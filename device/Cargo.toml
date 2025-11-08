@@ -1,0 +1,19 @@
+[package]
+name = "morok-device"
+version = "0.1.0"
+
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+morok-dtype = { path = "../dtype" }
+
+ndarray.workspace = true
+enum_delegate.workspace = true
+
+snafu = "0.8"
+cudarc = { version = "0.17", features = ["cuda-13000"], optional = true }
+
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc"]

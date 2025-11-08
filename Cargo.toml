@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["device", "dtype"]
+
+[workspace.package]
+authors = ["Patsakula Nikita <nikita.patsakula@gmail.com>"]
+edition = "2024"
+
+[workspace.dependencies]
+ndarray = "0.17"
+enum_delegate = "0.2"

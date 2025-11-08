@@ -1,0 +1,20 @@
+[package]
+name = "morok-dtype"
+version = "0.1.0"
+
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+proptest = { version = "1.9", optional = true }
+proptest-derive = { version = "0.7", optional = true }
+
+enumset = "1.1"
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+strum = { version = "0.27", features = ["derive"] }
+
+[features]
+default = ["proptest", "serde"]
+proptest = ["dep:proptest", "dep:proptest-derive"]
+serde = ["dep:serde"]
