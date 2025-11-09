@@ -34,6 +34,15 @@
 - Add dependencies to `Cargo.toml` file using `cargo add` command; if there is a new minor/major version
   since the last time you used them, check the difference in interface using an agent.
   
+### Testing
+
+- Each crate has a `test/` module with unit and property-based tests; we don't write tests in-place.
+- We use the `proptest` (dep) crate for property-based testing; if we use the `proptest-derive` crate, we
+  put the derive under a feature `proptest`.
+- We use the `test_case` (dep) crate for unit testing if a test requires different inputs in order to reduce
+  code duplication and simplify test understanding.
+- We add test infrastructure to the `.tokeignore` file in order to understand the codebase size better.
+  
 ## Task evaluation
 
 - `cargo fmt`, `cargo clippy` and `cargo test` should pass before I can perform review.

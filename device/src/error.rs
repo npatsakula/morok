@@ -28,6 +28,7 @@ pub enum Error {
     #[snafu(display("invalid view: offset {offset} + size {size} exceeds buffer size {buffer_size}"))]
     InvalidView { offset: usize, size: usize, buffer_size: usize },
 
+    #[cfg(feature = "cuda")]
     /// CUDA-specific errors.
     #[snafu(display("CUDA error: {source}"))]
     CudaError { source: cudarc::driver::DriverError },

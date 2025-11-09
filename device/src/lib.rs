@@ -32,6 +32,9 @@ pub mod registry;
 pub use buffer::Buffer;
 pub use error::{Error, Result};
 
+#[cfg(test)]
+mod test;
+
 // Re-export commonly used types
 #[cfg(feature = "cuda")]
 pub use allocator::CudaAllocator;
