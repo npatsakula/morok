@@ -42,7 +42,7 @@ impl BufferData {
         // Try to set - if another thread beat us, free this allocation
         if let Err(raw) = self.raw.set(raw) {
             // Another thread won the race - free our allocation
-            self.allocator.free(raw);
+            self.allocator.free(raw, &self.options);
         }
 
         Ok(())
@@ -63,7 +63,7 @@ impl Drop for BufferData {
     fn drop(&mut self) {
         // Free the buffer if it was allocated
         if let Some(raw) = self.raw.take() {
-            self.allocator.free(raw);
+            self.allocator.free(raw, &self.options);
         }
     }
 }
@@ -173,17 +173,25 @@ impl Buffer {
 
         let raw = self.data.raw();
         match raw {
-            RawBuffer::Cpu { data } => {
+            RawBuffer::Cpu { data, .. } => {
                 let mut data_mut = data.borrow_mut();
                 let slice = &mut data_mut[self.offset..self.offset + self.size];
                 slice.copy_from_slice(src);
                 Ok(())
             }
             #[cfg(feature = "cuda")]
-            RawBuffer::Cuda { data, device } => {
+            RawBuffer::CudaDevice { data, device } => {
                 let mut cuda_data = data.borrow_mut();
                 let mut view = cuda_data.slice_mut(self.offset..self.offset + self.size);
                 device.default_stream().memcpy_htod(src, &mut view).context(CudaSnafu)
+            }
+            #[cfg(feature = "cuda")]
+            RawBuffer::CudaUnified { data, .. } => {
+                let mut unified_data = data.borrow_mut();
+                let slice = unified_data.as_mut_slice().context(CudaSnafu)?;
+                let target = &mut slice[self.offset..self.offset + self.size];
+                target.copy_from_slice(src);
+                Ok(())
             }
         }
     }
@@ -198,17 +206,25 @@ impl Buffer {
 
         let raw = self.data.raw();
         match raw {
-            RawBuffer::Cpu { data } => {
+            RawBuffer::Cpu { data, .. } => {
                 let data_ref = data.borrow();
                 dst.copy_from_slice(&data_ref[self.offset..self.offset + self.size]);
                 Ok(())
             }
             #[cfg(feature = "cuda")]
-            RawBuffer::Cuda { data, device } => {
+            RawBuffer::CudaDevice { data, device } => {
                 device.synchronize().context(CudaSnafu)?;
                 let cuda_data = data.borrow();
                 let view = cuda_data.slice(self.offset..self.offset + self.size);
                 device.default_stream().memcpy_dtoh(&view, dst).context(CudaSnafu)
+            }
+            #[cfg(feature = "cuda")]
+            RawBuffer::CudaUnified { data, .. } => {
+                let unified_data = data.borrow();
+                let slice = unified_data.as_slice().context(CudaSnafu)?;
+                let source = &slice[self.offset..self.offset + self.size];
+                dst.copy_from_slice(source);
+                Ok(())
             }
         }
     }
@@ -227,7 +243,7 @@ impl Buffer {
 
         match (dst_raw, src_raw) {
             // CPU -> CPU
-            (RawBuffer::Cpu { data: dst_data }, RawBuffer::Cpu { data: src_data }) => {
+            (RawBuffer::Cpu { data: dst_data, .. }, RawBuffer::Cpu { data: src_data, .. }) => {
                 let mut dst_mut = dst_data.borrow_mut();
                 let src_ref = src_data.borrow();
                 let dst_slice = &mut dst_mut[self.offset..self.offset + self.size];
@@ -235,32 +251,96 @@ impl Buffer {
                 dst_slice.copy_from_slice(src_slice);
                 Ok(())
             }
-            // CUDA -> CUDA
+            // CudaDevice -> CudaDevice
             #[cfg(feature = "cuda")]
-            (RawBuffer::Cuda { data: dst_data, device: dst_device }, RawBuffer::Cuda { data: src_data, .. }) => {
+            (
+                RawBuffer::CudaDevice { data: dst_data, device: dst_device },
+                RawBuffer::CudaDevice { data: src_data, .. },
+            ) => {
                 let mut dst_cuda = dst_data.borrow_mut();
                 let src_cuda = src_data.borrow();
                 let mut dst_view = dst_cuda.slice_mut(self.offset..self.offset + self.size);
                 let src_view = src_cuda.slice(src.offset..src.offset + src.size);
                 dst_device.default_stream().memcpy_dtod(&src_view, &mut dst_view).context(CudaSnafu)
             }
-            // CPU -> CUDA
+            // CPU -> CudaDevice
             #[cfg(feature = "cuda")]
-            (RawBuffer::Cuda { data: dst_data, device }, RawBuffer::Cpu { data: src_data }) => {
+            (RawBuffer::CudaDevice { data: dst_data, device }, RawBuffer::Cpu { data: src_data, .. }) => {
                 let mut dst_cuda = dst_data.borrow_mut();
                 let src_ref = src_data.borrow();
                 let mut dst_view = dst_cuda.slice_mut(self.offset..self.offset + self.size);
                 let src_slice = &src_ref[src.offset..src.offset + src.size];
                 device.default_stream().memcpy_htod(src_slice, &mut dst_view).context(CudaSnafu)
             }
-            // CUDA -> CPU
+            // CudaDevice -> CPU
             #[cfg(feature = "cuda")]
-            (RawBuffer::Cpu { data: dst_data }, RawBuffer::Cuda { data: src_data, device }) => {
+            (RawBuffer::Cpu { data: dst_data, .. }, RawBuffer::CudaDevice { data: src_data, device }) => {
                 let mut dst_mut = dst_data.borrow_mut();
                 let src_cuda = src_data.borrow();
                 let dst_slice = &mut dst_mut[self.offset..self.offset + self.size];
                 let src_view = src_cuda.slice(src.offset..src.offset + src.size);
                 device.default_stream().memcpy_dtoh(&src_view, dst_slice).context(CudaSnafu)
+            }
+            // CudaUnified -> CudaUnified (direct CPU access)
+            #[cfg(feature = "cuda")]
+            (RawBuffer::CudaUnified { data: dst_data, .. }, RawBuffer::CudaUnified { data: src_data, .. }) => {
+                let mut dst_unified = dst_data.borrow_mut();
+                let src_unified = src_data.borrow();
+                let dst_slice = dst_unified.as_mut_slice().context(CudaSnafu)?;
+                let src_slice = src_unified.as_slice().context(CudaSnafu)?;
+                let dst_target = &mut dst_slice[self.offset..self.offset + self.size];
+                let src_source = &src_slice[src.offset..src.offset + src.size];
+                dst_target.copy_from_slice(src_source);
+                Ok(())
+            }
+            // CPU -> CudaUnified (direct CPU access)
+            #[cfg(feature = "cuda")]
+            (RawBuffer::CudaUnified { data: dst_data, .. }, RawBuffer::Cpu { data: src_data, .. }) => {
+                let mut dst_unified = dst_data.borrow_mut();
+                let src_ref = src_data.borrow();
+                let dst_slice = dst_unified.as_mut_slice().context(CudaSnafu)?;
+                let dst_target = &mut dst_slice[self.offset..self.offset + self.size];
+                let src_source = &src_ref[src.offset..src.offset + src.size];
+                dst_target.copy_from_slice(src_source);
+                Ok(())
+            }
+            // CudaUnified -> CPU (direct CPU access)
+            #[cfg(feature = "cuda")]
+            (RawBuffer::Cpu { data: dst_data, .. }, RawBuffer::CudaUnified { data: src_data, .. }) => {
+                let mut dst_mut = dst_data.borrow_mut();
+                let src_unified = src_data.borrow();
+                let src_slice = src_unified.as_slice().context(CudaSnafu)?;
+                let dst_target = &mut dst_mut[self.offset..self.offset + self.size];
+                let src_source = &src_slice[src.offset..src.offset + src.size];
+                dst_target.copy_from_slice(src_source);
+                Ok(())
+            }
+            // CudaDevice -> CudaUnified (device-to-host memcpy)
+            #[cfg(feature = "cuda")]
+            (
+                RawBuffer::CudaUnified { data: dst_data, device: dst_device },
+                RawBuffer::CudaDevice { data: src_data, .. },
+            ) => {
+                let mut dst_unified = dst_data.borrow_mut();
+                let src_cuda = src_data.borrow();
+                let src_view = src_cuda.slice(src.offset..src.offset + src.size);
+                // Get CPU-accessible slice from unified memory
+                let dst_slice = dst_unified.as_mut_slice().context(CudaSnafu)?;
+                let dst_target = &mut dst_slice[self.offset..self.offset + self.size];
+                // Copy directly from device to unified memory (via host access)
+                dst_device.default_stream().memcpy_dtoh(&src_view, dst_target).context(CudaSnafu)
+            }
+            // CudaUnified -> CudaDevice (host-to-device memcpy)
+            #[cfg(feature = "cuda")]
+            (RawBuffer::CudaDevice { data: dst_data, device }, RawBuffer::CudaUnified { data: src_data, .. }) => {
+                let mut dst_cuda = dst_data.borrow_mut();
+                let src_unified = src_data.borrow();
+                let mut dst_view = dst_cuda.slice_mut(self.offset..self.offset + self.size);
+                // Get CPU-accessible slice from unified memory
+                let src_slice = src_unified.as_slice().context(CudaSnafu)?;
+                let src_source = &src_slice[src.offset..src.offset + src.size];
+                // Copy directly from unified memory to device (via host access)
+                device.default_stream().memcpy_htod(src_source, &mut dst_view).context(CudaSnafu)
             }
         }
     }
@@ -268,5 +348,29 @@ impl Buffer {
     /// Synchronize the device (wait for all operations to complete).
     pub fn synchronize(&self) -> Result<()> {
         self.data.allocator.synchronize()
+    }
+
+    /// Get the raw data pointer for testing buffer identity.
+    ///
+    /// This is used in tests to verify cache reuse by comparing pointer addresses.
+    /// Returns the pointer to the underlying buffer data.
+    #[cfg(test)]
+    pub(crate) fn raw_data_ptr(&self) -> usize {
+        let raw = self.data.raw();
+        match raw {
+            RawBuffer::Cpu { data, .. } => data.borrow().as_ptr() as usize,
+            #[cfg(feature = "cuda")]
+            RawBuffer::CudaDevice { data, .. } => {
+                // For CUDA device memory, we use the CudaSlice's internal pointer
+                // CudaSlice wraps a device pointer, we cast the RefCell ref to get a stable address
+                &*data.borrow() as *const _ as usize
+            }
+            #[cfg(feature = "cuda")]
+            RawBuffer::CudaUnified { data, .. } => {
+                // For CUDA unified memory, we use the UnifiedSlice's internal pointer
+                // UnifiedSlice wraps a managed pointer, we cast the RefCell ref to get a stable address
+                &*data.borrow() as *const _ as usize
+            }
+        }
     }
 }
