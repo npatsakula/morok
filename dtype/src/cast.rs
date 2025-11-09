@@ -43,7 +43,7 @@ impl DType {
 
     fn get_recursive_parents(self) -> EnumSet<Self> {
         self.promotion_lattice()
-            .into_iter()
+            .iter()
             .fold(EnumSet::only(self), |dtypes, &parent| dtypes.union(parent.get_recursive_parents()))
     }
 

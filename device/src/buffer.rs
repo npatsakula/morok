@@ -1,0 +1,308 @@
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
+
+use morok_dtype::DType;
+use smallvec::{SmallVec, smallvec};
+use snafu::ResultExt;
+
+use crate::allocator::{Allocator, BufferOptions, RawBuffer};
+use crate::error::{InvalidViewSnafu, Result, SizeMismatchSnafu};
+
+#[cfg(feature = "cuda")]
+use crate::error::CudaSnafu;
+
+/// Shared buffer data that can be referenced by multiple views.
+#[derive(Debug)]
+struct BufferData {
+    /// Lazily-initialized raw buffer (lock-free after first allocation).
+    raw: OnceLock<RawBuffer>,
+    allocator: Arc<dyn Allocator>,
+    /// Total size of the underlying allocation in bytes.
+    total_size: usize,
+    /// Allocation options.
+    options: BufferOptions,
+}
+
+impl BufferData {
+    fn new(allocator: Arc<dyn Allocator>, size: usize, options: BufferOptions) -> Self {
+        Self { raw: OnceLock::new(), allocator, total_size: size, options }
+    }
+
+    /// Ensure the buffer is allocated, allocating if necessary.
+    /// Uses lock-free OnceLock for efficient repeated checks.
+    fn ensure_allocated(&self) -> Result<()> {
+        if self.raw.get().is_some() {
+            return Ok(());
+        }
+
+        // Allocate - if another thread beat us, that's fine
+        let raw = self.allocator.alloc(self.total_size, &self.options)?;
+
+        // Try to set - if another thread beat us, free this allocation
+        if let Err(raw) = self.raw.set(raw) {
+            // Another thread won the race - free our allocation
+            self.allocator.free(raw);
+        }
+
+        Ok(())
+    }
+
+    /// Check if the buffer is currently allocated.
+    fn is_allocated(&self) -> bool {
+        self.raw.get().is_some()
+    }
+
+    /// Get raw buffer reference (buffer must be allocated).
+    fn raw(&self) -> &RawBuffer {
+        self.raw.get().expect("buffer not allocated")
+    }
+}
+
+impl Drop for BufferData {
+    fn drop(&mut self) {
+        // Free the buffer if it was allocated
+        if let Some(raw) = self.raw.take() {
+            self.allocator.free(raw);
+        }
+    }
+}
+
+/// A device buffer that may be a view into another buffer.
+///
+/// This type is `!Send + !Sync` to prevent accidental sharing across threads,
+/// matching Tinygrad's single-threaded execution model.
+#[derive(Debug, Clone)]
+pub struct Buffer {
+    /// Shared data for the base allocation.
+    data: Rc<BufferData>,
+    /// Offset into the base buffer (in bytes).
+    offset: usize,
+    /// Size of this view (in bytes).
+    size: usize,
+    /// Data type of the buffer elements.
+    dtype: DType,
+    /// Shape of the tensor (stack-allocated for 0-4D tensors).
+    #[allow(dead_code)]
+    shape: SmallVec<[usize; 4]>,
+    /// Marker to make Buffer `!Send + !Sync` (single-threaded only).
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+impl Buffer {
+    /// Create a new buffer with lazy allocation.
+    pub fn new(allocator: Arc<dyn Allocator>, dtype: DType, shape: Vec<usize>, options: BufferOptions) -> Self {
+        let size = dtype.bytes() * shape.iter().product::<usize>();
+        Self {
+            data: Rc::new(BufferData::new(allocator, size, options)),
+            offset: 0,
+            size,
+            dtype,
+            shape: SmallVec::from_vec(shape),
+            _not_send_sync: PhantomData,
+        }
+    }
+
+    /// Create a new buffer with immediate allocation.
+    pub fn allocate(
+        allocator: Arc<dyn Allocator>,
+        dtype: DType,
+        shape: Vec<usize>,
+        options: BufferOptions,
+    ) -> Result<Self> {
+        let buffer = Self::new(allocator, dtype, shape, options);
+        buffer.ensure_allocated()?;
+        Ok(buffer)
+    }
+
+    /// Create a view into this buffer.
+    pub fn view(&self, offset: usize, size: usize) -> Result<Self> {
+        // Validate view parameters
+        if offset + size > self.size {
+            return InvalidViewSnafu { offset, size, buffer_size: self.size }.fail();
+        }
+
+        Ok(Self {
+            data: Rc::clone(&self.data),
+            offset: self.offset + offset,
+            size,
+            dtype: self.dtype,
+            // For views, shape is not well-defined without reshaping logic
+            shape: smallvec![size / self.dtype.bytes()],
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    /// Ensure the underlying buffer is allocated.
+    pub fn ensure_allocated(&self) -> Result<()> {
+        self.data.ensure_allocated()
+    }
+
+    /// Check if the buffer is allocated.
+    pub fn is_allocated(&self) -> bool {
+        self.data.is_allocated()
+    }
+
+    /// Get the size of this buffer view in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Get the offset of this view in bytes.
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Get the data type.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Get the allocator used by this buffer.
+    pub fn allocator(&self) -> &dyn Allocator {
+        &*self.data.allocator
+    }
+
+    /// Copy data from host memory into this buffer.
+    pub fn copyin(&mut self, src: &[u8]) -> Result<()> {
+        self.ensure_allocated()?;
+
+        let expected = self.size;
+        let actual = src.len();
+        snafu::ensure!(expected == actual, SizeMismatchSnafu { expected, actual });
+
+        let raw = self.data.raw();
+        match raw {
+            RawBuffer::Cpu { data } => {
+                let mut data_mut = data.borrow_mut();
+                let slice = &mut data_mut[self.offset..self.offset + self.size];
+                slice.copy_from_slice(src);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            RawBuffer::Cuda { data, device } => {
+                let mut cuda_data = data.borrow_mut();
+                let mut view = cuda_data.slice_mut(self.offset..self.offset + self.size);
+                device.default_stream().memcpy_htod(src, &mut view).context(CudaSnafu)
+            }
+        }
+    }
+
+    /// Copy data from this buffer to host memory.
+    pub fn copyout(&self, dst: &mut [u8]) -> Result<()> {
+        self.ensure_allocated()?;
+
+        let expected = self.size;
+        let actual = dst.len();
+        snafu::ensure!(expected == actual, SizeMismatchSnafu { expected, actual });
+
+        let raw = self.data.raw();
+        match raw {
+            RawBuffer::Cpu { data } => {
+                let data_ref = data.borrow();
+                dst.copy_from_slice(&data_ref[self.offset..self.offset + self.size]);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            RawBuffer::Cuda { data, device } => {
+                device.synchronize().context(CudaSnafu)?;
+                let cuda_data = data.borrow();
+                let view = cuda_data.slice(self.offset..self.offset + self.size);
+                device.default_stream().memcpy_dtoh(&view, dst).context(CudaSnafu)
+            }
+        }
+    }
+
+    /// Copy data from another buffer to this buffer.
+    pub fn copy_from(&mut self, src: &Buffer) -> Result<()> {
+        self.ensure_allocated()?;
+        src.ensure_allocated()?;
+
+        let expected = self.size;
+        let actual = src.size;
+        snafu::ensure!(expected == actual, SizeMismatchSnafu { expected, actual });
+
+        let dst_raw = self.data.raw();
+        let src_raw = src.data.raw();
+
+        match (dst_raw, src_raw) {
+            // CPU -> CPU
+            (RawBuffer::Cpu { data: dst_data }, RawBuffer::Cpu { data: src_data }) => {
+                let mut dst_mut = dst_data.borrow_mut();
+                let src_ref = src_data.borrow();
+                let dst_slice = &mut dst_mut[self.offset..self.offset + self.size];
+                let src_slice = &src_ref[src.offset..src.offset + src.size];
+                dst_slice.copy_from_slice(src_slice);
+                Ok(())
+            }
+            // CUDA -> CUDA
+            #[cfg(feature = "cuda")]
+            (RawBuffer::Cuda { data: dst_data, device: dst_device }, RawBuffer::Cuda { data: src_data, .. }) => {
+                let mut dst_cuda = dst_data.borrow_mut();
+                let src_cuda = src_data.borrow();
+                let mut dst_view = dst_cuda.slice_mut(self.offset..self.offset + self.size);
+                let src_view = src_cuda.slice(src.offset..src.offset + src.size);
+                dst_device.default_stream().memcpy_dtod(&src_view, &mut dst_view).context(CudaSnafu)
+            }
+            // CPU -> CUDA
+            #[cfg(feature = "cuda")]
+            (RawBuffer::Cuda { data: dst_data, device }, RawBuffer::Cpu { data: src_data }) => {
+                let mut dst_cuda = dst_data.borrow_mut();
+                let src_ref = src_data.borrow();
+                let mut dst_view = dst_cuda.slice_mut(self.offset..self.offset + self.size);
+                let src_slice = &src_ref[src.offset..src.offset + src.size];
+                device.default_stream().memcpy_htod(src_slice, &mut dst_view).context(CudaSnafu)
+            }
+            // CUDA -> CPU
+            #[cfg(feature = "cuda")]
+            (RawBuffer::Cpu { data: dst_data }, RawBuffer::Cuda { data: src_data, device }) => {
+                let mut dst_mut = dst_data.borrow_mut();
+                let src_cuda = src_data.borrow();
+                let dst_slice = &mut dst_mut[self.offset..self.offset + self.size];
+                let src_view = src_cuda.slice(src.offset..src.offset + src.size);
+                device.default_stream().memcpy_dtoh(&src_view, dst_slice).context(CudaSnafu)
+            }
+        }
+    }
+
+    /// Synchronize the device (wait for all operations to complete).
+    pub fn synchronize(&self) -> Result<()> {
+        self.data.allocator.synchronize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocator::CpuAllocator;
+
+    #[test]
+    fn test_lazy_allocation() {
+        let allocator = Arc::new(CpuAllocator);
+        let buffer = Buffer::new(allocator, DType::Float32, vec![10], BufferOptions::default());
+
+        assert!(!buffer.is_allocated());
+        buffer.ensure_allocated().unwrap();
+        assert!(buffer.is_allocated());
+    }
+
+    #[test]
+    fn test_buffer_view() {
+        let allocator = Arc::new(CpuAllocator);
+        let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], BufferOptions::default()).unwrap();
+
+        let view = buffer.view(4, 16).unwrap();
+        assert_eq!(view.offset(), 4);
+        assert_eq!(view.size(), 16);
+    }
+
+    #[test]
+    fn test_invalid_view() {
+        let allocator = Arc::new(CpuAllocator);
+        let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], BufferOptions::default()).unwrap();
+
+        // Try to create a view that exceeds buffer size
+        let result = buffer.view(36, 16);
+        assert!(result.is_err());
+    }
+}

@@ -1,67 +1,41 @@
-use std::sync::Arc;
+//! Device abstraction layer for tensor operations.
+//!
+//! This module provides a clean abstraction over different compute devices (CPU, CUDA, etc.)
+//! with support for:
+//! - Lazy buffer allocation
+//! - Buffer views with zero-copy slicing
+//! - LRU caching of allocations for performance
+//! - Device-agnostic copy operations
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use morok_device::{registry, Buffer};
+//! use morok_dtype::DType;
+//! use morok_device::allocator::BufferOptions;
+//!
+//! // Get a CPU device
+//! let cpu = registry::cpu().unwrap();
+//!
+//! // Create a buffer with lazy allocation
+//! let buffer = Buffer::new(cpu, DType::Float32, vec![10, 10], BufferOptions::default());
+//!
+//! // Allocation happens on first use
+//! buffer.ensure_allocated().unwrap();
+//! ```
 
-use cudarc::driver::{CudaContext, CudaSlice};
-use morok_dtype::DType;
+pub mod allocator;
+pub mod buffer;
+pub mod error;
+pub mod registry;
 
-enum Handle {
-    CPU { buffer: Box<[u8]> },
-    CUDA { buffer: CudaSlice<u8> },
-}
+pub use buffer::Buffer;
+pub use error::{Error, Result};
 
-pub struct Buffer {
-    buffer: Handle,
-    dtype: DType,
-    shape: Vec<usize>,
-}
-
-#[enum_delegate::implement(DeviceExt)]
-pub enum Device {
-    CPU(CPU),
-    CUDA(CUDA),
-}
-
-impl Device {
-    pub const fn cpu() -> Self {
-        Device::CPU(CPU)
-    }
-
-    pub fn cuda(id: usize) -> Self {
-        let context = CudaContext::new(id).unwrap();
-        Device::CUDA(CUDA { context })
-    }
-}
-
-#[enum_delegate::register]
-pub trait DeviceExt {
-    fn allocate_dtype(&mut self, dtype: DType, shape: Vec<usize>) -> Buffer;
-    fn allocate_zeroes_dtype(&mut self, dtype: DType, shape: Vec<usize>) -> Buffer {
-        self.allocate_dtype(dtype, shape)
-    }
-}
-
-pub struct CPU;
-
-impl DeviceExt for CPU {
-    fn allocate_dtype(&mut self, dtype: DType, shape: Vec<usize>) -> Buffer {
-        let bytes = dtype.bytes() * shape.iter().product::<usize>();
-        Buffer { buffer: Handle::CPU { buffer: vec![0; bytes].into_boxed_slice() }, dtype, shape }
-    }
-}
-
-pub struct CUDA {
-    context: Arc<CudaContext>,
-}
-
-impl DeviceExt for CUDA {
-    fn allocate_dtype(&mut self, dtype: DType, shape: Vec<usize>) -> Buffer {
-        let bytes = dtype.bytes() * shape.iter().product::<usize>();
-        let buffer = unsafe { self.context.default_stream().alloc(bytes) }.expect("unable to allocate CUDA memory");
-        Buffer { buffer: Handle::CUDA { buffer }, dtype, shape }
-    }
-
-    fn allocate_zeroes_dtype(&mut self, dtype: DType, shape: Vec<usize>) -> Buffer {
-        let bytes = dtype.bytes() * shape.iter().product::<usize>();
-        let buffer = self.context.default_stream().alloc_zeros(bytes).expect("unable to allocate CUDA memory");
-        Buffer { buffer: Handle::CUDA { buffer }, dtype, shape }
-    }
-}
+// Re-export commonly used types
+#[cfg(feature = "cuda")]
+pub use allocator::CudaAllocator;
+pub use allocator::{Allocator, BufferOptions, CpuAllocator};
+#[cfg(feature = "cuda")]
+pub use registry::cuda;
+pub use registry::{DeviceSpec, cpu, get_device};
