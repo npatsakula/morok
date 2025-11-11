@@ -38,6 +38,7 @@ impl DType {
             BFloat16 => &[Float32],
             Float32 => &[Float64],
             Float64 => &[],
+            Void => &[], // Void has no promotions
         }
     }
 

@@ -29,6 +29,9 @@ pub enum DType {
     BFloat16 = 12,
     Float32 = 13,
     Float64 = 14,
+
+    /// Void type for metadata operations (no data).
+    Void = 15,
 }
 
 impl DType {
@@ -49,6 +52,7 @@ impl DType {
             Self::BFloat16 => 2,
             Self::Float32 => 4,
             Self::Float64 => 8,
+            Self::Void => 0,
         }
     }
 
@@ -85,6 +89,7 @@ impl DType {
             Self::Float32 => "float",
             Self::Float64 => "double",
             Self::BFloat16 => "__bf16",
+            Self::Void => "void",
         }
     }
 }

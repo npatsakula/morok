@@ -21,6 +21,9 @@ impl DType {
 proptest! {
     #[test]
     fn least_upper_dtype(lhs: DType, rhs: DType) {
+        // Void is excluded from type promotion
+        prop_assume!(lhs != DType::Void && rhs != DType::Void);
+
         match DType::least_upper_dtype(&[lhs, rhs]) {
             Some(_) => (),
             None => prop_assert!([lhs, rhs].contains(&DType::Float64)),

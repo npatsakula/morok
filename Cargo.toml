@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["device", "dtype"]
+members = ["device", "dtype", "ir"]
 
 [workspace.package]
 authors = ["Patsakula Nikita <nikita.patsakula@gmail.com>"]

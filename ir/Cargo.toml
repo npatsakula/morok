@@ -1,0 +1,10 @@
+[package]
+name = "morok-ir"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+morok-dtype = { path = "../dtype" }
+morok-device = { path = "../device" }
+smallvec = "1.15.1"
