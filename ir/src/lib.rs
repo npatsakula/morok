@@ -5,9 +5,16 @@ use std::mem::discriminant;
 use std::rc::{Rc, Weak};
 
 use smallvec::SmallVec;
+use snafu::ensure;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
+
+pub mod error;
+pub mod ops;
+pub mod shape;
+
+pub use error::{Error, IndexTypeMismatchSnafu, Result};
 
 // Thread-local counter for unique identifiers.
 //
@@ -66,6 +73,40 @@ impl BufferizeOpts {
     }
 }
 
+/// Axis type for loop ranges and reductions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AxisType {
+    /// GPU grid dimension.
+    Global,
+    /// Warp/wavefront dimension.
+    Warp,
+    /// GPU block/workgroup dimension (local memory scope).
+    Local,
+    /// Regular loop.
+    Loop,
+    /// Grouped reduction.
+    GroupReduce,
+    /// Reduction axis.
+    Reduce,
+    /// Vectorization axis (upcast).
+    Upcast,
+    /// Unrolled loop.
+    Unroll,
+    /// Thread dimension.
+    Thread,
+}
+
+/// Reduction operation types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReduceOp {
+    /// Sum reduction (a + b).
+    Add,
+    /// Product reduction (a * b).
+    Mul,
+    /// Maximum reduction (max(a, b)).
+    Max,
+}
+
 /// Unary operation types.
 ///
 /// All unary operations preserve the input dtype.
@@ -82,11 +123,17 @@ pub enum UnaryOp {
     Log2,
     /// Bitwise NOT: ~x (int/bool only)
     Not,
+    /// Sine: sin(x) (float only)
+    Sin,
+    /// Reciprocal: 1/x
+    Reciprocal,
+    /// Truncate towards zero (remove fractional part)
+    Trunc,
 }
 
 /// Binary operation types.
 ///
-/// Arithmetic operations (Add, Mul, Sub, Div, Rem) preserve the LHS dtype.
+/// Arithmetic operations (Add, Mul, Sub, Div, Rem, Max, Pow, Idiv, Fdiv) preserve the LHS dtype.
 /// Comparison operations (Lt, Eq, Ne) always return DType::Bool.
 /// Bitwise operations (And, Or, Xor, Shl, Shr) preserve dtype and require int/bool types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,10 +145,18 @@ pub enum BinaryOp {
     Mul,
     /// Subtraction: a - b
     Sub,
-    /// Division: a / b
+    /// Division: a / b (generic)
     Div,
     /// Remainder/Modulo: a % b
     Rem,
+    /// Maximum: max(a, b)
+    Max,
+    /// Power: a^b
+    Pow,
+    /// Integer division: a // b (truncated)
+    Idiv,
+    /// Float division: a / b (exact float division)
+    Fdiv,
 
     // Comparison operations
     /// Less than: a < b
@@ -122,6 +177,10 @@ pub enum BinaryOp {
     Shl,
     /// Right shift: a >> b
     Shr,
+
+    // Special operations
+    /// Threefry PRNG: threefry(x, key) -> uint64
+    Threefry,
 }
 
 impl BinaryOp {
@@ -132,7 +191,10 @@ impl BinaryOp {
 
     /// Returns true if this is an arithmetic operation.
     pub fn is_arithmetic(self) -> bool {
-        matches!(self, Self::Add | Self::Mul | Self::Sub | Self::Div | Self::Rem)
+        matches!(
+            self,
+            Self::Add | Self::Mul | Self::Sub | Self::Div | Self::Rem | Self::Max | Self::Pow | Self::Idiv | Self::Fdiv
+        )
     }
 
     /// Returns true if this is a bitwise operation.
@@ -142,25 +204,48 @@ impl BinaryOp {
 
     /// Returns true if this operation is associative.
     pub fn is_associative(self) -> bool {
-        matches!(self, Self::Add | Self::Mul | Self::And | Self::Or | Self::Xor)
+        matches!(self, Self::Add | Self::Mul | Self::And | Self::Or | Self::Max)
     }
 
     /// Returns true if this operation is commutative.
     pub fn is_commutative(self) -> bool {
-        matches!(
-            self,
-            Self::Add | Self::Mul | Self::Eq | Self::Ne | Self::And | Self::Or | Self::Xor
-        )
+        matches!(self, Self::Add | Self::Mul | Self::Eq | Self::Ne | Self::And | Self::Or | Self::Xor | Self::Max)
+    }
+
+    /// Returns true if this operation is idempotent (f(x, x) = x).
+    pub fn is_idempotent(self) -> bool {
+        matches!(self, Self::Or | Self::And | Self::Max)
     }
 }
 
 /// Ternary operation types.
-///
-/// Currently unused, but reserved for future WHERE operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TernaryOp {
     /// Conditional selection: condition ? true_val : false_val
     Where,
+    /// Multiply-accumulate: a * b + c (fused operation)
+    MulAcc,
+}
+
+/// Metadata for WMMA (Warp Matrix Multiply-Accumulate) operations.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WmmaMetadata {
+    /// Operation name (e.g., "WMMA_INSTRUCTION").
+    pub name: String,
+    /// Matrix dimensions (N, M, K).
+    pub dims: (usize, usize, usize),
+    /// Input matrix dtype.
+    pub dtype_in: DType,
+    /// Output/accumulator dtype.
+    pub dtype_out: DType,
+    /// Target device string.
+    pub device: String,
+    /// Thread count.
+    pub threads: usize,
+    /// Upcast axes for vectorization.
+    pub upcast_axes: Vec<(usize, usize)>,
+    /// Reduction axes.
+    pub reduce_axes: Vec<(usize, usize)>,
 }
 
 /// Wrapper for ConstValue that implements Eq and Hash.
@@ -224,13 +309,18 @@ pub enum Op {
     DefineGlobal(usize),
     DefineLocal(usize),
 
-    // Grouped operations (2 variants, down from 11)
+    // Grouped operations (3 variants)
     Unary(UnaryOp, Rc<UOp>),
     Binary(BinaryOp, Rc<UOp>, Rc<UOp>),
+    Ternary(TernaryOp, Rc<UOp>, Rc<UOp>, Rc<UOp>),
 
-    // Special unary operations with extra data (2 variants)
+    // Type operations (2 variants)
     Cast { src: Rc<UOp>, dtype: DType },
+    BitCast { src: Rc<UOp>, dtype: DType },
+
+    // Special operations (2 variants)
     MSelect { buffer: Rc<UOp>, device_index: usize },
+    Special { end: Rc<UOp>, name: String },
 
     // Buffer operations (high-level, 6 variants)
     Buffer { unique: Rc<UOp>, device: Rc<UOp>, size: usize },
@@ -239,6 +329,51 @@ pub enum Op {
     Index { buffer: Rc<UOp>, indices: SmallVec<[Rc<UOp>; 4]>, gate: Option<Rc<UOp>> },
     Copy { src: Rc<UOp>, device: Rc<UOp> },
     MStack { buffers: SmallVec<[Rc<UOp>; 4]> },
+
+    // Movement/Reshape operations (7 variants)
+    Reshape { src: Rc<UOp>, new_shape: Rc<UOp> },
+    Permute { src: Rc<UOp>, axes: Vec<usize> },
+    Expand { src: Rc<UOp>, new_shape: Rc<UOp> },
+    Pad { src: Rc<UOp>, begin_pads: Rc<UOp>, end_pads: Rc<UOp> },
+    Shrink { src: Rc<UOp>, begins: Rc<UOp>, ends: Rc<UOp> },
+    Flip { src: Rc<UOp>, axes: Vec<bool> },
+    Multi { src: Rc<UOp>, axis: usize },
+
+    // Reduction operations (3 variants)
+    ReduceAxis { src: Rc<UOp>, reduce_op: ReduceOp, axes: Vec<usize> },
+    Reduce { src: Rc<UOp>, ranges: SmallVec<[Rc<UOp>; 4]>, reduce_op: ReduceOp },
+    AllReduce { src: Rc<UOp>, device: Rc<UOp>, reduce_op: ReduceOp },
+
+    // Control flow operations (5 variants)
+    If { condition: Rc<UOp>, body: SmallVec<[Rc<UOp>; 4]> },
+    EndIf { if_op: Rc<UOp> },
+    Range { end: Rc<UOp>, axis_id: usize, axis_type: AxisType },
+    End { range_or_reduce: Rc<UOp> },
+    Barrier { src: Rc<UOp>, deps: SmallVec<[Rc<UOp>; 4]> },
+
+    // Vector operations (3 variants)
+    Vectorize { elements: SmallVec<[Rc<UOp>; 4]> },
+    Gep { vector: Rc<UOp>, indices: Vec<usize> },
+    VConst { values: Vec<ConstValue> },
+
+    // Symbolic/Define operations (3 variants)
+    DefineVar { name: String, min_val: i64, max_val: i64 },
+    Bind { var: Rc<UOp>, value: Rc<UOp> },
+    DefineReg { size: usize },
+
+    // Advanced operations (12 variants)
+    Wmma { a: Rc<UOp>, b: Rc<UOp>, c: Rc<UOp>, metadata: WmmaMetadata },
+    Contract { src: Rc<UOp>, upcast_ranges: Vec<(usize, usize)> },
+    Unroll { src: Rc<UOp>, unroll_axes: Vec<(usize, usize)> },
+    Kernel { ast: Option<Rc<UOp>> },
+    Assign { target: Rc<UOp>, value: Rc<UOp> },
+    Detach { src: Rc<UOp> },
+    Contiguous { src: Rc<UOp> },
+    ContiguousBackward { src: Rc<UOp> },
+    After { passthrough: Rc<UOp>, deps: SmallVec<[Rc<UOp>; 4]> },
+    Precast { src: Rc<UOp> },
+    Custom { deps: SmallVec<[Rc<UOp>; 4]>, code: String },
+    CustomI { deps: SmallVec<[Rc<UOp>; 4]>, code: String },
 
     // Memory operations (low-level, after kernel splitting, 4 variants)
     Load { buffer: Rc<UOp>, index: Rc<UOp> },
@@ -252,7 +387,7 @@ impl Op {
     ///
     /// This is the convenient API for traversing the graph.
     /// Allocates a Vec but is simple to use.
-    pub fn children(&self) -> Vec<&Rc<UOp>> {
+    pub fn children(&self) -> SmallVec<[&Rc<UOp>; 4]> {
         match self {
             // Nullary operations
             Self::Const(_)
@@ -260,115 +395,106 @@ impl Op {
             | Self::Device(_)
             | Self::Noop
             | Self::DefineGlobal(_)
-            | Self::DefineLocal(_) => vec![],
+            | Self::DefineLocal(_)
+            | Self::VConst { .. }
+            | Self::DefineVar { .. }
+            | Self::DefineReg { .. } => SmallVec::new(),
 
             // Grouped operations
-            Self::Unary(_, x) => vec![x],
-            Self::Binary(_, a, b) => vec![a, b],
+            Self::Unary(_, x) => SmallVec::from_slice(&[x]),
+            Self::Binary(_, a, b) => SmallVec::from_slice(&[a, b]),
+            Self::Ternary(_, a, b, c) => SmallVec::from_slice(&[a, b, c]),
 
-            // Special unary operations
-            Self::Cast { src, .. } => vec![src],
-            Self::MSelect { buffer, .. } => vec![buffer],
+            // Type operations
+            Self::Cast { src, .. } | Self::BitCast { src, .. } => SmallVec::from_slice(&[src]),
+
+            // Special operations
+            Self::MSelect { buffer, .. } => SmallVec::from_slice(&[buffer]),
+            Self::Special { end, .. } => SmallVec::from_slice(&[end]),
 
             // Buffer operations
-            Self::Buffer { unique, device, .. } => vec![unique, device],
-            Self::BufferView { buffer, .. } => vec![buffer],
+            Self::Buffer { unique, device, .. } => SmallVec::from_slice(&[unique, device]),
+            Self::BufferView { buffer, .. } => SmallVec::from_slice(&[buffer]),
             Self::Bufferize { compute, ranges, .. } => {
-                let mut children = vec![compute];
+                let mut children = SmallVec::from_slice(&[compute]);
                 children.extend(ranges.iter());
                 children
             }
             Self::Index { buffer, indices, gate } => {
-                let mut children = vec![buffer];
+                let mut children = SmallVec::from_slice(&[buffer]);
                 children.extend(indices.iter());
-                if let Some(g) = gate {
-                    children.push(g);
-                }
+                children.extend(gate);
                 children
             }
-            Self::Copy { src, device } => vec![src, device],
+            Self::Copy { src, device } => SmallVec::from_slice(&[src, device]),
             Self::MStack { buffers } => buffers.iter().collect(),
 
+            // Movement operations
+            Self::Reshape { src, new_shape } => SmallVec::from_slice(&[src, new_shape]),
+            Self::Permute { src, .. } | Self::Flip { src, .. } | Self::Multi { src, .. } => {
+                SmallVec::from_slice(&[src])
+            }
+            Self::Expand { src, new_shape } => SmallVec::from_slice(&[src, new_shape]),
+            Self::Pad { src, begin_pads, end_pads } => SmallVec::from_slice(&[src, begin_pads, end_pads]),
+            Self::Shrink { src, begins, ends } => SmallVec::from_slice(&[src, begins, ends]),
+
+            // Reduction operations
+            Self::ReduceAxis { src, .. } => SmallVec::from_slice(&[src]),
+            Self::Reduce { src, ranges, .. } => {
+                let mut children = SmallVec::from_slice(&[src]);
+                children.extend(ranges.iter());
+                children
+            }
+            Self::AllReduce { src, device, .. } => SmallVec::from_slice(&[src, device]),
+
+            // Control flow operations
+            Self::If { condition, body } => {
+                let mut children = SmallVec::from_slice(&[condition]);
+                children.extend(body.iter());
+                children
+            }
+            Self::EndIf { if_op } => SmallVec::from_slice(&[if_op]),
+            Self::Range { end, .. } => SmallVec::from_slice(&[end]),
+            Self::End { range_or_reduce } => SmallVec::from_slice(&[range_or_reduce]),
+            Self::Barrier { src, deps } => {
+                let mut children = SmallVec::from_slice(&[src]);
+                children.extend(deps.iter());
+                children
+            }
+
+            // Vector operations
+            Self::Vectorize { elements } => elements.iter().collect(),
+            Self::Gep { vector, .. } => SmallVec::from_slice(&[vector]),
+
+            // Symbolic/Define operations
+            Self::Bind { var, value } => SmallVec::from_slice(&[var, value]),
+
+            // Advanced operations
+            Self::Wmma { a, b, c, .. } => SmallVec::from_slice(&[a, b, c]),
+            Self::Contract { src, .. }
+            | Self::Unroll { src, .. }
+            | Self::Detach { src }
+            | Self::Contiguous { src }
+            | Self::ContiguousBackward { src }
+            | Self::Precast { src } => SmallVec::from_slice(&[src]),
+            Self::Kernel { ast } => {
+                let mut children = SmallVec::new();
+                children.extend(ast);
+                children
+            }
+            Self::Assign { target, value } => SmallVec::from_slice(&[target, value]),
+            Self::After { passthrough, deps } => {
+                let mut children = SmallVec::from_slice(&[passthrough]);
+                children.extend(deps.iter());
+                children
+            }
+            Self::Custom { deps, .. } | Self::CustomI { deps, .. } => deps.iter().collect(),
+
             // Memory operations
-            Self::Load { buffer, index } => vec![buffer, index],
-            Self::LoadGated { buffer, index, gate } => vec![buffer, index, gate],
-            Self::Store { buffer, index, value } => vec![buffer, index, value],
-            Self::StoreGated { buffer, index, value, gate } => vec![buffer, index, value, gate],
-        }
-    }
-
-    /// Visit all child UOps with a visitor function.
-    ///
-    /// This is the zero-allocation API for performance-critical code.
-    /// More efficient than children() but slightly less convenient.
-    pub fn for_each_child<F>(&self, mut f: F)
-    where
-        F: FnMut(&Rc<UOp>),
-    {
-        match self {
-            // Nullary operations
-            Self::Const(_)
-            | Self::Unique(_)
-            | Self::Device(_)
-            | Self::Noop
-            | Self::DefineGlobal(_)
-            | Self::DefineLocal(_) => {}
-
-            // Grouped operations
-            Self::Unary(_, x) => f(x),
-            Self::Binary(_, a, b) => {
-                f(a);
-                f(b);
-            }
-
-            // Special unary operations
-            Self::Cast { src, .. } => f(src),
-            Self::MSelect { buffer, .. } => f(buffer),
-
-            // Buffer operations
-            Self::Buffer { unique, device, .. } => {
-                f(unique);
-                f(device);
-            }
-            Self::BufferView { buffer, .. } => f(buffer),
-            Self::Bufferize { compute, ranges, .. } => {
-                f(compute);
-                ranges.iter().for_each(&mut f);
-            }
-            Self::Index { buffer, indices, gate } => {
-                f(buffer);
-                indices.iter().for_each(&mut f);
-                if let Some(g) = gate {
-                    f(g);
-                }
-            }
-            Self::Copy { src, device } => {
-                f(src);
-                f(device);
-            }
-            Self::MStack { buffers } => buffers.iter().for_each(f),
-
-            // Memory operations
-            Self::Load { buffer, index } => {
-                f(buffer);
-                f(index);
-            }
-            Self::LoadGated { buffer, index, gate } => {
-                f(buffer);
-                f(index);
-                f(gate);
-            }
-            Self::Store { buffer, index, value } => {
-                f(buffer);
-                f(index);
-                f(value);
-            }
-            Self::StoreGated { buffer, index, value, gate } => {
-                f(buffer);
-                f(index);
-                f(value);
-                f(gate);
-            }
+            Self::Load { buffer, index } => SmallVec::from_slice(&[buffer, index]),
+            Self::LoadGated { buffer, index, gate } => SmallVec::from_slice(&[buffer, index, gate]),
+            Self::Store { buffer, index, value } => SmallVec::from_slice(&[buffer, index, value]),
+            Self::StoreGated { buffer, index, value, gate } => SmallVec::from_slice(&[buffer, index, value, gate]),
         }
     }
 
@@ -377,8 +503,18 @@ impl Op {
     /// Returns raw pointers to avoid reference counting overhead during hashing.
     fn src_ptrs(&self) -> Vec<*const UOp> {
         let mut ptrs = Vec::new();
-        self.for_each_child(|child| ptrs.push(Rc::as_ptr(child)));
+        self.children().into_iter().for_each(|child| ptrs.push(Rc::as_ptr(child)));
         ptrs
+    }
+
+    /// Apply a function to each child UOp.
+    pub fn map_child<F>(&self, mut f: F)
+    where
+        F: FnMut(&Rc<UOp>),
+    {
+        for child in self.children() {
+            f(child);
+        }
     }
 }
 
@@ -390,6 +526,16 @@ impl Op {
 pub struct UOp {
     op: Op,
     dtype: DType,
+}
+
+impl UOp {
+    // TODO: Implement map() method for recursively transforming UOps
+    // pub fn map<F>(self, f: F) -> Self
+    // where
+    //     F: FnMut(&Self) -> Self,
+    // {
+    //     ...
+    // }
 }
 
 /// Cache key for hash consing.
@@ -435,7 +581,7 @@ impl UOpKey {
             Op::DefineLocal(slot) => OpData::DefineLocal(*slot),
             Op::Unary(unary_op, _) => OpData::Unary(*unary_op),
             Op::Binary(binary_op, _, _) => OpData::Binary(*binary_op),
-            Op::Cast { dtype, .. } => OpData::CastDType(*dtype),
+            Op::Cast { dtype, .. } => OpData::CastDType(dtype.clone()),
             Op::MSelect { device_index, .. } => OpData::MSelectIdx(*device_index),
             Op::Buffer { size, .. } => OpData::BufferSize(*size),
             Op::BufferView { size, offset, .. } => OpData::BufferView(*size, *offset),
@@ -468,7 +614,7 @@ impl UOp {
     /// If an identical UOp already exists, returns a reference to it.
     /// Otherwise, creates a new UOp and caches it.
     pub fn new(op: Op, dtype: DType) -> Rc<Self> {
-        let key = UOpKey::new(&op, dtype);
+        let key = UOpKey::new(&op, dtype.clone());
 
         CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -497,7 +643,7 @@ impl UOp {
 
     /// Get the data type.
     pub fn dtype(&self) -> DType {
-        self.dtype
+        self.dtype.clone()
     }
 
     // Construction helpers
@@ -525,7 +671,7 @@ impl UOp {
 
     /// Create a cast operation.
     pub fn cast(src: Rc<Self>, dtype: DType) -> Rc<Self> {
-        Self::new(Op::Cast { src, dtype }, dtype)
+        Self::new(Op::Cast { src, dtype: dtype.clone() }, dtype)
     }
 
     // Macro-generated helpers for repetitive operations
@@ -541,28 +687,40 @@ impl UOp {
 
     /// Create a buffer view.
     pub fn buffer_view(buffer: Rc<Self>, size: usize, offset: usize) -> Rc<Self> {
-        let dtype = buffer.dtype;
+        let dtype = buffer.dtype.clone();
         Self::new(Op::BufferView { buffer, size, offset }, dtype)
     }
 
     /// Create an index operation.
-    pub fn index(buffer: Rc<Self>, indices: Vec<Rc<Self>>) -> Rc<Self> {
-        let dtype = buffer.dtype;
+    pub fn index(buffer: Rc<Self>, indices: Vec<Rc<Self>>) -> Result<Rc<Self>> {
+        // Validate that all indices have Index dtype
+        for idx in &indices {
+            let idx_dtype = idx.dtype();
+            ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
+        }
+
+        let dtype = buffer.dtype.clone();
         let indices = SmallVec::from_vec(indices);
-        Self::new(Op::Index { buffer, indices, gate: None }, dtype)
+        Ok(Self::new(Op::Index { buffer, indices, gate: None }, dtype))
     }
 
     /// Create a gated index operation.
-    pub fn index_gated(buffer: Rc<Self>, indices: Vec<Rc<Self>>, gate: Rc<Self>) -> Rc<Self> {
-        let dtype = buffer.dtype;
+    pub fn index_gated(buffer: Rc<Self>, indices: Vec<Rc<Self>>, gate: Rc<Self>) -> Result<Rc<Self>> {
+        // Validate that all indices have Index dtype
+        for idx in &indices {
+            let idx_dtype = idx.dtype();
+            ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
+        }
+
+        let dtype = buffer.dtype.clone();
         let indices = SmallVec::from_vec(indices);
-        Self::new(Op::Index { buffer, indices, gate: Some(gate) }, dtype)
+        Ok(Self::new(Op::Index { buffer, indices, gate: Some(gate) }, dtype))
     }
 
     /// Copy to a different device.
     pub fn copy_to_device(self: &Rc<Self>, device: DeviceSpec) -> Rc<Self> {
         let dev = Self::device(device);
-        Self::new(Op::Copy { src: self.clone(), device: dev }, self.dtype)
+        Self::new(Op::Copy { src: self.clone(), device: dev }, self.dtype.clone())
     }
 
     /// Topological sort of the computation graph.
@@ -588,7 +746,7 @@ impl UOp {
 
                 // Use for_each_child for zero-allocation traversal
                 let mut children = Vec::new();
-                node.op.for_each_child(|child| {
+                node.op.map_child(|child| {
                     if !visited.contains(&Rc::as_ptr(child)) {
                         children.push(child.clone());
                     }
@@ -610,22 +768,9 @@ macro_rules! unary_ops {
     ($($name:ident => $op:ident),* $(,)?) => {
         impl UOp {
             $(
-                pub fn $name(arg: Rc<Self>) -> Rc<Self> {
-                    let dtype = arg.dtype;
-                    Self::new(Op::Unary(UnaryOp::$op, arg), dtype)
-                }
-            )*
-        }
-    }
-}
-
-macro_rules! binary_ops {
-    ($($name:ident => $op:ident),* $(,)?) => {
-        impl UOp {
-            $(
-                pub fn $name(lhs: Rc<Self>, rhs: Rc<Self>) -> Rc<Self> {
-                    let dtype = lhs.dtype; // TODO: proper type promotion
-                    Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), dtype)
+                pub fn $name(arg: &Rc<Self>) -> Rc<Self> {
+                    let dtype = arg.dtype.clone();
+                    Self::new(Op::Unary(UnaryOp::$op, arg.clone()), dtype)
                 }
             )*
         }
@@ -636,8 +781,8 @@ macro_rules! cmp_ops {
     ($($name:ident => $op:ident),* $(,)?) => {
         impl UOp {
             $(
-                pub fn $name(lhs: Rc<Self>, rhs: Rc<Self>) -> Rc<Self> {
-                    Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), DType::Bool)
+                pub fn $name(lhs: &Rc<Self>, rhs: &Rc<Self>) -> Rc<Self> {
+                    Self::new(Op::Binary(BinaryOp::$op, lhs.clone(), rhs.clone()), DType::Bool)
                 }
             )*
         }
@@ -651,13 +796,6 @@ unary_ops! {
     log2 => Log2,
 }
 
-binary_ops! {
-    add => Add,
-    mul => Mul,
-    sub => Sub,
-    div => Div,
-}
-
 cmp_ops! {
     cmplt => Lt,
     cmpeq => Eq,
@@ -666,7 +804,210 @@ cmp_ops! {
 
 impl Clone for UOp {
     fn clone(&self) -> Self {
-        Self { op: self.op.clone(), dtype: self.dtype }
+        Self { op: self.op.clone(), dtype: self.dtype.clone() }
+    }
+}
+
+/// Trait for converting scalar values into UOps.
+///
+/// This allows operator overloading to work with mixed scalar/UOp operands.
+/// For example: `uop + 5.0` or `5.0 + uop`.
+pub trait IntoUOp {
+    fn into_uop(self, dtype: DType) -> Rc<UOp>;
+}
+
+impl IntoUOp for f32 {
+    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+        UOp::const_(dtype, ConstValue::Float(self as f64))
+    }
+}
+
+impl IntoUOp for f64 {
+    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+        UOp::const_(dtype, ConstValue::Float(self))
+    }
+}
+
+impl IntoUOp for i32 {
+    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+        UOp::const_(dtype, ConstValue::Int(self as i64))
+    }
+}
+
+impl IntoUOp for i64 {
+    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+        UOp::const_(dtype, ConstValue::Int(self))
+    }
+}
+
+impl IntoUOp for u32 {
+    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+        UOp::const_(dtype, ConstValue::UInt(self as u64))
+    }
+}
+
+impl IntoUOp for u64 {
+    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+        UOp::const_(dtype, ConstValue::UInt(self))
+    }
+}
+
+impl IntoUOp for bool {
+    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+        UOp::const_(dtype, ConstValue::Bool(self))
+    }
+}
+
+/// Index specification for multi-dimensional slicing.
+///
+/// Similar to NumPy/ndarray indexing:
+/// - `Single(idx)`: Select single element (like `arr[5]`)
+/// - `Range{start, end, step}`: Slice range (like `arr[0:10:2]`)
+/// - `Full`: Select all elements (like `arr[:]`)
+/// - `NewAxis`: Add new dimension (like `arr[np.newaxis]`)
+///
+/// # Example
+/// ```ignore
+/// use morok_ir::{s, IndexSpec, UOp};
+///
+/// // Using macro syntax
+/// let specs = vec![
+///     s![idx],              // Single index
+///     s![..],               // Full slice
+///     s![start, end],       // Range
+///     s![start, end, step], // Range with step
+///     s![NewAxis],          // New axis
+/// ];
+/// ```
+#[derive(Debug, Clone)]
+pub enum IndexSpec {
+    /// Single integer index - selects one element and removes dimension.
+    Single(Rc<UOp>),
+
+    /// Range with optional step - selects multiple elements.
+    Range { start: Rc<UOp>, end: Rc<UOp>, step: Option<Rc<UOp>> },
+
+    /// Full slice - selects all elements along this dimension.
+    Full,
+
+    /// New axis - adds a dimension of size 1.
+    NewAxis,
+}
+
+/// Slice macro for creating IndexSpec instances.
+///
+/// Similar to ndarray's `s![]` macro, provides syntactic sugar for slicing.
+///
+/// # Syntax
+/// - `s![idx]` → `IndexSpec::Single(idx)`
+/// - `s![..]` → `IndexSpec::Full`
+/// - `s![start, end]` → `IndexSpec::Range{start, end, step: None}`
+/// - `s![start, end, step]` → `IndexSpec::Range{start, end, step: Some(step)}`
+/// - `s![NewAxis]` → `IndexSpec::NewAxis`
+///
+/// # Example
+/// ```ignore
+/// let buf = UOp::new_buffer(DeviceSpec::Cpu, 1000, DType::Float32);
+/// let idx = UOp::const_(DType::Int32, ConstValue::Int(5));
+/// let start = UOp::const_(DType::Int32, ConstValue::Int(0));
+/// let end = UOp::const_(DType::Int32, ConstValue::Int(10));
+///
+/// let slice = UOp::slice(buf, vec![
+///     s![start, end],  // Range 0..10
+///     s![idx],         // Single index at 5
+///     s![..],          // Full slice
+/// ]);
+/// ```
+#[macro_export]
+macro_rules! s {
+    // Full slice: s![..]
+    (..) => {
+        $crate::IndexSpec::Full
+    };
+
+    // Single index: s![idx]
+    ($idx:expr) => {
+        $crate::IndexSpec::Single($idx)
+    };
+
+    // Range without step: s![start, end]
+    ($start:expr, $end:expr) => {
+        $crate::IndexSpec::Range { start: $start, end: $end, step: None }
+    };
+
+    // Range with step: s![start, end, step]
+    ($start:expr, $end:expr, $step:expr) => {
+        $crate::IndexSpec::Range { start: $start, end: $end, step: Some($step) }
+    };
+
+    // NewAxis: s![NewAxis]
+    (NewAxis) => {
+        $crate::IndexSpec::NewAxis
+    };
+}
+
+impl UOp {
+    /// Multi-dimensional slicing with IndexSpec.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let buf = UOp::new_buffer(DeviceSpec::Cpu, 1000, DType::Float32);
+    /// let start = UOp::const_(DType::Int32, ConstValue::Int(0));
+    /// let end = UOp::const_(DType::Int32, ConstValue::Int(10));
+    ///
+    /// // Slice first 10 elements
+    /// let slice = UOp::slice(buf, vec![
+    ///     IndexSpec::Range { start, end, step: None }
+    /// ]);
+    /// ```
+    pub fn slice(buffer: Rc<Self>, specs: Vec<IndexSpec>) -> Result<Rc<Self>> {
+        let mut indices = Vec::new();
+
+        for spec in specs {
+            match spec {
+                IndexSpec::Single(idx) => {
+                    // Single index - just use it directly
+                    indices.push(idx);
+                }
+                IndexSpec::Range { start, end: _, step: _ } => {
+                    // Range indexing - for now, just use start as a simple index
+                    // TODO: Proper range expansion requires loop IR and range operations
+                    indices.push(start);
+                }
+                IndexSpec::Full => {
+                    // Full slice - skip (means "all elements")
+                    // TODO: Proper handling requires understanding dimension size
+                }
+                IndexSpec::NewAxis => {
+                    // NewAxis - adds dimension
+                    // TODO: Requires reshape operation
+                }
+            }
+        }
+
+        if indices.is_empty() {
+            // No actual indexing, just return buffer
+            Ok(buffer)
+        } else {
+            Self::index(buffer, indices)
+        }
+    }
+
+    /// Gated slicing - conditional access with gate.
+    ///
+    /// Similar to `slice` but with a boolean gate for conditional indexing.
+    pub fn slice_gated(buffer: Rc<Self>, specs: Vec<IndexSpec>, gate: Rc<Self>) -> Result<Rc<Self>> {
+        let mut indices = Vec::new();
+
+        for spec in specs {
+            match spec {
+                IndexSpec::Single(idx) => indices.push(idx),
+                IndexSpec::Range { start, .. } => indices.push(start),
+                IndexSpec::Full | IndexSpec::NewAxis => {}
+            }
+        }
+
+        if indices.is_empty() { Ok(buffer) } else { Self::index_gated(buffer, indices, gate) }
     }
 }
 
@@ -697,8 +1038,8 @@ mod test {
         let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
         // Create a + b twice
-        let add1 = UOp::add(a.clone(), b.clone());
-        let add2 = UOp::add(a.clone(), b.clone());
+        let add1 = UOp::try_add_op(a.clone(), b.clone()).unwrap();
+        let add2 = UOp::try_add_op(a.clone(), b.clone()).unwrap();
 
         // Should be the same object
         assert!(Rc::ptr_eq(&add1, &add2), "Hash consing should work with src nodes");
@@ -709,11 +1050,11 @@ mod test {
         let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
         let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-        let add = UOp::add(a.clone(), b.clone());
+        let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
         assert_eq!(add.dtype(), DType::Float32);
         assert_eq!(add.op().children().len(), 2);
 
-        let mul = UOp::mul(a.clone(), b.clone());
+        let mul = UOp::try_mul_op(a.clone(), b.clone()).unwrap();
         assert_eq!(mul.dtype(), DType::Float32);
     }
 
@@ -721,7 +1062,7 @@ mod test {
     fn test_unary_operations() {
         let a = UOp::const_(DType::Float32, ConstValue::Float(4.0));
 
-        let sqrt = UOp::sqrt(a.clone());
+        let sqrt = UOp::sqrt(&a);
         assert_eq!(sqrt.dtype(), DType::Float32);
         assert_eq!(sqrt.op().children().len(), 1);
     }
@@ -739,7 +1080,7 @@ mod test {
         let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
         let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-        let cmp = UOp::cmplt(a.clone(), b.clone());
+        let cmp = UOp::cmplt(&a, &b);
         assert_eq!(cmp.dtype(), DType::Bool);
     }
 
@@ -750,8 +1091,8 @@ mod test {
         let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
         let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
 
-        let add = UOp::add(a.clone(), b.clone());
-        let mul = UOp::mul(add.clone(), c.clone());
+        let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
+        let mul = UOp::try_mul_op(add.clone(), c.clone()).unwrap();
 
         let sorted = mul.toposort();
 
@@ -778,9 +1119,9 @@ mod test {
         let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
         let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
 
-        let x = UOp::add(a.clone(), b.clone());
-        let y = UOp::add(a.clone(), c.clone());
-        let z = UOp::mul(x.clone(), y.clone());
+        let x = UOp::try_add_op(a.clone(), b.clone()).unwrap();
+        let y = UOp::try_add_op(a.clone(), c.clone()).unwrap();
+        let z = UOp::try_mul_op(x.clone(), y.clone()).unwrap();
 
         let sorted = z.toposort();
 
@@ -831,9 +1172,9 @@ mod test {
     #[test]
     fn test_index_operation() {
         let buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-        let idx = UOp::const_(DType::Int32, ConstValue::Int(10));
+        let idx = UOp::const_(DType::Index, ConstValue::UInt(10));
 
-        let indexed = UOp::index(buf, vec![idx]);
+        let indexed = UOp::index(buf, vec![idx]).expect("index should succeed");
         assert!(matches!(indexed.op(), Op::Index { .. }));
         assert_eq!(indexed.op().children().len(), 2); // buffer + 1 index
     }
@@ -868,7 +1209,7 @@ mod test {
     fn test_children_method() {
         let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
         let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-        let add = UOp::add(a.clone(), b.clone());
+        let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
 
         let children = add.op().children();
         assert_eq!(children.len(), 2);
@@ -880,10 +1221,10 @@ mod test {
     fn test_for_each_child() {
         let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
         let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-        let add = UOp::add(a.clone(), b.clone());
+        let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
 
         let mut children = Vec::new();
-        add.op().for_each_child(|child| children.push(child.clone()));
+        add.op().map_child(|child| children.push(child.clone()));
 
         assert_eq!(children.len(), 2);
         assert!(Rc::ptr_eq(&children[0], &a));

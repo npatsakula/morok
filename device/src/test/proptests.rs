@@ -1,9 +1,9 @@
 use crate::Buffer;
 use crate::allocator::{Allocator, BufferOptions, CpuAllocator, LruAllocator};
-use morok_dtype::DType;
+use morok_dtype::{DType, ScalarDType};
 use proptest::prelude::*;
 use std::sync::Arc;
-use strum::IntoEnumIterator;
+use strum::VariantArray;
 use tinyvec::ArrayVec;
 
 /// Helper to create an LRU allocator for testing.
@@ -12,7 +12,7 @@ fn allocator() -> Arc<LruAllocator> {
 }
 
 /// A buffer specification for property-based testing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct BufferSpec {
     dtype: DType,
     shape: ArrayVec<[usize; 4]>,
@@ -25,9 +25,9 @@ impl BufferSpec {
         self.dtype.bytes() * self.shape.iter().product::<usize>()
     }
 
-    fn alloc<A: Allocator + 'static>(self, allocator: Arc<A>) -> Result<Buffer, crate::Error> {
+    fn alloc<A: Allocator + 'static>(&self, allocator: Arc<A>) -> Result<Buffer, crate::Error> {
         let options = BufferOptions { zero_init: self.zero_init, ..Default::default() };
-        Buffer::allocate(allocator, self.dtype, self.shape.to_vec(), options)
+        Buffer::allocate(allocator, self.dtype.clone(), self.shape.to_vec(), options)
     }
 }
 
@@ -36,7 +36,7 @@ impl Arbitrary for BufferSpec {
     type Strategy = BoxedStrategy<Self>;
 
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        (any::<DType>(), prop::collection::vec(1usize..50, 1..=4), any::<bool>())
+        (DType::scalar_generator(), prop::collection::vec(1usize..50, 1..=4), any::<bool>())
             .prop_map(|(dtype, shape, zero_init)| BufferSpec { dtype, shape: ArrayVec::from_iter(shape), zero_init })
             .prop_filter("total size must be reasonable", |spec| (1..=10 * 1024 * 1024).contains(&spec.size()))
             .boxed()
@@ -44,7 +44,13 @@ impl Arbitrary for BufferSpec {
 }
 
 fn same_size_dtypes(dtype: DType) -> impl Strategy<Value = DType> {
-    let dtypes = DType::iter().filter(|d| *d != dtype && d.bytes() == dtype.bytes()).collect::<Vec<_>>();
+    // Get all scalar dtypes and filter by byte size
+    let dtypes = ScalarDType::VARIANTS
+        .iter()
+        .filter(|s| s.bytes() == dtype.bytes())
+        .map(|s| DType::Scalar(*s))
+        .filter(|d| *d != dtype)
+        .collect::<Vec<_>>();
     proptest::sample::select(dtypes)
 }
 
@@ -55,11 +61,12 @@ fn same_size_dtypes(dtype: DType) -> impl Strategy<Value = DType> {
 fn same_size_specs() -> impl Strategy<Value = (BufferSpec, BufferSpec)> {
     any::<BufferSpec>().prop_flat_map(|spec| {
         let total_bytes = spec.size();
-        same_size_dtypes(spec.dtype).prop_map(move |dtype| {
+        let dtype = spec.dtype.clone();
+        same_size_dtypes(dtype).prop_map(move |dtype| {
             let num_elements = total_bytes / dtype.bytes();
             let shape = ArrayVec::from_iter(vec![num_elements]);
             let spec2 = BufferSpec { dtype, shape, zero_init: spec.zero_init };
-            (spec, spec2)
+            (spec.clone(), spec2)
         })
     })
 }
@@ -82,7 +89,7 @@ proptest! {
         let buffer2 = spec2.alloc(alloc)?;
 
         prop_assert_eq!(ptr1, buffer2.raw_data_ptr(), "buffer2 should reuse buffer1's RawBuffer from cache");
-        prop_assert_eq!(buffer2.dtype(), spec2.dtype, "dtype must be from spec2, not spec1");
+        prop_assert_eq!(buffer2.dtype(), spec2.dtype.clone(), "dtype must be from spec2, not spec1");
         prop_assert_eq!(buffer2.size(), spec2.size(), "size must be from spec2, not spec1");
     }
 
@@ -144,7 +151,7 @@ proptest! {
         {
             let _buffer1 = Buffer::allocate(
                 alloc.clone() as Arc<dyn Allocator>,
-                spec.dtype,
+                spec.dtype.clone(),
                 spec.shape.to_vec(),
                 BufferOptions { zero_init: false, cpu_accessible: false },
             )?;
@@ -156,7 +163,7 @@ proptest! {
         // Allocate with zero_init=true - should reuse from cache and zero it
         let _buffer2 = Buffer::allocate(
             alloc.clone() as Arc<dyn Allocator>,
-            spec.dtype,
+            spec.dtype.clone(),
             spec.shape.to_vec(),
             BufferOptions { zero_init: true, cpu_accessible: false },
         )?;

@@ -126,7 +126,7 @@ impl Buffer {
             data: Rc::clone(&self.data),
             offset: self.offset + offset,
             size,
-            dtype: self.dtype,
+            dtype: self.dtype.clone(),
             // For views, shape is not well-defined without reshaping logic
             shape: smallvec![size / self.dtype.bytes()],
             _not_send_sync: PhantomData,
@@ -155,7 +155,7 @@ impl Buffer {
 
     /// Get the data type.
     pub fn dtype(&self) -> DType {
-        self.dtype
+        self.dtype.clone()
     }
 
     /// Get the allocator used by this buffer.
@@ -321,26 +321,25 @@ impl Buffer {
                 RawBuffer::CudaUnified { data: dst_data, device: dst_device },
                 RawBuffer::CudaDevice { data: src_data, .. },
             ) => {
-                let mut dst_unified = dst_data.borrow_mut();
+                // let mut dst_unified = dst_data.borrow_mut();
                 let src_cuda = src_data.borrow();
                 let src_view = src_cuda.slice(src.offset..src.offset + src.size);
                 // Get CPU-accessible slice from unified memory
-                let dst_slice = dst_unified.as_mut_slice().context(CudaSnafu)?;
-                let dst_target = &mut dst_slice[self.offset..self.offset + self.size];
+                let mut dst_unified = dst_data.borrow_mut();
+                let mut dst_target = dst_unified.slice_mut(self.offset..self.offset + self.size);
                 // Copy directly from device to unified memory (via host access)
-                dst_device.default_stream().memcpy_dtoh(&src_view, dst_target).context(CudaSnafu)
+                dst_device.default_stream().memcpy_dtod(&src_view, &mut dst_target).context(CudaSnafu)
             }
             // CudaUnified -> CudaDevice (host-to-device memcpy)
             #[cfg(feature = "cuda")]
             (RawBuffer::CudaDevice { data: dst_data, device }, RawBuffer::CudaUnified { data: src_data, .. }) => {
                 let mut dst_cuda = dst_data.borrow_mut();
-                let src_unified = src_data.borrow();
                 let mut dst_view = dst_cuda.slice_mut(self.offset..self.offset + self.size);
                 // Get CPU-accessible slice from unified memory
-                let src_slice = src_unified.as_slice().context(CudaSnafu)?;
-                let src_source = &src_slice[src.offset..src.offset + src.size];
+                let src_unified = src_data.borrow();
+                let src_source = src_unified.slice(src.offset..src.offset + src.size);
                 // Copy directly from unified memory to device (via host access)
-                device.default_stream().memcpy_htod(src_source, &mut dst_view).context(CudaSnafu)
+                device.default_stream().memcpy_htod(&src_source, &mut dst_view).context(CudaSnafu)
             }
         }
     }

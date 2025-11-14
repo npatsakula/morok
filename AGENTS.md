@@ -3,6 +3,8 @@
 ## Task planning
 
 - Feel free to use multiple agents to explore different strategies and solutions.
+- You can find Tinygrad codebase at `submodules/tinygrad`; you can use it as source
+  of inspiration.
 - Avoid assumptions that are not supported by evidence; gather information using agents.
 - Keep the main context clear and perform hypothesis testing using agents.
 - Avoid fast/hacky solutions; make them robust and scalable.

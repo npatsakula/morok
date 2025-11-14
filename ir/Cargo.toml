@@ -8,3 +8,5 @@ edition.workspace = true
 morok-dtype = { path = "../dtype" }
 morok-device = { path = "../device" }
 smallvec = "1.15.1"
+snafu = "0.8.9"
+itertools = "0.14.0"
