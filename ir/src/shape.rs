@@ -13,8 +13,9 @@
 use std::rc::Rc;
 
 use smallvec::{SmallVec, smallvec};
+use snafu::ensure;
 
-use crate::{Error, Op, Result, SInt, UOp};
+use crate::{ConstValue, Op, Result, SInt, UOp, error::*};
 
 /// Shape type - sequence of symbolic integers.
 ///
@@ -34,7 +35,8 @@ pub type Shape = SmallVec<[SInt; 4]>;
 ///
 /// ```rust
 /// # use morok_ir::{SInt, shape::is_static};
-/// let shape = vec![SInt::from(3), SInt::from(4), SInt::from(5)];
+/// # use smallvec::smallvec;
+/// let shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
 /// assert!(is_static(&shape));
 /// ```
 pub fn is_static(shape: &Shape) -> bool {
@@ -47,11 +49,12 @@ pub fn is_static(shape: &Shape) -> bool {
 ///
 /// ```rust
 /// # use morok_ir::{SInt, shape::to_static};
-/// let shape = vec![SInt::from(3), SInt::from(4)];
-/// assert_eq!(to_static(&shape), Some(vec![3, 4]));
+/// # use smallvec::smallvec;
+/// let shape = smallvec![SInt::from(3), SInt::from(4)];
+/// assert_eq!(to_static(&shape), Some(smallvec![3, 4]));
 /// ```
-pub fn to_static(shape: &Shape) -> Option<Vec<usize>> {
-    if is_static(shape) { Some(shape.iter().map(|dim| dim.as_const().unwrap()).collect()) } else { None }
+pub fn to_static(shape: &Shape) -> Option<SmallVec<[usize; 4]>> {
+    is_static(shape).then_some(shape.iter().map(|dim| dim.as_const().unwrap()).collect())
 }
 
 // =========================================================================
@@ -64,21 +67,15 @@ pub fn to_static(shape: &Shape) -> Option<Vec<usize>> {
 /// Returns error if any dimension is negative or zero.
 ///
 /// # Examples
-///
 /// ```rust
 /// # use morok_ir::shape::validate_shape;
 /// let valid = vec![1, 2, 3];
 /// assert!(validate_shape(&valid).is_ok());
-///
 /// let invalid = vec![1, -2, 3];
 /// assert!(validate_shape(&invalid).is_err());
 /// ```
-pub fn validate_shape(shape: &[isize]) -> Result<Vec<usize>> {
-    use crate::error::ReshapeNegativeDimensionSnafu;
-    use snafu::ensure;
-
-    ensure!(shape.iter().all(|&s| s > 0), ReshapeNegativeDimensionSnafu { shape: shape.to_vec() });
-
+pub fn validate_shape(shape: &[isize]) -> Result<SmallVec<[usize; 4]>> {
+    ensure!(shape.iter().all(|&s| s > 0), ReshapeNegativeDimensionSnafu { shape });
     Ok(shape.iter().map(|&s| s as usize).collect())
 }
 
@@ -86,7 +83,7 @@ pub fn validate_shape(shape: &[isize]) -> Result<Vec<usize>> {
 ///
 /// Uses pointer equality for symbolic dimensions (consistent with hash consing).
 pub fn shapes_equal(lhs: &Shape, rhs: &Shape) -> bool {
-    lhs.len() == rhs.len() && lhs.iter().zip(rhs.iter()).all(|(l, r)| l == r)
+    lhs == rhs
 }
 
 /// Check if all shapes in a slice are equal.
@@ -95,16 +92,14 @@ pub fn shapes_equal(lhs: &Shape, rhs: &Shape) -> bool {
 ///
 /// ```rust
 /// # use morok_ir::{SInt, shape::all_shapes_equal};
-/// let shape1 = vec![SInt::from(3), SInt::from(4)];
-/// let shape2 = vec![SInt::from(3), SInt::from(4)];
-/// let shape3 = vec![SInt::from(3), SInt::from(4)];
+/// # use smallvec::smallvec;
+/// let shape1 = smallvec![SInt::from(3), SInt::from(4)];
+/// let shape2 = smallvec![SInt::from(3), SInt::from(4)];
+/// let shape3 = smallvec![SInt::from(3), SInt::from(4)];
 /// assert!(all_shapes_equal(&[shape1, shape2, shape3]));
 /// ```
 pub fn all_shapes_equal(shapes: &[Shape]) -> bool {
-    if shapes.is_empty() {
-        return true;
-    }
-    shapes.iter().all(|s| shapes_equal(s, &shapes[0]))
+    (!shapes.is_empty()) && shapes.iter().all(|s| shapes_equal(s, &shapes[0]))
 }
 
 // =========================================================================
@@ -120,8 +115,9 @@ pub fn all_shapes_equal(shapes: &[Shape]) -> bool {
 ///
 /// ```rust
 /// # use morok_ir::{SInt, shape::align_shapes_left};
-/// let shape1 = vec![SInt::from(5)];
-/// let shape2 = vec![SInt::from(3), SInt::from(5)];
+/// # use smallvec::smallvec;
+/// let shape1 = smallvec![SInt::from(5)];
+/// let shape2 = smallvec![SInt::from(3), SInt::from(5)];
 /// let aligned = align_shapes_left(&[shape1, shape2]);
 /// assert_eq!(aligned.len(), 2);
 /// assert_eq!(aligned[0].len(), 2); // [1, 5]
@@ -156,11 +152,12 @@ pub fn align_shapes_left(shapes: &[Shape]) -> Vec<Shape> {
 ///
 /// ```rust
 /// # use morok_ir::{SInt, shape::can_broadcast};
-/// let shape1 = vec![SInt::from(1), SInt::from(5)];
-/// let shape2 = vec![SInt::from(3), SInt::from(5)];
+/// # use smallvec::smallvec;
+/// let shape1 = smallvec![SInt::from(1), SInt::from(5)];
+/// let shape2 = smallvec![SInt::from(3), SInt::from(5)];
 /// assert!(can_broadcast(&shape1, &shape2));
 ///
-/// let shape3 = vec![SInt::from(3), SInt::from(4)];
+/// let shape3 = smallvec![SInt::from(3), SInt::from(4)];
 /// assert!(!can_broadcast(&shape1, &shape3));
 /// ```
 pub fn can_broadcast(lhs: &Shape, rhs: &Shape) -> bool {
@@ -195,8 +192,9 @@ pub fn can_broadcast(lhs: &Shape, rhs: &Shape) -> bool {
 ///
 /// ```rust
 /// # use morok_ir::{SInt, shape::broadcast_shape};
-/// let shape1 = vec![SInt::from(1), SInt::from(5)];
-/// let shape2 = vec![SInt::from(3), SInt::from(5)];
+/// # use smallvec::smallvec;
+/// let shape1 = smallvec![SInt::from(1), SInt::from(5)];
+/// let shape2 = smallvec![SInt::from(3), SInt::from(5)];
 /// let result = broadcast_shape(&shape1, &shape2).unwrap();
 /// assert_eq!(result[0].as_const(), Some(3));
 /// assert_eq!(result[1].as_const(), Some(5));
@@ -205,10 +203,7 @@ pub fn broadcast_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape> {
     use crate::error::BroadcastShapeMismatchSnafu;
     use snafu::ensure;
 
-    ensure!(
-        lhs.len() == rhs.len(),
-        BroadcastShapeMismatchSnafu { lhs: format!("{:?}", lhs), rhs: format!("{:?}", rhs) }
-    );
+    ensure!(lhs.len() == rhs.len(), BroadcastShapeMismatchSnafu { lhs: lhs.clone(), rhs: rhs.clone() });
 
     let mut result = SmallVec::with_capacity(lhs.len());
 
@@ -223,7 +218,7 @@ pub fn broadcast_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape> {
             } else if rv == 1 || lv == rv {
                 result.push(l.clone());
             } else {
-                return Err(Error::BroadcastShapeMismatch { lhs: format!("{:?}", lhs), rhs: format!("{:?}", rhs) });
+                return BroadcastShapeMismatchSnafu { lhs: lhs.clone(), rhs: rhs.clone() }.fail();
             }
         } else {
             // At least one is symbolic - use max (conservatively)
@@ -268,19 +263,12 @@ pub fn broadcast_shapes(shapes: &[Shape]) -> Result<Shape> {
 fn extract_shape_from_uop(shape_uop: &Rc<UOp>) -> Option<Shape> {
     match shape_uop.op() {
         // VECTORIZE with Index-typed elements
-        Op::Vectorize { elements } => {
-            let mut dims = SmallVec::with_capacity(elements.len());
-            for elem in elements {
-                // Each element should be an Index UOp (const or symbolic)
-                dims.push(SInt::from(elem.clone()));
-            }
-            Some(dims)
-        }
+        Op::Vectorize { elements } => Some(elements.into_iter().cloned().map(SInt::from).collect()),
 
         // Single CONST value (for 1D shapes)
         Op::Const(const_hash) => match const_hash.0 {
-            crate::ConstValue::Int(v) if v >= 0 => Some(smallvec![SInt::from(v as usize)]),
-            crate::ConstValue::UInt(v) => Some(smallvec![SInt::from(v as usize)]),
+            ConstValue::Int(v) if v >= 0 => Some(smallvec![SInt::from(v as usize)]),
+            ConstValue::UInt(v) => Some(smallvec![SInt::from(v as usize)]),
             _ => None,
         },
 
@@ -289,8 +277,8 @@ fn extract_shape_from_uop(shape_uop: &Rc<UOp>) -> Option<Shape> {
             let mut dims = SmallVec::with_capacity(values.len());
             for val in values {
                 match val {
-                    crate::ConstValue::Int(v) if *v >= 0 => dims.push(SInt::from(*v as usize)),
-                    crate::ConstValue::UInt(v) => dims.push(SInt::from(*v as usize)),
+                    ConstValue::Int(v) if *v >= 0 => dims.push(SInt::from(*v as usize)),
+                    ConstValue::UInt(v) => dims.push(SInt::from(*v as usize)),
                     _ => return None,
                 }
             }
@@ -325,7 +313,8 @@ fn extract_ranges_from_uops(begins_uop: &Rc<UOp>, ends_uop: &Rc<UOp>) -> Option<
 /// ```rust
 /// # use morok_ir::{SInt, shape::shape_to_uop};
 /// # use morok_dtype::DType;
-/// let shape = vec![SInt::from(3), SInt::from(4), SInt::from(5)];
+/// # use smallvec::smallvec;
+/// let shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
 /// let shape_uop = shape_to_uop(&shape);
 /// assert_eq!(shape_uop.dtype(), DType::Index.vec(3));
 /// ```
@@ -390,9 +379,12 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         // =====================================================================
         Op::Const(_) => Some(SmallVec::new()), // Scalar has empty shape
 
-        Op::VConst { values } => Some(smallvec![SInt::from(values.len())]),
+        Op::VConst { .. } => None,
 
-        Op::Unique(_) | Op::Device(_) | Op::Noop | Op::DefineGlobal(_) | Op::DefineLocal(_) => None,
+        Op::Unique(_) | Op::Device(_) | Op::Noop => None,
+
+        // Define operations have shape (size,)
+        Op::DefineGlobal(size) | Op::DefineLocal(size) => Some(smallvec![SInt::from(*size)]),
 
         // =====================================================================
         // Unary operations - preserve shape
@@ -430,9 +422,9 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         Op::Cast { src, .. } | Op::BitCast { src, .. } => src.shape().cloned(),
 
         // =====================================================================
-        // Vector operations
+        // Vector operations (kernel-level, no tensor shape)
         // =====================================================================
-        Op::Vectorize { elements } => Some(smallvec![SInt::from(elements.len())]),
+        Op::Vectorize { .. } => None,
 
         Op::Gep { .. } => Some(SmallVec::new()), // Extract element from vector -> scalar
 
@@ -517,7 +509,9 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         }
 
         Op::Multi { src, .. } => {
-            // Multi preserves shape
+            // Multi scales the specified axis by device count
+            // TODO: Need device count from somewhere - for now preserve shape
+            // Tinygrad: tuple(s*len(self.device) if a == self.axis else s for a,s in enumerate(ps))
             src.shape().cloned()
         }
 
@@ -526,8 +520,14 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         // =====================================================================
         Op::ReduceAxis { axes, src, .. } => {
             let src_shape = src.shape()?;
-            // Remove reduced axes
-            Some(src_shape.iter().enumerate().filter(|(i, _)| !axes.contains(i)).map(|(_, dim)| dim.clone()).collect())
+            // Set reduced axes to 1 (don't remove them - matches Tinygrad)
+            Some(
+                src_shape
+                    .iter()
+                    .enumerate()
+                    .map(|(i, dim)| if axes.contains(&i) { SInt::from(1) } else { dim.clone() })
+                    .collect(),
+            )
         }
 
         Op::Reduce { .. } => {
@@ -543,12 +543,17 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         // =====================================================================
         // Buffer and memory operations - shape depends on buffer
         // =====================================================================
-        Op::Buffer { .. }
-        | Op::BufferView { .. }
-        | Op::Bufferize { .. }
+        // Buffer operations have shape (size,)
+        Op::Buffer { size, .. } => Some(smallvec![SInt::from(*size)]),
+        Op::BufferView { size, .. } => Some(smallvec![SInt::from(*size)]),
+
+        // Passthrough operations
+        Op::Copy { src, .. } => src.shape().cloned(),
+        Op::MStack { buffers } => buffers.first().and_then(|b| b.shape().cloned()),
+
+        // These have no shape
+        Op::Bufferize { .. }
         | Op::Index { .. }
-        | Op::Copy { .. }
-        | Op::MStack { .. }
         | Op::Load { .. }
         | Op::LoadGated { .. }
         | Op::Store { .. }
@@ -557,20 +562,24 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         // =====================================================================
         // Control flow - no static shape
         // =====================================================================
-        Op::If { .. } | Op::EndIf { .. } | Op::Range { .. } | Op::End { .. } | Op::Barrier { .. } => None,
+        Op::If { .. } | Op::EndIf { .. } | Op::Range { .. } | Op::Barrier { .. } => None,
+
+        // End passes through the source shape
+        Op::End { range_or_reduce } => range_or_reduce.shape().cloned(),
 
         // =====================================================================
         // Special operations
         // =====================================================================
-        Op::MSelect { .. } => None,
+        // MSelect passes through buffer shape
+        Op::MSelect { buffer, .. } => buffer.shape().cloned(),
 
-        Op::Special { .. } => Some(SmallVec::new()), // Special returns index (scalar)
+        Op::Special { .. } => None,
 
         Op::DefineVar { .. } => Some(SmallVec::new()), // Variable is scalar
 
         Op::Bind { value, .. } => value.shape().cloned(),
 
-        Op::DefineReg { .. } => None,
+        Op::DefineReg { size } => Some(smallvec![SInt::from(*size)]),
 
         // =====================================================================
         // Advanced operations
@@ -591,180 +600,18 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         Op::After { passthrough, .. } => passthrough.shape().cloned(),
 
         Op::Custom { .. } | Op::CustomI { .. } => None,
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ConstValue, UOp};
-    use morok_dtype::DType;
+        // Graph organization operations have no shape
+        Op::Sink { .. } => None,
+        Op::Group { sources } => {
+            // Group passes through first source's shape
+            sources.first().and_then(|src| src.shape().cloned())
+        }
 
-    #[test]
-    fn test_is_static() {
-        let static_shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
-        assert!(is_static(&static_shape));
+        // PointerIndex is a scalar index operation (no shape)
+        Op::PointerIndex { .. } => Some(smallvec![]),
 
-        // Note: Const UOps are automatically simplified to SInt::Const
-        // To get a truly symbolic dimension, we need a non-const UOp
-        // For now, just test with concrete values
-        let also_static = smallvec![SInt::from(3), SInt::from(10)];
-        assert!(is_static(&also_static));
-    }
-
-    #[test]
-    fn test_to_static() {
-        let shape = smallvec![SInt::from(3), SInt::from(4)];
-        assert_eq!(to_static(&shape), Some(vec![3, 4]));
-
-        // Note: Const UOps are automatically simplified, so we'd need
-        // a truly symbolic UOp (like from an operation) to test dynamic shapes
-        // For now, just verify static conversion works
-        let shape2 = smallvec![SInt::from(5), SInt::from(6), SInt::from(7)];
-        assert_eq!(to_static(&shape2), Some(vec![5, 6, 7]));
-    }
-
-    #[test]
-    fn test_ndim() {
-        let shape: Shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
-        assert_eq!(shape.len(), 3);
-    }
-
-    #[test]
-    fn test_shape_product() {
-        let shape: Shape = smallvec![SInt::from(2), SInt::from(3), SInt::from(4)];
-        let product = crate::sint_prod(&shape);
-        assert_eq!(product.as_const(), Some(24));
-    }
-
-    #[test]
-    fn test_validate_shape() {
-        assert!(validate_shape(&[1, 2, 3]).is_ok());
-        assert!(validate_shape(&[1, -2, 3]).is_err());
-        assert!(validate_shape(&[1, 0, 3]).is_err());
-    }
-
-    #[test]
-    fn test_shapes_equal() {
-        let shape1 = smallvec![SInt::from(3), SInt::from(4)];
-        let shape2 = smallvec![SInt::from(3), SInt::from(4)];
-        assert!(shapes_equal(&shape1, &shape2));
-
-        let shape3 = smallvec![SInt::from(3), SInt::from(5)];
-        assert!(!shapes_equal(&shape1, &shape3));
-    }
-
-    #[test]
-    fn test_all_shapes_equal() {
-        let shape1 = smallvec![SInt::from(3), SInt::from(4)];
-        let shape2 = smallvec![SInt::from(3), SInt::from(4)];
-        let shape3 = smallvec![SInt::from(3), SInt::from(4)];
-        assert!(all_shapes_equal(&[shape1, shape2, shape3]));
-    }
-
-    #[test]
-    fn test_align_shapes_left() {
-        let shape1 = smallvec![SInt::from(5)];
-        let shape2 = smallvec![SInt::from(3), SInt::from(5)];
-        let aligned = align_shapes_left(&[shape1, shape2]);
-
-        assert_eq!(aligned.len(), 2);
-        assert_eq!(aligned[0].len(), 2);
-        assert_eq!(aligned[0][0].as_const(), Some(1));
-        assert_eq!(aligned[0][1].as_const(), Some(5));
-    }
-
-    #[test]
-    fn test_can_broadcast() {
-        let shape1 = smallvec![SInt::from(1), SInt::from(5)];
-        let shape2 = smallvec![SInt::from(3), SInt::from(5)];
-        assert!(can_broadcast(&shape1, &shape2));
-
-        let shape3 = smallvec![SInt::from(3), SInt::from(4)];
-        assert!(!can_broadcast(&shape1, &shape3));
-    }
-
-    #[test]
-    fn test_broadcast_shape() {
-        let shape1 = smallvec![SInt::from(1), SInt::from(5)];
-        let shape2 = smallvec![SInt::from(3), SInt::from(5)];
-        let result = broadcast_shape(&shape1, &shape2).unwrap();
-
-        assert_eq!(result[0].as_const(), Some(3));
-        assert_eq!(result[1].as_const(), Some(5));
-    }
-
-    #[test]
-    fn test_broadcast_shape_error() {
-        let shape1 = smallvec![SInt::from(3), SInt::from(4)];
-        let shape2 = smallvec![SInt::from(3), SInt::from(5)];
-        assert!(broadcast_shape(&shape1, &shape2).is_err());
-    }
-
-    #[test]
-    fn test_broadcast_shapes_multiple() {
-        let shape1 = smallvec![SInt::from(1), SInt::from(5)];
-        let shape2 = smallvec![SInt::from(3), SInt::from(1)];
-        let shape3 = smallvec![SInt::from(3), SInt::from(5)];
-
-        let result = broadcast_shapes(&[shape1, shape2, shape3]).unwrap();
-        assert_eq!(result[0].as_const(), Some(3));
-        assert_eq!(result[1].as_const(), Some(5));
-    }
-
-    // =====================================================================
-    // Shape Inference Tests
-    // =====================================================================
-
-    #[test]
-    fn test_infer_const_shape() {
-        let scalar = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-        let shape = scalar.shape().expect("Const should have shape");
-        assert_eq!(shape.len(), 0); // Scalar has empty shape
-    }
-
-    #[test]
-    fn test_infer_vconst_shape() {
-        let values =
-            vec![ConstValue::Float(1.0), ConstValue::Float(2.0), ConstValue::Float(3.0), ConstValue::Float(4.0)];
-        let vec = UOp::new(crate::Op::VConst { values: values.clone() }, DType::Float32.vec(4));
-        let shape = vec.shape().expect("VConst should have shape");
-        assert_eq!(shape.len(), 1);
-        assert_eq!(shape[0].as_const(), Some(4));
-    }
-
-    #[test]
-    fn test_infer_unary_shape() {
-        let val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
-        let neg = UOp::neg_op(val);
-        let shape = neg.shape().expect("Unary should have shape");
-        assert_eq!(shape.len(), 0); // Preserves scalar shape
-    }
-
-    #[test]
-    fn test_infer_binary_shape() {
-        let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-        let add = UOp::try_add_op(a, b).unwrap();
-        let shape = add.shape().expect("Binary should have shape");
-        assert_eq!(shape.len(), 0); // Both scalars -> scalar result
-    }
-
-    #[test]
-    fn test_infer_cast_shape() {
-        let val = UOp::const_(DType::Float32, ConstValue::Float(1.5));
-        let cast = UOp::cast(val, DType::Int32);
-        let shape = cast.shape().expect("Cast should preserve shape");
-        assert_eq!(shape.len(), 0);
-    }
-
-    #[test]
-    fn test_shape_caching() {
-        let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        // First access computes shape
-        let shape1 = val.shape().expect("Should have shape");
-        // Second access uses cached value (same pointer)
-        let shape2 = val.shape().expect("Should have cached shape");
-        assert!(std::ptr::eq(shape1, shape2), "Shape should be cached");
+        // Cat and PtrCat are kernel-level vector ops (no tensor shape)
+        Op::Cat { .. } | Op::PtrCat { .. } => None,
     }
 }

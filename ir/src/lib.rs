@@ -7,6 +7,9 @@ use std::rc::{Rc, Weak};
 use smallvec::SmallVec;
 use snafu::ensure;
 
+#[cfg(test)]
+pub mod test;
+
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
 
@@ -112,7 +115,6 @@ pub enum ReduceOp {
 /// Unary operation types.
 ///
 /// All unary operations preserve the input dtype.
-/// Not requires int/bool dtype.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     /// Negation: -x
@@ -123,8 +125,6 @@ pub enum UnaryOp {
     Exp2,
     /// Base-2 logarithm: log₂(x)
     Log2,
-    /// Bitwise NOT: ~x (int/bool only)
-    Not,
     /// Sine: sin(x) (float only)
     Sin,
     /// Reciprocal: 1/x
@@ -135,7 +135,7 @@ pub enum UnaryOp {
 
 /// Binary operation types.
 ///
-/// Arithmetic operations (Add, Mul, Sub, Div, Rem, Max, Pow, Idiv, Fdiv) preserve the LHS dtype.
+/// Arithmetic operations (Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv) preserve the LHS dtype.
 /// Comparison operations (Lt, Eq, Ne) always return DType::Bool.
 /// Bitwise operations (And, Or, Xor, Shl, Shr) preserve dtype and require int/bool types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -147,17 +147,32 @@ pub enum BinaryOp {
     Mul,
     /// Subtraction: a - b
     Sub,
-    /// Division: a / b (generic)
-    Div,
-    /// Remainder/Modulo: a % b
-    Rem,
+    /// Modulo: a % b (C-style remainder)
+    ///
+    /// Uses C/Rust semantics where result has the sign of the dividend (first operand).
+    /// This matches Tinygrad's MOD and C's % operator.
+    ///
+    /// **NOT** Python's modulo operator (which has sign of the divisor).
+    ///
+    /// Examples: -9 % 5 = -4 (Python gives 1), 9 % -5 = 4 (Python gives -1)
+    Mod,
     /// Maximum: max(a, b)
     Max,
     /// Power: a^b
     Pow,
-    /// Integer division: a // b (truncated)
+    /// Integer division: a / b (truncated toward zero)
+    ///
+    /// Uses C-style truncation, NOT floor division.
+    /// This matches Tinygrad's IDIV and C's / operator for integers.
+    ///
+    /// **NOT** Python's // floor division (which rounds toward -∞).
+    ///
+    /// Examples: -9 / 5 = -1 (Python's // gives -2), 9 / -5 = -1 (Python's // gives -2)
     Idiv,
-    /// Float division: a / b (exact float division)
+    /// Float division: a / b (exact IEEE 754 division)
+    ///
+    /// Only used for float dtypes. Performs exact floating-point division.
+    /// Matches Tinygrad's FDIV.
     Fdiv,
 
     // Comparison operations
@@ -193,10 +208,7 @@ impl BinaryOp {
 
     /// Returns true if this is an arithmetic operation.
     pub fn is_arithmetic(self) -> bool {
-        matches!(
-            self,
-            Self::Add | Self::Mul | Self::Sub | Self::Div | Self::Rem | Self::Max | Self::Pow | Self::Idiv | Self::Fdiv
-        )
+        matches!(self, Self::Add | Self::Mul | Self::Sub | Self::Mod | Self::Max | Self::Pow | Self::Idiv | Self::Fdiv)
     }
 
     /// Returns true if this is a bitwise operation.
@@ -311,77 +323,247 @@ pub enum Op {
     DefineGlobal(usize),
     DefineLocal(usize),
 
+    // Graph organization operations (2 variants)
+    Sink {
+        sources: SmallVec<[Rc<UOp>; 4]>,
+    },
+    Group {
+        sources: SmallVec<[Rc<UOp>; 4]>,
+    },
+
     // Grouped operations (3 variants)
     Unary(UnaryOp, Rc<UOp>),
     Binary(BinaryOp, Rc<UOp>, Rc<UOp>),
     Ternary(TernaryOp, Rc<UOp>, Rc<UOp>, Rc<UOp>),
 
     // Type operations (2 variants)
-    Cast { src: Rc<UOp>, dtype: DType },
-    BitCast { src: Rc<UOp>, dtype: DType },
+    Cast {
+        src: Rc<UOp>,
+        dtype: DType,
+    },
+    BitCast {
+        src: Rc<UOp>,
+        dtype: DType,
+    },
 
     // Special operations (2 variants)
-    MSelect { buffer: Rc<UOp>, device_index: usize },
-    Special { end: Rc<UOp>, name: String },
+    MSelect {
+        buffer: Rc<UOp>,
+        device_index: usize,
+    },
+    Special {
+        end: Rc<UOp>,
+        name: String,
+    },
 
-    // Buffer operations (high-level, 6 variants)
-    Buffer { unique: Rc<UOp>, device: Rc<UOp>, size: usize },
-    BufferView { buffer: Rc<UOp>, size: usize, offset: usize },
-    Bufferize { compute: Rc<UOp>, ranges: SmallVec<[Rc<UOp>; 4]>, opts: BufferizeOpts },
-    Index { buffer: Rc<UOp>, indices: SmallVec<[Rc<UOp>; 4]>, gate: Option<Rc<UOp>> },
-    Copy { src: Rc<UOp>, device: Rc<UOp> },
-    MStack { buffers: SmallVec<[Rc<UOp>; 4]> },
+    // Buffer operations (high-level, 7 variants)
+    Buffer {
+        unique: Rc<UOp>,
+        device: Rc<UOp>,
+        size: usize,
+    },
+    BufferView {
+        buffer: Rc<UOp>,
+        size: usize,
+        offset: usize,
+    },
+    Bufferize {
+        compute: Rc<UOp>,
+        ranges: SmallVec<[Rc<UOp>; 4]>,
+        opts: BufferizeOpts,
+    },
+    Index {
+        buffer: Rc<UOp>,
+        indices: SmallVec<[Rc<UOp>; 4]>,
+        gate: Option<Rc<UOp>>,
+    },
+    PointerIndex {
+        ptr: Rc<UOp>,
+        offset: Rc<UOp>,
+    },
+    Copy {
+        src: Rc<UOp>,
+        device: Rc<UOp>,
+    },
+    MStack {
+        buffers: SmallVec<[Rc<UOp>; 4]>,
+    },
 
     // Movement/Reshape operations (7 variants)
-    Reshape { src: Rc<UOp>, new_shape: Rc<UOp> },
-    Permute { src: Rc<UOp>, axes: Vec<usize> },
-    Expand { src: Rc<UOp>, new_shape: Rc<UOp> },
-    Pad { src: Rc<UOp>, begin_pads: Rc<UOp>, end_pads: Rc<UOp> },
-    Shrink { src: Rc<UOp>, begins: Rc<UOp>, ends: Rc<UOp> },
-    Flip { src: Rc<UOp>, axes: Vec<bool> },
-    Multi { src: Rc<UOp>, axis: usize },
+    Reshape {
+        src: Rc<UOp>,
+        new_shape: Rc<UOp>,
+    },
+    Permute {
+        src: Rc<UOp>,
+        axes: Vec<usize>,
+    },
+    Expand {
+        src: Rc<UOp>,
+        new_shape: Rc<UOp>,
+    },
+    Pad {
+        src: Rc<UOp>,
+        begin_pads: Rc<UOp>,
+        end_pads: Rc<UOp>,
+    },
+    Shrink {
+        src: Rc<UOp>,
+        begins: Rc<UOp>,
+        ends: Rc<UOp>,
+    },
+    Flip {
+        src: Rc<UOp>,
+        axes: Vec<bool>,
+    },
+    Multi {
+        src: Rc<UOp>,
+        axis: usize,
+    },
 
     // Reduction operations (3 variants)
-    ReduceAxis { src: Rc<UOp>, reduce_op: ReduceOp, axes: Vec<usize> },
-    Reduce { src: Rc<UOp>, ranges: SmallVec<[Rc<UOp>; 4]>, reduce_op: ReduceOp },
-    AllReduce { src: Rc<UOp>, device: Rc<UOp>, reduce_op: ReduceOp },
+    ReduceAxis {
+        src: Rc<UOp>,
+        reduce_op: ReduceOp,
+        axes: Vec<usize>,
+    },
+    Reduce {
+        src: Rc<UOp>,
+        ranges: SmallVec<[Rc<UOp>; 4]>,
+        reduce_op: ReduceOp,
+    },
+    AllReduce {
+        src: Rc<UOp>,
+        device: Rc<UOp>,
+        reduce_op: ReduceOp,
+    },
 
     // Control flow operations (5 variants)
-    If { condition: Rc<UOp>, body: SmallVec<[Rc<UOp>; 4]> },
-    EndIf { if_op: Rc<UOp> },
-    Range { end: Rc<UOp>, axis_id: usize, axis_type: AxisType },
-    End { range_or_reduce: Rc<UOp> },
-    Barrier { src: Rc<UOp>, deps: SmallVec<[Rc<UOp>; 4]> },
+    If {
+        condition: Rc<UOp>,
+        body: SmallVec<[Rc<UOp>; 4]>,
+    },
+    EndIf {
+        if_op: Rc<UOp>,
+    },
+    Range {
+        end: Rc<UOp>,
+        axis_id: usize,
+        axis_type: AxisType,
+    },
+    End {
+        range_or_reduce: Rc<UOp>,
+    },
+    Barrier {
+        src: Rc<UOp>,
+        deps: SmallVec<[Rc<UOp>; 4]>,
+    },
 
-    // Vector operations (3 variants)
-    Vectorize { elements: SmallVec<[Rc<UOp>; 4]> },
-    Gep { vector: Rc<UOp>, indices: Vec<usize> },
-    VConst { values: Vec<ConstValue> },
+    // Vector operations (5 variants)
+    Vectorize {
+        elements: SmallVec<[Rc<UOp>; 4]>,
+    },
+    Gep {
+        vector: Rc<UOp>,
+        indices: Vec<usize>,
+    },
+    VConst {
+        values: Vec<ConstValue>,
+    },
+    /// Concatenate vectors into larger vector (expander op).
+    /// Like VECTORIZE but sources can be vectors themselves.
+    /// Output vcount = sum of all input vcounts.
+    Cat {
+        sources: SmallVec<[Rc<UOp>; 4]>,
+    },
+    /// Concatenate pointers into vectorized pointer (expander op).
+    /// Used for grouping memory accesses in devectorizer.
+    PtrCat {
+        sources: SmallVec<[Rc<UOp>; 4]>,
+    },
 
     // Symbolic/Define operations (3 variants)
-    DefineVar { name: String, min_val: i64, max_val: i64 },
-    Bind { var: Rc<UOp>, value: Rc<UOp> },
-    DefineReg { size: usize },
+    DefineVar {
+        name: String,
+        min_val: i64,
+        max_val: i64,
+    },
+    Bind {
+        var: Rc<UOp>,
+        value: Rc<UOp>,
+    },
+    DefineReg {
+        size: usize,
+    },
 
     // Advanced operations (12 variants)
-    Wmma { a: Rc<UOp>, b: Rc<UOp>, c: Rc<UOp>, metadata: WmmaMetadata },
-    Contract { src: Rc<UOp>, upcast_ranges: Vec<(usize, usize)> },
-    Unroll { src: Rc<UOp>, unroll_axes: Vec<(usize, usize)> },
-    Kernel { ast: Option<Rc<UOp>> },
-    Assign { target: Rc<UOp>, value: Rc<UOp> },
-    Detach { src: Rc<UOp> },
-    Contiguous { src: Rc<UOp> },
-    ContiguousBackward { src: Rc<UOp> },
-    After { passthrough: Rc<UOp>, deps: SmallVec<[Rc<UOp>; 4]> },
-    Precast { src: Rc<UOp> },
-    Custom { deps: SmallVec<[Rc<UOp>; 4]>, code: String },
-    CustomI { deps: SmallVec<[Rc<UOp>; 4]>, code: String },
+    Wmma {
+        a: Rc<UOp>,
+        b: Rc<UOp>,
+        c: Rc<UOp>,
+        metadata: WmmaMetadata,
+    },
+    Contract {
+        src: Rc<UOp>,
+        upcast_ranges: Vec<(usize, usize)>,
+    },
+    Unroll {
+        src: Rc<UOp>,
+        unroll_axes: Vec<(usize, usize)>,
+    },
+    Kernel {
+        ast: Option<Rc<UOp>>,
+    },
+    Assign {
+        target: Rc<UOp>,
+        value: Rc<UOp>,
+    },
+    Detach {
+        src: Rc<UOp>,
+    },
+    Contiguous {
+        src: Rc<UOp>,
+    },
+    ContiguousBackward {
+        src: Rc<UOp>,
+    },
+    After {
+        passthrough: Rc<UOp>,
+        deps: SmallVec<[Rc<UOp>; 4]>,
+    },
+    Precast {
+        src: Rc<UOp>,
+    },
+    Custom {
+        deps: SmallVec<[Rc<UOp>; 4]>,
+        code: String,
+    },
+    CustomI {
+        deps: SmallVec<[Rc<UOp>; 4]>,
+        code: String,
+    },
 
     // Memory operations (low-level, after kernel splitting, 4 variants)
-    Load { buffer: Rc<UOp>, index: Rc<UOp> },
-    LoadGated { buffer: Rc<UOp>, index: Rc<UOp>, gate: Rc<UOp> },
-    Store { buffer: Rc<UOp>, index: Rc<UOp>, value: Rc<UOp> },
-    StoreGated { buffer: Rc<UOp>, index: Rc<UOp>, value: Rc<UOp>, gate: Rc<UOp> },
+    Load {
+        buffer: Rc<UOp>,
+        index: Rc<UOp>,
+    },
+    LoadGated {
+        buffer: Rc<UOp>,
+        index: Rc<UOp>,
+        gate: Rc<UOp>,
+    },
+    Store {
+        buffer: Rc<UOp>,
+        index: Rc<UOp>,
+        value: Rc<UOp>,
+    },
+    StoreGated {
+        buffer: Rc<UOp>,
+        index: Rc<UOp>,
+        value: Rc<UOp>,
+        gate: Rc<UOp>,
+    },
 }
 
 impl Op {
@@ -401,6 +583,9 @@ impl Op {
             | Self::VConst { .. }
             | Self::DefineVar { .. }
             | Self::DefineReg { .. } => SmallVec::new(),
+
+            // Graph organization operations
+            Self::Sink { sources } | Self::Group { sources } => sources.iter().collect(),
 
             // Grouped operations
             Self::Unary(_, x) => SmallVec::from_slice(&[x]),
@@ -428,6 +613,7 @@ impl Op {
                 children.extend(gate);
                 children
             }
+            Self::PointerIndex { ptr, offset } => SmallVec::from_slice(&[ptr, offset]),
             Self::Copy { src, device } => SmallVec::from_slice(&[src, device]),
             Self::MStack { buffers } => buffers.iter().collect(),
 
@@ -467,6 +653,7 @@ impl Op {
             // Vector operations
             Self::Vectorize { elements } => elements.iter().collect(),
             Self::Gep { vector, .. } => SmallVec::from_slice(&[vector]),
+            Self::Cat { sources } | Self::PtrCat { sources } => sources.iter().collect(),
 
             // Symbolic/Define operations
             Self::Bind { var, value } => SmallVec::from_slice(&[var, value]),
@@ -533,16 +720,6 @@ pub struct UOp {
     /// Cached shape - computed lazily on first access.
     /// OnceCell provides thread-safe lazy initialization.
     shape_cache: std::cell::OnceCell<Option<shape::Shape>>,
-}
-
-impl UOp {
-    // TODO: Implement map() method for recursively transforming UOps
-    // pub fn map<F>(self, f: F) -> Self
-    // where
-    //     F: FnMut(&Self) -> Self,
-    // {
-    //     ...
-    // }
 }
 
 /// Cache key for hash consing.
@@ -747,6 +924,65 @@ impl UOp {
         Self::new(Op::Copy { src: self.clone(), device: dev }, self.dtype.clone())
     }
 
+    /// Create a sink operation (graph termination).
+    ///
+    /// Sink marks outputs that must be evaluated. All sources are dependencies.
+    pub fn sink(sources: Vec<Rc<Self>>) -> Rc<Self> {
+        Self::new(Op::Sink { sources: SmallVec::from_vec(sources) }, DType::Void)
+    }
+
+    /// Create a group operation (merging/organizing related ops).
+    ///
+    /// Group is a NOOP that helps organize related operations together.
+    /// It passes through the first source while ensuring all sources are dependencies.
+    pub fn group(sources: Vec<Rc<Self>>) -> Rc<Self> {
+        let dtype = if sources.is_empty() { DType::Void } else { sources[0].dtype.clone() };
+        Self::new(Op::Group { sources: SmallVec::from_vec(sources) }, dtype)
+    }
+
+    /// Create a pointer index operation (pointer arithmetic).
+    ///
+    /// Performs pointer + offset arithmetic for address calculation in kernels.
+    /// Both ptr and offset should have Index dtype.
+    pub fn pointer_index(ptr: Rc<Self>, offset: Rc<Self>) -> Result<Rc<Self>> {
+        let ptr_dtype = ptr.dtype();
+        let offset_dtype = offset.dtype();
+        ensure!(ptr_dtype == DType::Index, IndexTypeMismatchSnafu { actual: ptr_dtype });
+        ensure!(offset_dtype == DType::Index, IndexTypeMismatchSnafu { actual: offset_dtype });
+        Ok(Self::new(Op::PointerIndex { ptr, offset }, DType::Index))
+    }
+
+    /// Create a CAT operation (concatenate vectors).
+    ///
+    /// Combines multiple scalar or vector values into a single larger vector.
+    /// This is an expander-level operation used during kernel optimization.
+    ///
+    /// Like VECTORIZE but sources can be vectors themselves.
+    /// Output dtype vcount = sum of all input vcounts.
+    ///
+    /// Example: CAT(vec4, vec2) → vec6
+    ///
+    /// Note: This operation should be lowered before final codegen.
+    pub fn cat(sources: Vec<Rc<Self>>) -> Rc<Self> {
+        assert!(!sources.is_empty(), "CAT requires at least one source");
+        let dtype = sources[0].dtype.clone();
+        Self::new(Op::Cat { sources: SmallVec::from_vec(sources) }, dtype)
+    }
+
+    /// Create a PTRCAT operation (concatenate pointers).
+    ///
+    /// Combines multiple pointer indices into a vectorized pointer.
+    /// This is an expander-level operation used in devectorizer for grouping memory accesses.
+    ///
+    /// Output dtype vcount = sum of all source base counts.
+    ///
+    /// Note: This operation should be lowered to multiple LOAD/STORE before final codegen.
+    pub fn ptrcat(sources: Vec<Rc<Self>>) -> Rc<Self> {
+        assert!(!sources.is_empty(), "PTRCAT requires at least one source");
+        let dtype = sources[0].dtype.clone();
+        Self::new(Op::PtrCat { sources: SmallVec::from_vec(sources) }, dtype)
+    }
+
     /// Topological sort of the computation graph.
     ///
     /// Returns nodes in an order where all dependencies come before their dependents.
@@ -805,16 +1041,43 @@ macro_rules! cmp_ops {
     ($($name:ident => $op:ident),* $(,)?) => {
         impl UOp {
             $(
-                pub fn $name(lhs: &Rc<Self>, rhs: &Rc<Self>) -> Rc<Self> {
-                    Self::new(Op::Binary(BinaryOp::$op, lhs.clone(), rhs.clone()), DType::Bool)
+                pub fn $name(lhs: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+                    // Use type promotion to validate types and find common type
+                    let (lhs, rhs, _) = Self::promote_and_cast(lhs.clone(), rhs.clone())?;
+                    Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), DType::Bool))
                 }
             )*
         }
     }
 }
 
+// Macro for transcendental functions that require float dtype
+macro_rules! transcendental_ops {
+    ($($name:ident => $op:ident),* $(,)?) => {
+        impl UOp {
+            $(
+                pub fn $name(arg: &Rc<Self>) -> Result<Rc<Self>> {
+                    let dtype = arg.dtype();
+                    if !dtype.is_float() {
+                        return Err(Error::InvalidDTypeForOp {
+                            operation: stringify!($name),
+                            dtype: dtype.clone()
+                        });
+                    }
+                    Ok(Self::new(Op::Unary(UnaryOp::$op, arg.clone()), dtype))
+                }
+            )*
+        }
+    }
+}
+
+// Negation works on any numeric type
 unary_ops! {
     neg => Neg,
+}
+
+// Transcendental functions require float types
+transcendental_ops! {
     sqrt => Sqrt,
     exp2 => Exp2,
     log2 => Log2,
@@ -1032,226 +1295,5 @@ impl UOp {
         }
 
         if indices.is_empty() { Ok(buffer) } else { Self::index_gated(buffer, indices, gate) }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_const_creation() {
-        let c1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        assert_eq!(c1.dtype(), DType::Float32);
-        assert!(matches!(c1.op(), Op::Const(_)));
-    }
-
-    #[test]
-    fn test_hash_consing() {
-        // Create two identical constants
-        let c1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let c2 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-
-        // They should be the same object
-        assert!(Rc::ptr_eq(&c1, &c2), "Hash consing should return same Rc for identical UOps");
-    }
-
-    #[test]
-    fn test_hash_consing_with_src() {
-        let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-
-        // Create a + b twice
-        let add1 = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-        let add2 = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-
-        // Should be the same object
-        assert!(Rc::ptr_eq(&add1, &add2), "Hash consing should work with src nodes");
-    }
-
-    #[test]
-    fn test_binary_operations() {
-        let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-
-        let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-        assert_eq!(add.dtype(), DType::Float32);
-        assert_eq!(add.op().children().len(), 2);
-
-        let mul = UOp::try_mul_op(a.clone(), b.clone()).unwrap();
-        assert_eq!(mul.dtype(), DType::Float32);
-    }
-
-    #[test]
-    fn test_unary_operations() {
-        let a = UOp::const_(DType::Float32, ConstValue::Float(4.0));
-
-        let sqrt = UOp::sqrt(&a);
-        assert_eq!(sqrt.dtype(), DType::Float32);
-        assert_eq!(sqrt.op().children().len(), 1);
-    }
-
-    #[test]
-    fn test_cast() {
-        let a = UOp::const_(DType::Float32, ConstValue::Float(1.5));
-        let cast = UOp::cast(a.clone(), DType::Int32);
-
-        assert_eq!(cast.dtype(), DType::Int32);
-    }
-
-    #[test]
-    fn test_comparison() {
-        let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-
-        let cmp = UOp::cmplt(&a, &b);
-        assert_eq!(cmp.dtype(), DType::Bool);
-    }
-
-    #[test]
-    fn test_toposort() {
-        // Build graph: (a + b) * c
-        let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-        let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-
-        let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-        let mul = UOp::try_mul_op(add.clone(), c.clone()).unwrap();
-
-        let sorted = mul.toposort();
-
-        // All nodes should be present
-        assert!(sorted.len() >= 5); // a, b, c, add, mul
-
-        // Check that dependencies come before dependents
-        let positions: HashMap<_, _> = sorted.iter().enumerate().map(|(i, node)| (Rc::as_ptr(node), i)).collect();
-
-        for node in &sorted {
-            let node_pos = positions[&Rc::as_ptr(node)];
-            for child in node.op().children() {
-                let child_pos = positions[&Rc::as_ptr(child)];
-                assert!(child_pos < node_pos, "Dependencies must come before dependents");
-            }
-        }
-    }
-
-    #[test]
-    fn test_toposort_shared_node() {
-        // Build graph: x = a + b; y = a + c; z = x * y
-        // Node 'a' is shared between x and y
-        let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-        let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-
-        let x = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-        let y = UOp::try_add_op(a.clone(), c.clone()).unwrap();
-        let z = UOp::try_mul_op(x.clone(), y.clone()).unwrap();
-
-        let sorted = z.toposort();
-
-        // Node 'a' should appear only once
-        let a_ptr = Rc::as_ptr(&a);
-        let a_count = sorted.iter().filter(|node| Rc::as_ptr(node) == a_ptr).count();
-        assert_eq!(a_count, 1, "Shared node 'a' should appear exactly once");
-    }
-
-    #[test]
-    fn test_buffer_creation() {
-        let buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-        assert!(matches!(buf.op(), Op::Buffer { .. }));
-        assert_eq!(buf.dtype(), DType::Float32);
-
-        if let Op::Buffer { size, .. } = buf.op() {
-            assert_eq!(*size, 100);
-        } else {
-            panic!("Expected Buffer op");
-        }
-    }
-
-    #[test]
-    fn test_buffer_hash_consing() {
-        // Two buffers with same device and size should NOT be the same
-        // (due to different UNIQUE identifiers)
-        let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-        let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-        assert!(!Rc::ptr_eq(&buf1, &buf2), "Different buffers should have different UNIQUE ids");
-    }
-
-    #[test]
-    fn test_buffer_view() {
-        let buf = UOp::new_buffer(DeviceSpec::Cpu, 1000, DType::Float32);
-        let view = UOp::buffer_view(buf, 100, 50);
-
-        assert!(matches!(view.op(), Op::BufferView { .. }));
-        assert_eq!(view.dtype(), DType::Float32);
-
-        if let Op::BufferView { size, offset, .. } = view.op() {
-            assert_eq!(*size, 100);
-            assert_eq!(*offset, 50);
-        } else {
-            panic!("Expected BufferView op");
-        }
-    }
-
-    #[test]
-    fn test_index_operation() {
-        let buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-        let idx = UOp::const_(DType::Index, ConstValue::UInt(10));
-
-        let indexed = UOp::index(buf, vec![idx]).expect("index should succeed");
-        assert!(matches!(indexed.op(), Op::Index { .. }));
-        assert_eq!(indexed.op().children().len(), 2); // buffer + 1 index
-    }
-
-    #[test]
-    #[cfg(feature = "cuda")]
-    fn test_copy_to_device() {
-        let buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-        let gpu_copy = buf.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
-
-        assert!(matches!(gpu_copy.op(), Op::Copy { .. }));
-        assert_eq!(gpu_copy.dtype(), DType::Float32);
-        assert_eq!(gpu_copy.op().children().len(), 2); // source buffer + target device
-    }
-
-    #[test]
-    fn test_device_and_unique() {
-        let dev = UOp::device(DeviceSpec::Cpu);
-        assert!(matches!(dev.op(), Op::Device(_)));
-        if let Op::Device(spec) = dev.op() {
-            assert_eq!(*spec, DeviceSpec::Cpu);
-        }
-
-        let uniq = UOp::unique(Some(42));
-        assert!(matches!(uniq.op(), Op::Unique(42)));
-
-        let uniq_auto = UOp::unique(None);
-        assert!(matches!(uniq_auto.op(), Op::Unique(_)));
-    }
-
-    #[test]
-    fn test_children_method() {
-        let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-        let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-
-        let children = add.op().children();
-        assert_eq!(children.len(), 2);
-        assert!(Rc::ptr_eq(children[0], &a));
-        assert!(Rc::ptr_eq(children[1], &b));
-    }
-
-    #[test]
-    fn test_for_each_child() {
-        let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-        let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-
-        let mut children = Vec::new();
-        add.op().map_child(|child| children.push(child.clone()));
-
-        assert_eq!(children.len(), 2);
-        assert!(Rc::ptr_eq(&children[0], &a));
-        assert!(Rc::ptr_eq(&children[1], &b));
     }
 }

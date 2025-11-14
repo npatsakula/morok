@@ -9,16 +9,20 @@ use morok_dtype::DType;
 use smallvec::SmallVec;
 
 use super::super::{BinaryOp, Op, Result, TernaryOp, UOp, UnaryOp, WmmaMetadata};
+use crate::error::InvalidDTypeForOpSnafu;
 
 impl UOp {
     // =========================================================================
     // Extended Unary Operations
     // =========================================================================
 
-    /// Sine: sin(x).
-    pub fn sin_op(operand: Rc<Self>) -> Rc<Self> {
+    /// Sine: sin(x) - requires float dtype.
+    pub fn sin_op(operand: Rc<Self>) -> Result<Rc<Self>> {
         let dtype = operand.dtype();
-        Self::new(Op::Unary(UnaryOp::Sin, operand), dtype)
+        if !dtype.is_float() {
+            return InvalidDTypeForOpSnafu { operation: "sin", dtype }.fail();
+        }
+        Ok(Self::new(Op::Unary(UnaryOp::Sin, operand), dtype))
     }
 
     /// Reciprocal: 1/x.

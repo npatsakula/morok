@@ -1,5 +1,8 @@
 use morok_dtype::DType;
+use smallvec::SmallVec;
 use snafu::Snafu;
+
+use crate::shape::Shape;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -86,9 +89,9 @@ pub enum Error {
 
     /// Reshape contains negative dimension.
     #[snafu(display("reshape contains negative dimension in {shape:?}"))]
-    ReshapeNegativeDimension { shape: Vec<isize> },
+    ReshapeNegativeDimension { shape: SmallVec<[isize; 4]> },
 
     /// Broadcasting shape mismatch.
-    #[snafu(display("cannot broadcast shapes {lhs} and {rhs}"))]
-    BroadcastShapeMismatch { lhs: String, rhs: String },
+    #[snafu(display("cannot broadcast shapes {lhs:?} and {rhs:?}"))]
+    BroadcastShapeMismatch { lhs: Box<Shape>, rhs: Box<Shape> },
 }

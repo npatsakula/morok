@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use super::super::{BinaryOp, Op, Result, UOp, UnaryOp};
+use super::super::{BinaryOp, Op, Result, UOp};
 
 /// Macro for bitwise binary operations with type promotion and dtype validation.
 ///
@@ -95,31 +95,5 @@ impl UOp {
     shift_ops! {
         try_shl_op => Shl, "Left shift",
         try_shr_op => Shr, "Right shift",
-    }
-
-    /// Bitwise NOT (unary).
-    ///
-    /// # Errors
-    /// Returns error if dtype is not int/bool.
-    /// ```rust
-    /// # use morok_ir::{UOp, ConstValue, error::Error};
-    /// # use morok_dtype::DType;
-    /// let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    /// let result = UOp::try_not_op(val);
-    /// assert!(result.is_err(), "Expected error for float dtype");
-    /// ```
-    /// # Examples
-    /// ```rust
-    /// # use morok_ir::{UOp, ConstValue, error::Error};
-    /// # use morok_dtype::DType;
-    /// let val = UOp::const_(DType::Int32, ConstValue::Int(0b1010));
-    /// let result = UOp::try_not_op(val)?;
-    /// assert_eq!(result.dtype(), DType::Int32);
-    /// # Ok::<(), Error>(())
-    /// ```
-    pub fn try_not_op(operand: Rc<Self>) -> Result<Rc<Self>> {
-        let dtype = operand.dtype();
-        Self::check_bitwise_dtype(dtype.clone(), "not_op")?;
-        Ok(Self::new(Op::Unary(UnaryOp::Not, operand), dtype))
     }
 }

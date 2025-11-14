@@ -156,6 +156,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `ReduceAxisInvalid` if any axis is out of bounds
+    #[allow(dead_code)]
     pub(super) fn validate_reduce_axes(axes: &[usize], shape_dims: usize) -> Result<()> {
         use crate::error::ReduceAxisInvalidSnafu;
         use snafu::ensure;

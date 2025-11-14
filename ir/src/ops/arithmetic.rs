@@ -106,8 +106,7 @@ impl UOp {
 
     // Division operations with zero check
     division_ops! {
-        try_div_op => Div, "Division",
-        try_rem_op => Rem, "Remainder",
+        try_mod_op => Mod, "Modulo",
     }
 
     /// Negate a UOp (unary minus).

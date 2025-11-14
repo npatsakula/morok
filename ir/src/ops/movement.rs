@@ -106,8 +106,9 @@ impl UOp {
     /// ```rust
     /// # use morok_ir::{UOp, ConstValue, SInt, shape};
     /// # use morok_dtype::DType;
+    /// # use smallvec::smallvec;
     /// let src = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar
-    /// let new_shape = vec![SInt::from(1), SInt::from(1)];
+    /// let new_shape = smallvec![SInt::from(1), SInt::from(1)];
     /// let shape_uop = shape::shape_to_uop(&new_shape);
     /// // This would work: scalar (product=1) -> [1,1] (product=1)
     /// // let reshaped = UOp::try_reshape_validated(src, &new_shape);

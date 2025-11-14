@@ -44,7 +44,6 @@ impl UOp {
         try_add_scalar => try_add_op, "Addition",
         try_sub_scalar => try_sub_op, "Subtraction",
         try_mul_scalar => try_mul_op, "Multiplication",
-        try_div_scalar => try_div_op, "Division",
-        try_rem_scalar => try_rem_op, "Remainder",
+        try_mod_scalar => try_mod_op, "Modulo",
     }
 }

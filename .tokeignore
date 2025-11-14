@@ -1,2 +1,4 @@
 device/src/test/
 dtype/src/test/
+ir/src/test/
+submodules/

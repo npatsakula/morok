@@ -16,15 +16,18 @@ use crate::UOp;
 /// # Examples
 ///
 /// ```rust
-/// # use morok_ir::{SInt, UOp, ConstValue};
+/// # use morok_ir::{SInt, UOp, ConstValue, Op};
 /// # use morok_dtype::DType;
 /// // Concrete dimension
 /// let static_dim = SInt::from(32);
 /// assert!(static_dim.is_const());
 /// assert_eq!(static_dim.as_const(), Some(32));
 ///
-/// // Symbolic dimension
-/// let batch_size = UOp::const_(DType::Index, ConstValue::Int(0));
+/// // Symbolic dimension - use DefineVar for truly dynamic dimensions
+/// let batch_size = UOp::new(
+///     Op::DefineVar { name: "batch".to_string(), min_val: 1, max_val: 1024 },
+///     DType::Index,
+/// );
 /// let dynamic_dim = SInt::from(batch_size);
 /// assert!(!dynamic_dim.is_const());
 /// ```
@@ -79,9 +82,10 @@ impl SInt {
     /// # Examples
     ///
     /// ```rust
-    /// # use morok_ir::{SInt, UOp, ConstValue};
+    /// # use morok_ir::{SInt, UOp, ConstValue, Op};
     /// # use morok_dtype::DType;
-    /// let uop = UOp::const_(DType::Index, ConstValue::Int(10));
+    /// let uop =
+    ///     UOp::new(Op::DefineVar { name: "n".to_string(), min_val: 1, max_val: 100 }, DType::Index);
     /// let s = SInt::from(uop);
     /// assert!(s.is_symbolic());
     /// ```
@@ -98,9 +102,10 @@ impl SInt {
     /// let s = SInt::from(42);
     /// assert_eq!(s.as_const(), Some(42));
     ///
-    /// # use morok_ir::{UOp, ConstValue};
+    /// # use morok_ir::{UOp, ConstValue, Op};
     /// # use morok_dtype::DType;
-    /// let uop = UOp::const_(DType::Index, ConstValue::Int(10));
+    /// let uop =
+    ///     UOp::new(Op::DefineVar { name: "n".to_string(), min_val: 1, max_val: 100 }, DType::Index);
     /// let s = SInt::from(uop);
     /// assert_eq!(s.as_const(), None);
     /// ```
@@ -116,9 +121,10 @@ impl SInt {
     /// # Examples
     ///
     /// ```rust
-    /// # use morok_ir::{SInt, UOp, ConstValue};
+    /// # use morok_ir::{SInt, UOp, ConstValue, Op};
     /// # use morok_dtype::DType;
-    /// let uop = UOp::const_(DType::Index, ConstValue::Int(10));
+    /// let uop =
+    ///     UOp::new(Op::DefineVar { name: "n".to_string(), min_val: 1, max_val: 100 }, DType::Index);
     /// let s = SInt::from(uop.clone());
     /// assert!(s.as_symbolic().is_some());
     /// ```
@@ -298,63 +304,4 @@ pub fn sint_min(values: &[SInt]) -> SInt {
     // TODO: Implement symbolic min when UOp::try_min_op is available
     // For now, fall back to first element for symbolic cases
     values[0].clone()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{ConstValue, UOp};
-    use morok_dtype::DType;
-
-    #[test]
-    fn test_sint_const() {
-        let s = SInt::from(42);
-        assert!(s.is_const());
-        assert!(!s.is_symbolic());
-        assert_eq!(s.as_const(), Some(42));
-    }
-
-    #[test]
-    fn test_sint_symbolic() {
-        let uop = UOp::const_(DType::Index, ConstValue::Int(10));
-        let s = SInt::from(uop);
-        assert!(s.is_const()); // Should simplify to const
-        assert_eq!(s.as_const(), Some(10));
-    }
-
-    #[test]
-    fn test_sint_prod_concrete() {
-        let dims = vec![SInt::from(2), SInt::from(3), SInt::from(4)];
-        let result = sint_prod(&dims);
-        assert_eq!(result.as_const(), Some(24));
-    }
-
-    #[test]
-    fn test_sint_max_concrete() {
-        let vals = vec![SInt::from(10), SInt::from(20), SInt::from(15)];
-        let result = sint_max(&vals);
-        assert_eq!(result.as_const(), Some(20));
-    }
-
-    #[test]
-    fn test_sint_min_concrete() {
-        let vals = vec![SInt::from(10), SInt::from(20), SInt::from(15)];
-        let result = sint_min(&vals);
-        assert_eq!(result.as_const(), Some(10));
-    }
-
-    #[test]
-    fn test_sint_to_uop() {
-        let s = SInt::from(42);
-        let uop = s.to_uop(DType::Index);
-        assert_eq!(uop.dtype(), DType::Index);
-    }
-
-    #[test]
-    fn test_sint_simplify() {
-        let uop = UOp::const_(DType::Index, ConstValue::Int(100));
-        let s = SInt::from(uop);
-        let simplified = s.simplify();
-        assert_eq!(simplified.as_const(), Some(100));
-    }
 }

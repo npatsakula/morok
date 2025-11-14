@@ -6,12 +6,16 @@
 - You can find Tinygrad codebase at `submodules/tinygrad`; you can use it as source
   of inspiration.
 - Avoid assumptions that are not supported by evidence; gather information using agents.
+  Don't use Haiku as an agent, it's too stupid for our codebase; use Sonnet or Opus.
 - Keep the main context clear and perform hypothesis testing using agents.
 - Avoid fast/hacky solutions; make them robust and scalable.
 - Make sure that you understand all type signatures and their implications (some crates may
   have updated their API since the last time you used them).
 - Focus on code size and performance: minimize code; use Rust's capabilities
   and ecosystem to optimize performance.
+- You you or agent reached limit of 25k tokens during file read, consider batched file
+  reading; don't play games with symbols searching, large files are source of grand
+  knowledge.
 
 ## Task execution
 
