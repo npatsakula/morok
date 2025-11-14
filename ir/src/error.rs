@@ -87,4 +87,8 @@ pub enum Error {
     /// Reshape contains negative dimension.
     #[snafu(display("reshape contains negative dimension in {shape:?}"))]
     ReshapeNegativeDimension { shape: Vec<isize> },
+
+    /// Broadcasting shape mismatch.
+    #[snafu(display("cannot broadcast shapes {lhs} and {rhs}"))]
+    BroadcastShapeMismatch { lhs: String, rhs: String },
 }

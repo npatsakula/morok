@@ -13,8 +13,10 @@ use morok_dtype::DType;
 pub mod error;
 pub mod ops;
 pub mod shape;
+pub mod sint;
 
 pub use error::{Error, IndexTypeMismatchSnafu, Result};
+pub use sint::{SInt, sint_max, sint_min, sint_prod};
 
 // Thread-local counter for unique identifiers.
 //
@@ -522,10 +524,15 @@ impl Op {
 ///
 /// UOps form a DAG where operations reference their inputs through the Op enum.
 /// Hash consing ensures that structurally identical UOps share the same allocation.
+///
+/// Shape inference is lazy and cached - computed on first access via `shape()` method.
 #[derive(Debug)]
 pub struct UOp {
     op: Op,
     dtype: DType,
+    /// Cached shape - computed lazily on first access.
+    /// OnceCell provides thread-safe lazy initialization.
+    shape_cache: std::cell::OnceCell<Option<shape::Shape>>,
 }
 
 impl UOp {
@@ -627,7 +634,7 @@ impl UOp {
             }
 
             // Create new UOp
-            let uop = Rc::new(Self { op, dtype });
+            let uop = Rc::new(Self { op, dtype, shape_cache: std::cell::OnceCell::new() });
 
             // Cache it
             cache.insert(key, Rc::downgrade(&uop));
@@ -644,6 +651,23 @@ impl UOp {
     /// Get the data type.
     pub fn dtype(&self) -> DType {
         self.dtype.clone()
+    }
+
+    /// Get the shape of this UOp.
+    ///
+    /// Shape is computed lazily on first access and cached.
+    /// Returns None if shape cannot be determined (e.g., for control flow ops).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use morok_ir::{UOp, ConstValue};
+    /// # use morok_dtype::DType;
+    /// let scalar = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    /// assert_eq!(scalar.shape().map(|s| s.len()), Some(0)); // Scalar has empty shape
+    /// ```
+    pub fn shape(&self) -> Option<&shape::Shape> {
+        self.shape_cache.get_or_init(|| shape::infer_shape_from_op(self)).as_ref()
     }
 
     // Construction helpers
@@ -804,7 +828,7 @@ cmp_ops! {
 
 impl Clone for UOp {
     fn clone(&self) -> Self {
-        Self { op: self.op.clone(), dtype: self.dtype.clone() }
+        Self { op: self.op.clone(), dtype: self.dtype.clone(), shape_cache: std::cell::OnceCell::new() }
     }
 }
 

@@ -111,14 +111,41 @@ impl UOp {
         use crate::error::PermuteInvalidPermutationSnafu;
         use snafu::ensure;
 
+        // Check length first
         ensure!(
-            axes.len() == expected_dims && {
-                let mut sorted = axes.to_vec();
-                sorted.sort_unstable();
-                sorted == (0..expected_dims).collect::<Vec<_>>()
-            },
+            axes.len() == expected_dims,
             PermuteInvalidPermutationSnafu { permutation: axes.to_vec(), expected_dims }
         );
+
+        // O(n) validation: check each index appears exactly once
+        // Use bitset for small dims (≤64), boolean array for larger
+        if expected_dims <= 64 {
+            let mut seen = 0u64;
+            for &axis in axes {
+                ensure!(
+                    axis < expected_dims,
+                    PermuteInvalidPermutationSnafu { permutation: axes.to_vec(), expected_dims }
+                );
+                let bit = 1u64 << axis;
+                ensure!(seen & bit == 0, PermuteInvalidPermutationSnafu { permutation: axes.to_vec(), expected_dims });
+                seen |= bit;
+            }
+            // All bits must be set
+            ensure!(
+                seen == (1u64 << expected_dims) - 1,
+                PermuteInvalidPermutationSnafu { permutation: axes.to_vec(), expected_dims }
+            );
+        } else {
+            let mut seen = vec![false; expected_dims];
+            for &axis in axes {
+                ensure!(
+                    axis < expected_dims,
+                    PermuteInvalidPermutationSnafu { permutation: axes.to_vec(), expected_dims }
+                );
+                ensure!(!seen[axis], PermuteInvalidPermutationSnafu { permutation: axes.to_vec(), expected_dims });
+                seen[axis] = true;
+            }
+        }
 
         Ok(())
     }
