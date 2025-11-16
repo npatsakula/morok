@@ -2,7 +2,7 @@ use morok_dtype::DType;
 use morok_ir::{AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
 
-use crate::rangeify::{split_kernel::{split_store}, KernelContext};
+use crate::rangeify::{KernelContext, split_kernel::split_store};
 
 #[test]
 fn test_split_store_basic() {
@@ -83,29 +83,38 @@ fn test_split_store_creates_sink() {
     let buffer = UOp::unique(Some(0));
     let index = UOp::const_(DType::Index, ConstValue::Int(0));
     let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+    let store = UOp::new(Op::Store { buffer: buffer.clone(), index, value: value.clone() }, DType::Void);
 
     let result = split_store(&store, &mut ctx).unwrap();
 
     // Extract the AST from the KERNEL
-    if let Op::Kernel { ast, .. } = result.op() {
+    if let Op::Kernel { sources, ast } = result.op() {
         // The AST should be a SINK operation
-        assert!(matches!(ast.op(), Op::Sink { .. }));
+        if let Op::Sink { sources: sink_sources } = ast.op() {
+            // SINK should wrap the original STORE
+            assert_eq!(sink_sources.len(), 1);
+            assert!(std::rc::Rc::ptr_eq(&sink_sources[0], &store));
 
-        // The SINK should wrap the original STORE
-        if let Op::Sink { sources } = ast.op() {
-            assert_eq!(sources.len(), 1);
-            // The source should be the original STORE
-            assert!(matches!(sources[0].op(), Op::Store { .. }));
+            // Verify the STORE structure is preserved
+            if let Op::Store { buffer: store_buf, value: store_val, .. } = sink_sources[0].op() {
+                assert!(std::rc::Rc::ptr_eq(store_buf, &buffer));
+                assert!(std::rc::Rc::ptr_eq(store_val, &value));
+            } else {
+                panic!("Expected STORE in SINK sources");
+            }
+        } else {
+            panic!("Expected SINK operation");
         }
+
+        // Sources should be empty since no buffers were tracked in context
+        assert!(sources.is_empty());
     } else {
         panic!("Expected KERNEL operation");
     }
 }
 
-
 #[test]
-fn test_split_store_preserves_dtype() {
+fn test_split_store_preserves_computation() {
     let mut ctx = KernelContext::new();
 
     // Create STOREs with different value dtypes
@@ -118,13 +127,27 @@ fn test_split_store_preserves_dtype() {
     for (dtype, const_val) in test_cases {
         let buffer = UOp::unique(Some(0));
         let index = UOp::const_(DType::Index, ConstValue::Int(0));
-        let value = UOp::const_(dtype, const_val);
-        let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+        let value = UOp::const_(dtype.clone(), const_val);
+        let store = UOp::new(Op::Store { buffer, index, value: value.clone() }, DType::Void);
 
         let result = split_store(&store, &mut ctx);
 
-        // Should successfully create kernel regardless of value dtype
         assert!(result.is_some());
+        let kernel = result.unwrap();
+
+        // Verify KERNEL structure
+        if let Op::Kernel { ast, .. } = kernel.op() {
+            if let Op::Sink { sources } = ast.op() {
+                // SINK should wrap the STORE
+                assert!(std::rc::Rc::ptr_eq(&sources[0], &store));
+
+                // Verify the stored value dtype is preserved
+                if let Op::Store { value: stored_val, .. } = sources[0].op() {
+                    assert_eq!(stored_val.dtype(), dtype);
+                    assert!(std::rc::Rc::ptr_eq(stored_val, &value));
+                }
+            }
+        }
     }
 }
 
@@ -163,14 +186,35 @@ fn test_split_store_end_with_multiple_ranges() {
     let store = UOp::noop();
     let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(4)), 0, AxisType::Loop);
     let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(8)), 1, AxisType::Loop);
-    let end = UOp::end(store, smallvec![range1, range2]);
+    let end = UOp::end(store.clone(), smallvec![range1.clone(), range2.clone()]);
 
     let result = split_store(&end, &mut ctx);
 
-    // Should create a kernel
     assert!(result.is_some());
     let kernel = result.unwrap();
-    assert!(matches!(kernel.op(), Op::Kernel { .. }));
+
+    // Verify KERNEL wraps the END operation
+    if let Op::Kernel { ast, .. } = kernel.op() {
+        if let Op::Sink { sources } = ast.op() {
+            // SINK should wrap the END
+            assert_eq!(sources.len(), 1);
+            assert!(std::rc::Rc::ptr_eq(&sources[0], &end));
+
+            // Verify END structure is preserved
+            if let Op::End { computation, ranges } = sources[0].op() {
+                assert_eq!(ranges.len(), 2);
+                assert!(std::rc::Rc::ptr_eq(&ranges[0], &range1));
+                assert!(std::rc::Rc::ptr_eq(&ranges[1], &range2));
+                assert!(std::rc::Rc::ptr_eq(computation, &store));
+            } else {
+                panic!("Expected END operation in SINK");
+            }
+        } else {
+            panic!("Expected SINK operation");
+        }
+    } else {
+        panic!("Expected KERNEL operation");
+    }
 }
 
 #[test]

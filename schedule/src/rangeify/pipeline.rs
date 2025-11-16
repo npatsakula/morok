@@ -1,137 +1,144 @@
 //! Kernel splitting pipeline orchestration.
 //!
-//! This module orchestrates the complete kernel splitting transformation pipeline:
-//! 1. BUFFERIZE → STORE conversion (bufferize_to_store)
-//! 2. Graph rewriting with to_define_global patterns
-//! 3. Kernel splitting at STORE boundaries (split_store)
+//! This module implements the run_kernel_split_pipeline function that orchestrates
+//! the complete transformation from high-level BUFFERIZE operations to executable
+//! KERNEL operations.
 //!
-//! Based on Tinygrad's get_rangeify_map function (schedule/rangeify.py:525-580).
+//! # Pipeline Overview
+//!
+//! The full Tinygrad pipeline has 13 stages (see research notes), but this
+//! implementation focuses on the core kernel splitting functionality:
+//!
+//! 1. **BUFFERIZE → STORE**: Convert memory allocation ops to explicit stores
+//! 2. **STORE → KERNEL**: Split computation graph at store boundaries
+//!
+//! Additional stages (symbolic simplification, cost-based optimization, etc.)
+//! will be added as pattern matchers are implemented.
 
 use std::rc::Rc;
 
 use morok_ir::UOp;
 
-use super::kernel_context::KernelContext;
+use super::{bufferize_to_store::bufferize_to_store, kernel_context::KernelContext, split_kernel::split_store};
 
-/// Run the complete kernel splitting pipeline on a computation graph.
+/// Run the kernel splitting pipeline.
 ///
-/// This function orchestrates the transformation from high-level BUFFERIZE operations
-/// to low-level KERNEL operations containing executable compute graphs.
+/// This function orchestrates the transformation from high-level operations
+/// (BUFFERIZE, etc.) to low-level KERNEL operations ready for code generation.
 ///
-/// # Pipeline Stages
+/// # Current Implementation
 ///
-/// ## Stage 1: BUFFERIZE → STORE Conversion
-/// - Applies bufferize_to_store transformation
-/// - Converts BUFFERIZE(compute, ranges, opts) → STORE wrapped in END operations
-/// - Creates DEFINE_GLOBAL or DEFINE_LOCAL buffer allocations
-/// - Adds BARRIER for local buffer synchronization
+/// The pipeline currently implements 2 core stages:
 ///
-/// ## Stage 2: Graph Rewriting (to_define_global patterns)
-/// - Replaces BUFFER → DEFINE_GLOBAL
-/// - Handles AFTER operations for dependency tracking
-/// - Unbinds BIND operations (kernel-local variables)
-/// - Renumbers RANGE operations for deduplication
-/// - Cleans up spurious sources from CONST/DEFINE_VAR
+/// 1. **Stage 1: BUFFERIZE → STORE conversion**
+///    - Walks the graph bottom-up
+///    - Converts each BUFFERIZE to STORE + DEFINE_GLOBAL/DEFINE_LOCAL
+///    - Tracks buffer allocations in KernelContext
 ///
-/// ## Stage 3: Kernel Splitting
-/// - Splits computation at STORE/END boundaries
-/// - Creates KERNEL operations when all ranges are OUTER
-/// - Builds kernel arguments from accessed buffers + bound variables
-/// - Wraps computation in SINK operations
+/// 2. **Stage 2: STORE → KERNEL splitting**
+///    - Walks the graph bottom-up
+///    - Splits computation at STORE/END boundaries
+///    - Creates KERNEL operations with proper sources
+///
+/// # Future Stages
+///
+/// To match Tinygrad's full pipeline, we'll need to add:
+/// - Symbolic simplification (constant folding, algebraic rewrites)
+/// - Cost-based bufferize removal
+/// - Range optimization and flattening
+/// - Device-specific buffer limits
+///
+/// These will be added via pattern matchers integrated with the graph_rewrite engine.
 ///
 /// # Arguments
 ///
-/// * `root` - The root of the computation graph to transform
+/// * `root` - The root UOp of the computation graph
 ///
 /// # Returns
 ///
-/// A transformed graph with KERNEL operations created at appropriate boundaries.
+/// The transformed graph with KERNEL operations
 ///
 /// # Example
 ///
 /// ```ignore
-/// // Input: Graph with BUFFERIZE operations
-/// let graph = build_computation_graph();
+/// // Input graph with BUFFERIZE ops:
+/// // BUFFERIZE(compute, ranges, opts)
 ///
-/// // Transform to kernels
 /// let kernels = run_kernel_split_pipeline(graph);
 ///
-/// // kernels now contains KERNEL operations ready for codegen
+/// // Output graph with KERNEL ops:
+/// // KERNEL([buffers, vars], SINK(STORE(...)))
 /// ```
-///
-/// # Implementation Status
-///
-/// **Current (Phase 5):** Basic pipeline orchestration
-/// - Stage 1: Placeholder for bufferize_to_store integration
-/// - Stage 2: Placeholder for to_define_global pattern application
-/// - Stage 3: Placeholder for split_store integration
-///
-/// **Future (Phase 6):** Full integration with graph_rewrite engine
-/// - Pattern matcher-based transformations
-/// - Context-aware rewriting
-/// - Topological ordering and dependency tracking
-///
-/// Based on Tinygrad's get_rangeify_map (schedule/rangeify.py:525-580).
 pub fn run_kernel_split_pipeline(root: Rc<UOp>) -> Rc<UOp> {
-    // Create kernel context for tracking transformations
-    let mut _ctx = KernelContext::new();
+    let mut ctx = KernelContext::new();
 
     // **STAGE 1: BUFFERIZE → STORE Conversion**
-    // TODO: Walk the graph and apply bufferize_to_store to all BUFFERIZE operations
-    // For now, pass through unchanged
-    let after_bufferize = root.clone();
+    //
+    // Walk the graph bottom-up and convert all BUFFERIZE operations to
+    // STORE operations with explicit buffer allocation.
+    //
+    // This populates ctx.buffer_map with BUFFERIZE → DEFINE_GLOBAL/DEFINE_LOCAL mappings.
+    let after_bufferize = transform_bottom_up(&root, &mut ctx, bufferize_to_store);
 
-    // **STAGE 2: Graph Rewriting with to_define_global patterns**
-    // TODO: Apply to_define_global patterns via graph_rewrite
-    // Patterns to apply:
-    // - BUFFER → DEFINE_GLOBAL/DEFINE_LOCAL (debuf)
-    // - AFTER → extract buffer (handle_after)
-    // - BIND → unbind (unbind_kernel)
-    // - RANGE → renumber (renumber_range)
-    // - Remove zero-sized ranges (remove_zero_range)
-    // - Clean up CONST/DEFINE_VAR sources (cleanup_const)
-    let after_rewrite = after_bufferize;
-
-    // **STAGE 3: Kernel Splitting**
-    // TODO: Walk the graph and apply split_store to all STORE/END operations
-    // For now, pass through unchanged
-    let after_split = after_rewrite;
+    // **STAGE 2: STORE → KERNEL Splitting**
+    //
+    // Walk the graph bottom-up and split at STORE/END boundaries to create
+    // KERNEL operations.
+    //
+    // Uses buffer_map from Stage 1 to populate KERNEL sources.
+    let after_split = transform_bottom_up(&after_bufferize, &mut ctx, split_store);
 
     after_split
 }
 
-/// Walk the computation graph and apply a transformation function to matching nodes.
+/// Apply a transformation function bottom-up on a graph.
 ///
-/// This is a helper function for applying transformations during the pipeline.
-/// It performs a bottom-up traversal and applies the transformation function
-/// to each node that matches a predicate.
+/// This helper walks the computation graph in bottom-up order (children before parents)
+/// and applies the given transformation function to each node.
+///
+/// # Algorithm
+///
+/// 1. Recursively transform all sources (children) first
+/// 2. Reconstruct the current node with transformed sources
+/// 3. Apply the transformation function to the reconstructed node
+/// 4. Return the final result (or original if no transformation)
 ///
 /// # Arguments
 ///
-/// * `root` - The root of the graph to transform
-/// * `predicate` - Function to determine if a node should be transformed
-/// * `transform` - Function to apply to matching nodes
+/// * `uop` - The UOp to transform
+/// * `ctx` - Mutable kernel context for tracking state
+/// * `transform_fn` - Function to apply to each node
 ///
 /// # Returns
 ///
-/// A new graph with transformations applied.
-///
-/// # Example
-///
-/// ```ignore
-/// // Transform all CONST operations
-/// let transformed = walk_and_transform(
-///     root,
-///     |uop| matches!(uop.op(), Op::Const(_)),
-///     |uop| /* transform const */
-/// );
-/// ```
-pub fn walk_and_transform<P, T>(root: Rc<UOp>, _predicate: P, _transform: T) -> Rc<UOp>
+/// The transformed UOp
+fn transform_bottom_up<F>(uop: &Rc<UOp>, ctx: &mut KernelContext, transform_fn: F) -> Rc<UOp>
 where
-    P: Fn(&Rc<UOp>) -> bool,
-    T: Fn(Rc<UOp>) -> Rc<UOp>,
+    F: Fn(&Rc<UOp>, &mut KernelContext) -> Option<Rc<UOp>> + Copy,
 {
-    // TODO: Implement graph traversal and transformation
-    // For now, return unchanged
-    root
+    // **Step 1: Recursively transform all sources**
+    let sources = uop.op().sources();
+
+    if sources.is_empty() {
+        // Leaf node - try to transform directly
+        return transform_fn(uop, ctx).unwrap_or_else(|| uop.clone());
+    }
+
+    // Transform all sources
+    let mut transformed_sources = Vec::with_capacity(sources.len());
+    let mut any_changed = false;
+
+    for src in sources {
+        let transformed = transform_bottom_up(&src, ctx, transform_fn);
+        if !Rc::ptr_eq(&transformed, &src) {
+            any_changed = true;
+        }
+        transformed_sources.push(transformed);
+    }
+
+    // **Step 2: Reconstruct with transformed sources**
+    let reconstructed = if any_changed { uop.with_sources(transformed_sources) } else { uop.clone() };
+
+    // **Step 3: Try to transform the reconstructed node**
+    transform_fn(&reconstructed, ctx).unwrap_or(reconstructed)
 }

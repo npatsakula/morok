@@ -17,7 +17,6 @@ use morok_ir::{AxisType, Op, UOp};
 use smallvec::SmallVec;
 
 use super::kernel_context::KernelContext;
-use crate::rewrite::graph_rewrite;
 
 /// Split STORE and END operations into individual kernels.
 ///
@@ -67,12 +66,12 @@ use crate::rewrite::graph_rewrite;
 /// ```
 ///
 /// Based on Tinygrad's split_store (schedule/rangeify.py:471-497).
-pub fn split_store(x: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
+pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // TODO: Implement range filtering
     // For now, we'll implement a simplified version that doesn't check ranges
 
     // **FILTERING CRITERION 1: Only process STORE and END operations**
-    match x.op() {
+    match uop.op() {
         Op::Store { .. } | Op::StoreGated { .. } => {
             // Process STORE operations
         }
@@ -92,43 +91,30 @@ pub fn split_store(x: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
 
     // **STEP 2: Create SINK operation**
     // Wrap the computation in a SINK
-    let sink = UOp::new(Op::Sink { sources: smallvec::smallvec![x.clone()] }, DType::Void);
+    let sink = UOp::new(Op::Sink { sources: smallvec::smallvec![uop.clone()] }, DType::Void);
 
     // **STEP 3: Build kernel sources from context**
     // Sources = all accessed buffers + all BIND variables
+    //
+    // Note: buffer_map is populated by bufferize_to_store() when BUFFERIZE ops
+    // are converted to STORE ops. Each BUFFERIZE gets a DEFINE_GLOBAL/DEFINE_LOCAL
+    // tracked in the context.
+    //
+    // vars will be populated when we implement BIND handling patterns.
     let mut sources: SmallVec<[Rc<UOp>; 4]> = SmallVec::new();
 
-    // Add buffers from context (these were tracked during transformation)
-    // TODO: ctx.map.values() when we integrate with graph_rewrite
+    // Add all buffers from context
+    sources.extend(ctx.buffer_map.values().cloned());
 
-    // Add variables from context
-    // TODO: ctx.vars.keys() when we integrate with graph_rewrite
+    // Add all variables from context
+    for var_key in &ctx.vars {
+        sources.push(var_key.0.clone());
+    }
 
     // **STEP 4: Create KERNEL operation**
     let kernel = UOp::kernel(sources, sink);
 
     Some(kernel)
-}
-
-/// Helper function to check if an operation has only OUTER ranges.
-///
-/// This determines whether an operation is ready to be split into a kernel.
-/// An operation is ready when all its RANGE dependencies are AxisType::Outer,
-/// meaning we're at the outermost scheduling level.
-///
-/// # Arguments
-///
-/// * `x` - The operation to check
-///
-/// # Returns
-///
-/// * `true` - All ranges are OUTER (ready to split)
-/// * `false` - Some ranges are not OUTER (not ready yet)
-fn all_ranges_outer(x: &Rc<UOp>) -> bool {
-    // TODO: Implement range checking
-    // This requires tracking which RANGEs each operation depends on
-    // For now, we'll return true to allow splitting
-    true
 }
 
 /// Helper function to check if an END operation closes an OUTER range.
