@@ -8,10 +8,12 @@
 //! - [`core`] - UOp struct and fundamental operations
 //! - [`hash_consing`] - Caching infrastructure for deduplication
 //! - [`constructors`] - Helper methods for creating UOps
+//! - [`helpers`] - Pattern matching and simplification helpers
 
+pub mod constructors;
 pub mod core;
 pub mod hash_consing;
-pub mod constructors;
+pub mod helpers;
 
 // Re-export the main types
-pub use core::{IntoUOp, UOp};
+pub use core::{IntoUOp, UOp, UOpKey};

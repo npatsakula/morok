@@ -400,6 +400,14 @@ impl Op {
         }
     }
 
+    /// Get all child UOps as a Vec of owned Rcs (cloned).
+    ///
+    /// Similar to `children()` but returns owned Rcs instead of references.
+    /// Useful when you need to reconstruct nodes or store sources.
+    pub fn sources(&self) -> SmallVec<[Rc<UOp>; 4]> {
+        self.children().iter().map(|rc| (*rc).clone()).collect()
+    }
+
     /// Apply a function to each child UOp.
     pub fn map_child<F>(&self, mut f: F)
     where
@@ -408,5 +416,28 @@ impl Op {
         for child in self.children() {
             f(child);
         }
+    }
+
+    /// Check if this operation is a movement operation.
+    ///
+    /// Movement operations transform tensor shapes without changing data values:
+    /// - RESHAPE: Change shape with same number of elements
+    /// - PERMUTE: Transpose/reorder axes
+    /// - EXPAND: Broadcast to larger shape
+    /// - PAD: Add padding around tensor
+    /// - SHRINK: Extract sub-region
+    /// - FLIP: Reverse along axes
+    ///
+    /// Note: MULTI is not considered a pure movement op as it has different semantics.
+    pub fn is_movement(&self) -> bool {
+        matches!(
+            self,
+            Self::Reshape { .. }
+                | Self::Permute { .. }
+                | Self::Expand { .. }
+                | Self::Pad { .. }
+                | Self::Shrink { .. }
+                | Self::Flip { .. }
+        )
     }
 }

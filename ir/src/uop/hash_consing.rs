@@ -196,12 +196,7 @@ impl UOpKey {
             _ => OpData::None,
         };
 
-        Self {
-            op_discriminant,
-            dtype,
-            src_ids,
-            op_data,
-        }
+        Self { op_discriminant, dtype, src_ids, op_data }
     }
 }
 
@@ -244,6 +239,7 @@ impl UOp {
                 op,
                 dtype,
                 shape_cache: std::cell::OnceCell::new(),
+                ranges_cache: std::cell::OnceCell::new(),
             });
 
             // Cache it

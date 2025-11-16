@@ -4,8 +4,8 @@
 
 use std::rc::Rc;
 
-use crate::uop::UOp;
 use crate::Result;
+use crate::uop::UOp;
 
 /// Index specification for multi-dimensional slicing.
 ///
@@ -34,11 +34,7 @@ pub enum IndexSpec {
     Single(Rc<UOp>),
 
     /// Range with optional step - selects multiple elements.
-    Range {
-        start: Rc<UOp>,
-        end: Rc<UOp>,
-        step: Option<Rc<UOp>>,
-    },
+    Range { start: Rc<UOp>, end: Rc<UOp>, step: Option<Rc<UOp>> },
 
     /// Full slice - selects all elements along this dimension.
     Full,
@@ -85,20 +81,12 @@ macro_rules! s {
 
     // Range without step: s![start, end]
     ($start:expr, $end:expr) => {
-        $crate::IndexSpec::Range {
-            start: $start,
-            end: $end,
-            step: None,
-        }
+        $crate::IndexSpec::Range { start: $start, end: $end, step: None }
     };
 
     // Range with step: s![start, end, step]
     ($start:expr, $end:expr, $step:expr) => {
-        $crate::IndexSpec::Range {
-            start: $start,
-            end: $end,
-            step: Some($step),
-        }
+        $crate::IndexSpec::Range { start: $start, end: $end, step: Some($step) }
     };
 
     // NewAxis: s![NewAxis]
@@ -168,10 +156,6 @@ impl UOp {
             }
         }
 
-        if indices.is_empty() {
-            Ok(buffer)
-        } else {
-            Self::index_gated(buffer, indices, gate)
-        }
+        if indices.is_empty() { Ok(buffer) } else { Self::index_gated(buffer, indices, gate) }
     }
 }

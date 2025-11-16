@@ -37,7 +37,7 @@ pub use types::{
     AddrSpace, AxisType, BinaryOp, BufferizeOpts, ConstValue, ConstValueHash, ReduceOp, TernaryOp, UnaryOp,
     WmmaMetadata,
 };
-pub use uop::{IntoUOp, UOp};
+pub use uop::{IntoUOp, UOp, UOpKey};
 
 // Re-export external types for convenience
 pub use morok_device::DeviceSpec;

@@ -1,0 +1,12 @@
+[package]
+name = "schedule"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+morok-ir = { path = "../ir" }
+morok-dtype = { path = "../dtype" }
+morok-device = { path = "../device" }
+smallvec = { version = "1.13", features = ["union"] }
+rustc-hash = "2.1"

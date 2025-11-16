@@ -148,6 +148,61 @@ impl UOp {
         let dtype = sources[0].dtype.clone();
         Self::new(Op::PtrCat { sources: SmallVec::from_vec(sources) }, dtype)
     }
+
+    /// Create a BUFFERIZE operation.
+    ///
+    /// Marks a computation to be materialized into a buffer.
+    /// The computation is evaluated over the given ranges and stored.
+    pub fn bufferize(compute: Rc<Self>, ranges: Vec<Rc<Self>>, opts: BufferizeOpts) -> Rc<Self> {
+        let dtype = compute.dtype.clone();
+        Self::new(Op::Bufferize { compute, ranges: SmallVec::from_vec(ranges), opts }, dtype)
+    }
+
+    /// Create a LOAD operation.
+    ///
+    /// Loads a value from a buffer at the given index.
+    pub fn load(buffer: Rc<Self>, index: Rc<Self>) -> Rc<Self> {
+        let dtype = buffer.dtype.clone();
+        Self::new(Op::Load { buffer, index }, dtype)
+    }
+
+    /// Create a gated LOAD operation.
+    ///
+    /// Loads a value from a buffer at the given index, conditionally based on gate.
+    /// If gate is false, the load may be skipped or return undefined.
+    pub fn load_gated(buffer: Rc<Self>, index: Rc<Self>, gate: Rc<Self>) -> Rc<Self> {
+        let dtype = buffer.dtype.clone();
+        Self::new(Op::LoadGated { buffer, index, gate }, dtype)
+    }
+
+    /// Create a STORE operation.
+    ///
+    /// Stores a value to a buffer at the given index.
+    pub fn store(buffer: Rc<Self>, index: Rc<Self>, value: Rc<Self>) -> Rc<Self> {
+        Self::new(Op::Store { buffer, index, value }, DType::Void)
+    }
+
+    /// Create a gated STORE operation.
+    ///
+    /// Stores a value to a buffer at the given index, conditionally based on gate.
+    /// If gate is false, the store may be skipped.
+    pub fn store_gated(buffer: Rc<Self>, index: Rc<Self>, value: Rc<Self>, gate: Rc<Self>) -> Rc<Self> {
+        Self::new(Op::StoreGated { buffer, index, value, gate }, DType::Void)
+    }
+
+    /// Create a DEFINE_GLOBAL operation.
+    ///
+    /// Defines a global memory allocation with the given ID.
+    pub fn define_global(id: usize, dtype: DType) -> Rc<Self> {
+        Self::new(Op::DefineGlobal(id), dtype)
+    }
+
+    /// Create a DEFINE_LOCAL operation.
+    ///
+    /// Defines a local (shared) memory allocation with the given ID.
+    pub fn define_local(id: usize, dtype: DType) -> Rc<Self> {
+        Self::new(Op::DefineLocal(id), dtype)
+    }
 }
 
 // Macro-generated helper methods for arithmetic operations

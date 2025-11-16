@@ -1,0 +1,28 @@
+//! Schedule module for Morok compiler.
+//!
+//! This module implements pattern matching and graph rewriting for the IR,
+//! including symbolic simplification and optimization passes.
+//!
+//! # Module Organization
+//!
+//! - [`pattern`] - UPat pattern matching and PatternMatcher
+//! - [`rewrite`] - Graph rewrite engine with fixed-point iteration
+//! - [`symbolic`] - Symbolic simplification patterns
+//! - [`rangeify`] - RANGEIFY transformation (movement ops → kernels)
+
+#[macro_use]
+pub mod pattern;
+pub mod rangeify;
+pub mod rewrite;
+pub mod symbolic;
+
+#[cfg(test)]
+pub mod test;
+
+// Re-export main types
+pub use pattern::{PatternMatcher, UPat};
+pub use rangeify::rangeify;
+pub use rewrite::graph_rewrite;
+
+// Re-export UOp for macro usage
+pub use morok_ir::UOp;
