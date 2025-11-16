@@ -40,13 +40,13 @@ pub enum SInt {
     Symbolic(Rc<UOp>),
 }
 
-// Manual implementations using pointer equality for Symbolic (consistent with hash consing)
+// Manual implementations using stable ID equality for Symbolic (consistent with hash consing)
 impl PartialEq for SInt {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (SInt::Const(a), SInt::Const(b)) => a == b,
-            (SInt::Symbolic(a), SInt::Symbolic(b)) => Rc::ptr_eq(a, b),
-            _ => false,
+            (SInt::Symbolic(a), SInt::Symbolic(b)) => a.id == b.id,
+            (SInt::Const(_), SInt::Symbolic(_)) | (SInt::Symbolic(_), SInt::Const(_)) => false,
         }
     }
 }
@@ -58,7 +58,7 @@ impl std::hash::Hash for SInt {
         std::mem::discriminant(self).hash(state);
         match self {
             SInt::Const(v) => v.hash(state),
-            SInt::Symbolic(uop) => (Rc::as_ptr(uop) as usize).hash(state),
+            SInt::Symbolic(uop) => uop.id.hash(state),
         }
     }
 }
