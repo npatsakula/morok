@@ -9,6 +9,8 @@
 //! - [`rewrite`] - Graph rewrite engine with fixed-point iteration
 //! - [`symbolic`] - Symbolic simplification patterns
 //! - [`rangeify`] - RANGEIFY transformation (movement ops → kernels)
+//!   - Phases 1-4: Movement ops to BUFFERIZE with symbolic simplification
+//!   - Phase 5: Kernel splitting at STORE boundaries
 
 #[macro_use]
 pub mod pattern;
@@ -21,7 +23,7 @@ pub mod test;
 
 // Re-export main types
 pub use pattern::{PatternMatcher, UPat};
-pub use rangeify::rangeify;
+pub use rangeify::{rangeify, run_kernel_split_pipeline};
 pub use rewrite::graph_rewrite;
 
 // Re-export UOp for macro usage

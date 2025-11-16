@@ -43,11 +43,7 @@ impl UOp {
             Op::Binary(BinaryOp::Idiv, a, b) => {
                 let fa = a.const_factor();
                 let fb = b.const_factor();
-                if fb != 0 && fa % fb == 0 {
-                    fa / fb
-                } else {
-                    1
-                }
+                if fb != 0 && fa % fb == 0 { fa / fb } else { 1 }
             }
 
             // Modulo: GCD of both operands
@@ -87,10 +83,7 @@ impl UOp {
                     // If self is constant, return const result
                     if let Op::Const(self_cv) = self.op() {
                         if let ConstValue::Int(dividend) = self_cv.0 {
-                            return Some(Self::const_(
-                                self.dtype(),
-                                ConstValue::Int(dividend / divisor),
-                            ));
+                            return Some(Self::const_(self.dtype(), ConstValue::Int(dividend / divisor)));
                         }
                     }
 
@@ -104,10 +97,7 @@ impl UOp {
                                         Op::Binary(
                                             BinaryOp::Mul,
                                             a.clone(),
-                                            Self::const_(
-                                                b.dtype(),
-                                                ConstValue::Int(mult / divisor),
-                                            ),
+                                            Self::const_(b.dtype(), ConstValue::Int(mult / divisor)),
                                         ),
                                         self.dtype(),
                                     ));
@@ -122,10 +112,7 @@ impl UOp {
                                     return Some(Self::new(
                                         Op::Binary(
                                             BinaryOp::Mul,
-                                            Self::const_(
-                                                a.dtype(),
-                                                ConstValue::Int(mult / divisor),
-                                            ),
+                                            Self::const_(a.dtype(), ConstValue::Int(mult / divisor)),
                                             b.clone(),
                                         ),
                                         self.dtype(),

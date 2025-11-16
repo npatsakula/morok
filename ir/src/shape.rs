@@ -564,8 +564,8 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         // =====================================================================
         Op::If { .. } | Op::EndIf { .. } | Op::Range { .. } | Op::Barrier { .. } => None,
 
-        // End passes through the source shape
-        Op::End { range_or_reduce } => range_or_reduce.shape().cloned(),
+        // End passes through the computation shape
+        Op::End { computation, .. } => computation.shape().cloned(),
 
         // =====================================================================
         // Special operations

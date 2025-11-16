@@ -149,8 +149,15 @@ impl UOp {
     // =========================================================================
 
     /// Kernel wrapper.
-    pub fn kernel(ast: Option<Rc<Self>>) -> Rc<Self> {
-        Self::new(Op::Kernel { ast }, DType::Void)
+    ///
+    /// Creates a KERNEL operation with the given sources (kernel arguments) and AST (computation).
+    ///
+    /// # Arguments
+    ///
+    /// * `sources` - Kernel arguments (buffers and variables)
+    /// * `ast` - The computation graph (usually SINK, COPY, or BUFFER_VIEW)
+    pub fn kernel(sources: SmallVec<[Rc<Self>; 4]>, ast: Rc<Self>) -> Rc<Self> {
+        Self::new(Op::Kernel { sources, ast }, DType::Void)
     }
 
     /// In-place assignment.

@@ -120,10 +120,7 @@ fn test_rangeify_with_symbolic_simplification() {
 
     // Create a simple PERMUTE operation: swap axes
     let src = UOp::define_global(0, DType::Float32);
-    let permute = UOp::new(
-        Op::Permute { src: src.clone(), axes: vec![1, 0] },
-        DType::Float32,
-    );
+    let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
 
     // Run full rangeify pipeline (includes symbolic simplification in Step 8)
     let (result, _ctx) = crate::rangeify::rangeify(permute);

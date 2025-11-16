@@ -190,10 +190,13 @@ fn test_range_dtype_is_index() {
 #[test]
 fn test_end_of_range() {
     let end_val = UOp::const_(DType::Int32, ConstValue::Int(10));
-
     let range_op = UOp::new(Op::Range { end: end_val, axis_id: 0, axis_type: AxisType::Loop }, DType::Index);
 
-    let end_op = UOp::new(Op::End { range_or_reduce: range_op }, DType::Void);
+    // Create a simple computation (NOOP)
+    let computation = UOp::noop();
+
+    // Create END with computation and ranges
+    let end_op = UOp::new(Op::End { computation, ranges: smallvec![range_op] }, DType::Void);
 
     assert_eq!(end_op.dtype(), DType::Void);
 }
@@ -202,10 +205,13 @@ fn test_end_of_range() {
 fn test_end_preserves_dtype() {
     // End operation should have DType::Void
     let end_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-
     let range_op = UOp::new(Op::Range { end: end_val, axis_id: 0, axis_type: AxisType::Global }, DType::Index);
 
-    let end_op = UOp::new(Op::End { range_or_reduce: range_op }, DType::Void);
+    // Create a simple computation (NOOP)
+    let computation = UOp::noop();
+
+    // Create END with computation and ranges
+    let end_op = UOp::new(Op::End { computation, ranges: smallvec![range_op] }, DType::Void);
 
     assert_eq!(end_op.dtype(), DType::Void);
 }
@@ -213,10 +219,13 @@ fn test_end_preserves_dtype() {
 #[test]
 fn test_end_returns_void() {
     let end_val = UOp::const_(DType::Int32, ConstValue::Int(100));
-
     let range_op = UOp::new(Op::Range { end: end_val, axis_id: 1, axis_type: AxisType::Reduce }, DType::Index);
 
-    let end_op = UOp::new(Op::End { range_or_reduce: range_op }, DType::Void);
+    // Create a simple computation (NOOP)
+    let computation = UOp::noop();
+
+    // Create END with computation and ranges
+    let end_op = UOp::new(Op::End { computation, ranges: smallvec![range_op] }, DType::Void);
 
     // Verify End has DType::Void
     assert_eq!(end_op.dtype(), DType::Void);
@@ -367,7 +376,11 @@ fn test_end_dtype_is_void() {
     let end_val = UOp::const_(DType::Int32, ConstValue::Int(10));
     let range_op = UOp::new(Op::Range { end: end_val, axis_id: 0, axis_type: AxisType::Global }, DType::Index);
 
-    let end_op = UOp::new(Op::End { range_or_reduce: range_op }, DType::Void);
+    // Create a simple computation (NOOP)
+    let computation = UOp::noop();
+
+    // Create END with computation and ranges
+    let end_op = UOp::new(Op::End { computation, ranges: smallvec![range_op] }, DType::Void);
 
     // Confirm End dtype
     assert_eq!(end_op.dtype(), DType::Void);

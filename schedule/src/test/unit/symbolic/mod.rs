@@ -349,13 +349,7 @@ fn test_cast_int_to_float_constant() {
     // Test: cast(int_const) -> float_const
     let matcher = symbolic_simple();
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let cast = UOp::new(
-        Op::Cast {
-            src: int_val,
-            dtype: DType::Float32,
-        },
-        DType::Float32,
-    );
+    let cast = UOp::new(Op::Cast { src: int_val, dtype: DType::Float32 }, DType::Float32);
 
     let result = matcher.rewrite(&cast);
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -374,13 +368,7 @@ fn test_cast_float_to_int_constant() {
     // Test: cast(float_const) -> int_const
     let matcher = symbolic_simple();
     let float_val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
-    let cast = UOp::new(
-        Op::Cast {
-            src: float_val,
-            dtype: DType::Int32,
-        },
-        DType::Int32,
-    );
+    let cast = UOp::new(Op::Cast { src: float_val, dtype: DType::Int32 }, DType::Int32);
 
     let result = matcher.rewrite(&cast);
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -399,13 +387,7 @@ fn test_cast_bool_to_int_constant() {
     // Test: cast(bool_const) -> int_const
     let matcher = symbolic_simple();
     let bool_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let cast = UOp::new(
-        Op::Cast {
-            src: bool_val,
-            dtype: DType::Int32,
-        },
-        DType::Int32,
-    );
+    let cast = UOp::new(Op::Cast { src: bool_val, dtype: DType::Int32 }, DType::Int32);
 
     let result = matcher.rewrite(&cast);
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -423,13 +405,7 @@ fn test_noop_cast_same_dtype() {
     // Test: x.cast(dtype) -> x if same dtype
     let matcher = symbolic_simple();
     let x = UOp::define_global(1, DType::Int32);
-    let cast = UOp::new(
-        Op::Cast {
-            src: x.clone(),
-            dtype: DType::Int32,
-        },
-        DType::Int32,
-    );
+    let cast = UOp::new(Op::Cast { src: x.clone(), dtype: DType::Int32 }, DType::Int32);
 
     let result = matcher.rewrite(&cast);
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -445,22 +421,10 @@ fn test_double_cast_collapse() {
     let x = UOp::define_global(1, DType::Int32);
 
     // First cast: Int32 -> Float32
-    let inner_cast = UOp::new(
-        Op::Cast {
-            src: x.clone(),
-            dtype: DType::Float32,
-        },
-        DType::Float32,
-    );
+    let inner_cast = UOp::new(Op::Cast { src: x.clone(), dtype: DType::Float32 }, DType::Float32);
 
     // Second cast: Float32 -> Int32
-    let outer_cast = UOp::new(
-        Op::Cast {
-            src: inner_cast,
-            dtype: DType::Int32,
-        },
-        DType::Int32,
-    );
+    let outer_cast = UOp::new(Op::Cast { src: inner_cast, dtype: DType::Int32 }, DType::Int32);
 
     let result = matcher.rewrite(&outer_cast);
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -480,13 +444,7 @@ fn test_cast_non_constant_no_fold() {
     // Test: cast(variable) -> no constant folding (only dtype change)
     let matcher = symbolic_simple();
     let x = UOp::define_global(1, DType::Int32);
-    let cast = UOp::new(
-        Op::Cast {
-            src: x.clone(),
-            dtype: DType::Float32,
-        },
-        DType::Float32,
-    );
+    let cast = UOp::new(Op::Cast { src: x.clone(), dtype: DType::Float32 }, DType::Float32);
 
     let result = matcher.rewrite(&cast);
     // Should not match constant folding pattern (not a constant)

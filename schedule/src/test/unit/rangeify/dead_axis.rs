@@ -11,25 +11,11 @@ fn create_const(val: i64) -> Rc<UOp> {
 }
 
 fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
-    UOp::new(
-        Op::Range {
-            end: create_const(end),
-            axis_id,
-            axis_type: AxisType::Loop,
-        },
-        DType::Index,
-    )
+    UOp::new(Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop }, DType::Index)
 }
 
 fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
-    UOp::bufferize(
-        compute,
-        ranges,
-        BufferizeOpts {
-            device: None,
-            addrspace: AddrSpace::Global,
-        },
-    )
+    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
 }
 
 // Pattern 1: BUFFERIZE Dead Axis Removal Tests
@@ -53,11 +39,7 @@ fn test_bufferize_with_size_1_range() {
 fn test_bufferize_all_dead_axes() {
     // BUFFERIZE(x, [RANGE(1), RANGE(1), RANGE(1)]) → x
     let x = UOp::define_global(1, DType::Float32);
-    let dead_ranges = vec![
-        create_range(1, 0),
-        create_range(1, 1),
-        create_range(1, 2),
-    ];
+    let dead_ranges = vec![create_range(1, 0), create_range(1, 1), create_range(1, 2)];
 
     let bufferized = create_bufferize(x.clone(), dead_ranges);
 
@@ -76,10 +58,7 @@ fn test_bufferize_mixed_live_dead() {
     let dead_range = create_range(1, 1); // Dead
     let live_range2 = create_range(20, 2);
 
-    let bufferized = create_bufferize(
-        x.clone(),
-        vec![live_range1.clone(), dead_range, live_range2.clone()],
-    );
+    let bufferized = create_bufferize(x.clone(), vec![live_range1.clone(), dead_range, live_range2.clone()]);
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, bufferized.clone());
@@ -98,10 +77,7 @@ fn test_bufferize_mixed_live_dead() {
 fn test_bufferize_no_dead_axes() {
     // BUFFERIZE(x, [RANGE(10), RANGE(20)]) should remain unchanged
     let x = UOp::define_global(1, DType::Float32);
-    let live_ranges = vec![
-        create_range(10, 0),
-        create_range(20, 1),
-    ];
+    let live_ranges = vec![create_range(10, 0), create_range(20, 1)];
 
     let bufferized = create_bufferize(x, live_ranges);
 
@@ -123,17 +99,13 @@ fn test_index_after_dead_axis_removal() {
     let dead_range = create_range(1, 1);
 
     // Create BUFFERIZE with mixed ranges
-    let bufferized = create_bufferize(
-        x,
-        vec![live_range.clone(), dead_range.clone()],
-    );
+    let bufferized = create_bufferize(x, vec![live_range.clone(), dead_range.clone()]);
 
     // Create INDEX with indices matching the buffer structure
     let idx1 = UOp::const_(DType::Index, ConstValue::Int(5));
     let idx2 = UOp::const_(DType::Index, ConstValue::Int(0));
 
-    let indexed = UOp::index(bufferized, vec![idx1.clone(), idx2])
-        .expect("Failed to create INDEX");
+    let indexed = UOp::index(bufferized, vec![idx1.clone(), idx2]).expect("Failed to create INDEX");
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, indexed);
@@ -154,14 +126,7 @@ fn test_bufferize_dead_axis_with_constants() {
 
     // Create range with constant end = 1
     let const_end = UOp::const_(DType::Index, ConstValue::Int(1));
-    let dead_range_const = UOp::new(
-        Op::Range {
-            end: const_end,
-            axis_id: 0,
-            axis_type: AxisType::Loop,
-        },
-        DType::Index,
-    );
+    let dead_range_const = UOp::new(Op::Range { end: const_end, axis_id: 0, axis_type: AxisType::Loop }, DType::Index);
 
     let bufferized = create_bufferize(x.clone(), vec![dead_range_const]);
 
@@ -180,10 +145,7 @@ fn test_multiple_dead_axis_removal_passes() {
     let dead_range1 = create_range(1, 1);
     let dead_range2 = create_range(1, 2);
 
-    let bufferized = create_bufferize(
-        x.clone(),
-        vec![live_range.clone(), dead_range1, dead_range2],
-    );
+    let bufferized = create_bufferize(x.clone(), vec![live_range.clone(), dead_range1, dead_range2]);
 
     let matcher = dead_axis_removal();
     // Run multiple times to ensure idempotence
@@ -208,14 +170,7 @@ fn test_dead_axis_uint_constant() {
     let x = UOp::define_global(1, DType::Float32);
 
     let const_end = UOp::const_(DType::Index, ConstValue::UInt(1));
-    let dead_range = UOp::new(
-        Op::Range {
-            end: const_end,
-            axis_id: 0,
-            axis_type: AxisType::Loop,
-        },
-        DType::Index,
-    );
+    let dead_range = UOp::new(Op::Range { end: const_end, axis_id: 0, axis_type: AxisType::Loop }, DType::Index);
 
     let bufferized = create_bufferize(x.clone(), vec![dead_range]);
 

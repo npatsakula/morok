@@ -51,6 +51,12 @@ impl BufferizeOpts {
 /// Axis type for loop ranges and reductions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AxisType {
+    /// Outer kernel-level scheduling dimension (doesn't go inside kernels).
+    ///
+    /// Used to mark ranges that exist at the scheduling/orchestration level
+    /// but don't become part of kernel execution. These ranges are used during
+    /// kernel splitting to identify boundaries.
+    Outer,
     /// GPU grid dimension.
     Global,
     /// Warp/wavefront dimension.
@@ -69,6 +75,17 @@ pub enum AxisType {
     Unroll,
     /// Thread dimension.
     Thread,
+}
+
+impl AxisType {
+    /// Returns true if this axis type represents a kernel boundary.
+    ///
+    /// Kernel boundary ranges (Outer) exist at the scheduling level and
+    /// don't go inside individual kernels. During kernel splitting, operations
+    /// with outer ranges are skipped from being packaged into KERNEL ops.
+    pub const fn is_kernel_boundary(&self) -> bool {
+        matches!(self, Self::Outer)
+    }
 }
 
 /// Reduction operation types.

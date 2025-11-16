@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::rangeify::patterns::buffer_removal;
 use crate::rewrite::graph_rewrite;
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, UnaryOp, UOp};
+use morok_ir::{AddrSpace, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, UOp, UnaryOp};
 
 // Helper functions
 fn create_const(val: i64) -> Rc<UOp> {
@@ -11,25 +11,11 @@ fn create_const(val: i64) -> Rc<UOp> {
 }
 
 fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
-    UOp::new(
-        Op::Range {
-            end: create_const(end),
-            axis_id,
-            axis_type: AxisType::Loop,
-        },
-        DType::Index,
-    )
+    UOp::new(Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop }, DType::Index)
 }
 
 fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
-    UOp::bufferize(
-        compute,
-        ranges,
-        BufferizeOpts {
-            device: None,
-            addrspace: AddrSpace::Global,
-        },
-    )
+    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
 }
 
 // Pattern 1: Cheap Compute Inlining Tests
@@ -71,13 +57,7 @@ fn test_remove_bufferize_cheap_binary() {
 fn test_remove_bufferize_cast() {
     // BUFFERIZE(CAST(x), ranges) should inline (cheap operation)
     let x = UOp::define_global(1, DType::Int32);
-    let cast = UOp::new(
-        Op::Cast {
-            src: x,
-            dtype: DType::Float32,
-        },
-        DType::Float32,
-    );
+    let cast = UOp::new(Op::Cast { src: x, dtype: DType::Float32 }, DType::Float32);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(cast.clone(), vec![range]);
@@ -96,11 +76,7 @@ fn test_keep_bufferize_expensive() {
     let range = create_range(100, 0);
 
     let reduce = UOp::new(
-        Op::Reduce {
-            src: x,
-            ranges: vec![range.clone()].into(),
-            reduce_op: morok_ir::ReduceOp::Add,
-        },
+        Op::Reduce { src: x, ranges: vec![range.clone()].into(), reduce_op: morok_ir::ReduceOp::Add },
         DType::Float32,
     );
 
@@ -154,13 +130,7 @@ fn test_remove_bufferize_assign() {
     // BUFFERIZE(ASSIGN(target, value), ranges) should be removed (always-run op)
     let target = UOp::define_global(1, DType::Float32);
     let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let assign = UOp::new(
-        Op::Assign {
-            target,
-            value,
-        },
-        DType::Float32,
-    );
+    let assign = UOp::new(Op::Assign { target, value }, DType::Float32);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(assign.clone(), vec![range]);
@@ -273,6 +243,8 @@ fn test_no_removal_on_normal_buffer() {
 
     // Might be the same or modified, but the key is it doesn't crash
     // and follows the expected cost-based logic
-    assert!(!result.op().children().is_empty() || matches!(result.op(), Op::DefineGlobal(_)),
-            "Should produce valid result");
+    assert!(
+        !result.op().children().is_empty() || matches!(result.op(), Op::DefineGlobal(_)),
+        "Should produce valid result"
+    );
 }

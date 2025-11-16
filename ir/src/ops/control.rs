@@ -25,9 +25,24 @@ impl UOp {
     }
 
     /// End of range or reduce scope.
-    pub fn end(range_or_reduce: Rc<Self>) -> Rc<Self> {
-        let dtype = range_or_reduce.dtype();
-        Self::new(Op::End { range_or_reduce }, dtype)
+    ///
+    /// Wraps a computation and closes the specified ranges.
+    /// This marks the end of RANGE or REDUCE loops.
+    ///
+    /// # Arguments
+    ///
+    /// * `computation` - The computation being performed (e.g., STORE)
+    /// * `ranges` - The RANGE or REDUCE operations being closed
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let range = UOp::range(10, 0, AxisType::Loop);
+    /// let store = UOp::store(buffer, index, value);
+    /// let end = UOp::end(store, smallvec![range]);
+    /// ```
+    pub fn end(computation: Rc<Self>, ranges: SmallVec<[Rc<Self>; 4]>) -> Rc<Self> {
+        Self::new(Op::End { computation, ranges }, DType::Void)
     }
 
     /// Synchronization barrier.

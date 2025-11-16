@@ -25,7 +25,8 @@ use std::mem::discriminant;
 use std::rc::Rc;
 
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, ConstValueHash, Op, TernaryOp, UOp, UnaryOp};
+use morok_ir::{AxisType, BinaryOp, ConstValue, ConstValueHash, Op, TernaryOp, UOp, UnaryOp};
+use smallvec::SmallVec;
 
 /// Filter for matching operation types.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +439,219 @@ impl UPat {
             src: Some(SrcPattern::Tuple(vec![src])),
             arg: None,
             name: Some(name.into()),
+        }
+    }
+
+    // ===== Kernel Splitting Helpers =====
+
+    /// Match STORE operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: STORE(buffer, index, value)
+    /// pattern!(patterns,
+    ///     UPat::store(UPat::var("buf"), UPat::var("idx"), UPat::var("val")) => |buf, idx, val| {
+    ///         Some(optimize_store(buf, idx, val))
+    ///     }
+    /// );
+    /// ```
+    pub fn store(buffer: UPat, index: UPat, value: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Store {
+                buffer: UOp::noop(),
+                index: UOp::noop(),
+                value: UOp::noop(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![buffer, index, value])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match END operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: END(range)
+    /// pattern!(patterns,
+    ///     UPat::end(UPat::var("range")) => |range| {
+    ///         Some(handle_end(range))
+    ///     }
+    /// );
+    /// ```
+    pub fn end(computation: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::End {
+                computation: UOp::noop(),
+                ranges: SmallVec::new(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![computation])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match BUFFERIZE operation.
+    ///
+    /// Note: This matches any BUFFERIZE regardless of the number of ranges.
+    /// Use specific patterns if you need to match exact range counts.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: BUFFERIZE(compute, ...)
+    /// pattern!(patterns,
+    ///     UPat::var("buf") => |buf| {
+    ///         if matches!(buf.op(), Op::Bufferize { .. }) {
+    ///             Some(convert_bufferize(buf))
+    ///         } else {
+    ///             None
+    ///         }
+    ///     }
+    /// );
+    /// ```
+    pub fn bufferize_var(name: impl Into<String>) -> Self {
+        UPat::var(name) // Simplified - check op type in pattern closure
+    }
+
+    /// Match DEFINE_GLOBAL operation with name binding.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: DEFINE_GLOBAL(n)
+    /// pattern!(patterns,
+    ///     UPat::define_global("global") => |global| {
+    ///         Some(use_global(global))
+    ///     }
+    /// );
+    /// ```
+    pub fn define_global(name: impl Into<String>) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::DefineGlobal(0)))]),
+            dtype: None,
+            src: None,
+            arg: None,
+            name: Some(name.into()),
+        }
+    }
+
+    /// Match DEFINE_LOCAL operation with name binding.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: DEFINE_LOCAL(n)
+    /// pattern!(patterns,
+    ///     UPat::define_local("local") => |local| {
+    ///         Some(use_local(local))
+    ///     }
+    /// );
+    /// ```
+    pub fn define_local(name: impl Into<String>) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::DefineLocal(0)))]),
+            dtype: None,
+            src: None,
+            arg: None,
+            name: Some(name.into()),
+        }
+    }
+
+    /// Match RANGE operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: RANGE(end)
+    /// pattern!(patterns,
+    ///     UPat::range(UPat::var("end")) => |end| {
+    ///         Some(optimize_range(end))
+    ///     }
+    /// );
+    /// ```
+    pub fn range(end: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Range {
+                end: UOp::noop(),
+                axis_id: 0,
+                axis_type: AxisType::Loop,
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![end])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match BUFFER operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: BUFFER(unique, device)
+    /// pattern!(patterns,
+    ///     UPat::buffer(UPat::var("unique"), UPat::var("device")) => |unique, device| {
+    ///         Some(optimize_buffer(unique, device))
+    ///     }
+    /// );
+    /// ```
+    pub fn buffer(unique: UPat, device: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Buffer {
+                unique: UOp::noop(),
+                device: UOp::noop(),
+                size: 0,
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![unique, device])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match AFTER operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: AFTER(passthrough, ...)
+    /// pattern!(patterns,
+    ///     UPat::after(UPat::var("pass")) => |pass| {
+    ///         Some(handle_after(pass))
+    ///     }
+    /// );
+    /// ```
+    pub fn after(passthrough: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::After {
+                passthrough: UOp::noop(),
+                deps: SmallVec::new(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Fork(vec![
+                vec![passthrough.clone()],
+                // Could also match with deps, but keep it simple for now
+            ])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match BIND operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: BIND(var, value)
+    /// pattern!(patterns,
+    ///     UPat::bind(UPat::var("var"), UPat::var("value")) => |var, value| {
+    ///         Some(remove_bind(value))  // Unbind returns the value
+    ///     }
+    /// );
+    /// ```
+    pub fn bind(var: UPat, value: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Bind { var: UOp::noop(), value: UOp::noop() }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![var, value])),
+            arg: None,
+            name: None,
         }
     }
 

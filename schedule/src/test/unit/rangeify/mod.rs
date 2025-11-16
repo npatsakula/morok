@@ -1,8 +1,12 @@
 pub mod buffer_folding;
+pub mod bufferize_to_store;
 pub mod cost_based;
 pub mod dead_axis;
 pub mod helpers;
 pub mod indexing;
+pub mod kernel_context;
+pub mod split_kernel;
+pub mod split_patterns;
 pub mod transform;
 
 use morok_dtype::DType;

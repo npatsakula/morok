@@ -320,12 +320,16 @@ impl UOp {
                 }
                 Op::EndIf { if_op: new_if_op }
             }
-            Op::End { range_or_reduce } => {
-                let new_ror = range_or_reduce.substitute(map);
-                if Rc::ptr_eq(&new_ror, range_or_reduce) {
+            Op::End { computation, ranges } => {
+                let new_comp = computation.substitute(map);
+                let new_ranges: SmallVec<[Rc<UOp>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
+
+                if Rc::ptr_eq(&new_comp, computation)
+                    && new_ranges.iter().zip(ranges.iter()).all(|(a, b)| Rc::ptr_eq(a, b))
+                {
                     return self.clone();
                 }
-                Op::End { range_or_reduce: new_ror }
+                Op::End { computation: new_comp, ranges: new_ranges }
             }
             Op::Contract { src, upcast_ranges } => {
                 let new_src = src.substitute(map);
@@ -602,16 +606,15 @@ impl UOp {
                 }
                 Op::MStack { buffers: new_buffers }
             }
-            Op::Kernel { ast } => {
-                if let Some(ast_uop) = ast {
-                    let new_ast = ast_uop.substitute(map);
-                    if Rc::ptr_eq(&new_ast, ast_uop) {
-                        return self.clone();
-                    }
-                    Op::Kernel { ast: Some(new_ast) }
-                } else {
+            Op::Kernel { sources, ast } => {
+                let new_sources: SmallVec<[Rc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
+                let new_ast = ast.substitute(map);
+
+                if sources.iter().zip(&new_sources).all(|(old, new)| Rc::ptr_eq(old, new)) && Rc::ptr_eq(&new_ast, ast)
+                {
                     return self.clone();
                 }
+                Op::Kernel { sources: new_sources, ast: new_ast }
             }
             Op::After { passthrough, deps } => {
                 let new_passthrough = passthrough.substitute(map);
@@ -817,8 +820,8 @@ impl UOp {
                 Op::Range { end: src(0), axis_id: *axis_id, axis_type: *axis_type }
             }
             Op::End { .. } => {
-                assert_eq!(new_srcs.len(), 1);
-                Op::End { range_or_reduce: src(0) }
+                assert!(new_srcs.len() >= 1);
+                Op::End { computation: src(0), ranges: new_srcs[1..].iter().cloned().collect() }
             }
             Op::Barrier { .. } => {
                 assert!(new_srcs.len() >= 1);
@@ -854,8 +857,11 @@ impl UOp {
                 Op::Unroll { src: src(0), unroll_axes: unroll_axes.clone() }
             }
             Op::Kernel { .. } => {
-                assert!(new_srcs.len() <= 1);
-                Op::Kernel { ast: new_srcs.first().cloned() }
+                assert!(new_srcs.len() >= 1);
+                Op::Kernel {
+                    sources: new_srcs[..new_srcs.len() - 1].iter().cloned().collect(),
+                    ast: src(new_srcs.len() - 1),
+                }
             }
             Op::Assign { .. } => {
                 assert_eq!(new_srcs.len(), 2);

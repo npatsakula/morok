@@ -1,7 +1,4 @@
-use crate::{
-    PatternMatcher, graph_rewrite,
-    pattern::UPat,
-};
+use crate::{PatternMatcher, graph_rewrite, pattern::UPat};
 use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, ConstValueHash, Op, UOp};
 use std::rc::Rc;

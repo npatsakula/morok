@@ -165,7 +165,8 @@ pub enum Op {
         axis_type: AxisType,
     },
     End {
-        range_or_reduce: Rc<UOp>,
+        computation: Rc<UOp>,
+        ranges: SmallVec<[Rc<UOp>; 4]>,
     },
     Barrier {
         src: Rc<UOp>,
@@ -225,7 +226,8 @@ pub enum Op {
         unroll_axes: Vec<(usize, usize)>,
     },
     Kernel {
-        ast: Option<Rc<UOp>>,
+        sources: SmallVec<[Rc<UOp>; 4]>,
+        ast: Rc<UOp>,
     },
     Assign {
         target: Rc<UOp>,
@@ -356,7 +358,11 @@ impl Op {
             }
             Self::EndIf { if_op } => SmallVec::from_slice(&[if_op]),
             Self::Range { end, .. } => SmallVec::from_slice(&[end]),
-            Self::End { range_or_reduce } => SmallVec::from_slice(&[range_or_reduce]),
+            Self::End { computation, ranges } => {
+                let mut children = SmallVec::from_slice(&[computation]);
+                children.extend(ranges.iter());
+                children
+            }
             Self::Barrier { src, deps } => {
                 let mut children = SmallVec::from_slice(&[src]);
                 children.extend(deps.iter());
@@ -379,9 +385,9 @@ impl Op {
             | Self::Contiguous { src }
             | Self::ContiguousBackward { src }
             | Self::Precast { src } => SmallVec::from_slice(&[src]),
-            Self::Kernel { ast } => {
-                let mut children = SmallVec::new();
-                children.extend(ast);
+            Self::Kernel { sources, ast } => {
+                let mut children: SmallVec<[&Rc<UOp>; 4]> = sources.iter().collect();
+                children.push(ast);
                 children
             }
             Self::Assign { target, value } => SmallVec::from_slice(&[target, value]),

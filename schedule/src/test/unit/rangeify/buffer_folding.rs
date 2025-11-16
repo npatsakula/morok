@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use crate::rangeify::patterns::{buffer_folding};
+use crate::rangeify::patterns::buffer_folding;
 use crate::rewrite::graph_rewrite;
 use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
@@ -11,25 +11,11 @@ fn create_const(val: i64) -> Rc<UOp> {
 }
 
 fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
-    UOp::new(
-        Op::Range {
-            end: create_const(end),
-            axis_id,
-            axis_type: AxisType::Loop,
-        },
-        DType::Index,
-    )
+    UOp::new(Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop }, DType::Index)
 }
 
 fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
-    UOp::bufferize(
-        compute,
-        ranges,
-        BufferizeOpts {
-            device: None,
-            addrspace: AddrSpace::Global,
-        },
-    )
+    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
 }
 
 // Pattern 1: Noop Buffer Removal Tests
@@ -121,8 +107,7 @@ fn test_bufferize_different_const_types() {
         let matcher = buffer_folding();
         let result = graph_rewrite(&matcher, bufferized);
 
-        assert!(Rc::ptr_eq(&result, &const_val),
-                "BUFFERIZE(CONST) should fold for {:?}", dtype);
+        assert!(Rc::ptr_eq(&result, &const_val), "BUFFERIZE(CONST) should fold for {:?}", dtype);
     }
 }
 
@@ -147,11 +132,7 @@ fn test_index_const_folding() {
 fn test_index_const_multiple_indices() {
     // INDEX(CONST, [R1, R2, R3]) → CONST
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(2.5));
-    let ranges = vec![
-        create_range(10, 0),
-        create_range(20, 1),
-        create_range(30, 2),
-    ];
+    let ranges = vec![create_range(10, 0), create_range(20, 1), create_range(30, 2)];
 
     let indexed = UOp::index(const_val.clone(), ranges).expect("Failed to create INDEX");
 
@@ -169,13 +150,7 @@ fn test_copy_const_folding() {
     let const_val = create_const(99);
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
 
-    let copy = UOp::new(
-        Op::Copy {
-            src: const_val.clone(),
-            device,
-        },
-        DType::Int32,
-    );
+    let copy = UOp::new(Op::Copy { src: const_val.clone(), device }, DType::Int32);
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, copy);
@@ -189,26 +164,16 @@ fn test_copy_const_different_devices() {
     // Test copying constants to different devices - all should fold
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.5));
 
-    let devices = vec![
-        morok_device::DeviceSpec::Cpu,
-        morok_device::DeviceSpec::Cuda { device_id: 0 },
-    ];
+    let devices = vec![morok_device::DeviceSpec::Cpu, morok_device::DeviceSpec::Cuda { device_id: 0 }];
 
     for device_spec in devices {
         let device = UOp::device(device_spec);
-        let copy = UOp::new(
-            Op::Copy {
-                src: const_val.clone(),
-                device,
-            },
-            DType::Float32,
-        );
+        let copy = UOp::new(Op::Copy { src: const_val.clone(), device }, DType::Float32);
 
         let matcher = buffer_folding();
         let result = graph_rewrite(&matcher, copy);
 
-        assert!(Rc::ptr_eq(&result, &const_val),
-                "COPY(CONST) should fold regardless of device");
+        assert!(Rc::ptr_eq(&result, &const_val), "COPY(CONST) should fold regardless of device");
     }
 }
 
@@ -227,8 +192,7 @@ fn test_nested_constant_folding() {
     let result = graph_rewrite(&matcher, indexed);
 
     // Should fold all the way to the constant
-    assert!(Rc::ptr_eq(&result, &const_val),
-            "Nested constant operations should fold completely");
+    assert!(Rc::ptr_eq(&result, &const_val), "Nested constant operations should fold completely");
 }
 
 #[test]
@@ -237,10 +201,7 @@ fn test_noop_fold_non_const_operations() {
     let x = UOp::define_global(1, DType::Float32);
     let y = UOp::define_global(2, DType::Float32);
 
-    let add = UOp::new(
-        Op::Binary(morok_ir::BinaryOp::Add, x, y),
-        DType::Float32,
-    );
+    let add = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, x, y), DType::Float32);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(add.clone(), vec![range.clone()]);
@@ -250,6 +211,5 @@ fn test_noop_fold_non_const_operations() {
     let result = graph_rewrite(&matcher, indexed.clone());
 
     // Should fold - noop buffer removal works for all operations
-    assert!(Rc::ptr_eq(&result, &add),
-            "Noop BUFFERIZE+INDEX should fold regardless of operation type");
+    assert!(Rc::ptr_eq(&result, &add), "Noop BUFFERIZE+INDEX should fold regardless of operation type");
 }

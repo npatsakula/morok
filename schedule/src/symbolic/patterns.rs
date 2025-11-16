@@ -244,7 +244,7 @@ pub fn symbolic_simple() -> PatternMatcher {
         }
     );
 
-    // x & x → x 
+    // x & x → x
     pattern!(patterns,
         UPat::var("x") & UPat::var("x2") => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
             if Rc::ptr_eq(x, x2) {
@@ -255,7 +255,7 @@ pub fn symbolic_simple() -> PatternMatcher {
         }
     );
 
-    // x | x → x 
+    // x | x → x
     pattern!(patterns,
         UPat::var("x") | UPat::var("x2") => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
             if Rc::ptr_eq(x, x2) {
