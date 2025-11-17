@@ -2,47 +2,51 @@
 //!
 //! Implements the core graph rewriting algorithm with fixed-point iteration.
 //!
-//! The algorithm operates in 3 stages:
+//! # Algorithm
+//!
+//! The algorithm operates in 2 stages:
 //! - Stage 0: Initial visit + bottom-up fixed-point iteration
 //! - Stage 1: Source reconstruction after children are rewritten
-//! - Stage 2: Link rewritten results back to original nodes
+//!   (includes Stage 2: linking rewritten results back to original nodes)
+//!
+//! # Pattern Context
+//!
+//! Patterns that need external state should use **closure capture** rather than
+//! a context parameter. This is the idiomatic Rust approach and provides better
+//! type safety.
+//!
+//! ## Example
+//!
+//! ```ignore
+//! use std::rc::Rc;
+//! use std::cell::RefCell;
+//!
+//! // Create context wrapped in Rc<RefCell<>>
+//! let ctx = Rc::new(RefCell::new(MyContext::new()));
+//!
+//! // Patterns capture context via closure
+//! let mut patterns = vec![];
+//! let ctx_clone = Rc::clone(&ctx);
+//! patterns.push((
+//!     UPat::var("x"),
+//!     Box::new(move |bindings| {
+//!         // Access context inside pattern
+//!         let ctx_ref = ctx_clone.borrow();
+//!         // ... use context
+//!     })
+//! ));
+//!
+//! let matcher = PatternMatcher::new(patterns);
+//! graph_rewrite(&matcher, root);
+//! ```
+//!
+//! See `crate::rangeify::patterns::apply_rangeify_patterns` for a real-world example.
 
 use morok_ir::UOp;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::pattern::{PatternMatcher, RewriteResult};
-
-/// Context for graph rewriting with optional user-defined context.
-///
-/// Supports generic user context that can be passed to rewrite patterns.
-/// This allows patterns to access external state during rewriting.
-pub struct RewriteContext<Context = ()> {
-    /// Pattern matcher for applying rewrite rules
-    pub(crate) matcher: PatternMatcher,
-
-    /// Optional user-defined context
-    pub(crate) user_context: Context,
-}
-
-impl<Context> RewriteContext<Context> {
-    /// Create a new rewrite context with the given matcher and user context.
-    pub fn new(matcher: PatternMatcher, user_context: Context) -> Self {
-        Self { matcher, user_context }
-    }
-
-    /// Get a reference to the user context.
-    pub fn context(&self) -> &Context {
-        &self.user_context
-    }
-}
-
-impl RewriteContext<()> {
-    /// Create a new rewrite context without user context.
-    pub fn with_matcher(matcher: PatternMatcher) -> Self {
-        Self::new(matcher, ())
-    }
-}
 
 /// Stage in the 3-stage rewrite algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,8 +55,6 @@ enum Stage {
     BottomUp,
     /// Stage 1: Source reconstruction after children are rewritten
     SourceReconstruction,
-    /// Stage 2: Link result back to original node
-    Link,
 }
 
 /// Internal rewrite engine that implements the 3-stage stack-based algorithm.
@@ -191,10 +193,10 @@ impl<'a> RewriteEngine<'a> {
             match stage {
                 Stage::BottomUp => {
                     // Check if already visited at this stage
-                    if let Some(&visited_stage) = self.visited.get(&key) {
-                        if visited_stage >= Stage::BottomUp {
-                            continue; // Already processed
-                        }
+                    if let Some(&visited_stage) = self.visited.get(&key)
+                        && visited_stage >= Stage::BottomUp
+                    {
+                        continue; // Already processed
                     }
 
                     // Try Stage 0: bottom-up pattern matching
@@ -227,10 +229,10 @@ impl<'a> RewriteEngine<'a> {
 
                 Stage::SourceReconstruction => {
                     // Check if already visited at this stage
-                    if let Some(&visited_stage) = self.visited.get(&key) {
-                        if visited_stage >= Stage::SourceReconstruction {
-                            continue;
-                        }
+                    if let Some(&visited_stage) = self.visited.get(&key)
+                        && visited_stage >= Stage::SourceReconstruction
+                    {
+                        continue;
                     }
 
                     // Stage 1: Reconstruct with rewritten children
@@ -239,11 +241,6 @@ impl<'a> RewriteEngine<'a> {
 
                     // Stage 2: Link result
                     self.stage2_link(&uop, reconstructed);
-                }
-
-                Stage::Link => {
-                    // Stage 2 is handled inline in other stages
-                    // This variant exists for completeness but isn't used in the stack
                 }
             }
         }

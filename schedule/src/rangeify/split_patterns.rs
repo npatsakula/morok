@@ -264,7 +264,7 @@ pub fn cleanup_const(_bindings: &HashMap<String, Rc<UOp>>, _ctx: &mut KernelCont
 
     // Create new operation with no sources
     let cleaned = match op.op() {
-        Op::Const(val) => UOp::new(Op::Const(val.clone()), op.dtype()),
+        Op::Const(val) => UOp::new(Op::Const(*val), op.dtype()),
         Op::DefineVar { name, min_val, max_val } => {
             UOp::new(Op::DefineVar { name: name.clone(), min_val: *min_val, max_val: *max_val }, op.dtype())
         }

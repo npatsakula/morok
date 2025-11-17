@@ -165,13 +165,11 @@ pub fn buffer_folding() -> PatternMatcher {
     // INDEX(BUFFERIZE(x, ranges1), ranges2) → x if ranges1 == ranges2
     pattern!(patterns,
         UPat::var("idx") => |idx: &Rc<UOp>| {
-            if let Op::Index { buffer, indices, gate: None } = idx.op() {
-                if let Op::Bufferize { compute, ranges: buf_ranges, .. } = buffer.op() {
-                    if ranges_equal(buf_ranges, &indices) {
-                        return Some(Rc::clone(&compute));
+            if let Op::Index { buffer, indices, gate: None } = idx.op()
+                && let Op::Bufferize { compute, ranges: buf_ranges, .. } = buffer.op()
+                    && ranges_equal(buf_ranges, indices) {
+                        return Some(Rc::clone(compute));
                     }
-                }
-            }
             None
         }
     );
@@ -180,11 +178,10 @@ pub fn buffer_folding() -> PatternMatcher {
     // Constants don't need buffering
     pattern!(patterns,
         UPat::var("buf") => |buf: &Rc<UOp>| {
-            if let Op::Bufferize { compute, .. } = buf.op() {
-                if matches!(compute.op(), Op::Const(_)) {
-                    return Some(Rc::clone(&compute));
+            if let Op::Bufferize { compute, .. } = buf.op()
+                && matches!(compute.op(), Op::Const(_)) {
+                    return Some(Rc::clone(compute));
                 }
-            }
             None
         }
     );
@@ -193,11 +190,10 @@ pub fn buffer_folding() -> PatternMatcher {
     // Indexing into a constant is still that constant
     pattern!(patterns,
         UPat::var("idx") => |idx: &Rc<UOp>| {
-            if let Op::Index { buffer, .. } = idx.op() {
-                if matches!(buffer.op(), Op::Const(_)) {
-                    return Some(Rc::clone(&buffer));
+            if let Op::Index { buffer, .. } = idx.op()
+                && matches!(buffer.op(), Op::Const(_)) {
+                    return Some(Rc::clone(buffer));
                 }
-            }
             None
         }
     );
@@ -206,11 +202,10 @@ pub fn buffer_folding() -> PatternMatcher {
     // Copying a constant is still that constant (device doesn't matter for constants)
     pattern!(patterns,
         UPat::var("copy") => |copy: &Rc<UOp>| {
-            if let Op::Copy { src, .. } = copy.op() {
-                if matches!(src.op(), Op::Const(_)) {
-                    return Some(Rc::clone(&src));
+            if let Op::Copy { src, .. } = copy.op()
+                && matches!(src.op(), Op::Const(_)) {
+                    return Some(Rc::clone(src));
                 }
-            }
             None
         }
     );
@@ -238,19 +233,19 @@ pub fn dead_axis_removal() -> PatternMatcher {
                 let live_ranges: Vec<_> = ranges
                     .iter()
                     .filter(|r| !is_dead_axis(r))
-                    .map(|r| Rc::clone(r))
+                    .map(Rc::clone)
                     .collect();
 
                 // Only rewrite if we removed some dead axes
                 if live_ranges.len() < ranges.len() {
                     // If all axes are dead, return the compute directly
                     if live_ranges.is_empty() {
-                        return Some(Rc::clone(&compute));
+                        return Some(Rc::clone(compute));
                     }
 
                     // Create new BUFFERIZE with only live axes
                     return Some(UOp::bufferize(
-                        Rc::clone(&compute),
+                        Rc::clone(compute),
                         live_ranges,
                         opts.clone(),
                     ));
@@ -264,8 +259,8 @@ pub fn dead_axis_removal() -> PatternMatcher {
     // When BUFFERIZE has dead axes removed, INDEX operations need matching adjustments
     pattern!(patterns,
         UPat::var("idx") => |idx: &Rc<UOp>| {
-            if let Op::Index { buffer, indices, gate: _ } = idx.op() {
-                if let Op::Bufferize { ranges: buf_ranges, .. } = buffer.op() {
+            if let Op::Index { buffer, indices, gate: _ } = idx.op()
+                && let Op::Bufferize { ranges: buf_ranges, .. } = buffer.op() {
                     // Build new indices by filtering out positions where buffer has dead axes
                     let mut new_indices = Vec::new();
                     let mut idx_iter = indices.iter();
@@ -289,13 +284,12 @@ pub fn dead_axis_removal() -> PatternMatcher {
                             return None;
                         }
 
-                        return Some(UOp::index(
-                            Rc::clone(&buffer),
+                        return UOp::index(
+                            Rc::clone(buffer),
                             new_indices,
-                        ).ok()?);
+                        ).ok();
                     }
                 }
-            }
             None
         }
     );
@@ -324,7 +318,7 @@ pub fn buffer_removal() -> PatternMatcher {
             if let Op::Bufferize { compute, .. } = buf.op() {
                 // If compute is cheap and doesn't need buffering, inline it
                 if is_cheap_to_inline(compute.op()) {
-                    return Some(Rc::clone(&compute));
+                    return Some(Rc::clone(compute));
                 }
             }
             None
@@ -336,11 +330,10 @@ pub fn buffer_removal() -> PatternMatcher {
     // and shouldn't be wrapped in BUFFERIZE
     pattern!(patterns,
         UPat::var("buf") => |buf: &Rc<UOp>| {
-            if let Op::Bufferize { compute, .. } = buf.op() {
-                if is_always_run_op(compute.op()) {
-                    return Some(Rc::clone(&compute));
+            if let Op::Bufferize { compute, .. } = buf.op()
+                && is_always_run_op(compute.op()) {
+                    return Some(Rc::clone(compute));
                 }
-            }
             None
         }
     );
@@ -350,16 +343,15 @@ pub fn buffer_removal() -> PatternMatcher {
     // Inner buffer is unnecessary if outer buffer exists
     pattern!(patterns,
         UPat::var("outer") => |outer: &Rc<UOp>| {
-            if let Op::Bufferize { compute: outer_compute, ranges, opts } = outer.op() {
-                if let Op::Bufferize { compute: inner_compute, .. } = outer_compute.op() {
+            if let Op::Bufferize { compute: outer_compute, ranges, opts } = outer.op()
+                && let Op::Bufferize { compute: inner_compute, .. } = outer_compute.op() {
                     // Replace nested BUFFERIZE with single-level BUFFERIZE
                     return Some(UOp::bufferize(
-                        Rc::clone(&inner_compute),
+                        Rc::clone(inner_compute),
                         ranges.to_vec(),
                         opts.clone(),
                     ));
                 }
-            }
             None
         }
     );

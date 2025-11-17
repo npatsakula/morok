@@ -218,11 +218,10 @@ pub fn symbolic_simple() -> PatternMatcher {
         UPat::binary(vec![BinaryOp::Idiv], vec![UPat::var("x"), UPat::cvar("divisor")]) => |x: &Rc<morok_ir::UOp>, divisor: &Rc<morok_ir::UOp>| {
             use morok_ir::{Op, UnaryOp, UOp, ConstValue};
             // Check if divisor is -1
-            if let Op::Const(cv) = divisor.op() {
-                if cv.0 == ConstValue::Int(-1) {
+            if let Op::Const(cv) = divisor.op()
+                && cv.0 == ConstValue::Int(-1) {
                     return Some(UOp::new(Op::Unary(UnaryOp::Neg, Rc::clone(x)), x.dtype()));
                 }
-            }
             None
         }
     );
@@ -395,11 +394,10 @@ pub fn symbolic_simple() -> PatternMatcher {
             use morok_ir::Op;
 
             // Check if cast is to the same dtype
-            if let Op::Cast { dtype: target_dtype, .. } = cast.op() {
-                if x.dtype() == *target_dtype {
+            if let Op::Cast { dtype: target_dtype, .. } = cast.op()
+                && x.dtype() == *target_dtype {
                     return Some(Rc::clone(x));
                 }
-            }
             None
         }
     );
@@ -458,8 +456,8 @@ pub fn symbolic_simple() -> PatternMatcher {
             // Check if x and y are the same variable
             if Rc::ptr_eq(x, y) {
                 // Both c1 and c2 must be constants
-                if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op()) {
-                    if let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
+                if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
+                    && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                         // (c1 * x) + (c2 * x) → (c1 + c2) * x
                         let sum = UOp::const_(c1.dtype(), ConstValue::Int(i1 + i2));
                         return Some(UOp::new(
@@ -467,7 +465,6 @@ pub fn symbolic_simple() -> PatternMatcher {
                             x.dtype(),
                         ));
                     }
-                }
             }
             None
         }
@@ -484,8 +481,8 @@ pub fn symbolic_simple() -> PatternMatcher {
             // Check if x and y are the same variable
             if Rc::ptr_eq(x, y) {
                 // Both c1 and c2 must be constants
-                if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op()) {
-                    if let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
+                if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
+                    && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                         // (x * c1) + (x * c2) → x * (c1 + c2)
                         let sum = UOp::const_(c1.dtype(), ConstValue::Int(i1 + i2));
                         return Some(UOp::new(
@@ -493,7 +490,6 @@ pub fn symbolic_simple() -> PatternMatcher {
                             x.dtype(),
                         ));
                     }
-                }
             }
             None
         }
@@ -509,8 +505,8 @@ pub fn symbolic_simple() -> PatternMatcher {
             use morok_ir::{Op, ConstValue, UOp};
 
             // Get constant values
-            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op()) {
-                if let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
+            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
+                && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                     // (x + c1) + c2 → x + (c1 + c2)
                     let sum = UOp::const_(c1.dtype(), ConstValue::Int(i1 + i2));
                     return Some(UOp::new(
@@ -518,7 +514,6 @@ pub fn symbolic_simple() -> PatternMatcher {
                         x.dtype(),
                     ));
                 }
-            }
             None
         }
     );
@@ -530,8 +525,8 @@ pub fn symbolic_simple() -> PatternMatcher {
             use morok_ir::{Op, ConstValue, UOp};
 
             // Get constant values
-            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op()) {
-                if let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
+            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
+                && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                     // (x * c1) * c2 → x * (c1 * c2)
                     let product = UOp::const_(c1.dtype(), ConstValue::Int(i1 * i2));
                     return Some(UOp::new(
@@ -539,7 +534,6 @@ pub fn symbolic_simple() -> PatternMatcher {
                         x.dtype(),
                     ));
                 }
-            }
             None
         }
     );
@@ -551,8 +545,8 @@ pub fn symbolic_simple() -> PatternMatcher {
             use morok_ir::{Op, ConstValue, UOp};
 
             // Get constant values
-            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op()) {
-                if let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
+            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
+                && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                     let diff = i2 - i1;
                     if diff >= 0 {
                         // (x - c1) + c2 → x + (c2 - c1)
@@ -570,7 +564,6 @@ pub fn symbolic_simple() -> PatternMatcher {
                         ));
                     }
                 }
-            }
             None
         }
     );
@@ -582,8 +575,8 @@ pub fn symbolic_simple() -> PatternMatcher {
             use morok_ir::{Op, ConstValue, UOp};
 
             // Get constant values
-            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op()) {
-                if let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
+            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
+                && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                     let diff = i1 - i2;
                     if diff >= 0 {
                         // (x + c1) - c2 → x + (c1 - c2)
@@ -601,7 +594,6 @@ pub fn symbolic_simple() -> PatternMatcher {
                         ));
                     }
                 }
-            }
             None
         }
     );
@@ -628,9 +620,9 @@ pub fn symbolic_simple() -> PatternMatcher {
             use morok_ir::{Op, ConstValue, UOp};
 
             // Get constant values
-            if let (Op::Const(cv_b), Op::Const(cv_c)) = (b.op(), c.op()) {
-                if let (ConstValue::Int(ib), ConstValue::Int(ic)) = (&cv_b.0, &cv_c.0) {
-                    if *ib != 0 && *ic != 0 {
+            if let (Op::Const(cv_b), Op::Const(cv_c)) = (b.op(), c.op())
+                && let (ConstValue::Int(ib), ConstValue::Int(ic)) = (&cv_b.0, &cv_c.0)
+                    && *ib != 0 && *ic != 0 {
                         // (a // b) // c → a // (b * c)
                         let product = UOp::const_(b.dtype(), ConstValue::Int(ib * ic));
                         return Some(UOp::new(
@@ -638,8 +630,6 @@ pub fn symbolic_simple() -> PatternMatcher {
                             a.dtype(),
                         ));
                     }
-                }
-            }
             None
         }
     );
@@ -663,9 +653,9 @@ pub fn symbolic_simple() -> PatternMatcher {
             use morok_ir::{Op, ConstValue, UOp};
 
             // Only apply if c is a small constant to avoid explosion
-            if let Op::Const(cv) = c.op() {
-                if let ConstValue::Int(modulus) = &cv.0 {
-                    if *modulus > 0 && *modulus <= 256 {
+            if let Op::Const(cv) = c.op()
+                && let ConstValue::Int(modulus) = &cv.0
+                    && *modulus > 0 && *modulus <= 256 {
                         // Check if either operand is already a multiple of the modulus
                         let a_factor = a.const_factor();
                         let b_factor = b.const_factor();
@@ -686,8 +676,6 @@ pub fn symbolic_simple() -> PatternMatcher {
                             ));
                         }
                     }
-                }
-            }
             None
         }
     );
@@ -702,15 +690,14 @@ pub fn symbolic_simple() -> PatternMatcher {
             use morok_ir::{Op, UOp};
 
             // Check if both a and b are divisible by c
-            if let Some(a_div) = a.divides(c) {
-                if let Some(b_div) = b.divides(c) {
+            if let Some(a_div) = a.divides(c)
+                && let Some(b_div) = b.divides(c) {
                     // (a + b) // c → (a // c) + (b // c)
                     return Some(UOp::new(
                         Op::Binary(BinaryOp::Add, a_div, b_div),
                         a.dtype(),
                     ));
                 }
-            }
             None
         }
     );
@@ -722,15 +709,14 @@ pub fn symbolic_simple() -> PatternMatcher {
             use morok_ir::{Op, UOp};
 
             // Check if both a and b are divisible by c
-            if let Some(a_div) = a.divides(c) {
-                if let Some(b_div) = b.divides(c) {
+            if let Some(a_div) = a.divides(c)
+                && let Some(b_div) = b.divides(c) {
                     // (a - b) // c → (a // c) - (b // c)
                     return Some(UOp::new(
                         Op::Binary(BinaryOp::Sub, a_div, b_div),
                         a.dtype(),
                     ));
                 }
-            }
             None
         }
     );

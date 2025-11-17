@@ -730,25 +730,22 @@ impl UPat {
 
             UPat::Match { op: op_filter, dtype: dtype_filter, src: src_pattern, arg: arg_pattern, name } => {
                 // 1. Check operation type
-                if let Some(filters) = op_filter {
-                    if !Self::matches_op_filter(uop.op(), filters) {
+                if let Some(filters) = op_filter
+                    && !Self::matches_op_filter(uop.op(), filters) {
                         return vec![];
                     }
-                }
 
                 // 2. Check dtype
-                if let Some(dtypes) = dtype_filter {
-                    if !dtypes.contains(&uop.dtype()) {
+                if let Some(dtypes) = dtype_filter
+                    && !dtypes.contains(&uop.dtype()) {
                         return vec![];
                     }
-                }
 
                 // 3. Check argument pattern
-                if let Some(arg_pat) = arg_pattern {
-                    if !Self::matches_arg(uop, arg_pat) {
+                if let Some(arg_pat) = arg_pattern
+                    && !Self::matches_arg(uop, arg_pat) {
                         return vec![];
                     }
-                }
 
                 // 4. Check/store named binding
                 if let Some(n) = name {
@@ -779,14 +776,14 @@ impl UPat {
                         }
 
                         // Match each child against corresponding pattern
-                        self.match_sources_tuple(&children, patterns, store)
+                        Self::match_sources_tuple(&children, patterns, store)
                     }
 
                     Some(SrcPattern::Repeat(pattern)) => {
                         let children = uop.op().children();
 
                         // All children must match the same pattern
-                        self.match_sources_repeat(&children, pattern, store)
+                        Self::match_sources_repeat(&children, pattern, store)
                     }
 
                     Some(SrcPattern::Fork(fork_patterns)) => {
@@ -797,7 +794,7 @@ impl UPat {
                         for tuple_pattern in fork_patterns {
                             if children.len() == tuple_pattern.len() {
                                 let mut store_copy = store.clone();
-                                results.extend(self.match_sources_tuple(&children, tuple_pattern, &mut store_copy));
+                                results.extend(Self::match_sources_tuple(&children, tuple_pattern, &mut store_copy));
                             }
                         }
                         results
@@ -809,7 +806,6 @@ impl UPat {
 
     /// Match sources against a tuple pattern (fixed list).
     fn match_sources_tuple(
-        &self,
         children: &[&Rc<UOp>],
         patterns: &[UPat],
         store: &mut HashMap<String, Rc<UOp>>,
@@ -826,7 +822,7 @@ impl UPat {
         let mut results = Vec::new();
         for mut binding in first_pattern.match_internal(first_child, store) {
             // Match remaining children with updated bindings
-            results.extend(self.match_sources_tuple(&children[1..], &patterns[1..], &mut binding));
+            results.extend(Self::match_sources_tuple(&children[1..], &patterns[1..], &mut binding));
         }
 
         results
@@ -834,7 +830,6 @@ impl UPat {
 
     /// Match sources against a repeat pattern (all match same pattern).
     fn match_sources_repeat(
-        &self,
         children: &[&Rc<UOp>],
         pattern: &UPat,
         store: &mut HashMap<String, Rc<UOp>>,
@@ -850,7 +845,7 @@ impl UPat {
         let mut results = Vec::new();
         for mut binding in pattern.match_internal(first_child, store) {
             // Match remaining children with updated bindings
-            results.extend(self.match_sources_repeat(&children[1..], pattern, &mut binding));
+            results.extend(Self::match_sources_repeat(&children[1..], pattern, &mut binding));
         }
 
         results

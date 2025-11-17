@@ -86,9 +86,9 @@ pub fn run_kernel_split_pipeline(root: Rc<UOp>) -> Rc<UOp> {
     // KERNEL operations.
     //
     // Uses buffer_map from Stage 1 to populate KERNEL sources.
-    let after_split = transform_bottom_up(&after_bufferize, &mut ctx, split_store);
+    
 
-    after_split
+    transform_bottom_up(&after_bufferize, &mut ctx, split_store)
 }
 
 /// Apply a transformation function bottom-up on a graph.

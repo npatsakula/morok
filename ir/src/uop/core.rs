@@ -239,6 +239,7 @@ impl UOp {
     /// // After END, range is no longer in scope
     /// assert!(!end_op.in_scope_ranges().contains(&range));
     /// ```
+    #[allow(clippy::mutable_key_type)]
     pub fn in_scope_ranges(self: &Rc<Self>) -> &HashSet<UOpKey> {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::InScopeRangesProperty;
@@ -249,6 +250,7 @@ impl UOp {
     ///
     /// Uses toposort to ensure we process nodes in dependency order,
     /// computing each node's scope from its sources' scopes.
+    #[allow(clippy::mutable_key_type)]
     pub(crate) fn compute_in_scope_ranges(self: &Rc<Self>) -> HashSet<UOpKey> {
         use crate::Op;
 
@@ -317,6 +319,7 @@ impl UOp {
     /// // Inside kernel: has non-OUTER ranges
     /// assert!(!uop.all_in_scope_ranges_are(AxisType::Outer));
     /// ```
+    #[allow(clippy::mutable_key_type)]
     pub fn all_in_scope_ranges_are(self: &Rc<Self>, axis_type: AxisType) -> bool {
         use crate::Op;
 
@@ -952,11 +955,11 @@ impl UOp {
                 Op::BufferView { buffer: src(0), size: *size, offset: *offset }
             }
             Op::Bufferize { opts, .. } => {
-                assert!(new_srcs.len() >= 1);
+                assert!(!new_srcs.is_empty());
                 Op::Bufferize { compute: src(0), ranges: new_srcs[1..].iter().cloned().collect(), opts: opts.clone() }
             }
             Op::Index { gate, .. } => {
-                assert!(new_srcs.len() >= 1);
+                assert!(!new_srcs.is_empty());
                 // First source is buffer, rest are indices, last might be gate
                 let buffer = src(0);
                 let (indices, gate_new) = if gate.is_some() && new_srcs.len() >= 2 {
@@ -1015,7 +1018,7 @@ impl UOp {
                 Op::ReduceAxis { src: src(0), reduce_op: *reduce_op, axes: axes.clone() }
             }
             Op::Reduce { reduce_op, .. } => {
-                assert!(new_srcs.len() >= 1);
+                assert!(!new_srcs.is_empty());
                 Op::Reduce { src: src(0), ranges: new_srcs[1..].iter().cloned().collect(), reduce_op: *reduce_op }
             }
             Op::AllReduce { reduce_op, .. } => {
@@ -1025,7 +1028,7 @@ impl UOp {
 
             // Control flow operations
             Op::If { .. } => {
-                assert!(new_srcs.len() >= 1);
+                assert!(!new_srcs.is_empty());
                 Op::If { condition: src(0), body: new_srcs[1..].iter().cloned().collect() }
             }
             Op::EndIf { .. } => {
@@ -1037,11 +1040,11 @@ impl UOp {
                 Op::Range { end: src(0), axis_id: *axis_id, axis_type: *axis_type }
             }
             Op::End { .. } => {
-                assert!(new_srcs.len() >= 1);
+                assert!(!new_srcs.is_empty());
                 Op::End { computation: src(0), ranges: new_srcs[1..].iter().cloned().collect() }
             }
             Op::Barrier { .. } => {
-                assert!(new_srcs.len() >= 1);
+                assert!(!new_srcs.is_empty());
                 Op::Barrier { src: src(0), deps: new_srcs[1..].iter().cloned().collect() }
             }
 
@@ -1074,7 +1077,7 @@ impl UOp {
                 Op::Unroll { src: src(0), unroll_axes: unroll_axes.clone() }
             }
             Op::Kernel { .. } => {
-                assert!(new_srcs.len() >= 1);
+                assert!(!new_srcs.is_empty());
                 Op::Kernel {
                     sources: new_srcs[..new_srcs.len() - 1].iter().cloned().collect(),
                     ast: src(new_srcs.len() - 1),
@@ -1097,7 +1100,7 @@ impl UOp {
                 Op::ContiguousBackward { src: src(0) }
             }
             Op::After { .. } => {
-                assert!(new_srcs.len() >= 1);
+                assert!(!new_srcs.is_empty());
                 Op::After { passthrough: src(0), deps: new_srcs[1..].iter().cloned().collect() }
             }
             Op::Precast { .. } => {

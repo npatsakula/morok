@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use morok_ir::{BinaryOp, ConstValue, DType, Op, UOp};
+use morok_ir::{AddrSpace, AxisType, BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
 
 use crate::rangeify::helpers::{get_const_value, is_const, is_identity_value, is_zero_value};
 
@@ -50,6 +50,46 @@ pub fn count_ends(uop: &Rc<UOp>) -> usize {
 pub fn count_bufferizes(uop: &Rc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::Bufferize { .. }))
 }
+
+// ============================================================================
+// Test UOp Construction Helpers
+// ============================================================================
+
+/// Create a constant UOp with the given value.
+pub fn create_const(val: i64) -> Rc<UOp> {
+    UOp::const_(DType::Index, ConstValue::Int(val))
+}
+
+/// Create a RANGE operation with constant end value.
+pub fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
+    UOp::new(
+        Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop },
+        DType::Index,
+    )
+}
+
+/// Create a RANGE operation with symbolic end value.
+pub fn create_range_symbolic(end: Rc<UOp>, axis_id: usize) -> Rc<UOp> {
+    UOp::new(Op::Range { end, axis_id, axis_type: AxisType::Loop }, DType::Index)
+}
+
+/// Create a BUFFERIZE operation with global address space.
+pub fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
+    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
+}
+
+/// Create a BUFFERIZE operation with custom options.
+pub fn create_bufferize_opts(
+    compute: Rc<UOp>,
+    ranges: Vec<Rc<UOp>>,
+    opts: BufferizeOpts,
+) -> Rc<UOp> {
+    UOp::bufferize(compute, ranges, opts)
+}
+
+// ============================================================================
+// Helper Function Tests
+// ============================================================================
 
 #[test]
 fn test_is_identity_value() {

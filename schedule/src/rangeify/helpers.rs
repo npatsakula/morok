@@ -346,6 +346,7 @@ pub fn is_always_run_op(op: &Op) -> bool {
 ///
 /// This is used in cost-based buffer removal to decide if buffering
 /// reduces the number of memory accesses.
+#[allow(clippy::mutable_key_type)]
 pub fn count_buffer_accesses(uop: &Rc<UOp>) -> usize {
     use morok_ir::UOpKey;
     use std::collections::HashSet;
@@ -390,14 +391,12 @@ pub fn count_buffer_accesses(uop: &Rc<UOp>) -> usize {
 ///
 /// Dead axes can be removed from BUFFERIZE operations to simplify indexing.
 pub fn is_dead_axis(range: &Rc<UOp>) -> bool {
-    if let Op::Range { end, .. } = range.op() {
-        // Check if end is constant 1
-        if let Some(val) = get_const_value(end) {
-            match val {
-                ConstValue::Int(1) | ConstValue::UInt(1) => return true,
-                _ => {}
-            }
-        }
+    // TODO: Enhance to detect provably-dead symbolic ranges
+    // Currently only handles constant size-1 ranges
+    if let Op::Range { end, .. } = range.op()
+        && let Some(ConstValue::Int(1) | ConstValue::UInt(1)) = get_const_value(end)
+    {
+        return true;
     }
     false
 }
@@ -449,6 +448,7 @@ pub fn is_cheap_to_inline(op: &Op) -> bool {
 ///
 /// Note: This is a simplified version that doesn't track parent relationships.
 /// A more sophisticated implementation would build a use-def graph.
+#[allow(clippy::mutable_key_type)]
 pub fn count_uses(target: &Rc<UOp>, root: &Rc<UOp>) -> usize {
     use morok_ir::UOpKey;
     use std::collections::HashSet;

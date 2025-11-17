@@ -11,6 +11,12 @@ use morok_ir::{AxisType, ConstValue, Op, SInt, UOp, UOpKey};
 
 use super::helpers;
 
+/// Represents (input_ranges, output_ranges) for a UOp.
+///
+/// - Input ranges: The ranges used to compute this UOp's value
+/// - Output ranges: The ranges this UOp operates on (from consumers)
+type UOpRanges = (Vec<Rc<UOp>>, Vec<Rc<UOp>>);
+
 /// Context for range assignment during rangeify.
 ///
 /// Tracks which UOps need to be realized (materialized to buffers) and
@@ -27,7 +33,7 @@ pub struct IndexingContext {
     ///
     /// Input ranges: The ranges used to compute this UOp's value
     /// Output ranges: The ranges this UOp operates on (from consumers)
-    pub range_map: HashMap<UOpKey, (Vec<Rc<UOp>>, Vec<Rc<UOp>>)>,
+    pub range_map: HashMap<UOpKey, UOpRanges>,
 
     /// Counter for generating unique range IDs.
     range_idx: usize,
@@ -89,7 +95,7 @@ impl IndexingContext {
     }
 
     /// Get the ranges for a UOp.
-    pub fn get_ranges(&self, uop: &Rc<UOp>) -> Option<&(Vec<Rc<UOp>>, Vec<Rc<UOp>>)> {
+    pub fn get_ranges(&self, uop: &Rc<UOp>) -> Option<&UOpRanges> {
         self.range_map.get(&UOpKey(Rc::clone(uop)))
     }
 
@@ -120,6 +126,7 @@ impl IndexingContext {
 /// # Returns
 ///
 /// A tuple of (transformed_sink, indexing_context)
+#[allow(clippy::mutable_key_type)]
 pub fn run_rangeify(sink: Rc<UOp>) -> (Rc<UOp>, IndexingContext) {
     let mut ctx = IndexingContext::new();
 
@@ -190,6 +197,7 @@ fn is_always_contiguous(uop: &Rc<UOp>) -> bool {
 }
 
 /// Assign input/output ranges for each UOp via reverse toposort traversal.
+#[allow(clippy::mutable_key_type)]
 fn assign_ranges(reverse_topo: &[Rc<UOp>], consumer_map: &HashMap<UOpKey, Vec<Rc<UOp>>>, ctx: &mut IndexingContext) {
     for x in reverse_topo {
         // Skip certain ops
@@ -198,7 +206,7 @@ fn assign_ranges(reverse_topo: &[Rc<UOp>], consumer_map: &HashMap<UOpKey, Vec<Rc
         }
 
         // Get consumers for this UOp
-        let consumers: Vec<_> = consumer_map.get(&UOpKey(x.clone())).map(|v| v.clone()).unwrap_or_default();
+        let consumers: Vec<_> = consumer_map.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
 
         // Collect consumer ranges
         let consumer_rngs: Vec<Vec<Rc<UOp>>> =

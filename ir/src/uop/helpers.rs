@@ -76,23 +76,22 @@ impl UOp {
     /// ```
     pub fn divides(self: &Rc<Self>, v: &Rc<Self>) -> Option<Rc<Self>> {
         // If v is a constant, check if const_factor is divisible
-        if let Op::Const(cv) = v.op() {
-            if let ConstValue::Int(divisor) = cv.0 {
+        if let Op::Const(cv) = v.op()
+            && let ConstValue::Int(divisor) = cv.0 {
                 let factor = self.const_factor();
                 if divisor != 0 && factor % divisor == 0 {
                     // If self is constant, return const result
-                    if let Op::Const(self_cv) = self.op() {
-                        if let ConstValue::Int(dividend) = self_cv.0 {
+                    if let Op::Const(self_cv) = self.op()
+                        && let ConstValue::Int(dividend) = self_cv.0 {
                             return Some(Self::const_(self.dtype(), ConstValue::Int(dividend / divisor)));
                         }
-                    }
 
                     // If self is multiplication by constant
                     if let Op::Binary(BinaryOp::Mul, a, b) = self.op() {
                         // Check right operand for constant
-                        if let Op::Const(const_cv) = b.op() {
-                            if let ConstValue::Int(mult) = const_cv.0 {
-                                if mult % divisor == 0 {
+                        if let Op::Const(const_cv) = b.op()
+                            && let ConstValue::Int(mult) = const_cv.0
+                                && mult % divisor == 0 {
                                     return Some(Self::new(
                                         Op::Binary(
                                             BinaryOp::Mul,
@@ -102,13 +101,11 @@ impl UOp {
                                         self.dtype(),
                                     ));
                                 }
-                            }
-                        }
 
                         // Check left operand for constant (multiplication is commutative)
-                        if let Op::Const(const_cv) = a.op() {
-                            if let ConstValue::Int(mult) = const_cv.0 {
-                                if mult % divisor == 0 {
+                        if let Op::Const(const_cv) = a.op()
+                            && let ConstValue::Int(mult) = const_cv.0
+                                && mult % divisor == 0 {
                                     return Some(Self::new(
                                         Op::Binary(
                                             BinaryOp::Mul,
@@ -118,12 +115,9 @@ impl UOp {
                                         self.dtype(),
                                     ));
                                 }
-                            }
-                        }
                     }
                 }
             }
-        }
 
         None
     }
@@ -141,20 +135,18 @@ impl UOp {
     /// // x.pop_const(ADD) = (x, None)
     /// ```
     pub fn pop_const(self: &Rc<Self>, op: BinaryOp) -> (Rc<Self>, Option<ConstValue>) {
-        if let Op::Binary(self_op, a, b) = self.op() {
-            if *self_op == op {
+        if let Op::Binary(self_op, a, b) = self.op()
+            && *self_op == op {
                 // Check if right operand is constant
                 if let Op::Const(cv) = b.op() {
-                    return (a.clone(), Some(cv.0.clone()));
+                    return (a.clone(), Some(cv.0));
                 }
                 // Check if left operand is constant (for commutative ops)
-                if op.is_commutative() {
-                    if let Op::Const(cv) = a.op() {
-                        return (b.clone(), Some(cv.0.clone()));
+                if op.is_commutative()
+                    && let Op::Const(cv) = a.op() {
+                        return (b.clone(), Some(cv.0));
                     }
-                }
             }
-        }
 
         (self.clone(), None)
     }
@@ -175,14 +167,13 @@ impl UOp {
         let mut stack = vec![self.clone()];
 
         while let Some(node) = stack.pop() {
-            if let Op::Binary(op, a, b) = node.op() {
-                if *op == sep {
+            if let Op::Binary(op, a, b) = node.op()
+                && *op == sep {
                     // Add operands to stack in reverse order to maintain left-to-right
                     stack.push(b.clone());
                     stack.push(a.clone());
                     continue;
                 }
-            }
             result.push(node);
         }
 
