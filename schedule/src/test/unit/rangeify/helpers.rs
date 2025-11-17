@@ -1,6 +1,55 @@
-use morok_ir::{BinaryOp, ConstValue, DType, UOp};
+use std::rc::Rc;
+
+use morok_ir::{BinaryOp, ConstValue, DType, Op, UOp};
 
 use crate::rangeify::helpers::{get_const_value, is_const, is_identity_value, is_zero_value};
+
+/// Count occurrences of ops matching a predicate in a UOp graph.
+///
+/// Recursively traverses the graph and counts all UOps where `predicate` returns true.
+pub fn count_ops<F>(uop: &Rc<UOp>, predicate: F) -> usize
+where
+    F: Fn(&Op) -> bool + Copy,
+{
+    let mut count = if predicate(uop.op()) { 1 } else { 0 };
+
+    // Count in all source UOps
+    for src in uop.op().sources() {
+        count += count_ops(&src, predicate);
+    }
+
+    count
+}
+
+/// Count KERNEL operations in a UOp graph.
+pub fn count_kernels(uop: &Rc<UOp>) -> usize {
+    count_ops(uop, |op| matches!(op, Op::Kernel { .. }))
+}
+
+/// Count DEFINE_GLOBAL operations in a UOp graph.
+pub fn count_define_globals(uop: &Rc<UOp>) -> usize {
+    count_ops(uop, |op| matches!(op, Op::DefineGlobal(_)))
+}
+
+/// Count DEFINE_LOCAL operations in a UOp graph.
+pub fn count_define_locals(uop: &Rc<UOp>) -> usize {
+    count_ops(uop, |op| matches!(op, Op::DefineLocal(_)))
+}
+
+/// Count STORE operations in a UOp graph.
+pub fn count_stores(uop: &Rc<UOp>) -> usize {
+    count_ops(uop, |op| matches!(op, Op::Store { .. }))
+}
+
+/// Count END operations in a UOp graph.
+pub fn count_ends(uop: &Rc<UOp>) -> usize {
+    count_ops(uop, |op| matches!(op, Op::End { .. }))
+}
+
+/// Count BUFFERIZE operations in a UOp graph.
+pub fn count_bufferizes(uop: &Rc<UOp>) -> usize {
+    count_ops(uop, |op| matches!(op, Op::Bufferize { .. }))
+}
 
 #[test]
 fn test_is_identity_value() {

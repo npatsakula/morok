@@ -9,11 +9,15 @@
 //! - [`hash_consing`] - Caching infrastructure for deduplication
 //! - [`constructors`] - Helper methods for creating UOps
 //! - [`helpers`] - Pattern matching and simplification helpers
+//! - [`cached_property`] - Reusable pattern for cached graph properties
+//! - [`properties`] - Standard cached properties (shape, ranges, etc.)
 
+pub mod cached_property;
 pub mod constructors;
 pub mod core;
 pub mod hash_consing;
 pub mod helpers;
+pub mod properties;
 
 // Re-export the main types
 pub use core::{IntoUOp, UOp, UOpKey};

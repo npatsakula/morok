@@ -240,6 +240,7 @@ impl UOp {
                 dtype,
                 shape_cache: std::cell::OnceCell::new(),
                 ranges_cache: std::cell::OnceCell::new(),
+                in_scope_ranges_cache: std::cell::OnceCell::new(),
             });
 
             // Cache it

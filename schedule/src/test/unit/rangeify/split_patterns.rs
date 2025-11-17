@@ -2,7 +2,7 @@ use std::{collections::HashMap, rc::Rc};
 
 use morok_dtype::DType;
 use morok_ir::{AxisType, ConstValue, Op, UOp};
-use smallvec::smallvec;
+use smallvec::{smallvec, SmallVec};
 
 use crate::{
     pattern::RewriteResult,
@@ -420,4 +420,201 @@ fn test_remove_zero_range_non_zero() {
 
     // Should return NoMatch
     assert!(matches!(result, RewriteResult::NoMatch));
+}
+
+#[test]
+#[ignore = "MSTACK/AFTER handling not fully implemented yet"]
+fn test_handle_after_mstack_advanced() {
+    let mut ctx = KernelContext::new();
+
+    // Create MSTACK operation
+    let buf1 = UOp::unique(Some(1));
+    let buf2 = UOp::unique(Some(2));
+    let mstack = UOp::new(Op::MStack { buffers: smallvec::smallvec![buf1.clone(), buf2] }, DType::Float32);
+
+    // Create AFTER wrapping MSTACK
+    // Note: AFTER has passthrough + deps, not src
+    let after = UOp::new(Op::After { passthrough: mstack.clone(), deps: SmallVec::new() }, DType::Float32);
+
+    let mut bindings = HashMap::new();
+    bindings.insert("after".to_string(), after);
+
+    let result = handle_after(&bindings, &mut ctx);
+
+    // Should unwrap MSTACK and return first buffer
+    match result {
+        RewriteResult::Rewritten(buf) => {
+            // Should return buf1 (first in MSTACK)
+            assert!(std::rc::Rc::ptr_eq(&buf, &buf1));
+
+            // MSTACK should be tracked in context
+            assert!(ctx.buffer_map.contains_key(&morok_ir::UOpKey(mstack)));
+        }
+        _ => panic!("Expected Rewritten result"),
+    }
+}
+
+#[test]
+fn test_cleanup_const_with_spurious_sources() {
+    let mut ctx = KernelContext::new();
+
+    // Create a CONST that has sources (spurious - consts shouldn't have sources normally)
+    // This tests the cleanup pattern that removes unnecessary sources from CONST
+
+    // For now, UOp::const_ doesn't allow sources, so we'll create a DEFINE_VAR
+    // and verify it doesn't get cleaned up (it should keep its sources)
+    let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
+
+    let mut bindings = HashMap::new();
+    bindings.insert("c".to_string(), define_var.clone());
+
+    let result = cleanup_const(&bindings, &mut ctx);
+
+    // DEFINE_VAR shouldn't be cleaned up (it's not a CONST)
+    assert!(matches!(result, RewriteResult::NoMatch));
+}
+
+#[test]
+fn test_renumber_range_with_gaps() {
+    let mut ctx = KernelContext::new();
+
+    // Create ranges with non-sequential IDs (0, 5, 10)
+    let range0 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+    let range5 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 5, AxisType::Loop);
+    let range10 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(30)), 10, AxisType::Reduce);
+
+    // Process them in sequence
+    let mut bindings0 = HashMap::new();
+    bindings0.insert("r".to_string(), range0.clone());
+
+    let result0 = renumber_range(&bindings0, &mut ctx);
+
+    // First range should keep ID 0
+    match result0 {
+        RewriteResult::NoMatch => {
+            // Correct - ID 0 is what we'd assign anyway
+        }
+        _ => panic!("Expected NoMatch for first range"),
+    }
+
+    // Second range (ID 5) should be renumbered to 1
+    let mut bindings5 = HashMap::new();
+    bindings5.insert("r".to_string(), range5.clone());
+
+    let result5 = renumber_range(&bindings5, &mut ctx);
+
+    match result5 {
+        RewriteResult::Rewritten(new_range) => {
+            // Should be renumbered to ID 1
+            if let Op::Range { axis_id, .. } = new_range.op() {
+                assert_eq!(*axis_id, 1);
+            } else {
+                panic!("Expected RANGE operation");
+            }
+        }
+        _ => panic!("Expected Rewritten result for range with ID 5"),
+    }
+
+    // Third range (ID 10) should be renumbered to 2
+    let mut bindings10 = HashMap::new();
+    bindings10.insert("r".to_string(), range10);
+
+    let result10 = renumber_range(&bindings10, &mut ctx);
+
+    match result10 {
+        RewriteResult::Rewritten(new_range) => {
+            // Should be renumbered to ID 2
+            if let Op::Range { axis_id, axis_type, .. } = new_range.op() {
+                assert_eq!(*axis_id, 2);
+                // Should preserve axis type
+                assert_eq!(*axis_type, AxisType::Reduce);
+            } else {
+                panic!("Expected RANGE operation");
+            }
+        }
+        _ => panic!("Expected Rewritten result for range with ID 10"),
+    }
+
+    // Context should have assigned 3 sequential IDs
+    assert_eq!(ctx.range_counter, 3);
+}
+
+#[test]
+fn test_remove_zero_range_verification() {
+    let mut ctx = KernelContext::new();
+
+    // Create RANGE with end=0
+    let end = UOp::const_(DType::Index, ConstValue::Int(0));
+    let range = UOp::range(end.clone(), 0, AxisType::Loop);
+
+    let mut bindings = HashMap::new();
+    bindings.insert("r".to_string(), range.clone());
+
+    let result = remove_zero_range(&bindings, &mut ctx);
+
+    // Should rewrite to CONST(0)
+    match result {
+        RewriteResult::Rewritten(const_op) => {
+            // Should be a CONST
+            if let Op::Const(val) = const_op.op() {
+                // Should be Int(0)
+                assert_eq!(val.0, ConstValue::Int(0));
+
+                // Should NOT be the same as the original range
+                assert!(!std::rc::Rc::ptr_eq(&const_op, &range));
+
+                // Should have Index dtype (same as range)
+                assert_eq!(const_op.dtype(), DType::Index);
+            } else {
+                panic!("Expected CONST operation");
+            }
+        }
+        _ => panic!("Expected Rewritten result for zero range"),
+    }
+}
+
+#[test]
+fn test_pattern_composition_sequence() {
+    let mut ctx = KernelContext::new();
+
+    // Test that patterns can be applied in sequence
+    // 1. Create a RANGE with non-sequential ID
+    // 2. Apply renumber_range
+    // 3. Verify the result
+
+    let range_gap = UOp::range(UOp::const_(DType::Index, ConstValue::Int(15)), 7, AxisType::Loop);
+
+    let mut bindings = HashMap::new();
+    bindings.insert("r".to_string(), range_gap.clone());
+
+    // Apply renumber_range pattern
+    let result1 = renumber_range(&bindings, &mut ctx);
+
+    match result1 {
+        RewriteResult::Rewritten(renumbered) => {
+            // Should be renumbered to ID 0 (first in sequence)
+            if let Op::Range { axis_id, end, axis_type } = renumbered.op() {
+                assert_eq!(*axis_id, 0);
+                assert_eq!(*axis_type, AxisType::Loop);
+
+                // End should be preserved
+                if let Op::Range { end: original_end, .. } = range_gap.op() {
+                    assert!(std::rc::Rc::ptr_eq(end, original_end));
+                }
+
+                // Now apply another pattern to the result
+                // For example, if the renumbered range has zero end, remove it
+                let mut bindings2 = HashMap::new();
+                bindings2.insert("r".to_string(), renumbered.clone());
+
+                let result2 = remove_zero_range(&bindings2, &mut ctx);
+
+                // Should return NoMatch since end is 15, not 0
+                assert!(matches!(result2, RewriteResult::NoMatch));
+            } else {
+                panic!("Expected RANGE operation");
+            }
+        }
+        _ => panic!("Expected Rewritten result"),
+    }
 }

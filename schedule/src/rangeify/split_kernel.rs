@@ -67,8 +67,15 @@ use super::kernel_context::KernelContext;
 ///
 /// Based on Tinygrad's split_store (schedule/rangeify.py:471-497).
 pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
-    // TODO: Implement range filtering
-    // For now, we'll implement a simplified version that doesn't check ranges
+    // **FILTERING CRITERION 0: Skip if has non-OUTER ranges in scope**
+    // Matches Tinygrad line 472:
+    // if len([r for r in x.ranges if r.arg[-1] != AxisType.OUTER]): return None
+    //
+    // Only split at operations where ALL in-scope ranges are OUTER.
+    // This ensures we only create kernels at proper kernel boundaries.
+    if uop.has_non_outer_ranges() {
+        return None;
+    }
 
     // **FILTERING CRITERION 1: Only process STORE and END operations**
     match uop.op() {
@@ -77,7 +84,12 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
         }
         Op::End { .. } => {
             // Process END operations
-            // TODO: Skip END operations for OUTER ranges
+            // **FILTERING CRITERION 2: Skip END for single OUTER ranges**
+            // Matches Tinygrad line 475:
+            // if x.op is Ops.END and x.src[1].op is Ops.RANGE and x.src[1].arg[-1] == AxisType.OUTER
+            if is_outer_end(uop) {
+                return None;
+            }
         }
         _ => return None,
     }

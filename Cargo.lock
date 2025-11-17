@@ -277,6 +277,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "morok-schedule"
+version = "0.1.0"
+dependencies = [
+ "morok-device",
+ "morok-dtype",
+ "morok-ir",
+ "rustc-hash",
+ "smallvec",
+]
+
+[[package]]
 name = "ndarray"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -549,17 +560,6 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
-]
-
-[[package]]
-name = "schedule"
-version = "0.1.0"
-dependencies = [
- "morok-device",
- "morok-dtype",
- "morok-ir",
- "rustc-hash",
- "smallvec",
 ]
 
 [[package]]

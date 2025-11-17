@@ -446,4 +446,79 @@ impl Op {
                 | Self::Flip { .. }
         )
     }
+
+    /// Get the source index where ranges start being "ended" by this operation.
+    ///
+    /// Based on Tinygrad's `range_start` dict (ops.py:28).
+    /// Returns `Some(index)` if this operation ends ranges, `None` otherwise.
+    ///
+    /// Operations that end ranges:
+    /// - BUFFERIZE: ranges start at index 1 (compute is 0, ranges are 1+)
+    /// - REDUCE: ranges start at index 1 (src is 0, ranges are 1+)
+    /// - STORE: ranges start at index 2 (buffer=0, index=1, value=2)
+    /// - WMMA: ranges start at index 3 (a=0, b=1, c=2)
+    /// - END: ranges start at index 1 (computation=0, ranges=1+)
+    ///
+    /// These operations mark range boundaries in the computation graph.
+    /// Any RANGE operations in sources at or after the returned index
+    /// are considered "ended" and removed from scope.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use morok_ir::Op;
+    ///
+    /// // BUFFERIZE ends ranges starting at source index 1
+    /// let bufferize_op = Op::Bufferize { /* ... */ };
+    /// assert_eq!(bufferize_op.range_ending_src_index(), Some(1));
+    ///
+    /// // Regular arithmetic operations don't end ranges
+    /// let add_op = Op::Add { /* ... */ };
+    /// assert_eq!(add_op.range_ending_src_index(), None);
+    /// ```
+    pub fn range_ending_src_index(&self) -> Option<usize> {
+        match self {
+            Self::Bufferize { .. } => Some(1),
+            Self::Reduce { .. } => Some(1),
+            Self::Store { .. } | Self::StoreGated { .. } => Some(2),
+            Self::Wmma { .. } => Some(3),
+            Self::End { .. } => Some(1),
+            _ => None,
+        }
+    }
+
+    /// Get the "ended ranges" for this operation.
+    ///
+    /// These are the RANGE operations (and operations containing ranges)
+    /// that should be removed from scope after this operation.
+    ///
+    /// Based on Tinygrad's `ended_ranges` property (ops.py:296-299).
+    ///
+    /// # Returns
+    ///
+    /// A SmallVec of references to child UOps that represent ended ranges.
+    /// For operations that don't end ranges, returns an empty SmallVec.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use morok_ir::{Op, UOp};
+    ///
+    /// // END operation ends its range arguments
+    /// let range = UOp::range(/* ... */);
+    /// let computation = UOp::const_(/* ... */);
+    /// let end_op = UOp::end(computation, vec![range.clone()]);
+    ///
+    /// // ended_ranges() returns the ranges that are closed
+    /// let ended = end_op.op().ended_ranges();
+    /// assert_eq!(ended.len(), 1);
+    /// ```
+    pub fn ended_ranges(&self) -> SmallVec<[&Rc<UOp>; 4]> {
+        if let Some(start_idx) = self.range_ending_src_index() {
+            let children = self.children();
+            children.into_iter().skip(start_idx).collect()
+        } else {
+            SmallVec::new()
+        }
+    }
 }

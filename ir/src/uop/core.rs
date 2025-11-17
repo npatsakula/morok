@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::op::Op;
 use crate::shape;
-use crate::types::ConstValue;
+use crate::types::{AxisType, ConstValue};
 use morok_dtype::DType;
 
 /// Wrapper for Rc<UOp> that implements Hash and Eq based on stable ID.
@@ -20,7 +20,7 @@ use morok_dtype::DType;
 /// Note: While UOp contains OnceCell fields, Hash/Eq are based solely on the
 /// immutable `id` field, making this safe to use as a HashMap key.
 #[allow(clippy::mutable_key_type)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct UOpKey(pub Rc<UOp>);
 
 impl PartialEq for UOpKey {
@@ -56,6 +56,12 @@ pub struct UOp {
     /// Cached list of RANGE operations in this UOp's graph.
     /// Computed lazily via toposort to collect all RANGE ops.
     pub(crate) ranges_cache: std::cell::OnceCell<Vec<Rc<UOp>>>,
+    /// Cached set of RANGE operations that are in scope at this UOp.
+    /// Unlike ranges_cache which contains ALL ranges in the graph,
+    /// this contains only the ranges that are currently "active" (not yet ended).
+    /// Computed lazily based on Tinygrad's ranges property.
+    /// Uses UOpKey wrapper to enable Hash/Eq based on UOp ID.
+    pub(crate) in_scope_ranges_cache: std::cell::OnceCell<HashSet<UOpKey>>,
 }
 
 impl UOp {
@@ -82,8 +88,10 @@ impl UOp {
     /// let scalar = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     /// assert_eq!(scalar.shape().map(|s| s.len()), Some(0)); // Scalar has empty shape
     /// ```
-    pub fn shape(&self) -> Option<&shape::Shape> {
-        self.shape_cache.get_or_init(|| shape::infer_shape_from_op(self)).as_ref()
+    pub fn shape(self: &Rc<Self>) -> Option<&shape::Shape> {
+        use crate::uop::cached_property::CachedProperty;
+        use crate::uop::properties::ShapeProperty;
+        ShapeProperty::get(self).as_ref()
     }
 
     /// Topological sort of the computation graph.
@@ -125,14 +133,223 @@ impl UOp {
         result
     }
 
+    /// Topological sort with gate function (filtered toposort).
+    ///
+    /// Only traverses nodes for which `gate(node)` returns true.
+    /// Nodes for which gate returns false are excluded from the
+    /// traversal entirely (along with their ancestors).
+    ///
+    /// This is a key optimization for cached property computation,
+    /// allowing us to skip nodes that already have a property cached.
+    ///
+    /// # Performance
+    ///
+    /// For a graph with 10,000 nodes where 9,900 already have a cached property:
+    /// - **Full toposort**: 10,000 nodes visited
+    /// - **Filtered toposort**: 100 nodes visited
+    /// - **Speedup**: 100x
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Only process nodes that don't have shape cached
+    /// let uncached = uop.toposort_filtered(|node| {
+    ///     node.shape_cache.get().is_none()
+    /// });
+    /// ```
+    pub fn toposort_filtered<F>(self: &Rc<Self>, gate: F) -> Vec<Rc<Self>>
+    where
+        F: Fn(&Rc<UOp>) -> bool,
+    {
+        let mut visited = HashSet::new();
+        let mut result = Vec::new();
+        let mut stack = vec![(self.clone(), false)];
+
+        while let Some((node, processed)) = stack.pop() {
+            let ptr = Rc::as_ptr(&node);
+
+            if visited.contains(&ptr) {
+                continue;
+            }
+
+            if processed {
+                visited.insert(ptr);
+                result.push(node);
+            } else {
+                // Key optimization: only traverse nodes that pass the gate
+                if gate(&node) {
+                    stack.push((node.clone(), true));
+
+                    let mut children = Vec::new();
+                    node.op.map_child(|child| {
+                        if !visited.contains(&Rc::as_ptr(child)) {
+                            children.push(child.clone());
+                        }
+                    });
+
+                    // Push in reverse order for proper traversal
+                    for child in children.into_iter().rev() {
+                        stack.push((child, false));
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     /// Get all RANGE operations in this UOp's computation graph.
     ///
     /// Lazily computed and cached. Useful for rangeify pass to track loop variables.
     pub fn ranges(self: &Rc<Self>) -> &Vec<Rc<Self>> {
-        self.ranges_cache.get_or_init(|| {
-            use crate::Op;
-            self.toposort().into_iter().filter(|node| matches!(node.op, Op::Range { .. })).collect()
+        use crate::uop::cached_property::CachedProperty;
+        use crate::uop::properties::RangesProperty;
+        RangesProperty::get(self)
+    }
+
+    /// Get the RANGE operations that are in scope at this UOp.
+    ///
+    /// Returns only the ranges that are currently "active" (not yet ended).
+    /// This is computed by:
+    /// 1. Merging ranges from all source operations
+    /// 2. Removing ranges that are ended by this operation
+    /// 3. Adding self if this is a RANGE operation
+    ///
+    /// Based on Tinygrad's `ranges` property (ops.py:318-320) and
+    /// `_ranges` recursive property (ops.py:302-315).
+    ///
+    /// # Returns
+    ///
+    /// A HashSet of RANGE UOps that are in scope at this point in the graph.
+    /// The result is cached for performance.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use morok_ir::{UOp, AxisType};
+    ///
+    /// // A simple computation inside a range
+    /// let range = UOp::range(end, 0, AxisType::Loop);
+    /// let value = UOp::const_(...);
+    /// let end_op = UOp::end(value, vec![range.clone()]);
+    ///
+    /// // Value has range in scope
+    /// assert!(value.in_scope_ranges().contains(&range));
+    ///
+    /// // After END, range is no longer in scope
+    /// assert!(!end_op.in_scope_ranges().contains(&range));
+    /// ```
+    pub fn in_scope_ranges(self: &Rc<Self>) -> &HashSet<UOpKey> {
+        use crate::uop::cached_property::CachedProperty;
+        use crate::uop::properties::InScopeRangesProperty;
+        InScopeRangesProperty::get(self)
+    }
+
+    /// Internal helper to compute in-scope ranges via toposort.
+    ///
+    /// Uses toposort to ensure we process nodes in dependency order,
+    /// computing each node's scope from its sources' scopes.
+    pub(crate) fn compute_in_scope_ranges(self: &Rc<Self>) -> HashSet<UOpKey> {
+        use crate::Op;
+
+        // Map from UOp ID to its computed in-scope ranges
+        let mut scope_map: HashMap<u64, HashSet<UOpKey>> = HashMap::new();
+
+        // Process in topological order (sources before consumers)
+        for node in self.toposort() {
+            let mut in_scope: HashSet<UOpKey> = HashSet::new();
+
+            // Step 1: Merge ranges from all sources
+            node.op.map_child(|src| {
+                if let Some(src_ranges) = scope_map.get(&src.id) {
+                    in_scope.extend(src_ranges.iter().cloned());
+                }
+            });
+
+            // Step 2: Remove ended ranges
+            for ended in node.op.ended_ranges() {
+                match ended.op() {
+                    Op::Range { .. } => {
+                        // Remove the specific RANGE
+                        in_scope.remove(&UOpKey(ended.clone()));
+                    }
+                    _ => {
+                        // Remove all ranges that were in the ended op's scope
+                        if let Some(ended_scope) = scope_map.get(&ended.id) {
+                            for r in ended_scope.iter() {
+                                in_scope.remove(r);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step 3: If this is a RANGE, add it to scope
+            if matches!(node.op, Op::Range { .. }) {
+                in_scope.insert(UOpKey(node.clone()));
+            }
+
+            scope_map.insert(node.id, in_scope);
+        }
+
+        // Return the scope for this node
+        scope_map.remove(&self.id).unwrap_or_default()
+    }
+
+    /// Check if all in-scope ranges at this UOp have the given AxisType.
+    ///
+    /// Returns true if the in-scope ranges set is empty or all ranges
+    /// match the specified axis type.
+    ///
+    /// # Use Cases
+    ///
+    /// - `all_in_scope_ranges_are(AxisType::Outer)` - Used in split_store
+    ///   to determine if we're at a kernel boundary
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use morok_ir::{UOp, AxisType};
+    ///
+    /// // At kernel boundary: only OUTER ranges in scope
+    /// assert!(uop.all_in_scope_ranges_are(AxisType::Outer));
+    ///
+    /// // Inside kernel: has non-OUTER ranges
+    /// assert!(!uop.all_in_scope_ranges_are(AxisType::Outer));
+    /// ```
+    pub fn all_in_scope_ranges_are(self: &Rc<Self>, axis_type: AxisType) -> bool {
+        use crate::Op;
+
+        let ranges = self.in_scope_ranges();
+
+        // Empty scope means we're at the top level (treat as all OUTER)
+        if ranges.is_empty() {
+            return true;
+        }
+
+        ranges.iter().all(|r| match r.0.op() {
+            Op::Range { axis_type: at, .. } => *at == axis_type,
+            _ => false, // Should never happen
         })
+    }
+
+    /// Check if any in-scope range is NOT of the given AxisType.
+    ///
+    /// Inverse of `all_in_scope_ranges_are`. Useful for Tinygrad-style
+    /// filtering: "skip if any range is not OUTER".
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use morok_ir::{UOp, AxisType};
+    ///
+    /// // Has non-OUTER ranges: should skip in split_store
+    /// if uop.has_non_outer_ranges() {
+    ///     return None;  // Don't split here
+    /// }
+    /// ```
+    pub fn has_non_outer_ranges(self: &Rc<Self>) -> bool {
+        !self.all_in_scope_ranges_are(AxisType::Outer)
     }
 
     /// Build a consumer map for this UOp's computation graph.
@@ -925,6 +1142,7 @@ impl Clone for UOp {
             dtype: self.dtype.clone(),
             shape_cache: std::cell::OnceCell::new(),
             ranges_cache: std::cell::OnceCell::new(),
+            in_scope_ranges_cache: std::cell::OnceCell::new(),
         }
     }
 }

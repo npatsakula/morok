@@ -336,10 +336,11 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
 
     let mut ctx = KernelContext::new();
 
-    // Create a BUFFERIZE operation
+    // Create a BUFFERIZE operation with OUTER range
+    // (split_store only splits at kernel boundaries where all ranges are OUTER)
     let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
     let range = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(10)), axis_id: 0, axis_type: AxisType::Loop },
+        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(10)), axis_id: 0, axis_type: AxisType::Outer },
         DType::Index,
     );
 

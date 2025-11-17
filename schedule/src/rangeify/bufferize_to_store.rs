@@ -51,15 +51,27 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
         _ => return None,
     };
 
-    // Create buffer allocation based on address space
-    let buffer = if opts.addrspace == AddrSpace::Global {
-        // Global memory: DEFINE_GLOBAL
-        let global_id = ctx.next_global();
-        UOp::new(Op::DefineGlobal(global_id), compute.dtype())
+    // Check if we've already allocated a buffer for this BUFFERIZE
+    // If so, reuse it to avoid creating duplicate buffers for the same operation
+    let buffer = if let Some(existing_buffer) = ctx.get_buffer(bufferize_op) {
+        // Reuse existing buffer
+        existing_buffer.clone()
     } else {
-        // Local/shared memory: DEFINE_LOCAL
-        let local_id = ctx.next_local();
-        UOp::new(Op::DefineLocal(local_id), compute.dtype())
+        // Create new buffer allocation based on address space
+        let buffer = if opts.addrspace == AddrSpace::Global {
+            // Global memory: DEFINE_GLOBAL
+            let global_id = ctx.next_global();
+            UOp::new(Op::DefineGlobal(global_id), compute.dtype())
+        } else {
+            // Local/shared memory: DEFINE_LOCAL
+            let local_id = ctx.next_local();
+            UOp::new(Op::DefineLocal(local_id), compute.dtype())
+        };
+
+        // Track the buffer in context for later reference
+        ctx.map_buffer(bufferize_op.clone(), buffer.clone());
+
+        buffer
     };
 
     // Create index for the STORE
@@ -91,9 +103,6 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
     if opts.addrspace == AddrSpace::Local {
         result = UOp::new(Op::Barrier { src: result, deps: SmallVec::new() }, DType::Void);
     }
-
-    // Track the buffer in context for later reference
-    ctx.map_buffer(bufferize_op.clone(), buffer);
 
     Some(result)
 }
