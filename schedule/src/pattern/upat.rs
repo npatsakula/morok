@@ -674,6 +674,27 @@ impl UPat {
         Self::binary_op(BinaryOp::Lt, self, rhs)
     }
 
+    /// Match less-than-or-equal operation: `a <= b`
+    /// Note: This is typically represented as !(a > b) = !(b < a) in the IR
+    /// For now, this is not directly supported - use lt() instead
+    pub fn le(self, _rhs: UPat) -> UPat {
+        panic!("Le operation not directly supported in IR - express as !(b < a)")
+    }
+
+    /// Match greater-than operation: `a > b`
+    /// Note: This is typically represented as b < a in the IR
+    pub fn gt(self, rhs: UPat) -> UPat {
+        // a > b is b < a
+        rhs.lt(self)
+    }
+
+    /// Match greater-than-or-equal operation: `a >= b`
+    /// Note: This is typically represented as !(a < b) in the IR
+    /// For now, this is not directly supported - use lt() instead
+    pub fn ge(self, _rhs: UPat) -> UPat {
+        panic!("Ge operation not directly supported in IR - express as !(a < b)")
+    }
+
     /// Match equality operation: `a == b`
     ///
     /// Note: This is a method, not the `==` operator, because Rust's `==`

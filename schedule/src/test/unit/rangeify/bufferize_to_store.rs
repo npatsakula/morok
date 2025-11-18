@@ -1,6 +1,5 @@
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
-use smallvec::SmallVec;
+use morok_ir::{AxisType, ConstValue, Op, UOp};
 
 use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store};
 
@@ -10,19 +9,9 @@ fn test_bufferize_to_store_global() {
 
     // Create a simple BUFFERIZE with one range
     let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(10)), axis_id: 0, axis_type: AxisType::Loop },
-        DType::Index,
-    );
+    let range = UOp::range_const(10, 0);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute: compute.clone(),
-            ranges: smallvec::smallvec![range.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize = UOp::bufferize_global(compute.clone(), vec![range.clone()]);
 
     // Convert to STORE
     let result = bufferize_to_store(&bufferize, &mut ctx);
@@ -67,19 +56,9 @@ fn test_bufferize_to_store_local_with_barrier() {
 
     // Create BUFFERIZE with LOCAL addrspace
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(5)), axis_id: 0, axis_type: AxisType::Loop },
-        DType::Index,
-    );
+    let range = UOp::range_const(5, 0);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute: compute.clone(),
-            ranges: smallvec::smallvec![range.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Local },
-        },
-        DType::Float32,
-    );
+    let bufferize = UOp::bufferize_local(compute.clone(), vec![range.clone()]);
 
     // Convert to STORE
     let result = bufferize_to_store(&bufferize, &mut ctx);
@@ -121,23 +100,10 @@ fn test_bufferize_to_store_multiple_ranges() {
 
     // Create BUFFERIZE with multiple ranges
     let compute = UOp::const_(DType::Int32, ConstValue::Int(100));
-    let range1 = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(4)), axis_id: 0, axis_type: AxisType::Loop },
-        DType::Index,
-    );
-    let range2 = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(8)), axis_id: 1, axis_type: AxisType::Loop },
-        DType::Index,
-    );
+    let range1 = UOp::range_const(4, 0);
+    let range2 = UOp::range_const(8, 1);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute: compute.clone(),
-            ranges: smallvec::smallvec![range1.clone(), range2.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Int32,
-    );
+    let bufferize = UOp::bufferize_global(compute.clone(), vec![range1.clone(), range2.clone()]);
 
     // Convert to STORE
     let result = bufferize_to_store(&bufferize, &mut ctx);
@@ -199,14 +165,7 @@ fn test_buffer_tracked_in_context() {
     let mut ctx = KernelContext::new();
 
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute,
-            ranges: SmallVec::new(),
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize = UOp::bufferize_global(compute, vec![]);
 
     // Before conversion, buffer should not be tracked
     assert!(!ctx.has_buffer(&bufferize));
@@ -229,14 +188,7 @@ fn test_bufferize_to_store_sequential_global_ids() {
     // Create three BUFFERIZE operations
     for i in 0..3 {
         let compute = UOp::const_(DType::Float32, ConstValue::Float(i as f64));
-        let bufferize = UOp::new(
-            Op::Bufferize {
-                compute,
-                ranges: SmallVec::new(),
-                opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-            },
-            DType::Float32,
-        );
+        let bufferize = UOp::bufferize_global(compute, vec![]);
 
         bufferize_to_store(&bufferize, &mut ctx);
 
@@ -253,14 +205,7 @@ fn test_bufferize_to_store_sequential_local_ids() {
     // Create three BUFFERIZE operations with LOCAL addrspace
     for i in 0..3 {
         let compute = UOp::const_(DType::Float32, ConstValue::Float(i as f64));
-        let bufferize = UOp::new(
-            Op::Bufferize {
-                compute,
-                ranges: SmallVec::new(),
-                opts: BufferizeOpts { device: None, addrspace: AddrSpace::Local },
-            },
-            DType::Float32,
-        );
+        let bufferize = UOp::bufferize_local(compute, vec![]);
 
         bufferize_to_store(&bufferize, &mut ctx);
 
@@ -278,24 +223,10 @@ fn test_bufferize_to_store_mixed_global_local() {
     let local_compute = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
     // Global buffer
-    let global_bufferize = UOp::new(
-        Op::Bufferize {
-            compute: global_compute.clone(),
-            ranges: SmallVec::new(),
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let global_bufferize = UOp::bufferize_global(global_compute.clone(), vec![]);
 
     // Local buffer
-    let local_bufferize = UOp::new(
-        Op::Bufferize {
-            compute: local_compute.clone(),
-            ranges: SmallVec::new(),
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Local },
-        },
-        DType::Float32,
-    );
+    let local_bufferize = UOp::bufferize_local(local_compute.clone(), vec![]);
 
     // Convert both
     let global_result = bufferize_to_store(&global_bufferize, &mut ctx);
@@ -339,19 +270,9 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
     // Create a BUFFERIZE operation with OUTER range
     // (split_store only splits at kernel boundaries where all ranges are OUTER)
     let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(10)), axis_id: 0, axis_type: AxisType::Outer },
-        DType::Index,
-    );
+    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Outer);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute: compute.clone(),
-            ranges: smallvec::smallvec![range],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize = UOp::bufferize_global(compute.clone(), vec![range]);
 
     // Stage 1: BUFFERIZE → STORE
     let store_result = bufferize_to_store(&bufferize, &mut ctx).unwrap();

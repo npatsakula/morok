@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use morok_ir::{AddrSpace, AxisType, BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
+use morok_ir::{BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
 
 use crate::rangeify::helpers::{get_const_value, is_const, is_identity_value, is_zero_value};
 
@@ -62,17 +62,17 @@ pub fn create_const(val: i64) -> Rc<UOp> {
 
 /// Create a RANGE operation with constant end value.
 pub fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
-    UOp::new(Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop }, DType::Index)
+    UOp::range_const(end, axis_id)
 }
 
 /// Create a RANGE operation with symbolic end value.
 pub fn create_range_symbolic(end: Rc<UOp>, axis_id: usize) -> Rc<UOp> {
-    UOp::new(Op::Range { end, axis_id, axis_type: AxisType::Loop }, DType::Index)
+    UOp::range(end, axis_id)
 }
 
 /// Create a BUFFERIZE operation with global address space.
 pub fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
-    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
+    UOp::bufferize_global(compute, ranges)
 }
 
 /// Create a BUFFERIZE operation with custom options.

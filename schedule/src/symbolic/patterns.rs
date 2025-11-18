@@ -10,7 +10,8 @@
 //! These patterns are separated from rangeify patterns because they apply
 //! universally to any UOp graph, not just during schedule transformation.
 
-use morok_ir::{BinaryOp, TernaryOp, UnaryOp};
+use morok_ir::UOp;
+use morok_ir::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
 
 use crate::pattern::UPat;
 use crate::pattern::matcher::PatternMatcher;
@@ -92,9 +93,10 @@ pub fn symbolic_simple() -> PatternMatcher {
     binary_const_fold!(patterns, Pow);
     binary_const_fold!(patterns, Idiv);
     binary_const_fold!(patterns, Fdiv);
-    binary_const_fold!(patterns, Lt, comparison);
-    binary_const_fold!(patterns, Eq, comparison);
-    binary_const_fold!(patterns, Ne, comparison);
+    // Note: Lt, Eq, Ne are handled specially below to support both constant folding AND DCE
+    // binary_const_fold!(patterns, Lt, comparison);
+    // binary_const_fold!(patterns, Eq, comparison);
+    // binary_const_fold!(patterns, Ne, comparison);
     binary_const_fold!(patterns, And);
     binary_const_fold!(patterns, Or);
     binary_const_fold!(patterns, Xor);
@@ -123,6 +125,68 @@ pub fn symbolic_simple() -> PatternMatcher {
             Some(morok_ir::UOp::const_(a.dtype(), result))
         }
     );
+
+    // ========== Dead Code Elimination (DCE) ==========
+    // These patterns use vmin/vmax range analysis to eliminate dead code
+
+    // WHERE with constant condition → select appropriate branch
+    pattern!(patterns,
+        UPat::ternary(vec![TernaryOp::Where], vec![UPat::var("cond"), UPat::var("true_val"), UPat::var("false_val")])
+        => |cond, true_val, false_val| {
+            use morok_ir::uop::cached_property::CachedProperty;
+            use morok_ir::uop::properties::VminVmaxProperty;
+
+            let (vmin, vmax) = VminVmaxProperty::get(cond);
+            match (*vmin, *vmax) {
+                (ConstValue::Bool(true), ConstValue::Bool(true)) => Some(Rc::clone(true_val)),
+                (ConstValue::Bool(false), ConstValue::Bool(false)) => Some(Rc::clone(false_val)),
+                _ => None
+            }
+        }
+    );
+
+    // Comparison patterns (Lt, Eq, Ne) with unified handler
+    // Note: We only handle Lt, Eq, Ne since those are the only comparison ops in BinaryOp
+    // Other comparisons (Gt, Le, Ge) are typically expressed using these primitives
+    macro_rules! apply_comparison_pattern {
+        ($patterns:ident, $method:ident, $variant:ident) => {
+            pattern!($patterns,
+                UPat::var("x").$method(UPat::var("y")) => |x: &Rc<UOp>, y: &Rc<UOp>| {
+                    use morok_ir::uop::eval::eval_binary_op;
+                    use morok_ir::uop::comparison_analysis::ComparisonAnalyzer;
+
+                    // 1. Self-comparison fast path (before constant folding for efficiency)
+                    if Rc::ptr_eq(x, y) && !x.dtype().is_float() {
+                        let result = match BinaryOp::$variant {
+                            BinaryOp::Lt => ConstValue::Bool(false),
+                            BinaryOp::Eq => ConstValue::Bool(true),
+                            BinaryOp::Ne => ConstValue::Bool(false),
+                            _ => return None,
+                        };
+                        return Some(UOp::const_(morok_dtype::DType::Bool, result));
+                    }
+
+                    // 2. Constant folding
+                    if let (Some(a_val), Some(b_val)) = (get_const_value(x), get_const_value(y)) {
+                        if let Some(result) = eval_binary_op(BinaryOp::$variant, a_val, b_val) {
+                            return Some(UOp::const_(morok_dtype::DType::Bool, result));
+                        }
+                    }
+
+                    // 3. Range-based analysis
+                    if let Some(result) = ComparisonAnalyzer::analyze(BinaryOp::$variant, x, y) {
+                        return Some(UOp::const_(morok_dtype::DType::Bool, ConstValue::Bool(result)));
+                    }
+
+                    None
+                }
+            );
+        };
+    }
+
+    apply_comparison_pattern!(patterns, lt, Lt);
+    apply_comparison_pattern!(patterns, eq, Eq);
+    apply_comparison_pattern!(patterns, ne, Ne);
 
     // ========== Identity folding ==========
 
@@ -360,11 +424,12 @@ pub fn symbolic_simple() -> PatternMatcher {
 
     // ====== ZERO FOLDING  ======
 
-    // x < x → False
+    // x < x → False (for non-float types; float NaN < NaN is also false but handled conservatively)
     pattern!(patterns,
         UPat::binary(vec![BinaryOp::Lt], vec![UPat::var("x"), UPat::var("x2")]) => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
             use morok_ir::{ConstValue, UOp};
-            if Rc::ptr_eq(x, x2) {
+            // Only apply for non-float types to avoid NaN edge cases
+            if Rc::ptr_eq(x, x2) && !x.dtype().is_float() {
                 Some(UOp::const_(x.dtype(), ConstValue::Bool(false)))
             } else {
                 None

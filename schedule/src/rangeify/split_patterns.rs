@@ -218,7 +218,7 @@ pub fn renumber_range(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelConte
     }
 
     // Create new RANGE with renumbered axis_id
-    let new_range = UOp::range(end.clone(), new_axis_id, axis_type);
+    let new_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);
 
     RewriteResult::Rewritten(new_range)
 }

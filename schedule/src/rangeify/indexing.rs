@@ -63,7 +63,7 @@ impl IndexingContext {
             SInt::Symbolic(uop) => Rc::clone(uop),
         };
 
-        UOp::new(Op::Range { end: size_uop, axis_id: range_id, axis_type: axistype }, DType::Index)
+        UOp::range_axis(size_uop, range_id, axistype)
     }
 
     /// Mark a UOp for realization on all axes.

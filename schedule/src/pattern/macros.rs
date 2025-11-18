@@ -87,7 +87,10 @@ macro_rules! pattern {
             Box::new(|bindings: &std::collections::HashMap<String, std::rc::Rc<$crate::UOp>>| {
                 // Extract each variable from bindings
                 $(
-                    let $var: $ty = match bindings.get(stringify!($var)) {
+                    // Strip leading underscore from variable name for lookup
+                    // (e.g., "_x" -> "x" to match UPat::var("x"))
+                    let var_name = stringify!($var).trim_start_matches('_');
+                    let $var: $ty = match bindings.get(var_name) {
                         Some(v) => v,
                         None => return $crate::pattern::matcher::RewriteResult::NoMatch,
                     };
@@ -114,7 +117,10 @@ macro_rules! pattern {
             Box::new(|bindings: &std::collections::HashMap<String, std::rc::Rc<$crate::UOp>>| {
                 // Extract each variable from bindings
                 $(
-                    let $var = match bindings.get(stringify!($var)) {
+                    // Strip leading underscore from variable name for lookup
+                    // (e.g., "_x" -> "x" to match UPat::var("x"))
+                    let var_name = stringify!($var).trim_start_matches('_');
+                    let $var = match bindings.get(var_name) {
                         Some(v) => v,
                         None => return $crate::pattern::matcher::RewriteResult::NoMatch,
                     };

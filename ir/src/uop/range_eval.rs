@@ -40,15 +40,11 @@ pub fn compute_vmin_vmax(uop: &Rc<UOp>) -> (ConstValue, ConstValue) {
             let (cond_min, cond_max) = VminVmaxProperty::get(a);
             let (true_min, true_max) = VminVmaxProperty::get(b);
             let (false_min, false_max) = VminVmaxProperty::get(c);
-            compute_ternary_range(*op, *cond_min, *cond_max,
-                                 *true_min, *true_max,
-                                 *false_min, *false_max, &uop.dtype)
+            compute_ternary_range(*op, *cond_min, *cond_max, *true_min, *true_max, *false_min, *false_max, &uop.dtype)
         }
 
         // DefineVar has explicit min/max values
-        Op::DefineVar { min_val, max_val, .. } => {
-            (ConstValue::Int(*min_val), ConstValue::Int(*max_val))
-        }
+        Op::DefineVar { min_val, max_val, .. } => (ConstValue::Int(*min_val), ConstValue::Int(*max_val)),
 
         // Range operations go from 0 to end-1
         Op::Range { end, .. } => {
@@ -65,6 +61,17 @@ pub fn compute_vmin_vmax(uop: &Rc<UOp>) -> (ConstValue, ConstValue) {
         // Cast operations clamp to target dtype bounds
         Op::Cast { src, .. } => {
             let (src_min, src_max) = VminVmaxProperty::get(src);
+
+            // Check for float special values (NaN, infinity) when casting
+            // These can't be safely clamped and should result in conservative bounds
+            let has_special_values = matches!(src_min, ConstValue::Float(f) if f.is_nan() || f.is_infinite())
+                || matches!(src_max, ConstValue::Float(f) if f.is_nan() || f.is_infinite());
+
+            if has_special_values {
+                // Conservative: return full dtype bounds for special values
+                return dtype_bounds(&uop.dtype);
+            }
+
             let (target_min, target_max) = dtype_bounds(&uop.dtype);
 
             // Clamp source range to target bounds, then cast
@@ -110,11 +117,7 @@ fn compute_unary_range(op: UnaryOp, vmin: ConstValue, vmax: ConstValue, dtype: &
             match (val_min, val_max) {
                 (Some(min), Some(max)) => {
                     // Ensure min <= max (for non-monotonic functions)
-                    if compare_const_values(&min, &max) == Ordering::Greater {
-                        (max, min)
-                    } else {
-                        (min, max)
-                    }
+                    if compare_const_values(&min, &max) == Ordering::Greater { (max, min) } else { (min, max) }
                 }
                 _ => dtype_bounds(dtype),
             }
@@ -127,8 +130,14 @@ fn compute_unary_range(op: UnaryOp, vmin: ConstValue, vmax: ConstValue, dtype: &
 // ============================================================================
 
 /// Compute range for binary operations.
-fn compute_binary_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
-                        b_min: ConstValue, b_max: ConstValue, dtype: &DType) -> (ConstValue, ConstValue) {
+fn compute_binary_range(
+    op: BinaryOp,
+    a_min: ConstValue,
+    a_max: ConstValue,
+    b_min: ConstValue,
+    b_max: ConstValue,
+    dtype: &DType,
+) -> (ConstValue, ConstValue) {
     use crate::uop::eval::eval_binary_op;
 
     // Fast path: if both operands are constants, evaluate exactly
@@ -141,16 +150,50 @@ fn compute_binary_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
     }
 
     match op {
-        // Simple arithmetic operations
+        // Arithmetic operations with overflow checking
         BinaryOp::Add => {
-            let min = eval_binary_op(BinaryOp::Add, a_min, b_min).unwrap_or_else(|| dtype_bounds(dtype).0);
-            let max = eval_binary_op(BinaryOp::Add, a_max, b_max).unwrap_or_else(|| dtype_bounds(dtype).1);
-            (min, max)
+            match (a_min, a_max, b_min, b_max) {
+                (ConstValue::Int(amin), ConstValue::Int(amax), ConstValue::Int(bmin), ConstValue::Int(bmax)) => {
+                    match (amin.checked_add(bmin), amax.checked_add(bmax)) {
+                        (Some(min), Some(max)) => (ConstValue::Int(min), ConstValue::Int(max)),
+                        _ => dtype_bounds(dtype), // Overflow - return conservative bounds
+                    }
+                }
+                (ConstValue::UInt(amin), ConstValue::UInt(amax), ConstValue::UInt(bmin), ConstValue::UInt(bmax)) => {
+                    match (amin.checked_add(bmin), amax.checked_add(bmax)) {
+                        (Some(min), Some(max)) => (ConstValue::UInt(min), ConstValue::UInt(max)),
+                        _ => dtype_bounds(dtype), // Overflow - return conservative bounds
+                    }
+                }
+                _ => {
+                    // Float or fallback - use eval_binary_op (floats don't overflow to wrong values)
+                    let min = eval_binary_op(BinaryOp::Add, a_min, b_min).unwrap_or_else(|| dtype_bounds(dtype).0);
+                    let max = eval_binary_op(BinaryOp::Add, a_max, b_max).unwrap_or_else(|| dtype_bounds(dtype).1);
+                    (min, max)
+                }
+            }
         }
         BinaryOp::Sub => {
-            let min = eval_binary_op(BinaryOp::Sub, a_min, b_max).unwrap_or_else(|| dtype_bounds(dtype).0);
-            let max = eval_binary_op(BinaryOp::Sub, a_max, b_min).unwrap_or_else(|| dtype_bounds(dtype).1);
-            (min, max)
+            match (a_min, a_max, b_min, b_max) {
+                (ConstValue::Int(amin), ConstValue::Int(amax), ConstValue::Int(bmin), ConstValue::Int(bmax)) => {
+                    match (amin.checked_sub(bmax), amax.checked_sub(bmin)) {
+                        (Some(min), Some(max)) => (ConstValue::Int(min), ConstValue::Int(max)),
+                        _ => dtype_bounds(dtype), // Overflow - return conservative bounds
+                    }
+                }
+                (ConstValue::UInt(amin), ConstValue::UInt(amax), ConstValue::UInt(bmin), ConstValue::UInt(bmax)) => {
+                    match (amin.checked_sub(bmax), amax.checked_sub(bmin)) {
+                        (Some(min), Some(max)) => (ConstValue::UInt(min), ConstValue::UInt(max)),
+                        _ => dtype_bounds(dtype), // Overflow - return conservative bounds
+                    }
+                }
+                _ => {
+                    // Float or fallback
+                    let min = eval_binary_op(BinaryOp::Sub, a_min, b_max).unwrap_or_else(|| dtype_bounds(dtype).0);
+                    let max = eval_binary_op(BinaryOp::Sub, a_max, b_min).unwrap_or_else(|| dtype_bounds(dtype).1);
+                    (min, max)
+                }
+            }
         }
         BinaryOp::Max => {
             let min = eval_binary_op(BinaryOp::Max, a_min, b_min).unwrap_or_else(|| dtype_bounds(dtype).0);
@@ -159,9 +202,7 @@ fn compute_binary_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
         }
 
         // Operations requiring all four corners
-        BinaryOp::Mul | BinaryOp::Pow => {
-            eval_four_corners(op, a_min, a_max, b_min, b_max, dtype)
-        }
+        BinaryOp::Mul | BinaryOp::Pow => eval_four_corners(op, a_min, a_max, b_min, b_max, dtype),
 
         // Division operations
         BinaryOp::Idiv | BinaryOp::Fdiv => {
@@ -184,20 +225,17 @@ fn compute_binary_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
             }
         }
 
-        // Comparison operations return bool
+        // Comparison operations - use unified ComparisonAnalyzer
         BinaryOp::Lt | BinaryOp::Eq | BinaryOp::Ne => {
-            (ConstValue::Bool(false), ConstValue::Bool(true))
+            use crate::uop::comparison_analysis::ComparisonAnalyzer;
+            ComparisonAnalyzer::get_comparison_range(op, a_min, a_max, b_min, b_max)
         }
 
         // Bitwise operations
-        BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
-            compute_bitwise_range(op, a_min, a_max, b_min, b_max, dtype)
-        }
+        BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => compute_bitwise_range(op, a_min, a_max, b_min, b_max, dtype),
 
         // Shift operations
-        BinaryOp::Shl | BinaryOp::Shr => {
-            compute_shift_range(op, a_min, a_max, b_min, b_max, dtype)
-        }
+        BinaryOp::Shl | BinaryOp::Shr => compute_shift_range(op, a_min, a_max, b_min, b_max, dtype),
 
         // PRNG - unpredictable
         BinaryOp::Threefry => dtype_bounds(dtype),
@@ -205,9 +243,14 @@ fn compute_binary_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
 }
 
 /// Compute range for bitwise operations.
-fn compute_bitwise_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
-                         b_min: ConstValue, b_max: ConstValue, dtype: &DType) -> (ConstValue, ConstValue) {
-
+fn compute_bitwise_range(
+    op: BinaryOp,
+    a_min: ConstValue,
+    a_max: ConstValue,
+    b_min: ConstValue,
+    b_max: ConstValue,
+    dtype: &DType,
+) -> (ConstValue, ConstValue) {
     if dtype == &DType::Bool {
         // For bool, evaluate all combinations
         eval_four_corners(op, a_min, a_max, b_min, b_max, dtype)
@@ -216,10 +259,10 @@ fn compute_bitwise_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
             BinaryOp::And => {
                 // AND result is bounded by the smaller operand
                 // For positive values: 0 <= result <= min(a_max, b_max)
-                if let (ConstValue::Int(a), ConstValue::Int(b)) = (a_max, b_max) {
-                    if a >= 0 && b >= 0 {
-                        return (ConstValue::Int(0), ConstValue::Int(a.min(b)));
-                    }
+                if let (ConstValue::Int(a), ConstValue::Int(b)) = (a_max, b_max)
+                    && a >= 0 && b >= 0
+                {
+                    return (ConstValue::Int(0), ConstValue::Int(a.min(b)));
                 }
                 // Conservative for mixed signs or unknowns
                 dtype_bounds(dtype)
@@ -230,15 +273,38 @@ fn compute_bitwise_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
 }
 
 /// Compute range for shift operations.
-fn compute_shift_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
-                       b_min: ConstValue, b_max: ConstValue, dtype: &DType) -> (ConstValue, ConstValue) {
-    // Check if shift amount is valid (0-63 for 64-bit)
+fn compute_shift_range(
+    op: BinaryOp,
+    a_min: ConstValue,
+    a_max: ConstValue,
+    b_min: ConstValue,
+    b_max: ConstValue,
+    dtype: &DType,
+) -> (ConstValue, ConstValue) {
+    // Get the bit width of the dtype
+    let bit_width = if dtype == &DType::Int8 || dtype == &DType::UInt8 {
+        8
+    } else if dtype == &DType::Int16 || dtype == &DType::UInt16 {
+        16
+    } else if dtype == &DType::Int32 || dtype == &DType::UInt32 {
+        32
+    } else if dtype == &DType::Int64 || dtype == &DType::UInt64 {
+        64
+    } else {
+        return dtype_bounds(dtype); // Unsupported type for shifts
+    };
+
+    // Check if shift amount is valid (0 to bit_width-1)
     match (b_min, b_max) {
-        (ConstValue::Int(shift_min), ConstValue::Int(shift_max))
-            if shift_min >= 0 && shift_max < 64 => {
+        (ConstValue::Int(shift_min), ConstValue::Int(shift_max)) if shift_min >= 0 && shift_max < bit_width as i64 => {
             eval_four_corners(op, a_min, a_max, b_min, b_max, dtype)
         }
-        _ => dtype_bounds(dtype), // Invalid shift amount
+        (ConstValue::UInt(shift_min), ConstValue::UInt(shift_max))
+            if shift_min == 0 && shift_max < bit_width as u64 =>
+        {
+            eval_four_corners(op, a_min, a_max, b_min, b_max, dtype)
+        }
+        _ => dtype_bounds(dtype), // Invalid shift amount or range crosses zero
     }
 }
 
@@ -247,9 +313,17 @@ fn compute_shift_range(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
 // ============================================================================
 
 /// Compute range for ternary operations.
-fn compute_ternary_range(op: TernaryOp, cond_min: ConstValue, cond_max: ConstValue,
-                         true_min: ConstValue, true_max: ConstValue,
-                         false_min: ConstValue, false_max: ConstValue, dtype: &DType) -> (ConstValue, ConstValue) {
+#[allow(clippy::too_many_arguments)]
+fn compute_ternary_range(
+    op: TernaryOp,
+    cond_min: ConstValue,
+    cond_max: ConstValue,
+    true_min: ConstValue,
+    true_max: ConstValue,
+    false_min: ConstValue,
+    false_max: ConstValue,
+    dtype: &DType,
+) -> (ConstValue, ConstValue) {
     match op {
         TernaryOp::Where => {
             // WHERE: if cond then true_val else false_val
@@ -299,16 +373,17 @@ fn compute_ternary_range(op: TernaryOp, cond_min: ConstValue, cond_max: ConstVal
 // ============================================================================
 
 /// Evaluate binary operation at all four corners of input ranges.
-fn eval_four_corners(op: BinaryOp, a_min: ConstValue, a_max: ConstValue,
-                     b_min: ConstValue, b_max: ConstValue, dtype: &DType) -> (ConstValue, ConstValue) {
+fn eval_four_corners(
+    op: BinaryOp,
+    a_min: ConstValue,
+    a_max: ConstValue,
+    b_min: ConstValue,
+    b_max: ConstValue,
+    dtype: &DType,
+) -> (ConstValue, ConstValue) {
     use crate::uop::eval::eval_binary_op;
 
-    let corners = [
-        (a_min, b_min),
-        (a_min, b_max),
-        (a_max, b_min),
-        (a_max, b_max),
-    ];
+    let corners = [(a_min, b_min), (a_min, b_max), (a_max, b_min), (a_max, b_max)];
 
     let mut min = None;
     let mut max = None;
@@ -333,7 +408,7 @@ fn dtype_bounds(dtype: &DType) -> (ConstValue, ConstValue) {
     const BFLOAT16_MIN: f64 = -3.38953e38;
     const BFLOAT16_MAX: f64 = 3.38953e38;
 
-    let bounds = if dtype == &DType::Bool {
+    if dtype == &DType::Bool {
         (Bool(false), Bool(true))
     } else if dtype == &DType::Int8 {
         (Int(i8::MIN as i64), Int(i8::MAX as i64))
@@ -362,9 +437,7 @@ fn dtype_bounds(dtype: &DType) -> (ConstValue, ConstValue) {
     } else {
         // Default for unknown types
         (Int(0), Int(i64::MAX))
-    };
-
-    bounds
+    }
 }
 
 /// Compare two ConstValues and return the minimum.
@@ -410,6 +483,7 @@ fn compare_const_values(a: &ConstValue, b: &ConstValue) -> Ordering {
 fn contains_zero(min: ConstValue, max: ConstValue) -> bool {
     match (min, max) {
         (ConstValue::Int(min_v), ConstValue::Int(max_v)) => min_v <= 0 && max_v >= 0,
+        (ConstValue::UInt(min_v), _) => min_v == 0, // UInt range contains zero iff min is zero
         (ConstValue::Float(min_v), ConstValue::Float(max_v)) => min_v <= 0.0 && max_v >= 0.0,
         _ => false,
     }

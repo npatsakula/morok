@@ -158,6 +158,30 @@ impl UOp {
         Self::new(Op::Bufferize { compute, ranges: SmallVec::from_vec(ranges), opts }, dtype)
     }
 
+    /// Create a BUFFERIZE operation with Global address space.
+    ///
+    /// This is the most common pattern - bufferize to global memory.
+    ///
+    /// # Examples
+    /// ```
+    /// let buf = UOp::bufferize_global(compute, vec![range]);
+    /// ```
+    pub fn bufferize_global(compute: Rc<Self>, ranges: Vec<Rc<Self>>) -> Rc<Self> {
+        Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
+    }
+
+    /// Create a BUFFERIZE operation with Local address space.
+    ///
+    /// For shared/local memory bufferization.
+    ///
+    /// # Examples
+    /// ```
+    /// let buf = UOp::bufferize_local(compute, vec![range]);
+    /// ```
+    pub fn bufferize_local(compute: Rc<Self>, ranges: Vec<Rc<Self>>) -> Rc<Self> {
+        Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Local })
+    }
+
     /// Create a LOAD operation.
     ///
     /// Loads a value from a buffer at the given index.
@@ -202,6 +226,67 @@ impl UOp {
     /// Defines a local (shared) memory allocation with the given ID.
     pub fn define_local(id: usize, dtype: DType) -> Rc<Self> {
         Self::new(Op::DefineLocal(id), dtype)
+    }
+
+    /// Create a DefineVar operation for range-bounded variables.
+    ///
+    /// Used in testing and symbolic analysis to define variables with known ranges.
+    /// This significantly reduces boilerplate compared to manual Op construction.
+    ///
+    /// # Examples
+    /// ```
+    /// let idx = UOp::var("idx", DType::Int32, 0, 15);
+    /// ```
+    pub fn var(name: impl Into<String>, dtype: DType, min_val: i64, max_val: i64) -> Rc<Self> {
+        Self::new(Op::DefineVar { name: name.into(), min_val, max_val }, dtype)
+    }
+
+    /// Create a Range operation with default Loop axis type.
+    ///
+    /// This is the most common range pattern - a loop from 0 to end.
+    /// Returns Index dtype by default, which is standard for ranges.
+    ///
+    /// # Examples
+    /// ```
+    /// let range = UOp::range(UOp::const_(DType::Int32, ConstValue::Int(10)), 0);
+    /// ```
+    pub fn range(end: Rc<Self>, axis_id: usize) -> Rc<Self> {
+        Self::range_typed(end, axis_id, AxisType::Loop, DType::Index)
+    }
+
+    /// Create a Range operation with specified axis type.
+    ///
+    /// Use when you need specific axis types like Reduce or Outer.
+    ///
+    /// # Examples
+    /// ```
+    /// let range = UOp::range_axis(end, 0, AxisType::Reduce);
+    /// ```
+    pub fn range_axis(end: Rc<Self>, axis_id: usize, axis_type: AxisType) -> Rc<Self> {
+        Self::range_typed(end, axis_id, axis_type, DType::Index)
+    }
+
+    /// Create a Range operation with full control over all parameters.
+    ///
+    /// # Examples
+    /// ```
+    /// let range = UOp::range_typed(end, 0, AxisType::Loop, DType::Int32);
+    /// ```
+    pub fn range_typed(end: Rc<Self>, axis_id: usize, axis_type: AxisType, dtype: DType) -> Rc<Self> {
+        Self::new(Op::Range { end, axis_id, axis_type }, dtype)
+    }
+
+    /// Create a Range with a constant integer end value.
+    ///
+    /// Convenience method that combines const creation with range.
+    ///
+    /// # Examples
+    /// ```
+    /// let range = UOp::range_const(10, 0);  // Range from 0 to 10
+    /// ```
+    pub fn range_const(end_val: i64, axis_id: usize) -> Rc<Self> {
+        let end = Self::const_(DType::Index, ConstValue::Int(end_val));
+        Self::range(end, axis_id)
     }
 }
 

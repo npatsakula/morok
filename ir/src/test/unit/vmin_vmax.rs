@@ -63,22 +63,8 @@ fn test_vmin_vmax_mul() {
 #[test]
 fn test_vmin_vmax_mul_range() {
     // Test multiplication with ranges
-    let a = UOp::new(
-        Op::DefineVar {
-            name: "a".to_string(),
-            min_val: -2,
-            max_val: 3,
-        },
-        DType::Int32,
-    );
-    let b = UOp::new(
-        Op::DefineVar {
-            name: "b".to_string(),
-            min_val: -1,
-            max_val: 4,
-        },
-        DType::Int32,
-    );
+    let a = UOp::new(Op::DefineVar { name: "a".to_string(), min_val: -2, max_val: 3 }, DType::Int32);
+    let b = UOp::new(Op::DefineVar { name: "b".to_string(), min_val: -1, max_val: 4 }, DType::Int32);
     let prod = UOp::new(Op::Binary(BinaryOp::Mul, a, b), DType::Int32);
 
     // Check all 4 corners: -2*-1=2, -2*4=-8, 3*-1=-3, 3*4=12
@@ -132,14 +118,7 @@ fn test_vmin_vmax_neg() {
 
 #[test]
 fn test_vmin_vmax_neg_range() {
-    let var = UOp::new(
-        Op::DefineVar {
-            name: "x".to_string(),
-            min_val: -3,
-            max_val: 5,
-        },
-        DType::Int32,
-    );
+    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: -3, max_val: 5 }, DType::Int32);
     let neg = UOp::new(Op::Unary(UnaryOp::Neg, var), DType::Int32);
 
     // Negation flips the range
@@ -157,8 +136,8 @@ fn test_vmin_vmax_cmplt() {
     let b = UOp::const_(DType::Int32, ConstValue::Int(10));
     let cmp = UOp::new(Op::Binary(BinaryOp::Lt, a, b), DType::Bool);
 
-    // Comparison returns bool [false, true]
-    assert_eq!(cmp.vmin(), &ConstValue::Bool(false));
+    // 5 < 10 is always true, so range is [true, true]
+    assert_eq!(cmp.vmin(), &ConstValue::Bool(true));
     assert_eq!(cmp.vmax(), &ConstValue::Bool(true));
 }
 
@@ -168,8 +147,8 @@ fn test_vmin_vmax_eq() {
     let b = UOp::const_(DType::Int32, ConstValue::Int(5));
     let eq = UOp::new(Op::Binary(BinaryOp::Eq, a, b), DType::Bool);
 
-    // Comparison returns bool [false, true]
-    assert_eq!(eq.vmin(), &ConstValue::Bool(false));
+    // 5 == 5 is always true, so range is [true, true]
+    assert_eq!(eq.vmin(), &ConstValue::Bool(true));
     assert_eq!(eq.vmax(), &ConstValue::Bool(true));
 }
 
@@ -202,7 +181,7 @@ fn test_vmin_vmax_or_bool() {
 #[test]
 fn test_vmin_vmax_and_int() {
     let a = UOp::const_(DType::Int32, ConstValue::Int(15)); // 0b1111
-    let b = UOp::const_(DType::Int32, ConstValue::Int(7));  // 0b0111
+    let b = UOp::const_(DType::Int32, ConstValue::Int(7)); // 0b0111
     let and = UOp::new(Op::Binary(BinaryOp::And, a, b), DType::Int32);
 
     // 15 & 7 = 7
@@ -238,14 +217,7 @@ fn test_vmin_vmax_shr() {
 
 #[test]
 fn test_vmin_vmax_define_var() {
-    let var = UOp::new(
-        Op::DefineVar {
-            name: "x".to_string(),
-            min_val: -10,
-            max_val: 20,
-        },
-        DType::Int32,
-    );
+    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: -10, max_val: 20 }, DType::Int32);
 
     assert_eq!(var.vmin(), &ConstValue::Int(-10));
     assert_eq!(var.vmax(), &ConstValue::Int(20));
@@ -254,14 +226,7 @@ fn test_vmin_vmax_define_var() {
 #[test]
 fn test_vmin_vmax_range() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let range = UOp::new(
-        Op::Range {
-            end,
-            axis_id: 0,
-            axis_type: crate::types::AxisType::Loop,
-        },
-        DType::Int32,
-    );
+    let range = UOp::new(Op::Range { end, axis_id: 0, axis_type: crate::types::AxisType::Loop }, DType::Int32);
 
     // RANGE goes from 0 to end-1
     assert_eq!(range.vmin(), &ConstValue::Int(0));
@@ -271,13 +236,7 @@ fn test_vmin_vmax_range() {
 #[test]
 fn test_vmin_vmax_cast() {
     let float_val = UOp::const_(DType::Float32, ConstValue::Float(5.7));
-    let int_val = UOp::new(
-        Op::Cast {
-            src: float_val.clone(),
-            dtype: DType::Float32,
-        },
-        DType::Int32,
-    );
+    let int_val = UOp::new(Op::Cast { src: float_val.clone(), dtype: DType::Float32 }, DType::Int32);
 
     // Cast from 5.7 to int = 5
     assert_eq!(int_val.vmin(), &ConstValue::Int(5));
@@ -286,22 +245,9 @@ fn test_vmin_vmax_cast() {
 
 #[test]
 fn test_vmin_vmax_cast_range() {
-    let var = UOp::new(
-        Op::DefineVar {
-            name: "x".to_string(),
-            min_val: -1000,
-            max_val: 1000,
-        },
-        DType::Int32,
-    );
+    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: -1000, max_val: 1000 }, DType::Int32);
     // Cast to Int8 which has range [-128, 127]
-    let casted = UOp::new(
-        Op::Cast {
-            src: var.clone(),
-            dtype: DType::Int32,
-        },
-        DType::Int8,
-    );
+    let casted = UOp::new(Op::Cast { src: var.clone(), dtype: DType::Int32 }, DType::Int8);
 
     // Should be clamped to Int8 bounds
     assert_eq!(casted.vmin(), &ConstValue::Int(-128));
@@ -317,10 +263,7 @@ fn test_vmin_vmax_where_true() {
     let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let true_val = UOp::const_(DType::Int32, ConstValue::Int(10));
     let false_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let where_op = UOp::new(
-        Op::Ternary(TernaryOp::Where, cond, true_val, false_val),
-        DType::Int32,
-    );
+    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_val, false_val), DType::Int32);
 
     // Condition is always true, so result is true_val
     assert_eq!(where_op.vmin(), &ConstValue::Int(10));
@@ -332,10 +275,7 @@ fn test_vmin_vmax_where_false() {
     let cond = UOp::const_(DType::Bool, ConstValue::Bool(false));
     let true_val = UOp::const_(DType::Int32, ConstValue::Int(10));
     let false_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let where_op = UOp::new(
-        Op::Ternary(TernaryOp::Where, cond, true_val, false_val),
-        DType::Int32,
-    );
+    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_val, false_val), DType::Int32);
 
     // Condition is always false, so result is false_val
     assert_eq!(where_op.vmin(), &ConstValue::Int(5));
@@ -345,20 +285,10 @@ fn test_vmin_vmax_where_false() {
 #[test]
 fn test_vmin_vmax_where_range() {
     // Condition can be either true or false
-    let cond = UOp::new(
-        Op::DefineVar {
-            name: "cond".to_string(),
-            min_val: 0,
-            max_val: 1,
-        },
-        DType::Bool,
-    );
+    let cond = UOp::new(Op::DefineVar { name: "cond".to_string(), min_val: 0, max_val: 1 }, DType::Bool);
     let true_val = UOp::const_(DType::Int32, ConstValue::Int(10));
     let false_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let where_op = UOp::new(
-        Op::Ternary(TernaryOp::Where, cond, true_val, false_val),
-        DType::Int32,
-    );
+    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_val, false_val), DType::Int32);
 
     // Could be either branch
     assert_eq!(where_op.vmin(), &ConstValue::Int(5));
@@ -370,10 +300,7 @@ fn test_vmin_vmax_mulacc() {
     let a = UOp::const_(DType::Int32, ConstValue::Int(3));
     let b = UOp::const_(DType::Int32, ConstValue::Int(4));
     let c = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let mulacc = UOp::new(
-        Op::Ternary(TernaryOp::MulAcc, a, b, c),
-        DType::Int32,
-    );
+    let mulacc = UOp::new(Op::Ternary(TernaryOp::MulAcc, a, b, c), DType::Int32);
 
     // 3 * 4 + 5 = 17
     assert_eq!(mulacc.vmin(), &ConstValue::Int(17));
@@ -387,14 +314,7 @@ fn test_vmin_vmax_mulacc() {
 #[test]
 fn test_vmin_vmax_complex_expression() {
     // Test: (x + 5) * 2 where x in [0, 10]
-    let x = UOp::new(
-        Op::DefineVar {
-            name: "x".to_string(),
-            min_val: 0,
-            max_val: 10,
-        },
-        DType::Int32,
-    );
+    let x = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Int32);
     let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     let two = UOp::const_(DType::Int32, ConstValue::Int(2));
 
@@ -462,7 +382,7 @@ fn test_vmin_vmax_division_by_zero_range() {
         Op::DefineVar {
             name: "b".to_string(),
             min_val: -1,
-            max_val: 1,  // Includes zero!
+            max_val: 1, // Includes zero!
         },
         DType::Int32,
     );
@@ -481,7 +401,7 @@ fn test_vmin_vmax_mod_by_zero_range() {
         Op::DefineVar {
             name: "b".to_string(),
             min_val: -1,
-            max_val: 1,  // Includes zero!
+            max_val: 1, // Includes zero!
         },
         DType::Int32,
     );

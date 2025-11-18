@@ -43,7 +43,7 @@ fn test_split_store_end_operation() {
 
     // Create an END operation
     let store = UOp::noop();
-    let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+    let range = UOp::range_const(10, 0);
     let end = UOp::end(store, smallvec![range]);
 
     // Try to split
@@ -137,16 +137,17 @@ fn test_split_store_preserves_computation() {
 
         // Verify KERNEL structure
         if let Op::Kernel { ast, .. } = kernel.op()
-            && let Op::Sink { sources } = ast.op() {
-                // SINK should wrap the STORE
-                assert!(std::rc::Rc::ptr_eq(&sources[0], &store));
+            && let Op::Sink { sources } = ast.op()
+        {
+            // SINK should wrap the STORE
+            assert!(std::rc::Rc::ptr_eq(&sources[0], &store));
 
-                // Verify the stored value dtype is preserved
-                if let Op::Store { value: stored_val, .. } = sources[0].op() {
-                    assert_eq!(stored_val.dtype(), dtype);
-                    assert!(std::rc::Rc::ptr_eq(stored_val, &value));
-                }
+            // Verify the stored value dtype is preserved
+            if let Op::Store { value: stored_val, .. } = sources[0].op() {
+                assert_eq!(stored_val.dtype(), dtype);
+                assert!(std::rc::Rc::ptr_eq(stored_val, &value));
             }
+        }
     }
 }
 
@@ -183,8 +184,8 @@ fn test_split_store_end_with_multiple_ranges() {
 
     // Create END with multiple ranges
     let store = UOp::noop();
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(4)), 0, AxisType::Loop);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(8)), 1, AxisType::Loop);
+    let range1 = UOp::range_const(4, 0);
+    let range2 = UOp::range_const(8, 1);
     let end = UOp::end(store.clone(), smallvec![range1.clone(), range2.clone()]);
 
     let result = split_store(&end, &mut ctx);
@@ -223,7 +224,7 @@ fn test_split_store_end_with_outer_range() {
 
     // Create END with OUTER range
     let store = UOp::noop();
-    let range_outer = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Outer);
+    let range_outer = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Outer);
     let end = UOp::end(store, smallvec![range_outer]);
 
     let result = split_store(&end, &mut ctx);
@@ -240,8 +241,8 @@ fn test_split_store_end_with_mixed_ranges() {
 
     // Create END with mix of LOOP and OUTER ranges
     let store = UOp::noop();
-    let range_loop = UOp::range(UOp::const_(DType::Index, ConstValue::Int(4)), 0, AxisType::Loop);
-    let range_outer = UOp::range(UOp::const_(DType::Index, ConstValue::Int(8)), 1, AxisType::Outer);
+    let range_loop = UOp::range_const(4, 0);
+    let range_outer = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(8)), 1, AxisType::Outer);
     let end = UOp::end(store, smallvec![range_loop, range_outer]);
 
     let result = split_store(&end, &mut ctx);

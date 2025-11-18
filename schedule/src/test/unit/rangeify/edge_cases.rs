@@ -12,7 +12,7 @@ use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store, pip
 #[test]
 fn test_zero_size_range() {
     // RANGE with end=0 should be handled gracefully
-    let range_zero = UOp::range(UOp::const_(DType::Index, ConstValue::Int(0)), 0, AxisType::Loop);
+    let range_zero = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(0)), 0, AxisType::Loop);
 
     // Should create a valid RANGE operation
     assert!(matches!(range_zero.op(), Op::Range { .. }));
@@ -112,7 +112,7 @@ fn test_bufferize_with_zero_range_inside() {
 
     // Create BUFFERIZE with a zero-sized range
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range_zero = UOp::range(UOp::const_(DType::Index, ConstValue::Int(0)), 0, AxisType::Loop);
+    let range_zero = UOp::range_const(0, 0);
 
     let bufferize = UOp::new(
         Op::Bufferize {
@@ -142,8 +142,8 @@ fn test_multiple_zero_ranges() {
 
     // Create BUFFERIZE with multiple zero-sized ranges
     let compute = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(0)), 0, AxisType::Loop);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(0)), 1, AxisType::Loop);
+    let range1 = UOp::range_const(0, 0);
+    let range2 = UOp::range_const(0, 1);
 
     let bufferize = UOp::new(
         Op::Bufferize {

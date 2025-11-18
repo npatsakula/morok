@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 
 use morok_dtype::DType;
 
-use super::super::{AxisType, Op, UOp};
+use super::super::{Op, UOp};
 
 impl UOp {
     /// Conditional: if(condition) { body }.
@@ -17,11 +17,6 @@ impl UOp {
     /// End if block.
     pub fn endif(if_op: Rc<Self>) -> Rc<Self> {
         Self::new(Op::EndIf { if_op }, DType::Void)
-    }
-
-    /// Loop range with axis information.
-    pub fn range(end: Rc<Self>, axis_id: usize, axis_type: AxisType) -> Rc<Self> {
-        Self::new(Op::Range { end, axis_id, axis_type }, DType::Index)
     }
 
     /// End of range or reduce scope.
@@ -37,7 +32,7 @@ impl UOp {
     /// # Example
     ///
     /// ```ignore
-    /// let range = UOp::range(10, 0, AxisType::Loop);
+    /// let range = UOp::range_const(10, 0);
     /// let store = UOp::store(buffer, index, value);
     /// let end = UOp::end(store, smallvec![range]);
     /// ```

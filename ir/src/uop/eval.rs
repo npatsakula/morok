@@ -299,9 +299,7 @@ fn eval_shl(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
         (ConstValue::Int(x), ConstValue::Int(y)) if (0..64).contains(&y) => {
             Some(ConstValue::Int(x.wrapping_shl(y as u32)))
         }
-        (ConstValue::UInt(x), ConstValue::UInt(y)) if y < 64 => {
-            Some(ConstValue::UInt(x.wrapping_shl(y as u32)))
-        }
+        (ConstValue::UInt(x), ConstValue::UInt(y)) if y < 64 => Some(ConstValue::UInt(x.wrapping_shl(y as u32))),
         _ => None,
     }
 }
@@ -312,9 +310,7 @@ fn eval_shr(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
         (ConstValue::Int(x), ConstValue::Int(y)) if (0..64).contains(&y) => {
             Some(ConstValue::Int(x.wrapping_shr(y as u32)))
         }
-        (ConstValue::UInt(x), ConstValue::UInt(y)) if y < 64 => {
-            Some(ConstValue::UInt(x.wrapping_shr(y as u32)))
-        }
+        (ConstValue::UInt(x), ConstValue::UInt(y)) if y < 64 => Some(ConstValue::UInt(x.wrapping_shr(y as u32))),
         _ => None,
     }
 }

@@ -268,7 +268,7 @@ fn test_ranges_property_with_range() {
 
     // Create a RANGE op
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, 0, AxisType::Loop);
 
     // Create some computation that uses the range
     let idx = UOp::cast(range.clone(), DType::Float32);
@@ -285,7 +285,7 @@ fn test_ranges_property_lazy_evaluation() {
     use crate::uop::properties::RangesProperty;
 
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, 0, AxisType::Loop);
     let idx = UOp::cast(range.clone(), DType::Float32);
 
     // VERIFY: Cache is empty before first access (lazy evaluation)
@@ -312,7 +312,7 @@ fn test_in_scope_ranges_simple() {
 
     // Create a RANGE op
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, 0, AxisType::Loop);
 
     // RANGE itself should have itself in scope
     let in_scope = range.in_scope_ranges();
@@ -331,7 +331,7 @@ fn test_in_scope_ranges_lazy_evaluation() {
     use crate::uop::properties::InScopeRangesProperty;
 
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, 0, AxisType::Loop);
     let idx = UOp::cast(range.clone(), DType::Float32);
 
     // VERIFY: Cache is empty before first access (lazy evaluation)
@@ -358,7 +358,7 @@ fn test_in_scope_ranges_after_end() {
 
     // Create a RANGE and computation
     let end_val = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range(end_val, 0, AxisType::Loop);
+    let range = UOp::range_axis(end_val, 0, AxisType::Loop);
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
     // Create END operation
@@ -376,10 +376,10 @@ fn test_in_scope_ranges_nested() {
 
     // Create two nested RANGEs
     let end1 = UOp::const_(DType::Index, ConstValue::Int(10));
-    let _range1 = UOp::range(end1, 0, AxisType::Loop);
+    let _range1 = UOp::range_axis(end1, 0, AxisType::Loop);
 
     let end2 = UOp::const_(DType::Index, ConstValue::Int(20));
-    let range2 = UOp::range(end2, 1, AxisType::Loop);
+    let range2 = UOp::range_axis(end2, 1, AxisType::Loop);
 
     // Computation that uses both ranges
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));

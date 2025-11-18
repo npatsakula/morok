@@ -4,7 +4,7 @@
 //! ensuring fusion decisions are correct without needing actual tensor data.
 
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
+use morok_ir::{AxisType, ConstValue, Op, UOp};
 
 use crate::rangeify::{KernelContext, pipeline::run_kernel_split_pipeline};
 use crate::test::unit::rangeify::helpers::{count_define_globals, count_kernels, count_stores};
@@ -13,16 +13,9 @@ use crate::test::unit::rangeify::helpers::{count_define_globals, count_kernels, 
 fn test_single_store_one_kernel() {
     // Single BUFFERIZE → Should create 1 KERNEL
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+    let range = UOp::range_const(10, 0);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute,
-            ranges: smallvec::smallvec![range],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize = UOp::bufferize_global(compute, vec![range]);
 
     let result = run_kernel_split_pipeline(bufferize);
 
@@ -37,26 +30,12 @@ fn test_double_store_two_kernels() {
     let compute1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let compute2 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 1, AxisType::Loop);
+    let range1 = UOp::range_const(10, 0);
+    let range2 = UOp::range_const(20, 1);
 
-    let bufferize1 = UOp::new(
-        Op::Bufferize {
-            compute: compute1,
-            ranges: smallvec::smallvec![range1],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize1 = UOp::bufferize_global(compute1, vec![range1]);
 
-    let bufferize2 = UOp::new(
-        Op::Bufferize {
-            compute: compute2,
-            ranges: smallvec::smallvec![range2],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize2 = UOp::bufferize_global(compute2, vec![range2]);
 
     // Create a root that references both (e.g., SINK)
     let root = UOp::new(Op::Sink { sources: smallvec::smallvec![bufferize1, bufferize2] }, DType::Void);
@@ -73,16 +52,9 @@ fn test_shared_buffer_one_kernel() {
 
     // Same BUFFERIZE used twice → should reuse buffer
     let compute = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(5)), 0, AxisType::Loop);
+    let range = UOp::range_const(5, 0);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute,
-            ranges: smallvec::smallvec![range],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Int32,
-    );
+    let bufferize = UOp::bufferize_global(compute, vec![range]);
 
     // Convert to STORE twice (simulating reuse)
     use crate::rangeify::bufferize_to_store::bufferize_to_store;
@@ -108,25 +80,11 @@ fn test_independent_buffers_separate() {
     let compute1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let compute2 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-    let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+    let range = UOp::range_const(10, 0);
 
-    let bufferize1 = UOp::new(
-        Op::Bufferize {
-            compute: compute1,
-            ranges: smallvec::smallvec![range.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize1 = UOp::bufferize_global(compute1, vec![range.clone()]);
 
-    let bufferize2 = UOp::new(
-        Op::Bufferize {
-            compute: compute2,
-            ranges: smallvec::smallvec![range],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize2 = UOp::bufferize_global(compute2, vec![range]);
 
     use crate::rangeify::bufferize_to_store::bufferize_to_store;
 
@@ -150,8 +108,8 @@ fn test_independent_buffers_separate() {
 fn test_nested_end_operations() {
     // Nested END operations should each contribute to structure
     let store = UOp::noop();
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(4)), 0, AxisType::Loop);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(8)), 1, AxisType::Loop);
+    let range1 = UOp::range_const(4, 0);
+    let range2 = UOp::range_const(8, 1);
 
     // Create nested ENDs (unusual but should handle)
     let end1 = UOp::end(store, smallvec::smallvec![range1.clone()]);
@@ -181,16 +139,9 @@ fn test_pipeline_kernel_count() {
     // After full pipeline, count kernels
     // Use OUTER range so split_store will split at kernel boundary
     let compute = UOp::const_(DType::Bool, ConstValue::Bool(false));
-    let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(100)), 0, AxisType::Outer);
+    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(100)), 0, AxisType::Outer);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute,
-            ranges: smallvec::smallvec![range],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Bool,
-    );
+    let bufferize = UOp::bufferize_global(compute, vec![range]);
 
     let result = run_kernel_split_pipeline(bufferize);
 

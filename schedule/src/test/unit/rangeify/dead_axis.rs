@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::rangeify::patterns::dead_axis_removal;
 use crate::rewrite::graph_rewrite;
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
+use morok_ir::{ConstValue, Op, UOp};
 
 // Helper functions
 fn create_const(val: i64) -> Rc<UOp> {
@@ -11,11 +11,11 @@ fn create_const(val: i64) -> Rc<UOp> {
 }
 
 fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
-    UOp::new(Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop }, DType::Index)
+    UOp::range_const(end, axis_id)
 }
 
 fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
-    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
+    UOp::bufferize_global(compute, ranges)
 }
 
 // Pattern 1: BUFFERIZE Dead Axis Removal Tests
@@ -125,8 +125,7 @@ fn test_bufferize_dead_axis_with_constants() {
     let x = UOp::define_global(1, DType::Float32);
 
     // Create range with constant end = 1
-    let const_end = UOp::const_(DType::Index, ConstValue::Int(1));
-    let dead_range_const = UOp::new(Op::Range { end: const_end, axis_id: 0, axis_type: AxisType::Loop }, DType::Index);
+    let dead_range_const = UOp::range_const(1, 0);
 
     let bufferized = create_bufferize(x.clone(), vec![dead_range_const]);
 
@@ -170,7 +169,7 @@ fn test_dead_axis_uint_constant() {
     let x = UOp::define_global(1, DType::Float32);
 
     let const_end = UOp::const_(DType::Index, ConstValue::UInt(1));
-    let dead_range = UOp::new(Op::Range { end: const_end, axis_id: 0, axis_type: AxisType::Loop }, DType::Index);
+    let dead_range = UOp::range(const_end, 0);
 
     let bufferized = create_bufferize(x.clone(), vec![dead_range]);
 

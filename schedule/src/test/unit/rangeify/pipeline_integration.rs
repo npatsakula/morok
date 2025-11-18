@@ -4,7 +4,7 @@
 //! threading context between stages and preserving UOp structure.
 
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
+use morok_ir::{ConstValue, Op, UOp};
 
 use crate::rangeify::pipeline::run_kernel_split_pipeline;
 use crate::test::unit::rangeify::helpers::{count_define_globals, count_define_locals, count_kernels};
@@ -15,26 +15,12 @@ fn test_pipeline_two_bufferizes() {
     let compute1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let compute2 = UOp::const_(DType::Int32, ConstValue::Int(42));
 
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(5)), 1, AxisType::Loop);
+    let range1 = UOp::range_const(10, 0);
+    let range2 = UOp::range_const(5, 1);
 
-    let bufferize_global = UOp::new(
-        Op::Bufferize {
-            compute: compute1,
-            ranges: smallvec::smallvec![range1],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize_global = UOp::bufferize_global(compute1, vec![range1]);
 
-    let bufferize_local = UOp::new(
-        Op::Bufferize {
-            compute: compute2,
-            ranges: smallvec::smallvec![range2],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Local },
-        },
-        DType::Int32,
-    );
+    let bufferize_local = UOp::bufferize_local(compute2, vec![range2]);
 
     // Create root with both
     let root = UOp::new(Op::Sink { sources: smallvec::smallvec![bufferize_global, bufferize_local] }, DType::Void);
@@ -55,16 +41,9 @@ fn test_pipeline_two_bufferizes() {
 fn test_pipeline_preserves_structure() {
     // Verify that UOp identity is preserved through pipeline stages
     let compute = UOp::const_(DType::Float32, ConstValue::Float(std::f64::consts::PI));
-    let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 0, AxisType::Loop);
+    let range = UOp::range_const(20, 0);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute: compute.clone(),
-            ranges: smallvec::smallvec![range.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let bufferize = UOp::bufferize_global(compute.clone(), vec![range.clone()]);
 
     let result = run_kernel_split_pipeline(bufferize.clone());
 
@@ -93,16 +72,9 @@ fn test_pipeline_preserves_structure() {
 fn test_pipeline_context_threading() {
     // Verify that context state is preserved between stages
     let compute = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(8)), 0, AxisType::Loop);
+    let range = UOp::range_const(8, 0);
 
-    let bufferize = UOp::new(
-        Op::Bufferize {
-            compute,
-            ranges: smallvec::smallvec![range],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Bool,
-    );
+    let bufferize = UOp::bufferize_global(compute, vec![range]);
 
     let result = run_kernel_split_pipeline(bufferize);
 
@@ -125,25 +97,11 @@ fn test_pipeline_mixed_addrspace() {
     let global_compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let local_compute = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-    let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Loop);
+    let range = UOp::range_const(16, 0);
 
-    let global_buf = UOp::new(
-        Op::Bufferize {
-            compute: global_compute,
-            ranges: smallvec::smallvec![range.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Float32,
-    );
+    let global_buf = UOp::bufferize_global(global_compute, vec![range.clone()]);
 
-    let local_buf = UOp::new(
-        Op::Bufferize {
-            compute: local_compute,
-            ranges: smallvec::smallvec![range],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Local },
-        },
-        DType::Float32,
-    );
+    let local_buf = UOp::bufferize_local(local_compute, vec![range]);
 
     // Create a SINK with both
     let root = UOp::new(Op::Sink { sources: smallvec::smallvec![global_buf, local_buf] }, DType::Void);
@@ -169,30 +127,16 @@ fn test_pipeline_chained_operations() {
     // Should create 2 buffers and appropriate kernel boundaries
 
     let compute_a = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let range_a = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+    let range_a = UOp::range_const(10, 0);
 
-    let buf_a = UOp::new(
-        Op::Bufferize {
-            compute: compute_a.clone(),
-            ranges: smallvec::smallvec![range_a],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Int32,
-    );
+    let buf_a = UOp::bufferize_global(compute_a.clone(), vec![range_a]);
 
     // Use buf_a as input to next operation
     // (In real code, this would be a load from buf_a)
     let compute_b = buf_a; // Simplified for testing
-    let range_b = UOp::range(UOp::const_(DType::Index, ConstValue::Int(5)), 1, AxisType::Loop);
+    let range_b = UOp::range_const(5, 1);
 
-    let buf_b = UOp::new(
-        Op::Bufferize {
-            compute: compute_b,
-            ranges: smallvec::smallvec![range_b],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
-        },
-        DType::Int32,
-    );
+    let buf_b = UOp::bufferize_global(compute_b, vec![range_b]);
 
     let result = run_kernel_split_pipeline(buf_b);
 

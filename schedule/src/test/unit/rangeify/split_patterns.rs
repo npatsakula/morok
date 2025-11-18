@@ -70,7 +70,7 @@ fn test_renumber_range() {
 
     // Create a RANGE with axis_id=5
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range(end, 5, AxisType::Loop);
+    let range = UOp::range_axis(end, 5, AxisType::Loop);
 
     // Create bindings
     let mut bindings = HashMap::new();
@@ -98,7 +98,7 @@ fn test_remove_zero_range() {
 
     // Create a RANGE with end=0
     let end = UOp::const_(DType::Index, ConstValue::Int(0));
-    let range = UOp::range(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, 0, AxisType::Loop);
 
     // Create bindings
     let mut bindings = HashMap::new();
@@ -281,9 +281,9 @@ fn test_renumber_range_sequential() {
 
     // Create three ranges with different axis IDs
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range1 = UOp::range(end.clone(), 5, AxisType::Loop);
-    let range2 = UOp::range(end.clone(), 10, AxisType::Reduce);
-    let range3 = UOp::range(end.clone(), 3, AxisType::Outer);
+    let range1 = UOp::range_axis(end.clone(), 5, AxisType::Loop);
+    let range2 = UOp::range_axis(end.clone(), 10, AxisType::Reduce);
+    let range3 = UOp::range_axis(end.clone(), 3, AxisType::Outer);
 
     // Renumber all three
     let mut bindings1 = HashMap::new();
@@ -300,19 +300,22 @@ fn test_renumber_range_sequential() {
 
     // Should get sequential IDs 0, 1, 2
     if let RewriteResult::Rewritten(r) = result1
-        && let Op::Range { axis_id, .. } = r.op() {
-            assert_eq!(*axis_id, 0);
-        }
+        && let Op::Range { axis_id, .. } = r.op()
+    {
+        assert_eq!(*axis_id, 0);
+    }
 
     if let RewriteResult::Rewritten(r) = result2
-        && let Op::Range { axis_id, .. } = r.op() {
-            assert_eq!(*axis_id, 1);
-        }
+        && let Op::Range { axis_id, .. } = r.op()
+    {
+        assert_eq!(*axis_id, 1);
+    }
 
     if let RewriteResult::Rewritten(r) = result3
-        && let Op::Range { axis_id, .. } = r.op() {
-            assert_eq!(*axis_id, 2);
-        }
+        && let Op::Range { axis_id, .. } = r.op()
+    {
+        assert_eq!(*axis_id, 2);
+    }
 }
 
 #[test]
@@ -322,7 +325,7 @@ fn test_renumber_range_different_axis_types() {
 
     // Test all three axis types
     for axis_type in [AxisType::Loop, AxisType::Reduce, AxisType::Outer] {
-        let range = UOp::range(end.clone(), 99, axis_type);
+        let range = UOp::range_axis(end.clone(), 99, axis_type);
         let mut bindings = HashMap::new();
         bindings.insert("r".to_string(), range);
 
@@ -345,14 +348,14 @@ fn test_renumber_range_no_change_if_same() {
 
     // First range will get ID 0
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range1 = UOp::range(end.clone(), 5, AxisType::Loop);
+    let range1 = UOp::range_axis(end.clone(), 5, AxisType::Loop);
 
     let mut bindings1 = HashMap::new();
     bindings1.insert("r".to_string(), range1);
     renumber_range(&bindings1, &mut ctx);
 
     // Now create a range that already has axis_id=1 (which would be the next ID)
-    let range2 = UOp::range(end.clone(), 1, AxisType::Loop);
+    let range2 = UOp::range_axis(end.clone(), 1, AxisType::Loop);
     let mut bindings2 = HashMap::new();
     bindings2.insert("r".to_string(), range2);
 
@@ -386,7 +389,7 @@ fn test_remove_zero_range_uint() {
 
     // Create a RANGE with end=0 (UInt)
     let end = UOp::const_(DType::Index, ConstValue::UInt(0));
-    let range = UOp::range(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, 0, AxisType::Loop);
 
     let mut bindings = HashMap::new();
     bindings.insert("r".to_string(), range);
@@ -408,7 +411,7 @@ fn test_remove_zero_range_non_zero() {
 
     // Create a RANGE with non-zero end
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, 0, AxisType::Loop);
 
     let mut bindings = HashMap::new();
     bindings.insert("r".to_string(), range);
@@ -476,9 +479,9 @@ fn test_renumber_range_with_gaps() {
     let mut ctx = KernelContext::new();
 
     // Create ranges with non-sequential IDs (0, 5, 10)
-    let range0 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
-    let range5 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 5, AxisType::Loop);
-    let range10 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(30)), 10, AxisType::Reduce);
+    let range0 = UOp::range_const(10, 0);
+    let range5 = UOp::range_const(20, 5);
+    let range10 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(30)), 10, AxisType::Reduce);
 
     // Process them in sequence
     let mut bindings0 = HashMap::new();
@@ -542,7 +545,7 @@ fn test_remove_zero_range_verification() {
 
     // Create RANGE with end=0
     let end = UOp::const_(DType::Index, ConstValue::Int(0));
-    let range = UOp::range(end.clone(), 0, AxisType::Loop);
+    let range = UOp::range(end.clone(), 0);
 
     let mut bindings = HashMap::new();
     bindings.insert("r".to_string(), range.clone());
@@ -579,7 +582,7 @@ fn test_pattern_composition_sequence() {
     // 2. Apply renumber_range
     // 3. Verify the result
 
-    let range_gap = UOp::range(UOp::const_(DType::Index, ConstValue::Int(15)), 7, AxisType::Loop);
+    let range_gap = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(15)), 7, AxisType::Loop);
 
     let mut bindings = HashMap::new();
     bindings.insert("r".to_string(), range_gap.clone());

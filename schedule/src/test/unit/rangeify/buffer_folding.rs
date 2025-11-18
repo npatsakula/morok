@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::rangeify::patterns::buffer_folding;
 use crate::rewrite::graph_rewrite;
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
+use morok_ir::{ConstValue, Op, UOp};
 
 // Helper functions for creating test UOps
 fn create_const(val: i64) -> Rc<UOp> {
@@ -11,11 +11,11 @@ fn create_const(val: i64) -> Rc<UOp> {
 }
 
 fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
-    UOp::new(Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop }, DType::Index)
+    UOp::range_const(end, axis_id)
 }
 
 fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
-    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
+    UOp::bufferize_global(compute, ranges)
 }
 
 // Pattern 1: Noop Buffer Removal Tests

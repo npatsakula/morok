@@ -7,7 +7,9 @@
 //! The algorithm operates in 2 stages:
 //! - Stage 0: Initial visit + bottom-up fixed-point iteration
 //! - Stage 1: Source reconstruction after children are rewritten
-//!   (includes Stage 2: linking rewritten results back to original nodes)
+//!   - If reconstruction creates a new node, patterns are re-applied to it
+//!   - This enables multi-stage optimizations (e.g., WHERE elimination after comparison folding)
+//!     (includes Stage 2: linking rewritten results back to original nodes)
 //!
 //! # Pattern Context
 //!
@@ -236,7 +238,41 @@ impl<'a> RewriteEngine<'a> {
                     }
 
                     // Stage 1: Reconstruct with rewritten children
-                    let reconstructed = self.stage1_reconstruct(&uop);
+                    let mut reconstructed = self.stage1_reconstruct(&uop);
+
+                    // NEW: If reconstruction created a new node, try patterns on it
+                    // This enables multi-stage optimizations where patterns can match
+                    // on reconstructed nodes (e.g., WHERE with constant condition)
+                    if !Rc::ptr_eq(&reconstructed, &uop) {
+                        // Apply fixed-point iteration on the reconstructed node
+                        const MAX_RECONSTRUCTION_REWRITES: usize = 1000;
+                        let mut current = reconstructed.clone();
+                        let mut iterations = 0;
+                        loop {
+                            if iterations >= MAX_RECONSTRUCTION_REWRITES {
+                                eprintln!(
+                                    "Warning: reconstruction rewrite limit ({}) reached for op: {:?}",
+                                    MAX_RECONSTRUCTION_REWRITES,
+                                    current.op()
+                                );
+                                reconstructed = current;
+                                break;
+                            }
+                            match self.matcher.rewrite(&current) {
+                                RewriteResult::Rewritten(new_uop) => {
+                                    // Pattern matched - continue fixed-point iteration
+                                    current = new_uop;
+                                    iterations += 1;
+                                }
+                                _ => {
+                                    // No more rewrites possible
+                                    reconstructed = current;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
                     self.visited.insert(key, Stage::SourceReconstruction);
 
                     // Stage 2: Link result
@@ -263,6 +299,8 @@ impl<'a> RewriteEngine<'a> {
 ///    - If a Gate is returned, skip and process children first
 ///
 /// 2. **Stage 1** (Source reconstruction): Reconstruct nodes with rewritten children
+///    - If reconstruction creates a new node, patterns are re-applied
+///    - Enables multi-stage optimizations (e.g., WHERE(Lt(x, y), t, f) → WHERE(false, t, f) → f)
 ///
 /// 3. **Stage 2** (Link): Cache final replacements
 ///

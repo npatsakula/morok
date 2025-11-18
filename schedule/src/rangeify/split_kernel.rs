@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn test_is_outer_end() {
         // Create an END with an OUTER range
-        let range_outer = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Outer);
+        let range_outer = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Outer);
         let store = UOp::noop();
         let end = UOp::end(store, smallvec::smallvec![range_outer]);
 
@@ -205,7 +205,7 @@ mod tests {
         assert!(is_outer_end(&end));
 
         // Create an END with a Loop range
-        let range_loop = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+        let range_loop = UOp::range_const(10, 0);
         let end_loop = UOp::end(UOp::noop(), smallvec::smallvec![range_loop]);
 
         // Should NOT be detected as OUTER end

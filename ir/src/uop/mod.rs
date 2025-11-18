@@ -13,8 +13,10 @@
 //! - [`properties`] - Standard cached properties (shape, ranges, etc.)
 //! - [`eval`] - Constant evaluation for operations
 //! - [`range_eval`] - Range analysis (vmin/vmax) for operations
+//! - [`comparison_analysis`] - Unified comparison analysis for optimizations
 
 pub mod cached_property;
+pub mod comparison_analysis;
 pub mod constructors;
 pub mod core;
 pub mod eval;
