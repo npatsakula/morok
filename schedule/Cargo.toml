@@ -10,3 +10,8 @@ morok-dtype = { path = "../dtype" }
 morok-device = { path = "../device" }
 smallvec = { version = "1.13", features = ["union"] }
 rustc-hash = "2.1"
+z3 = { version = "0.19.4", optional = true }
+
+[features]
+default = []
+z3 = ["dep:z3"]

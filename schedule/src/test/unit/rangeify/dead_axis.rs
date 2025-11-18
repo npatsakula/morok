@@ -5,28 +5,13 @@ use crate::rewrite::graph_rewrite;
 use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp};
 
-// Helper functions
-fn create_const(val: i64) -> Rc<UOp> {
-    UOp::const_(DType::Int32, ConstValue::Int(val))
-}
-
-fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
-    UOp::range_const(end, axis_id)
-}
-
-fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
-    UOp::bufferize_global(compute, ranges)
-}
-
-// Pattern 1: BUFFERIZE Dead Axis Removal Tests
-
 #[test]
 fn test_bufferize_with_size_1_range() {
     // BUFFERIZE(x, [RANGE(1)]) should have the dead axis removed
     let x = UOp::define_global(1, DType::Float32);
-    let dead_range = create_range(1, 0); // Size 1 = dead axis
+    let dead_range = UOp::range_const(1, 0); // Size 1 = dead axis
 
-    let bufferized = create_bufferize(x.clone(), vec![dead_range]);
+    let bufferized = UOp::bufferize_global(x.clone(), vec![dead_range]);
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, bufferized);
@@ -39,9 +24,9 @@ fn test_bufferize_with_size_1_range() {
 fn test_bufferize_all_dead_axes() {
     // BUFFERIZE(x, [RANGE(1), RANGE(1), RANGE(1)]) → x
     let x = UOp::define_global(1, DType::Float32);
-    let dead_ranges = vec![create_range(1, 0), create_range(1, 1), create_range(1, 2)];
+    let dead_ranges = vec![UOp::range_const(1, 0), UOp::range_const(1, 1), UOp::range_const(1, 2)];
 
-    let bufferized = create_bufferize(x.clone(), dead_ranges);
+    let bufferized = UOp::bufferize_global(x.clone(), dead_ranges);
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, bufferized);
@@ -54,11 +39,11 @@ fn test_bufferize_all_dead_axes() {
 fn test_bufferize_mixed_live_dead() {
     // BUFFERIZE(x, [RANGE(10), RANGE(1), RANGE(20)]) should keep only live axes
     let x = UOp::define_global(1, DType::Float32);
-    let live_range1 = create_range(10, 0);
-    let dead_range = create_range(1, 1); // Dead
-    let live_range2 = create_range(20, 2);
+    let live_range1 = UOp::range_const(10, 0);
+    let dead_range = UOp::range_const(1, 1); // Dead
+    let live_range2 = UOp::range_const(20, 2);
 
-    let bufferized = create_bufferize(x.clone(), vec![live_range1.clone(), dead_range, live_range2.clone()]);
+    let bufferized = UOp::bufferize_global(x.clone(), vec![live_range1.clone(), dead_range, live_range2.clone()]);
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, bufferized.clone());
@@ -77,9 +62,9 @@ fn test_bufferize_mixed_live_dead() {
 fn test_bufferize_no_dead_axes() {
     // BUFFERIZE(x, [RANGE(10), RANGE(20)]) should remain unchanged
     let x = UOp::define_global(1, DType::Float32);
-    let live_ranges = vec![create_range(10, 0), create_range(20, 1)];
+    let live_ranges = vec![UOp::range_const(10, 0), UOp::range_const(20, 1)];
 
-    let bufferized = create_bufferize(x, live_ranges);
+    let bufferized = UOp::bufferize_global(x.clone(), live_ranges);
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, bufferized.clone());
@@ -95,11 +80,11 @@ fn test_index_after_dead_axis_removal() {
     // When BUFFERIZE has dead axes, INDEX should adjust indices accordingly
     // This is more complex and requires the pattern to work with actual buffer structure
     let x = UOp::define_global(1, DType::Float32);
-    let live_range = create_range(10, 0);
-    let dead_range = create_range(1, 1);
+    let live_range = UOp::range_const(10, 0);
+    let dead_range = UOp::range_const(1, 1);
 
     // Create BUFFERIZE with mixed ranges
-    let bufferized = create_bufferize(x, vec![live_range.clone(), dead_range.clone()]);
+    let bufferized = UOp::bufferize_global(x.clone(), vec![live_range.clone(), dead_range.clone()]);
 
     // Create INDEX with indices matching the buffer structure
     let idx1 = UOp::const_(DType::Index, ConstValue::Int(5));
@@ -127,7 +112,7 @@ fn test_bufferize_dead_axis_with_constants() {
     // Create range with constant end = 1
     let dead_range_const = UOp::range_const(1, 0);
 
-    let bufferized = create_bufferize(x.clone(), vec![dead_range_const]);
+    let bufferized = UOp::bufferize_global(x.clone(), vec![dead_range_const]);
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, bufferized);
@@ -140,11 +125,11 @@ fn test_bufferize_dead_axis_with_constants() {
 fn test_multiple_dead_axis_removal_passes() {
     // Test that multiple passes of dead axis removal work correctly
     let x = UOp::define_global(1, DType::Float32);
-    let live_range = create_range(10, 0);
-    let dead_range1 = create_range(1, 1);
-    let dead_range2 = create_range(1, 2);
+    let live_range = UOp::range_const(10, 0);
+    let dead_range1 = UOp::range_const(1, 1);
+    let dead_range2 = UOp::range_const(1, 2);
 
-    let bufferized = create_bufferize(x.clone(), vec![live_range.clone(), dead_range1, dead_range2]);
+    let bufferized = UOp::bufferize_global(x.clone(), vec![live_range.clone(), dead_range1, dead_range2]);
 
     let matcher = dead_axis_removal();
     // Run multiple times to ensure idempotence
@@ -171,7 +156,7 @@ fn test_dead_axis_uint_constant() {
     let const_end = UOp::const_(DType::Index, ConstValue::UInt(1));
     let dead_range = UOp::range(const_end, 0);
 
-    let bufferized = create_bufferize(x.clone(), vec![dead_range]);
+    let bufferized = UOp::bufferize_global(x.clone(), vec![dead_range]);
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, bufferized);

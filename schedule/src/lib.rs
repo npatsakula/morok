@@ -18,6 +18,9 @@ pub mod rangeify;
 pub mod rewrite;
 pub mod symbolic;
 
+#[cfg(feature = "z3")]
+pub mod z3;
+
 #[cfg(test)]
 pub mod test;
 
