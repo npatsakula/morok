@@ -95,7 +95,7 @@ fn test_neg_int() {
 
 #[test]
 fn test_neg_float() {
-    let val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
     let result = UOp::neg_op(val);
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -107,7 +107,7 @@ fn test_neg_float() {
 #[test]
 fn test_add_type_promotion_int_to_float() {
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
 
     let result = UOp::try_add_op(int_val, float_val).unwrap();
     // Int32 should promote to Float32
@@ -181,7 +181,7 @@ fn test_add_void_type() {
 #[test]
 fn test_mul_void_type() {
     let void_val = UOp::const_(DType::Void, ConstValue::Int(0));
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
 
     let result = UOp::try_mul_op(void_val, float_val);
     assert!(matches!(result, Err(Error::VoidTypeInOp)));

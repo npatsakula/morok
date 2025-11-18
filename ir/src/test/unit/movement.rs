@@ -164,7 +164,7 @@ fn test_movement_ops_preserve_dtype() {
     assert_eq!(reshaped.dtype(), DType::Int64);
 
     // Permute preserves dtype
-    let val_float = UOp::const_(DType::Float64, ConstValue::Float(3.14));
+    let val_float = UOp::const_(DType::Float64, ConstValue::Float(std::f64::consts::PI));
     let permuted = UOp::try_permute_validated(val_float, vec![]).unwrap();
     assert_eq!(permuted.dtype(), DType::Float64);
 

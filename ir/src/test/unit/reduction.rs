@@ -25,7 +25,7 @@ fn test_reduce_axis_preserves_dtype() {
     let result = UOp::try_reduce_axis(val_int, ReduceOp::Add, vec![]).unwrap();
     assert_eq!(result.dtype(), DType::Int32);
 
-    let val_float = UOp::const_(DType::Float64, ConstValue::Float(3.14));
+    let val_float = UOp::const_(DType::Float64, ConstValue::Float(std::f64::consts::PI));
     let result = UOp::try_reduce_axis(val_float, ReduceOp::Max, vec![]).unwrap();
     assert_eq!(result.dtype(), DType::Float64);
 }

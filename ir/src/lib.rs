@@ -24,7 +24,7 @@ pub mod sint;
 pub mod types;
 pub mod uop;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "proptest"))]
 pub mod test;
 
 // Re-exports for backward compatibility

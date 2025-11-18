@@ -22,8 +22,8 @@ fn test_lt_int32() {
 
 #[test]
 fn test_lt_float32() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(3.14));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.71));
+    let a = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
+    let b = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::E as f64));
 
     let result = UOp::cmplt(&a, &b).unwrap();
     assert_eq!(result.dtype(), DType::Bool);
@@ -85,8 +85,8 @@ fn test_eq_int32() {
 
 #[test]
 fn test_eq_float32() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(3.14));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let a = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
+    let b = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
 
     let result = UOp::cmpeq(&a, &b).unwrap();
     assert_eq!(result.dtype(), DType::Bool);
@@ -146,8 +146,8 @@ fn test_ne_int32() {
 
 #[test]
 fn test_ne_float32() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(3.14));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.71));
+    let a = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
+    let b = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::E as f64));
 
     let result = UOp::cmpne(&a, &b).unwrap();
     assert_eq!(result.dtype(), DType::Bool);

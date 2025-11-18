@@ -248,7 +248,7 @@ fn test_barrier_basic() {
 #[test]
 fn test_barrier_with_single_dep() {
     let src = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let dep = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let dep = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
 
     let barrier = UOp::new(Op::Barrier { src: src.clone(), deps: smallvec![dep] }, DType::Int32);
 
@@ -257,7 +257,7 @@ fn test_barrier_with_single_dep() {
 
 #[test]
 fn test_barrier_with_multiple_deps() {
-    let src = UOp::const_(DType::Float64, ConstValue::Float(2.718));
+    let src = UOp::const_(DType::Float64, ConstValue::Float(std::f64::consts::E));
     let dep1 = UOp::const_(DType::Int32, ConstValue::Int(1));
     let dep2 = UOp::const_(DType::Int32, ConstValue::Int(2));
     let dep3 = UOp::const_(DType::Int32, ConstValue::Int(3));
@@ -273,8 +273,8 @@ fn test_barrier_preserves_dtype() {
     let dtypes = vec![
         (DType::Int8, ConstValue::Int(1)),
         (DType::Int32, ConstValue::Int(100)),
-        (DType::Float32, ConstValue::Float(3.14)),
-        (DType::Float64, ConstValue::Float(2.71)),
+        (DType::Float32, ConstValue::Float(std::f32::consts::PI as f64)),
+        (DType::Float64, ConstValue::Float(std::f64::consts::E)),
         (DType::UInt32, ConstValue::UInt(42)),
     ];
 
@@ -393,7 +393,7 @@ fn test_barrier_dtype_preservation() {
     let int_barrier = UOp::new(Op::Barrier { src: int_src, deps: smallvec![] }, DType::Int32);
     assert_eq!(int_barrier.dtype(), DType::Int32);
 
-    let float_src = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let float_src = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
     let float_barrier = UOp::new(Op::Barrier { src: float_src, deps: smallvec![] }, DType::Float32);
     assert_eq!(float_barrier.dtype(), DType::Float32);
 }

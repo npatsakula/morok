@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 94812b4a6635425363164aa00749f29ce72c618343c141bbc8a69fdf25f4e8d5 # shrinks to graph = UOp { id: 5948, op: Binary(Mul, UOp { id: 5946, op: Binary(Add, UOp { id: 5944, op: DefineVar { name: "a", min_val: 0, max_val: 1 }, dtype: Scalar(Int32), shape_cache: OnceCell(<uninit>), ranges_cache: OnceCell(<uninit>), in_scope_ranges_cache: OnceCell(<uninit>), vmin_vmax_cache: OnceCell(<uninit>) }, UOp { id: 5945, op: Const(ConstValueHash(Int(0))), dtype: Scalar(Int32), shape_cache: OnceCell(<uninit>), ranges_cache: OnceCell(<uninit>), in_scope_ranges_cache: OnceCell(<uninit>), vmin_vmax_cache: OnceCell(<uninit>) }), dtype: Scalar(Int32), shape_cache: OnceCell(<uninit>), ranges_cache: OnceCell(<uninit>), in_scope_ranges_cache: OnceCell(<uninit>), vmin_vmax_cache: OnceCell(<uninit>) }, UOp { id: 5947, op: Const(ConstValueHash(Int(2))), dtype: Scalar(Int32), shape_cache: OnceCell(<uninit>), ranges_cache: OnceCell(<uninit>), in_scope_ranges_cache: OnceCell(<uninit>), vmin_vmax_cache: OnceCell(<uninit>) }), dtype: Scalar(Int32), shape_cache: OnceCell(<uninit>), ranges_cache: OnceCell(<uninit>), in_scope_ranges_cache: OnceCell(<uninit>), vmin_vmax_cache: OnceCell(<uninit>) }

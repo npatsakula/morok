@@ -153,7 +153,7 @@ fn test_or_mixed_int_types() {
 
 #[test]
 fn test_and_float_error() {
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
 
     let result = UOp::try_and_op(float_val, int_val);

@@ -11,7 +11,7 @@ use crate::types::ConstValue;
 #[test_case(ConstValue::Bool(false), DType::Bool, ConstValue::Bool(false); "bool_to_bool_false")]
 #[test_case(ConstValue::Int(42), DType::Int64, ConstValue::Int(42); "int64_to_int64")]
 #[test_case(ConstValue::UInt(42), DType::UInt64, ConstValue::UInt(42); "uint64_to_uint64")]
-#[test_case(ConstValue::Float(3.14), DType::Float64, ConstValue::Float(3.14); "float64_to_float64")]
+#[test_case(ConstValue::Float(std::f64::consts::PI), DType::Float64, ConstValue::Float(std::f64::consts::PI); "float64_to_float64")]
 fn test_identity_cast(input: ConstValue, dtype: DType, expected: ConstValue) {
     assert_eq!(input.cast(&dtype), Some(expected));
 }
@@ -106,9 +106,9 @@ fn test_float_to_int_allowed() {
 #[test]
 fn test_float_to_float_allowed() {
     // Float -> Float is allowed (including narrowing)
-    let value = ConstValue::Float(3.14);
-    assert_eq!(value.cast(&DType::Float32), Some(ConstValue::Float(3.14)));
-    assert_eq!(value.cast(&DType::Float64), Some(ConstValue::Float(3.14)));
+    let value = ConstValue::Float(std::f64::consts::PI);
+    assert_eq!(value.cast(&DType::Float32), Some(ConstValue::Float(std::f64::consts::PI)));
+    assert_eq!(value.cast(&DType::Float64), Some(ConstValue::Float(std::f64::consts::PI)));
 }
 
 // =============================================================================
@@ -238,6 +238,6 @@ fn test_const_value_always_uses_wide_storage() {
     let value = ConstValue::UInt(42);
     assert_eq!(value.dtype(), DType::UInt64);
 
-    let value = ConstValue::Float(3.14);
+    let value = ConstValue::Float(std::f64::consts::PI);
     assert_eq!(value.dtype(), DType::Float64);
 }

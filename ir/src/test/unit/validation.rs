@@ -27,7 +27,7 @@ fn test_type_promotion_failed() {
     // However, based on dtype implementation, most types can be promoted
     // This test verifies the error exists, even if hard to trigger naturally
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
 
     // This should succeed (int promotes to float), so let's just verify the API
     let result = UOp::try_add_op(int_val, float_val);
@@ -36,7 +36,7 @@ fn test_type_promotion_failed() {
 
 #[test]
 fn test_invalid_dtype_for_bitwise_op() {
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
 
     // Bitwise AND requires int or bool, not float
@@ -243,8 +243,8 @@ fn test_comparison_bool_dtype_result() {
     let int_a = UOp::const_(DType::Int32, ConstValue::Int(5));
     let int_b = UOp::const_(DType::Int32, ConstValue::Int(10));
 
-    let float_a = UOp::const_(DType::Float32, ConstValue::Float(3.14));
-    let float_b = UOp::const_(DType::Float32, ConstValue::Float(2.71));
+    let float_a = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
+    let float_b = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::E as f64));
 
     // All comparisons should return Bool
     assert_eq!(UOp::cmplt(&int_a, &int_b).unwrap().dtype(), DType::Bool);
@@ -898,7 +898,7 @@ fn test_shift_void_error() {
 #[test]
 fn test_invalid_type_combinations() {
     // Document behavior with various invalid type combinations
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
 
     // Float with bitwise operations should error

@@ -17,9 +17,9 @@ fn test_vmin_vmax_const() {
     assert_eq!(neg_three.vmin(), &ConstValue::Int(-3));
     assert_eq!(neg_three.vmax(), &ConstValue::Int(-3));
 
-    let pi = UOp::const_(DType::Float32, ConstValue::Float(3.14159));
-    assert_eq!(pi.vmin(), &ConstValue::Float(3.14159));
-    assert_eq!(pi.vmax(), &ConstValue::Float(3.14159));
+    let pi = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
+    assert_eq!(pi.vmin(), &ConstValue::Float(std::f32::consts::PI as f64));
+    assert_eq!(pi.vmax(), &ConstValue::Float(std::f32::consts::PI as f64));
 
     let bool_true = UOp::const_(DType::Bool, ConstValue::Bool(true));
     assert_eq!(bool_true.vmin(), &ConstValue::Bool(true));

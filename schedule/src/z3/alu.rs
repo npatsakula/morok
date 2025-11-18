@@ -38,11 +38,11 @@ mod tests {
         let b = Int::new_const("b");
 
         // For positive a, b: cdiv should match euclidean div
-        solver.assert(&a.ge(&Int::from_i64(0)));
-        solver.assert(&b.gt(&Int::from_i64(0)));
+        solver.assert(a.ge(Int::from_i64(0)));
+        solver.assert(b.gt(Int::from_i64(0)));
 
         let result = z3_cdiv(&a, &b);
-        solver.assert(&result.eq(&(&a / &b)));
+        solver.assert(result.eq(&a / &b));
 
         assert_eq!(solver.check(), z3::SatResult::Sat);
     }
@@ -56,7 +56,7 @@ mod tests {
         let b = Int::from_i64(3);
 
         let result = z3_cdiv(&a, &b);
-        solver.assert(&result.eq(&Int::from_i64(-2)));
+        solver.assert(result.eq(Int::from_i64(-2)));
 
         assert_eq!(solver.check(), z3::SatResult::Sat);
     }
@@ -70,7 +70,7 @@ mod tests {
         let b = Int::from_i64(3);
 
         let result = z3_cmod(&a, &b);
-        solver.assert(&result.eq(&Int::from_i64(-1)));
+        solver.assert(result.eq(Int::from_i64(-1)));
 
         assert_eq!(solver.check(), z3::SatResult::Sat);
     }
