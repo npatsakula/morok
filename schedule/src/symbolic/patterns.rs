@@ -10,8 +10,8 @@
 //! These patterns are separated from rangeify patterns because they apply
 //! universally to any UOp graph, not just during schedule transformation.
 
-use morok_ir::UOp;
 use morok_ir::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
+use morok_ir::{Op, UOp};
 
 use crate::pattern::UPat;
 use crate::pattern::matcher::PatternMatcher;
@@ -142,6 +142,67 @@ pub fn symbolic_simple() -> PatternMatcher {
                 (ConstValue::Bool(false), ConstValue::Bool(false)) => Some(Rc::clone(false_val)),
                 _ => None
             }
+        }
+    );
+
+    // Dead loop elimination patterns
+
+    // RANGE with vmax ≤ 0 → Const(0)
+    pattern!(patterns,
+        UPat::var("r") => |r: &Rc<UOp>| {
+            use crate::symbolic::dce::is_empty_range;
+            use morok_dtype::DType;
+
+            if let Op::Range { .. } = r.op()
+                && is_empty_range(r)
+            {
+                return Some(UOp::const_(DType::Index, ConstValue::Int(0)));
+            }
+            None
+        }
+    );
+
+    // END with dead ranges → remove dead ranges or unwrap entirely
+    pattern!(patterns,
+        UPat::var("end_op") => |end_op: &Rc<UOp>| {
+            use crate::symbolic::dce::is_empty_range;
+            use smallvec::SmallVec;
+
+            if let Op::End { computation, ranges } = end_op.op() {
+                let live_ranges: SmallVec<[Rc<UOp>; 4]> = ranges
+                    .iter()
+                    .filter(|r| !is_empty_range(r))
+                    .cloned()
+                    .collect();
+
+                // No changes if all ranges are live
+                if live_ranges.len() == ranges.len() {
+                    return None;
+                }
+
+                // All ranges dead - return computation directly
+                if live_ranges.is_empty() {
+                    return Some(Rc::clone(computation));
+                }
+
+                // Some ranges dead - create new END with only live ranges
+                return Some(UOp::end(Rc::clone(computation), live_ranges));
+            }
+            None
+        }
+    );
+
+    // REDUCE with all empty ranges → identity element
+    pattern!(patterns,
+        UPat::var("reduce_op") => |reduce_op: &Rc<UOp>| {
+            use crate::symbolic::dce::{is_empty_range, reduce_identity};
+
+            if let Op::Reduce { ranges, reduce_op: op, .. } = reduce_op.op()
+                && ranges.iter().all(is_empty_range)
+            {
+                return Some(reduce_identity(*op, reduce_op.dtype()));
+            }
+            None
         }
     );
 

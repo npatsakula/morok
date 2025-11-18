@@ -83,6 +83,54 @@ pub fn analyze_comparison(x: &Rc<UOp>, y: &Rc<UOp>) -> (Option<bool>, Option<boo
     (lt_result, eq_result, ne_result)
 }
 
+/// Get the identity element for a reduce operation.
+///
+/// The identity element is the value that has no effect in the reduction:
+/// - Add: 0 (x + 0 = x)
+/// - Mul: 1 (x * 1 = x)
+/// - Max: minimum value for dtype (max(x, MIN) = x)
+pub fn reduce_identity(op: morok_ir::types::ReduceOp, dtype: morok_dtype::DType) -> Rc<UOp> {
+    use ConstValue::*;
+    use morok_dtype::DType;
+    use morok_ir::types::ReduceOp;
+
+    match op {
+        ReduceOp::Add => UOp::const_(dtype, Int(0)),
+        ReduceOp::Mul => UOp::const_(dtype, Int(1)),
+        ReduceOp::Max => {
+            // Return dtype minimum value
+            let min_val = if dtype == DType::Int8 {
+                Int(i8::MIN as i64)
+            } else if dtype == DType::Int16 {
+                Int(i16::MIN as i64)
+            } else if dtype == DType::Int32 {
+                Int(i32::MIN as i64)
+            } else if dtype == DType::Int64 {
+                Int(i64::MIN)
+            } else if dtype == DType::UInt8 {
+                UInt(u8::MIN as u64)
+            } else if dtype == DType::UInt16 {
+                UInt(u16::MIN as u64)
+            } else if dtype == DType::UInt32 {
+                UInt(u32::MIN as u64)
+            } else if dtype == DType::UInt64 {
+                UInt(u64::MIN)
+            } else if dtype == DType::Float16 {
+                Float(-65504.0)
+            } else if dtype == DType::BFloat16 {
+                Float(-3.38953e38)
+            } else if dtype == DType::Float32 {
+                Float(f32::MIN as f64)
+            } else if dtype == DType::Float64 {
+                Float(f64::MIN)
+            } else {
+                Int(0) // Fallback for unsupported types
+            };
+            UOp::const_(dtype, min_val)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

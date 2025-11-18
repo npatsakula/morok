@@ -260,7 +260,8 @@ fn compute_bitwise_range(
                 // AND result is bounded by the smaller operand
                 // For positive values: 0 <= result <= min(a_max, b_max)
                 if let (ConstValue::Int(a), ConstValue::Int(b)) = (a_max, b_max)
-                    && a >= 0 && b >= 0
+                    && a >= 0
+                    && b >= 0
                 {
                     return (ConstValue::Int(0), ConstValue::Int(a.min(b)));
                 }

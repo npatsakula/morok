@@ -151,31 +151,6 @@ fn test_ne_non_overlapping_ranges() {
 }
 
 #[test]
-fn test_float_comparison_not_eliminated() {
-    // Float comparisons should not be eliminated due to NaN
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let y = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let check = UOp::new(Op::Binary(BinaryOp::Lt, x.clone(), y.clone()), DType::Bool);
-
-    let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, check);
-
-    // For now, float comparisons might still be eliminated if we can prove no NaN
-    // But x == x for floats should NOT be eliminated (NaN != NaN)
-    let self_check = UOp::new(Op::Binary(BinaryOp::Eq, x.clone(), x.clone()), DType::Bool);
-    let self_result = graph_rewrite(&matcher, self_check);
-
-    // x == x for floats should not become true (due to NaN possibility)
-    // However, in this specific case with constants, it might be optimized
-    // This test documents current behavior
-    if x.dtype().is_float() {
-        // Float self-equality is complex due to NaN
-        // Current implementation might optimize it, but ideally shouldn't
-        // This is a known limitation
-    }
-}
-
-#[test]
 fn test_cascading_bounds_elimination() {
     // Test that eliminated bounds checks enable further optimizations
     let idx = UOp::var("idx", DType::Int32, 0, 10);
