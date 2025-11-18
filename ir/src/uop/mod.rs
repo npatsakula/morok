@@ -11,13 +11,17 @@
 //! - [`helpers`] - Pattern matching and simplification helpers
 //! - [`cached_property`] - Reusable pattern for cached graph properties
 //! - [`properties`] - Standard cached properties (shape, ranges, etc.)
+//! - [`eval`] - Constant evaluation for operations
+//! - [`range_eval`] - Range analysis (vmin/vmax) for operations
 
 pub mod cached_property;
 pub mod constructors;
 pub mod core;
+pub mod eval;
 pub mod hash_consing;
 pub mod helpers;
 pub mod properties;
+pub mod range_eval;
 
 // Re-export the main types
 pub use core::{IntoUOp, UOp, UOpKey};

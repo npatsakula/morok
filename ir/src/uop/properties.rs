@@ -8,8 +8,10 @@
 //! - [`ShapeProperty`] - Shape inference for tensor operations
 //! - [`RangesProperty`] - All RANGE operations in the graph
 //! - [`InScopeRangesProperty`] - RANGE operations currently in scope
+//! - [`VminVmaxProperty`] - Range analysis (min/max values) for operations
 
 use crate::cached_property;
+use crate::types::ConstValue;
 use crate::{Op, UOpKey};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -101,5 +103,34 @@ cached_property! {
     InScopeRangesProperty: HashSet<UOpKey> {
         cache_field: in_scope_ranges_cache,
         compute: |uop| uop.compute_in_scope_ranges()
+    }
+}
+
+// ============================================================================
+// VminVmax Property
+// ============================================================================
+
+cached_property! {
+    /// Cached vmin/vmax range analysis property.
+    ///
+    /// Computes the minimum and maximum possible values for a UOp based on
+    /// operation semantics and input ranges. Returns a tuple of (vmin, vmax)
+    /// where both values are ConstValue types.
+    ///
+    /// The analysis is conservative - when in doubt, it returns the full dtype
+    /// bounds to avoid incorrect optimizations.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use morok_ir::uop::properties::VminVmaxProperty;
+    /// use morok_ir::uop::cached_property::CachedProperty;
+    ///
+    /// let (vmin, vmax) = VminVmaxProperty::get(&my_uop);
+    /// println!("Value range: [{:?}, {:?}]", vmin, vmax);
+    /// ```
+    VminVmaxProperty: (ConstValue, ConstValue) {
+        cache_field: vmin_vmax_cache,
+        compute: |uop| crate::uop::range_eval::compute_vmin_vmax(uop)
     }
 }

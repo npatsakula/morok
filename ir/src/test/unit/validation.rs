@@ -540,7 +540,7 @@ fn test_shift_preserves_lhs_dtype_all_types() {
     ];
 
     for (dtype, value) in types_and_values {
-        let val = UOp::const_(dtype.clone(), value.clone());
+        let val = UOp::const_(dtype.clone(), value);
         let shl_result = UOp::try_shl_op(val.clone(), shift_amt.clone());
         assert!(shl_result.is_ok());
         assert_eq!(shl_result.unwrap().dtype(), dtype);
@@ -790,7 +790,7 @@ fn test_all_int_types_with_and() {
     ];
 
     for (dtype, value) in int_types {
-        let a = UOp::const_(dtype.clone(), value.clone());
+        let a = UOp::const_(dtype.clone(), value);
         let b = UOp::const_(dtype.clone(), value);
 
         let result = UOp::try_and_op(a, b);
@@ -815,7 +815,7 @@ fn test_all_int_types_with_or() {
     ];
 
     for (dtype, value) in int_types {
-        let a = UOp::const_(dtype.clone(), value.clone());
+        let a = UOp::const_(dtype.clone(), value);
         let b = UOp::const_(dtype.clone(), value);
 
         let result = UOp::try_or_op(a, b);
@@ -839,7 +839,7 @@ fn test_all_int_types_with_xor() {
     ];
 
     for (dtype, value) in int_types {
-        let a = UOp::const_(dtype.clone(), value.clone());
+        let a = UOp::const_(dtype.clone(), value);
         let b = UOp::const_(dtype.clone(), value);
 
         let result = UOp::try_xor_op(a, b);

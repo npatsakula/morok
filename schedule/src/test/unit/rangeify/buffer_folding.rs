@@ -94,7 +94,7 @@ fn test_bufferize_different_const_types() {
     // Test with different constant types
     let test_cases = vec![
         (DType::Int32, ConstValue::Int(100)),
-        (DType::Float32, ConstValue::Float(3.14)),
+        (DType::Float32, ConstValue::Float(std::f64::consts::PI)),
         (DType::Bool, ConstValue::Bool(true)),
     ];
 

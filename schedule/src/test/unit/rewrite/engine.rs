@@ -19,11 +19,10 @@ fn test_simple_rewrite() {
 
     pattern!(patterns,
         UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Rc<UOp>, zero: &Rc<UOp>| {
-            if let Op::Const(cv) = zero.op() {
-                if cv.0 == ConstValue::Int(0) {
+            if let Op::Const(cv) = zero.op()
+                && cv.0 == ConstValue::Int(0) {
                     return Some(Rc::clone(x));
                 }
-            }
             None
         }
     );
@@ -46,11 +45,10 @@ fn test_nested_rewrite() {
 
     pattern!(patterns,
         UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Rc<UOp>, zero: &Rc<UOp>| {
-            if let Op::Const(cv) = zero.op() {
-                if cv.0 == ConstValue::Int(0) {
+            if let Op::Const(cv) = zero.op()
+                && cv.0 == ConstValue::Int(0) {
                     return Some(Rc::clone(x));
                 }
-            }
             None
         }
     );
@@ -74,11 +72,10 @@ fn test_fixed_point_iteration() {
 
     pattern!(patterns,
         UPat::binary(vec![BinaryOp::Mul], vec![UPat::var("x"), UPat::cvar("one")]) => |x: &Rc<UOp>, one: &Rc<UOp>| {
-            if let Op::Const(cv) = one.op() {
-                if cv.0 == ConstValue::Int(1) {
+            if let Op::Const(cv) = one.op()
+                && cv.0 == ConstValue::Int(1) {
                     return Some(Rc::clone(x));
                 }
-            }
             None
         }
     );
@@ -103,22 +100,20 @@ fn test_multiple_patterns() {
 
     pattern!(patterns,
         UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Rc<UOp>, c: &Rc<UOp>| {
-            if let Op::Const(cv) = c.op() {
-                if cv.0 == ConstValue::Int(0) {
+            if let Op::Const(cv) = c.op()
+                && cv.0 == ConstValue::Int(0) {
                     return Some(Rc::clone(x));
                 }
-            }
             None
         }
     );
 
     pattern!(patterns,
         UPat::binary(vec![BinaryOp::Mul], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Rc<UOp>, c: &Rc<UOp>| {
-            if let Op::Const(cv) = c.op() {
-                if cv.0 == ConstValue::Int(1) {
+            if let Op::Const(cv) = c.op()
+                && cv.0 == ConstValue::Int(1) {
                     return Some(Rc::clone(x));
                 }
-            }
             None
         }
     );
@@ -143,11 +138,10 @@ fn test_no_rewrite() {
 
     pattern!(patterns,
         UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Rc<UOp>, zero: &Rc<UOp>| {
-            if let Op::Const(cv) = zero.op() {
-                if cv.0 == ConstValue::Int(0) {
+            if let Op::Const(cv) = zero.op()
+                && cv.0 == ConstValue::Int(0) {
                     return Some(Rc::clone(x));
                 }
-            }
             None
         }
     );

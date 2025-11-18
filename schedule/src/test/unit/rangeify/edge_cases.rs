@@ -7,9 +7,7 @@ use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use smallvec::SmallVec;
 
-use crate::rangeify::{
-    bufferize_to_store::bufferize_to_store, pipeline::run_kernel_split_pipeline, KernelContext,
-};
+use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store, pipeline::run_kernel_split_pipeline};
 
 #[test]
 fn test_zero_size_range() {
@@ -36,7 +34,11 @@ fn test_empty_bufferize() {
     // BUFFERIZE with no ranges (scalar store)
     let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
     let bufferize = UOp::new(
-        Op::Bufferize { compute: compute.clone(), ranges: SmallVec::new(), opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global } },
+        Op::Bufferize {
+            compute: compute.clone(),
+            ranges: SmallVec::new(),
+            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
+        },
         DType::Float32,
     );
 
@@ -89,7 +91,11 @@ fn test_zero_size_pipeline() {
     // Full pipeline with zero-size BUFFERIZE
     let compute = UOp::const_(DType::Int32, ConstValue::Int(0));
     let bufferize = UOp::new(
-        Op::Bufferize { compute, ranges: SmallVec::new(), opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global } },
+        Op::Bufferize {
+            compute,
+            ranges: SmallVec::new(),
+            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
+        },
         DType::Int32,
     );
 

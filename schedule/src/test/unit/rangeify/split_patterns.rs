@@ -2,7 +2,7 @@ use std::{collections::HashMap, rc::Rc};
 
 use morok_dtype::DType;
 use morok_ir::{AxisType, ConstValue, Op, UOp};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 
 use crate::{
     pattern::RewriteResult,
@@ -157,7 +157,7 @@ fn test_handle_after() {
             // Check that the buffer was mapped to the after operation
             assert!(ctx.has_buffer(&buffer));
             // Use Rc::ptr_eq for comparison
-            assert!(Rc::ptr_eq(&ctx.get_buffer(&buffer).unwrap(), &after));
+            assert!(Rc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
         }
         _ => panic!("Expected Rewritten result"),
     }
@@ -214,7 +214,7 @@ fn test_debuf_buffer_mapping() {
     // Buffer should be mapped to itself
     assert!(ctx.has_buffer(&buffer));
     let mapped = ctx.get_buffer(&buffer).unwrap();
-    assert!(Rc::ptr_eq(&mapped, &buffer));
+    assert!(Rc::ptr_eq(mapped, &buffer));
 }
 
 #[test]
@@ -241,7 +241,7 @@ fn test_handle_after_mstack_unwrap() {
             assert!(matches!(op.op(), Op::Unique(_)));
             assert!(Rc::ptr_eq(&op, &buf1));
             // buf1 should be mapped to after
-            assert!(Rc::ptr_eq(&ctx.get_buffer(&buf1).unwrap(), &after));
+            assert!(Rc::ptr_eq(ctx.get_buffer(&buf1).unwrap(), &after));
         }
         _ => panic!("Expected Rewritten result"),
     }
@@ -269,7 +269,7 @@ fn test_handle_after_mselect_unwrap() {
         RewriteResult::Rewritten(op) => {
             assert!(Rc::ptr_eq(&op, &buffer));
             // buffer should be mapped to after
-            assert!(Rc::ptr_eq(&ctx.get_buffer(&buffer).unwrap(), &after));
+            assert!(Rc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
         }
         _ => panic!("Expected Rewritten result"),
     }
@@ -299,23 +299,20 @@ fn test_renumber_range_sequential() {
     let result3 = renumber_range(&bindings3, &mut ctx);
 
     // Should get sequential IDs 0, 1, 2
-    if let RewriteResult::Rewritten(r) = result1 {
-        if let Op::Range { axis_id, .. } = r.op() {
+    if let RewriteResult::Rewritten(r) = result1
+        && let Op::Range { axis_id, .. } = r.op() {
             assert_eq!(*axis_id, 0);
         }
-    }
 
-    if let RewriteResult::Rewritten(r) = result2 {
-        if let Op::Range { axis_id, .. } = r.op() {
+    if let RewriteResult::Rewritten(r) = result2
+        && let Op::Range { axis_id, .. } = r.op() {
             assert_eq!(*axis_id, 1);
         }
-    }
 
-    if let RewriteResult::Rewritten(r) = result3 {
-        if let Op::Range { axis_id, .. } = r.op() {
+    if let RewriteResult::Rewritten(r) = result3
+        && let Op::Range { axis_id, .. } = r.op() {
             assert_eq!(*axis_id, 2);
         }
-    }
 }
 
 #[test]

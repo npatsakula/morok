@@ -54,7 +54,7 @@ fn test_pipeline_two_bufferizes() {
 #[test]
 fn test_pipeline_preserves_structure() {
     // Verify that UOp identity is preserved through pipeline stages
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let compute = UOp::const_(DType::Float32, ConstValue::Float(std::f64::consts::PI));
     let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 0, AxisType::Loop);
 
     let bufferize = UOp::new(

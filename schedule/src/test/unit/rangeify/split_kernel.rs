@@ -136,8 +136,8 @@ fn test_split_store_preserves_computation() {
         let kernel = result.unwrap();
 
         // Verify KERNEL structure
-        if let Op::Kernel { ast, .. } = kernel.op() {
-            if let Op::Sink { sources } = ast.op() {
+        if let Op::Kernel { ast, .. } = kernel.op()
+            && let Op::Sink { sources } = ast.op() {
                 // SINK should wrap the STORE
                 assert!(std::rc::Rc::ptr_eq(&sources[0], &store));
 
@@ -147,7 +147,6 @@ fn test_split_store_preserves_computation() {
                     assert!(std::rc::Rc::ptr_eq(stored_val, &value));
                 }
             }
-        }
     }
 }
 

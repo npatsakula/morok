@@ -6,7 +6,7 @@
 use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 
-use crate::rangeify::{pipeline::run_kernel_split_pipeline, KernelContext};
+use crate::rangeify::{KernelContext, pipeline::run_kernel_split_pipeline};
 use crate::test::unit::rangeify::helpers::{count_define_globals, count_kernels, count_stores};
 
 #[test]

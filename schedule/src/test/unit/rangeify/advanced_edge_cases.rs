@@ -6,13 +6,11 @@
 //! - Multi-consumer patterns
 //! - Complex indexing scenarios
 
-use morok_ir::{AxisType, ConstValue, DType, Op, UOp};
-use std::rc::Rc;
+use morok_ir::{ConstValue, DType, Op, UOp};
 
 use crate::rangeify::transform::rangeify;
-use crate::rewrite::graph_rewrite;
 
-use super::helpers::{create_bufferize, create_const, create_range, create_range_symbolic, count_kernels};
+use super::helpers::{create_bufferize, create_const, create_range, create_range_symbolic};
 
 // ============================================================================
 // Symbolic Range Size Tests
@@ -133,23 +131,12 @@ fn test_bufferize_multiple_consumers() {
     let buf = create_bufferize(compute, vec![range]);
 
     // Two independent consumers of the same buffer
-    let consumer1 = UOp::try_add_op(
-        buf.clone(),
-        UOp::const_(DType::Float32, ConstValue::Float(2.0)),
-    )
-    .unwrap();
+    let consumer1 = UOp::try_add_op(buf.clone(), UOp::const_(DType::Float32, ConstValue::Float(2.0))).unwrap();
 
-    let consumer2 = UOp::try_mul_op(
-        buf.clone(),
-        UOp::const_(DType::Float32, ConstValue::Float(3.0)),
-    )
-    .unwrap();
+    let consumer2 = UOp::try_mul_op(buf.clone(), UOp::const_(DType::Float32, ConstValue::Float(3.0))).unwrap();
 
     // Combine consumers with SINK
-    let sink = UOp::new(
-        Op::Sink { sources: vec![consumer1, consumer2].into() },
-        DType::Float32,
-    );
+    let sink = UOp::new(Op::Sink { sources: vec![consumer1, consumer2].into() }, DType::Float32);
 
     // Should handle multi-consumer pattern without crashing
     let (_result, _ctx) = rangeify(sink);
@@ -171,10 +158,7 @@ fn test_operation_with_multiple_uses() {
     let buf2 = create_bufferize(compute.clone(), vec![r2]);
 
     // Both bufferize the same compute
-    let sink = UOp::new(
-        Op::Sink { sources: vec![buf1, buf2].into() },
-        DType::Float32,
-    );
+    let sink = UOp::new(Op::Sink { sources: vec![buf1, buf2].into() }, DType::Float32);
 
     // Should handle same operation bufferized with different ranges
     let (_result, _ctx) = rangeify(sink);
@@ -202,10 +186,7 @@ fn test_index_with_multiple_ranges() {
         DType::Float32,
     );
 
-    let (result, _ctx) = rangeify(index_op);
-
-    // Should handle multi-dimensional indexing
-    assert!(result.op().sources().len() >= 0, "Should successfully transform multi-dim index");
+    let (_result, _ctx) = rangeify(index_op);
 }
 
 #[test]

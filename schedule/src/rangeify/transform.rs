@@ -121,9 +121,10 @@ pub fn should_remove_movement_op(x: &Rc<UOp>, ctx: &IndexingContext) -> bool {
 
     // Remove if source is already indexed
     if let Some(src) = x.op().sources().first()
-        && matches!(src.op(), Op::Index { .. }) {
-            return true;
-        }
+        && matches!(src.op(), Op::Index { .. })
+    {
+        return true;
+    }
 
     false
 }

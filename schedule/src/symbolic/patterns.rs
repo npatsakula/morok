@@ -3,14 +3,14 @@
 //! Defines the core symbolic simplification patterns for algebraic optimization.
 //!
 //! This module contains:
+//! - Constant folding (const op const → const)
 //! - Identity element folding (x + 0 → x, x * 1 → x)
 //! - Zero propagation (x * 0 → 0, x & 0 → 0)
-//! - Constant folding (coming soon)
 //!
 //! These patterns are separated from rangeify patterns because they apply
 //! universally to any UOp graph, not just during schedule transformation.
 
-use morok_ir::BinaryOp;
+use morok_ir::{BinaryOp, TernaryOp, UnaryOp};
 
 use crate::pattern::UPat;
 use crate::pattern::matcher::PatternMatcher;
@@ -30,6 +30,99 @@ use std::rc::Rc;
 /// - x & 0 → 0, 0 & x → 0
 pub fn symbolic_simple() -> PatternMatcher {
     let mut patterns = vec![];
+
+    // ========== Constant Folding ==========
+    // These patterns must come first to fold constants before other optimizations
+
+    // Helper macro for unary constant folding
+    macro_rules! unary_const_fold {
+        ($patterns:ident, $op:ident) => {
+            pattern!($patterns,
+                UPat::unary(vec![UnaryOp::$op], UPat::cvar("c")) => |c| {
+                    use morok_ir::uop::eval::eval_unary_op;
+                    let c_val = get_const_value(c)?;
+                    let result = eval_unary_op(UnaryOp::$op, c_val)?;
+                    Some(morok_ir::UOp::const_(c.dtype(), result))
+                }
+            );
+        };
+    }
+
+    // Apply constant folding for all unary operations
+    unary_const_fold!(patterns, Neg);
+    unary_const_fold!(patterns, Sqrt);
+    unary_const_fold!(patterns, Exp2);
+    unary_const_fold!(patterns, Log2);
+    unary_const_fold!(patterns, Sin);
+    unary_const_fold!(patterns, Reciprocal);
+    unary_const_fold!(patterns, Trunc);
+
+    // Helper macro for binary constant folding
+    macro_rules! binary_const_fold {
+        ($patterns:ident, $op:ident, comparison) => {
+            pattern!($patterns,
+                UPat::binary(vec![BinaryOp::$op], vec![UPat::cvar("a"), UPat::cvar("b")]) => |a, b| {
+                    use morok_ir::uop::eval::eval_binary_op;
+                    let a_val = get_const_value(a)?;
+                    let b_val = get_const_value(b)?;
+                    let result = eval_binary_op(BinaryOp::$op, a_val, b_val)?;
+                    Some(morok_ir::UOp::const_(morok_ir::DType::Bool, result))
+                }
+            );
+        };
+        ($patterns:ident, $op:ident) => {
+            pattern!($patterns,
+                UPat::binary(vec![BinaryOp::$op], vec![UPat::cvar("a"), UPat::cvar("b")]) => |a, b| {
+                    use morok_ir::uop::eval::eval_binary_op;
+                    let a_val = get_const_value(a)?;
+                    let b_val = get_const_value(b)?;
+                    let result = eval_binary_op(BinaryOp::$op, a_val, b_val)?;
+                    Some(morok_ir::UOp::const_(a.dtype(), result))
+                }
+            );
+        };
+    }
+
+    // Apply constant folding for all binary operations (except Threefry - PRNG)
+    binary_const_fold!(patterns, Add);
+    binary_const_fold!(patterns, Mul);
+    binary_const_fold!(patterns, Sub);
+    binary_const_fold!(patterns, Mod);
+    binary_const_fold!(patterns, Max);
+    binary_const_fold!(patterns, Pow);
+    binary_const_fold!(patterns, Idiv);
+    binary_const_fold!(patterns, Fdiv);
+    binary_const_fold!(patterns, Lt, comparison);
+    binary_const_fold!(patterns, Eq, comparison);
+    binary_const_fold!(patterns, Ne, comparison);
+    binary_const_fold!(patterns, And);
+    binary_const_fold!(patterns, Or);
+    binary_const_fold!(patterns, Xor);
+    binary_const_fold!(patterns, Shl);
+    binary_const_fold!(patterns, Shr);
+
+    // Ternary constant folding
+    pattern!(patterns,
+        UPat::ternary(vec![TernaryOp::Where], vec![UPat::cvar("cond"), UPat::cvar("t"), UPat::cvar("f")]) => |cond, t, f| {
+            use morok_ir::uop::eval::eval_ternary_op;
+            let cond_val = get_const_value(cond)?;
+            let t_val = get_const_value(t)?;
+            let f_val = get_const_value(f)?;
+            let result = eval_ternary_op(TernaryOp::Where, cond_val, t_val, f_val)?;
+            Some(morok_ir::UOp::const_(t.dtype(), result))
+        }
+    );
+
+    pattern!(patterns,
+        UPat::ternary(vec![TernaryOp::MulAcc], vec![UPat::cvar("a"), UPat::cvar("b"), UPat::cvar("c")]) => |a, b, c| {
+            use morok_ir::uop::eval::eval_ternary_op;
+            let a_val = get_const_value(a)?;
+            let b_val = get_const_value(b)?;
+            let c_val = get_const_value(c)?;
+            let result = eval_ternary_op(TernaryOp::MulAcc, a_val, b_val, c_val)?;
+            Some(morok_ir::UOp::const_(a.dtype(), result))
+        }
+    );
 
     // ========== Identity folding ==========
 
@@ -343,41 +436,13 @@ pub fn symbolic_simple() -> PatternMatcher {
     // Constant folding for cast operations
     pattern!(patterns,
         UPat::cast_named(UPat::cvar("c"), "cast") => |c: &Rc<morok_ir::UOp>, cast: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
+            use morok_ir::{Op, UOp};
 
             // Get the target dtype from the cast
             if let Op::Cast { dtype: target_dtype, .. } = cast.op() {
                 // Get the constant value
                 if let Op::Const(cv) = c.op() {
-                    // Convert the constant to the target type
-                    let new_value = match &cv.0 {
-                        ConstValue::Int(i) => {
-                            if target_dtype.is_float() {
-                                Some(ConstValue::Float(*i as f64))
-                            } else if target_dtype.is_int() {
-                                Some(ConstValue::Int(*i))
-                            } else {
-                                None
-                            }
-                        },
-                        ConstValue::Float(f) => {
-                            if target_dtype.is_int() {
-                                Some(ConstValue::Int(*f as i64))
-                            } else if target_dtype.is_float() {
-                                Some(ConstValue::Float(*f))
-                            } else {
-                                None
-                            }
-                        },
-                        ConstValue::Bool(b) => {
-                            if target_dtype.is_int() {
-                                Some(ConstValue::Int(if *b { 1 } else { 0 }))
-                            } else {
-                                None
-                            }
-                        },
-                        _ => None,
-                    };
+                    let new_value = cv.0.cast(target_dtype);
 
                     if let Some(val) = new_value {
                         return Some(UOp::const_(target_dtype.clone(), val));

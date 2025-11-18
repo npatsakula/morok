@@ -62,10 +62,7 @@ pub fn create_const(val: i64) -> Rc<UOp> {
 
 /// Create a RANGE operation with constant end value.
 pub fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
-    UOp::new(
-        Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop },
-        DType::Index,
-    )
+    UOp::new(Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop }, DType::Index)
 }
 
 /// Create a RANGE operation with symbolic end value.
@@ -79,11 +76,7 @@ pub fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
 }
 
 /// Create a BUFFERIZE operation with custom options.
-pub fn create_bufferize_opts(
-    compute: Rc<UOp>,
-    ranges: Vec<Rc<UOp>>,
-    opts: BufferizeOpts,
-) -> Rc<UOp> {
+pub fn create_bufferize_opts(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>, opts: BufferizeOpts) -> Rc<UOp> {
     UOp::bufferize(compute, ranges, opts)
 }
 

@@ -731,21 +731,24 @@ impl UPat {
             UPat::Match { op: op_filter, dtype: dtype_filter, src: src_pattern, arg: arg_pattern, name } => {
                 // 1. Check operation type
                 if let Some(filters) = op_filter
-                    && !Self::matches_op_filter(uop.op(), filters) {
-                        return vec![];
-                    }
+                    && !Self::matches_op_filter(uop.op(), filters)
+                {
+                    return vec![];
+                }
 
                 // 2. Check dtype
                 if let Some(dtypes) = dtype_filter
-                    && !dtypes.contains(&uop.dtype()) {
-                        return vec![];
-                    }
+                    && !dtypes.contains(&uop.dtype())
+                {
+                    return vec![];
+                }
 
                 // 3. Check argument pattern
                 if let Some(arg_pat) = arg_pattern
-                    && !Self::matches_arg(uop, arg_pat) {
-                        return vec![];
-                    }
+                    && !Self::matches_arg(uop, arg_pat)
+                {
+                    return vec![];
+                }
 
                 // 4. Check/store named binding
                 if let Some(n) = name {

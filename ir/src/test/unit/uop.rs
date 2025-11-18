@@ -280,9 +280,9 @@ fn test_ranges_property_with_range() {
 
 #[test]
 fn test_ranges_property_lazy_evaluation() {
+    use crate::AxisType;
     use crate::uop::cached_property::CachedProperty;
     use crate::uop::properties::RangesProperty;
-    use crate::AxisType;
 
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
     let range = UOp::range(end, 0, AxisType::Loop);
@@ -326,9 +326,9 @@ fn test_in_scope_ranges_simple() {
 
 #[test]
 fn test_in_scope_ranges_lazy_evaluation() {
+    use crate::AxisType;
     use crate::uop::cached_property::CachedProperty;
     use crate::uop::properties::InScopeRangesProperty;
-    use crate::AxisType;
 
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
     let range = UOp::range(end, 0, AxisType::Loop);

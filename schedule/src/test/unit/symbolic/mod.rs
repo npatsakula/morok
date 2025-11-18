@@ -95,23 +95,37 @@ fn test_symbolic_simple_zero_propagation() {
 }
 
 #[test]
-fn test_symbolic_simple_no_match() {
+fn test_symbolic_simple_const_folding() {
     let matcher = symbolic_simple();
 
-    // Test: 5 + 3 (not identity) -> no match
+    // Test: 5 + 3 -> 8 (constant folding)
     let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     let three = UOp::const_(DType::Int32, ConstValue::Int(3));
     let add = UOp::new(Op::Binary(BinaryOp::Add, five.clone(), three), DType::Int32);
 
     let result = matcher.rewrite(&add);
-    assert!(matches!(result, RewriteResult::NoMatch));
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Int(8));
+        } else {
+            panic!("Expected Const(Int(8)), got {:?}", rewritten.op());
+        }
+    }
 
-    // Test: 5 * 2 (not identity) -> no match
+    // Test: 5 * 2 -> 10 (constant folding)
     let two = UOp::const_(DType::Int32, ConstValue::Int(2));
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, five, two), DType::Int32);
 
     let result2 = matcher.rewrite(&mul);
-    assert!(matches!(result2, RewriteResult::NoMatch));
+    assert!(matches!(result2, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result2 {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Int(10));
+        } else {
+            panic!("Expected Const(Int(10)), got {:?}", rewritten.op());
+        }
+    }
 }
 
 // ====== Tests for NEW patterns ======
@@ -367,7 +381,7 @@ fn test_cast_int_to_float_constant() {
 fn test_cast_float_to_int_constant() {
     // Test: cast(float_const) -> int_const
     let matcher = symbolic_simple();
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f64::consts::PI));
     let cast = UOp::new(Op::Cast { src: float_val, dtype: DType::Int32 }, DType::Int32);
 
     let result = matcher.rewrite(&cast);

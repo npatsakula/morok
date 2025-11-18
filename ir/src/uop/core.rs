@@ -62,6 +62,10 @@ pub struct UOp {
     /// Computed lazily based on Tinygrad's ranges property.
     /// Uses UOpKey wrapper to enable Hash/Eq based on UOp ID.
     pub(crate) in_scope_ranges_cache: std::cell::OnceCell<HashSet<UOpKey>>,
+    /// Cached vmin/vmax range analysis values.
+    /// Computed lazily via range propagation through the computation graph.
+    /// Returns (vmin, vmax) as ConstValue types.
+    pub(crate) vmin_vmax_cache: std::cell::OnceCell<(ConstValue, ConstValue)>,
 }
 
 impl UOp {
@@ -92,6 +96,44 @@ impl UOp {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::ShapeProperty;
         ShapeProperty::get(self).as_ref()
+    }
+
+    /// Get the minimum possible value of this UOp.
+    ///
+    /// Returns the minimum value based on range analysis.
+    /// Computed lazily on first access and cached.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use morok_ir::{UOp, ConstValue};
+    /// # use morok_dtype::DType;
+    /// let five = UOp::const_(DType::Int32, ConstValue::Int(5));
+    /// assert_eq!(five.vmin(), &ConstValue::Int(5));
+    /// ```
+    pub fn vmin(self: &Rc<Self>) -> &ConstValue {
+        use crate::uop::cached_property::CachedProperty;
+        use crate::uop::properties::VminVmaxProperty;
+        &VminVmaxProperty::get(self).0
+    }
+
+    /// Get the maximum possible value of this UOp.
+    ///
+    /// Returns the maximum value based on range analysis.
+    /// Computed lazily on first access and cached.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use morok_ir::{UOp, ConstValue};
+    /// # use morok_dtype::DType;
+    /// let five = UOp::const_(DType::Int32, ConstValue::Int(5));
+    /// assert_eq!(five.vmax(), &ConstValue::Int(5));
+    /// ```
+    pub fn vmax(self: &Rc<Self>) -> &ConstValue {
+        use crate::uop::cached_property::CachedProperty;
+        use crate::uop::properties::VminVmaxProperty;
+        &VminVmaxProperty::get(self).1
     }
 
     /// Topological sort of the computation graph.
@@ -1146,6 +1188,7 @@ impl Clone for UOp {
             shape_cache: std::cell::OnceCell::new(),
             ranges_cache: std::cell::OnceCell::new(),
             in_scope_ranges_cache: std::cell::OnceCell::new(),
+            vmin_vmax_cache: std::cell::OnceCell::new(),
         }
     }
 }

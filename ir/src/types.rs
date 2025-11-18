@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 
 use morok_device::DeviceSpec;
-use morok_dtype::DType;
+use morok_dtype::{DType, ScalarDType};
 
 /// Constant value that can be stored in a UOp.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -16,6 +16,128 @@ pub enum ConstValue {
     UInt(u64),
     Float(f64),
     Bool(bool),
+}
+
+/// Helper macro to cast to target width and back to storage type (for proper truncation/extension).
+macro_rules! cast_via {
+    ($v:expr, $target:ty, $storage:ty) => {
+        ($v as $target) as $storage
+    };
+}
+
+/// Macro to generate casting logic by delegating to helper functions.
+macro_rules! impl_cast {
+    ($self:expr, $to:expr) => {
+        match ($self, $to) {
+            (ConstValue::Bool(v), dt) => cast_bool(v, dt)?,
+            (ConstValue::Int(v), dt) => cast_int(v, dt)?,
+            (ConstValue::UInt(v), dt) => cast_uint(v, dt)?,
+            (ConstValue::Float(v), dt) => cast_float(v, dt)?,
+        }
+    };
+}
+
+#[inline]
+fn cast_bool(v: bool, to: ScalarDType) -> Option<ConstValue> {
+    use ScalarDType::*;
+    Some(match to {
+        Bool => ConstValue::Bool(v),
+        Int8 | Int16 | Int32 | Int64 => ConstValue::Int(v as i64),
+        UInt8 | UInt16 | UInt32 | UInt64 => ConstValue::UInt(v as u64),
+        Float16 | Float32 | Float64 => ConstValue::Float(v as u8 as f64),
+        _ => return None,
+    })
+}
+
+#[inline]
+fn cast_int(v: i64, to: ScalarDType) -> Option<ConstValue> {
+    use ScalarDType::*;
+    Some(match to {
+        Bool => ConstValue::Bool(v != 0),
+        Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
+        Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
+        Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
+        Int64 => ConstValue::Int(v),
+        UInt8 => ConstValue::UInt(cast_via!(v, u8, u64)),
+        UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
+        UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
+        UInt64 => ConstValue::UInt(v as u64),
+        Float16 | Float32 | Float64 => ConstValue::Float(v as f64),
+        _ => return None,
+    })
+}
+
+#[inline]
+fn cast_uint(v: u64, to: ScalarDType) -> Option<ConstValue> {
+    use ScalarDType::*;
+    Some(match to {
+        Bool => ConstValue::Bool(v != 0),
+        Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
+        Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
+        Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
+        Int64 => ConstValue::Int(v as i64),
+        UInt8 => ConstValue::UInt(cast_via!(v, u8, u64)),
+        UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
+        UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
+        UInt64 => ConstValue::UInt(v),
+        Float16 | Float32 | Float64 => ConstValue::Float(v as f64),
+        _ => return None,
+    })
+}
+
+#[inline]
+fn cast_float(v: f64, to: ScalarDType) -> Option<ConstValue> {
+    use ScalarDType::*;
+    Some(match to {
+        Bool => ConstValue::Bool(v != 0.0),
+        Int8 => ConstValue::Int(cast_via!(v, i8, i64)),
+        Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
+        Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
+        Int64 => ConstValue::Int(v as i64),
+        // Float-to-unsigned: route through i64 first (matches Tinygrad behavior)
+        UInt8 => ConstValue::UInt(cast_via!(v as i64, u8, u64)),
+        UInt16 => ConstValue::UInt(cast_via!(v as i64, u16, u64)),
+        UInt32 => ConstValue::UInt(cast_via!(v as i64, u32, u64)),
+        UInt64 => ConstValue::UInt((v as i64) as u64),
+        Float16 | Float32 | Float64 => ConstValue::Float(v),
+        _ => return None,
+    })
+}
+
+impl ConstValue {
+    pub const fn dtype(&self) -> DType {
+        match self {
+            ConstValue::Int(_) => DType::Int64,
+            ConstValue::UInt(_) => DType::UInt64,
+            ConstValue::Float(_) => DType::Float64,
+            ConstValue::Bool(_) => DType::Bool,
+        }
+    }
+
+    /// Cast this constant value to the target dtype.
+    ///
+    /// Returns `None` if:
+    /// - The target dtype is not a scalar type
+    /// - The target dtype is not representable as a ConstValue (e.g., Void, Index, special float formats)
+    ///
+    /// # Safety and Semantics
+    ///
+    /// This method performs constant folding for cast operations and allows ALL casts
+    /// (including lossy ones like float->int) since the user explicitly wrote the cast operation.
+    ///
+    /// Uses Rust's `as` operator for conversions, which follows C semantics:
+    /// - Truncation for narrowing conversions (e.g., i64 -> i32)
+    /// - Wrap-around for unsigned overflow
+    /// - Truncation toward zero for float-to-int conversions
+    ///
+    /// For multi-stage conversions (e.g., casting through intermediate types),
+    /// the value is cast to the target width and then extended back to the storage type.
+    /// Example: i64 -> i8 -> i64 ensures proper sign extension.
+    pub fn cast(&self, dtype: &DType) -> Option<Self> {
+        let scalar_dtype = dtype.scalar()?;
+
+        Some(impl_cast!(*self, scalar_dtype))
+    }
 }
 
 /// Memory address space for buffer allocation.
