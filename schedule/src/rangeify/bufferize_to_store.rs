@@ -89,11 +89,7 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
 
     // Wrap STORE in END operation with all ranges
     // END references the computation (STORE) and closes all the ranges
-    let mut result = if !ranges.is_empty() {
-        UOp::end(store.clone(), ranges.clone())
-    } else {
-        store
-    };
+    let mut result = if !ranges.is_empty() { UOp::end(store.clone(), ranges.clone()) } else { store };
 
     // For local buffers, add BARRIER for synchronization
     // This ensures all threads in a workgroup have completed their stores

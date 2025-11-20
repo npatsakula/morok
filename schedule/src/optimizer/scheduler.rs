@@ -1,0 +1,696 @@
+//! Scheduler for kernel optimization.
+//!
+//! The `Scheduler` manages kernel optimization state and applies transformation primitives (OptOps)
+//! to improve performance on specific backends.
+
+use std::cell::OnceCell;
+use std::fmt;
+use std::rc::Rc;
+
+use morok_ir::{AxisType, Op, UOp};
+
+use super::error::*;
+use super::renderer::Renderer;
+use super::types::{Opt, OptOps};
+
+/// Scheduler for kernel optimization.
+///
+/// Manages the optimization state of a kernel, including:
+/// - The UOp AST being optimized
+/// - Backend capabilities (Renderer)
+/// - Applied optimizations history
+/// - Cached properties (ranges, shapes, etc.)
+///
+/// # Architecture
+///
+/// The Scheduler is the central component of the optimization layer:
+/// 1. Created from a kernel AST + backend Renderer
+/// 2. Applies OptOps via `apply_opt()` or heuristics
+/// 3. Each optimization may create new ranges or modify existing ones
+/// 4. Caches are cleared after mutations to ensure consistency
+/// 5. Final optimized AST retrieved via `get_optimized_ast()`
+///
+/// # Example
+///
+/// ```ignore
+/// let renderer = Renderer::cuda();
+/// let mut scheduler = Scheduler::new(kernel_ast, renderer);
+///
+/// // Initial parallelization
+/// scheduler.convert_loop_to_global()?;
+///
+/// // Apply optimizations
+/// scheduler.apply_opt(Opt::upcast(0, 4))?;  // Vectorize by 4
+/// scheduler.apply_opt(Opt::local(1, 16))?;  // 16 threads per workgroup
+///
+/// // Get result
+/// let optimized = scheduler.get_optimized_ast(None);
+/// ```
+pub struct Scheduler {
+    /// The kernel AST being optimized.
+    ///
+    /// This is the root UOp representing the computation. Immutable during the lifetime
+    /// of a Scheduler instance - transformations create new ASTs.
+    ast: Rc<UOp>,
+
+    /// Backend renderer capabilities.
+    ///
+    /// Describes what optimizations the target backend supports and enforces device limits.
+    pub ren: Renderer,
+
+    /// Whether local memory usage is disabled.
+    ///
+    /// Set to true by NOLOCALS opt or if backend doesn't support local memory.
+    pub dont_use_locals: bool,
+
+    /// History of applied optimizations.
+    ///
+    /// Used for debugging, kernel naming, and potential undo functionality.
+    pub applied_opts: Vec<Opt>,
+
+    // Cached properties (computed lazily)
+    /// Cached list of all RANGE operations, sorted by (axis_type.priority(), axis_id).
+    rngs_cache: OnceCell<Vec<Rc<UOp>>>,
+
+    /// Cached maximum axis_id used in any RANGE.
+    maxarg_cache: OnceCell<usize>,
+}
+
+impl Scheduler {
+    /// Create a new Scheduler for the given kernel AST and backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `ast` - The kernel UOp AST to optimize (typically from rangeify phase 5)
+    /// * `ren` - Backend renderer describing capabilities and limits
+    ///
+    /// # Returns
+    ///
+    /// A new Scheduler with empty optimization history and cleared caches.
+    pub fn new(ast: Rc<UOp>, ren: Renderer) -> Self {
+        Self {
+            ast,
+            ren,
+            dont_use_locals: false,
+            applied_opts: Vec::new(),
+            rngs_cache: OnceCell::new(),
+            maxarg_cache: OnceCell::new(),
+        }
+    }
+
+    /// Get a reference to the current AST.
+    pub fn ast(&self) -> &Rc<UOp> {
+        &self.ast
+    }
+
+    /// Set the AST to a new value and clear caches.
+    ///
+    /// Used by optimization operations that transform the AST.
+    pub(crate) fn set_ast(&mut self, ast: Rc<UOp>) {
+        self.ast = ast;
+        self.clear_caches();
+    }
+
+    /// Clear all cached properties.
+    ///
+    /// Must be called after any mutation to the AST to ensure consistency.
+    pub(crate) fn clear_caches(&mut self) {
+        self.rngs_cache.take();
+        self.maxarg_cache.take();
+    }
+
+    /// Get the list of all RANGE operations, sorted by (axis_type.priority(), axis_id).
+    ///
+    /// Ranges are the fundamental unit of loop structure in the kernel. They are sorted
+    /// to determine nesting order: lower priority types are outer loops.
+    ///
+    /// **Sorting order:**
+    /// - Primary: `axis_type.priority()` (Outer=-2, Loop=-1, Global=0, ..., Unroll=5)
+    /// - Secondary: `axis_id` (ascending)
+    ///
+    /// # Returns
+    ///
+    /// Cached slice of RANGE UOps in canonical order.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let rngs = scheduler.rngs();
+    /// for (i, rng) in rngs.iter().enumerate() {
+    ///     println!("Axis {}: {:?} size={}", i, rng.axis_type(), rng.size());
+    /// }
+    /// ```
+    pub fn rngs(&self) -> &[Rc<UOp>] {
+        self.rngs_cache.get_or_init(|| self.compute_rngs())
+    }
+
+    /// Compute the list of RANGE operations and sort them.
+    ///
+    /// This is called lazily the first time `rngs()` is accessed.
+    fn compute_rngs(&self) -> Vec<Rc<UOp>> {
+        // Collect all RANGE nodes via toposort
+        let mut ranges: Vec<Rc<UOp>> =
+            self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
+
+        // Sort by (axis_type.priority(), axis_id)
+        ranges.sort_by_key(|rng| {
+            if let Op::Range { axis_id, axis_type, .. } = rng.op() {
+                (axis_type.priority(), *axis_id)
+            } else {
+                unreachable!("Filtered to only Range ops")
+            }
+        });
+
+        ranges
+    }
+
+    /// Get the number of dimensions (ranges) in the kernel.
+    pub fn shape_len(&self) -> usize {
+        self.rngs().len()
+    }
+
+    /// Get the maximum axis_id used in any RANGE operation.
+    ///
+    /// This is used when creating new ranges to ensure unique axis_ids.
+    ///
+    /// # Returns
+    ///
+    /// The highest axis_id, or 0 if no ranges exist.
+    pub fn maxarg(&self) -> usize {
+        *self.maxarg_cache.get_or_init(|| {
+            self.rngs()
+                .iter()
+                .filter_map(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(*axis_id) } else { None })
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Find the first REDUCE operation in the kernel.
+    ///
+    /// Used to determine if this is a reduction kernel and to extract reduction properties.
+    ///
+    /// # Returns
+    ///
+    /// The first REDUCE UOp found via toposort, or None if no reductions exist.
+    pub fn reduceop(&self) -> Option<Rc<UOp>> {
+        self.ast.toposort().into_iter().find(|node| matches!(node.op(), Op::Reduce { .. }))
+    }
+
+    /// Find all REDUCE operations in the kernel.
+    ///
+    /// Some kernels may have multiple independent reductions.
+    ///
+    /// # Returns
+    ///
+    /// Vector of all REDUCE UOps found via toposort.
+    pub fn reduceops(&self) -> Vec<Rc<UOp>> {
+        self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Reduce { .. })).collect()
+    }
+
+    /// Find all buffer access operations (INDEX) in the kernel.
+    ///
+    /// INDEX operations represent memory loads/stores and are used for:
+    /// - Determining which buffers are accessed
+    /// - Analyzing memory access patterns
+    /// - Applying PADTO optimizations
+    ///
+    /// # Returns
+    ///
+    /// Vector of all INDEX UOps found via toposort.
+    pub fn bufs(&self) -> Vec<Rc<UOp>> {
+        self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Index { .. })).collect()
+    }
+
+    /// Get the output shape (dimensions without reduction axes).
+    ///
+    /// This is the shape of the final result tensor, excluding any REDUCE/UNROLL/GROUP_REDUCE axes.
+    ///
+    /// # Returns
+    ///
+    /// Vector of sizes for each non-reduction dimension.
+    pub fn output_shape(&self) -> Vec<i64> {
+        self.rngs()
+            .iter()
+            .filter(|rng| if let Op::Range { axis_type, .. } = rng.op() { !axis_type.is_reduce() } else { false })
+            .filter_map(|rng| {
+                if let Op::Range { end, .. } = rng.op()
+                    && let Op::Const(cv) = end.op()
+                    && let morok_ir::ConstValue::Int(sz) = cv.0
+                {
+                    return Some(sz);
+                }
+                None
+            })
+            .collect()
+    }
+
+    /// Calculate the total upcast size (product of all UPCAST dimensions).
+    ///
+    /// Upcast size represents vectorization width - how many elements are processed
+    /// per loop iteration. Typical values: 1 (no upcast), 2, 4, 8, 16.
+    ///
+    /// # Returns
+    ///
+    /// Product of all UPCAST dimension sizes, or 1 if no upcasts exist.
+    pub fn upcast_size(&self) -> usize {
+        self.rngs()
+            .iter()
+            .filter(
+                |rng| {
+                    if let Op::Range { axis_type, .. } = rng.op() { *axis_type == AxisType::Upcast } else { false }
+                },
+            )
+            .filter_map(|rng| {
+                if let Op::Range { end, .. } = rng.op()
+                    && let Op::Const(cv) = end.op()
+                    && let morok_ir::ConstValue::Int(sz) = cv.0
+                {
+                    return Some(sz as usize);
+                }
+                None
+            })
+            .product()
+    }
+
+    /// Count the number of GROUP_REDUCE axes.
+    ///
+    /// GROUP_REDUCE represents two-stage reductions with shared memory synchronization.
+    /// Each GROUP_REDUCE axis adds a synchronization barrier.
+    ///
+    /// # Returns
+    ///
+    /// Number of GROUP_REDUCE axes (typically 0 or 1).
+    pub fn group_for_reduces(&self) -> usize {
+        self.rngs()
+            .iter()
+            .filter(|rng| {
+                if let Op::Range { axis_type, .. } = rng.op() { *axis_type == AxisType::GroupReduce } else { false }
+            })
+            .count()
+    }
+
+    /// Get indices of axes matching any of the given types.
+    ///
+    /// This is useful for filtering operations that only apply to certain axis types.
+    ///
+    /// # Arguments
+    ///
+    /// * `types` - Slice of AxisTypes to match against
+    ///
+    /// # Returns
+    ///
+    /// Vector of indices into `rngs()` for matching axes.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Get all reduce axes (REDUCE, UNROLL, GROUP_REDUCE)
+    /// let reduce_axes = scheduler.axes_of(&[
+    ///     AxisType::Reduce,
+    ///     AxisType::Unroll,
+    ///     AxisType::GroupReduce,
+    /// ]);
+    /// ```
+    pub fn axes_of(&self, types: &[AxisType]) -> Vec<usize> {
+        self.rngs()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rng)| {
+                if let Op::Range { axis_type, .. } = rng.op() {
+                    if types.contains(axis_type) { Some(i) } else { None }
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get Range UOps matching any of the given types.
+    ///
+    /// Similar to `axes_of()` but returns the actual Range UOps instead of indices.
+    ///
+    /// # Arguments
+    ///
+    /// * `types` - Slice of AxisTypes to match against
+    ///
+    /// # Returns
+    ///
+    /// Vector of Range UOps with matching axis types.
+    pub fn ranges_of(&self, types: &[AxisType]) -> Vec<Rc<UOp>> {
+        self.axes_of(types).into_iter().map(|i| self.rngs()[i].clone()).collect()
+    }
+
+    /// Get indices of axes that can be upcasted (vectorized).
+    ///
+    /// Upcastable axes are GLOBAL, LOCAL, or LOOP axes with size > 1.
+    /// These represent dimensions that can be combined via SIMD/vectorization.
+    ///
+    /// # Returns
+    ///
+    /// Vector of indices into `rngs()` for upcastable axes, sorted by position.
+    pub fn upcastable_dims(&self) -> Vec<usize> {
+        self.rngs()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rng)| {
+                if let Op::Range { axis_type, end, .. } = rng.op() {
+                    // Check type
+                    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
+                        return None;
+                    }
+
+                    // Check size > 1
+                    if let Op::Const(cv) = end.op()
+                        && let morok_ir::ConstValue::Int(sz) = cv.0
+                        && sz > 1
+                    {
+                        return Some(i);
+                    }
+
+                    None
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get indices of axes that can be unrolled.
+    ///
+    /// Unrollable axes are GROUP_REDUCE or REDUCE axes with size > 1.
+    /// These represent reduction loops that can be unrolled for better ILP.
+    ///
+    /// # Returns
+    ///
+    /// Vector of indices into `rngs()` for unrollable axes.
+    pub fn unrollable_dims(&self) -> Vec<usize> {
+        self.rngs()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rng)| {
+                if let Op::Range { axis_type, end, .. } = rng.op() {
+                    // Check type
+                    if !matches!(axis_type, AxisType::GroupReduce | AxisType::Reduce) {
+                        return None;
+                    }
+
+                    // Check size > 1
+                    if let Op::Const(cv) = end.op()
+                        && let morok_ir::ConstValue::Int(sz) = cv.0
+                        && sz > 1
+                    {
+                        return Some(i);
+                    }
+
+                    None
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Map logical axis index to physical axis index.
+    ///
+    /// Different OptOps use different logical axis numbering schemes:
+    /// - Most ops: Direct index into `rngs()`
+    /// - UNROLL: Index into `unrollable_dims()` (only reduction axes)
+    /// - GROUP/GROUPTOP: Index into `axes_of([REDUCE])` (only REDUCE axes)
+    /// - TC: Returns -1 (no single axis)
+    ///
+    /// # Arguments
+    ///
+    /// * `op` - The optimization operation type
+    /// * `axis` - The logical axis index (if applicable)
+    ///
+    /// # Returns
+    ///
+    /// Physical axis index into `rngs()`, or -1 for TC operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OptError::AxisOutOfBounds` if the logical axis is out of range.
+    pub fn real_axis(&self, op: OptOps, axis: Option<usize>) -> Result<isize, OptError> {
+        match op {
+            // TC doesn't operate on a single axis
+            OptOps::TC => Ok(-1),
+
+            // NOLOCALS doesn't use axis
+            OptOps::NOLOCALS => Ok(-1),
+
+            // UNROLL uses logical index into unrollable dims
+            OptOps::UNROLL => {
+                let axis = axis.ok_or(OptError::MissingAxisParameter)?;
+
+                let unrollable = self.unrollable_dims();
+                let real_idx =
+                    *unrollable.get(axis).ok_or(OptError::AxisOutOfBounds { axis, max: unrollable.len() })?;
+
+                Ok(real_idx as isize)
+            }
+
+            // GROUP/GROUPTOP use logical index into REDUCE axes
+            OptOps::GROUP | OptOps::GROUPTOP => {
+                let axis = axis.ok_or(OptError::MissingAxisParameter)?;
+
+                let reduce_axes = self.axes_of(&[AxisType::Reduce]);
+                let real_idx =
+                    *reduce_axes.get(axis).ok_or(OptError::AxisOutOfBounds { axis, max: reduce_axes.len() })?;
+
+                Ok(real_idx as isize)
+            }
+
+            // All other ops use direct axis index
+            _ => {
+                let axis = axis.ok_or(OptError::MissingAxisParameter)?;
+
+                if axis >= self.shape_len() {
+                    return Err(OptError::AxisOutOfBounds { axis, max: self.shape_len() });
+                }
+
+                Ok(axis as isize)
+            }
+        }
+    }
+
+    /// Get a colored string representation of the kernel shape.
+    ///
+    /// Each axis is represented by its type letter and size:
+    /// - Outer: 'O'
+    /// - Loop: 'L'
+    /// - Global: 'g'
+    /// - Thread: 't'
+    /// - Warp: 'w'
+    /// - Local: 'l'
+    /// - GroupReduce: 'G'
+    /// - Upcast: 'u'
+    /// - Reduce: 'R'
+    /// - Unroll: 'r'
+    ///
+    /// # Returns
+    ///
+    /// String like "g16l8R32u4" (Global 16, Local 8, Reduce 32, Upcast 4).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let shape = scheduler.colored_shape();
+    /// println!("Kernel: {}", shape); // "g16l16R32u4"
+    /// ```
+    pub fn colored_shape(&self) -> String {
+        self.rngs()
+            .iter()
+            .filter_map(|rng| {
+                if let Op::Range { axis_type, end, .. } = rng.op() {
+                    // Get size
+                    if let Op::Const(cv) = end.op()
+                        && let morok_ir::ConstValue::Int(sz) = cv.0
+                    {
+                        return Some(format!("{}{}", axis_type.letter(), sz));
+                    }
+                    // Symbolic size
+                    Some(format!("{}?", axis_type.letter()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// Get a vector of string representations for each axis.
+    ///
+    /// Similar to `colored_shape()` but returns individual strings per axis.
+    ///
+    /// # Returns
+    ///
+    /// Vector like ["g16", "l8", "R32", "u4"].
+    pub fn shape_str(&self) -> Vec<String> {
+        self.rngs()
+            .iter()
+            .filter_map(|rng| {
+                if let Op::Range { axis_type, end, .. } = rng.op() {
+                    if let Op::Const(cv) = end.op()
+                        && let morok_ir::ConstValue::Int(sz) = cv.0
+                    {
+                        return Some(format!("{}{}", axis_type.letter(), sz));
+                    }
+                    Some(format!("{}?", axis_type.letter()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get the kernel type prefix for naming.
+    ///
+    /// - "r" for reduction kernels (has REDUCE op)
+    /// - "E" for elementwise kernels
+    ///
+    /// # Returns
+    ///
+    /// Single character string representing kernel type.
+    pub fn kernel_type(&self) -> &'static str {
+        if self.reduceop().is_some() { "r" } else { "E" }
+    }
+
+    /// Core transformation: split a range into two dimensions.
+    ///
+    /// This is the fundamental operation used by all OptOps. It splits a single range
+    /// of size `old_sz * amount` into two ranges: one of size `old_sz` (reduced original)
+    /// and one of size `amount` (new range with `new_type`).
+    ///
+    /// The `top` parameter controls iteration order and affects memory access patterns.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. **Validate divisibility:** Check that `rng.size()` is divisible by `amount`
+    /// 2. **Create new range:** Either use `input_new_rng` or create one with `new_type`
+    /// 3. **Create reduced old range:** Replace size with `old_sz = size / amount`
+    /// 4. **Compute substitution:**
+    ///    - If `top=true`: `new_rng * old_sz + replaced_rng` (new varies faster)
+    ///    - If `top=false`: `replaced_rng * amount + new_rng` (old varies faster)
+    /// 5. **Substitute** in AST and clear caches
+    /// 6. **Return** both ranges for further transformations
+    ///
+    /// # Arguments
+    ///
+    /// * `rng` - The range to split (must be divisible by `amount`)
+    /// * `amount` - The size of the new dimension
+    /// * `new_type` - The AxisType for the new range (e.g., Upcast, Local)
+    /// * `top` - If true, new range is outer loop; if false, new range is inner loop
+    /// * `input_new_rng` - Optional pre-created range (used for specific axis_id control)
+    ///
+    /// # Returns
+    ///
+    /// `(replaced_rng, new_rng)` - The reduced old range and the new range
+    ///
+    /// # Errors
+    ///
+    /// Returns `OptError::DivisionError` if `amount` doesn't divide `rng.size()` evenly.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Split a Global(16) into Global(4) and Upcast(4)
+    /// let global_16 = rngs[0].clone();
+    /// let (global_4, upcast_4) = scheduler.shift_to(
+    ///     global_16,
+    ///     4,              // amount
+    ///     AxisType::Upcast,
+    ///     false,          // upcast is inner (varies faster)
+    ///     None,
+    /// )?;
+    /// // Result: iteration order is [0,1,2,3, 4,5,6,7, 8,9,10,11, 12,13,14,15]
+    /// ```
+    #[allow(dead_code)] // Will be used in Phase 4 (OptOps implementation)
+    pub(crate) fn shift_to(
+        &mut self,
+        rng: Rc<UOp>,
+        amount: usize,
+        new_type: AxisType,
+        top: bool,
+        input_new_rng: Option<Rc<UOp>>,
+    ) -> Result<(Rc<UOp>, Rc<UOp>), OptError> {
+        use morok_ir::{ConstValue, UOpKey};
+        use std::collections::HashMap;
+
+        // 1. Validate divisibility
+        let old_sz = rng.divisible_by(amount).ok_or_else(|| {
+            // Provide structured error based on size type
+            if let Op::Range { end, .. } = rng.op() {
+                if let Op::Const(cv) = end.op()
+                    && let ConstValue::Int(sz) = cv.0
+                {
+                    DivisionSnafu { size: sz as usize, amount }.build()
+                } else {
+                    SymbolicDivisionSnafu { amount }.build()
+                }
+            } else {
+                ExpectedRangeOperationSnafu.build()
+            }
+        })?;
+
+        // 2. Create new range
+        let new_rng = input_new_rng.unwrap_or_else(|| {
+            let end = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
+            UOp::range_axis(end, self.maxarg() + 1, new_type)
+        });
+
+        // 3. Create reduced old range (same axis_id and type, but smaller size)
+        let replaced_rng = if let Op::Range { axis_id, axis_type, .. } = rng.op() {
+            let new_end = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(old_sz as i64));
+            UOp::range_axis(new_end, *axis_id, *axis_type)
+        } else {
+            return ExpectedRangeOperationSnafu.fail();
+        };
+
+        // 4. Compute substitution expression
+        let sub_axis = if top {
+            // Top order: new varies faster
+            // Example: [0,8,16,24, 1,9,17,25, ...]
+            let old_sz_uop = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(old_sz as i64));
+            new_rng
+                .try_mul_op(&old_sz_uop)
+                .expect("Multiplication should not fail for index types")
+                .try_add_op(&replaced_rng)
+                .expect("Addition should not fail for index types")
+        } else {
+            // Bottom order: old varies faster
+            // Example: [0,1,2,3, 4,5,6,7, 8,9,10,11, ...]
+            let amount_uop = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
+            replaced_rng
+                .try_mul_op(&amount_uop)
+                .expect("Multiplication should not fail for index types")
+                .try_add_op(&new_rng)
+                .expect("Addition should not fail for index types")
+        };
+
+        // 5. Perform substitution
+        #[allow(clippy::mutable_key_type)] // UOpKey uses stable ID for Hash/Eq (safe)
+        let mut subst_map = HashMap::new();
+        subst_map.insert(UOpKey(rng), sub_axis);
+        self.ast = self.ast.substitute(&subst_map);
+
+        // Clear caches (maxarg will be recomputed on next access)
+        self.clear_caches();
+
+        // 6. Return both ranges
+        Ok((replaced_rng, new_rng))
+    }
+}
+
+impl fmt::Display for Scheduler {
+    /// Format the scheduler as a kernel descriptor string.
+    ///
+    /// Format: "{kernel_type}_{colored_shape}"
+    ///
+    /// Examples:
+    /// - "r_g16l16R32u4" - Reduction kernel with Global, Local, Reduce, Upcast
+    /// - "E_g256g256" - Elementwise kernel with 2D Global shape
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}_{}", self.kernel_type(), self.colored_shape())
+    }
+}

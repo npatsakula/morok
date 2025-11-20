@@ -7,6 +7,8 @@ use std::rc::Rc;
 
 use super::super::{Op, Result, UOp};
 
+// These constructors are not yet used but will be needed for future optimization passes
+#[allow(dead_code)]
 impl UOp {
     /// Reshape tensor to new shape (low-level, UOp-based constructor).
     ///

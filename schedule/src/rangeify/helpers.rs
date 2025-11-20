@@ -195,9 +195,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                     let begin_uop = UOp::const_(DType::Index, ConstValue::Int(begin as i64));
                     let shape_plus_begin = match shape {
                         SInt::Const(n) => UOp::const_(DType::Index, ConstValue::Int(*n as i64 + begin as i64)),
-                        SInt::Symbolic(uop) => {
-                            uop.try_add_op(&begin_uop).unwrap()
-                        }
+                        SInt::Symbolic(uop) => uop.try_add_op(&begin_uop).unwrap(),
                     };
                     // rng >= begin  (use !(rng < begin) implemented as (rng < begin) XOR true)
                     let too_low = UOp::cmplt(rng, &begin_uop).unwrap();

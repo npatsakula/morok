@@ -11,9 +11,11 @@
 //! - [`rangeify`] - RANGEIFY transformation (movement ops → kernels)
 //!   - Phases 1-4: Movement ops to BUFFERIZE with symbolic simplification
 //!   - Phase 5: Kernel splitting at STORE boundaries
+//! - [`optimizer`] - Kernel optimization layer (OptOps, Scheduler, heuristics)
 
 #[macro_use]
 pub mod pattern;
+pub mod optimizer;
 pub mod rangeify;
 pub mod rewrite;
 pub mod symbolic;

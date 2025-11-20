@@ -230,6 +230,91 @@ impl AxisType {
     pub const fn is_kernel_boundary(&self) -> bool {
         matches!(self, Self::Outer)
     }
+
+    /// Returns the priority for sorting ranges.
+    ///
+    /// Lower values are outer loops, higher values are inner loops.
+    /// Matches Tinygrad's axis_to_pos ordering for kernel optimization.
+    ///
+    /// **Priority Order:**
+    /// - Outer: -2 (kernel-level boundary)
+    /// - Loop: -1 (not yet parallelized)
+    /// - Global/Thread: 0 (outer parallelism)
+    /// - Warp: 1 (sub-group parallelism)
+    /// - Local/GroupReduce: 2 (workgroup parallelism + synchronization)
+    /// - Upcast: 3 (vectorization)
+    /// - Reduce: 4 (reduction loops)
+    /// - Unroll: 5 (unrolled loops, innermost)
+    pub const fn priority(self) -> i32 {
+        match self {
+            Self::Outer => -2,
+            Self::Loop => -1,
+            Self::Global | Self::Thread => 0,
+            Self::Warp => 1,
+            Self::Local | Self::GroupReduce => 2,
+            Self::Upcast => 3,
+            Self::Reduce => 4,
+            Self::Unroll => 5,
+        }
+    }
+
+    /// Returns the single-letter code for this axis type.
+    ///
+    /// Used in kernel name generation and debug output.
+    ///
+    /// **Letter Codes:**
+    /// - O: Outer
+    /// - L: Loop
+    /// - g: Global
+    /// - t: Thread
+    /// - w: Warp
+    /// - l: Local
+    /// - G: GroupReduce
+    /// - u: Upcast
+    /// - R: Reduce
+    /// - r: Unroll
+    pub const fn letter(self) -> char {
+        match self {
+            Self::Outer => 'O',
+            Self::Loop => 'L',
+            Self::Global => 'g',
+            Self::Thread => 't',
+            Self::Warp => 'w',
+            Self::Local => 'l',
+            Self::GroupReduce => 'G',
+            Self::Upcast => 'u',
+            Self::Reduce => 'R',
+            Self::Unroll => 'r',
+        }
+    }
+
+    /// Returns true if this is a parallelizable axis type.
+    pub const fn is_parallel(self) -> bool {
+        matches!(self, Self::Global | Self::Thread | Self::Local | Self::Warp)
+    }
+
+    /// Returns true if this is a reduction axis type.
+    pub const fn is_reduce(self) -> bool {
+        matches!(self, Self::Reduce | Self::GroupReduce | Self::Unroll)
+    }
+}
+
+impl PartialOrd for AxisType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AxisType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority().cmp(&other.priority())
+    }
+}
+
+impl std::fmt::Display for AxisType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.letter())
+    }
 }
 
 /// Reduction operation types.

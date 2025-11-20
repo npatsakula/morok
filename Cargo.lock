@@ -386,8 +386,8 @@ dependencies = [
  "morok-ir",
  "proptest",
  "proptest-derive 0.5.1",
- "rustc-hash",
  "smallvec",
+ "snafu",
  "z3",
 ]
 

@@ -531,10 +531,7 @@ impl UPat {
     /// ```
     pub fn load(buffer: UPat, index: UPat) -> Self {
         UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Load {
-                buffer: UOp::noop(),
-                index: UOp::noop(),
-            }))]),
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Load { buffer: UOp::noop(), index: UOp::noop() }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![buffer, index])),
             arg: None,
@@ -656,10 +653,7 @@ impl UPat {
     /// ```
     pub fn permute(src: UPat) -> Self {
         UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Permute {
-                src: UOp::noop(),
-                axes: vec![],
-            }))]),
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Permute { src: UOp::noop(), axes: vec![] }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![src])),
             arg: None,
@@ -754,10 +748,7 @@ impl UPat {
     /// ```
     pub fn flip(src: UPat) -> Self {
         UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Flip {
-                src: UOp::noop(),
-                axes: vec![],
-            }))]),
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Flip { src: UOp::noop(), axes: vec![] }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![src])),
             arg: None,

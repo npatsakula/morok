@@ -2,6 +2,7 @@
 //!
 //! These methods support symbolic pattern matching, based on Tinygrad's ops.py.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::op::Op;
@@ -185,6 +186,88 @@ impl UOp {
         }
 
         result
+    }
+
+    /// Returns all nodes that this UOp depends on (backward slice / dependency set).
+    ///
+    /// This is used by the optimizer to check if a range appears in an expression's dependencies.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let x = UOp::var("x", DType::Int32, 0, 10);
+    /// let y = UOp::var("y", DType::Int32, 0, 20);
+    /// let expr = x.try_add_op(&y).unwrap();
+    ///
+    /// let deps = expr.backward_slice();
+    /// // Check if x is in dependencies using pointer equality
+    /// assert!(deps.iter().any(|d| Rc::ptr_eq(d, &x)));
+    /// ```
+    pub fn backward_slice(self: &Rc<Self>) -> Vec<Rc<Self>> {
+        let mut visited = HashSet::new();
+        let mut result = Vec::new();
+        let mut stack = vec![self.clone()];
+
+        while let Some(node) = stack.pop() {
+            let ptr = Rc::as_ptr(&node);
+
+            if visited.contains(&ptr) {
+                continue;
+            }
+
+            visited.insert(ptr);
+            result.push(node.clone());
+
+            // Add all children to stack
+            node.op.map_child(|child| {
+                stack.push(child.clone());
+            });
+        }
+
+        result
+    }
+
+    /// Check if this UOp's size is divisible by the given amount.
+    ///
+    /// Returns `Some(quotient)` if divisible, `None` otherwise.
+    /// This is a convenience method for the optimizer to validate transformations.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let range = UOp::range(SInt::Const(16), 0, AxisType::Loop);
+    /// assert_eq!(range.divisible_by(4), Some(4)); // 16 / 4 = 4
+    /// assert_eq!(range.divisible_by(5), None);    // 16 not divisible by 5
+    /// ```
+    pub fn divisible_by(self: &Rc<Self>, amount: usize) -> Option<usize> {
+        // For RANGE operations, check the end (size) field
+        if let Op::Range { end, axis_id: _, axis_type: _ } = self.op() {
+            // Check if end is a constant
+            if let Op::Const(cv) = end.op()
+                && let ConstValue::Int(sz) = cv.0
+                && sz > 0
+                && (sz as usize).is_multiple_of(amount)
+            {
+                return Some((sz as usize) / amount);
+            }
+
+            // Check using const_factor
+            let factor = end.const_factor();
+            if factor > 0 && (factor as usize).is_multiple_of(amount) {
+                return Some((factor as usize) / amount);
+            }
+        }
+
+        // For constants, check the value directly
+        if let Op::Const(cv) = self.op()
+            && let ConstValue::Int(val) = cv.0
+            && val > 0
+            && (val as usize).is_multiple_of(amount)
+        {
+            return Some((val as usize) / amount);
+        }
+
+        None
     }
 }
 
