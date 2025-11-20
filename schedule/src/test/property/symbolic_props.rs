@@ -331,7 +331,7 @@ proptest! {
 
     /// Division by non-zero constant should fold
     #[test]
-    fn const_fold_idiv(a in arb_small_int(), b in arb_nonzero_int()) {
+    fn const_fold_idiv(a in arb_small_int(), b in nonzero_int()) {
         let a_uop = UOp::const_(DType::Int32, a);
         let b_uop = UOp::const_(DType::Int32, b);
         let expr = UOp::new(Op::Binary(BinaryOp::Idiv, a_uop, b_uop), DType::Int32);

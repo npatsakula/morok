@@ -147,7 +147,7 @@ fn test_infer_unary_shape() {
 fn test_infer_binary_shape() {
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = UOp::try_add_op(a, b).unwrap();
+    let add = a.try_add_op(&b).unwrap();
     let shape = add.shape().unwrap().expect("Binary should have shape");
     assert_eq!(shape.len(), 0); // Both scalars -> scalar result
 }

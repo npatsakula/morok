@@ -15,7 +15,7 @@ fn test_and_int32() {
     let a = UOp::const_(DType::Int32, ConstValue::Int(0b1010));
     let b = UOp::const_(DType::Int32, ConstValue::Int(0b1100));
 
-    let result = UOp::try_and_op(a, b).unwrap();
+    let result = a.try_and_op(&b).unwrap();
     assert_eq!(result.dtype(), DType::Int32);
 }
 
@@ -24,7 +24,7 @@ fn test_or_int32() {
     let a = UOp::const_(DType::Int32, ConstValue::Int(0b1010));
     let b = UOp::const_(DType::Int32, ConstValue::Int(0b1100));
 
-    let result = UOp::try_or_op(a, b).unwrap();
+    let result = a.try_or_op(&b).unwrap();
     assert_eq!(result.dtype(), DType::Int32);
 }
 
@@ -33,7 +33,7 @@ fn test_xor_int32() {
     let a = UOp::const_(DType::Int32, ConstValue::Int(0b1010));
     let b = UOp::const_(DType::Int32, ConstValue::Int(0b1100));
 
-    let result = UOp::try_xor_op(a, b).unwrap();
+    let result = a.try_xor_op(&b).unwrap();
     assert_eq!(result.dtype(), DType::Int32);
 }
 
@@ -46,7 +46,7 @@ fn test_shl_int32() {
     let value = UOp::const_(DType::Int32, ConstValue::Int(8));
     let shift = UOp::const_(DType::Int32, ConstValue::Int(2));
 
-    let result = UOp::try_shl_op(value, shift).unwrap();
+    let result = value.try_shl_op(&shift).unwrap();
     assert_eq!(result.dtype(), DType::Int32);
 }
 
@@ -55,7 +55,7 @@ fn test_shr_int32() {
     let value = UOp::const_(DType::Int32, ConstValue::Int(32));
     let shift = UOp::const_(DType::Int32, ConstValue::Int(2));
 
-    let result = UOp::try_shr_op(value, shift).unwrap();
+    let result = value.try_shr_op(&shift).unwrap();
     assert_eq!(result.dtype(), DType::Int32);
 }
 
@@ -65,7 +65,7 @@ fn test_shift_preserves_lhs_dtype() {
     let shift = UOp::const_(DType::Int32, ConstValue::Int(3));
 
     // Shift should preserve LHS dtype (Int64), not promote
-    let result = UOp::try_shl_op(value, shift).unwrap();
+    let result = value.try_shl_op(&shift).unwrap();
     assert_eq!(result.dtype(), DType::Int64);
 }
 
@@ -78,7 +78,7 @@ fn test_and_bool() {
     let a = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let b = UOp::const_(DType::Bool, ConstValue::Bool(false));
 
-    let result = UOp::try_and_op(a, b).unwrap();
+    let result = a.try_and_op(&b).unwrap();
     assert_eq!(result.dtype(), DType::Bool);
 }
 
@@ -87,7 +87,7 @@ fn test_or_bool() {
     let a = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let b = UOp::const_(DType::Bool, ConstValue::Bool(false));
 
-    let result = UOp::try_or_op(a, b).unwrap();
+    let result = a.try_or_op(&b).unwrap();
     assert_eq!(result.dtype(), DType::Bool);
 }
 
@@ -96,7 +96,7 @@ fn test_xor_bool() {
     let a = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let b = UOp::const_(DType::Bool, ConstValue::Bool(false));
 
-    let result = UOp::try_xor_op(a, b).unwrap();
+    let result = a.try_xor_op(&b).unwrap();
     assert_eq!(result.dtype(), DType::Bool);
 }
 
@@ -109,7 +109,7 @@ fn test_and_uint32() {
     let a = UOp::const_(DType::UInt32, ConstValue::UInt(15));
     let b = UOp::const_(DType::UInt32, ConstValue::UInt(7));
 
-    let result = UOp::try_and_op(a, b).unwrap();
+    let result = a.try_and_op(&b).unwrap();
     // UInt32 promotes to Int64 in type promotion
     assert_eq!(result.dtype(), DType::Int64);
 }
@@ -119,7 +119,7 @@ fn test_shl_uint64() {
     let value = UOp::const_(DType::UInt64, ConstValue::UInt(1));
     let shift = UOp::const_(DType::UInt32, ConstValue::UInt(10));
 
-    let result = UOp::try_shl_op(value, shift).unwrap();
+    let result = value.try_shl_op(&shift).unwrap();
     assert_eq!(result.dtype(), DType::UInt64);
 }
 
@@ -132,7 +132,7 @@ fn test_and_type_promotion() {
     let small = UOp::const_(DType::Int8, ConstValue::Int(15));
     let large = UOp::const_(DType::Int32, ConstValue::Int(255));
 
-    let result = UOp::try_and_op(small, large).unwrap();
+    let result = small.try_and_op(&large).unwrap();
     // Int8 should promote to Int32
     assert_eq!(result.dtype(), DType::Int32);
 }
@@ -142,7 +142,7 @@ fn test_or_mixed_int_types() {
     let i16 = UOp::const_(DType::Int16, ConstValue::Int(100));
     let i32 = UOp::const_(DType::Int32, ConstValue::Int(200));
 
-    let result = UOp::try_or_op(i16, i32).unwrap();
+    let result = i16.try_or_op(&i32).unwrap();
     // Int16 should promote to Int32
     assert_eq!(result.dtype(), DType::Int32);
 }
@@ -156,7 +156,7 @@ fn test_and_float_error() {
     let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
 
-    let result = UOp::try_and_op(float_val, int_val);
+    let result = float_val.try_and_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_and_op", .. })));
 }
 
@@ -165,7 +165,7 @@ fn test_or_float_error() {
     let float_val = UOp::const_(DType::Float32, ConstValue::Float(2.5));
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(10));
 
-    let result = UOp::try_or_op(float_val, int_val);
+    let result = float_val.try_or_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_or_op", .. })));
 }
 
@@ -174,7 +174,7 @@ fn test_xor_float_error() {
     let float_val = UOp::const_(DType::Float64, ConstValue::Float(1.5));
     let int_val = UOp::const_(DType::Int64, ConstValue::Int(7));
 
-    let result = UOp::try_xor_op(float_val, int_val);
+    let result = float_val.try_xor_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_xor_op", .. })));
 }
 
@@ -183,7 +183,7 @@ fn test_shl_float_error() {
     let float_val = UOp::const_(DType::Float32, ConstValue::Float(8.0));
     let shift = UOp::const_(DType::Int32, ConstValue::Int(2));
 
-    let result = UOp::try_shl_op(float_val, shift);
+    let result = float_val.try_shl_op(&shift);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shl_op", .. })));
 }
 
@@ -192,7 +192,7 @@ fn test_shr_float_error() {
     let float_val = UOp::const_(DType::Float32, ConstValue::Float(16.0));
     let shift = UOp::const_(DType::Int32, ConstValue::Int(1));
 
-    let result = UOp::try_shr_op(float_val, shift);
+    let result = float_val.try_shr_op(&shift);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shr_op", .. })));
 }
 
@@ -201,7 +201,7 @@ fn test_and_both_floats_error() {
     let f1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let f2 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-    let result = UOp::try_and_op(f1, f2);
+    let result = f1.try_and_op(&f2);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_and_op", .. })));
 }
 
@@ -214,7 +214,7 @@ fn test_and_bool_and_int() {
     let bool_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
 
-    let result = UOp::try_and_op(bool_val, int_val).unwrap();
+    let result = bool_val.try_and_op(&int_val).unwrap();
     // Bool should promote to Int32
     assert_eq!(result.dtype(), DType::Int32);
 }
@@ -224,7 +224,7 @@ fn test_or_int_and_bool() {
     let int_val = UOp::const_(DType::Int8, ConstValue::Int(7));
     let bool_val = UOp::const_(DType::Bool, ConstValue::Bool(false));
 
-    let result = UOp::try_or_op(int_val, bool_val).unwrap();
+    let result = int_val.try_or_op(&bool_val).unwrap();
     // Bool should promote to Int8
     assert_eq!(result.dtype(), DType::Int8);
 }
@@ -238,7 +238,7 @@ fn test_and_with_zero() {
     let val = UOp::const_(DType::Int32, ConstValue::Int(0xFF));
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
 
-    let result = UOp::try_and_op(val, zero).unwrap();
+    let result = val.try_and_op(&zero).unwrap();
     assert_eq!(result.dtype(), DType::Int32);
 }
 
@@ -247,7 +247,7 @@ fn test_or_with_max() {
     let val = UOp::const_(DType::UInt8, ConstValue::UInt(0x55));
     let max = UOp::const_(DType::UInt8, ConstValue::UInt(0xFF));
 
-    let result = UOp::try_or_op(val, max).unwrap();
+    let result = val.try_or_op(&max).unwrap();
     // UInt8 promotes to Int16 in type promotion
     assert_eq!(result.dtype(), DType::Int16);
 }
@@ -256,7 +256,7 @@ fn test_or_with_max() {
 fn test_xor_with_self() {
     let val = UOp::const_(DType::Int32, ConstValue::Int(42));
 
-    let result = UOp::try_xor_op(val.clone(), val).unwrap();
+    let result = val.try_xor_op(&val).unwrap();
     assert_eq!(result.dtype(), DType::Int32);
 }
 
@@ -265,6 +265,6 @@ fn test_shl_by_zero() {
     let val = UOp::const_(DType::Int32, ConstValue::Int(100));
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
 
-    let result = UOp::try_shl_op(val, zero).unwrap();
+    let result = val.try_shl_op(&zero).unwrap();
     assert_eq!(result.dtype(), DType::Int32);
 }

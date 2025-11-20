@@ -12,7 +12,6 @@
 
 use std::rc::Rc;
 
-use morok_dtype::DType;
 use morok_ir::{AddrSpace, Op, UOp};
 use smallvec::SmallVec;
 
@@ -61,11 +60,11 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
         let buffer = if opts.addrspace == AddrSpace::Global {
             // Global memory: DEFINE_GLOBAL
             let global_id = ctx.next_global();
-            UOp::new(Op::DefineGlobal(global_id), compute.dtype())
+            UOp::define_global(global_id, compute.dtype())
         } else {
             // Local/shared memory: DEFINE_LOCAL
             let local_id = ctx.next_local();
-            UOp::new(Op::DefineLocal(local_id), compute.dtype())
+            UOp::define_local(local_id, compute.dtype())
         };
 
         // Track the buffer in context for later reference
@@ -86,13 +85,12 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
     };
 
     // Create STORE operation
-    let store =
-        UOp::new(Op::Store { buffer: buffer.clone(), index: store_target, value: compute.clone() }, DType::Void);
+    let store = UOp::store(buffer.clone(), store_target, compute.clone());
 
     // Wrap STORE in END operation with all ranges
     // END references the computation (STORE) and closes all the ranges
     let mut result = if !ranges.is_empty() {
-        UOp::new(Op::End { computation: store.clone(), ranges: ranges.clone() }, DType::Void)
+        UOp::end(store.clone(), ranges.clone())
     } else {
         store
     };
@@ -101,7 +99,7 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
     // This ensures all threads in a workgroup have completed their stores
     // before any thread proceeds to read from the local buffer
     if opts.addrspace == AddrSpace::Local {
-        result = UOp::new(Op::Barrier { src: result, deps: SmallVec::new() }, DType::Void);
+        result = UOp::barrier(result, SmallVec::new());
     }
 
     Some(result)

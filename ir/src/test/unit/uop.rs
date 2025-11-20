@@ -32,8 +32,8 @@ fn test_hash_consing_with_src() {
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
     // Create a + b twice
-    let add1 = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-    let add2 = UOp::try_add_op(a.clone(), b.clone()).unwrap();
+    let add1 = a.try_add_op(&b).unwrap();
+    let add2 = a.try_add_op(&b).unwrap();
 
     // Should be the same object
     assert!(Rc::ptr_eq(&add1, &add2), "Hash consing should work with src nodes");
@@ -44,11 +44,11 @@ fn test_binary_operations() {
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-    let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
+    let add = a.try_add_op(&b).unwrap();
     assert_eq!(add.dtype(), DType::Float32);
     assert_eq!(add.op().children().len(), 2);
 
-    let mul = UOp::try_mul_op(a.clone(), b.clone()).unwrap();
+    let mul = a.try_mul_op(&b).unwrap();
     assert_eq!(mul.dtype(), DType::Float32);
 }
 
@@ -85,8 +85,8 @@ fn test_toposort() {
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
     let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
 
-    let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-    let mul = UOp::try_mul_op(add.clone(), c.clone()).unwrap();
+    let add = a.try_add_op(&b).unwrap();
+    let mul = add.try_mul_op(&c).unwrap();
 
     let sorted = mul.toposort();
 
@@ -113,9 +113,9 @@ fn test_toposort_shared_node() {
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
     let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
 
-    let x = UOp::try_add_op(a.clone(), b.clone()).unwrap();
-    let y = UOp::try_add_op(a.clone(), c.clone()).unwrap();
-    let z = UOp::try_mul_op(x.clone(), y.clone()).unwrap();
+    let x = a.try_add_op(&b).unwrap();
+    let y = a.try_add_op(&c).unwrap();
+    let z = x.try_mul_op(&y).unwrap();
 
     let sorted = z.toposort();
 
@@ -192,7 +192,7 @@ fn test_device_and_unique() {
 fn test_children_method() {
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
+    let add = a.try_add_op(&b).unwrap();
 
     let children = add.op().children();
     assert_eq!(children.len(), 2);
@@ -204,7 +204,7 @@ fn test_children_method() {
 fn test_for_each_child() {
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
+    let add = a.try_add_op(&b).unwrap();
 
     let mut children = Vec::new();
     add.op().map_child(|child| children.push(child.clone()));
@@ -235,7 +235,7 @@ fn test_shape_property_lazy_evaluation() {
 
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
+    let add = a.try_add_op(&b).unwrap();
 
     // VERIFY: Cache is empty before first access (lazy evaluation)
     assert!(ShapeProperty::cache(&add).get().is_none(), "Cache should be empty before first access");
@@ -259,7 +259,7 @@ fn test_ranges_property_no_ranges() {
     // Simple arithmetic with no RANGE ops
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = UOp::try_add_op(a, b).unwrap();
+    let add = a.try_add_op(&b).unwrap();
 
     let ranges = add.ranges();
     assert_eq!(ranges.len(), 0, "No RANGE ops in simple arithmetic");
@@ -401,8 +401,8 @@ fn test_in_scope_ranges_nested() {
 fn test_toposort_filtered_basic() {
     // Build graph: a -> b -> c
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::try_add_op(a.clone(), UOp::const_(DType::Float32, ConstValue::Float(2.0))).unwrap();
-    let c = UOp::try_mul_op(b.clone(), UOp::const_(DType::Float32, ConstValue::Float(3.0))).unwrap();
+    let b = a.try_add_op(&UOp::const_(DType::Float32, ConstValue::Float(2.0))).unwrap();
+    let c = b.try_mul_op(&UOp::const_(DType::Float32, ConstValue::Float(3.0))).unwrap();
 
     // Filter to only include 'c'
     let filtered = c.toposort_filtered(|node| Rc::ptr_eq(node, &c));
@@ -417,7 +417,7 @@ fn test_toposort_filtered_all() {
     // Build graph: a + b
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = UOp::try_add_op(a.clone(), b.clone()).unwrap();
+    let add = a.try_add_op(&b).unwrap();
 
     // Filter that accepts all nodes
     let filtered = add.toposort_filtered(|_| true);
@@ -446,7 +446,7 @@ fn test_multiple_properties_coexist() {
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
     // Create an addition operation
-    let add = UOp::try_add_op(a, b).unwrap();
+    let add = a.try_add_op(&b).unwrap();
 
     // Access shape property (const operations have shape)
     let shape = add.shape().unwrap();

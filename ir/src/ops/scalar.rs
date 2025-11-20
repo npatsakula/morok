@@ -33,7 +33,7 @@ macro_rules! scalar_ops {
             /// ```
             pub fn $method<T: IntoUOp>(lhs: Rc<Self>, rhs: T) -> Result<Rc<Self>> {
                 let rhs_uop = rhs.into_uop(lhs.dtype());
-                Self::$op_method(lhs, rhs_uop)
+                lhs.$op_method(&rhs_uop)
             }
         )+
     };

@@ -434,11 +434,11 @@ pub fn symbolic_simple() -> PatternMatcher {
     // x // -1 → -x
     pattern!(patterns,
         UPat::binary(vec![BinaryOp::Idiv], vec![UPat::var("x"), UPat::cvar("divisor")]) => |x: &Rc<morok_ir::UOp>, divisor: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, UnaryOp, UOp, ConstValue};
+            use morok_ir::{Op, UOp, ConstValue};
             // Check if divisor is -1
             if let Op::Const(cv) = divisor.op()
                 && cv.0 == ConstValue::Int(-1) {
-                    return Some(UOp::new(Op::Unary(UnaryOp::Neg, Rc::clone(x)), x.dtype()));
+                    return Some(UOp::neg(x));
                 }
             None
         }
@@ -450,11 +450,10 @@ pub fn symbolic_simple() -> PatternMatcher {
             UPat::binary(vec![BinaryOp::Mod], vec![UPat::var("x"), UPat::var("y")]),
             UPat::var("y2")
         ]) => |x: &Rc<morok_ir::UOp>, y: &Rc<morok_ir::UOp>, y2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, UOp};
             // Check if outer y is same as inner y (pointer equality)
             if Rc::ptr_eq(y, y2) {
                 // Return the inner (x % y) modulo
-                Some(UOp::new(Op::Binary(BinaryOp::Mod, Rc::clone(x), Rc::clone(y)), x.dtype()))
+                x.try_mod_op(y).ok()
             } else {
                 None
             }
@@ -602,13 +601,7 @@ pub fn symbolic_simple() -> PatternMatcher {
             // Get the final target dtype from outer cast
             if let Op::Cast { dtype: final_dtype, .. } = outer_cast.op() {
                 // Create a single cast from x to final_dtype
-                return Some(UOp::new(
-                    Op::Cast {
-                        src: Rc::clone(x),
-                        dtype: final_dtype.clone(),
-                    },
-                    final_dtype.clone(),
-                ));
+                return Some(UOp::cast(Rc::clone(x), final_dtype.clone()));
             }
             None
         }
@@ -621,16 +614,13 @@ pub fn symbolic_simple() -> PatternMatcher {
     // Combine identical terms in addition
     pattern!(patterns,
         UPat::var("x") + UPat::var("y") => |x: &Rc<morok_ir::UOp>, y: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
+            use morok_ir::{ConstValue, UOp};
 
             // Check if x and y are the same UOp (pointer equality for hash-consed nodes)
             if Rc::ptr_eq(x, y) {
                 // x + x → 2*x
                 let two = UOp::const_(x.dtype(), ConstValue::Int(2));
-                return Some(UOp::new(
-                    Op::Binary(BinaryOp::Mul, two, Rc::clone(x)),
-                    x.dtype(),
-                ));
+                return two.try_mul_op(x).ok();
             }
             None
         }
@@ -651,10 +641,7 @@ pub fn symbolic_simple() -> PatternMatcher {
                     && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                         // (c1 * x) + (c2 * x) → (c1 + c2) * x
                         let sum = UOp::const_(c1.dtype(), ConstValue::Int(i1 + i2));
-                        return Some(UOp::new(
-                            Op::Binary(BinaryOp::Mul, sum, Rc::clone(x)),
-                            x.dtype(),
-                        ));
+                        return sum.try_mul_op(x).ok();
                     }
             }
             None
@@ -676,10 +663,7 @@ pub fn symbolic_simple() -> PatternMatcher {
                     && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                         // (x * c1) + (x * c2) → x * (c1 + c2)
                         let sum = UOp::const_(c1.dtype(), ConstValue::Int(i1 + i2));
-                        return Some(UOp::new(
-                            Op::Binary(BinaryOp::Mul, Rc::clone(x), sum),
-                            x.dtype(),
-                        ));
+                        return x.try_mul_op(&sum).ok();
                     }
             }
             None
@@ -700,10 +684,7 @@ pub fn symbolic_simple() -> PatternMatcher {
                 && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                     // (x + c1) + c2 → x + (c1 + c2)
                     let sum = UOp::const_(c1.dtype(), ConstValue::Int(i1 + i2));
-                    return Some(UOp::new(
-                        Op::Binary(BinaryOp::Add, Rc::clone(x), sum),
-                        x.dtype(),
-                    ));
+                    return x.try_add_op(&sum).ok();
                 }
             None
         }
@@ -720,10 +701,7 @@ pub fn symbolic_simple() -> PatternMatcher {
                 && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
                     // (x * c1) * c2 → x * (c1 * c2)
                     let product = UOp::const_(c1.dtype(), ConstValue::Int(i1 * i2));
-                    return Some(UOp::new(
-                        Op::Binary(BinaryOp::Mul, Rc::clone(x), product),
-                        x.dtype(),
-                    ));
+                    return x.try_mul_op(&product).ok();
                 }
             None
         }
@@ -742,17 +720,11 @@ pub fn symbolic_simple() -> PatternMatcher {
                     if diff >= 0 {
                         // (x - c1) + c2 → x + (c2 - c1)
                         let const_val = UOp::const_(c1.dtype(), ConstValue::Int(diff));
-                        return Some(UOp::new(
-                            Op::Binary(BinaryOp::Add, Rc::clone(x), const_val),
-                            x.dtype(),
-                        ));
+                        return x.try_add_op(&const_val).ok();
                     } else {
                         // (x - c1) + c2 → x - (c1 - c2)
                         let const_val = UOp::const_(c1.dtype(), ConstValue::Int(-diff));
-                        return Some(UOp::new(
-                            Op::Binary(BinaryOp::Sub, Rc::clone(x), const_val),
-                            x.dtype(),
-                        ));
+                        return x.try_sub_op(&const_val).ok();
                     }
                 }
             None
@@ -772,17 +744,11 @@ pub fn symbolic_simple() -> PatternMatcher {
                     if diff >= 0 {
                         // (x + c1) - c2 → x + (c1 - c2)
                         let const_val = UOp::const_(c1.dtype(), ConstValue::Int(diff));
-                        return Some(UOp::new(
-                            Op::Binary(BinaryOp::Add, Rc::clone(x), const_val),
-                            x.dtype(),
-                        ));
+                        return x.try_add_op(&const_val).ok();
                     } else {
                         // (x + c1) - c2 → x - (c2 - c1)
                         let const_val = UOp::const_(c1.dtype(), ConstValue::Int(-diff));
-                        return Some(UOp::new(
-                            Op::Binary(BinaryOp::Sub, Rc::clone(x), const_val),
-                            x.dtype(),
-                        ));
+                        return x.try_sub_op(&const_val).ok();
                     }
                 }
             None
@@ -816,10 +782,7 @@ pub fn symbolic_simple() -> PatternMatcher {
                     && *ib != 0 && *ic != 0 {
                         // (a // b) // c → a // (b * c)
                         let product = UOp::const_(b.dtype(), ConstValue::Int(ib * ic));
-                        return Some(UOp::new(
-                            Op::Binary(BinaryOp::Idiv, Rc::clone(a), product),
-                            a.dtype(),
-                        ));
+                        return a.try_idiv_op(&product).ok();
                     }
             None
         }
@@ -841,7 +804,7 @@ pub fn symbolic_simple() -> PatternMatcher {
     // Distribute modulo over addition when const_factor allows
     pattern!(patterns,
         (UPat::var("a") + UPat::var("b")) % UPat::cvar("c") => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
+            use morok_ir::{Op, ConstValue};
 
             // Only apply if c is a small constant to avoid explosion
             if let Op::Const(cv) = c.op()
@@ -853,18 +816,12 @@ pub fn symbolic_simple() -> PatternMatcher {
 
                         if a_factor % modulus == 0 {
                             // a is divisible by c, so (a + b) % c = b % c
-                            return Some(UOp::new(
-                                Op::Binary(BinaryOp::Mod, Rc::clone(b), Rc::clone(c)),
-                                a.dtype(),
-                            ));
+                            return b.try_mod_op(c).ok();
                         }
 
                         if b_factor % modulus == 0 {
                             // b is divisible by c, so (a + b) % c = a % c
-                            return Some(UOp::new(
-                                Op::Binary(BinaryOp::Mod, Rc::clone(a), Rc::clone(c)),
-                                a.dtype(),
-                            ));
+                            return a.try_mod_op(c).ok();
                         }
                     }
             None
@@ -878,16 +835,11 @@ pub fn symbolic_simple() -> PatternMatcher {
     // Distribute division over addition (only when exact)
     pattern!(patterns,
         (UPat::var("a") + UPat::var("b")).idiv(UPat::cvar("c")) => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, UOp};
-
             // Check if both a and b are divisible by c
             if let Some(a_div) = a.divides(c)
                 && let Some(b_div) = b.divides(c) {
                     // (a + b) // c → (a // c) + (b // c)
-                    return Some(UOp::new(
-                        Op::Binary(BinaryOp::Add, a_div, b_div),
-                        a.dtype(),
-                    ));
+                    return a_div.try_add_op(&b_div).ok();
                 }
             None
         }
@@ -897,16 +849,11 @@ pub fn symbolic_simple() -> PatternMatcher {
     // Distribute division over subtraction (only when exact)
     pattern!(patterns,
         (UPat::var("a") - UPat::var("b")).idiv(UPat::cvar("c")) => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, UOp};
-
             // Check if both a and b are divisible by c
             if let Some(a_div) = a.divides(c)
                 && let Some(b_div) = b.divides(c) {
                     // (a - b) // c → (a // c) - (b // c)
-                    return Some(UOp::new(
-                        Op::Binary(BinaryOp::Sub, a_div, b_div),
-                        a.dtype(),
-                    ));
+                    return a_div.try_sub_op(&b_div).ok();
                 }
             None
         }
@@ -917,20 +864,9 @@ pub fn symbolic_simple() -> PatternMatcher {
     // Note: Distributes unconditionally without size checks
     pattern!(patterns,
         UPat::cvar("c") * (UPat::var("a") + UPat::var("b")) => |c: &Rc<morok_ir::UOp>, a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, UOp};
-
-            let ca = UOp::new(
-                Op::Binary(BinaryOp::Mul, Rc::clone(c), Rc::clone(a)),
-                a.dtype(),
-            );
-            let cb = UOp::new(
-                Op::Binary(BinaryOp::Mul, Rc::clone(c), Rc::clone(b)),
-                b.dtype(),
-            );
-            Some(UOp::new(
-                Op::Binary(BinaryOp::Add, ca, cb),
-                a.dtype(),
-            ))
+            let ca = c.try_mul_op(a).ok()?;
+            let cb = c.try_mul_op(b).ok()?;
+            ca.try_add_op(&cb).ok()
         }
     );
 
@@ -939,20 +875,9 @@ pub fn symbolic_simple() -> PatternMatcher {
     // Note: Distributes unconditionally without size checks
     pattern!(patterns,
         (UPat::var("a") + UPat::var("b")) * UPat::cvar("c") => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, UOp};
-
-            let ac = UOp::new(
-                Op::Binary(BinaryOp::Mul, Rc::clone(a), Rc::clone(c)),
-                a.dtype(),
-            );
-            let bc = UOp::new(
-                Op::Binary(BinaryOp::Mul, Rc::clone(b), Rc::clone(c)),
-                b.dtype(),
-            );
-            Some(UOp::new(
-                Op::Binary(BinaryOp::Add, ac, bc),
-                a.dtype(),
-            ))
+            let ac = a.try_mul_op(c).ok()?;
+            let bc = b.try_mul_op(c).ok()?;
+            ac.try_add_op(&bc).ok()
         }
     );
 

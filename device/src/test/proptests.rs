@@ -1,6 +1,7 @@
 use crate::Buffer;
 use crate::allocator::{Allocator, BufferOptions, CpuAllocator, LruAllocator};
 use morok_dtype::{DType, ScalarDType};
+use morok_dtype::test::proptests::generators;
 use proptest::prelude::*;
 use std::sync::Arc;
 use strum::VariantArray;
@@ -36,7 +37,7 @@ impl Arbitrary for BufferSpec {
     type Strategy = BoxedStrategy<Self>;
 
     fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-        (DType::scalar_generator(), prop::collection::vec(1usize..50, 1..=4), any::<bool>())
+        (generators::scalar_generator().prop_map(DType::Scalar), prop::collection::vec(1usize..50, 1..=4), any::<bool>())
             .prop_map(|(dtype, shape, zero_init)| BufferSpec { dtype, shape: ArrayVec::from_iter(shape), zero_init })
             .prop_filter("total size must be reasonable", |spec| (1..=10 * 1024 * 1024).contains(&spec.size()))
             .boxed()

@@ -20,3 +20,4 @@ proptest = ["dep:proptest-derive", "morok-ir/proptest"]
 
 [dev-dependencies]
 proptest = "1.9.0"
+morok-ir = { path = "../ir", features = ["proptest"] }

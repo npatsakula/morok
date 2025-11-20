@@ -112,4 +112,10 @@ pub enum Error {
         "ternary operation branches have mismatched shapes: true branch {true_branch:?} vs false branch {false_branch:?}"
     ))]
     TernaryBranchShapeMismatch { true_branch: Box<Shape>, false_branch: Box<Shape> },
+
+    /// DefineGlobal/DefineLocal must have Ptr dtype.
+    #[snafu(display(
+        "{op} must have Ptr dtype (following Tinygrad spec), got {dtype:?}. Use DefineVar for scalar variables."
+    ))]
+    DefineGlobalRequiresPtrDType { op: &'static str, dtype: DType },
 }

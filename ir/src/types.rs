@@ -44,7 +44,7 @@ fn cast_bool(v: bool, to: ScalarDType) -> Option<ConstValue> {
         Bool => ConstValue::Bool(v),
         Int8 | Int16 | Int32 | Int64 => ConstValue::Int(v as i64),
         UInt8 | UInt16 | UInt32 | UInt64 => ConstValue::UInt(v as u64),
-        Float16 | Float32 | Float64 => ConstValue::Float(v as u8 as f64),
+        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as u8 as f64),
         _ => return None,
     })
 }
@@ -62,7 +62,7 @@ fn cast_int(v: i64, to: ScalarDType) -> Option<ConstValue> {
         UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
         UInt64 => ConstValue::UInt(v as u64),
-        Float16 | Float32 | Float64 => ConstValue::Float(v as f64),
+        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as f64),
         _ => return None,
     })
 }
@@ -80,7 +80,7 @@ fn cast_uint(v: u64, to: ScalarDType) -> Option<ConstValue> {
         UInt16 => ConstValue::UInt(cast_via!(v, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v, u32, u64)),
         UInt64 => ConstValue::UInt(v),
-        Float16 | Float32 | Float64 => ConstValue::Float(v as f64),
+        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v as f64),
         _ => return None,
     })
 }
@@ -99,7 +99,7 @@ fn cast_float(v: f64, to: ScalarDType) -> Option<ConstValue> {
         UInt16 => ConstValue::UInt(cast_via!(v as i64, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v as i64, u32, u64)),
         UInt64 => ConstValue::UInt((v as i64) as u64),
-        Float16 | Float32 | Float64 => ConstValue::Float(v),
+        Float16 | BFloat16 | Float32 | Float64 => ConstValue::Float(v),
         _ => return None,
     })
 }
@@ -111,6 +111,28 @@ impl ConstValue {
             ConstValue::UInt(_) => DType::UInt64,
             ConstValue::Float(_) => DType::Float64,
             ConstValue::Bool(_) => DType::Bool,
+        }
+    }
+
+    pub const fn zero(dtype: ScalarDType) -> Self {
+        use ScalarDType::*;
+        match dtype {
+            Bool => Self::Bool(false),
+            Int8 | Int16 | Int32 | Int64 => Self::Int(0),
+            UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(0),
+            FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(0.0),
+            Void | Index => Self::Int(0), // TODO: remove this types from scalars
+        }
+    }
+
+    pub const fn one(dtype: ScalarDType) -> Self {
+        use ScalarDType::*;
+        match dtype {
+            Bool => Self::Bool(true),
+            Int8 | Int16 | Int32 | Int64 => Self::Int(1),
+            UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(1),
+            FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(1.0),
+            Void | Index => Self::Int(1), // TODO: remove this types from scalars
         }
     }
 

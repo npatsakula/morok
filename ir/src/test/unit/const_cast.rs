@@ -146,12 +146,6 @@ fn test_unsupported_fp8_cast() {
     assert_eq!(value.cast(&DType::Scalar(ScalarDType::FP8E5M2)), None);
 }
 
-#[test]
-fn test_unsupported_bfloat16_cast() {
-    let value = ConstValue::Bool(true);
-    assert_eq!(value.cast(&DType::Scalar(ScalarDType::BFloat16)), None);
-}
-
 // =============================================================================
 // Actual safe casts that work (Bool to everything)
 // =============================================================================

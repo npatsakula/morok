@@ -1,11 +1,8 @@
 pub mod cast;
 pub mod ext;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "proptest"))]
 pub mod test;
-
-#[cfg(feature = "proptest")]
-pub mod proptest_gen;
 
 /// Address space for pointer types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -143,6 +140,12 @@ impl ScalarDType {
             Self::Void => "void",
             Self::Index => "size_t",
         }
+    }
+}
+
+impl From<ScalarDType> for DType {
+    fn from(scalar: ScalarDType) -> Self {
+        Self::Scalar(scalar)
     }
 }
 

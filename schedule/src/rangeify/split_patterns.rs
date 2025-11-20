@@ -59,10 +59,10 @@ pub fn debuf(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelContext) -> Re
     // Create DEFINE_GLOBAL or DEFINE_LOCAL based on address space
     let replacement = if addrspace == AddrSpace::Global {
         let global_id = ctx.next_global();
-        UOp::new(Op::DefineGlobal(global_id), dtype)
+        UOp::define_global(global_id, dtype)
     } else {
         let local_id = ctx.next_local();
-        UOp::new(Op::DefineLocal(local_id), dtype)
+        UOp::define_local(local_id, dtype)
     };
 
     // Track the buffer in context (maps original buffer to itself for later reference)
@@ -264,9 +264,9 @@ pub fn cleanup_const(_bindings: &HashMap<String, Rc<UOp>>, _ctx: &mut KernelCont
 
     // Create new operation with no sources
     let cleaned = match op.op() {
-        Op::Const(val) => UOp::new(Op::Const(*val), op.dtype()),
+        Op::Const(val) => UOp::const_(op.dtype(), val.0),
         Op::DefineVar { name, min_val, max_val } => {
-            UOp::new(Op::DefineVar { name: name.clone(), min_val: *min_val, max_val: *max_val }, op.dtype())
+            UOp::var(name.clone(), op.dtype(), *min_val, *max_val)
         }
         _ => unreachable!(),
     };

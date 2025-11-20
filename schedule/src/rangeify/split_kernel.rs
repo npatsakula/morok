@@ -12,7 +12,6 @@
 
 use std::rc::Rc;
 
-use morok_dtype::DType;
 use morok_ir::{AxisType, Op, UOp};
 use smallvec::SmallVec;
 
@@ -103,7 +102,7 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
 
     // **STEP 2: Create SINK operation**
     // Wrap the computation in a SINK
-    let sink = UOp::new(Op::Sink { sources: smallvec::smallvec![uop.clone()] }, DType::Void);
+    let sink = UOp::sink(vec![uop.clone()]);
 
     // **STEP 3: Build kernel sources from context**
     // Sources = all accessed buffers + all BIND variables

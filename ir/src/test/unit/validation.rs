@@ -17,7 +17,7 @@ fn test_void_type_in_binary_op() {
     let void1 = UOp::const_(DType::Void, ConstValue::Int(0));
     let void2 = UOp::const_(DType::Void, ConstValue::Int(0));
 
-    let result = UOp::try_add_op(void1, void2);
+    let result = void1.try_add_op(&void2);
     assert!(matches!(result, Err(Error::VoidTypeInOp)));
 }
 
@@ -30,7 +30,7 @@ fn test_type_promotion_failed() {
     let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
 
     // This should succeed (int promotes to float), so let's just verify the API
-    let result = UOp::try_add_op(int_val, float_val);
+    let result = int_val.try_add_op(&float_val);
     assert!(result.is_ok());
 }
 
@@ -40,22 +40,22 @@ fn test_invalid_dtype_for_bitwise_op() {
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
 
     // Bitwise AND requires int or bool, not float
-    let result = UOp::try_and_op(float_val.clone(), int_val.clone());
+    let result = float_val.try_and_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_and_op", .. })));
 
     // OR also requires int or bool
-    let result = UOp::try_or_op(float_val.clone(), int_val.clone());
+    let result = float_val.try_or_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_or_op", .. })));
 
     // XOR also requires int or bool
-    let result = UOp::try_xor_op(float_val.clone(), int_val.clone());
+    let result = float_val.try_xor_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_xor_op", .. })));
 
     // Shifts also require int or bool
-    let result = UOp::try_shl_op(float_val.clone(), int_val.clone());
+    let result = float_val.try_shl_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shl_op", .. })));
 
-    let result = UOp::try_shr_op(float_val, int_val);
+    let result = float_val.try_shr_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shr_op", .. })));
 }
 
@@ -79,10 +79,10 @@ fn test_division_by_zero_const() {
     let numerator = UOp::const_(DType::Int32, ConstValue::Int(10));
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
 
-    let result = UOp::try_idiv_op(numerator.clone(), zero.clone());
+    let result = numerator.try_idiv_op(&zero);
     assert!(matches!(result, Err(Error::DivisionByZero)));
 
-    let result = UOp::try_mod_op(numerator, zero);
+    let result = numerator.try_mod_op(&zero);
     assert!(matches!(result, Err(Error::DivisionByZero)));
 }
 
@@ -91,7 +91,7 @@ fn test_division_by_zero_float() {
     let numerator = UOp::const_(DType::Float32, ConstValue::Float(10.0));
     let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
 
-    let result = UOp::try_fdiv_op(numerator, zero);
+    let result = numerator.try_fdiv_op(&zero);
     assert!(matches!(result, Err(Error::DivisionByZero)));
 }
 
@@ -394,19 +394,19 @@ fn test_and_all_int_types() {
     let val_i64 = UOp::const_(DType::Int64, ConstValue::Int(4095));
 
     // AND with same type
-    let result_i8 = UOp::try_and_op(val_i8.clone(), val_i8);
+    let result_i8 = val_i8.try_and_op(&val_i8);
     assert!(result_i8.is_ok());
     assert_eq!(result_i8.unwrap().dtype(), DType::Int8);
 
-    let result_i16 = UOp::try_and_op(val_i16.clone(), val_i16);
+    let result_i16 = val_i16.try_and_op(&val_i16);
     assert!(result_i16.is_ok());
     assert_eq!(result_i16.unwrap().dtype(), DType::Int16);
 
-    let result_i32 = UOp::try_and_op(val_i32.clone(), val_i32);
+    let result_i32 = val_i32.try_and_op(&val_i32);
     assert!(result_i32.is_ok());
     assert_eq!(result_i32.unwrap().dtype(), DType::Int32);
 
-    let result_i64 = UOp::try_and_op(val_i64.clone(), val_i64);
+    let result_i64 = val_i64.try_and_op(&val_i64);
     assert!(result_i64.is_ok());
     assert_eq!(result_i64.unwrap().dtype(), DType::Int64);
 }
@@ -420,25 +420,25 @@ fn test_or_all_uint_types() {
     let val_u64 = UOp::const_(DType::UInt64, ConstValue::UInt(4095));
 
     // OR with same type (note: UInt8/UInt16 may promote to Int16 in some implementations)
-    let result_u8 = UOp::try_or_op(val_u8.clone(), val_u8);
+    let result_u8 = val_u8.try_or_op(&val_u8);
     assert!(result_u8.is_ok());
     // UInt8 may promote to Int16 based on type promotion rules
     let u8_dtype = result_u8.unwrap().dtype();
     assert!(u8_dtype == DType::UInt8 || u8_dtype == DType::Int16);
 
-    let result_u16 = UOp::try_or_op(val_u16.clone(), val_u16);
+    let result_u16 = val_u16.try_or_op(&val_u16);
     assert!(result_u16.is_ok());
     // UInt16 may promote to Int32 based on type promotion rules
     let u16_dtype = result_u16.unwrap().dtype();
     assert!(u16_dtype == DType::UInt16 || u16_dtype == DType::Int32);
 
-    let result_u32 = UOp::try_or_op(val_u32.clone(), val_u32);
+    let result_u32 = val_u32.try_or_op(&val_u32);
     assert!(result_u32.is_ok());
     // UInt32 may promote to Int64 based on type promotion rules
     let u32_dtype = result_u32.unwrap().dtype();
     assert!(u32_dtype == DType::UInt32 || u32_dtype == DType::Int64);
 
-    let result_u64 = UOp::try_or_op(val_u64.clone(), val_u64);
+    let result_u64 = val_u64.try_or_op(&val_u64);
     assert!(result_u64.is_ok());
     assert_eq!(result_u64.unwrap().dtype(), DType::UInt64);
 }
@@ -449,7 +449,7 @@ fn test_xor_mixed_signedness() {
     let signed = UOp::const_(DType::Int32, ConstValue::Int(42));
     let unsigned = UOp::const_(DType::UInt32, ConstValue::UInt(24));
 
-    let result = UOp::try_xor_op(signed, unsigned);
+    let result = signed.try_xor_op(&unsigned);
     assert!(result.is_ok());
     // Result dtype depends on type promotion rules
 }
@@ -465,24 +465,24 @@ fn test_shifts_all_types() {
     let shift_amt = UOp::const_(DType::Int32, ConstValue::Int(2));
 
     // SHL preserves left operand dtype
-    let shl_i8 = UOp::try_shl_op(i8_val, shift_amt.clone());
+    let shl_i8 = i8_val.try_shl_op(&shift_amt);
     assert!(shl_i8.is_ok());
     assert_eq!(shl_i8.unwrap().dtype(), DType::Int8);
 
-    let shl_i16 = UOp::try_shl_op(i16_val.clone(), shift_amt.clone());
+    let shl_i16 = i16_val.try_shl_op(&shift_amt);
     assert!(shl_i16.is_ok());
     assert_eq!(shl_i16.unwrap().dtype(), DType::Int16);
 
-    let shl_i32 = UOp::try_shl_op(i32_val, shift_amt.clone());
+    let shl_i32 = i32_val.try_shl_op(&shift_amt);
     assert!(shl_i32.is_ok());
     assert_eq!(shl_i32.unwrap().dtype(), DType::Int32);
 
     // SHR preserves left operand dtype
-    let shr_i16 = UOp::try_shr_op(i16_val, shift_amt.clone());
+    let shr_i16 = i16_val.try_shr_op(&shift_amt);
     assert!(shr_i16.is_ok());
     assert_eq!(shr_i16.unwrap().dtype(), DType::Int16);
 
-    let shr_u32 = UOp::try_shr_op(u32_val, shift_amt);
+    let shr_u32 = u32_val.try_shr_op(&shift_amt);
     assert!(shr_u32.is_ok());
     assert_eq!(shr_u32.unwrap().dtype(), DType::UInt32);
 }
@@ -496,7 +496,7 @@ fn test_shl_by_zero() {
     let value = UOp::const_(DType::Int32, ConstValue::Int(42));
     let zero_shift = UOp::const_(DType::Int32, ConstValue::Int(0));
 
-    let result = UOp::try_shl_op(value, zero_shift);
+    let result = value.try_shl_op(&zero_shift);
     assert!(result.is_ok());
     // Shifting by zero should return the original value
 }
@@ -506,7 +506,7 @@ fn test_shr_by_zero() {
     let value = UOp::const_(DType::Int32, ConstValue::Int(42));
     let zero_shift = UOp::const_(DType::Int32, ConstValue::Int(0));
 
-    let result = UOp::try_shr_op(value, zero_shift);
+    let result = value.try_shr_op(&zero_shift);
     assert!(result.is_ok());
     // Shifting by zero should return the original value
 }
@@ -518,7 +518,7 @@ fn test_shl_large_amount() {
     let value = UOp::const_(DType::Int32, ConstValue::Int(1));
     let large_shift = UOp::const_(DType::Int32, ConstValue::Int(40)); // > 32 bits
 
-    let result = UOp::try_shl_op(value, large_shift);
+    let result = value.try_shl_op(&large_shift);
     // Current implementation doesn't validate shift amount
     assert!(result.is_ok());
 }
@@ -541,11 +541,11 @@ fn test_shift_preserves_lhs_dtype_all_types() {
 
     for (dtype, value) in types_and_values {
         let val = UOp::const_(dtype.clone(), value);
-        let shl_result = UOp::try_shl_op(val.clone(), shift_amt.clone());
+        let shl_result = val.try_shl_op(&shift_amt);
         assert!(shl_result.is_ok());
         assert_eq!(shl_result.unwrap().dtype(), dtype);
 
-        let shr_result = UOp::try_shr_op(val, shift_amt.clone());
+        let shr_result = val.try_shr_op(&shift_amt);
         assert!(shr_result.is_ok());
         assert_eq!(shr_result.unwrap().dtype(), dtype);
     }
@@ -562,22 +562,22 @@ fn test_and_with_min_max_int8() {
     let zero = UOp::const_(DType::Int8, ConstValue::Int(0));
 
     // AND with MIN
-    let result = UOp::try_and_op(min_val.clone(), min_val.clone());
+    let result = min_val.try_and_op(&min_val);
     assert!(result.is_ok());
 
     // AND with MAX
-    let result = UOp::try_and_op(max_val.clone(), max_val.clone());
+    let result = max_val.try_and_op(&max_val);
     assert!(result.is_ok());
 
     // AND MIN with MAX
-    let result = UOp::try_and_op(min_val.clone(), max_val.clone());
+    let result = min_val.try_and_op(&max_val);
     assert!(result.is_ok());
 
     // AND with zero
-    let result = UOp::try_and_op(min_val, zero.clone());
+    let result = min_val.try_and_op(&zero);
     assert!(result.is_ok());
 
-    let result = UOp::try_and_op(max_val, zero);
+    let result = max_val.try_and_op(&zero);
     assert!(result.is_ok());
 }
 
@@ -587,13 +587,13 @@ fn test_or_with_min_max_values() {
     let i32_min = UOp::const_(DType::Int32, ConstValue::Int(i32::MIN as i64));
     let i32_max = UOp::const_(DType::Int32, ConstValue::Int(i32::MAX as i64));
 
-    let result = UOp::try_or_op(i32_min.clone(), i32_max.clone());
+    let result = i32_min.try_or_op(&i32_max);
     assert!(result.is_ok());
 
     let u32_min = UOp::const_(DType::UInt32, ConstValue::UInt(u32::MIN as u64));
     let u32_max = UOp::const_(DType::UInt32, ConstValue::UInt(u32::MAX as u64));
 
-    let result = UOp::try_or_op(u32_min, u32_max);
+    let result = u32_min.try_or_op(&u32_max);
     assert!(result.is_ok());
 }
 
@@ -604,14 +604,14 @@ fn test_xor_with_min_max_values() {
     let i16_max = UOp::const_(DType::Int16, ConstValue::Int(i16::MAX as i64));
 
     // XOR MIN with MAX
-    let result = UOp::try_xor_op(i16_min.clone(), i16_max.clone());
+    let result = i16_min.try_xor_op(&i16_max);
     assert!(result.is_ok());
 
     // XOR with self should give zero
-    let result = UOp::try_xor_op(i16_min.clone(), i16_min);
+    let result = i16_min.try_xor_op(&i16_min);
     assert!(result.is_ok());
 
-    let result = UOp::try_xor_op(i16_max.clone(), i16_max);
+    let result = i16_max.try_xor_op(&i16_max);
     assert!(result.is_ok());
 }
 
@@ -623,17 +623,17 @@ fn test_shift_at_boundaries() {
     let shift_one = UOp::const_(DType::Int32, ConstValue::Int(1));
 
     // Shift MIN
-    let result = UOp::try_shl_op(i32_min.clone(), shift_one.clone());
+    let result = i32_min.try_shl_op(&shift_one);
     assert!(result.is_ok());
 
-    let result = UOp::try_shr_op(i32_min, shift_one.clone());
+    let result = i32_min.try_shr_op(&shift_one);
     assert!(result.is_ok());
 
     // Shift MAX
-    let result = UOp::try_shl_op(i32_max.clone(), shift_one.clone());
+    let result = i32_max.try_shl_op(&shift_one);
     assert!(result.is_ok());
 
-    let result = UOp::try_shr_op(i32_max, shift_one);
+    let result = i32_max.try_shr_op(&shift_one);
     assert!(result.is_ok());
 }
 
@@ -647,10 +647,10 @@ fn test_bool_add_behavior() {
     let bool_true = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let bool_false = UOp::const_(DType::Bool, ConstValue::Bool(false));
 
-    let result = UOp::try_add_op(bool_true.clone(), bool_false.clone());
+    let result = bool_true.try_add_op(&bool_false);
     assert!(result.is_ok());
 
-    let result = UOp::try_add_op(bool_true, bool_false);
+    let result = bool_true.try_add_op(&bool_false);
     assert!(result.is_ok());
 }
 
@@ -660,10 +660,10 @@ fn test_bool_mul_behavior() {
     let bool_true = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let bool_false = UOp::const_(DType::Bool, ConstValue::Bool(false));
 
-    let result = UOp::try_mul_op(bool_true.clone(), bool_false.clone());
+    let result = bool_true.try_mul_op(&bool_false);
     assert!(result.is_ok());
 
-    let result = UOp::try_mul_op(bool_true, bool_false);
+    let result = bool_true.try_mul_op(&bool_false);
     assert!(result.is_ok());
 }
 
@@ -673,11 +673,11 @@ fn test_bool_with_int_promotion() {
     let bool_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
 
-    let result = UOp::try_add_op(bool_val.clone(), int_val.clone());
+    let result = bool_val.try_add_op(&int_val);
     assert!(result.is_ok());
     // Bool should promote to Int32
 
-    let result = UOp::try_mul_op(bool_val, int_val);
+    let result = bool_val.try_mul_op(&int_val);
     assert!(result.is_ok());
 }
 
@@ -691,24 +691,24 @@ fn test_bitwise_int8_operations() {
     let b = UOp::const_(DType::Int8, ConstValue::Int(0x33));
 
     // Test all bitwise operations on Int8
-    let and_result = UOp::try_and_op(a.clone(), b.clone());
+    let and_result = a.try_and_op(&b);
     assert!(and_result.is_ok());
     assert_eq!(and_result.unwrap().dtype(), DType::Int8);
 
-    let or_result = UOp::try_or_op(a.clone(), b.clone());
+    let or_result = a.try_or_op(&b);
     assert!(or_result.is_ok());
     assert_eq!(or_result.unwrap().dtype(), DType::Int8);
 
-    let xor_result = UOp::try_xor_op(a.clone(), b);
+    let xor_result = a.try_xor_op(&b);
     assert!(xor_result.is_ok());
     assert_eq!(xor_result.unwrap().dtype(), DType::Int8);
 
     let shift_amt = UOp::const_(DType::Int8, ConstValue::Int(2));
-    let shl_result = UOp::try_shl_op(a.clone(), shift_amt.clone());
+    let shl_result = a.try_shl_op(&shift_amt);
     assert!(shl_result.is_ok());
     assert_eq!(shl_result.unwrap().dtype(), DType::Int8);
 
-    let shr_result = UOp::try_shr_op(a, shift_amt);
+    let shr_result = a.try_shr_op(&shift_amt);
     assert!(shr_result.is_ok());
     assert_eq!(shr_result.unwrap().dtype(), DType::Int8);
 }
@@ -718,15 +718,15 @@ fn test_bitwise_int16_operations() {
     let a = UOp::const_(DType::Int16, ConstValue::Int(0x0F0F));
     let b = UOp::const_(DType::Int16, ConstValue::Int(0x3333));
 
-    let and_result = UOp::try_and_op(a.clone(), b.clone());
+    let and_result = a.try_and_op(&b);
     assert!(and_result.is_ok());
     assert_eq!(and_result.unwrap().dtype(), DType::Int16);
 
-    let or_result = UOp::try_or_op(a.clone(), b.clone());
+    let or_result = a.try_or_op(&b);
     assert!(or_result.is_ok());
     assert_eq!(or_result.unwrap().dtype(), DType::Int16);
 
-    let xor_result = UOp::try_xor_op(a, b);
+    let xor_result = a.try_xor_op(&b);
     assert!(xor_result.is_ok());
     assert_eq!(xor_result.unwrap().dtype(), DType::Int16);
 }
@@ -737,17 +737,17 @@ fn test_bitwise_uint8_operations() {
     let b = UOp::const_(DType::UInt8, ConstValue::UInt(0xAA));
 
     // UInt8 may promote to Int16 based on type promotion rules
-    let and_result = UOp::try_and_op(a.clone(), b.clone());
+    let and_result = a.try_and_op(&b);
     assert!(and_result.is_ok());
     let and_dtype = and_result.unwrap().dtype();
     assert!(and_dtype == DType::UInt8 || and_dtype == DType::Int16);
 
-    let or_result = UOp::try_or_op(a.clone(), b.clone());
+    let or_result = a.try_or_op(&b);
     assert!(or_result.is_ok());
     let or_dtype = or_result.unwrap().dtype();
     assert!(or_dtype == DType::UInt8 || or_dtype == DType::Int16);
 
-    let xor_result = UOp::try_xor_op(a, b);
+    let xor_result = a.try_xor_op(&b);
     assert!(xor_result.is_ok());
     let xor_dtype = xor_result.unwrap().dtype();
     assert!(xor_dtype == DType::UInt8 || xor_dtype == DType::Int16);
@@ -759,17 +759,17 @@ fn test_bitwise_uint16_operations() {
     let b = UOp::const_(DType::UInt16, ConstValue::UInt(0xAAAA));
 
     // UInt16 may promote to Int32 based on type promotion rules
-    let and_result = UOp::try_and_op(a.clone(), b.clone());
+    let and_result = a.try_and_op(&b);
     assert!(and_result.is_ok());
     let and_dtype = and_result.unwrap().dtype();
     assert!(and_dtype == DType::UInt16 || and_dtype == DType::Int32);
 
-    let or_result = UOp::try_or_op(a.clone(), b.clone());
+    let or_result = a.try_or_op(&b);
     assert!(or_result.is_ok());
     let or_dtype = or_result.unwrap().dtype();
     assert!(or_dtype == DType::UInt16 || or_dtype == DType::Int32);
 
-    let xor_result = UOp::try_xor_op(a, b);
+    let xor_result = a.try_xor_op(&b);
     assert!(xor_result.is_ok());
     let xor_dtype = xor_result.unwrap().dtype();
     assert!(xor_dtype == DType::UInt16 || xor_dtype == DType::Int32);
@@ -793,7 +793,7 @@ fn test_all_int_types_with_and() {
         let a = UOp::const_(dtype.clone(), value);
         let b = UOp::const_(dtype.clone(), value);
 
-        let result = UOp::try_and_op(a, b);
+        let result = a.try_and_op(&b);
         assert!(result.is_ok());
         // Note: Small unsigned types may be promoted (UInt8->Int16, UInt16->Int32)
         // but larger types and signed types should preserve their dtype
@@ -818,7 +818,7 @@ fn test_all_int_types_with_or() {
         let a = UOp::const_(dtype.clone(), value);
         let b = UOp::const_(dtype.clone(), value);
 
-        let result = UOp::try_or_op(a, b);
+        let result = a.try_or_op(&b);
         assert!(result.is_ok());
         // Note: Small unsigned types may be promoted (UInt8->Int16, UInt16->Int32)
     }
@@ -842,7 +842,7 @@ fn test_all_int_types_with_xor() {
         let a = UOp::const_(dtype.clone(), value);
         let b = UOp::const_(dtype.clone(), value);
 
-        let result = UOp::try_xor_op(a, b);
+        let result = a.try_xor_op(&b);
         assert!(result.is_ok());
         // Note: Small unsigned types may be promoted (UInt8->Int16, UInt16->Int32)
     }
@@ -857,13 +857,13 @@ fn test_bitwise_with_void_lhs() {
     let void_val = UOp::const_(DType::Void, ConstValue::Int(0));
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
 
-    let result = UOp::try_and_op(void_val.clone(), int_val.clone());
+    let result = void_val.try_and_op(&int_val);
     assert!(result.is_err());
 
-    let result = UOp::try_or_op(void_val.clone(), int_val.clone());
+    let result = void_val.try_or_op(&int_val);
     assert!(result.is_err());
 
-    let result = UOp::try_xor_op(void_val, int_val);
+    let result = void_val.try_xor_op(&int_val);
     assert!(result.is_err());
 }
 
@@ -872,13 +872,13 @@ fn test_bitwise_with_void_rhs() {
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
     let void_val = UOp::const_(DType::Void, ConstValue::Int(0));
 
-    let result = UOp::try_and_op(int_val.clone(), void_val.clone());
+    let result = int_val.try_and_op(&void_val);
     assert!(result.is_err());
 
-    let result = UOp::try_or_op(int_val.clone(), void_val.clone());
+    let result = int_val.try_or_op(&void_val);
     assert!(result.is_err());
 
-    let result = UOp::try_xor_op(int_val, void_val);
+    let result = int_val.try_xor_op(&void_val);
     assert!(result.is_err());
 }
 
@@ -888,10 +888,10 @@ fn test_shift_void_error() {
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(1));
 
     // Shift operations validate LHS dtype through check_bitwise_dtype
-    let result = UOp::try_shl_op(void_val.clone(), int_val.clone());
+    let result = void_val.try_shl_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { .. })));
 
-    let result = UOp::try_shr_op(void_val, int_val);
+    let result = void_val.try_shr_op(&int_val);
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { .. })));
 }
 
@@ -902,18 +902,18 @@ fn test_invalid_type_combinations() {
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
 
     // Float with bitwise operations should error
-    let result = UOp::try_and_op(float_val.clone(), int_val.clone());
+    let result = float_val.try_and_op(&int_val);
     assert!(result.is_err());
 
-    let result = UOp::try_or_op(float_val.clone(), int_val.clone());
+    let result = float_val.try_or_op(&int_val);
     assert!(result.is_err());
 
-    let result = UOp::try_xor_op(float_val.clone(), int_val.clone());
+    let result = float_val.try_xor_op(&int_val);
     assert!(result.is_err());
 
-    let result = UOp::try_shl_op(float_val.clone(), int_val.clone());
+    let result = float_val.try_shl_op(&int_val);
     assert!(result.is_err());
 
-    let result = UOp::try_shr_op(float_val, int_val);
+    let result = float_val.try_shr_op(&int_val);
     assert!(result.is_err());
 }

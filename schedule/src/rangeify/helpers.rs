@@ -1,7 +1,7 @@
 //! Helper functions for rangeify pattern matching and transformations.
 
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, Op, SInt, TernaryOp, UOp};
+use morok_ir::{BinaryOp, ConstValue, Op, SInt, UOp};
 use std::rc::Rc;
 
 /// Check if a constant value is the identity element for a given binary operation.
@@ -131,7 +131,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                         Rc::clone(rng)
                     } else {
                         let begin_uop = UOp::const_(DType::Index, ConstValue::Int(begin as i64));
-                        UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(rng), begin_uop), DType::Index)
+                        rng.try_add_op(&begin_uop).unwrap()
                     }
                 })
                 .collect()
@@ -156,10 +156,10 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                         SInt::Const(n) => UOp::const_(DType::Index, ConstValue::Int(*n as i64 - 1)),
                         SInt::Symbolic(uop) => {
                             let one = UOp::const_(DType::Index, ConstValue::Int(1));
-                            UOp::new(Op::Binary(BinaryOp::Sub, Rc::clone(uop), one), DType::Index)
+                            uop.try_sub_op(&one).unwrap()
                         }
                     };
-                    UOp::new(Op::Binary(BinaryOp::Sub, shape_minus_1, Rc::clone(rng)), DType::Index)
+                    shape_minus_1.try_sub_op(rng).unwrap()
                 }
             })
             .collect(),
@@ -196,23 +196,23 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                     let shape_plus_begin = match shape {
                         SInt::Const(n) => UOp::const_(DType::Index, ConstValue::Int(*n as i64 + begin as i64)),
                         SInt::Symbolic(uop) => {
-                            UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(uop), begin_uop.clone()), DType::Index)
+                            uop.try_add_op(&begin_uop).unwrap()
                         }
                     };
                     // rng >= begin  (use !(rng < begin) implemented as (rng < begin) XOR true)
-                    let too_low = UOp::new(Op::Binary(BinaryOp::Lt, Rc::clone(rng), begin_uop.clone()), DType::Bool);
+                    let too_low = UOp::cmplt(rng, &begin_uop).unwrap();
                     let true_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
-                    let valid_low = UOp::new(Op::Binary(BinaryOp::Xor, too_low, true_val), DType::Bool);
+                    let valid_low = too_low.try_xor_op(&true_val).unwrap();
                     // rng < shape + begin
-                    let valid_high = UOp::new(Op::Binary(BinaryOp::Lt, Rc::clone(rng), shape_plus_begin), DType::Bool);
+                    let valid_high = UOp::cmplt(rng, &shape_plus_begin).unwrap();
                     // valid = valid_low & valid_high
-                    let valid = UOp::new(Op::Binary(BinaryOp::And, valid_low, valid_high), DType::Bool);
+                    let valid = valid_low.try_and_op(&valid_high).unwrap();
                     // Subtract padding: rng - begin
-                    let adjusted_rng = UOp::new(Op::Binary(BinaryOp::Sub, Rc::clone(rng), begin_uop), DType::Index);
+                    let adjusted_rng = rng.try_sub_op(&begin_uop).unwrap();
                     // Use 0 as invalid value (will be masked by valid check later)
                     // TODO: Proper invalid handling - need to check Tinygrad's approach
                     let invalid_val = UOp::const_(DType::Index, ConstValue::Int(0));
-                    UOp::new(Op::Ternary(TernaryOp::Where, valid, adjusted_rng, invalid_val), DType::Index)
+                    UOp::where_op(valid, adjusted_rng, invalid_val).unwrap()
                 })
                 .collect()
         }
@@ -224,19 +224,19 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
             let mut acc = UOp::const_(DType::Index, ConstValue::Int(1));
             let mut axes_in = Vec::new();
             for (shape_dim, rng) in new_shape_vals.iter().zip(rngs.iter()).rev() {
-                let weighted = UOp::new(Op::Binary(BinaryOp::Mul, acc.clone(), Rc::clone(rng)), DType::Index);
+                let weighted = acc.try_mul_op(rng).unwrap();
                 axes_in.push(weighted);
                 acc = match shape_dim {
-                    SInt::Const(n) => UOp::new(
-                        Op::Binary(BinaryOp::Mul, acc, UOp::const_(DType::Index, ConstValue::Int(*n as i64))),
-                        DType::Index,
-                    ),
-                    SInt::Symbolic(uop) => UOp::new(Op::Binary(BinaryOp::Mul, acc, Rc::clone(uop)), DType::Index),
+                    SInt::Const(n) => {
+                        let n_uop = UOp::const_(DType::Index, ConstValue::Int(*n as i64));
+                        acc.try_mul_op(&n_uop).unwrap()
+                    }
+                    SInt::Symbolic(uop) => acc.try_mul_op(uop).unwrap(),
                 };
             }
             let combined_axes = axes_in
                 .into_iter()
-                .reduce(|a, b| UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Index))
+                .reduce(|a, b| a.try_add_op(&b).unwrap())
                 .unwrap_or_else(|| UOp::const_(DType::Index, ConstValue::Int(0)));
             // Step 2: Unflatten into input shape dimensions
             let mut axes_out = Vec::new();
@@ -246,9 +246,9 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                     SInt::Const(n) => UOp::const_(DType::Index, ConstValue::Int(*n as i64)),
                     SInt::Symbolic(uop) => Rc::clone(uop),
                 };
-                let mod_result = UOp::new(Op::Binary(BinaryOp::Mod, combined.clone(), shape_uop.clone()), DType::Index);
+                let mod_result = combined.try_mod_op(&shape_uop).unwrap();
                 axes_out.push(mod_result);
-                combined = UOp::new(Op::Binary(BinaryOp::Idiv, combined, shape_uop), DType::Index);
+                combined = combined.try_idiv_op(&shape_uop).unwrap();
             }
             axes_out.reverse();
             axes_out

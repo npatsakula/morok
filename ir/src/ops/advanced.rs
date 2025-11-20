@@ -45,8 +45,8 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if type promotion fails or void type is used.
-    pub fn try_max_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
-        let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+    pub fn try_max_op(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+        let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
         Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Max)?;
         Ok(Self::new(Op::Binary(BinaryOp::Max, lhs, rhs), dtype))
     }
@@ -55,8 +55,8 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if type promotion fails or void type is used.
-    pub fn try_pow_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
-        let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+    pub fn try_pow_op(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+        let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
         Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Pow)?;
         Ok(Self::new(Op::Binary(BinaryOp::Pow, lhs, rhs), dtype))
     }
@@ -65,9 +65,9 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if type promotion fails, void type is used, or division by zero is detected.
-    pub fn try_idiv_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
-        Self::check_division_by_zero(&rhs)?;
-        let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+    pub fn try_idiv_op(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+        Self::check_division_by_zero(rhs)?;
+        let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
         Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Idiv)?;
         Ok(Self::new(Op::Binary(BinaryOp::Idiv, lhs, rhs), dtype))
     }
@@ -76,9 +76,9 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if type promotion fails, void type is used, or division by zero is detected.
-    pub fn try_fdiv_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
-        Self::check_division_by_zero(&rhs)?;
-        let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+    pub fn try_fdiv_op(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+        Self::check_division_by_zero(rhs)?;
+        let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
         Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Fdiv)?;
         Ok(Self::new(Op::Binary(BinaryOp::Fdiv, lhs, rhs), dtype))
     }

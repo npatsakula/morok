@@ -21,7 +21,7 @@ fn test_symbolic_range_size() {
     // Test BUFFERIZE with symbolic (variable) range size
     // This tests that rangeify doesn't crash on non-constant range sizes
 
-    let size_var = UOp::define_global(0, DType::Index);
+    let size_var = UOp::var("size", DType::Index, 1, 1024);
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
     // Create range with symbolic size
@@ -38,8 +38,8 @@ fn test_symbolic_range_size() {
 #[test]
 fn test_symbolic_range_multiple() {
     // Test multiple symbolic ranges
-    let size1 = UOp::define_global(0, DType::Index);
-    let size2 = UOp::define_global(1, DType::Index);
+    let size1 = UOp::var("size1", DType::Index, 1, 1024);
+    let size2 = UOp::var("size2", DType::Index, 1, 1024);
 
     let compute = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
@@ -58,8 +58,8 @@ fn test_symbolic_range_multiple() {
 #[test]
 fn test_symbolic_range_with_arithmetic() {
     // Test symbolic range size with arithmetic expression
-    let n = UOp::define_global(0, DType::Index);
-    let size = UOp::try_mul_op(n, create_const(2)).unwrap();
+    let n = UOp::var("n", DType::Index, 1, 512);
+    let size = n.try_mul_op(&create_const(2)).unwrap();
 
     let compute = UOp::const_(DType::Float32, ConstValue::Float(3.0));
     let range = create_range_symbolic(size, 0);
@@ -131,9 +131,9 @@ fn test_bufferize_multiple_consumers() {
     let buf = create_bufferize(compute, vec![range]);
 
     // Two independent consumers of the same buffer
-    let consumer1 = UOp::try_add_op(buf.clone(), UOp::const_(DType::Float32, ConstValue::Float(2.0))).unwrap();
+    let consumer1 = buf.try_add_op(&UOp::const_(DType::Float32, ConstValue::Float(2.0))).unwrap();
 
-    let consumer2 = UOp::try_mul_op(buf.clone(), UOp::const_(DType::Float32, ConstValue::Float(3.0))).unwrap();
+    let consumer2 = buf.try_mul_op(&UOp::const_(DType::Float32, ConstValue::Float(3.0))).unwrap();
 
     // Combine consumers with SINK
     let sink = UOp::new(Op::Sink { sources: vec![consumer1, consumer2].into() }, DType::Float32);

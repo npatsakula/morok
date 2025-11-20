@@ -134,7 +134,7 @@ fn test_symbolic_simple_const_folding() {
 fn test_self_division() {
     // Test: x // x -> 1
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, x.clone(), x), DType::Int32);
 
     let result = matcher.rewrite(&div);
@@ -152,7 +152,7 @@ fn test_self_division() {
 fn test_division_by_neg_one() {
     // Test: x // -1 -> -x
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let neg_one = UOp::const_(DType::Int32, ConstValue::Int(-1));
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, x.clone(), neg_one), DType::Int32);
 
@@ -171,8 +171,8 @@ fn test_division_by_neg_one() {
 fn test_idempotent_modulo() {
     // Test: (x % y) % y -> x % y
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
 
     // Build (x % y) % y
     let inner_mod = UOp::new(Op::Binary(BinaryOp::Mod, x.clone(), y.clone()), DType::Int32);
@@ -195,7 +195,7 @@ fn test_idempotent_modulo() {
 fn test_idempotent_and() {
     // Test: x & x -> x
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let and_op = UOp::new(Op::Binary(BinaryOp::And, x.clone(), x.clone()), DType::Int32);
 
     let result = matcher.rewrite(&and_op);
@@ -209,7 +209,7 @@ fn test_idempotent_and() {
 fn test_idempotent_or() {
     // Test: x | x -> x
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let or_op = UOp::new(Op::Binary(BinaryOp::Or, x.clone(), x.clone()), DType::Int32);
 
     let result = matcher.rewrite(&or_op);
@@ -223,8 +223,8 @@ fn test_idempotent_or() {
 fn test_non_idempotent_and() {
     // Test: x & y (different variables) -> no match
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let and_op = UOp::new(Op::Binary(BinaryOp::And, x, y), DType::Int32);
 
     let result = matcher.rewrite(&and_op);
@@ -240,7 +240,7 @@ fn test_non_idempotent_and() {
 fn test_self_comparison_lt() {
     // Test: x < x -> False
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let lt = UOp::new(Op::Binary(BinaryOp::Lt, x.clone(), x), DType::Int32);
 
     let result = matcher.rewrite(&lt);
@@ -258,7 +258,7 @@ fn test_self_comparison_lt() {
 fn test_self_modulo() {
     // Test: x % x -> 0
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let modulo = UOp::new(Op::Binary(BinaryOp::Mod, x.clone(), x), DType::Int32);
 
     let result = matcher.rewrite(&modulo);
@@ -276,7 +276,7 @@ fn test_self_modulo() {
 fn test_self_inequality_int() {
     // Test: x != x -> False (for integers)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let ne = UOp::new(Op::Binary(BinaryOp::Ne, x.clone(), x), DType::Int32);
 
     let result = matcher.rewrite(&ne);
@@ -294,7 +294,7 @@ fn test_self_inequality_int() {
 fn test_self_inequality_float_no_fold() {
     // Test: x != x (for floats) -> no match (NaN != NaN is true)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::var("x", DType::Float32, i64::MIN, i64::MAX);
     let ne = UOp::new(Op::Binary(BinaryOp::Ne, x.clone(), x), DType::Float32);
 
     let result = matcher.rewrite(&ne);
@@ -308,7 +308,7 @@ fn test_self_inequality_float_no_fold() {
 fn test_float_self_division() {
     // Test: x / x -> 1.0 (float division)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::var("x", DType::Float32, i64::MIN, i64::MAX);
     let div = UOp::new(Op::Binary(BinaryOp::Fdiv, x.clone(), x), DType::Float32);
 
     let result = matcher.rewrite(&div);
@@ -326,8 +326,8 @@ fn test_float_self_division() {
 fn test_division_cancel_multiplication() {
     // Test: (x * y) / y -> x
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Float32);
-    let y = UOp::define_global(2, DType::Float32);
+    let x = UOp::var("x", DType::Float32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Float32, i64::MIN, i64::MAX);
 
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, x.clone(), y.clone()), DType::Float32);
     let div = UOp::new(Op::Binary(BinaryOp::Fdiv, mul, y), DType::Float32);
@@ -343,8 +343,8 @@ fn test_division_cancel_multiplication() {
 fn test_int_division_cancel_multiplication() {
     // Test: (x * y) // y -> x (integer division)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
 
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, x.clone(), y.clone()), DType::Int32);
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, mul, y), DType::Int32);
@@ -418,7 +418,7 @@ fn test_cast_bool_to_int_constant() {
 fn test_noop_cast_same_dtype() {
     // Test: x.cast(dtype) -> x if same dtype
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let cast = UOp::new(Op::Cast { src: x.clone(), dtype: DType::Int32 }, DType::Int32);
 
     let result = matcher.rewrite(&cast);
@@ -432,7 +432,7 @@ fn test_noop_cast_same_dtype() {
 fn test_double_cast_collapse() {
     // Test: x.cast(Float32).cast(Int32) -> x.cast(Int32)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
 
     // First cast: Int32 -> Float32
     let inner_cast = UOp::new(Op::Cast { src: x.clone(), dtype: DType::Float32 }, DType::Float32);
@@ -457,7 +457,7 @@ fn test_double_cast_collapse() {
 fn test_cast_non_constant_no_fold() {
     // Test: cast(variable) -> no constant folding (only dtype change)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let cast = UOp::new(Op::Cast { src: x.clone(), dtype: DType::Float32 }, DType::Float32);
 
     let result = matcher.rewrite(&cast);
@@ -472,7 +472,7 @@ fn test_cast_non_constant_no_fold() {
 fn test_combine_identical_terms() {
     // Test: x + x → 2*x
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), x.clone()), DType::Int32);
 
     let result = matcher.rewrite(&add);
@@ -504,7 +504,7 @@ fn test_combine_identical_terms() {
 fn test_combine_terms_with_coefficients() {
     // Test: (3 * x) + (5 * x) → 8 * x
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let c5 = UOp::const_(DType::Int32, ConstValue::Int(5));
     let term1 = UOp::new(Op::Binary(BinaryOp::Mul, c3, x.clone()), DType::Int32);
@@ -533,7 +533,7 @@ fn test_combine_terms_with_coefficients() {
 fn test_combine_terms_reversed_multiplication() {
     // Test: (x * 3) + (x * 5) → x * 8
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let c5 = UOp::const_(DType::Int32, ConstValue::Int(5));
     let term1 = UOp::new(Op::Binary(BinaryOp::Mul, x.clone(), c3), DType::Int32);
@@ -562,8 +562,8 @@ fn test_combine_terms_reversed_multiplication() {
 fn test_no_combine_different_variables() {
     // Test: (3 * x) + (5 * y) → no rewrite (different variables)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let c5 = UOp::const_(DType::Int32, ConstValue::Int(5));
     let term1 = UOp::new(Op::Binary(BinaryOp::Mul, c3, x), DType::Int32);
@@ -581,7 +581,7 @@ fn test_no_combine_different_variables() {
 fn test_alu_fold_addition_chain() {
     // Test: (x + 3) + 5 → x + 8
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let c5 = UOp::const_(DType::Int32, ConstValue::Int(5));
     let add1 = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), c3), DType::Int32);
@@ -609,7 +609,7 @@ fn test_alu_fold_addition_chain() {
 fn test_alu_fold_multiplication_chain() {
     // Test: (x * 2) * 3 → x * 6
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let c2 = UOp::const_(DType::Int32, ConstValue::Int(2));
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let mul1 = UOp::new(Op::Binary(BinaryOp::Mul, x.clone(), c2), DType::Int32);
@@ -637,7 +637,7 @@ fn test_alu_fold_multiplication_chain() {
 fn test_alu_fold_sub_then_add_positive() {
     // Test: (x - 3) + 5 → x + 2
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let c5 = UOp::const_(DType::Int32, ConstValue::Int(5));
     let sub = UOp::new(Op::Binary(BinaryOp::Sub, x.clone(), c3), DType::Int32);
@@ -665,7 +665,7 @@ fn test_alu_fold_sub_then_add_positive() {
 fn test_alu_fold_sub_then_add_negative() {
     // Test: (x - 5) + 3 → x - 2
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let c5 = UOp::const_(DType::Int32, ConstValue::Int(5));
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let sub = UOp::new(Op::Binary(BinaryOp::Sub, x.clone(), c5), DType::Int32);
@@ -693,7 +693,7 @@ fn test_alu_fold_sub_then_add_negative() {
 fn test_alu_fold_add_then_sub_positive() {
     // Test: (x + 5) - 3 → x + 2
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let c5 = UOp::const_(DType::Int32, ConstValue::Int(5));
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), c5), DType::Int32);
@@ -721,7 +721,7 @@ fn test_alu_fold_add_then_sub_positive() {
 fn test_alu_fold_add_then_sub_negative() {
     // Test: (x + 3) - 5 → x - 2
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let c5 = UOp::const_(DType::Int32, ConstValue::Int(5));
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), c3), DType::Int32);
@@ -751,8 +751,8 @@ fn test_alu_fold_add_then_sub_negative() {
 fn test_division_cancel_with_multiplication() {
     // Test: (a * b) // b → a
     let matcher = symbolic_simple();
-    let a = UOp::define_global(1, DType::Int32);
-    let b = UOp::define_global(2, DType::Int32);
+    let a = UOp::var("a", DType::Int32, i64::MIN, i64::MAX);
+    let b = UOp::var("b", DType::Int32, i64::MIN, i64::MAX);
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, a.clone(), b.clone()), DType::Int32);
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, mul, b.clone()), DType::Int32);
 
@@ -769,7 +769,7 @@ fn test_division_cancel_with_multiplication() {
 fn test_division_chain_folding() {
     // Test: (a // 2) // 3 → a // 6
     let matcher = symbolic_simple();
-    let a = UOp::define_global(1, DType::Int32);
+    let a = UOp::var("a", DType::Int32, i64::MIN, i64::MAX);
     let c2 = UOp::const_(DType::Int32, ConstValue::Int(2));
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let div1 = UOp::new(Op::Binary(BinaryOp::Idiv, a.clone(), c2), DType::Int32);
@@ -797,7 +797,7 @@ fn test_division_chain_folding() {
 fn test_exact_division_with_divides_helper() {
     // Test: (12 * x) // 3 → 4 * x (using divides helper)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let c12 = UOp::const_(DType::Int32, ConstValue::Int(12));
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, c12, x.clone()), DType::Int32);
@@ -825,8 +825,8 @@ fn test_exact_division_with_divides_helper() {
 fn test_modulo_with_divisible_left_operand() {
     // Test: (6 * x + y) % 3 → y % 3 (since 6*x is divisible by 3)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let c6 = UOp::const_(DType::Int32, ConstValue::Int(6));
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, c6, x), DType::Int32);
@@ -851,8 +851,8 @@ fn test_modulo_with_divisible_left_operand() {
 fn test_modulo_with_divisible_right_operand() {
     // Test: (x + 9 * y) % 3 → x % 3 (since 9*y is divisible by 3)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let c9 = UOp::const_(DType::Int32, ConstValue::Int(9));
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, c9, y), DType::Int32);
@@ -877,8 +877,8 @@ fn test_modulo_with_divisible_right_operand() {
 fn test_modulo_no_simplification() {
     // Test: (x + y) % 3 → no simplification (neither divisible by 3)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
     let add = UOp::new(Op::Binary(BinaryOp::Add, x, y), DType::Int32);
     let modulo = UOp::new(Op::Binary(BinaryOp::Mod, add, c3), DType::Int32);
@@ -894,8 +894,8 @@ fn test_modulo_no_simplification() {
 fn test_distribute_division_over_addition() {
     // Test: (6*x + 9*y) // 3 → (2*x) + (3*y)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let c6 = UOp::const_(DType::Int32, ConstValue::Int(6));
     let c9 = UOp::const_(DType::Int32, ConstValue::Int(9));
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
@@ -940,8 +940,8 @@ fn test_distribute_division_over_addition() {
 fn test_distribute_division_over_subtraction() {
     // Test: (12*x - 6*y) // 3 → (4*x) - (2*y)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let c12 = UOp::const_(DType::Int32, ConstValue::Int(12));
     let c6 = UOp::const_(DType::Int32, ConstValue::Int(6));
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
@@ -982,8 +982,8 @@ fn test_distribute_division_over_subtraction() {
 fn test_distribute_multiplication_over_addition() {
     // Test: 2 * (x + y) → (2*x) + (2*y)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let c2 = UOp::const_(DType::Int32, ConstValue::Int(2));
 
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), y.clone()), DType::Int32);
@@ -1016,8 +1016,8 @@ fn test_distribute_multiplication_over_addition() {
 fn test_distribute_multiplication_over_addition_reversed() {
     // Test: (x + y) * 3 → (x*3) + (y*3)
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let c3 = UOp::const_(DType::Int32, ConstValue::Int(3));
 
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), y.clone()), DType::Int32);
@@ -1051,8 +1051,8 @@ fn test_distribute_large_constant() {
     // Test: (x + y) * 100 → (x*100) + (y*100)
     // Note: Distributes unconditionally without size checks
     let matcher = symbolic_simple();
-    let x = UOp::define_global(1, DType::Int32);
-    let y = UOp::define_global(2, DType::Int32);
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let c100 = UOp::const_(DType::Int32, ConstValue::Int(100));
 
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), y.clone()), DType::Int32);

@@ -493,6 +493,108 @@ impl UPat {
         }
     }
 
+    /// Match INDEX operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: INDEX(buffer, indices...)
+    /// pattern!(patterns,
+    ///     UPat::index(UPat::var("buf"), UPat::var("indices")) => |buf, indices| {
+    ///         Some(optimize_index(buf, indices))
+    ///     }
+    /// );
+    /// ```
+    pub fn index(buffer: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Index {
+                buffer: UOp::noop(),
+                indices: SmallVec::new(),
+                gate: None,
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![buffer])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match LOAD operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: LOAD(buffer, index)
+    /// pattern!(patterns,
+    ///     UPat::load(UPat::var("buf"), UPat::var("idx")) => |buf, idx| {
+    ///         Some(optimize_load(buf, idx))
+    ///     }
+    /// );
+    /// ```
+    pub fn load(buffer: UPat, index: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Load {
+                buffer: UOp::noop(),
+                index: UOp::noop(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![buffer, index])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match gated LOAD operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: LOAD_GATED(buffer, index, gate)
+    /// pattern!(patterns,
+    ///     UPat::load_gated(UPat::var("buf"), UPat::var("idx"), UPat::var("gate")) => |buf, idx, gate| {
+    ///         Some(optimize_load_gated(buf, idx, gate))
+    ///     }
+    /// );
+    /// ```
+    pub fn load_gated(buffer: UPat, index: UPat, gate: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::LoadGated {
+                buffer: UOp::noop(),
+                index: UOp::noop(),
+                gate: UOp::noop(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![buffer, index, gate])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match REDUCE operation.
+    ///
+    /// Matches any REDUCE operation regardless of reduce_op type.
+    /// To match specific reduce operations, check the op in the closure.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: REDUCE(src, ranges...)
+    /// pattern!(patterns,
+    ///     UPat::reduce(UPat::var("src")) => |src| {
+    ///         Some(optimize_reduce(src))
+    ///     }
+    /// );
+    /// ```
+    pub fn reduce(src: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reduce {
+                src: UOp::noop(),
+                ranges: SmallVec::new(),
+                reduce_op: morok_ir::ReduceOp::Add,
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![src])),
+            arg: None,
+            name: None,
+        }
+    }
+
     /// Match BUFFERIZE operation.
     ///
     /// Note: This matches any BUFFERIZE regardless of the number of ranges.
@@ -513,6 +615,154 @@ impl UPat {
     /// ```
     pub fn bufferize_var(name: impl Into<String>) -> Self {
         UPat::var(name) // Simplified - check op type in pattern closure
+    }
+
+    // ===== Movement Operation Helpers =====
+
+    /// Match RESHAPE operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: RESHAPE(src, new_shape)
+    /// pattern!(patterns,
+    ///     UPat::reshape(UPat::var("src")) => |src| {
+    ///         Some(optimize_reshape(src))
+    ///     }
+    /// );
+    /// ```
+    pub fn reshape(src: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reshape {
+                src: UOp::noop(),
+                new_shape: UOp::noop(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![src])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match PERMUTE operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: PERMUTE(src, axes)
+    /// pattern!(patterns,
+    ///     UPat::permute(UPat::var("src")) => |src| {
+    ///         Some(optimize_permute(src))
+    ///     }
+    /// );
+    /// ```
+    pub fn permute(src: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Permute {
+                src: UOp::noop(),
+                axes: vec![],
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![src])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match EXPAND operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: EXPAND(src, new_shape)
+    /// pattern!(patterns,
+    ///     UPat::expand(UPat::var("src")) => |src| {
+    ///         Some(optimize_expand(src))
+    ///     }
+    /// );
+    /// ```
+    pub fn expand(src: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Expand {
+                src: UOp::noop(),
+                new_shape: UOp::noop(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![src])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match PAD operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: PAD(src, begin_pads, end_pads)
+    /// pattern!(patterns,
+    ///     UPat::pad(UPat::var("src")) => |src| {
+    ///         Some(optimize_pad(src))
+    ///     }
+    /// );
+    /// ```
+    pub fn pad(src: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Pad {
+                src: UOp::noop(),
+                begin_pads: UOp::noop(),
+                end_pads: UOp::noop(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![src])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match SHRINK operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: SHRINK(src, begins, ends)
+    /// pattern!(patterns,
+    ///     UPat::shrink(UPat::var("src")) => |src| {
+    ///         Some(optimize_shrink(src))
+    ///     }
+    /// );
+    /// ```
+    pub fn shrink(src: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Shrink {
+                src: UOp::noop(),
+                begins: UOp::noop(),
+                ends: UOp::noop(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![src])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match FLIP operation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Match: FLIP(src, axes)
+    /// pattern!(patterns,
+    ///     UPat::flip(UPat::var("src")) => |src| {
+    ///         Some(optimize_flip(src))
+    ///     }
+    /// );
+    /// ```
+    pub fn flip(src: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Flip {
+                src: UOp::noop(),
+                axes: vec![],
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![src])),
+            arg: None,
+            name: None,
+        }
     }
 
     /// Match DEFINE_GLOBAL operation with name binding.

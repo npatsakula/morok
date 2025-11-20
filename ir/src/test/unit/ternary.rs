@@ -201,8 +201,8 @@ fn test_mulacc_vs_separate_ops() {
     let fused = UOp::mulacc_op(a.clone(), b.clone(), c.clone()).unwrap();
 
     // Separate: (a * b) + c
-    let mul = UOp::try_mul_op(a, b).unwrap();
-    let separate = UOp::try_add_op(mul, c).unwrap();
+    let mul = a.try_mul_op(&b).unwrap();
+    let separate = mul.try_add_op(&c).unwrap();
 
     // Both should have same dtype
     assert_eq!(fused.dtype(), separate.dtype());
@@ -221,7 +221,7 @@ fn test_mulacc_chained() {
 
     // Chained mulacc: (2*3 + 4) * 5 + ...
     // This tests using mulacc result in another operation
-    let result2 = UOp::try_mul_op(result1, d).unwrap();
+    let result2 = result1.try_mul_op(&d).unwrap();
 
     assert_eq!(result2.dtype(), DType::Float32);
 }

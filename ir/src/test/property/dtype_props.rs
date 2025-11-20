@@ -17,8 +17,7 @@ proptest! {
 
     /// Casting to the same dtype should be identity.
     #[test]
-    fn const_cast_identity(cv in arb_const_value()) {
-        let dtype = cv.dtype();
+    fn const_cast_identity((dtype, cv) in const_pair()) {
         let casted = cv.cast(&dtype).expect("Cast to same dtype should succeed");
         prop_assert_eq!(cv, casted, "Cast to same dtype should be identity");
     }
@@ -107,7 +106,8 @@ proptest! {
 
     /// Zero casts to zero in any dtype.
     #[test]
-    fn const_cast_zero_to_any_dtype(dtype in arb_arithmetic_dtype()) {
+    fn const_cast_zero_to_any_dtype(sdtype in arithmetic_sdtype()) {
+        let dtype = DType::from(sdtype);
         let zero_int = ConstValue::Int(0);
         let zero_float = ConstValue::Float(0.0);
         let zero_bool = ConstValue::Bool(false);
@@ -142,7 +142,8 @@ proptest! {
 
     /// One casts to one in numeric dtypes.
     #[test]
-    fn const_cast_one_to_numeric_dtype(dtype in arb_arithmetic_dtype()) {
+    fn const_cast_one_to_numeric_dtype(dtype in arithmetic_sdtype()) {
+        let dtype = DType::from(dtype);
         let one = ConstValue::Int(1);
 
         if let Some(casted) = one.cast(&dtype) {

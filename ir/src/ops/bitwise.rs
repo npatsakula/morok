@@ -35,8 +35,8 @@ macro_rules! bitwise_binary_ops {
             /// assert_eq!(result.dtype(), DType::Int32);
             /// # Ok::<(), Error>(())
             /// ```
-            pub fn $method(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
-                let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+            pub fn $method(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+                let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
                 Self::check_bitwise_dtype(dtype.clone(), stringify!($method))?;
                 Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
                 Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), dtype))
@@ -75,11 +75,11 @@ macro_rules! shift_ops {
             /// assert_eq!(result.dtype(), DType::Int32);
             /// # Ok::<(), Error>(())
             /// ```
-            pub fn $method(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
-                let dtype = lhs.dtype();
+            pub fn $method(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+                let dtype = self.dtype();
                 Self::check_bitwise_dtype(dtype.clone(), stringify!($method))?;
-                Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
-                Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), dtype))
+                Self::validate_binary_shapes(self, rhs, BinaryOp::$op)?;
+                Ok(Self::new(Op::Binary(BinaryOp::$op, self.clone(), rhs.clone()), dtype))
             }
         )+
     };

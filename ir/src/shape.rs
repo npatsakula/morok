@@ -383,8 +383,27 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         Op::Unique(_) | Op::Device(_) | Op::Noop => None,
 
-        // Define operations have shape (size,)
-        Op::DefineGlobal(size) | Op::DefineLocal(size) => Some(smallvec![SInt::from(*size)]),
+        // Define operations have shape from dtype.size (pointer types)
+        // Following Tinygrad: shape comes from PtrDType.size, not from the id parameter
+        Op::DefineGlobal(_id) | Op::DefineLocal(_id) => {
+            use morok_dtype::DType;
+            match uop.dtype() {
+                DType::Ptr { size: Some(s), .. } => Some(smallvec![SInt::from(s)]),
+                DType::Ptr { size: None, .. } => {
+                    // Unlimited size - represented as -1 following Tinygrad
+                    let neg_one = UOp::const_(DType::Index, ConstValue::Int(-1));
+                    Some(smallvec![SInt::from(neg_one)])
+                }
+                dtype => {
+                    // DefineGlobal/Local must have Ptr dtype (following Tinygrad spec)
+                    return crate::error::DefineGlobalRequiresPtrDTypeSnafu {
+                        op: "DefineGlobal/DefineLocal",
+                        dtype: dtype.clone(),
+                    }
+                    .fail();
+                }
+            }
+        }
 
         // =====================================================================
         // Unary operations - preserve shape

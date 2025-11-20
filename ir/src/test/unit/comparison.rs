@@ -231,7 +231,7 @@ fn test_comparison_chain() {
     assert_eq!(cmp2.dtype(), DType::Bool);
 
     // (a < b) AND (b < c) - both comparisons return Bool
-    let result = UOp::try_and_op(cmp1, cmp2).unwrap();
+    let result = cmp1.try_and_op(&cmp2).unwrap();
     assert_eq!(result.dtype(), DType::Bool);
 }
 
