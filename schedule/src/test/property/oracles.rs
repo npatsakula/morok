@@ -95,10 +95,7 @@ proptest! {
     #[test]
     fn z3_verify_zero_mul(x in arb_var_uop(DType::Int32)) {
         let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(
-            morok_ir::Op::Binary(morok_ir::types::BinaryOp::Mul, Rc::clone(&x), Rc::clone(&zero)),
-            DType::Int32,
-        );
+        let expr = UOp::try_mul_op(x.clone(), zero.clone()).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr.clone());

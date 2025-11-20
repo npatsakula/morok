@@ -67,11 +67,12 @@ impl IndexingContext {
     }
 
     /// Mark a UOp for realization on all axes.
-    pub fn mark_realize_all(&mut self, uop: &Rc<UOp>) {
-        if let Some(shape) = uop.shape() {
+    pub fn mark_realize_all(&mut self, uop: &Rc<UOp>) -> morok_ir::Result<()> {
+        if let Some(shape) = uop.shape()? {
             let axes = (0..shape.len()).collect();
             self.realize_map.insert(UOpKey(Rc::clone(uop)), Some(axes));
         }
+        Ok(())
     }
 
     /// Mark a UOp for realization on specific axes.
@@ -127,27 +128,27 @@ impl IndexingContext {
 ///
 /// A tuple of (transformed_sink, indexing_context)
 #[allow(clippy::mutable_key_type)]
-pub fn run_rangeify(sink: Rc<UOp>) -> (Rc<UOp>, IndexingContext) {
+pub fn run_rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
 
     // Step 1: Generate realize map - determine which UOps need materialization
-    generate_realize_map(&sink, &mut ctx);
+    generate_realize_map(&sink, &mut ctx)?;
 
     // Step 2: Get reverse toposort and consumer map
     let consumer_map = sink.get_consumer_map();
     let reverse_topo = sink.reverse_toposort(&consumer_map);
 
     // Step 3: Assign ranges via reverse traversal
-    assign_ranges(&reverse_topo, &consumer_map, &mut ctx);
+    assign_ranges(&reverse_topo, &consumer_map, &mut ctx)?;
 
     // Step 4: Apply transformations (convert to BUFFERIZE/INDEX)
     let transformed_sink = apply_rangeify_transform(sink, &ctx);
 
-    (transformed_sink, ctx)
+    Ok((transformed_sink, ctx))
 }
 
 /// Generate the realize map - mark which UOps need to be materialized to buffers.
-fn generate_realize_map(sink: &Rc<UOp>, ctx: &mut IndexingContext) {
+fn generate_realize_map(sink: &Rc<UOp>, ctx: &mut IndexingContext) -> morok_ir::Result<()> {
     // Traverse graph and mark realization points
     for node in sink.toposort() {
         match node.op() {
@@ -155,21 +156,21 @@ fn generate_realize_map(sink: &Rc<UOp>, ctx: &mut IndexingContext) {
             Op::Sink { sources } => {
                 for src in sources {
                     if !is_always_contiguous(src) {
-                        ctx.mark_realize_all(src);
+                        ctx.mark_realize_all(src)?;
                     }
                 }
             }
 
             // Always realize these operations
             Op::Copy { .. } | Op::Contiguous { .. } => {
-                ctx.mark_realize_all(&node);
+                ctx.mark_realize_all(&node)?;
             }
 
             // Realize sources of these operations
             Op::MStack { buffers } => {
                 for buf in buffers {
                     if !is_always_contiguous(buf) {
-                        ctx.mark_realize_all(buf);
+                        ctx.mark_realize_all(buf)?;
                     }
                 }
             }
@@ -177,6 +178,7 @@ fn generate_realize_map(sink: &Rc<UOp>, ctx: &mut IndexingContext) {
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// Check if a UOp is always contiguous (doesn't need realization).
@@ -198,7 +200,11 @@ fn is_always_contiguous(uop: &Rc<UOp>) -> bool {
 
 /// Assign input/output ranges for each UOp via reverse toposort traversal.
 #[allow(clippy::mutable_key_type)]
-fn assign_ranges(reverse_topo: &[Rc<UOp>], consumer_map: &HashMap<UOpKey, Vec<Rc<UOp>>>, ctx: &mut IndexingContext) {
+fn assign_ranges(
+    reverse_topo: &[Rc<UOp>],
+    consumer_map: &HashMap<UOpKey, Vec<Rc<UOp>>>,
+    ctx: &mut IndexingContext,
+) -> morok_ir::Result<()> {
     for x in reverse_topo {
         // Skip certain ops
         if matches!(x.op(), Op::Device(_) | Op::Unique(_)) {
@@ -215,7 +221,7 @@ fn assign_ranges(reverse_topo: &[Rc<UOp>], consumer_map: &HashMap<UOpKey, Vec<Rc
         // Determine output ranges
         let out_rngs = if ctx.should_realize(x) {
             // Create new ranges for realized ops
-            if let Some(shape) = x.shape() {
+            if let Some(shape) = x.shape()? {
                 let rngs: Vec<_> = shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect();
 
                 // Mark all axes as realized
@@ -248,7 +254,7 @@ fn assign_ranges(reverse_topo: &[Rc<UOp>], consumer_map: &HashMap<UOpKey, Vec<Rc
             | Op::Pad { src, .. }
             | Op::Shrink { src, .. }
             | Op::Flip { src, .. } => {
-                if let Some(in_shape) = src.shape() {
+                if let Some(in_shape) = src.shape()? {
                     helpers::apply_movement_op(x.op(), in_shape, &out_rngs)
                 } else {
                     out_rngs.clone()
@@ -257,7 +263,7 @@ fn assign_ranges(reverse_topo: &[Rc<UOp>], consumer_map: &HashMap<UOpKey, Vec<Rc
 
             // REDUCE_AXIS creates ranges for reduction axes
             Op::ReduceAxis { src, axes, .. } => {
-                if let Some(in_shape) = src.shape() {
+                if let Some(in_shape) = src.shape()? {
                     let mut rngs = out_rngs.clone();
                     // Extend with reduction ranges
                     for (i, s) in in_shape.iter().enumerate() {
@@ -278,6 +284,7 @@ fn assign_ranges(reverse_topo: &[Rc<UOp>], consumer_map: &HashMap<UOpKey, Vec<Rc
         // Store the range mapping
         ctx.set_ranges(x, in_rngs, out_rngs);
     }
+    Ok(())
 }
 
 /// Apply the rangeify transformation to convert movement ops to BUFFERIZE/INDEX.

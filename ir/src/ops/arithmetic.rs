@@ -49,6 +49,7 @@ macro_rules! binary_arith_ops {
             /// ```
             pub fn $method(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
                 let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+                Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
                 Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), dtype))
             }
         )+
@@ -90,6 +91,7 @@ macro_rules! division_ops {
             pub fn $method(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
                 Self::check_division_by_zero(&rhs)?;
                 let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+                Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
                 Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), dtype))
             }
         )+

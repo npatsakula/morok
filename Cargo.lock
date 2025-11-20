@@ -374,6 +374,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "morok-tensor"
+version = "0.1.0"
+dependencies = [
+ "morok-device",
+ "morok-dtype",
+ "morok-ir",
+ "once_cell",
+ "snafu",
+]
+
+[[package]]
 name = "ndarray"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

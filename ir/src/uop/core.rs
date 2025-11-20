@@ -47,12 +47,12 @@ impl Hash for UOpKey {
 pub struct UOp {
     /// Unique stable ID for this UOp instance.
     /// Used for identity-based caching instead of fragile raw pointers.
-    pub(crate) id: u64,
+    pub id: u64,
     pub(crate) op: Op,
     pub(crate) dtype: DType,
     /// Cached shape - computed lazily on first access.
     /// OnceCell provides thread-safe lazy initialization.
-    pub(crate) shape_cache: std::cell::OnceCell<Option<shape::Shape>>,
+    pub(crate) shape_cache: std::cell::OnceCell<crate::Result<Option<shape::Shape>>>,
     /// Cached list of RANGE operations in this UOp's graph.
     /// Computed lazily via toposort to collect all RANGE ops.
     pub(crate) ranges_cache: std::cell::OnceCell<Vec<Rc<UOp>>>,
@@ -82,7 +82,8 @@ impl UOp {
     /// Get the shape of this UOp.
     ///
     /// Shape is computed lazily on first access and cached.
-    /// Returns None if shape cannot be determined (e.g., for control flow ops).
+    /// Returns Ok(None) if shape cannot be determined (e.g., for control flow ops).
+    /// Returns Err if there is a shape mismatch error.
     ///
     /// # Examples
     ///
@@ -90,12 +91,15 @@ impl UOp {
     /// # use morok_ir::{UOp, ConstValue};
     /// # use morok_dtype::DType;
     /// let scalar = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    /// assert_eq!(scalar.shape().map(|s| s.len()), Some(0)); // Scalar has empty shape
+    /// assert_eq!(scalar.shape().unwrap().as_ref().map(|s| s.len()), Some(0)); // Scalar has empty shape
     /// ```
-    pub fn shape(self: &Rc<Self>) -> Option<&shape::Shape> {
+    pub fn shape(self: &Rc<Self>) -> crate::Result<Option<&shape::Shape>> {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::ShapeProperty;
-        ShapeProperty::get(self).as_ref()
+        match ShapeProperty::get(self) {
+            Ok(opt) => Ok(opt.as_ref()),
+            Err(e) => Err(e.clone()),
+        }
     }
 
     /// Get the minimum possible value of this UOp.
@@ -134,6 +138,42 @@ impl UOp {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::VminVmaxProperty;
         &VminVmaxProperty::get(self).1
+    }
+
+    /// Get the base UOp by walking through movement operations.
+    ///
+    /// Movement operations (RESHAPE, PERMUTE, EXPAND, etc.) are views that don't
+    /// change the underlying data. This method recursively walks through these
+    /// operations to find the actual buffer or computation that owns the data.
+    ///
+    /// Based on Tinygrad's `base` property (ops.py:524-527).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use morok_ir::{UOp, SInt, shape::Shape};
+    /// # use morok_dtype::DType;
+    /// # use morok_device::DeviceSpec;
+    /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
+    /// let shape = Shape::from_iter([SInt::Const(2), SInt::Const(5)]);
+    /// let reshaped = UOp::try_reshape(buffer.clone(), &shape).unwrap();
+    ///
+    /// // base() walks through RESHAPE to get the original BUFFER
+    /// assert!(std::rc::Rc::ptr_eq(&reshaped.base(), &buffer));
+    /// ```
+    pub fn base(self: &Rc<Self>) -> Rc<Self> {
+        match &self.op {
+            // Movement operations - recursively get base of source
+            Op::Reshape { src, .. }
+            | Op::Permute { src, .. }
+            | Op::Expand { src, .. }
+            | Op::Pad { src, .. }
+            | Op::Shrink { src, .. }
+            | Op::Flip { src, .. }
+            | Op::Multi { src, .. } => src.base(),
+            // All other operations are their own base
+            _ => self.clone(),
+        }
     }
 
     /// Topological sort of the computation graph.

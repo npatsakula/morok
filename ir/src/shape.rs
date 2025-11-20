@@ -372,8 +372,8 @@ pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Rc<UOp>, Rc<UOp>) {
 /// - **Movement ops**: Compute shape from operation arguments
 /// - **Reduce ops**: Compute reduced shape
 /// - **Late/control flow ops**: Return None
-pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
-    match uop.op() {
+pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
+    Ok(match uop.op() {
         // =====================================================================
         // Nullary operations
         // =====================================================================
@@ -389,37 +389,52 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         // =====================================================================
         // Unary operations - preserve shape
         // =====================================================================
-        Op::Unary(_, input) => input.shape().cloned(),
+        Op::Unary(_, input) => input.shape()?.cloned(),
 
         // =====================================================================
         // Binary operations - validate shapes match
         // =====================================================================
-        Op::Binary(_, lhs, rhs) => {
-            let lhs_shape = lhs.shape()?;
-            let rhs_shape = rhs.shape()?;
-
-            // Shapes must match for binary ops (no automatic broadcasting)
-            if shapes_equal(lhs_shape, rhs_shape) {
-                Some(lhs_shape.clone())
-            } else {
-                // Shape mismatch - in strict mode this would error
-                // For now, return None (unknown shape)
-                None
+        Op::Binary(op, lhs, rhs) => {
+            match (lhs.shape()?, rhs.shape()?) {
+                (Some(lhs_shape), Some(rhs_shape)) if !shapes_equal(lhs_shape, rhs_shape) => {
+                    // Both have shapes but they differ - ERROR
+                    return BinaryShapeMismatchSnafu {
+                        op: *op,
+                        lhs: Box::new(lhs_shape.clone()),
+                        rhs: Box::new(rhs_shape.clone()),
+                    }
+                    .fail();
+                }
+                (Some(s), _) | (_, Some(s)) => Some(s.clone()),
+                (None, None) => None, // Both shapeless - valid (RANGE + RANGE)
             }
         }
 
         // =====================================================================
         // Ternary operations
         // =====================================================================
-        Op::Ternary(_, _condition, true_val, _false_val) => {
-            // Result has shape of value branches (should match)
-            true_val.shape().cloned()
+        Op::Ternary(_, _condition, true_val, false_val) => {
+            // Result has shape of value branches - they must match
+            let true_shape = true_val.shape()?;
+            let false_shape = false_val.shape()?;
+
+            match (true_shape, false_shape) {
+                (Some(ts), Some(fs)) if !shapes_equal(ts, fs) => {
+                    return crate::error::TernaryBranchShapeMismatchSnafu {
+                        true_branch: Box::new(ts.clone()),
+                        false_branch: Box::new(fs.clone()),
+                    }
+                    .fail();
+                }
+                (Some(s), _) | (_, Some(s)) => Some(s.clone()),
+                (None, None) => None,
+            }
         }
 
         // =====================================================================
         // Type operations - preserve shape
         // =====================================================================
-        Op::Cast { src, .. } | Op::BitCast { src, .. } => src.shape().cloned(),
+        Op::Cast { src, .. } | Op::BitCast { src, .. } => src.shape()?.cloned(),
 
         // =====================================================================
         // Vector operations (kernel-level, no tensor shape)
@@ -437,7 +452,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         }
 
         Op::Permute { axes, src } => {
-            let src_shape = src.shape()?;
+            let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
             // Reorder dimensions according to permutation
             Some(axes.iter().map(|&i| src_shape[i].clone()).collect())
         }
@@ -448,78 +463,81 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         }
 
         Op::Pad { src, begin_pads, end_pads } => {
-            let src_shape = src.shape()?;
-            let ranges = extract_ranges_from_uops(begin_pads, end_pads)?;
+            let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
+            let ranges = extract_ranges_from_uops(begin_pads, end_pads).ok_or_else(|| crate::Error::VoidTypeInOp)?;
 
             if src_shape.len() != ranges.len() {
-                return None;
+                return Ok(None);
             }
 
             // New shape = src_shape + begin_pads + end_pads for each dimension
+            // All padding values must be concrete (checked during construction)
             Some(
                 src_shape
                     .iter()
                     .zip(ranges.iter())
                     .map(|(dim, (begin, end))| {
                         // dim + begin + end
-                        // For now, if all are const we can compute, otherwise create symbolic add
                         if let (Some(d), Some(b), Some(e)) = (dim.as_const(), begin.as_const(), end.as_const()) {
-                            SInt::from(d + b + e)
+                            Ok(SInt::from(d + b + e))
                         } else {
-                            // Would need to create Add UOps - for now approximate
-                            dim.clone()
+                            // Symbolic padding should have been rejected at construction time
+                            // This case should not be reachable if try_pad validates properly
+                            crate::error::SymbolicPaddingUnsupportedSnafu.fail()
                         }
                     })
-                    .collect(),
+                    .collect::<crate::Result<Shape>>()?,
             )
         }
 
         Op::Shrink { src, begins, ends } => {
-            let src_shape = src.shape()?;
-            let ranges = extract_ranges_from_uops(begins, ends)?;
+            let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
+            let ranges = extract_ranges_from_uops(begins, ends).ok_or_else(|| crate::Error::VoidTypeInOp)?;
 
             if src_shape.len() != ranges.len() {
-                return None;
+                return Ok(None);
             }
 
             // New shape = end - begin for each dimension
+            // All shrink values must be concrete (checked during construction)
             Some(
                 ranges
                     .iter()
                     .map(|(begin, end)| {
                         // end - begin
                         if let (Some(b), Some(e)) = (begin.as_const(), end.as_const()) {
-                            if e >= b {
+                            Ok(if e >= b {
                                 SInt::from(e - b)
                             } else {
                                 SInt::from(0) // Invalid shrink
-                            }
+                            })
                         } else {
-                            // Would need to create Sub UOps - approximate for now
-                            SInt::from(1)
+                            // Symbolic shrinking should have been rejected at construction time
+                            // This case should not be reachable if try_shrink validates properly
+                            crate::error::SymbolicShrinkingUnsupportedSnafu.fail()
                         }
                     })
-                    .collect(),
+                    .collect::<crate::Result<Shape>>()?,
             )
         }
 
         Op::Flip { src, .. } => {
             // Flip preserves shape
-            src.shape().cloned()
+            src.shape()?.cloned()
         }
 
         Op::Multi { src, .. } => {
             // Multi scales the specified axis by device count
             // TODO: Need device count from somewhere - for now preserve shape
             // Tinygrad: tuple(s*len(self.device) if a == self.axis else s for a,s in enumerate(ps))
-            src.shape().cloned()
+            src.shape()?.cloned()
         }
 
         // =====================================================================
         // Reduction operations
         // =====================================================================
         Op::ReduceAxis { axes, src, .. } => {
-            let src_shape = src.shape()?;
+            let src_shape = src.shape()?.ok_or_else(|| crate::Error::VoidTypeInOp)?;
             // Set reduced axes to 1 (don't remove them - matches Tinygrad)
             Some(
                 src_shape
@@ -537,7 +555,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
 
         Op::AllReduce { src, .. } => {
             // AllReduce preserves shape
-            src.shape().cloned()
+            src.shape()?.cloned()
         }
 
         // =====================================================================
@@ -548,8 +566,11 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         Op::BufferView { size, .. } => Some(smallvec![SInt::from(*size)]),
 
         // Passthrough operations
-        Op::Copy { src, .. } => src.shape().cloned(),
-        Op::MStack { buffers } => buffers.first().and_then(|b| b.shape().cloned()),
+        Op::Copy { src, .. } => src.shape()?.cloned(),
+        Op::MStack { buffers } => match buffers.first() {
+            Some(b) => b.shape()?.cloned(),
+            None => None,
+        },
 
         // These have no shape
         Op::Bufferize { .. }
@@ -565,19 +586,19 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
         Op::If { .. } | Op::EndIf { .. } | Op::Range { .. } | Op::Barrier { .. } => None,
 
         // End passes through the computation shape
-        Op::End { computation, .. } => computation.shape().cloned(),
+        Op::End { computation, .. } => computation.shape()?.cloned(),
 
         // =====================================================================
         // Special operations
         // =====================================================================
         // MSelect passes through buffer shape
-        Op::MSelect { buffer, .. } => buffer.shape().cloned(),
+        Op::MSelect { buffer, .. } => buffer.shape()?.cloned(),
 
         Op::Special { .. } => None,
 
         Op::DefineVar { .. } => Some(SmallVec::new()), // Variable is scalar
 
-        Op::Bind { value, .. } => value.shape().cloned(),
+        Op::Bind { value, .. } => value.shape()?.cloned(),
 
         Op::DefineReg { size } => Some(smallvec![SInt::from(*size)]),
 
@@ -591,27 +612,27 @@ pub fn infer_shape_from_op(uop: &UOp) -> Option<Shape> {
 
         Op::Kernel { .. } => None,
 
-        Op::Assign { target, .. } => target.shape().cloned(),
+        Op::Assign { target, .. } => target.shape()?.cloned(),
 
         Op::Detach { src } | Op::Contiguous { src } | Op::ContiguousBackward { src } | Op::Precast { src } => {
-            src.shape().cloned()
+            src.shape()?.cloned()
         }
 
-        Op::After { passthrough, .. } => passthrough.shape().cloned(),
+        Op::After { passthrough, .. } => passthrough.shape()?.cloned(),
 
         Op::Custom { .. } | Op::CustomI { .. } => None,
 
         // Graph organization operations have no shape
         Op::Sink { .. } => None,
-        Op::Group { sources } => {
-            // Group passes through first source's shape
-            sources.first().and_then(|src| src.shape().cloned())
-        }
+        Op::Group { sources } => match sources.first() {
+            Some(src) => src.shape()?.cloned(),
+            None => None,
+        },
 
         // PointerIndex is a scalar index operation (no shape)
         Op::PointerIndex { .. } => Some(smallvec![]),
 
         // Cat and PtrCat are kernel-level vector ops (no tensor shape)
         Op::Cat { .. } | Op::PtrCat { .. } => None,
-    }
+    })
 }

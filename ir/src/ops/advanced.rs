@@ -47,6 +47,7 @@ impl UOp {
     /// Returns error if type promotion fails or void type is used.
     pub fn try_max_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
         let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+        Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Max)?;
         Ok(Self::new(Op::Binary(BinaryOp::Max, lhs, rhs), dtype))
     }
 
@@ -56,6 +57,7 @@ impl UOp {
     /// Returns error if type promotion fails or void type is used.
     pub fn try_pow_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
         let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+        Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Pow)?;
         Ok(Self::new(Op::Binary(BinaryOp::Pow, lhs, rhs), dtype))
     }
 
@@ -66,6 +68,7 @@ impl UOp {
     pub fn try_idiv_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
         Self::check_division_by_zero(&rhs)?;
         let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+        Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Idiv)?;
         Ok(Self::new(Op::Binary(BinaryOp::Idiv, lhs, rhs), dtype))
     }
 
@@ -76,13 +79,18 @@ impl UOp {
     pub fn try_fdiv_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
         Self::check_division_by_zero(&rhs)?;
         let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
+        Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Fdiv)?;
         Ok(Self::new(Op::Binary(BinaryOp::Fdiv, lhs, rhs), dtype))
     }
 
     /// Threefry PRNG: threefry(x, key).
-    pub fn threefry_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Rc<Self> {
+    ///
+    /// # Errors
+    /// Returns error if shapes don't match.
+    pub fn threefry_op(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
         let dtype = DType::UInt64; // Threefry always returns uint64
-        Self::new(Op::Binary(BinaryOp::Threefry, lhs, rhs), dtype)
+        Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Threefry)?;
+        Ok(Self::new(Op::Binary(BinaryOp::Threefry, lhs, rhs), dtype))
     }
 
     // =========================================================================
@@ -90,15 +98,25 @@ impl UOp {
     // =========================================================================
 
     /// Conditional selection: condition ? true_val : false_val.
-    pub fn where_op(condition: Rc<Self>, true_val: Rc<Self>, false_val: Rc<Self>) -> Rc<Self> {
+    ///
+    /// # Errors
+    /// Returns error if true_val and false_val have mismatched shapes.
+    pub fn where_op(condition: Rc<Self>, true_val: Rc<Self>, false_val: Rc<Self>) -> Result<Rc<Self>> {
         let dtype = true_val.dtype(); // Result has same dtype as branches
-        Self::new(Op::Ternary(TernaryOp::Where, condition, true_val, false_val), dtype)
+        Self::validate_ternary_shapes(&true_val, &false_val)?;
+        Ok(Self::new(Op::Ternary(TernaryOp::Where, condition, true_val, false_val), dtype))
     }
 
     /// Multiply-accumulate: a * b + c (fused operation).
-    pub fn mulacc_op(a: Rc<Self>, b: Rc<Self>, c: Rc<Self>) -> Rc<Self> {
+    ///
+    /// # Errors
+    /// Returns error if operands have mismatched shapes.
+    pub fn mulacc_op(a: Rc<Self>, b: Rc<Self>, c: Rc<Self>) -> Result<Rc<Self>> {
         let dtype = a.dtype(); // Preserve first operand dtype
-        Self::new(Op::Ternary(TernaryOp::MulAcc, a, b, c), dtype)
+        // Validate all three operands have matching shapes
+        Self::validate_ternary_shapes(&a, &b)?;
+        Self::validate_ternary_shapes(&a, &c)?;
+        Ok(Self::new(Op::Ternary(TernaryOp::MulAcc, a, b, c), dtype))
     }
 
     // =========================================================================

@@ -167,12 +167,12 @@ pub fn should_remove_movement_op(x: &Rc<UOp>, ctx: &IndexingContext) -> bool {
 /// let (result, ctx) = rangeify(x);
 /// println!("Generated {} ranges", ctx.range_counter);
 /// ```
-pub fn rangeify(sink: Rc<UOp>) -> (Rc<UOp>, super::context::RangeifyContext) {
+pub fn rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, super::context::RangeifyContext)> {
     use std::cell::RefCell;
     use std::rc::Rc as StdRc;
 
     // Step 1: Run range assignment to build IndexingContext
-    let (mut sink, indexing_ctx) = super::indexing::run_rangeify(sink);
+    let (mut sink, indexing_ctx) = super::indexing::run_rangeify(sink)?;
 
     // Step 2: Wrap context for pattern access via closure capture
     let ctx = StdRc::new(RefCell::new(indexing_ctx));
@@ -217,5 +217,5 @@ pub fn rangeify(sink: Rc<UOp>) -> (Rc<UOp>, super::context::RangeifyContext) {
         range_map: std::collections::HashMap::new(), // Could populate from indexing_ctx if needed
     };
 
-    (sink, rangeify_ctx)
+    Ok((sink, rangeify_ctx))
 }

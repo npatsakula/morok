@@ -38,6 +38,7 @@ macro_rules! bitwise_binary_ops {
             pub fn $method(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
                 let (lhs, rhs, dtype) = Self::promote_and_cast(lhs, rhs)?;
                 Self::check_bitwise_dtype(dtype.clone(), stringify!($method))?;
+                Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
                 Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), dtype))
             }
         )+
@@ -77,6 +78,7 @@ macro_rules! shift_ops {
             pub fn $method(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
                 let dtype = lhs.dtype();
                 Self::check_bitwise_dtype(dtype.clone(), stringify!($method))?;
+                Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
                 Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), dtype))
             }
         )+

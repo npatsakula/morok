@@ -99,6 +99,90 @@ impl UOp {
         Ok(())
     }
 
+    /// Validate that binary operation operands have compatible shapes.
+    ///
+    /// This enforces exact shape matching (no broadcasting). Both operands must have
+    /// the same shape, or at least one must be shapeless (None).
+    ///
+    /// # Arguments
+    /// * `lhs` - Left-hand side operand
+    /// * `rhs` - Right-hand side operand
+    /// * `op` - Binary operation type (for error reporting)
+    ///
+    /// # Errors
+    /// Returns `BinaryShapeMismatch` if both operands have shapes and they differ
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Same shapes - OK
+    /// validate_binary_shapes(&tensor_3x4, &tensor_3x4, BinaryOp::Add)?;
+    ///
+    /// // Different shapes - ERROR
+    /// validate_binary_shapes(&tensor_3x4, &tensor_5x6, BinaryOp::Add)?;
+    ///
+    /// // Shapeless operands - OK (e.g., RANGE + RANGE)
+    /// validate_binary_shapes(&range_op, &const_op, BinaryOp::Add)?;
+    /// ```
+    pub(super) fn validate_binary_shapes(lhs: &Rc<Self>, rhs: &Rc<Self>, op: crate::BinaryOp) -> Result<()> {
+        use crate::error::BinaryShapeMismatchSnafu;
+        use crate::shape::shapes_equal;
+
+        // Get shapes from both operands
+        let lhs_shape = lhs.shape()?;
+        let rhs_shape = rhs.shape()?;
+
+        // Validate: either shapes match or at least one is None
+        match (lhs_shape, rhs_shape) {
+            (Some(ls), Some(rs)) if !shapes_equal(ls, rs) => {
+                // Both have shapes but they differ - ERROR
+                BinaryShapeMismatchSnafu { op, lhs: Box::new(ls.clone()), rhs: Box::new(rs.clone()) }.fail()
+            }
+            _ => Ok(()), // Either shapes match or at least one is None
+        }
+    }
+
+    /// Validate that ternary operation branches have matching shapes.
+    ///
+    /// For ternary operations like WHERE and MULACC, the value branches
+    /// must have compatible shapes.
+    ///
+    /// # Arguments
+    /// * `true_val` - True branch value
+    /// * `false_val` - False branch value
+    ///
+    /// # Errors
+    /// Returns `TernaryBranchShapeMismatch` if both branches have shapes and they differ
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Same shapes - OK
+    /// validate_ternary_shapes(&tensor_3x4, &tensor_3x4)?;
+    ///
+    /// // Different shapes - ERROR
+    /// validate_ternary_shapes(&tensor_3x4, &tensor_5x6)?;
+    /// ```
+    pub(super) fn validate_ternary_shapes(true_val: &Rc<Self>, false_val: &Rc<Self>) -> Result<()> {
+        use crate::error::TernaryBranchShapeMismatchSnafu;
+        use crate::shape::shapes_equal;
+
+        // Get shapes from both branches
+        let true_shape = true_val.shape()?;
+        let false_shape = false_val.shape()?;
+
+        // Validate: either shapes match or at least one is None
+        match (true_shape, false_shape) {
+            (Some(ts), Some(fs)) if !shapes_equal(ts, fs) => {
+                // Both have shapes but they differ - ERROR
+                TernaryBranchShapeMismatchSnafu {
+                    true_branch: Box::new(ts.clone()),
+                    false_branch: Box::new(fs.clone()),
+                }
+                .fail()
+            }
+            _ => Ok(()), // Either shapes match or at least one is None
+        }
+    }
+
     /// Validate permutation is valid (all indices 0..n, no duplicates).
     ///
     /// A valid permutation must:
@@ -156,7 +240,6 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `ReduceAxisInvalid` if any axis is out of bounds
-    #[allow(dead_code)]
     pub(super) fn validate_reduce_axes(axes: &[usize], shape_dims: usize) -> Result<()> {
         use crate::error::ReduceAxisInvalidSnafu;
         use snafu::ensure;

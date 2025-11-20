@@ -123,7 +123,7 @@ fn test_broadcast_shapes_multiple() {
 #[test]
 fn test_infer_const_shape() {
     let scalar = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let shape = scalar.shape().expect("Const should have shape");
+    let shape = scalar.shape().unwrap().expect("Const should have shape");
     assert_eq!(shape.len(), 0); // Scalar has empty shape
 }
 
@@ -132,14 +132,14 @@ fn test_infer_vconst_shape() {
     let values = vec![ConstValue::Float(1.0), ConstValue::Float(2.0), ConstValue::Float(3.0), ConstValue::Float(4.0)];
     let vec = UOp::new(crate::Op::VConst { values: values.clone() }, DType::Float32.vec(4));
     // VConst is a kernel-level op and returns None (matches Tinygrad)
-    assert!(vec.shape().is_none(), "VConst should return None for shape");
+    assert!(vec.shape().unwrap().is_none(), "VConst should return None for shape");
 }
 
 #[test]
 fn test_infer_unary_shape() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
     let neg = UOp::neg_op(val);
-    let shape = neg.shape().expect("Unary should have shape");
+    let shape = neg.shape().unwrap().expect("Unary should have shape");
     assert_eq!(shape.len(), 0); // Preserves scalar shape
 }
 
@@ -148,7 +148,7 @@ fn test_infer_binary_shape() {
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
     let add = UOp::try_add_op(a, b).unwrap();
-    let shape = add.shape().expect("Binary should have shape");
+    let shape = add.shape().unwrap().expect("Binary should have shape");
     assert_eq!(shape.len(), 0); // Both scalars -> scalar result
 }
 
@@ -156,7 +156,7 @@ fn test_infer_binary_shape() {
 fn test_infer_cast_shape() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.5));
     let cast = UOp::cast(val, DType::Int32);
-    let shape = cast.shape().expect("Cast should preserve shape");
+    let shape = cast.shape().unwrap().expect("Cast should preserve shape");
     assert_eq!(shape.len(), 0);
 }
 
@@ -164,8 +164,8 @@ fn test_infer_cast_shape() {
 fn test_shape_caching() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     // First access computes shape
-    let shape1 = val.shape().expect("Should have shape");
+    let shape1 = val.shape().unwrap().expect("Should have shape");
     // Second access uses cached value (same pointer)
-    let shape2 = val.shape().expect("Should have cached shape");
+    let shape2 = val.shape().unwrap().expect("Should have cached shape");
     assert!(std::ptr::eq(shape1, shape2), "Shape should be cached");
 }

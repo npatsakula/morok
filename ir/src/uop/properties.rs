@@ -24,8 +24,8 @@ cached_property! {
     /// Cached shape property.
     ///
     /// Computes the shape of a UOp via shape inference rules.
-    /// Shape is `None` for control flow operations (SINK, END, KERNEL, etc.)
-    /// and `Some(shape)` for tensor operations.
+    /// Returns `Ok(None)` for control flow operations (SINK, END, KERNEL, etc.),
+    /// `Ok(Some(shape))` for tensor operations, and `Err` for shape mismatches.
     ///
     /// # Example
     ///
@@ -33,9 +33,9 @@ cached_property! {
     /// use morok_ir::uop::properties::ShapeProperty;
     /// use morok_ir::uop::cached_property::CachedProperty;
     ///
-    /// let shape = ShapeProperty::get(&my_uop);
+    /// let shape_result = ShapeProperty::get(&my_uop);
     /// ```
-    ShapeProperty: Option<crate::shape::Shape> {
+    ShapeProperty: crate::Result<Option<crate::shape::Shape>> {
         cache_field: shape_cache,
         compute: |uop| crate::shape::infer_shape_from_op(uop)
     }

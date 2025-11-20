@@ -6,7 +6,7 @@ use crate::shape::Shape;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, Clone, PartialEq, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
     /// DType mismatch in binary operation.
@@ -87,6 +87,10 @@ pub enum Error {
     #[snafu(display("shape mismatch: cannot perform elementwise operation on shapes {lhs_shape:?} and {rhs_shape:?}"))]
     ShapeMismatch { lhs_shape: Vec<usize>, rhs_shape: Vec<usize> },
 
+    /// Shape mismatch in binary operation.
+    #[snafu(display("Shape mismatch in {op:?}: {lhs:?} vs {rhs:?}"))]
+    BinaryShapeMismatch { op: crate::types::BinaryOp, lhs: Box<Shape>, rhs: Box<Shape> },
+
     /// Reshape contains negative dimension.
     #[snafu(display("reshape contains negative dimension in {shape:?}"))]
     ReshapeNegativeDimension { shape: SmallVec<[isize; 4]> },
@@ -94,4 +98,18 @@ pub enum Error {
     /// Broadcasting shape mismatch.
     #[snafu(display("cannot broadcast shapes {lhs:?} and {rhs:?}"))]
     BroadcastShapeMismatch { lhs: Box<Shape>, rhs: Box<Shape> },
+
+    /// Symbolic padding unsupported.
+    #[snafu(display("symbolic padding is not supported: padding dimensions must be concrete values"))]
+    SymbolicPaddingUnsupported,
+
+    /// Symbolic shrinking unsupported.
+    #[snafu(display("symbolic shrinking is not supported: shrink ranges must be concrete values"))]
+    SymbolicShrinkingUnsupported,
+
+    /// Ternary branch shape mismatch.
+    #[snafu(display(
+        "ternary operation branches have mismatched shapes: true branch {true_branch:?} vs false branch {false_branch:?}"
+    ))]
+    TernaryBranchShapeMismatch { true_branch: Box<Shape>, false_branch: Box<Shape> },
 }

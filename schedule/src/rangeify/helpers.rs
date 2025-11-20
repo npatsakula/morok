@@ -1,7 +1,7 @@
 //! Helper functions for rangeify pattern matching and transformations.
 
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp};
+use morok_ir::{BinaryOp, ConstValue, Op, SInt, TernaryOp, UOp};
 use std::rc::Rc;
 
 /// Check if a constant value is the identity element for a given binary operation.
@@ -78,8 +78,7 @@ pub fn is_const(uop: &Rc<UOp>, value: &ConstValue) -> bool {
 ///
 /// A tensor has zero size if any dimension in its shape is 0.
 pub fn is_zero_size(uop: &Rc<UOp>) -> bool {
-    use morok_ir::SInt;
-    uop.shape().map(|shape| shape.iter().any(|dim| matches!(dim, SInt::Const(0)))).unwrap_or(false)
+    uop.shape().ok().flatten().map(|shape| shape.iter().any(|dim| matches!(dim, SInt::Const(0)))).unwrap_or(false)
 }
 
 /// Check if a dtype is void (used for side-effecting operations).

@@ -8,76 +8,56 @@ use std::rc::Rc;
 use super::super::{Op, Result, UOp};
 
 impl UOp {
-    /// Reshape tensor to new shape.
+    /// Reshape tensor to new shape (low-level, UOp-based constructor).
     ///
-    /// # Shape Parameters
-    /// The `new_shape` parameter should contain Index-typed values representing
-    /// the target dimensions. This is validated at runtime or during codegen.
-    pub fn reshape(src: Rc<Self>, new_shape: Rc<Self>) -> Rc<Self> {
+    /// Takes a UOp for the shape parameter (used internally by compiler passes).
+    /// For the public API with validation, use `try_reshape`.
+    pub(crate) fn reshape(src: Rc<Self>, new_shape: Rc<Self>) -> Rc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Reshape { src, new_shape }, dtype)
     }
 
-    /// Permute dimensions according to axes.
+    /// Permute dimensions (low-level, UOp-based constructor).
     ///
-    /// # Errors
-    /// Returns error if permutation is invalid (not a valid permutation of 0..n).
-    ///
-    /// Note: Validation only occurs if source shape can be inferred.
-    pub fn try_permute(src: Rc<Self>, axes: Vec<usize>) -> Result<Rc<Self>> {
-        // TODO: Validate permutation using symbolic shape system
-        // Shape validation will be done when shape inference is implemented
-        // if let Some(src_shape) = src.shape() {
-        //     Self::validate_permutation(&axes, src_shape.len())?;
-        // }
+    /// For the public API with validation, use `try_permute`.
+    pub(crate) fn permute(src: Rc<Self>, axes: Vec<usize>) -> Rc<Self> {
         let dtype = src.dtype();
-        Ok(Self::new(Op::Permute { src, axes }, dtype))
+        Self::new(Op::Permute { src, axes }, dtype)
     }
 
-    /// Expand (broadcast) dimensions.
+    /// Expand (broadcast) dimensions (low-level, UOp-based constructor).
     ///
-    /// # Shape Parameters
-    /// The `new_shape` parameter should contain Index-typed values representing
-    /// the target dimensions. This is validated at runtime or during codegen.
-    pub fn expand(src: Rc<Self>, new_shape: Rc<Self>) -> Rc<Self> {
+    /// Takes a UOp for the shape parameter (used internally by compiler passes).
+    /// For the public API with validation, use `try_expand`.
+    pub(crate) fn expand(src: Rc<Self>, new_shape: Rc<Self>) -> Rc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Expand { src, new_shape }, dtype)
     }
 
-    /// Pad tensor with begin and end padding for each dimension.
+    /// Pad tensor (low-level, UOp-based constructor).
     ///
-    /// # Shape Parameters
-    /// The `begin_pads` and `end_pads` parameters should contain Index-typed
-    /// values. This is validated at runtime or during codegen.
-    pub fn pad(src: Rc<Self>, begin_pads: Rc<Self>, end_pads: Rc<Self>) -> Rc<Self> {
+    /// Takes UOps for padding parameters (used internally by compiler passes).
+    /// For the public API with validation, use `try_pad`.
+    pub(crate) fn pad(src: Rc<Self>, begin_pads: Rc<Self>, end_pads: Rc<Self>) -> Rc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Pad { src, begin_pads, end_pads }, dtype)
     }
 
-    /// Shrink (slice) tensor with begin and end indices for each dimension.
+    /// Shrink (slice) tensor (low-level, UOp-based constructor).
     ///
-    /// # Shape Parameters
-    /// The `begins` and `ends` parameters should contain Index-typed values
-    /// representing the slice ranges. This is validated at runtime or during codegen.
-    pub fn shrink(src: Rc<Self>, begins: Rc<Self>, ends: Rc<Self>) -> Rc<Self> {
+    /// Takes UOps for range parameters (used internally by compiler passes).
+    /// For the public API with validation, use `try_shrink`.
+    pub(crate) fn shrink(src: Rc<Self>, begins: Rc<Self>, ends: Rc<Self>) -> Rc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Shrink { src, begins, ends }, dtype)
     }
 
-    /// Flip (reverse) specified axes.
+    /// Flip (reverse) axes (low-level, UOp-based constructor).
     ///
-    /// # Errors
-    /// Returns error if flip specification length doesn't match shape dimensions.
-    ///
-    /// Note: Validation only occurs if source shape can be inferred.
-    pub fn try_flip(src: Rc<Self>, axes: Vec<bool>) -> Result<Rc<Self>> {
-        // TODO: Validate flip axes using symbolic shape system
-        // Shape validation will be done when shape inference is implemented
-        // if let Some(src_shape) = src.shape() {
-        //     Self::validate_flip_axes(&axes, src_shape.len())?;
-        // }
+    /// For the public API with validation, use `try_flip`.
+    pub(crate) fn flip(src: Rc<Self>, axes: Vec<bool>) -> Rc<Self> {
         let dtype = src.dtype();
-        Ok(Self::new(Op::Flip { src, axes }, dtype))
+        Self::new(Op::Flip { src, axes }, dtype)
     }
 
     /// Multi-device split along axis.
@@ -88,7 +68,7 @@ impl UOp {
 }
 
 // =========================================================================
-// Validated Movement Operation Constructors (Tinygrad-style)
+// Primary Movement Operation Constructors (with validation)
 // =========================================================================
 
 impl UOp {
@@ -111,9 +91,9 @@ impl UOp {
     /// let new_shape = smallvec![SInt::from(1), SInt::from(1)];
     /// let shape_uop = shape::shape_to_uop(&new_shape);
     /// // This would work: scalar (product=1) -> [1,1] (product=1)
-    /// // let reshaped = UOp::try_reshape_validated(src, &new_shape);
+    /// // let reshaped = UOp::try_reshape(src, &new_shape);
     /// ```
-    pub fn try_reshape_validated(src: Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
+    pub fn try_reshape(src: Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
         use crate::error::ReshapeNegativeDimensionSnafu;
         use crate::error::ReshapeSizeMismatchSnafu;
         use crate::shape::shape_to_uop;
@@ -128,7 +108,7 @@ impl UOp {
         }
 
         // Validate product equality if source shape is known
-        if let Some(src_shape) = src.shape() {
+        if let Some(src_shape) = src.shape()? {
             let src_product = crate::sint_prod(src_shape);
             let dst_product = crate::sint_prod(new_shape);
 
@@ -152,13 +132,13 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if validation fails.
-    pub fn try_expand_validated(src: Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
+    pub fn try_expand(src: Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
         use crate::error::ExpandDimensionMismatchSnafu;
         use crate::error::ExpandInvalidDimensionSnafu;
         use crate::shape::shape_to_uop;
         use snafu::ensure;
 
-        if let Some(src_shape) = src.shape() {
+        if let Some(src_shape) = src.shape()? {
             // Check dimension count
             ensure!(
                 src_shape.len() == new_shape.len(),
@@ -190,9 +170,9 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if permutation is invalid.
-    pub fn try_permute_validated(src: Rc<Self>, axes: Vec<usize>) -> Result<Rc<Self>> {
+    pub fn try_permute(src: Rc<Self>, axes: Vec<usize>) -> Result<Rc<Self>> {
         // Validate permutation if source shape is known
-        if let Some(src_shape) = src.shape() {
+        if let Some(src_shape) = src.shape()? {
             Self::validate_permutation(&axes, src_shape.len())?;
         }
 
@@ -203,23 +183,28 @@ impl UOp {
     /// Pad with strict validation.
     ///
     /// Validates:
-    /// - Padding values are non-negative
+    /// - Padding values are concrete (not symbolic)
     /// - Number of padding pairs matches dimensions
     ///
     /// # Errors
-    /// Returns error if validation fails.
-    pub fn try_pad_validated(src: Rc<Self>, padding: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
-        use crate::error::PadDimensionMismatchSnafu;
+    /// Returns error if validation fails or if padding contains symbolic values.
+    pub fn try_pad(src: Rc<Self>, padding: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
+        use crate::error::{PadDimensionMismatchSnafu, SymbolicPaddingUnsupportedSnafu};
         use crate::shape::ranges_to_uops;
         use snafu::ensure;
 
-        if let Some(src_shape) = src.shape() {
+        // Check for symbolic padding values
+        for (begin, end) in padding {
+            ensure!(begin.is_const(), SymbolicPaddingUnsupportedSnafu);
+            ensure!(end.is_const(), SymbolicPaddingUnsupportedSnafu);
+        }
+
+        if let Some(src_shape) = src.shape()? {
             // Check dimension count
             ensure!(
                 padding.len() == src_shape.len(),
                 PadDimensionMismatchSnafu { padding_dims: padding.len(), shape_dims: src_shape.len() }
             );
-            // Note: No need to validate non-negative padding since SInt::Const uses usize
         }
 
         let (begin_pads, end_pads) = ranges_to_uops(padding);
@@ -230,27 +215,33 @@ impl UOp {
     /// Shrink (slice) with strict validation.
     ///
     /// Validates:
+    /// - Range values are concrete (not symbolic)
     /// - begin <= end for each dimension
     /// - 0 <= begin, end <= dimension_size
     ///
     /// # Errors
-    /// Returns error if validation fails.
-    pub fn try_shrink_validated(src: Rc<Self>, ranges: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
-        use crate::error::ShrinkBoundsViolationSnafu;
+    /// Returns error if validation fails or if ranges contain symbolic values.
+    pub fn try_shrink(src: Rc<Self>, ranges: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
+        use crate::error::{ShrinkBoundsViolationSnafu, SymbolicShrinkingUnsupportedSnafu};
         use crate::shape::ranges_to_uops;
         use snafu::ensure;
 
-        if let Some(src_shape) = src.shape() {
+        // Check for symbolic range values
+        for (begin, end) in ranges {
+            ensure!(begin.is_const(), SymbolicShrinkingUnsupportedSnafu);
+            ensure!(end.is_const(), SymbolicShrinkingUnsupportedSnafu);
+        }
+
+        if let Some(src_shape) = src.shape()? {
             // Validate each range
             for (dim_idx, ((begin, end), dim_size)) in ranges.iter().zip(src_shape.iter()).enumerate() {
-                // If all are concrete, validate bounds
+                // All are concrete now (checked above), validate bounds
                 if let (Some(b), Some(e), Some(s)) = (begin.as_const(), end.as_const(), dim_size.as_const()) {
                     ensure!(
                         b <= e && e <= s,
                         ShrinkBoundsViolationSnafu { dim: dim_idx, begin: b, end: e, shape_size: s }
                     );
                 }
-                // Symbolic values can't be validated at compile time
             }
         }
 
@@ -266,8 +257,8 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if specification is invalid.
-    pub fn try_flip_validated(src: Rc<Self>, axes: Vec<bool>) -> Result<Rc<Self>> {
-        if let Some(src_shape) = src.shape() {
+    pub fn try_flip(src: Rc<Self>, axes: Vec<bool>) -> Result<Rc<Self>> {
+        if let Some(src_shape) = src.shape()? {
             Self::validate_flip_axes(&axes, src_shape.len())?;
         }
 

@@ -17,7 +17,7 @@ fn test_reshape_basic() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar
     let new_shape: Shape = smallvec![SInt::from(1), SInt::from(1)];
 
-    let result = UOp::try_reshape_validated(val, &new_shape).unwrap();
+    let result = UOp::try_reshape(val, &new_shape).unwrap();
     assert_eq!(result.dtype(), DType::Float32);
 }
 
@@ -26,7 +26,7 @@ fn test_reshape_size_must_match() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar (size=1)
     let bad_shape: Shape = smallvec![SInt::from(2), SInt::from(3)]; // size=6
 
-    let result = UOp::try_reshape_validated(val, &bad_shape);
+    let result = UOp::try_reshape(val, &bad_shape);
     assert!(matches!(result, Err(Error::ReshapeSizeMismatch { input_size: 1, output_size: 6 })));
 }
 
@@ -39,7 +39,7 @@ fn test_permute_empty_on_scalar() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar
 
     let perm = vec![]; // Empty permutation for scalar
-    let result = UOp::try_permute_validated(val, perm).unwrap();
+    let result = UOp::try_permute(val, perm).unwrap();
     assert_eq!(result.dtype(), DType::Float32);
 }
 
@@ -48,7 +48,7 @@ fn test_permute_invalid_on_scalar() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar
 
     let bad_perm = vec![0, 1]; // Not valid for scalar (empty shape)
-    let result = UOp::try_permute_validated(val, bad_perm);
+    let result = UOp::try_permute(val, bad_perm);
     assert!(matches!(result, Err(Error::PermuteInvalidPermutation { .. })));
 }
 
@@ -69,7 +69,7 @@ fn test_expand_dimension_mismatch() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar (0 dims)
     let new_shape: Shape = smallvec![SInt::from(3), SInt::from(5)]; // 2 dims
 
-    let result = UOp::try_expand_validated(val, &new_shape);
+    let result = UOp::try_expand(val, &new_shape);
     assert!(matches!(result, Err(Error::ExpandDimensionMismatch { input_dims: 0, output_dims: 2 })));
 }
 
@@ -84,7 +84,7 @@ fn test_pad_dimension_mismatch() {
     // Padding for 2 dimensions but scalar has 0
     let padding = vec![(SInt::from(0), SInt::from(0)), (SInt::from(1), SInt::from(1))];
 
-    let result = UOp::try_pad_validated(val, &padding);
+    let result = UOp::try_pad(val, &padding);
     assert!(matches!(result, Err(Error::PadDimensionMismatch { padding_dims: 2, shape_dims: 0 })));
 }
 
@@ -95,7 +95,7 @@ fn test_pad_empty_on_scalar() {
     // Empty padding for scalar
     let padding = vec![];
 
-    let result = UOp::try_pad_validated(val, &padding).unwrap();
+    let result = UOp::try_pad(val, &padding).unwrap();
     assert_eq!(result.dtype(), DType::Float32);
 }
 
@@ -110,7 +110,7 @@ fn test_shrink_empty_on_scalar() {
     // Empty ranges for scalar
     let ranges = vec![];
 
-    let result = UOp::try_shrink_validated(val, &ranges).unwrap();
+    let result = UOp::try_shrink(val, &ranges).unwrap();
     assert_eq!(result.dtype(), DType::Float32);
 }
 
@@ -125,7 +125,7 @@ fn test_flip_dimension_mismatch() {
     // Flip spec for 2 dimensions but scalar has 0
     let flip_spec = vec![true, false];
 
-    let result = UOp::try_flip_validated(val, flip_spec);
+    let result = UOp::try_flip(val, flip_spec);
     assert!(matches!(result, Err(Error::FlipInvalidSpec { expected_dims: 0, got_dims: 2 })));
 }
 
@@ -136,7 +136,7 @@ fn test_flip_empty_on_scalar() {
     // Empty flip spec for scalar
     let flip_spec = vec![];
 
-    let result = UOp::try_flip_validated(val, flip_spec).unwrap();
+    let result = UOp::try_flip(val, flip_spec).unwrap();
     assert_eq!(result.dtype(), DType::Float32);
 }
 
@@ -160,12 +160,12 @@ fn test_movement_ops_preserve_dtype() {
     // Reshape preserves dtype
     let val_int = UOp::const_(DType::Int64, ConstValue::Int(42));
     let shape: Shape = smallvec![SInt::from(1)];
-    let reshaped = UOp::try_reshape_validated(val_int, &shape).unwrap();
+    let reshaped = UOp::try_reshape(val_int, &shape).unwrap();
     assert_eq!(reshaped.dtype(), DType::Int64);
 
     // Permute preserves dtype
     let val_float = UOp::const_(DType::Float64, ConstValue::Float(std::f64::consts::PI));
-    let permuted = UOp::try_permute_validated(val_float, vec![]).unwrap();
+    let permuted = UOp::try_permute(val_float, vec![]).unwrap();
     assert_eq!(permuted.dtype(), DType::Float64);
 
     // Multi preserves dtype

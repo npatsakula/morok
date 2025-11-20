@@ -222,7 +222,7 @@ fn test_for_each_child() {
 fn test_shape_property_scalar() {
     // Scalar constant should have empty shape
     let scalar = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let shape = scalar.shape();
+    let shape = scalar.shape().unwrap();
 
     assert!(shape.is_some(), "Scalar should have shape");
     assert_eq!(shape.unwrap().len(), 0, "Scalar should have empty shape");
@@ -242,7 +242,7 @@ fn test_shape_property_lazy_evaluation() {
 
     // First access triggers computation
     let shape1 = ShapeProperty::get(&add);
-    assert!(shape1.is_some());
+    assert!(shape1.is_ok() && shape1.as_ref().unwrap().is_some());
 
     // VERIFY: Cache is now populated
     assert!(ShapeProperty::cache(&add).get().is_some(), "Cache should be populated after first access");
@@ -449,7 +449,7 @@ fn test_multiple_properties_coexist() {
     let add = UOp::try_add_op(a, b).unwrap();
 
     // Access shape property (const operations have shape)
-    let shape = add.shape();
+    let shape = add.shape().unwrap();
     assert!(shape.is_some());
     assert_eq!(shape.unwrap().len(), 0); // Scalar
 
@@ -462,7 +462,7 @@ fn test_multiple_properties_coexist() {
     assert_eq!(in_scope.len(), 0);
 
     // All should be cached independently
-    let shape2 = add.shape();
+    let shape2 = add.shape().unwrap();
     let ranges2 = add.ranges();
     let in_scope2 = add.in_scope_ranges();
 

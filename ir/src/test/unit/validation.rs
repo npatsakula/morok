@@ -114,7 +114,7 @@ fn test_reshape_size_mismatch() {
     // Try to reshape scalar (size=1) to [2, 2] (size=4) - mismatch
     let output_shape: Shape = smallvec![SInt::from(2), SInt::from(2)];
 
-    let result = UOp::try_reshape_validated(val, &output_shape);
+    let result = UOp::try_reshape(val, &output_shape);
     assert!(matches!(result, Err(Error::ReshapeSizeMismatch { input_size: 1, output_size: 4 })));
 }
 
@@ -123,12 +123,12 @@ fn test_reshape_negative_dimension() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
     // SInt uses usize, so we need to pass negative value differently
-    // Actually, try_reshape_validated checks for negative in symbolic dims
+    // Actually, try_reshape checks for negative in symbolic dims
     // Since SInt::Const uses usize, we can't represent negative
     // This error is mainly for future symbolic shape support
     // For now, test that positive values work
     let shape: crate::shape::Shape = smallvec![SInt::from(1)];
-    let result = UOp::try_reshape_validated(val, &shape);
+    let result = UOp::try_reshape(val, &shape);
     assert!(result.is_ok());
 }
 
@@ -162,7 +162,7 @@ fn test_expand_dimension_mismatch() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar (empty shape)
     let output_shape: Shape = smallvec![SInt::from(3), SInt::from(5)]; // 2 dimensions
 
-    let result = UOp::try_expand_validated(val, &output_shape);
+    let result = UOp::try_expand(val, &output_shape);
     assert!(matches!(result, Err(Error::ExpandDimensionMismatch { input_dims: 0, output_dims: 2 })));
 }
 
@@ -183,12 +183,12 @@ fn test_permute_invalid_permutation() {
 
     // Invalid: permutation for scalar should be empty
     let bad_perm = vec![0, 1];
-    let result = UOp::try_permute_validated(val.clone(), bad_perm);
+    let result = UOp::try_permute(val.clone(), bad_perm);
     assert!(matches!(result, Err(Error::PermuteInvalidPermutation { .. })));
 
     // Valid: empty permutation for scalar
     let good_perm = vec![];
-    let result = UOp::try_permute_validated(val, good_perm);
+    let result = UOp::try_permute(val, good_perm);
     assert!(result.is_ok());
 }
 
@@ -199,7 +199,7 @@ fn test_pad_dimension_mismatch() {
     // Padding for 2 dimensions but scalar has 0
     let padding = vec![(SInt::from(0), SInt::from(0)), (SInt::from(1), SInt::from(1))];
 
-    let result = UOp::try_pad_validated(val, &padding);
+    let result = UOp::try_pad(val, &padding);
     assert!(matches!(result, Err(Error::PadDimensionMismatch { padding_dims: 2, shape_dims: 0 })));
 }
 
@@ -210,7 +210,7 @@ fn test_flip_invalid_spec() {
     // Flip spec for 2 dimensions but scalar has 0
     let flip_spec = vec![true, false];
 
-    let result = UOp::try_flip_validated(val, flip_spec);
+    let result = UOp::try_flip(val, flip_spec);
     assert!(matches!(result, Err(Error::FlipInvalidSpec { expected_dims: 0, got_dims: 2 })));
 }
 
@@ -270,7 +270,7 @@ fn test_where_condition_must_be_bool() {
     let false_val = UOp::const_(DType::Float32, ConstValue::Float(0.0));
 
     // Should succeed - non-bool conditions are allowed (interpreted as C-style boolean)
-    let _result = UOp::where_op(non_bool_cond, true_val, false_val);
+    let _result = UOp::where_op(non_bool_cond, true_val, false_val).unwrap();
 }
 
 #[test]
@@ -280,7 +280,7 @@ fn test_where_branch_dtype_compatibility() {
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
     let float_val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
 
-    let result = UOp::where_op(condition, int_val, float_val);
+    let result = UOp::where_op(condition, int_val, float_val).unwrap();
     // Result dtype comes from first non-condition argument (true_val)
     assert_eq!(result.dtype(), DType::Int32);
 }
@@ -292,7 +292,7 @@ fn test_mulacc_preserves_first_operand_dtype() {
     let int_c = UOp::const_(DType::Int32, ConstValue::Int(4));
 
     // MulAcc preserves first operand dtype (a in a*b+c)
-    let result = UOp::mulacc_op(float_a, float_b, int_c);
+    let result = UOp::mulacc_op(float_a, float_b, int_c).unwrap();
     assert_eq!(result.dtype(), DType::Float32);
 }
 

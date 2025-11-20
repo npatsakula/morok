@@ -311,6 +311,7 @@ macro_rules! cmp_ops {
                 pub fn $name(lhs: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
                     // Use type promotion to validate types and find common type
                     let (lhs, rhs, _) = Self::promote_and_cast(lhs.clone(), rhs.clone())?;
+                    Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
                     Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), DType::Bool))
                 }
             )*

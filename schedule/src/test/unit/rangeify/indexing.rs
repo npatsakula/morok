@@ -25,6 +25,6 @@ fn test_indexing_context_realize_map() {
 
     assert!(!ctx.should_realize(&x));
 
-    ctx.mark_realize_all(&x);
+    ctx.mark_realize_all(&x).unwrap();
     assert!(ctx.should_realize(&x));
 }

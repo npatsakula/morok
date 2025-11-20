@@ -29,7 +29,7 @@ fn test_symbolic_range_size() {
     let bufferized = create_bufferize(compute, vec![range]);
 
     // Symbolic ranges work correctly and create kernels
-    let (_result, _ctx) = rangeify(bufferized);
+    let (_result, _ctx) = rangeify(bufferized).unwrap();
 
     // Note: Dead-axis optimization is skipped for symbolic ranges
     // TODO: Enhance dead-axis detection to handle provably-dead symbolic ranges
@@ -49,7 +49,7 @@ fn test_symbolic_range_multiple() {
     let bufferized = create_bufferize(compute.clone(), vec![range1, range2]);
 
     // Symbolic ranges work correctly with multiple dimensions
-    let (_result, _ctx) = rangeify(bufferized);
+    let (_result, _ctx) = rangeify(bufferized).unwrap();
 
     // Note: Dead-axis optimization is skipped for symbolic ranges
     // TODO: Enhance dead-axis detection to handle provably-dead symbolic ranges
@@ -66,7 +66,7 @@ fn test_symbolic_range_with_arithmetic() {
     let bufferized = create_bufferize(compute, vec![range]);
 
     // Symbolic arithmetic expressions work correctly as range sizes
-    let (_result, _ctx) = rangeify(bufferized);
+    let (_result, _ctx) = rangeify(bufferized).unwrap();
 
     // Note: Dead-axis optimization is skipped for symbolic ranges
     // TODO: Enhance dead-axis detection to handle provably-dead symbolic ranges
@@ -92,7 +92,7 @@ fn test_nested_bufferize_different_ranges() {
     let outer_buf = create_bufferize(inner_buf, vec![outer_range]);
 
     // Should handle nested bufferization without crashing
-    let (_result, _ctx) = rangeify(outer_buf);
+    let (_result, _ctx) = rangeify(outer_buf).unwrap();
 
     // Note: Tests robustness - nested BUFFERIZE operations should be handled gracefully
 }
@@ -112,7 +112,7 @@ fn test_deeply_nested_bufferize() {
     let buf3 = create_bufferize(buf2, vec![r3]);
 
     // Should handle deep nesting without crashing
-    let (_result, _ctx) = rangeify(buf3);
+    let (_result, _ctx) = rangeify(buf3).unwrap();
 
     // Note: Tests that deeply nested BUFFERIZE operations don't cause stack overflow or panics
 }
@@ -139,7 +139,7 @@ fn test_bufferize_multiple_consumers() {
     let sink = UOp::new(Op::Sink { sources: vec![consumer1, consumer2].into() }, DType::Float32);
 
     // Should handle multi-consumer pattern without crashing
-    let (_result, _ctx) = rangeify(sink);
+    let (_result, _ctx) = rangeify(sink).unwrap();
 
     // Note: Tests that multiple consumers of the same BUFFERIZE don't cause issues
 }
@@ -161,7 +161,7 @@ fn test_operation_with_multiple_uses() {
     let sink = UOp::new(Op::Sink { sources: vec![buf1, buf2].into() }, DType::Float32);
 
     // Should handle same operation bufferized with different ranges
-    let (_result, _ctx) = rangeify(sink);
+    let (_result, _ctx) = rangeify(sink).unwrap();
 
     // Note: Tests that same compute can be buffered with different iteration spaces
 }
@@ -186,7 +186,7 @@ fn test_index_with_multiple_ranges() {
         DType::Float32,
     );
 
-    let (_result, _ctx) = rangeify(index_op);
+    let (_result, _ctx) = rangeify(index_op).unwrap();
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn test_range_size_mismatch() {
     let bufferized = create_bufferize(compute, vec![const_range, sym_range]);
 
     // Mixed constant and symbolic ranges work correctly
-    let (_result, _ctx) = rangeify(bufferized);
+    let (_result, _ctx) = rangeify(bufferized).unwrap();
 
     // Note: Dead-axis optimization is skipped for symbolic ranges
     // TODO: Enhance dead-axis detection to handle provably-dead symbolic ranges
