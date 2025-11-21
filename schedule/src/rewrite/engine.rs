@@ -169,6 +169,15 @@ impl<'a> RewriteEngine<'a> {
     /// Caches the final replacement mapping from original to rewritten UOp.
     fn stage2_link(&mut self, original: &Rc<UOp>, rewritten: Rc<UOp>) {
         let key = Self::uop_key(original);
+
+        // Record provenance if UOp was actually rewritten
+        if !Rc::ptr_eq(original, &rewritten) {
+            use morok_ir::provenance::{PassName, PROVENANCE_TRACKER};
+            PROVENANCE_TRACKER.with(|tracker| {
+                tracker.borrow_mut().record_transform(rewritten.id, original.id, PassName::RewritePattern);
+            });
+        }
+
         self.replacement_cache.insert(key, rewritten);
     }
 

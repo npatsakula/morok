@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::op::Op;
-use crate::types::{BinaryOp, ConstValue};
+use crate::types::{AxisType, BinaryOp, ConstValue};
 use crate::uop::UOp;
 
 impl UOp {
@@ -268,6 +268,30 @@ impl UOp {
         }
 
         None
+    }
+
+    /// Create a new RANGE UOp with a different axis type.
+    ///
+    /// This is a convenience method for the optimizer to convert ranges between
+    /// axis types (e.g., LOOP → GLOBAL for parallelization).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a non-RANGE operation.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let loop_range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Loop);
+    /// let global_range = loop_range.with_axis_type(AxisType::Global);
+    /// // global_range has same size and axis_id, but different axis type
+    /// ```
+    pub fn with_axis_type(self: &Rc<Self>, new_type: AxisType) -> Rc<Self> {
+        if let Op::Range { end, axis_id, axis_type: _ } = self.op() {
+            Self::range_axis(end.clone(), *axis_id, new_type)
+        } else {
+            panic!("with_axis_type() called on non-RANGE operation: {:?}", self.op);
+        }
     }
 }
 

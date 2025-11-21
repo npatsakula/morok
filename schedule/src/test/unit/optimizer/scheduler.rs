@@ -1143,3 +1143,165 @@ fn test_group_no_shared_memory() {
         assert!(matches!(e, OptError::UnsupportedFeature { .. }));
     }
 }
+
+// ===== Phase 7: Initialization & Finalization Tests =====
+
+#[test]
+fn test_convert_loop_to_global_gpu() {
+    // Create a simple kernel with LOOP axes
+    let loop1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Loop);
+    let loop2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 1, AxisType::Loop);
+
+    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let sink = UOp::sink(vec![val, loop1.clone(), loop2.clone()]);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Convert LOOP to GLOBAL
+    scheduler.convert_loop_to_global().unwrap();
+
+    // Verify that LOOP axes were converted to GLOBAL
+    let ranges = scheduler.rngs();
+    assert_eq!(ranges.len(), 2);
+
+    for rng in ranges {
+        if let Op::Range { axis_type, .. } = rng.op() {
+            assert_eq!(*axis_type, AxisType::Global);
+        } else {
+            panic!("Expected RANGE operation");
+        }
+    }
+}
+
+#[test]
+fn test_convert_loop_to_global_cpu() {
+    // Create a simple kernel with LOOP axes
+    let loop1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Loop);
+    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let sink = UOp::sink(vec![val, loop1.clone()]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Convert should be a no-op for CPU
+    scheduler.convert_loop_to_global().unwrap();
+
+    // Verify that LOOP axes were NOT converted (CPU doesn't have local memory)
+    let ranges = scheduler.rngs();
+    assert_eq!(ranges.len(), 1);
+
+    if let Op::Range { axis_type, .. } = ranges[0].op() {
+        assert_eq!(*axis_type, AxisType::Loop);
+    }
+}
+
+#[test]
+fn test_get_optimized_ast_reduce_kernel() {
+    // Create a reduction kernel
+    let r_global = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Global);
+    let r_local = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(8)), 1, AxisType::Local);
+    let r_reduce = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(32)), 2, AxisType::Reduce);
+    let r_upcast = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(4)), 3, AxisType::Upcast);
+
+    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let reduce = UOp::reduce(val, vec![r_reduce.clone()].into(), ReduceOp::Add);
+    let sink = UOp::sink(vec![reduce, r_global, r_local, r_upcast]);
+
+    let ren = Renderer::cuda();
+    let scheduler = Scheduler::new(sink, ren);
+
+    // Get optimized AST
+    let optimized = scheduler.get_optimized_ast(None);
+
+    // Verify metadata is attached
+    use crate::optimizer::KernelInfo;
+    let info = optimized.metadata::<KernelInfo>();
+    assert!(info.is_some());
+
+    let info = info.unwrap();
+    // Kernel name should be: r_g16l8R32u4
+    assert!(info.name.starts_with("r_"));
+    assert!(info.name.contains("g16"));
+    assert!(info.name.contains("l8"));
+    assert!(info.name.contains("R32"));
+    assert!(info.name.contains("u4"));
+}
+
+#[test]
+fn test_get_optimized_ast_elementwise_kernel() {
+    // Create an elementwise kernel (no reduction)
+    let r_global = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(256)), 0, AxisType::Global);
+
+    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let sink = UOp::sink(vec![val, r_global]);
+
+    let ren = Renderer::cuda();
+    let scheduler = Scheduler::new(sink, ren);
+
+    // Get optimized AST
+    let optimized = scheduler.get_optimized_ast(None);
+
+    // Verify metadata is attached
+    use crate::optimizer::KernelInfo;
+    let info = optimized.metadata::<KernelInfo>();
+    assert!(info.is_some());
+
+    let info = info.unwrap();
+    // Kernel name should be: E_g256
+    assert!(info.name.starts_with("E_"));
+    assert!(info.name.contains("g256"));
+}
+
+#[test]
+fn test_get_optimized_ast_custom_name() {
+    let r_global = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Global);
+    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let sink = UOp::sink(vec![val, r_global]);
+
+    let ren = Renderer::cuda();
+    let scheduler = Scheduler::new(sink, ren);
+
+    // Get optimized AST with custom name
+    let optimized = scheduler.get_optimized_ast(Some("custom_kernel".to_string()));
+
+    // Verify custom name is used
+    use crate::optimizer::KernelInfo;
+    let info = optimized.metadata::<KernelInfo>();
+    assert!(info.is_some());
+
+    let info = info.unwrap();
+    assert_eq!(info.name, "custom_kernel");
+}
+
+#[test]
+fn test_phase7_integration() {
+    // Full Phase 7 integration test: LOOP → GLOBAL → optimize → finalize
+    let loop1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Loop);
+    let loop2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 1, AxisType::Loop);
+
+    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let sink = UOp::sink(vec![val, loop1, loop2]);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // 1. Convert LOOP to GLOBAL
+    scheduler.convert_loop_to_global().unwrap();
+
+    // 2. Apply some optimizations
+    let opt = Opt::upcast(0, 4);
+    apply_opt(&mut scheduler, &opt, true).unwrap();
+
+    // 3. Get optimized AST
+    let optimized = scheduler.get_optimized_ast(None);
+
+    // 4. Verify metadata contains applied opts
+    use crate::optimizer::KernelInfo;
+    let info = optimized.metadata::<KernelInfo>();
+    assert!(info.is_some());
+
+    let info = info.unwrap();
+    assert_eq!(info.applied_opts.len(), 1);
+    assert_eq!(info.applied_opts[0].op, OptOps::UPCAST);
+}

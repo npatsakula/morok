@@ -17,12 +17,15 @@
 // Module declarations
 pub mod error;
 pub mod indexing;
+pub mod kernel_info;
 pub mod op;
 pub mod ops;
 pub mod shape;
 pub mod sint;
 pub mod types;
 pub mod uop;
+
+pub mod provenance;
 
 #[cfg(any(test, feature = "proptest"))]
 pub mod test;

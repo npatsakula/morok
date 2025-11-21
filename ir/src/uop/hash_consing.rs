@@ -220,6 +220,7 @@ impl UOp {
     ///
     /// If an identical UOp already exists, returns a reference to it.
     /// Otherwise, creates a new UOp and caches it.
+    #[track_caller]
     pub fn new(op: Op, dtype: DType) -> Rc<Self> {
         let key = UOpKey::new(&op, dtype.clone());
 
@@ -242,6 +243,13 @@ impl UOp {
                 ranges_cache: std::cell::OnceCell::new(),
                 in_scope_ranges_cache: std::cell::OnceCell::new(),
                 vmin_vmax_cache: std::cell::OnceCell::new(),
+                metadata: None,
+            });
+
+            // Capture provenance information
+            use crate::provenance::PROVENANCE_TRACKER;
+            PROVENANCE_TRACKER.with(|tracker| {
+                tracker.borrow_mut().capture(uop.id, std::panic::Location::caller());
             });
 
             // Cache it
@@ -249,5 +257,45 @@ impl UOp {
 
             uop
         })
+    }
+
+    /// Attach metadata to this UOp, creating a new instance.
+    ///
+    /// Metadata is NOT part of hash consing - this method creates a new UOp
+    /// with a different ID but the same operation structure. This allows
+    /// attaching metadata (like kernel info) after optimization.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let ast = /* ... optimized AST ... */;
+    /// let with_info = ast.with_metadata(KernelInfo::new("r_g16l16", vec![], false));
+    /// ```
+    pub fn with_metadata<T: std::any::Any + Send + Sync + 'static>(self: &Rc<Self>, metadata: T) -> Rc<Self> {
+        Rc::new(Self {
+            id: next_uop_id(),
+            op: self.op.clone(),
+            dtype: self.dtype.clone(),
+            shape_cache: std::cell::OnceCell::new(),
+            ranges_cache: std::cell::OnceCell::new(),
+            in_scope_ranges_cache: std::cell::OnceCell::new(),
+            vmin_vmax_cache: std::cell::OnceCell::new(),
+            metadata: Some(std::sync::Arc::new(metadata)),
+        })
+    }
+
+    /// Get metadata of a specific type if it exists.
+    ///
+    /// Returns `None` if no metadata is attached or if the metadata is of a different type.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// if let Some(info) = ast.metadata::<KernelInfo>() {
+    ///     println!("Kernel name: {}", info.name);
+    /// }
+    /// ```
+    pub fn metadata<T: std::any::Any + Send + Sync>(&self) -> Option<std::sync::Arc<T>> {
+        self.metadata.as_ref()?.clone().downcast::<T>().ok()
     }
 }

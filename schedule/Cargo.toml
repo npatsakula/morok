@@ -18,6 +18,7 @@ snafu = "0.8.9"
 default = []
 z3 = ["dep:z3"]
 proptest = ["dep:proptest-derive", "morok-ir/proptest"]
+serde = ["morok-ir/serde"]
 
 [dev-dependencies]
 proptest = "1.9.0"

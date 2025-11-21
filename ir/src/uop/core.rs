@@ -66,6 +66,15 @@ pub struct UOp {
     /// Computed lazily via range propagation through the computation graph.
     /// Returns (vmin, vmax) as ConstValue types.
     pub(crate) vmin_vmax_cache: std::cell::OnceCell<(ConstValue, ConstValue)>,
+    /// Optional metadata attached to this UOp.
+    ///
+    /// Metadata is NOT part of hash consing - attaching metadata creates a new UOp
+    /// instance with a different ID. This is used for kernel info (name, opts) after
+    /// optimization is complete.
+    ///
+    /// Uses Arc<dyn Any> to allow attaching any metadata type without circular
+    /// dependencies (e.g., schedule::KernelInfo).
+    pub(crate) metadata: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl UOp {
@@ -500,6 +509,12 @@ impl UOp {
 
         // Check if this UOp is in the substitution map
         if let Some(replacement) = map.get(&UOpKey(self.clone())) {
+            // Record substitution transformation
+            use crate::provenance::{PassName, PROVENANCE_TRACKER};
+            PROVENANCE_TRACKER.with(|tracker| {
+                tracker.borrow_mut().record_transform(replacement.id, self.id, PassName::Substitute);
+            });
+
             return replacement.clone();
         }
 
@@ -944,7 +959,15 @@ impl UOp {
             }
         };
 
-        Self::new(new_op, self.dtype.clone())
+        let new_uop = Self::new(new_op, self.dtype.clone());
+
+        // Record transformation in provenance tracker
+        use crate::provenance::{PassName, PROVENANCE_TRACKER};
+        PROVENANCE_TRACKER.with(|tracker| {
+            tracker.borrow_mut().record_transform(new_uop.id, self.id, PassName::Substitute);
+        });
+
+        new_uop
     }
 
     /// Reconstruct this UOp with new sources.
@@ -1229,6 +1252,7 @@ impl Clone for UOp {
             ranges_cache: std::cell::OnceCell::new(),
             in_scope_ranges_cache: std::cell::OnceCell::new(),
             vmin_vmax_cache: std::cell::OnceCell::new(),
+            metadata: self.metadata.clone(),
         }
     }
 }

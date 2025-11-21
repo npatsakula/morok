@@ -43,12 +43,14 @@
 //! ```
 
 pub mod error;
+pub mod kernel_info;
 pub mod opts;
 pub mod renderer;
 pub mod scheduler;
 pub mod types;
 
 // Re-exports
+pub use kernel_info::KernelInfo;
 pub use opts::apply_opt;
 pub use renderer::{Renderer, TcOpt, TensorCore};
 pub use scheduler::Scheduler;

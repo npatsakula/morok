@@ -119,3 +119,21 @@ pub enum Error {
     ))]
     DefineGlobalRequiresPtrDType { op: &'static str, dtype: DType },
 }
+
+/// Enhance an error with provenance information for a UOp.
+///
+/// This function retrieves the provenance chain for a UOp and prints it to stderr,
+/// providing detailed debugging information about the operation's origin and
+/// transformation history.
+pub fn log_provenance(uop_id: u64, error: &Error) {
+    use crate::provenance::{PROVENANCE_TRACKER, format_chain};
+
+    PROVENANCE_TRACKER.with(|tracker| {
+        let chain = tracker.borrow().get_chain(uop_id);
+        if !chain.is_empty() {
+            eprintln!("\nError in UOp {} with provenance:", uop_id);
+            eprintln!("{}", error);
+            eprintln!("\nProvenance chain:{}", format_chain(&chain));
+        }
+    });
+}

@@ -7,7 +7,7 @@ use std::cell::OnceCell;
 use std::fmt;
 use std::rc::Rc;
 
-use morok_ir::{AxisType, Op, UOp};
+use morok_ir::{AxisType, Op, UOp, UOpKey};
 
 use super::error::*;
 use super::renderer::Renderer;
@@ -672,13 +672,259 @@ impl Scheduler {
         #[allow(clippy::mutable_key_type)] // UOpKey uses stable ID for Hash/Eq (safe)
         let mut subst_map = HashMap::new();
         subst_map.insert(UOpKey(rng), sub_axis);
+
+        let old_ast_id = self.ast.id;
         self.ast = self.ast.substitute(&subst_map);
+
+        // Record high-level transformation
+        if old_ast_id != self.ast.id {
+            use morok_ir::provenance::{PassName, PROVENANCE_TRACKER};
+            PROVENANCE_TRACKER.with(|tracker| {
+                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ShiftTo);
+            });
+        }
 
         // Clear caches (maxarg will be recomputed on next access)
         self.clear_caches();
 
         // 6. Return both ranges
         Ok((replaced_rng, new_rng))
+    }
+
+    // ==== Phase 7: Initialization & Finalization ====
+
+    /// Get all ranges from output operations (excluding REDUCE axes).
+    ///
+    /// Returns ranges that appear in output buffers. These are candidates for
+    /// parallelization since they represent independent output elements.
+    ///
+    /// Based on Tinygrad's `_output_rngs()`.
+    fn output_rngs(&self) -> Vec<Rc<UOp>> {
+        // Find all STORE operations (outputs)
+        let stores: Vec<_> = self
+            .ast
+            .toposort()
+            .into_iter()
+            .filter(|node| matches!(node.op(), Op::Store { .. } | Op::Sink { .. }))
+            .collect();
+
+        if stores.is_empty() {
+            return vec![];
+        }
+
+        // Get ranges from all stores, excluding REDUCE axes
+        let mut output_ranges = Vec::new();
+        for store in stores {
+            // Use backward_slice to get all dependencies
+            let deps = store.backward_slice();
+            for dep in deps {
+                if let Op::Range { axis_type, .. } = dep.op() {
+                    // Include all non-REDUCE ranges
+                    if *axis_type != AxisType::Reduce {
+                        // Only add if not already in list (use pointer equality)
+                        if !output_ranges.iter().any(|r: &Rc<UOp>| Rc::ptr_eq(r, &dep)) {
+                            output_ranges.push(dep);
+                        }
+                    }
+                }
+            }
+        }
+
+        output_ranges
+    }
+
+    /// Get LOOP ranges that can be safely parallelized to GLOBAL.
+    ///
+    /// A range is globalizable if:
+    /// 1. It's currently a LOOP axis
+    /// 2. It appears in all output operations (STORE nodes)
+    ///
+    /// This ensures parallelizing the range won't cause race conditions.
+    ///
+    /// Based on Tinygrad's `_globalizable_rngs()`.
+    fn globalizable_rngs(&self) -> Vec<Rc<UOp>> {
+        // Start with LOOP axes from outputs
+        let mut candidates: Vec<_> = self
+            .output_rngs()
+            .into_iter()
+            .filter(|r| if let Op::Range { axis_type, .. } = r.op() { *axis_type == AxisType::Loop } else { false })
+            .collect();
+
+        // Find all STORE operations
+        let stores: Vec<_> =
+            self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Store { .. })).collect();
+
+        if stores.is_empty() {
+            return candidates;
+        }
+
+        // Keep only ranges that appear in ALL stores
+        for store in &stores {
+            let store_deps = store.backward_slice();
+            let store_ranges: Vec<_> =
+                store_deps.into_iter().filter(|dep| matches!(dep.op(), Op::Range { .. })).collect();
+
+            // Filter candidates to keep only those in this store's ranges
+            candidates.retain(|candidate| store_ranges.iter().any(|r| Rc::ptr_eq(r, candidate)));
+        }
+
+        candidates
+    }
+
+    /// Convert eligible LOOP axes to GLOBAL for parallelization.
+    ///
+    /// This is the initial transformation that identifies which loops can be
+    /// safely parallelized and converts them to GLOBAL (GPU thread) axes.
+    ///
+    /// Only applicable for GPU backends (has_local=true).
+    ///
+    /// Based on Tinygrad's `convert_loop_to_global()`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let renderer = Renderer::cuda();
+    /// let mut scheduler = Scheduler::new(ast, renderer);
+    /// scheduler.convert_loop_to_global()?;
+    /// // LOOP axes that appear in all outputs are now GLOBAL
+    /// ```
+    pub fn convert_loop_to_global(&mut self) -> Result<(), OptError> {
+        // Only for GPU backends
+        if !self.ren.has_local {
+            return Ok(());
+        }
+
+        let globalizable = self.globalizable_rngs();
+        if globalizable.is_empty() {
+            return Ok(());
+        }
+
+        // Build substitution map: LOOP → GLOBAL
+        #[allow(clippy::mutable_key_type)]
+        let mut subst_map = std::collections::HashMap::new();
+        for rng in globalizable {
+            let new_rng = rng.with_axis_type(AxisType::Global);
+            subst_map.insert(UOpKey(rng), new_rng);
+        }
+
+        // Apply substitution
+        let old_ast_id = self.ast.id;
+        self.ast = self.ast.substitute(&subst_map);
+
+        // Record high-level transformation
+        if old_ast_id != self.ast.id {
+            use morok_ir::provenance::{PassName, PROVENANCE_TRACKER};
+            PROVENANCE_TRACKER.with(|tracker| {
+                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ConvertLoopToGlobal);
+            });
+        }
+
+        self.clear_caches();
+
+        Ok(())
+    }
+
+    /// Flatten nested ranges in REDUCE operations.
+    ///
+    /// Ensures ranges are stored in canonical flat order by collecting all
+    /// RANGE operations via toposort and replacing them in sorted order.
+    ///
+    /// Based on Tinygrad's `pm_flatten_range` pattern.
+    ///
+    /// Note: In Morok's IR, ranges are typically already flat. This method
+    /// ensures canonical ordering for REDUCE operations.
+    fn flatten_ranges(&self, ast: Rc<UOp>) -> Rc<UOp> {
+        // For REDUCE operations at the top level, flatten their range lists
+        if let Op::Reduce { reduce_op, ranges, src } = ast.op() {
+            // Sink all ranges together and toposort to ensure canonical order
+            let sink = UOp::sink(ranges.iter().cloned().collect());
+            let flattened: Vec<_> =
+                sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
+
+            // Recreate REDUCE with flattened ranges
+            UOp::reduce(src.clone(), flattened.into(), *reduce_op)
+        } else {
+            // No flattening needed for other operations
+            ast
+        }
+    }
+
+    /// Get the optimized AST with kernel metadata attached.
+    ///
+    /// This is the final step of optimization, which:
+    /// 1. Generates a kernel name from the shape (e.g., "r_g16l16R32u4")
+    /// 2. Flattens nested ranges
+    /// 3. Attaches KernelInfo metadata
+    ///
+    /// # Arguments
+    ///
+    /// * `name_override` - Optional custom kernel name (otherwise auto-generated)
+    ///
+    /// # Returns
+    ///
+    /// UOp with attached KernelInfo metadata containing name, applied_opts, and flags.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let optimized = scheduler.get_optimized_ast(None);
+    /// let info = optimized.metadata::<KernelInfo>().unwrap();
+    /// println!("Kernel: {}", info.name); // "r_g16l16R32u4"
+    /// ```
+    pub fn get_optimized_ast(&self, name_override: Option<String>) -> Rc<UOp> {
+        use crate::optimizer::KernelInfo;
+
+        // 1. Generate kernel name
+        let name = name_override.unwrap_or_else(|| {
+            // Prefix: "r" for reduce, "E" for elementwise
+            let prefix = if self.reduceop().is_some() { "r" } else { "E" };
+
+            // Encode each range: {letter}{size}
+            // Based on Tinygrad's axis_letters mapping
+            let shape_parts: Vec<String> = self
+                .rngs()
+                .iter()
+                .filter_map(|rng| {
+                    if let Op::Range { end, axis_type, .. } = rng.op() {
+                        // Get size if constant
+                        let size = if let Op::Const(cv) = end.op()
+                            && let morok_ir::ConstValue::Int(sz) = cv.0
+                        {
+                            sz.to_string()
+                        } else {
+                            "?".to_string()
+                        };
+
+                        // Get letter for axis type
+                        let letter = match axis_type {
+                            AxisType::Global => "g",
+                            AxisType::Local => "l",
+                            AxisType::Loop => "L",
+                            AxisType::Upcast => "u",
+                            AxisType::Reduce => "R",
+                            AxisType::GroupReduce => "G",
+                            AxisType::Unroll => "r",
+                            AxisType::Warp => "w",
+                            AxisType::Thread => "t",
+                            AxisType::Outer => "O",
+                        };
+
+                        Some(format!("{}{}", letter, size))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            format!("{}_{}", prefix, shape_parts.join(""))
+        });
+
+        // 2. Flatten ranges
+        let flattened_ast = self.flatten_ranges(self.ast.clone());
+
+        // 3. Attach metadata
+        let info = KernelInfo { name, applied_opts: self.applied_opts.clone(), dont_use_locals: self.dont_use_locals };
+        flattened_ast.with_metadata(info)
     }
 }
 
