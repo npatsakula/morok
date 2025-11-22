@@ -12,11 +12,15 @@ macro_rules! impl_tensor_ops {
         unary_infallible { $($inf_method:ident => $inf_uop:ident),* $(,)? }
         unary_fallible { $($fall_method:ident => $fall_uop:ident),* $(,)? }
     ) => {
-        // Binary operations
+        // Binary operations (with automatic broadcasting)
         $(
             #[track_caller]
             pub fn $bin_method(&self, other: &Tensor) -> Result<Tensor> {
-                self.uop.$bin_uop(&other.uop).map(Self::new).context(UOpSnafu)
+                // Broadcast tensors to common shape
+                let (lhs, rhs) = self.broadcast_for_binop(other)?;
+
+                // Now call UOp operation with matching shapes
+                lhs.uop.$bin_uop(&rhs.uop).map(Self::new).context(UOpSnafu)
             }
         )*
 
@@ -88,13 +92,12 @@ impl Tensor {
         let true_scalar = Self::from_slice([true]);
         let self_shape = as_bool.shape()?;
 
-        let true_broadcast = if !self_shape.is_empty() {
-            let shape_vec: Vec<isize> = self_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
-            let ones_shape = vec![1isize; self_shape.len()];
-            let true_reshaped = true_scalar.try_reshape(&ones_shape)?;
-            true_reshaped.try_expand(&shape_vec)?
-        } else {
+        let true_broadcast = if self_shape.is_empty() {
+            // Input is scalar - reshape [1] to []
             true_scalar.try_reshape(&[])?
+        } else {
+            // Broadcast to match non-scalar shape
+            true_scalar.broadcast_to(&self_shape)?
         };
 
         // Compare: !x ≡ (x != true)
@@ -130,13 +133,13 @@ impl Tensor {
 
         // Broadcast one to match self shape
         let self_shape = self.shape()?;
-        let one_broadcast = if !self_shape.is_empty() {
-            let shape_vec: Vec<isize> = self_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
-            let ones_shape = vec![1isize; self_shape.len()];
-            let one_reshaped = one_scalar.try_reshape(&ones_shape)?;
-            one_reshaped.try_expand(&shape_vec)?
-        } else {
+
+        let one_broadcast = if self_shape.is_empty() {
+            // Input is scalar - reshape [1] to []
             one_scalar.try_reshape(&[])?
+        } else {
+            // Broadcast to match non-scalar shape
+            one_scalar.broadcast_to(&self_shape)?
         };
 
         negated.try_sub(&one_broadcast)
@@ -210,17 +213,20 @@ mod tests {
 
     #[test]
     fn test_shape_mismatch_error() {
-        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-        let b = Tensor::from_slice([4.0f32, 5.0]);
+        // Test incompatible shapes that cannot be broadcasted
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]); // Shape [3]
+        let b = Tensor::from_slice([4.0f32, 5.0]); // Shape [2]
 
         let result = a.try_add(&b);
         assert!(result.is_err());
 
-        if let Err(Error::UOp { source: morok_ir::Error::BinaryShapeMismatch { op: _, lhs, rhs } }) = result {
-            assert_eq!(lhs.len(), 1);
-            assert_eq!(rhs.len(), 1);
-        } else {
-            panic!("Expected BinaryShapeMismatch error");
+        // With broadcasting, this now gives a BroadcastShapeMismatch error
+        // (dimension 0: cannot broadcast 3 to 2 or vice versa)
+        match result {
+            Err(Error::UOp { source: morok_ir::Error::BroadcastShapeMismatch { .. } }) => {
+                // Expected - shapes [3] and [2] cannot be broadcasted
+            }
+            _ => panic!("Expected BroadcastShapeMismatch error"),
         }
     }
 

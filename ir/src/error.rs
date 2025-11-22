@@ -107,6 +107,10 @@ pub enum Error {
     #[snafu(display("symbolic shrinking is not supported: shrink ranges must be concrete values"))]
     SymbolicShrinkingUnsupported,
 
+    /// Symbolic shape unsupported.
+    #[snafu(display("symbolic shape is not supported for {operation}: shape dimensions must be concrete values"))]
+    SymbolicShapeUnsupported { operation: String },
+
     /// Ternary branch shape mismatch.
     #[snafu(display(
         "ternary operation branches have mismatched shapes: true branch {true_branch:?} vs false branch {false_branch:?}"

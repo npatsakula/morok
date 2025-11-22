@@ -5,59 +5,23 @@
 
 use morok_ir::{ConstValue, UOp};
 
-use crate::{Error, Result, Tensor, reduce::AxisSpec};
+use crate::{Result, Tensor, reduce::AxisSpec};
 
 impl Tensor {
     /// Helper to broadcast a scalar constant to match this tensor's shape.
     ///
-    /// Creates a constant, reshapes it to [1, 1, ..., 1] with same rank,
-    /// then expands to match the full shape.
+    /// Uses the broadcast_to method which supports symbolic shapes.
     fn broadcast_scalar(&self, value: ConstValue) -> Result<Self> {
         let shape = self.shape()?;
-        let shape_vec: Vec<isize> = shape.iter().filter_map(|s| s.as_const().map(|v| v as isize)).collect();
-
         let scalar = Self::new(UOp::const_(self.uop.dtype(), value));
-
-        // Scalar case - no broadcasting needed
-        if shape_vec.is_empty() {
-            return Ok(scalar);
-        }
-
-        // Reshape to [1, 1, ..., 1]
-        let ones_shape: Vec<isize> = vec![1; shape_vec.len()];
-        let reshaped = scalar.try_reshape(&ones_shape)?;
-
-        // Expand to target shape
-        reshaped.try_expand(&shape_vec)
+        scalar.broadcast_to(&shape)
     }
 
     /// Helper to broadcast this tensor to a target shape.
     ///
-    /// Assumes this tensor is a scalar or has shape that can be broadcast.
+    /// Uses the broadcast_to method which supports symbolic shapes.
     fn broadcast_to_shape(&self, target_shape: &morok_ir::shape::Shape) -> Result<Self> {
-        let target_vec: Vec<isize> = target_shape.iter().filter_map(|s| s.as_const().map(|v| v as isize)).collect();
-
-        let my_shape = self.shape()?;
-
-        // Already matching shape
-        if my_shape.len() == target_shape.len() {
-            return Ok(self.clone());
-        }
-
-        // Scalar to ND
-        if my_shape.is_empty() {
-            let ones_shape: Vec<isize> = vec![1; target_vec.len()];
-            let reshaped = self.try_reshape(&ones_shape)?;
-            return reshaped.try_expand(&target_vec);
-        }
-
-        // For now, only support scalar broadcasting
-        Err(Error::UOp {
-            source: morok_ir::Error::ExpandDimensionMismatch {
-                input_dims: my_shape.len(),
-                output_dims: target_vec.len(),
-            },
-        })
+        self.broadcast_to(target_shape)
     }
 
     /// Rectified Linear Unit: `max(0, x)`.

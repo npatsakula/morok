@@ -248,6 +248,63 @@ impl Tensor {
         self.uop.shape().context(UOpSnafu)?.cloned().ok_or(Error::ShapeUnknown)
     }
 
+    /// Get the number of dimensions (rank) of this tensor.
+    ///
+    /// This is equivalent to `len(tensor.shape)` in NumPy/PyTorch.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let scalar = Tensor::from_slice([5.0f32]);  // Shape [1]
+    /// assert_eq!(scalar.ndim()?, 1);
+    ///
+    /// let matrix = Tensor::from_slice([1.0f32; 6]).try_reshape(&[2, 3])?;
+    /// assert_eq!(matrix.ndim()?, 2);
+    /// ```
+    pub(crate) fn ndim(&self) -> Result<usize> {
+        Ok(self.shape()?.len())
+    }
+
+    /// Get the size of a specific dimension.
+    ///
+    /// Supports negative indexing (e.g., -1 for last dimension).
+    /// Returns a SInt which can be either concrete (Const) or symbolic.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let t = Tensor::from_slice([1.0f32; 6]).try_reshape(&[2, 3])?;
+    /// assert_eq!(t.dim(0)?.as_const(), Some(2));   // First dimension
+    /// assert_eq!(t.dim(1)?.as_const(), Some(3));   // Second dimension
+    /// assert_eq!(t.dim(-1)?.as_const(), Some(3));  // Last dimension (negative indexing)
+    /// assert_eq!(t.dim(-2)?.as_const(), Some(2));  // Second-to-last dimension
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns error if axis is out of range.
+    pub(crate) fn dim(&self, axis: isize) -> Result<morok_ir::SInt> {
+        let shape = self.shape()?;
+        let idx = Self::normalize_axis(axis, shape.len())?;
+        Ok(shape[idx].clone())
+    }
+
+    /// Get the concrete size of a specific dimension.
+    ///
+    /// Like `dim()`, but returns an error if the dimension is symbolic.
+    /// Use this when you need a concrete usize value (e.g., for buffer allocation).
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Axis is out of range
+    /// - Dimension is symbolic (non-concrete)
+    pub(crate) fn dim_concrete(&self, axis: isize) -> Result<usize> {
+        self.dim(axis)?
+            .as_const()
+            .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: format!("dim_concrete({})", axis) })
+    }
+
     /// Normalize a single axis index (handle negative indices).
     pub(crate) fn normalize_axis(axis: isize, ndim: usize) -> Result<usize> {
         if axis < 0 {
@@ -284,12 +341,6 @@ impl Tensor {
     fn resolve_shape_with_inference(&self, shape_spec: &[isize]) -> Result<Shape> {
         let current_shape = self.shape()?;
 
-        // Count total elements in current shape
-        let total_elements = current_shape
-            .iter()
-            .try_fold(1usize, |acc, dim| dim.as_const().map(|v| acc * v))
-            .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "reshape".to_string() })?;
-
         // Find -1 position and validate
         let minus_one_pos = shape_spec.iter().position(|&s| s == -1);
         let has_multiple_minus_one = shape_spec.iter().filter(|&&s| s == -1).count() > 1;
@@ -303,6 +354,12 @@ impl Tensor {
 
         // Calculate new shape
         let new_shape: Shape = if let Some(_infer_pos) = minus_one_pos {
+            // Inference requires concrete shape to compute total elements
+            let total_elements = current_shape
+                .iter()
+                .try_fold(1usize, |acc, dim| dim.as_const().map(|v| acc * v))
+                .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "reshape with -1 inference".to_string() })?;
+
             // Calculate product of known dimensions
             let known_product: usize = shape_spec.iter().filter(|&&s| s > 0).map(|&s| s as usize).product();
 
@@ -318,7 +375,7 @@ impl Tensor {
                 .map(|&s| if s == -1 { SInt::Const(inferred_dim) } else { SInt::Const(s as usize) })
                 .collect()
         } else {
-            // No inference, direct conversion
+            // No inference, direct conversion - allow symbolic shapes to pass through
             shape_spec.iter().map(|&s| SInt::Const(s as usize)).collect()
         };
 
@@ -756,5 +813,115 @@ mod tests {
 
         assert_eq!(reshaped_f32.uop.dtype(), morok_dtype::DType::Float32);
         assert_eq!(reshaped_i32.uop.dtype(), morok_dtype::DType::Int32);
+    }
+
+    // =========================================================================
+    // Symbolic Shape Tests
+    // =========================================================================
+
+    #[test]
+    fn test_symbolic_shape_support() {
+        use morok_ir::{Op, DType, ConstValue};
+
+        // Create a tensor with a symbolic dimension using DefineVar
+        let batch_var = UOp::new(Op::DefineVar { name: "batch".to_string(), min_val: 1, max_val: 128 }, DType::Index);
+        let batch_dim = morok_ir::SInt::Symbolic(batch_var);
+
+        // Create shape: [batch, 3, 4] where batch is symbolic
+        let symbolic_shape: morok_ir::shape::Shape =
+            vec![batch_dim.clone(), morok_ir::SInt::from(3), morok_ir::SInt::from(4)].into();
+
+        // Create a tensor with this symbolic shape using a const value
+        let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+        let tensor_with_symbolic_shape = const_val.try_reshape(&symbolic_shape).unwrap();
+        let tensor = Tensor::new(tensor_with_symbolic_shape);
+
+        // Test 1: dim() returns SInt (can be symbolic or concrete)
+        let dim0 = tensor.dim(0).unwrap();
+        let dim1 = tensor.dim(1).unwrap();
+        let dim2 = tensor.dim(2).unwrap();
+
+        // First dimension is symbolic
+        assert!(dim0.as_const().is_none()); // Symbolic, no concrete value
+        assert_eq!(dim1.as_const(), Some(3)); // Concrete
+        assert_eq!(dim2.as_const(), Some(4)); // Concrete
+
+        // Test 2: ndim() works with symbolic shapes
+        assert_eq!(tensor.ndim().unwrap(), 3);
+
+        // Test 3: Reshape preserving symbolic dimension
+        let new_shape: morok_ir::shape::Shape =
+            vec![batch_dim.clone(), morok_ir::SInt::from(12)].into();
+        let reshaped = tensor.uop.try_reshape(&new_shape).map(Tensor::new).unwrap();
+        assert_eq!(reshaped.ndim().unwrap(), 2);
+
+        // Test 4: Permute works with symbolic shapes
+        let permuted = tensor.try_permute(&[1, 0, 2]).unwrap();
+        let perm_shape = permuted.shape().unwrap();
+        assert_eq!(perm_shape[0].as_const(), Some(3)); // Was dim 1
+        assert!(perm_shape[1].as_const().is_none()); // Was dim 0 (symbolic)
+        assert_eq!(perm_shape[2].as_const(), Some(4)); // Was dim 2
+    }
+
+    #[test]
+    fn test_symbolic_shape_broadcast() {
+        use morok_ir::{Op, DType, ConstValue};
+
+        // Create symbolic batch dimension
+        let batch_var = UOp::new(Op::DefineVar { name: "N".to_string(), min_val: 1, max_val: 1024 }, DType::Index);
+        let batch_dim = morok_ir::SInt::Symbolic(batch_var);
+
+        // Create tensor with shape [N, 4]
+        let symbolic_shape: morok_ir::shape::Shape = vec![batch_dim.clone(), morok_ir::SInt::from(4)].into();
+
+        let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+        let tensor_symbolic = const_val.try_reshape(&symbolic_shape).unwrap();
+        let tensor = Tensor::new(tensor_symbolic);
+
+        // Create a concrete tensor to broadcast against: [1, 4]
+        let concrete = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 4]).unwrap();
+
+        // Broadcasting should work with symbolic shapes
+        let (broadcasted_symbolic, broadcasted_concrete) = tensor.broadcast_for_binop(&concrete).unwrap();
+
+        // Both should have shape [N, 4]
+        let result_shape = broadcasted_symbolic.shape().unwrap();
+        assert_eq!(result_shape.len(), 2);
+        assert!(result_shape[0].as_const().is_none()); // Symbolic N
+        assert_eq!(result_shape[1].as_const(), Some(4)); // Concrete 4
+    }
+
+    #[test]
+    fn test_symbolic_shape_binary_ops() {
+        use morok_ir::{Op, DType, ConstValue};
+
+        // Create symbolic dimensions
+        let dim_var = UOp::new(Op::DefineVar { name: "D".to_string(), min_val: 1, max_val: 512 }, DType::Index);
+        let dim_sym = morok_ir::SInt::Symbolic(dim_var);
+
+        // Create two tensors with symbolic shape [D]
+        let shape: morok_ir::shape::Shape = vec![dim_sym.clone()].into();
+
+        let const1 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+        let tensor1_uop = const1.try_reshape(&shape).unwrap();
+        let tensor1 = Tensor::new(tensor1_uop);
+
+        let const2 = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+        let tensor2_uop = const2.try_reshape(&shape).unwrap();
+        let tensor2 = Tensor::new(tensor2_uop);
+
+        // Binary operations should work with matching symbolic shapes
+        let sum = tensor1.try_add(&tensor2).unwrap();
+        let product = tensor1.try_mul(&tensor2).unwrap();
+
+        // Results should preserve symbolic shape
+        let sum_shape = sum.shape().unwrap();
+        let product_shape = product.shape().unwrap();
+
+        assert_eq!(sum_shape.len(), 1);
+        assert!(sum_shape[0].as_const().is_none()); // Still symbolic
+
+        assert_eq!(product_shape.len(), 1);
+        assert!(product_shape[0].as_const().is_none()); // Still symbolic
     }
 }

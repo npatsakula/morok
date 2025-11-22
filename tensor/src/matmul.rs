@@ -3,10 +3,14 @@
 //! This module provides dot product and matrix multiplication operations
 //! following Tinygrad's implementation strategy.
 
+use std::iter;
+
 use bon::bon;
 use morok_dtype::DType;
+use morok_ir::{SInt, shape::Shape};
+use snafu::{ResultExt, ensure};
 
-use crate::{Error, Result, Tensor};
+use crate::{Result, Tensor, UOpSnafu, error::*};
 
 impl Tensor {
     /// Dot product / matrix multiplication.
@@ -34,141 +38,7 @@ impl Tensor {
     /// let result = a.dot(&b)?; // [2, 2]
     /// ```
     pub fn dot(&self, other: &Tensor) -> Result<Tensor> {
-        self.dot_impl(other, None)
-    }
-
-    /// Implementation of dot product with optional dtype.
-    fn dot_impl(&self, other: &Tensor, dtype: Option<DType>) -> Result<Tensor> {
-        let x_shape = self.shape()?;
-        let w_shape = other.shape()?;
-
-        let dx = x_shape.len();
-        let dw = w_shape.len();
-
-        // Step 1: Validate dimensions - both must be at least 1D
-        if dx == 0 || dw == 0 {
-            return Err(Error::DotDimensionError { lhs_dims: dx, rhs_dims: dw });
-        }
-
-        // Step 2: Determine contraction axis for RHS
-        // In Python: axis_w = -min(w.ndim, 2)
-        // For 1D: axis is -1, for 2D+: axis is -2
-        // We'll use negative indexing to match Tinygrad's behavior
-        let axis_w = -(std::cmp::min(dw, 2) as isize);
-
-        // Step 3: Validate contraction dimension
-        // x's last dim must match w's contraction dim
-        let x_shape_vec = require_concrete_shape(self)?;
-        let w_shape_vec = require_concrete_shape(other)?;
-
-        let x_contract = x_shape_vec[dx - 1];
-        // Convert negative axis_w to positive index for accessing the vector
-        let axis_w_pos = if axis_w < 0 { (dw as isize + axis_w) as usize } else { axis_w as usize };
-        let w_contract = w_shape_vec[axis_w_pos];
-
-        if x_contract != w_contract {
-            return Err(Error::DotShapeMismatch { lhs_shape: x_shape_vec, rhs_shape: w_shape_vec });
-        }
-
-        // Step 4: Reshape for broadcasting
-        // broadcast_dims = min(min(dx-1, dw-1), 1)
-        let broadcast_dims = std::cmp::min(std::cmp::min(dx.saturating_sub(1), dw.saturating_sub(1)), 1);
-
-        // Reshape x: [..., K] → [..., 1, K] (insert broadcast_dims before last)
-        let mut x_new_shape: Vec<isize> = Vec::new();
-        x_new_shape.extend(x_shape_vec[..dx - 1].iter().map(|&s| s as isize));
-        x_new_shape.extend(vec![1; broadcast_dims]);
-        x_new_shape.push(x_shape_vec[dx - 1] as isize);
-
-        let x_reshaped = self.try_reshape(&x_new_shape)?;
-
-        // Reshape w: [..., K, N] → [..., 1, K, N] (insert broadcast_dims after batch dims)
-        // In Python: w.reshape(*w.shape[0:-2], *[1]*min(dx-1, dw-1, 1), *w.shape[axis_w:])
-        // w.shape[0:-2] takes all but last 2 dims
-        // w.shape[axis_w:] takes from axis_w to end
-        let mut w_new_shape: Vec<isize> = Vec::new();
-        // For dw >= 2: take w.shape[0:-2] (all but last 2)
-        // For dw == 1: take nothing (0:-2 is empty for 1D)
-        if dw >= 2 {
-            w_new_shape.extend(w_shape_vec[..dw - 2].iter().map(|&s| s as isize));
-        }
-        w_new_shape.extend(vec![1; broadcast_dims]);
-        w_new_shape.extend(w_shape_vec[axis_w_pos..].iter().map(|&s| s as isize));
-
-        let w_reshaped = other.try_reshape(&w_new_shape)?;
-
-        // Step 5: Transpose w to move contraction dim to last
-        // Tinygrad: w.reshape(...).transpose(-1, axis_w)
-        // axis_w is negative: -1 for 1D, -2 for 2D+
-        let w_transposed = w_reshaped.try_transpose(-1, axis_w)?;
-
-        // Step 6: Broadcast and element-wise multiply
-        // After reshape and transpose, shapes should be broadcastable
-        // For 2D @ 2D: x=[2,1,2], w=[1,2,2] → need to broadcast to [2,2,2]
-        // For 2D @ 1D: x=[2,3], w=[3] → shapes already align on last dim
-        let x_shape_after = x_reshaped.shape()?;
-        let w_shape_after = w_transposed.shape()?;
-
-        // Compute broadcast shape (element-wise max of each dimension)
-        // Handle different ranks by padding with 1s on the left
-        let max_rank = std::cmp::max(x_shape_after.len(), w_shape_after.len());
-        let mut broadcast_shape: Vec<isize> = Vec::new();
-
-        for i in 0..max_rank {
-            // Index from the right (negative indexing)
-            let idx = i as isize - max_rank as isize;
-
-            let x_dim = if (idx + x_shape_after.len() as isize) >= 0 {
-                let pos = (idx + x_shape_after.len() as isize) as usize;
-                x_shape_after[pos]
-                    .as_const()
-                    .ok_or(Error::SymbolicShapeUnsupported { operation: "matmul".to_string() })?
-            } else {
-                1 // Implicit dimension of size 1
-            };
-
-            let w_dim = if (idx + w_shape_after.len() as isize) >= 0 {
-                let pos = (idx + w_shape_after.len() as isize) as usize;
-                w_shape_after[pos]
-                    .as_const()
-                    .ok_or(Error::SymbolicShapeUnsupported { operation: "matmul".to_string() })?
-            } else {
-                1 // Implicit dimension of size 1
-            };
-
-            broadcast_shape.push(std::cmp::max(x_dim, w_dim) as isize);
-        }
-
-        // Expand both tensors to broadcast shape
-        // First reshape to add missing dimensions (as 1s), then expand
-        let x_with_dims = if x_shape_after.len() < max_rank {
-            // Pad on left with 1s
-            let mut new_shape = vec![1isize; max_rank - x_shape_after.len()];
-            new_shape.extend(x_shape_after.iter().map(|s| s.as_const().unwrap() as isize));
-            x_reshaped.try_reshape(&new_shape)?
-        } else {
-            x_reshaped
-        };
-
-        let w_with_dims = if w_shape_after.len() < max_rank {
-            // Pad on left with 1s
-            let mut new_shape = vec![1isize; max_rank - w_shape_after.len()];
-            new_shape.extend(w_shape_after.iter().map(|s| s.as_const().unwrap() as isize));
-            w_transposed.try_reshape(&new_shape)?
-        } else {
-            w_transposed
-        };
-
-        let x_expanded = x_with_dims.try_expand(&broadcast_shape)?;
-        let w_expanded = w_with_dims.try_expand(&broadcast_shape)?;
-
-        let product = x_expanded.try_mul(&w_expanded)?;
-
-        // Step 7: Sum over last axis (the contraction dimension)
-        let result =
-            if let Some(dt) = dtype { product.sum_with().axes(-1).dtype(dt).call()? } else { product.sum(-1)? };
-
-        Ok(result)
+        self.matmul_with().other(other).call()
     }
 
     /// Matrix multiplication (alias for dot).
@@ -182,27 +52,24 @@ impl Tensor {
     /// let result = a.matmul(&b)?;
     /// ```
     pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
-        self.dot(other)
+        self.matmul_with().other(other).call()
     }
+}
+
+/// Build matmul broadcast shape by inserting broadcast dimensions.
+///
+/// Constructs: shape[..prefix_len] + [1; broadcast_dims] + shape[tail_start..]
+fn build_matmul_broadcast_shape(shape: &Shape, prefix_len: usize, broadcast_dims: usize, tail_start: usize) -> Shape {
+    shape[..prefix_len]
+        .iter()
+        .cloned()
+        .chain(iter::repeat_n(SInt::Const(1), broadcast_dims))
+        .chain(shape[tail_start..].iter().cloned())
+        .collect()
 }
 
 #[bon]
 impl Tensor {
-    /// Dot product with optional accumulation dtype.
-    ///
-    /// # Examples
-    /// ```ignore
-    /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-    ///
-    /// // Use float64 accumulation for better precision
-    /// let result = a.dot_with(&b).dtype(DType::Float64).call()?;
-    /// ```
-    #[builder]
-    pub fn dot_with(&self, other: &Tensor, dtype: Option<DType>) -> Result<Tensor> {
-        self.dot_impl(other, dtype)
-    }
-
     /// Matrix multiplication with optional dtype.
     ///
     /// # Examples
@@ -213,7 +80,33 @@ impl Tensor {
     /// ```
     #[builder]
     pub fn matmul_with(&self, other: &Tensor, dtype: Option<DType>) -> Result<Tensor> {
-        self.dot_impl(other, dtype)
+        // Step 1: Check dimensions
+        let (dx, dw) = (self.ndim()?, other.ndim()?);
+        ensure!(dx != 0 && dw != 0, DotDimensionSnafu { lhs_dims: dx, rhs_dims: dw });
+
+        let x_shape = self.shape()?;
+        let w_shape = other.shape()?;
+
+        // Step 2: Determine contraction axis and validate
+        let axis_w = -(dw.min(2) as isize);
+        ensure!(self.dim(-1)? == other.dim(axis_w)?, DotShapeMismatchSnafu { lhs_shape: x_shape, rhs_shape: w_shape });
+
+        // Step 3: Reshape for broadcasting
+        let broadcast_dims = (dx - 1).min(dw - 1).min(1);
+
+        // Reshape x: [..., K] → [..., 1, K]
+        let x_new_shape = build_matmul_broadcast_shape(&x_shape, dx - 1, broadcast_dims, dx - 1);
+        let x_reshaped = self.uop.try_reshape(&x_new_shape).map(Self::new).context(UOpSnafu)?;
+
+        // Reshape w: [..., K, N] → [..., 1, K, N]
+        let axis_w_pos = Tensor::normalize_axis(axis_w, dw)?;
+        let w_new_shape = build_matmul_broadcast_shape(&w_shape, dw.saturating_sub(2), broadcast_dims, axis_w_pos);
+        let w_reshaped = other.uop.try_reshape(&w_new_shape).map(Self::new).context(UOpSnafu)?;
+
+        // Step 4: Transpose, multiply, and sum
+        let product = x_reshaped.try_mul(&w_reshaped.try_transpose(-1, axis_w)?)?;
+
+        if let Some(dt) = dtype { product.sum_with().axes(-1).dtype(dt).call() } else { product.sum(-1) }
     }
 
     /// Linear transformation: `self @ weight.T + bias`.
@@ -256,50 +149,18 @@ impl Tensor {
             // For 2D+ weight, transpose it first (PyTorch convention)
             // PyTorch Linear layer: x @ weight.T
             let weight_t = weight.try_transpose(-1, -2)?;
-            self.dot_impl(&weight_t, dtype)?
+            self.matmul_with().other(&weight_t).maybe_dtype(dtype).call()?
         };
 
         // Add bias if provided
         if let Some(bias_tensor) = bias {
-            // Bias might need broadcasting if result has more dimensions
-            // e.g., result=[1,2], bias=[2] needs bias to be reshaped to [1,2]
             let result_shape = result.shape()?;
-            let bias_shape = bias_tensor.shape()?;
-
-            if result_shape.len() == bias_shape.len() {
-                // Same rank, direct add
-                result.try_add(bias_tensor)
-            } else if result_shape.len() > bias_shape.len() {
-                // Need to add leading dimensions to bias
-                let mut new_bias_shape: Vec<isize> = vec![1; result_shape.len() - bias_shape.len()];
-                new_bias_shape.extend(bias_shape.iter().map(|s| s.as_const().unwrap() as isize));
-
-                // Reshape bias to match rank
-                let bias_reshaped = bias_tensor.try_reshape(&new_bias_shape)?;
-
-                // Expand to match result shape
-                let result_shape_vec: Vec<isize> =
-                    result_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
-                let bias_expanded = bias_reshaped.try_expand(&result_shape_vec)?;
-
-                result.try_add(&bias_expanded)
-            } else {
-                // Bias has more dimensions than result - shouldn't happen in practice
-                result.try_add(bias_tensor)
-            }
+            let bias_broadcasted = bias_tensor.broadcast_to(&result_shape)?;
+            result.try_add(&bias_broadcasted)
         } else {
             Ok(result)
         }
     }
-}
-
-/// Validate and extract concrete shape (no symbolic dims allowed for matmul).
-fn require_concrete_shape(tensor: &Tensor) -> Result<Vec<usize>> {
-    let shape = tensor.shape()?;
-    shape
-        .iter()
-        .map(|dim| dim.as_const().ok_or(Error::SymbolicShapeUnsupported { operation: "matmul".to_string() }))
-        .collect()
 }
 
 #[cfg(test)]
@@ -465,7 +326,7 @@ mod tests {
         let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2]).unwrap();
 
         // Use float64 accumulation
-        let c = a.dot_with().other(&b).dtype(DType::Float64).call().unwrap();
+        let c = a.matmul_with().other(&b).dtype(DType::Float64).call().unwrap();
         assert_eq!(c.uop.dtype(), DType::Float64);
     }
 

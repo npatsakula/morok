@@ -11,6 +11,7 @@ use error::*;
 pub mod activation;
 pub mod arithmetic;
 pub mod bitwise;
+pub mod broadcast;
 pub mod conditional;
 pub mod math;
 pub mod matmul;

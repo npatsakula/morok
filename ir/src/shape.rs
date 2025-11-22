@@ -250,6 +250,23 @@ pub fn broadcast_shapes(shapes: &[Shape]) -> Result<Shape> {
     Ok(result)
 }
 
+/// Convert shape to Vec<usize>, ensuring all dimensions are concrete.
+///
+/// This is a helper function to reduce boilerplate when converting shapes
+/// for operations that require concrete (non-symbolic) dimensions.
+///
+/// # Errors
+///
+/// Returns error if any dimension contains a symbolic (non-const) value.
+pub fn to_vec_usize(shape: &Shape) -> Result<Vec<usize>> {
+    shape
+        .iter()
+        .map(|dim| {
+            dim.as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape conversion".to_string() })
+        })
+        .collect()
+}
+
 // =========================================================================
 // Movement Op Argument Extraction (marg equivalent)
 // =========================================================================

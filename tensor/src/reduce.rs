@@ -504,14 +504,15 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
         .as_const()
         .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "argmax".to_string() })?;
 
+    // Convert shape to isize vec once for reuse in expand operations
+    let shape_vec: Vec<isize> = shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+
     // Step 1: Find maximum values along axis (with keepdim for broadcasting)
     let max_vals_keepdim = working_tensor.max_with().axes(working_axis).keepdim(true).call()?;
 
     // Step 2: Create mask where values equal the max
     // Need to broadcast max_vals to match working_tensor shape
-    let max_shape = working_tensor.shape()?;
-    let max_shape_vec: Vec<isize> = max_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
-    let max_vals_broadcast = max_vals_keepdim.try_expand(&max_shape_vec)?;
+    let max_vals_broadcast = max_vals_keepdim.try_expand(&shape_vec)?;
 
     let mask = working_tensor.try_eq(&max_vals_broadcast)?;
 
@@ -526,7 +527,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
     let indices_reshaped = indices.try_reshape(&idx_shape)?;
 
     // Expand indices to match working_tensor shape
-    let indices_broadcast = indices_reshaped.try_expand(&max_shape_vec)?;
+    let indices_broadcast = indices_reshaped.try_expand(&shape_vec)?;
 
     // Step 5: Multiply mask by indices (0 where not max, index where max)
     let mask_int = mask.cast(DType::Int32)?;

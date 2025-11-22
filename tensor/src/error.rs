@@ -1,3 +1,4 @@
+use morok_ir::shape::Shape;
 use snafu::Snafu;
 
 #[derive(Debug, Snafu)]
@@ -49,7 +50,17 @@ pub enum Error {
     #[snafu(display(
         "Matrix multiplication shape mismatch: cannot multiply shapes {lhs_shape:?} and {rhs_shape:?} (contraction dimension mismatch)"
     ))]
-    DotShapeMismatch { lhs_shape: Vec<usize>, rhs_shape: Vec<usize> },
+    DotShapeMismatch { lhs_shape: Box<Shape>, rhs_shape: Box<Shape> },
+
+    #[snafu(display(
+        "Cannot broadcast to fewer dimensions: tensor has {from_dims} dimensions, target has {to_dims} dimensions"
+    ))]
+    BroadcastFewerDimensions { from_dims: usize, to_dims: usize },
+
+    #[snafu(display(
+        "Incompatible dimension {dim} for broadcasting: cannot broadcast size {from_size} to size {to_size}"
+    ))]
+    BroadcastIncompatible { dim: usize, from_size: usize, to_size: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

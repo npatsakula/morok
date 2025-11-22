@@ -7,7 +7,7 @@
   of inspiration. If you want to run some code you can use `uv run` since Tinygrad
   has UV infrastructure.
 - Avoid assumptions that are not supported by evidence; gather information using agents.
-  Don't use Haiku as an agent, it's too stupid for our codebase; use Sonnet or Opus.
+  Don't use cheap model as an agent, it's too stupid for our codebase.
 - Keep the main context clear and perform hypothesis testing using agents.
 - Avoid fast/hacky solutions; make them robust and scalable.
 - Make sure that you understand all type signatures and their implications (some crates may
