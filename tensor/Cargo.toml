@@ -1,0 +1,13 @@
+[package]
+name = "morok-tensor"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+morok-dtype.path = "../dtype"
+morok-ir.path = "../ir"
+morok-device.path = "../device"
+once_cell = "1.21.3"
+snafu = "0.8.9"
+bon = "3.8"

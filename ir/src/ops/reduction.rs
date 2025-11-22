@@ -11,13 +11,13 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if any axis is >= number of dimensions.
-    pub fn try_reduce_axis(src: Rc<Self>, reduce_op: ReduceOp, axes: Vec<usize>) -> Result<Rc<Self>> {
+    pub fn try_reduce_axis(self: &Rc<Self>, reduce_op: ReduceOp, axes: Vec<usize>) -> Result<Rc<Self>> {
         // Validate axes if source shape is known
-        if let Some(src_shape) = src.shape()? {
+        if let Some(src_shape) = self.shape()? {
             Self::validate_reduce_axes(&axes, src_shape.len())?;
         }
-        let dtype = src.dtype();
-        Ok(Self::new(Op::ReduceAxis { src, reduce_op, axes }, dtype))
+        let dtype = self.dtype();
+        Ok(Self::new(Op::ReduceAxis { src: self.clone(), reduce_op, axes }, dtype))
     }
 
     /// Reduce across loop ranges.

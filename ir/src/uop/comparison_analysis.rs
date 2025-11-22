@@ -47,8 +47,6 @@ impl ComparisonAnalyzer {
     /// Analyze comparison with explicit ranges.
     ///
     /// This is the core logic that determines comparison results based on ranges.
-    /// Note: Only Lt, Eq, Ne are actual IR operations. Other comparisons (Gt, Le, Ge)
-    /// would need to be expressed using these primitives.
     pub fn analyze_with_ranges(
         op: BinaryOp,
         x_min: ConstValue,
@@ -60,8 +58,11 @@ impl ComparisonAnalyzer {
 
         match op {
             Lt => Self::analyze_lt(x_min, x_max, y_min, y_max),
+            Le => Self::analyze_le(x_min, x_max, y_min, y_max),
             Eq => Self::analyze_eq(x_min, x_max, y_min, y_max),
             Ne => Self::analyze_ne(x_min, x_max, y_min, y_max),
+            Gt => Self::analyze_gt(x_min, x_max, y_min, y_max),
+            Ge => Self::analyze_ge(x_min, x_max, y_min, y_max),
             _ => None,
         }
     }

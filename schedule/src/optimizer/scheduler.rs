@@ -4,14 +4,73 @@
 //! to improve performance on specific backends.
 
 use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::{Mutex, OnceLock};
 
 use morok_ir::{AxisType, Op, UOp, UOpKey};
 
 use super::error::*;
 use super::renderer::Renderer;
 use super::types::{Opt, OptOps};
+
+/// Global kernel name counter for deduplication.
+///
+/// Tracks how many times each kernel name has been generated to avoid collisions.
+/// When multiple kernels have the same shape, subsequent ones get suffixed with "n0", "n1", etc.
+static KERNEL_NAME_COUNTS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+/// Get the kernel name counts map, initializing if needed.
+fn kernel_name_counts() -> &'static Mutex<HashMap<String, usize>> {
+    KERNEL_NAME_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Clear kernel name counts (for testing).
+#[cfg(test)]
+pub fn clear_kernel_name_counts() {
+    if let Some(counts) = KERNEL_NAME_COUNTS.get() {
+        counts.lock().unwrap().clear();
+    }
+}
+
+/// Flatten nested ranges in REDUCE and STORE operations.
+///
+/// Ensures ranges are stored in canonical flat order by collecting all
+/// RANGE operations via toposort and replacing them in sorted order.
+///
+/// Based on Tinygrad's `pm_flatten_range` pattern.
+///
+/// Note: In Morok's IR, ranges are typically already flat. This function
+/// ensures canonical ordering for REDUCE operations and recursively
+/// processes STORE operations.
+fn flatten_ranges(ast: Rc<UOp>) -> Rc<UOp> {
+    match ast.op() {
+        Op::Reduce { reduce_op, ranges, src } => {
+            // Flatten REDUCE ranges
+            let sink = UOp::sink(ranges.iter().cloned().collect());
+            let flattened: Vec<_> =
+                sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
+
+            // Recursively flatten the src
+            let flattened_src = flatten_ranges(src.clone());
+
+            // Recreate REDUCE with flattened ranges
+            UOp::reduce(flattened_src, flattened.into(), *reduce_op)
+        }
+        Op::Store { buffer, index, value } => {
+            // Recursively flatten value being stored
+            let flattened_value = flatten_ranges(value.clone());
+
+            // Recreate STORE with flattened value
+            UOp::store(buffer.clone(), index.clone(), flattened_value)
+        }
+        _ => {
+            // No flattening needed for other operations
+            ast
+        }
+    }
+}
 
 /// Scheduler for kernel optimization.
 ///
@@ -149,8 +208,27 @@ impl Scheduler {
     /// This is called lazily the first time `rngs()` is accessed.
     fn compute_rngs(&self) -> Vec<Rc<UOp>> {
         // Collect all RANGE nodes via toposort
-        let mut ranges: Vec<Rc<UOp>> =
-            self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
+        // Filter out size-1 ranges (where vmax == 0) to match Tinygrad's behavior
+        // This causes Global(1), Local(1), etc. axes to be excluded from rngs()
+        let mut ranges: Vec<Rc<UOp>> = self
+            .ast
+            .toposort()
+            .into_iter()
+            .filter(|node| {
+                if let Op::Range { .. } = node.op() {
+                    // Include only ranges with vmax > 0 (size > 1)
+                    // vmax = size - 1, so vmax > 0 means size > 1
+                    use morok_ir::ConstValue;
+                    match node.vmax() {
+                        ConstValue::Int(v) => *v > 0,
+                        ConstValue::UInt(v) => *v > 0,
+                        _ => false, // Symbolic or unknown sizes are excluded for safety
+                    }
+                } else {
+                    false
+                }
+            })
+            .collect();
 
         // Sort by (axis_type.priority(), axis_id)
         ranges.sort_by_key(|rng| {
@@ -243,6 +321,43 @@ impl Scheduler {
                 None
             })
             .collect()
+    }
+
+    /// Get the full shape including all axes (global, local, reduce, upcast, etc.).
+    ///
+    /// Returns the sizes of all dimension ranges in order. Returns -1 for symbolic/unknown sizes.
+    ///
+    /// Used by heuristics to calculate total work and make optimization decisions.
+    pub fn full_shape(&self) -> Vec<i64> {
+        self.rngs()
+            .iter()
+            .map(|rng| {
+                if let Op::Range { end, .. } = rng.op()
+                    && let Op::Const(cv) = end.op()
+                    && let morok_ir::ConstValue::Int(sz) = cv.0
+                {
+                    sz
+                } else {
+                    -1 // Symbolic or unknown size
+                }
+            })
+            .collect()
+    }
+
+    /// Check if any axes have been upcasted.
+    ///
+    /// Returns true if there are any UPCAST axis types in the kernel.
+    /// Used by heuristics to avoid redundant upcasting.
+    pub fn upcasted(&self) -> bool {
+        !self.axes_of(&[AxisType::Upcast]).is_empty()
+    }
+
+    /// Get a reference to the backend renderer.
+    ///
+    /// Returns the renderer that describes backend capabilities and constraints.
+    /// Used by heuristics to check device features and limits.
+    pub fn renderer(&self) -> &Renderer {
+        &self.ren
     }
 
     /// Calculate the total upcast size (product of all UPCAST dimensions).
@@ -678,7 +793,7 @@ impl Scheduler {
 
         // Record high-level transformation
         if old_ast_id != self.ast.id {
-            use morok_ir::provenance::{PassName, PROVENANCE_TRACKER};
+            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ShiftTo);
             });
@@ -750,9 +865,13 @@ impl Scheduler {
             .filter(|r| if let Op::Range { axis_type, .. } = r.op() { *axis_type == AxisType::Loop } else { false })
             .collect();
 
-        // Find all STORE operations
-        let stores: Vec<_> =
-            self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Store { .. })).collect();
+        // Find all STORE and SINK operations
+        let stores: Vec<_> = self
+            .ast
+            .toposort()
+            .into_iter()
+            .filter(|node| matches!(node.op(), Op::Store { .. } | Op::Sink { .. }))
+            .collect();
 
         if stores.is_empty() {
             return candidates;
@@ -813,7 +932,7 @@ impl Scheduler {
 
         // Record high-level transformation
         if old_ast_id != self.ast.id {
-            use morok_ir::provenance::{PassName, PROVENANCE_TRACKER};
+            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ConvertLoopToGlobal);
             });
@@ -822,31 +941,6 @@ impl Scheduler {
         self.clear_caches();
 
         Ok(())
-    }
-
-    /// Flatten nested ranges in REDUCE operations.
-    ///
-    /// Ensures ranges are stored in canonical flat order by collecting all
-    /// RANGE operations via toposort and replacing them in sorted order.
-    ///
-    /// Based on Tinygrad's `pm_flatten_range` pattern.
-    ///
-    /// Note: In Morok's IR, ranges are typically already flat. This method
-    /// ensures canonical ordering for REDUCE operations.
-    fn flatten_ranges(&self, ast: Rc<UOp>) -> Rc<UOp> {
-        // For REDUCE operations at the top level, flatten their range lists
-        if let Op::Reduce { reduce_op, ranges, src } = ast.op() {
-            // Sink all ranges together and toposort to ensure canonical order
-            let sink = UOp::sink(ranges.iter().cloned().collect());
-            let flattened: Vec<_> =
-                sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
-
-            // Recreate REDUCE with flattened ranges
-            UOp::reduce(src.clone(), flattened.into(), *reduce_op)
-        } else {
-            // No flattening needed for other operations
-            ast
-        }
     }
 
     /// Get the optimized AST with kernel metadata attached.
@@ -919,8 +1013,17 @@ impl Scheduler {
             format!("{}_{}", prefix, shape_parts.join(""))
         });
 
+        // Deduplicate kernel names
+        let name = {
+            let mut counts = kernel_name_counts().lock().unwrap();
+            let count = counts.entry(name.clone()).or_insert(0);
+            *count += 1;
+
+            if *count > 1 { format!("{}n{}", name, *count - 1) } else { name }
+        };
+
         // 2. Flatten ranges
-        let flattened_ast = self.flatten_ranges(self.ast.clone());
+        let flattened_ast = flatten_ranges(self.ast.clone());
 
         // 3. Attach metadata
         let info = KernelInfo { name, applied_opts: self.applied_opts.clone(), dont_use_locals: self.dont_use_locals };

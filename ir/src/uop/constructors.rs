@@ -163,7 +163,7 @@ impl UOp {
     /// This is the most common pattern - bufferize to global memory.
     ///
     /// # Examples
-    /// ```
+    /// ```ignore
     /// let buf = UOp::bufferize_global(compute, vec![range]);
     /// ```
     pub fn bufferize_global(compute: Rc<Self>, ranges: Vec<Rc<Self>>) -> Rc<Self> {
@@ -175,7 +175,7 @@ impl UOp {
     /// For shared/local memory bufferization.
     ///
     /// # Examples
-    /// ```
+    /// ```ignore
     /// let buf = UOp::bufferize_local(compute, vec![range]);
     /// ```
     pub fn bufferize_local(compute: Rc<Self>, ranges: Vec<Rc<Self>>) -> Rc<Self> {
@@ -234,7 +234,7 @@ impl UOp {
     /// This significantly reduces boilerplate compared to manual Op construction.
     ///
     /// # Examples
-    /// ```
+    /// ```ignore
     /// let idx = UOp::var("idx", DType::Int32, 0, 15);
     /// ```
     pub fn var(name: impl Into<String>, dtype: DType, min_val: i64, max_val: i64) -> Rc<Self> {
@@ -247,7 +247,7 @@ impl UOp {
     /// Returns Index dtype by default, which is standard for ranges.
     ///
     /// # Examples
-    /// ```
+    /// ```ignore
     /// let range = UOp::range(UOp::const_(DType::Int32, ConstValue::Int(10)), 0);
     /// ```
     pub fn range(end: Rc<Self>, axis_id: usize) -> Rc<Self> {
@@ -295,9 +295,10 @@ macro_rules! unary_ops {
     ($($name:ident => $op:ident),* $(,)?) => {
         impl UOp {
             $(
-                pub fn $name(arg: &Rc<Self>) -> Rc<Self> {
-                    let dtype = arg.dtype.clone();
-                    Self::new(Op::Unary(UnaryOp::$op, arg.clone()), dtype)
+                #[track_caller]
+                pub fn $name(self: &Rc<Self>) -> Rc<Self> {
+                    let dtype = self.dtype.clone();
+                    Self::new(Op::Unary(UnaryOp::$op, self.clone()), dtype)
                 }
             )*
         }
@@ -308,9 +309,10 @@ macro_rules! cmp_ops {
     ($($name:ident => $op:ident),* $(,)?) => {
         impl UOp {
             $(
-                pub fn $name(lhs: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+                #[track_caller]
+                pub fn $name(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
                     // Use type promotion to validate types and find common type
-                    let (lhs, rhs, _) = Self::promote_and_cast(lhs.clone(), rhs.clone())?;
+                    let (lhs, rhs, _) = Self::promote_and_cast(self.clone(), rhs.clone())?;
                     Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
                     Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), DType::Bool))
                 }
@@ -324,35 +326,43 @@ macro_rules! transcendental_ops {
     ($($name:ident => $op:ident),* $(,)?) => {
         impl UOp {
             $(
-                pub fn $name(arg: &Rc<Self>) -> Result<Rc<Self>> {
-                    let dtype = arg.dtype();
+                #[track_caller]
+                pub fn $name(self: &Rc<Self>) -> Result<Rc<Self>> {
+                    let dtype = self.dtype();
                     if !dtype.is_float() {
                         return Err(Error::InvalidDTypeForOp {
                             operation: stringify!($name),
                             dtype: dtype.clone()
                         });
                     }
-                    Ok(Self::new(Op::Unary(UnaryOp::$op, arg.clone()), dtype))
+                    Ok(Self::new(Op::Unary(UnaryOp::$op, self.clone()), dtype))
                 }
             )*
         }
     }
 }
 
-// Negation works on any numeric type
+// Negation and abs work on any numeric type
 unary_ops! {
     neg => Neg,
+    abs => Abs,
 }
 
 // Transcendental functions require float types
 transcendental_ops! {
-    sqrt => Sqrt,
-    exp2 => Exp2,
-    log2 => Log2,
+    try_sqrt => Sqrt,
+    try_rsqrt => Rsqrt,
+    try_exp => Exp,
+    try_exp2 => Exp2,
+    try_log => Log,
+    try_log2 => Log2,
 }
 
 cmp_ops! {
-    cmplt => Lt,
-    cmpeq => Eq,
-    cmpne => Ne,
+    try_cmplt => Lt,
+    try_cmple => Le,
+    try_cmpeq => Eq,
+    try_cmpne => Ne,
+    try_cmpgt => Gt,
+    try_cmpge => Ge,
 }

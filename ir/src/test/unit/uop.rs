@@ -56,7 +56,7 @@ fn test_binary_operations() {
 fn test_unary_operations() {
     let a = UOp::const_(DType::Float32, ConstValue::Float(4.0));
 
-    let sqrt = UOp::sqrt(&a).unwrap();
+    let sqrt = a.try_sqrt().unwrap();
     assert_eq!(sqrt.dtype(), DType::Float32);
     assert_eq!(sqrt.op().children().len(), 1);
 }
@@ -74,7 +74,7 @@ fn test_comparison() {
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
-    let cmp = UOp::cmplt(&a, &b).unwrap();
+    let cmp = a.try_cmplt(&b).unwrap();
     assert_eq!(cmp.dtype(), DType::Bool);
 }
 

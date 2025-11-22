@@ -4,7 +4,8 @@
 
 - Feel free to use multiple agents to explore different strategies and solutions.
 - You can find Tinygrad codebase at `submodules/tinygrad`; you can use it as source
-  of inspiration.
+  of inspiration. If you want to run some code you can use `uv run` since Tinygrad
+  has UV infrastructure.
 - Avoid assumptions that are not supported by evidence; gather information using agents.
   Don't use Haiku as an agent, it's too stupid for our codebase; use Sonnet or Opus.
 - Keep the main context clear and perform hypothesis testing using agents.
@@ -13,9 +14,9 @@
   have updated their API since the last time you used them).
 - Focus on code size and performance: minimize code; use Rust's capabilities
   and ecosystem to optimize performance.
-- You you or agent reached limit of 25k tokens during file read, consider batched file
-  reading; don't play games with symbols searching, large files are source of grand
-  knowledge.
+- If you or agent reached limit of 25k tokens during file read, consider chunked file
+  reading (e.g. 1000 line each chunk); don't play games with symbols searching, large
+  files are source of grand knowledge.
 
 ## Task execution
 

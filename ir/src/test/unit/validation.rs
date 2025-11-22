@@ -114,7 +114,7 @@ fn test_reshape_size_mismatch() {
     // Try to reshape scalar (size=1) to [2, 2] (size=4) - mismatch
     let output_shape: Shape = smallvec![SInt::from(2), SInt::from(2)];
 
-    let result = UOp::try_reshape(val, &output_shape);
+    let result = val.try_reshape(&output_shape);
     assert!(matches!(result, Err(Error::ReshapeSizeMismatch { input_size: 1, output_size: 4 })));
 }
 
@@ -128,7 +128,7 @@ fn test_reshape_negative_dimension() {
     // This error is mainly for future symbolic shape support
     // For now, test that positive values work
     let shape: crate::shape::Shape = smallvec![SInt::from(1)];
-    let result = UOp::try_reshape(val, &shape);
+    let result = val.try_reshape(&shape);
     assert!(result.is_ok());
 }
 
@@ -162,7 +162,7 @@ fn test_expand_dimension_mismatch() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar (empty shape)
     let output_shape: Shape = smallvec![SInt::from(3), SInt::from(5)]; // 2 dimensions
 
-    let result = UOp::try_expand(val, &output_shape);
+    let result = val.try_expand(&output_shape);
     assert!(matches!(result, Err(Error::ExpandDimensionMismatch { input_dims: 0, output_dims: 2 })));
 }
 
@@ -183,12 +183,12 @@ fn test_permute_invalid_permutation() {
 
     // Invalid: permutation for scalar should be empty
     let bad_perm = vec![0, 1];
-    let result = UOp::try_permute(val.clone(), bad_perm);
+    let result = val.clone().try_permute(bad_perm);
     assert!(matches!(result, Err(Error::PermuteInvalidPermutation { .. })));
 
     // Valid: empty permutation for scalar
     let good_perm = vec![];
-    let result = UOp::try_permute(val, good_perm);
+    let result = val.try_permute(good_perm);
     assert!(result.is_ok());
 }
 
@@ -199,7 +199,7 @@ fn test_pad_dimension_mismatch() {
     // Padding for 2 dimensions but scalar has 0
     let padding = vec![(SInt::from(0), SInt::from(0)), (SInt::from(1), SInt::from(1))];
 
-    let result = UOp::try_pad(val, &padding);
+    let result = val.try_pad(&padding);
     assert!(matches!(result, Err(Error::PadDimensionMismatch { padding_dims: 2, shape_dims: 0 })));
 }
 
@@ -210,7 +210,7 @@ fn test_flip_invalid_spec() {
     // Flip spec for 2 dimensions but scalar has 0
     let flip_spec = vec![true, false];
 
-    let result = UOp::try_flip(val, flip_spec);
+    let result = val.try_flip(flip_spec);
     assert!(matches!(result, Err(Error::FlipInvalidSpec { expected_dims: 0, got_dims: 2 })));
 }
 
@@ -226,14 +226,14 @@ fn test_comparison_with_void_type() {
     let void2 = UOp::const_(DType::Void, ConstValue::Int(0));
 
     // Comparisons use promote_and_cast internally which validates void types
-    let result = UOp::cmplt(&void1, &void2);
+    let result = void1.try_cmplt(&void2);
     assert!(matches!(result, Err(Error::VoidTypeInOp)));
 
     // Test other comparison operations too
-    let result = UOp::cmpeq(&void1, &void2);
+    let result = void1.try_cmpeq(&void2);
     assert!(matches!(result, Err(Error::VoidTypeInOp)));
 
-    let result = UOp::cmpne(&void1, &void2);
+    let result = void1.try_cmpne(&void2);
     assert!(matches!(result, Err(Error::VoidTypeInOp)));
 }
 
@@ -247,13 +247,13 @@ fn test_comparison_bool_dtype_result() {
     let float_b = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::E as f64));
 
     // All comparisons should return Bool
-    assert_eq!(UOp::cmplt(&int_a, &int_b).unwrap().dtype(), DType::Bool);
-    assert_eq!(UOp::cmpeq(&int_a, &int_b).unwrap().dtype(), DType::Bool);
-    assert_eq!(UOp::cmpne(&int_a, &int_b).unwrap().dtype(), DType::Bool);
+    assert_eq!(int_a.try_cmplt(&int_b).unwrap().dtype(), DType::Bool);
+    assert_eq!(int_a.try_cmpeq(&int_b).unwrap().dtype(), DType::Bool);
+    assert_eq!(int_a.try_cmpne(&int_b).unwrap().dtype(), DType::Bool);
 
-    assert_eq!(UOp::cmplt(&float_a, &float_b).unwrap().dtype(), DType::Bool);
-    assert_eq!(UOp::cmpeq(&float_a, &float_b).unwrap().dtype(), DType::Bool);
-    assert_eq!(UOp::cmpne(&float_a, &float_b).unwrap().dtype(), DType::Bool);
+    assert_eq!(float_a.try_cmplt(&float_b).unwrap().dtype(), DType::Bool);
+    assert_eq!(float_a.try_cmpeq(&float_b).unwrap().dtype(), DType::Bool);
+    assert_eq!(float_a.try_cmpne(&float_b).unwrap().dtype(), DType::Bool);
 }
 
 // =========================================================================
@@ -305,8 +305,8 @@ fn test_sqrt_preserves_dtype() {
     let f32_val = UOp::const_(DType::Float32, ConstValue::Float(4.0));
     let f64_val = UOp::const_(DType::Float64, ConstValue::Float(4.0));
 
-    assert_eq!(UOp::sqrt(&f32_val).unwrap().dtype(), DType::Float32);
-    assert_eq!(UOp::sqrt(&f64_val).unwrap().dtype(), DType::Float64);
+    assert_eq!(f32_val.try_sqrt().unwrap().dtype(), DType::Float32);
+    assert_eq!(f64_val.try_sqrt().unwrap().dtype(), DType::Float64);
 }
 
 #[test]
@@ -314,13 +314,13 @@ fn test_transcendental_on_int_types() {
     // Transcendental functions require float types and reject integer types
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(4));
 
-    let sqrt_result = UOp::sqrt(&int_val);
+    let sqrt_result = int_val.try_sqrt();
     assert!(matches!(sqrt_result, Err(Error::InvalidDTypeForOp { .. })));
 
-    let exp2_result = UOp::exp2(&int_val);
+    let exp2_result = int_val.try_exp2();
     assert!(matches!(exp2_result, Err(Error::InvalidDTypeForOp { .. })));
 
-    let log2_result = UOp::log2(&int_val);
+    let log2_result = int_val.try_log2();
     assert!(matches!(log2_result, Err(Error::InvalidDTypeForOp { .. })));
 }
 

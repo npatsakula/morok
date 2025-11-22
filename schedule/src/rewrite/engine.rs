@@ -172,7 +172,7 @@ impl<'a> RewriteEngine<'a> {
 
         // Record provenance if UOp was actually rewritten
         if !Rc::ptr_eq(original, &rewritten) {
-            use morok_ir::provenance::{PassName, PROVENANCE_TRACKER};
+            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().record_transform(rewritten.id, original.id, PassName::RewritePattern);
             });

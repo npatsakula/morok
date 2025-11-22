@@ -43,6 +43,7 @@
 //! ```
 
 pub mod error;
+pub mod heuristics;
 pub mod kernel_info;
 pub mod opts;
 pub mod renderer;
@@ -54,4 +55,6 @@ pub use kernel_info::KernelInfo;
 pub use opts::apply_opt;
 pub use renderer::{Renderer, TcOpt, TensorCore};
 pub use scheduler::Scheduler;
+#[cfg(test)]
+pub use scheduler::clear_kernel_name_counts;
 pub use types::{AxisType, Opt, OptArg, OptOps};

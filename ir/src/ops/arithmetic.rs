@@ -22,7 +22,7 @@ macro_rules! binary_arith_ops {
             /// # use morok_dtype::DType;
             /// let a = UOp::const_(DType::Int32, ConstValue::Int(5));
             /// let b = UOp::const_(DType::Void, ConstValue::Int(0));
-            #[doc = concat!("let result = UOp::", stringify!($method), "(a, b);")]
+            #[doc = concat!("let result = a.", stringify!($method), "(&b);")]
             /// assert!(result.is_err(), "Expected error for void type");
             /// ```
             /// # Examples
@@ -32,7 +32,7 @@ macro_rules! binary_arith_ops {
             /// # use morok_dtype::DType;
             /// let a = UOp::const_(DType::Float32, ConstValue::Float(5.0));
             /// let b = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-            #[doc = concat!("let result = UOp::", stringify!($method), "(a, b)?;")]
+            #[doc = concat!("let result = a.", stringify!($method), "(&b)?;")]
             /// assert_eq!(result.dtype(), DType::Float32);
             /// # Ok::<(), Error>(())
             /// ```
@@ -43,10 +43,11 @@ macro_rules! binary_arith_ops {
             /// // Int32 + Float32 automatically promotes to Float32
             /// let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
             /// let float_val = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-            #[doc = concat!("let result = UOp::", stringify!($method), "(int_val, float_val)?;")]
+            #[doc = concat!("let result = int_val.", stringify!($method), "(&float_val)?;")]
             /// assert_eq!(result.dtype(), DType::Float32);
             /// # Ok::<(), Error>(())
             /// ```
+            #[track_caller]
             pub fn $method(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
                 let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
                 Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
@@ -75,7 +76,7 @@ macro_rules! division_ops {
             /// # use morok_dtype::DType;
             /// let a = UOp::const_(DType::Float32, ConstValue::Float(10.0));
             /// let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-            #[doc = concat!("let result = UOp::", stringify!($method), "(a, zero);")]
+            #[doc = concat!("let result = a.", stringify!($method), "(&zero);")]
             /// assert!(result.is_err(), "Expected error for division by zero");
             /// ```
             /// # Examples
@@ -84,10 +85,11 @@ macro_rules! division_ops {
             /// # use morok_dtype::DType;
             /// let a = UOp::const_(DType::Float32, ConstValue::Float(10.0));
             /// let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-            #[doc = concat!("let result = UOp::", stringify!($method), "(a, b)?;")]
+            #[doc = concat!("let result = a.", stringify!($method), "(&b)?;")]
             /// assert_eq!(result.dtype(), DType::Float32);
             /// # Ok::<(), Error>(())
             /// ```
+            #[track_caller]
             pub fn $method(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
                 Self::check_division_by_zero(rhs)?;
                 let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
@@ -109,6 +111,21 @@ impl UOp {
     // Division operations with zero check
     division_ops! {
         try_mod_op => Mod, "Modulo",
+    }
+
+    /// Division with automatic type-based operator selection.
+    ///
+    /// Uses Idiv for integer types and Fdiv for float types.
+    #[track_caller]
+    pub fn try_div_op(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+        Self::check_division_by_zero(rhs)?;
+        let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
+
+        // Choose division operator based on dtype
+        let op = if dtype.is_float() { BinaryOp::Fdiv } else { BinaryOp::Idiv };
+
+        Self::validate_binary_shapes(&lhs, &rhs, op)?;
+        Ok(Self::new(Op::Binary(op, lhs, rhs), dtype))
     }
 
     /// Negate a UOp (unary minus).

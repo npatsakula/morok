@@ -19,12 +19,24 @@ use crate::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
 pub fn eval_unary_op(op: UnaryOp, v: ConstValue) -> Option<ConstValue> {
     match op {
         UnaryOp::Neg => eval_neg(v),
+        UnaryOp::Abs => eval_abs(v),
         UnaryOp::Sqrt => eval_sqrt(v),
+        UnaryOp::Rsqrt => eval_rsqrt(v),
+        UnaryOp::Exp => eval_exp(v),
         UnaryOp::Exp2 => eval_exp2(v),
+        UnaryOp::Log => eval_log(v),
         UnaryOp::Log2 => eval_log2(v),
         UnaryOp::Sin => eval_sin(v),
+        UnaryOp::Cos => eval_cos(v),
+        UnaryOp::Tan => eval_tan(v),
         UnaryOp::Reciprocal => eval_reciprocal(v),
         UnaryOp::Trunc => eval_trunc(v),
+        UnaryOp::Floor => eval_floor(v),
+        UnaryOp::Ceil => eval_ceil(v),
+        UnaryOp::Round => eval_round(v),
+        UnaryOp::Sign => eval_sign(v),
+        UnaryOp::Erf => eval_erf(v),
+        UnaryOp::Square => eval_square(v),
     }
 }
 
@@ -53,8 +65,11 @@ pub fn eval_binary_op(op: BinaryOp, a: ConstValue, b: ConstValue) -> Option<Cons
         BinaryOp::Idiv => eval_idiv(a, b),
         BinaryOp::Fdiv => eval_fdiv(a, b),
         BinaryOp::Lt => eval_lt(a, b),
+        BinaryOp::Le => eval_le(a, b),
         BinaryOp::Eq => eval_eq(a, b),
         BinaryOp::Ne => eval_ne(a, b),
+        BinaryOp::Gt => eval_gt(a, b),
+        BinaryOp::Ge => eval_ge(a, b),
         BinaryOp::And => eval_and(a, b),
         BinaryOp::Or => eval_or(a, b),
         BinaryOp::Xor => eval_xor(a, b),
@@ -88,6 +103,16 @@ fn eval_neg(v: ConstValue) -> Option<ConstValue> {
 }
 
 #[inline]
+fn eval_abs(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Int(x) => Some(ConstValue::Int(x.wrapping_abs())),
+        ConstValue::UInt(x) => Some(ConstValue::UInt(x)), // Already positive
+        ConstValue::Float(x) => Some(ConstValue::Float(x.abs())),
+        _ => None,
+    }
+}
+
+#[inline]
 fn eval_sqrt(v: ConstValue) -> Option<ConstValue> {
     match v {
         ConstValue::Float(x) => Some(ConstValue::Float(x.sqrt())),
@@ -96,9 +121,33 @@ fn eval_sqrt(v: ConstValue) -> Option<ConstValue> {
 }
 
 #[inline]
+fn eval_rsqrt(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Float(x) => Some(ConstValue::Float(1.0 / x.sqrt())),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_exp(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Float(x) => Some(ConstValue::Float(x.exp())),
+        _ => None,
+    }
+}
+
+#[inline]
 fn eval_exp2(v: ConstValue) -> Option<ConstValue> {
     match v {
         ConstValue::Float(x) => Some(ConstValue::Float(x.exp2())),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_log(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Float(x) => Some(ConstValue::Float(x.ln())),
         _ => None,
     }
 }
@@ -131,6 +180,93 @@ fn eval_reciprocal(v: ConstValue) -> Option<ConstValue> {
 fn eval_trunc(v: ConstValue) -> Option<ConstValue> {
     match v {
         ConstValue::Float(x) => Some(ConstValue::Float(x.trunc())),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_cos(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Float(x) => Some(ConstValue::Float(x.cos())),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_tan(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Float(x) => Some(ConstValue::Float(x.tan())),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_floor(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Float(x) => Some(ConstValue::Float(x.floor())),
+        ConstValue::Int(x) => Some(ConstValue::Int(x)), // Already integer
+        ConstValue::UInt(x) => Some(ConstValue::UInt(x)), // Already integer
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_ceil(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Float(x) => Some(ConstValue::Float(x.ceil())),
+        ConstValue::Int(x) => Some(ConstValue::Int(x)), // Already integer
+        ConstValue::UInt(x) => Some(ConstValue::UInt(x)), // Already integer
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_round(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Float(x) => Some(ConstValue::Float(x.round())),
+        ConstValue::Int(x) => Some(ConstValue::Int(x)), // Already integer
+        ConstValue::UInt(x) => Some(ConstValue::UInt(x)), // Already integer
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_sign(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Int(x) => Some(ConstValue::Int(if x < 0 {
+            -1
+        } else if x > 0 {
+            1
+        } else {
+            0
+        })),
+        ConstValue::Float(x) => Some(ConstValue::Float(if x < 0.0 {
+            -1.0
+        } else if x > 0.0 {
+            1.0
+        } else {
+            0.0
+        })),
+        ConstValue::UInt(x) => Some(ConstValue::UInt(if x > 0 { 1 } else { 0 })),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_erf(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        // Use libm for erf function (Rust std doesn't have it)
+        ConstValue::Float(x) => Some(ConstValue::Float(libm::erf(x))),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_square(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Int(x) => Some(ConstValue::Int(x.wrapping_mul(x))),
+        ConstValue::UInt(x) => Some(ConstValue::UInt(x.wrapping_mul(x))),
+        ConstValue::Float(x) => Some(ConstValue::Float(x * x)),
         _ => None,
     }
 }
@@ -255,6 +391,39 @@ fn eval_ne(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
         (ConstValue::UInt(x), ConstValue::UInt(y)) => Some(ConstValue::Bool(x != y)),
         (ConstValue::Float(x), ConstValue::Float(y)) => Some(ConstValue::Bool(x != y)),
         (ConstValue::Bool(x), ConstValue::Bool(y)) => Some(ConstValue::Bool(x != y)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_le(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+    match (a, b) {
+        (ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Bool(x <= y)),
+        (ConstValue::UInt(x), ConstValue::UInt(y)) => Some(ConstValue::Bool(x <= y)),
+        (ConstValue::Float(x), ConstValue::Float(y)) => Some(ConstValue::Bool(x <= y)),
+        (ConstValue::Bool(x), ConstValue::Bool(y)) => Some(ConstValue::Bool((!x) | y)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_gt(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+    match (a, b) {
+        (ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Bool(x > y)),
+        (ConstValue::UInt(x), ConstValue::UInt(y)) => Some(ConstValue::Bool(x > y)),
+        (ConstValue::Float(x), ConstValue::Float(y)) => Some(ConstValue::Bool(x > y)),
+        (ConstValue::Bool(x), ConstValue::Bool(y)) => Some(ConstValue::Bool(x & !y)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_ge(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+    match (a, b) {
+        (ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Bool(x >= y)),
+        (ConstValue::UInt(x), ConstValue::UInt(y)) => Some(ConstValue::Bool(x >= y)),
+        (ConstValue::Float(x), ConstValue::Float(y)) => Some(ConstValue::Bool(x >= y)),
+        (ConstValue::Bool(x), ConstValue::Bool(y)) => Some(ConstValue::Bool(x | !y)),
         _ => None,
     }
 }

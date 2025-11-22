@@ -13,14 +13,14 @@ use crate::{ConstValue, UOp};
 #[test]
 fn test_sqrt_positive() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(9.0));
-    let result = UOp::sqrt(&val).unwrap();
+    let result = val.try_sqrt().unwrap();
     assert_eq!(result.dtype(), DType::Float32);
 }
 
 #[test]
 fn test_sqrt_zero() {
     let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let result = UOp::sqrt(&zero).unwrap();
+    let result = zero.try_sqrt().unwrap();
     // sqrt(0) = 0
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -28,7 +28,7 @@ fn test_sqrt_zero() {
 #[test]
 fn test_sqrt_one() {
     let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let result = UOp::sqrt(&one).unwrap();
+    let result = one.try_sqrt().unwrap();
     // sqrt(1) = 1
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -36,11 +36,11 @@ fn test_sqrt_one() {
 #[test]
 fn test_sqrt_preserves_dtype() {
     let val_f32 = UOp::const_(DType::Float32, ConstValue::Float(4.0));
-    let result_f32 = UOp::sqrt(&val_f32).unwrap();
+    let result_f32 = val_f32.try_sqrt().unwrap();
     assert_eq!(result_f32.dtype(), DType::Float32);
 
     let val_f64 = UOp::const_(DType::Float64, ConstValue::Float(4.0));
-    let result_f64 = UOp::sqrt(&val_f64).unwrap();
+    let result_f64 = val_f64.try_sqrt().unwrap();
     assert_eq!(result_f64.dtype(), DType::Float64);
 }
 
@@ -51,7 +51,7 @@ fn test_sqrt_preserves_dtype() {
 #[test]
 fn test_exp2_zero() {
     let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let result = UOp::exp2(&zero).unwrap();
+    let result = zero.try_exp2().unwrap();
     // 2^0 = 1
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -59,7 +59,7 @@ fn test_exp2_zero() {
 #[test]
 fn test_exp2_positive() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-    let result = UOp::exp2(&val).unwrap();
+    let result = val.try_exp2().unwrap();
     // 2^3 = 8
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -67,7 +67,7 @@ fn test_exp2_positive() {
 #[test]
 fn test_exp2_negative() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(-2.0));
-    let result = UOp::exp2(&val).unwrap();
+    let result = val.try_exp2().unwrap();
     // 2^-2 = 0.25
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -75,7 +75,7 @@ fn test_exp2_negative() {
 #[test]
 fn test_exp2_one() {
     let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let result = UOp::exp2(&one).unwrap();
+    let result = one.try_exp2().unwrap();
     // 2^1 = 2
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -87,7 +87,7 @@ fn test_exp2_one() {
 #[test]
 fn test_log2_one() {
     let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let result = UOp::log2(&one).unwrap();
+    let result = one.try_log2().unwrap();
     // log2(1) = 0
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -95,7 +95,7 @@ fn test_log2_one() {
 #[test]
 fn test_log2_power_of_two() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(8.0));
-    let result = UOp::log2(&val).unwrap();
+    let result = val.try_log2().unwrap();
     // log2(8) = 3
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -103,7 +103,7 @@ fn test_log2_power_of_two() {
 #[test]
 fn test_log2_two() {
     let two = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let result = UOp::log2(&two).unwrap();
+    let result = two.try_log2().unwrap();
     // log2(2) = 1
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -111,7 +111,7 @@ fn test_log2_two() {
 #[test]
 fn test_log2_fractional() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(0.5));
-    let result = UOp::log2(&val).unwrap();
+    let result = val.try_log2().unwrap();
     // log2(0.5) = -1
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -249,9 +249,9 @@ fn test_sqrt_exp2_identity() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(4.0));
 
     // log2(x)
-    let log_val = UOp::log2(&val).unwrap();
+    let log_val = val.try_log2().unwrap();
     // exp2(log2(x)) should be x
-    let result = UOp::exp2(&log_val).unwrap();
+    let result = log_val.try_exp2().unwrap();
 
     assert_eq!(result.dtype(), DType::Float32);
 }
@@ -273,8 +273,8 @@ fn test_transcendental_composition() {
     let val = UOp::const_(DType::Float32, ConstValue::Float(2.0));
 
     // sqrt(exp2(x))
-    let exp_val = UOp::exp2(&val).unwrap();
-    let result = UOp::sqrt(&exp_val).unwrap();
+    let exp_val = val.try_exp2().unwrap();
+    let result = exp_val.try_sqrt().unwrap();
 
     assert_eq!(result.dtype(), DType::Float32);
 }

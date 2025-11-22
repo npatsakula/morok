@@ -22,7 +22,7 @@ macro_rules! bitwise_binary_ops {
             /// # use morok_dtype::DType;
             /// let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
             /// let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-            #[doc = concat!("let result = UOp::", stringify!($method), "(a, b);")]
+            #[doc = concat!("let result = a.", stringify!($method), "(&b);")]
             /// assert!(result.is_err(), "Expected error for float dtype");
             /// ```
             /// # Examples
@@ -31,7 +31,7 @@ macro_rules! bitwise_binary_ops {
             /// # use morok_dtype::DType;
             /// let a = UOp::const_(DType::Int32, ConstValue::Int(0b1010));
             /// let b = UOp::const_(DType::Int32, ConstValue::Int(0b1100));
-            #[doc = concat!("let result = UOp::", stringify!($method), "(a, b)?;")]
+            #[doc = concat!("let result = a.", stringify!($method), "(&b)?;")]
             /// assert_eq!(result.dtype(), DType::Int32);
             /// # Ok::<(), Error>(())
             /// ```
@@ -61,7 +61,7 @@ macro_rules! shift_ops {
             /// # use morok_dtype::DType;
             /// let value = UOp::const_(DType::Float32, ConstValue::Float(8.0));
             /// let shift_amount = UOp::const_(DType::Int32, ConstValue::Int(2));
-            #[doc = concat!("let result = UOp::", stringify!($method), "(value, shift_amount);")]
+            #[doc = concat!("let result = value.", stringify!($method), "(&shift_amount);")]
             /// assert!(result.is_err(), "Expected error for float LHS")
             /// ```
             /// # Examples
@@ -70,7 +70,7 @@ macro_rules! shift_ops {
             /// # use morok_dtype::DType;
             /// let value = UOp::const_(DType::Int32, ConstValue::Int(8));
             /// let shift_amount = UOp::const_(DType::Int32, ConstValue::Int(2));
-            #[doc = concat!("let result = UOp::", stringify!($method), "(value, shift_amount)?;")]
+            #[doc = concat!("let result = value.", stringify!($method), "(&shift_amount)?;")]
             /// // Result preserves LHS dtype
             /// assert_eq!(result.dtype(), DType::Int32);
             /// # Ok::<(), Error>(())

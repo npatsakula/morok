@@ -28,7 +28,7 @@ fn test_if_with_comparison_condition() {
     let b = UOp::const_(DType::Int32, ConstValue::Int(10));
 
     // Create comparison condition: a < b
-    let condition = UOp::cmplt(&a, &b).unwrap();
+    let condition = a.try_cmplt(&b).unwrap();
     assert_eq!(condition.dtype(), DType::Bool);
 
     let body_stmt = UOp::const_(DType::Float32, ConstValue::Float(42.0));

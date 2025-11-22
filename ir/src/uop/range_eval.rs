@@ -104,12 +104,133 @@ fn compute_unary_range(op: UnaryOp, vmin: ConstValue, vmax: ConstValue, dtype: &
             let new_max = eval_unary_op(UnaryOp::Neg, vmin).unwrap_or_else(|| dtype_bounds(dtype).1);
             (new_min, new_max)
         }
-        UnaryOp::Sin => {
-            // Sin is bounded in [-1, 1] for any input
+        UnaryOp::Abs => {
+            // Absolute value: if range crosses zero, min becomes 0
+            // Otherwise, we need to take abs of both endpoints and find min/max
+            let crosses_zero = match (vmin, vmax) {
+                (ConstValue::Int(min), ConstValue::Int(max)) => min <= 0 && max >= 0,
+                (ConstValue::Float(min), ConstValue::Float(max)) => min <= 0.0 && max >= 0.0,
+                _ => false,
+            };
+
+            if crosses_zero {
+                // Range includes zero, so min is 0
+                let zero = match vmin {
+                    ConstValue::Int(_) => ConstValue::Int(0),
+                    ConstValue::UInt(_) => ConstValue::UInt(0),
+                    ConstValue::Float(_) => ConstValue::Float(0.0),
+                    _ => dtype_bounds(dtype).0,
+                };
+
+                let abs_min = eval_unary_op(UnaryOp::Abs, vmin);
+                let abs_max = eval_unary_op(UnaryOp::Abs, vmax);
+                let max_val = match (abs_min, abs_max) {
+                    (Some(a), Some(b)) => {
+                        if compare_const_values(&a, &b) == Ordering::Greater {
+                            a
+                        } else {
+                            b
+                        }
+                    }
+                    _ => dtype_bounds(dtype).1,
+                };
+                (zero, max_val)
+            } else {
+                // Range doesn't cross zero, evaluate at endpoints
+                let val_min = eval_unary_op(op, vmin);
+                let val_max = eval_unary_op(op, vmax);
+                match (val_min, val_max) {
+                    (Some(min), Some(max)) => {
+                        if compare_const_values(&min, &max) == Ordering::Greater {
+                            (max, min)
+                        } else {
+                            (min, max)
+                        }
+                    }
+                    _ => dtype_bounds(dtype),
+                }
+            }
+        }
+        UnaryOp::Sin | UnaryOp::Cos => {
+            // Sin and Cos are bounded in [-1, 1] for any input
             // TODO: Could be more precise for small ranges
             (ConstValue::Float(-1.0), ConstValue::Float(1.0))
         }
-        UnaryOp::Sqrt | UnaryOp::Exp2 | UnaryOp::Log2 | UnaryOp::Reciprocal | UnaryOp::Trunc => {
+        UnaryOp::Tan => {
+            // Tan is unbounded, so use dtype bounds
+            // TODO: Could be more precise for small ranges avoiding discontinuities
+            dtype_bounds(dtype)
+        }
+        UnaryOp::Erf => {
+            // Erf is bounded in [-1, 1] for all inputs
+            (ConstValue::Float(-1.0), ConstValue::Float(1.0))
+        }
+        UnaryOp::Sign => {
+            // Sign returns -1, 0, or 1
+            match vmin {
+                ConstValue::Int(_) => (ConstValue::Int(-1), ConstValue::Int(1)),
+                ConstValue::Float(_) => (ConstValue::Float(-1.0), ConstValue::Float(1.0)),
+                ConstValue::UInt(_) => (ConstValue::UInt(0), ConstValue::UInt(1)),
+                _ => dtype_bounds(dtype),
+            }
+        }
+        UnaryOp::Square => {
+            // Square: x² - similar to Abs, if range crosses zero, min becomes 0
+            let crosses_zero = match (vmin, vmax) {
+                (ConstValue::Int(min), ConstValue::Int(max)) => min <= 0 && max >= 0,
+                (ConstValue::Float(min), ConstValue::Float(max)) => min <= 0.0 && max >= 0.0,
+                _ => false,
+            };
+
+            if crosses_zero {
+                // Range includes zero, so min is 0
+                let zero = match vmin {
+                    ConstValue::Int(_) => ConstValue::Int(0),
+                    ConstValue::UInt(_) => ConstValue::UInt(0),
+                    ConstValue::Float(_) => ConstValue::Float(0.0),
+                    _ => dtype_bounds(dtype).0,
+                };
+
+                let sq_min = eval_unary_op(UnaryOp::Square, vmin);
+                let sq_max = eval_unary_op(UnaryOp::Square, vmax);
+                let max_val = match (sq_min, sq_max) {
+                    (Some(a), Some(b)) => {
+                        if compare_const_values(&a, &b) == Ordering::Greater {
+                            a
+                        } else {
+                            b
+                        }
+                    }
+                    _ => dtype_bounds(dtype).1,
+                };
+                (zero, max_val)
+            } else {
+                // Range doesn't cross zero, evaluate at endpoints
+                let val_min = eval_unary_op(op, vmin);
+                let val_max = eval_unary_op(op, vmax);
+                match (val_min, val_max) {
+                    (Some(min), Some(max)) => {
+                        if compare_const_values(&min, &max) == Ordering::Greater {
+                            (max, min)
+                        } else {
+                            (min, max)
+                        }
+                    }
+                    _ => dtype_bounds(dtype),
+                }
+            }
+        }
+        UnaryOp::Sqrt
+        | UnaryOp::Rsqrt
+        | UnaryOp::Exp
+        | UnaryOp::Exp2
+        | UnaryOp::Log
+        | UnaryOp::Log2
+        | UnaryOp::Reciprocal
+        | UnaryOp::Trunc
+        | UnaryOp::Floor
+        | UnaryOp::Ceil
+        | UnaryOp::Round => {
             // For monotonic or simple functions, evaluate at endpoints
             let val_min = eval_unary_op(op, vmin);
             let val_max = eval_unary_op(op, vmax);
@@ -142,7 +263,10 @@ fn compute_binary_range(
 
     // Fast path: if both operands are constants, evaluate exactly
     // (except for comparisons which always return full bool range for consistency)
-    if a_min == a_max && b_min == b_max && !matches!(op, BinaryOp::Lt | BinaryOp::Eq | BinaryOp::Ne) {
+    if a_min == a_max
+        && b_min == b_max
+        && !matches!(op, BinaryOp::Lt | BinaryOp::Le | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Gt | BinaryOp::Ge)
+    {
         if let Some(val) = eval_binary_op(op, a_min, b_min) {
             return (val, val);
         }
@@ -226,7 +350,7 @@ fn compute_binary_range(
         }
 
         // Comparison operations - use unified ComparisonAnalyzer
-        BinaryOp::Lt | BinaryOp::Eq | BinaryOp::Ne => {
+        BinaryOp::Lt | BinaryOp::Le | BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Gt | BinaryOp::Ge => {
             use crate::uop::comparison_analysis::ComparisonAnalyzer;
             ComparisonAnalyzer::get_comparison_range(op, a_min, a_max, b_min, b_max)
         }

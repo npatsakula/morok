@@ -37,7 +37,7 @@ fn test_where_with_comparison() {
     let b = UOp::const_(DType::Int32, ConstValue::Int(10));
 
     // condition: a < b
-    let condition = UOp::cmplt(&a, &b).unwrap();
+    let condition = a.try_cmplt(&b).unwrap();
 
     let true_val = UOp::const_(DType::Int32, ConstValue::Int(1));
     let false_val = UOp::const_(DType::Int32, ConstValue::Int(0));

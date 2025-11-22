@@ -15,6 +15,7 @@ proptest = { version = "1.9.0", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 half = "2.7.1"
 derive_more = { version = "2.0.1", features = ["display"] }
+libm = "0.2.15"
 
 [dev-dependencies]
 proptest = "1.9.0"

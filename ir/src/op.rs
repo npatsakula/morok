@@ -465,7 +465,7 @@ impl Op {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use morok_ir::Op;
     ///
     /// // BUFFERIZE ends ranges starting at source index 1
@@ -473,8 +473,8 @@ impl Op {
     /// assert_eq!(bufferize_op.range_ending_src_index(), Some(1));
     ///
     /// // Regular arithmetic operations don't end ranges
-    /// let add_op = Op::Add { /* ... */ };
-    /// assert_eq!(add_op.range_ending_src_index(), None);
+    /// let binary_op = Op::Binary(/* ... */);
+    /// assert_eq!(binary_op.range_ending_src_index(), None);
     /// ```
     pub fn range_ending_src_index(&self) -> Option<usize> {
         match self {
@@ -501,7 +501,7 @@ impl Op {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use morok_ir::{Op, UOp};
     ///
     /// // END operation ends its range arguments

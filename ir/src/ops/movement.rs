@@ -88,14 +88,13 @@ impl UOp {
     /// ```rust
     /// # use morok_ir::{UOp, ConstValue, SInt, shape};
     /// # use morok_dtype::DType;
-    /// # use smallvec::smallvec;
+    /// # use smallvec::SmallVec;
     /// let src = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar
-    /// let new_shape = smallvec![SInt::from(1), SInt::from(1)];
-    /// let shape_uop = shape::shape_to_uop(&new_shape);
+    /// let new_shape: SmallVec<[SInt; 4]> = SmallVec::from_vec(vec![SInt::from(1), SInt::from(1)]);
     /// // This would work: scalar (product=1) -> [1,1] (product=1)
-    /// // let reshaped = UOp::try_reshape(src, &new_shape);
+    /// // let reshaped = src.try_reshape(&new_shape);
     /// ```
-    pub fn try_reshape(src: Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
+    pub fn try_reshape(self: &Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
         use crate::error::ReshapeNegativeDimensionSnafu;
         use crate::error::ReshapeSizeMismatchSnafu;
         use crate::shape::shape_to_uop;
@@ -110,7 +109,7 @@ impl UOp {
         }
 
         // Validate product equality if source shape is known
-        if let Some(src_shape) = src.shape()? {
+        if let Some(src_shape) = self.shape()? {
             let src_product = crate::sint_prod(src_shape);
             let dst_product = crate::sint_prod(new_shape);
 
@@ -122,8 +121,8 @@ impl UOp {
         }
 
         let shape_uop = shape_to_uop(new_shape);
-        let dtype = src.dtype();
-        Ok(Self::new(Op::Reshape { src, new_shape: shape_uop }, dtype))
+        let dtype = self.dtype();
+        Ok(Self::new(Op::Reshape { src: self.clone(), new_shape: shape_uop }, dtype))
     }
 
     /// Expand (broadcast) with strict validation.
@@ -134,13 +133,13 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if validation fails.
-    pub fn try_expand(src: Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
+    pub fn try_expand(self: &Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
         use crate::error::ExpandDimensionMismatchSnafu;
         use crate::error::ExpandInvalidDimensionSnafu;
         use crate::shape::shape_to_uop;
         use snafu::ensure;
 
-        if let Some(src_shape) = src.shape()? {
+        if let Some(src_shape) = self.shape()? {
             // Check dimension count
             ensure!(
                 src_shape.len() == new_shape.len(),
@@ -161,8 +160,8 @@ impl UOp {
         }
 
         let shape_uop = shape_to_uop(new_shape);
-        let dtype = src.dtype();
-        Ok(Self::new(Op::Expand { src, new_shape: shape_uop }, dtype))
+        let dtype = self.dtype();
+        Ok(Self::new(Op::Expand { src: self.clone(), new_shape: shape_uop }, dtype))
     }
 
     /// Permute with strict validation.
@@ -172,14 +171,14 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if permutation is invalid.
-    pub fn try_permute(src: Rc<Self>, axes: Vec<usize>) -> Result<Rc<Self>> {
+    pub fn try_permute(self: &Rc<Self>, axes: Vec<usize>) -> Result<Rc<Self>> {
         // Validate permutation if source shape is known
-        if let Some(src_shape) = src.shape()? {
+        if let Some(src_shape) = self.shape()? {
             Self::validate_permutation(&axes, src_shape.len())?;
         }
 
-        let dtype = src.dtype();
-        Ok(Self::new(Op::Permute { src, axes }, dtype))
+        let dtype = self.dtype();
+        Ok(Self::new(Op::Permute { src: self.clone(), axes }, dtype))
     }
 
     /// Pad with strict validation.
@@ -190,7 +189,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if validation fails or if padding contains symbolic values.
-    pub fn try_pad(src: Rc<Self>, padding: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
+    pub fn try_pad(self: &Rc<Self>, padding: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
         use crate::error::{PadDimensionMismatchSnafu, SymbolicPaddingUnsupportedSnafu};
         use crate::shape::ranges_to_uops;
         use snafu::ensure;
@@ -201,7 +200,7 @@ impl UOp {
             ensure!(end.is_const(), SymbolicPaddingUnsupportedSnafu);
         }
 
-        if let Some(src_shape) = src.shape()? {
+        if let Some(src_shape) = self.shape()? {
             // Check dimension count
             ensure!(
                 padding.len() == src_shape.len(),
@@ -210,8 +209,8 @@ impl UOp {
         }
 
         let (begin_pads, end_pads) = ranges_to_uops(padding);
-        let dtype = src.dtype();
-        Ok(Self::new(Op::Pad { src, begin_pads, end_pads }, dtype))
+        let dtype = self.dtype();
+        Ok(Self::new(Op::Pad { src: self.clone(), begin_pads, end_pads }, dtype))
     }
 
     /// Shrink (slice) with strict validation.
@@ -223,7 +222,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if validation fails or if ranges contain symbolic values.
-    pub fn try_shrink(src: Rc<Self>, ranges: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
+    pub fn try_shrink(self: &Rc<Self>, ranges: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
         use crate::error::{ShrinkBoundsViolationSnafu, SymbolicShrinkingUnsupportedSnafu};
         use crate::shape::ranges_to_uops;
         use snafu::ensure;
@@ -234,7 +233,7 @@ impl UOp {
             ensure!(end.is_const(), SymbolicShrinkingUnsupportedSnafu);
         }
 
-        if let Some(src_shape) = src.shape()? {
+        if let Some(src_shape) = self.shape()? {
             // Validate each range
             for (dim_idx, ((begin, end), dim_size)) in ranges.iter().zip(src_shape.iter()).enumerate() {
                 // All are concrete now (checked above), validate bounds
@@ -248,8 +247,8 @@ impl UOp {
         }
 
         let (begins, ends) = ranges_to_uops(ranges);
-        let dtype = src.dtype();
-        Ok(Self::new(Op::Shrink { src, begins, ends }, dtype))
+        let dtype = self.dtype();
+        Ok(Self::new(Op::Shrink { src: self.clone(), begins, ends }, dtype))
     }
 
     /// Flip with strict validation.
@@ -259,12 +258,12 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if specification is invalid.
-    pub fn try_flip(src: Rc<Self>, axes: Vec<bool>) -> Result<Rc<Self>> {
-        if let Some(src_shape) = src.shape()? {
+    pub fn try_flip(self: &Rc<Self>, axes: Vec<bool>) -> Result<Rc<Self>> {
+        if let Some(src_shape) = self.shape()? {
             Self::validate_flip_axes(&axes, src_shape.len())?;
         }
 
-        let dtype = src.dtype();
-        Ok(Self::new(Op::Flip { src, axes }, dtype))
+        let dtype = self.dtype();
+        Ok(Self::new(Op::Flip { src: self.clone(), axes }, dtype))
     }
 }

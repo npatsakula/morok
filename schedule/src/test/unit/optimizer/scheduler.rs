@@ -1305,3 +1305,101 @@ fn test_phase7_integration() {
     assert_eq!(info.applied_opts.len(), 1);
     assert_eq!(info.applied_opts[0].op, OptOps::UPCAST);
 }
+
+#[test]
+fn test_kernel_name_deduplication() {
+    use crate::optimizer::{KernelInfo, clear_kernel_name_counts};
+
+    // Clear the counter to ensure clean state for this test
+    clear_kernel_name_counts();
+
+    // Create two identical kernel shapes
+    let r_global = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Global);
+    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let sink = UOp::sink(vec![val, r_global]);
+
+    let ren = Renderer::cuda();
+    let scheduler1 = Scheduler::new(sink.clone(), ren.clone());
+    let scheduler2 = Scheduler::new(sink.clone(), ren.clone());
+    let scheduler3 = Scheduler::new(sink.clone(), ren);
+
+    // Get optimized ASTs
+    let opt1 = scheduler1.get_optimized_ast(None);
+    let opt2 = scheduler2.get_optimized_ast(None);
+    let opt3 = scheduler3.get_optimized_ast(None);
+
+    // Extract names
+    let info1 = opt1.metadata::<KernelInfo>().unwrap();
+    let info2 = opt2.metadata::<KernelInfo>().unwrap();
+    let info3 = opt3.metadata::<KernelInfo>().unwrap();
+
+    // All three names should be different (deduplication working)
+    assert_ne!(info1.name, info2.name, "Second kernel should have different name than first");
+    assert_ne!(info2.name, info3.name, "Third kernel should have different name than second");
+    assert_ne!(info1.name, info3.name, "Third kernel should have different name than first");
+
+    // They should all start with the same base name
+    assert!(info1.name.starts_with("E_g16"), "First kernel name should start with E_g16");
+    assert!(info2.name.starts_with("E_g16"), "Second kernel name should start with E_g16");
+    assert!(info3.name.starts_with("E_g16"), "Third kernel name should start with E_g16");
+
+    // The second and third should have the deduplication suffix 'n'
+    assert!(info2.name.contains('n'), "Second kernel should have deduplication suffix");
+    assert!(info3.name.contains('n'), "Third kernel should have deduplication suffix");
+
+    // Clean up for other tests
+    clear_kernel_name_counts();
+}
+
+#[test]
+fn test_globalizable_rngs_with_sink() {
+    // Test that SINK operations are properly handled in globalizable_rngs
+    let loop1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Loop);
+    let loop2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 1, AxisType::Loop);
+
+    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    // Use SINK operation
+    let sink = UOp::sink(vec![val, loop1.clone(), loop2.clone()]);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Convert LOOP to GLOBAL
+    scheduler.convert_loop_to_global().unwrap();
+
+    // Verify that LOOP axes were converted to GLOBAL
+    let ranges = scheduler.rngs();
+    assert_eq!(ranges.len(), 2);
+
+    for rng in ranges {
+        if let Op::Range { axis_type, .. } = rng.op() {
+            assert_eq!(*axis_type, AxisType::Global, "LOOP axes in SINK should be converted to GLOBAL");
+        }
+    }
+}
+
+#[test]
+fn test_flatten_ranges_store() {
+    // Test that STORE operations with nested REDUCE are properly flattened
+    let r_reduce = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(32)), 0, AxisType::Reduce);
+
+    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let reduce = UOp::reduce(val.clone(), vec![r_reduce].into(), ReduceOp::Add);
+
+    // Create a STORE operation with the reduce as its value
+    let buffer = UOp::const_(DType::Index, ConstValue::Int(0)); // Dummy buffer
+    let index = UOp::const_(DType::Index, ConstValue::Int(0)); // Dummy index
+    let store = UOp::store(buffer, index, reduce);
+
+    let ren = Renderer::cuda();
+    let scheduler = Scheduler::new(store, ren);
+
+    // Get optimized AST (which calls flatten_ranges)
+    let optimized = scheduler.get_optimized_ast(None);
+
+    // Verify the AST was processed without errors
+    // The flattening should have recursively processed the STORE and its nested REDUCE
+    use crate::optimizer::KernelInfo;
+    let info = optimized.metadata::<KernelInfo>();
+    assert!(info.is_some(), "STORE with nested REDUCE should be flattened successfully");
+}

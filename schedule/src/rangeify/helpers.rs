@@ -198,11 +198,11 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                         SInt::Symbolic(uop) => uop.try_add_op(&begin_uop).unwrap(),
                     };
                     // rng >= begin  (use !(rng < begin) implemented as (rng < begin) XOR true)
-                    let too_low = UOp::cmplt(rng, &begin_uop).unwrap();
+                    let too_low = rng.try_cmplt(&begin_uop).unwrap();
                     let true_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
                     let valid_low = too_low.try_xor_op(&true_val).unwrap();
                     // rng < shape + begin
-                    let valid_high = UOp::cmplt(rng, &shape_plus_begin).unwrap();
+                    let valid_high = rng.try_cmplt(&shape_plus_begin).unwrap();
                     // valid = valid_low & valid_high
                     let valid = valid_low.try_and_op(&valid_high).unwrap();
                     // Subtract padding: rng - begin

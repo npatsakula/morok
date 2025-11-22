@@ -510,7 +510,7 @@ impl UOp {
         // Check if this UOp is in the substitution map
         if let Some(replacement) = map.get(&UOpKey(self.clone())) {
             // Record substitution transformation
-            use crate::provenance::{PassName, PROVENANCE_TRACKER};
+            use crate::provenance::{PROVENANCE_TRACKER, PassName};
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().record_transform(replacement.id, self.id, PassName::Substitute);
             });
@@ -962,7 +962,7 @@ impl UOp {
         let new_uop = Self::new(new_op, self.dtype.clone());
 
         // Record transformation in provenance tracker
-        use crate::provenance::{PassName, PROVENANCE_TRACKER};
+        use crate::provenance::{PROVENANCE_TRACKER, PassName};
         PROVENANCE_TRACKER.with(|tracker| {
             tracker.borrow_mut().record_transform(new_uop.id, self.id, PassName::Substitute);
         });

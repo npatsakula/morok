@@ -25,16 +25,73 @@ impl UOp {
         Ok(Self::new(Op::Unary(UnaryOp::Sin, operand), dtype))
     }
 
+    /// Cosine: cos(x) - requires float dtype.
+    pub fn cos_op(operand: Rc<Self>) -> Result<Rc<Self>> {
+        let dtype = operand.dtype();
+        if !dtype.is_float() {
+            return InvalidDTypeForOpSnafu { operation: "cos", dtype }.fail();
+        }
+        Ok(Self::new(Op::Unary(UnaryOp::Cos, operand), dtype))
+    }
+
+    /// Tangent: tan(x) - requires float dtype.
+    pub fn tan_op(operand: Rc<Self>) -> Result<Rc<Self>> {
+        let dtype = operand.dtype();
+        if !dtype.is_float() {
+            return InvalidDTypeForOpSnafu { operation: "tan", dtype }.fail();
+        }
+        Ok(Self::new(Op::Unary(UnaryOp::Tan, operand), dtype))
+    }
+
+    /// Error function: erf(x) - requires float dtype.
+    pub fn erf_op(operand: Rc<Self>) -> Result<Rc<Self>> {
+        let dtype = operand.dtype();
+        if !dtype.is_float() {
+            return InvalidDTypeForOpSnafu { operation: "erf", dtype }.fail();
+        }
+        Ok(Self::new(Op::Unary(UnaryOp::Erf, operand), dtype))
+    }
+
     /// Reciprocal: 1/x.
     pub fn reciprocal_op(operand: Rc<Self>) -> Rc<Self> {
         let dtype = operand.dtype();
         Self::new(Op::Unary(UnaryOp::Reciprocal, operand), dtype)
     }
 
+    /// Square: x².
+    pub fn square_op(operand: Rc<Self>) -> Rc<Self> {
+        let dtype = operand.dtype();
+        Self::new(Op::Unary(UnaryOp::Square, operand), dtype)
+    }
+
     /// Truncate towards zero.
     pub fn trunc_op(operand: Rc<Self>) -> Rc<Self> {
         let dtype = operand.dtype();
         Self::new(Op::Unary(UnaryOp::Trunc, operand), dtype)
+    }
+
+    /// Floor: round towards -∞.
+    pub fn floor_op(operand: Rc<Self>) -> Rc<Self> {
+        let dtype = operand.dtype();
+        Self::new(Op::Unary(UnaryOp::Floor, operand), dtype)
+    }
+
+    /// Ceiling: round towards +∞.
+    pub fn ceil_op(operand: Rc<Self>) -> Rc<Self> {
+        let dtype = operand.dtype();
+        Self::new(Op::Unary(UnaryOp::Ceil, operand), dtype)
+    }
+
+    /// Round: round to nearest integer (half to even).
+    pub fn round_op(operand: Rc<Self>) -> Rc<Self> {
+        let dtype = operand.dtype();
+        Self::new(Op::Unary(UnaryOp::Round, operand), dtype)
+    }
+
+    /// Sign: -1 for negative, 0 for zero, 1 for positive.
+    pub fn sign_op(operand: Rc<Self>) -> Rc<Self> {
+        let dtype = operand.dtype();
+        Self::new(Op::Unary(UnaryOp::Sign, operand), dtype)
     }
 
     // =========================================================================

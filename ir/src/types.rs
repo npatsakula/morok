@@ -326,6 +326,8 @@ pub enum ReduceOp {
     Mul,
     /// Maximum reduction (max(a, b)).
     Max,
+    /// Minimum reduction (min(a, b)).
+    Min,
 }
 
 /// Unary operation types.
@@ -335,18 +337,42 @@ pub enum ReduceOp {
 pub enum UnaryOp {
     /// Negation: -x
     Neg,
+    /// Absolute value: |x|
+    Abs,
     /// Square root: √x
     Sqrt,
+    /// Reciprocal square root: 1/√x
+    Rsqrt,
+    /// Natural exponential: e^x
+    Exp,
     /// Base-2 exponential: 2^x
     Exp2,
+    /// Natural logarithm: ln(x)
+    Log,
     /// Base-2 logarithm: log₂(x)
     Log2,
     /// Sine: sin(x) (float only)
     Sin,
+    /// Cosine: cos(x) (float only)
+    Cos,
+    /// Tangent: tan(x) (float only)
+    Tan,
     /// Reciprocal: 1/x
     Reciprocal,
     /// Truncate towards zero (remove fractional part)
     Trunc,
+    /// Floor: round towards -∞
+    Floor,
+    /// Ceiling: round towards +∞
+    Ceil,
+    /// Round: round to nearest integer (half to even)
+    Round,
+    /// Sign: -1 for negative, 0 for zero, 1 for positive
+    Sign,
+    /// Error function: erf(x) (float only)
+    Erf,
+    /// Square: x²
+    Square,
 }
 
 /// Binary operation types.
@@ -394,10 +420,16 @@ pub enum BinaryOp {
     // Comparison operations
     /// Less than: a < b
     Lt,
+    /// Less than or equal: a <= b
+    Le,
     /// Equality: a == b
     Eq,
     /// Inequality: a != b
     Ne,
+    /// Greater than: a > b
+    Gt,
+    /// Greater than or equal: a >= b
+    Ge,
 
     // Bitwise operations (int/bool only)
     /// Bitwise AND: a & b

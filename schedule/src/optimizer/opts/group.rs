@@ -88,19 +88,20 @@ pub fn apply(scheduler: &mut Scheduler, rng: Rc<UOp>, amount: usize, top: bool) 
             .fail();
     }
 
-    // 4. Check not inside another reduce
-    // Get all ranges used by the reduce operation
-    let reduce_ranges = get_reduce_ranges(&reduce_uop);
-
-    for dep_range in &reduce_ranges {
-        if let Op::Range { axis_type, .. } = dep_range.op()
-            && matches!(axis_type, AxisType::Reduce | AxisType::Unroll | AxisType::GroupReduce)
-        {
-            // Skip the range we're about to split
-            if Rc::ptr_eq(dep_range, &rng) {
+    // 4. Check not inside another reduce (nested reductions)
+    // Look for OTHER REDUCE operations in the backward slice
+    // If found, GROUP is being applied inside a nested reduction
+    let reduce_ptr = Rc::as_ptr(&reduce_uop) as *const _;
+    for node in reduce_uop.backward_slice() {
+        if let Op::Reduce { .. } = node.op() {
+            let node_ptr = Rc::as_ptr(&node) as *const _;
+            // Skip the current reduce we're working on
+            if node_ptr == reduce_ptr {
                 continue;
             }
 
+            // Found a different REDUCE operation in the backward slice
+            // This means we're trying to GROUP inside a nested reduction
             return ValidationFailedSnafu { op: "GROUP", reason: "cannot apply GROUP inside another reduction" }.fail();
         }
     }
@@ -124,9 +125,4 @@ fn find_reduce_using_range(scheduler: &Scheduler, rng: &Rc<UOp>) -> Result<Rc<UO
     }
 
     ValidationFailedSnafu { op: "GROUP", reason: "could not find REDUCE operation using this range" }.fail()
-}
-
-/// Get all Range UOps used by a REDUCE operation (from backward_slice).
-fn get_reduce_ranges(reduce: &Rc<UOp>) -> Vec<Rc<UOp>> {
-    reduce.backward_slice().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect()
 }

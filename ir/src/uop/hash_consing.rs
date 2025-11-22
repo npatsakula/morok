@@ -222,6 +222,9 @@ impl UOp {
     /// Otherwise, creates a new UOp and caches it.
     #[track_caller]
     pub fn new(op: Op, dtype: DType) -> Rc<Self> {
+        // Capture caller location BEFORE entering any closures
+        // This is critical for #[track_caller] to work correctly
+        let caller_location = std::panic::Location::caller();
         let key = UOpKey::new(&op, dtype.clone());
 
         CACHE.with(|cache| {
@@ -246,10 +249,10 @@ impl UOp {
                 metadata: None,
             });
 
-            // Capture provenance information
+            // Capture provenance information using the location captured before the closure
             use crate::provenance::PROVENANCE_TRACKER;
             PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().capture(uop.id, std::panic::Location::caller());
+                tracker.borrow_mut().capture(uop.id, caller_location);
             });
 
             // Cache it

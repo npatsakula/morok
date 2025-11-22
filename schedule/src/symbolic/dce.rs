@@ -128,6 +128,37 @@ pub fn reduce_identity(op: morok_ir::types::ReduceOp, dtype: morok_dtype::DType)
             };
             UOp::const_(dtype, min_val)
         }
+        ReduceOp::Min => {
+            // Return dtype maximum value
+            let max_val = if dtype == DType::Int8 {
+                Int(i8::MAX as i64)
+            } else if dtype == DType::Int16 {
+                Int(i16::MAX as i64)
+            } else if dtype == DType::Int32 {
+                Int(i32::MAX as i64)
+            } else if dtype == DType::Int64 {
+                Int(i64::MAX)
+            } else if dtype == DType::UInt8 {
+                UInt(u8::MAX as u64)
+            } else if dtype == DType::UInt16 {
+                UInt(u16::MAX as u64)
+            } else if dtype == DType::UInt32 {
+                UInt(u32::MAX as u64)
+            } else if dtype == DType::UInt64 {
+                UInt(u64::MAX)
+            } else if dtype == DType::Float16 {
+                Float(65504.0)
+            } else if dtype == DType::BFloat16 {
+                Float(3.38953e38)
+            } else if dtype == DType::Float32 {
+                Float(f32::MAX as f64)
+            } else if dtype == DType::Float64 {
+                Float(f64::MAX)
+            } else {
+                Int(0) // Fallback for unsupported types
+            };
+            UOp::const_(dtype, max_val)
+        }
     }
 }
 
