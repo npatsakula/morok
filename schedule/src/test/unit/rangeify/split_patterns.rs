@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::rc::Rc;
 
 use morok_dtype::DType;
 use morok_ir::{AxisType, ConstValue, Op, UOp};
@@ -21,12 +21,8 @@ fn test_debuf_global() {
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
 
-    // Create bindings
-    let mut bindings = HashMap::new();
-    bindings.insert("buf".to_string(), buffer.clone());
-
     // Apply debuf pattern
-    let result = debuf(&bindings, &mut ctx);
+    let result = debuf(&buffer, &mut ctx);
 
     // Should return a DEFINE_GLOBAL
     match result {
@@ -47,12 +43,8 @@ fn test_unbind_kernel() {
     let value = UOp::const_(DType::Index, ConstValue::Int(5));
     let bind = UOp::bind(var.clone(), value);
 
-    // Create bindings
-    let mut bindings = HashMap::new();
-    bindings.insert("b".to_string(), bind);
-
     // Apply unbind_kernel pattern
-    let result = unbind_kernel(&bindings, &mut ctx);
+    let result = unbind_kernel(&bind, &mut ctx);
 
     // Should return just the variable
     match result {
@@ -72,12 +64,8 @@ fn test_renumber_range() {
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
     let range = UOp::range_axis(end, 5, AxisType::Loop);
 
-    // Create bindings
-    let mut bindings = HashMap::new();
-    bindings.insert("r".to_string(), range);
-
     // Apply renumber_range pattern
-    let result = renumber_range(&bindings, &mut ctx);
+    let result = renumber_range(&range, &mut ctx);
 
     // Should return a RANGE with axis_id=0
     match result {
@@ -101,11 +89,9 @@ fn test_remove_zero_range() {
     let range = UOp::range_axis(end, 0, AxisType::Loop);
 
     // Create bindings
-    let mut bindings = HashMap::new();
-    bindings.insert("r".to_string(), range);
 
     // Apply remove_zero_range pattern
-    let result = remove_zero_range(&bindings, &mut ctx);
+    let result = remove_zero_range(&range, &mut ctx);
 
     // Should return CONST(0)
     match result {
@@ -124,11 +110,9 @@ fn test_cleanup_const_with_sources() {
     let const_op = UOp::const_(DType::Int32, ConstValue::Int(42));
 
     // Create bindings
-    let mut bindings = HashMap::new();
-    bindings.insert("c".to_string(), const_op.clone());
 
     // Apply cleanup_const pattern (should not match since const has no sources normally)
-    let result = cleanup_const(&bindings, &mut ctx);
+    let result = cleanup_const(&const_op, &mut ctx);
 
     // Should return NoMatch since the const has no sources
     assert!(matches!(result, RewriteResult::NoMatch));
@@ -144,11 +128,9 @@ fn test_handle_after() {
     let after = UOp::new(Op::After { passthrough: buffer.clone(), deps: smallvec![store] }, buffer.dtype());
 
     // Create bindings
-    let mut bindings = HashMap::new();
-    bindings.insert("after".to_string(), after.clone());
 
     // Apply handle_after pattern
-    let result = handle_after(&bindings, &mut ctx);
+    let result = handle_after(&after, &mut ctx);
 
     // Should return the buffer
     match result {
@@ -178,17 +160,13 @@ fn test_debuf_counter_increment() {
     let buffer2 = UOp::new(Op::Buffer { unique: unique2, device: device2, size: 200 }, DType::Float32);
 
     // Apply debuf to first buffer
-    let mut bindings1 = HashMap::new();
-    bindings1.insert("buf".to_string(), buffer1.clone());
-    let result1 = debuf(&bindings1, &mut ctx);
+    let result1 = debuf(&buffer1, &mut ctx);
 
     assert!(matches!(result1, RewriteResult::Rewritten(_)));
     assert_eq!(ctx.global_counter, 1);
 
     // Apply debuf to second buffer
-    let mut bindings2 = HashMap::new();
-    bindings2.insert("buf".to_string(), buffer2.clone());
-    let result2 = debuf(&bindings2, &mut ctx);
+    let result2 = debuf(&buffer2, &mut ctx);
 
     assert!(matches!(result2, RewriteResult::Rewritten(_)));
     assert_eq!(ctx.global_counter, 2);
@@ -206,10 +184,7 @@ fn test_debuf_buffer_mapping() {
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
 
-    let mut bindings = HashMap::new();
-    bindings.insert("buf".to_string(), buffer.clone());
-
-    debuf(&bindings, &mut ctx);
+    debuf(&buffer, &mut ctx);
 
     // Buffer should be mapped to itself
     assert!(ctx.has_buffer(&buffer));
@@ -230,10 +205,7 @@ fn test_handle_after_mstack_unwrap() {
     let store = UOp::noop();
     let after = UOp::new(Op::After { passthrough: mstack, deps: smallvec![store] }, buf1.dtype());
 
-    let mut bindings = HashMap::new();
-    bindings.insert("after".to_string(), after.clone());
-
-    let result = handle_after(&bindings, &mut ctx);
+    let result = handle_after(&after, &mut ctx);
 
     // Should unwrap to first buffer of MSTACK
     match result {
@@ -259,10 +231,7 @@ fn test_handle_after_mselect_unwrap() {
     let store = UOp::noop();
     let after = UOp::new(Op::After { passthrough: mselect, deps: smallvec![store] }, buffer.dtype());
 
-    let mut bindings = HashMap::new();
-    bindings.insert("after".to_string(), after.clone());
-
-    let result = handle_after(&bindings, &mut ctx);
+    let result = handle_after(&after, &mut ctx);
 
     // Should unwrap to buffer
     match result {
@@ -286,17 +255,11 @@ fn test_renumber_range_sequential() {
     let range3 = UOp::range_axis(end.clone(), 3, AxisType::Outer);
 
     // Renumber all three
-    let mut bindings1 = HashMap::new();
-    bindings1.insert("r".to_string(), range1);
-    let result1 = renumber_range(&bindings1, &mut ctx);
+    let result1 = renumber_range(&range1, &mut ctx);
 
-    let mut bindings2 = HashMap::new();
-    bindings2.insert("r".to_string(), range2);
-    let result2 = renumber_range(&bindings2, &mut ctx);
+    let result2 = renumber_range(&range2, &mut ctx);
 
-    let mut bindings3 = HashMap::new();
-    bindings3.insert("r".to_string(), range3);
-    let result3 = renumber_range(&bindings3, &mut ctx);
+    let result3 = renumber_range(&range3, &mut ctx);
 
     // Should get sequential IDs 0, 1, 2
     if let RewriteResult::Rewritten(r) = result1
@@ -326,10 +289,8 @@ fn test_renumber_range_different_axis_types() {
     // Test all three axis types
     for axis_type in [AxisType::Loop, AxisType::Reduce, AxisType::Outer] {
         let range = UOp::range_axis(end.clone(), 99, axis_type);
-        let mut bindings = HashMap::new();
-        bindings.insert("r".to_string(), range);
 
-        let result = renumber_range(&bindings, &mut ctx);
+        let result = renumber_range(&range, &mut ctx);
 
         if let RewriteResult::Rewritten(r) = result {
             if let Op::Range { axis_type: new_type, .. } = r.op() {
@@ -350,16 +311,12 @@ fn test_renumber_range_no_change_if_same() {
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
     let range1 = UOp::range_axis(end.clone(), 5, AxisType::Loop);
 
-    let mut bindings1 = HashMap::new();
-    bindings1.insert("r".to_string(), range1);
-    renumber_range(&bindings1, &mut ctx);
+    renumber_range(&range1, &mut ctx);
 
     // Now create a range that already has axis_id=1 (which would be the next ID)
     let range2 = UOp::range_axis(end.clone(), 1, AxisType::Loop);
-    let mut bindings2 = HashMap::new();
-    bindings2.insert("r".to_string(), range2);
 
-    let result = renumber_range(&bindings2, &mut ctx);
+    let result = renumber_range(&range2, &mut ctx);
 
     // Should return NoMatch since the ID matches what we would assign
     assert!(matches!(result, RewriteResult::NoMatch));
@@ -373,11 +330,8 @@ fn test_cleanup_const_define_var() {
     // Create a DEFINE_VAR
     let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
 
-    let mut bindings = HashMap::new();
-    bindings.insert("c".to_string(), define_var.clone());
-
     // Without sources, should not match
-    let result = cleanup_const(&bindings, &mut ctx);
+    let result = cleanup_const(&define_var, &mut ctx);
     assert!(matches!(result, RewriteResult::NoMatch));
 
     // TODO: Test with spurious sources once we have a way to create them
@@ -391,10 +345,7 @@ fn test_remove_zero_range_uint() {
     let end = UOp::const_(DType::Index, ConstValue::UInt(0));
     let range = UOp::range_axis(end, 0, AxisType::Loop);
 
-    let mut bindings = HashMap::new();
-    bindings.insert("r".to_string(), range);
-
-    let result = remove_zero_range(&bindings, &mut ctx);
+    let result = remove_zero_range(&range, &mut ctx);
 
     // Should return CONST(0)
     match result {
@@ -413,10 +364,7 @@ fn test_remove_zero_range_non_zero() {
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
     let range = UOp::range_axis(end, 0, AxisType::Loop);
 
-    let mut bindings = HashMap::new();
-    bindings.insert("r".to_string(), range);
-
-    let result = remove_zero_range(&bindings, &mut ctx);
+    let result = remove_zero_range(&range, &mut ctx);
 
     // Should return NoMatch
     assert!(matches!(result, RewriteResult::NoMatch));
@@ -436,10 +384,7 @@ fn test_handle_after_mstack_advanced() {
     // Note: AFTER has passthrough + deps, not src
     let after = UOp::new(Op::After { passthrough: mstack.clone(), deps: SmallVec::new() }, DType::Float32);
 
-    let mut bindings = HashMap::new();
-    bindings.insert("after".to_string(), after);
-
-    let result = handle_after(&bindings, &mut ctx);
+    let result = handle_after(&after, &mut ctx);
 
     // Should unwrap MSTACK and return first buffer
     match result {
@@ -461,14 +406,10 @@ fn test_cleanup_const_with_spurious_sources() {
     // Create a CONST that has sources (spurious - consts shouldn't have sources normally)
     // This tests the cleanup pattern that removes unnecessary sources from CONST
 
-    // For now, UOp::const_ doesn't allow sources, so we'll create a DEFINE_VAR
-    // and verify it doesn't get cleaned up (it should keep its sources)
-    let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
+    // Create a CONST
+    let const_op = UOp::const_(DType::Int32, ConstValue::Int(42));
 
-    let mut bindings = HashMap::new();
-    bindings.insert("c".to_string(), define_var.clone());
-
-    let result = cleanup_const(&bindings, &mut ctx);
+    let result = cleanup_const(&const_op, &mut ctx);
 
     // DEFINE_VAR shouldn't be cleaned up (it's not a CONST)
     assert!(matches!(result, RewriteResult::NoMatch));
@@ -484,10 +425,8 @@ fn test_renumber_range_with_gaps() {
     let range10 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(30)), 10, AxisType::Reduce);
 
     // Process them in sequence
-    let mut bindings0 = HashMap::new();
-    bindings0.insert("r".to_string(), range0.clone());
 
-    let result0 = renumber_range(&bindings0, &mut ctx);
+    let result0 = renumber_range(&range0, &mut ctx);
 
     // First range should keep ID 0
     match result0 {
@@ -498,10 +437,8 @@ fn test_renumber_range_with_gaps() {
     }
 
     // Second range (ID 5) should be renumbered to 1
-    let mut bindings5 = HashMap::new();
-    bindings5.insert("r".to_string(), range5.clone());
 
-    let result5 = renumber_range(&bindings5, &mut ctx);
+    let result5 = renumber_range(&range5, &mut ctx);
 
     match result5 {
         RewriteResult::Rewritten(new_range) => {
@@ -516,10 +453,8 @@ fn test_renumber_range_with_gaps() {
     }
 
     // Third range (ID 10) should be renumbered to 2
-    let mut bindings10 = HashMap::new();
-    bindings10.insert("r".to_string(), range10);
 
-    let result10 = renumber_range(&bindings10, &mut ctx);
+    let result10 = renumber_range(&range10, &mut ctx);
 
     match result10 {
         RewriteResult::Rewritten(new_range) => {
@@ -547,10 +482,7 @@ fn test_remove_zero_range_verification() {
     let end = UOp::const_(DType::Index, ConstValue::Int(0));
     let range = UOp::range(end.clone(), 0);
 
-    let mut bindings = HashMap::new();
-    bindings.insert("r".to_string(), range.clone());
-
-    let result = remove_zero_range(&bindings, &mut ctx);
+    let result = remove_zero_range(&range, &mut ctx);
 
     // Should rewrite to CONST(0)
     match result {
@@ -584,11 +516,8 @@ fn test_pattern_composition_sequence() {
 
     let range_gap = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(15)), 7, AxisType::Loop);
 
-    let mut bindings = HashMap::new();
-    bindings.insert("r".to_string(), range_gap.clone());
-
     // Apply renumber_range pattern
-    let result1 = renumber_range(&bindings, &mut ctx);
+    let result1 = renumber_range(&range_gap, &mut ctx);
 
     match result1 {
         RewriteResult::Rewritten(renumbered) => {
@@ -604,10 +533,8 @@ fn test_pattern_composition_sequence() {
 
                 // Now apply another pattern to the result
                 // For example, if the renumbered range has zero end, remove it
-                let mut bindings2 = HashMap::new();
-                bindings2.insert("r".to_string(), renumbered.clone());
 
-                let result2 = remove_zero_range(&bindings2, &mut ctx);
+                let result2 = remove_zero_range(&renumbered, &mut ctx);
 
                 // Should return NoMatch since end is 15, not 0
                 assert!(matches!(result2, RewriteResult::NoMatch));

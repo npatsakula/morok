@@ -61,6 +61,22 @@ pub enum Error {
         "Incompatible dimension {dim} for broadcasting: cannot broadcast size {from_size} to size {to_size}"
     ))]
     BroadcastIncompatible { dim: usize, from_size: usize, to_size: usize },
+
+    /// Codegen error occurred.
+    #[snafu(display("Codegen error: {message}"))]
+    Codegen { message: String },
+
+    /// Runtime error occurred.
+    #[snafu(display("Runtime error: {message}"))]
+    Runtime { message: String },
+
+    /// Buffer not found in registry.
+    #[snafu(display("Buffer for UOp {} not found in registry", uop_id))]
+    BufferNotFound { uop_id: u64 },
+
+    /// Device error occurred.
+    #[snafu(display("Device error: {message}"))]
+    Device { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

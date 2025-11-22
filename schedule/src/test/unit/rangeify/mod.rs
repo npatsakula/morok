@@ -1,13 +1,20 @@
 pub mod advanced_edge_cases;
 pub mod buffer_folding;
 pub mod bufferize_to_store;
+pub mod codegen_integration;
+pub mod codegen_patterns;
+pub mod context;
 pub mod cost_based;
+pub mod cycle_detection;
 pub mod dead_axis;
 pub mod edge_cases;
+pub mod flatten_range;
 pub mod helpers;
 pub mod indexing;
 pub mod kernel_context;
 pub mod kernel_count;
+pub mod patterns;
+pub mod pipeline;
 pub mod pipeline_integration;
 pub mod split_kernel;
 pub mod split_patterns;
@@ -16,7 +23,8 @@ pub mod transform;
 use morok_dtype::DType;
 use morok_ir::{ConstValue, UOp};
 
-use crate::rangeify::{RangeifyContext, patterns};
+use crate::rangeify::RangeifyContext;
+use crate::rangeify::patterns as rangeify_patterns;
 
 #[test]
 fn test_rangeify_context_new() {
@@ -60,9 +68,9 @@ fn test_rangeify_context_get_missing() {
 #[test]
 fn test_pattern_matchers_stub() {
     // Test that stub pattern matchers return empty matchers
-    let m3 = patterns::buffer_folding();
-    let m4 = patterns::buffer_removal();
-    let m5 = patterns::kernel_splitting();
+    let m3 = rangeify_patterns::buffer_folding();
+    let m4 = rangeify_patterns::buffer_removal();
+    let m5 = rangeify_patterns::kernel_splitting();
 
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
@@ -78,7 +86,7 @@ fn test_early_rewrites_detach_removal() {
     use crate::pattern::matcher::RewriteResult;
     use morok_ir::Op;
 
-    let matcher = patterns::early_rewrites();
+    let matcher = rangeify_patterns::early_rewrites();
 
     // Test: DETACH(x) -> x
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
@@ -96,7 +104,7 @@ fn test_early_rewrites_contiguous_backward_removal() {
     use crate::pattern::matcher::RewriteResult;
     use morok_ir::Op;
 
-    let matcher = patterns::early_rewrites();
+    let matcher = rangeify_patterns::early_rewrites();
 
     // Test: CONTIGUOUS_BACKWARD(x) -> x
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));

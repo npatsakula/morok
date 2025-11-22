@@ -141,8 +141,9 @@ pub fn run_rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, IndexingContext
     // Step 3: Assign ranges via reverse traversal
     assign_ranges(&reverse_topo, &consumer_map, &mut ctx)?;
 
-    // Step 4: Apply transformations (convert to BUFFERIZE/INDEX)
-    let transformed_sink = apply_rangeify_transform(sink, &ctx);
+    // Step 4: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
+    let early_matcher = super::patterns::early_rewrites();
+    let transformed_sink = crate::rewrite::graph_rewrite(&early_matcher, sink);
 
     Ok((transformed_sink, ctx))
 }
@@ -287,12 +288,3 @@ fn assign_ranges(
     Ok(())
 }
 
-/// Apply the rangeify transformation to convert movement ops to BUFFERIZE/INDEX.
-///
-/// NOTE: This is now a no-op. The actual transformation happens in transform::rangeify()
-/// via pattern matching after range assignment is complete.
-fn apply_rangeify_transform(sink: Rc<UOp>, _ctx: &IndexingContext) -> Rc<UOp> {
-    // Transformation is now handled by pattern matching in transform::rangeify()
-    // This function is kept for backward compatibility but does nothing
-    sink
-}

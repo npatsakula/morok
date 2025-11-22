@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["device", "dtype", "ir", "schedule", "tensor"]
+members = ["codegen", "device", "dtype", "ir", "runtime", "schedule", "tensor"]
+exclude = ["submodules"]
 
 [workspace.package]
 authors = ["Patsakula Nikita <nikita.patsakula@gmail.com>"]

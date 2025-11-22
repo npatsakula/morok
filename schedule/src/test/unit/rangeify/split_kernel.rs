@@ -41,18 +41,59 @@ fn test_split_store_non_store_returns_none() {
 fn test_split_store_end_operation() {
     let mut ctx = KernelContext::new();
 
-    // Create an END operation
-    let store = UOp::noop();
+    // Create an END operation wrapping a STORE
+    let buffer = UOp::unique(Some(0));
+    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
     let range = UOp::range_const(10, 0);
-    let end = UOp::end(store, smallvec![range]);
+    let end = UOp::end(store.clone(), smallvec![range.clone()]);
 
     // Try to split
     let result = split_store(&end, &mut ctx);
 
-    // Should process END operations
+    // Should process END wrapping STORE
     assert!(result.is_some());
     let kernel = result.unwrap();
     assert!(matches!(kernel.op(), Op::Kernel { .. }));
+
+    // Verify KERNEL structure matches Tinygrad: KERNEL(..., ast=SINK(END(STORE, RANGE)))
+    if let Op::Kernel { ast, .. } = kernel.op() {
+        if let Op::Sink { sources } = ast.op() {
+            // SINK should wrap the END (not extract STORE)
+            assert_eq!(sources.len(), 1);
+            assert!(std::rc::Rc::ptr_eq(&sources[0], &end));
+
+            // Verify END structure is preserved
+            if let Op::End { computation, ranges } = sources[0].op() {
+                assert!(std::rc::Rc::ptr_eq(computation, &store));
+                assert_eq!(ranges.len(), 1);
+                assert!(std::rc::Rc::ptr_eq(&ranges[0], &range));
+            } else {
+                panic!("Expected END operation in SINK");
+            }
+        } else {
+            panic!("Expected SINK operation");
+        }
+    } else {
+        panic!("Expected KERNEL operation");
+    }
+}
+
+#[test]
+fn test_split_store_end_non_store_returns_none() {
+    let mut ctx = KernelContext::new();
+
+    // Create an END operation wrapping non-STORE (control flow marker)
+    let noop = UOp::noop();
+    let range = UOp::range_const(10, 0);
+    let end = UOp::end(noop, smallvec![range]);
+
+    // Try to split
+    let result = split_store(&end, &mut ctx);
+
+    // Should return None (skip control flow markers)
+    assert!(result.is_none());
 }
 
 #[test]
@@ -182,8 +223,11 @@ fn test_split_store_multiple_calls_independent() {
 fn test_split_store_end_with_multiple_ranges() {
     let mut ctx = KernelContext::new();
 
-    // Create END with multiple ranges
-    let store = UOp::noop();
+    // Create END with multiple ranges wrapping a STORE
+    let buffer = UOp::unique(Some(0));
+    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
     let range1 = UOp::range_const(4, 0);
     let range2 = UOp::range_const(8, 1);
     let end = UOp::end(store.clone(), smallvec![range1.clone(), range2.clone()]);
@@ -193,19 +237,19 @@ fn test_split_store_end_with_multiple_ranges() {
     assert!(result.is_some());
     let kernel = result.unwrap();
 
-    // Verify KERNEL wraps the END operation
+    // Verify KERNEL wraps the END (not extracted STORE) - matches Tinygrad behavior
     if let Op::Kernel { ast, .. } = kernel.op() {
         if let Op::Sink { sources } = ast.op() {
-            // SINK should wrap the END
+            // SINK should wrap the END (preserving full structure)
             assert_eq!(sources.len(), 1);
             assert!(std::rc::Rc::ptr_eq(&sources[0], &end));
 
-            // Verify END structure is preserved
+            // Verify END structure with multiple ranges is preserved
             if let Op::End { computation, ranges } = sources[0].op() {
+                assert!(std::rc::Rc::ptr_eq(computation, &store));
                 assert_eq!(ranges.len(), 2);
                 assert!(std::rc::Rc::ptr_eq(&ranges[0], &range1));
                 assert!(std::rc::Rc::ptr_eq(&ranges[1], &range2));
-                assert!(std::rc::Rc::ptr_eq(computation, &store));
             } else {
                 panic!("Expected END operation in SINK");
             }
@@ -218,35 +262,39 @@ fn test_split_store_end_with_multiple_ranges() {
 }
 
 #[test]
-#[ignore = "Incomplete: proper AxisType::Outer filtering not implemented in split_store"]
 fn test_split_store_end_with_outer_range() {
     let mut ctx = KernelContext::new();
 
-    // Create END with OUTER range
-    let store = UOp::noop();
+    // Create END with OUTER range wrapping a STORE
+    let buffer = UOp::unique(Some(0));
+    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
     let range_outer = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Outer);
     let end = UOp::end(store, smallvec![range_outer]);
 
     let result = split_store(&end, &mut ctx);
 
-    // Should still create a kernel (the simplified implementation doesn't skip OUTER ENDs yet)
-    // TODO: Update this test when proper filtering is implemented
-    assert!(result.is_some());
+    // Should skip END with OUTER ranges (control flow marker)
+    // Tinygrad line 485: if x.op is Ops.END and x.src[1].arg[-1] == AxisType.OUTER: return None
+    assert!(result.is_none());
 }
 
 #[test]
-#[ignore = "Incomplete: proper AxisType::Outer filtering not implemented in split_store"]
 fn test_split_store_end_with_mixed_ranges() {
     let mut ctx = KernelContext::new();
 
-    // Create END with mix of LOOP and OUTER ranges
-    let store = UOp::noop();
+    // Create END with mix of LOOP and OUTER ranges wrapping a STORE
+    let buffer = UOp::unique(Some(0));
+    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
     let range_loop = UOp::range_const(4, 0);
     let range_outer = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(8)), 1, AxisType::Outer);
     let end = UOp::end(store, smallvec![range_loop, range_outer]);
 
     let result = split_store(&end, &mut ctx);
 
-    // Should create a kernel
-    assert!(result.is_some());
+    // Should skip if ANY range is OUTER (our implementation checks all ranges)
+    assert!(result.is_none());
 }

@@ -349,6 +349,37 @@ impl Buffer {
         self.data.allocator.synchronize()
     }
 
+    /// Get a raw pointer to the buffer data for kernel execution.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is only valid while the buffer is allocated.
+    /// The caller must ensure:
+    /// - Buffer remains allocated during pointer lifetime
+    /// - No conflicting accesses occur during kernel execution
+    /// - Pointer is not used after buffer is freed
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer is not yet allocated.
+    pub unsafe fn as_raw_ptr(&self) -> *mut u8 {
+        let raw = self.data.raw();
+        match raw {
+            RawBuffer::Cpu { data, .. } => {
+                let mut data_mut = data.borrow_mut();
+                let slice = &mut data_mut[self.offset..self.offset + self.size];
+                slice.as_mut_ptr()
+            }
+            #[cfg(feature = "cuda")]
+            RawBuffer::CudaDevice { .. } | RawBuffer::CudaUnified { .. } => {
+                // TODO: CUDA device memory support for kernels
+                // This requires proper stream management and synchronization
+                // For MVP, we only support CPU execution
+                unimplemented!("CUDA buffer raw pointers not yet supported for kernel execution")
+            }
+        }
+    }
+
     /// Get the raw data pointer for testing buffer identity.
     ///
     /// This is used in tests to verify cache reuse by comparing pointer addresses.

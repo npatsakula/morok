@@ -1,0 +1,16 @@
+[package]
+name = "morok-codegen"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+morok-dtype = { path = "../dtype" }
+morok-ir = { path = "../ir" }
+morok-schedule = { path = "../schedule" }
+inkwell = { version = "0.7.1", features = ["llvm21-1"] }
+snafu = "0.8.9"
+itertools = "0.14.0"
+
+[dev-dependencies]
+test-case = "3.3.1"

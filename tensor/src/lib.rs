@@ -15,7 +15,9 @@ pub mod broadcast;
 pub mod conditional;
 pub mod math;
 pub mod matmul;
+pub mod realize;
 pub mod reduce;
+pub mod schedule;
 pub mod shape_ops;
 pub mod traits;
 

@@ -6,13 +6,14 @@
 //!
 //! Based on Tinygrad's to_define_global PatternMatcher (schedule/rangeify.py:410-425).
 
-use std::collections::HashMap;
+use std::cell::RefCell;
 use std::rc::Rc;
 
-use morok_ir::{AddrSpace, Op, UOp};
+use morok_ir::{AddrSpace, ConstValue, Op, UOp};
 
 use super::kernel_context::KernelContext;
-use crate::pattern::matcher::RewriteResult;
+use crate::pattern::UPat;
+use crate::pattern::matcher::{PatternMatcher, RewriteFn, RewriteResult};
 
 /// Replace BUFFER with DEFINE_GLOBAL or DEFINE_LOCAL.
 ///
@@ -39,12 +40,7 @@ use crate::pattern::matcher::RewriteResult;
 /// // Before: BUFFER(unique, device, size)
 /// // After:  DEFINE_GLOBAL(0) or DEFINE_LOCAL(0)
 /// ```
-pub fn debuf(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelContext) -> RewriteResult {
-    let buf = match bindings.get("buf") {
-        Some(b) => b,
-        None => return RewriteResult::NoMatch,
-    };
-
+pub fn debuf(buf: &Rc<UOp>, ctx: &mut KernelContext) -> RewriteResult {
     // Extract buffer information
     let (dtype, addrspace) = match buf.op() {
         Op::Buffer { .. } => {
@@ -97,12 +93,7 @@ pub fn debuf(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelContext) -> Re
 /// // Before: AFTER(BUFFER, store_computation)
 /// // After:  BUFFER (but ctx.map[BUFFER] = AFTER for dependencies)
 /// ```
-pub fn handle_after(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelContext) -> RewriteResult {
-    let after = match bindings.get("after") {
-        Some(a) => a,
-        None => return RewriteResult::NoMatch,
-    };
-
+pub fn handle_after(after: &Rc<UOp>, ctx: &mut KernelContext) -> RewriteResult {
     // Verify this is an AFTER operation
     if !matches!(after.op(), Op::After { .. }) {
         return RewriteResult::NoMatch;
@@ -156,12 +147,7 @@ pub fn handle_after(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelContext
 /// // Before: BIND(var, value)
 /// // After:  var (but ctx.vars tracks it)
 /// ```
-pub fn unbind_kernel(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelContext) -> RewriteResult {
-    let bind = match bindings.get("b") {
-        Some(b) => b,
-        None => return RewriteResult::NoMatch,
-    };
-
+pub fn unbind_kernel(bind: &Rc<UOp>, ctx: &mut KernelContext) -> RewriteResult {
     // Verify this is a BIND operation
     let (var, _value) = match bind.op() {
         Op::Bind { var, value } => (var, value),
@@ -197,12 +183,7 @@ pub fn unbind_kernel(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelContex
 /// // Before: RANGE(end, axis_id=5, type=Loop)
 /// // After:  RANGE(end, axis_id=0, type=Loop) (first range in kernel)
 /// ```
-pub fn renumber_range(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelContext) -> RewriteResult {
-    let range = match bindings.get("r") {
-        Some(r) => r,
-        None => return RewriteResult::NoMatch,
-    };
-
+pub fn renumber_range(range: &Rc<UOp>, ctx: &mut KernelContext) -> RewriteResult {
     // Verify this is a RANGE operation
     let (end, old_axis_id, axis_type) = match range.op() {
         Op::Range { end, axis_id, axis_type } => (end, *axis_id, *axis_type),
@@ -243,12 +224,7 @@ pub fn renumber_range(bindings: &HashMap<String, Rc<UOp>>, ctx: &mut KernelConte
 /// // Before: CONST(42, dtype=Int32) with spurious sources
 /// // After:  CONST(42, dtype=Int32) with no sources
 /// ```
-pub fn cleanup_const(_bindings: &HashMap<String, Rc<UOp>>, _ctx: &mut KernelContext) -> RewriteResult {
-    let op = match _bindings.get("c") {
-        Some(c) => c,
-        None => return RewriteResult::NoMatch,
-    };
-
+pub fn cleanup_const(op: &Rc<UOp>, _ctx: &mut KernelContext) -> RewriteResult {
     // Check if this is CONST or DEFINE_VAR with sources
     let should_clean = matches!(op.op(), Op::Const(_) | Op::DefineVar { .. });
 
@@ -292,12 +268,7 @@ pub fn cleanup_const(_bindings: &HashMap<String, Rc<UOp>>, _ctx: &mut KernelCont
 /// // Before: RANGE(end=CONST(0), axis_id=0, type=Loop)
 /// // After:  CONST(0, dtype=Index)
 /// ```
-pub fn remove_zero_range(bindings: &HashMap<String, Rc<UOp>>, _ctx: &mut KernelContext) -> RewriteResult {
-    let range = match bindings.get("r") {
-        Some(r) => r,
-        None => return RewriteResult::NoMatch,
-    };
-
+pub fn remove_zero_range(range: &Rc<UOp>, _ctx: &mut KernelContext) -> RewriteResult {
     // Verify this is a RANGE operation
     let end = match range.op() {
         Op::Range { end, .. } => end,
@@ -320,8 +291,113 @@ pub fn remove_zero_range(bindings: &HashMap<String, Rc<UOp>>, _ctx: &mut KernelC
 
     // Replace with constant 0
     use morok_dtype::DType;
-    use morok_ir::ConstValue;
     let zero = UOp::const_(DType::Index, ConstValue::Int(0));
 
     RewriteResult::Rewritten(zero)
+}
+
+/// Create patterns for `to_define_global` transformation with KernelContext.
+///
+/// This function creates a PatternMatcher whose patterns have access to KernelContext
+/// via closure capture. The patterns implement Tinygrad's to_define_global transformation:
+///
+/// 1. **debuf**: BUFFER → DEFINE_GLOBAL/DEFINE_LOCAL
+/// 2. **unbind_kernel**: BIND(var, value) → var (track variable)
+/// 3. **handle_after**: AFTER/MSTACK/MSELECT → underlying buffer (track dependencies)
+/// 4. **cleanup_const**: Remove spurious sources from CONST/DEFINE_VAR
+/// 5. **remove_zero_range**: RANGE(end=0) → CONST(0)
+/// 6. **renumber_range**: Renumber RANGEs for deduplication
+///
+/// # Arguments
+///
+/// * `ctx` - Shared reference to KernelContext for tracking buffers, variables, and ranges
+///
+/// # Returns
+///
+/// A PatternMatcher with all to_define_global patterns
+///
+/// # Example
+///
+/// ```ignore
+/// use std::cell::RefCell;
+/// use std::rc::Rc;
+///
+/// let ctx = Rc::new(RefCell::new(KernelContext::new()));
+/// let matcher = to_define_global_patterns(Rc::clone(&ctx));
+///
+/// // Apply patterns via graph_rewrite
+/// let result = graph_rewrite(&matcher, computation);
+/// ```
+///
+/// Based on Tinygrad's to_define_global (schedule/rangeify.py:419-434).
+pub fn to_define_global_patterns(ctx: Rc<RefCell<KernelContext>>) -> PatternMatcher {
+    let mut patterns: Vec<(UPat, RewriteFn)> = vec![];
+
+    // Pattern 1: debuf - BUFFER → DEFINE_GLOBAL/DEFINE_LOCAL
+    pattern_ctx_mut!(patterns, Rc::clone(&ctx),
+        UPat::var("buf") => |buf, ctx| {
+            // Only match BUFFER operations
+            if !matches!(buf.op(), Op::Buffer { .. }) {
+                return RewriteResult::NoMatch;
+            }
+            debuf(buf, ctx)
+        }
+    );
+
+    // Pattern 2: unbind_kernel - BIND → var
+    pattern_ctx_mut!(patterns, Rc::clone(&ctx),
+        UPat::var("b") => |b, ctx| {
+            // Only match BIND operations
+            if !matches!(b.op(), Op::Bind { .. }) {
+                return RewriteResult::NoMatch;
+            }
+            unbind_kernel(b, ctx)
+        }
+    );
+
+    // Pattern 3: handle_after - AFTER/MSTACK/MSELECT → buffer
+    pattern_ctx_mut!(patterns, Rc::clone(&ctx),
+        UPat::var("after") => |after, ctx| {
+            // Only match AFTER, MSTACK, or MSELECT operations
+            if !matches!(after.op(), Op::After { .. } | Op::MStack { .. } | Op::MSelect { .. }) {
+                return RewriteResult::NoMatch;
+            }
+            handle_after(after, ctx)
+        }
+    );
+
+    // Pattern 4: cleanup_const - Remove spurious sources from CONST/DEFINE_VAR
+    pattern_ctx_mut!(patterns, Rc::clone(&ctx),
+        UPat::var("c") => |c, ctx| {
+            // Only match CONST or DEFINE_VAR with sources
+            if !matches!(c.op(), Op::Const(_) | Op::DefineVar { .. }) {
+                return RewriteResult::NoMatch;
+            }
+            cleanup_const(c, ctx)
+        }
+    );
+
+    // Pattern 5: remove_zero_range - RANGE(end=0) → CONST(0)
+    pattern_ctx_mut!(patterns, Rc::clone(&ctx),
+        UPat::var("r") => |r, ctx| {
+            // Only match RANGE operations
+            if !matches!(r.op(), Op::Range { .. }) {
+                return RewriteResult::NoMatch;
+            }
+            remove_zero_range(r, ctx)
+        }
+    );
+
+    // Pattern 6: renumber_range - Renumber RANGEs for deduplication
+    pattern_ctx_mut!(patterns, Rc::clone(&ctx),
+        UPat::var("r") => |r, ctx| {
+            // Only match RANGE operations
+            if !matches!(r.op(), Op::Range { .. }) {
+                return RewriteResult::NoMatch;
+            }
+            renumber_range(r, ctx)
+        }
+    );
+
+    PatternMatcher::new(patterns)
 }

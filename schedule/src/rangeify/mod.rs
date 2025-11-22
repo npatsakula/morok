@@ -45,6 +45,9 @@ pub mod transform;
 
 // Kernel splitting components (Phase 5)
 pub mod bufferize_to_store;
+pub mod codegen_patterns;
+pub mod cycle_detection;
+pub mod flatten_range;
 pub mod kernel_context;
 pub mod pipeline;
 pub mod split_kernel;
