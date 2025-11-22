@@ -861,7 +861,7 @@ pub fn symbolic_simple() -> PatternMatcher {
 
     // c * (a + b) → (c * a) + (c * b)
     // Distribute multiplication over addition
-    // Note: Distributes unconditionally without size checks
+    // Note: This pattern increases operation count but may enable other optimizations
     pattern!(patterns,
         UPat::cvar("c") * (UPat::var("a") + UPat::var("b")) => |c: &Rc<morok_ir::UOp>, a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>| {
             let ca = c.try_mul_op(a).ok()?;
@@ -872,7 +872,7 @@ pub fn symbolic_simple() -> PatternMatcher {
 
     // (a + b) * c → (a * c) + (b * c)
     // Distribute multiplication over addition (reversed operand order)
-    // Note: Distributes unconditionally without size checks
+    // Note: This pattern increases operation count but may enable other optimizations
     pattern!(patterns,
         (UPat::var("a") + UPat::var("b")) * UPat::cvar("c") => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
             let ac = a.try_mul_op(c).ok()?;

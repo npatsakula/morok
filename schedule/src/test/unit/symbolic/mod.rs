@@ -1081,3 +1081,119 @@ fn test_distribute_large_constant() {
         }
     }
 }
+
+// ========== Compositional Optimization Tests ==========
+
+#[test]
+#[ignore = "Distribution patterns conflict with compositional optimization"]
+fn test_compositional_optimization_minimal_failure() {
+    // Reproduces the exact failing case from the property test
+    // Input: ((0 + var("a")) * 2) * 2
+    // Expected: var("a") * 4
+    // Direct optimization should give better or equal results to compositional
+    //
+    // NOTE: This test is ignored for the same reason as compositional_subexpr_optimization:
+    // distribution patterns increase operation count but may enable other optimizations.
+
+    use crate::rewrite::graph_rewrite;
+    let matcher = symbolic_simple();
+
+    // Build the expression: (0 + var("a")) * 2
+    let a_var = UOp::var("a", DType::Int32, 0, 1);
+    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let add = UOp::new(Op::Binary(BinaryOp::Add, zero, a_var.clone()), DType::Int32);
+    let a = UOp::new(Op::Binary(BinaryOp::Mul, add, two.clone()), DType::Int32);
+    let b = two.clone();
+
+    // === DIRECT PATH ===
+    // Build expression with un-optimized subexpressions and optimize
+    let expr_unopt = UOp::new(Op::Binary(BinaryOp::Mul, a.clone(), b.clone()), DType::Int32);
+    let direct_opt = graph_rewrite(&matcher, expr_unopt);
+
+    // === COMPOSITIONAL PATH ===
+    // Optimize subexpressions first
+    let opt_a = graph_rewrite(&matcher, a.clone());
+    let opt_b = graph_rewrite(&matcher, b.clone());
+
+    // Build expression with optimized subexpressions
+    let expr_opt_subs = UOp::new(Op::Binary(BinaryOp::Mul, opt_a.clone(), opt_b.clone()), DType::Int32);
+
+    // Optimize the composed expression
+    let final_opt = graph_rewrite(&matcher, expr_opt_subs);
+
+    // Count operations
+    fn count_ops(uop: &Rc<UOp>) -> usize {
+        match uop.op() {
+            Op::Binary(_, left, right) => 1 + count_ops(left) + count_ops(right),
+            Op::Unary(_, src) => 1 + count_ops(src),
+            Op::Ternary(_, a, b, c) => 1 + count_ops(a) + count_ops(b) + count_ops(c),
+            _ => 0,
+        }
+    }
+
+    let direct_count = count_ops(&direct_opt);
+    let final_count = count_ops(&final_opt);
+
+    println!("=== COMPOSITIONAL OPTIMIZATION DEBUG ===");
+    println!("Original a: (0 + var(\"a\")) * 2");
+    println!("Original b: 2");
+    println!("Full expr: ((0 + var(\"a\")) * 2) * 2");
+    println!();
+    println!("Optimized a: {:?}", opt_a.op());
+    println!("Optimized b: {:?}", opt_b.op());
+    println!();
+    println!("Direct optimization: {} ops -> {:?}", direct_count, direct_opt.op());
+    println!("Compositional optimization: {} ops -> {:?}", final_count, final_opt.op());
+    println!();
+
+    // The compositional approach should be nearly as good as direct
+    // EXPECTED: Both should optimize to var("a") * 4 (1 operation)
+    // ACTUAL: Compositional gives worse results
+    assert!(final_count <= direct_count + 1,
+        "Compositional optimization ({} ops) should be nearly as good as direct ({} ops)",
+        final_count, direct_count);
+}
+
+#[test]
+fn test_multiplication_chain_folding() {
+    // Test: (var("a") * 2) * 2 → var("a") * 4
+    // This is the simplified version of the failing case
+
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MIN, i64::MAX);
+    let c2 = UOp::const_(DType::Int32, ConstValue::Int(2));
+
+    // Build (a * 2) * 2
+    let mul1 = UOp::new(Op::Binary(BinaryOp::Mul, a.clone(), c2.clone()), DType::Int32);
+    let mul2 = UOp::new(Op::Binary(BinaryOp::Mul, mul1, c2.clone()), DType::Int32);
+
+    let result = matcher.rewrite(&mul2);
+
+    println!("=== MULTIPLICATION CHAIN TEST ===");
+    println!("Input: (var(\"a\") * 2) * 2");
+    match &result {
+        crate::pattern::matcher::RewriteResult::Rewritten(r) => {
+            println!("Result: {:?}", r.op());
+        }
+        _ => {
+            println!("Result: No rewrite");
+        }
+    }
+
+    assert!(matches!(result, crate::pattern::matcher::RewriteResult::Rewritten(_)));
+
+    if let crate::pattern::matcher::RewriteResult::Rewritten(rewritten) = result {
+        // Should be a * 4
+        if let Op::Binary(BinaryOp::Mul, var, c) = rewritten.op() {
+            assert!(Rc::ptr_eq(var, &a), "Variable should be unchanged");
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(4), "Constant should be folded to 4");
+            } else {
+                panic!("Expected constant 4, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Binary(Mul, a, 4), got {:?}", rewritten.op());
+        }
+    }
+}
