@@ -136,3 +136,6 @@ impl Tensor {
         Ok(Self::new(casted))
     }
 }
+
+#[cfg(test)]
+mod test;
