@@ -134,7 +134,7 @@ pub fn should_remove_movement_op(x: &Rc<UOp>, ctx: &IndexingContext) -> bool {
 /// Converts movement operations (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)
 /// into BUFFERIZE + INDEX operations with explicit loop ranges.
 ///
-/// # Algorithm (Phase 4 Implementation)
+/// # Algorithm
 ///
 /// 1. **Range assignment** - Determine input/output ranges for each UOp
 /// 2. **Early rewrites** - Cleanup (DETACH, CONTIGUOUS_BACKWARD removal)
@@ -143,9 +143,11 @@ pub fn should_remove_movement_op(x: &Rc<UOp>, ctx: &IndexingContext) -> bool {
 /// 5. **Dead axis removal** - Remove size-1 dimensions
 /// 6. **Cost-based removal** - Remove unnecessary buffers
 /// 7. **Symbolic simplification** - Optimize index expressions
+/// 8. **Buffer limit enforcement** - Force bufferization when device limits exceeded
+/// 9. **Reduction simplifications** - reduce_unparented, split_reduceop
 ///
 /// Future phases will add:
-/// 8. **Kernel splitting** - Split at STORE boundaries
+/// 10. **Kernel splitting** - Split at STORE boundaries
 ///
 /// # Arguments
 ///
@@ -164,10 +166,13 @@ pub fn should_remove_movement_op(x: &Rc<UOp>, ctx: &IndexingContext) -> bool {
 /// use morok_ir::UOp;
 ///
 /// let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-/// let (result, ctx) = rangeify(x);
+/// let (result, ctx) = rangeify(x, None);
 /// println!("Generated {} ranges", ctx.range_counter);
 /// ```
-pub fn rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, super::context::RangeifyContext)> {
+pub fn rangeify(
+    sink: Rc<UOp>,
+    pcontig_config: Option<&super::buffer_cost::PcontigConfig>,
+) -> morok_ir::Result<(Rc<UOp>, super::context::RangeifyContext)> {
     use std::cell::RefCell;
     use std::rc::Rc as StdRc;
 
@@ -198,9 +203,11 @@ pub fn rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, super::context::Ran
     let dead_axis_matcher = super::patterns::dead_axis_removal();
     sink = crate::rewrite::graph_rewrite(&dead_axis_matcher, sink);
 
-    // Step 7: Cost-based buffer removal
+    // Step 7: Cost-based buffer removal with partial contiguous
     // Remove buffers that don't provide performance benefits
-    let buffer_removal_matcher = super::patterns::buffer_removal();
+    // Use partial contiguous to selectively materialize dimensions when beneficial
+    let config = pcontig_config.cloned().unwrap_or_default();
+    let buffer_removal_matcher = super::patterns::buffer_removal_with_pcontig(&config);
     sink = crate::rewrite::graph_rewrite(&buffer_removal_matcher, sink);
 
     // Step 8: Symbolic simplification
@@ -208,10 +215,26 @@ pub fn rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, super::context::Ran
     let symbolic_matcher = crate::symbolic::symbolic_simple();
     sink = crate::rewrite::graph_rewrite(&symbolic_matcher, sink);
 
-    // Step 9: Extract final context
+    // Step 8.5: Buffer limit enforcement
+    // Enforce device-specific buffer limits by forcing bufferization when exceeded
+    // Only applies if device has buffer limits (Metal: 31, WebGPU: 8)
+    if let Some(device) = super::buffer_limits::extract_device_from_graph(&sink)
+        && let Some(limit) = device.max_buffers()
+    {
+        let limit_matcher = super::buffer_limits::buffer_limit_patterns(limit);
+        sink = crate::rewrite::graph_rewrite(&limit_matcher, sink);
+    }
+
+    // Step 9: Reduction simplifications
+    // Apply reduce_unparented and split_reduceop optimizations
+    let split_config = super::split_reduceop::SplitReduceOpConfig::default();
+    let reduction_matcher = super::patterns::reduction_simplify_patterns(&split_config);
+    sink = crate::rewrite::graph_rewrite(&reduction_matcher, sink);
+
+    // Step 10: Extract final context
     let final_indexing_ctx = StdRc::try_unwrap(ctx).ok().expect("Context should have no other references").into_inner();
 
-    // Step 10: Build RangeifyContext for return
+    // Step 11: Build RangeifyContext for return
     let rangeify_ctx = super::context::RangeifyContext {
         range_counter: final_indexing_ctx.range_counter(),
         range_map: std::collections::HashMap::new(), // Could populate from indexing_ctx if needed

@@ -26,6 +26,9 @@ strum = "0.27.2"
 tinyvec = "1.10"
 
 [features]
-default = ["cuda", "proptest"]
-cuda = ["dep:cudarc"]
+default = ["cuda", "webgpu", "metal", "proptest"]
 proptest = ["dep:proptest", "dep:proptest-derive", "morok-dtype/proptest"]
+# Devices
+cuda = ["dep:cudarc"]
+webgpu = []
+metal = []

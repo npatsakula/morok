@@ -18,8 +18,11 @@ use morok_ir::{Op, UOp};
 use crate::pattern::UPat;
 use crate::pattern::matcher::{PatternMatcher, RewriteFn, RewriteResult};
 
+use super::buffer_cost::PcontigConfig;
 use super::helpers::{is_always_run_op, is_cheap_to_inline, is_dead_axis, ranges_equal};
 use super::indexing::IndexingContext;
+use super::reduce_simplify::reduce_unparented;
+use super::split_reduceop::{SplitReduceOpConfig, split_reduceop};
 use super::transform::{should_remove_movement_op, transform_sources_with_bufferize};
 
 /// Pattern matcher for removing movement ops after rangeify transformation.
@@ -359,6 +362,179 @@ pub fn buffer_removal() -> PatternMatcher {
     PatternMatcher::new(patterns)
 }
 
+/// Pattern matcher for cost-based buffer removal with partial contiguous support.
+///
+/// This extends buffer_removal() with cost-based heuristics to decide when to:
+/// 1. Fully remove buffers (inline compute)
+/// 2. Apply partial contiguous (materialize subset of dimensions)
+/// 3. Keep buffers as-is (too complex to optimize)
+///
+/// Decision tree based on three heuristics:
+/// - `accessed_buffers > max_buffers_threshold` → keep (complex multi-input)
+/// - `out_in_ratio < out_in_ratio_threshold` → keep (efficient buffer)
+/// - `buffer_in_reduce` → partial contiguous candidate
+///
+/// # Arguments
+///
+/// * `config` - Configuration for partial contiguous thresholds
+///
+/// # Returns
+///
+/// A PatternMatcher with buffer removal patterns including partial contiguous logic
+pub fn buffer_removal_with_pcontig(config: &PcontigConfig) -> PatternMatcher {
+    use super::buffer_cost::{
+        apply_partial_contiguous, calculate_buffer_size, calculate_out_in_ratio, collect_accessed_buffers,
+        collect_indexes, collect_local_indexes, collect_reduces, extract_exclude_ranges, has_buffer_in_reduce,
+        partition_ranges,
+    };
+
+    let mut patterns = vec![];
+
+    // Pattern 1: Remove BUFFERIZE when compute is cheap to inline
+    // (Same as buffer_removal() - keep for backward compatibility)
+    pattern!(patterns,
+        UPat::var("buf") => |buf: &Rc<UOp>| {
+            if let Op::Bufferize { compute, .. } = buf.op()
+                && is_cheap_to_inline(compute.op()) {
+                    return Some(Rc::clone(compute));
+                }
+            None
+        }
+    );
+
+    // Pattern 2: Remove BUFFERIZE when compute must always run
+    // (Same as buffer_removal() - keep for backward compatibility)
+    pattern!(patterns,
+        UPat::var("buf") => |buf: &Rc<UOp>| {
+            if let Op::Bufferize { compute, .. } = buf.op()
+                && is_always_run_op(compute.op()) {
+                    return Some(Rc::clone(compute));
+                }
+            None
+        }
+    );
+
+    // Pattern 3: Remove nested BUFFERIZE (redundant buffering)
+    // (Same as buffer_removal() - keep for backward compatibility)
+    pattern!(patterns,
+        UPat::var("outer") => |outer: &Rc<UOp>| {
+            if let Op::Bufferize { compute: outer_compute, ranges, opts } = outer.op()
+                && let Op::Bufferize { compute: inner_compute, .. } = outer_compute.op() {
+                    return Some(UOp::bufferize(
+                        Rc::clone(inner_compute),
+                        ranges.to_vec(),
+                        opts.clone(),
+                    ));
+                }
+            None
+        }
+    );
+
+    // Pattern 4: Complex INDEX(BUFFERIZE) with partial contiguous
+    // This implements the cost-based decision tree for selective materialization
+    let config_clone = *config;
+    patterns.push((
+        UPat::var("idx"),
+        Box::new(move |bindings: &HashMap<String, Rc<UOp>>| {
+            let Some(idx) = bindings.get("idx") else {
+                return RewriteResult::NoMatch;
+            };
+
+            // Match INDEX(BUFFERIZE(...), ...)
+            let (buffer, idx_ranges) = match idx.op() {
+                Op::Index { buffer, indices, gate: None } => (buffer, indices),
+                _ => return RewriteResult::NoMatch,
+            };
+
+            let (src, buf_ranges) = match buffer.op() {
+                Op::Bufferize { compute, ranges, .. } => (compute, ranges),
+                _ => return RewriteResult::NoMatch,
+            };
+
+            // Early exit: Check if disabled
+            if config_clone.level == 0 {
+                return RewriteResult::NoMatch;
+            }
+
+            // Early exit: Always-run ops should not be transformed
+            if is_always_run_op(src.op()) {
+                return RewriteResult::NoMatch;
+            }
+
+            // === Heuristic 1: accessed_buffers check ===
+            // If too many buffers are accessed, keep the buffer (complex multi-input)
+            let accessed_buffers = collect_accessed_buffers(src);
+            if accessed_buffers.len() > config_clone.max_buffers_threshold {
+                return RewriteResult::NoMatch;
+            }
+
+            // === Heuristic 2: out_in_ratio check ===
+            // If output/input ratio is low, keep the buffer (efficient buffer)
+            if let Some(output_size) = calculate_buffer_size(buffer)
+                && let Some(ratio) = calculate_out_in_ratio(output_size, &accessed_buffers)
+                && ratio < config_clone.out_in_ratio_threshold
+            {
+                return RewriteResult::NoMatch;
+            }
+
+            // === Heuristic 3: buffer_in_reduce check ===
+            // Determines whether to do full removal or partial contiguous
+            let reduces = collect_reduces(src);
+            let buf_in_reduce = has_buffer_in_reduce(&reduces);
+
+            if !buf_in_reduce {
+                // No reduce usage → full removal via substitution
+                use morok_ir::UOpKey;
+                use std::collections::HashMap;
+
+                // Build substitution map: buffer ranges → index ranges
+                #[allow(clippy::mutable_key_type)]
+                let subs_map: HashMap<UOpKey, Rc<UOp>> = buf_ranges
+                    .iter()
+                    .zip(idx_ranges.iter())
+                    .map(|(k, v)| (UOpKey(Rc::clone(k)), Rc::clone(v)))
+                    .collect();
+
+                let substituted = src.substitute(&subs_map);
+                return RewriteResult::Rewritten(substituted);
+            }
+
+            // Buffer is used in reduce → partial contiguous candidate
+            // Collect all INDEX operations and determine which ranges to materialize
+            let indexes = collect_indexes(src);
+            let local_indexes = collect_local_indexes(&indexes);
+            #[allow(clippy::mutable_key_type)]
+            let exclude_ranges = extract_exclude_ranges(&local_indexes);
+
+            // Partition ranges: materialize (LOCAL, REDUCE) vs substitute (inline)
+            let (materialize, substitute) = partition_ranges(buf_ranges, idx_ranges, &exclude_ranges);
+
+            // Check if partial contiguous would be beneficial
+            if materialize.is_empty() {
+                // No dimensions to materialize → full removal
+                use morok_ir::UOpKey;
+                use std::collections::HashMap;
+
+                #[allow(clippy::mutable_key_type)]
+                let subs_map: HashMap<UOpKey, Rc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
+
+                let substituted = src.substitute(&subs_map);
+                return RewriteResult::Rewritten(substituted);
+            }
+
+            // Apply partial contiguous transformation
+            if let Some(result) = apply_partial_contiguous(src, materialize, substitute) {
+                return RewriteResult::Rewritten(result);
+            }
+
+            // Transformation failed → keep original buffer
+            RewriteResult::NoMatch
+        }) as RewriteFn,
+    ));
+
+    PatternMatcher::new(patterns)
+}
+
 /// Pattern matcher for kernel splitting.
 ///
 /// This will split the graph into individual kernels at
@@ -368,4 +544,73 @@ pub fn buffer_removal() -> PatternMatcher {
 pub fn kernel_splitting() -> PatternMatcher {
     // TODO (Phase 2): Implement kernel boundary detection
     PatternMatcher::new(vec![])
+}
+
+/// Pattern matcher for reduction simplifications.
+///
+/// This applies optimizations to REDUCE operations:
+/// 1. **reduce_unparented**: Remove ranges that don't appear in source (2-10x speedup)
+/// 2. **reduce_collapse**: Lift range-independent computations outside reductions (2-10x speedup)
+/// 3. **split_reduceop**: Split large reductions into two-stage for better parallelism
+///
+/// These patterns should run after symbolic simplification to benefit from
+/// simplified index expressions.
+///
+/// # Arguments
+///
+/// * `config` - Configuration for split_reduceop (threshold, divisor limits, etc.)
+///
+/// # Returns
+///
+/// A PatternMatcher with all reduction optimization patterns
+///
+/// # Example
+///
+/// ```ignore
+/// let config = SplitReduceOpConfig::default();
+/// let matcher = reduction_simplify_patterns(&config);
+/// let optimized = graph_rewrite(&matcher, graph);
+/// ```
+pub fn reduction_simplify_patterns(config: &SplitReduceOpConfig) -> PatternMatcher {
+    let mut patterns: Vec<(UPat, RewriteFn)> = vec![];
+
+    // Pattern 1: reduce_unparented - Remove unused reduction ranges
+    // REDUCE(const, [range], ADD) → const * range.size
+    // REDUCE(const, [range], MUL) → const ^ range.size
+    // REDUCE(const, [range], MAX/MIN) → const
+    pattern!(patterns,
+        UPat::var("reduce") => |reduce: &Rc<UOp>| {
+            reduce_unparented(reduce)
+        }
+    );
+
+    // Pattern 2: reduce_collapse - Lift range-independent computations outside reductions
+    // Uses symbolic substitution to detect and eliminate range dependencies
+    // REDUCE(x, [range], op) → x if symbolic simplification proves x is range-independent
+    pattern!(patterns,
+        UPat::var("reduce") => |reduce: &Rc<UOp>| {
+            super::reduce_simplify::reduce_collapse(reduce)
+        }
+    );
+
+    // Pattern 3: split_reduceop - Split large reductions into two stages
+    // REDUCE_AXIS(src, [axis], op) where prod(shape)/prod(output) >= 32768
+    // → reshape → permute → reduce1 → contiguous → reduce2 → reshape
+    let config_clone = *config;
+    patterns.push((
+        UPat::var("reduce"),
+        Box::new(move |bindings: &HashMap<String, Rc<UOp>>| {
+            let Some(reduce) = bindings.get("reduce") else {
+                return RewriteResult::NoMatch;
+            };
+
+            if let Some(result) = split_reduceop(reduce, &config_clone) {
+                RewriteResult::Rewritten(result)
+            } else {
+                RewriteResult::NoMatch
+            }
+        }) as RewriteFn,
+    ));
+
+    PatternMatcher::new(patterns)
 }

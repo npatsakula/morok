@@ -83,8 +83,8 @@ pub fn apply(
     // 6. Apply padding if needed (tc_opt >= 2)
     let axes = [n_range.clone(), m_range.clone(), k_range.clone()];
     if tc_opt >= 2 {
-        for i in 0..3 {
-            let dim_size = get_range_size(&axes[i]);
+        for (i, axis) in axes.iter().enumerate() {
+            let dim_size = get_range_size(axis);
             let tc_dim = match i {
                 0 => tc.dims.0,
                 1 => tc.dims.1,
@@ -183,6 +183,7 @@ pub fn apply(
         let tc_uop = UOp::unroll(wmma, c_axes);
 
         // Substitute REDUCE with WMMA/UNROLL tree
+        #[allow(clippy::mutable_key_type)]
         let mut subst_map = std::collections::HashMap::new();
         subst_map.insert(morok_ir::UOpKey(pattern.reduce_op.clone()), tc_uop);
         let new_ast = scheduler.ast().substitute(&subst_map);

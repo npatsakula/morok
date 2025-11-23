@@ -540,12 +540,10 @@ fn test_shift_to_substitution_in_ast() {
         .filter_map(|node| {
             if let Op::Range { end, axis_id, .. } = node.op()
                 && *axis_id == 0
+                && let Op::Const(cv) = end.op()
+                && let ConstValue::Int(sz) = cv.0
             {
-                if let Op::Const(cv) = end.op()
-                    && let ConstValue::Int(sz) = cv.0
-                {
-                    return Some(sz);
-                }
+                return Some(sz);
             }
             None
         })
@@ -1021,12 +1019,11 @@ fn test_swap_basic() {
     // Get sizes of ranges before swap
     let rngs_before = scheduler.rngs();
     let get_size = |rng: &Rc<UOp>| -> i64 {
-        if let Op::Range { end, .. } = rng.op() {
-            if let Op::Const(cv) = end.op()
-                && let morok_ir::ConstValue::Int(sz) = cv.0
-            {
-                return sz;
-            }
+        if let Op::Range { end, .. } = rng.op()
+            && let Op::Const(cv) = end.op()
+            && let morok_ir::ConstValue::Int(sz) = cv.0
+        {
+            return sz;
         }
         panic!("Expected Range with constant size");
     };

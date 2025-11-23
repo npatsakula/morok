@@ -182,6 +182,21 @@ impl DType {
         }
     }
 
+    /// Check if this is a vector type.
+    pub fn is_vector(&self) -> bool {
+        matches!(self, Self::Vector { .. })
+    }
+
+    /// Get the base scalar type (works for both scalars and vectors).
+    pub fn base(&self) -> ScalarDType {
+        match self {
+            Self::Scalar(s) => *s,
+            Self::Vector { scalar, .. } => *scalar,
+            Self::Ptr { base, .. } => base.base(),
+            Self::Image { .. } => ScalarDType::Float32, // Images use float32 by default
+        }
+    }
+
     /// Get the vector count (1 for scalars).
     pub fn count(&self) -> usize {
         match self {

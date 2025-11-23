@@ -9,7 +9,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use morok_ir::{AddrSpace, ConstValue, Op, UOp};
+use morok_dtype::AddrSpace;
+use morok_ir::{ConstValue, DType, Op, UOp};
 
 use super::kernel_context::KernelContext;
 use crate::pattern::UPat;
@@ -105,10 +106,6 @@ pub fn handle_after(after: &Rc<UOp>, ctx: &mut KernelContext) -> RewriteResult {
         _ => unreachable!(),
     };
 
-    // Skip AFTER for local buffers (they don't need cross-kernel dependency tracking)
-    // TODO: Add check for local buffer address space when dtype API is available
-    // For now, we handle all AFTER operations uniformly
-
     // Get the underlying buffer
     // If the passthrough is MSTACK or MSELECT, unwrap to the first source
     let buf = match passthrough.op() {
@@ -117,7 +114,13 @@ pub fn handle_after(after: &Rc<UOp>, ctx: &mut KernelContext) -> RewriteResult {
         _ => passthrough.clone(),
     };
 
-    // Track the mapping: buffer -> AFTER operation
+    // Skip AFTER for local buffers (they don't need cross-kernel dependency tracking)
+    // Local buffers are kernel-scoped and synchronized via BARRIER operations
+    if matches!(buf.dtype(), DType::Ptr { addrspace: AddrSpace::Local, .. }) {
+        return RewriteResult::Rewritten(buf);
+    }
+
+    // Track the mapping: buffer -> AFTER operation for global buffers
     // This will be used when building kernel arguments
     ctx.map_buffer(buf.clone(), after.clone());
 

@@ -6,6 +6,9 @@
 use crate::optimizer::renderer::{SwizzleAxis, TcOpt, TensorCore};
 use std::collections::HashMap;
 
+/// Upcast axes configuration: (axis_id, size) tuples for A, B, and C matrices.
+type UpcastAxes = (Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>);
+
 /// Generate the base shape from tensor core opts.
 ///
 /// Creates a shape like [U(0), L(0), L(0), L(1), L(1), L(1), U(1), R(0), R(1)]
@@ -122,10 +125,7 @@ pub fn permutes_for_shape(tc: &TensorCore, shape: &[SwizzleAxis]) -> (Vec<usize>
 ///
 /// Returns tuples of (axis_id, size) for each dimension's upcast/local/reduce decomposition.
 /// Format: (A_axes, B_axes, C_axes)
-pub fn build_upcast_axes(
-    tc: &TensorCore,
-    _new_ranges: &[usize],
-) -> (Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>) {
+pub fn build_upcast_axes(tc: &TensorCore, _new_ranges: &[usize]) -> UpcastAxes {
     // Simplified implementation - actual implementation would extract from new_ranges
     // and match with tc.elements_per_thread
 

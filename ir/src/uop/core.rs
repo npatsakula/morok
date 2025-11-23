@@ -525,6 +525,7 @@ impl UOp {
             | Op::Unique(_)
             | Op::Device(_)
             | Op::Noop
+            | Op::Invalid
             | Op::DefineGlobal(_)
             | Op::DefineLocal(_)
             | Op::VConst { .. }
@@ -1003,6 +1004,7 @@ impl UOp {
             | Op::Unique(_)
             | Op::Device(_)
             | Op::Noop
+            | Op::Invalid
             | Op::DefineGlobal(_)
             | Op::DefineLocal(_)
             | Op::VConst { .. }

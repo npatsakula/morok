@@ -15,9 +15,35 @@ pub enum DeviceSpec {
     Cuda {
         device_id: usize,
     },
+    #[cfg(feature = "metal")]
+    Metal {
+        device_id: usize,
+    },
+    #[cfg(feature = "webgpu")]
+    WebGpu,
 }
 
 impl DeviceSpec {
+    /// Get maximum buffer count for this device.
+    ///
+    /// Returns None if the device has no buffer limit (effectively unlimited).
+    ///
+    /// Known limits:
+    /// - Metal: 31 buffers (Apple Silicon hardware limit)
+    /// - WebGPU: 8 buffers (WebGPU specification limit)
+    /// - CPU/CUDA: None (no practical limit)
+    pub fn max_buffers(&self) -> Option<usize> {
+        match self {
+            DeviceSpec::Cpu => None,
+            #[cfg(feature = "cuda")]
+            DeviceSpec::Cuda { .. } => None, // 128+ buffers, effectively unlimited
+            #[cfg(feature = "metal")]
+            DeviceSpec::Metal { .. } => Some(31),
+            #[cfg(feature = "webgpu")]
+            DeviceSpec::WebGpu => Some(8),
+        }
+    }
+
     /// Parse a device string into a DeviceSpec.
     ///
     /// Examples:
@@ -39,6 +65,19 @@ impl DeviceSpec {
                 };
                 Ok(DeviceSpec::Cuda { device_id })
             }
+            #[cfg(feature = "metal")]
+            "METAL" => {
+                let _device_id = if parts.len() > 1 {
+                    parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
+                } else {
+                    0
+                };
+                unimplemented!("Metal device support - to be implemented")
+            }
+            #[cfg(feature = "webgpu")]
+            "WEBGPU" => {
+                unimplemented!("WebGPU device support - to be implemented")
+            }
             _ => InvalidDeviceSnafu { device: s }.fail(),
         }
     }
@@ -49,6 +88,10 @@ impl DeviceSpec {
             DeviceSpec::Cpu => "CPU".to_string(),
             #[cfg(feature = "cuda")]
             DeviceSpec::Cuda { device_id } => format!("CUDA:{}", device_id),
+            #[cfg(feature = "metal")]
+            DeviceSpec::Metal { .. } => unimplemented!("Metal device support - to be implemented"),
+            #[cfg(feature = "webgpu")]
+            DeviceSpec::WebGpu => unimplemented!("WebGPU device support - to be implemented"),
         }
     }
 }
@@ -97,6 +140,10 @@ impl DeviceRegistry {
             DeviceSpec::Cpu => Box::new(CpuAllocator),
             #[cfg(feature = "cuda")]
             DeviceSpec::Cuda { device_id } => Box::new(crate::allocator::CudaAllocator::new(*device_id)?),
+            #[cfg(feature = "metal")]
+            DeviceSpec::Metal { .. } => unimplemented!("Metal allocator - to be implemented"),
+            #[cfg(feature = "webgpu")]
+            DeviceSpec::WebGpu => unimplemented!("WebGPU allocator - to be implemented"),
         };
 
         // Wrap with LRU cache (already thread-safe via Mutex)

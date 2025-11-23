@@ -61,7 +61,7 @@ fn test_fix_after_broadcast_in_pipeline() {
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();
-    let after = UOp::new(Op::After { passthrough: expand, deps: vec![computation].into() }, source.dtype());
+    let after = UOp::after(expand, smallvec::smallvec![computation]);
 
     // Pattern should unwrap EXPAND
     let result = fix_after_broadcast(&after);
@@ -96,6 +96,7 @@ fn test_no_cycle_valid_access_pattern() {
     let store = UOp::new(Op::Store { buffer: out_buf.clone(), index, value: computed }, DType::Void);
 
     // Should not panic - valid access pattern
+    #[allow(clippy::mutable_key_type)]
     let buf_accesses = find_bufs(&store);
 
     // Verify we tracked both buffers correctly
@@ -197,6 +198,7 @@ fn test_multiple_buffer_integration() {
     let store = UOp::new(Op::Store { buffer: out_buf.clone(), index, value: sum }, DType::Void);
 
     // Verify cycle detection works
+    #[allow(clippy::mutable_key_type)]
     let buf_accesses = find_bufs(&store);
     assert_eq!(buf_accesses.len(), 3);
 }

@@ -727,4 +727,3 @@ fn std_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<(Tens
     let std = variance.try_sqrt()?;
     Ok((std, mean))
 }
-

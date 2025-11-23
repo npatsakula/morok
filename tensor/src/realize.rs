@@ -7,9 +7,9 @@
 //! 4. **Execution** - Compile and run each kernel in dependency order
 
 use crate::{Result, Tensor};
-use morok_runtime::{CompiledKernel, LlvmKernel};
 use morok_device::Buffer;
 use morok_ir::UOp;
+use morok_runtime::{CompiledKernel, LlvmKernel};
 
 impl Tensor {
     /// Realize (execute) this tensor's computation graph.
@@ -47,11 +47,8 @@ impl Tensor {
         // Step 2: Run rangeify pipeline (Phases 1-4)
         // This transforms movement ops (RESHAPE, PERMUTE, etc.) into
         // BUFFERIZE + INDEX operations with explicit ranges
-        let (rangeified, _context) = morok_schedule::rangeify(sink).map_err(|e| {
-            crate::Error::Runtime {
-                message: format!("Rangeify failed: {}", e),
-            }
-        })?;
+        let (rangeified, _context) = morok_schedule::rangeify(sink, None)
+            .map_err(|e| crate::Error::Runtime { message: format!("Rangeify failed: {}", e) })?;
 
         // Step 3: Run kernel splitting pipeline (Phase 5)
         // This transforms BUFFERIZE → KERNEL operations by splitting
@@ -93,35 +90,28 @@ fn execute_schedule(schedule: &crate::schedule::Schedule) -> Result<()> {
 
         // Step 2: Ensure all buffers are allocated
         for buffer in &buffers {
-            buffer.ensure_allocated().map_err(|e| crate::Error::Device {
-                message: format!("Buffer allocation failed: {}", e),
-            })?;
+            buffer
+                .ensure_allocated()
+                .map_err(|e| crate::Error::Device { message: format!("Buffer allocation failed: {}", e) })?;
         }
 
         // Step 3: Render kernel AST to LLVM IR
         let rendered = morok_codegen::llvm::render(&item.ast, Some("kernel"))
-            .map_err(|e| crate::Error::Codegen {
-                message: format!("Failed to render kernel: {}", e),
-            })?;
+            .map_err(|e| crate::Error::Codegen { message: format!("Failed to render kernel: {}", e) })?;
 
         // Step 4: JIT compile
-        let kernel = LlvmKernel::compile(&rendered).map_err(|e| {
-            crate::Error::Runtime {
-                message: format!("Failed to compile kernel: {}", e),
-            }
-        })?;
+        let kernel = LlvmKernel::compile(&rendered)
+            .map_err(|e| crate::Error::Runtime { message: format!("Failed to compile kernel: {}", e) })?;
 
         // Step 5: Collect buffer pointers
-        let pointers: Vec<*mut u8> = buffers
-            .iter()
-            .map(|b| unsafe { get_buffer_ptr(b) })
-            .collect::<Result<Vec<_>>>()?;
+        let pointers: Vec<*mut u8> =
+            buffers.iter().map(|b| unsafe { get_buffer_ptr(b) }).collect::<Result<Vec<_>>>()?;
 
         // Step 6: Execute kernel
         unsafe {
-            kernel.execute(&pointers).map_err(|e| crate::Error::Runtime {
-                message: format!("Kernel execution failed: {}", e),
-            })?;
+            kernel
+                .execute(&pointers)
+                .map_err(|e| crate::Error::Runtime { message: format!("Kernel execution failed: {}", e) })?;
         }
     }
 

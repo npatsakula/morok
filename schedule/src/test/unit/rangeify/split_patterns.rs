@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
-use morok_dtype::DType;
+use morok_dtype::{AddrSpace, DType, ScalarDType};
 use morok_ir::{AxisType, ConstValue, Op, UOp};
-use smallvec::{SmallVec, smallvec};
+use smallvec::smallvec;
 
 use crate::{
     pattern::RewriteResult,
@@ -125,7 +125,7 @@ fn test_handle_after() {
     // Create an AFTER operation
     let buffer = UOp::unique(Some(0));
     let store = UOp::noop();
-    let after = UOp::new(Op::After { passthrough: buffer.clone(), deps: smallvec![store] }, buffer.dtype());
+    let after = UOp::after(buffer.clone(), smallvec::smallvec![store]);
 
     // Create bindings
 
@@ -203,7 +203,7 @@ fn test_handle_after_mstack_unwrap() {
 
     // Create AFTER wrapping MSTACK
     let store = UOp::noop();
-    let after = UOp::new(Op::After { passthrough: mstack, deps: smallvec![store] }, buf1.dtype());
+    let after = UOp::after(mstack, smallvec::smallvec![store]);
 
     let result = handle_after(&after, &mut ctx);
 
@@ -229,7 +229,7 @@ fn test_handle_after_mselect_unwrap() {
 
     // Create AFTER wrapping MSELECT
     let store = UOp::noop();
-    let after = UOp::new(Op::After { passthrough: mselect, deps: smallvec![store] }, buffer.dtype());
+    let after = UOp::after(mselect, smallvec::smallvec![store]);
 
     let result = handle_after(&after, &mut ctx);
 
@@ -382,7 +382,7 @@ fn test_handle_after_mstack_advanced() {
 
     // Create AFTER wrapping MSTACK
     // Note: AFTER has passthrough + deps, not src
-    let after = UOp::new(Op::After { passthrough: mstack.clone(), deps: SmallVec::new() }, DType::Float32);
+    let after = UOp::after(mstack.clone(), smallvec::SmallVec::new());
 
     let result = handle_after(&after, &mut ctx);
 
@@ -544,4 +544,191 @@ fn test_pattern_composition_sequence() {
         }
         _ => panic!("Expected Rewritten result"),
     }
+}
+
+// ============================================================================
+// Local Buffer Address Space Tests
+// ============================================================================
+
+#[test]
+fn test_handle_after_local_buffer_not_tracked() {
+    // Local buffers should NOT be tracked in the buffer map
+    // They are kernel-scoped and synchronized via BARRIER, not AFTER
+    let mut ctx = KernelContext::new();
+
+    // Create a local buffer (DEFINE_LOCAL with Ptr{Local} dtype)
+    let local_dtype = DType::Ptr {
+        base: Box::new(DType::Scalar(ScalarDType::Float32)),
+        addrspace: AddrSpace::Local,
+        size: Some(1024),
+    };
+    let local_buf = UOp::define_local(1, local_dtype);
+
+    // Wrap in AFTER operation
+    let store = UOp::noop();
+    let after = UOp::after(local_buf.clone(), smallvec![store]);
+
+    // Apply handle_after pattern
+    let result = handle_after(&after, &mut ctx);
+
+    // Should return the buffer unwrapped
+    match result {
+        RewriteResult::Rewritten(op) => {
+            assert!(matches!(op.op(), Op::DefineLocal(_)));
+            // Local buffer should NOT be in buffer map
+            assert!(!ctx.has_buffer(&local_buf));
+        }
+        _ => panic!("Expected Rewritten result"),
+    }
+}
+
+#[test]
+fn test_handle_after_global_buffer_tracked() {
+    // Global buffers SHOULD be tracked in the buffer map
+    let mut ctx = KernelContext::new();
+
+    // Create a global buffer (DEFINE_GLOBAL with Ptr{Global} dtype)
+    let global_dtype = DType::Ptr {
+        base: Box::new(DType::Scalar(ScalarDType::Float32)),
+        addrspace: AddrSpace::Global,
+        size: Some(1024),
+    };
+    let global_buf = UOp::define_global(1, global_dtype);
+
+    // Wrap in AFTER operation
+    let store = UOp::noop();
+    let after = UOp::after(global_buf.clone(), smallvec![store]);
+
+    // Apply handle_after pattern
+    let result = handle_after(&after, &mut ctx);
+
+    // Should return the buffer unwrapped
+    match result {
+        RewriteResult::Rewritten(op) => {
+            assert!(matches!(op.op(), Op::DefineGlobal(_)));
+            // Global buffer SHOULD be in buffer map
+            assert!(ctx.has_buffer(&global_buf));
+            assert!(Rc::ptr_eq(ctx.get_buffer(&global_buf).unwrap(), &after));
+        }
+        _ => panic!("Expected Rewritten result"),
+    }
+}
+
+#[test]
+fn test_handle_after_mstack_with_local_buffer() {
+    // AFTER wrapping MSTACK containing local buffer should not be tracked
+    let mut ctx = KernelContext::new();
+
+    // Create local buffer
+    let local_dtype = DType::Ptr {
+        base: Box::new(DType::Scalar(ScalarDType::Float32)),
+        addrspace: AddrSpace::Local,
+        size: Some(512),
+    };
+    let local_buf1 = UOp::define_local(1, local_dtype.clone());
+    let local_buf2 = UOp::define_local(2, local_dtype.clone());
+
+    // Create MSTACK
+    let mstack = UOp::new(Op::MStack { buffers: smallvec![local_buf1.clone(), local_buf2] }, local_dtype);
+
+    // Wrap in AFTER
+    let store = UOp::noop();
+    let after = UOp::after(mstack, smallvec![store]);
+
+    // Apply handle_after pattern
+    let result = handle_after(&after, &mut ctx);
+
+    // Should unwrap to first buffer in MSTACK
+    match result {
+        RewriteResult::Rewritten(op) => {
+            // Verify MSTACK was actually unwrapped to local_buf1 (not just any DEFINE_LOCAL)
+            assert!(Rc::ptr_eq(&op, &local_buf1), "Should unwrap to first buffer in MSTACK");
+            assert!(matches!(op.op(), Op::DefineLocal(1)));
+            // Local buffer should NOT be tracked
+            assert!(!ctx.has_buffer(&local_buf1));
+        }
+        _ => panic!("Expected Rewritten result"),
+    }
+}
+
+#[test]
+fn test_handle_after_mselect_with_local_buffer() {
+    // AFTER wrapping MSELECT containing local buffer should not be tracked
+    let mut ctx = KernelContext::new();
+
+    // Create local buffer
+    let local_dtype =
+        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Int32)), addrspace: AddrSpace::Local, size: Some(256) };
+    let local_buf = UOp::define_local(3, local_dtype.clone());
+
+    // Create MSELECT
+    let mselect = UOp::new(Op::MSelect { buffer: local_buf.clone(), device_index: 0 }, local_dtype);
+
+    // Wrap in AFTER
+    let store = UOp::noop();
+    let after = UOp::after(mselect, smallvec![store]);
+
+    // Apply handle_after pattern
+    let result = handle_after(&after, &mut ctx);
+
+    // Should unwrap to the buffer in MSELECT
+    match result {
+        RewriteResult::Rewritten(op) => {
+            // Verify MSELECT was actually unwrapped to local_buf (not just any DEFINE_LOCAL)
+            assert!(Rc::ptr_eq(&op, &local_buf), "Should unwrap to buffer from MSELECT");
+            assert!(matches!(op.op(), Op::DefineLocal(3)));
+            // Local buffer should NOT be tracked
+            assert!(!ctx.has_buffer(&local_buf));
+        }
+        _ => panic!("Expected Rewritten result"),
+    }
+}
+
+#[test]
+fn test_handle_after_mixed_address_spaces() {
+    // Verify local and global buffers are handled differently
+    let mut ctx = KernelContext::new();
+
+    // Create both local and global buffers
+    let local_dtype = DType::Ptr {
+        base: Box::new(DType::Scalar(ScalarDType::Float32)),
+        addrspace: AddrSpace::Local,
+        size: Some(128),
+    };
+    let global_dtype = DType::Ptr {
+        base: Box::new(DType::Scalar(ScalarDType::Float32)),
+        addrspace: AddrSpace::Global,
+        size: Some(128),
+    };
+
+    let local_buf = UOp::define_local(10, local_dtype);
+    let global_buf = UOp::define_global(11, global_dtype);
+
+    // Wrap both in AFTER
+    let store1 = UOp::noop();
+    let store2 = UOp::noop();
+    let after_local = UOp::after(local_buf.clone(), smallvec![store1]);
+    let after_global = UOp::after(global_buf.clone(), smallvec![store2]);
+
+    // Apply handle_after to both and validate return values
+    let result_local = handle_after(&after_local, &mut ctx);
+    let result_global = handle_after(&after_global, &mut ctx);
+
+    // Verify both returned Rewritten with correct buffers
+    match result_local {
+        RewriteResult::Rewritten(op) => {
+            assert!(Rc::ptr_eq(&op, &local_buf), "Local AFTER should return local buffer");
+        }
+        _ => panic!("Expected Rewritten for local"),
+    }
+    match result_global {
+        RewriteResult::Rewritten(op) => {
+            assert!(Rc::ptr_eq(&op, &global_buf), "Global AFTER should return global buffer");
+        }
+        _ => panic!("Expected Rewritten for global"),
+    }
+
+    // Verify only global buffer is tracked (side effect validation)
+    assert!(!ctx.has_buffer(&local_buf), "Local buffer should NOT be tracked");
+    assert!(ctx.has_buffer(&global_buf), "Global buffer SHOULD be tracked");
 }

@@ -1,5 +1,6 @@
 pub mod advanced_edge_cases;
 pub mod buffer_folding;
+pub mod buffer_limits;
 pub mod bufferize_to_store;
 pub mod codegen_integration;
 pub mod codegen_patterns;
@@ -13,11 +14,16 @@ pub mod helpers;
 pub mod indexing;
 pub mod kernel_context;
 pub mod kernel_count;
+pub mod movement_patterns;
+pub mod partial_contiguous;
 pub mod patterns;
 pub mod pipeline;
 pub mod pipeline_integration;
+pub mod range_merging;
+pub mod reduce_simplify;
 pub mod split_kernel;
 pub mod split_patterns;
+pub mod split_reduceop;
 pub mod transform;
 
 use morok_dtype::DType;

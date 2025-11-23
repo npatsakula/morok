@@ -398,7 +398,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         Op::VConst { .. } => None,
 
-        Op::Unique(_) | Op::Device(_) | Op::Noop => None,
+        Op::Unique(_) | Op::Device(_) | Op::Noop | Op::Invalid => None,
 
         // Define operations have shape from dtype.size (pointer types)
         // Following Tinygrad: shape comes from PtrDType.size, not from the id parameter

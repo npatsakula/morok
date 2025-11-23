@@ -59,11 +59,7 @@ impl<'ctx> LlvmRenderer<'ctx> {
     /// This creates a module with:
     /// 1. The actual kernel function taking individual buffer pointers
     /// 2. A bootstrap function that unpacks an array of pointers and calls the kernel
-    fn render_to_module(
-        &self,
-        uop: &Rc<UOp>,
-        name: &str,
-    ) -> Result<Module<'ctx>> {
+    fn render_to_module(&self, uop: &Rc<UOp>, name: &str) -> Result<Module<'ctx>> {
         let module = self.context.create_module(name);
         let builder = self.context.create_builder();
 
@@ -97,9 +93,7 @@ impl<'ctx> LlvmRenderer<'ctx> {
         }
 
         // Return void
-        builder.build_return(None).map_err(|e| crate::Error::LlvmError {
-            reason: format!("build_return: {}", e),
-        })?;
+        builder.build_return(None).map_err(|e| crate::Error::LlvmError { reason: format!("build_return: {}", e) })?;
 
         // Create bootstrap function: void kernel_bootstrap(ptr %args)
         // This unpacks the array of pointers and calls the kernel
@@ -120,17 +114,13 @@ impl<'ctx> LlvmRenderer<'ctx> {
             let ptr_to_ptr = unsafe {
                 builder
                     .build_gep(ptr_type, args_array, &[index], &format!("arg{}_ptr", i))
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_gep for arg {}: {}", i, e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_gep for arg {}: {}", i, e) })?
             };
 
             // Load the actual buffer pointer
             let buffer_ptr = builder
                 .build_load(ptr_type, ptr_to_ptr, &format!("arg{}", i))
-                .map_err(|e| crate::Error::LlvmError {
-                    reason: format!("build_load for arg {}: {}", i, e),
-                })?;
+                .map_err(|e| crate::Error::LlvmError { reason: format!("build_load for arg {}: {}", i, e) })?;
 
             buffer_ptrs.push(buffer_ptr.into());
         }
@@ -138,20 +128,16 @@ impl<'ctx> LlvmRenderer<'ctx> {
         // Call the kernel with unpacked arguments
         builder
             .build_call(kernel_function, &buffer_ptrs, "")
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_call kernel: {}", e),
-            })?;
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_call kernel: {}", e) })?;
 
         // Return void
-        builder.build_return(None).map_err(|e| crate::Error::LlvmError {
-            reason: format!("build_return bootstrap: {}", e),
-        })?;
+        builder
+            .build_return(None)
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_return bootstrap: {}", e) })?;
 
         // Verify the module
         if let Err(err) = module.verify() {
-            return Err(crate::Error::LlvmError {
-                reason: format!("Module verification failed: {}", err),
-            });
+            return Err(crate::Error::LlvmError { reason: format!("Module verification failed: {}", err) });
         }
 
         Ok(module)
@@ -168,11 +154,7 @@ impl<'ctx> Renderer for LlvmRenderer<'ctx> {
         // Get LLVM IR as string
         let ir_string = module.print_to_string().to_string();
 
-        Ok(RenderedKernel::new(
-            ir_string,
-            kernel_name.to_string(),
-            kernel_name.to_string(),
-        ))
+        Ok(RenderedKernel::new(ir_string, kernel_name.to_string(), kernel_name.to_string()))
     }
 
     fn backend_name(&self) -> &str {

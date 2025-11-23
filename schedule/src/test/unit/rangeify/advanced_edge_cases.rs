@@ -29,10 +29,10 @@ fn test_symbolic_range_size() {
     let bufferized = create_bufferize(compute, vec![range]);
 
     // Symbolic ranges work correctly and create kernels
-    let (_result, _ctx) = rangeify(bufferized).unwrap();
+    let (_result, _ctx) = rangeify(bufferized, None).unwrap();
 
-    // Note: Dead-axis optimization is skipped for symbolic ranges
-    // TODO: Enhance dead-axis detection to handle provably-dead symbolic ranges
+    // Note: Dead-axis optimization now works for provably-dead symbolic ranges
+    // (uses vmax analysis - see test_is_dead_axis_symbolic_bounded test)
 }
 
 #[test]
@@ -49,7 +49,7 @@ fn test_symbolic_range_multiple() {
     let bufferized = create_bufferize(compute.clone(), vec![range1, range2]);
 
     // Symbolic ranges work correctly with multiple dimensions
-    let (_result, _ctx) = rangeify(bufferized).unwrap();
+    let (_result, _ctx) = rangeify(bufferized, None).unwrap();
 
     // Note: Dead-axis optimization is skipped for symbolic ranges
     // TODO: Enhance dead-axis detection to handle provably-dead symbolic ranges
@@ -66,7 +66,7 @@ fn test_symbolic_range_with_arithmetic() {
     let bufferized = create_bufferize(compute, vec![range]);
 
     // Symbolic arithmetic expressions work correctly as range sizes
-    let (_result, _ctx) = rangeify(bufferized).unwrap();
+    let (_result, _ctx) = rangeify(bufferized, None).unwrap();
 
     // Note: Dead-axis optimization is skipped for symbolic ranges
     // TODO: Enhance dead-axis detection to handle provably-dead symbolic ranges
@@ -92,7 +92,7 @@ fn test_nested_bufferize_different_ranges() {
     let outer_buf = create_bufferize(inner_buf, vec![outer_range]);
 
     // Should handle nested bufferization without crashing
-    let (_result, _ctx) = rangeify(outer_buf).unwrap();
+    let (_result, _ctx) = rangeify(outer_buf, None).unwrap();
 
     // Note: Tests robustness - nested BUFFERIZE operations should be handled gracefully
 }
@@ -112,7 +112,7 @@ fn test_deeply_nested_bufferize() {
     let buf3 = create_bufferize(buf2, vec![r3]);
 
     // Should handle deep nesting without crashing
-    let (_result, _ctx) = rangeify(buf3).unwrap();
+    let (_result, _ctx) = rangeify(buf3, None).unwrap();
 
     // Note: Tests that deeply nested BUFFERIZE operations don't cause stack overflow or panics
 }
@@ -139,7 +139,7 @@ fn test_bufferize_multiple_consumers() {
     let sink = UOp::new(Op::Sink { sources: vec![consumer1, consumer2].into() }, DType::Float32);
 
     // Should handle multi-consumer pattern without crashing
-    let (_result, _ctx) = rangeify(sink).unwrap();
+    let (_result, _ctx) = rangeify(sink, None).unwrap();
 
     // Note: Tests that multiple consumers of the same BUFFERIZE don't cause issues
 }
@@ -161,7 +161,7 @@ fn test_operation_with_multiple_uses() {
     let sink = UOp::new(Op::Sink { sources: vec![buf1, buf2].into() }, DType::Float32);
 
     // Should handle same operation bufferized with different ranges
-    let (_result, _ctx) = rangeify(sink).unwrap();
+    let (_result, _ctx) = rangeify(sink, None).unwrap();
 
     // Note: Tests that same compute can be buffered with different iteration spaces
 }
@@ -186,7 +186,7 @@ fn test_index_with_multiple_ranges() {
         DType::Float32,
     );
 
-    let (_result, _ctx) = rangeify(index_op).unwrap();
+    let (_result, _ctx) = rangeify(index_op, None).unwrap();
 }
 
 #[test]
@@ -200,8 +200,99 @@ fn test_range_size_mismatch() {
     let bufferized = create_bufferize(compute, vec![const_range, sym_range]);
 
     // Mixed constant and symbolic ranges work correctly
-    let (_result, _ctx) = rangeify(bufferized).unwrap();
+    let (_result, _ctx) = rangeify(bufferized, None).unwrap();
+}
 
-    // Note: Dead-axis optimization is skipped for symbolic ranges
-    // TODO: Enhance dead-axis detection to handle provably-dead symbolic ranges
+// ============================================================================
+// Dead Axis Detection Tests (is_dead_axis with vmax analysis)
+// ============================================================================
+
+#[test]
+fn test_is_dead_axis_constant_ranges() {
+    use crate::rangeify::helpers::is_dead_axis;
+
+    // Dead: RANGE(0) - vmax = -1
+    let range_0 = create_range(0, 0);
+    assert!(is_dead_axis(&range_0));
+
+    // Dead: RANGE(1) - vmax = 0
+    let range_1 = create_range(1, 0);
+    assert!(is_dead_axis(&range_1));
+
+    // Live: RANGE(2) - vmax = 1
+    let range_2 = create_range(2, 0);
+    assert!(!is_dead_axis(&range_2));
+
+    // Live: RANGE(10) - vmax = 9
+    let range_10 = create_range(10, 0);
+    assert!(!is_dead_axis(&range_10));
+}
+
+#[test]
+fn test_is_dead_axis_symbolic_bounded() {
+    use crate::rangeify::helpers::is_dead_axis;
+
+    // Dead: variable bounded to [1, 1]
+    let size = UOp::var("size", DType::Index, 1, 1);
+    let range = create_range_symbolic(size, 0);
+    assert!(is_dead_axis(&range));
+
+    // Live: variable with max > 1
+    let size = UOp::var("size", DType::Index, 1, 1024);
+    let range = create_range_symbolic(size, 0);
+    assert!(!is_dead_axis(&range));
+
+    // Live: variable with min > 1 (still live range)
+    let size = UOp::var("size", DType::Index, 10, 100);
+    let range = create_range_symbolic(size, 0);
+    assert!(!is_dead_axis(&range));
+}
+
+#[test]
+fn test_is_dead_axis_non_range() {
+    use crate::rangeify::helpers::is_dead_axis;
+
+    // Non-RANGE operations should return false
+    let const_op = UOp::const_(DType::Index, ConstValue::Int(0));
+    assert!(!is_dead_axis(&const_op));
+
+    let add_op = const_op.try_add_op(&const_op).unwrap();
+    assert!(!is_dead_axis(&add_op));
+}
+
+#[test]
+fn test_symbolic_dead_range_smoke_test() {
+    // Smoke test: verify that symbolic dead ranges don't cause crashes
+    // This tests that the is_dead_axis() vmax analysis works end-to-end,
+    // but doesn't validate that the optimization actually happens.
+    //
+    // NOTE: Full validation would require checking that the dead axis
+    // is actually removed from the result (e.g., verify kernel has 1D ranges
+    // instead of 2D). This would depend on dead axis elimination passes that
+    // may run in later optimization stages.
+
+    let size = UOp::var("size", DType::Index, 1, 1); // Bounded to [1, 1] - provably dead
+    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+
+    // Create BUFFERIZE with dead symbolic range and live range
+    let dead_range = create_range_symbolic(size, 0);
+    let live_range = create_range(10, 1);
+
+    // Clone for later assertions (create_bufferize moves the ranges)
+    let dead_range_clone = dead_range.clone();
+    let live_range_clone = live_range.clone();
+
+    let bufferized = create_bufferize(compute, vec![dead_range, live_range]);
+
+    // Rangeify should process this without errors
+    let bufferized_clone = bufferized.clone();
+    let (result, _ctx) = rangeify(bufferized, None).unwrap();
+
+    // Basic smoke test: verify transformation occurred
+    assert!(!std::rc::Rc::ptr_eq(&result, &bufferized_clone), "Result should be transformed");
+
+    // Verify is_dead_axis() correctly identifies the dead range
+    use crate::rangeify::helpers::is_dead_axis;
+    assert!(is_dead_axis(&dead_range_clone), "var[1,1] range should be detected as dead");
+    assert!(!is_dead_axis(&live_range_clone), "Range(10) should be detected as live");
 }

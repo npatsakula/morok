@@ -293,6 +293,122 @@ impl UOp {
             panic!("with_axis_type() called on non-RANGE operation: {:?}", self.op);
         }
     }
+
+    /// Extract the actual index from a range, stripping validity checks.
+    ///
+    /// If the range is a WHERE(valid, idx, invalid_marker), returns idx.
+    /// Otherwise, returns the range itself.
+    ///
+    /// This is used for range merging when comparing indexing patterns across
+    /// multiple consumers.
+    ///
+    /// Based on Tinygrad's `get_idx()` (ops.py:438-439).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Range with padding: WHERE(i < 5, i, SENTINEL)
+    /// let padded_range = UOp::where_op(valid, idx.clone(), invalid_marker)?;
+    /// assert!(Rc::ptr_eq(&padded_range.get_idx(), &idx));
+    ///
+    /// // Plain range: returns itself
+    /// let plain_range = UOp::range_axis(...);
+    /// assert!(Rc::ptr_eq(&plain_range.get_idx(), &plain_range));
+    /// ```
+    pub fn get_idx(self: &Rc<Self>) -> Rc<Self> {
+        use crate::types::TernaryOp;
+
+        match self.op() {
+            Op::Ternary(TernaryOp::Where, _, true_val, false_val)
+                if Self::is_invalid_marker(false_val) => {
+                // WHERE(valid, idx, INVALID) → return idx
+                true_val.clone()
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// Extract the validity mask from a range.
+    ///
+    /// If the range is a WHERE(valid, idx, invalid_marker), returns valid.
+    /// Otherwise, returns constant true (always valid).
+    ///
+    /// This is used for range merging to combine validity conditions when
+    /// multiple consumers share compatible indexing patterns.
+    ///
+    /// Based on Tinygrad's `get_valid()` (ops.py:440-441).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Range with padding: WHERE(i < 5, i, SENTINEL)
+    /// let padded_range = UOp::where_op(valid.clone(), idx, invalid_marker)?;
+    /// assert!(Rc::ptr_eq(&padded_range.get_valid(), &valid));
+    ///
+    /// // Plain range: returns constant true
+    /// let plain_range = UOp::range_axis(...);
+    /// if let Op::Const(cv) = plain_range.get_valid().op() {
+    ///     assert_eq!(cv.0, ConstValue::Bool(true));
+    /// }
+    /// ```
+    pub fn get_valid(self: &Rc<Self>) -> Rc<Self> {
+        use crate::types::TernaryOp;
+        use morok_dtype::DType;
+
+        match self.op() {
+            Op::Ternary(TernaryOp::Where, cond, _, false_val)
+                if Self::is_invalid_marker(false_val) => {
+                // WHERE(valid, idx, INVALID) → return valid
+                cond.clone()
+            }
+            _ => {
+                // Always valid - return constant true
+                Self::const_(DType::Bool, ConstValue::Bool(true))
+            }
+        }
+    }
+
+    /// Check if a UOp represents an invalid index marker.
+    ///
+    /// Currently uses a sentinel value convention (i64::MIN for Index type).
+    /// This will be replaced with proper ConstValue::Invalid in Phase 5.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let invalid = UOp::invalid_marker();
+    /// assert!(UOp::is_invalid_marker(&invalid));
+    ///
+    /// let valid_idx = UOp::const_(DType::Index, ConstValue::Int(5));
+    /// assert!(!UOp::is_invalid_marker(&valid_idx));
+    /// ```
+    fn is_invalid_marker(uop: &Rc<Self>) -> bool {
+        matches!(uop.op(), Op::Invalid)
+    }
+
+    /// Create an invalid index marker.
+    ///
+    /// Invalid markers are used with WHERE operations to indicate out-of-bounds
+    /// or padded regions. The value is undefined and should never be used directly -
+    /// it exists only to be masked away by validity checks.
+    ///
+    /// # Returns
+    ///
+    /// A UOp representing an invalid index value.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Padding: WHERE(i < actual_size, i, invalid)
+    /// let invalid = UOp::invalid_marker();
+    /// let padded = UOp::where_op(valid, actual_idx, invalid)?;
+    /// ```
+    pub fn invalid_marker() -> Rc<Self> {
+        use morok_dtype::DType;
+
+        // Invalid marker for out-of-bounds indices (used in padding/masking)
+        Self::new(Op::Invalid, DType::Index)
+    }
 }
 
 /// Computes the greatest common divisor using Euclid's algorithm.

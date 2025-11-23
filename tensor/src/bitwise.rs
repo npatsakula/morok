@@ -111,4 +111,3 @@ impl Tensor {
         self.uop.try_shr_op(&other.uop).map(Self::new).context(UOpSnafu)
     }
 }
-

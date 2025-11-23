@@ -148,4 +148,3 @@ impl Tensor {
         reshaped.uop.try_expand(target_shape).map(Self::new).context(UOpSnafu)
     }
 }
-

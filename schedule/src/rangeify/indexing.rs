@@ -199,6 +199,121 @@ fn is_always_contiguous(uop: &Rc<UOp>) -> bool {
     )
 }
 
+/// Merge ranges from multiple consumers of a UOp.
+///
+/// When a UOp has multiple consumers with different indexing patterns, this function
+/// determines which ranges to assign. For each dimension:
+///
+/// 1. Extract index and valid components from all consumer ranges
+/// 2. Check if all indices are structurally identical (ignoring validity masks)
+/// 3. If identical: merge by OR-ing validity masks
+/// 4. If different: create new range and mark axis for realization
+///
+/// # Algorithm
+///
+/// Based on Tinygrad's multi-consumer range merging (schedule/indexing.py:198-222).
+///
+/// # Arguments
+///
+/// * `uop` - The UOp whose consumer ranges are being merged
+/// * `consumer_rngs` - List of range lists from each consumer
+/// * `ctx` - Indexing context for creating new ranges and tracking realization
+///
+/// # Returns
+///
+/// Merged output ranges for the UOp.
+///
+/// # Example
+///
+/// ```ignore
+/// // x = tensor[10, 20]
+/// // Consumer 1: x[i, j]   (same indices)
+/// // Consumer 2: x[i, j]   (same indices)
+/// // Result: Merge with OR of validity masks, no realization
+///
+/// // x = tensor[10, 20]
+/// // Consumer 1: x[i, j]
+/// // Consumer 2: x[i, k]   (different j vs k)
+/// // Result: Create new range for dim 1, realize axis 1
+/// ```
+fn merge_consumer_ranges(
+    uop: &Rc<UOp>,
+    consumer_rngs: &[Vec<Rc<UOp>>],
+    ctx: &mut IndexingContext,
+) -> morok_ir::Result<Vec<Rc<UOp>>> {
+    // Get shape to know how many dimensions
+    let Some(shape) = uop.shape()? else {
+        // No shape - return empty ranges (should not happen in practice)
+        return Ok(Vec::new());
+    };
+
+    let num_dims = shape.len();
+
+    // Transpose: consumer_rngs[consumer_idx][dim_idx] → all_rngs[dim_idx][consumer_idx]
+    let mut all_rngs: Vec<Vec<Rc<UOp>>> = vec![Vec::new(); num_dims];
+    for consumer_rng in consumer_rngs {
+        for (dim_idx, range) in consumer_rng.iter().enumerate() {
+            if dim_idx < num_dims {
+                all_rngs[dim_idx].push(Rc::clone(range));
+            }
+        }
+    }
+
+    let mut out_rngs = Vec::new();
+    let mut realize_axes = Vec::new();
+
+    // Process each dimension
+    for (dim_idx, dim_ranges) in all_rngs.iter().enumerate() {
+        if dim_ranges.is_empty() {
+            // No ranges for this dimension - create new one
+            out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Loop));
+            realize_axes.push(dim_idx);
+            continue;
+        }
+
+        // Extract index and valid components
+        let indices: Vec<_> = dim_ranges.iter().map(|r| r.get_idx()).collect();
+        let valids: Vec<_> = dim_ranges.iter().map(|r| r.get_valid()).collect();
+
+        // Check if all indices are the same
+        if helpers::all_ranges_same(&indices) {
+            // Compatible - merge validity masks
+            let merged_idx = Rc::clone(&indices[0]);
+
+            // OR all validity masks: valid1 | valid2 | ... | validN
+            let merged_valid = if valids.len() == 1 {
+                Rc::clone(&valids[0])
+            } else {
+                valids.iter().skip(1).try_fold(Rc::clone(&valids[0]), |acc, v| acc.try_or_op(v))?
+            };
+
+            // Check if merged valid is constant true (no validity check needed)
+            let merged_range = if let Op::Const(cv) = merged_valid.op()
+                && let ConstValue::Bool(true) = cv.0
+            {
+                // Always valid - use idx directly
+                merged_idx
+            } else {
+                // Wrap index with merged validity: WHERE(merged_valid, merged_idx, INVALID)
+                UOp::where_op(merged_valid, merged_idx, UOp::invalid_marker())?
+            };
+
+            out_rngs.push(merged_range);
+        } else {
+            // Incompatible - create new range and mark for realization
+            out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Loop));
+            realize_axes.push(dim_idx);
+        }
+    }
+
+    // Update realize map with axes that need materialization
+    if !realize_axes.is_empty() {
+        ctx.mark_realize(uop, realize_axes);
+    }
+
+    Ok(out_rngs)
+}
+
 /// Assign input/output ranges for each UOp via reverse toposort traversal.
 #[allow(clippy::mutable_key_type)]
 fn assign_ranges(
@@ -241,9 +356,7 @@ fn assign_ranges(
             consumer_rngs[0].clone()
         } else {
             // Multiple consumers - merge ranges
-            // For now, just take ranges from first consumer
-            // TODO: Implement proper range merging logic
-            consumer_rngs[0].clone()
+            merge_consumer_ranges(x, &consumer_rngs, ctx)?
         };
 
         // Determine input ranges by applying movement op transformations
@@ -287,4 +400,3 @@ fn assign_ranges(
     }
     Ok(())
 }
-

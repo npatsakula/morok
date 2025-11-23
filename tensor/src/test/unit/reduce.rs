@@ -1,5 +1,5 @@
-use crate::*;
 use crate::reduce::AxisSpec;
+use crate::*;
 use morok_dtype::DType;
 
 #[test]

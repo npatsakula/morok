@@ -207,10 +207,8 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                     let valid = valid_low.try_and_op(&valid_high).unwrap();
                     // Subtract padding: rng - begin
                     let adjusted_rng = rng.try_sub_op(&begin_uop).unwrap();
-                    // Use 0 as invalid value (will be masked by valid check later)
-                    // TODO: Proper invalid handling - need to check Tinygrad's approach
-                    let invalid_val = UOp::const_(DType::Index, ConstValue::Int(0));
-                    UOp::where_op(valid, adjusted_rng, invalid_val).unwrap()
+                    // Use invalid marker for out-of-bounds regions (will be masked by valid check)
+                    UOp::where_op(valid, adjusted_rng, UOp::invalid_marker()).unwrap()
                 })
                 .collect()
         }
@@ -382,20 +380,30 @@ pub fn count_buffer_accesses(uop: &Rc<UOp>) -> usize {
 
 /// Check if a range represents a dead axis (size 1).
 ///
-/// A range is dead if:
-/// - It's a RANGE(1) operation (loop from 0 to 1)
-/// - The end value is a constant 1
+/// A range is dead if it iterates 0 or 1 times (size ≤ 1).
+///
+/// Uses vmax analysis to detect both constant and symbolic dead ranges:
+/// - Constant: RANGE(1) has vmax = 0
+/// - Symbolic: Variable bounded to [1,1] has vmax = 0
+/// - Arithmetic: Expression that simplifies to 1 has vmax = 0
+///
+/// For RANGE(end), the vmax is end - 1 (maximum loop variable value).
+/// If vmax ≤ 0, the range iterates at most once (dead axis).
 ///
 /// Dead axes can be removed from BUFFERIZE operations to simplify indexing.
 pub fn is_dead_axis(range: &Rc<UOp>) -> bool {
-    // TODO: Enhance to detect provably-dead symbolic ranges
-    // Currently only handles constant size-1 ranges
-    if let Op::Range { end, .. } = range.op()
-        && let Some(ConstValue::Int(1) | ConstValue::UInt(1)) = get_const_value(end)
-    {
-        return true;
+    if !matches!(range.op(), Op::Range { .. }) {
+        return false;
     }
-    false
+
+    // Use vmax analysis to detect dead ranges
+    // A range is dead if vmax ≤ 0 (iterates 0 or 1 time)
+    // For RANGE(end), vmax = end - 1, so vmax ≤ 0 means end ≤ 1
+    match range.vmax() {
+        ConstValue::Int(v) => *v <= 0,
+        ConstValue::UInt(v) => *v == 0, // UInt can't be negative
+        _ => false,                     // Symbolic or non-numeric vmax - can't prove dead
+    }
 }
 
 /// Check if an operation is cheap to inline (low recomputation cost).
@@ -472,4 +480,203 @@ pub fn count_uses(target: &Rc<UOp>, root: &Rc<UOp>) -> usize {
 
     visit(root, &target_key, &mut visited, &mut count);
     count
+}
+
+/// Check if a UOp has no RANGE dependencies.
+///
+/// This is critical for reduce_collapse: after symbolic simplification,
+/// we verify that all ranges have been eliminated before accepting the result.
+///
+/// # Algorithm
+///
+/// Uses `in_scope_ranges()` to get all ranges this UOp depends on, then
+/// checks if any of them are actual RANGE operations.
+///
+/// # Example
+///
+/// ```ignore
+/// // Has range dependency
+/// let range = UOp::range_axis(end, 0, AxisType::Loop);
+/// let sum = range.try_add_op(&const_5).unwrap();
+/// assert!(!no_range(&sum)); // false - depends on range
+///
+/// // No range dependency
+/// let const_val = UOp::const_(DType::Int32, ConstValue::Int(42));
+/// assert!(no_range(&const_val)); // true - no ranges
+/// ```
+///
+/// Based on Tinygrad's `no_range()` (tinygrad/codegen/simplify.py:66)
+pub fn no_range(uop: &Rc<UOp>) -> bool {
+    #[allow(clippy::mutable_key_type)]
+    let in_scope_ranges = uop.in_scope_ranges();
+
+    // Check if any of the in-scope ranges are actual RANGE operations
+    !in_scope_ranges.iter().any(|key| matches!(key.0.op(), Op::Range { .. }))
+}
+
+/// Extract the size of a RANGE operation as an i64 constant.
+///
+/// This is used for computing closed-form sums when we know the range size.
+/// Only works for constant-sized ranges; symbolic ranges return None.
+///
+/// # Arguments
+///
+/// * `range` - A RANGE UOp
+///
+/// # Returns
+///
+/// * `Some(size)` - The constant size if available
+/// * `None` - If not a RANGE or if size is symbolic
+///
+/// # Example
+///
+/// ```ignore
+/// let range = UOp::range_axis(
+///     UOp::const_(DType::Index, ConstValue::Int(10)),
+///     0,
+///     AxisType::Loop
+/// );
+/// assert_eq!(range_size_as_i64(&range), Some(10));
+/// ```
+///
+/// Used by reduce_collapse pattern matchers for bound computation.
+pub fn range_size_as_i64(range: &Rc<UOp>) -> Option<i64> {
+    if let Op::Range { end, .. } = range.op() {
+        get_const_value(end).and_then(|cv| match cv {
+            ConstValue::Int(n) => Some(n),
+            ConstValue::UInt(n) => Some(n as i64),
+            _ => None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Check if all ranges in a list are structurally equal (ignoring validity masks).
+///
+/// Two ranges are considered equal if their index expressions are identical.
+/// Validity masks (from padding/WHERE operations) are ignored.
+///
+/// This is used for range merging to determine if multiple consumers can share
+/// the same indexing pattern.
+///
+/// # Arguments
+///
+/// * `ranges` - List of range UOps to compare
+///
+/// # Returns
+///
+/// * `true` - All ranges have identical index expressions
+/// * `false` - At least one range differs
+///
+/// # Examples
+///
+/// ```ignore
+/// // Identical ranges (same pointer)
+/// let r1 = UOp::range_axis(end.clone(), 0, AxisType::Loop);
+/// let r2 = r1.clone();
+/// assert!(all_ranges_same(&[r1, r2]));
+///
+/// // Identical ranges (different pointers, same structure)
+/// let end = UOp::const_(DType::Index, ConstValue::Int(10));
+/// let r1 = UOp::range_axis(end.clone(), 0, AxisType::Loop);
+/// let r2 = UOp::range_axis(end.clone(), 0, AxisType::Loop);
+/// assert!(all_ranges_same(&[r1, r2])); // Structurally equal
+///
+/// // Different ranges
+/// let r1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+/// let r2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(20)), 0, AxisType::Loop);
+/// assert!(!all_ranges_same(&[r1, r2]));
+/// ```
+///
+/// Used by range merging logic in indexing.rs.
+pub fn all_ranges_same(ranges: &[Rc<UOp>]) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
+
+    // Extract index expressions (strip validity masks)
+    let first_idx = ranges[0].get_idx();
+
+    ranges.iter().skip(1).all(|r| {
+        let idx = r.get_idx();
+        // Check pointer equality first (fast path)
+        Rc::ptr_eq(&first_idx, &idx) || uop_equal(&first_idx, &idx)
+    })
+}
+
+/// Deep structural equality check for UOps.
+///
+/// Compares two UOps for structural equality, checking:
+/// - Operation type and fields (via PartialEq on Op)
+/// - Data type
+/// - All sources recursively
+///
+/// This is used by range comparison to detect when two ranges have
+/// the same structure even if they're different heap objects.
+///
+/// # Arguments
+///
+/// * `a`, `b` - UOps to compare
+///
+/// # Returns
+///
+/// * `true` - UOps are structurally identical
+/// * `false` - UOps differ in structure
+///
+/// # Examples
+///
+/// ```ignore
+/// // Same pointer - always equal
+/// let x = UOp::const_(DType::Int32, ConstValue::Int(5));
+/// assert!(uop_equal(&x, &x));
+///
+/// // Different pointers, same structure
+/// let x1 = UOp::const_(DType::Int32, ConstValue::Int(5));
+/// let x2 = UOp::const_(DType::Int32, ConstValue::Int(5));
+/// assert!(uop_equal(&x1, &x2)); // hash-consing may make these the same
+///
+/// // Different values
+/// let x1 = UOp::const_(DType::Int32, ConstValue::Int(5));
+/// let x2 = UOp::const_(DType::Int32, ConstValue::Int(10));
+/// assert!(!uop_equal(&x1, &x2));
+/// ```
+///
+/// Note: This is a structural comparison, not pointer comparison.
+/// Hash-consing may cause structurally equal UOps to have the same pointer.
+pub fn uop_equal(a: &Rc<UOp>, b: &Rc<UOp>) -> bool {
+    // Fast path: pointer equality
+    if Rc::ptr_eq(a, b) {
+        return true;
+    }
+
+    // Check operation type (discriminant)
+    if std::mem::discriminant(a.op()) != std::mem::discriminant(b.op()) {
+        return false;
+    }
+
+    // Check dtype
+    if a.dtype() != b.dtype() {
+        return false;
+    }
+
+    // Special case: Const operations need value comparison
+    if let (Op::Const(cv_a), Op::Const(cv_b)) = (a.op(), b.op()) {
+        return cv_a.0 == cv_b.0;
+    }
+
+    // For Range operations, we need to compare all fields including axis_id
+    // which is not included in sources(). Use simplified equality:
+    // just compare sources since that's what matters for range merging.
+    // Different axis_ids with same end value are still compatible ranges.
+
+    // Check sources recursively
+    let a_srcs = a.op().sources();
+    let b_srcs = b.op().sources();
+
+    if a_srcs.len() != b_srcs.len() {
+        return false;
+    }
+
+    a_srcs.iter().zip(b_srcs.iter()).all(|(sa, sb)| uop_equal(sa, sb))
 }

@@ -19,9 +19,9 @@
 
 pub mod context;
 pub mod error;
+pub mod llvm;
 pub mod traits;
 pub mod types;
-pub mod llvm;
 
 #[cfg(test)]
 pub mod test;

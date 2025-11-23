@@ -11,7 +11,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp, UOpKey};
+use smallvec::SmallVec;
 
 use super::kernel_context::KernelContext;
 use crate::pattern::UPat;
@@ -58,27 +60,27 @@ pub fn remove_noop(noop: &Rc<UOp>) -> Option<Rc<UOp>> {
 
     let dtype = noop.dtype();
 
-    // Check if this is a vector type
-    // TODO: Once DType has vector support, handle vector case:
-    // if dtype.is_vector() {
-    //     let base = dtype.base();
-    //     let count = dtype.count();
-    //     let zeros: Vec<_> = (0..count).map(|_| {
-    //         UOp::const_(base, ConstValue::Int(0))
-    //     }).collect();
-    //     return Some(UOp::vec(zeros));
-    // }
-
-    // Scalar case: create zero constant matching dtype
-    // Extract scalar dtype (vectors not yet supported)
-    let scalar_dtype = dtype.scalar()?;
+    // Get the base scalar type (works for both scalars and vectors)
+    let base = dtype.base();
 
     // Don't create zero for Void type
-    if scalar_dtype == morok_dtype::ScalarDType::Void {
+    if base == morok_dtype::ScalarDType::Void {
         return None;
     }
 
-    let zero_value = ConstValue::zero(scalar_dtype);
+    // Check if this is a vector type
+    if dtype.is_vector() {
+        let count = dtype.count();
+        let zero_value = ConstValue::zero(base);
+
+        // Create a vector of zeros using vectorize
+        let zeros: SmallVec<[Rc<UOp>; 4]> = (0..count).map(|_| UOp::const_(DType::Scalar(base), zero_value)).collect();
+
+        return Some(UOp::vectorize(zeros));
+    }
+
+    // Scalar case: create zero constant matching dtype
+    let zero_value = ConstValue::zero(base);
     Some(UOp::const_(dtype, zero_value))
 }
 
@@ -169,6 +171,7 @@ pub fn fix_after_broadcast(after: &Rc<UOp>) -> Option<Rc<UOp>> {
 
     // Check if expand source has RANGE parents (indicates local buffer)
     // This requires building a consumer map to check parent relationships
+    #[allow(clippy::mutable_key_type)]
     let consumer_map = expand_src.get_consumer_map();
     let has_range_parents = consumer_map
         .get(&UOpKey(expand_src.clone()))
@@ -181,7 +184,7 @@ pub fn fix_after_broadcast(after: &Rc<UOp>) -> Option<Rc<UOp>> {
 
     // Replace AFTER's passthrough with expand source
     // New structure: AFTER(passthrough=expand_src, deps=deps)
-    let new_after = UOp::new(Op::After { passthrough: expand_src.clone(), deps: deps.clone() }, after.dtype());
+    let new_after = UOp::after(expand_src.clone(), deps.clone());
 
     Some(new_after)
 }
@@ -245,10 +248,23 @@ pub fn rangeify_codegen_patterns(_ctx: Rc<RefCell<KernelContext>>) -> PatternMat
         }
     );
 
-    // TODO: Investigate add_load_to_index patterns:
-    // These patterns in Tinygrad convert INDEX operations to LOAD operations.
-    // In our IR, we might already have separate LOAD/STORE operations.
-    // Investigation concluded: NOT needed - our architecture differs (see investigation in Phase 1.3b).
+    // NOTE: add_load_to_index patterns from Tinygrad are NOT needed in Morok.
+    //
+    // Architectural difference:
+    // - Tinygrad: INDEX operation serves dual purpose (pointer-returning vs value-returning)
+    //   - Patterns convert value-returning INDEX → pointer INDEX + LOAD
+    // - Morok: INDEX and LOAD are separate operations from the start
+    //   - INDEX: High-level buffer indexing (used in bufferize_to_store)
+    //   - LOAD/STORE: Low-level memory operations (created during kernel splitting)
+    //
+    // Our bufferize_to_store.rs already creates STORE operations that take INDEX
+    // as an argument, so no conversion pattern is needed.
+    //
+    // Example in Morok:
+    // ```rust
+    // let store_target = UOp::index(buffer, ranges)?;
+    // let store = UOp::store(buffer, store_target, compute);
+    // ```
 
     // NOTE: flatten_range patterns are NOT integrated here.
     // flatten_range_impl() in flatten_range.rs requires a consumer map and substitution pass.

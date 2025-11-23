@@ -101,6 +101,7 @@ pub fn as_buf(uop: &Rc<UOp>) -> Rc<UOp> {
 ///       ret[idx.src[0]] = idx.arg
 ///   return ret
 /// ```
+#[allow(clippy::mutable_key_type)]
 pub fn find_bufs(store: &Rc<UOp>) -> HashMap<UOpKey, OpAccessType> {
     let mut ret: HashMap<UOpKey, OpAccessType> = HashMap::new();
 
@@ -116,15 +117,15 @@ pub fn find_bufs(store: &Rc<UOp>) -> HashMap<UOpKey, OpAccessType> {
             let buf_key = UOpKey(buf.clone());
 
             // Check for conflicting access
-            if let Some(&existing_access) = ret.get(&buf_key) {
-                if existing_access != OpAccessType::Load {
-                    panic!(
-                        "buffer accessed with conflicting ops: {:?} (existing: {:?}, new: {:?})",
-                        buf,
-                        existing_access,
-                        OpAccessType::Load
-                    );
-                }
+            if let Some(&existing_access) = ret.get(&buf_key)
+                && existing_access != OpAccessType::Load
+            {
+                panic!(
+                    "buffer accessed with conflicting ops: {:?} (existing: {:?}, new: {:?})",
+                    buf,
+                    existing_access,
+                    OpAccessType::Load
+                );
             }
 
             ret.insert(buf_key, OpAccessType::Load);
@@ -136,15 +137,15 @@ pub fn find_bufs(store: &Rc<UOp>) -> HashMap<UOpKey, OpAccessType> {
             let buf_key = UOpKey(buf.clone());
 
             // Check for conflicting access
-            if let Some(&existing_access) = ret.get(&buf_key) {
-                if existing_access != OpAccessType::Store {
-                    panic!(
-                        "buffer accessed with conflicting ops: {:?} (existing: {:?}, new: {:?})",
-                        buf,
-                        existing_access,
-                        OpAccessType::Store
-                    );
-                }
+            if let Some(&existing_access) = ret.get(&buf_key)
+                && existing_access != OpAccessType::Store
+            {
+                panic!(
+                    "buffer accessed with conflicting ops: {:?} (existing: {:?}, new: {:?})",
+                    buf,
+                    existing_access,
+                    OpAccessType::Store
+                );
             }
 
             ret.insert(buf_key, OpAccessType::Store);

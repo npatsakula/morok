@@ -19,6 +19,7 @@ fn test_find_bufs_store_only() {
     let store = UOp::new(Op::Store { buffer: buffer.clone(), index, value }, DType::Void);
 
     // Should succeed - only STORE access
+    #[allow(clippy::mutable_key_type)]
     let buf_accesses = find_bufs(&store);
 
     // Verify we found one buffer with STORE access
@@ -39,6 +40,7 @@ fn test_find_bufs_load_only() {
     let store = UOp::new(Op::Store { buffer: out_buffer.clone(), index, value: loaded }, DType::Void);
 
     // Should succeed - input buffer only LOADed, output buffer only STOREd
+    #[allow(clippy::mutable_key_type)]
     let buf_accesses = find_bufs(&store);
 
     // Verify we found two buffers with correct access types
@@ -85,6 +87,7 @@ fn test_find_bufs_multiple_buffers() {
     let store = UOp::new(Op::Store { buffer: out_buf.clone(), index, value: sum }, DType::Void);
 
     // Should succeed
+    #[allow(clippy::mutable_key_type)]
     let buf_accesses = find_bufs(&store);
 
     // Verify all three buffers tracked correctly
@@ -110,6 +113,7 @@ fn test_find_bufs_gated_operations() {
     let store = UOp::new(Op::StoreGated { buffer: out_buf.clone(), index, value: loaded, gate }, DType::Void);
 
     // Should succeed
+    #[allow(clippy::mutable_key_type)]
     let buf_accesses = find_bufs(&store);
 
     // Verify both buffers tracked
@@ -144,7 +148,7 @@ fn test_as_buf_after() {
     // Test as_buf extracts passthrough from After
     let buffer = UOp::unique(Some(0));
     let computation = UOp::noop();
-    let after = UOp::new(Op::After { passthrough: buffer.clone(), deps: vec![computation].into() }, buffer.dtype());
+    let after = UOp::after(buffer.clone(), smallvec::smallvec![computation]);
 
     let extracted = as_buf(&after);
     assert!(Rc::ptr_eq(&extracted, &buffer));

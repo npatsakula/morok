@@ -28,11 +28,12 @@ use morok_dtype::DType;
 /// Hash consing uses UOpKey which compares by pointer equality instead.
 #[derive(Debug, Clone)]
 pub enum Op {
-    // Nullary operations (6 variants)
+    // Nullary operations (7 variants)
     Const(ConstValueHash),
     Unique(usize),
     Device(DeviceSpec),
     Noop,
+    Invalid,
     DefineGlobal(usize),
     DefineLocal(usize),
 
@@ -293,6 +294,7 @@ impl Op {
             | Self::Unique(_)
             | Self::Device(_)
             | Self::Noop
+            | Self::Invalid
             | Self::DefineGlobal(_)
             | Self::DefineLocal(_)
             | Self::VConst { .. }

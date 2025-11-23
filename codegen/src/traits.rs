@@ -1,6 +1,6 @@
 //! Core traits for code generation.
 
-use crate::{Result, RenderedKernel};
+use crate::{RenderedKernel, Result};
 use morok_ir::UOp;
 use std::rc::Rc;
 

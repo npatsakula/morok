@@ -543,6 +543,7 @@ dependencies = [
  "proptest-derive 0.5.1",
  "smallvec",
  "snafu",
+ "test-case",
  "z3",
 ]
 

@@ -56,11 +56,7 @@ fn vector_to_basic_type<'ctx>(scalar: ScalarDType, count: u32, context: &'ctx Co
 }
 
 /// Get vector type for a dtype with specified width.
-pub fn dtype_to_vector_type<'ctx>(
-    dtype: &DType,
-    width: u32,
-    context: &'ctx Context,
-) -> BasicTypeEnum<'ctx> {
+pub fn dtype_to_vector_type<'ctx>(dtype: &DType, width: u32, context: &'ctx Context) -> BasicTypeEnum<'ctx> {
     let base_type = dtype_to_basic_type(dtype, context);
 
     match base_type {

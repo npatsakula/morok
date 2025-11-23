@@ -288,9 +288,9 @@ fn test_local_and_grouped_reduce() {
 
         // Verify we have multiple optimization types
         // Note: UNROLL converts GroupReduce → Unroll, so check for Unroll instead
-        assert!(sched.axes_of(&[AxisType::Local]).len() > 0);
-        assert!(sched.axes_of(&[AxisType::Unroll]).len() > 0);
-        assert!(sched.axes_of(&[AxisType::Upcast]).len() > 0);
+        assert!(!sched.axes_of(&[AxisType::Local]).is_empty());
+        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
+        assert!(!sched.axes_of(&[AxisType::Upcast]).is_empty());
     }
 }
 
@@ -405,8 +405,8 @@ fn test_double_reduce() {
 
         // Verify that we have multiple optimization types
         // Note: UNROLL may convert GroupReduce→Unroll, so we check for presence not exact counts
-        assert!(sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len() > 0);
-        assert!(sched.axes_of(&[AxisType::Unroll]).len() > 0);
+        assert!(!sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).is_empty());
+        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
     }
 
     // Test 9: GROUPTOP + UNROLL on different axis
@@ -418,8 +418,8 @@ fn test_double_reduce() {
         apply_opt(&mut sched, &Opt::unroll(2, 4), true).unwrap();
 
         // Verify optimizations were applied successfully
-        assert!(sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len() > 0);
-        assert!(sched.axes_of(&[AxisType::Unroll]).len() > 0);
+        assert!(!sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).is_empty());
+        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
     }
 
     // Test 10: LOCAL + GROUPTOP on both axes
@@ -448,8 +448,8 @@ fn test_double_reduce() {
 
         // Verify we have all expected optimization types
         assert_axis_count(&sched, AxisType::Local, 2);
-        assert!(sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len() > 0);
-        assert!(sched.axes_of(&[AxisType::Unroll]).len() > 0);
+        assert!(!sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).is_empty());
+        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
     }
 
     // Test 12: LOCAL + GROUPTOP + UPCAST
@@ -481,9 +481,9 @@ fn test_double_reduce() {
 
         // Verify we have all expected optimization types
         assert_axis_count(&sched, AxisType::Local, 2);
-        assert!(sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len() > 0);
+        assert!(!sched.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).is_empty());
         assert_axis_count(&sched, AxisType::Upcast, 1);
-        assert!(sched.axes_of(&[AxisType::Unroll]).len() > 0);
+        assert!(!sched.axes_of(&[AxisType::Unroll]).is_empty());
     }
 
     // Test 14: "no globals" - LOCAL + GROUPTOP + double UPCAST

@@ -43,14 +43,7 @@ pub struct BufferArg {
 impl RenderedKernel {
     /// Create a new rendered kernel.
     pub fn new(code: String, entry_point: String, name: String) -> Self {
-        Self {
-            code,
-            entry_point,
-            name,
-            buffer_args: Vec::new(),
-            global_size: None,
-            local_size: None,
-        }
+        Self { code, entry_point, name, buffer_args: Vec::new(), global_size: None, local_size: None }
     }
 
     /// Add a buffer argument.

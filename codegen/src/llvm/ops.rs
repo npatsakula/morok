@@ -6,7 +6,7 @@ use inkwell::context::Context;
 use inkwell::module::Module;
 use inkwell::values::{BasicValueEnum, CallSiteValue, FunctionValue};
 use inkwell::{FloatPredicate, IntPredicate};
-use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UnaryOp, UOp};
+use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 use snafu::ensure;
 use std::rc::Rc;
 
@@ -30,85 +30,54 @@ pub fn codegen_uop<'ctx>(
         Op::Const(val_hash) => Some(codegen_const(val_hash.0, &uop.dtype(), context)?),
         Op::Unary(op, src) => {
             let src_val = codegen_uop(src, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "source value for unary op".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "source value for unary op".to_string() })?;
             Some(codegen_unary(*op, src_val, &uop.dtype(), context, module, builder)?)
         }
         Op::Binary(op, lhs, rhs) => {
             let lhs_val = codegen_uop(lhs, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "lhs value for binary op".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "lhs value for binary op".to_string() })?;
             let rhs_val = codegen_uop(rhs, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "rhs value for binary op".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "rhs value for binary op".to_string() })?;
             Some(codegen_binary(*op, lhs_val, rhs_val, &uop.dtype(), context, module, builder)?)
         }
         Op::Ternary(op, a, b, c) => {
             let a_val = codegen_uop(a, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "first value for ternary op".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "first value for ternary op".to_string() })?;
             let b_val = codegen_uop(b, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "second value for ternary op".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "second value for ternary op".to_string() })?;
             let c_val = codegen_uop(c, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "third value for ternary op".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "third value for ternary op".to_string() })?;
             Some(codegen_ternary(*op, a_val, b_val, c_val, &uop.dtype(), context, module, builder)?)
         }
         Op::Cast { src, dtype } => {
             let src_val = codegen_uop(src, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "source value for cast".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "source value for cast".to_string() })?;
             Some(codegen_cast(src_val, &src.dtype(), dtype, context, builder)?)
         }
         Op::Load { buffer, index } => {
             let buffer_ptr = codegen_uop(buffer, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "buffer pointer for load".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "buffer pointer for load".to_string() })?;
             let index_val = codegen_uop(index, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "index value for load".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "index value for load".to_string() })?;
             Some(codegen_load(buffer_ptr, index_val, &uop.dtype(), context, builder)?)
         }
         Op::Store { buffer, index, value } => {
             let buffer_ptr = codegen_uop(buffer, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "buffer pointer for store".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "buffer pointer for store".to_string() })?;
             let index_val = codegen_uop(index, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "index value for store".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "index value for store".to_string() })?;
             let value_val = codegen_uop(value, context, module, builder, values)?
-                .ok_or_else(|| crate::Error::Missing {
-                    what: "value for store".to_string(),
-                })?;
+                .ok_or_else(|| crate::Error::Missing { what: "value for store".to_string() })?;
             codegen_store(buffer_ptr, index_val, value_val, builder)?;
             None // Store doesn't produce a value
         }
         Op::Buffer { .. } => {
             // BUFFER operations should be handled by the renderer and added to ValueMap
             // before codegen starts. If we reach here, it means the buffer wasn't registered.
-            return Err(crate::Error::Missing {
-                what: format!("Buffer UOp {} should be in ValueMap", uop.id),
-            });
+            return Err(crate::Error::Missing { what: format!("Buffer UOp {} should be in ValueMap", uop.id) });
         }
         _ => {
-            ensure!(
-                false,
-                UnsupportedOpSnafu {
-                    op: format!("{:?}", uop.op())
-                }
-            );
+            ensure!(false, UnsupportedOpSnafu { op: format!("{:?}", uop.op()) });
             unreachable!()
         }
     };
@@ -143,15 +112,12 @@ fn get_intrinsic<'ctx>(
 ) -> Result<FunctionValue<'ctx>> {
     use inkwell::intrinsics::Intrinsic;
 
-    let intrinsic = Intrinsic::find(name).ok_or_else(|| crate::Error::LlvmError {
-        reason: format!("Intrinsic {} not found", name),
-    })?;
+    let intrinsic = Intrinsic::find(name)
+        .ok_or_else(|| crate::Error::LlvmError { reason: format!("Intrinsic {} not found", name) })?;
 
     intrinsic
         .get_declaration(module, &[ret_type.get_type().into()])
-        .ok_or_else(|| crate::Error::LlvmError {
-            reason: format!("Failed to get declaration for {}", name),
-        })
+        .ok_or_else(|| crate::Error::LlvmError { reason: format!("Failed to get declaration for {}", name) })
 }
 
 /// Call an LLVM intrinsic and extract the result.
@@ -165,9 +131,7 @@ fn call_intrinsic<'ctx>(
     let intrinsic_fn = get_intrinsic(intrinsic_name, args[0], module)?;
     let call_site = builder
         .build_call(intrinsic_fn, &args.iter().map(|v| (*v).into()).collect::<Vec<_>>(), name)
-        .map_err(|e| crate::Error::LlvmError {
-            reason: format!("build_call {}: {}", intrinsic_name, e),
-        })?;
+        .map_err(|e| crate::Error::LlvmError { reason: format!("build_call {}: {}", intrinsic_name, e) })?;
     Ok(extract_value(call_site))
 }
 
@@ -178,9 +142,7 @@ fn get_type_suffix(dtype: &morok_dtype::DType) -> Result<String> {
         Some(morok_dtype::ScalarDType::BFloat16) => Ok("f16".to_string()),
         Some(morok_dtype::ScalarDType::Float32) => Ok("f32".to_string()),
         Some(morok_dtype::ScalarDType::Float64) => Ok("f64".to_string()),
-        _ => Err(crate::Error::TypeError {
-            reason: format!("Type {:?} not supported for intrinsics", dtype),
-        }),
+        _ => Err(crate::Error::TypeError { reason: format!("Type {:?} not supported for intrinsics", dtype) }),
     }
 }
 
@@ -222,16 +184,12 @@ fn codegen_unary<'ctx>(
             if is_float {
                 Ok(builder
                     .build_float_neg(src.into_float_value(), "neg")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_neg: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_neg: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_int_neg(src.into_int_value(), "neg")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_neg: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_neg: {}", e) })?
                     .into())
             }
         }
@@ -245,19 +203,13 @@ fn codegen_unary<'ctx>(
                 let zero = int_val.get_type().const_zero();
                 let is_neg = builder
                     .build_int_compare(IntPredicate::SLT, int_val, zero, "is_neg")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_compare: {}", e),
-                    })?;
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?;
                 let neg_val = builder
                     .build_int_neg(int_val, "neg_val")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_neg: {}", e),
-                    })?;
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_neg: {}", e) })?;
                 Ok(builder
                     .build_select(is_neg, neg_val, int_val, "abs")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_select: {}", e),
-                    })?)
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_select: {}", e) })?)
             }
         }
         UnaryOp::Sqrt => {
@@ -267,19 +219,11 @@ fn codegen_unary<'ctx>(
         UnaryOp::Rsqrt => {
             // rsqrt = 1 / sqrt(x)
             let suffix = get_type_suffix(result_dtype)?;
-            let sqrt_val = call_intrinsic(
-                &format!("llvm.sqrt.{}", suffix),
-                &[src],
-                "sqrt",
-                module,
-                builder,
-            )?;
+            let sqrt_val = call_intrinsic(&format!("llvm.sqrt.{}", suffix), &[src], "sqrt", module, builder)?;
             let one = src.into_float_value().get_type().const_float(1.0);
             Ok(builder
                 .build_float_div(one, sqrt_val.into_float_value(), "rsqrt")
-                .map_err(|e| crate::Error::LlvmError {
-                    reason: format!("build_float_div: {}", e),
-                })?
+                .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_div: {}", e) })?
                 .into())
         }
         UnaryOp::Exp => {
@@ -307,12 +251,7 @@ fn codegen_unary<'ctx>(
             call_intrinsic(&format!("llvm.cos.{}", suffix), &[src], "cos", module, builder)
         }
         _ => {
-            ensure!(
-                false,
-                UnsupportedOpSnafu {
-                    op: format!("{:?}", op)
-                }
-            );
+            ensure!(false, UnsupportedOpSnafu { op: format!("{:?}", op) });
             unreachable!()
         }
     }
@@ -336,16 +275,12 @@ fn codegen_binary<'ctx>(
             if is_float {
                 Ok(builder
                     .build_float_add(lhs.into_float_value(), rhs.into_float_value(), "add")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_add: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_add: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_int_add(lhs.into_int_value(), rhs.into_int_value(), "add")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_add: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_add: {}", e) })?
                     .into())
             }
         }
@@ -353,16 +288,12 @@ fn codegen_binary<'ctx>(
             if is_float {
                 Ok(builder
                     .build_float_mul(lhs.into_float_value(), rhs.into_float_value(), "mul")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_mul: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_mul: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_int_mul(lhs.into_int_value(), rhs.into_int_value(), "mul")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_mul: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_mul: {}", e) })?
                     .into())
             }
         }
@@ -370,39 +301,29 @@ fn codegen_binary<'ctx>(
             if is_float {
                 Ok(builder
                     .build_float_sub(lhs.into_float_value(), rhs.into_float_value(), "sub")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_sub: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_sub: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_int_sub(lhs.into_int_value(), rhs.into_int_value(), "sub")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_sub: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_sub: {}", e) })?
                     .into())
             }
         }
         BinaryOp::Fdiv => Ok(builder
             .build_float_div(lhs.into_float_value(), rhs.into_float_value(), "fdiv")
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_float_div: {}", e),
-            })?
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_div: {}", e) })?
             .into()),
         BinaryOp::Idiv => {
             if is_signed {
                 Ok(builder
                     .build_int_signed_div(lhs.into_int_value(), rhs.into_int_value(), "idiv")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_signed_div: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_signed_div: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_int_unsigned_div(lhs.into_int_value(), rhs.into_int_value(), "idiv")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_unsigned_div: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_unsigned_div: {}", e) })?
                     .into())
             }
         }
@@ -410,23 +331,17 @@ fn codegen_binary<'ctx>(
             if is_float {
                 Ok(builder
                     .build_float_rem(lhs.into_float_value(), rhs.into_float_value(), "mod")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_rem: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_rem: {}", e) })?
                     .into())
             } else if is_signed {
                 Ok(builder
                     .build_int_signed_rem(lhs.into_int_value(), rhs.into_int_value(), "mod")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_signed_rem: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_signed_rem: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_int_unsigned_rem(lhs.into_int_value(), rhs.into_int_value(), "mod")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_unsigned_rem: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_unsigned_rem: {}", e) })?
                     .into())
             }
         }
@@ -446,49 +361,35 @@ fn codegen_binary<'ctx>(
         }
         BinaryOp::And => Ok(builder
             .build_and(lhs.into_int_value(), rhs.into_int_value(), "and")
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_and: {}", e),
-            })?
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_and: {}", e) })?
             .into()),
         BinaryOp::Or => Ok(builder
             .build_or(lhs.into_int_value(), rhs.into_int_value(), "or")
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_or: {}", e),
-            })?
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_or: {}", e) })?
             .into()),
         BinaryOp::Xor => Ok(builder
             .build_xor(lhs.into_int_value(), rhs.into_int_value(), "xor")
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_xor: {}", e),
-            })?
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_xor: {}", e) })?
             .into()),
         BinaryOp::Shl => Ok(builder
             .build_left_shift(lhs.into_int_value(), rhs.into_int_value(), "shl")
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_left_shift: {}", e),
-            })?
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_left_shift: {}", e) })?
             .into()),
         BinaryOp::Shr => Ok(builder
             .build_right_shift(lhs.into_int_value(), rhs.into_int_value(), is_signed, "shr")
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_right_shift: {}", e),
-            })?
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_right_shift: {}", e) })?
             .into()),
         BinaryOp::Lt => {
             if is_float {
                 Ok(builder
                     .build_float_compare(FloatPredicate::OLT, lhs.into_float_value(), rhs.into_float_value(), "lt")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_compare: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_compare: {}", e) })?
                     .into())
             } else {
                 let pred = if is_signed { IntPredicate::SLT } else { IntPredicate::ULT };
                 Ok(builder
                     .build_int_compare(pred, lhs.into_int_value(), rhs.into_int_value(), "lt")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_compare: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?
                     .into())
             }
         }
@@ -496,26 +397,17 @@ fn codegen_binary<'ctx>(
             if is_float {
                 Ok(builder
                     .build_float_compare(FloatPredicate::OEQ, lhs.into_float_value(), rhs.into_float_value(), "eq")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_compare: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_compare: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_int_compare(IntPredicate::EQ, lhs.into_int_value(), rhs.into_int_value(), "eq")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_compare: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?
                     .into())
             }
         }
         _ => {
-            ensure!(
-                false,
-                UnsupportedOpSnafu {
-                    op: format!("{:?}", op)
-                }
-            );
+            ensure!(false, UnsupportedOpSnafu { op: format!("{:?}", op) });
             unreachable!()
         }
     }
@@ -535,9 +427,7 @@ fn codegen_ternary<'ctx>(
     match op {
         TernaryOp::Where => Ok(builder
             .build_select(a.into_int_value(), b, c, "where")
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_select: {}", e),
-            })?),
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_select: {}", e) })?),
         TernaryOp::MulAcc => {
             let suffix = get_type_suffix(result_dtype)?;
             call_intrinsic(&format!("llvm.fma.{}", suffix), &[a, b, c], "fma", module, builder)
@@ -567,16 +457,12 @@ fn codegen_cast<'ctx>(
             if src_dtype.bytes() > dst_dtype.bytes() {
                 Ok(builder
                     .build_float_trunc(src_val, dst_type, "fptrunc")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_trunc: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_trunc: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_float_ext(src_val, dst_type, "fpext")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_ext: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_ext: {}", e) })?
                     .into())
             }
         }
@@ -586,16 +472,12 @@ fn codegen_cast<'ctx>(
             if dst_is_signed {
                 Ok(builder
                     .build_float_to_signed_int(src_val, dst_type, "fptosi")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_to_signed_int: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_to_signed_int: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_float_to_unsigned_int(src_val, dst_type, "fptoui")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_float_to_unsigned_int: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_to_unsigned_int: {}", e) })?
                     .into())
             }
         }
@@ -605,16 +487,12 @@ fn codegen_cast<'ctx>(
             if src_is_signed {
                 Ok(builder
                     .build_signed_int_to_float(src_val, dst_type, "sitofp")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_signed_int_to_float: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_signed_int_to_float: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_unsigned_int_to_float(src_val, dst_type, "uitofp")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_unsigned_int_to_float: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_unsigned_int_to_float: {}", e) })?
                     .into())
             }
         }
@@ -624,23 +502,17 @@ fn codegen_cast<'ctx>(
             if src_dtype.bytes() > dst_dtype.bytes() {
                 Ok(builder
                     .build_int_truncate(src_val, dst_type, "trunc")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_truncate: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_truncate: {}", e) })?
                     .into())
             } else if src_is_signed {
                 Ok(builder
                     .build_int_s_extend(src_val, dst_type, "sext")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_s_extend: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_s_extend: {}", e) })?
                     .into())
             } else {
                 Ok(builder
                     .build_int_z_extend(src_val, dst_type, "zext")
-                    .map_err(|e| crate::Error::LlvmError {
-                        reason: format!("build_int_z_extend: {}", e),
-                    })?
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_z_extend: {}", e) })?
                     .into())
             }
         }
@@ -661,23 +533,14 @@ fn codegen_load<'ctx>(
     // GEP to get the element pointer
     let element_ptr = unsafe {
         builder
-            .build_gep(
-                dtype_to_basic_type(result_dtype, context),
-                ptr_val,
-                &[index_val],
-                "gep",
-            )
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_gep: {}", e),
-            })?
+            .build_gep(dtype_to_basic_type(result_dtype, context), ptr_val, &[index_val], "gep")
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_gep: {}", e) })?
     };
 
     // Load from the pointer
     let loaded = builder
         .build_load(dtype_to_basic_type(result_dtype, context), element_ptr, "load")
-        .map_err(|e| crate::Error::LlvmError {
-            reason: format!("build_load: {}", e),
-        })?;
+        .map_err(|e| crate::Error::LlvmError { reason: format!("build_load: {}", e) })?;
 
     Ok(loaded)
 }
@@ -702,17 +565,13 @@ fn codegen_store<'ctx>(
                 &[index_val],
                 "gep",
             )
-            .map_err(|e| crate::Error::LlvmError {
-                reason: format!("build_gep: {}", e),
-            })?
+            .map_err(|e| crate::Error::LlvmError { reason: format!("build_gep: {}", e) })?
     };
 
     // Store the value
     builder
         .build_store(element_ptr, value)
-        .map_err(|e| crate::Error::LlvmError {
-            reason: format!("build_store: {}", e),
-        })?;
+        .map_err(|e| crate::Error::LlvmError { reason: format!("build_store: {}", e) })?;
 
     Ok(())
 }

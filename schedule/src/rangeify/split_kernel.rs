@@ -22,6 +22,50 @@ use super::kernel_context::KernelContext;
 use super::split_patterns::to_define_global_patterns;
 use crate::rewrite::graph_rewrite;
 
+/// Find first COPY or BUFFER_VIEW operation in the computation graph.
+///
+/// When a kernel's computation contains a COPY or BUFFER_VIEW operation,
+/// the kernel's AST should be that operation directly rather than wrapped
+/// in a SINK. This allows:
+/// - **COPY:** Scheduler to detect cross-device transfers and assign elevated priority
+/// - **BUFFER_VIEW:** Runtime to extract view parameters (size, offset) for sub-buffer creation
+///
+/// If multiple COPY/BUFFER_VIEW operations exist, returns the first one found
+/// during topological traversal (typically the one deepest in the graph).
+///
+/// # Arguments
+///
+/// * `uop` - The computation graph to search
+///
+/// # Returns
+///
+/// * `Some(op)` - The first COPY or BUFFER_VIEW operation found
+/// * `None` - If no such operation exists in the graph
+///
+/// # Example
+///
+/// ```ignore
+/// let copy = UOp::new(Op::Copy { src: buffer, device }, DType::Float32);
+/// let store = UOp::store(output, vec![idx], copy);
+///
+/// // Returns Some(copy), not None
+/// assert!(find_copy_or_buffer_view(&store).is_some());
+/// ```
+///
+/// Based on Tinygrad's "hack for COPY" (rangeify.py:494-499).
+fn find_copy_or_buffer_view(uop: &Rc<UOp>) -> Option<Rc<UOp>> {
+    // Traverse the computation graph in topological order
+    for node in uop.toposort() {
+        match node.op() {
+            Op::Copy { .. } | Op::BufferView { .. } => {
+                return Some(node);
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
 /// Split STORE and END operations into individual kernels.
 ///
 /// This function determines whether a STORE or END operation should be split into
@@ -43,9 +87,9 @@ use crate::rewrite::graph_rewrite;
 /// 3. **Validation:**
 ///    - Check for buffer access cycles (LOAD vs STORE conflicts)
 ///
-/// 4. **SINK Creation:**
-///    - Wrap the computation in a SINK operation
-///    - TODO: Add support for COPY/BUFFER_VIEW special cases
+/// 4. **Kernel AST Creation:**
+///    - Wrap computation in SINK operation (for normal kernels)
+///    - Use COPY/BUFFER_VIEW directly as AST (for special kernels)
 ///
 /// 5. **KERNEL Creation:**
 ///    - Create KERNEL with sources from KernelContext
@@ -171,12 +215,29 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // Check that no buffer is accessed with conflicting operations (LOAD vs STORE).
     // This prevents creating invalid kernels. Panics if cycles detected.
     // Based on Tinygrad's find_bufs (schedule/rangeify.py:413-417)
+    #[allow(clippy::mutable_key_type)]
     let _buf_accesses = find_bufs(&transformed);
 
-    // **STEP 3: Create SINK operation**
-    // Wrap the transformed computation (either STORE or END(STORE, RANGE)) in a SINK
-    // Tinygrad line 501: ret = ret.sink(...)
-    let sink = UOp::sink(vec![transformed]);
+    // **STEP 3: Create kernel AST (SINK or special operations)**
+    //
+    // Normal case: Wrap computation in SINK
+    // Special cases: Use COPY or BUFFER_VIEW directly as kernel AST
+    //
+    // Rationale:
+    // - COPY kernels need direct AST for scheduler priority assignment
+    // - BUFFER_VIEW kernels need direct AST for view parameter extraction
+    //
+    // If both COPY and BUFFER_VIEW exist, the first one found (deepest in toposort)
+    // is used as the AST. This is deterministic and matches Tinygrad's behavior.
+    //
+    // Based on Tinygrad's "hack for COPY" (rangeify.py:494-499).
+    let ast = if let Some(special_op) = find_copy_or_buffer_view(&transformed) {
+        // Found COPY or BUFFER_VIEW - use it directly as kernel AST
+        special_op
+    } else {
+        // Normal computational kernel - wrap in SINK
+        UOp::sink(vec![transformed])
+    };
 
     // **STEP 4: Build kernel sources from context**
     // Sources = all accessed buffers + all BIND variables
@@ -197,7 +258,8 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     }
 
     // **STEP 5: Create KERNEL operation**
-    let kernel = UOp::kernel(sources, sink);
+    // Use the AST we created in STEP 3 (either SINK or special operation)
+    let kernel = UOp::kernel(sources, ast);
 
     Some(kernel)
 }

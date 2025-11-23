@@ -50,10 +50,7 @@ fn test_record_and_retrieve_transform() {
 
     let retrieved = ctx.get_rangeified(&original);
     assert!(retrieved.is_some(), "Should find recorded transformation");
-    assert!(
-        Rc::ptr_eq(retrieved.unwrap(), &rangeified),
-        "Retrieved value should be the same Rc as recorded"
-    );
+    assert!(Rc::ptr_eq(retrieved.unwrap(), &rangeified), "Retrieved value should be the same Rc as recorded");
 }
 
 #[test]
@@ -104,10 +101,7 @@ fn test_overwrite_transform() {
 
     // Should have the second value
     let retrieved = ctx.get_rangeified(&original).unwrap();
-    assert!(
-        Rc::ptr_eq(retrieved, &rangeified2),
-        "Should retrieve the most recently recorded transform"
-    );
+    assert!(Rc::ptr_eq(retrieved, &rangeified2), "Should retrieve the most recently recorded transform");
     assert_eq!(ctx.range_map.len(), 1, "Should still have only 1 entry (overwritten)");
 }
 
@@ -203,16 +197,8 @@ fn test_many_transforms() {
     // Verify all transforms are retrievable
     for (i, (original, rangeified)) in originals.iter().zip(rangeifieds.iter()).enumerate() {
         let retrieved = ctx.get_rangeified(original);
-        assert!(
-            retrieved.is_some(),
-            "Transform {} should be retrievable",
-            i
-        );
-        assert!(
-            Rc::ptr_eq(retrieved.unwrap(), rangeified),
-            "Transform {} should match",
-            i
-        );
+        assert!(retrieved.is_some(), "Transform {} should be retrievable", i);
+        assert!(Rc::ptr_eq(retrieved.unwrap(), rangeified), "Transform {} should match", i);
     }
 }
 
@@ -232,10 +218,7 @@ fn test_transform_with_equivalent_uops() {
 
     // Since original1 and original2 are structurally equal and use hash consing,
     // they should be the same Rc
-    assert!(
-        Rc::ptr_eq(&original1, &original2),
-        "Hash consing should make equivalent UOps share the same Rc"
-    );
+    assert!(Rc::ptr_eq(&original1, &original2), "Hash consing should make equivalent UOps share the same Rc");
 
     // So we should be able to retrieve using original2
     let retrieved = ctx.get_rangeified(&original2);

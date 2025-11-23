@@ -1150,9 +1150,12 @@ fn test_compositional_optimization_minimal_failure() {
     // The compositional approach should be nearly as good as direct
     // EXPECTED: Both should optimize to var("a") * 4 (1 operation)
     // ACTUAL: Compositional gives worse results
-    assert!(final_count <= direct_count + 1,
+    assert!(
+        final_count <= direct_count + 1,
         "Compositional optimization ({} ops) should be nearly as good as direct ({} ops)",
-        final_count, direct_count);
+        final_count,
+        direct_count
+    );
 }
 
 #[test]

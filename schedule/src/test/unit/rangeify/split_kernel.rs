@@ -298,3 +298,188 @@ fn test_split_store_end_with_mixed_ranges() {
     // Should skip if ANY range is OUTER (our implementation checks all ranges)
     assert!(result.is_none());
 }
+
+// ============================================================================
+// COPY/BUFFER_VIEW Support Tests
+// ============================================================================
+
+#[test]
+fn test_split_store_with_copy() {
+    use morok_ir::DeviceSpec;
+
+    let mut ctx = KernelContext::new();
+
+    // Create a COPY operation
+    let src_buffer = UOp::unique(Some(1));
+    let copy = src_buffer.copy_to_device(DeviceSpec::Cpu);
+
+    // Create STORE using the COPY result
+    let output_buffer = UOp::unique(Some(0));
+    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let store = UOp::new(Op::Store { buffer: output_buffer, index, value: copy.clone() }, DType::Void);
+
+    let result = split_store(&store, &mut ctx);
+
+    assert!(result.is_some());
+    let kernel = result.unwrap();
+
+    // Verify kernel AST is COPY, not SINK
+    if let Op::Kernel { ast, .. } = kernel.op() {
+        assert!(matches!(ast.op(), Op::Copy { .. }), "Expected COPY operation as kernel AST, got: {:?}", ast.op());
+
+        // Verify it's the same COPY we created
+        assert!(std::rc::Rc::ptr_eq(ast, &copy));
+    } else {
+        panic!("Expected KERNEL operation");
+    }
+}
+
+#[test]
+fn test_split_store_with_buffer_view() {
+    let mut ctx = KernelContext::new();
+
+    // Create a BUFFER_VIEW operation
+    let base_buffer = UOp::unique(Some(1));
+    let buffer_view = UOp::buffer_view(base_buffer, 256, 128);
+
+    // Create STORE using the BUFFER_VIEW result
+    let output_buffer = UOp::unique(Some(0));
+    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let store = UOp::new(Op::Store { buffer: output_buffer, index, value: buffer_view.clone() }, DType::Void);
+
+    let result = split_store(&store, &mut ctx);
+
+    assert!(result.is_some());
+    let kernel = result.unwrap();
+
+    // Verify kernel AST is BUFFER_VIEW, not SINK
+    if let Op::Kernel { ast, .. } = kernel.op() {
+        if let Op::BufferView { size, offset, .. } = ast.op() {
+            assert_eq!(*size, 256);
+            assert_eq!(*offset, 128);
+            // Verify it's the same BUFFER_VIEW we created
+            assert!(std::rc::Rc::ptr_eq(ast, &buffer_view));
+        } else {
+            panic!("Expected BUFFER_VIEW operation as kernel AST, got: {:?}", ast.op());
+        }
+    } else {
+        panic!("Expected KERNEL operation");
+    }
+}
+
+#[test]
+fn test_split_store_normal_computation_uses_sink() {
+    let mut ctx = KernelContext::new();
+
+    // Create normal arithmetic computation (no COPY/BUFFER_VIEW)
+    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let value = a.try_add_op(&b).unwrap();
+
+    // Create STORE with normal computation
+    let buffer = UOp::unique(Some(0));
+    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let store = UOp::new(Op::Store { buffer: buffer.clone(), index, value: value.clone() }, DType::Void);
+
+    let result = split_store(&store, &mut ctx);
+
+    assert!(result.is_some());
+    let kernel = result.unwrap();
+
+    // Verify kernel AST is SINK (normal case)
+    if let Op::Kernel { ast, .. } = kernel.op() {
+        if let Op::Sink { sources } = ast.op() {
+            // SINK should wrap the STORE
+            assert_eq!(sources.len(), 1);
+            assert!(std::rc::Rc::ptr_eq(&sources[0], &store));
+        } else {
+            panic!("Expected SINK operation for normal computation, got: {:?}", ast.op());
+        }
+    } else {
+        panic!("Expected KERNEL operation");
+    }
+}
+
+#[test]
+fn test_split_store_nested_copy_in_store() {
+    use morok_ir::DeviceSpec;
+
+    let mut ctx = KernelContext::new();
+
+    // Create nested structure: END(STORE(COPY))
+    let src_buffer = UOp::unique(Some(1));
+    let copy = src_buffer.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
+
+    let output_buffer = UOp::unique(Some(0));
+    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let store = UOp::new(Op::Store { buffer: output_buffer, index, value: copy.clone() }, DType::Void);
+
+    let range = UOp::range_const(10, 0);
+    let end = UOp::end(store, smallvec![range]);
+
+    let result = split_store(&end, &mut ctx);
+
+    assert!(result.is_some());
+    let kernel = result.unwrap();
+
+    // Verify kernel AST is COPY (found via toposort in END→STORE→COPY)
+    if let Op::Kernel { ast, .. } = kernel.op() {
+        assert!(
+            matches!(ast.op(), Op::Copy { .. }),
+            "Expected COPY operation as kernel AST even when nested, got: {:?}",
+            ast.op()
+        );
+
+        // Verify it's the same COPY we created
+        assert!(std::rc::Rc::ptr_eq(ast, &copy));
+    } else {
+        panic!("Expected KERNEL operation");
+    }
+}
+
+#[test]
+fn test_split_store_copy_precedence_documented() {
+    use morok_ir::DeviceSpec;
+
+    // This test documents the precedence behavior when multiple COPY/BUFFER_VIEW
+    // operations exist in a computation graph:
+    //
+    // **Behavior:** The first COPY or BUFFER_VIEW found during toposort() traversal
+    // becomes the kernel AST. This is deterministic based on graph structure.
+    //
+    // **Rationale:** Scheduler needs direct AST access to detect cross-device
+    // transfers (COPY) or extract view parameters (BUFFER_VIEW). Using the first
+    // special op found ensures we don't miss important operations.
+    //
+    // For this test, we create a structure with nested COPY operations to verify
+    // that find_copy_or_buffer_view() correctly identifies them.
+
+    let mut ctx = KernelContext::new();
+
+    // Create nested COPY: COPY(COPY(buffer))
+    let base_buffer = UOp::unique(Some(1));
+    let copy1 = base_buffer.copy_to_device(DeviceSpec::Cpu);
+    let copy2 = copy1.clone().copy_to_device(DeviceSpec::Cuda { device_id: 0 });
+
+    let output_buffer = UOp::unique(Some(0));
+    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let store = UOp::new(Op::Store { buffer: output_buffer, index, value: copy2.clone() }, DType::Void);
+
+    let result = split_store(&store, &mut ctx);
+
+    assert!(result.is_some());
+    let kernel = result.unwrap();
+
+    // Verify kernel AST is one of the COPY operations (toposort order determines which)
+    if let Op::Kernel { ast, .. } = kernel.op() {
+        assert!(matches!(ast.op(), Op::Copy { .. }), "Expected COPY operation as kernel AST, got: {:?}", ast.op());
+
+        // Should be either copy1 or copy2 (both are valid COPY operations)
+        let is_copy1 = std::rc::Rc::ptr_eq(ast, &copy1);
+        let is_copy2 = std::rc::Rc::ptr_eq(ast, &copy2);
+
+        assert!(is_copy1 || is_copy2, "Kernel AST should be one of the COPY operations in the graph");
+    } else {
+        panic!("Expected KERNEL operation");
+    }
+}

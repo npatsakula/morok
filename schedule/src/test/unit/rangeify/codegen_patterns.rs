@@ -93,7 +93,7 @@ fn test_fix_after_broadcast_unwraps_expand() {
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();
-    let after = UOp::new(Op::After { passthrough: expand, deps: vec![computation].into() }, source.dtype());
+    let after = UOp::after(expand, smallvec::smallvec![computation]);
 
     let result = fix_after_broadcast(&after);
     assert!(result.is_some());
@@ -121,7 +121,7 @@ fn test_fix_after_broadcast_returns_none_for_non_expand() {
     // Test that AFTER not wrapping EXPAND returns None
     let source = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let computation = UOp::noop();
-    let after = UOp::new(Op::After { passthrough: source, deps: vec![computation].into() }, DType::Float32);
+    let after = UOp::after(source, smallvec::smallvec![computation]);
 
     let result = fix_after_broadcast(&after);
     assert!(result.is_none());
@@ -136,7 +136,7 @@ fn test_fix_after_broadcast_no_panic_on_global() {
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();
-    let after = UOp::new(Op::After { passthrough: expand, deps: vec![computation].into() }, source.dtype());
+    let after = UOp::after(expand, smallvec::smallvec![computation]);
 
     // Should not panic for global (non-local) buffer
     let result = fix_after_broadcast(&after);

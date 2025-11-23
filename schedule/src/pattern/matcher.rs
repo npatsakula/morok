@@ -52,6 +52,7 @@ enum OpKey {
     Unique,
     Device,
     Noop,
+    Invalid,
     DefineGlobal,
     DefineLocal,
 
@@ -144,6 +145,7 @@ impl OpKey {
             Op::Unique(_) => OpKey::Unique,
             Op::Device(_) => OpKey::Device,
             Op::Noop => OpKey::Noop,
+            Op::Invalid => OpKey::Invalid,
             Op::DefineGlobal(_) => OpKey::DefineGlobal,
             Op::DefineLocal(_) => OpKey::DefineLocal,
 

@@ -39,7 +39,7 @@ fn test_early_rewrites_contiguous_backward_removal() {
     let matcher = patterns::early_rewrites();
 
     // Test: CONTIGUOUS_BACKWARD(x) → x
-    let x = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let x = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as _));
     let contiguous = UOp::new(Op::ContiguousBackward { src: x.clone() }, x.dtype());
 
     let result = matcher.rewrite(&contiguous);
@@ -79,10 +79,7 @@ fn test_early_rewrites_nested_detach() {
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(
-            Rc::ptr_eq(&rewritten, &inner_detach),
-            "Should unwrap outer DETACH to inner DETACH"
-        );
+        assert!(Rc::ptr_eq(&rewritten, &inner_detach), "Should unwrap outer DETACH to inner DETACH");
     }
 }
 
@@ -131,7 +128,7 @@ fn test_buffer_folding_index_const() {
     let matcher = patterns::buffer_folding();
 
     // Test: INDEX(CONST) → CONST
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let const_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as _));
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
     let range = UOp::range_axis(range_end, 0, AxisType::Loop);
     let index = UOp::index(const_val.clone(), vec![range]).unwrap();
@@ -240,10 +237,7 @@ fn test_dead_axis_removal_mixed_axes() {
         RewriteResult::Rewritten(rewritten) => {
             if let Op::Bufferize { ranges, .. } = rewritten.op() {
                 // Should have removed the dead axis
-                assert!(
-                    ranges.len() <= 2,
-                    "Should have at most the same number of ranges"
-                );
+                assert!(ranges.len() <= 2, "Should have at most the same number of ranges");
                 // Ideally should have 1 range (live_range only)
             }
         }
@@ -292,10 +286,7 @@ fn test_buffer_removal_cheap_compute() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(
-                Rc::ptr_eq(&rewritten, &add),
-                "Should remove BUFFERIZE from cheap compute"
-            );
+            assert!(Rc::ptr_eq(&rewritten, &add), "Should remove BUFFERIZE from cheap compute");
         }
         _ => {
             // Acceptable if cost model determines it's not cheap enough
@@ -319,10 +310,7 @@ fn test_buffer_removal_always_run_ops() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(
-                Rc::ptr_eq(&rewritten, &contiguous),
-                "Should remove BUFFERIZE from always-run op"
-            );
+            assert!(Rc::ptr_eq(&rewritten, &contiguous), "Should remove BUFFERIZE from always-run op");
         }
         _ => {
             // Acceptable depending on implementation
@@ -352,10 +340,7 @@ fn test_buffer_removal_nested_bufferize() {
         RewriteResult::Rewritten(rewritten) => {
             if let Op::Bufferize { compute, .. } = rewritten.op() {
                 // Should have unwrapped inner BUFFERIZE
-                assert!(
-                    Rc::ptr_eq(compute, &x),
-                    "Should have compute pointing to x, not inner BUFFERIZE"
-                );
+                assert!(Rc::ptr_eq(compute, &x), "Should have compute pointing to x, not inner BUFFERIZE");
             } else {
                 panic!("Expected BUFFERIZE operation");
             }
@@ -464,16 +449,9 @@ fn test_idempotent_patterns() {
     let result1 = matcher.rewrite(&detach);
     assert!(matches!(result1, RewriteResult::Rewritten(_)));
 
-    let unwrapped = if let RewriteResult::Rewritten(r) = result1 {
-        r
-    } else {
-        x.clone()
-    };
+    let unwrapped = if let RewriteResult::Rewritten(r) = result1 { r } else { x.clone() };
 
     // Second application (should not match on CONST)
     let result2 = matcher.rewrite(&unwrapped);
-    assert!(
-        matches!(result2, RewriteResult::NoMatch),
-        "Should not match on already-processed node"
-    );
+    assert!(matches!(result2, RewriteResult::NoMatch), "Should not match on already-processed node");
 }

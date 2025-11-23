@@ -11,10 +11,10 @@
 //! The scheduling process converts from lazy tensor operations to
 //! executable kernels with properly allocated device buffers.
 
-use std::rc::Rc;
-use morok_ir::{Op, UOp};
+use crate::{BUFFERS, Result};
 use morok_device::Buffer;
-use crate::{Result, BUFFERS};
+use morok_ir::{Op, UOp};
+use std::rc::Rc;
 
 /// A single executable kernel with its buffers.
 ///
@@ -64,9 +64,7 @@ pub fn create_schedule(transformed: Rc<UOp>) -> Result<Schedule> {
     }
 
     if kernels.is_empty() {
-        return Err(Error::Runtime {
-            message: "No kernels found after scheduling pipeline".to_string(),
-        });
+        return Err(Error::Runtime { message: "No kernels found after scheduling pipeline".to_string() });
     }
 
     // Step 2: For each kernel, collect buffers from sources
@@ -90,10 +88,7 @@ pub fn create_schedule(transformed: Rc<UOp>) -> Result<Schedule> {
 
         let buffers = collect_kernel_buffers(sources, &kernel_uop)?;
 
-        schedule.push(ScheduleItem {
-            ast: kernel_uop.clone(),
-            buffers,
-        });
+        schedule.push(ScheduleItem { ast: kernel_uop.clone(), buffers });
     }
 
     Ok(schedule)
@@ -107,10 +102,7 @@ pub fn create_schedule(transformed: Rc<UOp>) -> Result<Schedule> {
 ///
 /// For MVP, we only handle input buffers. Intermediate buffer allocation
 /// is handled separately in allocate_kernel_buffers().
-fn collect_kernel_buffers(
-    sources: &[Rc<UOp>],
-    _kernel: &Rc<UOp>,
-) -> Result<Vec<Buffer>> {
+fn collect_kernel_buffers(sources: &[Rc<UOp>], _kernel: &Rc<UOp>) -> Result<Vec<Buffer>> {
     use crate::error::*;
 
     let mut buffers = Vec::new();
@@ -172,9 +164,7 @@ pub fn allocate_kernel_buffers(kernel: &Rc<UOp>) -> Result<Vec<Buffer>> {
     let (sources, ast) = match kernel.op() {
         Op::Kernel { sources, ast } => (sources, ast),
         _ => {
-            return Err(Error::Runtime {
-                message: "Expected KERNEL operation".to_string(),
-            });
+            return Err(Error::Runtime { message: "Expected KERNEL operation".to_string() });
         }
     };
 
@@ -187,15 +177,9 @@ pub fn allocate_kernel_buffers(kernel: &Rc<UOp>) -> Result<Vec<Buffer>> {
                 let dtype = src.dtype();
                 let size = compute_buffer_size(ast, src)?;
 
-                let device = registry::cpu().map_err(|e| Error::Device {
-                    message: format!("Failed to get CPU device: {}", e),
-                })?;
-                let buffer = Buffer::new(
-                    device,
-                    dtype,
-                    vec![size],
-                    Default::default(),
-                );
+                let device = registry::cpu()
+                    .map_err(|e| Error::Device { message: format!("Failed to get CPU device: {}", e) })?;
+                let buffer = Buffer::new(device, dtype, vec![size], Default::default());
 
                 // Register in BUFFERS for future lookups
                 BUFFERS.with(|b| b.borrow_mut().insert(*id as u64, buffer.clone()));
@@ -207,15 +191,9 @@ pub fn allocate_kernel_buffers(kernel: &Rc<UOp>) -> Result<Vec<Buffer>> {
                 let dtype = src.dtype();
                 let size = compute_buffer_size(ast, src)?;
 
-                let device = registry::cpu().map_err(|e| Error::Device {
-                    message: format!("Failed to get CPU device: {}", e),
-                })?;
-                let buffer = Buffer::new(
-                    device,
-                    dtype,
-                    vec![size],
-                    Default::default(),
-                );
+                let device = registry::cpu()
+                    .map_err(|e| Error::Device { message: format!("Failed to get CPU device: {}", e) })?;
+                let buffer = Buffer::new(device, dtype, vec![size], Default::default());
 
                 BUFFERS.with(|b| b.borrow_mut().insert(*id as u64, buffer.clone()));
 
@@ -235,9 +213,7 @@ pub fn allocate_kernel_buffers(kernel: &Rc<UOp>) -> Result<Vec<Buffer>> {
             }
             _ => {
                 // Unknown source type
-                return Err(Error::Runtime {
-                    message: format!("Unexpected kernel source: {:?}", src.op()),
-                });
+                return Err(Error::Runtime { message: format!("Unexpected kernel source: {:?}", src.op()) });
             }
         }
     }
@@ -277,9 +253,7 @@ fn compute_buffer_size(ast: &Rc<UOp>, buffer_def: &Rc<UOp>) -> Result<usize> {
     // Couldn't determine size - this might be OK for local memory
     // which gets sized based on workgroup dimensions
     // For now, default to 1 element
-    Err(Error::Runtime {
-        message: "Could not determine buffer size from kernel AST".to_string(),
-    })
+    Err(Error::Runtime { message: "Could not determine buffer size from kernel AST".to_string() })
 }
 
 #[cfg(test)]
@@ -304,10 +278,7 @@ mod tests {
         let kernel = UOp::kernel(sources, sink);
 
         // ScheduleItem should be creatable
-        let item = ScheduleItem {
-            ast: kernel.clone(),
-            buffers: vec![],
-        };
+        let item = ScheduleItem { ast: kernel.clone(), buffers: vec![] };
 
         assert!(matches!(item.ast.op(), Op::Kernel { .. }));
     }
