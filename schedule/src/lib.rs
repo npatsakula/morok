@@ -13,6 +13,10 @@
 //!   - Phase 5: Kernel splitting at STORE boundaries
 //! - [`optimizer`] - Kernel optimization layer (OptOps, Scheduler, heuristics)
 
+// Make this crate available as `morok_schedule` for proc-macro generated code
+// This is a common pattern for crates that use proc-macros internally
+extern crate self as morok_schedule;
+
 #[macro_use]
 pub mod pattern;
 pub mod optimizer;
@@ -33,3 +37,6 @@ pub use rewrite::graph_rewrite;
 
 // Re-export UOp for macro usage
 pub use morok_ir::UOp;
+
+// Re-export the patterns! proc-macro
+pub use morok_schedule_macros::patterns;

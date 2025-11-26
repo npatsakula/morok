@@ -1267,6 +1267,12 @@ pub trait IntoUOp {
     fn into_uop(self, dtype: DType) -> Rc<UOp>;
 }
 
+impl IntoUOp for ConstValue {
+    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+        UOp::const_(dtype, self)
+    }
+}
+
 impl IntoUOp for f32 {
     fn into_uop(self, dtype: DType) -> Rc<UOp> {
         UOp::const_(dtype, ConstValue::Float(self as f64))

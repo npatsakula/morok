@@ -9,5 +9,5 @@ pub mod upat;
 #[macro_use]
 pub mod macros;
 
-pub use matcher::{PatternMatcher, RewriteResult};
-pub use upat::UPat;
+pub use matcher::{FastRewrite, LegacyRewriteFn, PatternMatcher, RewriteFn, RewriteResult};
+pub use upat::{BindingStore, BindingStoreExt, UPat, VarIntern};

@@ -1,6 +1,6 @@
 use crate::{pattern::matcher::RewriteResult, symbolic::symbolic_simple};
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, Op, UOp};
+use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UnaryOp, UOp};
 use std::rc::Rc;
 
 #[test]
@@ -1198,5 +1198,282 @@ fn test_multiplication_chain_folding() {
         } else {
             panic!("Expected Binary(Mul, a, 4), got {:?}", rewritten.op());
         }
+    }
+}
+
+// ====== Tests for BOOLEAN patterns (boolean_dsl_patterns) ======
+
+#[test]
+fn test_double_not_elimination() {
+    // !!x → x
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 0, 1);
+    let not_x = x.not();
+    let not_not_x = not_x.not();
+
+    let result = matcher.rewrite(&not_not_x);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_double_not_int() {
+    // !!x → x (for integers - bitwise NOT)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let not_x = x.not();
+    let not_not_x = not_x.not();
+
+    let result = matcher.rewrite(&not_not_x);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_xor_self_cancellation() {
+    // x ^ x → 0
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let xor_self = x.try_xor_op(&x).unwrap();
+
+    let result = matcher.rewrite(&xor_self);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Int(0));
+        } else {
+            panic!("Expected constant 0");
+        }
+    }
+}
+
+// ====== Tests for NEGATION patterns (negation_dsl_patterns) ======
+
+#[test]
+fn test_double_neg_elimination() {
+    // -(-x) → x
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
+    let neg_x = x.neg();
+    let neg_neg_x = neg_x.neg();
+
+    let result = matcher.rewrite(&neg_neg_x);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_double_neg_float() {
+    // -(-x) → x (for floats)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Float32, i64::MIN, i64::MAX);
+    let neg_x = x.neg();
+    let neg_neg_x = neg_x.neg();
+
+    let result = matcher.rewrite(&neg_neg_x);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &x));
+    }
+}
+
+// ====== Tests for MINMAX patterns (minmax_dsl_patterns) ======
+
+#[test]
+fn test_max_self_identity() {
+    // max(x, x) → x
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let max_self = x.try_max_op(&x).unwrap();
+
+    let result = matcher.rewrite(&max_self);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_max_self_float() {
+    // max(x, x) → x (for floats)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Float32, i64::MIN, i64::MAX);
+    let max_self = x.try_max_op(&x).unwrap();
+
+    let result = matcher.rewrite(&max_self);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &x));
+    }
+}
+
+// ====== Tests for POWER patterns (power_dsl_patterns) ======
+
+#[test]
+fn test_pow_zero_is_one() {
+    // x ** 0 → 1
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, 1, 100);
+    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let pow = x.try_pow_op(&zero).unwrap();
+
+    let result = matcher.rewrite(&pow);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Int(1));
+        } else {
+            panic!("Expected constant 1");
+        }
+    }
+}
+
+#[test]
+fn test_pow_one_is_identity() {
+    // x ** 1 → x
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let pow = x.try_pow_op(&one).unwrap();
+
+    let result = matcher.rewrite(&pow);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_pow_float_zero() {
+    // x ** 0.0 → 1.0
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Float32, 1, 100);
+    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let pow = x.try_pow_op(&zero).unwrap();
+
+    let result = matcher.rewrite(&pow);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Float(1.0));
+        } else {
+            panic!("Expected constant 1.0");
+        }
+    }
+}
+
+// ====== Tests for WHERE/DCE patterns (dce_dsl_patterns) ======
+
+#[test]
+fn test_where_same_branches() {
+    // where(cond, x, x) → x
+    let matcher = symbolic_simple();
+    let cond = UOp::var("cond", DType::Bool, 0, 1);
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let where_op = UOp::where_op(cond, Rc::clone(&x), Rc::clone(&x)).unwrap();
+
+    let result = matcher.rewrite(&where_op);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_where_bool_true_false() {
+    // where(x, true, false) → x (for bool x)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 0, 1);
+    let true_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let false_val = UOp::const_(DType::Bool, ConstValue::Bool(false));
+    let where_op = UOp::where_op(Rc::clone(&x), true_val, false_val).unwrap();
+
+    let result = matcher.rewrite(&where_op);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_where_bool_false_true() {
+    // where(x, false, true) → !x (for bool x)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 0, 1);
+    let false_val = UOp::const_(DType::Bool, ConstValue::Bool(false));
+    let true_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let where_op = UOp::where_op(Rc::clone(&x), false_val, true_val).unwrap();
+
+    let result = matcher.rewrite(&where_op);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        // Should be Not(x)
+        if let Op::Unary(UnaryOp::Not, inner) = rewritten.op() {
+            assert!(Rc::ptr_eq(inner, &x));
+        } else {
+            panic!("Expected Not(x)");
+        }
+    }
+}
+
+#[test]
+fn test_where_negated_condition() {
+    // where(!cond, t, f) → where(cond, f, t)
+    let matcher = symbolic_simple();
+    let cond = UOp::var("cond", DType::Bool, 0, 1);
+    let not_cond = cond.not();
+    let t = UOp::var("t", DType::Int32, 0, 100);
+    let f = UOp::var("f", DType::Int32, 0, 100);
+    let where_op = UOp::where_op(not_cond, Rc::clone(&t), Rc::clone(&f)).unwrap();
+
+    let result = matcher.rewrite(&where_op);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        // Should be Where(cond, f, t) - branches swapped
+        if let Op::Ternary(TernaryOp::Where, new_cond, new_t, new_f) = rewritten.op() {
+            assert!(Rc::ptr_eq(new_cond, &cond));
+            assert!(Rc::ptr_eq(new_t, &f)); // swapped
+            assert!(Rc::ptr_eq(new_f, &t)); // swapped
+        } else {
+            panic!("Expected Where with swapped branches");
+        }
+    }
+}
+
+#[test]
+fn test_where_const_true_condition() {
+    // where(true, t, f) → t
+    let matcher = symbolic_simple();
+    let true_cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let t = UOp::var("t", DType::Int32, 0, 100);
+    let f = UOp::var("f", DType::Int32, 0, 100);
+    let where_op = UOp::where_op(true_cond, Rc::clone(&t), f).unwrap();
+
+    let result = matcher.rewrite(&where_op);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &t));
+    }
+}
+
+#[test]
+fn test_where_const_false_condition() {
+    // where(false, t, f) → f
+    let matcher = symbolic_simple();
+    let false_cond = UOp::const_(DType::Bool, ConstValue::Bool(false));
+    let t = UOp::var("t", DType::Int32, 0, 100);
+    let f = UOp::var("f", DType::Int32, 0, 100);
+    let where_op = UOp::where_op(false_cond, t, Rc::clone(&f)).unwrap();
+
+    let result = matcher.rewrite(&where_op);
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Rc::ptr_eq(&rewritten, &f));
     }
 }

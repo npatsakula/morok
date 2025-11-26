@@ -1,8 +1,8 @@
-use std::{collections::HashMap, rc::Rc};
+use std::rc::Rc;
 
 use crate::{
     PatternMatcher, UPat,
-    pattern::{RewriteResult, matcher::RewriteFn},
+    pattern::{BindingStore, RewriteResult, VarIntern, matcher::RewriteFn},
 };
 use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, ConstValueHash, Op, UOp};
@@ -131,7 +131,7 @@ fn test_wildcard_pattern() {
     // Note: Uses manual closure to test low-level pattern matching infrastructure
     let patterns = vec![(
         UPat::var("anything"),
-        Box::new(|_bindings: &HashMap<String, Rc<UOp>>| RewriteResult::Rewritten(const_uop(42))) as RewriteFn,
+        Box::new(|_bindings: &BindingStore, _intern: &VarIntern| RewriteResult::Rewritten(const_uop(42))) as RewriteFn,
     )];
 
     let matcher = PatternMatcher::new(patterns);
@@ -169,7 +169,7 @@ fn test_indexed_before_wildcard() {
 
     patterns.push((
         UPat::var("anything"),
-        Box::new(|_bindings: &HashMap<String, Rc<UOp>>| RewriteResult::Rewritten(const_uop(99))) as RewriteFn,
+        Box::new(|_bindings: &BindingStore, _intern: &VarIntern| RewriteResult::Rewritten(const_uop(99))) as RewriteFn,
     ));
 
     let matcher = PatternMatcher::new(patterns);

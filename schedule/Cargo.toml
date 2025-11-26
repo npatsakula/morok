@@ -8,10 +8,11 @@ edition.workspace = true
 morok-ir = { path = "../ir" }
 morok-dtype = { path = "../dtype" }
 morok-device = { path = "../device" }
-smallvec = { version = "1.13", features = ["union"] }
+morok-schedule-macros = { path = "../schedule-macros" }
+smallvec = { version = "1.15", features = ["union"] }
 
-z3 = { version = "0.19.4", optional = true }
-proptest-derive = { version = "0.5", optional = true }
+z3 = { version = "0.19", optional = true }
+proptest-derive = { version = "0.7", optional = true }
 snafu = "0.8.9"
 
 [features]

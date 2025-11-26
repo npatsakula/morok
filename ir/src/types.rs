@@ -10,7 +10,7 @@ use morok_device::DeviceSpec;
 use morok_dtype::{DType, ScalarDType};
 
 /// Constant value that can be stored in a UOp.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, derive_more::From)]
 pub enum ConstValue {
     Int(i64),
     UInt(u64),
@@ -159,6 +159,39 @@ impl ConstValue {
         let scalar_dtype = dtype.scalar()?;
 
         Some(impl_cast!(*self, scalar_dtype))
+    }
+
+    /// Returns true if this constant is zero (additive identity).
+    ///
+    /// Works for all numeric types: Int, UInt, Float, Bool.
+    pub const fn is_zero(&self) -> bool {
+        match self {
+            Self::Int(0) | Self::UInt(0) | Self::Bool(false) => true,
+            Self::Float(f) => *f == 0.0,
+            _ => false,
+        }
+    }
+
+    /// Returns true if this constant is one (multiplicative identity).
+    ///
+    /// Works for all numeric types: Int, UInt, Float, Bool.
+    pub const fn is_one(&self) -> bool {
+        match self {
+            Self::Int(1) | Self::UInt(1) | Self::Bool(true) => true,
+            Self::Float(f) => *f == 1.0,
+            _ => false,
+        }
+    }
+
+    /// Returns true if this constant is negative one.
+    ///
+    /// Used for patterns like `x // -1 → -x`.
+    pub const fn is_neg_one(&self) -> bool {
+        match self {
+            Self::Int(-1) => true,
+            Self::Float(f) => *f == -1.0,
+            _ => false,
+        }
     }
 }
 
@@ -337,6 +370,8 @@ pub enum ReduceOp {
 pub enum UnaryOp {
     /// Negation: -x
     Neg,
+    /// Logical/bitwise NOT: !x (bool) or ~x (int)
+    Not,
     /// Absolute value: |x|
     Abs,
     /// Square root: √x

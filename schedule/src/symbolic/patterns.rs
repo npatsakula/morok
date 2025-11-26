@@ -10,13 +10,87 @@
 //! These patterns are separated from rangeify patterns because they apply
 //! universally to any UOp graph, not just during schedule transformation.
 
-use morok_ir::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
-use morok_ir::{Op, UOp};
+use morok_dtype::DType;
+use morok_ir::types::{BinaryOp, ConstValue};
+use morok_ir::uop::cached_property::CachedProperty;
+use morok_ir::uop::comparison_analysis::ComparisonAnalyzer;
+use morok_ir::uop::eval::{eval_add, eval_binary_op, eval_mul, eval_sub};
+use morok_ir::uop::properties::VminVmaxProperty;
+use morok_ir::{IntoUOp, Op, UOp};
 
-use crate::pattern::UPat;
 use crate::pattern::matcher::PatternMatcher;
-use crate::rangeify::helpers::{get_const_value, is_identity_value};
+use crate::patterns;
+use crate::rangeify::helpers::get_const_value;
+use crate::symbolic::dce::is_empty_range;
+
+use smallvec::SmallVec;
 use std::rc::Rc;
+
+/// Constant folding patterns using the DSL with for-loop iteration.
+///
+/// This uses the new for-loop syntax to compactly express constant folding
+/// for unary and binary operations. The `?` operator works in block expressions
+/// because they're wrapped in an Option-returning closure.
+pub fn constant_folding_dsl_patterns() -> PatternMatcher {
+    use morok_ir::uop::eval::{eval_binary_op, eval_ternary_op, eval_unary_op};
+
+    patterns! {
+        // Unary constant folding - 7 operations in one declaration
+        for op in unary [Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
+            op(c @const(c_val))
+              => eval_unary_op(op, c_val).map(|r| UOp::const_(c.dtype(), r)),
+        },
+
+        // Binary constant folding - 13 operations in one declaration
+        for op in binary [Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr] {
+            op(a @const(a_val), b @const(b_val))
+              => eval_binary_op(op, a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
+        },
+
+        // Ternary constant folding - 2 operations in one declaration
+        for op in ternary [Where, MulAcc] {
+            // For Where: use second operand's dtype (true branch)
+            // For MulAcc: use first operand's dtype (all same dtype)
+            op(a @const(a_val), b @const(b_val), c @const(c_val))
+              => eval_ternary_op(op, a_val, b_val, c_val).map(|r| UOp::const_(b.dtype(), r)),
+        },
+    }
+}
+
+/// Identity and zero propagation patterns using the DSL.
+///
+/// This is a declarative version of identity folding and zero propagation rules:
+/// - Identity folding (right side): x + 0, x - 0, x * 1, x / 1, x | 0, x ^ 0 → x
+/// - Identity folding (left side): 0 + x, 1 * x, 0 | x, 0 ^ x → x
+/// - Zero propagation: x * 0, x & 0 → 0
+pub fn identity_and_zero_patterns() -> PatternMatcher {
+    patterns! {
+        // ========== Identity folding (right side) ==========
+        Add(x, @zero) ~> x,
+        Sub(x, @zero) ~> x,
+        Mul(x, @one) ~> x,
+        Idiv(x, @one) ~> x,
+        Fdiv(x, @one) ~> x,
+        Or(x, @zero) ~> x,
+        Xor(x, @zero) ~> x,
+
+        // ========== Identity folding (left side) ==========
+        Add(@zero, x) ~> x,
+        Mul(@one, x) ~> x,
+        Or(@zero, x) ~> x,
+        Xor(@zero, x) ~> x,
+
+        // ========== Zero propagation ==========
+        // x * 0 → 0
+        Mul(_, zero @ @zero) ~> zero,
+        // 0 * x → 0
+        Mul(zero @ @zero, _) ~> zero,
+        // x & 0 → 0
+        And(_, zero @ @zero) ~> zero,
+        // 0 & x → 0
+        And(zero @ @zero, _) ~> zero,
+    }
+}
 
 /// Pattern matcher for simple symbolic simplifications.
 ///
@@ -30,861 +104,406 @@ use std::rc::Rc;
 /// - x * 0 → 0, 0 * x → 0
 /// - x & 0 → 0, 0 & x → 0
 pub fn symbolic_simple() -> PatternMatcher {
-    let mut patterns = vec![];
-
-    // ========== Constant Folding ==========
-    // These patterns must come first to fold constants before other optimizations
-
-    // Helper macro for unary constant folding
-    macro_rules! unary_const_fold {
-        ($patterns:ident, $op:ident) => {
-            pattern!($patterns,
-                UPat::unary(vec![UnaryOp::$op], UPat::cvar("c")) => |c| {
-                    use morok_ir::uop::eval::eval_unary_op;
-                    let c_val = get_const_value(c)?;
-                    let result = eval_unary_op(UnaryOp::$op, c_val)?;
-                    Some(morok_ir::UOp::const_(c.dtype(), result))
-                }
-            );
-        };
-    }
-
-    // Apply constant folding for all unary operations
-    unary_const_fold!(patterns, Neg);
-    unary_const_fold!(patterns, Sqrt);
-    unary_const_fold!(patterns, Exp2);
-    unary_const_fold!(patterns, Log2);
-    unary_const_fold!(patterns, Sin);
-    unary_const_fold!(patterns, Reciprocal);
-    unary_const_fold!(patterns, Trunc);
-
-    // Helper macro for binary constant folding
-    macro_rules! binary_const_fold {
-        ($patterns:ident, $op:ident, comparison) => {
-            pattern!($patterns,
-                UPat::binary(vec![BinaryOp::$op], vec![UPat::cvar("a"), UPat::cvar("b")]) => |a, b| {
-                    use morok_ir::uop::eval::eval_binary_op;
-                    let a_val = get_const_value(a)?;
-                    let b_val = get_const_value(b)?;
-                    let result = eval_binary_op(BinaryOp::$op, a_val, b_val)?;
-                    Some(morok_ir::UOp::const_(morok_ir::DType::Bool, result))
-                }
-            );
-        };
-        ($patterns:ident, $op:ident) => {
-            pattern!($patterns,
-                UPat::binary(vec![BinaryOp::$op], vec![UPat::cvar("a"), UPat::cvar("b")]) => |a, b| {
-                    use morok_ir::uop::eval::eval_binary_op;
-                    let a_val = get_const_value(a)?;
-                    let b_val = get_const_value(b)?;
-                    let result = eval_binary_op(BinaryOp::$op, a_val, b_val)?;
-                    Some(morok_ir::UOp::const_(a.dtype(), result))
-                }
-            );
-        };
-    }
-
-    // Apply constant folding for all binary operations (except Threefry - PRNG)
-    binary_const_fold!(patterns, Add);
-    binary_const_fold!(patterns, Mul);
-    binary_const_fold!(patterns, Sub);
-    binary_const_fold!(patterns, Mod);
-    binary_const_fold!(patterns, Max);
-    binary_const_fold!(patterns, Pow);
-    binary_const_fold!(patterns, Idiv);
-    binary_const_fold!(patterns, Fdiv);
-    // Note: Lt, Eq, Ne are handled specially below to support both constant folding AND DCE
-    // binary_const_fold!(patterns, Lt, comparison);
-    // binary_const_fold!(patterns, Eq, comparison);
-    // binary_const_fold!(patterns, Ne, comparison);
-    binary_const_fold!(patterns, And);
-    binary_const_fold!(patterns, Or);
-    binary_const_fold!(patterns, Xor);
-    binary_const_fold!(patterns, Shl);
-    binary_const_fold!(patterns, Shr);
-
-    // Ternary constant folding
-    pattern!(patterns,
-        UPat::ternary(vec![TernaryOp::Where], vec![UPat::cvar("cond"), UPat::cvar("t"), UPat::cvar("f")]) => |cond, t, f| {
-            use morok_ir::uop::eval::eval_ternary_op;
-            let cond_val = get_const_value(cond)?;
-            let t_val = get_const_value(t)?;
-            let f_val = get_const_value(f)?;
-            let result = eval_ternary_op(TernaryOp::Where, cond_val, t_val, f_val)?;
-            Some(morok_ir::UOp::const_(t.dtype(), result))
-        }
-    );
-
-    pattern!(patterns,
-        UPat::ternary(vec![TernaryOp::MulAcc], vec![UPat::cvar("a"), UPat::cvar("b"), UPat::cvar("c")]) => |a, b, c| {
-            use morok_ir::uop::eval::eval_ternary_op;
-            let a_val = get_const_value(a)?;
-            let b_val = get_const_value(b)?;
-            let c_val = get_const_value(c)?;
-            let result = eval_ternary_op(TernaryOp::MulAcc, a_val, b_val, c_val)?;
-            Some(morok_ir::UOp::const_(a.dtype(), result))
-        }
-    );
-
-    // ========== Dead Code Elimination (DCE) ==========
-    // These patterns use vmin/vmax range analysis to eliminate dead code
-
-    // WHERE with constant condition → select appropriate branch
-    pattern!(patterns,
-        UPat::ternary(vec![TernaryOp::Where], vec![UPat::var("cond"), UPat::var("true_val"), UPat::var("false_val")])
-        => |cond, true_val, false_val| {
-            use morok_ir::uop::cached_property::CachedProperty;
-            use morok_ir::uop::properties::VminVmaxProperty;
-
-            let (vmin, vmax) = VminVmaxProperty::get(cond);
-            match (*vmin, *vmax) {
-                (ConstValue::Bool(true), ConstValue::Bool(true)) => Some(Rc::clone(true_val)),
-                (ConstValue::Bool(false), ConstValue::Bool(false)) => Some(Rc::clone(false_val)),
-                _ => None
-            }
-        }
-    );
-
-    // Dead loop elimination patterns
-
-    // RANGE with vmax ≤ 0 → Const(0)
-    pattern!(patterns,
-        UPat::var("r") => |r: &Rc<UOp>| {
-            use crate::symbolic::dce::is_empty_range;
-            use morok_dtype::DType;
-
-            if let Op::Range { .. } = r.op()
-                && is_empty_range(r)
-            {
-                return Some(UOp::const_(DType::Index, ConstValue::Int(0)));
-            }
-            None
-        }
-    );
-
-    // END with dead ranges → remove dead ranges or unwrap entirely
-    pattern!(patterns,
-        UPat::var("end_op") => |end_op: &Rc<UOp>| {
-            use crate::symbolic::dce::is_empty_range;
-            use smallvec::SmallVec;
-
-            if let Op::End { computation, ranges } = end_op.op() {
-                let live_ranges: SmallVec<[Rc<UOp>; 4]> = ranges
-                    .iter()
-                    .filter(|r| !is_empty_range(r))
-                    .cloned()
-                    .collect();
-
-                // No changes if all ranges are live
-                if live_ranges.len() == ranges.len() {
-                    return None;
-                }
-
-                // All ranges dead - return computation directly
-                if live_ranges.is_empty() {
-                    return Some(Rc::clone(computation));
-                }
-
-                // Some ranges dead - create new END with only live ranges
-                return Some(UOp::end(Rc::clone(computation), live_ranges));
-            }
-            None
-        }
-    );
-
-    // REDUCE with all empty ranges → identity element
-    pattern!(patterns,
-        UPat::var("reduce_op") => |reduce_op: &Rc<UOp>| {
-            use crate::symbolic::dce::{is_empty_range, reduce_identity};
-
-            if let Op::Reduce { ranges, reduce_op: op, .. } = reduce_op.op()
-                && ranges.iter().all(is_empty_range)
-            {
-                return Some(reduce_identity(*op, reduce_op.dtype()));
-            }
-            None
-        }
-    );
-
-    // Comparison patterns (Lt, Eq, Ne) with unified handler
-    // Note: We only handle Lt, Eq, Ne since those are the only comparison ops in BinaryOp
-    // Other comparisons (Gt, Le, Ge) are typically expressed using these primitives
-    macro_rules! apply_comparison_pattern {
-        ($patterns:ident, $method:ident, $variant:ident) => {
-            pattern!($patterns,
-                UPat::var("x").$method(UPat::var("y")) => |x: &Rc<UOp>, y: &Rc<UOp>| {
-                    use morok_ir::uop::eval::eval_binary_op;
-                    use morok_ir::uop::comparison_analysis::ComparisonAnalyzer;
-
-                    // 1. Self-comparison fast path (before constant folding for efficiency)
-                    if Rc::ptr_eq(x, y) && !x.dtype().is_float() {
-                        let result = match BinaryOp::$variant {
-                            BinaryOp::Lt => ConstValue::Bool(false),
-                            BinaryOp::Eq => ConstValue::Bool(true),
-                            BinaryOp::Ne => ConstValue::Bool(false),
-                            _ => return None,
-                        };
-                        return Some(UOp::const_(morok_dtype::DType::Bool, result));
-                    }
-
-                    // 2. Constant folding
-                    if let (Some(a_val), Some(b_val)) = (get_const_value(x), get_const_value(y)) {
-                        if let Some(result) = eval_binary_op(BinaryOp::$variant, a_val, b_val) {
-                            return Some(UOp::const_(morok_dtype::DType::Bool, result));
-                        }
-                    }
-
-                    // 3. Range-based analysis
-                    if let Some(result) = ComparisonAnalyzer::analyze(BinaryOp::$variant, x, y) {
-                        return Some(UOp::const_(morok_dtype::DType::Bool, ConstValue::Bool(result)));
-                    }
-
-                    None
-                }
-            );
-        };
-    }
-
-    apply_comparison_pattern!(patterns, lt, Lt);
-    apply_comparison_pattern!(patterns, eq, Eq);
-    apply_comparison_pattern!(patterns, ne, Ne);
-
-    // ========== Identity folding ==========
-
-    // x + 0 → x
-    pattern!(patterns,
-        UPat::var("x") + UPat::cvar("c") => |x, c| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Add, true) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x - 0 → x
-    pattern!(patterns,
-        UPat::var("x") - UPat::cvar("c") => |x, c| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Sub, true) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x * 1 → x
-    pattern!(patterns,
-        UPat::var("x") * UPat::cvar("c") => |x, c| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Mul, true) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x / 1 → x (int division)
-    pattern!(patterns,
-        UPat::var("x").idiv(UPat::cvar("c")) => |x, c| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Idiv, true) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x / 1 → x (float division)
-    pattern!(patterns,
-        UPat::var("x") / UPat::cvar("c") => |x, c| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Fdiv, true) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x | 0 → x
-    pattern!(patterns,
-        UPat::var("x") | UPat::cvar("c") => |x, c| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Or, true) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x ^ 0 → x
-    pattern!(patterns,
-        UPat::var("x") ^ UPat::cvar("c") => |x, c| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Xor, true) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // 0 + x → x (left identity for Add)
-    pattern!(patterns,
-        UPat::cvar("c") + UPat::var("x") => |c, x| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Add, false) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // 1 * x → x (left identity for Mul)
-    pattern!(patterns,
-        UPat::cvar("c") * UPat::var("x") => |c, x| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Mul, false) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // 0 | x → x (left identity for Or)
-    pattern!(patterns,
-        UPat::cvar("c") | UPat::var("x") => |c, x| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Or, false) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // 0 ^ x → x (left identity for Xor)
-    pattern!(patterns,
-        UPat::cvar("c") ^ UPat::var("x") => |c, x| {
-            let const_val = get_const_value(c)?;
-            if is_identity_value(&const_val, &BinaryOp::Xor, false) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x * 0 → 0 (zero propagation for Mul)
-    pattern!(patterns,
-        UPat::var("x") * UPat::zero_const("zero") => |x, zero| {
-            let _unused = x;
-            Some(Rc::clone(zero))
-        }
-    );
-
-    // 0 * x → 0 (zero propagation for Mul, left side)
-    pattern!(patterns,
-        UPat::zero_const("zero") * UPat::var("x") => |zero, x| {
-            let _unused = x;
-            Some(Rc::clone(zero))
-        }
-    );
-
-    // x & 0 → 0 (zero propagation for And)
-    pattern!(patterns,
-        UPat::var("x") & UPat::zero_const("zero") => |x, zero| {
-            let _unused = x;
-            Some(Rc::clone(zero))
-        }
-    );
-
-    // 0 & x → 0 (zero propagation for And, left side)
-    pattern!(patterns,
-        UPat::zero_const("zero") & UPat::var("x") => |zero, x| {
-            let _unused = x;
-            Some(Rc::clone(zero))
-        }
-    );
-
-    // ====== Self-folding operations ======
-
-    // x // x → 1
-    pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Idiv], vec![UPat::var("x"), UPat::var("x2")]) => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{ConstValue, UOp};
-            // Check if both operands are the same (pointer equality)
-            if Rc::ptr_eq(x, x2) {
-                // Return 1 in the same dtype as x
-                Some(UOp::const_(x.dtype(), ConstValue::Int(1)))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x // -1 → -x
-    pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Idiv], vec![UPat::var("x"), UPat::cvar("divisor")]) => |x: &Rc<morok_ir::UOp>, divisor: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, UOp, ConstValue};
-            // Check if divisor is -1
-            if let Op::Const(cv) = divisor.op()
-                && cv.0 == ConstValue::Int(-1) {
-                    return Some(UOp::neg(x));
-                }
-            None
-        }
-    );
-
-    // (x % y) % y → x % y
-    pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Mod], vec![
-            UPat::binary(vec![BinaryOp::Mod], vec![UPat::var("x"), UPat::var("y")]),
-            UPat::var("y2")
-        ]) => |x: &Rc<morok_ir::UOp>, y: &Rc<morok_ir::UOp>, y2: &Rc<morok_ir::UOp>| {
-            // Check if outer y is same as inner y (pointer equality)
-            if Rc::ptr_eq(y, y2) {
-                // Return the inner (x % y) modulo
-                x.try_mod_op(y).ok()
-            } else {
-                None
-            }
-        }
-    );
-
-    // x & x → x
-    pattern!(patterns,
-        UPat::var("x") & UPat::var("x2") => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
-            if Rc::ptr_eq(x, x2) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x | x → x
-    pattern!(patterns,
-        UPat::var("x") | UPat::var("x2") => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
-            if Rc::ptr_eq(x, x2) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // ====== ZERO FOLDING  ======
-
-    // x < x → False (for non-float types; float NaN < NaN is also false but handled conservatively)
-    pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Lt], vec![UPat::var("x"), UPat::var("x2")]) => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{ConstValue, UOp};
-            // Only apply for non-float types to avoid NaN edge cases
-            if Rc::ptr_eq(x, x2) && !x.dtype().is_float() {
-                Some(UOp::const_(x.dtype(), ConstValue::Bool(false)))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x % x → 0
-    pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Mod], vec![UPat::var("x"), UPat::var("x2")]) => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{ConstValue, UOp};
-            if Rc::ptr_eq(x, x2) {
-                Some(UOp::const_(x.dtype(), ConstValue::Int(0)))
-            } else {
-                None
-            }
-        }
-    );
-
-    // x != x → False (for integers)
-    pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Ne], vec![UPat::var("x"), UPat::var("x2")]) => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{ConstValue, UOp};
-            if Rc::ptr_eq(x, x2) {
-                // Only for integer types (floats can have NaN != NaN)
-                if x.dtype().is_int() {
-                    Some(UOp::const_(x.dtype(), ConstValue::Bool(false)))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-    );
-
-    // ====== DIVISION PATTERNS  ======
-
-    // x / x → 1.0 (float division)
-    pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Fdiv], vec![UPat::var("x"), UPat::var("x2")]) => |x: &Rc<morok_ir::UOp>, x2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{ConstValue, UOp};
-            if Rc::ptr_eq(x, x2) {
-                Some(UOp::const_(x.dtype(), ConstValue::Float(1.0)))
-            } else {
-                None
-            }
-        }
-    );
-
-    // (x * y) / y → x
-    pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Fdiv, BinaryOp::Idiv], vec![
-            UPat::binary(vec![BinaryOp::Mul], vec![UPat::var("x"), UPat::var("y")]),
-            UPat::var("y2")
-        ]) => |x: &Rc<morok_ir::UOp>, y: &Rc<morok_ir::UOp>, y2: &Rc<morok_ir::UOp>| {
-            // Check if divisor is same as multiplier
-            if Rc::ptr_eq(y, y2) {
-                Some(Rc::clone(x))
-            } else {
-                None
-            }
-        }
-    );
-
-    // ====== CAST OPTIMIZATION  ======
-
-    // cast(const) → const
-    // Constant folding for cast operations
-    pattern!(patterns,
-        UPat::cast_named(UPat::cvar("c"), "cast") => |c: &Rc<morok_ir::UOp>, cast: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, UOp};
-
-            // Get the target dtype from the cast
-            if let Op::Cast { dtype: target_dtype, .. } = cast.op() {
-                // Get the constant value
-                if let Op::Const(cv) = c.op() {
-                    let new_value = cv.0.cast(target_dtype);
-
-                    if let Some(val) = new_value {
-                        return Some(UOp::const_(target_dtype.clone(), val));
-                    }
-                }
-            }
-            None
-        }
-    );
-
-    // x.cast(dtype) → x if same dtype
-    pattern!(patterns,
-        UPat::cast_named(UPat::var("x"), "cast") => |x: &Rc<morok_ir::UOp>, cast: &Rc<morok_ir::UOp>| {
-            use morok_ir::Op;
-
-            // Check if cast is to the same dtype
-            if let Op::Cast { dtype: target_dtype, .. } = cast.op()
-                && x.dtype() == *target_dtype {
-                    return Some(Rc::clone(x));
-                }
-            None
-        }
-    );
-
-    // x.cast(a).cast(b) → x.cast(b)
-    // Collapse double cast
-    pattern!(patterns,
-        UPat::cast_named(UPat::cast(UPat::var("x")), "outer_cast") => |x: &Rc<morok_ir::UOp>, outer_cast: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, UOp};
-
-            // Get the final target dtype from outer cast
-            if let Op::Cast { dtype: final_dtype, .. } = outer_cast.op() {
-                // Create a single cast from x to final_dtype
-                return Some(UOp::cast(Rc::clone(x), final_dtype.clone()));
-            }
-            None
-        }
-    );
-
-    // ========== Combine terms ==========
-    // Critical for RESHAPE - combines like terms in addition/multiplication
-
-    // x + x → 2*x
-    // Combine identical terms in addition
-    pattern!(patterns,
-        UPat::var("x") + UPat::var("y") => |x: &Rc<morok_ir::UOp>, y: &Rc<morok_ir::UOp>| {
-            use morok_ir::{ConstValue, UOp};
-
-            // Check if x and y are the same UOp (pointer equality for hash-consed nodes)
-            if Rc::ptr_eq(x, y) {
-                // x + x → 2*x
-                let two = UOp::const_(x.dtype(), ConstValue::Int(2));
-                return two.try_mul_op(x).ok();
-            }
-            None
-        }
-    );
-
-    // (c1 * x) + (c2 * x) → (c1 + c2) * x
-    // Combine terms with same variable but different coefficients
-    pattern!(patterns,
-        (UPat::cvar("c1") * UPat::var("x")) + (UPat::cvar("c2") * UPat::var("y"))
-            => |c1: &Rc<morok_ir::UOp>, x: &Rc<morok_ir::UOp>,
-                c2: &Rc<morok_ir::UOp>, y: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
-
-            // Check if x and y are the same variable
-            if Rc::ptr_eq(x, y) {
-                // Both c1 and c2 must be constants
-                if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
-                    && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
-                        // (c1 * x) + (c2 * x) → (c1 + c2) * x
-                        let sum = UOp::const_(c1.dtype(), ConstValue::Int(i1 + i2));
-                        return sum.try_mul_op(x).ok();
-                    }
-            }
-            None
-        }
-    );
-
-    // (x * c1) + (x * c2) → x * (c1 + c2)
-    // Same as above but with reversed multiplication order
-    pattern!(patterns,
-        (UPat::var("x") * UPat::cvar("c1")) + (UPat::var("y") * UPat::cvar("c2"))
-            => |x: &Rc<morok_ir::UOp>, c1: &Rc<morok_ir::UOp>,
-                y: &Rc<morok_ir::UOp>, c2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
-
-            // Check if x and y are the same variable
-            if Rc::ptr_eq(x, y) {
-                // Both c1 and c2 must be constants
-                if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
-                    && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
-                        // (x * c1) + (x * c2) → x * (c1 + c2)
-                        let sum = UOp::const_(c1.dtype(), ConstValue::Int(i1 + i2));
-                        return x.try_mul_op(&sum).ok();
-                    }
-            }
-            None
-        }
-    );
-
-    // ========== Two-stage ALU folding ==========
-    // Fold constants in associative operation chains
-
-    // (x + c1) + c2 → x + (c1 + c2)
-    // Fold constants in addition chains
-    pattern!(patterns,
-        (UPat::var("x") + UPat::cvar("c1")) + UPat::cvar("c2") => |x: &Rc<morok_ir::UOp>, c1: &Rc<morok_ir::UOp>, c2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
-
-            // Get constant values
-            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
-                && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
-                    // (x + c1) + c2 → x + (c1 + c2)
-                    let sum = UOp::const_(c1.dtype(), ConstValue::Int(i1 + i2));
-                    return x.try_add_op(&sum).ok();
-                }
-            None
-        }
-    );
-
-    // (x * c1) * c2 → x * (c1 * c2)
-    // Fold constants in multiplication chains
-    pattern!(patterns,
-        (UPat::var("x") * UPat::cvar("c1")) * UPat::cvar("c2") => |x: &Rc<morok_ir::UOp>, c1: &Rc<morok_ir::UOp>, c2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
-
-            // Get constant values
-            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
-                && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
-                    // (x * c1) * c2 → x * (c1 * c2)
-                    let product = UOp::const_(c1.dtype(), ConstValue::Int(i1 * i2));
-                    return x.try_mul_op(&product).ok();
-                }
-            None
-        }
-    );
-
-    // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2)
-    // Fold constants in mixed add/sub chains
-    pattern!(patterns,
-        (UPat::var("x") - UPat::cvar("c1")) + UPat::cvar("c2") => |x: &Rc<morok_ir::UOp>, c1: &Rc<morok_ir::UOp>, c2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
-
-            // Get constant values
-            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
-                && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
-                    let diff = i2 - i1;
-                    if diff >= 0 {
-                        // (x - c1) + c2 → x + (c2 - c1)
-                        let const_val = UOp::const_(c1.dtype(), ConstValue::Int(diff));
-                        return x.try_add_op(&const_val).ok();
-                    } else {
-                        // (x - c1) + c2 → x - (c1 - c2)
-                        let const_val = UOp::const_(c1.dtype(), ConstValue::Int(-diff));
-                        return x.try_sub_op(&const_val).ok();
-                    }
-                }
-            None
-        }
-    );
-
-    // (x + c1) - c2 → x + (c1 - c2) or x - (c2 - c1)
-    // Fold constants in mixed add/sub chains (reversed)
-    pattern!(patterns,
-        (UPat::var("x") + UPat::cvar("c1")) - UPat::cvar("c2") => |x: &Rc<morok_ir::UOp>, c1: &Rc<morok_ir::UOp>, c2: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
-
-            // Get constant values
-            if let (Op::Const(cv1), Op::Const(cv2)) = (c1.op(), c2.op())
-                && let (ConstValue::Int(i1), ConstValue::Int(i2)) = (&cv1.0, &cv2.0) {
-                    let diff = i1 - i2;
-                    if diff >= 0 {
-                        // (x + c1) - c2 → x + (c1 - c2)
-                        let const_val = UOp::const_(c1.dtype(), ConstValue::Int(diff));
-                        return x.try_add_op(&const_val).ok();
-                    } else {
-                        // (x + c1) - c2 → x - (c2 - c1)
-                        let const_val = UOp::const_(c1.dtype(), ConstValue::Int(-diff));
-                        return x.try_sub_op(&const_val).ok();
-                    }
-                }
-            None
-        }
-    );
-
-    // ========== Basic division patterns ==========
-    // Division and modulo simplifications using helper methods
-
-    // (a * b) // b → a (when b divides evenly)
-    // Simplify division when divisor cancels with multiplication
-    pattern!(patterns,
-        (UPat::var("a") * UPat::var("b")).idiv(UPat::var("c")) => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            // Check if b and c are the same (b cancels out)
-            if Rc::ptr_eq(b, c) {
-                return Some(Rc::clone(a));
-            }
-            None
-        }
-    );
-
-    // (a // b) // c → a // (b * c)
-    // Combine division chains
-    pattern!(patterns,
-        UPat::var("a").idiv(UPat::cvar("b")).idiv(UPat::cvar("c")) => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue, UOp};
-
-            // Get constant values
-            if let (Op::Const(cv_b), Op::Const(cv_c)) = (b.op(), c.op())
-                && let (ConstValue::Int(ib), ConstValue::Int(ic)) = (&cv_b.0, &cv_c.0)
-                    && *ib != 0 && *ic != 0 {
-                        // (a // b) // c → a // (b * c)
-                        let product = UOp::const_(b.dtype(), ConstValue::Int(ib * ic));
-                        return a.try_idiv_op(&product).ok();
-                    }
-            None
-        }
-    );
-
-    // (a % b) % b → a % b
-    // Already handled earlier, but this is explicit for clarity
-
-    // (a * c) // c → a (using divides helper)
-    // Use divides() to check if division is exact
-    pattern!(patterns,
-        UPat::var("expr").idiv(UPat::cvar("divisor")) => |expr: &Rc<morok_ir::UOp>, divisor: &Rc<morok_ir::UOp>| {
-            // Use the divides() helper method to check exact division
-            expr.divides(divisor)
-        }
-    );
-
-    // (a + b) % c → (a % c + b % c) % c (for certain cases)
-    // Distribute modulo over addition when const_factor allows
-    pattern!(patterns,
-        (UPat::var("a") + UPat::var("b")) % UPat::cvar("c") => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            use morok_ir::{Op, ConstValue};
-
-            // Only apply if c is a small constant to avoid explosion
-            if let Op::Const(cv) = c.op()
-                && let ConstValue::Int(modulus) = &cv.0
-                    && *modulus > 0 && *modulus <= 256 {
-                        // Check if either operand is already a multiple of the modulus
-                        let a_factor = a.const_factor();
-                        let b_factor = b.const_factor();
-
-                        if a_factor % modulus == 0 {
-                            // a is divisible by c, so (a + b) % c = b % c
-                            return b.try_mod_op(c).ok();
-                        }
-
-                        if b_factor % modulus == 0 {
-                            // b is divisible by c, so (a + b) % c = a % c
-                            return a.try_mod_op(c).ok();
-                        }
-                    }
-            None
-        }
-    );
-
-    // ========== Distribute operations ==========
-    // Distribution patterns for multiplication and division
-
-    // (a + b) // c → (a // c) + (b // c) when both divide evenly
-    // Distribute division over addition (only when exact)
-    pattern!(patterns,
-        (UPat::var("a") + UPat::var("b")).idiv(UPat::cvar("c")) => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            // Check if both a and b are divisible by c
-            if let Some(a_div) = a.divides(c)
-                && let Some(b_div) = b.divides(c) {
-                    // (a + b) // c → (a // c) + (b // c)
-                    return a_div.try_add_op(&b_div).ok();
-                }
-            None
-        }
-    );
-
-    // (a - b) // c → (a // c) - (b // c) when both divide evenly
-    // Distribute division over subtraction (only when exact)
-    pattern!(patterns,
-        (UPat::var("a") - UPat::var("b")).idiv(UPat::cvar("c")) => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            // Check if both a and b are divisible by c
-            if let Some(a_div) = a.divides(c)
-                && let Some(b_div) = b.divides(c) {
-                    // (a - b) // c → (a // c) - (b // c)
-                    return a_div.try_sub_op(&b_div).ok();
-                }
-            None
-        }
-    );
-
-    // c * (a + b) → (c * a) + (c * b)
-    // Distribute multiplication over addition
-    // Note: This pattern increases operation count but may enable other optimizations
-    pattern!(patterns,
-        UPat::cvar("c") * (UPat::var("a") + UPat::var("b")) => |c: &Rc<morok_ir::UOp>, a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>| {
-            let ca = c.try_mul_op(a).ok()?;
-            let cb = c.try_mul_op(b).ok()?;
-            ca.try_add_op(&cb).ok()
-        }
-    );
-
-    // (a + b) * c → (a * c) + (b * c)
-    // Distribute multiplication over addition (reversed operand order)
-    // Note: This pattern increases operation count but may enable other optimizations
-    pattern!(patterns,
-        (UPat::var("a") + UPat::var("b")) * UPat::cvar("c") => |a: &Rc<morok_ir::UOp>, b: &Rc<morok_ir::UOp>, c: &Rc<morok_ir::UOp>| {
-            let ac = a.try_mul_op(c).ok()?;
-            let bc = b.try_mul_op(c).ok()?;
-            ac.try_add_op(&bc).ok()
-        }
-    );
-
-    PatternMatcher::new(patterns)
+    // All patterns are now organized into separate functions.
+    // Combine all DSL-based pattern functions:
+    // - constant_folding_dsl_patterns(): unary/binary/ternary constant folding (for-loop DSL)
+    // - identity_and_zero_patterns(): identity folding and zero propagation
+    // - self_folding_dsl_patterns(): x // x, x & x, x | x, etc.
+    // - zero_folding_dsl_patterns(): x < x → false, x % x → 0, x != x → false
+    // - division_dsl_patterns(): x / x → 1.0, (x * y) / y → x
+    // - cast_dsl_patterns(): cast optimizations
+    // - term_combining_dsl_patterns(): x + x → 2*x, coefficient combining
+    // - alu_folding_dsl_patterns(): (x + c1) + c2 → x + (c1 + c2), etc.
+    // - advanced_division_dsl_patterns(): division chains, distribution
+    // - comparison_dsl_patterns(): Lt, Eq, Ne with range analysis (for-loop DSL)
+    // - boolean_dsl_patterns(): !!x → x, x ^ x → 0
+    // - minmax_dsl_patterns(): max(x, x) → x
+    // - power_dsl_patterns(): x ** 0 → 1, x ** 1 → x
+    // - negation_dsl_patterns(): -(-x) → x
+    // - dce_dsl_patterns(): WHERE branch selection (DSL)
+    // - dead_loop_patterns(): RANGE/END/REDUCE DCE (catch-all patterns)
+    constant_folding_dsl_patterns()
+        + identity_and_zero_patterns()
+        + self_folding_dsl_patterns()
+        + zero_folding_dsl_patterns()
+        + division_dsl_patterns()
+        + cast_dsl_patterns()
+        + term_combining_dsl_patterns()
+        + alu_folding_dsl_patterns()
+        + advanced_division_dsl_patterns()
+        + comparison_dsl_patterns()
+        + boolean_dsl_patterns()
+        + minmax_dsl_patterns()
+        + power_dsl_patterns()
+        + negation_dsl_patterns()
+        + dce_dsl_patterns()
+        + dead_loop_patterns()
 }
 
 pub fn symbolic() -> PatternMatcher {
     // TODO: Add more complex symbolic patterns
     PatternMatcher::new(vec![])
+}
+
+/// Self-folding patterns using the DSL.
+///
+/// Patterns where an operand appears twice:
+/// - x // x → 1
+/// - x // -1 → -x
+/// - (x % y) % y → x % y
+/// - x & x → x
+/// - x | x → x
+pub fn self_folding_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // x // x → 1
+        Idiv(x, x2) if Rc::ptr_eq(x, x2) ~> 1.into_uop(x.dtype()),
+        // x // -1 → -x
+        Idiv(x, c @const(c_val)) if c_val.is_neg_one() ~> UOp::neg(x),
+        // (x % y) % y → x % y
+        Mod(Mod(x, y), y2) if Rc::ptr_eq(y, y2) => x.try_mod_op(y).ok(),
+        // x & x → x
+        And(x, x2) if Rc::ptr_eq(x, x2) ~> Rc::clone(x),
+        // x | x → x
+        Or(x, x2) if Rc::ptr_eq(x, x2) ~> Rc::clone(x),
+    }
+}
+
+/// Zero folding patterns using the DSL.
+///
+/// Patterns that fold to zero or false:
+/// - x < x → False (non-float only)
+/// - x % x → 0
+/// - x != x → False (int only)
+pub fn zero_folding_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // x % x → 0
+        Mod(x, x2) if Rc::ptr_eq(x, x2) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+        // x < x → False (for non-float types)
+        Lt(x, x2) if Rc::ptr_eq(x, x2) && !x.dtype().is_float() ~> false.into_uop(DType::Bool),
+        // x != x → False (int only)
+        Ne(x, x2) if Rc::ptr_eq(x, x2) && x.dtype().is_int() ~> false.into_uop(DType::Bool),
+    }
+}
+
+/// Division simplification patterns using the DSL.
+///
+/// - x / x → 1.0 (float division)
+/// - (x * y) / y → x (for both Fdiv and Idiv)
+pub fn division_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // x / x → 1.0 (float division)
+        Fdiv(x, x2) if Rc::ptr_eq(x, x2) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
+        // (x * y) / y → x (float division)
+        Fdiv(Mul(x, y), y2) if Rc::ptr_eq(y, y2) ~> Rc::clone(x),
+        // (x * y) // y → x (integer division)
+        Idiv(Mul(x, y), y2) if Rc::ptr_eq(y, y2) ~> Rc::clone(x),
+    }
+}
+
+/// Cast optimization patterns using the DSL.
+///
+/// - cast(const) → const (constant folding)
+/// - x.cast(dtype) → x if same dtype (noop cast)
+/// - x.cast(a).cast(b) → x.cast(b) (collapse double cast)
+pub fn cast_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // cast(const) → const with folding
+        Cast { src: c @const(c_val), dtype } => c_val.cast(&dtype).map(|v| UOp::const_(dtype.clone(), v)),
+        // x.cast(dtype) → x if same dtype
+        Cast { src: x, dtype } if x.dtype() == dtype ~> Rc::clone(x),
+        // x.cast(a).cast(b) → x.cast(b) (collapse double cast)
+        Cast { src: Cast { src: x, .. }, dtype } ~> UOp::cast(Rc::clone(x), dtype.clone()),
+    }
+}
+
+/// Term combining patterns using the DSL.
+///
+/// - x + x → 2*x
+/// - (c1 * x) + (c2 * x) → (c1 + c2) * x
+/// - (x * c1) + (x * c2) → x * (c1 + c2)
+pub fn term_combining_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // x + x → 2*x
+        Add(x, y) if Rc::ptr_eq(x, y) => 2.into_uop(x.dtype()).try_mul_op(x).ok(),
+        // (c1 * x) + (c2 * x) → (c1 + c2) * x
+        Add(Mul(c1 @const(c1_val), x), Mul(c2 @const(c2_val), y)) if Rc::ptr_eq(x, y)
+          => eval_add(c1_val, c2_val)?.into_uop(c1.dtype()).try_mul_op(x).ok(),
+        // (x * c1) + (x * c2) → x * (c1 + c2)
+        Add(Mul(x, c1 @const(c1_val)), Mul(y, c2 @const(c2_val))) if Rc::ptr_eq(x, y)
+          => x.try_mul_op(&eval_add(c1_val, c2_val)?.into_uop(c1.dtype())).ok(),
+    }
+}
+
+/// Advanced division and distribution patterns using the DSL.
+///
+/// - (a // b) // c → a // (b * c)
+/// - expr // divisor → expr.divides(divisor) (generic exact division)
+/// - (a + b) % c → simplify when one operand is multiple of c
+/// - (a + b) // c → (a // c) + (b // c) when both divide evenly
+/// - (a - b) // c → (a // c) - (b // c) when both divide evenly
+/// - c * (a + b) → (c * a) + (c * b)
+/// - (a + b) * c → (a * c) + (b * c)
+pub fn advanced_division_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // (a // b) // c → a // (b * c) if b,c non-zero
+        Idiv(Idiv(a, b @const(b_val)), c @const(c_val)) if !b_val.is_zero() && !c_val.is_zero() => {
+            a.try_idiv_op(&UOp::const_(b.dtype(), eval_mul(b_val, c_val)?)).ok()
+        },
+        // expr // divisor → expr.divides(divisor) (generic exact division)
+        Idiv(expr, divisor @ @const) => expr.divides(divisor),
+        // (a + b) % c → simplify when one operand is multiple of c
+        Mod(Add(a, b), c @const(c_val)) => {
+            let ConstValue::Int(modulus) = c_val else { return None };
+            (modulus > 0 && modulus <= 256).then(|| {
+                let (af, bf) = (a.const_factor(), b.const_factor());
+                if af % modulus == 0 {
+                    b.try_mod_op(c).ok()
+                } else if bf % modulus == 0 {
+                    a.try_mod_op(c).ok()
+                } else {
+                    None
+                }
+            }).flatten()
+        },
+        // (a + b) // c → (a // c) + (b // c) when both divide evenly
+        Idiv(Add(a, b), c @ @const) => a.divides(c)?.try_add_op(&b.divides(c)?).ok(),
+        // (a - b) // c → (a // c) - (b // c) when both divide evenly
+        Idiv(Sub(a, b), c @ @const) => a.divides(c)?.try_sub_op(&b.divides(c)?).ok(),
+        // c * (a + b) → (c * a) + (c * b)
+        Mul(c @ @const, Add(a, b)) => c.try_mul_op(a).ok()?.try_add_op(&c.try_mul_op(b).ok()?).ok(),
+        // (a + b) * c → (a * c) + (b * c)
+        Mul(Add(a, b), c @ @const) => a.try_mul_op(c).ok()?.try_add_op(&b.try_mul_op(c).ok()?).ok(),
+    }
+}
+
+/// Two-stage ALU folding patterns using the DSL.
+///
+/// Fold constants in associative operation chains:
+/// - (x + c1) + c2 → x + (c1 + c2)
+/// - (x * c1) * c2 → x * (c1 * c2)
+/// - (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2)
+/// - (x + c1) - c2 → x + (c1 - c2) or x - (c2 - c1)
+pub fn alu_folding_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // (x + c1) + c2 → x + (c1 + c2)
+        Add(Add(x, c1 @const(c1_val)), c2 @const(c2_val))
+          => x.try_add_op(&UOp::const_(c1.dtype(), eval_add(c1_val, c2_val)?)).ok(),
+
+        // (x * c1) * c2 → x * (c1 * c2)
+        Mul(Mul(x, c1 @const(c1_val)), c2 @const(c2_val))
+          => x.try_mul_op(&UOp::const_(c1.dtype(), eval_mul(c1_val, c2_val)?)).ok(),
+
+        // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2) when result is negative
+        Add(Sub(x, c1 @const(c1_val)), c2 @const(c2_val)) => {
+            let diff_val = eval_sub(c2_val, c1_val)?;
+            // Normalize: prefer x - |c| over x + (-c)
+            if let ConstValue::Int(v) = diff_val && v < 0 {
+                x.try_sub_op(&(-v).into_uop(c1.dtype())).ok()
+            } else {
+                x.try_add_op(&UOp::const_(c1.dtype(), diff_val)).ok()
+            }
+        },
+
+        // (x + c1) - c2 → x + (c1 - c2) or x - (c2 - c1) when result is negative
+        Sub(Add(x, c1 @const(c1_val)), c2 @const(c2_val)) => {
+            let diff_val = eval_sub(c1_val, c2_val)?;
+            // Normalize: prefer x - |c| over x + (-c)
+            if let ConstValue::Int(v) = diff_val && v < 0 {
+                return x.try_sub_op(&(-v).into_uop(c1.dtype())).ok();
+            }
+            x.try_add_op(&UOp::const_(c1.dtype(), diff_val)).ok()
+        },
+    }
+}
+
+/// Dead loop elimination patterns.
+///
+/// Uses the patterns! DSL macro with op-specific matching:
+/// - RANGE with vmax ≤ 0 → Const(0)
+/// - END with dead ranges → remove dead ranges
+/// - REDUCE with all empty ranges → identity element
+pub fn dead_loop_patterns() -> PatternMatcher {
+    use crate::symbolic::dce::reduce_identity;
+
+    /// Check if END has any dead ranges (for guard).
+    fn has_dead_ranges(end_op: &Rc<UOp>) -> bool {
+        if let Op::End { ranges, .. } = end_op.op() {
+            ranges.iter().any(is_empty_range)
+        } else {
+            false
+        }
+    }
+
+    /// Check if all REDUCE ranges are empty (for guard).
+    fn all_ranges_empty(reduce_op: &Rc<UOp>) -> bool {
+        if let Op::Reduce { ranges, .. } = reduce_op.op() {
+            ranges.iter().all(is_empty_range)
+        } else {
+            false
+        }
+    }
+
+    /// Filter dead ranges from END, or unwrap if all dead.
+    fn filter_dead_ranges(end_op: &Rc<UOp>) -> Rc<UOp> {
+        let Op::End { computation, ranges } = end_op.op() else {
+            unreachable!("filter_dead_ranges called on non-End")
+        };
+
+        let live_ranges: SmallVec<[Rc<UOp>; 4]> = ranges
+            .iter()
+            .filter(|r| !is_empty_range(r))
+            .cloned()
+            .collect();
+
+        if live_ranges.is_empty() {
+            // All ranges dead - return computation directly
+            Rc::clone(computation)
+        } else {
+            // Some ranges dead - create new END with only live ranges
+            UOp::end(Rc::clone(computation), live_ranges)
+        }
+    }
+
+    /// Get identity element for REDUCE with all empty ranges.
+    fn reduce_to_identity(reduce_op: &Rc<UOp>) -> Rc<UOp> {
+        let Op::Reduce { reduce_op: op, .. } = reduce_op.op() else {
+            unreachable!("reduce_to_identity called on non-Reduce")
+        };
+        reduce_identity(*op, reduce_op.dtype())
+    }
+
+    patterns! {
+        // RANGE with vmax ≤ 0 → Const(0)
+        r @ Range(_) if is_empty_range(r) ~> UOp::const_(DType::Index, ConstValue::Int(0)),
+
+        // END with dead ranges → filter or unwrap
+        end_op @ End(_, ..) if has_dead_ranges(end_op) ~> filter_dead_ranges(end_op),
+
+        // REDUCE with all empty ranges → identity element
+        reduce_op @ Reduce(_, ..) if all_ranges_empty(reduce_op) ~> reduce_to_identity(reduce_op),
+    }
+}
+
+/// Dead code elimination patterns using the DSL.
+///
+/// Handles WHERE optimizations:
+/// - WHERE(true, t, f) → t
+/// - WHERE(false, t, f) → f
+/// - WHERE(_, t, t) → t (same branches)
+/// - WHERE(x, true, false) → x (bool)
+/// - WHERE(x, false, true) → !x (bool)
+/// - WHERE(!cond, t, f) → WHERE(cond, f, t)
+pub fn dce_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // WHERE with constant condition → select appropriate branch
+        Where(cond, true_val, false_val) => {
+            match VminVmaxProperty::get(cond) {
+                (ConstValue::Bool(true), ConstValue::Bool(true)) => Some(Rc::clone(true_val)),
+                (ConstValue::Bool(false), ConstValue::Bool(false)) => Some(Rc::clone(false_val)),
+                _ => None,
+            }
+        },
+
+        // WHERE(_, same, same) → same
+        Where(_, t, f) if Rc::ptr_eq(t, f) ~> Rc::clone(t),
+
+        // WHERE(x, true, false) → x (for bool x)
+        Where(x, t @const(t_val), f @const(f_val))
+          if x.dtype() == DType::Bool && t_val == ConstValue::Bool(true) && f_val == ConstValue::Bool(false)
+          ~> Rc::clone(x),
+
+        // WHERE(x, false, true) → !x (for bool x)
+        Where(x, t @const(t_val), f @const(f_val))
+          if x.dtype() == DType::Bool && t_val == ConstValue::Bool(false) && f_val == ConstValue::Bool(true)
+          ~> x.not(),
+
+        // WHERE(!cond, t, f) → WHERE(cond, f, t) - negated condition swap
+        Where(Not(cond), t, f) => UOp::where_op(Rc::clone(cond), Rc::clone(f), Rc::clone(t)).ok(),
+    }
+}
+
+/// Comparison patterns using the DSL with for-loop iteration.
+///
+/// Handles Lt, Eq, Ne comparisons with:
+/// - Self-comparison fast path (x op x)
+/// - Constant folding
+/// - Range-based analysis via vmin/vmax
+pub fn comparison_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        for op in binary [Lt, Eq, Ne] {
+            op(x, y) => {
+                // 1. Self-comparison fast path (non-float only)
+                if Rc::ptr_eq(x, y) && !x.dtype().is_float() {
+                    let result = match op {
+                        BinaryOp::Lt => ConstValue::Bool(false),
+                        BinaryOp::Eq => ConstValue::Bool(true),
+                        BinaryOp::Ne => ConstValue::Bool(false),
+                        _ => return None,
+                    };
+                    return Some(UOp::const_(DType::Bool, result));
+                }
+
+                // 2. Constant folding
+                if let (Some(a_val), Some(b_val)) = (get_const_value(x), get_const_value(y))
+                    && let Some(result) = eval_binary_op(op, a_val, b_val)
+                {
+                    return Some(UOp::const_(DType::Bool, result));
+                }
+
+                // 3. Range-based analysis
+                if let Some(result) = ComparisonAnalyzer::analyze(op, x, y) {
+                    return Some(result.into_uop(DType::Bool));
+                }
+
+                None
+            }
+        }
+    }
+}
+
+/// Boolean logic patterns using the DSL.
+///
+/// - !!x → x (double negation elimination)
+/// - x ^ x → 0 (xor self-cancellation)
+pub fn boolean_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // Double negation: !!x → x
+        Not(Not(x)) ~> Rc::clone(x),
+        // XOR self-cancellation: x ^ x → 0
+        Xor(x, x2) if Rc::ptr_eq(x, x2) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+    }
+}
+
+/// Min/max patterns using the DSL.
+///
+/// - max(x, x) → x
+/// - min(x, x) → x (via Min = negated Max)
+pub fn minmax_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // max(x, x) → x
+        Max(x, x2) if Rc::ptr_eq(x, x2) ~> Rc::clone(x),
+    }
+}
+
+/// Power patterns using the DSL.
+///
+/// - x ** 0 → 1
+/// - x ** 1 → x
+pub fn power_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // x ** 0 → 1
+        Pow(x, c @const(c_val)) if c_val.is_zero() => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
+        // x ** 1 → x
+        Pow(x, c @const(c_val)) if c_val.is_one() ~> Rc::clone(x),
+    }
+}
+
+/// Negation patterns using the DSL.
+///
+/// - -(-x) → x (double negation for arithmetic)
+pub fn negation_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // Double arithmetic negation: -(-x) → x
+        Neg(Neg(x)) ~> Rc::clone(x),
+    }
 }

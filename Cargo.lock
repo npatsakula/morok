@@ -482,7 +482,7 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "proptest",
- "proptest-derive 0.7.0",
+ "proptest-derive",
  "smallvec",
  "snafu",
  "strum",
@@ -495,7 +495,7 @@ version = "0.1.0"
 dependencies = [
  "enumset",
  "proptest",
- "proptest-derive 0.7.0",
+ "proptest-derive",
  "serde",
  "strum",
 ]
@@ -511,7 +511,7 @@ dependencies = [
  "morok-device",
  "morok-dtype",
  "proptest",
- "proptest-derive 0.5.1",
+ "proptest-derive",
  "serde",
  "serde_json",
  "smallvec",
@@ -539,12 +539,22 @@ dependencies = [
  "morok-device",
  "morok-dtype",
  "morok-ir",
+ "morok-schedule-macros",
  "proptest",
- "proptest-derive 0.5.1",
+ "proptest-derive",
  "smallvec",
  "snafu",
  "test-case",
  "z3",
+]
+
+[[package]]
+name = "morok-schedule-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.110",
 ]
 
 [[package]]
@@ -756,17 +766,6 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
-]
-
-[[package]]
-name = "proptest-derive"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ee1c9ac207483d5e7db4940700de86a9aae46ef90c48b57f99fe7edb8345e49"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.110",
 ]
 
 [[package]]

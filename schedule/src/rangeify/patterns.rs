@@ -10,12 +10,12 @@
 //! to the symbolic module (schedule/src/symbolic/patterns.rs).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use morok_ir::{Op, UOp};
 
 use crate::pattern::UPat;
+use crate::pattern::{BindingStore, BindingStoreExt, VarIntern};
 use crate::pattern::matcher::{PatternMatcher, RewriteFn, RewriteResult};
 
 use super::buffer_cost::PcontigConfig;
@@ -47,27 +47,13 @@ pub fn movement_op_removal() -> PatternMatcher {
 /// Note: Algebraic simplifications (x+0, x*1, x*0, etc.) have been moved
 /// to the symbolic module where they belong.
 pub fn early_rewrites() -> PatternMatcher {
-    let mut patterns = vec![];
-
-    // Pattern 1: DETACH(x) → x
-    // DETACH marks gradient boundaries during autodiff, but is not needed
-    // for scheduling/execution.
-    pattern!(patterns,
-        UPat::detach(UPat::var("x")) => |x| {
-            Some(Rc::clone(x))
-        }
-    );
-
-    // Pattern 2: CONTIGUOUS_BACKWARD(x) → x
-    // CONTIGUOUS_BACKWARD marks backward pass contiguous requirements,
-    // but is not needed for scheduling/execution.
-    pattern!(patterns,
-        UPat::contiguous_backward(UPat::var("x")) => |x| {
-            Some(Rc::clone(x))
-        }
-    );
-
-    PatternMatcher::new(patterns)
+    // Using the patterns! proc-macro DSL for simple rewrites:
+    // - DETACH(x) → x: DETACH marks gradient boundaries, not needed for scheduling
+    // - CONTIGUOUS_BACKWARD(x) → x: backward pass marker, not needed for scheduling
+    crate::patterns! {
+        Detach(x) ~> x,
+        ContiguousBackward(x) ~> x,
+    }
 }
 
 /// Create patterns for applying rangeify transformation with IndexingContext.
@@ -97,8 +83,8 @@ pub fn apply_rangeify_patterns(ctx: Rc<RefCell<IndexingContext>>) -> PatternMatc
         let ctx_clone = Rc::clone(&ctx);
         patterns.push((
             UPat::var("x"),
-            Box::new(move |bindings: &HashMap<String, Rc<UOp>>| {
-                let Some(x) = bindings.get("x") else {
+            Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
+                let Some(x) = intern.get_index("x").and_then(|i| bindings.get_by_index(i)) else {
                     return RewriteResult::NoMatch;
                 };
 
@@ -123,8 +109,8 @@ pub fn apply_rangeify_patterns(ctx: Rc<RefCell<IndexingContext>>) -> PatternMatc
         let ctx_clone = Rc::clone(&ctx);
         patterns.push((
             UPat::var("x"),
-            Box::new(move |bindings: &HashMap<String, Rc<UOp>>| {
-                let Some(x) = bindings.get("x") else {
+            Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
+                let Some(x) = intern.get_index("x").and_then(|i| bindings.get_by_index(i)) else {
                     return RewriteResult::NoMatch;
                 };
 
@@ -435,8 +421,8 @@ pub fn buffer_removal_with_pcontig(config: &PcontigConfig) -> PatternMatcher {
     let config_clone = *config;
     patterns.push((
         UPat::var("idx"),
-        Box::new(move |bindings: &HashMap<String, Rc<UOp>>| {
-            let Some(idx) = bindings.get("idx") else {
+        Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
+            let Some(idx) = intern.get_index("idx").and_then(|i| bindings.get_by_index(i)) else {
                 return RewriteResult::NoMatch;
             };
 
@@ -599,8 +585,8 @@ pub fn reduction_simplify_patterns(config: &SplitReduceOpConfig) -> PatternMatch
     let config_clone = *config;
     patterns.push((
         UPat::var("reduce"),
-        Box::new(move |bindings: &HashMap<String, Rc<UOp>>| {
-            let Some(reduce) = bindings.get("reduce") else {
+        Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
+            let Some(reduce) = intern.get_index("reduce").and_then(|i| bindings.get_by_index(i)) else {
                 return RewriteResult::NoMatch;
             };
 

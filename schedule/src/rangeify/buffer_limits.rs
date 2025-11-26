@@ -155,7 +155,7 @@ pub fn is_elementwise(uop: &Rc<UOp>) -> bool {
 /// - Counts buffers, forces bufferization when exceeded
 pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
     use crate::pattern::matcher::RewriteFn;
-    use std::collections::HashMap;
+    use crate::pattern::{BindingStore, BindingStoreExt, VarIntern};
 
     let mut patterns = vec![];
 
@@ -163,8 +163,8 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
     let limit = max_buffers; // Copy for closure capture
     patterns.push((
         UPat::var("op"),
-        Box::new(move |bindings: &HashMap<String, Rc<UOp>>| {
-            let Some(op) = bindings.get("op") else {
+        Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
+            let Some(op) = intern.get_index("op").and_then(|i| bindings.get_by_index(i)) else {
                 return RewriteResult::NoMatch;
             };
 

@@ -39,34 +39,17 @@
 ///
 /// # Expansion
 ///
-/// The macro expands to:
+/// The macro expands to use the optimized BindingStore for O(1) indexed access:
 ///
 /// ```ignore
 /// patterns.push((
 ///     UPat::var("x") + UPat::cvar("c"),
-///     Box::new(|bindings: &HashMap<String, Rc<UOp>>| {
-///         let x = match bindings.get("x") {
+///     Box::new(|bindings: &BindingStore, intern: &VarIntern| {
+///         let x = match intern.get_index("x").and_then(|i| bindings.get_by_index(i)) {
 ///             Some(v) => v,
 ///             None => return RewriteResult::NoMatch,
 ///         };
-///         let c = match bindings.get("c") {
-///             Some(v) => v,
-///             None => return RewriteResult::NoMatch,
-///         };
-///
-///         let rewrite_result = (|x, c| {
-///             let const_val = get_const_value(c)?;
-///             if is_identity_value(&const_val, &BinaryOp::Add, true) {
-///                 Some(x.clone())
-///             } else {
-///                 None
-///             }
-///         })(x, c);
-///
-///         match rewrite_result {
-///             Some(uop) => RewriteResult::Rewritten(uop),
-///             None => RewriteResult::NoMatch,
-///         }
+///         // ...
 ///     }) as RewriteFn,
 /// ));
 /// ```
@@ -76,21 +59,20 @@
 /// Variable names in the closure parameters must match the names used in the pattern:
 /// - `UPat::var("x")` requires parameter named `x`
 /// - `UPat::cvar("c")` requires parameter named `c`
-///
-/// The macro automatically extracts these bindings from the pattern matcher's HashMap.
 #[macro_export]
 macro_rules! pattern {
     // Pattern with type annotations: patterns, PATTERN => |var: Type, ...| { body }
     ($patterns:ident, $pattern:expr => |$($var:ident: $ty:ty),* $(,)?| $body:expr) => {
         $patterns.push((
             $pattern,
-            Box::new(|bindings: &std::collections::HashMap<String, std::rc::Rc<$crate::UOp>>| {
-                // Extract each variable from bindings
+            Box::new(|bindings: &$crate::pattern::BindingStore, intern: &$crate::pattern::VarIntern| {
+                use $crate::pattern::BindingStoreExt;
+                // Extract each variable from bindings using indexed lookup
                 $(
                     // Strip leading underscore from variable name for lookup
                     // (e.g., "_x" -> "x" to match UPat::var("x"))
                     let var_name = stringify!($var).trim_start_matches('_');
-                    let $var: $ty = match bindings.get(var_name) {
+                    let $var: $ty = match intern.get_index(var_name).and_then(|i| bindings.get_by_index(i)) {
                         Some(v) => v,
                         None => return $crate::pattern::matcher::RewriteResult::NoMatch,
                     };
@@ -114,13 +96,14 @@ macro_rules! pattern {
     ($patterns:ident, $pattern:expr => |$($var:ident),* $(,)?| $body:expr) => {
         $patterns.push((
             $pattern,
-            Box::new(|bindings: &std::collections::HashMap<String, std::rc::Rc<$crate::UOp>>| {
-                // Extract each variable from bindings
+            Box::new(|bindings: &$crate::pattern::BindingStore, intern: &$crate::pattern::VarIntern| {
+                use $crate::pattern::BindingStoreExt;
+                // Extract each variable from bindings using indexed lookup
                 $(
                     // Strip leading underscore from variable name for lookup
                     // (e.g., "_x" -> "x" to match UPat::var("x"))
                     let var_name = stringify!($var).trim_start_matches('_');
-                    let $var = match bindings.get(var_name) {
+                    let $var = match intern.get_index(var_name).and_then(|i| bindings.get_by_index(i)) {
                         Some(v) => v,
                         None => return $crate::pattern::matcher::RewriteResult::NoMatch,
                     };
@@ -180,7 +163,7 @@ macro_rules! pattern {
 ///
 /// The macro:
 /// 1. Creates a closure that captures `ctx_clone`
-/// 2. Extracts pattern variable bindings
+/// 2. Extracts pattern variable bindings using indexed lookup
 /// 3. Calls `ctx_clone.borrow_mut()` to get mutable context
 /// 4. Passes context to your rewrite function
 /// 5. Returns the rewrite function's result
@@ -199,10 +182,11 @@ macro_rules! pattern_ctx_mut {
             let ctx_clone = $ctx;
             $patterns.push((
                 $pattern,
-                Box::new(move |bindings: &std::collections::HashMap<String, std::rc::Rc<$crate::UOp>>| {
+                Box::new(move |bindings: &$crate::pattern::BindingStore, intern: &$crate::pattern::VarIntern| {
+                    use $crate::pattern::BindingStoreExt;
                     // Extract the variable from bindings
                     let var_name = stringify!($var).trim_start_matches('_');
-                    let $var = match bindings.get(var_name) {
+                    let $var = match intern.get_index(var_name).and_then(|i| bindings.get_by_index(i)) {
                         Some(v) => v,
                         None => return $crate::pattern::matcher::RewriteResult::NoMatch,
                     };
@@ -221,11 +205,12 @@ macro_rules! pattern_ctx_mut {
             let ctx_clone = $ctx;
             $patterns.push((
                 $pattern,
-                Box::new(move |bindings: &std::collections::HashMap<String, std::rc::Rc<$crate::UOp>>| {
+                Box::new(move |bindings: &$crate::pattern::BindingStore, intern: &$crate::pattern::VarIntern| {
+                    use $crate::pattern::BindingStoreExt;
                     // Extract each variable from bindings
                     $(
                         let var_name = stringify!($var).trim_start_matches('_');
-                        let $var = match bindings.get(var_name) {
+                        let $var = match intern.get_index(var_name).and_then(|i| bindings.get_by_index(i)) {
                             Some(v) => v,
                             None => return $crate::pattern::matcher::RewriteResult::NoMatch,
                         };
@@ -281,7 +266,7 @@ macro_rules! pattern_ctx_mut {
 ///
 /// The macro:
 /// 1. Creates a closure that captures `ctx_clone`
-/// 2. Extracts pattern variable bindings
+/// 2. Extracts pattern variable bindings using indexed lookup
 /// 3. Calls `ctx_clone.borrow()` to get immutable context
 /// 4. Passes context to your rewrite function
 /// 5. Converts `Option<Rc<UOp>>` to `RewriteResult`
@@ -300,11 +285,12 @@ macro_rules! pattern_ctx {
             let ctx_clone = $ctx;
             $patterns.push((
                 $pattern,
-                Box::new(move |bindings: &std::collections::HashMap<String, std::rc::Rc<$crate::UOp>>| {
+                Box::new(move |bindings: &$crate::pattern::BindingStore, intern: &$crate::pattern::VarIntern| {
+                    use $crate::pattern::BindingStoreExt;
                     // Extract each variable from bindings
                     $(
                         let var_name = stringify!($var).trim_start_matches('_');
-                        let $var = match bindings.get(var_name) {
+                        let $var = match intern.get_index(var_name).and_then(|i| bindings.get_by_index(i)) {
                             Some(v) => v,
                             None => return $crate::pattern::matcher::RewriteResult::NoMatch,
                         };

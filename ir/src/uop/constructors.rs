@@ -342,9 +342,10 @@ macro_rules! transcendental_ops {
     }
 }
 
-// Negation and abs work on any numeric type
+// Negation, not, and abs work on any numeric type
 unary_ops! {
     neg => Neg,
+    not => Not,
     abs => Abs,
 }
 

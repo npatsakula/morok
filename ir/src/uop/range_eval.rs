@@ -220,6 +220,12 @@ fn compute_unary_range(op: UnaryOp, vmin: ConstValue, vmax: ConstValue, dtype: &
                 }
             }
         }
+        UnaryOp::Not => {
+            // Not flips bits/booleans - evaluate at endpoints and swap
+            let new_min = eval_unary_op(UnaryOp::Not, vmax).unwrap_or_else(|| dtype_bounds(dtype).0);
+            let new_max = eval_unary_op(UnaryOp::Not, vmin).unwrap_or_else(|| dtype_bounds(dtype).1);
+            (new_min, new_max)
+        }
         UnaryOp::Sqrt
         | UnaryOp::Rsqrt
         | UnaryOp::Exp

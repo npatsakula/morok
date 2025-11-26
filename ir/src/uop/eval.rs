@@ -19,6 +19,7 @@ use crate::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
 pub fn eval_unary_op(op: UnaryOp, v: ConstValue) -> Option<ConstValue> {
     match op {
         UnaryOp::Neg => eval_neg(v),
+        UnaryOp::Not => eval_not(v),
         UnaryOp::Abs => eval_abs(v),
         UnaryOp::Sqrt => eval_sqrt(v),
         UnaryOp::Rsqrt => eval_rsqrt(v),
@@ -98,6 +99,16 @@ fn eval_neg(v: ConstValue) -> Option<ConstValue> {
     match v {
         ConstValue::Int(x) => Some(ConstValue::Int(x.wrapping_neg())),
         ConstValue::Float(x) => Some(ConstValue::Float(-x)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn eval_not(v: ConstValue) -> Option<ConstValue> {
+    match v {
+        ConstValue::Bool(b) => Some(ConstValue::Bool(!b)),
+        ConstValue::Int(i) => Some(ConstValue::Int(!i)),
+        ConstValue::UInt(u) => Some(ConstValue::UInt(!u)),
         _ => None,
     }
 }
@@ -275,8 +286,9 @@ fn eval_square(v: ConstValue) -> Option<ConstValue> {
 // Binary Arithmetic Operations
 // ============================================================================
 
+/// Evaluate addition on two constant values.
 #[inline]
-fn eval_add(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+pub fn eval_add(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
     match (a, b) {
         (ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Int(x.wrapping_add(y))),
         (ConstValue::UInt(x), ConstValue::UInt(y)) => Some(ConstValue::UInt(x.wrapping_add(y))),
@@ -285,8 +297,9 @@ fn eval_add(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
     }
 }
 
+/// Evaluate multiplication on two constant values.
 #[inline]
-fn eval_mul(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+pub fn eval_mul(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
     match (a, b) {
         (ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Int(x.wrapping_mul(y))),
         (ConstValue::UInt(x), ConstValue::UInt(y)) => Some(ConstValue::UInt(x.wrapping_mul(y))),
@@ -295,8 +308,9 @@ fn eval_mul(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
     }
 }
 
+/// Evaluate subtraction on two constant values.
 #[inline]
-fn eval_sub(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
+pub fn eval_sub(a: ConstValue, b: ConstValue) -> Option<ConstValue> {
     match (a, b) {
         (ConstValue::Int(x), ConstValue::Int(y)) => Some(ConstValue::Int(x.wrapping_sub(y))),
         (ConstValue::UInt(x), ConstValue::UInt(y)) => Some(ConstValue::UInt(x.wrapping_sub(y))),
