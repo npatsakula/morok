@@ -30,7 +30,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), zero), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "x + 0 should simplify to x");
@@ -43,7 +43,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Add, zero, Rc::clone(&x)), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "0 + x should simplify to x");
@@ -56,7 +56,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Sub, Rc::clone(&x), zero), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "x - 0 should simplify to x");
@@ -69,7 +69,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&x), one), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "x * 1 should simplify to x");
@@ -82,7 +82,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Mul, one, Rc::clone(&x)), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "1 * x should simplify to x");
@@ -95,7 +95,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&x), one), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "x / 1 should simplify to x");
@@ -108,7 +108,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Or, Rc::clone(&x), zero), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "x | 0 should simplify to x");
@@ -121,7 +121,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Xor, Rc::clone(&x), zero), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "x ^ 0 should simplify to x");
@@ -142,7 +142,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Mul, x, Rc::clone(&zero)), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &zero),
             "x * 0 should simplify to 0");
@@ -155,7 +155,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&zero), x), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &zero),
             "0 * x should simplify to 0");
@@ -168,7 +168,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::And, x, Rc::clone(&zero)), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &zero),
             "x & 0 should simplify to 0");
@@ -181,7 +181,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::And, Rc::clone(&zero), x), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &zero),
             "0 & x should simplify to 0");
@@ -201,7 +201,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         // Should simplify to constant 1
         match simplified.op() {
@@ -217,7 +217,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::And, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "x & x should simplify to x");
@@ -229,7 +229,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Or, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Rc::ptr_eq(&simplified, &x),
             "x | x should simplify to x");
@@ -241,7 +241,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Lt, Rc::clone(&x), Rc::clone(&x)), DType::Bool);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         match simplified.op() {
             Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Bool(false),
@@ -256,7 +256,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Eq, Rc::clone(&x), Rc::clone(&x)), DType::Bool);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         match simplified.op() {
             Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Bool(true),
@@ -271,7 +271,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Ne, Rc::clone(&x), Rc::clone(&x)), DType::Bool);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         match simplified.op() {
             Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Bool(false),
@@ -296,7 +296,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Add, a_uop, b_uop), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         // Should be a constant
         match simplified.op() {
@@ -322,7 +322,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Mul, a_uop, b_uop), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         // Should be a constant
         prop_assert!(matches!(simplified.op(), Op::Const(_)),
@@ -337,7 +337,7 @@ proptest! {
         let expr = UOp::new(Op::Binary(BinaryOp::Idiv, a_uop, b_uop), DType::Int32);
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite(&matcher, expr);
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         // Should be a constant
         prop_assert!(matches!(simplified.op(), Op::Const(_)),
@@ -362,8 +362,8 @@ proptest! {
         let yx = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&y), Rc::clone(&x)), DType::Int32);
 
         let matcher = symbolic_simple();
-        let opt_xy = graph_rewrite(&matcher, xy);
-        let opt_yx = graph_rewrite(&matcher, yx);
+        let opt_xy = graph_rewrite(&matcher, xy, &mut ());
+        let opt_yx = graph_rewrite(&matcher, yx, &mut ());
 
         // Both should optimize to same structure (either both to x+y or both simplified)
         // We verify this by checking if optimization preserves commutativity
@@ -384,8 +384,8 @@ proptest! {
         let x_and_x_and_x = UOp::new(Op::Binary(BinaryOp::And, Rc::clone(&x_and_x), Rc::clone(&x)), DType::Int32);
 
         let matcher = symbolic_simple();
-        let opt1 = graph_rewrite(&matcher, x_and_x);
-        let opt2 = graph_rewrite(&matcher, x_and_x_and_x);
+        let opt1 = graph_rewrite(&matcher, x_and_x, &mut ());
+        let opt2 = graph_rewrite(&matcher, x_and_x_and_x, &mut ());
 
         // Both should simplify to the same form (ideally to x, but constants may fold differently)
         // The key property is idempotence: applying & with self gives same result

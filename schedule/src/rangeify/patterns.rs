@@ -9,14 +9,11 @@
 //! Note: Algebraic simplifications (x+0, x*1, x*0, etc.) have been moved
 //! to the symbolic module (schedule/src/symbolic/patterns.rs).
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use morok_ir::{Op, UOp};
 
-use crate::pattern::UPat;
-use crate::pattern::{BindingStore, BindingStoreExt, VarIntern};
-use crate::pattern::matcher::{PatternMatcher, RewriteFn, RewriteResult};
+use crate::pattern::matcher::PatternMatcher;
 
 use super::buffer_cost::PcontigConfig;
 use super::helpers::{is_always_run_op, is_cheap_to_inline, is_dead_axis, ranges_equal};
@@ -59,85 +56,39 @@ pub fn early_rewrites() -> PatternMatcher {
 /// Create patterns for applying rangeify transformation with IndexingContext.
 ///
 /// This function creates a PatternMatcher whose patterns have access to the IndexingContext
-/// via closure capture. The patterns implement the core rangeify algorithm:
+/// via the `@context` DSL. The patterns implement the core rangeify algorithm:
 ///
 /// 1. **Generic BUFFERIZE insertion**: Adds BUFFERIZE + INDEX to op sources where needed
 /// 2. **Movement op removal**: Removes movement ops after transformation
-/// 3. **REDUCE_AXIS → REDUCE**: Converts REDUCE_AXIS with ranges to REDUCE
-/// 4. **PAD → WHERE**: Converts PAD operations to WHERE with validity checks
-/// 5. **CONST/DEFINE_VAR cleanup**: Removes sources from constants
-///
-/// # Arguments
-///
-/// * `ctx` - Shared reference to IndexingContext for range and realize tracking
 ///
 /// # Returns
 ///
-/// A PatternMatcher with all rangeify transformation patterns
-pub fn apply_rangeify_patterns(ctx: Rc<RefCell<IndexingContext>>) -> PatternMatcher {
-    let mut patterns: Vec<(UPat, RewriteFn)> = vec![];
-
-    // Pattern 1: Generic BUFFERIZE insertion
-    // Matches any op (except already processed) and adds BUFFERIZE+INDEX to sources
-    {
-        let ctx_clone = Rc::clone(&ctx);
-        patterns.push((
-            UPat::var("x"),
-            Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
-                let Some(x) = intern.get_index("x").and_then(|i| bindings.get_by_index(i)) else {
-                    return RewriteResult::NoMatch;
-                };
-
-                // Try to transform sources (scope limits context borrow)
-                let new_sources = {
-                    let ctx_ref = ctx_clone.borrow();
-                    transform_sources_with_bufferize(x, &ctx_ref)
-                };
-
-                if let Some(new_sources) = new_sources {
-                    return RewriteResult::Rewritten(x.with_sources(new_sources));
-                }
-
-                RewriteResult::NoMatch
-            }) as RewriteFn,
-        ));
+/// A PatternMatcher<IndexingContext> with all rangeify transformation patterns
+pub fn apply_rangeify_patterns() -> PatternMatcher<IndexingContext> {
+    crate::patterns! {
+        @context IndexingContext;
+        // Pattern 1: Generic BUFFERIZE insertion
+        x => apply_bufferize_transform(x, ctx),
+        // Pattern 2: Remove movement ops after transformation
+        x if x.op().is_movement() => remove_movement_op(x, ctx),
     }
+}
 
-    // Pattern 2: Remove movement ops after transformation
-    // Matches RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP and removes them if processed
-    {
-        let ctx_clone = Rc::clone(&ctx);
-        patterns.push((
-            UPat::var("x"),
-            Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
-                let Some(x) = intern.get_index("x").and_then(|i| bindings.get_by_index(i)) else {
-                    return RewriteResult::NoMatch;
-                };
+/// Apply BUFFERIZE transformation to op sources.
+fn apply_bufferize_transform(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Option<Rc<UOp>> {
+    // Try to transform sources
+    let new_sources = transform_sources_with_bufferize(x, ctx)?;
+    Some(x.with_sources(new_sources))
+}
 
-                // Check if this is a movement op
-                if !x.op().is_movement() {
-                    return RewriteResult::NoMatch;
-                }
-
-                // Check if it should be removed (scope limits context borrow)
-                let should_remove = {
-                    let ctx_ref = ctx_clone.borrow();
-                    should_remove_movement_op(x, &ctx_ref)
-                };
-
-                if should_remove {
-                    // Return the source (first operand)
-                    if let Some(src) = x.op().sources().first() {
-                        return RewriteResult::Rewritten(Rc::clone(src));
-                    }
-                }
-
-                RewriteResult::NoMatch
-            }) as RewriteFn,
-        ));
+/// Remove movement ops after transformation has been applied.
+fn remove_movement_op(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Option<Rc<UOp>> {
+    // Check if it should be removed
+    if should_remove_movement_op(x, ctx) {
+        // Return the source (first operand)
+        return x.op().sources().first().map(Rc::clone);
     }
-
-    PatternMatcher::new(patterns)
+    None
 }
 
 /// Pattern matcher for buffer folding and constant propagation.
@@ -148,58 +99,17 @@ pub fn apply_rangeify_patterns(ctx: Rc<RefCell<IndexingContext>>) -> PatternMatc
 ///
 /// More complex patterns (dead axis removal, cost-based removal) are in separate functions.
 pub fn buffer_folding() -> PatternMatcher {
-    let mut patterns = vec![];
-
-    // Pattern 1: Remove noop BUFFERIZE
-    // INDEX(BUFFERIZE(x, ranges1), ranges2) → x if ranges1 == ranges2
-    pattern!(patterns,
-        UPat::var("idx") => |idx: &Rc<UOp>| {
-            if let Op::Index { buffer, indices, gate: None } = idx.op()
-                && let Op::Bufferize { compute, ranges: buf_ranges, .. } = buffer.op()
-                    && ranges_equal(buf_ranges, indices) {
-                        return Some(Rc::clone(compute));
-                    }
-            None
-        }
-    );
-
-    // Pattern 2: BUFFERIZE(CONST) → CONST
-    // Constants don't need buffering
-    pattern!(patterns,
-        UPat::var("buf") => |buf: &Rc<UOp>| {
-            if let Op::Bufferize { compute, .. } = buf.op()
-                && matches!(compute.op(), Op::Const(_)) {
-                    return Some(Rc::clone(compute));
-                }
-            None
-        }
-    );
-
-    // Pattern 3: INDEX(CONST) → CONST
-    // Indexing into a constant is still that constant
-    pattern!(patterns,
-        UPat::var("idx") => |idx: &Rc<UOp>| {
-            if let Op::Index { buffer, .. } = idx.op()
-                && matches!(buffer.op(), Op::Const(_)) {
-                    return Some(Rc::clone(buffer));
-                }
-            None
-        }
-    );
-
-    // Pattern 4: COPY(CONST, device) → CONST
-    // Copying a constant is still that constant (device doesn't matter for constants)
-    pattern!(patterns,
-        UPat::var("copy") => |copy: &Rc<UOp>| {
-            if let Op::Copy { src, .. } = copy.op()
-                && matches!(src.op(), Op::Const(_)) {
-                    return Some(Rc::clone(src));
-                }
-            None
-        }
-    );
-
-    PatternMatcher::new(patterns)
+    crate::patterns! {
+        // BUFFERIZE(CONST) → CONST: Constants don't need buffering
+        Bufferize { compute: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
+        // INDEX(CONST) → CONST: Indexing into a constant is still that constant
+        Index { buffer: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
+        // COPY(CONST) → CONST: Copying a constant is still that constant
+        Copy { src: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
+        // INDEX(BUFFERIZE) noop removal: INDEX(BUFFERIZE(x, ranges), ranges) → x
+        Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
+            if ranges_equal(&ranges, &indices) ~> compute,
+    }
 }
 
 /// Pattern matcher for dead axis removal.
@@ -211,79 +121,75 @@ pub fn buffer_folding() -> PatternMatcher {
 ///
 /// Removing dead axes simplifies the buffer structure and indexing operations.
 pub fn dead_axis_removal() -> PatternMatcher {
-    let mut patterns = vec![];
+    crate::patterns! {
+        // BUFFERIZE with dead axes → BUFFERIZE with only live axes
+        buf if matches!(buf.op(), Op::Bufferize { .. }) => filter_dead_bufferize(buf),
+        // INDEX into BUFFERIZE with dead axes → INDEX with adjusted indices
+        idx if matches!(idx.op(), Op::Index { .. }) => adjust_index_for_dead_axes(idx),
+    }
+}
 
-    // Pattern: BUFFERIZE with dead axes → BUFFERIZE with only live axes
-    // BUFFERIZE(compute, [r1, r2, dead, r4, ...], opts) → BUFFERIZE(compute, [r1, r2, r4, ...], opts)
-    pattern!(patterns,
-        UPat::var("buf") => |buf: &Rc<UOp>| {
-            if let Op::Bufferize { compute, ranges, opts } = buf.op() {
-                // Filter out dead axes
-                let live_ranges: Vec<_> = ranges
-                    .iter()
-                    .filter(|r| !is_dead_axis(r))
-                    .map(Rc::clone)
-                    .collect();
+/// Filter dead axes from BUFFERIZE operations.
+///
+/// BUFFERIZE(compute, [r1, r2, dead, r4, ...], opts) → BUFFERIZE(compute, [r1, r2, r4, ...], opts)
+fn filter_dead_bufferize(buf: &Rc<UOp>) -> Option<Rc<UOp>> {
+    let Op::Bufferize { compute, ranges, opts } = buf.op() else {
+        return None;
+    };
 
-                // Only rewrite if we removed some dead axes
-                if live_ranges.len() < ranges.len() {
-                    // If all axes are dead, return the compute directly
-                    if live_ranges.is_empty() {
-                        return Some(Rc::clone(compute));
-                    }
+    // Filter out dead axes
+    let live_ranges: Vec<_> = ranges.iter().filter(|r| !is_dead_axis(r)).map(Rc::clone).collect();
 
-                    // Create new BUFFERIZE with only live axes
-                    return Some(UOp::bufferize(
-                        Rc::clone(compute),
-                        live_ranges,
-                        opts.clone(),
-                    ));
-                }
+    // Only rewrite if we removed some dead axes
+    if live_ranges.len() < ranges.len() {
+        // If all axes are dead, return the compute directly
+        if live_ranges.is_empty() {
+            return Some(Rc::clone(compute));
+        }
+
+        // Create new BUFFERIZE with only live axes
+        return Some(UOp::bufferize(Rc::clone(compute), live_ranges, opts.clone()));
+    }
+
+    None
+}
+
+/// Adjust INDEX indices when BUFFERIZE has dead axes removed.
+fn adjust_index_for_dead_axes(idx: &Rc<UOp>) -> Option<Rc<UOp>> {
+    let Op::Index { buffer, indices, gate: _ } = idx.op() else {
+        return None;
+    };
+    let Op::Bufferize { ranges: buf_ranges, .. } = buffer.op() else {
+        return None;
+    };
+
+    // Build new indices by filtering out positions where buffer has dead axes
+    let mut new_indices = Vec::new();
+    let mut idx_iter = indices.iter();
+
+    for range in buf_ranges.iter() {
+        if !is_dead_axis(range) {
+            // Keep this index for live axis
+            if let Some(idx_val) = idx_iter.next() {
+                new_indices.push(Rc::clone(idx_val));
             }
-            None
+        } else {
+            // Skip index for dead axis
+            idx_iter.next();
         }
-    );
+    }
 
-    // Pattern: INDEX into BUFFERIZE with dead axes → INDEX with adjusted indices
-    // When BUFFERIZE has dead axes removed, INDEX operations need matching adjustments
-    pattern!(patterns,
-        UPat::var("idx") => |idx: &Rc<UOp>| {
-            if let Op::Index { buffer, indices, gate: _ } = idx.op()
-                && let Op::Bufferize { ranges: buf_ranges, .. } = buffer.op() {
-                    // Build new indices by filtering out positions where buffer has dead axes
-                    let mut new_indices = Vec::new();
-                    let mut idx_iter = indices.iter();
-
-                    for range in buf_ranges.iter() {
-                        if !is_dead_axis(range) {
-                            // Keep this index for live axis
-                            if let Some(idx_val) = idx_iter.next() {
-                                new_indices.push(Rc::clone(idx_val));
-                            }
-                        } else {
-                            // Skip index for dead axis
-                            idx_iter.next();
-                        }
-                    }
-
-                    // Only rewrite if we removed some indices
-                    if new_indices.len() < indices.len() {
-                        // If no indices remain, this is invalid - keep original
-                        if new_indices.is_empty() {
-                            return None;
-                        }
-
-                        return UOp::index(
-                            Rc::clone(buffer),
-                            new_indices,
-                        ).ok();
-                    }
-                }
-            None
+    // Only rewrite if we removed some indices
+    if new_indices.len() < indices.len() {
+        // If no indices remain, this is invalid - keep original
+        if new_indices.is_empty() {
+            return None;
         }
-    );
 
-    PatternMatcher::new(patterns)
+        return UOp::index(Rc::clone(buffer), new_indices).ok();
+    }
+
+    None
 }
 
 /// Pattern matcher for cost-based buffer removal.
@@ -297,55 +203,15 @@ pub fn dead_axis_removal() -> PatternMatcher {
 /// The goal is to remove unnecessary buffering overhead while preserving
 /// buffers that genuinely improve performance through memoization.
 pub fn buffer_removal() -> PatternMatcher {
-    let mut patterns = vec![];
-
-    // Pattern 1: Remove BUFFERIZE when compute is cheap to inline
-    // BUFFERIZE(cheap_compute, ranges, opts) → cheap_compute
-    // Only applies to simple operations (unary, binary, casts, etc.)
-    pattern!(patterns,
-        UPat::var("buf") => |buf: &Rc<UOp>| {
-            if let Op::Bufferize { compute, .. } = buf.op() {
-                // If compute is cheap and doesn't need buffering, inline it
-                if is_cheap_to_inline(compute.op()) {
-                    return Some(Rc::clone(compute));
-                }
-            }
-            None
-        }
-    );
-
-    // Pattern 2: Remove BUFFERIZE when compute must always run
-    // Operations like CONTIGUOUS, COPY, ASSIGN have side effects
-    // and shouldn't be wrapped in BUFFERIZE
-    pattern!(patterns,
-        UPat::var("buf") => |buf: &Rc<UOp>| {
-            if let Op::Bufferize { compute, .. } = buf.op()
-                && is_always_run_op(compute.op()) {
-                    return Some(Rc::clone(compute));
-                }
-            None
-        }
-    );
-
-    // Pattern 3: Remove nested BUFFERIZE (redundant buffering)
-    // BUFFERIZE(BUFFERIZE(x, r1, o1), r2, o2) → BUFFERIZE(x, r2, o2)
-    // Inner buffer is unnecessary if outer buffer exists
-    pattern!(patterns,
-        UPat::var("outer") => |outer: &Rc<UOp>| {
-            if let Op::Bufferize { compute: outer_compute, ranges, opts } = outer.op()
-                && let Op::Bufferize { compute: inner_compute, .. } = outer_compute.op() {
-                    // Replace nested BUFFERIZE with single-level BUFFERIZE
-                    return Some(UOp::bufferize(
-                        Rc::clone(inner_compute),
-                        ranges.to_vec(),
-                        opts.clone(),
-                    ));
-                }
-            None
-        }
-    );
-
-    PatternMatcher::new(patterns)
+    crate::patterns! {
+        // Cheap to inline: remove buffering for simple ops
+        Bufferize { compute, .. } if is_cheap_to_inline(compute.op()) ~> compute,
+        // Always-run ops: CONTIGUOUS, COPY, ASSIGN shouldn't be buffered
+        Bufferize { compute, .. } if is_always_run_op(compute.op()) ~> compute,
+        // Nested BUFFERIZE: flatten redundant buffering
+        Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
+            => Some(UOp::bufferize(Rc::clone(inner), ranges.to_vec(), opts.clone())),
+    }
 }
 
 /// Pattern matcher for cost-based buffer removal with partial contiguous support.
@@ -360,176 +226,111 @@ pub fn buffer_removal() -> PatternMatcher {
 /// - `out_in_ratio < out_in_ratio_threshold` → keep (efficient buffer)
 /// - `buffer_in_reduce` → partial contiguous candidate
 ///
-/// # Arguments
-///
-/// * `config` - Configuration for partial contiguous thresholds
-///
 /// # Returns
 ///
-/// A PatternMatcher with buffer removal patterns including partial contiguous logic
-pub fn buffer_removal_with_pcontig(config: &PcontigConfig) -> PatternMatcher {
+/// A PatternMatcher<PcontigConfig> with buffer removal patterns including partial contiguous logic
+pub fn buffer_removal_with_pcontig() -> PatternMatcher<PcontigConfig> {
+    crate::patterns! {
+        @context PcontigConfig;
+        // Cheap to inline: remove buffering for simple ops
+        Bufferize { compute, .. } if is_cheap_to_inline(compute.op()) ~> compute,
+        // Always-run ops: CONTIGUOUS, COPY, ASSIGN shouldn't be buffered
+        Bufferize { compute, .. } if is_always_run_op(compute.op()) ~> compute,
+        // Nested BUFFERIZE: flatten redundant buffering
+        Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
+            => Some(UOp::bufferize(Rc::clone(inner), ranges.to_vec(), opts.clone())),
+        // Complex INDEX(BUFFERIZE) with partial contiguous
+        idx if matches!(idx.op(), Op::Index { .. }) => apply_pcontig_removal(idx, ctx),
+    }
+}
+
+/// Apply partial contiguous buffer removal.
+fn apply_pcontig_removal(idx: &Rc<UOp>, config: &mut PcontigConfig) -> Option<Rc<UOp>> {
     use super::buffer_cost::{
         apply_partial_contiguous, calculate_buffer_size, calculate_out_in_ratio, collect_accessed_buffers,
         collect_indexes, collect_local_indexes, collect_reduces, extract_exclude_ranges, has_buffer_in_reduce,
         partition_ranges,
     };
 
-    let mut patterns = vec![];
+    // Match INDEX(BUFFERIZE(...), ...)
+    let Op::Index { buffer, indices: idx_ranges, gate: None } = idx.op() else {
+        return None;
+    };
+    let Op::Bufferize { compute: src, ranges: buf_ranges, .. } = buffer.op() else {
+        return None;
+    };
 
-    // Pattern 1: Remove BUFFERIZE when compute is cheap to inline
-    // (Same as buffer_removal() - keep for backward compatibility)
-    pattern!(patterns,
-        UPat::var("buf") => |buf: &Rc<UOp>| {
-            if let Op::Bufferize { compute, .. } = buf.op()
-                && is_cheap_to_inline(compute.op()) {
-                    return Some(Rc::clone(compute));
-                }
-            None
-        }
-    );
+    // Early exit: Check if disabled
+    if config.level == 0 {
+        return None;
+    }
 
-    // Pattern 2: Remove BUFFERIZE when compute must always run
-    // (Same as buffer_removal() - keep for backward compatibility)
-    pattern!(patterns,
-        UPat::var("buf") => |buf: &Rc<UOp>| {
-            if let Op::Bufferize { compute, .. } = buf.op()
-                && is_always_run_op(compute.op()) {
-                    return Some(Rc::clone(compute));
-                }
-            None
-        }
-    );
+    // Early exit: Always-run ops should not be transformed
+    if is_always_run_op(src.op()) {
+        return None;
+    }
 
-    // Pattern 3: Remove nested BUFFERIZE (redundant buffering)
-    // (Same as buffer_removal() - keep for backward compatibility)
-    pattern!(patterns,
-        UPat::var("outer") => |outer: &Rc<UOp>| {
-            if let Op::Bufferize { compute: outer_compute, ranges, opts } = outer.op()
-                && let Op::Bufferize { compute: inner_compute, .. } = outer_compute.op() {
-                    return Some(UOp::bufferize(
-                        Rc::clone(inner_compute),
-                        ranges.to_vec(),
-                        opts.clone(),
-                    ));
-                }
-            None
-        }
-    );
+    // === Heuristic 1: accessed_buffers check ===
+    // If too many buffers are accessed, keep the buffer (complex multi-input)
+    let accessed_buffers = collect_accessed_buffers(src);
+    if accessed_buffers.len() > config.max_buffers_threshold {
+        return None;
+    }
 
-    // Pattern 4: Complex INDEX(BUFFERIZE) with partial contiguous
-    // This implements the cost-based decision tree for selective materialization
-    let config_clone = *config;
-    patterns.push((
-        UPat::var("idx"),
-        Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
-            let Some(idx) = intern.get_index("idx").and_then(|i| bindings.get_by_index(i)) else {
-                return RewriteResult::NoMatch;
-            };
+    // === Heuristic 2: out_in_ratio check ===
+    // If output/input ratio is low, keep the buffer (efficient buffer)
+    if let Some(output_size) = calculate_buffer_size(buffer)
+        && let Some(ratio) = calculate_out_in_ratio(output_size, &accessed_buffers)
+        && ratio < config.out_in_ratio_threshold
+    {
+        return None;
+    }
 
-            // Match INDEX(BUFFERIZE(...), ...)
-            let (buffer, idx_ranges) = match idx.op() {
-                Op::Index { buffer, indices, gate: None } => (buffer, indices),
-                _ => return RewriteResult::NoMatch,
-            };
+    // === Heuristic 3: buffer_in_reduce check ===
+    // Determines whether to do full removal or partial contiguous
+    let reduces = collect_reduces(src);
+    let buf_in_reduce = has_buffer_in_reduce(&reduces);
 
-            let (src, buf_ranges) = match buffer.op() {
-                Op::Bufferize { compute, ranges, .. } => (compute, ranges),
-                _ => return RewriteResult::NoMatch,
-            };
+    if !buf_in_reduce {
+        // No reduce usage → full removal via substitution
+        use morok_ir::UOpKey;
+        use std::collections::HashMap;
 
-            // Early exit: Check if disabled
-            if config_clone.level == 0 {
-                return RewriteResult::NoMatch;
-            }
+        // Build substitution map: buffer ranges → index ranges
+        #[allow(clippy::mutable_key_type)]
+        let subs_map: HashMap<UOpKey, Rc<UOp>> = buf_ranges
+            .iter()
+            .zip(idx_ranges.iter())
+            .map(|(k, v)| (UOpKey(Rc::clone(k)), Rc::clone(v)))
+            .collect();
 
-            // Early exit: Always-run ops should not be transformed
-            if is_always_run_op(src.op()) {
-                return RewriteResult::NoMatch;
-            }
+        return Some(src.substitute(&subs_map));
+    }
 
-            // === Heuristic 1: accessed_buffers check ===
-            // If too many buffers are accessed, keep the buffer (complex multi-input)
-            let accessed_buffers = collect_accessed_buffers(src);
-            if accessed_buffers.len() > config_clone.max_buffers_threshold {
-                return RewriteResult::NoMatch;
-            }
+    // Buffer is used in reduce → partial contiguous candidate
+    // Collect all INDEX operations and determine which ranges to materialize
+    let indexes = collect_indexes(src);
+    let local_indexes = collect_local_indexes(&indexes);
+    #[allow(clippy::mutable_key_type)]
+    let exclude_ranges = extract_exclude_ranges(&local_indexes);
 
-            // === Heuristic 2: out_in_ratio check ===
-            // If output/input ratio is low, keep the buffer (efficient buffer)
-            if let Some(output_size) = calculate_buffer_size(buffer)
-                && let Some(ratio) = calculate_out_in_ratio(output_size, &accessed_buffers)
-                && ratio < config_clone.out_in_ratio_threshold
-            {
-                return RewriteResult::NoMatch;
-            }
+    // Partition ranges: materialize (LOCAL, REDUCE) vs substitute (inline)
+    let (materialize, substitute) = partition_ranges(buf_ranges, idx_ranges, &exclude_ranges);
 
-            // === Heuristic 3: buffer_in_reduce check ===
-            // Determines whether to do full removal or partial contiguous
-            let reduces = collect_reduces(src);
-            let buf_in_reduce = has_buffer_in_reduce(&reduces);
+    // Check if partial contiguous would be beneficial
+    if materialize.is_empty() {
+        // No dimensions to materialize → full removal
+        use morok_ir::UOpKey;
+        use std::collections::HashMap;
 
-            if !buf_in_reduce {
-                // No reduce usage → full removal via substitution
-                use morok_ir::UOpKey;
-                use std::collections::HashMap;
+        #[allow(clippy::mutable_key_type)]
+        let subs_map: HashMap<UOpKey, Rc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
 
-                // Build substitution map: buffer ranges → index ranges
-                #[allow(clippy::mutable_key_type)]
-                let subs_map: HashMap<UOpKey, Rc<UOp>> = buf_ranges
-                    .iter()
-                    .zip(idx_ranges.iter())
-                    .map(|(k, v)| (UOpKey(Rc::clone(k)), Rc::clone(v)))
-                    .collect();
+        return Some(src.substitute(&subs_map));
+    }
 
-                let substituted = src.substitute(&subs_map);
-                return RewriteResult::Rewritten(substituted);
-            }
-
-            // Buffer is used in reduce → partial contiguous candidate
-            // Collect all INDEX operations and determine which ranges to materialize
-            let indexes = collect_indexes(src);
-            let local_indexes = collect_local_indexes(&indexes);
-            #[allow(clippy::mutable_key_type)]
-            let exclude_ranges = extract_exclude_ranges(&local_indexes);
-
-            // Partition ranges: materialize (LOCAL, REDUCE) vs substitute (inline)
-            let (materialize, substitute) = partition_ranges(buf_ranges, idx_ranges, &exclude_ranges);
-
-            // Check if partial contiguous would be beneficial
-            if materialize.is_empty() {
-                // No dimensions to materialize → full removal
-                use morok_ir::UOpKey;
-                use std::collections::HashMap;
-
-                #[allow(clippy::mutable_key_type)]
-                let subs_map: HashMap<UOpKey, Rc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
-
-                let substituted = src.substitute(&subs_map);
-                return RewriteResult::Rewritten(substituted);
-            }
-
-            // Apply partial contiguous transformation
-            if let Some(result) = apply_partial_contiguous(src, materialize, substitute) {
-                return RewriteResult::Rewritten(result);
-            }
-
-            // Transformation failed → keep original buffer
-            RewriteResult::NoMatch
-        }) as RewriteFn,
-    ));
-
-    PatternMatcher::new(patterns)
-}
-
-/// Pattern matcher for kernel splitting.
-///
-/// This will split the graph into individual kernels at
-/// STORE operation boundaries.
-///
-/// Phase 1 stub - returns empty matcher.
-pub fn kernel_splitting() -> PatternMatcher {
-    // TODO (Phase 2): Implement kernel boundary detection
-    PatternMatcher::new(vec![])
+    // Apply partial contiguous transformation
+    apply_partial_contiguous(src, materialize, substitute)
 }
 
 /// Pattern matcher for reduction simplifications.
@@ -542,61 +343,37 @@ pub fn kernel_splitting() -> PatternMatcher {
 /// These patterns should run after symbolic simplification to benefit from
 /// simplified index expressions.
 ///
-/// # Arguments
-///
-/// * `config` - Configuration for split_reduceop (threshold, divisor limits, etc.)
-///
 /// # Returns
 ///
-/// A PatternMatcher with all reduction optimization patterns
+/// A PatternMatcher<SplitReduceOpConfig> with all reduction optimization patterns
 ///
 /// # Example
 ///
 /// ```ignore
-/// let config = SplitReduceOpConfig::default();
-/// let matcher = reduction_simplify_patterns(&config);
-/// let optimized = graph_rewrite(&matcher, graph);
+/// let mut config = SplitReduceOpConfig::default();
+/// let matcher = reduction_simplify_patterns();
+/// let optimized = graph_rewrite(&matcher, graph, &mut config);
 /// ```
-pub fn reduction_simplify_patterns(config: &SplitReduceOpConfig) -> PatternMatcher {
-    let mut patterns: Vec<(UPat, RewriteFn)> = vec![];
+pub fn reduction_simplify_patterns() -> PatternMatcher<SplitReduceOpConfig> {
+    crate::patterns! {
+        @context SplitReduceOpConfig;
+        // reduce_unparented - Remove unused reduction ranges
+        // REDUCE(const, [range], ADD) → const * range.size
+        // REDUCE(const, [range], MUL) → const ^ range.size
+        // REDUCE(const, [range], MAX/MIN) → const
+        x => reduce_unparented(x),
+        // reduce_collapse - Lift range-independent computations outside reductions
+        // Uses symbolic substitution to detect and eliminate range dependencies
+        // REDUCE(x, [range], op) → x if symbolic simplification proves x is range-independent
+        x => super::reduce_simplify::reduce_collapse(x),
+        // split_reduceop - Split large reductions into two stages
+        // REDUCE_AXIS(src, [axis], op) where prod(shape)/prod(output) >= 32768
+        // → reshape → permute → reduce1 → contiguous → reduce2 → reshape
+        reduce if matches!(reduce.op(), Op::ReduceAxis { .. }) => apply_split_reduceop(reduce, ctx),
+    }
+}
 
-    // Pattern 1: reduce_unparented - Remove unused reduction ranges
-    // REDUCE(const, [range], ADD) → const * range.size
-    // REDUCE(const, [range], MUL) → const ^ range.size
-    // REDUCE(const, [range], MAX/MIN) → const
-    pattern!(patterns,
-        UPat::var("reduce") => |reduce: &Rc<UOp>| {
-            reduce_unparented(reduce)
-        }
-    );
-
-    // Pattern 2: reduce_collapse - Lift range-independent computations outside reductions
-    // Uses symbolic substitution to detect and eliminate range dependencies
-    // REDUCE(x, [range], op) → x if symbolic simplification proves x is range-independent
-    pattern!(patterns,
-        UPat::var("reduce") => |reduce: &Rc<UOp>| {
-            super::reduce_simplify::reduce_collapse(reduce)
-        }
-    );
-
-    // Pattern 3: split_reduceop - Split large reductions into two stages
-    // REDUCE_AXIS(src, [axis], op) where prod(shape)/prod(output) >= 32768
-    // → reshape → permute → reduce1 → contiguous → reduce2 → reshape
-    let config_clone = *config;
-    patterns.push((
-        UPat::var("reduce"),
-        Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
-            let Some(reduce) = intern.get_index("reduce").and_then(|i| bindings.get_by_index(i)) else {
-                return RewriteResult::NoMatch;
-            };
-
-            if let Some(result) = split_reduceop(reduce, &config_clone) {
-                RewriteResult::Rewritten(result)
-            } else {
-                RewriteResult::NoMatch
-            }
-        }) as RewriteFn,
-    ));
-
-    PatternMatcher::new(patterns)
+/// Apply split_reduceop transformation.
+fn apply_split_reduceop(reduce: &Rc<UOp>, config: &mut SplitReduceOpConfig) -> Option<Rc<UOp>> {
+    split_reduceop(reduce, config)
 }

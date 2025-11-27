@@ -13,36 +13,37 @@
 //!
 //! # Pattern Context
 //!
-//! Patterns that need external state should use **closure capture** rather than
-//! a context parameter. This is the idiomatic Rust approach and provides better
-//! type safety.
+//! Context is passed at rewrite-time through `graph_rewrite()`, not captured in
+//! closures. This provides compile-time type safety without `Rc<RefCell<>>`
+//! boilerplate.
 //!
 //! ## Example
 //!
 //! ```ignore
-//! use std::rc::Rc;
-//! use std::cell::RefCell;
+//! // Create context
+//! let mut ctx = KernelContext::new();
 //!
-//! // Create context wrapped in Rc<RefCell<>>
-//! let ctx = Rc::new(RefCell::new(MyContext::new()));
+//! // Patterns are simple functions - no closure capture needed
+//! fn debuf(b: &BindingStore, i: &VarIntern, ctx: &mut KernelContext) -> RewriteResult {
+//!     let id = ctx.next_global();  // Direct mutable access
+//!     // ...
+//! }
 //!
-//! // Patterns capture context via closure
-//! let mut patterns = vec![];
-//! let ctx_clone = Rc::clone(&ctx);
-//! patterns.push((
-//!     UPat::var("x"),
-//!     Box::new(move |bindings| {
-//!         // Access context inside pattern
-//!         let ctx_ref = ctx_clone.borrow();
-//!         // ... use context
-//!     })
-//! ));
+//! let matcher: PatternMatcher<KernelContext> = PatternMatcher::new(vec![
+//!     (pattern, Box::new(debuf)),
+//! ]);
 //!
-//! let matcher = PatternMatcher::new(patterns);
-//! graph_rewrite(&matcher, root);
+//! // Pass context at rewrite time
+//! let result = graph_rewrite(&matcher, root, &mut ctx, &mut ());
 //! ```
 //!
-//! See `crate::rangeify::patterns::apply_rangeify_patterns` for a real-world example.
+//! Patterns that don't need context simply ignore the `_ctx` parameter:
+//!
+//! ```ignore
+//! fn add_zero<C>(b: &BindingStore, _: &VarIntern, _ctx: &mut C) -> RewriteResult {
+//!     // Don't use _ctx
+//! }
+//! ```
 
 use morok_ir::UOp;
 use std::collections::HashMap;
@@ -60,9 +61,14 @@ enum Stage {
 }
 
 /// Internal rewrite engine that implements the 3-stage stack-based algorithm.
-struct RewriteEngine<'a> {
+///
+/// Generic over context type `C` for compile-time type-safe context passing.
+struct RewriteEngine<'a, C> {
     /// Pattern matcher for applying rewrite rules
-    matcher: &'a PatternMatcher,
+    matcher: &'a PatternMatcher<C>,
+
+    /// Mutable reference to context passed through to patterns
+    ctx: &'a mut C,
 
     /// Tracking which nodes have been visited in each stage
     /// Key: UOp pointer (as usize), Value: stage reached
@@ -77,9 +83,9 @@ struct RewriteEngine<'a> {
     replacement_cache: HashMap<usize, Rc<UOp>>,
 }
 
-impl<'a> RewriteEngine<'a> {
-    fn new(matcher: &'a PatternMatcher) -> Self {
-        Self { matcher, visited: HashMap::new(), match_cache: HashMap::new(), replacement_cache: HashMap::new() }
+impl<'a, C> RewriteEngine<'a, C> {
+    fn new(matcher: &'a PatternMatcher<C>, ctx: &'a mut C) -> Self {
+        Self { matcher, ctx, visited: HashMap::new(), match_cache: HashMap::new(), replacement_cache: HashMap::new() }
     }
 
     /// Get a stable pointer value for a UOp (for use as HashMap key).
@@ -105,7 +111,7 @@ impl<'a> RewriteEngine<'a> {
         // Try to rewrite, applying fixed-point iteration
         let mut current = uop.clone();
         loop {
-            match self.matcher.rewrite(&current) {
+            match self.matcher.rewrite(&current, self.ctx) {
                 RewriteResult::NoMatch => {
                     // No more rewrites possible - cache and return
                     let result = if Rc::ptr_eq(&current, uop) {
@@ -267,7 +273,7 @@ impl<'a> RewriteEngine<'a> {
                                 reconstructed = current;
                                 break;
                             }
-                            match self.matcher.rewrite(&current) {
+                            match self.matcher.rewrite(&current, self.ctx) {
                                 RewriteResult::Rewritten(new_uop) => {
                                     // Pattern matched - continue fixed-point iteration
                                     current = new_uop;
@@ -301,6 +307,11 @@ impl<'a> RewriteEngine<'a> {
 /// stack-based algorithm to rewrite the graph bottom-up with fixed-point
 /// iteration.
 ///
+/// # Type Parameters
+///
+/// * `C` - Context type passed through to pattern rewrite functions.
+///   Use `()` for patterns that don't need context.
+///
 /// # Algorithm
 ///
 /// 1. **Stage 0** (Bottom-up): Try to match patterns against each node.
@@ -319,13 +330,16 @@ impl<'a> RewriteEngine<'a> {
 /// use schedule::{PatternMatcher, graph_rewrite};
 /// use morok_ir::UOp;
 ///
-/// // Create pattern matcher with optimization patterns
-/// let matcher = PatternMatcher::new(vec![/* patterns */]);
+/// // Patterns without context
+/// let matcher: PatternMatcher<()> = PatternMatcher::new(vec![/* patterns */]);
+/// let optimized = graph_rewrite(&matcher, root_uop, &mut ());
 ///
-/// // Apply rewrites to the graph
-/// let optimized = graph_rewrite(&matcher, root_uop);
+/// // Patterns with context
+/// let matcher: PatternMatcher<KernelContext> = PatternMatcher::new(vec![/* patterns */]);
+/// let mut ctx = KernelContext::new();
+/// let optimized = graph_rewrite(&matcher, root_uop, &mut ctx, &mut ());
 /// ```
-pub fn graph_rewrite(matcher: &PatternMatcher, root: Rc<UOp>) -> Rc<UOp> {
-    let mut engine = RewriteEngine::new(matcher);
+pub fn graph_rewrite<C>(matcher: &PatternMatcher<C>, root: Rc<UOp>, ctx: &mut C) -> Rc<UOp> {
+    let mut engine = RewriteEngine::new(matcher, ctx);
     engine.rewrite(root)
 }

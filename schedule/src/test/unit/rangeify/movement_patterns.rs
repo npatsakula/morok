@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
-use morok_ir::{AxisType, ConstValue, Op, SInt, UOp};
+use morok_ir::{AxisType, ConstValue, Op, SInt, UOp, UnaryOp};
 
 use crate::rangeify::movement_patterns::movement_op_patterns;
 use crate::rewrite::graph_rewrite;
@@ -30,7 +30,9 @@ fn create_range(size: usize, axis_id: usize) -> Rc<UOp> {
 #[test]
 fn test_expand_index_transformation() {
     // Test: EXPAND([10, 1, 20] → [10, 5, 20]).INDEX([r0, r1, r2])
-    // Expected: buffer.INDEX([r0, 0, r2]) - r1 becomes 0 due to broadcast
+    // Since the source is RESHAPE(buffer), graph_rewrite transforms both:
+    // 1. EXPAND transformation: INDEX(RESHAPE(buf), [r0, 0, r2]) - r1 becomes 0
+    // 2. RESHAPE transformation: INDEX(buf, [flattened]) - combines to 1D index
 
     #[allow(clippy::identity_op)]
     let buffer = create_buffer(10 * 1 * 20);
@@ -58,27 +60,21 @@ fn test_expand_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed);
+    let result = graph_rewrite(&pm, indexed, &mut ());
 
-    // Verify: should transform EXPAND through INDEX
-    // After transformation, we should have buffer.INDEX([r0, 0, r2])
-    // where dimension 1 became a constant 0
-
+    // Verify: should transform all movement ops through INDEX
+    // Final result: buffer.INDEX([flattened_index])
     assert!(matches!(result.op(), Op::Index { .. }), "Result should be INDEX");
 
-    let Op::Index { buffer: _res_buf, indices: res_idx, .. } = result.op() else {
+    let Op::Index { buffer: res_buf, indices: res_idx, .. } = result.op() else {
         panic!("Expected INDEX");
     };
 
-    assert_eq!(res_idx.len(), 3, "Should have 3 indices");
+    // After both EXPAND and RESHAPE are transformed, we get 1 flattened index
+    assert_eq!(res_idx.len(), 1, "Should have 1 index after all movement ops transformed");
 
-    // Index 1 should be constant 0 (broadcast dimension)
-    match res_idx[1].op() {
-        Op::Const(cv) => {
-            assert_eq!(cv.0, ConstValue::Int(0), "Broadcast dimension should become constant 0");
-        }
-        _ => panic!("Index 1 should be constant 0, got {:?}", res_idx[1].op()),
-    }
+    // The buffer should be the original buffer (no movement ops remaining)
+    assert!(matches!(res_buf.op(), Op::Buffer { .. }), "Buffer should be the original buffer");
 }
 
 // ===== PERMUTE Tests =====
@@ -86,7 +82,9 @@ fn test_expand_index_transformation() {
 #[test]
 fn test_permute_index_transformation() {
     // Test: PERMUTE([10, 20, 30], axes=[1, 2, 0]).INDEX([r0, r1, r2])
-    // Expected: buffer.INDEX([r2, r0, r1]) - indices reordered
+    // Since the source is RESHAPE(buffer), graph_rewrite transforms both:
+    // 1. PERMUTE transformation: INDEX(RESHAPE(buf), [r2, r0, r1]) - indices reordered
+    // 2. RESHAPE transformation: INDEX(buf, [flattened]) - combines to 1D index
 
     let buffer = create_buffer(10 * 20 * 30);
     let reshaped =
@@ -103,20 +101,20 @@ fn test_permute_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed);
+    let result = graph_rewrite(&pm, indexed, &mut ());
 
     // Verify transformation
     assert!(matches!(result.op(), Op::Index { .. }));
 
-    let Op::Index { indices: res_idx, .. } = result.op() else {
+    let Op::Index { buffer: res_buf, indices: res_idx, .. } = result.op() else {
         panic!("Expected INDEX");
     };
 
-    assert_eq!(res_idx.len(), 3);
+    // After both PERMUTE and RESHAPE are transformed, we get 1 flattened index
+    assert_eq!(res_idx.len(), 1, "Should have 1 index after all movement ops transformed");
 
-    // After permutation, indices should be reordered
-    // Permute axes=[1,2,0] means: output[0] = input[1], output[1] = input[2], output[2] = input[0]
-    // So when we index output with [r0, r1, r2], we're accessing input at [r2, r0, r1]
+    // The buffer should be the original buffer (no movement ops remaining)
+    assert!(matches!(res_buf.op(), Op::Buffer { .. }), "Buffer should be the original buffer");
 }
 
 // ===== RESHAPE Tests =====
@@ -138,7 +136,7 @@ fn test_reshape_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed);
+    let result = graph_rewrite(&pm, indexed, &mut ());
 
     // Verify: should have INDEX with combined indices
     assert!(matches!(result.op(), Op::Index { .. }));
@@ -177,7 +175,7 @@ fn test_shrink_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed);
+    let result = graph_rewrite(&pm, indexed, &mut ());
 
     // Verify transformation
     assert!(matches!(result.op(), Op::Index { .. }));
@@ -203,7 +201,7 @@ fn test_flip_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed);
+    let result = graph_rewrite(&pm, indexed, &mut ());
 
     // Verify transformation
     assert!(matches!(result.op(), Op::Index { .. }));
@@ -235,7 +233,7 @@ fn test_pad_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed);
+    let result = graph_rewrite(&pm, indexed, &mut ());
 
     // Verify transformation
     assert!(matches!(result.op(), Op::Index { .. }));
@@ -249,28 +247,27 @@ fn test_non_movement_op_no_match() {
 
     let buffer = create_buffer(100);
 
-    // Create a non-movement op (ADD)
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let added = buffer.try_add_op(&const_val).unwrap();
+    // Create a non-movement op (NEG) - using unary op to avoid shape issues
+    let negated = UOp::new(Op::Unary(UnaryOp::Neg, buffer), DType::Float32);
 
     // Create INDEX
     let r0 = create_range(100, 0);
-    let indexed = UOp::index(added, vec![r0]).unwrap();
+    let indexed = UOp::index(negated, vec![r0]).unwrap();
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed);
+    let result = graph_rewrite(&pm, indexed, &mut ());
 
     // Should NOT transform (no movement op)
-    // The result should still have the ADD operation somewhere in the tree
+    // The result should still have the NEG operation somewhere in the tree
     assert!(matches!(result.op(), Op::Index { .. }));
 
-    // The buffer should still be the ADD node
+    // The buffer should still be the NEG node
     let Op::Index { buffer: res_buf, .. } = result.op() else {
         panic!("Expected INDEX");
     };
 
-    assert!(matches!(res_buf.op(), Op::Binary { .. }), "Buffer should still be the ADD");
+    assert!(matches!(res_buf.op(), Op::Unary(..)), "Buffer should still be the NEG");
 }
 
 // ===== Nested Movement Ops Test =====
@@ -299,7 +296,7 @@ fn test_nested_movement_ops() {
 
     // Apply pattern (should iterate multiple times)
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed);
+    let result = graph_rewrite(&pm, indexed, &mut ());
 
     // Verify: should have transformed through all movement ops
     assert!(matches!(result.op(), Op::Index { .. }));

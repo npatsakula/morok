@@ -8,16 +8,13 @@
 //!
 //! Based on Tinygrad's rangeify_codegen PatternMatcher (schedule/rangeify.py:440-465).
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp, UOpKey};
 use smallvec::SmallVec;
 
-use super::kernel_context::KernelContext;
-use crate::pattern::UPat;
-use crate::pattern::matcher::{PatternMatcher, RewriteFn};
+use crate::pattern::matcher::PatternMatcher;
 
 /// Replace NOOP operations with actual zero values.
 ///
@@ -202,52 +199,21 @@ pub fn fix_after_broadcast(after: &Rc<UOp>) -> Option<Rc<UOp>> {
 /// 4. **add_load_to_index (broadcast)**: Generate LOAD for broadcast INDEX (investigation needed)
 /// 5. **add_load_to_index (GEP)**: Generate LOAD for GEP INDEX (investigation needed)
 ///
-/// # Arguments
-///
-/// * `ctx` - Shared reference to KernelContext for tracking buffers and variables
-///
 /// # Returns
 ///
-/// A PatternMatcher with all codegen preparation patterns
+/// A PatternMatcher<()> with all codegen preparation patterns (no context needed)
 ///
 /// # Example
 ///
 /// ```ignore
-/// use std::cell::RefCell;
-/// use std::rc::Rc;
-///
-/// let ctx = Rc::new(RefCell::new(KernelContext::new()));
-/// let matcher = rangeify_codegen_patterns(ctx);
+/// let matcher = rangeify_codegen_patterns();
 ///
 /// // Apply patterns via graph_rewrite
-/// let result = graph_rewrite(&matcher, computation);
+/// let result = graph_rewrite(&matcher, computation, &mut ());
 /// ```
 ///
 /// Based on Tinygrad's rangeify_codegen (schedule/rangeify.py:440-465).
-pub fn rangeify_codegen_patterns(_ctx: Rc<RefCell<KernelContext>>) -> PatternMatcher {
-    let mut patterns: Vec<(UPat, RewriteFn)> = vec![];
-
-    // Pattern 1: remove_noop - NOOP → zero constant
-    pattern!(patterns,
-        UPat::var("noop") => |noop| {
-            remove_noop(noop)
-        }
-    );
-
-    // Pattern 2: get_contiguous - Remove CONTIGUOUS markers
-    pattern!(patterns,
-        UPat::var("contiguous") => |contiguous| {
-            get_contiguous(contiguous)
-        }
-    );
-
-    // Pattern 3: fix_after_broadcast - Fix AFTER wrapping EXPAND
-    pattern!(patterns,
-        UPat::var("after") => |after| {
-            fix_after_broadcast(after)
-        }
-    );
-
+pub fn rangeify_codegen_patterns() -> PatternMatcher<()> {
     // NOTE: add_load_to_index patterns from Tinygrad are NOT needed in Morok.
     //
     // Architectural difference:
@@ -259,17 +225,15 @@ pub fn rangeify_codegen_patterns(_ctx: Rc<RefCell<KernelContext>>) -> PatternMat
     //
     // Our bufferize_to_store.rs already creates STORE operations that take INDEX
     // as an argument, so no conversion pattern is needed.
-    //
-    // Example in Morok:
-    // ```rust
-    // let store_target = UOp::index(buffer, ranges)?;
-    // let store = UOp::store(buffer, store_target, compute);
-    // ```
 
     // NOTE: flatten_range patterns are NOT integrated here.
     // flatten_range_impl() in flatten_range.rs requires a consumer map and substitution pass.
     // It's currently implemented as a direct transformation function, not a pattern.
     // Future work: Add substitution pass infrastructure to support flatten_range integration.
 
-    PatternMatcher::new(patterns)
+    crate::patterns! {
+        noop if matches!(noop.op(), Op::Noop) => remove_noop(noop),
+        cont if matches!(cont.op(), Op::Contiguous { .. }) => get_contiguous(cont),
+        after if matches!(after.op(), Op::After { .. }) => fix_after_broadcast(after),
+    }
 }

@@ -1,10 +1,4 @@
-//! Reduction simplification optimizations.
-//!
-//! This module implements optimizations that simplify REDUCE operations:
-//! - `reduce_unparented`: Remove ranges that don't appear in the reduction source
-//! - `reduce_collapse`: Lift range-independent computations outside reductions (future)
-//!
-//! These optimizations provide 2-10x performance improvements on reduction-heavy workloads.
+//! Reduction simplification: reduce_unparented and reduce_collapse.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -12,34 +6,8 @@ use std::rc::Rc;
 use morok_ir::{Op, ReduceOp, UOp, UOpKey};
 use smallvec::SmallVec;
 
-/// Remove ranges from REDUCE that don't appear in the source expression.
-///
-/// Mathematical justification:
-/// - **ADD**: `sum(x, r) = x * |r|` when x doesn't depend on r
-/// - **MUL**: `prod(x, r) = x^|r|` when x doesn't depend on r
-/// - **MAX/MIN**: `max/min(x, r) = x` when x doesn't depend on r
-///
-/// # Algorithm
-///
-/// 1. Partition ranges into those used vs unused by the source
-/// 2. Create new REDUCE with only used ranges (or return source if none)
-/// 3. Apply transformation based on reduce operation:
-///    - ADD: Multiply by size of each unused range
-///    - MUL: Exponentiate by size of each unused range
-///    - MAX/MIN: No transformation needed (constant optimization)
-///
-/// # Example
-///
-/// ```ignore
-/// // Before: sum(5, range(10))
-/// REDUCE(CONST(5), [range(10)], ADD)
-///
-/// // After: 5 * 10 = 50
-/// BINARY(MUL, CONST(5), CONST(10))
-/// ```
-///
-/// Based on Tinygrad's reduce_unparented (tinygrad/codegen/simplify.py:70-80).
-#[allow(clippy::mutable_key_type)] // HashSet<UOpKey> has interior mutability
+/// Remove ranges from REDUCE that don't appear in source. ADD→mul by size, MUL→pow.
+#[allow(clippy::mutable_key_type)]
 pub fn reduce_unparented(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
     let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
         return None;
@@ -104,12 +72,7 @@ pub fn reduce_unparented(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
 }
 
 /// Partition ranges into parented (in src_ranges) and unparented.
-///
-/// Equivalent to Tinygrad's:
-/// ```python
-/// partition(red.src[1:], lambda x: x in red.src[0].ranges)
-/// ```
-#[allow(clippy::mutable_key_type)] // UOpKey contains Rc which has interior mutability
+#[allow(clippy::mutable_key_type)]
 fn partition_ranges(
     ranges: &SmallVec<[Rc<UOp>; 4]>,
     src_ranges: &HashSet<UOpKey>,
@@ -129,67 +92,13 @@ fn partition_ranges(
     (parented, unparented)
 }
 
-/// Extract the size (end value) from a RANGE operation.
-///
-/// RANGE goes from 0 to (end - 1), so size is the `end` field.
+/// Extract size (end value) from RANGE.
 fn get_range_size(range: &Rc<UOp>) -> Option<Rc<UOp>> {
     if let Op::Range { end, .. } = range.op() { Some(Rc::clone(end)) } else { None }
 }
 
-/// Lift range-independent computations outside REDUCE operations.
-///
-/// This optimization uses symbolic substitution to detect when a reduction
-/// can be simplified by factoring out range-independent terms. It provides
-/// 2-10x performance improvements on reduction-heavy workloads.
-///
-/// # Algorithm
-///
-/// 1. **Substitute ranges with symbolic variables**: Replace each RANGE with
-///    a DEFINE_VAR that has the same bounds (0 to size-1)
-/// 2. **Apply symbolic simplification**: Run symbolic patterns on the substituted
-///    expression to eliminate range dependencies
-/// 3. **Verify ranges eliminated**: Check that no RANGE operations remain using
-///    `no_range()`
-/// 4. **Substitute back**: Replace DEFINE_VARs with original RANGEs
-/// 5. **Return simplified result**
-///
-/// # Mathematical Correctness
-///
-/// This optimization is valid when the simplified expression no longer depends
-/// on the reduction ranges. The symbolic simplification must prove that the
-/// range variables can be eliminated, which happens when:
-///
-/// - **Constant propagation**: `sum(5, r)` → constant independent of r
-/// - **Algebraic cancellation**: `sum(r - r, r)` → sum(0, r) = 0
-/// - **Range arithmetic**: `sum(i % N, i in [0, N))` can sometimes be closed-form
-///
-/// # Example
-///
-/// ```ignore
-/// // Before: sum(x, range(10)) where x doesn't depend on range
-/// REDUCE(x, [range(10)], ADD)
-///
-/// // Step 1: Substitute range with symbolic var
-/// // x[idx0 where idx0 ∈ [0,9]]
-///
-/// // Step 2: Symbolic simplification detects no dependency on idx0
-/// // x (constant w.r.t. idx0)
-///
-/// // Step 3: Verify no ranges remain - SUCCESS
-///
-/// // Step 4: Substitute back (no idx0 to substitute)
-/// // x
-///
-/// // Result: x (reduction eliminated!)
-/// ```
-///
-/// # Returns
-///
-/// - `Some(simplified)` if the reduction can be simplified by eliminating ranges
-/// - `None` if optimization doesn't apply (ranges remain after simplification)
-///
-/// Based on Tinygrad's reduce_collapse (tinygrad/codegen/simplify.py:63-68).
-#[allow(clippy::mutable_key_type)] // HashMap<UOpKey> has interior mutability
+/// Lift range-independent computations outside REDUCE via symbolic simplification.
+#[allow(clippy::mutable_key_type)]
 pub fn reduce_collapse(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
     use std::collections::{HashMap, HashSet};
 
@@ -229,7 +138,7 @@ pub fn reduce_collapse(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
     // Step 3: Apply symbolic simplification
     // This is where the magic happens - symbolic patterns eliminate range dependencies
     let matcher = crate::symbolic::symbolic_simple();
-    let simplified = crate::rewrite::graph_rewrite(&matcher, substituted);
+    let simplified = crate::rewrite::graph_rewrite(&matcher, substituted, &mut ());
 
     // Step 4: Verify range dependencies eliminated
     // Check if simplified expression still depends on any of the DEFINE_VARs we created
@@ -261,15 +170,7 @@ pub fn reduce_collapse(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
     Some(result)
 }
 
-/// Cast a value to a specific dtype, with broadcasting if needed.
-///
-/// For vector types, casts to scalar type and creates a vector with repeated elements.
-/// For scalar types, just casts to the target dtype.
-///
-/// Equivalent to Tinygrad's:
-/// ```python
-/// val.cast(target.dtype.scalar()).broadcast(target.dtype.count)
-/// ```
+/// Cast value to dtype, with broadcasting for vector types.
 fn cast_to_dtype(value: &Rc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Rc<UOp>> {
     use morok_dtype::DType;
 

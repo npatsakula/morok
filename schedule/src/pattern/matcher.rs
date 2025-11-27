@@ -35,21 +35,35 @@ pub enum RewriteResult {
     Gate(Rc<UOp>),
 }
 
-/// Rewrite function type (optimized).
+/// Rewrite function type - generic over context type.
 ///
-/// Takes the variable bindings from a successful pattern match and the
-/// variable interning table, and returns a RewriteResult indicating
-/// whether the rewrite should be applied.
+/// Takes the variable bindings from a successful pattern match, the
+/// variable interning table, and a mutable reference to the context,
+/// returning a RewriteResult indicating whether the rewrite should be applied.
 ///
 /// The BindingStore provides O(1) indexed access to bindings, avoiding
 /// string hashing overhead during pattern matching hot paths.
-pub type RewriteFn = Box<dyn Fn(&BindingStore, &VarIntern) -> RewriteResult>;
-
-/// Legacy rewrite function type for backward compatibility.
 ///
-/// Takes a HashMap of variable bindings. This type is provided for
-/// gradual migration - new code should use `RewriteFn` instead.
-pub type LegacyRewriteFn = Box<dyn Fn(&HashMap<String, Rc<UOp>>) -> RewriteResult>;
+/// Context is passed from `graph_rewrite()` through the rewrite engine
+/// to each pattern handler. Patterns that need state mutation or external
+/// information receive it through the context parameter. Patterns that
+/// don't need context simply ignore the `_ctx` parameter.
+///
+/// # Example
+///
+/// ```ignore
+/// // Pattern that uses context
+/// fn debuf(b: &BindingStore, i: &VarIntern, ctx: &mut KernelContext) -> RewriteResult {
+///     let id = ctx.next_global();  // Direct mutable access
+///     // ...
+/// }
+///
+/// // Pattern that ignores context
+/// fn add_zero<C>(b: &BindingStore, i: &VarIntern, _ctx: &mut C) -> RewriteResult {
+///     // Don't use _ctx
+/// }
+/// ```
+pub type RewriteFn<C> = Box<dyn Fn(&BindingStore, &VarIntern, &mut C) -> RewriteResult>;
 
 /// Fast rewrite for common patterns that avoids closure overhead.
 ///
@@ -58,7 +72,7 @@ pub type LegacyRewriteFn = Box<dyn Fn(&HashMap<String, Rc<UOp>>) -> RewriteResul
 ///
 /// Note: This enum doesn't derive Clone because `RewriteFn` (boxed closures)
 /// can't be cloned. For cloning support, use the specific variants.
-pub enum FastRewrite {
+pub enum FastRewrite<C> {
     /// Return a bound variable unchanged: `x + 0 ~> x`
     /// The string is the variable name to look up in VarIntern at runtime.
     ReturnBinding(String),
@@ -72,20 +86,20 @@ pub enum FastRewrite {
     },
 
     /// Fallback to closure for complex rewrites
-    Closure(RewriteFn),
+    Closure(RewriteFn<C>),
 }
 
-impl FastRewrite {
-    /// Apply this rewrite given bindings and variable interning.
-    pub fn apply(&self, bindings: &BindingStore, intern: &VarIntern) -> RewriteResult {
+impl<C> FastRewrite<C> {
+    /// Apply this rewrite given bindings, variable interning, and context.
+    pub fn apply(&self, bindings: &BindingStore, intern: &VarIntern, ctx: &mut C) -> RewriteResult {
         use super::upat::BindingStoreExt;
 
         match self {
             FastRewrite::ReturnBinding(var_name) => {
-                if let Some(idx) = intern.get_index(var_name) {
-                    if let Some(uop) = bindings.get_by_index(idx) {
-                        return RewriteResult::Rewritten(uop.clone());
-                    }
+                if let Some(idx) = intern.get_index(var_name)
+                    && let Some(uop) = bindings.get_by_index(idx)
+                {
+                    return RewriteResult::Rewritten(uop.clone());
                 }
                 RewriteResult::NoMatch
             }
@@ -94,17 +108,16 @@ impl FastRewrite {
                 let var_idx = intern.get_index(var);
                 let compare_idx = intern.get_index(compare);
 
-                if let (Some(vi), Some(ci)) = (var_idx, compare_idx) {
-                    if let (Some(var_uop), Some(cmp_uop)) = (bindings.get_by_index(vi), bindings.get_by_index(ci)) {
-                        if Rc::ptr_eq(var_uop, cmp_uop) {
-                            return RewriteResult::Rewritten(var_uop.clone());
-                        }
-                    }
+                if let (Some(vi), Some(ci)) = (var_idx, compare_idx)
+                    && let (Some(var_uop), Some(cmp_uop)) = (bindings.get_by_index(vi), bindings.get_by_index(ci))
+                    && Rc::ptr_eq(var_uop, cmp_uop)
+                {
+                    return RewriteResult::Rewritten(var_uop.clone());
                 }
                 RewriteResult::NoMatch
             }
 
-            FastRewrite::Closure(f) => f(bindings, intern),
+            FastRewrite::Closure(f) => f(bindings, intern, ctx),
         }
     }
 }
@@ -391,10 +404,41 @@ impl OpKey {
 
 /// Pattern matcher that applies rewrite rules to UOps.
 ///
+/// Generic over context type `C`, enabling compile-time type-safe context
+/// passing without `Rc<RefCell<>>` or `dyn Any` downcasting. Default context
+/// is `()` for patterns that don't need external state.
+///
 /// Follows Tinygrad's pdict design:
 /// - Patterns are indexed by the specific operations they match
 /// - Wildcard patterns (match any op) are stored separately
 /// - When rewriting, we check indexed patterns first, then wildcards
+///
+/// # Context Passing
+///
+/// Context is passed at rewrite-time through `graph_rewrite()`, not captured
+/// in closures. This enables patterns to be simple functions:
+///
+/// ```ignore
+/// // Pattern that uses context
+/// fn debuf(b: &BindingStore, i: &VarIntern, ctx: &mut KernelContext) -> RewriteResult {
+///     let id = ctx.next_global();  // Direct mutable access
+///     // ...
+/// }
+///
+/// // Pattern that ignores context
+/// fn add_zero<C>(b: &BindingStore, _: &VarIntern, _ctx: &mut C) -> RewriteResult {
+///     // Don't use _ctx
+/// }
+/// ```
+///
+/// # Composition
+///
+/// Matchers with the same context type can be combined:
+/// ```ignore
+/// let pm1: PatternMatcher<KernelContext> = ...;
+/// let pm2: PatternMatcher<KernelContext> = ...;
+/// let combined = pm1 + pm2;  // OK: same context type
+/// ```
 ///
 /// # Example
 ///
@@ -408,7 +452,7 @@ impl OpKey {
 ///         UPat::var("x"),
 ///         UPat::cvar("zero"),
 ///     ]),
-///     Box::new(|bindings| {
+///     Box::new(|bindings, intern, _ctx: &mut ()| {
 ///         let zero = bindings.get("zero")?;
 ///         if let Op::Const(cv) = zero.op() {
 ///             if cv.0 == ConstValue::Int(0) {
@@ -419,12 +463,12 @@ impl OpKey {
 ///     }),
 /// )];
 ///
-/// let matcher = PatternMatcher::new(patterns);
+/// let matcher: PatternMatcher<()> = PatternMatcher::new(patterns);
 /// ```
-pub struct PatternMatcher {
+pub struct PatternMatcher<C = ()> {
     /// All patterns with their rewrite functions and variable interning tables.
     /// Each pattern has its own VarIntern for efficient binding lookup.
-    patterns: Vec<(UPat, VarIntern, RewriteFn)>,
+    patterns: Vec<(UPat, VarIntern, RewriteFn<C>)>,
 
     /// Pattern dictionary: maps operation keys to pattern indices.
     /// This is the main optimization - we only try patterns that can match.
@@ -439,7 +483,7 @@ pub struct PatternMatcher {
     single_solution: Vec<bool>,
 }
 
-impl PatternMatcher {
+impl<C> PatternMatcher<C> {
     /// Create an empty PatternMatcher.
     pub fn empty() -> Self {
         Self {
@@ -458,13 +502,13 @@ impl PatternMatcher {
     /// Each pattern's variable names are interned once during construction for
     /// efficient binding lookup during matching. Single-solution patterns are
     /// detected to enable a faster matching path.
-    pub fn new(patterns: Vec<(UPat, RewriteFn)>) -> Self {
+    pub fn new(patterns: Vec<(UPat, RewriteFn<C>)>) -> Self {
         let mut pdict: HashMap<OpKey, Vec<usize>> = HashMap::new();
         let mut wildcard_indices = Vec::new();
         let mut single_solution = Vec::with_capacity(patterns.len());
 
         // Build pattern dictionary and intern variable names
-        let patterns_with_intern: Vec<(UPat, VarIntern, RewriteFn)> = patterns
+        let patterns_with_intern: Vec<(UPat, VarIntern, RewriteFn<C>)> = patterns
             .into_iter()
             .enumerate()
             .map(|(idx, (pattern, rewrite_fn))| {
@@ -524,6 +568,9 @@ impl PatternMatcher {
 
     /// Try to rewrite a UOp using the patterns in this matcher.
     ///
+    /// Takes a mutable reference to the context, which is passed through to
+    /// pattern rewrite functions. Patterns that don't need context ignore it.
+    ///
     /// Returns the result of the rewrite attempt:
     /// - NoMatch: No pattern matched or all rewrite functions declined
     /// - Rewritten(uop): A pattern matched and returned a replacement
@@ -534,7 +581,7 @@ impl PatternMatcher {
     /// 2. Wildcard patterns (match any op)
     ///
     /// For single-solution patterns, uses `match_first()` which avoids Vec allocation.
-    pub fn rewrite(&self, uop: &Rc<UOp>) -> RewriteResult {
+    pub fn rewrite(&self, uop: &Rc<UOp>, ctx: &mut C) -> RewriteResult {
         let op_key = OpKey::from_op(uop.op());
 
         // Chain indexed patterns with wildcards - no Vec allocation
@@ -548,7 +595,7 @@ impl PatternMatcher {
             // Use fast path for single-solution patterns (no Vec allocation)
             if self.single_solution[*idx] {
                 if let Some(bindings) = pattern.match_first(uop, intern) {
-                    match rewrite_fn(&bindings, intern) {
+                    match rewrite_fn(&bindings, intern, ctx) {
                         RewriteResult::NoMatch => continue,
                         result @ (RewriteResult::Rewritten(_) | RewriteResult::Gate(_)) => {
                             return result;
@@ -559,7 +606,7 @@ impl PatternMatcher {
                 // Multi-solution pattern: need to try all matches
                 let matches = pattern.match_uop_fast(uop, intern);
                 for bindings in matches {
-                    match rewrite_fn(&bindings, intern) {
+                    match rewrite_fn(&bindings, intern, ctx) {
                         RewriteResult::NoMatch => continue,
                         result @ (RewriteResult::Rewritten(_) | RewriteResult::Gate(_)) => {
                             return result;
@@ -575,12 +622,12 @@ impl PatternMatcher {
     /// Get access to the patterns (for composition).
     ///
     /// Returns patterns with their VarIntern tables stripped (tuple of pattern and rewrite fn).
-    pub fn into_patterns(self) -> Vec<(UPat, RewriteFn)> {
+    pub fn into_patterns(self) -> Vec<(UPat, RewriteFn<C>)> {
         self.patterns.into_iter().map(|(pat, _intern, f)| (pat, f)).collect()
     }
 
     /// Get access to the patterns with their interning tables (for composition).
-    pub fn into_patterns_with_intern(self) -> Vec<(UPat, VarIntern, RewriteFn)> {
+    pub fn into_patterns_with_intern(self) -> Vec<(UPat, VarIntern, RewriteFn<C>)> {
         self.patterns
     }
 
@@ -588,7 +635,7 @@ impl PatternMatcher {
     ///
     /// This is more efficient than `new()` for combining matchers since it
     /// avoids re-computing the variable interning.
-    pub fn from_patterns_with_intern(patterns: Vec<(UPat, VarIntern, RewriteFn)>) -> Self {
+    pub fn from_patterns_with_intern(patterns: Vec<(UPat, VarIntern, RewriteFn<C>)>) -> Self {
         let mut pdict: HashMap<OpKey, Vec<usize>> = HashMap::new();
         let mut wildcard_indices = Vec::new();
         let mut single_solution = Vec::with_capacity(patterns.len());
@@ -615,19 +662,27 @@ impl PatternMatcher {
 
 // ===== Pattern Matcher Composition =====
 
-impl std::ops::Add for PatternMatcher {
-    type Output = PatternMatcher;
+impl<C> std::ops::Add for PatternMatcher<C> {
+    type Output = PatternMatcher<C>;
 
-    /// Combine two PatternMatchers.
+    /// Combine two PatternMatchers with the same context type.
     ///
     /// Patterns from `self` are tried first, then patterns from `rhs`.
     /// This allows composing pattern matchers like Tinygrad's `pm1 + pm2`.
     ///
+    /// Only matchers with the same context type `C` can be combined - this
+    /// is enforced at compile time.
+    ///
     /// # Example
     /// ```ignore
-    /// let combined = reduce_unparented() + reduce_collapse() + symbolic();
+    /// let pm1: PatternMatcher<KernelContext> = ...;
+    /// let pm2: PatternMatcher<KernelContext> = ...;
+    /// let combined = pm1 + pm2;  // OK: same context type
+    ///
+    /// let pm3: PatternMatcher<()> = ...;
+    /// let bad = pm1 + pm3;  // Error: mismatched context types
     /// ```
-    fn add(self, rhs: PatternMatcher) -> PatternMatcher {
+    fn add(self, rhs: PatternMatcher<C>) -> PatternMatcher<C> {
         let mut patterns = self.patterns;
         patterns.extend(rhs.patterns);
         // Use from_patterns_with_intern to avoid re-computing VarIntern

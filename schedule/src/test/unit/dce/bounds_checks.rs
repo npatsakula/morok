@@ -17,7 +17,7 @@ fn test_lt_always_true() {
     let check = UOp::new(Op::Binary(BinaryOp::Lt, idx, size), DType::Bool);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, check);
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant true
     match result.op() {
@@ -35,7 +35,7 @@ fn test_lt_always_false() {
     let check = UOp::new(Op::Binary(BinaryOp::Lt, idx, size), DType::Bool);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, check);
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant false
     match result.op() {
@@ -53,7 +53,7 @@ fn test_lt_unknown() {
     let check = UOp::new(Op::Binary(BinaryOp::Lt, idx.clone(), size.clone()), DType::Bool);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, check);
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should not be constant
     match result.op() {
@@ -72,7 +72,7 @@ fn test_eq_same_var() {
     let check = UOp::new(Op::Binary(BinaryOp::Eq, x.clone(), x.clone()), DType::Bool);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, check);
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant true
     match result.op() {
@@ -90,7 +90,7 @@ fn test_eq_non_overlapping_ranges() {
     let check = UOp::new(Op::Binary(BinaryOp::Eq, x, y), DType::Bool);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, check);
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant false
     match result.op() {
@@ -107,7 +107,7 @@ fn test_eq_same_constant() {
     let check = UOp::new(Op::Binary(BinaryOp::Eq, x, y), DType::Bool);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, check);
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant true
     match result.op() {
@@ -123,7 +123,7 @@ fn test_ne_same_var() {
     let check = UOp::new(Op::Binary(BinaryOp::Ne, x.clone(), x.clone()), DType::Bool);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, check);
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant false
     match result.op() {
@@ -141,7 +141,7 @@ fn test_ne_non_overlapping_ranges() {
     let check = UOp::new(Op::Binary(BinaryOp::Ne, x, y), DType::Bool);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, check);
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant true
     match result.op() {
@@ -165,7 +165,7 @@ fn test_cascading_bounds_elimination() {
     let where_op = UOp::new(Op::Ternary(TernaryOp::Where, bounds_check, safe_val.clone(), error_val), DType::Int32);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op);
+    let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // Should eliminate to safe_val
     assert!(Rc::ptr_eq(&result, &safe_val));

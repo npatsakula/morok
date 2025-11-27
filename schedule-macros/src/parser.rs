@@ -13,8 +13,17 @@ use syn::{
 };
 
 /// A list of pattern items (rules or for-blocks).
+///
+/// Optionally declares a context type with `@context Type;` at the start.
+/// When a context type is declared:
+/// - Generated `PatternMatcher<ContextType>` instead of `PatternMatcher<()>`
+/// - Pattern closures receive `ctx: &mut ContextType`
+/// - `ctx` is available in RHS expressions
 #[derive(Debug)]
 pub struct PatternList {
+    /// Optional context type declaration (e.g., `@context KernelContext;`)
+    pub context_type: Option<syn::Type>,
+    /// Pattern items
     pub items: Vec<PatternItem>,
 }
 
@@ -60,6 +69,37 @@ pub enum ArrowKind {
 
 impl Parse for PatternList {
     fn parse(input: ParseStream) -> Result<Self> {
+        // Check for optional @context declaration at the start
+        let context_type = if input.peek(Token![@]) {
+            let fork = input.fork();
+            fork.parse::<Token![@]>()?;
+
+            // Check if next is "context" keyword
+            if fork.peek(Ident::peek_any) {
+                let maybe_context: Ident = Ident::parse_any(&fork)?;
+                if maybe_context == "context" {
+                    // This is a context declaration - consume from real stream
+                    input.parse::<Token![@]>()?;
+                    let _: Ident = Ident::parse_any(input)?; // "context"
+
+                    // Parse the type
+                    let ty: syn::Type = input.parse()?;
+
+                    // Expect semicolon
+                    input.parse::<Token![;]>()?;
+
+                    Some(ty)
+                } else {
+                    // Not a context declaration - probably @zero or similar
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mut items = Vec::new();
 
         while !input.is_empty() {
@@ -76,7 +116,7 @@ impl Parse for PatternList {
             }
         }
 
-        Ok(PatternList { items })
+        Ok(PatternList { context_type, items })
     }
 }
 
@@ -189,7 +229,7 @@ fn parse_guard_expr(input: ParseStream) -> Result<syn::Expr> {
 }
 
 /// A pattern in the LHS of a rule.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Pattern {
     /// Wildcard: `_`
     Wildcard,
@@ -208,10 +248,14 @@ pub enum Pattern {
     /// Constant with value extraction: `name@const(value_name)`
     /// Binds both the UOp (to uop_name) and the extracted ConstValue (to value_name)
     ConstWithValue { uop_name: Ident, value_name: Ident },
+    /// Alternative patterns: `pat1 | pat2 | pat3` - matches if ANY alternative matches
+    Any(Vec<Pattern>),
+    /// Permutation pattern: `Add[x, y]` - tries all orderings of arguments
+    OpPermute { op: Ident, args: Vec<Pattern> },
 }
 
 /// A named field in a struct-style pattern.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct FieldPattern {
     pub name: Ident,
@@ -219,7 +263,7 @@ pub struct FieldPattern {
 }
 
 /// Constant pattern variants.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ConstPattern {
     /// Any constant: `Const(_)` or `@const`
     Any,
@@ -235,143 +279,241 @@ pub enum ConstPattern {
 
 impl Parse for Pattern {
     fn parse(input: ParseStream) -> Result<Self> {
-        // Check for wildcard
-        if input.peek(Token![_]) {
-            input.parse::<Token![_]>()?;
-            return Ok(Pattern::Wildcard);
-        }
+        // Parse single pattern first, then check for alternatives
+        let first = parse_single_pattern(input)?;
 
-        // Check for special constant syntax: @zero, @one, @const
-        if input.peek(Token![@]) {
-            input.parse::<Token![@]>()?;
-            // Use parse_any to allow keywords like `const`
-            let ident: Ident = Ident::parse_any(input)?;
-            return match ident.to_string().as_str() {
-                "zero" => Ok(Pattern::Const(ConstPattern::Zero)),
-                "one" => Ok(Pattern::Const(ConstPattern::One)),
-                "const" => Ok(Pattern::Const(ConstPattern::Any)),
-                other => Err(syn::Error::new_spanned(
-                    ident,
-                    format!("Unknown special constant '@{}'. Use @zero, @one, or @const", other),
-                )),
-            };
-        }
-
-        // Parse identifier
-        let ident: Ident = input.parse()?;
-
-        // Check for name@const(value) or name @ pattern
-        if input.peek(Token![@]) {
-            // Use lookahead to check for @const(value) syntax
-            let lookahead = input.fork();
-            lookahead.parse::<Token![@]>()?;
-
-            // Check if next is "const" keyword followed by parentheses
-            if lookahead.peek(Ident::peek_any) {
-                let maybe_const: Ident = Ident::parse_any(&lookahead)?;
-                if maybe_const == "const" && lookahead.peek(token::Paren) {
-                    // Consume @ and const from real stream
-                    input.parse::<Token![@]>()?;
-                    let _: Ident = Ident::parse_any(input)?; // "const"
-
-                    // Parse (value_name)
-                    let content;
-                    parenthesized!(content in input);
-                    let value_name: Ident = content.parse()?;
-
-                    return Ok(Pattern::ConstWithValue { uop_name: ident, value_name });
-                }
+        // Check for pipe operator to build alternatives
+        if input.peek(Token![|]) {
+            let mut alternatives = vec![first];
+            while input.peek(Token![|]) {
+                input.parse::<Token![|]>()?;
+                alternatives.push(parse_single_pattern(input)?);
             }
-
-            // Fall through to regular binding pattern: `name @ pattern`
-            input.parse::<Token![@]>()?;
-            let pattern = input.parse()?;
-            return Ok(Pattern::Binding { name: ident, pattern: Box::new(pattern) });
+            return Ok(Pattern::Any(alternatives));
         }
 
-        // Check for operation pattern with tuple args: `Op(args)` or `op(args)` (iteration variable)
-        if input.peek(token::Paren) {
+        Ok(first)
+    }
+}
+
+/// Parse a single pattern (without checking for alternatives).
+fn parse_single_pattern(input: ParseStream) -> Result<Pattern> {
+    // Check for parenthesized group: `(pattern)` or `(pat1 | pat2)`
+    if input.peek(token::Paren) {
+        // Fork to check if this is an operation-name-alternatives pattern: (Add | Mul)(args)
+        let fork = input.fork();
+        let content;
+        parenthesized!(content in fork);
+
+        // Check if this is just identifiers separated by pipes followed by tuple args
+        if is_op_alternatives(&content) && fork.peek(token::Paren) {
+            // Parse: (Add | Mul)(args)
             let content;
             parenthesized!(content in input);
+            let ops = parse_op_alternatives(&content)?;
 
-            // Special case for Const
-            if ident == "Const" {
-                return parse_const_pattern(&content);
-            }
+            // Now parse the args
+            let args_content;
+            parenthesized!(args_content in input);
+            let (args, rest) = parse_pattern_args(&args_content)?;
 
-            // Parse args, but handle trailing `..` for variable-arity ops
-            let mut args = Vec::new();
-            let mut rest = false;
+            // Build alternatives for each op
+            let alternatives: Vec<Pattern> =
+                ops.into_iter().map(|op| Pattern::OpTuple { op, args: args.clone(), rest }).collect();
 
-            while !content.is_empty() {
-                // Check for `..` (rest pattern)
-                if content.peek(Token![..]) {
-                    content.parse::<Token![..]>()?;
-                    rest = true;
-                    break;
-                }
-
-                // Parse pattern
-                args.push(content.parse()?);
-
-                // Handle comma
-                if content.peek(Token![,]) {
-                    content.parse::<Token![,]>()?;
-                }
-            }
-
-            // If the identifier starts with lowercase, treat as operation variable
-            // (Real op names like Add, Mul start with uppercase)
-            let is_lowercase = ident.to_string().chars().next().is_some_and(|c| c.is_lowercase());
-
-            if is_lowercase {
-                return Ok(Pattern::OpVar { var_name: ident, args });
-            }
-
-            return Ok(Pattern::OpTuple { op: ident, args, rest });
+            return Ok(Pattern::Any(alternatives));
         }
 
-        // Check for operation pattern with struct fields: `Op { fields }`
-        if input.peek(token::Brace) {
-            let content;
-            braced!(content in input);
-
-            let mut fields = Vec::new();
-            let mut rest = false;
-
-            while !content.is_empty() {
-                // Check for `..`
-                if content.peek(Token![..]) {
-                    content.parse::<Token![..]>()?;
-                    rest = true;
-                    break;
-                }
-
-                // Parse field: `name: pattern` or just `name`
-                let field_name: Ident = content.parse()?;
-
-                let pattern = if content.peek(Token![:]) {
-                    content.parse::<Token![:]>()?;
-                    content.parse()?
-                } else {
-                    // Shorthand: `name` means `name: name`
-                    Pattern::Var(field_name.clone())
-                };
-
-                fields.push(FieldPattern { name: field_name, pattern });
-
-                // Allow trailing comma
-                if content.peek(Token![,]) {
-                    content.parse::<Token![,]>()?;
-                }
-            }
-
-            return Ok(Pattern::OpStruct { op: ident, fields, rest });
-        }
-
-        // Just a variable
-        Ok(Pattern::Var(ident))
+        // Regular grouped pattern: (pattern) or (pat1 | pat2)
+        let content;
+        parenthesized!(content in input);
+        return content.parse();
     }
+
+    // Check for wildcard
+    if input.peek(Token![_]) {
+        input.parse::<Token![_]>()?;
+        return Ok(Pattern::Wildcard);
+    }
+
+    // Check for special constant syntax: @zero, @one, @const
+    if input.peek(Token![@]) {
+        input.parse::<Token![@]>()?;
+        // Use parse_any to allow keywords like `const`
+        let ident: Ident = Ident::parse_any(input)?;
+        return match ident.to_string().as_str() {
+            "zero" => Ok(Pattern::Const(ConstPattern::Zero)),
+            "one" => Ok(Pattern::Const(ConstPattern::One)),
+            "const" => Ok(Pattern::Const(ConstPattern::Any)),
+            other => Err(syn::Error::new_spanned(
+                ident,
+                format!("Unknown special constant '@{}'. Use @zero, @one, or @const", other),
+            )),
+        };
+    }
+
+    // Parse identifier
+    let ident: Ident = input.parse()?;
+
+    // Check for name@const(value) or name @ pattern
+    if input.peek(Token![@]) {
+        // Use lookahead to check for @const(value) syntax
+        let lookahead = input.fork();
+        lookahead.parse::<Token![@]>()?;
+
+        // Check if next is "const" keyword followed by parentheses
+        if lookahead.peek(Ident::peek_any) {
+            let maybe_const: Ident = Ident::parse_any(&lookahead)?;
+            if maybe_const == "const" && lookahead.peek(token::Paren) {
+                // Consume @ and const from real stream
+                input.parse::<Token![@]>()?;
+                let _: Ident = Ident::parse_any(input)?; // "const"
+
+                // Parse (value_name)
+                let content;
+                parenthesized!(content in input);
+                let value_name: Ident = content.parse()?;
+
+                return Ok(Pattern::ConstWithValue { uop_name: ident, value_name });
+            }
+        }
+
+        // Fall through to regular binding pattern: `name @ pattern`
+        input.parse::<Token![@]>()?;
+        let pattern = parse_single_pattern(input)?;
+        return Ok(Pattern::Binding { name: ident, pattern: Box::new(pattern) });
+    }
+
+    // Check for permutation pattern: `Op[args]`
+    if input.peek(token::Bracket) {
+        let content;
+        bracketed!(content in input);
+
+        let (args, _rest) = parse_pattern_args(&content)?;
+        return Ok(Pattern::OpPermute { op: ident, args });
+    }
+
+    // Check for operation pattern with tuple args: `Op(args)` or `op(args)` (iteration variable)
+    if input.peek(token::Paren) {
+        let content;
+        parenthesized!(content in input);
+
+        // Special case for Const
+        if ident == "Const" {
+            return parse_const_pattern(&content);
+        }
+
+        let (args, rest) = parse_pattern_args(&content)?;
+
+        // If the identifier starts with lowercase, treat as operation variable
+        // (Real op names like Add, Mul start with uppercase)
+        let is_lowercase = ident.to_string().chars().next().is_some_and(|c| c.is_lowercase());
+
+        if is_lowercase {
+            return Ok(Pattern::OpVar { var_name: ident, args });
+        }
+
+        return Ok(Pattern::OpTuple { op: ident, args, rest });
+    }
+
+    // Check for operation pattern with struct fields: `Op { fields }`
+    if input.peek(token::Brace) {
+        let content;
+        braced!(content in input);
+
+        let mut fields = Vec::new();
+        let mut rest = false;
+
+        while !content.is_empty() {
+            // Check for `..`
+            if content.peek(Token![..]) {
+                content.parse::<Token![..]>()?;
+                rest = true;
+                break;
+            }
+
+            // Parse field: `name: pattern` or just `name`
+            let field_name: Ident = content.parse()?;
+
+            let pattern = if content.peek(Token![:]) {
+                content.parse::<Token![:]>()?;
+                content.parse()?
+            } else {
+                // Shorthand: `name` means `name: name`
+                Pattern::Var(field_name.clone())
+            };
+
+            fields.push(FieldPattern { name: field_name, pattern });
+
+            // Allow trailing comma
+            if content.peek(Token![,]) {
+                content.parse::<Token![,]>()?;
+            }
+        }
+
+        return Ok(Pattern::OpStruct { op: ident, fields, rest });
+    }
+
+    // Just a variable
+    Ok(Pattern::Var(ident))
+}
+
+/// Parse pattern arguments from a parenthesized or bracketed group.
+fn parse_pattern_args(content: ParseStream) -> Result<(Vec<Pattern>, bool)> {
+    let mut args = Vec::new();
+    let mut rest = false;
+
+    while !content.is_empty() {
+        // Check for `..` (rest pattern)
+        if content.peek(Token![..]) {
+            content.parse::<Token![..]>()?;
+            rest = true;
+            break;
+        }
+
+        // Parse pattern
+        args.push(content.parse()?);
+
+        // Handle comma
+        if content.peek(Token![,]) {
+            content.parse::<Token![,]>()?;
+        }
+    }
+
+    Ok((args, rest))
+}
+
+/// Check if content contains only identifiers separated by pipes (for op alternatives).
+fn is_op_alternatives(content: ParseStream) -> bool {
+    let fork = content.fork();
+
+    // Must start with an identifier
+    if fork.parse::<Ident>().is_err() {
+        return false;
+    }
+
+    // Check for pattern: (Ident (| Ident)*)
+    while fork.peek(Token![|]) {
+        if fork.parse::<Token![|]>().is_err() {
+            return false;
+        }
+        if fork.parse::<Ident>().is_err() {
+            return false;
+        }
+    }
+
+    // Must be fully consumed
+    fork.is_empty()
+}
+
+/// Parse operation alternatives: `Add | Mul | Sub`
+fn parse_op_alternatives(content: ParseStream) -> Result<Vec<Ident>> {
+    let mut ops = vec![content.parse::<Ident>()?];
+    while content.peek(Token![|]) {
+        content.parse::<Token![|]>()?;
+        ops.push(content.parse::<Ident>()?);
+    }
+    Ok(ops)
 }
 
 fn parse_const_pattern(input: ParseStream) -> Result<Pattern> {

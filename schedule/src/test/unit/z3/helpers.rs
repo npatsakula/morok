@@ -16,7 +16,7 @@ use crate::z3::verify::verify_equivalence;
 /// 3. Returns the simplified expression for further assertions
 pub fn verify_simplifies_to(expr: Rc<UOp>, expected: Rc<UOp>) -> Rc<UOp> {
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Verify semantic equivalence
     verify_equivalence(&expr, &simplified).expect("Simplification should preserve semantics");
@@ -33,7 +33,7 @@ pub fn verify_simplifies_to(expr: Rc<UOp>, expected: Rc<UOp>) -> Rc<UOp> {
 /// Verify that simplification preserves semantics (even if structure changes).
 pub fn verify_preserves_semantics(expr: Rc<UOp>) -> Rc<UOp> {
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     verify_equivalence(&expr, &simplified).expect("Simplification should preserve semantics");
 

@@ -30,7 +30,7 @@ fn test_remove_bufferize_cheap_unary() {
     let bufferized = create_bufferize(neg.clone(), vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized);
+    let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return the cheap operation
     assert!(Rc::ptr_eq(&result, &neg), "Cheap unary op should be inlined");
@@ -47,7 +47,7 @@ fn test_remove_bufferize_cheap_binary() {
     let bufferized = create_bufferize(add.clone(), vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized);
+    let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return the cheap operation
     assert!(Rc::ptr_eq(&result, &add), "Cheap binary op should be inlined");
@@ -63,7 +63,7 @@ fn test_remove_bufferize_cast() {
     let bufferized = create_bufferize(cast.clone(), vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized);
+    let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return the cast
     assert!(Rc::ptr_eq(&result, &cast), "CAST should be inlined");
@@ -84,7 +84,7 @@ fn test_keep_bufferize_expensive() {
     let bufferized = create_bufferize(reduce, vec![buf_range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized.clone());
+    let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
     // Should NOT remove BUFFERIZE (reduce is expensive)
     assert!(Rc::ptr_eq(&result, &bufferized), "REDUCE should remain buffered");
@@ -102,7 +102,7 @@ fn test_remove_bufferize_contiguous() {
     let bufferized = create_bufferize(contiguous.clone(), vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized);
+    let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return CONTIGUOUS
     assert!(Rc::ptr_eq(&result, &contiguous), "CONTIGUOUS shouldn't be buffered");
@@ -119,7 +119,7 @@ fn test_remove_bufferize_copy() {
     let bufferized = create_bufferize(copy.clone(), vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized);
+    let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return COPY
     assert!(Rc::ptr_eq(&result, &copy), "COPY shouldn't be buffered");
@@ -136,7 +136,7 @@ fn test_remove_bufferize_assign() {
     let bufferized = create_bufferize(assign.clone(), vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized);
+    let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return ASSIGN
     assert!(Rc::ptr_eq(&result, &assign), "ASSIGN shouldn't be buffered");
@@ -151,7 +151,7 @@ fn test_remove_bufferize_noop() {
     let bufferized = create_bufferize(noop.clone(), vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized);
+    let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return NOOP
     assert!(Rc::ptr_eq(&result, &noop), "NOOP shouldn't be buffered");
@@ -170,7 +170,7 @@ fn test_flatten_nested_bufferize() {
     let outer_buf = create_bufferize(inner_buf, vec![outer_range.clone()]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, outer_buf);
+    let result = graph_rewrite(&matcher, outer_buf, &mut ());
 
     // Should flatten to single BUFFERIZE with outer ranges
     if let Op::Bufferize { compute, ranges, .. } = result.op() {
@@ -193,7 +193,7 @@ fn test_nested_bufferize_multiple_ranges() {
     let outer_buf = create_bufferize(inner_buf, outer_ranges.clone());
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, outer_buf);
+    let result = graph_rewrite(&matcher, outer_buf, &mut ());
 
     // Should flatten to single BUFFERIZE with outer ranges
     if let Op::Bufferize { compute, ranges, .. } = result.op() {
@@ -224,7 +224,7 @@ fn test_multiple_cheap_ops_inline() {
 
     for op in test_ops {
         let bufferized = create_bufferize(op.clone(), vec![range.clone()]);
-        let result = graph_rewrite(&matcher, bufferized);
+        let result = graph_rewrite(&matcher, bufferized, &mut ());
         assert!(Rc::ptr_eq(&result, &op), "All cheap ops should inline");
     }
 }
@@ -239,7 +239,7 @@ fn test_no_removal_on_normal_buffer() {
     let bufferized = create_bufferize(x, vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized.clone());
+    let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
     // Might be the same or modified, but the key is it doesn't crash
     // and follows the expected cost-based logic

@@ -26,7 +26,7 @@ fn test_early_rewrites_detach_removal() {
     let x = UOp::const_(DType::Float32, ConstValue::Float(42.0));
     let detach = UOp::new(Op::Detach { src: x.clone() }, x.dtype());
 
-    let result = matcher.rewrite(&detach);
+    let result = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite DETACH");
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -42,7 +42,7 @@ fn test_early_rewrites_contiguous_backward_removal() {
     let x = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as _));
     let contiguous = UOp::new(Op::ContiguousBackward { src: x.clone() }, x.dtype());
 
-    let result = matcher.rewrite(&contiguous);
+    let result = matcher.rewrite(&contiguous, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite CONTIGUOUS_BACKWARD");
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -56,13 +56,13 @@ fn test_early_rewrites_no_match_for_other_ops() {
 
     // Test that non-DETACH/CONTIGUOUS_BACKWARD operations return NoMatch
     let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let result = matcher.rewrite(&const_op);
+    let result = matcher.rewrite(&const_op, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match CONST");
 
     let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
     let add = a.try_add_op(&b).unwrap();
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match Binary ops");
 }
 
@@ -75,7 +75,7 @@ fn test_early_rewrites_nested_detach() {
     let inner_detach = UOp::new(Op::Detach { src: x.clone() }, x.dtype());
     let outer_detach = UOp::new(Op::Detach { src: inner_detach.clone() }, x.dtype());
 
-    let result = matcher.rewrite(&outer_detach);
+    let result = matcher.rewrite(&outer_detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -97,7 +97,7 @@ fn test_buffer_folding_noop_bufferize() {
     let bufferize = UOp::bufferize(x.clone(), vec![range.clone()], BufferizeOpts::local());
     let index = UOp::index(bufferize, vec![range]).unwrap();
 
-    let result = matcher.rewrite(&index);
+    let result = matcher.rewrite(&index, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove noop BUFFERIZE");
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -115,7 +115,7 @@ fn test_buffer_folding_bufferize_const() {
     let range = UOp::range_axis(range_end, 0, AxisType::Loop);
     let bufferize = UOp::bufferize(const_val.clone(), vec![range], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize);
+    let result = matcher.rewrite(&bufferize, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove BUFFERIZE from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -133,7 +133,7 @@ fn test_buffer_folding_index_const() {
     let range = UOp::range_axis(range_end, 0, AxisType::Loop);
     let index = UOp::index(const_val.clone(), vec![range]).unwrap();
 
-    let result = matcher.rewrite(&index);
+    let result = matcher.rewrite(&index, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove INDEX from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -150,7 +150,7 @@ fn test_buffer_folding_copy_const() {
     let device = UOp::device(morok_ir::DeviceSpec::Cpu);
     let copy = UOp::new(Op::Copy { src: const_val.clone(), device }, const_val.dtype());
 
-    let result = matcher.rewrite(&copy);
+    let result = matcher.rewrite(&copy, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove COPY from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -173,7 +173,7 @@ fn test_buffer_folding_no_match_different_ranges() {
     let bufferize = UOp::bufferize(x, vec![range1], BufferizeOpts::local());
     let index = UOp::index(bufferize, vec![range2]).unwrap();
 
-    let result = matcher.rewrite(&index);
+    let result = matcher.rewrite(&index, &mut ());
     // This might match or not depending on implementation details,
     // but should NOT return the original compute 'x' directly
     match result {
@@ -199,7 +199,7 @@ fn test_dead_axis_removal_single_dead_axis() {
 
     let bufferize = UOp::bufferize(x.clone(), vec![dead_range], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize);
+    let result = matcher.rewrite(&bufferize, &mut ());
 
     // Should remove the dead axis and return compute directly
     match result {
@@ -231,7 +231,7 @@ fn test_dead_axis_removal_mixed_axes() {
 
     let bufferize = UOp::bufferize(x, vec![live_range.clone(), dead_range], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize);
+    let result = matcher.rewrite(&bufferize, &mut ());
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
@@ -261,7 +261,7 @@ fn test_dead_axis_removal_no_dead_axes() {
 
     let bufferize = UOp::bufferize(x, vec![range1, range2], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize);
+    let result = matcher.rewrite(&bufferize, &mut ());
 
     // Should not match since there are no dead axes
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match when no dead axes");
@@ -282,7 +282,7 @@ fn test_buffer_removal_cheap_compute() {
     let range = UOp::range_axis(range_end, 0, AxisType::Loop);
     let bufferize = UOp::bufferize(add.clone(), vec![range], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize);
+    let result = matcher.rewrite(&bufferize, &mut ());
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
@@ -306,7 +306,7 @@ fn test_buffer_removal_always_run_ops() {
     let range = UOp::range_axis(range_end, 0, AxisType::Loop);
     let bufferize = UOp::bufferize(contiguous.clone(), vec![range], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize);
+    let result = matcher.rewrite(&bufferize, &mut ());
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
@@ -334,7 +334,7 @@ fn test_buffer_removal_nested_bufferize() {
 
     let outer = UOp::bufferize(inner, vec![range2.clone()], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&outer);
+    let result = matcher.rewrite(&outer, &mut ());
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
@@ -365,7 +365,7 @@ fn test_buffer_removal_no_match_expensive_compute() {
     let range = UOp::range_axis(range_end, 0, AxisType::Loop);
     let bufferize = UOp::bufferize(load, vec![range], BufferizeOpts::local());
 
-    let result = matcher.rewrite(&bufferize);
+    let result = matcher.rewrite(&bufferize, &mut ());
 
     // Should not remove BUFFERIZE from expensive LOAD
     assert!(matches!(result, RewriteResult::NoMatch), "Should not remove BUFFERIZE from expensive op");
@@ -378,21 +378,10 @@ fn test_movement_op_removal_is_stub() {
     let matcher = patterns::movement_op_removal();
 
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let result = matcher.rewrite(&x);
+    let result = matcher.rewrite(&x, &mut ());
 
     // Should return NoMatch since it's a stub
     assert!(matches!(result, RewriteResult::NoMatch), "movement_op_removal is a stub");
-}
-
-#[test]
-fn test_kernel_splitting_is_stub() {
-    let matcher = patterns::kernel_splitting();
-
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let result = matcher.rewrite(&x);
-
-    // Should return NoMatch since it's a stub
-    assert!(matches!(result, RewriteResult::NoMatch), "kernel_splitting is a stub");
 }
 
 // ===== Integration Tests =====
@@ -408,7 +397,7 @@ fn test_pattern_composition() {
 
     // Then apply early_rewrites to remove DETACH
     let early = patterns::early_rewrites();
-    let result1 = early.rewrite(&detach);
+    let result1 = early.rewrite(&detach, &mut ());
     assert!(matches!(result1, RewriteResult::Rewritten(_)));
 
     let unwrapped = if let RewriteResult::Rewritten(r) = result1 {
@@ -424,7 +413,7 @@ fn test_pattern_composition() {
 
     // Apply buffer_folding to remove BUFFERIZE(CONST)
     let folding = patterns::buffer_folding();
-    let result2 = folding.rewrite(&bufferize);
+    let result2 = folding.rewrite(&bufferize, &mut ());
 
     match result2 {
         RewriteResult::Rewritten(rewritten) => {
@@ -446,12 +435,12 @@ fn test_idempotent_patterns() {
     let matcher = patterns::early_rewrites();
 
     // First application
-    let result1 = matcher.rewrite(&detach);
+    let result1 = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result1, RewriteResult::Rewritten(_)));
 
     let unwrapped = if let RewriteResult::Rewritten(r) = result1 { r } else { x.clone() };
 
     // Second application (should not match on CONST)
-    let result2 = matcher.rewrite(&unwrapped);
+    let result2 = matcher.rewrite(&unwrapped, &mut ());
     assert!(matches!(result2, RewriteResult::NoMatch), "Should not match on already-processed node");
 }

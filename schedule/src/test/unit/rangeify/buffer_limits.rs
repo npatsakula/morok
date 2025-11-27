@@ -88,7 +88,7 @@ fn count_bufferizes(uop: &Rc<UOp>) -> usize {
 /// Count the number of unique BUFFER/BUFFERIZE operations accessed by a computation.
 ///
 /// This replicates the buffer counting logic used by buffer_limit_patterns.
-#[allow(clippy::mutable_key_type)]
+#[allow(clippy::mutable_key_type, dead_code)]
 fn count_accessed_buffers(uop: &Rc<UOp>) -> usize {
     let mut buffers = Vec::new();
     let mut visited = HashSet::new();
@@ -139,7 +139,7 @@ fn test_metal_limit_at_threshold() {
     let (_, computation) = create_multi_buffer_computation(30, device.clone());
 
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, computation.clone());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
 
     // Should NOT materialize (30 <= 30, within limit)
     assert!(
@@ -158,7 +158,7 @@ fn test_metal_limit_exceeded() {
 
     let before_count = count_bufferizes(&computation);
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, computation.clone());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some operations
@@ -177,7 +177,7 @@ fn test_webgpu_limit_at_threshold() {
     let (_, computation) = create_multi_buffer_computation(7, device);
 
     let matcher = buffer_limit_patterns(8);
-    let result = graph_rewrite(&matcher, computation.clone());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
 
     // Should NOT materialize (7 <= 7, within limit)
     assert!(
@@ -196,7 +196,7 @@ fn test_webgpu_limit_exceeded() {
 
     let before_count = count_bufferizes(&computation);
     let matcher = buffer_limit_patterns(8);
-    let result = graph_rewrite(&matcher, computation.clone());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some operations
@@ -281,7 +281,7 @@ fn test_materialize_only_elementwise() {
 
     // The computation is a chain of ADD operations (elementwise)
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, computation);
+    let result = graph_rewrite(&matcher, computation, &mut ());
 
     // Should have created BUFFERIZE operations for elementwise ops
     let bufferize_count = count_bufferizes(&result);
@@ -301,7 +301,7 @@ fn test_output_buffer_accounting(num_buffers: usize, should_materialize: bool) {
 
     let before_count = count_bufferizes(&computation);
     let matcher = buffer_limit_patterns(31); // Metal limit
-    let result = graph_rewrite(&matcher, computation.clone());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
     let after_count = count_bufferizes(&result);
 
     if should_materialize {
@@ -361,7 +361,7 @@ fn test_no_double_materialization() {
 
     // Apply pattern (shouldn't double-materialize)
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite(&matcher, indexed_materialized);
+    let result = graph_rewrite(&matcher, indexed_materialized, &mut ());
 
     let after_count = count_bufferizes(&result);
     assert_eq!(before_count, after_count, "Should not double-materialize already-materialized operations");
@@ -412,7 +412,7 @@ fn test_multiple_binary_ops() {
     // Apply buffer limit (10 buffer limit)
     let before_count = count_bufferizes(&expr);
     let matcher = buffer_limit_patterns(10);
-    let result = graph_rewrite(&matcher, expr);
+    let result = graph_rewrite(&matcher, expr, &mut ());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some intermediate results
@@ -459,9 +459,32 @@ fn test_ternary_op_materialization() {
     // Apply buffer limit (10 buffer limit)
     let before_count = count_bufferizes(&where_op);
     let matcher = buffer_limit_patterns(10);
-    let result = graph_rewrite(&matcher, where_op);
+    let result = graph_rewrite(&matcher, where_op, &mut ());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some intermediate results
     assert!(after_count > before_count, "Should materialize intermediate results in ternary operations");
+}
+
+#[test]
+fn test_is_elementwise() {
+    use morok_dtype::DType;
+    use morok_ir::ConstValue;
+
+    // Binary operations are elementwise
+    let left = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let right = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let add = left.try_add_op(&right).unwrap();
+    assert!(is_elementwise(&add), "Binary ADD should be elementwise");
+
+    // Ternary operations are elementwise
+    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let true_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let false_val = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let where_op = UOp::where_op(cond, true_val, false_val).unwrap();
+    assert!(is_elementwise(&where_op), "Ternary WHERE should be elementwise");
+
+    // Constants are not elementwise
+    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    assert!(!is_elementwise(&const_op), "CONST should not be elementwise");
 }

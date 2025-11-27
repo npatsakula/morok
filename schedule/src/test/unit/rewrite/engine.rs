@@ -34,7 +34,7 @@ fn test_simple_rewrite() {
     let zero = const_uop(0);
     let add = binary_uop(BinaryOp::Add, five.clone(), zero);
 
-    let result = graph_rewrite(&matcher, add);
+    let result = graph_rewrite(&matcher, add, &mut ());
     assert!(Rc::ptr_eq(&result, &five));
 }
 
@@ -61,7 +61,7 @@ fn test_nested_rewrite() {
     let inner_add = binary_uop(BinaryOp::Add, five.clone(), zero.clone());
     let outer_add = binary_uop(BinaryOp::Add, inner_add, zero);
 
-    let result = graph_rewrite(&matcher, outer_add);
+    let result = graph_rewrite(&matcher, outer_add, &mut ());
     assert!(Rc::ptr_eq(&result, &five));
 }
 
@@ -88,7 +88,7 @@ fn test_fixed_point_iteration() {
     let inner_mul = binary_uop(BinaryOp::Mul, five.clone(), one.clone());
     let outer_mul = binary_uop(BinaryOp::Mul, inner_mul, one);
 
-    let result = graph_rewrite(&matcher, outer_mul);
+    let result = graph_rewrite(&matcher, outer_mul, &mut ());
     assert!(Rc::ptr_eq(&result, &five));
 }
 
@@ -127,7 +127,7 @@ fn test_multiple_patterns() {
     let add = binary_uop(BinaryOp::Add, five.clone(), zero);
     let mul = binary_uop(BinaryOp::Mul, add, one);
 
-    let result = graph_rewrite(&matcher, mul);
+    let result = graph_rewrite(&matcher, mul, &mut ());
     assert!(Rc::ptr_eq(&result, &five));
 }
 
@@ -153,7 +153,7 @@ fn test_no_rewrite() {
     let three = const_uop(3);
     let add = binary_uop(BinaryOp::Add, five, three);
 
-    let result = graph_rewrite(&matcher, add.clone());
+    let result = graph_rewrite(&matcher, add.clone(), &mut ());
     // Should return original (no rewrite)
     assert!(Rc::ptr_eq(&result, &add));
 }

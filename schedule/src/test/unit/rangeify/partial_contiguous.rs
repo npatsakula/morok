@@ -196,9 +196,8 @@ fn test_config_levels() {
 
 #[test]
 fn test_pattern_matcher_creation() {
-    // Test that pattern matcher can be created with different configs
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    // Test that pattern matcher can be created
+    let matcher = buffer_removal_with_pcontig();
 
     // Pattern matcher should be created successfully
     // (We can't inspect internal state, but we can verify it doesn't panic)
@@ -208,8 +207,8 @@ fn test_pattern_matcher_creation() {
 #[test]
 fn test_disabled_config_no_rewrite() {
     // When level=0, pattern should not match
-    let config = PcontigConfig { level: 0, ..Default::default() };
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig { level: 0, ..Default::default() };
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let (_buffer, range1, range2, compute) = create_simple_graph(&mut ctx);
@@ -219,7 +218,7 @@ fn test_disabled_config_no_rewrite() {
     let idx_buf = create_index_bufferize(compute, vec![range1.clone(), range2.clone()], vec![range1, range2], opts);
 
     // Apply rewrite - should not change anything
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // With level=0, no rewrite should occur
     assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite with level=0");
@@ -228,8 +227,8 @@ fn test_disabled_config_no_rewrite() {
 #[test]
 fn test_cheap_inline_removal() {
     // Test Pattern 1: cheap operations should be inlined
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     // Create BUFFERIZE(const, [range])
     let mut ctx = IndexingContext::new();
@@ -239,7 +238,7 @@ fn test_cheap_inline_removal() {
     let bufferized = UOp::bufferize(const_val.clone(), vec![range], opts);
 
     // Apply rewrite - should remove BUFFERIZE and return const
-    let rewritten = graph_rewrite(&matcher, bufferized);
+    let rewritten = graph_rewrite(&matcher, bufferized, &mut config);
 
     // Should inline the constant
     assert!(matches!(rewritten.op(), Op::Const(_)), "Expected const to be inlined");
@@ -248,8 +247,8 @@ fn test_cheap_inline_removal() {
 #[test]
 fn test_nested_bufferize_removal() {
     // Test Pattern 3: nested BUFFERIZE should be flattened
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
@@ -261,19 +260,19 @@ fn test_nested_bufferize_removal() {
     let outer = UOp::bufferize(inner, vec![range.clone()], opts);
 
     // Apply rewrite - should flatten to single BUFFERIZE or inline const
-    let rewritten = graph_rewrite(&matcher, outer);
+    let rewritten = graph_rewrite(&matcher, outer, &mut config);
 
     // After multiple rewrites, const should be fully inlined
     // (First rewrite removes nested bufferize, second inlines const)
-    let final_result = graph_rewrite(&matcher, rewritten);
+    let final_result = graph_rewrite(&matcher, rewritten, &mut config);
     assert!(matches!(final_result.op(), Op::Const(_)), "Expected const to be fully inlined");
 }
 
 #[test]
 fn test_simple_index_bufferize_pattern() {
     // Test that INDEX(BUFFERIZE) pattern is recognized
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let (_buffer, range1, range2, compute) = create_simple_graph(&mut ctx);
@@ -283,7 +282,7 @@ fn test_simple_index_bufferize_pattern() {
     let idx_buf = create_index_bufferize(compute, vec![range1.clone(), range2.clone()], vec![range1, range2], opts);
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Pattern should match, but exact behavior depends on heuristics
     // For now, just verify it doesn't panic
@@ -304,8 +303,8 @@ fn test_simple_index_bufferize_pattern() {
 #[test_case(4 ; "four buffers - above threshold should keep")]
 #[test_case(5 ; "five buffers - above threshold should keep")]
 fn test_accessed_buffers_threshold(num_buffers: usize) {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let (_buffers, ranges, compute) = create_multi_buffer_graph(&mut ctx, num_buffers);
@@ -315,7 +314,7 @@ fn test_accessed_buffers_threshold(num_buffers: usize) {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Verify behavior based on threshold
     let threshold = config.max_buffers_threshold;
@@ -340,8 +339,8 @@ fn test_accessed_buffers_threshold(num_buffers: usize) {
 /// If the same buffer is accessed multiple times, it should only be counted once.
 #[test]
 fn test_accessed_buffers_with_duplicates() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(100, DType::Float32, 1);
@@ -363,7 +362,7 @@ fn test_accessed_buffers_with_duplicates() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - should see this as 1 buffer accessed (not 3)
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
 
     // With only 1 unique buffer, should be eligible for optimization
     // (exact behavior depends on other heuristics, but shouldn't be blocked by accessed_buffers)
@@ -375,8 +374,8 @@ fn test_accessed_buffers_with_duplicates() {
 /// Buffers accessed in nested computations should all be counted.
 #[test]
 fn test_accessed_buffers_nested_computation() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let ranges = vec![ctx.new_range(&SInt::Const(10), AxisType::Loop), ctx.new_range(&SInt::Const(10), AxisType::Loop)];
@@ -401,7 +400,7 @@ fn test_accessed_buffers_nested_computation() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - with 4 buffers (> threshold of 3), should keep buffer
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite with 4 buffers in nested computation");
 }
@@ -415,8 +414,8 @@ fn test_accessed_buffers_nested_computation() {
 /// Buffers with low out/in ratio are memory-efficient and should be kept.
 #[test]
 fn test_out_in_ratio_efficient_buffer() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -432,7 +431,7 @@ fn test_out_in_ratio_efficient_buffer() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - efficient buffer should be kept
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // With ratio < 10, should keep buffer (no rewrite)
     assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite for efficient buffer (ratio 9.0 < 10.0)");
@@ -443,8 +442,8 @@ fn test_out_in_ratio_efficient_buffer() {
 /// Buffers at exactly the threshold (ratio = 10.0) test edge case behavior.
 #[test]
 fn test_out_in_ratio_at_threshold() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -459,7 +458,7 @@ fn test_out_in_ratio_at_threshold() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
 
     // At threshold, behavior is implementation-defined
     // Just verify it doesn't crash
@@ -471,8 +470,8 @@ fn test_out_in_ratio_at_threshold() {
 /// Buffers with high out/in ratio waste memory and should be optimized.
 #[test]
 fn test_out_in_ratio_wasteful_buffer() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -487,7 +486,7 @@ fn test_out_in_ratio_wasteful_buffer() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - wasteful buffer should be optimized
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // With ratio >> 10, may optimize (depends on other heuristics)
     // At minimum, verify it doesn't crash and doesn't prevent optimization
@@ -502,8 +501,8 @@ fn test_out_in_ratio_wasteful_buffer() {
 /// contiguous is beneficial for attention mechanisms.
 #[test]
 fn test_out_in_ratio_flash_attention_simulation() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -528,7 +527,7 @@ fn test_out_in_ratio_flash_attention_simulation() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - extreme ratio should be eligible for optimization
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
 
     // This tests that extremely high ratios are handled correctly
     // The actual optimization depends on other heuristics (buffer_in_reduce)
@@ -541,8 +540,8 @@ fn test_out_in_ratio_flash_attention_simulation() {
 /// and the heuristic should fall back to safe behavior (keep buffer).
 #[test]
 fn test_out_in_ratio_symbolic_sizes() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     // Create buffer with symbolic size via DEFINE_GLOBAL
     let n = UOp::define_global(1, DType::Index);
@@ -560,7 +559,7 @@ fn test_out_in_ratio_symbolic_sizes() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - with symbolic sizes, ratio is None, should keep buffer
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Symbolic sizes should cause safe fallback (keep buffer)
     // We can't guarantee NoMatch due to other patterns, but verify no crash
@@ -572,8 +571,8 @@ fn test_out_in_ratio_symbolic_sizes() {
 /// When there are no input buffers, ratio calculation should handle gracefully.
 #[test]
 fn test_out_in_ratio_no_inputs() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
@@ -587,7 +586,7 @@ fn test_out_in_ratio_no_inputs() {
     let idx_buf = create_index_bufferize(const_val, ranges.clone(), ranges, opts);
 
     // Apply rewrite - should be handled by cheap_inline pattern instead
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
 
     // Const should be inlined (cheap operation)
     assert!(matches!(rewritten.op(), Op::Const(_)), "Expected constant to be inlined");
@@ -603,8 +602,8 @@ fn test_out_in_ratio_no_inputs() {
 /// should be eligible for full removal via substitution.
 #[test]
 fn test_buffer_not_in_reduce_full_removal() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -624,7 +623,7 @@ fn test_buffer_not_in_reduce_full_removal() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - without reduce, should do full removal
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
 
     // Verify transformation occurred (full removal via substitution)
     // The result should not contain BUFFERIZE
@@ -637,8 +636,8 @@ fn test_buffer_not_in_reduce_full_removal() {
 /// to materialize only the necessary dimensions.
 #[test]
 fn test_buffer_in_reduce_partial_contiguous() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -654,7 +653,7 @@ fn test_buffer_in_reduce_partial_contiguous() {
     // So this test validates that REDUCE with buffer is detected correctly
 
     // Apply rewrite directly to bufferized (tests Pattern 1-3)
-    let rewritten = graph_rewrite(&matcher, bufferized);
+    let rewritten = graph_rewrite(&matcher, bufferized, &mut config);
 
     // With REDUCE accessing buffer, may apply partial contiguous or keep buffer
     // Depends on LOCAL index detection
@@ -666,8 +665,8 @@ fn test_buffer_in_reduce_partial_contiguous() {
 /// If REDUCE exists but doesn't access the buffer, should still do full removal.
 #[test]
 fn test_reduce_without_buffer_access_full_removal() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -686,7 +685,7 @@ fn test_reduce_without_buffer_access_full_removal() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - REDUCE exists but doesn't access buffer, so full removal
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
 
     // Should still be eligible for optimization
     drop(rewritten);
@@ -697,8 +696,8 @@ fn test_reduce_without_buffer_access_full_removal() {
 /// Multiple REDUCE operations accessing the buffer should still be detected.
 #[test]
 fn test_multiple_reduces_with_buffer() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -728,7 +727,7 @@ fn test_multiple_reduces_with_buffer() {
     let bufferized = UOp::bufferize(reduce2, ranges, opts);
 
     // Apply rewrite - multiple reduces accessing buffer
-    let rewritten = graph_rewrite(&matcher, bufferized);
+    let rewritten = graph_rewrite(&matcher, bufferized, &mut config);
 
     // Should detect buffer in reduce and apply appropriate transformation
     drop(rewritten);
@@ -739,8 +738,8 @@ fn test_multiple_reduces_with_buffer() {
 /// Nested reduces should be analyzed correctly for buffer access.
 #[test]
 fn test_nested_reduce_with_buffer() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -773,7 +772,7 @@ fn test_nested_reduce_with_buffer() {
     let bufferized = UOp::bufferize(outer_reduce, ranges, opts);
 
     // Apply rewrite - nested reduces with buffer access
-    let rewritten = graph_rewrite(&matcher, bufferized);
+    let rewritten = graph_rewrite(&matcher, bufferized, &mut config);
 
     // Should detect buffer in nested reduce structure
     drop(rewritten);
@@ -812,8 +811,8 @@ fn count_bufferizes(uop: &Rc<UOp>) -> usize {
 /// Cheap operations should always be inlined.
 #[test]
 fn test_pattern1_cheap_inline() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
@@ -824,7 +823,7 @@ fn test_pattern1_cheap_inline() {
     let bufferized = UOp::bufferize(const_val.clone(), vec![range], opts);
 
     // Apply rewrite - Pattern 1 should match
-    let rewritten = graph_rewrite(&matcher, bufferized);
+    let rewritten = graph_rewrite(&matcher, bufferized, &mut config);
 
     // Verify: BUFFERIZE removed, const returned
     assert!(matches!(rewritten.op(), Op::Const(_)), "Pattern 1 should inline const");
@@ -838,12 +837,12 @@ fn test_pattern1_cheap_inline() {
 #[test]
 fn test_pattern4_full_removal_with_permissive_config() {
     // Use permissive config that allows optimization
-    let config = PcontigConfig {
+    let mut config = PcontigConfig {
         level: 2,
         max_buffers_threshold: 10,   // Allow many buffers
         out_in_ratio_threshold: 1.0, // Allow any ratio >= 1.0
     };
-    let matcher = buffer_removal_with_pcontig(&config);
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -862,7 +861,7 @@ fn test_pattern4_full_removal_with_permissive_config() {
     let bufferizes_before = count_bufferizes(&idx_buf);
 
     // Apply rewrite - with permissive config, Pattern 4 should match
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     let bufferizes_after = count_bufferizes(&rewritten);
 
@@ -880,8 +879,8 @@ fn test_pattern4_full_removal_with_permissive_config() {
 /// When ratio < threshold, buffer should be KEPT (not optimized).
 #[test]
 fn test_pattern4_keeps_efficient_buffer() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -898,7 +897,7 @@ fn test_pattern4_keeps_efficient_buffer() {
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite - Pattern 4 should NOT match (ratio 1.0 < 10.0)
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Verify buffer was kept (no optimization)
     assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Efficient buffer (ratio=1.0) should be KEPT");
@@ -909,8 +908,8 @@ fn test_pattern4_keeps_efficient_buffer() {
 /// Inlining should maintain the dtype of the original computation.
 #[test]
 fn test_pattern1_preserves_dtype() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
@@ -922,7 +921,7 @@ fn test_pattern1_preserves_dtype() {
     let bufferized = UOp::bufferize(const_val, vec![range], opts);
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, bufferized);
+    let rewritten = graph_rewrite(&matcher, bufferized, &mut config);
 
     // Verify dtype preserved
     assert_eq!(rewritten.dtype(), original_dtype, "Dtype should be preserved after Pattern 1");
@@ -933,8 +932,8 @@ fn test_pattern1_preserves_dtype() {
 /// If accessed_buffers > threshold, full removal should not occur.
 #[test]
 fn test_full_removal_blocked_by_heuristics() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -946,7 +945,7 @@ fn test_full_removal_blocked_by_heuristics() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - should NOT do full removal due to accessed_buffers heuristic
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Should keep buffer (no rewrite)
     assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite when heuristics prevent optimization");
@@ -962,8 +961,8 @@ fn test_full_removal_blocked_by_heuristics() {
 /// while inlining LOOP dimensions.
 #[test]
 fn test_partial_contiguous_single_reduce() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(4000, DType::Float32, 1); // 100 * 10 * 4 bytes
@@ -986,7 +985,7 @@ fn test_partial_contiguous_single_reduce() {
     let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
 
     // Apply rewrite - should apply partial contiguous
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Verify transformation occurred (may be partial contiguous or full removal depending on heuristics)
     // This is primarily a smoke test to ensure reduce handling works
@@ -998,8 +997,8 @@ fn test_partial_contiguous_single_reduce() {
 /// LOCAL axes should be materialized, LOOP axes should be inlined.
 #[test]
 fn test_partial_contiguous_local_axis() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(400, DType::Float32, 1); // 10 * 10 * 4 bytes
@@ -1019,7 +1018,7 @@ fn test_partial_contiguous_local_axis() {
     let idx_buf = create_index_bufferize(compute, all_ranges.clone(), all_ranges, opts);
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Verify transformation (LOCAL should trigger partial contiguous)
     // The exact behavior depends on heuristics
@@ -1031,8 +1030,8 @@ fn test_partial_contiguous_local_axis() {
 /// Should materialize REDUCE dimension, inline LOOP dimension.
 #[test]
 fn test_partial_contiguous_mixed_axes() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(8000, DType::Float32, 1); // 100 * 20 * 4 bytes
@@ -1054,7 +1053,7 @@ fn test_partial_contiguous_mixed_axes() {
     let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
 
     // Verify transformation
     drop(rewritten);
@@ -1068,8 +1067,8 @@ fn test_partial_contiguous_different_reduce_ops() {
     use morok_ir::ReduceOp;
 
     for reduce_op in [ReduceOp::Add, ReduceOp::Max, ReduceOp::Mul] {
-        let config = PcontigConfig::default();
-        let matcher = buffer_removal_with_pcontig(&config);
+        let mut config = PcontigConfig::default();
+        let matcher = buffer_removal_with_pcontig();
 
         let mut ctx = IndexingContext::new();
         let buffer = create_test_buffer(400, DType::Float32, 1);
@@ -1087,7 +1086,7 @@ fn test_partial_contiguous_different_reduce_ops() {
         let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
 
         // Apply rewrite - should not panic regardless of reduce op
-        let rewritten = graph_rewrite(&matcher, idx_buf);
+        let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
         drop(rewritten);
     }
 }
@@ -1097,8 +1096,8 @@ fn test_partial_contiguous_different_reduce_ops() {
 /// Multiple REDUCE dimensions should all be materialized.
 #[test]
 fn test_partial_contiguous_multi_dimensional_reduce() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(8000, DType::Float32, 1); // 10 * 20 * 10 * 4 bytes
@@ -1127,7 +1126,7 @@ fn test_partial_contiguous_multi_dimensional_reduce() {
     let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1136,8 +1135,8 @@ fn test_partial_contiguous_multi_dimensional_reduce() {
 /// Even with REDUCE, if accessed_buffers > threshold, should not optimize.
 #[test]
 fn test_partial_contiguous_blocked_by_heuristics() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -1173,7 +1172,7 @@ fn test_partial_contiguous_blocked_by_heuristics() {
     let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
 
     // Apply rewrite - should be blocked by accessed_buffers heuristic
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Should not rewrite (4 buffers > 3 threshold)
     assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite when accessed_buffers > threshold");
@@ -1188,8 +1187,8 @@ fn test_partial_contiguous_blocked_by_heuristics() {
 /// Should handle gracefully without panicking.
 #[test]
 fn test_edge_case_empty_computation() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1203,7 +1202,7 @@ fn test_edge_case_empty_computation() {
     let idx_buf = create_index_bufferize(indexed, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite - should not panic
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1212,8 +1211,8 @@ fn test_edge_case_empty_computation() {
 /// Should inline completely via Pattern 1.
 #[test]
 fn test_edge_case_all_const_operations() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
@@ -1228,7 +1227,7 @@ fn test_edge_case_all_const_operations() {
     let bufferized = UOp::bufferize(compute.clone(), vec![range], opts);
 
     // Apply rewrite - should inline via Pattern 1
-    let rewritten = graph_rewrite(&matcher, bufferized.clone());
+    let rewritten = graph_rewrite(&matcher, bufferized.clone(), &mut config);
 
     // Should be different from original (inlined)
     assert!(!Rc::ptr_eq(&rewritten, &bufferized), "Expected const computation to be inlined");
@@ -1239,8 +1238,8 @@ fn test_edge_case_all_const_operations() {
 /// Multiple levels of BUFFERIZE should be flattened correctly.
 #[test]
 fn test_edge_case_deeply_nested_bufferize() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(5), AxisType::Loop);
@@ -1254,8 +1253,8 @@ fn test_edge_case_deeply_nested_bufferize() {
     let level3 = UOp::bufferize(level2, vec![range], opts);
 
     // Apply multiple rewrites to flatten
-    let rewritten1 = graph_rewrite(&matcher, level3);
-    let rewritten2 = graph_rewrite(&matcher, rewritten1);
+    let rewritten1 = graph_rewrite(&matcher, level3, &mut config);
+    let rewritten2 = graph_rewrite(&matcher, rewritten1, &mut config);
 
     // Should eventually inline to const
     drop(rewritten2);
@@ -1266,8 +1265,8 @@ fn test_edge_case_deeply_nested_bufferize() {
 /// Should handle edge case without panicking.
 #[test]
 fn test_edge_case_zero_sized_range() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1283,7 +1282,7 @@ fn test_edge_case_zero_sized_range() {
     let idx_buf = create_index_bufferize(compute, vec![zero_range.clone()], vec![zero_range], opts);
 
     // Apply rewrite - should handle gracefully
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1296,15 +1295,7 @@ fn test_edge_case_zero_sized_range() {
 /// A config with higher threshold should optimize more cases.
 #[test]
 fn test_config_custom_max_buffers_threshold() {
-    // Default threshold is 3
-    let default_config = PcontigConfig::default();
-    let permissive_config = PcontigConfig {
-        max_buffers_threshold: 10, // Allow up to 10 buffers
-        ..Default::default()
-    };
-
-    let default_matcher = buffer_removal_with_pcontig(&default_config);
-    let permissive_matcher = buffer_removal_with_pcontig(&permissive_config);
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -1315,11 +1306,16 @@ fn test_config_custom_max_buffers_threshold() {
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Default config should NOT optimize (4 > 3)
-    let default_rewritten = graph_rewrite(&default_matcher, idx_buf.clone());
+    let mut default_config = PcontigConfig::default();
+    let default_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut default_config);
     assert!(Rc::ptr_eq(&default_rewritten, &idx_buf), "Default config should block 4 buffers");
 
     // Permissive config MIGHT optimize (4 < 10), depends on ratio heuristic
-    let permissive_rewritten = graph_rewrite(&permissive_matcher, idx_buf);
+    let mut permissive_config = PcontigConfig {
+        max_buffers_threshold: 10, // Allow up to 10 buffers
+        ..Default::default()
+    };
+    let permissive_rewritten = graph_rewrite(&matcher, idx_buf, &mut permissive_config);
     // Don't assert specific behavior since ratio heuristic might still block
     drop(permissive_rewritten);
 }
@@ -1329,20 +1325,7 @@ fn test_config_custom_max_buffers_threshold() {
 /// A config with lower threshold should optimize fewer cases.
 #[test]
 fn test_config_custom_ratio_threshold() {
-    // Config with very high ratio threshold (only optimize very wasteful buffers)
-    let strict_config = PcontigConfig {
-        out_in_ratio_threshold: 100.0, // Only optimize if ratio >= 100
-        ..Default::default()
-    };
-
-    // Config with very low ratio threshold (optimize almost everything)
-    let permissive_config = PcontigConfig {
-        out_in_ratio_threshold: 1.0, // Optimize if ratio >= 1.0
-        ..Default::default()
-    };
-
-    let strict_matcher = buffer_removal_with_pcontig(&strict_config);
-    let permissive_matcher = buffer_removal_with_pcontig(&permissive_config);
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1358,11 +1341,19 @@ fn test_config_custom_ratio_threshold() {
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
 
     // Strict config: ratio = (40+1)/(40+1) = 1.0 < 100.0 → should KEEP buffer
-    let strict_rewritten = graph_rewrite(&strict_matcher, idx_buf.clone());
+    let mut strict_config = PcontigConfig {
+        out_in_ratio_threshold: 100.0, // Only optimize if ratio >= 100
+        ..Default::default()
+    };
+    let strict_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut strict_config);
     assert!(Rc::ptr_eq(&strict_rewritten, &idx_buf), "Strict config should keep efficient buffer (ratio 1.0 < 100.0)");
 
     // Permissive config: ratio = 1.0 >= 1.0 → should OPTIMIZE
-    let permissive_rewritten = graph_rewrite(&permissive_matcher, idx_buf.clone());
+    let mut permissive_config = PcontigConfig {
+        out_in_ratio_threshold: 1.0, // Optimize if ratio >= 1.0
+        ..Default::default()
+    };
+    let permissive_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut permissive_config);
     assert!(
         !Rc::ptr_eq(&permissive_rewritten, &idx_buf),
         "Permissive config should optimize buffer (ratio 1.0 >= 1.0)"
@@ -1375,15 +1366,7 @@ fn test_config_custom_ratio_threshold() {
 /// Note: Patterns 1-3 (cheap inline, nested bufferize) still run with level 0.
 #[test]
 fn test_config_level_0_vs_2() {
-    let disabled_config = PcontigConfig { level: 0, ..Default::default() };
-    let enabled_config = PcontigConfig {
-        level: 2,
-        out_in_ratio_threshold: 1.0, // Permissive to ensure optimization happens
-        ..Default::default()
-    };
-
-    let disabled_matcher = buffer_removal_with_pcontig(&disabled_config);
-    let enabled_matcher = buffer_removal_with_pcontig(&enabled_config);
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1398,24 +1381,26 @@ fn test_config_level_0_vs_2() {
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
 
     // Level 0: Pattern 4 disabled → should NOT optimize
-    let disabled_rewritten = graph_rewrite(&disabled_matcher, idx_buf.clone());
+    let mut disabled_config = PcontigConfig { level: 0, ..Default::default() };
+    let disabled_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut disabled_config);
     assert!(Rc::ptr_eq(&disabled_rewritten, &idx_buf), "Level 0 should disable Pattern 4 optimizations");
 
     // Level 2: Pattern 4 enabled → should optimize (ratio=1.0 >= threshold)
-    let enabled_rewritten = graph_rewrite(&enabled_matcher, idx_buf.clone());
+    let mut enabled_config = PcontigConfig {
+        level: 2,
+        out_in_ratio_threshold: 1.0, // Permissive to ensure optimization happens
+        ..Default::default()
+    };
+    let enabled_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut enabled_config);
     assert!(!Rc::ptr_eq(&enabled_rewritten, &idx_buf), "Level 2 should enable Pattern 4 optimizations");
 }
 
-/// Test that multiple matchers with different configs work independently.
+/// Test that the same matcher with different configs produces different results.
 ///
-/// Each matcher should respect its own config.
+/// Each graph_rewrite call should respect its own config.
 #[test]
-fn test_config_multiple_matchers_independent() {
-    let config1 = PcontigConfig { max_buffers_threshold: 2, ..Default::default() };
-    let config2 = PcontigConfig { max_buffers_threshold: 5, ..Default::default() };
-
-    let matcher1 = buffer_removal_with_pcontig(&config1);
-    let matcher2 = buffer_removal_with_pcontig(&config2);
+fn test_config_different_configs_produce_different_results() {
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -1425,12 +1410,14 @@ fn test_config_multiple_matchers_independent() {
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
-    // Matcher1 (threshold=2): should NOT optimize (3 > 2)
-    let rewritten1 = graph_rewrite(&matcher1, idx_buf.clone());
-    assert!(Rc::ptr_eq(&rewritten1, &idx_buf), "Matcher1 should block 3 buffers (threshold=2)");
+    // Config1 (threshold=2): should NOT optimize (3 > 2)
+    let mut config1 = PcontigConfig { max_buffers_threshold: 2, ..Default::default() };
+    let rewritten1 = graph_rewrite(&matcher, idx_buf.clone(), &mut config1);
+    assert!(Rc::ptr_eq(&rewritten1, &idx_buf), "Config1 should block 3 buffers (threshold=2)");
 
-    // Matcher2 (threshold=5): MIGHT optimize (3 < 5), depends on ratio
-    let rewritten2 = graph_rewrite(&matcher2, idx_buf);
+    // Config2 (threshold=5): MIGHT optimize (3 < 5), depends on ratio
+    let mut config2 = PcontigConfig { max_buffers_threshold: 5, ..Default::default() };
+    let rewritten2 = graph_rewrite(&matcher, idx_buf, &mut config2);
     // Don't assert specific behavior since ratio might still block
     drop(rewritten2);
 }
@@ -1462,8 +1449,8 @@ fn test_pipeline_integration_full_rangeify() {
 /// Complex graphs may need multiple patterns to fully optimize.
 #[test]
 fn test_pipeline_multiple_patterns_in_sequence() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
@@ -1477,11 +1464,11 @@ fn test_pipeline_multiple_patterns_in_sequence() {
     let outer = UOp::bufferize(inner, vec![range], opts);
 
     // Single rewrite should apply Pattern 3
-    let rewritten1 = graph_rewrite(&matcher, outer.clone());
+    let rewritten1 = graph_rewrite(&matcher, outer.clone(), &mut config);
     assert!(!Rc::ptr_eq(&rewritten1, &outer), "Pattern 3 should fire");
 
     // Second rewrite should apply Pattern 1
-    let rewritten2 = graph_rewrite(&matcher, rewritten1.clone());
+    let rewritten2 = graph_rewrite(&matcher, rewritten1.clone(), &mut config);
     // Might inline to const depending on graph_rewrite's bottom-up traversal
     drop(rewritten2);
 }
@@ -1491,8 +1478,8 @@ fn test_pipeline_multiple_patterns_in_sequence() {
 /// After optimization, the graph should still be semantically valid.
 #[test]
 fn test_pipeline_preserves_graph_structure() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1513,7 +1500,7 @@ fn test_pipeline_preserves_graph_structure() {
     let original_dtype = idx_buf.dtype();
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
 
     // Dtype should be preserved
     assert_eq!(rewritten.dtype(), original_dtype, "Dtype should be preserved");
@@ -1524,8 +1511,8 @@ fn test_pipeline_preserves_graph_structure() {
 /// Pattern 1 (cheap inline) should work correctly with Pattern 4.
 #[test]
 fn test_pipeline_cheap_inline_interaction() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
@@ -1538,7 +1525,7 @@ fn test_pipeline_cheap_inline_interaction() {
     let bufferized = UOp::bufferize(neg.clone(), vec![range], opts);
 
     // Pattern 1 should inline (unary op is cheap)
-    let rewritten = graph_rewrite(&matcher, bufferized.clone());
+    let rewritten = graph_rewrite(&matcher, bufferized.clone(), &mut config);
     assert!(!Rc::ptr_eq(&rewritten, &bufferized), "Pattern 1 should inline cheap unary op");
 }
 
@@ -1551,8 +1538,8 @@ fn test_pipeline_cheap_inline_interaction() {
 /// When buffer size cannot be computed (symbolic ranges), heuristics should skip.
 #[test]
 fn test_symbolic_buffer_size_handling() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     // Create symbolic range using DEFINE_VAR
     let batch_size = UOp::define_var("batch".to_string(), 1, 128);
@@ -1576,7 +1563,7 @@ fn test_symbolic_buffer_size_handling() {
     let idx_buf = UOp::index(bufferized, vec![symbolic_range]).expect("Failed to create INDEX");
 
     // Apply rewrite - should handle gracefully (ratio calculation returns None)
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1585,8 +1572,8 @@ fn test_symbolic_buffer_size_handling() {
 /// Pattern 4 should skip when all sizes are symbolic.
 #[test]
 fn test_all_symbolic_sizes() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     // Create symbolic ranges
     let n = UOp::define_var("n".to_string(), 1, 1024);
@@ -1607,7 +1594,7 @@ fn test_all_symbolic_sizes() {
     let idx_buf = UOp::index(bufferized, vec![range_m]).expect("Failed to create INDEX");
 
     // Apply rewrite - should not crash with symbolic sizes
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1616,8 +1603,8 @@ fn test_all_symbolic_sizes() {
 /// Heuristics should handle mixed scenarios gracefully.
 #[test]
 fn test_mixed_concrete_symbolic_sizes() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     // Concrete range
     let concrete_range = UOp::new(
@@ -1640,7 +1627,7 @@ fn test_mixed_concrete_symbolic_sizes() {
     let idx_buf = UOp::index(bufferized, vec![concrete_range, symbolic_range]).expect("Failed to create INDEX");
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1653,8 +1640,8 @@ fn test_mixed_concrete_symbolic_sizes() {
 /// A value used multiple times should be handled correctly.
 #[test]
 fn test_complex_diamond_pattern() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1674,7 +1661,7 @@ fn test_complex_diamond_pattern() {
     let idx_buf = create_index_bufferize(add, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite - should handle diamond correctly
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1683,8 +1670,8 @@ fn test_complex_diamond_pattern() {
 /// Long chains should be optimized without stack overflow.
 #[test]
 fn test_complex_deep_computation_chain() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1704,7 +1691,7 @@ fn test_complex_deep_computation_chain() {
     let idx_buf = create_index_bufferize(current, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1713,8 +1700,8 @@ fn test_complex_deep_computation_chain() {
 /// Should trigger accessed_buffers heuristic correctly.
 #[test]
 fn test_complex_multiple_independent_buffers() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
@@ -1738,7 +1725,7 @@ fn test_complex_multiple_independent_buffers() {
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite - should block due to >3 buffers
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
     assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Should block optimization with 5 buffers");
 }
 
@@ -1747,8 +1734,8 @@ fn test_complex_multiple_independent_buffers() {
 /// Complex reduce patterns should be handled correctly.
 #[test]
 fn test_complex_multiple_sequential_reduces() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let buffer = create_test_buffer(8000, DType::Float32, 1);
@@ -1781,7 +1768,7 @@ fn test_complex_multiple_sequential_reduces() {
     let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1794,8 +1781,8 @@ fn test_complex_multiple_sequential_reduces() {
 /// Should handle large numbers without overflow.
 #[test]
 fn test_boundary_very_large_buffer() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -1811,7 +1798,7 @@ fn test_boundary_very_large_buffer() {
     let idx_buf = create_index_bufferize(compute, vec![large_range.clone()], vec![large_range], opts);
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1820,8 +1807,8 @@ fn test_boundary_very_large_buffer() {
 /// Degenerate cases should be handled correctly.
 #[test]
 fn test_boundary_size_one_dimension() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
     let range1 = ctx.new_range(&SInt::Const(1), AxisType::Loop);
@@ -1835,7 +1822,7 @@ fn test_boundary_size_one_dimension() {
     let idx_buf = create_index_bufferize(compute, vec![range1.clone()], vec![range1], opts);
 
     // Apply rewrite
-    let rewritten = graph_rewrite(&matcher, idx_buf);
+    let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
     drop(rewritten);
 }
 
@@ -1845,8 +1832,8 @@ fn test_boundary_size_one_dimension() {
 #[test]
 fn test_boundary_exact_threshold_values() {
     // Test exact ratio threshold (10.0)
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     let mut ctx = IndexingContext::new();
 
@@ -1864,7 +1851,7 @@ fn test_boundary_exact_threshold_values() {
     let idx_buf = create_index_bufferize(compute, vec![output_range.clone()], vec![output_range], opts);
 
     // Apply rewrite - at threshold should optimize (ratio >= 10.0)
-    let rewritten = graph_rewrite(&matcher, idx_buf.clone());
+    let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
     // The actual behavior depends on exact ratio calculation
     drop(rewritten);
 }
@@ -1874,8 +1861,8 @@ fn test_boundary_exact_threshold_values() {
 /// Minimal graphs should not cause issues.
 #[test]
 fn test_boundary_minimal_computation() {
-    let config = PcontigConfig::default();
-    let matcher = buffer_removal_with_pcontig(&config);
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
 
     // Just a constant
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
@@ -1887,6 +1874,6 @@ fn test_boundary_minimal_computation() {
     let bufferized = UOp::bufferize(const_val, vec![range], opts);
 
     // Apply rewrite - Pattern 1 should inline const
-    let rewritten = graph_rewrite(&matcher, bufferized.clone());
+    let rewritten = graph_rewrite(&matcher, bufferized.clone(), &mut config);
     assert!(!Rc::ptr_eq(&rewritten, &bufferized), "Const should be inlined via Pattern 1");
 }

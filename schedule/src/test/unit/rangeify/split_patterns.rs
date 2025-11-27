@@ -4,12 +4,9 @@ use morok_dtype::{AddrSpace, DType, ScalarDType};
 use morok_ir::{AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
 
-use crate::{
-    pattern::RewriteResult,
-    rangeify::{
-        KernelContext,
-        split_patterns::{cleanup_const, debuf, handle_after, remove_zero_range, renumber_range, unbind_kernel},
-    },
+use crate::rangeify::{
+    KernelContext,
+    split_patterns::{cleanup_const, debuf, handle_after, remove_zero_range, renumber_range, unbind_kernel},
 };
 
 #[test]
@@ -25,13 +22,9 @@ fn test_debuf_global() {
     let result = debuf(&buffer, &mut ctx);
 
     // Should return a DEFINE_GLOBAL
-    match result {
-        RewriteResult::Rewritten(op) => {
-            assert!(matches!(op.op(), Op::DefineGlobal(_)));
-            assert_eq!(ctx.global_counter, 1);
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
+    let op = result.expect("Expected Some result");
+    assert!(matches!(op.op(), Op::DefineGlobal(_)));
+    assert_eq!(ctx.global_counter, 1);
 }
 
 #[test]
@@ -47,13 +40,9 @@ fn test_unbind_kernel() {
     let result = unbind_kernel(&bind, &mut ctx);
 
     // Should return just the variable
-    match result {
-        RewriteResult::Rewritten(op) => {
-            assert!(matches!(op.op(), Op::DefineVar { .. }));
-            assert!(ctx.has_var(&var));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
+    let op = result.expect("Expected Some result");
+    assert!(matches!(op.op(), Op::DefineVar { .. }));
+    assert!(ctx.has_var(&var));
 }
 
 #[test]
@@ -68,15 +57,11 @@ fn test_renumber_range() {
     let result = renumber_range(&range, &mut ctx);
 
     // Should return a RANGE with axis_id=0
-    match result {
-        RewriteResult::Rewritten(op) => {
-            if let Op::Range { axis_id, .. } = op.op() {
-                assert_eq!(*axis_id, 0);
-            } else {
-                panic!("Expected RANGE operation");
-            }
-        }
-        _ => panic!("Expected Rewritten result"),
+    let op = result.expect("Expected Some result");
+    if let Op::Range { axis_id, .. } = op.op() {
+        assert_eq!(*axis_id, 0);
+    } else {
+        panic!("Expected RANGE operation");
     }
 }
 
@@ -88,18 +73,12 @@ fn test_remove_zero_range() {
     let end = UOp::const_(DType::Index, ConstValue::Int(0));
     let range = UOp::range_axis(end, 0, AxisType::Loop);
 
-    // Create bindings
-
     // Apply remove_zero_range pattern
     let result = remove_zero_range(&range, &mut ctx);
 
     // Should return CONST(0)
-    match result {
-        RewriteResult::Rewritten(op) => {
-            assert!(matches!(op.op(), Op::Const(_)));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
+    let op = result.expect("Expected Some result");
+    assert!(matches!(op.op(), Op::Const(_)));
 }
 
 #[test]
@@ -109,13 +88,11 @@ fn test_cleanup_const_with_sources() {
     // Create a CONST operation (normally has no sources)
     let const_op = UOp::const_(DType::Int32, ConstValue::Int(42));
 
-    // Create bindings
-
     // Apply cleanup_const pattern (should not match since const has no sources normally)
     let result = cleanup_const(&const_op, &mut ctx);
 
-    // Should return NoMatch since the const has no sources
-    assert!(matches!(result, RewriteResult::NoMatch));
+    // Should return None since the const has no sources
+    assert!(result.is_none());
 }
 
 #[test]
@@ -127,22 +104,16 @@ fn test_handle_after() {
     let store = UOp::noop();
     let after = UOp::after(buffer.clone(), smallvec::smallvec![store]);
 
-    // Create bindings
-
     // Apply handle_after pattern
     let result = handle_after(&after, &mut ctx);
 
     // Should return the buffer
-    match result {
-        RewriteResult::Rewritten(op) => {
-            assert!(matches!(op.op(), Op::Unique(_)));
-            // Check that the buffer was mapped to the after operation
-            assert!(ctx.has_buffer(&buffer));
-            // Use Rc::ptr_eq for comparison
-            assert!(Rc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
+    let op = result.expect("Expected Some result");
+    assert!(matches!(op.op(), Op::Unique(_)));
+    // Check that the buffer was mapped to the after operation
+    assert!(ctx.has_buffer(&buffer));
+    // Use Rc::ptr_eq for comparison
+    assert!(Rc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
 }
 
 #[test]
@@ -162,13 +133,13 @@ fn test_debuf_counter_increment() {
     // Apply debuf to first buffer
     let result1 = debuf(&buffer1, &mut ctx);
 
-    assert!(matches!(result1, RewriteResult::Rewritten(_)));
+    assert!(result1.is_some());
     assert_eq!(ctx.global_counter, 1);
 
     // Apply debuf to second buffer
     let result2 = debuf(&buffer2, &mut ctx);
 
-    assert!(matches!(result2, RewriteResult::Rewritten(_)));
+    assert!(result2.is_some());
     assert_eq!(ctx.global_counter, 2);
 
     // Verify both buffers are mapped
@@ -208,15 +179,11 @@ fn test_handle_after_mstack_unwrap() {
     let result = handle_after(&after, &mut ctx);
 
     // Should unwrap to first buffer of MSTACK
-    match result {
-        RewriteResult::Rewritten(op) => {
-            assert!(matches!(op.op(), Op::Unique(_)));
-            assert!(Rc::ptr_eq(&op, &buf1));
-            // buf1 should be mapped to after
-            assert!(Rc::ptr_eq(ctx.get_buffer(&buf1).unwrap(), &after));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
+    let op = result.expect("Expected Some result");
+    assert!(matches!(op.op(), Op::Unique(_)));
+    assert!(Rc::ptr_eq(&op, &buf1));
+    // buf1 should be mapped to after
+    assert!(Rc::ptr_eq(ctx.get_buffer(&buf1).unwrap(), &after));
 }
 
 #[test]
@@ -234,14 +201,10 @@ fn test_handle_after_mselect_unwrap() {
     let result = handle_after(&after, &mut ctx);
 
     // Should unwrap to buffer
-    match result {
-        RewriteResult::Rewritten(op) => {
-            assert!(Rc::ptr_eq(&op, &buffer));
-            // buffer should be mapped to after
-            assert!(Rc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
+    let op = result.expect("Expected Some result");
+    assert!(Rc::ptr_eq(&op, &buffer));
+    // buffer should be mapped to after
+    assert!(Rc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
 }
 
 #[test]
@@ -256,25 +219,23 @@ fn test_renumber_range_sequential() {
 
     // Renumber all three
     let result1 = renumber_range(&range1, &mut ctx);
-
     let result2 = renumber_range(&range2, &mut ctx);
-
     let result3 = renumber_range(&range3, &mut ctx);
 
     // Should get sequential IDs 0, 1, 2
-    if let RewriteResult::Rewritten(r) = result1
+    if let Some(r) = result1
         && let Op::Range { axis_id, .. } = r.op()
     {
         assert_eq!(*axis_id, 0);
     }
 
-    if let RewriteResult::Rewritten(r) = result2
+    if let Some(r) = result2
         && let Op::Range { axis_id, .. } = r.op()
     {
         assert_eq!(*axis_id, 1);
     }
 
-    if let RewriteResult::Rewritten(r) = result3
+    if let Some(r) = result3
         && let Op::Range { axis_id, .. } = r.op()
     {
         assert_eq!(*axis_id, 2);
@@ -292,13 +253,13 @@ fn test_renumber_range_different_axis_types() {
 
         let result = renumber_range(&range, &mut ctx);
 
-        if let RewriteResult::Rewritten(r) = result {
+        if let Some(r) = result {
             if let Op::Range { axis_type: new_type, .. } = r.op() {
                 // Axis type should be preserved
                 assert_eq!(*new_type, axis_type);
             }
         } else {
-            panic!("Expected Rewritten result for {:?}", axis_type);
+            panic!("Expected Some result for {:?}", axis_type);
         }
     }
 }
@@ -318,8 +279,8 @@ fn test_renumber_range_no_change_if_same() {
 
     let result = renumber_range(&range2, &mut ctx);
 
-    // Should return NoMatch since the ID matches what we would assign
-    assert!(matches!(result, RewriteResult::NoMatch));
+    // Should return None since the ID matches what we would assign
+    assert!(result.is_none());
 }
 
 #[test]
@@ -332,7 +293,7 @@ fn test_cleanup_const_define_var() {
 
     // Without sources, should not match
     let result = cleanup_const(&define_var, &mut ctx);
-    assert!(matches!(result, RewriteResult::NoMatch));
+    assert!(result.is_none());
 
     // TODO: Test with spurious sources once we have a way to create them
 }
@@ -348,12 +309,8 @@ fn test_remove_zero_range_uint() {
     let result = remove_zero_range(&range, &mut ctx);
 
     // Should return CONST(0)
-    match result {
-        RewriteResult::Rewritten(op) => {
-            assert!(matches!(op.op(), Op::Const(_)));
-        }
-        _ => panic!("Expected Rewritten result"),
-    }
+    let op = result.expect("Expected Some result");
+    assert!(matches!(op.op(), Op::Const(_)));
 }
 
 #[test]
@@ -366,8 +323,8 @@ fn test_remove_zero_range_non_zero() {
 
     let result = remove_zero_range(&range, &mut ctx);
 
-    // Should return NoMatch
-    assert!(matches!(result, RewriteResult::NoMatch));
+    // Should return None
+    assert!(result.is_none());
 }
 
 #[test]
@@ -388,7 +345,7 @@ fn test_handle_after_mstack_advanced() {
 
     // Should unwrap MSTACK and return first buffer
     match result {
-        RewriteResult::Rewritten(buf) => {
+        Some(buf) => {
             // Should return buf1 (first in MSTACK)
             assert!(std::rc::Rc::ptr_eq(&buf, &buf1));
 
@@ -412,7 +369,7 @@ fn test_cleanup_const_with_spurious_sources() {
     let result = cleanup_const(&const_op, &mut ctx);
 
     // DEFINE_VAR shouldn't be cleaned up (it's not a CONST)
-    assert!(matches!(result, RewriteResult::NoMatch));
+    assert!(result.is_none());
 }
 
 #[test]
@@ -430,7 +387,7 @@ fn test_renumber_range_with_gaps() {
 
     // First range should keep ID 0
     match result0 {
-        RewriteResult::NoMatch => {
+        None => {
             // Correct - ID 0 is what we'd assign anyway
         }
         _ => panic!("Expected NoMatch for first range"),
@@ -441,7 +398,7 @@ fn test_renumber_range_with_gaps() {
     let result5 = renumber_range(&range5, &mut ctx);
 
     match result5 {
-        RewriteResult::Rewritten(new_range) => {
+        Some(new_range) => {
             // Should be renumbered to ID 1
             if let Op::Range { axis_id, .. } = new_range.op() {
                 assert_eq!(*axis_id, 1);
@@ -457,7 +414,7 @@ fn test_renumber_range_with_gaps() {
     let result10 = renumber_range(&range10, &mut ctx);
 
     match result10 {
-        RewriteResult::Rewritten(new_range) => {
+        Some(new_range) => {
             // Should be renumbered to ID 2
             if let Op::Range { axis_id, axis_type, .. } = new_range.op() {
                 assert_eq!(*axis_id, 2);
@@ -486,7 +443,7 @@ fn test_remove_zero_range_verification() {
 
     // Should rewrite to CONST(0)
     match result {
-        RewriteResult::Rewritten(const_op) => {
+        Some(const_op) => {
             // Should be a CONST
             if let Op::Const(val) = const_op.op() {
                 // Should be Int(0)
@@ -520,7 +477,7 @@ fn test_pattern_composition_sequence() {
     let result1 = renumber_range(&range_gap, &mut ctx);
 
     match result1 {
-        RewriteResult::Rewritten(renumbered) => {
+        Some(renumbered) => {
             // Should be renumbered to ID 0 (first in sequence)
             if let Op::Range { axis_id, end, axis_type } = renumbered.op() {
                 assert_eq!(*axis_id, 0);
@@ -537,7 +494,7 @@ fn test_pattern_composition_sequence() {
                 let result2 = remove_zero_range(&renumbered, &mut ctx);
 
                 // Should return NoMatch since end is 15, not 0
-                assert!(matches!(result2, RewriteResult::NoMatch));
+                assert!(result2.is_none());
             } else {
                 panic!("Expected RANGE operation");
             }
@@ -573,7 +530,7 @@ fn test_handle_after_local_buffer_not_tracked() {
 
     // Should return the buffer unwrapped
     match result {
-        RewriteResult::Rewritten(op) => {
+        Some(op) => {
             assert!(matches!(op.op(), Op::DefineLocal(_)));
             // Local buffer should NOT be in buffer map
             assert!(!ctx.has_buffer(&local_buf));
@@ -604,7 +561,7 @@ fn test_handle_after_global_buffer_tracked() {
 
     // Should return the buffer unwrapped
     match result {
-        RewriteResult::Rewritten(op) => {
+        Some(op) => {
             assert!(matches!(op.op(), Op::DefineGlobal(_)));
             // Global buffer SHOULD be in buffer map
             assert!(ctx.has_buffer(&global_buf));
@@ -640,7 +597,7 @@ fn test_handle_after_mstack_with_local_buffer() {
 
     // Should unwrap to first buffer in MSTACK
     match result {
-        RewriteResult::Rewritten(op) => {
+        Some(op) => {
             // Verify MSTACK was actually unwrapped to local_buf1 (not just any DEFINE_LOCAL)
             assert!(Rc::ptr_eq(&op, &local_buf1), "Should unwrap to first buffer in MSTACK");
             assert!(matches!(op.op(), Op::DefineLocal(1)));
@@ -673,7 +630,7 @@ fn test_handle_after_mselect_with_local_buffer() {
 
     // Should unwrap to the buffer in MSELECT
     match result {
-        RewriteResult::Rewritten(op) => {
+        Some(op) => {
             // Verify MSELECT was actually unwrapped to local_buf (not just any DEFINE_LOCAL)
             assert!(Rc::ptr_eq(&op, &local_buf), "Should unwrap to buffer from MSELECT");
             assert!(matches!(op.op(), Op::DefineLocal(3)));
@@ -716,13 +673,13 @@ fn test_handle_after_mixed_address_spaces() {
 
     // Verify both returned Rewritten with correct buffers
     match result_local {
-        RewriteResult::Rewritten(op) => {
+        Some(op) => {
             assert!(Rc::ptr_eq(&op, &local_buf), "Local AFTER should return local buffer");
         }
         _ => panic!("Expected Rewritten for local"),
     }
     match result_global {
-        RewriteResult::Rewritten(op) => {
+        Some(op) => {
             assert!(Rc::ptr_eq(&op, &global_buf), "Global AFTER should return global buffer");
         }
         _ => panic!("Expected Rewritten for global"),

@@ -31,7 +31,7 @@ fn test_noop_bufferize_same_ranges() {
     let indexed = UOp::index(bufferized, ranges).expect("Failed to create INDEX");
 
     let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed);
+    let result = graph_rewrite(&matcher, indexed, &mut ());
 
     // Should fold to just x
     assert!(Rc::ptr_eq(&result, &x), "Noop BUFFERIZE should be removed");
@@ -48,7 +48,7 @@ fn test_noop_bufferize_different_ranges() {
     let indexed = UOp::index(bufferized.clone(), vec![range2]).expect("Failed to create INDEX");
 
     let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed.clone());
+    let result = graph_rewrite(&matcher, indexed.clone(), &mut ());
 
     // Should NOT fold - ranges are different
     assert!(Rc::ptr_eq(&result, &indexed), "Should not fold with different ranges");
@@ -66,7 +66,7 @@ fn test_noop_bufferize_multiple_ranges() {
     let indexed = UOp::index(bufferized, ranges).expect("Failed to create INDEX");
 
     let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed);
+    let result = graph_rewrite(&matcher, indexed, &mut ());
 
     // Should fold to just x
     assert!(Rc::ptr_eq(&result, &x), "Noop BUFFERIZE with multiple ranges should be removed");
@@ -83,7 +83,7 @@ fn test_bufferize_const_folding() {
     let bufferized = create_bufferize(const_val.clone(), vec![range]);
 
     let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, bufferized);
+    let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should fold to just the constant
     assert!(Rc::ptr_eq(&result, &const_val), "BUFFERIZE(CONST) should fold to CONST");
@@ -105,7 +105,7 @@ fn test_bufferize_different_const_types() {
         let bufferized = create_bufferize(const_val.clone(), vec![range]);
 
         let matcher = buffer_folding();
-        let result = graph_rewrite(&matcher, bufferized);
+        let result = graph_rewrite(&matcher, bufferized, &mut ());
 
         assert!(Rc::ptr_eq(&result, &const_val), "BUFFERIZE(CONST) should fold for {:?}", dtype);
     }
@@ -122,7 +122,7 @@ fn test_index_const_folding() {
     let indexed = UOp::index(const_val.clone(), vec![range]).expect("Failed to create INDEX");
 
     let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed);
+    let result = graph_rewrite(&matcher, indexed, &mut ());
 
     // Should fold to just the constant
     assert!(Rc::ptr_eq(&result, &const_val), "INDEX(CONST) should fold to CONST");
@@ -137,7 +137,7 @@ fn test_index_const_multiple_indices() {
     let indexed = UOp::index(const_val.clone(), ranges).expect("Failed to create INDEX");
 
     let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed);
+    let result = graph_rewrite(&matcher, indexed, &mut ());
 
     assert!(Rc::ptr_eq(&result, &const_val), "INDEX(CONST) with multiple indices should fold");
 }
@@ -153,7 +153,7 @@ fn test_copy_const_folding() {
     let copy = UOp::new(Op::Copy { src: const_val.clone(), device }, DType::Int32);
 
     let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, copy);
+    let result = graph_rewrite(&matcher, copy, &mut ());
 
     // Should fold to just the constant (device doesn't matter for constants)
     assert!(Rc::ptr_eq(&result, &const_val), "COPY(CONST) should fold to CONST");
@@ -171,7 +171,7 @@ fn test_copy_const_different_devices() {
         let copy = UOp::new(Op::Copy { src: const_val.clone(), device }, DType::Float32);
 
         let matcher = buffer_folding();
-        let result = graph_rewrite(&matcher, copy);
+        let result = graph_rewrite(&matcher, copy, &mut ());
 
         assert!(Rc::ptr_eq(&result, &const_val), "COPY(CONST) should fold regardless of device");
     }
@@ -189,7 +189,7 @@ fn test_nested_constant_folding() {
     let indexed = UOp::index(bufferized, vec![range]).expect("Failed to create INDEX");
 
     let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed);
+    let result = graph_rewrite(&matcher, indexed, &mut ());
 
     // Should fold all the way to the constant
     assert!(Rc::ptr_eq(&result, &const_val), "Nested constant operations should fold completely");
@@ -208,7 +208,7 @@ fn test_noop_fold_non_const_operations() {
     let indexed = UOp::index(bufferized.clone(), vec![range]).expect("Failed to create INDEX");
 
     let matcher = buffer_folding();
-    let result = graph_rewrite(&matcher, indexed.clone());
+    let result = graph_rewrite(&matcher, indexed.clone(), &mut ());
 
     // Should fold - noop buffer removal works for all operations
     assert!(Rc::ptr_eq(&result, &add), "Noop BUFFERIZE+INDEX should fold regardless of operation type");

@@ -1,47 +1,9 @@
 //! Two-stage reduction splitting for large tensors.
 //!
-//! This module implements the `split_reduceop` optimization, which transforms
-//! large single-stage reductions into two-stage reductions for better parallelism
-//! and memory locality.
-//!
-//! ## Algorithm Overview
-//!
-//! For reductions where `prod(input_shape) / prod(output_shape) >= threshold`:
-//!
-//! 1. **Detect expanded dimensions** - Find which dimensions are broadcast (expanded)
-//! 2. **Find split candidates** - Search for valid (dimension, divisor) pairs
-//! 3. **Apply transformation** - Split into two stages:
-//!    - Reshape input to split one reduction dimension
-//!    - Permute to move split dim to end (memory locality)
-//!    - Reduce original axes (first stage - parallel)
-//!    - Add CONTIGUOUS barrier (materialize intermediate)
-//!    - Reduce the split dimension (second stage)
-//!    - Reshape back to original output shape
-//!
-//! ## Example Transformation
-//!
-//! ```ignore
-//! // Before: sum((1_000_000,)) - poor parallelism, 1 kernel
-//! REDUCE_AXIS(tensor, op=ADD, axes=[0])
-//!
-//! // After: reshape + two-stage reduce - 8000 parallel kernels
-//! tensor
-//!   .reshape([125, 8000])
-//!   .permute([1, 0])
-//!   .reduce_axis(ADD, [1])    // 8000 parallel reductions
-//!   .contiguous()             // Materialize intermediate [8000]
-//!   .reduce_axis(ADD, [0])    // Final reduction
-//!   .reshape([])              // Back to scalar
-//! ```
-//!
-//! ## Performance Model
-//!
-//! - **Threshold:** `prod(input_shape) / prod(output_shape) >= 32768`
-//! - **Output Cap:** `prod(output_shape) * divisor <= 2^22` (~4M elements)
-//! - **Divisor Range:** 8 to 256
-//! - **Speedup:** 2-10x for large tensor reductions (>32K elements)
-//!
-//! Based on Tinygrad's split_reduceop (tinygrad/schedule/rangeify.py:37-58).
+//! Splits large reductions into two stages for better parallelism:
+//! - Threshold: input/output ratio >= 32768
+//! - Divisor range: 8-256, output cap: 2^22 elements
+//! - Speedup: 2-10x for large reductions
 
 use std::{
     collections::{HashMap, HashSet},
@@ -57,63 +19,17 @@ use smallvec::SmallVec;
 // ============================================================================
 
 /// Configuration for split_reduceop optimization.
-///
-/// Controls when and how large reductions are split into two-stage operations
-/// for better parallelism and memory locality.
-///
-/// # Examples
-///
-/// ```ignore
-/// // Use default configuration
-/// let config = SplitReduceOpConfig::default();
-///
-/// // Custom configuration
-/// let config = SplitReduceOpConfig {
-///     split_threshold: 65536,
-///     ..Default::default()
-/// };
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitReduceOpConfig {
-    /// Minimum reduction size threshold to trigger splitting.
-    ///
-    /// Only reductions where `prod(input_shape) / prod(output_shape) >= threshold`
-    /// will be split. This ensures overhead of two kernels is justified.
-    ///
-    /// Default: 32768 (from Tinygrad REDUCEOP_SPLIT_THRESHOLD)
-    /// Rationale: Below this, single-kernel overhead < two-kernel overhead
+    /// Minimum input/output ratio to trigger splitting (default: 32768)
     pub split_threshold: usize,
-
-    /// Maximum output buffer size (2^N elements) for intermediate results.
-    ///
-    /// Caps the size of the intermediate buffer created by the first reduction stage.
-    /// Prevents excessive memory usage while maintaining parallelism.
-    ///
-    /// Default: 22 (4,194,304 elements = ~16MB for float32)
-    /// Rationale: Achieves max occupancy with enough locals+upcasts for GEMM
-    ///            ~2^10 should be enough if GROUP is used
+    /// Max output buffer size as 2^N elements (default: 22 = 4M elements)
     pub output_size_bits: u32,
-
-    /// Maximum split divisor (how many chunks to split into).
-    ///
-    /// Limits the divisor used to split reduction dimensions.
-    /// Higher values = more parallelism but more overhead.
-    ///
-    /// Default: 256
-    /// Rationale: "negligible reduce" for low prod(reduce.shape)
+    /// Max split divisor (default: 256)
     pub max_divisor: usize,
-
-    /// Minimum split divisor (lower bound on chunking).
-    ///
-    /// Ensures meaningful parallelism from splitting.
-    ///
-    /// Default: 8
-    /// Rationale: Minimum benefit threshold
+    /// Min split divisor (default: 8)
     pub min_divisor: usize,
-
-    /// Enable/disable the optimization.
-    ///
-    /// Default: true
+    /// Enable/disable the optimization (default: true)
     pub enabled: bool,
 }
 
@@ -134,32 +50,7 @@ impl SplitReduceOpConfig {
 // Helper Functions
 // ============================================================================
 
-/// Extract all RANGE axis IDs from an indexed UOp.
-///
-/// This walks the UOp tree and collects the `axis_id` field from all RANGE
-/// operations. Used to determine which input dimensions are actually accessed
-/// (vs. dimensions that are broadcast/expanded).
-///
-/// # Algorithm
-/// 1. Perform topological sort of the UOp graph
-/// 2. Filter for RANGE operations
-/// 3. Extract axis_id from each RANGE
-/// 4. Return as sorted Vec for stable comparison
-///
-/// # Arguments
-/// - `indexed`: The UOp after indexing (result of `base.index(ranges)`)
-///
-/// # Returns
-/// Sorted vector of axis IDs that appear in RANGE operations
-///
-/// # Examples
-/// ```ignore
-/// let range0 = UOp::range_const(10, 0);  // axis_id = 0
-/// let range1 = UOp::range_const(5, 1);   // axis_id = 1
-/// let indexed = buffer.index(vec![range0, range1]).unwrap();
-/// let range_ids = collect_range_ids(&indexed);
-/// assert_eq!(range_ids, vec![0, 1]);
-/// ```
+/// Extract all RANGE axis IDs from a UOp tree (sorted, deduplicated).
 pub fn collect_range_ids(indexed: &Rc<UOp>) -> Vec<usize> {
     let mut range_ids: Vec<usize> = indexed
         .toposort()
@@ -195,22 +86,7 @@ struct SplitCandidate {
 // Core Algorithm Functions
 // ============================================================================
 
-/// Detect which dimensions are expanded (broadcast).
-///
-/// A dimension is "expanded" if it's broadcast from size 1 to a larger size.
-/// These dimensions don't actually consume memory and cannot be split.
-///
-/// # Algorithm
-///
-/// 1. Create INDEX with fresh RANGE for each dimension
-/// 2. Substitute source buffer with NOOP (breaks dependency cycles)
-/// 3. Apply movement patterns to transform movement ops into index arithmetic
-/// 4. Collect range IDs that appear in the transformed expression
-/// 5. Dimensions whose ranges disappeared are expanded
-///
-/// # Returns
-///
-/// Vec<bool> where true = dimension is expanded (can't split)
+/// Detect expanded (broadcast) dimensions. Returns Vec<bool> where true = expanded.
 fn detect_expanded_dimensions(source: &Rc<UOp>, input_shape: &[SInt]) -> Vec<bool> {
     // Step 1: Create fresh RANGEs for each dimension
     let ranges: Vec<Rc<UOp>> = input_shape
@@ -257,7 +133,7 @@ fn detect_expanded_dimensions(source: &Rc<UOp>, input_shape: &[SInt]) -> Vec<boo
     use crate::rewrite::graph_rewrite;
 
     let pm_mops = movement_op_patterns();
-    let transformed = graph_rewrite(&pm_mops, substituted);
+    let transformed = graph_rewrite(&pm_mops, substituted, &mut ());
 
     // Step 5: Collect range IDs that appear in transformed graph
     let surviving_range_ids = collect_range_ids(&transformed);
@@ -267,21 +143,7 @@ fn detect_expanded_dimensions(source: &Rc<UOp>, input_shape: &[SInt]) -> Vec<boo
     input_shape.iter().enumerate().map(|(axis_id, _)| !surviving_set.contains(&axis_id)).collect()
 }
 
-/// Find valid split candidates ranked by preference.
-///
-/// # Algorithm
-///
-/// 1. For each reduce axis:
-///    - Check if dimension is expanded (skip if yes)
-///    - For divisors in range [max_divisor, min_divisor] (descending):
-///      - Check if dimension size is divisible by divisor
-///      - Calculate output buffer size
-///      - Check if size is within cap
-///      - Add to candidates if valid
-///
-/// # Returns
-///
-/// Vec of SplitCandidate, sorted by preference (larger divisor = better parallelism).
+/// Find valid split candidates (larger divisor = better parallelism).
 fn find_split_candidates(
     reduce: &Rc<UOp>,
     input_shape: &[SInt],
@@ -339,16 +201,7 @@ fn find_split_candidates(
     candidates
 }
 
-/// Apply the two-stage reduction transformation.
-///
-/// # Transformation Steps
-///
-/// 1. **Reshape:** Split dimension into (divisor, remainder)
-/// 2. **Permute:** Move split dimension to end for memory locality
-/// 3. **First Reduce:** Reduce original axes (now shifted due to reshape)
-/// 4. **Contiguous:** Materialize intermediate results
-/// 5. **Second Reduce:** Reduce the split dimension
-/// 6. **Reshape:** Back to original output shape
+/// Apply two-stage transformation: reshape → permute → reduce1 → contiguous → reduce2 → reshape.
 fn apply_split_transformation(
     source: &Rc<UOp>,
     reduce: &Rc<UOp>,
@@ -442,41 +295,7 @@ fn apply_split_transformation(
 // Main Entry Point
 // ============================================================================
 
-/// Split large REDUCE_AXIS operations into two-stage reductions.
-///
-/// # Algorithm
-/// For reductions where `prod(input_shape) / prod(output_shape) >= threshold`:
-/// 1. Detect expanded dimensions (via rangeify + range ID collection)
-/// 2. Find best split candidate (divisor that fits output cap)
-/// 3. Apply transformation:
-///    - Reshape input to split one reduction dimension
-///    - Permute to move split dim to end
-///    - Reduce original axes
-///    - Add CONTIGUOUS barrier
-///    - Reduce the split dimension
-///    - Reshape back to original output shape
-///
-/// # Arguments
-/// - `reduce`: The REDUCE_AXIS operation to potentially split
-/// - `config`: Configuration for split thresholds and caps
-///
-/// # Returns
-/// - `Some(UOp)`: Transformed two-stage reduction
-/// - `None`: No transformation (doesn't meet criteria or not beneficial)
-///
-/// # Example Transformation
-/// ```ignore
-/// // Before: sum((1000000,)) - poor parallelism
-/// REDUCE_AXIS(src: (1000000,), op: ADD, axes: [0])
-///
-/// // After: reshape(1000, 1000).sum(1).sum(0) - 1000 parallel kernels
-/// let reshaped = src.reshape((1000, 1000));
-/// let permuted = reshaped.permute((1, 0));
-/// let first_reduce = permuted.reduce_axis(ADD, [0]);
-/// let contiguous = first_reduce.contiguous();
-/// let second_reduce = contiguous.reduce_axis(ADD, [1]);
-/// second_reduce.reshape(reduce.shape())
-/// ```
+/// Split large REDUCE_AXIS into two stages when input/output ratio >= threshold.
 pub fn split_reduceop(reduce: &Rc<UOp>, config: &SplitReduceOpConfig) -> Option<Rc<UOp>> {
     // Check if enabled
     if !config.enabled {

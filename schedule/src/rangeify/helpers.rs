@@ -4,13 +4,7 @@ use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, Op, SInt, UOp};
 use std::rc::Rc;
 
-/// Check if a constant value is the identity element for a given binary operation.
-///
-/// Identity elements:
-/// - Add/Sub: 0
-/// - Mul/Div: 1
-/// - And: all bits set
-/// - Or/Xor: 0
+/// Check if value is identity for op (Add: 0, Mul: 1, And: -1, Or/Xor: 0).
 pub fn is_identity_value(value: &ConstValue, op: &BinaryOp, is_right: bool) -> bool {
     match (op, value) {
         // Addition: x + 0 = x, 0 + x = x
@@ -42,12 +36,7 @@ pub fn is_identity_value(value: &ConstValue, op: &BinaryOp, is_right: bool) -> b
     }
 }
 
-/// Check if a constant value is the zero element for a given binary operation.
-///
-/// Zero elements (annihilators):
-/// - Mul: 0 (x * 0 = 0)
-/// - And: 0 (x & 0 = 0)
-/// - Or: all bits set (x | -1 = -1)
+/// Check if value is zero/annihilator for op (Mul: 0, And: 0).
 pub fn is_zero_value(value: &ConstValue, op: &BinaryOp) -> bool {
     match (op, value) {
         // Multiplication: x * 0 = 0
@@ -94,29 +83,7 @@ pub fn get_binary_op(uop: &Rc<UOp>) -> Option<BinaryOp> {
     }
 }
 
-/// Apply a movement operation to transform input ranges.
-///
-/// This is the core function for converting movement ops to index transformations.
-/// Each movement operation defines how output ranges map to input ranges.
-///
-/// # Arguments
-///
-/// * `op` - The movement operation to apply
-/// * `in_shape` - The input shape (before movement)
-/// * `rngs` - The output ranges (indices into the result)
-///
-/// # Returns
-///
-/// The transformed input ranges (indices into the source)
-///
-/// # Movement Op Transformations
-///
-/// - **SHRINK**: Add offset to each range: `rng[i] + begin[i]`
-/// - **PERMUTE**: Reorder ranges: `rngs[inv_perm[i]]`
-/// - **FLIP**: Reverse indices: `(shape[i]-1) - rng[i]` if flipped
-/// - **EXPAND**: Replace with 0 for broadcast dims
-/// - **PAD**: Add valid checks and subtract padding
-/// - **RESHAPE**: Complex multi-dim index arithmetic (flatten → unflatten)
+/// Transform ranges through a movement op (SHRINK, PERMUTE, FLIP, EXPAND, PAD, RESHAPE).
 pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>]) -> Vec<Rc<UOp>> {
     use morok_ir::SInt;
 
@@ -312,85 +279,17 @@ fn argsort(perm: &[usize]) -> Vec<usize> {
     inv
 }
 
-/// Check if two range lists are structurally equal.
-///
-/// Two ranges are considered equal if they are pointer-equal (same UOp).
-/// This is used to detect noop BUFFERIZE operations where INDEX uses
-/// the same ranges.
+/// Check if two range lists are pointer-equal (same UOps).
 pub fn ranges_equal(ranges1: &[Rc<UOp>], ranges2: &[Rc<UOp>]) -> bool {
     ranges1.len() == ranges2.len() && ranges1.iter().zip(ranges2).all(|(r1, r2)| Rc::ptr_eq(r1, r2))
 }
 
-/// Check if an operation should always run (never removed by buffer optimization).
-///
-/// These operations have important side effects or semantic requirements:
-/// - CONTIGUOUS: Forces contiguous memory layout
-/// - COPY: Moves data between devices
-/// - ASSIGN: Writes to a specific location
-/// - NOOP: Placeholder that must be preserved
+/// Check if op should always run (CONTIGUOUS, COPY, ASSIGN, NOOP).
 pub fn is_always_run_op(op: &Op) -> bool {
     matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Assign { .. } | Op::Noop)
 }
 
-/// Count the number of buffer-like operations accessed in a UOp tree.
-///
-/// Buffer-like operations include:
-/// - BUFFER, BUFFER_VIEW: Actual buffers
-/// - MSTACK, MSELECT: Multi-buffer operations
-/// - DEFINE_GLOBAL, DEFINE_LOCAL: Global/local memory
-///
-/// This is used in cost-based buffer removal to decide if buffering
-/// reduces the number of memory accesses.
-#[allow(clippy::mutable_key_type)]
-pub fn count_buffer_accesses(uop: &Rc<UOp>) -> usize {
-    use morok_ir::UOpKey;
-    use std::collections::HashSet;
-
-    let mut visited = HashSet::new();
-    let mut count = 0;
-
-    fn visit(uop: &Rc<UOp>, visited: &mut HashSet<UOpKey>, count: &mut usize) {
-        let key = UOpKey(Rc::clone(uop));
-        if !visited.insert(key) {
-            return; // Already visited
-        }
-
-        // Check if this is a buffer-like operation
-        if matches!(
-            uop.op(),
-            Op::Buffer { .. }
-                | Op::BufferView { .. }
-                | Op::MStack { .. }
-                | Op::MSelect { .. }
-                | Op::DefineGlobal(_)
-                | Op::DefineLocal(_)
-        ) {
-            *count += 1;
-        }
-
-        // Recursively visit children
-        for child in uop.op().sources() {
-            visit(&child, visited, count);
-        }
-    }
-
-    visit(uop, &mut visited, &mut count);
-    count
-}
-
-/// Check if a range represents a dead axis (size 1).
-///
-/// A range is dead if it iterates 0 or 1 times (size ≤ 1).
-///
-/// Uses vmax analysis to detect both constant and symbolic dead ranges:
-/// - Constant: RANGE(1) has vmax = 0
-/// - Symbolic: Variable bounded to [1,1] has vmax = 0
-/// - Arithmetic: Expression that simplifies to 1 has vmax = 0
-///
-/// For RANGE(end), the vmax is end - 1 (maximum loop variable value).
-/// If vmax ≤ 0, the range iterates at most once (dead axis).
-///
-/// Dead axes can be removed from BUFFERIZE operations to simplify indexing.
+/// Check if range is dead (size ≤ 1). Uses vmax analysis.
 pub fn is_dead_axis(range: &Rc<UOp>) -> bool {
     if !matches!(range.op(), Op::Range { .. }) {
         return false;
@@ -406,20 +305,7 @@ pub fn is_dead_axis(range: &Rc<UOp>) -> bool {
     }
 }
 
-/// Check if an operation is cheap to inline (low recomputation cost).
-///
-/// Cheap operations include:
-/// - Nullary ops: CONST, DEFINE_VAR, DEVICE, NOOP
-/// - Unary ops: Simple transformations
-/// - Binary ops: Arithmetic, comparisons
-/// - Type conversions: CAST, BITCAST
-/// - Indexing: GEP (vector element access)
-///
-/// Expensive operations (worth buffering):
-/// - Memory ops: LOAD, STORE
-/// - Reductions: REDUCE, REDUCE_AXIS
-/// - Special ops: WMMA, CONTRACT
-/// - Control flow: IF, RANGE (already buffered)
+/// Check if op is cheap to inline (CONST, Unary, Binary, Ternary, Cast, Gep, Vectorize).
 pub fn is_cheap_to_inline(op: &Op) -> bool {
     matches!(
         op,
@@ -445,67 +331,7 @@ pub fn is_cheap_to_inline(op: &Op) -> bool {
     )
 }
 
-/// Count how many times a UOp is used in a computation tree.
-///
-/// This helps determine if buffering is beneficial:
-/// - Used once: buffering may not help (unless compute is expensive)
-/// - Used multiple times: buffering avoids recomputation
-///
-/// Note: This is a simplified version that doesn't track parent relationships.
-/// A more sophisticated implementation would build a use-def graph.
-#[allow(clippy::mutable_key_type)]
-pub fn count_uses(target: &Rc<UOp>, root: &Rc<UOp>) -> usize {
-    use morok_ir::UOpKey;
-    use std::collections::HashSet;
-
-    let mut visited = HashSet::new();
-    let mut count = 0;
-    let target_key = UOpKey(Rc::clone(target));
-
-    fn visit(uop: &Rc<UOp>, target_key: &UOpKey, visited: &mut HashSet<UOpKey>, count: &mut usize) {
-        let key = UOpKey(Rc::clone(uop));
-        if !visited.insert(key) {
-            return; // Already visited
-        }
-
-        // Check if this UOp uses the target
-        for child in uop.op().sources() {
-            let child_key = UOpKey(Rc::clone(&child));
-            if child_key == *target_key {
-                *count += 1;
-            }
-            visit(&child, target_key, visited, count);
-        }
-    }
-
-    visit(root, &target_key, &mut visited, &mut count);
-    count
-}
-
-/// Check if a UOp has no RANGE dependencies.
-///
-/// This is critical for reduce_collapse: after symbolic simplification,
-/// we verify that all ranges have been eliminated before accepting the result.
-///
-/// # Algorithm
-///
-/// Uses `in_scope_ranges()` to get all ranges this UOp depends on, then
-/// checks if any of them are actual RANGE operations.
-///
-/// # Example
-///
-/// ```ignore
-/// // Has range dependency
-/// let range = UOp::range_axis(end, 0, AxisType::Loop);
-/// let sum = range.try_add_op(&const_5).unwrap();
-/// assert!(!no_range(&sum)); // false - depends on range
-///
-/// // No range dependency
-/// let const_val = UOp::const_(DType::Int32, ConstValue::Int(42));
-/// assert!(no_range(&const_val)); // true - no ranges
-/// ```
-///
-/// Based on Tinygrad's `no_range()` (tinygrad/codegen/simplify.py:66)
+/// Check if UOp has no RANGE dependencies.
 pub fn no_range(uop: &Rc<UOp>) -> bool {
     #[allow(clippy::mutable_key_type)]
     let in_scope_ranges = uop.in_scope_ranges();
@@ -514,32 +340,7 @@ pub fn no_range(uop: &Rc<UOp>) -> bool {
     !in_scope_ranges.iter().any(|key| matches!(key.0.op(), Op::Range { .. }))
 }
 
-/// Extract the size of a RANGE operation as an i64 constant.
-///
-/// This is used for computing closed-form sums when we know the range size.
-/// Only works for constant-sized ranges; symbolic ranges return None.
-///
-/// # Arguments
-///
-/// * `range` - A RANGE UOp
-///
-/// # Returns
-///
-/// * `Some(size)` - The constant size if available
-/// * `None` - If not a RANGE or if size is symbolic
-///
-/// # Example
-///
-/// ```ignore
-/// let range = UOp::range_axis(
-///     UOp::const_(DType::Index, ConstValue::Int(10)),
-///     0,
-///     AxisType::Loop
-/// );
-/// assert_eq!(range_size_as_i64(&range), Some(10));
-/// ```
-///
-/// Used by reduce_collapse pattern matchers for bound computation.
+/// Extract RANGE size as i64. Returns None for symbolic ranges.
 pub fn range_size_as_i64(range: &Rc<UOp>) -> Option<i64> {
     if let Op::Range { end, .. } = range.op() {
         get_const_value(end).and_then(|cv| match cv {
@@ -552,44 +353,7 @@ pub fn range_size_as_i64(range: &Rc<UOp>) -> Option<i64> {
     }
 }
 
-/// Check if all ranges in a list are structurally equal (ignoring validity masks).
-///
-/// Two ranges are considered equal if their index expressions are identical.
-/// Validity masks (from padding/WHERE operations) are ignored.
-///
-/// This is used for range merging to determine if multiple consumers can share
-/// the same indexing pattern.
-///
-/// # Arguments
-///
-/// * `ranges` - List of range UOps to compare
-///
-/// # Returns
-///
-/// * `true` - All ranges have identical index expressions
-/// * `false` - At least one range differs
-///
-/// # Examples
-///
-/// ```ignore
-/// // Identical ranges (same pointer)
-/// let r1 = UOp::range_axis(end.clone(), 0, AxisType::Loop);
-/// let r2 = r1.clone();
-/// assert!(all_ranges_same(&[r1, r2]));
-///
-/// // Identical ranges (different pointers, same structure)
-/// let end = UOp::const_(DType::Index, ConstValue::Int(10));
-/// let r1 = UOp::range_axis(end.clone(), 0, AxisType::Loop);
-/// let r2 = UOp::range_axis(end.clone(), 0, AxisType::Loop);
-/// assert!(all_ranges_same(&[r1, r2])); // Structurally equal
-///
-/// // Different ranges
-/// let r1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
-/// let r2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(20)), 0, AxisType::Loop);
-/// assert!(!all_ranges_same(&[r1, r2]));
-/// ```
-///
-/// Used by range merging logic in indexing.rs.
+/// Check if all ranges have identical index expressions (ignoring validity masks).
 pub fn all_ranges_same(ranges: &[Rc<UOp>]) -> bool {
     if ranges.is_empty() {
         return true;
@@ -606,44 +370,6 @@ pub fn all_ranges_same(ranges: &[Rc<UOp>]) -> bool {
 }
 
 /// Deep structural equality check for UOps.
-///
-/// Compares two UOps for structural equality, checking:
-/// - Operation type and fields (via PartialEq on Op)
-/// - Data type
-/// - All sources recursively
-///
-/// This is used by range comparison to detect when two ranges have
-/// the same structure even if they're different heap objects.
-///
-/// # Arguments
-///
-/// * `a`, `b` - UOps to compare
-///
-/// # Returns
-///
-/// * `true` - UOps are structurally identical
-/// * `false` - UOps differ in structure
-///
-/// # Examples
-///
-/// ```ignore
-/// // Same pointer - always equal
-/// let x = UOp::const_(DType::Int32, ConstValue::Int(5));
-/// assert!(uop_equal(&x, &x));
-///
-/// // Different pointers, same structure
-/// let x1 = UOp::const_(DType::Int32, ConstValue::Int(5));
-/// let x2 = UOp::const_(DType::Int32, ConstValue::Int(5));
-/// assert!(uop_equal(&x1, &x2)); // hash-consing may make these the same
-///
-/// // Different values
-/// let x1 = UOp::const_(DType::Int32, ConstValue::Int(5));
-/// let x2 = UOp::const_(DType::Int32, ConstValue::Int(10));
-/// assert!(!uop_equal(&x1, &x2));
-/// ```
-///
-/// Note: This is a structural comparison, not pointer comparison.
-/// Hash-consing may cause structurally equal UOps to have the same pointer.
 pub fn uop_equal(a: &Rc<UOp>, b: &Rc<UOp>) -> bool {
     // Fast path: pointer equality
     if Rc::ptr_eq(a, b) {

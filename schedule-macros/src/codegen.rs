@@ -16,6 +16,8 @@ use crate::parser::{
 mod binding_names {
     /// Name for the root UOp in struct patterns (used for field extraction)
     pub const STRUCT_ROOT: &str = "__struct_root";
+    /// Prefix for nested struct bindings (e.g., __nested_0, __nested_1)
+    pub const NESTED_PREFIX: &str = "__nested_";
     /// Name for any constant binding
     pub const CONST: &str = "__const";
     /// Name for zero constant binding
@@ -31,6 +33,108 @@ mod binding_names {
 /// Example: `Cast { src: x, dtype }` - `dtype` is extractable.
 fn has_extractable_fields(fields: &[FieldPattern]) -> bool {
     fields.iter().skip(1).any(|f| matches!(&f.pattern, Pattern::Var(var) if *var == f.name))
+}
+
+/// Tracks duplicate variable names for auto ptr_eq generation.
+///
+/// When a pattern like `Add(x, x)` is used, this tracker:
+/// 1. Records the first `x` normally
+/// 2. Renames the second `x` to `x__dup` and records the pair
+///
+/// The rewrite function then generates `Rc::ptr_eq(&x, &x__dup)` checks.
+#[derive(Default)]
+struct DuplicateTracker {
+    /// Variable names we've seen so far
+    seen: std::collections::HashSet<String>,
+    /// Pairs of (original_name, duplicate_name) for ptr_eq generation
+    duplicates: Vec<(String, String)>,
+}
+
+impl DuplicateTracker {
+    /// Process a variable name, returning the name to use in the pattern.
+    /// If this is a duplicate, returns a renamed version and records the pair.
+    fn process_name(&mut self, name: &str) -> String {
+        if self.seen.contains(name) {
+            // This is a duplicate - create a unique name
+            let dup_name = format!("{}_dup", name);
+            self.duplicates.push((name.to_string(), dup_name.clone()));
+            dup_name
+        } else {
+            self.seen.insert(name.to_string());
+            name.to_string()
+        }
+    }
+
+    /// Get the duplicate pairs for ptr_eq generation.
+    fn get_duplicates(&self) -> &[(String, String)] {
+        &self.duplicates
+    }
+}
+
+/// Tracks nested struct patterns for field extraction.
+///
+/// When we have nested patterns like `Index { buffer: Bufferize { compute, ranges, .. }, indices }`,
+/// we need to bind both the outer `Index` and inner `Bufferize` to extract their fields.
+struct NestedStructInfo {
+    /// Binding name for this struct level (e.g., "__struct_root" or "__nested_0")
+    binding_name: String,
+    /// The Op name (e.g., "Index", "Bufferize")
+    op_name: String,
+    /// Fields that need extraction at this level: (field_name, var_name)
+    extractable_fields: Vec<(Ident, Ident)>,
+}
+
+/// Recursively collect nested struct information for field extraction.
+///
+/// Walks the pattern tree to find all struct patterns that have extractable fields,
+/// assigning unique binding names to each level (__struct_root for depth 0, __nested_N for deeper).
+fn collect_nested_struct_info(pattern: &Pattern, depth: usize) -> Vec<NestedStructInfo> {
+    let mut result = Vec::new();
+
+    if let Pattern::OpStruct { op, fields, .. } = pattern {
+        let op_name = op.to_string();
+
+        // Check if this op supports field extraction
+        if !EXTRACTABLE_OPS.contains(&op_name.as_str()) {
+            return result;
+        }
+
+        // Collect extractable fields at this level (shorthand fields after the first)
+        let extractable: Vec<(Ident, Ident)> = fields
+            .iter()
+            .skip(1)
+            .filter_map(|f| {
+                if let Pattern::Var(var) = &f.pattern
+                    && *var == f.name
+                {
+                    return Some((f.name.clone(), var.clone()));
+                }
+                None
+            })
+            .collect();
+
+        // Add this level if it has extractable fields
+        if !extractable.is_empty() {
+            let binding_name = if depth == 0 {
+                binding_names::STRUCT_ROOT.to_string()
+            } else {
+                format!("{}{}", binding_names::NESTED_PREFIX, depth - 1)
+            };
+
+            result.push(NestedStructInfo {
+                binding_name,
+                op_name: op_name.clone(),
+                extractable_fields: extractable,
+            });
+        }
+
+        // Recurse into first field (the main UOp child) to find nested structs
+        if let Some(first_field) = fields.first() {
+            result.extend(collect_nested_struct_info(&first_field.pattern, depth + 1));
+        }
+    }
+
+    result
 }
 
 /// Output from pattern generation containing both code and collected names.
@@ -96,35 +200,57 @@ enum OpKind {
 }
 
 /// Generate a `PatternMatcher` from the parsed pattern list.
+///
+/// When `@context Type;` is declared:
+/// - Generates `PatternMatcher<Type>` instead of `PatternMatcher<()>`
+/// - Pattern closures receive `ctx: &mut Type`
+/// - `ctx` is available in RHS expressions
 pub fn generate_pattern_matcher(patterns: &PatternList) -> Result<TokenStream2> {
     let mut pattern_exprs = Vec::new();
+
+    // Determine if we have a context type
+    let has_context = patterns.context_type.is_some();
 
     for item in &patterns.items {
         match item {
             PatternItem::Rule(rule) => {
-                pattern_exprs.push(generate_rule(rule, None)?);
+                pattern_exprs.push(generate_rule(rule, None, has_context)?);
             }
             PatternItem::ForBlock(for_block) => {
-                let expanded = expand_for_block(for_block)?;
+                let expanded = expand_for_block(for_block, has_context)?;
                 pattern_exprs.extend(expanded);
             }
         }
     }
 
-    Ok(quote! {
-        {
-            let mut __patterns: Vec<(
-                morok_schedule::pattern::UPat,
-                morok_schedule::pattern::matcher::RewriteFn
-            )> = Vec::new();
-            #(#pattern_exprs)*
-            morok_schedule::pattern::PatternMatcher::new(__patterns)
-        }
-    })
+    // Generate code based on whether context type is declared
+    if let Some(ref ctx_type) = patterns.context_type {
+        Ok(quote! {
+            {
+                let mut __patterns: Vec<(
+                    morok_schedule::pattern::UPat,
+                    morok_schedule::pattern::matcher::RewriteFn<#ctx_type>
+                )> = Vec::new();
+                #(#pattern_exprs)*
+                morok_schedule::pattern::PatternMatcher::<#ctx_type>::new(__patterns)
+            }
+        })
+    } else {
+        Ok(quote! {
+            {
+                let mut __patterns: Vec<(
+                    morok_schedule::pattern::UPat,
+                    morok_schedule::pattern::matcher::RewriteFn<()>
+                )> = Vec::new();
+                #(#pattern_exprs)*
+                morok_schedule::pattern::PatternMatcher::<()>::new(__patterns)
+            }
+        })
+    }
 }
 
 /// Expand a for-block into multiple pattern rules.
-fn expand_for_block(for_block: &ForBlock) -> Result<Vec<TokenStream2>> {
+fn expand_for_block(for_block: &ForBlock, has_context: bool) -> Result<Vec<TokenStream2>> {
     let var_name = &for_block.var;
     let mut results = Vec::new();
 
@@ -137,7 +263,7 @@ fn expand_for_block(for_block: &ForBlock) -> Result<Vec<TokenStream2>> {
     for op_ident in ops {
         for rule in &for_block.body {
             let ctx = IterContext { var_name: var_name.clone(), op_ident: op_ident.clone(), op_kind: kind };
-            results.push(generate_rule(rule, Some(&ctx))?);
+            results.push(generate_rule(rule, Some(&ctx), has_context)?);
         }
     }
 
@@ -145,28 +271,65 @@ fn expand_for_block(for_block: &ForBlock) -> Result<Vec<TokenStream2>> {
 }
 
 /// Generate code for a single pattern rule.
-fn generate_rule(rule: &PatternRule, iter_ctx: Option<&IterContext>) -> Result<TokenStream2> {
-    let pattern_output = generate_pattern(&rule.lhs, iter_ctx)?;
+///
+/// When `has_context` is true:
+/// - Closure receives `ctx: &mut _` (type inferred from PatternMatcher<C>)
+/// - `ctx` is available for use in RHS expressions
+fn generate_rule(rule: &PatternRule, iter_ctx: Option<&IterContext>, has_context: bool) -> Result<TokenStream2> {
+    let mut dup_tracker = DuplicateTracker::default();
+    let pattern_output = generate_pattern_with_tracker(&rule.lhs, iter_ctx, &mut Some(&mut dup_tracker))?;
     let var_names = pattern_output.all_names();
     let pattern_code = pattern_output.code;
 
-    let (bindings, rewrite_code) =
-        generate_rewrite(&rule.lhs, &rule.rhs, &rule.guard, rule.arrow, iter_ctx, &var_names)?;
+    // Get duplicate pairs for auto ptr_eq generation
+    let duplicate_pairs: Vec<(String, String)> = dup_tracker.get_duplicates().to_vec();
 
-    Ok(quote! {
-        __patterns.push((
-            #pattern_code,
-            Box::new(|__bindings: &morok_schedule::pattern::BindingStore, __intern: &morok_schedule::pattern::VarIntern| {
-                use morok_schedule::pattern::BindingStoreExt;
-                #(#bindings)*
-                #rewrite_code
-            }) as morok_schedule::pattern::matcher::RewriteFn,
-        ));
-    })
+    let (bindings, rewrite_code) =
+        generate_rewrite(&rule.lhs, &rule.rhs, &rule.guard, rule.arrow, iter_ctx, &var_names, &duplicate_pairs)?;
+
+    // Generate closure with appropriate context parameter name
+    // When has_context is true, use `ctx` so it's available in RHS expressions
+    // When has_context is false, use `_ctx` to silence unused warnings
+    if has_context {
+        Ok(quote! {
+            __patterns.push((
+                #pattern_code,
+                Box::new(|__bindings: &morok_schedule::pattern::BindingStore, __intern: &morok_schedule::pattern::VarIntern, ctx: &mut _| {
+                    use morok_schedule::pattern::BindingStoreExt;
+                    #(#bindings)*
+                    #rewrite_code
+                }),
+            ));
+        })
+    } else {
+        Ok(quote! {
+            __patterns.push((
+                #pattern_code,
+                Box::new(|__bindings: &morok_schedule::pattern::BindingStore, __intern: &morok_schedule::pattern::VarIntern, _ctx: &mut ()| {
+                    use morok_schedule::pattern::BindingStoreExt;
+                    #(#bindings)*
+                    #rewrite_code
+                }) as morok_schedule::pattern::matcher::RewriteFn<()>,
+            ));
+        })
+    }
 }
 
 /// Generate a UPat expression from a pattern, returning both code and collected names.
+/// This is a wrapper that doesn't track duplicates.
 fn generate_pattern(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Result<PatternOutput> {
+    generate_pattern_with_tracker(pattern, iter_ctx, &mut None)
+}
+
+/// Generate a UPat expression from a pattern with optional duplicate tracking.
+///
+/// When `dup_tracker` is Some, variable names are tracked for auto ptr_eq generation.
+/// Duplicate variable names (like `x` in `Add(x, x)`) are renamed and recorded.
+fn generate_pattern_with_tracker(
+    pattern: &Pattern,
+    iter_ctx: Option<&IterContext>,
+    dup_tracker: &mut Option<&mut DuplicateTracker>,
+) -> Result<PatternOutput> {
     match pattern {
         Pattern::Wildcard => {
             // Wildcard matches any UOp but doesn't bind
@@ -183,34 +346,116 @@ fn generate_pattern(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Result
         }
 
         Pattern::Var(name) => {
-            let name_str = name.to_string();
-            let code = quote! { morok_schedule::pattern::UPat::var(#name_str) };
-            Ok(PatternOutput::self_only(code, name.clone()))
+            // Process name through duplicate tracker if available
+            let actual_name = if let Some(tracker) = dup_tracker {
+                tracker.process_name(&name.to_string())
+            } else {
+                name.to_string()
+            };
+            let code = quote! { morok_schedule::pattern::UPat::var(#actual_name) };
+            Ok(PatternOutput::self_only(code, Ident::new(&actual_name, name.span())))
         }
 
         Pattern::Binding { name, pattern } => {
-            let inner = generate_pattern(pattern, iter_ctx)?;
-            let name_str = name.to_string();
+            let inner = generate_pattern_with_tracker(pattern, iter_ctx, dup_tracker)?;
+            // Process name through duplicate tracker if available
+            let actual_name = if let Some(tracker) = dup_tracker {
+                tracker.process_name(&name.to_string())
+            } else {
+                name.to_string()
+            };
             let inner_code = inner.code;
-            let code = quote! { #inner_code.named(#name_str) };
+            let code = quote! { #inner_code.named(#actual_name) };
             // KEY: .named() replaces inner's self_name, keeps inner's children
-            Ok(PatternOutput { code, self_name: Some(name.clone()), child_names: inner.child_names })
+            Ok(PatternOutput { code, self_name: Some(Ident::new(&actual_name, name.span())), child_names: inner.child_names })
         }
 
-        Pattern::OpTuple { op, args, rest } => generate_op_tuple_pattern(op, args, iter_ctx, *rest),
+        Pattern::OpTuple { op, args, rest } => generate_op_tuple_pattern_with_tracker(op, args, iter_ctx, *rest, dup_tracker),
 
-        Pattern::OpStruct { op, fields, rest } => generate_op_struct_pattern(op, fields, *rest),
+        Pattern::OpStruct { op, fields, rest } => generate_op_struct_pattern_with_depth(op, fields, *rest, 0),
 
         Pattern::Const(const_pat) => generate_const_pattern(const_pat),
 
-        Pattern::OpVar { var_name, args } => generate_op_var_pattern(var_name, args, iter_ctx),
+        Pattern::OpVar { var_name, args } => generate_op_var_pattern_with_tracker(var_name, args, iter_ctx, dup_tracker),
 
         Pattern::ConstWithValue { uop_name, .. } => {
-            // Generate same pattern as @const but with the uop_name binding
-            let name_str = uop_name.to_string();
-            let code = quote! { morok_schedule::pattern::UPat::cvar(#name_str) };
+            // Process name through duplicate tracker if available
+            let actual_name = if let Some(tracker) = dup_tracker {
+                tracker.process_name(&uop_name.to_string())
+            } else {
+                uop_name.to_string()
+            };
+            let code = quote! { morok_schedule::pattern::UPat::cvar(#actual_name) };
             // Only uop_name is bound; value_name is extracted separately in generate_rewrite
-            Ok(PatternOutput::self_only(code, uop_name.clone()))
+            Ok(PatternOutput::self_only(code, Ident::new(&actual_name, uop_name.span())))
+        }
+
+        Pattern::Any(alternatives) => {
+            // For alternatives, we don't track duplicates ACROSS alternatives
+            // because each alternative is independent. The same variable x in
+            // (Add(x, y) | Mul(x, y)) should NOT be considered a duplicate.
+            // We pass &mut None to disable duplicate tracking within alternatives.
+            let alt_outputs: Vec<PatternOutput> =
+                alternatives.iter().map(|p| generate_pattern_with_tracker(p, iter_ctx, &mut None)).collect::<Result<_>>()?;
+
+            // Collect all names from all alternatives (deduplicated)
+            let mut seen = std::collections::HashSet::new();
+            let child_names: Vec<Ident> = alt_outputs
+                .iter()
+                .flat_map(|o| o.all_names())
+                .filter(|name| seen.insert(name.to_string()))
+                .collect();
+
+            let alt_codes: Vec<&TokenStream2> = alt_outputs.iter().map(|o| &o.code).collect();
+            let code = quote! {
+                morok_schedule::pattern::UPat::any(vec![#(#alt_codes),*])
+            };
+
+            Ok(PatternOutput::children_only(code, child_names))
+        }
+
+        Pattern::OpPermute { op, args } => {
+            // Generate permutation pattern - tries all orderings of arguments
+            let op_name = op.to_string();
+
+            // Collect all child patterns and their names
+            let arg_outputs: Vec<PatternOutput> =
+                args.iter().map(|a| generate_pattern_with_tracker(a, iter_ctx, dup_tracker)).collect::<Result<_>>()?;
+
+            // Collect all names from children in order
+            let child_names: Vec<Ident> = arg_outputs.iter().flat_map(|o| o.all_names()).collect();
+
+            // Extract codes for use in quote!
+            let arg_codes: Vec<&TokenStream2> = arg_outputs.iter().map(|o| &o.code).collect();
+
+            // For binary operations, use binary_commutative
+            // For other arities, generate all permutations as Any
+            let code = if args.len() == 2 {
+                // Binary commutative - use specialized helper
+                // binary_commutative(ops: Vec<BinaryOp>, src: Vec<UPat>)
+                let left = &arg_codes[0];
+                let right = &arg_codes[1];
+
+                // Check if it's a known binary op
+                if BINARY_OPS.contains(&op_name.as_str()) {
+                    let binary_op = format_ident!("{}", op_name);
+                    quote! {
+                        morok_schedule::pattern::UPat::binary_commutative(
+                            vec![morok_ir::BinaryOp::#binary_op],
+                            vec![#left, #right]
+                        )
+                    }
+                } else {
+                    return Err(Error::new_spanned(op, format!("Permutation pattern requires binary op, got: {}", op_name)));
+                }
+            } else {
+                return Err(Error::new_spanned(
+                    op,
+                    format!("Permutation pattern currently only supports binary ops (2 args), got {} args", args.len()),
+                ));
+            };
+
+            Ok(PatternOutput::children_only(code, child_names))
         }
     }
 }
@@ -272,16 +517,17 @@ fn classify_op(op_name: &str) -> OpClass {
 }
 
 /// Generate pattern for tuple-style op: `Add(x, y)` or `End(comp, ..)`
-fn generate_op_tuple_pattern(
+fn generate_op_tuple_pattern_with_tracker(
     op: &Ident,
     args: &[Pattern],
     iter_ctx: Option<&IterContext>,
     rest: bool,
+    dup_tracker: &mut Option<&mut DuplicateTracker>,
 ) -> Result<PatternOutput> {
     let op_name = op.to_string();
 
     // Collect all child patterns and their names
-    let arg_outputs: Vec<PatternOutput> = args.iter().map(|a| generate_pattern(a, iter_ctx)).collect::<Result<_>>()?;
+    let arg_outputs: Vec<PatternOutput> = args.iter().map(|a| generate_pattern_with_tracker(a, iter_ctx, dup_tracker)).collect::<Result<_>>()?;
 
     // Collect all names from children in order
     let child_names: Vec<Ident> = arg_outputs.iter().flat_map(|o| o.all_names()).collect();
@@ -426,16 +672,26 @@ fn generate_special_op_pattern(
 
 /// Generate pattern for struct-style op: `Bufferize { compute: x, .. }`
 ///
-/// This generates a UPat that matches the op and binds it to "__struct_root",
-/// allowing field extraction in the rewrite closure.
-fn generate_op_struct_pattern(op: &Ident, fields: &[FieldPattern], _rest: bool) -> Result<PatternOutput> {
+/// This generates a UPat that matches the op and binds it to a unique name
+/// based on nesting depth, allowing field extraction in the rewrite closure.
+///
+/// - Depth 0: binds to `__struct_root`
+/// - Depth N > 0: binds to `__nested_N-1` (e.g., depth 1 -> `__nested_0`)
+fn generate_op_struct_pattern_with_depth(
+    op: &Ident,
+    fields: &[FieldPattern],
+    _rest: bool,
+    depth: usize,
+) -> Result<PatternOutput> {
     let op_name = op.to_string();
 
     // Find the first UOp child field (the main source pattern)
     let first_field =
         fields.first().ok_or_else(|| Error::new_spanned(op, "Struct pattern must have at least one field"))?;
 
-    let first_output = generate_pattern(&first_field.pattern, None)?;
+    // Recursively generate the first field's pattern, passing incremented depth
+    // if it's also a struct pattern
+    let first_output = generate_pattern_for_nested_struct(&first_field.pattern, depth + 1)?;
     let first_code = &first_output.code;
 
     // Collect child names from the first field (these are nested, so use all_names)
@@ -450,6 +706,7 @@ fn generate_op_struct_pattern(op: &Ident, fields: &[FieldPattern], _rest: bool) 
         "Permute" => quote! { #first_code.f_permute() },
         "Expand" => quote! { #first_code.f_expand() },
         "Reduce" => quote! { #first_code.f_reduce() },
+        "Copy" => quote! { #first_code.f_copy() },
         "Detach" => quote! { morok_schedule::pattern::UPat::detach(#first_code) },
         "ContiguousBackward" => quote! { morok_schedule::pattern::UPat::contiguous_backward(#first_code) },
         _ => {
@@ -458,19 +715,34 @@ fn generate_op_struct_pattern(op: &Ident, fields: &[FieldPattern], _rest: bool) 
     };
 
     // If there are fields beyond the main UOp child that need extraction,
-    // bind the root op so we can extract them in the rewrite closure
+    // bind this op so we can extract them in the rewrite closure
     if has_extractable_fields(fields) {
-        let name = binding_names::STRUCT_ROOT;
-        let code = quote! { #base.named(#name) };
-        // __struct_root becomes the self_name (top-level binding)
+        // Choose binding name based on depth
+        let binding_name = if depth == 0 {
+            binding_names::STRUCT_ROOT.to_string()
+        } else {
+            format!("{}{}", binding_names::NESTED_PREFIX, depth - 1)
+        };
+
+        let code = quote! { #base.named(#binding_name) };
         Ok(PatternOutput {
             code,
-            self_name: Some(Ident::new(binding_names::STRUCT_ROOT, proc_macro2::Span::call_site())),
+            self_name: Some(Ident::new(&binding_name, proc_macro2::Span::call_site())),
             child_names,
         })
     } else {
         // No self_name, just child names from the first field
         Ok(PatternOutput::children_only(base, child_names))
+    }
+}
+
+/// Generate pattern for a field that might be a nested struct.
+/// Passes depth through to nested struct patterns.
+fn generate_pattern_for_nested_struct(pattern: &Pattern, depth: usize) -> Result<PatternOutput> {
+    match pattern {
+        Pattern::OpStruct { op, fields, rest } => generate_op_struct_pattern_with_depth(op, fields, *rest, depth),
+        // For non-struct patterns, use the regular generator
+        _ => generate_pattern(pattern, None),
     }
 }
 
@@ -506,10 +778,11 @@ fn generate_const_pattern(const_pat: &ConstPattern) -> Result<PatternOutput> {
 }
 
 /// Generate pattern for operation variable: `op(x, y)` where `op` is an iteration variable.
-fn generate_op_var_pattern(
+fn generate_op_var_pattern_with_tracker(
     var_name: &Ident,
     args: &[Pattern],
     iter_ctx: Option<&IterContext>,
+    dup_tracker: &mut Option<&mut DuplicateTracker>,
 ) -> Result<PatternOutput> {
     let ctx = iter_ctx.ok_or_else(|| Error::new_spanned(var_name, "Operation variable used outside of for-block"))?;
 
@@ -524,7 +797,7 @@ fn generate_op_var_pattern(
     let op_ident = &ctx.op_ident;
 
     // Collect all child patterns and their names
-    let arg_outputs: Vec<PatternOutput> = args.iter().map(|a| generate_pattern(a, iter_ctx)).collect::<Result<_>>()?;
+    let arg_outputs: Vec<PatternOutput> = args.iter().map(|a| generate_pattern_with_tracker(a, iter_ctx, dup_tracker)).collect::<Result<_>>()?;
 
     // Collect all names from children in order
     let child_names: Vec<Ident> = arg_outputs.iter().flat_map(|o| o.all_names()).collect();
@@ -577,6 +850,105 @@ fn generate_op_var_pattern(
     Ok(PatternOutput::children_only(code, child_names))
 }
 
+/// Collect identifiers used in an expression.
+/// This is used to determine which pattern bindings are actually needed.
+fn collect_used_identifiers(expr: &syn::Expr, used: &mut std::collections::HashSet<String>) {
+    use syn::visit::Visit;
+
+    struct IdentCollector<'a> {
+        used: &'a mut std::collections::HashSet<String>,
+    }
+
+    impl<'ast> Visit<'ast> for IdentCollector<'_> {
+        fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+            self.used.insert(ident.to_string());
+        }
+
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            // For paths like `x` or `Rc::clone`, only collect the first segment
+            // if it's a simple identifier (not a type path like `Rc`)
+            if node.path.segments.len() == 1 {
+                self.used.insert(node.path.segments[0].ident.to_string());
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+    }
+
+    let mut collector = IdentCollector { used };
+    collector.visit_expr(expr);
+}
+
+/// Collect identifiers used in the RHS and guard expressions.
+fn collect_rhs_used_identifiers(
+    rhs: &RewriteExpr,
+    guard: &Option<syn::Expr>,
+) -> std::collections::HashSet<String> {
+    let mut used = std::collections::HashSet::new();
+
+    match rhs {
+        RewriteExpr::Var(name) => {
+            used.insert(name.to_string());
+        }
+        RewriteExpr::Block(block) => {
+            // Visit all statements in the block
+            for stmt in &block.block.stmts {
+                match stmt {
+                    syn::Stmt::Expr(expr, _) => {
+                        collect_used_identifiers(expr, &mut used);
+                    }
+                    syn::Stmt::Local(syn::Local { init: Some(init), .. }) => {
+                        collect_used_identifiers(&init.expr, &mut used);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        RewriteExpr::Expr(expr) => {
+            collect_used_identifiers(expr, &mut used);
+        }
+    }
+
+    if let Some(guard_expr) = guard {
+        collect_used_identifiers(guard_expr, &mut used);
+    }
+
+    used
+}
+
+/// Add dependency bindings for ConstWithValue patterns.
+/// If `c_val` is used, we need to extract `c` first.
+fn add_const_value_dependencies(
+    lhs: &Pattern,
+    used: &mut std::collections::HashSet<String>,
+) {
+    let const_value_bindings = collect_const_value_bindings(lhs);
+    for (uop_name, value_name) in const_value_bindings {
+        // If value_name is used, we need to extract uop_name first
+        if used.contains(&value_name.to_string()) {
+            used.insert(uop_name.to_string());
+        }
+    }
+}
+
+/// Add dependency bindings for struct field extraction.
+/// If any extracted field is used, we need the corresponding struct binding
+/// (__struct_root for outer, __nested_N for nested structs).
+fn add_struct_field_dependencies(
+    lhs: &Pattern,
+    used: &mut std::collections::HashSet<String>,
+) {
+    // Collect all nested struct info and check if any of their fields are used
+    let nested_infos = collect_nested_struct_info(lhs, 0);
+    for info in nested_infos {
+        for (field_name, _) in &info.extractable_fields {
+            if used.contains(&field_name.to_string()) {
+                // This field is used, so we need its struct binding
+                used.insert(info.binding_name.clone());
+            }
+        }
+    }
+}
+
 /// Generate variable bindings and rewrite code.
 fn generate_rewrite(
     lhs: &Pattern,
@@ -585,6 +957,7 @@ fn generate_rewrite(
     arrow: ArrowKind,
     iter_ctx: Option<&IterContext>,
     var_names: &[Ident],
+    duplicate_pairs: &[(String, String)],
 ) -> Result<(Vec<TokenStream2>, TokenStream2)> {
     // Build a map of variable name to index for compile-time lookup
     // The order matches collect_var_names_internal in upat.rs
@@ -597,11 +970,30 @@ fn generate_rewrite(
         }
     }
 
+    // Collect identifiers actually used in RHS and guard
+    // This is important for alternative patterns where different alternatives
+    // may bind different names - we only extract names that are actually used
+    let mut used_identifiers = collect_rhs_used_identifiers(rhs, guard);
+
+    // Add dependency bindings: if c_val is used, we need to extract c first
+    add_const_value_dependencies(lhs, &mut used_identifiers);
+
+    // Add struct field dependencies: if any field is used, we need __struct_root
+    add_struct_field_dependencies(lhs, &mut used_identifiers);
+
+    // Add duplicate pair dependencies: both original and dup names are needed for ptr_eq
+    for (orig, dup) in duplicate_pairs {
+        used_identifiers.insert(orig.clone());
+        used_identifiers.insert(dup.clone());
+    }
+
     // Generate bindings using compile-time indices (no runtime string lookup!)
     // The index matches the order that VarIntern::get_or_insert assigns indices
+    // Only generate bindings for names that are actually used in the RHS/guard
     let mut bindings: Vec<TokenStream2> = unique_var_names
         .iter()
         .enumerate()
+        .filter(|(_, name)| used_identifiers.contains(&name.to_string()))
         .map(|(idx, name)| {
             let idx_u8 = idx as u8;
             quote! {
@@ -612,6 +1004,18 @@ fn generate_rewrite(
             }
         })
         .collect();
+
+    // Generate auto ptr_eq checks for duplicate variable names
+    // e.g., Add(x, x) generates: if !Rc::ptr_eq(&x, &x__dup) { return NoMatch }
+    for (orig, dup) in duplicate_pairs {
+        let orig_ident = format_ident!("{}", orig);
+        let dup_ident = format_ident!("{}", dup);
+        bindings.push(quote! {
+            if !std::rc::Rc::ptr_eq(#orig_ident, #dup_ident) {
+                return morok_schedule::pattern::matcher::RewriteResult::NoMatch;
+            }
+        });
+    }
 
     // Add operation variable binding if in iteration context
     if let Some(ctx) = iter_ctx {
@@ -632,11 +1036,9 @@ fn generate_rewrite(
         bindings.insert(0, op_binding);
     }
 
-    // Generate field extraction for struct patterns
-    if let Pattern::OpStruct { op, fields, .. } = lhs {
-        let field_extractions = generate_struct_field_extractions(op, fields)?;
-        bindings.extend(field_extractions);
-    }
+    // Generate field extraction for struct patterns (including nested structs)
+    let field_extractions = generate_nested_field_extractions(lhs);
+    bindings.extend(field_extractions);
 
     // Generate ConstValue extraction for ConstWithValue patterns
     let const_value_bindings = collect_const_value_bindings(lhs);
@@ -713,19 +1115,21 @@ fn generate_fallible_rewrite(rhs: &RewriteExpr, guard: &Option<syn::Expr>) -> To
 }
 
 /// Operations that support field extraction in struct patterns.
-const EXTRACTABLE_OPS: &[&str] = &["Cast", "Permute", "Reduce", "Bufferize", "Reshape", "Expand", "Index"];
+const EXTRACTABLE_OPS: &[&str] = &["Cast", "Permute", "Reduce", "Bufferize", "Reshape", "Expand", "Index", "Copy"];
 
 /// Generate field extraction code for a single field from a struct op.
-fn generate_field_extraction(op_name: &str, field_name: &Ident) -> TokenStream2 {
-    let struct_root = binding_names::STRUCT_ROOT;
+///
+/// The `binding_name` parameter specifies which bound UOp to extract from
+/// (e.g., "__struct_root" for outer struct, "__nested_0" for first nested struct).
+fn generate_field_extraction_from_binding(binding_name: &str, op_name: &str, field_name: &Ident) -> TokenStream2 {
     let op_ident = format_ident!("{}", op_name);
     quote! {
         let #field_name = {
-            let __root = match __intern.get_index(#struct_root).and_then(|i| __bindings.get_by_index(i)) {
+            let __bound = match __intern.get_index(#binding_name).and_then(|i| __bindings.get_by_index(i)) {
                 Some(v) => v,
                 None => return morok_schedule::pattern::matcher::RewriteResult::NoMatch,
             };
-            match __root.op() {
+            match __bound.op() {
                 morok_ir::Op::#op_ident { #field_name, .. } => #field_name.clone(),
                 _ => return morok_schedule::pattern::matcher::RewriteResult::NoMatch,
             }
@@ -733,31 +1137,28 @@ fn generate_field_extraction(op_name: &str, field_name: &Ident) -> TokenStream2 
     }
 }
 
-/// Generate field extraction code for struct patterns.
+/// Generate field extraction code for all nested struct patterns.
 ///
-/// For patterns like `Cast { src: x, dtype }`, this generates code to extract
-/// the `dtype` field from the matched Cast op.
-fn generate_struct_field_extractions(op: &Ident, fields: &[FieldPattern]) -> Result<Vec<TokenStream2>> {
-    let op_name = op.to_string();
-
-    // Check if this op supports field extraction
-    if !EXTRACTABLE_OPS.contains(&op_name.as_str()) {
-        return Ok(vec![]);
-    }
-
+/// This recursively collects all nested struct patterns and generates extraction
+/// code for each level. For example:
+/// - `Index { buffer: x, indices }` extracts `indices` from `__struct_root`
+/// - `Index { buffer: Bufferize { compute, ranges, .. }, indices }` extracts
+///   `indices` from `__struct_root` and `ranges` from `__nested_0`
+fn generate_nested_field_extractions(lhs: &Pattern) -> Vec<TokenStream2> {
+    let nested_infos = collect_nested_struct_info(lhs, 0);
     let mut extractions = Vec::new();
 
-    // Skip the first field (it's the main UOp child, already bound)
-    for field in fields.iter().skip(1) {
-        // Only extract if it's a simple variable matching the field name (shorthand syntax)
-        if let Pattern::Var(var) = &field.pattern
-            && *var == field.name
-        {
-            extractions.push(generate_field_extraction(&op_name, &field.name));
+    for info in nested_infos {
+        for (field_name, _var_name) in &info.extractable_fields {
+            extractions.push(generate_field_extraction_from_binding(
+                &info.binding_name,
+                &info.op_name,
+                field_name,
+            ));
         }
     }
 
-    Ok(extractions)
+    extractions
 }
 
 /// Collect ConstWithValue patterns for value binding generation.
@@ -786,6 +1187,16 @@ fn collect_const_value_bindings_recursive(pattern: &Pattern, bindings: &mut Vec<
             collect_const_value_bindings_recursive(pattern, bindings);
         }
         Pattern::OpVar { args, .. } => {
+            for arg in args {
+                collect_const_value_bindings_recursive(arg, bindings);
+            }
+        }
+        Pattern::Any(alternatives) => {
+            for alt in alternatives {
+                collect_const_value_bindings_recursive(alt, bindings);
+            }
+        }
+        Pattern::OpPermute { args, .. } => {
             for arg in args {
                 collect_const_value_bindings_recursive(arg, bindings);
             }

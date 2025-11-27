@@ -1,4 +1,5 @@
 pub mod advanced_edge_cases;
+pub mod buffer_cost;
 pub mod buffer_folding;
 pub mod buffer_limits;
 pub mod bufferize_to_store;
@@ -76,15 +77,13 @@ fn test_pattern_matchers_stub() {
     // Test that stub pattern matchers return empty matchers
     let m3 = rangeify_patterns::buffer_folding();
     let m4 = rangeify_patterns::buffer_removal();
-    let m5 = rangeify_patterns::kernel_splitting();
 
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
     // Should all return NoMatch since they're empty
     use crate::pattern::matcher::RewriteResult;
-    assert!(matches!(m3.rewrite(&x), RewriteResult::NoMatch));
-    assert!(matches!(m4.rewrite(&x), RewriteResult::NoMatch));
-    assert!(matches!(m5.rewrite(&x), RewriteResult::NoMatch));
+    assert!(matches!(m3.rewrite(&x, &mut ()), RewriteResult::NoMatch));
+    assert!(matches!(m4.rewrite(&x, &mut ()), RewriteResult::NoMatch));
 }
 
 #[test]
@@ -98,7 +97,7 @@ fn test_early_rewrites_detach_removal() {
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let detach = UOp::new(Op::Detach { src: x.clone() }, DType::Float32);
 
-    let result = matcher.rewrite(&detach);
+    let result = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
@@ -116,7 +115,7 @@ fn test_early_rewrites_contiguous_backward_removal() {
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let contiguous = UOp::new(Op::ContiguousBackward { src: x.clone() }, DType::Float32);
 
-    let result = matcher.rewrite(&contiguous);
+    let result = matcher.rewrite(&contiguous, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(std::rc::Rc::ptr_eq(&rewritten, &x));

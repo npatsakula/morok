@@ -25,7 +25,7 @@ fn test_identity_add_zero() {
     let expr = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), zero), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to x
     assert!(Rc::ptr_eq(&simplified, &x), "x + 0 should simplify to x");
@@ -42,7 +42,7 @@ fn test_identity_mul_one() {
     let expr = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&x), one), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     assert!(Rc::ptr_eq(&simplified, &x), "x * 1 should simplify to x");
     verify_equivalence(&expr, &simplified).expect("x * 1 should equal x");
@@ -56,7 +56,7 @@ fn test_identity_sub_zero() {
     let expr = UOp::new(Op::Binary(BinaryOp::Sub, Rc::clone(&x), zero), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     assert!(Rc::ptr_eq(&simplified, &x), "x - 0 should simplify to x");
     verify_equivalence(&expr, &simplified).expect("x - 0 should equal x");
@@ -70,7 +70,7 @@ fn test_identity_div_one() {
     let expr = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&x), one), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     assert!(Rc::ptr_eq(&simplified, &x), "x / 1 should simplify to x");
     verify_equivalence(&expr, &simplified).expect("x / 1 should equal x");
@@ -100,7 +100,7 @@ fn test_zero_mul_zero() {
     let expr = UOp::new(Op::Binary(BinaryOp::Mul, x, Rc::clone(&zero)), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
     assert!(Rc::ptr_eq(&simplified, &zero), "x * 0 should simplify to 0");
@@ -115,7 +115,7 @@ fn test_zero_and_zero() {
     let expr = UOp::new(Op::Binary(BinaryOp::And, x, Rc::clone(&zero)), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
     assert!(Rc::ptr_eq(&simplified, &zero), "x & 0 should simplify to 0");
@@ -157,7 +157,7 @@ fn test_self_div_one() {
     let expr = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 1
     match simplified.op() {
@@ -175,7 +175,7 @@ fn test_self_mod_zero() {
     let expr = UOp::new(Op::Binary(BinaryOp::Mod, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
     match simplified.op() {
@@ -193,7 +193,7 @@ fn test_self_and_identity() {
     let expr = UOp::new(Op::Binary(BinaryOp::And, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to x
     assert!(Rc::ptr_eq(&simplified, &x), "x & x should simplify to x");
@@ -215,7 +215,7 @@ fn test_div_cancel_mul() {
     let expr = UOp::new(Op::Binary(BinaryOp::Idiv, a_mul_b, Rc::clone(&b)), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to a
     assert!(Rc::ptr_eq(&simplified, &a), "(a * b) / b should simplify to a");
@@ -232,7 +232,7 @@ fn test_div_chain() {
     let expr = UOp::new(Op::Binary(BinaryOp::Idiv, a_div_b, Rc::clone(&c)), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Verify semantically (structure might differ)
     verify_equivalence(&expr, &simplified).expect("(a / b) / c should be semantically equivalent");
@@ -250,7 +250,7 @@ fn test_div_gcd_factor() {
     let expr = UOp::new(Op::Binary(BinaryOp::Idiv, a_mul_6, b_mul_6), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Verify semantically
     verify_equivalence(&expr, &simplified).expect("(a * c) / (b * c) should be semantically equivalent");
@@ -263,7 +263,7 @@ fn test_mod_self_zero() {
     let expr = UOp::new(Op::Binary(BinaryOp::Mod, Rc::clone(&a), Rc::clone(&a)), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
     match simplified.op() {
@@ -285,7 +285,7 @@ fn test_term_combine_add() {
     let expr = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Verify semantically (might be 2*x or x*2 or x+x)
     verify_equivalence(&expr, &simplified).expect("x + x should be semantically equivalent to 2 * x");
@@ -303,7 +303,7 @@ fn test_term_combine_coefficients() {
     let expr = UOp::new(Op::Binary(BinaryOp::Add, two_x, three_x), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Verify semantically
     verify_equivalence(&expr, &simplified).expect("(2 * x) + (3 * x) should equal 5 * x");
@@ -320,7 +320,7 @@ fn test_const_folding_add() {
     let expr = UOp::new(Op::Binary(BinaryOp::Add, x_plus_3, five), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Verify semantically
     verify_equivalence(&expr, &simplified).expect("(x + 3) + 5 should equal x + 8");
@@ -337,7 +337,7 @@ fn test_const_folding_mul() {
     let expr = UOp::new(Op::Binary(BinaryOp::Mul, x_mul_2, three), DType::Int32);
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Verify semantically
     verify_equivalence(&expr, &simplified).expect("(x * 2) * 3 should equal x * 6");

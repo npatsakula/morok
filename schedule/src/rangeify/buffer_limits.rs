@@ -1,38 +1,7 @@
 //! Buffer limit enforcement for device-specific constraints.
 //!
-//! This module implements **active buffer limit enforcement** following Tinygrad's approach:
-//! when a computation accesses more buffers than the device supports, force bufferization
-//! of elementwise sources to reduce buffer count.
-//!
-//! # Device Limits
-//!
-//! Different hardware has different buffer/argument limits per kernel:
-//! - **Metal**: 31 buffers (Apple Silicon hardware limit)
-//! - **WebGPU**: 8 buffers (WebGPU specification limit)
-//! - **CPU/CUDA**: No practical limit
-//!
-//! # Algorithm
-//!
-//! For each binary/ternary operation in the graph:
-//! 1. Count accessed buffers (using `collect_accessed_buffers`)
-//! 2. If count > max_buffers - 1 (accounting for output buffer):
-//!    - Force bufferization of elementwise sources
-//!    - This materializes intermediate results, reducing buffer count
-//! 3. Otherwise: no transformation
-//!
-//! # Integration
-//!
-//! This runs at **Step 8.5** in the rangeify pipeline:
-//! - After symbolic simplification
-//! - Before bufferize_to_store
-//!
-//! This ensures buffer limits are enforced before kernel splitting.
-//!
-//! # Based on Tinygrad
-//!
-//! - File: `tinygrad/schedule/rangeify.py`
-//! - Function: `limit_bufs()` (lines 268-290)
-//! - Commit: 2c397eb2a (2025-09-30) - "rangeify implements input buffer limiting"
+//! Forces bufferization when buffer count exceeds device limits:
+//! - Metal: 31 buffers, WebGPU: 8 buffers, CPU/CUDA: no limit
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -44,22 +13,7 @@ use super::buffer_cost::collect_accessed_buffers;
 use crate::pattern::UPat;
 use crate::pattern::matcher::{PatternMatcher, RewriteResult};
 
-/// Extract device specification from a UOp graph.
-///
-/// Walks the graph recursively looking for:
-/// - Op::Device operations
-/// - Op::Buffer operations (which contain a device)
-///
-/// Returns the first device found, or None if no device is present in the graph.
-///
-/// # Example
-///
-/// ```ignore
-/// let device = extract_device_from_graph(&computation)?;
-/// if let Some(limit) = device.max_buffers() {
-///     // Enforce buffer limit
-/// }
-/// ```
+/// Extract device specification from a UOp graph (first device found).
 #[allow(clippy::mutable_key_type)]
 pub fn extract_device_from_graph(root: &Rc<UOp>) -> Option<DeviceSpec> {
     let mut visited = HashSet::new();
@@ -100,59 +54,13 @@ pub fn extract_device_from_graph(root: &Rc<UOp>) -> Option<DeviceSpec> {
     visit(root, &mut visited)
 }
 
-/// Check if a UOp is an elementwise operation.
-///
-/// Elementwise operations are those that can be computed independently for each element:
-/// - Binary operations (ADD, MUL, SUB, DIV, etc.)
-/// - Ternary operations (WHERE, etc.)
-///
-/// These are candidates for forced bufferization when buffer limits are exceeded.
-///
-/// # Returns
-///
-/// - `true` if the operation is Binary or Ternary
-/// - `false` otherwise
-///
-/// # Example
-///
-/// ```ignore
-/// if is_elementwise(&src) {
-///     // Can force bufferize this source
-/// }
-/// ```
+/// Check if operation is elementwise (Binary or Ternary).
 pub fn is_elementwise(uop: &Rc<UOp>) -> bool {
     matches!(uop.op(), Op::Binary(..) | Op::Ternary(..))
 }
 
-/// Create pattern matchers for buffer limit enforcement.
-///
-/// Returns a PatternMatcher that:
-/// 1. Matches binary and ternary operations
-/// 2. Counts accessed buffers in their sources
-/// 3. If count > max_buffers - 1, forces bufferization of elementwise sources
-///
-/// The -1 accounts for the output buffer of the operation.
-///
-/// # Arguments
-///
-/// * `max_buffers` - Maximum buffer count allowed by the device
-///
-/// # Returns
-///
-/// A PatternMatcher that enforces buffer limits by forcing bufferization.
-///
-/// # Example
-///
-/// ```ignore
-/// let limit = device.max_buffers().unwrap();
-/// let matcher = buffer_limit_patterns(limit);
-/// let result = graph_rewrite(&matcher, computation);
-/// ```
-///
-/// # Based on Tinygrad
-///
-/// - Tinygrad's `limit_bufs()` function (rangeify.py:281-289)
-/// - Counts buffers, forces bufferization when exceeded
+/// Create pattern matcher for buffer limit enforcement.
+/// Forces bufferization of elementwise sources when buffer count > max_buffers - 1.
 pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
     use crate::pattern::matcher::RewriteFn;
     use crate::pattern::{BindingStore, BindingStoreExt, VarIntern};
@@ -163,7 +71,7 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
     let limit = max_buffers; // Copy for closure capture
     patterns.push((
         UPat::var("op"),
-        Box::new(move |bindings: &BindingStore, intern: &VarIntern| {
+        Box::new(move |bindings: &BindingStore, intern: &VarIntern, _ctx: &mut ()| {
             let Some(op) = intern.get_index("op").and_then(|i| bindings.get_by_index(i)) else {
                 return RewriteResult::NoMatch;
             };
@@ -226,45 +134,13 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
             }
 
             RewriteResult::NoMatch
-        }) as RewriteFn,
+        }) as RewriteFn<()>,
     ));
 
     PatternMatcher::new(patterns)
 }
 
-/// Force bufferization of a computation to materialize intermediate result.
-///
-/// Creates a BUFFERIZE operation that:
-/// - Materializes the computation in global memory
-/// - Collects all ranges from the source
-/// - Uses GLOBAL address space
-///
-/// This reduces buffer count by creating one intermediate buffer instead of
-/// accessing multiple input buffers.
-///
-/// # Arguments
-///
-/// * `src` - The computation to bufferize
-///
-/// # Returns
-///
-/// A BUFFERIZE(src, ranges, GLOBAL) operation wrapped in INDEX to make it usable.
-///
-/// # Example
-///
-/// ```ignore
-/// // Before: ADD accesses buf1 and buf2 (2 buffers)
-/// let add = UOp::add(buf1_access, buf2_access);
-///
-/// // After: ADD result materialized (1 buffer)
-/// let materialized = force_bufferize(add);
-/// // Now: INDEX(BUFFERIZE(ADD(...)))
-/// ```
-///
-/// # Based on Tinygrad
-///
-/// - Tinygrad's forced bufferization (rangeify.py:285-287)
-/// - Uses `substitute` to change range types, then bufferize + index
+/// Force bufferization of a computation to GLOBAL memory.
 fn force_bufferize(src: &Rc<UOp>) -> Rc<UOp> {
     // Collect all ranges from the source computation
     let ranges = collect_ranges(src);
@@ -283,9 +159,6 @@ fn force_bufferize(src: &Rc<UOp>) -> Rc<UOp> {
 }
 
 /// Collect all RANGE operations from a computation tree.
-///
-/// Recursively walks the UOp graph and collects all Op::Range operations.
-/// These ranges are used when forcing bufferization.
 #[allow(clippy::mutable_key_type)]
 fn collect_ranges(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
     let mut ranges = Vec::new();
@@ -313,51 +186,4 @@ fn collect_ranges(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
     ranges.retain(|r| seen.insert(UOpKey(Rc::clone(r))));
 
     ranges
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_elementwise() {
-        use morok_dtype::DType;
-        use morok_ir::ConstValue;
-
-        // Binary operations are elementwise
-        let left = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let right = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-        let add = left.try_add_op(&right).unwrap();
-        assert!(is_elementwise(&add), "Binary ADD should be elementwise");
-
-        // Ternary operations are elementwise
-        let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
-        let true_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let false_val = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-        let where_op = UOp::where_op(cond, true_val, false_val).unwrap();
-        assert!(is_elementwise(&where_op), "Ternary WHERE should be elementwise");
-
-        // Constants are not elementwise
-        let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        assert!(!is_elementwise(&const_op), "CONST should not be elementwise");
-    }
-
-    #[test]
-    fn test_extract_device_no_device() {
-        use morok_dtype::DType;
-        use morok_ir::ConstValue;
-
-        // Graph with no device info
-        let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        assert_eq!(extract_device_from_graph(&const_op), None, "Should return None when no device");
-    }
-
-    #[test]
-    fn test_extract_device_from_device_op() {
-        use morok_device::DeviceSpec;
-
-        // Graph with Op::Device
-        let device_op = UOp::device(DeviceSpec::Cpu);
-        assert_eq!(extract_device_from_graph(&device_op), Some(DeviceSpec::Cpu), "Should extract CPU device");
-    }
 }

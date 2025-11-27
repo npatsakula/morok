@@ -26,11 +26,9 @@ use crate::symbolic::dce::is_empty_range;
 use smallvec::SmallVec;
 use std::rc::Rc;
 
-/// Constant folding patterns using the DSL with for-loop iteration.
+/// Constant folding patterns.
 ///
-/// This uses the new for-loop syntax to compactly express constant folding
-/// for unary and binary operations. The `?` operator works in block expressions
-/// because they're wrapped in an Option-returning closure.
+/// Folds constant expressions at compile time for unary, binary, and ternary operations.
 pub fn constant_folding_dsl_patterns() -> PatternMatcher {
     use morok_ir::uop::eval::{eval_binary_op, eval_ternary_op, eval_unary_op};
 
@@ -57,38 +55,26 @@ pub fn constant_folding_dsl_patterns() -> PatternMatcher {
     }
 }
 
-/// Identity and zero propagation patterns using the DSL.
+/// Identity and zero propagation patterns.
 ///
-/// This is a declarative version of identity folding and zero propagation rules:
-/// - Identity folding (right side): x + 0, x - 0, x * 1, x / 1, x | 0, x ^ 0 → x
-/// - Identity folding (left side): 0 + x, 1 * x, 0 | x, 0 ^ x → x
-/// - Zero propagation: x * 0, x & 0 → 0
+/// - Identity folding: x + 0 → x, 0 + x → x, x * 1 → x, 1 * x → x, etc.
+/// - Zero propagation: x * 0 → 0, 0 * x → 0, x & 0 → 0, 0 & x → 0
 pub fn identity_and_zero_patterns() -> PatternMatcher {
     patterns! {
-        // ========== Identity folding (right side) ==========
-        Add(x, @zero) ~> x,
+        // ========== Identity folding (commutative) ==========
+        Add[x, @zero] ~> x,
+        Mul[x, @one] ~> x,
+        Or[x, @zero] ~> x,
+        Xor[x, @zero] ~> x,
+
+        // ========== Identity folding (non-commutative) ==========
         Sub(x, @zero) ~> x,
-        Mul(x, @one) ~> x,
         Idiv(x, @one) ~> x,
         Fdiv(x, @one) ~> x,
-        Or(x, @zero) ~> x,
-        Xor(x, @zero) ~> x,
-
-        // ========== Identity folding (left side) ==========
-        Add(@zero, x) ~> x,
-        Mul(@one, x) ~> x,
-        Or(@zero, x) ~> x,
-        Xor(@zero, x) ~> x,
 
         // ========== Zero propagation ==========
-        // x * 0 → 0
-        Mul(_, zero @ @zero) ~> zero,
-        // 0 * x → 0
-        Mul(zero @ @zero, _) ~> zero,
-        // x & 0 → 0
-        And(_, zero @ @zero) ~> zero,
-        // 0 & x → 0
-        And(zero @ @zero, _) ~> zero,
+        Mul[_, zero @ @zero] ~> zero,
+        And[_, zero @ @zero] ~> zero,
     }
 }
 
@@ -104,24 +90,6 @@ pub fn identity_and_zero_patterns() -> PatternMatcher {
 /// - x * 0 → 0, 0 * x → 0
 /// - x & 0 → 0, 0 & x → 0
 pub fn symbolic_simple() -> PatternMatcher {
-    // All patterns are now organized into separate functions.
-    // Combine all DSL-based pattern functions:
-    // - constant_folding_dsl_patterns(): unary/binary/ternary constant folding (for-loop DSL)
-    // - identity_and_zero_patterns(): identity folding and zero propagation
-    // - self_folding_dsl_patterns(): x // x, x & x, x | x, etc.
-    // - zero_folding_dsl_patterns(): x < x → false, x % x → 0, x != x → false
-    // - division_dsl_patterns(): x / x → 1.0, (x * y) / y → x
-    // - cast_dsl_patterns(): cast optimizations
-    // - term_combining_dsl_patterns(): x + x → 2*x, coefficient combining
-    // - alu_folding_dsl_patterns(): (x + c1) + c2 → x + (c1 + c2), etc.
-    // - advanced_division_dsl_patterns(): division chains, distribution
-    // - comparison_dsl_patterns(): Lt, Eq, Ne with range analysis (for-loop DSL)
-    // - boolean_dsl_patterns(): !!x → x, x ^ x → 0
-    // - minmax_dsl_patterns(): max(x, x) → x
-    // - power_dsl_patterns(): x ** 0 → 1, x ** 1 → x
-    // - negation_dsl_patterns(): -(-x) → x
-    // - dce_dsl_patterns(): WHERE branch selection (DSL)
-    // - dead_loop_patterns(): RANGE/END/REDUCE DCE (catch-all patterns)
     constant_folding_dsl_patterns()
         + identity_and_zero_patterns()
         + self_folding_dsl_patterns()
@@ -145,7 +113,7 @@ pub fn symbolic() -> PatternMatcher {
     PatternMatcher::new(vec![])
 }
 
-/// Self-folding patterns using the DSL.
+/// Self-folding patterns.
 ///
 /// Patterns where an operand appears twice:
 /// - x // x → 1
@@ -156,19 +124,19 @@ pub fn symbolic() -> PatternMatcher {
 pub fn self_folding_dsl_patterns() -> PatternMatcher {
     patterns! {
         // x // x → 1
-        Idiv(x, x2) if Rc::ptr_eq(x, x2) ~> 1.into_uop(x.dtype()),
+        Idiv(x, x) ~> 1.into_uop(x.dtype()),
         // x // -1 → -x
         Idiv(x, c @const(c_val)) if c_val.is_neg_one() ~> UOp::neg(x),
         // (x % y) % y → x % y
-        Mod(Mod(x, y), y2) if Rc::ptr_eq(y, y2) => x.try_mod_op(y).ok(),
+        Mod(Mod(x, y), y) => x.try_mod_op(y).ok(),
         // x & x → x
-        And(x, x2) if Rc::ptr_eq(x, x2) ~> Rc::clone(x),
+        And(x, x) ~> Rc::clone(x),
         // x | x → x
-        Or(x, x2) if Rc::ptr_eq(x, x2) ~> Rc::clone(x),
+        Or(x, x) ~> Rc::clone(x),
     }
 }
 
-/// Zero folding patterns using the DSL.
+/// Zero folding patterns.
 ///
 /// Patterns that fold to zero or false:
 /// - x < x → False (non-float only)
@@ -177,46 +145,47 @@ pub fn self_folding_dsl_patterns() -> PatternMatcher {
 pub fn zero_folding_dsl_patterns() -> PatternMatcher {
     patterns! {
         // x % x → 0
-        Mod(x, x2) if Rc::ptr_eq(x, x2) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
-        // x < x → False (for non-float types)
-        Lt(x, x2) if Rc::ptr_eq(x, x2) && !x.dtype().is_float() ~> false.into_uop(DType::Bool),
+        Mod(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+        // x < x → False (non-float only)
+        Lt(x, x) if !x.dtype().is_float() ~> false.into_uop(DType::Bool),
         // x != x → False (int only)
-        Ne(x, x2) if Rc::ptr_eq(x, x2) && x.dtype().is_int() ~> false.into_uop(DType::Bool),
+        Ne(x, x) if x.dtype().is_int() ~> false.into_uop(DType::Bool),
     }
 }
 
-/// Division simplification patterns using the DSL.
+/// Division simplification patterns.
 ///
 /// - x / x → 1.0 (float division)
-/// - (x * y) / y → x (for both Fdiv and Idiv)
+/// - (x * y) / y → x
+/// - (x * y) // y → x
 pub fn division_dsl_patterns() -> PatternMatcher {
     patterns! {
         // x / x → 1.0 (float division)
-        Fdiv(x, x2) if Rc::ptr_eq(x, x2) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
-        // (x * y) / y → x (float division)
-        Fdiv(Mul(x, y), y2) if Rc::ptr_eq(y, y2) ~> Rc::clone(x),
-        // (x * y) // y → x (integer division)
-        Idiv(Mul(x, y), y2) if Rc::ptr_eq(y, y2) ~> Rc::clone(x),
+        Fdiv(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
+        // (x * y) / y → x
+        Fdiv(Mul(x, y), y) ~> Rc::clone(x),
+        // (x * y) // y → x
+        Idiv(Mul(x, y), y) ~> Rc::clone(x),
     }
 }
 
-/// Cast optimization patterns using the DSL.
+/// Cast optimization patterns.
 ///
 /// - cast(const) → const (constant folding)
 /// - x.cast(dtype) → x if same dtype (noop cast)
 /// - x.cast(a).cast(b) → x.cast(b) (collapse double cast)
 pub fn cast_dsl_patterns() -> PatternMatcher {
     patterns! {
-        // cast(const) → const with folding
+        // cast(const) → const
         Cast { src: c @const(c_val), dtype } => c_val.cast(&dtype).map(|v| UOp::const_(dtype.clone(), v)),
         // x.cast(dtype) → x if same dtype
         Cast { src: x, dtype } if x.dtype() == dtype ~> Rc::clone(x),
-        // x.cast(a).cast(b) → x.cast(b) (collapse double cast)
+        // x.cast(a).cast(b) → x.cast(b)
         Cast { src: Cast { src: x, .. }, dtype } ~> UOp::cast(Rc::clone(x), dtype.clone()),
     }
 }
 
-/// Term combining patterns using the DSL.
+/// Term combining patterns.
 ///
 /// - x + x → 2*x
 /// - (c1 * x) + (c2 * x) → (c1 + c2) * x
@@ -224,17 +193,17 @@ pub fn cast_dsl_patterns() -> PatternMatcher {
 pub fn term_combining_dsl_patterns() -> PatternMatcher {
     patterns! {
         // x + x → 2*x
-        Add(x, y) if Rc::ptr_eq(x, y) => 2.into_uop(x.dtype()).try_mul_op(x).ok(),
+        Add(x, x) => 2.into_uop(x.dtype()).try_mul_op(x).ok(),
         // (c1 * x) + (c2 * x) → (c1 + c2) * x
-        Add(Mul(c1 @const(c1_val), x), Mul(c2 @const(c2_val), y)) if Rc::ptr_eq(x, y)
+        Add(Mul(c1 @const(c1_val), x), Mul(c2 @const(c2_val), x))
           => eval_add(c1_val, c2_val)?.into_uop(c1.dtype()).try_mul_op(x).ok(),
         // (x * c1) + (x * c2) → x * (c1 + c2)
-        Add(Mul(x, c1 @const(c1_val)), Mul(y, c2 @const(c2_val))) if Rc::ptr_eq(x, y)
+        Add(Mul(x, c1 @const(c1_val)), Mul(x, c2 @const(c2_val)))
           => x.try_mul_op(&eval_add(c1_val, c2_val)?.into_uop(c1.dtype())).ok(),
     }
 }
 
-/// Advanced division and distribution patterns using the DSL.
+/// Advanced division and distribution patterns.
 ///
 /// - (a // b) // c → a // (b * c)
 /// - expr // divisor → expr.divides(divisor) (generic exact division)
@@ -276,7 +245,7 @@ pub fn advanced_division_dsl_patterns() -> PatternMatcher {
     }
 }
 
-/// Two-stage ALU folding patterns using the DSL.
+/// Two-stage ALU folding patterns.
 ///
 /// Fold constants in associative operation chains:
 /// - (x + c1) + c2 → x + (c1 + c2)
@@ -318,7 +287,6 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
 
 /// Dead loop elimination patterns.
 ///
-/// Uses the patterns! DSL macro with op-specific matching:
 /// - RANGE with vmax ≤ 0 → Const(0)
 /// - END with dead ranges → remove dead ranges
 /// - REDUCE with all empty ranges → identity element
@@ -384,7 +352,7 @@ pub fn dead_loop_patterns() -> PatternMatcher {
     }
 }
 
-/// Dead code elimination patterns using the DSL.
+/// Dead code elimination patterns.
 ///
 /// Handles WHERE optimizations:
 /// - WHERE(true, t, f) → t
@@ -405,7 +373,7 @@ pub fn dce_dsl_patterns() -> PatternMatcher {
         },
 
         // WHERE(_, same, same) → same
-        Where(_, t, f) if Rc::ptr_eq(t, f) ~> Rc::clone(t),
+        Where(_, t, t) ~> Rc::clone(t),
 
         // WHERE(x, true, false) → x (for bool x)
         Where(x, t @const(t_val), f @const(f_val))
@@ -422,7 +390,7 @@ pub fn dce_dsl_patterns() -> PatternMatcher {
     }
 }
 
-/// Comparison patterns using the DSL with for-loop iteration.
+/// Comparison patterns.
 ///
 /// Handles Lt, Eq, Ne comparisons with:
 /// - Self-comparison fast path (x op x)
@@ -461,31 +429,31 @@ pub fn comparison_dsl_patterns() -> PatternMatcher {
     }
 }
 
-/// Boolean logic patterns using the DSL.
+/// Boolean logic patterns.
 ///
 /// - !!x → x (double negation elimination)
 /// - x ^ x → 0 (xor self-cancellation)
 pub fn boolean_dsl_patterns() -> PatternMatcher {
     patterns! {
-        // Double negation: !!x → x
+        // !!x → x
         Not(Not(x)) ~> Rc::clone(x),
-        // XOR self-cancellation: x ^ x → 0
-        Xor(x, x2) if Rc::ptr_eq(x, x2) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+        // x ^ x → 0
+        Xor(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
     }
 }
 
-/// Min/max patterns using the DSL.
+/// Min/max patterns.
 ///
 /// - max(x, x) → x
 /// - min(x, x) → x (via Min = negated Max)
 pub fn minmax_dsl_patterns() -> PatternMatcher {
     patterns! {
         // max(x, x) → x
-        Max(x, x2) if Rc::ptr_eq(x, x2) ~> Rc::clone(x),
+        Max(x, x) ~> Rc::clone(x),
     }
 }
 
-/// Power patterns using the DSL.
+/// Power patterns.
 ///
 /// - x ** 0 → 1
 /// - x ** 1 → x
@@ -498,7 +466,7 @@ pub fn power_dsl_patterns() -> PatternMatcher {
     }
 }
 
-/// Negation patterns using the DSL.
+/// Negation patterns.
 ///
 /// - -(-x) → x (double negation for arithmetic)
 pub fn negation_dsl_patterns() -> PatternMatcher {

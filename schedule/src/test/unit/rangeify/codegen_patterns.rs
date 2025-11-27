@@ -3,14 +3,12 @@
 //! Validates that remove_noop, get_contiguous, and fix_after_broadcast correctly
 //! transform UOps for code generation.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp};
 
 use crate::rangeify::codegen_patterns::{fix_after_broadcast, get_contiguous, rangeify_codegen_patterns, remove_noop};
-use crate::rangeify::kernel_context::KernelContext;
 
 #[test]
 fn test_remove_noop_void_returns_none() {
@@ -151,8 +149,7 @@ fn test_fix_after_broadcast_no_panic_on_global() {
 
 #[test]
 fn test_codegen_patterns_creates_matcher() {
-    let ctx = Rc::new(RefCell::new(KernelContext::new()));
-    let _matcher = rangeify_codegen_patterns(ctx);
+    let _matcher = rangeify_codegen_patterns();
 
     // Verify the matcher was created successfully
     // We can't access the patterns field (it's private), but we can verify

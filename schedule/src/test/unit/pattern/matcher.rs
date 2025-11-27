@@ -38,7 +38,7 @@ fn test_simple_rewrite() {
     let zero = const_uop(0);
     let add = binary_uop(BinaryOp::Add, five.clone(), zero);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(ref rewritten) = result {
         assert!(Rc::ptr_eq(rewritten, &five));
@@ -47,7 +47,7 @@ fn test_simple_rewrite() {
     // Test: 5 + 3 should not rewrite
     let three = const_uop(3);
     let add2 = binary_uop(BinaryOp::Add, five, three);
-    let result2 = matcher.rewrite(&add2);
+    let result2 = matcher.rewrite(&add2, &mut ());
     assert!(matches!(result2, RewriteResult::NoMatch));
 }
 
@@ -83,7 +83,7 @@ fn test_multiple_patterns() {
 
     // Test: 5 + 0 -> 5
     let add = binary_uop(BinaryOp::Add, five.clone(), const_uop(0));
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(ref rewritten) = result {
         assert!(Rc::ptr_eq(rewritten, &five));
@@ -91,7 +91,7 @@ fn test_multiple_patterns() {
 
     // Test: 5 * 1 -> 5
     let mul = binary_uop(BinaryOp::Mul, five.clone(), const_uop(1));
-    let result = matcher.rewrite(&mul);
+    let result = matcher.rewrite(&mul, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(ref rewritten) = result {
         assert!(Rc::ptr_eq(rewritten, &five));
@@ -116,12 +116,12 @@ fn test_no_match() {
 
     // MUL doesn't match ADD pattern
     let mul = binary_uop(BinaryOp::Mul, const_uop(5), const_uop(0));
-    let result = matcher.rewrite(&mul);
+    let result = matcher.rewrite(&mul, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch));
 
     // ADD with non-zero doesn't match the rewrite condition
     let add = binary_uop(BinaryOp::Add, const_uop(5), const_uop(3));
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch));
 }
 
@@ -131,14 +131,14 @@ fn test_wildcard_pattern() {
     // Note: Uses manual closure to test low-level pattern matching infrastructure
     let patterns = vec![(
         UPat::var("anything"),
-        Box::new(|_bindings: &BindingStore, _intern: &VarIntern| RewriteResult::Rewritten(const_uop(42))) as RewriteFn,
+        Box::new(|_bindings: &BindingStore, _intern: &VarIntern, _ctx: &mut ()| RewriteResult::Rewritten(const_uop(42))) as RewriteFn<()>,
     )];
 
     let matcher = PatternMatcher::new(patterns);
 
     // Should match any UOp
     let add = binary_uop(BinaryOp::Add, const_uop(1), const_uop(2));
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(ref result_val) = result {
@@ -169,7 +169,7 @@ fn test_indexed_before_wildcard() {
 
     patterns.push((
         UPat::var("anything"),
-        Box::new(|_bindings: &BindingStore, _intern: &VarIntern| RewriteResult::Rewritten(const_uop(99))) as RewriteFn,
+        Box::new(|_bindings: &BindingStore, _intern: &VarIntern, _ctx: &mut ()| RewriteResult::Rewritten(const_uop(99))) as RewriteFn<()>,
     ));
 
     let matcher = PatternMatcher::new(patterns);
@@ -178,7 +178,7 @@ fn test_indexed_before_wildcard() {
 
     // 5 + 0 should match first pattern (indexed) and return 5, not 99
     let add = binary_uop(BinaryOp::Add, five.clone(), const_uop(0));
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(ref rewritten) = result {
         assert!(Rc::ptr_eq(rewritten, &five));
@@ -186,7 +186,7 @@ fn test_indexed_before_wildcard() {
 
     // MUL doesn't match first pattern, so wildcard applies -> 99
     let mul = binary_uop(BinaryOp::Mul, const_uop(5), const_uop(1));
-    let result = matcher.rewrite(&mul);
+    let result = matcher.rewrite(&mul, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(ref rewritten) = result {

@@ -10,7 +10,6 @@
 //! 3. Creates SINK operation wrapping the computation
 //! 4. Creates KERNEL operation with proper buffer and variable arguments
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use morok_ir::{AxisType, Op, UOp};
@@ -182,19 +181,8 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     //
     // Apply to_define_global patterns via graph_rewrite
     let transformed = {
-        // Wrap context in RefCell for pattern access
-        let ctx_ref = Rc::new(RefCell::new(ctx.clone()));
-
-        // Build pattern matcher with context
-        let matcher = to_define_global_patterns(ctx_ref.clone());
-
-        // Apply patterns to computation graph
-        let result = graph_rewrite(&matcher, computation);
-
-        // Extract updated context (patterns may have modified it)
-        *ctx = ctx_ref.borrow().clone();
-
-        result
+        let matcher = to_define_global_patterns();
+        graph_rewrite(&matcher, computation, ctx)
     };
 
     // **STEP 1.5: Apply codegen preparation patterns**
@@ -204,11 +192,8 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // - CONTIGUOUS markers removed
     // - AFTER wrapping EXPAND fixed
     let transformed = {
-        let ctx_ref = Rc::new(RefCell::new(ctx.clone()));
-        let codegen_matcher = rangeify_codegen_patterns(ctx_ref.clone());
-        let result = graph_rewrite(&codegen_matcher, transformed);
-        *ctx = ctx_ref.borrow().clone();
-        result
+        let codegen_matcher = rangeify_codegen_patterns();
+        graph_rewrite(&codegen_matcher, transformed, &mut ())
     };
 
     // **STEP 2: Validate no buffer access cycles**

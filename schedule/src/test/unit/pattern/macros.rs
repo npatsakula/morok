@@ -30,7 +30,7 @@ fn test_pattern_macro_basic() {
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
     let add = UOp::new(Op::Binary(BinaryOp::Add, five.clone(), zero), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &five));
@@ -59,7 +59,7 @@ fn test_pattern_macro_no_match() {
     let three = UOp::const_(DType::Int32, ConstValue::Int(3));
     let add = UOp::new(Op::Binary(BinaryOp::Add, five, three), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch));
 }
 
@@ -88,7 +88,7 @@ fn test_pattern_macro_multiple_variables() {
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, five, zero.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&mul);
+    let result = matcher.rewrite(&mul, &mut ());
     match &result {
         RewriteResult::Rewritten(r) => {
             assert!(Rc::ptr_eq(r, &zero));

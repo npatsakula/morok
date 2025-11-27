@@ -12,7 +12,7 @@ fn test_symbolic_simple_identity_folding() {
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
     let add = UOp::new(Op::Binary(BinaryOp::Add, five.clone(), zero.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(std::rc::Rc::ptr_eq(&rewritten, &five));
@@ -20,40 +20,40 @@ fn test_symbolic_simple_identity_folding() {
 
     // Test: 0 + 5 -> 5 (commutative)
     let add2 = UOp::new(Op::Binary(BinaryOp::Add, zero.clone(), five.clone()), DType::Int32);
-    let result2 = matcher.rewrite(&add2);
+    let result2 = matcher.rewrite(&add2, &mut ());
     assert!(matches!(result2, RewriteResult::Rewritten(_)));
 
     // Test: 5 * 1 -> 5
     let one = UOp::const_(DType::Int32, ConstValue::Int(1));
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, five.clone(), one.clone()), DType::Int32);
-    let result3 = matcher.rewrite(&mul);
+    let result3 = matcher.rewrite(&mul, &mut ());
     assert!(matches!(result3, RewriteResult::Rewritten(_)));
 
     // Test: 5 - 0 -> 5
     let sub = UOp::new(Op::Binary(BinaryOp::Sub, five.clone(), zero.clone()), DType::Int32);
-    let result4 = matcher.rewrite(&sub);
+    let result4 = matcher.rewrite(&sub, &mut ());
     assert!(matches!(result4, RewriteResult::Rewritten(_)));
 
     // Test: 5 / 1 -> 5 (int division)
     let idiv = UOp::new(Op::Binary(BinaryOp::Idiv, five.clone(), one.clone()), DType::Int32);
-    let result5 = matcher.rewrite(&idiv);
+    let result5 = matcher.rewrite(&idiv, &mut ());
     assert!(matches!(result5, RewriteResult::Rewritten(_)));
 
     // Test: 5.0 / 1.0 -> 5.0 (float division)
     let five_f = UOp::const_(DType::Float32, ConstValue::Float(5.0));
     let one_f = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let fdiv = UOp::new(Op::Binary(BinaryOp::Fdiv, five_f.clone(), one_f), DType::Float32);
-    let result6 = matcher.rewrite(&fdiv);
+    let result6 = matcher.rewrite(&fdiv, &mut ());
     assert!(matches!(result6, RewriteResult::Rewritten(_)));
 
     // Test: 5 | 0 -> 5
     let or_op = UOp::new(Op::Binary(BinaryOp::Or, five.clone(), zero.clone()), DType::Int32);
-    let result7 = matcher.rewrite(&or_op);
+    let result7 = matcher.rewrite(&or_op, &mut ());
     assert!(matches!(result7, RewriteResult::Rewritten(_)));
 
     // Test: 5 ^ 0 -> 5
     let xor_op = UOp::new(Op::Binary(BinaryOp::Xor, five.clone(), zero.clone()), DType::Int32);
-    let result8 = matcher.rewrite(&xor_op);
+    let result8 = matcher.rewrite(&xor_op, &mut ());
     assert!(matches!(result8, RewriteResult::Rewritten(_)));
 }
 
@@ -67,7 +67,7 @@ fn test_symbolic_simple_zero_propagation() {
     // Test: 5 * 0 -> 0
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, five.clone(), zero.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&mul);
+    let result = matcher.rewrite(&mul, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         // Check that the result is a zero constant (value-based)
@@ -80,17 +80,17 @@ fn test_symbolic_simple_zero_propagation() {
 
     // Test: 0 * 5 -> 0 (commutative)
     let mul2 = UOp::new(Op::Binary(BinaryOp::Mul, zero.clone(), five.clone()), DType::Int32);
-    let result2 = matcher.rewrite(&mul2);
+    let result2 = matcher.rewrite(&mul2, &mut ());
     assert!(matches!(result2, RewriteResult::Rewritten(_)));
 
     // Test: 5 & 0 -> 0
     let and_op = UOp::new(Op::Binary(BinaryOp::And, five.clone(), zero.clone()), DType::Int32);
-    let result3 = matcher.rewrite(&and_op);
+    let result3 = matcher.rewrite(&and_op, &mut ());
     assert!(matches!(result3, RewriteResult::Rewritten(_)));
 
     // Test: 0 & 5 -> 0 (commutative)
     let and2 = UOp::new(Op::Binary(BinaryOp::And, zero.clone(), five), DType::Int32);
-    let result4 = matcher.rewrite(&and2);
+    let result4 = matcher.rewrite(&and2, &mut ());
     assert!(matches!(result4, RewriteResult::Rewritten(_)));
 }
 
@@ -103,7 +103,7 @@ fn test_symbolic_simple_const_folding() {
     let three = UOp::const_(DType::Int32, ConstValue::Int(3));
     let add = UOp::new(Op::Binary(BinaryOp::Add, five.clone(), three), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -117,7 +117,7 @@ fn test_symbolic_simple_const_folding() {
     let two = UOp::const_(DType::Int32, ConstValue::Int(2));
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, five, two), DType::Int32);
 
-    let result2 = matcher.rewrite(&mul);
+    let result2 = matcher.rewrite(&mul, &mut ());
     assert!(matches!(result2, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result2 {
         if let Op::Const(cv) = rewritten.op() {
@@ -137,7 +137,7 @@ fn test_self_division() {
     let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, x.clone(), x), DType::Int32);
 
-    let result = matcher.rewrite(&div);
+    let result = matcher.rewrite(&div, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -156,7 +156,7 @@ fn test_division_by_neg_one() {
     let neg_one = UOp::const_(DType::Int32, ConstValue::Int(-1));
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, x.clone(), neg_one), DType::Int32);
 
-    let result = matcher.rewrite(&div);
+    let result = matcher.rewrite(&div, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Unary(morok_ir::UnaryOp::Neg, negated) = rewritten.op() {
@@ -178,7 +178,7 @@ fn test_idempotent_modulo() {
     let inner_mod = UOp::new(Op::Binary(BinaryOp::Mod, x.clone(), y.clone()), DType::Int32);
     let outer_mod = UOp::new(Op::Binary(BinaryOp::Mod, inner_mod.clone(), y.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&outer_mod);
+    let result = matcher.rewrite(&outer_mod, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be equivalent to inner_mod (x % y)
@@ -198,7 +198,7 @@ fn test_idempotent_and() {
     let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let and_op = UOp::new(Op::Binary(BinaryOp::And, x.clone(), x.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&and_op);
+    let result = matcher.rewrite(&and_op, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
@@ -212,7 +212,7 @@ fn test_idempotent_or() {
     let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let or_op = UOp::new(Op::Binary(BinaryOp::Or, x.clone(), x.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&or_op);
+    let result = matcher.rewrite(&or_op, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
@@ -227,7 +227,7 @@ fn test_non_idempotent_and() {
     let y = UOp::var("y", DType::Int32, i64::MIN, i64::MAX);
     let and_op = UOp::new(Op::Binary(BinaryOp::And, x, y), DType::Int32);
 
-    let result = matcher.rewrite(&and_op);
+    let result = matcher.rewrite(&and_op, &mut ());
     // Should not match idempotent pattern
     // But might match other patterns (like zero propagation if one is zero)
     // For this test, we're using variables, so no simplification expected
@@ -243,7 +243,7 @@ fn test_self_comparison_lt() {
     let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let lt = UOp::new(Op::Binary(BinaryOp::Lt, x.clone(), x), DType::Int32);
 
-    let result = matcher.rewrite(&lt);
+    let result = matcher.rewrite(&lt, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -261,7 +261,7 @@ fn test_self_modulo() {
     let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let modulo = UOp::new(Op::Binary(BinaryOp::Mod, x.clone(), x), DType::Int32);
 
-    let result = matcher.rewrite(&modulo);
+    let result = matcher.rewrite(&modulo, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -279,7 +279,7 @@ fn test_self_inequality_int() {
     let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let ne = UOp::new(Op::Binary(BinaryOp::Ne, x.clone(), x), DType::Int32);
 
-    let result = matcher.rewrite(&ne);
+    let result = matcher.rewrite(&ne, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -297,7 +297,7 @@ fn test_self_inequality_float_no_fold() {
     let x = UOp::var("x", DType::Float32, i64::MIN, i64::MAX);
     let ne = UOp::new(Op::Binary(BinaryOp::Ne, x.clone(), x), DType::Float32);
 
-    let result = matcher.rewrite(&ne);
+    let result = matcher.rewrite(&ne, &mut ());
     // Should not match because floats can have NaN
     assert!(matches!(result, RewriteResult::NoMatch));
 }
@@ -311,7 +311,7 @@ fn test_float_self_division() {
     let x = UOp::var("x", DType::Float32, i64::MIN, i64::MAX);
     let div = UOp::new(Op::Binary(BinaryOp::Fdiv, x.clone(), x), DType::Float32);
 
-    let result = matcher.rewrite(&div);
+    let result = matcher.rewrite(&div, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -332,7 +332,7 @@ fn test_division_cancel_multiplication() {
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, x.clone(), y.clone()), DType::Float32);
     let div = UOp::new(Op::Binary(BinaryOp::Fdiv, mul, y), DType::Float32);
 
-    let result = matcher.rewrite(&div);
+    let result = matcher.rewrite(&div, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
@@ -349,7 +349,7 @@ fn test_int_division_cancel_multiplication() {
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, x.clone(), y.clone()), DType::Int32);
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, mul, y), DType::Int32);
 
-    let result = matcher.rewrite(&div);
+    let result = matcher.rewrite(&div, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
@@ -365,7 +365,7 @@ fn test_cast_int_to_float_constant() {
     let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
     let cast = UOp::new(Op::Cast { src: int_val, dtype: DType::Float32 }, DType::Float32);
 
-    let result = matcher.rewrite(&cast);
+    let result = matcher.rewrite(&cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -384,7 +384,7 @@ fn test_cast_float_to_int_constant() {
     let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f64::consts::PI));
     let cast = UOp::new(Op::Cast { src: float_val, dtype: DType::Int32 }, DType::Int32);
 
-    let result = matcher.rewrite(&cast);
+    let result = matcher.rewrite(&cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -403,7 +403,7 @@ fn test_cast_bool_to_int_constant() {
     let bool_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let cast = UOp::new(Op::Cast { src: bool_val, dtype: DType::Int32 }, DType::Int32);
 
-    let result = matcher.rewrite(&cast);
+    let result = matcher.rewrite(&cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -421,7 +421,7 @@ fn test_noop_cast_same_dtype() {
     let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let cast = UOp::new(Op::Cast { src: x.clone(), dtype: DType::Int32 }, DType::Int32);
 
-    let result = matcher.rewrite(&cast);
+    let result = matcher.rewrite(&cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
@@ -440,7 +440,7 @@ fn test_double_cast_collapse() {
     // Second cast: Float32 -> Int32
     let outer_cast = UOp::new(Op::Cast { src: inner_cast, dtype: DType::Int32 }, DType::Int32);
 
-    let result = matcher.rewrite(&outer_cast);
+    let result = matcher.rewrite(&outer_cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be a single cast from x to Int32
@@ -460,7 +460,7 @@ fn test_cast_non_constant_no_fold() {
     let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let cast = UOp::new(Op::Cast { src: x.clone(), dtype: DType::Float32 }, DType::Float32);
 
-    let result = matcher.rewrite(&cast);
+    let result = matcher.rewrite(&cast, &mut ());
     // Should not match constant folding pattern (not a constant)
     // Should not match noop cast (different dtypes)
     assert!(matches!(result, RewriteResult::NoMatch));
@@ -475,7 +475,7 @@ fn test_combine_identical_terms() {
     let x = UOp::var("x", DType::Int32, i64::MIN, i64::MAX);
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), x.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
 
     // Debug: print the result if it doesn't match
     if !matches!(result, RewriteResult::Rewritten(_)) {
@@ -511,7 +511,7 @@ fn test_combine_terms_with_coefficients() {
     let term2 = UOp::new(Op::Binary(BinaryOp::Mul, c5, x.clone()), DType::Int32);
     let add = UOp::new(Op::Binary(BinaryOp::Add, term1, term2), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -540,7 +540,7 @@ fn test_combine_terms_reversed_multiplication() {
     let term2 = UOp::new(Op::Binary(BinaryOp::Mul, x.clone(), c5), DType::Int32);
     let add = UOp::new(Op::Binary(BinaryOp::Add, term1, term2), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -570,7 +570,7 @@ fn test_no_combine_different_variables() {
     let term2 = UOp::new(Op::Binary(BinaryOp::Mul, c5, y), DType::Int32);
     let add = UOp::new(Op::Binary(BinaryOp::Add, term1, term2), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     // Should not combine different variables
     assert!(matches!(result, RewriteResult::NoMatch));
 }
@@ -587,7 +587,7 @@ fn test_alu_fold_addition_chain() {
     let add1 = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), c3), DType::Int32);
     let add2 = UOp::new(Op::Binary(BinaryOp::Add, add1, c5), DType::Int32);
 
-    let result = matcher.rewrite(&add2);
+    let result = matcher.rewrite(&add2, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -615,7 +615,7 @@ fn test_alu_fold_multiplication_chain() {
     let mul1 = UOp::new(Op::Binary(BinaryOp::Mul, x.clone(), c2), DType::Int32);
     let mul2 = UOp::new(Op::Binary(BinaryOp::Mul, mul1, c3), DType::Int32);
 
-    let result = matcher.rewrite(&mul2);
+    let result = matcher.rewrite(&mul2, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -643,7 +643,7 @@ fn test_alu_fold_sub_then_add_positive() {
     let sub = UOp::new(Op::Binary(BinaryOp::Sub, x.clone(), c3), DType::Int32);
     let add = UOp::new(Op::Binary(BinaryOp::Add, sub, c5), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -671,7 +671,7 @@ fn test_alu_fold_sub_then_add_negative() {
     let sub = UOp::new(Op::Binary(BinaryOp::Sub, x.clone(), c5), DType::Int32);
     let add = UOp::new(Op::Binary(BinaryOp::Add, sub, c3), DType::Int32);
 
-    let result = matcher.rewrite(&add);
+    let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -699,7 +699,7 @@ fn test_alu_fold_add_then_sub_positive() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), c5), DType::Int32);
     let sub = UOp::new(Op::Binary(BinaryOp::Sub, add, c3), DType::Int32);
 
-    let result = matcher.rewrite(&sub);
+    let result = matcher.rewrite(&sub, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -727,7 +727,7 @@ fn test_alu_fold_add_then_sub_negative() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), c3), DType::Int32);
     let sub = UOp::new(Op::Binary(BinaryOp::Sub, add, c5), DType::Int32);
 
-    let result = matcher.rewrite(&sub);
+    let result = matcher.rewrite(&sub, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -756,7 +756,7 @@ fn test_division_cancel_with_multiplication() {
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, a.clone(), b.clone()), DType::Int32);
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, mul, b.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&div);
+    let result = matcher.rewrite(&div, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -775,7 +775,7 @@ fn test_division_chain_folding() {
     let div1 = UOp::new(Op::Binary(BinaryOp::Idiv, a.clone(), c2), DType::Int32);
     let div2 = UOp::new(Op::Binary(BinaryOp::Idiv, div1, c3), DType::Int32);
 
-    let result = matcher.rewrite(&div2);
+    let result = matcher.rewrite(&div2, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -803,7 +803,7 @@ fn test_exact_division_with_divides_helper() {
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, c12, x.clone()), DType::Int32);
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, mul, c3), DType::Int32);
 
-    let result = matcher.rewrite(&div);
+    let result = matcher.rewrite(&div, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -833,7 +833,7 @@ fn test_modulo_with_divisible_left_operand() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, mul, y.clone()), DType::Int32);
     let modulo = UOp::new(Op::Binary(BinaryOp::Mod, add, c3.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&modulo);
+    let result = matcher.rewrite(&modulo, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -859,7 +859,7 @@ fn test_modulo_with_divisible_right_operand() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), mul), DType::Int32);
     let modulo = UOp::new(Op::Binary(BinaryOp::Mod, add, c3.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&modulo);
+    let result = matcher.rewrite(&modulo, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -883,7 +883,7 @@ fn test_modulo_no_simplification() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, x, y), DType::Int32);
     let modulo = UOp::new(Op::Binary(BinaryOp::Mod, add, c3), DType::Int32);
 
-    let result = matcher.rewrite(&modulo);
+    let result = matcher.rewrite(&modulo, &mut ());
     // Should not simplify
     assert!(matches!(result, RewriteResult::NoMatch));
 }
@@ -905,7 +905,7 @@ fn test_distribute_division_over_addition() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, term1, term2), DType::Int32);
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, add, c3), DType::Int32);
 
-    let result = matcher.rewrite(&div);
+    let result = matcher.rewrite(&div, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -951,7 +951,7 @@ fn test_distribute_division_over_subtraction() {
     let sub = UOp::new(Op::Binary(BinaryOp::Sub, term1, term2), DType::Int32);
     let div = UOp::new(Op::Binary(BinaryOp::Idiv, sub, c3), DType::Int32);
 
-    let result = matcher.rewrite(&div);
+    let result = matcher.rewrite(&div, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -989,7 +989,7 @@ fn test_distribute_multiplication_over_addition() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), y.clone()), DType::Int32);
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, c2.clone(), add), DType::Int32);
 
-    let result = matcher.rewrite(&mul);
+    let result = matcher.rewrite(&mul, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -1023,7 +1023,7 @@ fn test_distribute_multiplication_over_addition_reversed() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), y.clone()), DType::Int32);
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, add, c3.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&mul);
+    let result = matcher.rewrite(&mul, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
@@ -1058,7 +1058,7 @@ fn test_distribute_large_constant() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), y.clone()), DType::Int32);
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, add, c100.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&mul);
+    let result = matcher.rewrite(&mul, &mut ());
     // Should distribute even with large constant (matching Tinygrad behavior)
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
@@ -1109,18 +1109,18 @@ fn test_compositional_optimization_minimal_failure() {
     // === DIRECT PATH ===
     // Build expression with un-optimized subexpressions and optimize
     let expr_unopt = UOp::new(Op::Binary(BinaryOp::Mul, a.clone(), b.clone()), DType::Int32);
-    let direct_opt = graph_rewrite(&matcher, expr_unopt);
+    let direct_opt = graph_rewrite(&matcher, expr_unopt, &mut ());
 
     // === COMPOSITIONAL PATH ===
     // Optimize subexpressions first
-    let opt_a = graph_rewrite(&matcher, a.clone());
-    let opt_b = graph_rewrite(&matcher, b.clone());
+    let opt_a = graph_rewrite(&matcher, a.clone(), &mut ());
+    let opt_b = graph_rewrite(&matcher, b.clone(), &mut ());
 
     // Build expression with optimized subexpressions
     let expr_opt_subs = UOp::new(Op::Binary(BinaryOp::Mul, opt_a.clone(), opt_b.clone()), DType::Int32);
 
     // Optimize the composed expression
-    let final_opt = graph_rewrite(&matcher, expr_opt_subs);
+    let final_opt = graph_rewrite(&matcher, expr_opt_subs, &mut ());
 
     // Count operations
     fn count_ops(uop: &Rc<UOp>) -> usize {
@@ -1171,7 +1171,7 @@ fn test_multiplication_chain_folding() {
     let mul1 = UOp::new(Op::Binary(BinaryOp::Mul, a.clone(), c2.clone()), DType::Int32);
     let mul2 = UOp::new(Op::Binary(BinaryOp::Mul, mul1, c2.clone()), DType::Int32);
 
-    let result = matcher.rewrite(&mul2);
+    let result = matcher.rewrite(&mul2, &mut ());
 
     println!("=== MULTIPLICATION CHAIN TEST ===");
     println!("Input: (var(\"a\") * 2) * 2");
@@ -1211,7 +1211,7 @@ fn test_double_not_elimination() {
     let not_x = x.not();
     let not_not_x = not_x.not();
 
-    let result = matcher.rewrite(&not_not_x);
+    let result = matcher.rewrite(&not_not_x, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &x));
@@ -1226,7 +1226,7 @@ fn test_double_not_int() {
     let not_x = x.not();
     let not_not_x = not_x.not();
 
-    let result = matcher.rewrite(&not_not_x);
+    let result = matcher.rewrite(&not_not_x, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &x));
@@ -1240,7 +1240,7 @@ fn test_xor_self_cancellation() {
     let x = UOp::var("x", DType::Int32, 0, 100);
     let xor_self = x.try_xor_op(&x).unwrap();
 
-    let result = matcher.rewrite(&xor_self);
+    let result = matcher.rewrite(&xor_self, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -1261,7 +1261,7 @@ fn test_double_neg_elimination() {
     let neg_x = x.neg();
     let neg_neg_x = neg_x.neg();
 
-    let result = matcher.rewrite(&neg_neg_x);
+    let result = matcher.rewrite(&neg_neg_x, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &x));
@@ -1276,7 +1276,7 @@ fn test_double_neg_float() {
     let neg_x = x.neg();
     let neg_neg_x = neg_x.neg();
 
-    let result = matcher.rewrite(&neg_neg_x);
+    let result = matcher.rewrite(&neg_neg_x, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &x));
@@ -1292,7 +1292,7 @@ fn test_max_self_identity() {
     let x = UOp::var("x", DType::Int32, 0, 100);
     let max_self = x.try_max_op(&x).unwrap();
 
-    let result = matcher.rewrite(&max_self);
+    let result = matcher.rewrite(&max_self, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &x));
@@ -1306,7 +1306,7 @@ fn test_max_self_float() {
     let x = UOp::var("x", DType::Float32, i64::MIN, i64::MAX);
     let max_self = x.try_max_op(&x).unwrap();
 
-    let result = matcher.rewrite(&max_self);
+    let result = matcher.rewrite(&max_self, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &x));
@@ -1323,7 +1323,7 @@ fn test_pow_zero_is_one() {
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
     let pow = x.try_pow_op(&zero).unwrap();
 
-    let result = matcher.rewrite(&pow);
+    let result = matcher.rewrite(&pow, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -1342,7 +1342,7 @@ fn test_pow_one_is_identity() {
     let one = UOp::const_(DType::Int32, ConstValue::Int(1));
     let pow = x.try_pow_op(&one).unwrap();
 
-    let result = matcher.rewrite(&pow);
+    let result = matcher.rewrite(&pow, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &x));
@@ -1357,7 +1357,7 @@ fn test_pow_float_zero() {
     let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
     let pow = x.try_pow_op(&zero).unwrap();
 
-    let result = matcher.rewrite(&pow);
+    let result = matcher.rewrite(&pow, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Const(cv) = rewritten.op() {
@@ -1378,7 +1378,7 @@ fn test_where_same_branches() {
     let x = UOp::var("x", DType::Int32, 0, 100);
     let where_op = UOp::where_op(cond, Rc::clone(&x), Rc::clone(&x)).unwrap();
 
-    let result = matcher.rewrite(&where_op);
+    let result = matcher.rewrite(&where_op, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &x));
@@ -1394,7 +1394,7 @@ fn test_where_bool_true_false() {
     let false_val = UOp::const_(DType::Bool, ConstValue::Bool(false));
     let where_op = UOp::where_op(Rc::clone(&x), true_val, false_val).unwrap();
 
-    let result = matcher.rewrite(&where_op);
+    let result = matcher.rewrite(&where_op, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &x));
@@ -1410,7 +1410,7 @@ fn test_where_bool_false_true() {
     let true_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let where_op = UOp::where_op(Rc::clone(&x), false_val, true_val).unwrap();
 
-    let result = matcher.rewrite(&where_op);
+    let result = matcher.rewrite(&where_op, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be Not(x)
@@ -1432,7 +1432,7 @@ fn test_where_negated_condition() {
     let f = UOp::var("f", DType::Int32, 0, 100);
     let where_op = UOp::where_op(not_cond, Rc::clone(&t), Rc::clone(&f)).unwrap();
 
-    let result = matcher.rewrite(&where_op);
+    let result = matcher.rewrite(&where_op, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be Where(cond, f, t) - branches swapped
@@ -1455,7 +1455,7 @@ fn test_where_const_true_condition() {
     let f = UOp::var("f", DType::Int32, 0, 100);
     let where_op = UOp::where_op(true_cond, Rc::clone(&t), f).unwrap();
 
-    let result = matcher.rewrite(&where_op);
+    let result = matcher.rewrite(&where_op, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &t));
@@ -1471,7 +1471,7 @@ fn test_where_const_false_condition() {
     let f = UOp::var("f", DType::Int32, 0, 100);
     let where_op = UOp::where_op(false_cond, t, Rc::clone(&f)).unwrap();
 
-    let result = matcher.rewrite(&where_op);
+    let result = matcher.rewrite(&where_op, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
         assert!(Rc::ptr_eq(&rewritten, &f));

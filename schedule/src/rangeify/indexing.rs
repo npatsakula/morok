@@ -1,7 +1,4 @@
 //! Range assignment and indexing context for rangeify transformation.
-//!
-//! This module implements the core range assignment algorithm that determines
-//! which ranges (loop indices) each UOp operates on.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -11,30 +8,16 @@ use morok_ir::{AxisType, ConstValue, Op, SInt, UOp, UOpKey};
 
 use super::helpers;
 
-/// Represents (input_ranges, output_ranges) for a UOp.
-///
-/// - Input ranges: The ranges used to compute this UOp's value
-/// - Output ranges: The ranges this UOp operates on (from consumers)
+/// (input_ranges, output_ranges) for a UOp.
 type UOpRanges = (Vec<Rc<UOp>>, Vec<Rc<UOp>>);
 
 /// Context for range assignment during rangeify.
-///
-/// Tracks which UOps need to be realized (materialized to buffers) and
-/// assigns input/output ranges for each UOp in the graph.
 #[derive(Default)]
 pub struct IndexingContext {
-    /// Maps UOps to their realize status.
-    ///
-    /// - `None`: Not yet processed or doesn't need realization
-    /// - `Some(axes)`: Needs realization on the specified axes
+    /// Maps UOps to realize status: Some(axes) = needs realization on axes.
     pub realize_map: HashMap<UOpKey, Option<Vec<usize>>>,
-
     /// Maps each UOp to its (input_ranges, output_ranges).
-    ///
-    /// Input ranges: The ranges used to compute this UOp's value
-    /// Output ranges: The ranges this UOp operates on (from consumers)
     pub range_map: HashMap<UOpKey, UOpRanges>,
-
     /// Counter for generating unique range IDs.
     range_idx: usize,
 }
@@ -45,9 +28,7 @@ impl IndexingContext {
         Self::default()
     }
 
-    /// Create a new RANGE UOp with a unique ID.
-    ///
-    /// If size is 1, returns a constant 0 instead (optimization).
+    /// Create new RANGE with unique ID. Returns const 0 if size is 1.
     pub fn new_range(&mut self, size: &SInt, axistype: AxisType) -> Rc<UOp> {
         // Check if size is constant 1
         if let SInt::Const(1) = size {
@@ -106,27 +87,7 @@ impl IndexingContext {
     }
 }
 
-/// Run the range assignment algorithm on a UOp graph.
-///
-/// This is the core of the rangeify transformation. It:
-/// 1. Determines which UOps need to be realized (materialized to buffers)
-/// 2. Assigns input/output ranges for each UOp
-/// 3. Returns a transformed graph with BUFFERIZE and INDEX operations
-///
-/// # Algorithm
-///
-/// Performs a reverse toposort traversal (bottom-up from leaves):
-/// - For each UOp, determine output ranges based on consumers
-/// - Apply movement op transformations to get input ranges
-/// - Create new ranges at realization points
-///
-/// # Arguments
-///
-/// * `sink` - The sink UOp representing the entire graph
-///
-/// # Returns
-///
-/// A tuple of (transformed_sink, indexing_context)
+/// Run range assignment on a UOp graph. Returns (transformed_sink, context).
 #[allow(clippy::mutable_key_type)]
 pub fn run_rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
@@ -143,7 +104,7 @@ pub fn run_rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, IndexingContext
 
     // Step 4: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
     let early_matcher = super::patterns::early_rewrites();
-    let transformed_sink = crate::rewrite::graph_rewrite(&early_matcher, sink);
+    let transformed_sink = crate::rewrite::graph_rewrite(&early_matcher, sink, &mut ());
 
     Ok((transformed_sink, ctx))
 }
@@ -199,43 +160,7 @@ fn is_always_contiguous(uop: &Rc<UOp>) -> bool {
     )
 }
 
-/// Merge ranges from multiple consumers of a UOp.
-///
-/// When a UOp has multiple consumers with different indexing patterns, this function
-/// determines which ranges to assign. For each dimension:
-///
-/// 1. Extract index and valid components from all consumer ranges
-/// 2. Check if all indices are structurally identical (ignoring validity masks)
-/// 3. If identical: merge by OR-ing validity masks
-/// 4. If different: create new range and mark axis for realization
-///
-/// # Algorithm
-///
-/// Based on Tinygrad's multi-consumer range merging (schedule/indexing.py:198-222).
-///
-/// # Arguments
-///
-/// * `uop` - The UOp whose consumer ranges are being merged
-/// * `consumer_rngs` - List of range lists from each consumer
-/// * `ctx` - Indexing context for creating new ranges and tracking realization
-///
-/// # Returns
-///
-/// Merged output ranges for the UOp.
-///
-/// # Example
-///
-/// ```ignore
-/// // x = tensor[10, 20]
-/// // Consumer 1: x[i, j]   (same indices)
-/// // Consumer 2: x[i, j]   (same indices)
-/// // Result: Merge with OR of validity masks, no realization
-///
-/// // x = tensor[10, 20]
-/// // Consumer 1: x[i, j]
-/// // Consumer 2: x[i, k]   (different j vs k)
-/// // Result: Create new range for dim 1, realize axis 1
-/// ```
+/// Merge ranges from multiple consumers. Creates new ranges and marks realization when needed.
 fn merge_consumer_ranges(
     uop: &Rc<UOp>,
     consumer_rngs: &[Vec<Rc<UOp>>],

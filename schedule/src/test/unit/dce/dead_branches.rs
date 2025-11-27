@@ -19,7 +19,7 @@ fn test_where_always_true() {
     let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_branch.clone(), false_branch), DType::Int32);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op);
+    let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // Should eliminate to true branch
     assert!(Rc::ptr_eq(&result, &true_branch));
@@ -35,7 +35,7 @@ fn test_where_always_false() {
     let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_branch, false_branch.clone()), DType::Int32);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op);
+    let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // Should eliminate to false branch
     assert!(Rc::ptr_eq(&result, &false_branch));
@@ -54,7 +54,7 @@ fn test_where_range_based_true() {
     let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_branch.clone(), false_branch), DType::Int32);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op);
+    let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // The comparison should be folded to true, then WHERE should select true branch
     assert!(Rc::ptr_eq(&result, &true_branch));
@@ -73,7 +73,7 @@ fn test_where_range_based_false() {
     let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_branch, false_branch.clone()), DType::Int32);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op);
+    let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // The comparison should be folded to false, then WHERE should select false branch
     assert!(Rc::ptr_eq(&result, &false_branch));
@@ -93,7 +93,7 @@ fn test_where_unknown_condition() {
         UOp::new(Op::Ternary(TernaryOp::Where, cond.clone(), true_branch.clone(), false_branch.clone()), DType::Int32);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op);
+    let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // Should not be eliminated (condition is not constant)
     match result.op() {
@@ -124,7 +124,7 @@ fn test_nested_where_elimination() {
     let outer = UOp::new(Op::Ternary(TernaryOp::Where, cond1, inner, val3), DType::Int32);
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, outer);
+    let result = graph_rewrite(&matcher, outer, &mut ());
 
     // Should eliminate to val2
     assert!(Rc::ptr_eq(&result, &val2));

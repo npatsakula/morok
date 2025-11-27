@@ -173,70 +173,54 @@ pub fn rangeify(
     sink: Rc<UOp>,
     pcontig_config: Option<&super::buffer_cost::PcontigConfig>,
 ) -> morok_ir::Result<(Rc<UOp>, super::context::RangeifyContext)> {
-    use std::cell::RefCell;
-    use std::rc::Rc as StdRc;
-
     // Step 1: Run range assignment to build IndexingContext
-    let (mut sink, indexing_ctx) = super::indexing::run_rangeify(sink)?;
+    let (mut sink, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
 
-    // Step 2: Wrap context for pattern access via closure capture
-    let ctx = StdRc::new(RefCell::new(indexing_ctx));
-
-    // Step 3: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
+    // Step 2: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
     let early_matcher = super::patterns::early_rewrites();
-    sink = crate::rewrite::graph_rewrite(&early_matcher, sink);
+    sink = crate::rewrite::graph_rewrite(&early_matcher, sink, &mut ());
 
-    // Step 4: Apply core rangeify patterns (BUFFERIZE insertion, movement removal)
-    {
-        let rangeify_matcher = super::patterns::apply_rangeify_patterns(StdRc::clone(&ctx));
-        sink = crate::rewrite::graph_rewrite(&rangeify_matcher, sink);
-        // rangeify_matcher is dropped here, releasing its reference to ctx
-    }
+    // Step 3: Apply core rangeify patterns (BUFFERIZE insertion, movement removal)
+    let rangeify_matcher = super::patterns::apply_rangeify_patterns();
+    sink = crate::rewrite::graph_rewrite(&rangeify_matcher, sink, &mut indexing_ctx);
 
-    // Step 5: Apply buffer folding optimizations
-    // These patterns simplify and optimize BUFFERIZE operations
-    let buffer_folding_matcher = super::patterns::buffer_folding();
-    sink = crate::rewrite::graph_rewrite(&buffer_folding_matcher, sink);
+    // Step 4: Buffer simplification (folding + dead axis removal)
+    // - Folds noop BUFFERIZE (INDEX with same ranges)
+    // - Removes size-1 dimensions from BUFFERIZE
+    let buffer_simplify = super::patterns::buffer_folding() + super::patterns::dead_axis_removal();
+    sink = crate::rewrite::graph_rewrite(&buffer_simplify, sink, &mut ());
 
-    // Step 6: Remove dead axes (size-1 dimensions)
-    // This simplifies buffer structure after folding
-    let dead_axis_matcher = super::patterns::dead_axis_removal();
-    sink = crate::rewrite::graph_rewrite(&dead_axis_matcher, sink);
-
-    // Step 7: Cost-based buffer removal with partial contiguous
+    // Step 5: Cost-based buffer removal with partial contiguous
     // Remove buffers that don't provide performance benefits
     // Use partial contiguous to selectively materialize dimensions when beneficial
-    let config = pcontig_config.cloned().unwrap_or_default();
-    let buffer_removal_matcher = super::patterns::buffer_removal_with_pcontig(&config);
-    sink = crate::rewrite::graph_rewrite(&buffer_removal_matcher, sink);
+    let mut pcontig = pcontig_config.cloned().unwrap_or_default();
+    let buffer_removal_matcher = super::patterns::buffer_removal_with_pcontig();
+    sink = crate::rewrite::graph_rewrite(&buffer_removal_matcher, sink, &mut pcontig);
 
-    // Step 8: Symbolic simplification
+    // Step 6: Symbolic simplification
     // Optimize index expressions created during rangeify
     let symbolic_matcher = crate::symbolic::symbolic_simple();
-    sink = crate::rewrite::graph_rewrite(&symbolic_matcher, sink);
+    sink = crate::rewrite::graph_rewrite(&symbolic_matcher, sink, &mut ());
 
-    // Step 8.5: Buffer limit enforcement
+    // Step 6.5: Buffer limit enforcement
     // Enforce device-specific buffer limits by forcing bufferization when exceeded
     // Only applies if device has buffer limits (Metal: 31, WebGPU: 8)
     if let Some(device) = super::buffer_limits::extract_device_from_graph(&sink)
         && let Some(limit) = device.max_buffers()
     {
         let limit_matcher = super::buffer_limits::buffer_limit_patterns(limit);
-        sink = crate::rewrite::graph_rewrite(&limit_matcher, sink);
+        sink = crate::rewrite::graph_rewrite(&limit_matcher, sink, &mut ());
     }
 
-    // Step 9: Reduction simplifications
+    // Step 7: Reduction simplifications
     // Apply reduce_unparented and split_reduceop optimizations
-    let split_config = super::split_reduceop::SplitReduceOpConfig::default();
-    let reduction_matcher = super::patterns::reduction_simplify_patterns(&split_config);
-    sink = crate::rewrite::graph_rewrite(&reduction_matcher, sink);
+    let mut split_config = super::split_reduceop::SplitReduceOpConfig::default();
+    let reduction_matcher = super::patterns::reduction_simplify_patterns();
+    sink = crate::rewrite::graph_rewrite(&reduction_matcher, sink, &mut split_config);
 
-    // Step 10: Extract final context
-    let final_indexing_ctx = StdRc::try_unwrap(ctx).ok().expect("Context should have no other references").into_inner();
-
-    // Step 11: Build RangeifyContext for return
+    // Step 8: Build RangeifyContext for return
     let rangeify_ctx = super::context::RangeifyContext {
-        range_counter: final_indexing_ctx.range_counter(),
+        range_counter: indexing_ctx.range_counter(),
         range_map: std::collections::HashMap::new(), // Could populate from indexing_ctx if needed
     };
 

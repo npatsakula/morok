@@ -1249,6 +1249,20 @@ impl UPat {
         }
     }
 
+    /// Chain as COPY source.
+    pub fn f_copy(self) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Copy {
+                src: UOp::noop(),
+                device: UOp::noop(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![self])),
+            arg: None,
+            name: None,
+        }
+    }
+
     /// Bind this pattern to a name.
     ///
     /// This is the Tinygrad `name=` equivalent. The matched UOp will be
@@ -1274,32 +1288,6 @@ impl UPat {
                     name: Some(name.into()),
                 }
             }
-        }
-    }
-
-    /// Allow variable-length source matching.
-    ///
-    /// Converts a Tuple source pattern to Repeat, allowing the pattern
-    /// to match any number of sources (0 or more).
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match SINK with any number of sources, all bound to pattern
-    /// UPat::sink(UPat::var("x")).allow_any_len()
-    /// ```
-    pub fn allow_any_len(self) -> Self {
-        match self {
-            UPat::Match { op, dtype, src, arg, name } => {
-                let new_src = match src {
-                    Some(SrcPattern::Tuple(patterns)) if !patterns.is_empty() => {
-                        // Use first pattern for all sources
-                        Some(SrcPattern::Repeat(Box::new(patterns.into_iter().next().unwrap())))
-                    }
-                    other => other,
-                };
-                UPat::Match { op, dtype, src: new_src, arg, name }
-            }
-            other => other,
         }
     }
 
@@ -1571,36 +1559,36 @@ impl UPat {
 
             UPat::Match { op: op_filter, dtype: dtype_filter, src: src_pattern, arg: arg_pattern, name } => {
                 // 1. Check operation type
-                if let Some(filters) = op_filter {
-                    if !Self::matches_op_filter(uop.op(), filters) {
-                        return false;
-                    }
+                if let Some(filters) = op_filter
+                    && !Self::matches_op_filter(uop.op(), filters)
+                {
+                    return false;
                 }
 
                 // 2. Check dtype
-                if let Some(dtypes) = dtype_filter {
-                    if !dtypes.contains(&uop.dtype()) {
-                        return false;
-                    }
+                if let Some(dtypes) = dtype_filter
+                    && !dtypes.contains(&uop.dtype())
+                {
+                    return false;
                 }
 
                 // 3. Check argument pattern
-                if let Some(arg_pat) = arg_pattern {
-                    if !Self::matches_arg(uop, arg_pat) {
-                        return false;
-                    }
+                if let Some(arg_pat) = arg_pattern
+                    && !Self::matches_arg(uop, arg_pat)
+                {
+                    return false;
                 }
 
                 // 4. Check/store named binding
-                if let Some(n) = name {
-                    if let Some(idx) = intern.get_index(n) {
-                        if let Some(existing) = store.get_by_index(idx) {
-                            if !Rc::ptr_eq(existing, uop) {
-                                return false;
-                            }
-                        } else {
-                            store.set_binding(idx, uop.clone());
+                if let Some(n) = name
+                    && let Some(idx) = intern.get_index(n)
+                {
+                    if let Some(existing) = store.get_by_index(idx) {
+                        if !Rc::ptr_eq(existing, uop) {
+                            return false;
                         }
+                    } else {
+                        store.set_binding(idx, uop.clone());
                     }
                 }
 
@@ -1610,7 +1598,8 @@ impl UPat {
 
                     Some(SrcPattern::Tuple(patterns)) => {
                         let children = uop.op().children();
-                        if children.len() != patterns.len() {
+                        // Prefix matching: require at least N children, match first N
+                        if children.len() < patterns.len() {
                             return false;
                         }
                         for (child, pat) in children.iter().zip(patterns.iter()) {
@@ -1801,17 +1790,17 @@ impl UPat {
                 }
 
                 // 4. Check/store named binding (using index)
-                if let Some(n) = name {
-                    if let Some(idx) = intern.get_index(n) {
-                        if let Some(existing) = store.get_by_index(idx) {
-                            // Name already bound - must match same UOp (by pointer equality)
-                            if !Rc::ptr_eq(existing, uop) {
-                                return vec![];
-                            }
-                        } else {
-                            // Bind index to this UOp
-                            store.set_binding(idx, uop.clone());
+                if let Some(n) = name
+                    && let Some(idx) = intern.get_index(n)
+                {
+                    if let Some(existing) = store.get_by_index(idx) {
+                        // Name already bound - must match same UOp (by pointer equality)
+                        if !Rc::ptr_eq(existing, uop) {
+                            return vec![];
                         }
+                    } else {
+                        // Bind index to this UOp
+                        store.set_binding(idx, uop.clone());
                     }
                 }
 
@@ -1821,10 +1810,11 @@ impl UPat {
 
                     Some(SrcPattern::Tuple(patterns)) => {
                         let children = uop.op().children();
-                        if children.len() != patterns.len() {
+                        // Prefix matching: require at least N children, match first N
+                        if children.len() < patterns.len() {
                             return vec![];
                         }
-                        Self::match_sources_tuple_fast(&children, patterns, store, intern)
+                        Self::match_sources_tuple_fast(&children[..patterns.len()], patterns, store, intern)
                     }
 
                     Some(SrcPattern::Repeat(pattern)) => {
@@ -2075,13 +2065,13 @@ impl UPat {
                     Some(SrcPattern::Tuple(patterns)) => {
                         let children = uop.op().children();
 
-                        // Length must match exactly
-                        if children.len() != patterns.len() {
+                        // Prefix matching: require at least N children, match first N
+                        if children.len() < patterns.len() {
                             return vec![];
                         }
 
-                        // Match each child against corresponding pattern
-                        Self::match_sources_tuple(&children, patterns, store)
+                        // Match first N children against corresponding patterns
+                        Self::match_sources_tuple(&children[..patterns.len()], patterns, store)
                     }
 
                     Some(SrcPattern::Repeat(pattern)) => {
