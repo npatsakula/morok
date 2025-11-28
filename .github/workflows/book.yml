@@ -29,7 +29,9 @@ jobs:
           mdbook-version: 'latest'
 
       - name: Build book
-        run: mdbook build book
+        run: |
+          mdbook build book
+          cp book/src/CNAME book/build/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
