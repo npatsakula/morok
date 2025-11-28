@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ac025deb3271be4564ad4c7e2a8817c1384dc62b884120ae50c2dabdaf857fbb # shrinks to kpg = SubSelf { x: UOp { id: 1658, op: DefineVar { name: "a", min_val: 0, max_val: 1 }, dtype: Scalar(Int8), shape_cache: OnceCell(<uninit>), ranges_cache: OnceCell(<uninit>), in_scope_ranges_cache: OnceCell(<uninit>), vmin_vmax_cache: OnceCell(<uninit>) }, dtype: Scalar(Int8) }
+cc dbe02d05cd7e14c7d0fdbad241584b926f080aff62cbd85f0e89fcea8c9574b2 # shrinks to x = UOp { id: 532, op: DefineVar { name: "a", min_val: 0, max_val: 1 }, dtype: Scalar(Int32), shape_cache: OnceCell(<uninit>), ranges_cache: OnceCell(<uninit>), in_scope_ranges_cache: OnceCell(<uninit>), vmin_vmax_cache: OnceCell(<uninit>) }

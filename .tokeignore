@@ -1,0 +1,7 @@
+device/src/test/
+dtype/src/test/
+ir/src/test/
+schedule/src/test/
+schedule-macros/src/test/
+tensor/src/test/
+submodules/

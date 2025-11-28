@@ -1,0 +1,31 @@
+[package]
+name = "morok-schedule"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+morok-ir = { path = "../ir" }
+morok-dtype = { path = "../dtype" }
+morok-device = { path = "../device" }
+morok-schedule-macros = { path = "../schedule-macros" }
+smallvec = { version = "1.15", features = ["union"] }
+
+z3 = { version = "0.19", optional = true }
+proptest-derive = { version = "0.7", optional = true }
+snafu = "0.8.9"
+
+[features]
+default = ["cuda", "metal", "webgpu"]
+z3 = ["dep:z3"]
+proptest = ["dep:proptest-derive", "morok-ir/proptest"]
+serde = ["morok-ir/serde"]
+# Devices
+cuda = ["morok-device/cuda"]
+metal = ["morok-device/metal"]
+webgpu = ["morok-device/webgpu"]
+
+[dev-dependencies]
+proptest = "1.9.0"
+morok-ir = { path = "../ir", features = ["proptest"] }
+test-case = "3.3.1"

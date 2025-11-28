@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a6d87876ec949e44869c5bb9fe7d2b8fd62f331db933ecca8386c9bdb1969a87 # shrinks to x = UOp { id: 84, op: Const(ConstValueHash(Int(-1))), dtype: Scalar(Int32), shape_cache: OnceCell(<uninit>), ranges_cache: OnceCell(<uninit>), in_scope_ranges_cache: OnceCell(<uninit>), vmin_vmax_cache: OnceCell(<uninit>) }

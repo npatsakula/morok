@@ -1,0 +1,14 @@
+[book]
+title = "Morok"
+authors = ["Patsakula Nikita <nikita.patsakula@gmail.com>"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "build"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/patsak/morok"
+edit-url-template = "https://github.com/patsak/morok/edit/main/book/{path}"

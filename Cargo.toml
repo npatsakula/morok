@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["codegen", "device", "dtype", "ir", "runtime", "schedule", "schedule-macros", "tensor"]
+exclude = ["submodules"]
+
+[workspace.package]
+authors = ["Patsakula Nikita <nikita.patsakula@gmail.com>"]
+edition = "2024"
+
+[workspace.dependencies]
+ndarray = "0.17"
+enum_delegate = "0.2"
