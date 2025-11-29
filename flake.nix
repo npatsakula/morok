@@ -77,6 +77,7 @@
             commonArgs
             // {
               inherit cargoArtifacts;
+              cargoNextestExtraArgs = "--features z3,proptest";
             }
           );
 
