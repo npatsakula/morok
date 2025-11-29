@@ -231,20 +231,18 @@ fn compute_buffer_size(ast: &Rc<UOp>, buffer_def: &Rc<UOp>) -> Result<usize> {
 
     // Find STORE operations that write to this buffer
     for node in ast.toposort() {
-        if let Op::Store { buffer, .. } = node.op() {
-            if Rc::ptr_eq(buffer, buffer_def) {
-                // Get shape from buffer
-                if let Ok(Some(shape_vec)) = buffer.shape() {
-                    // Convert to static dimensions if possible
-                    if let Some(static_shape) = shape::to_static(shape_vec) {
-                        // Compute product of all dimensions
-                        let numel: usize = static_shape.iter().product();
-                        return Ok(numel);
-                    } else {
-                        return Err(Error::SymbolicShapeUnsupported {
-                            operation: "buffer size computation".to_string(),
-                        });
-                    }
+        if let Op::Store { buffer, .. } = node.op()
+            && Rc::ptr_eq(buffer, buffer_def)
+        {
+            // Get shape from buffer
+            if let Ok(Some(shape_vec)) = buffer.shape() {
+                // Convert to static dimensions if possible
+                if let Some(static_shape) = shape::to_static(shape_vec) {
+                    // Compute product of all dimensions
+                    let numel: usize = static_shape.iter().product();
+                    return Ok(numel);
+                } else {
+                    return Err(Error::SymbolicShapeUnsupported { operation: "buffer size computation".to_string() });
                 }
             }
         }

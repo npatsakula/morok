@@ -123,7 +123,7 @@ fn test_provenance_chain() {
 #[test]
 fn test_onnx_node_attachment() {
     // Create a UOp
-    let uop = UOp::const_(DType::Float32, ConstValue::Float(3.14));
+    let uop = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI.into()));
 
     // Attach ONNX node information
     let onnx_node = OnnxNodeInfo {

@@ -16,7 +16,7 @@ proptest-derive = { version = "0.7", optional = true }
 snafu = "0.8.9"
 
 [features]
-default = ["cuda", "metal", "webgpu"]
+default = []
 z3 = ["dep:z3"]
 proptest = ["dep:proptest-derive", "morok-ir/proptest"]
 serde = ["morok-ir/serde"]

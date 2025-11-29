@@ -298,11 +298,8 @@ fn apply_pcontig_removal(idx: &Rc<UOp>, config: &mut PcontigConfig) -> Option<Rc
 
         // Build substitution map: buffer ranges → index ranges
         #[allow(clippy::mutable_key_type)]
-        let subs_map: HashMap<UOpKey, Rc<UOp>> = buf_ranges
-            .iter()
-            .zip(idx_ranges.iter())
-            .map(|(k, v)| (UOpKey(Rc::clone(k)), Rc::clone(v)))
-            .collect();
+        let subs_map: HashMap<UOpKey, Rc<UOp>> =
+            buf_ranges.iter().zip(idx_ranges.iter()).map(|(k, v)| (UOpKey(Rc::clone(k)), Rc::clone(v))).collect();
 
         return Some(src.substitute(&subs_map));
     }

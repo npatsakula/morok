@@ -7,7 +7,7 @@
 //! by the specific operations they match, with wildcard patterns stored separately.
 
 use std::collections::HashMap;
-use std::mem::{discriminant, Discriminant};
+use std::mem::{Discriminant, discriminant};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -359,8 +359,14 @@ impl OpKey {
             m.insert(discriminant(&Op::Multi { src: noop(), axis: 0 }), OpKey::Multi);
 
             // Reduction operations (key ops for dead_loop_patterns)
-            m.insert(discriminant(&Op::ReduceAxis { src: noop(), reduce_op: ReduceOp::Add, axes: Vec::new() }), OpKey::ReduceAxis);
-            m.insert(discriminant(&Op::Reduce { src: noop(), ranges: SmallVec::new(), reduce_op: ReduceOp::Add }), OpKey::Reduce);
+            m.insert(
+                discriminant(&Op::ReduceAxis { src: noop(), reduce_op: ReduceOp::Add, axes: Vec::new() }),
+                OpKey::ReduceAxis,
+            );
+            m.insert(
+                discriminant(&Op::Reduce { src: noop(), ranges: SmallVec::new(), reduce_op: ReduceOp::Add }),
+                OpKey::Reduce,
+            );
 
             // Control flow (key ops for dead_loop_patterns)
             m.insert(discriminant(&Op::Range { end: noop(), axis_id: 0, axis_type: AxisType::Loop }), OpKey::Range);
@@ -393,7 +399,10 @@ impl OpKey {
             m.insert(discriminant(&Op::Load { buffer: noop(), index: noop() }), OpKey::Load);
             m.insert(discriminant(&Op::LoadGated { buffer: noop(), index: noop(), gate: noop() }), OpKey::LoadGated);
             m.insert(discriminant(&Op::Store { buffer: noop(), index: noop(), value: noop() }), OpKey::Store);
-            m.insert(discriminant(&Op::StoreGated { buffer: noop(), index: noop(), value: noop(), gate: noop() }), OpKey::StoreGated);
+            m.insert(
+                discriminant(&Op::StoreGated { buffer: noop(), index: noop(), value: noop(), gate: noop() }),
+                OpKey::StoreGated,
+            );
 
             m
         });
@@ -486,12 +495,7 @@ pub struct PatternMatcher<C = ()> {
 impl<C> PatternMatcher<C> {
     /// Create an empty PatternMatcher.
     pub fn empty() -> Self {
-        Self {
-            patterns: Vec::new(),
-            pdict: HashMap::new(),
-            wildcard_indices: Vec::new(),
-            single_solution: Vec::new(),
-        }
+        Self { patterns: Vec::new(), pdict: HashMap::new(), wildcard_indices: Vec::new(), single_solution: Vec::new() }
     }
 
     /// Create a new PatternMatcher from a list of patterns and rewrite functions.

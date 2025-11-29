@@ -319,8 +319,7 @@ impl UOp {
         use crate::types::TernaryOp;
 
         match self.op() {
-            Op::Ternary(TernaryOp::Where, _, true_val, false_val)
-                if Self::is_invalid_marker(false_val) => {
+            Op::Ternary(TernaryOp::Where, _, true_val, false_val) if Self::is_invalid_marker(false_val) => {
                 // WHERE(valid, idx, INVALID) → return idx
                 true_val.clone()
             }
@@ -356,8 +355,7 @@ impl UOp {
         use morok_dtype::DType;
 
         match self.op() {
-            Op::Ternary(TernaryOp::Where, cond, _, false_val)
-                if Self::is_invalid_marker(false_val) => {
+            Op::Ternary(TernaryOp::Where, cond, _, false_val) if Self::is_invalid_marker(false_val) => {
                 // WHERE(valid, idx, INVALID) → return valid
                 cond.clone()
             }

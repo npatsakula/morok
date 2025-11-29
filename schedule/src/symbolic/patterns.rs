@@ -295,33 +295,19 @@ pub fn dead_loop_patterns() -> PatternMatcher {
 
     /// Check if END has any dead ranges (for guard).
     fn has_dead_ranges(end_op: &Rc<UOp>) -> bool {
-        if let Op::End { ranges, .. } = end_op.op() {
-            ranges.iter().any(is_empty_range)
-        } else {
-            false
-        }
+        if let Op::End { ranges, .. } = end_op.op() { ranges.iter().any(is_empty_range) } else { false }
     }
 
     /// Check if all REDUCE ranges are empty (for guard).
     fn all_ranges_empty(reduce_op: &Rc<UOp>) -> bool {
-        if let Op::Reduce { ranges, .. } = reduce_op.op() {
-            ranges.iter().all(is_empty_range)
-        } else {
-            false
-        }
+        if let Op::Reduce { ranges, .. } = reduce_op.op() { ranges.iter().all(is_empty_range) } else { false }
     }
 
     /// Filter dead ranges from END, or unwrap if all dead.
     fn filter_dead_ranges(end_op: &Rc<UOp>) -> Rc<UOp> {
-        let Op::End { computation, ranges } = end_op.op() else {
-            unreachable!("filter_dead_ranges called on non-End")
-        };
+        let Op::End { computation, ranges } = end_op.op() else { unreachable!("filter_dead_ranges called on non-End") };
 
-        let live_ranges: SmallVec<[Rc<UOp>; 4]> = ranges
-            .iter()
-            .filter(|r| !is_empty_range(r))
-            .cloned()
-            .collect();
+        let live_ranges: SmallVec<[Rc<UOp>; 4]> = ranges.iter().filter(|r| !is_empty_range(r)).cloned().collect();
 
         if live_ranges.is_empty() {
             // All ranges dead - return computation directly

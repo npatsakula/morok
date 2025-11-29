@@ -136,8 +136,8 @@ mod tests {
     #[ignore] // TODO: Enable once rangeify/kernel splitting is fully integrated
     fn test_realize_simple_add() {
         // Test that realizing a simple computation works
-        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-        let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
 
         // Create computation: a + b
         let c = &a + &b;
