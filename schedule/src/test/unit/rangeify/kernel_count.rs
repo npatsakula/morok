@@ -4,7 +4,7 @@
 //! ensuring fusion decisions are correct without needing actual tensor data.
 
 use morok_dtype::DType;
-use morok_ir::{AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 
 use crate::rangeify::{KernelContext, pipeline::run_kernel_split_pipeline};
 use crate::test::unit::rangeify::helpers::{count_define_globals, count_ends, count_kernels, count_stores};
@@ -137,7 +137,8 @@ fn test_pipeline_kernel_count() {
     // After full pipeline, count kernels
     // Use OUTER range so split_store will split at kernel boundary
     let compute = UOp::const_(DType::Bool, ConstValue::Bool(false));
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(100)), 0, AxisType::Outer);
+    let range =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(100)), AxisId::Renumbered(0), AxisType::Outer);
 
     let bufferize = UOp::bufferize_global(compute, vec![range]);
 

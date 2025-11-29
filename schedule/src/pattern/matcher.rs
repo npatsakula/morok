@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use morok_dtype::DType;
-use morok_ir::types::{AxisType, ConstValue, ConstValueHash, ReduceOp};
+use morok_ir::types::{AxisId, AxisType, ConstValue, ConstValueHash, ReduceOp};
 use morok_ir::{BinaryOp, Op, TernaryOp, UOp, UnaryOp};
 use smallvec::SmallVec;
 
@@ -369,7 +369,10 @@ impl OpKey {
             );
 
             // Control flow (key ops for dead_loop_patterns)
-            m.insert(discriminant(&Op::Range { end: noop(), axis_id: 0, axis_type: AxisType::Loop }), OpKey::Range);
+            m.insert(
+                discriminant(&Op::Range { end: noop(), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop }),
+                OpKey::Range,
+            );
             m.insert(discriminant(&Op::End { computation: noop(), ranges: SmallVec::new() }), OpKey::End);
 
             // Vector operations

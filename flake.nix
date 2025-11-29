@@ -51,14 +51,15 @@
         };
         nativeBuildInputs = with pkgs; [
           pkgconf
-          llvm.llvm.dev
           libffi
           libxml2
           z3
+          zlib
         ];
         commonArgs = {
           inherit src nativeBuildInputs;
           LLVM_SYS_211_PREFIX = "${llvm.llvm.dev}";
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib/";
         };
 
         cargoArtifacts = crane'.buildDepsOnly (commonArgs // { });

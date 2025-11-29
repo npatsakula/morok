@@ -3,14 +3,22 @@
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
 
-use crate::types::{AddrSpace, AxisType, BufferizeOpts};
+use crate::types::{AddrSpace, AxisId, AxisType, BufferizeOpts};
 use crate::{Op, UOp};
 
 #[test]
 fn test_bufferize() {
     let compute = UOp::const_(DType::Float32, crate::types::ConstValue::Float(1.0));
-    let r1 = UOp::range_axis(UOp::const_(DType::Int32, crate::types::ConstValue::Int(10)), 0, AxisType::Loop);
-    let r2 = UOp::range_axis(UOp::const_(DType::Int32, crate::types::ConstValue::Int(20)), 1, AxisType::Loop);
+    let r1 = UOp::range_axis(
+        UOp::const_(DType::Int32, crate::types::ConstValue::Int(10)),
+        AxisId::Renumbered(0),
+        AxisType::Loop,
+    );
+    let r2 = UOp::range_axis(
+        UOp::const_(DType::Int32, crate::types::ConstValue::Int(20)),
+        AxisId::Renumbered(1),
+        AxisType::Loop,
+    );
 
     let opts = BufferizeOpts::new(DeviceSpec::Cpu);
     let bufferize = UOp::bufferize(compute.clone(), vec![r1, r2], opts);
@@ -32,7 +40,11 @@ fn test_bufferize() {
 #[test]
 fn test_bufferize_local() {
     let compute = UOp::const_(DType::Float32, crate::types::ConstValue::Float(1.0));
-    let r = UOp::range_axis(UOp::const_(DType::Int32, crate::types::ConstValue::Int(10)), 0, AxisType::Loop);
+    let r = UOp::range_axis(
+        UOp::const_(DType::Int32, crate::types::ConstValue::Int(10)),
+        AxisId::Renumbered(0),
+        AxisType::Loop,
+    );
 
     let opts = BufferizeOpts::local();
     let bufferize = UOp::bufferize(compute, vec![r], opts);

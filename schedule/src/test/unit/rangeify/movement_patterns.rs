@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
-use morok_ir::{AxisType, ConstValue, Op, SInt, UOp, UnaryOp};
+use morok_ir::{AxisId, AxisType, ConstValue, Op, SInt, UOp, UnaryOp};
 
 use crate::rangeify::movement_patterns::movement_op_patterns;
 use crate::rewrite::graph_rewrite;
@@ -22,7 +22,7 @@ fn create_buffer(size: usize) -> Rc<UOp> {
 /// Create a RANGE for testing.
 fn create_range(size: usize, axis_id: usize) -> Rc<UOp> {
     let end = UOp::const_(DType::Index, ConstValue::Int(size as i64));
-    UOp::range_axis(end, axis_id, AxisType::Loop)
+    UOp::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
 }
 
 // ===== EXPAND Tests =====

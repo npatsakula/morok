@@ -123,6 +123,9 @@ nix flake check # Run CI tests
 | NVCC | >13.x | CUDA code generation backend (optional) |
 | MESA NAK | >=25.x | CUDA code generation backend (optional) |
 | Z3 | >=4.15 | SMT solver for optimization verification (optional) |
+| zlib | >=1.3 | Compression library |
+| libffi | >=3.4 | Foreign function interface library |
+| libxml | >=2.13 | XML parsing library |
 
 ## Test
 

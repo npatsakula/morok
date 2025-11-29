@@ -11,7 +11,7 @@
 use std::rc::Rc;
 
 use morok_dtype::DType;
-use morok_ir::{AxisType, BufferizeOpts, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 
 use crate::pattern::matcher::RewriteResult;
 use crate::rangeify::patterns;
@@ -92,7 +92,7 @@ fn test_buffer_folding_noop_bufferize() {
     // Test: INDEX(BUFFERIZE(x, ranges), ranges) → x when ranges are equal
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(range_end, 0, AxisType::Loop);
+    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x.clone(), vec![range.clone()], BufferizeOpts::local());
     let index = UOp::index(bufferize, vec![range]).unwrap();
@@ -112,7 +112,7 @@ fn test_buffer_folding_bufferize_const() {
     // Test: BUFFERIZE(CONST) → CONST
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(range_end, 0, AxisType::Loop);
+    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(const_val.clone(), vec![range], BufferizeOpts::local());
 
     let result = matcher.rewrite(&bufferize, &mut ());
@@ -130,7 +130,7 @@ fn test_buffer_folding_index_const() {
     // Test: INDEX(CONST) → CONST
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as _));
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(range_end, 0, AxisType::Loop);
+    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let index = UOp::index(const_val.clone(), vec![range]).unwrap();
 
     let result = matcher.rewrite(&index, &mut ());
@@ -165,10 +165,10 @@ fn test_buffer_folding_no_match_different_ranges() {
     // Test: INDEX(BUFFERIZE(x, r1), r2) should NOT match when r1 != r2
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let range1_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range1 = UOp::range_axis(range1_end, 0, AxisType::Loop);
+    let range1 = UOp::range_axis(range1_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let range2_end = UOp::const_(DType::Index, ConstValue::Int(20));
-    let range2 = UOp::range_axis(range2_end, 1, AxisType::Loop);
+    let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x, vec![range1], BufferizeOpts::local());
     let index = UOp::index(bufferize, vec![range2]).unwrap();
@@ -195,7 +195,7 @@ fn test_dead_axis_removal_single_dead_axis() {
     // Create a BUFFERIZE with one dead axis (range with size 1)
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let dead_range_end = UOp::const_(DType::Index, ConstValue::Int(1)); // size 1 = dead
-    let dead_range = UOp::range_axis(dead_range_end, 0, AxisType::Loop);
+    let dead_range = UOp::range_axis(dead_range_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x.clone(), vec![dead_range], BufferizeOpts::local());
 
@@ -224,10 +224,10 @@ fn test_dead_axis_removal_mixed_axes() {
     // Create BUFFERIZE with mix of live and dead axes
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let live_range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let live_range = UOp::range_axis(live_range_end, 0, AxisType::Loop);
+    let live_range = UOp::range_axis(live_range_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let dead_range_end = UOp::const_(DType::Index, ConstValue::Int(1));
-    let dead_range = UOp::range_axis(dead_range_end, 1, AxisType::Loop);
+    let dead_range = UOp::range_axis(dead_range_end, AxisId::Renumbered(1), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x, vec![live_range.clone(), dead_range], BufferizeOpts::local());
 
@@ -254,10 +254,10 @@ fn test_dead_axis_removal_no_dead_axes() {
     // Create BUFFERIZE with all live axes
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let range1_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range1 = UOp::range_axis(range1_end, 0, AxisType::Loop);
+    let range1 = UOp::range_axis(range1_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let range2_end = UOp::const_(DType::Index, ConstValue::Int(20));
-    let range2 = UOp::range_axis(range2_end, 1, AxisType::Loop);
+    let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x, vec![range1, range2], BufferizeOpts::local());
 
@@ -279,7 +279,7 @@ fn test_buffer_removal_cheap_compute() {
     let add = a.try_add_op(&b).unwrap(); // Binary add is cheap
 
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(range_end, 0, AxisType::Loop);
+    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(add.clone(), vec![range], BufferizeOpts::local());
 
     let result = matcher.rewrite(&bufferize, &mut ());
@@ -303,7 +303,7 @@ fn test_buffer_removal_always_run_ops() {
     let contiguous = UOp::new(Op::Contiguous { src: src.clone() }, src.dtype());
 
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(range_end, 0, AxisType::Loop);
+    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(contiguous.clone(), vec![range], BufferizeOpts::local());
 
     let result = matcher.rewrite(&bufferize, &mut ());
@@ -325,12 +325,12 @@ fn test_buffer_removal_nested_bufferize() {
     // Test: BUFFERIZE(BUFFERIZE(x, r1), r2) → BUFFERIZE(x, r2)
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let range1_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range1 = UOp::range_axis(range1_end, 0, AxisType::Loop);
+    let range1 = UOp::range_axis(range1_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let inner = UOp::bufferize(x.clone(), vec![range1], BufferizeOpts::local());
 
     let range2_end = UOp::const_(DType::Index, ConstValue::Int(20));
-    let range2 = UOp::range_axis(range2_end, 1, AxisType::Loop);
+    let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
     let outer = UOp::bufferize(inner, vec![range2.clone()], BufferizeOpts::local());
 
@@ -362,7 +362,7 @@ fn test_buffer_removal_no_match_expensive_compute() {
     let load = UOp::new(Op::Load { buffer, index }, DType::Float32);
 
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(range_end, 0, AxisType::Loop);
+    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(load, vec![range], BufferizeOpts::local());
 
     let result = matcher.rewrite(&bufferize, &mut ());
@@ -408,7 +408,7 @@ fn test_pattern_composition() {
 
     // Now wrap in BUFFERIZE
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(range_end, 0, AxisType::Loop);
+    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(unwrapped, vec![range], BufferizeOpts::local());
 
     // Apply buffer_folding to remove BUFFERIZE(CONST)

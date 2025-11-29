@@ -109,7 +109,7 @@ pub fn apply(
     // 7. Create WARP dimension
     let warp = UOp::range_axis(
         UOp::const_(morok_dtype::DType::Index, morok_ir::ConstValue::Int(tc.threads as i64)),
-        scheduler.maxarg() + 1,
+        morok_ir::AxisId::Renumbered(scheduler.maxarg() + 1),
         AxisType::Warp,
     );
 

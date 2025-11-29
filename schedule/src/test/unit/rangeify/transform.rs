@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use morok_dtype::DType;
-use morok_ir::{AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 
 use crate::rangeify::{
     IndexingContext,
@@ -23,7 +23,11 @@ fn test_transform_buffer_source() {
     );
 
     let range = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(10)), axis_id: 0, axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::const_(DType::Index, ConstValue::Int(10)),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+        },
         DType::Index,
     );
 
@@ -58,7 +62,11 @@ fn test_transform_realizable_source() {
 
     // Create ranges
     let range = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(5)), axis_id: 0, axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::const_(DType::Index, ConstValue::Int(5)),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+        },
         DType::Index,
     );
 
@@ -91,7 +99,11 @@ fn test_should_remove_movement_op() {
 
     // After assigning ranges, should remove
     let range = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(5)), axis_id: 0, axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::const_(DType::Index, ConstValue::Int(5)),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+        },
         DType::Index,
     );
     ctx.set_ranges(&permute, vec![range.clone()], vec![range.clone()]);

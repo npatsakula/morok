@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use morok_dtype::DType;
-use morok_ir::{AxisType, ConstValue, Op, SInt, UOp, UOpKey};
+use morok_ir::{AxisId, AxisType, ConstValue, Op, SInt, UOp, UOpKey};
 
 use super::helpers;
 
@@ -29,14 +29,18 @@ impl IndexingContext {
     }
 
     /// Create new RANGE with unique ID. Returns const 0 if size is 1.
+    ///
+    /// Ranges are created with `AxisId::Unrenumbered` to mark them as needing
+    /// renumbering. The `renumber_range` pattern will later convert them to
+    /// `AxisId::Renumbered` with sequential IDs starting from 0 for each kernel.
     pub fn new_range(&mut self, size: &SInt, axistype: AxisType) -> Rc<UOp> {
         // Check if size is constant 1
         if let SInt::Const(1) = size {
             return UOp::const_(DType::Index, ConstValue::Int(0));
         }
 
-        // Create range with unique ID
-        let range_id = self.range_idx;
+        // Create range with Unrenumbered axis_id
+        let axis_id = AxisId::Unrenumbered(self.range_idx);
         self.range_idx += 1;
 
         let size_uop = match size {
@@ -44,7 +48,7 @@ impl IndexingContext {
             SInt::Symbolic(uop) => Rc::clone(uop),
         };
 
-        UOp::range_axis(size_uop, range_id, axistype)
+        UOp::range_axis(size_uop, axis_id, axistype)
     }
 
     /// Mark a UOp for realization on all axes.

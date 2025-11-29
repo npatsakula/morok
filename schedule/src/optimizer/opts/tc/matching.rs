@@ -128,7 +128,7 @@ fn get_ranges(uop: &Rc<UOp>) -> Vec<Rc<UOp>> {
 /// Extract axis_id from a RANGE UOp.
 fn get_axis_id(range: &Rc<UOp>) -> usize {
     if let Op::Range { axis_id, .. } = range.op() {
-        *axis_id
+        axis_id.value()
     } else {
         0 // Fallback (shouldn't happen)
     }

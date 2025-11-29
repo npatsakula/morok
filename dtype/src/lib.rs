@@ -36,14 +36,14 @@ pub enum ImageKind {
 pub enum ScalarDType {
     Bool = 0,
 
+    // Interleaved signed/unsigned for correct LUB priority (lower = more specific)
     Int8 = 1,
-    Int16 = 2,
-    Int32 = 3,
-    Int64 = 4,
-
-    UInt8 = 5,
-    UInt16 = 6,
-    UInt32 = 7,
+    UInt8 = 2,
+    Int16 = 3,
+    UInt16 = 4,
+    Int32 = 5,
+    UInt32 = 6,
+    Int64 = 7,
     UInt64 = 8,
 
     FP8E4M3 = 9,

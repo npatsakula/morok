@@ -241,52 +241,39 @@ impl UOp {
         Self::new(Op::DefineVar { name: name.into(), min_val, max_val }, dtype)
     }
 
-    /// Create a Range operation with default Loop axis type.
-    ///
-    /// This is the most common range pattern - a loop from 0 to end.
-    /// Returns Index dtype by default, which is standard for ranges.
+    /// Create a Range operation with specified axis type.
     ///
     /// # Examples
     /// ```ignore
-    /// let range = UOp::range(UOp::const_(DType::Int32, ConstValue::Int(10)), 0);
+    /// let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Reduce);
+    /// ```
+    pub fn range_axis(end: Rc<Self>, axis_id: AxisId, axis_type: AxisType) -> Rc<Self> {
+        Self::new(Op::Range { end, axis_id, axis_type }, DType::Index)
+    }
+
+    /// Create a RANGE operation with Loop axis type (convenience for tests).
+    ///
+    /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let range = UOp::range(end, 0);  // axis_id=0, AxisType::Loop
     /// ```
     pub fn range(end: Rc<Self>, axis_id: usize) -> Rc<Self> {
-        Self::range_typed(end, axis_id, AxisType::Loop, DType::Index)
+        Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
     }
 
-    /// Create a Range operation with specified axis type.
+    /// Create a RANGE operation with constant end value (convenience for tests).
     ///
-    /// Use when you need specific axis types like Reduce or Outer.
-    ///
-    /// # Examples
-    /// ```
-    /// let range = UOp::range_axis(end, 0, AxisType::Reduce);
-    /// ```
-    pub fn range_axis(end: Rc<Self>, axis_id: usize, axis_type: AxisType) -> Rc<Self> {
-        Self::range_typed(end, axis_id, axis_type, DType::Index)
-    }
-
-    /// Create a Range operation with full control over all parameters.
+    /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
     ///
     /// # Examples
+    /// ```ignore
+    /// let range = UOp::range_const(10, 0);  // RANGE(0..10), axis_id=0, AxisType::Loop
     /// ```
-    /// let range = UOp::range_typed(end, 0, AxisType::Loop, DType::Int32);
-    /// ```
-    pub fn range_typed(end: Rc<Self>, axis_id: usize, axis_type: AxisType, dtype: DType) -> Rc<Self> {
-        Self::new(Op::Range { end, axis_id, axis_type }, dtype)
-    }
-
-    /// Create a Range with a constant integer end value.
-    ///
-    /// Convenience method that combines const creation with range.
-    ///
-    /// # Examples
-    /// ```
-    /// let range = UOp::range_const(10, 0);  // Range from 0 to 10
-    /// ```
-    pub fn range_const(end_val: i64, axis_id: usize) -> Rc<Self> {
-        let end = Self::const_(DType::Index, ConstValue::Int(end_val));
-        Self::range(end, axis_id)
+    pub fn range_const(end_value: i64, axis_id: usize) -> Rc<Self> {
+        let end = Self::const_(DType::Index, ConstValue::Int(end_value));
+        Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
     }
 }
 

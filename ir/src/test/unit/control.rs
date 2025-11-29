@@ -6,7 +6,7 @@ use smallvec::smallvec;
 
 use morok_dtype::DType;
 
-use crate::{AxisType, ConstValue, Op, UOp};
+use crate::{AxisId, AxisType, ConstValue, Op, UOp};
 
 // =========================================================================
 // Basic If/EndIf Tests
@@ -100,7 +100,8 @@ fn test_if_returns_void() {
 fn test_range_global_axis() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(10));
 
-    let range_op = UOp::new(Op::Range { end, axis_id: 0, axis_type: AxisType::Global }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Global }, DType::Index);
 
     assert_eq!(range_op.dtype(), DType::Index);
 }
@@ -109,7 +110,7 @@ fn test_range_global_axis() {
 fn test_range_warp_axis() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(32));
 
-    let range_op = UOp::new(Op::Range { end, axis_id: 1, axis_type: AxisType::Warp }, DType::Index);
+    let range_op = UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(1), axis_type: AxisType::Warp }, DType::Index);
 
     assert_eq!(range_op.dtype(), DType::Index);
 }
@@ -118,7 +119,8 @@ fn test_range_warp_axis() {
 fn test_range_local_axis() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(256));
 
-    let range_op = UOp::new(Op::Range { end, axis_id: 0, axis_type: AxisType::Local }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Local }, DType::Index);
 
     assert_eq!(range_op.dtype(), DType::Index);
 }
@@ -127,7 +129,7 @@ fn test_range_local_axis() {
 fn test_range_loop_axis() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(100));
 
-    let range_op = UOp::new(Op::Range { end, axis_id: 2, axis_type: AxisType::Loop }, DType::Index);
+    let range_op = UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(2), axis_type: AxisType::Loop }, DType::Index);
 
     assert_eq!(range_op.dtype(), DType::Index);
 }
@@ -136,7 +138,8 @@ fn test_range_loop_axis() {
 fn test_range_reduce_axis() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(1024));
 
-    let range_op = UOp::new(Op::Range { end, axis_id: 0, axis_type: AxisType::Reduce }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Reduce }, DType::Index);
 
     assert_eq!(range_op.dtype(), DType::Index);
 }
@@ -145,7 +148,8 @@ fn test_range_reduce_axis() {
 fn test_range_unroll_axis() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(4));
 
-    let range_op = UOp::new(Op::Range { end, axis_id: 3, axis_type: AxisType::Unroll }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(3), axis_type: AxisType::Unroll }, DType::Index);
 
     assert_eq!(range_op.dtype(), DType::Index);
 }
@@ -154,7 +158,8 @@ fn test_range_unroll_axis() {
 fn test_range_thread_axis() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(8));
 
-    let range_op = UOp::new(Op::Range { end, axis_id: 1, axis_type: AxisType::Thread }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(1), axis_type: AxisType::Thread }, DType::Index);
 
     assert_eq!(range_op.dtype(), DType::Index);
 }
@@ -177,7 +182,8 @@ fn test_range_dtype_is_index() {
     ];
 
     for (idx, axis_type) in axis_types.into_iter().enumerate() {
-        let range_op = UOp::new(Op::Range { end: end.clone(), axis_id: idx, axis_type }, DType::Index);
+        let range_op =
+            UOp::new(Op::Range { end: end.clone(), axis_id: AxisId::Renumbered(idx), axis_type }, DType::Index);
 
         assert_eq!(range_op.dtype(), DType::Index);
     }
@@ -190,7 +196,8 @@ fn test_range_dtype_is_index() {
 #[test]
 fn test_end_of_range() {
     let end_val = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let range_op = UOp::new(Op::Range { end: end_val, axis_id: 0, axis_type: AxisType::Loop }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end: end_val, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop }, DType::Index);
 
     // Create a simple computation (NOOP)
     let computation = UOp::noop();
@@ -205,7 +212,8 @@ fn test_end_of_range() {
 fn test_end_preserves_dtype() {
     // End operation should have DType::Void
     let end_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let range_op = UOp::new(Op::Range { end: end_val, axis_id: 0, axis_type: AxisType::Global }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end: end_val, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Global }, DType::Index);
 
     // Create a simple computation (NOOP)
     let computation = UOp::noop();
@@ -219,7 +227,8 @@ fn test_end_preserves_dtype() {
 #[test]
 fn test_end_returns_void() {
     let end_val = UOp::const_(DType::Int32, ConstValue::Int(100));
-    let range_op = UOp::new(Op::Range { end: end_val, axis_id: 1, axis_type: AxisType::Reduce }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end: end_val, axis_id: AxisId::Renumbered(1), axis_type: AxisType::Reduce }, DType::Index);
 
     // Create a simple computation (NOOP)
     let computation = UOp::noop();
@@ -310,7 +319,8 @@ fn test_range_inside_if() {
     let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let range_end = UOp::const_(DType::Int32, ConstValue::Int(10));
 
-    let range_op = UOp::new(Op::Range { end: range_end, axis_id: 0, axis_type: AxisType::Loop }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end: range_end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop }, DType::Index);
 
     let if_op = UOp::new(Op::If { condition, body: smallvec![range_op] }, DType::Void);
 
@@ -323,11 +333,14 @@ fn test_multiple_sequential_ranges() {
     let end2 = UOp::const_(DType::Int32, ConstValue::Int(20));
     let end3 = UOp::const_(DType::Int32, ConstValue::Int(30));
 
-    let range1 = UOp::new(Op::Range { end: end1, axis_id: 0, axis_type: AxisType::Global }, DType::Index);
+    let range1 =
+        UOp::new(Op::Range { end: end1, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Global }, DType::Index);
 
-    let range2 = UOp::new(Op::Range { end: end2, axis_id: 1, axis_type: AxisType::Local }, DType::Index);
+    let range2 =
+        UOp::new(Op::Range { end: end2, axis_id: AxisId::Renumbered(1), axis_type: AxisType::Local }, DType::Index);
 
-    let range3 = UOp::new(Op::Range { end: end3, axis_id: 2, axis_type: AxisType::Loop }, DType::Index);
+    let range3 =
+        UOp::new(Op::Range { end: end3, axis_id: AxisId::Renumbered(2), axis_type: AxisType::Loop }, DType::Index);
 
     // All ranges should be valid
     assert_eq!(range1.dtype(), DType::Index);
@@ -365,7 +378,7 @@ fn test_endif_dtype_is_void() {
 fn test_range_confirms_index_dtype() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(100));
 
-    let range_op = UOp::new(Op::Range { end, axis_id: 0, axis_type: AxisType::Loop }, DType::Index);
+    let range_op = UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop }, DType::Index);
 
     // Confirm Range dtype
     assert_eq!(range_op.dtype(), DType::Index);
@@ -374,7 +387,8 @@ fn test_range_confirms_index_dtype() {
 #[test]
 fn test_end_dtype_is_void() {
     let end_val = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let range_op = UOp::new(Op::Range { end: end_val, axis_id: 0, axis_type: AxisType::Global }, DType::Index);
+    let range_op =
+        UOp::new(Op::Range { end: end_val, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Global }, DType::Index);
 
     // Create a simple computation (NOOP)
     let computation = UOp::noop();

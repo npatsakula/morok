@@ -1,5 +1,5 @@
 use morok_dtype::DType;
-use morok_ir::{AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
 
 use crate::rangeify::{KernelContext, split_kernel::split_store};
@@ -270,7 +270,8 @@ fn test_split_store_end_with_outer_range() {
     let index = UOp::const_(DType::Index, ConstValue::Int(0));
     let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
-    let range_outer = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Outer);
+    let range_outer =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Outer);
     let end = UOp::end(store, smallvec![range_outer]);
 
     let result = split_store(&end, &mut ctx);
@@ -290,7 +291,8 @@ fn test_split_store_end_with_mixed_ranges() {
     let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
     let range_loop = UOp::range_const(4, 0);
-    let range_outer = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(8)), 1, AxisType::Outer);
+    let range_outer =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(8)), AxisId::Renumbered(1), AxisType::Outer);
     let end = UOp::end(store, smallvec![range_loop, range_outer]);
 
     let result = split_store(&end, &mut ctx);

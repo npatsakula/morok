@@ -350,6 +350,45 @@ impl std::fmt::Display for AxisType {
     }
 }
 
+/// State of range numbering for kernel deduplication.
+///
+/// Ranges go through two states during the compilation pipeline:
+/// - `Unrenumbered`: Created during rangeify with unique IDs for graph construction
+/// - `Renumbered`: Assigned sequential IDs starting from 0 within each kernel
+///
+/// The enum makes the renumber_range pattern naturally idempotent:
+/// it only matches `Unrenumbered` variants and produces `Renumbered` variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AxisId {
+    /// Range created during rangeify, not yet renumbered.
+    Unrenumbered(usize),
+    /// Range renumbered for kernel deduplication.
+    Renumbered(usize),
+}
+
+impl AxisId {
+    /// Get the numeric value, regardless of state.
+    pub fn value(&self) -> usize {
+        match self {
+            AxisId::Unrenumbered(n) | AxisId::Renumbered(n) => *n,
+        }
+    }
+
+    /// Check if this range has been renumbered.
+    pub fn is_renumbered(&self) -> bool {
+        matches!(self, AxisId::Renumbered(_))
+    }
+}
+
+impl std::fmt::Display for AxisId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AxisId::Unrenumbered(n) => write!(f, "U{}", n),
+            AxisId::Renumbered(n) => write!(f, "R{}", n),
+        }
+    }
+}
+
 /// Reduction operation types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReduceOp {

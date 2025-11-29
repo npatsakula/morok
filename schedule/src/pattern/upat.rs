@@ -25,7 +25,7 @@ use std::mem::discriminant;
 use std::rc::Rc;
 
 use morok_dtype::DType;
-use morok_ir::{AxisType, BinaryOp, ConstValue, ConstValueHash, Op, TernaryOp, UOp, UnaryOp};
+use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, ConstValueHash, Op, TernaryOp, UOp, UnaryOp};
 use smallvec::SmallVec;
 
 // ===== Optimized Binding Storage =====
@@ -1058,7 +1058,7 @@ impl UPat {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Range {
                 end: UOp::noop(),
-                axis_id: 0,
+                axis_id: AxisId::Renumbered(0),
                 axis_type: AxisType::Loop,
             }))]),
             dtype: None,

@@ -1,6 +1,6 @@
 //! Unit tests for vmin/vmax range analysis.
 
-use crate::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
+use crate::{AxisId, BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 use morok_dtype::DType;
 
 // ============================================================================
@@ -226,7 +226,10 @@ fn test_vmin_vmax_define_var() {
 #[test]
 fn test_vmin_vmax_range() {
     let end = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let range = UOp::new(Op::Range { end, axis_id: 0, axis_type: crate::types::AxisType::Loop }, DType::Int32);
+    let range = UOp::new(
+        Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: crate::types::AxisType::Loop },
+        DType::Int32,
+    );
 
     // RANGE goes from 0 to end-1
     assert_eq!(range.vmin(), &ConstValue::Int(0));

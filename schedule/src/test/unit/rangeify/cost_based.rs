@@ -3,7 +3,7 @@ use std::rc::Rc;
 use crate::rangeify::patterns::buffer_removal;
 use crate::rewrite::graph_rewrite;
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, UOp, UnaryOp};
+use morok_ir::{AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, UOp, UnaryOp};
 
 // Helper functions
 fn create_const(val: i64) -> Rc<UOp> {
@@ -11,7 +11,10 @@ fn create_const(val: i64) -> Rc<UOp> {
 }
 
 fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
-    UOp::new(Op::Range { end: create_const(end), axis_id, axis_type: AxisType::Loop }, DType::Index)
+    UOp::new(
+        Op::Range { end: create_const(end), axis_id: AxisId::Renumbered(axis_id), axis_type: AxisType::Loop },
+        DType::Index,
+    )
 }
 
 fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {

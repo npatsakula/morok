@@ -8,7 +8,7 @@
 use std::rc::Rc;
 
 use morok_dtype::DType;
-use morok_ir::{AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 
 use crate::rangeify::codegen_patterns::{fix_after_broadcast, get_contiguous, remove_noop};
 use crate::rangeify::cycle_detection::find_bufs;
@@ -141,7 +141,7 @@ fn test_split_store_with_loop_ranges() {
 
     // Wrap in END with LOOP range
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let loop_range = UOp::range_axis(range_end, 0, AxisType::Loop);
+    let loop_range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let end = UOp::new(Op::End { computation: store, ranges: vec![loop_range].into() }, DType::Void);
 
     let mut ctx = KernelContext::new();
@@ -216,7 +216,7 @@ fn test_end_store_structure() {
 
     // Wrap in END (normal pipeline output)
     let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(range_end, 0, AxisType::Loop);
+    let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let end = UOp::new(Op::End { computation: store.clone(), ranges: vec![range].into() }, DType::Void);
 
     // Verify END wraps STORE correctly before transformation

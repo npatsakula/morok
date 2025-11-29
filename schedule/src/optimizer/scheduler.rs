@@ -9,7 +9,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
-use morok_ir::{AxisType, Op, UOp, UOpKey};
+use morok_ir::{AxisId, AxisType, Op, UOp, UOpKey};
 
 use super::error::*;
 use super::renderer::Renderer;
@@ -258,7 +258,7 @@ impl Scheduler {
         *self.maxarg_cache.get_or_init(|| {
             self.rngs()
                 .iter()
-                .filter_map(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(*axis_id) } else { None })
+                .filter_map(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(axis_id.value()) } else { None })
                 .max()
                 .unwrap_or(0)
         })
@@ -751,7 +751,7 @@ impl Scheduler {
         // 2. Create new range
         let new_rng = input_new_rng.unwrap_or_else(|| {
             let end = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
-            UOp::range_axis(end, self.maxarg() + 1, new_type)
+            UOp::range_axis(end, AxisId::Renumbered(self.maxarg() + 1), new_type)
         });
 
         // 3. Create reduced old range (same axis_id and type, but smaller size)
