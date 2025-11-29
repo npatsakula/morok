@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use crate::rangeify::buffer_cost::*;
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
+use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use smallvec::SmallVec;
 
 /// Helper: Create a BUFFER operation for testing.
@@ -54,7 +54,7 @@ fn test_collect_accessed_buffers_stops_at_global_bufferize() {
     let inner_buf = create_test_buffer(100, DType::Float32, 0);
 
     // Wrap in GLOBAL bufferize
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Loop);
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferize = UOp::bufferize(inner_buf, vec![range], opts);
 
@@ -86,7 +86,8 @@ fn test_collect_reduces_empty() {
 fn test_collect_reduces_single() {
     // Create simple reduce
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Reduce);
+    let range =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
 
     use morok_ir::ReduceOp;
     let reduce = UOp::reduce(const_val, SmallVec::from_iter([range]), ReduceOp::Add);
@@ -108,7 +109,7 @@ fn test_collect_indexes_empty() {
 fn test_collect_indexes_single() {
     // Create INDEX operation
     let buffer = create_test_buffer(100, DType::Float32, 0);
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Loop);
 
     let index = UOp::index(buffer, vec![range]).unwrap();
 
@@ -120,9 +121,9 @@ fn test_collect_indexes_single() {
 #[test]
 fn test_calculate_buffer_size_concrete_ranges() {
     // BUFFERIZE with concrete ranges [10, 20, 30] → 10*20*30=6000 elements → 6000*4=24000 bytes (Float32)
-    let range1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
-    let range2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(20)), 1, AxisType::Loop);
-    let range3 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(30)), 2, AxisType::Loop);
+    let range1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Loop);
+    let range2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(20)), AxisId::Renumbered(1), AxisType::Loop);
+    let range3 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(30)), AxisId::Renumbered(2), AxisType::Loop);
 
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Local };
@@ -145,7 +146,7 @@ fn test_calculate_buffer_size_buffer_op() {
 fn test_calculate_buffer_size_symbolic() {
     // Symbolic range → None
     let batch_size = UOp::define_var("batch".to_string(), 1, 128);
-    let range = UOp::range_axis(batch_size, 0, AxisType::Loop);
+    let range = UOp::range_axis(batch_size, AxisId::Renumbered(0), AxisType::Loop);
 
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Local };
@@ -203,7 +204,7 @@ fn test_calculate_out_in_ratio_with_symbolic_bufferize() {
     let output_size = 100;
 
     let batch_size = UOp::define_var("batch".to_string(), 1, 128);
-    let range = UOp::range_axis(batch_size, 0, AxisType::Loop);
+    let range = UOp::range_axis(batch_size, AxisId::Renumbered(0), AxisType::Loop);
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Local };
     let symbolic_bufferize = UOp::bufferize(compute, vec![range], opts);
@@ -220,7 +221,8 @@ fn test_has_buffer_in_reduce_positive() {
     use morok_ir::ReduceOp;
 
     let buffer = create_test_buffer(100, DType::Float32, 0);
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Reduce);
+    let range =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
 
     let reduce = UOp::reduce(buffer, SmallVec::from_iter([range]), ReduceOp::Add);
 
@@ -234,7 +236,8 @@ fn test_has_buffer_in_reduce_negative() {
     use morok_ir::ReduceOp;
 
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Reduce);
+    let range =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
 
     let reduce = UOp::reduce(const_val, SmallVec::from_iter([range]), ReduceOp::Add);
 
@@ -255,11 +258,12 @@ fn test_has_buffer_in_reduce_nested_bufferize() {
     use morok_ir::ReduceOp;
 
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Loop);
+    let range1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Loop);
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Local };
     let bufferize = UOp::bufferize(compute, vec![range1.clone()], opts);
 
-    let range2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 1, AxisType::Reduce);
+    let range2 =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(1), AxisType::Reduce);
     let reduce = UOp::reduce(bufferize, SmallVec::from_iter([range2]), ReduceOp::Add);
 
     let reduces = vec![reduce];

@@ -107,7 +107,7 @@ enum OpData {
     AllReduceOp(ReduceOp),
 
     // Control flow operations
-    RangeData(usize, AxisType),
+    RangeData(AxisId, AxisType),
 
     // Vector operations
     GepIndices(Vec<usize>),

@@ -121,11 +121,7 @@ fn collect_nested_struct_info(pattern: &Pattern, depth: usize) -> Vec<NestedStru
                 format!("{}{}", binding_names::NESTED_PREFIX, depth - 1)
             };
 
-            result.push(NestedStructInfo {
-                binding_name,
-                op_name: op_name.clone(),
-                extractable_fields: extractable,
-            });
+            result.push(NestedStructInfo { binding_name, op_name: op_name.clone(), extractable_fields: extractable });
         }
 
         // Recurse into first field (the main UOp child) to find nested structs
@@ -367,16 +363,24 @@ fn generate_pattern_with_tracker(
             let inner_code = inner.code;
             let code = quote! { #inner_code.named(#actual_name) };
             // KEY: .named() replaces inner's self_name, keeps inner's children
-            Ok(PatternOutput { code, self_name: Some(Ident::new(&actual_name, name.span())), child_names: inner.child_names })
+            Ok(PatternOutput {
+                code,
+                self_name: Some(Ident::new(&actual_name, name.span())),
+                child_names: inner.child_names,
+            })
         }
 
-        Pattern::OpTuple { op, args, rest } => generate_op_tuple_pattern_with_tracker(op, args, iter_ctx, *rest, dup_tracker),
+        Pattern::OpTuple { op, args, rest } => {
+            generate_op_tuple_pattern_with_tracker(op, args, iter_ctx, *rest, dup_tracker)
+        }
 
         Pattern::OpStruct { op, fields, rest } => generate_op_struct_pattern_with_depth(op, fields, *rest, 0),
 
         Pattern::Const(const_pat) => generate_const_pattern(const_pat),
 
-        Pattern::OpVar { var_name, args } => generate_op_var_pattern_with_tracker(var_name, args, iter_ctx, dup_tracker),
+        Pattern::OpVar { var_name, args } => {
+            generate_op_var_pattern_with_tracker(var_name, args, iter_ctx, dup_tracker)
+        }
 
         Pattern::ConstWithValue { uop_name, .. } => {
             // Process name through duplicate tracker if available
@@ -395,16 +399,15 @@ fn generate_pattern_with_tracker(
             // because each alternative is independent. The same variable x in
             // (Add(x, y) | Mul(x, y)) should NOT be considered a duplicate.
             // We pass &mut None to disable duplicate tracking within alternatives.
-            let alt_outputs: Vec<PatternOutput> =
-                alternatives.iter().map(|p| generate_pattern_with_tracker(p, iter_ctx, &mut None)).collect::<Result<_>>()?;
+            let alt_outputs: Vec<PatternOutput> = alternatives
+                .iter()
+                .map(|p| generate_pattern_with_tracker(p, iter_ctx, &mut None))
+                .collect::<Result<_>>()?;
 
             // Collect all names from all alternatives (deduplicated)
             let mut seen = std::collections::HashSet::new();
-            let child_names: Vec<Ident> = alt_outputs
-                .iter()
-                .flat_map(|o| o.all_names())
-                .filter(|name| seen.insert(name.to_string()))
-                .collect();
+            let child_names: Vec<Ident> =
+                alt_outputs.iter().flat_map(|o| o.all_names()).filter(|name| seen.insert(name.to_string())).collect();
 
             let alt_codes: Vec<&TokenStream2> = alt_outputs.iter().map(|o| &o.code).collect();
             let code = quote! {
@@ -446,7 +449,10 @@ fn generate_pattern_with_tracker(
                         )
                     }
                 } else {
-                    return Err(Error::new_spanned(op, format!("Permutation pattern requires binary op, got: {}", op_name)));
+                    return Err(Error::new_spanned(
+                        op,
+                        format!("Permutation pattern requires binary op, got: {}", op_name),
+                    ));
                 }
             } else {
                 return Err(Error::new_spanned(
@@ -527,7 +533,8 @@ fn generate_op_tuple_pattern_with_tracker(
     let op_name = op.to_string();
 
     // Collect all child patterns and their names
-    let arg_outputs: Vec<PatternOutput> = args.iter().map(|a| generate_pattern_with_tracker(a, iter_ctx, dup_tracker)).collect::<Result<_>>()?;
+    let arg_outputs: Vec<PatternOutput> =
+        args.iter().map(|a| generate_pattern_with_tracker(a, iter_ctx, dup_tracker)).collect::<Result<_>>()?;
 
     // Collect all names from children in order
     let child_names: Vec<Ident> = arg_outputs.iter().flat_map(|o| o.all_names()).collect();
@@ -797,7 +804,8 @@ fn generate_op_var_pattern_with_tracker(
     let op_ident = &ctx.op_ident;
 
     // Collect all child patterns and their names
-    let arg_outputs: Vec<PatternOutput> = args.iter().map(|a| generate_pattern_with_tracker(a, iter_ctx, dup_tracker)).collect::<Result<_>>()?;
+    let arg_outputs: Vec<PatternOutput> =
+        args.iter().map(|a| generate_pattern_with_tracker(a, iter_ctx, dup_tracker)).collect::<Result<_>>()?;
 
     // Collect all names from children in order
     let child_names: Vec<Ident> = arg_outputs.iter().flat_map(|o| o.all_names()).collect();
@@ -879,10 +887,7 @@ fn collect_used_identifiers(expr: &syn::Expr, used: &mut std::collections::HashS
 }
 
 /// Collect identifiers used in the RHS and guard expressions.
-fn collect_rhs_used_identifiers(
-    rhs: &RewriteExpr,
-    guard: &Option<syn::Expr>,
-) -> std::collections::HashSet<String> {
+fn collect_rhs_used_identifiers(rhs: &RewriteExpr, guard: &Option<syn::Expr>) -> std::collections::HashSet<String> {
     let mut used = std::collections::HashSet::new();
 
     match rhs {
@@ -917,10 +922,7 @@ fn collect_rhs_used_identifiers(
 
 /// Add dependency bindings for ConstWithValue patterns.
 /// If `c_val` is used, we need to extract `c` first.
-fn add_const_value_dependencies(
-    lhs: &Pattern,
-    used: &mut std::collections::HashSet<String>,
-) {
+fn add_const_value_dependencies(lhs: &Pattern, used: &mut std::collections::HashSet<String>) {
     let const_value_bindings = collect_const_value_bindings(lhs);
     for (uop_name, value_name) in const_value_bindings {
         // If value_name is used, we need to extract uop_name first
@@ -933,10 +935,7 @@ fn add_const_value_dependencies(
 /// Add dependency bindings for struct field extraction.
 /// If any extracted field is used, we need the corresponding struct binding
 /// (__struct_root for outer, __nested_N for nested structs).
-fn add_struct_field_dependencies(
-    lhs: &Pattern,
-    used: &mut std::collections::HashSet<String>,
-) {
+fn add_struct_field_dependencies(lhs: &Pattern, used: &mut std::collections::HashSet<String>) {
     // Collect all nested struct info and check if any of their fields are used
     let nested_infos = collect_nested_struct_info(lhs, 0);
     for info in nested_infos {
@@ -1150,11 +1149,7 @@ fn generate_nested_field_extractions(lhs: &Pattern) -> Vec<TokenStream2> {
 
     for info in nested_infos {
         for (field_name, _var_name) in &info.extractable_fields {
-            extractions.push(generate_field_extraction_from_binding(
-                &info.binding_name,
-                &info.op_name,
-                field_name,
-            ));
+            extractions.push(generate_field_extraction_from_binding(&info.binding_name, &info.op_name, field_name));
         }
     }
 

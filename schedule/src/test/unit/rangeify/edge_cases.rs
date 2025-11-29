@@ -4,7 +4,7 @@
 //! that could cause crashes or incorrect behavior.
 
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, UOp};
+use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use smallvec::SmallVec;
 
 use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store, pipeline::run_kernel_split_pipeline};
@@ -12,7 +12,8 @@ use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store, pip
 #[test]
 fn test_zero_size_range() {
     // RANGE with end=0 should be handled gracefully
-    let range_zero = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(0)), 0, AxisType::Loop);
+    let range_zero =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(0)), AxisId::Renumbered(0), AxisType::Loop);
 
     // Should create a valid RANGE operation
     assert!(matches!(range_zero.op(), Op::Range { .. }));

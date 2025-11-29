@@ -11,15 +11,8 @@ use crate::error::{InvalidDeviceSnafu, Result};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DeviceSpec {
     Cpu,
-    #[cfg(feature = "cuda")]
-    Cuda {
-        device_id: usize,
-    },
-    #[cfg(feature = "metal")]
-    Metal {
-        device_id: usize,
-    },
-    #[cfg(feature = "webgpu")]
+    Cuda { device_id: usize },
+    Metal { device_id: usize },
     WebGpu,
 }
 
@@ -35,11 +28,8 @@ impl DeviceSpec {
     pub fn max_buffers(&self) -> Option<usize> {
         match self {
             DeviceSpec::Cpu => None,
-            #[cfg(feature = "cuda")]
             DeviceSpec::Cuda { .. } => None, // 128+ buffers, effectively unlimited
-            #[cfg(feature = "metal")]
             DeviceSpec::Metal { .. } => Some(31),
-            #[cfg(feature = "webgpu")]
             DeviceSpec::WebGpu => Some(8),
         }
     }
@@ -86,11 +76,8 @@ impl DeviceSpec {
     pub fn canonicalize(&self) -> String {
         match self {
             DeviceSpec::Cpu => "CPU".to_string(),
-            #[cfg(feature = "cuda")]
             DeviceSpec::Cuda { device_id } => format!("CUDA:{}", device_id),
-            #[cfg(feature = "metal")]
             DeviceSpec::Metal { .. } => unimplemented!("Metal device support - to be implemented"),
-            #[cfg(feature = "webgpu")]
             DeviceSpec::WebGpu => unimplemented!("WebGPU device support - to be implemented"),
         }
     }
@@ -140,9 +127,9 @@ impl DeviceRegistry {
             DeviceSpec::Cpu => Box::new(CpuAllocator),
             #[cfg(feature = "cuda")]
             DeviceSpec::Cuda { device_id } => Box::new(crate::allocator::CudaAllocator::new(*device_id)?),
-            #[cfg(feature = "metal")]
+            #[cfg(not(feature = "cuda"))]
+            DeviceSpec::Cuda { .. } => unimplemented!("Cuda allocator - to be implemented"),
             DeviceSpec::Metal { .. } => unimplemented!("Metal allocator - to be implemented"),
-            #[cfg(feature = "webgpu")]
             DeviceSpec::WebGpu => unimplemented!("WebGPU allocator - to be implemented"),
         };
 

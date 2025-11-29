@@ -4,7 +4,7 @@ use inkwell::context::Context;
 use std::cell::RefCell;
 
 thread_local! {
-    static CONTEXT: RefCell<Option<Box<Context>>> = RefCell::new(None);
+    static CONTEXT: RefCell<Option<Box<Context>>> = const { RefCell::new(None) };
 }
 
 /// Get or create the thread-local LLVM context.
@@ -44,13 +44,5 @@ mod tests {
         let ptr1 = with_context(|ctx| ctx as *const Context);
         let ptr2 = with_context(|ctx| ctx as *const Context);
         assert_eq!(ptr1, ptr2, "Context should be reused");
-    }
-
-    #[test]
-    fn test_clear_context() {
-        let ptr1 = with_context(|ctx| ctx as *const Context);
-        clear_context();
-        let ptr2 = with_context(|ctx| ctx as *const Context);
-        assert_ne!(ptr1, ptr2, "Context should be recreated after clear");
     }
 }

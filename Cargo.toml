@@ -3,9 +3,13 @@ resolver = "3"
 members = ["codegen", "device", "dtype", "ir", "runtime", "schedule", "schedule-macros", "tensor"]
 exclude = ["submodules"]
 
+[workspace.metadata.crane]
+name = "morok"
+
 [workspace.package]
 authors = ["Patsakula Nikita <nikita.patsakula@gmail.com>"]
 edition = "2024"
+version = "0.1.0"
 
 [workspace.dependencies]
 ndarray = "0.17"

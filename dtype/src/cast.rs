@@ -97,7 +97,7 @@ impl DType {
             .map(|s| s.get_recursive_parents())
             .reduce(|lhs, rhs| lhs.intersection(rhs))?
             .iter()
-            .next()?;
+            .min()?; // min by discriminant (= priority: lower = more specific)
 
         // Always return scalar (not vector), matching Tinygrad
         Some(DType::Scalar(scalar_result))

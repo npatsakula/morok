@@ -1,6 +1,6 @@
 use crate::{pattern::matcher::RewriteResult, symbolic::symbolic_simple};
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UnaryOp, UOp};
+use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 use std::rc::Rc;
 
 #[test]

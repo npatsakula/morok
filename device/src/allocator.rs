@@ -1,12 +1,15 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaContext, CudaSlice, UnifiedSlice};
+#[cfg(feature = "cuda")]
 use snafu::ResultExt;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
-use crate::error::{CudaSnafu, Result};
+use crate::error::*;
 
 /// Opaque handle to device memory.
 ///

@@ -110,8 +110,8 @@ fn test_and_uint32() {
     let b = UOp::const_(DType::UInt32, ConstValue::UInt(7));
 
     let result = a.try_and_op(&b).unwrap();
-    // UInt32 promotes to Int64 in type promotion
-    assert_eq!(result.dtype(), DType::Int64);
+    // Same-type operands: result is same type
+    assert_eq!(result.dtype(), DType::UInt32);
 }
 
 #[test]
@@ -248,8 +248,8 @@ fn test_or_with_max() {
     let max = UOp::const_(DType::UInt8, ConstValue::UInt(0xFF));
 
     let result = val.try_or_op(&max).unwrap();
-    // UInt8 promotes to Int16 in type promotion
-    assert_eq!(result.dtype(), DType::Int16);
+    // Same-type operands: result is same type
+    assert_eq!(result.dtype(), DType::UInt8);
 }
 
 #[test]

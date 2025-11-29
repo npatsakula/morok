@@ -2,16 +2,16 @@
 
 use crate::optimizer::{Renderer, Scheduler, opts::tc::*};
 use morok_dtype::DType;
-use morok_ir::{AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp};
+use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp};
 
 // ===== Matching Tests =====
 
 #[test]
 fn test_detect_matmul_basic() {
     // Create a simple matmul: C[i,j] = sum_k A[i,k] * B[k,j]
-    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Global);
-    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 1, AxisType::Global);
-    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 2, AxisType::Reduce);
+    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Global);
+    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(1), AxisType::Global);
+    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(2), AxisType::Reduce);
 
     // Create A[i,k] and B[k,j] (simplified - just use constants)
     let a_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
@@ -53,7 +53,7 @@ fn test_detect_matmul_no_reduce() {
 #[test]
 fn test_detect_matmul_not_mul() {
     // REDUCE but not of MUL
-    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Reduce);
+    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Reduce);
     let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let reduce = UOp::reduce(val, vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
@@ -71,9 +71,9 @@ fn test_detect_matmul_not_mul() {
 #[test]
 fn test_select_tensor_core_auto() {
     // Create a simple pattern
-    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Global);
-    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 1, AxisType::Global);
-    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 2, AxisType::Reduce);
+    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Global);
+    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(1), AxisType::Global);
+    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(2), AxisType::Reduce);
 
     let a_val = UOp::const_(DType::Float16, ConstValue::Float(1.0));
     let b_val = UOp::const_(DType::Float16, ConstValue::Float(2.0));
@@ -100,9 +100,9 @@ fn test_select_tensor_core_auto() {
 
 #[test]
 fn test_select_tensor_core_specific() {
-    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Global);
-    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 1, AxisType::Global);
-    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 2, AxisType::Reduce);
+    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Global);
+    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(1), AxisType::Global);
+    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(2), AxisType::Reduce);
 
     let a_val = UOp::const_(DType::Float16, ConstValue::Float(1.0));
     let b_val = UOp::const_(DType::Float16, ConstValue::Float(2.0));
@@ -128,9 +128,9 @@ fn test_select_tensor_core_specific() {
 
 #[test]
 fn test_select_tensor_core_out_of_bounds() {
-    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Global);
-    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 1, AxisType::Global);
-    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 2, AxisType::Reduce);
+    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Global);
+    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(1), AxisType::Global);
+    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(2), AxisType::Reduce);
 
     let a_val = UOp::const_(DType::Float16, ConstValue::Float(1.0));
     let b_val = UOp::const_(DType::Float16, ConstValue::Float(2.0));
@@ -214,9 +214,9 @@ fn test_reduce_axes_count() {
 #[test]
 fn test_apply_tc_basic() {
     // Create a simple matmul pattern
-    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Global);
-    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 1, AxisType::Global);
-    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 2, AxisType::Reduce);
+    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Global);
+    let j = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(1), AxisType::Global);
+    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(2), AxisType::Reduce);
 
     let a_val = UOp::const_(DType::Float16, ConstValue::Float(1.0));
     let b_val = UOp::const_(DType::Float16, ConstValue::Float(2.0));
@@ -248,8 +248,8 @@ fn test_apply_tc_validation() {
 
 #[test]
 fn test_apply_tc_invalid_use_tc() {
-    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Global);
-    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 1, AxisType::Reduce);
+    let i = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Global);
+    let k = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(1), AxisType::Reduce);
 
     let val = UOp::const_(DType::Float16, ConstValue::Float(1.0));
     let mul = UOp::new(Op::Binary(BinaryOp::Mul, val.clone(), val.clone()), DType::Float16);

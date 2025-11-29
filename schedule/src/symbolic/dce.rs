@@ -24,8 +24,8 @@ pub fn is_empty_range(uop: &Rc<UOp>) -> bool {
 /// - Mul: 1 (x * 1 = x)
 /// - Max: minimum value for dtype (max(x, MIN) = x)
 pub fn reduce_identity(op: morok_ir::types::ReduceOp, dtype: morok_dtype::DType) -> Rc<UOp> {
-    use morok_ir::types::ConstValue::*;
     use morok_dtype::DType;
+    use morok_ir::types::ConstValue::*;
     use morok_ir::types::ReduceOp;
 
     match op {

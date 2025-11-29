@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
 
 use crate::rangeify::{
@@ -49,20 +49,33 @@ fn test_unbind_kernel() {
 fn test_renumber_range() {
     let mut ctx = KernelContext::new();
 
-    // Create a RANGE with axis_id=5
+    // Create a RANGE with unrenumbered axis_id
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(end, 5, AxisType::Loop);
+    let range = UOp::range_axis(end, AxisId::Unrenumbered(5), AxisType::Loop);
 
     // Apply renumber_range pattern
     let result = renumber_range(&range, &mut ctx);
 
-    // Should return a RANGE with axis_id=0
+    // Should return a RANGE with axis_id=Renumbered(0) (renumbered)
     let op = result.expect("Expected Some result");
     if let Op::Range { axis_id, .. } = op.op() {
-        assert_eq!(*axis_id, 0);
+        assert_eq!(*axis_id, AxisId::Renumbered(0));
     } else {
         panic!("Expected RANGE operation");
     }
+}
+
+#[test]
+fn test_renumber_range_already_numbered() {
+    let mut ctx = KernelContext::new();
+
+    // Create a RANGE with already-renumbered axis_id
+    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range = UOp::range_axis(end, AxisId::Renumbered(5), AxisType::Loop);
+
+    // Apply renumber_range pattern - should return None (already numbered)
+    let result = renumber_range(&range, &mut ctx);
+    assert!(result.is_none(), "Already-numbered range should not be renumbered");
 }
 
 #[test]
@@ -71,7 +84,7 @@ fn test_remove_zero_range() {
 
     // Create a RANGE with end=0
     let end = UOp::const_(DType::Index, ConstValue::Int(0));
-    let range = UOp::range_axis(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     // Apply remove_zero_range pattern
     let result = remove_zero_range(&range, &mut ctx);
@@ -208,55 +221,20 @@ fn test_handle_after_mselect_unwrap() {
 }
 
 #[test]
-fn test_renumber_range_sequential() {
-    let mut ctx = KernelContext::new();
-
-    // Create three ranges with different axis IDs
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range1 = UOp::range_axis(end.clone(), 5, AxisType::Loop);
-    let range2 = UOp::range_axis(end.clone(), 10, AxisType::Reduce);
-    let range3 = UOp::range_axis(end.clone(), 3, AxisType::Outer);
-
-    // Renumber all three
-    let result1 = renumber_range(&range1, &mut ctx);
-    let result2 = renumber_range(&range2, &mut ctx);
-    let result3 = renumber_range(&range3, &mut ctx);
-
-    // Should get sequential IDs 0, 1, 2
-    if let Some(r) = result1
-        && let Op::Range { axis_id, .. } = r.op()
-    {
-        assert_eq!(*axis_id, 0);
-    }
-
-    if let Some(r) = result2
-        && let Op::Range { axis_id, .. } = r.op()
-    {
-        assert_eq!(*axis_id, 1);
-    }
-
-    if let Some(r) = result3
-        && let Op::Range { axis_id, .. } = r.op()
-    {
-        assert_eq!(*axis_id, 2);
-    }
-}
-
-#[test]
 fn test_renumber_range_different_axis_types() {
     let mut ctx = KernelContext::new();
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
 
-    // Test all three axis types
-    for axis_type in [AxisType::Loop, AxisType::Reduce, AxisType::Outer] {
-        let range = UOp::range_axis(end.clone(), 99, axis_type);
+    // Test all three axis types with unrenumbered axis_ids
+    for (i, axis_type) in [AxisType::Loop, AxisType::Reduce, AxisType::Outer].iter().enumerate() {
+        let range = UOp::range_axis(end.clone(), AxisId::Unrenumbered(i), *axis_type);
 
         let result = renumber_range(&range, &mut ctx);
 
         if let Some(r) = result {
             if let Op::Range { axis_type: new_type, .. } = r.op() {
                 // Axis type should be preserved
-                assert_eq!(*new_type, axis_type);
+                assert_eq!(*new_type, *axis_type);
             }
         } else {
             panic!("Expected Some result for {:?}", axis_type);
@@ -270,16 +248,16 @@ fn test_renumber_range_no_change_if_same() {
 
     // First range will get ID 0
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range1 = UOp::range_axis(end.clone(), 5, AxisType::Loop);
+    let range1 = UOp::range_axis(end.clone(), AxisId::Renumbered(5), AxisType::Loop);
 
     renumber_range(&range1, &mut ctx);
 
-    // Now create a range that already has axis_id=1 (which would be the next ID)
-    let range2 = UOp::range_axis(end.clone(), 1, AxisType::Loop);
+    // Now create a range that already has axis_id=Renumbered(1)
+    let range2 = UOp::range_axis(end.clone(), AxisId::Renumbered(1), AxisType::Loop);
 
     let result = renumber_range(&range2, &mut ctx);
 
-    // Should return None since the ID matches what we would assign
+    // Should return None since it's already renumbered
     assert!(result.is_none());
 }
 
@@ -304,7 +282,7 @@ fn test_remove_zero_range_uint() {
 
     // Create a RANGE with end=0 (UInt)
     let end = UOp::const_(DType::Index, ConstValue::UInt(0));
-    let range = UOp::range_axis(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     let result = remove_zero_range(&range, &mut ctx);
 
@@ -319,7 +297,7 @@ fn test_remove_zero_range_non_zero() {
 
     // Create a RANGE with non-zero end
     let end = UOp::const_(DType::Index, ConstValue::Int(10));
-    let range = UOp::range_axis(end, 0, AxisType::Loop);
+    let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     let result = remove_zero_range(&range, &mut ctx);
 
@@ -373,58 +351,55 @@ fn test_cleanup_const_with_spurious_sources() {
 }
 
 #[test]
-fn test_renumber_range_with_gaps() {
+fn test_renumber_range_sequential() {
     let mut ctx = KernelContext::new();
 
-    // Create ranges with non-sequential IDs (0, 5, 10)
-    let range0 = UOp::range_const(10, 0);
-    let range5 = UOp::range_const(20, 5);
-    let range10 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(30)), 10, AxisType::Reduce);
+    // Create ranges with unrenumbered axis_ids
+    let range0 =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Unrenumbered(0), AxisType::Loop);
+    let range1 =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(20)), AxisId::Unrenumbered(1), AxisType::Loop);
+    let range2 =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(30)), AxisId::Unrenumbered(2), AxisType::Reduce);
 
-    // Process them in sequence
+    // Process them in sequence - should get sequential IDs Renumbered(0), Renumbered(1), Renumbered(2)
 
     let result0 = renumber_range(&range0, &mut ctx);
-
-    // First range should keep ID 0
     match result0 {
-        None => {
-            // Correct - ID 0 is what we'd assign anyway
-        }
-        _ => panic!("Expected NoMatch for first range"),
-    }
-
-    // Second range (ID 5) should be renumbered to 1
-
-    let result5 = renumber_range(&range5, &mut ctx);
-
-    match result5 {
         Some(new_range) => {
-            // Should be renumbered to ID 1
             if let Op::Range { axis_id, .. } = new_range.op() {
-                assert_eq!(*axis_id, 1);
+                assert_eq!(*axis_id, AxisId::Renumbered(0));
             } else {
                 panic!("Expected RANGE operation");
             }
         }
-        _ => panic!("Expected Rewritten result for range with ID 5"),
+        None => panic!("Expected renumbered range"),
     }
 
-    // Third range (ID 10) should be renumbered to 2
-
-    let result10 = renumber_range(&range10, &mut ctx);
-
-    match result10 {
+    let result1 = renumber_range(&range1, &mut ctx);
+    match result1 {
         Some(new_range) => {
-            // Should be renumbered to ID 2
+            if let Op::Range { axis_id, .. } = new_range.op() {
+                assert_eq!(*axis_id, AxisId::Renumbered(1));
+            } else {
+                panic!("Expected RANGE operation");
+            }
+        }
+        None => panic!("Expected renumbered range"),
+    }
+
+    let result2 = renumber_range(&range2, &mut ctx);
+    match result2 {
+        Some(new_range) => {
             if let Op::Range { axis_id, axis_type, .. } = new_range.op() {
-                assert_eq!(*axis_id, 2);
+                assert_eq!(*axis_id, AxisId::Renumbered(2));
                 // Should preserve axis type
                 assert_eq!(*axis_type, AxisType::Reduce);
             } else {
                 panic!("Expected RANGE operation");
             }
         }
-        _ => panic!("Expected Rewritten result for range with ID 10"),
+        None => panic!("Expected renumbered range"),
     }
 
     // Context should have assigned 3 sequential IDs
@@ -437,7 +412,7 @@ fn test_remove_zero_range_verification() {
 
     // Create RANGE with end=0
     let end = UOp::const_(DType::Index, ConstValue::Int(0));
-    let range = UOp::range(end.clone(), 0);
+    let range = UOp::range_axis(end.clone(), AxisId::Renumbered(0), AxisType::Loop);
 
     let result = remove_zero_range(&range, &mut ctx);
 
@@ -467,24 +442,25 @@ fn test_pattern_composition_sequence() {
     let mut ctx = KernelContext::new();
 
     // Test that patterns can be applied in sequence
-    // 1. Create a RANGE with non-sequential ID
+    // 1. Create a RANGE with unrenumbered ID
     // 2. Apply renumber_range
     // 3. Verify the result
 
-    let range_gap = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(15)), 7, AxisType::Loop);
+    let range_unnum =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(15)), AxisId::Unrenumbered(7), AxisType::Loop);
 
     // Apply renumber_range pattern
-    let result1 = renumber_range(&range_gap, &mut ctx);
+    let result1 = renumber_range(&range_unnum, &mut ctx);
 
     match result1 {
         Some(renumbered) => {
             // Should be renumbered to ID 0 (first in sequence)
             if let Op::Range { axis_id, end, axis_type } = renumbered.op() {
-                assert_eq!(*axis_id, 0);
+                assert_eq!(*axis_id, AxisId::Renumbered(0));
                 assert_eq!(*axis_type, AxisType::Loop);
 
                 // End should be preserved
-                if let Op::Range { end: original_end, .. } = range_gap.op() {
+                if let Op::Range { end: original_end, .. } = range_unnum.op() {
                     assert!(std::rc::Rc::ptr_eq(end, original_end));
                 }
 
@@ -499,7 +475,7 @@ fn test_pattern_composition_sequence() {
                 panic!("Expected RANGE operation");
             }
         }
-        _ => panic!("Expected Rewritten result"),
+        None => panic!("Expected Rewritten result"),
     }
 }
 

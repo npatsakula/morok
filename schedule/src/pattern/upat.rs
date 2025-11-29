@@ -25,7 +25,7 @@ use std::mem::discriminant;
 use std::rc::Rc;
 
 use morok_dtype::DType;
-use morok_ir::{AxisType, BinaryOp, ConstValue, ConstValueHash, Op, TernaryOp, UOp, UnaryOp};
+use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, ConstValueHash, Op, TernaryOp, UOp, UnaryOp};
 use smallvec::SmallVec;
 
 // ===== Optimized Binding Storage =====
@@ -79,9 +79,7 @@ impl VarIntern {
     pub fn to_hashmap(&self, store: &BindingStore) -> HashMap<String, Rc<UOp>> {
         store
             .iter()
-            .filter_map(|(idx, uop)| {
-                self.names.get(*idx as usize).map(|name| (name.clone(), uop.clone()))
-            })
+            .filter_map(|(idx, uop)| self.names.get(*idx as usize).map(|name| (name.clone(), uop.clone())))
             .collect()
     }
 
@@ -1060,7 +1058,7 @@ impl UPat {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Range {
                 end: UOp::noop(),
-                axis_id: 0,
+                axis_id: AxisId::Renumbered(0),
                 axis_type: AxisType::Loop,
             }))]),
             dtype: None,
@@ -1252,10 +1250,7 @@ impl UPat {
     /// Chain as COPY source.
     pub fn f_copy(self) -> Self {
         UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Copy {
-                src: UOp::noop(),
-                device: UOp::noop(),
-            }))]),
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Copy { src: UOp::noop(), device: UOp::noop() }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![self])),
             arg: None,
@@ -1512,7 +1507,7 @@ impl UPat {
                     None => true, // No source pattern = single solution
                     Some(SrcPattern::Tuple(pats)) => pats.iter().all(|p| p.is_single_solution()),
                     Some(SrcPattern::Repeat(pat)) => pat.is_single_solution(),
-                    Some(SrcPattern::Fork(_)) => false,   // Fork branches
+                    Some(SrcPattern::Fork(_)) => false,    // Fork branches
                     Some(SrcPattern::Permute(_)) => false, // Permute branches
                 }
             }
@@ -1530,20 +1525,11 @@ impl UPat {
     /// Returns `Some(bindings)` if matched, `None` otherwise.
     pub fn match_first(&self, uop: &Rc<UOp>, intern: &VarIntern) -> Option<BindingStore> {
         let mut store = BindingStore::new();
-        if self.match_first_internal(uop, &mut store, intern) {
-            Some(store)
-        } else {
-            None
-        }
+        if self.match_first_internal(uop, &mut store, intern) { Some(store) } else { None }
     }
 
     /// Internal single-solution matching. Returns true if matched.
-    fn match_first_internal(
-        &self,
-        uop: &Rc<UOp>,
-        store: &mut BindingStore,
-        intern: &VarIntern,
-    ) -> bool {
+    fn match_first_internal(&self, uop: &Rc<UOp>, store: &mut BindingStore, intern: &VarIntern) -> bool {
         match self {
             UPat::Any(patterns) => {
                 // Try each pattern, return first match
@@ -1751,12 +1737,7 @@ impl UPat {
         self.match_internal_fast(uop, &mut store, intern)
     }
 
-    fn match_internal_fast(
-        &self,
-        uop: &Rc<UOp>,
-        store: &mut BindingStore,
-        intern: &VarIntern,
-    ) -> Vec<BindingStore> {
+    fn match_internal_fast(&self, uop: &Rc<UOp>, store: &mut BindingStore, intern: &VarIntern) -> Vec<BindingStore> {
         match self {
             UPat::Any(patterns) => {
                 let mut results = Vec::new();
@@ -1866,12 +1847,7 @@ impl UPat {
 
         let mut results = Vec::new();
         for mut binding in first_pattern.match_internal_fast(first_child, store, intern) {
-            results.extend(Self::match_sources_tuple_fast(
-                &children[1..],
-                &patterns[1..],
-                &mut binding,
-                intern,
-            ));
+            results.extend(Self::match_sources_tuple_fast(&children[1..], &patterns[1..], &mut binding, intern));
         }
         results
     }
@@ -1889,12 +1865,7 @@ impl UPat {
         let first_child = children[0];
         let mut results = Vec::new();
         for mut binding in pattern.match_internal_fast(first_child, store, intern) {
-            results.extend(Self::match_sources_repeat_fast(
-                &children[1..],
-                pattern,
-                &mut binding,
-                intern,
-            ));
+            results.extend(Self::match_sources_repeat_fast(&children[1..], pattern, &mut binding, intern));
         }
         results
     }
@@ -1984,12 +1955,7 @@ impl UPat {
 
         let mut results = Vec::new();
         for mut binding in first_pattern.match_internal_fast(first_child, store, intern) {
-            results.extend(Self::match_sources_tuple_ref_fast(
-                &children[1..],
-                &patterns[1..],
-                &mut binding,
-                intern,
-            ));
+            results.extend(Self::match_sources_tuple_ref_fast(&children[1..], &patterns[1..], &mut binding, intern));
         }
         results
     }

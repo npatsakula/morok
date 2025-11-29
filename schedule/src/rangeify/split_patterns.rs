@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use morok_dtype::AddrSpace;
-use morok_ir::{ConstValue, DType, Op, UOp};
+use morok_ir::{AxisId, ConstValue, DType, Op, UOp};
 
 use super::kernel_context::KernelContext;
 use crate::pattern::matcher::PatternMatcher;
@@ -84,6 +84,10 @@ pub fn unbind_kernel(bind: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>>
 }
 
 /// Renumber RANGE axis_id starting from 0 for kernel deduplication.
+///
+/// Uses enum-based guard that is naturally idempotent:
+/// - Only matches ranges with `AxisId::Unrenumbered`
+/// - Produces ranges with `AxisId::Renumbered`, so won't match again
 pub fn renumber_range(range: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // Verify this is a RANGE operation
     let (end, old_axis_id, axis_type) = match range.op() {
@@ -91,13 +95,14 @@ pub fn renumber_range(range: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp
         _ => return None,
     };
 
-    // Get the new axis ID (automatically increments)
-    let new_axis_id = ctx.next_range();
-
-    // Only rewrite if the ID changed
-    if new_axis_id == old_axis_id {
-        return None;
+    // Guard: only renumber unrenumbered ranges (type-safe idempotence)
+    match old_axis_id {
+        AxisId::Unrenumbered(_) => {}
+        AxisId::Renumbered(_) => return None,
     }
+
+    // Assign sequential id starting from 0
+    let new_axis_id = AxisId::Renumbered(ctx.next_range());
 
     // Create new RANGE with renumbered axis_id
     let new_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);

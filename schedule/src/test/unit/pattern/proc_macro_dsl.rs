@@ -6,8 +6,8 @@ use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, Op, UOp};
 
 use crate::pattern::UPat;
-use crate::pattern::{BindingStore, BindingStoreExt, VarIntern};
 use crate::pattern::matcher::RewriteResult;
+use crate::pattern::{BindingStore, BindingStoreExt, VarIntern};
 use crate::patterns;
 
 /// Helper to create a binary operation UOp
@@ -271,10 +271,7 @@ fn test_auto_ptr_eq_three_args() {
     let b = UOp::const_(DType::Int32, ConstValue::Int(99));
 
     // Test Where(a, a, a) - should match
-    let where_same = UOp::new(
-        Op::Ternary(morok_ir::TernaryOp::Where, a.clone(), a.clone(), a.clone()),
-        DType::Int32,
-    );
+    let where_same = UOp::new(Op::Ternary(morok_ir::TernaryOp::Where, a.clone(), a.clone(), a.clone()), DType::Int32);
 
     match matcher.rewrite(&where_same, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a), "Where(x, x, x) should rewrite to x"),
@@ -282,10 +279,7 @@ fn test_auto_ptr_eq_three_args() {
     }
 
     // Test Where(a, a, b) - should NOT match
-    let where_diff = UOp::new(
-        Op::Ternary(morok_ir::TernaryOp::Where, a.clone(), a.clone(), b.clone()),
-        DType::Int32,
-    );
+    let where_diff = UOp::new(Op::Ternary(morok_ir::TernaryOp::Where, a.clone(), a.clone(), b.clone()), DType::Int32);
 
     match matcher.rewrite(&where_diff, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
@@ -1283,8 +1277,8 @@ fn test_index_variable_indices() {
 
 #[test]
 fn test_prefix_matching_minimum_children() {
-    use morok_ir::types::{AddrSpace, BufferizeOpts};
     use crate::pattern::upat::{OpFilter, SrcPattern};
+    use morok_ir::types::{AddrSpace, BufferizeOpts};
     use std::mem::discriminant;
 
     // Test that prefix matching enforces minimum children requirement
@@ -1502,14 +1496,8 @@ fn test_upat_any_direct_api() {
 
     // Build: UPat::any([Add(x, zero), Add(x, one)])
     let pattern = UPat::any(vec![
-        UPat::binary(
-            vec![BinaryOp::Add],
-            vec![UPat::var("x"), UPat::zero_const("__zero")],
-        ),
-        UPat::binary(
-            vec![BinaryOp::Add],
-            vec![UPat::var("x"), UPat::one_const("__one")],
-        ),
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::zero_const("__zero")]),
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::one_const("__one")]),
     ]);
 
     let x = UOp::const_(DType::Int32, ConstValue::Int(42));

@@ -99,21 +99,38 @@ let optimizer = patterns! {
 };
 ```
 
-## Build
+## Development
+
+### Environment setup
+
+#### Nix
+
+This project contains a pre-defined Nix development environment
+with all dependencies and compilers included. The same infrastructure
+is used for CI/CD, so it's the preferred way to develop and test.
 
 ```bash
-cargo build --release
-cargo build --release --features cuda  # with CUDA support
+nix develop # Open development shell
+nix flake check # Run CI tests
 ```
+
+#### Bare metal
+
+| Dependency | Version | Description |
+|------------|---------|-------------|
+| Rust toolchain | 1.75+ | Required for building and testing |
+| LLVM | >21.x | CPU code generation backend |
+| NVCC | >13.x | CUDA code generation backend (optional) |
+| MESA NAK | >=25.x | CUDA code generation backend (optional) |
+| Z3 | >=4.15 | SMT solver for optimization verification (optional) |
+| zlib | >=1.3 | Compression library |
+| libffi | >=3.4 | Foreign function interface library |
+| libxml | >=2.13 | XML parsing library |
 
 ## Test
 
 ```bash
 cargo test
-cargo test --features z3     # with Z3 verification
-cargo test --features cuda   # with CUDA tests
+cargo test --features z3,proptest  # With Z3 verification and PB generated tests
+cargo test --features cuda   # With CUDA tests
 ```
-
-## License
-
-MIT

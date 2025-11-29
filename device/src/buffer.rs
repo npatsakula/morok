@@ -4,13 +4,14 @@ use std::sync::{Arc, OnceLock};
 
 use morok_dtype::DType;
 use smallvec::{SmallVec, smallvec};
-use snafu::ResultExt;
 
 use crate::allocator::{Allocator, BufferOptions, RawBuffer};
 use crate::error::{InvalidViewSnafu, Result, SizeMismatchSnafu};
 
 #[cfg(feature = "cuda")]
 use crate::error::CudaSnafu;
+#[cfg(feature = "cuda")]
+use snafu::ResultExt;
 
 /// Shared buffer data that can be referenced by multiple views.
 #[derive(Debug)]

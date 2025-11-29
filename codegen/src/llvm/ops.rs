@@ -116,7 +116,7 @@ fn get_intrinsic<'ctx>(
         .ok_or_else(|| crate::Error::LlvmError { reason: format!("Intrinsic {} not found", name) })?;
 
     intrinsic
-        .get_declaration(module, &[ret_type.get_type().into()])
+        .get_declaration(module, &[ret_type.get_type()])
         .ok_or_else(|| crate::Error::LlvmError { reason: format!("Failed to get declaration for {}", name) })
 }
 
@@ -414,6 +414,7 @@ fn codegen_binary<'ctx>(
 }
 
 /// Generate code for ternary operations.
+#[allow(clippy::too_many_arguments)]
 fn codegen_ternary<'ctx>(
     op: TernaryOp,
     a: BasicValueEnum<'ctx>,

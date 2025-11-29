@@ -1,5 +1,5 @@
 use morok_dtype::DType;
-use morok_ir::{AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 
 use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store};
 
@@ -270,7 +270,7 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
     // Create a BUFFERIZE operation with OUTER range
     // (split_store only splits at kernel boundaries where all ranges are OUTER)
     let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), 0, AxisType::Outer);
+    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Outer);
 
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range]);
 

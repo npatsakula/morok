@@ -55,7 +55,7 @@ pub fn collect_range_ids(indexed: &Rc<UOp>) -> Vec<usize> {
     let mut range_ids: Vec<usize> = indexed
         .toposort()
         .into_iter()
-        .filter_map(|node| if let Op::Range { axis_id, .. } = node.op() { Some(*axis_id) } else { None })
+        .filter_map(|node| if let Op::Range { axis_id, .. } = node.op() { Some(axis_id.value()) } else { None })
         .collect();
 
     // Sort for stable comparison
@@ -97,7 +97,7 @@ fn detect_expanded_dimensions(source: &Rc<UOp>, input_shape: &[SInt]) -> Vec<boo
                 SInt::Const(n) if *n > 1 => {
                     // Create RANGE(0, n) with unique axis_id
                     let end = UOp::const_(DType::Index, ConstValue::Int(*n as i64));
-                    UOp::range_axis(end, axis_id, morok_ir::AxisType::Loop)
+                    UOp::range_axis(end, morok_ir::AxisId::Unrenumbered(axis_id), morok_ir::AxisType::Loop)
                 }
                 _ => {
                     // Size 0 or 1: use constant 0 (no iteration needed)

@@ -162,7 +162,7 @@ pub enum Op {
     },
     Range {
         end: Rc<UOp>,
-        axis_id: usize,
+        axis_id: AxisId,
         axis_type: AxisType,
     },
     End {

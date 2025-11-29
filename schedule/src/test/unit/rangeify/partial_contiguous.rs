@@ -11,7 +11,7 @@
 use std::rc::Rc;
 
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, SInt, UOp};
+use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, SInt, UOp};
 use test_case::test_case;
 
 use crate::rangeify::buffer_cost::PcontigConfig;
@@ -548,7 +548,7 @@ fn test_out_in_ratio_symbolic_sizes() {
     let buffer = UOp::define_global(2, DType::Float32);
 
     // Create ranges with symbolic size
-    let range = UOp::new(Op::Range { end: n, axis_id: 0, axis_type: AxisType::Loop }, DType::Index);
+    let range = UOp::new(Op::Range { end: n, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop }, DType::Index);
     let ranges = vec![range.clone()];
 
     // Create computation
@@ -1543,13 +1543,17 @@ fn test_symbolic_buffer_size_handling() {
 
     // Create symbolic range using DEFINE_VAR
     let batch_size = UOp::define_var("batch".to_string(), 1, 128);
-    let symbolic_range = UOp::range_axis(batch_size, 0, AxisType::Loop);
+    let symbolic_range = UOp::range_axis(batch_size, AxisId::Renumbered(0), AxisType::Loop);
 
     let buffer = create_test_buffer(40, DType::Float32, 1);
 
     // Create computation with symbolic output range
     let concrete_range = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(10)), axis_id: 1, axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::const_(DType::Index, ConstValue::Int(10)),
+            axis_id: AxisId::Renumbered(1),
+            axis_type: AxisType::Loop,
+        },
         DType::Index,
     );
 
@@ -1578,8 +1582,8 @@ fn test_all_symbolic_sizes() {
     // Create symbolic ranges
     let n = UOp::define_var("n".to_string(), 1, 1024);
     let m = UOp::define_var("m".to_string(), 1, 1024);
-    let range_n = UOp::range_axis(n, 0, AxisType::Loop);
-    let range_m = UOp::range_axis(m, 1, AxisType::Loop);
+    let range_n = UOp::range_axis(n, AxisId::Renumbered(0), AxisType::Loop);
+    let range_m = UOp::range_axis(m, AxisId::Renumbered(1), AxisType::Loop);
 
     // Create symbolic buffer (we can't, so use concrete buffer)
     let buffer = create_test_buffer(4096, DType::Float32, 1);
@@ -1608,13 +1612,17 @@ fn test_mixed_concrete_symbolic_sizes() {
 
     // Concrete range
     let concrete_range = UOp::new(
-        Op::Range { end: UOp::const_(DType::Index, ConstValue::Int(10)), axis_id: 0, axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::const_(DType::Index, ConstValue::Int(10)),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+        },
         DType::Index,
     );
 
     // Symbolic range
     let batch = UOp::define_var("batch".to_string(), 1, 64);
-    let symbolic_range = UOp::range_axis(batch, 1, AxisType::Loop);
+    let symbolic_range = UOp::range_axis(batch, AxisId::Renumbered(1), AxisType::Loop);
 
     let buffer = create_test_buffer(40, DType::Float32, 1);
     let indexed = UOp::index(buffer, vec![concrete_range.clone()]).expect("Failed to create INDEX");
