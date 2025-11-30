@@ -329,6 +329,15 @@ pub fn is_cheap_to_inline(op: &Op) -> bool {
     )
 }
 
+/// Check if a BUFFERIZE operation is for local memory (intermediate buffer).
+///
+/// Only LOCAL BUFFERIZE operations are candidates for removal by the
+/// "cheap to inline" optimization. GLOBAL BUFFERIZE operations represent
+/// user-requested output materialization and should never be removed.
+pub fn is_local_bufferize(uop: &Rc<UOp>) -> bool {
+    if let Op::Bufferize { opts, .. } = uop.op() { opts.addrspace == morok_ir::AddrSpace::Local } else { false }
+}
+
 /// Check if UOp has no RANGE dependencies.
 pub fn no_range(uop: &Rc<UOp>) -> bool {
     #[allow(clippy::mutable_key_type)]

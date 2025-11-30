@@ -182,11 +182,20 @@ struct RewriteEngine<'a, C> {
     /// Nodes pending processing (prevents duplicate pushes in DAGs).
     /// A node is in this set if it's currently on the stack or being processed.
     pending: HashSet<UOpKey>,
+
+    /// Whether to always process children (bottom-up traversal).
+    /// When true, all nodes have their children processed first.
+    /// When false (default), only patterns returning Gate trigger child processing.
+    bottom_up: bool,
 }
 
 impl<'a, C> RewriteEngine<'a, C> {
     fn new(matcher: &'a PatternMatcher<C>, ctx: &'a mut C) -> Self {
-        Self { matcher, ctx, results: ResultMap::new(), pending: HashSet::new() }
+        Self { matcher, ctx, results: ResultMap::new(), pending: HashSet::new(), bottom_up: false }
+    }
+
+    fn new_bottom_up(matcher: &'a PatternMatcher<C>, ctx: &'a mut C) -> Self {
+        Self { matcher, ctx, results: ResultMap::new(), pending: HashSet::new(), bottom_up: true }
     }
 
     /// Stage 0: Bottom-up fixed-point pattern matching.
@@ -225,9 +234,18 @@ impl<'a, C> RewriteEngine<'a, C> {
         // Schedule: Finalize (after children are done if needed)
         stack.push(StackEntry::finalize(original, node.clone()));
 
-        // Only push children for processing when Gate was returned
-        // This matches Tinygrad's behavior where patterns control when children are processed
-        if needs_children {
+        // Push children for processing when:
+        // 1. Gate was explicitly returned by a pattern, OR
+        // 2. Bottom-up traversal is enabled (always process children)
+        //
+        // The `bottom_up` flag is set on the engine, not on individual patterns.
+        // When false (default), only patterns returning Gate trigger child processing.
+        // When true, all nodes have their children processed first.
+        //
+        // Use bottom_up=true for patterns like to_define_global that need to transform
+        // deep nodes (e.g., BUFFER inside INDEX inside ADD inside STORE).
+        // Use bottom_up=false for patterns like buffer_removal that need parent context.
+        if needs_children || self.bottom_up {
             // Push children for processing in REVERSE order
             // Stack is LIFO, so reverse order means they're processed in original order
             let sources = node.op().sources();
@@ -405,5 +423,22 @@ impl<'a, C> RewriteEngine<'a, C> {
 /// ```
 pub fn graph_rewrite<C>(matcher: &PatternMatcher<C>, root: Rc<UOp>, ctx: &mut C) -> Rc<UOp> {
     let mut engine = RewriteEngine::new(matcher, ctx);
+    engine.rewrite(root)
+}
+
+/// Apply graph rewriting with bottom-up traversal.
+///
+/// Like `graph_rewrite`, but always processes children before parents.
+/// Use this for patterns that need to transform deep nodes in the graph.
+///
+/// # Example
+///
+/// ```ignore
+/// // Use bottom-up for patterns that need to transform deep nodes
+/// let matcher = to_define_global_patterns();
+/// let optimized = graph_rewrite_bottom_up(&matcher, root, &mut ctx);
+/// ```
+pub fn graph_rewrite_bottom_up<C>(matcher: &PatternMatcher<C>, root: Rc<UOp>, ctx: &mut C) -> Rc<UOp> {
+    let mut engine = RewriteEngine::new_bottom_up(matcher, ctx);
     engine.rewrite(root)
 }

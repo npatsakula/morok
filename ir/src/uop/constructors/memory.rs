@@ -125,8 +125,14 @@ impl UOp {
     /// Create a LOAD operation.
     ///
     /// Loads a value from a buffer at the given index.
+    /// The result dtype is the element type (base of the Ptr dtype).
     pub fn load(buffer: Rc<Self>, index: Rc<Self>) -> Rc<Self> {
-        let dtype = buffer.dtype.clone();
+        // Get the element type from the buffer's Ptr dtype
+        let dtype = match &buffer.dtype {
+            DType::Ptr { base, .. } => (**base).clone(),
+            // Fallback: if buffer isn't a Ptr, use its dtype directly
+            other => other.clone(),
+        };
         Self::new(Op::Load { buffer, index }, dtype)
     }
 
@@ -134,8 +140,14 @@ impl UOp {
     ///
     /// Loads a value from a buffer at the given index, conditionally based on gate.
     /// If gate is false, the load may be skipped or return undefined.
+    /// The result dtype is the element type (base of the Ptr dtype).
     pub fn load_gated(buffer: Rc<Self>, index: Rc<Self>, gate: Rc<Self>) -> Rc<Self> {
-        let dtype = buffer.dtype.clone();
+        // Get the element type from the buffer's Ptr dtype
+        let dtype = match &buffer.dtype {
+            DType::Ptr { base, .. } => (**base).clone(),
+            // Fallback: if buffer isn't a Ptr, use its dtype directly
+            other => other.clone(),
+        };
         Self::new(Op::LoadGated { buffer, index, gate }, dtype)
     }
 

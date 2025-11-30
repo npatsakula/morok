@@ -16,7 +16,12 @@ pub fn render(uop: &Rc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
     })
 }
 
-/// Collect all BUFFER operations from a UOp graph.
+/// Collect all buffer parameters from a UOp graph.
+///
+/// After rangeify, BUFFER operations have been converted to DEFINE_GLOBAL/DEFINE_LOCAL.
+/// This function collects both patterns:
+/// - Op::Buffer (for non-rangeified graphs)
+/// - Op::DefineGlobal/DefineLocal (for rangeified kernels)
 ///
 /// Returns buffers in a consistent order (sorted by UOp ID) for deterministic
 /// function signatures.
@@ -25,8 +30,11 @@ fn collect_buffers(root: &Rc<UOp>) -> Vec<Rc<UOp>> {
     let nodes = root.toposort();
 
     for node in &nodes {
-        if matches!(node.op(), Op::Buffer { .. }) {
-            buffers.push(node.clone());
+        match node.op() {
+            Op::Buffer { .. } | Op::DefineGlobal(_) | Op::DefineLocal(_) => {
+                buffers.push(node.clone());
+            }
+            _ => {}
         }
     }
 

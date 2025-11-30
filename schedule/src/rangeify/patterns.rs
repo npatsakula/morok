@@ -67,6 +67,9 @@ pub fn early_rewrites() -> PatternMatcher {
 pub fn apply_rangeify_patterns() -> PatternMatcher<IndexingContext> {
     crate::patterns! {
         @context IndexingContext;
+        // Pattern 0: ReduceAxis → REDUCE conversion (BEFORE sources are transformed)
+        // This must come first to access the original ranges from Step 1
+        x => convert_reduceaxis_with_context(x, ctx),
         // Pattern 1: Generic BUFFERIZE insertion
         x => apply_bufferize_transform(x, ctx),
         // Pattern 2: Remove movement ops after transformation
@@ -74,11 +77,34 @@ pub fn apply_rangeify_patterns() -> PatternMatcher<IndexingContext> {
     }
 }
 
+/// Pattern matcher for ReduceAxis → REDUCE conversion (deprecated).
+///
+/// This pattern matcher is no longer used as the conversion is now integrated
+/// into `apply_rangeify_patterns()` to ensure ranges are extracted before
+/// sources are transformed.
+#[allow(dead_code)]
+pub fn reduceaxis_to_reduce_patterns() -> PatternMatcher<IndexingContext> {
+    crate::patterns! {
+        @context IndexingContext;
+        // ReduceAxis → REDUCE: Extract ranges from range_map and create REDUCE
+        x => convert_reduceaxis_with_context(x, ctx),
+    }
+}
+
 /// Apply BUFFERIZE transformation to op sources.
+///
+/// Returns:
+/// - `Some(new_op)` if sources were transformed (triggers rewrite)
+/// - `None` if no transformation needed but children should be processed
 fn apply_bufferize_transform(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Option<Rc<UOp>> {
     // Try to transform sources
-    let new_sources = transform_sources_with_bufferize(x, ctx)?;
-    Some(x.with_sources(new_sources))
+    if let Some(new_sources) = transform_sources_with_bufferize(x, ctx) {
+        return Some(x.with_sources(new_sources));
+    }
+
+    // For ops with children that might need processing, the pattern matcher will
+    // handle traversal automatically via the finalization stage
+    None
 }
 
 /// Remove movement ops after transformation has been applied.
@@ -192,6 +218,51 @@ fn adjust_index_for_dead_axes(idx: &Rc<UOp>) -> Option<Rc<UOp>> {
     None
 }
 
+/// Convert ReduceAxis → REDUCE using IndexingContext.
+///
+/// Following Tinygrad's approach: extract ranges from the range_map that were
+/// created during the explicit rangeify phase, then create REDUCE with those ranges.
+fn convert_reduceaxis_with_context(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Option<Rc<UOp>> {
+    use morok_ir::AxisType;
+    use smallvec::SmallVec;
+
+    let Op::ReduceAxis { src, reduce_op, axes } = x.op() else {
+        return None;
+    };
+
+    // Following Tinygrad: Get input ranges from the ReduceAxis operation's input ranges
+    // These are the ranges that were created for this operation during indexing
+    let (input_ranges, _) = ctx.get_ranges(x)?;
+
+    // Extract only the ranges corresponding to reduction axes
+    let reduce_ranges: SmallVec<[Rc<UOp>; 4]> = input_ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(i, range)| {
+            if axes.contains(&i) {
+                // Verify this is a REDUCE-type range
+                if let Op::Range { axis_type: AxisType::Reduce, .. } = range.op() {
+                    Some(Rc::clone(range))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // If no reduction ranges (all axes filtered out), return the source directly
+    if reduce_ranges.is_empty() {
+        return Some(Rc::clone(src));
+    }
+
+    // Create the REDUCE operation with the extracted ranges
+    let reduced = UOp::reduce(Rc::clone(src), reduce_ranges, *reduce_op);
+
+    Some(reduced)
+}
+
 /// Pattern matcher for cost-based buffer removal.
 ///
 /// This removes BUFFERIZE operations that don't provide performance benefits
@@ -232,16 +303,37 @@ pub fn buffer_removal() -> PatternMatcher {
 pub fn buffer_removal_with_pcontig() -> PatternMatcher<PcontigConfig> {
     crate::patterns! {
         @context PcontigConfig;
-        // Cheap to inline: remove buffering for simple ops
-        Bufferize { compute, .. } if is_cheap_to_inline(compute.op()) ~> compute,
-        // Always-run ops: CONTIGUOUS, COPY, ASSIGN shouldn't be buffered
-        Bufferize { compute, .. } if is_always_run_op(compute.op()) ~> compute,
+        // INDEX(BUFFERIZE) with full heuristics including cheap inlining
+        // This MUST come BEFORE bare BUFFERIZE patterns to ensure heuristics are checked
+        idx if matches!(idx.op(), Op::Index { .. }) => apply_pcontig_removal(idx, ctx),
+        // Cheap to inline: remove bare BUFFERIZE for simple ops (level > 0)
+        buf if ctx.level > 0 && matches!(buf.op(), Op::Bufferize { .. }) => remove_cheap_bufferize(buf),
+        // Always-run ops: bare BUFFERIZE for CONTIGUOUS, COPY, ASSIGN shouldn't be buffered (level > 0)
+        buf if ctx.level > 0 && matches!(buf.op(), Op::Bufferize { .. }) => remove_always_run_bufferize(buf),
         // Nested BUFFERIZE: flatten redundant buffering
         Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
             => Some(UOp::bufferize(Rc::clone(inner), ranges.to_vec(), opts.clone())),
-        // Complex INDEX(BUFFERIZE) with partial contiguous
-        idx if matches!(idx.op(), Op::Index { .. }) => apply_pcontig_removal(idx, ctx),
     }
+}
+
+/// Remove BUFFERIZE if compute is cheap to inline.
+fn remove_cheap_bufferize(buf: &Rc<UOp>) -> Option<Rc<UOp>> {
+    if let Op::Bufferize { compute, .. } = buf.op()
+        && is_cheap_to_inline(compute.op())
+    {
+        return Some(compute.clone());
+    }
+    None
+}
+
+/// Remove BUFFERIZE if compute is an always-run op.
+fn remove_always_run_bufferize(buf: &Rc<UOp>) -> Option<Rc<UOp>> {
+    if let Op::Bufferize { compute, .. } = buf.op()
+        && is_always_run_op(compute.op())
+    {
+        return Some(compute.clone());
+    }
+    None
 }
 
 /// Apply partial contiguous buffer removal.
@@ -363,14 +455,9 @@ pub fn reduction_simplify_patterns() -> PatternMatcher<SplitReduceOpConfig> {
         // Uses symbolic substitution to detect and eliminate range dependencies
         // REDUCE(x, [range], op) → x if symbolic simplification proves x is range-independent
         x => super::reduce_simplify::reduce_collapse(x),
-        // split_reduceop - Split large reductions into two stages
-        // REDUCE_AXIS(src, [axis], op) where prod(shape)/prod(output) >= 32768
-        // → reshape → permute → reduce1 → contiguous → reduce2 → reshape
-        reduce if matches!(reduce.op(), Op::ReduceAxis { .. }) => apply_split_reduceop(reduce, ctx),
+        // split_reduceop - Split large reductions (if above threshold)
+        // NOTE: ReduceAxis → REDUCE conversion now happens in Step 3.5, before this step
+        reduce if matches!(reduce.op(), Op::ReduceAxis { .. }) => split_reduceop(reduce, ctx),
     }
 }
 
-/// Apply split_reduceop transformation.
-fn apply_split_reduceop(reduce: &Rc<UOp>, config: &mut SplitReduceOpConfig) -> Option<Rc<UOp>> {
-    split_reduceop(reduce, config)
-}

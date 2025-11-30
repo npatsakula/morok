@@ -23,7 +23,10 @@ use std::rc::Rc;
 /// results to buffers.
 #[derive(Clone)]
 pub struct ScheduleItem {
-    /// The kernel AST (Op::Kernel with SINK containing STORE ops)
+    /// The KERNEL wrapper UOp (for buffer allocation)
+    pub kernel: Rc<UOp>,
+
+    /// The inner kernel AST (SINK containing STORE ops) - for codegen
     pub ast: Rc<UOp>,
 
     /// Device buffers for this kernel (in order expected by codegen)
@@ -71,7 +74,7 @@ pub fn create_schedule(transformed: Rc<UOp>) -> Result<Schedule> {
     let mut schedule = Vec::new();
 
     for kernel_uop in kernels {
-        let (sources, _ast) = match kernel_uop.op() {
+        let (sources, inner_ast) = match kernel_uop.op() {
             Op::Kernel { sources, ast } => (sources, ast),
             _ => unreachable!("filtered to only kernels above"),
         };
@@ -88,7 +91,8 @@ pub fn create_schedule(transformed: Rc<UOp>) -> Result<Schedule> {
 
         let buffers = collect_kernel_buffers(sources, &kernel_uop)?;
 
-        schedule.push(ScheduleItem { ast: kernel_uop.clone(), buffers });
+        // Use inner_ast (the kernel's internal AST) for codegen, kernel_uop for buffer allocation
+        schedule.push(ScheduleItem { kernel: kernel_uop.clone(), ast: inner_ast.clone(), buffers });
     }
 
     Ok(schedule)
@@ -221,37 +225,20 @@ pub fn allocate_kernel_buffers(kernel: &Rc<UOp>) -> Result<Vec<Buffer>> {
     Ok(buffers)
 }
 
-/// Compute buffer size from kernel AST by finding STORE operations.
+/// Compute buffer size from the buffer definition's dtype.
 ///
-/// This walks the kernel AST to find STORE operations that write to the
-/// given buffer definition, then extracts the size from the buffer's shape.
-fn compute_buffer_size(ast: &Rc<UOp>, buffer_def: &Rc<UOp>) -> Result<usize> {
+/// Buffer size is embedded in the Ptr dtype by debuf() during rangeify.
+/// This follows Tinygrad's pattern where size is stored in `dtype.ptr(size=...)`.
+fn compute_buffer_size(_ast: &Rc<UOp>, buffer_def: &Rc<UOp>) -> Result<usize> {
     use crate::error::*;
-    use morok_ir::shape;
+    use morok_dtype::DType;
 
-    // Find STORE operations that write to this buffer
-    for node in ast.toposort() {
-        if let Op::Store { buffer, .. } = node.op()
-            && Rc::ptr_eq(buffer, buffer_def)
-        {
-            // Get shape from buffer
-            if let Ok(Some(shape_vec)) = buffer.shape() {
-                // Convert to static dimensions if possible
-                if let Some(static_shape) = shape::to_static(shape_vec) {
-                    // Compute product of all dimensions
-                    let numel: usize = static_shape.iter().product();
-                    return Ok(numel);
-                } else {
-                    return Err(Error::SymbolicShapeUnsupported { operation: "buffer size computation".to_string() });
-                }
-            }
-        }
+    // Extract size from Ptr dtype (set by debuf() in split_patterns.rs)
+    match buffer_def.dtype() {
+        DType::Ptr { size: Some(s), .. } => Ok(s),
+        DType::Ptr { size: None, .. } => Err(Error::Runtime { message: "Buffer Ptr dtype has no size".to_string() }),
+        other => Err(Error::Runtime { message: format!("Expected Ptr dtype with size, got {:?}", other) }),
     }
-
-    // Couldn't determine size - this might be OK for local memory
-    // which gets sized based on workgroup dimensions
-    // For now, default to 1 element
-    Err(Error::Runtime { message: "Could not determine buffer size from kernel AST".to_string() })
 }
 
 #[cfg(test)]
@@ -273,11 +260,11 @@ mod tests {
 
         let mut sources = SmallVec::new();
         sources.push(buffer);
-        let kernel = UOp::kernel(sources, sink);
+        let kernel = UOp::kernel(sources, sink.clone());
 
         // ScheduleItem should be creatable
-        let item = ScheduleItem { ast: kernel.clone(), buffers: vec![] };
+        let item = ScheduleItem { kernel: kernel.clone(), ast: sink, buffers: vec![] };
 
-        assert!(matches!(item.ast.op(), Op::Kernel { .. }));
+        assert!(matches!(item.kernel.op(), Op::Kernel { .. }));
     }
 }

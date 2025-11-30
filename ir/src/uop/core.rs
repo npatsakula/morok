@@ -960,7 +960,20 @@ impl UOp {
             }
         };
 
-        let new_uop = Self::new(new_op, self.dtype.clone());
+        // Compute correct dtype for operations whose dtype depends on source dtypes
+        let dtype = match &new_op {
+            // INDEX dtype = buffer dtype (first source)
+            Op::Index { buffer, .. } => buffer.dtype.clone(),
+            // LOAD dtype = element type of buffer (base of Ptr)
+            Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } => match &buffer.dtype {
+                DType::Ptr { base, .. } => (**base).clone(),
+                other => other.clone(),
+            },
+            // All other operations preserve their original dtype
+            _ => self.dtype.clone(),
+        };
+
+        let new_uop = Self::new(new_op, dtype);
 
         // Record transformation in provenance tracker
         use crate::provenance::{PROVENANCE_TRACKER, PassName};
@@ -1240,7 +1253,20 @@ impl UOp {
             Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
         };
 
-        Self::new(new_op, self.dtype.clone())
+        // Compute correct dtype for operations whose dtype depends on source dtypes
+        let dtype = match &new_op {
+            // INDEX dtype = buffer dtype (first source)
+            Op::Index { buffer, .. } => buffer.dtype.clone(),
+            // LOAD dtype = element type of buffer (base of Ptr)
+            Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } => match &buffer.dtype {
+                DType::Ptr { base, .. } => (**base).clone(),
+                other => other.clone(),
+            },
+            // All other operations preserve their original dtype
+            _ => self.dtype.clone(),
+        };
+
+        Self::new(new_op, dtype)
     }
 }
 

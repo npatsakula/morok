@@ -219,16 +219,8 @@ impl ConstValue {
     }
 }
 
-/// Memory address space for buffer allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AddrSpace {
-    /// Global/device memory.
-    Global,
-    /// Local/shared memory.
-    Local,
-    /// Register memory.
-    Reg,
-}
+// Re-export AddrSpace from dtype to avoid duplication
+pub use morok_dtype::AddrSpace;
 
 /// Options for BUFFERIZE operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

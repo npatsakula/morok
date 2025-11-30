@@ -98,12 +98,18 @@ pub fn run_rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, IndexingContext
     // Step 1: Generate realize map - determine which UOps need materialization
     generate_realize_map(&sink, &mut ctx)?;
 
-    // Step 2: Get reverse toposort and consumer map
+    // Step 2: Get toposort (root-to-leaves) and consumer map
+    // We need forward traversal so that BUFFERIZE is processed first,
+    // then its compute (ADD), then the inputs (RESHAPE, BUFFER).
+    // This allows ranges to propagate from BUFFERIZE → ADD → RESHAPE.
     let consumer_map = sink.get_consumer_map();
-    let reverse_topo = sink.reverse_toposort(&consumer_map);
 
-    // Step 3: Assign ranges via reverse traversal
-    assign_ranges(&reverse_topo, &consumer_map, &mut ctx)?;
+    // Use forward toposort (root first) for range propagation
+    // The sink.toposort() gives leaves-to-root, so we reverse it
+    let forward_topo: Vec<_> = sink.toposort().into_iter().rev().collect();
+
+    // Step 3: Assign ranges via forward traversal
+    assign_ranges(&forward_topo, &consumer_map, &mut ctx)?;
 
     // Step 4: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
     let early_matcher = super::patterns::early_rewrites();
@@ -276,6 +282,11 @@ fn assign_ranges(
             } else {
                 continue;
             }
+        } else if let Op::Bufferize { ranges, .. } = x.op() {
+            // BUFFERIZE has no shape but already contains ranges
+            // Use those ranges directly as output ranges
+            // This allows range propagation to the compute inside BUFFERIZE
+            ranges.to_vec()
         } else if consumer_rngs.is_empty() {
             // No consumers have ranges
             continue;

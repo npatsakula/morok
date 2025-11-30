@@ -97,6 +97,54 @@ fn test_no_transform_for_normal_source() {
 }
 
 #[test]
+fn test_transform_movement_chain_on_buffer() {
+    // Test that RESHAPE(BUFFER) gets INDEX wrapping
+    let buffer = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
+
+    // RESHAPE(BUFFER) to 3x4 shape
+    let reshape_shape = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
+    let reshape = UOp::new(Op::Reshape { src: buffer.clone(), new_shape: reshape_shape }, DType::Float32);
+
+    // Verify is_movement works
+    assert!(reshape.op().is_movement(), "RESHAPE should be identified as movement op");
+
+    // Create an ADD that uses the reshaped buffer
+    // Create another RESHAPE(BUFFER) with same shape for valid binary op
+    let buffer2 = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
+    let reshape_shape2 = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
+    let reshape2 = UOp::new(Op::Reshape { src: buffer2.clone(), new_shape: reshape_shape2 }, DType::Float32);
+    let add = reshape.try_add(&reshape2).unwrap();
+
+    // Set up context with ranges for add (simulating what indexing.rs does)
+    let range0 = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(0), AxisType::Loop);
+    let range1 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(1), AxisType::Loop);
+
+    let mut ctx = IndexingContext::new();
+    ctx.set_ranges(&add, vec![range0.clone(), range1.clone()], vec![range0.clone(), range1.clone()]);
+
+    // Transform sources
+    let new_sources = transform_sources_with_bufferize(&add, &ctx);
+
+    // RESHAPE(BUFFER) should be transformed to INDEX(RESHAPE(BUFFER), ranges)
+    assert!(new_sources.is_some(), "Transform should happen for movement chain on buffer");
+    let new_sources = new_sources.unwrap();
+    assert_eq!(new_sources.len(), 2);
+
+    // First source (RESHAPE(BUFFER)) should be wrapped in INDEX
+    println!("First source op: {:?}", new_sources[0].op());
+    assert!(
+        matches!(new_sources[0].op(), Op::Index { .. }),
+        "RESHAPE(BUFFER) should be wrapped in INDEX, got: {:?}",
+        new_sources[0].op()
+    );
+
+    // Verify the INDEX wraps the RESHAPE
+    if let Op::Index { buffer, .. } = new_sources[0].op() {
+        assert!(matches!(buffer.op(), Op::Reshape { .. }), "INDEX should wrap RESHAPE, got: {:?}", buffer.op());
+    }
+}
+
+#[test]
 fn test_rangeify_with_symbolic_simplification() {
     // This test verifies that symbolic simplification is integrated into rangeify.
     // We create a computation with a PERMUTE operation that will create index expressions,

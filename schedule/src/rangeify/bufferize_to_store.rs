@@ -12,10 +12,46 @@
 
 use std::rc::Rc;
 
-use morok_ir::{AddrSpace, Op, UOp};
+use morok_ir::{AddrSpace, ConstValue, Op, UOp};
 use smallvec::SmallVec;
 
 use super::kernel_context::KernelContext;
+
+/// Calculate buffer size from RANGE operations.
+///
+/// Size = product of all range bounds.
+/// For ranges with constant bounds, returns the product.
+///
+/// # Panics
+///
+/// Panics if any range has a symbolic (non-constant) bound.
+/// This matches Tinygrad's behavior: `assert isinstance(size, int), "no symbolic sized buffers"`
+fn calculate_size_from_ranges(ranges: &SmallVec<[Rc<UOp>; 4]>) -> usize {
+    if ranges.is_empty() {
+        return 1;
+    }
+
+    ranges
+        .iter()
+        .map(|r| {
+            if let Op::Range { end, .. } = r.op() {
+                // Extract constant bound from end (via vmax for symbolic simplification)
+                match end.vmax() {
+                    ConstValue::Int(v) if *v > 0 => *v as usize,
+                    ConstValue::UInt(v) if *v > 0 => *v as usize,
+                    other => panic!(
+                        "Cannot allocate buffer with symbolic size: range bound resolved to {:?}. \
+                         Buffers require concrete sizes (Tinygrad: 'no symbolic sized buffers')",
+                        other
+                    ),
+                }
+            } else {
+                // Non-RANGE operations contribute size 1 (scalar)
+                1
+            }
+        })
+        .product()
+}
 
 /// Convert BUFFERIZE operation to STORE with buffer allocation and END wrapping.
 ///
@@ -56,15 +92,22 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
         // Reuse existing buffer
         existing_buffer.clone()
     } else {
+        // Calculate buffer size from ranges (like Tinygrad's prod(shape))
+        let size = calculate_size_from_ranges(ranges);
+
+        // Create Ptr dtype with embedded size (like Tinygrad's dtype.ptr(size=...))
+        let base_dtype = compute.dtype();
+        let ptr_dtype = base_dtype.ptr(Some(size), opts.addrspace);
+
         // Create new buffer allocation based on address space
         let buffer = if opts.addrspace == AddrSpace::Global {
             // Global memory: DEFINE_GLOBAL
             let global_id = ctx.next_global();
-            UOp::define_global(global_id, compute.dtype())
+            UOp::define_global(global_id, ptr_dtype)
         } else {
             // Local/shared memory: DEFINE_LOCAL
             let local_id = ctx.next_local();
-            UOp::define_local(local_id, compute.dtype())
+            UOp::define_local(local_id, ptr_dtype)
         };
 
         // Track the buffer in context for later reference

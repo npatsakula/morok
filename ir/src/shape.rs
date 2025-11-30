@@ -339,13 +339,9 @@ pub fn shape_to_uop(shape: &Shape) -> Rc<UOp> {
     use morok_dtype::DType;
     use smallvec::SmallVec;
 
-    if shape.is_empty() {
-        // Empty shape - return a const 0 or empty vectorize?
-        // Following Tinygrad, empty shape might use VConst with empty vec
-        return UOp::vconst(vec![]);
-    }
-
-    // Convert each SInt to a UOp
+    // Use Vectorize for all shapes (including empty)
+    // Empty shape → Vectorize { elements: [] }
+    // This is consistent with non-empty path and compatible with extract_shape_from_uop
     let elements: SmallVec<[Rc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
 
     UOp::vectorize(elements)

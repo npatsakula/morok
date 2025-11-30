@@ -9,14 +9,19 @@ use super::kernel_context::KernelContext;
 use crate::pattern::matcher::PatternMatcher;
 
 /// Replace BUFFER with DEFINE_GLOBAL or DEFINE_LOCAL.
+///
+/// **Critical:** Embeds buffer size in the Ptr dtype following Tinygrad's pattern.
+/// This ensures `compute_buffer_size()` can extract size from the DefineGlobal dtype
+/// instead of searching through the AST.
 pub fn debuf(buf: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
-    // Extract buffer information
-    let (dtype, addrspace) = match buf.op() {
-        Op::Buffer { .. } => {
-            // Get dtype from the buffer
-            let dtype = buf.dtype();
-            // For now, assume global unless we add addrspace tracking
-            (dtype, AddrSpace::Global)
+    // Extract buffer information including size
+    let (ptr_dtype, addrspace) = match buf.op() {
+        Op::Buffer { size, .. } => {
+            // Get base dtype from the buffer
+            let base_dtype = buf.dtype();
+            // Embed size in Ptr dtype (like Tinygrad's dtype.ptr(size=...))
+            let ptr_dtype = base_dtype.ptr(Some(*size), AddrSpace::Global);
+            (ptr_dtype, AddrSpace::Global)
         }
         _ => return None,
     };
@@ -24,10 +29,10 @@ pub fn debuf(buf: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // Create DEFINE_GLOBAL or DEFINE_LOCAL based on address space
     let replacement = if addrspace == AddrSpace::Global {
         let global_id = ctx.next_global();
-        UOp::define_global(global_id, dtype)
+        UOp::define_global(global_id, ptr_dtype)
     } else {
         let local_id = ctx.next_local();
-        UOp::define_local(local_id, dtype)
+        UOp::define_local(local_id, ptr_dtype)
     };
 
     // Track the buffer in context (maps original buffer to itself for later reference)

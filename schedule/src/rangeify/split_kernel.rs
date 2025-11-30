@@ -19,7 +19,7 @@ use super::codegen_patterns::rangeify_codegen_patterns;
 use super::cycle_detection::find_bufs;
 use super::kernel_context::KernelContext;
 use super::split_patterns::to_define_global_patterns;
-use crate::rewrite::graph_rewrite;
+use crate::rewrite::graph_rewrite_bottom_up;
 
 /// Find first COPY or BUFFER_VIEW operation in the computation graph.
 ///
@@ -179,21 +179,38 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // - Preserve END structure (no pattern removes END)
     // - Result: END(STORE(DEFINE_GLOBAL, ...), RANGE(...))
     //
-    // Apply to_define_global patterns via graph_rewrite
+    // Apply to_define_global patterns via graph_rewrite (bottom-up)
+    // Bottom-up traversal ensures deep nodes (BUFFER inside INDEX inside ADD) are processed.
     let transformed = {
         let matcher = to_define_global_patterns();
-        graph_rewrite(&matcher, computation, ctx)
+        graph_rewrite_bottom_up(&matcher, computation, ctx)
     };
 
-    // **STEP 1.5: Apply codegen preparation patterns**
+    // **STEP 1.5a: Apply movement op patterns**
+    // This pushes movement ops through INDEX operations:
+    // INDEX(RESHAPE(buffer), ranges) → INDEX(buffer, transformed_ranges)
+    //
+    // This step is critical for input buffers with movement ops (RESHAPE(BUFFER), etc.)
+    // After this step, movement ops are eliminated and indices are properly transformed.
+    //
+    // Based on Tinygrad's pm_mops (schedule/rangeify.py:18-25).
+    // Bottom-up ensures movement ops deep in the graph are processed.
+    let transformed = {
+        let movement_matcher = super::movement_patterns::movement_op_patterns();
+        graph_rewrite_bottom_up(&movement_matcher, transformed, &mut ())
+    };
+
+    // **STEP 1.5b: Apply codegen preparation patterns**
     // Apply rangeify_codegen patterns (remove_noop, get_contiguous, fix_after_broadcast)
     // These prepare the IR for final code generation:
     // - NOOP → zero constant
     // - CONTIGUOUS markers removed
     // - AFTER wrapping EXPAND fixed
+    // - INDEX on DEFINE_GLOBAL gets LOAD wrapper
+    // Bottom-up ensures INDEX operations are processed after their children.
     let transformed = {
         let codegen_matcher = rangeify_codegen_patterns();
-        graph_rewrite(&codegen_matcher, transformed, &mut ())
+        graph_rewrite_bottom_up(&codegen_matcher, transformed, &mut ())
     };
 
     // **STEP 2: Validate no buffer access cycles**
@@ -224,20 +241,28 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
         UOp::sink(vec![transformed])
     };
 
-    // **STEP 4: Build kernel sources from context**
-    // Sources = all accessed buffers + all BIND variables
+    // **STEP 4: Build kernel sources from transformed AST**
+    // Sources = all DEFINE_GLOBAL/DEFINE_LOCAL nodes + all BIND variables
     //
-    // Note: buffer_map is populated by bufferize_to_store() when BUFFERIZE ops
-    // are converted to STORE ops. Each BUFFERIZE gets a DEFINE_GLOBAL/DEFINE_LOCAL
-    // tracked in the context.
+    // Walk the transformed AST to collect all buffer definitions.
+    // This is necessary because input buffers (LOADs) also become DEFINE_GLOBAL
+    // via the debuf pattern, and we need to include them in kernel sources.
     //
-    // vars will be populated when we implement BIND handling patterns.
+    // Based on Tinygrad's split_store (schedule/rangeify.py:510-512).
     let mut sources: SmallVec<[Rc<UOp>; 4]> = SmallVec::new();
 
-    // Add all buffers from context
-    sources.extend(ctx.buffer_map.values().cloned());
+    // Collect all DEFINE_GLOBAL and DEFINE_LOCAL from the transformed AST
+    // These are the kernel's buffer arguments (both inputs and outputs)
+    for node in ast.toposort() {
+        match node.op() {
+            Op::DefineGlobal(_) | Op::DefineLocal(_) => {
+                sources.push(node);
+            }
+            _ => {}
+        }
+    }
 
-    // Add all variables from context
+    // Add all variables from context (BIND tracking)
     for var_key in &ctx.vars {
         sources.push(var_key.0.clone());
     }

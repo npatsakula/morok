@@ -467,6 +467,7 @@ dependencies = [
  "morok-dtype",
  "morok-ir",
  "morok-schedule",
+ "smallvec",
  "snafu",
  "test-case",
 ]

@@ -186,6 +186,52 @@ pub fn fix_after_broadcast(after: &Rc<UOp>) -> Option<Rc<UOp>> {
     Some(new_after)
 }
 
+/// Convert value-returning INDEX to LOAD operation.
+///
+/// Pattern: INDEX(DEFINE_GLOBAL|DEFINE_LOCAL, indices) where dtype is NOT a pointer
+/// Result:  LOAD(buffer, INDEX(buffer, indices))
+///
+/// This creates explicit memory reads for input buffers. Output buffers already have
+/// STORE operations created by `bufferize_to_store.rs`, but input buffers stay as
+/// INDEX without a LOAD wrapper. This pattern adds the necessary LOAD operation.
+///
+/// # Arguments
+///
+/// * `idx` - The INDEX operation to potentially wrap with LOAD
+///
+/// # Returns
+///
+/// * `Some(load)` - A LOAD operation wrapping the INDEX
+/// * `None` - If the INDEX should not be converted (not on a buffer def, or already ptr type)
+///
+/// # Example
+///
+/// ```ignore
+/// // Before: INDEX(DEFINE_GLOBAL(0), [r0])
+/// // After:  LOAD(DEFINE_GLOBAL(0), INDEX(DEFINE_GLOBAL(0), [r0]))
+/// ```
+///
+/// Based on Tinygrad's rangeify_codegen (schedule/rangeify.py:452-464).
+pub fn add_load_to_index(_idx: &Rc<UOp>) -> Option<Rc<UOp>> {
+    // DISABLED: INDEX→LOAD wrapping is handled in codegen via `auto_load_pointer`.
+    //
+    // Pattern-based approach was disabled because patterns can't distinguish:
+    // - INDEX used for reading (should become LOAD)
+    // - INDEX used as STORE address (should NOT become LOAD)
+    //
+    // The problem manifests as:
+    // 1. STORE(buf, INDEX(...), value) - INDEX is the target address
+    // 2. Pattern wraps INDEX in LOAD: STORE(buf, LOAD(INDEX(...)), value)
+    // 3. This causes "buffer accessed with conflicting ops: Load, Store" cycle errors
+    //
+    // Tinygrad also has this pattern commented out (rangeify.py:452-454).
+    //
+    // Current solution: codegen/src/llvm/ops.rs `auto_load_pointer` function handles
+    // auto-loading when INDEX (Ptr) values are used as operands in arithmetic ops
+    // (Unary, Binary, Ternary, Cast). The STORE codegen uses INDEX directly as address.
+    None
+}
+
 /// Create patterns for codegen preparation.
 ///
 /// This function builds a PatternMatcher with patterns that prepare kernel IR
@@ -194,10 +240,7 @@ pub fn fix_after_broadcast(after: &Rc<UOp>) -> Option<Rc<UOp>> {
 /// 1. **remove_noop**: NOOP → zero constant
 /// 2. **get_contiguous**: Remove CONTIGUOUS markers
 /// 3. **fix_after_broadcast**: Fix AFTER wrapping EXPAND (broadcast)
-///
-/// Future patterns to add (from MISSING_RANGEIFY_PATTERNS.md):
-/// 4. **add_load_to_index (broadcast)**: Generate LOAD for broadcast INDEX (investigation needed)
-/// 5. **add_load_to_index (GEP)**: Generate LOAD for GEP INDEX (investigation needed)
+/// 4. **add_load_to_index**: Generate LOAD for INDEX on buffer definitions
 ///
 /// # Returns
 ///
@@ -214,18 +257,6 @@ pub fn fix_after_broadcast(after: &Rc<UOp>) -> Option<Rc<UOp>> {
 ///
 /// Based on Tinygrad's rangeify_codegen (schedule/rangeify.py:440-465).
 pub fn rangeify_codegen_patterns() -> PatternMatcher<()> {
-    // NOTE: add_load_to_index patterns from Tinygrad are NOT needed in Morok.
-    //
-    // Architectural difference:
-    // - Tinygrad: INDEX operation serves dual purpose (pointer-returning vs value-returning)
-    //   - Patterns convert value-returning INDEX → pointer INDEX + LOAD
-    // - Morok: INDEX and LOAD are separate operations from the start
-    //   - INDEX: High-level buffer indexing (used in bufferize_to_store)
-    //   - LOAD/STORE: Low-level memory operations (created during kernel splitting)
-    //
-    // Our bufferize_to_store.rs already creates STORE operations that take INDEX
-    // as an argument, so no conversion pattern is needed.
-
     // NOTE: flatten_range patterns are NOT integrated here.
     // flatten_range_impl() in flatten_range.rs requires a consumer map and substitution pass.
     // It's currently implemented as a direct transformation function, not a pattern.
@@ -235,5 +266,7 @@ pub fn rangeify_codegen_patterns() -> PatternMatcher<()> {
         noop if matches!(noop.op(), Op::Noop) => remove_noop(noop),
         cont if matches!(cont.op(), Op::Contiguous { .. }) => get_contiguous(cont),
         after if matches!(after.op(), Op::After { .. }) => fix_after_broadcast(after),
+        // Add LOAD to INDEX operations on buffer definitions (input buffers)
+        idx if matches!(idx.op(), Op::Index { .. }) => add_load_to_index(idx),
     }
 }

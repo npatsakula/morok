@@ -46,6 +46,26 @@ pub fn transform_sources_with_bufferize(x: &Rc<UOp>, ctx: &IndexingContext) -> O
     if any_changed { Some(new_sources) } else { None }
 }
 
+/// Check if a UOp is a chain of movement ops ending in a buffer-like op.
+///
+/// This detects patterns like `RESHAPE(BUFFER)`, `PERMUTE(EXPAND(BUFFER))`, etc.
+/// These need INDEX wrapping so that `movement_op_patterns` can later transform
+/// the indices appropriately.
+fn is_movement_chain_on_buffer(uop: &Rc<UOp>) -> bool {
+    let mut current = uop.clone();
+    while current.op().is_movement() {
+        if let Some(src) = current.op().sources().first() {
+            current = src.clone();
+        } else {
+            return false;
+        }
+    }
+    matches!(
+        current.op(),
+        Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
+    )
+}
+
 /// Transform a single source by adding BUFFERIZE + INDEX if needed.
 pub(crate) fn transform_single_source(
     _consumer: &Rc<UOp>,
@@ -60,6 +80,14 @@ pub(crate) fn transform_single_source(
     ) {
         // Add INDEX with input ranges from consumer
         return UOp::index(Rc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for buffer source");
+    }
+
+    // Case 1.5: Movement op chain on buffer-like source → add INDEX
+    // This enables movement_op_patterns to later transform the indices.
+    // Example: RESHAPE(BUFFER).INDEX([ranges]) will become BUFFER.INDEX(transformed_ranges)
+    if src.op().is_movement() && is_movement_chain_on_buffer(src) {
+        return UOp::index(Rc::clone(src), input_ranges.to_vec())
+            .expect("Failed to create INDEX for movement buffer source");
     }
 
     // Case 2: Source needs realization → wrap in BUFFERIZE + INDEX
@@ -129,6 +157,49 @@ pub fn should_remove_movement_op(x: &Rc<UOp>, ctx: &IndexingContext) -> bool {
     false
 }
 
+/// Apply buffer removal patterns while protecting SINK sources from removal.
+///
+/// SINK sources are root BUFFERIZE operations that represent user-requested
+/// output materialization. These should NOT be removed even if their compute
+/// is "cheap to inline".
+///
+/// This function:
+/// 1. Extracts SINK sources (the BUFFERIZEs to protect)
+/// 2. For each BUFFERIZE, applies buffer_removal only to its compute graph
+/// 3. Reconstructs the BUFFERIZEs with optimized compute
+/// 4. Reconstructs SINK with the protected BUFFERIZEs
+fn apply_buffer_removal_protecting_sink(
+    sink: &Rc<UOp>,
+    matcher: &crate::pattern::matcher::PatternMatcher<super::buffer_cost::PcontigConfig>,
+    ctx: &mut super::buffer_cost::PcontigConfig,
+) -> Rc<UOp> {
+    // If not a SINK, apply buffer_removal normally
+    let Op::Sink { sources } = sink.op() else {
+        return crate::rewrite::graph_rewrite(matcher, sink.clone(), ctx);
+    };
+
+    // Process each SINK source
+    let mut new_sources = Vec::with_capacity(sources.len());
+    for src in sources.iter() {
+        // If source is BUFFERIZE, optimize its compute but keep the BUFFERIZE wrapper
+        if let Op::Bufferize { compute, ranges, opts } = src.op() {
+            // Apply buffer_removal to the compute graph only
+            let optimized_compute = crate::rewrite::graph_rewrite(matcher, compute.clone(), ctx);
+
+            // Reconstruct BUFFERIZE with optimized compute (preserve the BUFFERIZE wrapper)
+            let new_bufferize = UOp::bufferize(optimized_compute, ranges.to_vec(), opts.clone());
+            new_sources.push(new_bufferize);
+        } else {
+            // Non-BUFFERIZE source: apply buffer_removal normally
+            let optimized = crate::rewrite::graph_rewrite(matcher, src.clone(), ctx);
+            new_sources.push(optimized);
+        }
+    }
+
+    // Reconstruct SINK with protected sources
+    UOp::sink(new_sources)
+}
+
 /// Main rangeify transformation entry point.
 ///
 /// Converts movement operations (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)
@@ -138,7 +209,7 @@ pub fn should_remove_movement_op(x: &Rc<UOp>, ctx: &IndexingContext) -> bool {
 ///
 /// 1. **Range assignment** - Determine input/output ranges for each UOp
 /// 2. **Early rewrites** - Cleanup (DETACH, CONTIGUOUS_BACKWARD removal)
-/// 3. **Core rangeify** - Convert movement ops to BUFFERIZE + INDEX
+/// 3. **Core rangeify** - Convert movement ops to BUFFERIZE + INDEX (bottom-up)
 /// 4. **Buffer folding** - Noop removal, constant folding
 /// 5. **Dead axis removal** - Remove size-1 dimensions
 /// 6. **Cost-based removal** - Remove unnecessary buffers
@@ -180,9 +251,12 @@ pub fn rangeify(
     let early_matcher = super::patterns::early_rewrites();
     sink = crate::rewrite::graph_rewrite(&early_matcher, sink, &mut ());
 
-    // Step 3: Apply core rangeify patterns (BUFFERIZE insertion, movement removal)
+    // Step 3: Apply core rangeify transformation (bottom-up)
+    // This must be bottom-up so that ADD gets transformed before BUFFERIZE.
+    // Using graph_rewrite_bottom_up to ensure children are processed first.
+    // NOTE: ReduceAxis → REDUCE conversion is now part of this step
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
-    sink = crate::rewrite::graph_rewrite(&rangeify_matcher, sink, &mut indexing_ctx);
+    sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, sink, &mut indexing_ctx);
 
     // Step 4: Buffer simplification (folding + dead axis removal)
     // - Folds noop BUFFERIZE (INDEX with same ranges)
@@ -193,9 +267,14 @@ pub fn rangeify(
     // Step 5: Cost-based buffer removal with partial contiguous
     // Remove buffers that don't provide performance benefits
     // Use partial contiguous to selectively materialize dimensions when beneficial
+    //
+    // IMPORTANT: SINK sources (root BUFFERIZE ops) should NOT be removed.
+    // They represent user-requested output materialization.
+    // We protect them by extracting SINK sources, applying buffer_removal to their
+    // compute graphs only, then reconstructing SINK.
     let mut pcontig = pcontig_config.cloned().unwrap_or_default();
     let buffer_removal_matcher = super::patterns::buffer_removal_with_pcontig();
-    sink = crate::rewrite::graph_rewrite(&buffer_removal_matcher, sink, &mut pcontig);
+    sink = apply_buffer_removal_protecting_sink(&sink, &buffer_removal_matcher, &mut pcontig);
 
     // Step 6: Symbolic simplification
     // Optimize index expressions created during rangeify
