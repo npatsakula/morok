@@ -267,7 +267,7 @@ fn test_provenance_tracking() {
     // Test at UOp level first to verify #[track_caller] works
     let uop_a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let uop_b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let uop_c = uop_a.try_add_op(&uop_b).unwrap(); // Line 248: Track this
+    let uop_c = uop_a.try_add(&uop_b).unwrap(); // Line 248: Track this
 
     PROVENANCE_TRACKER.with(|tracker| {
         let t = tracker.borrow();

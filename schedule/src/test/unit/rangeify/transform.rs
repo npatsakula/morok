@@ -1,7 +1,5 @@
-use std::rc::Rc;
-
 use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::{
     IndexingContext,
@@ -10,34 +8,17 @@ use crate::rangeify::{
 
 #[test]
 fn test_transform_buffer_source() {
-    // Create an actual BUFFER operation and a consumer with ranges
-    let unique = UOp::unique(Some(0));
-    let device = UOp::device(morok_device::DeviceSpec::Cpu);
-    let buffer = UOp::new(
-        Op::Buffer {
-            unique,
-            device,
-            size: 40, // 10 floats * 4 bytes
-        },
-        DType::Float32,
-    );
+    // Create two BUFFER operations with the same shape for a valid binary op
+    let buffer1 = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 40, DType::Float32);
+    let buffer2 = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 40, DType::Float32);
 
-    let range = UOp::new(
-        Op::Range {
-            end: UOp::const_(DType::Index, ConstValue::Int(10)),
-            axis_id: AxisId::Renumbered(0),
-            axis_type: AxisType::Loop,
-        },
-        DType::Index,
-    );
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Loop);
 
-    // Create consumer (e.g., a binary op using the buffer)
-    let five = UOp::const_(DType::Float32, ConstValue::Float(5.0));
-    let consumer = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, buffer.clone(), five.clone()), DType::Float32);
+    // Create consumer - adding two buffers of the same shape
+    let consumer = buffer1.try_add(&buffer2).unwrap();
 
     // Setup context with ranges for consumer
     let mut ctx = IndexingContext::new();
-    // Consumer has ranges assigned (input_ranges same as output_ranges)
     ctx.set_ranges(&consumer, vec![range.clone()], vec![range.clone()]);
 
     // Transform sources
@@ -47,26 +28,20 @@ fn test_transform_buffer_source() {
     let new_sources = new_sources.unwrap();
     assert_eq!(new_sources.len(), 2);
 
-    // First source (buffer) should be wrapped in INDEX
+    // Both buffer sources should be wrapped in INDEX
     assert!(matches!(new_sources[0].op(), Op::Index { .. }));
-
-    // Second source (const) should be unchanged
-    assert!(Rc::ptr_eq(&new_sources[1], &five));
+    assert!(matches!(new_sources[1].op(), Op::Index { .. }));
 }
 
 #[test]
 fn test_transform_realizable_source() {
     // Create a source that needs realization
     let x = UOp::define_global(1, DType::Float32);
-    let consumer = UOp::new(Op::Unary(morok_ir::UnaryOp::Neg, x.clone()), DType::Float32);
+    let consumer = x.neg();
 
     // Create ranges
     let range = UOp::new(
-        Op::Range {
-            end: UOp::const_(DType::Index, ConstValue::Int(5)),
-            axis_id: AxisId::Renumbered(0),
-            axis_type: AxisType::Loop,
-        },
+        Op::Range { end: UOp::index_const(5), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
         DType::Index,
     );
 
@@ -99,11 +74,7 @@ fn test_should_remove_movement_op() {
 
     // After assigning ranges, should remove
     let range = UOp::new(
-        Op::Range {
-            end: UOp::const_(DType::Index, ConstValue::Int(5)),
-            axis_id: AxisId::Renumbered(0),
-            axis_type: AxisType::Loop,
-        },
+        Op::Range { end: UOp::index_const(5), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
         DType::Index,
     );
     ctx.set_ranges(&permute, vec![range.clone()], vec![range.clone()]);
@@ -113,9 +84,10 @@ fn test_should_remove_movement_op() {
 
 #[test]
 fn test_no_transform_for_normal_source() {
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let y = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, x.clone(), y.clone()), DType::Float32);
+    let x = UOp::native_const(1.0f32);
+    let y = UOp::native_const(2.0f32);
+    // Use direct Binary construction - this test checks transform behavior, not arithmetic
+    let add = x.try_add(&y).unwrap();
 
     let ctx = IndexingContext::new();
 

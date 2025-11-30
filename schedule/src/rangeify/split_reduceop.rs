@@ -10,8 +10,7 @@ use std::{
     rc::Rc,
 };
 
-use morok_dtype::DType;
-use morok_ir::{ConstValue, Op, SInt, UOp, UOpKey};
+use morok_ir::{Op, SInt, UOp, UOpKey};
 use smallvec::SmallVec;
 
 // ============================================================================
@@ -96,12 +95,12 @@ fn detect_expanded_dimensions(source: &Rc<UOp>, input_shape: &[SInt]) -> Vec<boo
             match dim {
                 SInt::Const(n) if *n > 1 => {
                     // Create RANGE(0, n) with unique axis_id
-                    let end = UOp::const_(DType::Index, ConstValue::Int(*n as i64));
+                    let end = UOp::index_const(*n as i64);
                     UOp::range_axis(end, morok_ir::AxisId::Unrenumbered(axis_id), morok_ir::AxisType::Loop)
                 }
                 _ => {
                     // Size 0 or 1: use constant 0 (no iteration needed)
-                    UOp::const_(DType::Index, ConstValue::Int(0))
+                    UOp::index_const(0)
                 }
             }
         })

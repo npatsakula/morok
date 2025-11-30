@@ -6,7 +6,7 @@
 //! - Multi-consumer patterns
 //! - Complex indexing scenarios
 
-use morok_ir::{ConstValue, DType, Op, UOp};
+use morok_ir::{DType, Op, UOp};
 
 use crate::rangeify::transform::rangeify;
 
@@ -22,7 +22,7 @@ fn test_symbolic_range_size() {
     // This tests that rangeify doesn't crash on non-constant range sizes
 
     let size_var = UOp::var("size", DType::Index, 1, 1024);
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
 
     // Create range with symbolic size
     let range = create_range_symbolic(size_var, 0);
@@ -41,7 +41,7 @@ fn test_symbolic_range_multiple() {
     let size1 = UOp::var("size1", DType::Index, 1, 1024);
     let size2 = UOp::var("size2", DType::Index, 1, 1024);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let compute = UOp::native_const(2.0f32);
 
     let range1 = create_range_symbolic(size1, 0);
     let range2 = create_range_symbolic(size2, 1);
@@ -59,9 +59,9 @@ fn test_symbolic_range_multiple() {
 fn test_symbolic_range_with_arithmetic() {
     // Test symbolic range size with arithmetic expression
     let n = UOp::var("n", DType::Index, 1, 512);
-    let size = n.try_mul_op(&create_const(2)).unwrap();
+    let size = n.try_mul(&create_const(2)).unwrap();
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+    let compute = UOp::native_const(3.0f32);
     let range = create_range_symbolic(size, 0);
     let bufferized = create_bufferize(compute, vec![range]);
 
@@ -81,7 +81,7 @@ fn test_nested_bufferize_different_ranges() {
     // Test BUFFERIZE(BUFFERIZE(x, R1), R2) where R1 != R2
     // This tests multi-level buffering with different iteration spaces
 
-    let inner_compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let inner_compute = UOp::native_const(1.0f32);
 
     // Inner bufferize with range [0, 10)
     let inner_range = create_range(10, 0);
@@ -100,7 +100,7 @@ fn test_nested_bufferize_different_ranges() {
 #[test]
 fn test_deeply_nested_bufferize() {
     // Test 3-level nesting: BUFFERIZE(BUFFERIZE(BUFFERIZE(x)))
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
 
     let r1 = create_range(5, 0);
     let buf1 = create_bufferize(compute, vec![r1]);
@@ -126,17 +126,17 @@ fn test_bufferize_multiple_consumers() {
     // Test single BUFFERIZE with multiple consumers
     // Pattern: buf = BUFFERIZE(x); y = f(buf); z = g(buf)
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let range = create_range(10, 0);
     let buf = create_bufferize(compute, vec![range]);
 
     // Two independent consumers of the same buffer
-    let consumer1 = buf.try_add_op(&UOp::const_(DType::Float32, ConstValue::Float(2.0))).unwrap();
+    let consumer1 = buf.try_add(&UOp::native_const(2.0f32)).unwrap();
 
-    let consumer2 = buf.try_mul_op(&UOp::const_(DType::Float32, ConstValue::Float(3.0))).unwrap();
+    let consumer2 = buf.try_mul(&UOp::native_const(3.0f32)).unwrap();
 
     // Combine consumers with SINK
-    let sink = UOp::new(Op::Sink { sources: vec![consumer1, consumer2].into() }, DType::Float32);
+    let sink = UOp::sink(vec![consumer1, consumer2]);
 
     // Should handle multi-consumer pattern without crashing
     let (_result, _ctx) = rangeify(sink, None).unwrap();
@@ -149,7 +149,7 @@ fn test_operation_with_multiple_uses() {
     // Test intermediate operation used multiple times
     // Pattern: x = CONST; buf1 = BUFFERIZE(x); buf2 = BUFFERIZE(x)
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
 
     let r1 = create_range(10, 0);
     let buf1 = create_bufferize(compute.clone(), vec![r1]);
@@ -158,7 +158,7 @@ fn test_operation_with_multiple_uses() {
     let buf2 = create_bufferize(compute.clone(), vec![r2]);
 
     // Both bufferize the same compute
-    let sink = UOp::new(Op::Sink { sources: vec![buf1, buf2].into() }, DType::Float32);
+    let sink = UOp::sink(vec![buf1, buf2]);
 
     // Should handle same operation bufferized with different ranges
     let (_result, _ctx) = rangeify(sink, None).unwrap();
@@ -173,7 +173,7 @@ fn test_operation_with_multiple_uses() {
 #[test]
 fn test_index_with_multiple_ranges() {
     // Test INDEX operation with multiple range dimensions
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let r1 = create_range(10, 0);
     let r2 = create_range(20, 1);
     let r3 = create_range(5, 2);
@@ -196,7 +196,7 @@ fn test_range_size_mismatch() {
     let sym_size = UOp::define_global(0, DType::Index);
     let sym_range = create_range_symbolic(sym_size, 1);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let bufferized = create_bufferize(compute, vec![const_range, sym_range]);
 
     // Mixed constant and symbolic ranges work correctly
@@ -253,10 +253,10 @@ fn test_is_dead_axis_non_range() {
     use crate::rangeify::helpers::is_dead_axis;
 
     // Non-RANGE operations should return false
-    let const_op = UOp::const_(DType::Index, ConstValue::Int(0));
+    let const_op = UOp::index_const(0);
     assert!(!is_dead_axis(&const_op));
 
-    let add_op = const_op.try_add_op(&const_op).unwrap();
+    let add_op = const_op.try_add(&const_op).unwrap();
     assert!(!is_dead_axis(&add_op));
 }
 
@@ -272,7 +272,7 @@ fn test_symbolic_dead_range_smoke_test() {
     // may run in later optimization stages.
 
     let size = UOp::var("size", DType::Index, 1, 1); // Bounded to [1, 1] - provably dead
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
 
     // Create BUFFERIZE with dead symbolic range and live range
     let dead_range = create_range_symbolic(size, 0);

@@ -1,6 +1,6 @@
 use morok_dtype::DType;
 
-use crate::{ConstValue, SInt, UOp, sint_max, sint_min, sint_prod};
+use crate::{SInt, UOp, sint_max, sint_min, sint_prod};
 
 #[test]
 fn test_sint_const() {
@@ -12,7 +12,7 @@ fn test_sint_const() {
 
 #[test]
 fn test_sint_symbolic() {
-    let uop = UOp::const_(DType::Index, ConstValue::Int(10));
+    let uop = UOp::index_const(10);
     let s = SInt::from(uop);
     assert!(s.is_const()); // Should simplify to const
     assert_eq!(s.as_const(), Some(10));
@@ -48,7 +48,7 @@ fn test_sint_to_uop() {
 
 #[test]
 fn test_sint_simplify() {
-    let uop = UOp::const_(DType::Index, ConstValue::Int(100));
+    let uop = UOp::index_const(100);
     let s = SInt::from(uop);
     let simplified = s.simplify();
     assert_eq!(simplified.as_const(), Some(100));

@@ -3,8 +3,9 @@
 //! Tests that verify the full rangeify pipeline orchestrates correctly,
 //! threading context between stages and preserving UOp structure.
 
-use morok_dtype::DType;
-use morok_ir::{ConstValue, Op, UOp};
+use std::f32::consts::PI;
+
+use morok_ir::{Op, UOp};
 
 use crate::rangeify::pipeline::run_kernel_split_pipeline;
 use crate::test::unit::rangeify::helpers::{count_define_globals, count_define_locals, count_kernels};
@@ -12,8 +13,8 @@ use crate::test::unit::rangeify::helpers::{count_define_globals, count_define_lo
 #[test]
 fn test_pipeline_two_bufferizes() {
     // Two BUFFERIZEs with different address spaces
-    let compute1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let compute2 = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let compute1 = UOp::native_const(1.0f32);
+    let compute2 = UOp::native_const(42i32);
 
     let range1 = UOp::range_const(10, 0);
     let range2 = UOp::range_const(5, 1);
@@ -23,7 +24,7 @@ fn test_pipeline_two_bufferizes() {
     let bufferize_local = UOp::bufferize_local(compute2, vec![range2]);
 
     // Create root with both
-    let root = UOp::new(Op::Sink { sources: smallvec::smallvec![bufferize_global, bufferize_local] }, DType::Void);
+    let root = UOp::sink(vec![bufferize_global, bufferize_local]);
 
     let result = run_kernel_split_pipeline(root);
 
@@ -40,7 +41,7 @@ fn test_pipeline_two_bufferizes() {
 #[test]
 fn test_pipeline_preserves_structure() {
     // Verify that UOp identity is preserved through pipeline stages
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(std::f64::consts::PI));
+    let compute = UOp::native_const(PI);
     let range = UOp::range_const(20, 0);
 
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range.clone()]);
@@ -71,7 +72,7 @@ fn test_pipeline_preserves_structure() {
 #[test]
 fn test_pipeline_context_threading() {
     // Verify that context state is preserved between stages
-    let compute = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let compute = UOp::native_const(true);
     let range = UOp::range_const(8, 0);
 
     let bufferize = UOp::bufferize_global(compute, vec![range]);
@@ -94,8 +95,8 @@ fn test_pipeline_context_threading() {
 #[test]
 fn test_pipeline_mixed_addrspace() {
     // Global and Local buffers in the same graph
-    let global_compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let local_compute = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let global_compute = UOp::native_const(1.0f32);
+    let local_compute = UOp::native_const(2.0f32);
 
     let range = UOp::range_const(16, 0);
 
@@ -104,7 +105,7 @@ fn test_pipeline_mixed_addrspace() {
     let local_buf = UOp::bufferize_local(local_compute, vec![range]);
 
     // Create a SINK with both
-    let root = UOp::new(Op::Sink { sources: smallvec::smallvec![global_buf, local_buf] }, DType::Void);
+    let root = UOp::sink(vec![global_buf, local_buf]);
 
     let result = run_kernel_split_pipeline(root);
 
@@ -126,7 +127,7 @@ fn test_pipeline_chained_operations() {
     // Test: A → bufferize → B → bufferize → C
     // Should create 2 buffers and appropriate kernel boundaries
 
-    let compute_a = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let compute_a = UOp::native_const(1i32);
     let range_a = UOp::range_const(10, 0);
 
     let buf_a = UOp::bufferize_global(compute_a.clone(), vec![range_a]);

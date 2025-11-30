@@ -5,7 +5,7 @@
 //! that the original and simplified versions are semantically equivalent.
 
 use morok_dtype::DType;
-use morok_ir::types::{BinaryOp, ConstValue};
+use morok_ir::types::ConstValue;
 use morok_ir::{Op, UOp};
 use std::rc::Rc;
 
@@ -21,8 +21,8 @@ use crate::z3::verify::verify_equivalence;
 fn test_identity_add_zero() {
     // x + 0 → x
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let expr = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), zero), DType::Int32);
+    let zero = UOp::native_const(0i32);
+    let expr = x.try_add(&zero).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -38,8 +38,8 @@ fn test_identity_add_zero() {
 fn test_identity_mul_one() {
     // x * 1 → x
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let expr = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&x), one), DType::Int32);
+    let one = UOp::native_const(1i32);
+    let expr = x.try_mul(&one).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -52,8 +52,8 @@ fn test_identity_mul_one() {
 fn test_identity_sub_zero() {
     // x - 0 → x
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let expr = UOp::new(Op::Binary(BinaryOp::Sub, Rc::clone(&x), zero), DType::Int32);
+    let zero = UOp::native_const(0i32);
+    let expr = x.try_sub(&zero).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -66,8 +66,8 @@ fn test_identity_sub_zero() {
 fn test_identity_div_one() {
     // x / 1 → x
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let expr = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&x), one), DType::Int32);
+    let one = UOp::native_const(1i32);
+    let expr = x.try_div(&one).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -80,9 +80,9 @@ fn test_identity_div_one() {
 fn test_identity_mod_one() {
     // x % 1 → 0 (verify semantically even if optimizer doesn't simplify)
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let expr = UOp::new(Op::Binary(BinaryOp::Mod, Rc::clone(&x), Rc::clone(&one)), DType::Int32);
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let one = UOp::native_const(1i32);
+    let expr = x.try_mod(&one).unwrap();
+    let zero = UOp::native_const(0i32);
 
     // Z3 verification: x % 1 is semantically equivalent to 0
     verify_equivalence(&expr, &zero).expect("x % 1 should equal 0");
@@ -96,8 +96,8 @@ fn test_identity_mod_one() {
 fn test_zero_mul_zero() {
     // x * 0 → 0
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let expr = UOp::new(Op::Binary(BinaryOp::Mul, x, Rc::clone(&zero)), DType::Int32);
+    let zero = UOp::native_const(0i32);
+    let expr = x.try_mul(&zero).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -111,8 +111,8 @@ fn test_zero_mul_zero() {
 fn test_zero_and_zero() {
     // x & 0 → 0
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let expr = UOp::new(Op::Binary(BinaryOp::And, x, Rc::clone(&zero)), DType::Int32);
+    let zero = UOp::native_const(0i32);
+    let expr = x.try_and_op(&zero).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -128,8 +128,8 @@ fn test_zero_and_zero() {
 fn test_zero_div_x() {
     // 0 / x → 0 (verify semantically, for x ≠ 0)
     let x = UOp::var("x", DType::Int32, 1, 100); // x ≠ 0
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let expr = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&zero), x), DType::Int32);
+    let zero = UOp::native_const(0i32);
+    let expr = zero.try_div(&x).unwrap();
 
     // Z3 verification: 0 / x is semantically equivalent to 0
     verify_equivalence(&expr, &zero).expect("0 / x should equal 0");
@@ -143,8 +143,8 @@ fn test_zero_div_x() {
 fn test_self_sub_zero() {
     // x - x → 0 (verify semantically even if optimizer doesn't simplify)
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let expr = UOp::new(Op::Binary(BinaryOp::Sub, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let expr = x.try_sub(&x).unwrap();
+    let zero = UOp::native_const(0i32);
 
     // Z3 verification: x - x is semantically equivalent to 0
     verify_equivalence(&expr, &zero).expect("x - x should equal 0");
@@ -154,7 +154,7 @@ fn test_self_sub_zero() {
 fn test_self_div_one() {
     // x / x → 1 (for x ≠ 0)
     let x = UOp::var("x", DType::Int32, 1, 100); // x ≠ 0
-    let expr = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
+    let expr = x.try_div(&x).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -172,7 +172,7 @@ fn test_self_div_one() {
 fn test_self_mod_zero() {
     // x % x → 0 (for x ≠ 0)
     let x = UOp::var("x", DType::Int32, 1, 100); // x ≠ 0
-    let expr = UOp::new(Op::Binary(BinaryOp::Mod, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
+    let expr = x.try_mod(&x).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -190,7 +190,7 @@ fn test_self_mod_zero() {
 fn test_self_and_identity() {
     // x & x → x
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let expr = UOp::new(Op::Binary(BinaryOp::And, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
+    let expr = x.try_and_op(&x).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -211,8 +211,8 @@ fn test_div_cancel_mul() {
     // (a * b) / b → a (for b ≠ 0)
     let a = UOp::var("a", DType::Int32, 0, 100);
     let b = UOp::var("b", DType::Int32, 1, 100); // b ≠ 0
-    let a_mul_b = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&a), Rc::clone(&b)), DType::Int32);
-    let expr = UOp::new(Op::Binary(BinaryOp::Idiv, a_mul_b, Rc::clone(&b)), DType::Int32);
+    let a_mul_b = a.try_mul(&b).unwrap();
+    let expr = a_mul_b.try_div(&b).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -228,8 +228,8 @@ fn test_div_chain() {
     let a = UOp::var("a", DType::Int32, 0, 100);
     let b = UOp::var("b", DType::Int32, 1, 10); // b ≠ 0
     let c = UOp::var("c", DType::Int32, 1, 10); // c ≠ 0
-    let a_div_b = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&a), Rc::clone(&b)), DType::Int32);
-    let expr = UOp::new(Op::Binary(BinaryOp::Idiv, a_div_b, Rc::clone(&c)), DType::Int32);
+    let a_div_b = a.try_div(&b).unwrap();
+    let expr = a_div_b.try_div(&c).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -243,11 +243,11 @@ fn test_div_gcd_factor() {
     // (a * 6) / (b * 6) → a / b (for b ≠ 0)
     let a = UOp::var("a", DType::Int32, 0, 60);
     let b = UOp::var("b", DType::Int32, 1, 10); // b ≠ 0
-    let six = UOp::const_(DType::Int32, ConstValue::Int(6));
+    let six = UOp::native_const(6i32);
 
-    let a_mul_6 = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&a), Rc::clone(&six)), DType::Int32);
-    let b_mul_6 = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&b), Rc::clone(&six)), DType::Int32);
-    let expr = UOp::new(Op::Binary(BinaryOp::Idiv, a_mul_6, b_mul_6), DType::Int32);
+    let a_mul_6 = a.try_mul(&six).unwrap();
+    let b_mul_6 = b.try_mul(&six).unwrap();
+    let expr = a_mul_6.try_div(&b_mul_6).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -260,7 +260,7 @@ fn test_div_gcd_factor() {
 fn test_mod_self_zero() {
     // a % a → 0 (for a ≠ 0)
     let a = UOp::var("a", DType::Int32, 1, 100); // a ≠ 0
-    let expr = UOp::new(Op::Binary(BinaryOp::Mod, Rc::clone(&a), Rc::clone(&a)), DType::Int32);
+    let expr = a.try_mod(&a).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -282,7 +282,7 @@ fn test_mod_self_zero() {
 fn test_term_combine_add() {
     // x + x → 2 * x
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let expr = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
+    let expr = x.try_add(&x).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -295,12 +295,12 @@ fn test_term_combine_add() {
 fn test_term_combine_coefficients() {
     // (2 * x) + (3 * x) → 5 * x
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let two = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let three = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let two = UOp::native_const(2i32);
+    let three = UOp::native_const(3i32);
 
-    let two_x = UOp::new(Op::Binary(BinaryOp::Mul, two, Rc::clone(&x)), DType::Int32);
-    let three_x = UOp::new(Op::Binary(BinaryOp::Mul, three, Rc::clone(&x)), DType::Int32);
-    let expr = UOp::new(Op::Binary(BinaryOp::Add, two_x, three_x), DType::Int32);
+    let two_x = two.try_mul(&x).unwrap();
+    let three_x = three.try_mul(&x).unwrap();
+    let expr = two_x.try_add(&three_x).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -313,11 +313,11 @@ fn test_term_combine_coefficients() {
 fn test_const_folding_add() {
     // (x + 3) + 5 → x + 8
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let three = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let five = UOp::const_(DType::Int32, ConstValue::Int(5));
+    let three = UOp::native_const(3i32);
+    let five = UOp::native_const(5i32);
 
-    let x_plus_3 = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), three), DType::Int32);
-    let expr = UOp::new(Op::Binary(BinaryOp::Add, x_plus_3, five), DType::Int32);
+    let x_plus_3 = x.try_add(&three).unwrap();
+    let expr = x_plus_3.try_add(&five).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -330,11 +330,11 @@ fn test_const_folding_add() {
 fn test_const_folding_mul() {
     // (x * 2) * 3 → x * 6
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let two = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let three = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let two = UOp::native_const(2i32);
+    let three = UOp::native_const(3i32);
 
-    let x_mul_2 = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&x), two), DType::Int32);
-    let expr = UOp::new(Op::Binary(BinaryOp::Mul, x_mul_2, three), DType::Int32);
+    let x_mul_2 = x.try_mul(&two).unwrap();
+    let expr = x_mul_2.try_mul(&three).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());

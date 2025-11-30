@@ -41,12 +41,11 @@ fn test_next_range() {
 #[test]
 fn test_buffer_mapping() {
     use morok_dtype::DType;
-    use morok_ir::{ConstValue, Op};
 
     let mut ctx = KernelContext::new();
 
-    let original = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let replacement = UOp::new(Op::DefineGlobal(0), DType::Float32);
+    let original = UOp::native_const(1.0f32);
+    let replacement = UOp::define_global(0, DType::Float32);
 
     assert!(!ctx.has_buffer(&original));
 

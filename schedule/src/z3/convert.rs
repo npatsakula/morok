@@ -343,7 +343,7 @@ mod tests {
 
         let a = UOp::const_(DType::Int32, ConstValue::Int(10));
         let b = UOp::const_(DType::Int32, ConstValue::Int(20));
-        let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Int32);
+        let add = a.try_add(&b).expect("Should create ADD");
 
         let z3_expr = z3ctx.convert_uop(&add).expect("Should convert");
         assert!(z3_expr.as_int().is_some());

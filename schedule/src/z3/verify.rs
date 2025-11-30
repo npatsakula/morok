@@ -130,15 +130,15 @@ pub fn verify_equivalence(original: &Rc<UOp>, simplified: &Rc<UOp>) -> Verificat
 mod tests {
     use super::*;
     use morok_dtype::DType;
-    use morok_ir::Op;
-    use morok_ir::types::{BinaryOp, ConstValue};
+
+    use morok_ir::types::ConstValue;
 
     #[test]
     fn test_verify_identity_add_zero() {
         // x + 0 = x
         let x = UOp::var("x", DType::Int32, 0, 100);
         let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let x_plus_zero = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), zero), DType::Int32);
+        let x_plus_zero = x.try_add(&zero).unwrap();
 
         verify_equivalence(&x_plus_zero, &x).expect("x + 0 should equal x");
     }
@@ -148,8 +148,8 @@ mod tests {
         // x + y = y + x
         let x = UOp::var("x", DType::Int32, 0, 100);
         let y = UOp::var("y", DType::Int32, 0, 100);
-        let x_plus_y = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), Rc::clone(&y)), DType::Int32);
-        let y_plus_x = UOp::new(Op::Binary(BinaryOp::Add, y, x), DType::Int32);
+        let x_plus_y = x.try_add(&y).unwrap();
+        let y_plus_x = y.try_add(&x).unwrap();
 
         verify_equivalence(&x_plus_y, &y_plus_x).expect("x + y should equal y + x");
     }
@@ -159,7 +159,7 @@ mod tests {
         // x + 1 ≠ x (should find counterexample)
         let x = UOp::var("x", DType::Int32, 0, 100);
         let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-        let x_plus_one = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), one), DType::Int32);
+        let x_plus_one = x.try_add(&one).unwrap();
 
         let result = verify_equivalence(&x_plus_one, &x);
         assert!(result.is_err(), "x + 1 should not equal x");
@@ -173,7 +173,7 @@ mod tests {
     fn test_verify_self_folding() {
         // x - x = 0
         let x = UOp::var("x", DType::Int32, 0, 100);
-        let x_minus_x = UOp::new(Op::Binary(BinaryOp::Sub, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
+        let x_minus_x = x.try_sub(&x).unwrap();
         let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
 
         verify_equivalence(&x_minus_x, &zero).expect("x - x should equal 0");

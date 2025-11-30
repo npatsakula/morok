@@ -3,8 +3,7 @@
 //! Tests that verify the number of kernels created by the pipeline,
 //! ensuring fusion decisions are correct without needing actual tensor data.
 
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::{KernelContext, pipeline::run_kernel_split_pipeline};
 use crate::test::unit::rangeify::helpers::{count_define_globals, count_ends, count_kernels, count_stores};
@@ -12,7 +11,7 @@ use crate::test::unit::rangeify::helpers::{count_define_globals, count_ends, cou
 #[test]
 fn test_single_store_one_kernel() {
     // Single BUFFERIZE → Should create 1 KERNEL
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let range = UOp::range_const(10, 0);
 
     let bufferize = UOp::bufferize_global(compute, vec![range]);
@@ -26,8 +25,8 @@ fn test_single_store_one_kernel() {
 #[test]
 fn test_double_store_two_kernels() {
     // Two independent BUFFERIZEs → Should create 2 KERNELs
-    let compute1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let compute2 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let compute1 = UOp::native_const(1.0f32);
+    let compute2 = UOp::native_const(2.0f32);
 
     let range1 = UOp::range_const(10, 0);
     let range2 = UOp::range_const(20, 1);
@@ -37,7 +36,7 @@ fn test_double_store_two_kernels() {
     let bufferize2 = UOp::bufferize_global(compute2, vec![range2]);
 
     // Create a root that references both (e.g., SINK)
-    let root = UOp::new(Op::Sink { sources: smallvec::smallvec![bufferize1, bufferize2] }, DType::Void);
+    let root = UOp::sink(vec![bufferize1, bufferize2]);
 
     let result = run_kernel_split_pipeline(root);
 
@@ -50,7 +49,7 @@ fn test_shared_buffer_one_kernel() {
     let mut ctx = KernelContext::new();
 
     // Same BUFFERIZE used twice → should reuse buffer
-    let compute = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let compute = UOp::native_const(42i32);
     let range = UOp::range_const(5, 0);
 
     let bufferize = UOp::bufferize_global(compute, vec![range]);
@@ -76,8 +75,8 @@ fn test_independent_buffers_separate() {
     let mut ctx = KernelContext::new();
 
     // Different BUFFERIZEs → separate buffers
-    let compute1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let compute2 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let compute1 = UOp::native_const(1.0f32);
+    let compute2 = UOp::native_const(2.0f32);
 
     let range = UOp::range_const(10, 0);
 
@@ -136,9 +135,8 @@ fn test_nested_end_operations() {
 fn test_pipeline_kernel_count() {
     // After full pipeline, count kernels
     // Use OUTER range so split_store will split at kernel boundary
-    let compute = UOp::const_(DType::Bool, ConstValue::Bool(false));
-    let range =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(100)), AxisId::Renumbered(0), AxisType::Outer);
+    let compute = UOp::native_const(false);
+    let range = UOp::range_axis(UOp::index_const(100), AxisId::Renumbered(0), AxisType::Outer);
 
     let bufferize = UOp::bufferize_global(compute, vec![range]);
 

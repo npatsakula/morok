@@ -27,8 +27,7 @@ pub mod split_patterns;
 pub mod split_reduceop;
 pub mod transform;
 
-use morok_dtype::DType;
-use morok_ir::{ConstValue, UOp};
+use morok_ir::UOp;
 
 use crate::rangeify::RangeifyContext;
 use crate::rangeify::patterns as rangeify_patterns;
@@ -54,8 +53,8 @@ fn test_rangeify_context_next_range_id() {
 fn test_rangeify_context_record_transform() {
     let mut ctx = RangeifyContext::new();
 
-    let original = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let rangeified = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let original = UOp::native_const(1.0f32);
+    let rangeified = UOp::native_const(2.0f32);
 
     ctx.record_transform(original.clone(), rangeified.clone());
 
@@ -68,7 +67,7 @@ fn test_rangeify_context_record_transform() {
 fn test_rangeify_context_get_missing() {
     let ctx = RangeifyContext::new();
 
-    let uop = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let uop = UOp::native_const(1.0f32);
     assert!(ctx.get_rangeified(&uop).is_none());
 }
 
@@ -78,7 +77,7 @@ fn test_pattern_matchers_stub() {
     let m3 = rangeify_patterns::buffer_folding();
     let m4 = rangeify_patterns::buffer_removal();
 
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let x = UOp::native_const(1.0f32);
 
     // Should all return NoMatch since they're empty
     use crate::pattern::matcher::RewriteResult;
@@ -89,13 +88,12 @@ fn test_pattern_matchers_stub() {
 #[test]
 fn test_early_rewrites_detach_removal() {
     use crate::pattern::matcher::RewriteResult;
-    use morok_ir::Op;
 
     let matcher = rangeify_patterns::early_rewrites();
 
     // Test: DETACH(x) -> x
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let detach = UOp::new(Op::Detach { src: x.clone() }, DType::Float32);
+    let x = UOp::native_const(1.0f32);
+    let detach = UOp::detach(x.clone());
 
     let result = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -107,13 +105,12 @@ fn test_early_rewrites_detach_removal() {
 #[test]
 fn test_early_rewrites_contiguous_backward_removal() {
     use crate::pattern::matcher::RewriteResult;
-    use morok_ir::Op;
 
     let matcher = rangeify_patterns::early_rewrites();
 
     // Test: CONTIGUOUS_BACKWARD(x) -> x
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let contiguous = UOp::new(Op::ContiguousBackward { src: x.clone() }, DType::Float32);
+    let x = UOp::native_const(1.0f32);
+    let contiguous = UOp::contiguous_backward(x.clone());
 
     let result = matcher.rewrite(&contiguous, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));

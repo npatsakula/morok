@@ -409,10 +409,10 @@ fn test_dtype_preservation() {
 
 #[test]
 fn test_symbolic_shape_support() {
-    use morok_ir::{ConstValue, DType, Op};
+    use morok_ir::{ConstValue, DType};
 
     // Create a tensor with a symbolic dimension using DefineVar
-    let batch_var = UOp::new(Op::DefineVar { name: "batch".to_string(), min_val: 1, max_val: 128 }, DType::Index);
+    let batch_var = UOp::define_var("batch".to_string(), 1, 128);
     let batch_dim = morok_ir::SInt::Symbolic(batch_var);
 
     // Create shape: [batch, 3, 4] where batch is symbolic
@@ -452,10 +452,10 @@ fn test_symbolic_shape_support() {
 
 #[test]
 fn test_symbolic_shape_broadcast() {
-    use morok_ir::{ConstValue, DType, Op};
+    use morok_ir::{ConstValue, DType};
 
     // Create symbolic batch dimension
-    let batch_var = UOp::new(Op::DefineVar { name: "N".to_string(), min_val: 1, max_val: 1024 }, DType::Index);
+    let batch_var = UOp::define_var("N".to_string(), 1, 1024);
     let batch_dim = morok_ir::SInt::Symbolic(batch_var);
 
     // Create tensor with shape [N, 4]
@@ -480,10 +480,10 @@ fn test_symbolic_shape_broadcast() {
 
 #[test]
 fn test_symbolic_shape_binary_ops() {
-    use morok_ir::{ConstValue, DType, Op};
+    use morok_ir::{ConstValue, DType};
 
     // Create symbolic dimensions
-    let dim_var = UOp::new(Op::DefineVar { name: "D".to_string(), min_val: 1, max_val: 512 }, DType::Index);
+    let dim_var = UOp::define_var("D".to_string(), 1, 512);
     let dim_sym = morok_ir::SInt::Symbolic(dim_var);
 
     // Create two tensors with symbolic shape [D]

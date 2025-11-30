@@ -8,6 +8,7 @@
 //!
 //! Based on Tinygrad's test_schedule.py pattern tests.
 
+use std::f32::consts::PI;
 use std::rc::Rc;
 
 use morok_dtype::DType;
@@ -23,8 +24,8 @@ fn test_early_rewrites_detach_removal() {
     let matcher = patterns::early_rewrites();
 
     // Test: DETACH(x) → x
-    let x = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let detach = UOp::new(Op::Detach { src: x.clone() }, x.dtype());
+    let x = UOp::native_const(42.0f32);
+    let detach = UOp::detach(x.clone());
 
     let result = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite DETACH");
@@ -39,8 +40,8 @@ fn test_early_rewrites_contiguous_backward_removal() {
     let matcher = patterns::early_rewrites();
 
     // Test: CONTIGUOUS_BACKWARD(x) → x
-    let x = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as _));
-    let contiguous = UOp::new(Op::ContiguousBackward { src: x.clone() }, x.dtype());
+    let x = UOp::native_const(PI);
+    let contiguous = UOp::contiguous_backward(x.clone());
 
     let result = matcher.rewrite(&contiguous, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite CONTIGUOUS_BACKWARD");
@@ -55,13 +56,13 @@ fn test_early_rewrites_no_match_for_other_ops() {
     let matcher = patterns::early_rewrites();
 
     // Test that non-DETACH/CONTIGUOUS_BACKWARD operations return NoMatch
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_op = UOp::native_const(1.0f32);
     let result = matcher.rewrite(&const_op, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match CONST");
 
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = a.try_add_op(&b).unwrap();
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let add = a.try_add(&b).unwrap();
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match Binary ops");
 }
@@ -71,9 +72,9 @@ fn test_early_rewrites_nested_detach() {
     let matcher = patterns::early_rewrites();
 
     // Test: DETACH(DETACH(x)) should rewrite outer DETACH to DETACH(x)
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let inner_detach = UOp::new(Op::Detach { src: x.clone() }, x.dtype());
-    let outer_detach = UOp::new(Op::Detach { src: inner_detach.clone() }, x.dtype());
+    let x = UOp::native_const(1.0f32);
+    let inner_detach = UOp::detach(x.clone());
+    let outer_detach = UOp::detach(inner_detach.clone());
 
     let result = matcher.rewrite(&outer_detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -90,8 +91,8 @@ fn test_buffer_folding_noop_bufferize() {
     let matcher = patterns::buffer_folding();
 
     // Test: INDEX(BUFFERIZE(x, ranges), ranges) → x when ranges are equal
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let x = UOp::native_const(1.0f32);
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x.clone(), vec![range.clone()], BufferizeOpts::local());
@@ -110,8 +111,8 @@ fn test_buffer_folding_bufferize_const() {
     let matcher = patterns::buffer_folding();
 
     // Test: BUFFERIZE(CONST) → CONST
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let const_val = UOp::native_const(42.0f32);
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(const_val.clone(), vec![range], BufferizeOpts::local());
 
@@ -128,8 +129,8 @@ fn test_buffer_folding_index_const() {
     let matcher = patterns::buffer_folding();
 
     // Test: INDEX(CONST) → CONST
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as _));
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let const_val = UOp::native_const(PI);
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let index = UOp::index(const_val.clone(), vec![range]).unwrap();
 
@@ -146,9 +147,9 @@ fn test_buffer_folding_copy_const() {
     let matcher = patterns::buffer_folding();
 
     // Test: COPY(CONST, device) → CONST
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
     let device = UOp::device(morok_ir::DeviceSpec::Cpu);
-    let copy = UOp::new(Op::Copy { src: const_val.clone(), device }, const_val.dtype());
+    let copy = UOp::copy(const_val.clone(), device);
 
     let result = matcher.rewrite(&copy, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove COPY from CONST");
@@ -163,11 +164,11 @@ fn test_buffer_folding_no_match_different_ranges() {
     let matcher = patterns::buffer_folding();
 
     // Test: INDEX(BUFFERIZE(x, r1), r2) should NOT match when r1 != r2
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range1_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let x = UOp::native_const(1.0f32);
+    let range1_end = UOp::index_const(10);
     let range1 = UOp::range_axis(range1_end, AxisId::Renumbered(0), AxisType::Loop);
 
-    let range2_end = UOp::const_(DType::Index, ConstValue::Int(20));
+    let range2_end = UOp::index_const(20);
     let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x, vec![range1], BufferizeOpts::local());
@@ -193,8 +194,8 @@ fn test_dead_axis_removal_single_dead_axis() {
     let matcher = patterns::dead_axis_removal();
 
     // Create a BUFFERIZE with one dead axis (range with size 1)
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let dead_range_end = UOp::const_(DType::Index, ConstValue::Int(1)); // size 1 = dead
+    let x = UOp::native_const(1.0f32);
+    let dead_range_end = UOp::index_const(1); // size 1 = dead
     let dead_range = UOp::range_axis(dead_range_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x.clone(), vec![dead_range], BufferizeOpts::local());
@@ -222,11 +223,11 @@ fn test_dead_axis_removal_mixed_axes() {
     let matcher = patterns::dead_axis_removal();
 
     // Create BUFFERIZE with mix of live and dead axes
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let live_range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let x = UOp::native_const(1.0f32);
+    let live_range_end = UOp::index_const(10);
     let live_range = UOp::range_axis(live_range_end, AxisId::Renumbered(0), AxisType::Loop);
 
-    let dead_range_end = UOp::const_(DType::Index, ConstValue::Int(1));
+    let dead_range_end = UOp::index_const(1);
     let dead_range = UOp::range_axis(dead_range_end, AxisId::Renumbered(1), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x, vec![live_range.clone(), dead_range], BufferizeOpts::local());
@@ -252,11 +253,11 @@ fn test_dead_axis_removal_no_dead_axes() {
     let matcher = patterns::dead_axis_removal();
 
     // Create BUFFERIZE with all live axes
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range1_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let x = UOp::native_const(1.0f32);
+    let range1_end = UOp::index_const(10);
     let range1 = UOp::range_axis(range1_end, AxisId::Renumbered(0), AxisType::Loop);
 
-    let range2_end = UOp::const_(DType::Index, ConstValue::Int(20));
+    let range2_end = UOp::index_const(20);
     let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x, vec![range1, range2], BufferizeOpts::local());
@@ -274,11 +275,11 @@ fn test_buffer_removal_cheap_compute() {
     let matcher = patterns::buffer_removal();
 
     // Test: BUFFERIZE(cheap_op) should be removed if cheap to inline
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = a.try_add_op(&b).unwrap(); // Binary add is cheap
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let add = a.try_add(&b).unwrap(); // Binary add is cheap
 
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(add.clone(), vec![range], BufferizeOpts::local());
 
@@ -300,9 +301,9 @@ fn test_buffer_removal_always_run_ops() {
 
     // Test: BUFFERIZE(CONTIGUOUS) should be removed (always-run op)
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let contiguous = UOp::new(Op::Contiguous { src: src.clone() }, src.dtype());
+    let contiguous = UOp::contiguous(src.clone());
 
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(contiguous.clone(), vec![range], BufferizeOpts::local());
 
@@ -324,12 +325,12 @@ fn test_buffer_removal_nested_bufferize() {
 
     // Test: BUFFERIZE(BUFFERIZE(x, r1), r2) → BUFFERIZE(x, r2)
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range1_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range1_end = UOp::index_const(10);
     let range1 = UOp::range_axis(range1_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let inner = UOp::bufferize(x.clone(), vec![range1], BufferizeOpts::local());
 
-    let range2_end = UOp::const_(DType::Index, ConstValue::Int(20));
+    let range2_end = UOp::index_const(20);
     let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
     let outer = UOp::bufferize(inner, vec![range2.clone()], BufferizeOpts::local());
@@ -357,11 +358,11 @@ fn test_buffer_removal_no_match_expensive_compute() {
 
     // Test: BUFFERIZE(expensive_op) should NOT be removed
     // LOAD is typically considered expensive and should not be inlined
-    let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let load = UOp::new(Op::Load { buffer, index }, DType::Float32);
+    let buffer = UOp::buffer_id(Some(0));
+    let index = UOp::index_const(0);
+    let load = UOp::load(buffer, index);
 
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(load, vec![range], BufferizeOpts::local());
 
@@ -393,7 +394,7 @@ fn test_pattern_composition() {
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
     // First apply DETACH
-    let detach = UOp::new(Op::Detach { src: x.clone() }, x.dtype());
+    let detach = UOp::detach(x.clone());
 
     // Then apply early_rewrites to remove DETACH
     let early = patterns::early_rewrites();
@@ -407,7 +408,7 @@ fn test_pattern_composition() {
     };
 
     // Now wrap in BUFFERIZE
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(unwrapped, vec![range], BufferizeOpts::local());
 
@@ -430,7 +431,7 @@ fn test_idempotent_patterns() {
     // Test that applying patterns multiple times doesn't cause issues
 
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let detach = UOp::new(Op::Detach { src: x.clone() }, x.dtype());
+    let detach = UOp::detach(x.clone());
 
     let matcher = patterns::early_rewrites();
 

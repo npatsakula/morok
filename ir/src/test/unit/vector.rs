@@ -14,22 +14,22 @@ use crate::{ConstValue, UOp};
 
 #[test]
 fn test_vectorize_basic() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-    let d = UOp::const_(DType::Float32, ConstValue::Float(4.0));
-
-    let vec = UOp::vectorize(smallvec![a, b, c, d]);
     // Should be Float32 vector of size 4
-    assert_eq!(vec.dtype(), DType::Float32.vec(4));
+    assert_eq!(
+        UOp::vectorize(smallvec![
+            UOp::native_const(1.0f32),
+            UOp::native_const(2.0f32),
+            UOp::native_const(3.0f32),
+            UOp::native_const(4.0f32)
+        ])
+        .dtype(),
+        DType::Float32.vec(4)
+    );
 }
 
 #[test]
 fn test_vectorize_preserves_base_dtype() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(2));
-
-    let vec = UOp::vectorize(smallvec![a, b]);
+    let vec = UOp::vectorize(smallvec![UOp::native_const(1i32), UOp::native_const(2i32)]);
     assert_eq!(vec.dtype(), DType::Int32.vec(2));
 }
 
@@ -40,11 +40,12 @@ fn test_vectorize_preserves_base_dtype() {
 #[test]
 fn test_gep_basic() {
     // Create a vector
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-    let d = UOp::const_(DType::Float32, ConstValue::Float(4.0));
-    let vec = UOp::vectorize(smallvec![a, b, c, d]);
+    let vec = UOp::vectorize(smallvec![
+        UOp::native_const(1.0f32),
+        UOp::native_const(2.0f32),
+        UOp::native_const(3.0f32),
+        UOp::native_const(4.0f32)
+    ]);
 
     // GEP operation exists (actual behavior may vary based on implementation)
     let _elem = UOp::gep(vec, vec![0]);
@@ -54,10 +55,10 @@ fn test_gep_basic() {
 #[test]
 fn test_gep_multiple_indices() {
     let vec = UOp::vectorize(smallvec![
-        UOp::const_(DType::Int32, ConstValue::Int(10)),
-        UOp::const_(DType::Int32, ConstValue::Int(20)),
-        UOp::const_(DType::Int32, ConstValue::Int(30)),
-        UOp::const_(DType::Int32, ConstValue::Int(40)),
+        UOp::native_const(10i32),
+        UOp::native_const(20i32),
+        UOp::native_const(30i32),
+        UOp::native_const(40i32),
     ]);
 
     // Extract multiple elements -> keeps vector dtype (doesn't reduce count)
@@ -84,14 +85,8 @@ fn test_vconst_basic() {
 
 #[test]
 fn test_cat_basic() {
-    let a = UOp::vectorize(smallvec![
-        UOp::const_(DType::Float32, ConstValue::Float(1.0)),
-        UOp::const_(DType::Float32, ConstValue::Float(2.0)),
-    ]);
-    let b = UOp::vectorize(smallvec![
-        UOp::const_(DType::Float32, ConstValue::Float(3.0)),
-        UOp::const_(DType::Float32, ConstValue::Float(4.0)),
-    ]);
+    let a = UOp::vectorize(smallvec![UOp::native_const(1.0f32), UOp::native_const(2.0f32),]);
+    let b = UOp::vectorize(smallvec![UOp::native_const(3.0f32), UOp::native_const(4.0f32),]);
 
     let result = UOp::cat(vec![a, b]);
     // Cat concatenates vectors

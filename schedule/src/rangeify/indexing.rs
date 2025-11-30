@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, ConstValue, Op, SInt, UOp, UOpKey};
 
 use super::helpers;
@@ -36,7 +35,7 @@ impl IndexingContext {
     pub fn new_range(&mut self, size: &SInt, axistype: AxisType) -> Rc<UOp> {
         // Check if size is constant 1
         if let SInt::Const(1) = size {
-            return UOp::const_(DType::Index, ConstValue::Int(0));
+            return UOp::index_const(0);
         }
 
         // Create range with Unrenumbered axis_id
@@ -44,7 +43,7 @@ impl IndexingContext {
         self.range_idx += 1;
 
         let size_uop = match size {
-            SInt::Const(n) => UOp::const_(DType::Index, ConstValue::Int(*n as i64)),
+            SInt::Const(n) => UOp::index_const(*n as i64),
             SInt::Symbolic(uop) => Rc::clone(uop),
         };
 
@@ -224,7 +223,7 @@ fn merge_consumer_ranges(
                 merged_idx
             } else {
                 // Wrap index with merged validity: WHERE(merged_valid, merged_idx, INVALID)
-                UOp::where_op(merged_valid, merged_idx, UOp::invalid_marker())?
+                UOp::try_where(merged_valid, merged_idx, UOp::invalid_marker())?
             };
 
             out_rngs.push(merged_range);

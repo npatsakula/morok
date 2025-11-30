@@ -1,35 +1,39 @@
-//! Operation implementations for UOps.
+//! UOp constructor methods organized by semantic category.
 //!
-//! This module contains all operation constructors organized by category:
-//! - `arithmetic`: Basic arithmetic operations (add, sub, mul, div, rem)
-//! - `bitwise`: Bitwise and shift operations
-//! - `scalar`: Scalar convenience wrappers
-//! - `movement`: Tensor reshaping and movement operations
-//! - `reduction`: Reduction and aggregation operations
-//! - `control`: Control flow operations
-//! - `vector`: SIMD/vector operations
-//! - `advanced`: Specialized operations (wmma, contract, etc.)
+//! This module consolidates all UOp constructors into semantic groups:
+//!
+//! - [`data`] - Constants, buffers, device specifications
+//! - [`compute`] - Arithmetic, transcendental, bitwise, comparison operations
+//! - [`shape`] - Shape manipulation (reshape, permute, expand, pad, shrink, flip)
+//! - [`memory`] - Memory operations (load, store, index, copy, bufferize)
+//! - [`control`] - Control flow (range, if/end, barrier, var)
+//! - [`reduce`] - Reduction operations
+//! - [`hardware`] - Hardware-specific (WMMA, vectorize, kernel)
+//! - [`graph`] - Graph organization (sink, group, assign)
 
 use std::rc::Rc;
 
-use super::{DType, Op, Result, UOp};
+use smallvec::smallvec;
+
 use crate::error::Error;
+use crate::uop::UOp;
+use crate::{BinaryOp, DType, Op, Result};
 
 // Submodules
-pub mod advanced;
-pub mod arithmetic;
-pub mod bitwise;
+pub mod compute;
 pub mod control;
-pub mod movement;
-pub mod reduction;
-pub mod scalar;
-pub mod vector;
+pub mod data;
+pub mod graph;
+pub mod hardware;
+pub mod memory;
+pub mod reduce;
+pub mod shape;
 
 // =========================================================================
-// Common Helper Functions
+// Validation Helper Functions
 // =========================================================================
 //
-// These helpers are used across multiple operation categories and are kept
+// These helpers are used across multiple constructor categories and are kept
 // centralized to avoid duplication.
 
 impl UOp {
@@ -42,7 +46,7 @@ impl UOp {
     /// # Errors
     /// - Returns `VoidTypeInOp` if either operand has Void dtype
     /// - Returns `TypePromotionFailed` if no common type exists
-    pub(super) fn promote_and_cast(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<(Rc<Self>, Rc<Self>, DType)> {
+    pub(crate) fn promote_and_cast(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<(Rc<Self>, Rc<Self>, DType)> {
         let lhs_dtype = lhs.dtype();
         let rhs_dtype = rhs.dtype();
 
@@ -68,9 +72,9 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `InvalidDTypeForOp` if dtype is not int or bool
-    pub(super) fn check_bitwise_dtype(dtype: DType, operation: &'static str) -> Result<()> {
+    pub(crate) fn check_bitwise_dtype(dtype: DType, operation: BinaryOp) -> Result<()> {
         let is_valid = dtype.is_bool() || dtype.is_signed() || dtype.is_unsigned();
-        if !is_valid { Err(Error::InvalidDTypeForOp { operation, dtype }) } else { Ok(()) }
+        if !is_valid { Err(Error::InvalidDTypeForBinaryOp { operation, dtypes: smallvec![dtype] }) } else { Ok(()) }
     }
 
     /// Check for division by zero when divisor is a constant.
@@ -80,8 +84,8 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `DivisionByZero` if divisor is a constant zero
-    pub(super) fn check_division_by_zero(divisor: &Rc<Self>) -> Result<()> {
-        use super::ConstValue;
+    pub(crate) fn check_division_by_zero(divisor: &Rc<Self>) -> Result<()> {
+        use crate::ConstValue;
         use crate::error::DivisionByZeroSnafu;
         use snafu::ensure;
 
@@ -111,19 +115,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `BinaryShapeMismatch` if both operands have shapes and they differ
-    ///
-    /// # Examples
-    /// ```ignore
-    /// // Same shapes - OK
-    /// validate_binary_shapes(&tensor_3x4, &tensor_3x4, BinaryOp::Add)?;
-    ///
-    /// // Different shapes - ERROR
-    /// validate_binary_shapes(&tensor_3x4, &tensor_5x6, BinaryOp::Add)?;
-    ///
-    /// // Shapeless operands - OK (e.g., RANGE + RANGE)
-    /// validate_binary_shapes(&range_op, &const_op, BinaryOp::Add)?;
-    /// ```
-    pub(super) fn validate_binary_shapes(lhs: &Rc<Self>, rhs: &Rc<Self>, op: crate::BinaryOp) -> Result<()> {
+    pub(crate) fn validate_binary_shapes(lhs: &Rc<Self>, rhs: &Rc<Self>, op: crate::BinaryOp) -> Result<()> {
         use crate::error::BinaryShapeMismatchSnafu;
         use crate::shape::shapes_equal;
 
@@ -152,16 +144,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `TernaryBranchShapeMismatch` if both branches have shapes and they differ
-    ///
-    /// # Examples
-    /// ```ignore
-    /// // Same shapes - OK
-    /// validate_ternary_shapes(&tensor_3x4, &tensor_3x4)?;
-    ///
-    /// // Different shapes - ERROR
-    /// validate_ternary_shapes(&tensor_3x4, &tensor_5x6)?;
-    /// ```
-    pub(super) fn validate_ternary_shapes(true_val: &Rc<Self>, false_val: &Rc<Self>) -> Result<()> {
+    pub(crate) fn validate_ternary_shapes(true_val: &Rc<Self>, false_val: &Rc<Self>) -> Result<()> {
         use crate::error::TernaryBranchShapeMismatchSnafu;
         use crate::shape::shapes_equal;
 
@@ -191,7 +174,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `PermuteInvalidPermutation` if permutation is invalid
-    pub(super) fn validate_permutation(axes: &[usize], expected_dims: usize) -> Result<()> {
+    pub(crate) fn validate_permutation(axes: &[usize], expected_dims: usize) -> Result<()> {
         use crate::error::PermuteInvalidPermutationSnafu;
         use snafu::ensure;
 
@@ -240,7 +223,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `ReduceAxisInvalid` if any axis is out of bounds
-    pub(super) fn validate_reduce_axes(axes: &[usize], shape_dims: usize) -> Result<()> {
+    pub(crate) fn validate_reduce_axes(axes: &[usize], shape_dims: usize) -> Result<()> {
         use crate::error::ReduceAxisInvalidSnafu;
         use snafu::ensure;
 
@@ -257,7 +240,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `FlipInvalidSpec` if specification length doesn't match expected dimensions
-    pub(super) fn validate_flip_axes(axes: &[bool], expected_dims: usize) -> Result<()> {
+    pub(crate) fn validate_flip_axes(axes: &[bool], expected_dims: usize) -> Result<()> {
         use crate::error::FlipInvalidSpecSnafu;
         use snafu::ensure;
 

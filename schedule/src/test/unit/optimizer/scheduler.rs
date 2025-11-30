@@ -2,7 +2,6 @@
 
 use std::rc::Rc;
 
-use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp};
 
 use crate::optimizer::error::OptError;
@@ -10,7 +9,7 @@ use crate::optimizer::{OptOps, Renderer, Scheduler};
 
 #[test]
 fn test_scheduler_new() {
-    let ast = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let ast = UOp::native_const(1.0f32);
     let ren = Renderer::cpu();
     let scheduler = Scheduler::new(ast, ren);
 
@@ -22,10 +21,10 @@ fn test_scheduler_new() {
 #[test]
 fn test_scheduler_rngs_sorting() {
     // Create ranges with different types and IDs using range_axis
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_8 = UOp::const_(DType::Index, ConstValue::Int(8));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
-    let end_4 = UOp::const_(DType::Index, ConstValue::Int(4));
+    let end_16 = UOp::index_const(16);
+    let end_8 = UOp::index_const(8);
+    let end_32 = UOp::index_const(32);
+    let end_4 = UOp::index_const(4);
 
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
     let r_local = UOp::range_axis(end_8, AxisId::Renumbered(1), AxisType::Local);
@@ -33,7 +32,7 @@ fn test_scheduler_rngs_sorting() {
     let r_loop = UOp::range_axis(end_4, AxisId::Renumbered(3), AxisType::Loop);
 
     // Build a simple computation using all ranges
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global, r_local, r_reduce, r_loop]);
 
     let ren = Renderer::cpu();
@@ -60,11 +59,11 @@ fn test_scheduler_rngs_sorting() {
 #[test]
 fn test_scheduler_maxarg() {
     // Using range_const for convenience
-    let r1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(5), AxisType::Loop);
-    let r2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(20)), AxisId::Renumbered(2), AxisType::Global);
-    let r3 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(30)), AxisId::Renumbered(10), AxisType::Reduce);
+    let r1 = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(5), AxisType::Loop);
+    let r2 = UOp::range_axis(UOp::index_const(20), AxisId::Renumbered(2), AxisType::Global);
+    let r3 = UOp::range_axis(UOp::index_const(30), AxisId::Renumbered(10), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r1, r2, r3]);
 
     let ren = Renderer::cpu();
@@ -76,16 +75,16 @@ fn test_scheduler_maxarg() {
 #[test]
 fn test_scheduler_helper_properties() {
     // Create a reduction kernel: sum over axis
-    let end_8 = UOp::const_(DType::Index, ConstValue::Int(8));
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_8 = UOp::index_const(8);
+    let end_16 = UOp::index_const(16);
+    let end_32 = UOp::index_const(32);
 
     let r_global = UOp::range_axis(end_16.clone(), AxisId::Renumbered(0), AxisType::Global);
     let r_local = UOp::range_axis(end_8.clone(), AxisId::Renumbered(1), AxisType::Local);
     let r_reduce = UOp::range_axis(end_32.clone(), AxisId::Renumbered(2), AxisType::Reduce);
 
     // Create a simple reduction: value to reduce
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let value = UOp::native_const(1.0f32);
     let reduce_op = UOp::reduce(value.clone(), vec![r_reduce.clone()].into(), ReduceOp::Add);
 
     // Wrap in sink with all ranges
@@ -117,13 +116,13 @@ fn test_scheduler_helper_properties() {
 #[test]
 fn test_scheduler_upcast_size() {
     // Create kernel with UPCAST axes
-    let end_4 = UOp::const_(DType::Index, ConstValue::Int(4));
-    let end_8 = UOp::const_(DType::Index, ConstValue::Int(8));
+    let end_4 = UOp::index_const(4);
+    let end_8 = UOp::index_const(8);
 
     let r_upcast1 = UOp::range_axis(end_4, AxisId::Renumbered(0), AxisType::Upcast);
     let r_upcast2 = UOp::range_axis(end_8, AxisId::Renumbered(1), AxisType::Upcast);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_upcast1, r_upcast2]);
 
     let ren = Renderer::cpu();
@@ -136,13 +135,13 @@ fn test_scheduler_upcast_size() {
 #[test]
 fn test_scheduler_group_for_reduces() {
     // Create kernel with GROUP_REDUCE axes
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_16 = UOp::index_const(16);
+    let end_32 = UOp::index_const(32);
 
     let r_group = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::GroupReduce);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_group, r_reduce]);
 
     let ren = Renderer::cpu();
@@ -155,15 +154,15 @@ fn test_scheduler_group_for_reduces() {
 #[test]
 fn test_scheduler_axes_of() {
     // Create kernel with mixed axis types
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_8 = UOp::const_(DType::Index, ConstValue::Int(8));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_16 = UOp::index_const(16);
+    let end_8 = UOp::index_const(8);
+    let end_32 = UOp::index_const(32);
 
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
     let r_local = UOp::range_axis(end_8, AxisId::Renumbered(1), AxisType::Local);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(2), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global, r_local, r_reduce]);
 
     let ren = Renderer::cpu();
@@ -192,16 +191,16 @@ fn test_scheduler_axes_of() {
 #[test]
 fn test_scheduler_upcastable_dims() {
     // Create kernel with various axis types
-    let end_1 = UOp::const_(DType::Index, ConstValue::Int(1));
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_1 = UOp::index_const(1);
+    let end_16 = UOp::index_const(16);
+    let end_32 = UOp::index_const(32);
 
     let r_global = UOp::range_axis(end_16.clone(), AxisId::Renumbered(0), AxisType::Global);
     let r_loop = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Loop);
     let r_reduce = UOp::range_axis(end_16.clone(), AxisId::Renumbered(2), AxisType::Reduce);
     let r_size1 = UOp::range_axis(end_1, AxisId::Renumbered(3), AxisType::Global); // Size 1, not upcastable
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global, r_loop, r_reduce, r_size1]);
 
     let ren = Renderer::cpu();
@@ -217,9 +216,9 @@ fn test_scheduler_upcastable_dims() {
 #[test]
 fn test_scheduler_unrollable_dims() {
     // Create kernel with reduction axes
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
-    let end_1 = UOp::const_(DType::Index, ConstValue::Int(1));
+    let end_16 = UOp::index_const(16);
+    let end_32 = UOp::index_const(32);
+    let end_1 = UOp::index_const(1);
 
     let r_global = UOp::range_axis(end_16.clone(), AxisId::Renumbered(0), AxisType::Global);
     let r_reduce1 = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Reduce);
@@ -227,7 +226,7 @@ fn test_scheduler_unrollable_dims() {
     let r_reduce_size1 = UOp::range_axis(end_1, AxisId::Renumbered(3), AxisType::Reduce); // Size 1, not unrollable
 
     // Create reduction
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let value = UOp::native_const(1.0f32);
     let reduce_op = UOp::reduce(value, vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_global, r_reduce1, r_reduce2, r_reduce_size1]);
@@ -245,15 +244,15 @@ fn test_scheduler_unrollable_dims() {
 #[test]
 fn test_scheduler_real_axis() {
     // Create complex kernel
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_16 = UOp::index_const(16);
+    let end_32 = UOp::index_const(32);
 
     let r_global = UOp::range_axis(end_16.clone(), AxisId::Renumbered(0), AxisType::Global);
     let r_loop = UOp::range_axis(end_16.clone(), AxisId::Renumbered(1), AxisType::Loop);
     let r_reduce1 = UOp::range_axis(end_32.clone(), AxisId::Renumbered(2), AxisType::Reduce);
     let r_reduce2 = UOp::range_axis(end_16, AxisId::Renumbered(3), AxisType::Reduce);
 
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let value = UOp::native_const(1.0f32);
     let reduce_op = UOp::reduce(value, vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_global, r_loop, r_reduce1, r_reduce2]);
@@ -288,17 +287,17 @@ fn test_scheduler_real_axis() {
 #[test]
 fn test_scheduler_colored_shape() {
     // Create a typical reduction kernel: g16l8R32u4
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_8 = UOp::const_(DType::Index, ConstValue::Int(8));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
-    let end_4 = UOp::const_(DType::Index, ConstValue::Int(4));
+    let end_16 = UOp::index_const(16);
+    let end_8 = UOp::index_const(8);
+    let end_32 = UOp::index_const(32);
+    let end_4 = UOp::index_const(4);
 
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
     let r_local = UOp::range_axis(end_8, AxisId::Renumbered(1), AxisType::Local);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(2), AxisType::Reduce);
     let r_upcast = UOp::range_axis(end_4, AxisId::Renumbered(3), AxisType::Upcast);
 
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let value = UOp::native_const(1.0f32);
     let reduce_op = UOp::reduce(value, vec![r_reduce.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_global, r_local, r_reduce, r_upcast]);
@@ -326,12 +325,12 @@ fn test_scheduler_colored_shape() {
 #[test]
 fn test_scheduler_display_elementwise() {
     // Create an elementwise kernel: E_g256g256
-    let end_256 = UOp::const_(DType::Index, ConstValue::Int(256));
+    let end_256 = UOp::index_const(256);
 
     let r_global1 = UOp::range_axis(end_256.clone(), AxisId::Renumbered(0), AxisType::Global);
     let r_global2 = UOp::range_axis(end_256, AxisId::Renumbered(1), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global1, r_global2]);
 
     let ren = Renderer::cpu();
@@ -348,11 +347,11 @@ fn test_scheduler_display_elementwise() {
 #[test]
 fn test_scheduler_display_complex() {
     // Create complex kernel with multiple axis types
-    let end_2 = UOp::const_(DType::Index, ConstValue::Int(2));
-    let end_4 = UOp::const_(DType::Index, ConstValue::Int(4));
-    let end_8 = UOp::const_(DType::Index, ConstValue::Int(8));
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_2 = UOp::index_const(2);
+    let end_4 = UOp::index_const(4);
+    let end_8 = UOp::index_const(8);
+    let end_16 = UOp::index_const(16);
+    let end_32 = UOp::index_const(32);
 
     let r_loop = UOp::range_axis(end_2, AxisId::Renumbered(0), AxisType::Loop);
     let r_global = UOp::range_axis(end_32.clone(), AxisId::Renumbered(1), AxisType::Global);
@@ -361,7 +360,7 @@ fn test_scheduler_display_complex() {
     let r_upcast = UOp::range_axis(end_4, AxisId::Renumbered(4), AxisType::Upcast);
     let r_unroll = UOp::range_axis(end_8, AxisId::Renumbered(5), AxisType::Unroll);
 
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let value = UOp::native_const(1.0f32);
     let reduce_op = UOp::reduce(value, vec![r_reduce.clone(), r_unroll.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_loop, r_global, r_local, r_reduce, r_upcast, r_unroll]);
@@ -384,11 +383,11 @@ fn test_scheduler_display_complex() {
 #[test]
 fn test_shift_to_basic_split() {
     // Create a simple kernel with a single Global(16) range
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
+    let end_16 = UOp::index_const(16);
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
 
     // Use the range in a simple computation
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global.clone()]);
 
     let ren = Renderer::cpu();
@@ -444,10 +443,10 @@ fn test_shift_to_basic_split() {
 #[test]
 fn test_shift_to_top_order() {
     // Create a kernel with Global(16)
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
+    let end_16 = UOp::index_const(16);
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global.clone()]);
 
     let ren = Renderer::cpu();
@@ -489,10 +488,10 @@ fn test_shift_to_top_order() {
 #[test]
 fn test_shift_to_division_error() {
     // Create a kernel with Global(15)
-    let end_15 = UOp::const_(DType::Index, ConstValue::Int(15));
+    let end_15 = UOp::index_const(15);
     let r_global = UOp::range_axis(end_15, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global.clone()]);
 
     let ren = Renderer::cpu();
@@ -511,12 +510,12 @@ fn test_shift_to_division_error() {
 #[test]
 fn test_shift_to_substitution_in_ast() {
     // Create a kernel that actually uses the range value in a computation
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
+    let end_16 = UOp::index_const(16);
     let r_global = UOp::range_axis(end_16.clone(), AxisId::Renumbered(0), AxisType::Global);
 
     // Create a computation that uses the range: r_global * 2
-    let two = UOp::const_(DType::Index, ConstValue::Int(2));
-    let compute = r_global.try_mul_op(&two).unwrap();
+    let two = UOp::index_const(2);
+    let compute = r_global.try_mul(&two).unwrap();
 
     let sink = UOp::sink(vec![compute.clone(), r_global.clone()]);
 
@@ -557,10 +556,10 @@ fn test_shift_to_substitution_in_ast() {
 #[test]
 fn test_shift_to_cache_invalidation() {
     // Create a kernel with a single range
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
+    let end_16 = UOp::index_const(16);
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global.clone()]);
 
     let ren = Renderer::cpu();
@@ -589,14 +588,14 @@ fn test_shift_to_cache_invalidation() {
 #[test]
 fn test_shift_to_with_custom_range() {
     // Test providing a custom new_rng (input_new_rng parameter)
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
+    let end_16 = UOp::index_const(16);
     let r_global = UOp::range_axis(end_16.clone(), AxisId::Renumbered(0), AxisType::Global);
 
     // Create a custom range with specific axis_id
-    let end_4 = UOp::const_(DType::Index, ConstValue::Int(4));
+    let end_4 = UOp::index_const(4);
     let custom_rng = UOp::range_axis(end_4, AxisId::Renumbered(99), AxisType::Upcast);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global.clone()]);
 
     let ren = Renderer::cpu();
@@ -619,10 +618,10 @@ fn test_shift_to_with_custom_range() {
 #[test]
 fn test_shift_to_multiple_splits() {
     // Test multiple consecutive splits
-    let end_64 = UOp::const_(DType::Index, ConstValue::Int(64));
+    let end_64 = UOp::index_const(64);
     let r_global = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global.clone()]);
 
     let ren = Renderer::cpu();
@@ -666,10 +665,10 @@ fn get_axis_type(uop: &UOp) -> AxisType {
 #[test]
 fn test_upcast_basic() {
     // Create a kernel with Global(16)
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
+    let end_16 = UOp::index_const(16);
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global]);
 
     let ren = Renderer::cpu();
@@ -695,10 +694,10 @@ fn test_upcast_basic() {
 #[test]
 fn test_upcast_invalid_axis_type() {
     // Create a kernel with Reduce axis (cannot upcast reduce axes)
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_32 = UOp::index_const(32);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
@@ -718,10 +717,10 @@ fn test_upcast_invalid_axis_type() {
 #[test]
 fn test_upcast_device_limit() {
     // Create a kernel with Global(256)
-    let end_256 = UOp::const_(DType::Index, ConstValue::Int(256));
+    let end_256 = UOp::index_const(256);
     let r_global = UOp::range_axis(end_256, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global]);
 
     let ren = Renderer::cpu();
@@ -740,10 +739,10 @@ fn test_upcast_device_limit() {
 #[test]
 fn test_local_basic() {
     // Create a kernel with Global(64) and a backend that supports local memory
-    let end_64 = UOp::const_(DType::Index, ConstValue::Int(64));
+    let end_64 = UOp::index_const(64);
     let r_global = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global]);
 
     let ren = Renderer::cuda(); // CUDA has local memory support
@@ -768,10 +767,10 @@ fn test_local_basic() {
 #[test]
 fn test_local_no_backend_support() {
     // Create a kernel with CPU backend (no local memory)
-    let end_64 = UOp::const_(DType::Index, ConstValue::Int(64));
+    let end_64 = UOp::index_const(64);
     let r_global = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global]);
 
     let ren = Renderer::cpu();
@@ -790,10 +789,10 @@ fn test_local_no_backend_support() {
 #[test]
 fn test_local_invalid_axis_type() {
     // Create a kernel with Reduce axis
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_32 = UOp::index_const(32);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
@@ -813,10 +812,10 @@ fn test_local_invalid_axis_type() {
 #[test]
 fn test_unroll_basic() {
     // Create a kernel with a reduction
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_32 = UOp::index_const(32);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
@@ -846,10 +845,10 @@ fn test_unroll_basic() {
 #[test]
 fn test_unroll_axis_out_of_bounds() {
     // Create a kernel with a single reduction
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_32 = UOp::index_const(32);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
@@ -869,10 +868,10 @@ fn test_unroll_axis_out_of_bounds() {
 #[test]
 fn test_unroll_excessive_amount() {
     // Create a kernel with a large reduction
-    let end_128 = UOp::const_(DType::Index, ConstValue::Int(128));
+    let end_128 = UOp::index_const(128);
     let r_reduce = UOp::range_axis(end_128, AxisId::Renumbered(0), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
@@ -892,13 +891,13 @@ fn test_unroll_excessive_amount() {
 #[test]
 fn test_apply_opt_multiple_operations() {
     // Create a complex kernel with Global and Reduce axes
-    let end_64 = UOp::const_(DType::Index, ConstValue::Int(64));
+    let end_64 = UOp::index_const(64);
     let r_global = UOp::range_axis(end_64.clone(), AxisId::Renumbered(0), AxisType::Global);
 
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_32 = UOp::index_const(32);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(compute, vec![r_global, r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
@@ -924,10 +923,10 @@ fn test_apply_opt_multiple_operations() {
 #[test]
 fn test_apply_opt_invalid_arg_type() {
     // Test that OptArg type validation works
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
+    let end_16 = UOp::index_const(16);
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global]);
 
     let ren = Renderer::cpu();
@@ -951,10 +950,10 @@ fn test_apply_opt_invalid_arg_type() {
 #[test]
 fn test_nolocals_basic() {
     // Create a simple kernel without any local axes
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
+    let end_16 = UOp::index_const(16);
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global]);
 
     let ren = Renderer::cuda();
@@ -980,10 +979,10 @@ fn test_nolocals_basic() {
 #[test]
 fn test_nolocals_with_existing_local() {
     // Create a kernel with a Local axis
-    let end_64 = UOp::const_(DType::Index, ConstValue::Int(64));
+    let end_64 = UOp::index_const(64);
     let r_global = UOp::range_axis(end_64.clone(), AxisId::Renumbered(0), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global]);
 
     let ren = Renderer::cuda();
@@ -1005,12 +1004,12 @@ fn test_nolocals_with_existing_local() {
 #[test]
 fn test_swap_basic() {
     // Create a kernel with two Global axes
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_16 = UOp::index_const(16);
+    let end_32 = UOp::index_const(32);
     let r_global1 = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
     let r_global2 = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global1, r_global2]);
 
     let ren = Renderer::cpu();
@@ -1048,12 +1047,12 @@ fn test_swap_basic() {
 #[test]
 fn test_swap_invalid_axis() {
     // Create a kernel with two Global axes
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_16 = UOp::index_const(16);
+    let end_32 = UOp::index_const(32);
     let r_global1 = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
     let r_global2 = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Global);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_global1, r_global2]);
 
     let ren = Renderer::cpu();
@@ -1071,12 +1070,12 @@ fn test_swap_invalid_axis() {
 #[test]
 fn test_swap_non_global_axis() {
     // Create a kernel with a Global and a Reduce axis
-    let end_16 = UOp::const_(DType::Index, ConstValue::Int(16));
-    let end_32 = UOp::const_(DType::Index, ConstValue::Int(32));
+    let end_16 = UOp::index_const(16);
+    let end_32 = UOp::index_const(32);
     let r_global = UOp::range_axis(end_16, AxisId::Renumbered(0), AxisType::Global);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(compute, vec![r_global.clone(), r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
@@ -1095,10 +1094,10 @@ fn test_swap_non_global_axis() {
 #[test]
 fn test_group_basic() {
     // Create a reduction kernel for GPU
-    let end_64 = UOp::const_(DType::Index, ConstValue::Int(64));
+    let end_64 = UOp::index_const(64);
     let r_reduce = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
@@ -1122,10 +1121,10 @@ fn test_group_basic() {
 #[test]
 fn test_group_no_shared_memory() {
     // Create a reduction kernel for CPU (no shared memory)
-    let end_64 = UOp::const_(DType::Index, ConstValue::Int(64));
+    let end_64 = UOp::index_const(64);
     let r_reduce = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Reduce);
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
@@ -1146,10 +1145,10 @@ fn test_group_no_shared_memory() {
 #[test]
 fn test_convert_loop_to_global_gpu() {
     // Create a simple kernel with LOOP axes
-    let loop1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Loop);
-    let loop2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(1), AxisType::Loop);
+    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Loop);
+    let loop2 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Loop);
 
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val, loop1.clone(), loop2.clone()]);
 
     let ren = Renderer::cuda();
@@ -1174,8 +1173,8 @@ fn test_convert_loop_to_global_gpu() {
 #[test]
 fn test_convert_loop_to_global_cpu() {
     // Create a simple kernel with LOOP axes
-    let loop1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Loop);
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Loop);
+    let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val, loop1.clone()]);
 
     let ren = Renderer::cpu();
@@ -1196,16 +1195,12 @@ fn test_convert_loop_to_global_cpu() {
 #[test]
 fn test_get_optimized_ast_reduce_kernel() {
     // Create a reduction kernel
-    let r_global =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Global);
-    let r_local =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(8)), AxisId::Renumbered(1), AxisType::Local);
-    let r_reduce =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(32)), AxisId::Renumbered(2), AxisType::Reduce);
-    let r_upcast =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(4)), AxisId::Renumbered(3), AxisType::Upcast);
+    let r_global = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Global);
+    let r_local = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), AxisType::Local);
+    let r_reduce = UOp::range_axis(UOp::index_const(32), AxisId::Renumbered(2), AxisType::Reduce);
+    let r_upcast = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(3), AxisType::Upcast);
 
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let val = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(val, vec![r_reduce.clone()].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, r_global, r_local, r_upcast]);
 
@@ -1232,10 +1227,9 @@ fn test_get_optimized_ast_reduce_kernel() {
 #[test]
 fn test_get_optimized_ast_elementwise_kernel() {
     // Create an elementwise kernel (no reduction)
-    let r_global =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(256)), AxisId::Renumbered(0), AxisType::Global);
+    let r_global = UOp::range_axis(UOp::index_const(256), AxisId::Renumbered(0), AxisType::Global);
 
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val, r_global]);
 
     let ren = Renderer::cuda();
@@ -1257,9 +1251,8 @@ fn test_get_optimized_ast_elementwise_kernel() {
 
 #[test]
 fn test_get_optimized_ast_custom_name() {
-    let r_global =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Global);
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let r_global = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Global);
+    let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val, r_global]);
 
     let ren = Renderer::cuda();
@@ -1280,10 +1273,10 @@ fn test_get_optimized_ast_custom_name() {
 #[test]
 fn test_phase7_integration() {
     // Full Phase 7 integration test: LOOP → GLOBAL → optimize → finalize
-    let loop1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Loop);
-    let loop2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(1), AxisType::Loop);
+    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Loop);
+    let loop2 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Loop);
 
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val, loop1, loop2]);
 
     let ren = Renderer::cuda();
@@ -1317,9 +1310,8 @@ fn test_kernel_name_deduplication() {
     clear_kernel_name_counts();
 
     // Create two identical kernel shapes
-    let r_global =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Global);
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let r_global = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Global);
+    let val = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![val, r_global]);
 
     let ren = Renderer::cuda();
@@ -1358,10 +1350,10 @@ fn test_kernel_name_deduplication() {
 #[test]
 fn test_globalizable_rngs_with_sink() {
     // Test that SINK operations are properly handled in globalizable_rngs
-    let loop1 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(0), AxisType::Loop);
-    let loop2 = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), AxisId::Renumbered(1), AxisType::Loop);
+    let loop1 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Loop);
+    let loop2 = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Loop);
 
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let val = UOp::native_const(1.0f32);
     // Use SINK operation
     let sink = UOp::sink(vec![val, loop1.clone(), loop2.clone()]);
 
@@ -1385,15 +1377,14 @@ fn test_globalizable_rngs_with_sink() {
 #[test]
 fn test_flatten_ranges_store() {
     // Test that STORE operations with nested REDUCE are properly flattened
-    let r_reduce =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(32)), AxisId::Renumbered(0), AxisType::Reduce);
+    let r_reduce = UOp::range_axis(UOp::index_const(32), AxisId::Renumbered(0), AxisType::Reduce);
 
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let val = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(val.clone(), vec![r_reduce].into(), ReduceOp::Add);
 
     // Create a STORE operation with the reduce as its value
-    let buffer = UOp::const_(DType::Index, ConstValue::Int(0)); // Dummy buffer
-    let index = UOp::const_(DType::Index, ConstValue::Int(0)); // Dummy index
+    let buffer = UOp::index_const(0); // Dummy buffer
+    let index = UOp::index_const(0); // Dummy index
     let store = UOp::store(buffer, index, reduce);
 
     let ren = Renderer::cuda();

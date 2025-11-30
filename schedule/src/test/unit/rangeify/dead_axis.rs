@@ -87,8 +87,8 @@ fn test_index_after_dead_axis_removal() {
     let bufferized = UOp::bufferize_global(x.clone(), vec![live_range.clone(), dead_range.clone()]);
 
     // Create INDEX with indices matching the buffer structure
-    let idx1 = UOp::const_(DType::Index, ConstValue::Int(5));
-    let idx2 = UOp::const_(DType::Index, ConstValue::Int(0));
+    let idx1 = UOp::index_const(5);
+    let idx2 = UOp::index_const(0);
 
     let indexed = UOp::index(bufferized, vec![idx1.clone(), idx2]).expect("Failed to create INDEX");
 

@@ -2,7 +2,7 @@ use morok_dtype::DType;
 use smallvec::SmallVec;
 use snafu::Snafu;
 
-use crate::shape::Shape;
+use crate::{BinaryOp, UnaryOp, shape::Shape};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -18,8 +18,12 @@ pub enum Error {
     TypePromotionFailed { lhs: DType, rhs: DType },
 
     /// Invalid dtype for operation (e.g., bitwise on float).
-    #[snafu(display("invalid dtype for operation: {operation:?} requires int or bool dtype, got {dtype:?}"))]
-    InvalidDTypeForOp { operation: &'static str, dtype: DType },
+    #[snafu(display("invalid dtype for operation: operation {operation:?}; dtype {dtype:?}"))]
+    InvalidDTypeForUnaryOp { operation: UnaryOp, dtype: DType },
+
+    /// Invalid dtype for operation (e.g., bitwise on float).
+    #[snafu(display("invalid dtype for operation: operation {operation:?}; dtypes {dtypes:?}"))]
+    InvalidDTypeForBinaryOp { operation: BinaryOp, dtypes: SmallVec<[DType; 2]> },
 
     /// Void dtype cannot be used in operations.
     #[snafu(display("void dtype cannot be used in operations"))]

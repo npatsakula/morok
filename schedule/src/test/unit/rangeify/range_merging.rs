@@ -66,10 +66,10 @@ fn test_get_idx_with_validity() {
     // Ranges with WHERE wrapper should extract the index
     let mut ctx = IndexingContext::new();
     let idx = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let valid = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let valid = UOp::native_const(true);
     let invalid = UOp::invalid_marker();
 
-    let wrapped = UOp::where_op(valid, idx.clone(), invalid).unwrap();
+    let wrapped = UOp::try_where(valid, idx.clone(), invalid).unwrap();
 
     let extracted_idx = wrapped.get_idx();
     assert!(Rc::ptr_eq(&extracted_idx, &idx));
@@ -82,11 +82,11 @@ fn test_get_valid_with_validity() {
     let idx = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create validity condition: i < 5
-    let five = UOp::const_(DType::Index, ConstValue::Int(5));
+    let five = UOp::index_const(5);
     let valid = idx.try_cmplt(&five).unwrap();
     let invalid = UOp::invalid_marker();
 
-    let wrapped = UOp::where_op(valid.clone(), idx.clone(), invalid).unwrap();
+    let wrapped = UOp::try_where(valid.clone(), idx.clone(), invalid).unwrap();
 
     let extracted_valid = wrapped.get_valid();
     assert!(Rc::ptr_eq(&extracted_valid, &valid));
@@ -131,11 +131,11 @@ fn test_invalid_marker_detection() {
 #[test]
 fn test_padding_uses_invalid_marker() {
     // Test that padding logic creates WHERE with Invalid marker
-    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
-    let valid = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let idx = UOp::index_const(0);
+    let valid = UOp::native_const(true);
     let invalid = UOp::invalid_marker();
 
-    let padded = UOp::where_op(valid, idx, invalid).unwrap();
+    let padded = UOp::try_where(valid, idx, invalid).unwrap();
 
     // Verify structure: WHERE(valid, idx, Invalid)
     if let Op::Ternary(TernaryOp::Where, _cond, _true_val, false_val) = padded.op() {
@@ -152,8 +152,8 @@ fn test_or_merging_of_validity_masks() {
     let idx = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create two different validity conditions
-    let five = UOp::const_(DType::Index, ConstValue::Int(5));
-    let eight = UOp::const_(DType::Index, ConstValue::Int(8));
+    let five = UOp::index_const(5);
+    let eight = UOp::index_const(8);
 
     let valid1 = idx.try_cmplt(&five).unwrap(); // i < 5
     let valid2 = idx.try_cmplt(&eight).unwrap(); // i < 8

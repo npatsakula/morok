@@ -8,9 +8,9 @@
 //! - [`types`] - Fundamental type definitions (ConstValue, operation types, etc.)
 //! - [`op`] - Operation enum defining all IR operations
 //! - [`uop`] - UOp (micro-operation) struct and implementation
+//! - [`uop::constructors`] - UOp constructor methods by semantic category
 //! - [`indexing`] - Multi-dimensional indexing support
 //! - [`error`] - Error types and result handling
-//! - [`ops`] - Operation implementations (arithmetic, bitwise, etc.)
 //! - [`shape`] - Shape inference utilities
 //! - [`sint`] - Symbolic integers
 
@@ -19,7 +19,7 @@ pub mod error;
 pub mod indexing;
 pub mod kernel_info;
 pub mod op;
-pub mod ops;
+pub mod prelude;
 pub mod shape;
 pub mod sint;
 pub mod types;

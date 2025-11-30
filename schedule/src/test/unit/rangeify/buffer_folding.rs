@@ -1,13 +1,13 @@
-use std::rc::Rc;
+use std::{f32::consts::PI, rc::Rc};
 
 use crate::rangeify::patterns::buffer_folding;
 use crate::rewrite::graph_rewrite;
 use morok_dtype::DType;
-use morok_ir::{ConstValue, Op, UOp};
+use morok_ir::{ConstValue, UOp};
 
 // Helper functions for creating test UOps
 fn create_const(val: i64) -> Rc<UOp> {
-    UOp::const_(DType::Int32, ConstValue::Int(val))
+    UOp::native_const(val as i32)
 }
 
 fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
@@ -94,7 +94,7 @@ fn test_bufferize_different_const_types() {
     // Test with different constant types
     let test_cases = vec![
         (DType::Int32, ConstValue::Int(100)),
-        (DType::Float32, ConstValue::Float(std::f64::consts::PI)),
+        (DType::Float32, ConstValue::Float(PI.into())),
         (DType::Bool, ConstValue::Bool(true)),
     ];
 
@@ -131,7 +131,7 @@ fn test_index_const_folding() {
 #[test]
 fn test_index_const_multiple_indices() {
     // INDEX(CONST, [R1, R2, R3]) → CONST
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(2.5));
+    let const_val = UOp::native_const(2.5f32);
     let ranges = vec![create_range(10, 0), create_range(20, 1), create_range(30, 2)];
 
     let indexed = UOp::index(const_val.clone(), ranges).expect("Failed to create INDEX");
@@ -150,7 +150,7 @@ fn test_copy_const_folding() {
     let const_val = create_const(99);
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
 
-    let copy = UOp::new(Op::Copy { src: const_val.clone(), device }, DType::Int32);
+    let copy = UOp::copy(const_val.clone(), device);
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, copy, &mut ());
@@ -162,13 +162,13 @@ fn test_copy_const_folding() {
 #[test]
 fn test_copy_const_different_devices() {
     // Test copying constants to different devices - all should fold
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.5));
+    let const_val = UOp::native_const(1.5f32);
 
     let devices = vec![morok_device::DeviceSpec::Cpu, morok_device::DeviceSpec::Cuda { device_id: 0 }];
 
     for device_spec in devices {
         let device = UOp::device(device_spec);
-        let copy = UOp::new(Op::Copy { src: const_val.clone(), device }, DType::Float32);
+        let copy = UOp::copy(const_val.clone(), device);
 
         let matcher = buffer_folding();
         let result = graph_rewrite(&matcher, copy, &mut ());
@@ -198,10 +198,11 @@ fn test_nested_constant_folding() {
 #[test]
 fn test_noop_fold_non_const_operations() {
     // INDEX(BUFFERIZE(x, R), R) should fold to x even for non-constant operations
-    let x = UOp::define_global(1, DType::Float32);
-    let y = UOp::define_global(2, DType::Float32);
+    // Use symbolic variables instead of define_global (which requires pointer dtype)
+    let x = UOp::var("x", DType::Float32, 0, 100);
+    let y = UOp::var("y", DType::Float32, 0, 100);
 
-    let add = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, x, y), DType::Float32);
+    let add = x.try_add(&y).unwrap();
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(add.clone(), vec![range.clone()]);

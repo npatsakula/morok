@@ -6,7 +6,7 @@
 //! 3. REDUCE with all dead ranges → identity element
 
 use morok_dtype::DType;
-use morok_ir::types::{BinaryOp, ConstValue, ReduceOp};
+use morok_ir::types::{ConstValue, ReduceOp};
 use morok_ir::{Op, UOp};
 use smallvec::smallvec;
 use std::rc::Rc;
@@ -26,7 +26,7 @@ use super::helpers::{assert_const_value, assert_end_range_count, assert_end_unwr
 #[test]
 fn test_range_zero_to_const() {
     // RANGE(0) → Const(0)
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let zero = UOp::native_const(0i32);
     let range = UOp::range(zero, 0);
 
     let matcher = get_matcher();
@@ -38,7 +38,7 @@ fn test_range_zero_to_const() {
 #[test]
 fn test_range_negative_to_const() {
     // RANGE(-5) → Const(0)
-    let neg_five = UOp::const_(DType::Int32, ConstValue::Int(-5));
+    let neg_five = UOp::native_const(-5i32);
     let range = UOp::range(neg_five, 0);
 
     let matcher = get_matcher();
@@ -146,8 +146,8 @@ fn test_range_symbolic_dead() {
     // size ∈ [0,5], RANGE(size - 10) → Const(0)
     // vmax(size - 10) = 5 - 10 = -5 ≤ 0, so dead
     let size = UOp::var("size", DType::Int32, 0, 5);
-    let ten = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let count = UOp::new(Op::Binary(BinaryOp::Sub, size, ten), DType::Int32);
+    let ten = UOp::native_const(10i32);
+    let count = size.try_sub(&ten).expect("SUB should succeed");
     let range = UOp::range(count, 0);
 
     let matcher = get_matcher();
@@ -160,9 +160,9 @@ fn test_range_symbolic_dead() {
 fn test_range_boundary_vmax_zero() {
     // max(-10, 0) = 0, so RANGE has vmax = 0 (boundary)
     // RANGE(max(-10, 0)) → Const(0)
-    let neg_ten = UOp::const_(DType::Int32, ConstValue::Int(-10));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let max_val = UOp::new(Op::Binary(BinaryOp::Max, neg_ten, zero), DType::Int32);
+    let neg_ten = UOp::native_const(-10i32);
+    let zero = UOp::native_const(0i32);
+    let max_val = neg_ten.try_max(&zero).unwrap();
     let range = UOp::range(max_val, 0);
 
     let matcher = get_matcher();

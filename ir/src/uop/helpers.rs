@@ -96,14 +96,8 @@ impl UOp {
                         && let ConstValue::Int(mult) = const_cv.0
                         && mult % divisor == 0
                     {
-                        return Some(Self::new(
-                            Op::Binary(
-                                BinaryOp::Mul,
-                                a.clone(),
-                                Self::const_(b.dtype(), ConstValue::Int(mult / divisor)),
-                            ),
-                            self.dtype(),
-                        ));
+                        let new_const = Self::const_(b.dtype(), ConstValue::Int(mult / divisor));
+                        return Some(a.try_mul(&new_const).expect("divides: mul should succeed with same dtype"));
                     }
 
                     // Check left operand for constant (multiplication is commutative)
@@ -111,14 +105,8 @@ impl UOp {
                         && let ConstValue::Int(mult) = const_cv.0
                         && mult % divisor == 0
                     {
-                        return Some(Self::new(
-                            Op::Binary(
-                                BinaryOp::Mul,
-                                Self::const_(a.dtype(), ConstValue::Int(mult / divisor)),
-                                b.clone(),
-                            ),
-                            self.dtype(),
-                        ));
+                        let new_const = Self::const_(a.dtype(), ConstValue::Int(mult / divisor));
+                        return Some(new_const.try_mul(b).expect("divides: mul should succeed with same dtype"));
                     }
                 }
             }
@@ -282,7 +270,7 @@ impl UOp {
     /// # Examples
     ///
     /// ```ignore
-    /// let loop_range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(16)), 0, AxisType::Loop);
+    /// let loop_range = UOp::range_axis(UOp::index_const(16), 0, AxisType::Loop);
     /// let global_range = loop_range.with_axis_type(AxisType::Global);
     /// // global_range has same size and axis_id, but different axis type
     /// ```
@@ -377,7 +365,7 @@ impl UOp {
     /// let invalid = UOp::invalid_marker();
     /// assert!(UOp::is_invalid_marker(&invalid));
     ///
-    /// let valid_idx = UOp::const_(DType::Index, ConstValue::Int(5));
+    /// let valid_idx = UOp::index_const(5);
     /// assert!(!UOp::is_invalid_marker(&valid_idx));
     /// ```
     fn is_invalid_marker(uop: &Rc<Self>) -> bool {
@@ -454,9 +442,9 @@ mod tests {
 
     #[test]
     fn test_const_factor_multiplication() {
-        let x = UOp::define_global(1, DType::Int32);
+        let x = UOp::var("x", DType::Int32, 0, 100);
         let c = UOp::const_(DType::Int32, ConstValue::Int(6));
-        let mul = UOp::new(Op::Binary(BinaryOp::Mul, x, c), DType::Int32);
+        let mul = x.try_mul(&c).unwrap();
         assert_eq!(mul.const_factor(), 6);
     }
 
@@ -464,7 +452,7 @@ mod tests {
     fn test_const_factor_addition() {
         let c1 = UOp::const_(DType::Int32, ConstValue::Int(6));
         let c2 = UOp::const_(DType::Int32, ConstValue::Int(9));
-        let add = UOp::new(Op::Binary(BinaryOp::Add, c1, c2), DType::Int32);
+        let add = c1.try_add(&c2).unwrap();
         assert_eq!(add.const_factor(), 3); // GCD(6, 9) = 3
     }
 
@@ -495,9 +483,9 @@ mod tests {
 
     #[test]
     fn test_pop_const_with_constant() {
-        let x = UOp::define_global(1, DType::Int32);
+        let x = UOp::var("x", DType::Int32, 0, 100);
         let c = UOp::const_(DType::Int32, ConstValue::Int(5));
-        let add = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), c), DType::Int32);
+        let add = x.try_add(&c).unwrap();
 
         let (rest, const_val) = add.pop_const(BinaryOp::Add);
 
@@ -507,9 +495,9 @@ mod tests {
 
     #[test]
     fn test_pop_const_without_constant() {
-        let x = UOp::define_global(1, DType::Int32);
-        let y = UOp::define_global(2, DType::Int32);
-        let add = UOp::new(Op::Binary(BinaryOp::Add, x, y), DType::Int32);
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let y = UOp::var("y", DType::Int32, 0, 100);
+        let add = x.try_add(&y).unwrap();
 
         let (rest, const_val) = add.pop_const(BinaryOp::Add);
 
@@ -519,13 +507,13 @@ mod tests {
 
     #[test]
     fn test_split_uop_chain() {
-        let x = UOp::define_global(1, DType::Int32);
-        let y = UOp::define_global(2, DType::Int32);
-        let z = UOp::define_global(3, DType::Int32);
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let y = UOp::var("y", DType::Int32, 0, 100);
+        let z = UOp::var("z", DType::Int32, 0, 100);
 
         // Build: x + y + z = (x + y) + z
-        let xy = UOp::new(Op::Binary(BinaryOp::Add, x.clone(), y.clone()), DType::Int32);
-        let xyz = UOp::new(Op::Binary(BinaryOp::Add, xy, z.clone()), DType::Int32);
+        let xy = x.try_add(&y).unwrap();
+        let xyz = xy.try_add(&z).unwrap();
 
         let terms = xyz.split_uop(BinaryOp::Add);
 
@@ -537,7 +525,7 @@ mod tests {
 
     #[test]
     fn test_split_uop_single() {
-        let x = UOp::define_global(1, DType::Int32);
+        let x = UOp::var("x", DType::Int32, 0, 100);
         let terms = x.split_uop(BinaryOp::Add);
 
         assert_eq!(terms.len(), 1);

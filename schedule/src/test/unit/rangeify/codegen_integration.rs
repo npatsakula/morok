@@ -7,8 +7,9 @@
 
 use std::rc::Rc;
 
+use morok_device::DeviceSpec;
 use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::codegen_patterns::{fix_after_broadcast, get_contiguous, remove_noop};
 use crate::rangeify::cycle_detection::find_bufs;
@@ -38,8 +39,8 @@ fn test_remove_noop_in_pipeline() {
 #[test]
 fn test_get_contiguous_in_pipeline() {
     // Create a computation with CONTIGUOUS marker
-    let value = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let contiguous = UOp::new(Op::Contiguous { src: value.clone() }, value.dtype());
+    let value = UOp::native_const(42.0f32);
+    let contiguous = UOp::contiguous(value.clone());
 
     // Pattern should remove the CONTIGUOUS marker
     let result = get_contiguous(&contiguous);
@@ -56,8 +57,8 @@ fn test_get_contiguous_in_pipeline() {
 #[test]
 fn test_fix_after_broadcast_in_pipeline() {
     // Create AFTER wrapping EXPAND (broadcast)
-    let source = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let new_shape = UOp::const_(DType::Index, ConstValue::Int(10));
+    let source = UOp::native_const(1.0f32);
+    let new_shape = UOp::index_const(10);
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();
@@ -81,19 +82,19 @@ fn test_fix_after_broadcast_in_pipeline() {
 #[test]
 fn test_no_cycle_valid_access_pattern() {
     // Create a valid pattern: LOAD from input buffer, STORE to output buffer
-    let in_buf = UOp::unique(Some(1));
-    let out_buf = UOp::unique(Some(2));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let in_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let index = UOp::index_const(0);
 
     // LOAD from input
-    let loaded = UOp::new(Op::Load { buffer: in_buf.clone(), index: index.clone() }, DType::Float32);
+    let loaded = UOp::load(in_buf.clone(), index.clone());
 
     // Compute something
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let computed = loaded.try_mul_op(&const_val).unwrap();
+    let const_val = UOp::native_const(2.0f32);
+    let computed = loaded.try_mul(&const_val).unwrap();
 
     // STORE to output
-    let store = UOp::new(Op::Store { buffer: out_buf.clone(), index, value: computed }, DType::Void);
+    let store = UOp::store(out_buf.clone(), index, computed);
 
     // Should not panic - valid access pattern
     #[allow(clippy::mutable_key_type)]
@@ -109,10 +110,10 @@ fn test_no_cycle_valid_access_pattern() {
 #[test]
 fn test_split_store_simple_kernel() {
     // Create a simple STORE operation
-    let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer: buffer.clone(), index, value }, DType::Void);
+    let buffer = UOp::buffer_id(Some(0));
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer.clone(), index, value);
 
     let mut ctx = KernelContext::new();
 
@@ -134,15 +135,15 @@ fn test_split_store_simple_kernel() {
 #[test]
 fn test_split_store_with_loop_ranges() {
     // Create a STORE with LOOP ranges
-    let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+    let buffer = UOp::buffer_id(Some(0));
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer, index, value);
 
     // Wrap in END with LOOP range
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range_end = UOp::index_const(10);
     let loop_range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::new(Op::End { computation: store, ranges: vec![loop_range].into() }, DType::Void);
+    let end = UOp::end(store, vec![loop_range].into());
 
     let mut ctx = KernelContext::new();
 
@@ -165,10 +166,10 @@ fn test_split_store_with_loop_ranges() {
 #[test]
 fn test_pattern_application_order() {
     // Create a computation with patterns to apply
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let value = UOp::native_const(1.0f32);
 
     // Wrap in CONTIGUOUS (should be removed by get_contiguous)
-    let contiguous = UOp::new(Op::Contiguous { src: value }, DType::Float32);
+    let contiguous = UOp::contiguous(value);
 
     // In real pipeline, this would go through split_store
     // For now, verify get_contiguous works
@@ -182,20 +183,20 @@ fn test_pattern_application_order() {
 #[test]
 fn test_multiple_buffer_integration() {
     // Create computation with multiple input buffers
-    let buf1 = UOp::unique(Some(1));
-    let buf2 = UOp::unique(Some(2));
-    let out_buf = UOp::unique(Some(3));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let index = UOp::index_const(0);
 
     // LOAD from both inputs
-    let load1 = UOp::new(Op::Load { buffer: buf1.clone(), index: index.clone() }, DType::Float32);
-    let load2 = UOp::new(Op::Load { buffer: buf2.clone(), index: index.clone() }, DType::Float32);
+    let load1 = UOp::load(buf1.clone(), index.clone());
+    let load2 = UOp::load(buf2.clone(), index.clone());
 
     // Compute sum
-    let sum = load1.try_add_op(&load2).unwrap();
+    let sum = load1.try_add(&load2).unwrap();
 
     // STORE to output
-    let store = UOp::new(Op::Store { buffer: out_buf.clone(), index, value: sum }, DType::Void);
+    let store = UOp::store(out_buf.clone(), index, sum);
 
     // Verify cycle detection works
     #[allow(clippy::mutable_key_type)]
@@ -209,15 +210,15 @@ fn test_multiple_buffer_integration() {
 #[test]
 fn test_end_store_structure() {
     // Create STORE
-    let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+    let buffer = UOp::buffer_id(Some(0));
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer, index, value);
 
     // Wrap in END (normal pipeline output)
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::new(Op::End { computation: store.clone(), ranges: vec![range].into() }, DType::Void);
+    let end = UOp::end(store.clone(), vec![range].into());
 
     // Verify END wraps STORE correctly before transformation
     if let Op::End { computation, .. } = end.op() {

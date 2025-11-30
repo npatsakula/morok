@@ -517,3 +517,57 @@ fn eval_mulacc(a: ConstValue, b: ConstValue, c: ConstValue) -> Option<ConstValue
     let mul_result = eval_mul(a, b)?;
     eval_add(mul_result, c)
 }
+
+// ============================================================================
+// Dtype-Aware Evaluation (with truncation for constant folding)
+// ============================================================================
+
+use morok_dtype::ScalarDType;
+
+/// Evaluate unary op with dtype-aware truncation (for constant folding).
+///
+/// Applies truncation after evaluation to ensure results fit within dtype boundaries.
+#[inline]
+pub fn eval_unary_op_typed(op: UnaryOp, v: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
+    eval_unary_op(op, v).map(|r| r.truncate(dtype))
+}
+
+/// Evaluate binary op with dtype-aware truncation (for constant folding).
+///
+/// Applies truncation after evaluation to ensure results fit within dtype boundaries.
+#[inline]
+pub fn eval_binary_op_typed(op: BinaryOp, a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
+    eval_binary_op(op, a, b).map(|r| r.truncate(dtype))
+}
+
+/// Evaluate ternary op with dtype-aware truncation (for constant folding).
+///
+/// Applies truncation after evaluation to ensure results fit within dtype boundaries.
+#[inline]
+pub fn eval_ternary_op_typed(
+    op: TernaryOp,
+    a: ConstValue,
+    b: ConstValue,
+    c: ConstValue,
+    dtype: ScalarDType,
+) -> Option<ConstValue> {
+    eval_ternary_op(op, a, b, c).map(|r| r.truncate(dtype))
+}
+
+/// Evaluate addition with dtype-aware truncation.
+#[inline]
+pub fn eval_add_typed(a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
+    eval_add(a, b).map(|r| r.truncate(dtype))
+}
+
+/// Evaluate multiplication with dtype-aware truncation.
+#[inline]
+pub fn eval_mul_typed(a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
+    eval_mul(a, b).map(|r| r.truncate(dtype))
+}
+
+/// Evaluate subtraction with dtype-aware truncation.
+#[inline]
+pub fn eval_sub_typed(a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
+    eval_sub(a, b).map(|r| r.truncate(dtype))
+}

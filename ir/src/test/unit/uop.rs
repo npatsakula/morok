@@ -7,11 +7,11 @@ use std::rc::Rc;
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
 
-use crate::{AxisId, ConstValue, Op, UOp};
+use crate::{AxisId, ConstValue, Op, UOp}; // ConstValue kept for DType::Index
 
 #[test]
 fn test_const_creation() {
-    let c1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let c1 = UOp::native_const(1.0f32);
     assert_eq!(c1.dtype(), DType::Float32);
     assert!(matches!(c1.op(), Op::Const(_)));
 }
@@ -19,8 +19,8 @@ fn test_const_creation() {
 #[test]
 fn test_hash_consing() {
     // Create two identical constants
-    let c1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let c2 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let c1 = UOp::native_const(1.0f32);
+    let c2 = UOp::native_const(1.0f32);
 
     // They should be the same object
     assert!(Rc::ptr_eq(&c1, &c2), "Hash consing should return same Rc for identical UOps");
@@ -28,12 +28,12 @@ fn test_hash_consing() {
 
 #[test]
 fn test_hash_consing_with_src() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
 
     // Create a + b twice
-    let add1 = a.try_add_op(&b).unwrap();
-    let add2 = a.try_add_op(&b).unwrap();
+    let add1 = a.try_add(&b).unwrap();
+    let add2 = a.try_add(&b).unwrap();
 
     // Should be the same object
     assert!(Rc::ptr_eq(&add1, &add2), "Hash consing should work with src nodes");
@@ -41,20 +41,20 @@ fn test_hash_consing_with_src() {
 
 #[test]
 fn test_binary_operations() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
 
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
     assert_eq!(add.dtype(), DType::Float32);
     assert_eq!(add.op().children().len(), 2);
 
-    let mul = a.try_mul_op(&b).unwrap();
+    let mul = a.try_mul(&b).unwrap();
     assert_eq!(mul.dtype(), DType::Float32);
 }
 
 #[test]
 fn test_unary_operations() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(4.0));
+    let a = UOp::native_const(4.0f32);
 
     let sqrt = a.try_sqrt().unwrap();
     assert_eq!(sqrt.dtype(), DType::Float32);
@@ -63,7 +63,7 @@ fn test_unary_operations() {
 
 #[test]
 fn test_cast() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.5));
+    let a = UOp::native_const(1.5f32);
     let cast = UOp::cast(a.clone(), DType::Int32);
 
     assert_eq!(cast.dtype(), DType::Int32);
@@ -71,8 +71,8 @@ fn test_cast() {
 
 #[test]
 fn test_comparison() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
 
     let cmp = a.try_cmplt(&b).unwrap();
     assert_eq!(cmp.dtype(), DType::Bool);
@@ -81,12 +81,12 @@ fn test_comparison() {
 #[test]
 fn test_toposort() {
     // Build graph: (a + b) * c
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let c = UOp::native_const(3.0f32);
 
-    let add = a.try_add_op(&b).unwrap();
-    let mul = add.try_mul_op(&c).unwrap();
+    let add = a.try_add(&b).unwrap();
+    let mul = add.try_mul(&c).unwrap();
 
     let sorted = mul.toposort();
 
@@ -109,13 +109,13 @@ fn test_toposort() {
 fn test_toposort_shared_node() {
     // Build graph: x = a + b; y = a + c; z = x * y
     // Node 'a' is shared between x and y
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let c = UOp::native_const(3.0f32);
 
-    let x = a.try_add_op(&b).unwrap();
-    let y = a.try_add_op(&c).unwrap();
-    let z = x.try_mul_op(&y).unwrap();
+    let x = a.try_add(&b).unwrap();
+    let y = a.try_add(&c).unwrap();
+    let z = x.try_mul(&y).unwrap();
 
     let sorted = z.toposort();
 
@@ -181,18 +181,18 @@ fn test_device_and_unique() {
         assert_eq!(*spec, DeviceSpec::Cpu);
     }
 
-    let uniq = UOp::unique(Some(42));
+    let uniq = UOp::buffer_id(Some(42));
     assert!(matches!(uniq.op(), Op::Unique(42)));
 
-    let uniq_auto = UOp::unique(None);
+    let uniq_auto = UOp::buffer_id(None);
     assert!(matches!(uniq_auto.op(), Op::Unique(_)));
 }
 
 #[test]
 fn test_children_method() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = a.try_add_op(&b).unwrap();
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let add = a.try_add(&b).unwrap();
 
     let children = add.op().children();
     assert_eq!(children.len(), 2);
@@ -202,9 +202,9 @@ fn test_children_method() {
 
 #[test]
 fn test_for_each_child() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = a.try_add_op(&b).unwrap();
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let add = a.try_add(&b).unwrap();
 
     let mut children = Vec::new();
     add.op().map_child(|child| children.push(child.clone()));
@@ -221,7 +221,7 @@ fn test_for_each_child() {
 #[test]
 fn test_shape_property_scalar() {
     // Scalar constant should have empty shape
-    let scalar = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let scalar = UOp::native_const(42.0f32);
     let shape = scalar.shape().unwrap();
 
     assert!(shape.is_some(), "Scalar should have shape");
@@ -233,9 +233,9 @@ fn test_shape_property_lazy_evaluation() {
     use crate::uop::cached_property::CachedProperty;
     use crate::uop::properties::ShapeProperty;
 
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = a.try_add_op(&b).unwrap();
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let add = a.try_add(&b).unwrap();
 
     // VERIFY: Cache is empty before first access (lazy evaluation)
     assert!(ShapeProperty::cache(&add).get().is_none(), "Cache should be empty before first access");
@@ -257,9 +257,9 @@ fn test_shape_property_lazy_evaluation() {
 #[test]
 fn test_ranges_property_no_ranges() {
     // Simple arithmetic with no RANGE ops
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = a.try_add_op(&b).unwrap();
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let add = a.try_add(&b).unwrap();
 
     let ranges = add.ranges();
     assert_eq!(ranges.len(), 0, "No RANGE ops in simple arithmetic");
@@ -270,7 +270,7 @@ fn test_ranges_property_with_range() {
     use crate::AxisType;
 
     // Create a RANGE op
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     // Create some computation that uses the range
@@ -287,7 +287,7 @@ fn test_ranges_property_lazy_evaluation() {
     use crate::uop::cached_property::CachedProperty;
     use crate::uop::properties::RangesProperty;
 
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
     let idx = UOp::cast(range.clone(), DType::Float32);
 
@@ -314,7 +314,7 @@ fn test_in_scope_ranges_simple() {
     use crate::AxisType;
 
     // Create a RANGE op
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     // RANGE itself should have itself in scope
@@ -333,7 +333,7 @@ fn test_in_scope_ranges_lazy_evaluation() {
     use crate::uop::cached_property::CachedProperty;
     use crate::uop::properties::InScopeRangesProperty;
 
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
     let idx = UOp::cast(range.clone(), DType::Float32);
 
@@ -360,9 +360,9 @@ fn test_in_scope_ranges_after_end() {
     use smallvec::smallvec;
 
     // Create a RANGE and computation
-    let end_val = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end_val = UOp::index_const(10);
     let range = UOp::range_axis(end_val, AxisId::Renumbered(0), AxisType::Loop);
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
 
     // Create END operation
     let end_op = UOp::end(compute.clone(), smallvec![range.clone()]);
@@ -378,14 +378,14 @@ fn test_in_scope_ranges_nested() {
     use smallvec::smallvec;
 
     // Create two nested RANGEs
-    let end1 = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end1 = UOp::index_const(10);
     let _range1 = UOp::range_axis(end1, AxisId::Renumbered(0), AxisType::Loop);
 
-    let end2 = UOp::const_(DType::Index, ConstValue::Int(20));
+    let end2 = UOp::index_const(20);
     let range2 = UOp::range_axis(end2, AxisId::Renumbered(1), AxisType::Loop);
 
     // Computation that uses both ranges
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
 
     // Both ranges should be in scope
     let in_scope = compute.in_scope_ranges();
@@ -400,9 +400,9 @@ fn test_in_scope_ranges_nested() {
 #[test]
 fn test_toposort_filtered_basic() {
     // Build graph: a -> b -> c
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = a.try_add_op(&UOp::const_(DType::Float32, ConstValue::Float(2.0))).unwrap();
-    let c = b.try_mul_op(&UOp::const_(DType::Float32, ConstValue::Float(3.0))).unwrap();
+    let a = UOp::native_const(1.0f32);
+    let b = a.try_add(&UOp::native_const(2.0f32)).unwrap();
+    let c = b.try_mul(&UOp::native_const(3.0f32)).unwrap();
 
     // Filter to only include 'c'
     let filtered = c.toposort_filtered(|node| Rc::ptr_eq(node, &c));
@@ -415,9 +415,9 @@ fn test_toposort_filtered_basic() {
 #[test]
 fn test_toposort_filtered_all() {
     // Build graph: a + b
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = a.try_add_op(&b).unwrap();
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let add = a.try_add(&b).unwrap();
 
     // Filter that accepts all nodes
     let filtered = add.toposort_filtered(|_| true);
@@ -430,7 +430,7 @@ fn test_toposort_filtered_all() {
 #[test]
 fn test_toposort_filtered_none() {
     // Build graph
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let a = UOp::native_const(1.0f32);
 
     // Filter that rejects all nodes
     let filtered = a.toposort_filtered(|_| false);
@@ -442,11 +442,11 @@ fn test_toposort_filtered_none() {
 #[test]
 fn test_multiple_properties_coexist() {
     // Create a constant (has shape)
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
 
     // Create an addition operation
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
 
     // Access shape property (const operations have shape)
     let shape = add.shape().unwrap();

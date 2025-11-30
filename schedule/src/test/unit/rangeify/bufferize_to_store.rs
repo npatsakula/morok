@@ -1,5 +1,4 @@
-use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store};
 
@@ -8,7 +7,7 @@ fn test_bufferize_to_store_global() {
     let mut ctx = KernelContext::new();
 
     // Create a simple BUFFERIZE with one range
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let compute = UOp::native_const(42.0f32);
     let range = UOp::range_const(10, 0);
 
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range.clone()]);
@@ -55,7 +54,7 @@ fn test_bufferize_to_store_local_with_barrier() {
     let mut ctx = KernelContext::new();
 
     // Create BUFFERIZE with LOCAL addrspace
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let range = UOp::range_const(5, 0);
 
     let bufferize = UOp::bufferize_local(compute.clone(), vec![range.clone()]);
@@ -99,7 +98,7 @@ fn test_bufferize_to_store_multiple_ranges() {
     let mut ctx = KernelContext::new();
 
     // Create BUFFERIZE with multiple ranges
-    let compute = UOp::const_(DType::Int32, ConstValue::Int(100));
+    let compute = UOp::native_const(100i32);
     let range1 = UOp::range_const(4, 0);
     let range2 = UOp::range_const(8, 1);
 
@@ -153,7 +152,7 @@ fn test_non_bufferize_returns_none() {
     let mut ctx = KernelContext::new();
 
     // Create a non-BUFFERIZE operation
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_op = UOp::native_const(1.0f32);
 
     // Should return None
     let result = bufferize_to_store(&const_op, &mut ctx);
@@ -164,7 +163,7 @@ fn test_non_bufferize_returns_none() {
 fn test_buffer_tracked_in_context() {
     let mut ctx = KernelContext::new();
 
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let bufferize = UOp::bufferize_global(compute, vec![]);
 
     // Before conversion, buffer should not be tracked
@@ -187,7 +186,7 @@ fn test_bufferize_to_store_sequential_global_ids() {
 
     // Create three BUFFERIZE operations
     for i in 0..3 {
-        let compute = UOp::const_(DType::Float32, ConstValue::Float(i as f64));
+        let compute = UOp::native_const((i as f64) as f32);
         let bufferize = UOp::bufferize_global(compute, vec![]);
 
         bufferize_to_store(&bufferize, &mut ctx);
@@ -204,7 +203,7 @@ fn test_bufferize_to_store_sequential_local_ids() {
 
     // Create three BUFFERIZE operations with LOCAL addrspace
     for i in 0..3 {
-        let compute = UOp::const_(DType::Float32, ConstValue::Float(i as f64));
+        let compute = UOp::native_const((i as f64) as f32);
         let bufferize = UOp::bufferize_local(compute, vec![]);
 
         bufferize_to_store(&bufferize, &mut ctx);
@@ -219,8 +218,8 @@ fn test_bufferize_to_store_sequential_local_ids() {
 fn test_bufferize_to_store_mixed_global_local() {
     let mut ctx = KernelContext::new();
 
-    let global_compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let local_compute = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let global_compute = UOp::native_const(1.0f32);
+    let local_compute = UOp::native_const(2.0f32);
 
     // Global buffer
     let global_bufferize = UOp::bufferize_global(global_compute.clone(), vec![]);
@@ -269,8 +268,8 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
 
     // Create a BUFFERIZE operation with OUTER range
     // (split_store only splits at kernel boundaries where all ranges are OUTER)
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Outer);
+    let compute = UOp::native_const(42.0f32);
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Outer);
 
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range]);
 

@@ -113,20 +113,45 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
 
                 // If any source changed, reconstruct the operation
                 if any_changed {
-                    let dtype = op.dtype();
                     let rewritten = match op.op() {
                         Op::Binary(bin_op, _, _) => {
-                            UOp::new(Op::Binary(*bin_op, new_sources[0].clone(), new_sources[1].clone()), dtype)
+                            let lhs = &new_sources[0];
+                            let rhs = &new_sources[1];
+                            match bin_op {
+                                morok_ir::BinaryOp::Add => lhs.try_add(rhs),
+                                morok_ir::BinaryOp::Sub => lhs.try_sub(rhs),
+                                morok_ir::BinaryOp::Mul => lhs.try_mul(rhs),
+                                morok_ir::BinaryOp::Idiv => lhs.try_div(rhs),
+                                morok_ir::BinaryOp::Fdiv => lhs.try_div(rhs),
+                                morok_ir::BinaryOp::Mod => lhs.try_mod(rhs),
+                                morok_ir::BinaryOp::And => lhs.try_and_op(rhs),
+                                morok_ir::BinaryOp::Or => lhs.try_or_op(rhs),
+                                morok_ir::BinaryOp::Xor => lhs.try_xor_op(rhs),
+                                morok_ir::BinaryOp::Lt => lhs.try_cmplt(rhs),
+                                morok_ir::BinaryOp::Le => lhs.try_cmple(rhs),
+                                morok_ir::BinaryOp::Eq => lhs.try_cmpeq(rhs),
+                                morok_ir::BinaryOp::Ne => lhs.try_cmpne(rhs),
+                                morok_ir::BinaryOp::Gt => lhs.try_cmpgt(rhs),
+                                morok_ir::BinaryOp::Ge => lhs.try_cmpge(rhs),
+                                morok_ir::BinaryOp::Max => lhs.try_max(rhs),
+                                morok_ir::BinaryOp::Pow => lhs.try_pow(rhs),
+                                // Shl/Shr/Threefry don't have helper methods, use direct construction
+                                morok_ir::BinaryOp::Shl | morok_ir::BinaryOp::Shr | morok_ir::BinaryOp::Threefry => {
+                                    Ok(UOp::new(Op::Binary(*bin_op, lhs.clone(), rhs.clone()), op.dtype()))
+                                }
+                            }
+                            .expect("Binary op reconstruction should succeed with compatible types")
                         }
-                        Op::Ternary(tern_op, _, _, _) => UOp::new(
-                            Op::Ternary(
-                                *tern_op,
-                                new_sources[0].clone(),
-                                new_sources[1].clone(),
-                                new_sources[2].clone(),
-                            ),
-                            dtype,
-                        ),
+                        Op::Ternary(tern_op, _, _, _) => match tern_op {
+                            morok_ir::TernaryOp::Where => {
+                                UOp::try_where(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
+                                    .unwrap()
+                            }
+                            morok_ir::TernaryOp::MulAcc => {
+                                UOp::try_mulacc(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
+                                    .expect("MulAcc reconstruction should succeed")
+                            }
+                        },
                         _ => unreachable!(),
                     };
                     return RewriteResult::Rewritten(rewritten);

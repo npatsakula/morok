@@ -4,8 +4,9 @@
 //! including relu, sigmoid, tanh, softmax, and their variants.
 
 use morok_ir::{ConstValue, UOp};
+use snafu::ResultExt;
 
-use crate::{Result, Tensor, reduce::AxisSpec};
+use crate::{Result, Tensor, error::UOpSnafu, reduce::AxisSpec};
 
 impl Tensor {
     /// Helper to broadcast a scalar constant to match this tensor's shape.
@@ -61,7 +62,7 @@ impl Tensor {
         let denominator = one.try_add(&exp_neg_x)?;
 
         // Use reciprocal for 1 / denominator
-        let recip = Self::new(UOp::reciprocal_op(denominator.uop));
+        let recip = Self::new(UOp::try_reciprocal(&denominator.uop).context(UOpSnafu)?);
         Ok(recip)
     }
 

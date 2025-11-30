@@ -158,8 +158,7 @@ pub fn remove_zero_range(range: &Rc<UOp>, _ctx: &mut KernelContext) -> Option<Rc
     }
 
     // Replace with constant 0
-    use morok_dtype::DType;
-    let zero = UOp::const_(DType::Index, ConstValue::Int(0));
+    let zero = UOp::index_const(0);
 
     Some(zero)
 }

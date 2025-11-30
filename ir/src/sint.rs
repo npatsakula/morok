@@ -225,7 +225,7 @@ impl From<&Rc<UOp>> for SInt {
 /// assert_eq!(result.as_const(), Some(24));
 /// ```
 pub fn sint_prod(values: &[SInt]) -> SInt {
-    sint_aggregate(values, 1, |vals| vals.into_iter().product(), |a, b| a.try_mul_op(&b), "multiplication")
+    sint_aggregate(values, 1, |vals| vals.into_iter().product(), |a, b| a.try_mul(&b), "multiplication")
 }
 
 /// Helper for aggregating SInt values with both concrete and symbolic paths.
@@ -273,7 +273,7 @@ where
 /// assert_eq!(result.as_const(), Some(20));
 /// ```
 pub fn sint_max(values: &[SInt]) -> SInt {
-    sint_aggregate(values, 0, |vals| vals.into_iter().max().unwrap(), |a, b| a.try_max_op(&b), "max")
+    sint_aggregate(values, 0, |vals| vals.into_iter().max().unwrap(), |a, b| a.try_max(&b), "max")
 }
 
 /// Compute minimum of SInt values (symbolic-aware).

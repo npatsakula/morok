@@ -45,11 +45,11 @@ macro_rules! impl_tensor_ops {
 impl Tensor {
     impl_tensor_ops! {
         binary {
-            try_add => try_add_op,
-            try_sub => try_sub_op,
-            try_mul => try_mul_op,
-            try_div => try_div_op,
-            try_pow => try_pow_op,
+            try_add => try_add,
+            try_sub => try_sub,
+            try_mul => try_mul,
+            try_div => try_div,
+            try_pow => try_pow,
             try_eq => try_cmpeq,
             try_ne => try_cmpne,
             try_lt => try_cmplt,
