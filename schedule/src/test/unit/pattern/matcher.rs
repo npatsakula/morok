@@ -5,10 +5,10 @@ use crate::{
     pattern::{BindingStore, RewriteResult, VarIntern, matcher::RewriteFn},
 };
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, ConstValueHash, Op, UOp};
+use morok_ir::{BinaryOp, ConstValue, Op, UOp};
 
 fn const_uop(val: i64) -> Rc<UOp> {
-    UOp::new(Op::Const(ConstValueHash(ConstValue::Int(val))), DType::Int32)
+    UOp::const_(DType::Int32, ConstValue::Int(val))
 }
 
 fn binary_uop(op: BinaryOp, a: Rc<UOp>, b: Rc<UOp>) -> Rc<UOp> {

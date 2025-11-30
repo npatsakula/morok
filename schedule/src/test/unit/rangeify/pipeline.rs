@@ -8,8 +8,9 @@
 //!
 //! Based on Tinygrad's test_schedule.py integration tests.
 
-use std::rc::Rc;
+use std::{f32::consts::PI, rc::Rc};
 
+use morok_device::DeviceSpec;
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp};
 
@@ -30,7 +31,7 @@ fn rangeify_unwrap(uop: Rc<UOp>) -> Rc<UOp> {
 #[test]
 fn test_run_rangeify_simple_const() {
     // Test: CONST should pass through unchanged
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let const_val = UOp::native_const(42.0f32);
 
     let result = run_rangeify(const_val);
     assert!(result.is_ok(), "rangeify should succeed");
@@ -43,8 +44,8 @@ fn test_run_rangeify_simple_const() {
 #[test]
 fn test_run_rangeify_detach_removal() {
     // Test: DETACH should be removed by early_rewrites
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let detach = UOp::new(Op::Detach { src: x.clone() }, x.dtype());
+    let x = UOp::native_const(1.0f32);
+    let detach = UOp::detach(x.clone());
 
     let result = run_rangeify(detach);
     assert!(result.is_ok(), "rangeify should succeed");
@@ -68,8 +69,8 @@ fn test_run_rangeify_detach_removal() {
 #[test]
 fn test_run_rangeify_contiguous_backward_removal() {
     // Test: CONTIGUOUS_BACKWARD should be removed
-    let x = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as _));
-    let contiguous = UOp::new(Op::ContiguousBackward { src: x.clone() }, x.dtype());
+    let x = UOp::native_const(PI);
+    let contiguous = UOp::contiguous_backward(x.clone());
 
     let rangeified = rangeify_unwrap(contiguous);
 
@@ -87,8 +88,8 @@ fn test_run_rangeify_contiguous_backward_removal() {
 #[test]
 fn test_run_rangeify_binary_op() {
     // Test: Binary operations should be processed
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
     let add = a.try_add_op(&b).unwrap();
 
     let rangeified = rangeify_unwrap(add);
@@ -100,9 +101,9 @@ fn test_run_rangeify_binary_op() {
 #[test]
 fn test_run_rangeify_preserves_structure() {
     // Test: Complex computation structure should be preserved
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let c = UOp::native_const(3.0f32);
 
     // (a + b) * c
     let sum = a.try_add_op(&b).unwrap();
@@ -128,9 +129,9 @@ fn test_run_rangeify_preserves_structure() {
 fn test_kernel_split_pipeline_simple_store() {
     // Test: Simple STORE should create a KERNEL
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer, index, value);
 
     let result = run_kernel_split_pipeline(store);
 
@@ -143,13 +144,13 @@ fn test_kernel_split_pipeline_simple_store() {
 fn test_kernel_split_pipeline_with_end() {
     // Test: END(STORE) should be processed correctly
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer, index, value);
 
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::new(Op::End { computation: store, ranges: vec![range].into() }, DType::Void);
+    let end = UOp::end(store, vec![range].into());
 
     let result = run_kernel_split_pipeline(end);
 
@@ -160,12 +161,12 @@ fn test_kernel_split_pipeline_with_end() {
 #[test]
 fn test_kernel_split_pipeline_load_store() {
     // Test: LOAD + STORE pattern
-    let in_buf = UOp::unique(Some(1));
-    let out_buf = UOp::unique(Some(2));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let in_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let index = UOp::index_const(0);
 
-    let load = UOp::new(Op::Load { buffer: in_buf, index: index.clone() }, DType::Float32);
-    let store = UOp::new(Op::Store { buffer: out_buf, index, value: load }, DType::Void);
+    let load = UOp::load(in_buf, index.clone());
+    let store = UOp::store(out_buf, index, load);
 
     let result = run_kernel_split_pipeline(store);
 
@@ -176,15 +177,15 @@ fn test_kernel_split_pipeline_load_store() {
 #[test]
 fn test_kernel_split_pipeline_multiple_loads() {
     // Test: Multiple LOADs feeding into STORE
-    let buf1 = UOp::unique(Some(1));
-    let buf2 = UOp::unique(Some(2));
-    let out_buf = UOp::unique(Some(3));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
+    let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let index = UOp::index_const(0);
 
-    let load1 = UOp::new(Op::Load { buffer: buf1, index: index.clone() }, DType::Float32);
-    let load2 = UOp::new(Op::Load { buffer: buf2, index: index.clone() }, DType::Float32);
+    let load1 = UOp::load(buf1, index.clone());
+    let load2 = UOp::load(buf2, index.clone());
     let sum = load1.try_add_op(&load2).unwrap();
-    let store = UOp::new(Op::Store { buffer: out_buf, index, value: sum }, DType::Void);
+    let store = UOp::store(out_buf, index, sum);
 
     let result = run_kernel_split_pipeline(store);
 
@@ -199,14 +200,14 @@ fn test_end_to_end_simple_computation() {
     // Test: Full pipeline from computation to kernel
 
     // Step 1: Create computation
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
     let sum = a.try_add_op(&b).unwrap();
 
     // Step 2: Wrap in STORE
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let store = UOp::new(Op::Store { buffer, index, value: sum }, DType::Void);
+    let index = UOp::index_const(0);
+    let store = UOp::store(buffer, index, sum);
 
     // Step 3: Apply rangeify
     let rangeified = rangeify_unwrap(store);
@@ -223,14 +224,14 @@ fn test_end_to_end_with_ranges() {
     // Test: Pipeline with explicit range operations
 
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer, index, value);
 
     // Wrap in END with ranges
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(100));
+    let range_end = UOp::index_const(100);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::new(Op::End { computation: store, ranges: vec![range].into() }, DType::Void);
+    let end = UOp::end(store, vec![range].into());
 
     let rangeified = rangeify_unwrap(end);
     let kernel = run_kernel_split_pipeline(rangeified);
@@ -243,7 +244,7 @@ fn test_end_to_end_with_ranges() {
 #[test]
 fn test_pipeline_idempotent() {
     // Test: Applying pipeline twice should be safe
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let x = UOp::native_const(1.0f32);
 
     let rangeified1 = rangeify_unwrap(x.clone());
     let rangeified2 = rangeify_unwrap(rangeified1);
@@ -255,16 +256,15 @@ fn test_pipeline_idempotent() {
 #[test]
 fn test_pipeline_preserves_dtype() {
     // Test: Pipeline should preserve data types
-    let dtypes = vec![
-        (DType::Float32, ConstValue::Float(1.0)),
-        (DType::Float64, ConstValue::Float(1.0)),
-        (DType::Int32, ConstValue::Int(42)),
-        (DType::Int64, ConstValue::Int(42)),
-        (DType::Bool, ConstValue::Bool(true)),
+    let test_cases = vec![
+        (DType::Float32, UOp::native_const(1.0f32)),
+        (DType::Float64, UOp::native_const(1.0f64)),
+        (DType::Int32, UOp::native_const(42i32)),
+        (DType::Int64, UOp::native_const(42i64)),
+        (DType::Bool, UOp::native_const(true)),
     ];
 
-    for (dtype, const_val) in dtypes {
-        let value = UOp::const_(dtype.clone(), const_val);
+    for (dtype, value) in test_cases {
         let rangeified = rangeify_unwrap(value.clone());
 
         // Should preserve dtype (or transform to compatible type)
@@ -289,11 +289,11 @@ fn test_pipeline_handles_noop() {
 #[test]
 fn test_pipeline_complex_nested_structure() {
     // Test: Pipeline should handle deeply nested operations
-    let mut current = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let mut current = UOp::native_const(1.0f32);
 
     // Build a deep tree: ((((x + 1) + 1) + 1) + 1)
     for _ in 0..10 {
-        let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+        let one = UOp::native_const(1.0f32);
         current = current.try_add_op(&one).unwrap();
     }
 
@@ -309,7 +309,7 @@ fn test_pipeline_wide_tree() {
     let mut operands = Vec::new();
 
     for i in 0..20 {
-        operands.push(UOp::const_(DType::Float32, ConstValue::Float(i as f64)));
+        operands.push(UOp::native_const(i as f32));
     }
 
     // Sum all operands
@@ -329,8 +329,8 @@ fn test_pipeline_wide_tree() {
 #[test]
 fn test_pipeline_applies_early_rewrites_first() {
     // Test: early_rewrites should be applied before other patterns
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let detach = UOp::new(Op::Detach { src: x.clone() }, x.dtype());
+    let x = UOp::native_const(1.0f32);
+    let detach = UOp::detach(x.clone());
 
     let rangeified = rangeify_unwrap(detach);
 
@@ -345,8 +345,8 @@ fn test_pipeline_applies_buffer_folding() {
     // Test: buffer_folding patterns should be applied
 
     // Create BUFFERIZE(CONST) which should be folded
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range_end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let const_val = UOp::native_const(42.0f32);
+    let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let bufferize = UOp::bufferize(const_val.clone(), vec![range], BufferizeOpts::local());
 
@@ -367,9 +367,9 @@ fn test_pipeline_maintains_computation_semantics() {
     // Test: Transformation should not change computation semantics
 
     // Original: a * b + c
-    let a = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-    let c = UOp::const_(DType::Float32, ConstValue::Float(4.0));
+    let a = UOp::native_const(2.0f32);
+    let b = UOp::native_const(3.0f32);
+    let c = UOp::native_const(4.0f32);
 
     let product = a.try_mul_op(&b).unwrap();
     let sum = product.try_add_op(&c).unwrap();
@@ -391,9 +391,8 @@ fn test_pipeline_reduce_unparented_add() {
     // REDUCE(CONST(5), [range(10)], ADD) should become CONST(50)
     use morok_ir::ReduceOp;
 
-    let const_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let range =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
+    let const_val = UOp::native_const(5i32);
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
     let reduce = UOp::reduce(const_val, vec![range].into(), ReduceOp::Add);
 
     let rangeified = rangeify_unwrap(reduce);
@@ -423,8 +422,8 @@ fn test_pipeline_reduce_unparented_max() {
     // REDUCE(CONST(42), [range(5)], MAX) should become CONST(42)
     use morok_ir::ReduceOp;
 
-    let const_val = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(5)), AxisId::Renumbered(0), AxisType::Reduce);
+    let const_val = UOp::native_const(42i32);
+    let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
     let reduce = UOp::reduce(const_val.clone(), vec![range].into(), ReduceOp::Max);
 
     let rangeified = rangeify_unwrap(reduce);
@@ -499,11 +498,9 @@ fn test_pipeline_reduction_optimizations_dont_break_graph() {
     use morok_ir::ReduceOp;
 
     // Create a realistic reduction scenario
-    let data = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as _));
-    let range1 =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(8)), AxisId::Renumbered(0), AxisType::Reduce);
-    let range2 =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(4)), AxisId::Renumbered(1), AxisType::Reduce);
+    let data = UOp::native_const(PI);
+    let range1 = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Reduce);
+    let range2 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(1), AxisType::Reduce);
 
     // Create a multi-range reduction
     let reduce = UOp::reduce(data, vec![range1, range2].into(), ReduceOp::Add);
@@ -526,9 +523,8 @@ fn test_pipeline_reduction_optimizations_dont_break_graph() {
 fn test_pipeline_reduce_collapse_constant() {
     // Test: REDUCE(const, [range], ADD) should be simplified by reduce_collapse
     // after symbolic simplification eliminates range dependency
-    let const_val = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let range =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
+    let const_val = UOp::native_const(42i32);
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
     let reduce = UOp::reduce(const_val, vec![range].into(), ReduceOp::Add);
 
     let result = rangeify_unwrap(reduce);
@@ -542,11 +538,9 @@ fn test_pipeline_reduce_collapse_constant() {
 #[test]
 fn test_pipeline_reduce_collapse_multiple_ranges() {
     // Test: REDUCE with multiple independent ranges
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as _));
-    let range1 =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(5)), AxisId::Renumbered(0), AxisType::Reduce);
-    let range2 =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(1), AxisType::Reduce);
+    let const_val = UOp::native_const(PI);
+    let range1 = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
+    let range2 = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(1), AxisType::Reduce);
 
     let reduce = UOp::reduce(const_val, vec![range1, range2].into(), ReduceOp::Add);
 
@@ -559,12 +553,11 @@ fn test_pipeline_reduce_collapse_multiple_ranges() {
 #[test]
 fn test_pipeline_reduce_collapse_with_algebraic_simplification() {
     // Test: reduce_collapse combined with algebraic patterns (x + 0)
-    let x = UOp::const_(DType::Int32, ConstValue::Int(100));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(100i32);
+    let zero = UOp::native_const(0i32);
     let x_plus_0 = x.try_add_op(&zero).unwrap();
 
-    let range =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(20)), AxisId::Renumbered(0), AxisType::Reduce);
+    let range = UOp::range_axis(UOp::index_const(20), AxisId::Renumbered(0), AxisType::Reduce);
 
     let reduce = UOp::reduce(x_plus_0, vec![range].into(), ReduceOp::Add);
 
@@ -578,11 +571,10 @@ fn test_pipeline_reduce_collapse_with_algebraic_simplification() {
 #[test]
 fn test_pipeline_reduce_collapse_preserves_dependent_reductions() {
     // Test: Reductions with actual range dependencies should NOT be collapsed
-    let range =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
 
     // Create expression that depends on range: range + 1
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let one = UOp::native_const(1i32);
     let range_int = UOp::cast(range.clone(), DType::Int32);
     let src = range_int.try_add_op(&one).unwrap();
 
@@ -598,8 +590,8 @@ fn test_pipeline_reduce_collapse_preserves_dependent_reductions() {
 #[test]
 fn test_pipeline_reduce_collapse_different_ops() {
     // Test: reduce_collapse works with different ReduceOp types through pipeline
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(2.5));
-    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(8)), AxisId::Renumbered(0), AxisType::Reduce);
+    let const_val = UOp::native_const(2.5f32);
+    let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Reduce);
 
     // Test with MAX
     let reduce_max = UOp::reduce(const_val.clone(), vec![range.clone()].into(), ReduceOp::Max);
@@ -616,13 +608,11 @@ fn test_pipeline_reduce_collapse_different_ops() {
 fn test_pipeline_reduce_collapse_integration_with_unparented() {
     // Test: reduce_collapse and reduce_unparented should work together
     // Create a scenario where both optimizations could apply
-    let const_val = UOp::const_(DType::Int32, ConstValue::Int(7));
+    let const_val = UOp::native_const(7i32);
 
     // Create two ranges: one will be unparented, one could be collapsed
-    let range1 =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(5)), AxisId::Renumbered(0), AxisType::Reduce);
-    let range2 =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(3)), AxisId::Renumbered(1), AxisType::Reduce);
+    let range1 = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
+    let range2 = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(1), AxisType::Reduce);
 
     // Const doesn't depend on either range
     let reduce = UOp::reduce(const_val, vec![range1, range2].into(), ReduceOp::Add);

@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, SInt, TernaryOp, UOp, UOpKey};
+use morok_ir::{AddrSpace, AxisType, BufferizeOpts, Op, SInt, UOp, UOpKey};
 use test_case::test_case;
 
 use crate::rangeify::buffer_limits::{buffer_limit_patterns, extract_device_from_graph, is_elementwise};
@@ -243,19 +243,19 @@ fn test_cuda_no_limit() {
 
 #[test]
 fn test_binary_op_is_elementwise() {
-    let left = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let right = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let add = UOp::new(Op::Binary(BinaryOp::Add, left, right), DType::Float32);
+    let left = UOp::native_const(1.0f32);
+    let right = UOp::native_const(2.0f32);
+    let add = left.try_add_op(&right).unwrap();
 
     assert!(is_elementwise(&add), "Binary ADD should be elementwise");
 }
 
 #[test]
 fn test_ternary_op_is_elementwise() {
-    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let true_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let false_val = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_val, false_val), DType::Float32);
+    let cond = UOp::native_const(true);
+    let true_val = UOp::native_const(1.0f32);
+    let false_val = UOp::native_const(2.0f32);
+    let where_op = UOp::where_(cond, true_val, false_val);
 
     assert!(is_elementwise(&where_op), "Ternary WHERE should be elementwise");
 }
@@ -263,7 +263,7 @@ fn test_ternary_op_is_elementwise() {
 #[test]
 fn test_non_elementwise_operations() {
     // Constants are not elementwise
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_op = UOp::native_const(1.0f32);
     assert!(!is_elementwise(&const_op), "CONST should not be elementwise");
 
     // Buffers are not elementwise
@@ -318,7 +318,7 @@ fn test_output_buffer_accounting(num_buffers: usize, should_materialize: bool) {
 #[test]
 fn test_extract_device_no_device() {
     // Graph with no device info
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_op = UOp::native_const(1.0f32);
     assert_eq!(extract_device_from_graph(&const_op), None, "Should return None when no device");
 }
 
@@ -437,13 +437,13 @@ fn test_ternary_op_materialization() {
     // cond = (b0 > b1 && b2 > b3 && ... b8 > b9)
     let indexed0 = UOp::index(buffers[0].clone(), ranges.clone()).expect("Failed");
     let indexed1 = UOp::index(buffers[1].clone(), ranges.clone()).expect("Failed");
-    let mut cond = UOp::new(Op::Binary(BinaryOp::Gt, indexed0, indexed1), DType::Bool);
+    let mut cond = indexed1.try_cmplt(&indexed0).unwrap(); // indexed0 > indexed1 => indexed1 < indexed0
 
     for i in (2..10).step_by(2) {
         let left = UOp::index(buffers[i].clone(), ranges.clone()).expect("Failed");
         let right = UOp::index(buffers[i + 1].clone(), ranges.clone()).expect("Failed");
-        let cmp = UOp::new(Op::Binary(BinaryOp::Gt, left, right), DType::Bool);
-        cond = UOp::new(Op::Binary(BinaryOp::And, cond, cmp), DType::Bool);
+        let cmp = right.try_cmplt(&left).unwrap(); // a > b => b < a
+        cond = cond.try_and_op(&cmp).unwrap();
     }
 
     // true_val and false_val access more buffers
@@ -454,7 +454,7 @@ fn test_ternary_op_materialization() {
         b11.try_add_op(&b12).expect("Failed to create ADD")
     };
 
-    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_val, false_val), DType::Float32);
+    let where_op = UOp::where_(cond, true_val, false_val);
 
     // Apply buffer limit (10 buffer limit)
     let before_count = count_bufferizes(&where_op);
@@ -468,23 +468,20 @@ fn test_ternary_op_materialization() {
 
 #[test]
 fn test_is_elementwise() {
-    use morok_dtype::DType;
-    use morok_ir::ConstValue;
-
     // Binary operations are elementwise
-    let left = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let right = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let left = UOp::native_const(1.0f32);
+    let right = UOp::native_const(2.0f32);
     let add = left.try_add_op(&right).unwrap();
     assert!(is_elementwise(&add), "Binary ADD should be elementwise");
 
     // Ternary operations are elementwise
-    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let true_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let false_val = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let cond = UOp::native_const(true);
+    let true_val = UOp::native_const(1.0f32);
+    let false_val = UOp::native_const(2.0f32);
     let where_op = UOp::where_op(cond, true_val, false_val).unwrap();
     assert!(is_elementwise(&where_op), "Ternary WHERE should be elementwise");
 
     // Constants are not elementwise
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_op = UOp::native_const(1.0f32);
     assert!(!is_elementwise(&const_op), "CONST should not be elementwise");
 }

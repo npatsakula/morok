@@ -26,8 +26,8 @@ proptest! {
     /// x + 0 should simplify to x
     #[test]
     fn identity_add_zero_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), zero), DType::Int32);
+        let zero = UOp::native_const(0i32);
+        let expr = x.try_add_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -39,8 +39,8 @@ proptest! {
     /// 0 + x should simplify to x (commutativity)
     #[test]
     fn identity_add_zero_left(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(Op::Binary(BinaryOp::Add, zero, Rc::clone(&x)), DType::Int32);
+        let zero = UOp::native_const(0i32);
+        let expr = zero.try_add_op(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -52,8 +52,8 @@ proptest! {
     /// x - 0 should simplify to x
     #[test]
     fn identity_sub_zero(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(Op::Binary(BinaryOp::Sub, Rc::clone(&x), zero), DType::Int32);
+        let zero = UOp::native_const(0i32);
+        let expr = x.try_sub_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -65,8 +65,8 @@ proptest! {
     /// x * 1 should simplify to x
     #[test]
     fn identity_mul_one_right(x in arb_simple_uop(DType::Int32)) {
-        let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-        let expr = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&x), one), DType::Int32);
+        let one = UOp::native_const(1i32);
+        let expr = x.try_mul_op(&one).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -78,8 +78,8 @@ proptest! {
     /// 1 * x should simplify to x (commutativity)
     #[test]
     fn identity_mul_one_left(x in arb_simple_uop(DType::Int32)) {
-        let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-        let expr = UOp::new(Op::Binary(BinaryOp::Mul, one, Rc::clone(&x)), DType::Int32);
+        let one = UOp::native_const(1i32);
+        let expr = one.try_mul_op(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -91,8 +91,8 @@ proptest! {
     /// x / 1 should simplify to x (integer division)
     #[test]
     fn identity_idiv_one(x in arb_simple_uop(DType::Int32)) {
-        let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-        let expr = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&x), one), DType::Int32);
+        let one = UOp::native_const(1i32);
+        let expr = x.try_idiv_op(&one).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -104,8 +104,8 @@ proptest! {
     /// x | 0 should simplify to x
     #[test]
     fn identity_or_zero_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(Op::Binary(BinaryOp::Or, Rc::clone(&x), zero), DType::Int32);
+        let zero = UOp::native_const(0i32);
+        let expr = x.try_or_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -117,8 +117,8 @@ proptest! {
     /// x ^ 0 should simplify to x
     #[test]
     fn identity_xor_zero_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(Op::Binary(BinaryOp::Xor, Rc::clone(&x), zero), DType::Int32);
+        let zero = UOp::native_const(0i32);
+        let expr = x.try_xor_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -138,8 +138,8 @@ proptest! {
     /// x * 0 should simplify to 0
     #[test]
     fn zero_mul_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(Op::Binary(BinaryOp::Mul, x, Rc::clone(&zero)), DType::Int32);
+        let zero = UOp::native_const(0i32);
+        let expr = x.try_mul_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -151,8 +151,8 @@ proptest! {
     /// 0 * x should simplify to 0
     #[test]
     fn zero_mul_left(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(Op::Binary(BinaryOp::Mul, Rc::clone(&zero), x), DType::Int32);
+        let zero = UOp::native_const(0i32);
+        let expr = zero.try_mul_op(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -164,8 +164,8 @@ proptest! {
     /// x & 0 should simplify to 0
     #[test]
     fn zero_and_right(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(Op::Binary(BinaryOp::And, x, Rc::clone(&zero)), DType::Int32);
+        let zero = UOp::native_const(0i32);
+        let expr = x.try_and_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -177,8 +177,8 @@ proptest! {
     /// 0 & x should simplify to 0
     #[test]
     fn zero_and_left(x in arb_simple_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-        let expr = UOp::new(Op::Binary(BinaryOp::And, Rc::clone(&zero), x), DType::Int32);
+        let zero = UOp::native_const(0i32);
+        let expr = zero.try_and_op(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -198,7 +198,7 @@ proptest! {
     /// x / x should simplify to 1 (for x as variable, not constant 0)
     #[test]
     fn self_idiv_one(x in arb_var_uop(DType::Int32)) {
-        let expr = UOp::new(Op::Binary(BinaryOp::Idiv, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
+        let expr = x.try_idiv_op(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -214,7 +214,7 @@ proptest! {
     /// x & x should simplify to x (idempotent)
     #[test]
     fn self_and_identity(x in arb_simple_uop(DType::Int32)) {
-        let expr = UOp::new(Op::Binary(BinaryOp::And, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
+        let expr = x.try_and_op(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -226,7 +226,7 @@ proptest! {
     /// x | x should simplify to x (idempotent)
     #[test]
     fn self_or_identity(x in arb_simple_uop(DType::Int32)) {
-        let expr = UOp::new(Op::Binary(BinaryOp::Or, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
+        let expr = x.try_or_op(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -238,7 +238,7 @@ proptest! {
     /// x < x should simplify to false (for non-float types)
     #[test]
     fn self_lt_false(x in arb_var_uop(DType::Int32)) {
-        let expr = UOp::new(Op::Binary(BinaryOp::Lt, Rc::clone(&x), Rc::clone(&x)), DType::Bool);
+        let expr = x.try_cmplt(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -253,7 +253,7 @@ proptest! {
     /// x == x should simplify to true (for non-float types)
     #[test]
     fn self_eq_true(x in arb_var_uop(DType::Int32)) {
-        let expr = UOp::new(Op::Binary(BinaryOp::Eq, Rc::clone(&x), Rc::clone(&x)), DType::Bool);
+        let expr = x.try_cmpeq(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -268,7 +268,7 @@ proptest! {
     /// x != x should simplify to false (for non-float types)
     #[test]
     fn self_ne_false(x in arb_var_uop(DType::Int32)) {
-        let expr = UOp::new(Op::Binary(BinaryOp::Ne, Rc::clone(&x), Rc::clone(&x)), DType::Bool);
+        let expr = x.try_cmpne(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -293,7 +293,7 @@ proptest! {
     fn const_fold_add(a in arb_small_int(), b in arb_small_int()) {
         let a_uop = UOp::const_(DType::Int32, a);
         let b_uop = UOp::const_(DType::Int32, b);
-        let expr = UOp::new(Op::Binary(BinaryOp::Add, a_uop, b_uop), DType::Int32);
+        let expr = a_uop.try_add_op(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -319,7 +319,7 @@ proptest! {
     fn const_fold_mul(a in arb_small_int(), b in arb_small_int()) {
         let a_uop = UOp::const_(DType::Int32, a);
         let b_uop = UOp::const_(DType::Int32, b);
-        let expr = UOp::new(Op::Binary(BinaryOp::Mul, a_uop, b_uop), DType::Int32);
+        let expr = a_uop.try_mul_op(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -334,7 +334,7 @@ proptest! {
     fn const_fold_idiv(a in arb_small_int(), b in nonzero_int()) {
         let a_uop = UOp::const_(DType::Int32, a);
         let b_uop = UOp::const_(DType::Int32, b);
-        let expr = UOp::new(Op::Binary(BinaryOp::Idiv, a_uop, b_uop), DType::Int32);
+        let expr = a_uop.try_idiv_op(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -358,8 +358,8 @@ proptest! {
         x in arb_simple_uop(DType::Int32),
         y in arb_simple_uop(DType::Int32),
     ) {
-        let xy = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&x), Rc::clone(&y)), DType::Int32);
-        let yx = UOp::new(Op::Binary(BinaryOp::Add, Rc::clone(&y), Rc::clone(&x)), DType::Int32);
+        let xy = x.try_add_op(&y).unwrap();
+        let yx = y.try_add_op(&x).unwrap();
 
         let matcher = symbolic_simple();
         let opt_xy = graph_rewrite(&matcher, xy, &mut ());
@@ -380,8 +380,8 @@ proptest! {
     #[test]
     fn idempotent_and(x in arb_simple_uop(DType::Int32)) {
         // x & x & x = x & x = x
-        let x_and_x = UOp::new(Op::Binary(BinaryOp::And, Rc::clone(&x), Rc::clone(&x)), DType::Int32);
-        let x_and_x_and_x = UOp::new(Op::Binary(BinaryOp::And, Rc::clone(&x_and_x), Rc::clone(&x)), DType::Int32);
+        let x_and_x = x.try_and_op(&x).unwrap();
+        let x_and_x_and_x = x_and_x.try_and_op(&x).unwrap();
 
         let matcher = symbolic_simple();
         let opt1 = graph_rewrite(&matcher, x_and_x, &mut ());

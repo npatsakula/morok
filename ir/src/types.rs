@@ -193,6 +193,30 @@ impl ConstValue {
             _ => false,
         }
     }
+
+    /// Truncate value to fit within dtype boundaries (two's complement wrapping).
+    ///
+    /// This is equivalent to Tinygrad's ctypes-based truncation. Used for constant
+    /// folding to ensure results respect the target dtype's bit width.
+    pub fn truncate(self, dtype: ScalarDType) -> Self {
+        use ScalarDType::*;
+        match (self, dtype) {
+            // Signed integers: cast to target width, then back to i64
+            (Self::Int(v), Int8) => Self::Int((v as i8) as i64),
+            (Self::Int(v), Int16) => Self::Int((v as i16) as i64),
+            (Self::Int(v), Int32) => Self::Int((v as i32) as i64),
+            (Self::Int(v), Int64 | Index) => Self::Int(v),
+
+            // Unsigned integers: cast to target width, then back to u64
+            (Self::UInt(v), UInt8) => Self::UInt((v as u8) as u64),
+            (Self::UInt(v), UInt16) => Self::UInt((v as u16) as u64),
+            (Self::UInt(v), UInt32) => Self::UInt((v as u32) as u64),
+            (Self::UInt(v), UInt64) => Self::UInt(v),
+
+            // Float/Bool: no truncation needed
+            _ => self,
+        }
+    }
 }
 
 /// Memory address space for buffer allocation.

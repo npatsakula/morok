@@ -97,7 +97,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                     if begin == 0 {
                         Rc::clone(rng)
                     } else {
-                        let begin_uop = UOp::const_(DType::Index, ConstValue::Int(begin as i64));
+                        let begin_uop = UOp::index_const(begin as i64);
                         rng.try_add_op(&begin_uop).unwrap()
                     }
                 })
@@ -120,9 +120,9 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                     Rc::clone(rng)
                 } else {
                     let shape_minus_1 = match shape {
-                        SInt::Const(n) => UOp::const_(DType::Index, ConstValue::Int(*n as i64 - 1)),
+                        SInt::Const(n) => UOp::index_const(*n as i64 - 1),
                         SInt::Symbolic(uop) => {
-                            let one = UOp::const_(DType::Index, ConstValue::Int(1));
+                            let one = UOp::index_const(1);
                             uop.try_sub_op(&one).unwrap()
                         }
                     };
@@ -143,7 +143,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                         (SInt::Const(1), SInt::Symbolic(_)) => true,
                         _ => false,
                     };
-                    if expanding { UOp::const_(DType::Index, ConstValue::Int(0)) } else { Rc::clone(rng) }
+                    if expanding { UOp::index_const(0) } else { Rc::clone(rng) }
                 })
                 .collect()
         }
@@ -159,9 +159,9 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                     if begin == 0 && end == 0 {
                         return Rc::clone(rng);
                     }
-                    let begin_uop = UOp::const_(DType::Index, ConstValue::Int(begin as i64));
+                    let begin_uop = UOp::index_const(begin as i64);
                     let shape_plus_begin = match shape {
-                        SInt::Const(n) => UOp::const_(DType::Index, ConstValue::Int(*n as i64 + begin as i64)),
+                        SInt::Const(n) => UOp::index_const(*n as i64 + begin as i64),
                         SInt::Symbolic(uop) => uop.try_add_op(&begin_uop).unwrap(),
                     };
                     // rng >= begin  (use !(rng < begin) implemented as (rng < begin) XOR true)
@@ -184,29 +184,27 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
         Op::Reshape { new_shape, .. } => {
             let new_shape_vals = extract_shape_from_uop(new_shape);
             // Step 1: Flatten output indices
-            let mut acc = UOp::const_(DType::Index, ConstValue::Int(1));
+            let mut acc = UOp::index_const(1);
             let mut axes_in = Vec::new();
             for (shape_dim, rng) in new_shape_vals.iter().zip(rngs.iter()).rev() {
                 let weighted = acc.try_mul_op(rng).unwrap();
                 axes_in.push(weighted);
                 acc = match shape_dim {
                     SInt::Const(n) => {
-                        let n_uop = UOp::const_(DType::Index, ConstValue::Int(*n as i64));
+                        let n_uop = UOp::index_const(*n as i64);
                         acc.try_mul_op(&n_uop).unwrap()
                     }
                     SInt::Symbolic(uop) => acc.try_mul_op(uop).unwrap(),
                 };
             }
-            let combined_axes = axes_in
-                .into_iter()
-                .reduce(|a, b| a.try_add_op(&b).unwrap())
-                .unwrap_or_else(|| UOp::const_(DType::Index, ConstValue::Int(0)));
+            let combined_axes =
+                axes_in.into_iter().reduce(|a, b| a.try_add_op(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
             // Step 2: Unflatten into input shape dimensions
             let mut axes_out = Vec::new();
             let mut combined = combined_axes;
             for shape_dim in in_shape.iter().rev() {
                 let shape_uop = match shape_dim {
-                    SInt::Const(n) => UOp::const_(DType::Index, ConstValue::Int(*n as i64)),
+                    SInt::Const(n) => UOp::index_const(*n as i64),
                     SInt::Symbolic(uop) => Rc::clone(uop),
                 };
                 let mod_result = combined.try_mod_op(&shape_uop).unwrap();

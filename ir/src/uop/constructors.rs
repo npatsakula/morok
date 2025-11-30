@@ -5,14 +5,15 @@
 
 use std::rc::Rc;
 
+use morok_dtype::ext::HasDType;
 use smallvec::SmallVec;
 use snafu::ensure;
 
 use crate::error::{Error, IndexTypeMismatchSnafu, Result};
 use crate::op::Op;
-use crate::types::*;
 use crate::uop::core::UOp;
 use crate::uop::hash_consing::next_unique_id;
+use crate::{IntoUOp, types::*};
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
 
@@ -20,6 +21,16 @@ impl UOp {
     /// Create a constant UOp.
     pub fn const_(dtype: DType, value: ConstValue) -> Rc<Self> {
         Self::new(Op::Const(ConstValueHash(value)), dtype)
+    }
+
+    /// Create a constant UOp from a Rust native value.
+    pub fn native_const<T: HasDType + IntoUOp>(value: T) -> Rc<Self> {
+        value.into_uop(T::DTYPE)
+    }
+
+    /// Create an index constant.
+    pub fn index_const(value: i64) -> Rc<Self> {
+        Self::const_(DType::Index, ConstValue::Int(value))
     }
 
     /// Create a unique identifier.
@@ -274,6 +285,35 @@ impl UOp {
     pub fn range_const(end_value: i64, axis_id: usize) -> Rc<Self> {
         let end = Self::const_(DType::Index, ConstValue::Int(end_value));
         Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
+    }
+
+    /// Create a WHERE operation (ternary select).
+    ///
+    /// Selects between `true_val` and `false_val` based on `cond`.
+    /// Returns `true_val` where `cond` is true, `false_val` otherwise.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let result = UOp::where_(cond, true_val, false_val);
+    /// ```
+    pub fn where_(cond: Rc<Self>, true_val: Rc<Self>, false_val: Rc<Self>) -> Rc<Self> {
+        let dtype = true_val.dtype.clone();
+        Self::new(Op::Ternary(TernaryOp::Where, cond, true_val, false_val), dtype)
+    }
+
+    /// Create a COPY operation with explicit device UOp.
+    ///
+    /// Unlike `copy_to_device` which takes a `DeviceSpec`, this takes
+    /// a device UOp directly (useful when you already have one).
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let device = UOp::device(DeviceSpec::Cpu);
+    /// let copy = UOp::copy(src, device);
+    /// ```
+    pub fn copy(src: Rc<Self>, device: Rc<Self>) -> Rc<Self> {
+        let dtype = src.dtype.clone();
+        Self::new(Op::Copy { src, device }, dtype)
     }
 }
 

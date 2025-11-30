@@ -122,7 +122,7 @@ fn test_broadcast_shapes_multiple() {
 
 #[test]
 fn test_infer_const_shape() {
-    let scalar = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let scalar = UOp::native_const(42.0f32);
     let shape = scalar.shape().unwrap().expect("Const should have shape");
     assert_eq!(shape.len(), 0); // Scalar has empty shape
 }
@@ -137,7 +137,7 @@ fn test_infer_vconst_shape() {
 
 #[test]
 fn test_infer_unary_shape() {
-    let val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
+    let val = UOp::native_const(5.0f32);
     let neg = UOp::neg_op(val);
     let shape = neg.shape().unwrap().expect("Unary should have shape");
     assert_eq!(shape.len(), 0); // Preserves scalar shape
@@ -145,8 +145,8 @@ fn test_infer_unary_shape() {
 
 #[test]
 fn test_infer_binary_shape() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
     let add = a.try_add_op(&b).unwrap();
     let shape = add.shape().unwrap().expect("Binary should have shape");
     assert_eq!(shape.len(), 0); // Both scalars -> scalar result
@@ -154,7 +154,7 @@ fn test_infer_binary_shape() {
 
 #[test]
 fn test_infer_cast_shape() {
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.5));
+    let val = UOp::native_const(1.5f32);
     let cast = UOp::cast(val, DType::Int32);
     let shape = cast.shape().unwrap().expect("Cast should preserve shape");
     assert_eq!(shape.len(), 0);
@@ -162,7 +162,7 @@ fn test_infer_cast_shape() {
 
 #[test]
 fn test_shape_caching() {
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let val = UOp::native_const(1.0f32);
     // First access computes shape
     let shape1 = val.shape().unwrap().expect("Should have shape");
     // Second access uses cached value (same pointer)

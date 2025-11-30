@@ -2,7 +2,7 @@ use crate::pattern::UPat;
 use crate::pattern::{PatternMatcher, RewriteResult};
 use crate::rangeify::helpers::{get_const_value, is_identity_value};
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, Op, UOp};
+use morok_ir::{BinaryOp, ConstValue, UOp};
 use std::rc::Rc;
 
 #[test]
@@ -28,7 +28,7 @@ fn test_pattern_macro_basic() {
 
     let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let add = UOp::new(Op::Binary(BinaryOp::Add, five.clone(), zero), DType::Int32);
+    let add = five.try_add_op(&zero).unwrap();
 
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -57,7 +57,7 @@ fn test_pattern_macro_no_match() {
     // 5 + 3 (not identity) should not match
     let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     let three = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let add = UOp::new(Op::Binary(BinaryOp::Add, five, three), DType::Int32);
+    let add = five.try_add_op(&three).unwrap();
 
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch));
@@ -86,7 +86,7 @@ fn test_pattern_macro_multiple_variables() {
 
     let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let mul = UOp::new(Op::Binary(BinaryOp::Mul, five, zero.clone()), DType::Int32);
+    let mul = five.try_mul_op(&zero).unwrap();
 
     let result = matcher.rewrite(&mul, &mut ());
     match &result {

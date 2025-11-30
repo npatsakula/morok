@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, ConstValue, Op, SInt, UOp, UnaryOp};
+use morok_ir::{AxisId, AxisType, Op, SInt, UOp};
 
 use crate::rangeify::movement_patterns::movement_op_patterns;
 use crate::rewrite::graph_rewrite;
@@ -21,7 +21,7 @@ fn create_buffer(size: usize) -> Rc<UOp> {
 
 /// Create a RANGE for testing.
 fn create_range(size: usize, axis_id: usize) -> Rc<UOp> {
-    let end = UOp::const_(DType::Index, ConstValue::Int(size as i64));
+    let end = UOp::index_const(size as i64);
     UOp::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
 }
 
@@ -42,14 +42,7 @@ fn test_expand_index_transformation() {
         buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(1), SInt::Const(20)].into_iter().collect()).unwrap();
 
     // Expand to [10, 5, 20]
-    let shape2 = UOp::vectorize(
-        vec![
-            UOp::const_(DType::Index, ConstValue::Int(10)),
-            UOp::const_(DType::Index, ConstValue::Int(5)),
-            UOp::const_(DType::Index, ConstValue::Int(20)),
-        ]
-        .into(),
-    );
+    let shape2 = UOp::vectorize(vec![UOp::index_const(10), UOp::index_const(5), UOp::index_const(20)].into());
     let expanded = UOp::new(Op::Expand { src: reshaped, new_shape: shape2 }, DType::Float32);
 
     // Create INDEX with ranges [r0, r1, r2]
@@ -160,12 +153,8 @@ fn test_shrink_index_transformation() {
     let reshaped = buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(40)].into_iter().collect()).unwrap();
 
     // SHRINK: begin=[0, 10], end=[5, 30]
-    let begins = UOp::vectorize(
-        vec![UOp::const_(DType::Index, ConstValue::Int(0)), UOp::const_(DType::Index, ConstValue::Int(10))].into(),
-    );
-    let ends = UOp::vectorize(
-        vec![UOp::const_(DType::Index, ConstValue::Int(5)), UOp::const_(DType::Index, ConstValue::Int(30))].into(),
-    );
+    let begins = UOp::vectorize(vec![UOp::index_const(0), UOp::index_const(10)].into());
+    let ends = UOp::vectorize(vec![UOp::index_const(5), UOp::index_const(30)].into());
     let shrunk = UOp::new(Op::Shrink { src: reshaped, begins, ends }, DType::Float32);
 
     // Create INDEX
@@ -218,12 +207,8 @@ fn test_pad_index_transformation() {
     let reshaped = buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(20)].into_iter().collect()).unwrap();
 
     // PAD: add 1 padding on each side of first dim, 2 on each side of second dim
-    let begin_pads = UOp::vectorize(
-        vec![UOp::const_(DType::Index, ConstValue::Int(1)), UOp::const_(DType::Index, ConstValue::Int(2))].into(),
-    );
-    let end_pads = UOp::vectorize(
-        vec![UOp::const_(DType::Index, ConstValue::Int(1)), UOp::const_(DType::Index, ConstValue::Int(2))].into(),
-    );
+    let begin_pads = UOp::vectorize(vec![UOp::index_const(1), UOp::index_const(2)].into());
+    let end_pads = UOp::vectorize(vec![UOp::index_const(1), UOp::index_const(2)].into());
     let padded = UOp::new(Op::Pad { src: reshaped, begin_pads, end_pads }, DType::Float32);
 
     // Create INDEX
@@ -248,7 +233,7 @@ fn test_non_movement_op_no_match() {
     let buffer = create_buffer(100);
 
     // Create a non-movement op (NEG) - using unary op to avoid shape issues
-    let negated = UOp::new(Op::Unary(UnaryOp::Neg, buffer), DType::Float32);
+    let negated = buffer.neg();
 
     // Create INDEX
     let r0 = create_range(100, 0);
@@ -282,9 +267,7 @@ fn test_nested_movement_ops() {
     let reshaped1 = buffer.try_reshape(&vec![SInt::Const(10), SInt::Const(1)].into_iter().collect()).unwrap();
 
     // Expand to [10, 5]
-    let shape = UOp::vectorize(
-        vec![UOp::const_(DType::Index, ConstValue::Int(10)), UOp::const_(DType::Index, ConstValue::Int(5))].into(),
-    );
+    let shape = UOp::vectorize(vec![UOp::index_const(10), UOp::index_const(5)].into());
     let expanded = UOp::new(Op::Expand { src: reshaped1, new_shape: shape }, DType::Float32);
 
     // Reshape to [50]

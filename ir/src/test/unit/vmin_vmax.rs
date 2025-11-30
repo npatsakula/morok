@@ -1,6 +1,8 @@
 //! Unit tests for vmin/vmax range analysis.
 
-use crate::{AxisId, BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
+use std::f32::consts::PI;
+
+use crate::{AxisId, ConstValue, Op, UOp};
 use morok_dtype::DType;
 
 // ============================================================================
@@ -9,21 +11,17 @@ use morok_dtype::DType;
 
 #[test]
 fn test_vmin_vmax_const() {
-    let five = UOp::const_(DType::Int32, ConstValue::Int(5));
-    assert_eq!(five.vmin(), &ConstValue::Int(5));
-    assert_eq!(five.vmax(), &ConstValue::Int(5));
+    assert_eq!(UOp::native_const(5i32).vmin(), &ConstValue::Int(5));
+    assert_eq!(UOp::native_const(5i32).vmax(), &ConstValue::Int(5));
 
-    let neg_three = UOp::const_(DType::Int32, ConstValue::Int(-3));
-    assert_eq!(neg_three.vmin(), &ConstValue::Int(-3));
-    assert_eq!(neg_three.vmax(), &ConstValue::Int(-3));
+    assert_eq!(UOp::native_const(-3i32).vmin(), &ConstValue::Int(-3));
+    assert_eq!(UOp::native_const(-3i32).vmax(), &ConstValue::Int(-3));
 
-    let pi = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
-    assert_eq!(pi.vmin(), &ConstValue::Float(std::f32::consts::PI as f64));
-    assert_eq!(pi.vmax(), &ConstValue::Float(std::f32::consts::PI as f64));
+    assert_eq!(UOp::native_const(PI).vmin(), &ConstValue::Float(PI as f64));
+    assert_eq!(UOp::native_const(PI).vmax(), &ConstValue::Float(PI as f64));
 
-    let bool_true = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    assert_eq!(bool_true.vmin(), &ConstValue::Bool(true));
-    assert_eq!(bool_true.vmax(), &ConstValue::Bool(true));
+    assert_eq!(UOp::native_const(true).vmin(), &ConstValue::Bool(true));
+    assert_eq!(UOp::native_const(true).vmax(), &ConstValue::Bool(true));
 }
 
 // ============================================================================
@@ -32,9 +30,7 @@ fn test_vmin_vmax_const() {
 
 #[test]
 fn test_vmin_vmax_add() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let sum = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Int32);
+    let sum = UOp::native_const(2i32).try_add_op(&UOp::native_const(3i32)).unwrap();
 
     assert_eq!(sum.vmin(), &ConstValue::Int(5));
     assert_eq!(sum.vmax(), &ConstValue::Int(5));
@@ -42,9 +38,9 @@ fn test_vmin_vmax_add() {
 
 #[test]
 fn test_vmin_vmax_sub() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let diff = UOp::new(Op::Binary(BinaryOp::Sub, a, b), DType::Int32);
+    let a = UOp::native_const(10i32);
+    let b = UOp::native_const(3i32);
+    let diff = a.try_sub_op(&b).unwrap();
 
     assert_eq!(diff.vmin(), &ConstValue::Int(7));
     assert_eq!(diff.vmax(), &ConstValue::Int(7));
@@ -52,9 +48,9 @@ fn test_vmin_vmax_sub() {
 
 #[test]
 fn test_vmin_vmax_mul() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(-2));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let prod = UOp::new(Op::Binary(BinaryOp::Mul, a, b), DType::Int32);
+    let a = UOp::native_const(-2i32);
+    let b = UOp::native_const(3i32);
+    let prod = a.try_mul_op(&b).unwrap();
 
     assert_eq!(prod.vmin(), &ConstValue::Int(-6));
     assert_eq!(prod.vmax(), &ConstValue::Int(-6));
@@ -63,9 +59,9 @@ fn test_vmin_vmax_mul() {
 #[test]
 fn test_vmin_vmax_mul_range() {
     // Test multiplication with ranges
-    let a = UOp::new(Op::DefineVar { name: "a".to_string(), min_val: -2, max_val: 3 }, DType::Int32);
-    let b = UOp::new(Op::DefineVar { name: "b".to_string(), min_val: -1, max_val: 4 }, DType::Int32);
-    let prod = UOp::new(Op::Binary(BinaryOp::Mul, a, b), DType::Int32);
+    let a = UOp::define_var("a".to_string(), -2, 3);
+    let b = UOp::define_var("b".to_string(), -1, 4);
+    let prod = a.try_mul_op(&b).unwrap();
 
     // Check all 4 corners: -2*-1=2, -2*4=-8, 3*-1=-3, 3*4=12
     // Min is -8, max is 12
@@ -75,9 +71,9 @@ fn test_vmin_vmax_mul_range() {
 
 #[test]
 fn test_vmin_vmax_max() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let max_val = UOp::new(Op::Binary(BinaryOp::Max, a, b), DType::Int32);
+    let a = UOp::native_const(5i32);
+    let b = UOp::native_const(10i32);
+    let max_val = a.try_max_op(&b).unwrap();
 
     assert_eq!(max_val.vmin(), &ConstValue::Int(10));
     assert_eq!(max_val.vmax(), &ConstValue::Int(10));
@@ -85,9 +81,9 @@ fn test_vmin_vmax_max() {
 
 #[test]
 fn test_vmin_vmax_idiv() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(15));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let div = UOp::new(Op::Binary(BinaryOp::Idiv, a, b), DType::Int32);
+    let a = UOp::native_const(15i32);
+    let b = UOp::native_const(3i32);
+    let div = a.try_idiv_op(&b).unwrap();
 
     assert_eq!(div.vmin(), &ConstValue::Int(5));
     assert_eq!(div.vmax(), &ConstValue::Int(5));
@@ -95,9 +91,9 @@ fn test_vmin_vmax_idiv() {
 
 #[test]
 fn test_vmin_vmax_mod() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(17));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let modulo = UOp::new(Op::Binary(BinaryOp::Mod, a, b), DType::Int32);
+    let a = UOp::native_const(17i32);
+    let b = UOp::native_const(5i32);
+    let modulo = a.try_mod_op(&b).unwrap();
 
     assert_eq!(modulo.vmin(), &ConstValue::Int(2));
     assert_eq!(modulo.vmax(), &ConstValue::Int(2));
@@ -109,8 +105,8 @@ fn test_vmin_vmax_mod() {
 
 #[test]
 fn test_vmin_vmax_neg() {
-    let five = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let neg = UOp::new(Op::Unary(UnaryOp::Neg, five), DType::Int32);
+    let five = UOp::native_const(5i32);
+    let neg = five.neg();
 
     assert_eq!(neg.vmin(), &ConstValue::Int(-5));
     assert_eq!(neg.vmax(), &ConstValue::Int(-5));
@@ -118,8 +114,8 @@ fn test_vmin_vmax_neg() {
 
 #[test]
 fn test_vmin_vmax_neg_range() {
-    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: -3, max_val: 5 }, DType::Int32);
-    let neg = UOp::new(Op::Unary(UnaryOp::Neg, var), DType::Int32);
+    let var = UOp::define_var("x".to_string(), -3, 5);
+    let neg = var.neg();
 
     // Negation flips the range
     assert_eq!(neg.vmin(), &ConstValue::Int(-5));
@@ -132,9 +128,9 @@ fn test_vmin_vmax_neg_range() {
 
 #[test]
 fn test_vmin_vmax_cmplt() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let cmp = UOp::new(Op::Binary(BinaryOp::Lt, a, b), DType::Bool);
+    let a = UOp::native_const(5i32);
+    let b = UOp::native_const(10i32);
+    let cmp = a.try_cmplt(&b).unwrap();
 
     // 5 < 10 is always true, so range is [true, true]
     assert_eq!(cmp.vmin(), &ConstValue::Bool(true));
@@ -143,9 +139,9 @@ fn test_vmin_vmax_cmplt() {
 
 #[test]
 fn test_vmin_vmax_eq() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let eq = UOp::new(Op::Binary(BinaryOp::Eq, a, b), DType::Bool);
+    let a = UOp::native_const(5i32);
+    let b = UOp::native_const(5i32);
+    let eq = a.try_cmpeq(&b).unwrap();
 
     // 5 == 5 is always true, so range is [true, true]
     assert_eq!(eq.vmin(), &ConstValue::Bool(true));
@@ -158,9 +154,7 @@ fn test_vmin_vmax_eq() {
 
 #[test]
 fn test_vmin_vmax_and_bool() {
-    let a = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let b = UOp::const_(DType::Bool, ConstValue::Bool(false));
-    let and = UOp::new(Op::Binary(BinaryOp::And, a, b), DType::Bool);
+    let and = UOp::native_const(true).try_and_op(&UOp::native_const(false)).unwrap();
 
     // true & false = false
     assert_eq!(and.vmin(), &ConstValue::Bool(false));
@@ -169,9 +163,7 @@ fn test_vmin_vmax_and_bool() {
 
 #[test]
 fn test_vmin_vmax_or_bool() {
-    let a = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let b = UOp::const_(DType::Bool, ConstValue::Bool(false));
-    let or = UOp::new(Op::Binary(BinaryOp::Or, a, b), DType::Bool);
+    let or = UOp::native_const(true).try_or_op(&UOp::native_const(false)).unwrap();
 
     // true | false = true
     assert_eq!(or.vmin(), &ConstValue::Bool(true));
@@ -180,9 +172,9 @@ fn test_vmin_vmax_or_bool() {
 
 #[test]
 fn test_vmin_vmax_and_int() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(15)); // 0b1111
-    let b = UOp::const_(DType::Int32, ConstValue::Int(7)); // 0b0111
-    let and = UOp::new(Op::Binary(BinaryOp::And, a, b), DType::Int32);
+    let a = UOp::native_const(15i32); // 0b1111
+    let b = UOp::native_const(7i32); // 0b0111
+    let and = a.try_and_op(&b).unwrap();
 
     // 15 & 7 = 7
     assert_eq!(and.vmin(), &ConstValue::Int(7));
@@ -191,9 +183,9 @@ fn test_vmin_vmax_and_int() {
 
 #[test]
 fn test_vmin_vmax_shl() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let shl = UOp::new(Op::Binary(BinaryOp::Shl, a, b), DType::Int32);
+    let a = UOp::native_const(3i32);
+    let b = UOp::native_const(2i32);
+    let shl = a.try_shl_op(&b).unwrap();
 
     // 3 << 2 = 12
     assert_eq!(shl.vmin(), &ConstValue::Int(12));
@@ -202,9 +194,9 @@ fn test_vmin_vmax_shl() {
 
 #[test]
 fn test_vmin_vmax_shr() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(12));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let shr = UOp::new(Op::Binary(BinaryOp::Shr, a, b), DType::Int32);
+    let a = UOp::native_const(12i32);
+    let b = UOp::native_const(2i32);
+    let shr = a.try_shr_op(&b).unwrap();
 
     // 12 >> 2 = 3
     assert_eq!(shr.vmin(), &ConstValue::Int(3));
@@ -217,7 +209,7 @@ fn test_vmin_vmax_shr() {
 
 #[test]
 fn test_vmin_vmax_define_var() {
-    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: -10, max_val: 20 }, DType::Int32);
+    let var = UOp::define_var("x".to_string(), -10, 20);
 
     assert_eq!(var.vmin(), &ConstValue::Int(-10));
     assert_eq!(var.vmax(), &ConstValue::Int(20));
@@ -225,7 +217,7 @@ fn test_vmin_vmax_define_var() {
 
 #[test]
 fn test_vmin_vmax_range() {
-    let end = UOp::const_(DType::Int32, ConstValue::Int(10));
+    let end = UOp::native_const(10i32);
     let range = UOp::new(
         Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: crate::types::AxisType::Loop },
         DType::Int32,
@@ -238,8 +230,8 @@ fn test_vmin_vmax_range() {
 
 #[test]
 fn test_vmin_vmax_cast() {
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(5.7));
-    let int_val = UOp::new(Op::Cast { src: float_val.clone(), dtype: DType::Float32 }, DType::Int32);
+    let float_val = UOp::native_const(5.7f32);
+    let int_val = UOp::cast(float_val.clone(), DType::Int32);
 
     // Cast from 5.7 to int = 5
     assert_eq!(int_val.vmin(), &ConstValue::Int(5));
@@ -248,9 +240,9 @@ fn test_vmin_vmax_cast() {
 
 #[test]
 fn test_vmin_vmax_cast_range() {
-    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: -1000, max_val: 1000 }, DType::Int32);
+    let var = UOp::define_var("x".to_string(), -1000, 1000);
     // Cast to Int8 which has range [-128, 127]
-    let casted = UOp::new(Op::Cast { src: var.clone(), dtype: DType::Int32 }, DType::Int8);
+    let casted = UOp::cast(var.clone(), DType::Int8);
 
     // Should be clamped to Int8 bounds
     assert_eq!(casted.vmin(), &ConstValue::Int(-128));
@@ -263,10 +255,7 @@ fn test_vmin_vmax_cast_range() {
 
 #[test]
 fn test_vmin_vmax_where_true() {
-    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let true_val = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let false_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_val, false_val), DType::Int32);
+    let where_op = UOp::where_(UOp::native_const(true), UOp::native_const(10i32), UOp::native_const(5i32));
 
     // Condition is always true, so result is true_val
     assert_eq!(where_op.vmin(), &ConstValue::Int(10));
@@ -275,10 +264,7 @@ fn test_vmin_vmax_where_true() {
 
 #[test]
 fn test_vmin_vmax_where_false() {
-    let cond = UOp::const_(DType::Bool, ConstValue::Bool(false));
-    let true_val = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let false_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_val, false_val), DType::Int32);
+    let where_op = UOp::where_(UOp::native_const(false), UOp::native_const(10i32), UOp::native_const(5i32));
 
     // Condition is always false, so result is false_val
     assert_eq!(where_op.vmin(), &ConstValue::Int(5));
@@ -288,10 +274,10 @@ fn test_vmin_vmax_where_false() {
 #[test]
 fn test_vmin_vmax_where_range() {
     // Condition can be either true or false
-    let cond = UOp::new(Op::DefineVar { name: "cond".to_string(), min_val: 0, max_val: 1 }, DType::Bool);
-    let true_val = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let false_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, true_val, false_val), DType::Int32);
+    let cond = UOp::define_var("cond".to_string(), 0, 1);
+    let true_val = UOp::native_const(10i32);
+    let false_val = UOp::native_const(5i32);
+    let where_op = UOp::where_(cond, true_val, false_val);
 
     // Could be either branch
     assert_eq!(where_op.vmin(), &ConstValue::Int(5));
@@ -300,10 +286,10 @@ fn test_vmin_vmax_where_range() {
 
 #[test]
 fn test_vmin_vmax_mulacc() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(4));
-    let c = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let mulacc = UOp::new(Op::Ternary(TernaryOp::MulAcc, a, b, c), DType::Int32);
+    let a = UOp::native_const(3i32);
+    let b = UOp::native_const(4i32);
+    let c = UOp::native_const(5i32);
+    let mulacc = UOp::mulacc_op(a, b, c).unwrap();
 
     // 3 * 4 + 5 = 17
     assert_eq!(mulacc.vmin(), &ConstValue::Int(17));
@@ -317,12 +303,12 @@ fn test_vmin_vmax_mulacc() {
 #[test]
 fn test_vmin_vmax_complex_expression() {
     // Test: (x + 5) * 2 where x in [0, 10]
-    let x = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Int32);
-    let five = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let x = UOp::var("x", DType::Int32, 0, 10);
+    let five = UOp::native_const(5i32);
+    let two = UOp::native_const(2i32);
 
-    let x_plus_5 = UOp::new(Op::Binary(BinaryOp::Add, x, five), DType::Int32);
-    let result = UOp::new(Op::Binary(BinaryOp::Mul, x_plus_5, two), DType::Int32);
+    let x_plus_5 = x.try_add_op(&five).unwrap();
+    let result = x_plus_5.try_mul_op(&two).unwrap();
 
     // x in [0, 10] => x+5 in [5, 15] => (x+5)*2 in [10, 30]
     assert_eq!(result.vmin(), &ConstValue::Int(10));
@@ -332,12 +318,12 @@ fn test_vmin_vmax_complex_expression() {
 #[test]
 fn test_vmin_vmax_nested_max() {
     // Test: max(max(a, b), c) where a=3, b=7, c=5
-    let a = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(7));
-    let c = UOp::const_(DType::Int32, ConstValue::Int(5));
+    let a = UOp::native_const(3i32);
+    let b = UOp::native_const(7i32);
+    let c = UOp::native_const(5i32);
 
-    let max_ab = UOp::new(Op::Binary(BinaryOp::Max, a, b), DType::Int32);
-    let max_abc = UOp::new(Op::Binary(BinaryOp::Max, max_ab, c), DType::Int32);
+    let max_ab = a.try_max_op(&b).unwrap();
+    let max_abc = max_ab.try_max_op(&c).unwrap();
 
     assert_eq!(max_abc.vmin(), &ConstValue::Int(7));
     assert_eq!(max_abc.vmax(), &ConstValue::Int(7));
@@ -349,22 +335,22 @@ fn test_vmin_vmax_nested_max() {
 
 #[test]
 fn test_vmin_vmax_float_ops() {
-    let a = UOp::const_(DType::Float32, ConstValue::Float(2.5));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(1.5));
+    let a = UOp::native_const(2.5f32);
+    let b = UOp::native_const(1.5f32);
 
-    let sum = UOp::new(Op::Binary(BinaryOp::Add, a.clone(), b.clone()), DType::Float32);
+    let sum = a.try_add_op(&b).unwrap();
     assert_eq!(sum.vmin(), &ConstValue::Float(4.0));
     assert_eq!(sum.vmax(), &ConstValue::Float(4.0));
 
-    let diff = UOp::new(Op::Binary(BinaryOp::Sub, a.clone(), b.clone()), DType::Float32);
+    let diff = a.try_sub_op(&b).unwrap();
     assert_eq!(diff.vmin(), &ConstValue::Float(1.0));
     assert_eq!(diff.vmax(), &ConstValue::Float(1.0));
 
-    let prod = UOp::new(Op::Binary(BinaryOp::Mul, a.clone(), b.clone()), DType::Float32);
+    let prod = a.try_mul_op(&b).unwrap();
     assert_eq!(prod.vmin(), &ConstValue::Float(3.75));
     assert_eq!(prod.vmax(), &ConstValue::Float(3.75));
 
-    let div = UOp::new(Op::Binary(BinaryOp::Fdiv, a.clone(), b.clone()), DType::Float32);
+    let div = a.try_fdiv_op(&b).unwrap();
     // 2.5 / 1.5 = 1.666...
     if let ConstValue::Float(min_val) = div.vmin() {
         assert!((min_val - 1.6666666666666667).abs() < 1e-10);
@@ -380,16 +366,9 @@ fn test_vmin_vmax_float_ops() {
 #[test]
 fn test_vmin_vmax_division_by_zero_range() {
     // Test division when divisor range includes zero
-    let a = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let b = UOp::new(
-        Op::DefineVar {
-            name: "b".to_string(),
-            min_val: -1,
-            max_val: 1, // Includes zero!
-        },
-        DType::Int32,
-    );
-    let div = UOp::new(Op::Binary(BinaryOp::Idiv, a, b), DType::Int32);
+    let a = UOp::native_const(10i32);
+    let b = UOp::var("b", DType::Int32, -1, 1); // Includes zero!
+    let div = a.try_idiv_op(&b).unwrap();
 
     // Division by zero range returns dtype bounds
     assert_eq!(div.vmin(), &ConstValue::Int(i32::MIN as i64));
@@ -399,16 +378,9 @@ fn test_vmin_vmax_division_by_zero_range() {
 #[test]
 fn test_vmin_vmax_mod_by_zero_range() {
     // Test modulo when divisor range includes zero
-    let a = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let b = UOp::new(
-        Op::DefineVar {
-            name: "b".to_string(),
-            min_val: -1,
-            max_val: 1, // Includes zero!
-        },
-        DType::Int32,
-    );
-    let modulo = UOp::new(Op::Binary(BinaryOp::Mod, a, b), DType::Int32);
+    let a = UOp::native_const(10i32);
+    let b = UOp::var("b", DType::Int32, -1, 1); // Includes zero!
+    let modulo = a.try_mod_op(&b).unwrap();
 
     // Modulo by zero range returns dtype bounds
     assert_eq!(modulo.vmin(), &ConstValue::Int(i32::MIN as i64));
@@ -417,9 +389,9 @@ fn test_vmin_vmax_mod_by_zero_range() {
 
 #[test]
 fn test_vmin_vmax_shift_overflow() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(64)); // Shift by 64 or more
-    let shl = UOp::new(Op::Binary(BinaryOp::Shl, a, b), DType::Int32);
+    let a = UOp::native_const(1i32);
+    let b = UOp::native_const(64i32); // Shift by 64 or more
+    let shl = a.try_shl_op(&b).unwrap();
 
     // Shift by >= 64 returns dtype bounds
     assert_eq!(shl.vmin(), &ConstValue::Int(i32::MIN as i64));

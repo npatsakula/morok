@@ -23,8 +23,8 @@ fn test_simple_add_zero_pattern() {
     };
 
     // Create x + 0
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
     let add = binary(BinaryOp::Add, x.clone(), zero);
 
     let result = matcher.rewrite(&add, &mut ());
@@ -44,8 +44,8 @@ fn test_mul_one_pattern() {
     };
 
     // Create x * 1
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let x = UOp::native_const(42i32);
+    let one = UOp::native_const(1i32);
     let mul = binary(BinaryOp::Mul, x.clone(), one);
 
     let result = matcher.rewrite(&mul, &mut ());
@@ -65,8 +65,8 @@ fn test_binding_pattern() {
     };
 
     // Create x * 0
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
     let mul = binary(BinaryOp::Mul, x, zero.clone());
 
     let result = matcher.rewrite(&mul, &mut ());
@@ -88,9 +88,9 @@ fn test_multiple_patterns() {
     };
 
     // Test x + 0
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
+    let one = UOp::native_const(1i32);
 
     let add_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
     match matcher.rewrite(&add_zero, &mut ()) {
@@ -120,8 +120,8 @@ fn test_no_match() {
     };
 
     // Create x + 1 (should not match)
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let x = UOp::native_const(42i32);
+    let one = UOp::native_const(1i32);
     let add = binary(BinaryOp::Add, x, one);
 
     let result = matcher.rewrite(&add, &mut ());
@@ -141,9 +141,9 @@ fn test_pattern_matcher_composition() {
     // Compose pattern matchers
     let combined = pm1 + pm2;
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
+    let one = UOp::native_const(1i32);
 
     // Test x + 0
     let add_zero = binary(BinaryOp::Add, x.clone(), zero);
@@ -174,8 +174,8 @@ fn test_complex_guard_with_block() {
     };
 
     // Test x + 0 (int) - should match
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero_int = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(42i32);
+    let zero_int = UOp::native_const(0i32);
     let add_zero_int = binary(BinaryOp::Add, x.clone(), zero_int);
 
     match matcher.rewrite(&add_zero_int, &mut ()) {
@@ -184,8 +184,8 @@ fn test_complex_guard_with_block() {
     }
 
     // Test x + 0.0 (float) - should match
-    let x_f32 = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let zero_float = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let x_f32 = UOp::native_const(42.0f32);
+    let zero_float = UOp::native_const(0.0f32);
     let add_zero_float = binary(BinaryOp::Add, x_f32.clone(), zero_float);
 
     match matcher.rewrite(&add_zero_float, &mut ()) {
@@ -194,7 +194,7 @@ fn test_complex_guard_with_block() {
     }
 
     // Test x + 1 - should NOT match
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let one = UOp::native_const(1i32);
     let add_one = binary(BinaryOp::Add, x.clone(), one);
 
     match matcher.rewrite(&add_one, &mut ()) {
@@ -210,10 +210,10 @@ fn test_guard_with_pointer_equality() {
         And(x, y) if Rc::ptr_eq(x, y) ~> x
     };
 
-    let a = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let a = UOp::native_const(42i32);
 
     // Test a & a - should match (same Rc pointer due to hash-consing)
-    let and_same = UOp::new(Op::Binary(BinaryOp::And, a.clone(), a.clone()), DType::Int32);
+    let and_same = a.try_and_op(&a).unwrap();
 
     match matcher.rewrite(&and_same, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a)),
@@ -223,8 +223,8 @@ fn test_guard_with_pointer_equality() {
     // Test a & b - should NOT match (different values = different pointers)
     // Note: Morok uses hash-consing, so Const(42) and Const(42) will share the same Rc
     // We need to use actually different values to test this
-    let b = UOp::const_(DType::Int32, ConstValue::Int(99)); // Different value = different Rc
-    let and_diff = UOp::new(Op::Binary(BinaryOp::And, a.clone(), b), DType::Int32);
+    let b = UOp::native_const(99i32); // Different value = different Rc
+    let and_diff = a.try_and_op(&b).unwrap();
 
     match matcher.rewrite(&and_diff, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
@@ -240,10 +240,10 @@ fn test_auto_ptr_eq_duplicate_variable() {
         And(x, x) ~> x
     };
 
-    let a = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let a = UOp::native_const(42i32);
 
     // Test a & a - should match (same Rc pointer)
-    let and_same = UOp::new(Op::Binary(BinaryOp::And, a.clone(), a.clone()), DType::Int32);
+    let and_same = a.try_and_op(&a).unwrap();
 
     match matcher.rewrite(&and_same, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a), "And(x, x) should rewrite to x"),
@@ -251,8 +251,8 @@ fn test_auto_ptr_eq_duplicate_variable() {
     }
 
     // Test a & b - should NOT match (different values = different pointers)
-    let b = UOp::const_(DType::Int32, ConstValue::Int(99));
-    let and_diff = UOp::new(Op::Binary(BinaryOp::And, a.clone(), b), DType::Int32);
+    let b = UOp::native_const(99i32);
+    let and_diff = a.try_and_op(&b).unwrap();
 
     match matcher.rewrite(&and_diff, &mut ()) {
         RewriteResult::NoMatch => {} // Expected - auto ptr_eq check fails
@@ -267,11 +267,11 @@ fn test_auto_ptr_eq_three_args() {
         Where(x, x, x) ~> x
     };
 
-    let a = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(99));
+    let a = UOp::native_const(42i32);
+    let b = UOp::native_const(99i32);
 
     // Test Where(a, a, a) - should match
-    let where_same = UOp::new(Op::Ternary(morok_ir::TernaryOp::Where, a.clone(), a.clone(), a.clone()), DType::Int32);
+    let where_same = UOp::where_(a.clone(), a.clone(), a.clone());
 
     match matcher.rewrite(&where_same, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a), "Where(x, x, x) should rewrite to x"),
@@ -279,7 +279,7 @@ fn test_auto_ptr_eq_three_args() {
     }
 
     // Test Where(a, a, b) - should NOT match
-    let where_diff = UOp::new(Op::Ternary(morok_ir::TernaryOp::Where, a.clone(), a.clone(), b.clone()), DType::Int32);
+    let where_diff = UOp::where_(a.clone(), a.clone(), b.clone());
 
     match matcher.rewrite(&where_diff, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
@@ -295,8 +295,8 @@ fn test_special_constant_zero() {
     };
 
     // Test x + 0 (int)
-    let x_int = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero_int = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x_int = UOp::native_const(42i32);
+    let zero_int = UOp::native_const(0i32);
     let add_zero_int = binary(BinaryOp::Add, x_int.clone(), zero_int);
 
     match matcher.rewrite(&add_zero_int, &mut ()) {
@@ -305,8 +305,8 @@ fn test_special_constant_zero() {
     }
 
     // Test x + 0.0 (float)
-    let x_f32 = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let zero_float = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let x_f32 = UOp::native_const(42.0f32);
+    let zero_float = UOp::native_const(0.0f32);
     let add_zero_float = binary(BinaryOp::Add, x_f32.clone(), zero_float);
 
     match matcher.rewrite(&add_zero_float, &mut ()) {
@@ -315,7 +315,7 @@ fn test_special_constant_zero() {
     }
 
     // Test x + 1 - should NOT match @zero
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let one = UOp::native_const(1i32);
     let add_one = binary(BinaryOp::Add, x_int.clone(), one);
 
     match matcher.rewrite(&add_one, &mut ()) {
@@ -332,8 +332,8 @@ fn test_special_constant_one() {
     };
 
     // Test x * 1 (int)
-    let x_int = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let one_int = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let x_int = UOp::native_const(42i32);
+    let one_int = UOp::native_const(1i32);
     let mul_one_int = binary(BinaryOp::Mul, x_int.clone(), one_int);
 
     match matcher.rewrite(&mul_one_int, &mut ()) {
@@ -342,8 +342,8 @@ fn test_special_constant_one() {
     }
 
     // Test x * 1.0 (float)
-    let x_f32 = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let one_float = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let x_f32 = UOp::native_const(42.0f32);
+    let one_float = UOp::native_const(1.0f32);
     let mul_one_float = binary(BinaryOp::Mul, x_f32.clone(), one_float);
 
     match matcher.rewrite(&mul_one_float, &mut ()) {
@@ -352,7 +352,7 @@ fn test_special_constant_one() {
     }
 
     // Test x * 2 - should NOT match @one
-    let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let two = UOp::native_const(2i32);
     let mul_two = binary(BinaryOp::Mul, x_int.clone(), two);
 
     match matcher.rewrite(&mul_two, &mut ()) {
@@ -369,8 +369,8 @@ fn test_special_constant_with_binding() {
     };
 
     // Test x * 0 - should return the zero constant
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
     let mul_zero = binary(BinaryOp::Mul, x, zero.clone());
 
     match matcher.rewrite(&mul_zero, &mut ()) {
@@ -379,8 +379,8 @@ fn test_special_constant_with_binding() {
     }
 
     // Test with float 0.0
-    let x_f32 = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let zero_f32 = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let x_f32 = UOp::native_const(42.0f32);
+    let zero_f32 = UOp::native_const(0.0f32);
     let mul_zero_f32 = binary(BinaryOp::Mul, x_f32, zero_f32.clone());
 
     match matcher.rewrite(&mul_zero_f32, &mut ()) {
@@ -401,9 +401,9 @@ fn test_identity_patterns_with_special_constants() {
         Mul(zero @ @zero, _) ~> zero,
     };
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
+    let one = UOp::native_const(1i32);
 
     // x + 0 => x
     let add_x_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
@@ -471,7 +471,7 @@ fn test_or_casted_method() {
     )]);
 
     // Create a constant
-    let c = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let c = UOp::native_const(42i32);
 
     // Test direct constant - should match and return the constant
     match matcher.rewrite(&c, &mut ()) {
@@ -517,7 +517,7 @@ fn test_or_detach_method() {
     )]);
 
     // Create a constant
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let x = UOp::native_const(42i32);
 
     // Test direct constant - should match
     match matcher.rewrite(&x, &mut ()) {
@@ -554,8 +554,8 @@ fn test_binary_commutative_pattern() {
         }),
     )]);
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
 
     // Test x + 0 - should match
     let add_x_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
@@ -587,12 +587,12 @@ fn test_permute_pattern_with_three_sources() {
     };
 
     // Just test that the pattern matches - where(a, b, c) in any order
-    let a = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let c = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let a = UOp::native_const(1i32);
+    let b = UOp::native_const(2i32);
+    let c = UOp::native_const(3i32);
 
     // Create where(a, b, c)
-    let where_abc = UOp::new(Op::Ternary(morok_ir::TernaryOp::Where, a.clone(), b.clone(), c.clone()), DType::Int32);
+    let where_abc = UOp::where_(a.clone(), b.clone(), c.clone());
 
     // Match and verify we get bindings
     let results = pattern.match_uop(&where_abc);
@@ -620,7 +620,7 @@ fn test_struct_field_extraction() {
     };
 
     // Create an Int32 constant
-    let x_int = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let x_int = UOp::native_const(42i32);
 
     // Create Cast(x_int) to Float32
     let cast_to_f32 = UOp::cast(x_int.clone(), DType::Float32);
@@ -651,7 +651,7 @@ fn test_struct_field_extraction_permute() {
     };
 
     // Create a simple tensor
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let x = UOp::native_const(1.0f32);
 
     // Create Permute with 2 axes
     let permute_2 = UOp::new(Op::Permute { src: x.clone(), axes: vec![1, 0] }, DType::Float32);
@@ -683,7 +683,7 @@ fn test_nested_struct_pattern() {
     };
 
     // Create an Int32 constant
-    let x_int = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let x_int = UOp::native_const(42i32);
 
     // Create inner cast: Cast(x_int) to Int64
     let inner_cast = UOp::cast(x_int.clone(), DType::Int64);
@@ -722,9 +722,9 @@ fn test_nested_struct_field_extraction() {
     };
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 1);
+    let compute = UOp::native_const(42.0f32);
+    let range1 = UOp::range(UOp::index_const(10), 0);
+    let range2 = UOp::range(UOp::index_const(20), 1);
 
     // Create: INDEX(BUFFERIZE(compute, [r1, r2]), [r1, r2])
     let buf = UOp::bufferize(compute.clone(), vec![range1.clone(), range2.clone()], opts);
@@ -750,9 +750,9 @@ fn test_nested_struct_field_extraction_mismatch() {
     };
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 1);
+    let compute = UOp::native_const(42.0f32);
+    let range1 = UOp::range(UOp::index_const(10), 0);
+    let range2 = UOp::range(UOp::index_const(20), 1);
 
     // Create: INDEX(BUFFERIZE(compute, [r1, r2]), [r1]) - different lengths
     let buf = UOp::bufferize(compute.clone(), vec![range1.clone(), range2], opts);
@@ -769,8 +769,6 @@ fn test_nested_struct_field_extraction_mismatch() {
 
 #[test]
 fn test_for_loop_unary_expansion() {
-    use morok_ir::UnaryOp;
-
     // Test that for-loop syntax generates patterns for multiple unary ops
     #[allow(unused_variables)]
     let matcher = patterns! {
@@ -783,8 +781,8 @@ fn test_for_loop_unary_expansion() {
     };
 
     // Create Neg(x)
-    let x = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let neg_x = UOp::new(Op::Unary(UnaryOp::Neg, x.clone()), DType::Float32);
+    let x = UOp::native_const(42.0f32);
+    let neg_x = x.neg();
 
     match matcher.rewrite(&neg_x, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
@@ -792,7 +790,7 @@ fn test_for_loop_unary_expansion() {
     }
 
     // Create Sqrt(x)
-    let sqrt_x = UOp::new(Op::Unary(UnaryOp::Sqrt, x.clone()), DType::Float32);
+    let sqrt_x = x.try_sqrt().unwrap();
 
     match matcher.rewrite(&sqrt_x, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
@@ -800,7 +798,7 @@ fn test_for_loop_unary_expansion() {
     }
 
     // Create Exp2(x) - should NOT match (not in the loop)
-    let exp2_x = UOp::new(Op::Unary(UnaryOp::Exp2, x.clone()), DType::Float32);
+    let exp2_x = x.try_exp2().unwrap();
 
     match matcher.rewrite(&exp2_x, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
@@ -818,8 +816,8 @@ fn test_for_loop_binary_expansion() {
         }
     };
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
 
     // Test Add(x, 0) => x
     let add_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
@@ -843,7 +841,7 @@ fn test_for_loop_binary_expansion() {
     }
 
     // Test And(x, 0) - should NOT match (not in the loop)
-    let and_zero = UOp::new(Op::Binary(BinaryOp::And, x.clone(), zero.clone()), DType::Int32);
+    let and_zero = x.try_and_op(&zero).unwrap();
     match matcher.rewrite(&and_zero, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
         _ => panic!("And should NOT match (not in for-loop list)"),
@@ -852,8 +850,6 @@ fn test_for_loop_binary_expansion() {
 
 #[test]
 fn test_for_loop_ternary_expansion() {
-    use morok_ir::TernaryOp;
-
     // Test that for-loop syntax generates patterns for ternary ops
     #[allow(unused_variables)]
     let matcher = patterns! {
@@ -865,19 +861,19 @@ fn test_for_loop_ternary_expansion() {
         }
     };
 
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let c = UOp::native_const(3.0f32);
 
     // Test Where(a, b, c) => a
-    let where_abc = UOp::new(Op::Ternary(TernaryOp::Where, a.clone(), b.clone(), c.clone()), DType::Float32);
+    let where_abc = UOp::where_(a.clone(), b.clone(), c.clone());
     match matcher.rewrite(&where_abc, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a)),
         _ => panic!("Where pattern from for-loop should match"),
     }
 
     // Test MulAcc(a, b, c) => a
-    let mulacc_abc = UOp::new(Op::Ternary(TernaryOp::MulAcc, a.clone(), b.clone(), c.clone()), DType::Float32);
+    let mulacc_abc = UOp::mulacc_op(a.clone(), b.clone(), c.clone()).unwrap();
     match matcher.rewrite(&mulacc_abc, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a)),
         _ => panic!("MulAcc pattern from for-loop should match"),
@@ -895,18 +891,18 @@ fn test_for_loop_with_op_var_access() {
                 // Use the op variable to verify it's accessible
                 // Create a different unary op with the same operand
                 match op {
-                    UnaryOp::Neg => UOp::new(Op::Unary(UnaryOp::Sqrt, x.clone()), x.dtype()),
-                    UnaryOp::Sqrt => UOp::new(Op::Unary(UnaryOp::Neg, x.clone()), x.dtype()),
+                    UnaryOp::Neg => x.try_sqrt().unwrap(),
+                    UnaryOp::Sqrt => x.neg(),
                     _ => Rc::clone(x),
                 }
             }
         }
     };
 
-    let x = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let x = UOp::native_const(42.0f32);
 
     // Neg(x) should rewrite to Sqrt(x) (swapped)
-    let neg_x = UOp::new(Op::Unary(UnaryOp::Neg, x.clone()), DType::Float32);
+    let neg_x = x.neg();
     match matcher.rewrite(&neg_x, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(matches!(r.op(), Op::Unary(UnaryOp::Sqrt, _)), "Neg should rewrite to Sqrt");
@@ -915,7 +911,7 @@ fn test_for_loop_with_op_var_access() {
     }
 
     // Sqrt(x) should rewrite to Neg(x) (swapped)
-    let sqrt_x = UOp::new(Op::Unary(UnaryOp::Sqrt, x.clone()), DType::Float32);
+    let sqrt_x = x.try_sqrt().unwrap();
     match matcher.rewrite(&sqrt_x, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(matches!(r.op(), Op::Unary(UnaryOp::Neg, _)), "Sqrt should rewrite to Neg");
@@ -926,8 +922,6 @@ fn test_for_loop_with_op_var_access() {
 
 #[test]
 fn test_for_loop_mixed_with_regular_patterns() {
-    use morok_ir::UnaryOp;
-
     // Test mixing for-loops with regular patterns
     #[allow(unused_variables)]
     let matcher = patterns! {
@@ -943,9 +937,9 @@ fn test_for_loop_mixed_with_regular_patterns() {
         Mul(x, @one) ~> x,
     };
 
-    let x = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let x = UOp::native_const(42.0f32);
+    let zero = UOp::native_const(0.0f32);
+    let one = UOp::native_const(1.0f32);
 
     // Test Add(x, 0) => x
     let add_zero = binary(BinaryOp::Add, x.clone(), zero);
@@ -955,7 +949,7 @@ fn test_for_loop_mixed_with_regular_patterns() {
     }
 
     // Test Neg(x) => x
-    let neg_x = UOp::new(Op::Unary(UnaryOp::Neg, x.clone()), DType::Float32);
+    let neg_x = x.neg();
     match matcher.rewrite(&neg_x, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
         _ => panic!("Neg(x) from for-loop should match"),
@@ -971,8 +965,6 @@ fn test_for_loop_mixed_with_regular_patterns() {
 
 #[test]
 fn test_for_loop_with_guard() {
-    use morok_ir::UnaryOp;
-
     // Test for-loop patterns with guards
     #[allow(unused_variables)]
     let matcher = patterns! {
@@ -982,22 +974,22 @@ fn test_for_loop_with_guard() {
         }
     };
 
-    let c = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let c = UOp::native_const(42.0f32);
 
     // Neg(const) - should match
-    let neg_c = UOp::new(Op::Unary(UnaryOp::Neg, c.clone()), DType::Float32);
+    let neg_c = c.neg();
     match matcher.rewrite(&neg_c, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &c)),
         _ => panic!("Neg(const) should match with guard"),
     }
 
     // Create a non-constant operand (binary)
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let y = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let x = UOp::native_const(1.0f32);
+    let y = UOp::native_const(2.0f32);
     let add_xy = binary(BinaryOp::Add, x, y);
 
     // Neg(add) - should NOT match (operand is not a constant)
-    let neg_add = UOp::new(Op::Unary(UnaryOp::Neg, add_xy), DType::Float32);
+    let neg_add = add_xy.neg();
     match matcher.rewrite(&neg_add, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
         _ => panic!("Neg(non-const) should NOT match with const guard"),
@@ -1006,8 +998,6 @@ fn test_for_loop_with_guard() {
 
 #[test]
 fn test_for_loop_with_binding() {
-    use morok_ir::UnaryOp;
-
     // Test for-loop patterns with bindings
     #[allow(unused_variables)]
     let matcher = patterns! {
@@ -1016,17 +1006,17 @@ fn test_for_loop_with_binding() {
         }
     };
 
-    let c = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let c = UOp::native_const(42.0f32);
 
     // Neg(const) - should match and return the inner constant
-    let neg_c = UOp::new(Op::Unary(UnaryOp::Neg, c.clone()), DType::Float32);
+    let neg_c = c.neg();
     match matcher.rewrite(&neg_c, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &c)),
         _ => panic!("Neg(inner @ @const) should match and return inner"),
     }
 
     // Sqrt(const) - should also match
-    let sqrt_c = UOp::new(Op::Unary(UnaryOp::Sqrt, c.clone()), DType::Float32);
+    let sqrt_c = c.try_sqrt().unwrap();
     match matcher.rewrite(&sqrt_c, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &c)),
         _ => panic!("Sqrt(inner @ @const) should match and return inner"),
@@ -1043,9 +1033,9 @@ fn test_const_with_value_extraction() {
         Add(x, _c@const(cv)) if cv == ConstValue::Int(0) ~> x
     };
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
+    let one = UOp::native_const(1i32);
 
     // Test x + 0 - should match (cv == 0)
     let add_zero = binary(BinaryOp::Add, x.clone(), zero);
@@ -1070,8 +1060,8 @@ fn test_const_with_value_extraction_fallible() {
         Neg(c@const(cv)) => cv.cast(&DType::Float32).map(|casted| UOp::const_(DType::Float32, casted))
     };
 
-    let c = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let neg_c = UOp::new(Op::Unary(morok_ir::UnaryOp::Neg, c.clone()), DType::Int32);
+    let c = UOp::native_const(42i32);
+    let neg_c = c.neg();
 
     match matcher.rewrite(&neg_c, &mut ()) {
         RewriteResult::Rewritten(r) => {
@@ -1100,9 +1090,9 @@ fn test_rest_pattern_end() {
         }
     };
 
-    let computation = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 1);
+    let computation = UOp::native_const(42i32);
+    let range1 = UOp::range(UOp::index_const(10), 0);
+    let range2 = UOp::range(UOp::index_const(20), 1);
 
     // END with 1 range - should match
     let end1 = UOp::end(computation.clone(), smallvec![range1.clone()]);
@@ -1134,9 +1124,9 @@ fn test_rest_pattern_reduce() {
         reduce_op @ Reduce(_, ..) ~> UOp::const_(reduce_op.dtype(), ConstValue::Int(99))
     };
 
-    let src = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 1);
+    let src = UOp::native_const(42i32);
+    let range1 = UOp::range(UOp::index_const(10), 0);
+    let range2 = UOp::range(UOp::index_const(20), 1);
 
     // REDUCE with 1 range - should match
     let reduce1 = UOp::reduce(src.clone(), smallvec![range1.clone()], ReduceOp::Add);
@@ -1170,8 +1160,8 @@ fn test_rest_pattern_with_guard() {
         } ~> UOp::const_(reduce_op.dtype(), ConstValue::Int(0))
     };
 
-    let src = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let range = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0);
+    let src = UOp::native_const(42i32);
+    let range = UOp::range(UOp::index_const(10), 0);
 
     // REDUCE with Add - should match
     let reduce_add = UOp::reduce(src.clone(), smallvec![range.clone()], ReduceOp::Add);
@@ -1203,9 +1193,9 @@ fn test_bufferize_variable_ranges() {
     };
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 1);
+    let const_val = UOp::native_const(42.0f32);
+    let range1 = UOp::range(UOp::index_const(10), 0);
+    let range2 = UOp::range(UOp::index_const(20), 1);
 
     // Test with 0 ranges
     let buf0 = UOp::bufferize(const_val.clone(), vec![], opts.clone());
@@ -1242,9 +1232,9 @@ fn test_index_variable_indices() {
         Index { buffer: c, .. } if matches!(c.op(), Op::Const(_)) ~> c
     };
 
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let idx1 = UOp::const_(DType::Index, ConstValue::Int(0));
-    let idx2 = UOp::const_(DType::Index, ConstValue::Int(1));
+    let const_val = UOp::native_const(42.0f32);
+    let idx1 = UOp::index_const(0);
+    let idx2 = UOp::index_const(1);
 
     // Test with 1 index (minimum for Index)
     let index1 = UOp::index(const_val.clone(), vec![idx1.clone()]).unwrap();
@@ -1276,6 +1266,44 @@ fn test_index_variable_indices() {
 }
 
 #[test]
+fn test_index_gate_bare_binding() {
+    // Test that bare `gate` field binding extracts Option<Rc<UOp>>
+    // This tests if the DSL already supports optional field binding
+    let matcher = patterns! {
+        Index { buffer: b, indices: _, gate } => {
+            // gate should be Option<Rc<UOp>>
+            // indices should be SmallVec<[Rc<UOp>; 4]>
+            match gate {
+                Some(g) => Some(g.clone()),  // Return the gate if present
+                None => Some(b.clone()),      // Return the buffer if no gate
+            }
+        }
+    };
+
+    let buffer = UOp::native_const(42.0f32);
+    let idx = UOp::index_const(0);
+    let gate_val = UOp::const_(DType::Bool, ConstValue::Int(1));
+
+    // Test ungated index
+    let ungated = UOp::index(buffer.clone(), vec![idx.clone()]).unwrap();
+    match matcher.rewrite(&ungated, &mut ()) {
+        RewriteResult::Rewritten(r) => {
+            assert!(Rc::ptr_eq(&r, &buffer), "Should return buffer when no gate");
+        }
+        _ => panic!("Pattern should match ungated Index"),
+    }
+
+    // Test gated index
+    let gated = UOp::index_gated(buffer.clone(), vec![idx], gate_val.clone()).unwrap();
+    match matcher.rewrite(&gated, &mut ()) {
+        RewriteResult::Rewritten(r) => {
+            assert!(Rc::ptr_eq(&r, &gate_val), "Should return gate when present");
+        }
+        _ => panic!("Pattern should match gated Index"),
+    }
+}
+
+#[test]
 fn test_prefix_matching_minimum_children() {
     use crate::pattern::upat::{OpFilter, SrcPattern};
     use morok_ir::types::{AddrSpace, BufferizeOpts};
@@ -1299,8 +1327,8 @@ fn test_prefix_matching_minimum_children() {
     };
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0);
+    let const_val = UOp::native_const(42.0f32);
+    let range1 = UOp::range(UOp::index_const(10), 0);
 
     // Test with 0 ranges - the pattern requires at least 2 children (compute + range)
     // Bufferize with 0 ranges has only 1 child (compute)
@@ -1330,10 +1358,10 @@ fn test_tuple_prefix_semantics_vs_exact() {
     };
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let range1 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(10)), 0);
-    let range2 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(20)), 1);
-    let range3 = UOp::range(UOp::const_(DType::Index, ConstValue::Int(30)), 2);
+    let const_val = UOp::native_const(42.0f32);
+    let range1 = UOp::range(UOp::index_const(10), 0);
+    let range2 = UOp::range(UOp::index_const(20), 1);
+    let range3 = UOp::range(UOp::index_const(30), 2);
 
     // All of these should match because prefix matching ignores extra ranges
     for (n, ranges) in [
@@ -1361,8 +1389,8 @@ fn test_alternative_patterns_basic() {
         (Add(x, y) | Mul(x, y)) ~> x
     };
 
-    let a = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let a = UOp::native_const(5i32);
+    let b = UOp::native_const(3i32);
 
     // Add should match
     let add = binary(BinaryOp::Add, a.clone(), b.clone());
@@ -1397,8 +1425,8 @@ fn test_alternative_patterns_op_shorthand() {
         (Add | Mul)(x, @zero) ~> x
     };
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
 
     // Add(x, 0) should match
     let add = binary(BinaryOp::Add, x.clone(), zero.clone());
@@ -1426,8 +1454,8 @@ fn test_alternative_patterns_grouped() {
         (Add(x, y) | Mul(x, y)) ~> x
     };
 
-    let a = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let a = UOp::native_const(5i32);
+    let b = UOp::native_const(3i32);
 
     // Add should match
     let add = binary(BinaryOp::Add, a.clone(), b.clone());
@@ -1455,10 +1483,10 @@ fn test_alternative_patterns_with_special_const() {
         (Add(x, @zero) | Add(x, @one)) ~> x
     };
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
+    let one = UOp::native_const(1i32);
+    let two = UOp::native_const(2i32);
 
     // Add(x, 0) should match
     let add0 = binary(BinaryOp::Add, x.clone(), zero);
@@ -1500,10 +1528,10 @@ fn test_upat_any_direct_api() {
         UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::one_const("__one")]),
     ]);
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
+    let one = UOp::native_const(1i32);
+    let two = UOp::native_const(2i32);
 
     // Add(x, 0) should match the first alternative
     let add0 = binary(BinaryOp::Add, x.clone(), zero);
@@ -1530,8 +1558,8 @@ fn test_permutation_pattern_basic() {
         Add[x, @const] ~> x
     };
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let c = UOp::const_(DType::Int32, ConstValue::Int(5));
+    let x = UOp::native_const(42i32);
+    let c = UOp::native_const(5i32);
 
     // Add(x, c) should match with x bound to first arg
     let add1 = binary(BinaryOp::Add, x.clone(), c.clone());
@@ -1556,8 +1584,8 @@ fn test_permutation_pattern_commutative_const_folding() {
         Add[x, Const(0)] ~> x
     };
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
 
     // Add(x, 0) should match
     let add1 = binary(BinaryOp::Add, x.clone(), zero.clone());
@@ -1590,7 +1618,7 @@ fn test_copy_struct_pattern() {
         Copy { src: c, .. } if matches!(c.op(), Op::Const(_)) ~> c
     };
 
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let const_val = UOp::native_const(42.0f32);
     let copy_op = const_val.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
 
     match matcher.rewrite(&copy_op, &mut ()) {
@@ -1608,7 +1636,7 @@ fn test_copy_f_copy_helper() {
     // Test f_copy() helper function for chaining
     let pattern = UPat::cvar("c").f_copy();
 
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let const_val = UOp::native_const(42.0f32);
     let copy_op = const_val.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
 
     let results = pattern.match_uop(&copy_op);
@@ -1650,7 +1678,7 @@ fn test_context_declaration() {
     };
 
     // Create a constant
-    let c = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let c = UOp::native_const(42i32);
 
     // Create context
     let mut ctx = TestContext::default();
@@ -1682,8 +1710,8 @@ fn test_context_with_graph_rewrite() {
         }
     };
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let x = UOp::native_const(5i32);
+    let zero = UOp::native_const(0i32);
     let add = binary(BinaryOp::Add, x.clone(), zero);
 
     let mut ctx = TestContext::default();
@@ -1718,9 +1746,9 @@ fn test_context_pattern_composition() {
     // Combine matchers - same context type, so this compiles
     let combined = matcher1 + matcher2;
 
-    let x = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let x = UOp::native_const(5i32);
+    let zero = UOp::native_const(0i32);
+    let one = UOp::native_const(1i32);
 
     let add_zero = binary(BinaryOp::Add, x.clone(), zero);
     let mul_one = binary(BinaryOp::Mul, x.clone(), one);
@@ -1736,46 +1764,4 @@ fn test_context_pattern_composition() {
     let result2 = combined.rewrite(&mul_one, &mut ctx);
     assert!(matches!(result2, RewriteResult::Rewritten(_)));
     assert_eq!(ctx.counter, 3); // Mul pattern increments twice (1 + 2 = 3)
-}
-
-// ============================================================================
-// Optional Field Binding Tests
-// ============================================================================
-
-#[test]
-fn test_index_gate_bare_binding() {
-    // Test that bare `gate` field binding extracts Option<Rc<UOp>>
-    // This tests if the DSL already supports optional field binding
-    let matcher = patterns! {
-        Index { buffer: b, indices: _, gate } => {
-            // gate should be Option<Rc<UOp>>
-            // indices should be SmallVec<[Rc<UOp>; 4]>
-            match gate {
-                Some(g) => Some(g.clone()),  // Return the gate if present
-                None => Some(b.clone()),      // Return the buffer if no gate
-            }
-        }
-    };
-
-    let buffer = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
-    let gate_val = UOp::const_(DType::Bool, ConstValue::Int(1));
-
-    // Test ungated index
-    let ungated = UOp::index(buffer.clone(), vec![idx.clone()]).unwrap();
-    match matcher.rewrite(&ungated, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &buffer), "Should return buffer when no gate");
-        }
-        _ => panic!("Pattern should match ungated Index"),
-    }
-
-    // Test gated index
-    let gated = UOp::index_gated(buffer.clone(), vec![idx], gate_val.clone()).unwrap();
-    match matcher.rewrite(&gated, &mut ()) {
-        RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &gate_val), "Should return gate when present");
-        }
-        _ => panic!("Pattern should match gated Index"),
-    }
 }

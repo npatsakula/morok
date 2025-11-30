@@ -2,6 +2,8 @@
 //!
 //! Tests all error types from error.rs to ensure proper validation.
 
+use std::f32::consts::{E, PI};
+
 use smallvec::smallvec;
 
 use morok_dtype::DType;
@@ -14,8 +16,8 @@ use crate::{ConstValue, SInt, UOp, error::Error};
 
 #[test]
 fn test_void_type_in_binary_op() {
-    let void1 = UOp::const_(DType::Void, ConstValue::Int(0));
-    let void2 = UOp::const_(DType::Void, ConstValue::Int(0));
+    let void1 = UOp::const_(DType::Void, crate::ConstValue::Int(0));
+    let void2 = UOp::const_(DType::Void, crate::ConstValue::Int(0));
 
     let result = void1.try_add_op(&void2);
     assert!(matches!(result, Err(Error::VoidTypeInOp)));
@@ -26,36 +28,30 @@ fn test_type_promotion_failed() {
     // Try to promote incompatible types - this should fail in type promotion
     // However, based on dtype implementation, most types can be promoted
     // This test verifies the error exists, even if hard to trigger naturally
-    let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
-
     // This should succeed (int promotes to float), so let's just verify the API
-    let result = int_val.try_add_op(&float_val);
+    let result = UOp::native_const(5i32).try_add_op(&UOp::native_const(PI));
     assert!(result.is_ok());
 }
 
 #[test]
 fn test_invalid_dtype_for_bitwise_op() {
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
-    let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-
     // Bitwise AND requires int or bool, not float
-    let result = float_val.try_and_op(&int_val);
+    let result = UOp::native_const(PI).try_and_op(&UOp::native_const(5i32));
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_and_op", .. })));
 
     // OR also requires int or bool
-    let result = float_val.try_or_op(&int_val);
+    let result = UOp::native_const(PI).try_or_op(&UOp::native_const(5i32));
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_or_op", .. })));
 
     // XOR also requires int or bool
-    let result = float_val.try_xor_op(&int_val);
+    let result = UOp::native_const(PI).try_xor_op(&UOp::native_const(5i32));
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_xor_op", .. })));
 
     // Shifts also require int or bool
-    let result = float_val.try_shl_op(&int_val);
+    let result = UOp::native_const(PI).try_shl_op(&UOp::native_const(5i32));
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shl_op", .. })));
 
-    let result = float_val.try_shr_op(&int_val);
+    let result = UOp::native_const(PI).try_shr_op(&UOp::native_const(5i32));
     assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shr_op", .. })));
 }
 
@@ -64,9 +60,8 @@ fn test_index_type_mismatch() {
     use crate::DeviceSpec;
 
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let wrong_idx = UOp::const_(DType::Int32, ConstValue::Int(0)); // Should be Index type
 
-    let result = UOp::index(buffer, vec![wrong_idx]);
+    let result = UOp::index(buffer, vec![UOp::native_const(0i32)]);
     assert!(matches!(result, Err(Error::IndexTypeMismatch { .. })));
 }
 
@@ -76,22 +71,16 @@ fn test_index_type_mismatch() {
 
 #[test]
 fn test_division_by_zero_const() {
-    let numerator = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-
-    let result = numerator.try_idiv_op(&zero);
+    let result = UOp::native_const(10i32).try_idiv_op(&UOp::native_const(0i32));
     assert!(matches!(result, Err(Error::DivisionByZero)));
 
-    let result = numerator.try_mod_op(&zero);
+    let result = UOp::native_const(10i32).try_mod_op(&UOp::native_const(0i32));
     assert!(matches!(result, Err(Error::DivisionByZero)));
 }
 
 #[test]
 fn test_division_by_zero_float() {
-    let numerator = UOp::const_(DType::Float32, ConstValue::Float(10.0));
-    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-
-    let result = numerator.try_fdiv_op(&zero);
+    let result = UOp::native_const(10.0f32).try_fdiv_op(&UOp::native_const(0.0f32));
     assert!(matches!(result, Err(Error::DivisionByZero)));
 }
 
@@ -107,36 +96,28 @@ fn test_reshape_size_mismatch() {
 
     use crate::shape::Shape;
 
-    // We need a UOp with an inferrable shape. Let's create a simple one.
-    // Since shape inference is limited, we'll test the validated constructor directly
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar
-
     // Try to reshape scalar (size=1) to [2, 2] (size=4) - mismatch
     let output_shape: Shape = smallvec![SInt::from(2), SInt::from(2)];
 
-    let result = val.try_reshape(&output_shape);
+    let result = UOp::native_const(1.0f32).try_reshape(&output_shape);
     assert!(matches!(result, Err(Error::ReshapeSizeMismatch { input_size: 1, output_size: 4 })));
 }
 
 #[test]
 fn test_reshape_negative_dimension() {
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-
     // SInt uses usize, so we need to pass negative value differently
     // Actually, try_reshape checks for negative in symbolic dims
     // Since SInt::Const uses usize, we can't represent negative
     // This error is mainly for future symbolic shape support
     // For now, test that positive values work
     let shape: crate::shape::Shape = smallvec![SInt::from(1)];
-    let result = val.try_reshape(&shape);
+    let result = UOp::native_const(1.0f32).try_reshape(&shape);
     assert!(result.is_ok());
 }
 
 #[test]
 fn test_shrink_bounds_violation() {
     use crate::shape::Shape;
-
-    let _val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
     // Create a UOp with a mock shape by using a test helper
     // Since we need shape inference, let's use a technique that works
@@ -159,10 +140,9 @@ fn test_shrink_bounds_violation() {
 fn test_expand_dimension_mismatch() {
     use crate::shape::Shape;
 
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar (empty shape)
     let output_shape: Shape = smallvec![SInt::from(3), SInt::from(5)]; // 2 dimensions
 
-    let result = val.try_expand(&output_shape);
+    let result = UOp::native_const(1.0f32).try_expand(&output_shape);
     assert!(matches!(result, Err(Error::ExpandDimensionMismatch { input_dims: 0, output_dims: 2 })));
 }
 
@@ -175,42 +155,36 @@ fn test_expand_invalid_dimension() {
 
 #[test]
 fn test_permute_invalid_permutation() {
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar (empty shape)
+    let val = UOp::native_const(1.0f32); // Scalar (empty shape)
 
     // To test permute validation, we need a UOp with a known shape
     // For scalars (empty shape), permutation should be empty
     // Let's test with a non-empty permutation on a scalar
 
     // Invalid: permutation for scalar should be empty
-    let bad_perm = vec![0, 1];
-    let result = val.clone().try_permute(bad_perm);
+    let result = val.clone().try_permute(vec![0, 1]);
     assert!(matches!(result, Err(Error::PermuteInvalidPermutation { .. })));
 
     // Valid: empty permutation for scalar
-    let good_perm = vec![];
-    let result = val.try_permute(good_perm);
+    let result = val.try_permute(vec![]);
     assert!(result.is_ok());
 }
 
 #[test]
 fn test_pad_dimension_mismatch() {
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar (empty shape)
-
     // Padding for 2 dimensions but scalar has 0
     let padding = vec![(SInt::from(0), SInt::from(0)), (SInt::from(1), SInt::from(1))];
 
-    let result = val.try_pad(&padding);
+    let result = UOp::native_const(1.0f32).try_pad(&padding);
     assert!(matches!(result, Err(Error::PadDimensionMismatch { padding_dims: 2, shape_dims: 0 })));
 }
 
 #[test]
 fn test_flip_invalid_spec() {
-    let val = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar (empty shape)
-
     // Flip spec for 2 dimensions but scalar has 0
     let flip_spec = vec![true, false];
 
-    let result = val.try_flip(flip_spec);
+    let result = UOp::native_const(1.0f32).try_flip(flip_spec);
     assert!(matches!(result, Err(Error::FlipInvalidSpec { expected_dims: 0, got_dims: 2 })));
 }
 
@@ -222,8 +196,8 @@ fn test_flip_invalid_spec() {
 
 #[test]
 fn test_comparison_with_void_type() {
-    let void1 = UOp::const_(DType::Void, ConstValue::Int(0));
-    let void2 = UOp::const_(DType::Void, ConstValue::Int(0));
+    let void1 = UOp::const_(DType::Void, crate::ConstValue::Int(0));
+    let void2 = UOp::const_(DType::Void, crate::ConstValue::Int(0));
 
     // Comparisons use promote_and_cast internally which validates void types
     let result = void1.try_cmplt(&void2);
@@ -240,20 +214,14 @@ fn test_comparison_with_void_type() {
 #[test]
 fn test_comparison_bool_dtype_result() {
     // Verify all comparison operations return Bool dtype regardless of input types
-    let int_a = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let int_b = UOp::const_(DType::Int32, ConstValue::Int(10));
-
-    let float_a = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
-    let float_b = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::E as f64));
-
     // All comparisons should return Bool
-    assert_eq!(int_a.try_cmplt(&int_b).unwrap().dtype(), DType::Bool);
-    assert_eq!(int_a.try_cmpeq(&int_b).unwrap().dtype(), DType::Bool);
-    assert_eq!(int_a.try_cmpne(&int_b).unwrap().dtype(), DType::Bool);
+    assert_eq!(UOp::native_const(5i32).try_cmplt(&UOp::native_const(10i32)).unwrap().dtype(), DType::Bool);
+    assert_eq!(UOp::native_const(5i32).try_cmpeq(&UOp::native_const(10i32)).unwrap().dtype(), DType::Bool);
+    assert_eq!(UOp::native_const(5i32).try_cmpne(&UOp::native_const(10i32)).unwrap().dtype(), DType::Bool);
 
-    assert_eq!(float_a.try_cmplt(&float_b).unwrap().dtype(), DType::Bool);
-    assert_eq!(float_a.try_cmpeq(&float_b).unwrap().dtype(), DType::Bool);
-    assert_eq!(float_a.try_cmpne(&float_b).unwrap().dtype(), DType::Bool);
+    assert_eq!(UOp::native_const(PI).try_cmplt(&UOp::native_const(E)).unwrap().dtype(), DType::Bool);
+    assert_eq!(UOp::native_const(PI).try_cmpeq(&UOp::native_const(E)).unwrap().dtype(), DType::Bool);
+    assert_eq!(UOp::native_const(PI).try_cmpne(&UOp::native_const(E)).unwrap().dtype(), DType::Bool);
 }
 
 // =========================================================================
@@ -265,34 +233,28 @@ fn test_where_condition_must_be_bool() {
     // Note: Tinygrad allows non-bool conditions (C-style: 0 = false, non-zero = true)
     // Morok currently follows this behavior and doesn't enforce Bool dtype for conditions
     // This test documents that non-bool conditions are accepted
-    let non_bool_cond = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let true_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let false_val = UOp::const_(DType::Float32, ConstValue::Float(0.0));
 
     // Should succeed - non-bool conditions are allowed (interpreted as C-style boolean)
-    let _result = UOp::where_op(non_bool_cond, true_val, false_val).unwrap();
+    let _result = UOp::where_op(UOp::native_const(1i32), UOp::native_const(1.0f32), UOp::native_const(0.0f32)).unwrap();
 }
 
 #[test]
 fn test_where_branch_dtype_compatibility() {
     // Where result takes dtype from true branch
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let int_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
-
-    let result = UOp::where_op(condition, int_val, float_val).unwrap();
+    let result = UOp::where_op(
+        UOp::const_(DType::Bool, ConstValue::Bool(true)),
+        UOp::native_const(5i32),
+        UOp::native_const(5.0f32),
+    )
+    .unwrap();
     // Result dtype comes from first non-condition argument (true_val)
     assert_eq!(result.dtype(), DType::Int32);
 }
 
 #[test]
 fn test_mulacc_preserves_first_operand_dtype() {
-    let float_a = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let float_b = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-    let int_c = UOp::const_(DType::Int32, ConstValue::Int(4));
-
     // MulAcc preserves first operand dtype (a in a*b+c)
-    let result = UOp::mulacc_op(float_a, float_b, int_c).unwrap();
+    let result = UOp::mulacc_op(UOp::native_const(2.0f32), UOp::native_const(3.0f32), UOp::native_const(4i32)).unwrap();
     assert_eq!(result.dtype(), DType::Float32);
 }
 
@@ -302,17 +264,14 @@ fn test_mulacc_preserves_first_operand_dtype() {
 
 #[test]
 fn test_sqrt_preserves_dtype() {
-    let f32_val = UOp::const_(DType::Float32, ConstValue::Float(4.0));
-    let f64_val = UOp::const_(DType::Float64, ConstValue::Float(4.0));
-
-    assert_eq!(f32_val.try_sqrt().unwrap().dtype(), DType::Float32);
-    assert_eq!(f64_val.try_sqrt().unwrap().dtype(), DType::Float64);
+    assert_eq!(UOp::native_const(4.0f32).try_sqrt().unwrap().dtype(), DType::Float32);
+    assert_eq!(UOp::native_const(4.0f64).try_sqrt().unwrap().dtype(), DType::Float64);
 }
 
 #[test]
 fn test_transcendental_on_int_types() {
     // Transcendental functions require float types and reject integer types
-    let int_val = UOp::const_(DType::Int32, ConstValue::Int(4));
+    let int_val = UOp::native_const(4i32);
 
     let sqrt_result = int_val.try_sqrt();
     assert!(matches!(sqrt_result, Err(Error::InvalidDTypeForOp { .. })));
@@ -320,7 +279,7 @@ fn test_transcendental_on_int_types() {
     let exp2_result = int_val.try_exp2();
     assert!(matches!(exp2_result, Err(Error::InvalidDTypeForOp { .. })));
 
-    let log2_result = int_val.try_log2();
+    let log2_result = int_val.clone().try_log2();
     assert!(matches!(log2_result, Err(Error::InvalidDTypeForOp { .. })));
 }
 
@@ -390,8 +349,8 @@ fn test_and_all_int_types() {
     // Test AND operation across all signed integer types
     let val_i8 = UOp::const_(DType::Int8, ConstValue::Int(15));
     let val_i16 = UOp::const_(DType::Int16, ConstValue::Int(255));
-    let val_i32 = UOp::const_(DType::Int32, ConstValue::Int(1023));
-    let val_i64 = UOp::const_(DType::Int64, ConstValue::Int(4095));
+    let val_i32 = UOp::native_const(1023i32);
+    let val_i64 = UOp::native_const(4095i64);
 
     // AND with same type
     let result_i8 = val_i8.try_and_op(&val_i8);
@@ -402,9 +361,7 @@ fn test_and_all_int_types() {
     assert!(result_i16.is_ok());
     assert_eq!(result_i16.unwrap().dtype(), DType::Int16);
 
-    let result_i32 = val_i32.try_and_op(&val_i32);
-    assert!(result_i32.is_ok());
-    assert_eq!(result_i32.unwrap().dtype(), DType::Int32);
+    assert_eq!(val_i32.try_and_op(&val_i32).unwrap().dtype(), DType::Int32);
 
     let result_i64 = val_i64.try_and_op(&val_i64);
     assert!(result_i64.is_ok());
@@ -416,8 +373,8 @@ fn test_or_all_uint_types() {
     // Test OR operation across all unsigned integer types
     let val_u8 = UOp::const_(DType::UInt8, ConstValue::UInt(15));
     let val_u16 = UOp::const_(DType::UInt16, ConstValue::UInt(255));
-    let val_u32 = UOp::const_(DType::UInt32, ConstValue::UInt(1023));
-    let val_u64 = UOp::const_(DType::UInt64, ConstValue::UInt(4095));
+    let val_u32 = UOp::native_const(1023u32);
+    let val_u64 = UOp::native_const(4095u64);
 
     // OR with same type (note: UInt8/UInt16 may promote to Int16 in some implementations)
     let result_u8 = val_u8.try_or_op(&val_u8);
@@ -446,8 +403,8 @@ fn test_or_all_uint_types() {
 #[test]
 fn test_xor_mixed_signedness() {
     // Test XOR with mixed signed/unsigned - should promote
-    let signed = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let unsigned = UOp::const_(DType::UInt32, ConstValue::UInt(24));
+    let signed = UOp::native_const(42i32);
+    let unsigned = UOp::native_const(24u32);
 
     let result = signed.try_xor_op(&unsigned);
     assert!(result.is_ok());
@@ -459,10 +416,10 @@ fn test_shifts_all_types() {
     // Test shift operations with all integer types
     let i8_val = UOp::const_(DType::Int8, ConstValue::Int(4));
     let i16_val = UOp::const_(DType::Int16, ConstValue::Int(16));
-    let i32_val = UOp::const_(DType::Int32, ConstValue::Int(256));
-    let u32_val = UOp::const_(DType::UInt32, ConstValue::UInt(1024));
+    let i32_val = UOp::native_const(256i32);
+    let u32_val = UOp::native_const(1024u32);
 
-    let shift_amt = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let shift_amt = UOp::native_const(2i32);
 
     // SHL preserves left operand dtype
     let shl_i8 = i8_val.try_shl_op(&shift_amt);
@@ -493,8 +450,8 @@ fn test_shifts_all_types() {
 
 #[test]
 fn test_shl_by_zero() {
-    let value = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero_shift = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let value = UOp::native_const(42i32);
+    let zero_shift = UOp::native_const(0i32);
 
     let result = value.try_shl_op(&zero_shift);
     assert!(result.is_ok());
@@ -503,8 +460,8 @@ fn test_shl_by_zero() {
 
 #[test]
 fn test_shr_by_zero() {
-    let value = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let zero_shift = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let value = UOp::native_const(42i32);
+    let zero_shift = UOp::native_const(0i32);
 
     let result = value.try_shr_op(&zero_shift);
     assert!(result.is_ok());
@@ -515,8 +472,8 @@ fn test_shr_by_zero() {
 fn test_shl_large_amount() {
     // Test shifting by an amount larger than bit width
     // This documents behavior - may want to add validation later
-    let value = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let large_shift = UOp::const_(DType::Int32, ConstValue::Int(40)); // > 32 bits
+    let value = UOp::native_const(1i32);
+    let large_shift = UOp::native_const(40i32); // > 32 bits
 
     let result = value.try_shl_op(&large_shift);
     // Current implementation doesn't validate shift amount
@@ -525,7 +482,7 @@ fn test_shl_large_amount() {
 
 #[test]
 fn test_shift_preserves_lhs_dtype_all_types() {
-    let shift_amt = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let shift_amt = UOp::native_const(1i32);
 
     // Test that all integer types preserve dtype after shift
     let types_and_values = vec![
@@ -620,7 +577,7 @@ fn test_shift_at_boundaries() {
     // Test shifts with MIN and MAX values
     let i32_min = UOp::const_(DType::Int32, ConstValue::Int(i32::MIN as i64));
     let i32_max = UOp::const_(DType::Int32, ConstValue::Int(i32::MAX as i64));
-    let shift_one = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let shift_one = UOp::native_const(1i32);
 
     // Shift MIN
     let result = i32_min.try_shl_op(&shift_one);
@@ -671,7 +628,7 @@ fn test_bool_mul_behavior() {
 fn test_bool_with_int_promotion() {
     // Bool should promote to int in mixed operations
     let bool_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let int_val = UOp::native_const(42i32);
 
     let result = bool_val.try_add_op(&int_val);
     assert!(result.is_ok());
@@ -854,8 +811,8 @@ fn test_all_int_types_with_xor() {
 
 #[test]
 fn test_bitwise_with_void_lhs() {
-    let void_val = UOp::const_(DType::Void, ConstValue::Int(0));
-    let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let void_val = UOp::const_(DType::Void, crate::ConstValue::Int(0));
+    let int_val = UOp::native_const(42i32);
 
     let result = void_val.try_and_op(&int_val);
     assert!(result.is_err());
@@ -869,8 +826,8 @@ fn test_bitwise_with_void_lhs() {
 
 #[test]
 fn test_bitwise_with_void_rhs() {
-    let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let void_val = UOp::const_(DType::Void, ConstValue::Int(0));
+    let int_val = UOp::native_const(42i32);
+    let void_val = UOp::const_(DType::Void, crate::ConstValue::Int(0));
 
     let result = int_val.try_and_op(&void_val);
     assert!(result.is_err());
@@ -884,8 +841,8 @@ fn test_bitwise_with_void_rhs() {
 
 #[test]
 fn test_shift_void_error() {
-    let void_val = UOp::const_(DType::Void, ConstValue::Int(0));
-    let int_val = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let void_val = UOp::const_(DType::Void, crate::ConstValue::Int(0));
+    let int_val = UOp::native_const(1i32);
 
     // Shift operations validate LHS dtype through check_bitwise_dtype
     let result = void_val.try_shl_op(&int_val);
@@ -898,8 +855,8 @@ fn test_shift_void_error() {
 #[test]
 fn test_invalid_type_combinations() {
     // Document behavior with various invalid type combinations
-    let float_val = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
-    let int_val = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let float_val = UOp::native_const(PI);
+    let int_val = UOp::native_const(42i32);
 
     // Float with bitwise operations should error
     let result = float_val.try_and_op(&int_val);

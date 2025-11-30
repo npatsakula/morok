@@ -5,13 +5,13 @@ use crate::provenance::{
     get_relative_location,
 };
 use crate::uop::UOp;
-use crate::{ConstValue, DType};
+use std::f32::consts::PI;
 use std::panic::Location;
 
 #[test]
 fn test_basic_provenance_capture() {
     // Create a UOp - provenance should be captured automatically
-    let uop = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let uop = UOp::native_const(42i32);
 
     PROVENANCE_TRACKER.with(|tracker| {
         let tracker = tracker.borrow();
@@ -33,8 +33,8 @@ fn test_basic_provenance_capture() {
 #[test]
 fn test_transformation_tracking() {
     // Create initial UOps
-    let a = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let a = UOp::native_const(1i32);
+    let b = UOp::native_const(2i32);
 
     // Perform operation (creates new UOp)
     let c = a.try_add_op(&b).unwrap();
@@ -58,10 +58,10 @@ fn test_substitute_transformation() {
     use std::collections::HashMap;
 
     // Create a simple UOp
-    let original = UOp::const_(DType::Int32, ConstValue::Int(10));
+    let original = UOp::native_const(10i32);
 
     // Create replacement
-    let replacement = UOp::const_(DType::Int32, ConstValue::Int(20));
+    let replacement = UOp::native_const(20i32);
 
     // Build substitution map
     #[allow(clippy::mutable_key_type)]
@@ -91,17 +91,17 @@ fn test_provenance_chain() {
     use std::collections::HashMap;
 
     // Create initial UOp
-    let uop1 = UOp::const_(DType::Int32, ConstValue::Int(1));
+    let uop1 = UOp::native_const(1i32);
 
     // Transform it multiple times
-    let uop2 = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let uop2 = UOp::native_const(2i32);
     #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(uop1.clone()), uop2.clone());
     let result1 = uop1.substitute(&subst_map);
 
     // Another transformation
-    let uop3 = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let uop3 = UOp::native_const(3i32);
     #[allow(clippy::mutable_key_type)]
     let mut subst_map2 = HashMap::new();
     subst_map2.insert(UOpKey(result1.clone()), uop3.clone());
@@ -123,7 +123,7 @@ fn test_provenance_chain() {
 #[test]
 fn test_onnx_node_attachment() {
     // Create a UOp
-    let uop = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI.into()));
+    let uop = UOp::native_const(PI);
 
     // Attach ONNX node information
     let onnx_node = OnnxNodeInfo {
@@ -244,14 +244,14 @@ fn test_multiple_parents() {
     use std::collections::HashMap;
 
     // Create two UOps
-    let a = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(2));
+    let a = UOp::native_const(1i32);
+    let b = UOp::native_const(2i32);
 
     // Create a UOp that depends on both
     let c = a.try_add_op(&b).unwrap();
 
     // Now substitute 'a' in 'c'
-    let a_new = UOp::const_(DType::Int32, ConstValue::Int(10));
+    let a_new = UOp::native_const(10i32);
     #[allow(clippy::mutable_key_type)]
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(a.clone()), a_new.clone());
@@ -347,7 +347,7 @@ fn test_error_provenance_logging() {
     use crate::error::{Error, log_provenance};
 
     // Create a UOp
-    let uop = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let uop = UOp::native_const(42i32);
 
     // Create an error
     let error = Error::DivisionByZero;

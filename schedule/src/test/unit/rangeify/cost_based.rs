@@ -2,12 +2,12 @@ use std::rc::Rc;
 
 use crate::rangeify::patterns::buffer_removal;
 use crate::rewrite::graph_rewrite;
-use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, UOp, UnaryOp};
+use morok_dtype::{AddrSpace as DTypeAddrSpace, DType};
+use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, UOp};
 
 // Helper functions
 fn create_const(val: i64) -> Rc<UOp> {
-    UOp::const_(DType::Int32, ConstValue::Int(val))
+    UOp::native_const(val as i32)
 }
 
 fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
@@ -26,8 +26,8 @@ fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
 #[test]
 fn test_remove_bufferize_cheap_unary() {
     // BUFFERIZE(NEG(x), ranges) should inline (cheap operation)
-    let x = UOp::define_global(1, DType::Float32);
-    let neg = UOp::new(Op::Unary(UnaryOp::Neg, x), DType::Float32);
+    let x = UOp::var("x", DType::Float32, 0, 100);
+    let neg = x.neg();
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(neg.clone(), vec![range]);
@@ -42,9 +42,9 @@ fn test_remove_bufferize_cheap_unary() {
 #[test]
 fn test_remove_bufferize_cheap_binary() {
     // BUFFERIZE(x + y, ranges) should inline (cheap operation)
-    let x = UOp::define_global(1, DType::Float32);
-    let y = UOp::define_global(2, DType::Float32);
-    let add = UOp::new(Op::Binary(BinaryOp::Add, x, y), DType::Float32);
+    let x = UOp::var("x", DType::Float32, 0, 100);
+    let y = UOp::var("y", DType::Float32, 0, 100);
+    let add = x.try_add_op(&y).unwrap();
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(add.clone(), vec![range]);
@@ -59,8 +59,8 @@ fn test_remove_bufferize_cheap_binary() {
 #[test]
 fn test_remove_bufferize_cast() {
     // BUFFERIZE(CAST(x), ranges) should inline (cheap operation)
-    let x = UOp::define_global(1, DType::Int32);
-    let cast = UOp::new(Op::Cast { src: x, dtype: DType::Float32 }, DType::Float32);
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let cast = UOp::cast(x, DType::Float32);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(cast.clone(), vec![range]);
@@ -75,7 +75,7 @@ fn test_remove_bufferize_cast() {
 #[test]
 fn test_keep_bufferize_expensive() {
     // BUFFERIZE(REDUCE(...), ranges) should NOT inline (expensive operation)
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::var("x", DType::Float32, 0, 100);
     let range = create_range(100, 0);
 
     let reduce = UOp::new(
@@ -98,8 +98,8 @@ fn test_keep_bufferize_expensive() {
 #[test]
 fn test_remove_bufferize_contiguous() {
     // BUFFERIZE(CONTIGUOUS(x), ranges) should be removed (always-run op)
-    let x = UOp::define_global(1, DType::Float32);
-    let contiguous = UOp::new(Op::Contiguous { src: x }, DType::Float32);
+    let x = UOp::var("x", DType::Float32, 0, 100);
+    let contiguous = UOp::contiguous(x);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(contiguous.clone(), vec![range]);
@@ -114,9 +114,9 @@ fn test_remove_bufferize_contiguous() {
 #[test]
 fn test_remove_bufferize_copy() {
     // BUFFERIZE(COPY(x, device), ranges) should be removed (always-run op)
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::var("x", DType::Float32, 0, 100);
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
-    let copy = UOp::new(Op::Copy { src: x, device }, DType::Float32);
+    let copy = UOp::copy(x, device);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(copy.clone(), vec![range]);
@@ -132,8 +132,8 @@ fn test_remove_bufferize_copy() {
 fn test_remove_bufferize_assign() {
     // BUFFERIZE(ASSIGN(target, value), ranges) should be removed (always-run op)
     let target = UOp::define_global(1, DType::Float32);
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let assign = UOp::new(Op::Assign { target, value }, DType::Float32);
+    let value = UOp::native_const(1.0f32);
+    let assign = UOp::assign(target, value);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(assign.clone(), vec![range]);
@@ -148,7 +148,7 @@ fn test_remove_bufferize_assign() {
 #[test]
 fn test_remove_bufferize_noop() {
     // BUFFERIZE(NOOP, ranges) should be removed (always-run op)
-    let noop = UOp::new(Op::Noop, DType::Float32);
+    let noop = UOp::noop();
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(noop.clone(), vec![range]);
@@ -165,7 +165,9 @@ fn test_remove_bufferize_noop() {
 #[test]
 fn test_flatten_nested_bufferize() {
     // BUFFERIZE(BUFFERIZE(x, R1), R2) → BUFFERIZE(x, R2)
-    let x = UOp::define_global(1, DType::Float32);
+    // Use define_global with pointer dtype (represents a buffer pointer - not cheap)
+    let ptr_dtype = DType::Float32.ptr(Some(100), DTypeAddrSpace::Global);
+    let x = UOp::define_global(1, ptr_dtype);
     let inner_range = create_range(10, 0);
     let outer_range = create_range(20, 1);
 
@@ -188,7 +190,9 @@ fn test_flatten_nested_bufferize() {
 #[test]
 fn test_nested_bufferize_multiple_ranges() {
     // BUFFERIZE(BUFFERIZE(x, [R1, R2]), [R3, R4]) → BUFFERIZE(x, [R3, R4])
-    let x = UOp::define_global(1, DType::Float32);
+    // Use define_global with pointer dtype (represents a buffer pointer - not cheap)
+    let ptr_dtype = DType::Float32.ptr(Some(100), DTypeAddrSpace::Global);
+    let x = UOp::define_global(1, ptr_dtype);
     let inner_ranges = vec![create_range(10, 0), create_range(15, 1)];
     let outer_ranges = vec![create_range(20, 2), create_range(25, 3)];
 
@@ -214,14 +218,11 @@ fn test_nested_bufferize_multiple_ranges() {
 #[test]
 fn test_multiple_cheap_ops_inline() {
     // Multiple cheap operations should all inline
-    let x = UOp::define_global(1, DType::Float32);
+    let x = UOp::var("x", DType::Float32, 0, 100);
     let range = create_range(10, 0);
 
-    let test_ops = vec![
-        UOp::new(Op::Unary(UnaryOp::Neg, x.clone()), DType::Float32),
-        UOp::new(Op::Unary(UnaryOp::Exp2, x.clone()), DType::Float32),
-        UOp::new(Op::Binary(BinaryOp::Mul, x.clone(), x.clone()), DType::Float32),
-    ];
+    // Use direct Binary construction to test buffer removal, not type validation
+    let test_ops = vec![x.neg(), x.try_exp2().unwrap(), x.try_mul_op(&x).unwrap()];
 
     let matcher = buffer_removal();
 
@@ -235,7 +236,9 @@ fn test_multiple_cheap_ops_inline() {
 #[test]
 fn test_no_removal_on_normal_buffer() {
     // Normal buffer operations (not cheap, not always-run) should remain
-    let x = UOp::define_global(1, DType::Float32);
+    // Use define_global with pointer dtype (represents a buffer pointer - not cheap)
+    let ptr_dtype = DType::Float32.ptr(Some(100), DTypeAddrSpace::Global);
+    let x = UOp::define_global(1, ptr_dtype);
     let range = create_range(10, 0);
 
     // Create a normal BUFFERIZE (not covering special cases)

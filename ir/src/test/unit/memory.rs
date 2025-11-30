@@ -8,17 +8,9 @@ use crate::{Op, UOp};
 
 #[test]
 fn test_bufferize() {
-    let compute = UOp::const_(DType::Float32, crate::types::ConstValue::Float(1.0));
-    let r1 = UOp::range_axis(
-        UOp::const_(DType::Int32, crate::types::ConstValue::Int(10)),
-        AxisId::Renumbered(0),
-        AxisType::Loop,
-    );
-    let r2 = UOp::range_axis(
-        UOp::const_(DType::Int32, crate::types::ConstValue::Int(20)),
-        AxisId::Renumbered(1),
-        AxisType::Loop,
-    );
+    let compute = UOp::native_const(1.0f32);
+    let r1 = UOp::range_axis(UOp::native_const(10i32), AxisId::Renumbered(0), AxisType::Loop);
+    let r2 = UOp::range_axis(UOp::native_const(20i32), AxisId::Renumbered(1), AxisType::Loop);
 
     let opts = BufferizeOpts::new(DeviceSpec::Cpu);
     let bufferize = UOp::bufferize(compute.clone(), vec![r1, r2], opts);
@@ -39,12 +31,8 @@ fn test_bufferize() {
 
 #[test]
 fn test_bufferize_local() {
-    let compute = UOp::const_(DType::Float32, crate::types::ConstValue::Float(1.0));
-    let r = UOp::range_axis(
-        UOp::const_(DType::Int32, crate::types::ConstValue::Int(10)),
-        AxisId::Renumbered(0),
-        AxisType::Loop,
-    );
+    let compute = UOp::native_const(1.0f32);
+    let r = UOp::range_axis(UOp::native_const(10i32), AxisId::Renumbered(0), AxisType::Loop);
 
     let opts = BufferizeOpts::local();
     let bufferize = UOp::bufferize(compute, vec![r], opts);
@@ -59,7 +47,7 @@ fn test_bufferize_local() {
 #[test]
 fn test_load() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::const_(DType::Index, crate::types::ConstValue::Int(0));
+    let index = UOp::index_const(0);
 
     let load = UOp::load(buffer.clone(), index.clone());
 
@@ -78,8 +66,8 @@ fn test_load() {
 #[test]
 fn test_load_gated() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::const_(DType::Index, crate::types::ConstValue::Int(0));
-    let gate = UOp::const_(DType::Bool, crate::types::ConstValue::Bool(true));
+    let index = UOp::index_const(0);
+    let gate = UOp::native_const(true);
 
     let load = UOp::load_gated(buffer.clone(), index.clone(), gate.clone());
 
@@ -99,8 +87,8 @@ fn test_load_gated() {
 #[test]
 fn test_store() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::const_(DType::Index, crate::types::ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, crate::types::ConstValue::Float(42.0));
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(42.0f32);
 
     let store = UOp::store(buffer.clone(), index.clone(), value.clone());
 
@@ -120,9 +108,9 @@ fn test_store() {
 #[test]
 fn test_store_gated() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::const_(DType::Index, crate::types::ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, crate::types::ConstValue::Float(42.0));
-    let gate = UOp::const_(DType::Bool, crate::types::ConstValue::Bool(true));
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(42.0f32);
+    let gate = UOp::native_const(true);
 
     let store = UOp::store_gated(buffer.clone(), index.clone(), value.clone(), gate.clone());
 

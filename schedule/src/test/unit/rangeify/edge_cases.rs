@@ -12,8 +12,7 @@ use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store, pip
 #[test]
 fn test_zero_size_range() {
     // RANGE with end=0 should be handled gracefully
-    let range_zero =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(0)), AxisId::Renumbered(0), AxisType::Loop);
+    let range_zero = UOp::range_axis(UOp::index_const(0), AxisId::Renumbered(0), AxisType::Loop);
 
     // Should create a valid RANGE operation
     assert!(matches!(range_zero.op(), Op::Range { .. }));
@@ -33,7 +32,7 @@ fn test_empty_bufferize() {
     let mut ctx = KernelContext::new();
 
     // BUFFERIZE with no ranges (scalar store)
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let compute = UOp::native_const(42.0f32);
     let bufferize = UOp::new(
         Op::Bufferize {
             compute: compute.clone(),
@@ -90,7 +89,7 @@ fn test_zero_size_end() {
 #[test]
 fn test_zero_size_pipeline() {
     // Full pipeline with zero-size BUFFERIZE
-    let compute = UOp::const_(DType::Int32, ConstValue::Int(0));
+    let compute = UOp::native_const(0i32);
     let bufferize = UOp::new(
         Op::Bufferize {
             compute,
@@ -112,7 +111,7 @@ fn test_bufferize_with_zero_range_inside() {
     let mut ctx = KernelContext::new();
 
     // Create BUFFERIZE with a zero-sized range
-    let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let compute = UOp::native_const(1.0f32);
     let range_zero = UOp::range_const(0, 0);
 
     let bufferize = UOp::new(
@@ -142,7 +141,7 @@ fn test_multiple_zero_ranges() {
     let mut ctx = KernelContext::new();
 
     // Create BUFFERIZE with multiple zero-sized ranges
-    let compute = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let compute = UOp::native_const(true);
     let range1 = UOp::range_const(0, 0);
     let range2 = UOp::range_const(0, 1);
 

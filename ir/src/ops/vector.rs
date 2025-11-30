@@ -71,4 +71,21 @@ impl UOp {
         let ptr_dtype = DType::Void.ptr(Some(size), AddrSpace::Reg);
         Self::new(Op::DefineReg { size }, ptr_dtype)
     }
+
+    /// Stack multiple buffers (multi-device tensors).
+    ///
+    /// MStack combines buffers from multiple devices into a single logical tensor.
+    /// Used for distributed/multi-GPU tensor operations.
+    pub fn mstack(buffers: SmallVec<[Rc<Self>; 4]>) -> Rc<Self> {
+        let dtype = buffers.first().map(|b| b.dtype()).unwrap_or(DType::Void);
+        Self::new(Op::MStack { buffers }, dtype)
+    }
+
+    /// Select buffer by device index (multi-device access).
+    ///
+    /// MSelect retrieves a specific device's buffer from a multi-device tensor.
+    pub fn mselect(buffer: Rc<Self>, device_index: usize) -> Rc<Self> {
+        let dtype = buffer.dtype();
+        Self::new(Op::MSelect { buffer, device_index }, dtype)
+    }
 }

@@ -57,7 +57,7 @@ pub fn count_bufferizes(uop: &Rc<UOp>) -> usize {
 
 /// Create a constant UOp with the given value.
 pub fn create_const(val: i64) -> Rc<UOp> {
-    UOp::const_(DType::Index, ConstValue::Int(val))
+    UOp::index_const(val)
 }
 
 /// Create a RANGE operation with constant end value.
@@ -125,7 +125,7 @@ fn test_is_zero_value() {
 
 #[test]
 fn test_get_const_value() {
-    let c = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let c = UOp::native_const(42i32);
     assert_eq!(get_const_value(&c), Some(ConstValue::Int(42)));
 
     let x = UOp::define_global(0, DType::Float32);
@@ -134,7 +134,7 @@ fn test_get_const_value() {
 
 #[test]
 fn test_is_const() {
-    let c = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let c = UOp::native_const(42i32);
     assert!(is_const(&c, &ConstValue::Int(42)));
     assert!(!is_const(&c, &ConstValue::Int(0)));
 }

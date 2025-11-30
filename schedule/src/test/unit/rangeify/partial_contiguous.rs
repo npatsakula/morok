@@ -11,7 +11,7 @@
 use std::rc::Rc;
 
 use morok_dtype::DType;
-use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, SInt, UOp};
+use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, SInt, UOp};
 use test_case::test_case;
 
 use crate::rangeify::buffer_cost::PcontigConfig;
@@ -58,7 +58,7 @@ fn create_simple_graph(ctx: &mut IndexingContext) -> (Rc<UOp>, Rc<UOp>, Rc<UOp>,
     let indexed = UOp::index(buffer.clone(), vec![range1.clone(), range2.clone()]).expect("Failed to create INDEX");
 
     // Create simple ADD operation
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
 
     (buffer, range1, range2, compute)
@@ -157,7 +157,7 @@ fn create_reduce_graph(ctx: &mut IndexingContext, has_buffer_access: bool) -> (V
         )
     } else {
         // Create REDUCE without buffer access (just reduce a constant)
-        let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+        let const_val = UOp::native_const(1.0f32);
         UOp::new(
             Op::Reduce { src: const_val, ranges: vec![reduce_range].into(), reduce_op: morok_ir::ReduceOp::Add },
             DType::Float32,
@@ -233,7 +233,7 @@ fn test_cheap_inline_removal() {
     // Create BUFFERIZE(const, [range])
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(const_val.clone(), vec![range], opts);
 
@@ -254,7 +254,7 @@ fn test_nested_bufferize_removal() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create nested BUFFERIZE(BUFFERIZE(const, r1), r2)
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let inner = UOp::bufferize(const_val.clone(), vec![range.clone()], opts.clone());
     let outer = UOp::bufferize(inner, vec![range.clone()], opts);
@@ -548,7 +548,7 @@ fn test_out_in_ratio_symbolic_sizes() {
     let buffer = UOp::define_global(2, DType::Float32);
 
     // Create ranges with symbolic size
-    let range = UOp::new(Op::Range { end: n, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop }, DType::Index);
+    let range = UOp::range(n, 0);
     let ranges = vec![range.clone()];
 
     // Create computation
@@ -579,7 +579,7 @@ fn test_out_in_ratio_no_inputs() {
     let ranges = vec![range];
 
     // Compute with no buffer inputs (just a constant)
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
 
     // Create INDEX(BUFFERIZE(const, ranges), ranges)
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -615,7 +615,7 @@ fn test_buffer_not_in_reduce_full_removal() {
 
     // Just index + add (no reduce)
     let indexed = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
@@ -818,7 +818,7 @@ fn test_pattern1_cheap_inline() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // BUFFERIZE(const) - Pattern 1 should inline this
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let const_val = UOp::native_const(42.0f32);
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(const_val.clone(), vec![range], opts);
 
@@ -915,7 +915,7 @@ fn test_pattern1_preserves_dtype() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create BUFFERIZE(const) with specific dtype
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let const_val = UOp::native_const(42.0f32);
     let original_dtype = const_val.dtype();
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(const_val, vec![range], opts);
@@ -1010,7 +1010,7 @@ fn test_partial_contiguous_local_axis() {
 
     // Create computation that indexes buffer with both dimensions
     let indexed = UOp::index(buffer, all_ranges.clone()).expect("Failed to create INDEX");
-    let two = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let two = UOp::native_const(2.0f32);
     let compute = indexed.try_mul_op(&two).expect("Failed to create MUL");
 
     // Create INDEX(BUFFERIZE(compute, all_ranges), all_ranges)
@@ -1078,8 +1078,7 @@ fn test_partial_contiguous_different_reduce_ops() {
 
         let indexed =
             UOp::index(buffer, vec![loop_range.clone(), reduce_range.clone()]).expect("Failed to create INDEX");
-        let reduce =
-            UOp::new(Op::Reduce { src: indexed, ranges: vec![reduce_range].into(), reduce_op }, DType::Float32);
+        let reduce = UOp::reduce(indexed, smallvec::smallvec![reduce_range], reduce_op);
 
         let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
         let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);
@@ -1218,8 +1217,8 @@ fn test_edge_case_all_const_operations() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create computation with only constants
-    let const1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let const2 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let const1 = UOp::native_const(1.0f32);
+    let const2 = UOp::native_const(2.0f32);
     let compute = const1.try_add_op(&const2).expect("Failed to create ADD");
 
     // Bufferize it
@@ -1245,7 +1244,7 @@ fn test_edge_case_deeply_nested_bufferize() {
     let range = ctx.new_range(&SInt::Const(5), AxisType::Loop);
 
     // Create deeply nested: BUFFERIZE(BUFFERIZE(BUFFERIZE(const)))
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let const_val = UOp::native_const(42.0f32);
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
 
     let level1 = UOp::bufferize(const_val, vec![range.clone()], opts.clone());
@@ -1274,7 +1273,7 @@ fn test_edge_case_zero_sized_range() {
 
     // Create computation with zero-sized range
     let indexed = UOp::index(buffer, vec![zero_range.clone()]).expect("Failed to create INDEX");
-    let two = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let two = UOp::native_const(2.0f32);
     let compute = indexed.try_mul_op(&two).expect("Failed to create MUL");
 
     // Bufferize with zero range
@@ -1333,7 +1332,7 @@ fn test_config_custom_ratio_threshold() {
 
     // Create simple computation: INDEX(buffer) + const
     let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
 
     // Create INDEX(BUFFERIZE(compute, [range]), [range])
@@ -1374,7 +1373,7 @@ fn test_config_level_0_vs_2() {
 
     // Create INDEX(BUFFERIZE(...)) pattern that triggers Pattern 4
     let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1458,7 +1457,7 @@ fn test_pipeline_multiple_patterns_in_sequence() {
     // Create nested BUFFERIZE(BUFFERIZE(const))
     // Pattern 3 should remove inner BUFFERIZE
     // Pattern 1 should then remove outer BUFFERIZE
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let inner = UOp::bufferize(const_val.clone(), vec![range.clone()], opts.clone());
     let outer = UOp::bufferize(inner, vec![range], opts);
@@ -1487,9 +1486,9 @@ fn test_pipeline_preserves_graph_structure() {
 
     // Create a computation chain: INDEX(buf) → MUL → ADD
     let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
-    let two = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let two = UOp::native_const(2.0f32);
     let mul = indexed.try_mul_op(&two).expect("Failed to create MUL");
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let one = UOp::native_const(1.0f32);
     let add = mul.try_add_op(&one).expect("Failed to create ADD");
 
     // Bufferize and index
@@ -1518,8 +1517,8 @@ fn test_pipeline_cheap_inline_interaction() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create BUFFERIZE(unary_op(const)) - both unary and const are cheap
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
-    let neg = UOp::new(Op::Unary(morok_ir::UnaryOp::Neg, const_val), DType::Float32);
+    let const_val = UOp::native_const(5.0f32);
+    let neg = const_val.neg();
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(neg.clone(), vec![range], opts);
@@ -1549,16 +1548,12 @@ fn test_symbolic_buffer_size_handling() {
 
     // Create computation with symbolic output range
     let concrete_range = UOp::new(
-        Op::Range {
-            end: UOp::const_(DType::Index, ConstValue::Int(10)),
-            axis_id: AxisId::Renumbered(1),
-            axis_type: AxisType::Loop,
-        },
+        Op::Range { end: UOp::index_const(10), axis_id: AxisId::Renumbered(1), axis_type: AxisType::Loop },
         DType::Index,
     );
 
     let indexed = UOp::index(buffer, vec![concrete_range]).expect("Failed to create INDEX");
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
 
     // Bufferize with symbolic range
@@ -1589,7 +1584,7 @@ fn test_all_symbolic_sizes() {
     let buffer = create_test_buffer(4096, DType::Float32, 1);
 
     let indexed = UOp::index(buffer, vec![range_n.clone()]).expect("Failed to create INDEX");
-    let two = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let two = UOp::native_const(2.0f32);
     let compute = indexed.try_mul_op(&two).expect("Failed to create MUL");
 
     // Bufferize with symbolic ranges
@@ -1612,11 +1607,7 @@ fn test_mixed_concrete_symbolic_sizes() {
 
     // Concrete range
     let concrete_range = UOp::new(
-        Op::Range {
-            end: UOp::const_(DType::Index, ConstValue::Int(10)),
-            axis_id: AxisId::Renumbered(0),
-            axis_type: AxisType::Loop,
-        },
+        Op::Range { end: UOp::index_const(10), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
         DType::Index,
     );
 
@@ -1626,7 +1617,7 @@ fn test_mixed_concrete_symbolic_sizes() {
 
     let buffer = create_test_buffer(40, DType::Float32, 1);
     let indexed = UOp::index(buffer, vec![concrete_range.clone()]).expect("Failed to create INDEX");
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
 
     // Bufferize with mixed ranges
@@ -1657,8 +1648,8 @@ fn test_complex_diamond_pattern() {
 
     // Create diamond: indexed → mul1, mul2 → add
     let indexed = UOp::index(buffer.clone(), vec![range.clone()]).expect("Failed to create INDEX");
-    let two = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let three = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+    let two = UOp::native_const(2.0f32);
+    let three = UOp::native_const(3.0f32);
 
     let mul1 = indexed.try_mul_op(&two).expect("Failed to create MUL");
     let mul2 = indexed.try_mul_op(&three).expect("Failed to create MUL");
@@ -1690,7 +1681,7 @@ fn test_complex_deep_computation_chain() {
     let mut current = indexed;
 
     for i in 1..=5 {
-        let const_val = UOp::const_(DType::Float32, ConstValue::Float(i as f64));
+        let const_val = UOp::native_const(i as f32);
         current = current.try_add_op(&const_val).expect("Failed to create ADD");
     }
 
@@ -1799,7 +1790,7 @@ fn test_boundary_very_large_buffer() {
     let buffer = create_test_buffer(40000, DType::Float32, 1);
 
     let indexed = UOp::index(buffer, vec![large_range.clone()]).expect("Failed to create INDEX");
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1823,7 +1814,7 @@ fn test_boundary_size_one_dimension() {
     let buffer = create_test_buffer(4, DType::Float32, 1);
 
     let indexed = UOp::index(buffer, vec![range1.clone()]).expect("Failed to create INDEX");
-    let two = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let two = UOp::native_const(2.0f32);
     let compute = indexed.try_mul_op(&two).expect("Failed to create MUL");
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1852,7 +1843,7 @@ fn test_boundary_exact_threshold_values() {
     let output_range = ctx.new_range(&SInt::Const(102), AxisType::Loop); // 102 * 4 = 408 bytes
 
     let indexed = UOp::index(buffer, vec![input_range]).expect("Failed to create INDEX");
-    let one = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1873,7 +1864,7 @@ fn test_boundary_minimal_computation() {
     let matcher = buffer_removal_with_pcontig();
 
     // Just a constant
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let const_val = UOp::native_const(42.0f32);
 
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);

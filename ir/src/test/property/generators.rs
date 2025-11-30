@@ -10,8 +10,8 @@ use proptest::prelude::*;
 
 use morok_dtype::{DType, ScalarDType};
 
+use crate::UOp;
 use crate::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
-use crate::{Op, UOp};
 
 use morok_dtype::ScalarDType as Scalar;
 static NON_SUPPORTED: &[Scalar] = &[Scalar::FP8E4M3, Scalar::FP8E5M2, Scalar::Index, Scalar::Void];
@@ -214,15 +214,20 @@ pub fn arb_arithmetic_tree(dtype: DType, depth: usize) -> impl Strategy<Value = 
     let leaf = arb_simple_uop(dtype.clone());
 
     leaf.prop_recursive(depth as u32, depth as u32 * 4, 3, move |inner| {
-        let dtype = dtype.clone();
-        let dtype_for_binary = dtype.clone();
-        let dtype_for_unary = dtype;
+        let _dtype = dtype.clone();
         prop_oneof![
             // Binary operation
-            (arb_arithmetic_binary_op(), inner.clone(), inner.clone())
-                .prop_map(move |(op, lhs, rhs)| { UOp::new(Op::Binary(op, lhs, rhs), dtype_for_binary.clone()) }),
+            (arb_arithmetic_binary_op(), inner.clone(), inner.clone()).prop_map(move |(op, lhs, rhs)| {
+                match op {
+                    BinaryOp::Add => lhs.try_add_op(&rhs).unwrap(),
+                    BinaryOp::Mul => lhs.try_mul_op(&rhs).unwrap(),
+                    BinaryOp::Sub => lhs.try_sub_op(&rhs).unwrap(),
+                    BinaryOp::Max => lhs.try_max_op(&rhs).unwrap(),
+                    _ => unreachable!("arb_arithmetic_binary_op only generates Add, Mul, Sub, Max"),
+                }
+            }),
             // Unary operation (only Neg for arithmetic)
-            inner.clone().prop_map(move |src| { UOp::new(Op::Unary(UnaryOp::Neg, src), dtype_for_unary.clone()) }),
+            inner.clone().prop_map(move |src| src.neg()),
         ]
     })
 }
@@ -230,6 +235,55 @@ pub fn arb_arithmetic_tree(dtype: DType, depth: usize) -> impl Strategy<Value = 
 /// Generate an arithmetic tree with depth up to max_depth.
 pub fn arb_arithmetic_tree_up_to(dtype: DType, max_depth: usize) -> impl Strategy<Value = Rc<UOp>> {
     (0..=max_depth).prop_flat_map(move |depth| arb_arithmetic_tree(dtype.clone(), depth))
+}
+
+// ============================================================================
+// Bounded Generators (for Z3 verification tests)
+// ============================================================================
+
+/// Generate bounded constant for Z3 verification tests.
+/// Uses small values to avoid overflow when combined in arithmetic trees.
+/// Z3 uses unbounded integers, so we need to avoid values that would overflow.
+pub fn arb_bounded_const(dtype: DType) -> impl Strategy<Value = Rc<UOp>> {
+    use morok_dtype::ScalarDType::*;
+    (-100i64..=100).prop_map(move |v| {
+        let cv = match dtype.scalar().unwrap() {
+            Int8 | Int16 | Int32 | Int64 | Index => ConstValue::Int(v),
+            UInt8 | UInt16 | UInt32 | UInt64 => ConstValue::UInt(v.unsigned_abs()),
+            _ => ConstValue::Int(v),
+        };
+        UOp::const_(dtype.clone(), cv)
+    })
+}
+
+/// Generate simple UOp with bounded constants (for Z3 tests).
+pub fn arb_simple_uop_bounded(dtype: DType) -> impl Strategy<Value = Rc<UOp>> {
+    prop_oneof![arb_bounded_const(dtype.clone()), arb_var_uop(dtype),]
+}
+
+/// Generate arithmetic tree with bounded constants (for Z3 verification).
+pub fn arb_arithmetic_tree_bounded(dtype: DType, depth: usize) -> impl Strategy<Value = Rc<UOp>> {
+    let leaf = arb_simple_uop_bounded(dtype.clone());
+
+    leaf.prop_recursive(depth as u32, depth as u32 * 4, 3, move |inner| {
+        prop_oneof![
+            (arb_arithmetic_binary_op(), inner.clone(), inner.clone()).prop_map(move |(op, lhs, rhs)| {
+                match op {
+                    BinaryOp::Add => lhs.try_add_op(&rhs).unwrap(),
+                    BinaryOp::Mul => lhs.try_mul_op(&rhs).unwrap(),
+                    BinaryOp::Sub => lhs.try_sub_op(&rhs).unwrap(),
+                    BinaryOp::Max => lhs.try_max_op(&rhs).unwrap(),
+                    _ => unreachable!("arb_arithmetic_binary_op only generates Add, Mul, Sub, Max"),
+                }
+            }),
+            inner.clone().prop_map(move |src| src.neg()),
+        ]
+    })
+}
+
+/// Generate bounded arithmetic tree with depth up to max_depth.
+pub fn arb_arithmetic_tree_bounded_up_to(dtype: DType, max_depth: usize) -> impl Strategy<Value = Rc<UOp>> {
+    (0..=max_depth).prop_flat_map(move |depth| arb_arithmetic_tree_bounded(dtype.clone(), depth))
 }
 
 // ============================================================================

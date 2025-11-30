@@ -14,7 +14,7 @@ use morok_dtype::DType;
 use morok_ir::types::{BinaryOp, ConstValue};
 use morok_ir::uop::cached_property::CachedProperty;
 use morok_ir::uop::comparison_analysis::ComparisonAnalyzer;
-use morok_ir::uop::eval::{eval_add, eval_binary_op, eval_mul, eval_sub};
+use morok_ir::uop::eval::{eval_add_typed, eval_binary_op, eval_mul_typed, eval_sub_typed};
 use morok_ir::uop::properties::VminVmaxProperty;
 use morok_ir::{IntoUOp, Op, UOp};
 
@@ -29,20 +29,21 @@ use std::rc::Rc;
 /// Constant folding patterns.
 ///
 /// Folds constant expressions at compile time for unary, binary, and ternary operations.
+/// Uses dtype-aware evaluation to ensure results respect type boundaries (e.g., Int32 wraps at 32 bits).
 pub fn constant_folding_dsl_patterns() -> PatternMatcher {
-    use morok_ir::uop::eval::{eval_binary_op, eval_ternary_op, eval_unary_op};
+    use morok_ir::uop::eval::{eval_binary_op_typed, eval_ternary_op_typed, eval_unary_op_typed};
 
     patterns! {
         // Unary constant folding - 7 operations in one declaration
         for op in unary [Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
             op(c @const(c_val))
-              => eval_unary_op(op, c_val).map(|r| UOp::const_(c.dtype(), r)),
+              => eval_unary_op_typed(op, c_val, c.dtype().base()).map(|r| UOp::const_(c.dtype(), r)),
         },
 
         // Binary constant folding - 13 operations in one declaration
         for op in binary [Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr] {
             op(a @const(a_val), b @const(b_val))
-              => eval_binary_op(op, a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
+              => eval_binary_op_typed(op, a_val, b_val, a.dtype().base()).map(|r| UOp::const_(a.dtype(), r)),
         },
 
         // Ternary constant folding - 2 operations in one declaration
@@ -50,7 +51,7 @@ pub fn constant_folding_dsl_patterns() -> PatternMatcher {
             // For Where: use second operand's dtype (true branch)
             // For MulAcc: use first operand's dtype (all same dtype)
             op(a @const(a_val), b @const(b_val), c @const(c_val))
-              => eval_ternary_op(op, a_val, b_val, c_val).map(|r| UOp::const_(b.dtype(), r)),
+              => eval_ternary_op_typed(op, a_val, b_val, c_val, b.dtype().base()).map(|r| UOp::const_(b.dtype(), r)),
         },
     }
 }
@@ -196,10 +197,10 @@ pub fn term_combining_dsl_patterns() -> PatternMatcher {
         Add(x, x) => 2.into_uop(x.dtype()).try_mul_op(x).ok(),
         // (c1 * x) + (c2 * x) → (c1 + c2) * x
         Add(Mul(c1 @const(c1_val), x), Mul(c2 @const(c2_val), x))
-          => eval_add(c1_val, c2_val)?.into_uop(c1.dtype()).try_mul_op(x).ok(),
+          => eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype()).try_mul_op(x).ok(),
         // (x * c1) + (x * c2) → x * (c1 + c2)
         Add(Mul(x, c1 @const(c1_val)), Mul(x, c2 @const(c2_val)))
-          => x.try_mul_op(&eval_add(c1_val, c2_val)?.into_uop(c1.dtype())).ok(),
+          => x.try_mul_op(&eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype())).ok(),
     }
 }
 
@@ -216,7 +217,7 @@ pub fn advanced_division_dsl_patterns() -> PatternMatcher {
     patterns! {
         // (a // b) // c → a // (b * c) if b,c non-zero
         Idiv(Idiv(a, b @const(b_val)), c @const(c_val)) if !b_val.is_zero() && !c_val.is_zero() => {
-            a.try_idiv_op(&UOp::const_(b.dtype(), eval_mul(b_val, c_val)?)).ok()
+            a.try_idiv_op(&UOp::const_(b.dtype(), eval_mul_typed(b_val, c_val, b.dtype().base())?)).ok()
         },
         // expr // divisor → expr.divides(divisor) (generic exact division)
         Idiv(expr, divisor @ @const) => expr.divides(divisor),
@@ -256,15 +257,15 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
     patterns! {
         // (x + c1) + c2 → x + (c1 + c2)
         Add(Add(x, c1 @const(c1_val)), c2 @const(c2_val))
-          => x.try_add_op(&UOp::const_(c1.dtype(), eval_add(c1_val, c2_val)?)).ok(),
+          => x.try_add_op(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
         // (x * c1) * c2 → x * (c1 * c2)
         Mul(Mul(x, c1 @const(c1_val)), c2 @const(c2_val))
-          => x.try_mul_op(&UOp::const_(c1.dtype(), eval_mul(c1_val, c2_val)?)).ok(),
+          => x.try_mul_op(&UOp::const_(c1.dtype(), eval_mul_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
         // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2) when result is negative
         Add(Sub(x, c1 @const(c1_val)), c2 @const(c2_val)) => {
-            let diff_val = eval_sub(c2_val, c1_val)?;
+            let diff_val = eval_sub_typed(c2_val, c1_val, c1.dtype().base())?;
             // Normalize: prefer x - |c| over x + (-c)
             if let ConstValue::Int(v) = diff_val && v < 0 {
                 x.try_sub_op(&(-v).into_uop(c1.dtype())).ok()
@@ -275,7 +276,7 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
 
         // (x + c1) - c2 → x + (c1 - c2) or x - (c2 - c1) when result is negative
         Sub(Add(x, c1 @const(c1_val)), c2 @const(c2_val)) => {
-            let diff_val = eval_sub(c1_val, c2_val)?;
+            let diff_val = eval_sub_typed(c1_val, c2_val, c1.dtype().base())?;
             // Normalize: prefer x - |c| over x + (-c)
             if let ConstValue::Int(v) = diff_val && v < 0 {
                 return x.try_sub_op(&(-v).into_uop(c1.dtype())).ok();
@@ -328,7 +329,7 @@ pub fn dead_loop_patterns() -> PatternMatcher {
 
     patterns! {
         // RANGE with vmax ≤ 0 → Const(0)
-        r @ Range(_) if is_empty_range(r) ~> UOp::const_(DType::Index, ConstValue::Int(0)),
+        r @ Range(_) if is_empty_range(r) ~> UOp::index_const(0),
 
         // END with dead ranges → filter or unwrap
         end_op @ End(_, ..) if has_dead_ranges(end_op) ~> filter_dead_ranges(end_op),

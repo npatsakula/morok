@@ -5,8 +5,7 @@
 
 use std::rc::Rc;
 
-use morok_dtype::DType;
-use morok_ir::{ConstValue, Op, UOp};
+use morok_ir::{Op, UOp};
 
 use crate::rangeify::codegen_patterns::{fix_after_broadcast, get_contiguous, rangeify_codegen_patterns, remove_noop};
 
@@ -37,7 +36,7 @@ fn test_remove_noop_non_void() {
 #[test]
 fn test_remove_noop_returns_none_for_non_noop() {
     // Test that non-NOOP operations return None
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_op = UOp::native_const(1.0f32);
 
     let result = remove_noop(&const_op);
     assert!(result.is_none());
@@ -47,7 +46,7 @@ fn test_remove_noop_returns_none_for_non_noop() {
 fn test_remove_noop_pattern_matching() {
     // Verify remove_noop only matches NOOP operations
     let noop = UOp::noop();
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let const_op = UOp::native_const(0.0f32);
 
     // NOOP should be handled (returns None for Void dtype)
     assert!(matches!(noop.op(), Op::Noop));
@@ -63,8 +62,8 @@ fn test_remove_noop_pattern_matching() {
 #[test]
 fn test_get_contiguous_removes_marker() {
     // Test that CONTIGUOUS marker is removed
-    let tensor = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let contiguous = UOp::new(Op::Contiguous { src: tensor.clone() }, tensor.dtype());
+    let tensor = UOp::native_const(1.0f32);
+    let contiguous = UOp::contiguous(tensor.clone());
 
     let result = get_contiguous(&contiguous);
     assert!(result.is_some());
@@ -77,7 +76,7 @@ fn test_get_contiguous_removes_marker() {
 #[test]
 fn test_get_contiguous_returns_none_for_non_contiguous() {
     // Test that non-CONTIGUOUS operations return None
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_op = UOp::native_const(1.0f32);
 
     let result = get_contiguous(&const_op);
     assert!(result.is_none());
@@ -86,8 +85,8 @@ fn test_get_contiguous_returns_none_for_non_contiguous() {
 #[test]
 fn test_fix_after_broadcast_unwraps_expand() {
     // Test that AFTER wrapping EXPAND gets unwrapped
-    let source = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let new_shape = UOp::const_(DType::Index, ConstValue::Int(4));
+    let source = UOp::native_const(1.0f32);
+    let new_shape = UOp::index_const(4);
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();
@@ -108,7 +107,7 @@ fn test_fix_after_broadcast_unwraps_expand() {
 #[test]
 fn test_fix_after_broadcast_returns_none_for_non_after() {
     // Test that non-AFTER operations return None
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_op = UOp::native_const(1.0f32);
 
     let result = fix_after_broadcast(&const_op);
     assert!(result.is_none());
@@ -117,7 +116,7 @@ fn test_fix_after_broadcast_returns_none_for_non_after() {
 #[test]
 fn test_fix_after_broadcast_returns_none_for_non_expand() {
     // Test that AFTER not wrapping EXPAND returns None
-    let source = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let source = UOp::native_const(1.0f32);
     let computation = UOp::noop();
     let after = UOp::after(source, smallvec::smallvec![computation]);
 
@@ -128,9 +127,9 @@ fn test_fix_after_broadcast_returns_none_for_non_expand() {
 #[test]
 fn test_fix_after_broadcast_no_panic_on_global() {
     // Test that AFTER with EXPAND of global buffer (no RANGE parent) works
-    let source = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let source = UOp::native_const(1.0f32);
 
-    let new_shape = UOp::const_(DType::Index, ConstValue::Int(4));
+    let new_shape = UOp::index_const(4);
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();

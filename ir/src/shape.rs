@@ -342,14 +342,13 @@ pub fn shape_to_uop(shape: &Shape) -> Rc<UOp> {
     if shape.is_empty() {
         // Empty shape - return a const 0 or empty vectorize?
         // Following Tinygrad, empty shape might use VConst with empty vec
-        return UOp::new(Op::VConst { values: vec![] }, DType::Index);
+        return UOp::vconst(vec![]);
     }
 
     // Convert each SInt to a UOp
     let elements: SmallVec<[Rc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
 
-    let vec_dtype = DType::Index.vec(elements.len());
-    UOp::new(Op::Vectorize { elements }, vec_dtype)
+    UOp::vectorize(elements)
 }
 
 /// Convert a vector of (begin, end) ranges to two UOps for Pad/Shrink operations.
@@ -363,12 +362,7 @@ pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Rc<UOp>, Rc<UOp>) {
 
     let ends: SmallVec<[Rc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::Index)).collect();
 
-    let vec_dtype = DType::Index.vec(ranges.len());
-
-    (
-        UOp::new(Op::Vectorize { elements: begins }, vec_dtype.clone()),
-        UOp::new(Op::Vectorize { elements: ends }, vec_dtype),
-    )
+    (UOp::vectorize(begins), UOp::vectorize(ends))
 }
 
 // =========================================================================
@@ -408,7 +402,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
                 DType::Ptr { size: Some(s), .. } => Some(smallvec![SInt::from(s)]),
                 DType::Ptr { size: None, .. } => {
                     // Unlimited size - represented as -1 following Tinygrad
-                    let neg_one = UOp::const_(DType::Index, ConstValue::Int(-1));
+                    let neg_one = UOp::index_const(-1);
                     Some(smallvec![SInt::from(neg_one)])
                 }
                 dtype => {

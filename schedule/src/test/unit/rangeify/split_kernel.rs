@@ -10,9 +10,9 @@ fn test_split_store_basic() {
 
     // Create a simple STORE operation
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer: buffer.clone(), index, value }, DType::Void);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer.clone(), index, value);
 
     // Try to split
     let result = split_store(&store, &mut ctx);
@@ -28,7 +28,7 @@ fn test_split_store_non_store_returns_none() {
     let mut ctx = KernelContext::new();
 
     // Create a non-STORE operation
-    let const_op = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_op = UOp::native_const(1.0f32);
 
     // Try to split
     let result = split_store(&const_op, &mut ctx);
@@ -43,9 +43,9 @@ fn test_split_store_end_operation() {
 
     // Create an END operation wrapping a STORE
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer, index, value);
     let range = UOp::range_const(10, 0);
     let end = UOp::end(store.clone(), smallvec![range.clone()]);
 
@@ -102,10 +102,10 @@ fn test_split_store_gated() {
 
     // Create a STORE_GATED operation
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let gate = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let store_gated = UOp::new(Op::StoreGated { buffer, index, value, gate }, DType::Void);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let gate = UOp::native_const(true);
+    let store_gated = UOp::store_gated(buffer, index, value, gate);
 
     // Try to split
     let result = split_store(&store_gated, &mut ctx);
@@ -122,9 +122,9 @@ fn test_split_store_creates_sink() {
 
     // Create a STORE operation
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer: buffer.clone(), index, value: value.clone() }, DType::Void);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer.clone(), index, value.clone());
 
     let result = split_store(&store, &mut ctx).unwrap();
 
@@ -165,11 +165,16 @@ fn test_split_store_preserves_computation() {
         (DType::Bool, ConstValue::Bool(true)),
     ];
 
-    for (dtype, const_val) in test_cases {
+    for (_dtype_idx, (dtype, _const_val)) in test_cases.iter().enumerate() {
         let buffer = UOp::unique(Some(0));
-        let index = UOp::const_(DType::Index, ConstValue::Int(0));
-        let value = UOp::const_(dtype.clone(), const_val);
-        let store = UOp::new(Op::Store { buffer, index, value: value.clone() }, DType::Void);
+        let index = UOp::index_const(0);
+        let value = match _dtype_idx {
+            0 => UOp::native_const(1.0f32),
+            1 => UOp::native_const(1i32),
+            2 => UOp::native_const(true),
+            _ => panic!("Unsupported dtype index"),
+        };
+        let store = UOp::store(buffer, index, value.clone());
 
         let result = split_store(&store, &mut ctx);
 
@@ -185,7 +190,7 @@ fn test_split_store_preserves_computation() {
 
             // Verify the stored value dtype is preserved
             if let Op::Store { value: stored_val, .. } = sources[0].op() {
-                assert_eq!(stored_val.dtype(), dtype);
+                assert_eq!(stored_val.dtype(), *dtype);
                 assert!(std::rc::Rc::ptr_eq(stored_val, &value));
             }
         }
@@ -198,14 +203,14 @@ fn test_split_store_multiple_calls_independent() {
 
     // Create two different STORE operations
     let buffer1 = UOp::unique(Some(1));
-    let index1 = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store1 = UOp::new(Op::Store { buffer: buffer1, index: index1, value: value1 }, DType::Void);
+    let index1 = UOp::index_const(0);
+    let value1 = UOp::native_const(1.0f32);
+    let store1 = UOp::store(buffer1, index1, value1);
 
     let buffer2 = UOp::unique(Some(2));
-    let index2 = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value2 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let store2 = UOp::new(Op::Store { buffer: buffer2, index: index2, value: value2 }, DType::Void);
+    let index2 = UOp::index_const(0);
+    let value2 = UOp::native_const(2.0f32);
+    let store2 = UOp::store(buffer2, index2, value2);
 
     // Split both
     let kernel1 = split_store(&store1, &mut ctx).unwrap();
@@ -225,9 +230,9 @@ fn test_split_store_end_with_multiple_ranges() {
 
     // Create END with multiple ranges wrapping a STORE
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer, index, value);
     let range1 = UOp::range_const(4, 0);
     let range2 = UOp::range_const(8, 1);
     let end = UOp::end(store.clone(), smallvec![range1.clone(), range2.clone()]);
@@ -267,11 +272,10 @@ fn test_split_store_end_with_outer_range() {
 
     // Create END with OUTER range wrapping a STORE
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
-    let range_outer =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Outer);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer, index, value);
+    let range_outer = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Outer);
     let end = UOp::end(store, smallvec![range_outer]);
 
     let result = split_store(&end, &mut ctx);
@@ -287,12 +291,11 @@ fn test_split_store_end_with_mixed_ranges() {
 
     // Create END with mix of LOOP and OUTER ranges wrapping a STORE
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let store = UOp::new(Op::Store { buffer, index, value }, DType::Void);
+    let index = UOp::index_const(0);
+    let value = UOp::native_const(1.0f32);
+    let store = UOp::store(buffer, index, value);
     let range_loop = UOp::range_const(4, 0);
-    let range_outer =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(8)), AxisId::Renumbered(1), AxisType::Outer);
+    let range_outer = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), AxisType::Outer);
     let end = UOp::end(store, smallvec![range_loop, range_outer]);
 
     let result = split_store(&end, &mut ctx);
@@ -317,8 +320,8 @@ fn test_split_store_with_copy() {
 
     // Create STORE using the COPY result
     let output_buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let store = UOp::new(Op::Store { buffer: output_buffer, index, value: copy.clone() }, DType::Void);
+    let index = UOp::index_const(0);
+    let store = UOp::store(output_buffer, index, copy.clone());
 
     let result = split_store(&store, &mut ctx);
 
@@ -346,8 +349,8 @@ fn test_split_store_with_buffer_view() {
 
     // Create STORE using the BUFFER_VIEW result
     let output_buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let store = UOp::new(Op::Store { buffer: output_buffer, index, value: buffer_view.clone() }, DType::Void);
+    let index = UOp::index_const(0);
+    let store = UOp::store(output_buffer, index, buffer_view.clone());
 
     let result = split_store(&store, &mut ctx);
 
@@ -374,14 +377,14 @@ fn test_split_store_normal_computation_uses_sink() {
     let mut ctx = KernelContext::new();
 
     // Create normal arithmetic computation (no COPY/BUFFER_VIEW)
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
     let value = a.try_add_op(&b).unwrap();
 
     // Create STORE with normal computation
     let buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let store = UOp::new(Op::Store { buffer: buffer.clone(), index, value: value.clone() }, DType::Void);
+    let index = UOp::index_const(0);
+    let store = UOp::store(buffer.clone(), index, value.clone());
 
     let result = split_store(&store, &mut ctx);
 
@@ -413,8 +416,8 @@ fn test_split_store_nested_copy_in_store() {
     let copy = src_buffer.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
 
     let output_buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let store = UOp::new(Op::Store { buffer: output_buffer, index, value: copy.clone() }, DType::Void);
+    let index = UOp::index_const(0);
+    let store = UOp::store(output_buffer, index, copy.clone());
 
     let range = UOp::range_const(10, 0);
     let end = UOp::end(store, smallvec![range]);
@@ -464,8 +467,8 @@ fn test_split_store_copy_precedence_documented() {
     let copy2 = copy1.clone().copy_to_device(DeviceSpec::Cuda { device_id: 0 });
 
     let output_buffer = UOp::unique(Some(0));
-    let index = UOp::const_(DType::Index, ConstValue::Int(0));
-    let store = UOp::new(Op::Store { buffer: output_buffer, index, value: copy2.clone() }, DType::Void);
+    let index = UOp::index_const(0);
+    let store = UOp::store(output_buffer, index, copy2.clone());
 
     let result = split_store(&store, &mut ctx);
 

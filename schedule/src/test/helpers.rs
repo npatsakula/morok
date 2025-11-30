@@ -3,7 +3,7 @@
 //! This module provides helper functions to create common test patterns
 //! (reduces, matmul, etc.) and assertion utilities for validating scheduler state.
 
-use morok_ir::{AxisId, AxisType, ConstValue, DType, Op, ReduceOp, UOp};
+use morok_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
 use std::rc::Rc;
 
 use crate::optimizer::Scheduler;
@@ -29,10 +29,10 @@ use crate::optimizer::Scheduler;
 pub fn create_simple_reduce(size: i64, reduce_op: ReduceOp) -> Rc<UOp> {
     use smallvec::smallvec;
 
-    let size_uop = UOp::const_(DType::Int64, ConstValue::Int(size));
+    let size_uop = UOp::native_const(size as i32 as i64);
     // Use Reduce axis type for reduction dimensions
     let range = UOp::range_axis(size_uop, AxisId::Renumbered(0), AxisType::Reduce);
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(const_val, smallvec![range], reduce_op);
     UOp::sink(vec![reduce])
 }
@@ -67,17 +67,17 @@ pub fn create_reduce_with_globals(global_sizes: &[i64], reduce_size: i64, reduce
     // Create Global axes
     let mut all_axes = Vec::new();
     for (i, &size) in global_sizes.iter().enumerate() {
-        let size_uop = UOp::const_(DType::Int64, ConstValue::Int(size));
+        let size_uop = UOp::native_const(size as i32 as i64);
         let axis = UOp::range_axis(size_uop, AxisId::Renumbered(i), AxisType::Global);
         all_axes.push(axis);
     }
 
     // Create Reduce axis
-    let reduce_size_uop = UOp::const_(DType::Int64, ConstValue::Int(reduce_size));
+    let reduce_size_uop = UOp::native_const(reduce_size as i32 as i64);
     let reduce_axis = UOp::range_axis(reduce_size_uop, AxisId::Renumbered(global_sizes.len()), AxisType::Reduce);
 
     // Create reduction
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(const_val, smallvec![reduce_axis], reduce_op);
 
     // Add all axes to sink
@@ -114,13 +114,12 @@ pub fn create_reduce_with_globals(global_sizes: &[i64], reduce_size: i64, reduce
 /// # Returns
 /// A UOp representing the matmul sink
 pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Rc<UOp> {
-    use morok_ir::BinaryOp;
     use smallvec::smallvec;
 
     // Create ranges for M, N, K dimensions
-    let m_uop = UOp::const_(DType::Int64, ConstValue::Int(m));
-    let n_uop = UOp::const_(DType::Int64, ConstValue::Int(n));
-    let k_uop = UOp::const_(DType::Int64, ConstValue::Int(k));
+    let m_uop = UOp::native_const(m as i32 as i64);
+    let n_uop = UOp::native_const(n as i32 as i64);
+    let k_uop = UOp::native_const(k as i32 as i64);
 
     let m_range = UOp::range_axis(m_uop, AxisId::Renumbered(0), AxisType::Global);
     let n_range = UOp::range_axis(n_uop, AxisId::Renumbered(1), AxisType::Global);
@@ -128,7 +127,7 @@ pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Rc<UOp> {
 
     // Create a simple computation that uses all ranges
     // (simplified for testing - structure matters more than exact computation)
-    let add_expr = UOp::new(Op::Binary(BinaryOp::Add, m_range.clone(), k_range.clone()), DType::Int64);
+    let add_expr = m_range.try_add_op(&k_range).expect("ADD should succeed with same dtype");
 
     // Create reduction over K
     let reduce = UOp::reduce(add_expr, smallvec![k_range], ReduceOp::Add);
@@ -160,14 +159,14 @@ pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Rc<UOp> {
 pub fn create_double_reduce(size1: i64, size2: i64, reduce_op: ReduceOp) -> Rc<UOp> {
     use smallvec::smallvec;
 
-    let size1_uop = UOp::const_(DType::Int64, ConstValue::Int(size1));
-    let size2_uop = UOp::const_(DType::Int64, ConstValue::Int(size2));
+    let size1_uop = UOp::native_const(size1 as i32 as i64);
+    let size2_uop = UOp::native_const(size2 as i32 as i64);
 
     // Reduction axes should be marked as Reduce from the start
     let range1 = UOp::range_axis(size1_uop, AxisId::Renumbered(0), AxisType::Reduce);
     let range2 = UOp::range_axis(size2_uop, AxisId::Renumbered(1), AxisType::Reduce);
 
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(const_val, smallvec![range1, range2], reduce_op);
 
     UOp::sink(vec![reduce])
@@ -210,7 +209,7 @@ pub fn create_double_reduce_with_globals(global_sizes: &[i64], reduce_sizes: &[i
     let mut axis_id = 0;
 
     for &size in global_sizes {
-        let size_uop = UOp::const_(DType::Int64, ConstValue::Int(size));
+        let size_uop = UOp::native_const(size as i32 as i64);
         let axis = UOp::range_axis(size_uop, AxisId::Renumbered(axis_id), AxisType::Global);
         all_axes.push(axis);
         axis_id += 1;
@@ -219,14 +218,14 @@ pub fn create_double_reduce_with_globals(global_sizes: &[i64], reduce_sizes: &[i
     // Create Reduce axes
     let mut reduce_axes = smallvec![];
     for &size in reduce_sizes {
-        let size_uop = UOp::const_(DType::Int64, ConstValue::Int(size));
+        let size_uop = UOp::native_const(size as i32 as i64);
         let axis = UOp::range_axis(size_uop, AxisId::Renumbered(axis_id), AxisType::Reduce);
         reduce_axes.push(axis);
         axis_id += 1;
     }
 
     // Create reduction
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
     let reduce = UOp::reduce(const_val, reduce_axes, reduce_op);
 
     // Build sink with reduce first, then global axes
@@ -252,12 +251,12 @@ pub fn create_double_reduce_with_globals(global_sizes: &[i64], reduce_sizes: &[i
 /// # Returns
 /// A UOp representing the elementwise sink
 pub fn create_elementwise_pattern(sizes: &[i64]) -> Rc<UOp> {
-    let const_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let const_val = UOp::native_const(1.0f32);
 
     let mut ops = vec![const_val];
 
     for (axis_id, &size) in sizes.iter().enumerate() {
-        let size_uop = UOp::const_(DType::Int64, ConstValue::Int(size));
+        let size_uop = UOp::native_const(size as i32 as i64);
         let range = UOp::range_axis(size_uop, AxisId::Renumbered(axis_id), AxisType::Global);
         ops.push(range);
     }

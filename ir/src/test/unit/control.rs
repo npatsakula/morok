@@ -2,11 +2,13 @@
 //!
 //! Tests control flow operations: If, EndIf, Range, End, Barrier.
 
+use std::{f32::consts::PI, f64::consts::E};
+
 use smallvec::smallvec;
 
 use morok_dtype::DType;
 
-use crate::{AxisId, AxisType, ConstValue, Op, UOp};
+use crate::{AxisId, AxisType, ConstValue, UOp};
 
 // =========================================================================
 // Basic If/EndIf Tests
@@ -14,79 +16,75 @@ use crate::{AxisId, AxisType, ConstValue, Op, UOp};
 
 #[test]
 fn test_if_basic_construction() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let body_stmt = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let condition = UOp::native_const(true);
 
-    let if_op = UOp::new(Op::If { condition: condition.clone(), body: smallvec![body_stmt] }, DType::Void);
+    let if_op = UOp::if_(condition.clone(), smallvec![UOp::native_const(1.0f32)]);
 
     assert_eq!(if_op.dtype(), DType::Void);
 }
 
 #[test]
 fn test_if_with_comparison_condition() {
-    let a = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let b = UOp::const_(DType::Int32, ConstValue::Int(10));
-
     // Create comparison condition: a < b
-    let condition = a.try_cmplt(&b).unwrap();
+    let condition = UOp::native_const(5i32).try_cmplt(&UOp::native_const(10i32)).unwrap();
     assert_eq!(condition.dtype(), DType::Bool);
 
-    let body_stmt = UOp::const_(DType::Float32, ConstValue::Float(42.0));
+    let body_stmt = UOp::native_const(42.0f32);
 
-    let if_op = UOp::new(Op::If { condition, body: smallvec![body_stmt] }, DType::Void);
+    let if_op = UOp::if_(condition, smallvec![body_stmt]);
 
     assert_eq!(if_op.dtype(), DType::Void);
 }
 
 #[test]
 fn test_if_empty_body() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(false));
+    let condition = UOp::native_const(false);
 
-    let if_op = UOp::new(Op::If { condition, body: smallvec![] }, DType::Void);
+    let if_op = UOp::if_(condition, smallvec![]);
 
     assert_eq!(if_op.dtype(), DType::Void);
 }
 
 #[test]
 fn test_if_single_statement_body() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let stmt = UOp::const_(DType::Int32, ConstValue::Int(100));
+    let condition = UOp::native_const(true);
+    let stmt = UOp::native_const(100i32);
 
-    let if_op = UOp::new(Op::If { condition, body: smallvec![stmt] }, DType::Void);
+    let if_op = UOp::if_(condition, smallvec![stmt]);
 
     assert_eq!(if_op.dtype(), DType::Void);
 }
 
 #[test]
 fn test_if_multiple_statements() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let stmt1 = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let stmt2 = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let stmt3 = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let condition = UOp::native_const(true);
+    let stmt1 = UOp::native_const(1i32);
+    let stmt2 = UOp::native_const(2i32);
+    let stmt3 = UOp::native_const(3i32);
 
-    let if_op = UOp::new(Op::If { condition, body: smallvec![stmt1, stmt2, stmt3] }, DType::Void);
+    let if_op = UOp::if_(condition, smallvec![stmt1, stmt2, stmt3]);
 
     assert_eq!(if_op.dtype(), DType::Void);
 }
 
 #[test]
 fn test_endif_basic() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let body_stmt = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let condition = UOp::native_const(true);
+    let body_stmt = UOp::native_const(1.0f32);
 
-    let if_op = UOp::new(Op::If { condition, body: smallvec![body_stmt] }, DType::Void);
+    let if_op = UOp::if_(condition, smallvec![body_stmt]);
 
-    let endif = UOp::new(Op::EndIf { if_op: if_op.clone() }, DType::Void);
+    let endif = UOp::endif(if_op.clone());
 
     assert_eq!(endif.dtype(), DType::Void);
 }
 
 #[test]
 fn test_if_returns_void() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let body = smallvec![UOp::const_(DType::Int32, ConstValue::Int(42))];
+    let condition = UOp::native_const(true);
+    let body = smallvec![UOp::native_const(42i32)];
 
-    let if_op = UOp::new(Op::If { condition, body }, DType::Void);
+    let if_op = UOp::if_(condition, body);
 
     // Verify If has DType::Void
     assert_eq!(if_op.dtype(), DType::Void);
@@ -98,77 +96,61 @@ fn test_if_returns_void() {
 
 #[test]
 fn test_range_global_axis() {
-    let end = UOp::const_(DType::Int32, ConstValue::Int(10));
+    let end = UOp::native_const(10i32);
 
-    let range_op =
-        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Global }, DType::Index);
+    let range_op = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Global);
 
     assert_eq!(range_op.dtype(), DType::Index);
 }
 
 #[test]
 fn test_range_warp_axis() {
-    let end = UOp::const_(DType::Int32, ConstValue::Int(32));
+    let end = UOp::native_const(32i32);
 
-    let range_op = UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(1), axis_type: AxisType::Warp }, DType::Index);
+    let range_op = UOp::range_axis(end, AxisId::Renumbered(1), AxisType::Warp);
 
     assert_eq!(range_op.dtype(), DType::Index);
 }
 
 #[test]
 fn test_range_local_axis() {
-    let end = UOp::const_(DType::Int32, ConstValue::Int(256));
-
-    let range_op =
-        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Local }, DType::Index);
-
+    let end = UOp::native_const(256i32);
+    let range_op = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Local);
     assert_eq!(range_op.dtype(), DType::Index);
 }
 
 #[test]
 fn test_range_loop_axis() {
-    let end = UOp::const_(DType::Int32, ConstValue::Int(100));
-
-    let range_op = UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(2), axis_type: AxisType::Loop }, DType::Index);
-
+    let end = UOp::native_const(100i32);
+    let range_op = UOp::range(end, 2);
     assert_eq!(range_op.dtype(), DType::Index);
 }
 
 #[test]
 fn test_range_reduce_axis() {
-    let end = UOp::const_(DType::Int32, ConstValue::Int(1024));
-
-    let range_op =
-        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Reduce }, DType::Index);
-
+    let end = UOp::native_const(1024i32);
+    let range_op = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Reduce);
     assert_eq!(range_op.dtype(), DType::Index);
 }
 
 #[test]
 fn test_range_unroll_axis() {
-    let end = UOp::const_(DType::Int32, ConstValue::Int(4));
-
-    let range_op =
-        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(3), axis_type: AxisType::Unroll }, DType::Index);
-
+    let end = UOp::native_const(4i32);
+    let range_op = UOp::range_axis(end, AxisId::Renumbered(3), AxisType::Unroll);
     assert_eq!(range_op.dtype(), DType::Index);
 }
 
 #[test]
 fn test_range_thread_axis() {
-    let end = UOp::const_(DType::Int32, ConstValue::Int(8));
-
-    let range_op =
-        UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(1), axis_type: AxisType::Thread }, DType::Index);
-
+    let end = UOp::native_const(8i32);
+    let range_op = UOp::range_axis(end, AxisId::Renumbered(1), AxisType::Thread);
     assert_eq!(range_op.dtype(), DType::Index);
 }
 
 #[test]
 fn test_range_dtype_is_index() {
     // Verify all Range operations return DType::Index
-    let end = UOp::const_(DType::Int32, ConstValue::Int(10));
-
+    let end = UOp::native_const(10i32);
     let axis_types = vec![
         AxisType::Global,
         AxisType::Warp,
@@ -182,8 +164,7 @@ fn test_range_dtype_is_index() {
     ];
 
     for (idx, axis_type) in axis_types.into_iter().enumerate() {
-        let range_op =
-            UOp::new(Op::Range { end: end.clone(), axis_id: AxisId::Renumbered(idx), axis_type }, DType::Index);
+        let range_op = UOp::range_axis(end.clone(), AxisId::Renumbered(idx), axis_type);
 
         assert_eq!(range_op.dtype(), DType::Index);
     }
@@ -195,15 +176,14 @@ fn test_range_dtype_is_index() {
 
 #[test]
 fn test_end_of_range() {
-    let end_val = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let range_op =
-        UOp::new(Op::Range { end: end_val, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop }, DType::Index);
+    let end_val = UOp::native_const(10i32);
+    let range_op = UOp::range(end_val, 0);
 
     // Create a simple computation (NOOP)
     let computation = UOp::noop();
 
     // Create END with computation and ranges
-    let end_op = UOp::new(Op::End { computation, ranges: smallvec![range_op] }, DType::Void);
+    let end_op = UOp::end(computation, smallvec![range_op]);
 
     assert_eq!(end_op.dtype(), DType::Void);
 }
@@ -211,30 +191,28 @@ fn test_end_of_range() {
 #[test]
 fn test_end_preserves_dtype() {
     // End operation should have DType::Void
-    let end_val = UOp::const_(DType::Int32, ConstValue::Int(5));
-    let range_op =
-        UOp::new(Op::Range { end: end_val, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Global }, DType::Index);
+    let end_val = UOp::native_const(5i32);
+    let range_op = UOp::range_axis(end_val, AxisId::Renumbered(0), AxisType::Global);
 
     // Create a simple computation (NOOP)
     let computation = UOp::noop();
 
     // Create END with computation and ranges
-    let end_op = UOp::new(Op::End { computation, ranges: smallvec![range_op] }, DType::Void);
+    let end_op = UOp::end(computation, smallvec![range_op]);
 
     assert_eq!(end_op.dtype(), DType::Void);
 }
 
 #[test]
 fn test_end_returns_void() {
-    let end_val = UOp::const_(DType::Int32, ConstValue::Int(100));
-    let range_op =
-        UOp::new(Op::Range { end: end_val, axis_id: AxisId::Renumbered(1), axis_type: AxisType::Reduce }, DType::Index);
+    let end_val = UOp::native_const(100i32);
+    let range_op = UOp::range_axis(end_val, AxisId::Renumbered(1), AxisType::Reduce);
 
     // Create a simple computation (NOOP)
     let computation = UOp::noop();
 
     // Create END with computation and ranges
-    let end_op = UOp::new(Op::End { computation, ranges: smallvec![range_op] }, DType::Void);
+    let end_op = UOp::end(computation, smallvec![range_op]);
 
     // Verify End has DType::Void
     assert_eq!(end_op.dtype(), DType::Void);
@@ -246,9 +224,9 @@ fn test_end_returns_void() {
 
 #[test]
 fn test_barrier_basic() {
-    let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let src = UOp::native_const(1.0f32);
 
-    let barrier = UOp::new(Op::Barrier { src: src.clone(), deps: smallvec![] }, DType::Float32);
+    let barrier = UOp::barrier(src.clone(), smallvec![]);
 
     // Barrier preserves src dtype
     assert_eq!(barrier.dtype(), DType::Float32);
@@ -256,22 +234,22 @@ fn test_barrier_basic() {
 
 #[test]
 fn test_barrier_with_single_dep() {
-    let src = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let dep = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
+    let src = UOp::native_const(42i32);
+    let dep = UOp::native_const(PI);
 
-    let barrier = UOp::new(Op::Barrier { src: src.clone(), deps: smallvec![dep] }, DType::Int32);
+    let barrier = UOp::barrier(src.clone(), smallvec![dep]);
 
     assert_eq!(barrier.dtype(), DType::Int32);
 }
 
 #[test]
 fn test_barrier_with_multiple_deps() {
-    let src = UOp::const_(DType::Float64, ConstValue::Float(std::f64::consts::E));
-    let dep1 = UOp::const_(DType::Int32, ConstValue::Int(1));
-    let dep2 = UOp::const_(DType::Int32, ConstValue::Int(2));
-    let dep3 = UOp::const_(DType::Int32, ConstValue::Int(3));
+    let src = UOp::native_const(E);
+    let dep1 = UOp::native_const(1i32);
+    let dep2 = UOp::native_const(2i32);
+    let dep3 = UOp::native_const(3i32);
 
-    let barrier = UOp::new(Op::Barrier { src: src.clone(), deps: smallvec![dep1, dep2, dep3] }, DType::Float64);
+    let barrier = UOp::barrier(src.clone(), smallvec![dep1, dep2, dep3]);
 
     assert_eq!(barrier.dtype(), DType::Float64);
 }
@@ -282,14 +260,14 @@ fn test_barrier_preserves_dtype() {
     let dtypes = vec![
         (DType::Int8, ConstValue::Int(1)),
         (DType::Int32, ConstValue::Int(100)),
-        (DType::Float32, ConstValue::Float(std::f32::consts::PI as f64)),
-        (DType::Float64, ConstValue::Float(std::f64::consts::E)),
+        (DType::Float32, ConstValue::Float(PI as f64)),
+        (DType::Float64, ConstValue::Float(E)),
         (DType::UInt32, ConstValue::UInt(42)),
     ];
 
     for (dtype, value) in dtypes {
         let src = UOp::const_(dtype.clone(), value);
-        let barrier = UOp::new(Op::Barrier { src, deps: smallvec![] }, dtype.clone());
+        let barrier = UOp::barrier(src, smallvec![]);
 
         assert_eq!(barrier.dtype(), dtype);
     }
@@ -301,46 +279,42 @@ fn test_barrier_preserves_dtype() {
 
 #[test]
 fn test_nested_if() {
-    let outer_cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let inner_cond = UOp::const_(DType::Bool, ConstValue::Bool(false));
+    let outer_cond = UOp::native_const(true);
+    let inner_cond = UOp::native_const(false);
 
-    let inner_body = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let inner_body = UOp::native_const(42i32);
 
-    let inner_if = UOp::new(Op::If { condition: inner_cond, body: smallvec![inner_body] }, DType::Void);
+    let inner_if = UOp::if_(inner_cond, smallvec![inner_body]);
 
     // Outer if contains inner if in its body
-    let outer_if = UOp::new(Op::If { condition: outer_cond, body: smallvec![inner_if] }, DType::Void);
+    let outer_if = UOp::if_(outer_cond, smallvec![inner_if]);
 
     assert_eq!(outer_if.dtype(), DType::Void);
 }
 
 #[test]
 fn test_range_inside_if() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let range_end = UOp::const_(DType::Int32, ConstValue::Int(10));
+    let condition = UOp::native_const(true);
+    let range_end = UOp::native_const(10i32);
 
-    let range_op =
-        UOp::new(Op::Range { end: range_end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop }, DType::Index);
+    let range_op = UOp::range(range_end, 0);
 
-    let if_op = UOp::new(Op::If { condition, body: smallvec![range_op] }, DType::Void);
+    let if_op = UOp::if_(condition, smallvec![range_op]);
 
     assert_eq!(if_op.dtype(), DType::Void);
 }
 
 #[test]
 fn test_multiple_sequential_ranges() {
-    let end1 = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let end2 = UOp::const_(DType::Int32, ConstValue::Int(20));
-    let end3 = UOp::const_(DType::Int32, ConstValue::Int(30));
+    let end1 = UOp::native_const(10i32);
+    let end2 = UOp::native_const(20i32);
+    let end3 = UOp::native_const(30i32);
 
-    let range1 =
-        UOp::new(Op::Range { end: end1, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Global }, DType::Index);
+    let range1 = UOp::range_axis(end1, AxisId::Renumbered(0), AxisType::Global);
 
-    let range2 =
-        UOp::new(Op::Range { end: end2, axis_id: AxisId::Renumbered(1), axis_type: AxisType::Local }, DType::Index);
+    let range2 = UOp::range_axis(end2, AxisId::Renumbered(1), AxisType::Local);
 
-    let range3 =
-        UOp::new(Op::Range { end: end3, axis_id: AxisId::Renumbered(2), axis_type: AxisType::Loop }, DType::Index);
+    let range3 = UOp::range(end3, 2);
 
     // All ranges should be valid
     assert_eq!(range1.dtype(), DType::Index);
@@ -354,10 +328,10 @@ fn test_multiple_sequential_ranges() {
 
 #[test]
 fn test_if_dtype_is_void() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let body = smallvec![UOp::const_(DType::Float32, ConstValue::Float(1.0))];
+    let condition = UOp::native_const(true);
+    let body = smallvec![UOp::native_const(1.0f32)];
 
-    let if_op = UOp::new(Op::If { condition, body }, DType::Void);
+    let if_op = UOp::if_(condition, body);
 
     // Confirm If dtype
     assert_eq!(if_op.dtype(), DType::Void);
@@ -365,10 +339,10 @@ fn test_if_dtype_is_void() {
 
 #[test]
 fn test_endif_dtype_is_void() {
-    let condition = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let if_op = UOp::new(Op::If { condition, body: smallvec![] }, DType::Void);
+    let condition = UOp::native_const(true);
+    let if_op = UOp::if_(condition, smallvec![]);
 
-    let endif = UOp::new(Op::EndIf { if_op }, DType::Void);
+    let endif = UOp::endif(if_op);
 
     // Confirm EndIf dtype
     assert_eq!(endif.dtype(), DType::Void);
@@ -376,9 +350,9 @@ fn test_endif_dtype_is_void() {
 
 #[test]
 fn test_range_confirms_index_dtype() {
-    let end = UOp::const_(DType::Int32, ConstValue::Int(100));
+    let end = UOp::native_const(100i32);
 
-    let range_op = UOp::new(Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop }, DType::Index);
+    let range_op = UOp::range(end, 0);
 
     // Confirm Range dtype
     assert_eq!(range_op.dtype(), DType::Index);
@@ -386,15 +360,14 @@ fn test_range_confirms_index_dtype() {
 
 #[test]
 fn test_end_dtype_is_void() {
-    let end_val = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let range_op =
-        UOp::new(Op::Range { end: end_val, axis_id: AxisId::Renumbered(0), axis_type: AxisType::Global }, DType::Index);
+    let end_val = UOp::native_const(10i32);
+    let range_op = UOp::range_axis(end_val, AxisId::Renumbered(0), AxisType::Global);
 
     // Create a simple computation (NOOP)
     let computation = UOp::noop();
 
     // Create END with computation and ranges
-    let end_op = UOp::new(Op::End { computation, ranges: smallvec![range_op] }, DType::Void);
+    let end_op = UOp::end(computation, smallvec![range_op]);
 
     // Confirm End dtype
     assert_eq!(end_op.dtype(), DType::Void);
@@ -403,11 +376,11 @@ fn test_end_dtype_is_void() {
 #[test]
 fn test_barrier_dtype_preservation() {
     // Test that Barrier preserves src dtype across different types
-    let int_src = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let int_barrier = UOp::new(Op::Barrier { src: int_src, deps: smallvec![] }, DType::Int32);
+    let int_src = UOp::native_const(42i32);
+    let int_barrier = UOp::barrier(int_src, smallvec![]);
     assert_eq!(int_barrier.dtype(), DType::Int32);
 
-    let float_src = UOp::const_(DType::Float32, ConstValue::Float(std::f32::consts::PI as f64));
-    let float_barrier = UOp::new(Op::Barrier { src: float_src, deps: smallvec![] }, DType::Float32);
+    let float_src = UOp::native_const(PI);
+    let float_barrier = UOp::barrier(float_src, smallvec![]);
     assert_eq!(float_barrier.dtype(), DType::Float32);
 }

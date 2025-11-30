@@ -74,7 +74,7 @@ proptest! {
     /// Test that identity eliminations are Z3-verified
     #[test]
     fn z3_verify_identity_add_zero(x in arb_var_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+        let zero = UOp::native_const(0i32);
         let expr = UOp::new(
             morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, Rc::clone(&x), zero),
             DType::Int32,
@@ -94,7 +94,7 @@ proptest! {
     /// Test that zero propagation is Z3-verified
     #[test]
     fn z3_verify_zero_mul(x in arb_var_uop(DType::Int32)) {
-        let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
+        let zero = UOp::native_const(0i32);
         let expr = x.try_mul_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
@@ -135,9 +135,12 @@ proptest! {
             .expect("Z3 should verify x / x = 1 for x ≠ 0");
     }
 
-    /// Test arithmetic trees with Z3 verification
+    /// Test arithmetic trees with Z3 verification.
+    ///
+    /// Uses bounded constants to avoid overflow mismatches between
+    /// Z3's unbounded integers and our IR's wrapping semantics.
     #[test]
-    fn z3_verify_arithmetic_optimization(graph in arb_arithmetic_tree_up_to(DType::Int32, 3)) {
+    fn z3_verify_arithmetic_optimization(graph in arb_arithmetic_tree_bounded_up_to(DType::Int32, 3)) {
         let matcher = symbolic_simple();
         let optimized = graph_rewrite(&matcher, graph.clone(), &mut ());
 
@@ -225,22 +228,22 @@ fn rebuild_with_dtype(kpg: &KnownPropertyGraph, dtype: DType) -> Rc<UOp> {
     match kpg {
         KnownPropertyGraph::AddZero { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
-            let zero = UOp::const_(dtype.clone(), ConstValue::Int(0));
+            let zero = UOp::native_const(0i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, x, zero), dtype)
         }
         KnownPropertyGraph::MulOne { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
-            let one = UOp::const_(dtype.clone(), ConstValue::Int(1));
+            let one = UOp::native_const(1i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Mul, x, one), dtype)
         }
         KnownPropertyGraph::SubZero { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
-            let zero = UOp::const_(dtype.clone(), ConstValue::Int(0));
+            let zero = UOp::native_const(0i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Sub, x, zero), dtype)
         }
         KnownPropertyGraph::MulZero { .. } => {
             let x = UOp::var("x", dtype.clone(), 0, 100);
-            let zero = UOp::const_(dtype.clone(), ConstValue::Int(0));
+            let zero = UOp::native_const(0i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Mul, x, zero), dtype)
         }
         KnownPropertyGraph::SubSelf { .. } => {

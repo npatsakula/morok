@@ -3,12 +3,12 @@ use crate::{
     pattern::upat::{ArgPattern, OpFilter},
 };
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, ConstValueHash, Op, UOp, UnaryOp};
+use morok_ir::{BinaryOp, ConstValue, ConstValueHash, Op, UOp};
 use std::{mem::discriminant, rc::Rc};
 
 /// Helper to create a const UOp
 fn const_uop(val: i64) -> Rc<UOp> {
-    UOp::new(Op::Const(ConstValueHash(ConstValue::Int(val))), DType::Int32)
+    UOp::const_(DType::Int32, ConstValue::Int(val))
 }
 
 /// Helper to create a binary op UOp
@@ -151,9 +151,9 @@ fn test_operator_div() {
     let pat = UPat::var("x") / UPat::cvar("c");
 
     // Create float division UOp
-    let five_f = UOp::new(Op::Const(ConstValueHash(ConstValue::Float(5.0))), DType::Float32);
-    let one_f = UOp::new(Op::Const(ConstValueHash(ConstValue::Float(1.0))), DType::Float32);
-    let fdiv = UOp::new(Op::Binary(BinaryOp::Fdiv, five_f, one_f), DType::Float32);
+    let five_f = UOp::const_(DType::Float32, ConstValue::Float(5.0));
+    let one_f = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let fdiv = five_f.try_fdiv_op(&one_f).unwrap();
 
     let matches = pat.match_uop(&fdiv);
     assert_eq!(matches.len(), 1);
@@ -181,7 +181,7 @@ fn test_operator_neg() {
     let pat = -UPat::var("x");
 
     let five = const_uop(5);
-    let neg = UOp::new(Op::Unary(UnaryOp::Neg, five), DType::Int32);
+    let neg = five.neg();
 
     let matches = pat.match_uop(&neg);
     assert_eq!(matches.len(), 1);
@@ -379,12 +379,12 @@ fn test_float_const() {
     let pat = UPat::float(1.5);
 
     // Create a float constant UOp
-    let one_point_five = UOp::new(Op::Const(ConstValueHash(ConstValue::Float(1.5))), DType::Float32);
+    let one_point_five = UOp::const_(DType::Float32, ConstValue::Float(1.5));
     let matches = pat.match_uop(&one_point_five);
     assert_eq!(matches.len(), 1);
 
     // Should not match different value
-    let two_point_zero = UOp::new(Op::Const(ConstValueHash(ConstValue::Float(2.0))), DType::Float32);
+    let two_point_zero = UOp::const_(DType::Float32, ConstValue::Float(2.0));
     let matches = pat.match_uop(&two_point_zero);
     assert_eq!(matches.len(), 0);
 }
@@ -403,7 +403,7 @@ fn test_detach_helper() {
     let pat = UPat::detach(UPat::var("x"));
 
     let five = const_uop(5);
-    let detach = UOp::new(Op::Detach { src: five.clone() }, DType::Int32);
+    let detach = UOp::detach(five.clone());
 
     let matches = pat.match_uop(&detach);
     assert_eq!(matches.len(), 1);
@@ -420,7 +420,7 @@ fn test_contiguous_backward_helper() {
     let pat = UPat::contiguous_backward(UPat::var("x"));
 
     let five = const_uop(5);
-    let contiguous = UOp::new(Op::ContiguousBackward { src: five.clone() }, DType::Int32);
+    let contiguous = UOp::contiguous_backward(five.clone());
 
     let matches = pat.match_uop(&contiguous);
     assert_eq!(matches.len(), 1);

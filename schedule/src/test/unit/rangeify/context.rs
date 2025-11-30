@@ -43,8 +43,8 @@ fn test_next_range_id_increments() {
 fn test_record_and_retrieve_transform() {
     let mut ctx = RangeifyContext::new();
 
-    let original = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let rangeified = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let original = UOp::native_const(1.0f32);
+    let rangeified = UOp::native_const(2.0f32);
 
     ctx.record_transform(original.clone(), rangeified.clone());
 
@@ -57,7 +57,7 @@ fn test_record_and_retrieve_transform() {
 fn test_get_missing_returns_none() {
     let ctx = RangeifyContext::new();
 
-    let uop = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let uop = UOp::native_const(1.0f32);
     assert!(ctx.get_rangeified(&uop).is_none(), "Should return None for missing transformation");
 }
 
@@ -67,14 +67,14 @@ fn test_get_missing_returns_none() {
 fn test_multiple_transforms() {
     let mut ctx = RangeifyContext::new();
 
-    let original1 = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let rangeified1 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let original1 = UOp::native_const(1.0f32);
+    let rangeified1 = UOp::native_const(2.0f32);
 
-    let original2 = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let rangeified2 = UOp::const_(DType::Int32, ConstValue::Int(20));
+    let original2 = UOp::native_const(10i32);
+    let rangeified2 = UOp::native_const(20i32);
 
-    let original3 = UOp::const_(DType::Bool, ConstValue::Bool(true));
-    let rangeified3 = UOp::const_(DType::Bool, ConstValue::Bool(false));
+    let original3 = UOp::native_const(true);
+    let rangeified3 = UOp::native_const(false);
 
     ctx.record_transform(original1.clone(), rangeified1.clone());
     ctx.record_transform(original2.clone(), rangeified2.clone());
@@ -92,9 +92,9 @@ fn test_multiple_transforms() {
 fn test_overwrite_transform() {
     let mut ctx = RangeifyContext::new();
 
-    let original = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let rangeified1 = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-    let rangeified2 = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+    let original = UOp::native_const(1.0f32);
+    let rangeified1 = UOp::native_const(2.0f32);
+    let rangeified2 = UOp::native_const(3.0f32);
 
     ctx.record_transform(original.clone(), rangeified1.clone());
     ctx.record_transform(original.clone(), rangeified2.clone());
@@ -111,12 +111,12 @@ fn test_overwrite_transform() {
 fn test_transform_with_binary_ops() {
     let mut ctx = RangeifyContext::new();
 
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
     let original = a.try_add_op(&b).unwrap();
 
-    let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-    let d = UOp::const_(DType::Float32, ConstValue::Float(4.0));
+    let c = UOp::native_const(3.0f32);
+    let d = UOp::native_const(4.0f32);
     let rangeified = c.try_add_op(&d).unwrap();
 
     ctx.record_transform(original.clone(), rangeified.clone());
@@ -130,14 +130,14 @@ fn test_transform_with_nested_structure() {
     let mut ctx = RangeifyContext::new();
 
     // Create nested computation: (a + b) * c
-    let a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
     let sum = a.try_add_op(&b).unwrap();
-    let c = UOp::const_(DType::Float32, ConstValue::Float(3.0));
+    let c = UOp::native_const(3.0f32);
     let original = sum.try_mul_op(&c).unwrap();
 
     // Create rangeified version
-    let d = UOp::const_(DType::Float32, ConstValue::Float(4.0));
+    let d = UOp::native_const(4.0f32);
     let rangeified = d;
 
     ctx.record_transform(original.clone(), rangeified.clone());
@@ -152,7 +152,7 @@ fn test_transform_with_nested_structure() {
 fn test_transform_same_value() {
     let mut ctx = RangeifyContext::new();
 
-    let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let value = UOp::native_const(1.0f32);
 
     // Record a transform where original == rangeified
     ctx.record_transform(value.clone(), value.clone());
@@ -183,8 +183,8 @@ fn test_many_transforms() {
     let mut rangeifieds = Vec::new();
 
     for i in 0..count {
-        let original = UOp::const_(DType::Int32, ConstValue::Int(i as i64));
-        let rangeified = UOp::const_(DType::Int32, ConstValue::Int((i * 2) as i64));
+        let original = UOp::native_const(i);
+        let rangeified = UOp::native_const(i * 2);
 
         originals.push(original.clone());
         rangeifieds.push(rangeified.clone());
@@ -233,7 +233,7 @@ fn test_transform_with_reshape() {
     let mut ctx = RangeifyContext::new();
 
     let tensor = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let new_shape = UOp::const_(DType::Index, ConstValue::Int(10));
+    let new_shape = UOp::index_const(10);
     let reshape = UOp::new(Op::Reshape { src: tensor.clone(), new_shape }, tensor.dtype());
 
     let rangeified = UOp::const_(DType::Float32, ConstValue::Float(2.0));
@@ -249,7 +249,7 @@ fn test_transform_with_bufferize() {
     let mut ctx = RangeifyContext::new();
 
     let compute = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let range = UOp::const_(DType::Index, ConstValue::Int(10));
+    let range = UOp::index_const(10);
     let bufferize = UOp::bufferize(compute, vec![range], BufferizeOpts::local());
 
     let rangeified = UOp::const_(DType::Float32, ConstValue::Float(2.0));

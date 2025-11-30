@@ -33,7 +33,7 @@ fn test_unbind_kernel() {
 
     // Create a BIND operation
     let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
-    let value = UOp::const_(DType::Index, ConstValue::Int(5));
+    let value = UOp::index_const(5);
     let bind = UOp::bind(var.clone(), value);
 
     // Apply unbind_kernel pattern
@@ -50,7 +50,7 @@ fn test_renumber_range() {
     let mut ctx = KernelContext::new();
 
     // Create a RANGE with unrenumbered axis_id
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Unrenumbered(5), AxisType::Loop);
 
     // Apply renumber_range pattern
@@ -70,7 +70,7 @@ fn test_renumber_range_already_numbered() {
     let mut ctx = KernelContext::new();
 
     // Create a RANGE with already-renumbered axis_id
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(5), AxisType::Loop);
 
     // Apply renumber_range pattern - should return None (already numbered)
@@ -83,7 +83,7 @@ fn test_remove_zero_range() {
     let mut ctx = KernelContext::new();
 
     // Create a RANGE with end=0
-    let end = UOp::const_(DType::Index, ConstValue::Int(0));
+    let end = UOp::index_const(0);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     // Apply remove_zero_range pattern
@@ -99,7 +99,7 @@ fn test_cleanup_const_with_sources() {
     let mut ctx = KernelContext::new();
 
     // Create a CONST operation (normally has no sources)
-    let const_op = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let const_op = UOp::native_const(42i32);
 
     // Apply cleanup_const pattern (should not match since const has no sources normally)
     let result = cleanup_const(&const_op, &mut ctx);
@@ -223,7 +223,7 @@ fn test_handle_after_mselect_unwrap() {
 #[test]
 fn test_renumber_range_different_axis_types() {
     let mut ctx = KernelContext::new();
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end = UOp::index_const(10);
 
     // Test all three axis types with unrenumbered axis_ids
     for (i, axis_type) in [AxisType::Loop, AxisType::Reduce, AxisType::Outer].iter().enumerate() {
@@ -247,7 +247,7 @@ fn test_renumber_range_no_change_if_same() {
     let mut ctx = KernelContext::new();
 
     // First range will get ID 0
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end = UOp::index_const(10);
     let range1 = UOp::range_axis(end.clone(), AxisId::Renumbered(5), AxisType::Loop);
 
     renumber_range(&range1, &mut ctx);
@@ -281,7 +281,7 @@ fn test_remove_zero_range_uint() {
     let mut ctx = KernelContext::new();
 
     // Create a RANGE with end=0 (UInt)
-    let end = UOp::const_(DType::Index, ConstValue::UInt(0));
+    let end = UOp::index_const(0);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     let result = remove_zero_range(&range, &mut ctx);
@@ -296,7 +296,7 @@ fn test_remove_zero_range_non_zero() {
     let mut ctx = KernelContext::new();
 
     // Create a RANGE with non-zero end
-    let end = UOp::const_(DType::Index, ConstValue::Int(10));
+    let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     let result = remove_zero_range(&range, &mut ctx);
@@ -342,7 +342,7 @@ fn test_cleanup_const_with_spurious_sources() {
     // This tests the cleanup pattern that removes unnecessary sources from CONST
 
     // Create a CONST
-    let const_op = UOp::const_(DType::Int32, ConstValue::Int(42));
+    let const_op = UOp::native_const(42i32);
 
     let result = cleanup_const(&const_op, &mut ctx);
 
@@ -355,12 +355,9 @@ fn test_renumber_range_sequential() {
     let mut ctx = KernelContext::new();
 
     // Create ranges with unrenumbered axis_ids
-    let range0 =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Unrenumbered(0), AxisType::Loop);
-    let range1 =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(20)), AxisId::Unrenumbered(1), AxisType::Loop);
-    let range2 =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(30)), AxisId::Unrenumbered(2), AxisType::Reduce);
+    let range0 = UOp::range_axis(UOp::index_const(10), AxisId::Unrenumbered(0), AxisType::Loop);
+    let range1 = UOp::range_axis(UOp::index_const(20), AxisId::Unrenumbered(1), AxisType::Loop);
+    let range2 = UOp::range_axis(UOp::index_const(30), AxisId::Unrenumbered(2), AxisType::Reduce);
 
     // Process them in sequence - should get sequential IDs Renumbered(0), Renumbered(1), Renumbered(2)
 
@@ -411,7 +408,7 @@ fn test_remove_zero_range_verification() {
     let mut ctx = KernelContext::new();
 
     // Create RANGE with end=0
-    let end = UOp::const_(DType::Index, ConstValue::Int(0));
+    let end = UOp::index_const(0);
     let range = UOp::range_axis(end.clone(), AxisId::Renumbered(0), AxisType::Loop);
 
     let result = remove_zero_range(&range, &mut ctx);
@@ -446,8 +443,7 @@ fn test_pattern_composition_sequence() {
     // 2. Apply renumber_range
     // 3. Verify the result
 
-    let range_unnum =
-        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(15)), AxisId::Unrenumbered(7), AxisType::Loop);
+    let range_unnum = UOp::range_axis(UOp::index_const(15), AxisId::Unrenumbered(7), AxisType::Loop);
 
     // Apply renumber_range pattern
     let result1 = renumber_range(&range_unnum, &mut ctx);
