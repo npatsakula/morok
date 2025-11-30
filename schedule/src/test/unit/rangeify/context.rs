@@ -113,11 +113,11 @@ fn test_transform_with_binary_ops() {
 
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let original = a.try_add_op(&b).unwrap();
+    let original = a.try_add(&b).unwrap();
 
     let c = UOp::native_const(3.0f32);
     let d = UOp::native_const(4.0f32);
-    let rangeified = c.try_add_op(&d).unwrap();
+    let rangeified = c.try_add(&d).unwrap();
 
     ctx.record_transform(original.clone(), rangeified.clone());
 
@@ -132,9 +132,9 @@ fn test_transform_with_nested_structure() {
     // Create nested computation: (a + b) * c
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let sum = a.try_add_op(&b).unwrap();
+    let sum = a.try_add(&b).unwrap();
     let c = UOp::native_const(3.0f32);
-    let original = sum.try_mul_op(&c).unwrap();
+    let original = sum.try_mul(&c).unwrap();
 
     // Create rangeified version
     let d = UOp::native_const(4.0f32);

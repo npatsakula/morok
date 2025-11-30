@@ -59,7 +59,7 @@ fn test_symbolic_range_multiple() {
 fn test_symbolic_range_with_arithmetic() {
     // Test symbolic range size with arithmetic expression
     let n = UOp::var("n", DType::Index, 1, 512);
-    let size = n.try_mul_op(&create_const(2)).unwrap();
+    let size = n.try_mul(&create_const(2)).unwrap();
 
     let compute = UOp::native_const(3.0f32);
     let range = create_range_symbolic(size, 0);
@@ -131,9 +131,9 @@ fn test_bufferize_multiple_consumers() {
     let buf = create_bufferize(compute, vec![range]);
 
     // Two independent consumers of the same buffer
-    let consumer1 = buf.try_add_op(&UOp::native_const(2.0f32)).unwrap();
+    let consumer1 = buf.try_add(&UOp::native_const(2.0f32)).unwrap();
 
-    let consumer2 = buf.try_mul_op(&UOp::native_const(3.0f32)).unwrap();
+    let consumer2 = buf.try_mul(&UOp::native_const(3.0f32)).unwrap();
 
     // Combine consumers with SINK
     let sink = UOp::sink(vec![consumer1, consumer2]);
@@ -256,7 +256,7 @@ fn test_is_dead_axis_non_range() {
     let const_op = UOp::index_const(0);
     assert!(!is_dead_axis(&const_op));
 
-    let add_op = const_op.try_add_op(&const_op).unwrap();
+    let add_op = const_op.try_add(&const_op).unwrap();
     assert!(!is_dead_axis(&add_op));
 }
 

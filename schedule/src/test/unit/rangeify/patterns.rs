@@ -62,7 +62,7 @@ fn test_early_rewrites_no_match_for_other_ops() {
 
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match Binary ops");
 }
@@ -277,7 +277,7 @@ fn test_buffer_removal_cheap_compute() {
     // Test: BUFFERIZE(cheap_op) should be removed if cheap to inline
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let add = a.try_add_op(&b).unwrap(); // Binary add is cheap
+    let add = a.try_add(&b).unwrap(); // Binary add is cheap
 
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
@@ -358,7 +358,7 @@ fn test_buffer_removal_no_match_expensive_compute() {
 
     // Test: BUFFERIZE(expensive_op) should NOT be removed
     // LOAD is typically considered expensive and should not be inlined
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let load = UOp::load(buffer, index);
 

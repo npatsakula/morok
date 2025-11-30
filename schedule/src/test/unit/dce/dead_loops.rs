@@ -147,7 +147,7 @@ fn test_range_symbolic_dead() {
     // vmax(size - 10) = 5 - 10 = -5 ≤ 0, so dead
     let size = UOp::var("size", DType::Int32, 0, 5);
     let ten = UOp::native_const(10i32);
-    let count = size.try_sub_op(&ten).expect("SUB should succeed");
+    let count = size.try_sub(&ten).expect("SUB should succeed");
     let range = UOp::range(count, 0);
 
     let matcher = get_matcher();
@@ -162,7 +162,7 @@ fn test_range_boundary_vmax_zero() {
     // RANGE(max(-10, 0)) → Const(0)
     let neg_ten = UOp::native_const(-10i32);
     let zero = UOp::native_const(0i32);
-    let max_val = neg_ten.try_max_op(&zero).unwrap();
+    let max_val = neg_ten.try_max(&zero).unwrap();
     let range = UOp::range(max_val, 0);
 
     let matcher = get_matcher();

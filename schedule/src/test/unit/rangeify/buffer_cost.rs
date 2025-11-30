@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 
 /// Helper: Create a BUFFER operation for testing.
 fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Rc<UOp> {
-    let unique = UOp::unique(Some(id));
+    let unique = UOp::buffer_id(Some(id));
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     UOp::new(Op::Buffer { unique, device, size }, dtype)
 }
@@ -42,7 +42,7 @@ fn test_collect_accessed_buffers_multiple() {
     // Two buffers in ADD operation
     let buf1 = create_test_buffer(100, DType::Float32, 0);
     let buf2 = create_test_buffer(100, DType::Float32, 1);
-    let add = buf1.try_add_op(&buf2).unwrap();
+    let add = buf1.try_add(&buf2).unwrap();
 
     let buffers = collect_accessed_buffers(&add);
     assert_eq!(buffers.len(), 2);
@@ -68,7 +68,7 @@ fn test_collect_accessed_buffers_stops_at_global_bufferize() {
 fn test_collect_accessed_buffers_deduplication() {
     // Use same buffer twice (b + b)
     let buf = create_test_buffer(100, DType::Float32, 0);
-    let add = buf.try_add_op(&buf).unwrap();
+    let add = buf.try_add(&buf).unwrap();
 
     let buffers = collect_accessed_buffers(&add);
     assert_eq!(buffers.len(), 1); // Deduplicated

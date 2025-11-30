@@ -51,7 +51,7 @@ pub fn reduce_unparented(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
             for range in &unparented {
                 let size = get_range_size(range)?;
                 let size_casted = cast_to_dtype(&size, &result.dtype())?;
-                result = result.try_mul_op(&size_casted).ok()?;
+                result = result.try_mul(&size_casted).ok()?;
             }
         }
         ReduceOp::Mul => {
@@ -59,7 +59,7 @@ pub fn reduce_unparented(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
             for range in &unparented {
                 let size = get_range_size(range)?;
                 let size_casted = cast_to_dtype(&size, &result.dtype())?;
-                result = result.try_pow_op(&size_casted).ok()?;
+                result = result.try_pow(&size_casted).ok()?;
             }
         }
         ReduceOp::Max | ReduceOp::Min => {

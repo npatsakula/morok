@@ -129,7 +129,7 @@ pub fn self_folding_dsl_patterns() -> PatternMatcher {
         // x // -1 → -x
         Idiv(x, c @const(c_val)) if c_val.is_neg_one() ~> UOp::neg(x),
         // (x % y) % y → x % y
-        Mod(Mod(x, y), y) => x.try_mod_op(y).ok(),
+        Mod(Mod(x, y), y) => x.try_mod(y).ok(),
         // x & x → x
         And(x, x) ~> Rc::clone(x),
         // x | x → x
@@ -194,13 +194,13 @@ pub fn cast_dsl_patterns() -> PatternMatcher {
 pub fn term_combining_dsl_patterns() -> PatternMatcher {
     patterns! {
         // x + x → 2*x
-        Add(x, x) => 2.into_uop(x.dtype()).try_mul_op(x).ok(),
+        Add(x, x) => 2.into_uop(x.dtype()).try_mul(x).ok(),
         // (c1 * x) + (c2 * x) → (c1 + c2) * x
         Add(Mul(c1 @const(c1_val), x), Mul(c2 @const(c2_val), x))
-          => eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype()).try_mul_op(x).ok(),
+          => eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype()).try_mul(x).ok(),
         // (x * c1) + (x * c2) → x * (c1 + c2)
         Add(Mul(x, c1 @const(c1_val)), Mul(x, c2 @const(c2_val)))
-          => x.try_mul_op(&eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype())).ok(),
+          => x.try_mul(&eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype())).ok(),
     }
 }
 
@@ -217,7 +217,7 @@ pub fn advanced_division_dsl_patterns() -> PatternMatcher {
     patterns! {
         // (a // b) // c → a // (b * c) if b,c non-zero
         Idiv(Idiv(a, b @const(b_val)), c @const(c_val)) if !b_val.is_zero() && !c_val.is_zero() => {
-            a.try_idiv_op(&UOp::const_(b.dtype(), eval_mul_typed(b_val, c_val, b.dtype().base())?)).ok()
+            a.try_div(&UOp::const_(b.dtype(), eval_mul_typed(b_val, c_val, b.dtype().base())?)).ok()
         },
         // expr // divisor → expr.divides(divisor) (generic exact division)
         Idiv(expr, divisor @ @const) => expr.divides(divisor),
@@ -227,22 +227,22 @@ pub fn advanced_division_dsl_patterns() -> PatternMatcher {
             (modulus > 0 && modulus <= 256).then(|| {
                 let (af, bf) = (a.const_factor(), b.const_factor());
                 if af % modulus == 0 {
-                    b.try_mod_op(c).ok()
+                    b.try_mod(c).ok()
                 } else if bf % modulus == 0 {
-                    a.try_mod_op(c).ok()
+                    a.try_mod(c).ok()
                 } else {
                     None
                 }
             }).flatten()
         },
         // (a + b) // c → (a // c) + (b // c) when both divide evenly
-        Idiv(Add(a, b), c @ @const) => a.divides(c)?.try_add_op(&b.divides(c)?).ok(),
+        Idiv(Add(a, b), c @ @const) => a.divides(c)?.try_add(&b.divides(c)?).ok(),
         // (a - b) // c → (a // c) - (b // c) when both divide evenly
-        Idiv(Sub(a, b), c @ @const) => a.divides(c)?.try_sub_op(&b.divides(c)?).ok(),
+        Idiv(Sub(a, b), c @ @const) => a.divides(c)?.try_sub(&b.divides(c)?).ok(),
         // c * (a + b) → (c * a) + (c * b)
-        Mul(c @ @const, Add(a, b)) => c.try_mul_op(a).ok()?.try_add_op(&c.try_mul_op(b).ok()?).ok(),
+        Mul(c @ @const, Add(a, b)) => c.try_mul(a).ok()?.try_add(&c.try_mul(b).ok()?).ok(),
         // (a + b) * c → (a * c) + (b * c)
-        Mul(Add(a, b), c @ @const) => a.try_mul_op(c).ok()?.try_add_op(&b.try_mul_op(c).ok()?).ok(),
+        Mul(Add(a, b), c @ @const) => a.try_mul(c).ok()?.try_add(&b.try_mul(c).ok()?).ok(),
     }
 }
 
@@ -257,20 +257,20 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
     patterns! {
         // (x + c1) + c2 → x + (c1 + c2)
         Add(Add(x, c1 @const(c1_val)), c2 @const(c2_val))
-          => x.try_add_op(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
+          => x.try_add(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
         // (x * c1) * c2 → x * (c1 * c2)
         Mul(Mul(x, c1 @const(c1_val)), c2 @const(c2_val))
-          => x.try_mul_op(&UOp::const_(c1.dtype(), eval_mul_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
+          => x.try_mul(&UOp::const_(c1.dtype(), eval_mul_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
         // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2) when result is negative
         Add(Sub(x, c1 @const(c1_val)), c2 @const(c2_val)) => {
             let diff_val = eval_sub_typed(c2_val, c1_val, c1.dtype().base())?;
             // Normalize: prefer x - |c| over x + (-c)
             if let ConstValue::Int(v) = diff_val && v < 0 {
-                x.try_sub_op(&(-v).into_uop(c1.dtype())).ok()
+                x.try_sub(&(-v).into_uop(c1.dtype())).ok()
             } else {
-                x.try_add_op(&UOp::const_(c1.dtype(), diff_val)).ok()
+                x.try_add(&UOp::const_(c1.dtype(), diff_val)).ok()
             }
         },
 
@@ -279,9 +279,9 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
             let diff_val = eval_sub_typed(c1_val, c2_val, c1.dtype().base())?;
             // Normalize: prefer x - |c| over x + (-c)
             if let ConstValue::Int(v) = diff_val && v < 0 {
-                return x.try_sub_op(&(-v).into_uop(c1.dtype())).ok();
+                return x.try_sub(&(-v).into_uop(c1.dtype())).ok();
             }
-            x.try_add_op(&UOp::const_(c1.dtype(), diff_val)).ok()
+            x.try_add(&UOp::const_(c1.dtype(), diff_val)).ok()
         },
     }
 }
@@ -373,7 +373,7 @@ pub fn dce_dsl_patterns() -> PatternMatcher {
           ~> x.not(),
 
         // WHERE(!cond, t, f) → WHERE(cond, f, t) - negated condition swap
-        Where(Not(cond), t, f) => UOp::where_op(Rc::clone(cond), Rc::clone(f), Rc::clone(t)).ok(),
+        Where(Not(cond), t, f) => UOp::try_where(Rc::clone(cond), Rc::clone(f), Rc::clone(t)).ok(),
     }
 }
 

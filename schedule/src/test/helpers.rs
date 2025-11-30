@@ -127,7 +127,7 @@ pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Rc<UOp> {
 
     // Create a simple computation that uses all ranges
     // (simplified for testing - structure matters more than exact computation)
-    let add_expr = m_range.try_add_op(&k_range).expect("ADD should succeed with same dtype");
+    let add_expr = m_range.try_add(&k_range).expect("ADD should succeed with same dtype");
 
     // Create reduction over K
     let reduce = UOp::reduce(add_expr, smallvec![k_range], ReduceOp::Add);

@@ -44,7 +44,7 @@ fn test_remove_bufferize_cheap_binary() {
     // BUFFERIZE(x + y, ranges) should inline (cheap operation)
     let x = UOp::var("x", DType::Float32, 0, 100);
     let y = UOp::var("y", DType::Float32, 0, 100);
-    let add = x.try_add_op(&y).unwrap();
+    let add = x.try_add(&y).unwrap();
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(add.clone(), vec![range]);
@@ -222,7 +222,7 @@ fn test_multiple_cheap_ops_inline() {
     let range = create_range(10, 0);
 
     // Use direct Binary construction to test buffer removal, not type validation
-    let test_ops = vec![x.neg(), x.try_exp2().unwrap(), x.try_mul_op(&x).unwrap()];
+    let test_ops = vec![x.neg(), x.try_exp2().unwrap(), x.try_mul(&x).unwrap()];
 
     let matcher = buffer_removal();
 

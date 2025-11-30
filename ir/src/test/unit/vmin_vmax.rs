@@ -30,7 +30,7 @@ fn test_vmin_vmax_const() {
 
 #[test]
 fn test_vmin_vmax_add() {
-    let sum = UOp::native_const(2i32).try_add_op(&UOp::native_const(3i32)).unwrap();
+    let sum = UOp::native_const(2i32).try_add(&UOp::native_const(3i32)).unwrap();
 
     assert_eq!(sum.vmin(), &ConstValue::Int(5));
     assert_eq!(sum.vmax(), &ConstValue::Int(5));
@@ -40,7 +40,7 @@ fn test_vmin_vmax_add() {
 fn test_vmin_vmax_sub() {
     let a = UOp::native_const(10i32);
     let b = UOp::native_const(3i32);
-    let diff = a.try_sub_op(&b).unwrap();
+    let diff = a.try_sub(&b).unwrap();
 
     assert_eq!(diff.vmin(), &ConstValue::Int(7));
     assert_eq!(diff.vmax(), &ConstValue::Int(7));
@@ -50,7 +50,7 @@ fn test_vmin_vmax_sub() {
 fn test_vmin_vmax_mul() {
     let a = UOp::native_const(-2i32);
     let b = UOp::native_const(3i32);
-    let prod = a.try_mul_op(&b).unwrap();
+    let prod = a.try_mul(&b).unwrap();
 
     assert_eq!(prod.vmin(), &ConstValue::Int(-6));
     assert_eq!(prod.vmax(), &ConstValue::Int(-6));
@@ -61,7 +61,7 @@ fn test_vmin_vmax_mul_range() {
     // Test multiplication with ranges
     let a = UOp::define_var("a".to_string(), -2, 3);
     let b = UOp::define_var("b".to_string(), -1, 4);
-    let prod = a.try_mul_op(&b).unwrap();
+    let prod = a.try_mul(&b).unwrap();
 
     // Check all 4 corners: -2*-1=2, -2*4=-8, 3*-1=-3, 3*4=12
     // Min is -8, max is 12
@@ -73,7 +73,7 @@ fn test_vmin_vmax_mul_range() {
 fn test_vmin_vmax_max() {
     let a = UOp::native_const(5i32);
     let b = UOp::native_const(10i32);
-    let max_val = a.try_max_op(&b).unwrap();
+    let max_val = a.try_max(&b).unwrap();
 
     assert_eq!(max_val.vmin(), &ConstValue::Int(10));
     assert_eq!(max_val.vmax(), &ConstValue::Int(10));
@@ -83,7 +83,7 @@ fn test_vmin_vmax_max() {
 fn test_vmin_vmax_idiv() {
     let a = UOp::native_const(15i32);
     let b = UOp::native_const(3i32);
-    let div = a.try_idiv_op(&b).unwrap();
+    let div = a.try_div(&b).unwrap();
 
     assert_eq!(div.vmin(), &ConstValue::Int(5));
     assert_eq!(div.vmax(), &ConstValue::Int(5));
@@ -93,7 +93,7 @@ fn test_vmin_vmax_idiv() {
 fn test_vmin_vmax_mod() {
     let a = UOp::native_const(17i32);
     let b = UOp::native_const(5i32);
-    let modulo = a.try_mod_op(&b).unwrap();
+    let modulo = a.try_mod(&b).unwrap();
 
     assert_eq!(modulo.vmin(), &ConstValue::Int(2));
     assert_eq!(modulo.vmax(), &ConstValue::Int(2));
@@ -255,7 +255,7 @@ fn test_vmin_vmax_cast_range() {
 
 #[test]
 fn test_vmin_vmax_where_true() {
-    let where_op = UOp::where_(UOp::native_const(true), UOp::native_const(10i32), UOp::native_const(5i32));
+    let where_op = UOp::try_where(UOp::native_const(true), UOp::native_const(10i32), UOp::native_const(5i32)).unwrap();
 
     // Condition is always true, so result is true_val
     assert_eq!(where_op.vmin(), &ConstValue::Int(10));
@@ -264,7 +264,7 @@ fn test_vmin_vmax_where_true() {
 
 #[test]
 fn test_vmin_vmax_where_false() {
-    let where_op = UOp::where_(UOp::native_const(false), UOp::native_const(10i32), UOp::native_const(5i32));
+    let where_op = UOp::try_where(UOp::native_const(false), UOp::native_const(10i32), UOp::native_const(5i32)).unwrap();
 
     // Condition is always false, so result is false_val
     assert_eq!(where_op.vmin(), &ConstValue::Int(5));
@@ -277,7 +277,7 @@ fn test_vmin_vmax_where_range() {
     let cond = UOp::define_var("cond".to_string(), 0, 1);
     let true_val = UOp::native_const(10i32);
     let false_val = UOp::native_const(5i32);
-    let where_op = UOp::where_(cond, true_val, false_val);
+    let where_op = UOp::try_where(cond, true_val, false_val).unwrap();
 
     // Could be either branch
     assert_eq!(where_op.vmin(), &ConstValue::Int(5));
@@ -289,7 +289,7 @@ fn test_vmin_vmax_mulacc() {
     let a = UOp::native_const(3i32);
     let b = UOp::native_const(4i32);
     let c = UOp::native_const(5i32);
-    let mulacc = UOp::mulacc_op(a, b, c).unwrap();
+    let mulacc = UOp::try_mulacc(a, b, c).unwrap();
 
     // 3 * 4 + 5 = 17
     assert_eq!(mulacc.vmin(), &ConstValue::Int(17));
@@ -307,8 +307,8 @@ fn test_vmin_vmax_complex_expression() {
     let five = UOp::native_const(5i32);
     let two = UOp::native_const(2i32);
 
-    let x_plus_5 = x.try_add_op(&five).unwrap();
-    let result = x_plus_5.try_mul_op(&two).unwrap();
+    let x_plus_5 = x.try_add(&five).unwrap();
+    let result = x_plus_5.try_mul(&two).unwrap();
 
     // x in [0, 10] => x+5 in [5, 15] => (x+5)*2 in [10, 30]
     assert_eq!(result.vmin(), &ConstValue::Int(10));
@@ -322,8 +322,8 @@ fn test_vmin_vmax_nested_max() {
     let b = UOp::native_const(7i32);
     let c = UOp::native_const(5i32);
 
-    let max_ab = a.try_max_op(&b).unwrap();
-    let max_abc = max_ab.try_max_op(&c).unwrap();
+    let max_ab = a.try_max(&b).unwrap();
+    let max_abc = max_ab.try_max(&c).unwrap();
 
     assert_eq!(max_abc.vmin(), &ConstValue::Int(7));
     assert_eq!(max_abc.vmax(), &ConstValue::Int(7));
@@ -338,19 +338,19 @@ fn test_vmin_vmax_float_ops() {
     let a = UOp::native_const(2.5f32);
     let b = UOp::native_const(1.5f32);
 
-    let sum = a.try_add_op(&b).unwrap();
+    let sum = a.try_add(&b).unwrap();
     assert_eq!(sum.vmin(), &ConstValue::Float(4.0));
     assert_eq!(sum.vmax(), &ConstValue::Float(4.0));
 
-    let diff = a.try_sub_op(&b).unwrap();
+    let diff = a.try_sub(&b).unwrap();
     assert_eq!(diff.vmin(), &ConstValue::Float(1.0));
     assert_eq!(diff.vmax(), &ConstValue::Float(1.0));
 
-    let prod = a.try_mul_op(&b).unwrap();
+    let prod = a.try_mul(&b).unwrap();
     assert_eq!(prod.vmin(), &ConstValue::Float(3.75));
     assert_eq!(prod.vmax(), &ConstValue::Float(3.75));
 
-    let div = a.try_fdiv_op(&b).unwrap();
+    let div = a.try_div(&b).unwrap();
     // 2.5 / 1.5 = 1.666...
     if let ConstValue::Float(min_val) = div.vmin() {
         assert!((min_val - 1.6666666666666667).abs() < 1e-10);
@@ -368,7 +368,7 @@ fn test_vmin_vmax_division_by_zero_range() {
     // Test division when divisor range includes zero
     let a = UOp::native_const(10i32);
     let b = UOp::var("b", DType::Int32, -1, 1); // Includes zero!
-    let div = a.try_idiv_op(&b).unwrap();
+    let div = a.try_div(&b).unwrap();
 
     // Division by zero range returns dtype bounds
     assert_eq!(div.vmin(), &ConstValue::Int(i32::MIN as i64));
@@ -380,7 +380,7 @@ fn test_vmin_vmax_mod_by_zero_range() {
     // Test modulo when divisor range includes zero
     let a = UOp::native_const(10i32);
     let b = UOp::var("b", DType::Int32, -1, 1); // Includes zero!
-    let modulo = a.try_mod_op(&b).unwrap();
+    let modulo = a.try_mod(&b).unwrap();
 
     // Modulo by zero range returns dtype bounds
     assert_eq!(modulo.vmin(), &ConstValue::Int(i32::MIN as i64));

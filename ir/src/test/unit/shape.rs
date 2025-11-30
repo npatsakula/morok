@@ -138,7 +138,7 @@ fn test_infer_vconst_shape() {
 #[test]
 fn test_infer_unary_shape() {
     let val = UOp::native_const(5.0f32);
-    let neg = UOp::neg_op(val);
+    let neg = val.neg();
     let shape = neg.shape().unwrap().expect("Unary should have shape");
     assert_eq!(shape.len(), 0); // Preserves scalar shape
 }
@@ -147,7 +147,7 @@ fn test_infer_unary_shape() {
 fn test_infer_binary_shape() {
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
     let shape = add.shape().unwrap().expect("Binary should have shape");
     assert_eq!(shape.len(), 0); // Both scalars -> scalar result
 }

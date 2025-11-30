@@ -15,7 +15,7 @@ fn test_where_always_true() {
     let true_branch = UOp::native_const(42i32);
     let false_branch = UOp::native_const(0i32);
 
-    let where_op = UOp::where_(cond, true_branch.clone(), false_branch);
+    let where_op = UOp::try_where(cond, true_branch.clone(), false_branch).unwrap();
 
     let matcher = symbolic_simple();
     let result = graph_rewrite(&matcher, where_op, &mut ());
@@ -31,7 +31,7 @@ fn test_where_always_false() {
     let true_branch = UOp::native_const(42i32);
     let false_branch = UOp::native_const(0i32);
 
-    let where_op = UOp::where_(cond, true_branch, false_branch.clone());
+    let where_op = UOp::try_where(cond, true_branch, false_branch.clone()).unwrap();
 
     let matcher = symbolic_simple();
     let result = graph_rewrite(&matcher, where_op, &mut ());
@@ -50,7 +50,7 @@ fn test_where_range_based_true() {
     let true_branch = UOp::native_const(1i32);
     let false_branch = UOp::native_const(0i32);
 
-    let where_op = UOp::where_(cond, true_branch.clone(), false_branch);
+    let where_op = UOp::try_where(cond, true_branch.clone(), false_branch).unwrap();
 
     let matcher = symbolic_simple();
     let result = graph_rewrite(&matcher, where_op, &mut ());
@@ -69,7 +69,7 @@ fn test_where_range_based_false() {
     let true_branch = UOp::native_const(1i32);
     let false_branch = UOp::native_const(0i32);
 
-    let where_op = UOp::where_(cond, true_branch, false_branch.clone());
+    let where_op = UOp::try_where(cond, true_branch, false_branch.clone()).unwrap();
 
     let matcher = symbolic_simple();
     let result = graph_rewrite(&matcher, where_op, &mut ());
@@ -88,7 +88,7 @@ fn test_where_unknown_condition() {
     let true_branch = UOp::native_const(1i32);
     let false_branch = UOp::native_const(0i32);
 
-    let where_op = UOp::where_(cond.clone(), true_branch.clone(), false_branch.clone());
+    let where_op = UOp::try_where(cond.clone(), true_branch.clone(), false_branch.clone()).unwrap();
 
     let matcher = symbolic_simple();
     let result = graph_rewrite(&matcher, where_op, &mut ());
@@ -116,10 +116,10 @@ fn test_nested_where_elimination() {
     let _val4 = UOp::native_const(4i32);
 
     // Inner WHERE: if false then val1 else val2 → val2
-    let inner = UOp::where_(cond2, val1, val2.clone());
+    let inner = UOp::try_where(cond2, val1, val2.clone()).unwrap();
 
     // Outer WHERE: if true then inner else val3 → inner → val2
-    let outer = UOp::where_(cond1, inner, val3);
+    let outer = UOp::try_where(cond1, inner, val3).unwrap();
 
     let matcher = symbolic_simple();
     let result = graph_rewrite(&matcher, outer, &mut ());

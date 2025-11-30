@@ -25,7 +25,7 @@ use crate::rewrite::graph_rewrite;
 
 /// Create a test BUFFER with given size and dtype.
 fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Rc<UOp> {
-    let unique = UOp::unique(Some(id));
+    let unique = UOp::buffer_id(Some(id));
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     UOp::new(Op::Buffer { unique, device, size }, dtype)
 }
@@ -59,7 +59,7 @@ fn create_simple_graph(ctx: &mut IndexingContext) -> (Rc<UOp>, Rc<UOp>, Rc<UOp>,
 
     // Create simple ADD operation
     let one = UOp::native_const(1.0f32);
-    let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
+    let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     (buffer, range1, range2, compute)
 }
@@ -91,7 +91,7 @@ fn create_multi_buffer_graph(ctx: &mut IndexingContext, num_buffers: usize) -> (
     for i in 1..num_buffers {
         let buffer = create_test_buffer(100, DType::Float32, i);
         let indexed = UOp::index(buffer.clone(), ranges.clone()).expect("Failed to create INDEX");
-        compute = compute.try_add_op(&indexed).expect("Failed to create ADD");
+        compute = compute.try_add(&indexed).expect("Failed to create ADD");
         buffers.push(buffer);
     }
 
@@ -354,8 +354,7 @@ fn test_accessed_buffers_with_duplicates() {
     let idx3 = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
 
     // Create compute: idx1 + idx2 + idx3 (all same buffer)
-    let compute =
-        idx1.try_add_op(&idx2).expect("Failed to create ADD").try_add_op(&idx3).expect("Failed to create ADD");
+    let compute = idx1.try_add(&idx2).expect("Failed to create ADD").try_add(&idx3).expect("Failed to create ADD");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -391,9 +390,9 @@ fn test_accessed_buffers_nested_computation() {
     let idx3 = UOp::index(buf3, ranges.clone()).expect("Failed to create INDEX");
     let idx4 = UOp::index(buf4, ranges.clone()).expect("Failed to create INDEX");
 
-    let left = idx1.try_add_op(&idx2).expect("Failed to create ADD");
-    let right = idx3.try_add_op(&idx4).expect("Failed to create ADD");
-    let compute = left.try_mul_op(&right).expect("Failed to create MUL");
+    let left = idx1.try_add(&idx2).expect("Failed to create ADD");
+    let right = idx3.try_add(&idx4).expect("Failed to create ADD");
+    let compute = left.try_mul(&right).expect("Failed to create MUL");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -616,7 +615,7 @@ fn test_buffer_not_in_reduce_full_removal() {
     // Just index + add (no reduce)
     let indexed = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
-    let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
+    let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -678,7 +677,7 @@ fn test_reduce_without_buffer_access_full_removal() {
     let buffer_indexed = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
 
     // Combine: buffer_access + reduce_const
-    let compute = buffer_indexed.try_add_op(&reduce_compute).expect("Failed to create ADD");
+    let compute = buffer_indexed.try_add(&reduce_compute).expect("Failed to create ADD");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1011,7 +1010,7 @@ fn test_partial_contiguous_local_axis() {
     // Create computation that indexes buffer with both dimensions
     let indexed = UOp::index(buffer, all_ranges.clone()).expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
-    let compute = indexed.try_mul_op(&two).expect("Failed to create MUL");
+    let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
     // Create INDEX(BUFFERIZE(compute, all_ranges), all_ranges)
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1155,9 +1154,9 @@ fn test_partial_contiguous_blocked_by_heuristics() {
     let idx4 = UOp::index(buf4, vec![loop_range.clone()]).expect("Failed to create INDEX");
 
     // Combine them
-    let add1 = idx1.try_add_op(&idx2).expect("Failed to create ADD");
-    let add2 = idx3.try_add_op(&idx4).expect("Failed to create ADD");
-    let combined = add1.try_add_op(&add2).expect("Failed to create ADD");
+    let add1 = idx1.try_add(&idx2).expect("Failed to create ADD");
+    let add2 = idx3.try_add(&idx4).expect("Failed to create ADD");
+    let combined = add1.try_add(&add2).expect("Failed to create ADD");
 
     // Add reduce
     let reduce = UOp::new(
@@ -1219,7 +1218,7 @@ fn test_edge_case_all_const_operations() {
     // Create computation with only constants
     let const1 = UOp::native_const(1.0f32);
     let const2 = UOp::native_const(2.0f32);
-    let compute = const1.try_add_op(&const2).expect("Failed to create ADD");
+    let compute = const1.try_add(&const2).expect("Failed to create ADD");
 
     // Bufferize it
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1274,7 +1273,7 @@ fn test_edge_case_zero_sized_range() {
     // Create computation with zero-sized range
     let indexed = UOp::index(buffer, vec![zero_range.clone()]).expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
-    let compute = indexed.try_mul_op(&two).expect("Failed to create MUL");
+    let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
     // Bufferize with zero range
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1333,7 +1332,7 @@ fn test_config_custom_ratio_threshold() {
     // Create simple computation: INDEX(buffer) + const
     let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
-    let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
+    let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     // Create INDEX(BUFFERIZE(compute, [range]), [range])
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1374,7 +1373,7 @@ fn test_config_level_0_vs_2() {
     // Create INDEX(BUFFERIZE(...)) pattern that triggers Pattern 4
     let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
-    let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
+    let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
@@ -1487,9 +1486,9 @@ fn test_pipeline_preserves_graph_structure() {
     // Create a computation chain: INDEX(buf) → MUL → ADD
     let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
-    let mul = indexed.try_mul_op(&two).expect("Failed to create MUL");
+    let mul = indexed.try_mul(&two).expect("Failed to create MUL");
     let one = UOp::native_const(1.0f32);
-    let add = mul.try_add_op(&one).expect("Failed to create ADD");
+    let add = mul.try_add(&one).expect("Failed to create ADD");
 
     // Bufferize and index
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1554,7 +1553,7 @@ fn test_symbolic_buffer_size_handling() {
 
     let indexed = UOp::index(buffer, vec![concrete_range]).expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
-    let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
+    let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     // Bufferize with symbolic range
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1585,7 +1584,7 @@ fn test_all_symbolic_sizes() {
 
     let indexed = UOp::index(buffer, vec![range_n.clone()]).expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
-    let compute = indexed.try_mul_op(&two).expect("Failed to create MUL");
+    let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
     // Bufferize with symbolic ranges
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1618,7 +1617,7 @@ fn test_mixed_concrete_symbolic_sizes() {
     let buffer = create_test_buffer(40, DType::Float32, 1);
     let indexed = UOp::index(buffer, vec![concrete_range.clone()]).expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
-    let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
+    let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     // Bufferize with mixed ranges
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1651,9 +1650,9 @@ fn test_complex_diamond_pattern() {
     let two = UOp::native_const(2.0f32);
     let three = UOp::native_const(3.0f32);
 
-    let mul1 = indexed.try_mul_op(&two).expect("Failed to create MUL");
-    let mul2 = indexed.try_mul_op(&three).expect("Failed to create MUL");
-    let add = mul1.try_add_op(&mul2).expect("Failed to create ADD");
+    let mul1 = indexed.try_mul(&two).expect("Failed to create MUL");
+    let mul2 = indexed.try_mul(&three).expect("Failed to create MUL");
+    let add = mul1.try_add(&mul2).expect("Failed to create ADD");
 
     // Bufferize and index
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1682,7 +1681,7 @@ fn test_complex_deep_computation_chain() {
 
     for i in 1..=5 {
         let const_val = UOp::native_const(i as f32);
-        current = current.try_add_op(&const_val).expect("Failed to create ADD");
+        current = current.try_add(&const_val).expect("Failed to create ADD");
     }
 
     // Bufferize the chain
@@ -1716,7 +1715,7 @@ fn test_complex_multiple_independent_buffers() {
     // Chain additions: ((((a + b) + c) + d) + e)
     let mut compute = adds[0].clone();
     for add in &adds[1..] {
-        compute = compute.try_add_op(add).expect("Failed to create ADD");
+        compute = compute.try_add(add).expect("Failed to create ADD");
     }
 
     // Bufferize
@@ -1759,7 +1758,7 @@ fn test_complex_multiple_sequential_reduces() {
     );
 
     // Combine reduces
-    let combined = reduce1.try_add_op(&reduce2).expect("Failed to create ADD");
+    let combined = reduce1.try_add(&reduce2).expect("Failed to create ADD");
 
     // Bufferize
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1791,7 +1790,7 @@ fn test_boundary_very_large_buffer() {
 
     let indexed = UOp::index(buffer, vec![large_range.clone()]).expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
-    let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
+    let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let idx_buf = create_index_bufferize(compute, vec![large_range.clone()], vec![large_range], opts);
@@ -1815,7 +1814,7 @@ fn test_boundary_size_one_dimension() {
 
     let indexed = UOp::index(buffer, vec![range1.clone()]).expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
-    let compute = indexed.try_mul_op(&two).expect("Failed to create MUL");
+    let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let idx_buf = create_index_bufferize(compute, vec![range1.clone()], vec![range1], opts);
@@ -1844,7 +1843,7 @@ fn test_boundary_exact_threshold_values() {
 
     let indexed = UOp::index(buffer, vec![input_range]).expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
-    let compute = indexed.try_add_op(&one).expect("Failed to create ADD");
+    let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let idx_buf = create_index_bufferize(compute, vec![output_range.clone()], vec![output_range], opts);

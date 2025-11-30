@@ -69,7 +69,7 @@ fn test_get_idx_with_validity() {
     let valid = UOp::native_const(true);
     let invalid = UOp::invalid_marker();
 
-    let wrapped = UOp::where_op(valid, idx.clone(), invalid).unwrap();
+    let wrapped = UOp::try_where(valid, idx.clone(), invalid).unwrap();
 
     let extracted_idx = wrapped.get_idx();
     assert!(Rc::ptr_eq(&extracted_idx, &idx));
@@ -86,7 +86,7 @@ fn test_get_valid_with_validity() {
     let valid = idx.try_cmplt(&five).unwrap();
     let invalid = UOp::invalid_marker();
 
-    let wrapped = UOp::where_op(valid.clone(), idx.clone(), invalid).unwrap();
+    let wrapped = UOp::try_where(valid.clone(), idx.clone(), invalid).unwrap();
 
     let extracted_valid = wrapped.get_valid();
     assert!(Rc::ptr_eq(&extracted_valid, &valid));
@@ -135,7 +135,7 @@ fn test_padding_uses_invalid_marker() {
     let valid = UOp::native_const(true);
     let invalid = UOp::invalid_marker();
 
-    let padded = UOp::where_op(valid, idx, invalid).unwrap();
+    let padded = UOp::try_where(valid, idx, invalid).unwrap();
 
     // Verify structure: WHERE(valid, idx, Invalid)
     if let Op::Ternary(TernaryOp::Where, _cond, _true_val, false_val) = padded.op() {

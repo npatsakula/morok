@@ -15,7 +15,7 @@ fn test_transform_buffer_source() {
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Loop);
 
     // Create consumer - adding two buffers of the same shape
-    let consumer = buffer1.try_add_op(&buffer2).unwrap();
+    let consumer = buffer1.try_add(&buffer2).unwrap();
 
     // Setup context with ranges for consumer
     let mut ctx = IndexingContext::new();
@@ -87,7 +87,7 @@ fn test_no_transform_for_normal_source() {
     let x = UOp::native_const(1.0f32);
     let y = UOp::native_const(2.0f32);
     // Use direct Binary construction - this test checks transform behavior, not arithmetic
-    let add = x.try_add_op(&y).unwrap();
+    let add = x.try_add(&y).unwrap();
 
     let ctx = IndexingContext::new();
 

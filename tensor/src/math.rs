@@ -27,7 +27,7 @@ impl Tensor {
     /// Returns error if dtype is not float.
     #[track_caller]
     pub fn sin(&self) -> Result<Tensor> {
-        UOp::sin_op(self.uop.clone()).map(Self::new).context(UOpSnafu)
+        self.uop.clone().try_sin().map(Self::new).context(UOpSnafu)
     }
 
     /// Cosine function: cos(x).
@@ -45,7 +45,7 @@ impl Tensor {
     /// Returns error if dtype is not float.
     #[track_caller]
     pub fn cos(&self) -> Result<Tensor> {
-        UOp::cos_op(self.uop.clone()).map(Self::new).context(UOpSnafu)
+        self.uop.try_cos().map(Self::new).context(UOpSnafu)
     }
 
     /// Tangent function: tan(x).
@@ -63,7 +63,7 @@ impl Tensor {
     /// Returns error if dtype is not float.
     #[track_caller]
     pub fn tan(&self) -> Result<Tensor> {
-        UOp::tan_op(self.uop.clone()).map(Self::new).context(UOpSnafu)
+        self.uop.try_tan().map(Self::new).context(UOpSnafu)
     }
 
     // =========================================================================
@@ -82,7 +82,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn floor(&self) -> Result<Tensor> {
-        Ok(Self::new(UOp::floor_op(self.uop.clone())))
+        Ok(Self::new(UOp::floor(self.uop.clone())))
     }
 
     /// Ceiling function: round towards +∞.
@@ -97,7 +97,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn ceil(&self) -> Result<Tensor> {
-        Ok(Self::new(UOp::ceil_op(self.uop.clone())))
+        Ok(Self::new(UOp::ceil(self.uop.clone())))
     }
 
     /// Round function: round to nearest integer (half to even).
@@ -112,7 +112,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn round(&self) -> Result<Tensor> {
-        Ok(Self::new(UOp::round_op(self.uop.clone())))
+        Ok(Self::new(UOp::round(self.uop.clone())))
     }
 
     /// Truncate function: round towards zero.
@@ -127,7 +127,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn trunc(&self) -> Result<Tensor> {
-        Ok(Self::new(UOp::trunc_op(self.uop.clone())))
+        Ok(Self::new(UOp::trunc(self.uop.clone())))
     }
 
     // =========================================================================
@@ -149,7 +149,7 @@ impl Tensor {
     /// Returns error if dtype is not float.
     #[track_caller]
     pub fn erf(&self) -> Result<Tensor> {
-        UOp::erf_op(self.uop.clone()).map(Self::new).context(UOpSnafu)
+        UOp::erf(self.uop.clone()).map(Self::new).context(UOpSnafu)
     }
 
     /// Reciprocal: 1/x.
@@ -163,7 +163,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn reciprocal(&self) -> Result<Tensor> {
-        Ok(Self::new(UOp::reciprocal_op(self.uop.clone())))
+        UOp::try_reciprocal(&self.uop).map(Self::new).context(UOpSnafu)
     }
 
     /// Square: x².
@@ -177,7 +177,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn square(&self) -> Result<Tensor> {
-        Ok(Self::new(UOp::square_op(self.uop.clone())))
+        Ok(Self::new(UOp::square(self.uop.clone())))
     }
 
     /// Sign function: -1 for negative, 0 for zero, 1 for positive.
@@ -191,6 +191,6 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn sign(&self) -> Result<Tensor> {
-        Ok(Self::new(UOp::sign_op(self.uop.clone())))
+        Ok(Self::new(UOp::sign(self.uop.clone())))
     }
 }

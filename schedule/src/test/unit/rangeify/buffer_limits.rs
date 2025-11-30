@@ -25,7 +25,7 @@ use crate::rewrite::graph_rewrite;
 
 /// Create a test BUFFER with given size and dtype.
 fn create_test_buffer(size: usize, dtype: DType, id: usize, device: DeviceSpec) -> Rc<UOp> {
-    let unique = UOp::unique(Some(id));
+    let unique = UOp::buffer_id(Some(id));
     let device_op = UOp::device(device);
     UOp::new(Op::Buffer { unique, device: device_op, size }, dtype)
 }
@@ -53,7 +53,7 @@ fn create_multi_buffer_computation(num_buffers: usize, device: DeviceSpec) -> (V
     for i in 1..num_buffers {
         let buffer = create_test_buffer(40, DType::Float32, i, device.clone());
         let indexed = UOp::index(buffer.clone(), ranges.clone()).expect("Failed to create INDEX");
-        computation = computation.try_add_op(&indexed).expect("Failed to create ADD");
+        computation = computation.try_add(&indexed).expect("Failed to create ADD");
         buffers.push(buffer);
     }
 
@@ -245,7 +245,7 @@ fn test_cuda_no_limit() {
 fn test_binary_op_is_elementwise() {
     let left = UOp::native_const(1.0f32);
     let right = UOp::native_const(2.0f32);
-    let add = left.try_add_op(&right).unwrap();
+    let add = left.try_add(&right).unwrap();
 
     assert!(is_elementwise(&add), "Binary ADD should be elementwise");
 }
@@ -255,7 +255,7 @@ fn test_ternary_op_is_elementwise() {
     let cond = UOp::native_const(true);
     let true_val = UOp::native_const(1.0f32);
     let false_val = UOp::native_const(2.0f32);
-    let where_op = UOp::where_(cond, true_val, false_val);
+    let where_op = UOp::try_where(cond, true_val, false_val).unwrap();
 
     assert!(is_elementwise(&where_op), "Ternary WHERE should be elementwise");
 }
@@ -406,7 +406,7 @@ fn test_multiple_binary_ops() {
 
     for buffer in buffers.iter().skip(1) {
         let indexed = UOp::index(buffer.clone(), ranges.clone()).expect("Failed");
-        expr = expr.try_add_op(&indexed).expect("Failed to create ADD");
+        expr = expr.try_add(&indexed).expect("Failed to create ADD");
     }
 
     // Apply buffer limit (10 buffer limit)
@@ -451,10 +451,10 @@ fn test_ternary_op_materialization() {
     let false_val = {
         let b11 = UOp::index(buffers[11].clone(), ranges.clone()).expect("Failed");
         let b12 = UOp::index(buffers[12].clone(), ranges.clone()).expect("Failed");
-        b11.try_add_op(&b12).expect("Failed to create ADD")
+        b11.try_add(&b12).expect("Failed to create ADD")
     };
 
-    let where_op = UOp::where_(cond, true_val, false_val);
+    let where_op = UOp::try_where(cond, true_val, false_val).unwrap();
 
     // Apply buffer limit (10 buffer limit)
     let before_count = count_bufferizes(&where_op);
@@ -471,14 +471,14 @@ fn test_is_elementwise() {
     // Binary operations are elementwise
     let left = UOp::native_const(1.0f32);
     let right = UOp::native_const(2.0f32);
-    let add = left.try_add_op(&right).unwrap();
+    let add = left.try_add(&right).unwrap();
     assert!(is_elementwise(&add), "Binary ADD should be elementwise");
 
     // Ternary operations are elementwise
     let cond = UOp::native_const(true);
     let true_val = UOp::native_const(1.0f32);
     let false_val = UOp::native_const(2.0f32);
-    let where_op = UOp::where_op(cond, true_val, false_val).unwrap();
+    let where_op = UOp::try_where(cond, true_val, false_val).unwrap();
     assert!(is_elementwise(&where_op), "Ternary WHERE should be elementwise");
 
     // Constants are not elementwise

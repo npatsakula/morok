@@ -7,7 +7,7 @@
 //!
 //! - [`core`] - UOp struct and fundamental operations
 //! - [`hash_consing`] - Caching infrastructure for deduplication
-//! - [`constructors`] - Helper methods for creating UOps
+//! - [`constructors`] - Constructor methods organized by semantic category
 //! - [`helpers`] - Pattern matching and simplification helpers
 //! - [`cached_property`] - Reusable pattern for cached graph properties
 //! - [`properties`] - Standard cached properties (shape, ranges, etc.)

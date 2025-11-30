@@ -14,7 +14,7 @@ fn test_debuf_global() {
     let mut ctx = KernelContext::new();
 
     // Create a BUFFER operation directly
-    let unique = UOp::unique(Some(0));
+    let unique = UOp::buffer_id(Some(0));
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
 
@@ -113,7 +113,7 @@ fn test_handle_after() {
     let mut ctx = KernelContext::new();
 
     // Create an AFTER operation
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let store = UOp::noop();
     let after = UOp::after(buffer.clone(), smallvec::smallvec![store]);
 
@@ -134,12 +134,12 @@ fn test_debuf_counter_increment() {
     let mut ctx = KernelContext::new();
 
     // Create first buffer
-    let unique1 = UOp::unique(Some(1));
+    let unique1 = UOp::buffer_id(Some(1));
     let device1 = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer1 = UOp::new(Op::Buffer { unique: unique1, device: device1, size: 100 }, DType::Float32);
 
     // Create second buffer
-    let unique2 = UOp::unique(Some(2));
+    let unique2 = UOp::buffer_id(Some(2));
     let device2 = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer2 = UOp::new(Op::Buffer { unique: unique2, device: device2, size: 200 }, DType::Float32);
 
@@ -164,7 +164,7 @@ fn test_debuf_counter_increment() {
 fn test_debuf_buffer_mapping() {
     let mut ctx = KernelContext::new();
 
-    let unique = UOp::unique(Some(0));
+    let unique = UOp::buffer_id(Some(0));
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
 
@@ -181,8 +181,8 @@ fn test_handle_after_mstack_unwrap() {
     let mut ctx = KernelContext::new();
 
     // Create MSTACK with buffers
-    let buf1 = UOp::unique(Some(1));
-    let buf2 = UOp::unique(Some(2));
+    let buf1 = UOp::buffer_id(Some(1));
+    let buf2 = UOp::buffer_id(Some(2));
     let mstack = UOp::new(Op::MStack { buffers: smallvec![buf1.clone(), buf2] }, buf1.dtype());
 
     // Create AFTER wrapping MSTACK
@@ -204,7 +204,7 @@ fn test_handle_after_mselect_unwrap() {
     let mut ctx = KernelContext::new();
 
     // Create MSELECT
-    let buffer = UOp::unique(Some(1));
+    let buffer = UOp::buffer_id(Some(1));
     let mselect = UOp::new(Op::MSelect { buffer: buffer.clone(), device_index: 0 }, buffer.dtype());
 
     // Create AFTER wrapping MSELECT
@@ -311,8 +311,8 @@ fn test_handle_after_mstack_advanced() {
     let mut ctx = KernelContext::new();
 
     // Create MSTACK operation
-    let buf1 = UOp::unique(Some(1));
-    let buf2 = UOp::unique(Some(2));
+    let buf1 = UOp::buffer_id(Some(1));
+    let buf2 = UOp::buffer_id(Some(2));
     let mstack = UOp::new(Op::MStack { buffers: smallvec::smallvec![buf1.clone(), buf2] }, DType::Float32);
 
     // Create AFTER wrapping MSTACK

@@ -162,7 +162,7 @@ fn test_cascading_bounds_elimination() {
     // Use bounds check in WHERE
     let safe_val = UOp::native_const(42i32);
     let error_val = UOp::native_const(-1i32);
-    let where_op = UOp::where_(bounds_check, safe_val.clone(), error_val);
+    let where_op = UOp::try_where(bounds_check, safe_val.clone(), error_val).unwrap();
 
     let matcher = symbolic_simple();
     let result = graph_rewrite(&matcher, where_op, &mut ());

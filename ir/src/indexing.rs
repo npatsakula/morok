@@ -1,11 +1,14 @@
 //! Multi-dimensional indexing and slicing support.
 //!
 //! This module provides NumPy-style indexing through [`IndexSpec`] and the [`s!`](crate::s) macro.
+//!
+//! For UOp slice methods, see [`crate::uop::constructors::memory`].
 
 use std::rc::Rc;
 
-use crate::Result;
 use crate::uop::UOp;
+
+// Note: Rc and UOp are used by IndexSpec::Single and IndexSpec::Range
 
 /// Index specification for multi-dimensional slicing.
 ///
@@ -95,67 +98,4 @@ macro_rules! s {
     };
 }
 
-impl UOp {
-    /// Multi-dimensional slicing with IndexSpec.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let buf = UOp::new_buffer(DeviceSpec::Cpu, 1000, DType::Float32);
-    /// let start = UOp::const_(DType::Int32, ConstValue::Int(0));
-    /// let end = UOp::const_(DType::Int32, ConstValue::Int(10));
-    ///
-    /// // Slice first 10 elements
-    /// let slice = UOp::slice(buf, vec![
-    ///     IndexSpec::Range { start, end, step: None }
-    /// ]);
-    /// ```
-    pub fn slice(buffer: Rc<Self>, specs: Vec<IndexSpec>) -> Result<Rc<Self>> {
-        let mut indices = Vec::new();
-
-        for spec in specs {
-            match spec {
-                IndexSpec::Single(idx) => {
-                    // Single index - just use it directly
-                    indices.push(idx);
-                }
-                IndexSpec::Range { start, end: _, step: _ } => {
-                    // Range indexing - for now, just use start as a simple index
-                    // TODO: Proper range expansion requires loop IR and range operations
-                    indices.push(start);
-                }
-                IndexSpec::Full => {
-                    // Full slice - skip (means "all elements")
-                    // TODO: Proper handling requires understanding dimension size
-                }
-                IndexSpec::NewAxis => {
-                    // NewAxis - adds dimension
-                    // TODO: Requires reshape operation
-                }
-            }
-        }
-
-        if indices.is_empty() {
-            // No actual indexing, just return buffer
-            Ok(buffer)
-        } else {
-            Self::index(buffer, indices)
-        }
-    }
-
-    /// Gated slicing - conditional access with gate.
-    ///
-    /// Similar to `slice` but with a boolean gate for conditional indexing.
-    pub fn slice_gated(buffer: Rc<Self>, specs: Vec<IndexSpec>, gate: Rc<Self>) -> Result<Rc<Self>> {
-        let mut indices = Vec::new();
-
-        for spec in specs {
-            match spec {
-                IndexSpec::Single(idx) => indices.push(idx),
-                IndexSpec::Range { start, .. } => indices.push(start),
-                IndexSpec::Full | IndexSpec::NewAxis => {}
-            }
-        }
-
-        if indices.is_empty() { Ok(buffer) } else { Self::index_gated(buffer, indices, gate) }
-    }
-}
+// UOp::slice and UOp::slice_gated methods have been moved to uop/constructors/memory.rs

@@ -97,7 +97,7 @@ impl UOp {
                         && mult % divisor == 0
                     {
                         let new_const = Self::const_(b.dtype(), ConstValue::Int(mult / divisor));
-                        return Some(a.try_mul_op(&new_const).expect("divides: mul should succeed with same dtype"));
+                        return Some(a.try_mul(&new_const).expect("divides: mul should succeed with same dtype"));
                     }
 
                     // Check left operand for constant (multiplication is commutative)
@@ -106,7 +106,7 @@ impl UOp {
                         && mult % divisor == 0
                     {
                         let new_const = Self::const_(a.dtype(), ConstValue::Int(mult / divisor));
-                        return Some(new_const.try_mul_op(b).expect("divides: mul should succeed with same dtype"));
+                        return Some(new_const.try_mul(b).expect("divides: mul should succeed with same dtype"));
                     }
                 }
             }
@@ -444,7 +444,7 @@ mod tests {
     fn test_const_factor_multiplication() {
         let x = UOp::var("x", DType::Int32, 0, 100);
         let c = UOp::const_(DType::Int32, ConstValue::Int(6));
-        let mul = x.try_mul_op(&c).unwrap();
+        let mul = x.try_mul(&c).unwrap();
         assert_eq!(mul.const_factor(), 6);
     }
 
@@ -452,7 +452,7 @@ mod tests {
     fn test_const_factor_addition() {
         let c1 = UOp::const_(DType::Int32, ConstValue::Int(6));
         let c2 = UOp::const_(DType::Int32, ConstValue::Int(9));
-        let add = c1.try_add_op(&c2).unwrap();
+        let add = c1.try_add(&c2).unwrap();
         assert_eq!(add.const_factor(), 3); // GCD(6, 9) = 3
     }
 
@@ -485,7 +485,7 @@ mod tests {
     fn test_pop_const_with_constant() {
         let x = UOp::var("x", DType::Int32, 0, 100);
         let c = UOp::const_(DType::Int32, ConstValue::Int(5));
-        let add = x.try_add_op(&c).unwrap();
+        let add = x.try_add(&c).unwrap();
 
         let (rest, const_val) = add.pop_const(BinaryOp::Add);
 
@@ -497,7 +497,7 @@ mod tests {
     fn test_pop_const_without_constant() {
         let x = UOp::var("x", DType::Int32, 0, 100);
         let y = UOp::var("y", DType::Int32, 0, 100);
-        let add = x.try_add_op(&y).unwrap();
+        let add = x.try_add(&y).unwrap();
 
         let (rest, const_val) = add.pop_const(BinaryOp::Add);
 
@@ -512,8 +512,8 @@ mod tests {
         let z = UOp::var("z", DType::Int32, 0, 100);
 
         // Build: x + y + z = (x + y) + z
-        let xy = x.try_add_op(&y).unwrap();
-        let xyz = xy.try_add_op(&z).unwrap();
+        let xy = x.try_add(&y).unwrap();
+        let xyz = xy.try_add(&z).unwrap();
 
         let terms = xyz.split_uop(BinaryOp::Add);
 

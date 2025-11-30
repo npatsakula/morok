@@ -223,7 +223,7 @@ fn merge_consumer_ranges(
                 merged_idx
             } else {
                 // Wrap index with merged validity: WHERE(merged_valid, merged_idx, INVALID)
-                UOp::where_op(merged_valid, merged_idx, UOp::invalid_marker())?
+                UOp::try_where(merged_valid, merged_idx, UOp::invalid_marker())?
             };
 
             out_rngs.push(merged_range);

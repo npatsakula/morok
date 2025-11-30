@@ -17,7 +17,7 @@ fn test_detect_matmul_basic() {
     let b_val = UOp::native_const(2.0f32);
 
     // Multiply A * B
-    let mul = a_val.try_mul_op(&b_val).unwrap();
+    let mul = a_val.try_mul(&b_val).unwrap();
 
     // Reduce over k
     let reduce = UOp::reduce(mul, vec![k].into(), ReduceOp::Add);
@@ -76,7 +76,7 @@ fn test_select_tensor_core_auto() {
 
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
-    let mul = a_val.try_mul_op(&b_val).unwrap();
+    let mul = a_val.try_mul(&b_val).unwrap();
     let reduce = UOp::reduce(mul, vec![k.clone()].into(), ReduceOp::Add);
 
     let pattern = matching::MatmulPattern {
@@ -105,7 +105,7 @@ fn test_select_tensor_core_specific() {
 
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
-    let mul = a_val.try_mul_op(&b_val).unwrap();
+    let mul = a_val.try_mul(&b_val).unwrap();
     let reduce = UOp::reduce(mul, vec![k.clone()].into(), ReduceOp::Add);
 
     let pattern = matching::MatmulPattern {
@@ -133,7 +133,7 @@ fn test_select_tensor_core_out_of_bounds() {
 
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
-    let mul = a_val.try_mul_op(&b_val).unwrap();
+    let mul = a_val.try_mul(&b_val).unwrap();
     let reduce = UOp::reduce(mul, vec![k.clone()].into(), ReduceOp::Add);
 
     let pattern = matching::MatmulPattern {
@@ -219,7 +219,7 @@ fn test_apply_tc_basic() {
 
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
-    let mul = a_val.try_mul_op(&b_val).unwrap();
+    let mul = a_val.try_mul(&b_val).unwrap();
     let reduce = UOp::reduce(mul, vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, i, j]);
 
@@ -251,7 +251,7 @@ fn test_apply_tc_invalid_use_tc() {
     let k = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(1), AxisType::Reduce);
 
     let val = UOp::native_const(1.0f32);
-    let mul = val.try_mul_op(&val).unwrap();
+    let mul = val.try_mul(&val).unwrap();
     let reduce = UOp::reduce(mul, vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, i]);
 

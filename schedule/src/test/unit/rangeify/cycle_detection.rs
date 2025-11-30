@@ -82,7 +82,7 @@ fn test_find_bufs_multiple_buffers() {
     let load2 = UOp::load(buf2.clone(), index.clone());
 
     // Add them together
-    let sum = load1.try_add_op(&load2).unwrap();
+    let sum = load1.try_add(&load2).unwrap();
 
     // STORE to output buffer
     let store = UOp::store(out_buf.clone(), index, sum);
@@ -125,7 +125,7 @@ fn test_find_bufs_gated_operations() {
 #[test]
 fn test_as_buf_mselect() {
     // Test as_buf extracts buffer from MSelect
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let mselect = UOp::mselect(buffer.clone(), 0);
 
     let extracted = as_buf(&mselect);
@@ -135,8 +135,8 @@ fn test_as_buf_mselect() {
 #[test]
 fn test_as_buf_mstack() {
     // Test as_buf extracts first buffer from MStack
-    let buf1 = UOp::unique(Some(1));
-    let buf2 = UOp::unique(Some(2));
+    let buf1 = UOp::buffer_id(Some(1));
+    let buf2 = UOp::buffer_id(Some(2));
     let mstack = UOp::mstack(vec![buf1.clone(), buf2].into());
 
     let extracted = as_buf(&mstack);
@@ -146,7 +146,7 @@ fn test_as_buf_mstack() {
 #[test]
 fn test_as_buf_after() {
     // Test as_buf extracts passthrough from After
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let computation = UOp::noop();
     let after = UOp::after(buffer.clone(), smallvec::smallvec![computation]);
 

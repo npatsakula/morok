@@ -27,7 +27,7 @@ proptest! {
     #[test]
     fn identity_add_zero_right(x in arb_simple_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
-        let expr = x.try_add_op(&zero).unwrap();
+        let expr = x.try_add(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -40,7 +40,7 @@ proptest! {
     #[test]
     fn identity_add_zero_left(x in arb_simple_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
-        let expr = zero.try_add_op(&x).unwrap();
+        let expr = zero.try_add(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -53,7 +53,7 @@ proptest! {
     #[test]
     fn identity_sub_zero(x in arb_simple_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
-        let expr = x.try_sub_op(&zero).unwrap();
+        let expr = x.try_sub(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -66,7 +66,7 @@ proptest! {
     #[test]
     fn identity_mul_one_right(x in arb_simple_uop(DType::Int32)) {
         let one = UOp::native_const(1i32);
-        let expr = x.try_mul_op(&one).unwrap();
+        let expr = x.try_mul(&one).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -79,7 +79,7 @@ proptest! {
     #[test]
     fn identity_mul_one_left(x in arb_simple_uop(DType::Int32)) {
         let one = UOp::native_const(1i32);
-        let expr = one.try_mul_op(&x).unwrap();
+        let expr = one.try_mul(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -92,7 +92,7 @@ proptest! {
     #[test]
     fn identity_idiv_one(x in arb_simple_uop(DType::Int32)) {
         let one = UOp::native_const(1i32);
-        let expr = x.try_idiv_op(&one).unwrap();
+        let expr = x.try_div(&one).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -139,7 +139,7 @@ proptest! {
     #[test]
     fn zero_mul_right(x in arb_simple_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
-        let expr = x.try_mul_op(&zero).unwrap();
+        let expr = x.try_mul(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -152,7 +152,7 @@ proptest! {
     #[test]
     fn zero_mul_left(x in arb_simple_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
-        let expr = zero.try_mul_op(&x).unwrap();
+        let expr = zero.try_mul(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -198,7 +198,7 @@ proptest! {
     /// x / x should simplify to 1 (for x as variable, not constant 0)
     #[test]
     fn self_idiv_one(x in arb_var_uop(DType::Int32)) {
-        let expr = x.try_idiv_op(&x).unwrap();
+        let expr = x.try_div(&x).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -293,7 +293,7 @@ proptest! {
     fn const_fold_add(a in arb_small_int(), b in arb_small_int()) {
         let a_uop = UOp::const_(DType::Int32, a);
         let b_uop = UOp::const_(DType::Int32, b);
-        let expr = a_uop.try_add_op(&b_uop).unwrap();
+        let expr = a_uop.try_add(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -319,7 +319,7 @@ proptest! {
     fn const_fold_mul(a in arb_small_int(), b in arb_small_int()) {
         let a_uop = UOp::const_(DType::Int32, a);
         let b_uop = UOp::const_(DType::Int32, b);
-        let expr = a_uop.try_mul_op(&b_uop).unwrap();
+        let expr = a_uop.try_mul(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -334,7 +334,7 @@ proptest! {
     fn const_fold_idiv(a in arb_small_int(), b in nonzero_int()) {
         let a_uop = UOp::const_(DType::Int32, a);
         let b_uop = UOp::const_(DType::Int32, b);
-        let expr = a_uop.try_idiv_op(&b_uop).unwrap();
+        let expr = a_uop.try_div(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
@@ -358,8 +358,8 @@ proptest! {
         x in arb_simple_uop(DType::Int32),
         y in arb_simple_uop(DType::Int32),
     ) {
-        let xy = x.try_add_op(&y).unwrap();
-        let yx = y.try_add_op(&x).unwrap();
+        let xy = x.try_add(&y).unwrap();
+        let yx = y.try_add(&x).unwrap();
 
         let matcher = symbolic_simple();
         let opt_xy = graph_rewrite(&matcher, xy, &mut ());

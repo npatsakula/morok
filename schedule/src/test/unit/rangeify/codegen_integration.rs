@@ -91,7 +91,7 @@ fn test_no_cycle_valid_access_pattern() {
 
     // Compute something
     let const_val = UOp::native_const(2.0f32);
-    let computed = loaded.try_mul_op(&const_val).unwrap();
+    let computed = loaded.try_mul(&const_val).unwrap();
 
     // STORE to output
     let store = UOp::store(out_buf.clone(), index, computed);
@@ -110,7 +110,7 @@ fn test_no_cycle_valid_access_pattern() {
 #[test]
 fn test_split_store_simple_kernel() {
     // Create a simple STORE operation
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer.clone(), index, value);
@@ -135,7 +135,7 @@ fn test_split_store_simple_kernel() {
 #[test]
 fn test_split_store_with_loop_ranges() {
     // Create a STORE with LOOP ranges
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);
@@ -193,7 +193,7 @@ fn test_multiple_buffer_integration() {
     let load2 = UOp::load(buf2.clone(), index.clone());
 
     // Compute sum
-    let sum = load1.try_add_op(&load2).unwrap();
+    let sum = load1.try_add(&load2).unwrap();
 
     // STORE to output
     let store = UOp::store(out_buf.clone(), index, sum);
@@ -210,7 +210,7 @@ fn test_multiple_buffer_integration() {
 #[test]
 fn test_end_store_structure() {
     // Create STORE
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);

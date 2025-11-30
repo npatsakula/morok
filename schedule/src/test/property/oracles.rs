@@ -95,7 +95,7 @@ proptest! {
     #[test]
     fn z3_verify_zero_mul(x in arb_var_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
-        let expr = x.try_mul_op(&zero).unwrap();
+        let expr = x.try_mul(&zero).unwrap();
 
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());

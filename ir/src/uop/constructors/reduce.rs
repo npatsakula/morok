@@ -1,10 +1,18 @@
-//! Reduction and aggregation operations.
+//! Reduction operations: reduce, allreduce.
+//!
+//! This module contains reduction and aggregation operations:
+//! - try_reduce_axis: Reduce along specified axes
+//! - reduce: Reduce across loop ranges
+//! - allreduce: All-reduce across multiple devices
 
 use std::rc::Rc;
 
 use smallvec::SmallVec;
 
-use super::super::{Op, ReduceOp, Result, UOp};
+use crate::Result;
+use crate::op::Op;
+use crate::types::ReduceOp;
+use crate::uop::UOp;
 
 impl UOp {
     /// Reduce along specified axes using reduce_op.
@@ -20,7 +28,10 @@ impl UOp {
         Ok(Self::new(Op::ReduceAxis { src: self.clone(), reduce_op, axes }, dtype))
     }
 
-    /// Reduce across loop ranges.
+    /// Reduce across loop ranges using reduce_op.
+    ///
+    /// Unlike `try_reduce_axis` (operates on tensor axes), this reduces
+    /// values accumulated across RANGE loop iterations.
     pub fn reduce(src: Rc<Self>, ranges: SmallVec<[Rc<Self>; 4]>, reduce_op: ReduceOp) -> Rc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Reduce { src, ranges, reduce_op }, dtype)

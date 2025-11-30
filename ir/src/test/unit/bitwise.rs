@@ -147,7 +147,7 @@ fn test_and_float_error() {
     let int_val = UOp::native_const(5i32);
 
     let result = float_val.try_and_op(&int_val);
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_and_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn test_or_float_error() {
     let int_val = UOp::native_const(10i32);
 
     let result = float_val.try_or_op(&int_val);
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_or_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 }
 
 #[test]
@@ -165,7 +165,7 @@ fn test_xor_float_error() {
     let int_val = UOp::native_const(7i64);
 
     let result = float_val.try_xor_op(&int_val);
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_xor_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn test_shl_float_error() {
     let shift = UOp::native_const(2i32);
 
     let result = float_val.try_shl_op(&shift);
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shl_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn test_shr_float_error() {
     let shift = UOp::native_const(1i32);
 
     let result = float_val.try_shr_op(&shift);
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shr_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn test_and_both_floats_error() {
     let f2 = UOp::native_const(2.0f32);
 
     let result = f1.try_and_op(&f2);
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_and_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 }
 
 // =========================================================================

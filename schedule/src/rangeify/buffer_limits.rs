@@ -118,12 +118,12 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
                             let lhs = &new_sources[0];
                             let rhs = &new_sources[1];
                             match bin_op {
-                                morok_ir::BinaryOp::Add => lhs.try_add_op(rhs),
-                                morok_ir::BinaryOp::Sub => lhs.try_sub_op(rhs),
-                                morok_ir::BinaryOp::Mul => lhs.try_mul_op(rhs),
-                                morok_ir::BinaryOp::Idiv => lhs.try_idiv_op(rhs),
-                                morok_ir::BinaryOp::Fdiv => lhs.try_fdiv_op(rhs),
-                                morok_ir::BinaryOp::Mod => lhs.try_mod_op(rhs),
+                                morok_ir::BinaryOp::Add => lhs.try_add(rhs),
+                                morok_ir::BinaryOp::Sub => lhs.try_sub(rhs),
+                                morok_ir::BinaryOp::Mul => lhs.try_mul(rhs),
+                                morok_ir::BinaryOp::Idiv => lhs.try_div(rhs),
+                                morok_ir::BinaryOp::Fdiv => lhs.try_div(rhs),
+                                morok_ir::BinaryOp::Mod => lhs.try_mod(rhs),
                                 morok_ir::BinaryOp::And => lhs.try_and_op(rhs),
                                 morok_ir::BinaryOp::Or => lhs.try_or_op(rhs),
                                 morok_ir::BinaryOp::Xor => lhs.try_xor_op(rhs),
@@ -133,8 +133,8 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
                                 morok_ir::BinaryOp::Ne => lhs.try_cmpne(rhs),
                                 morok_ir::BinaryOp::Gt => lhs.try_cmpgt(rhs),
                                 morok_ir::BinaryOp::Ge => lhs.try_cmpge(rhs),
-                                morok_ir::BinaryOp::Max => lhs.try_max_op(rhs),
-                                morok_ir::BinaryOp::Pow => lhs.try_pow_op(rhs),
+                                morok_ir::BinaryOp::Max => lhs.try_max(rhs),
+                                morok_ir::BinaryOp::Pow => lhs.try_pow(rhs),
                                 // Shl/Shr/Threefry don't have helper methods, use direct construction
                                 morok_ir::BinaryOp::Shl | morok_ir::BinaryOp::Shr | morok_ir::BinaryOp::Threefry => {
                                     Ok(UOp::new(Op::Binary(*bin_op, lhs.clone(), rhs.clone()), op.dtype()))
@@ -144,10 +144,11 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
                         }
                         Op::Ternary(tern_op, _, _, _) => match tern_op {
                             morok_ir::TernaryOp::Where => {
-                                UOp::where_(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
+                                UOp::try_where(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
+                                    .unwrap()
                             }
                             morok_ir::TernaryOp::MulAcc => {
-                                UOp::mulacc_op(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
+                                UOp::try_mulacc(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
                                     .expect("MulAcc reconstruction should succeed")
                             }
                         },

@@ -271,7 +271,7 @@ fn test_auto_ptr_eq_three_args() {
     let b = UOp::native_const(99i32);
 
     // Test Where(a, a, a) - should match
-    let where_same = UOp::where_(a.clone(), a.clone(), a.clone());
+    let where_same = UOp::try_where(a.clone(), a.clone(), a.clone()).unwrap();
 
     match matcher.rewrite(&where_same, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a), "Where(x, x, x) should rewrite to x"),
@@ -279,7 +279,7 @@ fn test_auto_ptr_eq_three_args() {
     }
 
     // Test Where(a, a, b) - should NOT match
-    let where_diff = UOp::where_(a.clone(), a.clone(), b.clone());
+    let where_diff = UOp::try_where(a.clone(), a.clone(), b.clone()).unwrap();
 
     match matcher.rewrite(&where_diff, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
@@ -592,7 +592,7 @@ fn test_permute_pattern_with_three_sources() {
     let c = UOp::native_const(3i32);
 
     // Create where(a, b, c)
-    let where_abc = UOp::where_(a.clone(), b.clone(), c.clone());
+    let where_abc = UOp::try_where(a.clone(), b.clone(), c.clone()).unwrap();
 
     // Match and verify we get bindings
     let results = pattern.match_uop(&where_abc);
@@ -866,14 +866,14 @@ fn test_for_loop_ternary_expansion() {
     let c = UOp::native_const(3.0f32);
 
     // Test Where(a, b, c) => a
-    let where_abc = UOp::where_(a.clone(), b.clone(), c.clone());
+    let where_abc = UOp::try_where(a.clone(), b.clone(), c.clone()).unwrap();
     match matcher.rewrite(&where_abc, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a)),
         _ => panic!("Where pattern from for-loop should match"),
     }
 
     // Test MulAcc(a, b, c) => a
-    let mulacc_abc = UOp::mulacc_op(a.clone(), b.clone(), c.clone()).unwrap();
+    let mulacc_abc = UOp::try_mulacc(a.clone(), b.clone(), c.clone()).unwrap();
     match matcher.rewrite(&mulacc_abc, &mut ()) {
         RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a)),
         _ => panic!("MulAcc pattern from for-loop should match"),

@@ -28,7 +28,7 @@ fn test_pattern_macro_basic() {
 
     let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let add = five.try_add_op(&zero).unwrap();
+    let add = five.try_add(&zero).unwrap();
 
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -57,7 +57,7 @@ fn test_pattern_macro_no_match() {
     // 5 + 3 (not identity) should not match
     let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     let three = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let add = five.try_add_op(&three).unwrap();
+    let add = five.try_add(&three).unwrap();
 
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::NoMatch));
@@ -86,7 +86,7 @@ fn test_pattern_macro_multiple_variables() {
 
     let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
-    let mul = five.try_mul_op(&zero).unwrap();
+    let mul = five.try_mul(&zero).unwrap();
 
     let result = matcher.rewrite(&mul, &mut ());
     match &result {

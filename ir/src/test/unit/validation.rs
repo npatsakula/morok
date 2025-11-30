@@ -19,7 +19,7 @@ fn test_void_type_in_binary_op() {
     let void1 = UOp::const_(DType::Void, crate::ConstValue::Int(0));
     let void2 = UOp::const_(DType::Void, crate::ConstValue::Int(0));
 
-    let result = void1.try_add_op(&void2);
+    let result = void1.try_add(&void2);
     assert!(matches!(result, Err(Error::VoidTypeInOp)));
 }
 
@@ -29,7 +29,7 @@ fn test_type_promotion_failed() {
     // However, based on dtype implementation, most types can be promoted
     // This test verifies the error exists, even if hard to trigger naturally
     // This should succeed (int promotes to float), so let's just verify the API
-    let result = UOp::native_const(5i32).try_add_op(&UOp::native_const(PI));
+    let result = UOp::native_const(5i32).try_add(&UOp::native_const(PI));
     assert!(result.is_ok());
 }
 
@@ -37,22 +37,22 @@ fn test_type_promotion_failed() {
 fn test_invalid_dtype_for_bitwise_op() {
     // Bitwise AND requires int or bool, not float
     let result = UOp::native_const(PI).try_and_op(&UOp::native_const(5i32));
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_and_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 
     // OR also requires int or bool
     let result = UOp::native_const(PI).try_or_op(&UOp::native_const(5i32));
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_or_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 
     // XOR also requires int or bool
     let result = UOp::native_const(PI).try_xor_op(&UOp::native_const(5i32));
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_xor_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 
     // Shifts also require int or bool
     let result = UOp::native_const(PI).try_shl_op(&UOp::native_const(5i32));
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shl_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 
     let result = UOp::native_const(PI).try_shr_op(&UOp::native_const(5i32));
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { operation: "try_shr_op", .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 }
 
 #[test]
@@ -71,16 +71,16 @@ fn test_index_type_mismatch() {
 
 #[test]
 fn test_division_by_zero_const() {
-    let result = UOp::native_const(10i32).try_idiv_op(&UOp::native_const(0i32));
+    let result = UOp::native_const(10i32).try_div(&UOp::native_const(0i32));
     assert!(matches!(result, Err(Error::DivisionByZero)));
 
-    let result = UOp::native_const(10i32).try_mod_op(&UOp::native_const(0i32));
+    let result = UOp::native_const(10i32).try_mod(&UOp::native_const(0i32));
     assert!(matches!(result, Err(Error::DivisionByZero)));
 }
 
 #[test]
 fn test_division_by_zero_float() {
-    let result = UOp::native_const(10.0f32).try_fdiv_op(&UOp::native_const(0.0f32));
+    let result = UOp::native_const(10.0f32).try_div(&UOp::native_const(0.0f32));
     assert!(matches!(result, Err(Error::DivisionByZero)));
 }
 
@@ -235,13 +235,14 @@ fn test_where_condition_must_be_bool() {
     // This test documents that non-bool conditions are accepted
 
     // Should succeed - non-bool conditions are allowed (interpreted as C-style boolean)
-    let _result = UOp::where_op(UOp::native_const(1i32), UOp::native_const(1.0f32), UOp::native_const(0.0f32)).unwrap();
+    let _result =
+        UOp::try_where(UOp::native_const(1i32), UOp::native_const(1.0f32), UOp::native_const(0.0f32)).unwrap();
 }
 
 #[test]
 fn test_where_branch_dtype_compatibility() {
     // Where result takes dtype from true branch
-    let result = UOp::where_op(
+    let result = UOp::try_where(
         UOp::const_(DType::Bool, ConstValue::Bool(true)),
         UOp::native_const(5i32),
         UOp::native_const(5.0f32),
@@ -254,7 +255,8 @@ fn test_where_branch_dtype_compatibility() {
 #[test]
 fn test_mulacc_preserves_first_operand_dtype() {
     // MulAcc preserves first operand dtype (a in a*b+c)
-    let result = UOp::mulacc_op(UOp::native_const(2.0f32), UOp::native_const(3.0f32), UOp::native_const(4i32)).unwrap();
+    let result =
+        UOp::try_mulacc(UOp::native_const(2.0f32), UOp::native_const(3.0f32), UOp::native_const(4i32)).unwrap();
     assert_eq!(result.dtype(), DType::Float32);
 }
 
@@ -274,13 +276,13 @@ fn test_transcendental_on_int_types() {
     let int_val = UOp::native_const(4i32);
 
     let sqrt_result = int_val.try_sqrt();
-    assert!(matches!(sqrt_result, Err(Error::InvalidDTypeForOp { .. })));
+    assert!(matches!(sqrt_result, Err(Error::InvalidDTypeForUnaryOp { .. })));
 
     let exp2_result = int_val.try_exp2();
-    assert!(matches!(exp2_result, Err(Error::InvalidDTypeForOp { .. })));
+    assert!(matches!(exp2_result, Err(Error::InvalidDTypeForUnaryOp { .. })));
 
     let log2_result = int_val.clone().try_log2();
-    assert!(matches!(log2_result, Err(Error::InvalidDTypeForOp { .. })));
+    assert!(matches!(log2_result, Err(Error::InvalidDTypeForUnaryOp { .. })));
 }
 
 // =========================================================================
@@ -604,10 +606,10 @@ fn test_bool_add_behavior() {
     let bool_true = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let bool_false = UOp::const_(DType::Bool, ConstValue::Bool(false));
 
-    let result = bool_true.try_add_op(&bool_false);
+    let result = bool_true.try_add(&bool_false);
     assert!(result.is_ok());
 
-    let result = bool_true.try_add_op(&bool_false);
+    let result = bool_true.try_add(&bool_false);
     assert!(result.is_ok());
 }
 
@@ -617,10 +619,10 @@ fn test_bool_mul_behavior() {
     let bool_true = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let bool_false = UOp::const_(DType::Bool, ConstValue::Bool(false));
 
-    let result = bool_true.try_mul_op(&bool_false);
+    let result = bool_true.try_mul(&bool_false);
     assert!(result.is_ok());
 
-    let result = bool_true.try_mul_op(&bool_false);
+    let result = bool_true.try_mul(&bool_false);
     assert!(result.is_ok());
 }
 
@@ -630,11 +632,11 @@ fn test_bool_with_int_promotion() {
     let bool_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let int_val = UOp::native_const(42i32);
 
-    let result = bool_val.try_add_op(&int_val);
+    let result = bool_val.try_add(&int_val);
     assert!(result.is_ok());
     // Bool should promote to Int32
 
-    let result = bool_val.try_mul_op(&int_val);
+    let result = bool_val.try_mul(&int_val);
     assert!(result.is_ok());
 }
 
@@ -846,10 +848,10 @@ fn test_shift_void_error() {
 
     // Shift operations validate LHS dtype through check_bitwise_dtype
     let result = void_val.try_shl_op(&int_val);
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 
     let result = void_val.try_shr_op(&int_val);
-    assert!(matches!(result, Err(Error::InvalidDTypeForOp { .. })));
+    assert!(matches!(result, Err(Error::InvalidDTypeForBinaryOp { .. })));
 }
 
 #[test]

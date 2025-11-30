@@ -37,7 +37,7 @@ fn test_transformation_tracking() {
     let b = UOp::native_const(2i32);
 
     // Perform operation (creates new UOp)
-    let c = a.try_add_op(&b).unwrap();
+    let c = a.try_add(&b).unwrap();
 
     // Check provenance
     PROVENANCE_TRACKER.with(|tracker| {
@@ -248,7 +248,7 @@ fn test_multiple_parents() {
     let b = UOp::native_const(2i32);
 
     // Create a UOp that depends on both
-    let c = a.try_add_op(&b).unwrap();
+    let c = a.try_add(&b).unwrap();
 
     // Now substitute 'a' in 'c'
     let a_new = UOp::native_const(10i32);

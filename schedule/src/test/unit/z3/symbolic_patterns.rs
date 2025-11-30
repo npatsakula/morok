@@ -22,7 +22,7 @@ fn test_identity_add_zero() {
     // x + 0 → x
     let x = UOp::var("x", DType::Int32, 0, 100);
     let zero = UOp::native_const(0i32);
-    let expr = x.try_add_op(&zero).unwrap();
+    let expr = x.try_add(&zero).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -39,7 +39,7 @@ fn test_identity_mul_one() {
     // x * 1 → x
     let x = UOp::var("x", DType::Int32, 0, 100);
     let one = UOp::native_const(1i32);
-    let expr = x.try_mul_op(&one).unwrap();
+    let expr = x.try_mul(&one).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -53,7 +53,7 @@ fn test_identity_sub_zero() {
     // x - 0 → x
     let x = UOp::var("x", DType::Int32, 0, 100);
     let zero = UOp::native_const(0i32);
-    let expr = x.try_sub_op(&zero).unwrap();
+    let expr = x.try_sub(&zero).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -67,7 +67,7 @@ fn test_identity_div_one() {
     // x / 1 → x
     let x = UOp::var("x", DType::Int32, 0, 100);
     let one = UOp::native_const(1i32);
-    let expr = x.try_idiv_op(&one).unwrap();
+    let expr = x.try_div(&one).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -81,7 +81,7 @@ fn test_identity_mod_one() {
     // x % 1 → 0 (verify semantically even if optimizer doesn't simplify)
     let x = UOp::var("x", DType::Int32, 0, 100);
     let one = UOp::native_const(1i32);
-    let expr = x.try_mod_op(&one).unwrap();
+    let expr = x.try_mod(&one).unwrap();
     let zero = UOp::native_const(0i32);
 
     // Z3 verification: x % 1 is semantically equivalent to 0
@@ -97,7 +97,7 @@ fn test_zero_mul_zero() {
     // x * 0 → 0
     let x = UOp::var("x", DType::Int32, 0, 100);
     let zero = UOp::native_const(0i32);
-    let expr = x.try_mul_op(&zero).unwrap();
+    let expr = x.try_mul(&zero).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -129,7 +129,7 @@ fn test_zero_div_x() {
     // 0 / x → 0 (verify semantically, for x ≠ 0)
     let x = UOp::var("x", DType::Int32, 1, 100); // x ≠ 0
     let zero = UOp::native_const(0i32);
-    let expr = zero.try_idiv_op(&x).unwrap();
+    let expr = zero.try_div(&x).unwrap();
 
     // Z3 verification: 0 / x is semantically equivalent to 0
     verify_equivalence(&expr, &zero).expect("0 / x should equal 0");
@@ -143,7 +143,7 @@ fn test_zero_div_x() {
 fn test_self_sub_zero() {
     // x - x → 0 (verify semantically even if optimizer doesn't simplify)
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let expr = x.try_sub_op(&x).unwrap();
+    let expr = x.try_sub(&x).unwrap();
     let zero = UOp::native_const(0i32);
 
     // Z3 verification: x - x is semantically equivalent to 0
@@ -154,7 +154,7 @@ fn test_self_sub_zero() {
 fn test_self_div_one() {
     // x / x → 1 (for x ≠ 0)
     let x = UOp::var("x", DType::Int32, 1, 100); // x ≠ 0
-    let expr = x.try_idiv_op(&x).unwrap();
+    let expr = x.try_div(&x).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -172,7 +172,7 @@ fn test_self_div_one() {
 fn test_self_mod_zero() {
     // x % x → 0 (for x ≠ 0)
     let x = UOp::var("x", DType::Int32, 1, 100); // x ≠ 0
-    let expr = x.try_mod_op(&x).unwrap();
+    let expr = x.try_mod(&x).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -211,8 +211,8 @@ fn test_div_cancel_mul() {
     // (a * b) / b → a (for b ≠ 0)
     let a = UOp::var("a", DType::Int32, 0, 100);
     let b = UOp::var("b", DType::Int32, 1, 100); // b ≠ 0
-    let a_mul_b = a.try_mul_op(&b).unwrap();
-    let expr = a_mul_b.try_idiv_op(&b).unwrap();
+    let a_mul_b = a.try_mul(&b).unwrap();
+    let expr = a_mul_b.try_div(&b).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -228,8 +228,8 @@ fn test_div_chain() {
     let a = UOp::var("a", DType::Int32, 0, 100);
     let b = UOp::var("b", DType::Int32, 1, 10); // b ≠ 0
     let c = UOp::var("c", DType::Int32, 1, 10); // c ≠ 0
-    let a_div_b = a.try_idiv_op(&b).unwrap();
-    let expr = a_div_b.try_idiv_op(&c).unwrap();
+    let a_div_b = a.try_div(&b).unwrap();
+    let expr = a_div_b.try_div(&c).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -245,9 +245,9 @@ fn test_div_gcd_factor() {
     let b = UOp::var("b", DType::Int32, 1, 10); // b ≠ 0
     let six = UOp::native_const(6i32);
 
-    let a_mul_6 = a.try_mul_op(&six).unwrap();
-    let b_mul_6 = b.try_mul_op(&six).unwrap();
-    let expr = a_mul_6.try_idiv_op(&b_mul_6).unwrap();
+    let a_mul_6 = a.try_mul(&six).unwrap();
+    let b_mul_6 = b.try_mul(&six).unwrap();
+    let expr = a_mul_6.try_div(&b_mul_6).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -260,7 +260,7 @@ fn test_div_gcd_factor() {
 fn test_mod_self_zero() {
     // a % a → 0 (for a ≠ 0)
     let a = UOp::var("a", DType::Int32, 1, 100); // a ≠ 0
-    let expr = a.try_mod_op(&a).unwrap();
+    let expr = a.try_mod(&a).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -282,7 +282,7 @@ fn test_mod_self_zero() {
 fn test_term_combine_add() {
     // x + x → 2 * x
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let expr = x.try_add_op(&x).unwrap();
+    let expr = x.try_add(&x).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -298,9 +298,9 @@ fn test_term_combine_coefficients() {
     let two = UOp::native_const(2i32);
     let three = UOp::native_const(3i32);
 
-    let two_x = two.try_mul_op(&x).unwrap();
-    let three_x = three.try_mul_op(&x).unwrap();
-    let expr = two_x.try_add_op(&three_x).unwrap();
+    let two_x = two.try_mul(&x).unwrap();
+    let three_x = three.try_mul(&x).unwrap();
+    let expr = two_x.try_add(&three_x).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -316,8 +316,8 @@ fn test_const_folding_add() {
     let three = UOp::native_const(3i32);
     let five = UOp::native_const(5i32);
 
-    let x_plus_3 = x.try_add_op(&three).unwrap();
-    let expr = x_plus_3.try_add_op(&five).unwrap();
+    let x_plus_3 = x.try_add(&three).unwrap();
+    let expr = x_plus_3.try_add(&five).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
@@ -333,8 +333,8 @@ fn test_const_folding_mul() {
     let two = UOp::native_const(2i32);
     let three = UOp::native_const(3i32);
 
-    let x_mul_2 = x.try_mul_op(&two).unwrap();
-    let expr = x_mul_2.try_mul_op(&three).unwrap();
+    let x_mul_2 = x.try_mul(&two).unwrap();
+    let expr = x_mul_2.try_mul(&three).unwrap();
 
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());

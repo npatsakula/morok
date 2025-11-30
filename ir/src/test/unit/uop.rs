@@ -32,8 +32,8 @@ fn test_hash_consing_with_src() {
     let b = UOp::native_const(2.0f32);
 
     // Create a + b twice
-    let add1 = a.try_add_op(&b).unwrap();
-    let add2 = a.try_add_op(&b).unwrap();
+    let add1 = a.try_add(&b).unwrap();
+    let add2 = a.try_add(&b).unwrap();
 
     // Should be the same object
     assert!(Rc::ptr_eq(&add1, &add2), "Hash consing should work with src nodes");
@@ -44,11 +44,11 @@ fn test_binary_operations() {
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
 
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
     assert_eq!(add.dtype(), DType::Float32);
     assert_eq!(add.op().children().len(), 2);
 
-    let mul = a.try_mul_op(&b).unwrap();
+    let mul = a.try_mul(&b).unwrap();
     assert_eq!(mul.dtype(), DType::Float32);
 }
 
@@ -85,8 +85,8 @@ fn test_toposort() {
     let b = UOp::native_const(2.0f32);
     let c = UOp::native_const(3.0f32);
 
-    let add = a.try_add_op(&b).unwrap();
-    let mul = add.try_mul_op(&c).unwrap();
+    let add = a.try_add(&b).unwrap();
+    let mul = add.try_mul(&c).unwrap();
 
     let sorted = mul.toposort();
 
@@ -113,9 +113,9 @@ fn test_toposort_shared_node() {
     let b = UOp::native_const(2.0f32);
     let c = UOp::native_const(3.0f32);
 
-    let x = a.try_add_op(&b).unwrap();
-    let y = a.try_add_op(&c).unwrap();
-    let z = x.try_mul_op(&y).unwrap();
+    let x = a.try_add(&b).unwrap();
+    let y = a.try_add(&c).unwrap();
+    let z = x.try_mul(&y).unwrap();
 
     let sorted = z.toposort();
 
@@ -181,10 +181,10 @@ fn test_device_and_unique() {
         assert_eq!(*spec, DeviceSpec::Cpu);
     }
 
-    let uniq = UOp::unique(Some(42));
+    let uniq = UOp::buffer_id(Some(42));
     assert!(matches!(uniq.op(), Op::Unique(42)));
 
-    let uniq_auto = UOp::unique(None);
+    let uniq_auto = UOp::buffer_id(None);
     assert!(matches!(uniq_auto.op(), Op::Unique(_)));
 }
 
@@ -192,7 +192,7 @@ fn test_device_and_unique() {
 fn test_children_method() {
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
 
     let children = add.op().children();
     assert_eq!(children.len(), 2);
@@ -204,7 +204,7 @@ fn test_children_method() {
 fn test_for_each_child() {
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
 
     let mut children = Vec::new();
     add.op().map_child(|child| children.push(child.clone()));
@@ -235,7 +235,7 @@ fn test_shape_property_lazy_evaluation() {
 
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
 
     // VERIFY: Cache is empty before first access (lazy evaluation)
     assert!(ShapeProperty::cache(&add).get().is_none(), "Cache should be empty before first access");
@@ -259,7 +259,7 @@ fn test_ranges_property_no_ranges() {
     // Simple arithmetic with no RANGE ops
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
 
     let ranges = add.ranges();
     assert_eq!(ranges.len(), 0, "No RANGE ops in simple arithmetic");
@@ -401,8 +401,8 @@ fn test_in_scope_ranges_nested() {
 fn test_toposort_filtered_basic() {
     // Build graph: a -> b -> c
     let a = UOp::native_const(1.0f32);
-    let b = a.try_add_op(&UOp::native_const(2.0f32)).unwrap();
-    let c = b.try_mul_op(&UOp::native_const(3.0f32)).unwrap();
+    let b = a.try_add(&UOp::native_const(2.0f32)).unwrap();
+    let c = b.try_mul(&UOp::native_const(3.0f32)).unwrap();
 
     // Filter to only include 'c'
     let filtered = c.toposort_filtered(|node| Rc::ptr_eq(node, &c));
@@ -417,7 +417,7 @@ fn test_toposort_filtered_all() {
     // Build graph: a + b
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
 
     // Filter that accepts all nodes
     let filtered = add.toposort_filtered(|_| true);
@@ -446,7 +446,7 @@ fn test_multiple_properties_coexist() {
     let b = UOp::native_const(2.0f32);
 
     // Create an addition operation
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
 
     // Access shape property (const operations have shape)
     let shape = add.shape().unwrap();

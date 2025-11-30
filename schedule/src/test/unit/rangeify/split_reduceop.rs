@@ -63,8 +63,8 @@ fn test_collect_range_ids_multiple() {
     let r0 = UOp::range_const(10, 0);
     let r1 = UOp::range_const(5, 1);
     let r2 = UOp::range_const(3, 2);
-    let add = r0.try_add_op(&r1).unwrap();
-    let mul = add.try_mul_op(&r2).unwrap();
+    let add = r0.try_add(&r1).unwrap();
+    let mul = add.try_mul(&r2).unwrap();
     let ids = collect_range_ids(&mul);
     assert_eq!(ids, vec![0, 1, 2]);
 }
@@ -75,7 +75,7 @@ fn test_collect_range_ids_unsorted() {
     let r2 = UOp::range_const(3, 2);
     let r0 = UOp::range_const(10, 0);
     let r1 = UOp::range_const(5, 1);
-    let expr = r2.try_add_op(&r0).unwrap().try_add_op(&r1).unwrap();
+    let expr = r2.try_add(&r0).unwrap().try_add(&r1).unwrap();
     let ids = collect_range_ids(&expr);
     assert_eq!(ids, vec![0, 1, 2]); // Should be sorted
 }

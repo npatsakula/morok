@@ -153,7 +153,7 @@ fn test_operator_div() {
     // Create float division UOp
     let five_f = UOp::const_(DType::Float32, ConstValue::Float(5.0));
     let one_f = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let fdiv = five_f.try_fdiv_op(&one_f).unwrap();
+    let fdiv = five_f.try_div(&one_f).unwrap();
 
     let matches = pat.match_uop(&fdiv);
     assert_eq!(matches.len(), 1);

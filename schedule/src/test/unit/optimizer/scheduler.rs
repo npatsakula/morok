@@ -515,7 +515,7 @@ fn test_shift_to_substitution_in_ast() {
 
     // Create a computation that uses the range: r_global * 2
     let two = UOp::index_const(2);
-    let compute = r_global.try_mul_op(&two).unwrap();
+    let compute = r_global.try_mul(&two).unwrap();
 
     let sink = UOp::sink(vec![compute.clone(), r_global.clone()]);
 

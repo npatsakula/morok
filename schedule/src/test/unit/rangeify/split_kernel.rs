@@ -9,7 +9,7 @@ fn test_split_store_basic() {
     let mut ctx = KernelContext::new();
 
     // Create a simple STORE operation
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer.clone(), index, value);
@@ -42,7 +42,7 @@ fn test_split_store_end_operation() {
     let mut ctx = KernelContext::new();
 
     // Create an END operation wrapping a STORE
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);
@@ -101,7 +101,7 @@ fn test_split_store_gated() {
     let mut ctx = KernelContext::new();
 
     // Create a STORE_GATED operation
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let gate = UOp::native_const(true);
@@ -121,7 +121,7 @@ fn test_split_store_creates_sink() {
     let mut ctx = KernelContext::new();
 
     // Create a STORE operation
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer.clone(), index, value.clone());
@@ -166,7 +166,7 @@ fn test_split_store_preserves_computation() {
     ];
 
     for (_dtype_idx, (dtype, _const_val)) in test_cases.iter().enumerate() {
-        let buffer = UOp::unique(Some(0));
+        let buffer = UOp::buffer_id(Some(0));
         let index = UOp::index_const(0);
         let value = match _dtype_idx {
             0 => UOp::native_const(1.0f32),
@@ -202,12 +202,12 @@ fn test_split_store_multiple_calls_independent() {
     let mut ctx = KernelContext::new();
 
     // Create two different STORE operations
-    let buffer1 = UOp::unique(Some(1));
+    let buffer1 = UOp::buffer_id(Some(1));
     let index1 = UOp::index_const(0);
     let value1 = UOp::native_const(1.0f32);
     let store1 = UOp::store(buffer1, index1, value1);
 
-    let buffer2 = UOp::unique(Some(2));
+    let buffer2 = UOp::buffer_id(Some(2));
     let index2 = UOp::index_const(0);
     let value2 = UOp::native_const(2.0f32);
     let store2 = UOp::store(buffer2, index2, value2);
@@ -229,7 +229,7 @@ fn test_split_store_end_with_multiple_ranges() {
     let mut ctx = KernelContext::new();
 
     // Create END with multiple ranges wrapping a STORE
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);
@@ -271,7 +271,7 @@ fn test_split_store_end_with_outer_range() {
     let mut ctx = KernelContext::new();
 
     // Create END with OUTER range wrapping a STORE
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);
@@ -290,7 +290,7 @@ fn test_split_store_end_with_mixed_ranges() {
     let mut ctx = KernelContext::new();
 
     // Create END with mix of LOOP and OUTER ranges wrapping a STORE
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);
@@ -315,11 +315,11 @@ fn test_split_store_with_copy() {
     let mut ctx = KernelContext::new();
 
     // Create a COPY operation
-    let src_buffer = UOp::unique(Some(1));
+    let src_buffer = UOp::buffer_id(Some(1));
     let copy = src_buffer.copy_to_device(DeviceSpec::Cpu);
 
     // Create STORE using the COPY result
-    let output_buffer = UOp::unique(Some(0));
+    let output_buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let store = UOp::store(output_buffer, index, copy.clone());
 
@@ -344,11 +344,11 @@ fn test_split_store_with_buffer_view() {
     let mut ctx = KernelContext::new();
 
     // Create a BUFFER_VIEW operation
-    let base_buffer = UOp::unique(Some(1));
+    let base_buffer = UOp::buffer_id(Some(1));
     let buffer_view = UOp::buffer_view(base_buffer, 256, 128);
 
     // Create STORE using the BUFFER_VIEW result
-    let output_buffer = UOp::unique(Some(0));
+    let output_buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let store = UOp::store(output_buffer, index, buffer_view.clone());
 
@@ -379,10 +379,10 @@ fn test_split_store_normal_computation_uses_sink() {
     // Create normal arithmetic computation (no COPY/BUFFER_VIEW)
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let value = a.try_add_op(&b).unwrap();
+    let value = a.try_add(&b).unwrap();
 
     // Create STORE with normal computation
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let store = UOp::store(buffer.clone(), index, value.clone());
 
@@ -412,10 +412,10 @@ fn test_split_store_nested_copy_in_store() {
     let mut ctx = KernelContext::new();
 
     // Create nested structure: END(STORE(COPY))
-    let src_buffer = UOp::unique(Some(1));
+    let src_buffer = UOp::buffer_id(Some(1));
     let copy = src_buffer.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
 
-    let output_buffer = UOp::unique(Some(0));
+    let output_buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let store = UOp::store(output_buffer, index, copy.clone());
 
@@ -462,11 +462,11 @@ fn test_split_store_copy_precedence_documented() {
     let mut ctx = KernelContext::new();
 
     // Create nested COPY: COPY(COPY(buffer))
-    let base_buffer = UOp::unique(Some(1));
+    let base_buffer = UOp::buffer_id(Some(1));
     let copy1 = base_buffer.copy_to_device(DeviceSpec::Cpu);
     let copy2 = copy1.clone().copy_to_device(DeviceSpec::Cuda { device_id: 0 });
 
-    let output_buffer = UOp::unique(Some(0));
+    let output_buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let store = UOp::store(output_buffer, index, copy2.clone());
 

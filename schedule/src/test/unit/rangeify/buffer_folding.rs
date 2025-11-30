@@ -202,7 +202,7 @@ fn test_noop_fold_non_const_operations() {
     let x = UOp::var("x", DType::Float32, 0, 100);
     let y = UOp::var("y", DType::Float32, 0, 100);
 
-    let add = x.try_add_op(&y).unwrap();
+    let add = x.try_add(&y).unwrap();
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(add.clone(), vec![range.clone()]);

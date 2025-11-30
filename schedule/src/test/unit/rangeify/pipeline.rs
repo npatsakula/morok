@@ -90,7 +90,7 @@ fn test_run_rangeify_binary_op() {
     // Test: Binary operations should be processed
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let add = a.try_add_op(&b).unwrap();
+    let add = a.try_add(&b).unwrap();
 
     let rangeified = rangeify_unwrap(add);
 
@@ -106,8 +106,8 @@ fn test_run_rangeify_preserves_structure() {
     let c = UOp::native_const(3.0f32);
 
     // (a + b) * c
-    let sum = a.try_add_op(&b).unwrap();
-    let product = sum.try_mul_op(&c).unwrap();
+    let sum = a.try_add(&b).unwrap();
+    let product = sum.try_mul(&c).unwrap();
 
     let rangeified = rangeify_unwrap(product);
 
@@ -128,7 +128,7 @@ fn test_run_rangeify_preserves_structure() {
 #[test]
 fn test_kernel_split_pipeline_simple_store() {
     // Test: Simple STORE should create a KERNEL
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);
@@ -143,7 +143,7 @@ fn test_kernel_split_pipeline_simple_store() {
 #[test]
 fn test_kernel_split_pipeline_with_end() {
     // Test: END(STORE) should be processed correctly
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);
@@ -184,7 +184,7 @@ fn test_kernel_split_pipeline_multiple_loads() {
 
     let load1 = UOp::load(buf1, index.clone());
     let load2 = UOp::load(buf2, index.clone());
-    let sum = load1.try_add_op(&load2).unwrap();
+    let sum = load1.try_add(&load2).unwrap();
     let store = UOp::store(out_buf, index, sum);
 
     let result = run_kernel_split_pipeline(store);
@@ -202,10 +202,10 @@ fn test_end_to_end_simple_computation() {
     // Step 1: Create computation
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
-    let sum = a.try_add_op(&b).unwrap();
+    let sum = a.try_add(&b).unwrap();
 
     // Step 2: Wrap in STORE
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let store = UOp::store(buffer, index, sum);
 
@@ -223,7 +223,7 @@ fn test_end_to_end_simple_computation() {
 fn test_end_to_end_with_ranges() {
     // Test: Pipeline with explicit range operations
 
-    let buffer = UOp::unique(Some(0));
+    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);
@@ -294,7 +294,7 @@ fn test_pipeline_complex_nested_structure() {
     // Build a deep tree: ((((x + 1) + 1) + 1) + 1)
     for _ in 0..10 {
         let one = UOp::native_const(1.0f32);
-        current = current.try_add_op(&one).unwrap();
+        current = current.try_add(&one).unwrap();
     }
 
     let rangeified = rangeify_unwrap(current);
@@ -315,7 +315,7 @@ fn test_pipeline_wide_tree() {
     // Sum all operands
     let mut sum = operands[0].clone();
     for operand in &operands[1..] {
-        sum = sum.try_add_op(operand).unwrap();
+        sum = sum.try_add(operand).unwrap();
     }
 
     let rangeified = rangeify_unwrap(sum);
@@ -371,8 +371,8 @@ fn test_pipeline_maintains_computation_semantics() {
     let b = UOp::native_const(3.0f32);
     let c = UOp::native_const(4.0f32);
 
-    let product = a.try_mul_op(&b).unwrap();
-    let sum = product.try_add_op(&c).unwrap();
+    let product = a.try_mul(&b).unwrap();
+    let sum = product.try_add(&c).unwrap();
 
     let rangeified = rangeify_unwrap(sum);
 
@@ -555,7 +555,7 @@ fn test_pipeline_reduce_collapse_with_algebraic_simplification() {
     // Test: reduce_collapse combined with algebraic patterns (x + 0)
     let x = UOp::native_const(100i32);
     let zero = UOp::native_const(0i32);
-    let x_plus_0 = x.try_add_op(&zero).unwrap();
+    let x_plus_0 = x.try_add(&zero).unwrap();
 
     let range = UOp::range_axis(UOp::index_const(20), AxisId::Renumbered(0), AxisType::Reduce);
 
@@ -576,7 +576,7 @@ fn test_pipeline_reduce_collapse_preserves_dependent_reductions() {
     // Create expression that depends on range: range + 1
     let one = UOp::native_const(1i32);
     let range_int = UOp::cast(range.clone(), DType::Int32);
-    let src = range_int.try_add_op(&one).unwrap();
+    let src = range_int.try_add(&one).unwrap();
 
     let reduce = UOp::reduce(src, vec![range].into(), ReduceOp::Add);
 

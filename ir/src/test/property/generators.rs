@@ -219,10 +219,10 @@ pub fn arb_arithmetic_tree(dtype: DType, depth: usize) -> impl Strategy<Value = 
             // Binary operation
             (arb_arithmetic_binary_op(), inner.clone(), inner.clone()).prop_map(move |(op, lhs, rhs)| {
                 match op {
-                    BinaryOp::Add => lhs.try_add_op(&rhs).unwrap(),
-                    BinaryOp::Mul => lhs.try_mul_op(&rhs).unwrap(),
-                    BinaryOp::Sub => lhs.try_sub_op(&rhs).unwrap(),
-                    BinaryOp::Max => lhs.try_max_op(&rhs).unwrap(),
+                    BinaryOp::Add => lhs.try_add(&rhs).unwrap(),
+                    BinaryOp::Mul => lhs.try_mul(&rhs).unwrap(),
+                    BinaryOp::Sub => lhs.try_sub(&rhs).unwrap(),
+                    BinaryOp::Max => lhs.try_max(&rhs).unwrap(),
                     _ => unreachable!("arb_arithmetic_binary_op only generates Add, Mul, Sub, Max"),
                 }
             }),
@@ -269,10 +269,10 @@ pub fn arb_arithmetic_tree_bounded(dtype: DType, depth: usize) -> impl Strategy<
         prop_oneof![
             (arb_arithmetic_binary_op(), inner.clone(), inner.clone()).prop_map(move |(op, lhs, rhs)| {
                 match op {
-                    BinaryOp::Add => lhs.try_add_op(&rhs).unwrap(),
-                    BinaryOp::Mul => lhs.try_mul_op(&rhs).unwrap(),
-                    BinaryOp::Sub => lhs.try_sub_op(&rhs).unwrap(),
-                    BinaryOp::Max => lhs.try_max_op(&rhs).unwrap(),
+                    BinaryOp::Add => lhs.try_add(&rhs).unwrap(),
+                    BinaryOp::Mul => lhs.try_mul(&rhs).unwrap(),
+                    BinaryOp::Sub => lhs.try_sub(&rhs).unwrap(),
+                    BinaryOp::Max => lhs.try_max(&rhs).unwrap(),
                     _ => unreachable!("arb_arithmetic_binary_op only generates Add, Mul, Sub, Max"),
                 }
             }),
@@ -313,22 +313,22 @@ impl KnownPropertyGraph {
         match self {
             Self::AddZero { x, dtype } => {
                 let zero = ConstValue::zero(dtype.scalar().unwrap());
-                x.try_add_op(&UOp::const_(dtype.clone(), zero)).unwrap()
+                x.try_add(&UOp::const_(dtype.clone(), zero)).unwrap()
             }
             Self::MulOne { x, dtype } => {
                 let one = ConstValue::one(dtype.scalar().unwrap());
-                x.try_mul_op(&UOp::const_(dtype.clone(), one)).unwrap()
+                x.try_mul(&UOp::const_(dtype.clone(), one)).unwrap()
             }
             Self::SubZero { x, dtype } => {
                 let zero = ConstValue::zero(dtype.scalar().unwrap());
-                x.try_sub_op(&UOp::const_(dtype.clone(), zero)).unwrap()
+                x.try_sub(&UOp::const_(dtype.clone(), zero)).unwrap()
             }
             Self::MulZero { x, dtype } => {
                 let zero = ConstValue::zero(dtype.scalar().unwrap());
-                x.try_mul_op(&UOp::const_(dtype.clone(), zero)).unwrap()
+                x.try_mul(&UOp::const_(dtype.clone(), zero)).unwrap()
             }
-            Self::SubSelf { x, .. } => x.try_sub_op(x).unwrap(),
-            Self::AddSelf { x, .. } => x.try_add_op(x).unwrap(),
+            Self::SubSelf { x, .. } => x.try_sub(x).unwrap(),
+            Self::AddSelf { x, .. } => x.try_add(x).unwrap(),
         }
     }
 

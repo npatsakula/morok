@@ -103,7 +103,7 @@ fn test_reduce_unparented_mixed_ranges() {
     let range_1 = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(1), AxisType::Reduce);
 
     let x = UOp::native_const(3i32);
-    let src = x.try_add_op(&UOp::cast(range_0.clone(), DType::Int32)).unwrap();
+    let src = x.try_add(&UOp::cast(range_0.clone(), DType::Int32)).unwrap();
 
     let reduce = UOp::reduce(src, vec![range_0.clone(), range_1].into(), ReduceOp::Add);
 
@@ -186,7 +186,7 @@ fn test_reduce_collapse_with_range_dependency() {
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
     let one = UOp::native_const(1i32);
     let range_int = UOp::cast(range.clone(), DType::Int32);
-    let src = range_int.try_add_op(&one).unwrap();
+    let src = range_int.try_add(&one).unwrap();
 
     let reduce = UOp::reduce(src, vec![range].into(), ReduceOp::Add);
 
@@ -241,7 +241,7 @@ fn test_reduce_collapse_algebraic_simplification() {
     // REDUCE(x + 0, [range], ADD) where x is constant
     let x = UOp::native_const(42i32);
     let zero = UOp::native_const(0i32);
-    let x_plus_0 = x.try_add_op(&zero).unwrap();
+    let x_plus_0 = x.try_add(&zero).unwrap();
 
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
 
@@ -263,7 +263,7 @@ fn test_reduce_collapse_multiplication_by_one() {
     // REDUCE(x * 1, [range], MUL) where x is constant
     let x = UOp::native_const(PI);
     let one = UOp::native_const(1.0f32);
-    let x_times_1 = x.try_mul_op(&one).unwrap();
+    let x_times_1 = x.try_mul(&one).unwrap();
 
     let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
 
@@ -329,7 +329,7 @@ fn test_no_range_with_ranges() {
     let const_5 = UOp::native_const(5i32);
 
     // Create expression that depends on range: range + 5
-    let sum = UOp::cast(range.clone(), DType::Int32).try_add_op(&const_5).unwrap();
+    let sum = UOp::cast(range.clone(), DType::Int32).try_add(&const_5).unwrap();
 
     // Should return false because sum depends on range
     assert!(!crate::rangeify::helpers::no_range(&sum));
@@ -344,7 +344,7 @@ fn test_no_range_without_ranges() {
     // Arithmetic operations on constants also have no ranges
     let a = UOp::native_const(10i32);
     let b = UOp::native_const(20i32);
-    let sum = a.try_add_op(&b).unwrap();
+    let sum = a.try_add(&b).unwrap();
     assert!(crate::rangeify::helpers::no_range(&sum));
 }
 
@@ -379,6 +379,6 @@ fn test_range_size_extraction_non_range() {
     // Binary operation also returns None
     let a = UOp::native_const(10i32);
     let b = UOp::native_const(20i32);
-    let sum = a.try_add_op(&b).unwrap();
+    let sum = a.try_add(&b).unwrap();
     assert_eq!(crate::rangeify::helpers::range_size_as_i64(&sum), None);
 }

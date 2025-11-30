@@ -1,13 +1,15 @@
-//! Movement and reshape operations.
+//! Shape manipulation: reshape, permute, expand, pad, shrink, flip.
 //!
 //! These operations manipulate tensor shapes and layouts without changing
 //! the underlying data (except for padding which may add values).
 
 use std::rc::Rc;
 
-use super::super::{Op, Result, UOp};
+use crate::Result;
+use crate::op::Op;
+use crate::uop::UOp;
 
-// These constructors are not yet used but will be needed for future optimization passes
+// Low-level constructors (pub(crate) - not yet used but will be needed for optimization passes)
 #[allow(dead_code)]
 impl UOp {
     /// Reshape tensor to new shape (low-level, UOp-based constructor).
@@ -61,39 +63,15 @@ impl UOp {
         let dtype = src.dtype();
         Self::new(Op::Flip { src, axes }, dtype)
     }
-
-    /// Multi-device split along axis.
-    pub fn multi(src: Rc<Self>, axis: usize) -> Rc<Self> {
-        let dtype = src.dtype();
-        Self::new(Op::Multi { src, axis }, dtype)
-    }
 }
 
-// =========================================================================
 // Primary Movement Operation Constructors (with validation)
-// =========================================================================
-
 impl UOp {
     /// Reshape with strict validation (fail-fast).
     ///
     /// Validates:
     /// - No negative dimensions in new_shape
     /// - Product of input shape == product of output shape
-    ///
-    /// # Errors
-    /// Returns error if validation fails.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use morok_ir::{UOp, ConstValue, SInt, shape};
-    /// # use morok_dtype::DType;
-    /// # use smallvec::SmallVec;
-    /// let src = UOp::const_(DType::Float32, ConstValue::Float(1.0)); // Scalar
-    /// let new_shape: SmallVec<[SInt; 4]> = SmallVec::from_vec(vec![SInt::from(1), SInt::from(1)]);
-    /// // This would work: scalar (product=1) -> [1,1] (product=1)
-    /// // let reshaped = src.try_reshape(&new_shape);
-    /// ```
     pub fn try_reshape(self: &Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
         use crate::error::ReshapeNegativeDimensionSnafu;
         use crate::error::ReshapeSizeMismatchSnafu;
@@ -130,9 +108,6 @@ impl UOp {
     /// Validates:
     /// - Number of dimensions matches
     /// - Each dimension either matches or src dimension is 1
-    ///
-    /// # Errors
-    /// Returns error if validation fails.
     pub fn try_expand(self: &Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
         use crate::error::ExpandDimensionMismatchSnafu;
         use crate::error::ExpandInvalidDimensionSnafu;
@@ -168,9 +143,6 @@ impl UOp {
     ///
     /// Validates:
     /// - Permutation is valid (contains each index 0..n exactly once)
-    ///
-    /// # Errors
-    /// Returns error if permutation is invalid.
     pub fn try_permute(self: &Rc<Self>, axes: Vec<usize>) -> Result<Rc<Self>> {
         // Validate permutation if source shape is known
         if let Some(src_shape) = self.shape()? {
@@ -186,9 +158,6 @@ impl UOp {
     /// Validates:
     /// - Padding values are concrete (not symbolic)
     /// - Number of padding pairs matches dimensions
-    ///
-    /// # Errors
-    /// Returns error if validation fails or if padding contains symbolic values.
     pub fn try_pad(self: &Rc<Self>, padding: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
         use crate::error::{PadDimensionMismatchSnafu, SymbolicPaddingUnsupportedSnafu};
         use crate::shape::ranges_to_uops;
@@ -219,9 +188,6 @@ impl UOp {
     /// - Range values are concrete (not symbolic)
     /// - begin <= end for each dimension
     /// - 0 <= begin, end <= dimension_size
-    ///
-    /// # Errors
-    /// Returns error if validation fails or if ranges contain symbolic values.
     pub fn try_shrink(self: &Rc<Self>, ranges: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
         use crate::error::{ShrinkBoundsViolationSnafu, SymbolicShrinkingUnsupportedSnafu};
         use crate::shape::ranges_to_uops;
@@ -255,9 +221,6 @@ impl UOp {
     ///
     /// Validates:
     /// - Flip specification length matches shape dimensions
-    ///
-    /// # Errors
-    /// Returns error if specification is invalid.
     pub fn try_flip(self: &Rc<Self>, axes: Vec<bool>) -> Result<Rc<Self>> {
         if let Some(src_shape) = self.shape()? {
             Self::validate_flip_axes(&axes, src_shape.len())?;
@@ -265,5 +228,14 @@ impl UOp {
 
         let dtype = self.dtype();
         Ok(Self::new(Op::Flip { src: self.clone(), axes }, dtype))
+    }
+
+    /// Split tensor across multiple devices along specified axis.
+    ///
+    /// Creates a multi-device tensor where each device holds a shard.
+    /// Use with MSTACK/MSELECT for distributed tensor operations.
+    pub fn multi(src: Rc<Self>, axis: usize) -> Rc<Self> {
+        let dtype = src.dtype();
+        Self::new(Op::Multi { src, axis }, dtype)
     }
 }

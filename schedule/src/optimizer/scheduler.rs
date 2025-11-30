@@ -768,18 +768,18 @@ impl Scheduler {
             // Example: [0,8,16,24, 1,9,17,25, ...]
             let old_sz_uop = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(old_sz as i64));
             new_rng
-                .try_mul_op(&old_sz_uop)
+                .try_mul(&old_sz_uop)
                 .expect("Multiplication should not fail for index types")
-                .try_add_op(&replaced_rng)
+                .try_add(&replaced_rng)
                 .expect("Addition should not fail for index types")
         } else {
             // Bottom order: old varies faster
             // Example: [0,1,2,3, 4,5,6,7, 8,9,10,11, ...]
             let amount_uop = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
             replaced_rng
-                .try_mul_op(&amount_uop)
+                .try_mul(&amount_uop)
                 .expect("Multiplication should not fail for index types")
-                .try_add_op(&new_rng)
+                .try_add(&new_rng)
                 .expect("Addition should not fail for index types")
         };
 

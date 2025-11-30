@@ -93,31 +93,31 @@ fn test_log2_fractional() {
 
 #[test]
 fn test_sin_zero() {
-    let result = UOp::sin_op(UOp::native_const(0.0f32)).unwrap();
+    let result = UOp::native_const(0.0f32).try_sin().unwrap();
     // sin(0) = 0
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_sin_positive() {
-    let result = UOp::sin_op(UOp::native_const(1.57f32)).unwrap(); // ~π/2
+    let result = UOp::native_const(1.57f32).try_sin().unwrap(); // ~π/2
     // sin(π/2) ≈ 1
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_sin_negative() {
-    let result = UOp::sin_op(UOp::native_const(-1.57f32)).unwrap(); // ~-π/2
+    let result = UOp::native_const(-1.57f32).try_sin().unwrap(); // ~-π/2
     // sin(-π/2) ≈ -1
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_sin_preserves_dtype() {
-    let result_f32 = UOp::sin_op(UOp::native_const(0.5f32)).unwrap();
+    let result_f32 = UOp::native_const(0.5f32).try_sin().unwrap();
     assert_eq!(result_f32.dtype(), morok_dtype::DType::Float32);
 
-    let result_f64 = UOp::sin_op(UOp::native_const(0.5f64)).unwrap();
+    let result_f64 = UOp::native_const(0.5f64).try_sin().unwrap();
     assert_eq!(result_f64.dtype(), morok_dtype::DType::Float64);
 }
 
@@ -127,28 +127,28 @@ fn test_sin_preserves_dtype() {
 
 #[test]
 fn test_reciprocal_one() {
-    let result = UOp::reciprocal_op(UOp::native_const(1.0f32));
+    let result = UOp::try_reciprocal(&UOp::native_const(1.0f32)).unwrap();
     // 1/1 = 1
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_reciprocal_two() {
-    let result = UOp::reciprocal_op(UOp::native_const(2.0f32));
+    let result = UOp::try_reciprocal(&UOp::native_const(2.0f32)).unwrap();
     // 1/2 = 0.5
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_reciprocal_negative() {
-    let result = UOp::reciprocal_op(UOp::native_const(-4.0f32));
+    let result = UOp::try_reciprocal(&UOp::native_const(-4.0f32)).unwrap();
     // 1/(-4) = -0.25
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_reciprocal_fractional() {
-    let result = UOp::reciprocal_op(UOp::native_const(0.5f32));
+    let result = UOp::try_reciprocal(&UOp::native_const(0.5f32)).unwrap();
     // 1/0.5 = 2
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
@@ -159,39 +159,39 @@ fn test_reciprocal_fractional() {
 
 #[test]
 fn test_trunc_positive() {
-    let result = UOp::trunc_op(UOp::native_const(3.7f32));
+    let result = UOp::trunc(UOp::native_const(3.7f32));
     // trunc(3.7) = 3.0
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_trunc_negative() {
-    let result = UOp::trunc_op(UOp::native_const(-3.7f32));
+    let result = UOp::trunc(UOp::native_const(-3.7f32));
     // trunc(-3.7) = -3.0 (towards zero)
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_trunc_zero() {
-    let result = UOp::trunc_op(UOp::native_const(0.0f32));
+    let result = UOp::trunc(UOp::native_const(0.0f32));
     // trunc(0) = 0
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_trunc_integer_value() {
-    let result = UOp::trunc_op(UOp::native_const(5.0f32));
+    let result = UOp::trunc(UOp::native_const(5.0f32));
     // trunc(5.0) = 5.0
     assert_eq!(result.dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
 fn test_trunc_near_zero() {
-    let result_pos = UOp::trunc_op(UOp::native_const(0.9f32));
+    let result_pos = UOp::trunc(UOp::native_const(0.9f32));
     // trunc(0.9) = 0.0
     assert_eq!(result_pos.dtype(), morok_dtype::DType::Float32);
 
-    let result_neg = UOp::trunc_op(UOp::native_const(-0.9f32));
+    let result_neg = UOp::trunc(UOp::native_const(-0.9f32));
     // trunc(-0.9) = -0.0 (towards zero)
     assert_eq!(result_neg.dtype(), morok_dtype::DType::Float32);
 }
@@ -215,9 +215,9 @@ fn test_reciprocal_twice() {
     let val = UOp::native_const(5.0f32);
 
     // 1/x
-    let recip1 = UOp::reciprocal_op(val.clone());
+    let recip1 = UOp::try_reciprocal(&val).unwrap();
     // 1/(1/x) = x
-    let recip2 = UOp::reciprocal_op(recip1);
+    let recip2 = UOp::try_reciprocal(&recip1).unwrap();
 
     assert_eq!(recip2.dtype(), morok_dtype::DType::Float32);
 }

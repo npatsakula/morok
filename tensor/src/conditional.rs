@@ -33,7 +33,7 @@ impl Tensor {
     /// // result = [0.0, 0.0, 3.0, 4.0]
     /// ```
     pub fn where_(&self, condition: &Tensor, other: &Tensor) -> Result<Self> {
-        let result = UOp::where_op(condition.uop.clone(), self.uop.clone(), other.uop.clone()).context(UOpSnafu)?;
+        let result = UOp::try_where(condition.uop.clone(), self.uop.clone(), other.uop.clone()).context(UOpSnafu)?;
         Ok(Self::new(result))
     }
 
@@ -53,7 +53,7 @@ impl Tensor {
     /// // result = [2.0, 5.0, 4.0]
     /// ```
     pub fn maximum(&self, other: &Tensor) -> Result<Self> {
-        let result = self.uop.try_max_op(&other.uop).context(UOpSnafu)?;
+        let result = self.uop.try_max(&other.uop).context(UOpSnafu)?;
         Ok(Self::new(result))
     }
 
