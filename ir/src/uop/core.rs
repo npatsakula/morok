@@ -162,7 +162,7 @@ impl UOp {
     /// ```rust
     /// # use morok_ir::{UOp, SInt, shape::Shape};
     /// # use morok_dtype::DType;
-    /// # use morok_device::DeviceSpec;
+    /// # use morok_dtype::DeviceSpec;
     /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
     /// let shape = Shape::from_iter([SInt::Const(2), SInt::Const(5)]);
     /// let reshaped = UOp::try_reshape(buffer.clone(), &shape).unwrap();

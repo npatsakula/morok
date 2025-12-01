@@ -19,5 +19,5 @@ pub use crate::indexing::IndexSpec;
 pub use crate::sint::SInt;
 
 // Re-exports from dependencies
-pub use morok_device::DeviceSpec;
+pub use morok_dtype::DeviceSpec;
 pub use morok_dtype::DType;

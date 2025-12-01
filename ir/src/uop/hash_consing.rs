@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 use crate::op::Op;
 use crate::types::*;
 use crate::uop::core::UOp;
-use morok_device::DeviceSpec;
+use morok_dtype::DeviceSpec;
 use morok_dtype::DType;
 
 // Thread-local counter for unique identifiers.

@@ -4,43 +4,27 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 
+pub use morok_dtype::DeviceSpec;
+
 use crate::allocator::{Allocator, CpuAllocator, LruAllocator};
 use crate::error::{InvalidDeviceSnafu, Result};
 
-/// Device specification parsed from a device string.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DeviceSpec {
-    Cpu,
-    Cuda { device_id: usize },
-    Metal { device_id: usize },
-    WebGpu,
-}
-
-impl DeviceSpec {
-    /// Get maximum buffer count for this device.
-    ///
-    /// Returns None if the device has no buffer limit (effectively unlimited).
-    ///
-    /// Known limits:
-    /// - Metal: 31 buffers (Apple Silicon hardware limit)
-    /// - WebGPU: 8 buffers (WebGPU specification limit)
-    /// - CPU/CUDA: None (no practical limit)
-    pub fn max_buffers(&self) -> Option<usize> {
-        match self {
-            DeviceSpec::Cpu => None,
-            DeviceSpec::Cuda { .. } => None, // 128+ buffers, effectively unlimited
-            DeviceSpec::Metal { .. } => Some(31),
-            DeviceSpec::WebGpu => Some(8),
-        }
-    }
-
+/// Extension trait for DeviceSpec to add parsing functionality.
+///
+/// This is in the device crate because parsing depends on feature flags
+/// and error types that are device-specific.
+pub trait DeviceSpecExt {
     /// Parse a device string into a DeviceSpec.
     ///
     /// Examples:
     /// - "CPU" -> DeviceSpec::Cpu
     /// - "CUDA:0" -> DeviceSpec::Cuda { device_id: 0 }
     /// - "cuda" -> DeviceSpec::Cuda { device_id: 0 } (default to device 0)
-    pub fn parse(s: &str) -> Result<Self> {
+    fn parse(s: &str) -> Result<DeviceSpec>;
+}
+
+impl DeviceSpecExt for DeviceSpec {
+    fn parse(s: &str) -> Result<Self> {
         let s = s.to_uppercase();
         let parts: Vec<&str> = s.split(':').collect();
 
@@ -55,30 +39,38 @@ impl DeviceSpec {
                 };
                 Ok(DeviceSpec::Cuda { device_id })
             }
-            #[cfg(feature = "metal")]
-            "METAL" => {
-                let _device_id = if parts.len() > 1 {
+            #[cfg(not(feature = "cuda"))]
+            "CUDA" | "GPU" => {
+                let device_id = if parts.len() > 1 {
                     parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
                 } else {
                     0
                 };
-                unimplemented!("Metal device support - to be implemented")
+                Ok(DeviceSpec::Cuda { device_id })
+            }
+            #[cfg(feature = "metal")]
+            "METAL" => {
+                let device_id = if parts.len() > 1 {
+                    parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
+                } else {
+                    0
+                };
+                Ok(DeviceSpec::Metal { device_id })
+            }
+            #[cfg(not(feature = "metal"))]
+            "METAL" => {
+                let device_id = if parts.len() > 1 {
+                    parts[1].parse().map_err(|_| crate::error::Error::InvalidDevice { device: s.to_string() })?
+                } else {
+                    0
+                };
+                Ok(DeviceSpec::Metal { device_id })
             }
             #[cfg(feature = "webgpu")]
-            "WEBGPU" => {
-                unimplemented!("WebGPU device support - to be implemented")
-            }
+            "WEBGPU" => Ok(DeviceSpec::WebGpu),
+            #[cfg(not(feature = "webgpu"))]
+            "WEBGPU" => Ok(DeviceSpec::WebGpu),
             _ => InvalidDeviceSnafu { device: s }.fail(),
-        }
-    }
-
-    /// Canonicalize the device spec to a standard string representation.
-    pub fn canonicalize(&self) -> String {
-        match self {
-            DeviceSpec::Cpu => "CPU".to_string(),
-            DeviceSpec::Cuda { device_id } => format!("CUDA:{}", device_id),
-            DeviceSpec::Metal { .. } => unimplemented!("Metal device support - to be implemented"),
-            DeviceSpec::WebGpu => unimplemented!("WebGPU device support - to be implemented"),
         }
     }
 }
@@ -118,7 +110,7 @@ impl DeviceRegistry {
 
     /// Get a device by parsing a device string.
     pub fn get_device(&self, device: &str) -> Result<Arc<dyn Allocator>> {
-        let spec = DeviceSpec::parse(device)?;
+        let spec = <DeviceSpec as DeviceSpecExt>::parse(device)?;
         self.get(&spec)
     }
 

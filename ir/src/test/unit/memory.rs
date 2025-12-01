@@ -1,6 +1,6 @@
 //! Tests for memory and buffer operations constructors.
 
-use morok_device::DeviceSpec;
+use morok_dtype::DeviceSpec;
 use morok_dtype::DType;
 
 use crate::types::{AddrSpace, AxisId, AxisType, BufferizeOpts};

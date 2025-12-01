@@ -26,6 +26,7 @@
 
 pub mod allocator;
 pub mod buffer;
+pub mod device;
 pub mod error;
 pub mod registry;
 

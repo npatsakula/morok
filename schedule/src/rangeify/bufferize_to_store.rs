@@ -110,8 +110,8 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
             UOp::define_local(local_id, ptr_dtype)
         };
 
-        // Track the buffer in context for later reference
-        ctx.map_buffer(bufferize_op.clone(), buffer.clone());
+        // DON'T track buffer here - handle_after will do it later
+        // Following Tinygrad's architecture: ctx.map is populated by handle_after pattern
 
         buffer
     };
@@ -132,14 +132,27 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
 
     // Wrap STORE in END operation with all ranges
     // END references the computation (STORE) and closes all the ranges
-    let mut result = if !ranges.is_empty() { UOp::end(store.clone(), ranges.clone()) } else { store };
+    let mut do_store = if !ranges.is_empty() { UOp::end(store.clone(), ranges.clone()) } else { store };
 
     // For local buffers, add BARRIER for synchronization
     // This ensures all threads in a workgroup have completed their stores
     // before any thread proceeds to read from the local buffer
     if opts.addrspace == AddrSpace::Local {
-        result = UOp::barrier(result, SmallVec::new());
+        do_store = UOp::barrier(do_store, SmallVec::new());
     }
+
+    // Following Tinygrad: return buffer.after(do_store)
+    // This creates the AFTER operation for dependency tracking
+    let result = UOp::after(buffer.clone(), SmallVec::from_elem(do_store, 1));
+
+    // Track the mapping: BUFFERIZE → AFTER
+    // This is critical for output buffers to be included in kernel sources.
+    // For input buffers, debuf pattern maps BUFFER → BUFFER (identity).
+    // For output buffers (BUFFERIZE), we map BUFFERIZE → AFTER here.
+    //
+    // Based on Tinygrad: ctx.map[buffer] = buffer.after(do_store)
+    // where buffer is the DEFINE_GLOBAL created for the BUFFERIZE output.
+    ctx.map_buffer(bufferize_op.clone(), result.clone());
 
     Some(result)
 }

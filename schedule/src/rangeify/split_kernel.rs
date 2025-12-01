@@ -248,18 +248,139 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // This is necessary because input buffers (LOADs) also become DEFINE_GLOBAL
     // via the debuf pattern, and we need to include them in kernel sources.
     //
+    // IMPORTANT: Sort by internal ID to match LLVM renderer ordering.
+    // The renderer sorts buffers by DEFINE_GLOBAL/DEFINE_LOCAL internal ID,
+    // so we must collect sources in the same order to ensure kernel function
+    // parameters match the runtime buffer array.
+    //
     // Based on Tinygrad's split_store (schedule/rangeify.py:510-512).
     let mut sources: SmallVec<[Rc<UOp>; 4]> = SmallVec::new();
 
     // Collect all DEFINE_GLOBAL and DEFINE_LOCAL from the transformed AST
-    // These are the kernel's buffer arguments (both inputs and outputs)
-    for node in ast.toposort() {
-        match node.op() {
-            Op::DefineGlobal(_) | Op::DefineLocal(_) => {
-                sources.push(node);
-            }
-            _ => {}
+    // We need these to determine the ordering for function parameters.
+    let mut define_nodes: Vec<Rc<UOp>> = ast.toposort()
+        .into_iter()
+        .filter(|node| matches!(node.op(), Op::DefineGlobal(_) | Op::DefineLocal(_)))
+        .collect();
+
+    // Print AST in Tinygrad style
+    morok_ir::uop::debug::print_ast(&ast, "KERNEL AST", 2);
+
+    // Sort by internal ID to match renderer ordering (see codegen/src/llvm/renderer.rs:collect_buffers)
+    define_nodes.sort_by_key(|b| match b.op() {
+        Op::DefineGlobal(id) => *id as u64,
+        Op::DefineLocal(id) => (*id as u64) + (1u64 << 32), // Offset locals after globals
+        _ => unreachable!("filtered to only DefineGlobal/DefineLocal above"),
+    });
+
+    // Now find the original BUFFER UOps from ctx.buffer_map that map to these DEFINE_GLOBAL/LOCAL
+    // The kernel sources should contain the original BUFFER UOps, not the DEFINE_GLOBAL.
+    // This allows buffer lookup to use the original BUFFER UOp IDs.
+    //
+    // Based on Tinygrad's approach: kernel.arg.append((ctx.map[x.arg], x))
+    // where ctx.map[x.arg] is the original BUFFER UOp.
+
+    // DEBUG: Print buffer_map contents
+    eprintln!("SPLIT_KERNEL buffer_map has {} entries", ctx.buffer_map.len());
+    let map_vec: Vec<_> = ctx.buffer_map.iter().collect();
+    eprintln!("SPLIT_KERNEL About to print {} map entries", map_vec.len());
+    for (i, (key, value)) in map_vec.iter().enumerate() {
+        let key_name = match key.0.op() {
+            Op::Buffer { .. } => "BUFFER",
+            Op::Bufferize { .. } => "BUFFERIZE",
+            _ => "OTHER",
+        };
+        let value_name = match value.op() {
+            Op::DefineGlobal(id) => format!("DEFINE_GLOBAL({})", id),
+            _ => "OTHER".to_string(),
+        };
+        eprintln!("SPLIT_KERNEL map[{}]: {} id={} -> {} id={}", i, key_name, key.0.id, value_name, value.id);
+    }
+    eprintln!("SPLIT_KERNEL Done printing map");
+
+    // Following Tinygrad: kernel.src = ctx.map.values() + ctx.vars.keys()
+    // BUT we need to unwrap AFTER operations to get the actual DEFINE_GLOBAL/BUFFER.
+    // For outputs: ctx.map[BUFFERIZE] = AFTER(DEFINE_GLOBAL, ...)
+    // For inputs: ctx.map[BUFFER] = BUFFER
+    let mut buffer_sources: Vec<Rc<UOp>> = Vec::new();
+
+    for value in ctx.buffer_map.values() {
+        // Unwrap AFTER to get the actual buffer (DEFINE_GLOBAL/DEFINE_LOCAL)
+        let actual_buffer = match value.op() {
+            Op::After { passthrough, .. } => passthrough.clone(),
+            _ => value.clone(),
+        };
+        buffer_sources.push(actual_buffer);
+    }
+
+    eprintln!("SPLIT_KERNEL: Using {} buffer_map values as buffer sources", buffer_sources.len());
+    for (i, src) in buffer_sources.iter().enumerate() {
+        match src.op() {
+            Op::Buffer { .. } => eprintln!("  [{}] BUFFER uop_id={}", i, src.id),
+            Op::DefineGlobal(id) => eprintln!("  [{}] DEFINE_GLOBAL({}), uop_id={}", i, id, src.id),
+            Op::DefineLocal(id) => eprintln!("  [{}] DEFINE_LOCAL({}), uop_id={}", i, id, src.id),
+            _ => eprintln!("  [{}] {:?} uop_id={}", i, src.op(), src.id),
         }
+    }
+
+    // DEBUG: Print buffer sources ordering for verification
+    eprintln!("SPLIT_KERNEL buffer sources order:");
+    for (i, (node, define)) in buffer_sources.iter().zip(define_nodes.iter()).enumerate() {
+        let node_op_name = match node.op() {
+            Op::Buffer { .. } => "BUFFER",
+            Op::DefineGlobal(_) => "DEFINE_GLOBAL",
+            Op::DefineLocal(_) => "DEFINE_LOCAL",
+            Op::Bufferize { .. } => "BUFFERIZE",
+            _ => "OTHER",
+        };
+        let define_op_name = match define.op() {
+            Op::DefineGlobal(id) => format!("DEFINE_GLOBAL({})", id),
+            Op::DefineLocal(id) => format!("DEFINE_LOCAL({})", id),
+            _ => "OTHER".to_string(),
+        };
+        eprintln!("  [{}] {} uop_id={} -> {} uop_id={}", i, node_op_name, node.id, define_op_name, define.id);
+    }
+
+    // Add sorted buffer sources
+    for node in buffer_sources {
+        sources.push(node);
+    }
+
+    // Collect all DEFINE_VAR nodes from the transformed AST
+    // These become function parameters for OUTER range iteration values.
+    // DEFINE_VAR nodes are created by renumber_range for OUTER ranges.
+    let mut var_sources: Vec<Rc<UOp>> = ast.toposort()
+        .into_iter()
+        .filter(|node| matches!(node.op(), Op::DefineVar { .. }))
+        .collect();
+
+    // Sort variables by name for deterministic ordering
+    var_sources.sort_by(|a, b| {
+        let name_a = match a.op() {
+            Op::DefineVar { name, .. } => name,
+            _ => unreachable!("filtered to only DefineVar above"),
+        };
+        let name_b = match b.op() {
+            Op::DefineVar { name, .. } => name,
+            _ => unreachable!("filtered to only DefineVar above"),
+        };
+        name_a.cmp(name_b)
+    });
+
+    // DEBUG: Print variable sources ordering for verification
+    eprintln!("SPLIT_KERNEL variable sources order:");
+    for (i, node) in var_sources.iter().enumerate() {
+        match node.op() {
+            Op::DefineVar { name, min_val, max_val } => {
+                eprintln!("  [{}] DEFINE_VAR(name='{}', min={}, max={}), uop_id={}", i, name, min_val, max_val, node.id);
+            }
+            _ => eprintln!("  [{}] {:?}, uop_id={}", i, node.op(), node.id),
+        }
+    }
+
+    // Add sorted variable sources after buffers
+    for node in var_sources {
+        sources.push(node);
     }
 
     // Add all variables from context (BIND tracking)

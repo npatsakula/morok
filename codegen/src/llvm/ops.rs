@@ -98,6 +98,21 @@ pub fn codegen_uop<'ctx>(
                 what: format!("DefineGlobal/Local UOp {} should be in ValueMap as function parameter", uop.id),
             });
         }
+        Op::DefineVar { .. } => {
+            // DEFINE_VAR should already be in ValueMap as a function parameter.
+            // Variables are registered by the renderer before codegen starts.
+            return Err(crate::Error::Missing {
+                what: format!("DefineVar UOp {} should be in ValueMap as function parameter", uop.id),
+            });
+        }
+        Op::Bind { var, .. } => {
+            // BIND evaluates to its variable value (the variable parameter).
+            // The variable should already be in ValueMap as a function parameter.
+            let var_value = values
+                .get(var.id)
+                .ok_or_else(|| crate::Error::Missing { what: format!("BIND variable {} not in ValueMap", var.id) })?;
+            Some(var_value)
+        }
         Op::Sink { sources } => {
             // SINK is a graph termination marker - evaluate all sources for side effects
             // (like STORE), but doesn't produce a value itself.
@@ -109,6 +124,7 @@ pub fn codegen_uop<'ctx>(
         Op::Index { buffer, indices, gate: None } => {
             // INDEX computes pointer arithmetic: buffer + sum(index * stride)
             // For now, handle single-index case (common for 1D buffers)
+            eprintln!("CODEGEN INDEX uop_id={}, buffer op={:?}", uop.id, buffer.op());
             let buffer_ptr = codegen_uop(buffer, context, module, builder, values)?
                 .ok_or_else(|| crate::Error::Missing { what: "buffer pointer for index".to_string() })?;
 
@@ -849,6 +865,134 @@ fn codegen_unary<'ctx>(
             let suffix = get_type_suffix(result_dtype)?;
             call_intrinsic(&format!("llvm.cos.{}", suffix), &[src], "cos", module, builder)
         }
+        UnaryOp::Tan => {
+            // tan(x) = sin(x) / cos(x)
+            let suffix = get_type_suffix(result_dtype)?;
+            let sin_val = call_intrinsic(&format!("llvm.sin.{}", suffix), &[src], "sin", module, builder)?;
+            let cos_val = call_intrinsic(&format!("llvm.cos.{}", suffix), &[src], "cos", module, builder)?;
+            Ok(builder
+                .build_float_div(sin_val.into_float_value(), cos_val.into_float_value(), "tan")
+                .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_div: {}", e) })?
+                .into())
+        }
+        UnaryOp::Reciprocal => {
+            // 1.0 / x
+            let one = src.into_float_value().get_type().const_float(1.0);
+            Ok(builder
+                .build_float_div(one, src.into_float_value(), "recip")
+                .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_div: {}", e) })?
+                .into())
+        }
+        UnaryOp::Trunc => {
+            if is_float {
+                let suffix = get_type_suffix(result_dtype)?;
+                call_intrinsic(&format!("llvm.trunc.{}", suffix), &[src], "trunc", module, builder)
+            } else {
+                // No-op for integers (already truncated)
+                Ok(src)
+            }
+        }
+        UnaryOp::Floor => {
+            let suffix = get_type_suffix(result_dtype)?;
+            call_intrinsic(&format!("llvm.floor.{}", suffix), &[src], "floor", module, builder)
+        }
+        UnaryOp::Ceil => {
+            let suffix = get_type_suffix(result_dtype)?;
+            call_intrinsic(&format!("llvm.ceil.{}", suffix), &[src], "ceil", module, builder)
+        }
+        UnaryOp::Round => {
+            let suffix = get_type_suffix(result_dtype)?;
+            call_intrinsic(&format!("llvm.round.{}", suffix), &[src], "round", module, builder)
+        }
+        UnaryOp::Sign => {
+            // sign(x) = (x > 0) - (x < 0)
+            // Returns: -1 for negative, 0 for zero, 1 for positive
+            if is_float {
+                let float_val = src.into_float_value();
+                let zero = float_val.get_type().const_zero();
+
+                // x > 0
+                let is_pos = builder
+                    .build_float_compare(FloatPredicate::OGT, float_val, zero, "is_pos")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_compare: {}", e) })?;
+
+                // x < 0
+                let is_neg = builder
+                    .build_float_compare(FloatPredicate::OLT, float_val, zero, "is_neg")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_compare: {}", e) })?;
+
+                // Cast bools to float
+                let one = float_val.get_type().const_float(1.0);
+                let pos_val = builder
+                    .build_select(is_pos, one, zero, "pos_val")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_select: {}", e) })?;
+                let neg_val = builder
+                    .build_select(is_neg, one, zero, "neg_val")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_select: {}", e) })?;
+
+                // pos_val - neg_val
+                Ok(builder
+                    .build_float_sub(pos_val.into_float_value(), neg_val.into_float_value(), "sign")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_sub: {}", e) })?
+                    .into())
+            } else {
+                let int_val = src.into_int_value();
+                let zero = int_val.get_type().const_zero();
+                let one = int_val.get_type().const_int(1, false);
+                let neg_one = int_val.get_type().const_int((-1_i64) as u64, true);
+
+                // x > 0
+                let is_pos = builder
+                    .build_int_compare(IntPredicate::SGT, int_val, zero, "is_pos")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?;
+
+                // x < 0
+                let is_neg = builder
+                    .build_int_compare(IntPredicate::SLT, int_val, zero, "is_neg")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?;
+
+                // Select: is_pos ? 1 : 0
+                let pos_val = builder
+                    .build_select(is_pos, one, zero, "pos_val")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_select: {}", e) })?;
+
+                // Select: is_neg ? -1 : 0
+                let neg_val = builder
+                    .build_select(is_neg, neg_one, zero, "neg_val")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_select: {}", e) })?;
+
+                // pos_val + neg_val (one is 0, other is 0, 1, or -1)
+                Ok(builder
+                    .build_int_add(pos_val.into_int_value(), neg_val.into_int_value(), "sign")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_add: {}", e) })?
+                    .into())
+            }
+        }
+        UnaryOp::Erf => {
+            // Call external erf() from libm
+            // We'll use a simpler approach: declare and call the function
+            let float_type = src.into_float_value().get_type();
+            let fn_type = float_type.fn_type(&[float_type.into()], false);
+            let fn_val = module.add_function("erf", fn_type, None);
+            let call_site = builder
+                .build_call(fn_val, &[src.into()], "erf")
+                .map_err(|e| crate::Error::LlvmError { reason: format!("build_call: {}", e) })?;
+            Ok(extract_value(call_site))
+        }
+        UnaryOp::Square => {
+            // x * x
+            if is_float {
+                Ok(builder
+                    .build_float_mul(src.into_float_value(), src.into_float_value(), "square")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_mul: {}", e) })?
+                    .into())
+            } else {
+                Ok(builder
+                    .build_int_mul(src.into_int_value(), src.into_int_value(), "square")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_mul: {}", e) })?
+                    .into())
+            }
+        }
         _ => {
             ensure!(false, UnsupportedOpSnafu { op: format!("{:?}", op) });
             unreachable!()
@@ -1001,6 +1145,61 @@ fn codegen_binary<'ctx>(
             } else {
                 Ok(builder
                     .build_int_compare(IntPredicate::EQ, lhs.into_int_value(), rhs.into_int_value(), "eq")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?
+                    .into())
+            }
+        }
+        BinaryOp::Le => {
+            if is_float {
+                Ok(builder
+                    .build_float_compare(FloatPredicate::OLE, lhs.into_float_value(), rhs.into_float_value(), "le")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_compare: {}", e) })?
+                    .into())
+            } else {
+                let pred = if is_signed { IntPredicate::SLE } else { IntPredicate::ULE };
+                Ok(builder
+                    .build_int_compare(pred, lhs.into_int_value(), rhs.into_int_value(), "le")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?
+                    .into())
+            }
+        }
+        BinaryOp::Gt => {
+            if is_float {
+                Ok(builder
+                    .build_float_compare(FloatPredicate::OGT, lhs.into_float_value(), rhs.into_float_value(), "gt")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_compare: {}", e) })?
+                    .into())
+            } else {
+                let pred = if is_signed { IntPredicate::SGT } else { IntPredicate::UGT };
+                Ok(builder
+                    .build_int_compare(pred, lhs.into_int_value(), rhs.into_int_value(), "gt")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?
+                    .into())
+            }
+        }
+        BinaryOp::Ge => {
+            if is_float {
+                Ok(builder
+                    .build_float_compare(FloatPredicate::OGE, lhs.into_float_value(), rhs.into_float_value(), "ge")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_compare: {}", e) })?
+                    .into())
+            } else {
+                let pred = if is_signed { IntPredicate::SGE } else { IntPredicate::UGE };
+                Ok(builder
+                    .build_int_compare(pred, lhs.into_int_value(), rhs.into_int_value(), "ge")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?
+                    .into())
+            }
+        }
+        BinaryOp::Ne => {
+            if is_float {
+                Ok(builder
+                    .build_float_compare(FloatPredicate::ONE, lhs.into_float_value(), rhs.into_float_value(), "ne")
+                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_float_compare: {}", e) })?
+                    .into())
+            } else {
+                Ok(builder
+                    .build_int_compare(IntPredicate::NE, lhs.into_int_value(), rhs.into_int_value(), "ne")
                     .map_err(|e| crate::Error::LlvmError { reason: format!("build_int_compare: {}", e) })?
                     .into())
             }

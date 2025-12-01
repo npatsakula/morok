@@ -4,6 +4,62 @@ pub mod ext;
 #[cfg(any(test, feature = "proptest"))]
 pub mod test;
 
+/// Device specification parsed from a device string.
+///
+/// This enum represents different compute devices that can execute kernels.
+/// It's used throughout the compilation pipeline for device selection and
+/// kernel caching.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DeviceSpec {
+    /// CPU device (single-threaded or multi-threaded execution)
+    Cpu,
+    /// CUDA GPU device with specific device ID
+    Cuda { device_id: usize },
+    /// Metal GPU device (Apple Silicon) with specific device ID
+    Metal { device_id: usize },
+    /// WebGPU device (browser or native WebGPU)
+    WebGpu,
+}
+
+impl DeviceSpec {
+    /// Canonicalize the device spec to a standard string representation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use morok_dtype::DeviceSpec;
+    ///
+    /// assert_eq!(DeviceSpec::Cpu.canonicalize(), "CPU");
+    /// assert_eq!(DeviceSpec::Cuda { device_id: 0 }.canonicalize(), "CUDA:0");
+    /// assert_eq!(DeviceSpec::Cuda { device_id: 1 }.canonicalize(), "CUDA:1");
+    /// ```
+    pub fn canonicalize(&self) -> String {
+        match self {
+            DeviceSpec::Cpu => "CPU".to_string(),
+            DeviceSpec::Cuda { device_id } => format!("CUDA:{}", device_id),
+            DeviceSpec::Metal { device_id } => format!("Metal:{}", device_id),
+            DeviceSpec::WebGpu => "WebGPU".to_string(),
+        }
+    }
+
+    /// Get maximum buffer count for this device.
+    ///
+    /// Returns None if the device has no buffer limit (effectively unlimited).
+    ///
+    /// Known limits:
+    /// - Metal: 31 buffers (Apple Silicon hardware limit)
+    /// - WebGPU: 8 buffers (WebGPU specification limit)
+    /// - CPU/CUDA: None (no practical limit)
+    pub fn max_buffers(&self) -> Option<usize> {
+        match self {
+            DeviceSpec::Cpu => None,
+            DeviceSpec::Cuda { .. } => None, // 128+ buffers, effectively unlimited
+            DeviceSpec::Metal { .. } => Some(31),
+            DeviceSpec::WebGpu => Some(8),
+        }
+    }
+}
+
 /// Address space for pointer types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -336,4 +392,55 @@ impl DType {
     pub const Float64: Self = Self::Scalar(ScalarDType::Float64);
     pub const Void: Self = Self::Scalar(ScalarDType::Void);
     pub const Index: Self = Self::Scalar(ScalarDType::Index);
+}
+
+/// Trait for types that have an associated DType.
+///
+/// This trait is used for type-safe tensor data extraction (e.g., to_ndarray<T>()).
+pub trait HasDType: Clone + Default {
+    const DTYPE: DType;
+}
+
+impl HasDType for f32 {
+    const DTYPE: DType = DType::Float32;
+}
+
+impl HasDType for f64 {
+    const DTYPE: DType = DType::Float64;
+}
+
+impl HasDType for i8 {
+    const DTYPE: DType = DType::Int8;
+}
+
+impl HasDType for i16 {
+    const DTYPE: DType = DType::Int16;
+}
+
+impl HasDType for i32 {
+    const DTYPE: DType = DType::Int32;
+}
+
+impl HasDType for i64 {
+    const DTYPE: DType = DType::Int64;
+}
+
+impl HasDType for u8 {
+    const DTYPE: DType = DType::UInt8;
+}
+
+impl HasDType for u16 {
+    const DTYPE: DType = DType::UInt16;
+}
+
+impl HasDType for u32 {
+    const DTYPE: DType = DType::UInt32;
+}
+
+impl HasDType for u64 {
+    const DTYPE: DType = DType::UInt64;
+}
+
+impl HasDType for bool {
+    const DTYPE: DType = DType::Bool;
 }

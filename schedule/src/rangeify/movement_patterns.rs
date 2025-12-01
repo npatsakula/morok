@@ -56,16 +56,25 @@ use crate::rangeify::helpers::apply_movement_op;
 /// // Result: buffer.index([r0, 0, r2]) - broadcast dimension becomes 0
 /// ```
 pub fn movement_op_patterns() -> PatternMatcher {
-    // Pattern: INDEX(movement_op) → movement_op.src[0].INDEX(apply_movement_op(indices))
+    // Pattern 1: INDEX(movement_op) → movement_op.src[0].INDEX(apply_movement_op(indices))
     //
     // Matches: INDEX(buffer, indices...)
     //   where buffer is a movement op (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)
     //
     // Transform: buffer.src[0].INDEX(transformed_indices)
     //   where transformed_indices = apply_movement_op(buffer.op, buffer.src[0].shape, indices)
+    //
+    // Pattern 2: INDEX(INDEX(buffer, idx1), idx2) → INDEX(buffer, idx1) when idx1 == idx2
+    //
+    // This handles the case where nested INDEX operations use the same index,
+    // which happens when RESHAPE is a no-op and we've already indexed once.
     crate::patterns! {
         Index { buffer: mop, indices, gate } if mop.op().is_movement() => {
             transform_movement_through_index(mop, &indices, &gate)
+        }
+        Index { buffer: inner_idx, indices, gate: None }
+            if matches!(inner_idx.op(), morok_ir::Op::Index { .. }) => {
+            flatten_nested_index(inner_idx, &indices)
         }
     }
 }
@@ -92,4 +101,24 @@ fn transform_movement_through_index(
     };
 
     result.ok()
+}
+
+/// Flatten nested INDEX operations: INDEX(INDEX(buffer, idx1), idx2) → INDEX(buffer, idx1)
+///
+/// When both INDEX operations use the same single index (common after no-op RESHAPE),
+/// we can just use the inner INDEX directly.
+fn flatten_nested_index(
+    inner_idx: &Rc<UOp>,
+    outer_indices: &smallvec::SmallVec<[Rc<UOp>; 4]>,
+) -> Option<Rc<UOp>> {
+    if let morok_ir::Op::Index { buffer: _inner_buffer, indices: inner_indices, gate: None } = inner_idx.op() {
+        // If both use the same single index, just return the inner INDEX
+        if inner_indices.len() == 1 && outer_indices.len() == 1 {
+            if inner_indices[0].id == outer_indices[0].id {
+                // Same index - use inner INDEX directly
+                return Some(inner_idx.clone());
+            }
+        }
+    }
+    None
 }

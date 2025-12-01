@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 
 use crate::types::*;
 use crate::uop::UOp;
-use morok_device::DeviceSpec;
+use morok_dtype::DeviceSpec;
 use morok_dtype::DType;
 
 /// Operation type with typed operands.

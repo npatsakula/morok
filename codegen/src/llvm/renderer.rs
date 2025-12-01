@@ -16,19 +16,23 @@ pub fn render(uop: &Rc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
     })
 }
 
-/// Collect all buffer parameters from a UOp graph.
+/// Collect all buffer and variable parameters from a UOp graph.
 ///
-/// After rangeify, BUFFER operations have been converted to DEFINE_GLOBAL/DEFINE_LOCAL.
-/// This function collects both patterns:
-/// - Op::Buffer (for non-rangeified graphs)
-/// - Op::DefineGlobal/DefineLocal (for rangeified kernels)
+/// After rangeify, BUFFER operations have been converted to DEFINE_GLOBAL/DEFINE_LOCAL,
+/// and OUTER ranges have been converted to DEFINE_VAR.
 ///
-/// Returns buffers in a consistent order (sorted by UOp ID) for deterministic
-/// function signatures.
-fn collect_buffers(root: &Rc<UOp>) -> Vec<Rc<UOp>> {
-    let mut buffers = Vec::new();
+/// This function collects:
+/// - Buffers: DEFINE_GLOBAL, DEFINE_LOCAL, BUFFER (for non-rangeified graphs)
+/// - Variables: DEFINE_VAR (for OUTER range iteration values)
+///
+/// Returns (buffers, variables) in a consistent order for deterministic function signatures:
+/// - Buffers: DEFINE_GLOBAL sorted by internal ID, DEFINE_LOCAL sorted by internal ID, BUFFER sorted by UOp ID
+/// - Variables: DEFINE_VAR sorted by variable name
+fn collect_buffers_and_vars(root: &Rc<UOp>) -> (Vec<Rc<UOp>>, Vec<Rc<UOp>>) {
     let nodes = root.toposort();
 
+    // Collect buffers
+    let mut buffers = Vec::new();
     for node in &nodes {
         match node.op() {
             Op::Buffer { .. } | Op::DefineGlobal(_) | Op::DefineLocal(_) => {
@@ -38,9 +42,101 @@ fn collect_buffers(root: &Rc<UOp>) -> Vec<Rc<UOp>> {
         }
     }
 
-    // Sort by ID for deterministic ordering
-    buffers.sort_by_key(|b| b.id);
-    buffers
+    // Sort buffers by internal ID (matches split_kernel.rs ordering)
+    buffers.sort_by_key(|b| match b.op() {
+        Op::DefineGlobal(id) => *id as u64,
+        Op::DefineLocal(id) => (*id as u64) + (1u64 << 32), // Offset locals after globals
+        Op::Buffer { .. } => b.id + (1u64 << 48), // Offset input buffers after defines
+        _ => b.id,
+    });
+
+    // Collect variables
+    let mut variables = Vec::new();
+    for node in &nodes {
+        if let Op::DefineVar { .. } = node.op() {
+            variables.push(node.clone());
+        }
+    }
+
+    // Sort variables by name for deterministic ordering (matches split_kernel.rs ordering)
+    variables.sort_by(|a, b| {
+        let name_a = match a.op() {
+            Op::DefineVar { name, .. } => name,
+            _ => unreachable!("filtered to only DefineVar above"),
+        };
+        let name_b = match b.op() {
+            Op::DefineVar { name, .. } => name,
+            _ => unreachable!("filtered to only DefineVar above"),
+        };
+        name_a.cmp(name_b)
+    });
+
+    (buffers, variables)
+}
+
+/// Add parameter attributes to buffer pointer parameters.
+///
+/// Adds `noalias` and `align 32` attributes to buffer parameters only.
+/// These attributes help LLVM optimize memory accesses by:
+/// - `noalias`: Indicates buffers don't overlap, enabling vectorization
+/// - `align 32`: Specifies 32-byte alignment for SIMD operations
+///
+/// Variable parameters (i64) don't get these attributes.
+///
+/// Based on Tinygrad's LLVM renderer (tinygrad/renderer/llvmir.py).
+fn add_buffer_param_attributes<'ctx>(
+    function: inkwell::values::FunctionValue<'ctx>,
+    buffer_count: u32,
+    context: &'ctx Context,
+) {
+    use inkwell::attributes::AttributeLoc;
+
+    // Only add attributes to buffer parameters (not variable parameters)
+    for i in 0..buffer_count {
+        // Add noalias attribute (buffers don't alias)
+        let noalias_attr_id = inkwell::attributes::Attribute::get_named_enum_kind_id("noalias");
+        let noalias = context.create_enum_attribute(noalias_attr_id, 0);
+        function.add_attribute(AttributeLoc::Param(i), noalias);
+
+        // Add alignment attribute (32-byte aligned for SIMD)
+        let align_attr_id = inkwell::attributes::Attribute::get_named_enum_kind_id("align");
+        let align = context.create_enum_attribute(align_attr_id, 32);
+        function.add_attribute(AttributeLoc::Param(i), align);
+    }
+}
+
+/// Add function attributes to kernel function.
+///
+/// Adds critical function attributes for correctness and performance:
+/// - `alwaysinline`: Always inline this function
+/// - `nounwind`: Function doesn't throw exceptions
+/// - `no-trapping-math`: Allows aggressive float optimizations
+/// - `no-builtins`: Don't replace with builtin implementations
+///
+/// Based on Tinygrad's LLVM renderer (tinygrad/renderer/llvmir.py).
+fn add_kernel_function_attributes<'ctx>(
+    function: inkwell::values::FunctionValue<'ctx>,
+    context: &'ctx Context,
+) {
+    use inkwell::attributes::AttributeLoc;
+
+    // nounwind - function doesn't throw exceptions
+    let nounwind_id = inkwell::attributes::Attribute::get_named_enum_kind_id("nounwind");
+    let nounwind = context.create_enum_attribute(nounwind_id, 0);
+    function.add_attribute(AttributeLoc::Function, nounwind);
+
+    // alwaysinline - always inline this function
+    let alwaysinline_id = inkwell::attributes::Attribute::get_named_enum_kind_id("alwaysinline");
+    let alwaysinline = context.create_enum_attribute(alwaysinline_id, 0);
+    function.add_attribute(AttributeLoc::Function, alwaysinline);
+
+    // no-trapping-math - allows aggressive float optimizations
+    let no_trap_math = context.create_string_attribute("no-trapping-math", "true");
+    function.add_attribute(AttributeLoc::Function, no_trap_math);
+
+    // no-builtins - don't replace with builtin implementations
+    let no_builtins = context.create_string_attribute("no-builtins", "");
+    function.add_attribute(AttributeLoc::Function, no_builtins);
 }
 
 /// LLVM IR code generator for CPU execution using inkwell.
@@ -71,26 +167,78 @@ impl<'ctx> LlvmRenderer<'ctx> {
         let module = self.context.create_module(name);
         let builder = self.context.create_builder();
 
-        // Collect all buffers from the graph
-        let buffers = collect_buffers(uop);
+        // Collect all buffers and variables from the graph
+        let (buffers, variables) = collect_buffers_and_vars(uop);
 
-        // Create kernel function signature: void kernel(ptr %buf0, ptr %buf1, ...)
+        // DEBUG: Print buffer ordering for verification
+        eprintln!("RENDERER buffer order for {}:", name);
+        for (i, buf) in buffers.iter().enumerate() {
+            match buf.op() {
+                Op::DefineGlobal(id) => eprintln!("  [{}] DEFINE_GLOBAL(id={}), uop_id={}", i, id, buf.id),
+                Op::DefineLocal(id) => eprintln!("  [{}] DEFINE_LOCAL(id={}), uop_id={}", i, id, buf.id),
+                Op::Buffer { .. } => eprintln!("  [{}] BUFFER, uop_id={}", i, buf.id),
+                _ => eprintln!("  [{}] {:?}, uop_id={}", i, buf.op(), buf.id),
+            }
+        }
+
+        // DEBUG: Print variable ordering for verification
+        eprintln!("RENDERER variable order for {}:", name);
+        for (i, var) in variables.iter().enumerate() {
+            match var.op() {
+                Op::DefineVar { name, min_val, max_val } => {
+                    eprintln!("  [{}] DEFINE_VAR(name='{}', min={}, max={}), uop_id={}", i, name, min_val, max_val, var.id);
+                }
+                _ => eprintln!("  [{}] {:?}, uop_id={}", i, var.op(), var.id),
+            }
+        }
+
+        // Create kernel function signature: void kernel(ptr %buf0, ptr %buf1, ..., i64 %var0, i64 %var1, ...)
         let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
-        let param_types: Vec<_> = buffers.iter().map(|_| ptr_type.into()).collect();
+        let i64_type = self.context.i64_type();
+
+        let mut param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
+
+        // Add buffer pointer parameters
+        for _ in &buffers {
+            param_types.push(ptr_type.into());
+        }
+
+        // Add variable i64 parameters
+        for _ in &variables {
+            param_types.push(i64_type.into());
+        }
+
         let fn_type = self.context.void_type().fn_type(&param_types, false);
         let kernel_name = format!("{}_impl", name);
         let kernel_function = module.add_function(&kernel_name, fn_type, None);
+
+        // Add LLVM attributes to buffer parameters only (not variables)
+        add_buffer_param_attributes(kernel_function, buffers.len() as u32, self.context);
+        add_kernel_function_attributes(kernel_function, self.context);
 
         // Create entry block for kernel
         let entry_block = self.context.append_basic_block(kernel_function, "entry");
         builder.position_at_end(entry_block);
 
-        // Create ValueMap and populate with buffer parameters
+        // Create ValueMap and populate with buffer and variable parameters
         let mut values = ValueMap::new();
+
+        // Add buffer parameters
         for (i, buffer_uop) in buffers.iter().enumerate() {
             let param = kernel_function.get_nth_param(i as u32).unwrap();
             param.set_name(&format!("buf{}", i));
             values.insert(buffer_uop.id, param);
+        }
+
+        // Add variable parameters (after buffers)
+        let buffer_count = buffers.len();
+        for (i, var_uop) in variables.iter().enumerate() {
+            let param_idx = (buffer_count + i) as u32;
+            let param = kernel_function.get_nth_param(param_idx).unwrap();
+            if let Op::DefineVar { name, .. } = var_uop.op() {
+                param.set_name(name);
+            }
+            values.insert(var_uop.id, param);
         }
 
         // Walk the UOp graph in topological order and generate code
@@ -103,9 +251,17 @@ impl<'ctx> LlvmRenderer<'ctx> {
         // Return void
         builder.build_return(None).map_err(|e| crate::Error::LlvmError { reason: format!("build_return: {}", e) })?;
 
-        // Create bootstrap function: void kernel_bootstrap(ptr %args)
-        // This unpacks the array of pointers and calls the kernel
-        let bootstrap_fn_type = self.context.void_type().fn_type(&[ptr_type.into()], false);
+        // Create bootstrap function: void kernel_bootstrap(ptr %args, i64 %var0, i64 %var1, ...)
+        // This unpacks the array of buffer pointers and forwards both buffers and variables to the kernel
+        let mut bootstrap_param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
+        bootstrap_param_types.push(ptr_type.into()); // buffer array pointer
+
+        // Add variable parameters
+        for _ in &variables {
+            bootstrap_param_types.push(i64_type.into());
+        }
+
+        let bootstrap_fn_type = self.context.void_type().fn_type(&bootstrap_param_types, false);
         let bootstrap_function = module.add_function(name, bootstrap_fn_type, None);
 
         let bootstrap_entry = self.context.append_basic_block(bootstrap_function, "entry");
@@ -115,7 +271,7 @@ impl<'ctx> LlvmRenderer<'ctx> {
         args_array.set_name("args");
 
         // Extract each buffer pointer from the array
-        let mut buffer_ptrs = Vec::new();
+        let mut kernel_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
         for i in 0..buffers.len() {
             // GEP to get pointer to args[i]
             let index = self.context.i64_type().const_int(i as u64, false);
@@ -130,12 +286,24 @@ impl<'ctx> LlvmRenderer<'ctx> {
                 .build_load(ptr_type, ptr_to_ptr, &format!("arg{}", i))
                 .map_err(|e| crate::Error::LlvmError { reason: format!("build_load for arg {}: {}", i, e) })?;
 
-            buffer_ptrs.push(buffer_ptr.into());
+            kernel_args.push(buffer_ptr.into());
         }
 
-        // Call the kernel with unpacked arguments
+        // Add variable parameters from bootstrap function parameters
+        for i in 0..variables.len() {
+            let param_idx = (1 + i) as u32; // +1 because first param is buffer array
+            let var_param = bootstrap_function.get_nth_param(param_idx).unwrap();
+            if i < variables.len() {
+                if let Op::DefineVar { name, .. } = variables[i].op() {
+                    var_param.set_name(name);
+                }
+            }
+            kernel_args.push(var_param.into());
+        }
+
+        // Call the kernel with unpacked buffer pointers and variable values
         builder
-            .build_call(kernel_function, &buffer_ptrs, "")
+            .build_call(kernel_function, &kernel_args, "")
             .map_err(|e| crate::Error::LlvmError { reason: format!("build_call kernel: {}", e) })?;
 
         // Return void
@@ -147,6 +315,10 @@ impl<'ctx> LlvmRenderer<'ctx> {
         if let Err(err) = module.verify() {
             return Err(crate::Error::LlvmError { reason: format!("Module verification failed: {}", err) });
         }
+
+        // DEBUG: Print LLVM IR to verify STORE operations and attributes
+        eprintln!("LLVM IR for {}:", name);
+        module.print_to_stderr();
 
         Ok(module)
     }

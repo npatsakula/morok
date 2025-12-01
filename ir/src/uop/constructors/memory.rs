@@ -9,7 +9,7 @@
 
 use std::rc::Rc;
 
-use morok_device::DeviceSpec;
+use morok_dtype::DeviceSpec;
 use morok_dtype::DType;
 use smallvec::SmallVec;
 use snafu::ensure;

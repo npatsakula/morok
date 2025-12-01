@@ -69,7 +69,7 @@ use super::{bufferize_to_store::bufferize_to_store, kernel_context::KernelContex
 /// // Output graph with KERNEL ops:
 /// // KERNEL([buffers, vars], SINK(STORE(...)))
 /// ```
-pub fn run_kernel_split_pipeline(root: Rc<UOp>) -> Rc<UOp> {
+pub fn run_kernel_split_pipeline(root: Rc<UOp>) -> (Rc<UOp>, KernelContext) {
     let mut ctx = KernelContext::new();
 
     // **STAGE 1: BUFFERIZE → STORE Conversion**
@@ -87,7 +87,10 @@ pub fn run_kernel_split_pipeline(root: Rc<UOp>) -> Rc<UOp> {
     //
     // Uses buffer_map from Stage 1 to populate KERNEL sources.
 
-    transform_bottom_up(&after_bufferize, &mut ctx, split_store)
+    let result = transform_bottom_up(&after_bufferize, &mut ctx, split_store);
+
+    // Return both the transformed graph and the context (containing buffer_map)
+    (result, ctx)
 }
 
 /// Apply a transformation function bottom-up on a graph.

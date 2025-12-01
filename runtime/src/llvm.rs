@@ -85,18 +85,100 @@ impl LlvmKernel {
 }
 
 impl CompiledKernel for LlvmKernel {
-    unsafe fn execute(&self, buffers: &[*mut u8]) -> Result<()> {
-        type BootstrapFn = unsafe extern "C" fn(*const *mut u8);
+    unsafe fn execute_with_vars(
+        &self,
+        buffers: &[*mut u8],
+        vars: &std::collections::HashMap<String, i64>,
+    ) -> Result<()> {
+        // Get the function from the module to inspect its signature
+        let function = self
+            .module
+            .get_function(&self.entry_point)
+            .ok_or_else(|| crate::Error::FunctionNotFound { name: self.entry_point.clone() })?;
 
-        let func: JitFunction<BootstrapFn> = unsafe {
-            self.execution_engine
-                .get_function(&self.entry_point)
-                .map_err(|e| crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) })?
-        };
+        let param_count = function.count_params() as usize;
+        let var_count = param_count.saturating_sub(1); // Subtract 1 for buffer array pointer
 
-        unsafe {
-            func.call(buffers.as_ptr());
+        if var_count == 0 {
+            // No variables - use simple bootstrap function
+            type BootstrapFn0 = unsafe extern "C" fn(*const *mut u8);
+            let func: JitFunction<BootstrapFn0> = unsafe {
+                self.execution_engine.get_function(&self.entry_point).map_err(|e| {
+                    crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) }
+                })?
+            };
+            unsafe {
+                func.call(buffers.as_ptr());
+            }
+        } else {
+            // Extract variable values in parameter order
+            // The function parameters are ordered: (ptr %args, i64 %var0, i64 %var1, ...)
+            // We need to match variable names from the HashMap to parameter positions
+            let mut var_values = Vec::new();
+            eprintln!("EXECUTE_WITH_VARS: param_count={}, var_count={}", param_count, var_count);
+            eprintln!("EXECUTE_WITH_VARS: vars={:?}", vars);
+            for i in 1..param_count {
+                if let Some(param) = function.get_nth_param(i as u32) {
+                    let param_name = param
+                        .get_name()
+                        .to_str()
+                        .map_err(|_| crate::Error::JitCompilation {
+                            reason: format!("Invalid UTF-8 in parameter name at index {}", i),
+                        })?;
+
+                    eprintln!("EXECUTE_WITH_VARS: param[{}] name='{}', looking up in vars", i, param_name);
+                    let value = vars.get(param_name).copied().ok_or_else(|| crate::Error::JitCompilation {
+                        reason: format!("Missing variable value for parameter '{}'", param_name),
+                    })?;
+
+                    eprintln!("EXECUTE_WITH_VARS: param[{}] name='{}', value={}", i, param_name, value);
+                    var_values.push(value);
+                }
+            }
+
+            // Call with the appropriate number of variable parameters
+            match var_count {
+                1 => {
+                    type BootstrapFn1 = unsafe extern "C" fn(*const *mut u8, i64);
+                    let func: JitFunction<BootstrapFn1> = unsafe {
+                        self.execution_engine.get_function(&self.entry_point).map_err(|e| {
+                            crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) }
+                        })?
+                    };
+                    unsafe {
+                        func.call(buffers.as_ptr(), var_values[0]);
+                    }
+                }
+                2 => {
+                    type BootstrapFn2 = unsafe extern "C" fn(*const *mut u8, i64, i64);
+                    let func: JitFunction<BootstrapFn2> = unsafe {
+                        self.execution_engine.get_function(&self.entry_point).map_err(|e| {
+                            crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) }
+                        })?
+                    };
+                    unsafe {
+                        func.call(buffers.as_ptr(), var_values[0], var_values[1]);
+                    }
+                }
+                3 => {
+                    type BootstrapFn3 = unsafe extern "C" fn(*const *mut u8, i64, i64, i64);
+                    let func: JitFunction<BootstrapFn3> = unsafe {
+                        self.execution_engine.get_function(&self.entry_point).map_err(|e| {
+                            crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) }
+                        })?
+                    };
+                    unsafe {
+                        func.call(buffers.as_ptr(), var_values[0], var_values[1], var_values[2]);
+                    }
+                }
+                _ => {
+                    return Err(crate::Error::JitCompilation {
+                        reason: format!("Unsupported number of variables: {}. Max supported is 3.", var_count),
+                    });
+                }
+            }
         }
+
         Ok(())
     }
 

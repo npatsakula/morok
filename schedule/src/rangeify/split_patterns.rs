@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use morok_dtype::AddrSpace;
-use morok_ir::{AxisId, ConstValue, DType, Op, UOp};
+use morok_ir::{AxisId, AxisType, ConstValue, DType, Op, UOp};
 
 use super::kernel_context::KernelContext;
 use crate::pattern::matcher::PatternMatcher;
@@ -35,10 +35,10 @@ pub fn debuf(buf: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
         UOp::define_local(local_id, ptr_dtype)
     };
 
-    // Track the buffer in context (maps original buffer to itself for later reference)
-    // Note: In Tinygrad this is ctx.map[buf] = buf, meaning the original buffer
-    // becomes part of the kernel's argument list.
-    ctx.map_buffer(buf.clone(), buf.clone());
+    // Track the buffer mapping: BUFFER → DEFINE_GLOBAL
+    // This is needed so kernel sources include the DEFINE_GLOBAL for each input buffer.
+    // Output buffers are tracked via bufferize_to_store as BUFFERIZE → AFTER(DEFINE_GLOBAL).
+    ctx.map_buffer(buf.clone(), replacement.clone());
 
     Some(replacement)
 }
@@ -106,10 +106,39 @@ pub fn renumber_range(range: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp
         AxisId::Renumbered(_) => return None,
     }
 
-    // Assign sequential id starting from 0
-    let new_axis_id = AxisId::Renumbered(ctx.next_range());
+    // OUTER ranges: convert to BIND(DEFINE_VAR, RANGE) pattern
+    // This follows Tinygrad's approach where OUTER ranges become variables
+    // that are passed as kernel parameters at runtime.
+    if axis_type == AxisType::Outer {
+        // Create variable name based on axis_id
+        let var_name = format!("range_{}", old_axis_id.value());
 
-    // Create new RANGE with renumbered axis_id
+        // Extract max value from range end (vmax = end - 1)
+        let vmax = match end.vmax() {
+            morok_ir::ConstValue::Int(v) => *v - 1,
+            morok_ir::ConstValue::UInt(v) => (*v - 1) as i64,
+            _ => {
+                // If we can't extract a concrete vmax, fall back to simple renumbering
+                // This handles symbolic/dynamic ranges
+                let new_axis_id = AxisId::Renumbered(ctx.next_range());
+                let new_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);
+                return Some(new_range);
+            }
+        };
+
+        // Create DEFINE_VAR with min=0, max=vmax
+        let var = UOp::define_var(var_name, 0, vmax);
+
+        // Create renumbered RANGE
+        let new_axis_id = AxisId::Renumbered(ctx.next_range());
+        let renumbered_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);
+
+        // Wrap in BIND(var, range)
+        return Some(UOp::bind(var, renumbered_range));
+    }
+
+    // Non-OUTER ranges: just renumber axis_id
+    let new_axis_id = AxisId::Renumbered(ctx.next_range());
     let new_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);
 
     Some(new_range)

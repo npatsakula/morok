@@ -183,6 +183,27 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
         // RESHAPE: Complex multi-dimensional index arithmetic
         Op::Reshape { new_shape, .. } => {
             let new_shape_vals = extract_shape_from_uop(new_shape);
+
+            // Optimization: If in_shape == new_shape, this is a no-op reshape
+            // Just pass through the ranges directly without modulo arithmetic
+            if in_shape.len() == new_shape_vals.len() {
+                let mut is_same_shape = true;
+                for (in_dim, out_dim) in in_shape.iter().zip(new_shape_vals.iter()) {
+                    match (in_dim, out_dim) {
+                        (SInt::Const(a), SInt::Const(b)) if a == b => continue,
+                        (SInt::Symbolic(a), SInt::Symbolic(b)) if a.id == b.id => continue,
+                        _ => {
+                            is_same_shape = false;
+                            break;
+                        }
+                    }
+                }
+                if is_same_shape {
+                    // No-op reshape: return ranges as-is
+                    return rngs.to_vec();
+                }
+            }
+
             // Step 1: Flatten output indices
             let mut acc = UOp::index_const(1);
             let mut axes_in = Vec::new();

@@ -11,6 +11,8 @@ morok-ir = { path = "../ir" }
 morok-codegen = { path = "../codegen" }
 inkwell = { version = "0.7.1", features = ["llvm21-1"] }
 snafu = "0.8.9"
+parking_lot = "0.12"
+once_cell = "1.19"
 
 [dev-dependencies]
 test-case = "3.3.1"

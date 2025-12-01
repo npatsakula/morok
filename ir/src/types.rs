@@ -6,7 +6,7 @@
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 
-use morok_device::DeviceSpec;
+use morok_dtype::DeviceSpec;
 use morok_dtype::{DType, ScalarDType};
 
 /// Constant value that can be stored in a UOp.

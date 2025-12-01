@@ -43,5 +43,5 @@ pub use types::{
 pub use uop::{IntoUOp, UOp, UOpKey};
 
 // Re-export external types for convenience
-pub use morok_device::DeviceSpec;
+pub use morok_dtype::DeviceSpec;
 pub use morok_dtype::DType;

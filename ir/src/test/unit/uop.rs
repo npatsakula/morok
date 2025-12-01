@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use morok_device::DeviceSpec;
+use morok_dtype::DeviceSpec;
 use morok_dtype::DType;
 
 use crate::{AxisId, ConstValue, Op, UOp}; // ConstValue kept for DType::Index

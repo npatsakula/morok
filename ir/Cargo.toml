@@ -6,7 +6,6 @@ edition.workspace = true
 
 [dependencies]
 morok-dtype = { path = "../dtype" }
-morok-device = { path = "../device" }
 smallvec = { version = "1.15.1", features = [] }
 snafu = "0.8.9"
 itertools = "0.14.0"
