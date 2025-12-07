@@ -271,16 +271,16 @@ pub fn advanced_division_dsl_patterns() -> PatternMatcher {
 /// - (x - c1) - c2 → x - (c1 + c2)
 pub fn alu_folding_dsl_patterns() -> PatternMatcher {
     patterns! {
-        // (x + c1) + c2 → x + (c1 + c2)
-        Add(Add(x, c1 @const(c1_val)), c2 @const(c2_val))
+        // (x + c1) + c2 → x + (c1 + c2) - commutative outer Add
+        Add[Add[x, c1 @const(c1_val)], c2 @const(c2_val)]
           => x.try_add(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
-        // (x * c1) * c2 → x * (c1 * c2)
-        Mul(Mul(x, c1 @const(c1_val)), c2 @const(c2_val))
+        // (x * c1) * c2 → x * (c1 * c2) - commutative outer Mul
+        Mul[Mul[x, c1 @const(c1_val)], c2 @const(c2_val)]
           => x.try_mul(&UOp::const_(c1.dtype(), eval_mul_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
-        // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2) when result is negative
-        Add(Sub(x, c1 @const(c1_val)), c2 @const(c2_val)) => {
+        // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2) - commutative outer Add
+        Add[Sub(x, c1 @const(c1_val)), c2 @const(c2_val)] => {
             let diff_val = eval_sub_typed(c2_val, c1_val, c1.dtype().base())?;
             // Normalize: prefer x - |c| over x + (-c)
             if let ConstValue::Int(v) = diff_val && v < 0 {
@@ -490,23 +490,17 @@ pub fn boolean_dsl_patterns() -> PatternMatcher {
         And[x, Not(y)] if Arc::ptr_eq(x, y) && x.dtype() == DType::Bool
           => Some(UOp::const_(DType::Bool, ConstValue::Bool(false))),
 
-        // true | x → true (both orderings)
-        Or(t @const(t_val), _) if t_val == ConstValue::Bool(true) ~> Arc::clone(t),
-        Or(_, t @const(t_val)) if t_val == ConstValue::Bool(true)
-          => Some(UOp::const_(DType::Bool, ConstValue::Bool(true))),
+        // true | x → true (commutative)
+        Or[t @const(t_val), _] if t_val == ConstValue::Bool(true) ~> Arc::clone(t),
 
-        // false & x → false (both orderings)
-        And(f @const(f_val), _) if f_val == ConstValue::Bool(false) ~> Arc::clone(f),
-        And(_, f @const(f_val)) if f_val == ConstValue::Bool(false)
-          => Some(UOp::const_(DType::Bool, ConstValue::Bool(false))),
+        // false & x → false (commutative)
+        And[f @const(f_val), _] if f_val == ConstValue::Bool(false) ~> Arc::clone(f),
 
-        // true & x → x (identity, both orderings)
-        And(c @const(c_val), x) if c_val == ConstValue::Bool(true) ~> Arc::clone(x),
-        And(x, c @const(c_val)) if c_val == ConstValue::Bool(true) ~> Arc::clone(x),
+        // true & x → x (identity, commutative)
+        And[c @const(c_val), x] if c_val == ConstValue::Bool(true) ~> Arc::clone(x),
 
-        // false | x → x (identity, both orderings)
-        Or(c @const(c_val), x) if c_val == ConstValue::Bool(false) ~> Arc::clone(x),
-        Or(x, c @const(c_val)) if c_val == ConstValue::Bool(false) ~> Arc::clone(x),
+        // false | x → x (identity, commutative)
+        Or[c @const(c_val), x] if c_val == ConstValue::Bool(false) ~> Arc::clone(x),
     }
 }
 

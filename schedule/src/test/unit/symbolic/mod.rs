@@ -1992,7 +1992,6 @@ fn test_lt_negation_flip() {
     }
 }
 
-
 // ===== Phase 3: Division/Modulo Recombination Tests =====
 
 #[test]
@@ -2001,7 +2000,7 @@ fn test_div_mod_recombine() {
     let matcher = symbolic_simple();
     let x = UOp::var("x", DType::Int32, i64::MAX);
     let n = UOp::native_const(4i32);
-    
+
     // Build: x % 4 + (x // 4) * 4
     let mod_part = x.try_mod(&n).unwrap();
     let div_part = x.try_div(&n).unwrap();
@@ -2021,7 +2020,7 @@ fn test_div_mod_recombine_commutative() {
     let matcher = symbolic_simple();
     let x = UOp::var("x", DType::Int32, i64::MAX);
     let n = UOp::native_const(4i32);
-    
+
     // Build: (x // 4) * 4 + x % 4
     let div_part = x.try_div(&n).unwrap();
     let mul_part = div_part.try_mul(&n).unwrap();
@@ -2042,7 +2041,7 @@ fn test_nested_div_const() {
     let a = UOp::var("a", DType::Int32, i64::MAX);
     let c2 = UOp::native_const(2i32);
     let c1 = UOp::native_const(1i32);
-    
+
     // Build: (a // 2 + 1) // 2
     let div_inner = a.try_div(&c2).unwrap();
     let add = div_inner.try_add(&c1).unwrap();
@@ -2050,7 +2049,7 @@ fn test_nested_div_const() {
 
     let result = matcher.rewrite(&div_outer, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
-    
+
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should become (a + 2) // 4
         if let Op::Binary(BinaryOp::Idiv, lhs, rhs) = rewritten.op() {
@@ -2085,7 +2084,7 @@ fn test_nested_div_const_larger() {
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let c4 = UOp::native_const(4i32);
-    
+
     // Build: (a // 3 + 5) // 4
     let div_inner = a.try_div(&c3).unwrap();
     let add = div_inner.try_add(&c5).unwrap();
@@ -2093,7 +2092,7 @@ fn test_nested_div_const_larger() {
 
     let result = matcher.rewrite(&div_outer, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
-    
+
     if let RewriteResult::Rewritten(rewritten) = result {
         if let Op::Binary(BinaryOp::Idiv, lhs, rhs) = rewritten.op() {
             // lhs should be a + 15
@@ -2126,7 +2125,7 @@ fn test_div_mod_recombine_different_n() {
     let x = UOp::var("x", DType::Int32, i64::MAX);
     let n4 = UOp::native_const(4i32);
     let n5 = UOp::native_const(5i32);
-    
+
     // Build: x % 4 + (x // 5) * 4
     let mod_part = x.try_mod(&n4).unwrap();
     let div_part = x.try_div(&n5).unwrap();
@@ -2144,15 +2143,13 @@ fn test_div_mod_property_identity() {
     // This is a quick property spot-check with concrete values
     let x_val = 17i32;
     let n_val = 5i32;
-    
-    let mod_result = x_val % n_val;  // 2
-    let div_result = x_val / n_val;  // 3
-    let recombined = mod_result + div_result * n_val;  // 2 + 15 = 17
-    
+
+    let mod_result = x_val % n_val; // 2
+    let div_result = x_val / n_val; // 3
+    let recombined = mod_result + div_result * n_val; // 2 + 15 = 17
+
     assert_eq!(recombined, x_val);
 }
-
-
 
 // ===== Phase 4: Where/Branch Pattern Tests =====
 
@@ -2164,14 +2161,14 @@ fn test_where_merge_branches() {
     let b = UOp::var("b", DType::Bool, 1);
     let c = UOp::var("c", DType::Int32, i64::MAX);
     let d = UOp::var("d", DType::Int32, i64::MAX);
-    
+
     // Build: where(a, where(b, c, d), d)
     let inner_where = UOp::try_where(b.clone(), c.clone(), d.clone()).unwrap();
     let outer_where = UOp::try_where(a.clone(), inner_where, d.clone()).unwrap();
 
     let result = matcher.rewrite(&outer_where, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
-    
+
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should become where(a & b, c, d)
         if let Op::Ternary(TernaryOp::Where, cond, true_val, false_val) = rewritten.op() {
@@ -2201,7 +2198,7 @@ fn test_where_merge_branches_no_match() {
     let c = UOp::var("c", DType::Int32, i64::MAX);
     let d = UOp::var("d", DType::Int32, i64::MAX);
     let e = UOp::var("e", DType::Int32, i64::MAX);
-    
+
     // Build: where(a, where(b, c, d), e)
     let inner_where = UOp::try_where(b.clone(), c.clone(), d.clone()).unwrap();
     let outer_where = UOp::try_where(a.clone(), inner_where.clone(), e.clone()).unwrap();
@@ -2225,14 +2222,14 @@ fn test_cast_where_push() {
     let s = UOp::var("s", DType::Bool, 1);
     let a = UOp::native_const(1i32);
     let b = UOp::native_const(0i32);
-    
+
     // Build: cast(where(s, a, b), f32)
     let where_op = UOp::try_where(s.clone(), a.clone(), b.clone()).unwrap();
     let cast_where = UOp::cast(where_op, DType::Float32);
 
     let result = matcher.rewrite(&cast_where, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
-    
+
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should become where(s, cast(a, f32), cast(b, f32))
         if let Op::Ternary(TernaryOp::Where, cond, true_val, false_val) = rewritten.op() {
@@ -2246,4 +2243,3 @@ fn test_cast_where_push() {
         }
     }
 }
-
