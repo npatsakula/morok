@@ -89,7 +89,8 @@
             inherit src advisory-db;
           };
 
-          format = treefmt.config.build.check self;
+          rustfmt = crane'.cargoFmt { inherit src; };
+          treefmt = treefmt.config.build.check self;
         };
 
         devShells = rec {
