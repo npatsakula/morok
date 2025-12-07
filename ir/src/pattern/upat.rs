@@ -22,12 +22,99 @@
 
 use std::collections::HashMap;
 use std::mem::discriminant;
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Rem, Shl, Shr, Sub};
 use std::sync::Arc;
 
 use crate::types::BufferizeOpts;
 use crate::{AxisId, AxisType, BinaryOp, ConstValue, ConstValueHash, Op, TernaryOp, UOp, UnaryOp};
 use morok_dtype::DType;
 use smallvec::SmallVec;
+
+// ===== UPat Constructor Macros =====
+
+/// Macro for implementing operator traits on UPat.
+/// Generates Add, Sub, Mul, etc. implementations in a concise form.
+macro_rules! impl_upat_ops {
+    (
+        binary: [ $(($Trait:ident, $method:ident, $op:expr)),* $(,)? ],
+        unary: [ $(($UTrait:ident, $umethod:ident, $uop:expr)),* $(,)? ] $(,)?
+    ) => {
+        $(
+            impl $Trait for UPat {
+                type Output = UPat;
+                fn $method(self, rhs: UPat) -> UPat {
+                    Self::binary_op($op, self, rhs)
+                }
+            }
+        )*
+        $(
+            impl $UTrait for UPat {
+                type Output = UPat;
+                fn $umethod(self) -> UPat {
+                    Self::unary_op($uop, self)
+                }
+            }
+        )*
+    };
+}
+
+/// Macro for single-source operation constructors.
+/// Generates methods like `detach(src)`, `cast(src)`, `reshape(src)`, etc.
+macro_rules! upat_op_single {
+    ($name:ident, $op_expr:expr) => {
+        pub fn $name(src: UPat) -> Self {
+            UPat::Match {
+                op: Some(vec![OpFilter::Discriminant(discriminant(&$op_expr))]),
+                dtype: None,
+                src: Some(SrcPattern::Tuple(vec![src])),
+                arg: None,
+                name: None,
+            }
+        }
+    };
+}
+
+/// Macro for fluent API methods (f_* pattern).
+/// Generates methods like `f_cast(self)`, `f_reshape(self)`, etc.
+macro_rules! upat_fluent {
+    ($name:ident, $op_expr:expr) => {
+        pub fn $name(self) -> Self {
+            UPat::Match {
+                op: Some(vec![OpFilter::Discriminant(discriminant(&$op_expr))]),
+                dtype: None,
+                src: Some(SrcPattern::Tuple(vec![self])),
+                arg: None,
+                name: None,
+            }
+        }
+    };
+}
+
+/// Macro for constant matchers with predicates.
+/// Generates methods like `zero_const("name")`, `one_const("name")`, etc.
+macro_rules! upat_const_pred {
+    ($name:ident, $pred:expr) => {
+        pub fn $name(name: impl Into<String>) -> Self {
+            UPat::Match {
+                op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Const(ConstValueHash(ConstValue::Int(0)))))]),
+                dtype: None,
+                src: None,
+                arg: Some(ArgPattern::Predicate($pred)),
+                name: Some(name.into()),
+            }
+        }
+    };
+}
+
+/// Macro for OR wrapper methods.
+/// Generates methods like `or_casted()`, `or_detach()`, etc.
+macro_rules! upat_or {
+    ($name:ident, $wrapper:ident) => {
+        pub fn $name(self) -> Self {
+            UPat::any(vec![self.clone(), UPat::$wrapper(self)])
+        }
+    };
+}
 
 // ===== Optimized Binding Storage =====
 
@@ -376,99 +463,10 @@ impl UPat {
 
     // ===== Predicate and Constant Helpers =====
 
-    /// Match a zero constant (0 or 0.0) with name binding.
-    ///
-    /// This is a convenience method that matches constants that are zero,
-    /// eliminating the need for manual zero checks in rewrite functions.
-    /// Unlike the exact `Int(0)` match, this uses the `IsZero` predicate
-    /// to match both integer 0 and float 0.0.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: x * 0 → 0
-    /// pattern!(patterns,
-    ///     UPat::var("x") * UPat::zero_const("zero") => |x, zero| {
-    ///         let _unused = x;
-    ///         Some(Rc::clone(zero))
-    ///     }
-    /// );
-    /// ```
-    pub fn zero_const(name: impl Into<String>) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Const(ConstValueHash(ConstValue::Int(0)))))]),
-            dtype: None,
-            src: None,
-            arg: Some(ArgPattern::Predicate(ArgPredicate::IsZero)),
-            name: Some(name.into()),
-        }
-    }
-
-    /// Match a one constant (1 or 1.0) with name binding.
-    ///
-    /// This is a convenience method that matches constants that are one,
-    /// useful for identity folding patterns like `x * 1 => x`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: x * 1 → x
-    /// pattern!(patterns,
-    ///     UPat::var("x") * UPat::one_const("one") => |x, one| {
-    ///         let _unused = one;
-    ///         Some(Rc::clone(x))
-    ///     }
-    /// );
-    /// ```
-    pub fn one_const(name: impl Into<String>) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Const(ConstValueHash(ConstValue::Int(0)))))]),
-            dtype: None,
-            src: None,
-            arg: Some(ArgPattern::Predicate(ArgPredicate::IsOne)),
-            name: Some(name.into()),
-        }
-    }
-
-    /// Match a positive constant with name binding.
-    ///
-    /// # Example
-    /// ```ignore
-    /// pattern!(patterns,
-    ///     UPat::var("x") / UPat::positive_const("n") => |x, n| {
-    ///         // n is guaranteed to be positive
-    ///         Some(optimize_division(x, n))
-    ///     }
-    /// );
-    /// ```
-    pub fn positive_const(name: impl Into<String>) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Const(ConstValueHash(ConstValue::Int(0)))))]),
-            dtype: None,
-            src: None,
-            arg: Some(ArgPattern::Predicate(ArgPredicate::IsPositive)),
-            name: Some(name.into()),
-        }
-    }
-
-    /// Match a non-zero constant with name binding.
-    ///
-    /// # Example
-    /// ```ignore
-    /// pattern!(patterns,
-    ///     UPat::var("x") / UPat::nonzero_const("n") => |x, n| {
-    ///         // n is guaranteed to be non-zero, safe to divide
-    ///         Some(safe_division(x, n))
-    ///     }
-    /// );
-    /// ```
-    pub fn nonzero_const(name: impl Into<String>) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Const(ConstValueHash(ConstValue::Int(0)))))]),
-            dtype: None,
-            src: None,
-            arg: Some(ArgPattern::Predicate(ArgPredicate::IsNonZero)),
-            name: Some(name.into()),
-        }
-    }
+    upat_const_pred!(zero_const, ArgPredicate::IsZero);
+    upat_const_pred!(one_const, ArgPredicate::IsOne);
+    upat_const_pred!(positive_const, ArgPredicate::IsPositive);
+    upat_const_pred!(nonzero_const, ArgPredicate::IsNonZero);
 
     /// Match a specific integer constant value.
     ///
@@ -525,101 +523,14 @@ impl UPat {
 
     // ===== Operation Helpers =====
 
-    /// Match DETACH operation with one source.
-    ///
-    /// DETACH marks gradient boundaries during autodiff.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: DETACH(x) → x
-    /// pattern!(patterns,
-    ///     UPat::detach(UPat::var("x")) => |x| {
-    ///         Some(Rc::clone(x))
-    ///     }
-    /// );
-    /// ```
-    pub fn detach(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Detach {
-                src: UOp::const_(DType::Void, ConstValue::Int(0)),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
+    upat_op_single!(detach, Op::Detach { src: UOp::noop() });
+    upat_op_single!(contiguous_backward, Op::ContiguousBackward { src: UOp::noop() });
+    upat_op_single!(cast, Op::Cast { src: UOp::noop(), dtype: DType::Void });
 
-    /// Match CONTIGUOUS_BACKWARD operation with one source.
-    ///
-    /// CONTIGUOUS_BACKWARD marks backward pass contiguous requirements.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: CONTIGUOUS_BACKWARD(x) → x
-    /// pattern!(patterns,
-    ///     UPat::contiguous_backward(UPat::var("x")) => |x| {
-    ///         Some(Rc::clone(x))
-    ///     }
-    /// );
-    /// ```
-    pub fn contiguous_backward(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::ContiguousBackward {
-                src: UOp::const_(DType::Void, ConstValue::Int(0)),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Match CAST operation with one source.
-    ///
-    /// Optionally specify a name to bind the matched cast operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: CAST(x)
-    /// pattern!(patterns,
-    ///     UPat::cast(UPat::var("x")) => |x| {
-    ///         // Optimize cast
-    ///         Some(optimize_cast(x))
-    ///     }
-    /// );
-    /// ```
-    pub fn cast(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Cast {
-                src: UOp::const_(DType::Void, ConstValue::Int(0)),
-                dtype: DType::Void,
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Match CAST operation with one source and bind to a name.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: CAST(CAST(x)) - double cast
-    /// pattern!(patterns,
-    ///     UPat::cast_named(UPat::cast(UPat::var("x")), "outer") => |x, outer| {
-    ///         // Access both the inner x and outer cast
-    ///         Some(collapse_double_cast(x, outer))
-    ///     }
-    /// );
-    /// ```
+    /// Match CAST operation and bind to name.
     pub fn cast_named(src: UPat, name: impl Into<String>) -> Self {
         UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Cast {
-                src: UOp::const_(DType::Void, ConstValue::Int(0)),
-                dtype: DType::Void,
-            }))]),
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Cast { src: UOp::noop(), dtype: DType::Void }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![src])),
             arg: None,
@@ -629,17 +540,7 @@ impl UPat {
 
     // ===== Kernel Splitting Helpers =====
 
-    /// Match STORE operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: STORE(buffer, index, value)
-    /// pattern!(patterns,
-    ///     UPat::store(UPat::var("buf"), UPat::var("idx"), UPat::var("val")) => |buf, idx, val| {
-    ///         Some(optimize_store(buf, idx, val))
-    ///     }
-    /// );
-    /// ```
+    /// Match STORE operation: `STORE(buffer, index, value)`
     pub fn store(buffer: UPat, index: UPat, value: UPat) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Store {
@@ -654,47 +555,9 @@ impl UPat {
         }
     }
 
-    /// Match END operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: END(range)
-    /// pattern!(patterns,
-    ///     UPat::end(UPat::var("range")) => |range| {
-    ///         Some(handle_end(range))
-    ///     }
-    /// );
-    /// ```
-    pub fn end(computation: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::End {
-                computation: UOp::noop(),
-                ranges: SmallVec::new(),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![computation])),
-            arg: None,
-            name: None,
-        }
-    }
+    upat_op_single!(end, Op::End { computation: UOp::noop(), ranges: SmallVec::new() });
 
     /// Match any END operation regardless of source count.
-    ///
-    /// Use this when END has variable numbers of ranges that shouldn't
-    /// be constrained by the pattern. Access computation and ranges via
-    /// the matched UOp in the rewrite closure.
-    ///
-    /// # Example
-    /// ```ignore
-    /// pattern!(patterns,
-    ///     UPat::end_any().named("end_op") => |end_op: &Arc<UOp>| {
-    ///         if let Op::End { computation, ranges } = end_op.op() {
-    ///             // handle variable ranges
-    ///         }
-    ///         None
-    ///     }
-    /// );
-    /// ```
     pub fn end_any() -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::End {
@@ -702,48 +565,15 @@ impl UPat {
                 ranges: SmallVec::new(),
             }))]),
             dtype: None,
-            src: None, // No source constraint - END has computation + variable ranges
+            src: None,
             arg: None,
             name: None,
         }
     }
 
-    /// Match INDEX operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: INDEX(buffer, indices...)
-    /// pattern!(patterns,
-    ///     UPat::index(UPat::var("buf"), UPat::var("indices")) => |buf, indices| {
-    ///         Some(optimize_index(buf, indices))
-    ///     }
-    /// );
-    /// ```
-    pub fn index(buffer: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Index {
-                buffer: UOp::noop(),
-                indices: SmallVec::new(),
-                gate: None,
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![buffer])),
-            arg: None,
-            name: None,
-        }
-    }
+    upat_op_single!(index, Op::Index { buffer: UOp::noop(), indices: SmallVec::new(), gate: None });
 
-    /// Match LOAD operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: LOAD(buffer, index)
-    /// pattern!(patterns,
-    ///     UPat::load(UPat::var("buf"), UPat::var("idx")) => |buf, idx| {
-    ///         Some(optimize_load(buf, idx))
-    ///     }
-    /// );
-    /// ```
+    /// Match LOAD operation: `LOAD(buffer, index)`
     pub fn load(buffer: UPat, index: UPat) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Load { buffer: UOp::noop(), index: UOp::noop() }))]),
@@ -754,17 +584,7 @@ impl UPat {
         }
     }
 
-    /// Match gated LOAD operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: LOAD_GATED(buffer, index, gate)
-    /// pattern!(patterns,
-    ///     UPat::load_gated(UPat::var("buf"), UPat::var("idx"), UPat::var("gate")) => |buf, idx, gate| {
-    ///         Some(optimize_load_gated(buf, idx, gate))
-    ///     }
-    /// );
-    /// ```
+    /// Match gated LOAD operation: `LOAD_GATED(buffer, index, gate)`
     pub fn load_gated(buffer: UPat, index: UPat, gate: UPat) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::LoadGated {
@@ -779,51 +599,9 @@ impl UPat {
         }
     }
 
-    /// Match REDUCE operation.
-    ///
-    /// Matches any REDUCE operation regardless of reduce_op type.
-    /// To match specific reduce operations, check the op in the closure.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: REDUCE(src, ranges...)
-    /// pattern!(patterns,
-    ///     UPat::reduce(UPat::var("src")) => |src| {
-    ///         Some(optimize_reduce(src))
-    ///     }
-    /// );
-    /// ```
-    pub fn reduce(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reduce {
-                src: UOp::noop(),
-                ranges: SmallVec::new(),
-                reduce_op: crate::ReduceOp::Add,
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
+    upat_op_single!(reduce, Op::Reduce { src: UOp::noop(), ranges: SmallVec::new(), reduce_op: crate::ReduceOp::Add });
 
     /// Match any REDUCE operation regardless of source count.
-    ///
-    /// Use this when REDUCE has variable numbers of ranges that shouldn't
-    /// be constrained by the pattern. Access src, ranges, and reduce_op via
-    /// the matched UOp in the rewrite closure.
-    ///
-    /// # Example
-    /// ```ignore
-    /// pattern!(patterns,
-    ///     UPat::reduce_any().named("reduce_op") => |reduce_op: &Arc<UOp>| {
-    ///         if let Op::Reduce { src, ranges, reduce_op: op } = reduce_op.op() {
-    ///             // handle variable ranges
-    ///         }
-    ///         None
-    ///     }
-    /// );
-    /// ```
     pub fn reduce_any() -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reduce {
@@ -832,187 +610,27 @@ impl UPat {
                 reduce_op: crate::ReduceOp::Add,
             }))]),
             dtype: None,
-            src: None, // No source constraint - REDUCE has src + variable ranges
+            src: None,
             arg: None,
             name: None,
         }
     }
 
-    /// Match BUFFERIZE operation.
-    ///
-    /// Note: This matches any BUFFERIZE regardless of the number of ranges.
-    /// Use specific patterns if you need to match exact range counts.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: BUFFERIZE(compute, ...)
-    /// pattern!(patterns,
-    ///     UPat::var("buf") => |buf| {
-    ///         if matches!(buf.op(), Op::Bufferize { .. }) {
-    ///             Some(convert_bufferize(buf))
-    ///         } else {
-    ///             None
-    ///         }
-    ///     }
-    /// );
-    /// ```
+    /// Match BUFFERIZE operation (simplified - check op type in closure).
     pub fn bufferize_var(name: impl Into<String>) -> Self {
-        UPat::var(name) // Simplified - check op type in pattern closure
+        UPat::var(name)
     }
 
     // ===== Movement Operation Helpers =====
 
-    /// Match RESHAPE operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: RESHAPE(src, new_shape)
-    /// pattern!(patterns,
-    ///     UPat::reshape(UPat::var("src")) => |src| {
-    ///         Some(optimize_reshape(src))
-    ///     }
-    /// );
-    /// ```
-    pub fn reshape(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reshape {
-                src: UOp::noop(),
-                new_shape: UOp::noop(),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Match PERMUTE operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: PERMUTE(src, axes)
-    /// pattern!(patterns,
-    ///     UPat::permute(UPat::var("src")) => |src| {
-    ///         Some(optimize_permute(src))
-    ///     }
-    /// );
-    /// ```
-    pub fn permute(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Permute { src: UOp::noop(), axes: vec![] }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Match EXPAND operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: EXPAND(src, new_shape)
-    /// pattern!(patterns,
-    ///     UPat::expand(UPat::var("src")) => |src| {
-    ///         Some(optimize_expand(src))
-    ///     }
-    /// );
-    /// ```
-    pub fn expand(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Expand {
-                src: UOp::noop(),
-                new_shape: UOp::noop(),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Match PAD operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: PAD(src, begin_pads, end_pads)
-    /// pattern!(patterns,
-    ///     UPat::pad(UPat::var("src")) => |src| {
-    ///         Some(optimize_pad(src))
-    ///     }
-    /// );
-    /// ```
-    pub fn pad(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Pad {
-                src: UOp::noop(),
-                begin_pads: UOp::noop(),
-                end_pads: UOp::noop(),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Match SHRINK operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: SHRINK(src, begins, ends)
-    /// pattern!(patterns,
-    ///     UPat::shrink(UPat::var("src")) => |src| {
-    ///         Some(optimize_shrink(src))
-    ///     }
-    /// );
-    /// ```
-    pub fn shrink(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Shrink {
-                src: UOp::noop(),
-                begins: UOp::noop(),
-                ends: UOp::noop(),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Match FLIP operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: FLIP(src, axes)
-    /// pattern!(patterns,
-    ///     UPat::flip(UPat::var("src")) => |src| {
-    ///         Some(optimize_flip(src))
-    ///     }
-    /// );
-    /// ```
-    pub fn flip(src: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Flip { src: UOp::noop(), axes: vec![] }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![src])),
-            arg: None,
-            name: None,
-        }
-    }
+    upat_op_single!(reshape, Op::Reshape { src: UOp::noop(), new_shape: UOp::noop() });
+    upat_op_single!(permute, Op::Permute { src: UOp::noop(), axes: vec![] });
+    upat_op_single!(expand, Op::Expand { src: UOp::noop(), new_shape: UOp::noop() });
+    upat_op_single!(pad, Op::Pad { src: UOp::noop(), begin_pads: UOp::noop(), end_pads: UOp::noop() });
+    upat_op_single!(shrink, Op::Shrink { src: UOp::noop(), begins: UOp::noop(), ends: UOp::noop() });
+    upat_op_single!(flip, Op::Flip { src: UOp::noop(), axes: vec![] });
 
     /// Match DEFINE_GLOBAL operation with name binding.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: DEFINE_GLOBAL(n)
-    /// pattern!(patterns,
-    ///     UPat::define_global("global") => |global| {
-    ///         Some(use_global(global))
-    ///     }
-    /// );
-    /// ```
     pub fn define_global(name: impl Into<String>) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::DefineGlobal(0)))]),
@@ -1024,16 +642,6 @@ impl UPat {
     }
 
     /// Match DEFINE_LOCAL operation with name binding.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: DEFINE_LOCAL(n)
-    /// pattern!(patterns,
-    ///     UPat::define_local("local") => |local| {
-    ///         Some(use_local(local))
-    ///     }
-    /// );
-    /// ```
     pub fn define_local(name: impl Into<String>) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::DefineLocal(0)))]),
@@ -1044,42 +652,9 @@ impl UPat {
         }
     }
 
-    /// Match RANGE operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: RANGE(end)
-    /// pattern!(patterns,
-    ///     UPat::range(UPat::var("end")) => |end| {
-    ///         Some(optimize_range(end))
-    ///     }
-    /// );
-    /// ```
-    pub fn range(end: UPat) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Range {
-                end: UOp::noop(),
-                axis_id: AxisId::Renumbered(0),
-                axis_type: AxisType::Loop,
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![end])),
-            arg: None,
-            name: None,
-        }
-    }
+    upat_op_single!(range, Op::Range { end: UOp::noop(), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop });
 
-    /// Match BUFFER operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: BUFFER(unique, device)
-    /// pattern!(patterns,
-    ///     UPat::buffer(UPat::var("unique"), UPat::var("device")) => |unique, device| {
-    ///         Some(optimize_buffer(unique, device))
-    ///     }
-    /// );
-    /// ```
+    /// Match BUFFER operation: `BUFFER(unique, device)`
     pub fn buffer(unique: UPat, device: UPat) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Buffer {
@@ -1094,17 +669,7 @@ impl UPat {
         }
     }
 
-    /// Match AFTER operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: AFTER(passthrough, ...)
-    /// pattern!(patterns,
-    ///     UPat::after(UPat::var("pass")) => |pass| {
-    ///         Some(handle_after(pass))
-    ///     }
-    /// );
-    /// ```
+    /// Match AFTER operation with Fork pattern.
     pub fn after(passthrough: UPat) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::After {
@@ -1112,26 +677,13 @@ impl UPat {
                 deps: SmallVec::new(),
             }))]),
             dtype: None,
-            src: Some(SrcPattern::Fork(vec![
-                vec![passthrough.clone()],
-                // Could also match with deps, but keep it simple for now
-            ])),
+            src: Some(SrcPattern::Fork(vec![vec![passthrough.clone()]])),
             arg: None,
             name: None,
         }
     }
 
-    /// Match BIND operation.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: BIND(var, value)
-    /// pattern!(patterns,
-    ///     UPat::bind(UPat::var("var"), UPat::var("value")) => |var, value| {
-    ///         Some(remove_bind(value))  // Unbind returns the value
-    ///     }
-    /// );
-    /// ```
+    /// Match BIND operation: `BIND(var, value)`
     pub fn bind(var: UPat, value: UPat) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Bind { var: UOp::noop(), value: UOp::noop() }))]),
@@ -1144,120 +696,17 @@ impl UPat {
 
     // ===== Fluent API Methods =====
 
-    /// Chain pattern: wraps this pattern as a source of another operation.
-    ///
-    /// This is the Tinygrad `.f()` equivalent. `pattern.f(Op::Foo)` matches
-    /// `Foo(pattern, ...)`.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: BUFFERIZE(CONST(...))
-    /// UPat::cvar("c").f_bufferize()  // Instead of nesting manually
-    /// ```
-    pub fn f_bufferize(self) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Bufferize {
-                compute: UOp::noop(),
-                ranges: SmallVec::new(),
-                opts: BufferizeOpts::local(),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![self])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Chain as INDEX source.
-    pub fn f_index(self) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Index {
-                buffer: UOp::noop(),
-                indices: SmallVec::new(),
-                gate: None,
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![self])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Chain as CAST source.
-    pub fn f_cast(self) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Cast { src: UOp::noop(), dtype: DType::Void }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![self])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Chain as RESHAPE source.
-    pub fn f_reshape(self) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reshape {
-                src: UOp::noop(),
-                new_shape: UOp::noop(),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![self])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Chain as PERMUTE source.
-    pub fn f_permute(self) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Permute { src: UOp::noop(), axes: vec![] }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![self])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Chain as EXPAND source.
-    pub fn f_expand(self) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Expand {
-                src: UOp::noop(),
-                new_shape: UOp::noop(),
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![self])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Chain as REDUCE source.
-    pub fn f_reduce(self) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reduce {
-                src: UOp::noop(),
-                ranges: SmallVec::new(),
-                reduce_op: crate::ReduceOp::Add,
-            }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![self])),
-            arg: None,
-            name: None,
-        }
-    }
-
-    /// Chain as COPY source.
-    pub fn f_copy(self) -> Self {
-        UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Copy { src: UOp::noop(), device: UOp::noop() }))]),
-            dtype: None,
-            src: Some(SrcPattern::Tuple(vec![self])),
-            arg: None,
-            name: None,
-        }
-    }
+    upat_fluent!(
+        f_bufferize,
+        Op::Bufferize { compute: UOp::noop(), ranges: SmallVec::new(), opts: BufferizeOpts::local() }
+    );
+    upat_fluent!(f_index, Op::Index { buffer: UOp::noop(), indices: SmallVec::new(), gate: None });
+    upat_fluent!(f_cast, Op::Cast { src: UOp::noop(), dtype: DType::Void });
+    upat_fluent!(f_reshape, Op::Reshape { src: UOp::noop(), new_shape: UOp::noop() });
+    upat_fluent!(f_permute, Op::Permute { src: UOp::noop(), axes: vec![] });
+    upat_fluent!(f_expand, Op::Expand { src: UOp::noop(), new_shape: UOp::noop() });
+    upat_fluent!(f_reduce, Op::Reduce { src: UOp::noop(), ranges: SmallVec::new(), reduce_op: crate::ReduceOp::Add });
+    upat_fluent!(f_copy, Op::Copy { src: UOp::noop(), device: UOp::noop() });
 
     /// Bind this pattern to a name.
     ///
@@ -1313,63 +762,10 @@ impl UPat {
 
     // ===== OR Convenience Methods =====
 
-    /// Match this pattern OR its casted form.
-    ///
-    /// Useful for patterns that should match both direct values and
-    /// values that have been cast from another type.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: x or CAST(x)
-    /// UPat::var("x").or_casted()
-    /// ```
-    pub fn or_casted(self) -> Self {
-        UPat::any(vec![self.clone(), UPat::cast(self)])
-    }
-
-    /// Match this pattern OR wrapped in AFTER.
-    ///
-    /// AFTER nodes are used for scheduling dependencies. This is useful
-    /// when a pattern should match regardless of whether it has
-    /// scheduling constraints.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: x or AFTER(x, ...)
-    /// UPat::var("x").or_after()
-    /// ```
-    pub fn or_after(self) -> Self {
-        UPat::any(vec![self.clone(), UPat::after(self)])
-    }
-
-    /// Match this pattern OR wrapped in DETACH.
-    ///
-    /// DETACH marks gradient boundaries during autodiff. This is useful
-    /// when a pattern should match regardless of gradient tracking.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: x or DETACH(x)
-    /// UPat::var("x").or_detach()
-    /// ```
-    pub fn or_detach(self) -> Self {
-        UPat::any(vec![self.clone(), UPat::detach(self)])
-    }
-
-    /// Match this pattern OR wrapped in CONTIGUOUS_BACKWARD.
-    ///
-    /// CONTIGUOUS_BACKWARD marks backward pass contiguous requirements.
-    /// This is useful when matching patterns that may or may not have
-    /// contiguous constraints.
-    ///
-    /// # Example
-    /// ```ignore
-    /// // Match: x or CONTIGUOUS_BACKWARD(x)
-    /// UPat::var("x").or_contiguous_backward()
-    /// ```
-    pub fn or_contiguous_backward(self) -> Self {
-        UPat::any(vec![self.clone(), UPat::contiguous_backward(self)])
-    }
+    upat_or!(or_casted, cast);
+    upat_or!(or_after, after);
+    upat_or!(or_detach, detach);
+    upat_or!(or_contiguous_backward, contiguous_backward);
 
     // ===== Operator Overloading Helpers =====
 
@@ -2251,107 +1647,20 @@ impl UPat {
 
 // ===== Operator Trait Implementations =====
 
-use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Rem, Shl, Shr, Sub};
-
-/// Arithmetic operators
-impl Add for UPat {
-    type Output = UPat;
-
-    /// Match addition: `a + b`
-    fn add(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::Add, self, rhs)
-    }
-}
-
-impl Sub for UPat {
-    type Output = UPat;
-
-    /// Match subtraction: `a - b`
-    fn sub(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::Sub, self, rhs)
-    }
-}
-
-impl Mul for UPat {
-    type Output = UPat;
-
-    /// Match multiplication: `a * b`
-    fn mul(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::Mul, self, rhs)
-    }
-}
-
-impl Div for UPat {
-    type Output = UPat;
-
-    /// Match division: `a / b` (float division by default)
-    ///
-    /// For integer division, use `.idiv()` method.
-    fn div(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::Fdiv, self, rhs)
-    }
-}
-
-impl Rem for UPat {
-    type Output = UPat;
-
-    /// Match modulo: `a % b`
-    fn rem(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::Mod, self, rhs)
-    }
-}
-
-impl Neg for UPat {
-    type Output = UPat;
-
-    /// Match negation: `-a`
-    fn neg(self) -> UPat {
-        Self::unary_op(UnaryOp::Neg, self)
-    }
-}
-
-/// Bitwise operators
-impl BitAnd for UPat {
-    type Output = UPat;
-
-    /// Match bitwise AND: `a & b`
-    fn bitand(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::And, self, rhs)
-    }
-}
-
-impl BitOr for UPat {
-    type Output = UPat;
-
-    /// Match bitwise OR: `a | b`
-    fn bitor(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::Or, self, rhs)
-    }
-}
-
-impl BitXor for UPat {
-    type Output = UPat;
-
-    /// Match bitwise XOR: `a ^ b`
-    fn bitxor(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::Xor, self, rhs)
-    }
-}
-
-impl Shl for UPat {
-    type Output = UPat;
-
-    /// Match left shift: `a << b`
-    fn shl(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::Shl, self, rhs)
-    }
-}
-
-impl Shr for UPat {
-    type Output = UPat;
-
-    /// Match right shift: `a >> b`
-    fn shr(self, rhs: UPat) -> UPat {
-        Self::binary_op(BinaryOp::Shr, self, rhs)
-    }
+impl_upat_ops! {
+    binary: [
+        (Add, add, BinaryOp::Add),
+        (Sub, sub, BinaryOp::Sub),
+        (Mul, mul, BinaryOp::Mul),
+        (Div, div, BinaryOp::Fdiv),
+        (Rem, rem, BinaryOp::Mod),
+        (BitAnd, bitand, BinaryOp::And),
+        (BitOr, bitor, BinaryOp::Or),
+        (BitXor, bitxor, BinaryOp::Xor),
+        (Shl, shl, BinaryOp::Shl),
+        (Shr, shr, BinaryOp::Shr),
+    ],
+    unary: [
+        (Neg, neg, UnaryOp::Neg),
+    ],
 }

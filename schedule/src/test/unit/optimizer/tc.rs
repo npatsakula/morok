@@ -1,6 +1,6 @@
 //! Tests for tensor core (TC) optimization.
 
-use crate::optimizer::{Renderer, Scheduler, opts::tc::*};
+use crate::optimizer::{Renderer, Scheduler, tc::*};
 use morok_ir::{AxisId, AxisType, ReduceOp, UOp};
 
 // ===== Matching Tests =====
@@ -157,9 +157,10 @@ fn test_select_tensor_core_out_of_bounds() {
 
 #[test]
 fn test_base_shape() {
-    use crate::optimizer::renderer::{SwizzleAxis, TensorCore};
+    use crate::optimizer::renderer::{CUDA_81616, SwizzleAxis};
+    use morok_dtype::DType;
 
-    let tc = TensorCore::cuda_81616_f16_f32();
+    let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     let shape = swizzle::base_shape(&tc);
 
     // Should have: u0, l0, l0, l1, l1, l1, u1, r0, r1, r2, r3
@@ -180,9 +181,10 @@ fn test_base_shape() {
 
 #[test]
 fn test_permutes_for_shape() {
-    use crate::optimizer::renderer::TensorCore;
+    use crate::optimizer::renderer::CUDA_81616;
+    use morok_dtype::DType;
 
-    let tc = TensorCore::cuda_81616_f16_f32();
+    let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     let shape = swizzle::base_shape(&tc);
     let (perm_a, perm_b) = swizzle::permutes_for_shape(&tc, &shape);
 
@@ -199,9 +201,10 @@ fn test_permutes_for_shape() {
 
 #[test]
 fn test_reduce_axes_count() {
-    use crate::optimizer::renderer::TensorCore;
+    use crate::optimizer::renderer::CUDA_81616;
+    use morok_dtype::DType;
 
-    let tc = TensorCore::cuda_81616_f16_f32();
+    let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     let count = swizzle::get_reduce_axes_count(&tc);
 
     // K=16 -> log2(16) = 4 reduce axes

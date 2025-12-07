@@ -49,9 +49,11 @@ pub mod opts;
 pub mod renderer;
 pub mod scheduler;
 pub mod strategy;
+pub mod tc;
 pub mod types;
 
 // Re-exports
+pub use heuristics::hand_coded_optimizations;
 pub use kernel_info::KernelInfo;
 pub use opts::apply_opt;
 pub use renderer::{Renderer, TcOpt, TensorCore};
@@ -60,9 +62,6 @@ pub use scheduler::Scheduler;
 pub use scheduler::clear_kernel_name_counts;
 pub use strategy::OptStrategy;
 pub use types::{AxisType, Opt, OptArg, OptOps};
-
-// Re-export heuristics entry point
-pub use heuristics::hand_coded_optimizations;
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::patterns::symbolic;
