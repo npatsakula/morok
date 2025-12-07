@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_ir::{AxisId, AxisType, ConstValue, Op, SInt, UOp, UOpKey};
+use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
 
 use super::helpers;
 
@@ -169,8 +169,28 @@ fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
     )
 }
 
+/// Check if a UOp represents constant true (handles unsimplified OR expressions).
+///
+/// This is needed because `try_or_op(const(true), const(true))` creates
+/// `Binary(Or, true, true)` without simplification, not `Const(true)`.
+fn is_const_true(uop: &Arc<UOp>) -> bool {
+    match uop.op() {
+        Op::Const(cv) => matches!(cv.0, ConstValue::Bool(true)),
+        // Handle unsimplified true | true = true
+        Op::Binary(BinaryOp::Or, a, b) => is_const_true(a) && is_const_true(b),
+        _ => false,
+    }
+}
+
 /// Merge ranges from multiple consumers. Creates new ranges and marks realization when needed.
-fn merge_consumer_ranges(
+///
+/// This function handles multi-consumer scenarios where different consumers may have
+/// different ranges for the same dimension. It:
+/// 1. Merges compatible ranges (same indices) by OR-ing validity masks
+/// 2. Creates new ranges for incompatible dimensions and marks them for realization
+///
+/// Returns the merged ranges and updates the context's realize_map if needed.
+pub(crate) fn merge_consumer_ranges(
     uop: &Arc<UOp>,
     consumer_rngs: &[Vec<Arc<UOp>>],
     ctx: &mut IndexingContext,
@@ -205,6 +225,13 @@ fn merge_consumer_ranges(
             continue;
         }
 
+        // FAST PATH: If all ranges are pointer-equal, return original unchanged
+        // This preserves Arc identity for tests like test_merge_consumer_ranges_identical_1d
+        if dim_ranges.iter().skip(1).all(|r| Arc::ptr_eq(&dim_ranges[0], r)) {
+            out_rngs.push(Arc::clone(&dim_ranges[0]));
+            continue;
+        }
+
         // Extract index and valid components
         let indices: Vec<_> = dim_ranges.iter().map(|r| r.get_idx()).collect();
         let valids: Vec<_> = dim_ranges.iter().map(|r| r.get_valid()).collect();
@@ -222,9 +249,8 @@ fn merge_consumer_ranges(
             };
 
             // Check if merged valid is constant true (no validity check needed)
-            let merged_range = if let Op::Const(cv) = merged_valid.op()
-                && let ConstValue::Bool(true) = cv.0
-            {
+            // Uses is_const_true to handle unsimplified true | true expressions
+            let merged_range = if is_const_true(&merged_valid) {
                 // Always valid - use idx directly
                 merged_idx
             } else {

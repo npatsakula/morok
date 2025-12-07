@@ -15,6 +15,7 @@ use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 
 use crate::pattern::matcher::RewriteResult;
+use crate::rangeify::IndexingContext;
 use crate::rangeify::patterns;
 
 // ===== early_rewrites Pattern Tests =====
@@ -372,17 +373,114 @@ fn test_buffer_removal_no_match_expensive_compute() {
     assert!(matches!(result, RewriteResult::NoMatch), "Should not remove BUFFERIZE from expensive op");
 }
 
-// ===== Stub Pattern Tests =====
+// ===== Movement Op Removal Tests =====
 
 #[test]
-fn test_movement_op_removal_is_stub() {
+fn test_movement_op_removal_no_match_without_ranges() {
     let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
 
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let result = matcher.rewrite(&x, &mut ());
+    // Create a PERMUTE operation (a movement op)
+    let src = UOp::define_global(0, DType::Float32);
+    let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
 
-    // Should return NoMatch since it's a stub
-    assert!(matches!(result, RewriteResult::NoMatch), "movement_op_removal is a stub");
+    // Without ranges assigned, should NOT remove
+    let result = matcher.rewrite(&permute, &mut ctx);
+    assert!(matches!(result, RewriteResult::NoMatch), "Should NOT remove movement op without ranges assigned");
+}
+
+#[test]
+fn test_movement_op_removal_removes_with_ranges() {
+    let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
+
+    // Create a PERMUTE operation
+    let src = UOp::define_global(0, DType::Float32);
+    let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
+
+    // Assign ranges to the movement op (simulating transformation has been applied)
+    let range = UOp::new(
+        Op::Range { end: UOp::index_const(5), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        DType::Index,
+    );
+    ctx.set_ranges(&permute, vec![range.clone()], vec![range.clone()]);
+
+    // With ranges assigned, SHOULD remove and return source
+    let result = matcher.rewrite(&permute, &mut ctx);
+    match result {
+        RewriteResult::Rewritten(result) => {
+            assert!(std::sync::Arc::ptr_eq(&result, &src), "Should return the source operand");
+        }
+        _ => panic!("Expected movement op to be removed when ranges are assigned"),
+    }
+}
+
+#[test]
+fn test_movement_op_removal_reshape() {
+    let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
+
+    // Create a RESHAPE operation
+    let src = UOp::define_global(0, DType::Float32);
+    let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
+    let reshape = UOp::new(Op::Reshape { src: src.clone(), new_shape }, DType::Float32);
+
+    // Assign ranges
+    let range = UOp::new(
+        Op::Range { end: UOp::index_const(4), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        DType::Index,
+    );
+    ctx.set_ranges(&reshape, vec![range.clone()], vec![range.clone()]);
+
+    // Should remove and return source
+    let result = matcher.rewrite(&reshape, &mut ctx);
+    match result {
+        RewriteResult::Rewritten(result) => {
+            assert!(std::sync::Arc::ptr_eq(&result, &src), "RESHAPE should be removed");
+        }
+        _ => panic!("Expected RESHAPE to be removed when ranges are assigned"),
+    }
+}
+
+#[test]
+fn test_movement_op_removal_expand() {
+    let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
+
+    // Create an EXPAND operation
+    let src = UOp::define_global(0, DType::Float32);
+    let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
+    let expand = UOp::new(Op::Expand { src: src.clone(), new_shape }, DType::Float32);
+
+    // Assign ranges
+    let range = UOp::new(
+        Op::Range { end: UOp::index_const(4), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        DType::Index,
+    );
+    ctx.set_ranges(&expand, vec![range.clone()], vec![range.clone()]);
+
+    // Should remove and return source
+    let result = matcher.rewrite(&expand, &mut ctx);
+    match result {
+        RewriteResult::Rewritten(result) => {
+            assert!(std::sync::Arc::ptr_eq(&result, &src), "EXPAND should be removed");
+        }
+        _ => panic!("Expected EXPAND to be removed when ranges are assigned"),
+    }
+}
+
+#[test]
+fn test_movement_op_removal_non_movement_op() {
+    let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
+
+    // Create a non-movement op (NEG)
+    let src = UOp::define_global(0, DType::Float32);
+    let neg = src.neg();
+
+    // Should NOT match non-movement ops
+    let result = matcher.rewrite(&neg, &mut ctx);
+    assert!(matches!(result, RewriteResult::NoMatch), "Should not match non-movement ops");
 }
 
 // ===== Integration Tests =====

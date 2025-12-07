@@ -28,11 +28,17 @@ use super::transform::{should_remove_movement_op, transform_sources_with_bufferi
 /// 1. They have ranges assigned (been processed), OR
 /// 2. Their source is already INDEX (transformation applied)
 ///
-/// This will be populated with actual patterns in Step 2.3.
 /// The logic uses `should_remove_movement_op()` from the transform module.
-pub fn movement_op_removal() -> PatternMatcher {
-    // Placeholder - patterns will be added in Step 2.3 with context support
-    PatternMatcher::new(vec![])
+///
+/// Note: Requires IndexingContext because movement op removal depends on
+/// range_map state to determine if transformation has been applied.
+pub fn movement_op_removal() -> PatternMatcher<IndexingContext> {
+    crate::patterns! {
+        @context IndexingContext;
+        // Remove movement ops after transformation has been applied
+        // Matches: RESHAPE, PERMUTE, EXPAND, SHRINK, FLIP, PAD
+        x if x.op().is_movement() => remove_movement_op(x, ctx),
+    }
 }
 
 /// Pattern matcher for early cleanup rewrites during scheduling.

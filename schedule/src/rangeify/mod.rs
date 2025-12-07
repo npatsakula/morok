@@ -31,6 +31,9 @@ pub use buffer_cost::{
 pub use buffer_limits::{buffer_limit_patterns, extract_device_from_graph, is_elementwise};
 pub use context::RangeifyContext;
 pub use indexing::{IndexingContext, run_rangeify};
+// merge_consumer_ranges is re-exported for testing in test::unit::rangeify::range_merging
+#[cfg(test)]
+pub(crate) use indexing::merge_consumer_ranges;
 pub use kernel_context::{KernelContext, KernelDependency};
 pub use pipeline::run_kernel_split_pipeline;
 pub use transform::rangeify;

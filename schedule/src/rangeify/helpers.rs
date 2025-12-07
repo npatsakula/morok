@@ -419,10 +419,16 @@ pub fn uop_equal(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
         return cv_a.0 == cv_b.0;
     }
 
-    // For Range operations, we need to compare all fields including axis_id
-    // which is not included in sources(). Use simplified equality:
-    // just compare sources since that's what matters for range merging.
-    // Different axis_ids with same end value are still compatible ranges.
+    // Special case: Range operations need axis_id comparison
+    // Different axis_ids represent different iteration spaces, even with same bounds
+    // This is important for range merging - different ranges trigger realization
+    if let (
+        Op::Range { end: end_a, axis_id: id_a, axis_type: type_a },
+        Op::Range { end: end_b, axis_id: id_b, axis_type: type_b },
+    ) = (a.op(), b.op())
+    {
+        return id_a == id_b && type_a == type_b && uop_equal(end_a, end_b);
+    }
 
     // Check sources recursively
     let a_srcs = a.op().sources();
