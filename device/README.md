@@ -27,6 +27,7 @@ dst.copy_from(&src)?;
 ## Features
 
 **Supported:**
+
 - Lazy buffer allocation via `OnceLock`
 - Zero-copy buffer views with offset tracking
 - LRU allocation cache (per-size pooling)
@@ -43,6 +44,7 @@ dst.copy_from(&src)?;
 | Zero-init | `memset_zeros` | Stream-based |
 
 **Planned:**
+
 - Metal allocator
 - WebGPU allocator
 - Multi-GPU peer access
@@ -53,7 +55,7 @@ dst.copy_from(&src)?;
 
 All combinations supported:
 
-|  | CPU | CudaDevice | CudaUnified |
+| | CPU | CudaDevice | CudaUnified |
 |--|-----|------------|-------------|
 | **CPU** | slice | H2D | slice |
 | **CudaDevice** | D2H | D2D | D2D |

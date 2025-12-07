@@ -15,12 +15,14 @@ let ptr = f32_type.ptr(AddrSpace::Global);
 ## Features
 
 **Supported:**
+
 - Scalar types: Bool, Int8-64, UInt8-64, Float16/32/64, BFloat16, Index
 - Vector types with configurable width
 - Pointer types with address spaces (Global, Local, Register)
 - Image types for texture-based computation
 
 **Planned:**
+
 - FP8 variants (e4m3, e5m2)
 - Type promotion lattice
 

@@ -25,6 +25,7 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 ## Features
 
 **Supported:**
+
 - Declarative `patterns!` DSL for rewrite rules
 - Fixed-point graph rewriting
 - RANGEIFY: movement ops -> BUFFERIZE+INDEX -> kernels
@@ -32,6 +33,7 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 - Heuristic-based kernel optimization
 
 **Planned:**
+
 - BEAM search optimization
 - Multi-device kernel splitting
 
@@ -41,11 +43,11 @@ let optimized = graph_rewrite(&matcher, graph, &mut ());
 |--------------|--------|-------------|
 | **Symbolic Simplification** | | |
 | Constant folding | ✅ | Fold unary/binary/ternary ops on constants |
-| Identity elimination | ✅ | x+0, x*1, x/1, x\|0, x^0 → x |
+| Identity elimination | ✅ | x+0, x*1, x/1, x|0, x^0 → x |
 | Zero propagation | ✅ | x*0, x&0 → 0 |
-| Self-folding | ✅ | x//x→1, x&x→x, x\|x→x, x^x→0 |
+| Self-folding | ✅ | x//x→1, x&x→x, x|x→x, x^x→0 |
 | ALU folding | ✅ | (x+c1)+c2 → x+(c1+c2) |
-| Term combining | ✅ | x+x→2*x, (c1*x)+(c2*x)→(c1+c2)*x |
+| Term combining | ✅ | x+x→2*x, (c1*x)+(c2\*x)→(c1+c2)\*x |
 | Division distribution | ✅ | (a+b)//c → a//c + b//c when exact |
 | Dead code elimination | ✅ | WHERE(true,t,f)→t, dead loops |
 | **Kernel Optimization** | | |
@@ -86,9 +88,9 @@ Uses [proptest](https://github.com/proptest-rs/proptest) to verify algebraic pro
 
 | Category | Properties |
 |----------|------------|
-| Identity | x+0→x, x*1→x, x-0→x, x/1→x, x\|0→x, x^0→x |
+| Identity | x+0→x, x*1→x, x-0→x, x/1→x, x|0→x, x^0→x |
 | Zero | x*0→0, x&0→0, 0/x→0 |
-| Self-fold | x/x→1, x&x→x, x\|x→x, x<x→false, x==x→true |
+| Self-fold | x/x→1, x&x→x, x|x→x, x\<x→false, x==x→true |
 | Structural | Idempotence, dtype preservation, cost bounds |
 
 ### Z3 Verification
@@ -96,6 +98,7 @@ Uses [proptest](https://github.com/proptest-rs/proptest) to verify algebraic pro
 Uses [Z3](https://github.com/Z3Prover/z3) SMT solver to formally prove semantic equivalence of rewrites. Z3 is a theorem prover from Microsoft Research that can verify mathematical properties by constraint solving.
 
 **How it works:**
+
 1. Convert original and simplified UOps to Z3 expressions
 2. Assert `NOT(original == simplified)`
 3. If UNSAT → rewrite is proven correct
@@ -106,6 +109,7 @@ cargo test -p morok-schedule --features z3
 ```
 
 **Resources:**
+
 - [Z3 GitHub](https://github.com/Z3Prover/z3)
 - [Z3 Guide](https://microsoft.github.io/z3guide/)
 - [z3.rs bindings](https://github.com/prove-rs/z3.rs)

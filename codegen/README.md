@@ -13,10 +13,12 @@ let code = render(&kernel_graph, backend)?;
 ## Features
 
 **Supported:**
+
 - LLVM IR generation for CPU
 - Renderer trait for backend abstraction
 
 **Planned:**
+
 - PTX renderer (CUDA)
 - Metal renderer
 - WebGPU (WGSL) renderer

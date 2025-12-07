@@ -16,6 +16,7 @@ pub struct UOp {
 ```
 
 **Key fields:**
+
 - `op`: An `Op` enum with 80+ operations spanning all abstraction levels
 - `dtype`: Type information (scalars, vectors, pointers)
 - `id`: Unique identifier for caching and provenance tracking
@@ -23,6 +24,7 @@ pub struct UOp {
 ## Why One IR?
 
 Traditional ML compilers use multiple IRs:
+
 - **TensorFlow:** Graph → XLA HLO → MLIR → LLVM IR
 - **PyTorch:** Python AST → TorchScript → FX Graph → Inductor IR → Triton
 - **JAX:** Python → Jaxpr → StableHLO → MHLO → platform IR
@@ -47,6 +49,7 @@ DEFINE_GLOBAL -> INDEX -> LOAD -> ADD -> STORE
 1. **Graph Rewriting as Universal Mechanism**
 
    Pattern matching + rewriting handles all transformations:
+
    ```rust
    let optimized = graph_rewrite(&patterns, uop_graph, &mut ctx);
    ```
@@ -54,6 +57,7 @@ DEFINE_GLOBAL -> INDEX -> LOAD -> ADD -> STORE
 2. **Hash Consing (Structural Sharing)**
 
    Identical subgraphs share memory via a thread-local cache:
+
    ```rust
    thread_local! {
        static CACHE: RefCell<HashMap<UOpKey, Weak<UOp>>> = ...;
@@ -61,6 +65,7 @@ DEFINE_GLOBAL -> INDEX -> LOAD -> ADD -> STORE
    ```
 
    Benefits:
+
    - O(1) equality checking (pointer comparison)
    - No duplicate subgraphs in memory
    - Pattern matching can use pointer identity
@@ -68,6 +73,7 @@ DEFINE_GLOBAL -> INDEX -> LOAD -> ADD -> STORE
 3. **Lazy Property Computation**
 
    Expensive analyses computed once and cached:
+
    ```rust
    pub(crate) shape_cache: OnceCell<Result<Option<Shape>>>,
    pub(crate) vmin_vmax_cache: OnceCell<(ConstValue, ConstValue)>,
@@ -76,6 +82,7 @@ DEFINE_GLOBAL -> INDEX -> LOAD -> ADD -> STORE
 4. **Operation Hierarchy**
 
    Ops organized by level to support progressive lowering:
+
    ```rust
    impl Op {
        pub fn is_movement(&self) -> bool { ... }
@@ -105,6 +112,7 @@ DEFINE_GLOBAL -> INDEX -> LOAD -> ADD -> STORE
 | Memory | Weakref + GC | `Rc<UOp>` + explicit cleanup |
 
 Morok's Rust implementation adds compile-time guarantees:
+
 ```rust
 // Each Op variant encodes its exact structure
 Op::Binary(BinaryOp::Add, lhs, rhs)  // vs Tinygrad's (Ops.ADD, (lhs, rhs))
