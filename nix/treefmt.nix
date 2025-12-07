@@ -9,15 +9,15 @@
     nixfmt.enable = true;
     yamlfmt = {
       enable = true;
-      settings.formatter.retain_line_breaks = true;
+      settings.formatter = {
+        retain_line_breaks = true;
+      };
     };
     # TOML
     taplo = {
       enable = true;
-      settings = {
-        reorder_keys = true;
+      settings.formatting = {
         reorder_arrays = true;
-        reorder_inline_tables = true;
       };
     };
   };

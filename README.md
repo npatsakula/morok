@@ -112,6 +112,7 @@ is used for CI/CD, so it's the preferred way to develop and test.
 ```bash
 nix develop # Open development shell
 nix flake check # Run CI tests
+nix fmt # Format source files
 ```
 
 #### Bare metal
