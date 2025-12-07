@@ -1,14 +1,14 @@
 //! Range flattening: unnest and canonicalize RANGE order for kernel deduplication.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{Op, UOp, UOpKey};
 
 use crate::pattern::matcher::PatternMatcher;
 
 /// Flatten nested RANGE operations into canonical form using SINK + toposort.
-pub fn flatten_range_impl(r: &Rc<UOp>) -> Option<Rc<UOp>> {
+pub fn flatten_range_impl(r: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Only process REDUCE, STORE, END operations (matches Tinygrad)
     // Each has range sources after a fixed offset
     let off = match r.op() {
@@ -19,7 +19,7 @@ pub fn flatten_range_impl(r: &Rc<UOp>) -> Option<Rc<UOp>> {
     };
 
     // Extract range sources (sources after offset)
-    let range_sources: Vec<Rc<UOp>> =
+    let range_sources: Vec<Arc<UOp>> =
         r.op().sources().iter().skip(off).filter(|src| matches!(src.op(), Op::Range { .. })).cloned().collect();
 
     if range_sources.is_empty() {
@@ -29,11 +29,11 @@ pub fn flatten_range_impl(r: &Rc<UOp>) -> Option<Rc<UOp>> {
     // Use SINK + toposort to gather all nested ranges (Tinygrad's modern approach)
     // This replaces the old consumer_map + sparents approach
     let sink = UOp::sink(range_sources);
-    let new_ranges: Vec<Rc<UOp>> =
+    let new_ranges: Vec<Arc<UOp>> =
         sink.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Range { .. })).collect();
 
     // Reconstruct with flattened ranges
-    let mut new_sources: Vec<Rc<UOp>> = r.op().sources()[..off].to_vec();
+    let mut new_sources: Vec<Arc<UOp>> = r.op().sources()[..off].to_vec();
     new_sources.extend(new_ranges);
 
     Some(r.with_sources(new_sources))
@@ -47,9 +47,9 @@ pub fn flatten_range_patterns() -> PatternMatcher {
 
 /// Apply range flattening to a computation graph via direct transformation.
 #[allow(clippy::mutable_key_type)]
-pub fn flatten_ranges(root: &Rc<UOp>) -> Rc<UOp> {
+pub fn flatten_ranges(root: &Arc<UOp>) -> Arc<UOp> {
     // No consumer map needed! (simplified via SINK + toposort)
-    let mut replacements: HashMap<UOpKey, Rc<UOp>> = HashMap::new();
+    let mut replacements: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
     for node in root.toposort() {
         // Try to flatten this node

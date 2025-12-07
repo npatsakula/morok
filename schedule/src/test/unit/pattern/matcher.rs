@@ -1,17 +1,17 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::{
     PatternMatcher, UPat,
     pattern::{BindingStore, RewriteResult, VarIntern, matcher::RewriteFn},
 };
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, Op, UOp};
+use morok_ir::{BinaryOp, ConstValue, Op, UOp, pattern};
 
-fn const_uop(val: i64) -> Rc<UOp> {
+fn const_uop(val: i64) -> Arc<UOp> {
     UOp::const_(DType::Int32, ConstValue::Int(val))
 }
 
-fn binary_uop(op: BinaryOp, a: Rc<UOp>, b: Rc<UOp>) -> Rc<UOp> {
+fn binary_uop(op: BinaryOp, a: Arc<UOp>, b: Arc<UOp>) -> Arc<UOp> {
     let dtype = a.dtype().clone();
     UOp::new(Op::Binary(op, a, b), dtype)
 }
@@ -22,10 +22,10 @@ fn test_simple_rewrite() {
     let mut patterns = vec![];
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Rc<UOp>, zero: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Arc<UOp>, zero: &Arc<UOp>| {
             if let Op::Const(cv) = zero.op()
                 && cv.0 == ConstValue::Int(0) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
@@ -41,7 +41,7 @@ fn test_simple_rewrite() {
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(ref rewritten) = result {
-        assert!(Rc::ptr_eq(rewritten, &five));
+        assert!(Arc::ptr_eq(rewritten, &five));
     }
 
     // Test: 5 + 3 should not rewrite
@@ -58,20 +58,20 @@ fn test_multiple_patterns() {
     let mut patterns = vec![];
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Rc<UOp>, c: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Arc<UOp>, c: &Arc<UOp>| {
             if let Op::Const(cv) = c.op()
                 && cv.0 == ConstValue::Int(0) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
     );
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Mul], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Rc<UOp>, c: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Mul], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Arc<UOp>, c: &Arc<UOp>| {
             if let Op::Const(cv) = c.op()
                 && cv.0 == ConstValue::Int(1) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
@@ -86,7 +86,7 @@ fn test_multiple_patterns() {
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(ref rewritten) = result {
-        assert!(Rc::ptr_eq(rewritten, &five));
+        assert!(Arc::ptr_eq(rewritten, &five));
     }
 
     // Test: 5 * 1 -> 5
@@ -94,7 +94,7 @@ fn test_multiple_patterns() {
     let result = matcher.rewrite(&mul, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(ref rewritten) = result {
-        assert!(Rc::ptr_eq(rewritten, &five));
+        assert!(Arc::ptr_eq(rewritten, &five));
     }
 }
 
@@ -103,10 +103,10 @@ fn test_no_match() {
     let mut patterns = vec![];
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Rc<UOp>, c: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Arc<UOp>, c: &Arc<UOp>| {
             if let Op::Const(cv) = c.op()
                 && cv.0 == ConstValue::Int(0) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
@@ -159,10 +159,10 @@ fn test_indexed_before_wildcard() {
     let mut patterns = vec![];
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Rc<UOp>, c: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Arc<UOp>, c: &Arc<UOp>| {
             if let Op::Const(cv) = c.op()
                 && cv.0 == ConstValue::Int(0) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
@@ -183,7 +183,7 @@ fn test_indexed_before_wildcard() {
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(ref rewritten) = result {
-        assert!(Rc::ptr_eq(rewritten, &five));
+        assert!(Arc::ptr_eq(rewritten, &five));
     }
 
     // MUL doesn't match first pattern, so wildcard applies -> 99

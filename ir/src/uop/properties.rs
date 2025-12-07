@@ -14,7 +14,7 @@ use crate::cached_property;
 use crate::types::ConstValue;
 use crate::{Op, UOpKey};
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 // ============================================================================
 // Shape Property
@@ -63,7 +63,7 @@ cached_property! {
     /// let all_ranges = RangesProperty::get(&my_uop);
     /// println!("Found {} ranges in graph", all_ranges.len());
     /// ```
-    RangesProperty: Vec<Rc<crate::UOp>> {
+    RangesProperty: Vec<Arc<crate::UOp>> {
         cache_field: ranges_cache,
         compute: |uop| {
             uop.toposort()

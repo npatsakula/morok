@@ -3,7 +3,7 @@
 //! Validates that flatten_range correctly unnests and canonicalizes RANGE operations
 //! for kernel deduplication.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::UOp;
 
@@ -37,5 +37,5 @@ fn test_flatten_ranges_identity() {
     let flattened = flatten_ranges(&computation);
 
     // Should return identical graph (same pointer)
-    assert!(Rc::ptr_eq(&flattened, &computation));
+    assert!(Arc::ptr_eq(&flattened, &computation));
 }

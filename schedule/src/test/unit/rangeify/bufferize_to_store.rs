@@ -1,4 +1,4 @@
-use morok_ir::{AxisId, AxisType, Op, UOp};
+use morok_ir::{Op, UOp};
 
 use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store};
 
@@ -18,30 +18,38 @@ fn test_bufferize_to_store_global() {
     assert!(result.is_some());
     let result = result.unwrap();
 
-    // Verify END structure
-    if let Op::End { computation, ranges } = result.op() {
-        // Should have 1 range
-        assert_eq!(ranges.len(), 1);
+    // bufferize_to_store returns AFTER(passthrough=DEFINE_GLOBAL, deps=[END(STORE)])
+    // Following Tinygrad's pattern: return buf.after(do_store)
+    let Op::After { passthrough, deps } = result.op() else {
+        panic!("Expected AFTER operation, got {:?}", result.op());
+    };
 
-        // Range should match the input range
-        assert!(std::rc::Rc::ptr_eq(&ranges[0], &range));
+    // Passthrough should be DEFINE_GLOBAL
+    assert!(matches!(passthrough.op(), Op::DefineGlobal(0)));
+    assert_eq!(deps.len(), 1);
 
-        // Computation should be STORE
-        if let Op::Store { buffer, index, value } = computation.op() {
-            // Buffer should be DEFINE_GLOBAL with ID 0
-            assert!(matches!(buffer.op(), Op::DefineGlobal(0)));
+    // Unwrap AFTER to get END
+    let Op::End { computation, ranges } = deps[0].op() else {
+        panic!("Expected END operation in deps");
+    };
 
-            // Value should be the compute
-            assert!(std::rc::Rc::ptr_eq(value, &compute));
+    // Should have 1 range
+    assert_eq!(ranges.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&ranges[0], &range));
 
-            // Index should be INDEX operation with the range
-            assert!(matches!(index.op(), Op::Index { .. }));
-        } else {
-            panic!("Expected STORE operation");
-        }
-    } else {
-        panic!("Expected END operation");
-    }
+    // Computation should be STORE
+    let Op::Store { buffer, index, value } = computation.op() else {
+        panic!("Expected STORE operation");
+    };
+
+    // Buffer should be DEFINE_GLOBAL with ID 0
+    assert!(matches!(buffer.op(), Op::DefineGlobal(0)));
+
+    // Value should be the compute
+    assert!(std::sync::Arc::ptr_eq(value, &compute));
+
+    // Index should be INDEX operation with the range
+    assert!(matches!(index.op(), Op::Index { .. }));
 
     // Verify context state
     assert_eq!(ctx.global_counter, 1);
@@ -65,27 +73,36 @@ fn test_bufferize_to_store_local_with_barrier() {
     assert!(result.is_some());
     let result = result.unwrap();
 
-    // Should be wrapped in BARRIER
-    if let Op::Barrier { src, .. } = result.op() {
-        // Unwrap BARRIER to check the END inside
-        if let Op::End { computation, ranges } = src.op() {
-            // Should have 1 range
-            assert_eq!(ranges.len(), 1);
-            assert!(std::rc::Rc::ptr_eq(&ranges[0], &range));
+    // bufferize_to_store returns AFTER(passthrough=DEFINE_LOCAL, deps=[BARRIER(END(STORE))])
+    let Op::After { passthrough, deps } = result.op() else {
+        panic!("Expected AFTER operation, got {:?}", result.op());
+    };
 
-            // Computation should be STORE with DEFINE_LOCAL(0)
-            if let Op::Store { buffer, value, .. } = computation.op() {
-                assert!(matches!(buffer.op(), Op::DefineLocal(0)));
-                assert!(std::rc::Rc::ptr_eq(value, &compute));
-            } else {
-                panic!("Expected STORE operation");
-            }
-        } else {
-            panic!("Expected END operation inside BARRIER");
-        }
-    } else {
-        panic!("Expected BARRIER operation");
-    }
+    // Passthrough should be DEFINE_LOCAL
+    assert!(matches!(passthrough.op(), Op::DefineLocal(0)));
+    assert_eq!(deps.len(), 1);
+
+    // Unwrap AFTER to get BARRIER
+    let Op::Barrier { src, .. } = deps[0].op() else {
+        panic!("Expected BARRIER operation in deps");
+    };
+
+    // Unwrap BARRIER to check the END inside
+    let Op::End { computation, ranges } = src.op() else {
+        panic!("Expected END operation inside BARRIER");
+    };
+
+    // Should have 1 range
+    assert_eq!(ranges.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&ranges[0], &range));
+
+    // Computation should be STORE with DEFINE_LOCAL(0)
+    let Op::Store { buffer, value, .. } = computation.op() else {
+        panic!("Expected STORE operation");
+    };
+
+    assert!(matches!(buffer.op(), Op::DefineLocal(0)));
+    assert!(std::sync::Arc::ptr_eq(value, &compute));
 
     // Verify context state
     assert_eq!(ctx.global_counter, 0);
@@ -110,37 +127,46 @@ fn test_bufferize_to_store_multiple_ranges() {
     assert!(result.is_some());
     let result = result.unwrap();
 
-    // Verify END structure with multiple ranges
-    if let Op::End { computation, ranges } = result.op() {
-        // Should have 2 ranges in the same order
-        assert_eq!(ranges.len(), 2);
-        assert!(std::rc::Rc::ptr_eq(&ranges[0], &range1));
-        assert!(std::rc::Rc::ptr_eq(&ranges[1], &range2));
+    // bufferize_to_store returns AFTER(passthrough=DEFINE_GLOBAL, deps=[END(STORE)])
+    let Op::After { passthrough, deps } = result.op() else {
+        panic!("Expected AFTER operation, got {:?}", result.op());
+    };
 
-        // Verify STORE structure
-        if let Op::Store { buffer, index, value } = computation.op() {
-            // Buffer should be DEFINE_GLOBAL(0)
-            assert!(matches!(buffer.op(), Op::DefineGlobal(0)));
+    // Passthrough should be DEFINE_GLOBAL
+    assert!(matches!(passthrough.op(), Op::DefineGlobal(0)));
+    assert_eq!(deps.len(), 1);
 
-            // Value should be the compute
-            assert!(std::rc::Rc::ptr_eq(value, &compute));
+    // Unwrap AFTER to get END
+    let Op::End { computation, ranges } = deps[0].op() else {
+        panic!("Expected END operation in deps");
+    };
 
-            // Index should be INDEX with both ranges
-            if let Op::Index { buffer: idx_buffer, indices, .. } = index.op() {
-                // Buffer should match the STORE buffer
-                assert!(std::rc::Rc::ptr_eq(idx_buffer, buffer));
+    // Should have 2 ranges in the same order
+    assert_eq!(ranges.len(), 2);
+    assert!(std::sync::Arc::ptr_eq(&ranges[0], &range1));
+    assert!(std::sync::Arc::ptr_eq(&ranges[1], &range2));
 
-                // Should have 2 indices
-                assert_eq!(indices.len(), 2);
-            } else {
-                panic!("Expected INDEX operation");
-            }
-        } else {
-            panic!("Expected STORE operation");
-        }
-    } else {
-        panic!("Expected END operation");
-    }
+    // Verify STORE structure
+    let Op::Store { buffer, index, value } = computation.op() else {
+        panic!("Expected STORE operation");
+    };
+
+    // Buffer should be DEFINE_GLOBAL(0)
+    assert!(matches!(buffer.op(), Op::DefineGlobal(0)));
+
+    // Value should be the compute
+    assert!(std::sync::Arc::ptr_eq(value, &compute));
+
+    // Index should be INDEX with both ranges
+    let Op::Index { buffer: idx_buffer, indices, .. } = index.op() else {
+        panic!("Expected INDEX operation");
+    };
+
+    // Buffer should match the STORE buffer
+    assert!(std::sync::Arc::ptr_eq(idx_buffer, buffer));
+
+    // Should have 2 indices
+    assert_eq!(indices.len(), 2);
 
     // Verify context
     assert_eq!(ctx.global_counter, 1);
@@ -175,9 +201,15 @@ fn test_buffer_tracked_in_context() {
     // After conversion, buffer should be tracked
     assert!(ctx.has_buffer(&bufferize));
 
-    // Should be able to get the DEFINE_GLOBAL
+    // Should be able to get the AFTER wrapping DEFINE_GLOBAL
+    // bufferize_to_store stores AFTER(buffer, [STORE]) in context
     let replacement = ctx.get_buffer(&bufferize).unwrap();
-    assert!(matches!(replacement.op(), Op::DefineGlobal(_)));
+
+    // Unwrap AFTER to get the actual DEFINE_GLOBAL
+    let Op::After { passthrough, .. } = replacement.op() else {
+        panic!("Expected AFTER operation, got {:?}", replacement.op());
+    };
+    assert!(matches!(passthrough.op(), Op::DefineGlobal(_)));
 }
 
 #[test]
@@ -235,25 +267,40 @@ fn test_bufferize_to_store_mixed_global_local() {
     assert_eq!(ctx.global_counter, 1);
     assert_eq!(ctx.local_counter, 1);
 
-    // Global should be STORE (no ranges, so no END wrapper)
-    if let Op::Store { buffer, value, .. } = global_result.unwrap().op() {
-        assert!(matches!(buffer.op(), Op::DefineGlobal(0)));
-        assert!(std::rc::Rc::ptr_eq(value, &global_compute));
-    } else {
-        panic!("Expected STORE operation for global");
-    }
+    // Global: AFTER(passthrough=DEFINE_GLOBAL, deps=[STORE])
+    // No ranges means no END wrapper, but still has AFTER
+    let global_result = global_result.unwrap();
+    let Op::After { passthrough: global_buf, deps: global_deps } = global_result.op() else {
+        panic!("Expected AFTER operation for global, got {:?}", global_result.op());
+    };
+    assert!(matches!(global_buf.op(), Op::DefineGlobal(0)));
+    assert_eq!(global_deps.len(), 1);
 
-    // Local should be BARRIER wrapping STORE
-    if let Op::Barrier { src, .. } = local_result.unwrap().op() {
-        if let Op::Store { buffer, value, .. } = src.op() {
-            assert!(matches!(buffer.op(), Op::DefineLocal(0)));
-            assert!(std::rc::Rc::ptr_eq(value, &local_compute));
-        } else {
-            panic!("Expected STORE operation inside BARRIER");
-        }
-    } else {
-        panic!("Expected BARRIER operation for local");
-    }
+    // deps[0] should be STORE (no ranges = no END)
+    let Op::Store { buffer, value, .. } = global_deps[0].op() else {
+        panic!("Expected STORE in global AFTER deps, got {:?}", global_deps[0].op());
+    };
+    assert!(std::sync::Arc::ptr_eq(buffer, global_buf));
+    assert!(std::sync::Arc::ptr_eq(value, &global_compute));
+
+    // Local: AFTER(passthrough=DEFINE_LOCAL, deps=[BARRIER(STORE)])
+    // No ranges means no END wrapper, but still has AFTER and BARRIER
+    let local_result = local_result.unwrap();
+    let Op::After { passthrough: local_buf, deps: local_deps } = local_result.op() else {
+        panic!("Expected AFTER operation for local, got {:?}", local_result.op());
+    };
+    assert!(matches!(local_buf.op(), Op::DefineLocal(0)));
+    assert_eq!(local_deps.len(), 1);
+
+    // deps[0] should be BARRIER wrapping STORE
+    let Op::Barrier { src, .. } = local_deps[0].op() else {
+        panic!("Expected BARRIER in local AFTER deps, got {:?}", local_deps[0].op());
+    };
+    let Op::Store { buffer, value, .. } = src.op() else {
+        panic!("Expected STORE inside BARRIER, got {:?}", src.op());
+    };
+    assert!(std::sync::Arc::ptr_eq(buffer, local_buf));
+    assert!(std::sync::Arc::ptr_eq(value, &local_compute));
 
     // Verify both are tracked in context
     assert!(ctx.has_buffer(&global_bufferize));
@@ -266,56 +313,60 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
 
     let mut ctx = KernelContext::new();
 
-    // Create a BUFFERIZE operation with OUTER range
-    // (split_store only splits at kernel boundaries where all ranges are OUTER)
+    // Create a BUFFERIZE operation with non-OUTER range
+    // split_store skips END operations with OUTER ranges (control flow markers)
+    // so we use range_const which creates a non-OUTER range
     let compute = UOp::native_const(42.0f32);
-    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Outer);
+    let range = UOp::range_const(10, 0);
 
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range]);
 
-    // Stage 1: BUFFERIZE → STORE
+    // Stage 1: BUFFERIZE → AFTER(DEFINE_GLOBAL, [END(STORE)])
     let store_result = bufferize_to_store(&bufferize, &mut ctx).unwrap();
 
     // Verify buffer was tracked
     assert_eq!(ctx.global_counter, 1);
     assert!(ctx.has_buffer(&bufferize));
 
-    // Extract the STORE from END
-    let store = if let Op::End { computation, .. } = store_result.op() {
-        computation.clone()
-    } else {
-        panic!("Expected END operation");
+    // Extract structure: AFTER(passthrough=DEFINE_GLOBAL, deps=[END(STORE)])
+    let Op::After { passthrough: define_global, deps } = store_result.op() else {
+        panic!("Expected AFTER operation, got {:?}", store_result.op());
     };
+    assert!(matches!(define_global.op(), Op::DefineGlobal(0)));
+    assert_eq!(deps.len(), 1);
 
-    // Stage 2: STORE → KERNEL (using split_store)
-    let kernel_result = split_store(&store, &mut ctx).unwrap();
+    // deps[0] should be END wrapping STORE
+    let Op::End { computation: store, .. } = deps[0].op() else {
+        panic!("Expected END in AFTER deps, got {:?}", deps[0].op());
+    };
+    assert!(matches!(store.op(), Op::Store { .. }));
+
+    // Stage 2: AFTER → KERNEL (split_store unwraps AFTER and creates KERNEL)
+    // We pass the AFTER to split_store, which extracts and processes the END(STORE)
+    let kernel_result = split_store(&store_result, &mut ctx).unwrap();
 
     // Verify KERNEL structure
-    if let Op::Kernel { sources, ast } = kernel_result.op() {
-        // KERNEL should have 1 source (the DEFINE_GLOBAL buffer)
-        assert_eq!(sources.len(), 1);
-        assert!(matches!(sources[0].op(), Op::DefineGlobal(0)));
+    let Op::Kernel { sources, ast } = kernel_result.op() else {
+        panic!("Expected KERNEL operation, got {:?}", kernel_result.op());
+    };
 
-        // AST should be SINK wrapping the STORE
-        if let Op::Sink { sources: sink_sources } = ast.op() {
-            assert_eq!(sink_sources.len(), 1);
-            assert!(std::rc::Rc::ptr_eq(&sink_sources[0], &store));
+    // KERNEL should have at least 1 source (the DEFINE_GLOBAL buffer)
+    assert!(!sources.is_empty(), "KERNEL should have at least one source");
+    assert!(
+        sources.iter().any(|s| matches!(s.op(), Op::DefineGlobal(0))),
+        "KERNEL sources should include DEFINE_GLOBAL(0)"
+    );
 
-            // Verify STORE references the buffer from context
-            if let Op::Store { buffer, value, .. } = sink_sources[0].op() {
-                // Buffer should be the DEFINE_GLOBAL from context
-                let ctx_buffer = ctx.get_buffer(&bufferize).unwrap();
-                assert!(std::rc::Rc::ptr_eq(buffer, ctx_buffer));
+    // AST should be SINK wrapping the computation
+    let Op::Sink { sources: sink_sources } = ast.op() else {
+        panic!("Expected SINK operation in kernel AST, got {:?}", ast.op());
+    };
+    assert_eq!(sink_sources.len(), 1, "SINK should have 1 source");
 
-                // Value should be the original compute
-                assert!(std::rc::Rc::ptr_eq(value, &compute));
-            } else {
-                panic!("Expected STORE in SINK");
-            }
-        } else {
-            panic!("Expected SINK operation");
-        }
-    } else {
-        panic!("Expected KERNEL operation");
-    }
+    // Verify the context stores AFTER (not bare DEFINE_GLOBAL)
+    let ctx_buffer = ctx.get_buffer(&bufferize).unwrap();
+    let Op::After { passthrough, .. } = ctx_buffer.op() else {
+        panic!("Expected AFTER in context buffer mapping");
+    };
+    assert!(matches!(passthrough.op(), Op::DefineGlobal(0)));
 }

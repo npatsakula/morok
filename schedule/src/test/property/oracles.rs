@@ -3,7 +3,7 @@
 //! This module implements the most comprehensive testing strategy by using multiple
 //! independent oracles to verify optimization correctness.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use proptest::prelude::*;
 
@@ -41,10 +41,10 @@ proptest! {
         // We just verify that IF simplification occurs, it's correct
         if let Some(expected) = kpg.expected_result() {
             // Only assert if actually simplified (not just returned original)
-            if !Rc::ptr_eq(&simplified, &graph) {
+            if !Arc::ptr_eq(&simplified, &graph) {
                 // If it simplified to something, it should match expected OR be semantically equivalent
                 // (we don't require exact pointer equality as different equivalent forms are ok)
-                let is_expected = Rc::ptr_eq(&simplified, &expected);
+                let is_expected = Arc::ptr_eq(&simplified, &expected);
                 let is_constant_zero = matches!(simplified.op(), morok_ir::Op::Const(cv) if cv.0 == ConstValue::Int(0))
                     && matches!(expected.op(), morok_ir::Op::Const(cv) if cv.0 == ConstValue::Int(0));
 
@@ -76,7 +76,7 @@ proptest! {
     fn z3_verify_identity_add_zero(x in arb_var_uop(DType::Int32)) {
         let zero = UOp::native_const(0i32);
         let expr = UOp::new(
-            morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, Rc::clone(&x), zero),
+            morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, Arc::clone(&x), zero),
             DType::Int32,
         );
 
@@ -84,7 +84,7 @@ proptest! {
         let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
         // Should simplify to x
-        prop_assert!(Rc::ptr_eq(&simplified, &x));
+        prop_assert!(Arc::ptr_eq(&simplified, &x));
 
         // Z3 should verify equivalence
         verify_equivalence(&expr, &simplified)
@@ -101,7 +101,7 @@ proptest! {
         let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
         // Should simplify to 0
-        prop_assert!(Rc::ptr_eq(&simplified, &zero));
+        prop_assert!(Arc::ptr_eq(&simplified, &zero));
 
         // Z3 should verify equivalence
         verify_equivalence(&expr, &simplified)
@@ -112,10 +112,10 @@ proptest! {
     #[test]
     fn z3_verify_self_div(name in "[a-z]", min_val in 1i64..100, range_size in 1i64..100) {
         // Create variable with min_val >= 1 to avoid division by zero
-        let x = UOp::var(&name, DType::Int32, min_val, min_val + range_size);
+        let x = UOp::var(&name, DType::Int32, min_val + range_size);
 
         let expr = UOp::new(
-            morok_ir::Op::Binary(morok_ir::types::BinaryOp::Idiv, Rc::clone(&x), Rc::clone(&x)),
+            morok_ir::Op::Binary(morok_ir::types::BinaryOp::Idiv, Arc::clone(&x), Arc::clone(&x)),
             DType::Int32,
         );
 
@@ -224,35 +224,35 @@ proptest! {
 // ============================================================================
 
 /// Rebuild a known property graph with a different dtype.
-fn rebuild_with_dtype(kpg: &KnownPropertyGraph, dtype: DType) -> Rc<UOp> {
+fn rebuild_with_dtype(kpg: &KnownPropertyGraph, dtype: DType) -> Arc<UOp> {
     match kpg {
         KnownPropertyGraph::AddZero { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
+            let x = UOp::var("x", dtype.clone(), 100);
             let zero = UOp::native_const(0i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, x, zero), dtype)
         }
         KnownPropertyGraph::MulOne { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
+            let x = UOp::var("x", dtype.clone(), 100);
             let one = UOp::native_const(1i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Mul, x, one), dtype)
         }
         KnownPropertyGraph::SubZero { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
+            let x = UOp::var("x", dtype.clone(), 100);
             let zero = UOp::native_const(0i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Sub, x, zero), dtype)
         }
         KnownPropertyGraph::MulZero { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
+            let x = UOp::var("x", dtype.clone(), 100);
             let zero = UOp::native_const(0i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Mul, x, zero), dtype)
         }
         KnownPropertyGraph::SubSelf { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
-            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Sub, Rc::clone(&x), x), dtype)
+            let x = UOp::var("x", dtype.clone(), 100);
+            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Sub, Arc::clone(&x), x), dtype)
         }
         KnownPropertyGraph::AddSelf { .. } => {
-            let x = UOp::var("x", dtype.clone(), 0, 100);
-            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, Rc::clone(&x), x), dtype)
+            let x = UOp::var("x", dtype.clone(), 100);
+            UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, Arc::clone(&x), x), dtype)
         }
     }
 }
@@ -260,7 +260,7 @@ fn rebuild_with_dtype(kpg: &KnownPropertyGraph, dtype: DType) -> Rc<UOp> {
 /// Get a simplified form descriptor for comparing optimization results.
 ///
 /// Returns: (op_type, is_const, is_var, child_count)
-fn optimization_form(uop: &Rc<UOp>) -> (String, bool, bool, usize) {
+fn optimization_form(uop: &Arc<UOp>) -> (String, bool, bool, usize) {
     use morok_ir::Op;
 
     match uop.op() {

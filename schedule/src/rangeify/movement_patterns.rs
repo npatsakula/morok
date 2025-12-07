@@ -24,7 +24,7 @@
 //!
 //! Based on Tinygrad's pm_mops (tinygrad/schedule/rangeify.py:18-25).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::UOp;
 
@@ -81,10 +81,10 @@ pub fn movement_op_patterns() -> PatternMatcher {
 
 /// Transform a movement op through INDEX by applying the movement to indices.
 fn transform_movement_through_index(
-    mop: &Rc<UOp>,
-    indices: &smallvec::SmallVec<[Rc<UOp>; 4]>,
-    gate: &Option<Rc<UOp>>,
-) -> Option<Rc<UOp>> {
+    mop: &Arc<UOp>,
+    indices: &smallvec::SmallVec<[Arc<UOp>; 4]>,
+    gate: &Option<Arc<UOp>>,
+) -> Option<Arc<UOp>> {
     // Get source buffer (first source of movement op)
     let src = &mop.op().sources()[0];
 
@@ -107,17 +107,12 @@ fn transform_movement_through_index(
 ///
 /// When both INDEX operations use the same single index (common after no-op RESHAPE),
 /// we can just use the inner INDEX directly.
-fn flatten_nested_index(
-    inner_idx: &Rc<UOp>,
-    outer_indices: &smallvec::SmallVec<[Rc<UOp>; 4]>,
-) -> Option<Rc<UOp>> {
+fn flatten_nested_index(inner_idx: &Arc<UOp>, outer_indices: &smallvec::SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
     if let morok_ir::Op::Index { buffer: _inner_buffer, indices: inner_indices, gate: None } = inner_idx.op() {
         // If both use the same single index, just return the inner INDEX
-        if inner_indices.len() == 1 && outer_indices.len() == 1 {
-            if inner_indices[0].id == outer_indices[0].id {
-                // Same index - use inner INDEX directly
-                return Some(inner_idx.clone());
-            }
+        if inner_indices.len() == 1 && outer_indices.len() == 1 && inner_indices[0].id == outer_indices[0].id {
+            // Same index - use inner INDEX directly
+            return Some(inner_idx.clone());
         }
     }
     None

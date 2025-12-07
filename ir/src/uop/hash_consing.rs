@@ -2,60 +2,58 @@
 //!
 //! This module implements the caching system that ensures structurally identical
 //! UOps share the same memory allocation (hash consing).
+//!
+//! # Thread Safety
+//!
+//! Uses a global lock-free concurrent HashMap (papaya) for cross-thread deduplication.
+//! Creating the same UOp in different threads returns the same `Arc<UOp>`, so
+//! `Arc::ptr_eq` works correctly across thread boundaries.
+//!
+//! # Memory Management
+//!
+//! UOps are stored as `Arc<UOp>` (not `Weak<UOp>`) for simpler atomic operations.
+//! This means UOps are kept alive by the cache until explicitly cleaned up via
+//! `gc_unused_uops()`. Call this after tensor operations complete to free memory.
 
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem::discriminant;
-use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
+use papaya::HashMap;
 use smallvec::SmallVec;
 
 use crate::op::Op;
 use crate::types::*;
 use crate::uop::core::UOp;
-use morok_dtype::DeviceSpec;
 use morok_dtype::DType;
+use morok_dtype::DeviceSpec;
 
-// Thread-local counter for unique identifiers.
+// Global atomic counter for unique identifiers.
 //
-// Design choice: Uses Cell<usize> for single-threaded efficiency.
-// - Cell is !Send + !Sync, preventing accidental multi-threading
-// - Zero overhead compared to atomics (no memory barriers)
-// - Matches Tinygrad's single-threaded execution model
-thread_local! {
-    static UNIQUE_COUNTER: Cell<usize> = const { Cell::new(0) };
-}
+// Uses AtomicUsize for thread-safe ID generation across all threads.
+// Ordering::Relaxed is sufficient since we only need uniqueness, not synchronization.
+static UNIQUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) fn next_unique_id() -> usize {
-    UNIQUE_COUNTER.with(|counter| {
-        let id = counter.get();
-        counter.set(id + 1);
-        id
-    })
+    UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-// Thread-local counter for UOp stable IDs.
+// Global atomic counter for UOp stable IDs.
 //
 // Provides monotonic IDs that never repeat, eliminating ABA problem.
 // Uses u64 to provide 2^64 unique IDs (effectively unlimited).
-thread_local! {
-    static UOP_ID_COUNTER: Cell<u64> = const { Cell::new(0) };
-}
+static UOP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn next_uop_id() -> u64 {
-    UOP_ID_COUNTER.with(|counter| {
-        let id = counter.get();
-        counter.set(id + 1);
-        id
-    })
+    UOP_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Cache key for hash consing.
 ///
 /// Uses stable UOp IDs for child UOps to avoid infinite recursion during hashing.
 /// IDs are monotonic and never reused, eliminating ABA problem from pointer-based approach.
-#[derive(Eq, PartialEq, Hash)]
+#[derive(Eq, PartialEq, Hash, Clone)]
 struct UOpKey {
     op_discriminant: std::mem::Discriminant<Op>,
     dtype: DType,
@@ -114,7 +112,7 @@ enum OpData {
     VConstValues(Vec<ConstValueHash>),
 
     // Symbolic/Define operations
-    DefineVarData(String, i64, i64),
+    DefineVarData(String, i64),
     DefineRegSize(usize),
 
     // Advanced operations
@@ -183,7 +181,7 @@ impl UOpKey {
             Op::VConst { values } => OpData::VConstValues(values.iter().map(|v| ConstValueHash(*v)).collect()),
 
             // Symbolic/Define operations
-            Op::DefineVar { name, min_val, max_val } => OpData::DefineVarData(name.clone(), *min_val, *max_val),
+            Op::DefineVar { name, max_val } => OpData::DefineVarData(name.clone(), *max_val),
             Op::DefineReg { size } => OpData::DefineRegSize(*size),
 
             // Advanced operations
@@ -200,66 +198,95 @@ impl UOpKey {
     }
 }
 
-// Thread-local hash consing cache.
+// Global hash consing cache using lock-free concurrent HashMap.
 //
-// Maps UOpKey to weak references. When all strong references are dropped,
-// the entry is automatically cleaned up.
+// Design: Stores Arc<UOp> (not Weak) for simpler atomic get-or-insert operations.
+// - Cross-thread deduplication: same UOpKey → same Arc<UOp> across all threads
+// - Lock-free reads and writes via papaya's epoch-based reclamation
+// - Requires explicit GC via gc_unused_uops() after tensor operations
 //
-// Design choice: Uses Rc + thread_local instead of Arc + DashMap.
-// - Rc is !Send + !Sync, preventing accidental threading bugs
-// - No atomic refcounting overhead (faster cloning)
-// - Thread-local cache avoids locking entirely
-// - Matches Tinygrad's single-threaded model
-// - Can switch to Arc + concurrent hashmap later if needed for parallelism
-thread_local! {
-    static CACHE: RefCell<HashMap<UOpKey, Weak<UOp>>> = RefCell::new(HashMap::new());
+// Memory lifecycle:
+// 1. UOps created via UOp::new() are cached indefinitely
+// 2. After tensor.realize(), call gc_unused_uops() to clean up
+// 3. UOps with strong_count == 1 (only cache holds them) are removed
+static UOPS: OnceLock<HashMap<UOpKey, Arc<UOp>>> = OnceLock::new();
+
+fn uops() -> &'static HashMap<UOpKey, Arc<UOp>> {
+    UOPS.get_or_init(HashMap::new)
+}
+
+/// Remove UOps that are only referenced by the cache (strong_count == 1).
+///
+/// Call this after tensor operations complete to free memory.
+/// UOps still referenced elsewhere will be kept.
+///
+/// # Example
+///
+/// ```ignore
+/// let result = tensor.realize()?;
+/// gc_unused_uops();  // Clean up intermediate UOps
+/// ```
+pub fn gc_unused_uops() {
+    let map = uops();
+    let guard = map.guard();
+
+    // Collect keys to remove (can't mutate while iterating)
+    let to_remove: Vec<UOpKey> =
+        map.iter(&guard).filter(|(_, arc)| Arc::strong_count(arc) == 1).map(|(k, _)| k.clone()).collect();
+
+    // Remove dead entries
+    for key in to_remove {
+        map.remove(&key, &guard);
+    }
 }
 
 impl UOp {
     /// Create a new UOp with hash consing.
     ///
-    /// If an identical UOp already exists, returns a reference to it.
-    /// Otherwise, creates a new UOp and caches it.
+    /// If an identical UOp already exists (in any thread), returns a reference to it.
+    /// Otherwise, creates a new UOp and caches it globally.
+    ///
+    /// # Thread Safety
+    ///
+    /// This function is thread-safe. Creating the same UOp from different threads
+    /// will return the same `Arc<UOp>`, so `Arc::ptr_eq` works across threads.
     #[track_caller]
-    pub fn new(op: Op, dtype: DType) -> Rc<Self> {
+    pub fn new(op: Op, dtype: DType) -> Arc<Self> {
         // Capture caller location BEFORE entering any closures
         // This is critical for #[track_caller] to work correctly
         let caller_location = std::panic::Location::caller();
         let key = UOpKey::new(&op, dtype.clone());
 
-        CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
+        let guard = uops().guard();
 
-            // Check if we already have this UOp
-            if let Some(weak) = cache.get(&key)
-                && let Some(rc) = weak.upgrade()
-            {
-                return rc;
-            }
+        // Atomic get-or-insert: if another thread races us, we both get the same Arc
+        let uop = uops().get_or_insert_with(
+            key,
+            || {
+                Arc::new(Self {
+                    id: next_uop_id(),
+                    op,
+                    dtype,
+                    shape_cache: std::sync::OnceLock::new(),
+                    ranges_cache: std::sync::OnceLock::new(),
+                    in_scope_ranges_cache: std::sync::OnceLock::new(),
+                    vmin_vmax_cache: std::sync::OnceLock::new(),
+                    metadata: None,
+                })
+            },
+            &guard,
+        );
 
-            // Create new UOp with unique stable ID
-            let uop = Rc::new(Self {
-                id: next_uop_id(),
-                op,
-                dtype,
-                shape_cache: std::cell::OnceCell::new(),
-                ranges_cache: std::cell::OnceCell::new(),
-                in_scope_ranges_cache: std::cell::OnceCell::new(),
-                vmin_vmax_cache: std::cell::OnceCell::new(),
-                metadata: None,
-            });
+        // Record provenance in the creating thread (thread-local, debug only)
+        // Note: Only the thread that actually created the UOp should record provenance,
+        // but get_or_insert_with doesn't tell us if we inserted. For simplicity,
+        // we record on every call - duplicate entries are harmless for debugging.
+        use crate::provenance::PROVENANCE_TRACKER;
+        PROVENANCE_TRACKER.with(|tracker| {
+            tracker.borrow_mut().capture(uop.id, caller_location);
+        });
 
-            // Capture provenance information using the location captured before the closure
-            use crate::provenance::PROVENANCE_TRACKER;
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().capture(uop.id, caller_location);
-            });
-
-            // Cache it
-            cache.insert(key, Rc::downgrade(&uop));
-
-            uop
-        })
+        Arc::clone(uop)
     }
 
     /// Attach metadata to this UOp, creating a new instance.
@@ -274,16 +301,16 @@ impl UOp {
     /// let ast = /* ... optimized AST ... */;
     /// let with_info = ast.with_metadata(KernelInfo::new("r_g16l16", vec![], false));
     /// ```
-    pub fn with_metadata<T: std::any::Any + Send + Sync + 'static>(self: &Rc<Self>, metadata: T) -> Rc<Self> {
-        Rc::new(Self {
+    pub fn with_metadata<T: std::any::Any + Send + Sync + 'static>(self: &Arc<Self>, metadata: T) -> Arc<Self> {
+        Arc::new(Self {
             id: next_uop_id(),
             op: self.op.clone(),
             dtype: self.dtype.clone(),
-            shape_cache: std::cell::OnceCell::new(),
-            ranges_cache: std::cell::OnceCell::new(),
-            in_scope_ranges_cache: std::cell::OnceCell::new(),
-            vmin_vmax_cache: std::cell::OnceCell::new(),
-            metadata: Some(std::sync::Arc::new(metadata)),
+            shape_cache: std::sync::OnceLock::new(),
+            ranges_cache: std::sync::OnceLock::new(),
+            in_scope_ranges_cache: std::sync::OnceLock::new(),
+            vmin_vmax_cache: std::sync::OnceLock::new(),
+            metadata: Some(Arc::new(metadata)),
         })
     }
 

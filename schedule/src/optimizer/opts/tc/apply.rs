@@ -5,7 +5,7 @@
 use super::{matching, selection, swizzle};
 use crate::optimizer::{Scheduler, error::*};
 use morok_ir::{AxisType, Op, UOp, WmmaMetadata};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Apply tensor core optimization to the scheduler.
 ///
@@ -121,7 +121,7 @@ pub fn apply(
         match opt {
             crate::optimizer::renderer::TcOpt::Local(dim) => {
                 // Split dimension by 2, assign to LOCAL, use warp lanes
-                let axis_idx = scheduler.rngs().iter().position(|r| Rc::ptr_eq(r, &axes[*dim]));
+                let axis_idx = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &axes[*dim]));
                 if let Some(idx) = axis_idx {
                     // For now, just note that we would split here
                     // Actual implementation would call scheduler.shift_to()
@@ -134,7 +134,7 @@ pub fn apply(
             }
             crate::optimizer::renderer::TcOpt::Upcast(dim) => {
                 // Split dimension by 2, assign to UPCAST
-                let axis_idx = scheduler.rngs().iter().position(|r| Rc::ptr_eq(r, &axes[*dim]));
+                let axis_idx = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &axes[*dim]));
                 if let Some(idx) = axis_idx {
                     // axes[*dim] = shift_to(axes[*dim], 2, AxisType::Upcast)?
                     new_ranges.push(idx);
@@ -194,7 +194,7 @@ pub fn apply(
 }
 
 /// Get the size of a RANGE UOp (if constant).
-fn get_range_size(range: &Rc<UOp>) -> Option<i64> {
+fn get_range_size(range: &Arc<UOp>) -> Option<i64> {
     if let Op::Range { end, .. } = range.op()
         && let Op::Const(cv) = end.op()
         && let morok_ir::ConstValue::Int(size) = cv.0

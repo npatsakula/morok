@@ -3,7 +3,7 @@
 //! Verifies that movement ops (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)
 //! are correctly pushed through INDEX operations.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
@@ -15,12 +15,12 @@ use crate::rewrite::graph_rewrite;
 // ===== Helper Functions =====
 
 /// Create a test buffer with given size.
-fn create_buffer(size: usize) -> Rc<UOp> {
+fn create_buffer(size: usize) -> Arc<UOp> {
     UOp::new_buffer(DeviceSpec::Cpu, size, DType::Float32)
 }
 
 /// Create a RANGE for testing.
-fn create_range(size: usize, axis_id: usize) -> Rc<UOp> {
+fn create_range(size: usize, axis_id: usize) -> Arc<UOp> {
     let end = UOp::index_const(size as i64);
     UOp::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
 }

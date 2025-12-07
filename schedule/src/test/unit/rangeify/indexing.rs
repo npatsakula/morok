@@ -21,7 +21,7 @@ fn test_indexing_context_new_range() {
 #[test]
 fn test_indexing_context_realize_map() {
     let mut ctx = IndexingContext::new();
-    let x = UOp::var("x", DType::Float32, i64::MIN, i64::MAX);
+    let x = UOp::var("x", DType::Float32, i64::MAX);
 
     assert!(!ctx.should_realize(&x));
 

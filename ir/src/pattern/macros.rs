@@ -109,7 +109,7 @@ macro_rules! pattern {
                 )*
 
                 // Call user's rewrite closure
-                let rewrite_result = (|$($var: $ty),*| -> Option<std::rc::Rc<$crate::UOp>> {
+                let rewrite_result = (|$($var: $ty),*| -> Option<std::sync::Arc<$crate::UOp>> {
                     $body
                 })($($var),*);
 
@@ -140,7 +140,7 @@ macro_rules! pattern {
                 )*
 
                 // Call user's rewrite closure
-                let rewrite_result = (|$($var),*| -> Option<std::rc::Rc<$crate::UOp>> {
+                let rewrite_result = (|$($var),*| -> Option<std::sync::Arc<$crate::UOp>> {
                     $body
                 })($($var),*);
 

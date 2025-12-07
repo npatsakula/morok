@@ -5,7 +5,7 @@
 
 use crate::optimizer::{Scheduler, error::*};
 use morok_ir::{AxisType, Op, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Apply GROUP optimization for two-stage reduction.
 ///
@@ -32,7 +32,7 @@ use std::rc::Rc;
 /// // Reduce(64) -> Reduce(8) + GroupReduce(8)
 /// apply(&mut scheduler, reduce_range, 8, false)?;
 /// ```
-pub fn apply(scheduler: &mut Scheduler, rng: Rc<UOp>, amount: usize, top: bool) -> Result<(), OptError> {
+pub fn apply(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize, top: bool) -> Result<(), OptError> {
     // 1. Validate backend support
     if !scheduler.ren.has_local {
         return UnsupportedFeatureSnafu { feature: "local memory" }.fail();
@@ -91,10 +91,10 @@ pub fn apply(scheduler: &mut Scheduler, rng: Rc<UOp>, amount: usize, top: bool) 
     // 4. Check not inside another reduce (nested reductions)
     // Look for OTHER REDUCE operations in the backward slice
     // If found, GROUP is being applied inside a nested reduction
-    let reduce_ptr = Rc::as_ptr(&reduce_uop) as *const _;
+    let reduce_ptr = Arc::as_ptr(&reduce_uop) as *const _;
     for node in reduce_uop.backward_slice() {
         if let Op::Reduce { .. } = node.op() {
-            let node_ptr = Rc::as_ptr(&node) as *const _;
+            let node_ptr = Arc::as_ptr(&node) as *const _;
             // Skip the current reduce we're working on
             if node_ptr == reduce_ptr {
                 continue;
@@ -113,11 +113,11 @@ pub fn apply(scheduler: &mut Scheduler, rng: Rc<UOp>, amount: usize, top: bool) 
 }
 
 /// Find the REDUCE operation that uses the given range.
-fn find_reduce_using_range(scheduler: &Scheduler, rng: &Rc<UOp>) -> Result<Rc<UOp>, OptError> {
+fn find_reduce_using_range(scheduler: &Scheduler, rng: &Arc<UOp>) -> Result<Arc<UOp>, OptError> {
     for reduce in scheduler.reduceops() {
         if let Op::Reduce { ranges, .. } = reduce.op() {
             for r in ranges.iter() {
-                if Rc::ptr_eq(r, rng) {
+                if Arc::ptr_eq(r, rng) {
                     return Ok(reduce);
                 }
             }

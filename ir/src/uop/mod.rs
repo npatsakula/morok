@@ -28,3 +28,4 @@ pub mod range_eval;
 
 // Re-export the main types
 pub use core::{IntoUOp, UOp, UOpKey};
+pub use hash_consing::gc_unused_uops;

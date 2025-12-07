@@ -1,14 +1,14 @@
 //! Range assignment and indexing context for rangeify transformation.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{AxisId, AxisType, ConstValue, Op, SInt, UOp, UOpKey};
 
 use super::helpers;
 
 /// (input_ranges, output_ranges) for a UOp.
-type UOpRanges = (Vec<Rc<UOp>>, Vec<Rc<UOp>>);
+type UOpRanges = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
 
 /// Context for range assignment during rangeify.
 #[derive(Default)]
@@ -32,7 +32,7 @@ impl IndexingContext {
     /// Ranges are created with `AxisId::Unrenumbered` to mark them as needing
     /// renumbering. The `renumber_range` pattern will later convert them to
     /// `AxisId::Renumbered` with sequential IDs starting from 0 for each kernel.
-    pub fn new_range(&mut self, size: &SInt, axistype: AxisType) -> Rc<UOp> {
+    pub fn new_range(&mut self, size: &SInt, axistype: AxisType) -> Arc<UOp> {
         // Check if size is constant 1
         if let SInt::Const(1) = size {
             return UOp::index_const(0);
@@ -44,44 +44,44 @@ impl IndexingContext {
 
         let size_uop = match size {
             SInt::Const(n) => UOp::index_const(*n as i64),
-            SInt::Symbolic(uop) => Rc::clone(uop),
+            SInt::Symbolic(uop) => Arc::clone(uop),
         };
 
         UOp::range_axis(size_uop, axis_id, axistype)
     }
 
     /// Mark a UOp for realization on all axes.
-    pub fn mark_realize_all(&mut self, uop: &Rc<UOp>) -> morok_ir::Result<()> {
+    pub fn mark_realize_all(&mut self, uop: &Arc<UOp>) -> morok_ir::Result<()> {
         if let Some(shape) = uop.shape()? {
             let axes = (0..shape.len()).collect();
-            self.realize_map.insert(UOpKey(Rc::clone(uop)), Some(axes));
+            self.realize_map.insert(UOpKey(Arc::clone(uop)), Some(axes));
         }
         Ok(())
     }
 
     /// Mark a UOp for realization on specific axes.
-    pub fn mark_realize(&mut self, uop: &Rc<UOp>, axes: Vec<usize>) {
-        self.realize_map.insert(UOpKey(Rc::clone(uop)), Some(axes));
+    pub fn mark_realize(&mut self, uop: &Arc<UOp>, axes: Vec<usize>) {
+        self.realize_map.insert(UOpKey(Arc::clone(uop)), Some(axes));
     }
 
     /// Check if a UOp is in the realize map.
-    pub fn should_realize(&self, uop: &Rc<UOp>) -> bool {
-        self.realize_map.contains_key(&UOpKey(Rc::clone(uop)))
+    pub fn should_realize(&self, uop: &Arc<UOp>) -> bool {
+        self.realize_map.contains_key(&UOpKey(Arc::clone(uop)))
     }
 
     /// Get the realize axes for a UOp.
-    pub fn get_realize_axes(&self, uop: &Rc<UOp>) -> Option<&Vec<usize>> {
-        self.realize_map.get(&UOpKey(Rc::clone(uop))).and_then(|opt| opt.as_ref())
+    pub fn get_realize_axes(&self, uop: &Arc<UOp>) -> Option<&Vec<usize>> {
+        self.realize_map.get(&UOpKey(Arc::clone(uop))).and_then(|opt| opt.as_ref())
     }
 
     /// Set the range map for a UOp.
-    pub fn set_ranges(&mut self, uop: &Rc<UOp>, input_ranges: Vec<Rc<UOp>>, output_ranges: Vec<Rc<UOp>>) {
-        self.range_map.insert(UOpKey(Rc::clone(uop)), (input_ranges, output_ranges));
+    pub fn set_ranges(&mut self, uop: &Arc<UOp>, input_ranges: Vec<Arc<UOp>>, output_ranges: Vec<Arc<UOp>>) {
+        self.range_map.insert(UOpKey(Arc::clone(uop)), (input_ranges, output_ranges));
     }
 
     /// Get the ranges for a UOp.
-    pub fn get_ranges(&self, uop: &Rc<UOp>) -> Option<&UOpRanges> {
-        self.range_map.get(&UOpKey(Rc::clone(uop)))
+    pub fn get_ranges(&self, uop: &Arc<UOp>) -> Option<&UOpRanges> {
+        self.range_map.get(&UOpKey(Arc::clone(uop)))
     }
 
     /// Get the current range counter value.
@@ -92,7 +92,7 @@ impl IndexingContext {
 
 /// Run range assignment on a UOp graph. Returns (transformed_sink, context).
 #[allow(clippy::mutable_key_type)]
-pub fn run_rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, IndexingContext)> {
+pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
 
     // Step 1: Generate realize map - determine which UOps need materialization
@@ -119,7 +119,7 @@ pub fn run_rangeify(sink: Rc<UOp>) -> morok_ir::Result<(Rc<UOp>, IndexingContext
 }
 
 /// Generate the realize map - mark which UOps need to be materialized to buffers.
-fn generate_realize_map(sink: &Rc<UOp>, ctx: &mut IndexingContext) -> morok_ir::Result<()> {
+fn generate_realize_map(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> morok_ir::Result<()> {
     // Traverse graph and mark realization points
     for node in sink.toposort() {
         match node.op() {
@@ -153,7 +153,7 @@ fn generate_realize_map(sink: &Rc<UOp>, ctx: &mut IndexingContext) -> morok_ir::
 }
 
 /// Check if a UOp is always contiguous (doesn't need realization).
-fn is_always_contiguous(uop: &Rc<UOp>) -> bool {
+fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
     matches!(
         uop.op(),
         Op::Contiguous { .. }
@@ -171,10 +171,10 @@ fn is_always_contiguous(uop: &Rc<UOp>) -> bool {
 
 /// Merge ranges from multiple consumers. Creates new ranges and marks realization when needed.
 fn merge_consumer_ranges(
-    uop: &Rc<UOp>,
-    consumer_rngs: &[Vec<Rc<UOp>>],
+    uop: &Arc<UOp>,
+    consumer_rngs: &[Vec<Arc<UOp>>],
     ctx: &mut IndexingContext,
-) -> morok_ir::Result<Vec<Rc<UOp>>> {
+) -> morok_ir::Result<Vec<Arc<UOp>>> {
     // Get shape to know how many dimensions
     let Some(shape) = uop.shape()? else {
         // No shape - return empty ranges (should not happen in practice)
@@ -184,11 +184,11 @@ fn merge_consumer_ranges(
     let num_dims = shape.len();
 
     // Transpose: consumer_rngs[consumer_idx][dim_idx] → all_rngs[dim_idx][consumer_idx]
-    let mut all_rngs: Vec<Vec<Rc<UOp>>> = vec![Vec::new(); num_dims];
+    let mut all_rngs: Vec<Vec<Arc<UOp>>> = vec![Vec::new(); num_dims];
     for consumer_rng in consumer_rngs {
         for (dim_idx, range) in consumer_rng.iter().enumerate() {
             if dim_idx < num_dims {
-                all_rngs[dim_idx].push(Rc::clone(range));
+                all_rngs[dim_idx].push(Arc::clone(range));
             }
         }
     }
@@ -212,13 +212,13 @@ fn merge_consumer_ranges(
         // Check if all indices are the same
         if helpers::all_ranges_same(&indices) {
             // Compatible - merge validity masks
-            let merged_idx = Rc::clone(&indices[0]);
+            let merged_idx = Arc::clone(&indices[0]);
 
             // OR all validity masks: valid1 | valid2 | ... | validN
             let merged_valid = if valids.len() == 1 {
-                Rc::clone(&valids[0])
+                Arc::clone(&valids[0])
             } else {
-                valids.iter().skip(1).try_fold(Rc::clone(&valids[0]), |acc, v| acc.try_or_op(v))?
+                valids.iter().skip(1).try_fold(Arc::clone(&valids[0]), |acc, v| acc.try_or_op(v))?
             };
 
             // Check if merged valid is constant true (no validity check needed)
@@ -251,8 +251,8 @@ fn merge_consumer_ranges(
 /// Assign input/output ranges for each UOp via reverse toposort traversal.
 #[allow(clippy::mutable_key_type)]
 fn assign_ranges(
-    reverse_topo: &[Rc<UOp>],
-    consumer_map: &HashMap<UOpKey, Vec<Rc<UOp>>>,
+    reverse_topo: &[Arc<UOp>],
+    consumer_map: &HashMap<UOpKey, Vec<Arc<UOp>>>,
     ctx: &mut IndexingContext,
 ) -> morok_ir::Result<()> {
     for x in reverse_topo {
@@ -265,7 +265,7 @@ fn assign_ranges(
         let consumers: Vec<_> = consumer_map.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
 
         // Collect consumer ranges
-        let consumer_rngs: Vec<Vec<Rc<UOp>>> =
+        let consumer_rngs: Vec<Vec<Arc<UOp>>> =
             consumers.iter().filter_map(|c| ctx.get_ranges(c).map(|(inp, _)| inp.clone())).collect();
 
         // Determine output ranges
@@ -315,13 +315,36 @@ fn assign_ranges(
             }
 
             // REDUCE_AXIS creates ranges for reduction axes
+            //
+            // The source has shape [d0, d1, ..., dn] and the output has reduced dims.
+            // For each axis in the source:
+            // - If it's a reduce axis: create a new REDUCE-type range
+            // - If it's not a reduce axis: use the corresponding output range
+            //
+            // Note: out_rngs comes from downstream RESHAPE (e.g., from remove_singleton_dims
+            // when keepdim=false). Since morok always uses keepdim=true internally then RESHAPE,
+            // out_rngs has the same number of dims as the REDUCE_AXIS output. Each position i
+            // in the source corresponds to position i in out_rngs.
+            //
+            // Follows Tinygrad's approach (indexing.py:256):
+            //   rngs = tuple(new_range(s, REDUCE) if i in axes else r for i,(r,s) in enumerate(zip(rngs, shape)))
             Op::ReduceAxis { src, axes, .. } => {
                 if let Some(in_shape) = src.shape()? {
-                    let mut rngs = out_rngs.clone();
-                    // Extend with reduction ranges
+                    let mut rngs = Vec::with_capacity(in_shape.len());
+
                     for (i, s) in in_shape.iter().enumerate() {
-                        if axes.contains(&i) && i >= rngs.len() {
+                        if axes.contains(&i) {
+                            // Reduce axis: create new REDUCE-type range
                             rngs.push(ctx.new_range(s, AxisType::Reduce));
+                        } else {
+                            // Non-reduce axis: use output range at same position
+                            // Position i in source maps to position i in out_rngs (keepdim=true)
+                            if i < out_rngs.len() {
+                                rngs.push(Arc::clone(&out_rngs[i]));
+                            } else {
+                                // Fallback: create LOOP range
+                                rngs.push(ctx.new_range(s, AxisType::Loop));
+                            }
                         }
                     }
                     rngs

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::rangeify::buffer_cost::*;
 use morok_dtype::DType;
@@ -6,7 +6,7 @@ use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, UOp};
 use smallvec::SmallVec;
 
 /// Helper: Create a BUFFER operation for testing.
-fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Rc<UOp> {
+fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Arc<UOp> {
     let unique = UOp::buffer_id(Some(id));
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     UOp::new(Op::Buffer { unique, device, size }, dtype)
@@ -34,7 +34,7 @@ fn test_collect_accessed_buffers_single_buffer() {
     let buffer = create_test_buffer(100, DType::Float32, 0);
     let buffers = collect_accessed_buffers(&buffer);
     assert_eq!(buffers.len(), 1);
-    assert!(Rc::ptr_eq(&buffers[0], &buffer));
+    assert!(Arc::ptr_eq(&buffers[0], &buffer));
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn test_collect_accessed_buffers_stops_at_global_bufferize() {
     // Should only see the bufferize, not the inner buffer
     let buffers = collect_accessed_buffers(&bufferize);
     assert_eq!(buffers.len(), 1);
-    assert!(Rc::ptr_eq(&buffers[0], &bufferize));
+    assert!(Arc::ptr_eq(&buffers[0], &bufferize));
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn test_collect_reduces_single() {
 
     let reduces = collect_reduces(&reduce);
     assert_eq!(reduces.len(), 1);
-    assert!(Rc::ptr_eq(&reduces[0], &reduce));
+    assert!(Arc::ptr_eq(&reduces[0], &reduce));
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn test_collect_indexes_single() {
 
     let indexes = collect_indexes(&index);
     assert_eq!(indexes.len(), 1);
-    assert!(Rc::ptr_eq(&indexes[0], &index));
+    assert!(Arc::ptr_eq(&indexes[0], &index));
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn test_calculate_buffer_size_buffer_op() {
 #[test]
 fn test_calculate_buffer_size_symbolic() {
     // Symbolic range → None
-    let batch_size = UOp::define_var("batch".to_string(), 1, 128);
+    let batch_size = UOp::define_var("batch".to_string(), 128);
     let range = UOp::range_axis(batch_size, AxisId::Renumbered(0), AxisType::Loop);
 
     let compute = UOp::native_const(1.0f32);
@@ -202,7 +202,7 @@ fn test_calculate_out_in_ratio_with_symbolic_bufferize() {
     // Bufferize with symbolic range → None
     let output_size = 100;
 
-    let batch_size = UOp::define_var("batch".to_string(), 1, 128);
+    let batch_size = UOp::define_var("batch".to_string(), 128);
     let range = UOp::range_axis(batch_size, AxisId::Renumbered(0), AxisType::Loop);
     let compute = UOp::native_const(1.0f32);
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Local };
@@ -245,7 +245,7 @@ fn test_has_buffer_in_reduce_negative() {
 #[test]
 fn test_has_buffer_in_reduce_empty() {
     // Empty reduces → false
-    let reduces: Vec<Rc<UOp>> = vec![];
+    let reduces: Vec<Arc<UOp>> = vec![];
     assert!(!has_buffer_in_reduce(&reduces));
 }
 

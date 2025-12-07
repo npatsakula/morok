@@ -3,9 +3,11 @@
 //! This module provides the core transformation functions that convert
 //! movement operations into explicit buffer materialization and indexing.
 
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use morok_ir::{AddrSpace, BufferizeOpts, Op, UOp, UOpKey};
+use morok_ir::{AddrSpace, AxisType, BufferizeOpts, Op, UOp, UOpKey};
+use smallvec::SmallVec;
 
 use super::indexing::IndexingContext;
 
@@ -18,7 +20,7 @@ use super::indexing::IndexingContext;
 /// 3. Passes through other sources unchanged
 ///
 /// Returns `Some(new_sources)` if any source was transformed, `None` otherwise.
-pub fn transform_sources_with_bufferize(x: &Rc<UOp>, ctx: &IndexingContext) -> Option<Vec<Rc<UOp>>> {
+pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &IndexingContext) -> Option<Vec<Arc<UOp>>> {
     // Skip already processed ops
     if matches!(x.op(), Op::Bufferize { .. } | Op::Index { .. } | Op::After { .. }) {
         return None;
@@ -37,7 +39,7 @@ pub fn transform_sources_with_bufferize(x: &Rc<UOp>, ctx: &IndexingContext) -> O
 
     for src in sources.iter() {
         let new_src = transform_single_source(x, src, input_ranges, ctx);
-        if !Rc::ptr_eq(&new_src, src) {
+        if !Arc::ptr_eq(&new_src, src) {
             any_changed = true;
         }
         new_sources.push(new_src);
@@ -51,7 +53,7 @@ pub fn transform_sources_with_bufferize(x: &Rc<UOp>, ctx: &IndexingContext) -> O
 /// This detects patterns like `RESHAPE(BUFFER)`, `PERMUTE(EXPAND(BUFFER))`, etc.
 /// These need INDEX wrapping so that `movement_op_patterns` can later transform
 /// the indices appropriately.
-fn is_movement_chain_on_buffer(uop: &Rc<UOp>) -> bool {
+fn is_movement_chain_on_buffer(uop: &Arc<UOp>) -> bool {
     let mut current = uop.clone();
     while current.op().is_movement() {
         if let Some(src) = current.op().sources().first() {
@@ -68,25 +70,25 @@ fn is_movement_chain_on_buffer(uop: &Rc<UOp>) -> bool {
 
 /// Transform a single source by adding BUFFERIZE + INDEX if needed.
 pub(crate) fn transform_single_source(
-    _consumer: &Rc<UOp>,
-    src: &Rc<UOp>,
-    input_ranges: &[Rc<UOp>],
+    _consumer: &Arc<UOp>,
+    src: &Arc<UOp>,
+    input_ranges: &[Arc<UOp>],
     ctx: &IndexingContext,
-) -> Rc<UOp> {
+) -> Arc<UOp> {
     // Case 1: Source is a buffer-like op → add INDEX
     if matches!(
         src.op(),
         Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
     ) {
         // Add INDEX with input ranges from consumer
-        return UOp::index(Rc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for buffer source");
+        return UOp::index(Arc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for buffer source");
     }
 
     // Case 1.5: Movement op chain on buffer-like source → add INDEX
     // This enables movement_op_patterns to later transform the indices.
     // Example: RESHAPE(BUFFER).INDEX([ranges]) will become BUFFER.INDEX(transformed_ranges)
     if src.op().is_movement() && is_movement_chain_on_buffer(src) {
-        return UOp::index(Rc::clone(src), input_ranges.to_vec())
+        return UOp::index(Arc::clone(src), input_ranges.to_vec())
             .expect("Failed to create INDEX for movement buffer source");
     }
 
@@ -99,7 +101,7 @@ pub(crate) fn transform_single_source(
             .iter()
             .enumerate()
             .filter(|(i, _)| realize_axes.contains(i))
-            .map(|(_, r)| Rc::clone(r))
+            .map(|(_, r)| Arc::clone(r))
             .collect();
 
         // Determine buffer options
@@ -113,14 +115,14 @@ pub(crate) fn transform_single_source(
         };
 
         // Create BUFFERIZE
-        let bufferized = UOp::bufferize(Rc::clone(src), closed_ranges, opts);
+        let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges, opts);
 
         // Add INDEX with consumer's input ranges (filtered to realized axes)
         let index_ranges: Vec<_> = input_ranges
             .iter()
             .enumerate()
             .filter(|(i, _)| realize_axes.contains(i))
-            .map(|(_, r)| Rc::clone(r))
+            .map(|(_, r)| Arc::clone(r))
             .collect();
 
         if !index_ranges.is_empty() {
@@ -131,7 +133,7 @@ pub(crate) fn transform_single_source(
     }
 
     // Case 3: No transformation needed
-    Rc::clone(src)
+    Arc::clone(src)
 }
 
 /// Check if a movement op should be removed.
@@ -141,9 +143,9 @@ pub(crate) fn transform_single_source(
 /// 2. Its source is already an INDEX operation
 ///
 /// This indicates the transformation has been applied.
-pub fn should_remove_movement_op(x: &Rc<UOp>, ctx: &IndexingContext) -> bool {
+pub fn should_remove_movement_op(x: &Arc<UOp>, ctx: &IndexingContext) -> bool {
     // Remove if op has ranges assigned
-    if ctx.range_map.contains_key(&UOpKey(Rc::clone(x))) {
+    if ctx.range_map.contains_key(&UOpKey(Arc::clone(x))) {
         return true;
     }
 
@@ -169,10 +171,10 @@ pub fn should_remove_movement_op(x: &Rc<UOp>, ctx: &IndexingContext) -> bool {
 /// 3. Reconstructs the BUFFERIZEs with optimized compute
 /// 4. Reconstructs SINK with the protected BUFFERIZEs
 fn apply_buffer_removal_protecting_sink(
-    sink: &Rc<UOp>,
+    sink: &Arc<UOp>,
     matcher: &crate::pattern::matcher::PatternMatcher<super::buffer_cost::PcontigConfig>,
     ctx: &mut super::buffer_cost::PcontigConfig,
-) -> Rc<UOp> {
+) -> Arc<UOp> {
     // If not a SINK, apply buffer_removal normally
     let Op::Sink { sources } = sink.op() else {
         return crate::rewrite::graph_rewrite(matcher, sink.clone(), ctx);
@@ -198,6 +200,71 @@ fn apply_buffer_removal_protecting_sink(
 
     // Reconstruct SINK with protected sources
     UOp::sink(new_sources)
+}
+
+/// Convert all ReduceAxis operations to REDUCE before bottom-up reconstruction.
+///
+/// This runs on original nodes before any reconstruction, avoiding ID mismatch issues
+/// in the IndexingContext. Following Tinygrad's approach where ReduceAxis → REDUCE
+/// conversion happens FIRST in the pattern list, before sources are transformed.
+///
+/// # Why This Is Needed
+///
+/// The `graph_rewrite_bottom_up` pass reconstructs nodes with new IDs when children
+/// change. If ReduceAxis conversion happens during that pass, the node passed to
+/// `ctx.get_ranges()` has a different ID than the original stored in `ctx.range_map`,
+/// causing the lookup to fail and the reduction to be incorrectly removed.
+///
+/// By running this conversion early, we operate on original nodes with their
+/// original IDs, ensuring `ctx.get_ranges()` works correctly.
+#[allow(clippy::mutable_key_type)]
+fn convert_reduceaxis_early(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> Arc<UOp> {
+    let mut replacements: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+
+    for node in sink.toposort() {
+        let Op::ReduceAxis { src, reduce_op, axes } = node.op() else {
+            continue;
+        };
+
+        // Get ranges from context (works because node hasn't been reconstructed)
+        let Some((input_ranges, _)) = ctx.get_ranges(&node) else {
+            continue;
+        };
+
+        // Extract REDUCE-type ranges for reduction axes
+        let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(i, range)| {
+                if axes.contains(&i) {
+                    if let Op::Range { axis_type: AxisType::Reduce, .. } = range.op() {
+                        Some(Arc::clone(range))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Create REDUCE and record replacement
+        let reduced = if reduce_ranges.is_empty() {
+            Arc::clone(src)
+        } else {
+            UOp::reduce(Arc::clone(src), reduce_ranges, *reduce_op)
+        };
+
+        // Preserve context mapping (following Tinygrad)
+        if let Some(ranges) = ctx.get_ranges(&node).cloned() {
+            ctx.set_ranges(&reduced, ranges.0, ranges.1);
+        }
+
+        replacements.insert(UOpKey(node.clone()), reduced);
+    }
+
+    // Substitute all replacements
+    sink.substitute(&replacements)
 }
 
 /// Main rangeify transformation entry point.
@@ -241,20 +308,25 @@ fn apply_buffer_removal_protecting_sink(
 /// println!("Generated {} ranges", ctx.range_counter);
 /// ```
 pub fn rangeify(
-    sink: Rc<UOp>,
+    sink: Arc<UOp>,
     pcontig_config: Option<&super::buffer_cost::PcontigConfig>,
-) -> morok_ir::Result<(Rc<UOp>, super::context::RangeifyContext)> {
+) -> morok_ir::Result<(Arc<UOp>, super::context::RangeifyContext)> {
     // Step 1: Run range assignment to build IndexingContext
     let (mut sink, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
 
     // Step 2: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
+    // Must use bottom_up to traverse all nodes in the graph, not just the root
     let early_matcher = super::patterns::early_rewrites();
-    sink = crate::rewrite::graph_rewrite(&early_matcher, sink, &mut ());
+    sink = crate::rewrite::graph_rewrite_bottom_up(&early_matcher, sink, &mut ());
+
+    // Step 2.5: Convert ReduceAxis → REDUCE early (before bottom-up reconstruction)
+    // This ensures we access original nodes with their original IDs, avoiding
+    // ID mismatch issues when graph_rewrite_bottom_up reconstructs nodes.
+    sink = convert_reduceaxis_early(&sink, &mut indexing_ctx);
 
     // Step 3: Apply core rangeify transformation (bottom-up)
     // This must be bottom-up so that ADD gets transformed before BUFFERIZE.
     // Using graph_rewrite_bottom_up to ensure children are processed first.
-    // NOTE: ReduceAxis → REDUCE conversion is now part of this step
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
     sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, sink, &mut indexing_ctx);
 
@@ -263,6 +335,11 @@ pub fn rangeify(
     // - Removes size-1 dimensions from BUFFERIZE
     let buffer_simplify = super::patterns::buffer_folding() + super::patterns::dead_axis_removal();
     sink = crate::rewrite::graph_rewrite(&buffer_simplify, sink, &mut ());
+
+    // Step 4.5: Apply early rewrites again to catch RESHAPE to scalar
+    // After convert_reduceaxis_early, we may have RESHAPE(REDUCE) where the REDUCE
+    // produces a scalar. This RESHAPE should be eliminated.
+    sink = crate::rewrite::graph_rewrite_bottom_up(&early_matcher, sink, &mut ());
 
     // Step 5: Cost-based buffer removal with partial contiguous
     // Remove buffers that don't provide performance benefits

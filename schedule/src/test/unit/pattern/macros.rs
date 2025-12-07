@@ -2,8 +2,8 @@ use crate::pattern::UPat;
 use crate::pattern::{PatternMatcher, RewriteResult};
 use crate::rangeify::helpers::{get_const_value, is_identity_value};
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, UOp};
-use std::rc::Rc;
+use morok_ir::{BinaryOp, ConstValue, UOp, pattern};
+use std::sync::Arc;
 
 #[test]
 fn test_pattern_macro_basic() {
@@ -14,7 +14,7 @@ fn test_pattern_macro_basic() {
         UPat::var("x") + UPat::cvar("c") => |x, c| {
             let const_val = get_const_value(c)?;
             if is_identity_value(&const_val, &BinaryOp::Add, true) {
-                Some(Rc::clone(x))
+                Some(Arc::clone(x))
             } else {
                 None
             }
@@ -33,7 +33,7 @@ fn test_pattern_macro_basic() {
     let result = matcher.rewrite(&add, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &five));
+        assert!(Arc::ptr_eq(&rewritten, &five));
     }
 }
 
@@ -45,7 +45,7 @@ fn test_pattern_macro_no_match() {
         UPat::var("x") + UPat::cvar("c") => |x, c| {
             let const_val = get_const_value(c)?;
             if is_identity_value(&const_val, &BinaryOp::Add, true) {
-                Some(Rc::clone(x))
+                Some(Arc::clone(x))
             } else {
                 None
             }
@@ -75,7 +75,7 @@ fn test_pattern_macro_multiple_variables() {
             let _unused = x;  // Suppress unused variable warning
             let const_val = get_const_value(zero)?;
             if is_zero_value(&const_val, &BinaryOp::Mul) {
-                Some(Rc::clone(zero))
+                Some(Arc::clone(zero))
             } else {
                 None
             }
@@ -91,7 +91,7 @@ fn test_pattern_macro_multiple_variables() {
     let result = matcher.rewrite(&mul, &mut ());
     match &result {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(r, &zero));
+            assert!(Arc::ptr_eq(r, &zero));
         }
         RewriteResult::NoMatch => {
             panic!("Pattern did not match!");

@@ -5,7 +5,7 @@
 
 use crate::optimizer::{Scheduler, error::*};
 use morok_ir::{AxisType, Op, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Apply UPCAST optimization to vectorize a dimension.
 ///
@@ -31,7 +31,7 @@ use std::rc::Rc;
 /// // Global(16) -> Global(4) + Upcast(4)
 /// apply(&mut scheduler, global_range, 4)?;
 /// ```
-pub fn apply(scheduler: &mut Scheduler, rng: Rc<UOp>, amount: usize) -> Result<(), OptError> {
+pub fn apply(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     // 1. Validate axis type
     let axis_type = if let Op::Range { axis_type, .. } = rng.op() {
         *axis_type

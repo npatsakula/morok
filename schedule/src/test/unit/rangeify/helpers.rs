@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
 
@@ -7,7 +7,7 @@ use crate::rangeify::helpers::{get_const_value, is_const, is_identity_value, is_
 /// Count occurrences of ops matching a predicate in a UOp graph.
 ///
 /// Recursively traverses the graph and counts all UOps where `predicate` returns true.
-pub fn count_ops<F>(uop: &Rc<UOp>, predicate: F) -> usize
+pub fn count_ops<F>(uop: &Arc<UOp>, predicate: F) -> usize
 where
     F: Fn(&Op) -> bool + Copy,
 {
@@ -22,32 +22,32 @@ where
 }
 
 /// Count KERNEL operations in a UOp graph.
-pub fn count_kernels(uop: &Rc<UOp>) -> usize {
+pub fn count_kernels(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::Kernel { .. }))
 }
 
 /// Count DEFINE_GLOBAL operations in a UOp graph.
-pub fn count_define_globals(uop: &Rc<UOp>) -> usize {
+pub fn count_define_globals(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::DefineGlobal(_)))
 }
 
 /// Count DEFINE_LOCAL operations in a UOp graph.
-pub fn count_define_locals(uop: &Rc<UOp>) -> usize {
+pub fn count_define_locals(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::DefineLocal(_)))
 }
 
 /// Count STORE operations in a UOp graph.
-pub fn count_stores(uop: &Rc<UOp>) -> usize {
+pub fn count_stores(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::Store { .. }))
 }
 
 /// Count END operations in a UOp graph.
-pub fn count_ends(uop: &Rc<UOp>) -> usize {
+pub fn count_ends(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::End { .. }))
 }
 
 /// Count BUFFERIZE operations in a UOp graph.
-pub fn count_bufferizes(uop: &Rc<UOp>) -> usize {
+pub fn count_bufferizes(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::Bufferize { .. }))
 }
 
@@ -56,27 +56,27 @@ pub fn count_bufferizes(uop: &Rc<UOp>) -> usize {
 // ============================================================================
 
 /// Create a constant UOp with the given value.
-pub fn create_const(val: i64) -> Rc<UOp> {
+pub fn create_const(val: i64) -> Arc<UOp> {
     UOp::index_const(val)
 }
 
 /// Create a RANGE operation with constant end value.
-pub fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
+pub fn create_range(end: i64, axis_id: usize) -> Arc<UOp> {
     UOp::range_const(end, axis_id)
 }
 
 /// Create a RANGE operation with symbolic end value.
-pub fn create_range_symbolic(end: Rc<UOp>, axis_id: usize) -> Rc<UOp> {
+pub fn create_range_symbolic(end: Arc<UOp>, axis_id: usize) -> Arc<UOp> {
     UOp::range(end, axis_id)
 }
 
 /// Create a BUFFERIZE operation with global address space.
-pub fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
+pub fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
     UOp::bufferize_global(compute, ranges)
 }
 
 /// Create a BUFFERIZE operation with custom options.
-pub fn create_bufferize_opts(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>, opts: BufferizeOpts) -> Rc<UOp> {
+pub fn create_bufferize_opts(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>, opts: BufferizeOpts) -> Arc<UOp> {
     UOp::bufferize(compute, ranges, opts)
 }
 

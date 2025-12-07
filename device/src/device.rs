@@ -10,10 +10,10 @@
 //! and share compiled kernels via the method cache.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use morok_dtype::DeviceSpec;
+use morok_ir::UOp;
 
 use crate::allocator::Allocator;
 use crate::error::Result;
@@ -54,29 +54,80 @@ pub trait Program {
     fn name(&self) -> &str;
 }
 
-/// A compiler that transforms source code into executable bytes.
+/// Compilation result carrying source (JIT) or bytes (AOT).
+///
+/// Different backends need different information:
+/// - LLVM JIT: needs source code to compile during runtime
+/// - CUDA: needs PTX/CUBIN bytes to load
+/// - Metal: needs metallib bytes to load
+///
+/// This design allows the RuntimeFactory to access whatever it needs
+/// without requiring separate code paths for JIT vs AOT backends.
+#[derive(Debug, Clone)]
+pub struct CompiledSpec {
+    /// Entry point function name
+    pub name: String,
+
+    /// Source code (for JIT backends like LLVM)
+    /// Set to Some(...) for LLVM JIT, None for AOT backends
+    pub src: Option<String>,
+
+    /// Compiled bytes (for AOT backends like CUDA/Metal)
+    /// Empty for LLVM JIT, populated for AOT backends
+    pub bytes: Vec<u8>,
+
+    /// Original AST for cache key construction via hash consing
+    pub ast: Arc<UOp>,
+}
+
+impl CompiledSpec {
+    /// Create a new CompiledSpec for JIT backends (source-based).
+    pub fn from_source(name: String, src: String, ast: Arc<UOp>) -> Self {
+        Self { name, src: Some(src), bytes: Vec::new(), ast }
+    }
+
+    /// Create a new CompiledSpec for AOT backends (bytecode-based).
+    pub fn from_bytes(name: String, bytes: Vec<u8>, ast: Arc<UOp>) -> Self {
+        Self { name, src: None, bytes, ast }
+    }
+}
+
+/// A compiler that transforms source code into a compiled specification.
 ///
 /// This trait abstracts over different compilation backends:
-/// - LLVM: IR -> object code
+/// - LLVM: IR validation (JIT compiles at runtime)
 /// - CUDA: CUDA C -> PTX/CUBIN
 /// - Metal: Metal Shading Language -> metallib
 /// - WebGPU: WGSL -> SPIR-V
 pub trait Compiler: Send + Sync {
-    /// Compile source code into executable bytes.
+    /// Compile a program specification into executable form.
     ///
     /// # Arguments
     ///
-    /// * `src` - The source code (LLVM IR, CUDA C, Metal, WGSL, etc.)
+    /// * `spec` - The program specification containing source code and metadata
     ///
     /// # Returns
     ///
-    /// Compiled bytes ready to be loaded by the runtime.
-    /// Format depends on backend:
-    /// - LLVM: Object code
-    /// - CUDA: PTX or CUBIN
-    /// - Metal: metallib binary
-    /// - WebGPU: SPIR-V binary
-    fn compile(&self, src: &str) -> Result<Vec<u8>>;
+    /// A CompiledSpec containing:
+    /// - For JIT backends (LLVM): source code in `src` field, empty `bytes`
+    /// - For AOT backends (CUDA/Metal): compiled bytes in `bytes` field, no `src`
+    ///
+    /// # Examples
+    ///
+    /// JIT backend (LLVM):
+    /// ```ignore
+    /// let compiled = compiler.compile(&spec)?;
+    /// assert!(compiled.src.is_some());
+    /// assert!(compiled.bytes.is_empty());
+    /// ```
+    ///
+    /// AOT backend (CUDA):
+    /// ```ignore
+    /// let compiled = compiler.compile(&spec)?;
+    /// assert!(compiled.src.is_none());
+    /// assert!(!compiled.bytes.is_empty());
+    /// ```
+    fn compile(&self, spec: &ProgramSpec) -> Result<CompiledSpec>;
 
     /// Optional cache key for this compiler configuration.
     ///
@@ -110,23 +161,39 @@ pub trait Renderer: Send + Sync {
     /// - Entry point name
     /// - Variable list
     /// - Work sizes (for GPU backends)
-    fn render(&self, ast: &Rc<morok_ir::UOp>) -> Result<ProgramSpec>;
+    fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec>;
 
     /// Get the device spec for this renderer.
     ///
     /// This is used for cache key construction and device selection.
     fn device(&self) -> &DeviceSpec;
+
+    /// Returns decomposition patterns for operations this backend doesn't support.
+    ///
+    /// This is used by the realization pass to decompose complex operations
+    /// into simpler primitives before rendering.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns `None`, meaning no decomposition is needed (backend supports all ops).
+    /// Backends that don't support certain operations (e.g., transcendentals on
+    /// Cranelift) should override this to return appropriate patterns.
+    fn decompositor(&self) -> Option<morok_ir::pattern::PatternMatcher<()>> {
+        None
+    }
 }
 
-/// A factory function that creates executable Programs from compiled bytes.
+/// A factory function that creates executable Programs from a compiled specification.
 ///
 /// This is a function pointer that wraps the backend-specific loader:
-/// - LLVM: Load object code via JIT
-/// - CUDA: cuModuleLoadData + cuModuleGetFunction
-/// - Metal: newLibraryWithData + newFunctionWithName
-/// - WebGPU: createShaderModule
-pub type RuntimeFactory =
-    Arc<dyn Fn(&str, &[u8]) -> Result<Box<dyn Program>> + Send + Sync>;
+/// - LLVM: Extract source from CompiledSpec and JIT compile
+/// - CUDA: Extract bytes from CompiledSpec and call cuModuleLoadData + cuModuleGetFunction
+/// - Metal: Extract bytes from CompiledSpec and call newLibraryWithData + newFunctionWithName
+/// - WebGPU: Extract bytes from CompiledSpec and call createShaderModule
+///
+/// The CompiledSpec contains either source (for JIT) or bytes (for AOT),
+/// allowing each backend to access what it needs.
+pub type RuntimeFactory = Arc<dyn Fn(&CompiledSpec) -> Result<Box<dyn Program>> + Send + Sync>;
 
 /// A (Renderer, Compiler) pair for a specific backend.
 ///
@@ -143,8 +210,8 @@ pub type CompilerPair = (Arc<dyn Renderer>, Arc<dyn Compiler>);
 /// ```ignore
 /// let cpu_device = create_cpu_device()?;
 /// let spec = cpu_device.renderer.render(&kernel_ast)?;
-/// let compiled_bytes = cpu_device.compiler.compile(&spec.src)?;
-/// let program = (cpu_device.runtime)(&spec.name, &compiled_bytes)?;
+/// let compiled = cpu_device.compiler.compile(&spec)?;
+/// let program = (cpu_device.runtime)(&compiled)?;
 /// unsafe { program.execute(&buffers, &vars, None, None)?; }
 /// ```
 pub struct Device {
@@ -203,12 +270,7 @@ impl Device {
     ///
     /// This allows compiled CUDA kernels to be reused across CUDA:0 and CUDA:1.
     pub fn base_device_key(&self) -> &'static str {
-        match &self.device {
-            DeviceSpec::Cpu => "CPU",
-            DeviceSpec::Cuda { .. } => "CUDA",
-            DeviceSpec::Metal { .. } => "Metal",
-            DeviceSpec::WebGpu => "WebGPU",
-        }
+        self.device.base_type()
     }
 }
 
@@ -228,7 +290,7 @@ pub struct ProgramSpec {
     pub device: DeviceSpec,
 
     /// Original AST (for cache key construction via hash consing)
-    pub ast: Rc<morok_ir::UOp>,
+    pub ast: Arc<UOp>,
 
     /// Global work size (for GPU backends, None for CPU)
     pub global_size: Option<[usize; 3]>,
@@ -242,16 +304,8 @@ pub struct ProgramSpec {
 
 impl ProgramSpec {
     /// Create a new program specification.
-    pub fn new(name: String, src: String, device: DeviceSpec, ast: Rc<morok_ir::UOp>) -> Self {
-        Self {
-            name,
-            src,
-            device,
-            ast,
-            global_size: None,
-            local_size: None,
-            vars: Vec::new(),
-        }
+    pub fn new(name: String, src: String, device: DeviceSpec, ast: Arc<UOp>) -> Self {
+        Self { name, src, device, ast, global_size: None, local_size: None, vars: Vec::new() }
     }
 
     /// Add a variable to the program.

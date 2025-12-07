@@ -46,9 +46,9 @@
 //! }
 //! ```
 
-use morok_ir::{UOp, UOpKey};
+use crate::{UOp, UOpKey};
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::pattern::{PatternMatcher, RewriteResult};
 
@@ -69,27 +69,34 @@ enum Stage {
 #[derive(Debug, Clone)]
 struct StackEntry {
     /// The node that consumers reference - used as key in results cache
-    original: Rc<UOp>,
+    original: Arc<UOp>,
     /// Current processing stage
     stage: Stage,
     /// The node we're actively working with (may differ after rewrites)
-    working: Rc<UOp>,
+    working: Arc<UOp>,
+    /// Retry count for Finalize stage (to detect infinite loops)
+    retry_count: u32,
 }
 
 impl StackEntry {
     /// Create entry for a fresh node starting at Rewrite stage.
-    fn new(node: Rc<UOp>) -> Self {
-        Self { original: node.clone(), stage: Stage::Rewrite, working: node }
+    fn new(node: Arc<UOp>) -> Self {
+        Self { original: node.clone(), stage: Stage::Rewrite, working: node, retry_count: 0 }
     }
 
     /// Create entry for Finalize stage with potentially different working node.
-    fn finalize(original: Rc<UOp>, working: Rc<UOp>) -> Self {
-        Self { original, stage: Stage::Finalize, working }
+    fn finalize(original: Arc<UOp>, working: Arc<UOp>) -> Self {
+        Self { original, stage: Stage::Finalize, working, retry_count: 0 }
+    }
+
+    /// Create entry for Finalize stage with retry count (for re-pushed entries).
+    fn finalize_retry(original: Arc<UOp>, working: Arc<UOp>, retry_count: u32) -> Self {
+        Self { original, stage: Stage::Finalize, working, retry_count }
     }
 
     /// Create entry for Rewrite stage where original == working.
-    fn rewrite(node: Rc<UOp>) -> Self {
-        Self { original: node.clone(), stage: Stage::Rewrite, working: node }
+    fn rewrite(node: Arc<UOp>) -> Self {
+        Self { original: node.clone(), stage: Stage::Rewrite, working: node, retry_count: 0 }
     }
 }
 
@@ -100,7 +107,7 @@ impl StackEntry {
 /// than the O(chain_length) traversal of naive chain following.
 struct ResultMap {
     /// Maps each node to its final result (with path compression on lookup)
-    results: HashMap<UOpKey, Rc<UOp>>,
+    results: HashMap<UOpKey, Arc<UOp>>,
 }
 
 impl ResultMap {
@@ -112,7 +119,7 @@ impl ResultMap {
     ///
     /// Follows the chain of rewrites and compresses the path so future
     /// lookups are O(1). Returns the node itself if no result is cached.
-    fn get(&mut self, node: &Rc<UOp>) -> Rc<UOp> {
+    fn get(&mut self, node: &Arc<UOp>) -> Arc<UOp> {
         let key = UOpKey(node.clone());
 
         // Fast path: no result cached
@@ -121,7 +128,7 @@ impl ResultMap {
         };
 
         // If result points to self, we're done
-        if Rc::ptr_eq(&result, node) {
+        if Arc::ptr_eq(&result, node) {
             return result;
         }
 
@@ -133,7 +140,7 @@ impl ResultMap {
         for _ in 0..MAX_DEPTH {
             let current_key = UOpKey(current.clone());
             match self.results.get(&current_key) {
-                Some(next) if !Rc::ptr_eq(next, &current) => {
+                Some(next) if !Arc::ptr_eq(next, &current) => {
                     path.push(current_key);
                     current = next.clone();
                 }
@@ -150,17 +157,17 @@ impl ResultMap {
     }
 
     /// Link original node to its result.
-    fn link(&mut self, original: Rc<UOp>, result: Rc<UOp>) {
+    fn link(&mut self, original: Arc<UOp>, result: Arc<UOp>) {
         self.results.insert(UOpKey(original), result);
     }
 
     /// Check if node has a result (without path compression).
-    fn contains(&self, node: &Rc<UOp>) -> bool {
+    fn contains(&self, node: &Arc<UOp>) -> bool {
         self.results.contains_key(&UOpKey(node.clone()))
     }
 
     /// Get result from raw HashMap (for early exit check).
-    fn get_direct(&self, key: &UOpKey) -> Option<Rc<UOp>> {
+    fn get_direct(&self, key: &UOpKey) -> Option<Arc<UOp>> {
         self.results.get(key).cloned()
     }
 }
@@ -203,7 +210,7 @@ impl<'a, C> RewriteEngine<'a, C> {
     /// Applies patterns to the node until no more rewrites are possible.
     /// Children are only pushed for processing when a Gate is returned,
     /// matching Tinygrad's behavior where patterns control child processing.
-    fn handle_rewrite(&mut self, stack: &mut Vec<StackEntry>, original: Rc<UOp>, working: Rc<UOp>) {
+    fn handle_rewrite(&mut self, stack: &mut Vec<StackEntry>, original: Arc<UOp>, working: Arc<UOp>) {
         // Fixed-point pattern matching with iteration limit (panic if exceeded)
         const MAX_ITERATIONS: usize = 1000;
         let mut node = working;
@@ -266,7 +273,21 @@ impl<'a, C> RewriteEngine<'a, C> {
     ///
     /// If reconstruction creates a new node, we push it back to Rewrite stage
     /// to ensure any new patterns are applied and new children are processed.
-    fn handle_finalize(&mut self, stack: &mut Vec<StackEntry>, original: Rc<UOp>, working: Rc<UOp>) {
+    ///
+    /// **Shared Children Handling:**
+    /// When multiple nodes share a child (e.g., REDUCE and INDEX both reference
+    /// the same RANGE), there's a risk that a parent's Finalize runs before the
+    /// shared child has been fully processed. We detect this by checking if any
+    /// source is still pending (in `pending` set but not in `results`). If so,
+    /// we push the pending source's Finalize first (if not already on stack),
+    /// then re-push this Finalize to try again after the source completes.
+    fn handle_finalize(
+        &mut self,
+        stack: &mut Vec<StackEntry>,
+        original: Arc<UOp>,
+        working: Arc<UOp>,
+        retry_count: u32,
+    ) {
         let sources = working.op().sources();
 
         // For leaf nodes, just link and return
@@ -275,13 +296,46 @@ impl<'a, C> RewriteEngine<'a, C> {
             return;
         }
 
-        // Collect optimized children
+        // Check if all sources have been fully processed.
+        // A source is ready if it has a result in the cache.
+        //
+        // If any source has no result yet, we must defer this Finalize until
+        // after that source completes. To avoid priority inversion (where this
+        // node's re-push keeps blocking the source), we push re-try BEFORE the
+        // current stack top, not on top.
+        let mut needs_defer = false;
+        for src in &sources {
+            if !self.results.contains(src) {
+                // Source has no result yet - check if it was supposed to be processed
+                let src_key = UOpKey(src.clone());
+                if self.pending.contains(&src_key) {
+                    // Source was pushed but hasn't completed - we need to wait
+                    needs_defer = true;
+                    break;
+                }
+                // Source was never pushed (not in pending) - it won't change,
+                // so we can use it as-is
+            }
+        }
+
+        if needs_defer {
+            const MAX_RETRIES: u32 = 10_000;
+            if retry_count >= MAX_RETRIES {
+                panic!("Finalize stuck waiting for sources after {} retries: {:?}", MAX_RETRIES, working.op());
+            }
+            // Re-push this Finalize, but at a LOWER priority by inserting at the
+            // FRONT of the stack (so it runs AFTER everything currently on the stack)
+            stack.insert(0, StackEntry::finalize_retry(original, working, retry_count + 1));
+            return;
+        }
+
+        // All sources ready - collect optimized children
         let mut new_sources = Vec::with_capacity(sources.len());
         let mut any_changed = false;
 
         for src in &sources {
             let optimized = self.results.get(src);
-            if !Rc::ptr_eq(&optimized, src) {
+            if !Arc::ptr_eq(&optimized, src) {
                 any_changed = true;
             }
             new_sources.push(optimized);
@@ -323,10 +377,13 @@ impl<'a, C> RewriteEngine<'a, C> {
     }
 
     /// Link original node to its final result in the cache.
-    fn link_result(&mut self, original: Rc<UOp>, result: Rc<UOp>) {
+    fn link_result(&mut self, original: Arc<UOp>, result: Arc<UOp>) {
+        // Remove from pending set - this node is now fully processed
+        self.pending.remove(&UOpKey(original.clone()));
+
         // Record provenance if actually rewritten
-        if !Rc::ptr_eq(&original, &result) {
-            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
+        if !Arc::ptr_eq(&original, &result) {
+            use crate::provenance::{PROVENANCE_TRACKER, PassName};
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().record_transform(result.id, original.id, PassName::RewritePattern);
             });
@@ -341,7 +398,7 @@ impl<'a, C> RewriteEngine<'a, C> {
     /// through 2 stages:
     /// 1. Stage 0 (Rewrite): Bottom-up pattern matching with fixed-point iteration
     /// 2. Stage 1 (Finalize): Source reconstruction + link final replacement
-    fn rewrite(&mut self, root: Rc<UOp>) -> Rc<UOp> {
+    fn rewrite(&mut self, root: Arc<UOp>) -> Arc<UOp> {
         let root_key = UOpKey(root.clone());
 
         // Early exit if already processed
@@ -356,7 +413,7 @@ impl<'a, C> RewriteEngine<'a, C> {
         const MAX_TOTAL_ITERATIONS: usize = 100_000;
         let mut iterations = 0;
 
-        while let Some(StackEntry { original, stage, working }) = stack.pop() {
+        while let Some(StackEntry { original, stage, working, retry_count }) = stack.pop() {
             iterations += 1;
             if iterations > MAX_TOTAL_ITERATIONS {
                 panic!(
@@ -374,7 +431,7 @@ impl<'a, C> RewriteEngine<'a, C> {
 
             match stage {
                 Stage::Rewrite => self.handle_rewrite(&mut stack, original, working),
-                Stage::Finalize => self.handle_finalize(&mut stack, original, working),
+                Stage::Finalize => self.handle_finalize(&mut stack, original, working, retry_count),
             }
         }
 
@@ -409,7 +466,7 @@ impl<'a, C> RewriteEngine<'a, C> {
 /// # Example
 ///
 /// ```ignore
-/// use schedule::{PatternMatcher, graph_rewrite};
+/// use morok_ir::{PatternMatcher, graph_rewrite};
 /// use morok_ir::UOp;
 ///
 /// // Patterns without context
@@ -421,7 +478,7 @@ impl<'a, C> RewriteEngine<'a, C> {
 /// let mut ctx = KernelContext::new();
 /// let optimized = graph_rewrite(&matcher, root_uop, &mut ctx);
 /// ```
-pub fn graph_rewrite<C>(matcher: &PatternMatcher<C>, root: Rc<UOp>, ctx: &mut C) -> Rc<UOp> {
+pub fn graph_rewrite<C>(matcher: &PatternMatcher<C>, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
     let mut engine = RewriteEngine::new(matcher, ctx);
     engine.rewrite(root)
 }
@@ -438,7 +495,7 @@ pub fn graph_rewrite<C>(matcher: &PatternMatcher<C>, root: Rc<UOp>, ctx: &mut C)
 /// let matcher = to_define_global_patterns();
 /// let optimized = graph_rewrite_bottom_up(&matcher, root, &mut ctx);
 /// ```
-pub fn graph_rewrite_bottom_up<C>(matcher: &PatternMatcher<C>, root: Rc<UOp>, ctx: &mut C) -> Rc<UOp> {
+pub fn graph_rewrite_bottom_up<C>(matcher: &PatternMatcher<C>, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
     let mut engine = RewriteEngine::new_bottom_up(matcher, ctx);
     engine.rewrite(root)
 }

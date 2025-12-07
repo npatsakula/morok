@@ -10,7 +10,7 @@
 //! - BUFFERIZE(compute, ranges, opts) with LOCAL addrspace
 //!   → DEFINE_LOCAL + STORE wrapped in END operations + BARRIER
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{AddrSpace, ConstValue, Op, UOp};
 use smallvec::SmallVec;
@@ -26,7 +26,7 @@ use super::kernel_context::KernelContext;
 ///
 /// Panics if any range has a symbolic (non-constant) bound.
 /// This matches Tinygrad's behavior: `assert isinstance(size, int), "no symbolic sized buffers"`
-fn calculate_size_from_ranges(ranges: &SmallVec<[Rc<UOp>; 4]>) -> usize {
+fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
     if ranges.is_empty() {
         return 1;
     }
@@ -79,7 +79,7 @@ fn calculate_size_from_ranges(ranges: &SmallVec<[Rc<UOp>; 4]>) -> usize {
 /// // Input: BUFFERIZE(compute, [range1, range2], {addrspace: GLOBAL})
 /// // Output: END(range2, END(range1, STORE(DEFINE_GLOBAL(0), index, compute)))
 /// ```
-pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
+pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     // Extract BUFFERIZE components
     let (compute, ranges, opts) = match bufferize_op.op() {
         Op::Bufferize { compute, ranges, opts } => (compute, ranges, opts),
@@ -100,7 +100,11 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
         let ptr_dtype = base_dtype.ptr(Some(size), opts.addrspace);
 
         // Create new buffer allocation based on address space
-        let buffer = if opts.addrspace == AddrSpace::Global {
+
+        // DON'T track buffer here - handle_after will do it later
+        // Following Tinygrad's architecture: ctx.map is populated by handle_after pattern
+
+        if opts.addrspace == AddrSpace::Global {
             // Global memory: DEFINE_GLOBAL
             let global_id = ctx.next_global();
             UOp::define_global(global_id, ptr_dtype)
@@ -108,12 +112,7 @@ pub fn bufferize_to_store(bufferize_op: &Rc<UOp>, ctx: &mut KernelContext) -> Op
             // Local/shared memory: DEFINE_LOCAL
             let local_id = ctx.next_local();
             UOp::define_local(local_id, ptr_dtype)
-        };
-
-        // DON'T track buffer here - handle_after will do it later
-        // Following Tinygrad's architecture: ctx.map is populated by handle_after pattern
-
-        buffer
+        }
     };
 
     // Create index for the STORE

@@ -75,15 +75,12 @@ impl DeviceSpecExt for DeviceSpec {
     }
 }
 
+#[derive(Default)]
 pub struct DeviceRegistry {
     devices: RwLock<HashMap<DeviceSpec, Arc<dyn Allocator>>>,
 }
 
 impl DeviceRegistry {
-    fn new() -> Self {
-        Self { devices: RwLock::new(HashMap::new()) }
-    }
-
     /// Get or create a device allocator.
     pub fn get(&self, spec: &DeviceSpec) -> Result<Arc<dyn Allocator>> {
         // Fast path: read lock
@@ -133,7 +130,7 @@ impl DeviceRegistry {
 }
 
 /// Global device registry instance.
-static REGISTRY: Lazy<DeviceRegistry> = Lazy::new(DeviceRegistry::new);
+static REGISTRY: Lazy<DeviceRegistry> = Lazy::new(DeviceRegistry::default);
 
 /// Get the global device registry.
 pub fn registry() -> &'static DeviceRegistry {

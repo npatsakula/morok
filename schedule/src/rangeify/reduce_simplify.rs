@@ -1,14 +1,14 @@
 //! Reduction simplification: reduce_unparented and reduce_collapse.
 
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{Op, ReduceOp, UOp, UOpKey};
 use smallvec::SmallVec;
 
 /// Remove ranges from REDUCE that don't appear in source. ADD→mul by size, MUL→pow.
 #[allow(clippy::mutable_key_type)]
-pub fn reduce_unparented(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
+pub fn reduce_unparented(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
         return None;
     };
@@ -38,10 +38,10 @@ pub fn reduce_unparented(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
     // Build result starting with parented ranges only
     let mut result = if !parented.is_empty() || reduce.dtype() != src.dtype() {
         // Create REDUCE with only parented ranges
-        UOp::reduce(Rc::clone(src), parented, *reduce_op)
+        UOp::reduce(Arc::clone(src), parented, *reduce_op)
     } else {
         // No parented ranges and same dtype - just return source
-        Rc::clone(src)
+        Arc::clone(src)
     };
 
     // Apply transformations for each unparented range
@@ -74,18 +74,18 @@ pub fn reduce_unparented(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
 /// Partition ranges into parented (in src_ranges) and unparented.
 #[allow(clippy::mutable_key_type)]
 fn partition_ranges(
-    ranges: &SmallVec<[Rc<UOp>; 4]>,
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
     src_ranges: &HashSet<UOpKey>,
-) -> (SmallVec<[Rc<UOp>; 4]>, Vec<Rc<UOp>>) {
+) -> (SmallVec<[Arc<UOp>; 4]>, Vec<Arc<UOp>>) {
     let mut parented = SmallVec::new();
     let mut unparented = Vec::new();
 
     for range in ranges {
-        let key = UOpKey(Rc::clone(range));
+        let key = UOpKey(Arc::clone(range));
         if src_ranges.contains(&key) {
-            parented.push(Rc::clone(range));
+            parented.push(Arc::clone(range));
         } else {
-            unparented.push(Rc::clone(range));
+            unparented.push(Arc::clone(range));
         }
     }
 
@@ -93,13 +93,13 @@ fn partition_ranges(
 }
 
 /// Extract size (end value) from RANGE.
-fn get_range_size(range: &Rc<UOp>) -> Option<Rc<UOp>> {
-    if let Op::Range { end, .. } = range.op() { Some(Rc::clone(end)) } else { None }
+fn get_range_size(range: &Arc<UOp>) -> Option<Arc<UOp>> {
+    if let Op::Range { end, .. } = range.op() { Some(Arc::clone(end)) } else { None }
 }
 
 /// Lift range-independent computations outside REDUCE via symbolic simplification.
 #[allow(clippy::mutable_key_type)]
-pub fn reduce_collapse(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
+pub fn reduce_collapse(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     use std::collections::{HashMap, HashSet};
 
     // Only handle REDUCE operations
@@ -114,7 +114,7 @@ pub fn reduce_collapse(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
 
     // Step 1: Create substitution map: RANGE → DEFINE_VAR
     // For each range, create a symbolic variable with bounds [0, size-1]
-    let mut substitute_map: HashMap<UOpKey, Rc<UOp>> = HashMap::new();
+    let mut substitute_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
     for (i, range) in ranges.iter().enumerate() {
         // Extract range size as constant i64
@@ -127,9 +127,9 @@ pub fn reduce_collapse(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
 
         // Create symbolic variable: Variable(f"idx{i}", 0, size-1)
         let var_name = format!("ridx{}", i); // "ridx" = reduction index
-        let define_var = UOp::define_var(var_name, 0, size_i64 - 1);
+        let define_var = UOp::define_var(var_name, size_i64 - 1);
 
-        substitute_map.insert(UOpKey(Rc::clone(range)), define_var);
+        substitute_map.insert(UOpKey(Arc::clone(range)), define_var);
     }
 
     // Step 2: Apply substitution to src
@@ -147,7 +147,7 @@ pub fn reduce_collapse(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
         simplified.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::DefineVar { .. })).map(UOpKey).collect();
 
     // Check if any of our substituted vars remain in the simplified expression
-    let has_var_dependency = substitute_map.values().any(|var| vars_in_simplified.contains(&UOpKey(Rc::clone(var))));
+    let has_var_dependency = substitute_map.values().any(|var| vars_in_simplified.contains(&UOpKey(Arc::clone(var))));
 
     if has_var_dependency {
         // Symbolic simplification didn't eliminate the range dependency
@@ -162,7 +162,7 @@ pub fn reduce_collapse(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
     // Step 5: Substitute back: DEFINE_VAR → RANGE
     // Create reverse mapping to restore original ranges (if any DEFINE_VARs remain)
     // Since we verified no var dependencies exist, this should be a no-op
-    let reverse_map: HashMap<UOpKey, Rc<UOp>> =
+    let reverse_map: HashMap<UOpKey, Arc<UOp>> =
         substitute_map.into_iter().map(|(range_key, var)| (UOpKey(var), range_key.0)).collect();
 
     let result = simplified.substitute(&reverse_map);
@@ -171,7 +171,7 @@ pub fn reduce_collapse(reduce: &Rc<UOp>) -> Option<Rc<UOp>> {
 }
 
 /// Cast value to dtype, with broadcasting for vector types.
-fn cast_to_dtype(value: &Rc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Rc<UOp>> {
+fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Arc<UOp>> {
     use morok_dtype::DType;
 
     // Get the scalar type to cast to
@@ -182,12 +182,12 @@ fn cast_to_dtype(value: &Rc<UOp>, target_dtype: &morok_dtype::DType) -> Option<R
     };
 
     // Cast to scalar type
-    let casted = UOp::cast(Rc::clone(value), scalar_type);
+    let casted = UOp::cast(Arc::clone(value), scalar_type);
 
     // Broadcast if target is a vector (create vector with repeated elements)
     if target_dtype.is_vector() {
         let count = target_dtype.count();
-        let elements: SmallVec<[Rc<UOp>; 4]> = (0..count).map(|_| casted.clone()).collect();
+        let elements: SmallVec<[Arc<UOp>; 4]> = (0..count).map(|_| casted.clone()).collect();
         Some(UOp::vectorize(elements))
     } else {
         Some(casted)

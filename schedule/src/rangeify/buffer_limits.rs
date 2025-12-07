@@ -4,7 +4,7 @@
 //! - Metal: 31 buffers, WebGPU: 8 buffers, CPU/CUDA: no limit
 
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_ir::{AddrSpace, BufferizeOpts, Op, UOp, UOpKey};
@@ -15,11 +15,11 @@ use crate::pattern::matcher::{PatternMatcher, RewriteResult};
 
 /// Extract device specification from a UOp graph (first device found).
 #[allow(clippy::mutable_key_type)]
-pub fn extract_device_from_graph(root: &Rc<UOp>) -> Option<DeviceSpec> {
+pub fn extract_device_from_graph(root: &Arc<UOp>) -> Option<DeviceSpec> {
     let mut visited = HashSet::new();
 
-    fn visit(uop: &Rc<UOp>, visited: &mut HashSet<UOpKey>) -> Option<DeviceSpec> {
-        let key = UOpKey(Rc::clone(uop));
+    fn visit(uop: &Arc<UOp>, visited: &mut HashSet<UOpKey>) -> Option<DeviceSpec> {
+        let key = UOpKey(Arc::clone(uop));
         if !visited.insert(key) {
             return None; // Already visited
         }
@@ -55,7 +55,7 @@ pub fn extract_device_from_graph(root: &Rc<UOp>) -> Option<DeviceSpec> {
 }
 
 /// Check if operation is elementwise (Binary or Ternary).
-pub fn is_elementwise(uop: &Rc<UOp>) -> bool {
+pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
     matches!(uop.op(), Op::Binary(..) | Op::Ternary(..))
 }
 
@@ -94,7 +94,7 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
             // Deduplicate
             #[allow(clippy::mutable_key_type)]
             let mut seen = HashSet::new();
-            all_buffers.retain(|b| seen.insert(UOpKey(Rc::clone(b))));
+            all_buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
 
             // Check if exceeds limit (-1 for output buffer)
             if all_buffers.len() > limit.saturating_sub(1) {
@@ -103,9 +103,9 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
                 let mut any_changed = false;
 
                 for src in &sources {
-                    let new_src = if is_elementwise(src) { force_bufferize(src) } else { Rc::clone(src) };
+                    let new_src = if is_elementwise(src) { force_bufferize(src) } else { Arc::clone(src) };
 
-                    if !Rc::ptr_eq(&new_src, src) {
+                    if !Arc::ptr_eq(&new_src, src) {
                         any_changed = true;
                     }
                     new_sources.push(new_src);
@@ -166,37 +166,37 @@ pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
 }
 
 /// Force bufferization of a computation to GLOBAL memory.
-fn force_bufferize(src: &Rc<UOp>) -> Rc<UOp> {
+fn force_bufferize(src: &Arc<UOp>) -> Arc<UOp> {
     // Collect all ranges from the source computation
     let ranges = collect_ranges(src);
 
     if ranges.is_empty() {
         // No ranges to bufferize, return original
-        return Rc::clone(src);
+        return Arc::clone(src);
     }
 
     // Create BUFFERIZE with GLOBAL address space
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
-    let bufferized = UOp::bufferize(Rc::clone(src), ranges.clone(), opts);
+    let bufferized = UOp::bufferize(Arc::clone(src), ranges.clone(), opts);
 
     // Wrap in INDEX to make it usable
-    UOp::index(bufferized, ranges).unwrap_or_else(|_| Rc::clone(src))
+    UOp::index(bufferized, ranges).unwrap_or_else(|_| Arc::clone(src))
 }
 
 /// Collect all RANGE operations from a computation tree.
 #[allow(clippy::mutable_key_type)]
-fn collect_ranges(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
+fn collect_ranges(src: &Arc<UOp>) -> Vec<Arc<UOp>> {
     let mut ranges = Vec::new();
     let mut visited = HashSet::new();
 
-    fn visit(uop: &Rc<UOp>, ranges: &mut Vec<Rc<UOp>>, visited: &mut HashSet<UOpKey>) {
-        let key = UOpKey(Rc::clone(uop));
+    fn visit(uop: &Arc<UOp>, ranges: &mut Vec<Arc<UOp>>, visited: &mut HashSet<UOpKey>) {
+        let key = UOpKey(Arc::clone(uop));
         if !visited.insert(key) {
             return; // Already visited
         }
 
         if matches!(uop.op(), Op::Range { .. }) {
-            ranges.push(Rc::clone(uop));
+            ranges.push(Arc::clone(uop));
         }
 
         for child in uop.op().sources() {
@@ -208,7 +208,7 @@ fn collect_ranges(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
 
     // Deduplicate while preserving order
     let mut seen = HashSet::new();
-    ranges.retain(|r| seen.insert(UOpKey(Rc::clone(r))));
+    ranges.retain(|r| seen.insert(UOpKey(Arc::clone(r))));
 
     ranges
 }

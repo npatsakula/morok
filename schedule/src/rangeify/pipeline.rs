@@ -11,13 +11,15 @@
 //!
 //! 1. **BUFFERIZE → STORE**: Convert memory allocation ops to explicit stores
 //! 2. **STORE → KERNEL**: Split computation graph at store boundaries
+//! 3. **Dependency Resolution**: Extract inter-kernel dependencies from AFTER nodes
 //!
 //! Additional stages (symbolic simplification, cost-based optimization, etc.)
 //! will be added as pattern matchers are implemented.
 
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use morok_ir::UOp;
+use morok_ir::{Op, UOp};
 
 use super::{bufferize_to_store::bufferize_to_store, kernel_context::KernelContext, split_kernel::split_store};
 
@@ -28,7 +30,7 @@ use super::{bufferize_to_store::bufferize_to_store, kernel_context::KernelContex
 ///
 /// # Current Implementation
 ///
-/// The pipeline currently implements 2 core stages:
+/// The pipeline currently implements 3 core stages:
 ///
 /// 1. **Stage 1: BUFFERIZE → STORE conversion**
 ///    - Walks the graph bottom-up
@@ -39,6 +41,10 @@ use super::{bufferize_to_store::bufferize_to_store, kernel_context::KernelContex
 ///    - Walks the graph bottom-up
 ///    - Splits computation at STORE/END boundaries
 ///    - Creates KERNEL operations with proper sources
+///
+/// 3. **Stage 3: Dependency resolution**
+///    - Extracts inter-kernel dependencies from AFTER nodes
+///    - Populates `ctx.kernel_deps` for scheduling
 ///
 /// # Future Stages
 ///
@@ -56,7 +62,7 @@ use super::{bufferize_to_store::bufferize_to_store, kernel_context::KernelContex
 ///
 /// # Returns
 ///
-/// The transformed graph with KERNEL operations
+/// The transformed graph with KERNEL operations and populated KernelContext
 ///
 /// # Example
 ///
@@ -64,12 +70,13 @@ use super::{bufferize_to_store::bufferize_to_store, kernel_context::KernelContex
 /// // Input graph with BUFFERIZE ops:
 /// // BUFFERIZE(compute, ranges, opts)
 ///
-/// let kernels = run_kernel_split_pipeline(graph);
+/// let (kernels, ctx) = run_kernel_split_pipeline(graph);
+/// // ctx.kernel_deps contains inter-kernel dependencies
 ///
 /// // Output graph with KERNEL ops:
 /// // KERNEL([buffers, vars], SINK(STORE(...)))
 /// ```
-pub fn run_kernel_split_pipeline(root: Rc<UOp>) -> (Rc<UOp>, KernelContext) {
+pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
     let mut ctx = KernelContext::new();
 
     // **STAGE 1: BUFFERIZE → STORE Conversion**
@@ -86,11 +93,108 @@ pub fn run_kernel_split_pipeline(root: Rc<UOp>) -> (Rc<UOp>, KernelContext) {
     // KERNEL operations.
     //
     // Uses buffer_map from Stage 1 to populate KERNEL sources.
+    let after_split = transform_bottom_up(&after_bufferize, &mut ctx, split_store);
 
-    let result = transform_bottom_up(&after_bufferize, &mut ctx, split_store);
+    // **STAGE 3: Dependency Resolution**
+    //
+    // Extract inter-kernel dependencies from AFTER nodes.
+    // This populates ctx.kernel_deps for use by the scheduler.
+    resolve_kernel_dependencies(&after_split, &mut ctx);
 
-    // Return both the transformed graph and the context (containing buffer_map)
-    (result, ctx)
+    // Return both the transformed graph and the context
+    (after_split, ctx)
+}
+
+/// Resolve dependencies between kernels by analyzing AFTER nodes.
+///
+/// This function walks the graph and identifies producer→consumer relationships
+/// between kernels via shared buffers. When kernel A writes to buffer B
+/// (wrapped in an AFTER node), and kernel C reads from buffer B,
+/// kernel C depends on kernel A.
+///
+/// # How it works
+///
+/// 1. Build a map: buffer_id → (AFTER node, producing KERNEL)
+/// 2. For each KERNEL, find buffers it reads (from its sources)
+/// 3. If a read buffer has a producer, record the dependency in ctx.kernel_deps
+///
+/// # Arguments
+///
+/// * `root` - The root UOp after kernel splitting
+/// * `ctx` - KernelContext to populate with dependencies
+fn resolve_kernel_dependencies(root: &Arc<UOp>, ctx: &mut KernelContext) {
+    // Build map: buffer_id → producing KERNEL
+    // An AFTER node wraps a buffer and depends on the kernel that produces it
+    let mut buffer_producers: HashMap<u64, Arc<UOp>> = HashMap::new();
+
+    for node in root.toposort() {
+        if let Op::After { passthrough, deps } = node.op() {
+            // The passthrough is the buffer (DEFINE_GLOBAL)
+            if let Op::DefineGlobal(_) = passthrough.op() {
+                // Find the KERNEL in deps
+                for dep in deps {
+                    if let Op::Kernel { .. } = dep.op() {
+                        buffer_producers.insert(passthrough.id, dep.clone());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // For each KERNEL, find what buffers it reads and record dependencies
+    for node in root.toposort() {
+        if let Op::Kernel { sources, ast } = node.op() {
+            // Find buffers this kernel reads from (via its sources)
+            for src in sources {
+                // If this source is an AFTER, extract the underlying buffer
+                let buffer_id = match src.op() {
+                    Op::After { passthrough, .. } => {
+                        if let Op::DefineGlobal(_) = passthrough.op() {
+                            Some(passthrough.id)
+                        } else {
+                            None
+                        }
+                    }
+                    Op::DefineGlobal(_) => Some(src.id),
+                    _ => None,
+                };
+
+                // If this buffer has a producer kernel, record the dependency
+                if let Some(buf_id) = buffer_id
+                    && let Some(producer) = buffer_producers.get(&buf_id)
+                    && !Arc::ptr_eq(producer, &node)
+                {
+                    ctx.add_dependency(buf_id, producer.clone(), node.clone());
+                }
+            }
+
+            // Also check the AST for LOAD operations that read from buffers
+            for ast_node in ast.toposort() {
+                if let Op::Load { buffer, .. } = ast_node.op() {
+                    let buffer_id = match buffer.op() {
+                        Op::DefineGlobal(_) => Some(buffer.id),
+                        _ => None,
+                    };
+
+                    if let Some(buf_id) = buffer_id
+                        && let Some(producer) = buffer_producers.get(&buf_id)
+                        && !Arc::ptr_eq(producer, &node)
+                    {
+                        // Avoid duplicate dependencies
+                        let already_tracked = ctx.kernel_deps.iter().any(|d| {
+                            d.buffer_id == buf_id
+                                && Arc::ptr_eq(&d.producer, producer)
+                                && Arc::ptr_eq(&d.consumer, &node)
+                        });
+                        if !already_tracked {
+                            ctx.add_dependency(buf_id, producer.clone(), node.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Apply a transformation function bottom-up on a graph.
@@ -114,9 +218,9 @@ pub fn run_kernel_split_pipeline(root: Rc<UOp>) -> (Rc<UOp>, KernelContext) {
 /// # Returns
 ///
 /// The transformed UOp
-fn transform_bottom_up<F>(uop: &Rc<UOp>, ctx: &mut KernelContext, transform_fn: F) -> Rc<UOp>
+fn transform_bottom_up<F>(uop: &Arc<UOp>, ctx: &mut KernelContext, transform_fn: F) -> Arc<UOp>
 where
-    F: Fn(&Rc<UOp>, &mut KernelContext) -> Option<Rc<UOp>> + Copy,
+    F: Fn(&Arc<UOp>, &mut KernelContext) -> Option<Arc<UOp>> + Copy,
 {
     // **Step 1: Recursively transform all sources**
     let sources = uop.op().sources();
@@ -132,7 +236,7 @@ where
 
     for src in sources {
         let transformed = transform_bottom_up(&src, ctx, transform_fn);
-        if !Rc::ptr_eq(&transformed, &src) {
+        if !Arc::ptr_eq(&transformed, &src) {
             any_changed = true;
         }
         transformed_sources.push(transformed);

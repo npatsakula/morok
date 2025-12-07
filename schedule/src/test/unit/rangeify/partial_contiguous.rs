@@ -8,7 +8,7 @@
 //! - Edge cases (empty ranges, symbolic sizes, etc.)
 //! - Integration with rangeify pipeline
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, SInt, UOp};
@@ -24,7 +24,7 @@ use crate::rewrite::graph_rewrite;
 // ============================================================================
 
 /// Create a test BUFFER with given size and dtype.
-fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Rc<UOp> {
+fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Arc<UOp> {
     let unique = UOp::buffer_id(Some(id));
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     UOp::new(Op::Buffer { unique, device, size }, dtype)
@@ -34,11 +34,11 @@ fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Rc<UOp> {
 ///
 /// This is the core pattern that buffer_removal_with_pcontig matches against.
 fn create_index_bufferize(
-    src: Rc<UOp>,
-    buf_ranges: Vec<Rc<UOp>>,
-    idx_ranges: Vec<Rc<UOp>>,
+    src: Arc<UOp>,
+    buf_ranges: Vec<Arc<UOp>>,
+    idx_ranges: Vec<Arc<UOp>>,
     opts: BufferizeOpts,
-) -> Rc<UOp> {
+) -> Arc<UOp> {
     let bufferized = UOp::bufferize(src, buf_ranges, opts);
     UOp::index(bufferized, idx_ranges).expect("Failed to create INDEX")
 }
@@ -49,7 +49,7 @@ fn create_index_bufferize(
 /// - buffer: BUFFER operation
 /// - range1, range2: RANGE operations
 /// - compute: Simple ADD operation on buffer
-fn create_simple_graph(ctx: &mut IndexingContext) -> (Rc<UOp>, Rc<UOp>, Rc<UOp>, Rc<UOp>) {
+fn create_simple_graph(ctx: &mut IndexingContext) -> (Arc<UOp>, Arc<UOp>, Arc<UOp>, Arc<UOp>) {
     let buffer = create_test_buffer(100, DType::Float32, 1);
     let range1 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
     let range2 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
@@ -71,7 +71,10 @@ fn create_simple_graph(ctx: &mut IndexingContext) -> (Rc<UOp>, Rc<UOp>, Rc<UOp>,
 /// - buffers: Vector of BUFFER operations
 /// - ranges: Vector of RANGE operations used for indexing
 /// - compute: Computation that accesses all buffers (nested ADD operations)
-fn create_multi_buffer_graph(ctx: &mut IndexingContext, num_buffers: usize) -> (Vec<Rc<UOp>>, Vec<Rc<UOp>>, Rc<UOp>) {
+fn create_multi_buffer_graph(
+    ctx: &mut IndexingContext,
+    num_buffers: usize,
+) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>, Arc<UOp>) {
     assert!(num_buffers > 0, "Must have at least one buffer");
 
     let mut buffers = Vec::new();
@@ -101,7 +104,7 @@ fn create_multi_buffer_graph(ctx: &mut IndexingContext, num_buffers: usize) -> (
 /// Create a buffer with specific size for ratio testing.
 ///
 /// Returns a BUFFER operation with the given size in bytes.
-fn create_buffer_with_size(size: usize, dtype: DType, id: usize) -> Rc<UOp> {
+fn create_buffer_with_size(size: usize, dtype: DType, id: usize) -> Arc<UOp> {
     create_test_buffer(size, dtype, id)
 }
 
@@ -114,7 +117,7 @@ fn create_ratio_test_graph(
     ctx: &mut IndexingContext,
     input_size: usize,
     output_size: usize,
-) -> (Rc<UOp>, usize, Vec<Rc<UOp>>, Rc<UOp>) {
+) -> (Arc<UOp>, usize, Vec<Arc<UOp>>, Arc<UOp>) {
     let input_buffer = create_buffer_with_size(input_size, DType::Float32, 1);
 
     // Create ranges that would produce the desired output size
@@ -139,7 +142,7 @@ fn create_ratio_test_graph(
 /// Returns: (all_ranges, compute)
 /// - all_ranges: Vector of all RANGE operations (mix of Loop and Reduce axes)
 /// - compute: Computation that may or may not access buffers
-fn create_reduce_graph(ctx: &mut IndexingContext, has_buffer_access: bool) -> (Vec<Rc<UOp>>, Rc<UOp>) {
+fn create_reduce_graph(ctx: &mut IndexingContext, has_buffer_access: bool) -> (Vec<Arc<UOp>>, Arc<UOp>) {
     let loop_range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
     let reduce_range = ctx.new_range(&SInt::Const(20), AxisType::Reduce);
     let all_ranges = vec![loop_range.clone(), reduce_range.clone()];
@@ -221,7 +224,7 @@ fn test_disabled_config_no_rewrite() {
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // With level=0, no rewrite should occur
-    assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite with level=0");
+    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite with level=0");
 }
 
 #[test]
@@ -321,7 +324,7 @@ fn test_accessed_buffers_threshold(num_buffers: usize) {
     if num_buffers > threshold {
         // Above threshold → should keep buffer (no rewrite)
         assert!(
-            Rc::ptr_eq(&rewritten, &idx_buf),
+            Arc::ptr_eq(&rewritten, &idx_buf),
             "Expected no rewrite with {} buffers (>{} threshold)",
             num_buffers,
             threshold
@@ -401,7 +404,7 @@ fn test_accessed_buffers_nested_computation() {
     // Apply rewrite - with 4 buffers (> threshold of 3), should keep buffer
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
-    assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite with 4 buffers in nested computation");
+    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite with 4 buffers in nested computation");
 }
 
 // ============================================================================
@@ -433,7 +436,7 @@ fn test_out_in_ratio_efficient_buffer() {
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // With ratio < 10, should keep buffer (no rewrite)
-    assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite for efficient buffer (ratio 9.0 < 10.0)");
+    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite for efficient buffer (ratio 9.0 < 10.0)");
 }
 
 /// Test out_in_ratio heuristic at threshold boundary.
@@ -783,7 +786,7 @@ fn test_nested_reduce_with_buffer() {
 
 /// Count the number of BUFFERIZE operations in a UOp tree.
 #[allow(clippy::mutable_key_type)] // UOpKey contains interior mutability (hash-consed IR)
-fn count_bufferizes(uop: &Rc<UOp>) -> usize {
+fn count_bufferizes(uop: &Arc<UOp>) -> usize {
     let mut count = 0;
     let mut stack = vec![uop.clone()];
     let mut visited = std::collections::HashSet::new();
@@ -899,7 +902,7 @@ fn test_pattern4_keeps_efficient_buffer() {
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Verify buffer was kept (no optimization)
-    assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Efficient buffer (ratio=1.0) should be KEPT");
+    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Efficient buffer (ratio=1.0) should be KEPT");
 }
 
 /// Test that Pattern 1 preserves dtype.
@@ -947,7 +950,7 @@ fn test_full_removal_blocked_by_heuristics() {
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Should keep buffer (no rewrite)
-    assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite when heuristics prevent optimization");
+    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite when heuristics prevent optimization");
 }
 
 // ============================================================================
@@ -1173,7 +1176,7 @@ fn test_partial_contiguous_blocked_by_heuristics() {
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // Should not rewrite (4 buffers > 3 threshold)
-    assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite when accessed_buffers > threshold");
+    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite when accessed_buffers > threshold");
 }
 
 // ============================================================================
@@ -1228,7 +1231,7 @@ fn test_edge_case_all_const_operations() {
     let rewritten = graph_rewrite(&matcher, bufferized.clone(), &mut config);
 
     // Should be different from original (inlined)
-    assert!(!Rc::ptr_eq(&rewritten, &bufferized), "Expected const computation to be inlined");
+    assert!(!Arc::ptr_eq(&rewritten, &bufferized), "Expected const computation to be inlined");
 }
 
 /// Test edge case: Deeply nested BUFFERIZE operations.
@@ -1306,7 +1309,7 @@ fn test_config_custom_max_buffers_threshold() {
     // Default config should NOT optimize (4 > 3)
     let mut default_config = PcontigConfig::default();
     let default_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut default_config);
-    assert!(Rc::ptr_eq(&default_rewritten, &idx_buf), "Default config should block 4 buffers");
+    assert!(Arc::ptr_eq(&default_rewritten, &idx_buf), "Default config should block 4 buffers");
 
     // Permissive config MIGHT optimize (4 < 10), depends on ratio heuristic
     let mut permissive_config = PcontigConfig {
@@ -1344,7 +1347,7 @@ fn test_config_custom_ratio_threshold() {
         ..Default::default()
     };
     let strict_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut strict_config);
-    assert!(Rc::ptr_eq(&strict_rewritten, &idx_buf), "Strict config should keep efficient buffer (ratio 1.0 < 100.0)");
+    assert!(Arc::ptr_eq(&strict_rewritten, &idx_buf), "Strict config should keep efficient buffer (ratio 1.0 < 100.0)");
 
     // Permissive config: ratio = 1.0 >= 1.0 → should OPTIMIZE
     let mut permissive_config = PcontigConfig {
@@ -1353,7 +1356,7 @@ fn test_config_custom_ratio_threshold() {
     };
     let permissive_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut permissive_config);
     assert!(
-        !Rc::ptr_eq(&permissive_rewritten, &idx_buf),
+        !Arc::ptr_eq(&permissive_rewritten, &idx_buf),
         "Permissive config should optimize buffer (ratio 1.0 >= 1.0)"
     );
 }
@@ -1381,7 +1384,7 @@ fn test_config_level_0_vs_2() {
     // Level 0: Pattern 4 disabled → should NOT optimize
     let mut disabled_config = PcontigConfig { level: 0, ..Default::default() };
     let disabled_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut disabled_config);
-    assert!(Rc::ptr_eq(&disabled_rewritten, &idx_buf), "Level 0 should disable Pattern 4 optimizations");
+    assert!(Arc::ptr_eq(&disabled_rewritten, &idx_buf), "Level 0 should disable Pattern 4 optimizations");
 
     // Level 2: Pattern 4 enabled → should optimize (ratio=1.0 >= threshold)
     let mut enabled_config = PcontigConfig {
@@ -1390,7 +1393,7 @@ fn test_config_level_0_vs_2() {
         ..Default::default()
     };
     let enabled_rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut enabled_config);
-    assert!(!Rc::ptr_eq(&enabled_rewritten, &idx_buf), "Level 2 should enable Pattern 4 optimizations");
+    assert!(!Arc::ptr_eq(&enabled_rewritten, &idx_buf), "Level 2 should enable Pattern 4 optimizations");
 }
 
 /// Test that the same matcher with different configs produces different results.
@@ -1411,7 +1414,7 @@ fn test_config_different_configs_produce_different_results() {
     // Config1 (threshold=2): should NOT optimize (3 > 2)
     let mut config1 = PcontigConfig { max_buffers_threshold: 2, ..Default::default() };
     let rewritten1 = graph_rewrite(&matcher, idx_buf.clone(), &mut config1);
-    assert!(Rc::ptr_eq(&rewritten1, &idx_buf), "Config1 should block 3 buffers (threshold=2)");
+    assert!(Arc::ptr_eq(&rewritten1, &idx_buf), "Config1 should block 3 buffers (threshold=2)");
 
     // Config2 (threshold=5): MIGHT optimize (3 < 5), depends on ratio
     let mut config2 = PcontigConfig { max_buffers_threshold: 5, ..Default::default() };
@@ -1463,7 +1466,7 @@ fn test_pipeline_multiple_patterns_in_sequence() {
 
     // Single rewrite should apply Pattern 3
     let rewritten1 = graph_rewrite(&matcher, outer.clone(), &mut config);
-    assert!(!Rc::ptr_eq(&rewritten1, &outer), "Pattern 3 should fire");
+    assert!(!Arc::ptr_eq(&rewritten1, &outer), "Pattern 3 should fire");
 
     // Second rewrite should apply Pattern 1
     let rewritten2 = graph_rewrite(&matcher, rewritten1.clone(), &mut config);
@@ -1524,7 +1527,7 @@ fn test_pipeline_cheap_inline_interaction() {
 
     // Pattern 1 should inline (unary op is cheap)
     let rewritten = graph_rewrite(&matcher, bufferized.clone(), &mut config);
-    assert!(!Rc::ptr_eq(&rewritten, &bufferized), "Pattern 1 should inline cheap unary op");
+    assert!(!Arc::ptr_eq(&rewritten, &bufferized), "Pattern 1 should inline cheap unary op");
 }
 
 // ============================================================================
@@ -1540,7 +1543,7 @@ fn test_symbolic_buffer_size_handling() {
     let matcher = buffer_removal_with_pcontig();
 
     // Create symbolic range using DEFINE_VAR
-    let batch_size = UOp::define_var("batch".to_string(), 1, 128);
+    let batch_size = UOp::define_var("batch".to_string(), 128);
     let symbolic_range = UOp::range_axis(batch_size, AxisId::Renumbered(0), AxisType::Loop);
 
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1574,8 +1577,8 @@ fn test_all_symbolic_sizes() {
     let matcher = buffer_removal_with_pcontig();
 
     // Create symbolic ranges
-    let n = UOp::define_var("n".to_string(), 1, 1024);
-    let m = UOp::define_var("m".to_string(), 1, 1024);
+    let n = UOp::define_var("n".to_string(), 1024);
+    let m = UOp::define_var("m".to_string(), 1024);
     let range_n = UOp::range_axis(n, AxisId::Renumbered(0), AxisType::Loop);
     let range_m = UOp::range_axis(m, AxisId::Renumbered(1), AxisType::Loop);
 
@@ -1611,7 +1614,7 @@ fn test_mixed_concrete_symbolic_sizes() {
     );
 
     // Symbolic range
-    let batch = UOp::define_var("batch".to_string(), 1, 64);
+    let batch = UOp::define_var("batch".to_string(), 64);
     let symbolic_range = UOp::range_axis(batch, AxisId::Renumbered(1), AxisType::Loop);
 
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1724,7 +1727,7 @@ fn test_complex_multiple_independent_buffers() {
 
     // Apply rewrite - should block due to >3 buffers
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
-    assert!(Rc::ptr_eq(&rewritten, &idx_buf), "Should block optimization with 5 buffers");
+    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Should block optimization with 5 buffers");
 }
 
 /// Test with multiple REDUCE operations.
@@ -1873,5 +1876,5 @@ fn test_boundary_minimal_computation() {
 
     // Apply rewrite - Pattern 1 should inline const
     let rewritten = graph_rewrite(&matcher, bufferized.clone(), &mut config);
-    assert!(!Rc::ptr_eq(&rewritten, &bufferized), "Const should be inlined via Pattern 1");
+    assert!(!Arc::ptr_eq(&rewritten, &bufferized), "Const should be inlined via Pattern 1");
 }

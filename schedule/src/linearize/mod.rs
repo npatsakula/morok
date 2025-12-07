@@ -6,13 +6,13 @@
 //! # Architecture
 //!
 //! ```text
-//! Kernel AST (Rc<UOp>)
+//! Kernel AST (Arc<UOp>)
 //!     ↓
 //! CFGContext::new(sink)     → Compute control flow edges
 //!     ↓
 //! linearize(sink)           → Priority-aware toposort
 //!     ↓
-//! Vec<Rc<UOp>>              → Linear instruction sequence
+//! Vec<Arc<UOp>>              → Linear instruction sequence
 //! ```
 //!
 //! # Usage

@@ -9,7 +9,7 @@
 //! Note: Algebraic simplifications (x+0, x*1, x*0, etc.) have been moved
 //! to the symbolic module (schedule/src/symbolic/patterns.rs).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{Op, UOp};
 
@@ -40,6 +40,7 @@ pub fn movement_op_removal() -> PatternMatcher {
 /// This handles schedule-specific cleanup:
 /// - DETACH removal (gradient computation marker no longer needed)
 /// - CONTIGUOUS_BACKWARD removal (gradient computation marker no longer needed)
+/// - RESHAPE to scalar (empty shape) removal
 ///
 /// Note: Algebraic simplifications (x+0, x*1, x*0, etc.) have been moved
 /// to the symbolic module where they belong.
@@ -47,9 +48,27 @@ pub fn early_rewrites() -> PatternMatcher {
     // Using the patterns! proc-macro DSL for simple rewrites:
     // - DETACH(x) → x: DETACH marks gradient boundaries, not needed for scheduling
     // - CONTIGUOUS_BACKWARD(x) → x: backward pass marker, not needed for scheduling
+    // - RESHAPE(x, []) → x: reshape to scalar is a no-op (from remove_singleton_dims)
     crate::patterns! {
         Detach(x) ~> x,
         ContiguousBackward(x) ~> x,
+        x => {
+            // Check if this is a Reshape to scalar (empty shape)
+            if let Op::Reshape { src, new_shape } = x.op()
+                && is_scalar_shape(new_shape)
+            {
+                return Some(src.clone());
+            }
+            None
+        }
+    }
+}
+
+/// Check if a shape UOp represents a scalar (empty or Vectorize with 0 elements).
+fn is_scalar_shape(shape: &Arc<UOp>) -> bool {
+    match shape.op() {
+        Op::Vectorize { elements } => elements.is_empty(),
+        _ => false,
     }
 }
 
@@ -61,15 +80,16 @@ pub fn early_rewrites() -> PatternMatcher {
 /// 1. **Generic BUFFERIZE insertion**: Adds BUFFERIZE + INDEX to op sources where needed
 /// 2. **Movement op removal**: Removes movement ops after transformation
 ///
+/// NOTE: ReduceAxis → REDUCE conversion is now handled by `convert_reduceaxis_early()`
+/// in transform.rs, which runs BEFORE this bottom-up pass. This avoids ID mismatch
+/// issues when graph_rewrite_bottom_up reconstructs nodes with new IDs.
+///
 /// # Returns
 ///
 /// A PatternMatcher<IndexingContext> with all rangeify transformation patterns
 pub fn apply_rangeify_patterns() -> PatternMatcher<IndexingContext> {
     crate::patterns! {
         @context IndexingContext;
-        // Pattern 0: ReduceAxis → REDUCE conversion (BEFORE sources are transformed)
-        // This must come first to access the original ranges from Step 1
-        x => convert_reduceaxis_with_context(x, ctx),
         // Pattern 1: Generic BUFFERIZE insertion
         x => apply_bufferize_transform(x, ctx),
         // Pattern 2: Remove movement ops after transformation
@@ -79,9 +99,9 @@ pub fn apply_rangeify_patterns() -> PatternMatcher<IndexingContext> {
 
 /// Pattern matcher for ReduceAxis → REDUCE conversion (deprecated).
 ///
-/// This pattern matcher is no longer used as the conversion is now integrated
-/// into `apply_rangeify_patterns()` to ensure ranges are extracted before
-/// sources are transformed.
+/// This pattern matcher is no longer used. ReduceAxis → REDUCE conversion is now
+/// handled by `convert_reduceaxis_early()` in transform.rs, which runs BEFORE
+/// the bottom-up pattern pass to avoid ID mismatch issues.
 #[allow(dead_code)]
 pub fn reduceaxis_to_reduce_patterns() -> PatternMatcher<IndexingContext> {
     crate::patterns! {
@@ -96,7 +116,7 @@ pub fn reduceaxis_to_reduce_patterns() -> PatternMatcher<IndexingContext> {
 /// Returns:
 /// - `Some(new_op)` if sources were transformed (triggers rewrite)
 /// - `None` if no transformation needed but children should be processed
-fn apply_bufferize_transform(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Option<Rc<UOp>> {
+fn apply_bufferize_transform(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
     // Try to transform sources
     if let Some(new_sources) = transform_sources_with_bufferize(x, ctx) {
         return Some(x.with_sources(new_sources));
@@ -108,11 +128,11 @@ fn apply_bufferize_transform(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Option<R
 }
 
 /// Remove movement ops after transformation has been applied.
-fn remove_movement_op(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Option<Rc<UOp>> {
+fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
     // Check if it should be removed
     if should_remove_movement_op(x, ctx) {
         // Return the source (first operand)
-        return x.op().sources().first().map(Rc::clone);
+        return x.op().sources().first().map(Arc::clone);
     }
     None
 }
@@ -158,30 +178,30 @@ pub fn dead_axis_removal() -> PatternMatcher {
 /// Filter dead axes from BUFFERIZE operations.
 ///
 /// BUFFERIZE(compute, [r1, r2, dead, r4, ...], opts) → BUFFERIZE(compute, [r1, r2, r4, ...], opts)
-fn filter_dead_bufferize(buf: &Rc<UOp>) -> Option<Rc<UOp>> {
+fn filter_dead_bufferize(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Bufferize { compute, ranges, opts } = buf.op() else {
         return None;
     };
 
     // Filter out dead axes
-    let live_ranges: Vec<_> = ranges.iter().filter(|r| !is_dead_axis(r)).map(Rc::clone).collect();
+    let live_ranges: Vec<_> = ranges.iter().filter(|r| !is_dead_axis(r)).map(Arc::clone).collect();
 
     // Only rewrite if we removed some dead axes
     if live_ranges.len() < ranges.len() {
         // If all axes are dead, return the compute directly
         if live_ranges.is_empty() {
-            return Some(Rc::clone(compute));
+            return Some(Arc::clone(compute));
         }
 
         // Create new BUFFERIZE with only live axes
-        return Some(UOp::bufferize(Rc::clone(compute), live_ranges, opts.clone()));
+        return Some(UOp::bufferize(Arc::clone(compute), live_ranges, opts.clone()));
     }
 
     None
 }
 
 /// Adjust INDEX indices when BUFFERIZE has dead axes removed.
-fn adjust_index_for_dead_axes(idx: &Rc<UOp>) -> Option<Rc<UOp>> {
+fn adjust_index_for_dead_axes(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Index { buffer, indices, gate: _ } = idx.op() else {
         return None;
     };
@@ -197,7 +217,7 @@ fn adjust_index_for_dead_axes(idx: &Rc<UOp>) -> Option<Rc<UOp>> {
         if !is_dead_axis(range) {
             // Keep this index for live axis
             if let Some(idx_val) = idx_iter.next() {
-                new_indices.push(Rc::clone(idx_val));
+                new_indices.push(Arc::clone(idx_val));
             }
         } else {
             // Skip index for dead axis
@@ -212,7 +232,7 @@ fn adjust_index_for_dead_axes(idx: &Rc<UOp>) -> Option<Rc<UOp>> {
             return None;
         }
 
-        return UOp::index(Rc::clone(buffer), new_indices).ok();
+        return UOp::index(Arc::clone(buffer), new_indices).ok();
     }
 
     None
@@ -222,7 +242,7 @@ fn adjust_index_for_dead_axes(idx: &Rc<UOp>) -> Option<Rc<UOp>> {
 ///
 /// Following Tinygrad's approach: extract ranges from the range_map that were
 /// created during the explicit rangeify phase, then create REDUCE with those ranges.
-fn convert_reduceaxis_with_context(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Option<Rc<UOp>> {
+fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
     use morok_ir::AxisType;
     use smallvec::SmallVec;
 
@@ -235,14 +255,14 @@ fn convert_reduceaxis_with_context(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Op
     let (input_ranges, _) = ctx.get_ranges(x)?;
 
     // Extract only the ranges corresponding to reduction axes
-    let reduce_ranges: SmallVec<[Rc<UOp>; 4]> = input_ranges
+    let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges
         .iter()
         .enumerate()
         .filter_map(|(i, range)| {
             if axes.contains(&i) {
                 // Verify this is a REDUCE-type range
                 if let Op::Range { axis_type: AxisType::Reduce, .. } = range.op() {
-                    Some(Rc::clone(range))
+                    Some(Arc::clone(range))
                 } else {
                     None
                 }
@@ -254,11 +274,11 @@ fn convert_reduceaxis_with_context(x: &Rc<UOp>, ctx: &mut IndexingContext) -> Op
 
     // If no reduction ranges (all axes filtered out), return the source directly
     if reduce_ranges.is_empty() {
-        return Some(Rc::clone(src));
+        return Some(Arc::clone(src));
     }
 
     // Create the REDUCE operation with the extracted ranges
-    let reduced = UOp::reduce(Rc::clone(src), reduce_ranges, *reduce_op);
+    let reduced = UOp::reduce(Arc::clone(src), reduce_ranges, *reduce_op);
 
     Some(reduced)
 }
@@ -281,7 +301,7 @@ pub fn buffer_removal() -> PatternMatcher {
         Bufferize { compute, .. } if is_always_run_op(compute.op()) ~> compute,
         // Nested BUFFERIZE: flatten redundant buffering
         Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
-            => Some(UOp::bufferize(Rc::clone(inner), ranges.to_vec(), opts.clone())),
+            => Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
     }
 }
 
@@ -312,12 +332,12 @@ pub fn buffer_removal_with_pcontig() -> PatternMatcher<PcontigConfig> {
         buf if ctx.level > 0 && matches!(buf.op(), Op::Bufferize { .. }) => remove_always_run_bufferize(buf),
         // Nested BUFFERIZE: flatten redundant buffering
         Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
-            => Some(UOp::bufferize(Rc::clone(inner), ranges.to_vec(), opts.clone())),
+            => Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
     }
 }
 
 /// Remove BUFFERIZE if compute is cheap to inline.
-fn remove_cheap_bufferize(buf: &Rc<UOp>) -> Option<Rc<UOp>> {
+fn remove_cheap_bufferize(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
     if let Op::Bufferize { compute, .. } = buf.op()
         && is_cheap_to_inline(compute.op())
     {
@@ -327,7 +347,7 @@ fn remove_cheap_bufferize(buf: &Rc<UOp>) -> Option<Rc<UOp>> {
 }
 
 /// Remove BUFFERIZE if compute is an always-run op.
-fn remove_always_run_bufferize(buf: &Rc<UOp>) -> Option<Rc<UOp>> {
+fn remove_always_run_bufferize(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
     if let Op::Bufferize { compute, .. } = buf.op()
         && is_always_run_op(compute.op())
     {
@@ -337,7 +357,7 @@ fn remove_always_run_bufferize(buf: &Rc<UOp>) -> Option<Rc<UOp>> {
 }
 
 /// Apply partial contiguous buffer removal.
-fn apply_pcontig_removal(idx: &Rc<UOp>, config: &mut PcontigConfig) -> Option<Rc<UOp>> {
+fn apply_pcontig_removal(idx: &Arc<UOp>, config: &mut PcontigConfig) -> Option<Arc<UOp>> {
     use super::buffer_cost::{
         apply_partial_contiguous, calculate_buffer_size, calculate_out_in_ratio, collect_accessed_buffers,
         collect_indexes, collect_local_indexes, collect_reduces, extract_exclude_ranges, has_buffer_in_reduce,
@@ -390,8 +410,8 @@ fn apply_pcontig_removal(idx: &Rc<UOp>, config: &mut PcontigConfig) -> Option<Rc
 
         // Build substitution map: buffer ranges → index ranges
         #[allow(clippy::mutable_key_type)]
-        let subs_map: HashMap<UOpKey, Rc<UOp>> =
-            buf_ranges.iter().zip(idx_ranges.iter()).map(|(k, v)| (UOpKey(Rc::clone(k)), Rc::clone(v))).collect();
+        let subs_map: HashMap<UOpKey, Arc<UOp>> =
+            buf_ranges.iter().zip(idx_ranges.iter()).map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v))).collect();
 
         return Some(src.substitute(&subs_map));
     }
@@ -413,7 +433,7 @@ fn apply_pcontig_removal(idx: &Rc<UOp>, config: &mut PcontigConfig) -> Option<Rc
         use std::collections::HashMap;
 
         #[allow(clippy::mutable_key_type)]
-        let subs_map: HashMap<UOpKey, Rc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
+        let subs_map: HashMap<UOpKey, Arc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
 
         return Some(src.substitute(&subs_map));
     }
@@ -460,4 +480,3 @@ pub fn reduction_simplify_patterns() -> PatternMatcher<SplitReduceOpConfig> {
         reduce if matches!(reduce.op(), Op::ReduceAxis { .. }) => split_reduceop(reduce, ctx),
     }
 }
-

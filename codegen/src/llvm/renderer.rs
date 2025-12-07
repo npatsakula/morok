@@ -4,12 +4,14 @@ use crate::{RenderedKernel, Renderer, Result, with_context};
 use inkwell::context::Context;
 use inkwell::module::Module;
 use morok_ir::{Op, UOp};
-use std::rc::Rc;
+use snafu::{OptionExt, ResultExt};
+use std::sync::Arc;
 
+use super::error::{BuildCallSnafu, BuildGepSnafu, BuildLoadSnafu, BuildReturnSnafu, InvalidFunctionParameterSnafu};
 use super::helpers::ValueMap;
 
 /// Render a UOp graph to LLVM IR using the thread-local context.
-pub fn render(uop: &Rc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
+pub fn render(uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
     with_context(|context| {
         let renderer = LlvmRenderer::new(context);
         renderer.render(uop, name)
@@ -28,7 +30,7 @@ pub fn render(uop: &Rc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
 /// Returns (buffers, variables) in a consistent order for deterministic function signatures:
 /// - Buffers: DEFINE_GLOBAL sorted by internal ID, DEFINE_LOCAL sorted by internal ID, BUFFER sorted by UOp ID
 /// - Variables: DEFINE_VAR sorted by variable name
-fn collect_buffers_and_vars(root: &Rc<UOp>) -> (Vec<Rc<UOp>>, Vec<Rc<UOp>>) {
+fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
     let nodes = root.toposort();
 
     // Collect buffers
@@ -46,7 +48,7 @@ fn collect_buffers_and_vars(root: &Rc<UOp>) -> (Vec<Rc<UOp>>, Vec<Rc<UOp>>) {
     buffers.sort_by_key(|b| match b.op() {
         Op::DefineGlobal(id) => *id as u64,
         Op::DefineLocal(id) => (*id as u64) + (1u64 << 32), // Offset locals after globals
-        Op::Buffer { .. } => b.id + (1u64 << 48), // Offset input buffers after defines
+        Op::Buffer { .. } => b.id + (1u64 << 48),           // Offset input buffers after defines
         _ => b.id,
     });
 
@@ -114,10 +116,7 @@ fn add_buffer_param_attributes<'ctx>(
 /// - `no-builtins`: Don't replace with builtin implementations
 ///
 /// Based on Tinygrad's LLVM renderer (tinygrad/renderer/llvmir.py).
-fn add_kernel_function_attributes<'ctx>(
-    function: inkwell::values::FunctionValue<'ctx>,
-    context: &'ctx Context,
-) {
+fn add_kernel_function_attributes<'ctx>(function: inkwell::values::FunctionValue<'ctx>, context: &'ctx Context) {
     use inkwell::attributes::AttributeLoc;
 
     // nounwind - function doesn't throw exceptions
@@ -163,34 +162,12 @@ impl<'ctx> LlvmRenderer<'ctx> {
     /// This creates a module with:
     /// 1. The actual kernel function taking individual buffer pointers
     /// 2. A bootstrap function that unpacks an array of pointers and calls the kernel
-    fn render_to_module(&self, uop: &Rc<UOp>, name: &str) -> Result<Module<'ctx>> {
+    fn render_to_module(&self, uop: &Arc<UOp>, name: &str) -> Result<Module<'ctx>> {
         let module = self.context.create_module(name);
         let builder = self.context.create_builder();
 
         // Collect all buffers and variables from the graph
         let (buffers, variables) = collect_buffers_and_vars(uop);
-
-        // DEBUG: Print buffer ordering for verification
-        eprintln!("RENDERER buffer order for {}:", name);
-        for (i, buf) in buffers.iter().enumerate() {
-            match buf.op() {
-                Op::DefineGlobal(id) => eprintln!("  [{}] DEFINE_GLOBAL(id={}), uop_id={}", i, id, buf.id),
-                Op::DefineLocal(id) => eprintln!("  [{}] DEFINE_LOCAL(id={}), uop_id={}", i, id, buf.id),
-                Op::Buffer { .. } => eprintln!("  [{}] BUFFER, uop_id={}", i, buf.id),
-                _ => eprintln!("  [{}] {:?}, uop_id={}", i, buf.op(), buf.id),
-            }
-        }
-
-        // DEBUG: Print variable ordering for verification
-        eprintln!("RENDERER variable order for {}:", name);
-        for (i, var) in variables.iter().enumerate() {
-            match var.op() {
-                Op::DefineVar { name, min_val, max_val } => {
-                    eprintln!("  [{}] DEFINE_VAR(name='{}', min={}, max={}), uop_id={}", i, name, min_val, max_val, var.id);
-                }
-                _ => eprintln!("  [{}] {:?}, uop_id={}", i, var.op(), var.id),
-            }
-        }
 
         // Create kernel function signature: void kernel(ptr %buf0, ptr %buf1, ..., i64 %var0, i64 %var1, ...)
         let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
@@ -225,7 +202,8 @@ impl<'ctx> LlvmRenderer<'ctx> {
 
         // Add buffer parameters
         for (i, buffer_uop) in buffers.iter().enumerate() {
-            let param = kernel_function.get_nth_param(i as u32).unwrap();
+            let param =
+                kernel_function.get_nth_param(i as u32).context(InvalidFunctionParameterSnafu { index: i as u32 })?;
             param.set_name(&format!("buf{}", i));
             values.insert(buffer_uop.id, param);
         }
@@ -234,7 +212,8 @@ impl<'ctx> LlvmRenderer<'ctx> {
         let buffer_count = buffers.len();
         for (i, var_uop) in variables.iter().enumerate() {
             let param_idx = (buffer_count + i) as u32;
-            let param = kernel_function.get_nth_param(param_idx).unwrap();
+            let param =
+                kernel_function.get_nth_param(param_idx).context(InvalidFunctionParameterSnafu { index: param_idx })?;
             if let Op::DefineVar { name, .. } = var_uop.op() {
                 param.set_name(name);
             }
@@ -249,7 +228,7 @@ impl<'ctx> LlvmRenderer<'ctx> {
         }
 
         // Return void
-        builder.build_return(None).map_err(|e| crate::Error::LlvmError { reason: format!("build_return: {}", e) })?;
+        builder.build_return(None).context(BuildReturnSnafu)?;
 
         // Create bootstrap function: void kernel_bootstrap(ptr %args, i64 %var0, i64 %var1, ...)
         // This unpacks the array of buffer pointers and forwards both buffers and variables to the kernel
@@ -267,7 +246,10 @@ impl<'ctx> LlvmRenderer<'ctx> {
         let bootstrap_entry = self.context.append_basic_block(bootstrap_function, "entry");
         builder.position_at_end(bootstrap_entry);
 
-        let args_array = bootstrap_function.get_first_param().unwrap().into_pointer_value();
+        let args_array = bootstrap_function
+            .get_first_param()
+            .context(InvalidFunctionParameterSnafu { index: 0u32 })?
+            .into_pointer_value();
         args_array.set_name("args");
 
         // Extract each buffer pointer from the array
@@ -276,15 +258,11 @@ impl<'ctx> LlvmRenderer<'ctx> {
             // GEP to get pointer to args[i]
             let index = self.context.i64_type().const_int(i as u64, false);
             let ptr_to_ptr = unsafe {
-                builder
-                    .build_gep(ptr_type, args_array, &[index], &format!("arg{}_ptr", i))
-                    .map_err(|e| crate::Error::LlvmError { reason: format!("build_gep for arg {}: {}", i, e) })?
+                builder.build_gep(ptr_type, args_array, &[index], &format!("arg{}_ptr", i)).context(BuildGepSnafu)?
             };
 
             // Load the actual buffer pointer
-            let buffer_ptr = builder
-                .build_load(ptr_type, ptr_to_ptr, &format!("arg{}", i))
-                .map_err(|e| crate::Error::LlvmError { reason: format!("build_load for arg {}: {}", i, e) })?;
+            let buffer_ptr = builder.build_load(ptr_type, ptr_to_ptr, &format!("arg{}", i)).context(BuildLoadSnafu)?;
 
             kernel_args.push(buffer_ptr.into());
         }
@@ -292,11 +270,13 @@ impl<'ctx> LlvmRenderer<'ctx> {
         // Add variable parameters from bootstrap function parameters
         for i in 0..variables.len() {
             let param_idx = (1 + i) as u32; // +1 because first param is buffer array
-            let var_param = bootstrap_function.get_nth_param(param_idx).unwrap();
-            if i < variables.len() {
-                if let Op::DefineVar { name, .. } = variables[i].op() {
-                    var_param.set_name(name);
-                }
+            let var_param = bootstrap_function
+                .get_nth_param(param_idx)
+                .context(InvalidFunctionParameterSnafu { index: param_idx })?;
+            if i < variables.len()
+                && let Op::DefineVar { name, .. } = variables[i].op()
+            {
+                var_param.set_name(name);
             }
             kernel_args.push(var_param.into());
         }
@@ -304,28 +284,20 @@ impl<'ctx> LlvmRenderer<'ctx> {
         // Call the kernel with unpacked buffer pointers and variable values
         builder
             .build_call(kernel_function, &kernel_args, "")
-            .map_err(|e| crate::Error::LlvmError { reason: format!("build_call kernel: {}", e) })?;
+            .context(BuildCallSnafu { intrinsic: kernel_name.to_string() })?;
 
         // Return void
-        builder
-            .build_return(None)
-            .map_err(|e| crate::Error::LlvmError { reason: format!("build_return bootstrap: {}", e) })?;
+        builder.build_return(None).context(BuildReturnSnafu)?;
 
         // Verify the module
-        if let Err(err) = module.verify() {
-            return Err(crate::Error::LlvmError { reason: format!("Module verification failed: {}", err) });
-        }
-
-        // DEBUG: Print LLVM IR to verify STORE operations and attributes
-        eprintln!("LLVM IR for {}:", name);
-        module.print_to_stderr();
+        module.verify().map_err(|err| super::error::Error::ModuleVerification { message: err.to_string() })?;
 
         Ok(module)
     }
 }
 
 impl<'ctx> Renderer for LlvmRenderer<'ctx> {
-    fn render(&self, uop: &Rc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
+    fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
         // Generate LLVM IR module
@@ -341,8 +313,8 @@ impl<'ctx> Renderer for LlvmRenderer<'ctx> {
         "llvm"
     }
 
-    fn supports_op(&self, _op: &Op) -> bool {
-        // TODO: Implement proper op support checking
-        true
+    fn decompositor(&self) -> Option<morok_ir::pattern::PatternMatcher<()>> {
+        // LLVM has native transcendentals, no decomposition needed
+        None
     }
 }

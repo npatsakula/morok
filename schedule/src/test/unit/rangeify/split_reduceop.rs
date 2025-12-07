@@ -7,7 +7,7 @@
 //! - Helper functions (collect_range_ids)
 //! - Integration tests for actual splitting behavior
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
@@ -83,7 +83,7 @@ fn test_collect_range_ids_unsorted() {
 // ===== Integration Tests =====
 
 /// Helper to create a test tensor with given shape for reduce testing
-fn create_test_tensor(shape: &[usize]) -> Rc<UOp> {
+fn create_test_tensor(shape: &[usize]) -> Arc<UOp> {
     let total_size: usize = shape.iter().product();
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, total_size, DType::Float32);
 

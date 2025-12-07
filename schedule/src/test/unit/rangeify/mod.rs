@@ -60,7 +60,7 @@ fn test_rangeify_context_record_transform() {
 
     let retrieved = ctx.get_rangeified(&original);
     assert!(retrieved.is_some());
-    assert!(std::rc::Rc::ptr_eq(retrieved.unwrap(), &rangeified));
+    assert!(std::sync::Arc::ptr_eq(retrieved.unwrap(), &rangeified));
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn test_early_rewrites_detach_removal() {
     let result = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
+        assert!(std::sync::Arc::ptr_eq(&rewritten, &x));
     }
 }
 
@@ -115,6 +115,6 @@ fn test_early_rewrites_contiguous_backward_removal() {
     let result = matcher.rewrite(&contiguous, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
+        assert!(std::sync::Arc::ptr_eq(&rewritten, &x));
     }
 }

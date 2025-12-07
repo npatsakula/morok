@@ -8,7 +8,7 @@
 //! - Integrates correctly with the rangeify pipeline
 
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
@@ -24,7 +24,7 @@ use crate::rewrite::graph_rewrite;
 // ============================================================================
 
 /// Create a test BUFFER with given size and dtype.
-fn create_test_buffer(size: usize, dtype: DType, id: usize, device: DeviceSpec) -> Rc<UOp> {
+fn create_test_buffer(size: usize, dtype: DType, id: usize, device: DeviceSpec) -> Arc<UOp> {
     let unique = UOp::buffer_id(Some(id));
     let device_op = UOp::device(device);
     UOp::new(Op::Buffer { unique, device: device_op, size }, dtype)
@@ -34,7 +34,7 @@ fn create_test_buffer(size: usize, dtype: DType, id: usize, device: DeviceSpec) 
 ///
 /// Creates a chain of binary ADD operations that access `num_buffers` buffers.
 /// Returns: (buffers, computation)
-fn create_multi_buffer_computation(num_buffers: usize, device: DeviceSpec) -> (Vec<Rc<UOp>>, Rc<UOp>) {
+fn create_multi_buffer_computation(num_buffers: usize, device: DeviceSpec) -> (Vec<Arc<UOp>>, Arc<UOp>) {
     assert!(num_buffers > 0, "Must have at least one buffer");
 
     let mut ctx = IndexingContext::new();
@@ -62,7 +62,7 @@ fn create_multi_buffer_computation(num_buffers: usize, device: DeviceSpec) -> (V
 
 /// Count the number of BUFFERIZE operations in a UOp tree.
 #[allow(clippy::mutable_key_type)]
-fn count_bufferizes(uop: &Rc<UOp>) -> usize {
+fn count_bufferizes(uop: &Arc<UOp>) -> usize {
     let mut count = 0;
     let mut stack = vec![uop.clone()];
     let mut visited = HashSet::new();
@@ -89,23 +89,23 @@ fn count_bufferizes(uop: &Rc<UOp>) -> usize {
 ///
 /// This replicates the buffer counting logic used by buffer_limit_patterns.
 #[allow(clippy::mutable_key_type, dead_code)]
-fn count_accessed_buffers(uop: &Rc<UOp>) -> usize {
+fn count_accessed_buffers(uop: &Arc<UOp>) -> usize {
     let mut buffers = Vec::new();
     let mut visited = HashSet::new();
 
-    fn visit(uop: &Rc<UOp>, buffers: &mut Vec<Rc<UOp>>, visited: &mut HashSet<UOpKey>) {
-        let key = UOpKey(Rc::clone(uop));
+    fn visit(uop: &Arc<UOp>, buffers: &mut Vec<Arc<UOp>>, visited: &mut HashSet<UOpKey>) {
+        let key = UOpKey(Arc::clone(uop));
         if !visited.insert(key) {
             return;
         }
 
         match uop.op() {
             Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
-                buffers.push(Rc::clone(uop));
+                buffers.push(Arc::clone(uop));
                 return; // Stop traversal
             }
             Op::Buffer { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
-                buffers.push(Rc::clone(uop));
+                buffers.push(Arc::clone(uop));
             }
             _ => {}
         }
@@ -119,7 +119,7 @@ fn count_accessed_buffers(uop: &Rc<UOp>) -> usize {
 
     // Deduplicate
     let mut seen = HashSet::new();
-    buffers.retain(|b| seen.insert(UOpKey(Rc::clone(b))));
+    buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
 
     buffers.len()
 }
@@ -143,7 +143,7 @@ fn test_metal_limit_at_threshold() {
 
     // Should NOT materialize (30 <= 30, within limit)
     assert!(
-        Rc::ptr_eq(&result, &computation),
+        Arc::ptr_eq(&result, &computation),
         "Should not materialize when exactly at limit (30 buffers + 1 output = 31 total)"
     );
 }
@@ -181,7 +181,7 @@ fn test_webgpu_limit_at_threshold() {
 
     // Should NOT materialize (7 <= 7, within limit)
     assert!(
-        Rc::ptr_eq(&result, &computation),
+        Arc::ptr_eq(&result, &computation),
         "Should not materialize when exactly at limit (7 buffers + 1 output = 8 total)"
     );
 }
@@ -218,7 +218,7 @@ fn test_cpu_no_limit() {
     let result = computation.clone(); // No pattern matcher needed
 
     // Should NOT change (no limit enforcement for CPU)
-    assert!(Rc::ptr_eq(&result, &computation), "CPU should have no buffer limit");
+    assert!(Arc::ptr_eq(&result, &computation), "CPU should have no buffer limit");
     assert_eq!(count_bufferizes(&result), before_count, "CPU should not materialize buffers");
 }
 
@@ -233,7 +233,7 @@ fn test_cuda_no_limit() {
     let result = computation.clone(); // No pattern matcher needed
 
     // Should NOT change (no limit enforcement for CUDA)
-    assert!(Rc::ptr_eq(&result, &computation), "CUDA should have no buffer limit");
+    assert!(Arc::ptr_eq(&result, &computation), "CUDA should have no buffer limit");
     assert_eq!(count_bufferizes(&result), before_count, "CUDA should not materialize buffers");
 }
 

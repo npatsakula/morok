@@ -18,6 +18,7 @@
 //! ```
 
 pub mod context;
+pub mod cranelift;
 pub mod error;
 pub mod llvm;
 pub mod traits;

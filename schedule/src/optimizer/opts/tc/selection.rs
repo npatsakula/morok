@@ -5,7 +5,7 @@
 use super::matching::MatmulPattern;
 use crate::optimizer::{Renderer, error::*};
 use morok_ir::{Op, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Result of tensor core selection.
 #[derive(Debug, Clone)]
@@ -13,7 +13,7 @@ pub struct TcSelection {
     /// Index of selected tensor core in renderer's tensor_cores list.
     pub tc_index: usize,
     /// Selected axis triple (N_range, M_range, K_range).
-    pub axes: (Rc<UOp>, Rc<UOp>, Rc<UOp>),
+    pub axes: (Arc<UOp>, Arc<UOp>, Arc<UOp>),
 }
 
 /// Select appropriate tensor core for the given matmul pattern.
@@ -99,7 +99,7 @@ pub fn select_tensor_core(
 /// Axes must be divisible by the tensor core's dimension requirements,
 /// or be paddable (checked later during application).
 fn check_dimension_compatibility(
-    axes: &(Rc<UOp>, Rc<UOp>, Rc<UOp>),
+    axes: &(Arc<UOp>, Arc<UOp>, Arc<UOp>),
     _tc: &crate::optimizer::renderer::TensorCore,
 ) -> bool {
     // Extract sizes from ranges
@@ -117,7 +117,7 @@ fn check_dimension_compatibility(
 }
 
 /// Get the size of a RANGE UOp (if constant).
-fn get_range_size(range: &Rc<UOp>) -> Option<i64> {
+fn get_range_size(range: &Arc<UOp>) -> Option<i64> {
     if let Op::Range { end, .. } = range.op()
         && let Op::Const(cv) = end.op()
         && let morok_ir::ConstValue::Int(size) = cv.0

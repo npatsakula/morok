@@ -61,9 +61,9 @@ pub enum IterKind {
 /// The kind of arrow in a pattern rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrowKind {
-    /// `~>` - Infallible, RHS returns Rc<UOp>
+    /// `~>` - Infallible, RHS returns Arc<UOp>
     Infallible,
-    /// `=>` - Fallible, RHS returns Option<Rc<UOp>>
+    /// `=>` - Fallible, RHS returns Option<Arc<UOp>>
     Fallible,
 }
 
@@ -168,8 +168,8 @@ impl Parse for IterKind {
 
 /// A single pattern rule: `lhs if guard ~> rhs` or `lhs if guard => rhs`.
 ///
-/// - `~>` (infallible): RHS returns `Rc<UOp>`, pattern always succeeds if matched
-/// - `=>` (fallible): RHS returns `Option<Rc<UOp>>`, pattern may return None
+/// - `~>` (infallible): RHS returns `Arc<UOp>`, pattern always succeeds if matched
+/// - `=>` (fallible): RHS returns `Option<Arc<UOp>>`, pattern may return None
 #[derive(Debug)]
 pub struct PatternRule {
     pub lhs: Pattern,

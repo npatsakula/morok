@@ -2,12 +2,17 @@
 #![allow(clippy::mutable_key_type)]
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
-use morok_dtype::DeviceSpec;
 use morok_dtype::DType;
+use morok_dtype::DeviceSpec;
 
 use crate::{AxisId, ConstValue, Op, UOp}; // ConstValue kept for DType::Index
+
+// Mutex to serialize tests that clear the global UOp cache.
+// Without this, parallel test execution causes races where one test clears
+// the cache while another test is creating UOps.
+static CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn test_const_creation() {
@@ -23,7 +28,7 @@ fn test_hash_consing() {
     let c2 = UOp::native_const(1.0f32);
 
     // They should be the same object
-    assert!(Rc::ptr_eq(&c1, &c2), "Hash consing should return same Rc for identical UOps");
+    assert!(Arc::ptr_eq(&c1, &c2), "Hash consing should return same Rc for identical UOps");
 }
 
 #[test]
@@ -36,7 +41,89 @@ fn test_hash_consing_with_src() {
     let add2 = a.try_add(&b).unwrap();
 
     // Should be the same object
-    assert!(Rc::ptr_eq(&add1, &add2), "Hash consing should work with src nodes");
+    assert!(Arc::ptr_eq(&add1, &add2), "Hash consing should work with src nodes");
+}
+
+/// Test that hash consing works across threads.
+///
+/// This is the key correctness property: creating the same UOp in different
+/// threads should return the same Arc<UOp>, so Arc::ptr_eq works across threads.
+#[test]
+fn test_cross_thread_hash_consing() {
+    use std::sync::Barrier;
+
+    // Serialize tests that manipulate cache to prevent races with parallel test execution
+    let _lock = CACHE_TEST_MUTEX.lock().unwrap();
+
+    // Remove unused UOps from previous tests (those with strong_count == 1)
+    crate::uop::gc_unused_uops();
+
+    let num_threads = 10;
+    let barrier = Arc::new(Barrier::new(num_threads));
+
+    // All threads create the same UOp concurrently
+    let handles: Vec<_> = (0..num_threads)
+        .map(|_| {
+            let b = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                // Wait for all threads to be ready
+                b.wait();
+                // Create the same constant in each thread
+                UOp::native_const(42.0f32)
+            })
+        })
+        .collect();
+
+    // Collect results from all threads
+    let uops: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // All threads must get the same Arc
+    for i in 1..uops.len() {
+        assert!(
+            Arc::ptr_eq(&uops[0], &uops[i]),
+            "Thread {} got different Arc than thread 0 (id {} vs {})",
+            i,
+            uops[i].id,
+            uops[0].id
+        );
+    }
+}
+
+/// Test that hash consing works for complex UOps across threads.
+#[test]
+fn test_cross_thread_hash_consing_complex() {
+    use std::sync::Barrier;
+
+    // Serialize tests that manipulate cache to prevent races with parallel test execution
+    let _lock = CACHE_TEST_MUTEX.lock().unwrap();
+
+    // Remove unused UOps from previous tests (those with strong_count == 1)
+    crate::uop::gc_unused_uops();
+
+    let num_threads = 8;
+    let barrier = Arc::new(Barrier::new(num_threads));
+
+    // All threads create the same expression: (1.0 + 2.0) * 3.0
+    let handles: Vec<_> = (0..num_threads)
+        .map(|_| {
+            let b = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                b.wait();
+                let a = UOp::native_const(1.0f32);
+                let b_val = UOp::native_const(2.0f32);
+                let c = UOp::native_const(3.0f32);
+                let add = a.try_add(&b_val).unwrap();
+                add.try_mul(&c).unwrap()
+            })
+        })
+        .collect();
+
+    let uops: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // All threads must get the same Arc for the final expression
+    for i in 1..uops.len() {
+        assert!(Arc::ptr_eq(&uops[0], &uops[i]), "Thread {} got different Arc for complex expression", i);
+    }
 }
 
 #[test]
@@ -94,12 +181,12 @@ fn test_toposort() {
     assert!(sorted.len() >= 5); // a, b, c, add, mul
 
     // Check that dependencies come before dependents
-    let positions: HashMap<_, _> = sorted.iter().enumerate().map(|(i, node)| (Rc::as_ptr(node), i)).collect();
+    let positions: HashMap<_, _> = sorted.iter().enumerate().map(|(i, node)| (Arc::as_ptr(node), i)).collect();
 
     for node in &sorted {
-        let node_pos = positions[&Rc::as_ptr(node)];
+        let node_pos = positions[&Arc::as_ptr(node)];
         for child in node.op().children() {
-            let child_pos = positions[&Rc::as_ptr(child)];
+            let child_pos = positions[&Arc::as_ptr(child)];
             assert!(child_pos < node_pos, "Dependencies must come before dependents");
         }
     }
@@ -120,8 +207,8 @@ fn test_toposort_shared_node() {
     let sorted = z.toposort();
 
     // Node 'a' should appear only once
-    let a_ptr = Rc::as_ptr(&a);
-    let a_count = sorted.iter().filter(|node| Rc::as_ptr(node) == a_ptr).count();
+    let a_ptr = Arc::as_ptr(&a);
+    let a_count = sorted.iter().filter(|node| Arc::as_ptr(node) == a_ptr).count();
     assert_eq!(a_count, 1, "Shared node 'a' should appear exactly once");
 }
 
@@ -144,7 +231,7 @@ fn test_buffer_hash_consing() {
     // (due to different UNIQUE identifiers)
     let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    assert!(!Rc::ptr_eq(&buf1, &buf2), "Different buffers should have different UNIQUE ids");
+    assert!(!Arc::ptr_eq(&buf1, &buf2), "Different buffers should have different UNIQUE ids");
 }
 
 #[test]
@@ -196,8 +283,8 @@ fn test_children_method() {
 
     let children = add.op().children();
     assert_eq!(children.len(), 2);
-    assert!(Rc::ptr_eq(children[0], &a));
-    assert!(Rc::ptr_eq(children[1], &b));
+    assert!(Arc::ptr_eq(children[0], &a));
+    assert!(Arc::ptr_eq(children[1], &b));
 }
 
 #[test]
@@ -210,8 +297,8 @@ fn test_for_each_child() {
     add.op().map_child(|child| children.push(child.clone()));
 
     assert_eq!(children.len(), 2);
-    assert!(Rc::ptr_eq(&children[0], &a));
-    assert!(Rc::ptr_eq(&children[1], &b));
+    assert!(Arc::ptr_eq(&children[0], &a));
+    assert!(Arc::ptr_eq(&children[1], &b));
 }
 
 // ============================================================================
@@ -233,8 +320,11 @@ fn test_shape_property_lazy_evaluation() {
     use crate::uop::cached_property::CachedProperty;
     use crate::uop::properties::ShapeProperty;
 
-    let a = UOp::native_const(1.0f32);
-    let b = UOp::native_const(2.0f32);
+    // Use unique values unlikely to be created by other tests to get fresh UOps
+    // (global hash consing means identical UOps are shared across all tests)
+    let unique_val = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as f64;
+    let a = UOp::native_const(unique_val as f32);
+    let b = UOp::native_const((unique_val + 1.0) as f32);
     let add = a.try_add(&b).unwrap();
 
     // VERIFY: Cache is empty before first access (lazy evaluation)
@@ -278,7 +368,7 @@ fn test_ranges_property_with_range() {
 
     let ranges = idx.ranges();
     assert_eq!(ranges.len(), 1, "Should find one RANGE op");
-    assert!(Rc::ptr_eq(&ranges[0], &range));
+    assert!(Arc::ptr_eq(&ranges[0], &range));
 }
 
 #[test]
@@ -306,7 +396,7 @@ fn test_ranges_property_lazy_evaluation() {
 
     // VERIFY: Both accesses return the same cached reference
     assert!(std::ptr::eq(ranges1, ranges2), "Second access should return same cached reference");
-    assert!(Rc::ptr_eq(&ranges1[0], &ranges2[0]));
+    assert!(Arc::ptr_eq(&ranges1[0], &ranges2[0]));
 }
 
 #[test]
@@ -405,11 +495,11 @@ fn test_toposort_filtered_basic() {
     let c = b.try_mul(&UOp::native_const(3.0f32)).unwrap();
 
     // Filter to only include 'c'
-    let filtered = c.toposort_filtered(|node| Rc::ptr_eq(node, &c));
+    let filtered = c.toposort_filtered(|node| Arc::ptr_eq(node, &c));
 
     // Should only contain 'c' since gate blocks traversal of children
     assert_eq!(filtered.len(), 1, "Filtered toposort should only include nodes passing gate");
-    assert!(Rc::ptr_eq(&filtered[0], &c));
+    assert!(Arc::ptr_eq(&filtered[0], &c));
 }
 
 #[test]

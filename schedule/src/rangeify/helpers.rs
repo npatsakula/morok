@@ -2,7 +2,7 @@
 
 use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, Op, SInt, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Check if value is identity for op (Add: 0, Mul: 1, And: -1, Or/Xor: 0).
 pub fn is_identity_value(value: &ConstValue, op: &BinaryOp, is_right: bool) -> bool {
@@ -51,7 +51,7 @@ pub fn is_zero_value(value: &ConstValue, op: &BinaryOp) -> bool {
 }
 
 /// Extract the constant value from a UOp if it's a CONST operation.
-pub fn get_const_value(uop: &Rc<UOp>) -> Option<ConstValue> {
+pub fn get_const_value(uop: &Arc<UOp>) -> Option<ConstValue> {
     match uop.op() {
         Op::Const(cv) => Some(cv.0),
         _ => None,
@@ -59,14 +59,14 @@ pub fn get_const_value(uop: &Rc<UOp>) -> Option<ConstValue> {
 }
 
 /// Check if a UOp is a constant with a specific value.
-pub fn is_const(uop: &Rc<UOp>, value: &ConstValue) -> bool {
+pub fn is_const(uop: &Arc<UOp>, value: &ConstValue) -> bool {
     get_const_value(uop).as_ref() == Some(value)
 }
 
 /// Check if a UOp represents a zero-size tensor.
 ///
 /// A tensor has zero size if any dimension in its shape is 0.
-pub fn is_zero_size(uop: &Rc<UOp>) -> bool {
+pub fn is_zero_size(uop: &Arc<UOp>) -> bool {
     uop.shape().ok().flatten().map(|shape| shape.iter().any(|dim| matches!(dim, SInt::Const(0)))).unwrap_or(false)
 }
 
@@ -76,7 +76,7 @@ pub fn is_void(dtype: &DType) -> bool {
 }
 
 /// Get the binary operation from a UOp if it's a BINARY operation.
-pub fn get_binary_op(uop: &Rc<UOp>) -> Option<BinaryOp> {
+pub fn get_binary_op(uop: &Arc<UOp>) -> Option<BinaryOp> {
     match uop.op() {
         Op::Binary(op, _, _) => Some(*op),
         _ => None,
@@ -84,7 +84,7 @@ pub fn get_binary_op(uop: &Rc<UOp>) -> Option<BinaryOp> {
 }
 
 /// Transform ranges through a movement op (SHRINK, PERMUTE, FLIP, EXPAND, PAD, RESHAPE).
-pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>]) -> Vec<Rc<UOp>> {
+pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     use morok_ir::SInt;
 
     match op {
@@ -95,7 +95,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                 .zip(begin_vals.iter())
                 .map(|(rng, &begin)| {
                     if begin == 0 {
-                        Rc::clone(rng)
+                        Arc::clone(rng)
                     } else {
                         let begin_uop = UOp::index_const(begin as i64);
                         rng.try_add(&begin_uop).unwrap()
@@ -107,7 +107,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
         // PERMUTE: ranges = [rngs[inv_perm[i]] for i in 0..len]
         Op::Permute { axes, .. } => {
             let inv_perm = argsort(axes);
-            inv_perm.iter().map(|&i| Rc::clone(&rngs[i])).collect()
+            inv_perm.iter().map(|&i| Arc::clone(&rngs[i])).collect()
         }
 
         // FLIP: ranges[i] = (shape[i]-1) - rng[i] if flip[i] else rng[i]
@@ -117,7 +117,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
             .zip(flips.iter())
             .map(|((rng, shape), &flip)| {
                 if !flip {
-                    Rc::clone(rng)
+                    Arc::clone(rng)
                 } else {
                     let shape_minus_1 = match shape {
                         SInt::Const(n) => UOp::index_const(*n as i64 - 1),
@@ -143,7 +143,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                         (SInt::Const(1), SInt::Symbolic(_)) => true,
                         _ => false,
                     };
-                    if expanding { UOp::index_const(0) } else { Rc::clone(rng) }
+                    if expanding { UOp::index_const(0) } else { Arc::clone(rng) }
                 })
                 .collect()
         }
@@ -157,7 +157,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
                 .zip(begin_vals.iter().zip(end_vals.iter()))
                 .map(|((rng, shape), (&begin, &end))| {
                     if begin == 0 && end == 0 {
-                        return Rc::clone(rng);
+                        return Arc::clone(rng);
                     }
                     let begin_uop = UOp::index_const(begin as i64);
                     let shape_plus_begin = match shape {
@@ -226,7 +226,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
             for shape_dim in in_shape.iter().rev() {
                 let shape_uop = match shape_dim {
                     SInt::Const(n) => UOp::index_const(*n as i64),
-                    SInt::Symbolic(uop) => Rc::clone(uop),
+                    SInt::Symbolic(uop) => Arc::clone(uop),
                 };
                 let mod_result = combined.try_mod(&shape_uop).unwrap();
                 axes_out.push(mod_result);
@@ -241,7 +241,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[morok_ir::SInt], rngs: &[Rc<UOp>])
 }
 
 /// Extract shape values from a UOp (for SHRINK begins/ends, PAD pads).
-fn extract_shape_values(uop: &Rc<UOp>) -> Vec<usize> {
+fn extract_shape_values(uop: &Arc<UOp>) -> Vec<usize> {
     match uop.op() {
         Op::Vectorize { elements } => elements
             .iter()
@@ -265,7 +265,7 @@ fn extract_shape_values(uop: &Rc<UOp>) -> Vec<usize> {
 }
 
 /// Extract shape from a UOp (for RESHAPE new_shape, EXPAND new_shape).
-fn extract_shape_from_uop(uop: &Rc<UOp>) -> Vec<morok_ir::SInt> {
+fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<morok_ir::SInt> {
     use morok_ir::SInt;
     match uop.op() {
         Op::Vectorize { elements } => elements
@@ -273,9 +273,9 @@ fn extract_shape_from_uop(uop: &Rc<UOp>) -> Vec<morok_ir::SInt> {
             .map(|elem| match elem.op() {
                 Op::Const(cv) => match cv.0 {
                     ConstValue::Int(n) => SInt::Const(n as usize),
-                    _ => SInt::Symbolic(Rc::clone(elem)),
+                    _ => SInt::Symbolic(Arc::clone(elem)),
                 },
-                _ => SInt::Symbolic(Rc::clone(elem)),
+                _ => SInt::Symbolic(Arc::clone(elem)),
             })
             .collect(),
         Op::Const(cv) => {
@@ -299,8 +299,8 @@ fn argsort(perm: &[usize]) -> Vec<usize> {
 }
 
 /// Check if two range lists are pointer-equal (same UOps).
-pub fn ranges_equal(ranges1: &[Rc<UOp>], ranges2: &[Rc<UOp>]) -> bool {
-    ranges1.len() == ranges2.len() && ranges1.iter().zip(ranges2).all(|(r1, r2)| Rc::ptr_eq(r1, r2))
+pub fn ranges_equal(ranges1: &[Arc<UOp>], ranges2: &[Arc<UOp>]) -> bool {
+    ranges1.len() == ranges2.len() && ranges1.iter().zip(ranges2).all(|(r1, r2)| Arc::ptr_eq(r1, r2))
 }
 
 /// Check if op should always run (CONTIGUOUS, COPY, ASSIGN, NOOP).
@@ -309,7 +309,7 @@ pub fn is_always_run_op(op: &Op) -> bool {
 }
 
 /// Check if range is dead (size ≤ 1). Uses vmax analysis.
-pub fn is_dead_axis(range: &Rc<UOp>) -> bool {
+pub fn is_dead_axis(range: &Arc<UOp>) -> bool {
     if !matches!(range.op(), Op::Range { .. }) {
         return false;
     }
@@ -355,12 +355,12 @@ pub fn is_cheap_to_inline(op: &Op) -> bool {
 /// Only LOCAL BUFFERIZE operations are candidates for removal by the
 /// "cheap to inline" optimization. GLOBAL BUFFERIZE operations represent
 /// user-requested output materialization and should never be removed.
-pub fn is_local_bufferize(uop: &Rc<UOp>) -> bool {
+pub fn is_local_bufferize(uop: &Arc<UOp>) -> bool {
     if let Op::Bufferize { opts, .. } = uop.op() { opts.addrspace == morok_ir::AddrSpace::Local } else { false }
 }
 
 /// Check if UOp has no RANGE dependencies.
-pub fn no_range(uop: &Rc<UOp>) -> bool {
+pub fn no_range(uop: &Arc<UOp>) -> bool {
     #[allow(clippy::mutable_key_type)]
     let in_scope_ranges = uop.in_scope_ranges();
 
@@ -369,7 +369,7 @@ pub fn no_range(uop: &Rc<UOp>) -> bool {
 }
 
 /// Extract RANGE size as i64. Returns None for symbolic ranges.
-pub fn range_size_as_i64(range: &Rc<UOp>) -> Option<i64> {
+pub fn range_size_as_i64(range: &Arc<UOp>) -> Option<i64> {
     if let Op::Range { end, .. } = range.op() {
         get_const_value(end).and_then(|cv| match cv {
             ConstValue::Int(n) => Some(n),
@@ -382,7 +382,7 @@ pub fn range_size_as_i64(range: &Rc<UOp>) -> Option<i64> {
 }
 
 /// Check if all ranges have identical index expressions (ignoring validity masks).
-pub fn all_ranges_same(ranges: &[Rc<UOp>]) -> bool {
+pub fn all_ranges_same(ranges: &[Arc<UOp>]) -> bool {
     if ranges.is_empty() {
         return true;
     }
@@ -393,14 +393,14 @@ pub fn all_ranges_same(ranges: &[Rc<UOp>]) -> bool {
     ranges.iter().skip(1).all(|r| {
         let idx = r.get_idx();
         // Check pointer equality first (fast path)
-        Rc::ptr_eq(&first_idx, &idx) || uop_equal(&first_idx, &idx)
+        Arc::ptr_eq(&first_idx, &idx) || uop_equal(&first_idx, &idx)
     })
 }
 
 /// Deep structural equality check for UOps.
-pub fn uop_equal(a: &Rc<UOp>, b: &Rc<UOp>) -> bool {
+pub fn uop_equal(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
     // Fast path: pointer equality
-    if Rc::ptr_eq(a, b) {
+    if Arc::ptr_eq(a, b) {
         return true;
     }
 

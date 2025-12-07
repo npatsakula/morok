@@ -7,10 +7,10 @@
 //! - Bufferization: bufferize, bufferize_global, bufferize_local
 //! - Memory definitions: define_global, define_local, define_reg
 
-use std::rc::Rc;
+use std::sync::Arc;
 
-use morok_dtype::DeviceSpec;
 use morok_dtype::DType;
+use morok_dtype::DeviceSpec;
 use smallvec::SmallVec;
 use snafu::ensure;
 
@@ -29,7 +29,7 @@ impl UOp {
     /// Create a buffer index operation for multi-dimensional access.
     ///
     /// All indices must have Index dtype. Returns element at specified position.
-    pub fn index(buffer: Rc<Self>, indices: Vec<Rc<Self>>) -> Result<Rc<Self>> {
+    pub fn index(buffer: Arc<Self>, indices: Vec<Arc<Self>>) -> Result<Arc<Self>> {
         // Validate that all indices have Index dtype
         for idx in &indices {
             let idx_dtype = idx.dtype();
@@ -42,7 +42,7 @@ impl UOp {
     }
 
     /// Create a gated index operation.
-    pub fn index_gated(buffer: Rc<Self>, indices: Vec<Rc<Self>>, gate: Rc<Self>) -> Result<Rc<Self>> {
+    pub fn index_gated(buffer: Arc<Self>, indices: Vec<Arc<Self>>, gate: Arc<Self>) -> Result<Arc<Self>> {
         // Validate that all indices have Index dtype
         for idx in &indices {
             let idx_dtype = idx.dtype();
@@ -58,7 +58,7 @@ impl UOp {
     ///
     /// Performs pointer + offset arithmetic for address calculation in kernels.
     /// Both ptr and offset should have Index dtype.
-    pub fn pointer_index(ptr: Rc<Self>, offset: Rc<Self>) -> Result<Rc<Self>> {
+    pub fn pointer_index(ptr: Arc<Self>, offset: Arc<Self>) -> Result<Arc<Self>> {
         let ptr_dtype = ptr.dtype();
         let offset_dtype = offset.dtype();
         ensure!(ptr_dtype == DType::Index, IndexTypeMismatchSnafu { actual: ptr_dtype });
@@ -70,7 +70,7 @@ impl UOp {
     ///
     /// **Note**: Range and NewAxis specs are not fully implemented;
     /// currently only Single indices are properly supported.
-    pub fn slice(buffer: Rc<Self>, specs: Vec<IndexSpec>) -> Result<Rc<Self>> {
+    pub fn slice(buffer: Arc<Self>, specs: Vec<IndexSpec>) -> Result<Arc<Self>> {
         let mut indices = Vec::new();
 
         for spec in specs {
@@ -104,7 +104,7 @@ impl UOp {
     }
 
     /// Gated slicing - conditional access with gate.
-    pub fn slice_gated(buffer: Rc<Self>, specs: Vec<IndexSpec>, gate: Rc<Self>) -> Result<Rc<Self>> {
+    pub fn slice_gated(buffer: Arc<Self>, specs: Vec<IndexSpec>, gate: Arc<Self>) -> Result<Arc<Self>> {
         let mut indices = Vec::new();
 
         for spec in specs {
@@ -126,7 +126,7 @@ impl UOp {
     ///
     /// Loads a value from a buffer at the given index.
     /// The result dtype is the element type (base of the Ptr dtype).
-    pub fn load(buffer: Rc<Self>, index: Rc<Self>) -> Rc<Self> {
+    pub fn load(buffer: Arc<Self>, index: Arc<Self>) -> Arc<Self> {
         // Get the element type from the buffer's Ptr dtype
         let dtype = match &buffer.dtype {
             DType::Ptr { base, .. } => (**base).clone(),
@@ -141,7 +141,7 @@ impl UOp {
     /// Loads a value from a buffer at the given index, conditionally based on gate.
     /// If gate is false, the load may be skipped or return undefined.
     /// The result dtype is the element type (base of the Ptr dtype).
-    pub fn load_gated(buffer: Rc<Self>, index: Rc<Self>, gate: Rc<Self>) -> Rc<Self> {
+    pub fn load_gated(buffer: Arc<Self>, index: Arc<Self>, gate: Arc<Self>) -> Arc<Self> {
         // Get the element type from the buffer's Ptr dtype
         let dtype = match &buffer.dtype {
             DType::Ptr { base, .. } => (**base).clone(),
@@ -154,7 +154,7 @@ impl UOp {
     /// Create a STORE operation.
     ///
     /// Stores a value to a buffer at the given index.
-    pub fn store(buffer: Rc<Self>, index: Rc<Self>, value: Rc<Self>) -> Rc<Self> {
+    pub fn store(buffer: Arc<Self>, index: Arc<Self>, value: Arc<Self>) -> Arc<Self> {
         Self::new(Op::Store { buffer, index, value }, DType::Void)
     }
 
@@ -162,7 +162,7 @@ impl UOp {
     ///
     /// Stores a value to a buffer at the given index, conditionally based on gate.
     /// If gate is false, the store may be skipped.
-    pub fn store_gated(buffer: Rc<Self>, index: Rc<Self>, value: Rc<Self>, gate: Rc<Self>) -> Rc<Self> {
+    pub fn store_gated(buffer: Arc<Self>, index: Arc<Self>, value: Arc<Self>, gate: Arc<Self>) -> Arc<Self> {
         Self::new(Op::StoreGated { buffer, index, value, gate }, DType::Void)
     }
 
@@ -171,7 +171,7 @@ impl UOp {
     // =========================================================================
 
     /// Copy to a different device.
-    pub fn copy_to_device(self: &Rc<Self>, device: DeviceSpec) -> Rc<Self> {
+    pub fn copy_to_device(self: &Arc<Self>, device: DeviceSpec) -> Arc<Self> {
         let dev = Self::device(device);
         Self::new(Op::Copy { src: self.clone(), device: dev }, self.dtype.clone())
     }
@@ -180,7 +180,7 @@ impl UOp {
     ///
     /// Unlike `copy_to_device` which takes a `DeviceSpec`, this takes
     /// a device UOp directly (useful when you already have one).
-    pub fn copy(src: Rc<Self>, device: Rc<Self>) -> Rc<Self> {
+    pub fn copy(src: Arc<Self>, device: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype.clone();
         Self::new(Op::Copy { src, device }, dtype)
     }
@@ -193,7 +193,7 @@ impl UOp {
     ///
     /// Marks a computation to be materialized into a buffer.
     /// The computation is evaluated over the given ranges and stored.
-    pub fn bufferize(compute: Rc<Self>, ranges: Vec<Rc<Self>>, opts: BufferizeOpts) -> Rc<Self> {
+    pub fn bufferize(compute: Arc<Self>, ranges: Vec<Arc<Self>>, opts: BufferizeOpts) -> Arc<Self> {
         let dtype = compute.dtype.clone();
         Self::new(Op::Bufferize { compute, ranges: SmallVec::from_vec(ranges), opts }, dtype)
     }
@@ -201,14 +201,14 @@ impl UOp {
     /// Create a BUFFERIZE operation with Global address space.
     ///
     /// This is the most common pattern - bufferize to global memory.
-    pub fn bufferize_global(compute: Rc<Self>, ranges: Vec<Rc<Self>>) -> Rc<Self> {
+    pub fn bufferize_global(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
         Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
     }
 
     /// Create a BUFFERIZE operation with Local address space.
     ///
     /// For shared/local memory bufferization.
-    pub fn bufferize_local(compute: Rc<Self>, ranges: Vec<Rc<Self>>) -> Rc<Self> {
+    pub fn bufferize_local(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
         Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Local })
     }
 
@@ -219,19 +219,19 @@ impl UOp {
     /// Create a DEFINE_GLOBAL operation.
     ///
     /// Defines a global memory allocation with the given ID.
-    pub fn define_global(id: usize, dtype: DType) -> Rc<Self> {
+    pub fn define_global(id: usize, dtype: DType) -> Arc<Self> {
         Self::new(Op::DefineGlobal(id), dtype)
     }
 
     /// Create a DEFINE_LOCAL operation.
     ///
     /// Defines a local (shared) memory allocation with the given ID.
-    pub fn define_local(id: usize, dtype: DType) -> Rc<Self> {
+    pub fn define_local(id: usize, dtype: DType) -> Arc<Self> {
         Self::new(Op::DefineLocal(id), dtype)
     }
 
     /// Define register memory.
-    pub fn define_reg(size: usize) -> Rc<Self> {
+    pub fn define_reg(size: usize) -> Arc<Self> {
         use morok_dtype::AddrSpace;
         let ptr_dtype = DType::Void.ptr(Some(size), AddrSpace::Reg);
         Self::new(Op::DefineReg { size }, ptr_dtype)

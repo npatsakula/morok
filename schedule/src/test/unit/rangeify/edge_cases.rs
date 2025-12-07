@@ -46,12 +46,20 @@ fn test_empty_bufferize() {
     let result = bufferize_to_store(&bufferize, &mut ctx);
     assert!(result.is_some());
 
-    // Result should be a STORE (no END wrapper since no ranges)
-    if let Op::Store { value, .. } = result.unwrap().op() {
-        assert!(std::rc::Rc::ptr_eq(value, &compute));
-    } else {
-        panic!("Expected STORE operation for empty ranges");
-    }
+    // Result should be AFTER(passthrough=DEFINE_GLOBAL, deps=[STORE])
+    // No ranges means no END wrapper, but still AFTER structure
+    let result = result.unwrap();
+    let Op::After { passthrough, deps } = result.op() else {
+        panic!("Expected AFTER operation, got {:?}", result.op());
+    };
+    assert!(matches!(passthrough.op(), Op::DefineGlobal(_)));
+    assert_eq!(deps.len(), 1);
+
+    // deps[0] should be STORE (no ranges = no END)
+    let Op::Store { value, .. } = deps[0].op() else {
+        panic!("Expected STORE in AFTER deps, got {:?}", deps[0].op());
+    };
+    assert!(std::sync::Arc::ptr_eq(value, &compute));
 }
 
 #[test]
@@ -64,7 +72,7 @@ fn test_zero_size_index() {
 
     // Should be a valid INDEX
     if let Op::Index { buffer: idx_buf, indices, .. } = index.op() {
-        assert!(std::rc::Rc::ptr_eq(idx_buf, &buffer));
+        assert!(std::sync::Arc::ptr_eq(idx_buf, &buffer));
         assert_eq!(indices.len(), 0);
     } else {
         panic!("Expected INDEX operation");
@@ -79,7 +87,7 @@ fn test_zero_size_end() {
 
     // Should create valid END
     if let Op::End { computation, ranges } = end.op() {
-        assert!(std::rc::Rc::ptr_eq(computation, &store));
+        assert!(std::sync::Arc::ptr_eq(computation, &store));
         assert_eq!(ranges.len(), 0);
     } else {
         panic!("Expected END operation");
@@ -100,7 +108,7 @@ fn test_zero_size_pipeline() {
     );
 
     // Run through pipeline
-    let result = run_kernel_split_pipeline(bufferize);
+    let (result, _context) = run_kernel_split_pipeline(bufferize);
 
     // Should create a KERNEL even with zero ranges
     assert!(matches!(result.op(), Op::Kernel { .. }));

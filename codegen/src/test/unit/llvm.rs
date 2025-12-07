@@ -63,11 +63,8 @@ fn test_range_end_basic() {
 fn test_reduce_add_basic() {
     // Create reduction: sum of constant 5.0 over range 0..10
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(5.0));
-    let range = UOp::range_axis(
-        UOp::const_(DType::Index, ConstValue::Int(10)),
-        AxisId::Renumbered(0),
-        AxisType::Reduce,
-    );
+    let range =
+        UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
 
     let reduce = UOp::reduce(const_val, smallvec::smallvec![range], ReduceOp::Add);
 
@@ -99,11 +96,7 @@ fn test_reduce_add_basic() {
 fn test_reduce_max() {
     // Create reduction: max of constant over range
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(3.0));
-    let range = UOp::range_axis(
-        UOp::const_(DType::Index, ConstValue::Int(5)),
-        AxisId::Renumbered(0),
-        AxisType::Reduce,
-    );
+    let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(5)), AxisId::Renumbered(0), AxisType::Reduce);
 
     let reduce = UOp::reduce(const_val, smallvec::smallvec![range], ReduceOp::Max);
     let sink = UOp::sink(vec![reduce]);

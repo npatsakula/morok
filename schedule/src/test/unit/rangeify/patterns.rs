@@ -9,7 +9,7 @@
 //! Based on Tinygrad's test_schedule.py pattern tests.
 
 use std::f32::consts::PI;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
@@ -31,7 +31,7 @@ fn test_early_rewrites_detach_removal() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite DETACH");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &x), "Should return the source");
+        assert!(Arc::ptr_eq(&rewritten, &x), "Should return the source");
     }
 }
 
@@ -47,7 +47,7 @@ fn test_early_rewrites_contiguous_backward_removal() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite CONTIGUOUS_BACKWARD");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &x), "Should return the source");
+        assert!(Arc::ptr_eq(&rewritten, &x), "Should return the source");
     }
 }
 
@@ -80,7 +80,7 @@ fn test_early_rewrites_nested_detach() {
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &inner_detach), "Should unwrap outer DETACH to inner DETACH");
+        assert!(Arc::ptr_eq(&rewritten, &inner_detach), "Should unwrap outer DETACH to inner DETACH");
     }
 }
 
@@ -102,7 +102,7 @@ fn test_buffer_folding_noop_bufferize() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove noop BUFFERIZE");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &x), "Should return the compute directly");
+        assert!(Arc::ptr_eq(&rewritten, &x), "Should return the compute directly");
     }
 }
 
@@ -120,7 +120,7 @@ fn test_buffer_folding_bufferize_const() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove BUFFERIZE from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
+        assert!(Arc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
     }
 }
 
@@ -138,7 +138,7 @@ fn test_buffer_folding_index_const() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove INDEX from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
+        assert!(Arc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
     }
 }
 
@@ -155,7 +155,7 @@ fn test_buffer_folding_copy_const() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove COPY from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
+        assert!(Arc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
     }
 }
 
@@ -208,7 +208,7 @@ fn test_dead_axis_removal_single_dead_axis() {
             // Either returns compute directly or BUFFERIZE with no ranges
             // Since all ranges are dead, should return compute directly
             assert!(
-                Rc::ptr_eq(&rewritten, &x) || matches!(rewritten.op(), Op::Bufferize { .. }),
+                Arc::ptr_eq(&rewritten, &x) || matches!(rewritten.op(), Op::Bufferize { .. }),
                 "Should either return compute or empty BUFFERIZE"
             );
         }
@@ -287,7 +287,7 @@ fn test_buffer_removal_cheap_compute() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Rc::ptr_eq(&rewritten, &add), "Should remove BUFFERIZE from cheap compute");
+            assert!(Arc::ptr_eq(&rewritten, &add), "Should remove BUFFERIZE from cheap compute");
         }
         _ => {
             // Acceptable if cost model determines it's not cheap enough
@@ -311,7 +311,7 @@ fn test_buffer_removal_always_run_ops() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Rc::ptr_eq(&rewritten, &contiguous), "Should remove BUFFERIZE from always-run op");
+            assert!(Arc::ptr_eq(&rewritten, &contiguous), "Should remove BUFFERIZE from always-run op");
         }
         _ => {
             // Acceptable depending on implementation
@@ -341,7 +341,7 @@ fn test_buffer_removal_nested_bufferize() {
         RewriteResult::Rewritten(rewritten) => {
             if let Op::Bufferize { compute, .. } = rewritten.op() {
                 // Should have unwrapped inner BUFFERIZE
-                assert!(Rc::ptr_eq(compute, &x), "Should have compute pointing to x, not inner BUFFERIZE");
+                assert!(Arc::ptr_eq(compute, &x), "Should have compute pointing to x, not inner BUFFERIZE");
             } else {
                 panic!("Expected BUFFERIZE operation");
             }
@@ -418,7 +418,7 @@ fn test_pattern_composition() {
 
     match result2 {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Rc::ptr_eq(&rewritten, &x), "Should have removed both DETACH and BUFFERIZE");
+            assert!(Arc::ptr_eq(&rewritten, &x), "Should have removed both DETACH and BUFFERIZE");
         }
         _ => {
             // Acceptable depending on implementation

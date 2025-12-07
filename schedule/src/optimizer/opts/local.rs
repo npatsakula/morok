@@ -5,7 +5,7 @@
 
 use crate::optimizer::{Scheduler, error::*};
 use morok_ir::{AxisType, Op, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Apply LOCAL optimization to use shared memory.
 ///
@@ -32,7 +32,7 @@ use std::rc::Rc;
 /// // Global(64) -> Global(8) + Local(8)
 /// apply(&mut scheduler, global_range, 8)?;
 /// ```
-pub fn apply(scheduler: &mut Scheduler, rng: Rc<UOp>, amount: usize) -> Result<(), OptError> {
+pub fn apply(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     // 1. Validate backend support
     if !scheduler.ren.has_local {
         return UnsupportedFeatureSnafu { feature: "local memory" }.fail();

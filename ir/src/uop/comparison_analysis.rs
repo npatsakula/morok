@@ -7,7 +7,7 @@
 use crate::UOp;
 use crate::types::{BinaryOp, ConstValue};
 use std::cmp::Ordering;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Unified comparison analyzer that handles both constant and range-based analysis.
 pub struct ComparisonAnalyzer;
@@ -17,12 +17,12 @@ impl ComparisonAnalyzer {
     ///
     /// Returns Some(true/false) if the comparison result is deterministic,
     /// or None if it could be either true or false.
-    pub fn analyze(op: BinaryOp, x: &Rc<UOp>, y: &Rc<UOp>) -> Option<bool> {
+    pub fn analyze(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Option<bool> {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::VminVmaxProperty;
 
         // Fast path: self-comparison for non-float types
-        if Rc::ptr_eq(x, y) && !x.dtype().is_float() {
+        if Arc::ptr_eq(x, y) && !x.dtype().is_float() {
             return match op {
                 BinaryOp::Lt => Some(false), // x < x is always false
                 BinaryOp::Eq => Some(true),  // x == x is always true
@@ -102,7 +102,7 @@ impl ComparisonAnalyzer {
     }
 
     /// Check if a comparison can be safely eliminated based on types.
-    fn can_eliminate_comparison(x: &Rc<UOp>, y: &Rc<UOp>) -> bool {
+    fn can_eliminate_comparison(x: &Arc<UOp>, y: &Arc<UOp>) -> bool {
         let dtype = x.dtype();
 
         // For non-float types, always safe to eliminate
@@ -114,7 +114,7 @@ impl ComparisonAnalyzer {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::VminVmaxProperty;
 
-        let check_nan = |uop: &Rc<UOp>| {
+        let check_nan = |uop: &Arc<UOp>| {
             let (min, max) = VminVmaxProperty::get(uop);
             matches!(min, ConstValue::Float(f) if f.is_nan()) || matches!(max, ConstValue::Float(f) if f.is_nan())
         };
@@ -208,7 +208,7 @@ impl ComparisonAnalyzer {
 }
 
 /// Convenience function for DCE to get all three comparison results at once.
-pub fn analyze_all_comparisons(x: &Rc<UOp>, y: &Rc<UOp>) -> (Option<bool>, Option<bool>, Option<bool>) {
+pub fn analyze_all_comparisons(x: &Arc<UOp>, y: &Arc<UOp>) -> (Option<bool>, Option<bool>, Option<bool>) {
     let lt = ComparisonAnalyzer::analyze(BinaryOp::Lt, x, y);
     let eq = ComparisonAnalyzer::analyze(BinaryOp::Eq, x, y);
     let ne = ComparisonAnalyzer::analyze(BinaryOp::Ne, x, y);

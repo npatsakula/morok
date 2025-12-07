@@ -5,7 +5,7 @@
 //! - Different ranges (create new range, partial realization)
 //! - Validity mask merging (OR operation)
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::{AxisType, ConstValue, Op, SInt, TernaryOp, UOp};
@@ -44,7 +44,7 @@ fn test_get_idx_plain_range() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     let idx = range.get_idx();
-    assert!(Rc::ptr_eq(&idx, &range));
+    assert!(Arc::ptr_eq(&idx, &range));
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn test_get_idx_with_validity() {
     let wrapped = UOp::try_where(valid, idx.clone(), invalid).unwrap();
 
     let extracted_idx = wrapped.get_idx();
-    assert!(Rc::ptr_eq(&extracted_idx, &idx));
+    assert!(Arc::ptr_eq(&extracted_idx, &idx));
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn test_get_valid_with_validity() {
     let wrapped = UOp::try_where(valid.clone(), idx.clone(), invalid).unwrap();
 
     let extracted_valid = wrapped.get_valid();
-    assert!(Rc::ptr_eq(&extracted_valid, &valid));
+    assert!(Arc::ptr_eq(&extracted_valid, &valid));
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::{AddrSpace, DType, ScalarDType};
 use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
@@ -32,7 +32,7 @@ fn test_unbind_kernel() {
     let mut ctx = KernelContext::new();
 
     // Create a BIND operation
-    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
+    let var = UOp::new(Op::DefineVar { name: "x".to_string(), max_val: 10 }, DType::Index);
     let value = UOp::index_const(5);
     let bind = UOp::bind(var.clone(), value);
 
@@ -125,8 +125,8 @@ fn test_handle_after() {
     assert!(matches!(op.op(), Op::Unique(_)));
     // Check that the buffer was mapped to the after operation
     assert!(ctx.has_buffer(&buffer));
-    // Use Rc::ptr_eq for comparison
-    assert!(Rc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
+    // Use Arc::ptr_eq for comparison
+    assert!(Arc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
 }
 
 #[test]
@@ -168,12 +168,17 @@ fn test_debuf_buffer_mapping() {
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
 
-    debuf(&buffer, &mut ctx);
+    let result = debuf(&buffer, &mut ctx);
 
-    // Buffer should be mapped to itself
+    // debuf returns DEFINE_GLOBAL and maps BUFFER → DEFINE_GLOBAL
+    assert!(result.is_some());
+    let define_global = result.unwrap();
+    assert!(matches!(define_global.op(), Op::DefineGlobal(0)));
+
+    // Buffer should be tracked, mapping to DEFINE_GLOBAL (not itself)
     assert!(ctx.has_buffer(&buffer));
     let mapped = ctx.get_buffer(&buffer).unwrap();
-    assert!(Rc::ptr_eq(mapped, &buffer));
+    assert!(Arc::ptr_eq(mapped, &define_global));
 }
 
 #[test]
@@ -194,9 +199,9 @@ fn test_handle_after_mstack_unwrap() {
     // Should unwrap to first buffer of MSTACK
     let op = result.expect("Expected Some result");
     assert!(matches!(op.op(), Op::Unique(_)));
-    assert!(Rc::ptr_eq(&op, &buf1));
+    assert!(Arc::ptr_eq(&op, &buf1));
     // buf1 should be mapped to after
-    assert!(Rc::ptr_eq(ctx.get_buffer(&buf1).unwrap(), &after));
+    assert!(Arc::ptr_eq(ctx.get_buffer(&buf1).unwrap(), &after));
 }
 
 #[test]
@@ -215,9 +220,9 @@ fn test_handle_after_mselect_unwrap() {
 
     // Should unwrap to buffer
     let op = result.expect("Expected Some result");
-    assert!(Rc::ptr_eq(&op, &buffer));
+    assert!(Arc::ptr_eq(&op, &buffer));
     // buffer should be mapped to after
-    assert!(Rc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
+    assert!(Arc::ptr_eq(ctx.get_buffer(&buffer).unwrap(), &after));
 }
 
 #[test]
@@ -267,7 +272,7 @@ fn test_cleanup_const_define_var() {
     let mut ctx = KernelContext::new();
 
     // Create a DEFINE_VAR
-    let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
+    let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), max_val: 10 }, DType::Index);
 
     // Without sources, should not match
     let result = cleanup_const(&define_var, &mut ctx);
@@ -325,7 +330,7 @@ fn test_handle_after_mstack_advanced() {
     match result {
         Some(buf) => {
             // Should return buf1 (first in MSTACK)
-            assert!(std::rc::Rc::ptr_eq(&buf, &buf1));
+            assert!(std::sync::Arc::ptr_eq(&buf, &buf1));
 
             // MSTACK should be tracked in context
             assert!(ctx.buffer_map.contains_key(&morok_ir::UOpKey(mstack)));
@@ -422,7 +427,7 @@ fn test_remove_zero_range_verification() {
                 assert_eq!(val.0, ConstValue::Int(0));
 
                 // Should NOT be the same as the original range
-                assert!(!std::rc::Rc::ptr_eq(&const_op, &range));
+                assert!(!std::sync::Arc::ptr_eq(&const_op, &range));
 
                 // Should have Index dtype (same as range)
                 assert_eq!(const_op.dtype(), DType::Index);
@@ -457,7 +462,7 @@ fn test_pattern_composition_sequence() {
 
                 // End should be preserved
                 if let Op::Range { end: original_end, .. } = range_unnum.op() {
-                    assert!(std::rc::Rc::ptr_eq(end, original_end));
+                    assert!(std::sync::Arc::ptr_eq(end, original_end));
                 }
 
                 // Now apply another pattern to the result
@@ -537,7 +542,7 @@ fn test_handle_after_global_buffer_tracked() {
             assert!(matches!(op.op(), Op::DefineGlobal(_)));
             // Global buffer SHOULD be in buffer map
             assert!(ctx.has_buffer(&global_buf));
-            assert!(Rc::ptr_eq(ctx.get_buffer(&global_buf).unwrap(), &after));
+            assert!(Arc::ptr_eq(ctx.get_buffer(&global_buf).unwrap(), &after));
         }
         _ => panic!("Expected Rewritten result"),
     }
@@ -571,7 +576,7 @@ fn test_handle_after_mstack_with_local_buffer() {
     match result {
         Some(op) => {
             // Verify MSTACK was actually unwrapped to local_buf1 (not just any DEFINE_LOCAL)
-            assert!(Rc::ptr_eq(&op, &local_buf1), "Should unwrap to first buffer in MSTACK");
+            assert!(Arc::ptr_eq(&op, &local_buf1), "Should unwrap to first buffer in MSTACK");
             assert!(matches!(op.op(), Op::DefineLocal(1)));
             // Local buffer should NOT be tracked
             assert!(!ctx.has_buffer(&local_buf1));
@@ -604,7 +609,7 @@ fn test_handle_after_mselect_with_local_buffer() {
     match result {
         Some(op) => {
             // Verify MSELECT was actually unwrapped to local_buf (not just any DEFINE_LOCAL)
-            assert!(Rc::ptr_eq(&op, &local_buf), "Should unwrap to buffer from MSELECT");
+            assert!(Arc::ptr_eq(&op, &local_buf), "Should unwrap to buffer from MSELECT");
             assert!(matches!(op.op(), Op::DefineLocal(3)));
             // Local buffer should NOT be tracked
             assert!(!ctx.has_buffer(&local_buf));
@@ -646,13 +651,13 @@ fn test_handle_after_mixed_address_spaces() {
     // Verify both returned Rewritten with correct buffers
     match result_local {
         Some(op) => {
-            assert!(Rc::ptr_eq(&op, &local_buf), "Local AFTER should return local buffer");
+            assert!(Arc::ptr_eq(&op, &local_buf), "Local AFTER should return local buffer");
         }
         _ => panic!("Expected Rewritten for local"),
     }
     match result_global {
         Some(op) => {
-            assert!(Rc::ptr_eq(&op, &global_buf), "Global AFTER should return global buffer");
+            assert!(Arc::ptr_eq(&op, &global_buf), "Global AFTER should return global buffer");
         }
         _ => panic!("Expected Rewritten for global"),
     }

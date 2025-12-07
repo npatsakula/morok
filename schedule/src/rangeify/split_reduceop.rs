@@ -7,7 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    rc::Rc,
+    sync::Arc,
 };
 
 use morok_ir::{Op, SInt, UOp, UOpKey};
@@ -50,7 +50,7 @@ impl SplitReduceOpConfig {
 // ============================================================================
 
 /// Extract all RANGE axis IDs from a UOp tree (sorted, deduplicated).
-pub fn collect_range_ids(indexed: &Rc<UOp>) -> Vec<usize> {
+pub fn collect_range_ids(indexed: &Arc<UOp>) -> Vec<usize> {
     let mut range_ids: Vec<usize> = indexed
         .toposort()
         .into_iter()
@@ -86,9 +86,9 @@ struct SplitCandidate {
 // ============================================================================
 
 /// Detect expanded (broadcast) dimensions. Returns Vec<bool> where true = expanded.
-fn detect_expanded_dimensions(source: &Rc<UOp>, input_shape: &[SInt]) -> Vec<bool> {
+fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bool> {
     // Step 1: Create fresh RANGEs for each dimension
-    let ranges: Vec<Rc<UOp>> = input_shape
+    let ranges: Vec<Arc<UOp>> = input_shape
         .iter()
         .enumerate()
         .map(|(axis_id, dim)| {
@@ -107,7 +107,7 @@ fn detect_expanded_dimensions(source: &Rc<UOp>, input_shape: &[SInt]) -> Vec<boo
         .collect();
 
     // Step 2: Create INDEX operation
-    let indexed = match UOp::index(Rc::clone(source), ranges) {
+    let indexed = match UOp::index(Arc::clone(source), ranges) {
         Ok(idx) => idx,
         Err(_) => {
             // If indexing fails, assume all dimensions are not expanded
@@ -144,7 +144,7 @@ fn detect_expanded_dimensions(source: &Rc<UOp>, input_shape: &[SInt]) -> Vec<boo
 
 /// Find valid split candidates (larger divisor = better parallelism).
 fn find_split_candidates(
-    reduce: &Rc<UOp>,
+    reduce: &Arc<UOp>,
     input_shape: &[SInt],
     is_expanded: &[bool],
     config: &SplitReduceOpConfig,
@@ -202,11 +202,11 @@ fn find_split_candidates(
 
 /// Apply two-stage transformation: reshape → permute → reduce1 → contiguous → reduce2 → reshape.
 fn apply_split_transformation(
-    source: &Rc<UOp>,
-    reduce: &Rc<UOp>,
+    source: &Arc<UOp>,
+    reduce: &Arc<UOp>,
     candidate: &SplitCandidate,
     input_shape: &[SInt],
-) -> Option<Rc<UOp>> {
+) -> Option<Arc<UOp>> {
     let Op::ReduceAxis { reduce_op, axes: reduce_axes, .. } = reduce.op() else {
         return None;
     };
@@ -295,7 +295,7 @@ fn apply_split_transformation(
 // ============================================================================
 
 /// Split large REDUCE_AXIS into two stages when input/output ratio >= threshold.
-pub fn split_reduceop(reduce: &Rc<UOp>, config: &SplitReduceOpConfig) -> Option<Rc<UOp>> {
+pub fn split_reduceop(reduce: &Arc<UOp>, config: &SplitReduceOpConfig) -> Option<Arc<UOp>> {
     // Check if enabled
     if !config.enabled {
         return None;

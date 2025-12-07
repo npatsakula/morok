@@ -3,7 +3,7 @@
 //! Provides custom shrinking to help proptest find minimal counterexamples
 //! when property tests fail.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::types::ConstValue;
 use crate::{Op, UOp};
@@ -17,16 +17,16 @@ use crate::{Op, UOp};
 /// 4. Simplify constants
 ///
 /// Returns an iterator of progressively simpler UOps.
-pub fn shrink_uop(uop: &Rc<UOp>) -> Vec<Rc<UOp>> {
+pub fn shrink_uop(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     let mut shrunk = Vec::new();
 
     match uop.op() {
         Op::Binary(_, lhs, rhs) => {
             // Strategy 1: Replace with left operand
-            shrunk.push(Rc::clone(lhs));
+            shrunk.push(Arc::clone(lhs));
 
             // Strategy 2: Replace with right operand
-            shrunk.push(Rc::clone(rhs));
+            shrunk.push(Arc::clone(rhs));
 
             // Strategy 3: Replace with constant 0
             shrunk.push(UOp::const_(uop.dtype().clone(), ConstValue::Int(0)));
@@ -41,7 +41,7 @@ pub fn shrink_uop(uop: &Rc<UOp>) -> Vec<Rc<UOp>> {
 
         Op::Unary(_, src) => {
             // Strategy 1: Replace with source operand
-            shrunk.push(Rc::clone(src));
+            shrunk.push(Arc::clone(src));
 
             // Strategy 2: Replace with constant 0
             shrunk.push(UOp::const_(uop.dtype().clone(), ConstValue::Int(0)));
@@ -57,9 +57,9 @@ pub fn shrink_uop(uop: &Rc<UOp>) -> Vec<Rc<UOp>> {
 
         Op::Ternary(_, a, b, c) => {
             // Replace with one of the branches
-            shrunk.push(Rc::clone(b)); // true branch
-            shrunk.push(Rc::clone(c)); // false branch
-            shrunk.push(Rc::clone(a)); // condition (least likely to help)
+            shrunk.push(Arc::clone(b)); // true branch
+            shrunk.push(Arc::clone(c)); // false branch
+            shrunk.push(Arc::clone(a)); // condition (least likely to help)
         }
 
         _ => {
@@ -71,7 +71,7 @@ pub fn shrink_uop(uop: &Rc<UOp>) -> Vec<Rc<UOp>> {
 }
 
 /// Shrink a constant value towards zero.
-fn shrink_const_value(cv: &ConstValue, dtype: &morok_dtype::DType) -> Vec<Rc<UOp>> {
+fn shrink_const_value(cv: &ConstValue, dtype: &morok_dtype::DType) -> Vec<Arc<UOp>> {
     let mut shrunk = Vec::new();
 
     match cv {
@@ -135,7 +135,7 @@ fn shrink_const_value(cv: &ConstValue, dtype: &morok_dtype::DType) -> Vec<Rc<UOp
 }
 
 /// Get the depth of a UOp graph (maximum path length from root to leaf).
-pub fn uop_depth(uop: &Rc<UOp>) -> usize {
+pub fn uop_depth(uop: &Arc<UOp>) -> usize {
     match uop.op() {
         Op::Binary(_, lhs, rhs) => 1 + uop_depth(lhs).max(uop_depth(rhs)),
         Op::Unary(_, src) => 1 + uop_depth(src),
@@ -145,7 +145,7 @@ pub fn uop_depth(uop: &Rc<UOp>) -> usize {
 }
 
 /// Count the number of operations in a UOp graph.
-pub fn uop_op_count(uop: &Rc<UOp>) -> usize {
+pub fn uop_op_count(uop: &Arc<UOp>) -> usize {
     match uop.op() {
         Op::Binary(_, lhs, rhs) => 1 + uop_op_count(lhs) + uop_op_count(rhs),
         Op::Unary(_, src) => 1 + uop_op_count(src),
@@ -171,11 +171,11 @@ mod tests {
 
     #[test]
     fn test_uop_depth() {
-        let x = UOp::var("x", DType::Int32, 0, 100);
+        let x = UOp::var("x", DType::Int32, 100);
         assert_eq!(uop_depth(&x), 0);
 
         let x_plus_1 = UOp::new(
-            Op::Binary(crate::types::BinaryOp::Add, Rc::clone(&x), UOp::const_(DType::Int32, ConstValue::Int(1))),
+            Op::Binary(crate::types::BinaryOp::Add, Arc::clone(&x), UOp::const_(DType::Int32, ConstValue::Int(1))),
             DType::Int32,
         );
         assert_eq!(uop_depth(&x_plus_1), 1);
@@ -183,11 +183,11 @@ mod tests {
 
     #[test]
     fn test_uop_op_count() {
-        let x = UOp::var("x", DType::Int32, 0, 100);
+        let x = UOp::var("x", DType::Int32, 100);
         assert_eq!(uop_op_count(&x), 0);
 
         let x_plus_1 = UOp::new(
-            Op::Binary(crate::types::BinaryOp::Add, Rc::clone(&x), UOp::const_(DType::Int32, ConstValue::Int(1))),
+            Op::Binary(crate::types::BinaryOp::Add, Arc::clone(&x), UOp::const_(DType::Int32, ConstValue::Int(1))),
             DType::Int32,
         );
         assert_eq!(uop_op_count(&x_plus_1), 1);

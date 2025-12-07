@@ -5,7 +5,7 @@
 //! - reduce: Reduce across loop ranges
 //! - allreduce: All-reduce across multiple devices
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
@@ -23,7 +23,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns error if any axis is >= number of dimensions.
-    pub fn try_reduce_axis(self: &Rc<Self>, reduce_op: ReduceOp, axes: Vec<usize>) -> Result<Rc<Self>> {
+    pub fn try_reduce_axis(self: &Arc<Self>, reduce_op: ReduceOp, axes: Vec<usize>) -> Result<Arc<Self>> {
         use crate::SInt;
 
         // Validate axes if source shape is known
@@ -33,12 +33,7 @@ impl UOp {
             // Filter out axes where dimension is 1 (no-op reductions)
             let active_axes: Vec<usize> = axes
                 .iter()
-                .filter(|&&axis| {
-                    src_shape
-                        .get(axis)
-                        .map(|dim| !matches!(dim, SInt::Const(1)))
-                        .unwrap_or(false)
-                })
+                .filter(|&&axis| src_shape.get(axis).map(|dim| !matches!(dim, SInt::Const(1))).unwrap_or(false))
                 .copied()
                 .collect();
 
@@ -63,13 +58,13 @@ impl UOp {
     ///
     /// Unlike `try_reduce_axis` (operates on tensor axes), this reduces
     /// values accumulated across RANGE loop iterations.
-    pub fn reduce(src: Rc<Self>, ranges: SmallVec<[Rc<Self>; 4]>, reduce_op: ReduceOp) -> Rc<Self> {
+    pub fn reduce(src: Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>, reduce_op: ReduceOp) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Reduce { src, ranges, reduce_op }, dtype)
     }
 
     /// All-reduce across multiple devices.
-    pub fn allreduce(src: Rc<Self>, device: Rc<Self>, reduce_op: ReduceOp) -> Rc<Self> {
+    pub fn allreduce(src: Arc<Self>, device: Arc<Self>, reduce_op: ReduceOp) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::AllReduce { src, device, reduce_op }, dtype)
     }

@@ -10,7 +10,7 @@
 //! - Explicit Result types instead of exceptions
 //! - Non-automatic broadcasting (must be explicit)
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 use snafu::ensure;
@@ -277,7 +277,7 @@ pub fn to_vec_usize(shape: &Shape) -> Result<Vec<usize>> {
 /// dimensions from the UOp used to store shape information.
 ///
 /// Returns None if the UOp is not in the expected format.
-fn extract_shape_from_uop(shape_uop: &Rc<UOp>) -> Option<Shape> {
+fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
     match shape_uop.op() {
         // VECTORIZE with Index-typed elements
         Op::Vectorize { elements } => Some(elements.into_iter().cloned().map(SInt::from).collect()),
@@ -309,7 +309,7 @@ fn extract_shape_from_uop(shape_uop: &Rc<UOp>) -> Option<Shape> {
 /// Extract padding/shrink ranges from UOps.
 ///
 /// Returns pairs of (begin, end) for each dimension.
-fn extract_ranges_from_uops(begins_uop: &Rc<UOp>, ends_uop: &Rc<UOp>) -> Option<Vec<(SInt, SInt)>> {
+fn extract_ranges_from_uops(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Option<Vec<(SInt, SInt)>> {
     let begins = extract_shape_from_uop(begins_uop)?;
     let ends = extract_shape_from_uop(ends_uop)?;
 
@@ -335,14 +335,14 @@ fn extract_ranges_from_uops(begins_uop: &Rc<UOp>, ends_uop: &Rc<UOp>) -> Option<
 /// let shape_uop = shape_to_uop(&shape);
 /// assert_eq!(shape_uop.dtype(), DType::Index.vec(3));
 /// ```
-pub fn shape_to_uop(shape: &Shape) -> Rc<UOp> {
+pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
     use morok_dtype::DType;
     use smallvec::SmallVec;
 
     // Use Vectorize for all shapes (including empty)
     // Empty shape → Vectorize { elements: [] }
     // This is consistent with non-empty path and compatible with extract_shape_from_uop
-    let elements: SmallVec<[Rc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
+    let elements: SmallVec<[Arc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
 
     UOp::vectorize(elements)
 }
@@ -350,13 +350,13 @@ pub fn shape_to_uop(shape: &Shape) -> Rc<UOp> {
 /// Convert a vector of (begin, end) ranges to two UOps for Pad/Shrink operations.
 ///
 /// Returns (begins_uop, ends_uop) as VECTORIZE UOps.
-pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Rc<UOp>, Rc<UOp>) {
+pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Arc<UOp>, Arc<UOp>) {
     use morok_dtype::DType;
     use smallvec::SmallVec;
 
-    let begins: SmallVec<[Rc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::Index)).collect();
+    let begins: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::Index)).collect();
 
-    let ends: SmallVec<[Rc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::Index)).collect();
+    let ends: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::Index)).collect();
 
     (UOp::vectorize(begins), UOp::vectorize(ends))
 }

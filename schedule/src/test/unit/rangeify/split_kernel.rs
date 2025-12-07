@@ -62,13 +62,13 @@ fn test_split_store_end_operation() {
         if let Op::Sink { sources } = ast.op() {
             // SINK should wrap the END (not extract STORE)
             assert_eq!(sources.len(), 1);
-            assert!(std::rc::Rc::ptr_eq(&sources[0], &end));
+            assert!(std::sync::Arc::ptr_eq(&sources[0], &end));
 
             // Verify END structure is preserved
             if let Op::End { computation, ranges } = sources[0].op() {
-                assert!(std::rc::Rc::ptr_eq(computation, &store));
+                assert!(std::sync::Arc::ptr_eq(computation, &store));
                 assert_eq!(ranges.len(), 1);
-                assert!(std::rc::Rc::ptr_eq(&ranges[0], &range));
+                assert!(std::sync::Arc::ptr_eq(&ranges[0], &range));
             } else {
                 panic!("Expected END operation in SINK");
             }
@@ -134,12 +134,12 @@ fn test_split_store_creates_sink() {
         if let Op::Sink { sources: sink_sources } = ast.op() {
             // SINK should wrap the original STORE
             assert_eq!(sink_sources.len(), 1);
-            assert!(std::rc::Rc::ptr_eq(&sink_sources[0], &store));
+            assert!(std::sync::Arc::ptr_eq(&sink_sources[0], &store));
 
             // Verify the STORE structure is preserved
             if let Op::Store { buffer: store_buf, value: store_val, .. } = sink_sources[0].op() {
-                assert!(std::rc::Rc::ptr_eq(store_buf, &buffer));
-                assert!(std::rc::Rc::ptr_eq(store_val, &value));
+                assert!(std::sync::Arc::ptr_eq(store_buf, &buffer));
+                assert!(std::sync::Arc::ptr_eq(store_val, &value));
             } else {
                 panic!("Expected STORE in SINK sources");
             }
@@ -186,12 +186,12 @@ fn test_split_store_preserves_computation() {
             && let Op::Sink { sources } = ast.op()
         {
             // SINK should wrap the STORE
-            assert!(std::rc::Rc::ptr_eq(&sources[0], &store));
+            assert!(std::sync::Arc::ptr_eq(&sources[0], &store));
 
             // Verify the stored value dtype is preserved
             if let Op::Store { value: stored_val, .. } = sources[0].op() {
                 assert_eq!(stored_val.dtype(), *dtype);
-                assert!(std::rc::Rc::ptr_eq(stored_val, &value));
+                assert!(std::sync::Arc::ptr_eq(stored_val, &value));
             }
         }
     }
@@ -221,7 +221,7 @@ fn test_split_store_multiple_calls_independent() {
     assert!(matches!(kernel2.op(), Op::Kernel { .. }));
 
     // They should be different kernels (different UOps)
-    assert!(!std::rc::Rc::ptr_eq(&kernel1, &kernel2));
+    assert!(!std::sync::Arc::ptr_eq(&kernel1, &kernel2));
 }
 
 #[test]
@@ -247,14 +247,14 @@ fn test_split_store_end_with_multiple_ranges() {
         if let Op::Sink { sources } = ast.op() {
             // SINK should wrap the END (preserving full structure)
             assert_eq!(sources.len(), 1);
-            assert!(std::rc::Rc::ptr_eq(&sources[0], &end));
+            assert!(std::sync::Arc::ptr_eq(&sources[0], &end));
 
             // Verify END structure with multiple ranges is preserved
             if let Op::End { computation, ranges } = sources[0].op() {
-                assert!(std::rc::Rc::ptr_eq(computation, &store));
+                assert!(std::sync::Arc::ptr_eq(computation, &store));
                 assert_eq!(ranges.len(), 2);
-                assert!(std::rc::Rc::ptr_eq(&ranges[0], &range1));
-                assert!(std::rc::Rc::ptr_eq(&ranges[1], &range2));
+                assert!(std::sync::Arc::ptr_eq(&ranges[0], &range1));
+                assert!(std::sync::Arc::ptr_eq(&ranges[1], &range2));
             } else {
                 panic!("Expected END operation in SINK");
             }
@@ -333,7 +333,7 @@ fn test_split_store_with_copy() {
         assert!(matches!(ast.op(), Op::Copy { .. }), "Expected COPY operation as kernel AST, got: {:?}", ast.op());
 
         // Verify it's the same COPY we created
-        assert!(std::rc::Rc::ptr_eq(ast, &copy));
+        assert!(std::sync::Arc::ptr_eq(ast, &copy));
     } else {
         panic!("Expected KERNEL operation");
     }
@@ -363,7 +363,7 @@ fn test_split_store_with_buffer_view() {
             assert_eq!(*size, 256);
             assert_eq!(*offset, 128);
             // Verify it's the same BUFFER_VIEW we created
-            assert!(std::rc::Rc::ptr_eq(ast, &buffer_view));
+            assert!(std::sync::Arc::ptr_eq(ast, &buffer_view));
         } else {
             panic!("Expected BUFFER_VIEW operation as kernel AST, got: {:?}", ast.op());
         }
@@ -396,7 +396,7 @@ fn test_split_store_normal_computation_uses_sink() {
         if let Op::Sink { sources } = ast.op() {
             // SINK should wrap the STORE
             assert_eq!(sources.len(), 1);
-            assert!(std::rc::Rc::ptr_eq(&sources[0], &store));
+            assert!(std::sync::Arc::ptr_eq(&sources[0], &store));
         } else {
             panic!("Expected SINK operation for normal computation, got: {:?}", ast.op());
         }
@@ -436,7 +436,7 @@ fn test_split_store_nested_copy_in_store() {
         );
 
         // Verify it's the same COPY we created
-        assert!(std::rc::Rc::ptr_eq(ast, &copy));
+        assert!(std::sync::Arc::ptr_eq(ast, &copy));
     } else {
         panic!("Expected KERNEL operation");
     }
@@ -480,8 +480,8 @@ fn test_split_store_copy_precedence_documented() {
         assert!(matches!(ast.op(), Op::Copy { .. }), "Expected COPY operation as kernel AST, got: {:?}", ast.op());
 
         // Should be either copy1 or copy2 (both are valid COPY operations)
-        let is_copy1 = std::rc::Rc::ptr_eq(ast, &copy1);
-        let is_copy2 = std::rc::Rc::ptr_eq(ast, &copy2);
+        let is_copy1 = std::sync::Arc::ptr_eq(ast, &copy1);
+        let is_copy2 = std::sync::Arc::ptr_eq(ast, &copy2);
 
         assert!(is_copy1 || is_copy2, "Kernel AST should be one of the COPY operations in the graph");
     } else {

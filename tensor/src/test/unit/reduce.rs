@@ -1,4 +1,5 @@
 use crate::reduce::AxisSpec;
+use crate::test::helpers::*;
 use crate::*;
 use morok_dtype::DType;
 
@@ -284,4 +285,384 @@ fn test_argmax_all_equal() {
     let result = t.argmax(Some(0)).unwrap();
     // All equal, should return first index (0)
     assert_eq!(result.uop.dtype(), DType::Int32);
+}
+
+// ============================================================================
+// VALUE-VERIFYING TESTS (ported from Tinygrad test_ops.py)
+// ============================================================================
+
+// ========== Sum Tests (from Tinygrad test_ops.py:1344-1380) ==========
+
+#[test]
+fn test_sum_1d_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let result = realize_f32(t.sum(()).unwrap());
+    assert_close_f32(&result, &[10.0], 1e-6);
+}
+
+#[test]
+fn test_sum_2d_full_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_f32(t.sum(()).unwrap());
+    assert_close_f32(&result, &[21.0], 1e-6);
+}
+
+#[test]
+fn test_sum_axis0_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_f32(t.sum(0).unwrap());
+    // [[1, 2, 3], [4, 5, 6]] -> [1+4, 2+5, 3+6] = [5, 7, 9]
+    assert_close_f32(&result, &[5.0, 7.0, 9.0], 1e-6);
+}
+
+#[test]
+fn test_sum_axis1_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_f32(t.sum(1).unwrap());
+    // [[1, 2, 3], [4, 5, 6]] -> [1+2+3, 4+5+6] = [6, 15]
+    assert_close_f32(&result, &[6.0, 15.0], 1e-6);
+}
+
+#[test]
+fn test_sum_keepdim_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+    let result = t.sum_with().axes(1).keepdim(true).call().unwrap();
+    let arr = realize_f32(result);
+    assert_eq!(arr.shape(), &[2, 1]);
+    // [[1, 2], [3, 4]] -> [[3], [7]]
+    assert_close_f32(&arr, &[3.0, 7.0], 1e-6);
+}
+
+#[test]
+fn test_sum_single_element_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([42.0f32]);
+    let result = realize_f32(t.sum(()).unwrap());
+    assert_close_f32(&result, &[42.0], 1e-6);
+}
+
+#[test]
+fn test_sum_negative_values() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([-1.0f32, -2.0, 3.0, 4.0]);
+    let result = realize_f32(t.sum(()).unwrap());
+    assert_close_f32(&result, &[4.0], 1e-6);
+}
+
+// ========== Max Tests (from Tinygrad test_ops.py:1405-1416) ==========
+
+#[test]
+fn test_max_1d_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0]);
+    let result = realize_f32(t.max(()).unwrap());
+    assert_close_f32(&result, &[5.0], 1e-6);
+}
+
+#[test]
+fn test_max_2d_axis1_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0, 8.0, 4.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_f32(t.max(1).unwrap());
+    // [[1, 5, 3], [2, 8, 4]] -> [5, 8]
+    assert_close_f32(&result, &[5.0, 8.0], 1e-6);
+}
+
+#[test]
+fn test_max_2d_axis0_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0, 8.0, 4.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_f32(t.max(0).unwrap());
+    // [[1, 5, 3], [2, 8, 4]] -> [2, 8, 4]
+    assert_close_f32(&result, &[2.0, 8.0, 4.0], 1e-6);
+}
+
+#[test]
+fn test_max_negative_values() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([-5.0f32, -1.0, -3.0, -2.0]);
+    let result = realize_f32(t.max(()).unwrap());
+    assert_close_f32(&result, &[-1.0], 1e-6);
+}
+
+// ========== Min Tests (from Tinygrad test_ops.py:1394-1403) ==========
+
+#[test]
+fn test_min_1d_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([5.0f32, 1.0, 3.0, 2.0]);
+    let result = realize_f32(t.min(()).unwrap());
+    assert_close_f32(&result, &[1.0], 1e-6);
+}
+
+#[test]
+fn test_min_2d_axis1_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0, 8.0, 4.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_f32(t.min(1).unwrap());
+    // [[1, 5, 3], [2, 8, 4]] -> [1, 2]
+    assert_close_f32(&result, &[1.0, 2.0], 1e-6);
+}
+
+#[test]
+fn test_min_negative_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([-1.0f32, -5.0, -3.0]);
+    let result = realize_f32(t.min(()).unwrap());
+    assert_close_f32(&result, &[-5.0], 1e-6);
+}
+
+// ========== Argmax Tests (from Tinygrad test_ops.py:1087-1105) ==========
+
+#[test]
+fn test_argmax_value_1d() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0]);
+    let result = realize_i32(t.argmax(Some(0)).unwrap());
+    // Max 5.0 at index 3
+    assert_eq_i32(&result, &[3]);
+}
+
+#[test]
+fn test_argmax_ties_first_value() {
+    let _guard = test_setup();
+    // Tinygrad test: [2, 2] -> should return 0 (first occurrence)
+    let t = Tensor::from_slice([2.0f32, 2.0]);
+    let result = realize_i32(t.argmax(Some(0)).unwrap());
+    assert_eq_i32(&result, &[0]);
+}
+
+#[test]
+fn test_argmax_2d_axis0_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_i32(t.argmax(Some(0)).unwrap());
+    // [[1, 3, 2], [4, 2, 5]]
+    // Max per column: [4>1, 3>2, 5>2] -> indices [1, 0, 1]
+    assert_eq_i32(&result, &[1, 0, 1]);
+}
+
+#[test]
+fn test_argmax_2d_axis1_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_i32(t.argmax(Some(1)).unwrap());
+    // [[1, 3, 2], [4, 2, 5]]
+    // Max per row: [3 at idx 1, 5 at idx 2] -> [1, 2]
+    assert_eq_i32(&result, &[1, 2]);
+}
+
+#[test]
+fn test_argmax_flatten_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_i32(t.argmax(None).unwrap());
+    // Flattened: [1, 3, 2, 4, 2, 5], max 5.0 at index 5
+    assert_eq_i32(&result, &[5]);
+}
+
+// ========== Argmin Tests (from Tinygrad test_ops.py:1106-1122) ==========
+
+#[test]
+fn test_argmin_value_1d() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
+    let result = realize_i32(t.argmin(Some(0)).unwrap());
+    // Min 1.0 at index 2
+    assert_eq_i32(&result, &[2]);
+}
+
+#[test]
+fn test_argmin_negative_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.5f32, -2.3, 0.5, 1.0]);
+    let result = realize_i32(t.argmin(Some(0)).unwrap());
+    // Min -2.3 at index 1
+    assert_eq_i32(&result, &[1]);
+}
+
+#[test]
+fn test_argmin_2d_axis0_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_i32(t.argmin(Some(0)).unwrap());
+    // [[1, 3, 2], [4, 2, 5]]
+    // Min per column: [1<4, 2<3, 2<5] -> indices [0, 1, 0]
+    assert_eq_i32(&result, &[0, 1, 0]);
+}
+
+#[test]
+fn test_argmin_2d_axis1_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_i32(t.argmin(Some(1)).unwrap());
+    // [[1, 3, 2], [4, 2, 5]]
+    // Min per row: [1 at idx 0, 2 at idx 1] -> [0, 1]
+    assert_eq_i32(&result, &[0, 1]);
+}
+
+// ========== Mean Tests (from Tinygrad test_ops.py:1465-1471) ==========
+
+#[test]
+fn test_mean_1d_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+    let result = realize_f32(t.mean(()).unwrap());
+    assert_close_f32(&result, &[2.5], 1e-6);
+}
+
+#[test]
+fn test_mean_2d_axis1_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_f32(t.mean(1).unwrap());
+    // [[1, 2, 3], [4, 5, 6]] -> [mean(1,2,3), mean(4,5,6)] = [2, 5]
+    assert_close_f32(&result, &[2.0, 5.0], 1e-6);
+}
+
+#[test]
+fn test_mean_2d_axis0_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let result = realize_f32(t.mean(0).unwrap());
+    // [[1, 2, 3], [4, 5, 6]] -> [mean(1,4), mean(2,5), mean(3,6)] = [2.5, 3.5, 4.5]
+    assert_close_f32(&result, &[2.5, 3.5, 4.5], 1e-6);
+}
+
+// ========== Any Tests (from Tinygrad test_ops.py:1423-1432) ==========
+
+#[test]
+fn test_any_value_all_true() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([true, true, true]);
+    let result = t.any(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    assert!(result[[]]);
+}
+
+#[test]
+fn test_any_value_one_true() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([false, true, false]);
+    let result = t.any(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    assert!(result[[]]);
+}
+
+#[test]
+fn test_any_value_all_false() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([false, false, false]);
+    let result = t.any(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    assert!(!result[[]]);
+}
+
+#[test]
+fn test_any_2d_axis0_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([true, false, false, true]).try_reshape(&[2, 2]).unwrap();
+    let result = t.any(0).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    // [[true, false], [false, true]] -> any along axis 0 -> [true, true]
+    assert_eq!(result.as_slice().unwrap(), &[true, true]);
+}
+
+#[test]
+fn test_any_2d_axis1_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([true, false, false, false]).try_reshape(&[2, 2]).unwrap();
+    let result = t.any(1).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    // [[true, false], [false, false]] -> any along axis 1 -> [true, false]
+    assert_eq!(result.as_slice().unwrap(), &[true, false]);
+}
+
+// ========== All Tests (from Tinygrad test_ops.py:1435-1444) ==========
+
+#[test]
+fn test_all_value_all_true() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([true, true, true]);
+    let result = t.all(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    assert!(result[[]]);
+}
+
+#[test]
+fn test_all_value_one_false() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([true, false, true]);
+    let result = t.all(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    assert!(!result[[]]);
+}
+
+#[test]
+fn test_all_value_all_false() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([false, false, false]);
+    let result = t.all(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    assert!(!result[[]]);
+}
+
+#[test]
+fn test_all_2d_axis0_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([true, true, false, true]).try_reshape(&[2, 2]).unwrap();
+    let result = t.all(0).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    // [[true, true], [false, true]] -> all along axis 0 -> [false, true]
+    assert_eq!(result.as_slice().unwrap(), &[false, true]);
+}
+
+#[test]
+fn test_all_2d_axis1_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([true, true, true, false]).try_reshape(&[2, 2]).unwrap();
+    let result = t.all(1).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
+    // [[true, true], [true, false]] -> all along axis 1 -> [true, false]
+    assert_eq!(result.as_slice().unwrap(), &[true, false]);
+}
+
+// ========== Edge Cases (from Tinygrad) ==========
+
+#[test]
+fn test_argmax_single_element_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([42.0f32]);
+    let result = realize_i32(t.argmax(Some(0)).unwrap());
+    // Only element, index should be 0
+    assert_eq_i32(&result, &[0]);
+}
+
+#[test]
+fn test_argmax_all_equal_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([5.0f32, 5.0, 5.0, 5.0]);
+    let result = realize_i32(t.argmax(Some(0)).unwrap());
+    // All equal, should return first index (0)
+    assert_eq_i32(&result, &[0]);
+}
+
+#[test]
+fn test_argmin_single_element_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([42.0f32]);
+    let result = realize_i32(t.argmin(Some(0)).unwrap());
+    // Only element, index should be 0
+    assert_eq_i32(&result, &[0]);
+}
+
+#[test]
+fn test_max_single_element_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([42.0f32]);
+    let result = realize_f32(t.max(()).unwrap());
+    assert_close_f32(&result, &[42.0], 1e-6);
+}
+
+#[test]
+fn test_min_single_element_value() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([42.0f32]);
+    let result = realize_f32(t.min(()).unwrap());
+    assert_close_f32(&result, &[42.0], 1e-6);
 }

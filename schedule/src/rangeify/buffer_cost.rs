@@ -5,7 +5,7 @@
 //! - Partial contiguous: selectively materialize dimensions
 
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{AddrSpace, Op, UOp, UOpKey};
 
@@ -29,23 +29,23 @@ impl Default for PcontigConfig {
 /// Collect BUFFER, BUFFERIZE(GLOBAL), MSTACK, and MSELECT operations in a tree.
 /// Stops traversal at GLOBAL bufferize boundaries.
 #[allow(clippy::mutable_key_type)]
-pub fn collect_accessed_buffers(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
+pub fn collect_accessed_buffers(src: &Arc<UOp>) -> Vec<Arc<UOp>> {
     let mut buffers = Vec::new();
     let mut visited = HashSet::new();
 
-    fn visit(uop: &Rc<UOp>, buffers: &mut Vec<Rc<UOp>>, visited: &mut HashSet<UOpKey>) -> bool {
-        let key = UOpKey(Rc::clone(uop));
+    fn visit(uop: &Arc<UOp>, buffers: &mut Vec<Arc<UOp>>, visited: &mut HashSet<UOpKey>) -> bool {
+        let key = UOpKey(Arc::clone(uop));
         if !visited.insert(key) {
             return true; // Already visited
         }
 
         match uop.op() {
             Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
-                buffers.push(Rc::clone(uop));
+                buffers.push(Arc::clone(uop));
                 return false; // Stop traversal - treat as atomic
             }
             Op::Buffer { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
-                buffers.push(Rc::clone(uop));
+                buffers.push(Arc::clone(uop));
             }
             _ => {}
         }
@@ -62,25 +62,25 @@ pub fn collect_accessed_buffers(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
 
     // Deduplicate while preserving order
     let mut seen = HashSet::new();
-    buffers.retain(|b| seen.insert(UOpKey(Rc::clone(b))));
+    buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
 
     buffers
 }
 
 /// Collect all REDUCE operations in a computation tree.
 #[allow(clippy::mutable_key_type)]
-pub fn collect_reduces(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
+pub fn collect_reduces(src: &Arc<UOp>) -> Vec<Arc<UOp>> {
     let mut reduces = Vec::new();
     let mut visited = HashSet::new();
 
-    fn visit(uop: &Rc<UOp>, reduces: &mut Vec<Rc<UOp>>, visited: &mut HashSet<UOpKey>) {
-        let key = UOpKey(Rc::clone(uop));
+    fn visit(uop: &Arc<UOp>, reduces: &mut Vec<Arc<UOp>>, visited: &mut HashSet<UOpKey>) {
+        let key = UOpKey(Arc::clone(uop));
         if !visited.insert(key) {
             return;
         }
 
         if matches!(uop.op(), Op::Reduce { .. }) {
-            reduces.push(Rc::clone(uop));
+            reduces.push(Arc::clone(uop));
         }
 
         for child in uop.op().sources() {
@@ -94,18 +94,18 @@ pub fn collect_reduces(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
 
 /// Collect all INDEX operations in a computation tree.
 #[allow(clippy::mutable_key_type)]
-pub fn collect_indexes(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
+pub fn collect_indexes(src: &Arc<UOp>) -> Vec<Arc<UOp>> {
     let mut indexes = Vec::new();
     let mut visited = HashSet::new();
 
-    fn visit(uop: &Rc<UOp>, indexes: &mut Vec<Rc<UOp>>, visited: &mut HashSet<UOpKey>) {
-        let key = UOpKey(Rc::clone(uop));
+    fn visit(uop: &Arc<UOp>, indexes: &mut Vec<Arc<UOp>>, visited: &mut HashSet<UOpKey>) {
+        let key = UOpKey(Arc::clone(uop));
         if !visited.insert(key) {
             return;
         }
 
         if matches!(uop.op(), Op::Index { .. }) {
-            indexes.push(Rc::clone(uop));
+            indexes.push(Arc::clone(uop));
         }
 
         for child in uop.op().sources() {
@@ -118,7 +118,7 @@ pub fn collect_indexes(src: &Rc<UOp>) -> Vec<Rc<UOp>> {
 }
 
 /// Calculate buffer size in bytes. Returns `None` for symbolic shapes.
-pub fn calculate_buffer_size(buffer: &Rc<UOp>) -> Option<usize> {
+pub fn calculate_buffer_size(buffer: &Arc<UOp>) -> Option<usize> {
     use morok_ir::ConstValue;
 
     match buffer.op() {
@@ -160,7 +160,7 @@ pub fn calculate_buffer_size(buffer: &Rc<UOp>) -> Option<usize> {
 
 /// Calculate output/input size ratio. Returns `None` for symbolic sizes.
 /// Ratio < 10 suggests efficient buffer, >= 10 suggests wasteful.
-pub fn calculate_out_in_ratio(output_size: usize, input_buffers: &[Rc<UOp>]) -> Option<f64> {
+pub fn calculate_out_in_ratio(output_size: usize, input_buffers: &[Arc<UOp>]) -> Option<f64> {
     let mut input_sum = 0usize;
 
     for buf in input_buffers {
@@ -179,15 +179,15 @@ pub fn calculate_out_in_ratio(output_size: usize, input_buffers: &[Rc<UOp>]) -> 
 
 /// Check if any buffer is accessed within a reduce scope.
 #[allow(clippy::mutable_key_type)]
-pub fn has_buffer_in_reduce(reduces: &[Rc<UOp>]) -> bool {
+pub fn has_buffer_in_reduce(reduces: &[Arc<UOp>]) -> bool {
     if reduces.is_empty() {
         return false;
     }
 
     // Collect reduce sources
-    let reduce_sources: Vec<Rc<UOp>> = reduces
+    let reduce_sources: Vec<Arc<UOp>> = reduces
         .iter()
-        .filter_map(|r| if let Op::Reduce { src, .. } = r.op() { Some(Rc::clone(src)) } else { None })
+        .filter_map(|r| if let Op::Reduce { src, .. } = r.op() { Some(Arc::clone(src)) } else { None })
         .collect();
 
     if reduce_sources.is_empty() {
@@ -201,12 +201,12 @@ pub fn has_buffer_in_reduce(reduces: &[Rc<UOp>]) -> bool {
     let mut visited = HashSet::new();
     let mut found_buffer = false;
 
-    fn visit(uop: &Rc<UOp>, found: &mut bool, visited: &mut HashSet<UOpKey>) -> bool {
+    fn visit(uop: &Arc<UOp>, found: &mut bool, visited: &mut HashSet<UOpKey>) -> bool {
         if *found {
             return false; // Early termination
         }
 
-        let key = UOpKey(Rc::clone(uop));
+        let key = UOpKey(Arc::clone(uop));
         if !visited.insert(key) {
             return true;
         }
@@ -233,7 +233,7 @@ pub fn has_buffer_in_reduce(reduces: &[Rc<UOp>]) -> bool {
 }
 
 /// Filter indexes to only those accessing LOCAL bufferize operations.
-pub fn collect_local_indexes(indexes: &[Rc<UOp>]) -> Vec<Rc<UOp>> {
+pub fn collect_local_indexes(indexes: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     indexes
         .iter()
         .filter(|idx| {
@@ -241,13 +241,13 @@ pub fn collect_local_indexes(indexes: &[Rc<UOp>]) -> Vec<Rc<UOp>> {
                 if matches!(buffer.op(), Op::Bufferize { opts, .. }
                     if opts.addrspace == AddrSpace::Local))
         })
-        .map(Rc::clone)
+        .map(Arc::clone)
         .collect()
 }
 
 /// Extract ranges that must be materialized (from LOCAL INDEX operations).
 #[allow(clippy::mutable_key_type)]
-pub fn extract_exclude_ranges(local_indexes: &[Rc<UOp>]) -> HashSet<UOpKey> {
+pub fn extract_exclude_ranges(local_indexes: &[Arc<UOp>]) -> HashSet<UOpKey> {
     let mut exclude = HashSet::new();
 
     for idx in local_indexes {
@@ -268,10 +268,10 @@ pub fn extract_exclude_ranges(local_indexes: &[Rc<UOp>]) -> HashSet<UOpKey> {
 /// Partition ranges into materialize (LOCAL/REDUCE) vs substitute (inline).
 #[allow(clippy::type_complexity, clippy::mutable_key_type)]
 pub fn partition_ranges(
-    buf_ranges: &[Rc<UOp>],
-    idx_ranges: &[Rc<UOp>],
+    buf_ranges: &[Arc<UOp>],
+    idx_ranges: &[Arc<UOp>],
     exclude_ranges: &HashSet<UOpKey>,
-) -> (Vec<(Rc<UOp>, Rc<UOp>)>, Vec<(Rc<UOp>, Rc<UOp>)>) {
+) -> (Vec<(Arc<UOp>, Arc<UOp>)>, Vec<(Arc<UOp>, Arc<UOp>)>) {
     use morok_ir::AxisType;
 
     let mut materialize = Vec::new();
@@ -283,7 +283,7 @@ pub fn partition_ranges(
             continue;
         }
 
-        let buf_key = UOpKey(Rc::clone(buf_rng));
+        let buf_key = UOpKey(Arc::clone(buf_rng));
 
         // Check if this range should be materialized
         let should_materialize =
@@ -298,7 +298,7 @@ pub fn partition_ranges(
                 }
             });
 
-        let pair = (Rc::clone(buf_rng), Rc::clone(idx_rng));
+        let pair = (Arc::clone(buf_rng), Arc::clone(idx_rng));
 
         if should_materialize {
             materialize.push(pair);
@@ -313,10 +313,10 @@ pub fn partition_ranges(
 /// Apply partial contiguous: substitute inlined ranges, bufferize the rest.
 #[allow(clippy::mutable_key_type)]
 pub fn apply_partial_contiguous(
-    src: &Rc<UOp>,
-    materialize: Vec<(Rc<UOp>, Rc<UOp>)>,
-    substitute: Vec<(Rc<UOp>, Rc<UOp>)>,
-) -> Option<Rc<UOp>> {
+    src: &Arc<UOp>,
+    materialize: Vec<(Arc<UOp>, Arc<UOp>)>,
+    substitute: Vec<(Arc<UOp>, Arc<UOp>)>,
+) -> Option<Arc<UOp>> {
     use std::collections::HashMap;
 
     // Must have something to substitute
@@ -324,8 +324,8 @@ pub fn apply_partial_contiguous(
         return None;
     }
 
-    // Build substitution map (UOpKey -> Rc<UOp>)
-    let subs_map: HashMap<UOpKey, Rc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
+    // Build substitution map (UOpKey -> Arc<UOp>)
+    let subs_map: HashMap<UOpKey, Arc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
 
     // Substitute inlined ranges
     let substituted = src.substitute(&subs_map);

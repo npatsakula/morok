@@ -3,7 +3,7 @@
 //! Validates that remove_noop, get_contiguous, and fix_after_broadcast correctly
 //! transform UOps for code generation.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{Op, UOp};
 
@@ -70,7 +70,7 @@ fn test_get_contiguous_removes_marker() {
 
     let unwrapped = result.unwrap();
     // Should return the original tensor
-    assert!(Rc::ptr_eq(&unwrapped, &tensor));
+    assert!(Arc::ptr_eq(&unwrapped, &tensor));
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn test_fix_after_broadcast_unwraps_expand() {
     let fixed = result.unwrap();
     // Should have replaced passthrough with expand source
     if let Op::After { passthrough, .. } = fixed.op() {
-        assert!(Rc::ptr_eq(passthrough, &source));
+        assert!(Arc::ptr_eq(passthrough, &source));
     } else {
         panic!("Expected AFTER operation");
     }

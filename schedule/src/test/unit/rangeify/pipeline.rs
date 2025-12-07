@@ -8,7 +8,7 @@
 //!
 //! Based on Tinygrad's test_schedule.py integration tests.
 
-use std::{f32::consts::PI, rc::Rc};
+use std::{f32::consts::PI, sync::Arc};
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
@@ -19,7 +19,7 @@ use crate::rangeify::{rangeify, run_kernel_split_pipeline, run_rangeify};
 // ===== Helper Function =====
 
 /// Helper to unwrap full rangeify pipeline (includes all optimizations)
-fn rangeify_unwrap(uop: Rc<UOp>) -> Rc<UOp> {
+fn rangeify_unwrap(uop: Arc<UOp>) -> Arc<UOp> {
     match rangeify(uop, None) {
         Ok((rangeified, _ctx)) => rangeified,
         Err(_) => panic!("rangeify failed"),
@@ -56,7 +56,7 @@ fn test_run_rangeify_detach_removal() {
     match rangeified.op() {
         Op::Const(_) => {
             // DETACH successfully removed
-            assert!(Rc::ptr_eq(&rangeified, &x) || matches!(rangeified.op(), Op::Const(_)));
+            assert!(Arc::ptr_eq(&rangeified, &x) || matches!(rangeified.op(), Op::Const(_)));
         }
         _ => {
             // Transformation may have applied additional patterns
@@ -77,7 +77,7 @@ fn test_run_rangeify_contiguous_backward_removal() {
     // CONTIGUOUS_BACKWARD should be removed
     match rangeified.op() {
         Op::Const(_) => {
-            assert!(Rc::ptr_eq(&rangeified, &x) || matches!(rangeified.op(), Op::Const(_)));
+            assert!(Arc::ptr_eq(&rangeified, &x) || matches!(rangeified.op(), Op::Const(_)));
         }
         _ => {
             assert!(!matches!(rangeified.op(), Op::ContiguousBackward { .. }));
@@ -133,7 +133,7 @@ fn test_kernel_split_pipeline_simple_store() {
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer, index, value);
 
-    let result = run_kernel_split_pipeline(store);
+    let (result, _context) = run_kernel_split_pipeline(store);
 
     // Should produce a KERNEL operation or transformation
     // Note: Exact output depends on split_store implementation
@@ -152,7 +152,7 @@ fn test_kernel_split_pipeline_with_end() {
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let end = UOp::end(store, vec![range].into());
 
-    let result = run_kernel_split_pipeline(end);
+    let (result, _context) = run_kernel_split_pipeline(end);
 
     // Should handle END wrapper correctly
     assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Kernel { .. }));
@@ -168,7 +168,7 @@ fn test_kernel_split_pipeline_load_store() {
     let load = UOp::load(in_buf, index.clone());
     let store = UOp::store(out_buf, index, load);
 
-    let result = run_kernel_split_pipeline(store);
+    let (result, _context) = run_kernel_split_pipeline(store);
 
     // Should create valid kernel or passthrough
     assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Kernel { .. }));
@@ -187,7 +187,7 @@ fn test_kernel_split_pipeline_multiple_loads() {
     let sum = load1.try_add(&load2).unwrap();
     let store = UOp::store(out_buf, index, sum);
 
-    let result = run_kernel_split_pipeline(store);
+    let (result, _context) = run_kernel_split_pipeline(store);
 
     // Should handle multiple inputs correctly
     assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Kernel { .. }));
@@ -213,7 +213,7 @@ fn test_end_to_end_simple_computation() {
     let rangeified = rangeify_unwrap(store);
 
     // Step 4: Apply kernel split
-    let kernel = run_kernel_split_pipeline(rangeified);
+    let (kernel, _context) = run_kernel_split_pipeline(rangeified);
 
     // Should produce valid output
     assert!(kernel.dtype() == DType::Void || matches!(kernel.op(), Op::Kernel { .. }));
@@ -234,7 +234,7 @@ fn test_end_to_end_with_ranges() {
     let end = UOp::end(store, vec![range].into());
 
     let rangeified = rangeify_unwrap(end);
-    let kernel = run_kernel_split_pipeline(rangeified);
+    let (kernel, _context) = run_kernel_split_pipeline(rangeified);
 
     assert!(kernel.dtype() == DType::Void || matches!(kernel.op(), Op::Kernel { .. }));
 }

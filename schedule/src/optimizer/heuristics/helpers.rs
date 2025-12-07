@@ -3,7 +3,7 @@
 //! These functions analyze kernels to detect specific patterns (matmul, matvec, etc.)
 //! and provide information for making optimization decisions.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{BinaryOp, Op, ReduceOp, TernaryOp};
 
@@ -62,7 +62,7 @@ pub fn is_masked(scheduler: &Scheduler, axis: usize) -> bool {
     for node in scheduler.ast().toposort() {
         if let Op::Ternary(TernaryOp::Where, cond, _, _) = node.op() {
             // Check if target range appears in the condition's backward slice
-            if cond.backward_slice().iter().any(|dep| Rc::ptr_eq(dep, target_rng)) {
+            if cond.backward_slice().iter().any(|dep| Arc::ptr_eq(dep, target_rng)) {
                 return true;
             }
         }
@@ -88,7 +88,7 @@ pub fn has_broadcast_pattern(scheduler: &Scheduler, axis: usize) -> bool {
 
     for buf in scheduler.bufs() {
         // Check if range is in buffer's backward slice
-        let in_backward_slice = buf.backward_slice().iter().any(|dep| Rc::ptr_eq(dep, target_rng));
+        let in_backward_slice = buf.backward_slice().iter().any(|dep| Arc::ptr_eq(dep, target_rng));
 
         if !in_backward_slice {
             continue;
@@ -97,7 +97,8 @@ pub fn has_broadcast_pattern(scheduler: &Scheduler, axis: usize) -> bool {
         // Check if it's NOT in the index expression itself
         // If it's in backward slice but not in index, it's broadcast
         if let Op::Index { indices, .. } = buf.op() {
-            let in_index = indices.iter().any(|idx| idx.backward_slice().iter().any(|dep| Rc::ptr_eq(dep, target_rng)));
+            let in_index =
+                indices.iter().any(|idx| idx.backward_slice().iter().any(|dep| Arc::ptr_eq(dep, target_rng)));
 
             if !in_index {
                 return true; // Found broadcast pattern
@@ -133,7 +134,7 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
         if let Op::Index { indices, .. } = buf.op() {
             // Check if this buffer uses the axis
             let uses_axis =
-                indices.iter().any(|idx| idx.backward_slice().iter().any(|dep| Rc::ptr_eq(dep, target_rng)));
+                indices.iter().any(|idx| idx.backward_slice().iter().any(|dep| Arc::ptr_eq(dep, target_rng)));
 
             if uses_axis {
                 num_strides += 1;
@@ -141,7 +142,7 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
                 // Simplified stride counting: count occurrences in index
                 // Full implementation would parse MUL operations to extract coefficients
                 for idx in indices.iter() {
-                    if idx.backward_slice().iter().any(|dep| Rc::ptr_eq(dep, target_rng)) {
+                    if idx.backward_slice().iter().any(|dep| Arc::ptr_eq(dep, target_rng)) {
                         sum_strides += 1;
                     }
                 }

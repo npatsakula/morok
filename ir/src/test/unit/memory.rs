@@ -1,7 +1,7 @@
 //! Tests for memory and buffer operations constructors.
 
-use morok_dtype::DeviceSpec;
 use morok_dtype::DType;
+use morok_dtype::DeviceSpec;
 
 use crate::types::{AddrSpace, AxisId, AxisType, BufferizeOpts};
 use crate::{Op, UOp};
@@ -20,7 +20,7 @@ fn test_bufferize() {
 
     // Should be Bufferize op
     if let Op::Bufferize { compute: c, ranges, opts: o } = bufferize.op() {
-        assert!(std::rc::Rc::ptr_eq(c, &compute));
+        assert!(std::sync::Arc::ptr_eq(c, &compute));
         assert_eq!(ranges.len(), 2);
         assert_eq!(o.device, Some(DeviceSpec::Cpu));
         assert_eq!(o.addrspace, AddrSpace::Global);
@@ -56,8 +56,8 @@ fn test_load() {
 
     // Should be Load op
     if let Op::Load { buffer: b, index: i } = load.op() {
-        assert!(std::rc::Rc::ptr_eq(b, &buffer));
-        assert!(std::rc::Rc::ptr_eq(i, &index));
+        assert!(std::sync::Arc::ptr_eq(b, &buffer));
+        assert!(std::sync::Arc::ptr_eq(i, &index));
     } else {
         panic!("Expected Load op");
     }
@@ -76,9 +76,9 @@ fn test_load_gated() {
 
     // Should be LoadGated op
     if let Op::LoadGated { buffer: b, index: i, gate: g } = load.op() {
-        assert!(std::rc::Rc::ptr_eq(b, &buffer));
-        assert!(std::rc::Rc::ptr_eq(i, &index));
-        assert!(std::rc::Rc::ptr_eq(g, &gate));
+        assert!(std::sync::Arc::ptr_eq(b, &buffer));
+        assert!(std::sync::Arc::ptr_eq(i, &index));
+        assert!(std::sync::Arc::ptr_eq(g, &gate));
     } else {
         panic!("Expected LoadGated op");
     }
@@ -97,9 +97,9 @@ fn test_store() {
 
     // Should be Store op
     if let Op::Store { buffer: b, index: i, value: v } = store.op() {
-        assert!(std::rc::Rc::ptr_eq(b, &buffer));
-        assert!(std::rc::Rc::ptr_eq(i, &index));
-        assert!(std::rc::Rc::ptr_eq(v, &value));
+        assert!(std::sync::Arc::ptr_eq(b, &buffer));
+        assert!(std::sync::Arc::ptr_eq(i, &index));
+        assert!(std::sync::Arc::ptr_eq(v, &value));
     } else {
         panic!("Expected Store op");
     }
@@ -119,10 +119,10 @@ fn test_store_gated() {
 
     // Should be StoreGated op
     if let Op::StoreGated { buffer: b, index: i, value: v, gate: g } = store.op() {
-        assert!(std::rc::Rc::ptr_eq(b, &buffer));
-        assert!(std::rc::Rc::ptr_eq(i, &index));
-        assert!(std::rc::Rc::ptr_eq(v, &value));
-        assert!(std::rc::Rc::ptr_eq(g, &gate));
+        assert!(std::sync::Arc::ptr_eq(b, &buffer));
+        assert!(std::sync::Arc::ptr_eq(i, &index));
+        assert!(std::sync::Arc::ptr_eq(v, &value));
+        assert!(std::sync::Arc::ptr_eq(g, &gate));
     } else {
         panic!("Expected StoreGated op");
     }

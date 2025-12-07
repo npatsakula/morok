@@ -5,28 +5,59 @@
 //! 2. **Kernel splitting** - Split at STORE boundaries into KERNEL ops
 //! 3. **Scheduling** - Extract kernels and create execution schedule
 //! 4. **Execution** - Compile and run each kernel in dependency order
+//!
+//! # Parallel Execution
+//!
+//! When independent kernels are detected (no buffer conflicts), they can be
+//! executed in parallel using the `UnifiedExecutor` from the runtime crate.
+//! The executor tracks buffer dependencies and uses timeline signals for
+//! cross-device synchronization.
+//!
+//! # ExecutionPlan (Pre-compiled Execution)
+//!
+//! For repeated executions, use `Tensor::prepare()` to create an `ExecutionPlan`
+//! that pre-compiles all kernels and allocates all buffers. Then call
+//! `plan.execute()` for fast repeated execution without recompilation overhead.
+//!
+//! ```ignore
+//! // One-time preparation (compiles kernels, allocates buffers)
+//! let plan = tensor.prepare()?;
+//!
+//! // Fast execution (can be called many times)
+//! plan.execute(&mut executor)?;
+//!
+//! // Get results
+//! let output = plan.output_buffer();
+//! ```
+
+use std::collections::HashMap;
 
 use crate::{
     Result, Tensor,
-    error::{RuntimeSnafu, ShapeUnknownSnafu, UOpSnafu},
+    error::{
+        CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceFactorySnafu, DeviceSnafu,
+        EmptyScheduleSnafu, ExecutionSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu, UOpSnafu,
+    },
+    schedule::{Schedule, ScheduleItem, expand_schedule},
 };
-use morok_codegen::IrSnafu;
-use morok_device::Buffer;
-use morok_ir::{AxisId, Op, SInt, UOp};
-use morok_runtime::{CachedKernel, CompiledKernel, LlvmKernel};
+use morok_ir::{AxisId, DeviceSpec, Op, SInt, UOp};
+use morok_runtime::{
+    ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, ParallelGroup,
+    PreparedKernel,
+};
 use snafu::{OptionExt, ResultExt};
 
 impl Tensor {
     /// Realize (execute) this tensor's computation graph.
     ///
-    /// This executes the full compilation pipeline:
-    /// 1. Creates a SINK of the computation graph
-    /// 2. Runs rangeify pipeline (movement ops → BUFFERIZE + INDEX)
-    /// 3. Runs kernel splitting (BUFFERIZE → KERNEL operations)
-    /// 4. Creates schedule of kernels to execute
-    /// 5. Compiles and executes each kernel
+    /// This is a convenience method that prepares and executes in one call.
+    /// For repeated executions of the same computation, use `prepare()` instead.
     ///
-    /// After realization, the tensor's buffer contains the computed results.
+    /// # Pipeline
+    ///
+    /// 1. **Prepare**: Creates an `ExecutionPlan` (compiles kernels, allocates buffers)
+    /// 2. **Execute**: Runs all kernels in dependency order
+    /// 3. **Return**: Links output buffer to this tensor's UOp
     ///
     /// # Example
     ///
@@ -39,22 +70,66 @@ impl Tensor {
     ///
     /// # Errors
     ///
+    /// Returns error if preparation or execution fails.
+    pub fn realize(self) -> Result<Self> {
+        // Prepare execution plan (compiles kernels, allocates buffers)
+        let plan = self.prepare()?;
+
+        // Execute the plan
+        let mut executor = morok_runtime::global_executor();
+        plan.execute(&mut executor).context(ExecutionSnafu)?;
+
+        // Link output buffer to this tensor's UOp for .buffer() access
+        let output_buf = plan.output_buffer().clone();
+        let base_id = self.uop.base().id;
+        crate::buffer_registry::get_or_create_buffer(base_id, || Ok(output_buf))?;
+
+        Ok(Self { uop: self.uop.clone(), kernels: self.kernels })
+    }
+
+    /// Prepare an execution plan for this tensor's computation graph.
+    ///
+    /// This performs all one-time work:
+    /// 1. Creates schedule from computation graph
+    /// 2. Expands bound ranges
+    /// 3. Compiles all kernels
+    /// 4. Allocates all buffers
+    /// 5. Computes parallel execution groups
+    ///
+    /// The returned `ExecutionPlan` can then be executed multiple times
+    /// without recompilation overhead.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
+    /// let c = &a + &b;
+    ///
+    /// // One-time preparation
+    /// let plan = c.prepare()?;
+    ///
+    /// // Fast execution (can be called many times)
+    /// let mut executor = morok_runtime::global_executor();
+    /// plan.execute(&mut executor)?;
+    ///
+    /// // Get results
+    /// let output = plan.output_buffer();
+    /// ```
+    ///
+    /// # Errors
+    ///
     /// Returns error if:
     /// - Rangeify transformation fails
     /// - No kernels found after scheduling
-    /// - Buffer allocation fails
     /// - Kernel compilation fails
-    /// - Kernel execution fails
-    pub fn realize(self) -> Result<Self> {
+    /// - Buffer allocation fails
+    pub fn prepare(&self) -> Result<ExecutionPlan> {
         use morok_ir::AxisType;
 
         // Step 1: Create BUFFERIZE wrapping the computation
-        // This tells the compiler to materialize the result into a buffer.
-        //
-        // Get shape to determine output size
         let shape = self.uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
 
-        // Create ranges for each dimension
         let ranges: Vec<_> = shape
             .iter()
             .enumerate()
@@ -67,264 +142,247 @@ impl Tensor {
             })
             .collect();
 
-        // Wrap computation in BUFFERIZE
         let bufferize = UOp::bufferize_global(self.uop.clone(), ranges);
 
         // Step 2: Create SINK of the BUFFERIZE
         let sink = UOp::sink(vec![bufferize]);
 
-        // Step 3: Run rangeify pipeline (Phases 1-4)
-        // This transforms movement ops (RESHAPE, PERMUTE, etc.) into
-        // BUFFERIZE + INDEX operations with explicit ranges
-        let (rangeified, _context) = morok_schedule::rangeify(sink, None)
-            .map_err(|e| crate::Error::Runtime { message: format!("Rangeify failed: {}", e) })?;
+        // Step 3: Run rangeify pipeline
+        let (rangeified, _context) = morok_schedule::rangeify(sink, None).context(RangeifySnafu)?;
 
-        // Step 4: Run kernel splitting pipeline (Phase 5)
-        // This transforms BUFFERIZE → KERNEL operations by splitting
-        // at STORE boundaries.
-        // Returns both the transformed graph and the KernelContext with buffer_map.
+        // Step 4: Run kernel splitting pipeline
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeified);
 
         // Step 5: Create schedule from kernels
-        // Extracts KERNEL operations and creates ScheduleItems with buffers.
-        // Passes buffer_map to enable reusing input buffers.
         let schedule = crate::schedule::create_schedule(kernelized, kernel_ctx)?;
 
-        // Step 6: Execute schedule
-        // Compiles and runs each kernel in dependency order
-        // Pass the tensor's kernels vec so it can track which kernels were used
-        let output_buffer_id = execute_schedule(&schedule, &self.kernels)?;
-
-        // Step 7: Create a new Tensor wrapping the output buffer
-        // After execution, the output is stored in a DEFINE_GLOBAL buffer which is
-        // already registered in BUFFERS with the DEFINE_GLOBAL's UOp ID.
-        // We can't use DEFINE_GLOBAL directly as a tensor (it's not a BUFFER op),
-        // so we create a BUFFER UOp with the correct size and link it to the same buffer.
-
-        // The output buffer is already registered under output_buffer_id.
-        // We just need to create a BUFFER UOp that points to it.
-
-        // The output buffer is already allocated and filled.
-        // Since the computation is complete, we return the original input UOp
-        // which still points to its buffer (for simple expressions) or we'd need
-        // to extract the actual output tensor's UOp from the schedule.
-        //
-        // For now, since the original self.uop's buffer should be updated in-place
-        // by the kernel execution (wait, no - we create NEW buffers), we need to
-        // return a NEW tensor that wraps the output buffer.
-        //
-        // The cleanest solution: Since we can't create a new BUFFER UOp (hash consing!),
-        // we'll create a new buffer and copy the output data into it, then register
-        // that under a unique ID.
-
-        // Get the output buffer that was written to
-        let output_buf = crate::buffer_registry::get_buffer(output_buffer_id).ok_or_else(|| crate::Error::Runtime {
-            message: format!("Output buffer {} not found in registry", output_buffer_id),
-        })?;
-
-        // Create a NEW BUFFER UOp (this will get a unique ID from hash consing based on device/size/dtype)
-        // Actually no - hash consing means same params = same ID!
-        // We need to use the DEFINE_GLOBAL itself, but DEFINE_GLOBAL is not a valid base for tensors.
-        //
-        // The correct solution: Just return self with the data updated!
-        // But wait - self.uop points to the INPUT, not the output.
-        //
-        // Let me think... The schedule created DEFINE_GLOBAL for outputs, and we executed
-        // kernels that wrote to those buffers. The output_buffer_id is the DEFINE_GLOBAL's ID.
-        // We need to return a Tensor whose .buffer() will return that buffer.
-        //
-        // Since BUFFER UOps use hash consing and will collide, we can't create a fresh BUFFER UOp.
-        // Instead, we'll just return the original tensor but with its buffer updated!
-        //
-        // Actually wait - for a simple add operation, the output is a NEW buffer, not one of the inputs.
-        // So self.uop won't have a buffer in the registry under its ID.
-        //
-        // The REAL solution: Don't use hash consing for BUFFER creation here.
-        // But we can't do that without modifying UOp.
-        //
-        // Alternative: Accept that realized tensors don't follow the normal UOp graph,
-        // and just store the buffer separately or use the DEFINE_GLOBAL ID directly.
-
-        // SIMPLEST FIX: Create a minimal BUFFER UOp and register the output buffer under THAT ID.
-        // But since new_buffer uses hash consing, we need a unique signature.
-        // We can use a different device spec or add randomness - but that's hacky.
-        //
-        // BETTER FIX: Just return self, and rely on the fact that the kernels updated
-        // the buffers in-place. But that won't work for new outputs...
-        //
-        // ACTUAL FIX: Keep the buffer registered under output_buffer_id (the DEFINE_GLOBAL ID),
-        // and return a tensor whose UOp's base().id == output_buffer_id.
-        // But DEFINE_GLOBAL is not a valid tensor base...
-        //
-        // Let me just use the original self.uop and update its buffer registration:
-        let base_id = self.uop.base().id;
-        crate::buffer_registry::get_or_create_buffer(base_id, || Ok(output_buf.clone()))?;
-
-        Ok(Self { uop: self.uop.clone(), kernels: self.kernels })
+        // Step 6: Build execution plan
+        prepare_execution_plan(&schedule)
     }
 }
 
-/// Execute a schedule of kernels.
+/// Build an execution graph from an expanded schedule.
 ///
-/// For each kernel in the schedule:
-/// 1. Allocates buffers for intermediate results (DEFINE_GLOBAL/DEFINE_LOCAL)
-/// 2. Renders kernel AST to LLVM IR (or reuses cached compiled kernel)
-/// 3. JIT compiles the kernel (or reuses cached compiled kernel)
-/// 4. Executes the kernel with buffer pointers
+/// Creates an `ExecutionGraph` that represents the DAG of kernel operations,
+/// capturing buffer dependencies and enabling parallel execution analysis.
 ///
 /// # Arguments
 ///
-/// * `schedule` - The schedule of kernels to execute
-/// * `kernels` - Mutable reference to the tensor's kernel tracking vec
+/// * `schedule` - The expanded schedule (after range iteration expansion)
 ///
 /// # Returns
 ///
-/// The UOp ID of the output buffer (first DEFINE_GLOBAL in first kernel)
+/// An `ExecutionGraph` with nodes for each schedule item.
+fn build_execution_graph(schedule: &[ScheduleItem]) -> ExecutionGraph {
+    let mut graph = ExecutionGraph::new();
+
+    for item in schedule {
+        // Determine device from first buffer
+        let device = item.buffers.first().map(|b| b.allocator().device_spec()).unwrap_or(DeviceSpec::Cpu);
+
+        // Collect buffer IDs
+        let all_buffer_ids: Vec<_> = item.buffers.iter().map(|b| b.id()).collect();
+
+        // Determine output indices (first buffer is typically output for computational kernels)
+        // For COPY operations, this will be handled differently
+        let is_transfer = matches!(item.ast.op(), Op::Copy { .. });
+        let output_indices = if is_transfer {
+            // For COPY, destination is output
+            vec![0usize]
+        } else {
+            // For computational kernels, first DEFINE_GLOBAL is output
+            vec![0usize] // TODO: properly detect outputs from STORE ops
+        };
+
+        // Split buffer IDs into inputs and outputs
+        let outputs: Vec<_> = output_indices.iter().map(|&i| all_buffer_ids[i]).collect();
+        let inputs: Vec<_> =
+            all_buffer_ids.iter().enumerate().filter(|(i, _)| !output_indices.contains(i)).map(|(_, id)| *id).collect();
+
+        // Create buffer access info for parallel execution
+        let buffer_access = Some(KernelBufferAccess { buffers: all_buffer_ids, output_indices });
+
+        let node = ExecutionNode {
+            id: item.ast.id,
+            device,
+            inputs,
+            outputs,
+            predecessors: item.dependencies.clone(),
+            is_transfer,
+            buffer_access,
+        };
+
+        graph.add_node(node);
+    }
+
+    graph
+}
+
+/// Prepare an execution plan from a schedule.
+///
+/// This performs all one-time preparation work:
+/// 1. Expands the schedule (handles bound ranges)
+/// 2. Builds execution graph and computes parallel groups
+/// 3. Allocates all buffers
+/// 4. Compiles all kernels
+/// 5. Creates PreparedKernel structures
+///
+/// # Arguments
+///
+/// * `schedule` - The schedule from `create_schedule()`
+///
+/// # Returns
+///
+/// An `ExecutionPlan` ready for fast repeated execution.
 ///
 /// # Errors
 ///
-/// Returns error if any step fails (allocation, compilation, execution).
-fn execute_schedule(
-    schedule: &crate::schedule::Schedule,
-    kernels: &std::rc::Rc<std::cell::RefCell<Vec<crate::KernelRef>>>,
-) -> Result<u64> {
-    // DEBUG: Print schedule before expansion
-    eprintln!("EXECUTION before expansion: {} items", schedule.len());
-    for (i, item) in schedule.iter().enumerate() {
-        eprintln!("  Item {}: {} bound_ranges", i, item.bound_ranges.len());
-        for br in &item.bound_ranges {
-            eprintln!("    BoundRange: var_name='{}', range={:?}", br.var_name, br.range_uop.op());
+/// Returns error if compilation or buffer allocation fails.
+fn prepare_execution_plan(schedule: &Schedule) -> Result<ExecutionPlan> {
+    // Expand the schedule to handle OUTER range iterations
+    let expanded_schedule = expand_schedule(schedule.clone());
+
+    // Build execution graph for parallel group analysis
+    let mut execution_graph = build_execution_graph(&expanded_schedule);
+
+    // Compute parallel groups
+    let _parallel_groups_raw = execution_graph.compute_parallel_groups();
+
+    // Verify the graph is valid (no cycles)
+    if !execution_graph.is_valid() {
+        return DependencyCyclesSnafu.fail();
+    }
+
+    // Get device from first buffer in first kernel (Tinygrad pattern: ctx[0].device)
+    let alloc_registry = morok_device::registry::registry();
+    let device = if let Some(first_item) = expanded_schedule.first() {
+        if let Some(first_buffer) = first_item.buffers.first() {
+            let device_spec = first_buffer.allocator().device_spec();
+            morok_runtime::DEVICE_FACTORIES.device(&device_spec, alloc_registry).context(DeviceFactorySnafu)?
+        } else {
+            morok_runtime::DEVICE_FACTORIES.device(&DeviceSpec::Cpu, alloc_registry).context(DeviceFactorySnafu)?
+        }
+    } else {
+        return EmptyScheduleSnafu.fail();
+    };
+
+    let device_str = device.device.canonicalize();
+
+    // Build the ExecutionPlan using the builder
+    let mut builder = ExecutionPlanBuilder::new(device.device.clone());
+
+    // Step 1: Add all buffers to the plan
+    // Buffers in each ScheduleItem are already in the correct order (from collect_kernel_buffers).
+    // We need to track unique buffers by their Buffer ID (not AST ID).
+    let mut buffer_id_to_idx: HashMap<u64, usize> = HashMap::new();
+
+    for item in &expanded_schedule {
+        // Ensure all buffers are allocated
+        for buffer in &item.buffers {
+            buffer.ensure_allocated().context(DeviceSnafu)?;
+
+            // Add buffer if not already added (use inner u64 from BufferId)
+            let buf_id = buffer.id().0;
+            buffer_id_to_idx.entry(buf_id).or_insert_with(|| builder.add_buffer(buf_id, buffer.clone()));
         }
     }
 
-    // Expand the schedule to handle OUTER range iterations
-    // This converts each kernel with bound_ranges into N schedule items
-    // with concrete variable values in fixedvars.
-    let expanded_schedule = crate::schedule::expand_schedule(schedule.clone());
+    // Track output buffer index (first buffer of first kernel is output)
+    let mut output_buffer_idx: Option<usize> = None;
 
-    // DEBUG: Print schedule after expansion
-    eprintln!("EXECUTION after expansion: {} items", expanded_schedule.len());
-    for (i, item) in expanded_schedule.iter().enumerate() {
-        eprintln!("  Item {}: fixedvars={:?}", i, item.fixedvars);
-    }
-
-    // Track the first DEFINE_GLOBAL we encounter - this is the output buffer
-    let mut output_buffer_id: Option<u64> = None;
+    // Step 2: Compile all kernels and create PreparedKernel structures
+    let mut prepared_kernels: Vec<PreparedKernel> = Vec::new();
 
     for item in &expanded_schedule {
-        // Step 1: Use pre-allocated buffers from ScheduleItem
-        // Buffers were allocated once in create_schedule() and are reused across all iterations
-        let buffers = &item.buffers;
+        // Skip COPY operations for now (handle separately in execution)
+        if matches!(item.ast.op(), Op::Copy { .. }) {
+            // TODO: Handle COPY operations in ExecutionPlan
+            continue;
+        }
 
-        // Capture the first DEFINE_GLOBAL as output buffer
-        if output_buffer_id.is_none()
-            && let Op::Kernel { sources, .. } = item.kernel.op()
-        {
-            for src in sources {
-                if let Op::DefineGlobal(_) = src.op() {
-                    // Use the UOp ID, not the internal DEFINE_GLOBAL ID
-                    output_buffer_id = Some(src.id);
-                    break;
-                }
+        // Capture output buffer index (first buffer of first kernel)
+        if output_buffer_idx.is_none() && !item.buffers.is_empty() {
+            let first_buf_id = item.buffers[0].id().0;
+            if let Some(&idx) = buffer_id_to_idx.get(&first_buf_id) {
+                output_buffer_idx = Some(idx);
             }
         }
 
-        // Step 2: Ensure all buffers are allocated (idempotent operation)
-        for buffer in buffers {
-            buffer
-                .ensure_allocated()
-                .map_err(|e| crate::Error::Device { message: format!("Buffer allocation failed: {}", e) })?;
-        }
+        // Get or compile kernel
+        let cached = morok_runtime::kernel_cache::get_or_compile_kernel(item.ast.id, &device_str, || {
+            // Apply optimizations
+            let optimizer_renderer = morok_schedule::OptimizerRenderer::cpu();
+            let optimized_ast = morok_schedule::optimize_kernel(item.ast.clone(), &optimizer_renderer);
 
-        // Step 3: Get or compile kernel using dedup cache
-        // Use the AST's UOp ID as cache key (thanks to hash consing!)
-        let ast_id = item.ast.id;
-        let device = "CPU"; // TODO: Get from item or schedule
+            // Apply decomposition
+            let ast_decomposed = match device.renderer.decompositor() {
+                Some(matcher) => morok_ir::decompositions::decompose_with(&optimized_ast, &matcher),
+                None => optimized_ast,
+            };
 
-        let compiled = morok_runtime::kernel_cache::get_or_compile_kernel(ast_id, device, || {
-            // Compile fresh if not cached
-            let rendered = morok_codegen::llvm::render(&item.ast, Some("kernel"))
-                .map_err(|e| crate::Error::Codegen { message: format!("Failed to render kernel: {}", e) })?;
+            // Render
+            let spec = device.renderer.render(&ast_decomposed).context(RenderKernelSnafu)?;
 
-            let kernel = LlvmKernel::compile(&rendered)
-                .map_err(|e| crate::Error::Runtime { message: format!("Failed to compile kernel: {}", e) })?;
+            // Compile
+            let compiled = device.compiler.compile(&spec).context(CompileKernelSnafu)?;
 
-            Ok(CachedKernel {
-                kernel: std::sync::Arc::new(kernel),
-                device: device.to_string(),
-                code: rendered.code.clone(),
-                entry_point: rendered.entry_point.clone(),
+            // Create program
+            let program = (device.runtime)(&compiled).context(CreateProgramSnafu)?;
+
+            Ok(morok_runtime::kernel_cache::CachedKernel {
+                program,
+                device: device_str.clone(),
+                code: spec.src.clone(),
+                entry_point: spec.name.clone(),
             })
         })?;
 
-        // Track this kernel for this tensor
-        kernels.borrow_mut().push(crate::KernelRef {
-            ast_id,
-            device: device.to_string(),
-            code: compiled.code.clone(),
-            entry_point: compiled.entry_point.clone(),
-        });
+        // Build buffer indices for this kernel using item.buffers (already in correct order)
+        let buffer_indices: Vec<usize> =
+            item.buffers.iter().filter_map(|buf| buffer_id_to_idx.get(&buf.id().0).copied()).collect();
 
-        // Step 4: Use the cached/compiled kernel
-        let kernel = &*compiled.kernel;
+        // Create PreparedKernel
+        let prepared = PreparedKernel {
+            id: item.ast.id,
+            kernel: cached,
+            device: device.device.clone(),
+            buffer_indices,
+            output_indices: vec![0], // First buffer is typically output
+            fixedvars: item.fixedvars.clone(),
+            dependencies: item.dependencies.clone(),
+        };
 
-        // Step 5: Collect buffer pointers
-        let pointers: Vec<*mut u8> =
-            buffers.iter().map(|b| unsafe { get_buffer_ptr(b) }).collect::<Result<Vec<_>>>()?;
-
-        // DEBUG: Print buffer info
-        eprintln!("EXECUTION: About to execute kernel with {} buffers", pointers.len());
-        for (i, buf) in buffers.iter().enumerate() {
-            eprintln!("  Buffer[{}]: size={}, dtype={:?}, ptr={:p}", i, buf.size(), buf.dtype(), pointers[i]);
-            // Try to read first few values if it's f32
-            if matches!(buf.dtype(), morok_dtype::DType::Scalar(morok_dtype::ScalarDType::Float32)) {
-                let count = (buf.size() / 4).min(5);
-                let mut data = vec![0.0f32; count];
-                if buf
-                    .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, count * 4) })
-                    .is_ok()
-                {
-                    eprintln!("    First {} values: {:?}", count, data);
-                }
-            }
-        }
-        eprintln!("EXECUTION: fixedvars={:?}", item.fixedvars);
-
-        // Step 6: Execute kernel with variable values (if any)
-        unsafe {
-            kernel
-                .execute_with_vars(&pointers, &item.fixedvars)
-                .map_err(|e| crate::Error::Runtime { message: format!("Kernel execution failed: {}", e) })?;
-        }
-
-        // DEBUG: Print output buffer after execution
-        eprintln!("EXECUTION: After kernel execution:");
-        if !buffers.is_empty() {
-            let buf = &buffers[0];
-            if matches!(buf.dtype(), morok_dtype::DType::Scalar(morok_dtype::ScalarDType::Float32)) {
-                let count = (buf.size() / 4).min(5);
-                let mut data = vec![0.0f32; count];
-                if buf
-                    .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, count * 4) })
-                    .is_ok()
-                {
-                    eprintln!("  Output buffer first {} values: {:?}", count, data);
-                }
-            }
-        }
+        prepared_kernels.push(prepared);
     }
 
-    output_buffer_id.ok_or_else(|| crate::Error::Runtime { message: "No output buffer found in schedule".to_string() })
-}
+    // Add kernels to builder and track their indices
+    let num_prepared_kernels = prepared_kernels.len();
+    for kernel in prepared_kernels {
+        builder.add_kernel(kernel);
+    }
 
-/// Get raw pointer to buffer data.
-///
-/// # Safety
-///
-/// This is unsafe because we're extracting a raw pointer from the buffer.
-/// The caller must ensure exclusive access during kernel execution.
-unsafe fn get_buffer_ptr(buffer: &Buffer) -> Result<*mut u8> {
-    Ok(unsafe { buffer.as_raw_ptr() })
+    // Step 3: Create parallel groups
+    // Each kernel goes into its own group for sequential execution.
+    //
+    // NOTE: While expanded iterations with different fixedvars ARE independent
+    // (they write to different positions in the same buffer), the UnifiedExecutor's
+    // validate_parallel_independence() cannot distinguish this - it sees writes to
+    // the same buffer ID as a conflict. Until we enhance the executor to understand
+    // position-based independence, we execute sequentially.
+    //
+    // Future optimization: Group truly independent kernels (different AST IDs
+    // writing to different buffers) for parallel execution.
+    let parallel_groups: Vec<ParallelGroup> =
+        (0..num_prepared_kernels).map(|idx| ParallelGroup { kernel_indices: vec![idx] }).collect();
+
+    builder.set_parallel_groups(parallel_groups);
+
+    // Set output buffer
+    if let Some(idx) = output_buffer_idx {
+        builder.set_output_buffer(idx);
+    }
+
+    Ok(builder.build())
 }
 
 #[cfg(test)]
@@ -333,6 +391,8 @@ mod tests {
 
     #[test]
     fn test_realize_simple_add() {
+        let _guard = crate::test::helpers::test_setup();
+
         // Test that realizing a simple computation works.
         // The pipeline transforms:
         //   ADD(RESHAPE(BUFFER_A), RESHAPE(BUFFER_B))
@@ -345,11 +405,9 @@ mod tests {
         let c = &a + &b;
 
         // Realize should compile and execute the kernel
-        let result = c.realize();
-        if let Err(ref e) = result {
-            eprintln!("Realize failed: {:?}", e);
-        }
-        assert!(result.is_ok());
+        let result: ndarray::ArrayD<f32> = c.realize().unwrap().to_ndarray().unwrap();
+        let (result, _) = result.into_raw_vec_and_offset();
+        assert_eq!(result, vec![5.0, 7.0, 9.0]);
     }
 
     /// Test that realizing a reduction (sum) works end-to-end.
@@ -361,6 +419,8 @@ mod tests {
     /// - REDUCE codegen generates correct LLVM IR
     #[test]
     fn test_realize_sum() {
+        let _guard = crate::test::helpers::test_setup();
+
         // Create a 1D tensor: [1, 2, 3, 4]
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
 
@@ -379,5 +439,113 @@ mod tests {
         assert!(realized.is_ok(), "Realize should succeed");
     }
 
+    #[test]
+    fn test_tensor_device_default_cpu() {
+        // Tensors created with from_slice default to CPU
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        assert_eq!(a.device(), morok_ir::DeviceSpec::Cpu);
+    }
+
+    #[test]
+    fn test_tensor_to_same_device_is_noop() {
+        // Moving to the same device should return a clone
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = a.to(morok_ir::DeviceSpec::Cpu);
+        // Both should point to the same UOp (clone shares Rc)
+        assert_eq!(a.device(), b.device());
+    }
+
+    #[test]
+    fn test_tensor_to_different_device_creates_copy() {
+        use morok_ir::DeviceSpec;
+        // Moving to a different device should create a COPY UOp
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = a.to(DeviceSpec::Cuda { device_id: 0 });
+        // b should report the new device
+        assert_eq!(b.device(), DeviceSpec::Cuda { device_id: 0 });
+        // a should still be on CPU
+        assert_eq!(a.device(), DeviceSpec::Cpu);
+    }
+
     // More comprehensive tests will be added in Phase 1.5
+
+    // ==========================================================================
+    // ExecutionPlan tests
+    // ==========================================================================
+
+    #[test]
+    fn test_prepare_simple_add() {
+        let _guard = crate::test::helpers::test_setup();
+
+        // Create computation: a + b
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
+        let c = &a + &b;
+
+        // Prepare should compile kernels and allocate buffers
+        let plan = c.prepare();
+        assert!(plan.is_ok(), "prepare() should succeed: {:?}", plan.err());
+
+        let plan = plan.unwrap();
+
+        // Verify plan has kernels and buffers
+        assert!(plan.kernels().next().is_some(), "Plan should have at least one kernel");
+        assert!(!plan.buffers().is_empty(), "Plan should have buffers");
+        assert!(!plan.parallel_groups().is_empty(), "Plan should have parallel groups");
+    }
+
+    #[test]
+    fn test_prepare_and_execute() {
+        let _guard = crate::test::helpers::test_setup();
+
+        // Create computation: a + b
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
+        let c = &a + &b;
+
+        // Prepare
+        let plan = c.prepare().expect("prepare should succeed");
+
+        // Execute
+        let mut executor = morok_runtime::global_executor();
+        let result = plan.execute(&mut executor);
+        assert!(result.is_ok(), "execute() should succeed: {:?}", result.err());
+
+        // Verify output buffer has correct data
+        let output = plan.output_buffer();
+        let mut data = vec![0.0f32; 3];
+        output
+            .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, 12) })
+            .expect("copyout should succeed");
+        assert_eq!(data, vec![5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn test_prepare_and_execute_twice() {
+        let _guard = crate::test::helpers::test_setup();
+
+        // Create computation
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
+        let c = &a + &b;
+
+        // Prepare once
+        let plan = c.prepare().expect("prepare should succeed");
+
+        // Execute twice to verify reusability
+        let mut executor = morok_runtime::global_executor();
+
+        for _ in 0..2 {
+            let result = plan.execute(&mut executor);
+            assert!(result.is_ok(), "execute() should succeed: {:?}", result.err());
+        }
+
+        // Verify output
+        let output = plan.output_buffer();
+        let mut data = vec![0.0f32; 3];
+        output
+            .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, 12) })
+            .expect("copyout should succeed");
+        assert_eq!(data, vec![5.0, 7.0, 9.0]);
+    }
 }

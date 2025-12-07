@@ -4,25 +4,25 @@
 
 use crate::optimizer::{Scheduler, error::*};
 use morok_ir::{Op, ReduceOp, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Information about a detected matmul pattern.
 #[derive(Debug, Clone)]
 pub struct MatmulPattern {
     /// The REDUCE operation being optimized.
-    pub reduce_op: Rc<UOp>,
+    pub reduce_op: Arc<UOp>,
     /// First input operand (M dimension).
-    pub in0: Rc<UOp>,
+    pub in0: Arc<UOp>,
     /// Second input operand (N dimension).
-    pub in1: Rc<UOp>,
+    pub in1: Arc<UOp>,
     /// Ranges unique to in0 (M dimensions).
-    pub in0_ranges: Vec<Rc<UOp>>,
+    pub in0_ranges: Vec<Arc<UOp>>,
     /// Ranges unique to in1 (N dimensions).
-    pub in1_ranges: Vec<Rc<UOp>>,
+    pub in1_ranges: Vec<Arc<UOp>>,
     /// Reduction ranges (K dimensions).
-    pub red_ranges: Vec<Rc<UOp>>,
+    pub red_ranges: Vec<Arc<UOp>>,
     /// All possible axis choices (N, M, K) combinations.
-    pub axis_choices: Vec<(Rc<UOp>, Rc<UOp>, Rc<UOp>)>,
+    pub axis_choices: Vec<(Arc<UOp>, Arc<UOp>, Arc<UOp>)>,
 }
 
 /// Detect matmul pattern in the scheduler's AST.
@@ -69,14 +69,14 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
             // 7. Find unique ranges (M and N dimensions)
             let mut in0_ranges = Vec::with_capacity(in0_all_ranges.len());
             for r in &in0_all_ranges {
-                if !in1_all_ranges.iter().any(|r2| Rc::ptr_eq(r, r2)) {
+                if !in1_all_ranges.iter().any(|r2| Arc::ptr_eq(r, r2)) {
                     in0_ranges.push(r.clone());
                 }
             }
 
             let mut in1_ranges = Vec::with_capacity(in1_all_ranges.len());
             for r in &in1_all_ranges {
-                if !in0_all_ranges.iter().any(|r2| Rc::ptr_eq(r, r2)) {
+                if !in0_all_ranges.iter().any(|r2| Arc::ptr_eq(r, r2)) {
                     in1_ranges.push(r.clone());
                 }
             }
@@ -121,12 +121,12 @@ pub fn detect_matmul(scheduler: &Scheduler) -> Result<Option<MatmulPattern>, Opt
 }
 
 /// Get all RANGE UOps used by the given UOp (via backward slice).
-fn get_ranges(uop: &Rc<UOp>) -> Vec<Rc<UOp>> {
+fn get_ranges(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     uop.backward_slice().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect()
 }
 
 /// Extract axis_id from a RANGE UOp.
-fn get_axis_id(range: &Rc<UOp>) -> usize {
+fn get_axis_id(range: &Arc<UOp>) -> usize {
     if let Op::Range { axis_id, .. } = range.op() {
         axis_id.value()
     } else {

@@ -103,9 +103,9 @@ impl CompiledKernel for LlvmKernel {
             // No variables - use simple bootstrap function
             type BootstrapFn0 = unsafe extern "C" fn(*const *mut u8);
             let func: JitFunction<BootstrapFn0> = unsafe {
-                self.execution_engine.get_function(&self.entry_point).map_err(|e| {
-                    crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) }
-                })?
+                self.execution_engine
+                    .get_function(&self.entry_point)
+                    .map_err(|e| crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) })?
             };
             unsafe {
                 func.call(buffers.as_ptr());
@@ -119,12 +119,9 @@ impl CompiledKernel for LlvmKernel {
             eprintln!("EXECUTE_WITH_VARS: vars={:?}", vars);
             for i in 1..param_count {
                 if let Some(param) = function.get_nth_param(i as u32) {
-                    let param_name = param
-                        .get_name()
-                        .to_str()
-                        .map_err(|_| crate::Error::JitCompilation {
-                            reason: format!("Invalid UTF-8 in parameter name at index {}", i),
-                        })?;
+                    let param_name = param.get_name().to_str().map_err(|_| crate::Error::JitCompilation {
+                        reason: format!("Invalid UTF-8 in parameter name at index {}", i),
+                    })?;
 
                     eprintln!("EXECUTE_WITH_VARS: param[{}] name='{}', looking up in vars", i, param_name);
                     let value = vars.get(param_name).copied().ok_or_else(|| crate::Error::JitCompilation {

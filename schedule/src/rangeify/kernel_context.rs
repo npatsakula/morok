@@ -1,12 +1,27 @@
 //! Kernel context for tracking state during kernel splitting.
 //!
 //! This module provides the KernelContext struct which tracks buffer allocations,
-//! variable bindings, and range numbering during the kernel splitting phase.
+//! variable bindings, range numbering, and inter-kernel dependencies during
+//! the kernel splitting phase.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{UOp, UOpKey};
+
+/// Represents a dependency between two kernels.
+///
+/// When kernel A writes to a buffer and kernel B reads from that buffer,
+/// kernel B depends on kernel A. This struct captures that relationship.
+#[derive(Clone, Debug)]
+pub struct KernelDependency {
+    /// The DEFINE_GLOBAL UOp ID of the buffer that creates the dependency.
+    pub buffer_id: u64,
+    /// The KERNEL UOp that writes to the buffer (producer).
+    pub producer: Arc<UOp>,
+    /// The KERNEL UOp that reads from the buffer (consumer).
+    pub consumer: Arc<UOp>,
+}
 
 /// Context for tracking state during kernel splitting.
 ///
@@ -17,6 +32,7 @@ use morok_ir::{UOp, UOpKey};
 /// - Buffer replacement mappings (BUFFER → DEFINE_GLOBAL/AFTER)
 /// - Kernel-local variable bindings
 /// - Range renumbering for deduplication
+/// - Inter-kernel dependencies
 #[derive(Clone)]
 pub struct KernelContext {
     /// Counter for DEFINE_GLOBAL numbering.
@@ -38,7 +54,7 @@ pub struct KernelContext {
     ///
     /// This map tracks these replacements so later operations can reference
     /// the correct buffer.
-    pub buffer_map: HashMap<UOpKey, Rc<UOp>>,
+    pub buffer_map: HashMap<UOpKey, Arc<UOp>>,
 
     /// Variable bindings for kernel-local vars.
     ///
@@ -52,12 +68,32 @@ pub struct KernelContext {
     /// This enables deduplication of identical kernels that differ only in
     /// their range IDs.
     pub range_counter: usize,
+
+    /// Dependencies between kernels.
+    ///
+    /// Populated during the dependency resolution phase (Stage 3).
+    /// Each entry represents a producer→consumer relationship via a shared buffer.
+    pub kernel_deps: Vec<KernelDependency>,
 }
 
 impl KernelContext {
     /// Create a new empty kernel context.
     pub fn new() -> Self {
-        Self { global_counter: 0, local_counter: 0, buffer_map: HashMap::new(), vars: HashSet::new(), range_counter: 0 }
+        Self {
+            global_counter: 0,
+            local_counter: 0,
+            buffer_map: HashMap::new(),
+            vars: HashSet::new(),
+            range_counter: 0,
+            kernel_deps: Vec::new(),
+        }
+    }
+
+    /// Add a dependency between two kernels.
+    ///
+    /// Records that `consumer` depends on `producer` via `buffer_id`.
+    pub fn add_dependency(&mut self, buffer_id: u64, producer: Arc<UOp>, consumer: Arc<UOp>) {
+        self.kernel_deps.push(KernelDependency { buffer_id, producer, consumer });
     }
 
     /// Allocate and return the next DEFINE_GLOBAL ID.
@@ -108,27 +144,27 @@ impl KernelContext {
     }
 
     /// Check if a buffer is already mapped.
-    pub fn has_buffer(&self, buf: &Rc<UOp>) -> bool {
+    pub fn has_buffer(&self, buf: &Arc<UOp>) -> bool {
         self.buffer_map.contains_key(&UOpKey(buf.clone()))
     }
 
     /// Get the replacement for a buffer, if it exists.
-    pub fn get_buffer(&self, buf: &Rc<UOp>) -> Option<&Rc<UOp>> {
+    pub fn get_buffer(&self, buf: &Arc<UOp>) -> Option<&Arc<UOp>> {
         self.buffer_map.get(&UOpKey(buf.clone()))
     }
 
     /// Map a buffer to its replacement.
-    pub fn map_buffer(&mut self, original: Rc<UOp>, replacement: Rc<UOp>) {
+    pub fn map_buffer(&mut self, original: Arc<UOp>, replacement: Arc<UOp>) {
         self.buffer_map.insert(UOpKey(original), replacement);
     }
 
     /// Add a variable to the kernel-local variable set.
-    pub fn add_var(&mut self, var: Rc<UOp>) {
+    pub fn add_var(&mut self, var: Arc<UOp>) {
         self.vars.insert(UOpKey(var));
     }
 
     /// Check if a variable is kernel-local.
-    pub fn has_var(&self, var: &Rc<UOp>) -> bool {
+    pub fn has_var(&self, var: &Arc<UOp>) -> bool {
         self.vars.contains(&UOpKey(var.clone()))
     }
 }

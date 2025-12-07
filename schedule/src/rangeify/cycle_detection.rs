@@ -1,7 +1,7 @@
 //! Buffer access cycle detection: validate no LOAD/STORE conflicts in kernels.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{Op, UOp, UOpKey};
 
@@ -15,7 +15,7 @@ pub enum OpAccessType {
 }
 
 /// Unwrap buffer-like ops (MSelect, MStack, After) to get the underlying buffer.
-pub fn as_buf(uop: &Rc<UOp>) -> Rc<UOp> {
+pub fn as_buf(uop: &Arc<UOp>) -> Arc<UOp> {
     match uop.op() {
         Op::MSelect { buffer, .. } => buffer.clone(),
         Op::MStack { buffers } if !buffers.is_empty() => buffers[0].clone(),
@@ -26,7 +26,7 @@ pub fn as_buf(uop: &Rc<UOp>) -> Rc<UOp> {
 
 /// Detect conflicting buffer accesses. Panics if same buffer has both LOAD and STORE.
 #[allow(clippy::mutable_key_type)]
-pub fn find_bufs(store: &Rc<UOp>) -> HashMap<UOpKey, OpAccessType> {
+pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
     let mut ret: HashMap<UOpKey, OpAccessType> = HashMap::new();
 
     // Toposort with gate: exclude AFTER operations from traversal

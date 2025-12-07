@@ -22,17 +22,18 @@
 
 use std::collections::HashMap;
 use std::mem::discriminant;
-use std::rc::Rc;
+use std::sync::Arc;
 
+use crate::types::BufferizeOpts;
+use crate::{AxisId, AxisType, BinaryOp, ConstValue, ConstValueHash, Op, TernaryOp, UOp, UnaryOp};
 use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, ConstValueHash, Op, TernaryOp, UOp, UnaryOp};
 use smallvec::SmallVec;
 
 // ===== Optimized Binding Storage =====
 
 /// Single binding entry: (variable_index, UOp reference).
 /// Uses u8 for index since patterns rarely exceed 255 bindings.
-pub type BindingEntry = (u8, Rc<UOp>);
+pub type BindingEntry = (u8, Arc<UOp>);
 
 /// Stack-allocated binding storage for typical patterns (up to 4 bindings).
 /// Falls back to heap allocation for complex patterns with more bindings.
@@ -76,7 +77,7 @@ impl VarIntern {
     }
 
     /// Convert BindingStore to HashMap (for backward compatibility).
-    pub fn to_hashmap(&self, store: &BindingStore) -> HashMap<String, Rc<UOp>> {
+    pub fn to_hashmap(&self, store: &BindingStore) -> HashMap<String, Arc<UOp>> {
         store
             .iter()
             .filter_map(|(idx, uop)| self.names.get(*idx as usize).map(|name| (name.clone(), uop.clone())))
@@ -97,22 +98,22 @@ impl VarIntern {
 /// Extension methods for BindingStore.
 pub trait BindingStoreExt {
     /// Get binding by index.
-    fn get_by_index(&self, idx: u8) -> Option<&Rc<UOp>>;
+    fn get_by_index(&self, idx: u8) -> Option<&Arc<UOp>>;
 
     /// Insert or update binding at index.
     /// Named `set_binding` to avoid conflict with `SmallVec::insert`.
-    fn set_binding(&mut self, idx: u8, uop: Rc<UOp>);
+    fn set_binding(&mut self, idx: u8, uop: Arc<UOp>);
 
     /// Check if binding exists at index.
     fn contains_index(&self, idx: u8) -> bool;
 }
 
 impl BindingStoreExt for BindingStore {
-    fn get_by_index(&self, idx: u8) -> Option<&Rc<UOp>> {
+    fn get_by_index(&self, idx: u8) -> Option<&Arc<UOp>> {
         self.iter().find(|(i, _)| *i == idx).map(|(_, uop)| uop)
     }
 
-    fn set_binding(&mut self, idx: u8, uop: Rc<UOp>) {
+    fn set_binding(&mut self, idx: u8, uop: Arc<UOp>) {
         // Check for existing entry at this index
         for (i, existing_uop) in self.iter_mut() {
             if *i == idx {
@@ -686,7 +687,7 @@ impl UPat {
     /// # Example
     /// ```ignore
     /// pattern!(patterns,
-    ///     UPat::end_any().named("end_op") => |end_op: &Rc<UOp>| {
+    ///     UPat::end_any().named("end_op") => |end_op: &Arc<UOp>| {
     ///         if let Op::End { computation, ranges } = end_op.op() {
     ///             // handle variable ranges
     ///         }
@@ -797,7 +798,7 @@ impl UPat {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reduce {
                 src: UOp::noop(),
                 ranges: SmallVec::new(),
-                reduce_op: morok_ir::ReduceOp::Add,
+                reduce_op: crate::ReduceOp::Add,
             }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![src])),
@@ -815,7 +816,7 @@ impl UPat {
     /// # Example
     /// ```ignore
     /// pattern!(patterns,
-    ///     UPat::reduce_any().named("reduce_op") => |reduce_op: &Rc<UOp>| {
+    ///     UPat::reduce_any().named("reduce_op") => |reduce_op: &Arc<UOp>| {
     ///         if let Op::Reduce { src, ranges, reduce_op: op } = reduce_op.op() {
     ///             // handle variable ranges
     ///         }
@@ -828,7 +829,7 @@ impl UPat {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reduce {
                 src: UOp::noop(),
                 ranges: SmallVec::new(),
-                reduce_op: morok_ir::ReduceOp::Add,
+                reduce_op: crate::ReduceOp::Add,
             }))]),
             dtype: None,
             src: None, // No source constraint - REDUCE has src + variable ranges
@@ -1158,7 +1159,7 @@ impl UPat {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Bufferize {
                 compute: UOp::noop(),
                 ranges: SmallVec::new(),
-                opts: morok_ir::BufferizeOpts::local(),
+                opts: BufferizeOpts::local(),
             }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![self])),
@@ -1238,7 +1239,7 @@ impl UPat {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Reduce {
                 src: UOp::noop(),
                 ranges: SmallVec::new(),
-                reduce_op: morok_ir::ReduceOp::Add,
+                reduce_op: crate::ReduceOp::Add,
             }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![self])),
@@ -1523,13 +1524,13 @@ impl UPat {
     /// solutions, use `match_uop_fast()` instead.
     ///
     /// Returns `Some(bindings)` if matched, `None` otherwise.
-    pub fn match_first(&self, uop: &Rc<UOp>, intern: &VarIntern) -> Option<BindingStore> {
+    pub fn match_first(&self, uop: &Arc<UOp>, intern: &VarIntern) -> Option<BindingStore> {
         let mut store = BindingStore::new();
         if self.match_first_internal(uop, &mut store, intern) { Some(store) } else { None }
     }
 
     /// Internal single-solution matching. Returns true if matched.
-    fn match_first_internal(&self, uop: &Rc<UOp>, store: &mut BindingStore, intern: &VarIntern) -> bool {
+    fn match_first_internal(&self, uop: &Arc<UOp>, store: &mut BindingStore, intern: &VarIntern) -> bool {
         match self {
             UPat::Any(patterns) => {
                 // Try each pattern, return first match
@@ -1570,7 +1571,7 @@ impl UPat {
                     && let Some(idx) = intern.get_index(n)
                 {
                     if let Some(existing) = store.get_by_index(idx) {
-                        if !Rc::ptr_eq(existing, uop) {
+                        if !Arc::ptr_eq(existing, uop) {
                             return false;
                         }
                     } else {
@@ -1643,7 +1644,7 @@ impl UPat {
 
     /// Try all permutations for single-solution matching.
     fn match_sources_permute_first(
-        children: &SmallVec<[&Rc<UOp>; 4]>,
+        children: &SmallVec<[&Arc<UOp>; 4]>,
         patterns: &[UPat],
         store: &mut BindingStore,
         intern: &VarIntern,
@@ -1715,7 +1716,7 @@ impl UPat {
     /// Try a single permutation for first-match.
     fn try_permutation_first(
         indices: &[usize],
-        children: &SmallVec<[&Rc<UOp>; 4]>,
+        children: &SmallVec<[&Arc<UOp>; 4]>,
         patterns: &[UPat],
         store: &mut BindingStore,
         intern: &VarIntern,
@@ -1732,12 +1733,12 @@ impl UPat {
     ///
     /// Returns all possible variable bindings that satisfy the pattern.
     /// Use with `collect_var_names()` to build the VarIntern first.
-    pub fn match_uop_fast(&self, uop: &Rc<UOp>, intern: &VarIntern) -> Vec<BindingStore> {
+    pub fn match_uop_fast(&self, uop: &Arc<UOp>, intern: &VarIntern) -> Vec<BindingStore> {
         let mut store = BindingStore::new();
         self.match_internal_fast(uop, &mut store, intern)
     }
 
-    fn match_internal_fast(&self, uop: &Rc<UOp>, store: &mut BindingStore, intern: &VarIntern) -> Vec<BindingStore> {
+    fn match_internal_fast(&self, uop: &Arc<UOp>, store: &mut BindingStore, intern: &VarIntern) -> Vec<BindingStore> {
         match self {
             UPat::Any(patterns) => {
                 let mut results = Vec::new();
@@ -1776,7 +1777,7 @@ impl UPat {
                 {
                     if let Some(existing) = store.get_by_index(idx) {
                         // Name already bound - must match same UOp (by pointer equality)
-                        if !Rc::ptr_eq(existing, uop) {
+                        if !Arc::ptr_eq(existing, uop) {
                             return vec![];
                         }
                     } else {
@@ -1833,7 +1834,7 @@ impl UPat {
     }
 
     fn match_sources_tuple_fast(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         patterns: &[UPat],
         store: &mut BindingStore,
         intern: &VarIntern,
@@ -1853,7 +1854,7 @@ impl UPat {
     }
 
     fn match_sources_repeat_fast(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         pattern: &UPat,
         store: &mut BindingStore,
         intern: &VarIntern,
@@ -1871,7 +1872,7 @@ impl UPat {
     }
 
     fn match_sources_permute_fast(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         patterns: &[UPat],
         store: &mut BindingStore,
         intern: &VarIntern,
@@ -1892,7 +1893,7 @@ impl UPat {
             results.extend(matches1);
 
             // Try [1, 0] order: pattern[0] -> children[1], pattern[1] -> children[0]
-            let swapped_children: [&Rc<UOp>; 2] = [children[1], children[0]];
+            let swapped_children: [&Arc<UOp>; 2] = [children[1], children[0]];
             let mut store2 = store.clone();
             let matches2 = Self::match_sources_tuple_fast(&swapped_children, patterns, &mut store2, intern);
             results.extend(matches2);
@@ -1927,7 +1928,7 @@ impl UPat {
     }
 
     fn permute_and_match_fast(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         patterns: &[UPat],
         indices: &[usize],
         store: &BindingStore,
@@ -1941,7 +1942,7 @@ impl UPat {
     }
 
     fn match_sources_tuple_ref_fast(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         patterns: &[&UPat],
         store: &mut BindingStore,
         intern: &VarIntern,
@@ -1966,7 +1967,7 @@ impl UPat {
     ///
     /// Returns all possible variable bindings that satisfy the pattern.
     /// An empty Vec means no match. Multiple bindings can occur with Fork patterns.
-    pub fn match_uop(&self, uop: &Rc<UOp>) -> Vec<HashMap<String, Rc<UOp>>> {
+    pub fn match_uop(&self, uop: &Arc<UOp>) -> Vec<HashMap<String, Arc<UOp>>> {
         let mut store = HashMap::new();
         self.match_internal(uop, &mut store)
     }
@@ -1974,7 +1975,7 @@ impl UPat {
     /// Internal matching implementation.
     ///
     /// Takes a mutable store for accumulating bindings across the match.
-    fn match_internal(&self, uop: &Rc<UOp>, store: &mut HashMap<String, Rc<UOp>>) -> Vec<HashMap<String, Rc<UOp>>> {
+    fn match_internal(&self, uop: &Arc<UOp>, store: &mut HashMap<String, Arc<UOp>>) -> Vec<HashMap<String, Arc<UOp>>> {
         match self {
             UPat::Any(patterns) => {
                 // Try each pattern, collect all successful matches
@@ -2012,7 +2013,7 @@ impl UPat {
                 if let Some(n) = name {
                     if let Some(existing) = store.get(n) {
                         // Name already bound - must match same UOp (by pointer equality)
-                        if !Rc::ptr_eq(existing, uop) {
+                        if !Arc::ptr_eq(existing, uop) {
                             return vec![];
                         }
                     } else {
@@ -2079,10 +2080,10 @@ impl UPat {
 
     /// Match sources against a tuple pattern (fixed list).
     fn match_sources_tuple(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         patterns: &[UPat],
-        store: &mut HashMap<String, Rc<UOp>>,
-    ) -> Vec<HashMap<String, Rc<UOp>>> {
+        store: &mut HashMap<String, Arc<UOp>>,
+    ) -> Vec<HashMap<String, Arc<UOp>>> {
         // Base case: all children matched
         if children.is_empty() {
             return vec![store.clone()];
@@ -2103,10 +2104,10 @@ impl UPat {
 
     /// Match sources against a repeat pattern (all match same pattern).
     fn match_sources_repeat(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         pattern: &UPat,
-        store: &mut HashMap<String, Rc<UOp>>,
-    ) -> Vec<HashMap<String, Rc<UOp>>> {
+        store: &mut HashMap<String, Arc<UOp>>,
+    ) -> Vec<HashMap<String, Arc<UOp>>> {
         // Base case: no children
         if children.is_empty() {
             return vec![store.clone()];
@@ -2130,10 +2131,10 @@ impl UPat {
     /// all successful bindings. This is useful for matching commutative
     /// operations where `x + y` should also match pattern `y + x`.
     fn match_sources_permute(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         patterns: &[UPat],
-        store: &mut HashMap<String, Rc<UOp>>,
-    ) -> Vec<HashMap<String, Rc<UOp>>> {
+        store: &mut HashMap<String, Arc<UOp>>,
+    ) -> Vec<HashMap<String, Arc<UOp>>> {
         // Generate all permutations of pattern indices and try each
         let n = patterns.len();
         let mut results = Vec::new();
@@ -2166,11 +2167,11 @@ impl UPat {
 
     /// Try matching children against patterns using given index permutation.
     fn permute_and_match(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         patterns: &[UPat],
         indices: &[usize],
-        store: &HashMap<String, Rc<UOp>>,
-        results: &mut Vec<HashMap<String, Rc<UOp>>>,
+        store: &HashMap<String, Arc<UOp>>,
+        results: &mut Vec<HashMap<String, Arc<UOp>>>,
     ) {
         // Create permuted pattern list
         let permuted_patterns: Vec<&UPat> = indices.iter().map(|&i| &patterns[i]).collect();
@@ -2183,10 +2184,10 @@ impl UPat {
 
     /// Match sources against a tuple pattern (using references to patterns).
     fn match_sources_tuple_ref(
-        children: &[&Rc<UOp>],
+        children: &[&Arc<UOp>],
         patterns: &[&UPat],
-        store: &mut HashMap<String, Rc<UOp>>,
-    ) -> Vec<HashMap<String, Rc<UOp>>> {
+        store: &mut HashMap<String, Arc<UOp>>,
+    ) -> Vec<HashMap<String, Arc<UOp>>> {
         // Base case: all children matched
         if children.is_empty() {
             return vec![store.clone()];

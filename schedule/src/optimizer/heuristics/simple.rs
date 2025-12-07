@@ -85,6 +85,8 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
             && let morok_ir::ConstValue::Int(size) = cv.0
             && size > 1
             && size <= 32
+            && false
+        // TEMPORARY: disable unroll until codegen supports Unroll axes
         {
             // Map physical axis to logical unroll axis index
             let unroll_axes = scheduler.unrollable_dims();

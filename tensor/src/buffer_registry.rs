@@ -1,24 +1,40 @@
 //! Buffer registry for UOp ID → Buffer mapping.
 //!
-//! This module provides a simple thread-local registry that maps UOp IDs to allocated buffers.
-//! This replaces the global `BUFFERS` thread-local, providing better encapsulation.
+//! This module provides a global concurrent registry that maps UOp IDs to allocated buffers.
+//! Uses papaya's lock-free HashMap for thread-safe access across parallel tensor operations.
+//!
+//! # Thread Safety
+//!
+//! All operations are thread-safe. Multiple threads can allocate and access buffers
+//! concurrently without explicit synchronization.
+//!
+//! # Memory Management
+//!
+//! Buffers live as long as they are in the registry. Call `remove_buffer()` or
+//! `clear_all()` to free them explicitly.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use morok_device::Buffer;
+use papaya::HashMap;
 
 use crate::Result;
 
-thread_local! {
-    /// Maps UOp ID -> Buffer for materialized tensors.
-    ///
-    /// Buffers are NOT weak refs - they live as long as referenced by schedule items
-    /// or until explicitly removed.
-    static BUFFER_MAP: RefCell<HashMap<u64, Buffer>> = RefCell::new(HashMap::new());
+// Global buffer registry using lock-free concurrent HashMap.
+//
+// Maps UOp ID -> Buffer for materialized tensors.
+// Buffers live until explicitly removed via remove_buffer() or clear_all().
+static BUFFERS: OnceLock<HashMap<u64, Buffer>> = OnceLock::new();
+
+fn buffers() -> &'static HashMap<u64, Buffer> {
+    BUFFERS.get_or_init(HashMap::new)
 }
 
 /// Get or create buffer for a UOp.
+///
+/// Thread-safe: if multiple threads call this with the same `uop_id` concurrently,
+/// exactly one will create the buffer (the one whose create_fn succeeds first),
+/// and all others will receive a clone of that buffer.
 ///
 /// # Arguments
 ///
@@ -36,18 +52,37 @@ pub fn get_or_create_buffer<F>(uop_id: u64, create_fn: F) -> Result<Buffer>
 where
     F: FnOnce() -> Result<Buffer>,
 {
-    BUFFER_MAP.with(|map| {
-        if let Some(buf) = map.borrow().get(&uop_id) {
-            return Ok(buf.clone());
-        }
+    let map = buffers();
+    let guard = map.guard();
 
-        let buffer = create_fn()?;
-        map.borrow_mut().insert(uop_id, buffer.clone());
-        Ok(buffer)
-    })
+    // Fast path: buffer already exists
+    if let Some(buf) = map.get(&uop_id, &guard) {
+        return Ok(buf.clone());
+    }
+
+    // Slow path: create buffer (expensive operation)
+    let buffer = create_fn()?;
+
+    // Atomic insert - if another thread beat us, use their buffer
+    // papaya's get_or_insert_with would be cleaner but create_fn is fallible
+    use papaya::{Compute, Operation};
+    match map.compute(
+        uop_id,
+        |entry| match entry {
+            Some((_, existing)) => Operation::Abort(existing.clone()),
+            None => Operation::Insert(buffer.clone()),
+        },
+        &guard,
+    ) {
+        Compute::Inserted(_, buf) => Ok(buf.clone()),
+        Compute::Aborted(buf) => Ok(buf),
+        _ => Ok(buffer),
+    }
 }
 
 /// Get existing buffer (returns None if not found).
+///
+/// Thread-safe read operation.
 ///
 /// # Arguments
 ///
@@ -57,21 +92,27 @@ where
 ///
 /// The buffer if found, None otherwise
 pub fn get_buffer(uop_id: u64) -> Option<Buffer> {
-    BUFFER_MAP.with(|map| map.borrow().get(&uop_id).cloned())
+    let guard = buffers().guard();
+    buffers().get(&uop_id, &guard).cloned()
 }
 
-/// Remove buffer (for explicit cleanup if needed).
+/// Remove buffer (for explicit cleanup).
+///
+/// Thread-safe removal operation.
 ///
 /// # Arguments
 ///
 /// * `uop_id` - The UOp ID to remove
 pub fn remove_buffer(uop_id: u64) {
-    BUFFER_MAP.with(|map| map.borrow_mut().remove(&uop_id));
+    let guard = buffers().guard();
+    buffers().remove(&uop_id, &guard);
 }
 
 /// Clear all buffers from the registry.
 ///
 /// This is primarily useful for testing to ensure test isolation.
+/// Thread-safe.
 pub fn clear_all() {
-    BUFFER_MAP.with(|map| map.borrow_mut().clear());
+    let guard = buffers().guard();
+    buffers().clear(&guard);
 }

@@ -33,7 +33,11 @@ pub trait CompiledKernel {
     /// All buffer pointers must be valid for the duration of kernel execution.
     /// The number and types of buffers must match the kernel's signature.
     /// Variable values must match the kernel's DEFINE_VAR parameters.
-    unsafe fn execute_with_vars(&self, buffers: &[*mut u8], vars: &std::collections::HashMap<String, i64>) -> Result<()>;
+    unsafe fn execute_with_vars(
+        &self,
+        buffers: &[*mut u8],
+        vars: &std::collections::HashMap<String, i64>,
+    ) -> Result<()>;
 
     /// Get the kernel name for debugging/profiling.
     fn name(&self) -> &str;

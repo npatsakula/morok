@@ -2,7 +2,7 @@
 //!
 //! Tests that pattern rewrites preserve semantics and follow algebraic laws.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use proptest::prelude::*;
 
@@ -32,7 +32,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x + 0 should simplify to x");
     }
 
@@ -45,7 +45,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "0 + x should simplify to x");
     }
 
@@ -58,7 +58,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x - 0 should simplify to x");
     }
 
@@ -71,7 +71,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x * 1 should simplify to x");
     }
 
@@ -84,7 +84,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "1 * x should simplify to x");
     }
 
@@ -97,7 +97,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x / 1 should simplify to x");
     }
 
@@ -110,7 +110,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x | 0 should simplify to x");
     }
 
@@ -123,7 +123,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x ^ 0 should simplify to x");
     }
 }
@@ -144,7 +144,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &zero),
+        prop_assert!(Arc::ptr_eq(&simplified, &zero),
             "x * 0 should simplify to 0");
     }
 
@@ -157,7 +157,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &zero),
+        prop_assert!(Arc::ptr_eq(&simplified, &zero),
             "0 * x should simplify to 0");
     }
 
@@ -170,7 +170,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &zero),
+        prop_assert!(Arc::ptr_eq(&simplified, &zero),
             "x & 0 should simplify to 0");
     }
 
@@ -183,7 +183,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &zero),
+        prop_assert!(Arc::ptr_eq(&simplified, &zero),
             "0 & x should simplify to 0");
     }
 }
@@ -219,7 +219,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x & x should simplify to x");
     }
 
@@ -231,7 +231,7 @@ proptest! {
         let matcher = symbolic_simple();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
-        prop_assert!(Rc::ptr_eq(&simplified, &x),
+        prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x | x should simplify to x");
     }
 
@@ -369,7 +369,7 @@ proptest! {
         // We verify this by checking if optimization preserves commutativity
         // by ensuring symmetric simplification
         prop_assert!(
-            (Rc::ptr_eq(&opt_xy, &opt_yx)) ||
+            (Arc::ptr_eq(&opt_xy, &opt_yx)) ||
             (matches!((opt_xy.op(), opt_yx.op()),
                 (Op::Binary(BinaryOp::Add, _, _), Op::Binary(BinaryOp::Add, _, _)))),
             "Addition should commute after optimization"
@@ -389,7 +389,7 @@ proptest! {
 
         // Both should simplify to the same form (ideally to x, but constants may fold differently)
         // The key property is idempotence: applying & with self gives same result
-        prop_assert!(Rc::ptr_eq(&opt1, &opt2) || Rc::ptr_eq(&opt1, &x),
+        prop_assert!(Arc::ptr_eq(&opt1, &opt2) || Arc::ptr_eq(&opt1, &x),
             "x & x should be idempotent: either both simplify to same form or to x");
     }
 }

@@ -53,9 +53,32 @@ impl DeviceSpec {
     pub fn max_buffers(&self) -> Option<usize> {
         match self {
             DeviceSpec::Cpu => None,
-            DeviceSpec::Cuda { .. } => None, // 128+ buffers, effectively unlimited
+            DeviceSpec::Cuda { .. } => Some(128),
             DeviceSpec::Metal { .. } => Some(31),
             DeviceSpec::WebGpu => Some(8),
+        }
+    }
+
+    /// Get the base device type string (strips device ID).
+    ///
+    /// Used for device factory lookup and cache key construction.
+    /// Unlike `canonicalize()`, this returns a static string without device ID.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use morok_dtype::DeviceSpec;
+    ///
+    /// assert_eq!(DeviceSpec::Cpu.base_type(), "CPU");
+    /// assert_eq!(DeviceSpec::Cuda { device_id: 0 }.base_type(), "CUDA");
+    /// assert_eq!(DeviceSpec::Cuda { device_id: 1 }.base_type(), "CUDA");
+    /// ```
+    pub fn base_type(&self) -> &'static str {
+        match self {
+            DeviceSpec::Cpu => "CPU",
+            DeviceSpec::Cuda { .. } => "CUDA",
+            DeviceSpec::Metal { .. } => "METAL",
+            DeviceSpec::WebGpu => "WEBGPU",
         }
     }
 }

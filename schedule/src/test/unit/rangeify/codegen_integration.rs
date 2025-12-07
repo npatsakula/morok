@@ -5,7 +5,7 @@
 //!
 //! Adapted from Tinygrad's test_rangeify.py and test_assign.py.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
@@ -47,7 +47,7 @@ fn test_get_contiguous_in_pipeline() {
     assert!(result.is_some());
 
     let unwrapped = result.unwrap();
-    assert!(Rc::ptr_eq(&unwrapped, &value));
+    assert!(Arc::ptr_eq(&unwrapped, &value));
 }
 
 /// Test that fix_after_broadcast handles AFTER+EXPAND correctly.
@@ -70,7 +70,7 @@ fn test_fix_after_broadcast_in_pipeline() {
 
     let fixed = result.unwrap();
     if let Op::After { passthrough, .. } = fixed.op() {
-        assert!(Rc::ptr_eq(passthrough, &source));
+        assert!(Arc::ptr_eq(passthrough, &source));
     } else {
         panic!("Expected AFTER operation");
     }

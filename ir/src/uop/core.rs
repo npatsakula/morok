@@ -5,23 +5,30 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::op::Op;
 use crate::shape;
 use crate::types::{AxisType, ConstValue};
 use morok_dtype::DType;
 
-/// Wrapper for Rc<UOp> that implements Hash and Eq based on stable ID.
+/// Wrapper for Arc<UOp> that implements Hash and Eq based on stable ID.
 ///
-/// This allows using Rc<UOp> as HashMap keys without implementing
+/// This allows using Arc<UOp> as HashMap keys without implementing
 /// Hash/Eq on UOp itself (which would be problematic due to OnceCell fields).
 ///
 /// Note: While UOp contains OnceCell fields, Hash/Eq are based solely on the
 /// immutable `id` field, making this safe to use as a HashMap key.
 #[allow(clippy::mutable_key_type)]
-#[derive(Clone, Debug)]
-pub struct UOpKey(pub Rc<UOp>);
+#[derive(Clone)]
+pub struct UOpKey(pub Arc<UOp>);
+
+// Custom Debug impl to show only the UOp ID, avoiding recursive printing
+impl std::fmt::Debug for UOpKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UOpKey(id={})", self.0.id)
+    }
+}
 
 impl PartialEq for UOpKey {
     fn eq(&self, other: &Self) -> bool {
@@ -43,7 +50,10 @@ impl Hash for UOpKey {
 /// Hash consing ensures that structurally identical UOps share the same allocation.
 ///
 /// Shape inference is lazy and cached - computed on first access via `shape()` method.
-#[derive(Debug)]
+///
+/// Note: Debug uses derive_more with `#[debug(skip)]` on cache fields to prevent
+/// stack overflow from recursive Arc<UOp> references in caches.
+#[derive(derive_more::Debug)]
 pub struct UOp {
     /// Unique stable ID for this UOp instance.
     /// Used for identity-based caching instead of fragile raw pointers.
@@ -51,21 +61,23 @@ pub struct UOp {
     pub(crate) op: Op,
     pub(crate) dtype: DType,
     /// Cached shape - computed lazily on first access.
-    /// OnceCell provides thread-safe lazy initialization.
-    pub(crate) shape_cache: std::cell::OnceCell<crate::Result<Option<shape::Shape>>>,
+    /// OnceLock provides thread-safe lazy initialization.
+    pub(crate) shape_cache: std::sync::OnceLock<crate::Result<Option<shape::Shape>>>,
     /// Cached list of RANGE operations in this UOp's graph.
     /// Computed lazily via toposort to collect all RANGE ops.
-    pub(crate) ranges_cache: std::cell::OnceCell<Vec<Rc<UOp>>>,
+    #[debug(skip)]
+    pub(crate) ranges_cache: std::sync::OnceLock<Vec<Arc<UOp>>>,
     /// Cached set of RANGE operations that are in scope at this UOp.
     /// Unlike ranges_cache which contains ALL ranges in the graph,
     /// this contains only the ranges that are currently "active" (not yet ended).
     /// Computed lazily based on Tinygrad's ranges property.
     /// Uses UOpKey wrapper to enable Hash/Eq based on UOp ID.
-    pub(crate) in_scope_ranges_cache: std::cell::OnceCell<HashSet<UOpKey>>,
+    #[debug(skip)]
+    pub(crate) in_scope_ranges_cache: std::sync::OnceLock<HashSet<UOpKey>>,
     /// Cached vmin/vmax range analysis values.
     /// Computed lazily via range propagation through the computation graph.
     /// Returns (vmin, vmax) as ConstValue types.
-    pub(crate) vmin_vmax_cache: std::cell::OnceCell<(ConstValue, ConstValue)>,
+    pub(crate) vmin_vmax_cache: std::sync::OnceLock<(ConstValue, ConstValue)>,
     /// Optional metadata attached to this UOp.
     ///
     /// Metadata is NOT part of hash consing - attaching metadata creates a new UOp
@@ -74,6 +86,7 @@ pub struct UOp {
     ///
     /// Uses Arc<dyn Any> to allow attaching any metadata type without circular
     /// dependencies (e.g., schedule::KernelInfo).
+    #[debug(skip)]
     pub(crate) metadata: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
@@ -102,7 +115,7 @@ impl UOp {
     /// let scalar = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     /// assert_eq!(scalar.shape().unwrap().as_ref().map(|s| s.len()), Some(0)); // Scalar has empty shape
     /// ```
-    pub fn shape(self: &Rc<Self>) -> crate::Result<Option<&shape::Shape>> {
+    pub fn shape(self: &Arc<Self>) -> crate::Result<Option<&shape::Shape>> {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::ShapeProperty;
         match ShapeProperty::get(self) {
@@ -124,7 +137,7 @@ impl UOp {
     /// let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     /// assert_eq!(five.vmin(), &ConstValue::Int(5));
     /// ```
-    pub fn vmin(self: &Rc<Self>) -> &ConstValue {
+    pub fn vmin(self: &Arc<Self>) -> &ConstValue {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::VminVmaxProperty;
         &VminVmaxProperty::get(self).0
@@ -143,10 +156,56 @@ impl UOp {
     /// let five = UOp::const_(DType::Int32, ConstValue::Int(5));
     /// assert_eq!(five.vmax(), &ConstValue::Int(5));
     /// ```
-    pub fn vmax(self: &Rc<Self>) -> &ConstValue {
+    pub fn vmax(self: &Arc<Self>) -> &ConstValue {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::VminVmaxProperty;
         &VminVmaxProperty::get(self).1
+    }
+
+    /// Extract device specification from this UOp graph.
+    ///
+    /// Traverses the graph to find Op::Device nodes following Tinygrad's
+    /// `_device` recursive property (ops.py:585-599):
+    /// - DEVICE: returns the DeviceSpec directly
+    /// - BUFFER: returns device from the device child
+    /// - COPY: returns device from the device child (target device)
+    /// - Otherwise: searches children recursively
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use morok_ir::UOp;
+    /// # use morok_dtype::{DType, DeviceSpec};
+    /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
+    /// assert_eq!(buffer.device_spec(), Some(DeviceSpec::Cpu));
+    /// ```
+    pub fn device_spec(&self) -> Option<morok_dtype::DeviceSpec> {
+        match self.op() {
+            Op::Device(spec) => Some(spec.clone()),
+            Op::Buffer { device, .. } => {
+                if let Op::Device(spec) = device.op() {
+                    Some(spec.clone())
+                } else {
+                    None
+                }
+            }
+            Op::Copy { device, .. } => {
+                if let Op::Device(spec) = device.op() {
+                    Some(spec.clone())
+                } else {
+                    None
+                }
+            }
+            _ => {
+                // Search children for device
+                for child in self.op().children() {
+                    if let Some(spec) = child.device_spec() {
+                        return Some(spec);
+                    }
+                }
+                None
+            }
+        }
     }
 
     /// Get the base UOp by walking through movement operations.
@@ -168,9 +227,9 @@ impl UOp {
     /// let reshaped = UOp::try_reshape(buffer.clone(), &shape).unwrap();
     ///
     /// // base() walks through RESHAPE to get the original BUFFER
-    /// assert!(std::rc::Rc::ptr_eq(&reshaped.base(), &buffer));
+    /// assert!(std::sync::Arc::ptr_eq(&reshaped.base(), &buffer));
     /// ```
-    pub fn base(self: &Rc<Self>) -> Rc<Self> {
+    pub fn base(self: &Arc<Self>) -> Arc<Self> {
         match &self.op {
             // Movement operations - recursively get base of source
             Op::Reshape { src, .. }
@@ -188,13 +247,13 @@ impl UOp {
     /// Topological sort of the computation graph.
     ///
     /// Returns nodes in an order where all dependencies come before their dependents.
-    pub fn toposort(self: &Rc<Self>) -> Vec<Rc<Self>> {
+    pub fn toposort(self: &Arc<Self>) -> Vec<Arc<Self>> {
         let mut visited = HashSet::new();
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
         while let Some((node, processed)) = stack.pop() {
-            let ptr = Rc::as_ptr(&node);
+            let ptr = Arc::as_ptr(&node);
 
             if visited.contains(&ptr) {
                 continue;
@@ -209,7 +268,7 @@ impl UOp {
                 // Use for_each_child for zero-allocation traversal
                 let mut children = Vec::new();
                 node.op.map_child(|child| {
-                    if !visited.contains(&Rc::as_ptr(child)) {
+                    if !visited.contains(&Arc::as_ptr(child)) {
                         children.push(child.clone());
                     }
                 });
@@ -248,16 +307,16 @@ impl UOp {
     ///     node.shape_cache.get().is_none()
     /// });
     /// ```
-    pub fn toposort_filtered<F>(self: &Rc<Self>, gate: F) -> Vec<Rc<Self>>
+    pub fn toposort_filtered<F>(self: &Arc<Self>, gate: F) -> Vec<Arc<Self>>
     where
-        F: Fn(&Rc<UOp>) -> bool,
+        F: Fn(&Arc<UOp>) -> bool,
     {
         let mut visited = HashSet::new();
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
 
         while let Some((node, processed)) = stack.pop() {
-            let ptr = Rc::as_ptr(&node);
+            let ptr = Arc::as_ptr(&node);
 
             if visited.contains(&ptr) {
                 continue;
@@ -273,7 +332,7 @@ impl UOp {
 
                     let mut children = Vec::new();
                     node.op.map_child(|child| {
-                        if !visited.contains(&Rc::as_ptr(child)) {
+                        if !visited.contains(&Arc::as_ptr(child)) {
                             children.push(child.clone());
                         }
                     });
@@ -292,7 +351,7 @@ impl UOp {
     /// Get all RANGE operations in this UOp's computation graph.
     ///
     /// Lazily computed and cached. Useful for rangeify pass to track loop variables.
-    pub fn ranges(self: &Rc<Self>) -> &Vec<Rc<Self>> {
+    pub fn ranges(self: &Arc<Self>) -> &Vec<Arc<Self>> {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::RangesProperty;
         RangesProperty::get(self)
@@ -331,7 +390,7 @@ impl UOp {
     /// assert!(!end_op.in_scope_ranges().contains(&range));
     /// ```
     #[allow(clippy::mutable_key_type)]
-    pub fn in_scope_ranges(self: &Rc<Self>) -> &HashSet<UOpKey> {
+    pub fn in_scope_ranges(self: &Arc<Self>) -> &HashSet<UOpKey> {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::InScopeRangesProperty;
         InScopeRangesProperty::get(self)
@@ -342,7 +401,7 @@ impl UOp {
     /// Uses toposort to ensure we process nodes in dependency order,
     /// computing each node's scope from its sources' scopes.
     #[allow(clippy::mutable_key_type)]
-    pub(crate) fn compute_in_scope_ranges(self: &Rc<Self>) -> HashSet<UOpKey> {
+    pub(crate) fn compute_in_scope_ranges(self: &Arc<Self>) -> HashSet<UOpKey> {
         use crate::Op;
 
         // Map from UOp ID to its computed in-scope ranges
@@ -411,7 +470,7 @@ impl UOp {
     /// assert!(!uop.all_in_scope_ranges_are(AxisType::Outer));
     /// ```
     #[allow(clippy::mutable_key_type)]
-    pub fn all_in_scope_ranges_are(self: &Rc<Self>, axis_type: AxisType) -> bool {
+    pub fn all_in_scope_ranges_are(self: &Arc<Self>, axis_type: AxisType) -> bool {
         use crate::Op;
 
         let ranges = self.in_scope_ranges();
@@ -442,7 +501,7 @@ impl UOp {
     ///     return None;  // Don't split here
     /// }
     /// ```
-    pub fn has_non_outer_ranges(self: &Rc<Self>) -> bool {
+    pub fn has_non_outer_ranges(self: &Arc<Self>) -> bool {
         !self.all_in_scope_ranges_are(AxisType::Outer)
     }
 
@@ -451,8 +510,8 @@ impl UOp {
     /// Returns a HashMap where each UOp maps to the list of UOps that consume it.
     /// Useful for reverse traversal and dependency analysis.
     #[allow(clippy::mutable_key_type)]
-    pub fn get_consumer_map(self: &Rc<Self>) -> HashMap<UOpKey, Vec<Rc<Self>>> {
-        let mut consumer_map: HashMap<UOpKey, Vec<Rc<Self>>> = HashMap::new();
+    pub fn get_consumer_map(self: &Arc<Self>) -> HashMap<UOpKey, Vec<Arc<Self>>> {
+        let mut consumer_map: HashMap<UOpKey, Vec<Arc<Self>>> = HashMap::new();
 
         for node in self.toposort() {
             node.op.map_child(|child| {
@@ -468,7 +527,7 @@ impl UOp {
     /// Returns nodes in bottom-up order (leaves first, root last).
     /// Requires a consumer map to traverse from leaves to roots.
     #[allow(clippy::mutable_key_type)]
-    pub fn reverse_toposort(self: &Rc<Self>, consumer_map: &HashMap<UOpKey, Vec<Rc<Self>>>) -> Vec<Rc<Self>> {
+    pub fn reverse_toposort(self: &Arc<Self>, consumer_map: &HashMap<UOpKey, Vec<Arc<Self>>>) -> Vec<Arc<Self>> {
         let mut visited = HashMap::new(); // Use HashMap to track visited by ID
         let mut result = Vec::new();
         let mut stack = vec![(self.clone(), false)];
@@ -503,7 +562,7 @@ impl UOp {
     /// Recursively traverses the graph and replaces any UOp found in the map.
     /// Returns a new UOp with substitutions applied.
     #[allow(clippy::mutable_key_type)]
-    pub fn substitute(self: &Rc<Self>, map: &HashMap<UOpKey, Rc<Self>>) -> Rc<Self> {
+    pub fn substitute(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         use crate::Op;
         use smallvec::SmallVec;
 
@@ -535,115 +594,115 @@ impl UOp {
             // Unary operations
             Op::Unary(op, src) => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Unary(*op, new_src)
             }
             Op::Cast { src, dtype } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Cast { src: new_src, dtype: dtype.clone() }
             }
             Op::BitCast { src, dtype } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::BitCast { src: new_src, dtype: dtype.clone() }
             }
             Op::Reshape { src, new_shape } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Reshape { src: new_src, new_shape: new_shape.clone() }
             }
             Op::Expand { src, new_shape } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Expand { src: new_src, new_shape: new_shape.clone() }
             }
             Op::Permute { src, axes } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Permute { src: new_src, axes: axes.clone() }
             }
             Op::Flip { src, axes } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Flip { src: new_src, axes: axes.clone() }
             }
             Op::Multi { src, axis } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Multi { src: new_src, axis: *axis }
             }
             Op::ReduceAxis { src, reduce_op, axes } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::ReduceAxis { src: new_src, reduce_op: *reduce_op, axes: axes.clone() }
             }
             Op::MSelect { buffer, device_index } => {
                 let new_buffer = buffer.substitute(map);
-                if Rc::ptr_eq(&new_buffer, buffer) {
+                if Arc::ptr_eq(&new_buffer, buffer) {
                     return self.clone();
                 }
                 Op::MSelect { buffer: new_buffer, device_index: *device_index }
             }
             Op::Special { name, end } => {
                 let new_end = end.substitute(map);
-                if Rc::ptr_eq(&new_end, end) {
+                if Arc::ptr_eq(&new_end, end) {
                     return self.clone();
                 }
                 Op::Special { name: name.clone(), end: new_end }
             }
             Op::BufferView { buffer, size, offset } => {
                 let new_buffer = buffer.substitute(map);
-                if Rc::ptr_eq(&new_buffer, buffer) {
+                if Arc::ptr_eq(&new_buffer, buffer) {
                     return self.clone();
                 }
                 Op::BufferView { buffer: new_buffer, size: *size, offset: *offset }
             }
             Op::Gep { vector, indices } => {
                 let new_vector = vector.substitute(map);
-                if Rc::ptr_eq(&new_vector, vector) {
+                if Arc::ptr_eq(&new_vector, vector) {
                     return self.clone();
                 }
                 Op::Gep { vector: new_vector, indices: indices.clone() }
             }
             Op::Range { end, axis_id, axis_type } => {
                 let new_end = end.substitute(map);
-                if Rc::ptr_eq(&new_end, end) {
+                if Arc::ptr_eq(&new_end, end) {
                     return self.clone();
                 }
                 Op::Range { end: new_end, axis_id: *axis_id, axis_type: *axis_type }
             }
             Op::EndIf { if_op } => {
                 let new_if_op = if_op.substitute(map);
-                if Rc::ptr_eq(&new_if_op, if_op) {
+                if Arc::ptr_eq(&new_if_op, if_op) {
                     return self.clone();
                 }
                 Op::EndIf { if_op: new_if_op }
             }
             Op::End { computation, ranges } => {
                 let new_comp = computation.substitute(map);
-                let new_ranges: SmallVec<[Rc<UOp>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
+                let new_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
 
-                if Rc::ptr_eq(&new_comp, computation)
-                    && new_ranges.iter().zip(ranges.iter()).all(|(a, b)| Rc::ptr_eq(a, b))
+                if Arc::ptr_eq(&new_comp, computation)
+                    && new_ranges.iter().zip(ranges.iter()).all(|(a, b)| Arc::ptr_eq(a, b))
                 {
                     return self.clone();
                 }
@@ -651,42 +710,42 @@ impl UOp {
             }
             Op::Contract { src, upcast_ranges } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Contract { src: new_src, upcast_ranges: upcast_ranges.clone() }
             }
             Op::Unroll { src, unroll_axes } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Unroll { src: new_src, unroll_axes: unroll_axes.clone() }
             }
             Op::Detach { src } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Detach { src: new_src }
             }
             Op::Contiguous { src } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Contiguous { src: new_src }
             }
             Op::ContiguousBackward { src } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::ContiguousBackward { src: new_src }
             }
             Op::Precast { src } => {
                 let new_src = src.substitute(map);
-                if Rc::ptr_eq(&new_src, src) {
+                if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
                 Op::Precast { src: new_src }
@@ -696,7 +755,7 @@ impl UOp {
             Op::Binary(op, lhs, rhs) => {
                 let new_lhs = lhs.substitute(map);
                 let new_rhs = rhs.substitute(map);
-                if Rc::ptr_eq(&new_lhs, lhs) && Rc::ptr_eq(&new_rhs, rhs) {
+                if Arc::ptr_eq(&new_lhs, lhs) && Arc::ptr_eq(&new_rhs, rhs) {
                     return self.clone();
                 }
                 Op::Binary(*op, new_lhs, new_rhs)
@@ -704,7 +763,7 @@ impl UOp {
             Op::Buffer { unique, device, size } => {
                 let new_unique = unique.substitute(map);
                 let new_device = device.substitute(map);
-                if Rc::ptr_eq(&new_unique, unique) && Rc::ptr_eq(&new_device, device) {
+                if Arc::ptr_eq(&new_unique, unique) && Arc::ptr_eq(&new_device, device) {
                     return self.clone();
                 }
                 Op::Buffer { unique: new_unique, device: new_device, size: *size }
@@ -712,7 +771,7 @@ impl UOp {
             Op::PointerIndex { ptr, offset } => {
                 let new_ptr = ptr.substitute(map);
                 let new_offset = offset.substitute(map);
-                if Rc::ptr_eq(&new_ptr, ptr) && Rc::ptr_eq(&new_offset, offset) {
+                if Arc::ptr_eq(&new_ptr, ptr) && Arc::ptr_eq(&new_offset, offset) {
                     return self.clone();
                 }
                 Op::PointerIndex { ptr: new_ptr, offset: new_offset }
@@ -720,7 +779,7 @@ impl UOp {
             Op::Copy { src, device } => {
                 let new_src = src.substitute(map);
                 let new_device = device.substitute(map);
-                if Rc::ptr_eq(&new_src, src) && Rc::ptr_eq(&new_device, device) {
+                if Arc::ptr_eq(&new_src, src) && Arc::ptr_eq(&new_device, device) {
                     return self.clone();
                 }
                 Op::Copy { src: new_src, device: new_device }
@@ -728,7 +787,7 @@ impl UOp {
             Op::AllReduce { src, device, reduce_op } => {
                 let new_src = src.substitute(map);
                 let new_device = device.substitute(map);
-                if Rc::ptr_eq(&new_src, src) && Rc::ptr_eq(&new_device, device) {
+                if Arc::ptr_eq(&new_src, src) && Arc::ptr_eq(&new_device, device) {
                     return self.clone();
                 }
                 Op::AllReduce { src: new_src, device: new_device, reduce_op: *reduce_op }
@@ -736,7 +795,7 @@ impl UOp {
             Op::Bind { var, value } => {
                 let new_var = var.substitute(map);
                 let new_value = value.substitute(map);
-                if Rc::ptr_eq(&new_var, var) && Rc::ptr_eq(&new_value, value) {
+                if Arc::ptr_eq(&new_var, var) && Arc::ptr_eq(&new_value, value) {
                     return self.clone();
                 }
                 Op::Bind { var: new_var, value: new_value }
@@ -744,7 +803,7 @@ impl UOp {
             Op::Assign { target, value } => {
                 let new_target = target.substitute(map);
                 let new_value = value.substitute(map);
-                if Rc::ptr_eq(&new_target, target) && Rc::ptr_eq(&new_value, value) {
+                if Arc::ptr_eq(&new_target, target) && Arc::ptr_eq(&new_value, value) {
                     return self.clone();
                 }
                 Op::Assign { target: new_target, value: new_value }
@@ -752,7 +811,7 @@ impl UOp {
             Op::Load { buffer, index } => {
                 let new_buffer = buffer.substitute(map);
                 let new_index = index.substitute(map);
-                if Rc::ptr_eq(&new_buffer, buffer) && Rc::ptr_eq(&new_index, index) {
+                if Arc::ptr_eq(&new_buffer, buffer) && Arc::ptr_eq(&new_index, index) {
                     return self.clone();
                 }
                 Op::Load { buffer: new_buffer, index: new_index }
@@ -763,7 +822,7 @@ impl UOp {
                 let new_a = a.substitute(map);
                 let new_b = b.substitute(map);
                 let new_c = c.substitute(map);
-                if Rc::ptr_eq(&new_a, a) && Rc::ptr_eq(&new_b, b) && Rc::ptr_eq(&new_c, c) {
+                if Arc::ptr_eq(&new_a, a) && Arc::ptr_eq(&new_b, b) && Arc::ptr_eq(&new_c, c) {
                     return self.clone();
                 }
                 Op::Ternary(*op, new_a, new_b, new_c)
@@ -772,7 +831,8 @@ impl UOp {
                 let new_src = src.substitute(map);
                 let new_begin = begin_pads.substitute(map);
                 let new_end = end_pads.substitute(map);
-                if Rc::ptr_eq(&new_src, src) && Rc::ptr_eq(&new_begin, begin_pads) && Rc::ptr_eq(&new_end, end_pads) {
+                if Arc::ptr_eq(&new_src, src) && Arc::ptr_eq(&new_begin, begin_pads) && Arc::ptr_eq(&new_end, end_pads)
+                {
                     return self.clone();
                 }
                 Op::Pad { src: new_src, begin_pads: new_begin, end_pads: new_end }
@@ -781,7 +841,7 @@ impl UOp {
                 let new_src = src.substitute(map);
                 let new_begins = begins.substitute(map);
                 let new_ends = ends.substitute(map);
-                if Rc::ptr_eq(&new_src, src) && Rc::ptr_eq(&new_begins, begins) && Rc::ptr_eq(&new_ends, ends) {
+                if Arc::ptr_eq(&new_src, src) && Arc::ptr_eq(&new_begins, begins) && Arc::ptr_eq(&new_ends, ends) {
                     return self.clone();
                 }
                 Op::Shrink { src: new_src, begins: new_begins, ends: new_ends }
@@ -790,7 +850,7 @@ impl UOp {
                 let new_a = a.substitute(map);
                 let new_b = b.substitute(map);
                 let new_c = c.substitute(map);
-                if Rc::ptr_eq(&new_a, a) && Rc::ptr_eq(&new_b, b) && Rc::ptr_eq(&new_c, c) {
+                if Arc::ptr_eq(&new_a, a) && Arc::ptr_eq(&new_b, b) && Arc::ptr_eq(&new_c, c) {
                     return self.clone();
                 }
                 Op::Wmma { a: new_a, b: new_b, c: new_c, metadata: metadata.clone() }
@@ -799,7 +859,7 @@ impl UOp {
                 let new_buffer = buffer.substitute(map);
                 let new_index = index.substitute(map);
                 let new_gate = gate.substitute(map);
-                if Rc::ptr_eq(&new_buffer, buffer) && Rc::ptr_eq(&new_index, index) && Rc::ptr_eq(&new_gate, gate) {
+                if Arc::ptr_eq(&new_buffer, buffer) && Arc::ptr_eq(&new_index, index) && Arc::ptr_eq(&new_gate, gate) {
                     return self.clone();
                 }
                 Op::LoadGated { buffer: new_buffer, index: new_index, gate: new_gate }
@@ -808,7 +868,8 @@ impl UOp {
                 let new_buffer = buffer.substitute(map);
                 let new_index = index.substitute(map);
                 let new_value = value.substitute(map);
-                if Rc::ptr_eq(&new_buffer, buffer) && Rc::ptr_eq(&new_index, index) && Rc::ptr_eq(&new_value, value) {
+                if Arc::ptr_eq(&new_buffer, buffer) && Arc::ptr_eq(&new_index, index) && Arc::ptr_eq(&new_value, value)
+                {
                     return self.clone();
                 }
                 Op::Store { buffer: new_buffer, index: new_index, value: new_value }
@@ -818,10 +879,10 @@ impl UOp {
                 let new_index = index.substitute(map);
                 let new_value = value.substitute(map);
                 let new_gate = gate.substitute(map);
-                if Rc::ptr_eq(&new_buffer, buffer)
-                    && Rc::ptr_eq(&new_index, index)
-                    && Rc::ptr_eq(&new_value, value)
-                    && Rc::ptr_eq(&new_gate, gate)
+                if Arc::ptr_eq(&new_buffer, buffer)
+                    && Arc::ptr_eq(&new_index, index)
+                    && Arc::ptr_eq(&new_value, value)
+                    && Arc::ptr_eq(&new_gate, gate)
                 {
                     return self.clone();
                 }
@@ -830,24 +891,24 @@ impl UOp {
 
             // Variable-arity operations
             Op::Sink { sources } => {
-                let new_sources: SmallVec<[Rc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
-                if sources.iter().zip(&new_sources).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
+                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
                     return self.clone();
                 }
                 Op::Sink { sources: new_sources }
             }
             Op::Group { sources } => {
-                let new_sources: SmallVec<[Rc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
-                if sources.iter().zip(&new_sources).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
+                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
                     return self.clone();
                 }
                 Op::Group { sources: new_sources }
             }
             Op::Bufferize { compute, ranges, opts } => {
                 let new_compute = compute.substitute(map);
-                let new_ranges: SmallVec<[Rc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
-                if Rc::ptr_eq(&new_compute, compute)
-                    && ranges.iter().zip(&new_ranges).all(|(old, new)| Rc::ptr_eq(old, new))
+                let new_ranges: SmallVec<[Arc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
+                if Arc::ptr_eq(&new_compute, compute)
+                    && ranges.iter().zip(&new_ranges).all(|(old, new)| Arc::ptr_eq(old, new))
                 {
                     return self.clone();
                 }
@@ -855,15 +916,15 @@ impl UOp {
             }
             Op::Index { buffer, indices, gate } => {
                 let new_buffer = buffer.substitute(map);
-                let new_indices: SmallVec<[Rc<Self>; 4]> = indices.iter().map(|i| i.substitute(map)).collect();
+                let new_indices: SmallVec<[Arc<Self>; 4]> = indices.iter().map(|i| i.substitute(map)).collect();
                 let new_gate = gate.as_ref().map(|g| g.substitute(map));
                 let gate_unchanged = match (gate, &new_gate) {
                     (None, None) => true,
-                    (Some(old), Some(new)) => Rc::ptr_eq(old, new),
+                    (Some(old), Some(new)) => Arc::ptr_eq(old, new),
                     _ => false,
                 };
-                if Rc::ptr_eq(&new_buffer, buffer)
-                    && indices.iter().zip(&new_indices).all(|(old, new)| Rc::ptr_eq(old, new))
+                if Arc::ptr_eq(&new_buffer, buffer)
+                    && indices.iter().zip(&new_indices).all(|(old, new)| Arc::ptr_eq(old, new))
                     && gate_unchanged
                 {
                     return self.clone();
@@ -872,17 +933,18 @@ impl UOp {
             }
             Op::Reduce { src, reduce_op, ranges } => {
                 let new_src = src.substitute(map);
-                let new_ranges: SmallVec<[Rc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
-                if Rc::ptr_eq(&new_src, src) && ranges.iter().zip(&new_ranges).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_ranges: SmallVec<[Arc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
+                if Arc::ptr_eq(&new_src, src) && ranges.iter().zip(&new_ranges).all(|(old, new)| Arc::ptr_eq(old, new))
+                {
                     return self.clone();
                 }
                 Op::Reduce { src: new_src, reduce_op: *reduce_op, ranges: new_ranges }
             }
             Op::If { condition, body } => {
                 let new_condition = condition.substitute(map);
-                let new_body: SmallVec<[Rc<Self>; 4]> = body.iter().map(|b| b.substitute(map)).collect();
-                if Rc::ptr_eq(&new_condition, condition)
-                    && body.iter().zip(&new_body).all(|(old, new)| Rc::ptr_eq(old, new))
+                let new_body: SmallVec<[Arc<Self>; 4]> = body.iter().map(|b| b.substitute(map)).collect();
+                if Arc::ptr_eq(&new_condition, condition)
+                    && body.iter().zip(&new_body).all(|(old, new)| Arc::ptr_eq(old, new))
                 {
                     return self.clone();
                 }
@@ -890,45 +952,46 @@ impl UOp {
             }
             Op::Barrier { src, deps } => {
                 let new_src = src.substitute(map);
-                let new_deps: SmallVec<[Rc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
-                if Rc::ptr_eq(&new_src, src) && deps.iter().zip(&new_deps).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_deps: SmallVec<[Arc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
+                if Arc::ptr_eq(&new_src, src) && deps.iter().zip(&new_deps).all(|(old, new)| Arc::ptr_eq(old, new)) {
                     return self.clone();
                 }
                 Op::Barrier { src: new_src, deps: new_deps }
             }
             Op::Vectorize { elements } => {
-                let new_elements: SmallVec<[Rc<Self>; 4]> = elements.iter().map(|e| e.substitute(map)).collect();
-                if elements.iter().zip(&new_elements).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_elements: SmallVec<[Arc<Self>; 4]> = elements.iter().map(|e| e.substitute(map)).collect();
+                if elements.iter().zip(&new_elements).all(|(old, new)| Arc::ptr_eq(old, new)) {
                     return self.clone();
                 }
                 Op::Vectorize { elements: new_elements }
             }
             Op::Cat { sources } => {
-                let new_sources: SmallVec<[Rc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
-                if sources.iter().zip(&new_sources).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
+                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
                     return self.clone();
                 }
                 Op::Cat { sources: new_sources }
             }
             Op::PtrCat { sources } => {
-                let new_sources: SmallVec<[Rc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
-                if sources.iter().zip(&new_sources).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
+                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
                     return self.clone();
                 }
                 Op::PtrCat { sources: new_sources }
             }
             Op::MStack { buffers } => {
-                let new_buffers: SmallVec<[Rc<Self>; 4]> = buffers.iter().map(|b| b.substitute(map)).collect();
-                if buffers.iter().zip(&new_buffers).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_buffers: SmallVec<[Arc<Self>; 4]> = buffers.iter().map(|b| b.substitute(map)).collect();
+                if buffers.iter().zip(&new_buffers).all(|(old, new)| Arc::ptr_eq(old, new)) {
                     return self.clone();
                 }
                 Op::MStack { buffers: new_buffers }
             }
             Op::Kernel { sources, ast } => {
-                let new_sources: SmallVec<[Rc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
+                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
                 let new_ast = ast.substitute(map);
 
-                if sources.iter().zip(&new_sources).all(|(old, new)| Rc::ptr_eq(old, new)) && Rc::ptr_eq(&new_ast, ast)
+                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new))
+                    && Arc::ptr_eq(&new_ast, ast)
                 {
                     return self.clone();
                 }
@@ -936,24 +999,24 @@ impl UOp {
             }
             Op::After { passthrough, deps } => {
                 let new_passthrough = passthrough.substitute(map);
-                let new_deps: SmallVec<[Rc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
-                if Rc::ptr_eq(&new_passthrough, passthrough)
-                    && deps.iter().zip(&new_deps).all(|(old, new)| Rc::ptr_eq(old, new))
+                let new_deps: SmallVec<[Arc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
+                if Arc::ptr_eq(&new_passthrough, passthrough)
+                    && deps.iter().zip(&new_deps).all(|(old, new)| Arc::ptr_eq(old, new))
                 {
                     return self.clone();
                 }
                 Op::After { passthrough: new_passthrough, deps: new_deps }
             }
             Op::Custom { code, deps } => {
-                let new_deps: SmallVec<[Rc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
-                if deps.iter().zip(&new_deps).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_deps: SmallVec<[Arc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
+                if deps.iter().zip(&new_deps).all(|(old, new)| Arc::ptr_eq(old, new)) {
                     return self.clone();
                 }
                 Op::Custom { code: code.clone(), deps: new_deps }
             }
             Op::CustomI { code, deps } => {
-                let new_deps: SmallVec<[Rc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
-                if deps.iter().zip(&new_deps).all(|(old, new)| Rc::ptr_eq(old, new)) {
+                let new_deps: SmallVec<[Arc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
+                if deps.iter().zip(&new_deps).all(|(old, new)| Arc::ptr_eq(old, new)) {
                     return self.clone();
                 }
                 Op::CustomI { code: code.clone(), deps: new_deps }
@@ -1005,7 +1068,7 @@ impl UOp {
     /// // Rewrite sources: a' + b'
     /// let new_add = add.with_sources(vec![a_prime, b_prime]);
     /// ```
-    pub fn with_sources(self: &Rc<Self>, new_srcs: Vec<Rc<Self>>) -> Rc<Self> {
+    pub fn with_sources(self: &Arc<Self>, new_srcs: Vec<Arc<Self>>) -> Arc<Self> {
         use smallvec::SmallVec;
 
         // Helper to get nth source
@@ -1084,10 +1147,10 @@ impl UOp {
                 let buffer = src(0);
                 let (indices, gate_new) = if gate.is_some() && new_srcs.len() >= 2 {
                     let gate_src = new_srcs.last().unwrap().clone();
-                    let indices: SmallVec<[Rc<Self>; 4]> = new_srcs[1..new_srcs.len() - 1].iter().cloned().collect();
+                    let indices: SmallVec<[Arc<Self>; 4]> = new_srcs[1..new_srcs.len() - 1].iter().cloned().collect();
                     (indices, Some(gate_src))
                 } else {
-                    let indices: SmallVec<[Rc<Self>; 4]> = new_srcs[1..].iter().cloned().collect();
+                    let indices: SmallVec<[Arc<Self>; 4]> = new_srcs[1..].iter().cloned().collect();
                     (indices, None)
                 };
                 Op::Index { buffer, indices, gate: gate_new }
@@ -1276,10 +1339,10 @@ impl Clone for UOp {
             id: self.id,
             op: self.op.clone(),
             dtype: self.dtype.clone(),
-            shape_cache: std::cell::OnceCell::new(),
-            ranges_cache: std::cell::OnceCell::new(),
-            in_scope_ranges_cache: std::cell::OnceCell::new(),
-            vmin_vmax_cache: std::cell::OnceCell::new(),
+            shape_cache: std::sync::OnceLock::new(),
+            ranges_cache: std::sync::OnceLock::new(),
+            in_scope_ranges_cache: std::sync::OnceLock::new(),
+            vmin_vmax_cache: std::sync::OnceLock::new(),
             metadata: self.metadata.clone(),
         }
     }
@@ -1290,53 +1353,53 @@ impl Clone for UOp {
 /// This allows operator overloading to work with mixed scalar/UOp operands.
 /// For example: `uop + 5.0` or `5.0 + uop`.
 pub trait IntoUOp {
-    fn into_uop(self, dtype: DType) -> Rc<UOp>;
+    fn into_uop(self, dtype: DType) -> Arc<UOp>;
 }
 
 impl IntoUOp for ConstValue {
-    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+    fn into_uop(self, dtype: DType) -> Arc<UOp> {
         UOp::const_(dtype, self)
     }
 }
 
 impl IntoUOp for f32 {
-    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+    fn into_uop(self, dtype: DType) -> Arc<UOp> {
         UOp::const_(dtype, ConstValue::Float(self as f64))
     }
 }
 
 impl IntoUOp for f64 {
-    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+    fn into_uop(self, dtype: DType) -> Arc<UOp> {
         UOp::const_(dtype, ConstValue::Float(self))
     }
 }
 
 impl IntoUOp for i32 {
-    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+    fn into_uop(self, dtype: DType) -> Arc<UOp> {
         UOp::const_(dtype, ConstValue::Int(self as i64))
     }
 }
 
 impl IntoUOp for i64 {
-    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+    fn into_uop(self, dtype: DType) -> Arc<UOp> {
         UOp::const_(dtype, ConstValue::Int(self))
     }
 }
 
 impl IntoUOp for u32 {
-    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+    fn into_uop(self, dtype: DType) -> Arc<UOp> {
         UOp::const_(dtype, ConstValue::UInt(self as u64))
     }
 }
 
 impl IntoUOp for u64 {
-    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+    fn into_uop(self, dtype: DType) -> Arc<UOp> {
         UOp::const_(dtype, ConstValue::UInt(self))
     }
 }
 
 impl IntoUOp for bool {
-    fn into_uop(self, dtype: DType) -> Rc<UOp> {
+    fn into_uop(self, dtype: DType) -> Arc<UOp> {
         UOp::const_(dtype, ConstValue::Bool(self))
     }
 }

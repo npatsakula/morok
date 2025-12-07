@@ -8,7 +8,7 @@
 //!
 //! Based on Tinygrad's rangeify_codegen PatternMatcher (schedule/rangeify.py:440-465).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp, UOpKey};
@@ -49,7 +49,7 @@ use crate::pattern::matcher::PatternMatcher;
 /// def remove_noop(x:UOp) -> UOp|None:
 ///   if x.op is Ops.NOOP: return x.dtype.base.vec(x.dtype.count) if x.dtype.count > 1 else x.dtype.base.as_const(0)
 /// ```
-pub fn remove_noop(noop: &Rc<UOp>) -> Option<Rc<UOp>> {
+pub fn remove_noop(noop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Only match NOOP operations
     if !matches!(noop.op(), Op::Noop) {
         return None;
@@ -71,7 +71,7 @@ pub fn remove_noop(noop: &Rc<UOp>) -> Option<Rc<UOp>> {
         let zero_value = ConstValue::zero(base);
 
         // Create a vector of zeros using vectorize
-        let zeros: SmallVec<[Rc<UOp>; 4]> = (0..count).map(|_| UOp::const_(DType::Scalar(base), zero_value)).collect();
+        let zeros: SmallVec<[Arc<UOp>; 4]> = (0..count).map(|_| UOp::const_(DType::Scalar(base), zero_value)).collect();
 
         return Some(UOp::vectorize(zeros));
     }
@@ -107,7 +107,7 @@ pub fn remove_noop(noop: &Rc<UOp>) -> Option<Rc<UOp>> {
 /// def get_contiguous(x:UOp) -> UOp|None:
 ///   if x.op is Ops.CONTIGUOUS: return x.src[0]
 /// ```
-pub fn get_contiguous(contiguous: &Rc<UOp>) -> Option<Rc<UOp>> {
+pub fn get_contiguous(contiguous: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Only match CONTIGUOUS operations
     if !matches!(contiguous.op(), Op::Contiguous { .. }) {
         return None;
@@ -153,7 +153,7 @@ pub fn get_contiguous(contiguous: &Rc<UOp>) -> Option<Rc<UOp>> {
 /// ```
 ///
 /// Note: We use EXPAND instead of BROADCAST (they're equivalent in our IR).
-pub fn fix_after_broadcast(after: &Rc<UOp>) -> Option<Rc<UOp>> {
+pub fn fix_after_broadcast(after: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Only match AFTER operations
     let (passthrough, deps) = match after.op() {
         Op::After { passthrough, deps } => (passthrough, deps),
@@ -186,6 +186,142 @@ pub fn fix_after_broadcast(after: &Rc<UOp>) -> Option<Rc<UOp>> {
     Some(new_after)
 }
 
+/// Linearize multi-index INDEX to single-index INDEX.
+///
+/// Pattern: INDEX(buffer, [idx0, idx1, ...]) with len(indices) > 1
+/// Result:  INDEX(buffer, [linear_offset])
+/// where linear_offset = idx0*stride0 + idx1*stride1 + ...
+///
+/// For row-major (C-style) layout, strides are computed as:
+///   stride[i] = prod(dims[i+1:])
+///   stride[last] = 1
+///
+/// Dimension sizes are extracted from RANGE operations (their 'end' value).
+///
+/// # Arguments
+///
+/// * `idx` - The INDEX operation to linearize
+///
+/// # Returns
+///
+/// * `Some(linearized_index)` - Single-index INDEX with linear offset
+/// * `None` - If not a multi-index INDEX or if linearization fails
+///
+/// # Example
+///
+/// ```ignore
+/// // 2D case: buffer[i][j] with shape [4, 5]
+/// // Before: INDEX(buffer, [range(4), range(5)])
+/// // After:  INDEX(buffer, [i*5 + j])
+/// ```
+///
+/// Based on Tinygrad's pm_syntactic_sugar pattern for INDEX linearization.
+pub fn linearize_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Index { buffer, indices, gate } = idx.op() else {
+        return None;
+    };
+
+    // Only transform multi-index case
+    if indices.len() <= 1 {
+        return None;
+    }
+
+    // Extract dimension sizes from each index (RANGE operations have 'end' value)
+    let dims: Vec<i64> = indices
+        .iter()
+        .map(|idx_uop| {
+            if let Op::Range { end, .. } = idx_uop.op()
+                && let Op::Const(cv) = end.op()
+                && let ConstValue::Int(size) = cv.0
+            {
+                return size;
+            }
+            // Fallback: assume dimension size 1 (conservative)
+            1
+        })
+        .collect();
+
+    // Compute strides (row-major): stride[i] = prod(dims[i+1:])
+    let mut strides = vec![1i64; dims.len()];
+    for i in (0..dims.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * dims[i + 1];
+    }
+
+    // Build linear offset: sum(indices[i] * strides[i])
+    let mut linear = UOp::index_const(0);
+    for (idx_uop, &stride) in indices.iter().zip(strides.iter()) {
+        let stride_uop = UOp::index_const(stride);
+        let term = idx_uop.try_mul(&stride_uop).ok()?;
+        linear = linear.try_add(&term).ok()?;
+    }
+
+    // Create single-index INDEX
+    match gate {
+        Some(g) => UOp::index_gated(buffer.clone(), vec![linear], g.clone()).ok(),
+        None => UOp::index(buffer.clone(), vec![linear]).ok(),
+    }
+}
+
+/// Check if an INDEX operation has multiple indices.
+fn has_multiple_indices(idx: &Arc<UOp>) -> bool {
+    if let Op::Index { indices, .. } = idx.op() { indices.len() > 1 } else { false }
+}
+
+/// Flatten cascaded INDEX operations (INDEX of INDEX).
+///
+/// Pattern: INDEX(INDEX(buffer, [idx0]), [idx1])
+/// Result:  INDEX(buffer, [idx0 + idx1])
+///
+/// This pattern handles the case where reshape creates nested INDEX operations.
+/// After linearization, each INDEX has a single index, so we can simply add them.
+///
+/// # Arguments
+///
+/// * `idx` - The outer INDEX operation
+///
+/// # Returns
+///
+/// * `Some(flattened_index)` - Single INDEX with combined offset
+/// * `None` - If not a cascaded INDEX pattern
+///
+/// Based on Tinygrad's pm_syntactic_sugar pattern for INDEX concatenation.
+pub fn flatten_cascaded_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Index { buffer: inner_idx, indices: outer_indices, gate: outer_gate } = idx.op() else {
+        return None;
+    };
+
+    // Check if buffer is itself an INDEX
+    let Op::Index { buffer: real_buffer, indices: inner_indices, gate: inner_gate } = inner_idx.op() else {
+        return None;
+    };
+
+    // Both indices should be single-element after linearization
+    if outer_indices.len() != 1 || inner_indices.len() != 1 {
+        return None;
+    }
+
+    // Combine gates (if any) - for now, require both to be ungated
+    if outer_gate.is_some() || inner_gate.is_some() {
+        return None;
+    }
+
+    // The inner INDEX already has the correct linear offset from RESHAPE transformation.
+    // The outer INDEX's offset is from the consumer's range iteration, which is redundant
+    // because the RESHAPE transformation already computed the linear index from those same ranges.
+    //
+    // We should use ONLY the inner offset, not add them together.
+    // Adding them would cause double-counting: the RESHAPE index + the iteration index.
+    let inner_offset = &inner_indices[0];
+
+    // Create single INDEX with just the inner offset
+    UOp::index(real_buffer.clone(), vec![inner_offset.clone()]).ok()
+}
+
+/// Check if an INDEX has another INDEX as its buffer.
+fn is_cascaded_index(idx: &Arc<UOp>) -> bool {
+    if let Op::Index { buffer, .. } = idx.op() { matches!(buffer.op(), Op::Index { .. }) } else { false }
+}
+
 /// Convert value-returning INDEX to LOAD operation.
 ///
 /// Pattern: INDEX(DEFINE_GLOBAL|DEFINE_LOCAL, indices) where dtype is NOT a pointer
@@ -212,7 +348,7 @@ pub fn fix_after_broadcast(after: &Rc<UOp>) -> Option<Rc<UOp>> {
 /// ```
 ///
 /// Based on Tinygrad's rangeify_codegen (schedule/rangeify.py:452-464).
-pub fn add_load_to_index(_idx: &Rc<UOp>) -> Option<Rc<UOp>> {
+pub fn add_load_to_index(_idx: &Arc<UOp>) -> Option<Arc<UOp>> {
     // DISABLED: INDEX→LOAD wrapping is handled in codegen via `auto_load_pointer`.
     //
     // Pattern-based approach was disabled because patterns can't distinguish:
@@ -266,6 +402,10 @@ pub fn rangeify_codegen_patterns() -> PatternMatcher<()> {
         noop if matches!(noop.op(), Op::Noop) => remove_noop(noop),
         cont if matches!(cont.op(), Op::Contiguous { .. }) => get_contiguous(cont),
         after if matches!(after.op(), Op::After { .. }) => fix_after_broadcast(after),
+        // Linearize multi-index INDEX to single-index (must run before codegen)
+        idx if has_multiple_indices(idx) => linearize_index(idx),
+        // Flatten cascaded INDEX (INDEX of INDEX) to single INDEX
+        idx if is_cascaded_index(idx) => flatten_cascaded_index(idx),
         // Add LOAD to INDEX operations on buffer definitions (input buffers)
         idx if matches!(idx.op(), Op::Index { .. }) => add_load_to_index(idx),
     }

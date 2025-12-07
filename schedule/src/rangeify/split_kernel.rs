@@ -10,7 +10,7 @@
 //! 3. Creates SINK operation wrapping the computation
 //! 4. Creates KERNEL operation with proper buffer and variable arguments
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{AxisType, Op, UOp};
 use smallvec::SmallVec;
@@ -52,7 +52,7 @@ use crate::rewrite::graph_rewrite_bottom_up;
 /// ```
 ///
 /// Based on Tinygrad's "hack for COPY" (rangeify.py:494-499).
-fn find_copy_or_buffer_view(uop: &Rc<UOp>) -> Option<Rc<UOp>> {
+fn find_copy_or_buffer_view(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Traverse the computation graph in topological order
     for node in uop.toposort() {
         match node.op() {
@@ -117,7 +117,50 @@ fn find_copy_or_buffer_view(uop: &Rc<UOp>) -> Option<Rc<UOp>> {
 /// ```
 ///
 /// Based on Tinygrad's split_store (schedule/rangeify.py:471-497).
-pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
+pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
+    // **STEP 0: Handle AFTER wrapping STORE/END**
+    //
+    // bufferize_to_store returns AFTER(buffer, [computation]) where computation
+    // is STORE, END(STORE), or BARRIER(END(STORE)). We need to unwrap and process
+    // the inner computation.
+    //
+    // Structure examples:
+    // - Global with ranges: AFTER(DEFINE_GLOBAL, [END(STORE, ranges)])
+    // - Global no ranges:   AFTER(DEFINE_GLOBAL, [STORE])
+    // - Local with ranges:  AFTER(DEFINE_LOCAL, [BARRIER(END(STORE, ranges))])
+    if let Op::After { deps, .. } = uop.op() {
+        for dep in deps.iter() {
+            match dep.op() {
+                // If dep is already a KERNEL (from prior transform), return it
+                Op::Kernel { .. } => {
+                    return Some(dep.clone());
+                }
+                // Bare STORE (global, no ranges)
+                Op::Store { .. } | Op::StoreGated { .. } => {
+                    return split_store(dep, ctx);
+                }
+                // END wrapping STORE (global with ranges)
+                Op::End { computation, .. } if matches!(computation.op(), Op::Store { .. } | Op::StoreGated { .. }) => {
+                    return split_store(dep, ctx);
+                }
+                // BARRIER wrapping END(STORE) (local with ranges)
+                Op::Barrier { src, .. } => {
+                    if let Op::End { computation, .. } = src.op()
+                        && matches!(computation.op(), Op::Store { .. } | Op::StoreGated { .. })
+                    {
+                        return split_store(src, ctx);
+                    }
+                    // BARRIER wrapping bare STORE (local, no ranges)
+                    if matches!(src.op(), Op::Store { .. } | Op::StoreGated { .. }) {
+                        return split_store(src, ctx);
+                    }
+                }
+                _ => continue,
+            }
+        }
+        return None;
+    }
+
     // **FILTERING CRITERION 0: Skip if has non-OUTER ranges in scope**
     // Matches Tinygrad line 472:
     // if len([r for r in x.ranges if r.arg[-1] != AxisType.OUTER]): return None
@@ -233,6 +276,7 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // is used as the AST. This is deterministic and matches Tinygrad's behavior.
     //
     // Based on Tinygrad's "hack for COPY" (rangeify.py:494-499).
+
     let ast = if let Some(special_op) = find_copy_or_buffer_view(&transformed) {
         // Found COPY or BUFFER_VIEW - use it directly as kernel AST
         special_op
@@ -254,16 +298,17 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // parameters match the runtime buffer array.
     //
     // Based on Tinygrad's split_store (schedule/rangeify.py:510-512).
-    let mut sources: SmallVec<[Rc<UOp>; 4]> = SmallVec::new();
+    let mut sources: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
 
     // Collect all DEFINE_GLOBAL and DEFINE_LOCAL from the transformed AST
     // We need these to determine the ordering for function parameters.
-    let mut define_nodes: Vec<Rc<UOp>> = ast.toposort()
+    let mut define_nodes: Vec<Arc<UOp>> = ast
+        .toposort()
         .into_iter()
         .filter(|node| matches!(node.op(), Op::DefineGlobal(_) | Op::DefineLocal(_)))
         .collect();
 
-    // Print AST in Tinygrad style
+    // Print AST in Tinygrad style (disabled for now due to recursive Debug)
     morok_ir::uop::debug::print_ast(&ast, "KERNEL AST", 2);
 
     // Sort by internal ID to match renderer ordering (see codegen/src/llvm/renderer.rs:collect_buffers)
@@ -280,29 +325,11 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // Based on Tinygrad's approach: kernel.arg.append((ctx.map[x.arg], x))
     // where ctx.map[x.arg] is the original BUFFER UOp.
 
-    // DEBUG: Print buffer_map contents
-    eprintln!("SPLIT_KERNEL buffer_map has {} entries", ctx.buffer_map.len());
-    let map_vec: Vec<_> = ctx.buffer_map.iter().collect();
-    eprintln!("SPLIT_KERNEL About to print {} map entries", map_vec.len());
-    for (i, (key, value)) in map_vec.iter().enumerate() {
-        let key_name = match key.0.op() {
-            Op::Buffer { .. } => "BUFFER",
-            Op::Bufferize { .. } => "BUFFERIZE",
-            _ => "OTHER",
-        };
-        let value_name = match value.op() {
-            Op::DefineGlobal(id) => format!("DEFINE_GLOBAL({})", id),
-            _ => "OTHER".to_string(),
-        };
-        eprintln!("SPLIT_KERNEL map[{}]: {} id={} -> {} id={}", i, key_name, key.0.id, value_name, value.id);
-    }
-    eprintln!("SPLIT_KERNEL Done printing map");
-
     // Following Tinygrad: kernel.src = ctx.map.values() + ctx.vars.keys()
     // BUT we need to unwrap AFTER operations to get the actual DEFINE_GLOBAL/BUFFER.
     // For outputs: ctx.map[BUFFERIZE] = AFTER(DEFINE_GLOBAL, ...)
     // For inputs: ctx.map[BUFFER] = BUFFER
-    let mut buffer_sources: Vec<Rc<UOp>> = Vec::new();
+    let mut buffer_sources: Vec<Arc<UOp>> = Vec::new();
 
     for value in ctx.buffer_map.values() {
         // Unwrap AFTER to get the actual buffer (DEFINE_GLOBAL/DEFINE_LOCAL)
@@ -313,33 +340,16 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
         buffer_sources.push(actual_buffer);
     }
 
-    eprintln!("SPLIT_KERNEL: Using {} buffer_map values as buffer sources", buffer_sources.len());
-    for (i, src) in buffer_sources.iter().enumerate() {
-        match src.op() {
-            Op::Buffer { .. } => eprintln!("  [{}] BUFFER uop_id={}", i, src.id),
-            Op::DefineGlobal(id) => eprintln!("  [{}] DEFINE_GLOBAL({}), uop_id={}", i, id, src.id),
-            Op::DefineLocal(id) => eprintln!("  [{}] DEFINE_LOCAL({}), uop_id={}", i, id, src.id),
-            _ => eprintln!("  [{}] {:?} uop_id={}", i, src.op(), src.id),
-        }
-    }
-
-    // DEBUG: Print buffer sources ordering for verification
-    eprintln!("SPLIT_KERNEL buffer sources order:");
-    for (i, (node, define)) in buffer_sources.iter().zip(define_nodes.iter()).enumerate() {
-        let node_op_name = match node.op() {
-            Op::Buffer { .. } => "BUFFER",
-            Op::DefineGlobal(_) => "DEFINE_GLOBAL",
-            Op::DefineLocal(_) => "DEFINE_LOCAL",
-            Op::Bufferize { .. } => "BUFFERIZE",
-            _ => "OTHER",
-        };
-        let define_op_name = match define.op() {
-            Op::DefineGlobal(id) => format!("DEFINE_GLOBAL({})", id),
-            Op::DefineLocal(id) => format!("DEFINE_LOCAL({})", id),
-            _ => "OTHER".to_string(),
-        };
-        eprintln!("  [{}] {} uop_id={} -> {} uop_id={}", i, node_op_name, node.id, define_op_name, define.id);
-    }
+    // Sort buffer_sources by DEFINE_GLOBAL/DEFINE_LOCAL internal ID to match
+    // the LLVM renderer's parameter ordering (see codegen/src/llvm/renderer.rs:collect_buffers).
+    // This is critical: HashMap iteration order is non-deterministic, but the renderer
+    // expects parameters in a consistent order sorted by internal ID.
+    buffer_sources.sort_by_key(|b| match b.op() {
+        Op::DefineGlobal(id) => *id as u64,
+        Op::DefineLocal(id) => (*id as u64) + (1u64 << 32), // Offset locals after globals
+        Op::Buffer { .. } => b.id + (1u64 << 48),           // Offset input buffers after defines
+        _ => b.id,
+    });
 
     // Add sorted buffer sources
     for node in buffer_sources {
@@ -349,10 +359,8 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
     // Collect all DEFINE_VAR nodes from the transformed AST
     // These become function parameters for OUTER range iteration values.
     // DEFINE_VAR nodes are created by renumber_range for OUTER ranges.
-    let mut var_sources: Vec<Rc<UOp>> = ast.toposort()
-        .into_iter()
-        .filter(|node| matches!(node.op(), Op::DefineVar { .. }))
-        .collect();
+    let mut var_sources: Vec<Arc<UOp>> =
+        ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::DefineVar { .. })).collect();
 
     // Sort variables by name for deterministic ordering
     var_sources.sort_by(|a, b| {
@@ -366,17 +374,6 @@ pub fn split_store(uop: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
         };
         name_a.cmp(name_b)
     });
-
-    // DEBUG: Print variable sources ordering for verification
-    eprintln!("SPLIT_KERNEL variable sources order:");
-    for (i, node) in var_sources.iter().enumerate() {
-        match node.op() {
-            Op::DefineVar { name, min_val, max_val } => {
-                eprintln!("  [{}] DEFINE_VAR(name='{}', min={}, max={}), uop_id={}", i, name, min_val, max_val, node.id);
-            }
-            _ => eprintln!("  [{}] {:?}, uop_id={}", i, node.op(), node.id),
-        }
-    }
 
     // Add sorted variable sources after buffers
     for node in var_sources {

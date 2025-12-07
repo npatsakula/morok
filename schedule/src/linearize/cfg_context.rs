@@ -4,7 +4,7 @@
 //! ordering edges between sibling RANGE operations at the same nesting level.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::UOp;
 use morok_ir::op::Op;
@@ -40,7 +40,7 @@ pub struct CFGContext {
     /// The predecessor is the operation that must complete before
     /// this RANGE can begin execution.
     #[allow(clippy::mutable_key_type)]
-    pub edges: HashMap<UOpKey, Rc<UOp>>,
+    pub edges: HashMap<UOpKey, Arc<UOp>>,
 }
 
 impl CFGContext {
@@ -57,7 +57,7 @@ impl CFGContext {
     /// 4. Group sibling RANGEs by their parent
     /// 5. Order siblings by dependency count (fewer deps = earlier)
     /// 6. Create edges between consecutive siblings
-    pub fn new(sink: &Rc<UOp>) -> Self {
+    pub fn new(sink: &Arc<UOp>) -> Self {
         let mut ctx = Self::default();
 
         // Step 1: Collect all nodes via toposort
@@ -87,11 +87,11 @@ impl CFGContext {
 
         // Step 3: Collect all ENDs and their associated RANGEs
         #[allow(clippy::mutable_key_type)]
-        let mut end_to_ranges: HashMap<UOpKey, Vec<Rc<UOp>>> = HashMap::new();
+        let mut end_to_ranges: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
 
         for node in &nodes {
             if let Op::End { ranges, .. } = node.op() {
-                let range_list: Vec<Rc<UOp>> = ranges.iter().cloned().collect();
+                let range_list: Vec<Arc<UOp>> = ranges.iter().cloned().collect();
                 end_to_ranges.insert(UOpKey(node.clone()), range_list);
             }
         }
@@ -99,14 +99,14 @@ impl CFGContext {
         // Step 4: For each RANGE, find its parent END (if nested)
         // A RANGE X is nested in END Y if END(Y) depends on X
         #[allow(clippy::mutable_key_type)]
-        let mut range_parent: HashMap<UOpKey, Option<Rc<UOp>>> = HashMap::new();
+        let mut range_parent: HashMap<UOpKey, Option<Arc<UOp>>> = HashMap::new();
 
         for node in &nodes {
             if let Op::Range { .. } = node.op() {
                 let range_key = UOpKey(node.clone());
 
                 // Find the innermost END that contains this RANGE
-                let mut parent: Option<Rc<UOp>> = None;
+                let mut parent: Option<Arc<UOp>> = None;
 
                 for end_key in end_to_ranges.keys() {
                     if let Some(end_deps) = deps.get(end_key) {
@@ -138,7 +138,7 @@ impl CFGContext {
         // Step 5: Group siblings by parent END
         // Siblings are RANGEs that share the same parent (or both have no parent)
         #[allow(clippy::mutable_key_type)]
-        let mut siblings: HashMap<Option<UOpKey>, Vec<Rc<UOp>>> = HashMap::new();
+        let mut siblings: HashMap<Option<UOpKey>, Vec<Arc<UOp>>> = HashMap::new();
 
         for (range_key, parent) in &range_parent {
             let parent_key = parent.as_ref().map(|p| UOpKey(p.clone()));
@@ -169,7 +169,7 @@ impl CFGContext {
     ///
     /// Returns `Some(predecessor)` if this RANGE has a sibling that must
     /// execute before it, `None` if this is the first RANGE at its level.
-    pub fn get_predecessor(&self, range: &Rc<UOp>) -> Option<&Rc<UOp>> {
+    pub fn get_predecessor(&self, range: &Arc<UOp>) -> Option<&Arc<UOp>> {
         self.edges.get(&UOpKey(range.clone()))
     }
 

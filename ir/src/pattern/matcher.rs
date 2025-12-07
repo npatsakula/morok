@@ -8,12 +8,12 @@
 
 use std::collections::HashMap;
 use std::mem::{Discriminant, discriminant};
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::OnceLock;
 
+use crate::types::{AxisId, AxisType, ConstValue, ConstValueHash, ReduceOp};
+use crate::{BinaryOp, Op, TernaryOp, UOp, UnaryOp};
 use morok_dtype::DType;
-use morok_ir::types::{AxisId, AxisType, ConstValue, ConstValueHash, ReduceOp};
-use morok_ir::{BinaryOp, Op, TernaryOp, UOp, UnaryOp};
 use smallvec::SmallVec;
 
 use super::upat::{BindingStore, OpFilter, UPat, VarIntern};
@@ -29,10 +29,10 @@ pub enum RewriteResult {
     /// Pattern didn't match or rewrite function declined to rewrite
     NoMatch,
     /// Pattern matched and returned a replacement UOp
-    Rewritten(Rc<UOp>),
+    Rewritten(Arc<UOp>),
     /// Pattern matched and indicates bottom-up gate (Tinygrad's BottomUpGate)
     /// This signals that children should be processed before proceeding
-    Gate(Rc<UOp>),
+    Gate(Arc<UOp>),
 }
 
 /// Rewrite function type - generic over context type.
@@ -110,7 +110,7 @@ impl<C> FastRewrite<C> {
 
                 if let (Some(vi), Some(ci)) = (var_idx, compare_idx)
                     && let (Some(var_uop), Some(cmp_uop)) = (bindings.get_by_index(vi), bindings.get_by_index(ci))
-                    && Rc::ptr_eq(var_uop, cmp_uop)
+                    && Arc::ptr_eq(var_uop, cmp_uop)
                 {
                     return RewriteResult::Rewritten(var_uop.clone());
                 }
@@ -383,7 +383,7 @@ impl OpKey {
             m.insert(discriminant(&Op::PtrCat { sources: SmallVec::new() }), OpKey::PtrCat);
 
             // Symbolic/Define
-            m.insert(discriminant(&Op::DefineVar { name: String::new(), min_val: 0, max_val: 0 }), OpKey::DefineVar);
+            m.insert(discriminant(&Op::DefineVar { name: String::new(), max_val: 0 }), OpKey::DefineVar);
             m.insert(discriminant(&Op::Bind { var: noop(), value: noop() }), OpKey::Bind);
             m.insert(discriminant(&Op::DefineReg { size: 0 }), OpKey::DefineReg);
 
@@ -456,7 +456,7 @@ impl OpKey {
 ///
 /// ```ignore
 /// use morok_ir::BinaryOp;
-/// use schedule::pattern::{UPat, PatternMatcher};
+/// use morok_ir::pattern::{UPat, PatternMatcher};
 ///
 /// // Pattern: x + 0 -> x
 /// let patterns = vec![(
@@ -588,7 +588,7 @@ impl<C> PatternMatcher<C> {
     /// 2. Wildcard patterns (match any op)
     ///
     /// For single-solution patterns, uses `match_first()` which avoids Vec allocation.
-    pub fn rewrite(&self, uop: &Rc<UOp>, ctx: &mut C) -> RewriteResult {
+    pub fn rewrite(&self, uop: &Arc<UOp>, ctx: &mut C) -> RewriteResult {
         let op_key = OpKey::from_op(uop.op());
 
         // Chain indexed patterns with wildcards - no Vec allocation

@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::rangeify::patterns::dead_axis_removal;
 use crate::rewrite::graph_rewrite;
@@ -17,7 +17,7 @@ fn test_bufferize_with_size_1_range() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should return compute directly since all axes are dead
-    assert!(Rc::ptr_eq(&result, &x), "BUFFERIZE with only dead axis should return compute");
+    assert!(Arc::ptr_eq(&result, &x), "BUFFERIZE with only dead axis should return compute");
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn test_bufferize_all_dead_axes() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // All axes dead → return compute directly
-    assert!(Rc::ptr_eq(&result, &x), "All dead axes should be removed, returning compute");
+    assert!(Arc::ptr_eq(&result, &x), "All dead axes should be removed, returning compute");
 }
 
 #[test]
@@ -51,8 +51,8 @@ fn test_bufferize_mixed_live_dead() {
     // Result should be BUFFERIZE with only live ranges
     if let Op::Bufferize { ranges, .. } = result.op() {
         assert_eq!(ranges.len(), 2, "Should have 2 live ranges");
-        assert!(Rc::ptr_eq(&ranges[0], &live_range1), "First live range should be preserved");
-        assert!(Rc::ptr_eq(&ranges[1], &live_range2), "Second live range should be preserved");
+        assert!(Arc::ptr_eq(&ranges[0], &live_range1), "First live range should be preserved");
+        assert!(Arc::ptr_eq(&ranges[1], &live_range2), "Second live range should be preserved");
     } else {
         panic!("Expected BUFFERIZE after dead axis removal");
     }
@@ -70,7 +70,7 @@ fn test_bufferize_no_dead_axes() {
     let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
     // Should remain unchanged (no dead axes to remove)
-    assert!(Rc::ptr_eq(&result, &bufferized), "No dead axes means no changes");
+    assert!(Arc::ptr_eq(&result, &bufferized), "No dead axes means no changes");
 }
 
 // Pattern 2: INDEX Adjustment Tests
@@ -99,7 +99,7 @@ fn test_index_after_dead_axis_removal() {
     if let Op::Index { indices, .. } = result.op() {
         // The second index (for dead axis) should be removed
         assert_eq!(indices.len(), 1, "Should have 1 index after dead axis removal");
-        assert!(Rc::ptr_eq(&indices[0], &idx1), "Live index should be preserved");
+        assert!(Arc::ptr_eq(&indices[0], &idx1), "Live index should be preserved");
     }
     // Note: This test might not pass if the pattern doesn't handle INDEX adjustment yet
 }
@@ -118,7 +118,7 @@ fn test_bufferize_dead_axis_with_constants() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should return compute directly
-    assert!(Rc::ptr_eq(&result, &x), "Dead axis with constant 1 should be removed");
+    assert!(Arc::ptr_eq(&result, &x), "Dead axis with constant 1 should be removed");
 }
 
 #[test]
@@ -137,12 +137,12 @@ fn test_multiple_dead_axis_removal_passes() {
     let result2 = graph_rewrite(&matcher, result1.clone(), &mut ());
 
     // Both should produce same result (idempotent)
-    assert!(Rc::ptr_eq(&result1, &result2), "Dead axis removal should be idempotent");
+    assert!(Arc::ptr_eq(&result1, &result2), "Dead axis removal should be idempotent");
 
     // Result should have only the live range
     if let Op::Bufferize { ranges, .. } = result1.op() {
         assert_eq!(ranges.len(), 1, "Should have 1 live range");
-        assert!(Rc::ptr_eq(&ranges[0], &live_range), "Live range should be preserved");
+        assert!(Arc::ptr_eq(&ranges[0], &live_range), "Live range should be preserved");
     } else {
         panic!("Expected BUFFERIZE after dead axis removal");
     }
@@ -162,5 +162,5 @@ fn test_dead_axis_uint_constant() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should return compute directly
-    assert!(Rc::ptr_eq(&result, &x), "Dead axis with UInt(1) should be removed");
+    assert!(Arc::ptr_eq(&result, &x), "Dead axis with UInt(1) should be removed");
 }

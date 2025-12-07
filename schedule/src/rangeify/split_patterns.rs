@@ -1,6 +1,6 @@
 //! Patterns for kernel splitting: BUFFER→DEFINE_GLOBAL, AFTER handling, range renumbering.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::AddrSpace;
 use morok_ir::{AxisId, AxisType, ConstValue, DType, Op, UOp};
@@ -13,7 +13,7 @@ use crate::pattern::matcher::PatternMatcher;
 /// **Critical:** Embeds buffer size in the Ptr dtype following Tinygrad's pattern.
 /// This ensures `compute_buffer_size()` can extract size from the DefineGlobal dtype
 /// instead of searching through the AST.
-pub fn debuf(buf: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
+pub fn debuf(buf: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     // Extract buffer information including size
     let (ptr_dtype, addrspace) = match buf.op() {
         Op::Buffer { size, .. } => {
@@ -44,7 +44,7 @@ pub fn debuf(buf: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
 }
 
 /// Handle AFTER: extract buffer and track dependency.
-pub fn handle_after(after: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
+pub fn handle_after(after: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     // Extract the passthrough (first source)
     let passthrough = match after.op() {
         Op::After { passthrough, .. } => passthrough,
@@ -74,7 +74,7 @@ pub fn handle_after(after: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>>
 }
 
 /// Remove BIND: extract var and track it.
-pub fn unbind_kernel(bind: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
+pub fn unbind_kernel(bind: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     // Verify this is a BIND operation
     let (var, _value) = match bind.op() {
         Op::Bind { var, value } => (var, value),
@@ -93,7 +93,7 @@ pub fn unbind_kernel(bind: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>>
 /// Uses enum-based guard that is naturally idempotent:
 /// - Only matches ranges with `AxisId::Unrenumbered`
 /// - Produces ranges with `AxisId::Renumbered`, so won't match again
-pub fn renumber_range(range: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp>> {
+pub fn renumber_range(range: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     // Verify this is a RANGE operation
     let (end, old_axis_id, axis_type) = match range.op() {
         Op::Range { end, axis_id, axis_type } => (end, *axis_id, *axis_type),
@@ -126,8 +126,8 @@ pub fn renumber_range(range: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp
             }
         };
 
-        // Create DEFINE_VAR with min=0, max=vmax
-        let var = UOp::define_var(var_name, 0, vmax);
+        // Create DEFINE_VAR with max=vmax (min is always 0)
+        let var = UOp::define_var(var_name, vmax);
 
         // Create renumbered RANGE
         let new_axis_id = AxisId::Renumbered(ctx.next_range());
@@ -145,7 +145,7 @@ pub fn renumber_range(range: &Rc<UOp>, ctx: &mut KernelContext) -> Option<Rc<UOp
 }
 
 /// Remove spurious sources from CONST and DEFINE_VAR.
-pub fn cleanup_const(op: &Rc<UOp>, _ctx: &mut KernelContext) -> Option<Rc<UOp>> {
+pub fn cleanup_const(op: &Arc<UOp>, _ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     // Check if this is CONST or DEFINE_VAR with sources
     let should_clean = matches!(op.op(), Op::Const(_) | Op::DefineVar { .. });
 
@@ -162,7 +162,7 @@ pub fn cleanup_const(op: &Rc<UOp>, _ctx: &mut KernelContext) -> Option<Rc<UOp>> 
     // Create new operation with no sources
     let cleaned = match op.op() {
         Op::Const(val) => UOp::const_(op.dtype(), val.0),
-        Op::DefineVar { name, min_val, max_val } => UOp::var(name.clone(), op.dtype(), *min_val, *max_val),
+        Op::DefineVar { name, max_val } => UOp::var(name.clone(), op.dtype(), *max_val),
         _ => unreachable!(),
     };
 
@@ -170,7 +170,7 @@ pub fn cleanup_const(op: &Rc<UOp>, _ctx: &mut KernelContext) -> Option<Rc<UOp>> 
 }
 
 /// Replace RANGE(end=0) with CONST(0).
-pub fn remove_zero_range(range: &Rc<UOp>, _ctx: &mut KernelContext) -> Option<Rc<UOp>> {
+pub fn remove_zero_range(range: &Arc<UOp>, _ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     // Verify this is a RANGE operation
     let end = match range.op() {
         Op::Range { end, .. } => end,

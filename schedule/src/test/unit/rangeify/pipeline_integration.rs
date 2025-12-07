@@ -26,7 +26,7 @@ fn test_pipeline_two_bufferizes() {
     // Create root with both
     let root = UOp::sink(vec![bufferize_global, bufferize_local]);
 
-    let result = run_kernel_split_pipeline(root);
+    let (result, _context) = run_kernel_split_pipeline(root);
 
     // Should create buffers for both address spaces
     // Note: Actual kernel count depends on how pipeline handles SINK
@@ -46,7 +46,7 @@ fn test_pipeline_preserves_structure() {
 
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range.clone()]);
 
-    let result = run_kernel_split_pipeline(bufferize.clone());
+    let (result, _context) = run_kernel_split_pipeline(bufferize.clone());
 
     // Result should be a KERNEL
     assert!(matches!(result.op(), Op::Kernel { .. }));
@@ -77,7 +77,7 @@ fn test_pipeline_context_threading() {
 
     let bufferize = UOp::bufferize_global(compute, vec![range]);
 
-    let result = run_kernel_split_pipeline(bufferize);
+    let (result, _context) = run_kernel_split_pipeline(bufferize);
 
     // After pipeline:
     // - Stage 1 (bufferize_to_store) creates DEFINE_GLOBAL and tracks in context
@@ -107,7 +107,7 @@ fn test_pipeline_mixed_addrspace() {
     // Create a SINK with both
     let root = UOp::sink(vec![global_buf, local_buf]);
 
-    let result = run_kernel_split_pipeline(root);
+    let (result, _context) = run_kernel_split_pipeline(root);
 
     // Count buffers by address space
     let globals = count_define_globals(&result);
@@ -219,7 +219,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
     println!("Rangeified root op: {:?}", rangeified.op());
 
     // Run kernel split pipeline (Phase 5)
-    let kernelized = run_kernel_split_pipeline(rangeified);
+    let (kernelized, _context) = run_kernel_split_pipeline(rangeified);
 
     // Print summarized graph for debugging
     println!("Kernelized graph ops:");
@@ -304,7 +304,7 @@ fn test_pipeline_chained_operations() {
 
     let buf_b = UOp::bufferize_global(compute_b, vec![range_b]);
 
-    let result = run_kernel_split_pipeline(buf_b);
+    let (result, _context) = run_kernel_split_pipeline(buf_b);
 
     // Should create multiple kernels for chained operations
     let kernel_count = count_kernels(&result);

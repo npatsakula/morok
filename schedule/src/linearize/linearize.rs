@@ -5,7 +5,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::UOp;
 use morok_ir::op::Op;
@@ -82,12 +82,12 @@ struct OrderKey {
 /// let kernel_ast = /* ... */;
 /// let instructions = linearize(kernel_ast);
 ///
-/// // instructions is now a Vec<Rc<UOp>> in execution order
+/// // instructions is now a Vec<Arc<UOp>> in execution order
 /// for (i, instr) in instructions.iter().enumerate() {
 ///     println!("{}: {:?}", i, instr.op());
 /// }
 /// ```
-pub fn linearize(sink: Rc<UOp>) -> Vec<Rc<UOp>> {
+pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
     // Step 1: Toposort from sink
     let nodes = sink.toposort();
 
@@ -98,13 +98,13 @@ pub fn linearize(sink: Rc<UOp>) -> Vec<Rc<UOp>> {
     // Step 2: Build consumer graph + priorities
     // CRITICAL: Must iterate in REVERSE order for correct consumer counting
     #[allow(clippy::mutable_key_type)]
-    let mut consumers: HashMap<UOpKey, Vec<Rc<UOp>>> = HashMap::new();
+    let mut consumers: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
     #[allow(clippy::mutable_key_type)]
     let mut out_degree: HashMap<UOpKey, usize> = HashMap::new();
     #[allow(clippy::mutable_key_type)]
     let mut priorities: HashMap<UOpKey, OrderKey> = HashMap::new();
-    // Map from UOp ID to Rc<UOp> for lookup
-    let mut id_to_uop: HashMap<u64, Rc<UOp>> = HashMap::new();
+    // Map from UOp ID to Arc<UOp> for lookup
+    let mut id_to_uop: HashMap<u64, Arc<UOp>> = HashMap::new();
 
     for u in nodes.iter().rev() {
         id_to_uop.insert(u.id, u.clone());
@@ -213,7 +213,7 @@ pub fn linearize(sink: Rc<UOp>) -> Vec<Rc<UOp>> {
 ///
 /// The run count estimates how many times this operation executes,
 /// based on the loop bounds of enclosing ranges.
-fn compute_run_count(uop: &Rc<UOp>) -> u64 {
+fn compute_run_count(uop: &Arc<UOp>) -> u64 {
     let ranges = uop.ranges();
     if ranges.is_empty() {
         return 1;
@@ -233,7 +233,7 @@ fn compute_run_count(uop: &Rc<UOp>) -> u64 {
 }
 
 /// Get priority and optional argument value for a UOp.
-fn get_priority(uop: &Rc<UOp>) -> (i32, Option<i64>) {
+fn get_priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
     match uop.op() {
         Op::DefineGlobal(id) => (priority::DEFINE_GLOBAL, Some(*id as i64)),
         Op::DefineVar { .. } => (priority::DEFINE_VAR, None),
@@ -324,10 +324,10 @@ mod tests {
         let result = linearize(sink);
 
         // c should appear before both a and b
-        let c_pos = result.iter().position(|u| std::rc::Rc::ptr_eq(u, &c));
-        let a_pos = result.iter().position(|u| std::rc::Rc::ptr_eq(u, &a));
-        let b_pos = result.iter().position(|u| std::rc::Rc::ptr_eq(u, &b));
-        let sum_pos = result.iter().position(|u| std::rc::Rc::ptr_eq(u, &sum));
+        let c_pos = result.iter().position(|u| std::sync::Arc::ptr_eq(u, &c));
+        let a_pos = result.iter().position(|u| std::sync::Arc::ptr_eq(u, &a));
+        let b_pos = result.iter().position(|u| std::sync::Arc::ptr_eq(u, &b));
+        let sum_pos = result.iter().position(|u| std::sync::Arc::ptr_eq(u, &sum));
 
         assert!(c_pos.is_some());
         assert!(a_pos.is_some());
@@ -342,6 +342,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_priority_ordering() {
         // Test that priority order is respected: DefineGlobal < Const < default < Range
         assert!(priority::DEFINE_GLOBAL < priority::CONST);
