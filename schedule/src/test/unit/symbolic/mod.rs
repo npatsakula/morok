@@ -1477,3 +1477,773 @@ fn test_where_const_false_condition() {
         assert!(Arc::ptr_eq(&rewritten, &f));
     }
 }
+
+// ========== Phase 1.1: Bounds-Based Comparison Tests ==========
+//
+// These tests verify that the ComparisonAnalyzer correctly simplifies
+// comparisons based on known variable ranges.
+
+#[test]
+fn test_lt_bounds_always_true() {
+    // a(0,8) < 77 → true (since max(a)=8 < 77)
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, 8); // range [0, 8]
+    let c77 = UOp::native_const(77i32);
+    let lt = a.try_cmplt(&c77).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(true));
+        } else {
+            panic!("Expected Const(Bool(true)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_lt_bounds_always_true_edge() {
+    // a(0,8) < 9 → true (since max(a)=8 < 9)
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, 8);
+    let c9 = UOp::native_const(9i32);
+    let lt = a.try_cmplt(&c9).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(true));
+        } else {
+            panic!("Expected Const(Bool(true)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_lt_bounds_indeterminate() {
+    // a(0,8) < 5 → indeterminate (could be 0 < 5 = true or 8 < 5 = false)
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, 8);
+    let c5 = UOp::native_const(5i32);
+    let lt = a.try_cmplt(&c5).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    // Should NOT be rewritten since the result is indeterminate
+    assert!(matches!(result, RewriteResult::NoMatch));
+}
+
+#[test]
+fn test_lt_bounds_always_false() {
+    // a(0,8) < 0 → false (since min(a)=0 is not < 0)
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, 8);
+    let c0 = UOp::native_const(0i32);
+    let lt = a.try_cmplt(&c0).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(false));
+        } else {
+            panic!("Expected Const(Bool(false)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_lt_two_vars_always_true() {
+    // a(0,4) < b(5,10) → true (since max(a)=4 < min(b)=5)
+    // We create b(5,10) as b(0,5) + 5
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, 4); // range [0, 4]
+    let b_base = UOp::var("b", DType::Int32, 5); // range [0, 5]
+    let c5 = UOp::native_const(5i32);
+    let b = b_base.try_add(&c5).unwrap(); // range [5, 10]
+
+    let lt = a.try_cmplt(&b).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(true));
+        } else {
+            panic!("Expected Const(Bool(true)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_lt_two_vars_always_false() {
+    // a(5,10) < b(0,4) → false (since min(a)=5 >= max(b)=4, so 5 < 4 is false)
+    // We create a(5,10) as a(0,5) + 5
+    let matcher = symbolic_simple();
+    let a_base = UOp::var("a", DType::Int32, 5); // range [0, 5]
+    let c5 = UOp::native_const(5i32);
+    let a = a_base.try_add(&c5).unwrap(); // range [5, 10]
+    let b = UOp::var("b", DType::Int32, 4); // range [0, 4]
+
+    let lt = a.try_cmplt(&b).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(false));
+        } else {
+            panic!("Expected Const(Bool(false)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_ge_bounds_always_true() {
+    // a(3,8) >= 3 → true (since min(a)=3 >= 3)
+    // We create a(3,8) as a(0,5) + 3
+    let matcher = symbolic_simple();
+    let a_base = UOp::var("a", DType::Int32, 5); // range [0, 5]
+    let c3 = UOp::native_const(3i32);
+    let a = a_base.try_add(&c3).unwrap(); // range [3, 8]
+
+    // a >= 3 is equivalent to !(a < 3), but we test via constants
+    // Since there's no cmpge, we test a < 3 and expect false
+    let lt = a.try_cmplt(&c3).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            // a(3,8) < 3 should be false (min(a)=3 is not < 3)
+            assert_eq!(cv.0, ConstValue::Bool(false));
+        } else {
+            panic!("Expected Const(Bool(false)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_eq_bounds_always_false() {
+    // a(0,4) == b(10,20) → false (non-overlapping ranges)
+    // We create b(10,20) as b(0,10) + 10
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, 4); // range [0, 4]
+    let b_base = UOp::var("b", DType::Int32, 10); // range [0, 10]
+    let c10 = UOp::native_const(10i32);
+    let b = b_base.try_add(&c10).unwrap(); // range [10, 20]
+
+    let eq = a.try_cmpeq(&b).unwrap();
+
+    let result = matcher.rewrite(&eq, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(false));
+        } else {
+            panic!("Expected Const(Bool(false)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_ne_bounds_always_true() {
+    // a(0,4) != b(10,20) → true (non-overlapping ranges)
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, 4); // range [0, 4]
+    let b_base = UOp::var("b", DType::Int32, 10);
+    let c10 = UOp::native_const(10i32);
+    let b = b_base.try_add(&c10).unwrap(); // range [10, 20]
+
+    let ne = a.try_cmpne(&b).unwrap();
+
+    let result = matcher.rewrite(&ne, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(true));
+        } else {
+            panic!("Expected Const(Bool(true)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+// ========== Phase 1.2: Nested Operation Tests ==========
+//
+// These tests verify that nested operations are correctly simplified
+// using existing patterns.
+
+#[test]
+fn test_nested_div_div() {
+    // (a // 10) // 9 → a // 90
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let c10 = UOp::native_const(10i32);
+    let c9 = UOp::native_const(9i32);
+    let div1 = a.try_div(&c10).unwrap();
+    let div2 = div1.try_div(&c9).unwrap();
+
+    let result = matcher.rewrite(&div2, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Idiv, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &a));
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(90));
+            } else {
+                panic!("Expected constant 90, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Idiv, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_nested_mul_mul() {
+    // (a * 10) * 9 → a * 90
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let c10 = UOp::native_const(10i32);
+    let c9 = UOp::native_const(9i32);
+    let mul1 = a.try_mul(&c10).unwrap();
+    let mul2 = mul1.try_mul(&c9).unwrap();
+
+    let result = matcher.rewrite(&mul2, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Mul, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &a));
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(90));
+            } else {
+                panic!("Expected constant 90, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Mul, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_nested_mod_mod_same_divisor() {
+    // (a % 5) % 5 → a % 5 (idempotent modulo)
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let c5 = UOp::native_const(5i32);
+    let mod1 = a.try_mod(&c5).unwrap();
+    let mod2 = mod1.try_mod(&c5).unwrap();
+
+    let result = matcher.rewrite(&mod2, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Mod, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &a));
+            assert!(Arc::ptr_eq(c, &c5));
+        } else {
+            panic!("Expected Mod(a, 5), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_nested_add_add() {
+    // (a + 3) + 5 → a + 8
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let c3 = UOp::native_const(3i32);
+    let c5 = UOp::native_const(5i32);
+    let add1 = a.try_add(&c3).unwrap();
+    let add2 = add1.try_add(&c5).unwrap();
+
+    let result = matcher.rewrite(&add2, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Add, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &a));
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(8));
+            } else {
+                panic!("Expected constant 8, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Add, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_nested_sub_sub() {
+    // (a - 3) - 5 → a - 8
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let c3 = UOp::native_const(3i32);
+    let c5 = UOp::native_const(5i32);
+    let sub1 = a.try_sub(&c3).unwrap();
+    let sub2 = sub1.try_sub(&c5).unwrap();
+
+    let result = matcher.rewrite(&sub2, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Sub, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &a));
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(8));
+            } else {
+                panic!("Expected constant 8, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Sub, got {:?}", rewritten.op());
+        }
+    }
+}
+
+// ========== Phase 2: Comparison & Boolean Patterns ==========
+//
+// Tests for new comparison and boolean patterns.
+
+#[test]
+fn test_bool_or_not_tautology() {
+    // x | !x → true (for bool type)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 1); // bool variable
+    let not_x = x.not();
+    let or_op = x.try_or_op(&not_x).unwrap();
+
+    let result = matcher.rewrite(&or_op, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(true));
+        } else {
+            panic!("Expected Const(Bool(true)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_bool_and_not_contradiction() {
+    // x & !x → false (for bool type)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 1);
+    let not_x = x.not();
+    let and_op = x.try_and_op(&not_x).unwrap();
+
+    let result = matcher.rewrite(&and_op, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(false));
+        } else {
+            panic!("Expected Const(Bool(false)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_bool_or_true_absorb() {
+    // true | x → true
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 1);
+    let true_const = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let or_op = true_const.try_or_op(&x).unwrap();
+
+    let result = matcher.rewrite(&or_op, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(true));
+        } else {
+            panic!("Expected Const(Bool(true)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_bool_and_false_absorb() {
+    // false & x → false
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 1);
+    let false_const = UOp::const_(DType::Bool, ConstValue::Bool(false));
+    let and_op = false_const.try_and_op(&x).unwrap();
+
+    let result = matcher.rewrite(&and_op, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Const(cv) = rewritten.op() {
+            assert_eq!(cv.0, ConstValue::Bool(false));
+        } else {
+            panic!("Expected Const(Bool(false)), got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_bool_and_true_identity() {
+    // true & x → x
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 1);
+    let true_const = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let and_op = true_const.try_and_op(&x).unwrap();
+
+    let result = matcher.rewrite(&and_op, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Arc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_bool_or_false_identity() {
+    // false | x → x
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 1);
+    let false_const = UOp::const_(DType::Bool, ConstValue::Bool(false));
+    let or_op = false_const.try_or_op(&x).unwrap();
+
+    let result = matcher.rewrite(&or_op, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Arc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_lt_const_offset() {
+    // (a + 2) < 5 → a < 3
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let c2 = UOp::native_const(2i32);
+    let c5 = UOp::native_const(5i32);
+    let add = a.try_add(&c2).unwrap();
+    let lt = add.try_cmplt(&c5).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Lt, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &a));
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(3)); // 5 - 2 = 3
+            } else {
+                panic!("Expected constant 3, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Lt, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_lt_const_offset_negative() {
+    // (a + 10) < 5 → a < -5
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let c10 = UOp::native_const(10i32);
+    let c5 = UOp::native_const(5i32);
+    let add = a.try_add(&c10).unwrap();
+    let lt = add.try_cmplt(&c5).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Lt, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &a));
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(-5)); // 5 - 10 = -5
+            } else {
+                panic!("Expected constant -5, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Lt, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_lt_negation_flip() {
+    // -a < -b → b < a
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let b = UOp::var("b", DType::Int32, i64::MAX);
+    let neg_a = a.neg();
+    let neg_b = b.neg();
+    let lt = neg_a.try_cmplt(&neg_b).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Lt, lhs, rhs) = rewritten.op() {
+            // Should become b < a
+            assert!(Arc::ptr_eq(lhs, &b));
+            assert!(Arc::ptr_eq(rhs, &a));
+        } else {
+            panic!("Expected Lt(b, a), got {:?}", rewritten.op());
+        }
+    }
+}
+
+
+// ===== Phase 3: Division/Modulo Recombination Tests =====
+
+#[test]
+fn test_div_mod_recombine() {
+    // x%n + (x//n)*n → x
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let n = UOp::native_const(4i32);
+    
+    // Build: x % 4 + (x // 4) * 4
+    let mod_part = x.try_mod(&n).unwrap();
+    let div_part = x.try_div(&n).unwrap();
+    let mul_part = div_part.try_mul(&n).unwrap();
+    let add = mod_part.try_add(&mul_part).unwrap();
+
+    let result = matcher.rewrite(&add, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Arc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_div_mod_recombine_commutative() {
+    // (x//n)*n + x%n → x (commutative form)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let n = UOp::native_const(4i32);
+    
+    // Build: (x // 4) * 4 + x % 4
+    let div_part = x.try_div(&n).unwrap();
+    let mul_part = div_part.try_mul(&n).unwrap();
+    let mod_part = x.try_mod(&n).unwrap();
+    let add = mul_part.try_add(&mod_part).unwrap();
+
+    let result = matcher.rewrite(&add, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        assert!(Arc::ptr_eq(&rewritten, &x));
+    }
+}
+
+#[test]
+fn test_nested_div_const() {
+    // (a//2 + 1) // 2 → (a + 2) // 4
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let c2 = UOp::native_const(2i32);
+    let c1 = UOp::native_const(1i32);
+    
+    // Build: (a // 2 + 1) // 2
+    let div_inner = a.try_div(&c2).unwrap();
+    let add = div_inner.try_add(&c1).unwrap();
+    let div_outer = add.try_div(&c2).unwrap();
+
+    let result = matcher.rewrite(&div_outer, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    
+    if let RewriteResult::Rewritten(rewritten) = result {
+        // Should become (a + 2) // 4
+        if let Op::Binary(BinaryOp::Idiv, lhs, rhs) = rewritten.op() {
+            // lhs should be a + 2
+            if let Op::Binary(BinaryOp::Add, var, c) = lhs.op() {
+                assert!(Arc::ptr_eq(var, &a));
+                if let Op::Const(cv) = c.op() {
+                    assert_eq!(cv.0, ConstValue::Int(2)); // c1 * c2 = 1 * 2 = 2
+                } else {
+                    panic!("Expected constant 2, got {:?}", c.op());
+                }
+            } else {
+                panic!("Expected Add, got {:?}", lhs.op());
+            }
+            // rhs should be 4
+            if let Op::Const(cv) = rhs.op() {
+                assert_eq!(cv.0, ConstValue::Int(4)); // c1 * c3 = 2 * 2 = 4
+            } else {
+                panic!("Expected constant 4, got {:?}", rhs.op());
+            }
+        } else {
+            panic!("Expected Idiv, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_nested_div_const_larger() {
+    // (a//3 + 5) // 4 → (a + 15) // 12
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let c3 = UOp::native_const(3i32);
+    let c5 = UOp::native_const(5i32);
+    let c4 = UOp::native_const(4i32);
+    
+    // Build: (a // 3 + 5) // 4
+    let div_inner = a.try_div(&c3).unwrap();
+    let add = div_inner.try_add(&c5).unwrap();
+    let div_outer = add.try_div(&c4).unwrap();
+
+    let result = matcher.rewrite(&div_outer, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Idiv, lhs, rhs) = rewritten.op() {
+            // lhs should be a + 15
+            if let Op::Binary(BinaryOp::Add, var, c) = lhs.op() {
+                assert!(Arc::ptr_eq(var, &a));
+                if let Op::Const(cv) = c.op() {
+                    assert_eq!(cv.0, ConstValue::Int(15)); // 3 * 5 = 15
+                } else {
+                    panic!("Expected constant 15, got {:?}", c.op());
+                }
+            } else {
+                panic!("Expected Add, got {:?}", lhs.op());
+            }
+            // rhs should be 12
+            if let Op::Const(cv) = rhs.op() {
+                assert_eq!(cv.0, ConstValue::Int(12)); // 3 * 4 = 12
+            } else {
+                panic!("Expected constant 12, got {:?}", rhs.op());
+            }
+        } else {
+            panic!("Expected Idiv, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_div_mod_recombine_different_n() {
+    // x%4 + (x//5)*4 should NOT simplify (different divisors)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let n4 = UOp::native_const(4i32);
+    let n5 = UOp::native_const(5i32);
+    
+    // Build: x % 4 + (x // 5) * 4
+    let mod_part = x.try_mod(&n4).unwrap();
+    let div_part = x.try_div(&n5).unwrap();
+    let mul_part = div_part.try_mul(&n4).unwrap();
+    let add = mod_part.try_add(&mul_part).unwrap();
+
+    let result = matcher.rewrite(&add, &mut ());
+    // Should NOT rewrite to x because divisors don't match
+    assert!(!matches!(result, RewriteResult::Rewritten(ref r) if Arc::ptr_eq(r, &x)));
+}
+
+#[test]
+fn test_div_mod_property_identity() {
+    // For any x, n > 0: x%n + (x//n)*n == x
+    // This is a quick property spot-check with concrete values
+    let x_val = 17i32;
+    let n_val = 5i32;
+    
+    let mod_result = x_val % n_val;  // 2
+    let div_result = x_val / n_val;  // 3
+    let recombined = mod_result + div_result * n_val;  // 2 + 15 = 17
+    
+    assert_eq!(recombined, x_val);
+}
+
+
+
+// ===== Phase 4: Where/Branch Pattern Tests =====
+
+#[test]
+fn test_where_merge_branches() {
+    // where(a, where(b, c, d), d) → where(a & b, c, d)
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Bool, 1);
+    let b = UOp::var("b", DType::Bool, 1);
+    let c = UOp::var("c", DType::Int32, i64::MAX);
+    let d = UOp::var("d", DType::Int32, i64::MAX);
+    
+    // Build: where(a, where(b, c, d), d)
+    let inner_where = UOp::try_where(b.clone(), c.clone(), d.clone()).unwrap();
+    let outer_where = UOp::try_where(a.clone(), inner_where, d.clone()).unwrap();
+
+    let result = matcher.rewrite(&outer_where, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    
+    if let RewriteResult::Rewritten(rewritten) = result {
+        // Should become where(a & b, c, d)
+        if let Op::Ternary(TernaryOp::Where, cond, true_val, false_val) = rewritten.op() {
+            // Check condition is a & b
+            if let Op::Binary(BinaryOp::And, lhs, rhs) = cond.op() {
+                assert!(Arc::ptr_eq(lhs, &a) || Arc::ptr_eq(lhs, &b));
+                assert!(Arc::ptr_eq(rhs, &a) || Arc::ptr_eq(rhs, &b));
+            } else {
+                panic!("Expected And condition, got {:?}", cond.op());
+            }
+            // True branch should be c
+            assert!(Arc::ptr_eq(true_val, &c));
+            // False branch should be d
+            assert!(Arc::ptr_eq(false_val, &d));
+        } else {
+            panic!("Expected Where, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_where_merge_branches_no_match() {
+    // where(a, where(b, c, d), e) should NOT simplify (d != e)
+    let matcher = symbolic_simple();
+    let a = UOp::var("a", DType::Bool, 1);
+    let b = UOp::var("b", DType::Bool, 1);
+    let c = UOp::var("c", DType::Int32, i64::MAX);
+    let d = UOp::var("d", DType::Int32, i64::MAX);
+    let e = UOp::var("e", DType::Int32, i64::MAX);
+    
+    // Build: where(a, where(b, c, d), e)
+    let inner_where = UOp::try_where(b.clone(), c.clone(), d.clone()).unwrap();
+    let outer_where = UOp::try_where(a.clone(), inner_where.clone(), e.clone()).unwrap();
+
+    let result = matcher.rewrite(&outer_where, &mut ());
+    // May or may not rewrite, but if it does, should NOT be where(a&b, c, _)
+    if let RewriteResult::Rewritten(rewritten) = &result {
+        if let Op::Ternary(TernaryOp::Where, cond, _, _) = rewritten.op() {
+            // If rewritten, condition should NOT be And(a, b)
+            if let Op::Binary(BinaryOp::And, _, _) = cond.op() {
+                panic!("Should not merge branches when false values differ");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_cast_where_push() {
+    // where(s, a, b).cast(f32) → where(s, a.cast(f32), b.cast(f32))
+    let matcher = symbolic_simple();
+    let s = UOp::var("s", DType::Bool, 1);
+    let a = UOp::native_const(1i32);
+    let b = UOp::native_const(0i32);
+    
+    // Build: cast(where(s, a, b), f32)
+    let where_op = UOp::try_where(s.clone(), a.clone(), b.clone()).unwrap();
+    let cast_where = UOp::cast(where_op, DType::Float32);
+
+    let result = matcher.rewrite(&cast_where, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    
+    if let RewriteResult::Rewritten(rewritten) = result {
+        // Should become where(s, cast(a, f32), cast(b, f32))
+        if let Op::Ternary(TernaryOp::Where, cond, true_val, false_val) = rewritten.op() {
+            assert!(Arc::ptr_eq(cond, &s));
+            // True branch should be cast
+            assert!(matches!(true_val.op(), Op::Cast { .. }));
+            // False branch should be cast
+            assert!(matches!(false_val.op(), Op::Cast { .. }));
+        } else {
+            panic!("Expected Where, got {:?}", rewritten.op());
+        }
+    }
+}
+

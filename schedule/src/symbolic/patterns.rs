@@ -97,9 +97,11 @@ pub fn symbolic_simple() -> PatternMatcher {
         + zero_folding_dsl_patterns()
         + division_dsl_patterns()
         + cast_dsl_patterns()
+        + cast_where_dsl_patterns()
         + term_combining_dsl_patterns()
         + alu_folding_dsl_patterns()
         + advanced_division_dsl_patterns()
+        + div_mod_recombine_dsl_patterns()
         + comparison_dsl_patterns()
         + boolean_dsl_patterns()
         + minmax_dsl_patterns()
@@ -266,6 +268,7 @@ pub fn advanced_division_dsl_patterns() -> PatternMatcher {
 /// - (x * c1) * c2 → x * (c1 * c2)
 /// - (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2)
 /// - (x + c1) - c2 → x + (c1 - c2) or x - (c2 - c1)
+/// - (x - c1) - c2 → x - (c1 + c2)
 pub fn alu_folding_dsl_patterns() -> PatternMatcher {
     patterns! {
         // (x + c1) + c2 → x + (c1 + c2)
@@ -296,6 +299,10 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
             }
             x.try_add(&UOp::const_(c1.dtype(), diff_val)).ok()
         },
+
+        // (x - c1) - c2 → x - (c1 + c2)
+        Sub(Sub(x, c1 @const(c1_val)), c2 @const(c2_val))
+          => x.try_sub(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
     }
 }
 
@@ -387,6 +394,26 @@ pub fn dce_dsl_patterns() -> PatternMatcher {
 
         // WHERE(!cond, t, f) → WHERE(cond, f, t) - negated condition swap
         Where(Not(cond), t, f) => UOp::try_where(Arc::clone(cond), Arc::clone(f), Arc::clone(t)).ok(),
+
+        // WHERE(a, WHERE(b, c, d), d) → WHERE(a & b, c, d) - branch merging
+        Where(a, Where(b, c, d), d2) if Arc::ptr_eq(d, d2) => {
+            let combined_cond = a.try_and_op(b).ok()?;
+            UOp::try_where(combined_cond, Arc::clone(c), Arc::clone(d)).ok()
+        },
+    }
+}
+
+/// Cast pushing through WHERE patterns.
+///
+/// - where(s, a, b).cast(dtype) → where(s, a.cast(dtype), b.cast(dtype))
+pub fn cast_where_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // cast(where(s, a, b), dtype) → where(s, cast(a, dtype), cast(b, dtype))
+        Cast { src: Where(s, a, b), dtype } => {
+            let cast_a = UOp::cast(Arc::clone(a), dtype.clone());
+            let cast_b = UOp::cast(Arc::clone(b), dtype.clone());
+            UOp::try_where(Arc::clone(s), cast_a, cast_b).ok()
+        },
     }
 }
 
@@ -396,6 +423,8 @@ pub fn dce_dsl_patterns() -> PatternMatcher {
 /// - Self-comparison fast path (x op x)
 /// - Constant folding
 /// - Range-based analysis via vmin/vmax
+/// - Const offset: (c0 + x) < c1 → x < (c1 - c0)
+/// - Negation flip: -x < -y → y < x
 pub fn comparison_dsl_patterns() -> PatternMatcher {
     patterns! {
         for op in binary [Lt, Eq, Ne] {
@@ -425,7 +454,16 @@ pub fn comparison_dsl_patterns() -> PatternMatcher {
 
                 None
             }
-        }
+        },
+
+        // (c0 + x) < c1 → x < (c1 - c0) for integers - commutative
+        Lt(Add[c0 @const(c0_val), x], c1 @const(c1_val)) => {
+            let diff = eval_sub_typed(c1_val, c0_val, c0.dtype().base())?;
+            x.try_cmplt(&UOp::const_(c0.dtype(), diff)).ok()
+        },
+
+        // -x < -y → y < x (negation flip for Lt)
+        Lt(Neg(x), Neg(y)) => y.try_cmplt(x).ok(),
     }
 }
 
@@ -433,12 +471,42 @@ pub fn comparison_dsl_patterns() -> PatternMatcher {
 ///
 /// - !!x → x (double negation elimination)
 /// - x ^ x → 0 (xor self-cancellation)
+/// - x | !x → true (tautology)
+/// - x & !x → false (contradiction)
+/// - true | x → true, false & x → false
+/// - true & x → x, false | x → x (identity)
 pub fn boolean_dsl_patterns() -> PatternMatcher {
     patterns! {
         // !!x → x
         Not(Not(x)) ~> Arc::clone(x),
         // x ^ x → 0
         Xor(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+
+        // x | !x → true (tautology) - commutative
+        Or[x, Not(y)] if Arc::ptr_eq(x, y) && x.dtype() == DType::Bool
+          => Some(UOp::const_(DType::Bool, ConstValue::Bool(true))),
+
+        // x & !x → false (contradiction) - commutative
+        And[x, Not(y)] if Arc::ptr_eq(x, y) && x.dtype() == DType::Bool
+          => Some(UOp::const_(DType::Bool, ConstValue::Bool(false))),
+
+        // true | x → true (both orderings)
+        Or(t @const(t_val), _) if t_val == ConstValue::Bool(true) ~> Arc::clone(t),
+        Or(_, t @const(t_val)) if t_val == ConstValue::Bool(true)
+          => Some(UOp::const_(DType::Bool, ConstValue::Bool(true))),
+
+        // false & x → false (both orderings)
+        And(f @const(f_val), _) if f_val == ConstValue::Bool(false) ~> Arc::clone(f),
+        And(_, f @const(f_val)) if f_val == ConstValue::Bool(false)
+          => Some(UOp::const_(DType::Bool, ConstValue::Bool(false))),
+
+        // true & x → x (identity, both orderings)
+        And(c @const(c_val), x) if c_val == ConstValue::Bool(true) ~> Arc::clone(x),
+        And(x, c @const(c_val)) if c_val == ConstValue::Bool(true) ~> Arc::clone(x),
+
+        // false | x → x (identity, both orderings)
+        Or(c @const(c_val), x) if c_val == ConstValue::Bool(false) ~> Arc::clone(x),
+        Or(x, c @const(c_val)) if c_val == ConstValue::Bool(false) ~> Arc::clone(x),
     }
 }
 
@@ -473,5 +541,30 @@ pub fn negation_dsl_patterns() -> PatternMatcher {
     patterns! {
         // Double arithmetic negation: -(-x) → x
         Neg(Neg(x)) ~> Arc::clone(x),
+    }
+}
+
+/// Div/Mod recombination patterns.
+///
+/// - x%n + (x//n)*n → x (div-mod identity)
+/// - (x//n)*n + x%n → x (commutative form)
+/// - (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division)
+pub fn div_mod_recombine_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // x%n + (x//n)*n → x (div-mod identity)
+        Add[Mod(x, n), Mul[Idiv(x2, n2), n3]]
+          if Arc::ptr_eq(x, x2) && Arc::ptr_eq(n, n2) && Arc::ptr_eq(n, n3)
+          ~> Arc::clone(x),
+
+        // (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division simplification)
+        // e.g., (a//2 + 1) // 2 → (a + 2) // 4
+        Idiv(Add[Idiv(a, c1 @const(c1_val)), c2 @const(c2_val)], c3 @const(c3_val)) => {
+            // Compute c1 * c2 and c1 * c3
+            let c1_times_c2 = eval_mul_typed(c1_val, c2_val, c1.dtype().base())?;
+            let c1_times_c3 = eval_mul_typed(c1_val, c3_val, c1.dtype().base())?;
+            // (a + c1*c2) // (c1*c3)
+            a.try_add(&UOp::const_(c1.dtype(), c1_times_c2)).ok()?
+             .try_div(&UOp::const_(c1.dtype(), c1_times_c3)).ok()
+        },
     }
 }
