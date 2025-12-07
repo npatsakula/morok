@@ -2,7 +2,7 @@ use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
 
-use crate::rangeify::{KernelContext, split_kernel::split_store};
+use crate::rangeify::{KernelContext, kernel::split_store};
 
 #[test]
 fn test_split_store_basic() {

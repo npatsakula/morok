@@ -27,7 +27,7 @@ fn test_identical_ranges_no_realization() {
     // This would be called by merge_consumer_ranges
     // For now, verify that identical ranges would not cause realization
     // by checking all_ranges_same helper
-    use crate::rangeify::helpers::all_ranges_same;
+    use crate::rangeify::indexing::all_ranges_same;
 
     let indices0: Vec<_> = consumer_rngs[0].iter().map(|r| r.get_idx()).collect();
     let indices1: Vec<_> = consumer_rngs[1].iter().map(|r| r.get_idx()).collect();
@@ -99,7 +99,7 @@ fn test_all_ranges_same_identical() {
     let r1 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
     let r2 = r1.clone();
 
-    use crate::rangeify::helpers::all_ranges_same;
+    use crate::rangeify::indexing::all_ranges_same;
     assert!(all_ranges_same(&[r1, r2]));
 }
 
@@ -114,7 +114,7 @@ fn test_all_ranges_same_different() {
     let idx1 = r1.get_idx();
     let idx2 = r2.get_idx();
 
-    use crate::rangeify::helpers::all_ranges_same;
+    use crate::rangeify::indexing::all_ranges_same;
     assert!(!all_ranges_same(&[idx1, idx2]));
 }
 
@@ -172,7 +172,7 @@ fn test_or_merging_of_validity_masks() {
 #[test]
 fn test_empty_ranges_list() {
     // Empty ranges list should return true
-    use crate::rangeify::helpers::all_ranges_same;
+    use crate::rangeify::indexing::all_ranges_same;
     assert!(all_ranges_same(&[]));
 }
 
@@ -182,7 +182,7 @@ fn test_single_range() {
     let mut ctx = IndexingContext::new();
     let r1 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
-    use crate::rangeify::helpers::all_ranges_same;
+    use crate::rangeify::indexing::all_ranges_same;
     assert!(all_ranges_same(&[r1]));
 }
 

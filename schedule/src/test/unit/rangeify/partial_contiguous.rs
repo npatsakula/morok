@@ -14,8 +14,8 @@ use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, SInt, UOp};
 use test_case::test_case;
 
-use crate::rangeify::buffer_cost::PcontigConfig;
 use crate::rangeify::indexing::IndexingContext;
+use crate::rangeify::kernel::PcontigConfig;
 use crate::rangeify::patterns::buffer_removal_with_pcontig;
 use crate::rewrite::graph_rewrite;
 

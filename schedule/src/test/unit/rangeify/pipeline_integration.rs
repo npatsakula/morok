@@ -7,7 +7,7 @@ use std::f32::consts::PI;
 
 use morok_ir::{Op, UOp};
 
-use crate::rangeify::pipeline::run_kernel_split_pipeline;
+use crate::rangeify::kernel::run_kernel_split_pipeline;
 use crate::test::unit::rangeify::helpers::{count_define_globals, count_define_locals, count_kernels};
 
 #[test]

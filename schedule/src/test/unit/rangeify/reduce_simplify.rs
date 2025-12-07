@@ -10,7 +10,7 @@ use std::{f32::consts::PI, sync::Arc};
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, UOp};
 
-use crate::rangeify::reduce_simplify::{reduce_collapse, reduce_unparented};
+use crate::rangeify::transforms::{reduce_collapse, reduce_unparented};
 
 // ===== Test Helper Functions =====
 
@@ -231,7 +231,7 @@ fn test_reduce_collapse_multiple_ranges_all_independent() {
 
     if let Some(res) = result {
         // Result should have no range dependencies
-        assert!(crate::rangeify::helpers::no_range(&res), "Result should have no range dependencies");
+        assert!(crate::rangeify::indexing::no_range(&res), "Result should have no range dependencies");
     }
 }
 
@@ -332,20 +332,20 @@ fn test_no_range_with_ranges() {
     let sum = UOp::cast(range.clone(), DType::Int32).try_add(&const_5).unwrap();
 
     // Should return false because sum depends on range
-    assert!(!crate::rangeify::helpers::no_range(&sum));
+    assert!(!crate::rangeify::indexing::no_range(&sum));
 }
 
 #[test]
 fn test_no_range_without_ranges() {
     // UOp without RANGE dependencies should return true
     let const_val = UOp::native_const(42i32);
-    assert!(crate::rangeify::helpers::no_range(&const_val));
+    assert!(crate::rangeify::indexing::no_range(&const_val));
 
     // Arithmetic operations on constants also have no ranges
     let a = UOp::native_const(10i32);
     let b = UOp::native_const(20i32);
     let sum = a.try_add(&b).unwrap();
-    assert!(crate::rangeify::helpers::no_range(&sum));
+    assert!(crate::rangeify::indexing::no_range(&sum));
 }
 
 #[test]
@@ -353,12 +353,12 @@ fn test_range_size_extraction_constant() {
     // Extract size from constant RANGE
     let range = UOp::range_axis(UOp::index_const(100), AxisId::Renumbered(0), AxisType::Loop);
 
-    assert_eq!(crate::rangeify::helpers::range_size_as_i64(&range), Some(100));
+    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&range), Some(100));
 
     // Test with different constant values
     let range_42 = UOp::range_axis(UOp::index_const(42), AxisId::Renumbered(1), AxisType::Reduce);
 
-    assert_eq!(crate::rangeify::helpers::range_size_as_i64(&range_42), Some(42));
+    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&range_42), Some(42));
 }
 
 #[test]
@@ -367,18 +367,18 @@ fn test_range_size_extraction_symbolic() {
     let symbolic_var = UOp::define_var("N".to_string(), 1000);
     let range = UOp::range_axis(symbolic_var, AxisId::Renumbered(0), AxisType::Loop);
 
-    assert_eq!(crate::rangeify::helpers::range_size_as_i64(&range), None);
+    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&range), None);
 }
 
 #[test]
 fn test_range_size_extraction_non_range() {
     // Non-RANGE UOp should return None
     let const_op = UOp::native_const(100i32);
-    assert_eq!(crate::rangeify::helpers::range_size_as_i64(&const_op), None);
+    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&const_op), None);
 
     // Binary operation also returns None
     let a = UOp::native_const(10i32);
     let b = UOp::native_const(20i32);
     let sum = a.try_add(&b).unwrap();
-    assert_eq!(crate::rangeify::helpers::range_size_as_i64(&sum), None);
+    assert_eq!(crate::rangeify::indexing::range_size_as_i64(&sum), None);
 }

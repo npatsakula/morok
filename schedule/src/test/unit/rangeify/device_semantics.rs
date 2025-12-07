@@ -12,7 +12,7 @@ use std::sync::Arc;
 use morok_dtype::{AddrSpace, DType, DeviceSpec};
 use morok_ir::{Op, UOp};
 
-use crate::rangeify::buffer_limits::extract_device_from_graph;
+use crate::rangeify::patterns::extract_device_from_graph;
 
 // ===== Device Extraction =====
 

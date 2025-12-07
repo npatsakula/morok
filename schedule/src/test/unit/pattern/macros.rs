@@ -1,6 +1,6 @@
 use crate::pattern::UPat;
 use crate::pattern::{PatternMatcher, RewriteResult};
-use crate::rangeify::helpers::{get_const_value, is_identity_value};
+use crate::rangeify::indexing::{get_const_value, is_identity_value};
 use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, UOp, pattern};
 use std::sync::Arc;
@@ -65,7 +65,7 @@ fn test_pattern_macro_no_match() {
 
 #[test]
 fn test_pattern_macro_multiple_variables() {
-    use crate::rangeify::helpers::is_zero_value;
+    use crate::rangeify::indexing::is_zero_value;
 
     let mut patterns = vec![];
 

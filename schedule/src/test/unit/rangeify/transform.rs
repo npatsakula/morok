@@ -3,7 +3,7 @@ use morok_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::{
     IndexingContext,
-    transform::{should_remove_movement_op, transform_single_source, transform_sources_with_bufferize},
+    transforms::{should_remove_movement_op, transform_single_source, transform_sources_with_bufferize},
 };
 
 #[test]

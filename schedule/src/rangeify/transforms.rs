@@ -1,0 +1,625 @@
+//! Consolidated transformation functions for rangeify.
+//!
+//! This module contains:
+//! - Main `rangeify()` entry point
+//! - Movement op → BUFFERIZE+INDEX transformation helpers
+//! - BUFFERIZE → STORE conversion
+//! - Reduction simplifications (reduce_unparented, reduce_collapse)
+//! - Range flattening (flatten_range_impl)
+//! - Cycle detection (find_bufs)
+//!
+//! Consolidated from: transform.rs, bufferize_to_store.rs, reduce_simplify.rs,
+//! flatten_range.rs, cycle_detection.rs
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey};
+use smallvec::SmallVec;
+
+use super::context::RangeifyContext;
+use super::indexing::IndexingContext;
+use super::kernel::KernelContext;
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+/// Main rangeify transformation entry point.
+///
+/// Converts movement operations (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)
+/// into BUFFERIZE + INDEX operations with explicit loop ranges.
+pub fn rangeify(
+    sink: Arc<UOp>,
+    pcontig_config: Option<&super::kernel::PcontigConfig>,
+) -> morok_ir::Result<(Arc<UOp>, RangeifyContext)> {
+    // Step 1: Run range assignment to build IndexingContext
+    let (mut sink, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
+
+    // Step 2: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
+    let early_matcher = super::patterns::early_rewrites();
+    sink = crate::rewrite::graph_rewrite_bottom_up(&early_matcher, sink, &mut ());
+
+    // Step 2.5: Convert ReduceAxis → REDUCE early
+    sink = convert_reduceaxis_early(&sink, &mut indexing_ctx);
+
+    // Step 3: Apply core rangeify transformation (bottom-up)
+    let rangeify_matcher = super::patterns::apply_rangeify_patterns();
+    sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, sink, &mut indexing_ctx);
+
+    // Step 4: Buffer simplification
+    let buffer_simplify = super::patterns::buffer_folding() + super::patterns::dead_axis_removal();
+    sink = crate::rewrite::graph_rewrite(&buffer_simplify, sink, &mut ());
+
+    // Step 4.5: Apply early rewrites again for RESHAPE to scalar
+    sink = crate::rewrite::graph_rewrite_bottom_up(&early_matcher, sink, &mut ());
+
+    // Step 5: Cost-based buffer removal with partial contiguous
+    let mut pcontig = pcontig_config.cloned().unwrap_or_default();
+    let buffer_removal_matcher = super::patterns::buffer_removal_with_pcontig();
+    sink = apply_buffer_removal_protecting_sink(&sink, &buffer_removal_matcher, &mut pcontig);
+
+    // Step 6: Symbolic simplification
+    let symbolic_matcher = crate::symbolic::symbolic_simple();
+    sink = crate::rewrite::graph_rewrite(&symbolic_matcher, sink, &mut ());
+
+    // Step 6.5: Buffer limit enforcement
+    if let Some(device) = super::patterns::extract_device_from_graph(&sink)
+        && let Some(limit) = device.max_buffers()
+    {
+        let limit_matcher = super::patterns::buffer_limit_patterns(limit);
+        sink = crate::rewrite::graph_rewrite(&limit_matcher, sink, &mut ());
+    }
+
+    // Step 7: Reduction simplifications
+    let mut split_config = super::kernel::SplitReduceOpConfig::default();
+    let reduction_matcher = super::patterns::reduction_simplify_patterns();
+    sink = crate::rewrite::graph_rewrite(&reduction_matcher, sink, &mut split_config);
+
+    // Step 8: Build RangeifyContext for return
+    let rangeify_ctx = RangeifyContext { range_counter: indexing_ctx.range_counter(), range_map: HashMap::new() };
+
+    Ok((sink, rangeify_ctx))
+}
+
+// ============================================================================
+// TRANSFORM HELPERS (movement ops → BUFFERIZE + INDEX)
+// ============================================================================
+
+/// Transform a UOp's sources by adding BUFFERIZE + INDEX where needed.
+pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &IndexingContext) -> Option<Vec<Arc<UOp>>> {
+    if matches!(x.op(), Op::Bufferize { .. } | Op::Index { .. } | Op::After { .. }) {
+        return None;
+    }
+
+    let sources = x.op().sources();
+    if sources.is_empty() {
+        return None;
+    }
+
+    let (input_ranges, _) = ctx.get_ranges(x)?;
+
+    let mut new_sources = Vec::with_capacity(sources.len());
+    let mut any_changed = false;
+
+    for src in sources.iter() {
+        let new_src = transform_single_source(x, src, input_ranges, ctx);
+        if !Arc::ptr_eq(&new_src, src) {
+            any_changed = true;
+        }
+        new_sources.push(new_src);
+    }
+
+    if any_changed { Some(new_sources) } else { None }
+}
+
+/// Check if a UOp is a chain of movement ops ending in a buffer-like op.
+fn is_movement_chain_on_buffer(uop: &Arc<UOp>) -> bool {
+    let mut current = uop.clone();
+    while current.op().is_movement() {
+        if let Some(src) = current.op().sources().first() {
+            current = src.clone();
+        } else {
+            return false;
+        }
+    }
+    matches!(
+        current.op(),
+        Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
+    )
+}
+
+/// Transform a single source by adding BUFFERIZE + INDEX if needed.
+pub(crate) fn transform_single_source(
+    _consumer: &Arc<UOp>,
+    src: &Arc<UOp>,
+    input_ranges: &[Arc<UOp>],
+    ctx: &IndexingContext,
+) -> Arc<UOp> {
+    // Case 1: Buffer-like op → add INDEX
+    if matches!(
+        src.op(),
+        Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
+    ) {
+        return UOp::index(Arc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for buffer source");
+    }
+
+    // Case 1.5: Movement op chain on buffer → add INDEX
+    if src.op().is_movement() && is_movement_chain_on_buffer(src) {
+        return UOp::index(Arc::clone(src), input_ranges.to_vec())
+            .expect("Failed to create INDEX for movement buffer source");
+    }
+
+    // Case 2: Source needs realization → wrap in BUFFERIZE + INDEX
+    if let Some(realize_axes) = ctx.get_realize_axes(src) {
+        let (_, output_ranges) = ctx.get_ranges(src).expect("Realized op must have ranges");
+
+        let closed_ranges: Vec<_> = output_ranges
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| realize_axes.contains(i))
+            .map(|(_, r)| Arc::clone(r))
+            .collect();
+
+        let opts = if output_ranges.len() == realize_axes.len() {
+            BufferizeOpts { device: None, addrspace: AddrSpace::Global }
+        } else {
+            BufferizeOpts { device: None, addrspace: AddrSpace::Local }
+        };
+
+        let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges, opts);
+
+        let index_ranges: Vec<_> = input_ranges
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| realize_axes.contains(i))
+            .map(|(_, r)| Arc::clone(r))
+            .collect();
+
+        if !index_ranges.is_empty() {
+            return UOp::index(bufferized, index_ranges).expect("Failed to create INDEX after BUFFERIZE");
+        } else {
+            return bufferized;
+        }
+    }
+
+    // Case 3: No transformation needed
+    Arc::clone(src)
+}
+
+/// Check if a movement op should be removed.
+pub fn should_remove_movement_op(x: &Arc<UOp>, ctx: &IndexingContext) -> bool {
+    if ctx.range_map.contains_key(&UOpKey(Arc::clone(x))) {
+        return true;
+    }
+
+    if let Some(src) = x.op().sources().first()
+        && matches!(src.op(), Op::Index { .. })
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Apply buffer removal patterns while protecting SINK sources.
+fn apply_buffer_removal_protecting_sink(
+    sink: &Arc<UOp>,
+    matcher: &crate::pattern::matcher::PatternMatcher<super::kernel::PcontigConfig>,
+    ctx: &mut super::kernel::PcontigConfig,
+) -> Arc<UOp> {
+    let Op::Sink { sources } = sink.op() else {
+        return crate::rewrite::graph_rewrite(matcher, sink.clone(), ctx);
+    };
+
+    let mut new_sources = Vec::with_capacity(sources.len());
+    for src in sources.iter() {
+        if let Op::Bufferize { compute, ranges, opts } = src.op() {
+            let optimized_compute = crate::rewrite::graph_rewrite(matcher, compute.clone(), ctx);
+            let new_bufferize = UOp::bufferize(optimized_compute, ranges.to_vec(), opts.clone());
+            new_sources.push(new_bufferize);
+        } else {
+            let optimized = crate::rewrite::graph_rewrite(matcher, src.clone(), ctx);
+            new_sources.push(optimized);
+        }
+    }
+
+    UOp::sink(new_sources)
+}
+
+/// Convert all ReduceAxis operations to REDUCE before bottom-up reconstruction.
+#[allow(clippy::mutable_key_type)]
+fn convert_reduceaxis_early(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> Arc<UOp> {
+    let mut replacements: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+
+    for node in sink.toposort() {
+        let Op::ReduceAxis { src, reduce_op, axes } = node.op() else {
+            continue;
+        };
+
+        let Some((input_ranges, _)) = ctx.get_ranges(&node) else {
+            continue;
+        };
+
+        let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(i, range)| {
+                if axes.contains(&i) {
+                    if let Op::Range { axis_type: AxisType::Reduce, .. } = range.op() {
+                        Some(Arc::clone(range))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let reduced = if reduce_ranges.is_empty() {
+            Arc::clone(src)
+        } else {
+            UOp::reduce(Arc::clone(src), reduce_ranges, *reduce_op)
+        };
+
+        if let Some(ranges) = ctx.get_ranges(&node).cloned() {
+            ctx.set_ranges(&reduced, ranges.0, ranges.1);
+        }
+
+        replacements.insert(UOpKey(node.clone()), reduced);
+    }
+
+    sink.substitute(&replacements)
+}
+
+// ============================================================================
+// BUFFERIZE TO STORE CONVERSION
+// ============================================================================
+
+/// Calculate buffer size from RANGE operations.
+fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
+    if ranges.is_empty() {
+        return 1;
+    }
+
+    ranges
+        .iter()
+        .map(|r| {
+            if let Op::Range { end, .. } = r.op() {
+                match end.vmax() {
+                    ConstValue::Int(v) if *v > 0 => *v as usize,
+                    ConstValue::UInt(v) if *v > 0 => *v as usize,
+                    other => panic!(
+                        "Cannot allocate buffer with symbolic size: range bound resolved to {:?}. \
+                         Buffers require concrete sizes (Tinygrad: 'no symbolic sized buffers')",
+                        other
+                    ),
+                }
+            } else {
+                1
+            }
+        })
+        .product()
+}
+
+/// Convert BUFFERIZE operation to STORE with buffer allocation and END wrapping.
+pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
+    let (compute, ranges, opts) = match bufferize_op.op() {
+        Op::Bufferize { compute, ranges, opts } => (compute, ranges, opts),
+        _ => return None,
+    };
+
+    let buffer = if let Some(existing_buffer) = ctx.get_buffer(bufferize_op) {
+        existing_buffer.clone()
+    } else {
+        let size = calculate_size_from_ranges(ranges);
+        let base_dtype = compute.dtype();
+        let ptr_dtype = base_dtype.ptr(Some(size), opts.addrspace);
+
+        if opts.addrspace == AddrSpace::Global {
+            let global_id = ctx.next_global();
+            UOp::define_global(global_id, ptr_dtype)
+        } else {
+            let local_id = ctx.next_local();
+            UOp::define_local(local_id, ptr_dtype)
+        }
+    };
+
+    let store_target = if !ranges.is_empty() {
+        UOp::index(buffer.clone(), ranges.to_vec()).expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
+    } else {
+        buffer.clone()
+    };
+
+    let store = UOp::store(buffer.clone(), store_target, compute.clone());
+
+    let mut do_store = if !ranges.is_empty() { UOp::end(store.clone(), ranges.clone()) } else { store };
+
+    if opts.addrspace == AddrSpace::Local {
+        do_store = UOp::barrier(do_store, SmallVec::new());
+    }
+
+    let result = UOp::after(buffer.clone(), SmallVec::from_elem(do_store, 1));
+    ctx.map_buffer(bufferize_op.clone(), result.clone());
+
+    Some(result)
+}
+
+// ============================================================================
+// REDUCTION SIMPLIFICATIONS
+// ============================================================================
+
+/// Remove ranges from REDUCE that don't appear in source.
+#[allow(clippy::mutable_key_type)]
+pub fn reduce_unparented(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
+        return None;
+    };
+
+    if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Mul | ReduceOp::Max | ReduceOp::Min) {
+        return None;
+    }
+
+    debug_assert!(
+        ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })),
+        "reduce_unparented: Some reduce srcs aren't ranges"
+    );
+
+    let src_ranges = src.in_scope_ranges();
+    let (parented, unparented) = partition_reduce_ranges(ranges, src_ranges);
+
+    if unparented.is_empty() {
+        return None;
+    }
+
+    let mut result = if !parented.is_empty() || reduce.dtype() != src.dtype() {
+        UOp::reduce(Arc::clone(src), parented, *reduce_op)
+    } else {
+        Arc::clone(src)
+    };
+
+    match reduce_op {
+        ReduceOp::Add => {
+            for range in &unparented {
+                let size = get_range_size(range)?;
+                let size_casted = cast_to_dtype(&size, &result.dtype())?;
+                result = result.try_mul(&size_casted).ok()?;
+            }
+        }
+        ReduceOp::Mul => {
+            for range in &unparented {
+                let size = get_range_size(range)?;
+                let size_casted = cast_to_dtype(&size, &result.dtype())?;
+                result = result.try_pow(&size_casted).ok()?;
+            }
+        }
+        ReduceOp::Max | ReduceOp::Min => {}
+    }
+
+    Some(result)
+}
+
+/// Partition ranges into parented and unparented.
+#[allow(clippy::mutable_key_type)]
+fn partition_reduce_ranges(
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
+    src_ranges: &HashSet<UOpKey>,
+) -> (SmallVec<[Arc<UOp>; 4]>, Vec<Arc<UOp>>) {
+    let mut parented = SmallVec::new();
+    let mut unparented = Vec::new();
+
+    for range in ranges {
+        let key = UOpKey(Arc::clone(range));
+        if src_ranges.contains(&key) {
+            parented.push(Arc::clone(range));
+        } else {
+            unparented.push(Arc::clone(range));
+        }
+    }
+
+    (parented, unparented)
+}
+
+fn get_range_size(range: &Arc<UOp>) -> Option<Arc<UOp>> {
+    if let Op::Range { end, .. } = range.op() { Some(Arc::clone(end)) } else { None }
+}
+
+/// Lift range-independent computations outside REDUCE via symbolic simplification.
+#[allow(clippy::mutable_key_type)]
+pub fn reduce_collapse(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Reduce { src, ranges, .. } = reduce.op() else {
+        return None;
+    };
+
+    if ranges.is_empty() {
+        return None;
+    }
+
+    let mut substitute_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+
+    for (i, range) in ranges.iter().enumerate() {
+        let size_i64 = super::indexing::range_size_as_i64(range)?;
+
+        if size_i64 <= 0 {
+            return None;
+        }
+
+        let var_name = format!("ridx{}", i);
+        let define_var = UOp::define_var(var_name, size_i64 - 1);
+
+        substitute_map.insert(UOpKey(Arc::clone(range)), define_var);
+    }
+
+    let substituted = src.substitute(&substitute_map);
+    let matcher = crate::symbolic::symbolic_simple();
+    let simplified = crate::rewrite::graph_rewrite(&matcher, substituted, &mut ());
+
+    let vars_in_simplified: HashSet<UOpKey> =
+        simplified.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::DefineVar { .. })).map(UOpKey).collect();
+
+    let has_var_dependency = substitute_map.values().any(|var| vars_in_simplified.contains(&UOpKey(Arc::clone(var))));
+
+    if has_var_dependency {
+        return None;
+    }
+
+    if !super::indexing::no_range(&simplified) {
+        return None;
+    }
+
+    let reverse_map: HashMap<UOpKey, Arc<UOp>> =
+        substitute_map.into_iter().map(|(range_key, var)| (UOpKey(var), range_key.0)).collect();
+
+    Some(simplified.substitute(&reverse_map))
+}
+
+fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Arc<UOp>> {
+    use morok_dtype::DType;
+
+    let scalar_type = match target_dtype {
+        DType::Scalar(s) => DType::Scalar(*s),
+        DType::Vector { scalar, .. } => DType::Scalar(*scalar),
+        _ => return None,
+    };
+
+    let casted = UOp::cast(Arc::clone(value), scalar_type);
+
+    if target_dtype.is_vector() {
+        let count = target_dtype.count();
+        let elements: SmallVec<[Arc<UOp>; 4]> = (0..count).map(|_| casted.clone()).collect();
+        Some(UOp::vectorize(elements))
+    } else {
+        Some(casted)
+    }
+}
+
+// ============================================================================
+// RANGE FLATTENING
+// ============================================================================
+
+/// Flatten nested RANGE operations into canonical form.
+pub fn flatten_range_impl(r: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let off = match r.op() {
+        Op::Reduce { .. } => 1,
+        Op::Store { .. } => 3,
+        Op::End { .. } => 1,
+        _ => return None,
+    };
+
+    let mut all_range_sources: Vec<Arc<UOp>> = r.op().sources().iter().skip(off).cloned().collect();
+
+    let innermost_computation = if matches!(r.op(), Op::End { .. }) {
+        let mut computation = Arc::clone(&r.op().sources()[0]);
+
+        while matches!(computation.op(), Op::End { .. }) {
+            all_range_sources.extend(computation.op().sources().iter().skip(1).cloned());
+            computation = Arc::clone(&computation.op().sources()[0]);
+        }
+
+        Some(computation)
+    } else {
+        None
+    };
+
+    if all_range_sources.is_empty() {
+        return None;
+    }
+
+    let sink = UOp::sink(all_range_sources);
+    let new_ranges: Vec<Arc<UOp>> =
+        sink.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::Range { .. })).collect();
+
+    if new_ranges.is_empty() {
+        return None;
+    }
+
+    let mut new_sources: Vec<Arc<UOp>> =
+        if let Some(inner_comp) = innermost_computation { vec![inner_comp] } else { r.op().sources()[..off].to_vec() };
+    new_sources.extend(new_ranges);
+
+    Some(r.with_sources(new_sources))
+}
+
+/// Apply range flattening to a computation graph.
+#[allow(clippy::mutable_key_type)]
+pub fn flatten_ranges(root: &Arc<UOp>) -> Arc<UOp> {
+    let mut replacements: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+
+    for node in root.toposort() {
+        if let Some(flattened) = flatten_range_impl(&node) {
+            replacements.insert(UOpKey(node.clone()), flattened);
+        }
+    }
+
+    root.substitute(&replacements)
+}
+
+// ============================================================================
+// CYCLE DETECTION
+// ============================================================================
+
+/// Buffer access types for cycle detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OpAccessType {
+    Load,
+    Store,
+}
+
+/// Unwrap buffer-like ops to get the underlying buffer.
+pub fn as_buf(uop: &Arc<UOp>) -> Arc<UOp> {
+    match uop.op() {
+        Op::MSelect { buffer, .. } => buffer.clone(),
+        Op::MStack { buffers } if !buffers.is_empty() => buffers[0].clone(),
+        Op::After { passthrough, .. } => passthrough.clone(),
+        _ => uop.clone(),
+    }
+}
+
+/// Detect conflicting buffer accesses. Panics if same buffer has both LOAD and STORE.
+#[allow(clippy::mutable_key_type)]
+pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
+    let mut ret: HashMap<UOpKey, OpAccessType> = HashMap::new();
+
+    let nodes = store.toposort_filtered(|uop| !matches!(uop.op(), Op::After { .. }));
+
+    for node in nodes {
+        if let Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } = node.op() {
+            let buf = as_buf(buffer);
+            let buf_key = UOpKey(buf.clone());
+
+            if let Some(&existing_access) = ret.get(&buf_key)
+                && existing_access != OpAccessType::Load
+            {
+                panic!(
+                    "buffer accessed with conflicting ops: {:?} (existing: {:?}, new: {:?})",
+                    buf,
+                    existing_access,
+                    OpAccessType::Load
+                );
+            }
+
+            ret.insert(buf_key, OpAccessType::Load);
+        }
+
+        if let Op::Store { buffer, .. } | Op::StoreGated { buffer, .. } = node.op() {
+            let buf = as_buf(buffer);
+            let buf_key = UOpKey(buf.clone());
+
+            if let Some(&existing_access) = ret.get(&buf_key)
+                && existing_access != OpAccessType::Store
+            {
+                panic!(
+                    "buffer accessed with conflicting ops: {:?} (existing: {:?}, new: {:?})",
+                    buf,
+                    existing_access,
+                    OpAccessType::Store
+                );
+            }
+
+            ret.insert(buf_key, OpAccessType::Store);
+        }
+    }
+
+    ret
+}

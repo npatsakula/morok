@@ -1,6 +1,6 @@
 use morok_ir::{Op, UOp};
 
-use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store};
+use crate::rangeify::{KernelContext, bufferize_to_store};
 
 #[test]
 fn test_bufferize_to_store_global() {
@@ -309,7 +309,7 @@ fn test_bufferize_to_store_mixed_global_local() {
 
 #[test]
 fn test_bufferize_to_store_integration_with_split_kernel() {
-    use crate::rangeify::split_kernel::split_store;
+    use crate::rangeify::kernel::split_store;
 
     let mut ctx = KernelContext::new();
 

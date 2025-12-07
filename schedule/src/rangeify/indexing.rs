@@ -1,11 +1,17 @@
 //! Range assignment and indexing context for rangeify transformation.
+//!
+//! This module provides the core range assignment algorithm that converts
+//! movement operations into explicit loop ranges.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
 
-use super::helpers;
+// ============================================================================
+// Context
+// ============================================================================
 
 /// (input_ranges, output_ranges) for a UOp.
 type UOpRanges = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
@@ -90,6 +96,10 @@ impl IndexingContext {
     }
 }
 
+// ============================================================================
+// Core Algorithm
+// ============================================================================
+
 /// Run range assignment on a UOp graph. Returns (transformed_sink, context).
 #[allow(clippy::mutable_key_type)]
 pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingContext)> {
@@ -99,13 +109,9 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
     generate_realize_map(&sink, &mut ctx)?;
 
     // Step 2: Get toposort (root-to-leaves) and consumer map
-    // We need forward traversal so that BUFFERIZE is processed first,
-    // then its compute (ADD), then the inputs (RESHAPE, BUFFER).
-    // This allows ranges to propagate from BUFFERIZE → ADD → RESHAPE.
     let consumer_map = sink.get_consumer_map();
 
     // Use forward toposort (root first) for range propagation
-    // The sink.toposort() gives leaves-to-root, so we reverse it
     let forward_topo: Vec<_> = sink.toposort().into_iter().rev().collect();
 
     // Step 3: Assign ranges via forward traversal
@@ -120,10 +126,8 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
 
 /// Generate the realize map - mark which UOps need to be materialized to buffers.
 fn generate_realize_map(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> morok_ir::Result<()> {
-    // Traverse graph and mark realization points
     for node in sink.toposort() {
         match node.op() {
-            // Always realize SINK sources
             Op::Sink { sources } => {
                 for src in sources {
                     if !is_always_contiguous(src) {
@@ -131,13 +135,9 @@ fn generate_realize_map(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> morok_ir:
                     }
                 }
             }
-
-            // Always realize these operations
             Op::Copy { .. } | Op::Contiguous { .. } => {
                 ctx.mark_realize_all(&node)?;
             }
-
-            // Realize sources of these operations
             Op::MStack { buffers } => {
                 for buf in buffers {
                     if !is_always_contiguous(buf) {
@@ -145,7 +145,6 @@ fn generate_realize_map(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> morok_ir:
                     }
                 }
             }
-
             _ => {}
         }
     }
@@ -170,34 +169,21 @@ fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
 }
 
 /// Check if a UOp represents constant true (handles unsimplified OR expressions).
-///
-/// This is needed because `try_or_op(const(true), const(true))` creates
-/// `Binary(Or, true, true)` without simplification, not `Const(true)`.
 fn is_const_true(uop: &Arc<UOp>) -> bool {
     match uop.op() {
         Op::Const(cv) => matches!(cv.0, ConstValue::Bool(true)),
-        // Handle unsimplified true | true = true
         Op::Binary(BinaryOp::Or, a, b) => is_const_true(a) && is_const_true(b),
         _ => false,
     }
 }
 
 /// Merge ranges from multiple consumers. Creates new ranges and marks realization when needed.
-///
-/// This function handles multi-consumer scenarios where different consumers may have
-/// different ranges for the same dimension. It:
-/// 1. Merges compatible ranges (same indices) by OR-ing validity masks
-/// 2. Creates new ranges for incompatible dimensions and marks them for realization
-///
-/// Returns the merged ranges and updates the context's realize_map if needed.
 pub(crate) fn merge_consumer_ranges(
     uop: &Arc<UOp>,
     consumer_rngs: &[Vec<Arc<UOp>>],
     ctx: &mut IndexingContext,
 ) -> morok_ir::Result<Vec<Arc<UOp>>> {
-    // Get shape to know how many dimensions
     let Some(shape) = uop.shape()? else {
-        // No shape - return empty ranges (should not happen in practice)
         return Ok(Vec::new());
     };
 
@@ -216,57 +202,43 @@ pub(crate) fn merge_consumer_ranges(
     let mut out_rngs = Vec::new();
     let mut realize_axes = Vec::new();
 
-    // Process each dimension
     for (dim_idx, dim_ranges) in all_rngs.iter().enumerate() {
         if dim_ranges.is_empty() {
-            // No ranges for this dimension - create new one
             out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Loop));
             realize_axes.push(dim_idx);
             continue;
         }
 
         // FAST PATH: If all ranges are pointer-equal, return original unchanged
-        // This preserves Arc identity for tests like test_merge_consumer_ranges_identical_1d
         if dim_ranges.iter().skip(1).all(|r| Arc::ptr_eq(&dim_ranges[0], r)) {
             out_rngs.push(Arc::clone(&dim_ranges[0]));
             continue;
         }
 
-        // Extract index and valid components
         let indices: Vec<_> = dim_ranges.iter().map(|r| r.get_idx()).collect();
         let valids: Vec<_> = dim_ranges.iter().map(|r| r.get_valid()).collect();
 
-        // Check if all indices are the same
-        if helpers::all_ranges_same(&indices) {
-            // Compatible - merge validity masks
+        if all_ranges_same(&indices) {
             let merged_idx = Arc::clone(&indices[0]);
-
-            // OR all validity masks: valid1 | valid2 | ... | validN
             let merged_valid = if valids.len() == 1 {
                 Arc::clone(&valids[0])
             } else {
                 valids.iter().skip(1).try_fold(Arc::clone(&valids[0]), |acc, v| acc.try_or_op(v))?
             };
 
-            // Check if merged valid is constant true (no validity check needed)
-            // Uses is_const_true to handle unsimplified true | true expressions
             let merged_range = if is_const_true(&merged_valid) {
-                // Always valid - use idx directly
                 merged_idx
             } else {
-                // Wrap index with merged validity: WHERE(merged_valid, merged_idx, INVALID)
                 UOp::try_where(merged_valid, merged_idx, UOp::invalid_marker())?
             };
 
             out_rngs.push(merged_range);
         } else {
-            // Incompatible - create new range and mark for realization
             out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Loop));
             realize_axes.push(dim_idx);
         }
     }
 
-    // Update realize map with axes that need materialization
     if !realize_axes.is_empty() {
         ctx.mark_realize(uop, realize_axes);
     }
@@ -282,51 +254,34 @@ fn assign_ranges(
     ctx: &mut IndexingContext,
 ) -> morok_ir::Result<()> {
     for x in reverse_topo {
-        // Skip certain ops
         if matches!(x.op(), Op::Device(_) | Op::Unique(_)) {
             continue;
         }
 
-        // Get consumers for this UOp
         let consumers: Vec<_> = consumer_map.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
-
-        // Collect consumer ranges
         let consumer_rngs: Vec<Vec<Arc<UOp>>> =
             consumers.iter().filter_map(|c| ctx.get_ranges(c).map(|(inp, _)| inp.clone())).collect();
 
-        // Determine output ranges
         let out_rngs = if ctx.should_realize(x) {
-            // Create new ranges for realized ops
             if let Some(shape) = x.shape()? {
                 let rngs: Vec<_> = shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect();
-
-                // Mark all axes as realized
                 let axes: Vec<usize> = (0..shape.len()).collect();
                 ctx.realize_map.insert(UOpKey(x.clone()), Some(axes));
-
                 rngs
             } else {
                 continue;
             }
         } else if let Op::Bufferize { ranges, .. } = x.op() {
-            // BUFFERIZE has no shape but already contains ranges
-            // Use those ranges directly as output ranges
-            // This allows range propagation to the compute inside BUFFERIZE
             ranges.to_vec()
         } else if consumer_rngs.is_empty() {
-            // No consumers have ranges
             continue;
         } else if consumer_rngs.len() == 1 {
-            // Single consumer - inherit ranges
             consumer_rngs[0].clone()
         } else {
-            // Multiple consumers - merge ranges
             merge_consumer_ranges(x, &consumer_rngs, ctx)?
         };
 
-        // Determine input ranges by applying movement op transformations
         let in_rngs = match x.op() {
-            // Movement ops transform ranges
             Op::Reshape { src, .. }
             | Op::Permute { src, .. }
             | Op::Expand { src, .. }
@@ -334,43 +289,21 @@ fn assign_ranges(
             | Op::Shrink { src, .. }
             | Op::Flip { src, .. } => {
                 if let Some(in_shape) = src.shape()? {
-                    helpers::apply_movement_op(x.op(), in_shape, &out_rngs)
+                    apply_movement_op(x.op(), in_shape, &out_rngs)
                 } else {
                     out_rngs.clone()
                 }
             }
-
-            // REDUCE_AXIS creates ranges for reduction axes
-            //
-            // The source has shape [d0, d1, ..., dn] and the output has reduced dims.
-            // For each axis in the source:
-            // - If it's a reduce axis: create a new REDUCE-type range
-            // - If it's not a reduce axis: use the corresponding output range
-            //
-            // Note: out_rngs comes from downstream RESHAPE (e.g., from remove_singleton_dims
-            // when keepdim=false). Since morok always uses keepdim=true internally then RESHAPE,
-            // out_rngs has the same number of dims as the REDUCE_AXIS output. Each position i
-            // in the source corresponds to position i in out_rngs.
-            //
-            // Follows Tinygrad's approach (indexing.py:256):
-            //   rngs = tuple(new_range(s, REDUCE) if i in axes else r for i,(r,s) in enumerate(zip(rngs, shape)))
             Op::ReduceAxis { src, axes, .. } => {
                 if let Some(in_shape) = src.shape()? {
                     let mut rngs = Vec::with_capacity(in_shape.len());
-
                     for (i, s) in in_shape.iter().enumerate() {
                         if axes.contains(&i) {
-                            // Reduce axis: create new REDUCE-type range
                             rngs.push(ctx.new_range(s, AxisType::Reduce));
+                        } else if i < out_rngs.len() {
+                            rngs.push(Arc::clone(&out_rngs[i]));
                         } else {
-                            // Non-reduce axis: use output range at same position
-                            // Position i in source maps to position i in out_rngs (keepdim=true)
-                            if i < out_rngs.len() {
-                                rngs.push(Arc::clone(&out_rngs[i]));
-                            } else {
-                                // Fallback: create LOOP range
-                                rngs.push(ctx.new_range(s, AxisType::Loop));
-                            }
+                            rngs.push(ctx.new_range(s, AxisType::Loop));
                         }
                     }
                     rngs
@@ -378,13 +311,388 @@ fn assign_ranges(
                     out_rngs.clone()
                 }
             }
-
-            // All other ops pass through ranges unchanged
             _ => out_rngs.clone(),
         };
 
-        // Store the range mapping
         ctx.set_ranges(x, in_rngs, out_rngs);
     }
     Ok(())
+}
+
+// ============================================================================
+// Movement Op Helpers (from helpers.rs)
+// ============================================================================
+
+/// Transform ranges through a movement op (SHRINK, PERMUTE, FLIP, EXPAND, PAD, RESHAPE).
+pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+    match op {
+        Op::Shrink { begins, .. } => {
+            let begin_vals = extract_shape_values(begins);
+            rngs.iter()
+                .zip(begin_vals.iter())
+                .map(|(rng, &begin)| {
+                    if begin == 0 {
+                        Arc::clone(rng)
+                    } else {
+                        let begin_uop = UOp::index_const(begin as i64);
+                        rng.try_add(&begin_uop).unwrap()
+                    }
+                })
+                .collect()
+        }
+
+        Op::Permute { axes, .. } => {
+            let inv_perm = argsort(axes);
+            inv_perm.iter().map(|&i| Arc::clone(&rngs[i])).collect()
+        }
+
+        Op::Flip { axes: flips, .. } => rngs
+            .iter()
+            .zip(in_shape.iter())
+            .zip(flips.iter())
+            .map(|((rng, shape), &flip)| {
+                if !flip {
+                    Arc::clone(rng)
+                } else {
+                    let shape_minus_1 = match shape {
+                        SInt::Const(n) => UOp::index_const(*n as i64 - 1),
+                        SInt::Symbolic(uop) => {
+                            let one = UOp::index_const(1);
+                            uop.try_sub(&one).unwrap()
+                        }
+                    };
+                    shape_minus_1.try_sub(rng).unwrap()
+                }
+            })
+            .collect(),
+
+        Op::Expand { new_shape, .. } => {
+            let new_shape_vals = extract_shape_from_uop(new_shape);
+            rngs.iter()
+                .zip(in_shape.iter())
+                .zip(new_shape_vals.iter())
+                .map(|((rng, in_sh), out_sh)| {
+                    let expanding = match (in_sh, out_sh) {
+                        (SInt::Const(1), SInt::Const(n)) if *n > 1 => true,
+                        (SInt::Const(1), SInt::Symbolic(_)) => true,
+                        _ => false,
+                    };
+                    if expanding { UOp::index_const(0) } else { Arc::clone(rng) }
+                })
+                .collect()
+        }
+
+        Op::Pad { begin_pads, end_pads, .. } => {
+            let begin_vals = extract_shape_values(begin_pads);
+            let end_vals = extract_shape_values(end_pads);
+            rngs.iter()
+                .zip(in_shape.iter())
+                .zip(begin_vals.iter().zip(end_vals.iter()))
+                .map(|((rng, shape), (&begin, &end))| {
+                    if begin == 0 && end == 0 {
+                        return Arc::clone(rng);
+                    }
+                    let begin_uop = UOp::index_const(begin as i64);
+                    let shape_plus_begin = match shape {
+                        SInt::Const(n) => UOp::index_const(*n as i64 + begin as i64),
+                        SInt::Symbolic(uop) => uop.try_add(&begin_uop).unwrap(),
+                    };
+                    let too_low = rng.try_cmplt(&begin_uop).unwrap();
+                    let true_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
+                    let valid_low = too_low.try_xor_op(&true_val).unwrap();
+                    let valid_high = rng.try_cmplt(&shape_plus_begin).unwrap();
+                    let valid = valid_low.try_and_op(&valid_high).unwrap();
+                    let adjusted_rng = rng.try_sub(&begin_uop).unwrap();
+                    UOp::try_where(valid, adjusted_rng, UOp::invalid_marker()).unwrap()
+                })
+                .collect()
+        }
+
+        Op::Reshape { new_shape, .. } => {
+            let new_shape_vals = extract_shape_from_uop(new_shape);
+
+            // Optimization: If in_shape == new_shape, this is a no-op reshape
+            if in_shape.len() == new_shape_vals.len() {
+                let mut is_same_shape = true;
+                for (in_dim, out_dim) in in_shape.iter().zip(new_shape_vals.iter()) {
+                    match (in_dim, out_dim) {
+                        (SInt::Const(a), SInt::Const(b)) if a == b => continue,
+                        (SInt::Symbolic(a), SInt::Symbolic(b)) if a.id == b.id => continue,
+                        _ => {
+                            is_same_shape = false;
+                            break;
+                        }
+                    }
+                }
+                if is_same_shape {
+                    return rngs.to_vec();
+                }
+            }
+
+            // Flatten output indices
+            let mut acc = UOp::index_const(1);
+            let mut axes_in = Vec::new();
+            for (shape_dim, rng) in new_shape_vals.iter().zip(rngs.iter()).rev() {
+                let weighted = acc.try_mul(rng).unwrap();
+                axes_in.push(weighted);
+                acc = match shape_dim {
+                    SInt::Const(n) => {
+                        let n_uop = UOp::index_const(*n as i64);
+                        acc.try_mul(&n_uop).unwrap()
+                    }
+                    SInt::Symbolic(uop) => acc.try_mul(uop).unwrap(),
+                };
+            }
+            let combined_axes =
+                axes_in.into_iter().reduce(|a, b| a.try_add(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
+
+            // Unflatten into input shape dimensions
+            let mut axes_out = Vec::new();
+            let mut combined = combined_axes;
+            for shape_dim in in_shape.iter().rev() {
+                let shape_uop = match shape_dim {
+                    SInt::Const(n) => UOp::index_const(*n as i64),
+                    SInt::Symbolic(uop) => Arc::clone(uop),
+                };
+                let mod_result = combined.try_mod(&shape_uop).unwrap();
+                axes_out.push(mod_result);
+                combined = combined.try_div(&shape_uop).unwrap();
+            }
+            axes_out.reverse();
+            axes_out
+        }
+
+        _ => panic!("apply_movement_op called with non-movement op: {:?}", op),
+    }
+}
+
+/// Extract shape values from a UOp (for SHRINK begins/ends, PAD pads).
+fn extract_shape_values(uop: &Arc<UOp>) -> Vec<usize> {
+    match uop.op() {
+        Op::Vectorize { elements } => elements
+            .iter()
+            .map(|elem| match elem.op() {
+                Op::Const(cv) => match cv.0 {
+                    ConstValue::Int(n) => n as usize,
+                    _ => panic!("Expected int constant in vectorize"),
+                },
+                _ => panic!("Expected constant element in vectorize"),
+            })
+            .collect(),
+        Op::Const(cv) => match cv.0 {
+            ConstValue::Int(n) => vec![n as usize],
+            _ => panic!("Expected int constant"),
+        },
+        _ => panic!("Expected vectorize or constant for shape values, got {:?}", uop.op()),
+    }
+}
+
+/// Extract shape from a UOp (for RESHAPE new_shape, EXPAND new_shape).
+fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<SInt> {
+    match uop.op() {
+        Op::Vectorize { elements } => elements
+            .iter()
+            .map(|elem| match elem.op() {
+                Op::Const(cv) => match cv.0 {
+                    ConstValue::Int(n) => SInt::Const(n as usize),
+                    _ => SInt::Symbolic(Arc::clone(elem)),
+                },
+                _ => SInt::Symbolic(Arc::clone(elem)),
+            })
+            .collect(),
+        Op::Const(cv) => match cv.0 {
+            ConstValue::Int(n) => vec![SInt::Const(n as usize)],
+            _ => panic!("Expected int constant for shape"),
+        },
+        _ => panic!("Expected vectorize or constant for shape, got {:?}", uop.op()),
+    }
+}
+
+/// Compute inverse permutation (argsort).
+fn argsort(perm: &[usize]) -> Vec<usize> {
+    let mut inv = vec![0; perm.len()];
+    for (i, &p) in perm.iter().enumerate() {
+        inv[p] = i;
+    }
+    inv
+}
+
+// ============================================================================
+// Range Utilities (from helpers.rs)
+// ============================================================================
+
+/// Check if two range lists are pointer-equal (same UOps).
+pub fn ranges_equal(ranges1: &[Arc<UOp>], ranges2: &[Arc<UOp>]) -> bool {
+    ranges1.len() == ranges2.len() && ranges1.iter().zip(ranges2).all(|(r1, r2)| Arc::ptr_eq(r1, r2))
+}
+
+/// Check if all ranges have identical index expressions (ignoring validity masks).
+pub fn all_ranges_same(ranges: &[Arc<UOp>]) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
+    let first_idx = ranges[0].get_idx();
+    ranges.iter().skip(1).all(|r| {
+        let idx = r.get_idx();
+        Arc::ptr_eq(&first_idx, &idx) || uop_equal(&first_idx, &idx)
+    })
+}
+
+/// Deep structural equality check for UOps.
+pub fn uop_equal(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
+    if Arc::ptr_eq(a, b) {
+        return true;
+    }
+    if std::mem::discriminant(a.op()) != std::mem::discriminant(b.op()) {
+        return false;
+    }
+    if a.dtype() != b.dtype() {
+        return false;
+    }
+    if let (Op::Const(cv_a), Op::Const(cv_b)) = (a.op(), b.op()) {
+        return cv_a.0 == cv_b.0;
+    }
+    if let (
+        Op::Range { end: end_a, axis_id: id_a, axis_type: type_a },
+        Op::Range { end: end_b, axis_id: id_b, axis_type: type_b },
+    ) = (a.op(), b.op())
+    {
+        return id_a == id_b && type_a == type_b && uop_equal(end_a, end_b);
+    }
+    let a_srcs = a.op().sources();
+    let b_srcs = b.op().sources();
+    if a_srcs.len() != b_srcs.len() {
+        return false;
+    }
+    a_srcs.iter().zip(b_srcs.iter()).all(|(sa, sb)| uop_equal(sa, sb))
+}
+
+/// Check if range is dead (size ≤ 1). Uses vmax analysis.
+pub fn is_dead_axis(range: &Arc<UOp>) -> bool {
+    if !matches!(range.op(), Op::Range { .. }) {
+        return false;
+    }
+    match range.vmax() {
+        ConstValue::Int(v) => *v <= 0,
+        ConstValue::UInt(v) => *v == 0,
+        _ => false,
+    }
+}
+
+/// Check if UOp has no RANGE dependencies.
+#[allow(clippy::mutable_key_type)]
+pub fn no_range(uop: &Arc<UOp>) -> bool {
+    let in_scope_ranges = uop.in_scope_ranges();
+    !in_scope_ranges.iter().any(|key| matches!(key.0.op(), Op::Range { .. }))
+}
+
+/// Extract RANGE size as i64. Returns None for symbolic ranges.
+pub fn range_size_as_i64(range: &Arc<UOp>) -> Option<i64> {
+    if let Op::Range { end, .. } = range.op() {
+        match end.op() {
+            Op::Const(cv) => match cv.0 {
+                ConstValue::Int(n) => Some(n),
+                ConstValue::UInt(n) => Some(n as i64),
+                _ => None,
+            },
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+// ============================================================================
+// Helpers for patterns (from helpers.rs)
+// ============================================================================
+
+/// Check if value is identity for op (Add: 0, Mul: 1, And: -1, Or/Xor: 0).
+pub fn is_identity_value(value: &ConstValue, op: &BinaryOp, is_right: bool) -> bool {
+    match (op, value) {
+        (BinaryOp::Add, ConstValue::Int(0)) => true,
+        (BinaryOp::Add, ConstValue::Float(f)) if *f == 0.0 => true,
+        (BinaryOp::Sub, ConstValue::Int(0)) if is_right => true,
+        (BinaryOp::Sub, ConstValue::Float(f)) if is_right && *f == 0.0 => true,
+        (BinaryOp::Mul, ConstValue::Int(1)) => true,
+        (BinaryOp::Mul, ConstValue::Float(f)) if *f == 1.0 => true,
+        (BinaryOp::Idiv, ConstValue::Int(1)) if is_right => true,
+        (BinaryOp::Fdiv, ConstValue::Float(f)) if is_right && *f == 1.0 => true,
+        (BinaryOp::Or, ConstValue::Int(0)) => true,
+        (BinaryOp::Xor, ConstValue::Int(0)) => true,
+        (BinaryOp::And, ConstValue::Int(-1)) => true,
+        _ => false,
+    }
+}
+
+/// Check if value is zero/annihilator for op (Mul: 0, And: 0).
+pub fn is_zero_value(value: &ConstValue, op: &BinaryOp) -> bool {
+    match (op, value) {
+        (BinaryOp::Mul, ConstValue::Int(0)) => true,
+        (BinaryOp::Mul, ConstValue::Float(f)) if *f == 0.0 => true,
+        (BinaryOp::And, ConstValue::Int(0)) => true,
+        _ => false,
+    }
+}
+
+/// Extract the constant value from a UOp if it's a CONST operation.
+pub fn get_const_value(uop: &Arc<UOp>) -> Option<ConstValue> {
+    match uop.op() {
+        Op::Const(cv) => Some(cv.0),
+        _ => None,
+    }
+}
+
+/// Check if a UOp is a constant with a specific value.
+pub fn is_const(uop: &Arc<UOp>, value: &ConstValue) -> bool {
+    get_const_value(uop).as_ref() == Some(value)
+}
+
+/// Check if a UOp represents a zero-size tensor.
+pub fn is_zero_size(uop: &Arc<UOp>) -> bool {
+    uop.shape().ok().flatten().map(|shape| shape.iter().any(|dim| matches!(dim, SInt::Const(0)))).unwrap_or(false)
+}
+
+/// Check if a dtype is void (used for side-effecting operations).
+pub fn is_void(dtype: &DType) -> bool {
+    *dtype == DType::Void
+}
+
+/// Get the binary operation from a UOp if it's a BINARY operation.
+pub fn get_binary_op(uop: &Arc<UOp>) -> Option<BinaryOp> {
+    match uop.op() {
+        Op::Binary(op, _, _) => Some(*op),
+        _ => None,
+    }
+}
+
+/// Check if op should always run (CONTIGUOUS, COPY, ASSIGN, NOOP).
+pub fn is_always_run_op(op: &Op) -> bool {
+    matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Assign { .. } | Op::Noop)
+}
+
+/// Check if op is cheap to inline (CONST, Unary, Binary, Ternary, Cast, Gep, Vectorize).
+pub fn is_cheap_to_inline(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Const(_)
+            | Op::Unique(_)
+            | Op::Device(_)
+            | Op::Noop
+            | Op::DefineVar { .. }
+            | Op::DefineReg { .. }
+            | Op::VConst { .. }
+            | Op::Unary(..)
+            | Op::Binary(..)
+            | Op::Ternary(..)
+            | Op::Cast { .. }
+            | Op::BitCast { .. }
+            | Op::Gep { .. }
+            | Op::Vectorize { .. }
+            | Op::PointerIndex { .. }
+    )
+}
+
+/// Check if a BUFFERIZE operation is for local memory.
+pub fn is_local_bufferize(uop: &Arc<UOp>) -> bool {
+    if let Op::Bufferize { opts, .. } = uop.op() { opts.addrspace == morok_ir::AddrSpace::Local } else { false }
 }

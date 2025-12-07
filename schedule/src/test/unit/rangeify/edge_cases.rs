@@ -7,7 +7,7 @@ use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use smallvec::SmallVec;
 
-use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store, pipeline::run_kernel_split_pipeline};
+use crate::rangeify::{KernelContext, bufferize_to_store, run_kernel_split_pipeline};
 
 #[test]
 fn test_zero_size_range() {

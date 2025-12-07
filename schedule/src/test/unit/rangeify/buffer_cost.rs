@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::rangeify::buffer_cost::*;
+use crate::rangeify::kernel::*;
 use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, UOp};
 use smallvec::SmallVec;

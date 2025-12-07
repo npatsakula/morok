@@ -9,7 +9,7 @@ use morok_device::DeviceSpec;
 use morok_dtype::DType;
 use morok_ir::{UOp, UOpKey};
 
-use crate::rangeify::cycle_detection::{OpAccessType, as_buf, find_bufs};
+use crate::rangeify::transforms::{OpAccessType, as_buf, find_bufs};
 
 #[test]
 fn test_find_bufs_store_only() {

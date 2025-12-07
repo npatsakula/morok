@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use morok_ir::{Op, UOp};
 
-use crate::rangeify::codegen_patterns::{fix_after_broadcast, get_contiguous, rangeify_codegen_patterns, remove_noop};
+use crate::rangeify::patterns::{fix_after_broadcast, get_contiguous, rangeify_codegen_patterns, remove_noop};
 
 #[test]
 fn test_remove_noop_void_returns_none() {

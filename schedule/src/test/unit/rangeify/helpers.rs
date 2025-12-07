@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use morok_ir::{BinaryOp, BufferizeOpts, ConstValue, DType, Op, UOp};
 
-use crate::rangeify::helpers::{get_const_value, is_const, is_identity_value, is_zero_value};
+use crate::rangeify::indexing::{get_const_value, is_const, is_identity_value, is_zero_value};
 
 /// Count occurrences of ops matching a predicate in a UOp graph.
 ///

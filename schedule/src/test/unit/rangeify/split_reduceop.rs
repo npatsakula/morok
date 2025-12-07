@@ -14,7 +14,7 @@ use morok_dtype::DType;
 use morok_ir::{Op, SInt, UOp};
 use smallvec::SmallVec;
 
-use crate::rangeify::split_reduceop::{SplitReduceOpConfig, collect_range_ids, split_reduceop};
+use crate::rangeify::kernel::{SplitReduceOpConfig, collect_range_ids, split_reduceop};
 
 // ===== Configuration Tests =====
 

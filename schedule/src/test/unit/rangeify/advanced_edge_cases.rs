@@ -8,7 +8,7 @@
 
 use morok_ir::{DType, Op, UOp};
 
-use crate::rangeify::transform::rangeify;
+use crate::rangeify::transforms::rangeify;
 
 use super::helpers::{create_bufferize, create_const, create_range, create_range_symbolic};
 
@@ -209,7 +209,7 @@ fn test_range_size_mismatch() {
 
 #[test]
 fn test_is_dead_axis_constant_ranges() {
-    use crate::rangeify::helpers::is_dead_axis;
+    use crate::rangeify::indexing::is_dead_axis;
 
     // Dead: RANGE(0) - vmax = -1
     let range_0 = create_range(0, 0);
@@ -230,7 +230,7 @@ fn test_is_dead_axis_constant_ranges() {
 
 #[test]
 fn test_is_dead_axis_symbolic_bounded() {
-    use crate::rangeify::helpers::is_dead_axis;
+    use crate::rangeify::indexing::is_dead_axis;
 
     // Dead: variable bounded to [1, 1]
     let size = UOp::var("size", DType::Index, 1);
@@ -250,7 +250,7 @@ fn test_is_dead_axis_symbolic_bounded() {
 
 #[test]
 fn test_is_dead_axis_non_range() {
-    use crate::rangeify::helpers::is_dead_axis;
+    use crate::rangeify::indexing::is_dead_axis;
 
     // Non-RANGE operations should return false
     let const_op = UOp::index_const(0);
@@ -292,7 +292,7 @@ fn test_symbolic_dead_range_smoke_test() {
     assert!(!std::sync::Arc::ptr_eq(&result, &bufferized_clone), "Result should be transformed");
 
     // Verify is_dead_axis() correctly identifies the dead range
-    use crate::rangeify::helpers::is_dead_axis;
+    use crate::rangeify::indexing::is_dead_axis;
     assert!(is_dead_axis(&dead_range_clone), "var[1,1] range should be detected as dead");
     assert!(!is_dead_axis(&live_range_clone), "Range(10) should be detected as live");
 }

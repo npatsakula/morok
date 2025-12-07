@@ -6,7 +6,7 @@ use smallvec::smallvec;
 
 use crate::rangeify::{
     KernelContext,
-    split_patterns::{cleanup_const, debuf, handle_after, remove_zero_range, renumber_range, unbind_kernel},
+    patterns::{cleanup_const, debuf, handle_after, remove_zero_range, renumber_range, unbind_kernel},
 };
 
 #[test]

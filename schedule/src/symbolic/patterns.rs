@@ -20,7 +20,7 @@ use morok_ir::{IntoUOp, Op, UOp};
 
 use crate::pattern::matcher::PatternMatcher;
 use crate::patterns;
-use crate::rangeify::helpers::get_const_value;
+use crate::rangeify::indexing::get_const_value;
 use crate::symbolic::dce::is_empty_range;
 
 use smallvec::SmallVec;

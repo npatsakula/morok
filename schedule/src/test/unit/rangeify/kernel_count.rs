@@ -5,7 +5,7 @@
 
 use morok_ir::{AxisId, AxisType, Op, UOp};
 
-use crate::rangeify::{KernelContext, pipeline::run_kernel_split_pipeline};
+use crate::rangeify::{KernelContext, run_kernel_split_pipeline};
 use crate::test::unit::rangeify::helpers::{count_define_globals, count_ends, count_kernels, count_stores};
 
 #[test]
@@ -55,7 +55,7 @@ fn test_shared_buffer_one_kernel() {
     let bufferize = UOp::bufferize_global(compute, vec![range]);
 
     // Convert to STORE twice (simulating reuse)
-    use crate::rangeify::bufferize_to_store::bufferize_to_store;
+    use crate::rangeify::transforms::bufferize_to_store;
 
     let _result1 = bufferize_to_store(&bufferize, &mut ctx);
     let _result2 = bufferize_to_store(&bufferize, &mut ctx);
@@ -84,7 +84,7 @@ fn test_independent_buffers_separate() {
 
     let bufferize2 = UOp::bufferize_global(compute2, vec![range]);
 
-    use crate::rangeify::bufferize_to_store::bufferize_to_store;
+    use crate::rangeify::transforms::bufferize_to_store;
 
     bufferize_to_store(&bufferize1, &mut ctx);
     bufferize_to_store(&bufferize2, &mut ctx);

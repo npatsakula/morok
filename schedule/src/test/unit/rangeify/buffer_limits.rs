@@ -15,8 +15,8 @@ use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisType, BufferizeOpts, Op, SInt, UOp, UOpKey};
 use test_case::test_case;
 
-use crate::rangeify::buffer_limits::{buffer_limit_patterns, extract_device_from_graph, is_elementwise};
 use crate::rangeify::indexing::IndexingContext;
+use crate::rangeify::patterns::{buffer_limit_patterns, extract_device_from_graph, is_elementwise};
 use crate::rewrite::graph_rewrite;
 
 // ============================================================================

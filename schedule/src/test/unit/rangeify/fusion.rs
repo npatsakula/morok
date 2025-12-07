@@ -13,7 +13,7 @@ use morok_dtype::DType;
 use morok_ir::{Op, ReduceOp, UOp};
 use smallvec::smallvec;
 
-use crate::rangeify::pipeline::run_kernel_split_pipeline;
+use crate::rangeify::kernel::run_kernel_split_pipeline;
 
 /// Helper to create a simple buffer
 fn create_buffer(size: usize) -> Arc<UOp> {

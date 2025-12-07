@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use morok_ir::UOp;
 
-use crate::rangeify::flatten_range::{flatten_range_impl, flatten_ranges};
+use crate::rangeify::transforms::{flatten_range_impl, flatten_ranges};
 
 #[test]
 fn test_flatten_range_impl_non_supported_op() {

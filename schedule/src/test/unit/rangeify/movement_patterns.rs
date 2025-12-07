@@ -9,7 +9,7 @@ use morok_device::DeviceSpec;
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, Op, SInt, UOp};
 
-use crate::rangeify::movement_patterns::movement_op_patterns;
+use crate::rangeify::patterns::movement_op_patterns;
 use crate::rewrite::graph_rewrite;
 
 // ===== Helper Functions =====

@@ -2205,12 +2205,12 @@ fn test_where_merge_branches_no_match() {
 
     let result = matcher.rewrite(&outer_where, &mut ());
     // May or may not rewrite, but if it does, should NOT be where(a&b, c, _)
-    if let RewriteResult::Rewritten(rewritten) = &result {
-        if let Op::Ternary(TernaryOp::Where, cond, _, _) = rewritten.op() {
-            // If rewritten, condition should NOT be And(a, b)
-            if let Op::Binary(BinaryOp::And, _, _) = cond.op() {
-                panic!("Should not merge branches when false values differ");
-            }
+    if let RewriteResult::Rewritten(rewritten) = &result
+        && let Op::Ternary(TernaryOp::Where, cond, _, _) = rewritten.op()
+    {
+        // If rewritten, condition should NOT be And(a, b)
+        if let Op::Binary(BinaryOp::And, _, _) = cond.op() {
+            panic!("Should not merge branches when false values differ");
         }
     }
 }
