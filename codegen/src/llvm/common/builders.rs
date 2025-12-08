@@ -2,7 +2,7 @@
 //!
 //! These helpers dispatch on float/int/signed types to reduce boilerplate in ops.rs.
 
-use super::error::{ArithmeticSnafu, ComparisonSnafu, Result};
+use crate::llvm::error::{ArithmeticSnafu, ComparisonSnafu, Result};
 use inkwell::builder::Builder;
 use inkwell::values::BasicValueEnum;
 use inkwell::{FloatPredicate, IntPredicate};
@@ -148,7 +148,7 @@ pub fn build_cmp<'ctx>(
     is_signed: bool,
 ) -> Result<BasicValueEnum<'ctx>> {
     let (float_pred, signed_pred, unsigned_pred) = comparison_predicates(op)
-        .ok_or_else(|| super::error::Error::InvalidComparisonOp { op: format!("{:?}", op) })?;
+        .ok_or_else(|| crate::llvm::error::Error::InvalidComparisonOp { op: format!("{:?}", op) })?;
 
     if is_float {
         Ok(builder

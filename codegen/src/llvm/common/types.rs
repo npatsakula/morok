@@ -4,7 +4,7 @@ use inkwell::context::Context;
 use inkwell::types::BasicTypeEnum;
 use morok_dtype::{DType, ScalarDType};
 
-use super::error::{InvalidLlvmTypeSnafu, Result};
+use crate::llvm::error::{InvalidLlvmTypeSnafu, Result};
 
 /// Convert DType to inkwell BasicTypeEnum.
 ///
