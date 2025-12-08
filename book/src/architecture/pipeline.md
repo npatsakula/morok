@@ -30,6 +30,7 @@ let d = c.sum();         // Adds REDUCE node to graph
 ```
 
 Each operation appends nodes to the UOp graph. The graph captures:
+
 - Arithmetic operations (ADD, MUL, etc.)
 - Movement operations (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)
 - Reductions (SUM, MAX, etc.)
@@ -81,6 +82,7 @@ Splits the graph at STORE boundaries into separate kernels:
 **Output:** `Vec<ScheduleItem>` with ordered kernels
 
 Collects kernels in execution order, gathering:
+
 - Kernel AST (the computation graph)
 - Buffer arguments (inputs/outputs)
 - Symbolic variable values
@@ -93,6 +95,7 @@ Collects kernels in execution order, gathering:
 **File:** `codegen/src/llvm/renderer.rs`
 
 Currently implements direct rendering to LLVM IR. Tinygrad has 16+ optimization passes here that morok is still developing:
+
 - Range splitting/flattening
 - GPU dimension assignment
 - Load/store optimization

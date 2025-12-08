@@ -14,10 +14,12 @@ kernel.execute(&[buf_a.ptr(), buf_b.ptr(), buf_out.ptr()])?;
 ## Features
 
 **Supported:**
+
 - LLVM JIT compilation and execution
 - CompiledKernel trait for backends
 
 **Planned:**
+
 - CUDA kernel execution
 - Metal kernel execution
 - Kernel caching

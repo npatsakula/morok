@@ -16,6 +16,7 @@ let result = c.realize()?;
 ## Features
 
 **Supported:**
+
 - Lazy tensor construction
 - Arithmetic: add, sub, mul, div, pow
 - Math: sqrt, exp, log, sin
@@ -23,6 +24,7 @@ let result = c.realize()?;
 - Shape: reshape, transpose, broadcast, pad
 
 **Planned:**
+
 - Convolution ops
 - Pooling ops
 - Automatic differentiation (backward)

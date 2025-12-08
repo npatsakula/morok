@@ -39,6 +39,7 @@ pub enum SrcPattern {
 ### Commutative Matching
 
 For `Add[x, @zero]`, both orderings are tried:
+
 ```rust
 // Fast path for binary (n=2)
 if patterns[0].matches(children[0]) && patterns[1].matches(children[1]) { return true; }

@@ -35,6 +35,7 @@ PROVENANCE_TRACKER.with(|t| {
 ```
 
 **Captured info:**
+
 - Workspace-relative file path, line, column
 - Transformation history (substitution, pattern rewrites)
 - ONNX node info (for model import)
@@ -42,6 +43,7 @@ PROVENANCE_TRACKER.with(|t| {
 ## Features
 
 **Supported:**
+
 - 80+ operations (arithmetic, memory, control flow)
 - UOp graph with topological traversal
 - Symbolic integers (SInt) for shape expressions
@@ -49,6 +51,7 @@ PROVENANCE_TRACKER.with(|t| {
 - Tensor core ops (WMMA)
 
 **Planned:**
+
 - Custom kernel ops
 - Graph visualization
 

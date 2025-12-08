@@ -23,5 +23,5 @@ test-case = "3.3.1"
 serde_json = "1"
 
 [features]
-proptest = ["dep:proptest-derive", "dep:proptest"]
+proptest = ["dep:proptest", "dep:proptest-derive"]
 serde = ["dep:serde", "smallvec/serde"]

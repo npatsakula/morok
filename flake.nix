@@ -5,12 +5,12 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
     crane = {
       url = "github:ipetkov/crane";
-      inputs.nixpkgs.follows = "nixpkgs";
     };
     advisory-db = {
       url = "github:rustsec/advisory-db";
       flake = false;
     };
+    treefmtSrc.url = "github:numtide/treefmt-nix";
   };
 
   outputs =
@@ -21,6 +21,7 @@
       crane,
       rust-overlay,
       advisory-db,
+      treefmtSrc,
     }:
     utils.lib.eachDefaultSystem (
       system:
@@ -37,6 +38,8 @@
                 rust_nightly = self.rust-bin.nightly.latest.default;
               }
             );
+
+        treefmt = treefmtSrc.lib.evalModule pkgs ./nix/treefmt.nix;
 
         llvm = pkgs.llvmPackages_21;
         stdenv = llvm.stdenv;
@@ -86,7 +89,8 @@
             inherit src advisory-db;
           };
 
-          format = crane'.cargoFmt { inherit src; };
+          rustfmt = crane'.cargoFmt { inherit src; };
+          treefmt = treefmt.config.build.check self;
         };
 
         devShells = rec {
@@ -119,6 +123,8 @@
 
           default = stable;
         };
+
+        formatter = treefmt.config.build.wrapper;
       }
     );
 }
