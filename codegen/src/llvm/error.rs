@@ -58,6 +58,10 @@ pub enum Error {
     #[snafu(display("LLVM build_select failed"))]
     BuildSelect { source: BuilderError },
 
+    /// Alloca instruction failed.
+    #[snafu(display("LLVM build_alloca failed"))]
+    BuildAlloca { source: BuilderError },
+
     /// Value extraction from builder result failed.
     #[snafu(display("Failed to extract {expected} from builder result"))]
     ValueExtractionFailed { expected: &'static str },

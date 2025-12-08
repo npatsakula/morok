@@ -137,6 +137,8 @@ pub fn movement_op_removal() -> PatternMatcher<IndexingContext> {
 pub fn apply_rangeify_patterns() -> PatternMatcher<IndexingContext> {
     crate::patterns! {
         @context IndexingContext;
+        // ReduceAxis conversion MUST come first - before bufferize wraps it
+        x if matches!(x.op(), Op::ReduceAxis { .. }) => convert_reduceaxis_with_context(x, ctx),
         x => apply_bufferize_transform(x, ctx),
         x if x.op().is_movement() => remove_movement_op(x, ctx),
     }
@@ -159,7 +161,6 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
 }
 
 /// Convert ReduceAxis → REDUCE using IndexingContext.
-#[allow(dead_code)]
 fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
     let Op::ReduceAxis { src, reduce_op, axes } = x.op() else {
         return None;

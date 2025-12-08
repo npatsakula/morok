@@ -83,22 +83,63 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
             values.insert(buffer_uop.id, param);
         }
 
-        // Add variable parameters (after buffers)
-        let buffer_count = buffers.len();
-        for (i, var_uop) in variables.iter().enumerate() {
-            let param_idx = (buffer_count + i) as u32;
-            let param =
-                kernel_function.get_nth_param(param_idx).context(InvalidFunctionParameterSnafu { index: param_idx })?;
-            if let Op::DefineVar { name, .. } = var_uop.op() {
-                param.set_name(name);
+        // Note: variables vector is empty for CPU with inlined outer loops
+        // DefineVar values are generated as loop counters below
+
+        // Walk the UOp graph in topological order
+        let nodes = uop.toposort();
+
+        // Pre-pass: Identify nodes that are in REDUCE source subgraphs
+        // These nodes should NOT be processed in the main loop - REDUCE will handle them
+        // This is critical because REDUCE needs to set up the loop counter BEFORE
+        // its source is evaluated (e.g., INDEX needs the loop counter, not the end value)
+        let reduce_src_nodes = find_reduce_source_nodes(&nodes);
+
+        // Pre-pass: Generate loops for DefineVar nodes
+        // For CPU with inlined outer loops, each DefineVar represents an outer loop
+        // We generate the loop structure here and map DefineVar to the loop counter
+        // Store the DefineVar IDs to close their loops at the end
+        let mut outer_loop_ids: Vec<u64> = Vec::new();
+        for node in &nodes {
+            if let Op::DefineVar { max_val, .. } = node.op() {
+                // Generate end value: max_val + 1 (DefineVar stores max value, we need exclusive upper bound)
+                let end_int = self.context.i64_type().const_int((*max_val + 1) as u64, false);
+
+                // Build loop structure
+                let (loop_ctx, counter_val) = crate::llvm::common::loop_gen::build_loop(
+                    self.context,
+                    &builder,
+                    kernel_function,
+                    end_int,
+                    node.id,
+                )?;
+
+                // Store loop context (using DefineVar id as key)
+                values.insert_loop(node.id, loop_ctx);
+
+                // Map DefineVar to loop counter
+                values.insert(node.id, counter_val.into());
+
+                // Track for closing at the end
+                outer_loop_ids.push(node.id);
             }
-            values.insert(var_uop.id, param);
         }
 
-        // Walk the UOp graph in topological order and generate code
-        let nodes = uop.toposort();
+        // Main pass: process all remaining nodes
+        // Skip nodes in REDUCE source subgraphs - REDUCE will handle them
         for node in &nodes {
+            if reduce_src_nodes.contains(&node.id) {
+                continue;
+            }
             ops::codegen_uop(node, self.context, &module, &builder, &mut values)?;
+        }
+
+        // Close outer loops (innermost to outermost, so reverse order)
+        for &loop_id in outer_loop_ids.iter().rev() {
+            if let Some(loop_ctx) = values.get_loop(loop_id) {
+                let loop_ctx = loop_ctx.clone();
+                crate::llvm::common::loop_gen::close_loop(&builder, &loop_ctx)?;
+            }
         }
 
         // Return void
@@ -137,12 +178,12 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         }
 
         // Add variable parameters from bootstrap function parameters
-        for i in 0..variables.len() {
+        for (i, var) in variables.iter().enumerate() {
             let param_idx = (1 + i) as u32; // +1 because first param is buffer array
             let var_param = bootstrap_function
                 .get_nth_param(param_idx)
                 .context(InvalidFunctionParameterSnafu { index: param_idx })?;
-            if let Op::DefineVar { name, .. } = variables[i].op() {
+            if let Op::DefineVar { name, .. } = var.op() {
                 var_param.set_name(name);
             }
             kernel_args.push(var_param.into());
@@ -180,13 +221,16 @@ impl<'ctx> Renderer for CpuLlvmRenderer<'ctx> {
     }
 }
 
-/// Collect all buffer and variable parameters from a UOp graph.
+/// Collect buffer parameters from a UOp graph.
 ///
 /// Collects:
 /// - Buffers: DEFINE_GLOBAL, DEFINE_LOCAL, BUFFER operations
-/// - Variables: DEFINE_VAR (for OUTER range iteration values)
 ///
-/// Returns (buffers, variables) sorted for deterministic function signatures.
+/// Note: DefineVar is NOT collected as a parameter. With inlined outer loops,
+/// DefineVar values are generated as loop counters inside the kernel, not as
+/// function parameters passed from the scheduler.
+///
+/// Returns buffers sorted for deterministic function signatures.
 fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
     let nodes = root.toposort();
 
@@ -209,26 +253,9 @@ fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
         _ => b.id,
     });
 
-    // Collect variables
-    let mut variables = Vec::new();
-    for node in &nodes {
-        if let Op::DefineVar { .. } = node.op() {
-            variables.push(node.clone());
-        }
-    }
-
-    // Sort variables by name for deterministic ordering
-    variables.sort_by(|a, b| {
-        let name_a = match a.op() {
-            Op::DefineVar { name, .. } => name,
-            _ => unreachable!(),
-        };
-        let name_b = match b.op() {
-            Op::DefineVar { name, .. } => name,
-            _ => unreachable!(),
-        };
-        name_a.cmp(name_b)
-    });
+    // For CPU with inlined outer loops, DefineVar becomes loop counters, not parameters
+    // Return empty variables vector
+    let variables = Vec::new();
 
     (buffers, variables)
 }
@@ -265,4 +292,61 @@ fn add_kernel_function_attributes<'ctx>(function: inkwell::values::FunctionValue
 
     let no_builtins = context.create_string_attribute("no-builtins", "");
     function.add_attribute(AttributeLoc::Function, no_builtins);
+}
+
+/// Find all nodes that are in a REDUCE's source subgraph.
+///
+/// REDUCE operations need to set up their loop counter BEFORE evaluating their source.
+/// This function identifies nodes that depend on Reduce RANGEs so they can be skipped
+/// in the main codegen loop - REDUCE will handle them when it evaluates its source.
+///
+/// Returns a set of UOp IDs to skip in the main loop.
+fn find_reduce_source_nodes(nodes: &[Arc<UOp>]) -> std::collections::HashSet<u64> {
+    use std::collections::HashSet;
+
+    // First, find all REDUCE nodes and collect their source subgraph nodes
+    let mut reduce_src_ids: HashSet<u64> = HashSet::new();
+
+    for node in nodes {
+        if let Op::Reduce { src, ranges, .. } = node.op() {
+            // Add all nodes in the source subgraph (excluding buffers/defines)
+            collect_source_subgraph(src, &mut reduce_src_ids);
+
+            // Add reduce ranges (but not their end values - those are constants)
+            for range in ranges {
+                if let Op::Range { axis_type: morok_ir::AxisType::Reduce, .. } = range.op() {
+                    reduce_src_ids.insert(range.id);
+                }
+            }
+        }
+    }
+
+    reduce_src_ids
+}
+
+/// Recursively collect all nodes in a subgraph, excluding buffers and defines.
+fn collect_source_subgraph(uop: &Arc<UOp>, ids: &mut std::collections::HashSet<u64>) {
+    // Don't re-process
+    if ids.contains(&uop.id) {
+        return;
+    }
+
+    // Skip buffer/define nodes - they're handled separately
+    match uop.op() {
+        Op::Buffer { .. } | Op::DefineGlobal(_) | Op::DefineLocal(_) | Op::DefineVar { .. } => {
+            return;
+        }
+        // Skip constants - they can be generated anywhere
+        Op::Const(_) => {
+            return;
+        }
+        _ => {}
+    }
+
+    ids.insert(uop.id);
+
+    // Recurse into sources
+    for src in uop.op().sources() {
+        collect_source_subgraph(&src, ids);
+    }
 }

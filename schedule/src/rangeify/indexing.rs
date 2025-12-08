@@ -273,6 +273,29 @@ fn assign_ranges(
             }
         } else if let Op::Bufferize { ranges, .. } = x.op() {
             ranges.to_vec()
+        } else if let Op::ReduceAxis { src, axes, .. } = x.op() {
+            // ReduceAxis always gets ranges - follow Tinygrad's approach
+            // Output ranges are non-reduced dimensions
+            if let Some(in_shape) = src.shape()? {
+                if consumer_rngs.is_empty() {
+                    // Create output ranges for non-reduced dimensions
+                    in_shape
+                        .iter()
+                        .enumerate()
+                        .filter_map(
+                            |(i, s)| {
+                                if !axes.contains(&i) { Some(ctx.new_range(s, AxisType::Loop)) } else { None }
+                            },
+                        )
+                        .collect()
+                } else if consumer_rngs.len() == 1 {
+                    consumer_rngs[0].clone()
+                } else {
+                    merge_consumer_ranges(x, &consumer_rngs, ctx)?
+                }
+            } else {
+                continue;
+            }
         } else if consumer_rngs.is_empty() {
             continue;
         } else if consumer_rngs.len() == 1 {

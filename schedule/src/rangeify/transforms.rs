@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey};
+use morok_ir::{AddrSpace, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey};
 use smallvec::SmallVec;
 
 use super::context::RangeifyContext;
@@ -40,10 +40,8 @@ pub fn rangeify(
     let early_matcher = super::patterns::early_rewrites();
     sink = crate::rewrite::graph_rewrite_bottom_up(&early_matcher, sink, &mut ());
 
-    // Step 2.5: Convert ReduceAxis → REDUCE early
-    sink = convert_reduceaxis_early(&sink, &mut indexing_ctx);
-
     // Step 3: Apply core rangeify transformation (bottom-up)
+    // This includes: bufferize transform, movement op removal, ReduceAxis → REDUCE conversion
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
     sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, sink, &mut indexing_ctx);
 
@@ -225,52 +223,6 @@ fn apply_buffer_removal_protecting_sink(
     }
 
     UOp::sink(new_sources)
-}
-
-/// Convert all ReduceAxis operations to REDUCE before bottom-up reconstruction.
-#[allow(clippy::mutable_key_type)]
-fn convert_reduceaxis_early(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> Arc<UOp> {
-    let mut replacements: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
-
-    for node in sink.toposort() {
-        let Op::ReduceAxis { src, reduce_op, axes } = node.op() else {
-            continue;
-        };
-
-        let Some((input_ranges, _)) = ctx.get_ranges(&node) else {
-            continue;
-        };
-
-        let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges
-            .iter()
-            .enumerate()
-            .filter_map(|(i, range)| {
-                if axes.contains(&i) {
-                    if let Op::Range { axis_type: AxisType::Reduce, .. } = range.op() {
-                        Some(Arc::clone(range))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let reduced = if reduce_ranges.is_empty() {
-            Arc::clone(src)
-        } else {
-            UOp::reduce(Arc::clone(src), reduce_ranges, *reduce_op)
-        };
-
-        if let Some(ranges) = ctx.get_ranges(&node).cloned() {
-            ctx.set_ranges(&reduced, ranges.0, ranges.1);
-        }
-
-        replacements.insert(UOpKey(node.clone()), reduced);
-    }
-
-    sink.substitute(&replacements)
 }
 
 // ============================================================================

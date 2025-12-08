@@ -414,6 +414,18 @@ pub fn expand_schedule(schedule: Schedule) -> Schedule {
             // No bound ranges - already expanded or no OUTER ranges
             expanded.push(item);
         } else {
+            // Check if this is a CPU kernel - skip expansion for CPU
+            // CPU codegen will inline outer loops for better LLVM optimization
+            let is_cpu =
+                item.buffers.first().map(|b| matches!(b.allocator().device_spec(), DeviceSpec::Cpu)).unwrap_or(true);
+
+            if is_cpu {
+                // Keep item as-is for CPU - codegen will inline outer loops
+                expanded.push(item);
+                continue;
+            }
+
+            // GPU/Metal: Expand into multiple schedule items (existing behavior)
             // Extract iteration counts from each bound range
             let iteration_counts: Vec<i64> = item
                 .bound_ranges

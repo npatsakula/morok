@@ -13,11 +13,11 @@
 //! exit_N:   <continuation>
 //! ```
 
+use inkwell::IntPredicate;
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PhiValue};
-use inkwell::IntPredicate;
 use snafu::{OptionExt, ResultExt};
 
 use crate::llvm::error::*;

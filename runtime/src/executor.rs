@@ -742,7 +742,8 @@ impl UnifiedExecutor {
         let output_indices = [1usize]; // dst is the output
 
         // For transfers, we don't skip same-device since transfers are explicit synchronization points
-        let (query, update) = self.query_resources(&buffer_ids, &output_indices, dst_device, transfer_id, timeline, false);
+        let (query, update) =
+            self.query_resources(&buffer_ids, &output_indices, dst_device, transfer_id, timeline, false);
 
         // Wait for all dependencies
         self.wait_for_tokens(&query.wait_on)?;
@@ -884,13 +885,9 @@ impl UnifiedExecutor {
 
             // Execute kernel - borrow directly, no cloning!
             unsafe {
-                kernel
-                    .kernel
-                    .program
-                    .execute(&kernel.buffer_ptrs, &kernel.fixedvars, None, None)
-                    .map_err(|e| crate::error::Error::Execution {
-                        reason: format!("Kernel {} failed: {}", kernel.id, e),
-                    })?;
+                kernel.kernel.program.execute(&kernel.buffer_ptrs, &kernel.fixedvars, None, None).map_err(|e| {
+                    crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) }
+                })?;
             }
 
             // Signal completion
@@ -952,12 +949,16 @@ impl UnifiedExecutor {
 
         // Pre-transmute pointer slices to usize slices (zero-copy, zero-alloc)
         #[allow(clippy::type_complexity)]
-        let ptr_slices: Vec<(&[usize], u64, &std::sync::Arc<crate::kernel_cache::CachedKernel>, &std::collections::HashMap<String, i64>)> = kernels
+        let ptr_slices: Vec<(
+            &[usize],
+            u64,
+            &std::sync::Arc<crate::kernel_cache::CachedKernel>,
+            &std::collections::HashMap<String, i64>,
+        )> = kernels
             .iter()
             .map(|k| {
-                let usize_slice: &[usize] = unsafe {
-                    std::mem::transmute::<&[*mut u8], &[usize]>(k.buffer_ptrs.as_slice())
-                };
+                let usize_slice: &[usize] =
+                    unsafe { std::mem::transmute::<&[*mut u8], &[usize]>(k.buffer_ptrs.as_slice()) };
                 (usize_slice, k.id, &k.kernel, &k.fixedvars)
             })
             .collect();
@@ -967,16 +968,15 @@ impl UnifiedExecutor {
                 let errors_ref = &errors;
                 s.spawn(move |_| {
                     // Transmute back to pointer slice (zero-copy)
-                    let ptrs: &[*mut u8] = unsafe {
-                        std::mem::transmute::<&[usize], &[*mut u8]>(usize_slice)
-                    };
+                    let ptrs: &[*mut u8] = unsafe { std::mem::transmute::<&[usize], &[*mut u8]>(usize_slice) };
 
                     let result = unsafe { program.program.execute(ptrs, fixedvars, None, None) };
 
                     if let Err(e) = result {
-                        errors_ref.lock().unwrap().push(crate::error::Error::Execution {
-                            reason: format!("Kernel {} failed: {}", id, e),
-                        });
+                        errors_ref
+                            .lock()
+                            .unwrap()
+                            .push(crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", id, e) });
                     }
                 });
             }
@@ -1008,11 +1008,8 @@ impl UnifiedExecutor {
         let mut all_inputs: HashSet<BufferId> = HashSet::new();
 
         for kernel in kernels {
-            let outputs: HashSet<_> = kernel
-                .output_indices
-                .iter()
-                .map(|&i| buffers[kernel.buffer_indices[i]].id())
-                .collect();
+            let outputs: HashSet<_> =
+                kernel.output_indices.iter().map(|&i| buffers[kernel.buffer_indices[i]].id()).collect();
 
             let inputs: HashSet<_> = kernel
                 .buffer_indices
@@ -1031,9 +1028,7 @@ impl UnifiedExecutor {
 
             // Check for read-write conflict (RAW/WAR)
             if !outputs.is_disjoint(&all_inputs) || !inputs.is_disjoint(&all_outputs) {
-                return Err(crate::error::Error::Execution {
-                    reason: "Read-write conflict in parallel group".into(),
-                });
+                return Err(crate::error::Error::Execution { reason: "Read-write conflict in parallel group".into() });
             }
 
             all_outputs.extend(outputs);

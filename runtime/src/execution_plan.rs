@@ -199,11 +199,7 @@ impl ExecutionPlan {
     pub fn execute(&self, executor: &mut UnifiedExecutor) -> Result<()> {
         for group in &self.parallel_groups {
             if !group.kernel_indices.is_empty() {
-                executor.execute_kernels_by_indices(
-                    &self.kernels,
-                    &group.kernel_indices,
-                    &self.buffers,
-                )?;
+                executor.execute_kernels_by_indices(&self.kernels, &group.kernel_indices, &self.buffers)?;
             }
         }
         Ok(())
@@ -305,11 +301,7 @@ impl ExecutionPlanBuilder {
                 .collect();
 
             // Pre-compute buffer IDs for dependency tracking
-            kernel.buffer_ids = kernel
-                .buffer_indices
-                .iter()
-                .map(|&idx| self.buffers[idx].id())
-                .collect();
+            kernel.buffer_ids = kernel.buffer_indices.iter().map(|&idx| self.buffers[idx].id()).collect();
         }
 
         ExecutionPlan {
