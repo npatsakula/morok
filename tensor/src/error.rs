@@ -92,6 +92,9 @@ pub enum Error {
     #[snafu(display("Rangeify failed: {source}"))]
     Rangeify { source: morok_ir::Error },
 
+    #[snafu(display("Optimization error: {source}"))]
+    Optimize { source: morok_schedule::OptError },
+
     #[snafu(display("No kernels found after scheduling pipeline"))]
     NoKernelsFound,
 

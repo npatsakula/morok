@@ -525,7 +525,7 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
     // Build kernel sources
     let mut sources: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
 
-    morok_ir::uop::debug::print_ast(&ast, "KERNEL AST", 2);
+    // morok_ir::uop::debug::print_ast(&ast, "KERNEL AST", 2);
 
     // Collect buffer sources
     let mut buffer_sources: Vec<Arc<UOp>> = Vec::new();

@@ -99,15 +99,22 @@ pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
 /// - DETACH removal (gradient computation marker no longer needed)
 /// - CONTIGUOUS_BACKWARD removal (gradient computation marker no longer needed)
 /// - RESHAPE to scalar (empty shape) removal
+/// - RESHAPE on REDUCE removal (REDUCE output doesn't need reshaping)
 pub fn early_rewrites() -> PatternMatcher {
     crate::patterns! {
         Detach(x) ~> x,
         ContiguousBackward(x) ~> x,
         x => {
-            if let Op::Reshape { src, new_shape } = x.op()
-                && is_scalar_shape(new_shape)
-            {
-                return Some(src.clone());
+            if let Op::Reshape { src, new_shape } = x.op() {
+                // RESHAPE to scalar - always remove
+                if is_scalar_shape(new_shape) {
+                    return Some(src.clone());
+                }
+                // RESHAPE on REDUCE - the reduce output is already "indexed" by its ranges
+                // The reshape just changes the view of the buffer, which can be done in STORE indexing
+                if matches!(src.op(), Op::Reduce { .. }) {
+                    return Some(src.clone());
+                }
             }
             None
         }

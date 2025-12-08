@@ -49,6 +49,9 @@ impl CraneliftKernel {
         // Setup ISA
         let mut flag_builder = settings::builder();
         flag_builder
+            .set("opt_level", "speed")
+            .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to set cranelift flag: {}", e) })?;
+        flag_builder
             .set("use_colocated_libcalls", "false")
             .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to set cranelift flag: {}", e) })?;
         flag_builder

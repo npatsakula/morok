@@ -40,7 +40,10 @@ pub use morok_ir::rewrite::graph_rewrite;
 pub use rangeify::{rangeify, run_kernel_split_pipeline};
 
 // Re-export optimizer entry points
-pub use optimizer::{OptStrategy, Renderer as OptimizerRenderer, optimize_kernel, optimize_kernel_with_strategy};
+pub use optimizer::{
+    BeamConfig, BeamResult, OptError, OptStrategy, Renderer as OptimizerRenderer, Scheduler, beam_search_cached,
+    optimize_kernel, optimize_kernel_with_strategy, prepare_scheduler,
+};
 
 // Re-export UOp for macro usage
 pub use morok_ir::UOp;

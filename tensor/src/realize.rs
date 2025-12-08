@@ -36,16 +36,20 @@ use crate::{
     Result, Tensor,
     error::{
         CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceFactorySnafu, DeviceSnafu,
-        EmptyScheduleSnafu, ExecutionSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu, UOpSnafu,
+        EmptyScheduleSnafu, ExecutionSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu,
+        UOpSnafu,
     },
     schedule::{Schedule, ScheduleItem, expand_schedule},
 };
+use morok_device::{Buffer, device::Device};
 use morok_ir::{AxisId, DeviceSpec, Op, SInt, UOp};
 use morok_runtime::{
     ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, ParallelGroup,
     PreparedKernel,
 };
 use snafu::{OptionExt, ResultExt};
+use std::sync::Arc;
+use std::time::Duration;
 
 impl Tensor {
     /// Realize (execute) this tensor's computation graph.
@@ -308,18 +312,27 @@ fn prepare_execution_plan(schedule: &Schedule) -> Result<ExecutionPlan> {
             }
         }
 
-        // Get or compile kernel
-        let cached = morok_runtime::kernel_cache::get_or_compile_kernel(item.ast.id, &device_str, || {
-            // Apply optimizations
-            let optimizer_renderer = morok_schedule::OptimizerRenderer::cpu();
-            let optimized_ast = morok_schedule::optimize_kernel(item.ast.clone(), &optimizer_renderer);
+        // Step 1: Get device-aware optimizer renderer
+        let optimizer_renderer = get_optimizer_renderer(&device);
 
-            // Apply decomposition
-            let ast_decomposed = match device.renderer.decompositor() {
-                Some(matcher) => morok_ir::decompositions::decompose_with(&optimized_ast, &matcher),
-                None => optimized_ast,
-            };
+        // Step 2: Optimize OUTSIDE cache (enables beam search)
+        let strategy = morok_schedule::OptStrategy::from_env();
+        let optimized_ast = if let morok_schedule::OptStrategy::Beam { width } = strategy {
+            // Beam search: compile-and-time multiple candidates
+            beam_search_optimize(item.ast.clone(), &optimizer_renderer, width, &device, &item.buffers)?
+        } else {
+            // Heuristic optimization (default)
+            morok_schedule::optimize_kernel(item.ast.clone(), &optimizer_renderer)
+        };
 
+        // Step 3: Apply decomposition
+        let ast_decomposed = match device.renderer.decompositor() {
+            Some(matcher) => morok_ir::decompositions::decompose_with(&optimized_ast, &matcher),
+            None => optimized_ast,
+        };
+
+        // Step 4: Cache by OPTIMIZED ast id (different optimizations → different cache entries)
+        let cached = morok_runtime::kernel_cache::get_or_compile_kernel(ast_decomposed.id, &device_str, || {
             // Render
             let spec = device.renderer.render(&ast_decomposed).context(RenderKernelSnafu)?;
 
@@ -342,6 +355,7 @@ fn prepare_execution_plan(schedule: &Schedule) -> Result<ExecutionPlan> {
             item.buffers.iter().filter_map(|buf| buffer_id_to_idx.get(&buf.id().0).copied()).collect();
 
         // Create PreparedKernel
+        // Note: buffer_ptrs and buffer_ids will be computed in ExecutionPlanBuilder::build()
         let prepared = PreparedKernel {
             id: item.ast.id,
             kernel: cached,
@@ -350,6 +364,8 @@ fn prepare_execution_plan(schedule: &Schedule) -> Result<ExecutionPlan> {
             output_indices: vec![0], // First buffer is typically output
             fixedvars: item.fixedvars.clone(),
             dependencies: item.dependencies.clone(),
+            buffer_ptrs: Vec::new(), // Computed in build()
+            buffer_ids: Vec::new(),  // Computed in build()
         };
 
         prepared_kernels.push(prepared);
@@ -383,6 +399,82 @@ fn prepare_execution_plan(schedule: &Schedule) -> Result<ExecutionPlan> {
     }
 
     Ok(builder.build())
+}
+
+/// Get the optimizer renderer for a device.
+fn get_optimizer_renderer(device: &Device) -> morok_schedule::OptimizerRenderer {
+    match device.device {
+        DeviceSpec::Cpu => morok_schedule::OptimizerRenderer::cpu(),
+        DeviceSpec::Cuda { .. } => morok_schedule::OptimizerRenderer::cuda(),
+        DeviceSpec::Metal { .. } => morok_schedule::OptimizerRenderer::metal(),
+        _ => morok_schedule::OptimizerRenderer::cpu(),
+    }
+}
+
+/// Optimize a kernel AST using beam search auto-tuning.
+///
+/// Beam search explores multiple optimization paths and selects the fastest
+/// by compiling and timing each candidate. This is slower than heuristics
+/// but can find better optimizations.
+fn beam_search_optimize(
+    ast: Arc<UOp>,
+    renderer: &morok_schedule::OptimizerRenderer,
+    beam_width: usize,
+    device: &Device,
+    buffers: &[Buffer],
+) -> Result<Arc<UOp>> {
+    use morok_schedule::{BeamConfig, Scheduler, beam_search_cached, prepare_scheduler};
+
+    let mut config = BeamConfig::from_env();
+    config.beam_width = beam_width;
+
+    // Prepare scheduler (applies symbolic simplification and loop→global)
+    let scheduler = prepare_scheduler(ast, renderer);
+
+    // Ensure all buffers are allocated for timing
+    for buf in buffers {
+        buf.ensure_allocated().context(DeviceSnafu)?;
+    }
+
+    // Clone buffers for the closure (Buffer is Clone + Send + Sync)
+    let buffers: Vec<Buffer> = buffers.to_vec();
+    let bench_config = morok_runtime::BenchmarkConfig::default();
+
+    // Clone device components for the closure
+    let dev_renderer = device.renderer.clone();
+    let dev_compiler = device.compiler.clone();
+    let dev_runtime = device.runtime.clone();
+
+    // Compile-and-time function: compilation is NOT timed, only execution
+    let compile_and_time = |s: &Scheduler| -> Option<Duration> {
+        let optimized = s.get_optimized_ast(None);
+
+        // Apply decomposition
+        let decomposed = match dev_renderer.decompositor() {
+            Some(m) => morok_ir::decompositions::decompose_with(&optimized, &m),
+            None => optimized,
+        };
+
+        // Render and compile (NOT timed)
+        let spec = dev_renderer.render(&decomposed).ok()?;
+        let compiled = dev_compiler.compile(&spec).ok()?;
+        let program = (dev_runtime)(&compiled).ok()?;
+
+        // Extract buffer pointers inside the closure (avoids Sync issue)
+        let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
+
+        // Time ONLY execution
+        let result = unsafe {
+            morok_runtime::benchmark_kernel(program.as_ref(), &buffer_ptrs, &HashMap::new(), &bench_config).ok()?
+        };
+
+        Some(result.min)
+    };
+
+    // Run beam search with caching
+    let result = beam_search_cached(scheduler, &config, compile_and_time).context(OptimizeSnafu)?;
+
+    Ok(result.scheduler.get_optimized_ast(None))
 }
 
 #[cfg(test)]

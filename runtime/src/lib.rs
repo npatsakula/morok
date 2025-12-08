@@ -7,7 +7,13 @@
 //!
 //! The `executor` module provides the `UnifiedExecutor` for parallel kernel
 //! execution across heterogeneous devices (CPU, GPU, etc.).
+//!
+//! # Benchmarking
+//!
+//! The `benchmark` module provides timing utilities for measuring kernel
+//! execution performance, used by beam search auto-tuning.
 
+pub mod benchmark;
 pub mod cranelift;
 pub mod device_registry;
 pub mod devices;
@@ -21,6 +27,7 @@ pub mod llvm;
 #[cfg(test)]
 pub mod test;
 
+pub use benchmark::{BenchmarkConfig, BenchmarkResult, benchmark_kernel, benchmark_kernel_with_cutoff};
 pub use device_registry::DEVICE_FACTORIES;
 pub use devices::cpu::create_cpu_device;
 pub use devices::cpu_queue::CpuQueue;
@@ -28,7 +35,7 @@ pub use error::*;
 pub use execution_plan::{ExecutionPlan, ExecutionPlanBuilder, ParallelGroup, PreparedKernel};
 pub use executor::{
     DependencyQuery, DependencyToken, DependencyUpdate, DeviceContext, ExecutionGraph, ExecutionNode,
-    KernelBufferAccess, ParallelKernelContext, SyncStrategy, UnifiedExecutor, global_executor,
+    KernelBufferAccess, SyncStrategy, UnifiedExecutor, global_executor,
 };
 pub use kernel::*;
 pub use kernel_cache::*;

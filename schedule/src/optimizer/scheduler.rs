@@ -1043,3 +1043,20 @@ impl fmt::Display for Scheduler {
         write!(f, "{}_{}", self.kernel_type(), self.colored_shape())
     }
 }
+
+impl Clone for Scheduler {
+    /// Clone the scheduler state.
+    ///
+    /// Note: Caches are cleared in the clone to ensure correct behavior.
+    fn clone(&self) -> Self {
+        Self {
+            ast: self.ast.clone(),
+            ren: self.ren.clone(),
+            dont_use_locals: self.dont_use_locals,
+            applied_opts: self.applied_opts.clone(),
+            // Clear caches in clone - they'll be recomputed on demand
+            rngs_cache: OnceCell::new(),
+            maxarg_cache: OnceCell::new(),
+        }
+    }
+}

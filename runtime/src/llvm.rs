@@ -115,20 +115,16 @@ impl CompiledKernel for LlvmKernel {
             // The function parameters are ordered: (ptr %args, i64 %var0, i64 %var1, ...)
             // We need to match variable names from the HashMap to parameter positions
             let mut var_values = Vec::new();
-            eprintln!("EXECUTE_WITH_VARS: param_count={}, var_count={}", param_count, var_count);
-            eprintln!("EXECUTE_WITH_VARS: vars={:?}", vars);
             for i in 1..param_count {
                 if let Some(param) = function.get_nth_param(i as u32) {
                     let param_name = param.get_name().to_str().map_err(|_| crate::Error::JitCompilation {
                         reason: format!("Invalid UTF-8 in parameter name at index {}", i),
                     })?;
 
-                    eprintln!("EXECUTE_WITH_VARS: param[{}] name='{}', looking up in vars", i, param_name);
                     let value = vars.get(param_name).copied().ok_or_else(|| crate::Error::JitCompilation {
                         reason: format!("Missing variable value for parameter '{}'", param_name),
                     })?;
 
-                    eprintln!("EXECUTE_WITH_VARS: param[{}] name='{}', value={}", i, param_name, value);
                     var_values.push(value);
                 }
             }

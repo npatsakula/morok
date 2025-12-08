@@ -41,11 +41,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_device::Buffer;
+use morok_device::{Buffer, BufferId};
 use morok_dtype::DeviceSpec;
 
 use crate::error::Result;
-use crate::executor::{ParallelKernelContext, UnifiedExecutor};
+use crate::executor::UnifiedExecutor;
 use crate::kernel_cache::CachedKernel;
 
 // ============================================================================
@@ -81,13 +81,24 @@ pub struct PreparedKernel {
 
     /// Kernel IDs that must complete before this one (dependencies).
     pub dependencies: Vec<u64>,
+
+    /// Pre-computed raw buffer pointers for zero-allocation execution.
+    /// Computed once during prepare(), stable for the lifetime of ExecutionPlan.
+    /// Initialize as empty; populated by `ExecutionPlanBuilder::build()`.
+    /// SAFETY: Pointers are valid as long as ExecutionPlan owns the buffers.
+    pub buffer_ptrs: Vec<*mut u8>,
+
+    /// Pre-computed buffer IDs for dependency tracking.
+    /// Avoids looking up Buffer objects during execution.
+    /// Initialize as empty; populated by `ExecutionPlanBuilder::build()`.
+    pub buffer_ids: Vec<BufferId>,
 }
 
 /// A group of kernels that can execute in parallel.
 ///
 /// Within a group, kernels have no buffer conflicts and can be
-/// dispatched via `execute_parallel_group`.
-#[derive(Clone, Debug)]
+/// executed together using `rayon::scope`.
+#[derive(Debug, Clone)]
 pub struct ParallelGroup {
     /// Indices into `ExecutionPlan::kernels` for kernels in this group.
     pub kernel_indices: Vec<usize>,
@@ -117,39 +128,6 @@ pub struct ExecutionPlan {
 
     /// Primary device for this plan.
     device: DeviceSpec,
-}
-
-// ============================================================================
-// Wrapper for raw pointer to enable Send
-// ============================================================================
-
-/// Wrapper to make raw pointers Send for parallel execution.
-///
-/// # Safety
-///
-/// The underlying pointer must remain valid for the duration of use.
-/// This is guaranteed because `ExecutionPlan` owns all its buffers.
-#[derive(Clone, Copy)]
-struct SendPtr(*mut u8);
-
-// SAFETY: The pointer comes from buffers owned by ExecutionPlan,
-// which keeps them alive for the duration of execute().
-unsafe impl Send for SendPtr {}
-
-impl SendPtr {
-    /// Create a new SendPtr from a raw pointer.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure the pointer remains valid.
-    unsafe fn new(ptr: *mut u8) -> Self {
-        Self(ptr)
-    }
-
-    /// Get the underlying raw pointer.
-    fn as_ptr(self) -> *mut u8 {
-        self.0
-    }
 }
 
 // ============================================================================
@@ -208,10 +186,8 @@ impl ExecutionPlan {
 
     /// Execute the plan. All buffers already allocated during prepare().
     ///
-    /// This is the fast path - no compilation, no allocation, just execution:
-    /// 1. Iterate through parallel groups
-    /// 2. Single kernel → `executor.execute_kernel()` (avoids rayon overhead)
-    /// 3. Multiple kernels → `executor.execute_parallel_group()` (parallel)
+    /// This is the fast path - no compilation, no allocation, just execution.
+    /// Uses `rayon::scope` for zero-allocation parallel execution.
     ///
     /// # Arguments
     ///
@@ -222,123 +198,14 @@ impl ExecutionPlan {
     /// Ok(()) on success, error if any kernel fails.
     pub fn execute(&self, executor: &mut UnifiedExecutor) -> Result<()> {
         for group in &self.parallel_groups {
-            self.execute_group(executor, group)?;
-        }
-        Ok(())
-    }
-
-    /// Execute a single parallel group.
-    fn execute_group(&self, executor: &mut UnifiedExecutor, group: &ParallelGroup) -> Result<()> {
-        if group.kernel_indices.is_empty() {
-            return Ok(());
-        }
-
-        if group.kernel_indices.len() == 1 {
-            // Single kernel - sequential path (no rayon overhead)
-            let kernel = &self.kernels[group.kernel_indices[0]];
-            self.execute_single_kernel(executor, kernel)?;
-        } else {
-            // Multiple kernels - parallel execution
-            self.execute_parallel_kernels(executor, group)?;
-        }
-
-        Ok(())
-    }
-
-    /// Execute a single kernel with dependency tracking.
-    fn execute_single_kernel(&self, executor: &mut UnifiedExecutor, kernel: &PreparedKernel) -> Result<()> {
-        // Collect buffer references
-        let buffers: Vec<&Buffer> = kernel.buffer_indices.iter().map(|&idx| &self.buffers[idx]).collect();
-
-        // Extract pointers for kernel execution
-        let pointers: Vec<*mut u8> = buffers
-            .iter()
-            .map(|b| {
-                // SAFETY: buffers are allocated and owned by ExecutionPlan
-                unsafe { b.as_raw_ptr() }
-            })
-            .collect();
-
-        // Clone data for the closure
-        let fixedvars = kernel.fixedvars.clone();
-        let program = Arc::clone(&kernel.kernel);
-
-        executor.execute_kernel(kernel.id, &kernel.device, &buffers, &kernel.output_indices, || {
-            // SAFETY: pointers are valid for the duration of this closure
-            unsafe {
-                program
-                    .program
-                    .execute(&pointers, &fixedvars, None, None)
-                    .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel execution failed: {}", e) })
+            if !group.kernel_indices.is_empty() {
+                executor.execute_kernels_by_indices(
+                    &self.kernels,
+                    &group.kernel_indices,
+                    &self.buffers,
+                )?;
             }
-        })?;
-
-        Ok(())
-    }
-
-    /// Execute multiple kernels in parallel.
-    fn execute_parallel_kernels(&self, executor: &mut UnifiedExecutor, group: &ParallelGroup) -> Result<()> {
-        // Build ParallelKernelContext for each kernel
-        let contexts: Vec<ParallelKernelContext> = group
-            .kernel_indices
-            .iter()
-            .map(|&idx| {
-                let kernel = &self.kernels[idx];
-                let buffers: Vec<Buffer> =
-                    kernel.buffer_indices.iter().map(|&buf_idx| self.buffers[buf_idx].clone()).collect();
-
-                ParallelKernelContext {
-                    node_id: kernel.id,
-                    device: kernel.device.clone(),
-                    buffers,
-                    output_indices: kernel.output_indices.clone(),
-                }
-            })
-            .collect();
-
-        // Build execution functions
-        // We need to extract pointers BEFORE creating closures to avoid lifetime issues
-        #[allow(clippy::type_complexity)]
-        let kernel_data: Vec<(Arc<CachedKernel>, Vec<SendPtr>, HashMap<String, i64>)> = group
-            .kernel_indices
-            .iter()
-            .map(|&idx| {
-                let kernel = &self.kernels[idx];
-
-                // Extract pointers
-                let pointers: Vec<SendPtr> = kernel
-                    .buffer_indices
-                    .iter()
-                    .map(|&buf_idx| {
-                        let ptr = unsafe { self.buffers[buf_idx].as_raw_ptr() };
-                        // SAFETY: buffers are owned by ExecutionPlan and live for duration of execute()
-                        unsafe { SendPtr::new(ptr) }
-                    })
-                    .collect();
-
-                (Arc::clone(&kernel.kernel), pointers, kernel.fixedvars.clone())
-            })
-            .collect();
-
-        // Create execution closures
-        let execute_fns: Vec<Box<dyn FnOnce() -> Result<()> + Send>> = kernel_data
-            .into_iter()
-            .map(|(program, pointers, fixedvars)| {
-                Box::new(move || {
-                    let raw_ptrs: Vec<*mut u8> = pointers.iter().map(|p| p.as_ptr()).collect();
-                    // SAFETY: pointers are valid for the duration of this closure
-                    unsafe {
-                        program.program.execute(&raw_ptrs, &fixedvars, None, None).map_err(|e| {
-                            crate::error::Error::Execution { reason: format!("Kernel execution failed: {}", e) }
-                        })
-                    }
-                }) as Box<dyn FnOnce() -> Result<()> + Send>
-            })
-            .collect();
-
-        // Execute in parallel
-        executor.execute_parallel_group(&contexts, execute_fns)?;
-
+        }
         Ok(())
     }
 }
@@ -422,7 +289,29 @@ impl ExecutionPlanBuilder {
     }
 
     /// Build the ExecutionPlan.
-    pub fn build(self) -> ExecutionPlan {
+    ///
+    /// This finalizes the plan by computing pre-allocated buffer pointers
+    /// and buffer IDs for zero-allocation execution.
+    pub fn build(mut self) -> ExecutionPlan {
+        // Compute buffer_ptrs and buffer_ids for each kernel
+        for kernel in &mut self.kernels {
+            kernel.buffer_ptrs = kernel
+                .buffer_indices
+                .iter()
+                .map(|&idx| {
+                    // SAFETY: buffers are allocated and owned by ExecutionPlan
+                    unsafe { self.buffers[idx].as_raw_ptr() }
+                })
+                .collect();
+
+            // Pre-compute buffer IDs for dependency tracking
+            kernel.buffer_ids = kernel
+                .buffer_indices
+                .iter()
+                .map(|&idx| self.buffers[idx].id())
+                .collect();
+        }
+
         ExecutionPlan {
             kernels: self.kernels,
             parallel_groups: self.parallel_groups,
@@ -437,18 +326,6 @@ impl ExecutionPlanBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_send_ptr() {
-        let mut data: Vec<u8> = vec![1, 2, 3, 4];
-        let ptr = data.as_mut_ptr();
-
-        // SAFETY: ptr is valid for this test
-        let send_ptr = unsafe { SendPtr::new(ptr) };
-
-        // Verify we can get the pointer back
-        assert_eq!(send_ptr.as_ptr(), ptr);
-    }
 
     #[test]
     fn test_builder_basic() {

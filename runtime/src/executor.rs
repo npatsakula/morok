@@ -38,6 +38,7 @@ use morok_dtype::DeviceSpec;
 use snafu::ResultExt;
 
 use crate::error::Result;
+use crate::execution_plan::PreparedKernel;
 
 // ============================================================================
 // Dependency Tracking Types (Tinygrad-Aligned)
@@ -183,23 +184,6 @@ pub struct KernelBufferAccess {
     pub buffers: Vec<BufferId>,
     /// Indices into `buffers` that are outputs (written by the kernel).
     /// Other indices are inputs (read-only).
-    pub output_indices: Vec<usize>,
-}
-
-/// Context for executing a kernel within a parallel group.
-///
-/// Used by `execute_parallel_group` to track per-kernel state during
-/// parallel execution. Contains the buffers and metadata needed to
-/// properly track dependencies and signal completion.
-#[derive(Debug)]
-pub struct ParallelKernelContext {
-    /// Kernel identifier (typically the AST node ID).
-    pub node_id: u64,
-    /// Device this kernel executes on.
-    pub device: DeviceSpec,
-    /// All buffers accessed by this kernel.
-    pub buffers: Vec<Buffer>,
-    /// Indices into `buffers` that are outputs.
     pub output_indices: Vec<usize>,
 }
 
@@ -511,7 +495,7 @@ impl UnifiedExecutor {
     /// - Update should be applied AFTER operation signals completion
     pub fn query_resources(
         &self,
-        buffers: &[&Buffer],
+        buffer_ids: &[BufferId],
         output_indices: &[usize],
         device: &DeviceSpec,
         operation_id: u64,
@@ -522,8 +506,7 @@ impl UnifiedExecutor {
         let mut writes = Vec::new();
         let mut reads = Vec::new();
 
-        for (i, buffer) in buffers.iter().enumerate() {
-            let buf_id = buffer.id();
+        for (i, &buf_id) in buffer_ids.iter().enumerate() {
             let is_output = output_indices.contains(&i);
 
             // Collect EXISTING writer dependency (already completed)
@@ -664,7 +647,7 @@ impl UnifiedExecutor {
         &mut self,
         kernel_id: u64,
         device: &DeviceSpec,
-        buffers: &[&Buffer],
+        buffer_ids: &[BufferId],
         output_indices: &[usize],
         execute_fn: F,
     ) -> Result<u64>
@@ -682,7 +665,7 @@ impl UnifiedExecutor {
         // 3. Query dependencies (skip_same_device=true for sequential execution)
         // Hardware queue provides ordering for same-device operations
         let (query, update) = self.query_resources(
-            buffers,
+            buffer_ids,
             output_indices,
             device,
             kernel_id,
@@ -754,12 +737,12 @@ impl UnifiedExecutor {
 
         // Query dependencies using the new pattern
         // For a transfer: src is input (index 0), dst is output (index 1)
-        // We create temporary buffer refs for the query
-        let buffers: [&Buffer; 2] = [src, dst];
+        // We pass buffer IDs for dependency tracking
+        let buffer_ids: [BufferId; 2] = [src.id(), dst.id()];
         let output_indices = [1usize]; // dst is the output
 
         // For transfers, we don't skip same-device since transfers are explicit synchronization points
-        let (query, update) = self.query_resources(&buffers, &output_indices, dst_device, transfer_id, timeline, false);
+        let (query, update) = self.query_resources(&buffer_ids, &output_indices, dst_device, transfer_id, timeline, false);
 
         // Wait for all dependencies
         self.wait_for_tokens(&query.wait_on)?;
@@ -844,43 +827,212 @@ impl UnifiedExecutor {
 }
 
 impl UnifiedExecutor {
-    /// Validate that kernels in a parallel group have no buffer conflicts.
+    /// Execute kernels by indices using scoped parallelism.
     ///
-    /// Two kernels conflict if:
-    /// - Both write to the same buffer (WAW hazard)
-    /// - One writes to a buffer the other reads (RAW/WAR hazard)
+    /// This is the new clean API that:
+    /// - Uses `rayon::scope` for borrowed parallel execution (no cloning)
+    /// - Takes kernel indices instead of pre-built contexts
+    /// - Borrows all data from `PreparedKernel` (fixedvars, buffer_ptrs, etc.)
     ///
-    /// # Errors
+    /// # Arguments
     ///
-    /// Returns an error if any buffer conflict is detected.
-    fn validate_parallel_independence(&self, contexts: &[ParallelKernelContext]) -> Result<()> {
+    /// * `all_kernels` - All prepared kernels in the execution plan
+    /// * `indices` - Indices of kernels to execute in this group
+    /// * `buffers` - All buffers in the execution plan (for validation)
+    ///
+    /// # Returns
+    ///
+    /// Vector of (kernel_id, timeline) pairs for each executed kernel.
+    pub fn execute_kernels_by_indices(
+        &mut self,
+        all_kernels: &[PreparedKernel],
+        indices: &[usize],
+        buffers: &[Buffer],
+    ) -> Result<Vec<(u64, u64)>> {
+        use std::sync::Mutex;
+
+        if indices.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Collect kernel references for this group
+        let kernels: Vec<&PreparedKernel> = indices.iter().map(|&idx| &all_kernels[idx]).collect();
+
+        // Single kernel fast path - avoid rayon overhead
+        if kernels.len() == 1 {
+            let kernel = kernels[0];
+
+            // Ensure device context exists
+            if !self.contexts.contains_key(&kernel.device) {
+                self.add_device(kernel.device.clone())?;
+            }
+
+            let timeline = self.contexts.get(&kernel.device).unwrap().next_timeline();
+
+            // Query dependencies
+            let (query, update) = self.query_resources(
+                &kernel.buffer_ids,
+                &kernel.output_indices,
+                &kernel.device,
+                kernel.id,
+                timeline,
+                true, // skip_same_device for sequential
+            );
+
+            // Wait for dependencies
+            self.wait_for_tokens(&query.wait_on)?;
+
+            // Execute kernel - borrow directly, no cloning!
+            unsafe {
+                kernel
+                    .kernel
+                    .program
+                    .execute(&kernel.buffer_ptrs, &kernel.fixedvars, None, None)
+                    .map_err(|e| crate::error::Error::Execution {
+                        reason: format!("Kernel {} failed: {}", kernel.id, e),
+                    })?;
+            }
+
+            // Signal completion
+            if let Some(ctx) = self.contexts.get(&kernel.device) {
+                ctx.signal_completion(timeline);
+            }
+
+            // Update dependency maps
+            self.update_resources(update);
+
+            return Ok(vec![(kernel.id, timeline)]);
+        }
+
+        // PHASE 0: Ensure all device contexts exist
+        for kernel in &kernels {
+            if !self.contexts.contains_key(&kernel.device) {
+                self.add_device(kernel.device.clone())?;
+            }
+        }
+
+        // PHASE 1: Validate no buffer conflicts
+        self.validate_kernel_independence(&kernels, buffers)?;
+
+        // PHASE 2: Query dependencies for all kernels
+        let mut queries_updates: Vec<(DependencyQuery, DependencyUpdate)> = Vec::with_capacity(kernels.len());
+        let mut timelines: Vec<(u64, DeviceSpec, u64)> = Vec::with_capacity(kernels.len());
+
+        for kernel in &kernels {
+            let timeline = self.contexts.get(&kernel.device).unwrap().next_timeline();
+            timelines.push((kernel.id, kernel.device.clone(), timeline));
+
+            let (query, update) = self.query_resources(
+                &kernel.buffer_ids,
+                &kernel.output_indices,
+                &kernel.device,
+                kernel.id,
+                timeline,
+                false, // parallel execution needs ALL deps
+            );
+            queries_updates.push((query, update));
+        }
+
+        // PHASE 3: Wait for all dependencies
+        for (query, _) in &queries_updates {
+            self.wait_for_tokens(&query.wait_on)?;
+        }
+
+        // PHASE 4: Execute in parallel using rayon::scope
+        //
+        // Problem: *mut u8 is not Sync, so &[*mut u8] is not Send.
+        // Solution: Transmute &[*mut u8] to &[usize] which IS Send.
+        //
+        // SAFETY: *mut u8 and usize are guaranteed same size and alignment.
+        // The pointers remain valid for the duration of ExecutionPlan's lifetime.
+        debug_assert_eq!(std::mem::size_of::<*mut u8>(), std::mem::size_of::<usize>());
+        debug_assert_eq!(std::mem::align_of::<*mut u8>(), std::mem::align_of::<usize>());
+
+        let errors: Mutex<Vec<crate::error::Error>> = Mutex::new(Vec::new());
+
+        // Pre-transmute pointer slices to usize slices (zero-copy, zero-alloc)
+        #[allow(clippy::type_complexity)]
+        let ptr_slices: Vec<(&[usize], u64, &std::sync::Arc<crate::kernel_cache::CachedKernel>, &std::collections::HashMap<String, i64>)> = kernels
+            .iter()
+            .map(|k| {
+                let usize_slice: &[usize] = unsafe {
+                    std::mem::transmute::<&[*mut u8], &[usize]>(k.buffer_ptrs.as_slice())
+                };
+                (usize_slice, k.id, &k.kernel, &k.fixedvars)
+            })
+            .collect();
+
+        rayon::scope(|s| {
+            for &(usize_slice, id, program, fixedvars) in &ptr_slices {
+                let errors_ref = &errors;
+                s.spawn(move |_| {
+                    // Transmute back to pointer slice (zero-copy)
+                    let ptrs: &[*mut u8] = unsafe {
+                        std::mem::transmute::<&[usize], &[*mut u8]>(usize_slice)
+                    };
+
+                    let result = unsafe { program.program.execute(ptrs, fixedvars, None, None) };
+
+                    if let Err(e) = result {
+                        errors_ref.lock().unwrap().push(crate::error::Error::Execution {
+                            reason: format!("Kernel {} failed: {}", id, e),
+                        });
+                    }
+                });
+            }
+        });
+
+        // Check for errors
+        let errs = errors.into_inner().unwrap();
+        if let Some(e) = errs.into_iter().next() {
+            return Err(e);
+        }
+
+        // PHASE 5: Signal completions and update state
+        for (_, device, timeline) in &timelines {
+            if let Some(dev_ctx) = self.contexts.get(device) {
+                dev_ctx.signal_completion(*timeline);
+            }
+        }
+
+        for (_, update) in queries_updates {
+            self.update_resources(update);
+        }
+
+        Ok(timelines.iter().map(|(id, _, t)| (*id, *t)).collect())
+    }
+
+    /// Validate that kernels have no buffer conflicts for parallel execution.
+    fn validate_kernel_independence(&self, kernels: &[&PreparedKernel], buffers: &[Buffer]) -> Result<()> {
         let mut all_outputs: HashSet<BufferId> = HashSet::new();
         let mut all_inputs: HashSet<BufferId> = HashSet::new();
 
-        for ctx in contexts {
-            let outputs: HashSet<_> = ctx.output_indices.iter().map(|&i| ctx.buffers[i].id()).collect();
+        for kernel in kernels {
+            let outputs: HashSet<_> = kernel
+                .output_indices
+                .iter()
+                .map(|&i| buffers[kernel.buffer_indices[i]].id())
+                .collect();
 
-            let inputs: HashSet<_> = ctx
-                .buffers
+            let inputs: HashSet<_> = kernel
+                .buffer_indices
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| !ctx.output_indices.contains(i))
-                .map(|(_, b)| b.id())
+                .filter(|(i, _)| !kernel.output_indices.contains(i))
+                .map(|(_, &buf_idx)| buffers[buf_idx].id())
                 .collect();
 
             // Check for write-write conflict (WAW)
             if !all_outputs.is_disjoint(&outputs) {
                 return Err(crate::error::Error::Execution {
-                    reason: "Write conflict in parallel group: multiple kernels write same buffer".into(),
+                    reason: "Write conflict: multiple kernels write same buffer".into(),
                 });
             }
 
             // Check for read-write conflict (RAW/WAR)
-            // - A new output conflicts with existing inputs (WAR)
-            // - A new input conflicts with existing outputs (RAW)
             if !outputs.is_disjoint(&all_inputs) || !inputs.is_disjoint(&all_outputs) {
                 return Err(crate::error::Error::Execution {
-                    reason: "Read-write conflict in parallel group: kernel reads buffer another writes".into(),
+                    reason: "Read-write conflict in parallel group".into(),
                 });
             }
 
@@ -889,153 +1041,6 @@ impl UnifiedExecutor {
         }
 
         Ok(())
-    }
-
-    /// Execute a group of kernels in parallel with proper dependency tracking.
-    ///
-    /// Uses the Tinygrad-aligned 5-phase execution model:
-    /// 1. VALIDATE: Ensure no buffer conflicts within the group
-    /// 2. QUERY: Collect all dependencies (no state mutation)
-    /// 3. WAIT: Wait for all dependencies (from PREVIOUS completed operations)
-    /// 4. EXECUTE: Run all kernels in parallel (rayon)
-    /// 5. SIGNAL+UPDATE: Signal completions, then update dependency maps
-    ///
-    /// # Key Invariants
-    ///
-    /// - `skip_same_device=false`: Rayon doesn't provide hardware queue ordering,
-    ///   so we track ALL dependencies regardless of device
-    /// - Dependency maps are updated AFTER signals, never before
-    /// - All tokens in `wait_on` are from already-signaled operations
-    ///
-    /// # Arguments
-    ///
-    /// * `contexts` - Kernel contexts containing buffer access info
-    /// * `execute_fns` - Execution functions for each kernel (must match contexts)
-    ///
-    /// # Returns
-    ///
-    /// Vector of (kernel_id, timeline) pairs for each executed kernel.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Buffer conflicts exist within the parallel group
-    /// - Any kernel execution fails
-    /// - Dependency wait fails
-    pub fn execute_parallel_group<F>(
-        &mut self,
-        contexts: &[ParallelKernelContext],
-        execute_fns: Vec<F>,
-    ) -> Result<Vec<(u64, u64)>>
-    where
-        F: FnOnce() -> Result<()> + Send,
-    {
-        use rayon::prelude::*;
-
-        if contexts.is_empty() {
-            return Ok(vec![]);
-        }
-
-        assert_eq!(contexts.len(), execute_fns.len(), "contexts and execute_fns must have the same length");
-
-        // PHASE 0: Ensure all device contexts exist
-        for ctx in contexts {
-            if !self.contexts.contains_key(&ctx.device) {
-                self.add_device(ctx.device.clone())?;
-            }
-        }
-
-        // For single task, use sequential path (skip rayon overhead)
-        if contexts.len() == 1 {
-            let ctx = &contexts[0];
-            let execute_fn = execute_fns.into_iter().next().unwrap();
-            let device = ctx.device.clone();
-
-            let timeline = self.contexts.get(&device).unwrap().next_timeline();
-
-            // Query dependencies (skip_same_device=true for single-kernel path)
-            let buffer_refs: Vec<&Buffer> = ctx.buffers.iter().collect();
-            let (query, update) =
-                self.query_resources(&buffer_refs, &ctx.output_indices, &device, ctx.node_id, timeline, true);
-
-            // Wait for dependencies
-            self.wait_for_tokens(&query.wait_on)?;
-
-            // Execute
-            execute_fn()?;
-
-            // Signal completion
-            if let Some(dev_ctx) = self.contexts.get(&device) {
-                dev_ctx.signal_completion(timeline);
-            }
-
-            // Update maps AFTER signal
-            self.update_resources(update);
-
-            return Ok(vec![(ctx.node_id, timeline)]);
-        }
-
-        // PHASE 1: VALIDATE - Ensure no buffer conflicts within the group
-        self.validate_parallel_independence(contexts)?;
-
-        // PHASE 2: QUERY - Collect all dependencies (no state changes)
-        // skip_same_device=false: rayon doesn't provide hardware queue ordering!
-        let mut queries_updates: Vec<(DependencyQuery, DependencyUpdate)> = Vec::with_capacity(contexts.len());
-        let mut timelines: Vec<(u64, DeviceSpec, u64)> = Vec::with_capacity(contexts.len());
-
-        for ctx in contexts {
-            let timeline = self.contexts.get(&ctx.device).unwrap().next_timeline();
-            timelines.push((ctx.node_id, ctx.device.clone(), timeline));
-
-            let buffer_refs: Vec<&Buffer> = ctx.buffers.iter().collect();
-            let (query, update) = self.query_resources(
-                &buffer_refs,
-                &ctx.output_indices,
-                &ctx.device,
-                ctx.node_id,
-                timeline,
-                false, // skip_same_device=false: parallel execution needs ALL deps
-            );
-            queries_updates.push((query, update));
-        }
-
-        // PHASE 3: WAIT - Wait for ALL dependencies (from PREVIOUS operations, already signaled)
-        for (query, _) in &queries_updates {
-            self.wait_for_tokens(&query.wait_on)?;
-        }
-
-        // PHASE 4: EXECUTE - Run all kernels in parallel using rayon
-        let results: Vec<Result<u64>> = execute_fns
-            .into_par_iter()
-            .zip(contexts.par_iter())
-            .map(|(execute_fn, ctx)| {
-                execute_fn()?;
-                Ok(ctx.node_id)
-            })
-            .collect();
-
-        // PHASE 5: SIGNAL + UPDATE
-        // First, signal ALL completions
-        for (_, device, timeline) in &timelines {
-            if let Some(dev_ctx) = self.contexts.get(device) {
-                dev_ctx.signal_completion(*timeline);
-            }
-        }
-
-        // Then, update ALL dependency maps (AFTER all signals)
-        for (_, update) in queries_updates {
-            self.update_resources(update);
-        }
-
-        // Collect results
-        let mut final_results = Vec::with_capacity(results.len());
-        for (result, (id, _, timeline)) in results.into_iter().zip(timelines.iter()) {
-            let node_id = result?;
-            debug_assert_eq!(node_id, *id);
-            final_results.push((node_id, *timeline));
-        }
-
-        Ok(final_results)
     }
 }
 
@@ -1273,76 +1278,5 @@ mod tests {
         let independent = graph.find_independent_kernels(&[1, 2]);
         // Should be in different groups due to read-write conflict
         assert_eq!(independent.len(), 2);
-    }
-
-    #[test]
-    fn test_execute_parallel_group_empty() {
-        let registry = morok_device::registry::registry();
-        let mut executor = UnifiedExecutor::new(registry);
-
-        // Empty context list should work
-        let contexts: Vec<ParallelKernelContext> = vec![];
-        let execute_fns: Vec<Box<dyn FnOnce() -> Result<()> + Send>> = vec![];
-        let results = executor.execute_parallel_group(&contexts, execute_fns).unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_execute_parallel_group_single() {
-        let registry = morok_device::registry::registry();
-        let mut executor = UnifiedExecutor::new(registry);
-
-        // Single task should work (fast path, no rayon)
-        let executed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let executed_clone = executed.clone();
-
-        let contexts = vec![ParallelKernelContext {
-            node_id: 1,
-            device: DeviceSpec::Cpu,
-            buffers: vec![], // No buffers for this simple test
-            output_indices: vec![],
-        }];
-
-        let execute_fns: Vec<Box<dyn FnOnce() -> Result<()> + Send>> = vec![Box::new(move || {
-            executed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        })];
-
-        let results = executor.execute_parallel_group(&contexts, execute_fns).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, 1); // kernel id
-        assert!(executed.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[test]
-    fn test_execute_parallel_group_multiple() {
-        let registry = morok_device::registry::registry();
-        let mut executor = UnifiedExecutor::new(registry);
-
-        // Multiple independent tasks in parallel
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        let contexts: Vec<_> = (0..4)
-            .map(|i| ParallelKernelContext {
-                node_id: i as u64,
-                device: DeviceSpec::Cpu,
-                buffers: vec![], // No buffers for this simple test
-                output_indices: vec![],
-            })
-            .collect();
-
-        let execute_fns: Vec<Box<dyn FnOnce() -> Result<()> + Send>> = (0..4)
-            .map(|_| {
-                let counter_clone = counter.clone();
-                Box::new(move || {
-                    counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok(())
-                }) as Box<dyn FnOnce() -> Result<()> + Send>
-            })
-            .collect();
-
-        let results = executor.execute_parallel_group(&contexts, execute_fns).unwrap();
-        assert_eq!(results.len(), 4);
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 }
