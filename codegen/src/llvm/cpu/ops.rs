@@ -146,7 +146,10 @@ fn codegen_arithmetic<'ctx>(
             let rhs_val = require_value(rhs, context, module, builder, values)?;
             let lhs_val = auto_load_pointer(lhs_val, &lhs.dtype(), context, builder)?;
             let rhs_val = auto_load_pointer(rhs_val, &rhs.dtype(), context, builder)?;
-            Ok(Some(codegen_binary(*op, lhs_val, rhs_val, &uop.dtype(), module, builder)?))
+            // Pass operand dtype for comparisons (like Tinygrad's lop[x.src[0].dtype])
+            // For Ptr types, extract the base type since auto_load_pointer already loaded the value
+            let operand_dtype = DType::Scalar(lhs.dtype().base());
+            Ok(Some(codegen_binary(*op, lhs_val, rhs_val, &operand_dtype, &uop.dtype(), module, builder)?))
         }
         Op::Ternary(op, a, b, c) => {
             let a_val = require_value(a, context, module, builder, values)?;
@@ -200,17 +203,21 @@ fn codegen_binary<'ctx>(
     op: BinaryOp,
     lhs: BasicValueEnum<'ctx>,
     rhs: BasicValueEnum<'ctx>,
+    operand_dtype: &DType,
     result_dtype: &DType,
     module: &Module<'ctx>,
     builder: &Builder<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>> {
-    let is_float = result_dtype.is_float();
-    let is_signed = result_dtype.is_signed();
-
-    // Handle comparisons
+    // For comparisons, use operand dtype (like Tinygrad's lop[x.src[0].dtype])
+    // For arithmetic ops, use result dtype
     if common::is_comparison(op) {
+        let is_float = operand_dtype.is_float();
+        let is_signed = operand_dtype.is_signed();
         return common::build_cmp(builder, op, lhs, rhs, is_float, is_signed);
     }
+
+    let is_float = result_dtype.is_float();
+    let is_signed = result_dtype.is_signed();
 
     match op {
         BinaryOp::Add => common::build_add(builder, lhs, rhs, is_float),
