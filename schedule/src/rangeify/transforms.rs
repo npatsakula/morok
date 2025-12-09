@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_ir::{AddrSpace, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey};
+use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey};
 use smallvec::SmallVec;
 
 use super::context::RangeifyContext;
@@ -85,7 +85,7 @@ pub fn rangeify(
 // ============================================================================
 
 /// Transform a UOp's sources by adding BUFFERIZE + INDEX where needed.
-pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &IndexingContext) -> Option<Vec<Arc<UOp>>> {
+pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Vec<Arc<UOp>>> {
     if matches!(x.op(), Op::Bufferize { .. } | Op::Index { .. } | Op::After { .. }) {
         return None;
     }
@@ -96,12 +96,13 @@ pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &IndexingContext) -> 
     }
 
     let (input_ranges, _) = ctx.get_ranges(x)?;
+    let input_ranges = input_ranges.clone(); // Clone to release borrow on ctx
 
     let mut new_sources = Vec::with_capacity(sources.len());
     let mut any_changed = false;
 
     for src in sources.iter() {
-        let new_src = transform_single_source(x, src, input_ranges, ctx);
+        let new_src = transform_single_source(x, src, &input_ranges, ctx);
         if !Arc::ptr_eq(&new_src, src) {
             any_changed = true;
         }
@@ -132,7 +133,7 @@ pub(crate) fn transform_single_source(
     _consumer: &Arc<UOp>,
     src: &Arc<UOp>,
     input_ranges: &[Arc<UOp>],
-    ctx: &IndexingContext,
+    ctx: &mut IndexingContext,
 ) -> Arc<UOp> {
     // Case 1: Buffer-like op → add INDEX
     if matches!(
@@ -151,10 +152,10 @@ pub(crate) fn transform_single_source(
     // Check for REDUCE op that might have been converted from ReduceAxis
     // During graph rewrite, ReduceAxis is converted to REDUCE but realize_map was keyed on ReduceAxis
     // We need to handle both cases
-    let realize_axes_opt = ctx.get_realize_axes(src);
+    let realize_axes_opt = ctx.get_realize_axes(src).cloned();
 
     // Case 2: Source needs realization → wrap in BUFFERIZE + INDEX
-    if let Some(realize_axes) = realize_axes_opt {
+    if let Some(ref realize_axes) = realize_axes_opt {
         let (_, output_ranges) = ctx.get_ranges(src).expect("Realized op must have ranges");
 
         let closed_ranges: Vec<_> = output_ranges
@@ -172,11 +173,20 @@ pub(crate) fn transform_single_source(
 
         let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges, opts);
 
+        // Convert REDUCE ranges to LOOP ranges (Tinygrad rangeify.py:286)
+        // When materializing a reduction, the iteration loop becomes a regular LOOP, not REDUCE.
         let index_ranges: Vec<_> = input_ranges
             .iter()
             .enumerate()
             .filter(|(i, _)| realize_axes.contains(i))
-            .map(|(_, r)| Arc::clone(r))
+            .map(|(_, r)| {
+                if let Op::Range { end, axis_type: AxisType::Reduce, .. } = r.op() {
+                    // Convert REDUCE range to LOOP range with new axis ID
+                    ctx.new_range_from_uop(end, AxisType::Loop)
+                } else {
+                    Arc::clone(r)
+                }
+            })
             .collect();
 
         if !index_ranges.is_empty() {

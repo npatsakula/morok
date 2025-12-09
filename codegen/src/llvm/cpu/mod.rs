@@ -339,8 +339,11 @@ fn find_reduce_source_nodes(nodes: &[Arc<UOp>]) -> std::collections::HashSet<u64
 /// Recursively collect all nodes in a subgraph, excluding buffers, defines, and REDUCEs.
 ///
 /// IMPORTANT: We stop at REDUCE nodes because nested REDUCEs need to be evaluated
-/// separately (they create their own loops). We also stop at INDEX nodes because
-/// they depend on the current loop counter and must be re-evaluated in each loop context.
+/// separately (they create their own loops).
+///
+/// INDEX nodes ARE included in the skip set - they must be evaluated by REDUCE
+/// after it sets up the loop counters. However, INDEX results should not be cached
+/// since they depend on loop context (handled by require_value not caching them).
 fn collect_source_subgraph(uop: &Arc<UOp>, ids: &mut std::collections::HashSet<u64>) {
     // Don't re-process
     if ids.contains(&uop.id) {
@@ -360,12 +363,6 @@ fn collect_source_subgraph(uop: &Arc<UOp>, ids: &mut std::collections::HashSet<u
         // that should be handled separately. Nested REDUCEs must be evaluated
         // BEFORE the outer REDUCE's loop, not inside it.
         Op::Reduce { .. } => {
-            return;
-        }
-        // Stop at INDEX nodes - they depend on the current loop counter and
-        // must NOT be cached across different loop contexts. Each loop that
-        // uses an INDEX should re-evaluate it with its own loop counter.
-        Op::Index { .. } => {
             return;
         }
         _ => {}

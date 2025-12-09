@@ -66,6 +66,15 @@ impl IndexingContext {
         UOp::range_axis(size_uop, axis_id, axistype)
     }
 
+    /// Create a new RANGE from an existing UOp end value.
+    /// Used when converting REDUCE ranges to LOOP ranges during bufferization.
+    /// (Tinygrad rangeify.py:286 - when bufferizing, REDUCE ranges become LOOP)
+    pub fn new_range_from_uop(&mut self, end: &Arc<UOp>, axis_type: AxisType) -> Arc<UOp> {
+        let axis_id = AxisId::Unrenumbered(self.range_idx);
+        self.range_idx += 1;
+        UOp::range_axis(Arc::clone(end), axis_id, axis_type)
+    }
+
     /// Mark a UOp for realization on all axes.
     pub fn mark_realize_all(&mut self, uop: &Arc<UOp>) -> morok_ir::Result<()> {
         if let Some(shape) = uop.shape()? {
