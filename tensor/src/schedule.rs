@@ -364,12 +364,31 @@ fn collect_kernel_buffers(
 ///
 /// Returns error if BIND structure is malformed.
 fn collect_bound_ranges(ast: &Arc<UOp>) -> Result<Vec<BoundRange>> {
+    use std::collections::HashSet;
+
+    let nodes = ast.toposort();
+
+    // Find DefineVar IDs that are bound to OUTER ranges (will be inlined as loops on CPU)
+    let mut bound_outer_vars: HashSet<u64> = HashSet::new();
+    for node in &nodes {
+        if let Op::Bind { var, value } = node.op()
+            && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. }) {
+                // This DefineVar is bound to an OUTER range
+                bound_outer_vars.insert(var.id);
+            }
+    }
+
     let mut bound_ranges = Vec::new();
 
-    // Walk the AST and collect all DEFINE_VAR nodes
-    // These represent OUTER range variables that need iteration
-    for node in ast.toposort() {
+    // Only collect DEFINE_VAR nodes that are NOT bound to OUTER ranges
+    // BIND+OUTER DefineVars will be inlined as loops by CPU codegen
+    for node in &nodes {
         if let Op::DefineVar { name, max_val } = node.op() {
+            // Skip DefineVars that are bound to OUTER ranges
+            if bound_outer_vars.contains(&node.id) {
+                continue;
+            }
+
             // Create a synthetic RANGE UOp for this variable
             // Range goes from 0 to max_val+1 (exclusive upper bound)
             let range_end = UOp::const_(
@@ -411,21 +430,12 @@ pub fn expand_schedule(schedule: Schedule) -> Schedule {
 
     for item in schedule {
         if item.bound_ranges.is_empty() {
-            // No bound ranges - already expanded or no OUTER ranges
+            // No bound ranges - already expanded or no standalone DefineVars
             expanded.push(item);
         } else {
-            // Check if this is a CPU kernel - skip expansion for CPU
-            // CPU codegen will inline outer loops for better LLVM optimization
-            let is_cpu =
-                item.buffers.first().map(|b| matches!(b.allocator().device_spec(), DeviceSpec::Cpu)).unwrap_or(true);
-
-            if is_cpu {
-                // Keep item as-is for CPU - codegen will inline outer loops
-                expanded.push(item);
-                continue;
-            }
-
-            // GPU/Metal: Expand into multiple schedule items (existing behavior)
+            // Expand into multiple schedule items
+            // Note: bound_ranges now only contains standalone DefineVars (not BIND+OUTER)
+            // BIND+OUTER DefineVars are handled by CPU codegen as inlined loops
             // Extract iteration counts from each bound range
             let iteration_counts: Vec<i64> = item
                 .bound_ranges

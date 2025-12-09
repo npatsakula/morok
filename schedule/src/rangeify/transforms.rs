@@ -148,8 +148,13 @@ pub(crate) fn transform_single_source(
             .expect("Failed to create INDEX for movement buffer source");
     }
 
+    // Check for REDUCE op that might have been converted from ReduceAxis
+    // During graph rewrite, ReduceAxis is converted to REDUCE but realize_map was keyed on ReduceAxis
+    // We need to handle both cases
+    let realize_axes_opt = ctx.get_realize_axes(src);
+
     // Case 2: Source needs realization → wrap in BUFFERIZE + INDEX
-    if let Some(realize_axes) = ctx.get_realize_axes(src) {
+    if let Some(realize_axes) = realize_axes_opt {
         let (_, output_ranges) = ctx.get_ranges(src).expect("Realized op must have ranges");
 
         let closed_ranges: Vec<_> = output_ranges

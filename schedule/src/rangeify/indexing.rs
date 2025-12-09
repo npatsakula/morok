@@ -23,6 +23,10 @@ pub struct IndexingContext {
     pub realize_map: HashMap<UOpKey, Option<Vec<usize>>>,
     /// Maps each UOp to its (input_ranges, output_ranges).
     pub range_map: HashMap<UOpKey, UOpRanges>,
+    /// Tracks ranges that are "ending" at each UOp (for nested reduction detection).
+    /// When EXPAND broadcasts to static dims, ranges are marked as ending.
+    /// When REDUCE_AXIS encounters ending ranges, it forces realization.
+    pub ending_ranges: HashMap<UOpKey, Vec<Arc<UOp>>>,
     /// Counter for generating unique range IDs.
     range_idx: usize,
 }
@@ -44,6 +48,12 @@ impl IndexingContext {
             return UOp::index_const(0);
         }
 
+        self.new_range_uncollapsed(size, axistype)
+    }
+
+    /// Create new RANGE with unique ID, without collapsing size=1 to Const(0).
+    /// Use this when you need a proper Range UOp for realization/kernel boundaries.
+    pub fn new_range_uncollapsed(&mut self, size: &SInt, axistype: AxisType) -> Arc<UOp> {
         // Create range with Unrenumbered axis_id
         let axis_id = AxisId::Unrenumbered(self.range_idx);
         self.range_idx += 1;
@@ -93,6 +103,21 @@ impl IndexingContext {
     /// Get the current range counter value.
     pub fn range_counter(&self) -> usize {
         self.range_idx
+    }
+
+    /// Get ending ranges for a UOp (ranges that "ended" at this point).
+    pub fn get_ending_ranges(&self, uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
+        self.ending_ranges.get(&UOpKey(Arc::clone(uop))).cloned().unwrap_or_default()
+    }
+
+    /// Set ending ranges for a UOp.
+    pub fn set_ending_ranges(&mut self, uop: &Arc<UOp>, ranges: Vec<Arc<UOp>>) {
+        self.ending_ranges.insert(UOpKey(Arc::clone(uop)), ranges);
+    }
+
+    /// Clear ending ranges for a UOp (after they've been handled).
+    pub fn clear_ending_ranges(&mut self, uop: &Arc<UOp>) {
+        self.ending_ranges.insert(UOpKey(Arc::clone(uop)), Vec::new());
     }
 }
 
@@ -262,11 +287,21 @@ fn assign_ranges(
         let consumer_rngs: Vec<Vec<Arc<UOp>>> =
             consumers.iter().filter_map(|c| ctx.get_ranges(c).map(|(inp, _)| inp.clone())).collect();
 
-        let out_rngs = if ctx.should_realize(x) {
+        // Inherit ending_ranges from consumers (like Tinygrad line 173)
+        // ending_ranges propagate from consumers → producers (backward in data flow)
+        let mut inherited_ending: Vec<Arc<UOp>> = Vec::new();
+        for consumer in &consumers {
+            inherited_ending.extend(ctx.get_ending_ranges(consumer));
+        }
+        ctx.set_ending_ranges(x, inherited_ending);
+
+        let mut out_rngs = if ctx.should_realize(x) {
             if let Some(shape) = x.shape()? {
                 let rngs: Vec<_> = shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect();
                 let axes: Vec<usize> = (0..shape.len()).collect();
                 ctx.realize_map.insert(UOpKey(x.clone()), Some(axes));
+                // Clear ending_ranges when realized (like Tinygrad line 185)
+                ctx.clear_ending_ranges(x);
                 rngs
             } else {
                 continue;
@@ -336,6 +371,59 @@ fn assign_ranges(
             }
             _ => out_rngs.clone(),
         };
+
+        // EXPAND marks ranges as ending when broadcasting to static dimensions (Tinygrad lines 249-252)
+        // "if the EXPAND is used to inject a range, we don't mark it as ending_ranges. otherwise we do."
+        if let Op::Expand { new_shape, .. } = x.op() {
+            // Check if new_shape is all static (no RANGE ops being injected in the shape)
+            let shape_is_static = extract_shape_from_uop(new_shape).iter().all(|s| matches!(s, SInt::Const(_)));
+
+            if shape_is_static {
+                // Ranges that changed (in_rngs != out_rngs) are "ending"
+                // These are the output ranges that were collapsed to const 0 in in_rngs
+                let mut changed_ranges: Vec<Arc<UOp>> = Vec::new();
+                for (inp, out) in in_rngs.iter().zip(out_rngs.iter()) {
+                    if !Arc::ptr_eq(inp, out) {
+                        // The output range is being collapsed - collect any RANGE ops in it
+                        changed_ranges.extend(collect_ranges_from_uop(out));
+                    }
+                }
+
+                if !changed_ranges.is_empty() {
+                    let mut ending = ctx.get_ending_ranges(x);
+                    ending.extend(changed_ranges);
+                    ctx.set_ending_ranges(x, ending);
+                }
+            }
+        }
+
+        // Check ending_ranges for REDUCE_AXIS and elementwise ops (Tinygrad lines 224-234)
+        // When there are ending_ranges, we force realization of ALL output axes.
+        // This matches Tinygrad's behavior with PCONTIG=0 (default):
+        //   if not (PCONTIG > 1) or any(...):  # With PCONTIG=0, this is always True
+        let ending = ctx.get_ending_ranges(x);
+        if !ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
+            // IMPORTANT: Use the op's actual output shape, not inherited out_rngs.
+            // For a scalar ReduceAxis (full reduction), the output is [] with no ranges.
+            // We must realize based on the actual output shape, not consumer-inherited ranges.
+            if let Some(shape) = x.shape().ok().flatten() {
+                let realize_axes: Vec<usize> = (0..shape.len()).collect();
+
+                // Clear ending_ranges after handling
+                ctx.clear_ending_ranges(x);
+
+                // Force realization on all axes (even if empty for scalar output)
+                // This marks the op for BUFFERIZE wrapping
+                ctx.mark_realize(x, realize_axes.clone());
+
+                // Create new ranges for realized axes
+                // IMPORTANT: For realization, we need proper RANGE ops, not collapsed Const(0)
+                // Use new_range_uncollapsed to ensure we get actual Range UOps
+                out_rngs = shape.iter().map(|s| ctx.new_range_uncollapsed(s, AxisType::Loop)).collect();
+            } else {
+                ctx.clear_ending_ranges(x);
+            }
+        }
 
         ctx.set_ranges(x, in_rngs, out_rngs);
     }
@@ -718,4 +806,31 @@ pub fn is_cheap_to_inline(op: &Op) -> bool {
 /// Check if a BUFFERIZE operation is for local memory.
 pub fn is_local_bufferize(uop: &Arc<UOp>) -> bool {
     if let Op::Bufferize { opts, .. } = uop.op() { opts.addrspace == morok_ir::AddrSpace::Local } else { false }
+}
+
+// ============================================================================
+// Ending Ranges Helpers (for nested reduction detection)
+// ============================================================================
+
+/// Collect all RANGE UOps from an expression tree.
+#[allow(clippy::mutable_key_type)]
+fn collect_ranges_from_uop(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
+    use std::collections::HashSet;
+    let mut ranges = Vec::new();
+    let mut seen = HashSet::new();
+
+    for node in uop.toposort() {
+        if matches!(node.op(), Op::Range { .. }) {
+            let key = UOpKey(Arc::clone(&node));
+            if seen.insert(key) {
+                ranges.push(node);
+            }
+        }
+    }
+    ranges
+}
+
+/// Check if UOp is an elementwise operation.
+fn is_elementwise_op(uop: &Arc<UOp>) -> bool {
+    matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Cast { .. })
 }

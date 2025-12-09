@@ -83,8 +83,16 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
             values.insert(buffer_uop.id, param);
         }
 
-        // Note: variables vector is empty for CPU with inlined outer loops
-        // DefineVar values are generated as loop counters below
+        // Add variable parameters (DefineVar nodes become i64 kernel parameters)
+        for (i, var_uop) in variables.iter().enumerate() {
+            let param_idx = (buffers.len() + i) as u32;
+            let param =
+                kernel_function.get_nth_param(param_idx).context(InvalidFunctionParameterSnafu { index: param_idx })?;
+            if let Op::DefineVar { name, .. } = var_uop.op() {
+                param.set_name(name);
+            }
+            values.insert(var_uop.id, param);
+        }
 
         // Walk the UOp graph in topological order
         let nodes = uop.toposort();
@@ -95,34 +103,14 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // its source is evaluated (e.g., INDEX needs the loop counter, not the end value)
         let reduce_src_nodes = find_reduce_source_nodes(&nodes);
 
-        // Pre-pass: Generate loops for DefineVar nodes
-        // For CPU with inlined outer loops, each DefineVar represents an outer loop
-        // We generate the loop structure here and map DefineVar to the loop counter
-        // Store the DefineVar IDs to close their loops at the end
-        let mut outer_loop_ids: Vec<u64> = Vec::new();
+        // Pre-pass: Process BIND operations with OUTER ranges first
+        // This ensures outer loop counters are available before other operations that use them.
+        // Without this, DefineVar would have no value when operations reference it.
         for node in &nodes {
-            if let Op::DefineVar { max_val, .. } = node.op() {
-                // Generate end value: max_val + 1 (DefineVar stores max value, we need exclusive upper bound)
-                let end_int = self.context.i64_type().const_int((*max_val + 1) as u64, false);
-
-                // Build loop structure
-                let (loop_ctx, counter_val) = crate::llvm::common::loop_gen::build_loop(
-                    self.context,
-                    &builder,
-                    kernel_function,
-                    end_int,
-                    node.id,
-                )?;
-
-                // Store loop context (using DefineVar id as key)
-                values.insert_loop(node.id, loop_ctx);
-
-                // Map DefineVar to loop counter
-                values.insert(node.id, counter_val.into());
-
-                // Track for closing at the end
-                outer_loop_ids.push(node.id);
-            }
+            if let Op::Bind { value, .. } = node.op()
+                && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. }) {
+                    ops::codegen_uop(node, self.context, &module, &builder, &mut values)?;
+                }
         }
 
         // Main pass: process all remaining nodes
@@ -134,10 +122,13 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
             ops::codegen_uop(node, self.context, &module, &builder, &mut values)?;
         }
 
-        // Close outer loops (innermost to outermost, so reverse order)
-        for &loop_id in outer_loop_ids.iter().rev() {
-            if let Some(loop_ctx) = values.get_loop(loop_id) {
-                let loop_ctx = loop_ctx.clone();
+        // Close all remaining outer loops (those not closed by END operations)
+        // END operations for Outer ranges are excluded from kernel bodies (Tinygrad pattern),
+        // so outer loops must be closed here at the end.
+        // Use take_loop to remove them, preventing any double-close issues.
+        let remaining_ids = values.remaining_loop_ids();
+        for loop_id in remaining_ids.into_iter().rev() {
+            if let Some(loop_ctx) = values.take_loop(loop_id) {
                 crate::llvm::common::loop_gen::close_loop(&builder, &loop_ctx)?;
             }
         }
@@ -221,17 +212,18 @@ impl<'ctx> Renderer for CpuLlvmRenderer<'ctx> {
     }
 }
 
-/// Collect buffer parameters from a UOp graph.
+/// Collect buffer and variable parameters from a UOp graph.
 ///
 /// Collects:
 /// - Buffers: DEFINE_GLOBAL, DEFINE_LOCAL, BUFFER operations
+/// - Variables: DEFINE_VAR operations NOT in BIND+OUTER patterns (passed as i64 kernel params)
 ///
-/// Note: DefineVar is NOT collected as a parameter. With inlined outer loops,
-/// DefineVar values are generated as loop counters inside the kernel, not as
-/// function parameters passed from the scheduler.
+/// DefineVars in BIND+OUTER patterns are handled as inlined loops, not kernel parameters.
 ///
-/// Returns buffers sorted for deterministic function signatures.
+/// Returns (buffers, variables) sorted for deterministic function signatures.
 fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
+    use std::collections::HashSet;
+
     let nodes = root.toposort();
 
     // Collect buffers
@@ -253,9 +245,27 @@ fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
         _ => b.id,
     });
 
-    // For CPU with inlined outer loops, DefineVar becomes loop counters, not parameters
-    // Return empty variables vector
-    let variables = Vec::new();
+    // Find DefineVar IDs that are bound to OUTER ranges (will be inlined as loops)
+    let mut bound_outer_vars: HashSet<u64> = HashSet::new();
+    for node in &nodes {
+        if let Op::Bind { var, value } = node.op()
+            && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. }) {
+                // This DefineVar is bound to an OUTER range - will be inlined as loop
+                bound_outer_vars.insert(var.id);
+            }
+    }
+
+    // Collect DefineVar nodes that are NOT bound to OUTER ranges
+    // Only these become i64 kernel parameters
+    let mut variables = Vec::new();
+    for node in &nodes {
+        if matches!(node.op(), Op::DefineVar { .. }) && !bound_outer_vars.contains(&node.id) {
+            variables.push(node.clone());
+        }
+    }
+
+    // Sort variables by name for deterministic function signatures
+    variables.sort_by_key(|v| if let Op::DefineVar { name, .. } = v.op() { name.clone() } else { String::new() });
 
     (buffers, variables)
 }
@@ -312,11 +322,13 @@ fn find_reduce_source_nodes(nodes: &[Arc<UOp>]) -> std::collections::HashSet<u64
             // Add all nodes in the source subgraph (excluding buffers/defines)
             collect_source_subgraph(src, &mut reduce_src_ids);
 
-            // Add reduce ranges (but not their end values - those are constants)
+            // Add Reduce AND Loop type ranges (OUTER is handled by BIND)
+            // These need to be skipped in main loop - REDUCE will handle them
             for range in ranges {
-                if let Op::Range { axis_type: morok_ir::AxisType::Reduce, .. } = range.op() {
-                    reduce_src_ids.insert(range.id);
-                }
+                if let Op::Range { axis_type, .. } = range.op()
+                    && matches!(axis_type, morok_ir::AxisType::Reduce | morok_ir::AxisType::Loop) {
+                        reduce_src_ids.insert(range.id);
+                    }
             }
         }
     }
@@ -324,7 +336,11 @@ fn find_reduce_source_nodes(nodes: &[Arc<UOp>]) -> std::collections::HashSet<u64
     reduce_src_ids
 }
 
-/// Recursively collect all nodes in a subgraph, excluding buffers and defines.
+/// Recursively collect all nodes in a subgraph, excluding buffers, defines, and REDUCEs.
+///
+/// IMPORTANT: We stop at REDUCE nodes because nested REDUCEs need to be evaluated
+/// separately (they create their own loops). We also stop at INDEX nodes because
+/// they depend on the current loop counter and must be re-evaluated in each loop context.
 fn collect_source_subgraph(uop: &Arc<UOp>, ids: &mut std::collections::HashSet<u64>) {
     // Don't re-process
     if ids.contains(&uop.id) {
@@ -338,6 +354,18 @@ fn collect_source_subgraph(uop: &Arc<UOp>, ids: &mut std::collections::HashSet<u
         }
         // Skip constants - they can be generated anywhere
         Op::Const(_) => {
+            return;
+        }
+        // Stop at REDUCE nodes - they have their own source subgraphs
+        // that should be handled separately. Nested REDUCEs must be evaluated
+        // BEFORE the outer REDUCE's loop, not inside it.
+        Op::Reduce { .. } => {
+            return;
+        }
+        // Stop at INDEX nodes - they depend on the current loop counter and
+        // must NOT be cached across different loop contexts. Each loop that
+        // uses an INDEX should re-evaluate it with its own loop counter.
+        Op::Index { .. } => {
             return;
         }
         _ => {}

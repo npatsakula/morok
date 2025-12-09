@@ -1,7 +1,7 @@
 //! Helper functions for LLVM code generation using inkwell.
 
 use inkwell::basic_block::BasicBlock;
-use inkwell::values::{BasicValueEnum, IntValue, PhiValue};
+use inkwell::values::{BasicValueEnum, PhiValue};
 use std::collections::HashMap;
 
 /// Loop context for tracking RANGE-generated basic blocks.
@@ -28,8 +28,8 @@ pub struct LoopContext<'ctx> {
     pub exit_block: BasicBlock<'ctx>,
     /// PHI node for loop counter (incoming edges from entry and footer)
     pub phi: PhiValue<'ctx>,
-    /// Incremented counter value (for PHI incoming edge from footer)
-    pub incremented: IntValue<'ctx>,
+    /// Loop ID for generating unique increment name in footer block
+    pub loop_id: u64,
 }
 
 /// Value tracker for UOp to LLVM value mapping.
@@ -40,6 +40,8 @@ pub struct LoopContext<'ctx> {
 pub struct ValueMap<'ctx> {
     uop_to_value: HashMap<u64, BasicValueEnum<'ctx>>,
     loop_contexts: HashMap<u64, LoopContext<'ctx>>,
+    /// Loop IDs in creation order (for correct nesting when closing)
+    loop_order: Vec<u64>,
     /// UOps that were processed but don't produce a value (like END, SINK).
     /// This prevents re-processing when they're encountered again.
     processed_no_value: std::collections::HashSet<u64>,
@@ -50,6 +52,7 @@ impl<'ctx> ValueMap<'ctx> {
         Self {
             uop_to_value: HashMap::new(),
             loop_contexts: HashMap::new(),
+            loop_order: Vec::new(),
             processed_no_value: std::collections::HashSet::new(),
         }
     }
@@ -75,13 +78,31 @@ impl<'ctx> ValueMap<'ctx> {
     }
 
     /// Store loop context for a RANGE operation.
+    /// Tracks insertion order for correct nesting when closing.
     pub fn insert_loop(&mut self, range_id: u64, ctx: LoopContext<'ctx>) {
+        // Only track in order if not already present (avoid duplicates when copied)
+        if !self.loop_contexts.contains_key(&range_id) {
+            self.loop_order.push(range_id);
+        }
         self.loop_contexts.insert(range_id, ctx);
     }
 
     /// Get loop context for a RANGE operation.
     pub fn get_loop(&self, range_id: u64) -> Option<&LoopContext<'ctx>> {
         self.loop_contexts.get(&range_id)
+    }
+
+    /// Remove and return loop context (used when closing a loop).
+    /// This prevents double-closing loops.
+    pub fn take_loop(&mut self, range_id: u64) -> Option<LoopContext<'ctx>> {
+        self.loop_contexts.remove(&range_id)
+    }
+
+    /// Get all remaining (unclosed) loop context IDs in creation order.
+    /// Use with .rev() to close innermost loops first.
+    pub fn remaining_loop_ids(&self) -> Vec<u64> {
+        // Return in creation order, filtered to only include still-open loops
+        self.loop_order.iter().filter(|id| self.loop_contexts.contains_key(id)).copied().collect()
     }
 }
 

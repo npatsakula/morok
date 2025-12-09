@@ -166,7 +166,7 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
         return None;
     };
 
-    let (input_ranges, _) = ctx.get_ranges(x)?;
+    let (input_ranges, output_ranges) = ctx.get_ranges(x)?;
     let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges
         .iter()
         .enumerate()
@@ -187,7 +187,24 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
         return Some(Arc::clone(src));
     }
 
-    Some(UOp::reduce(Arc::clone(src), reduce_ranges, *reduce_op))
+    let ret = UOp::reduce(Arc::clone(src), reduce_ranges, *reduce_op);
+
+    // KEY: Transfer range_map to new UOp (like Tinygrad line 94)
+    // When graph_rewrite creates a new UOp, the old range_map entry becomes invalid.
+    // We must copy the ranges to the new UOp's identity.
+    ctx.set_ranges(&ret, input_ranges.clone(), output_ranges.clone());
+
+    // Also transfer ending_ranges to the new UOp
+    let ending = ctx.get_ending_ranges(x);
+    ctx.set_ending_ranges(&ret, ending);
+
+    // Transfer realize_map to new UOp - critical for nested reductions!
+    // If the original ReduceAxis was marked for realization, the new REDUCE must be too.
+    if let Some(axes) = ctx.get_realize_axes(x).cloned() {
+        ctx.mark_realize(&ret, axes);
+    }
+
+    Some(ret)
 }
 
 // ============================================================================

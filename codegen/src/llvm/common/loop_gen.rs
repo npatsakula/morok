@@ -54,7 +54,8 @@ pub fn build_loop<'ctx>(
     builder.position_at_end(entry_block);
     builder.build_unconditional_branch(latch_block).context(BuildBranchSnafu)?;
 
-    // Latch block: PHI, increment, condition, conditional branch
+    // Latch block: PHI, condition, conditional branch
+    // NOTE: Increment is done in footer block to ensure SSA dominance
     builder.position_at_end(latch_block);
 
     // DType::Index maps to i64
@@ -68,11 +69,6 @@ pub fn build_loop<'ctx>(
     phi.add_incoming(&[(&zero, entry_block)]);
 
     let counter_val = phi.as_basic_value().into_int_value();
-
-    // Increment: counter + 1
-    let one = counter_type.const_int(1, false);
-    let incremented =
-        builder.build_int_add(counter_val, one, &format!("i{}_next", loop_id)).context(ArithmeticSnafu)?;
 
     // Cast end_val to i64 if needed
     let end_i64 = if end_val.get_type() != counter_type {
@@ -92,7 +88,8 @@ pub fn build_loop<'ctx>(
     // Position builder at body block for loop body code
     builder.position_at_end(body_block);
 
-    let loop_ctx = LoopContext { latch_block, footer_block, exit_block, phi, incremented };
+    // Store loop_id for footer block increment generation
+    let loop_ctx = LoopContext { latch_block, footer_block, exit_block, phi, loop_id };
 
     Ok((loop_ctx, counter_val))
 }
@@ -104,11 +101,22 @@ pub fn close_loop<'ctx>(builder: &Builder<'ctx>, loop_ctx: &LoopContext<'ctx>) -
     // Branch from current position (end of body) to footer
     builder.build_unconditional_branch(loop_ctx.footer_block).context(BuildBranchSnafu)?;
 
-    // Footer block: complete PHI and branch back to latch
+    // Footer block: compute increment, complete PHI, and branch back to latch
     builder.position_at_end(loop_ctx.footer_block);
 
+    // Get context from the footer block
+    let context = loop_ctx.footer_block.get_context();
+    let counter_type = context.i64_type();
+
+    // Compute increment HERE in footer block (ensures SSA dominance)
+    let counter_val = loop_ctx.phi.as_basic_value().into_int_value();
+    let one = counter_type.const_int(1, false);
+    let incremented = builder
+        .build_int_add(counter_val, one, &format!("i{}_next", loop_ctx.loop_id))
+        .context(ArithmeticSnafu)?;
+
     // Add incoming edge to PHI: incremented value from footer
-    loop_ctx.phi.add_incoming(&[(&loop_ctx.incremented, loop_ctx.footer_block)]);
+    loop_ctx.phi.add_incoming(&[(&incremented, loop_ctx.footer_block)]);
 
     // Branch back to latch
     builder.build_unconditional_branch(loop_ctx.latch_block).context(BuildBranchSnafu)?;
