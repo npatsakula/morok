@@ -22,12 +22,12 @@ use crate::{CompiledKernel, LlvmKernel};
 /// CPU backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CpuBackend {
-    /// Cranelift JIT backend (default).
+    /// Cranelift JIT backend.
     /// Faster compilation, good-enough codegen quality.
-    #[default]
     Cranelift,
-    /// LLVM JIT backend.
+    /// LLVM JIT backend (default).
     /// Maximum optimization, slower compilation.
+    #[default]
     Llvm,
 }
 

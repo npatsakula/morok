@@ -732,7 +732,37 @@ pub fn to_define_global_patterns() -> PatternMatcher<KernelContext> {
         c if matches!(c.op(), Op::Const(_) | Op::DefineVar { .. }) => cleanup_const(c, ctx),
         r if matches!(r.op(), Op::Range { .. }) => remove_zero_range(r, ctx),
         r if matches!(r.op(), Op::Range { .. }) => renumber_range(r, ctx),
+        // Replace KERNEL references with their output buffer
+        k if matches!(k.op(), Op::Kernel { .. }) => replace_kernel_with_buffer(k, ctx),
     }
+}
+
+/// Replace KERNEL node with its output buffer.
+/// When a kernel's AST contains a reference to another KERNEL (from nested reductions),
+/// we replace it with the DEFINE_GLOBAL buffer that the inner kernel writes to.
+/// The consuming operation should then INDEX+LOAD from this buffer.
+fn replace_kernel_with_buffer(kernel: &Arc<UOp>, _ctx: &mut KernelContext) -> Option<Arc<UOp>> {
+    let Op::Kernel { ast, .. } = kernel.op() else {
+        return None;
+    };
+
+    // Find the output buffer by looking at STORE operations in the AST
+    for node in ast.toposort() {
+        if let Op::Store { buffer, .. } = node.op() {
+            // Get the base buffer (unwrap INDEX if present)
+            let output_buf = match buffer.op() {
+                Op::Index { buffer: inner_buf, .. } => inner_buf.clone(),
+                _ => buffer.clone(),
+            };
+
+            if matches!(output_buf.op(), Op::DefineGlobal(_)) {
+                return Some(output_buf);
+            }
+        }
+    }
+
+    // No output buffer found - this shouldn't happen for valid kernels
+    None
 }
 
 // ============================================================================

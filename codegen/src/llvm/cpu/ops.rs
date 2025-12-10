@@ -11,6 +11,7 @@ use inkwell::values::{BasicValueEnum, CallSiteValue, FunctionValue, ValueKind};
 use inkwell::{FloatPredicate, IntPredicate};
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
+use tracing::{debug, trace};
 
 use morok_dtype::DType;
 use morok_ir::{AxisType, ReduceOp, prelude::*};
@@ -33,10 +34,20 @@ pub fn codegen_uop<'ctx>(
 ) -> Result<Option<BasicValueEnum<'ctx>>> {
     // Check if already generated
     if values.contains(uop.id) {
+        trace!(uop_id = uop.id, op = ?std::mem::discriminant(uop.op()), "codegen_uop: cache hit");
         return Ok(values.get(uop.id));
     }
 
-    let result = match classify_op(uop.op()) {
+    let category = classify_op(uop.op());
+    trace!(
+        uop_id = uop.id,
+        op = ?uop.op(),
+        dtype = ?uop.dtype(),
+        category = ?std::mem::discriminant(&category),
+        "codegen_uop: generating"
+    );
+
+    let result = match category {
         OpCategory::Constant => codegen_constant(uop, context)?,
         OpCategory::Arithmetic => codegen_arithmetic(uop, context, module, builder, values)?,
         OpCategory::Memory => codegen_memory(uop, context, module, builder, values)?,
@@ -47,6 +58,7 @@ pub fn codegen_uop<'ctx>(
 
     // Store result for future lookups
     if let Some(val) = result {
+        trace!(uop_id = uop.id, result = ?val, "codegen_uop: stored result");
         values.insert(uop.id, val);
     } else {
         values.mark_processed(uop.id);
@@ -85,9 +97,13 @@ fn classify_op(op: &Op) -> OpCategory {
         // Should be in ValueMap after Bind is processed. If not there, it's an error.
         Op::DefineVar { .. } => OpCategory::Meta,
 
-        Op::Sink { .. } | Op::Barrier { .. } | Op::Noop | Op::Unique(_) | Op::Device(_) | Op::Vectorize { .. } => {
-            OpCategory::Meta
-        }
+        Op::Sink { .. }
+        | Op::Barrier { .. }
+        | Op::Noop
+        | Op::Unique(_)
+        | Op::Device(_)
+        | Op::Vectorize { .. }
+        | Op::Kernel { .. } => OpCategory::Meta,
 
         Op::Reshape { .. }
         | Op::Permute { .. }
@@ -142,10 +158,23 @@ fn codegen_arithmetic<'ctx>(
             Ok(Some(codegen_unary(*op, src_val, &uop.dtype(), context, module, builder)?))
         }
         Op::Binary(op, lhs, rhs) => {
-            let lhs_val = require_value(lhs, context, module, builder, values)?;
-            let rhs_val = require_value(rhs, context, module, builder, values)?;
-            let lhs_val = auto_load_pointer(lhs_val, &lhs.dtype(), context, builder)?;
-            let rhs_val = auto_load_pointer(rhs_val, &rhs.dtype(), context, builder)?;
+            let lhs_val_raw = require_value(lhs, context, module, builder, values)?;
+            let rhs_val_raw = require_value(rhs, context, module, builder, values)?;
+            let lhs_val = auto_load_pointer(lhs_val_raw, &lhs.dtype(), context, builder)?;
+            let rhs_val = auto_load_pointer(rhs_val_raw, &rhs.dtype(), context, builder)?;
+            debug!(
+                uop_id = uop.id,
+                op = ?op,
+                lhs_id = lhs.id,
+                rhs_id = rhs.id,
+                lhs_dtype = ?lhs.dtype(),
+                rhs_dtype = ?rhs.dtype(),
+                lhs_val_raw = ?lhs_val_raw,
+                rhs_val_raw = ?rhs_val_raw,
+                lhs_val_loaded = ?lhs_val,
+                rhs_val_loaded = ?rhs_val,
+                "BINARY: lhs op rhs"
+            );
             // Pass operand dtype for comparisons (like Tinygrad's lop[x.src[0].dtype])
             // For Ptr types, extract the base type since auto_load_pointer already loaded the value
             let operand_dtype = DType::Scalar(lhs.dtype().base());
@@ -360,6 +389,16 @@ fn codegen_memory<'ctx>(
             let buffer_ptr = require_value(buffer, context, module, builder, values)?;
             if indices.len() == 1 {
                 let index_val = require_value(&indices[0], context, module, builder, values)?;
+                debug!(
+                    uop_id = uop.id,
+                    buffer_id = buffer.id,
+                    index_id = indices[0].id,
+                    index_op = ?indices[0].op(),
+                    buffer_ptr = ?buffer_ptr,
+                    index_val = ?index_val,
+                    result_dtype = ?uop.dtype(),
+                    "INDEX: buffer[index]"
+                );
                 let element_type = match uop.dtype() {
                     DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
                     other => common::dtype_to_basic_type(&other, context)?,
@@ -369,6 +408,7 @@ fn codegen_memory<'ctx>(
                         .build_gep(element_type, buffer_ptr.into_pointer_value(), &[index_val.into_int_value()], "idx")
                         .context(BuildGepSnafu)?
                 };
+                debug!(uop_id = uop.id, result_ptr = ?ptr, "INDEX: computed pointer");
                 Ok(Some(ptr.into()))
             } else {
                 UnsupportedSnafu { what: "Multi-index INDEX" }.fail()
@@ -753,10 +793,21 @@ fn auto_load_pointer<'ctx>(
     if value.is_pointer_value() {
         let element_type = match dtype {
             DType::Ptr { base, .. } => common::dtype_to_basic_type(base, context)?,
-            _ => return Ok(value),
+            _ => {
+                trace!(dtype = ?dtype, value = ?value, "auto_load_pointer: not a Ptr dtype, returning as-is");
+                return Ok(value);
+            }
         };
-        Ok(builder.build_load(element_type, value.into_pointer_value(), "autoload").context(BuildLoadSnafu)?)
+        let loaded = builder.build_load(element_type, value.into_pointer_value(), "autoload").context(BuildLoadSnafu)?;
+        debug!(
+            dtype = ?dtype,
+            ptr = ?value,
+            loaded = ?loaded,
+            "auto_load_pointer: loaded value from pointer"
+        );
+        Ok(loaded)
     } else {
+        trace!(dtype = ?dtype, value = ?value, "auto_load_pointer: not a pointer, returning as-is");
         Ok(value)
     }
 }

@@ -2,6 +2,7 @@ use crate::reduce::AxisSpec;
 use crate::test::helpers::*;
 use crate::*;
 use morok_dtype::DType;
+use tracing_test::traced_test;
 
 #[test]
 fn test_axis_spec_all() {
@@ -418,6 +419,111 @@ fn test_min_negative_value() {
 }
 
 // ========== Argmax Tests (from Tinygrad test_ops.py:1087-1105) ==========
+
+#[test]
+#[traced_test]
+fn test_argmax_debug_steps() {
+    let _guard = test_setup();
+
+    // Simplest test: compare two tensors
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let b = Tensor::from_slice([1.0f32, 5.0, 3.0]);
+    let eq = a.try_eq(&b).unwrap();
+    let eq_result = eq.realize().unwrap().to_ndarray::<bool>().unwrap();
+    println!("Simple eq test: a=[1,2,3], b=[1,5,3], a==b={:?}", eq_result.as_slice().unwrap());
+    assert_eq!(eq_result.as_slice().unwrap(), &[true, false, true], "Simple eq failed");
+
+    // Test with broadcast
+    let c = Tensor::from_slice([1.0f32, 2.0, 3.0, 2.0]);
+    let two = Tensor::from_slice([2.0f32]);
+    let two_broadcast = two.try_expand(&[4]).unwrap();
+    println!("two_broadcast shape={:?}", two_broadcast.uop.shape());
+    let eq2 = c.try_eq(&two_broadcast).unwrap();
+    let eq2_result = eq2.realize().unwrap().to_ndarray::<bool>().unwrap();
+    println!("Broadcast eq: c=[1,2,3,2], two_broadcast=[2,2,2,2], c==two_broadcast={:?}", eq2_result.as_slice().unwrap());
+    // Expected: [false, true, false, true] (positions 1 and 3 equal 2)
+    assert_eq!(eq2_result.as_slice().unwrap(), &[false, true, false, true], "Broadcast eq failed");
+
+    // Test expand of reduction result
+    let d = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0]);
+    let d_max = d.max_with().axes(0).keepdim(true).call().unwrap();
+    println!("d_max shape={:?}", d_max.uop.shape());
+
+    // DEBUG: Realize d_max first to verify it's correct
+    let d_max_realized = d_max.clone().realize().unwrap().to_ndarray::<f32>().unwrap();
+    println!("DEBUG: d_max realized value = {:?}", d_max_realized.as_slice().unwrap());
+
+    let d_max_expanded = d_max.try_expand(&[4]).unwrap();
+    println!("d_max_expanded shape={:?}", d_max_expanded.uop.shape());
+
+    let eq3 = d.try_eq(&d_max_expanded).unwrap();
+    morok_ir::uop::debug::print_ast(&eq3.uop, "EQ3 AST", 5);
+    let eq3_result = eq3.realize().unwrap().to_ndarray::<bool>().unwrap();
+    println!("Reduction expand eq: d=[1,5,3,2], d_max=5, eq={:?}", eq3_result.as_slice().unwrap());
+    // Expected: [false, true, false, false] (only position 1 equals 5)
+    assert_eq!(eq3_result.as_slice().unwrap(), &[false, true, false, false], "Reduction expand eq failed");
+}
+
+#[test]
+fn test_argmax_full_steps() {
+    let _guard = test_setup();
+    let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0]);
+
+    // Step 1: max value along axis 0
+    let max_vals = t.max_with().axes(0).keepdim(true).call().unwrap();
+
+    // Step 2: expand max to original shape
+    let max_broadcast = max_vals.try_expand(&[5]).unwrap();
+    println!("max_broadcast shape={:?}", max_broadcast.uop.shape());
+
+    // Step 3: mask where values == max
+    let mask = t.try_eq(&max_broadcast).unwrap();
+    let mask_realized = mask.clone().realize().unwrap().to_ndarray::<bool>().unwrap();
+    println!("Mask (eq max): {:?}", mask_realized.as_slice().unwrap());
+    assert_eq!(mask_realized.as_slice().unwrap(), &[false, false, false, true, false], "Mask mismatch");
+
+    // Step 4: Create descending indices [5, 4, 3, 2, 1]
+    let axis_size = 5;
+    let indices = Tensor::arange(axis_size as i64, Some(0), Some(-1)).unwrap();
+    let indices_realized = indices.clone().realize().unwrap().to_ndarray::<i64>().unwrap();
+    println!("Step 4 - Descending indices: {:?}", indices_realized.as_slice().unwrap());
+    assert_eq!(indices_realized.as_slice().unwrap(), &[5, 4, 3, 2, 1], "Indices mismatch");
+
+    // Step 5: Cast to int32
+    let mask_int = mask.cast(DType::Int32).unwrap();
+    let mask_int_realized = realize_i32(mask_int.clone());
+    println!("Step 5a - Mask as int32: {:?}", mask_int_realized.as_slice().unwrap());
+    // Expected: [0, 0, 0, 1, 0]
+    assert_eq!(mask_int_realized.as_slice().unwrap(), &[0, 0, 0, 1, 0], "Mask int mismatch");
+
+    let indices_i32 = indices.cast(DType::Int32).unwrap();
+    let indices_i32_realized = realize_i32(indices_i32.clone());
+    println!("Step 5b - Indices as int32: {:?}", indices_i32_realized.as_slice().unwrap());
+    assert_eq!(indices_i32_realized.as_slice().unwrap(), &[5, 4, 3, 2, 1], "Indices int32 mismatch");
+
+    // Step 6: Multiply mask by indices
+    let masked_indices = mask_int.try_mul(&indices_i32).unwrap();
+    let masked_realized = realize_i32(masked_indices.clone());
+    println!("Step 6 - Masked indices (mask * indices): {:?}", masked_realized.as_slice().unwrap());
+    // Expected: [0, 0, 0, 2, 0]
+    assert_eq!(masked_realized.as_slice().unwrap(), &[0, 0, 0, 2, 0], "Masked indices mismatch");
+
+    // Step 7: max of masked indices
+    let max_idx = masked_indices.max_with().axes(0).keepdim(false).call().unwrap();
+    let max_idx_realized = realize_i32(max_idx.clone());
+    println!("Step 7 - Max of masked indices: {:?}", max_idx_realized.as_slice().unwrap());
+    // Expected: [2]
+    assert_eq!(max_idx_realized.as_slice().unwrap(), &[2], "Max idx mismatch");
+
+    // Step 8: n - max_idx
+    let n_tensor = Tensor::from_slice([axis_size as i32]);
+    let n_scalar = n_tensor.try_reshape(&[]).unwrap();
+    let result = n_scalar.try_sub(&max_idx).unwrap();
+    let result_realized = realize_i32(result);
+    println!("Step 8 - Final result (N - max_idx): {:?}", result_realized.as_slice().unwrap());
+    // Expected: [3]
+    assert_eq!(result_realized.as_slice().unwrap(), &[3], "Final result mismatch");
+}
 
 #[test]
 fn test_argmax_value_1d() {

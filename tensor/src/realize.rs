@@ -42,6 +42,7 @@ use crate::{
     schedule::{Schedule, ScheduleItem, expand_schedule},
 };
 use morok_device::{Buffer, device::Device};
+use morok_dtype::DType;
 use morok_ir::{AxisId, DeviceSpec, Op, SInt, UOp};
 use morok_runtime::{
     ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, ParallelGroup,
@@ -146,6 +147,7 @@ impl Tensor {
             })
             .collect();
 
+        let output_dtype = self.uop.dtype();
         let bufferize = UOp::bufferize_global(self.uop.clone(), ranges);
 
         // Step 2: Create SINK of the BUFFERIZE
@@ -154,14 +156,26 @@ impl Tensor {
         // Step 3: Run rangeify pipeline
         let (rangeified, _context) = morok_schedule::rangeify(sink, None).context(RangeifySnafu)?;
 
+        // DEBUG: Print post-rangeify IR
+        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+            morok_ir::uop::debug::print_ast(&rangeified, "POST-RANGEIFY AST", 15);
+        }
+
         // Step 4: Run kernel splitting pipeline
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeified);
+
+        // DEBUG: Print post-kernel-split IR
+        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+            morok_ir::uop::debug::print_ast(&kernelized, "POST-KERNEL-SPLIT AST", 20);
+        }
 
         // Step 5: Create schedule from kernels
         let schedule = crate::schedule::create_schedule(kernelized, kernel_ctx)?;
 
-        // Step 6: Build execution plan
-        prepare_execution_plan(&schedule)
+        // Step 6: Build execution plan (pass expected output dtype and size)
+        let output_size = shape.iter().map(|s| s.as_const().unwrap_or(1)).product::<usize>()
+            * output_dtype.bytes();
+        prepare_execution_plan(&schedule, output_dtype, output_size)
     }
 }
 
@@ -242,7 +256,7 @@ fn build_execution_graph(schedule: &[ScheduleItem]) -> ExecutionGraph {
 /// # Errors
 ///
 /// Returns error if compilation or buffer allocation fails.
-fn prepare_execution_plan(schedule: &Schedule) -> Result<ExecutionPlan> {
+fn prepare_execution_plan(schedule: &Schedule, expected_output_dtype: DType, expected_output_size: usize) -> Result<ExecutionPlan> {
     // Expand the schedule to handle OUTER range iterations
     let expanded_schedule = expand_schedule(schedule.clone());
 
@@ -304,11 +318,44 @@ fn prepare_execution_plan(schedule: &Schedule) -> Result<ExecutionPlan> {
             continue;
         }
 
-        // Capture output buffer index (first buffer of first kernel)
+        // Find output buffer: match by dtype and size, prefer highest buffer ID
+        // For fused kernels, the output is the last-created buffer with matching dtype/size
         if output_buffer_idx.is_none() && !item.buffers.is_empty() {
-            let first_buf_id = item.buffers[0].id().0;
-            if let Some(&idx) = buffer_id_to_idx.get(&first_buf_id) {
+            // Find buffer with highest ID matching both dtype and size
+            let mut best_match: Option<(u64, usize)> = None;
+            for buf in &item.buffers {
+                if buf.dtype() == expected_output_dtype && buf.size() == expected_output_size {
+                    let buf_id = buf.id().0;
+                    if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
+                        if best_match.is_none() || buf_id > best_match.unwrap().0 {
+                            best_match = Some((buf_id, idx));
+                        }
+                    }
+                }
+            }
+            if let Some((_, idx)) = best_match {
                 output_buffer_idx = Some(idx);
+            }
+
+            // Fallback to first buffer with matching dtype
+            if output_buffer_idx.is_none() {
+                for buf in &item.buffers {
+                    if buf.dtype() == expected_output_dtype {
+                        let buf_id = buf.id().0;
+                        if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
+                            output_buffer_idx = Some(idx);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Fallback to first buffer
+            if output_buffer_idx.is_none() {
+                let first_buf_id = item.buffers[0].id().0;
+                if let Some(&idx) = buffer_id_to_idx.get(&first_buf_id) {
+                    output_buffer_idx = Some(idx);
+                }
             }
         }
 
@@ -353,6 +400,15 @@ fn prepare_execution_plan(schedule: &Schedule) -> Result<ExecutionPlan> {
         // Build buffer indices for this kernel using item.buffers (already in correct order)
         let buffer_indices: Vec<usize> =
             item.buffers.iter().filter_map(|buf| buffer_id_to_idx.get(&buf.id().0).copied()).collect();
+
+        // DEBUG: Print buffer mapping for this kernel
+        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+            eprintln!("DEBUG: Kernel AST id={} has {} buffers:", item.ast.id, item.buffers.len());
+            for (i, buf) in item.buffers.iter().enumerate() {
+                eprintln!("  buf[{}]: Buffer.id={:?}, dtype={:?}, size={}, plan_idx={:?}",
+                    i, buf.id(), buf.dtype(), buf.size(), buffer_id_to_idx.get(&buf.id().0));
+            }
+        }
 
         // Create PreparedKernel
         // Note: buffer_ptrs and buffer_ids will be computed in ExecutionPlanBuilder::build()

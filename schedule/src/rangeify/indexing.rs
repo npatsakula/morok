@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, SInt, UOp, UOpKey};
+use tracing::{debug, info_span, instrument, trace, warn};
 
 // ============================================================================
 // Context
@@ -136,6 +137,7 @@ impl IndexingContext {
 
 /// Run range assignment on a UOp graph. Returns (transformed_sink, context).
 #[allow(clippy::mutable_key_type)]
+#[instrument(skip(sink), fields(sink_id = sink.id))]
 pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
 
@@ -159,8 +161,10 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
 }
 
 /// Generate the realize map - mark which UOps need to be materialized to buffers.
+#[instrument(skip(sink, ctx))]
 fn generate_realize_map(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> morok_ir::Result<()> {
     for node in sink.toposort() {
+        trace!(node_id = node.id, op = ?std::mem::discriminant(node.op()), "Processing node");
         match node.op() {
             Op::Sink { sources } => {
                 for src in sources {
@@ -179,6 +183,11 @@ fn generate_realize_map(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> morok_ir:
                     }
                 }
             }
+            // NOTE: ReduceAxis does NOT get unconditional realization.
+            // Tinygrad only realizes ReduceAxis when:
+            // 1. It has ending_ranges (nested reduction detection)
+            // 2. Consumer range conflicts (handled by merge_consumer_ranges)
+            // 3. Being a SINK source (handled above)
             _ => {}
         }
     }
@@ -212,6 +221,7 @@ fn is_const_true(uop: &Arc<UOp>) -> bool {
 }
 
 /// Merge ranges from multiple consumers. Creates new ranges and marks realization when needed.
+#[instrument(skip(uop, consumer_rngs, ctx), fields(uop_id = uop.id))]
 pub(crate) fn merge_consumer_ranges(
     uop: &Arc<UOp>,
     consumer_rngs: &[Vec<Arc<UOp>>],
@@ -274,6 +284,7 @@ pub(crate) fn merge_consumer_ranges(
     }
 
     if !realize_axes.is_empty() {
+        warn!(realize_axes = ?realize_axes, "Range conflict detected - marking for realization");
         ctx.mark_realize(uop, realize_axes);
     }
 
@@ -282,6 +293,7 @@ pub(crate) fn merge_consumer_ranges(
 
 /// Assign input/output ranges for each UOp via reverse toposort traversal.
 #[allow(clippy::mutable_key_type)]
+#[instrument(skip_all)]
 fn assign_ranges(
     reverse_topo: &[Arc<UOp>],
     consumer_map: &HashMap<UOpKey, Vec<Arc<UOp>>>,
@@ -292,9 +304,17 @@ fn assign_ranges(
             continue;
         }
 
+        let _span = info_span!("assign_range",
+            uop_id = x.id,
+            op = ?std::mem::discriminant(x.op())
+        )
+        .entered();
+
         let consumers: Vec<_> = consumer_map.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
         let consumer_rngs: Vec<Vec<Arc<UOp>>> =
             consumers.iter().filter_map(|c| ctx.get_ranges(c).map(|(inp, _)| inp.clone())).collect();
+
+        debug!(num_consumers = consumers.len(), consumer_rngs_len = consumer_rngs.len(), "Consumer info");
 
         // Inherit ending_ranges from consumers (like Tinygrad line 173)
         // ending_ranges propagate from consumers → producers (backward in data flow)
@@ -317,28 +337,20 @@ fn assign_ranges(
             }
         } else if let Op::Bufferize { ranges, .. } = x.op() {
             ranges.to_vec()
-        } else if let Op::ReduceAxis { src, axes, .. } = x.op() {
-            // ReduceAxis always gets ranges - follow Tinygrad's approach
-            // Output ranges are non-reduced dimensions
-            if let Some(in_shape) = src.shape()? {
-                if consumer_rngs.is_empty() {
-                    // Create output ranges for non-reduced dimensions
-                    in_shape
-                        .iter()
-                        .enumerate()
-                        .filter_map(
-                            |(i, s)| {
-                                if !axes.contains(&i) { Some(ctx.new_range(s, AxisType::Loop)) } else { None }
-                            },
-                        )
-                        .collect()
-                } else if consumer_rngs.len() == 1 {
-                    consumer_rngs[0].clone()
+        } else if let Op::ReduceAxis { .. } = x.op() {
+            // Use the ReduceAxis's OUTPUT shape, not input shape.
+            // For keepdim=true, output shape is [1], not [] - we must use actual output shape.
+            // Tinygrad inherits output ranges from consumers or creates based on output shape.
+            if consumer_rngs.is_empty() {
+                if let Some(out_shape) = x.shape()? {
+                    out_shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect()
                 } else {
-                    merge_consumer_ranges(x, &consumer_rngs, ctx)?
+                    continue;
                 }
+            } else if consumer_rngs.len() == 1 {
+                consumer_rngs[0].clone()
             } else {
-                continue;
+                merge_consumer_ranges(x, &consumer_rngs, ctx)?
             }
         } else if consumer_rngs.is_empty() {
             continue;
@@ -347,6 +359,8 @@ fn assign_ranges(
         } else {
             merge_consumer_ranges(x, &consumer_rngs, ctx)?
         };
+
+        debug!(should_realize = ctx.should_realize(x), out_rngs_len = out_rngs.len(), "Output ranges computed");
 
         let in_rngs = match x.op() {
             Op::Reshape { src, .. }
@@ -381,6 +395,8 @@ fn assign_ranges(
             _ => out_rngs.clone(),
         };
 
+        debug!(in_rngs_len = in_rngs.len(), "Input ranges computed");
+
         // EXPAND marks ranges as ending when broadcasting to static dimensions (Tinygrad lines 249-252)
         // "if the EXPAND is used to inject a range, we don't mark it as ending_ranges. otherwise we do."
         if let Op::Expand { new_shape, .. } = x.op() {
@@ -411,6 +427,13 @@ fn assign_ranges(
         // This matches Tinygrad's behavior with PCONTIG=0 (default):
         //   if not (PCONTIG > 1) or any(...):  # With PCONTIG=0, this is always True
         let ending = ctx.get_ending_ranges(x);
+        if !ending.is_empty() {
+            debug!(
+                ending_count = ending.len(),
+                triggers_realization = matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x),
+                "Ending ranges detected"
+            );
+        }
         if !ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
             // IMPORTANT: Use the op's actual output shape, not inherited out_rngs.
             // For a scalar ReduceAxis (full reduction), the output is [] with no ranges.

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use morok_ir::{AddrSpace, AxisType, Op, SInt, UOp, UOpKey};
 use smallvec::SmallVec;
+use tracing::{debug, trace};
 
 // ============================================================================
 // CONFIGURATION
@@ -446,6 +447,8 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
     use super::transforms::find_bufs;
     use crate::rewrite::graph_rewrite_bottom_up;
 
+    trace!(uop_id = uop.id, op = ?std::mem::discriminant(uop.op()), "split_store: entering");
+
     // Handle AFTER wrapping STORE/END
     if let Op::After { deps, .. } = uop.op() {
         for dep in deps.iter() {
@@ -573,7 +576,25 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
         sources.push(var_key.0.clone());
     }
 
-    Some(UOp::kernel(sources, ast))
+    let kernel = UOp::kernel(sources.clone(), ast.clone());
+    debug!(
+        kernel_id = kernel.id,
+        num_sources = sources.len(),
+        buffer_map_size = ctx.buffer_map.len(),
+        "split_store: created kernel"
+    );
+    for (i, src) in sources.iter().enumerate() {
+        debug!(
+            kernel_id = kernel.id,
+            source_idx = i,
+            source_id = src.id,
+            source_op = ?src.op(),
+            source_dtype = ?src.dtype(),
+            "split_store: kernel source"
+        );
+    }
+
+    Some(kernel)
 }
 
 // ============================================================================
@@ -587,6 +608,12 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
     let mut ctx = KernelContext::new();
 
     let after_bufferize = transform_bottom_up(&root, &mut ctx, bufferize_to_store);
+
+    // DEBUG: Print after bufferize_to_store
+    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+        morok_ir::uop::debug::print_ast(&after_bufferize, "AFTER BUFFERIZE_TO_STORE", 15);
+    }
+
     let after_split = transform_bottom_up(&after_bufferize, &mut ctx, split_store);
 
     resolve_kernel_dependencies(&after_split, &mut ctx);

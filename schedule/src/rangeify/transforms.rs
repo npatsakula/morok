@@ -281,7 +281,10 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
         existing_buffer.clone()
     } else {
         let size = calculate_size_from_ranges(ranges);
-        let base_dtype = compute.dtype();
+        // Use bufferize_op.dtype() instead of compute.dtype() because after transform_bottom_up,
+        // the compute may have been replaced with AFTER(DEFINE_GLOBAL, KERNEL) which has Ptr dtype.
+        // The BUFFERIZE preserves its original dtype from creation time.
+        let base_dtype = bufferize_op.dtype();
         let ptr_dtype = base_dtype.ptr(Some(size), opts.addrspace);
 
         if opts.addrspace == AddrSpace::Global {
