@@ -314,13 +314,26 @@ fn assign_ranges(
         let consumer_rngs: Vec<Vec<Arc<UOp>>> =
             consumers.iter().filter_map(|c| ctx.get_ranges(c).map(|(inp, _)| inp.clone())).collect();
 
-        debug!(num_consumers = consumers.len(), consumer_rngs_len = consumer_rngs.len(), "Consumer info");
+        debug!(
+            num_consumers = consumers.len(),
+            consumer_rngs_len = consumer_rngs.len(),
+            consumer_ids = ?consumers.iter().map(|c| c.id).collect::<Vec<_>>(),
+            "Consumer info"
+        );
 
         // Inherit ending_ranges from consumers (like Tinygrad line 173)
         // ending_ranges propagate from consumers → producers (backward in data flow)
         let mut inherited_ending: Vec<Arc<UOp>> = Vec::new();
         for consumer in &consumers {
             inherited_ending.extend(ctx.get_ending_ranges(consumer));
+        }
+        if !inherited_ending.is_empty() {
+            debug!(
+                node_id = x.id,
+                inherited_count = inherited_ending.len(),
+                consumer_ids = ?consumers.iter().map(|c| c.id).collect::<Vec<_>>(),
+                "ending_ranges: node inherits from consumers"
+            );
         }
         ctx.set_ending_ranges(x, inherited_ending);
 
@@ -403,6 +416,16 @@ fn assign_ranges(
             // Check if new_shape is all static (no RANGE ops being injected in the shape)
             let shape_is_static = extract_shape_from_uop(new_shape).iter().all(|s| matches!(s, SInt::Const(_)));
 
+            debug!(
+                expand_id = x.id,
+                shape_is_static = shape_is_static,
+                in_rngs_len = in_rngs.len(),
+                out_rngs_len = out_rngs.len(),
+                in_rngs_ids = ?in_rngs.iter().map(|r| (r.id, format!("{:?}", std::mem::discriminant(r.op())))).collect::<Vec<_>>(),
+                out_rngs_ids = ?out_rngs.iter().map(|r| (r.id, format!("{:?}", std::mem::discriminant(r.op())))).collect::<Vec<_>>(),
+                "ending_ranges: EXPAND being processed"
+            );
+
             if shape_is_static {
                 // Ranges that changed (in_rngs != out_rngs) are "ending"
                 // These are the output ranges that were collapsed to const 0 in in_rngs
@@ -415,6 +438,12 @@ fn assign_ranges(
                 }
 
                 if !changed_ranges.is_empty() {
+                    debug!(
+                        expand_id = x.id,
+                        changed_ranges_count = changed_ranges.len(),
+                        changed_range_ids = ?changed_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
+                        "ending_ranges: EXPAND marking ranges as ending"
+                    );
                     let mut ending = ctx.get_ending_ranges(x);
                     ending.extend(changed_ranges);
                     ctx.set_ending_ranges(x, ending);
@@ -440,6 +469,14 @@ fn assign_ranges(
             // We must realize based on the actual output shape, not consumer-inherited ranges.
             if let Some(shape) = x.shape().ok().flatten() {
                 let realize_axes: Vec<usize> = (0..shape.len()).collect();
+
+                debug!(
+                    node_id = x.id,
+                    op = ?std::mem::discriminant(x.op()),
+                    ending_count = ending.len(),
+                    realize_axes = ?realize_axes,
+                    "REALIZATION TRIGGERED via ending_ranges"
+                );
 
                 // Clear ending_ranges after handling
                 ctx.clear_ending_ranges(x);

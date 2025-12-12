@@ -139,7 +139,11 @@ pub fn apply_rangeify_patterns() -> PatternMatcher<IndexingContext> {
         @context IndexingContext;
         // ReduceAxis conversion MUST come first - before bufferize wraps it
         x if matches!(x.op(), Op::ReduceAxis { .. }) => convert_reduceaxis_with_context(x, ctx),
-        x => apply_bufferize_transform(x, ctx),
+        // Movement ops should NOT be processed by bufferize transform - they'll be removed
+        // and their consumers will create proper BUFFERIZE + INDEX with correct ranges.
+        // Processing movement ops here creates INDEX with their conflicted ranges, which
+        // breaks range consistency when the movement op is later removed.
+        x if !x.op().is_movement() => apply_bufferize_transform(x, ctx),
         x if x.op().is_movement() => remove_movement_op(x, ctx),
     }
 }
@@ -167,6 +171,25 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
     };
 
     let (input_ranges, output_ranges) = ctx.get_ranges(x)?;
+
+    // DEBUG: Trace REDUCE conversion with input ranges
+    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+        eprintln!(
+            "[REDUCE] ReduceAxis id={} → input_ranges: {:?}",
+            x.id,
+            input_ranges
+                .iter()
+                .map(|r| {
+                    if let Op::Range { axis_id: _, axis_type, .. } = r.op() {
+                        format!("Range{}({:?})", r.id, axis_type)
+                    } else {
+                        format!("{}({:?})", r.id, std::mem::discriminant(r.op()))
+                    }
+                })
+                .collect::<Vec<_>>()
+        );
+        eprintln!("[REDUCE] src id={} op={:?}", src.id, std::mem::discriminant(src.op()));
+    }
     let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges
         .iter()
         .enumerate()
@@ -201,7 +224,15 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
     // Transfer realize_map to new UOp - critical for nested reductions!
     // If the original ReduceAxis was marked for realization, the new REDUCE must be too.
     if let Some(axes) = ctx.get_realize_axes(x).cloned() {
+        tracing::debug!(
+            reduceaxis_id = x.id,
+            reduce_id = ret.id,
+            axes = ?axes,
+            "ReduceAxis→REDUCE: transferring realize_map"
+        );
         ctx.mark_realize(&ret, axes);
+    } else {
+        tracing::debug!(reduceaxis_id = x.id, reduce_id = ret.id, "ReduceAxis→REDUCE: NO realize_map to transfer");
     }
 
     Some(ret)
@@ -308,6 +339,12 @@ fn remove_cheap_bufferize(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
     if let Op::Bufferize { compute, .. } = buf.op()
         && is_cheap_to_inline(compute.op())
     {
+        tracing::debug!(
+            bufferize_id = buf.id,
+            compute_id = compute.id,
+            compute_op = ?std::mem::discriminant(compute.op()),
+            "REMOVING cheap BUFFERIZE"
+        );
         return Some(compute.clone());
     }
     None
@@ -591,7 +628,11 @@ pub fn rangeify_codegen_patterns() -> PatternMatcher<()> {
 pub fn debuf(buf: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     let (ptr_dtype, addrspace) = match buf.op() {
         Op::Buffer { size, .. } => {
-            let base_dtype = buf.dtype();
+            // Extract element type - handle case where dtype might be Ptr
+            let base_dtype = match buf.dtype() {
+                DType::Ptr { base, .. } => (*base).clone(),
+                other => other,
+            };
             let ptr_dtype = base_dtype.ptr(Some(*size), AddrSpace::Global);
             (ptr_dtype, AddrSpace::Global)
         }
@@ -606,6 +647,15 @@ pub fn debuf(buf: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
         UOp::define_local(local_id, ptr_dtype)
     };
 
+    tracing::debug!(
+        buf_id = buf.id,
+        replacement_id = replacement.id,
+        replacement_op = ?std::mem::discriminant(replacement.op()),
+        "buffer_to_define_global: mapping BUFFER to DefineGlobal"
+    );
+    // Track DefineGlobal → original BUFFER id (never overwritten)
+    // This is used to find input buffers when buffer_map entries are overwritten
+    ctx.define_to_buffer_id.insert(replacement.id, buf.id);
     ctx.map_buffer(buf.clone(), replacement.clone());
     Some(replacement)
 }

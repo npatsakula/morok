@@ -348,6 +348,35 @@ impl UOp {
         result
     }
 
+    /// Render this UOp and its sources as a compact ASCII tree.
+    ///
+    /// Shared nodes (appearing multiple times due to hash-consing) are shown
+    /// as back-references: `[id] → (see above)`
+    ///
+    /// # Example Output
+    ///
+    /// ```text
+    /// [42] STORE : Void
+    /// ├── [10] DEFINE_GLOBAL(0) : Ptr<Float32> shape=[4]
+    /// ├── [35] INDEX : Ptr<Float32> shape=[4]
+    /// │   ├── [10] → (see above)
+    /// │   └── [30] RANGE(0, Reduce) : Index
+    /// │       └── [5] CONST(Int(4)) : Index
+    /// └── [40] REDUCE(Add) : Float32 shape=[]
+    ///     └── [35] → (see above)
+    /// ```
+    pub fn tree(self: &Arc<Self>) -> String {
+        crate::uop::tree::render_tree_compact(self)
+    }
+
+    /// Render this UOp and its sources as a full ASCII tree.
+    ///
+    /// Shared nodes are expanded every time they appear (verbose but complete).
+    /// Use this when you need to see the full subtree at every occurrence.
+    pub fn tree_full(self: &Arc<Self>) -> String {
+        crate::uop::tree::render_tree_full(self)
+    }
+
     /// Get all RANGE operations in this UOp's computation graph.
     ///
     /// Lazily computed and cached. Useful for rangeify pass to track loop variables.
@@ -1025,9 +1054,15 @@ impl UOp {
 
         // Compute correct dtype for operations whose dtype depends on source dtypes
         let dtype = match &new_op {
-            // INDEX dtype = buffer dtype (first source)
-            Op::Index { buffer, .. } => buffer.dtype.clone(),
-            // LOAD dtype = element type of buffer (base of Ptr)
+            // INDEX returns Ptr to element type (enables auto_load_pointer in codegen)
+            Op::Index { buffer, .. } => {
+                let element_dtype = match &buffer.dtype {
+                    DType::Ptr { base, .. } => (**base).clone(),
+                    other => other.clone(),
+                };
+                DType::Ptr { base: Box::new(element_dtype), size: None, addrspace: morok_dtype::AddrSpace::Global }
+            }
+            // LOAD returns element type (actual value)
             Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } => match &buffer.dtype {
                 DType::Ptr { base, .. } => (**base).clone(),
                 other => other.clone(),
@@ -1318,9 +1353,15 @@ impl UOp {
 
         // Compute correct dtype for operations whose dtype depends on source dtypes
         let dtype = match &new_op {
-            // INDEX dtype = buffer dtype (first source)
-            Op::Index { buffer, .. } => buffer.dtype.clone(),
-            // LOAD dtype = element type of buffer (base of Ptr)
+            // INDEX returns Ptr to element type (enables auto_load_pointer in codegen)
+            Op::Index { buffer, .. } => {
+                let element_dtype = match &buffer.dtype {
+                    DType::Ptr { base, .. } => (**base).clone(),
+                    other => other.clone(),
+                };
+                DType::Ptr { base: Box::new(element_dtype), size: None, addrspace: morok_dtype::AddrSpace::Global }
+            }
+            // LOAD returns element type (actual value)
             Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } => match &buffer.dtype {
                 DType::Ptr { base, .. } => (**base).clone(),
                 other => other.clone(),

@@ -19,12 +19,12 @@ pub mod cached_property;
 pub mod comparison_analysis;
 pub mod constructors;
 pub mod core;
-pub mod debug;
 pub mod eval;
 pub mod hash_consing;
 pub mod helpers;
 pub mod properties;
 pub mod range_eval;
+pub mod tree;
 
 // Re-export the main types
 pub use core::{IntoUOp, UOp, UOpKey};

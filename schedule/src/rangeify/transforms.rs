@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey};
+use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, ReduceOp, UOp, UOpKey};
 use smallvec::SmallVec;
 
 use super::context::RangeifyContext;
@@ -135,6 +135,27 @@ pub(crate) fn transform_single_source(
     input_ranges: &[Arc<UOp>],
     ctx: &mut IndexingContext,
 ) -> Arc<UOp> {
+    // DEBUG: Trace buffer source transformation
+    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+        let ranges_str: Vec<_> = input_ranges
+            .iter()
+            .map(|r| {
+                if let Op::Range { axis_type, .. } = r.op() {
+                    format!("Range{}({:?})", r.id, axis_type)
+                } else {
+                    format!("{}({:?})", r.id, std::mem::discriminant(r.op()))
+                }
+            })
+            .collect();
+        eprintln!(
+            "[INDEX] transform_single_source: src id={} op={:?} consumer={} → input_ranges={:?}",
+            src.id,
+            std::mem::discriminant(src.op()),
+            _consumer.id,
+            ranges_str
+        );
+    }
+
     // Case 1: Buffer-like op → add INDEX
     if matches!(
         src.op(),
@@ -154,8 +175,21 @@ pub(crate) fn transform_single_source(
     // We need to handle both cases
     let realize_axes_opt = ctx.get_realize_axes(src).cloned();
 
+    tracing::debug!(
+        src_id = src.id,
+        src_op = ?std::mem::discriminant(src.op()),
+        has_realize_axes = realize_axes_opt.is_some(),
+        realize_axes = ?realize_axes_opt,
+        "transform_single_source: checking realize_map"
+    );
+
     // Case 2: Source needs realization → wrap in BUFFERIZE + INDEX
     if let Some(ref realize_axes) = realize_axes_opt {
+        tracing::debug!(
+            src_id = src.id,
+            realize_axes = ?realize_axes,
+            "transform_single_source: CREATING BUFFERIZE for realized source"
+        );
         let (_, output_ranges) = ctx.get_ranges(src).expect("Realized op must have ranges");
 
         let closed_ranges: Vec<_> = output_ranges
@@ -273,7 +307,15 @@ fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
 /// Convert BUFFERIZE operation to STORE with buffer allocation and END wrapping.
 pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     let (compute, ranges, opts) = match bufferize_op.op() {
-        Op::Bufferize { compute, ranges, opts } => (compute, ranges, opts),
+        Op::Bufferize { compute, ranges, opts } => {
+            tracing::debug!(
+                bufferize_id = bufferize_op.id,
+                compute_id = compute.id,
+                ranges_len = ranges.len(),
+                "bufferize_to_store: CONVERTING BUFFERIZE to STORE→AFTER"
+            );
+            (compute, ranges, opts)
+        }
         _ => return None,
     };
 
@@ -281,10 +323,11 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
         existing_buffer.clone()
     } else {
         let size = calculate_size_from_ranges(ranges);
-        // Use bufferize_op.dtype() instead of compute.dtype() because after transform_bottom_up,
-        // the compute may have been replaced with AFTER(DEFINE_GLOBAL, KERNEL) which has Ptr dtype.
-        // The BUFFERIZE preserves its original dtype from creation time.
-        let base_dtype = bufferize_op.dtype();
+        // Extract element type - handle case where BUFFERIZE wraps INDEX (which now has Ptr dtype)
+        let base_dtype = match bufferize_op.dtype() {
+            DType::Ptr { base, .. } => (*base).clone(),
+            other => other,
+        };
         let ptr_dtype = base_dtype.ptr(Some(size), opts.addrspace);
 
         if opts.addrspace == AddrSpace::Global {
@@ -299,7 +342,8 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
     let store_target = if !ranges.is_empty() {
         UOp::index(buffer.clone(), ranges.to_vec()).expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
     } else {
-        buffer.clone()
+        // Scalar store: use index 0 (not the buffer pointer itself)
+        UOp::index_const(0)
     };
 
     let store = UOp::store(buffer.clone(), store_target, compute.clone());

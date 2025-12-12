@@ -86,6 +86,14 @@ pub struct KernelContext {
     pub vars: HashSet<UOpKey>,
     pub range_counter: usize,
     pub kernel_deps: Vec<KernelDependency>,
+    /// Mapping from original DefineGlobal UOp ID to renumbered UOp ID.
+    /// Used for buffer registry dual-registration so consumers can find
+    /// shared buffers using the original (pre-renumbered) ID from AFTER nodes.
+    pub buffer_id_mapping: HashMap<u64, u64>,
+    /// Mapping from DefineGlobal UOp ID to original BUFFER UOp ID.
+    /// Each DefineGlobal created from a BUFFER gets one entry (never overwritten).
+    /// Used to find input buffers when `buffer_map` entries are overwritten.
+    pub define_to_buffer_id: HashMap<u64, u64>,
 }
 
 impl KernelContext {
@@ -97,6 +105,8 @@ impl KernelContext {
             vars: HashSet::new(),
             range_counter: 0,
             kernel_deps: Vec::new(),
+            buffer_id_mapping: HashMap::new(),
+            define_to_buffer_id: HashMap::new(),
         }
     }
 
@@ -449,27 +459,79 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
 
     trace!(uop_id = uop.id, op = ?std::mem::discriminant(uop.op()), "split_store: entering");
 
-    // Handle AFTER wrapping STORE/END
-    if let Op::After { deps, .. } = uop.op() {
+    // Handle AFTER wrapping STORE/END - PRESERVE THE WRAPPER (like Tinygrad)
+    // Transform deps in-place and return new AFTER with transformed deps
+    if let Op::After { passthrough, deps } = uop.op() {
+        let mut new_deps = SmallVec::new();
+        let mut any_transformed = false;
+
         for dep in deps.iter() {
             match dep.op() {
-                Op::Kernel { .. } => return Some(dep.clone()),
-                Op::Store { .. } | Op::StoreGated { .. } => return split_store(dep, ctx),
-                Op::End { computation, .. } if matches!(computation.op(), Op::Store { .. } | Op::StoreGated { .. }) => {
-                    return split_store(dep, ctx);
+                Op::Kernel { .. } => {
+                    // Already a kernel - keep as is
+                    new_deps.push(dep.clone());
                 }
-                Op::Barrier { src, .. } => {
-                    if let Op::End { computation, .. } = src.op()
+                Op::End { computation, .. } if matches!(computation.op(), Op::Kernel { .. }) => {
+                    // Already END(Kernel) - keep as is
+                    new_deps.push(dep.clone());
+                }
+                Op::Store { .. } | Op::StoreGated { .. } => {
+                    // Transform STORE to KERNEL, wrap in END
+                    if let Some(kernel) = split_store(dep, ctx) {
+                        let end = UOp::end(kernel, SmallVec::new());
+                        new_deps.push(end);
+                        any_transformed = true;
+                    } else {
+                        new_deps.push(dep.clone());
+                    }
+                }
+                Op::End { computation, ranges }
+                    if matches!(computation.op(), Op::Store { .. } | Op::StoreGated { .. }) =>
+                {
+                    // Transform END(STORE) to END(KERNEL)
+                    if let Some(kernel) = split_store(computation, ctx) {
+                        let end = UOp::end(kernel, ranges.clone());
+                        new_deps.push(end);
+                        any_transformed = true;
+                    } else {
+                        new_deps.push(dep.clone());
+                    }
+                }
+                Op::Barrier { src, deps: barrier_deps } => {
+                    // Handle BARRIER wrapping END(STORE)
+                    let transformed_src = if let Op::End { computation, ranges } = src.op()
                         && matches!(computation.op(), Op::Store { .. } | Op::StoreGated { .. })
                     {
-                        return split_store(src, ctx);
-                    }
-                    if matches!(src.op(), Op::Store { .. } | Op::StoreGated { .. }) {
-                        return split_store(src, ctx);
-                    }
+                        if let Some(kernel) = split_store(computation, ctx) {
+                            let end = UOp::end(kernel, ranges.clone());
+                            any_transformed = true;
+                            end
+                        } else {
+                            src.clone()
+                        }
+                    } else if matches!(src.op(), Op::Store { .. } | Op::StoreGated { .. }) {
+                        if let Some(kernel) = split_store(src, ctx) {
+                            let end = UOp::end(kernel, SmallVec::new());
+                            any_transformed = true;
+                            end
+                        } else {
+                            src.clone()
+                        }
+                    } else {
+                        src.clone()
+                    };
+                    let new_barrier = UOp::barrier(transformed_src, barrier_deps.clone());
+                    new_deps.push(new_barrier);
                 }
-                _ => continue,
+                _ => {
+                    new_deps.push(dep.clone());
+                }
             }
+        }
+
+        if any_transformed {
+            // Return NEW AFTER with transformed deps - PRESERVES WRAPPER
+            return Some(UOp::after(passthrough.clone(), new_deps));
         }
         return None;
     }
@@ -500,6 +562,20 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
 
     // Apply transformation pipeline
     let transformed = {
+        // Debug: show BUFFER nodes in computation before transformation
+        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+            let buffer_nodes: Vec<_> = computation
+                .toposort()
+                .into_iter()
+                .filter(|n| matches!(n.op(), Op::Buffer { .. }))
+                .map(|n| n.id)
+                .collect();
+            tracing::debug!(
+                computation_id = computation.id,
+                buffer_nodes = ?buffer_nodes,
+                "split_store: BUFFER nodes in computation BEFORE to_define_global"
+            );
+        }
         let matcher = to_define_global_patterns();
         graph_rewrite_bottom_up(&matcher, computation, ctx)
     };
@@ -528,25 +604,86 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
     // Build kernel sources
     let mut sources: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
 
-    // morok_ir::uop::debug::print_ast(&ast, "KERNEL AST", 2);
+    // eprintln!("=== KERNEL AST ===\n{}", ast.tree_full());
 
-    // Collect buffer sources
+    // Collect buffer sources by traversing the kernel's AST.
+    // We find buffers in the AST, then check ctx.buffer_map for AFTER wrappers.
+    // If a buffer has an AFTER wrapper (from a producer kernel), we use the AFTER
+    // as the kernel source to track inter-kernel dependencies.
     let mut buffer_sources: Vec<Arc<UOp>> = Vec::new();
+    let mut seen_buffer_ids: HashSet<u64> = HashSet::new();
 
-    for value in ctx.buffer_map.values() {
-        let actual_buffer = match value.op() {
-            Op::After { passthrough, .. } => passthrough.clone(),
-            _ => value.clone(),
+    for node in ast.toposort() {
+        let buffer = match node.op() {
+            Op::DefineGlobal(_) | Op::DefineLocal(_) => Some(node.clone()),
+            Op::Index { buffer, .. } | Op::Load { buffer, .. } => {
+                // Get the actual buffer from Index/Load
+                match buffer.op() {
+                    Op::DefineGlobal(_) | Op::DefineLocal(_) => Some(buffer.clone()),
+                    _ => None,
+                }
+            }
+            Op::Store { buffer, .. } | Op::StoreGated { buffer, .. } => {
+                // Get output buffer from Store
+                match buffer.op() {
+                    Op::DefineGlobal(_) | Op::DefineLocal(_) => Some(buffer.clone()),
+                    Op::Index { buffer: inner, .. } => {
+                        if matches!(inner.op(), Op::DefineGlobal(_) | Op::DefineLocal(_)) {
+                            Some(inner.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         };
-        buffer_sources.push(actual_buffer);
+
+        if let Some(buf) = buffer
+            && seen_buffer_ids.insert(buf.id)
+        {
+            // Check if this buffer has an AFTER wrapper in buffer_map.
+            // If so, use the AFTER as the kernel source (tracks inter-kernel deps).
+            // Otherwise, use the bare DefineGlobal/DefineLocal.
+            let source = ctx.get_buffer(&buf).cloned().unwrap_or_else(|| buf.clone());
+            if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                let has_after = ctx.has_buffer(&buf);
+                tracing::debug!(
+                    "split_store: buffer_sources collect buf_id={} buf_op={:?} has_after={} source_id={} source_op={:?}",
+                    buf.id,
+                    std::mem::discriminant(buf.op()),
+                    has_after,
+                    source.id,
+                    std::mem::discriminant(source.op())
+                );
+            }
+            buffer_sources.push(source);
+        }
     }
 
-    buffer_sources.sort_by_key(|b| match b.op() {
-        Op::DefineGlobal(id) => *id as u64,
-        Op::DefineLocal(id) => (*id as u64) + (1u64 << 32),
-        Op::Buffer { .. } => b.id + (1u64 << 48),
-        _ => b.id,
+    // Sort buffer sources by their underlying DefineGlobal/DefineLocal index.
+    // AFTER wrappers need to be unwrapped to get the underlying buffer.
+    buffer_sources.sort_by_key(|b| {
+        let inner = match b.op() {
+            Op::After { passthrough, .. } => passthrough,
+            _ => b,
+        };
+        match inner.op() {
+            Op::DefineGlobal(id) => *id as u64,
+            Op::DefineLocal(id) => (*id as u64) + (1u64 << 32),
+            Op::Buffer { .. } => inner.id + (1u64 << 48),
+            _ => inner.id,
+        }
     });
+
+    // Renumber DefineGlobal/DefineLocal indices to match buffer positions.
+    // This ensures kernel AST references match the buffer list order.
+    let (ast, buffer_sources, id_mapping) = renumber_define_globals(ast, &buffer_sources);
+
+    // Store the ID mapping for buffer registry dual-registration.
+    // This allows consumers to find shared buffers using original IDs from AFTER nodes.
+    ctx.buffer_id_mapping.extend(id_mapping);
 
     for node in buffer_sources {
         sources.push(node);
@@ -597,6 +734,167 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
     Some(kernel)
 }
 
+/// Fix inter-kernel dependencies (like Tinygrad's fix_assign).
+///
+/// When kernel B reads from a buffer that kernel A writes to, this function
+/// ensures kernel B's AFTER node depends on kernel A's AFTER node.
+///
+/// This handles cases like `Eq(data, Expand(ReduceAxis(data)))` where:
+/// 1. ReduceAxis creates kernel A writing to buffer X
+/// 2. Eq creates kernel B reading from buffer X
+/// 3. Kernel B's AFTER must depend on Kernel A's AFTER
+fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
+    use morok_ir::UOpKey;
+
+    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+        // Count all nodes
+        let toposort_nodes: Vec<_> = root.toposort();
+        let after_count = toposort_nodes.iter().filter(|n| matches!(n.op(), Op::After { .. })).count();
+        let kernel_count = toposort_nodes.iter().filter(|n| matches!(n.op(), Op::Kernel { .. })).count();
+        tracing::debug!(
+            "fix_assign: starting, root_id={} total_nodes={} after_count={} kernel_count={}",
+            root.id,
+            toposort_nodes.len(),
+            after_count,
+            kernel_count
+        );
+    }
+
+    // Step 1: Map buffer_id -> AFTER node that writes to it
+    let mut kernel_assign: HashMap<u64, Arc<UOp>> = HashMap::new();
+
+    for node in root.toposort() {
+        if let Op::After { passthrough, deps } = node.op() {
+            if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                let dep_ops: Vec<_> =
+                    deps.iter().map(|d| format!("{}:{:?}", d.id, std::mem::discriminant(d.op()))).collect();
+                tracing::debug!(
+                    "fix_assign: found AFTER node after_id={} passthrough_id={} passthrough_op={:?} deps={:?}",
+                    node.id,
+                    passthrough.id,
+                    std::mem::discriminant(passthrough.op()),
+                    dep_ops
+                );
+            }
+            let buf_id = match passthrough.op() {
+                Op::DefineGlobal(_) => passthrough.id,
+                _ => continue,
+            };
+            // Only record if there's a Kernel dep (this AFTER produces a buffer)
+            // Note: The kernel may be wrapped in an End node: AFTER(DefineGlobal, [End(Kernel, ranges)])
+            let has_kernel = deps.iter().any(|d| match d.op() {
+                Op::Kernel { .. } => true,
+                Op::End { computation, .. } => matches!(computation.op(), Op::Kernel { .. }),
+                _ => false,
+            });
+            if has_kernel {
+                if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                    tracing::debug!("fix_assign: recording producer buf_id={} after_id={}", buf_id, node.id);
+                }
+                kernel_assign.insert(buf_id, node.clone());
+            }
+        }
+    }
+
+    if kernel_assign.is_empty() {
+        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+            tracing::debug!("fix_assign: no kernel producers found");
+        }
+        return root.clone();
+    }
+
+    // Step 2: Find AFTER nodes whose kernels read from buffers written by other kernels
+    #[allow(clippy::mutable_key_type)]
+    let mut assign_rep: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+
+    for node in root.toposort() {
+        if let Op::After { passthrough, deps } = node.op() {
+            let this_buf_id = match passthrough.op() {
+                Op::DefineGlobal(_) => passthrough.id,
+                _ => continue,
+            };
+
+            // Find the kernel in deps (may be wrapped in End node)
+            let kernel = deps.iter().find_map(|d| match d.op() {
+                Op::Kernel { .. } => Some(d.clone()),
+                Op::End { computation, .. } if matches!(computation.op(), Op::Kernel { .. }) => {
+                    Some(computation.clone())
+                }
+                _ => None,
+            });
+            let Some(kernel) = kernel else {
+                continue;
+            };
+
+            // Check each source of the kernel for buffer dependencies
+            if let Op::Kernel { sources, .. } = kernel.op() {
+                if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                    tracing::debug!(
+                        "fix_assign: checking kernel after_id={} this_buf_id={} num_sources={}",
+                        node.id,
+                        this_buf_id,
+                        sources.len()
+                    );
+                }
+                for src in sources {
+                    // Get buffer ID from source (could be DefineGlobal or AFTER wrapping one)
+                    let src_buf_id = match src.op() {
+                        Op::DefineGlobal(_) => src.id,
+                        Op::After { passthrough: p, .. } if matches!(p.op(), Op::DefineGlobal(_)) => p.id,
+                        _ => continue,
+                    };
+
+                    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                        tracing::debug!(
+                            "fix_assign: source src_id={} src_buf_id={} has_producer={}",
+                            src.id,
+                            src_buf_id,
+                            kernel_assign.contains_key(&src_buf_id)
+                        );
+                    }
+
+                    // Skip if same buffer as this AFTER produces
+                    if src_buf_id == this_buf_id {
+                        continue;
+                    }
+
+                    // Check if another kernel writes to this buffer
+                    if let Some(producer_after) = kernel_assign.get(&src_buf_id) {
+                        // Don't add dependency on self
+                        if Arc::ptr_eq(producer_after, &node) {
+                            continue;
+                        }
+
+                        // Add the producer AFTER as a dependency if not already present
+                        let mut new_deps = deps.clone();
+                        if !new_deps.iter().any(|d| Arc::ptr_eq(d, producer_after)) {
+                            if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                                tracing::debug!(
+                                    "fix_assign: adding dependency consumer_after_id={} producer_after_id={} producer_buf_id={}",
+                                    node.id,
+                                    producer_after.id,
+                                    src_buf_id
+                                );
+                            }
+                            new_deps.push(producer_after.clone());
+                            let new_after = UOp::after(passthrough.clone(), new_deps);
+                            assign_rep.insert(UOpKey(node.clone()), new_after.clone());
+                            // Update kernel_assign to point to the new AFTER
+                            kernel_assign.insert(this_buf_id, new_after);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+        tracing::debug!("fix_assign: made {} replacements", assign_rep.len());
+    }
+
+    if assign_rep.is_empty() { root.clone() } else { root.substitute(&assign_rep) }
+}
+
 // ============================================================================
 // PIPELINE
 // ============================================================================
@@ -606,19 +904,104 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
     use super::transforms::bufferize_to_store;
 
     let mut ctx = KernelContext::new();
+    let mut memo: HashMap<u64, Arc<UOp>> = HashMap::new();
 
-    let after_bufferize = transform_bottom_up(&root, &mut ctx, bufferize_to_store);
+    // Phase 1: Convert BUFFERIZE to STORE with memoization for DAG handling
+    let after_bufferize = transform_bottom_up_memo(&root, &mut ctx, bufferize_to_store, &mut memo);
 
     // DEBUG: Print after bufferize_to_store
     if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-        morok_ir::uop::debug::print_ast(&after_bufferize, "AFTER BUFFERIZE_TO_STORE", 15);
+        eprintln!("=== AFTER BUFFERIZE_TO_STORE ===\n{}", after_bufferize.tree_full());
     }
 
-    let after_split = transform_bottom_up(&after_bufferize, &mut ctx, split_store);
+    // Phase 2: Split STORE to KERNEL with fresh memoization
+    memo.clear();
+    let after_split = transform_bottom_up_memo(&after_bufferize, &mut ctx, split_store, &mut memo);
 
+    // Phase 2.5: Collect producer AFTERs from memo that have kernel deps
+    // These AFTERs may have been transformed but not connected to the final output
+    let producer_afters: Vec<Arc<UOp>> = memo
+        .values()
+        .filter(|uop| {
+            if let Op::After { deps, .. } = uop.op() {
+                deps.iter().any(|d| {
+                    matches!(d.op(), Op::Kernel { .. })
+                        || matches!(d.op(), Op::End { computation, .. } if matches!(computation.op(), Op::Kernel { .. }))
+                })
+            } else {
+                false
+            }
+        })
+        .cloned()
+        .collect();
+
+    // Phase 2.6: Ensure producer AFTERs are in the AST by adding to SINK
+    // This handles the case where producer kernels are embedded in consumer computations
+    let after_split = if !producer_afters.is_empty() {
+        ensure_producer_afters_in_sink(&after_split, &producer_afters)
+    } else {
+        after_split
+    };
+
+    // Phase 3: Fix inter-kernel dependencies (like Tinygrad's fix_assign)
+    let after_split = fix_assign(&after_split);
+
+    // Phase 4: Resolve kernel dependencies for scheduling
     resolve_kernel_dependencies(&after_split, &mut ctx);
 
     (after_split, ctx)
+}
+
+/// Ensure producer AFTERs are connected to the SINK.
+///
+/// When kernel B reads from a buffer produced by kernel A, kernel A's AFTER
+/// may have been transformed but not connected to the output. This function
+/// ensures all producer AFTERs appear in the final AST by adding them to the SINK.
+fn ensure_producer_afters_in_sink(root: &Arc<UOp>, producer_afters: &[Arc<UOp>]) -> Arc<UOp> {
+    // Find existing AFTER nodes in the AST to avoid duplicates
+    let existing_afters: HashSet<u64> = root
+        .toposort()
+        .into_iter()
+        .filter(|n| matches!(n.op(), Op::After { .. }))
+        .map(|n| {
+            // Key by passthrough buffer ID for deduplication
+            if let Op::After { passthrough, .. } = n.op() { passthrough.id } else { n.id }
+        })
+        .collect();
+
+    // Find producer AFTERs that aren't already in the AST
+    let missing_afters: Vec<_> = producer_afters
+        .iter()
+        .filter(|a| {
+            if let Op::After { passthrough, .. } = a.op() { !existing_afters.contains(&passthrough.id) } else { false }
+        })
+        .cloned()
+        .collect();
+
+    if missing_afters.is_empty() {
+        return root.clone();
+    }
+
+    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+        tracing::debug!("ensure_producer_afters_in_sink: adding {} missing producer AFTERs", missing_afters.len());
+        for after in &missing_afters {
+            if let Op::After { passthrough, .. } = after.op() {
+                tracing::debug!("  missing AFTER: id={} passthrough_id={}", after.id, passthrough.id);
+            }
+        }
+    }
+
+    // Add missing AFTERs to the SINK
+    if let Op::Sink { sources } = root.op() {
+        let mut new_sources: Vec<Arc<UOp>> = sources.iter().cloned().collect();
+        new_sources.extend(missing_afters);
+        UOp::sink(new_sources)
+    } else {
+        // Root is not a SINK - wrap it with missing AFTERs
+        let mut new_sources = vec![root.clone()];
+        new_sources.extend(missing_afters);
+        UOp::sink(new_sources)
+    }
 }
 
 fn resolve_kernel_dependencies(root: &Arc<UOp>, ctx: &mut KernelContext) {
@@ -628,9 +1011,24 @@ fn resolve_kernel_dependencies(root: &Arc<UOp>, ctx: &mut KernelContext) {
         if let Op::After { passthrough, deps } = node.op()
             && let Op::DefineGlobal(_) = passthrough.op()
         {
+            // Look for Kernel in deps (may be wrapped in End node)
             for dep in deps {
-                if let Op::Kernel { .. } = dep.op() {
-                    buffer_producers.insert(passthrough.id, dep.clone());
+                let kernel = match dep.op() {
+                    Op::Kernel { .. } => Some(dep.clone()),
+                    Op::End { computation, .. } if matches!(computation.op(), Op::Kernel { .. }) => {
+                        Some(computation.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(k) = kernel {
+                    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                        tracing::debug!(
+                            "resolve_kernel_dependencies: buffer {} produced by kernel {}",
+                            passthrough.id,
+                            k.id
+                        );
+                    }
+                    buffer_producers.insert(passthrough.id, k);
                     break;
                 }
             }
@@ -656,6 +1054,14 @@ fn resolve_kernel_dependencies(root: &Arc<UOp>, ctx: &mut KernelContext) {
                     && let Some(producer) = buffer_producers.get(&buf_id)
                     && !Arc::ptr_eq(producer, &node)
                 {
+                    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                        tracing::debug!(
+                            "resolve_kernel_dependencies: kernel {} depends on kernel {} (buffer {})",
+                            node.id,
+                            producer.id,
+                            buf_id
+                        );
+                    }
                     ctx.add_dependency(buf_id, producer.clone(), node.clone());
                 }
             }
@@ -686,21 +1092,36 @@ fn resolve_kernel_dependencies(root: &Arc<UOp>, ctx: &mut KernelContext) {
     }
 }
 
-fn transform_bottom_up<F>(uop: &Arc<UOp>, ctx: &mut KernelContext, transform_fn: F) -> Arc<UOp>
+/// Memoized version of transform_bottom_up for proper DAG handling.
+/// Without memoization, the same node referenced from multiple places
+/// gets processed independently, breaking multi-kernel dependencies.
+fn transform_bottom_up_memo<F>(
+    uop: &Arc<UOp>,
+    ctx: &mut KernelContext,
+    transform_fn: F,
+    memo: &mut HashMap<u64, Arc<UOp>>,
+) -> Arc<UOp>
 where
     F: Fn(&Arc<UOp>, &mut KernelContext) -> Option<Arc<UOp>> + Copy,
 {
+    // Check memo first - return cached result for same UOp id
+    if let Some(cached) = memo.get(&uop.id) {
+        return cached.clone();
+    }
+
     let sources = uop.op().sources();
 
     if sources.is_empty() {
-        return transform_fn(uop, ctx).unwrap_or_else(|| uop.clone());
+        let result = transform_fn(uop, ctx).unwrap_or_else(|| uop.clone());
+        memo.insert(uop.id, result.clone());
+        return result;
     }
 
     let mut transformed_sources = Vec::with_capacity(sources.len());
     let mut any_changed = false;
 
     for src in sources {
-        let transformed = transform_bottom_up(&src, ctx, transform_fn);
+        let transformed = transform_bottom_up_memo(&src, ctx, transform_fn, memo);
         if !Arc::ptr_eq(&transformed, &src) {
             any_changed = true;
         }
@@ -709,7 +1130,172 @@ where
 
     let reconstructed = if any_changed { uop.with_sources(transformed_sources) } else { uop.clone() };
 
-    transform_fn(&reconstructed, ctx).unwrap_or(reconstructed)
+    let result = transform_fn(&reconstructed, ctx).unwrap_or(reconstructed);
+    memo.insert(uop.id, result.clone());
+    result
+}
+
+/// Renumber DefineGlobal/DefineLocal indices in AST to match buffer positions.
+///
+/// When kernels are split, each kernel collects only the DefineGlobal nodes
+/// present in its AST. However, the indices (the arg in DefineGlobal(arg))
+/// are assigned globally during transformation. This creates a mismatch:
+/// - Kernel sources: [DefineGlobal(0), DefineGlobal(3)]
+/// - Buffer list built from sources: positions [0, 1]
+/// - But AST references DefineGlobal(3), which codegen interprets as index 3
+///
+/// This function renumbers the AST so DefineGlobal indices match their
+/// position in buffer_sources: 0, 1, 2, ... for sequential buffer access.
+///
+/// Returns:
+/// - Rewritten AST with renumbered DefineGlobal/DefineLocal indices
+/// - New buffer sources with renumbered nodes
+/// - Mapping from original UOp ID to new UOp ID (for buffer registry dual-registration)
+fn renumber_define_globals(ast: Arc<UOp>, buffer_sources: &[Arc<UOp>]) -> (Arc<UOp>, Vec<Arc<UOp>>, HashMap<u64, u64>) {
+    // Helper to extract the inner buffer from an AFTER wrapper or return the node itself.
+    fn get_inner_buffer(src: &Arc<UOp>) -> &Arc<UOp> {
+        match src.op() {
+            Op::After { passthrough, .. } => passthrough,
+            _ => src,
+        }
+    }
+
+    // Build old UOp id -> new index mapping
+    // DefineGlobals come first (indices 0..num_globals-1)
+    // DefineLocals come after (indices num_globals..num_globals+num_locals-1)
+    let mut id_to_new_idx: HashMap<u64, usize> = HashMap::new();
+    let mut global_idx = 0usize;
+    let mut local_start = 0usize;
+
+    // First pass: count globals to know where locals start
+    for src in buffer_sources {
+        let inner = get_inner_buffer(src);
+        if matches!(inner.op(), Op::DefineGlobal(_)) {
+            local_start += 1;
+        }
+    }
+
+    // Second pass: assign new indices
+    let mut local_idx = local_start;
+    for src in buffer_sources {
+        let inner = get_inner_buffer(src);
+        match inner.op() {
+            Op::DefineGlobal(_) => {
+                id_to_new_idx.insert(inner.id, global_idx);
+                global_idx += 1;
+            }
+            Op::DefineLocal(_) => {
+                id_to_new_idx.insert(inner.id, local_idx);
+                local_idx += 1;
+            }
+            _ => {}
+        }
+    }
+
+    // Build new buffer_sources with renumbered nodes.
+    // For AFTER wrappers, create new AFTER with renumbered inner buffer.
+    let new_sources: Vec<Arc<UOp>> = buffer_sources
+        .iter()
+        .map(|src| {
+            let inner = get_inner_buffer(src);
+            if let Some(&new_idx) = id_to_new_idx.get(&inner.id) {
+                let new_inner = match inner.op() {
+                    Op::DefineGlobal(_) => UOp::define_global(new_idx, inner.dtype().clone()),
+                    Op::DefineLocal(_) => UOp::define_local(new_idx, inner.dtype().clone()),
+                    _ => return src.clone(),
+                };
+                // Preserve AFTER wrapper if present
+                let result = match src.op() {
+                    Op::After { deps, .. } => UOp::after(new_inner.clone(), deps.clone()),
+                    _ => new_inner.clone(),
+                };
+                if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                    tracing::debug!(
+                        "renumber_define_globals: src_id={} inner_id={} new_inner_id={} result_id={} is_after={}",
+                        src.id,
+                        inner.id,
+                        new_inner.id,
+                        result.id,
+                        matches!(src.op(), Op::After { .. })
+                    );
+                }
+                result
+            } else {
+                src.clone()
+            }
+        })
+        .collect();
+
+    // Build UOp id -> new UOp mapping for AST rewrite.
+    // Map from INNER buffer ID (what appears in AST) to renumbered INNER buffer.
+    let old_to_new: HashMap<u64, Arc<UOp>> = buffer_sources
+        .iter()
+        .zip(new_sources.iter())
+        .map(|(old, new)| {
+            let old_inner = get_inner_buffer(old);
+            let new_inner = get_inner_buffer(new);
+            (old_inner.id, new_inner.clone())
+        })
+        .collect();
+
+    // Rewrite AST: replace all DefineGlobal/DefineLocal references
+    fn rewrite_ast(
+        node: &Arc<UOp>,
+        old_to_new: &HashMap<u64, Arc<UOp>>,
+        memo: &mut HashMap<u64, Arc<UOp>>,
+    ) -> Arc<UOp> {
+        if let Some(cached) = memo.get(&node.id) {
+            return cached.clone();
+        }
+
+        // If this node is a DefineGlobal/Local that needs replacement
+        if let Some(replacement) = old_to_new.get(&node.id) {
+            memo.insert(node.id, replacement.clone());
+            return replacement.clone();
+        }
+
+        let sources = node.op().sources();
+        if sources.is_empty() {
+            memo.insert(node.id, node.clone());
+            return node.clone();
+        }
+
+        let mut new_sources = Vec::with_capacity(sources.len());
+        let mut changed = false;
+        for src in &sources {
+            let new_src = rewrite_ast(src, old_to_new, memo);
+            if !Arc::ptr_eq(&new_src, src) {
+                changed = true;
+            }
+            new_sources.push(new_src);
+        }
+
+        let result = if changed { node.with_sources(new_sources) } else { node.clone() };
+        memo.insert(node.id, result.clone());
+        result
+    }
+
+    let mut memo = HashMap::new();
+    let new_ast = rewrite_ast(&ast, &old_to_new, &mut memo);
+
+    // Build old_id -> new_id mapping for buffer registry dual-registration.
+    // This allows consumers to find shared buffers using the original (pre-renumbered) ID.
+    // For AFTER wrappers, we map the inner buffer IDs.
+    let id_mapping: HashMap<u64, u64> = buffer_sources
+        .iter()
+        .zip(new_sources.iter())
+        .filter_map(|(old, new)| {
+            let old_inner = get_inner_buffer(old);
+            let new_inner = get_inner_buffer(new);
+            if matches!(old_inner.op(), Op::DefineGlobal(_) | Op::DefineLocal(_)) {
+                Some((old_inner.id, new_inner.id))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    (new_ast, new_sources, id_mapping)
 }
 
 // ============================================================================

@@ -18,10 +18,10 @@ smallvec = "1.15"
 ndarray.workspace = true
 papaya = "0.2.3"
 parking_lot = "0.12"
+tracing = "0.1.43"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-tracing = "0.1.43"
 tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
 
 [[bench]]

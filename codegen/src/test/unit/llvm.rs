@@ -81,12 +81,12 @@ fn test_reduce_add_basic() {
     let kernel = result.unwrap();
     let ir = &kernel.code;
 
-    // Verify reduction structure in generated IR
-    assert!(ir.contains("reduce_header_"), "Missing reduce header block:\n{}", ir);
-    assert!(ir.contains("reduce_body_"), "Missing reduce body block:\n{}", ir);
-    assert!(ir.contains("reduce_exit_"), "Missing reduce exit block:\n{}", ir);
-    // Verify accumulator PHI exists
-    assert!(ir.contains("phi float"), "Missing accumulator PHI node:\n{}", ir);
+    // Verify loop structure (uses standard loop blocks with alloca accumulator, like Tinygrad's DEFINE_REG)
+    assert!(ir.contains("loop_latch_"), "Missing loop latch block:\n{}", ir);
+    assert!(ir.contains("loop_body_"), "Missing loop body block:\n{}", ir);
+    assert!(ir.contains("loop_exit_"), "Missing loop exit block:\n{}", ir);
+    // Verify accumulator alloca (used instead of PHI for nested loop support)
+    assert!(ir.contains("reduce_acc"), "Missing reduce accumulator alloca:\n{}", ir);
     // Verify reduce add operation
     assert!(ir.contains("fadd"), "Missing fadd instruction:\n{}", ir);
 }

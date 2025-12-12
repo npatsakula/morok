@@ -382,6 +382,8 @@ fn codegen_memory<'ctx>(
             let buffer_ptr = require_value(buffer, context, module, builder, values)?;
             let index_val = require_value(index, context, module, builder, values)?;
             let value_val = require_value(value, context, module, builder, values)?;
+            // Auto-load if value is a pointer (from INDEX) - matches cranelift backend
+            let value_val = auto_load_pointer(value_val, &value.dtype(), context, builder)?;
             codegen_store(buffer_ptr, index_val, value_val, builder)?;
             Ok(None)
         }
@@ -495,6 +497,7 @@ fn codegen_loop<'ctx>(
             Ok(None)
         }
         Op::Reduce { src, ranges, reduce_op } => {
+            println!("[DEBUG] Codegen REDUCE uop.id={}", uop.id);
             codegen_reduce(uop.id, src, ranges, *reduce_op, &uop.dtype(), context, module, builder, values)
         }
         Op::Bind { var, value } => {
@@ -672,8 +675,10 @@ fn codegen_reduce<'ctx>(
     builder: &Builder<'ctx>,
     values: &mut ValueMap<'ctx>,
 ) -> Result<Option<BasicValueEnum<'ctx>>> {
+    println!("[DEBUG REDUCE] reduce_id={}, ranges.len()={}, reduce_op={:?}", reduce_id, ranges.len(), reduce_op);
     // If no ranges, just return the source
     if ranges.is_empty() {
+        println!("[DEBUG REDUCE] No ranges, returning source directly");
         return codegen_uop(src, context, module, builder, values);
     }
 
@@ -739,7 +744,9 @@ fn codegen_reduce<'ctx>(
 
     // Evaluate source first - this may create nested loops
     let src_val = require_value(src, context, module, builder, values)?;
+    println!("[DEBUG REDUCE] src.dtype()={:?}, src_val={:?}", src.dtype(), src_val);
     let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
+    println!("[DEBUG REDUCE] after auto_load: src_val={:?}", src_val);
 
     // Load accumulator AFTER source evaluation (inside any source loops)
     // This ensures we get the current value, not a stale one from before the source loops
@@ -798,7 +805,8 @@ fn auto_load_pointer<'ctx>(
                 return Ok(value);
             }
         };
-        let loaded = builder.build_load(element_type, value.into_pointer_value(), "autoload").context(BuildLoadSnafu)?;
+        let loaded =
+            builder.build_load(element_type, value.into_pointer_value(), "autoload").context(BuildLoadSnafu)?;
         debug!(
             dtype = ?dtype,
             ptr = ?value,

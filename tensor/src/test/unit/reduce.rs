@@ -440,7 +440,10 @@ fn test_argmax_debug_steps() {
     println!("two_broadcast shape={:?}", two_broadcast.uop.shape());
     let eq2 = c.try_eq(&two_broadcast).unwrap();
     let eq2_result = eq2.realize().unwrap().to_ndarray::<bool>().unwrap();
-    println!("Broadcast eq: c=[1,2,3,2], two_broadcast=[2,2,2,2], c==two_broadcast={:?}", eq2_result.as_slice().unwrap());
+    println!(
+        "Broadcast eq: c=[1,2,3,2], two_broadcast=[2,2,2,2], c==two_broadcast={:?}",
+        eq2_result.as_slice().unwrap()
+    );
     // Expected: [false, true, false, true] (positions 1 and 3 equal 2)
     assert_eq!(eq2_result.as_slice().unwrap(), &[false, true, false, true], "Broadcast eq failed");
 
@@ -449,15 +452,19 @@ fn test_argmax_debug_steps() {
     let d_max = d.max_with().axes(0).keepdim(true).call().unwrap();
     println!("d_max shape={:?}", d_max.uop.shape());
 
-    // DEBUG: Realize d_max first to verify it's correct
-    let d_max_realized = d_max.clone().realize().unwrap().to_ndarray::<f32>().unwrap();
-    println!("DEBUG: d_max realized value = {:?}", d_max_realized.as_slice().unwrap());
+    // Realize d_max first - IMPORTANT: use the realized tensor for subsequent ops
+    // In Rust, tensor.clone().realize() creates a new independent tensor.
+    // The original tensor's uop is unchanged, so we must use the realized result.
+    let d_max_realized = d_max.realize().unwrap();
+    let d_max_value = d_max_realized.clone().to_ndarray::<f32>().unwrap();
+    println!("DEBUG: d_max realized value = {:?}", d_max_value.as_slice().unwrap());
 
-    let d_max_expanded = d_max.try_expand(&[4]).unwrap();
+    // Use the REALIZED d_max for expansion
+    let d_max_expanded = d_max_realized.try_expand(&[4]).unwrap();
     println!("d_max_expanded shape={:?}", d_max_expanded.uop.shape());
 
     let eq3 = d.try_eq(&d_max_expanded).unwrap();
-    morok_ir::uop::debug::print_ast(&eq3.uop, "EQ3 AST", 5);
+    eprintln!("=== EQ3 AST ===\n{}", eq3.uop.tree_full());
     let eq3_result = eq3.realize().unwrap().to_ndarray::<bool>().unwrap();
     println!("Reduction expand eq: d=[1,5,3,2], d_max=5, eq={:?}", eq3_result.as_slice().unwrap());
     // Expected: [false, true, false, false] (only position 1 equals 5)
@@ -516,7 +523,7 @@ fn test_argmax_full_steps() {
     assert_eq!(max_idx_realized.as_slice().unwrap(), &[2], "Max idx mismatch");
 
     // Step 8: n - max_idx
-    let n_tensor = Tensor::from_slice([axis_size as i32]);
+    let n_tensor = Tensor::from_slice([axis_size]);
     let n_scalar = n_tensor.try_reshape(&[]).unwrap();
     let result = n_scalar.try_sub(&max_idx).unwrap();
     let result_realized = realize_i32(result);
@@ -526,6 +533,7 @@ fn test_argmax_full_steps() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn test_argmax_value_1d() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0]);

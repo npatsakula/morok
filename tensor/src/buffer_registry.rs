@@ -93,7 +93,15 @@ where
 /// The buffer if found, None otherwise
 pub fn get_buffer(uop_id: u64) -> Option<Buffer> {
     let guard = buffers().guard();
-    buffers().get(&uop_id, &guard).cloned()
+    let result = buffers().get(&uop_id, &guard).cloned();
+    if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
+        if let Some(ref buf) = result {
+            eprintln!("get_buffer({}) -> true, size={}", uop_id, buf.size());
+        } else {
+            eprintln!("get_buffer({}) -> false", uop_id);
+        }
+    }
+    result
 }
 
 /// Remove buffer (for explicit cleanup).

@@ -90,6 +90,43 @@ impl CompiledKernel for LlvmKernel {
         buffers: &[*mut u8],
         vars: &std::collections::HashMap<String, i64>,
     ) -> Result<()> {
+        // Debug: dump buffer contents before execution
+        let debug_buffers = std::env::var("MOROK_DEBUG_BUFFERS").is_ok();
+        if debug_buffers {
+            eprintln!("LLVM execute BEFORE: entry_point={}, num_buffers={}", self.entry_point, buffers.len());
+            for (i, &ptr) in buffers.iter().enumerate() {
+                if !ptr.is_null() {
+                    // Try to interpret as floats (first 5 values)
+                    let float_ptr = ptr as *const f32;
+                    let float_vals: Vec<f32> = (0..5).map(|j| unsafe { *float_ptr.add(j) }).collect();
+                    // Try to interpret as ints (first 5 values)
+                    let int_ptr = ptr as *const i32;
+                    let int_vals: Vec<i32> = (0..5).map(|j| unsafe { *int_ptr.add(j) }).collect();
+                    eprintln!("  buf[{}]: ptr={:?}, as_f32={:?}, as_i32={:?}", i, ptr, float_vals, int_vals);
+                } else {
+                    eprintln!("  buf[{}]: NULL", i);
+                }
+            }
+        }
+
+        // Helper closure for buffer debug output
+        let debug_buffer_output = |prefix: &str| {
+            if debug_buffers {
+                eprintln!("LLVM execute {}: entry_point={}, num_buffers={}", prefix, self.entry_point, buffers.len());
+                for (i, &ptr) in buffers.iter().enumerate() {
+                    if !ptr.is_null() {
+                        let float_ptr = ptr as *const f32;
+                        let float_vals: Vec<f32> = (0..5).map(|j| unsafe { *float_ptr.add(j) }).collect();
+                        let int_ptr = ptr as *const i32;
+                        let int_vals: Vec<i32> = (0..5).map(|j| unsafe { *int_ptr.add(j) }).collect();
+                        eprintln!("  buf[{}]: ptr={:?}, as_f32={:?}, as_i32={:?}", i, ptr, float_vals, int_vals);
+                    } else {
+                        eprintln!("  buf[{}]: NULL", i);
+                    }
+                }
+            }
+        };
+
         // Get the function from the module to inspect its signature
         let function = self
             .module
@@ -172,6 +209,7 @@ impl CompiledKernel for LlvmKernel {
             }
         }
 
+        debug_buffer_output("AFTER");
         Ok(())
     }
 

@@ -108,9 +108,10 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Without this, DefineVar would have no value when operations reference it.
         for node in &nodes {
             if let Op::Bind { value, .. } = node.op()
-                && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. }) {
-                    ops::codegen_uop(node, self.context, &module, &builder, &mut values)?;
-                }
+                && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. })
+            {
+                ops::codegen_uop(node, self.context, &module, &builder, &mut values)?;
+            }
         }
 
         // Main pass: process all remaining nodes
@@ -249,10 +250,11 @@ fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
     let mut bound_outer_vars: HashSet<u64> = HashSet::new();
     for node in &nodes {
         if let Op::Bind { var, value } = node.op()
-            && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. }) {
-                // This DefineVar is bound to an OUTER range - will be inlined as loop
-                bound_outer_vars.insert(var.id);
-            }
+            && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. })
+        {
+            // This DefineVar is bound to an OUTER range - will be inlined as loop
+            bound_outer_vars.insert(var.id);
+        }
     }
 
     // Collect DefineVar nodes that are NOT bound to OUTER ranges
@@ -326,9 +328,10 @@ fn find_reduce_source_nodes(nodes: &[Arc<UOp>]) -> std::collections::HashSet<u64
             // These need to be skipped in main loop - REDUCE will handle them
             for range in ranges {
                 if let Op::Range { axis_type, .. } = range.op()
-                    && matches!(axis_type, morok_ir::AxisType::Reduce | morok_ir::AxisType::Loop) {
-                        reduce_src_ids.insert(range.id);
-                    }
+                    && matches!(axis_type, morok_ir::AxisType::Reduce | morok_ir::AxisType::Loop)
+                {
+                    reduce_src_ids.insert(range.id);
+                }
             }
         }
     }

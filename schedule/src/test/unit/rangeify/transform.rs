@@ -22,7 +22,7 @@ fn test_transform_buffer_source() {
     ctx.set_ranges(&consumer, vec![range.clone()], vec![range.clone()]);
 
     // Transform sources
-    let new_sources = transform_sources_with_bufferize(&consumer, &ctx);
+    let new_sources = transform_sources_with_bufferize(&consumer, &mut ctx);
 
     assert!(new_sources.is_some());
     let new_sources = new_sources.unwrap();
@@ -52,7 +52,7 @@ fn test_transform_realizable_source() {
     ctx.mark_realize(&x, vec![0]);
 
     // Transform
-    let new_src = transform_single_source(&consumer, &x, std::slice::from_ref(&range), &ctx);
+    let new_src = transform_single_source(&consumer, &x, std::slice::from_ref(&range), &mut ctx);
 
     // Should be INDEX(BUFFERIZE(x))
     if let Op::Index { buffer, .. } = new_src.op() {
@@ -89,10 +89,10 @@ fn test_no_transform_for_normal_source() {
     // Use direct Binary construction - this test checks transform behavior, not arithmetic
     let add = x.try_add(&y).unwrap();
 
-    let ctx = IndexingContext::new();
+    let mut ctx = IndexingContext::new();
 
     // No ranges assigned, no transformation should happen
-    let result = transform_sources_with_bufferize(&add, &ctx);
+    let result = transform_sources_with_bufferize(&add, &mut ctx);
     assert!(result.is_none());
 }
 
@@ -123,7 +123,7 @@ fn test_transform_movement_chain_on_buffer() {
     ctx.set_ranges(&add, vec![range0.clone(), range1.clone()], vec![range0.clone(), range1.clone()]);
 
     // Transform sources
-    let new_sources = transform_sources_with_bufferize(&add, &ctx);
+    let new_sources = transform_sources_with_bufferize(&add, &mut ctx);
 
     // RESHAPE(BUFFER) should be transformed to INDEX(RESHAPE(BUFFER), ranges)
     assert!(new_sources.is_some(), "Transform should happen for movement chain on buffer");

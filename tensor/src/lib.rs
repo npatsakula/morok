@@ -230,7 +230,11 @@ impl Tensor {
     /// This allows multi-buffer operations to access buffers from multiple tensors.
     /// Uses `.base()` to walk through movement operations to find the actual buffer.
     pub fn buffer(&self) -> Option<Buffer> {
-        buffer_registry::get_buffer(self.uop.base().id)
+        let base_id = self.uop.base().id;
+        if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
+            eprintln!("buffer(): uop.id={} base().id={}", self.uop.id, base_id);
+        }
+        buffer_registry::get_buffer(base_id)
     }
 
     /// Get device specification from underlying UOp graph.

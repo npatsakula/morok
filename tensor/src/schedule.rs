@@ -11,7 +11,7 @@
 //! The scheduling process converts from lazy tensor operations to
 //! executable kernels with properly allocated device buffers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use morok_device::Buffer;
@@ -19,7 +19,7 @@ use morok_device::device::Device;
 use morok_device::registry;
 use morok_dtype::{DType, DeviceSpec};
 use morok_ir::{ConstValueHash, Op, UOp};
-use morok_schedule::rangeify::KernelContext;
+use morok_schedule::rangeify::{KernelContext, KernelDependency};
 
 use crate::error::*;
 use crate::{Error, Result};
@@ -81,6 +81,86 @@ pub struct ScheduleItem {
 /// Full execution schedule (list of kernels in dependency order).
 pub type Schedule = Vec<ScheduleItem>;
 
+/// Sort kernels by dependencies (producers before consumers).
+///
+/// Uses Kahn's algorithm for topological sort based on kernel_deps.
+/// This ensures producer kernels are processed before consumers, which is
+/// critical for buffer sharing: the producer allocates the buffer first,
+/// then the consumer finds it in the registry via `get_or_create_buffer`.
+fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], kernel_deps: &[KernelDependency]) -> Vec<Arc<UOp>> {
+    let debug = std::env::var("MOROK_DEBUG_RANGEIFY").is_ok();
+
+    if debug {
+        eprintln!("sort_kernels_by_dependencies: {} kernels, {} deps", kernels.len(), kernel_deps.len());
+        for k in kernels {
+            eprintln!("  kernel id={}", k.id);
+        }
+        for dep in kernel_deps {
+            eprintln!("  dep: producer={} -> consumer={} (buffer={})", dep.producer.id, dep.consumer.id, dep.buffer_id);
+        }
+    }
+
+    // Build kernel ID set
+    let kernel_ids: HashSet<u64> = kernels.iter().map(|k| k.id).collect();
+
+    // Build dependency graph (only for kernels in our list)
+    let mut in_degree: HashMap<u64, usize> = HashMap::new();
+    let mut dependents: HashMap<u64, Vec<u64>> = HashMap::new();
+
+    for kernel in kernels {
+        in_degree.entry(kernel.id).or_insert(0);
+        dependents.entry(kernel.id).or_default();
+    }
+
+    for dep in kernel_deps {
+        // Only count dependencies between kernels in our list
+        if kernel_ids.contains(&dep.consumer.id) && kernel_ids.contains(&dep.producer.id) {
+            *in_degree.entry(dep.consumer.id).or_insert(0) += 1;
+            dependents.entry(dep.producer.id).or_default().push(dep.consumer.id);
+        }
+    }
+
+    // Kahn's algorithm
+    let mut queue: VecDeque<u64> = in_degree.iter().filter(|&(_, deg)| *deg == 0).map(|(&id, _)| id).collect();
+
+    let kernel_map: HashMap<u64, Arc<UOp>> = kernels.iter().map(|k| (k.id, k.clone())).collect();
+
+    let mut sorted = Vec::new();
+    while let Some(id) = queue.pop_front() {
+        if let Some(kernel) = kernel_map.get(&id) {
+            sorted.push(kernel.clone());
+        }
+        for &dependent in dependents.get(&id).unwrap_or(&vec![]) {
+            if let Some(deg) = in_degree.get_mut(&dependent) {
+                *deg -= 1;
+                if *deg == 0 {
+                    queue.push_back(dependent);
+                }
+            }
+        }
+    }
+
+    // If sorting didn't include all kernels (possible cycle or disconnected graph),
+    // fall back to original order for any missing kernels
+    if sorted.len() < kernels.len() {
+        let sorted_ids: HashSet<u64> = sorted.iter().map(|k| k.id).collect();
+        for kernel in kernels {
+            if !sorted_ids.contains(&kernel.id) {
+                sorted.push(kernel.clone());
+            }
+        }
+    }
+
+    if debug {
+        eprintln!("sort_kernels_by_dependencies: sorted order:");
+        for (i, k) in sorted.iter().enumerate() {
+            eprintln!("  [{}] kernel id={}", i, k.id);
+        }
+    }
+
+    sorted
+}
+
 /// Extract kernels from transformed graph and create schedule.
 ///
 /// This function walks the transformed UOp graph (after rangeify and
@@ -102,6 +182,8 @@ pub type Schedule = Vec<ScheduleItem>;
 /// - No kernels found after scheduling pipeline
 /// - Buffer not found in registry for a kernel source
 pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Result<Schedule> {
+    let debug = std::env::var("MOROK_DEBUG_RANGEIFY").is_ok();
+
     // Step 1: Find all KERNEL operations
     let mut kernels = Vec::new();
     for node in transformed.toposort() {
@@ -113,6 +195,11 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
     if kernels.is_empty() {
         return NoKernelsFoundSnafu.fail();
     }
+
+    // Step 1.5: Sort kernels by dependencies (producers before consumers)
+    // This ensures producer kernels are processed first, so they allocate buffers
+    // before consumers look them up via get_or_create_buffer.
+    let kernels = sort_kernels_by_dependencies(&kernels, &kernel_ctx.kernel_deps);
 
     // Step 2: Build reverse mapping from DEFINE_GLOBAL → original BUFFER/BUFFERIZE
     // This allows us to reuse existing input buffers instead of allocating new ones.
@@ -137,6 +224,28 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
         // This causes collect_kernel_buffers to allocate a new buffer
     }
 
+    // Build reverse mapping: new_id -> old_id
+    // This is needed because kernel sources use POST-renumbered IDs,
+    // but define_to_buffer has PRE-renumbered IDs.
+    let reverse_id_mapping: HashMap<u64, u64> =
+        kernel_ctx.buffer_id_mapping.iter().map(|(&old_id, &new_id)| (new_id, old_id)).collect();
+
+    if debug {
+        eprintln!("define_to_buffer has {} entries:", define_to_buffer.len());
+        for (define_id, buffer) in &define_to_buffer {
+            eprintln!(
+                "  define_id={} -> buffer.id={} buffer_op={:?}",
+                define_id,
+                buffer.id,
+                std::mem::discriminant(buffer.op())
+            );
+        }
+        eprintln!("reverse_id_mapping has {} entries:", reverse_id_mapping.len());
+        for (new_id, old_id) in &reverse_id_mapping {
+            eprintln!("  new_id={} -> old_id={}", new_id, old_id);
+        }
+    }
+
     // Step 2: For each kernel, collect buffers from sources
     let mut schedule = Vec::new();
 
@@ -155,7 +264,14 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
 
         // Collect and allocate all buffers for this kernel
         // Buffers are allocated ONCE here, then reused across all iterations
-        let buffers = collect_kernel_buffers(sources, &kernel_uop, &define_to_buffer)?;
+        let buffers = collect_kernel_buffers(
+            sources,
+            &kernel_uop,
+            &define_to_buffer,
+            &kernel_ctx.buffer_id_mapping,
+            &reverse_id_mapping,
+            &kernel_ctx.define_to_buffer_id,
+        )?;
 
         // Collect bound ranges from kernel AST (BIND nodes with DEFINE_VAR)
         let bound_ranges = collect_bound_ranges(inner_ast)?;
@@ -178,6 +294,30 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
             .filter(|dep| dep.consumer.id == kernel_uop.id)
             .map(|dep| dep.producer.id)
             .collect();
+
+        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+            eprintln!("create_schedule: kernel {} has dependencies {:?}", kernel_uop.id, dependencies);
+            // Debug: show REDUCE ops in this kernel
+            let reduce_ops: Vec<_> = inner_ast
+                .toposort()
+                .into_iter()
+                .filter(|n| matches!(n.op(), Op::Reduce { .. }))
+                .map(|n| {
+                    if let Op::Reduce { reduce_op, .. } = n.op() {
+                        format!("REDUCE id={} op={:?}", n.id, reduce_op)
+                    } else {
+                        format!("REDUCE id={}", n.id)
+                    }
+                })
+                .collect();
+            if !reduce_ops.is_empty() {
+                tracing::debug!(
+                    kernel_id = kernel_uop.id,
+                    reduce_ops = ?reduce_ops,
+                    "create_schedule: REDUCE ops in kernel"
+                );
+            }
+        }
 
         // Use inner_ast (the kernel's internal AST) for codegen, kernel_uop for buffer allocation
         schedule.push(ScheduleItem {
@@ -203,6 +343,7 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
 fn find_first_input_buffer_device(
     sources: &[Arc<UOp>],
     define_to_buffer: &HashMap<u64, Arc<UOp>>,
+    reverse_id_mapping: &HashMap<u64, u64>,
 ) -> Result<Arc<Device>> {
     let alloc_registry = registry::registry();
 
@@ -218,8 +359,13 @@ fn find_first_input_buffer_device(
                 }
             }
             // DEFINE_GLOBAL that maps to an input buffer
+            // Use reverse mapping to handle renumbered IDs
             Op::DefineGlobal(_) => {
-                if let Some(original_buffer) = define_to_buffer.get(&src.id)
+                let lookup_result = define_to_buffer
+                    .get(&src.id)
+                    .or_else(|| reverse_id_mapping.get(&src.id).and_then(|old_id| define_to_buffer.get(old_id)));
+
+                if let Some(original_buffer) = lookup_result
                     && let Some(buffer) = crate::buffer_registry::get_buffer(original_buffer.id)
                 {
                     let device_spec = buffer.allocator().device_spec();
@@ -241,9 +387,14 @@ fn find_first_input_buffer_device(
 /// This walks the kernel sources and identifies:
 /// - Input buffers (Op::Buffer) - get from buffer_registry
 /// - Intermediate buffers (Op::DefineGlobal, Op::DefineLocal) - need allocation
+/// - Shared buffers (Op::After) - look up from producer kernel via registry
 ///
 /// For input buffers (DEFINE_GLOBAL that maps to an original BUFFER),
 /// we reuse the existing buffer from the registry instead of allocating a new one.
+///
+/// For shared buffers (AFTER nodes), we look up the buffer using the original
+/// (pre-renumbered) DefineGlobal ID from the AFTER passthrough, then translate
+/// to the renumbered ID using buffer_id_mapping.
 ///
 /// Output/intermediate buffers are allocated on the same device as the first input buffer
 /// (following Tinygrad's pattern).
@@ -251,7 +402,12 @@ fn collect_kernel_buffers(
     sources: &[Arc<UOp>],
     kernel: &Arc<UOp>,
     define_to_buffer: &HashMap<u64, Arc<UOp>>,
+    buffer_id_mapping: &HashMap<u64, u64>,
+    reverse_id_mapping: &HashMap<u64, u64>,
+    define_to_buffer_id: &HashMap<u64, u64>,
 ) -> Result<Vec<Buffer>> {
+    let debug = std::env::var("MOROK_DEBUG_RANGEIFY").is_ok();
+
     // Get AST for buffer size computation
     let ast = match kernel.op() {
         Op::Kernel { ast, .. } => ast,
@@ -261,15 +417,63 @@ fn collect_kernel_buffers(
     };
 
     // Get target device from first input buffer (Tinygrad pattern: ctx[0].device)
-    let target_device = find_first_input_buffer_device(sources, define_to_buffer)?;
+    // Pass reverse_id_mapping to handle renumbered IDs
+    let target_device = find_first_input_buffer_device(sources, define_to_buffer, reverse_id_mapping)?;
 
     let mut buffers = Vec::new();
 
     for src in sources {
         match src.op() {
+            Op::After { passthrough, .. } => {
+                // Shared buffer from producer kernel.
+                // passthrough.id is the ORIGINAL (pre-renumbered) buffer identity.
+                let original_id = passthrough.id;
+
+                // Look up using the renumbered ID (what producer registered under)
+                let lookup_id = buffer_id_mapping.get(&original_id).copied().unwrap_or(original_id);
+
+                if let Some(existing) = crate::buffer_registry::get_buffer(lookup_id) {
+                    if debug {
+                        eprintln!(
+                            "collect_kernel_buffers: AFTER source original_id={} lookup_id={} found shared buffer, BufferId={:?}",
+                            original_id,
+                            lookup_id,
+                            existing.id()
+                        );
+                    }
+
+                    // Also register under original_id for future lookups
+                    if original_id != lookup_id {
+                        crate::buffer_registry::get_or_create_buffer(original_id, || Ok(existing.clone()))?;
+                    }
+
+                    buffers.push(existing);
+                } else {
+                    // Producer should have allocated - check if sorting is correct
+                    if debug {
+                        eprintln!(
+                            "collect_kernel_buffers: AFTER source original_id={} lookup_id={} NOT FOUND in registry",
+                            original_id, lookup_id
+                        );
+                    }
+                    return Err(Error::BufferNotFound { uop_id: original_id });
+                }
+            }
             Op::DefineGlobal(_id) => {
                 // Check if this DEFINE_GLOBAL maps to an original BUFFER (input buffer)
-                if let Some(original_buffer) = define_to_buffer.get(&src.id) {
+                // First try direct lookup, then try with reverse mapping (new_id -> old_id)
+                // because define_to_buffer has PRE-renumbered IDs but kernel sources use POST-renumbered IDs.
+                let lookup_result = define_to_buffer
+                    .get(&src.id)
+                    .or_else(|| reverse_id_mapping.get(&src.id).and_then(|old_id| define_to_buffer.get(old_id)));
+
+                if let Some(original_buffer) = lookup_result {
+                    if debug {
+                        eprintln!(
+                            "collect_kernel_buffers: src.id={} is input buffer (original={})",
+                            src.id, original_buffer.id
+                        );
+                    }
                     // This is an input buffer - reuse the existing buffer
                     if let Some(buffer) = crate::buffer_registry::get_buffer(original_buffer.id) {
                         // Also register under the DEFINE_GLOBAL's ID for codegen lookup
@@ -279,6 +483,48 @@ fn collect_kernel_buffers(
                         return Err(Error::BufferNotFound { uop_id: original_buffer.id });
                     }
                 } else {
+                    // Try define_to_buffer_id mapping (tracks all DefineGlobal → BUFFER id)
+                    // This handles the case where buffer_map was overwritten by a later kernel
+                    let buffer_id_via_mapping = define_to_buffer_id
+                        .get(&src.id)
+                        .or_else(|| reverse_id_mapping.get(&src.id).and_then(|old_id| define_to_buffer_id.get(old_id)));
+
+                    if let Some(&original_buffer_id) = buffer_id_via_mapping
+                        && let Some(buffer) = crate::buffer_registry::get_buffer(original_buffer_id)
+                    {
+                        if debug {
+                            eprintln!(
+                                "collect_kernel_buffers: src.id={} is input buffer via define_to_buffer_id (original={}, BufferId={:?})",
+                                src.id,
+                                original_buffer_id,
+                                buffer.id()
+                            );
+                        }
+                        // Also register under the DEFINE_GLOBAL's ID for codegen lookup
+                        crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
+                        buffers.push(buffer);
+                        continue;
+                    }
+
+                    // First check if buffer already exists in registry (shared from another kernel)
+                    if let Some(existing) = crate::buffer_registry::get_buffer(src.id) {
+                        if debug {
+                            eprintln!(
+                                "collect_kernel_buffers: src.id={} found in registry (shared buffer), BufferId={:?}",
+                                src.id,
+                                existing.id()
+                            );
+                        }
+                        buffers.push(existing);
+                        continue;
+                    }
+
+                    if debug {
+                        eprintln!(
+                            "collect_kernel_buffers: src.id={} is output/intermediate buffer (creating new)",
+                            src.id
+                        );
+                    }
                     // This is an output/intermediate buffer - allocate on the same device as input
                     let ptr_dtype = src.dtype();
                     let size = compute_buffer_size(ast, src)?;
@@ -372,10 +618,11 @@ fn collect_bound_ranges(ast: &Arc<UOp>) -> Result<Vec<BoundRange>> {
     let mut bound_outer_vars: HashSet<u64> = HashSet::new();
     for node in &nodes {
         if let Op::Bind { var, value } = node.op()
-            && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. }) {
-                // This DefineVar is bound to an OUTER range
-                bound_outer_vars.insert(var.id);
-            }
+            && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. })
+        {
+            // This DefineVar is bound to an OUTER range
+            bound_outer_vars.insert(var.id);
+        }
     }
 
     let mut bound_ranges = Vec::new();

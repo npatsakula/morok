@@ -84,12 +84,51 @@ impl Tensor {
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
 
-        // Link output buffer to this tensor's UOp for .buffer() access
+        // Get output buffer and its properties
         let output_buf = plan.output_buffer().clone();
+
+        // DEBUG: Verify output buffer contains correct data
+        if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
+            let mut debug_data = vec![0u8; output_buf.size()];
+            output_buf.copyout(&mut debug_data).expect("copyout failed");
+            eprintln!("realize: output_buf.id()={:?} raw_bytes={:?}", output_buf.id(), &debug_data);
+        }
+
+        let output_dtype = self.uop.dtype();
+        let output_device = output_buf.allocator().device_spec();
+        // Buffer::size() returns bytes, convert to element count
+        let num_elements = output_buf.size() / output_dtype.bytes();
+
+        // Create a new BUFFER UOp to represent the materialized data.
+        // This is critical: after realization, the tensor's UOp should be a BUFFER
+        // so that subsequent schedules know this tensor is already materialized
+        // and don't re-compute it.
+        let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype.clone());
+
+        // Register the output buffer under the new BUFFER UOp's ID
+        crate::buffer_registry::get_or_create_buffer(buffer_uop.id, || Ok(output_buf.clone()))?;
+
+        // Also register under the original base ID for backwards compatibility
+        // (e.g., if user called .clone() before realize and uses both)
         let base_id = self.uop.base().id;
         crate::buffer_registry::get_or_create_buffer(base_id, || Ok(output_buf))?;
 
-        Ok(Self { uop: self.uop.clone(), kernels: self.kernels })
+        // Get the tensor's shape and reshape the buffer to match
+        let shape = self.uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
+        let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
+
+        if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
+            eprintln!(
+                "realize: buffer_uop.id={} num_elements={} shape={:?} realized_uop.id={} realized_uop.base().id={}",
+                buffer_uop.id,
+                num_elements,
+                shape,
+                realized_uop.id,
+                realized_uop.base().id
+            );
+        }
+
+        Ok(Self { uop: realized_uop, kernels: self.kernels })
     }
 
     /// Prepare an execution plan for this tensor's computation graph.
@@ -158,7 +197,7 @@ impl Tensor {
 
         // DEBUG: Print post-rangeify IR
         if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-            morok_ir::uop::debug::print_ast(&rangeified, "POST-RANGEIFY AST", 15);
+            eprintln!("=== POST-RANGEIFY AST ===\n{}", rangeified.tree_full());
         }
 
         // Step 4: Run kernel splitting pipeline
@@ -166,15 +205,14 @@ impl Tensor {
 
         // DEBUG: Print post-kernel-split IR
         if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-            morok_ir::uop::debug::print_ast(&kernelized, "POST-KERNEL-SPLIT AST", 20);
+            eprintln!("=== POST-KERNEL-SPLIT AST ===\n{}", kernelized.tree_full());
         }
 
         // Step 5: Create schedule from kernels
         let schedule = crate::schedule::create_schedule(kernelized, kernel_ctx)?;
 
         // Step 6: Build execution plan (pass expected output dtype and size)
-        let output_size = shape.iter().map(|s| s.as_const().unwrap_or(1)).product::<usize>()
-            * output_dtype.bytes();
+        let output_size = shape.iter().map(|s| s.as_const().unwrap_or(1)).product::<usize>() * output_dtype.bytes();
         prepare_execution_plan(&schedule, output_dtype, output_size)
     }
 }
@@ -201,15 +239,14 @@ fn build_execution_graph(schedule: &[ScheduleItem]) -> ExecutionGraph {
         // Collect buffer IDs
         let all_buffer_ids: Vec<_> = item.buffers.iter().map(|b| b.id()).collect();
 
-        // Determine output indices (first buffer is typically output for computational kernels)
-        // For COPY operations, this will be handled differently
+        // Determine output indices by finding buffers written to by STORE ops
         let is_transfer = matches!(item.ast.op(), Op::Copy { .. });
         let output_indices = if is_transfer {
             // For COPY, destination is output
             vec![0usize]
         } else {
-            // For computational kernels, first DEFINE_GLOBAL is output
-            vec![0usize] // TODO: properly detect outputs from STORE ops
+            // For computational kernels, detect outputs from STORE operations
+            detect_output_indices(&item.kernel, &item.buffers)
         };
 
         // Split buffer IDs into inputs and outputs
@@ -220,8 +257,10 @@ fn build_execution_graph(schedule: &[ScheduleItem]) -> ExecutionGraph {
         // Create buffer access info for parallel execution
         let buffer_access = Some(KernelBufferAccess { buffers: all_buffer_ids, output_indices });
 
+        // Use kernel UOp ID for node ID since dependencies reference kernel IDs
+        // (from kernel_ctx.kernel_deps which uses kernel UOp IDs)
         let node = ExecutionNode {
-            id: item.ast.id,
+            id: item.kernel.id,
             device,
             inputs,
             outputs,
@@ -234,6 +273,87 @@ fn build_execution_graph(schedule: &[ScheduleItem]) -> ExecutionGraph {
     }
 
     graph
+}
+
+/// Detect output buffer indices by finding buffers written to by STORE operations.
+///
+/// Examines the kernel's AST to find STORE and STOREGATED operations, then
+/// identifies which buffers in the buffer list are written to.
+///
+/// # Arguments
+///
+/// * `kernel` - The KERNEL UOp containing the AST
+/// * `buffers` - The list of buffers for this kernel
+///
+/// # Returns
+///
+/// Indices into `buffers` for output buffers. Falls back to [0] if no outputs found.
+fn detect_output_indices(kernel: &Arc<UOp>, buffers: &[Buffer]) -> Vec<usize> {
+    use std::collections::HashSet;
+
+    let ast = match kernel.op() {
+        Op::Kernel { ast, .. } => ast,
+        _ => return vec![0], // Fallback if not a kernel
+    };
+
+    // Find all DefineGlobal IDs that are written to by STORE operations
+    let mut output_buffer_uop_ids: HashSet<u64> = HashSet::new();
+
+    for node in ast.toposort() {
+        match node.op() {
+            Op::Store { buffer, .. } | Op::StoreGated { buffer, .. } => {
+                // Get the buffer's DefineGlobal ID
+                let buf_id = match buffer.op() {
+                    Op::DefineGlobal(_) | Op::DefineLocal(_) => buffer.id,
+                    Op::Index { buffer: inner, .. } => {
+                        if matches!(inner.op(), Op::DefineGlobal(_) | Op::DefineLocal(_)) {
+                            inner.id
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                };
+                output_buffer_uop_ids.insert(buf_id);
+            }
+            _ => {}
+        }
+    }
+
+    // Now map UOp IDs to buffer indices
+    // The kernel sources have DefineGlobal UOps in a specific order, which corresponds
+    // to the buffer list order. We need to find which DefineGlobal IDs match.
+    let sources = match kernel.op() {
+        Op::Kernel { sources, .. } => sources,
+        _ => return vec![0],
+    };
+
+    let mut output_indices = Vec::new();
+    let mut buffer_idx = 0;
+    for src in sources {
+        match src.op() {
+            Op::DefineGlobal(_) | Op::DefineLocal(_) => {
+                if output_buffer_uop_ids.contains(&src.id) && buffer_idx < buffers.len() {
+                    output_indices.push(buffer_idx);
+                }
+                buffer_idx += 1;
+            }
+            Op::Buffer { .. } => {
+                // Input buffer - also consumes a buffer slot
+                if output_buffer_uop_ids.contains(&src.id) && buffer_idx < buffers.len() {
+                    output_indices.push(buffer_idx);
+                }
+                buffer_idx += 1;
+            }
+            Op::DefineVar { .. } | Op::Bind { .. } => {
+                // Variable - doesn't consume a buffer slot
+            }
+            _ => {}
+        }
+    }
+
+    // Fallback to first buffer if no outputs found
+    if output_indices.is_empty() && !buffers.is_empty() { vec![0] } else { output_indices }
 }
 
 /// Prepare an execution plan from a schedule.
@@ -256,9 +376,20 @@ fn build_execution_graph(schedule: &[ScheduleItem]) -> ExecutionGraph {
 /// # Errors
 ///
 /// Returns error if compilation or buffer allocation fails.
-fn prepare_execution_plan(schedule: &Schedule, expected_output_dtype: DType, expected_output_size: usize) -> Result<ExecutionPlan> {
+fn prepare_execution_plan(
+    schedule: &Schedule,
+    expected_output_dtype: DType,
+    expected_output_size: usize,
+) -> Result<ExecutionPlan> {
     // Expand the schedule to handle OUTER range iterations
     let expanded_schedule = expand_schedule(schedule.clone());
+
+    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+        eprintln!("prepare_execution_plan: expanded_schedule order:");
+        for (i, item) in expanded_schedule.iter().enumerate() {
+            eprintln!("  [{}] kernel={}, ast={}", i, item.kernel.id, item.ast.id);
+        }
+    }
 
     // Build execution graph for parallel group analysis
     let mut execution_graph = build_execution_graph(&expanded_schedule);
@@ -305,9 +436,6 @@ fn prepare_execution_plan(schedule: &Schedule, expected_output_dtype: DType, exp
         }
     }
 
-    // Track output buffer index (first buffer of first kernel is output)
-    let mut output_buffer_idx: Option<usize> = None;
-
     // Step 2: Compile all kernels and create PreparedKernel structures
     let mut prepared_kernels: Vec<PreparedKernel> = Vec::new();
 
@@ -316,47 +444,6 @@ fn prepare_execution_plan(schedule: &Schedule, expected_output_dtype: DType, exp
         if matches!(item.ast.op(), Op::Copy { .. }) {
             // TODO: Handle COPY operations in ExecutionPlan
             continue;
-        }
-
-        // Find output buffer: match by dtype and size, prefer highest buffer ID
-        // For fused kernels, the output is the last-created buffer with matching dtype/size
-        if output_buffer_idx.is_none() && !item.buffers.is_empty() {
-            // Find buffer with highest ID matching both dtype and size
-            let mut best_match: Option<(u64, usize)> = None;
-            for buf in &item.buffers {
-                if buf.dtype() == expected_output_dtype && buf.size() == expected_output_size {
-                    let buf_id = buf.id().0;
-                    if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
-                        if best_match.is_none() || buf_id > best_match.unwrap().0 {
-                            best_match = Some((buf_id, idx));
-                        }
-                    }
-                }
-            }
-            if let Some((_, idx)) = best_match {
-                output_buffer_idx = Some(idx);
-            }
-
-            // Fallback to first buffer with matching dtype
-            if output_buffer_idx.is_none() {
-                for buf in &item.buffers {
-                    if buf.dtype() == expected_output_dtype {
-                        let buf_id = buf.id().0;
-                        if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
-                            output_buffer_idx = Some(idx);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Fallback to first buffer
-            if output_buffer_idx.is_none() {
-                let first_buf_id = item.buffers[0].id().0;
-                if let Some(&idx) = buffer_id_to_idx.get(&first_buf_id) {
-                    output_buffer_idx = Some(idx);
-                }
-            }
         }
 
         // Step 1: Get device-aware optimizer renderer
@@ -405,8 +492,14 @@ fn prepare_execution_plan(schedule: &Schedule, expected_output_dtype: DType, exp
         if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
             eprintln!("DEBUG: Kernel AST id={} has {} buffers:", item.ast.id, item.buffers.len());
             for (i, buf) in item.buffers.iter().enumerate() {
-                eprintln!("  buf[{}]: Buffer.id={:?}, dtype={:?}, size={}, plan_idx={:?}",
-                    i, buf.id(), buf.dtype(), buf.size(), buffer_id_to_idx.get(&buf.id().0));
+                eprintln!(
+                    "  buf[{}]: Buffer.id={:?}, dtype={:?}, size={}, plan_idx={:?}",
+                    i,
+                    buf.id(),
+                    buf.dtype(),
+                    buf.size(),
+                    buffer_id_to_idx.get(&buf.id().0)
+                );
             }
         }
 
@@ -448,6 +541,82 @@ fn prepare_execution_plan(schedule: &Schedule, expected_output_dtype: DType, exp
         (0..num_prepared_kernels).map(|idx| ParallelGroup { kernel_indices: vec![idx] }).collect();
 
     builder.set_parallel_groups(parallel_groups);
+
+    // Find output buffer by scanning ALL kernels' buffers
+    // Search order: exact match (dtype + size), then dtype only, then first buffer
+    let mut output_buffer_idx: Option<usize> = None;
+
+    // Pass 1: Look for exact match (dtype AND size)
+    for item in &expanded_schedule {
+        if matches!(item.ast.op(), Op::Copy { .. }) {
+            continue;
+        }
+        for buf in &item.buffers {
+            if buf.dtype() == expected_output_dtype && buf.size() == expected_output_size {
+                let buf_id = buf.id().0;
+                if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
+                    // Prefer highest buffer ID (latest allocated)
+                    if output_buffer_idx.is_none() {
+                        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                            eprintln!(
+                                "DEBUG: Selected output buffer: buf_id={}, idx={}, dtype={:?}, size={}",
+                                buf_id, idx, expected_output_dtype, expected_output_size
+                            );
+                        }
+                        output_buffer_idx = Some(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 2: Fallback to dtype match only
+    if output_buffer_idx.is_none() {
+        for item in &expanded_schedule {
+            if matches!(item.ast.op(), Op::Copy { .. }) {
+                continue;
+            }
+            for buf in &item.buffers {
+                if buf.dtype() == expected_output_dtype {
+                    let buf_id = buf.id().0;
+                    if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
+                        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                            eprintln!(
+                                "DEBUG: Fallback1 output buffer (dtype match): buf_id={}, idx={}, dtype={:?}",
+                                buf_id,
+                                idx,
+                                buf.dtype()
+                            );
+                        }
+                        output_buffer_idx = Some(idx);
+                        break;
+                    }
+                }
+            }
+            if output_buffer_idx.is_some() {
+                break;
+            }
+        }
+    }
+
+    // Pass 3: Last resort - first buffer
+    if output_buffer_idx.is_none()
+        && let Some(first_item) = expanded_schedule.first()
+        && !first_item.buffers.is_empty()
+    {
+        let first_buf_id = first_item.buffers[0].id().0;
+        if let Some(&idx) = buffer_id_to_idx.get(&first_buf_id) {
+            if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+                eprintln!(
+                    "DEBUG: Fallback2 output buffer (first buffer): buf_id={}, idx={}, dtype={:?}",
+                    first_buf_id,
+                    idx,
+                    first_item.buffers[0].dtype()
+                );
+            }
+            output_buffer_idx = Some(idx);
+        }
+    }
 
     // Set output buffer
     if let Some(idx) = output_buffer_idx {

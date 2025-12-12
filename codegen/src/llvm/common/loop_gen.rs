@@ -111,9 +111,8 @@ pub fn close_loop<'ctx>(builder: &Builder<'ctx>, loop_ctx: &LoopContext<'ctx>) -
     // Compute increment HERE in footer block (ensures SSA dominance)
     let counter_val = loop_ctx.phi.as_basic_value().into_int_value();
     let one = counter_type.const_int(1, false);
-    let incremented = builder
-        .build_int_add(counter_val, one, &format!("i{}_next", loop_ctx.loop_id))
-        .context(ArithmeticSnafu)?;
+    let incremented =
+        builder.build_int_add(counter_val, one, &format!("i{}_next", loop_ctx.loop_id)).context(ArithmeticSnafu)?;
 
     // Add incoming edge to PHI: incremented value from footer
     loop_ctx.phi.add_incoming(&[(&incremented, loop_ctx.footer_block)]);
