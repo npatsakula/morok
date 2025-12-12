@@ -64,6 +64,13 @@ impl LlvmKernel {
             return Err(crate::Error::JitCompilation { reason: format!("Module verification failed: {}", err) });
         }
 
+        // Dump LLVM IR if requested
+        if std::env::var("MOROK_DUMP_LLVM").is_ok() {
+            eprintln!("=== LLVM IR for {} ===", name);
+            eprintln!("{}", module.print_to_string().to_string());
+            eprintln!("=== END LLVM IR ===");
+        }
+
         // Create execution engine with optimization
         let execution_engine = module.create_jit_execution_engine(OptimizationLevel::Aggressive).map_err(|e| {
             crate::Error::JitCompilation { reason: format!("Failed to create execution engine: {}", e) }

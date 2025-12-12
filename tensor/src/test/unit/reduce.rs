@@ -583,6 +583,7 @@ fn test_argmax_flatten_value() {
 // ========== Argmin Tests (from Tinygrad test_ops.py:1106-1122) ==========
 
 #[test]
+#[tracing_test::traced_test]
 fn test_argmin_value_1d() {
     let _guard = test_setup();
     let t = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);

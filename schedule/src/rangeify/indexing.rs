@@ -259,6 +259,14 @@ pub(crate) fn merge_consumer_ranges(
             continue;
         }
 
+        // Debug: show which ranges are being compared
+        debug!(
+            dim_idx = dim_idx,
+            range_ids = ?dim_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
+            range_ops = ?dim_ranges.iter().map(|r| format!("{:?}", r.op())).collect::<Vec<_>>(),
+            "merge_consumer_ranges: ranges differ at dimension"
+        );
+
         let indices: Vec<_> = dim_ranges.iter().map(|r| r.get_idx()).collect();
         let valids: Vec<_> = dim_ranges.iter().map(|r| r.get_valid()).collect();
 
@@ -375,6 +383,43 @@ fn assign_ranges(
 
         debug!(should_realize = ctx.should_realize(x), out_rngs_len = out_rngs.len(), "Output ranges computed");
 
+        // Check ending_ranges FIRST (before in_rngs computation)
+        // Tinygrad lines 224-234: ending_ranges realization happens BEFORE input ranges
+        // This is critical: in_rngs must be computed from the FINAL out_rngs after realization
+        let ending = ctx.get_ending_ranges(x);
+        if !ending.is_empty() {
+            debug!(
+                ending_count = ending.len(),
+                triggers_realization = matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x),
+                "Ending ranges detected (pre-in_rngs check)"
+            );
+        }
+        if !ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
+            if let Some(shape) = x.shape().ok().flatten() {
+                let realize_axes: Vec<usize> = (0..shape.len()).collect();
+
+                debug!(
+                    node_id = x.id,
+                    op = ?std::mem::discriminant(x.op()),
+                    ending_count = ending.len(),
+                    realize_axes = ?realize_axes,
+                    "REALIZATION TRIGGERED via ending_ranges (pre-in_rngs)"
+                );
+
+                // Clear ending_ranges after handling
+                ctx.clear_ending_ranges(x);
+
+                // Force realization on all axes
+                ctx.mark_realize(x, realize_axes.clone());
+
+                // Create new ranges for realized axes - in_rngs will be computed from these
+                out_rngs = shape.iter().map(|s| ctx.new_range_uncollapsed(s, AxisType::Loop)).collect();
+            } else {
+                ctx.clear_ending_ranges(x);
+            }
+        }
+
+        // NOW compute in_rngs from the FINAL out_rngs (after any realization updates)
         let in_rngs = match x.op() {
             Op::Reshape { src, .. }
             | Op::Permute { src, .. }
@@ -448,49 +493,6 @@ fn assign_ranges(
                     ending.extend(changed_ranges);
                     ctx.set_ending_ranges(x, ending);
                 }
-            }
-        }
-
-        // Check ending_ranges for REDUCE_AXIS and elementwise ops (Tinygrad lines 224-234)
-        // When there are ending_ranges, we force realization of ALL output axes.
-        // This matches Tinygrad's behavior with PCONTIG=0 (default):
-        //   if not (PCONTIG > 1) or any(...):  # With PCONTIG=0, this is always True
-        let ending = ctx.get_ending_ranges(x);
-        if !ending.is_empty() {
-            debug!(
-                ending_count = ending.len(),
-                triggers_realization = matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x),
-                "Ending ranges detected"
-            );
-        }
-        if !ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
-            // IMPORTANT: Use the op's actual output shape, not inherited out_rngs.
-            // For a scalar ReduceAxis (full reduction), the output is [] with no ranges.
-            // We must realize based on the actual output shape, not consumer-inherited ranges.
-            if let Some(shape) = x.shape().ok().flatten() {
-                let realize_axes: Vec<usize> = (0..shape.len()).collect();
-
-                debug!(
-                    node_id = x.id,
-                    op = ?std::mem::discriminant(x.op()),
-                    ending_count = ending.len(),
-                    realize_axes = ?realize_axes,
-                    "REALIZATION TRIGGERED via ending_ranges"
-                );
-
-                // Clear ending_ranges after handling
-                ctx.clear_ending_ranges(x);
-
-                // Force realization on all axes (even if empty for scalar output)
-                // This marks the op for BUFFERIZE wrapping
-                ctx.mark_realize(x, realize_axes.clone());
-
-                // Create new ranges for realized axes
-                // IMPORTANT: For realization, we need proper RANGE ops, not collapsed Const(0)
-                // Use new_range_uncollapsed to ensure we get actual Range UOps
-                out_rngs = shape.iter().map(|s| ctx.new_range_uncollapsed(s, AxisType::Loop)).collect();
-            } else {
-                ctx.clear_ending_ranges(x);
             }
         }
 
