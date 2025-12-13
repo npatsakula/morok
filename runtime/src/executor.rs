@@ -890,6 +890,24 @@ impl UnifiedExecutor {
                 })?;
             }
 
+            // DEBUG: Dump buffer contents after kernel execution
+            if std::env::var("MOROK_DEBUG_KERNEL_BUFFERS").is_ok() {
+                eprintln!("[KERNEL {}] After execution, buffer contents:", kernel.id);
+                for (i, (&ptr, &buf_id)) in kernel.buffer_ptrs.iter().zip(kernel.buffer_ids.iter()).enumerate() {
+                    let buf = &buffers[kernel.buffer_indices[i]];
+                    let elem_size = buf.dtype().bytes();
+                    let num_elems = buf.size() / elem_size;
+                    let show_elems = 5.min(num_elems);
+                    if buf.dtype().is_float() {
+                        let slice = unsafe { std::slice::from_raw_parts(ptr as *const f32, show_elems) };
+                        eprintln!("  buf[{}] (BufferId={:?}, f32): {:?}", i, buf_id, slice);
+                    } else {
+                        let slice = unsafe { std::slice::from_raw_parts(ptr as *const i32, show_elems) };
+                        eprintln!("  buf[{}] (BufferId={:?}, i32): {:?}", i, buf_id, slice);
+                    }
+                }
+            }
+
             // Signal completion
             if let Some(ctx) = self.contexts.get(&kernel.device) {
                 ctx.signal_completion(timeline);

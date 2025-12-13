@@ -46,7 +46,10 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
 
         if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
             eprintln!("[CODEGEN] Buffers: {:?}", buffers.iter().map(|b| b.id).collect::<Vec<_>>());
-            eprintln!("[CODEGEN] Variables: {:?}", variables.iter().map(|v| (v.id, format!("{:?}", v.op()))).collect::<Vec<_>>());
+            eprintln!(
+                "[CODEGEN] Variables: {:?}",
+                variables.iter().map(|v| (v.id, format!("{:?}", v.op()))).collect::<Vec<_>>()
+            );
         }
 
         // Create kernel function signature: void kernel(ptr %buf0, ..., i64 %var0, ...)
@@ -108,7 +111,13 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
             for node in &nodes {
                 match node.op() {
                     Op::Bind { var, value } => {
-                        eprintln!("  id={} BIND(var.id={}, value.id={} op={:?})", node.id, var.id, value.id, std::mem::discriminant(value.op()));
+                        eprintln!(
+                            "  id={} BIND(var.id={}, value.id={} op={:?})",
+                            node.id,
+                            var.id,
+                            value.id,
+                            std::mem::discriminant(value.op())
+                        );
                     }
                     Op::Range { axis_id, axis_type, .. } => {
                         eprintln!("  id={} RANGE(axis_id={:?}, type={:?})", node.id, axis_id, axis_type);

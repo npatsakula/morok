@@ -526,21 +526,13 @@ pub struct GraphRewriteOutput {
 /// apply_map_to_tensors(&result.becomes_map);
 /// ```
 #[allow(clippy::mutable_key_type)]
-pub fn graph_rewrite_with_map<C>(
-    matcher: &PatternMatcher<C>,
-    root: Arc<UOp>,
-    ctx: &mut C,
-) -> GraphRewriteOutput {
+pub fn graph_rewrite_with_map<C>(matcher: &PatternMatcher<C>, root: Arc<UOp>, ctx: &mut C) -> GraphRewriteOutput {
     let mut engine = RewriteEngine::new(matcher, ctx);
     let result_root = engine.rewrite(root.clone());
 
     // Extract becomes_map: only include entries where the result differs from original
-    let becomes_map: HashMap<UOpKey, Arc<UOp>> = engine
-        .results
-        .results
-        .into_iter()
-        .filter(|(k, v)| !Arc::ptr_eq(&k.0, v))
-        .collect();
+    let becomes_map: HashMap<UOpKey, Arc<UOp>> =
+        engine.results.results.into_iter().filter(|(k, v)| !Arc::ptr_eq(&k.0, v)).collect();
 
     GraphRewriteOutput { root: result_root, becomes_map }
 }
@@ -558,12 +550,8 @@ pub fn graph_rewrite_bottom_up_with_map<C>(
     let result_root = engine.rewrite(root.clone());
 
     // Extract becomes_map: only include entries where the result differs from original
-    let becomes_map: HashMap<UOpKey, Arc<UOp>> = engine
-        .results
-        .results
-        .into_iter()
-        .filter(|(k, v)| !Arc::ptr_eq(&k.0, v))
-        .collect();
+    let becomes_map: HashMap<UOpKey, Arc<UOp>> =
+        engine.results.results.into_iter().filter(|(k, v)| !Arc::ptr_eq(&k.0, v)).collect();
 
     GraphRewriteOutput { root: result_root, becomes_map }
 }

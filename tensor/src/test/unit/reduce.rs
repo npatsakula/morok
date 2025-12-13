@@ -492,9 +492,9 @@ fn test_argmax_full_steps() {
     // Step 4: Create descending indices [5, 4, 3, 2, 1]
     let axis_size = 5;
     let indices = Tensor::arange(axis_size as i64, Some(0), Some(-1)).unwrap();
-    let indices_realized = indices.clone().realize().unwrap().to_ndarray::<i64>().unwrap();
+    let indices_realized = indices.clone().realize().unwrap().to_ndarray::<i32>().unwrap();
     println!("Step 4 - Descending indices: {:?}", indices_realized.as_slice().unwrap());
-    assert_eq!(indices_realized.as_slice().unwrap(), &[5, 4, 3, 2, 1], "Indices mismatch");
+    assert_eq!(indices_realized.as_slice().unwrap(), &[5i32, 4, 3, 2, 1], "Indices mismatch");
 
     // Step 5: Cast to int32
     let mask_int = mask.cast(DType::Int32).unwrap();
@@ -780,4 +780,61 @@ fn test_min_single_element_value() {
     let t = Tensor::from_slice([42.0f32]);
     let result = realize_f32(t.min(()).unwrap());
     assert_close_f32(&result, &[42.0], 1e-6);
+}
+
+#[test]
+fn test_debug_argmin_intermediate() {
+    let _guard = test_setup();
+    let values = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
+
+    // Test neg first - does it produce correct values?
+    let inverted = -values.clone();
+    let inv_arr = realize_f32(inverted);
+    println!("Negated values: {:?}", inv_arr.as_slice().unwrap());
+    // Expected: [-5.0, -3.0, -1.0, -4.0, -2.0]
+    assert_close_f32(&inv_arr, &[-5.0, -3.0, -1.0, -4.0, -2.0], 1e-6);
+
+    // Test max of explicit negated (should be -1.0)
+    let inverted2 = Tensor::from_slice([-5.0f32, -3.0, -1.0, -4.0, -2.0]);
+    let max_inv = inverted2.max_with().axes(0).keepdim(false).call().unwrap();
+    let max_arr = realize_f32(max_inv);
+    println!("Max of explicit negated: {:?}", max_arr.as_slice().unwrap());
+    assert_close_f32(&max_arr, &[-1.0], 1e-6);
+
+    // Test argmax of explicit negated values
+    let inverted3 = Tensor::from_slice([-5.0f32, -3.0, -1.0, -4.0, -2.0]);
+    let argmax_inv = inverted3.argmax(0).unwrap();
+    let argmax_arr = realize_i32(argmax_inv);
+    println!("Argmax of explicit negated: {:?}", argmax_arr.as_slice().unwrap());
+    assert_eq!(argmax_arr.as_slice().unwrap()[0], 2); // -1.0 is at index 2
+}
+
+#[test]
+#[traced_test]
+fn test_debug_lazy_neg_max() {
+    let _guard = test_setup();
+    let values = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
+
+    // Test max of lazy negated values
+    let inverted = -values.clone(); // lazy neg
+    let max_lazy = inverted.max(()).unwrap();
+    let max_arr = realize_f32(max_lazy);
+    println!("Max of LAZY negated: {:?}", max_arr.as_slice().unwrap());
+    // Should be -1.0 (max of [-5, -3, -1, -4, -2])
+    assert_close_f32(&max_arr, &[-1.0], 1e-6);
+}
+
+#[test]
+#[traced_test]
+fn test_debug_lazy_neg_argmax() {
+    let _guard = test_setup();
+    let values = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
+
+    // Chain neg and argmax LAZILY (like argmin does internally)
+    let inverted = -values; // lazy neg
+    let argmax_lazy = inverted.argmax(0).unwrap(); // lazy argmax of lazy neg
+    let argmax_arr = realize_i32(argmax_lazy);
+    println!("Argmax of LAZY negated: {:?}", argmax_arr.as_slice().unwrap());
+    // Should be 2 (index of -1.0, which is the max of [-5, -3, -1, -4, -2])
+    assert_eq!(argmax_arr.as_slice().unwrap()[0], 2);
 }

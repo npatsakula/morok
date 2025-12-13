@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, ReduceOp, UOp, UOpKey};
+use morok_ir::{AddrSpace, BufferizeOpts, ConstValue, DType, Op, ReduceOp, UOp, UOpKey};
 use smallvec::SmallVec;
 
 use super::context::RangeifyContext;
@@ -189,6 +189,9 @@ pub(crate) fn transform_single_source(
         src.op(),
         Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
     ) {
+        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+            eprintln!("[CASE1] Buffer-like: src id={}", src.id);
+        }
         return UOp::index(Arc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for buffer source");
     }
 
@@ -197,6 +200,9 @@ pub(crate) fn transform_single_source(
     // We apply movement op transformation here directly (like Tinygrad's apply_movement_op)
     // Then recursively call transform_single_source to let the appropriate case handle the inner source
     if src.op().is_movement() {
+        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+            eprintln!("[CASE1.5] Movement: src id={}", src.id);
+        }
         use super::indexing::apply_movement_op;
 
         // Get the inner source of the movement op
@@ -214,14 +220,22 @@ pub(crate) fn transform_single_source(
 
         // Fallback: if we can't get shape, create INDEX on the movement chain
         // (will be handled by pattern matcher later)
-        return UOp::index(Arc::clone(src), input_ranges.to_vec())
-            .expect("Failed to create INDEX for movement source");
+        return UOp::index(Arc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for movement source");
     }
 
     // Check for REDUCE op that might have been converted from ReduceAxis
     // During graph rewrite, ReduceAxis is converted to REDUCE but realize_map was keyed on ReduceAxis
     // We need to handle both cases
     let realize_axes_opt = ctx.get_realize_axes(src).cloned();
+
+    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+        eprintln!(
+            "[REALIZE_CHECK] src id={} op={:?} has_realize_axes={}",
+            src.id,
+            std::mem::discriminant(src.op()),
+            realize_axes_opt.is_some()
+        );
+    }
 
     tracing::debug!(
         src_id = src.id,
@@ -233,10 +247,16 @@ pub(crate) fn transform_single_source(
 
     // Case 2: Source needs realization → wrap in BUFFERIZE + INDEX
     if let Some(ref realize_axes) = realize_axes_opt {
+        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+            eprintln!("[CASE2] src id={} has realize_axes={:?}", src.id, realize_axes);
+        }
         // Check if ANY source of this node is also marked for realization
         // If so, skip wrapping here - the inner source should be wrapped first
         for inner_src in src.op().sources() {
             if ctx.should_realize(&inner_src) {
+                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                    eprintln!("[CASE2] SKIP: src id={} inner_src id={} also needs realization", src.id, inner_src.id);
+                }
                 tracing::debug!(
                     src_id = src.id,
                     inner_src_id = inner_src.id,
@@ -269,20 +289,14 @@ pub(crate) fn transform_single_source(
 
         let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges, opts);
 
-        // Convert REDUCE ranges to LOOP ranges (Tinygrad rangeify.py:286)
-        // When materializing a reduction, the iteration loop becomes a regular LOOP, not REDUCE.
+        // Use input ranges AS-IS (Tinygrad indexing.py:78)
+        // Do NOT convert Reduce→Loop here - that only happens in limit_bufs for buffer overflow.
+        // REDUCE consumers need Reduce-type ranges to share the same loop counter with their source INDEX.
         let index_ranges: Vec<_> = input_ranges
             .iter()
             .enumerate()
             .filter(|(i, _)| realize_axes.contains(i))
-            .map(|(_, r)| {
-                if let Op::Range { end, axis_type: AxisType::Reduce, .. } = r.op() {
-                    // Convert REDUCE range to LOOP range with new axis ID
-                    ctx.new_range_from_uop(end, AxisType::Loop)
-                } else {
-                    Arc::clone(r)
-                }
-            })
+            .map(|(_, r)| Arc::clone(r))
             .collect();
 
         if !index_ranges.is_empty() {
@@ -292,7 +306,53 @@ pub(crate) fn transform_single_source(
         }
     }
 
+    // Case 4: Intermediate compute op (Unary, Binary, etc.) → recursively transform sources
+    // This ensures that when REDUCE → Unary(Neg) → Buffer, the Buffer gets INDEX
+    // Aligns with Tinygrad's approach where patterns run on ALL nodes
+    if matches!(src.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. }) {
+        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+            eprintln!(
+                "[CASE4] transform_single_source: compute op src id={} op={:?}, recursively transforming {} sources",
+                src.id,
+                std::mem::discriminant(src.op()),
+                src.op().sources().len()
+            );
+        }
+        let inner_sources = src.op().sources();
+        let mut new_inner_sources = Vec::with_capacity(inner_sources.len());
+        let mut any_changed = false;
+
+        for inner_src in inner_sources.iter() {
+            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                eprintln!("[CASE4]   inner_src id={} op={:?}", inner_src.id, std::mem::discriminant(inner_src.op()));
+            }
+            let transformed = transform_single_source(_consumer, inner_src, input_ranges, ctx);
+            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                eprintln!(
+                    "[CASE4]   transformed id={} op={:?} changed={}",
+                    transformed.id,
+                    std::mem::discriminant(transformed.op()),
+                    !Arc::ptr_eq(&transformed, inner_src)
+                );
+            }
+            if !Arc::ptr_eq(&transformed, inner_src) {
+                any_changed = true;
+            }
+            new_inner_sources.push(transformed);
+        }
+
+        if any_changed {
+            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                eprintln!("[CASE4] rebuilding src id={} with new sources", src.id);
+            }
+            return src.with_sources(new_inner_sources);
+        }
+    }
+
     // Case 3: No transformation needed
+    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+        eprintln!("[CASE3] No transformation: src id={}", src.id);
+    }
     Arc::clone(src)
 }
 

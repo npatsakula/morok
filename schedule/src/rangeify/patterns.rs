@@ -44,6 +44,7 @@ fn is_scalar_shape(shape: &Arc<UOp>) -> bool {
 }
 
 /// Check if an op is cheap to inline (no buffering needed).
+/// Note: Unary ops are excluded because they need buffering when feeding into reductions.
 pub fn is_cheap_to_inline(op: &Op) -> bool {
     matches!(
         op,
@@ -56,7 +57,7 @@ pub fn is_cheap_to_inline(op: &Op) -> bool {
             | Op::DefineReg { .. }
             | Op::VConst { .. }
             // Simple operations - cheap to recompute
-            | Op::Unary(..)
+            // Note: Op::Unary excluded - needs buffering for reduce sources
             | Op::Binary(..)
             | Op::Ternary(..)
             | Op::Cast { .. }
@@ -169,6 +170,19 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
 
     let src = x.op().sources().first()?.clone();
 
+    // Tinygrad pattern: explicit buffer-like check, separate from realize_map
+    // See tinygrad/schedule/indexing.py:61-62
+    // Buffer sources aren't in realize_map (they're pre-existing, not computed)
+    // So we need to add INDEX directly when the movement op is in range_map
+    if matches!(
+        src.op(),
+        Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
+    ) {
+        // Use movement op's input ranges (from range_map, like Tinygrad's ctx.range_map[x][0])
+        let (input_ranges, _) = ctx.get_ranges(x)?;
+        return UOp::index(src, input_ranges.clone()).ok();
+    }
+
     // DEBUG: Trace movement op removal
     if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
         eprintln!(
@@ -235,12 +249,8 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
         let src_output = src_ranges.map(|(_, o)| o.clone())?;
 
         // Closed ranges are source's output ranges at realized axes
-        let closed_ranges: Vec<_> = src_output
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| axes.contains(i))
-            .map(|(_, r)| Arc::clone(r))
-            .collect();
+        let closed_ranges: Vec<_> =
+            src_output.iter().enumerate().filter(|(i, _)| axes.contains(i)).map(|(_, r)| Arc::clone(r)).collect();
 
         let opts = if src_output.len() == axes.len() {
             BufferizeOpts { device: None, addrspace: AddrSpace::Global }
@@ -252,7 +262,9 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
         if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
             eprintln!(
                 "[REMOVE_MOVEMENT] axes={:?} closed_ranges.len()={} input_ranges.len()={}",
-                axes, closed_ranges.len(), input_ranges.len()
+                axes,
+                closed_ranges.len(),
+                input_ranges.len()
             );
             // Show what src actually wraps
             let src_sources = src.op().sources();
@@ -266,36 +278,21 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
 
         let bufferized = UOp::bufferize(src.clone(), closed_ranges, opts);
 
-        // Index ranges: movement op's input ranges at realized axes
-        // Convert REDUCE ranges to LOOP ranges when materializing
-        let index_ranges: Vec<_> = input_ranges
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| axes.contains(i))
-            .map(|(_, r)| {
-                if let Op::Range { end, axis_type: AxisType::Reduce, .. } = r.op() {
-                    ctx.new_range_from_uop(end, AxisType::Loop)
-                } else {
-                    Arc::clone(r)
-                }
-            })
-            .collect();
+        // Use input ranges AS-IS (Tinygrad indexing.py:78)
+        // Do NOT convert Reduce→Loop here - that only happens in limit_bufs for buffer overflow.
+        // REDUCE consumers need Reduce-type ranges to share the same loop counter with their source INDEX.
+        let index_ranges: Vec<_> =
+            input_ranges.iter().enumerate().filter(|(i, _)| axes.contains(i)).map(|(_, r)| Arc::clone(r)).collect();
 
         // DEBUG
         if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-            eprintln!(
-                "[REMOVE_MOVEMENT] index_ranges.len()={} bufferized_id={}",
-                index_ranges.len(), bufferized.id
-            );
+            eprintln!("[REMOVE_MOVEMENT] index_ranges.len()={} bufferized_id={}", index_ranges.len(), bufferized.id);
         }
 
         if !index_ranges.is_empty() {
             let result = UOp::index(bufferized.clone(), index_ranges);
             if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                eprintln!(
-                    "[REMOVE_MOVEMENT] Returning INDEX result={:?}",
-                    result.as_ref().map(|r| r.id)
-                );
+                eprintln!("[REMOVE_MOVEMENT] Returning INDEX result={:?}", result.as_ref().map(|r| r.id));
             }
             return result.ok();
         } else {
@@ -353,6 +350,14 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
         .collect();
 
     if reduce_ranges.is_empty() {
+        // Transfer range context to src since we're returning it instead of REDUCE
+        // Without this, get_ranges(src) will return None in subsequent patterns
+        ctx.set_ranges(src, input_ranges.clone(), output_ranges.clone());
+        let ending = ctx.get_ending_ranges(x);
+        ctx.set_ending_ranges(src, ending);
+        if let Some(axes) = ctx.get_realize_axes(x).cloned() {
+            ctx.mark_realize(src, axes);
+        }
         return Some(Arc::clone(src));
     }
 
@@ -737,10 +742,7 @@ pub fn linearize_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
                 }
             })
             .collect();
-        eprintln!(
-            "[LINEARIZE] idx.id={} indices={:?} dims={:?} strides={:?}",
-            idx.id, indices_str, dims, strides
-        );
+        eprintln!("[LINEARIZE] idx.id={} indices={:?} dims={:?} strides={:?}", idx.id, indices_str, dims, strides);
     }
 
     let mut linear = UOp::index_const(0);

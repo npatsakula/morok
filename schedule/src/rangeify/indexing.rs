@@ -446,7 +446,11 @@ fn assign_ranges(
                         let out_shape = x.shape()?;
                         eprintln!(
                             "[REDUCEAXIS DEBUG] id={} axes={:?} in_shape.len={} out_shape.len={:?} out_rngs.len={}",
-                            x.id, axes, in_shape.len(), out_shape.as_ref().map(|s| s.len()), out_rngs.len()
+                            x.id,
+                            axes,
+                            in_shape.len(),
+                            out_shape.as_ref().map(|s| s.len()),
+                            out_rngs.len()
                         );
                         for (idx, rng) in out_rngs.iter().enumerate() {
                             // Print full op for detailed analysis
@@ -454,7 +458,13 @@ fn assign_ranges(
                                 Op::Binary(binop, a, b) => {
                                     eprintln!(
                                         "[REDUCEAXIS DEBUG] out_rngs[{}]: id={} Binary({:?}, a.id={} a.op={:?}, b.id={} b.op={:?})",
-                                        idx, rng.id, binop, a.id, std::mem::discriminant(a.op()), b.id, std::mem::discriminant(b.op())
+                                        idx,
+                                        rng.id,
+                                        binop,
+                                        a.id,
+                                        std::mem::discriminant(a.op()),
+                                        b.id,
+                                        std::mem::discriminant(b.op())
                                     );
                                 }
                                 Op::Range { axis_id, axis_type, .. } => {
@@ -466,7 +476,9 @@ fn assign_ranges(
                                 _ => {
                                     eprintln!(
                                         "[REDUCEAXIS DEBUG] out_rngs[{}]: id={} op={:?}",
-                                        idx, rng.id, std::mem::discriminant(rng.op())
+                                        idx,
+                                        rng.id,
+                                        std::mem::discriminant(rng.op())
                                     );
                                 }
                             }
@@ -480,10 +492,7 @@ fn assign_ranges(
                         } else if i < out_rngs.len() {
                             rngs.push(Arc::clone(&out_rngs[i]));
                             if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                                eprintln!(
-                                    "[REDUCEAXIS DEBUG] i={} using out_rngs[{}] id={}",
-                                    i, i, out_rngs[i].id
-                                );
+                                eprintln!("[REDUCEAXIS DEBUG] i={} using out_rngs[{}] id={}", i, i, out_rngs[i].id);
                             }
                         } else {
                             rngs.push(ctx.new_range(s, AxisType::Loop));
@@ -665,12 +674,21 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
 
             for (shape_dim, rng) in new_shape_vals.iter().zip(rngs.iter()).rev() {
                 if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                    eprintln!("[RESHAPE FLATTEN] shape_dim={:?}, rng.id={}, rng.op={:?}", shape_dim, rng.id, std::mem::discriminant(rng.op()));
+                    eprintln!(
+                        "[RESHAPE FLATTEN] shape_dim={:?}, rng.id={}, rng.op={:?}",
+                        shape_dim,
+                        rng.id,
+                        std::mem::discriminant(rng.op())
+                    );
                     eprintln!("[RESHAPE FLATTEN] acc before mul: {:?}", acc.op());
                 }
                 let weighted = acc.try_mul(rng).unwrap();
                 if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                    eprintln!("[RESHAPE FLATTEN] weighted.id={}, weighted.op={:?}", weighted.id, std::mem::discriminant(weighted.op()));
+                    eprintln!(
+                        "[RESHAPE FLATTEN] weighted.id={}, weighted.op={:?}",
+                        weighted.id,
+                        std::mem::discriminant(weighted.op())
+                    );
                 }
                 axes_in.push(weighted);
                 acc = match shape_dim {
@@ -696,9 +714,9 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             // Apply range-based simplification:
             //   x % n → x when 0 <= vmin(x) && vmax(x) < n
             //   x / n → 0 when 0 <= vmin(x) && vmax(x) < n
+            use morok_ir::types::ConstValue;
             use morok_ir::uop::cached_property::CachedProperty;
             use morok_ir::uop::properties::VminVmaxProperty;
-            use morok_ir::types::ConstValue;
 
             fn simplify_mod(x: &Arc<UOp>, n: i64) -> Arc<UOp> {
                 let (vmin, vmax) = VminVmaxProperty::get(x);
@@ -977,7 +995,7 @@ pub fn is_cheap_to_inline(op: &Op) -> bool {
             | Op::DefineVar { .. }
             | Op::DefineReg { .. }
             | Op::VConst { .. }
-            | Op::Unary(..)
+            // Note: Op::Unary excluded - needs buffering for reduce sources
             | Op::Binary(..)
             | Op::Ternary(..)
             | Op::Cast { .. }
