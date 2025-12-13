@@ -68,7 +68,7 @@ fn test_argmax_1d_basic() {
     // Max value 5.0 is at index 3
     let result_shape = result.shape().unwrap();
     assert_eq!(result_shape.len(), 0); // Scalar result
-    assert_eq!(result.uop.dtype(), DType::Int32);
+    assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn test_argmax_1d_ties_first_occurrence() {
     let t = Tensor::from_slice([1.0f32, 5.0, 3.0, 5.0, 2.0]);
     let result = t.argmax(Some(0)).unwrap();
     // Two maxima at indices 1 and 3, should return 1 (first)
-    assert_eq!(result.uop.dtype(), DType::Int32);
+    assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn test_argmin_1d_basic() {
     let t = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
     let result = t.argmin(Some(0)).unwrap();
     // Min value 1.0 is at index 2
-    assert_eq!(result.uop.dtype(), DType::Int32);
+    assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn test_argmin_float() {
     let t = Tensor::from_slice([1.5f32, -2.3, 0.5, 1.0]);
     let result = t.argmin(Some(0)).unwrap();
     // Min is -2.3 at index 1
-    assert_eq!(result.uop.dtype(), DType::Int32);
+    assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn test_argmin_int() {
     let t = Tensor::from_slice([5i32, 3, 1, 4, 2]);
     let result = t.argmin(Some(0)).unwrap();
     // Min is 1 at index 2
-    assert_eq!(result.uop.dtype(), DType::Int32);
+    assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn test_argmin_bool() {
     let t = Tensor::from_slice([true, false, true]);
     let result = t.argmin(Some(0)).unwrap();
     // Min (false) at index 1
-    assert_eq!(result.uop.dtype(), DType::Int32);
+    assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
 // ========== Any Tests ==========
@@ -170,7 +170,7 @@ fn test_any_all_true() {
     let t = Tensor::from_slice([true, true, true]);
     let result = t.any(()).unwrap();
     // Should be true
-    assert_eq!(result.uop.dtype(), DType::Bool);
+    assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn test_any_all_false() {
     let t = Tensor::from_slice([false, false, false]);
     let result = t.any(()).unwrap();
     // Should be false
-    assert_eq!(result.uop.dtype(), DType::Bool);
+    assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn test_any_mixed() {
     let t = Tensor::from_slice([false, true, false]);
     let result = t.any(()).unwrap();
     // Should be true
-    assert_eq!(result.uop.dtype(), DType::Bool);
+    assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
 #[test]
@@ -194,7 +194,7 @@ fn test_any_numeric() {
     let t = Tensor::from_slice([0.0f32, 1.0, 0.0]);
     let result = t.any(()).unwrap();
     // Non-zero treated as true, should be true
-    assert_eq!(result.uop.dtype(), DType::Bool);
+    assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn test_all_all_true() {
     let t = Tensor::from_slice([true, true, true]);
     let result = t.all(()).unwrap();
     // Should be true
-    assert_eq!(result.uop.dtype(), DType::Bool);
+    assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
 #[test]
@@ -243,7 +243,7 @@ fn test_all_one_false() {
     let t = Tensor::from_slice([true, false, true]);
     let result = t.all(()).unwrap();
     // Should be false
-    assert_eq!(result.uop.dtype(), DType::Bool);
+    assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
 #[test]
@@ -251,7 +251,7 @@ fn test_all_numeric() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let result = t.all(()).unwrap();
     // All non-zero, should be true
-    assert_eq!(result.uop.dtype(), DType::Bool);
+    assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn test_all_numeric_with_zero() {
     let t = Tensor::from_slice([1.0f32, 0.0, 3.0]);
     let result = t.all(()).unwrap();
     // Has zero, should be false
-    assert_eq!(result.uop.dtype(), DType::Bool);
+    assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn test_all_2d_multiaxis() {
     let t = Tensor::from_slice([true, true, true, true]).try_reshape(&[2, 2]).unwrap();
     let result = t.all(()).unwrap();
     // All true across all axes
-    assert_eq!(result.uop.dtype(), DType::Bool);
+    assert_eq!(result.uop().dtype(), DType::Bool);
 }
 
 // ========== Edge Cases ==========
@@ -277,7 +277,7 @@ fn test_argmax_single_element() {
     let t = Tensor::from_slice([42.0f32]);
     let result = t.argmax(Some(0)).unwrap();
     // Only element, index should be 0
-    assert_eq!(result.uop.dtype(), DType::Int32);
+    assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
 #[test]
@@ -285,7 +285,7 @@ fn test_argmax_all_equal() {
     let t = Tensor::from_slice([5.0f32, 5.0, 5.0, 5.0]);
     let result = t.argmax(Some(0)).unwrap();
     // All equal, should return first index (0)
-    assert_eq!(result.uop.dtype(), DType::Int32);
+    assert_eq!(result.uop().dtype(), DType::Int32);
 }
 
 // ============================================================================
@@ -437,7 +437,7 @@ fn test_argmax_debug_steps() {
     let c = Tensor::from_slice([1.0f32, 2.0, 3.0, 2.0]);
     let two = Tensor::from_slice([2.0f32]);
     let two_broadcast = two.try_expand(&[4]).unwrap();
-    println!("two_broadcast shape={:?}", two_broadcast.uop.shape());
+    println!("two_broadcast shape={:?}", two_broadcast.uop().shape());
     let eq2 = c.try_eq(&two_broadcast).unwrap();
     let eq2_result = eq2.realize().unwrap().to_ndarray::<bool>().unwrap();
     println!(
@@ -450,7 +450,7 @@ fn test_argmax_debug_steps() {
     // Test expand of reduction result
     let d = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0]);
     let d_max = d.max_with().axes(0).keepdim(true).call().unwrap();
-    println!("d_max shape={:?}", d_max.uop.shape());
+    println!("d_max shape={:?}", d_max.uop().shape());
 
     // Realize d_max first - IMPORTANT: use the realized tensor for subsequent ops
     // In Rust, tensor.clone().realize() creates a new independent tensor.
@@ -461,10 +461,10 @@ fn test_argmax_debug_steps() {
 
     // Use the REALIZED d_max for expansion
     let d_max_expanded = d_max_realized.try_expand(&[4]).unwrap();
-    println!("d_max_expanded shape={:?}", d_max_expanded.uop.shape());
+    println!("d_max_expanded shape={:?}", d_max_expanded.uop().shape());
 
     let eq3 = d.try_eq(&d_max_expanded).unwrap();
-    eprintln!("=== EQ3 AST ===\n{}", eq3.uop.tree_full());
+    eprintln!("=== EQ3 AST ===\n{}", eq3.uop().tree_full());
     let eq3_result = eq3.realize().unwrap().to_ndarray::<bool>().unwrap();
     println!("Reduction expand eq: d=[1,5,3,2], d_max=5, eq={:?}", eq3_result.as_slice().unwrap());
     // Expected: [false, true, false, false] (only position 1 equals 5)
@@ -481,7 +481,7 @@ fn test_argmax_full_steps() {
 
     // Step 2: expand max to original shape
     let max_broadcast = max_vals.try_expand(&[5]).unwrap();
-    println!("max_broadcast shape={:?}", max_broadcast.uop.shape());
+    println!("max_broadcast shape={:?}", max_broadcast.uop().shape());
 
     // Step 3: mask where values == max
     let mask = t.try_eq(&max_broadcast).unwrap();

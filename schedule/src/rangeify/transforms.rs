@@ -33,51 +33,95 @@ pub fn rangeify(
     sink: Arc<UOp>,
     pcontig_config: Option<&super::kernel::PcontigConfig>,
 ) -> morok_ir::Result<(Arc<UOp>, RangeifyContext)> {
+    let result = rangeify_with_map(sink, pcontig_config)?;
+    Ok((result.sink, result.context))
+}
+
+/// Result of rangeify transformation including the substitution map.
+pub struct RangeifyResult {
+    /// The transformed sink node
+    pub sink: Arc<UOp>,
+    /// Context with range information
+    pub context: RangeifyContext,
+    /// Maps original UOps to their transformed versions (for global substitution)
+    pub becomes_map: HashMap<UOpKey, Arc<UOp>>,
+}
+
+/// Main rangeify transformation entry point with becomes_map tracking.
+///
+/// Like `rangeify`, but also returns a `becomes_map` that tracks which
+/// original nodes were transformed. This is essential for global graph
+/// coordination when multiple tensors share subgraphs.
+#[allow(clippy::mutable_key_type)]
+pub fn rangeify_with_map(
+    sink: Arc<UOp>,
+    pcontig_config: Option<&super::kernel::PcontigConfig>,
+) -> morok_ir::Result<RangeifyResult> {
+    use morok_ir::rewrite::{graph_rewrite_bottom_up_with_map, graph_rewrite_with_map};
+
+    // Aggregate all becomes_maps from rewrite passes
+    let mut all_becomes: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+
     // Step 1: Run range assignment to build IndexingContext
     let (mut sink, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
 
     // Step 2: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
     let early_matcher = super::patterns::early_rewrites();
-    sink = crate::rewrite::graph_rewrite_bottom_up(&early_matcher, sink, &mut ());
+    let result = graph_rewrite_bottom_up_with_map(&early_matcher, sink, &mut ());
+    sink = result.root;
+    all_becomes.extend(result.becomes_map);
 
     // Step 3: Apply core rangeify transformation (bottom-up)
     // This includes: bufferize transform, movement op removal, ReduceAxis → REDUCE conversion
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
-    sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, sink, &mut indexing_ctx);
+    let result = graph_rewrite_bottom_up_with_map(&rangeify_matcher, sink, &mut indexing_ctx);
+    sink = result.root;
+    all_becomes.extend(result.becomes_map);
 
     // Step 4: Buffer simplification
     let buffer_simplify = super::patterns::buffer_folding() + super::patterns::dead_axis_removal();
-    sink = crate::rewrite::graph_rewrite(&buffer_simplify, sink, &mut ());
+    let result = graph_rewrite_with_map(&buffer_simplify, sink, &mut ());
+    sink = result.root;
+    all_becomes.extend(result.becomes_map);
 
     // Step 4.5: Apply early rewrites again for RESHAPE to scalar
-    sink = crate::rewrite::graph_rewrite_bottom_up(&early_matcher, sink, &mut ());
+    let result = graph_rewrite_bottom_up_with_map(&early_matcher, sink, &mut ());
+    sink = result.root;
+    all_becomes.extend(result.becomes_map);
 
     // Step 5: Cost-based buffer removal with partial contiguous
     let mut pcontig = pcontig_config.cloned().unwrap_or_default();
     let buffer_removal_matcher = super::patterns::buffer_removal_with_pcontig();
     sink = apply_buffer_removal_protecting_sink(&sink, &buffer_removal_matcher, &mut pcontig);
+    // Note: apply_buffer_removal_protecting_sink doesn't use _with_map yet, could add later
 
     // Step 6: Symbolic simplification
     let symbolic_matcher = crate::symbolic::symbolic_simple();
-    sink = crate::rewrite::graph_rewrite(&symbolic_matcher, sink, &mut ());
+    let result = graph_rewrite_with_map(&symbolic_matcher, sink, &mut ());
+    sink = result.root;
+    all_becomes.extend(result.becomes_map);
 
     // Step 6.5: Buffer limit enforcement
     if let Some(device) = super::patterns::extract_device_from_graph(&sink)
         && let Some(limit) = device.max_buffers()
     {
         let limit_matcher = super::patterns::buffer_limit_patterns(limit);
-        sink = crate::rewrite::graph_rewrite(&limit_matcher, sink, &mut ());
+        let result = graph_rewrite_with_map(&limit_matcher, sink, &mut ());
+        sink = result.root;
+        all_becomes.extend(result.becomes_map);
     }
 
     // Step 7: Reduction simplifications
     let mut split_config = super::kernel::SplitReduceOpConfig::default();
     let reduction_matcher = super::patterns::reduction_simplify_patterns();
-    sink = crate::rewrite::graph_rewrite(&reduction_matcher, sink, &mut split_config);
+    let result = graph_rewrite_with_map(&reduction_matcher, sink, &mut split_config);
+    sink = result.root;
+    all_becomes.extend(result.becomes_map);
 
     // Step 8: Build RangeifyContext for return
     let rangeify_ctx = RangeifyContext { range_counter: indexing_ctx.range_counter(), range_map: HashMap::new() };
 
-    Ok((sink, rangeify_ctx))
+    Ok(RangeifyResult { sink, context: rangeify_ctx, becomes_map: all_becomes })
 }
 
 // ============================================================================
@@ -185,6 +229,20 @@ pub(crate) fn transform_single_source(
 
     // Case 2: Source needs realization → wrap in BUFFERIZE + INDEX
     if let Some(ref realize_axes) = realize_axes_opt {
+        // Check if ANY source of this node is also marked for realization
+        // If so, skip wrapping here - the inner source should be wrapped first
+        for inner_src in src.op().sources() {
+            if ctx.should_realize(&inner_src) {
+                tracing::debug!(
+                    src_id = src.id,
+                    inner_src_id = inner_src.id,
+                    "transform_single_source: SKIPPING, inner source also needs realization"
+                );
+                // Return the source as-is - inner source will be wrapped when accessed
+                return Arc::clone(src);
+            }
+        }
+
         tracing::debug!(
             src_id = src.id,
             realize_axes = ?realize_axes,

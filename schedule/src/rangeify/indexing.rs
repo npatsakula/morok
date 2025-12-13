@@ -100,6 +100,12 @@ impl IndexingContext {
         self.realize_map.get(&UOpKey(Arc::clone(uop))).and_then(|opt| opt.as_ref())
     }
 
+    /// Get all keys in the realize_map (for debugging).
+    #[allow(dead_code)]
+    pub fn realize_map_keys(&self) -> Vec<&UOpKey> {
+        self.realize_map.keys().collect()
+    }
+
     /// Set the range map for a UOp.
     pub fn set_ranges(&mut self, uop: &Arc<UOp>, input_ranges: Vec<Arc<UOp>>, output_ranges: Vec<Arc<UOp>>) {
         self.range_map.insert(UOpKey(Arc::clone(uop)), (input_ranges, output_ranges));
@@ -435,12 +441,50 @@ fn assign_ranges(
             }
             Op::ReduceAxis { src, axes, .. } => {
                 if let Some(in_shape) = src.shape()? {
+                    // DEBUG: Print out_rngs details
+                    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                        let out_shape = x.shape()?;
+                        eprintln!(
+                            "[REDUCEAXIS DEBUG] id={} axes={:?} in_shape.len={} out_shape.len={:?} out_rngs.len={}",
+                            x.id, axes, in_shape.len(), out_shape.as_ref().map(|s| s.len()), out_rngs.len()
+                        );
+                        for (idx, rng) in out_rngs.iter().enumerate() {
+                            // Print full op for detailed analysis
+                            match rng.op() {
+                                Op::Binary(binop, a, b) => {
+                                    eprintln!(
+                                        "[REDUCEAXIS DEBUG] out_rngs[{}]: id={} Binary({:?}, a.id={} a.op={:?}, b.id={} b.op={:?})",
+                                        idx, rng.id, binop, a.id, std::mem::discriminant(a.op()), b.id, std::mem::discriminant(b.op())
+                                    );
+                                }
+                                Op::Range { axis_id, axis_type, .. } => {
+                                    eprintln!(
+                                        "[REDUCEAXIS DEBUG] out_rngs[{}]: id={} Range(axis_id={}, type={:?})",
+                                        idx, rng.id, axis_id, axis_type
+                                    );
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "[REDUCEAXIS DEBUG] out_rngs[{}]: id={} op={:?}",
+                                        idx, rng.id, std::mem::discriminant(rng.op())
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     let mut rngs = Vec::with_capacity(in_shape.len());
                     for (i, s) in in_shape.iter().enumerate() {
                         if axes.contains(&i) {
                             rngs.push(ctx.new_range(s, AxisType::Reduce));
                         } else if i < out_rngs.len() {
                             rngs.push(Arc::clone(&out_rngs[i]));
+                            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                                eprintln!(
+                                    "[REDUCEAXIS DEBUG] i={} using out_rngs[{}] id={}",
+                                    i, i, out_rngs[i].id
+                                );
+                            }
                         } else {
                             rngs.push(ctx.new_range(s, AxisType::Loop));
                         }
@@ -614,13 +658,29 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             // Flatten output indices
             let mut acc = UOp::index_const(1);
             let mut axes_in = Vec::new();
+
+            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                eprintln!("[RESHAPE FLATTEN] new_shape_vals={:?}, rngs.len={}", new_shape_vals, rngs.len());
+            }
+
             for (shape_dim, rng) in new_shape_vals.iter().zip(rngs.iter()).rev() {
+                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                    eprintln!("[RESHAPE FLATTEN] shape_dim={:?}, rng.id={}, rng.op={:?}", shape_dim, rng.id, std::mem::discriminant(rng.op()));
+                    eprintln!("[RESHAPE FLATTEN] acc before mul: {:?}", acc.op());
+                }
                 let weighted = acc.try_mul(rng).unwrap();
+                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                    eprintln!("[RESHAPE FLATTEN] weighted.id={}, weighted.op={:?}", weighted.id, std::mem::discriminant(weighted.op()));
+                }
                 axes_in.push(weighted);
                 acc = match shape_dim {
                     SInt::Const(n) => {
                         let n_uop = UOp::index_const(*n as i64);
-                        acc.try_mul(&n_uop).unwrap()
+                        let new_acc = acc.try_mul(&n_uop).unwrap();
+                        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                            eprintln!("[RESHAPE FLATTEN] acc after mul by {}: {:?}", n, new_acc.op());
+                        }
+                        new_acc
                     }
                     SInt::Symbolic(uop) => acc.try_mul(uop).unwrap(),
                 };
@@ -628,20 +688,74 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             let combined_axes =
                 axes_in.into_iter().reduce(|a, b| a.try_add(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
 
+            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                eprintln!("[RESHAPE FLATTEN] combined_axes.id={}", combined_axes.id);
+            }
+
             // Unflatten into input shape dimensions
+            // Apply range-based simplification:
+            //   x % n → x when 0 <= vmin(x) && vmax(x) < n
+            //   x / n → 0 when 0 <= vmin(x) && vmax(x) < n
+            use morok_ir::uop::cached_property::CachedProperty;
+            use morok_ir::uop::properties::VminVmaxProperty;
+            use morok_ir::types::ConstValue;
+
+            fn simplify_mod(x: &Arc<UOp>, n: i64) -> Arc<UOp> {
+                let (vmin, vmax) = VminVmaxProperty::get(x);
+                if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax) {
+                    if *min >= 0 && *max < n {
+                        // x is always in range [0, n), so x % n = x
+                        return Arc::clone(x);
+                    }
+                }
+                let n_uop = UOp::index_const(n);
+                x.try_mod(&n_uop).unwrap()
+            }
+
+            fn simplify_div(x: &Arc<UOp>, n: i64) -> Arc<UOp> {
+                let (vmin, vmax) = VminVmaxProperty::get(x);
+                if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax) {
+                    if *min >= 0 && *max < n && n > 0 {
+                        // x is always in range [0, n), so x / n = 0
+                        return UOp::index_const(0);
+                    }
+                }
+                let n_uop = UOp::index_const(n);
+                x.try_div(&n_uop).unwrap()
+            }
+
             let mut axes_out = Vec::new();
             let mut combined = combined_axes;
             for shape_dim in in_shape.iter().rev() {
-                let shape_uop = match shape_dim {
-                    SInt::Const(n) => UOp::index_const(*n as i64),
-                    SInt::Symbolic(uop) => Arc::clone(uop),
-                };
-                let mod_result = combined.try_mod(&shape_uop).unwrap();
-                axes_out.push(mod_result);
-                combined = combined.try_div(&shape_uop).unwrap();
+                match shape_dim {
+                    SInt::Const(n) => {
+                        let mod_result = simplify_mod(&combined, *n as i64);
+                        axes_out.push(mod_result);
+                        combined = simplify_div(&combined, *n as i64);
+                    }
+                    SInt::Symbolic(uop) => {
+                        let mod_result = combined.try_mod(uop).unwrap();
+                        axes_out.push(mod_result);
+                        combined = combined.try_div(uop).unwrap();
+                    }
+                }
             }
             axes_out.reverse();
-            axes_out
+
+            // Apply symbolic simplification to the output ranges (bottom-up to ensure children are simplified first)
+            // This is critical for simplifying Range(n) % n → Range(n) and Range(n) / n → 0
+            // Like Tinygrad: graph_rewrite(UOp.sink(*axes_out), symbolic+pm_simplify_valid, name="reshape").src
+            use crate::symbolic::patterns::symbolic_simple;
+            use morok_ir::rewrite::graph_rewrite_bottom_up;
+
+            let sink = UOp::sink(axes_out);
+            let simplified_sink = graph_rewrite_bottom_up(&symbolic_simple(), sink, &mut ());
+
+            // Extract simplified sources
+            match simplified_sink.op() {
+                Op::Sink { sources } => sources.iter().cloned().collect(),
+                _ => vec![simplified_sink],
+            }
         }
 
         _ => panic!("apply_movement_op called with non-movement op: {:?}", op),

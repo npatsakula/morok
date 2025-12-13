@@ -499,3 +499,71 @@ pub fn graph_rewrite_bottom_up<C>(matcher: &PatternMatcher<C>, root: Arc<UOp>, c
     let mut engine = RewriteEngine::new_bottom_up(matcher, ctx);
     engine.rewrite(root)
 }
+
+/// Result of graph rewriting including the transformation map.
+///
+/// The `becomes_map` maps original UOp nodes to their transformed versions.
+/// This is useful for global substitution in systems like Tinygrad's
+/// `_apply_map_to_tensors()`.
+pub struct GraphRewriteOutput {
+    /// The rewritten root node
+    pub root: Arc<UOp>,
+    /// Map from original nodes to their replacements
+    pub becomes_map: HashMap<UOpKey, Arc<UOp>>,
+}
+
+/// Apply graph rewriting and return both the result and the transformation map.
+///
+/// Like `graph_rewrite`, but also returns a `becomes_map` that tracks which
+/// original nodes were transformed to which new nodes. This is essential for
+/// global graph coordination where multiple tensors share subgraphs.
+///
+/// # Example
+///
+/// ```ignore
+/// let result = graph_rewrite_with_map(&matcher, root, &mut ctx);
+/// // Apply transformations globally
+/// apply_map_to_tensors(&result.becomes_map);
+/// ```
+#[allow(clippy::mutable_key_type)]
+pub fn graph_rewrite_with_map<C>(
+    matcher: &PatternMatcher<C>,
+    root: Arc<UOp>,
+    ctx: &mut C,
+) -> GraphRewriteOutput {
+    let mut engine = RewriteEngine::new(matcher, ctx);
+    let result_root = engine.rewrite(root.clone());
+
+    // Extract becomes_map: only include entries where the result differs from original
+    let becomes_map: HashMap<UOpKey, Arc<UOp>> = engine
+        .results
+        .results
+        .into_iter()
+        .filter(|(k, v)| !Arc::ptr_eq(&k.0, v))
+        .collect();
+
+    GraphRewriteOutput { root: result_root, becomes_map }
+}
+
+/// Apply bottom-up graph rewriting and return both the result and transformation map.
+///
+/// Like `graph_rewrite_bottom_up`, but also returns a `becomes_map`.
+#[allow(clippy::mutable_key_type)]
+pub fn graph_rewrite_bottom_up_with_map<C>(
+    matcher: &PatternMatcher<C>,
+    root: Arc<UOp>,
+    ctx: &mut C,
+) -> GraphRewriteOutput {
+    let mut engine = RewriteEngine::new_bottom_up(matcher, ctx);
+    let result_root = engine.rewrite(root.clone());
+
+    // Extract becomes_map: only include entries where the result differs from original
+    let becomes_map: HashMap<UOpKey, Arc<UOp>> = engine
+        .results
+        .results
+        .into_iter()
+        .filter(|(k, v)| !Arc::ptr_eq(&k.0, v))
+        .collect();
+
+    GraphRewriteOutput { root: result_root, becomes_map }
+}

@@ -157,11 +157,157 @@ fn apply_bufferize_transform(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<
 }
 
 /// Remove movement ops after transformation has been applied.
+///
+/// When removing a movement op, we check if the source needs realization.
+/// If so, we wrap it in BUFFERIZE + INDEX to ensure proper kernel splitting.
+/// This handles the identity mismatch where realize_map is keyed on the
+/// transformed REDUCE identity but movement op sources are the original identity.
 fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
-    if should_remove_movement_op(x, ctx) {
-        return x.op().sources().first().map(Arc::clone);
+    if !should_remove_movement_op(x, ctx) {
+        return None;
     }
-    None
+
+    let src = x.op().sources().first()?.clone();
+
+    // DEBUG: Trace movement op removal
+    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+        eprintln!(
+            "[REMOVE_MOVEMENT] x_id={} x_op={:?} src_id={} src_op={:?}",
+            x.id,
+            std::mem::discriminant(x.op()),
+            src.id,
+            std::mem::discriminant(src.op())
+        );
+        eprintln!(
+            "[REMOVE_MOVEMENT] realize_map keys: {:?}",
+            ctx.realize_map_keys().iter().map(|k| (k.0.id, std::mem::discriminant(k.0.op()))).collect::<Vec<_>>()
+        );
+    }
+
+    // Check if source needs realization - wrap in BUFFERIZE if so
+    // But skip if source is a movement op whose inner source is also marked
+    // (the innermost marked op will be wrapped by transform_single_source)
+    let realize_axes = ctx.get_realize_axes(&src).cloned();
+
+    // DEBUG: Show lookup result
+    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+        eprintln!(
+            "[REMOVE_MOVEMENT] src_id={} realize_axes={:?} should_realize={}",
+            src.id,
+            realize_axes,
+            ctx.should_realize(&src)
+        );
+    }
+
+    if let Some(axes) = realize_axes {
+        // Check if ANY source of this node is also marked for realization
+        // If so, skip wrapping here - the inner source should be wrapped first
+        // This ensures consistent computation: the innermost marked node is wrapped once
+        for inner_src in src.op().sources() {
+            if ctx.should_realize(&inner_src) {
+                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                    eprintln!(
+                        "[REMOVE_MOVEMENT] SKIPPING src_id={} because inner_src_id={} also needs realization",
+                        src.id, inner_src.id
+                    );
+                }
+                // Return the raw source - let the rewrite continue
+                // The inner source will be wrapped when its consumers process it
+                return Some(src);
+            }
+        }
+
+        // Source needs realization - wrap in BUFFERIZE + INDEX
+        // Use movement op's input ranges (which are source's output from consumer perspective)
+        let x_ranges = ctx.get_ranges(x);
+        let src_ranges = ctx.get_ranges(&src);
+
+        // DEBUG: Show ranges
+        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+            eprintln!(
+                "[REMOVE_MOVEMENT] Creating BUFFERIZE: x_ranges={:?} src_ranges={:?}",
+                x_ranges.map(|(i, o)| (i.len(), o.len())),
+                src_ranges.map(|(i, o)| (i.len(), o.len()))
+            );
+        }
+
+        let input_ranges = x_ranges.map(|(i, _)| i.clone())?;
+        let src_output = src_ranges.map(|(_, o)| o.clone())?;
+
+        // Closed ranges are source's output ranges at realized axes
+        let closed_ranges: Vec<_> = src_output
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| axes.contains(i))
+            .map(|(_, r)| Arc::clone(r))
+            .collect();
+
+        let opts = if src_output.len() == axes.len() {
+            BufferizeOpts { device: None, addrspace: AddrSpace::Global }
+        } else {
+            BufferizeOpts { device: None, addrspace: AddrSpace::Local }
+        };
+
+        // DEBUG
+        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+            eprintln!(
+                "[REMOVE_MOVEMENT] axes={:?} closed_ranges.len()={} input_ranges.len()={}",
+                axes, closed_ranges.len(), input_ranges.len()
+            );
+            // Show what src actually wraps
+            let src_sources = src.op().sources();
+            eprintln!(
+                "[REMOVE_MOVEMENT] src subtree: src_id={} src_op={:?} src_sources={:?}",
+                src.id,
+                std::mem::discriminant(src.op()),
+                src_sources.iter().map(|s| (s.id, std::mem::discriminant(s.op()))).collect::<Vec<_>>()
+            );
+        }
+
+        let bufferized = UOp::bufferize(src.clone(), closed_ranges, opts);
+
+        // Index ranges: movement op's input ranges at realized axes
+        // Convert REDUCE ranges to LOOP ranges when materializing
+        let index_ranges: Vec<_> = input_ranges
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| axes.contains(i))
+            .map(|(_, r)| {
+                if let Op::Range { end, axis_type: AxisType::Reduce, .. } = r.op() {
+                    ctx.new_range_from_uop(end, AxisType::Loop)
+                } else {
+                    Arc::clone(r)
+                }
+            })
+            .collect();
+
+        // DEBUG
+        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+            eprintln!(
+                "[REMOVE_MOVEMENT] index_ranges.len()={} bufferized_id={}",
+                index_ranges.len(), bufferized.id
+            );
+        }
+
+        if !index_ranges.is_empty() {
+            let result = UOp::index(bufferized.clone(), index_ranges);
+            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                eprintln!(
+                    "[REMOVE_MOVEMENT] Returning INDEX result={:?}",
+                    result.as_ref().map(|r| r.id)
+                );
+            }
+            return result.ok();
+        } else {
+            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                eprintln!("[REMOVE_MOVEMENT] Returning BUFFERIZE only");
+            }
+            return Some(bufferized);
+        }
+    }
+
+    // Source doesn't need realization - return as-is
+    Some(src)
 }
 
 /// Convert ReduceAxis → REDUCE using IndexingContext.
@@ -559,11 +705,17 @@ pub fn linearize_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
     let dims: Vec<i64> = indices
         .iter()
         .map(|idx_uop| {
+            // Handle Range nodes
             if let Op::Range { end, .. } = idx_uop.op()
                 && let Op::Const(cv) = end.op()
                 && let ConstValue::Int(size) = cv.0
             {
                 return size;
+            }
+            // Handle DefineVar (from OUTER ranges converted to kernel parameters)
+            // max_val is the maximum value, size = max_val + 1
+            if let Op::DefineVar { max_val, .. } = idx_uop.op() {
+                return *max_val + 1;
             }
             1
         })
@@ -572,6 +724,23 @@ pub fn linearize_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
     let mut strides = vec![1i64; dims.len()];
     for i in (0..dims.len().saturating_sub(1)).rev() {
         strides[i] = strides[i + 1] * dims[i + 1];
+    }
+
+    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+        let indices_str: Vec<_> = indices
+            .iter()
+            .map(|i| {
+                if let Op::Range { axis_id, axis_type, end, .. } = i.op() {
+                    format!("Range(id={}, axis={:?}, type={:?}, end={:?})", i.id, axis_id, axis_type, end.op())
+                } else {
+                    format!("{}({:?})", i.id, std::mem::discriminant(i.op()))
+                }
+            })
+            .collect();
+        eprintln!(
+            "[LINEARIZE] idx.id={} indices={:?} dims={:?} strides={:?}",
+            idx.id, indices_str, dims, strides
+        );
     }
 
     let mut linear = UOp::index_const(0);

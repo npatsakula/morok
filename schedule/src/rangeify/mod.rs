@@ -25,7 +25,7 @@ pub use kernel::{KernelContext, KernelDependency};
 
 // Entry points
 pub use kernel::run_kernel_split_pipeline;
-pub use transforms::rangeify;
+pub use transforms::{RangeifyResult, rangeify, rangeify_with_map};
 
 // Configuration
 pub use kernel::{PcontigConfig, SplitReduceOpConfig};

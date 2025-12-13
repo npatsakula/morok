@@ -107,6 +107,7 @@ pub fn symbolic_simple() -> PatternMatcher {
         + minmax_dsl_patterns()
         + power_dsl_patterns()
         + negation_dsl_patterns()
+        + range_based_mod_div_patterns()
         + dce_dsl_patterns()
         + dead_loop_patterns()
 }
@@ -166,6 +167,50 @@ pub fn zero_folding_dsl_patterns() -> PatternMatcher {
         Lt(x, x) if !x.dtype().is_float() ~> false.into_uop(DType::Bool),
         // x != x → False (int only)
         Ne(x, x) if x.dtype().is_int() ~> false.into_uop(DType::Bool),
+    }
+}
+
+/// Range-based modulo and division simplification patterns.
+///
+/// Uses vmin/vmax analysis to simplify:
+/// - x % n → x when 0 <= vmin(x) && vmax(x) < n
+/// - x / n → 0 when 0 <= vmin(x) && vmax(x) < n
+///
+/// This is critical for RESHAPE range propagation where Range(n) % n should simplify to Range(n).
+pub fn range_based_mod_div_patterns() -> PatternMatcher {
+    patterns! {
+        // x % n → x when 0 <= vmin(x) && vmax(x) < n
+        // This handles cases like Range(3) % 3 → Range(3)
+        Mod(x, n @const(n_val)) => {
+            let (vmin, vmax) = VminVmaxProperty::get(x);
+            // DEBUG
+            if std::env::var("MOROK_DEBUG_MOD").is_ok() {
+                eprintln!("[MOD SIMPLIFY] x.id={} vmin={:?} vmax={:?} n_val={:?}", x.id, vmin, vmax, n_val);
+            }
+            // Check if x is always non-negative and less than n
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val) {
+                if *min >= 0 && *max < n_int {
+                    if std::env::var("MOROK_DEBUG_MOD").is_ok() {
+                        eprintln!("[MOD SIMPLIFY] Simplifying x % {} → x (vmin={}, vmax={})", n_int, min, max);
+                    }
+                    return Some(Arc::clone(x));
+                }
+            }
+            None
+        },
+
+        // x / n → 0 when 0 <= vmin(x) && vmax(x) < n
+        // This handles cases like Range(3) / 3 → 0 (since Range(3) is 0,1,2 and all /3 = 0)
+        Idiv(x, n @const(n_val)) => {
+            let (vmin, vmax) = VminVmaxProperty::get(x);
+            // Check if x is always non-negative and less than n
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val) {
+                if *min >= 0 && *max < n_int && n_int > 0 {
+                    return Some(UOp::const_(x.dtype(), ConstValue::Int(0)));
+                }
+            }
+            None
+        },
     }
 }
 

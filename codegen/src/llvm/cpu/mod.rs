@@ -44,6 +44,11 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Collect all buffers and variables from the graph
         let (buffers, variables) = collect_buffers_and_vars(uop);
 
+        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+            eprintln!("[CODEGEN] Buffers: {:?}", buffers.iter().map(|b| b.id).collect::<Vec<_>>());
+            eprintln!("[CODEGEN] Variables: {:?}", variables.iter().map(|v| (v.id, format!("{:?}", v.op()))).collect::<Vec<_>>());
+        }
+
         // Create kernel function signature: void kernel(ptr %buf0, ..., i64 %var0, ...)
         let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
         let i64_type = self.context.i64_type();
@@ -97,6 +102,28 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Walk the UOp graph in topological order
         let nodes = uop.toposort();
 
+        // DEBUG: Print all nodes in toposort
+        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+            eprintln!("[CODEGEN] Toposort has {} nodes:", nodes.len());
+            for node in &nodes {
+                match node.op() {
+                    Op::Bind { var, value } => {
+                        eprintln!("  id={} BIND(var.id={}, value.id={} op={:?})", node.id, var.id, value.id, std::mem::discriminant(value.op()));
+                    }
+                    Op::Range { axis_id, axis_type, .. } => {
+                        eprintln!("  id={} RANGE(axis_id={:?}, type={:?})", node.id, axis_id, axis_type);
+                    }
+                    Op::Reduce { .. } => {
+                        eprintln!("  id={} REDUCE", node.id);
+                    }
+                    Op::Index { .. } => {
+                        eprintln!("  id={} INDEX", node.id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Pre-pass: Identify nodes that are in REDUCE source subgraphs
         // These nodes should NOT be processed in the main loop - REDUCE will handle them
         // This is critical because REDUCE needs to set up the loop counter BEFORE
@@ -110,6 +137,9 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
             if let Op::Bind { value, .. } = node.op()
                 && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. })
             {
+                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                    eprintln!("[PREPASS] Processing BIND id={} with OUTER Range id={}", node.id, value.id);
+                }
                 ops::codegen_uop(node, self.context, &module, &builder, &mut values)?;
             }
         }

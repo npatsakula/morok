@@ -1,6 +1,6 @@
 use bon::bon;
 use snafu::ResultExt;
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::sync::Arc;
 
 use morok_device::{Buffer, registry};
 use morok_dtype::ext::HasDType;
@@ -21,25 +21,11 @@ pub mod realize;
 pub mod reduce;
 pub mod schedule;
 pub mod shape_ops;
+pub mod tensor_registry;
 pub mod traits;
 
-/// Reference to a kernel used by a tensor.
-///
-/// Each tensor tracks which kernels were compiled during its realization.
-/// This allows `tensor.kernels()` to return only the kernels for that specific tensor,
-/// not a global list contaminated by other tensors.
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct KernelRef {
-    /// AST UOp ID (for global dedup cache lookup)
-    ast_id: u64,
-    /// Device it was compiled for
-    device: String,
-    /// Rendered code (for debugging)
-    code: String,
-    /// Entry point name
-    entry_point: String,
-}
+// Re-export for public API
+pub use tensor_registry::apply_map_to_tensors;
 
 /// Information about a rendered kernel.
 ///
@@ -63,6 +49,15 @@ pub struct KernelInfo {
 /// - Creating input tensors via `from_slice()`
 /// - Evaluating the computation graph via `realize()`
 ///
+/// # Global Graph Substitution
+///
+/// Tensors are registered in a global registry to support atomic graph substitution.
+/// When rangeify transforms a UOp (e.g., NEG → BUFFERIZE(NEG)), all tensors
+/// referencing it are updated atomically via `apply_map_to_tensors()`.
+///
+/// This is critical for diamond patterns (like argmin's NEG feeding both MAX and EQ)
+/// where different consumers must see the same transformed version.
+///
 /// # Examples
 ///
 /// ```
@@ -71,53 +66,34 @@ pub struct KernelInfo {
 /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
 /// let c = &a + &b;  // Lazy - only builds UOp graph
 /// let realized = c.realize().unwrap();  // Executes the computation
-/// println!("Kernels used: {:?}", realized.kernels());
 /// ```
 #[derive(Clone)]
 pub struct Tensor {
-    /// The computation graph (lazy)
-    uop: Arc<UOp>,
-    /// Kernels used by this tensor (populated by realize())
-    /// Stored in Rc<RefCell> to allow mutation during realize()
-    kernels: Rc<RefCell<Vec<KernelRef>>>,
+    /// Registry entry holding the computation graph (supports global substitution)
+    entry: Arc<tensor_registry::TensorEntry>,
 }
 
 #[bon]
 impl Tensor {
     fn new(uop: Arc<UOp>) -> Self {
-        Self { uop, kernels: Rc::new(RefCell::new(Vec::new())) }
+        let entry = tensor_registry::register_tensor(uop);
+        Self { entry }
     }
 
-    /// Get kernels for THIS tensor only (not global pollution).
+    /// Get the current UOp for this tensor.
     ///
-    /// Returns information about each kernel that was compiled and executed
-    /// during this tensor's realization. This list is specific to this tensor
-    /// and won't include kernels from other tensors.
+    /// This reads from the registry, so it reflects any global substitutions.
+    pub fn uop(&self) -> Arc<UOp> {
+        self.entry.uop.read().clone()
+    }
+
+    /// Get kernels for THIS tensor.
     ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
-    /// let c = (&a + &b).realize()?;
-    ///
-    /// // Only shows the kernel for this specific addition
-    /// for kernel in c.kernels() {
-    ///     println!("Kernel: {}", kernel.name);
-    ///     println!("Code:\n{}", kernel.code);
-    /// }
-    /// ```
+    /// Note: Kernel tracking is not yet implemented with the new registry.
+    /// This returns an empty list for now.
     pub fn kernels(&self) -> Vec<KernelInfo> {
-        self.kernels
-            .borrow()
-            .iter()
-            .map(|k| KernelInfo {
-                name: k.entry_point.clone(),
-                code: k.code.clone(),
-                entry_point: k.entry_point.clone(),
-                backend: "llvm".to_string(),
-            })
-            .collect()
+        // TODO: Implement kernel tracking with the new registry
+        Vec::new()
     }
 
     /// Create 1D tensor with evenly spaced values.
@@ -230,9 +206,10 @@ impl Tensor {
     /// This allows multi-buffer operations to access buffers from multiple tensors.
     /// Uses `.base()` to walk through movement operations to find the actual buffer.
     pub fn buffer(&self) -> Option<Buffer> {
-        let base_id = self.uop.base().id;
+        let uop = self.uop();
+        let base_id = uop.base().id;
         if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
-            eprintln!("buffer(): uop.id={} base().id={}", self.uop.id, base_id);
+            eprintln!("buffer(): uop.id={} base().id={}", uop.id, base_id);
         }
         buffer_registry::get_buffer(base_id)
     }
@@ -249,7 +226,7 @@ impl Tensor {
     /// assert_eq!(cpu_tensor.device(), DeviceSpec::Cpu);
     /// ```
     pub fn device(&self) -> DeviceSpec {
-        self.uop.device_spec().unwrap_or(DeviceSpec::Cpu)
+        self.uop().device_spec().unwrap_or(DeviceSpec::Cpu)
     }
 
     /// Move tensor to a different device.
@@ -268,7 +245,7 @@ impl Tensor {
             return self.clone();
         }
 
-        let copy_uop = self.uop.copy_to_device(device);
+        let copy_uop = self.uop().copy_to_device(device);
         Self::new(copy_uop)
     }
 
@@ -280,7 +257,7 @@ impl Tensor {
     /// let t_int = t.cast(DType::Int32)?;
     /// ```
     pub fn cast(&self, dtype: morok_dtype::DType) -> Result<Self> {
-        let casted = UOp::cast(self.uop.clone(), dtype);
+        let casted = UOp::cast(self.uop(), dtype);
         Ok(Self::new(casted))
     }
 
@@ -317,7 +294,8 @@ impl Tensor {
         }
 
         // Get shape
-        let shape = self.uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
+        let uop = self.uop();
+        let shape = uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
 
         // Convert shape to usize dimensions
         let dims: Vec<usize> = shape.iter().map(|dim| dim.as_const().unwrap_or(1)).collect();
@@ -333,6 +311,14 @@ impl Tensor {
         let arr = ArrayD::from_shape_vec(IxDyn(&dims), data).context(NdarrayShapeSnafu)?;
 
         Ok(arr)
+    }
+
+    /// Update the UOp for this tensor directly.
+    ///
+    /// This is used internally after realization to update the tensor's UOp
+    /// to point to the materialized buffer.
+    pub(crate) fn set_uop(&self, uop: Arc<UOp>) {
+        *self.entry.uop.write() = uop;
     }
 }
 

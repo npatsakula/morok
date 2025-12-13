@@ -14,7 +14,7 @@ impl Tensor {
     /// Uses the broadcast_to method which supports symbolic shapes.
     fn broadcast_scalar(&self, value: ConstValue) -> Result<Self> {
         let shape = self.shape()?;
-        let scalar = Self::new(UOp::const_(self.uop.dtype(), value));
+        let scalar = Self::new(UOp::const_(self.uop().dtype(), value));
         scalar.broadcast_to(&shape)
     }
 
@@ -62,7 +62,7 @@ impl Tensor {
         let denominator = one.try_add(&exp_neg_x)?;
 
         // Use reciprocal for 1 / denominator
-        let recip = Self::new(UOp::try_reciprocal(&denominator.uop).context(UOpSnafu)?);
+        let recip = Self::new(UOp::try_reciprocal(&denominator.uop()).context(UOpSnafu)?);
         Ok(recip)
     }
 

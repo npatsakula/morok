@@ -151,7 +151,7 @@ fn test_matmul_dtype_promotion() {
 
     let c = a.dot(&b).unwrap();
     // Result should be promoted to float32
-    assert_eq!(c.uop.dtype(), DType::Float32);
+    assert_eq!(c.uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn test_matmul_explicit_dtype() {
 
     // Use float64 accumulation
     let c = a.matmul_with().other(&b).dtype(DType::Float64).call().unwrap();
-    assert_eq!(c.uop.dtype(), DType::Float64);
+    assert_eq!(c.uop().dtype(), DType::Float64);
 }
 
 #[test]

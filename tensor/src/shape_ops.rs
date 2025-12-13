@@ -36,7 +36,7 @@ impl Tensor {
         // Convert to Shape, handling -1 inference
         let shape = self.resolve_shape_with_inference(new_shape)?;
 
-        self.uop.try_reshape(&shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_reshape(&shape).map(Self::new).context(UOpSnafu)
     }
 
     /// Permute (reorder) tensor dimensions.
@@ -66,7 +66,7 @@ impl Tensor {
         // Normalize negative indices and validate
         let normalized_axes = self.normalize_axes(axes, ndim)?;
 
-        self.uop.try_permute(normalized_axes).map(Self::new).context(UOpSnafu)
+        self.uop().try_permute(normalized_axes).map(Self::new).context(UOpSnafu)
     }
 
     /// Transpose two dimensions.
@@ -99,7 +99,7 @@ impl Tensor {
         let mut axes: Vec<usize> = (0..ndim).collect();
         axes.swap(d0, d1);
 
-        self.uop.try_permute(axes).map(Self::new).context(UOpSnafu)
+        self.uop().try_permute(axes).map(Self::new).context(UOpSnafu)
     }
 
     /// Expand (broadcast) dimensions.
@@ -124,7 +124,7 @@ impl Tensor {
     pub fn try_expand(&self, new_shape: &[isize]) -> Result<Tensor> {
         let shape = self.resolve_expand_shape(new_shape)?;
 
-        self.uop.try_expand(&shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_expand(&shape).map(Self::new).context(UOpSnafu)
     }
 
     /// Squeeze dimensions of size 1.
@@ -179,7 +179,7 @@ impl Tensor {
             }
         };
 
-        self.uop.try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
     }
 
     /// Add a dimension of size 1.
@@ -221,7 +221,7 @@ impl Tensor {
         let mut new_shape = shape.clone();
         new_shape.insert(normalized_dim, SInt::Const(1));
 
-        self.uop.try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
+        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
     }
 
     /// Flatten tensor to 1D.
@@ -245,7 +245,7 @@ impl Tensor {
 
     /// Get the shape of this tensor.
     pub(crate) fn shape(&self) -> Result<Shape> {
-        self.uop.shape().context(UOpSnafu)?.cloned().ok_or(Error::ShapeUnknown)
+        self.uop().shape().context(UOpSnafu)?.cloned().ok_or(Error::ShapeUnknown)
     }
 
     /// Get the number of dimensions (rank) of this tensor.

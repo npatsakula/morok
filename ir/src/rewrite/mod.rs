@@ -5,4 +5,7 @@
 
 pub mod engine;
 
-pub use engine::{graph_rewrite, graph_rewrite_bottom_up};
+pub use engine::{
+    GraphRewriteOutput, graph_rewrite, graph_rewrite_bottom_up, graph_rewrite_bottom_up_with_map,
+    graph_rewrite_with_map,
+};

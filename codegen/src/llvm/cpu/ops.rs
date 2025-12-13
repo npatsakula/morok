@@ -388,6 +388,39 @@ fn codegen_memory<'ctx>(
             Ok(None)
         }
         Op::Index { buffer, indices, gate: None } => {
+            // Debug: print the index expression tree
+            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                fn print_expr(uop: &Arc<UOp>, depth: usize) {
+                    let indent = "  ".repeat(depth);
+                    match uop.op() {
+                        Op::Binary(op, a, b) => {
+                            eprintln!("{}Binary({:?}, id={})", indent, op, uop.id);
+                            print_expr(a, depth + 1);
+                            print_expr(b, depth + 1);
+                        }
+                        Op::Range { axis_id, axis_type, .. } => {
+                            eprintln!("{}Range(id={}, axis_id={:?}, type={:?})", indent, uop.id, axis_id, axis_type);
+                        }
+                        Op::DefineVar { name, .. } => {
+                            eprintln!("{}DefineVar(id={}, name={})", indent, uop.id, name);
+                        }
+                        Op::Const(v) => {
+                            eprintln!("{}Const(id={}, val={:?})", indent, uop.id, v.0);
+                        }
+                        Op::Bind { var, value } => {
+                            eprintln!("{}Bind(id={}, var.id={}, value.id={})", indent, uop.id, var.id, value.id);
+                            print_expr(var, depth + 1);
+                            print_expr(value, depth + 1);
+                        }
+                        _ => {
+                            eprintln!("{}Other(id={}, op={:?})", indent, uop.id, std::mem::discriminant(uop.op()));
+                        }
+                    }
+                }
+                eprintln!("[INDEX id={}] Index expression tree:", uop.id);
+                print_expr(&indices[0], 1);
+            }
+
             let buffer_ptr = require_value(buffer, context, module, builder, values)?;
             if indices.len() == 1 {
                 let index_val = require_value(&indices[0], context, module, builder, values)?;
@@ -504,10 +537,19 @@ fn codegen_loop<'ctx>(
             // For OUTER ranges: Create the loop HERE (single responsibility)
             // This matches Tinygrad where loop creation happens at RANGE/BIND processing
             if let Op::Range { end, axis_type: AxisType::Outer, .. } = value.op() {
+                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                    eprintln!("[BIND] Processing BIND var.id={} value.id={} (OUTER Range)", var.id, value.id);
+                }
                 // Check if already created (idempotent)
                 if let Some(val) = values.get(value.id) {
+                    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                        eprintln!("[BIND] Already created, reusing counter for value.id={}", value.id);
+                    }
                     values.insert(var.id, val);
                     return Ok(Some(val));
+                }
+                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                    eprintln!("[BIND] Creating NEW loop for OUTER Range id={}", value.id);
                 }
 
                 // Check for size-1 loop - no loop needed, just use 0
@@ -742,8 +784,17 @@ fn codegen_reduce<'ctx>(
     // Track loops before source evaluation - source may create additional nested loops
     let loops_before: std::collections::HashSet<u64> = values.remaining_loop_ids().into_iter().collect();
 
+    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+        eprintln!("[REDUCE] About to evaluate source, loops_before={:?}", loops_before);
+    }
+
     // Evaluate source first - this may create nested loops
     let src_val = require_value(src, context, module, builder, values)?;
+
+    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+        let loops_after_src = values.remaining_loop_ids();
+        eprintln!("[REDUCE] After source eval, loops_after={:?}", loops_after_src);
+    }
     println!("[DEBUG REDUCE] src.dtype()={:?}, src_val={:?}", src.dtype(), src_val);
     let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
     println!("[DEBUG REDUCE] after auto_load: src_val={:?}", src_val);

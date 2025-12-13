@@ -3,7 +3,7 @@ use morok_ir::Op;
 
 // Helper to get concrete shape as Vec<usize>
 fn get_shape(tensor: &Tensor) -> Vec<usize> {
-    tensor.uop.shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
+    tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
 }
 
 // =========================================================================
@@ -16,7 +16,7 @@ fn test_reshape_basic() {
     let reshaped = t.try_reshape(&[2, 3]).unwrap();
 
     assert_eq!(get_shape(&reshaped), vec![2, 3]);
-    if let Op::Reshape { .. } = reshaped.uop.op() {
+    if let Op::Reshape { .. } = reshaped.uop().op() {
         // Correct operation type
     } else {
         panic!("Expected Reshape operation");
@@ -386,9 +386,9 @@ fn test_lazy_evaluation() {
     assert!(unsqueezed.buffer().is_some());
 
     // All should share the same buffer ID (same base)
-    assert_eq!(reshaped.uop.base().id, t.uop.base().id);
-    assert_eq!(permuted.uop.base().id, t.uop.base().id);
-    assert_eq!(unsqueezed.uop.base().id, t.uop.base().id);
+    assert_eq!(reshaped.uop().base().id, t.uop().base().id);
+    assert_eq!(permuted.uop().base().id, t.uop().base().id);
+    assert_eq!(unsqueezed.uop().base().id, t.uop().base().id);
 }
 
 #[test]
@@ -399,8 +399,8 @@ fn test_dtype_preservation() {
     let reshaped_f32 = t_f32.try_reshape(&[3, 1]).unwrap();
     let reshaped_i32 = t_i32.try_reshape(&[3, 1]).unwrap();
 
-    assert_eq!(reshaped_f32.uop.dtype(), morok_dtype::DType::Float32);
-    assert_eq!(reshaped_i32.uop.dtype(), morok_dtype::DType::Int32);
+    assert_eq!(reshaped_f32.uop().dtype(), morok_dtype::DType::Float32);
+    assert_eq!(reshaped_i32.uop().dtype(), morok_dtype::DType::Int32);
 }
 
 // =========================================================================
@@ -439,7 +439,7 @@ fn test_symbolic_shape_support() {
 
     // Test 3: Reshape preserving symbolic dimension
     let new_shape: morok_ir::shape::Shape = vec![batch_dim.clone(), morok_ir::SInt::from(12)].into();
-    let reshaped = tensor.uop.try_reshape(&new_shape).map(Tensor::new).unwrap();
+    let reshaped = tensor.uop().try_reshape(&new_shape).map(Tensor::new).unwrap();
     assert_eq!(reshaped.ndim().unwrap(), 2);
 
     // Test 4: Permute works with symbolic shapes

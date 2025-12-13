@@ -94,7 +94,8 @@ impl Tensor {
             eprintln!("realize: output_buf.id()={:?} raw_bytes={:?}", output_buf.id(), &debug_data);
         }
 
-        let output_dtype = self.uop.dtype();
+        let uop = self.uop();
+        let output_dtype = uop.dtype();
         let output_device = output_buf.allocator().device_spec();
         // Buffer::size() returns bytes, convert to element count
         let num_elements = output_buf.size() / output_dtype.bytes();
@@ -110,11 +111,11 @@ impl Tensor {
 
         // Also register under the original base ID for backwards compatibility
         // (e.g., if user called .clone() before realize and uses both)
-        let base_id = self.uop.base().id;
+        let base_id = uop.base().id;
         crate::buffer_registry::get_or_create_buffer(base_id, || Ok(output_buf))?;
 
         // Get the tensor's shape and reshape the buffer to match
-        let shape = self.uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
+        let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
         let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
 
         if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
@@ -128,7 +129,9 @@ impl Tensor {
             );
         }
 
-        Ok(Self { uop: realized_uop, kernels: self.kernels })
+        // Update this tensor's UOp to point to the realized buffer
+        self.set_uop(realized_uop);
+        Ok(self)
     }
 
     /// Prepare an execution plan for this tensor's computation graph.
@@ -171,8 +174,10 @@ impl Tensor {
     pub fn prepare(&self) -> Result<ExecutionPlan> {
         use morok_ir::AxisType;
 
+        let uop = self.uop();
+
         // Step 1: Create BUFFERIZE wrapping the computation
-        let shape = self.uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
+        let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
 
         let ranges: Vec<_> = shape
             .iter()
@@ -186,14 +191,19 @@ impl Tensor {
             })
             .collect();
 
-        let output_dtype = self.uop.dtype();
-        let bufferize = UOp::bufferize_global(self.uop.clone(), ranges);
+        let output_dtype = uop.dtype();
+        let bufferize = UOp::bufferize_global(uop.clone(), ranges);
 
         // Step 2: Create SINK of the BUFFERIZE
         let sink = UOp::sink(vec![bufferize]);
 
         // Step 3: Run rangeify pipeline
-        let (rangeified, _context) = morok_schedule::rangeify(sink, None).context(RangeifySnafu)?;
+        // Note: We track becomes_map but don't apply it globally.
+        // The becomes_map contains ALL transformations from rewrite passes including internal
+        // restructuring. Applying it to other tensors could corrupt them. The diamond pattern
+        // issue (like in argmin) needs to be solved within the scheduling logic itself.
+        let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
+        let rangeified = rangeify_result.sink;
 
         // DEBUG: Print post-rangeify IR
         if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {

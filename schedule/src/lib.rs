@@ -37,7 +37,7 @@ pub use morok_ir::rewrite;
 pub use linearize::{CFGContext, linearize};
 pub use morok_ir::pattern::{PatternMatcher, UPat};
 pub use morok_ir::rewrite::graph_rewrite;
-pub use rangeify::{rangeify, run_kernel_split_pipeline};
+pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, run_kernel_split_pipeline};
 
 // Re-export optimizer entry points
 pub use optimizer::{
