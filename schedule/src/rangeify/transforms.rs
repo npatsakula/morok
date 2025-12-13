@@ -156,22 +156,6 @@ pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &mut IndexingContext)
     if any_changed { Some(new_sources) } else { None }
 }
 
-/// Check if a UOp is a chain of movement ops ending in a buffer-like op.
-fn is_movement_chain_on_buffer(uop: &Arc<UOp>) -> bool {
-    let mut current = uop.clone();
-    while current.op().is_movement() {
-        if let Some(src) = current.op().sources().first() {
-            current = src.clone();
-        } else {
-            return false;
-        }
-    }
-    matches!(
-        current.op(),
-        Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
-    )
-}
-
 /// Transform a single source by adding BUFFERIZE + INDEX if needed.
 pub(crate) fn transform_single_source(
     _consumer: &Arc<UOp>,
@@ -208,10 +192,30 @@ pub(crate) fn transform_single_source(
         return UOp::index(Arc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for buffer source");
     }
 
-    // Case 1.5: Movement op chain on buffer → add INDEX
-    if src.op().is_movement() && is_movement_chain_on_buffer(src) {
+    // Case 1.5: Movement op → transform indices through it and recurse
+    // This handles EXPAND [1]->[4] by transforming [Range(0..4)] to [Const(0)]
+    // We apply movement op transformation here directly (like Tinygrad's apply_movement_op)
+    // Then recursively call transform_single_source to let the appropriate case handle the inner source
+    if src.op().is_movement() {
+        use super::indexing::apply_movement_op;
+
+        // Get the inner source of the movement op
+        let inner_src = &src.op().sources()[0];
+
+        // Get the source shape for transformation
+        if let Some(inner_shape) = inner_src.shape().ok().flatten() {
+            // Transform indices through the movement op
+            let transformed_indices = apply_movement_op(src.op(), inner_shape, input_ranges);
+
+            // Recursively call transform_single_source with transformed indices
+            // This will hit the appropriate case (Case 1 for buffer/AFTER, CONST case, etc.)
+            return transform_single_source(_consumer, inner_src, &transformed_indices, ctx);
+        }
+
+        // Fallback: if we can't get shape, create INDEX on the movement chain
+        // (will be handled by pattern matcher later)
         return UOp::index(Arc::clone(src), input_ranges.to_vec())
-            .expect("Failed to create INDEX for movement buffer source");
+            .expect("Failed to create INDEX for movement source");
     }
 
     // Check for REDUCE op that might have been converted from ReduceAxis
