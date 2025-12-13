@@ -3,7 +3,7 @@
 //! Provides Arbitrary implementations and custom strategies for generating
 //! UOp graphs, constants, operations, and dtype families.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use half::bf16;
 use proptest::prelude::*;
@@ -192,17 +192,17 @@ pub fn arb_ternary_op() -> impl Strategy<Value = TernaryOp> {
 // ============================================================================
 
 /// Generate a constant UOp with given dtype.
-pub fn arb_const_uop(dtype: DType) -> impl Strategy<Value = Rc<UOp>> {
+pub fn arb_const_uop(dtype: DType) -> impl Strategy<Value = Arc<UOp>> {
     const_(dtype.scalar().unwrap()).prop_map(move |cv| UOp::const_(dtype.clone(), cv))
 }
 
 /// Generate a variable UOp with bounded range.
-pub fn arb_var_uop(dtype: DType) -> impl Strategy<Value = Rc<UOp>> {
-    ("[a-z]", 0i64..100, 1i64..100).prop_map(move |(name, min, size)| UOp::var(name, dtype.clone(), min, min + size))
+pub fn arb_var_uop(dtype: DType) -> impl Strategy<Value = Arc<UOp>> {
+    ("[a-z]", 1i64..100).prop_map(move |(name, max_val)| UOp::var(name, dtype.clone(), max_val))
 }
 
 /// Generate a simple UOp (constant or variable).
-pub fn arb_simple_uop(dtype: DType) -> impl Strategy<Value = Rc<UOp>> {
+pub fn arb_simple_uop(dtype: DType) -> impl Strategy<Value = Arc<UOp>> {
     prop_oneof![arb_const_uop(dtype.clone()), arb_var_uop(dtype),]
 }
 
@@ -210,7 +210,7 @@ pub fn arb_simple_uop(dtype: DType) -> impl Strategy<Value = Rc<UOp>> {
 ///
 /// Depth 0: constant or variable
 /// Depth N: binary/unary operation over depth N-1 expressions
-pub fn arb_arithmetic_tree(dtype: DType, depth: usize) -> impl Strategy<Value = Rc<UOp>> {
+pub fn arb_arithmetic_tree(dtype: DType, depth: usize) -> impl Strategy<Value = Arc<UOp>> {
     let leaf = arb_simple_uop(dtype.clone());
 
     leaf.prop_recursive(depth as u32, depth as u32 * 4, 3, move |inner| {
@@ -233,7 +233,7 @@ pub fn arb_arithmetic_tree(dtype: DType, depth: usize) -> impl Strategy<Value = 
 }
 
 /// Generate an arithmetic tree with depth up to max_depth.
-pub fn arb_arithmetic_tree_up_to(dtype: DType, max_depth: usize) -> impl Strategy<Value = Rc<UOp>> {
+pub fn arb_arithmetic_tree_up_to(dtype: DType, max_depth: usize) -> impl Strategy<Value = Arc<UOp>> {
     (0..=max_depth).prop_flat_map(move |depth| arb_arithmetic_tree(dtype.clone(), depth))
 }
 
@@ -244,7 +244,7 @@ pub fn arb_arithmetic_tree_up_to(dtype: DType, max_depth: usize) -> impl Strateg
 /// Generate bounded constant for Z3 verification tests.
 /// Uses small values to avoid overflow when combined in arithmetic trees.
 /// Z3 uses unbounded integers, so we need to avoid values that would overflow.
-pub fn arb_bounded_const(dtype: DType) -> impl Strategy<Value = Rc<UOp>> {
+pub fn arb_bounded_const(dtype: DType) -> impl Strategy<Value = Arc<UOp>> {
     use morok_dtype::ScalarDType::*;
     (-100i64..=100).prop_map(move |v| {
         let cv = match dtype.scalar().unwrap() {
@@ -257,12 +257,12 @@ pub fn arb_bounded_const(dtype: DType) -> impl Strategy<Value = Rc<UOp>> {
 }
 
 /// Generate simple UOp with bounded constants (for Z3 tests).
-pub fn arb_simple_uop_bounded(dtype: DType) -> impl Strategy<Value = Rc<UOp>> {
+pub fn arb_simple_uop_bounded(dtype: DType) -> impl Strategy<Value = Arc<UOp>> {
     prop_oneof![arb_bounded_const(dtype.clone()), arb_var_uop(dtype),]
 }
 
 /// Generate arithmetic tree with bounded constants (for Z3 verification).
-pub fn arb_arithmetic_tree_bounded(dtype: DType, depth: usize) -> impl Strategy<Value = Rc<UOp>> {
+pub fn arb_arithmetic_tree_bounded(dtype: DType, depth: usize) -> impl Strategy<Value = Arc<UOp>> {
     let leaf = arb_simple_uop_bounded(dtype.clone());
 
     leaf.prop_recursive(depth as u32, depth as u32 * 4, 3, move |inner| {
@@ -282,7 +282,7 @@ pub fn arb_arithmetic_tree_bounded(dtype: DType, depth: usize) -> impl Strategy<
 }
 
 /// Generate bounded arithmetic tree with depth up to max_depth.
-pub fn arb_arithmetic_tree_bounded_up_to(dtype: DType, max_depth: usize) -> impl Strategy<Value = Rc<UOp>> {
+pub fn arb_arithmetic_tree_bounded_up_to(dtype: DType, max_depth: usize) -> impl Strategy<Value = Arc<UOp>> {
     (0..=max_depth).prop_flat_map(move |depth| arb_arithmetic_tree_bounded(dtype.clone(), depth))
 }
 
@@ -294,22 +294,22 @@ pub fn arb_arithmetic_tree_bounded_up_to(dtype: DType, max_depth: usize) -> impl
 #[derive(Debug, Clone)]
 pub enum KnownPropertyGraph {
     /// x + 0 (should simplify to x)
-    AddZero { x: Rc<UOp>, dtype: DType },
+    AddZero { x: Arc<UOp>, dtype: DType },
     /// x * 1 (should simplify to x)
-    MulOne { x: Rc<UOp>, dtype: DType },
+    MulOne { x: Arc<UOp>, dtype: DType },
     /// x - 0 (should simplify to x)
-    SubZero { x: Rc<UOp>, dtype: DType },
+    SubZero { x: Arc<UOp>, dtype: DType },
     /// x * 0 (should simplify to 0)
-    MulZero { x: Rc<UOp>, dtype: DType },
+    MulZero { x: Arc<UOp>, dtype: DType },
     /// x - x (should simplify to 0)
-    SubSelf { x: Rc<UOp>, dtype: DType },
+    SubSelf { x: Arc<UOp>, dtype: DType },
     /// x + x (should be equivalent to 2 * x)
-    AddSelf { x: Rc<UOp>, dtype: DType },
+    AddSelf { x: Arc<UOp>, dtype: DType },
 }
 
 impl KnownPropertyGraph {
     /// Build the UOp graph for this known property.
-    pub fn build(&self) -> Rc<UOp> {
+    pub fn build(&self) -> Arc<UOp> {
         match self {
             Self::AddZero { x, dtype } => {
                 let zero = ConstValue::zero(dtype.scalar().unwrap());
@@ -333,9 +333,9 @@ impl KnownPropertyGraph {
     }
 
     /// Get the expected simplified result (if deterministic).
-    pub fn expected_result(&self) -> Option<Rc<UOp>> {
+    pub fn expected_result(&self) -> Option<Arc<UOp>> {
         match self {
-            Self::AddZero { x, .. } | Self::MulOne { x, .. } | Self::SubZero { x, .. } => Some(Rc::clone(x)),
+            Self::AddZero { x, .. } | Self::MulOne { x, .. } | Self::SubZero { x, .. } => Some(Arc::clone(x)),
             Self::MulZero { dtype, .. } | Self::SubSelf { dtype, .. } => {
                 Some(UOp::const_(dtype.clone(), ConstValue::Int(0)))
             }
@@ -351,11 +351,11 @@ pub fn arb_known_property_graph() -> impl Strategy<Value = KnownPropertyGraph> {
             arb_var_uop(dtype.clone()).prop_flat_map(move |x| {
                 let dtype = dtype.clone();
                 prop_oneof![
-                    Just(KnownPropertyGraph::AddZero { x: Rc::clone(&x), dtype: dtype.clone() }),
-                    Just(KnownPropertyGraph::MulOne { x: Rc::clone(&x), dtype: dtype.clone() }),
-                    Just(KnownPropertyGraph::SubZero { x: Rc::clone(&x), dtype: dtype.clone() }),
-                    Just(KnownPropertyGraph::MulZero { x: Rc::clone(&x), dtype: dtype.clone() }),
-                    Just(KnownPropertyGraph::SubSelf { x: Rc::clone(&x), dtype: dtype.clone() }),
+                    Just(KnownPropertyGraph::AddZero { x: Arc::clone(&x), dtype: dtype.clone() }),
+                    Just(KnownPropertyGraph::MulOne { x: Arc::clone(&x), dtype: dtype.clone() }),
+                    Just(KnownPropertyGraph::SubZero { x: Arc::clone(&x), dtype: dtype.clone() }),
+                    Just(KnownPropertyGraph::MulZero { x: Arc::clone(&x), dtype: dtype.clone() }),
+                    Just(KnownPropertyGraph::SubSelf { x: Arc::clone(&x), dtype: dtype.clone() }),
                     Just(KnownPropertyGraph::AddSelf { x, dtype }),
                 ]
             })

@@ -5,5 +5,6 @@ pub mod broadcast;
 pub mod conditional;
 pub mod math;
 pub mod matmul;
+pub mod realize_binary;
 pub mod reduce;
 pub mod shape_ops;

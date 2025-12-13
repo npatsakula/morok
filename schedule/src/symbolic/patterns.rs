@@ -20,11 +20,11 @@ use morok_ir::{IntoUOp, Op, UOp};
 
 use crate::pattern::matcher::PatternMatcher;
 use crate::patterns;
-use crate::rangeify::helpers::get_const_value;
+use crate::rangeify::indexing::get_const_value;
 use crate::symbolic::dce::is_empty_range;
 
 use smallvec::SmallVec;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Constant folding patterns.
 ///
@@ -97,21 +97,37 @@ pub fn symbolic_simple() -> PatternMatcher {
         + zero_folding_dsl_patterns()
         + division_dsl_patterns()
         + cast_dsl_patterns()
+        + cast_where_dsl_patterns()
         + term_combining_dsl_patterns()
         + alu_folding_dsl_patterns()
         + advanced_division_dsl_patterns()
+        + div_mod_recombine_dsl_patterns()
         + comparison_dsl_patterns()
         + boolean_dsl_patterns()
         + minmax_dsl_patterns()
         + power_dsl_patterns()
         + negation_dsl_patterns()
+        + range_based_mod_div_patterns()
         + dce_dsl_patterns()
         + dead_loop_patterns()
 }
 
+/// Full symbolic simplification matcher.
+///
+/// Combines all symbolic patterns for comprehensive algebraic optimization:
+/// - Constant folding (unary, binary, ternary ops)
+/// - Identity folding (x+0→x, x*1→x)
+/// - Zero propagation (x*0→0, x&0→0)
+/// - Self-folding (x/x→1, x&x→x)
+/// - Division simplification
+/// - Cast optimization
+/// - Term combining
+/// - ALU folding
+/// - Comparison patterns
+/// - Boolean patterns
+/// - Dead code elimination
 pub fn symbolic() -> PatternMatcher {
-    // TODO: Add more complex symbolic patterns
-    PatternMatcher::new(vec![])
+    symbolic_simple()
 }
 
 /// Self-folding patterns.
@@ -131,9 +147,9 @@ pub fn self_folding_dsl_patterns() -> PatternMatcher {
         // (x % y) % y → x % y
         Mod(Mod(x, y), y) => x.try_mod(y).ok(),
         // x & x → x
-        And(x, x) ~> Rc::clone(x),
+        And(x, x) ~> Arc::clone(x),
         // x | x → x
-        Or(x, x) ~> Rc::clone(x),
+        Or(x, x) ~> Arc::clone(x),
     }
 }
 
@@ -154,6 +170,50 @@ pub fn zero_folding_dsl_patterns() -> PatternMatcher {
     }
 }
 
+/// Range-based modulo and division simplification patterns.
+///
+/// Uses vmin/vmax analysis to simplify:
+/// - x % n → x when 0 <= vmin(x) && vmax(x) < n
+/// - x / n → 0 when 0 <= vmin(x) && vmax(x) < n
+///
+/// This is critical for RESHAPE range propagation where Range(n) % n should simplify to Range(n).
+pub fn range_based_mod_div_patterns() -> PatternMatcher {
+    patterns! {
+        // x % n → x when 0 <= vmin(x) && vmax(x) < n
+        // This handles cases like Range(3) % 3 → Range(3)
+        Mod(x, n @const(n_val)) => {
+            let (vmin, vmax) = VminVmaxProperty::get(x);
+            // DEBUG
+            if std::env::var("MOROK_DEBUG_MOD").is_ok() {
+                eprintln!("[MOD SIMPLIFY] x.id={} vmin={:?} vmax={:?} n_val={:?}", x.id, vmin, vmax, n_val);
+            }
+            // Check if x is always non-negative and less than n
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val) {
+                if *min >= 0 && *max < n_int {
+                    if std::env::var("MOROK_DEBUG_MOD").is_ok() {
+                        eprintln!("[MOD SIMPLIFY] Simplifying x % {} → x (vmin={}, vmax={})", n_int, min, max);
+                    }
+                    return Some(Arc::clone(x));
+                }
+            }
+            None
+        },
+
+        // x / n → 0 when 0 <= vmin(x) && vmax(x) < n
+        // This handles cases like Range(3) / 3 → 0 (since Range(3) is 0,1,2 and all /3 = 0)
+        Idiv(x, n @const(n_val)) => {
+            let (vmin, vmax) = VminVmaxProperty::get(x);
+            // Check if x is always non-negative and less than n
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val) {
+                if *min >= 0 && *max < n_int && n_int > 0 {
+                    return Some(UOp::const_(x.dtype(), ConstValue::Int(0)));
+                }
+            }
+            None
+        },
+    }
+}
+
 /// Division simplification patterns.
 ///
 /// - x / x → 1.0 (float division)
@@ -164,9 +224,9 @@ pub fn division_dsl_patterns() -> PatternMatcher {
         // x / x → 1.0 (float division)
         Fdiv(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
         // (x * y) / y → x
-        Fdiv(Mul(x, y), y) ~> Rc::clone(x),
+        Fdiv(Mul(x, y), y) ~> Arc::clone(x),
         // (x * y) // y → x
-        Idiv(Mul(x, y), y) ~> Rc::clone(x),
+        Idiv(Mul(x, y), y) ~> Arc::clone(x),
     }
 }
 
@@ -180,9 +240,9 @@ pub fn cast_dsl_patterns() -> PatternMatcher {
         // cast(const) → const
         Cast { src: c @const(c_val), dtype } => c_val.cast(&dtype).map(|v| UOp::const_(dtype.clone(), v)),
         // x.cast(dtype) → x if same dtype
-        Cast { src: x, dtype } if x.dtype() == dtype ~> Rc::clone(x),
+        Cast { src: x, dtype } if x.dtype() == dtype ~> Arc::clone(x),
         // x.cast(a).cast(b) → x.cast(b)
-        Cast { src: Cast { src: x, .. }, dtype } ~> UOp::cast(Rc::clone(x), dtype.clone()),
+        Cast { src: Cast { src: x, .. }, dtype } ~> UOp::cast(Arc::clone(x), dtype.clone()),
     }
 }
 
@@ -253,18 +313,19 @@ pub fn advanced_division_dsl_patterns() -> PatternMatcher {
 /// - (x * c1) * c2 → x * (c1 * c2)
 /// - (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2)
 /// - (x + c1) - c2 → x + (c1 - c2) or x - (c2 - c1)
+/// - (x - c1) - c2 → x - (c1 + c2)
 pub fn alu_folding_dsl_patterns() -> PatternMatcher {
     patterns! {
-        // (x + c1) + c2 → x + (c1 + c2)
-        Add(Add(x, c1 @const(c1_val)), c2 @const(c2_val))
+        // (x + c1) + c2 → x + (c1 + c2) - commutative outer Add
+        Add[Add[x, c1 @const(c1_val)], c2 @const(c2_val)]
           => x.try_add(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
-        // (x * c1) * c2 → x * (c1 * c2)
-        Mul(Mul(x, c1 @const(c1_val)), c2 @const(c2_val))
+        // (x * c1) * c2 → x * (c1 * c2) - commutative outer Mul
+        Mul[Mul[x, c1 @const(c1_val)], c2 @const(c2_val)]
           => x.try_mul(&UOp::const_(c1.dtype(), eval_mul_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
-        // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2) when result is negative
-        Add(Sub(x, c1 @const(c1_val)), c2 @const(c2_val)) => {
+        // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2) - commutative outer Add
+        Add[Sub(x, c1 @const(c1_val)), c2 @const(c2_val)] => {
             let diff_val = eval_sub_typed(c2_val, c1_val, c1.dtype().base())?;
             // Normalize: prefer x - |c| over x + (-c)
             if let ConstValue::Int(v) = diff_val && v < 0 {
@@ -283,6 +344,10 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
             }
             x.try_add(&UOp::const_(c1.dtype(), diff_val)).ok()
         },
+
+        // (x - c1) - c2 → x - (c1 + c2)
+        Sub(Sub(x, c1 @const(c1_val)), c2 @const(c2_val))
+          => x.try_sub(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
     }
 }
 
@@ -295,32 +360,32 @@ pub fn dead_loop_patterns() -> PatternMatcher {
     use crate::symbolic::dce::reduce_identity;
 
     /// Check if END has any dead ranges (for guard).
-    fn has_dead_ranges(end_op: &Rc<UOp>) -> bool {
+    fn has_dead_ranges(end_op: &Arc<UOp>) -> bool {
         if let Op::End { ranges, .. } = end_op.op() { ranges.iter().any(is_empty_range) } else { false }
     }
 
     /// Check if all REDUCE ranges are empty (for guard).
-    fn all_ranges_empty(reduce_op: &Rc<UOp>) -> bool {
+    fn all_ranges_empty(reduce_op: &Arc<UOp>) -> bool {
         if let Op::Reduce { ranges, .. } = reduce_op.op() { ranges.iter().all(is_empty_range) } else { false }
     }
 
     /// Filter dead ranges from END, or unwrap if all dead.
-    fn filter_dead_ranges(end_op: &Rc<UOp>) -> Rc<UOp> {
+    fn filter_dead_ranges(end_op: &Arc<UOp>) -> Arc<UOp> {
         let Op::End { computation, ranges } = end_op.op() else { unreachable!("filter_dead_ranges called on non-End") };
 
-        let live_ranges: SmallVec<[Rc<UOp>; 4]> = ranges.iter().filter(|r| !is_empty_range(r)).cloned().collect();
+        let live_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.iter().filter(|r| !is_empty_range(r)).cloned().collect();
 
         if live_ranges.is_empty() {
             // All ranges dead - return computation directly
-            Rc::clone(computation)
+            Arc::clone(computation)
         } else {
             // Some ranges dead - create new END with only live ranges
-            UOp::end(Rc::clone(computation), live_ranges)
+            UOp::end(Arc::clone(computation), live_ranges)
         }
     }
 
     /// Get identity element for REDUCE with all empty ranges.
-    fn reduce_to_identity(reduce_op: &Rc<UOp>) -> Rc<UOp> {
+    fn reduce_to_identity(reduce_op: &Arc<UOp>) -> Arc<UOp> {
         let Op::Reduce { reduce_op: op, .. } = reduce_op.op() else {
             unreachable!("reduce_to_identity called on non-Reduce")
         };
@@ -353,19 +418,19 @@ pub fn dce_dsl_patterns() -> PatternMatcher {
         // WHERE with constant condition → select appropriate branch
         Where(cond, true_val, false_val) => {
             match VminVmaxProperty::get(cond) {
-                (ConstValue::Bool(true), ConstValue::Bool(true)) => Some(Rc::clone(true_val)),
-                (ConstValue::Bool(false), ConstValue::Bool(false)) => Some(Rc::clone(false_val)),
+                (ConstValue::Bool(true), ConstValue::Bool(true)) => Some(Arc::clone(true_val)),
+                (ConstValue::Bool(false), ConstValue::Bool(false)) => Some(Arc::clone(false_val)),
                 _ => None,
             }
         },
 
         // WHERE(_, same, same) → same
-        Where(_, t, t) ~> Rc::clone(t),
+        Where(_, t, t) ~> Arc::clone(t),
 
         // WHERE(x, true, false) → x (for bool x)
         Where(x, t @const(t_val), f @const(f_val))
           if x.dtype() == DType::Bool && t_val == ConstValue::Bool(true) && f_val == ConstValue::Bool(false)
-          ~> Rc::clone(x),
+          ~> Arc::clone(x),
 
         // WHERE(x, false, true) → !x (for bool x)
         Where(x, t @const(t_val), f @const(f_val))
@@ -373,7 +438,27 @@ pub fn dce_dsl_patterns() -> PatternMatcher {
           ~> x.not(),
 
         // WHERE(!cond, t, f) → WHERE(cond, f, t) - negated condition swap
-        Where(Not(cond), t, f) => UOp::try_where(Rc::clone(cond), Rc::clone(f), Rc::clone(t)).ok(),
+        Where(Not(cond), t, f) => UOp::try_where(Arc::clone(cond), Arc::clone(f), Arc::clone(t)).ok(),
+
+        // WHERE(a, WHERE(b, c, d), d) → WHERE(a & b, c, d) - branch merging
+        Where(a, Where(b, c, d), d2) if Arc::ptr_eq(d, d2) => {
+            let combined_cond = a.try_and_op(b).ok()?;
+            UOp::try_where(combined_cond, Arc::clone(c), Arc::clone(d)).ok()
+        },
+    }
+}
+
+/// Cast pushing through WHERE patterns.
+///
+/// - where(s, a, b).cast(dtype) → where(s, a.cast(dtype), b.cast(dtype))
+pub fn cast_where_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // cast(where(s, a, b), dtype) → where(s, cast(a, dtype), cast(b, dtype))
+        Cast { src: Where(s, a, b), dtype } => {
+            let cast_a = UOp::cast(Arc::clone(a), dtype.clone());
+            let cast_b = UOp::cast(Arc::clone(b), dtype.clone());
+            UOp::try_where(Arc::clone(s), cast_a, cast_b).ok()
+        },
     }
 }
 
@@ -383,12 +468,14 @@ pub fn dce_dsl_patterns() -> PatternMatcher {
 /// - Self-comparison fast path (x op x)
 /// - Constant folding
 /// - Range-based analysis via vmin/vmax
+/// - Const offset: (c0 + x) < c1 → x < (c1 - c0)
+/// - Negation flip: -x < -y → y < x
 pub fn comparison_dsl_patterns() -> PatternMatcher {
     patterns! {
         for op in binary [Lt, Eq, Ne] {
             op(x, y) => {
                 // 1. Self-comparison fast path (non-float only)
-                if Rc::ptr_eq(x, y) && !x.dtype().is_float() {
+                if Arc::ptr_eq(x, y) && !x.dtype().is_float() {
                     let result = match op {
                         BinaryOp::Lt => ConstValue::Bool(false),
                         BinaryOp::Eq => ConstValue::Bool(true),
@@ -412,7 +499,16 @@ pub fn comparison_dsl_patterns() -> PatternMatcher {
 
                 None
             }
-        }
+        },
+
+        // (c0 + x) < c1 → x < (c1 - c0) for integers - commutative
+        Lt(Add[c0 @const(c0_val), x], c1 @const(c1_val)) => {
+            let diff = eval_sub_typed(c1_val, c0_val, c0.dtype().base())?;
+            x.try_cmplt(&UOp::const_(c0.dtype(), diff)).ok()
+        },
+
+        // -x < -y → y < x (negation flip for Lt)
+        Lt(Neg(x), Neg(y)) => y.try_cmplt(x).ok(),
     }
 }
 
@@ -420,12 +516,36 @@ pub fn comparison_dsl_patterns() -> PatternMatcher {
 ///
 /// - !!x → x (double negation elimination)
 /// - x ^ x → 0 (xor self-cancellation)
+/// - x | !x → true (tautology)
+/// - x & !x → false (contradiction)
+/// - true | x → true, false & x → false
+/// - true & x → x, false | x → x (identity)
 pub fn boolean_dsl_patterns() -> PatternMatcher {
     patterns! {
         // !!x → x
-        Not(Not(x)) ~> Rc::clone(x),
+        Not(Not(x)) ~> Arc::clone(x),
         // x ^ x → 0
         Xor(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+
+        // x | !x → true (tautology) - commutative
+        Or[x, Not(y)] if Arc::ptr_eq(x, y) && x.dtype() == DType::Bool
+          => Some(UOp::const_(DType::Bool, ConstValue::Bool(true))),
+
+        // x & !x → false (contradiction) - commutative
+        And[x, Not(y)] if Arc::ptr_eq(x, y) && x.dtype() == DType::Bool
+          => Some(UOp::const_(DType::Bool, ConstValue::Bool(false))),
+
+        // true | x → true (commutative)
+        Or[t @const(t_val), _] if t_val == ConstValue::Bool(true) ~> Arc::clone(t),
+
+        // false & x → false (commutative)
+        And[f @const(f_val), _] if f_val == ConstValue::Bool(false) ~> Arc::clone(f),
+
+        // true & x → x (identity, commutative)
+        And[c @const(c_val), x] if c_val == ConstValue::Bool(true) ~> Arc::clone(x),
+
+        // false | x → x (identity, commutative)
+        Or[c @const(c_val), x] if c_val == ConstValue::Bool(false) ~> Arc::clone(x),
     }
 }
 
@@ -436,7 +556,7 @@ pub fn boolean_dsl_patterns() -> PatternMatcher {
 pub fn minmax_dsl_patterns() -> PatternMatcher {
     patterns! {
         // max(x, x) → x
-        Max(x, x) ~> Rc::clone(x),
+        Max(x, x) ~> Arc::clone(x),
     }
 }
 
@@ -449,7 +569,7 @@ pub fn power_dsl_patterns() -> PatternMatcher {
         // x ** 0 → 1
         Pow(x, c @const(c_val)) if c_val.is_zero() => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
         // x ** 1 → x
-        Pow(x, c @const(c_val)) if c_val.is_one() ~> Rc::clone(x),
+        Pow(x, c @const(c_val)) if c_val.is_one() ~> Arc::clone(x),
     }
 }
 
@@ -459,6 +579,31 @@ pub fn power_dsl_patterns() -> PatternMatcher {
 pub fn negation_dsl_patterns() -> PatternMatcher {
     patterns! {
         // Double arithmetic negation: -(-x) → x
-        Neg(Neg(x)) ~> Rc::clone(x),
+        Neg(Neg(x)) ~> Arc::clone(x),
+    }
+}
+
+/// Div/Mod recombination patterns.
+///
+/// - x%n + (x//n)*n → x (div-mod identity)
+/// - (x//n)*n + x%n → x (commutative form)
+/// - (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division)
+pub fn div_mod_recombine_dsl_patterns() -> PatternMatcher {
+    patterns! {
+        // x%n + (x//n)*n → x (div-mod identity)
+        Add[Mod(x, n), Mul[Idiv(x2, n2), n3]]
+          if Arc::ptr_eq(x, x2) && Arc::ptr_eq(n, n2) && Arc::ptr_eq(n, n3)
+          ~> Arc::clone(x),
+
+        // (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division simplification)
+        // e.g., (a//2 + 1) // 2 → (a + 2) // 4
+        Idiv(Add[Idiv(a, c1 @const(c1_val)), c2 @const(c2_val)], c3 @const(c3_val)) => {
+            // Compute c1 * c2 and c1 * c3
+            let c1_times_c2 = eval_mul_typed(c1_val, c2_val, c1.dtype().base())?;
+            let c1_times_c3 = eval_mul_typed(c1_val, c3_val, c1.dtype().base())?;
+            // (a + c1*c2) // (c1*c3)
+            a.try_add(&UOp::const_(c1.dtype(), c1_times_c2)).ok()?
+             .try_div(&UOp::const_(c1.dtype(), c1_times_c3)).ok()
+        },
     }
 }

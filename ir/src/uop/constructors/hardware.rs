@@ -6,7 +6,7 @@
 //! - Multi-device: mstack, mselect
 //! - Kernels: kernel
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use smallvec::SmallVec;
@@ -24,7 +24,7 @@ impl UOp {
     ///
     /// Computes D = A × B + C using hardware matrix units.
     /// `metadata` specifies dimensions, dtypes, and upcast axes for vectorization.
-    pub fn wmma(a: Rc<Self>, b: Rc<Self>, c: Rc<Self>, metadata: WmmaMetadata) -> Rc<Self> {
+    pub fn wmma(a: Arc<Self>, b: Arc<Self>, c: Arc<Self>, metadata: WmmaMetadata) -> Arc<Self> {
         let base_dtype = metadata.dtype_out.clone();
 
         // Calculate vector size from upcast axes (product of all axis sizes)
@@ -40,7 +40,7 @@ impl UOp {
     // =========================================================================
 
     /// Create vector from scalar elements.
-    pub fn vectorize(elements: SmallVec<[Rc<Self>; 4]>) -> Rc<Self> {
+    pub fn vectorize(elements: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
         let base_dtype = if let Some(first) = elements.first() {
             first.dtype()
         } else {
@@ -51,7 +51,7 @@ impl UOp {
     }
 
     /// Get element pointer (extract element(s) from vector).
-    pub fn gep(vector: Rc<Self>, indices: Vec<usize>) -> Rc<Self> {
+    pub fn gep(vector: Arc<Self>, indices: Vec<usize>) -> Arc<Self> {
         let vector_dtype = vector.dtype();
 
         // Extract scalar if single element, keep vector if multiple
@@ -76,7 +76,7 @@ impl UOp {
     ///
     /// Pairs with UNROLL: UNROLL expands loops for optimization,
     /// CONTRACT combines the results. Used in WMMA and vectorization passes.
-    pub fn contract(src: Rc<Self>, upcast_ranges: Vec<(usize, usize)>) -> Rc<Self> {
+    pub fn contract(src: Arc<Self>, upcast_ranges: Vec<(usize, usize)>) -> Arc<Self> {
         let base_dtype = src.dtype();
 
         // Calculate vector size from upcast ranges (product of all range sizes)
@@ -91,7 +91,7 @@ impl UOp {
     ///
     /// Creates multiple versions of the computation for each unroll axis.
     /// Pairs with CONTRACT which combines results back together.
-    pub fn unroll(src: Rc<Self>, unroll_axes: Vec<(usize, usize)>) -> Rc<Self> {
+    pub fn unroll(src: Arc<Self>, unroll_axes: Vec<(usize, usize)>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Unroll { src, unroll_axes }, dtype)
     }
@@ -103,7 +103,7 @@ impl UOp {
     ///
     /// Like VECTORIZE but sources can be vectors themselves.
     /// Output dtype vcount = sum of all input vcounts.
-    pub fn cat(sources: Vec<Rc<Self>>) -> Rc<Self> {
+    pub fn cat(sources: Vec<Arc<Self>>) -> Arc<Self> {
         assert!(!sources.is_empty(), "CAT requires at least one source");
         let dtype = sources[0].dtype.clone();
         Self::new(Op::Cat { sources: SmallVec::from_vec(sources) }, dtype)
@@ -113,7 +113,7 @@ impl UOp {
     ///
     /// Combines multiple pointer indices into a vectorized pointer.
     /// This is an expander-level operation used in devectorizer for grouping memory accesses.
-    pub fn ptrcat(sources: Vec<Rc<Self>>) -> Rc<Self> {
+    pub fn ptrcat(sources: Vec<Arc<Self>>) -> Arc<Self> {
         assert!(!sources.is_empty(), "PTRCAT requires at least one source");
         let dtype = sources[0].dtype.clone();
         Self::new(Op::PtrCat { sources: SmallVec::from_vec(sources) }, dtype)
@@ -127,7 +127,7 @@ impl UOp {
     ///
     /// MStack combines buffers from multiple devices into a single logical tensor.
     /// Used for distributed/multi-GPU tensor operations.
-    pub fn mstack(buffers: SmallVec<[Rc<Self>; 4]>) -> Rc<Self> {
+    pub fn mstack(buffers: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
         let dtype = buffers.first().map(|b| b.dtype()).unwrap_or(DType::Void);
         Self::new(Op::MStack { buffers }, dtype)
     }
@@ -135,7 +135,7 @@ impl UOp {
     /// Select buffer by device index (multi-device access).
     ///
     /// MSelect retrieves a specific device's buffer from a multi-device tensor.
-    pub fn mselect(buffer: Rc<Self>, device_index: usize) -> Rc<Self> {
+    pub fn mselect(buffer: Arc<Self>, device_index: usize) -> Arc<Self> {
         let dtype = buffer.dtype();
         Self::new(Op::MSelect { buffer, device_index }, dtype)
     }
@@ -152,7 +152,7 @@ impl UOp {
     ///
     /// * `sources` - Kernel arguments (buffers and variables)
     /// * `ast` - The computation graph (usually SINK, COPY, or BUFFER_VIEW)
-    pub fn kernel(sources: SmallVec<[Rc<Self>; 4]>, ast: Rc<Self>) -> Rc<Self> {
+    pub fn kernel(sources: SmallVec<[Arc<Self>; 4]>, ast: Arc<Self>) -> Arc<Self> {
         Self::new(Op::Kernel { sources, ast }, DType::Void)
     }
 }

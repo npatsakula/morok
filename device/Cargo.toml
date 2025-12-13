@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 morok-dtype = { path = "../dtype" }
+morok-ir = { path = "../ir" }
 
 ndarray.workspace = true
 enum_delegate.workspace = true

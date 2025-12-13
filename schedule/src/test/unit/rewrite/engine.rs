@@ -1,13 +1,13 @@
 use crate::{PatternMatcher, graph_rewrite, pattern::UPat};
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, Op, UOp};
-use std::rc::Rc;
+use morok_ir::{BinaryOp, ConstValue, Op, UOp, pattern};
+use std::sync::Arc;
 
-fn const_uop(val: i64) -> Rc<UOp> {
+fn const_uop(val: i64) -> Arc<UOp> {
     UOp::const_(DType::Int32, ConstValue::Int(val))
 }
 
-fn binary_uop(op: BinaryOp, a: Rc<UOp>, b: Rc<UOp>) -> Rc<UOp> {
+fn binary_uop(op: BinaryOp, a: Arc<UOp>, b: Arc<UOp>) -> Arc<UOp> {
     let dtype = a.dtype();
     UOp::new(Op::Binary(op, a, b), dtype)
 }
@@ -18,10 +18,10 @@ fn test_simple_rewrite() {
     let mut patterns = vec![];
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Rc<UOp>, zero: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Arc<UOp>, zero: &Arc<UOp>| {
             if let Op::Const(cv) = zero.op()
                 && cv.0 == ConstValue::Int(0) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
@@ -35,7 +35,7 @@ fn test_simple_rewrite() {
     let add = binary_uop(BinaryOp::Add, five.clone(), zero);
 
     let result = graph_rewrite(&matcher, add, &mut ());
-    assert!(Rc::ptr_eq(&result, &five));
+    assert!(Arc::ptr_eq(&result, &five));
 }
 
 #[test]
@@ -44,10 +44,10 @@ fn test_nested_rewrite() {
     let mut patterns = vec![];
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Rc<UOp>, zero: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Arc<UOp>, zero: &Arc<UOp>| {
             if let Op::Const(cv) = zero.op()
                 && cv.0 == ConstValue::Int(0) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
@@ -62,7 +62,7 @@ fn test_nested_rewrite() {
     let outer_add = binary_uop(BinaryOp::Add, inner_add, zero);
 
     let result = graph_rewrite(&matcher, outer_add, &mut ());
-    assert!(Rc::ptr_eq(&result, &five));
+    assert!(Arc::ptr_eq(&result, &five));
 }
 
 #[test]
@@ -71,10 +71,10 @@ fn test_fixed_point_iteration() {
     let mut patterns = vec![];
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Mul], vec![UPat::var("x"), UPat::cvar("one")]) => |x: &Rc<UOp>, one: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Mul], vec![UPat::var("x"), UPat::cvar("one")]) => |x: &Arc<UOp>, one: &Arc<UOp>| {
             if let Op::Const(cv) = one.op()
                 && cv.0 == ConstValue::Int(1) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
@@ -89,7 +89,7 @@ fn test_fixed_point_iteration() {
     let outer_mul = binary_uop(BinaryOp::Mul, inner_mul, one);
 
     let result = graph_rewrite(&matcher, outer_mul, &mut ());
-    assert!(Rc::ptr_eq(&result, &five));
+    assert!(Arc::ptr_eq(&result, &five));
 }
 
 #[test]
@@ -99,20 +99,20 @@ fn test_multiple_patterns() {
     let mut patterns = vec![];
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Rc<UOp>, c: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Arc<UOp>, c: &Arc<UOp>| {
             if let Op::Const(cv) = c.op()
                 && cv.0 == ConstValue::Int(0) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
     );
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Mul], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Rc<UOp>, c: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Mul], vec![UPat::var("x"), UPat::cvar("c")]) => |x: &Arc<UOp>, c: &Arc<UOp>| {
             if let Op::Const(cv) = c.op()
                 && cv.0 == ConstValue::Int(1) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
@@ -128,7 +128,7 @@ fn test_multiple_patterns() {
     let mul = binary_uop(BinaryOp::Mul, add, one);
 
     let result = graph_rewrite(&matcher, mul, &mut ());
-    assert!(Rc::ptr_eq(&result, &five));
+    assert!(Arc::ptr_eq(&result, &five));
 }
 
 #[test]
@@ -137,10 +137,10 @@ fn test_no_rewrite() {
     let mut patterns = vec![];
 
     pattern!(patterns,
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Rc<UOp>, zero: &Rc<UOp>| {
+        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::cvar("zero")]) => |x: &Arc<UOp>, zero: &Arc<UOp>| {
             if let Op::Const(cv) = zero.op()
                 && cv.0 == ConstValue::Int(0) {
-                    return Some(Rc::clone(x));
+                    return Some(Arc::clone(x));
                 }
             None
         }
@@ -155,5 +155,5 @@ fn test_no_rewrite() {
 
     let result = graph_rewrite(&matcher, add.clone(), &mut ());
     // Should return original (no rewrite)
-    assert!(Rc::ptr_eq(&result, &add));
+    assert!(Arc::ptr_eq(&result, &add));
 }

@@ -41,7 +41,7 @@ fn has_extractable_fields(fields: &[FieldPattern]) -> bool {
 /// 1. Records the first `x` normally
 /// 2. Renames the second `x` to `x__dup` and records the pair
 ///
-/// The rewrite function then generates `Rc::ptr_eq(&x, &x__dup)` checks.
+/// The rewrite function then generates `Arc::ptr_eq(&x, &x__dup)` checks.
 #[derive(Default)]
 struct DuplicateTracker {
     /// Variable names we've seen so far
@@ -224,22 +224,22 @@ pub fn generate_pattern_matcher(patterns: &PatternList) -> Result<TokenStream2> 
         Ok(quote! {
             {
                 let mut __patterns: Vec<(
-                    morok_schedule::pattern::UPat,
-                    morok_schedule::pattern::matcher::RewriteFn<#ctx_type>
+                    morok_ir::pattern::UPat,
+                    morok_ir::pattern::matcher::RewriteFn<#ctx_type>
                 )> = Vec::new();
                 #(#pattern_exprs)*
-                morok_schedule::pattern::PatternMatcher::<#ctx_type>::new(__patterns)
+                morok_ir::pattern::PatternMatcher::<#ctx_type>::new(__patterns)
             }
         })
     } else {
         Ok(quote! {
             {
                 let mut __patterns: Vec<(
-                    morok_schedule::pattern::UPat,
-                    morok_schedule::pattern::matcher::RewriteFn<()>
+                    morok_ir::pattern::UPat,
+                    morok_ir::pattern::matcher::RewriteFn<()>
                 )> = Vec::new();
                 #(#pattern_exprs)*
-                morok_schedule::pattern::PatternMatcher::<()>::new(__patterns)
+                morok_ir::pattern::PatternMatcher::<()>::new(__patterns)
             }
         })
     }
@@ -290,8 +290,8 @@ fn generate_rule(rule: &PatternRule, iter_ctx: Option<&IterContext>, has_context
         Ok(quote! {
             __patterns.push((
                 #pattern_code,
-                Box::new(|__bindings: &morok_schedule::pattern::BindingStore, __intern: &morok_schedule::pattern::VarIntern, ctx: &mut _| {
-                    use morok_schedule::pattern::BindingStoreExt;
+                Box::new(|__bindings: &morok_ir::pattern::BindingStore, __intern: &morok_ir::pattern::VarIntern, ctx: &mut _| {
+                    use morok_ir::pattern::BindingStoreExt;
                     #(#bindings)*
                     #rewrite_code
                 }),
@@ -301,11 +301,11 @@ fn generate_rule(rule: &PatternRule, iter_ctx: Option<&IterContext>, has_context
         Ok(quote! {
             __patterns.push((
                 #pattern_code,
-                Box::new(|__bindings: &morok_schedule::pattern::BindingStore, __intern: &morok_schedule::pattern::VarIntern, _ctx: &mut ()| {
-                    use morok_schedule::pattern::BindingStoreExt;
+                Box::new(|__bindings: &morok_ir::pattern::BindingStore, __intern: &morok_ir::pattern::VarIntern, _ctx: &mut ()| {
+                    use morok_ir::pattern::BindingStoreExt;
                     #(#bindings)*
                     #rewrite_code
-                }) as morok_schedule::pattern::matcher::RewriteFn<()>,
+                }) as morok_ir::pattern::matcher::RewriteFn<()>,
             ));
         })
     }
@@ -330,7 +330,7 @@ fn generate_pattern_with_tracker(
         Pattern::Wildcard => {
             // Wildcard matches any UOp but doesn't bind
             let code = quote! {
-                morok_schedule::pattern::UPat::Match {
+                morok_ir::pattern::UPat::Match {
                     op: None,
                     dtype: None,
                     src: None,
@@ -348,7 +348,7 @@ fn generate_pattern_with_tracker(
             } else {
                 name.to_string()
             };
-            let code = quote! { morok_schedule::pattern::UPat::var(#actual_name) };
+            let code = quote! { morok_ir::pattern::UPat::var(#actual_name) };
             Ok(PatternOutput::self_only(code, Ident::new(&actual_name, name.span())))
         }
 
@@ -389,7 +389,7 @@ fn generate_pattern_with_tracker(
             } else {
                 uop_name.to_string()
             };
-            let code = quote! { morok_schedule::pattern::UPat::cvar(#actual_name) };
+            let code = quote! { morok_ir::pattern::UPat::cvar(#actual_name) };
             // Only uop_name is bound; value_name is extracted separately in generate_rewrite
             Ok(PatternOutput::self_only(code, Ident::new(&actual_name, uop_name.span())))
         }
@@ -411,7 +411,7 @@ fn generate_pattern_with_tracker(
 
             let alt_codes: Vec<&TokenStream2> = alt_outputs.iter().map(|o| &o.code).collect();
             let code = quote! {
-                morok_schedule::pattern::UPat::any(vec![#(#alt_codes),*])
+                morok_ir::pattern::UPat::any(vec![#(#alt_codes),*])
             };
 
             Ok(PatternOutput::children_only(code, child_names))
@@ -443,7 +443,7 @@ fn generate_pattern_with_tracker(
                 if BINARY_OPS.contains(&op_name.as_str()) {
                     let binary_op = format_ident!("{}", op_name);
                     quote! {
-                        morok_schedule::pattern::UPat::binary_commutative(
+                        morok_ir::pattern::UPat::binary_commutative(
                             vec![morok_ir::BinaryOp::#binary_op],
                             vec![#left, #right]
                         )
@@ -486,7 +486,8 @@ const BINARY_OPS: &[&str] = &[
 ];
 
 /// Unary IR operations.
-const UNARY_OPS: &[&str] = &["Neg", "Not", "Abs", "Sqrt", "Exp", "Log", "Sin", "Cos"];
+const UNARY_OPS: &[&str] =
+    &["Neg", "Not", "Abs", "Sqrt", "Exp", "Log", "Sin", "Cos", "Exp2", "Log2", "Tan", "Rsqrt", "Erf"];
 
 /// Ternary IR operations.
 const TERNARY_OPS: &[&str] = &["Where", "MulAcc"];
@@ -552,7 +553,7 @@ fn generate_op_tuple_pattern_with_tracker(
             let right = &arg_codes[1];
             let binary_op = format_ident!("{}", op_name);
             quote! {
-                morok_schedule::pattern::UPat::binary(
+                morok_ir::pattern::UPat::binary(
                     vec![morok_ir::BinaryOp::#binary_op],
                     vec![#left, #right]
                 )
@@ -566,7 +567,7 @@ fn generate_op_tuple_pattern_with_tracker(
             let arg = &arg_codes[0];
             let unary_op = format_ident!("{}", op_name);
             quote! {
-                morok_schedule::pattern::UPat::unary(
+                morok_ir::pattern::UPat::unary(
                     vec![morok_ir::UnaryOp::#unary_op],
                     #arg
                 )
@@ -582,7 +583,7 @@ fn generate_op_tuple_pattern_with_tracker(
             let c = &arg_codes[2];
             let ternary_op = format_ident!("{}", op_name);
             quote! {
-                morok_schedule::pattern::UPat::ternary(
+                morok_ir::pattern::UPat::ternary(
                     vec![morok_ir::TernaryOp::#ternary_op],
                     vec![#a, #b, #c]
                 )
@@ -595,7 +596,7 @@ fn generate_op_tuple_pattern_with_tracker(
             }
             let src = &arg_codes[0];
             let helper_ident = format_ident!("{}", helper);
-            quote! { morok_schedule::pattern::UPat::#helper_ident(#src) }
+            quote! { morok_ir::pattern::UPat::#helper_ident(#src) }
         }
 
         OpClass::Special => generate_special_op_pattern(op, &op_name, args, &arg_codes, rest)?,
@@ -615,7 +616,7 @@ fn generate_special_op_pattern(
     match op_name {
         "Reduce" => {
             if rest {
-                Ok(quote! { morok_schedule::pattern::UPat::reduce_any() })
+                Ok(quote! { morok_ir::pattern::UPat::reduce_any() })
             } else {
                 if args.len() != 1 {
                     return Err(Error::new_spanned(
@@ -624,13 +625,13 @@ fn generate_special_op_pattern(
                     ));
                 }
                 let src = &arg_codes[0];
-                Ok(quote! { morok_schedule::pattern::UPat::reduce(#src) })
+                Ok(quote! { morok_ir::pattern::UPat::reduce(#src) })
             }
         }
 
         "End" => {
             if rest {
-                Ok(quote! { morok_schedule::pattern::UPat::end_any() })
+                Ok(quote! { morok_ir::pattern::UPat::end_any() })
             } else {
                 if args.len() != 1 {
                     return Err(Error::new_spanned(
@@ -639,7 +640,7 @@ fn generate_special_op_pattern(
                     ));
                 }
                 let computation = &arg_codes[0];
-                Ok(quote! { morok_schedule::pattern::UPat::end(#computation) })
+                Ok(quote! { morok_ir::pattern::UPat::end(#computation) })
             }
         }
 
@@ -650,7 +651,7 @@ fn generate_special_op_pattern(
             let buffer = &arg_codes[0];
             let index = &arg_codes[1];
             let value = &arg_codes[2];
-            Ok(quote! { morok_schedule::pattern::UPat::store(#buffer, #index, #value) })
+            Ok(quote! { morok_ir::pattern::UPat::store(#buffer, #index, #value) })
         }
 
         "Load" => {
@@ -659,7 +660,7 @@ fn generate_special_op_pattern(
             }
             let buffer = &arg_codes[0];
             let index = &arg_codes[1];
-            Ok(quote! { morok_schedule::pattern::UPat::load(#buffer, #index) })
+            Ok(quote! { morok_ir::pattern::UPat::load(#buffer, #index) })
         }
 
         "Bind" => {
@@ -668,7 +669,7 @@ fn generate_special_op_pattern(
             }
             let var = &arg_codes[0];
             let value = &arg_codes[1];
-            Ok(quote! { morok_schedule::pattern::UPat::bind(#var, #value) })
+            Ok(quote! { morok_ir::pattern::UPat::bind(#var, #value) })
         }
 
         "Const" => Err(Error::new_spanned(op, "Use Const(value) or Const(_) syntax for constants")),
@@ -714,8 +715,8 @@ fn generate_op_struct_pattern_with_depth(
         "Expand" => quote! { #first_code.f_expand() },
         "Reduce" => quote! { #first_code.f_reduce() },
         "Copy" => quote! { #first_code.f_copy() },
-        "Detach" => quote! { morok_schedule::pattern::UPat::detach(#first_code) },
-        "ContiguousBackward" => quote! { morok_schedule::pattern::UPat::contiguous_backward(#first_code) },
+        "Detach" => quote! { morok_ir::pattern::UPat::detach(#first_code) },
+        "ContiguousBackward" => quote! { morok_ir::pattern::UPat::contiguous_backward(#first_code) },
         _ => {
             return Err(Error::new_spanned(op, format!("Unknown operation for struct pattern: {}", op_name)));
         }
@@ -758,27 +759,27 @@ fn generate_const_pattern(const_pat: &ConstPattern) -> Result<PatternOutput> {
     match const_pat {
         ConstPattern::Any => {
             let name = binding_names::CONST;
-            let code = quote! { morok_schedule::pattern::UPat::cvar(#name) };
+            let code = quote! { morok_ir::pattern::UPat::cvar(#name) };
             Ok(PatternOutput::self_only(code, Ident::new(binding_names::CONST, proc_macro2::Span::call_site())))
         }
         ConstPattern::Int(0) | ConstPattern::Zero => {
             let name = binding_names::ZERO;
-            let code = quote! { morok_schedule::pattern::UPat::zero_const(#name) };
+            let code = quote! { morok_ir::pattern::UPat::zero_const(#name) };
             Ok(PatternOutput::self_only(code, Ident::new(binding_names::ZERO, proc_macro2::Span::call_site())))
         }
         ConstPattern::Int(value) => {
-            let code = quote! { morok_schedule::pattern::UPat::int(#value) };
+            let code = quote! { morok_ir::pattern::UPat::int(#value) };
             // Int patterns (except 0) don't bind - no names
             Ok(PatternOutput::no_names(code))
         }
         ConstPattern::Float(value) => {
-            let code = quote! { morok_schedule::pattern::UPat::float(#value) };
+            let code = quote! { morok_ir::pattern::UPat::float(#value) };
             // Float patterns don't bind - no names
             Ok(PatternOutput::no_names(code))
         }
         ConstPattern::One => {
             let name = binding_names::ONE;
-            let code = quote! { morok_schedule::pattern::UPat::one_const(#name) };
+            let code = quote! { morok_ir::pattern::UPat::one_const(#name) };
             Ok(PatternOutput::self_only(code, Ident::new(binding_names::ONE, proc_macro2::Span::call_site())))
         }
     }
@@ -820,7 +821,7 @@ fn generate_op_var_pattern_with_tracker(
             }
             let arg = &arg_codes[0];
             quote! {
-                morok_schedule::pattern::UPat::unary(
+                morok_ir::pattern::UPat::unary(
                     vec![morok_ir::UnaryOp::#op_ident],
                     #arg
                 )
@@ -833,7 +834,7 @@ fn generate_op_var_pattern_with_tracker(
             let left = &arg_codes[0];
             let right = &arg_codes[1];
             quote! {
-                morok_schedule::pattern::UPat::binary(
+                morok_ir::pattern::UPat::binary(
                     vec![morok_ir::BinaryOp::#op_ident],
                     vec![#left, #right]
                 )
@@ -847,7 +848,7 @@ fn generate_op_var_pattern_with_tracker(
             let then_val = &arg_codes[1];
             let else_val = &arg_codes[2];
             quote! {
-                morok_schedule::pattern::UPat::ternary(
+                morok_ir::pattern::UPat::ternary(
                     vec![morok_ir::TernaryOp::#op_ident],
                     vec![#cond, #then_val, #else_val]
                 )
@@ -873,8 +874,8 @@ fn collect_used_identifiers(expr: &syn::Expr, used: &mut std::collections::HashS
         }
 
         fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
-            // For paths like `x` or `Rc::clone`, only collect the first segment
-            // if it's a simple identifier (not a type path like `Rc`)
+            // For paths like `x` or `Arc::clone`, only collect the first segment
+            // if it's a simple identifier (not a type path like `Arc`)
             if node.path.segments.len() == 1 {
                 self.used.insert(node.path.segments[0].ident.to_string());
             }
@@ -998,20 +999,20 @@ fn generate_rewrite(
             quote! {
                 let #name = match __bindings.get_by_index(#idx_u8) {
                     Some(v) => v,
-                    None => return morok_schedule::pattern::matcher::RewriteResult::NoMatch,
+                    None => return morok_ir::pattern::matcher::RewriteResult::NoMatch,
                 };
             }
         })
         .collect();
 
     // Generate auto ptr_eq checks for duplicate variable names
-    // e.g., Add(x, x) generates: if !Rc::ptr_eq(&x, &x__dup) { return NoMatch }
+    // e.g., Add(x, x) generates: if !Arc::ptr_eq(&x, &x__dup) { return NoMatch }
     for (orig, dup) in duplicate_pairs {
         let orig_ident = format_ident!("{}", orig);
         let dup_ident = format_ident!("{}", dup);
         bindings.push(quote! {
-            if !std::rc::Rc::ptr_eq(#orig_ident, #dup_ident) {
-                return morok_schedule::pattern::matcher::RewriteResult::NoMatch;
+            if !std::sync::Arc::ptr_eq(#orig_ident, #dup_ident) {
+                return morok_ir::pattern::matcher::RewriteResult::NoMatch;
             }
         });
     }
@@ -1045,7 +1046,7 @@ fn generate_rewrite(
         bindings.push(quote! {
             let #value_name = match #uop_name.op() {
                 morok_ir::Op::Const(cv) => cv.0,
-                _ => return morok_schedule::pattern::matcher::RewriteResult::NoMatch,
+                _ => return morok_ir::pattern::matcher::RewriteResult::NoMatch,
             };
         });
     }
@@ -1059,10 +1060,10 @@ fn generate_rewrite(
     Ok((bindings, rewrite_code))
 }
 
-/// Generate code for `~>` (infallible) - RHS returns Rc<UOp>
+/// Generate code for `~>` (infallible) - RHS returns Arc<UOp>
 fn generate_infallible_rewrite(rhs: &RewriteExpr, guard: &Option<syn::Expr>) -> TokenStream2 {
     let rhs_expr = match rhs {
-        RewriteExpr::Var(name) => quote! { std::rc::Rc::clone(#name) },
+        RewriteExpr::Var(name) => quote! { std::sync::Arc::clone(#name) },
         RewriteExpr::Expr(expr) => quote! { #expr },
         RewriteExpr::Block(block) => quote! { #block },
     };
@@ -1070,33 +1071,33 @@ fn generate_infallible_rewrite(rhs: &RewriteExpr, guard: &Option<syn::Expr>) -> 
     if let Some(guard_expr) = guard {
         quote! {
             if #guard_expr {
-                morok_schedule::pattern::matcher::RewriteResult::Rewritten(#rhs_expr)
+                morok_ir::pattern::matcher::RewriteResult::Rewritten(#rhs_expr)
             } else {
-                morok_schedule::pattern::matcher::RewriteResult::NoMatch
+                morok_ir::pattern::matcher::RewriteResult::NoMatch
             }
         }
     } else {
         quote! {
-            morok_schedule::pattern::matcher::RewriteResult::Rewritten(#rhs_expr)
+            morok_ir::pattern::matcher::RewriteResult::Rewritten(#rhs_expr)
         }
     }
 }
 
-/// Generate code for `=>` (fallible) - RHS returns Option<Rc<UOp>>
+/// Generate code for `=>` (fallible) - RHS returns Option<Arc<UOp>>
 fn generate_fallible_rewrite(rhs: &RewriteExpr, guard: &Option<syn::Expr>) -> TokenStream2 {
     let rhs_expr = match rhs {
         // For simple variable, wrap in Some() for convenience
-        RewriteExpr::Var(name) => quote! { Some(std::rc::Rc::clone(#name)) },
+        RewriteExpr::Var(name) => quote! { Some(std::sync::Arc::clone(#name)) },
         // For expressions and blocks, wrap in a closure so `?` operator works
-        // The closure returns Option<Rc<UOp>>
+        // The closure returns Option<Arc<UOp>>
         RewriteExpr::Expr(expr) => quote! { (|| #expr)() },
         RewriteExpr::Block(block) => quote! { (|| #block)() },
     };
 
     let conversion = quote! {
         match #rhs_expr {
-            Some(__v) => morok_schedule::pattern::matcher::RewriteResult::Rewritten(__v),
-            None => morok_schedule::pattern::matcher::RewriteResult::NoMatch,
+            Some(__v) => morok_ir::pattern::matcher::RewriteResult::Rewritten(__v),
+            None => morok_ir::pattern::matcher::RewriteResult::NoMatch,
         }
     };
 
@@ -1105,7 +1106,7 @@ fn generate_fallible_rewrite(rhs: &RewriteExpr, guard: &Option<syn::Expr>) -> To
             if #guard_expr {
                 #conversion
             } else {
-                morok_schedule::pattern::matcher::RewriteResult::NoMatch
+                morok_ir::pattern::matcher::RewriteResult::NoMatch
             }
         }
     } else {
@@ -1126,11 +1127,11 @@ fn generate_field_extraction_from_binding(binding_name: &str, op_name: &str, fie
         let #field_name = {
             let __bound = match __intern.get_index(#binding_name).and_then(|i| __bindings.get_by_index(i)) {
                 Some(v) => v,
-                None => return morok_schedule::pattern::matcher::RewriteResult::NoMatch,
+                None => return morok_ir::pattern::matcher::RewriteResult::NoMatch,
             };
             match __bound.op() {
                 morok_ir::Op::#op_ident { #field_name, .. } => #field_name.clone(),
-                _ => return morok_schedule::pattern::matcher::RewriteResult::NoMatch,
+                _ => return morok_ir::pattern::matcher::RewriteResult::NoMatch,
             }
         };
     }

@@ -4,9 +4,15 @@ use snafu::Snafu;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
-    #[snafu(display("IR operation error"))]
+    // =========================================================================
+    // IR Layer Errors
+    // =========================================================================
+    #[snafu(display("IR operation error: {source}"))]
     UOp { source: morok_ir::Error },
 
+    // =========================================================================
+    // Shape Errors
+    // =========================================================================
     #[snafu(display("Tensor shape is unknown (symbolic or not yet inferred)"))]
     ShapeUnknown,
 
@@ -39,9 +45,15 @@ pub enum Error {
     #[snafu(display("Cannot squeeze dimension {dim}: size is {size}, not 1"))]
     SqueezeDimensionNotOne { dim: usize, size: usize },
 
+    // =========================================================================
+    // Reduction Errors
+    // =========================================================================
     #[snafu(display("Cannot specify both 'dtype' and 'promote=true' in reduction operation"))]
     ConflictingReductionOptions,
 
+    // =========================================================================
+    // Matrix Multiplication Errors
+    // =========================================================================
     #[snafu(display(
         "Matrix multiplication requires tensors with at least 1 dimension, got lhs: {lhs_dims}D, rhs: {rhs_dims}D"
     ))]
@@ -52,6 +64,9 @@ pub enum Error {
     ))]
     DotShapeMismatch { lhs_shape: Box<Shape>, rhs_shape: Box<Shape> },
 
+    // =========================================================================
+    // Broadcasting Errors
+    // =========================================================================
     #[snafu(display(
         "Cannot broadcast to fewer dimensions: tensor has {from_dims} dimensions, target has {to_dims} dimensions"
     ))]
@@ -62,21 +77,74 @@ pub enum Error {
     ))]
     BroadcastIncompatible { dim: usize, from_size: usize, to_size: usize },
 
-    /// Codegen error occurred.
-    #[snafu(display("Codegen error: {message}"))]
-    Codegen { message: String },
+    // =========================================================================
+    // Codegen Errors (from device traits that wrap codegen)
+    // =========================================================================
+    #[snafu(display("Failed to render kernel: {source}"))]
+    RenderKernel { source: morok_device::Error },
 
-    /// Runtime error occurred.
-    #[snafu(display("Runtime error: {message}"))]
-    Runtime { message: String },
+    #[snafu(display("Failed to compile kernel: {source}"))]
+    CompileKernel { source: morok_device::Error },
 
-    /// Buffer not found in registry.
+    // =========================================================================
+    // Schedule/Pipeline Errors
+    // =========================================================================
+    #[snafu(display("Rangeify failed: {source}"))]
+    Rangeify { source: morok_ir::Error },
+
+    #[snafu(display("Optimization error: {source}"))]
+    Optimize { source: morok_schedule::OptError },
+
+    #[snafu(display("No kernels found after scheduling pipeline"))]
+    NoKernelsFound,
+
+    #[snafu(display("Schedule contains dependency cycles"))]
+    DependencyCycles,
+
+    #[snafu(display("Empty schedule"))]
+    EmptySchedule,
+
+    #[snafu(display("Expected KERNEL operation"))]
+    ExpectedKernelOp,
+
+    // =========================================================================
+    // Runtime Errors
+    // =========================================================================
+    #[snafu(display("Execution failed: {source}"))]
+    Execution { source: morok_runtime::Error },
+
+    #[snafu(display("Failed to create program: {source}"))]
+    CreateProgram { source: morok_device::Error },
+
+    #[snafu(display("Failed to get device: {source}"))]
+    DeviceFactory { source: morok_runtime::Error },
+
     #[snafu(display("Buffer for UOp {} not found in registry", uop_id))]
     BufferNotFound { uop_id: u64 },
 
-    /// Device error occurred.
-    #[snafu(display("Device error: {message}"))]
-    Device { message: String },
+    #[snafu(display("Device error: {source}"))]
+    Device { source: morok_device::Error },
+
+    // =========================================================================
+    // Type Errors
+    // =========================================================================
+    #[snafu(display("Expected Ptr dtype for {context}, got {actual:?}"))]
+    ExpectedPtrDtype { context: &'static str, actual: morok_dtype::DType },
+
+    #[snafu(display("Buffer Ptr dtype has no size"))]
+    BufferPtrNoSize,
+
+    #[snafu(display("Tensor has no buffer (unrealized tensor?)"))]
+    NoBuffer,
+
+    #[snafu(display("Tensor has no shape"))]
+    NoShape,
+
+    #[snafu(display("Type mismatch: expected {expected:?}, got {actual:?}"))]
+    TypeMismatch { expected: morok_dtype::DType, actual: morok_dtype::DType },
+
+    #[snafu(display("Failed to create ndarray: {source}"))]
+    NdarrayShape { source: ndarray::ShapeError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

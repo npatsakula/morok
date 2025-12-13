@@ -36,4 +36,18 @@ pub enum Error {
     /// LLVM error.
     #[snafu(display("LLVM error: {reason}"))]
     LlvmError { reason: String },
+
+    /// Unsupported device type.
+    #[snafu(display("Unsupported device type: {device}"))]
+    UnsupportedDevice { device: String },
+
+    /// Device error (from morok_device crate).
+    #[snafu(display("Device error: {source}"))]
+    Device { source: morok_device::Error },
+}
+
+impl From<morok_device::Error> for Error {
+    fn from(source: morok_device::Error) -> Self {
+        Error::Device { source }
+    }
 }

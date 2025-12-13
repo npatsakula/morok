@@ -1,6 +1,6 @@
 //! Unit tests for the Scheduler (kernel optimization state manager).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp};
 
@@ -1017,7 +1017,7 @@ fn test_swap_basic() {
 
     // Get sizes of ranges before swap
     let rngs_before = scheduler.rngs();
-    let get_size = |rng: &Rc<UOp>| -> i64 {
+    let get_size = |rng: &Arc<UOp>| -> i64 {
         if let Op::Range { end, .. } = rng.op()
             && let Op::Const(cv) = end.op()
             && let morok_ir::ConstValue::Int(sz) = cv.0

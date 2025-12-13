@@ -134,7 +134,7 @@ impl Tensor {
         // Reshape to add explicit 1 dimensions (if needed)
         let reshaped = if aligned_shape != self_shape {
             // Call IR layer directly to support symbolic dimensions
-            self.uop.try_reshape(&aligned_shape).map(Self::new).context(UOpSnafu)?
+            self.uop().try_reshape(&aligned_shape).map(Self::new).context(UOpSnafu)?
         } else {
             self.clone()
         };
@@ -145,6 +145,6 @@ impl Tensor {
         }
 
         // Expand to target shape - call IR layer directly to support symbolic dimensions
-        reshaped.uop.try_expand(target_shape).map(Self::new).context(UOpSnafu)
+        reshaped.uop().try_expand(target_shape).map(Self::new).context(UOpSnafu)
     }
 }

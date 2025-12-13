@@ -1,6 +1,6 @@
 //! Tests for the patterns! proc-macro DSL.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, Op, UOp};
@@ -11,7 +11,7 @@ use crate::pattern::{BindingStore, BindingStoreExt, VarIntern};
 use crate::patterns;
 
 /// Helper to create a binary operation UOp
-fn binary(op: BinaryOp, lhs: Rc<UOp>, rhs: Rc<UOp>) -> Rc<UOp> {
+fn binary(op: BinaryOp, lhs: Arc<UOp>, rhs: Arc<UOp>) -> Arc<UOp> {
     let dtype = lhs.dtype();
     UOp::new(Op::Binary(op, lhs, rhs), dtype)
 }
@@ -31,7 +31,7 @@ fn test_simple_add_zero_pattern() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Rc::ptr_eq(&rewritten, &x), "Should rewrite to x");
+            assert!(Arc::ptr_eq(&rewritten, &x), "Should rewrite to x");
         }
         _ => panic!("Expected rewrite to succeed"),
     }
@@ -52,7 +52,7 @@ fn test_mul_one_pattern() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Rc::ptr_eq(&rewritten, &x), "Should rewrite to x");
+            assert!(Arc::ptr_eq(&rewritten, &x), "Should rewrite to x");
         }
         _ => panic!("Expected rewrite to succeed"),
     }
@@ -73,7 +73,7 @@ fn test_binding_pattern() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Rc::ptr_eq(&rewritten, &zero), "Should rewrite to zero");
+            assert!(Arc::ptr_eq(&rewritten, &zero), "Should rewrite to zero");
         }
         _ => panic!("Expected rewrite to succeed"),
     }
@@ -94,21 +94,21 @@ fn test_multiple_patterns() {
 
     let add_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
     match matcher.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Add(x, 0) should rewrite to x"),
     }
 
     // Test x * 1
     let mul_one = binary(BinaryOp::Mul, x.clone(), one);
     match matcher.rewrite(&mul_one, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Mul(x, 1) should rewrite to x"),
     }
 
     // Test x * 0
     let mul_zero = binary(BinaryOp::Mul, x, zero.clone());
     match matcher.rewrite(&mul_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &zero)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero)),
         _ => panic!("Mul(x, 0) should rewrite to 0"),
     }
 }
@@ -148,14 +148,14 @@ fn test_pattern_matcher_composition() {
     // Test x + 0
     let add_zero = binary(BinaryOp::Add, x.clone(), zero);
     match combined.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Combined matcher should handle Add(x, 0)"),
     }
 
     // Test x * 1
     let mul_one = binary(BinaryOp::Mul, x.clone(), one);
     match combined.rewrite(&mul_one, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Combined matcher should handle Mul(x, 1)"),
     }
 }
@@ -179,7 +179,7 @@ fn test_complex_guard_with_block() {
     let add_zero_int = binary(BinaryOp::Add, x.clone(), zero_int);
 
     match matcher.rewrite(&add_zero_int, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Add(x, 0) should match with complex guard"),
     }
 
@@ -189,7 +189,7 @@ fn test_complex_guard_with_block() {
     let add_zero_float = binary(BinaryOp::Add, x_f32.clone(), zero_float);
 
     match matcher.rewrite(&add_zero_float, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x_f32)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_f32)),
         _ => panic!("Add(x, 0.0) should match with complex guard"),
     }
 
@@ -205,9 +205,9 @@ fn test_complex_guard_with_block() {
 
 #[test]
 fn test_guard_with_pointer_equality() {
-    // Test guard using Rc::ptr_eq for self-folding patterns like x & x => x
+    // Test guard using Arc::ptr_eq for self-folding patterns like x & x => x
     let matcher = patterns! {
-        And(x, y) if Rc::ptr_eq(x, y) ~> x
+        And(x, y) if Arc::ptr_eq(x, y) ~> x
     };
 
     let a = UOp::native_const(42i32);
@@ -216,7 +216,7 @@ fn test_guard_with_pointer_equality() {
     let and_same = a.try_and_op(&a).unwrap();
 
     match matcher.rewrite(&and_same, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
         _ => panic!("And(x, x) should rewrite to x"),
     }
 
@@ -235,7 +235,7 @@ fn test_guard_with_pointer_equality() {
 #[test]
 fn test_auto_ptr_eq_duplicate_variable() {
     // Test auto ptr_eq with duplicate variable names: And(x, x) ~> x
-    // This should automatically generate Rc::ptr_eq check without explicit guard
+    // This should automatically generate Arc::ptr_eq check without explicit guard
     let matcher = patterns! {
         And(x, x) ~> x
     };
@@ -246,7 +246,7 @@ fn test_auto_ptr_eq_duplicate_variable() {
     let and_same = a.try_and_op(&a).unwrap();
 
     match matcher.rewrite(&and_same, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a), "And(x, x) should rewrite to x"),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a), "And(x, x) should rewrite to x"),
         _ => panic!("And(x, x) should match"),
     }
 
@@ -274,7 +274,7 @@ fn test_auto_ptr_eq_three_args() {
     let where_same = UOp::try_where(a.clone(), a.clone(), a.clone()).unwrap();
 
     match matcher.rewrite(&where_same, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a), "Where(x, x, x) should rewrite to x"),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a), "Where(x, x, x) should rewrite to x"),
         _ => panic!("Where(x, x, x) should match"),
     }
 
@@ -300,7 +300,7 @@ fn test_special_constant_zero() {
     let add_zero_int = binary(BinaryOp::Add, x_int.clone(), zero_int);
 
     match matcher.rewrite(&add_zero_int, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x_int)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_int)),
         _ => panic!("Add(x, @zero) should match int 0"),
     }
 
@@ -310,7 +310,7 @@ fn test_special_constant_zero() {
     let add_zero_float = binary(BinaryOp::Add, x_f32.clone(), zero_float);
 
     match matcher.rewrite(&add_zero_float, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x_f32)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_f32)),
         _ => panic!("Add(x, @zero) should match float 0.0"),
     }
 
@@ -337,7 +337,7 @@ fn test_special_constant_one() {
     let mul_one_int = binary(BinaryOp::Mul, x_int.clone(), one_int);
 
     match matcher.rewrite(&mul_one_int, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x_int)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_int)),
         _ => panic!("Mul(x, @one) should match int 1"),
     }
 
@@ -347,7 +347,7 @@ fn test_special_constant_one() {
     let mul_one_float = binary(BinaryOp::Mul, x_f32.clone(), one_float);
 
     match matcher.rewrite(&mul_one_float, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x_f32)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_f32)),
         _ => panic!("Mul(x, @one) should match float 1.0"),
     }
 
@@ -374,7 +374,7 @@ fn test_special_constant_with_binding() {
     let mul_zero = binary(BinaryOp::Mul, x, zero.clone());
 
     match matcher.rewrite(&mul_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &zero)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero)),
         _ => panic!("Mul(_, zero @ @zero) should return zero"),
     }
 
@@ -384,7 +384,7 @@ fn test_special_constant_with_binding() {
     let mul_zero_f32 = binary(BinaryOp::Mul, x_f32, zero_f32.clone());
 
     match matcher.rewrite(&mul_zero_f32, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &zero_f32)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero_f32)),
         _ => panic!("Mul(_, zero @ @zero) should return float zero"),
     }
 }
@@ -408,42 +408,42 @@ fn test_identity_patterns_with_special_constants() {
     // x + 0 => x
     let add_x_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
     match matcher.rewrite(&add_x_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Add(x, @zero) failed"),
     }
 
     // 0 + x => x
     let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
     match matcher.rewrite(&add_zero_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Add(@zero, x) failed"),
     }
 
     // x * 1 => x
     let mul_x_one = binary(BinaryOp::Mul, x.clone(), one.clone());
     match matcher.rewrite(&mul_x_one, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Mul(x, @one) failed"),
     }
 
     // 1 * x => x
     let mul_one_x = binary(BinaryOp::Mul, one.clone(), x.clone());
     match matcher.rewrite(&mul_one_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Mul(@one, x) failed"),
     }
 
     // x * 0 => 0
     let mul_x_zero = binary(BinaryOp::Mul, x.clone(), zero.clone());
     match matcher.rewrite(&mul_x_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &zero)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero)),
         _ => panic!("Mul(_, @zero) failed"),
     }
 
     // 0 * x => 0
     let mul_zero_x = binary(BinaryOp::Mul, zero.clone(), x.clone());
     match matcher.rewrite(&mul_zero_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &zero)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &zero)),
         _ => panic!("Mul(@zero, _) failed"),
     }
 }
@@ -463,7 +463,7 @@ fn test_or_casted_method() {
         pattern,
         Box::new(|bindings: &BindingStore, intern: &VarIntern, _ctx: &mut ()| {
             if let Some(c) = intern.get_index("c").and_then(|i| bindings.get_by_index(i)) {
-                RewriteResult::Rewritten(Rc::clone(c))
+                RewriteResult::Rewritten(Arc::clone(c))
             } else {
                 RewriteResult::NoMatch
             }
@@ -475,7 +475,7 @@ fn test_or_casted_method() {
 
     // Test direct constant - should match and return the constant
     match matcher.rewrite(&c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &c)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
         _ => panic!("Direct constant should match .or_casted()"),
     }
 
@@ -484,7 +484,7 @@ fn test_or_casted_method() {
 
     // Test cast(constant) - should match and return the inner constant
     match matcher.rewrite(&cast_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &c)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
         _ => panic!("Cast(constant) should match .or_casted()"),
     }
 
@@ -509,7 +509,7 @@ fn test_or_detach_method() {
         pattern,
         Box::new(|bindings: &BindingStore, intern: &VarIntern, _ctx: &mut ()| {
             if let Some(c) = intern.get_index("c").and_then(|i| bindings.get_by_index(i)) {
-                RewriteResult::Rewritten(Rc::clone(c))
+                RewriteResult::Rewritten(Arc::clone(c))
             } else {
                 RewriteResult::NoMatch
             }
@@ -521,7 +521,7 @@ fn test_or_detach_method() {
 
     // Test direct constant - should match
     match matcher.rewrite(&x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Direct value should match .or_detach()"),
     }
 
@@ -530,7 +530,7 @@ fn test_or_detach_method() {
 
     // Test detach(x) - should also match
     match matcher.rewrite(&detach_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Detach(x) should match .or_detach()"),
     }
 }
@@ -547,7 +547,7 @@ fn test_binary_commutative_pattern() {
         pattern,
         Box::new(|bindings: &BindingStore, intern: &VarIntern, _ctx: &mut ()| {
             if let Some(x) = intern.get_index("x").and_then(|i| bindings.get_by_index(i)) {
-                RewriteResult::Rewritten(Rc::clone(x))
+                RewriteResult::Rewritten(Arc::clone(x))
             } else {
                 RewriteResult::NoMatch
             }
@@ -560,14 +560,14 @@ fn test_binary_commutative_pattern() {
     // Test x + 0 - should match
     let add_x_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
     match matcher.rewrite(&add_x_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Add(x, 0) should match binary_commutative"),
     }
 
     // Test 0 + x - should also match!
     let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
     match matcher.rewrite(&add_zero_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Add(0, x) should match binary_commutative"),
     }
 }
@@ -627,7 +627,7 @@ fn test_struct_field_extraction() {
 
     // This should match (cast to Float32)
     match matcher.rewrite(&cast_to_f32, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x_int)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x_int)),
         _ => panic!("Cast {{ src: x, dtype }} with dtype == Float32 should match"),
     }
 
@@ -658,7 +658,7 @@ fn test_struct_field_extraction_permute() {
 
     // This should match (2 axes)
     match matcher.rewrite(&permute_2, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Permute with 2 axes should match"),
     }
 
@@ -694,7 +694,7 @@ fn test_nested_struct_pattern() {
     // This should match (outer cast to Float32)
     match matcher.rewrite(&outer_cast, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &x_int), "Should extract innermost source");
+            assert!(Arc::ptr_eq(&r, &x_int), "Should extract innermost source");
         }
         _ => panic!("Nested Cast pattern should match"),
     }
@@ -733,7 +733,7 @@ fn test_nested_struct_field_extraction() {
     // Should match and return compute (ranges.len() == indices.len())
     match matcher.rewrite(&idx, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &compute), "Should extract compute from nested pattern");
+            assert!(Arc::ptr_eq(&r, &compute), "Should extract compute from nested pattern");
         }
         _ => panic!("Nested Index(Bufferize) pattern should match with extracted ranges"),
     }
@@ -775,7 +775,7 @@ fn test_for_loop_unary_expansion() {
         for op in unary [Neg, Sqrt] {
             op(c) ~> {
                 // Just return the operand for testing
-                Rc::clone(c)
+                Arc::clone(c)
             }
         }
     };
@@ -785,7 +785,7 @@ fn test_for_loop_unary_expansion() {
     let neg_x = x.neg();
 
     match matcher.rewrite(&neg_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Neg pattern from for-loop should match"),
     }
 
@@ -793,7 +793,7 @@ fn test_for_loop_unary_expansion() {
     let sqrt_x = x.try_sqrt().unwrap();
 
     match matcher.rewrite(&sqrt_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Sqrt pattern from for-loop should match"),
     }
 
@@ -822,21 +822,21 @@ fn test_for_loop_binary_expansion() {
     // Test Add(x, 0) => x
     let add_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
     match matcher.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Add(x, 0) from for-loop should match"),
     }
 
     // Test Mul(x, 0) => x
     let mul_zero = binary(BinaryOp::Mul, x.clone(), zero.clone());
     match matcher.rewrite(&mul_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Mul(x, 0) from for-loop should match"),
     }
 
     // Test Sub(x, 0) => x
     let sub_zero = binary(BinaryOp::Sub, x.clone(), zero.clone());
     match matcher.rewrite(&sub_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Sub(x, 0) from for-loop should match"),
     }
 
@@ -856,7 +856,7 @@ fn test_for_loop_ternary_expansion() {
         for op in ternary [Where, MulAcc] {
             op(a, b, c) ~> {
                 // For testing, just return the first argument
-                Rc::clone(a)
+                Arc::clone(a)
             }
         }
     };
@@ -868,14 +868,14 @@ fn test_for_loop_ternary_expansion() {
     // Test Where(a, b, c) => a
     let where_abc = UOp::try_where(a.clone(), b.clone(), c.clone()).unwrap();
     match matcher.rewrite(&where_abc, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
         _ => panic!("Where pattern from for-loop should match"),
     }
 
     // Test MulAcc(a, b, c) => a
     let mulacc_abc = UOp::try_mulacc(a.clone(), b.clone(), c.clone()).unwrap();
     match matcher.rewrite(&mulacc_abc, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &a)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
         _ => panic!("MulAcc pattern from for-loop should match"),
     }
 }
@@ -893,7 +893,7 @@ fn test_for_loop_with_op_var_access() {
                 match op {
                     UnaryOp::Neg => x.try_sqrt().unwrap(),
                     UnaryOp::Sqrt => x.neg(),
-                    _ => Rc::clone(x),
+                    _ => Arc::clone(x),
                 }
             }
         }
@@ -930,7 +930,7 @@ fn test_for_loop_mixed_with_regular_patterns() {
 
         // For-loop in the middle
         for op in unary [Neg, Sqrt] {
-            op(x) ~> Rc::clone(x)
+            op(x) ~> Arc::clone(x)
         },
 
         // Regular pattern after
@@ -944,21 +944,21 @@ fn test_for_loop_mixed_with_regular_patterns() {
     // Test Add(x, 0) => x
     let add_zero = binary(BinaryOp::Add, x.clone(), zero);
     match matcher.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Add(x, 0) should match"),
     }
 
     // Test Neg(x) => x
     let neg_x = x.neg();
     match matcher.rewrite(&neg_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Neg(x) from for-loop should match"),
     }
 
     // Test Mul(x, 1) => x
     let mul_one = binary(BinaryOp::Mul, x.clone(), one);
     match matcher.rewrite(&mul_one, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Mul(x, 1) should match"),
     }
 }
@@ -970,7 +970,7 @@ fn test_for_loop_with_guard() {
     let matcher = patterns! {
         for op in unary [Neg, Sqrt] {
             // Only match if operand is a constant
-            op(c) if matches!(c.op(), Op::Const(_)) ~> Rc::clone(c)
+            op(c) if matches!(c.op(), Op::Const(_)) ~> Arc::clone(c)
         }
     };
 
@@ -979,7 +979,7 @@ fn test_for_loop_with_guard() {
     // Neg(const) - should match
     let neg_c = c.neg();
     match matcher.rewrite(&neg_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &c)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
         _ => panic!("Neg(const) should match with guard"),
     }
 
@@ -1011,14 +1011,14 @@ fn test_for_loop_with_binding() {
     // Neg(const) - should match and return the inner constant
     let neg_c = c.neg();
     match matcher.rewrite(&neg_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &c)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
         _ => panic!("Neg(inner @ @const) should match and return inner"),
     }
 
     // Sqrt(const) - should also match
     let sqrt_c = c.try_sqrt().unwrap();
     match matcher.rewrite(&sqrt_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &c)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
         _ => panic!("Sqrt(inner @ @const) should match and return inner"),
     }
 }
@@ -1029,7 +1029,7 @@ fn test_for_loop_with_binding() {
 fn test_const_with_value_extraction() {
     // Test automatic ConstValue extraction with c@const(cv)
     let matcher = patterns! {
-        // cv is ConstValue, c is &Rc<UOp>
+        // cv is ConstValue, c is &Arc<UOp>
         Add(x, _c@const(cv)) if cv == ConstValue::Int(0) ~> x
     };
 
@@ -1040,7 +1040,7 @@ fn test_const_with_value_extraction() {
     // Test x + 0 - should match (cv == 0)
     let add_zero = binary(BinaryOp::Add, x.clone(), zero);
     match matcher.rewrite(&add_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Rc::ptr_eq(&r, &x)),
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
         _ => panic!("Add(x, 0) should match with cv == 0"),
     }
 
@@ -1083,7 +1083,7 @@ fn test_rest_pattern_end() {
         // Match any END op and return its computation
         end_op @ End(_, ..) ~> {
             if let Op::End { computation, .. } = end_op.op() {
-                Rc::clone(computation)
+                Arc::clone(computation)
             } else {
                 unreachable!()
             }
@@ -1098,7 +1098,7 @@ fn test_rest_pattern_end() {
     let end1 = UOp::end(computation.clone(), smallvec![range1.clone()]);
     match matcher.rewrite(&end1, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &computation), "Should rewrite to computation");
+            assert!(Arc::ptr_eq(&r, &computation), "Should rewrite to computation");
         }
         _ => panic!("End(_, ..) should match END with 1 range"),
     }
@@ -1107,7 +1107,7 @@ fn test_rest_pattern_end() {
     let end2 = UOp::end(computation.clone(), smallvec![range1.clone(), range2.clone()]);
     match matcher.rewrite(&end2, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &computation), "Should rewrite to computation");
+            assert!(Arc::ptr_eq(&r, &computation), "Should rewrite to computation");
         }
         _ => panic!("End(_, ..) should match END with 2 ranges"),
     }
@@ -1201,7 +1201,7 @@ fn test_bufferize_variable_ranges() {
     let buf0 = UOp::bufferize(const_val.clone(), vec![], opts.clone());
     match matcher.rewrite(&buf0, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 0 ranges");
+            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 0 ranges");
         }
         _ => panic!("Bufferize {{ compute: c, .. }} should match with 0 ranges"),
     }
@@ -1210,7 +1210,7 @@ fn test_bufferize_variable_ranges() {
     let buf1 = UOp::bufferize(const_val.clone(), vec![range1.clone()], opts.clone());
     match matcher.rewrite(&buf1, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 1 range");
+            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 1 range");
         }
         _ => panic!("Bufferize {{ compute: c, .. }} should match with 1 range"),
     }
@@ -1219,7 +1219,7 @@ fn test_bufferize_variable_ranges() {
     let buf2 = UOp::bufferize(const_val.clone(), vec![range1, range2], opts);
     match matcher.rewrite(&buf2, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 2 ranges");
+            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 2 ranges");
         }
         _ => panic!("Bufferize {{ compute: c, .. }} should match with 2 ranges"),
     }
@@ -1240,7 +1240,7 @@ fn test_index_variable_indices() {
     let index1 = UOp::index(const_val.clone(), vec![idx1.clone()]).unwrap();
     match matcher.rewrite(&index1, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 1 index");
+            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 1 index");
         }
         _ => panic!("Index {{ buffer: c, .. }} should match with 1 index"),
     }
@@ -1249,7 +1249,7 @@ fn test_index_variable_indices() {
     let index2 = UOp::index(const_val.clone(), vec![idx1.clone(), idx2.clone()]).unwrap();
     match matcher.rewrite(&index2, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 2 indices");
+            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 2 indices");
         }
         _ => panic!("Index {{ buffer: c, .. }} should match with 2 indices"),
     }
@@ -1259,7 +1259,7 @@ fn test_index_variable_indices() {
     let index_gated = UOp::index_gated(const_val.clone(), vec![idx1], gate).unwrap();
     match matcher.rewrite(&index_gated, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &const_val), "Should rewrite to const_val with gate");
+            assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with gate");
         }
         _ => panic!("Index {{ buffer: c, .. }} should match with gate"),
     }
@@ -1267,12 +1267,12 @@ fn test_index_variable_indices() {
 
 #[test]
 fn test_index_gate_bare_binding() {
-    // Test that bare `gate` field binding extracts Option<Rc<UOp>>
+    // Test that bare `gate` field binding extracts Option<Arc<UOp>>
     // This tests if the DSL already supports optional field binding
     let matcher = patterns! {
         Index { buffer: b, indices: _, gate } => {
-            // gate should be Option<Rc<UOp>>
-            // indices should be SmallVec<[Rc<UOp>; 4]>
+            // gate should be Option<Arc<UOp>>
+            // indices should be SmallVec<[Arc<UOp>; 4]>
             match gate {
                 Some(g) => Some(g.clone()),  // Return the gate if present
                 None => Some(b.clone()),      // Return the buffer if no gate
@@ -1288,7 +1288,7 @@ fn test_index_gate_bare_binding() {
     let ungated = UOp::index(buffer.clone(), vec![idx.clone()]).unwrap();
     match matcher.rewrite(&ungated, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &buffer), "Should return buffer when no gate");
+            assert!(Arc::ptr_eq(&r, &buffer), "Should return buffer when no gate");
         }
         _ => panic!("Pattern should match ungated Index"),
     }
@@ -1297,7 +1297,7 @@ fn test_index_gate_bare_binding() {
     let gated = UOp::index_gated(buffer.clone(), vec![idx], gate_val.clone()).unwrap();
     match matcher.rewrite(&gated, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &gate_val), "Should return gate when present");
+            assert!(Arc::ptr_eq(&r, &gate_val), "Should return gate when present");
         }
         _ => panic!("Pattern should match gated Index"),
     }
@@ -1373,7 +1373,7 @@ fn test_tuple_prefix_semantics_vs_exact() {
         let buf = UOp::bufferize(const_val.clone(), ranges, opts.clone());
         match matcher.rewrite(&buf, &mut ()) {
             RewriteResult::Rewritten(r) => {
-                assert!(Rc::ptr_eq(&r, &const_val), "Should rewrite with {} ranges", n);
+                assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite with {} ranges", n);
             }
             _ => panic!("Bufferize {{ compute: c, .. }} should match with {} ranges (prefix semantics)", n),
         }
@@ -1396,7 +1396,7 @@ fn test_alternative_patterns_basic() {
     let add = binary(BinaryOp::Add, a.clone(), b.clone());
     match matcher.rewrite(&add, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &a), "Add should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &a), "Add should rewrite to x");
         }
         _ => panic!("Add should match alternative pattern"),
     }
@@ -1405,7 +1405,7 @@ fn test_alternative_patterns_basic() {
     let mul = binary(BinaryOp::Mul, a.clone(), b.clone());
     match matcher.rewrite(&mul, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &a), "Mul should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &a), "Mul should rewrite to x");
         }
         _ => panic!("Mul should match alternative pattern"),
     }
@@ -1432,7 +1432,7 @@ fn test_alternative_patterns_op_shorthand() {
     let add = binary(BinaryOp::Add, x.clone(), zero.clone());
     match matcher.rewrite(&add, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &x), "Add(x, 0) should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &x), "Add(x, 0) should rewrite to x");
         }
         _ => panic!("Add(x, 0) should match"),
     }
@@ -1441,7 +1441,7 @@ fn test_alternative_patterns_op_shorthand() {
     let mul = binary(BinaryOp::Mul, x.clone(), zero.clone());
     match matcher.rewrite(&mul, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &x), "Mul(x, 0) should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &x), "Mul(x, 0) should rewrite to x");
         }
         _ => panic!("Mul(x, 0) should match"),
     }
@@ -1461,7 +1461,7 @@ fn test_alternative_patterns_grouped() {
     let add = binary(BinaryOp::Add, a.clone(), b.clone());
     match matcher.rewrite(&add, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &a), "Add(x, y) should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &a), "Add(x, y) should rewrite to x");
         }
         _ => panic!("Add should match"),
     }
@@ -1470,7 +1470,7 @@ fn test_alternative_patterns_grouped() {
     let mul = binary(BinaryOp::Mul, a.clone(), b.clone());
     match matcher.rewrite(&mul, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &a), "Mul(x, y) should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &a), "Mul(x, y) should rewrite to x");
         }
         _ => panic!("Mul should match"),
     }
@@ -1492,7 +1492,7 @@ fn test_alternative_patterns_with_special_const() {
     let add0 = binary(BinaryOp::Add, x.clone(), zero);
     match matcher.rewrite(&add0, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &x), "Add(x, @zero) should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &x), "Add(x, @zero) should rewrite to x");
         }
         _ => panic!("Add(x, 0) should match @zero"),
     }
@@ -1501,7 +1501,7 @@ fn test_alternative_patterns_with_special_const() {
     let add1 = binary(BinaryOp::Add, x.clone(), one);
     match matcher.rewrite(&add1, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &x), "Add(x, @one) should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &x), "Add(x, @one) should rewrite to x");
         }
         _ => panic!("Add(x, 1) should match @one"),
     }
@@ -1591,7 +1591,7 @@ fn test_permutation_pattern_commutative_const_folding() {
     let add1 = binary(BinaryOp::Add, x.clone(), zero.clone());
     match matcher.rewrite(&add1, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &x), "Add(x, 0) should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &x), "Add(x, 0) should rewrite to x");
         }
         _ => panic!("Add(x, 0) should match"),
     }
@@ -1600,7 +1600,7 @@ fn test_permutation_pattern_commutative_const_folding() {
     let add2 = binary(BinaryOp::Add, zero.clone(), x.clone());
     match matcher.rewrite(&add2, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &x), "Add(0, x) should rewrite to x");
+            assert!(Arc::ptr_eq(&r, &x), "Add(0, x) should rewrite to x");
         }
         _ => panic!("Add(0, x) should match"),
     }
@@ -1623,7 +1623,7 @@ fn test_copy_struct_pattern() {
 
     match matcher.rewrite(&copy_op, &mut ()) {
         RewriteResult::Rewritten(r) => {
-            assert!(Rc::ptr_eq(&r, &const_val), "Copy {{ src: c, .. }} should rewrite to c");
+            assert!(Arc::ptr_eq(&r, &const_val), "Copy {{ src: c, .. }} should rewrite to c");
         }
         _ => panic!("Copy {{ src: c, .. }} should match when src is constant"),
     }
@@ -1670,7 +1670,7 @@ fn test_context_declaration() {
         x if matches!(x.op(), Op::Const(_)) => {
             let count = ctx.increment();
             if count > 0 {
-                Some(Rc::clone(x))
+                Some(Arc::clone(x))
             } else {
                 None
             }
@@ -1706,7 +1706,7 @@ fn test_context_with_graph_rewrite() {
         // Replace Add(x, @zero) with x, using context to track rewrites
         Add(x, @zero) => {
             ctx.increment();
-            Some(Rc::clone(x))
+            Some(Arc::clone(x))
         }
     };
 
@@ -1718,7 +1718,7 @@ fn test_context_with_graph_rewrite() {
     let result = graph_rewrite(&matcher, add, &mut ctx);
 
     // Should have rewritten Add(5, 0) to 5
-    assert!(Rc::ptr_eq(&result, &x));
+    assert!(Arc::ptr_eq(&result, &x));
     // Counter should have been incremented
     assert_eq!(ctx.counter, 1);
 }
@@ -1730,7 +1730,7 @@ fn test_context_pattern_composition() {
         @context TestContext;
         Add(x, @zero) => {
             ctx.increment();
-            Some(Rc::clone(x))
+            Some(Arc::clone(x))
         }
     };
 
@@ -1739,7 +1739,7 @@ fn test_context_pattern_composition() {
         Mul(x, @one) => {
             ctx.increment();
             ctx.increment(); // Increment twice for mul
-            Some(Rc::clone(x))
+            Some(Arc::clone(x))
         }
     };
 

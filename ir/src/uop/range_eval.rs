@@ -8,13 +8,13 @@ use crate::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
 use crate::{Op, UOp};
 use morok_dtype::DType;
 use std::cmp::Ordering;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Compute the minimum and maximum possible values for a UOp.
 ///
 /// Returns a tuple (vmin, vmax) where both values are ConstValue types.
 /// The analysis propagates ranges bottom-up through the computation graph.
-pub fn compute_vmin_vmax(uop: &Rc<UOp>) -> (ConstValue, ConstValue) {
+pub fn compute_vmin_vmax(uop: &Arc<UOp>) -> (ConstValue, ConstValue) {
     use crate::uop::cached_property::CachedProperty;
     use crate::uop::properties::VminVmaxProperty;
 
@@ -43,8 +43,8 @@ pub fn compute_vmin_vmax(uop: &Rc<UOp>) -> (ConstValue, ConstValue) {
             compute_ternary_range(*op, *cond_min, *cond_max, *true_min, *true_max, *false_min, *false_max, &uop.dtype)
         }
 
-        // DefineVar has explicit min/max values
-        Op::DefineVar { min_val, max_val, .. } => (ConstValue::Int(*min_val), ConstValue::Int(*max_val)),
+        // DefineVar always starts at 0 (RANGE = size iterator)
+        Op::DefineVar { max_val, .. } => (ConstValue::Int(0), ConstValue::Int(*max_val)),
 
         // Range operations go from 0 to end-1
         Op::Range { end, .. } => {

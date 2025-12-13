@@ -1,4 +1,4 @@
-use crate::DeviceSpec;
+use crate::{DeviceSpec, registry::DeviceSpecExt};
 
 #[test]
 fn test_device_spec_parse() {

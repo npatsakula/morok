@@ -2,7 +2,7 @@
 
 use morok_ir::types::ConstValue;
 use morok_ir::{Op, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::pattern::PatternMatcher;
 use crate::symbolic::symbolic_simple;
@@ -16,7 +16,7 @@ pub fn get_matcher() -> PatternMatcher {
 ///
 /// # Panics
 /// Panics if the UOp is not a Const or doesn't match the expected value.
-pub fn assert_const_value(uop: &Rc<UOp>, expected: ConstValue) {
+pub fn assert_const_value(uop: &Arc<UOp>, expected: ConstValue) {
     match uop.op() {
         Op::Const(cv) => {
             assert_eq!(cv.0, expected, "Expected Const({:?}), got Const({:?})", expected, cv.0);
@@ -31,7 +31,7 @@ pub fn assert_const_value(uop: &Rc<UOp>, expected: ConstValue) {
 ///
 /// # Panics
 /// Panics if the UOp is still an END operation.
-pub fn assert_end_unwrapped(uop: &Rc<UOp>) -> Rc<UOp> {
+pub fn assert_end_unwrapped(uop: &Arc<UOp>) -> Arc<UOp> {
     match uop.op() {
         Op::End { .. } => {
             panic!("Expected END to be unwrapped, but got END operation: {:?}", uop.op())
@@ -46,7 +46,7 @@ pub fn assert_end_unwrapped(uop: &Rc<UOp>) -> Rc<UOp> {
 ///
 /// # Panics
 /// Panics if the UOp is not an END operation or range count doesn't match.
-pub fn assert_end_range_count(uop: &Rc<UOp>, expected_count: usize) -> (Rc<UOp>, Vec<Rc<UOp>>) {
+pub fn assert_end_range_count(uop: &Arc<UOp>, expected_count: usize) -> (Arc<UOp>, Vec<Arc<UOp>>) {
     match uop.op() {
         Op::End { computation, ranges } => {
             assert_eq!(
@@ -56,7 +56,7 @@ pub fn assert_end_range_count(uop: &Rc<UOp>, expected_count: usize) -> (Rc<UOp>,
                 expected_count,
                 ranges.len()
             );
-            (Rc::clone(computation), ranges.iter().cloned().collect())
+            (Arc::clone(computation), ranges.iter().cloned().collect())
         }
         other => panic!("Expected END operation, got {:?}", other),
     }

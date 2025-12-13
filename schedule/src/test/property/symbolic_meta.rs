@@ -3,7 +3,7 @@
 //! Tests higher-level invariants like idempotence, cost monotonicity,
 //! and range preservation.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use proptest::prelude::*;
 
@@ -34,7 +34,7 @@ proptest! {
         let once = graph_rewrite(&matcher, graph.clone(), &mut ());
         let twice = graph_rewrite(&matcher, once.clone(), &mut ());
 
-        prop_assert!(Rc::ptr_eq(&once, &twice),
+        prop_assert!(Arc::ptr_eq(&once, &twice),
             "Optimizing twice should give same result as optimizing once");
     }
 
@@ -47,7 +47,7 @@ proptest! {
         let once = graph_rewrite(&matcher, graph, &mut ());
         let twice = graph_rewrite(&matcher, once.clone(), &mut ());
 
-        prop_assert!(Rc::ptr_eq(&once, &twice),
+        prop_assert!(Arc::ptr_eq(&once, &twice),
             "Known property graphs should be idempotent");
     }
 }
@@ -202,7 +202,7 @@ proptest! {
 // ============================================================================
 
 /// Verify that all constants in the graph have matching dtypes.
-fn verify_constant_dtypes(uop: &Rc<UOp>) -> Result<(), TestCaseError> {
+fn verify_constant_dtypes(uop: &Arc<UOp>) -> Result<(), TestCaseError> {
     use morok_ir::Op;
 
     match uop.op() {

@@ -4,15 +4,15 @@ use crate::{
 };
 use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, ConstValueHash, Op, UOp};
-use std::{mem::discriminant, rc::Rc};
+use std::{mem::discriminant, sync::Arc};
 
 /// Helper to create a const UOp
-fn const_uop(val: i64) -> Rc<UOp> {
+fn const_uop(val: i64) -> Arc<UOp> {
     UOp::const_(DType::Int32, ConstValue::Int(val))
 }
 
 /// Helper to create a binary op UOp
-fn binary_uop(op: BinaryOp, a: Rc<UOp>, b: Rc<UOp>) -> Rc<UOp> {
+fn binary_uop(op: BinaryOp, a: Arc<UOp>, b: Arc<UOp>) -> Arc<UOp> {
     let dtype = a.dtype().clone();
     UOp::new(Op::Binary(op, a, b), dtype)
 }
@@ -24,7 +24,7 @@ fn test_var_matches_any() {
 
     let matches = pat.match_uop(&uop);
     assert_eq!(matches.len(), 1);
-    assert!(Rc::ptr_eq(matches[0].get("x").unwrap(), &uop));
+    assert!(Arc::ptr_eq(matches[0].get("x").unwrap(), &uop));
 }
 
 #[test]
@@ -298,7 +298,7 @@ fn test_chained_operators() {
     }
 
     // c should be const 3
-    assert!(Rc::ptr_eq(c, &const_uop(3)));
+    assert!(Arc::ptr_eq(c, &const_uop(3)));
 }
 
 // ===== Helper Method Tests =====
@@ -311,7 +311,7 @@ fn test_zero_const() {
     let zero = const_uop(0);
     let matches = pat.match_uop(&zero);
     assert_eq!(matches.len(), 1);
-    assert!(Rc::ptr_eq(matches[0].get("z").unwrap(), &zero));
+    assert!(Arc::ptr_eq(matches[0].get("z").unwrap(), &zero));
 
     // Should not match non-zero
     let five = const_uop(5);
@@ -407,7 +407,7 @@ fn test_detach_helper() {
 
     let matches = pat.match_uop(&detach);
     assert_eq!(matches.len(), 1);
-    assert!(Rc::ptr_eq(matches[0].get("x").unwrap(), &five));
+    assert!(Arc::ptr_eq(matches[0].get("x").unwrap(), &five));
 
     // Should not match non-detach operations
     let add = binary_uop(BinaryOp::Add, const_uop(1), const_uop(2));
@@ -424,5 +424,5 @@ fn test_contiguous_backward_helper() {
 
     let matches = pat.match_uop(&contiguous);
     assert_eq!(matches.len(), 1);
-    assert!(Rc::ptr_eq(matches[0].get("x").unwrap(), &five));
+    assert!(Arc::ptr_eq(matches[0].get("x").unwrap(), &five));
 }

@@ -96,12 +96,12 @@ impl Tensor {
 
         // Reshape x: [..., K] → [..., 1, K]
         let x_new_shape = build_matmul_broadcast_shape(&x_shape, dx - 1, broadcast_dims, dx - 1);
-        let x_reshaped = self.uop.try_reshape(&x_new_shape).map(Self::new).context(UOpSnafu)?;
+        let x_reshaped = self.uop().try_reshape(&x_new_shape).map(Self::new).context(UOpSnafu)?;
 
         // Reshape w: [..., K, N] → [..., 1, K, N]
         let axis_w_pos = Tensor::normalize_axis(axis_w, dw)?;
         let w_new_shape = build_matmul_broadcast_shape(&w_shape, dw.saturating_sub(2), broadcast_dims, axis_w_pos);
-        let w_reshaped = other.uop.try_reshape(&w_new_shape).map(Self::new).context(UOpSnafu)?;
+        let w_reshaped = other.uop().try_reshape(&w_new_shape).map(Self::new).context(UOpSnafu)?;
 
         // Step 4: Transpose, multiply, and sum
         let product = x_reshaped.try_mul(&w_reshaped.try_transpose(-1, axis_w)?)?;

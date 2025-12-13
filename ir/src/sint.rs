@@ -2,12 +2,12 @@
 //!
 //! This module provides the SInt type, which represents a dimension that can be:
 //! - A concrete compile-time constant (`usize`)
-//! - A symbolic runtime expression (`Rc<UOp>`)
+//! - A symbolic runtime expression (`Arc<UOp>`)
 //!
 //! This follows Tinygrad's approach where shapes can contain mixed concrete/symbolic
 //! dimensions, enabling dynamic shapes (variable batch sizes, dynamic sequences, etc.).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::UOp;
 
@@ -37,7 +37,7 @@ pub enum SInt {
     Const(usize),
 
     /// Symbolic runtime expression (must have dtype Index or Int).
-    Symbolic(Rc<UOp>),
+    Symbolic(Arc<UOp>),
 }
 
 // Manual implementations using stable ID equality for Symbolic (consistent with hash consing)
@@ -128,7 +128,7 @@ impl SInt {
     /// let s = SInt::from(uop.clone());
     /// assert!(s.as_symbolic().is_some());
     /// ```
-    pub fn as_symbolic(&self) -> Option<&Rc<UOp>> {
+    pub fn as_symbolic(&self) -> Option<&Arc<UOp>> {
         match self {
             SInt::Const(_) => None,
             SInt::Symbolic(uop) => Some(uop),
@@ -146,7 +146,7 @@ impl SInt {
     /// let uop = s.to_uop(DType::Index);
     /// assert_eq!(uop.dtype(), DType::Index);
     /// ```
-    pub fn to_uop(&self, dtype: morok_dtype::DType) -> Rc<UOp> {
+    pub fn to_uop(&self, dtype: morok_dtype::DType) -> Arc<UOp> {
         match self {
             SInt::Const(v) => UOp::const_(dtype, crate::ConstValue::Int(*v as i64)),
             SInt::Symbolic(uop) => {
@@ -193,16 +193,16 @@ impl From<usize> for SInt {
     }
 }
 
-impl From<Rc<UOp>> for SInt {
-    fn from(value: Rc<UOp>) -> Self {
+impl From<Arc<UOp>> for SInt {
+    fn from(value: Arc<UOp>) -> Self {
         // Try to extract constant value if possible
         let sint = SInt::Symbolic(value);
         sint.simplify()
     }
 }
 
-impl From<&Rc<UOp>> for SInt {
-    fn from(value: &Rc<UOp>) -> Self {
+impl From<&Arc<UOp>> for SInt {
+    fn from(value: &Arc<UOp>) -> Self {
         SInt::from(value.clone())
     }
 }
@@ -238,7 +238,7 @@ fn sint_aggregate<F, G>(
 ) -> SInt
 where
     F: FnOnce(Vec<usize>) -> usize,
-    G: Fn(Rc<UOp>, Rc<UOp>) -> crate::Result<Rc<UOp>>,
+    G: Fn(Arc<UOp>, Arc<UOp>) -> crate::Result<Arc<UOp>>,
 {
     use morok_dtype::DType;
 

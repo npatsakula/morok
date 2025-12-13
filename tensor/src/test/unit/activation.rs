@@ -11,7 +11,7 @@ fn test_relu_basic() {
     assert!(y.is_ok());
 
     // Verify dtype preserved
-    assert_eq!(y.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -20,7 +20,7 @@ fn test_sigmoid_basic() {
     let y = x.sigmoid();
     assert!(y.is_ok());
 
-    assert_eq!(y.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -29,7 +29,7 @@ fn test_tanh_basic() {
     let y = x.tanh();
     assert!(y.is_ok());
 
-    assert_eq!(y.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn test_softmax_basic() {
     let y = x.softmax(-1);
     assert!(y.is_ok());
 
-    assert_eq!(y.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn test_log_softmax_basic() {
     let y = x.log_softmax(-1);
     assert!(y.is_ok());
 
-    assert_eq!(y.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn test_logsumexp_basic() {
     }
     assert!(y.is_ok());
 
-    assert_eq!(y.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn test_gelu_basic() {
     let y = x.gelu();
     assert!(y.is_ok());
 
-    assert_eq!(y.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn test_swish_basic() {
     let y = x.swish();
     assert!(y.is_ok());
 
-    assert_eq!(y.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -86,5 +86,5 @@ fn test_silu_alias() {
     let y = x.silu();
     assert!(y.is_ok());
 
-    assert_eq!(y.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }

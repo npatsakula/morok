@@ -26,7 +26,7 @@ fn test_maximum_shapes() {
     assert!(result.is_ok());
 
     // Check dtype is preserved
-    assert_eq!(result.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(result.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn test_minimum_shapes() {
     assert!(result.is_ok());
 
     // Check dtype is preserved
-    assert_eq!(result.unwrap().uop.dtype(), DType::Float32);
+    assert_eq!(result.unwrap().uop().dtype(), DType::Float32);
 }
 
 #[test]

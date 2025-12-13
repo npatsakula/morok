@@ -3,13 +3,13 @@
 //! Validates that find_bufs correctly detects buffer access conflicts and that
 //! as_buf properly extracts buffers from wrapper operations.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
 use morok_ir::{UOp, UOpKey};
 
-use crate::rangeify::cycle_detection::{OpAccessType, as_buf, find_bufs};
+use crate::rangeify::transforms::{OpAccessType, as_buf, find_bufs};
 
 #[test]
 fn test_find_bufs_store_only() {
@@ -129,7 +129,7 @@ fn test_as_buf_mselect() {
     let mselect = UOp::mselect(buffer.clone(), 0);
 
     let extracted = as_buf(&mselect);
-    assert!(Rc::ptr_eq(&extracted, &buffer));
+    assert!(Arc::ptr_eq(&extracted, &buffer));
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn test_as_buf_mstack() {
     let mstack = UOp::mstack(vec![buf1.clone(), buf2].into());
 
     let extracted = as_buf(&mstack);
-    assert!(Rc::ptr_eq(&extracted, &buf1));
+    assert!(Arc::ptr_eq(&extracted, &buf1));
 }
 
 #[test]
@@ -151,5 +151,5 @@ fn test_as_buf_after() {
     let after = UOp::after(buffer.clone(), smallvec::smallvec![computation]);
 
     let extracted = as_buf(&after);
-    assert!(Rc::ptr_eq(&extracted, &buffer));
+    assert!(Arc::ptr_eq(&extracted, &buffer));
 }

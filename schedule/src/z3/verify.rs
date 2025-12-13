@@ -2,7 +2,7 @@
 //!
 //! Provides equivalence checking for symbolic rewrites with counterexample extraction.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::UOp;
 
@@ -47,7 +47,7 @@ impl std::error::Error for CounterExample {}
 /// - Expressions are not equivalent (Z3 returns SAT)
 /// - Z3 times out (returns UNKNOWN)
 /// - Conversion to Z3 fails
-pub fn verify_equivalence(original: &Rc<UOp>, simplified: &Rc<UOp>) -> VerificationResult {
+pub fn verify_equivalence(original: &Arc<UOp>, simplified: &Arc<UOp>) -> VerificationResult {
     // Create Z3 context
     let mut z3ctx = Z3Context::new();
 
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn test_verify_identity_add_zero() {
         // x + 0 = x
-        let x = UOp::var("x", DType::Int32, 0, 100);
+        let x = UOp::var("x", DType::Int32, 100);
         let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
         let x_plus_zero = x.try_add(&zero).unwrap();
 
@@ -146,8 +146,8 @@ mod tests {
     #[test]
     fn test_verify_commutativity() {
         // x + y = y + x
-        let x = UOp::var("x", DType::Int32, 0, 100);
-        let y = UOp::var("y", DType::Int32, 0, 100);
+        let x = UOp::var("x", DType::Int32, 100);
+        let y = UOp::var("y", DType::Int32, 100);
         let x_plus_y = x.try_add(&y).unwrap();
         let y_plus_x = y.try_add(&x).unwrap();
 
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_verify_detect_inequality() {
         // x + 1 ≠ x (should find counterexample)
-        let x = UOp::var("x", DType::Int32, 0, 100);
+        let x = UOp::var("x", DType::Int32, 100);
         let one = UOp::const_(DType::Int32, ConstValue::Int(1));
         let x_plus_one = x.try_add(&one).unwrap();
 
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn test_verify_self_folding() {
         // x - x = 0
-        let x = UOp::var("x", DType::Int32, 0, 100);
+        let x = UOp::var("x", DType::Int32, 100);
         let x_minus_x = x.try_sub(&x).unwrap();
         let zero = UOp::const_(DType::Int32, ConstValue::Int(0));
 

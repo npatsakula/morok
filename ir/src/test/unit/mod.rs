@@ -10,6 +10,7 @@ pub mod shape;
 pub mod sint;
 pub mod ternary;
 pub mod transcendental;
+pub mod tree;
 pub mod uop;
 pub mod validation;
 pub mod vector;

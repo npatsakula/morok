@@ -1,5 +1,6 @@
+use bon::bon;
 use snafu::ResultExt;
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::sync::Arc;
 
 use morok_device::{Buffer, registry};
 use morok_dtype::ext::HasDType;
@@ -12,6 +13,7 @@ pub mod activation;
 pub mod arithmetic;
 pub mod bitwise;
 pub mod broadcast;
+pub mod buffer_registry;
 pub mod conditional;
 pub mod math;
 pub mod matmul;
@@ -19,12 +21,25 @@ pub mod realize;
 pub mod reduce;
 pub mod schedule;
 pub mod shape_ops;
+pub mod tensor_registry;
 pub mod traits;
 
-// Thread-local buffer registry (matches Tinygrad's single-threaded model)
-// Maps UOp id -> actual device Buffer
-thread_local! {
-    static BUFFERS: RefCell<HashMap<u64, Buffer>> = RefCell::new(HashMap::new());
+// Re-export for public API
+pub use tensor_registry::apply_map_to_tensors;
+
+/// Information about a rendered kernel.
+///
+/// This is the public API returned by `tensor.kernels()`.
+#[derive(Clone, Debug)]
+pub struct KernelInfo {
+    /// Kernel name (e.g., "kernel")
+    pub name: String,
+    /// Generated code (LLVM IR, CUDA PTX, etc.)
+    pub code: String,
+    /// Entry point function name
+    pub entry_point: String,
+    /// Backend that generated this kernel
+    pub backend: String,
 }
 
 /// Tensor represents a multi-dimensional array with lazy evaluation.
@@ -32,7 +47,16 @@ thread_local! {
 /// Operations like addition and multiplication build a computation graph
 /// without allocating buffers. Buffers are only allocated when:
 /// - Creating input tensors via `from_slice()`
-/// - Evaluating the computation graph (future feature)
+/// - Evaluating the computation graph via `realize()`
+///
+/// # Global Graph Substitution
+///
+/// Tensors are registered in a global registry to support atomic graph substitution.
+/// When rangeify transforms a UOp (e.g., NEG → BUFFERIZE(NEG)), all tensors
+/// referencing it are updated atomically via `apply_map_to_tensors()`.
+///
+/// This is critical for diamond patterns (like argmin's NEG feeding both MAX and EQ)
+/// where different consumers must see the same transformed version.
 ///
 /// # Examples
 ///
@@ -41,16 +65,35 @@ thread_local! {
 /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
 /// let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
 /// let c = &a + &b;  // Lazy - only builds UOp graph
-/// let d = &c * &a;  // Chain operations
+/// let realized = c.realize().unwrap();  // Executes the computation
 /// ```
 #[derive(Clone)]
 pub struct Tensor {
-    uop: Rc<UOp>,
+    /// Registry entry holding the computation graph (supports global substitution)
+    entry: Arc<tensor_registry::TensorEntry>,
 }
 
+#[bon]
 impl Tensor {
-    fn new(uop: Rc<UOp>) -> Self {
-        Self { uop }
+    fn new(uop: Arc<UOp>) -> Self {
+        let entry = tensor_registry::register_tensor(uop);
+        Self { entry }
+    }
+
+    /// Get the current UOp for this tensor.
+    ///
+    /// This reads from the registry, so it reflects any global substitutions.
+    pub fn uop(&self) -> Arc<UOp> {
+        self.entry.uop.read().clone()
+    }
+
+    /// Get kernels for THIS tensor.
+    ///
+    /// Note: Kernel tracking is not yet implemented with the new registry.
+    /// This returns an empty list for now.
+    pub fn kernels(&self) -> Vec<KernelInfo> {
+        // TODO: Implement kernel tracking with the new registry
+        Vec::new()
     }
 
     /// Create 1D tensor with evenly spaced values.
@@ -102,28 +145,108 @@ impl Tensor {
         Ok(Self::from_slice(&values))
     }
 
+    /// Create tensor from slice on CPU (default device).
+    ///
+    /// For explicit device specification, use `from_slice_with`.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    /// assert_eq!(a.device(), DeviceSpec::Cpu);
+    /// ```
     pub fn from_slice<T: HasDType, C: AsRef<[T]>>(source: C) -> Self {
+        Self::from_slice_on(source, DeviceSpec::Cpu)
+    }
+
+    /// Create tensor from slice with explicit device specification using builder pattern.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // CPU tensor with builder
+    /// let a = Tensor::from_slice_with(&[1.0f32, 2.0, 3.0]).call();
+    ///
+    /// // Explicit device
+    /// let b = Tensor::from_slice_with(&[1.0f32, 2.0, 3.0])
+    ///     .device(DeviceSpec::Cuda { device_id: 0 })
+    ///     .call();
+    /// ```
+    #[builder]
+    pub fn from_slice_with<T: HasDType, C: AsRef<[T]>>(
+        source: C,
+        #[builder(default = DeviceSpec::Cpu)] device: DeviceSpec,
+    ) -> Self {
+        Self::from_slice_on(source, device)
+    }
+
+    /// Internal: Create tensor from slice on specified device.
+    fn from_slice_on<T: HasDType, C: AsRef<[T]>>(source: C, device: DeviceSpec) -> Self {
         let source = source.as_ref();
         let shape = Shape::from_iter([SInt::Const(source.len())]);
         let dtype = T::DTYPE;
 
-        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, source.len(), dtype.clone());
+        let buffer_uop = UOp::new_buffer(device.clone(), source.len(), dtype.clone());
 
-        let device = registry::cpu().expect("CPU always should be accessible");
-        let mut buffer = Buffer::new(device, dtype.clone(), vec![source.len()], Default::default());
+        // Get allocator for specified device
+        let allocator = match &device {
+            DeviceSpec::Cpu => registry::cpu().expect("CPU always should be accessible"),
+            // For non-CPU devices, try to get from registry or fall back to CPU for now
+            _ => registry::cpu().expect("CPU fallback for unsupported device"),
+        };
+
+        let mut buffer = Buffer::new(allocator, dtype.clone(), vec![source.len()], Default::default());
         let bytes = unsafe { std::slice::from_raw_parts(source.as_ptr() as *const u8, source.len() * dtype.bytes()) };
-        buffer.copyin(bytes).expect("CPU buffer write always successful");
-        BUFFERS.with(|buffers| buffers.borrow_mut().insert(buffer_uop.id, buffer));
+        buffer.copyin(bytes).expect("Buffer write always successful");
+        buffer_registry::get_or_create_buffer(buffer_uop.id, || Ok(buffer)).expect("Buffer registration failed");
 
         let uop = buffer_uop.try_reshape(&shape).expect("this reshape is always successful");
-        Self { uop }
+        Self::new(uop)
     }
 
     /// Get a reference to the underlying buffer from the registry.
     /// This allows multi-buffer operations to access buffers from multiple tensors.
     /// Uses `.base()` to walk through movement operations to find the actual buffer.
     pub fn buffer(&self) -> Option<Buffer> {
-        BUFFERS.with(|buffers| buffers.borrow().get(&self.uop.base().id).cloned())
+        let uop = self.uop();
+        let base_id = uop.base().id;
+        if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
+            eprintln!("buffer(): uop.id={} base().id={}", uop.id, base_id);
+        }
+        buffer_registry::get_buffer(base_id)
+    }
+
+    /// Get device specification from underlying UOp graph.
+    ///
+    /// Returns the device where this tensor's data resides.
+    /// For lazy tensors (not yet realized), returns the target device.
+    /// Defaults to CPU if no device is found in the graph.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let cpu_tensor = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    /// assert_eq!(cpu_tensor.device(), DeviceSpec::Cpu);
+    /// ```
+    pub fn device(&self) -> DeviceSpec {
+        self.uop().device_spec().unwrap_or(DeviceSpec::Cpu)
+    }
+
+    /// Move tensor to a different device.
+    ///
+    /// Creates a lazy COPY operation. Data is not transferred until `realize()`.
+    /// If already on target device, returns a clone (no-op).
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let cpu_tensor = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    /// let gpu_tensor = cpu_tensor.to(DeviceSpec::Cuda { device_id: 0 });
+    /// let realized = gpu_tensor.realize()?;  // Actually transfers data
+    /// ```
+    pub fn to(&self, device: DeviceSpec) -> Self {
+        if self.device() == device {
+            return self.clone();
+        }
+
+        let copy_uop = self.uop().copy_to_device(device);
+        Self::new(copy_uop)
     }
 
     /// Cast tensor to a different dtype.
@@ -134,8 +257,68 @@ impl Tensor {
     /// let t_int = t.cast(DType::Int32)?;
     /// ```
     pub fn cast(&self, dtype: morok_dtype::DType) -> Result<Self> {
-        let casted = UOp::cast(self.uop.clone(), dtype);
+        let casted = UOp::cast(self.uop(), dtype);
         Ok(Self::new(casted))
+    }
+
+    /// Extract data as ndarray::ArrayD<T> (for testing).
+    ///
+    /// This method is primarily intended for testing and validation.
+    /// It extracts the computed tensor data into an ndarray with the proper shape.
+    ///
+    /// # Type Parameters
+    /// * `T` - The output type, must implement HasDType and match the tensor's dtype
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    /// let result = t.realize()?.to_ndarray::<f32>()?;
+    /// assert_eq!(result.shape(), &[3]);
+    /// ```
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Tensor has no buffer (unrealized)
+    /// - Type T doesn't match tensor's dtype
+    /// - Shape cannot be extracted
+    /// - Buffer read fails
+    pub fn to_ndarray<T: HasDType + Default + Clone>(&self) -> Result<ndarray::ArrayD<T>> {
+        use ndarray::{ArrayD, IxDyn};
+
+        // Get buffer
+        let buffer = self.buffer().ok_or(Error::NoBuffer)?;
+
+        // Validate dtype matches
+        if buffer.dtype() != T::DTYPE {
+            return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail();
+        }
+
+        // Get shape
+        let uop = self.uop();
+        let shape = uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
+
+        // Convert shape to usize dimensions
+        let dims: Vec<usize> = shape.iter().map(|dim| dim.as_const().unwrap_or(1)).collect();
+
+        // Extract data
+        let count = buffer.size() / T::DTYPE.bytes();
+        let mut data = vec![T::default(); count];
+        buffer
+            .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, count * T::DTYPE.bytes()) })
+            .context(DeviceSnafu)?;
+
+        // Create ndarray with proper shape
+        let arr = ArrayD::from_shape_vec(IxDyn(&dims), data).context(NdarrayShapeSnafu)?;
+
+        Ok(arr)
+    }
+
+    /// Update the UOp for this tensor directly.
+    ///
+    /// This is used internally after realization to update the tensor's UOp
+    /// to point to the materialized buffer.
+    pub(crate) fn set_uop(&self, uop: Arc<UOp>) {
+        *self.entry.uop.write() = uop;
     }
 }
 

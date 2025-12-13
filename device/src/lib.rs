@@ -26,11 +26,16 @@
 
 pub mod allocator;
 pub mod buffer;
+pub mod device;
 pub mod error;
+pub mod queue;
 pub mod registry;
+pub mod sync;
 
-pub use buffer::Buffer;
+pub use buffer::{Buffer, BufferId};
 pub use error::{Error, Result};
+pub use queue::{DynQueue, ExecParams, HardwareQueue, Program, QueueFactory};
+pub use sync::{CpuTimelineSignal, TimelineSignal};
 
 #[cfg(test)]
 mod test;

@@ -1,17 +1,33 @@
 //! Dead Code Elimination (DCE) helpers for symbolic optimization.
 
 use morok_ir::{Op, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Check if a range is provably empty (no iterations).
-pub fn is_empty_range(uop: &Rc<UOp>) -> bool {
+///
+/// A range is empty if its maximum iteration count is < 0 (negative).
+/// A range with vmax = 0 means ONE iteration (0..=0), NOT zero iterations.
+///
+/// IMPORTANT: vmax <= 0 would be incorrect because:
+/// - vmax = 0: 1 iteration (valid, e.g., after full unroll splits REDUCE axis)
+/// - vmax = -1: 0 iterations (truly empty/dead)
+/// - vmax < 0: unreachable/dead code
+pub fn is_empty_range(uop: &Arc<UOp>) -> bool {
     use morok_ir::types::ConstValue;
     use morok_ir::uop::cached_property::CachedProperty;
     use morok_ir::uop::properties::VminVmaxProperty;
 
-    if let Op::Range { end, .. } = uop.op() {
-        let (_, vmax) = VminVmaxProperty::get(end);
-        matches!(vmax, ConstValue::Int(v) if *v <= 0) || matches!(vmax, ConstValue::UInt(0))
+    if matches!(uop.op(), Op::Range { .. }) {
+        // Get the RANGE's vmin_vmax (not the end's!)
+        // RANGE vmax = end_max - 1, so:
+        // - end=0 → vmax=-1 (empty, 0 iterations)
+        // - end=1 → vmax=0 (one iteration: [0])
+        // - end=2 → vmax=1 (two iterations: [0, 1])
+        let (_, vmax) = VminVmaxProperty::get(uop);
+        // Only treat as empty if vmax < 0 (truly unreachable)
+        // NOT vmax == 0 (which is valid single iteration)
+        matches!(vmax, ConstValue::Int(v) if *v < 0)
+        // Note: UInt cannot be negative, so no UInt case needed for "empty"
     } else {
         false
     }
@@ -23,7 +39,7 @@ pub fn is_empty_range(uop: &Rc<UOp>) -> bool {
 /// - Add: 0 (x + 0 = x)
 /// - Mul: 1 (x * 1 = x)
 /// - Max: minimum value for dtype (max(x, MIN) = x)
-pub fn reduce_identity(op: morok_ir::types::ReduceOp, dtype: morok_dtype::DType) -> Rc<UOp> {
+pub fn reduce_identity(op: morok_ir::types::ReduceOp, dtype: morok_dtype::DType) -> Arc<UOp> {
     use morok_dtype::DType;
     use morok_ir::types::ConstValue::*;
     use morok_ir::types::ReduceOp;

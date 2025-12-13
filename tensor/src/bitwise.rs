@@ -24,7 +24,7 @@ impl Tensor {
     /// - Shapes don't match (broadcasting not implemented)
     #[track_caller]
     pub fn bitwise_and(&self, other: &Tensor) -> Result<Tensor> {
-        self.uop.try_and_op(&other.uop).map(Self::new).context(UOpSnafu)
+        self.uop().try_and_op(&other.uop()).map(Self::new).context(UOpSnafu)
     }
 
     /// Bitwise OR operation.
@@ -45,7 +45,7 @@ impl Tensor {
     /// - Shapes don't match (broadcasting not implemented)
     #[track_caller]
     pub fn bitwise_or(&self, other: &Tensor) -> Result<Tensor> {
-        self.uop.try_or_op(&other.uop).map(Self::new).context(UOpSnafu)
+        self.uop().try_or_op(&other.uop()).map(Self::new).context(UOpSnafu)
     }
 
     /// Bitwise XOR operation.
@@ -66,7 +66,7 @@ impl Tensor {
     /// - Shapes don't match (broadcasting not implemented)
     #[track_caller]
     pub fn bitwise_xor(&self, other: &Tensor) -> Result<Tensor> {
-        self.uop.try_xor_op(&other.uop).map(Self::new).context(UOpSnafu)
+        self.uop().try_xor_op(&other.uop()).map(Self::new).context(UOpSnafu)
     }
 
     /// Left shift operation.
@@ -87,7 +87,7 @@ impl Tensor {
     /// - Shapes don't match (broadcasting not implemented)
     #[track_caller]
     pub fn lshift(&self, other: &Tensor) -> Result<Tensor> {
-        self.uop.try_shl_op(&other.uop).map(Self::new).context(UOpSnafu)
+        self.uop().try_shl_op(&other.uop()).map(Self::new).context(UOpSnafu)
     }
 
     /// Right shift operation.
@@ -108,6 +108,6 @@ impl Tensor {
     /// - Shapes don't match (broadcasting not implemented)
     #[track_caller]
     pub fn rshift(&self, other: &Tensor) -> Result<Tensor> {
-        self.uop.try_shr_op(&other.uop).map(Self::new).context(UOpSnafu)
+        self.uop().try_shr_op(&other.uop()).map(Self::new).context(UOpSnafu)
     }
 }

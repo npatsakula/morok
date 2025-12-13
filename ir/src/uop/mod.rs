@@ -24,6 +24,8 @@ pub mod hash_consing;
 pub mod helpers;
 pub mod properties;
 pub mod range_eval;
+pub mod tree;
 
 // Re-export the main types
 pub use core::{IntoUOp, UOp, UOpKey};
+pub use hash_consing::gc_unused_uops;

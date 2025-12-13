@@ -78,8 +78,13 @@ impl DType {
 
     /// Find the least upper bound type for a set of dtypes.
     ///
-    /// Returns the smallest scalar type that all input types can be safely cast to.
-    /// Always returns a scalar type (or Image), matching Tinygrad's behavior.
+    /// Returns the smallest type that all input types can be safely cast to.
+    ///
+    /// Type promotion rules:
+    /// - Scalar + Scalar → promoted Scalar
+    /// - Ptr<T> + Ptr<T> → Ptr<T> (same Ptr types)
+    /// - Ptr<T> + Scalar(T) → Scalar(T) (Ptr will be auto-loaded in codegen)
+    /// - Ptr<T> + Scalar(U) → promoted Scalar (if T and U are compatible)
     pub fn least_upper_dtype(dtypes: &[Self]) -> Option<Self> {
         if dtypes.is_empty() {
             return None;
@@ -90,16 +95,24 @@ impl DType {
             return Some(img.clone());
         }
 
+        // Check if all types are identical Ptr types
+        let first = &dtypes[0];
+        if matches!(first, DType::Ptr { .. }) && dtypes.iter().all(|d| d == first) {
+            return Some(first.clone());
+        }
+
         // Find common scalar type via promotion lattice intersection
+        // Use base() to extract scalar from Ptr types for promotion
+        // This allows Ptr<Float32> + Float32 → Float32
         let scalar_result = dtypes
             .iter()
-            .filter_map(|d| d.scalar())
+            .map(|d| d.base())
             .map(|s| s.get_recursive_parents())
             .reduce(|lhs, rhs| lhs.intersection(rhs))?
             .iter()
             .min()?; // min by discriminant (= priority: lower = more specific)
 
-        // Always return scalar (not vector), matching Tinygrad
+        // Return scalar type (Ptr values will be auto-loaded in codegen)
         Some(DType::Scalar(scalar_result))
     }
 }

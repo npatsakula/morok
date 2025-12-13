@@ -5,8 +5,8 @@
 //!
 //! # Arrow Types
 //!
-//! - `~>` (infallible): RHS returns `Rc<UOp>`, pattern always succeeds if matched
-//! - `=>` (fallible): RHS returns `Option<Rc<UOp>>`, pattern may return None
+//! - `~>` (infallible): RHS returns `Arc<UOp>`, pattern always succeeds if matched
+//! - `=>` (fallible): RHS returns `Option<Arc<UOp>>`, pattern may return None
 //!
 //! # Constant Value Extraction
 //!
@@ -20,10 +20,10 @@
 //! use morok_schedule_macros::patterns;
 //!
 //! let matcher = patterns! {
-//!     // Infallible patterns (~>) - RHS returns Rc<UOp>
+//!     // Infallible patterns (~>) - RHS returns Arc<UOp>
 //!     Add(x, @zero) ~> x,
 //!     Mul(x, @one) ~> x,
-//!     And(x, x2) if Rc::ptr_eq(x, x2) ~> Rc::clone(x),
+//!     And(x, x2) if Arc::ptr_eq(x, x2) ~> Arc::clone(x),
 //!
 //!     // Automatic ConstValue extraction with c@const(cv)
 //!     Cast { src: c@const(cv), dtype } => Some(UOp::const_(dtype.clone(), cv.cast(&dtype)?)),
@@ -34,8 +34,8 @@
 //!     // Complex fallible logic with block
 //!     Where(cond, t, f) => {
 //!         match VminVmaxProperty::get(cond) {
-//!             (ConstValue::Bool(true), _) => Some(Rc::clone(t)),
-//!             (ConstValue::Bool(false), _) => Some(Rc::clone(f)),
+//!             (ConstValue::Bool(true), _) => Some(Arc::clone(t)),
+//!             (ConstValue::Bool(false), _) => Some(Arc::clone(f)),
 //!             _ => None,
 //!         }
 //!     },
@@ -74,8 +74,8 @@ use parser::PatternList;
 ///
 /// # Arrow Types
 ///
-/// - `~>` (infallible): RHS returns `Rc<UOp>`, pattern always succeeds if matched
-/// - `=>` (fallible): RHS returns `Option<Rc<UOp>>`, pattern may return None
+/// - `~>` (infallible): RHS returns `Arc<UOp>`, pattern always succeeds if matched
+/// - `=>` (fallible): RHS returns `Option<Arc<UOp>>`, pattern may return None
 ///
 /// # Example
 ///
@@ -83,7 +83,7 @@ use parser::PatternList;
 /// let matcher = patterns! {
 ///     // Infallible patterns
 ///     Add(x, @zero) ~> x,
-///     And(x, x2) if Rc::ptr_eq(x, x2) ~> Rc::clone(x),
+///     And(x, x2) if Arc::ptr_eq(x, x2) ~> Arc::clone(x),
 ///
 ///     // Automatic ConstValue extraction with c@const(cv)
 ///     Cast { src: c@const(cv), dtype } => Some(UOp::const_(dtype, cv.cast(&dtype)?)),

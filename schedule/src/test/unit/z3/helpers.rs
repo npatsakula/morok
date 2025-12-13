@@ -1,6 +1,6 @@
 //! Test helpers for Z3 verification tests.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::UOp;
 
@@ -14,7 +14,7 @@ use crate::z3::verify::verify_equivalence;
 /// 1. Applies symbolic simplification to the input
 /// 2. Verifies the result is semantically equivalent using Z3
 /// 3. Returns the simplified expression for further assertions
-pub fn verify_simplifies_to(expr: Rc<UOp>, expected: Rc<UOp>) -> Rc<UOp> {
+pub fn verify_simplifies_to(expr: Arc<UOp>, expected: Arc<UOp>) -> Arc<UOp> {
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
@@ -22,7 +22,7 @@ pub fn verify_simplifies_to(expr: Rc<UOp>, expected: Rc<UOp>) -> Rc<UOp> {
     verify_equivalence(&expr, &simplified).expect("Simplification should preserve semantics");
 
     // Also check structural equality with expected (optional but helpful for debugging)
-    if !Rc::ptr_eq(&simplified, &expected) {
+    if !Arc::ptr_eq(&simplified, &expected) {
         // If not pointer-equal, they might still be structurally equivalent
         // This is okay - Z3 verification is the source of truth
     }
@@ -31,7 +31,7 @@ pub fn verify_simplifies_to(expr: Rc<UOp>, expected: Rc<UOp>) -> Rc<UOp> {
 }
 
 /// Verify that simplification preserves semantics (even if structure changes).
-pub fn verify_preserves_semantics(expr: Rc<UOp>) -> Rc<UOp> {
+pub fn verify_preserves_semantics(expr: Arc<UOp>) -> Arc<UOp> {
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 

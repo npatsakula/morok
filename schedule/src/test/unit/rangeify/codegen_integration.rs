@@ -5,16 +5,16 @@
 //!
 //! Adapted from Tinygrad's test_rangeify.py and test_assign.py.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, Op, UOp};
 
-use crate::rangeify::codegen_patterns::{fix_after_broadcast, get_contiguous, remove_noop};
-use crate::rangeify::cycle_detection::find_bufs;
-use crate::rangeify::kernel_context::KernelContext;
-use crate::rangeify::split_kernel::split_store;
+use crate::rangeify::kernel::KernelContext;
+use crate::rangeify::kernel::split_store;
+use crate::rangeify::patterns::{fix_after_broadcast, get_contiguous, remove_noop};
+use crate::rangeify::transforms::find_bufs;
 
 /// Test that remove_noop integrates correctly in pipeline context.
 ///
@@ -47,7 +47,7 @@ fn test_get_contiguous_in_pipeline() {
     assert!(result.is_some());
 
     let unwrapped = result.unwrap();
-    assert!(Rc::ptr_eq(&unwrapped, &value));
+    assert!(Arc::ptr_eq(&unwrapped, &value));
 }
 
 /// Test that fix_after_broadcast handles AFTER+EXPAND correctly.
@@ -70,7 +70,7 @@ fn test_fix_after_broadcast_in_pipeline() {
 
     let fixed = result.unwrap();
     if let Op::After { passthrough, .. } = fixed.op() {
-        assert!(Rc::ptr_eq(passthrough, &source));
+        assert!(Arc::ptr_eq(passthrough, &source));
     } else {
         panic!("Expected AFTER operation");
     }

@@ -9,12 +9,13 @@
 //! Based on Tinygrad's test_schedule.py pattern tests.
 
 use std::f32::consts::PI;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 
 use crate::pattern::matcher::RewriteResult;
+use crate::rangeify::IndexingContext;
 use crate::rangeify::patterns;
 
 // ===== early_rewrites Pattern Tests =====
@@ -31,7 +32,7 @@ fn test_early_rewrites_detach_removal() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite DETACH");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &x), "Should return the source");
+        assert!(Arc::ptr_eq(&rewritten, &x), "Should return the source");
     }
 }
 
@@ -47,7 +48,7 @@ fn test_early_rewrites_contiguous_backward_removal() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite CONTIGUOUS_BACKWARD");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &x), "Should return the source");
+        assert!(Arc::ptr_eq(&rewritten, &x), "Should return the source");
     }
 }
 
@@ -80,7 +81,7 @@ fn test_early_rewrites_nested_detach() {
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &inner_detach), "Should unwrap outer DETACH to inner DETACH");
+        assert!(Arc::ptr_eq(&rewritten, &inner_detach), "Should unwrap outer DETACH to inner DETACH");
     }
 }
 
@@ -102,7 +103,7 @@ fn test_buffer_folding_noop_bufferize() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove noop BUFFERIZE");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &x), "Should return the compute directly");
+        assert!(Arc::ptr_eq(&rewritten, &x), "Should return the compute directly");
     }
 }
 
@@ -120,7 +121,7 @@ fn test_buffer_folding_bufferize_const() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove BUFFERIZE from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
+        assert!(Arc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
     }
 }
 
@@ -138,7 +139,7 @@ fn test_buffer_folding_index_const() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove INDEX from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
+        assert!(Arc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
     }
 }
 
@@ -155,7 +156,7 @@ fn test_buffer_folding_copy_const() {
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove COPY from CONST");
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(Rc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
+        assert!(Arc::ptr_eq(&rewritten, &const_val), "Should return the constant directly");
     }
 }
 
@@ -208,7 +209,7 @@ fn test_dead_axis_removal_single_dead_axis() {
             // Either returns compute directly or BUFFERIZE with no ranges
             // Since all ranges are dead, should return compute directly
             assert!(
-                Rc::ptr_eq(&rewritten, &x) || matches!(rewritten.op(), Op::Bufferize { .. }),
+                Arc::ptr_eq(&rewritten, &x) || matches!(rewritten.op(), Op::Bufferize { .. }),
                 "Should either return compute or empty BUFFERIZE"
             );
         }
@@ -287,7 +288,7 @@ fn test_buffer_removal_cheap_compute() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Rc::ptr_eq(&rewritten, &add), "Should remove BUFFERIZE from cheap compute");
+            assert!(Arc::ptr_eq(&rewritten, &add), "Should remove BUFFERIZE from cheap compute");
         }
         _ => {
             // Acceptable if cost model determines it's not cheap enough
@@ -311,7 +312,7 @@ fn test_buffer_removal_always_run_ops() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Rc::ptr_eq(&rewritten, &contiguous), "Should remove BUFFERIZE from always-run op");
+            assert!(Arc::ptr_eq(&rewritten, &contiguous), "Should remove BUFFERIZE from always-run op");
         }
         _ => {
             // Acceptable depending on implementation
@@ -341,7 +342,7 @@ fn test_buffer_removal_nested_bufferize() {
         RewriteResult::Rewritten(rewritten) => {
             if let Op::Bufferize { compute, .. } = rewritten.op() {
                 // Should have unwrapped inner BUFFERIZE
-                assert!(Rc::ptr_eq(compute, &x), "Should have compute pointing to x, not inner BUFFERIZE");
+                assert!(Arc::ptr_eq(compute, &x), "Should have compute pointing to x, not inner BUFFERIZE");
             } else {
                 panic!("Expected BUFFERIZE operation");
             }
@@ -372,17 +373,114 @@ fn test_buffer_removal_no_match_expensive_compute() {
     assert!(matches!(result, RewriteResult::NoMatch), "Should not remove BUFFERIZE from expensive op");
 }
 
-// ===== Stub Pattern Tests =====
+// ===== Movement Op Removal Tests =====
 
 #[test]
-fn test_movement_op_removal_is_stub() {
+fn test_movement_op_removal_no_match_without_ranges() {
     let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
 
-    let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let result = matcher.rewrite(&x, &mut ());
+    // Create a PERMUTE operation (a movement op)
+    let src = UOp::define_global(0, DType::Float32);
+    let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
 
-    // Should return NoMatch since it's a stub
-    assert!(matches!(result, RewriteResult::NoMatch), "movement_op_removal is a stub");
+    // Without ranges assigned, should NOT remove
+    let result = matcher.rewrite(&permute, &mut ctx);
+    assert!(matches!(result, RewriteResult::NoMatch), "Should NOT remove movement op without ranges assigned");
+}
+
+#[test]
+fn test_movement_op_removal_removes_with_ranges() {
+    let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
+
+    // Create a PERMUTE operation
+    let src = UOp::define_global(0, DType::Float32);
+    let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
+
+    // Assign ranges to the movement op (simulating transformation has been applied)
+    let range = UOp::new(
+        Op::Range { end: UOp::index_const(5), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        DType::Index,
+    );
+    ctx.set_ranges(&permute, vec![range.clone()], vec![range.clone()]);
+
+    // With ranges assigned, SHOULD remove and return source
+    let result = matcher.rewrite(&permute, &mut ctx);
+    match result {
+        RewriteResult::Rewritten(result) => {
+            assert!(std::sync::Arc::ptr_eq(&result, &src), "Should return the source operand");
+        }
+        _ => panic!("Expected movement op to be removed when ranges are assigned"),
+    }
+}
+
+#[test]
+fn test_movement_op_removal_reshape() {
+    let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
+
+    // Create a RESHAPE operation
+    let src = UOp::define_global(0, DType::Float32);
+    let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
+    let reshape = UOp::new(Op::Reshape { src: src.clone(), new_shape }, DType::Float32);
+
+    // Assign ranges
+    let range = UOp::new(
+        Op::Range { end: UOp::index_const(4), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        DType::Index,
+    );
+    ctx.set_ranges(&reshape, vec![range.clone()], vec![range.clone()]);
+
+    // Should remove and return source
+    let result = matcher.rewrite(&reshape, &mut ctx);
+    match result {
+        RewriteResult::Rewritten(result) => {
+            assert!(std::sync::Arc::ptr_eq(&result, &src), "RESHAPE should be removed");
+        }
+        _ => panic!("Expected RESHAPE to be removed when ranges are assigned"),
+    }
+}
+
+#[test]
+fn test_movement_op_removal_expand() {
+    let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
+
+    // Create an EXPAND operation
+    let src = UOp::define_global(0, DType::Float32);
+    let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
+    let expand = UOp::new(Op::Expand { src: src.clone(), new_shape }, DType::Float32);
+
+    // Assign ranges
+    let range = UOp::new(
+        Op::Range { end: UOp::index_const(4), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        DType::Index,
+    );
+    ctx.set_ranges(&expand, vec![range.clone()], vec![range.clone()]);
+
+    // Should remove and return source
+    let result = matcher.rewrite(&expand, &mut ctx);
+    match result {
+        RewriteResult::Rewritten(result) => {
+            assert!(std::sync::Arc::ptr_eq(&result, &src), "EXPAND should be removed");
+        }
+        _ => panic!("Expected EXPAND to be removed when ranges are assigned"),
+    }
+}
+
+#[test]
+fn test_movement_op_removal_non_movement_op() {
+    let matcher = patterns::movement_op_removal();
+    let mut ctx = IndexingContext::new();
+
+    // Create a non-movement op (NEG)
+    let src = UOp::define_global(0, DType::Float32);
+    let neg = src.neg();
+
+    // Should NOT match non-movement ops
+    let result = matcher.rewrite(&neg, &mut ctx);
+    assert!(matches!(result, RewriteResult::NoMatch), "Should not match non-movement ops");
 }
 
 // ===== Integration Tests =====
@@ -418,7 +516,7 @@ fn test_pattern_composition() {
 
     match result2 {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(Rc::ptr_eq(&rewritten, &x), "Should have removed both DETACH and BUFFERIZE");
+            assert!(Arc::ptr_eq(&rewritten, &x), "Should have removed both DETACH and BUFFERIZE");
         }
         _ => {
             // Acceptable depending on implementation

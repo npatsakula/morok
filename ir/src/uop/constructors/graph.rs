@@ -8,7 +8,7 @@
 //! - Optimization hints: precast
 //! - Custom code: custom, customi
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use smallvec::SmallVec;
@@ -24,7 +24,7 @@ impl UOp {
     /// Create a sink operation (graph termination).
     ///
     /// Sink marks outputs that must be evaluated. All sources are dependencies.
-    pub fn sink(sources: Vec<Rc<Self>>) -> Rc<Self> {
+    pub fn sink(sources: Vec<Arc<Self>>) -> Arc<Self> {
         Self::new(Op::Sink { sources: SmallVec::from_vec(sources) }, DType::Void)
     }
 
@@ -32,7 +32,7 @@ impl UOp {
     ///
     /// Group is a NOOP that helps organize related operations together.
     /// It passes through the first source while ensuring all sources are dependencies.
-    pub fn group(sources: Vec<Rc<Self>>) -> Rc<Self> {
+    pub fn group(sources: Vec<Arc<Self>>) -> Arc<Self> {
         let dtype = if sources.is_empty() { DType::Void } else { sources[0].dtype.clone() };
         Self::new(Op::Group { sources: SmallVec::from_vec(sources) }, dtype)
     }
@@ -42,7 +42,7 @@ impl UOp {
     // =========================================================================
 
     /// In-place assignment.
-    pub fn assign(target: Rc<Self>, value: Rc<Self>) -> Rc<Self> {
+    pub fn assign(target: Arc<Self>, value: Arc<Self>) -> Arc<Self> {
         let dtype = target.dtype();
         Self::new(Op::Assign { target, value }, dtype)
     }
@@ -52,7 +52,7 @@ impl UOp {
     // =========================================================================
 
     /// Ordering constraint: passthrough depends on deps.
-    pub fn after(passthrough: Rc<Self>, deps: SmallVec<[Rc<Self>; 4]>) -> Rc<Self> {
+    pub fn after(passthrough: Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
         let dtype = passthrough.dtype();
         Self::new(Op::After { passthrough, deps }, dtype)
     }
@@ -62,19 +62,19 @@ impl UOp {
     // =========================================================================
 
     /// Detach from gradient flow / force materialization.
-    pub fn detach(src: Rc<Self>) -> Rc<Self> {
+    pub fn detach(src: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Detach { src }, dtype)
     }
 
     /// Ensure contiguous memory layout.
-    pub fn contiguous(src: Rc<Self>) -> Rc<Self> {
+    pub fn contiguous(src: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Contiguous { src }, dtype)
     }
 
     /// Contiguous backward pass.
-    pub fn contiguous_backward(src: Rc<Self>) -> Rc<Self> {
+    pub fn contiguous_backward(src: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::ContiguousBackward { src }, dtype)
     }
@@ -87,7 +87,7 @@ impl UOp {
     ///
     /// Inserted before BITCAST to ensure the source is rendered separately
     /// in codegen (prevents invalid cast fusion).
-    pub fn precast(src: Rc<Self>) -> Rc<Self> {
+    pub fn precast(src: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Precast { src }, dtype)
     }
@@ -100,7 +100,7 @@ impl UOp {
     ///
     /// `deps` are UOps whose rendered names can be referenced in `code`.
     /// `dtype` specifies the result type (often Void for statements).
-    pub fn custom(deps: SmallVec<[Rc<Self>; 4]>, code: String, dtype: DType) -> Rc<Self> {
+    pub fn custom(deps: SmallVec<[Arc<Self>; 4]>, code: String, dtype: DType) -> Arc<Self> {
         Self::new(Op::Custom { deps, code }, dtype)
     }
 
@@ -108,7 +108,7 @@ impl UOp {
     ///
     /// Unlike `custom` (statement), this is substituted directly into expressions.
     /// `deps` provide values to reference; result has specified `dtype`.
-    pub fn customi(deps: SmallVec<[Rc<Self>; 4]>, code: String, dtype: DType) -> Rc<Self> {
+    pub fn customi(deps: SmallVec<[Arc<Self>; 4]>, code: String, dtype: DType) -> Arc<Self> {
         Self::new(Op::CustomI { deps, code }, dtype)
     }
 }

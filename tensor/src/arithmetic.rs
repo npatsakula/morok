@@ -20,7 +20,7 @@ macro_rules! impl_tensor_ops {
                 let (lhs, rhs) = self.broadcast_for_binop(other)?;
 
                 // Now call UOp operation with matching shapes
-                lhs.uop.$bin_uop(&rhs.uop).map(Self::new).context(UOpSnafu)
+                lhs.uop().$bin_uop(&rhs.uop()).map(Self::new).context(UOpSnafu)
             }
         )*
 
@@ -28,7 +28,7 @@ macro_rules! impl_tensor_ops {
         $(
             #[track_caller]
             pub fn $inf_method(&self) -> Result<Tensor> {
-                Ok(Self::new(self.uop.$inf_uop()))
+                Ok(Self::new(self.uop().$inf_uop()))
             }
         )*
 
@@ -36,7 +36,7 @@ macro_rules! impl_tensor_ops {
         $(
             #[track_caller]
             pub fn $fall_method(&self) -> Result<Tensor> {
-                self.uop.$fall_uop().map(Self::new).context(UOpSnafu)
+                self.uop().$fall_uop().map(Self::new).context(UOpSnafu)
             }
         )*
     };
@@ -120,7 +120,7 @@ impl Tensor {
     /// Returns error if called on non-integer dtype.
     pub fn bitwise_not(&self) -> Result<Tensor> {
         // Verify dtype is integer
-        let dtype = self.uop.dtype();
+        let dtype = self.uop().dtype();
         if !dtype.is_int() {
             return Err(Error::SymbolicShapeUnsupported {
                 operation: format!("bitwise_not on non-integer dtype {:?}", dtype),

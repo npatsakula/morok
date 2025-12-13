@@ -115,6 +115,10 @@ pub enum Error {
     #[snafu(display("symbolic shape is not supported for {operation}: shape dimensions must be concrete values"))]
     SymbolicShapeUnsupported { operation: String },
 
+    /// Symbolic buffer size unsupported.
+    #[snafu(display("cannot allocate buffer with symbolic size: range bound resolved to {bound:?}"))]
+    SymbolicBufferSize { bound: crate::ConstValue },
+
     /// Ternary branch shape mismatch.
     #[snafu(display(
         "ternary operation branches have mismatched shapes: true branch {true_branch:?} vs false branch {false_branch:?}"

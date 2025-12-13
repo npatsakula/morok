@@ -9,8 +9,11 @@ pub mod context;
 pub mod cost_based;
 pub mod cycle_detection;
 pub mod dead_axis;
+pub mod deduplication;
+pub mod device_semantics;
 pub mod edge_cases;
 pub mod flatten_range;
+pub mod fusion;
 pub mod helpers;
 pub mod indexing;
 pub mod kernel_context;
@@ -60,7 +63,7 @@ fn test_rangeify_context_record_transform() {
 
     let retrieved = ctx.get_rangeified(&original);
     assert!(retrieved.is_some());
-    assert!(std::rc::Rc::ptr_eq(retrieved.unwrap(), &rangeified));
+    assert!(std::sync::Arc::ptr_eq(retrieved.unwrap(), &rangeified));
 }
 
 #[test]
@@ -98,7 +101,7 @@ fn test_early_rewrites_detach_removal() {
     let result = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
+        assert!(std::sync::Arc::ptr_eq(&rewritten, &x));
     }
 }
 
@@ -115,6 +118,6 @@ fn test_early_rewrites_contiguous_backward_removal() {
     let result = matcher.rewrite(&contiguous, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
+        assert!(std::sync::Arc::ptr_eq(&rewritten, &x));
     }
 }

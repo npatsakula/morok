@@ -2,7 +2,7 @@
 
 use morok_ir::{UOp, UOpKey};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Context for rangeify transformation.
 ///
@@ -16,8 +16,8 @@ pub struct RangeifyContext {
     /// This allows us to track how each node in the original graph
     /// has been transformed during the rangeify process.
     ///
-    /// Uses UOpKey for HashMap keys since Rc<UOp> doesn't implement Hash/Eq.
-    pub range_map: HashMap<UOpKey, Rc<UOp>>,
+    /// Uses UOpKey for HashMap keys since Arc<UOp> doesn't implement Hash/Eq.
+    pub range_map: HashMap<UOpKey, Arc<UOp>>,
 
     /// Counter for generating unique range IDs.
     ///
@@ -47,12 +47,12 @@ impl RangeifyContext {
     ///
     /// Maps the original UOp to its rangeified version so we can
     /// track the transformation.
-    pub fn record_transform(&mut self, original: Rc<UOp>, rangeified: Rc<UOp>) {
+    pub fn record_transform(&mut self, original: Arc<UOp>, rangeified: Arc<UOp>) {
         self.range_map.insert(UOpKey(original), rangeified);
     }
 
     /// Get the rangeified version of a UOp, if it exists.
-    pub fn get_rangeified(&self, original: &Rc<UOp>) -> Option<&Rc<UOp>> {
+    pub fn get_rangeified(&self, original: &Arc<UOp>) -> Option<&Arc<UOp>> {
         self.range_map.get(&UOpKey(original.clone()))
     }
 }

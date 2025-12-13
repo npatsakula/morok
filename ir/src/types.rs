@@ -6,7 +6,7 @@
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 
-use morok_device::DeviceSpec;
+use morok_dtype::DeviceSpec;
 use morok_dtype::{DType, ScalarDType};
 
 /// Constant value that can be stored in a UOp.
@@ -219,16 +219,8 @@ impl ConstValue {
     }
 }
 
-/// Memory address space for buffer allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AddrSpace {
-    /// Global/device memory.
-    Global,
-    /// Local/shared memory.
-    Local,
-    /// Register memory.
-    Reg,
-}
+// Re-export AddrSpace from dtype to avoid duplication
+pub use morok_dtype::AddrSpace;
 
 /// Options for BUFFERIZE operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

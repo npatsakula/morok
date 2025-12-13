@@ -151,7 +151,7 @@ fn test_matmul_dtype_promotion() {
 
     let c = a.dot(&b).unwrap();
     // Result should be promoted to float32
-    assert_eq!(c.uop.dtype(), DType::Float32);
+    assert_eq!(c.uop().dtype(), DType::Float32);
 }
 
 #[test]
@@ -161,7 +161,25 @@ fn test_matmul_explicit_dtype() {
 
     // Use float64 accumulation
     let c = a.matmul_with().other(&b).dtype(DType::Float64).call().unwrap();
-    assert_eq!(c.uop.dtype(), DType::Float64);
+    assert_eq!(c.uop().dtype(), DType::Float64);
+}
+
+#[test]
+#[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_ir -- --ignored --nocapture
+fn test_print_matmul_ir() {
+    // Create 4x4 matmul to see generated IR
+    let a = Tensor::from_slice((0..16).map(|i| i as f32).collect::<Vec<_>>()).try_reshape(&[4, 4]).unwrap();
+    let b = Tensor::from_slice((0..16).map(|i| i as f32).collect::<Vec<_>>()).try_reshape(&[4, 4]).unwrap();
+    let c = a.matmul(&b).unwrap();
+
+    let plan = c.prepare().expect("prepare should succeed");
+
+    println!("\n=== Generated Kernels ===\n");
+    for kernel in plan.kernels() {
+        println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
+        println!("{}", kernel.code);
+        println!();
+    }
 }
 
 // ========== Linear Layer Tests ==========

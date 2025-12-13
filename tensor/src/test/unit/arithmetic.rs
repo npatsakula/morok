@@ -14,14 +14,14 @@ fn test_add_same_shape() {
     let c = &a + &b;
 
     // Verify it created an Add operation
-    if let Op::Binary(op, _, _) = c.uop.op() {
+    if let Op::Binary(op, _, _) = c.uop().op() {
         assert_eq!(format!("{:?}", op), "Add");
     } else {
         panic!("Expected Binary Add operation");
     }
 
     // Verify shape is preserved
-    assert_eq!(c.uop.shape().unwrap().as_ref().map(|s| s.len()), Some(1));
+    assert_eq!(c.uop().shape().unwrap().as_ref().map(|s| s.len()), Some(1));
 }
 
 #[test]
@@ -31,14 +31,14 @@ fn test_mul_same_shape() {
     let c = &a * &b;
 
     // Verify it created a Mul operation
-    if let Op::Binary(op, _, _) = c.uop.op() {
+    if let Op::Binary(op, _, _) = c.uop().op() {
         assert_eq!(format!("{:?}", op), "Mul");
     } else {
         panic!("Expected Binary Mul operation");
     }
 
     // Verify shape is preserved
-    assert_eq!(c.uop.shape().unwrap().as_ref().map(|s| s.len()), Some(1));
+    assert_eq!(c.uop().shape().unwrap().as_ref().map(|s| s.len()), Some(1));
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn test_add_type_promotion() {
     let c = &a + &b;
 
     // Result should be promoted to Float32
-    assert_eq!(c.uop.dtype(), morok_dtype::DType::Float32);
+    assert_eq!(c.uop().dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
@@ -58,7 +58,7 @@ fn test_mul_type_promotion() {
     let c = &a * &b;
 
     // Result should be promoted to Float32
-    assert_eq!(c.uop.dtype(), morok_dtype::DType::Float32);
+    assert_eq!(c.uop().dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn test_chained_operations() {
     let result = (&a + &b) * &c;
 
     // Verify it creates the correct UOp graph
-    if let Op::Binary(op, _, _) = result.uop.op() {
+    if let Op::Binary(op, _, _) = result.uop().op() {
         assert_eq!(format!("{:?}", op), "Mul");
     } else {
         panic!("Expected Binary Mul operation at top level");
@@ -147,7 +147,7 @@ fn test_sub_same_shape() {
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = &a - &b;
 
-    if let Op::Binary(op, _, _) = c.uop.op() {
+    if let Op::Binary(op, _, _) = c.uop().op() {
         assert_eq!(format!("{:?}", op), "Sub");
     } else {
         panic!("Expected Binary Sub operation");
@@ -160,7 +160,7 @@ fn test_div_same_shape() {
     let b = Tensor::from_slice([2.0f32, 4.0, 5.0]);
     let c = &a / &b;
 
-    if let Op::Binary(op, _, _) = c.uop.op() {
+    if let Op::Binary(op, _, _) = c.uop().op() {
         assert_eq!(format!("{:?}", op), "Fdiv");
     } else {
         panic!("Expected Binary Fdiv operation");
@@ -173,7 +173,7 @@ fn test_pow_same_shape() {
     let b = Tensor::from_slice([2.0f32, 2.0, 2.0]);
     let c = a.try_pow(&b).unwrap();
 
-    if let Op::Binary(op, _, _) = c.uop.op() {
+    if let Op::Binary(op, _, _) = c.uop().op() {
         assert_eq!(format!("{:?}", op), "Pow");
     } else {
         panic!("Expected Binary Pow operation");
@@ -208,7 +208,7 @@ fn test_eq_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = a.try_eq(&b).unwrap();
 
-    assert_eq!(c.uop.dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn test_ne_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 4.0]);
     let c = a.try_ne(&b).unwrap();
 
-    assert_eq!(c.uop.dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
 }
 
 #[test]
@@ -226,7 +226,7 @@ fn test_lt_comparison() {
     let b = Tensor::from_slice([2.0f32, 3.0, 4.0]);
     let c = a.try_lt(&b).unwrap();
 
-    assert_eq!(c.uop.dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
 }
 
 #[test]
@@ -235,7 +235,7 @@ fn test_le_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = a.try_le(&b).unwrap();
 
-    assert_eq!(c.uop.dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
 }
 
 #[test]
@@ -244,7 +244,7 @@ fn test_gt_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = a.try_gt(&b).unwrap();
 
-    assert_eq!(c.uop.dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
 }
 
 #[test]
@@ -253,7 +253,7 @@ fn test_ge_comparison() {
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = a.try_ge(&b).unwrap();
 
-    assert_eq!(c.uop.dtype(), morok_dtype::DType::Bool);
+    assert_eq!(c.uop().dtype(), morok_dtype::DType::Bool);
 }
 
 #[test]
@@ -292,7 +292,7 @@ fn test_provenance_tracking() {
         let t = tracker.borrow();
 
         eprintln!("\n=== Tensor Level Provenance ===");
-        let events = t.get_events(c.uop.id);
+        let events = t.get_events(c.uop().id);
         assert!(events.is_some(), "Expected provenance for Tensor");
 
         for (i, event) in events.unwrap().iter().enumerate() {
@@ -309,7 +309,7 @@ fn test_neg_basic() {
     let a = Tensor::from_slice([1.0f32, -2.0, 3.0]);
     let b = -&a;
 
-    if let Op::Unary(op, _) = b.uop.op() {
+    if let Op::Unary(op, _) = b.uop().op() {
         assert_eq!(format!("{:?}", op), "Neg");
     } else {
         panic!("Expected Unary Neg operation");
@@ -329,7 +329,7 @@ fn test_abs_basic() {
     let a = Tensor::from_slice([-1.0f32, 2.0, -3.0]);
     let b = a.try_abs().unwrap();
 
-    if let Op::Unary(op, _) = b.uop.op() {
+    if let Op::Unary(op, _) = b.uop().op() {
         assert_eq!(format!("{:?}", op), "Abs");
     } else {
         panic!("Expected Unary Abs operation");
@@ -341,7 +341,7 @@ fn test_abs_int() {
     let a = Tensor::from_slice([-1i32, 2, -3]);
     let b = a.try_abs().unwrap();
 
-    if let Op::Unary(op, _) = b.uop.op() {
+    if let Op::Unary(op, _) = b.uop().op() {
         assert_eq!(format!("{:?}", op), "Abs");
     } else {
         panic!("Expected Unary Abs operation");
@@ -353,14 +353,14 @@ fn test_sqrt_basic() {
     let a = Tensor::from_slice([1.0f32, 4.0, 9.0]);
     let b = a.try_sqrt().unwrap();
 
-    if let Op::Unary(op, _) = b.uop.op() {
+    if let Op::Unary(op, _) = b.uop().op() {
         assert_eq!(format!("{:?}", op), "Sqrt");
     } else {
         panic!("Expected Unary Sqrt operation");
     }
 
     // Verify dtype is preserved
-    assert_eq!(b.uop.dtype(), morok_dtype::DType::Float32);
+    assert_eq!(b.uop().dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
@@ -375,13 +375,13 @@ fn test_rsqrt_basic() {
     let a = Tensor::from_slice([1.0f32, 4.0, 9.0]);
     let b = a.try_rsqrt().unwrap();
 
-    if let Op::Unary(op, _) = b.uop.op() {
+    if let Op::Unary(op, _) = b.uop().op() {
         assert_eq!(format!("{:?}", op), "Rsqrt");
     } else {
         panic!("Expected Unary Rsqrt operation");
     }
 
-    assert_eq!(b.uop.dtype(), morok_dtype::DType::Float32);
+    assert_eq!(b.uop().dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
@@ -389,13 +389,13 @@ fn test_exp_basic() {
     let a = Tensor::from_slice([0.0f32, 1.0, 2.0]);
     let b = a.try_exp().unwrap();
 
-    if let Op::Unary(op, _) = b.uop.op() {
+    if let Op::Unary(op, _) = b.uop().op() {
         assert_eq!(format!("{:?}", op), "Exp");
     } else {
         panic!("Expected Unary Exp operation");
     }
 
-    assert_eq!(b.uop.dtype(), morok_dtype::DType::Float32);
+    assert_eq!(b.uop().dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]
@@ -403,13 +403,13 @@ fn test_log_basic() {
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let b = a.try_log().unwrap();
 
-    if let Op::Unary(op, _) = b.uop.op() {
+    if let Op::Unary(op, _) = b.uop().op() {
         assert_eq!(format!("{:?}", op), "Log");
     } else {
         panic!("Expected Unary Log operation");
     }
 
-    assert_eq!(b.uop.dtype(), morok_dtype::DType::Float32);
+    assert_eq!(b.uop().dtype(), morok_dtype::DType::Float32);
 }
 
 #[test]

@@ -2,6 +2,10 @@
 
 use morok_dtype::DType;
 
+// Re-export new unified types from device crate
+pub use morok_device::device::{ProgramSpec, Variable};
+pub use morok_dtype::DeviceSpec;
+
 /// A rendered kernel ready for compilation and execution.
 #[derive(Debug, Clone)]
 pub struct RenderedKernel {

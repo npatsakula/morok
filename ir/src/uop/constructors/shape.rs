@@ -3,7 +3,7 @@
 //! These operations manipulate tensor shapes and layouts without changing
 //! the underlying data (except for padding which may add values).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::Result;
 use crate::op::Op;
@@ -16,7 +16,7 @@ impl UOp {
     ///
     /// Takes a UOp for the shape parameter (used internally by compiler passes).
     /// For the public API with validation, use `try_reshape`.
-    pub(crate) fn reshape(src: Rc<Self>, new_shape: Rc<Self>) -> Rc<Self> {
+    pub(crate) fn reshape(src: Arc<Self>, new_shape: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Reshape { src, new_shape }, dtype)
     }
@@ -24,7 +24,7 @@ impl UOp {
     /// Permute dimensions (low-level, UOp-based constructor).
     ///
     /// For the public API with validation, use `try_permute`.
-    pub(crate) fn permute(src: Rc<Self>, axes: Vec<usize>) -> Rc<Self> {
+    pub(crate) fn permute(src: Arc<Self>, axes: Vec<usize>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Permute { src, axes }, dtype)
     }
@@ -33,7 +33,7 @@ impl UOp {
     ///
     /// Takes a UOp for the shape parameter (used internally by compiler passes).
     /// For the public API with validation, use `try_expand`.
-    pub(crate) fn expand(src: Rc<Self>, new_shape: Rc<Self>) -> Rc<Self> {
+    pub(crate) fn expand(src: Arc<Self>, new_shape: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Expand { src, new_shape }, dtype)
     }
@@ -42,7 +42,7 @@ impl UOp {
     ///
     /// Takes UOps for padding parameters (used internally by compiler passes).
     /// For the public API with validation, use `try_pad`.
-    pub(crate) fn pad(src: Rc<Self>, begin_pads: Rc<Self>, end_pads: Rc<Self>) -> Rc<Self> {
+    pub(crate) fn pad(src: Arc<Self>, begin_pads: Arc<Self>, end_pads: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Pad { src, begin_pads, end_pads }, dtype)
     }
@@ -51,7 +51,7 @@ impl UOp {
     ///
     /// Takes UOps for range parameters (used internally by compiler passes).
     /// For the public API with validation, use `try_shrink`.
-    pub(crate) fn shrink(src: Rc<Self>, begins: Rc<Self>, ends: Rc<Self>) -> Rc<Self> {
+    pub(crate) fn shrink(src: Arc<Self>, begins: Arc<Self>, ends: Arc<Self>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Shrink { src, begins, ends }, dtype)
     }
@@ -59,7 +59,7 @@ impl UOp {
     /// Flip (reverse) axes (low-level, UOp-based constructor).
     ///
     /// For the public API with validation, use `try_flip`.
-    pub(crate) fn flip(src: Rc<Self>, axes: Vec<bool>) -> Rc<Self> {
+    pub(crate) fn flip(src: Arc<Self>, axes: Vec<bool>) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Flip { src, axes }, dtype)
     }
@@ -72,7 +72,7 @@ impl UOp {
     /// Validates:
     /// - No negative dimensions in new_shape
     /// - Product of input shape == product of output shape
-    pub fn try_reshape(self: &Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
+    pub fn try_reshape(self: &Arc<Self>, new_shape: &crate::shape::Shape) -> Result<Arc<Self>> {
         use crate::error::ReshapeNegativeDimensionSnafu;
         use crate::error::ReshapeSizeMismatchSnafu;
         use crate::shape::shape_to_uop;
@@ -108,7 +108,7 @@ impl UOp {
     /// Validates:
     /// - Number of dimensions matches
     /// - Each dimension either matches or src dimension is 1
-    pub fn try_expand(self: &Rc<Self>, new_shape: &crate::shape::Shape) -> Result<Rc<Self>> {
+    pub fn try_expand(self: &Arc<Self>, new_shape: &crate::shape::Shape) -> Result<Arc<Self>> {
         use crate::error::ExpandDimensionMismatchSnafu;
         use crate::error::ExpandInvalidDimensionSnafu;
         use crate::shape::shape_to_uop;
@@ -143,7 +143,7 @@ impl UOp {
     ///
     /// Validates:
     /// - Permutation is valid (contains each index 0..n exactly once)
-    pub fn try_permute(self: &Rc<Self>, axes: Vec<usize>) -> Result<Rc<Self>> {
+    pub fn try_permute(self: &Arc<Self>, axes: Vec<usize>) -> Result<Arc<Self>> {
         // Validate permutation if source shape is known
         if let Some(src_shape) = self.shape()? {
             Self::validate_permutation(&axes, src_shape.len())?;
@@ -158,7 +158,7 @@ impl UOp {
     /// Validates:
     /// - Padding values are concrete (not symbolic)
     /// - Number of padding pairs matches dimensions
-    pub fn try_pad(self: &Rc<Self>, padding: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
+    pub fn try_pad(self: &Arc<Self>, padding: &[(crate::SInt, crate::SInt)]) -> Result<Arc<Self>> {
         use crate::error::{PadDimensionMismatchSnafu, SymbolicPaddingUnsupportedSnafu};
         use crate::shape::ranges_to_uops;
         use snafu::ensure;
@@ -188,7 +188,7 @@ impl UOp {
     /// - Range values are concrete (not symbolic)
     /// - begin <= end for each dimension
     /// - 0 <= begin, end <= dimension_size
-    pub fn try_shrink(self: &Rc<Self>, ranges: &[(crate::SInt, crate::SInt)]) -> Result<Rc<Self>> {
+    pub fn try_shrink(self: &Arc<Self>, ranges: &[(crate::SInt, crate::SInt)]) -> Result<Arc<Self>> {
         use crate::error::{ShrinkBoundsViolationSnafu, SymbolicShrinkingUnsupportedSnafu};
         use crate::shape::ranges_to_uops;
         use snafu::ensure;
@@ -221,7 +221,7 @@ impl UOp {
     ///
     /// Validates:
     /// - Flip specification length matches shape dimensions
-    pub fn try_flip(self: &Rc<Self>, axes: Vec<bool>) -> Result<Rc<Self>> {
+    pub fn try_flip(self: &Arc<Self>, axes: Vec<bool>) -> Result<Arc<Self>> {
         if let Some(src_shape) = self.shape()? {
             Self::validate_flip_axes(&axes, src_shape.len())?;
         }
@@ -234,7 +234,7 @@ impl UOp {
     ///
     /// Creates a multi-device tensor where each device holds a shard.
     /// Use with MSTACK/MSELECT for distributed tensor operations.
-    pub fn multi(src: Rc<Self>, axis: usize) -> Rc<Self> {
+    pub fn multi(src: Arc<Self>, axis: usize) -> Arc<Self> {
         let dtype = src.dtype();
         Self::new(Op::Multi { src, axis }, dtype)
     }
