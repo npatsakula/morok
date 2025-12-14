@@ -73,8 +73,11 @@ enum OpData {
     Const(ConstValueHash),
     Unique(usize),
     Device(DeviceSpec),
-    DefineGlobal(usize),
-    DefineLocal(usize),
+    // DefineGlobal and DefineLocal include unique IDs to prevent hash consing
+    // across different kernels/realizations. Each kernel's DEFINE_GLOBAL(0)
+    // must be a distinct UOp, even though they have the same slot number.
+    DefineGlobal(usize, usize), // (slot, unique_id)
+    DefineLocal(usize, usize),  // (slot, unique_id)
 
     // Grouped operations
     Unary(UnaryOp),
@@ -90,7 +93,7 @@ enum OpData {
     SpecialName(String),
 
     // Buffer operations
-    BufferSize(usize),
+    BufferData(usize, usize), // (unique_id, size) - each buffer is unique
     BufferView(usize, usize),
     Bufferize(BufferizeOpts),
 
@@ -142,8 +145,9 @@ impl UOpKey {
             Op::Const(c) => OpData::Const(*c),
             Op::Unique(id) => OpData::Unique(*id),
             Op::Device(d) => OpData::Device(d.clone()),
-            Op::DefineGlobal(slot) => OpData::DefineGlobal(*slot),
-            Op::DefineLocal(slot) => OpData::DefineLocal(*slot),
+            // DEFINE_GLOBAL/LOCAL need unique IDs to prevent hash consing across kernels
+            Op::DefineGlobal(slot) => OpData::DefineGlobal(*slot, next_unique_id()),
+            Op::DefineLocal(slot) => OpData::DefineLocal(*slot, next_unique_id()),
 
             // Grouped operations
             Op::Unary(unary_op, _) => OpData::Unary(*unary_op),
@@ -158,8 +162,15 @@ impl UOpKey {
             Op::MSelect { device_index, .. } => OpData::MSelectIdx(*device_index),
             Op::Special { name, .. } => OpData::SpecialName(name.clone()),
 
-            // Buffer operations
-            Op::Buffer { size, .. } => OpData::BufferSize(*size),
+            // Buffer operations - include unique ID to prevent collision
+            Op::Buffer { unique, size, .. } => {
+                if let Op::Unique(id) = unique.op() {
+                    OpData::BufferData(*id, *size)
+                } else {
+                    // Fallback: use UOp's stable id
+                    OpData::BufferData(unique.id as usize, *size)
+                }
+            }
             Op::BufferView { size, offset, .. } => OpData::BufferView(*size, *offset),
             Op::Bufferize { opts, .. } => OpData::Bufferize(opts.clone()),
 

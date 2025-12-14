@@ -557,6 +557,9 @@ fn prepare_execution_plan(
     let mut output_buffer_idx: Option<usize> = None;
 
     // Pass 1: Look for exact match (dtype AND size)
+    // Select the HIGHEST BufferId (most recently allocated = output buffer)
+    // because input and output buffers may have the same dtype+size for cast operations.
+    let mut best_buf_id: Option<u64> = None;
     for item in &expanded_schedule {
         if matches!(item.ast.op(), Op::Copy { .. }) {
             continue;
@@ -565,15 +568,16 @@ fn prepare_execution_plan(
             if buf.dtype() == expected_output_dtype && buf.size() == expected_output_size {
                 let buf_id = buf.id().0;
                 if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
-                    // Prefer highest buffer ID (latest allocated)
-                    if output_buffer_idx.is_none() {
+                    // Select highest BufferId (latest allocated = output)
+                    if best_buf_id.map_or(true, |best| buf_id > best) {
                         if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
                             eprintln!(
-                                "DEBUG: Selected output buffer: buf_id={}, idx={}, dtype={:?}, size={}",
+                                "DEBUG: Candidate output buffer: buf_id={}, idx={}, dtype={:?}, size={}",
                                 buf_id, idx, expected_output_dtype, expected_output_size
                             );
                         }
                         output_buffer_idx = Some(idx);
+                        best_buf_id = Some(buf_id);
                     }
                 }
             }

@@ -838,3 +838,29 @@ fn test_debug_lazy_neg_argmax() {
     // Should be 2 (index of -1.0, which is the max of [-5, -3, -1, -4, -2])
     assert_eq!(argmax_arr.as_slice().unwrap()[0], 2);
 }
+#[test]
+fn test_indices_cast_bug() {
+    use crate::Tensor;
+    use morok_dtype::DType;
+
+    let _guard = crate::test::helpers::test_setup();
+    
+    // Create indices tensor [5, 4, 3, 2, 1]
+    let indices = Tensor::arange(5, Some(0), Some(-1)).unwrap();
+    
+    // Realize BEFORE cast
+    let before_cast = indices.clone().realize().unwrap().to_ndarray::<i32>().unwrap();
+    eprintln!("BEFORE CAST: {:?}", before_cast.as_slice().unwrap());
+    
+    // Cast to Int32 (should be no-op since arange returns Int32)
+    let indices_i32 = indices.cast(DType::Int32).unwrap();
+    
+    // Check UOp tree
+    eprintln!("CAST UOp tree:\n{}", indices_i32.uop().tree_full());
+    
+    // Realize AFTER cast
+    let after_cast = indices_i32.realize().unwrap().to_ndarray::<i32>().unwrap();
+    eprintln!("AFTER CAST: {:?}", after_cast.as_slice().unwrap());
+    
+    assert_eq!(after_cast.as_slice().unwrap(), &[5, 4, 3, 2, 1]);
+}

@@ -104,6 +104,17 @@ impl<'ctx> ValueMap<'ctx> {
         // Return in creation order, filtered to only include still-open loops
         self.loop_order.iter().filter(|id| self.loop_contexts.contains_key(id)).copied().collect()
     }
+
+    /// Get all currently cached UOp IDs (for snapshotting).
+    pub fn cached_ids(&self) -> std::collections::HashSet<u64> {
+        self.uop_to_value.keys().copied().collect()
+    }
+
+    /// Remove a cached value by ID.
+    pub fn remove(&mut self, uop_id: u64) {
+        self.uop_to_value.remove(&uop_id);
+        self.processed_no_value.remove(&uop_id);
+    }
 }
 
 impl<'ctx> Default for ValueMap<'ctx> {

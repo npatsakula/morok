@@ -57,11 +57,18 @@ where
 
     // Fast path: buffer already exists
     if let Some(buf) = map.get(&uop_id, &guard) {
+        if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
+            eprintln!("get_or_create_buffer({}) -> existing BufferId({:?})", uop_id, buf.id().0);
+        }
         return Ok(buf.clone());
     }
 
     // Slow path: create buffer (expensive operation)
     let buffer = create_fn()?;
+
+    if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
+        eprintln!("get_or_create_buffer({}) -> creating BufferId({:?})", uop_id, buffer.id().0);
+    }
 
     // Atomic insert - if another thread beat us, use their buffer
     // papaya's get_or_insert_with would be cleaner but create_fn is fallible
@@ -96,9 +103,9 @@ pub fn get_buffer(uop_id: u64) -> Option<Buffer> {
     let result = buffers().get(&uop_id, &guard).cloned();
     if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
         if let Some(ref buf) = result {
-            eprintln!("get_buffer({}) -> true, size={}", uop_id, buf.size());
+            eprintln!("get_buffer({}) -> BufferId({:?}), size={}", uop_id, buf.id().0, buf.size());
         } else {
-            eprintln!("get_buffer({}) -> false", uop_id);
+            eprintln!("get_buffer({}) -> None", uop_id);
         }
     }
     result

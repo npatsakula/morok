@@ -38,6 +38,14 @@ pub fn codegen_uop<'ctx>(
         return Ok(values.get(uop.id));
     }
 
+    // REDUCE ranges must ONLY be handled by codegen_reduce which creates their loop structure.
+    // Don't process or cache them here - codegen_reduce will insert them into values when ready.
+    // This prevents LLVM dominator errors where range counters are used before defined.
+    if let Op::Range { axis_type: AxisType::Reduce, .. } = uop.op() {
+        trace!(uop_id = uop.id, "codegen_uop: skipping REDUCE range - handled by codegen_reduce");
+        return Ok(None);
+    }
+
     let category = classify_op(uop.op());
     trace!(
         uop_id = uop.id,
@@ -789,6 +797,11 @@ fn codegen_reduce<'ctx>(
     // Track loops before source evaluation - source may create additional nested loops
     let loops_before: std::collections::HashSet<u64> = values.remaining_loop_ids().into_iter().collect();
 
+    // IMPORTANT: Snapshot cached IDs before source evaluation.
+    // Values generated inside REDUCE loops are block-local and must not be reused
+    // by subsequent REDUCEs (they're in different basic blocks that don't dominate each other).
+    let cached_before = values.cached_ids();
+
     if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
         eprintln!("[REDUCE] About to evaluate source, loops_before={:?}", loops_before);
     }
@@ -825,6 +838,13 @@ fn codegen_reduce<'ctx>(
     // Close all reduce loops we created (innermost first)
     for loop_ctx in loop_ctxs.into_iter().rev() {
         loop_gen::close_loop(builder, &loop_ctx)?;
+    }
+
+    // Clear values that were generated inside REDUCE loops.
+    // These are block-local and must not be reused by subsequent REDUCEs.
+    let cached_after = values.cached_ids();
+    for id in cached_after.difference(&cached_before) {
+        values.remove(*id);
     }
 
     // Load final result

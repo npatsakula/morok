@@ -228,6 +228,13 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Return void
         builder.build_return(None).context(BuildReturnSnafu)?;
 
+        // Debug: dump IR before verification
+        if std::env::var("MOROK_DUMP_IR").is_ok() {
+            eprintln!("=== LLVM IR before verification ===");
+            eprintln!("{}", module.to_string());
+            eprintln!("=== END LLVM IR ===");
+        }
+
         // Verify the module
         module.verify().map_err(|err| Error::ModuleVerification { message: err.to_string() })?;
 
