@@ -134,7 +134,7 @@ pub enum Error {
 
 /// Enhance an error with provenance information for a UOp.
 ///
-/// This function retrieves the provenance chain for a UOp and prints it to stderr,
+/// This function retrieves the provenance chain for a UOp and logs it,
 /// providing detailed debugging information about the operation's origin and
 /// transformation history.
 pub fn log_provenance(uop_id: u64, error: &Error) {
@@ -143,9 +143,12 @@ pub fn log_provenance(uop_id: u64, error: &Error) {
     PROVENANCE_TRACKER.with(|tracker| {
         let chain = tracker.borrow().get_chain(uop_id);
         if !chain.is_empty() {
-            eprintln!("\nError in UOp {} with provenance:", uop_id);
-            eprintln!("{}", error);
-            eprintln!("\nProvenance chain:{}", format_chain(&chain));
+            tracing::error!(
+                uop.id = uop_id,
+                error = %error,
+                provenance_chain = %format_chain(&chain),
+                "uop error with provenance"
+            );
         }
     });
 }

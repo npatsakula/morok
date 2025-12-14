@@ -31,6 +31,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tracing::debug;
+
 use morok_device::device::Device;
 use morok_device::registry::DeviceRegistry;
 use morok_device::{Allocator, Buffer, BufferId, CpuTimelineSignal, TimelineSignal};
@@ -890,9 +892,8 @@ impl UnifiedExecutor {
                 })?;
             }
 
-            // DEBUG: Dump buffer contents after kernel execution
-            if std::env::var("MOROK_DEBUG_KERNEL_BUFFERS").is_ok() {
-                eprintln!("[KERNEL {}] After execution, buffer contents:", kernel.id);
+            // Debug buffer contents after kernel execution
+            if tracing::enabled!(tracing::Level::DEBUG) {
                 for (i, (&ptr, &buf_id)) in kernel.buffer_ptrs.iter().zip(kernel.buffer_ids.iter()).enumerate() {
                     let buf = &buffers[kernel.buffer_indices[i]];
                     let elem_size = buf.dtype().bytes();
@@ -900,10 +901,24 @@ impl UnifiedExecutor {
                     let show_elems = 5.min(num_elems);
                     if buf.dtype().is_float() {
                         let slice = unsafe { std::slice::from_raw_parts(ptr as *const f32, show_elems) };
-                        eprintln!("  buf[{}] (BufferId={:?}, f32): {:?}", i, buf_id, slice);
+                        debug!(
+                            kernel.id = kernel.id,
+                            buffer.index = i,
+                            buffer.id = ?buf_id,
+                            buffer.dtype = "f32",
+                            buffer.values = ?slice,
+                            "Buffer contents after kernel"
+                        );
                     } else {
                         let slice = unsafe { std::slice::from_raw_parts(ptr as *const i32, show_elems) };
-                        eprintln!("  buf[{}] (BufferId={:?}, i32): {:?}", i, buf_id, slice);
+                        debug!(
+                            kernel.id = kernel.id,
+                            buffer.index = i,
+                            buffer.id = ?buf_id,
+                            buffer.dtype = "i32",
+                            buffer.values = ?slice,
+                            "Buffer contents after kernel"
+                        );
                     }
                 }
             }

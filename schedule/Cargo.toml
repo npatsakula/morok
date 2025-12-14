@@ -25,6 +25,8 @@ default = []
 z3 = ["dep:z3"]
 proptest = ["dep:proptest-derive", "morok-ir/proptest"]
 serde = ["morok-ir/serde"]
+# Enable trace-level spans in hot paths (compile-time control)
+tracing-verbose = []
 # Devices
 cuda = ["morok-device/cuda"]
 metal = ["morok-device/metal"]

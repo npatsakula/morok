@@ -170,7 +170,7 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
 #[instrument(skip(sink, ctx))]
 fn generate_realize_map(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> morok_ir::Result<()> {
     for node in sink.toposort() {
-        trace!(node_id = node.id, op = ?std::mem::discriminant(node.op()), "Processing node");
+        trace!(node_id = node.id, op = ?std::mem::discriminant(node.op()), "processing node");
         match node.op() {
             Op::Sink { sources } => {
                 for src in sources {
@@ -298,7 +298,7 @@ pub(crate) fn merge_consumer_ranges(
     }
 
     if !realize_axes.is_empty() {
-        warn!(realize_axes = ?realize_axes, "Range conflict detected - marking for realization");
+        warn!(realize_axes = ?realize_axes, "range conflict detected - marking for realization");
         ctx.mark_realize(uop, realize_axes);
     }
 
@@ -387,7 +387,7 @@ fn assign_ranges(
             merge_consumer_ranges(x, &consumer_rngs, ctx)?
         };
 
-        debug!(should_realize = ctx.should_realize(x), out_rngs_len = out_rngs.len(), "Output ranges computed");
+        debug!(should_realize = ctx.should_realize(x), out_rngs_len = out_rngs.len(), "output ranges computed");
 
         // Check ending_ranges FIRST (before in_rngs computation)
         // Tinygrad lines 224-234: ending_ranges realization happens BEFORE input ranges
@@ -496,44 +496,46 @@ fn assign_ranges(
             }
             Op::ReduceAxis { src, axes, .. } => {
                 if let Some(in_shape) = src.shape()? {
-                    // DEBUG: Print out_rngs details
-                    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
+                    // Trace ReduceAxis range assignment details
+                    if tracing::enabled!(tracing::Level::TRACE) {
                         let out_shape = x.shape()?;
-                        eprintln!(
-                            "[REDUCEAXIS DEBUG] id={} axes={:?} in_shape.len={} out_shape.len={:?} out_rngs.len={}",
-                            x.id,
-                            axes,
-                            in_shape.len(),
-                            out_shape.as_ref().map(|s| s.len()),
-                            out_rngs.len()
+                        trace!(
+                            uop.id = x.id,
+                            reduce.axes = ?axes,
+                            in_shape.len = in_shape.len(),
+                            out_shape.len = ?out_shape.as_ref().map(|s| s.len()),
+                            out_rngs.len = out_rngs.len(),
+                            "ReduceAxis range assignment"
                         );
                         for (idx, rng) in out_rngs.iter().enumerate() {
-                            // Print full op for detailed analysis
                             match rng.op() {
                                 Op::Binary(binop, a, b) => {
-                                    eprintln!(
-                                        "[REDUCEAXIS DEBUG] out_rngs[{}]: id={} Binary({:?}, a.id={} a.op={:?}, b.id={} b.op={:?})",
-                                        idx,
-                                        rng.id,
-                                        binop,
-                                        a.id,
-                                        std::mem::discriminant(a.op()),
-                                        b.id,
-                                        std::mem::discriminant(b.op())
+                                    trace!(
+                                        range.index = idx,
+                                        range.id = rng.id,
+                                        op = "Binary",
+                                        binary_op = ?binop,
+                                        left.id = a.id,
+                                        right.id = b.id,
+                                        "ReduceAxis out_rngs entry"
                                     );
                                 }
                                 Op::Range { axis_id, axis_type, .. } => {
-                                    eprintln!(
-                                        "[REDUCEAXIS DEBUG] out_rngs[{}]: id={} Range(axis_id={}, type={:?})",
-                                        idx, rng.id, axis_id, axis_type
+                                    trace!(
+                                        range.index = idx,
+                                        range.id = rng.id,
+                                        op = "Range",
+                                        axis.id = ?axis_id,
+                                        axis.type_ = ?axis_type,
+                                        "ReduceAxis out_rngs entry"
                                     );
                                 }
                                 _ => {
-                                    eprintln!(
-                                        "[REDUCEAXIS DEBUG] out_rngs[{}]: id={} op={:?}",
-                                        idx,
-                                        rng.id,
-                                        std::mem::discriminant(rng.op())
+                                    trace!(
+                                        range.index = idx,
+                                        range.id = rng.id,
+                                        op = ?std::mem::discriminant(rng.op()),
+                                        "ReduceAxis out_rngs entry"
                                     );
                                 }
                             }
@@ -546,9 +548,11 @@ fn assign_ranges(
                             rngs.push(ctx.new_range(s, AxisType::Reduce));
                         } else if i < out_rngs.len() {
                             rngs.push(Arc::clone(&out_rngs[i]));
-                            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                                eprintln!("[REDUCEAXIS DEBUG] i={} using out_rngs[{}] id={}", i, i, out_rngs[i].id);
-                            }
+                            trace!(
+                                dim.index = i,
+                                range.id = out_rngs[i].id,
+                                "ReduceAxis using existing out_rngs"
+                            );
                         } else {
                             rngs.push(ctx.new_range(s, AxisType::Loop));
                         }
@@ -561,7 +565,7 @@ fn assign_ranges(
             _ => out_rngs.clone(),
         };
 
-        debug!(in_rngs_len = in_rngs.len(), "Input ranges computed");
+        debug!(in_rngs_len = in_rngs.len(), "input ranges computed");
 
         // EXPAND marks ranges as ending when broadcasting to static dimensions (Tinygrad lines 249-252)
         // "if the EXPAND is used to inject a range, we don't mark it as ending_ranges. otherwise we do."
@@ -590,11 +594,10 @@ fn assign_ranges(
                         // propagate as ending ranges to other operations.
                         let ranges = collect_ranges_from_uop(out);
                         for r in ranges {
-                            if let Op::Range { axis_type, .. } = r.op() {
-                                if *axis_type != AxisType::Reduce {
+                            if let Op::Range { axis_type, .. } = r.op()
+                                && *axis_type != AxisType::Reduce {
                                     changed_ranges.push(r);
                                 }
-                            }
                         }
                     }
                 }
@@ -732,36 +735,36 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             let mut acc = UOp::index_const(1);
             let mut axes_in = Vec::new();
 
-            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                eprintln!("[RESHAPE FLATTEN] new_shape_vals={:?}, rngs.len={}", new_shape_vals, rngs.len());
-            }
+            trace!(
+                new_shape = ?new_shape_vals,
+                rngs.len = rngs.len(),
+                "Reshape flatten start"
+            );
 
             for (shape_dim, rng) in new_shape_vals.iter().zip(rngs.iter()).rev() {
-                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                    eprintln!(
-                        "[RESHAPE FLATTEN] shape_dim={:?}, rng.id={}, rng.op={:?}",
-                        shape_dim,
-                        rng.id,
-                        std::mem::discriminant(rng.op())
-                    );
-                    eprintln!("[RESHAPE FLATTEN] acc before mul: {:?}", acc.op());
-                }
+                trace!(
+                    shape_dim = ?shape_dim,
+                    rng.id = rng.id,
+                    rng.op = ?std::mem::discriminant(rng.op()),
+                    acc.op = ?std::mem::discriminant(acc.op()),
+                    "Reshape flatten iteration"
+                );
                 let weighted = acc.try_mul(rng).unwrap();
-                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                    eprintln!(
-                        "[RESHAPE FLATTEN] weighted.id={}, weighted.op={:?}",
-                        weighted.id,
-                        std::mem::discriminant(weighted.op())
-                    );
-                }
+                trace!(
+                    weighted.id = weighted.id,
+                    weighted.op = ?std::mem::discriminant(weighted.op()),
+                    "Reshape flatten weighted"
+                );
                 axes_in.push(weighted);
                 acc = match shape_dim {
                     SInt::Const(n) => {
                         let n_uop = UOp::index_const(*n as i64);
                         let new_acc = acc.try_mul(&n_uop).unwrap();
-                        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                            eprintln!("[RESHAPE FLATTEN] acc after mul by {}: {:?}", n, new_acc.op());
-                        }
+                        trace!(
+                            multiplier = n,
+                            new_acc.op = ?std::mem::discriminant(new_acc.op()),
+                            "Reshape flatten acc update"
+                        );
                         new_acc
                     }
                     SInt::Symbolic(uop) => acc.try_mul(uop).unwrap(),
@@ -770,9 +773,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             let combined_axes =
                 axes_in.into_iter().reduce(|a, b| a.try_add(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
 
-            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                eprintln!("[RESHAPE FLATTEN] combined_axes.id={}", combined_axes.id);
-            }
+            trace!(combined_axes.id = combined_axes.id, "reshape flatten combined");
 
             // Unflatten into input shape dimensions
             // Apply range-based simplification:
@@ -784,24 +785,22 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
 
             fn simplify_mod(x: &Arc<UOp>, n: i64) -> Arc<UOp> {
                 let (vmin, vmax) = VminVmaxProperty::get(x);
-                if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax) {
-                    if *min >= 0 && *max < n {
+                if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
+                    && *min >= 0 && *max < n {
                         // x is always in range [0, n), so x % n = x
                         return Arc::clone(x);
                     }
-                }
                 let n_uop = UOp::index_const(n);
                 x.try_mod(&n_uop).unwrap()
             }
 
             fn simplify_div(x: &Arc<UOp>, n: i64) -> Arc<UOp> {
                 let (vmin, vmax) = VminVmaxProperty::get(x);
-                if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax) {
-                    if *min >= 0 && *max < n && n > 0 {
+                if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
+                    && *min >= 0 && *max < n && n > 0 {
                         // x is always in range [0, n), so x / n = 0
                         return UOp::index_const(0);
                     }
-                }
                 let n_uop = UOp::index_const(n);
                 x.try_div(&n_uop).unwrap()
             }

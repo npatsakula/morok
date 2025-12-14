@@ -1,6 +1,7 @@
 use bon::bon;
 use snafu::ResultExt;
 use std::sync::Arc;
+use tracing::trace;
 
 use morok_device::{Buffer, registry};
 use morok_dtype::ext::HasDType;
@@ -208,9 +209,7 @@ impl Tensor {
     pub fn buffer(&self) -> Option<Buffer> {
         let uop = self.uop();
         let base_id = uop.base().id;
-        if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
-            eprintln!("buffer(): uop.id={} base().id={}", uop.id, base_id);
-        }
+        trace!(uop.id = uop.id, base.id = base_id, "buffer lookup");
         buffer_registry::get_buffer(base_id)
     }
 

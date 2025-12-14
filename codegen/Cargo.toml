@@ -17,6 +17,11 @@ cranelift-frontend = "0.126"
 cranelift-native = "0.126"
 tracing = "0.1.43"
 
+[features]
+default = []
+# Enable trace-level spans in hot paths (compile-time control)
+tracing-verbose = []
+
 [dev-dependencies]
 smallvec = "1.15.1"
 test-case = "3.3.1"

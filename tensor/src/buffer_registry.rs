@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 
 use morok_device::Buffer;
 use papaya::HashMap;
+use tracing::trace;
 
 use crate::Result;
 
@@ -57,18 +58,14 @@ where
 
     // Fast path: buffer already exists
     if let Some(buf) = map.get(&uop_id, &guard) {
-        if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
-            eprintln!("get_or_create_buffer({}) -> existing BufferId({:?})", uop_id, buf.id().0);
-        }
+        trace!(uop_id, buffer.id = buf.id().0, "get_or_create_buffer: existing");
         return Ok(buf.clone());
     }
 
     // Slow path: create buffer (expensive operation)
     let buffer = create_fn()?;
 
-    if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
-        eprintln!("get_or_create_buffer({}) -> creating BufferId({:?})", uop_id, buffer.id().0);
-    }
+    trace!(uop_id, buffer.id = buffer.id().0, "get_or_create_buffer: creating");
 
     // Atomic insert - if another thread beat us, use their buffer
     // papaya's get_or_insert_with would be cleaner but create_fn is fallible
@@ -101,12 +98,10 @@ where
 pub fn get_buffer(uop_id: u64) -> Option<Buffer> {
     let guard = buffers().guard();
     let result = buffers().get(&uop_id, &guard).cloned();
-    if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
-        if let Some(ref buf) = result {
-            eprintln!("get_buffer({}) -> BufferId({:?}), size={}", uop_id, buf.id().0, buf.size());
-        } else {
-            eprintln!("get_buffer({}) -> None", uop_id);
-        }
+    if let Some(ref buf) = result {
+        trace!(uop_id, buffer.id = buf.id().0, buffer.size = buf.size(), "get_buffer: found");
+    } else {
+        trace!(uop_id, "get_buffer: not found");
     }
     result
 }

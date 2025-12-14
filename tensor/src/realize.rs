@@ -32,6 +32,8 @@
 
 use std::collections::HashMap;
 
+use tracing::{debug, trace};
+
 use crate::{
     Result, Tensor,
     error::{
@@ -87,12 +89,11 @@ impl Tensor {
         // Get output buffer and its properties
         let output_buf = plan.output_buffer().clone();
 
-        // DEBUG: Verify output buffer contains correct data
-        if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
-            let mut debug_data = vec![0u8; output_buf.size()];
-            output_buf.copyout(&mut debug_data).expect("copyout failed");
-            eprintln!("realize: output_buf.id()={:?} raw_bytes={:?}", output_buf.id(), &debug_data);
-        }
+        trace!(
+            buffer.id = ?output_buf.id(),
+            buffer.size = output_buf.size(),
+            "Realized output buffer"
+        );
 
         let uop = self.uop();
         let output_dtype = uop.dtype();
@@ -118,16 +119,14 @@ impl Tensor {
         let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
         let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
 
-        if std::env::var("MOROK_DEBUG_REALIZE").is_ok() {
-            eprintln!(
-                "realize: buffer_uop.id={} num_elements={} shape={:?} realized_uop.id={} realized_uop.base().id={}",
-                buffer_uop.id,
-                num_elements,
-                shape,
-                realized_uop.id,
-                realized_uop.base().id
-            );
-        }
+        debug!(
+            buffer_uop.id = buffer_uop.id,
+            num_elements,
+            shape = ?shape,
+            realized_uop.id = realized_uop.id,
+            realized_uop.base_id = realized_uop.base().id,
+            "Tensor realized"
+        );
 
         // Update this tensor's UOp to point to the realized buffer
         self.set_uop(realized_uop);
@@ -205,18 +204,12 @@ impl Tensor {
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let rangeified = rangeify_result.sink;
 
-        // DEBUG: Print post-rangeify IR
-        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-            eprintln!("=== POST-RANGEIFY AST ===\n{}", rangeified.tree_full());
-        }
+        trace!(ast = %rangeified.tree_full(), "post-rangeify ast");
 
         // Step 4: Run kernel splitting pipeline
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeified);
 
-        // DEBUG: Print post-kernel-split IR
-        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-            eprintln!("=== POST-KERNEL-SPLIT AST ===\n{}", kernelized.tree_full());
-        }
+        trace!(ast = %kernelized.tree_full(), "post-kernel-split ast");
 
         // Step 5: Create schedule from kernels
         let schedule = crate::schedule::create_schedule(kernelized, kernel_ctx)?;
@@ -394,12 +387,7 @@ fn prepare_execution_plan(
     // Expand the schedule to handle OUTER range iterations
     let expanded_schedule = expand_schedule(schedule.clone());
 
-    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-        eprintln!("prepare_execution_plan: expanded_schedule order:");
-        for (i, item) in expanded_schedule.iter().enumerate() {
-            eprintln!("  [{}] kernel={}, ast={}", i, item.kernel.id, item.ast.id);
-        }
-    }
+    debug!(num_items = expanded_schedule.len(), "expanded schedule");
 
     // Build execution graph for parallel group analysis
     let mut execution_graph = build_execution_graph(&expanded_schedule);
@@ -498,20 +486,7 @@ fn prepare_execution_plan(
         let buffer_indices: Vec<usize> =
             item.buffers.iter().filter_map(|buf| buffer_id_to_idx.get(&buf.id().0).copied()).collect();
 
-        // DEBUG: Print buffer mapping for this kernel
-        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-            eprintln!("DEBUG: Kernel AST id={} has {} buffers:", item.ast.id, item.buffers.len());
-            for (i, buf) in item.buffers.iter().enumerate() {
-                eprintln!(
-                    "  buf[{}]: Buffer.id={:?}, dtype={:?}, size={}, plan_idx={:?}",
-                    i,
-                    buf.id(),
-                    buf.dtype(),
-                    buf.size(),
-                    buffer_id_to_idx.get(&buf.id().0)
-                );
-            }
-        }
+        trace!(kernel.ast_id = item.ast.id, num_buffers = item.buffers.len(), "kernel buffer mapping");
 
         // Create PreparedKernel
         // Note: buffer_ptrs and buffer_ids will be computed in ExecutionPlanBuilder::build()
@@ -569,13 +544,14 @@ fn prepare_execution_plan(
                 let buf_id = buf.id().0;
                 if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
                     // Select highest BufferId (latest allocated = output)
-                    if best_buf_id.map_or(true, |best| buf_id > best) {
-                        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                            eprintln!(
-                                "DEBUG: Candidate output buffer: buf_id={}, idx={}, dtype={:?}, size={}",
-                                buf_id, idx, expected_output_dtype, expected_output_size
-                            );
-                        }
+                    if best_buf_id.is_none_or(|best| buf_id > best) {
+                        trace!(
+                            buffer.id = buf_id,
+                            buffer.idx = idx,
+                            buffer.dtype = ?expected_output_dtype,
+                            buffer.size = expected_output_size,
+                            "Candidate output buffer (exact match)"
+                        );
                         output_buffer_idx = Some(idx);
                         best_buf_id = Some(buf_id);
                     }
@@ -594,14 +570,12 @@ fn prepare_execution_plan(
                 if buf.dtype() == expected_output_dtype {
                     let buf_id = buf.id().0;
                     if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
-                        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                            eprintln!(
-                                "DEBUG: Fallback1 output buffer (dtype match): buf_id={}, idx={}, dtype={:?}",
-                                buf_id,
-                                idx,
-                                buf.dtype()
-                            );
-                        }
+                        trace!(
+                            buffer.id = buf_id,
+                            buffer.idx = idx,
+                            buffer.dtype = ?buf.dtype(),
+                            "Fallback output buffer (dtype match)"
+                        );
                         output_buffer_idx = Some(idx);
                         break;
                     }
@@ -620,14 +594,12 @@ fn prepare_execution_plan(
     {
         let first_buf_id = first_item.buffers[0].id().0;
         if let Some(&idx) = buffer_id_to_idx.get(&first_buf_id) {
-            if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                eprintln!(
-                    "DEBUG: Fallback2 output buffer (first buffer): buf_id={}, idx={}, dtype={:?}",
-                    first_buf_id,
-                    idx,
-                    first_item.buffers[0].dtype()
-                );
-            }
+            trace!(
+                buffer.id = first_buf_id,
+                buffer.idx = idx,
+                buffer.dtype = ?first_item.buffers[0].dtype(),
+                "Fallback output buffer (first buffer)"
+            );
             output_buffer_idx = Some(idx);
         }
     }
@@ -758,14 +730,14 @@ mod tests {
         // Sum all elements (should be 10.0)
         let sum_result = a.sum(());
         if let Err(ref e) = sum_result {
-            eprintln!("Sum failed: {:?}", e);
+            tracing::debug!(error = ?e, "sum failed");
         }
         assert!(sum_result.is_ok(), "Sum creation failed");
 
         // Realize the computation
         let realized = sum_result.unwrap().realize();
         if let Err(ref e) = realized {
-            eprintln!("Realize failed: {:?}", e);
+            tracing::debug!(error = ?e, "realize failed");
         }
         assert!(realized.is_ok(), "Realize should succeed");
     }

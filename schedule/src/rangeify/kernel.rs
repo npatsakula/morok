@@ -563,17 +563,17 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
     // Apply transformation pipeline
     let transformed = {
         // Debug: show BUFFER nodes in computation before transformation
-        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
+        if tracing::enabled!(tracing::Level::DEBUG) {
             let buffer_nodes: Vec<_> = computation
                 .toposort()
                 .into_iter()
                 .filter(|n| matches!(n.op(), Op::Buffer { .. }))
                 .map(|n| n.id)
                 .collect();
-            tracing::debug!(
-                computation_id = computation.id,
+            debug!(
+                computation.id = computation.id,
                 buffer_nodes = ?buffer_nodes,
-                "split_store: BUFFER nodes in computation BEFORE to_define_global"
+                "BUFFER nodes before to_define_global"
             );
         }
         let matcher = to_define_global_patterns();
@@ -647,17 +647,14 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
             // If so, use the AFTER as the kernel source (tracks inter-kernel deps).
             // Otherwise, use the bare DefineGlobal/DefineLocal.
             let source = ctx.get_buffer(&buf).cloned().unwrap_or_else(|| buf.clone());
-            if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                let has_after = ctx.has_buffer(&buf);
-                tracing::debug!(
-                    "split_store: buffer_sources collect buf_id={} buf_op={:?} has_after={} source_id={} source_op={:?}",
-                    buf.id,
-                    std::mem::discriminant(buf.op()),
-                    has_after,
-                    source.id,
-                    std::mem::discriminant(source.op())
-                );
-            }
+            trace!(
+                buffer.id = buf.id,
+                buffer.op = ?std::mem::discriminant(buf.op()),
+                has_after = ctx.has_buffer(&buf),
+                source.id = source.id,
+                source.op = ?std::mem::discriminant(source.op()),
+                "Collecting buffer source"
+            );
             buffer_sources.push(source);
         }
     }
@@ -746,17 +743,16 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
 fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
     use morok_ir::UOpKey;
 
-    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-        // Count all nodes
+    if tracing::enabled!(tracing::Level::DEBUG) {
         let toposort_nodes: Vec<_> = root.toposort();
         let after_count = toposort_nodes.iter().filter(|n| matches!(n.op(), Op::After { .. })).count();
         let kernel_count = toposort_nodes.iter().filter(|n| matches!(n.op(), Op::Kernel { .. })).count();
-        tracing::debug!(
-            "fix_assign: starting, root_id={} total_nodes={} after_count={} kernel_count={}",
-            root.id,
-            toposort_nodes.len(),
+        debug!(
+            root.id = root.id,
+            total_nodes = toposort_nodes.len(),
             after_count,
-            kernel_count
+            kernel_count,
+            "fix_assign starting"
         );
     }
 
@@ -765,17 +761,13 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
 
     for node in root.toposort() {
         if let Op::After { passthrough, deps } = node.op() {
-            if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                let dep_ops: Vec<_> =
-                    deps.iter().map(|d| format!("{}:{:?}", d.id, std::mem::discriminant(d.op()))).collect();
-                tracing::debug!(
-                    "fix_assign: found AFTER node after_id={} passthrough_id={} passthrough_op={:?} deps={:?}",
-                    node.id,
-                    passthrough.id,
-                    std::mem::discriminant(passthrough.op()),
-                    dep_ops
-                );
-            }
+            trace!(
+                after.id = node.id,
+                passthrough.id = passthrough.id,
+                passthrough.op = ?std::mem::discriminant(passthrough.op()),
+                num_deps = deps.len(),
+                "Found AFTER node"
+            );
             let buf_id = match passthrough.op() {
                 Op::DefineGlobal(_) => passthrough.id,
                 _ => continue,
@@ -788,18 +780,14 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
                 _ => false,
             });
             if has_kernel {
-                if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                    tracing::debug!("fix_assign: recording producer buf_id={} after_id={}", buf_id, node.id);
-                }
+                trace!(buffer.id = buf_id, after.id = node.id, "recording producer");
                 kernel_assign.insert(buf_id, node.clone());
             }
         }
     }
 
     if kernel_assign.is_empty() {
-        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-            tracing::debug!("fix_assign: no kernel producers found");
-        }
+        trace!("no kernel producers found");
         return root.clone();
     }
 
@@ -828,14 +816,12 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
 
             // Check each source of the kernel for buffer dependencies
             if let Op::Kernel { sources, .. } = kernel.op() {
-                if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                    tracing::debug!(
-                        "fix_assign: checking kernel after_id={} this_buf_id={} num_sources={}",
-                        node.id,
-                        this_buf_id,
-                        sources.len()
-                    );
-                }
+                trace!(
+                    after.id = node.id,
+                    buffer.id = this_buf_id,
+                    num_sources = sources.len(),
+                    "Checking kernel sources"
+                );
                 for src in sources {
                     // Get buffer ID from source (could be DefineGlobal or AFTER wrapping one)
                     let src_buf_id = match src.op() {
@@ -844,14 +830,12 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
                         _ => continue,
                     };
 
-                    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                        tracing::debug!(
-                            "fix_assign: source src_id={} src_buf_id={} has_producer={}",
-                            src.id,
-                            src_buf_id,
-                            kernel_assign.contains_key(&src_buf_id)
-                        );
-                    }
+                    trace!(
+                        source.id = src.id,
+                        source.buffer_id = src_buf_id,
+                        has_producer = kernel_assign.contains_key(&src_buf_id),
+                        "Checking source buffer"
+                    );
 
                     // Skip if same buffer as this AFTER produces
                     if src_buf_id == this_buf_id {
@@ -868,14 +852,12 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
                         // Add the producer AFTER as a dependency if not already present
                         let mut new_deps = deps.clone();
                         if !new_deps.iter().any(|d| Arc::ptr_eq(d, producer_after)) {
-                            if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                                tracing::debug!(
-                                    "fix_assign: adding dependency consumer_after_id={} producer_after_id={} producer_buf_id={}",
-                                    node.id,
-                                    producer_after.id,
-                                    src_buf_id
-                                );
-                            }
+                            debug!(
+                                consumer.after_id = node.id,
+                                producer.after_id = producer_after.id,
+                                producer.buffer_id = src_buf_id,
+                                "Adding inter-kernel dependency"
+                            );
                             new_deps.push(producer_after.clone());
                             let new_after = UOp::after(passthrough.clone(), new_deps);
                             assign_rep.insert(UOpKey(node.clone()), new_after.clone());
@@ -888,9 +870,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
         }
     }
 
-    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-        tracing::debug!("fix_assign: made {} replacements", assign_rep.len());
-    }
+    debug!(num_replacements = assign_rep.len(), "fix_assign completed");
 
     if assign_rep.is_empty() { root.clone() } else { root.substitute(&assign_rep) }
 }
@@ -909,10 +889,8 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
     // Phase 1: Convert BUFFERIZE to STORE with memoization for DAG handling
     let after_bufferize = transform_bottom_up_memo(&root, &mut ctx, bufferize_to_store, &mut memo);
 
-    // DEBUG: Print after bufferize_to_store
-    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-        eprintln!("=== AFTER BUFFERIZE_TO_STORE ===\n{}", after_bufferize.tree_full());
-    }
+    // Trace after bufferize_to_store
+    trace!(tree = %after_bufferize.tree_full(), "after bufferize_to_store");
 
     // Phase 2: Split STORE to KERNEL with fresh memoization
     memo.clear();
@@ -982,12 +960,10 @@ fn ensure_producer_afters_in_sink(root: &Arc<UOp>, producer_afters: &[Arc<UOp>])
         return root.clone();
     }
 
-    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-        tracing::debug!("ensure_producer_afters_in_sink: adding {} missing producer AFTERs", missing_afters.len());
-        for after in &missing_afters {
-            if let Op::After { passthrough, .. } = after.op() {
-                tracing::debug!("  missing AFTER: id={} passthrough_id={}", after.id, passthrough.id);
-            }
+    debug!(num_missing = missing_afters.len(), "adding missing producer afters to sink");
+    for after in &missing_afters {
+        if let Op::After { passthrough, .. } = after.op() {
+            trace!(after.id = after.id, passthrough.id = passthrough.id, "missing after");
         }
     }
 
@@ -1021,13 +997,11 @@ fn resolve_kernel_dependencies(root: &Arc<UOp>, ctx: &mut KernelContext) {
                     _ => None,
                 };
                 if let Some(k) = kernel {
-                    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                        tracing::debug!(
-                            "resolve_kernel_dependencies: buffer {} produced by kernel {}",
-                            passthrough.id,
-                            k.id
-                        );
-                    }
+                    trace!(
+                        buffer.id = passthrough.id,
+                        kernel.id = k.id,
+                        "Buffer produced by kernel"
+                    );
                     buffer_producers.insert(passthrough.id, k);
                     break;
                 }
@@ -1054,14 +1028,12 @@ fn resolve_kernel_dependencies(root: &Arc<UOp>, ctx: &mut KernelContext) {
                     && let Some(producer) = buffer_producers.get(&buf_id)
                     && !Arc::ptr_eq(producer, &node)
                 {
-                    if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                        tracing::debug!(
-                            "resolve_kernel_dependencies: kernel {} depends on kernel {} (buffer {})",
-                            node.id,
-                            producer.id,
-                            buf_id
-                        );
-                    }
+                    trace!(
+                        consumer.kernel_id = node.id,
+                        producer.kernel_id = producer.id,
+                        buffer.id = buf_id,
+                        "Kernel dependency found"
+                    );
                     ctx.add_dependency(buf_id, producer.clone(), node.clone());
                 }
             }
@@ -1209,16 +1181,14 @@ fn renumber_define_globals(ast: Arc<UOp>, buffer_sources: &[Arc<UOp>]) -> (Arc<U
                     Op::After { deps, .. } => UOp::after(new_inner.clone(), deps.clone()),
                     _ => new_inner.clone(),
                 };
-                if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-                    tracing::debug!(
-                        "renumber_define_globals: src_id={} inner_id={} new_inner_id={} result_id={} is_after={}",
-                        src.id,
-                        inner.id,
-                        new_inner.id,
-                        result.id,
-                        matches!(src.op(), Op::After { .. })
-                    );
-                }
+                trace!(
+                    source.id = src.id,
+                    inner.id = inner.id,
+                    new_inner.id = new_inner.id,
+                    result.id = result.id,
+                    is_after = matches!(src.op(), Op::After { .. }),
+                    "Renumbering DefineGlobal"
+                );
                 result
             } else {
                 src.clone()

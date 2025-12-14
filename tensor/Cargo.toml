@@ -20,6 +20,11 @@ papaya = "0.2.3"
 parking_lot = "0.12"
 tracing = "0.1.43"
 
+[features]
+default = []
+# Enable trace-level spans in hot paths (compile-time control)
+tracing-verbose = []
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tracing-test = { version = "0.2.5", features = ["no-env-filter"] }

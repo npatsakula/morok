@@ -165,7 +165,7 @@ mod tests {
         assert!(result.is_err(), "x + 1 should not equal x");
 
         if let Err(CounterExample::Found { message, model }) = result {
-            println!("Counterexample: {}\nModel: {}", message, model);
+            tracing::debug!(message = %message, model = %model, "z3 counterexample found");
         }
     }
 

@@ -25,6 +25,7 @@ use crate::symbolic::dce::is_empty_range;
 
 use smallvec::SmallVec;
 use std::sync::Arc;
+use tracing::trace;
 
 /// Constant folding patterns.
 ///
@@ -183,19 +184,24 @@ pub fn range_based_mod_div_patterns() -> PatternMatcher {
         // This handles cases like Range(3) % 3 → Range(3)
         Mod(x, n @const(n_val)) => {
             let (vmin, vmax) = VminVmaxProperty::get(x);
-            // DEBUG
-            if std::env::var("MOROK_DEBUG_MOD").is_ok() {
-                eprintln!("[MOD SIMPLIFY] x.id={} vmin={:?} vmax={:?} n_val={:?}", x.id, vmin, vmax, n_val);
-            }
+            trace!(
+                x.id = x.id,
+                vmin = ?vmin,
+                vmax = ?vmax,
+                n_val = ?n_val,
+                "Mod simplification check"
+            );
             // Check if x is always non-negative and less than n
-            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val) {
-                if *min >= 0 && *max < n_int {
-                    if std::env::var("MOROK_DEBUG_MOD").is_ok() {
-                        eprintln!("[MOD SIMPLIFY] Simplifying x % {} → x (vmin={}, vmax={})", n_int, min, max);
-                    }
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
+                && *min >= 0 && *max < n_int {
+                    trace!(
+                        n_int,
+                        min = *min,
+                        max = *max,
+                        "Simplifying x % n → x"
+                    );
                     return Some(Arc::clone(x));
                 }
-            }
             None
         },
 
@@ -204,11 +210,10 @@ pub fn range_based_mod_div_patterns() -> PatternMatcher {
         Idiv(x, n @const(n_val)) => {
             let (vmin, vmax) = VminVmaxProperty::get(x);
             // Check if x is always non-negative and less than n
-            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val) {
-                if *min >= 0 && *max < n_int && n_int > 0 {
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
+                && *min >= 0 && *max < n_int && n_int > 0 {
                     return Some(UOp::const_(x.dtype(), ConstValue::Int(0)));
                 }
-            }
             None
         },
     }

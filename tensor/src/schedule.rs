@@ -20,6 +20,7 @@ use morok_device::registry;
 use morok_dtype::{DType, DeviceSpec};
 use morok_ir::{ConstValueHash, Op, UOp};
 use morok_schedule::rangeify::{KernelContext, KernelDependency};
+use tracing::{debug, trace};
 
 use crate::error::*;
 use crate::{Error, Result};
@@ -88,17 +89,7 @@ pub type Schedule = Vec<ScheduleItem>;
 /// critical for buffer sharing: the producer allocates the buffer first,
 /// then the consumer finds it in the registry via `get_or_create_buffer`.
 fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], kernel_deps: &[KernelDependency]) -> Vec<Arc<UOp>> {
-    let debug = std::env::var("MOROK_DEBUG_RANGEIFY").is_ok();
-
-    if debug {
-        eprintln!("sort_kernels_by_dependencies: {} kernels, {} deps", kernels.len(), kernel_deps.len());
-        for k in kernels {
-            eprintln!("  kernel id={}", k.id);
-        }
-        for dep in kernel_deps {
-            eprintln!("  dep: producer={} -> consumer={} (buffer={})", dep.producer.id, dep.consumer.id, dep.buffer_id);
-        }
-    }
+    debug!(num_kernels = kernels.len(), num_deps = kernel_deps.len(), "sorting kernels by dependencies");
 
     // Build kernel ID set
     let kernel_ids: HashSet<u64> = kernels.iter().map(|k| k.id).collect();
@@ -151,12 +142,7 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], kernel_deps: &[KernelDepen
         }
     }
 
-    if debug {
-        eprintln!("sort_kernels_by_dependencies: sorted order:");
-        for (i, k) in sorted.iter().enumerate() {
-            eprintln!("  [{}] kernel id={}", i, k.id);
-        }
-    }
+    debug!(num_sorted = sorted.len(), "kernels sorted");
 
     sorted
 }
@@ -182,8 +168,6 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], kernel_deps: &[KernelDepen
 /// - No kernels found after scheduling pipeline
 /// - Buffer not found in registry for a kernel source
 pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Result<Schedule> {
-    let debug = std::env::var("MOROK_DEBUG_RANGEIFY").is_ok();
-
     // Step 1: Find all KERNEL operations
     let mut kernels = Vec::new();
     for node in transformed.toposort() {
@@ -230,21 +214,11 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
     let reverse_id_mapping: HashMap<u64, u64> =
         kernel_ctx.buffer_id_mapping.iter().map(|(&old_id, &new_id)| (new_id, old_id)).collect();
 
-    if debug {
-        eprintln!("define_to_buffer has {} entries:", define_to_buffer.len());
-        for (define_id, buffer) in &define_to_buffer {
-            eprintln!(
-                "  define_id={} -> buffer.id={} buffer_op={:?}",
-                define_id,
-                buffer.id,
-                std::mem::discriminant(buffer.op())
-            );
-        }
-        eprintln!("reverse_id_mapping has {} entries:", reverse_id_mapping.len());
-        for (new_id, old_id) in &reverse_id_mapping {
-            eprintln!("  new_id={} -> old_id={}", new_id, old_id);
-        }
-    }
+    trace!(
+        define_to_buffer_entries = define_to_buffer.len(),
+        reverse_id_mapping_entries = reverse_id_mapping.len(),
+        "Buffer mappings"
+    );
 
     // Step 2: For each kernel, collect buffers from sources
     let mut schedule = Vec::new();
@@ -295,29 +269,11 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
             .map(|dep| dep.producer.id)
             .collect();
 
-        if std::env::var("MOROK_DEBUG_RANGEIFY").is_ok() {
-            eprintln!("create_schedule: kernel {} has dependencies {:?}", kernel_uop.id, dependencies);
-            // Debug: show REDUCE ops in this kernel
-            let reduce_ops: Vec<_> = inner_ast
-                .toposort()
-                .into_iter()
-                .filter(|n| matches!(n.op(), Op::Reduce { .. }))
-                .map(|n| {
-                    if let Op::Reduce { reduce_op, .. } = n.op() {
-                        format!("REDUCE id={} op={:?}", n.id, reduce_op)
-                    } else {
-                        format!("REDUCE id={}", n.id)
-                    }
-                })
-                .collect();
-            if !reduce_ops.is_empty() {
-                tracing::debug!(
-                    kernel_id = kernel_uop.id,
-                    reduce_ops = ?reduce_ops,
-                    "create_schedule: REDUCE ops in kernel"
-                );
-            }
-        }
+        debug!(
+            kernel.id = kernel_uop.id,
+            dependencies = ?dependencies,
+            "Kernel dependencies"
+        );
 
         // Use inner_ast (the kernel's internal AST) for codegen, kernel_uop for buffer allocation
         schedule.push(ScheduleItem {
@@ -406,8 +362,6 @@ fn collect_kernel_buffers(
     reverse_id_mapping: &HashMap<u64, u64>,
     define_to_buffer_id: &HashMap<u64, u64>,
 ) -> Result<Vec<Buffer>> {
-    let debug = std::env::var("MOROK_DEBUG_RANGEIFY").is_ok();
-
     // Get AST for buffer size computation
     let ast = match kernel.op() {
         Op::Kernel { ast, .. } => ast,
@@ -433,14 +387,12 @@ fn collect_kernel_buffers(
                 let lookup_id = buffer_id_mapping.get(&original_id).copied().unwrap_or(original_id);
 
                 if let Some(existing) = crate::buffer_registry::get_buffer(lookup_id) {
-                    if debug {
-                        eprintln!(
-                            "collect_kernel_buffers: AFTER source original_id={} lookup_id={} found shared buffer, BufferId={:?}",
-                            original_id,
-                            lookup_id,
-                            existing.id()
-                        );
-                    }
+                    trace!(
+                        original_id,
+                        lookup_id,
+                        buffer.id = ?existing.id(),
+                        "Found shared buffer from AFTER"
+                    );
 
                     // Also register under original_id for future lookups
                     if original_id != lookup_id {
@@ -449,13 +401,7 @@ fn collect_kernel_buffers(
 
                     buffers.push(existing);
                 } else {
-                    // Producer should have allocated - check if sorting is correct
-                    if debug {
-                        eprintln!(
-                            "collect_kernel_buffers: AFTER source original_id={} lookup_id={} NOT FOUND in registry",
-                            original_id, lookup_id
-                        );
-                    }
+                    trace!(original_id, lookup_id, "after buffer not found in registry");
                     return Err(Error::BufferNotFound { uop_id: original_id });
                 }
             }
@@ -468,12 +414,7 @@ fn collect_kernel_buffers(
                     .or_else(|| reverse_id_mapping.get(&src.id).and_then(|old_id| define_to_buffer.get(old_id)));
 
                 if let Some(original_buffer) = lookup_result {
-                    if debug {
-                        eprintln!(
-                            "collect_kernel_buffers: src.id={} is input buffer (original={})",
-                            src.id, original_buffer.id
-                        );
-                    }
+                    trace!(src.id = src.id, original_buffer.id = original_buffer.id, "input buffer (reusing existing)");
                     // This is an input buffer - reuse the existing buffer
                     if let Some(buffer) = crate::buffer_registry::get_buffer(original_buffer.id) {
                         // Also register under the DEFINE_GLOBAL's ID for codegen lookup
@@ -492,14 +433,12 @@ fn collect_kernel_buffers(
                     if let Some(&original_buffer_id) = buffer_id_via_mapping
                         && let Some(buffer) = crate::buffer_registry::get_buffer(original_buffer_id)
                     {
-                        if debug {
-                            eprintln!(
-                                "collect_kernel_buffers: src.id={} is input buffer via define_to_buffer_id (original={}, BufferId={:?})",
-                                src.id,
-                                original_buffer_id,
-                                buffer.id()
-                            );
-                        }
+                        trace!(
+                            src.id = src.id,
+                            original_buffer_id,
+                            buffer.id = ?buffer.id(),
+                            "Input buffer via define_to_buffer_id"
+                        );
                         // Also register under the DEFINE_GLOBAL's ID for codegen lookup
                         crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
                         buffers.push(buffer);
@@ -508,23 +447,16 @@ fn collect_kernel_buffers(
 
                     // First check if buffer already exists in registry (shared from another kernel)
                     if let Some(existing) = crate::buffer_registry::get_buffer(src.id) {
-                        if debug {
-                            eprintln!(
-                                "collect_kernel_buffers: src.id={} found in registry (shared buffer), BufferId={:?}",
-                                src.id,
-                                existing.id()
-                            );
-                        }
+                        trace!(
+                            src.id = src.id,
+                            buffer.id = ?existing.id(),
+                            "Shared buffer from registry"
+                        );
                         buffers.push(existing);
                         continue;
                     }
 
-                    if debug {
-                        eprintln!(
-                            "collect_kernel_buffers: src.id={} is output/intermediate buffer (creating new)",
-                            src.id
-                        );
-                    }
+                    trace!(src.id = src.id, "creating output/intermediate buffer");
                     // This is an output/intermediate buffer - allocate on the same device as input
                     let ptr_dtype = src.dtype();
                     let size = compute_buffer_size(ast, src)?;

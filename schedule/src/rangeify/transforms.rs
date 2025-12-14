@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use morok_ir::{AddrSpace, BufferizeOpts, ConstValue, DType, Op, ReduceOp, UOp, UOpKey};
 use smallvec::SmallVec;
+use tracing::{debug, trace};
 
 use super::context::RangeifyContext;
 use super::indexing::IndexingContext;
@@ -163,35 +164,20 @@ pub(crate) fn transform_single_source(
     input_ranges: &[Arc<UOp>],
     ctx: &mut IndexingContext,
 ) -> Arc<UOp> {
-    // DEBUG: Trace buffer source transformation
-    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-        let ranges_str: Vec<_> = input_ranges
-            .iter()
-            .map(|r| {
-                if let Op::Range { axis_type, .. } = r.op() {
-                    format!("Range{}({:?})", r.id, axis_type)
-                } else {
-                    format!("{}({:?})", r.id, std::mem::discriminant(r.op()))
-                }
-            })
-            .collect();
-        eprintln!(
-            "[INDEX] transform_single_source: src id={} op={:?} consumer={} → input_ranges={:?}",
-            src.id,
-            std::mem::discriminant(src.op()),
-            _consumer.id,
-            ranges_str
-        );
-    }
+    trace!(
+        src.id = src.id,
+        src.op = ?std::mem::discriminant(src.op()),
+        consumer.id = _consumer.id,
+        input_ranges.len = input_ranges.len(),
+        "transform_single_source"
+    );
 
     // Case 1: Buffer-like op → add INDEX
     if matches!(
         src.op(),
         Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
     ) {
-        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-            eprintln!("[CASE1] Buffer-like: src id={}", src.id);
-        }
+        trace!(src.id = src.id, case = "buffer-like", "adding index");
         return UOp::index(Arc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for buffer source");
     }
 
@@ -200,9 +186,7 @@ pub(crate) fn transform_single_source(
     // We apply movement op transformation here directly (like Tinygrad's apply_movement_op)
     // Then recursively call transform_single_source to let the appropriate case handle the inner source
     if src.op().is_movement() {
-        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-            eprintln!("[CASE1.5] Movement: src id={}", src.id);
-        }
+        trace!(src.id = src.id, case = "movement", "processing movement op");
         use super::indexing::apply_movement_op;
 
         // Get the inner source of the movement op
@@ -228,49 +212,35 @@ pub(crate) fn transform_single_source(
     // We need to handle both cases
     let realize_axes_opt = ctx.get_realize_axes(src).cloned();
 
-    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-        eprintln!(
-            "[REALIZE_CHECK] src id={} op={:?} has_realize_axes={}",
-            src.id,
-            std::mem::discriminant(src.op()),
-            realize_axes_opt.is_some()
-        );
-    }
-
-    tracing::debug!(
-        src_id = src.id,
-        src_op = ?std::mem::discriminant(src.op()),
+    debug!(
+        src.id = src.id,
+        src.op = ?std::mem::discriminant(src.op()),
         has_realize_axes = realize_axes_opt.is_some(),
         realize_axes = ?realize_axes_opt,
-        "transform_single_source: checking realize_map"
+        "Checking realize_map"
     );
 
-    // Case 2: Source needs realization → wrap in BUFFERIZE + INDEX
+    // Case 2: source needs realization → wrap in BUFFERIZE + INDEX
     if let Some(ref realize_axes) = realize_axes_opt {
-        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-            eprintln!("[CASE2] src id={} has realize_axes={:?}", src.id, realize_axes);
-        }
+        trace!(src.id = src.id, realize_axes = ?realize_axes, case = "realize", "source needs realization");
         // Check if ANY source of this node is also marked for realization
         // If so, skip wrapping here - the inner source should be wrapped first
         for inner_src in src.op().sources() {
             if ctx.should_realize(&inner_src) {
-                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                    eprintln!("[CASE2] SKIP: src id={} inner_src id={} also needs realization", src.id, inner_src.id);
-                }
-                tracing::debug!(
-                    src_id = src.id,
-                    inner_src_id = inner_src.id,
-                    "transform_single_source: SKIPPING, inner source also needs realization"
+                debug!(
+                    src.id = src.id,
+                    inner_src.id = inner_src.id,
+                    "Skipping - inner source also needs realization"
                 );
                 // Return the source as-is - inner source will be wrapped when accessed
                 return Arc::clone(src);
             }
         }
 
-        tracing::debug!(
-            src_id = src.id,
+        debug!(
+            src.id = src.id,
             realize_axes = ?realize_axes,
-            "transform_single_source: CREATING BUFFERIZE for realized source"
+            "Creating BUFFERIZE for realized source"
         );
         let (_, output_ranges) = ctx.get_ranges(src).expect("Realized op must have ranges");
 
@@ -310,31 +280,25 @@ pub(crate) fn transform_single_source(
     // This ensures that when REDUCE → Unary(Neg) → Buffer, the Buffer gets INDEX
     // Aligns with Tinygrad's approach where patterns run on ALL nodes
     if matches!(src.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. }) {
-        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-            eprintln!(
-                "[CASE4] transform_single_source: compute op src id={} op={:?}, recursively transforming {} sources",
-                src.id,
-                std::mem::discriminant(src.op()),
-                src.op().sources().len()
-            );
-        }
+        trace!(
+            src.id = src.id,
+            src.op = ?std::mem::discriminant(src.op()),
+            num_sources = src.op().sources().len(),
+            case = "compute",
+            "Recursively transforming compute op sources"
+        );
         let inner_sources = src.op().sources();
         let mut new_inner_sources = Vec::with_capacity(inner_sources.len());
         let mut any_changed = false;
 
         for inner_src in inner_sources.iter() {
-            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                eprintln!("[CASE4]   inner_src id={} op={:?}", inner_src.id, std::mem::discriminant(inner_src.op()));
-            }
             let transformed = transform_single_source(_consumer, inner_src, input_ranges, ctx);
-            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                eprintln!(
-                    "[CASE4]   transformed id={} op={:?} changed={}",
-                    transformed.id,
-                    std::mem::discriminant(transformed.op()),
-                    !Arc::ptr_eq(&transformed, inner_src)
-                );
-            }
+            trace!(
+                inner_src.id = inner_src.id,
+                transformed.id = transformed.id,
+                changed = !Arc::ptr_eq(&transformed, inner_src),
+                "Inner source transformation"
+            );
             if !Arc::ptr_eq(&transformed, inner_src) {
                 any_changed = true;
             }
@@ -342,17 +306,13 @@ pub(crate) fn transform_single_source(
         }
 
         if any_changed {
-            if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                eprintln!("[CASE4] rebuilding src id={} with new sources", src.id);
-            }
+            trace!(src.id = src.id, "rebuilding compute op with new sources");
             return src.with_sources(new_inner_sources);
         }
     }
 
-    // Case 3: No transformation needed
-    if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-        eprintln!("[CASE3] No transformation: src id={}", src.id);
-    }
+    // Case 3: no transformation needed
+    trace!(src.id = src.id, case = "no-transform", "no transformation needed");
     Arc::clone(src)
 }
 

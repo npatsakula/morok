@@ -9,6 +9,7 @@ use inkwell::context::Context;
 use inkwell::module::Module;
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
+use tracing::{debug, trace};
 
 use morok_ir::{Op, UOp};
 
@@ -44,13 +45,11 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Collect all buffers and variables from the graph
         let (buffers, variables) = collect_buffers_and_vars(uop);
 
-        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-            eprintln!("[CODEGEN] Buffers: {:?}", buffers.iter().map(|b| b.id).collect::<Vec<_>>());
-            eprintln!(
-                "[CODEGEN] Variables: {:?}",
-                variables.iter().map(|v| (v.id, format!("{:?}", v.op()))).collect::<Vec<_>>()
-            );
-        }
+        debug!(
+            num_buffers = buffers.len(),
+            num_variables = variables.len(),
+            "Collected kernel parameters"
+        );
 
         // Create kernel function signature: void kernel(ptr %buf0, ..., i64 %var0, ...)
         let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
@@ -105,33 +104,7 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Walk the UOp graph in topological order
         let nodes = uop.toposort();
 
-        // DEBUG: Print all nodes in toposort
-        if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-            eprintln!("[CODEGEN] Toposort has {} nodes:", nodes.len());
-            for node in &nodes {
-                match node.op() {
-                    Op::Bind { var, value } => {
-                        eprintln!(
-                            "  id={} BIND(var.id={}, value.id={} op={:?})",
-                            node.id,
-                            var.id,
-                            value.id,
-                            std::mem::discriminant(value.op())
-                        );
-                    }
-                    Op::Range { axis_id, axis_type, .. } => {
-                        eprintln!("  id={} RANGE(axis_id={:?}, type={:?})", node.id, axis_id, axis_type);
-                    }
-                    Op::Reduce { .. } => {
-                        eprintln!("  id={} REDUCE", node.id);
-                    }
-                    Op::Index { .. } => {
-                        eprintln!("  id={} INDEX", node.id);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        debug!(num_nodes = nodes.len(), "walking toposort");
 
         // Pre-pass: Identify nodes that are in REDUCE source subgraphs
         // These nodes should NOT be processed in the main loop - REDUCE will handle them
@@ -146,9 +119,11 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
             if let Op::Bind { value, .. } = node.op()
                 && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. })
             {
-                if std::env::var("MOROK_DEBUG_RANGES").is_ok() {
-                    eprintln!("[PREPASS] Processing BIND id={} with OUTER Range id={}", node.id, value.id);
-                }
+                trace!(
+                    bind.id = node.id,
+                    range.id = value.id,
+                    "Pre-pass: Processing BIND with OUTER Range"
+                );
                 ops::codegen_uop(node, self.context, &module, &builder, &mut values)?;
             }
         }
@@ -228,12 +203,8 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Return void
         builder.build_return(None).context(BuildReturnSnafu)?;
 
-        // Debug: dump IR before verification
-        if std::env::var("MOROK_DUMP_IR").is_ok() {
-            eprintln!("=== LLVM IR before verification ===");
-            eprintln!("{}", module.to_string());
-            eprintln!("=== END LLVM IR ===");
-        }
+        // Dump IR at trace level
+        trace!(llvm.ir = %module.to_string(), "llvm ir before verification");
 
         // Verify the module
         module.verify().map_err(|err| Error::ModuleVerification { message: err.to_string() })?;

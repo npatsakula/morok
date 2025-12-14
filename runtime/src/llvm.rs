@@ -4,6 +4,7 @@ use std::mem::ManuallyDrop;
 
 use crate::{CompiledKernel, Result};
 use inkwell::OptimizationLevel;
+use tracing::{debug, instrument, trace};
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
@@ -40,9 +41,14 @@ impl LlvmKernel {
     ///
     /// This parses the LLVM IR, verifies it, runs optimization passes,
     /// and JIT compiles using LLVM's MCJIT or ORC engine.
+    #[instrument(skip_all, fields(kernel.entry_point, kernel.name))]
     pub fn compile_ir(ir: &str, entry_point: impl Into<String>, name: impl Into<String>) -> Result<Self> {
         let entry_point = entry_point.into();
         let name = name.into();
+
+        // Record span fields after conversion
+        tracing::Span::current().record("kernel.entry_point", &entry_point);
+        tracing::Span::current().record("kernel.name", &name);
 
         // Create boxed context (stable heap address)
         let context = Box::new(Context::create());
@@ -64,12 +70,12 @@ impl LlvmKernel {
             return Err(crate::Error::JitCompilation { reason: format!("Module verification failed: {}", err) });
         }
 
-        // Dump LLVM IR if requested
-        if std::env::var("MOROK_DUMP_LLVM").is_ok() {
-            eprintln!("=== LLVM IR for {} ===", name);
-            eprintln!("{}", module.print_to_string().to_string());
-            eprintln!("=== END LLVM IR ===");
-        }
+        // Dump LLVM IR at trace level
+        trace!(
+            kernel.name = %name,
+            llvm.ir = %module.print_to_string().to_string(),
+            "LLVM IR compiled"
+        );
 
         // Create execution engine with optimization
         let execution_engine = module.create_jit_execution_engine(OptimizationLevel::Aggressive).map_err(|e| {
@@ -97,42 +103,36 @@ impl CompiledKernel for LlvmKernel {
         buffers: &[*mut u8],
         vars: &std::collections::HashMap<String, i64>,
     ) -> Result<()> {
-        // Debug: dump buffer contents before execution
-        let debug_buffers = std::env::var("MOROK_DEBUG_BUFFERS").is_ok();
-        if debug_buffers {
-            eprintln!("LLVM execute BEFORE: entry_point={}, num_buffers={}", self.entry_point, buffers.len());
-            for (i, &ptr) in buffers.iter().enumerate() {
-                if !ptr.is_null() {
-                    // Try to interpret as floats (first 5 values)
-                    let float_ptr = ptr as *const f32;
-                    let float_vals: Vec<f32> = (0..5).map(|j| unsafe { *float_ptr.add(j) }).collect();
-                    // Try to interpret as ints (first 5 values)
-                    let int_ptr = ptr as *const i32;
-                    let int_vals: Vec<i32> = (0..5).map(|j| unsafe { *int_ptr.add(j) }).collect();
-                    eprintln!("  buf[{}]: ptr={:?}, as_f32={:?}, as_i32={:?}", i, ptr, float_vals, int_vals);
-                } else {
-                    eprintln!("  buf[{}]: NULL", i);
-                }
-            }
-        }
-
-        // Helper closure for buffer debug output
-        let debug_buffer_output = |prefix: &str| {
-            if debug_buffers {
-                eprintln!("LLVM execute {}: entry_point={}, num_buffers={}", prefix, self.entry_point, buffers.len());
+        // Debug buffer contents helper
+        let debug_buffer_contents = |phase: &str, buffers: &[*mut u8]| {
+            if tracing::enabled!(tracing::Level::DEBUG) {
                 for (i, &ptr) in buffers.iter().enumerate() {
                     if !ptr.is_null() {
                         let float_ptr = ptr as *const f32;
                         let float_vals: Vec<f32> = (0..5).map(|j| unsafe { *float_ptr.add(j) }).collect();
                         let int_ptr = ptr as *const i32;
                         let int_vals: Vec<i32> = (0..5).map(|j| unsafe { *int_ptr.add(j) }).collect();
-                        eprintln!("  buf[{}]: ptr={:?}, as_f32={:?}, as_i32={:?}", i, ptr, float_vals, int_vals);
+                        debug!(
+                            phase,
+                            buffer.index = i,
+                            buffer.ptr = ?ptr,
+                            buffer.as_f32 = ?float_vals,
+                            buffer.as_i32 = ?int_vals,
+                            "Buffer contents"
+                        );
                     } else {
-                        eprintln!("  buf[{}]: NULL", i);
+                        debug!(phase, buffer.index = i, "buffer is null");
                     }
                 }
             }
         };
+
+        debug!(
+            kernel.entry_point = %self.entry_point,
+            kernel.num_buffers = buffers.len(),
+            "Executing LLVM kernel"
+        );
+        debug_buffer_contents("before", buffers);
 
         // Get the function from the module to inspect its signature
         let function = self
@@ -216,7 +216,7 @@ impl CompiledKernel for LlvmKernel {
             }
         }
 
-        debug_buffer_output("AFTER");
+        debug_buffer_contents("after", buffers);
         Ok(())
     }
 
