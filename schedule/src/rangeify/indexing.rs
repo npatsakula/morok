@@ -400,26 +400,81 @@ fn assign_ranges(
                 "Ending ranges detected (pre-in_rngs check)"
             );
         }
-        if !ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
+        // Filter ending ranges: for ReduceAxis, ignore REDUCE ranges from other reductions
+        // since they're context-specific and shouldn't trigger realization here.
+        let filtered_ending: Vec<_> =
+            if matches!(x.op(), Op::ReduceAxis { .. }) {
+                ending
+                    .iter()
+                    .filter(|e| {
+                        if let Op::Range { axis_type, .. } = e.op() { *axis_type != AxisType::Reduce } else { true }
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                ending.clone()
+            };
+
+        if !filtered_ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
             if let Some(shape) = x.shape().ok().flatten() {
-                let realize_axes: Vec<usize> = (0..shape.len()).collect();
+                // Start with existing realize_axes (from merge_consumer_ranges)
+                let mut realize_axes: Vec<usize> = ctx.get_realize_axes(x).cloned().unwrap_or_default();
+
+                // Get axis_ids from ending ranges for comparison (matching Tinygrad's rr.arg > e.arg)
+                let ending_axis_ids: Vec<AxisId> = filtered_ending
+                    .iter()
+                    .filter_map(|e| if let Op::Range { axis_id, .. } = e.op() { Some(*axis_id) } else { None })
+                    .collect();
+
+                // For each axis, check if any range in out_rngs has axis_id > ending axis_id
+                // This matches Tinygrad's: any(any(rr.arg > e.arg for e in ending_ranges[x]) for rr in r.ranges)
+                for (i, r) in out_rngs.iter().enumerate() {
+                    if realize_axes.contains(&i) {
+                        continue;
+                    }
+
+                    // Check ranges in this output expression
+                    let should_realize = r.ranges().iter().any(|rr| {
+                        if let Op::Range { axis_id, .. } = rr.op() {
+                            ending_axis_ids.iter().any(|e_id| axis_id > e_id)
+                        } else {
+                            false
+                        }
+                    });
+
+                    if should_realize {
+                        realize_axes.push(i);
+                    }
+                }
 
                 debug!(
                     node_id = x.id,
                     op = ?std::mem::discriminant(x.op()),
                     ending_count = ending.len(),
                     realize_axes = ?realize_axes,
-                    "REALIZATION TRIGGERED via ending_ranges (pre-in_rngs)"
+                    "SELECTIVE REALIZATION via ending_ranges"
                 );
 
                 // Clear ending_ranges after handling
                 ctx.clear_ending_ranges(x);
 
-                // Force realization on all axes
-                ctx.mark_realize(x, realize_axes.clone());
+                if !realize_axes.is_empty() {
+                    // Mark for realization
+                    ctx.mark_realize(x, realize_axes.clone());
 
-                // Create new ranges for realized axes - in_rngs will be computed from these
-                out_rngs = shape.iter().map(|s| ctx.new_range_uncollapsed(s, AxisType::Loop)).collect();
+                    // Selectively replace only realized axes (preserve others)
+                    out_rngs = out_rngs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            if realize_axes.contains(&i) {
+                                ctx.new_range_uncollapsed(&shape[i], AxisType::Loop)
+                            } else {
+                                Arc::clone(r)
+                            }
+                        })
+                        .collect();
+                }
             } else {
                 ctx.clear_ending_ranges(x);
             }
@@ -531,7 +586,16 @@ fn assign_ranges(
                 for (inp, out) in in_rngs.iter().zip(out_rngs.iter()) {
                     if !Arc::ptr_eq(inp, out) {
                         // The output range is being collapsed - collect any RANGE ops in it
-                        changed_ranges.extend(collect_ranges_from_uop(out));
+                        // Filter out REDUCE ranges - they're internal to reductions and shouldn't
+                        // propagate as ending ranges to other operations.
+                        let ranges = collect_ranges_from_uop(out);
+                        for r in ranges {
+                            if let Op::Range { axis_type, .. } = r.op() {
+                                if *axis_type != AxisType::Reduce {
+                                    changed_ranges.push(r);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -840,6 +904,29 @@ pub fn ranges_equal(ranges1: &[Arc<UOp>], ranges2: &[Arc<UOp>]) -> bool {
     ranges1.len() == ranges2.len() && ranges1.iter().zip(ranges2).all(|(r1, r2)| Arc::ptr_eq(r1, r2))
 }
 
+/// Check if two ranges are compatible for merging.
+/// Two ranges are compatible if:
+/// 1. They are pointer-equal
+/// 2. They are structurally equal (same UOp graph)
+/// 3. They are both REDUCE ranges with the same `end` value (different axis_ids are OK)
+fn ranges_compatible(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
+    if Arc::ptr_eq(a, b) {
+        return true;
+    }
+    if uop_equal(a, b) {
+        return true;
+    }
+    // Special case: Two REDUCE ranges with same end value are compatible
+    // (they represent iteration over the same axis dimension, just from different contexts)
+    match (a.op(), b.op()) {
+        (
+            Op::Range { axis_type: AxisType::Reduce, end: end_a, .. },
+            Op::Range { axis_type: AxisType::Reduce, end: end_b, .. },
+        ) => Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b),
+        _ => false,
+    }
+}
+
 /// Check if all ranges have identical index expressions (ignoring validity masks).
 pub fn all_ranges_same(ranges: &[Arc<UOp>]) -> bool {
     if ranges.is_empty() {
@@ -848,7 +935,7 @@ pub fn all_ranges_same(ranges: &[Arc<UOp>]) -> bool {
     let first_idx = ranges[0].get_idx();
     ranges.iter().skip(1).all(|r| {
         let idx = r.get_idx();
-        Arc::ptr_eq(&first_idx, &idx) || uop_equal(&first_idx, &idx)
+        ranges_compatible(&first_idx, &idx)
     })
 }
 

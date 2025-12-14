@@ -192,7 +192,12 @@ fn codegen_arithmetic<'ctx>(
         Op::Cast { src, dtype } => {
             let src_val = require_value(src, context, module, builder, values)?;
             let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
-            Ok(Some(codegen_cast(src_val, &src.dtype(), dtype, context, builder)?))
+            // Get actual source dtype after auto-load (dereference Ptr)
+            let actual_src_dtype = match src.dtype() {
+                DType::Ptr { base, .. } => base.as_ref().clone(),
+                other => other,
+            };
+            Ok(Some(codegen_cast(src_val, &actual_src_dtype, dtype, context, builder)?))
         }
         _ => Ok(None),
     }
