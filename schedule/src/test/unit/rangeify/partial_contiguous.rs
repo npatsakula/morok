@@ -421,9 +421,9 @@ fn test_out_in_ratio_efficient_buffer() {
 
     let mut ctx = IndexingContext::new();
 
-    // Create a buffer with ratio = 9.0 (< threshold of 10.0)
-    // input_size = 1000 bytes, output_size = 9000 bytes
-    // ratio = 9000 / 1000 = 9.0
+    // Create a buffer with ratio ~8.8 (< threshold of 10.0)
+    // input_size = 1000 bytes, output_size = 9000 bytes target
+    // Actual: 47*47*4 = 8836 bytes output, ratio = 8836/1000 ≈ 8.8
     let input_size = 1000;
     let output_size = 9000;
     let (_input_buffer, _output_size, ranges, compute) = create_ratio_test_graph(&mut ctx, input_size, output_size);
@@ -436,7 +436,7 @@ fn test_out_in_ratio_efficient_buffer() {
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
     // With ratio < 10, should keep buffer (no rewrite)
-    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite for efficient buffer (ratio 9.0 < 10.0)");
+    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite for efficient buffer (ratio < 10.0)");
 }
 
 /// Test out_in_ratio heuristic at threshold boundary.

@@ -8,6 +8,7 @@ use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use smallvec::SmallVec;
 
 use crate::rangeify::{KernelContext, bufferize_to_store, run_kernel_split_pipeline};
+use crate::test::unit::rangeify::helpers::extract_kernel;
 
 #[test]
 fn test_zero_size_range() {
@@ -111,7 +112,9 @@ fn test_zero_size_pipeline() {
     let (result, _context) = run_kernel_split_pipeline(bufferize);
 
     // Should create a KERNEL even with zero ranges
-    assert!(matches!(result.op(), Op::Kernel { .. }));
+    // Extract KERNEL from result (may be wrapped in AFTER structure)
+    let kernel = extract_kernel(&result).expect("Pipeline should create a KERNEL");
+    assert!(matches!(kernel.op(), Op::Kernel { .. }));
 }
 
 #[test]

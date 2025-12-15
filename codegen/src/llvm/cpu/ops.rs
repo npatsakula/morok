@@ -401,12 +401,7 @@ fn codegen_memory<'ctx>(
             Ok(None)
         }
         Op::Index { buffer, indices, gate: None } => {
-            trace!(
-                index.id = uop.id,
-                buffer.id = buffer.id,
-                num_indices = indices.len(),
-                "INDEX operation"
-            );
+            trace!(index.id = uop.id, buffer.id = buffer.id, num_indices = indices.len(), "INDEX operation");
 
             let buffer_ptr = require_value(buffer, context, module, builder, values)?;
             if indices.len() == 1 {

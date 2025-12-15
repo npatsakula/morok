@@ -4,10 +4,10 @@ use std::mem::ManuallyDrop;
 
 use crate::{CompiledKernel, Result};
 use inkwell::OptimizationLevel;
-use tracing::{debug, instrument, trace};
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
+use tracing::{debug, instrument, trace};
 
 /// LLVM JIT-compiled kernel with proper context ownership.
 ///

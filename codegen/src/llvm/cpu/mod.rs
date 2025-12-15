@@ -45,11 +45,7 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Collect all buffers and variables from the graph
         let (buffers, variables) = collect_buffers_and_vars(uop);
 
-        debug!(
-            num_buffers = buffers.len(),
-            num_variables = variables.len(),
-            "Collected kernel parameters"
-        );
+        debug!(num_buffers = buffers.len(), num_variables = variables.len(), "Collected kernel parameters");
 
         // Create kernel function signature: void kernel(ptr %buf0, ..., i64 %var0, ...)
         let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
@@ -119,11 +115,7 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
             if let Op::Bind { value, .. } = node.op()
                 && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. })
             {
-                trace!(
-                    bind.id = node.id,
-                    range.id = value.id,
-                    "Pre-pass: Processing BIND with OUTER Range"
-                );
+                trace!(bind.id = node.id, range.id = value.id, "Pre-pass: Processing BIND with OUTER Range");
                 ops::codegen_uop(node, self.context, &module, &builder, &mut values)?;
             }
         }

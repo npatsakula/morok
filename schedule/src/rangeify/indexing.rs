@@ -548,11 +548,7 @@ fn assign_ranges(
                             rngs.push(ctx.new_range(s, AxisType::Reduce));
                         } else if i < out_rngs.len() {
                             rngs.push(Arc::clone(&out_rngs[i]));
-                            trace!(
-                                dim.index = i,
-                                range.id = out_rngs[i].id,
-                                "ReduceAxis using existing out_rngs"
-                            );
+                            trace!(dim.index = i, range.id = out_rngs[i].id, "ReduceAxis using existing out_rngs");
                         } else {
                             rngs.push(ctx.new_range(s, AxisType::Loop));
                         }
@@ -595,9 +591,10 @@ fn assign_ranges(
                         let ranges = collect_ranges_from_uop(out);
                         for r in ranges {
                             if let Op::Range { axis_type, .. } = r.op()
-                                && *axis_type != AxisType::Reduce {
-                                    changed_ranges.push(r);
-                                }
+                                && *axis_type != AxisType::Reduce
+                            {
+                                changed_ranges.push(r);
+                            }
                         }
                     }
                 }
@@ -786,10 +783,12 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             fn simplify_mod(x: &Arc<UOp>, n: i64) -> Arc<UOp> {
                 let (vmin, vmax) = VminVmaxProperty::get(x);
                 if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
-                    && *min >= 0 && *max < n {
-                        // x is always in range [0, n), so x % n = x
-                        return Arc::clone(x);
-                    }
+                    && *min >= 0
+                    && *max < n
+                {
+                    // x is always in range [0, n), so x % n = x
+                    return Arc::clone(x);
+                }
                 let n_uop = UOp::index_const(n);
                 x.try_mod(&n_uop).unwrap()
             }
@@ -797,10 +796,13 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             fn simplify_div(x: &Arc<UOp>, n: i64) -> Arc<UOp> {
                 let (vmin, vmax) = VminVmaxProperty::get(x);
                 if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
-                    && *min >= 0 && *max < n && n > 0 {
-                        // x is always in range [0, n), so x / n = 0
-                        return UOp::index_const(0);
-                    }
+                    && *min >= 0
+                    && *max < n
+                    && n > 0
+                {
+                    // x is always in range [0, n), so x / n = 0
+                    return UOp::index_const(0);
+                }
                 let n_uop = UOp::index_const(n);
                 x.try_div(&n_uop).unwrap()
             }

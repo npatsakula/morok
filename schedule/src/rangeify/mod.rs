@@ -34,7 +34,7 @@ pub use kernel::{PcontigConfig, SplitReduceOpConfig};
 pub use patterns::{
     apply_rangeify_patterns, buffer_folding, buffer_limit_patterns, buffer_removal, buffer_removal_with_pcontig,
     dead_axis_removal, early_rewrites, movement_op_patterns, rangeify_codegen_patterns, reduction_simplify_patterns,
-    to_define_global_patterns,
+    split_reduceop_patterns, to_define_global_patterns,
 };
 
 // Buffer cost analysis

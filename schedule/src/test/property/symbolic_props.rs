@@ -8,6 +8,8 @@ use proptest::prelude::*;
 
 use morok_dtype::DType;
 use morok_ir::types::{BinaryOp, ConstValue};
+use morok_ir::uop::cached_property::CachedProperty;
+use morok_ir::uop::properties::VminVmaxProperty;
 use morok_ir::{Op, UOp};
 
 use crate::rewrite::graph_rewrite;
@@ -402,12 +404,22 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(500))]
 
     /// Nested division: (a // b) // c = a // (b * c) for positive constants
+    ///
+    /// Note: When a's max < b*c, range optimization may simplify divisions to 0.
+    /// We use small divisors (b, c in 2..8) to ensure a.max >= b*c is often satisfied.
     #[test]
     fn nested_div_collapse(
         a in arb_var_uop(DType::Int32),
-        b in 2..20i32,
-        c in 2..20i32,
+        b in 2..8i32,
+        c in 2..8i32,
     ) {
+        // Skip when range optimization would apply:
+        // Need: a.max >= b * c to avoid intermediate divisions becoming 0
+        let (_, vmax) = VminVmaxProperty::get(&a);
+        if let ConstValue::Int(max) = vmax {
+            prop_assume!(*max >= (b as i64) * (c as i64));
+        }
+
         // (a // b) // c
         let b_uop = UOp::native_const(b);
         let c_uop = UOp::native_const(c);
@@ -464,11 +476,20 @@ proptest! {
     }
 
     /// Modulo idempotence: (a % b) % b = a % b
+    ///
+    /// Note: When a's max < b, the modulo simplifies to a via range analysis.
+    /// We skip such cases to test the algebraic idempotence pattern.
     #[test]
     fn mod_idempotence(
         a in arb_var_uop(DType::Int32),
         b in 2..100i32,
     ) {
+        // Skip when range optimization would apply (a.max < b means a % b = a)
+        let (_, vmax) = VminVmaxProperty::get(&a);
+        if let ConstValue::Int(max) = vmax {
+            prop_assume!(*max >= b as i64);
+        }
+
         let b_uop = UOp::native_const(b);
         let mod1 = a.try_mod(&b_uop).unwrap();
         let mod2 = mod1.try_mod(&b_uop).unwrap();

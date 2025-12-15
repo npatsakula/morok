@@ -270,7 +270,8 @@ pub fn calculate_buffer_size(buffer: &Arc<UOp>) -> Option<usize> {
                     _ => return None,
                 }
             }
-            let element_size = buffer.dtype().bytes();
+            // Use base scalar type for element size (handles Ptr types correctly)
+            let element_size = buffer.dtype().base().bytes();
             Some(product.checked_mul(element_size)?)
         }
         Op::Buffer { size, .. } => Some(*size),
@@ -536,10 +537,9 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
         return None;
     }
 
-    // Skip if has non-OUTER ranges
-    if uop.has_non_outer_ranges() {
-        return None;
-    }
+    // Note: We don't check has_non_outer_ranges() here because:
+    // - Loop/Reduce ranges on END(STORE) are valid kernel bodies
+    // - Only OUTER ranges on END should be skipped (control flow markers, checked below)
 
     // Verify operation type
     let computation = match uop.op() {
@@ -747,13 +747,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
         let toposort_nodes: Vec<_> = root.toposort();
         let after_count = toposort_nodes.iter().filter(|n| matches!(n.op(), Op::After { .. })).count();
         let kernel_count = toposort_nodes.iter().filter(|n| matches!(n.op(), Op::Kernel { .. })).count();
-        debug!(
-            root.id = root.id,
-            total_nodes = toposort_nodes.len(),
-            after_count,
-            kernel_count,
-            "fix_assign starting"
-        );
+        debug!(root.id = root.id, total_nodes = toposort_nodes.len(), after_count, kernel_count, "fix_assign starting");
     }
 
     // Step 1: Map buffer_id -> AFTER node that writes to it
@@ -997,11 +991,7 @@ fn resolve_kernel_dependencies(root: &Arc<UOp>, ctx: &mut KernelContext) {
                     _ => None,
                 };
                 if let Some(k) = kernel {
-                    trace!(
-                        buffer.id = passthrough.id,
-                        kernel.id = k.id,
-                        "Buffer produced by kernel"
-                    );
+                    trace!(buffer.id = passthrough.id, kernel.id = k.id, "Buffer produced by kernel");
                     buffer_producers.insert(passthrough.id, k);
                     break;
                 }

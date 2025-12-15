@@ -45,7 +45,9 @@ fn is_scalar_shape(shape: &Arc<UOp>) -> bool {
 }
 
 /// Check if an op is cheap to inline (no buffering needed).
-/// Note: Unary ops are excluded because they need buffering when feeding into reductions.
+///
+/// Note: Unary ops are included here but may need buffering in reduce context.
+/// Use `unary_in_reduce_context()` to check before inlining Unary ops.
 pub fn is_cheap_to_inline(op: &Op) -> bool {
     matches!(
         op,
@@ -58,7 +60,7 @@ pub fn is_cheap_to_inline(op: &Op) -> bool {
             | Op::DefineReg { .. }
             | Op::VConst { .. }
             // Simple operations - cheap to recompute
-            // Note: Op::Unary excluded - needs buffering for reduce sources
+            | Op::Unary(..)
             | Op::Binary(..)
             | Op::Ternary(..)
             | Op::Cast { .. }
@@ -69,6 +71,31 @@ pub fn is_cheap_to_inline(op: &Op) -> bool {
             // Index/pointer operations - cheap
             | Op::PointerIndex { .. }
     )
+}
+
+/// Check if a Unary op is within a reduce context (has REDUCE ranges in scope).
+///
+/// If a Unary op has reduce ranges in scope, it means it's being computed inside
+/// a reduction loop and must NOT be inlined (would recompute N times per element).
+fn unary_in_reduce_context(compute: &Arc<UOp>) -> bool {
+    if !matches!(compute.op(), Op::Unary(..)) {
+        return false;
+    }
+    compute
+        .in_scope_ranges()
+        .iter()
+        .any(|key| if let Op::Range { axis_type, .. } = key.0.op() { *axis_type == AxisType::Reduce } else { false })
+}
+
+/// Check if a BUFFERIZE wraps a Unary op in reduce context.
+fn unary_in_reduce_context_bufferize(buf: &Arc<UOp>) -> bool {
+    if let Op::Bufferize { compute, .. } = buf.op() { unary_in_reduce_context(compute) } else { false }
+}
+
+/// Block inlining of BUFFERIZE when it wraps a Unary op in reduce context.
+/// Returns None to keep the BUFFERIZE as-is (no transformation).
+fn block_reduce_unary_inline(_buf: &Arc<UOp>) -> Option<Arc<UOp>> {
+    None
 }
 
 /// Check if an op must always run (shouldn't be buffered).
@@ -210,11 +237,7 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
         // This ensures consistent computation: the innermost marked node is wrapped once
         for inner_src in src.op().sources() {
             if ctx.should_realize(&inner_src) {
-                trace!(
-                    src.id = src.id,
-                    inner_src.id = inner_src.id,
-                    "Skipping - inner source also needs realization"
-                );
+                trace!(src.id = src.id, inner_src.id = inner_src.id, "Skipping - inner source also needs realization");
                 // Return the raw source - let the rewrite continue
                 // The inner source will be wrapped when its consumers process it
                 return Some(src);
@@ -262,11 +285,7 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
         let index_ranges: Vec<_> =
             input_ranges.iter().enumerate().filter(|(i, _)| axes.contains(i)).map(|(_, r)| Arc::clone(r)).collect();
 
-        trace!(
-            index_ranges.len = index_ranges.len(),
-            bufferized.id = bufferized.id,
-            "Index ranges for bufferize"
-        );
+        trace!(index_ranges.len = index_ranges.len(), bufferized.id = bufferized.id, "Index ranges for bufferize");
 
         if !index_ranges.is_empty() {
             let result = UOp::index(bufferized.clone(), index_ranges);
@@ -430,8 +449,14 @@ fn adjust_index_for_dead_axes(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 // ============================================================================
 
 /// Pattern matcher for cost-based buffer removal.
+///
+/// Unary ops in reduce context are NOT inlined to avoid recomputing N times
+/// inside the reduction loop (e.g., argmax(-x) needs to compute -x once, not per element).
 pub fn buffer_removal() -> PatternMatcher {
     crate::patterns! {
+        // Unary in REDUCE context must NOT be inlined - check FIRST
+        buf if unary_in_reduce_context_bufferize(buf) => block_reduce_unary_inline(buf),
+        // Other cheap ops (including non-reduce Unary) can inline
         Bufferize { compute, .. } if is_cheap_to_inline(compute.op()) ~> compute,
         Bufferize { compute, .. } if is_always_run_op(compute.op()) ~> compute,
         Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
@@ -454,12 +479,14 @@ pub fn buffer_removal_with_pcontig() -> PatternMatcher<PcontigConfig> {
 fn remove_cheap_bufferize(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
     if let Op::Bufferize { compute, .. } = buf.op()
         && is_cheap_to_inline(compute.op())
+        && !unary_in_reduce_context(compute)
+    // Don't inline Unary in reduce context
     {
         tracing::debug!(
             bufferize_id = buf.id,
             compute_id = compute.id,
             compute_op = ?std::mem::discriminant(compute.op()),
-            "REMOVING cheap BUFFERIZE"
+            "removing cheap bufferize"
         );
         return Some(compute.clone());
     }
@@ -542,13 +569,21 @@ fn apply_pcontig_removal(idx: &Arc<UOp>, config: &mut PcontigConfig) -> Option<A
 // REDUCTION SIMPLIFY PATTERNS
 // ============================================================================
 
-/// Pattern matcher for reduction simplifications.
-pub fn reduction_simplify_patterns() -> PatternMatcher<SplitReduceOpConfig> {
+/// Pattern matcher for splitting large ReduceAxis operations.
+/// Must run BEFORE ReduceAxis → REDUCE conversion (Step 2.5).
+pub fn split_reduceop_patterns() -> PatternMatcher<SplitReduceOpConfig> {
     crate::patterns! {
         @context SplitReduceOpConfig;
+        reduce if matches!(reduce.op(), Op::ReduceAxis { .. }) => split_reduceop(reduce, ctx),
+    }
+}
+
+/// Pattern matcher for reduction simplifications (reduce_unparented, reduce_collapse).
+/// Must run AFTER ReduceAxis → REDUCE conversion (Step 7) because these match Op::Reduce.
+pub fn reduction_simplify_patterns() -> PatternMatcher {
+    crate::patterns! {
         x => reduce_unparented(x),
         x => super::transforms::reduce_collapse(x),
-        reduce if matches!(reduce.op(), Op::ReduceAxis { .. }) => split_reduceop(reduce, ctx),
     }
 }
 

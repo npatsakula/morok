@@ -1,6 +1,7 @@
 use morok_ir::{Op, UOp};
 
 use crate::rangeify::{KernelContext, bufferize_to_store};
+use crate::test::unit::rangeify::helpers::extract_kernel;
 
 #[test]
 fn test_bufferize_to_store_global() {
@@ -341,13 +342,16 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
     };
     assert!(matches!(store.op(), Op::Store { .. }));
 
-    // Stage 2: AFTER → KERNEL (split_store unwraps AFTER and creates KERNEL)
-    // We pass the AFTER to split_store, which extracts and processes the END(STORE)
-    let kernel_result = split_store(&store_result, &mut ctx).unwrap();
+    // Stage 2: AFTER → AFTER(DEFINE_GLOBAL, [END(KERNEL)])
+    // split_store transforms END(STORE) to END(KERNEL) but preserves AFTER wrapper
+    let split_result = split_store(&store_result, &mut ctx).unwrap();
+
+    // Extract KERNEL from result (wrapped in AFTER structure)
+    let kernel = extract_kernel(&split_result).expect("split_store should create a KERNEL");
 
     // Verify KERNEL structure
-    let Op::Kernel { sources, ast } = kernel_result.op() else {
-        panic!("Expected KERNEL operation, got {:?}", kernel_result.op());
+    let Op::Kernel { sources, ast } = kernel.op() else {
+        panic!("Expected KERNEL operation, got {:?}", kernel.op());
     };
 
     // KERNEL should have at least 1 source (the DEFINE_GLOBAL buffer)

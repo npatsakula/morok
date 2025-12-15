@@ -26,6 +26,48 @@ pub fn count_kernels(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::Kernel { .. }))
 }
 
+/// Extract the first KERNEL from a pipeline result.
+///
+/// The kernel split pipeline may return:
+/// - KERNEL directly
+/// - AFTER(DEFINE_GLOBAL, [END(KERNEL)])
+/// - SINK([AFTER(...)])
+///
+/// This helper extracts the first KERNEL found in any of these structures.
+pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+    match uop.op() {
+        // Direct KERNEL
+        Op::Kernel { .. } => Some(uop.clone()),
+        // AFTER(passthrough, deps) - check deps for END(KERNEL)
+        Op::After { deps, .. } => {
+            for dep in deps.iter() {
+                if let Op::End { computation, .. } = dep.op() {
+                    if matches!(computation.op(), Op::Kernel { .. }) {
+                        return Some(computation.clone());
+                    }
+                }
+                // Also check if dep is directly a KERNEL
+                if matches!(dep.op(), Op::Kernel { .. }) {
+                    return Some(dep.clone());
+                }
+            }
+            None
+        }
+        // SINK - check sources
+        Op::Sink { sources } => {
+            for src in sources.iter() {
+                if let Some(kernel) = extract_kernel(src) {
+                    return Some(kernel);
+                }
+            }
+            None
+        }
+        // END(KERNEL)
+        Op::End { computation, .. } if matches!(computation.op(), Op::Kernel { .. }) => Some(computation.clone()),
+        _ => None,
+    }
+}
+
 /// Count DEFINE_GLOBAL operations in a UOp graph.
 pub fn count_define_globals(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |op| matches!(op, Op::DefineGlobal(_)))

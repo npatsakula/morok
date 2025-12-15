@@ -36,9 +36,19 @@ impl UOp {
     /// Create a RANGE operation with constant end value (convenience for tests).
     ///
     /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
+    /// Creates a `Loop` range (inside kernels).
     pub fn range_const(end_value: i64, axis_id: usize) -> Arc<Self> {
         let end = Self::const_(DType::Index, ConstValue::Int(end_value));
         Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
+    }
+
+    /// Create an OUTER RANGE operation with constant end value (convenience for tests).
+    ///
+    /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
+    /// Creates an `Outer` range (wraps entire kernels).
+    pub fn range_outer_const(end_value: i64, axis_id: usize) -> Arc<Self> {
+        let end = Self::const_(DType::Index, ConstValue::Int(end_value));
+        Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Outer)
     }
 
     // =========================================================================

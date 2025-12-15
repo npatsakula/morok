@@ -98,7 +98,8 @@ fn test_no_transform_for_normal_source() {
 
 #[test]
 fn test_transform_movement_chain_on_buffer() {
-    // Test that RESHAPE(BUFFER) gets INDEX wrapping
+    // Test that RESHAPE(BUFFER) is transformed to INDEX(BUFFER, transformed_indices)
+    // The RESHAPE is eliminated and indices are computed to achieve the same memory access pattern
     let buffer = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
 
     // RESHAPE(BUFFER) to 3x4 shape
@@ -125,22 +126,29 @@ fn test_transform_movement_chain_on_buffer() {
     // Transform sources
     let new_sources = transform_sources_with_bufferize(&add, &mut ctx);
 
-    // RESHAPE(BUFFER) should be transformed to INDEX(RESHAPE(BUFFER), ranges)
+    // RESHAPE(BUFFER) should be transformed to INDEX(BUFFER, transformed_indices)
+    // RESHAPE is eliminated - indices are transformed to achieve the same effect
     assert!(new_sources.is_some(), "Transform should happen for movement chain on buffer");
     let new_sources = new_sources.unwrap();
     assert_eq!(new_sources.len(), 2);
 
-    // First source (RESHAPE(BUFFER)) should be wrapped in INDEX
-    println!("First source op: {:?}", new_sources[0].op());
+    // First source should be wrapped in INDEX
     assert!(
         matches!(new_sources[0].op(), Op::Index { .. }),
-        "RESHAPE(BUFFER) should be wrapped in INDEX, got: {:?}",
+        "RESHAPE(BUFFER) should be transformed to INDEX, got: {:?}",
         new_sources[0].op()
     );
 
-    // Verify the INDEX wraps the RESHAPE
-    if let Op::Index { buffer, .. } = new_sources[0].op() {
-        assert!(matches!(buffer.op(), Op::Reshape { .. }), "INDEX should wrap RESHAPE, got: {:?}", buffer.op());
+    // Verify the INDEX directly wraps the BUFFER (RESHAPE eliminated)
+    if let Op::Index { buffer: idx_buffer, indices, .. } = new_sources[0].op() {
+        assert!(
+            matches!(idx_buffer.op(), Op::Buffer { .. }),
+            "INDEX should wrap BUFFER directly (RESHAPE eliminated), got: {:?}",
+            idx_buffer.op()
+        );
+        // Indices should be transformed (not just the original ranges)
+        // For 3x4 reshape of a 12-element buffer: index = range0 * 4 + range1
+        assert_eq!(indices.len(), 1, "Transformed indices should be flattened to 1D");
     }
 }
 

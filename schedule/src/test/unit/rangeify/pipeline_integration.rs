@@ -8,7 +8,7 @@ use std::f32::consts::PI;
 use morok_ir::{Op, UOp};
 
 use crate::rangeify::kernel::run_kernel_split_pipeline;
-use crate::test::unit::rangeify::helpers::{count_define_globals, count_define_locals, count_kernels};
+use crate::test::unit::rangeify::helpers::{count_define_globals, count_define_locals, count_kernels, extract_kernel};
 
 #[test]
 fn test_pipeline_two_bufferizes() {
@@ -48,13 +48,13 @@ fn test_pipeline_preserves_structure() {
 
     let (result, _context) = run_kernel_split_pipeline(bufferize.clone());
 
-    // Result should be a KERNEL
-    assert!(matches!(result.op(), Op::Kernel { .. }));
+    // Extract KERNEL from result (may be wrapped in AFTER structure)
+    let kernel = extract_kernel(&result).expect("Pipeline should create a KERNEL");
 
     // KERNEL should contain the original compute somewhere in its graph
     // (We can't easily verify deep structure without graph traversal,
     // but we can check that the pipeline created a valid kernel)
-    if let Op::Kernel { ast, sources } = result.op() {
+    if let Op::Kernel { ast, sources } = kernel.op() {
         // AST should be a SINK
         assert!(matches!(ast.op(), Op::Sink { .. }));
 
@@ -65,7 +65,7 @@ fn test_pipeline_preserves_structure() {
             "KERNEL sources should include DEFINE_GLOBAL"
         );
     } else {
-        panic!("Expected KERNEL operation");
+        panic!("Expected KERNEL operation, got {:?}", kernel.op());
     }
 }
 
@@ -83,12 +83,15 @@ fn test_pipeline_context_threading() {
     // - Stage 1 (bufferize_to_store) creates DEFINE_GLOBAL and tracks in context
     // - Stage 2 (split_store) uses context to populate KERNEL sources
 
-    if let Op::Kernel { sources, .. } = result.op() {
+    // Extract KERNEL from result (may be wrapped in AFTER structure)
+    let kernel = extract_kernel(&result).expect("Pipeline should create a KERNEL");
+
+    if let Op::Kernel { sources, .. } = kernel.op() {
         // Sources should include the DEFINE_GLOBAL created in stage 1
         assert_eq!(sources.len(), 1, "KERNEL should have 1 source (the buffer from stage 1)");
         assert!(matches!(sources[0].op(), Op::DefineGlobal(0)), "Source should be DEFINE_GLOBAL(0)");
     } else {
-        panic!("Expected KERNEL operation");
+        panic!("Expected KERNEL operation, got {:?}", kernel.op());
     }
 }
 

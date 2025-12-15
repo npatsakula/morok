@@ -72,6 +72,14 @@ pub fn rangeify_with_map(
     sink = result.root;
     all_becomes.extend(result.becomes_map);
 
+    // Step 2.5: Split large reductions BEFORE ReduceAxis → REDUCE conversion
+    // split_reduceop needs ReduceAxis (not REDUCE), so it must run before Step 3
+    let mut split_config = super::kernel::SplitReduceOpConfig::default();
+    let split_matcher = super::patterns::split_reduceop_patterns();
+    let result = graph_rewrite_with_map(&split_matcher, sink, &mut split_config);
+    sink = result.root;
+    all_becomes.extend(result.becomes_map);
+
     // Step 3: Apply core rangeify transformation (bottom-up)
     // This includes: bufferize transform, movement op removal, ReduceAxis → REDUCE conversion
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
@@ -112,10 +120,10 @@ pub fn rangeify_with_map(
         all_becomes.extend(result.becomes_map);
     }
 
-    // Step 7: Reduction simplifications
-    let mut split_config = super::kernel::SplitReduceOpConfig::default();
+    // Step 7: Reduction simplifications (reduce_unparented, reduce_collapse)
+    // These match Op::Reduce, so must run AFTER ReduceAxis → REDUCE conversion
     let reduction_matcher = super::patterns::reduction_simplify_patterns();
-    let result = graph_rewrite_with_map(&reduction_matcher, sink, &mut split_config);
+    let result = graph_rewrite_with_map(&reduction_matcher, sink, &mut ());
     sink = result.root;
     all_becomes.extend(result.becomes_map);
 
@@ -227,11 +235,7 @@ pub(crate) fn transform_single_source(
         // If so, skip wrapping here - the inner source should be wrapped first
         for inner_src in src.op().sources() {
             if ctx.should_realize(&inner_src) {
-                debug!(
-                    src.id = src.id,
-                    inner_src.id = inner_src.id,
-                    "Skipping - inner source also needs realization"
-                );
+                debug!(src.id = src.id, inner_src.id = inner_src.id, "Skipping - inner source also needs realization");
                 // Return the source as-is - inner source will be wrapped when accessed
                 return Arc::clone(src);
             }
