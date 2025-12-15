@@ -41,10 +41,10 @@ pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         // AFTER(passthrough, deps) - check deps for END(KERNEL)
         Op::After { deps, .. } => {
             for dep in deps.iter() {
-                if let Op::End { computation, .. } = dep.op() {
-                    if matches!(computation.op(), Op::Kernel { .. }) {
-                        return Some(computation.clone());
-                    }
+                if let Op::End { computation, .. } = dep.op()
+                    && matches!(computation.op(), Op::Kernel { .. })
+                {
+                    return Some(computation.clone());
                 }
                 // Also check if dep is directly a KERNEL
                 if matches!(dep.op(), Op::Kernel { .. }) {
