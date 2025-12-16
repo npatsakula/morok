@@ -100,16 +100,16 @@ impl UOp {
     /// Create a DefineVar operation for range-bounded variables.
     ///
     /// Used in testing and symbolic analysis to define variables with known ranges.
-    /// Range always starts at 0 (following Tinygrad's architecture where RANGE = size iterator).
-    pub fn var(name: impl Into<String>, dtype: DType, max_val: i64) -> Arc<Self> {
-        Self::new(Op::DefineVar { name: name.into(), max_val }, dtype)
+    /// Range is [min_val, max_val] inclusive.
+    pub fn var(name: impl Into<String>, dtype: DType, min_val: i64, max_val: i64) -> Arc<Self> {
+        Self::new(Op::DefineVar { name: name.into(), min_val, max_val }, dtype)
     }
 
-    /// Define a symbolic variable with known upper bound for range analysis.
+    /// Define a symbolic variable with known bounds for range analysis.
     ///
-    /// Range starts at 0 (RANGE = size iterator, SHRINK = offset handler).
-    pub fn define_var(name: String, max_val: i64) -> Arc<Self> {
-        Self::new(Op::DefineVar { name, max_val }, DType::Index)
+    /// Range is [min_val, max_val] inclusive.
+    pub fn define_var(name: String, min_val: i64, max_val: i64) -> Arc<Self> {
+        Self::new(Op::DefineVar { name, min_val, max_val }, DType::Index)
     }
 
     /// Bind concrete value to symbolic variable.

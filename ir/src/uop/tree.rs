@@ -100,7 +100,7 @@ fn format_node(uop: &Arc<UOp>) -> String {
         Op::Const(val) => format!("CONST({:?})", val.0),
         Op::DefineGlobal(id) => format!("DEFINE_GLOBAL({})", id),
         Op::DefineLocal(id) => format!("DEFINE_LOCAL({})", id),
-        Op::DefineVar { name, max_val } => format!("DEFINE_VAR('{}', max={})", name, max_val),
+        Op::DefineVar { name, min_val, max_val } => format!("DEFINE_VAR('{}', min={}, max={})", name, min_val, max_val),
         Op::Buffer { size, .. } => format!("BUFFER(size={})", size),
         Op::Bufferize { .. } => "BUFFERIZE".to_string(),
         Op::Load { .. } => "LOAD".to_string(),

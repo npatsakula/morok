@@ -12,7 +12,7 @@ use crate::symbolic::symbolic_simple;
 fn test_lt_always_true() {
     // idx in [0, 15], size = 32
     // idx < size is always true
-    let idx = UOp::var("idx", DType::Int32, 15);
+    let idx = UOp::var("idx", DType::Int32, 0, 15);
     let size = UOp::native_const(32i32);
     let check = idx.try_cmplt(&size).unwrap();
 
@@ -30,7 +30,7 @@ fn test_lt_always_true() {
 fn test_lt_unknown() {
     // idx in [0, 100], size = 50
     // idx < size could be true or false
-    let idx = UOp::var("idx", DType::Int32, 100);
+    let idx = UOp::var("idx", DType::Int32, 0, 100);
     let size = UOp::native_const(50i32);
     let check = idx.try_cmplt(&size).unwrap();
 
@@ -50,7 +50,7 @@ fn test_lt_unknown() {
 #[test]
 fn test_eq_same_var() {
     // x == x is always true for integers
-    let x = UOp::var("x", DType::Int32, 100);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let check = x.try_cmpeq(&x).unwrap();
 
     let matcher = symbolic_simple();
@@ -66,7 +66,7 @@ fn test_eq_same_var() {
 #[test]
 fn test_ne_same_var() {
     // x != x is always false for integers
-    let x = UOp::var("x", DType::Int32, 100);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let check = x.try_cmpne(&x).unwrap();
 
     let matcher = symbolic_simple();
@@ -82,7 +82,7 @@ fn test_ne_same_var() {
 #[test]
 fn test_cascading_bounds_elimination() {
     // Test that eliminated bounds checks enable further optimizations
-    let idx = UOp::var("idx", DType::Int32, 10);
+    let idx = UOp::var("idx", DType::Int32, 0, 10);
     let size = UOp::native_const(20i32);
 
     // idx < size is always true

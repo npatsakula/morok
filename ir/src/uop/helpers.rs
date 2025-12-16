@@ -183,8 +183,8 @@ impl UOp {
     /// # Examples
     ///
     /// ```ignore
-    /// let x = UOp::var("x", DType::Int32, 10);
-    /// let y = UOp::var("y", DType::Int32, 20);
+    /// let x = UOp::var("x", DType::Int32, 0, 10);
+    /// let y = UOp::var("y", DType::Int32, 0, 20);
     /// let expr = x.try_add_op(&y).unwrap();
     ///
     /// let deps = expr.backward_slice();
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_const_factor_multiplication() {
-        let x = UOp::var("x", DType::Int32, 100);
+        let x = UOp::var("x", DType::Int32, 0, 100);
         let c = UOp::const_(DType::Int32, ConstValue::Int(6));
         let mul = x.try_mul(&c).unwrap();
         assert_eq!(mul.const_factor(), 6);
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_pop_const_with_constant() {
-        let x = UOp::var("x", DType::Int32, 100);
+        let x = UOp::var("x", DType::Int32, 0, 100);
         let c = UOp::const_(DType::Int32, ConstValue::Int(5));
         let add = x.try_add(&c).unwrap();
 
@@ -495,8 +495,8 @@ mod tests {
 
     #[test]
     fn test_pop_const_without_constant() {
-        let x = UOp::var("x", DType::Int32, 100);
-        let y = UOp::var("y", DType::Int32, 100);
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let y = UOp::var("y", DType::Int32, 0, 100);
         let add = x.try_add(&y).unwrap();
 
         let (rest, const_val) = add.pop_const(BinaryOp::Add);
@@ -507,9 +507,9 @@ mod tests {
 
     #[test]
     fn test_split_uop_chain() {
-        let x = UOp::var("x", DType::Int32, 100);
-        let y = UOp::var("y", DType::Int32, 100);
-        let z = UOp::var("z", DType::Int32, 100);
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let y = UOp::var("y", DType::Int32, 0, 100);
+        let z = UOp::var("z", DType::Int32, 0, 100);
 
         // Build: x + y + z = (x + y) + z
         let xy = x.try_add(&y).unwrap();
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn test_split_uop_single() {
-        let x = UOp::var("x", DType::Int32, 100);
+        let x = UOp::var("x", DType::Int32, 0, 100);
         let terms = x.split_uop(BinaryOp::Add);
 
         assert_eq!(terms.len(), 1);

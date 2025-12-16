@@ -199,8 +199,8 @@ fn test_nested_constant_folding() {
 fn test_noop_fold_non_const_operations() {
     // INDEX(BUFFERIZE(x, R), R) should fold to x even for non-constant operations
     // Use symbolic variables instead of define_global (which requires pointer dtype)
-    let x = UOp::var("x", DType::Float32, 100);
-    let y = UOp::var("y", DType::Float32, 100);
+    let x = UOp::var("x", DType::Float32, 0, 100);
+    let y = UOp::var("y", DType::Float32, 0, 100);
 
     let add = x.try_add(&y).unwrap();
 

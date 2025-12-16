@@ -97,7 +97,7 @@ fn test_end_partial_dead_ranges_removed() {
 #[test]
 fn test_reduce_add_empty_to_zero() {
     // REDUCE(x, [RANGE(0)], Add) → Const(0)
-    let src = UOp::var("x", DType::Int32, 100);
+    let src = UOp::var("x", DType::Int32, 0, 100);
     let dead_range = UOp::range_const(0, 0);
     let reduce = UOp::reduce(src, smallvec![dead_range], ReduceOp::Add);
 
@@ -110,7 +110,7 @@ fn test_reduce_add_empty_to_zero() {
 #[test]
 fn test_reduce_mul_empty_to_one() {
     // REDUCE(x, [RANGE(-5)], Mul) → Const(1)
-    let src = UOp::var("x", DType::Int32, 100);
+    let src = UOp::var("x", DType::Int32, 0, 100);
     let dead_range = UOp::range_const(-5, 0);
     let reduce = UOp::reduce(src, smallvec![dead_range], ReduceOp::Mul);
 
@@ -123,7 +123,7 @@ fn test_reduce_mul_empty_to_one() {
 #[test]
 fn test_reduce_max_empty_to_min() {
     // REDUCE(x, [RANGE(0)], Max) → Const(INT32_MIN)
-    let src = UOp::var("x", DType::Int32, 100);
+    let src = UOp::var("x", DType::Int32, 0, 100);
     let dead_range = UOp::range_const(0, 0);
     let reduce = UOp::reduce(src, smallvec![dead_range], ReduceOp::Max);
 
@@ -145,7 +145,7 @@ fn test_reduce_max_empty_to_min() {
 fn test_range_symbolic_dead() {
     // size ∈ [0,5], RANGE(size - 10) → Const(0)
     // vmax(size - 10) = 5 - 10 = -5 ≤ 0, so dead
-    let size = UOp::var("size", DType::Int32, 5);
+    let size = UOp::var("size", DType::Int32, 0, 5);
     let ten = UOp::native_const(10i32);
     let count = size.try_sub(&ten).expect("SUB should succeed");
     let range = UOp::range(count, 0);
@@ -217,7 +217,7 @@ fn test_end_multiple_dead_ranges_unwrapped() {
 #[test]
 fn test_reduce_multiple_dead_ranges() {
     // REDUCE(x, [RANGE(0), RANGE(-5)], Add) → Const(0)
-    let src = UOp::var("x", DType::Int32, 100);
+    let src = UOp::var("x", DType::Int32, 0, 100);
     let dead1 = UOp::range_const(0, 0);
     let dead2 = UOp::range_const(-5, 0);
     let reduce = UOp::reduce(src, smallvec![dead1, dead2], ReduceOp::Add);

@@ -881,7 +881,7 @@ pub fn renumber_range(range: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<U
             }
         };
 
-        let var = UOp::define_var(var_name, vmax);
+        let var = UOp::define_var(var_name, 0, vmax);
         let new_axis_id = AxisId::Renumbered(ctx.next_range());
         let renumbered_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);
         return Some(UOp::bind(var, renumbered_range));
@@ -907,7 +907,7 @@ pub fn cleanup_const(op: &Arc<UOp>, _ctx: &mut KernelContext) -> Option<Arc<UOp>
 
     let cleaned = match op.op() {
         Op::Const(val) => UOp::const_(op.dtype(), val.0),
-        Op::DefineVar { name, max_val } => UOp::var(name.clone(), op.dtype(), *max_val),
+        Op::DefineVar { name, min_val, max_val } => UOp::var(name.clone(), op.dtype(), *min_val, *max_val),
         _ => unreachable!(),
     };
 

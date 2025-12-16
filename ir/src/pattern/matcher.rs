@@ -383,7 +383,7 @@ impl OpKey {
             m.insert(discriminant(&Op::PtrCat { sources: SmallVec::new() }), OpKey::PtrCat);
 
             // Symbolic/Define
-            m.insert(discriminant(&Op::DefineVar { name: String::new(), max_val: 0 }), OpKey::DefineVar);
+            m.insert(discriminant(&Op::DefineVar { name: String::new(), min_val: 0, max_val: 0 }), OpKey::DefineVar);
             m.insert(discriminant(&Op::Bind { var: noop(), value: noop() }), OpKey::Bind);
             m.insert(discriminant(&Op::DefineReg { size: 0 }), OpKey::DefineReg);
 

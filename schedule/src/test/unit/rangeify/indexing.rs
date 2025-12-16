@@ -34,7 +34,7 @@ fn test_indexing_context_new_range() {
 #[test]
 fn test_indexing_context_realize_map() {
     let mut ctx = IndexingContext::new();
-    let x = UOp::var("x", DType::Float32, i64::MAX);
+    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
 
     assert!(!ctx.should_realize(&x));
 
@@ -91,7 +91,7 @@ fn test_symbolic_size_range() {
     let mut ctx = IndexingContext::new();
 
     // Create symbolic size
-    let n = UOp::var("n", DType::Index, i64::MAX);
+    let n = UOp::var("n", DType::Index, 0, i64::MAX);
     let symbolic_size = SInt::Symbolic(n.clone());
 
     let range = ctx.new_range(&symbolic_size, AxisType::Loop);
@@ -109,7 +109,7 @@ fn test_symbolic_size_range() {
 #[test]
 fn test_set_get_ranges() {
     let mut ctx = IndexingContext::new();
-    let x = UOp::var("x", DType::Float32, i64::MAX);
+    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
 
     let r0 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
     let r1 = ctx.new_range(&SInt::Const(20), AxisType::Loop);
@@ -139,7 +139,7 @@ fn test_set_get_ranges() {
 #[test]
 fn test_mark_realize_specific_axes() {
     let mut ctx = IndexingContext::new();
-    let x = UOp::var("x", DType::Float32, i64::MAX);
+    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
 
     // Mark specific axes
     ctx.mark_realize(&x, vec![0, 2]);
@@ -154,7 +154,7 @@ fn test_mark_realize_specific_axes() {
 #[test]
 fn test_get_realize_axes_none() {
     let ctx = IndexingContext::new();
-    let x = UOp::var("x", DType::Float32, i64::MAX);
+    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
 
     // Not in realize map
     assert!(ctx.get_realize_axes(&x).is_none());

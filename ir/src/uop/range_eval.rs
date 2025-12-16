@@ -43,8 +43,8 @@ pub fn compute_vmin_vmax(uop: &Arc<UOp>) -> (ConstValue, ConstValue) {
             compute_ternary_range(*op, *cond_min, *cond_max, *true_min, *true_max, *false_min, *false_max, &uop.dtype)
         }
 
-        // DefineVar always starts at 0 (RANGE = size iterator)
-        Op::DefineVar { max_val, .. } => (ConstValue::Int(0), ConstValue::Int(*max_val)),
+        // DefineVar uses explicit min_val and max_val bounds
+        Op::DefineVar { min_val, max_val, .. } => (ConstValue::Int(*min_val), ConstValue::Int(*max_val)),
 
         // Range operations go from 0 to end-1
         Op::Range { end, .. } => {

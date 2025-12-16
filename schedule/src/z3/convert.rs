@@ -58,7 +58,7 @@ impl Z3Context {
         let z3_expr = match uop.op() {
             Op::Const(cv) => Self::convert_const(&cv.0)?,
 
-            Op::DefineVar { name, max_val } => self.convert_var(name, *max_val)?,
+            Op::DefineVar { name, min_val, max_val } => self.convert_var(name, *min_val, *max_val)?,
 
             Op::Range { end, .. } => {
                 // Range represents loop variable: [0, end)
@@ -150,12 +150,12 @@ impl Z3Context {
     }
 
     /// Convert a variable with bounds to Z3.
-    fn convert_var(&mut self, name: &str, max_val: i64) -> Result<Dynamic, ConversionError> {
+    fn convert_var(&mut self, name: &str, min_val: i64, max_val: i64) -> Result<Dynamic, ConversionError> {
         let var = Int::new_const(name);
-        let min_z3 = Int::from_i64(0);
+        let min_z3 = Int::from_i64(min_val);
         let max_z3 = Int::from_i64(max_val);
 
-        // Add constraints: 0 <= var <= max_val
+        // Add constraints: min_val <= var <= max_val
         self.solver.assert(var.ge(&min_z3));
         self.solver.assert(var.le(&max_z3));
 
@@ -353,7 +353,7 @@ mod tests {
     fn test_convert_variable() {
         let mut z3ctx = Z3Context::new();
 
-        let var = UOp::var("x", DType::Int32, 100);
+        let var = UOp::var("x", DType::Int32, 0, 100);
         let z3_expr = z3ctx.convert_uop(&var).expect("Should convert");
 
         assert!(z3_expr.as_int().is_some());

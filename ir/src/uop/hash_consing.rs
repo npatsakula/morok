@@ -115,7 +115,7 @@ enum OpData {
     VConstValues(Vec<ConstValueHash>),
 
     // Symbolic/Define operations
-    DefineVarData(String, i64),
+    DefineVarData(String, i64, i64), // (name, min_val, max_val)
     DefineRegSize(usize),
 
     // Advanced operations
@@ -192,7 +192,7 @@ impl UOpKey {
             Op::VConst { values } => OpData::VConstValues(values.iter().map(|v| ConstValueHash(*v)).collect()),
 
             // Symbolic/Define operations
-            Op::DefineVar { name, max_val } => OpData::DefineVarData(name.clone(), *max_val),
+            Op::DefineVar { name, min_val, max_val } => OpData::DefineVarData(name.clone(), *min_val, *max_val),
             Op::DefineReg { size } => OpData::DefineRegSize(*size),
 
             // Advanced operations

@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_uop_depth() {
-        let x = UOp::var("x", DType::Int32, 100);
+        let x = UOp::var("x", DType::Int32, 0, 100);
         assert_eq!(uop_depth(&x), 0);
 
         let x_plus_1 = UOp::new(
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_uop_op_count() {
-        let x = UOp::var("x", DType::Int32, 100);
+        let x = UOp::var("x", DType::Int32, 0, 100);
         assert_eq!(uop_op_count(&x), 0);
 
         let x_plus_1 = UOp::new(

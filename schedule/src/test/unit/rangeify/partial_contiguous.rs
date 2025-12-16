@@ -1543,7 +1543,7 @@ fn test_symbolic_buffer_size_handling() {
     let matcher = buffer_removal_with_pcontig();
 
     // Create symbolic range using DEFINE_VAR
-    let batch_size = UOp::define_var("batch".to_string(), 128);
+    let batch_size = UOp::define_var("batch".to_string(), 0, 128);
     let symbolic_range = UOp::range_axis(batch_size, AxisId::Renumbered(0), AxisType::Loop);
 
     let buffer = create_test_buffer(40, DType::Float32, 1);
@@ -1577,8 +1577,8 @@ fn test_all_symbolic_sizes() {
     let matcher = buffer_removal_with_pcontig();
 
     // Create symbolic ranges
-    let n = UOp::define_var("n".to_string(), 1024);
-    let m = UOp::define_var("m".to_string(), 1024);
+    let n = UOp::define_var("n".to_string(), 0, 1024);
+    let m = UOp::define_var("m".to_string(), 0, 1024);
     let range_n = UOp::range_axis(n, AxisId::Renumbered(0), AxisType::Loop);
     let range_m = UOp::range_axis(m, AxisId::Renumbered(1), AxisType::Loop);
 
@@ -1614,7 +1614,7 @@ fn test_mixed_concrete_symbolic_sizes() {
     );
 
     // Symbolic range
-    let batch = UOp::define_var("batch".to_string(), 64);
+    let batch = UOp::define_var("batch".to_string(), 0, 64);
     let symbolic_range = UOp::range_axis(batch, AxisId::Renumbered(1), AxisType::Loop);
 
     let buffer = create_test_buffer(40, DType::Float32, 1);

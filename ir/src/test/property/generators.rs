@@ -198,7 +198,7 @@ pub fn arb_const_uop(dtype: DType) -> impl Strategy<Value = Arc<UOp>> {
 
 /// Generate a variable UOp with bounded range.
 pub fn arb_var_uop(dtype: DType) -> impl Strategy<Value = Arc<UOp>> {
-    ("[a-z]", 1i64..100).prop_map(move |(name, max_val)| UOp::var(name, dtype.clone(), max_val))
+    ("[a-z]", 1i64..100).prop_map(move |(name, max_val)| UOp::var(name, dtype.clone(), 0, max_val))
 }
 
 /// Generate a simple UOp (constant or variable).

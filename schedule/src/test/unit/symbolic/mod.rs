@@ -134,7 +134,7 @@ fn test_symbolic_simple_const_folding() {
 fn test_self_division() {
     // Test: x // x -> 1
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let div = x.try_div(&x).unwrap();
 
     let result = matcher.rewrite(&div, &mut ());
@@ -152,7 +152,7 @@ fn test_self_division() {
 fn test_division_by_neg_one() {
     // Test: x // -1 -> -x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let neg_one = UOp::native_const(-1i32);
     let div = x.try_div(&neg_one).unwrap();
 
@@ -171,8 +171,8 @@ fn test_division_by_neg_one() {
 fn test_idempotent_modulo() {
     // Test: (x % y) % y -> x % y
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
 
     // Build (x % y) % y
     let inner_mod = x.try_mod(&y).unwrap();
@@ -195,7 +195,7 @@ fn test_idempotent_modulo() {
 fn test_idempotent_and() {
     // Test: x & x -> x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let and_op = x.try_and_op(&x).unwrap();
 
     let result = matcher.rewrite(&and_op, &mut ());
@@ -209,7 +209,7 @@ fn test_idempotent_and() {
 fn test_idempotent_or() {
     // Test: x | x -> x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let or_op = x.try_or_op(&x).unwrap();
 
     let result = matcher.rewrite(&or_op, &mut ());
@@ -223,8 +223,8 @@ fn test_idempotent_or() {
 fn test_non_idempotent_and() {
     // Test: x & y (different variables) -> no match
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let and_op = x.try_and_op(&y).unwrap();
 
     let result = matcher.rewrite(&and_op, &mut ());
@@ -240,7 +240,7 @@ fn test_non_idempotent_and() {
 fn test_self_comparison_lt() {
     // Test: x < x -> False
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let lt = x.try_cmplt(&x).unwrap();
 
     let result = matcher.rewrite(&lt, &mut ());
@@ -258,7 +258,7 @@ fn test_self_comparison_lt() {
 fn test_self_modulo() {
     // Test: x % x -> 0
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let modulo = x.try_mod(&x).unwrap();
 
     let result = matcher.rewrite(&modulo, &mut ());
@@ -276,7 +276,7 @@ fn test_self_modulo() {
 fn test_self_inequality_int() {
     // Test: x != x -> False (for integers)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let ne = x.try_cmpne(&x).unwrap();
 
     let result = matcher.rewrite(&ne, &mut ());
@@ -294,7 +294,7 @@ fn test_self_inequality_int() {
 fn test_self_inequality_float_no_fold() {
     // Test: x != x (for floats) -> no match (NaN != NaN is true)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Float32, i64::MAX);
+    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
     let ne = x.try_cmpne(&x).unwrap();
 
     let result = matcher.rewrite(&ne, &mut ());
@@ -308,7 +308,7 @@ fn test_self_inequality_float_no_fold() {
 fn test_float_self_division() {
     // Test: x / x -> 1.0 (float division)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Float32, i64::MAX);
+    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
     let div = x.try_div(&x).unwrap();
 
     let result = matcher.rewrite(&div, &mut ());
@@ -326,8 +326,8 @@ fn test_float_self_division() {
 fn test_division_cancel_multiplication() {
     // Test: (x * y) / y -> x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Float32, i64::MAX);
-    let y = UOp::var("y", DType::Float32, i64::MAX);
+    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Float32, 0, i64::MAX);
 
     let mul = x.try_mul(&y).unwrap();
     let div = mul.try_div(&y).unwrap();
@@ -343,8 +343,8 @@ fn test_division_cancel_multiplication() {
 fn test_int_division_cancel_multiplication() {
     // Test: (x * y) // y -> x (integer division)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
 
     let mul = x.try_mul(&y).unwrap();
     let div = mul.try_div(&y).unwrap();
@@ -418,7 +418,7 @@ fn test_cast_bool_to_int_constant() {
 fn test_noop_cast_same_dtype() {
     // Test: x.cast(dtype) -> x if same dtype
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let cast = UOp::cast(x.clone(), DType::Int32);
 
     let result = matcher.rewrite(&cast, &mut ());
@@ -432,7 +432,7 @@ fn test_noop_cast_same_dtype() {
 fn test_double_cast_collapse() {
     // Test: x.cast(Float32).cast(Int32) -> x.cast(Int32)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
 
     // First cast: Int32 -> Float32
     let inner_cast = UOp::cast(x.clone(), DType::Float32);
@@ -457,7 +457,7 @@ fn test_double_cast_collapse() {
 fn test_cast_non_constant_no_fold() {
     // Test: cast(variable) -> no constant folding (only dtype change)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let cast = UOp::cast(x.clone(), DType::Float32);
 
     let result = matcher.rewrite(&cast, &mut ());
@@ -472,7 +472,7 @@ fn test_cast_non_constant_no_fold() {
 fn test_combine_identical_terms() {
     // Test: x + x → 2*x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let add = x.try_add(&x).unwrap();
 
     let result = matcher.rewrite(&add, &mut ());
@@ -504,7 +504,7 @@ fn test_combine_identical_terms() {
 fn test_combine_terms_with_coefficients() {
     // Test: (3 * x) + (5 * x) → 8 * x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let term1 = c3.try_mul(&x).unwrap();
@@ -533,7 +533,7 @@ fn test_combine_terms_with_coefficients() {
 fn test_combine_terms_reversed_multiplication() {
     // Test: (x * 3) + (x * 5) → x * 8
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let term1 = x.try_mul(&c3).unwrap();
@@ -562,8 +562,8 @@ fn test_combine_terms_reversed_multiplication() {
 fn test_no_combine_different_variables() {
     // Test: (3 * x) + (5 * y) → no rewrite (different variables)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let term1 = c3.try_mul(&x).unwrap();
@@ -581,7 +581,7 @@ fn test_no_combine_different_variables() {
 fn test_alu_fold_addition_chain() {
     // Test: (x + 3) + 5 → x + 8
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let add1 = x.try_add(&c3).unwrap();
@@ -609,7 +609,7 @@ fn test_alu_fold_addition_chain() {
 fn test_alu_fold_multiplication_chain() {
     // Test: (x * 2) * 3 → x * 6
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c2 = UOp::native_const(2i32);
     let c3 = UOp::native_const(3i32);
     let mul1 = x.try_mul(&c2).unwrap();
@@ -637,7 +637,7 @@ fn test_alu_fold_multiplication_chain() {
 fn test_alu_fold_sub_then_add_positive() {
     // Test: (x - 3) + 5 → x + 2
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let sub = x.try_sub(&c3).unwrap();
@@ -665,7 +665,7 @@ fn test_alu_fold_sub_then_add_positive() {
 fn test_alu_fold_sub_then_add_negative() {
     // Test: (x - 5) + 3 → x - 2
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c5 = UOp::native_const(5i32);
     let c3 = UOp::native_const(3i32);
     let sub = x.try_sub(&c5).unwrap();
@@ -693,7 +693,7 @@ fn test_alu_fold_sub_then_add_negative() {
 fn test_alu_fold_add_then_sub_positive() {
     // Test: (x + 5) - 3 → x + 2
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c5 = UOp::native_const(5i32);
     let c3 = UOp::native_const(3i32);
     let add = x.try_add(&c5).unwrap();
@@ -721,7 +721,7 @@ fn test_alu_fold_add_then_sub_positive() {
 fn test_alu_fold_add_then_sub_negative() {
     // Test: (x + 3) - 5 → x - 2
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let add = x.try_add(&c3).unwrap();
@@ -751,8 +751,8 @@ fn test_alu_fold_add_then_sub_negative() {
 fn test_division_cancel_with_multiplication() {
     // Test: (a * b) // b → a
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
-    let b = UOp::var("b", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
+    let b = UOp::var("b", DType::Int32, 0, i64::MAX);
     let mul = a.try_mul(&b).unwrap();
     let div = mul.try_div(&b).unwrap();
 
@@ -769,7 +769,7 @@ fn test_division_cancel_with_multiplication() {
 fn test_division_chain_folding() {
     // Test: (a // 2) // 3 → a // 6
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c2 = UOp::native_const(2i32);
     let c3 = UOp::native_const(3i32);
     let div1 = a.try_div(&c2).unwrap();
@@ -797,7 +797,7 @@ fn test_division_chain_folding() {
 fn test_exact_division_with_divides_helper() {
     // Test: (12 * x) // 3 → 4 * x (using divides helper)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c12 = UOp::native_const(12i32);
     let c3 = UOp::native_const(3i32);
     let mul = c12.try_mul(&x).unwrap();
@@ -825,8 +825,8 @@ fn test_exact_division_with_divides_helper() {
 fn test_modulo_with_divisible_left_operand() {
     // Test: (6 * x + y) % 3 → y % 3 (since 6*x is divisible by 3)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let c6 = UOp::native_const(6i32);
     let c3 = UOp::native_const(3i32);
     let mul = c6.try_mul(&x).unwrap();
@@ -851,8 +851,8 @@ fn test_modulo_with_divisible_left_operand() {
 fn test_modulo_with_divisible_right_operand() {
     // Test: (x + 9 * y) % 3 → x % 3 (since 9*y is divisible by 3)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let c9 = UOp::native_const(9i32);
     let c3 = UOp::native_const(3i32);
     let mul = c9.try_mul(&y).unwrap();
@@ -877,8 +877,8 @@ fn test_modulo_with_divisible_right_operand() {
 fn test_modulo_no_simplification() {
     // Test: (x + y) % 3 → no simplification (neither divisible by 3)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let add = x.try_add(&y).unwrap();
     let modulo = add.try_mod(&c3).unwrap();
@@ -894,8 +894,8 @@ fn test_modulo_no_simplification() {
 fn test_distribute_division_over_addition() {
     // Test: (6*x + 9*y) // 3 → (2*x) + (3*y)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let c6 = UOp::native_const(6i32);
     let c9 = UOp::native_const(9i32);
     let c3 = UOp::native_const(3i32);
@@ -940,8 +940,8 @@ fn test_distribute_division_over_addition() {
 fn test_distribute_division_over_subtraction() {
     // Test: (12*x - 6*y) // 3 → (4*x) - (2*y)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let c12 = UOp::native_const(12i32);
     let c6 = UOp::native_const(6i32);
     let c3 = UOp::native_const(3i32);
@@ -982,8 +982,8 @@ fn test_distribute_division_over_subtraction() {
 fn test_distribute_multiplication_over_addition() {
     // Test: 2 * (x + y) → (2*x) + (2*y)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let c2 = UOp::native_const(2i32);
 
     let add = x.try_add(&y).unwrap();
@@ -1016,8 +1016,8 @@ fn test_distribute_multiplication_over_addition() {
 fn test_distribute_multiplication_over_addition_reversed() {
     // Test: (x + y) * 3 → (x*3) + (y*3)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
 
     let add = x.try_add(&y).unwrap();
@@ -1051,8 +1051,8 @@ fn test_distribute_large_constant() {
     // Test: (x + y) * 100 → (x*100) + (y*100)
     // Note: Distributes unconditionally without size checks
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
-    let y = UOp::var("y", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
     let c100 = UOp::native_const(100i32);
 
     let add = x.try_add(&y).unwrap();
@@ -1099,7 +1099,7 @@ fn test_compositional_optimization_minimal_failure() {
     let matcher = symbolic_simple();
 
     // Build the expression: (0 + var("a")) * 2
-    let a_var = UOp::var("a", DType::Int32, 1);
+    let a_var = UOp::var("a", DType::Int32, 0, 1);
     let zero = UOp::native_const(0i32);
     let two = UOp::native_const(2i32);
     let add = zero.try_add(&a_var).unwrap();
@@ -1164,7 +1164,7 @@ fn test_multiplication_chain_folding() {
     // This is the simplified version of the failing case
 
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c2 = UOp::native_const(2i32);
 
     // Build (a * 2) * 2
@@ -1207,7 +1207,7 @@ fn test_multiplication_chain_folding() {
 fn test_double_not_elimination() {
     // !!x → x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Bool, 1);
+    let x = UOp::var("x", DType::Bool, 0, 1);
     let not_x = x.not();
     let not_not_x = not_x.not();
 
@@ -1222,7 +1222,7 @@ fn test_double_not_elimination() {
 fn test_double_not_int() {
     // !!x → x (for integers - bitwise NOT)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let not_x = x.not();
     let not_not_x = not_x.not();
 
@@ -1237,7 +1237,7 @@ fn test_double_not_int() {
 fn test_xor_self_cancellation() {
     // x ^ x → 0
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 100);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let xor_self = x.try_xor_op(&x).unwrap();
 
     let result = matcher.rewrite(&xor_self, &mut ());
@@ -1257,7 +1257,7 @@ fn test_xor_self_cancellation() {
 fn test_double_neg_elimination() {
     // -(-x) → x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let neg_x = x.neg();
     let neg_neg_x = neg_x.neg();
 
@@ -1272,7 +1272,7 @@ fn test_double_neg_elimination() {
 fn test_double_neg_float() {
     // -(-x) → x (for floats)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Float32, i64::MAX);
+    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
     let neg_x = x.neg();
     let neg_neg_x = neg_x.neg();
 
@@ -1289,7 +1289,7 @@ fn test_double_neg_float() {
 fn test_max_self_identity() {
     // max(x, x) → x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 100);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let max_self = x.try_max(&x).unwrap();
 
     let result = matcher.rewrite(&max_self, &mut ());
@@ -1303,7 +1303,7 @@ fn test_max_self_identity() {
 fn test_max_self_float() {
     // max(x, x) → x (for floats)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Float32, i64::MAX);
+    let x = UOp::var("x", DType::Float32, 0, i64::MAX);
     let max_self = x.try_max(&x).unwrap();
 
     let result = matcher.rewrite(&max_self, &mut ());
@@ -1319,7 +1319,7 @@ fn test_max_self_float() {
 fn test_pow_zero_is_one() {
     // x ** 0 → 1
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 100);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let zero = UOp::native_const(0i32);
     let pow = x.try_pow(&zero).unwrap();
 
@@ -1338,7 +1338,7 @@ fn test_pow_zero_is_one() {
 fn test_pow_one_is_identity() {
     // x ** 1 → x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 100);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let one = UOp::native_const(1i32);
     let pow = x.try_pow(&one).unwrap();
 
@@ -1353,7 +1353,7 @@ fn test_pow_one_is_identity() {
 fn test_pow_float_zero() {
     // x ** 0.0 → 1.0
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Float32, 100);
+    let x = UOp::var("x", DType::Float32, 0, 100);
     let zero = UOp::native_const(0.0f32);
     let pow = x.try_pow(&zero).unwrap();
 
@@ -1374,8 +1374,8 @@ fn test_pow_float_zero() {
 fn test_where_same_branches() {
     // where(cond, x, x) → x
     let matcher = symbolic_simple();
-    let cond = UOp::var("cond", DType::Bool, 1);
-    let x = UOp::var("x", DType::Int32, 100);
+    let cond = UOp::var("cond", DType::Bool, 0, 1);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let where_op = UOp::try_where(cond, Arc::clone(&x), Arc::clone(&x)).unwrap();
 
     let result = matcher.rewrite(&where_op, &mut ());
@@ -1389,7 +1389,7 @@ fn test_where_same_branches() {
 fn test_where_bool_true_false() {
     // where(x, true, false) → x (for bool x)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Bool, 1);
+    let x = UOp::var("x", DType::Bool, 0, 1);
     let true_val = UOp::native_const(true);
     let false_val = UOp::native_const(false);
     let where_op = UOp::try_where(Arc::clone(&x), true_val, false_val).unwrap();
@@ -1405,7 +1405,7 @@ fn test_where_bool_true_false() {
 fn test_where_bool_false_true() {
     // where(x, false, true) → !x (for bool x)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Bool, 1);
+    let x = UOp::var("x", DType::Bool, 0, 1);
     let false_val = UOp::native_const(false);
     let true_val = UOp::native_const(true);
     let where_op = UOp::try_where(Arc::clone(&x), false_val, true_val).unwrap();
@@ -1426,10 +1426,10 @@ fn test_where_bool_false_true() {
 fn test_where_negated_condition() {
     // where(!cond, t, f) → where(cond, f, t)
     let matcher = symbolic_simple();
-    let cond = UOp::var("cond", DType::Bool, 1);
+    let cond = UOp::var("cond", DType::Bool, 0, 1);
     let not_cond = cond.not();
-    let t = UOp::var("t", DType::Int32, 100);
-    let f = UOp::var("f", DType::Int32, 100);
+    let t = UOp::var("t", DType::Int32, 0, 100);
+    let f = UOp::var("f", DType::Int32, 0, 100);
     let where_op = UOp::try_where(not_cond, Arc::clone(&t), Arc::clone(&f)).unwrap();
 
     let result = matcher.rewrite(&where_op, &mut ());
@@ -1451,8 +1451,8 @@ fn test_where_const_true_condition() {
     // where(true, t, f) → t
     let matcher = symbolic_simple();
     let true_cond = UOp::native_const(true);
-    let t = UOp::var("t", DType::Int32, 100);
-    let f = UOp::var("f", DType::Int32, 100);
+    let t = UOp::var("t", DType::Int32, 0, 100);
+    let f = UOp::var("f", DType::Int32, 0, 100);
     let where_op = UOp::try_where(true_cond, Arc::clone(&t), f).unwrap();
 
     let result = matcher.rewrite(&where_op, &mut ());
@@ -1467,8 +1467,8 @@ fn test_where_const_false_condition() {
     // where(false, t, f) → f
     let matcher = symbolic_simple();
     let false_cond = UOp::native_const(false);
-    let t = UOp::var("t", DType::Int32, 100);
-    let f = UOp::var("f", DType::Int32, 100);
+    let t = UOp::var("t", DType::Int32, 0, 100);
+    let f = UOp::var("f", DType::Int32, 0, 100);
     let where_op = UOp::try_where(false_cond, t, Arc::clone(&f)).unwrap();
 
     let result = matcher.rewrite(&where_op, &mut ());
@@ -1487,7 +1487,7 @@ fn test_where_const_false_condition() {
 fn test_lt_bounds_always_true() {
     // a(0,8) < 77 → true (since max(a)=8 < 77)
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, 8); // range [0, 8]
+    let a = UOp::var("a", DType::Int32, 0, 8); // range [0, 8]
     let c77 = UOp::native_const(77i32);
     let lt = a.try_cmplt(&c77).unwrap();
 
@@ -1506,7 +1506,7 @@ fn test_lt_bounds_always_true() {
 fn test_lt_bounds_always_true_edge() {
     // a(0,8) < 9 → true (since max(a)=8 < 9)
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, 8);
+    let a = UOp::var("a", DType::Int32, 0, 8);
     let c9 = UOp::native_const(9i32);
     let lt = a.try_cmplt(&c9).unwrap();
 
@@ -1525,7 +1525,7 @@ fn test_lt_bounds_always_true_edge() {
 fn test_lt_bounds_indeterminate() {
     // a(0,8) < 5 → indeterminate (could be 0 < 5 = true or 8 < 5 = false)
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, 8);
+    let a = UOp::var("a", DType::Int32, 0, 8);
     let c5 = UOp::native_const(5i32);
     let lt = a.try_cmplt(&c5).unwrap();
 
@@ -1538,7 +1538,7 @@ fn test_lt_bounds_indeterminate() {
 fn test_lt_bounds_always_false() {
     // a(0,8) < 0 → false (since min(a)=0 is not < 0)
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, 8);
+    let a = UOp::var("a", DType::Int32, 0, 8);
     let c0 = UOp::native_const(0i32);
     let lt = a.try_cmplt(&c0).unwrap();
 
@@ -1558,8 +1558,8 @@ fn test_lt_two_vars_always_true() {
     // a(0,4) < b(5,10) → true (since max(a)=4 < min(b)=5)
     // We create b(5,10) as b(0,5) + 5
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, 4); // range [0, 4]
-    let b_base = UOp::var("b", DType::Int32, 5); // range [0, 5]
+    let a = UOp::var("a", DType::Int32, 0, 4); // range [0, 4]
+    let b_base = UOp::var("b", DType::Int32, 0, 5); // range [0, 5]
     let c5 = UOp::native_const(5i32);
     let b = b_base.try_add(&c5).unwrap(); // range [5, 10]
 
@@ -1581,10 +1581,10 @@ fn test_lt_two_vars_always_false() {
     // a(5,10) < b(0,4) → false (since min(a)=5 >= max(b)=4, so 5 < 4 is false)
     // We create a(5,10) as a(0,5) + 5
     let matcher = symbolic_simple();
-    let a_base = UOp::var("a", DType::Int32, 5); // range [0, 5]
+    let a_base = UOp::var("a", DType::Int32, 0, 5); // range [0, 5]
     let c5 = UOp::native_const(5i32);
     let a = a_base.try_add(&c5).unwrap(); // range [5, 10]
-    let b = UOp::var("b", DType::Int32, 4); // range [0, 4]
+    let b = UOp::var("b", DType::Int32, 0, 4); // range [0, 4]
 
     let lt = a.try_cmplt(&b).unwrap();
 
@@ -1604,7 +1604,7 @@ fn test_ge_bounds_always_true() {
     // a(3,8) >= 3 → true (since min(a)=3 >= 3)
     // We create a(3,8) as a(0,5) + 3
     let matcher = symbolic_simple();
-    let a_base = UOp::var("a", DType::Int32, 5); // range [0, 5]
+    let a_base = UOp::var("a", DType::Int32, 0, 5); // range [0, 5]
     let c3 = UOp::native_const(3i32);
     let a = a_base.try_add(&c3).unwrap(); // range [3, 8]
 
@@ -1629,8 +1629,8 @@ fn test_eq_bounds_always_false() {
     // a(0,4) == b(10,20) → false (non-overlapping ranges)
     // We create b(10,20) as b(0,10) + 10
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, 4); // range [0, 4]
-    let b_base = UOp::var("b", DType::Int32, 10); // range [0, 10]
+    let a = UOp::var("a", DType::Int32, 0, 4); // range [0, 4]
+    let b_base = UOp::var("b", DType::Int32, 0, 10); // range [0, 10]
     let c10 = UOp::native_const(10i32);
     let b = b_base.try_add(&c10).unwrap(); // range [10, 20]
 
@@ -1651,8 +1651,8 @@ fn test_eq_bounds_always_false() {
 fn test_ne_bounds_always_true() {
     // a(0,4) != b(10,20) → true (non-overlapping ranges)
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, 4); // range [0, 4]
-    let b_base = UOp::var("b", DType::Int32, 10);
+    let a = UOp::var("a", DType::Int32, 0, 4); // range [0, 4]
+    let b_base = UOp::var("b", DType::Int32, 0, 10);
     let c10 = UOp::native_const(10i32);
     let b = b_base.try_add(&c10).unwrap(); // range [10, 20]
 
@@ -1678,7 +1678,7 @@ fn test_ne_bounds_always_true() {
 fn test_nested_div_div() {
     // (a // 10) // 9 → a // 90
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c10 = UOp::native_const(10i32);
     let c9 = UOp::native_const(9i32);
     let div1 = a.try_div(&c10).unwrap();
@@ -1705,7 +1705,7 @@ fn test_nested_div_div() {
 fn test_nested_mul_mul() {
     // (a * 10) * 9 → a * 90
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c10 = UOp::native_const(10i32);
     let c9 = UOp::native_const(9i32);
     let mul1 = a.try_mul(&c10).unwrap();
@@ -1732,7 +1732,7 @@ fn test_nested_mul_mul() {
 fn test_nested_mod_mod_same_divisor() {
     // (a % 5) % 5 → a % 5 (idempotent modulo)
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c5 = UOp::native_const(5i32);
     let mod1 = a.try_mod(&c5).unwrap();
     let mod2 = mod1.try_mod(&c5).unwrap();
@@ -1754,7 +1754,7 @@ fn test_nested_mod_mod_same_divisor() {
 fn test_nested_add_add() {
     // (a + 3) + 5 → a + 8
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let add1 = a.try_add(&c3).unwrap();
@@ -1781,7 +1781,7 @@ fn test_nested_add_add() {
 fn test_nested_sub_sub() {
     // (a - 3) - 5 → a - 8
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let sub1 = a.try_sub(&c3).unwrap();
@@ -1812,7 +1812,7 @@ fn test_nested_sub_sub() {
 fn test_bool_or_not_tautology() {
     // x | !x → true (for bool type)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Bool, 1); // bool variable
+    let x = UOp::var("x", DType::Bool, 0, 1); // bool variable
     let not_x = x.not();
     let or_op = x.try_or_op(&not_x).unwrap();
 
@@ -1831,7 +1831,7 @@ fn test_bool_or_not_tautology() {
 fn test_bool_and_not_contradiction() {
     // x & !x → false (for bool type)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Bool, 1);
+    let x = UOp::var("x", DType::Bool, 0, 1);
     let not_x = x.not();
     let and_op = x.try_and_op(&not_x).unwrap();
 
@@ -1850,7 +1850,7 @@ fn test_bool_and_not_contradiction() {
 fn test_bool_or_true_absorb() {
     // true | x → true
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Bool, 1);
+    let x = UOp::var("x", DType::Bool, 0, 1);
     let true_const = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let or_op = true_const.try_or_op(&x).unwrap();
 
@@ -1869,7 +1869,7 @@ fn test_bool_or_true_absorb() {
 fn test_bool_and_false_absorb() {
     // false & x → false
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Bool, 1);
+    let x = UOp::var("x", DType::Bool, 0, 1);
     let false_const = UOp::const_(DType::Bool, ConstValue::Bool(false));
     let and_op = false_const.try_and_op(&x).unwrap();
 
@@ -1888,7 +1888,7 @@ fn test_bool_and_false_absorb() {
 fn test_bool_and_true_identity() {
     // true & x → x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Bool, 1);
+    let x = UOp::var("x", DType::Bool, 0, 1);
     let true_const = UOp::const_(DType::Bool, ConstValue::Bool(true));
     let and_op = true_const.try_and_op(&x).unwrap();
 
@@ -1903,7 +1903,7 @@ fn test_bool_and_true_identity() {
 fn test_bool_or_false_identity() {
     // false | x → x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Bool, 1);
+    let x = UOp::var("x", DType::Bool, 0, 1);
     let false_const = UOp::const_(DType::Bool, ConstValue::Bool(false));
     let or_op = false_const.try_or_op(&x).unwrap();
 
@@ -1918,7 +1918,7 @@ fn test_bool_or_false_identity() {
 fn test_lt_const_offset() {
     // (a + 2) < 5 → a < 3
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c2 = UOp::native_const(2i32);
     let c5 = UOp::native_const(5i32);
     let add = a.try_add(&c2).unwrap();
@@ -1945,7 +1945,7 @@ fn test_lt_const_offset() {
 fn test_lt_const_offset_negative() {
     // (a + 10) < 5 → a < -5
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c10 = UOp::native_const(10i32);
     let c5 = UOp::native_const(5i32);
     let add = a.try_add(&c10).unwrap();
@@ -1972,8 +1972,8 @@ fn test_lt_const_offset_negative() {
 fn test_lt_negation_flip() {
     // -a < -b → b < a
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
-    let b = UOp::var("b", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
+    let b = UOp::var("b", DType::Int32, 0, i64::MAX);
     let neg_a = a.neg();
     let neg_b = b.neg();
     let lt = neg_a.try_cmplt(&neg_b).unwrap();
@@ -1998,7 +1998,7 @@ fn test_lt_negation_flip() {
 fn test_div_mod_recombine() {
     // x%n + (x//n)*n → x
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let n = UOp::native_const(4i32);
 
     // Build: x % 4 + (x // 4) * 4
@@ -2018,7 +2018,7 @@ fn test_div_mod_recombine() {
 fn test_div_mod_recombine_commutative() {
     // (x//n)*n + x%n → x (commutative form)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let n = UOp::native_const(4i32);
 
     // Build: (x // 4) * 4 + x % 4
@@ -2038,7 +2038,7 @@ fn test_div_mod_recombine_commutative() {
 fn test_nested_div_const() {
     // (a//2 + 1) // 2 → (a + 2) // 4
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c2 = UOp::native_const(2i32);
     let c1 = UOp::native_const(1i32);
 
@@ -2080,7 +2080,7 @@ fn test_nested_div_const() {
 fn test_nested_div_const_larger() {
     // (a//3 + 5) // 4 → (a + 15) // 12
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
     let c5 = UOp::native_const(5i32);
     let c4 = UOp::native_const(4i32);
@@ -2122,7 +2122,7 @@ fn test_nested_div_const_larger() {
 fn test_div_mod_recombine_different_n() {
     // x%4 + (x//5)*4 should NOT simplify (different divisors)
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, i64::MAX);
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let n4 = UOp::native_const(4i32);
     let n5 = UOp::native_const(5i32);
 
@@ -2157,10 +2157,10 @@ fn test_div_mod_property_identity() {
 fn test_where_merge_branches() {
     // where(a, where(b, c, d), d) → where(a & b, c, d)
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Bool, 1);
-    let b = UOp::var("b", DType::Bool, 1);
-    let c = UOp::var("c", DType::Int32, i64::MAX);
-    let d = UOp::var("d", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Bool, 0, 1);
+    let b = UOp::var("b", DType::Bool, 0, 1);
+    let c = UOp::var("c", DType::Int32, 0, i64::MAX);
+    let d = UOp::var("d", DType::Int32, 0, i64::MAX);
 
     // Build: where(a, where(b, c, d), d)
     let inner_where = UOp::try_where(b.clone(), c.clone(), d.clone()).unwrap();
@@ -2193,11 +2193,11 @@ fn test_where_merge_branches() {
 fn test_where_merge_branches_no_match() {
     // where(a, where(b, c, d), e) should NOT simplify (d != e)
     let matcher = symbolic_simple();
-    let a = UOp::var("a", DType::Bool, 1);
-    let b = UOp::var("b", DType::Bool, 1);
-    let c = UOp::var("c", DType::Int32, i64::MAX);
-    let d = UOp::var("d", DType::Int32, i64::MAX);
-    let e = UOp::var("e", DType::Int32, i64::MAX);
+    let a = UOp::var("a", DType::Bool, 0, 1);
+    let b = UOp::var("b", DType::Bool, 0, 1);
+    let c = UOp::var("c", DType::Int32, 0, i64::MAX);
+    let d = UOp::var("d", DType::Int32, 0, i64::MAX);
+    let e = UOp::var("e", DType::Int32, 0, i64::MAX);
 
     // Build: where(a, where(b, c, d), e)
     let inner_where = UOp::try_where(b.clone(), c.clone(), d.clone()).unwrap();
@@ -2219,7 +2219,7 @@ fn test_where_merge_branches_no_match() {
 fn test_cast_where_push() {
     // where(s, a, b).cast(f32) → where(s, a.cast(f32), b.cast(f32))
     let matcher = symbolic_simple();
-    let s = UOp::var("s", DType::Bool, 1);
+    let s = UOp::var("s", DType::Bool, 0, 1);
     let a = UOp::native_const(1i32);
     let b = UOp::native_const(0i32);
 

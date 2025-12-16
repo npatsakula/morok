@@ -32,7 +32,7 @@ fn test_unbind_kernel() {
     let mut ctx = KernelContext::new();
 
     // Create a BIND operation
-    let var = UOp::new(Op::DefineVar { name: "x".to_string(), max_val: 10 }, DType::Index);
+    let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
     let value = UOp::index_const(5);
     let bind = UOp::bind(var.clone(), value);
 
@@ -272,7 +272,7 @@ fn test_cleanup_const_define_var() {
     let mut ctx = KernelContext::new();
 
     // Create a DEFINE_VAR
-    let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), max_val: 10 }, DType::Index);
+    let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
 
     // Without sources, should not match
     let result = cleanup_const(&define_var, &mut ctx);

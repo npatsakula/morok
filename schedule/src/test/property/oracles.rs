@@ -112,7 +112,7 @@ proptest! {
     #[test]
     fn z3_verify_self_div(name in "[a-z]", min_val in 1i64..100, range_size in 1i64..100) {
         // Create variable with min_val >= 1 to avoid division by zero
-        let x = UOp::var(&name, DType::Int32, min_val + range_size);
+        let x = UOp::var(&name, DType::Int32, min_val, min_val + range_size);
 
         let expr = UOp::new(
             morok_ir::Op::Binary(morok_ir::types::BinaryOp::Idiv, Arc::clone(&x), Arc::clone(&x)),
@@ -227,31 +227,31 @@ proptest! {
 fn rebuild_with_dtype(kpg: &KnownPropertyGraph, dtype: DType) -> Arc<UOp> {
     match kpg {
         KnownPropertyGraph::AddZero { .. } => {
-            let x = UOp::var("x", dtype.clone(), 100);
+            let x = UOp::var("x", dtype.clone(), 0, 100);
             let zero = UOp::native_const(0i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, x, zero), dtype)
         }
         KnownPropertyGraph::MulOne { .. } => {
-            let x = UOp::var("x", dtype.clone(), 100);
+            let x = UOp::var("x", dtype.clone(), 0, 100);
             let one = UOp::native_const(1i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Mul, x, one), dtype)
         }
         KnownPropertyGraph::SubZero { .. } => {
-            let x = UOp::var("x", dtype.clone(), 100);
+            let x = UOp::var("x", dtype.clone(), 0, 100);
             let zero = UOp::native_const(0i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Sub, x, zero), dtype)
         }
         KnownPropertyGraph::MulZero { .. } => {
-            let x = UOp::var("x", dtype.clone(), 100);
+            let x = UOp::var("x", dtype.clone(), 0, 100);
             let zero = UOp::native_const(0i64);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Mul, x, zero), dtype)
         }
         KnownPropertyGraph::SubSelf { .. } => {
-            let x = UOp::var("x", dtype.clone(), 100);
+            let x = UOp::var("x", dtype.clone(), 0, 100);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Sub, Arc::clone(&x), x), dtype)
         }
         KnownPropertyGraph::AddSelf { .. } => {
-            let x = UOp::var("x", dtype.clone(), 100);
+            let x = UOp::var("x", dtype.clone(), 0, 100);
             UOp::new(morok_ir::Op::Binary(morok_ir::types::BinaryOp::Add, Arc::clone(&x), x), dtype)
         }
     }

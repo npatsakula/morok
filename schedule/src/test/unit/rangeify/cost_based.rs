@@ -26,7 +26,7 @@ fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
 #[test]
 fn test_remove_bufferize_cheap_unary() {
     // BUFFERIZE(NEG(x), ranges) should inline (cheap operation)
-    let x = UOp::var("x", DType::Float32, 100);
+    let x = UOp::var("x", DType::Float32, 0, 100);
     let neg = x.neg();
 
     let range = create_range(10, 0);
@@ -42,8 +42,8 @@ fn test_remove_bufferize_cheap_unary() {
 #[test]
 fn test_remove_bufferize_cheap_binary() {
     // BUFFERIZE(x + y, ranges) should inline (cheap operation)
-    let x = UOp::var("x", DType::Float32, 100);
-    let y = UOp::var("y", DType::Float32, 100);
+    let x = UOp::var("x", DType::Float32, 0, 100);
+    let y = UOp::var("y", DType::Float32, 0, 100);
     let add = x.try_add(&y).unwrap();
 
     let range = create_range(10, 0);
@@ -59,7 +59,7 @@ fn test_remove_bufferize_cheap_binary() {
 #[test]
 fn test_remove_bufferize_cast() {
     // BUFFERIZE(CAST(x), ranges) should inline (cheap operation)
-    let x = UOp::var("x", DType::Int32, 100);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let cast = UOp::cast(x, DType::Float32);
 
     let range = create_range(10, 0);
@@ -75,7 +75,7 @@ fn test_remove_bufferize_cast() {
 #[test]
 fn test_keep_bufferize_expensive() {
     // BUFFERIZE(REDUCE(...), ranges) should NOT inline (expensive operation)
-    let x = UOp::var("x", DType::Float32, 100);
+    let x = UOp::var("x", DType::Float32, 0, 100);
     let range = create_range(100, 0);
 
     let reduce = UOp::new(
@@ -98,7 +98,7 @@ fn test_keep_bufferize_expensive() {
 #[test]
 fn test_remove_bufferize_contiguous() {
     // BUFFERIZE(CONTIGUOUS(x), ranges) should be removed (always-run op)
-    let x = UOp::var("x", DType::Float32, 100);
+    let x = UOp::var("x", DType::Float32, 0, 100);
     let contiguous = UOp::contiguous(x);
 
     let range = create_range(10, 0);
@@ -114,7 +114,7 @@ fn test_remove_bufferize_contiguous() {
 #[test]
 fn test_remove_bufferize_copy() {
     // BUFFERIZE(COPY(x, device), ranges) should be removed (always-run op)
-    let x = UOp::var("x", DType::Float32, 100);
+    let x = UOp::var("x", DType::Float32, 0, 100);
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     let copy = UOp::copy(x, device);
 
@@ -218,7 +218,7 @@ fn test_nested_bufferize_multiple_ranges() {
 #[test]
 fn test_multiple_cheap_ops_inline() {
     // Multiple cheap operations should all inline
-    let x = UOp::var("x", DType::Float32, 100);
+    let x = UOp::var("x", DType::Float32, 0, 100);
     let range = create_range(10, 0);
 
     // Use direct Binary construction to test buffer removal, not type validation

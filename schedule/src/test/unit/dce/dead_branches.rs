@@ -43,7 +43,7 @@ fn test_where_always_false() {
 #[test]
 fn test_where_range_based_true() {
     // Create a comparison that's always true based on ranges
-    let x = UOp::var("x", DType::Int32, 10);
+    let x = UOp::var("x", DType::Int32, 0, 10);
     let twenty = UOp::native_const(20i32);
     let cond = x.try_cmplt(&twenty).expect("LT should succeed"); // 0..10 < 20 is always true
 
@@ -62,7 +62,7 @@ fn test_where_range_based_true() {
 #[test]
 fn test_where_unknown_condition() {
     // Create a WHERE with unknown condition
-    let x = UOp::var("x", DType::Int32, 100);
+    let x = UOp::var("x", DType::Int32, 0, 100);
     let fifty = UOp::native_const(50i32);
     let cond = x.try_cmplt(&fifty).expect("LT should succeed"); // Could be true or false
 

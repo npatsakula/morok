@@ -562,7 +562,7 @@ fn collect_bound_ranges(ast: &Arc<UOp>) -> Result<Vec<BoundRange>> {
     // Only collect DEFINE_VAR nodes that are NOT bound to OUTER ranges
     // BIND+OUTER DefineVars will be inlined as loops by CPU codegen
     for node in &nodes {
-        if let Op::DefineVar { name, max_val } = node.op() {
+        if let Op::DefineVar { name, max_val, .. } = node.op() {
             // Skip DefineVars that are bound to OUTER ranges
             if bound_outer_vars.contains(&node.id) {
                 continue;

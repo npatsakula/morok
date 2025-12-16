@@ -144,7 +144,7 @@ fn test_calculate_buffer_size_buffer_op() {
 #[test]
 fn test_calculate_buffer_size_symbolic() {
     // Symbolic range → None
-    let batch_size = UOp::define_var("batch".to_string(), 128);
+    let batch_size = UOp::define_var("batch".to_string(), 0, 128);
     let range = UOp::range_axis(batch_size, AxisId::Renumbered(0), AxisType::Loop);
 
     let compute = UOp::native_const(1.0f32);
@@ -202,7 +202,7 @@ fn test_calculate_out_in_ratio_with_symbolic_bufferize() {
     // Bufferize with symbolic range → None
     let output_size = 100;
 
-    let batch_size = UOp::define_var("batch".to_string(), 128);
+    let batch_size = UOp::define_var("batch".to_string(), 0, 128);
     let range = UOp::range_axis(batch_size, AxisId::Renumbered(0), AxisType::Loop);
     let compute = UOp::native_const(1.0f32);
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Local };

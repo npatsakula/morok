@@ -200,6 +200,7 @@ pub enum Op {
     // Symbolic/Define operations (3 variants)
     DefineVar {
         name: String,
+        min_val: i64,
         max_val: i64,
     },
     Bind {

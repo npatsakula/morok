@@ -21,7 +21,7 @@ fn test_symbolic_range_size() {
     // Test BUFFERIZE with symbolic (variable) range size
     // This tests that rangeify doesn't crash on non-constant range sizes
 
-    let size_var = UOp::var("size", DType::Index, 1024);
+    let size_var = UOp::var("size", DType::Index, 0, 1024);
     let compute = UOp::native_const(1.0f32);
 
     // Create range with symbolic size
@@ -38,8 +38,8 @@ fn test_symbolic_range_size() {
 #[test]
 fn test_symbolic_range_multiple() {
     // Test multiple symbolic ranges
-    let size1 = UOp::var("size1", DType::Index, 1024);
-    let size2 = UOp::var("size2", DType::Index, 1024);
+    let size1 = UOp::var("size1", DType::Index, 0, 1024);
+    let size2 = UOp::var("size2", DType::Index, 0, 1024);
 
     let compute = UOp::native_const(2.0f32);
 
@@ -58,7 +58,7 @@ fn test_symbolic_range_multiple() {
 #[test]
 fn test_symbolic_range_with_arithmetic() {
     // Test symbolic range size with arithmetic expression
-    let n = UOp::var("n", DType::Index, 512);
+    let n = UOp::var("n", DType::Index, 0, 512);
     let size = n.try_mul(&create_const(2)).unwrap();
 
     let compute = UOp::native_const(3.0f32);
@@ -233,17 +233,17 @@ fn test_is_dead_axis_symbolic_bounded() {
     use crate::rangeify::indexing::is_dead_axis;
 
     // Dead: variable bounded to [1, 1]
-    let size = UOp::var("size", DType::Index, 1);
+    let size = UOp::var("size", DType::Index, 0, 1);
     let range = create_range_symbolic(size, 0);
     assert!(is_dead_axis(&range));
 
     // Live: variable with max > 1
-    let size = UOp::var("size", DType::Index, 1024);
+    let size = UOp::var("size", DType::Index, 0, 1024);
     let range = create_range_symbolic(size, 0);
     assert!(!is_dead_axis(&range));
 
     // Live: variable with min > 1 (still live range)
-    let size = UOp::var("size", DType::Index, 100);
+    let size = UOp::var("size", DType::Index, 0, 100);
     let range = create_range_symbolic(size, 0);
     assert!(!is_dead_axis(&range));
 }
@@ -271,7 +271,7 @@ fn test_symbolic_dead_range_smoke_test() {
     // instead of 2D). This would depend on dead axis elimination passes that
     // may run in later optimization stages.
 
-    let size = UOp::var("size", DType::Index, 1); // Bounded to [1, 1] - provably dead
+    let size = UOp::var("size", DType::Index, 0, 1); // Bounded to [1, 1] - provably dead
     let compute = UOp::native_const(1.0f32);
 
     // Create BUFFERIZE with dead symbolic range and live range

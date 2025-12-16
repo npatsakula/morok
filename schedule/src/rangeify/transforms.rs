@@ -546,7 +546,7 @@ pub fn reduce_collapse(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         }
 
         let var_name = format!("ridx{}", i);
-        let define_var = UOp::define_var(var_name, size_i64 - 1);
+        let define_var = UOp::define_var(var_name, 0, size_i64 - 1);
 
         substitute_map.insert(UOpKey(Arc::clone(range)), define_var);
     }

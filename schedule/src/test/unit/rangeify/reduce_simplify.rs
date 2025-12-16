@@ -364,7 +364,7 @@ fn test_range_size_extraction_constant() {
 #[test]
 fn test_range_size_extraction_symbolic() {
     // Symbolic RANGE should return None
-    let symbolic_var = UOp::define_var("N".to_string(), 1000);
+    let symbolic_var = UOp::define_var("N".to_string(), 0, 1000);
     let range = UOp::range_axis(symbolic_var, AxisId::Renumbered(0), AxisType::Loop);
 
     assert_eq!(crate::rangeify::indexing::range_size_as_i64(&range), None);
