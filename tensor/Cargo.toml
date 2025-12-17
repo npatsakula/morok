@@ -19,6 +19,7 @@ ndarray.workspace = true
 papaya = "0.2.3"
 parking_lot = "0.12"
 tracing = "0.1.43"
+tikv-jemallocator = "0.6.1"
 
 [features]
 default = []

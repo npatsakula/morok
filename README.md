@@ -73,9 +73,9 @@ A Rust-based ML compiler inspired by [Tinygrad](https://github.com/tinygrad/tiny
 use morok_tensor::Tensor;
 
 // Build lazy computation graph
-let a = Tensor::from_slice(&[1.0, 2.0, 3.0], &[3])?;
-let b = Tensor::from_slice(&[4.0, 5.0, 6.0], &[3])?;
-let c = (a + b).sum();
+let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
+let c = (&a + &b)?.sum(morok_tensor::AxisSpec::All)?;
 
 // Compile and execute
 let result = c.realize()?;

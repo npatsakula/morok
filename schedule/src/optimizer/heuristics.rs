@@ -7,38 +7,8 @@ use std::sync::Arc;
 
 use morok_ir::{AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
 
+use crate::optimizer::config::HeuristicsConfig;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
-
-// ============================================================================
-// CONFIGURATION CONSTANTS
-// ============================================================================
-
-/// Tensor core usage level (0=off, 1=enabled, 2=shape-only).
-pub const USE_TC: usize = 1;
-
-/// Tensor core optimization level (0=strict, 1=relaxed, 2=padded).
-pub const TC_OPT: usize = 2;
-
-/// Tensor core selection (-1=auto, >=0=specific index).
-pub const TC_SELECT: i32 = -1;
-
-/// Enable matrix-vector optimization.
-pub const MV_ENABLED: bool = true;
-
-/// Matrix-vector block size (rows per workgroup).
-pub const MV_BLOCKSIZE: usize = 4;
-
-/// Matrix-vector threads per row.
-pub const MV_THREADS_PER_ROW: usize = 8;
-
-/// Matrix-vector rows per thread.
-pub const MV_ROWS_PER_THREAD: usize = 4;
-
-/// Disable local memory globally.
-pub const NOLOCALS: bool = false;
-
-/// Debug verbosity (0=off).
-pub const DEBUG: usize = 0;
 
 // ============================================================================
 // MAIN ENTRY POINT
@@ -56,10 +26,10 @@ pub const DEBUG: usize = 0;
 /// 7. Default upcast (fallback)
 /// 8. Local dims (GPU workgroup)
 /// 9. Threading (CPU parallel)
-pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
+pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsConfig) {
     // 1. Tensor cores (skip other opts if applied)
-    if try_tensor_cores(scheduler) {
-        apply_local_dims(scheduler);
+    if try_tensor_cores(scheduler, config) {
+        apply_local_dims(scheduler, config);
         return;
     }
 
@@ -67,7 +37,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
     apply_image_upcasts(scheduler);
 
     // 3. Grouped reduction
-    try_grouped_reduction(scheduler);
+    try_grouped_reduction(scheduler, config);
 
     // 4. Masked upcasts
     apply_masked_upcasts(scheduler);
@@ -76,7 +46,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
     apply_heuristic_upcasts(scheduler);
 
     // 6. Unroll
-    apply_unroll(scheduler);
+    apply_unroll(scheduler, config);
 
     // 7. Default upcast
     if !scheduler.upcasted() {
@@ -84,7 +54,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler) {
     }
 
     // 8. Local dims
-    apply_local_dims(scheduler);
+    apply_local_dims(scheduler, config);
 
     // 9. Threading
     apply_threading(scheduler);
@@ -203,10 +173,11 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
     apply_opt(scheduler, &Opt::upcast(upcastable[0], 4), true).is_ok()
 }
 
-/// Unroll small reduction loops (size <= 32).
-pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
+/// Unroll small reduction loops (size <= threshold).
+pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     let mut applied = false;
     let unrollable = scheduler.unrollable_dims();
+    let threshold = config.unroll_threshold as i64;
 
     for axis_idx in unrollable {
         let rngs = scheduler.rngs();
@@ -218,7 +189,7 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
             && let Op::Const(cv) = end.op()
             && let morok_ir::ConstValue::Int(size) = cv.0
             && size > 1
-            && size <= 32
+            && size <= threshold
             && false
         // TEMPORARY: disable until codegen supports Unroll
         {
@@ -264,9 +235,9 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
     applied
 }
 
-/// Grouped reduction for large reduce dimensions (> 256).
-pub fn try_grouped_reduction(scheduler: &mut Scheduler) -> bool {
-    if !scheduler.renderer().has_local {
+/// Grouped reduction for large reduce dimensions (> threshold).
+pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    if !scheduler.renderer().has_local || config.disable_locals {
         return false;
     }
     let reduce_axes = scheduler.axes_of(&[AxisType::Reduce]);
@@ -277,6 +248,7 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler) -> bool {
     let rngs = scheduler.rngs();
     let mut largest_axis = None;
     let mut largest_size = 0;
+    let threshold = config.grouped_threshold as i64;
 
     for &axis_idx in &reduce_axes {
         if axis_idx >= rngs.len() {
@@ -293,13 +265,13 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler) -> bool {
         }
     }
 
-    if largest_size <= 256 {
+    if largest_size <= threshold {
         return false;
     }
     if let Some(axis_idx) = largest_axis
         && let Some(logical) = reduce_axes.iter().position(|&a| a == axis_idx)
     {
-        let group_size = 256.min(largest_size as usize);
+        let group_size = (config.grouped_threshold).min(largest_size as usize);
         if apply_opt(scheduler, &Opt::group(logical, group_size), true).is_ok() {
             return true;
         }
@@ -403,8 +375,8 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
 }
 
 /// GPU workgroup configuration (2D for 2D+ kernels, 1D fallback).
-pub fn apply_local_dims(scheduler: &mut Scheduler) -> bool {
-    if !scheduler.renderer().has_local {
+pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    if !scheduler.renderer().has_local || config.disable_locals {
         return false;
     }
     let global_axes = scheduler.axes_of(&[AxisType::Global]);
@@ -436,8 +408,10 @@ pub fn apply_local_dims(scheduler: &mut Scheduler) -> bool {
 }
 
 /// Tensor core optimization for matmul patterns.
-pub fn try_tensor_cores(scheduler: &mut Scheduler) -> bool {
-    if USE_TC == 0 {
+pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    use crate::optimizer::config::TcUsage;
+
+    if config.tc_enabled == TcUsage::Disabled {
         return false;
     }
     if scheduler.renderer().tensor_cores.is_empty() {
@@ -447,6 +421,6 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler) -> bool {
         return false;
     }
 
-    let opt = Opt::tc(None, TC_SELECT, TC_OPT, USE_TC);
+    let opt = Opt::tc(None, config.tc_select.as_i32(), config.tc_opt.as_usize(), config.tc_enabled.as_usize());
     apply_opt(scheduler, &opt, true).is_ok()
 }

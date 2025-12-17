@@ -18,6 +18,7 @@ pub mod buffer_registry;
 pub mod conditional;
 pub mod math;
 pub mod matmul;
+pub mod memory_planner;
 pub mod realize;
 pub mod reduce;
 pub mod schedule;

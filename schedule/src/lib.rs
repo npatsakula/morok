@@ -41,8 +41,9 @@ pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, run_kernel_split
 
 // Re-export optimizer entry points
 pub use optimizer::{
-    BeamConfig, BeamResult, OptError, OptStrategy, Renderer as OptimizerRenderer, Scheduler, beam_search_cached,
-    optimize_kernel, optimize_kernel_with_strategy, prepare_scheduler,
+    BeamConfig, BeamResult, HeuristicsConfig, OptError, OptStrategy, OptimizerConfig, Renderer as OptimizerRenderer,
+    Scheduler, TcOptLevel, TcSelect, TcUsage, beam_search_cached, optimize_kernel, optimize_kernel_with_config,
+    optimize_kernel_with_strategy, prepare_scheduler,
 };
 
 // Re-export UOp for macro usage

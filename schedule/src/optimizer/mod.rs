@@ -43,20 +43,19 @@
 //! ```
 
 pub mod beam;
+pub mod config;
 pub mod error;
 pub mod heuristics;
 pub mod kernel_info;
 pub mod opts;
 pub mod renderer;
 pub mod scheduler;
-pub mod strategy;
 pub mod tc;
 pub mod types;
 
 // Re-exports
-pub use beam::{
-    BeamConfig, BeamResult, beam_search, beam_search_cached, beam_search_with_timeout, clear_cache, replay_opts,
-};
+pub use beam::{BeamResult, beam_search, beam_search_cached, beam_search_with_timeout, clear_cache, replay_opts};
+pub use config::{BeamConfig, HeuristicsConfig, OptStrategy, OptimizerConfig, TcOpt as TcOptLevel, TcSelect, TcUsage};
 pub use error::OptError;
 pub use heuristics::hand_coded_optimizations;
 pub use kernel_info::KernelInfo;
@@ -65,7 +64,6 @@ pub use renderer::{Renderer, TcOpt, TensorCore};
 pub use scheduler::Scheduler;
 #[cfg(test)]
 pub use scheduler::clear_kernel_name_counts;
-pub use strategy::OptStrategy;
 pub use types::{AxisType, Opt, OptArg, OptOps};
 
 use crate::rewrite::graph_rewrite;
@@ -75,6 +73,7 @@ use std::sync::Arc;
 /// Apply optimizations to a kernel AST.
 ///
 /// This is the main entry point for optimization in the tensor pipeline.
+/// Uses environment variables for configuration (see `OptimizerConfig::from_env`).
 ///
 /// # Pipeline
 ///
@@ -96,32 +95,43 @@ use std::sync::Arc;
 /// * `MOROK_NOOPT=1` - Disable all optimizations (for debugging)
 /// * `MOROK_BEAM=N` - Use beam search with width N (future)
 pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<morok_ir::UOp> {
-    optimize_kernel_with_strategy(ast, renderer, OptStrategy::from_env())
+    optimize_kernel_with_config(ast, renderer, &OptimizerConfig::from_env())
 }
 
-/// Apply optimizations with explicit strategy selection.
+/// Apply optimizations with explicit configuration.
 ///
-/// Use this when you need explicit control over the optimization strategy,
-/// such as in tests or when comparing different approaches.
+/// Use this when you need explicit control over the optimization settings.
 ///
 /// Note: For beam search strategy, this falls back to heuristics because
 /// beam search requires a `compile_and_time` function from the runtime.
 /// Use `optimize_kernel_beam()` for actual beam search optimization.
+pub fn optimize_kernel_with_config(
+    ast: Arc<morok_ir::UOp>,
+    renderer: &Renderer,
+    config: &OptimizerConfig,
+) -> Arc<morok_ir::UOp> {
+    match config.strategy {
+        OptStrategy::None => ast,
+        OptStrategy::Heuristic => optimize_heuristic(ast, renderer, &config.heuristics),
+        OptStrategy::Beam { .. } => {
+            // Beam search requires a compile_and_time function.
+            // Use optimize_kernel_beam() for actual beam search.
+            // Fall back to heuristics for the simple API.
+            optimize_heuristic(ast, renderer, &config.heuristics)
+        }
+    }
+}
+
+/// Apply optimizations with explicit strategy selection (legacy API).
+///
+/// Prefer `optimize_kernel_with_config` for new code.
 pub fn optimize_kernel_with_strategy(
     ast: Arc<morok_ir::UOp>,
     renderer: &Renderer,
     strategy: OptStrategy,
 ) -> Arc<morok_ir::UOp> {
-    match strategy {
-        OptStrategy::None => ast,
-        OptStrategy::Heuristic => optimize_heuristic(ast, renderer),
-        OptStrategy::Beam { .. } => {
-            // Beam search requires a compile_and_time function.
-            // Use optimize_kernel_beam() for actual beam search.
-            // Fall back to heuristics for the simple API.
-            optimize_heuristic(ast, renderer)
-        }
-    }
+    let config = OptimizerConfig { strategy, ..Default::default() };
+    optimize_kernel_with_config(ast, renderer, &config)
 }
 
 /// Apply beam search optimization with custom timing function.
@@ -206,7 +216,7 @@ pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Schedu
 }
 
 /// Apply heuristic-based optimizations.
-fn optimize_heuristic(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<morok_ir::UOp> {
+fn optimize_heuristic(ast: Arc<morok_ir::UOp>, renderer: &Renderer, config: &HeuristicsConfig) -> Arc<morok_ir::UOp> {
     // Step 1: Symbolic simplification
     let simplified = graph_rewrite(&symbolic(), ast, &mut ());
 
@@ -216,8 +226,8 @@ fn optimize_heuristic(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<morok
     // Step 3: Convert eligible LOOP axes to GLOBAL (for GPU parallelization)
     let _ = scheduler.convert_loop_to_global();
 
-    // Step 4: Apply hand-coded heuristics
-    heuristics::hand_coded_optimizations(&mut scheduler);
+    // Step 4: Apply hand-coded heuristics with config
+    heuristics::hand_coded_optimizations(&mut scheduler, config);
 
     // Step 5: Extract optimized AST
     scheduler.get_optimized_ast(None)

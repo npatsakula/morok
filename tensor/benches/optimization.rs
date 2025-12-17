@@ -6,7 +6,9 @@
 //! Run with: `cargo bench -p morok-tensor`
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use morok_tensor::Tensor;
+use morok_device::registry::registry;
+use morok_schedule::{OptStrategy, OptimizerConfig};
+use morok_tensor::{Tensor, buffer_registry};
 
 /// Create a test matrix of given size with sequential values.
 fn create_matrix(rows: usize, cols: usize) -> Tensor {
@@ -24,6 +26,10 @@ fn bench_matmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("matmul_optimization");
     let mut executor = morok_runtime::global_executor();
 
+    // Typed optimizer configurations (no environment variables needed)
+    let heuristic_config = OptimizerConfig::default();
+    let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: 2 }).build();
+
     for size in [32, 64, 128, 256, 512] {
         let flops = matmul_flops(size, size, size);
         group.throughput(Throughput::Elements(flops));
@@ -32,26 +38,29 @@ fn bench_matmul(c: &mut Criterion) {
         let b = create_matrix(size, size);
 
         // HEURISTIC: Prepare OUTSIDE timing (compilation happens here)
-        unsafe { std::env::remove_var("MOROK_BEAM") };
         let result_h = a.matmul(&b).expect("matmul should succeed");
-        let plan_h = result_h.prepare().expect("prepare should succeed");
+        let plan_h = result_h.prepare_with(&heuristic_config).expect("prepare should succeed");
 
         group.bench_with_input(BenchmarkId::new("heuristic", size), &size, |bencher, _| {
             bencher.iter(|| plan_h.execute(&mut executor).expect("execute should succeed"));
+            buffer_registry::remove_buffer(result_h.uop().base().id);
         });
 
         // BEAM: Prepare OUTSIDE timing (beam search + compilation happens here)
-        unsafe { std::env::set_var("MOROK_BEAM", "2") };
         let result_b = a.matmul(&b).expect("matmul should succeed");
-        let plan_b = result_b.prepare().expect("prepare should succeed");
+        let plan_b = result_b.prepare_with(&beam_config).expect("prepare should succeed");
 
         group.bench_with_input(BenchmarkId::new("beam_w2", size), &size, |bencher, _| {
             bencher.iter(|| plan_b.execute(&mut executor).expect("execute should succeed"));
+            buffer_registry::remove_buffer(result_b.uop().base().id);
         });
     }
 
     group.finish();
 }
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 criterion_group!(benches, bench_matmul);
 criterion_main!(benches);

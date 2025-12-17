@@ -58,6 +58,11 @@ pub struct ScheduleItem {
     /// Device buffers for this kernel (in order expected by codegen)
     pub buffers: Vec<Buffer>,
 
+    /// UOp IDs under which each buffer was registered in buffer_registry.
+    /// Same length as `buffers`. Used for cleanup - to remove buffers from
+    /// the global registry, we need to know what key they were registered under.
+    pub buffer_uop_ids: Vec<u64>,
+
     /// Fixed variable values for this specific kernel invocation.
     /// Maps variable name (e.g., "range_0") to concrete i64 value.
     /// Empty for unexpanded schedule items.
@@ -77,6 +82,11 @@ pub struct ScheduleItem {
     /// Empty for the first kernel in a dependency chain.
     /// Populated from KernelContext.kernel_deps during schedule creation.
     pub dependencies: Vec<u64>,
+
+    /// Additional UOp IDs registered as aliases in buffer_registry.
+    /// These are IDs where the same buffer was registered under a different key
+    /// for lookup convenience. They need to be cleaned up along with buffer_uop_ids.
+    pub alias_registered_ids: Vec<u64>,
 }
 
 /// Full execution schedule (list of kernels in dependency order).
@@ -238,7 +248,7 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
 
         // Collect and allocate all buffers for this kernel
         // Buffers are allocated ONCE here, then reused across all iterations
-        let buffers = collect_kernel_buffers(
+        let (buffers, buffer_uop_ids, alias_registered_ids) = collect_kernel_buffers(
             sources,
             &kernel_uop,
             &define_to_buffer,
@@ -280,10 +290,12 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
             kernel: kernel_uop.clone(),
             ast: inner_ast.clone(),
             buffers,
+            buffer_uop_ids,
             fixedvars: HashMap::new(),
             bound_ranges,
             source_buffers,
             dependencies,
+            alias_registered_ids,
         });
     }
 
@@ -361,7 +373,7 @@ fn collect_kernel_buffers(
     buffer_id_mapping: &HashMap<u64, u64>,
     reverse_id_mapping: &HashMap<u64, u64>,
     define_to_buffer_id: &HashMap<u64, u64>,
-) -> Result<Vec<Buffer>> {
+) -> Result<(Vec<Buffer>, Vec<u64>, Vec<u64>)> {
     // Get AST for buffer size computation
     let ast = match kernel.op() {
         Op::Kernel { ast, .. } => ast,
@@ -375,6 +387,8 @@ fn collect_kernel_buffers(
     let target_device = find_first_input_buffer_device(sources, define_to_buffer, reverse_id_mapping)?;
 
     let mut buffers = Vec::new();
+    let mut uop_ids = Vec::new();
+    let mut alias_ids = Vec::new();
 
     for src in sources {
         match src.op() {
@@ -397,9 +411,11 @@ fn collect_kernel_buffers(
                     // Also register under original_id for future lookups
                     if original_id != lookup_id {
                         crate::buffer_registry::get_or_create_buffer(original_id, || Ok(existing.clone()))?;
+                        alias_ids.push(original_id); // Track for cleanup
                     }
 
                     buffers.push(existing);
+                    uop_ids.push(lookup_id);
                 } else {
                     trace!(original_id, lookup_id, "after buffer not found in registry");
                     return Err(Error::BufferNotFound { uop_id: original_id });
@@ -420,6 +436,7 @@ fn collect_kernel_buffers(
                         // Also register under the DEFINE_GLOBAL's ID for codegen lookup
                         crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
                         buffers.push(buffer);
+                        uop_ids.push(src.id);
                     } else {
                         return Err(Error::BufferNotFound { uop_id: original_buffer.id });
                     }
@@ -442,6 +459,7 @@ fn collect_kernel_buffers(
                         // Also register under the DEFINE_GLOBAL's ID for codegen lookup
                         crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
                         buffers.push(buffer);
+                        uop_ids.push(src.id);
                         continue;
                     }
 
@@ -453,6 +471,7 @@ fn collect_kernel_buffers(
                             "Shared buffer from registry"
                         );
                         buffers.push(existing);
+                        uop_ids.push(src.id);
                         continue;
                     }
 
@@ -480,6 +499,7 @@ fn collect_kernel_buffers(
                     crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
 
                     buffers.push(buffer);
+                    uop_ids.push(src.id);
                 }
             }
             Op::DefineLocal(_id) => {
@@ -502,11 +522,13 @@ fn collect_kernel_buffers(
                 crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
 
                 buffers.push(buffer);
+                uop_ids.push(src.id);
             }
             Op::Buffer { .. } => {
                 // Input buffer - get from registry
                 if let Some(buffer) = crate::buffer_registry::get_buffer(src.id) {
                     buffers.push(buffer);
+                    uop_ids.push(src.id);
                 } else {
                     return Err(Error::BufferNotFound { uop_id: src.id });
                 }
@@ -522,7 +544,7 @@ fn collect_kernel_buffers(
         }
     }
 
-    Ok(buffers)
+    Ok((buffers, uop_ids, alias_ids))
 }
 
 /// Collect bound ranges from kernel AST.
@@ -647,10 +669,12 @@ pub fn expand_schedule(schedule: Schedule) -> Schedule {
                     kernel: item.kernel.clone(),
                     ast: item.ast.clone(),
                     buffers: item.buffers.clone(),
+                    buffer_uop_ids: item.buffer_uop_ids.clone(),
                     fixedvars,
                     bound_ranges: vec![], // Expanded items have no bound ranges
                     source_buffers: item.source_buffers.clone(),
                     dependencies: item.dependencies.clone(),
+                    alias_registered_ids: item.alias_registered_ids.clone(),
                 });
             }
         }
@@ -754,10 +778,12 @@ mod tests {
             kernel: kernel.clone(),
             ast: sink,
             buffers: vec![],
+            buffer_uop_ids: vec![],
             fixedvars: HashMap::new(),
             bound_ranges: vec![],
             source_buffers: HashMap::new(),
             dependencies: vec![],
+            alias_registered_ids: vec![],
         };
 
         assert!(matches!(item.kernel.op(), Op::Kernel { .. }));

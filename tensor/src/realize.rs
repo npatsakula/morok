@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use tracing::{debug, trace};
 
 use crate::{
-    Result, Tensor,
+    Result, Tensor, buffer_registry,
     error::{
         CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceFactorySnafu, DeviceSnafu,
         EmptyScheduleSnafu, ExecutionSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu,
@@ -86,6 +86,11 @@ impl Tensor {
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
 
+        // Release ALL buffers from the global registry, including the output.
+        // This prevents memory growth from repeated realize() calls.
+        // The output buffer will be re-registered under the new BUFFER UOp's ID below.
+        plan.release_all_buffers(buffer_registry::remove_buffer);
+
         // Get output buffer and its properties
         let output_buf = plan.output_buffer().clone();
 
@@ -108,12 +113,9 @@ impl Tensor {
         let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype.clone());
 
         // Register the output buffer under the new BUFFER UOp's ID
-        crate::buffer_registry::get_or_create_buffer(buffer_uop.id, || Ok(output_buf.clone()))?;
-
-        // Also register under the original base ID for backwards compatibility
-        // (e.g., if user called .clone() before realize and uses both)
-        let base_id = uop.base().id;
-        crate::buffer_registry::get_or_create_buffer(base_id, || Ok(output_buf))?;
+        // Note: We only register under the new BUFFER UOp's ID, not the original base ID.
+        // This avoids memory leaks from repeated realize() calls creating orphaned registry entries.
+        crate::buffer_registry::get_or_create_buffer(buffer_uop.id, || Ok(output_buf))?;
 
         // Get the tensor's shape and reshape the buffer to match
         let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
@@ -171,6 +173,43 @@ impl Tensor {
     /// - Kernel compilation fails
     /// - Buffer allocation fails
     pub fn prepare(&self) -> Result<ExecutionPlan> {
+        self.prepare_with(&morok_schedule::OptimizerConfig::from_env())
+    }
+
+    /// Prepare an execution plan with explicit optimizer configuration.
+    ///
+    /// This method allows fine-grained control over kernel optimization settings,
+    /// including beam search width, heuristic parameters, and tensor core usage.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use morok_schedule::{OptimizerConfig, OptStrategy, BeamConfig};
+    ///
+    /// // Beam search with width 8 and 120s timeout
+    /// let config = OptimizerConfig::builder()
+    ///     .strategy(OptStrategy::Beam { width: 8 })
+    ///     .beam(BeamConfig::builder()
+    ///         .timeout_secs(120)
+    ///         .build())
+    ///     .build();
+    ///
+    /// let plan = tensor.prepare_with(&config)?;
+    /// plan.execute(&mut executor)?;
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Optimizer configuration controlling optimization strategy
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Rangeify transformation fails
+    /// - No kernels found after scheduling
+    /// - Kernel compilation fails
+    /// - Buffer allocation fails
+    pub fn prepare_with(&self, config: &morok_schedule::OptimizerConfig) -> Result<ExecutionPlan> {
         use morok_ir::AxisType;
 
         let uop = self.uop();
@@ -216,7 +255,7 @@ impl Tensor {
 
         // Step 6: Build execution plan (pass expected output dtype and size)
         let output_size = shape.iter().map(|s| s.as_const().unwrap_or(1)).product::<usize>() * output_dtype.bytes();
-        prepare_execution_plan(&schedule, output_dtype, output_size)
+        prepare_execution_plan(&schedule, output_dtype, output_size, config)
     }
 }
 
@@ -383,6 +422,7 @@ fn prepare_execution_plan(
     schedule: &Schedule,
     expected_output_dtype: DType,
     expected_output_size: usize,
+    config: &morok_schedule::OptimizerConfig,
 ) -> Result<ExecutionPlan> {
     // Expand the schedule to handle OUTER range iterations
     let expanded_schedule = expand_schedule(schedule.clone());
@@ -420,18 +460,20 @@ fn prepare_execution_plan(
 
     // Step 1: Add all buffers to the plan
     // Buffers in each ScheduleItem are already in the correct order (from collect_kernel_buffers).
-    // We need to track unique buffers by their Buffer ID (not AST ID).
-    let mut buffer_id_to_idx: HashMap<u64, usize> = HashMap::new();
+    // We track buffers by their UOp ID (what they were registered under in buffer_registry).
+    let mut uop_id_to_idx: HashMap<u64, usize> = HashMap::new();
 
     for item in &expanded_schedule {
         // Ensure all buffers are allocated
-        for buffer in &item.buffers {
+        for (buffer, &uop_id) in item.buffers.iter().zip(item.buffer_uop_ids.iter()) {
             buffer.ensure_allocated().context(DeviceSnafu)?;
 
-            // Add buffer if not already added (use inner u64 from BufferId)
-            let buf_id = buffer.id().0;
-            buffer_id_to_idx.entry(buf_id).or_insert_with(|| builder.add_buffer(buf_id, buffer.clone()));
+            // Add buffer if not already added (use UOp ID for registry cleanup)
+            uop_id_to_idx.entry(uop_id).or_insert_with(|| builder.add_buffer(uop_id, buffer.clone()));
         }
+
+        // Collect alias IDs for cleanup
+        builder.add_alias_ids(item.alias_registered_ids.iter().copied());
     }
 
     // Step 2: Compile all kernels and create PreparedKernel structures
@@ -448,13 +490,12 @@ fn prepare_execution_plan(
         let optimizer_renderer = get_optimizer_renderer(&device);
 
         // Step 2: Optimize OUTSIDE cache (enables beam search)
-        let strategy = morok_schedule::OptStrategy::from_env();
-        let optimized_ast = if let morok_schedule::OptStrategy::Beam { width } = strategy {
+        let optimized_ast = if let morok_schedule::OptStrategy::Beam { width } = config.strategy {
             // Beam search: compile-and-time multiple candidates
             beam_search_optimize(item.ast.clone(), &optimizer_renderer, width, &device, &item.buffers)?
         } else {
             // Heuristic optimization (default)
-            morok_schedule::optimize_kernel(item.ast.clone(), &optimizer_renderer)
+            morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, config)
         };
 
         // Step 3: Apply decomposition
@@ -482,9 +523,9 @@ fn prepare_execution_plan(
             })
         })?;
 
-        // Build buffer indices for this kernel using item.buffers (already in correct order)
+        // Build buffer indices for this kernel using item.buffer_uop_ids (already in correct order)
         let buffer_indices: Vec<usize> =
-            item.buffers.iter().filter_map(|buf| buffer_id_to_idx.get(&buf.id().0).copied()).collect();
+            item.buffer_uop_ids.iter().filter_map(|&uop_id| uop_id_to_idx.get(&uop_id).copied()).collect();
 
         trace!(kernel.ast_id = item.ast.id, num_buffers = item.buffers.len(), "kernel buffer mapping");
 
@@ -534,27 +575,30 @@ fn prepare_execution_plan(
     // Pass 1: Look for exact match (dtype AND size)
     // Select the HIGHEST BufferId (most recently allocated = output buffer)
     // because input and output buffers may have the same dtype+size for cast operations.
+    // Note: We use BufferId for selection but UOp ID for the map lookup.
     let mut best_buf_id: Option<u64> = None;
     for item in &expanded_schedule {
         if matches!(item.ast.op(), Op::Copy { .. }) {
             continue;
         }
-        for buf in &item.buffers {
-            if buf.dtype() == expected_output_dtype && buf.size() == expected_output_size {
+        for (buf, &uop_id) in item.buffers.iter().zip(item.buffer_uop_ids.iter()) {
+            if buf.dtype() == expected_output_dtype
+                && buf.size() == expected_output_size
+                && let Some(&idx) = uop_id_to_idx.get(&uop_id)
+            {
                 let buf_id = buf.id().0;
-                if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
-                    // Select highest BufferId (latest allocated = output)
-                    if best_buf_id.is_none_or(|best| buf_id > best) {
-                        trace!(
-                            buffer.id = buf_id,
-                            buffer.idx = idx,
-                            buffer.dtype = ?expected_output_dtype,
-                            buffer.size = expected_output_size,
-                            "Candidate output buffer (exact match)"
-                        );
-                        output_buffer_idx = Some(idx);
-                        best_buf_id = Some(buf_id);
-                    }
+                // Select highest BufferId (latest allocated = output)
+                if best_buf_id.is_none_or(|best| buf_id > best) {
+                    trace!(
+                        uop_id,
+                        buffer.id = buf_id,
+                        buffer.idx = idx,
+                        buffer.dtype = ?expected_output_dtype,
+                        buffer.size = expected_output_size,
+                        "Candidate output buffer (exact match)"
+                    );
+                    output_buffer_idx = Some(idx);
+                    best_buf_id = Some(buf_id);
                 }
             }
         }
@@ -566,19 +610,18 @@ fn prepare_execution_plan(
             if matches!(item.ast.op(), Op::Copy { .. }) {
                 continue;
             }
-            for buf in &item.buffers {
-                if buf.dtype() == expected_output_dtype {
-                    let buf_id = buf.id().0;
-                    if let Some(&idx) = buffer_id_to_idx.get(&buf_id) {
-                        trace!(
-                            buffer.id = buf_id,
-                            buffer.idx = idx,
-                            buffer.dtype = ?buf.dtype(),
-                            "Fallback output buffer (dtype match)"
-                        );
-                        output_buffer_idx = Some(idx);
-                        break;
-                    }
+            for (buf, &uop_id) in item.buffers.iter().zip(item.buffer_uop_ids.iter()) {
+                if buf.dtype() == expected_output_dtype
+                    && let Some(&idx) = uop_id_to_idx.get(&uop_id)
+                {
+                    trace!(
+                        uop_id,
+                        buffer.idx = idx,
+                        buffer.dtype = ?buf.dtype(),
+                        "Fallback output buffer (dtype match)"
+                    );
+                    output_buffer_idx = Some(idx);
+                    break;
                 }
             }
             if output_buffer_idx.is_some() {
@@ -590,12 +633,12 @@ fn prepare_execution_plan(
     // Pass 3: Last resort - first buffer
     if output_buffer_idx.is_none()
         && let Some(first_item) = expanded_schedule.first()
-        && !first_item.buffers.is_empty()
+        && !first_item.buffer_uop_ids.is_empty()
     {
-        let first_buf_id = first_item.buffers[0].id().0;
-        if let Some(&idx) = buffer_id_to_idx.get(&first_buf_id) {
+        let first_uop_id = first_item.buffer_uop_ids[0];
+        if let Some(&idx) = uop_id_to_idx.get(&first_uop_id) {
             trace!(
-                buffer.id = first_buf_id,
+                uop_id = first_uop_id,
                 buffer.idx = idx,
                 buffer.dtype = ?first_item.buffers[0].dtype(),
                 "Fallback output buffer (first buffer)"
@@ -850,5 +893,308 @@ mod tests {
             .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, 12) })
             .expect("copyout should succeed");
         assert_eq!(data, vec![5.0, 7.0, 9.0]);
+    }
+
+    /// Test that intermediate buffer cleanup is working in realize().
+    ///
+    /// This verifies that the intermediate buffer cleanup after execution
+    /// is removing buffers from the global registry.
+    #[test]
+    fn test_realize_buffer_cleanup() {
+        let _guard = crate::test::helpers::test_setup();
+
+        // Create input tensors ONCE (these will stay in registry)
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
+
+        // Record buffer count after input tensors are created
+        let count_after_inputs = crate::buffer_registry::buffer_count();
+
+        // Realize the computation
+        let c = (&a + &b).realize().expect("realize should succeed");
+
+        // Record buffer count after first realize
+        let count_after_first_realize = crate::buffer_registry::buffer_count();
+
+        // Verify computation is correct
+        let result: ndarray::ArrayD<f32> = c.to_ndarray().expect("to_ndarray should succeed");
+        let (data, _) = result.into_raw_vec_and_offset();
+        assert_eq!(data, vec![5.0, 7.0, 9.0]);
+
+        // The difference should be bounded - we should have:
+        // - 2 input buffers (a, b) that were already counted
+        // - 1 or 2 output buffer registrations (for the new buffer_uop.id and base_id)
+        // - Intermediate buffers should be cleaned up
+        let buffers_added = count_after_first_realize - count_after_inputs;
+
+        // We expect at most a few buffers (output + base ID registration)
+        // Without cleanup, this would include all intermediate buffers
+        assert!(
+            buffers_added <= 5,
+            "Too many buffers added: {} (from {} to {}). Expected <= 5 for output registrations.",
+            buffers_added,
+            count_after_inputs,
+            count_after_first_realize
+        );
+    }
+
+    /// Test that prepare() + execute() pattern can clean up with release_intermediate_buffers().
+    #[test]
+    fn test_prepare_execute_cleanup() {
+        let _guard = crate::test::helpers::test_setup();
+
+        // Create input tensors
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
+        let c = &a + &b;
+
+        // Prepare the plan
+        let plan = c.prepare().expect("prepare should succeed");
+
+        let count_before_cleanup = crate::buffer_registry::buffer_count();
+
+        // Execute multiple times (simulating benchmark loop)
+        let mut executor = morok_runtime::global_executor();
+        for _ in 0..3 {
+            plan.execute(&mut executor).expect("execute should succeed");
+        }
+
+        // Verify output
+        let output = plan.output_buffer();
+        let mut data = vec![0.0f32; 3];
+        output
+            .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, 12) })
+            .expect("copyout should succeed");
+        assert_eq!(data, vec![5.0, 7.0, 9.0]);
+
+        // Now cleanup
+        plan.release_intermediate_buffers(crate::buffer_registry::remove_buffer);
+
+        let count_after_cleanup = crate::buffer_registry::buffer_count();
+
+        // After cleanup, we should have fewer or equal buffers
+        // (intermediate buffers removed)
+        assert!(
+            count_after_cleanup <= count_before_cleanup,
+            "Cleanup should not increase buffer count: before={}, after={}",
+            count_before_cleanup,
+            count_after_cleanup
+        );
+    }
+
+    /// Test that intermediate buffer cleanup is working.
+    ///
+    /// The correct pattern is: prepare() ONCE, execute() many times.
+    /// This test verifies that repeated execute() calls do NOT grow the registry.
+    #[test]
+    fn test_memory_growth_detection() {
+        let _guard = crate::test::helpers::test_setup();
+
+        const ITERATIONS: usize = 10;
+
+        let mut executor = morok_runtime::global_executor();
+
+        // Create input tensors
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
+        let c = &a + &b;
+
+        // Prepare ONCE
+        let plan = c.prepare().expect("prepare should succeed");
+
+        // Record count after prepare
+        let count_after_prepare = crate::buffer_registry::buffer_count();
+
+        let mut counts: Vec<usize> = Vec::with_capacity(ITERATIONS);
+
+        // Execute MANY times
+        for _ in 0..ITERATIONS {
+            plan.execute(&mut executor).expect("execute should succeed");
+            counts.push(crate::buffer_registry::buffer_count());
+        }
+
+        // Cleanup after final execution
+        plan.release_intermediate_buffers(crate::buffer_registry::remove_buffer);
+        let count_after_cleanup = crate::buffer_registry::buffer_count();
+
+        // Execute() should NOT grow the registry
+        let growth_during_execute = counts.last().unwrap().saturating_sub(count_after_prepare);
+
+        eprintln!("Counts during execute: {:?}", counts);
+        eprintln!("Growth during execute: {}", growth_during_execute);
+        eprintln!("Count after cleanup: {}", count_after_cleanup);
+
+        assert_eq!(growth_during_execute, 0, "Registry should not grow during repeated execute() calls");
+
+        // Verify cleanup worked
+        assert!(
+            count_after_cleanup < count_after_prepare,
+            "Cleanup should reduce buffer count: before={}, after={}",
+            count_after_prepare,
+            count_after_cleanup
+        );
+    }
+
+    /// Test that creating new input tensors each iteration causes growth.
+    ///
+    /// This is expected behavior - input tensor buffers are not automatically
+    /// cleaned up when they go out of scope. Users should reuse tensors.
+    #[test]
+    fn test_memory_growth_with_new_inputs() {
+        let _guard = crate::test::helpers::test_setup();
+
+        const ITERATIONS: usize = 5;
+
+        let mut executor = morok_runtime::global_executor();
+        let mut counts: Vec<usize> = Vec::with_capacity(ITERATIONS);
+
+        let count_before = crate::buffer_registry::buffer_count();
+
+        for _ in 0..ITERATIONS {
+            // Create NEW input tensors each iteration - this causes growth
+            let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+            let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
+            let c = &a + &b;
+
+            let plan = c.prepare().expect("prepare should succeed");
+            plan.execute(&mut executor).expect("execute should succeed");
+            plan.release_intermediate_buffers(crate::buffer_registry::remove_buffer);
+
+            counts.push(crate::buffer_registry::buffer_count());
+        }
+
+        let total_growth = *counts.last().unwrap() as isize - count_before as isize;
+        let growth_per_iter = total_growth as f64 / ITERATIONS as f64;
+
+        eprintln!("Counts with new inputs each iteration: {:?}", counts);
+        eprintln!("Growth per iteration: {:.1} buffers", growth_per_iter);
+
+        // We expect growth because input tensor buffers accumulate
+        // (2 inputs per iteration that are never cleaned up)
+        // Plus some overhead for DefineGlobal registrations
+        assert!(growth_per_iter >= 2.0, "Expected growth with new inputs, but growth_per_iter={:.1}", growth_per_iter);
+    }
+
+    /// Test that realize() correctly computes and cleans up.
+    #[test]
+    fn test_memory_growth_realize_pattern() {
+        let _guard = crate::test::helpers::test_setup();
+
+        // Single realize should work correctly
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
+        let c = (&a + &b).realize().expect("realize should succeed");
+
+        // Verify result
+        let result: ndarray::ArrayD<f32> = c.to_ndarray().expect("to_ndarray should succeed");
+        assert_eq!(result.as_slice().unwrap(), &[6.0, 8.0, 10.0, 12.0]);
+    }
+
+    /// STRICT test: Repeated prepare+execute+cleanup cycles with SAME inputs.
+    ///
+    /// Each cycle should return to the same baseline registry count.
+    /// If this fails, we have a leak in the prepare or cleanup path.
+    #[test]
+    fn test_memory_growth_strict_cycles() {
+        let _guard = crate::test::helpers::test_setup();
+
+        const ITERATIONS: usize = 10;
+
+        let mut executor = morok_runtime::global_executor();
+
+        // Create input tensors ONCE
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
+
+        // Baseline after creating inputs
+        let baseline = crate::buffer_registry::buffer_count();
+        eprintln!("Baseline after creating inputs: {}", baseline);
+
+        let mut counts_after_cleanup: Vec<usize> = Vec::with_capacity(ITERATIONS);
+
+        for i in 0..ITERATIONS {
+            // Create computation graph (no new allocations, just UOp graph)
+            let c = &a + &b;
+
+            // Full cycle: prepare -> execute -> cleanup
+            let plan = c.prepare().expect("prepare should succeed");
+            let count_after_prepare = crate::buffer_registry::buffer_count();
+
+            plan.execute(&mut executor).expect("execute should succeed");
+            let count_after_execute = crate::buffer_registry::buffer_count();
+
+            // Use release_all_buffers since we're discarding the plan entirely
+            plan.release_all_buffers(crate::buffer_registry::remove_buffer);
+            let count_after_cleanup = crate::buffer_registry::buffer_count();
+
+            counts_after_cleanup.push(count_after_cleanup);
+
+            if i == 0 {
+                eprintln!(
+                    "Cycle 0: after_prepare={}, after_execute={}, after_cleanup={}",
+                    count_after_prepare, count_after_execute, count_after_cleanup
+                );
+            }
+        }
+
+        eprintln!("Counts after cleanup each cycle: {:?}", counts_after_cleanup);
+
+        // Check that counts stay bounded (within 1 of first cycle's cleanup count)
+        let first_cleanup = counts_after_cleanup[0];
+        let last_cleanup = *counts_after_cleanup.last().unwrap();
+        let growth = last_cleanup.saturating_sub(first_cleanup);
+
+        eprintln!("First cleanup: {}, Last cleanup: {}, Growth: {}", first_cleanup, last_cleanup, growth);
+
+        assert_eq!(
+            growth, 0,
+            "Registry should not grow across prepare+execute+cleanup cycles. \
+             First: {}, Last: {}, Growth: {}",
+            first_cleanup, last_cleanup, growth
+        );
+    }
+
+    /// STRICT test: Repeated realize() calls with SAME inputs.
+    ///
+    /// Each realize() creates a new output tensor, but intermediates should be cleaned.
+    /// Growth should only be 1 per iteration (the output tensor).
+    #[test]
+    fn test_memory_growth_strict_realize() {
+        let _guard = crate::test::helpers::test_setup();
+
+        const ITERATIONS: usize = 10;
+
+        // Create input tensors ONCE
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
+
+        // Baseline
+        let baseline = crate::buffer_registry::buffer_count();
+        eprintln!("Baseline: {}", baseline);
+
+        let mut counts: Vec<usize> = Vec::with_capacity(ITERATIONS);
+
+        for _ in 0..ITERATIONS {
+            let _c = (&a + &b).realize().expect("realize should succeed");
+            counts.push(crate::buffer_registry::buffer_count());
+        }
+
+        eprintln!("Counts after each realize: {:?}", counts);
+
+        // Calculate growth rate
+        let total_growth = counts.last().unwrap().saturating_sub(baseline);
+        let growth_per_iter = total_growth as f64 / ITERATIONS as f64;
+
+        eprintln!("Total growth: {}, Per iteration: {:.2}", total_growth, growth_per_iter);
+
+        // Each realize() produces 1 output tensor, so growth should be ~1 per iteration
+        // Allow some margin for the intermediate buffers
+        assert!(
+            growth_per_iter <= 2.0,
+            "Registry growing too fast: {:.2} buffers per realize(). \
+             Expected ~1 (output only). Counts: {:?}",
+            growth_per_iter,
+            counts
+        );
     }
 }

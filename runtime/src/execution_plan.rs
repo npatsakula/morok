@@ -128,6 +128,9 @@ pub struct ExecutionPlan {
 
     /// Primary device for this plan.
     device: DeviceSpec,
+
+    /// Additional UOp IDs registered as aliases that need cleanup.
+    alias_ids: Vec<u64>,
 }
 
 // ============================================================================
@@ -204,6 +207,86 @@ impl ExecutionPlan {
         }
         Ok(())
     }
+
+    /// Get the output buffer index.
+    pub fn output_buffer_idx(&self) -> usize {
+        self.output_buffer_idx
+    }
+
+    /// Get the AST ID to buffer index mapping.
+    ///
+    /// This returns UOp IDs mapped to their buffer indices in this plan.
+    /// Used for buffer registry cleanup.
+    pub fn ast_to_buffer_map(&self) -> &HashMap<u64, usize> {
+        &self.ast_to_buffer
+    }
+
+    /// Release intermediate buffers from the global buffer registry.
+    ///
+    /// Call this after you're done executing the plan to free intermediate
+    /// buffers from the global registry. The output buffer is preserved.
+    ///
+    /// This is useful for the `prepare()` + `execute()` pattern where you
+    /// want to clean up after the final execution. For `realize()`, this
+    /// cleanup happens automatically.
+    ///
+    /// # Arguments
+    ///
+    /// * `remove_fn` - Function to remove a buffer from the registry by AST ID.
+    ///   Typically `morok_tensor::buffer_registry::remove_buffer`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let plan = tensor.prepare()?;
+    /// for _ in 0..100 {
+    ///     plan.execute(&mut executor)?;
+    /// }
+    /// // Clean up intermediate buffers after final execution
+    /// plan.release_intermediate_buffers(morok_tensor::buffer_registry::remove_buffer);
+    /// ```
+    pub fn release_intermediate_buffers<F>(&self, remove_fn: F)
+    where
+        F: Fn(u64),
+    {
+        self.release_buffers_impl(remove_fn, true);
+    }
+
+    /// Release ALL buffers from the global registry, including the output.
+    ///
+    /// Use this when you're done with the plan and want to clean up everything.
+    /// The buffers themselves remain valid (owned by ExecutionPlan) but the
+    /// registry entries are removed.
+    ///
+    /// For `realize()`, use this method since the output buffer will be
+    /// re-registered under a new ID anyway.
+    pub fn release_all_buffers<F>(&self, remove_fn: F)
+    where
+        F: Fn(u64),
+    {
+        self.release_buffers_impl(remove_fn, false);
+    }
+
+    fn release_buffers_impl<F>(&self, remove_fn: F, skip_output: bool)
+    where
+        F: Fn(u64),
+    {
+        let output_buf_id = self.buffers.get(self.output_buffer_idx).map(|b| b.id().0);
+
+        for (&ast_id, &buf_idx) in &self.ast_to_buffer {
+            // Skip the output buffer if requested
+            if skip_output && Some(self.buffers[buf_idx].id().0) == output_buf_id {
+                continue;
+            }
+            // Remove buffer from global registry
+            remove_fn(ast_id);
+        }
+
+        // Also clean up alias IDs (alternate keys for the same buffers)
+        for &alias_id in &self.alias_ids {
+            remove_fn(alias_id);
+        }
+    }
 }
 
 impl std::fmt::Debug for ExecutionPlan {
@@ -244,6 +327,9 @@ pub struct ExecutionPlanBuilder {
     ast_to_buffer: HashMap<u64, usize>,
     output_buffer_idx: usize,
     device: DeviceSpec,
+    /// Additional UOp IDs registered as aliases in buffer_registry.
+    /// These need to be cleaned up but don't have their own buffer index.
+    alias_ids: Vec<u64>,
 }
 
 impl ExecutionPlanBuilder {
@@ -256,7 +342,17 @@ impl ExecutionPlanBuilder {
             ast_to_buffer: HashMap::new(),
             output_buffer_idx: 0,
             device,
+            alias_ids: Vec::new(),
         }
+    }
+
+    /// Add alias IDs that need cleanup.
+    ///
+    /// These are UOp IDs where a buffer was registered under an alternate key
+    /// for lookup convenience. They don't have their own buffer but need to be
+    /// removed from the registry during cleanup.
+    pub fn add_alias_ids(&mut self, ids: impl IntoIterator<Item = u64>) {
+        self.alias_ids.extend(ids);
     }
 
     /// Add a buffer to the plan.
@@ -311,6 +407,7 @@ impl ExecutionPlanBuilder {
             ast_to_buffer: self.ast_to_buffer,
             output_buffer_idx: self.output_buffer_idx,
             device: self.device,
+            alias_ids: self.alias_ids,
         }
     }
 }

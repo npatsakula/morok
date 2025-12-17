@@ -27,85 +27,10 @@ use once_cell::sync::Lazy;
 use morok_ir::{AxisType, ConstValue, Op};
 
 use super::Scheduler;
+use super::config::BeamConfig;
 use super::error::*;
 use super::opts::apply_opt;
 use super::types::Opt;
-
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-
-/// Configuration for beam search auto-tuning.
-#[derive(Debug, Clone)]
-pub struct BeamConfig {
-    /// Beam width - number of candidates to keep at each step.
-    pub beam_width: usize,
-    /// Maximum search time.
-    pub timeout: Duration,
-    /// Maximum upcast size (product of UPCAST/UNROLL dimensions).
-    pub max_upcast: usize,
-    /// Maximum local size (product of LOCAL/WARP/GROUP_REDUCE dimensions).
-    pub max_local: usize,
-    /// Maximum UOps in kernel before rejecting.
-    pub max_uops: usize,
-    /// Number of benchmark runs per kernel.
-    pub num_runs: usize,
-    /// Disable disk cache.
-    pub disable_cache: bool,
-}
-
-impl Default for BeamConfig {
-    fn default() -> Self {
-        Self {
-            beam_width: 4,
-            timeout: Duration::from_secs(60),
-            max_upcast: 256,
-            max_local: 1024,
-            max_uops: 3000,
-            num_runs: 3,
-            disable_cache: false,
-        }
-    }
-}
-
-impl BeamConfig {
-    /// Create configuration from environment variables.
-    ///
-    /// # Environment Variables
-    ///
-    /// * `MOROK_BEAM` - Beam width (default: 4)
-    /// * `MOROK_BEAM_TIMEOUT` - Max search time in seconds (default: 60)
-    /// * `BEAM_UPCAST_MAX` - Max upcast size (default: 256)
-    /// * `BEAM_LOCAL_MAX` - Max local memory elements (default: 1024)
-    /// * `BEAM_UOPS_MAX` - Max UOps before rejecting (default: 3000)
-    /// * `BEAM_RUNS` - Benchmark runs per kernel (default: 3)
-    /// * `IGNORE_BEAM_CACHE` - Bypass disk cache if set
-    pub fn from_env() -> Self {
-        let beam_width = std::env::var("MOROK_BEAM").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
-
-        let timeout_secs = std::env::var("MOROK_BEAM_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
-
-        let max_upcast = std::env::var("BEAM_UPCAST_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
-
-        let max_local = std::env::var("BEAM_LOCAL_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
-
-        let max_uops = std::env::var("BEAM_UOPS_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
-
-        let num_runs = std::env::var("BEAM_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-
-        let disable_cache = std::env::var("IGNORE_BEAM_CACHE").is_ok();
-
-        Self {
-            beam_width,
-            timeout: Duration::from_secs(timeout_secs),
-            max_upcast,
-            max_local,
-            max_uops,
-            num_runs,
-            disable_cache,
-        }
-    }
-}
 
 // ============================================================================
 // ACTION SPACE
