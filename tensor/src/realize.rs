@@ -110,9 +110,9 @@ impl Tensor {
         // RAII: Wrap output buffer in Arc for ownership
         let output_buf_arc = Arc::new(output_buf.clone());
 
-        // SECONDARY: Register for schedule lookup (backwards compat during migration)
-        // Note: We only register under the new BUFFER UOp's ID, not the original base ID.
-        // This avoids memory leaks from repeated realize() calls creating orphaned registry entries.
+        // Also register in buffer_registry for subsequent schedule creation.
+        // When this realized tensor is used as input to another operation,
+        // collect_input_buffers() needs to find this buffer by UOp ID.
         crate::buffer_registry::get_or_create_buffer(buffer_uop.id, || Ok(output_buf))?;
 
         // Get the tensor's shape and reshape the buffer to match
@@ -272,13 +272,16 @@ impl Tensor {
 /// Collect input buffers from a computation graph.
 ///
 /// Walks the UOp graph and collects all BUFFER UOps that have
-/// associated buffers (either tensor-owned or in the registry).
-/// This allows schedule creation to find buffers without global registry lookups.
+/// associated buffers in the registry. Input tensors (from `from_slice()`)
+/// register their buffers for this lookup to work.
+///
+/// This allows schedule creation to receive buffers explicitly without
+/// needing global registry lookups during kernel buffer collection.
 fn collect_input_buffers(root: &Arc<UOp>) -> crate::schedule::InputBuffers {
     let mut inputs = HashMap::new();
     for node in root.toposort() {
         if let Op::Buffer { .. } = node.op() {
-            // Try registry lookup (tensor-owned buffers are also registered during migration)
+            // Input tensor buffers are registered in from_slice_on()
             if let Some(buf) = buffer_registry::get_buffer(node.id) {
                 inputs.insert(node.id, buf);
             }

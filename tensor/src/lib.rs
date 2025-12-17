@@ -102,6 +102,15 @@ impl Tensor {
         Self { entry, buffer: Some(buffer) }
     }
 
+    /// Create a new tensor from a UOp, preserving buffer from self.
+    ///
+    /// Used by movement operations (reshape, permute, etc.) that create
+    /// new view UOps but share the underlying buffer.
+    fn with_same_buffer(&self, uop: Arc<UOp>) -> Self {
+        let entry = tensor_registry::register_tensor(uop);
+        Self { entry, buffer: self.buffer.clone() }
+    }
+
     /// Get the current UOp for this tensor.
     ///
     /// This reads from the registry, so it reflects any global substitutions.
@@ -235,20 +244,14 @@ impl Tensor {
 
     /// Get a reference to the underlying buffer.
     ///
-    /// First checks tensor-owned buffer (RAII), then falls back to registry lookup
-    /// for backwards compatibility during migration.
+    /// Tensors own their buffers via RAII. Input tensors get their buffer
+    /// from `from_slice()`, realized tensors get theirs from `realize()`.
     ///
-    /// Uses `.base()` to walk through movement operations to find the actual buffer.
+    /// Returns `None` for lazy tensors that haven't been realized yet.
+    /// Returns `Some(buffer)` for input tensors and realized tensors.
     pub fn buffer(&self) -> Option<Buffer> {
-        // First: check tensor-owned buffer (no lock!)
-        if let Some(arc_buf) = &self.buffer {
-            return Some((**arc_buf).clone());
-        }
-        // Fallback: registry lookup (backwards compat during migration)
-        let uop = self.uop();
-        let base_id = uop.base().id;
-        trace!(uop.id = uop.id, base.id = base_id, "buffer lookup (registry fallback)");
-        buffer_registry::get_buffer(base_id)
+        // Tensor-owned buffer via RAII (no locks, no registry lookup)
+        self.buffer.as_ref().map(|arc_buf| (**arc_buf).clone())
     }
 
     /// Get device specification from underlying UOp graph.
