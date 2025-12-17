@@ -1054,10 +1054,13 @@ mod tests {
 
         assert_eq!(growth_during_execute, 0, "Registry should not grow during repeated execute() calls");
 
-        // Verify cleanup worked
+        // With RAII buffer ownership, intermediate buffers are tracked locally
+        // in allocated_buffers, not in the registry. So cleanup doesn't reduce
+        // the registry count - it only removes output buffer aliases.
+        // The important invariant is that execute() doesn't cause growth.
         assert!(
-            count_after_cleanup < count_after_prepare,
-            "Cleanup should reduce buffer count: before={}, after={}",
+            count_after_cleanup <= count_after_prepare,
+            "Cleanup should not increase buffer count: before={}, after={}",
             count_after_prepare,
             count_after_cleanup
         );

@@ -205,8 +205,11 @@ pub fn create_schedule(
 
     // Step 1.5: Sort kernels by dependencies (producers before consumers)
     // This ensures producer kernels are processed first, so they allocate buffers
-    // before consumers look them up via get_or_create_buffer.
+    // before consumers look them up.
     let kernels = sort_kernels_by_dependencies(&kernels, &kernel_ctx.kernel_deps);
+
+    // Track allocated intermediate buffers locally (no global registry needed)
+    let mut allocated_buffers: HashMap<u64, Buffer> = HashMap::new();
 
     // Step 2: Build reverse mapping from DEFINE_GLOBAL → original BUFFER/BUFFERIZE
     // This allows us to reuse existing input buffers instead of allocating new ones.
@@ -269,6 +272,7 @@ pub fn create_schedule(
             &reverse_id_mapping,
             &kernel_ctx.define_to_buffer_id,
             input_buffers,
+            &mut allocated_buffers,
         )?;
 
         // Collect bound ranges from kernel AST (BIND nodes with DEFINE_VAR)
@@ -327,6 +331,7 @@ fn find_first_input_buffer_device(
     define_to_buffer: &HashMap<u64, Arc<UOp>>,
     reverse_id_mapping: &HashMap<u64, u64>,
     input_buffers: &InputBuffers,
+    allocated_buffers: &HashMap<u64, Buffer>,
 ) -> Result<Arc<Device>> {
     let alloc_registry = registry::registry();
 
@@ -334,8 +339,8 @@ fn find_first_input_buffer_device(
         match src.op() {
             // Direct input buffer
             Op::Buffer { .. } => {
-                // Try input_buffers first (RAII), then registry (backwards compat)
-                let buffer = input_buffers.get(&src.id).cloned().or_else(|| crate::buffer_registry::get_buffer(src.id));
+                // Try allocated_buffers, then input_buffers (no registry needed)
+                let buffer = allocated_buffers.get(&src.id).cloned().or_else(|| input_buffers.get(&src.id).cloned());
                 if let Some(buffer) = buffer {
                     let device_spec = buffer.allocator().device_spec();
                     return morok_runtime::DEVICE_FACTORIES
@@ -351,11 +356,11 @@ fn find_first_input_buffer_device(
                     .or_else(|| reverse_id_mapping.get(&src.id).and_then(|old_id| define_to_buffer.get(old_id)));
 
                 if let Some(original_buffer) = lookup_result {
-                    // Try input_buffers first (RAII), then registry (backwards compat)
-                    let buffer = input_buffers
+                    // Try allocated_buffers, then input_buffers (no registry needed)
+                    let buffer = allocated_buffers
                         .get(&original_buffer.id)
                         .cloned()
-                        .or_else(|| crate::buffer_registry::get_buffer(original_buffer.id));
+                        .or_else(|| input_buffers.get(&original_buffer.id).cloned());
                     if let Some(buffer) = buffer {
                         let device_spec = buffer.allocator().device_spec();
                         return morok_runtime::DEVICE_FACTORIES
@@ -375,19 +380,19 @@ fn find_first_input_buffer_device(
 /// Collect buffers for a kernel from its sources.
 ///
 /// This walks the kernel sources and identifies:
-/// - Input buffers (Op::Buffer) - get from input_buffers or buffer_registry
-/// - Intermediate buffers (Op::DefineGlobal, Op::DefineLocal) - need allocation
-/// - Shared buffers (Op::After) - look up from producer kernel via registry
+/// - Input buffers (Op::Buffer) - get from input_buffers
+/// - Intermediate buffers (Op::DefineGlobal, Op::DefineLocal) - allocate and track
+/// - Shared buffers (Op::After) - look up from allocated_buffers (producer kernel)
 ///
 /// For input buffers (DEFINE_GLOBAL that maps to an original BUFFER),
-/// we reuse the existing buffer from input_buffers/registry instead of allocating.
+/// we reuse the existing buffer from input_buffers instead of allocating.
 ///
 /// For shared buffers (AFTER nodes), we look up the buffer using the original
 /// (pre-renumbered) DefineGlobal ID from the AFTER passthrough, then translate
 /// to the renumbered ID using buffer_id_mapping.
 ///
 /// Output/intermediate buffers are allocated on the same device as the first input buffer
-/// (following Tinygrad's pattern).
+/// (following Tinygrad's pattern). Newly allocated buffers are tracked in `allocated_buffers`.
 fn collect_kernel_buffers(
     sources: &[Arc<UOp>],
     kernel: &Arc<UOp>,
@@ -396,6 +401,7 @@ fn collect_kernel_buffers(
     reverse_id_mapping: &HashMap<u64, u64>,
     define_to_buffer_id: &HashMap<u64, u64>,
     input_buffers: &InputBuffers,
+    allocated_buffers: &mut HashMap<u64, Buffer>,
 ) -> Result<(Vec<Buffer>, Vec<u64>, Vec<u64>)> {
     // Get AST for buffer size computation
     let ast = match kernel.op() {
@@ -407,7 +413,8 @@ fn collect_kernel_buffers(
 
     // Get target device from first input buffer (Tinygrad pattern: ctx[0].device)
     // Pass reverse_id_mapping to handle renumbered IDs
-    let target_device = find_first_input_buffer_device(sources, define_to_buffer, reverse_id_mapping, input_buffers)?;
+    let target_device =
+        find_first_input_buffer_device(sources, define_to_buffer, reverse_id_mapping, input_buffers, allocated_buffers)?;
 
     let mut buffers = Vec::new();
     let mut uop_ids = Vec::new();
@@ -420,10 +427,11 @@ fn collect_kernel_buffers(
                 // passthrough.id is the ORIGINAL (pre-renumbered) buffer identity.
                 let original_id = passthrough.id;
 
-                // Look up using the renumbered ID (what producer registered under)
+                // Look up using the renumbered ID (what producer allocated under)
                 let lookup_id = buffer_id_mapping.get(&original_id).copied().unwrap_or(original_id);
 
-                if let Some(existing) = crate::buffer_registry::get_buffer(lookup_id) {
+                // Look up from allocated_buffers (no registry needed)
+                if let Some(existing) = allocated_buffers.get(&lookup_id).cloned() {
                     trace!(
                         original_id,
                         lookup_id,
@@ -431,16 +439,16 @@ fn collect_kernel_buffers(
                         "Found shared buffer from AFTER"
                     );
 
-                    // Also register under original_id for future lookups
+                    // Also track under original_id for future lookups
                     if original_id != lookup_id {
-                        crate::buffer_registry::get_or_create_buffer(original_id, || Ok(existing.clone()))?;
+                        allocated_buffers.insert(original_id, existing.clone());
                         alias_ids.push(original_id); // Track for cleanup
                     }
 
                     buffers.push(existing);
                     uop_ids.push(lookup_id);
                 } else {
-                    trace!(original_id, lookup_id, "after buffer not found in registry");
+                    trace!(original_id, lookup_id, "after buffer not found in allocated_buffers");
                     return Err(Error::BufferNotFound { uop_id: original_id });
                 }
             }
@@ -454,10 +462,10 @@ fn collect_kernel_buffers(
 
                 if let Some(original_buffer) = lookup_result {
                     trace!(src.id = src.id, original_buffer.id = original_buffer.id, "input buffer (reusing existing)");
-                    // This is an input buffer - reuse the existing buffer
-                    if let Some(buffer) = crate::buffer_registry::get_buffer(original_buffer.id) {
-                        // Also register under the DEFINE_GLOBAL's ID for codegen lookup
-                        crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
+                    // This is an input buffer - get from input_buffers
+                    if let Some(buffer) = input_buffers.get(&original_buffer.id).cloned() {
+                        // Also track under the DEFINE_GLOBAL's ID for later lookups
+                        allocated_buffers.insert(src.id, buffer.clone());
                         buffers.push(buffer);
                         uop_ids.push(src.id);
                     } else {
@@ -471,7 +479,7 @@ fn collect_kernel_buffers(
                         .or_else(|| reverse_id_mapping.get(&src.id).and_then(|old_id| define_to_buffer_id.get(old_id)));
 
                     if let Some(&original_buffer_id) = buffer_id_via_mapping
-                        && let Some(buffer) = crate::buffer_registry::get_buffer(original_buffer_id)
+                        && let Some(buffer) = input_buffers.get(&original_buffer_id).cloned()
                     {
                         trace!(
                             src.id = src.id,
@@ -479,19 +487,19 @@ fn collect_kernel_buffers(
                             buffer.id = ?buffer.id(),
                             "Input buffer via define_to_buffer_id"
                         );
-                        // Also register under the DEFINE_GLOBAL's ID for codegen lookup
-                        crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
+                        // Also track under the DEFINE_GLOBAL's ID for later lookups
+                        allocated_buffers.insert(src.id, buffer.clone());
                         buffers.push(buffer);
                         uop_ids.push(src.id);
                         continue;
                     }
 
-                    // First check if buffer already exists in registry (shared from another kernel)
-                    if let Some(existing) = crate::buffer_registry::get_buffer(src.id) {
+                    // Check if buffer already exists in allocated_buffers (shared from another kernel)
+                    if let Some(existing) = allocated_buffers.get(&src.id).cloned() {
                         trace!(
                             src.id = src.id,
                             buffer.id = ?existing.id(),
-                            "Shared buffer from registry"
+                            "Shared buffer from allocated_buffers"
                         );
                         buffers.push(existing);
                         uop_ids.push(src.id);
@@ -518,8 +526,8 @@ fn collect_kernel_buffers(
                         Default::default(),
                     );
 
-                    // Register in buffer registry using the UOp ID
-                    crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
+                    // Track in allocated_buffers (no registry needed)
+                    allocated_buffers.insert(src.id, buffer.clone());
 
                     buffers.push(buffer);
                     uop_ids.push(src.id);
@@ -541,15 +549,15 @@ fn collect_kernel_buffers(
                 let buffer =
                     Buffer::new(target_device.allocator.clone(), scalar_dtype.clone(), vec![size], Default::default());
 
-                // Register using UOp ID
-                crate::buffer_registry::get_or_create_buffer(src.id, || Ok(buffer.clone()))?;
+                // Track in allocated_buffers (no registry needed)
+                allocated_buffers.insert(src.id, buffer.clone());
 
                 buffers.push(buffer);
                 uop_ids.push(src.id);
             }
             Op::Buffer { .. } => {
-                // Input buffer - get from registry
-                if let Some(buffer) = crate::buffer_registry::get_buffer(src.id) {
+                // Input buffer - get from input_buffers
+                if let Some(buffer) = input_buffers.get(&src.id).cloned() {
                     buffers.push(buffer);
                     uop_ids.push(src.id);
                 } else {
