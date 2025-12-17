@@ -26,6 +26,13 @@ use crate::error::*;
 use crate::{Error, Result};
 use snafu::ResultExt;
 
+/// Input buffers collected before schedule creation.
+///
+/// Maps BUFFER UOp ID → Buffer for input tensors.
+/// This allows schedule creation to find input buffers without
+/// global registry lookups (RAII migration).
+pub type InputBuffers = HashMap<u64, Buffer>;
+
 /// A bound range variable that needs to be iterated over.
 ///
 /// This represents a BIND(DEFINE_VAR, RANGE) node from the kernel AST.
@@ -167,6 +174,8 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], kernel_deps: &[KernelDepen
 ///
 /// * `transformed` - The UOp graph after rangeify + kernel splitting
 /// * `kernel_ctx` - The KernelContext from kernel splitting, containing buffer_map
+/// * `input_buffers` - Pre-collected input buffers (for RAII migration).
+///   If a buffer is found here, it's used directly instead of registry lookup.
 ///
 /// # Returns
 ///
@@ -177,7 +186,11 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], kernel_deps: &[KernelDepen
 /// Returns error if:
 /// - No kernels found after scheduling pipeline
 /// - Buffer not found in registry for a kernel source
-pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Result<Schedule> {
+pub fn create_schedule(
+    transformed: Arc<UOp>,
+    kernel_ctx: KernelContext,
+    input_buffers: &InputBuffers,
+) -> Result<Schedule> {
     // Step 1: Find all KERNEL operations
     let mut kernels = Vec::new();
     for node in transformed.toposort() {
@@ -255,6 +268,7 @@ pub fn create_schedule(transformed: Arc<UOp>, kernel_ctx: KernelContext) -> Resu
             &kernel_ctx.buffer_id_mapping,
             &reverse_id_mapping,
             &kernel_ctx.define_to_buffer_id,
+            input_buffers,
         )?;
 
         // Collect bound ranges from kernel AST (BIND nodes with DEFINE_VAR)
@@ -312,6 +326,7 @@ fn find_first_input_buffer_device(
     sources: &[Arc<UOp>],
     define_to_buffer: &HashMap<u64, Arc<UOp>>,
     reverse_id_mapping: &HashMap<u64, u64>,
+    input_buffers: &InputBuffers,
 ) -> Result<Arc<Device>> {
     let alloc_registry = registry::registry();
 
@@ -319,7 +334,9 @@ fn find_first_input_buffer_device(
         match src.op() {
             // Direct input buffer
             Op::Buffer { .. } => {
-                if let Some(buffer) = crate::buffer_registry::get_buffer(src.id) {
+                // Try input_buffers first (RAII), then registry (backwards compat)
+                let buffer = input_buffers.get(&src.id).cloned().or_else(|| crate::buffer_registry::get_buffer(src.id));
+                if let Some(buffer) = buffer {
                     let device_spec = buffer.allocator().device_spec();
                     return morok_runtime::DEVICE_FACTORIES
                         .device(&device_spec, alloc_registry)
@@ -333,13 +350,18 @@ fn find_first_input_buffer_device(
                     .get(&src.id)
                     .or_else(|| reverse_id_mapping.get(&src.id).and_then(|old_id| define_to_buffer.get(old_id)));
 
-                if let Some(original_buffer) = lookup_result
-                    && let Some(buffer) = crate::buffer_registry::get_buffer(original_buffer.id)
-                {
-                    let device_spec = buffer.allocator().device_spec();
-                    return morok_runtime::DEVICE_FACTORIES
-                        .device(&device_spec, alloc_registry)
-                        .context(DeviceFactorySnafu);
+                if let Some(original_buffer) = lookup_result {
+                    // Try input_buffers first (RAII), then registry (backwards compat)
+                    let buffer = input_buffers
+                        .get(&original_buffer.id)
+                        .cloned()
+                        .or_else(|| crate::buffer_registry::get_buffer(original_buffer.id));
+                    if let Some(buffer) = buffer {
+                        let device_spec = buffer.allocator().device_spec();
+                        return morok_runtime::DEVICE_FACTORIES
+                            .device(&device_spec, alloc_registry)
+                            .context(DeviceFactorySnafu);
+                    }
                 }
             }
             _ => continue,
@@ -353,12 +375,12 @@ fn find_first_input_buffer_device(
 /// Collect buffers for a kernel from its sources.
 ///
 /// This walks the kernel sources and identifies:
-/// - Input buffers (Op::Buffer) - get from buffer_registry
+/// - Input buffers (Op::Buffer) - get from input_buffers or buffer_registry
 /// - Intermediate buffers (Op::DefineGlobal, Op::DefineLocal) - need allocation
 /// - Shared buffers (Op::After) - look up from producer kernel via registry
 ///
 /// For input buffers (DEFINE_GLOBAL that maps to an original BUFFER),
-/// we reuse the existing buffer from the registry instead of allocating a new one.
+/// we reuse the existing buffer from input_buffers/registry instead of allocating.
 ///
 /// For shared buffers (AFTER nodes), we look up the buffer using the original
 /// (pre-renumbered) DefineGlobal ID from the AFTER passthrough, then translate
@@ -373,6 +395,7 @@ fn collect_kernel_buffers(
     buffer_id_mapping: &HashMap<u64, u64>,
     reverse_id_mapping: &HashMap<u64, u64>,
     define_to_buffer_id: &HashMap<u64, u64>,
+    input_buffers: &InputBuffers,
 ) -> Result<(Vec<Buffer>, Vec<u64>, Vec<u64>)> {
     // Get AST for buffer size computation
     let ast = match kernel.op() {
@@ -384,7 +407,7 @@ fn collect_kernel_buffers(
 
     // Get target device from first input buffer (Tinygrad pattern: ctx[0].device)
     // Pass reverse_id_mapping to handle renumbered IDs
-    let target_device = find_first_input_buffer_device(sources, define_to_buffer, reverse_id_mapping)?;
+    let target_device = find_first_input_buffer_device(sources, define_to_buffer, reverse_id_mapping, input_buffers)?;
 
     let mut buffers = Vec::new();
     let mut uop_ids = Vec::new();

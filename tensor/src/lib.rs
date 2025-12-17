@@ -60,6 +60,12 @@ pub struct KernelInfo {
 /// This is critical for diamond patterns (like argmin's NEG feeding both MAX and EQ)
 /// where different consumers must see the same transformed version.
 ///
+/// # Buffer Ownership (RAII)
+///
+/// Tensors own their buffers via `Arc<Buffer>`. When all Tensor clones referencing
+/// a buffer are dropped, the buffer is automatically freed. This provides RAII
+/// cleanup without manual buffer management.
+///
 /// # Examples
 ///
 /// ```
@@ -69,17 +75,31 @@ pub struct KernelInfo {
 /// let c = &a + &b;  // Lazy - only builds UOp graph
 /// let realized = c.realize().unwrap();  // Executes the computation
 /// ```
-#[derive(Clone)]
 pub struct Tensor {
     /// Registry entry holding the computation graph (supports global substitution)
     entry: Arc<tensor_registry::TensorEntry>,
+    /// Owned buffer for RAII cleanup. None for lazy tensors.
+    buffer: Option<Arc<Buffer>>,
+}
+
+// Manual Clone impl to share Arc<Buffer> across clones
+impl Clone for Tensor {
+    fn clone(&self) -> Self {
+        Self { entry: Arc::clone(&self.entry), buffer: self.buffer.clone() }
+    }
 }
 
 #[bon]
 impl Tensor {
+    /// Create tensor without buffer (for lazy computation graphs).
     fn new(uop: Arc<UOp>) -> Self {
         let entry = tensor_registry::register_tensor(uop);
-        Self { entry }
+        Self { entry, buffer: None }
+    }
+
+    /// Create tensor with existing buffer (for input tensors and realize results).
+    pub(crate) fn with_buffer(entry: Arc<tensor_registry::TensorEntry>, buffer: Arc<Buffer>) -> Self {
+        Self { entry, buffer: Some(buffer) }
     }
 
     /// Get the current UOp for this tensor.
@@ -198,19 +218,36 @@ impl Tensor {
         let mut buffer = Buffer::new(allocator, dtype.clone(), vec![source.len()], Default::default());
         let bytes = unsafe { std::slice::from_raw_parts(source.as_ptr() as *const u8, source.len() * dtype.bytes()) };
         buffer.copyin(bytes).expect("Buffer write always successful");
-        buffer_registry::get_or_create_buffer(buffer_uop.id, || Ok(buffer)).expect("Buffer registration failed");
+
+        // RAII: Wrap buffer in Arc for ownership
+        let buffer_arc = Arc::new(buffer);
+
+        // SECONDARY: Register for schedule lookup (backwards compat during migration)
+        buffer_registry::get_or_create_buffer(buffer_uop.id, || Ok((*buffer_arc).clone()))
+            .expect("Buffer registration failed");
 
         let uop = buffer_uop.try_reshape(&shape).expect("this reshape is always successful");
-        Self::new(uop)
+
+        // PRIMARY: Create tensor with buffer (RAII ownership)
+        let entry = tensor_registry::register_tensor(uop);
+        Self::with_buffer(entry, buffer_arc)
     }
 
-    /// Get a reference to the underlying buffer from the registry.
-    /// This allows multi-buffer operations to access buffers from multiple tensors.
+    /// Get a reference to the underlying buffer.
+    ///
+    /// First checks tensor-owned buffer (RAII), then falls back to registry lookup
+    /// for backwards compatibility during migration.
+    ///
     /// Uses `.base()` to walk through movement operations to find the actual buffer.
     pub fn buffer(&self) -> Option<Buffer> {
+        // First: check tensor-owned buffer (no lock!)
+        if let Some(arc_buf) = &self.buffer {
+            return Some((**arc_buf).clone());
+        }
+        // Fallback: registry lookup (backwards compat during migration)
         let uop = self.uop();
         let base_id = uop.base().id;
-        trace!(uop.id = uop.id, base.id = base_id, "buffer lookup");
+        trace!(uop.id = uop.id, base.id = base_id, "buffer lookup (registry fallback)");
         buffer_registry::get_buffer(base_id)
     }
 

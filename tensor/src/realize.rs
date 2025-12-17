@@ -86,11 +86,6 @@ impl Tensor {
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
 
-        // Release ALL buffers from the global registry, including the output.
-        // This prevents memory growth from repeated realize() calls.
-        // The output buffer will be re-registered under the new BUFFER UOp's ID below.
-        plan.release_all_buffers(buffer_registry::remove_buffer);
-
         // Get output buffer and its properties
         let output_buf = plan.output_buffer().clone();
 
@@ -112,7 +107,10 @@ impl Tensor {
         // and don't re-compute it.
         let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype.clone());
 
-        // Register the output buffer under the new BUFFER UOp's ID
+        // RAII: Wrap output buffer in Arc for ownership
+        let output_buf_arc = Arc::new(output_buf.clone());
+
+        // SECONDARY: Register for schedule lookup (backwards compat during migration)
         // Note: We only register under the new BUFFER UOp's ID, not the original base ID.
         // This avoids memory leaks from repeated realize() calls creating orphaned registry entries.
         crate::buffer_registry::get_or_create_buffer(buffer_uop.id, || Ok(output_buf))?;
@@ -132,7 +130,15 @@ impl Tensor {
 
         // Update this tensor's UOp to point to the realized buffer
         self.set_uop(realized_uop);
-        Ok(self)
+
+        // PRIMARY: Create NEW tensor with buffer (RAII ownership)
+        // Since realize(self) consumes self, we return a new Tensor with buffer set
+        let result = Tensor::with_buffer(Arc::clone(&self.entry), output_buf_arc);
+
+        // Only clean up INTERMEDIATES (not output - we own it now via RAII)
+        plan.release_intermediate_buffers(buffer_registry::remove_buffer);
+
+        Ok(result)
     }
 
     /// Prepare an execution plan for this tensor's computation graph.
@@ -250,13 +256,35 @@ impl Tensor {
 
         trace!(ast = %kernelized.tree_full(), "post-kernel-split ast");
 
-        // Step 5: Create schedule from kernels
-        let schedule = crate::schedule::create_schedule(kernelized, kernel_ctx)?;
+        // Step 5: Collect input buffers from the computation graph
+        // This allows schedule creation to find buffers without global registry lookups
+        let input_buffers = collect_input_buffers(&uop);
 
-        // Step 6: Build execution plan (pass expected output dtype and size)
+        // Step 6: Create schedule from kernels
+        let schedule = crate::schedule::create_schedule(kernelized, kernel_ctx, &input_buffers)?;
+
+        // Step 7: Build execution plan (pass expected output dtype and size)
         let output_size = shape.iter().map(|s| s.as_const().unwrap_or(1)).product::<usize>() * output_dtype.bytes();
         prepare_execution_plan(&schedule, output_dtype, output_size, config)
     }
+}
+
+/// Collect input buffers from a computation graph.
+///
+/// Walks the UOp graph and collects all BUFFER UOps that have
+/// associated buffers (either tensor-owned or in the registry).
+/// This allows schedule creation to find buffers without global registry lookups.
+fn collect_input_buffers(root: &Arc<UOp>) -> crate::schedule::InputBuffers {
+    let mut inputs = HashMap::new();
+    for node in root.toposort() {
+        if let Op::Buffer { .. } = node.op() {
+            // Try registry lookup (tensor-owned buffers are also registered during migration)
+            if let Some(buf) = buffer_registry::get_buffer(node.id) {
+                inputs.insert(node.id, buf);
+            }
+        }
+    }
+    inputs
 }
 
 /// Build an execution graph from an expanded schedule.
