@@ -41,8 +41,16 @@ pub fn codegen_uop<'ctx>(
     // REDUCE ranges must ONLY be handled by codegen_reduce which creates their loop structure.
     // Don't process or cache them here - codegen_reduce will insert them into values when ready.
     // This prevents LLVM dominator errors where range counters are used before defined.
-    if let Op::Range { axis_type: AxisType::Reduce, .. } = uop.op() {
-        trace!(uop_id = uop.id, "codegen_uop: skipping REDUCE range - handled by codegen_reduce");
+    //
+    // FALLBACK: After graph_rewrite in pre_expand, Range nodes may have different UOp IDs
+    // even though they're semantically equivalent (same axis_id). Try axis-based lookup first.
+    if let Op::Range { axis_type: AxisType::Reduce, axis_id, .. } = uop.op() {
+        // Try fallback: look for cached Range(Reduce) with same axis_id
+        if let Some(val) = values.get_reduce_by_axis(axis_id.value()) {
+            // Cache by this ID for future lookups
+            values.insert(uop.id, val);
+            return Ok(Some(val));
+        }
         return Ok(None);
     }
 
@@ -90,9 +98,15 @@ enum OpCategory {
 
 fn classify_op(op: &Op) -> OpCategory {
     match op {
-        Op::Const(_) => OpCategory::Constant,
+        Op::Const(_) | Op::VConst { .. } => OpCategory::Constant,
 
         Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } => OpCategory::Arithmetic,
+
+        // Contract/Unroll are metadata wrappers from pre_expand pass - pass through to source
+        Op::Contract { .. } | Op::Unroll { .. } => OpCategory::Arithmetic,
+
+        // Vector element operations
+        Op::Gep { .. } | Op::Cat { .. } | Op::PtrCat { .. } => OpCategory::Arithmetic,
 
         Op::Load { .. } | Op::Store { .. } | Op::Index { .. } | Op::PointerIndex { .. } => OpCategory::Memory,
 
@@ -131,21 +145,65 @@ fn classify_op(op: &Op) -> OpCategory {
 // ============================================================================
 
 fn codegen_constant<'ctx>(uop: &Arc<UOp>, context: &'ctx Context) -> Result<Option<BasicValueEnum<'ctx>>> {
-    let Op::Const(val_hash) = uop.op() else {
-        return Ok(None);
-    };
+    match uop.op() {
+        Op::Const(val_hash) => {
+            let dtype = uop.dtype();
+            let llvm_type = common::dtype_to_basic_type(&dtype, context)?;
 
-    let dtype = uop.dtype();
-    let llvm_type = common::dtype_to_basic_type(&dtype, context)?;
+            let value = match val_hash.0 {
+                ConstValue::Int(i) => llvm_type.into_int_type().const_int(i as u64, true).into(),
+                ConstValue::UInt(u) => llvm_type.into_int_type().const_int(u, false).into(),
+                ConstValue::Float(f) => llvm_type.into_float_type().const_float(f).into(),
+                ConstValue::Bool(b) => context.bool_type().const_int(b as u64, false).into(),
+            };
+            Ok(Some(value))
+        }
+        Op::VConst { values } => {
+            use inkwell::types::VectorType;
 
-    let value = match val_hash.0 {
-        ConstValue::Int(i) => llvm_type.into_int_type().const_int(i as u64, true).into(),
-        ConstValue::UInt(u) => llvm_type.into_int_type().const_int(u, false).into(),
-        ConstValue::Float(f) => llvm_type.into_float_type().const_float(f).into(),
-        ConstValue::Bool(b) => context.bool_type().const_int(b as u64, false).into(),
-    };
+            if values.is_empty() {
+                return Ok(None);
+            }
 
-    Ok(Some(value))
+            // Get scalar type from UOp's dtype (which should be a Vector type)
+            let dtype = uop.dtype();
+            let scalar_dtype = dtype.base();
+            let scalar_llvm = common::scalar_to_basic_type(scalar_dtype, context)?;
+
+            // Create vector constant based on scalar type from dtype
+            match scalar_llvm {
+                inkwell::types::BasicTypeEnum::IntType(it) => {
+                    let llvm_values: Vec<_> = values
+                        .iter()
+                        .map(|v| match v {
+                            ConstValue::Int(i) => it.const_int(*i as u64, scalar_dtype.is_signed()),
+                            ConstValue::UInt(u) => it.const_int(*u, false),
+                            ConstValue::Bool(b) => it.const_int(*b as u64, false),
+                            ConstValue::Float(f) => it.const_int(*f as u64, false),
+                        })
+                        .collect();
+                    Ok(Some(VectorType::const_vector(&llvm_values).into()))
+                }
+                inkwell::types::BasicTypeEnum::FloatType(ft) => {
+                    let llvm_values: Vec<_> = values
+                        .iter()
+                        .map(|v| match v {
+                            ConstValue::Float(f) => ft.const_float(*f),
+                            ConstValue::Int(i) => ft.const_float(*i as f64),
+                            ConstValue::UInt(u) => ft.const_float(*u as f64),
+                            ConstValue::Bool(b) => ft.const_float(if *b { 1.0 } else { 0.0 }),
+                        })
+                        .collect();
+                    Ok(Some(VectorType::const_vector(&llvm_values).into()))
+                }
+                _ => {
+                    // Fallback for unsupported types
+                    Ok(None)
+                }
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 // ============================================================================
@@ -170,6 +228,10 @@ fn codegen_arithmetic<'ctx>(
             let rhs_val_raw = require_value(rhs, context, module, builder, values)?;
             let lhs_val = auto_load_pointer(lhs_val_raw, &lhs.dtype(), context, builder)?;
             let rhs_val = auto_load_pointer(rhs_val_raw, &rhs.dtype(), context, builder)?;
+
+            // Harmonize operands: broadcast scalar to match vector width if needed
+            let (lhs_val, rhs_val) = common::harmonize_operands(builder, lhs_val, rhs_val, context)?;
+
             debug!(
                 uop_id = uop.id,
                 op = ?op,
@@ -195,6 +257,30 @@ fn codegen_arithmetic<'ctx>(
             let a_val = auto_load_pointer(a_val, &a.dtype(), context, builder)?;
             let b_val = auto_load_pointer(b_val, &b.dtype(), context, builder)?;
             let c_val = auto_load_pointer(c_val, &c.dtype(), context, builder)?;
+
+            // Harmonize all three operands to the maximum vector width
+            let max_count = [a_val, b_val, c_val]
+                .iter()
+                .map(|v| common::get_vector_count(*v))
+                .max()
+                .unwrap_or(1);
+
+            let a_val = if max_count > 1 && common::get_vector_count(a_val) == 1 {
+                common::broadcast_to_vector(builder, a_val, max_count, context)?
+            } else {
+                a_val
+            };
+            let b_val = if max_count > 1 && common::get_vector_count(b_val) == 1 {
+                common::broadcast_to_vector(builder, b_val, max_count, context)?
+            } else {
+                b_val
+            };
+            let c_val = if max_count > 1 && common::get_vector_count(c_val) == 1 {
+                common::broadcast_to_vector(builder, c_val, max_count, context)?
+            } else {
+                c_val
+            };
+
             Ok(Some(codegen_ternary(*op, a_val, b_val, c_val, &uop.dtype(), module, builder)?))
         }
         Op::Cast { src, dtype } => {
@@ -206,6 +292,106 @@ fn codegen_arithmetic<'ctx>(
                 other => other,
             };
             Ok(Some(codegen_cast(src_val, &actual_src_dtype, dtype, context, builder)?))
+        }
+        // Contract/Unroll are metadata wrappers from pre_expand pass
+        // They document unrolled axes but don't affect code generation - pass through to source
+        Op::Contract { src, .. } | Op::Unroll { src, .. } => {
+            require_value(src, context, module, builder, values).map(Some)
+        }
+        // GEP extracts element(s) from a vector
+        Op::Gep { vector, indices } => {
+            let vec_val = require_value(vector, context, module, builder, values)?;
+            let vec_val = auto_load_pointer(vec_val, &vector.dtype(), context, builder)?;
+
+            if !vec_val.is_vector_value() {
+                // Not a vector - just pass through
+                return Ok(Some(vec_val));
+            }
+
+            if indices.len() == 1 {
+                // Single index: extractelement
+                let idx = context.i32_type().const_int(indices[0] as u64, false);
+                let extracted = builder
+                    .build_extract_element(vec_val.into_vector_value(), idx, "gep")
+                    .context(VectorExtractSnafu)?;
+                Ok(Some(extracted.into()))
+            } else {
+                // Multiple indices: build new vector with selected elements
+                let result_count = indices.len() as u32;
+                let vec = vec_val.into_vector_value();
+                let elem_type = vec.get_type().get_element_type();
+                let result_type = match elem_type {
+                    inkwell::types::BasicTypeEnum::IntType(it) => it.vec_type(result_count),
+                    inkwell::types::BasicTypeEnum::FloatType(ft) => ft.vec_type(result_count),
+                    _ => return Ok(Some(vec_val)),
+                };
+
+                let mut result: BasicValueEnum = result_type.get_poison().into();
+                for (i, &src_idx) in indices.iter().enumerate() {
+                    let extract_idx = context.i32_type().const_int(src_idx as u64, false);
+                    let extracted = builder
+                        .build_extract_element(vec, extract_idx, "gep_elem")
+                        .context(VectorExtractSnafu)?;
+                    let insert_idx = context.i32_type().const_int(i as u64, false);
+                    result = builder
+                        .build_insert_element(result.into_vector_value(), extracted, insert_idx, "gep_build")
+                        .context(VectorInsertSnafu)?
+                        .into();
+                }
+                Ok(Some(result))
+            }
+        }
+        // Cat concatenates vectors into a larger vector
+        Op::Cat { sources } | Op::PtrCat { sources } => {
+            // Flatten all source elements into a single vector
+            let mut all_elements: Vec<BasicValueEnum> = Vec::new();
+            for src in sources.iter() {
+                let val = require_value(src, context, module, builder, values)?;
+                let val = auto_load_pointer(val, &src.dtype(), context, builder)?;
+
+                if val.is_vector_value() {
+                    // Extract all elements from vector
+                    let vec = val.into_vector_value();
+                    let count = vec.get_type().get_size();
+                    for i in 0..count {
+                        let idx = context.i32_type().const_int(i as u64, false);
+                        let elem = builder
+                            .build_extract_element(vec, idx, "cat_extract")
+                            .context(VectorExtractSnafu)?;
+                        all_elements.push(elem.into());
+                    }
+                } else {
+                    all_elements.push(val);
+                }
+            }
+
+            if all_elements.is_empty() {
+                return Ok(None);
+            }
+
+            if all_elements.len() == 1 {
+                return Ok(Some(all_elements[0]));
+            }
+
+            // Build result vector
+            let count = all_elements.len() as u32;
+            let vec_type = if all_elements[0].is_float_value() {
+                all_elements[0].into_float_value().get_type().vec_type(count)
+            } else if all_elements[0].is_int_value() {
+                all_elements[0].into_int_value().get_type().vec_type(count)
+            } else {
+                return Ok(Some(all_elements[0]));
+            };
+
+            let mut result: BasicValueEnum = vec_type.get_poison().into();
+            for (i, elem) in all_elements.into_iter().enumerate() {
+                let idx = context.i32_type().const_int(i as u64, false);
+                result = builder
+                    .build_insert_element(result.into_vector_value(), elem, idx, "cat_build")
+                    .context(VectorInsertSnafu)?
+                    .into();
+            }
+            Ok(Some(result))
         }
         _ => Ok(None),
     }
@@ -326,11 +512,63 @@ fn codegen_cast<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>> {
-    let dst_type = common::dtype_to_basic_type(dst_dtype, context)?;
     let src_is_float = src_dtype.is_float();
     let dst_is_float = dst_dtype.is_float();
     let src_is_signed = src_dtype.is_signed();
     let dst_is_signed = dst_dtype.is_signed();
+
+    // Handle vector types
+    if src.is_vector_value() {
+        let vec = src.into_vector_value();
+        let vec_len = vec.get_type().get_size();
+
+        // Get scalar destination type
+        let scalar_dst_dtype = DType::Scalar(dst_dtype.base());
+        let scalar_dst_type = common::dtype_to_basic_type(&scalar_dst_dtype, context)?;
+
+        // Build vector type for destination
+        let dst_vec_type = match scalar_dst_type {
+            inkwell::types::BasicTypeEnum::IntType(it) => it.vec_type(vec_len),
+            inkwell::types::BasicTypeEnum::FloatType(ft) => ft.vec_type(vec_len),
+            _ => return UnsupportedSnafu { what: "Unsupported cast destination type for vector" }.fail(),
+        };
+
+        // Element-wise cast
+        let mut result: BasicValueEnum = dst_vec_type.get_poison().into();
+        for i in 0..vec_len {
+            let idx = context.i32_type().const_int(i as u64, false);
+            let elem = builder
+                .build_extract_element(vec, idx, "cast_extract")
+                .context(VectorExtractSnafu)?;
+
+            // Cast the scalar element
+            let casted = codegen_cast_scalar(elem, src_is_float, dst_is_float, src_is_signed, dst_is_signed, src_dtype, dst_dtype, context, builder)?;
+
+            result = builder
+                .build_insert_element(result.into_vector_value(), casted, idx, "cast_insert")
+                .context(VectorInsertSnafu)?
+                .into();
+        }
+
+        return Ok(result);
+    }
+
+    // Scalar path
+    codegen_cast_scalar(src, src_is_float, dst_is_float, src_is_signed, dst_is_signed, src_dtype, dst_dtype, context, builder)
+}
+
+fn codegen_cast_scalar<'ctx>(
+    src: BasicValueEnum<'ctx>,
+    src_is_float: bool,
+    dst_is_float: bool,
+    src_is_signed: bool,
+    dst_is_signed: bool,
+    src_dtype: &DType,
+    dst_dtype: &DType,
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+) -> Result<BasicValueEnum<'ctx>> {
+    let dst_type = common::dtype_to_basic_type(dst_dtype, context)?;
 
     match (src_is_float, dst_is_float) {
         (true, true) => {
@@ -416,6 +654,60 @@ fn codegen_memory<'ctx>(
                     result_dtype = ?uop.dtype(),
                     "INDEX: buffer[index]"
                 );
+
+                // Handle vector indices (from UNROLL optimization) - perform gather
+                if index_val.is_vector_value() {
+                    let vec_indices = index_val.into_vector_value();
+                    let vec_len = vec_indices.get_type().get_size();
+
+                    // Get element type from buffer's dtype
+                    let element_type = match buffer.dtype() {
+                        DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
+                        _ => return UnsupportedSnafu { what: "INDEX buffer must be Ptr type" }.fail(),
+                    };
+
+                    // Build vector of loaded values using extractelement + GEP + load
+                    let result_vec_type = match element_type {
+                        inkwell::types::BasicTypeEnum::FloatType(ft) => ft.vec_type(vec_len),
+                        inkwell::types::BasicTypeEnum::IntType(it) => it.vec_type(vec_len),
+                        _ => return UnsupportedSnafu { what: "Unsupported element type for vector gather" }.fail(),
+                    };
+
+                    let mut result: BasicValueEnum = result_vec_type.get_poison().into();
+                    let ptr_val = buffer_ptr.into_pointer_value();
+
+                    for i in 0..vec_len {
+                        // Extract index
+                        let idx_const = context.i32_type().const_int(i as u64, false);
+                        let scalar_idx = builder
+                            .build_extract_element(vec_indices, idx_const, "gather_idx")
+                            .context(VectorExtractSnafu)?
+                            .into_int_value();
+
+                        // GEP to get pointer
+                        let elem_ptr = unsafe {
+                            builder
+                                .build_gep(element_type, ptr_val, &[scalar_idx], "gather_gep")
+                                .context(BuildGepSnafu)?
+                        };
+
+                        // Load element
+                        let elem_val = builder
+                            .build_load(element_type, elem_ptr, "gather_load")
+                            .context(BuildLoadSnafu)?;
+
+                        // Insert into result vector
+                        result = builder
+                            .build_insert_element(result.into_vector_value(), elem_val, idx_const, "gather_insert")
+                            .context(VectorInsertSnafu)?
+                            .into();
+                    }
+
+                    debug!(uop_id = uop.id, result = ?result, "INDEX: vector gather complete");
+                    return Ok(Some(result));
+                }
+
+                // Scalar index - regular GEP
                 let element_type = match uop.dtype() {
                     DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
                     other => common::dtype_to_basic_type(&other, context)?,
@@ -571,15 +863,55 @@ fn codegen_loop<'ctx>(
         Op::Barrier { src, .. } => codegen_uop(src, context, module, builder, values),
         Op::Noop | Op::Unique(_) | Op::Device(_) => Ok(None),
         Op::Vectorize { elements } => {
-            if elements.len() == 1 {
-                codegen_uop(&elements[0], context, module, builder, values)
-            } else {
-                let mut last_val = None;
-                for elem in elements {
-                    last_val = codegen_uop(elem, context, module, builder, values)?;
-                }
-                Ok(last_val)
+            if elements.is_empty() {
+                return Ok(None);
             }
+
+            // Compile all elements
+            let mut elem_vals: Vec<BasicValueEnum> = Vec::with_capacity(elements.len());
+            for elem in elements.iter() {
+                let val = require_value(elem, context, module, builder, values)?;
+                let val = auto_load_pointer(val, &elem.dtype(), context, builder)?;
+                elem_vals.push(val);
+            }
+
+            let count = elem_vals.len() as u32;
+
+            // Single element: return as-is (scalar)
+            if count == 1 {
+                return Ok(Some(elem_vals[0]));
+            }
+
+            // Check if all elements are the same UOp (broadcast case)
+            let all_same = elements.iter().skip(1).all(|e| e.id == elements[0].id);
+            if all_same {
+                return Ok(Some(common::broadcast_to_vector(
+                    builder,
+                    elem_vals[0],
+                    count,
+                    context,
+                )?));
+            }
+
+            // Build vector via insertelement chain
+            let vec_type = if elem_vals[0].is_float_value() {
+                elem_vals[0].into_float_value().get_type().vec_type(count)
+            } else if elem_vals[0].is_int_value() {
+                elem_vals[0].into_int_value().get_type().vec_type(count)
+            } else {
+                return Ok(Some(elem_vals[0]));
+            };
+
+            let mut vec: BasicValueEnum = vec_type.get_poison().into();
+            for (i, val) in elem_vals.into_iter().enumerate() {
+                let idx = context.i32_type().const_int(i as u64, false);
+                vec = builder
+                    .build_insert_element(vec.into_vector_value(), val, idx, &format!("vec_{}", i))
+                    .context(VectorInsertSnafu)?
+                    .into();
+            }
+
+            Ok(Some(vec))
         }
         _ => Ok(None),
     }
@@ -735,14 +1067,15 @@ fn codegen_reduce<'ctx>(
     // Build nested counting loops for reduce ranges
     let mut loop_ctxs = Vec::new();
     for (i, range_uop) in reduce_ranges.iter().enumerate() {
-        let Op::Range { end, .. } = range_uop.op() else {
+        let Op::Range { end, axis_id, .. } = range_uop.op() else {
             return UnsupportedSnafu { what: "REDUCE range must be RANGE op" }.fail();
         };
 
         // Check for size-1 loop - no loop needed, just use 0
         if is_const_one(end) {
             let zero = context.i64_type().const_int(0, false);
-            values.insert(range_uop.id, zero.into());
+            // Use insert_reduce_range to allow axis-based fallback lookup
+            values.insert_reduce_range(range_uop.id, axis_id.value(), zero.into());
             // Don't push to loop_ctxs - no loop to close
             continue;
         }
@@ -753,7 +1086,8 @@ fn codegen_reduce<'ctx>(
         let loop_id = reduce_id + i as u64;
         let (loop_ctx, counter_val) = loop_gen::build_loop(context, builder, function, end_int, loop_id)?;
 
-        values.insert(range_uop.id, counter_val.into());
+        // Use insert_reduce_range to allow axis-based fallback lookup
+        values.insert_reduce_range(range_uop.id, axis_id.value(), counter_val.into());
         loop_ctxs.push(loop_ctx);
     }
 
@@ -778,6 +1112,15 @@ fn codegen_reduce<'ctx>(
     );
     let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
     trace!(src_val_loaded = ?src_val, "reduce after auto_load");
+
+    // If source is vectorized (from UNROLL/CONTRACT), perform horizontal reduction first
+    // This collapses the vector to a scalar before accumulating
+    let src_val = if src_val.is_vector_value() {
+        trace!("vectorized source detected, performing horizontal reduction");
+        codegen_horizontal_reduce(reduce_op, src_val.into_vector_value(), result_dtype, context, module, builder)?
+    } else {
+        src_val
+    };
 
     // Load accumulator AFTER source evaluation (inside any source loops)
     // This ensures we get the current value, not a stale one from before the source loops
@@ -1131,5 +1474,72 @@ fn codegen_reduce_op<'ctx>(
                 call_intrinsic(&format!("llvm.umin.i{}", dtype.bytes() * 8), &[acc, src], "reduce_min", module, builder)
             }
         }
+    }
+}
+
+/// Perform horizontal reduction on a vector value using LLVM vector.reduce intrinsics.
+///
+/// This collapses a vector to a scalar using the specified reduce operation.
+/// Used when CONTRACT's source is vectorized (from UNROLL optimization).
+fn codegen_horizontal_reduce<'ctx>(
+    reduce_op: ReduceOp,
+    vector: inkwell::values::VectorValue<'ctx>,
+    result_dtype: &DType,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    builder: &Builder<'ctx>,
+) -> Result<BasicValueEnum<'ctx>> {
+    let vec_size = vector.get_type().get_size();
+    let is_float = result_dtype.is_float();
+    let scalar_bits = result_dtype.base().bytes() * 8;
+
+    // Build intrinsic name based on operation and type
+    let type_suffix = if is_float {
+        format!("v{}f{}", vec_size, scalar_bits)
+    } else {
+        format!("v{}i{}", vec_size, scalar_bits)
+    };
+
+    let intrinsic_name = match (reduce_op, is_float, result_dtype.is_signed()) {
+        (ReduceOp::Add, true, _) => format!("llvm.vector.reduce.fadd.{}", type_suffix),
+        (ReduceOp::Add, false, _) => format!("llvm.vector.reduce.add.{}", type_suffix),
+        (ReduceOp::Mul, true, _) => format!("llvm.vector.reduce.fmul.{}", type_suffix),
+        (ReduceOp::Mul, false, _) => format!("llvm.vector.reduce.mul.{}", type_suffix),
+        (ReduceOp::Max, true, _) => format!("llvm.vector.reduce.fmax.{}", type_suffix),
+        (ReduceOp::Max, false, true) => format!("llvm.vector.reduce.smax.{}", type_suffix),
+        (ReduceOp::Max, false, false) => format!("llvm.vector.reduce.umax.{}", type_suffix),
+        (ReduceOp::Min, true, _) => format!("llvm.vector.reduce.fmin.{}", type_suffix),
+        (ReduceOp::Min, false, true) => format!("llvm.vector.reduce.smin.{}", type_suffix),
+        (ReduceOp::Min, false, false) => format!("llvm.vector.reduce.umin.{}", type_suffix),
+    };
+
+    // Get the intrinsic
+    let intrinsic = Intrinsic::find(&intrinsic_name)
+        .context(IntrinsicNotFoundSnafu { name: intrinsic_name.clone() })?;
+
+    // Get declaration with vector type
+    let fn_val = intrinsic
+        .get_declaration(module, &[vector.get_type().into()])
+        .context(IntrinsicDeclarationSnafu { name: intrinsic_name.clone() })?;
+
+    // fadd/fmul need identity value as first argument (ordered reduction)
+    let args: Vec<BasicValueEnum> = if is_float && matches!(reduce_op, ReduceOp::Add | ReduceOp::Mul) {
+        let identity = if reduce_op == ReduceOp::Add { 0.0 } else { 1.0 };
+        let scalar_type = common::dtype_to_basic_type(&DType::Scalar(result_dtype.base()), context)?;
+        let identity_val = scalar_type.into_float_type().const_float(identity);
+        vec![identity_val.into(), vector.into()]
+    } else {
+        vec![vector.into()]
+    };
+
+    // Build call
+    let args_meta: Vec<_> = args.iter().map(|a| (*a).into()).collect();
+    let call_site = builder
+        .build_call(fn_val, &args_meta, "hreduce")
+        .context(IntrinsicCallSnafu)?;
+
+    match call_site.try_as_basic_value() {
+        ValueKind::Basic(v) => Ok(v),
+        ValueKind::Instruction(_) => IntrinsicNoReturnSnafu { name: intrinsic_name }.fail(),
     }
 }

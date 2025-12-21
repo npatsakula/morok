@@ -127,6 +127,33 @@ pub enum Error {
     InvalidComparisonOp { op: String },
 
     // ========================================================================
+    // Vector operations
+    // ========================================================================
+    /// Vector width mismatch in binary operation.
+    #[snafu(display("Vector width mismatch: lhs={lhs}, rhs={rhs}"))]
+    VectorWidthMismatch { lhs: u32, rhs: u32 },
+
+    /// Vector insert element failed.
+    #[snafu(display("Vector insert element failed"))]
+    VectorInsert { source: BuilderError },
+
+    /// Vector extract element failed.
+    #[snafu(display("Vector extract element failed"))]
+    VectorExtract { source: BuilderError },
+
+    /// Vector shuffle failed.
+    #[snafu(display("Vector shuffle failed"))]
+    VectorShuffle { source: BuilderError },
+
+    /// Intrinsic returned void unexpectedly.
+    #[snafu(display("Intrinsic '{name}' returned void"))]
+    IntrinsicNoReturn { name: String },
+
+    /// Intrinsic call failed.
+    #[snafu(display("Intrinsic call failed"))]
+    IntrinsicCall { source: BuilderError },
+
+    // ========================================================================
     // Unsupported operations
     // ========================================================================
     /// Operation not supported.

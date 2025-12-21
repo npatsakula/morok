@@ -22,7 +22,7 @@ pub fn dtype_to_basic_type<'ctx>(dtype: &DType, context: &'ctx Context) -> Resul
 }
 
 /// Convert ScalarDType to LLVM basic type.
-fn scalar_to_basic_type<'ctx>(scalar: ScalarDType, context: &'ctx Context) -> Result<BasicTypeEnum<'ctx>> {
+pub fn scalar_to_basic_type<'ctx>(scalar: ScalarDType, context: &'ctx Context) -> Result<BasicTypeEnum<'ctx>> {
     match scalar {
         ScalarDType::Bool => Ok(context.bool_type().into()),
         ScalarDType::Int8 => Ok(context.i8_type().into()),

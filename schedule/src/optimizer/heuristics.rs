@@ -190,8 +190,6 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
             && let morok_ir::ConstValue::Int(size) = cv.0
             && size > 1
             && size <= threshold
-            && false
-        // TEMPORARY: disable until codegen supports Unroll
         {
             let unroll_axes = scheduler.unrollable_dims();
             if let Some(logical) = unroll_axes.iter().position(|&a| a == axis_idx)

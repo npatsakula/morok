@@ -1,79 +1,103 @@
 //! Type-aware LLVM builder helpers.
 //!
 //! These helpers dispatch on float/int/signed types to reduce boilerplate in ops.rs.
+//! All arithmetic operations support both scalar and vector types.
 
-use crate::llvm::error::{ArithmeticSnafu, ComparisonSnafu, Result};
+use crate::llvm::error::{
+    ArithmeticSnafu, ComparisonSnafu, Result, VectorInsertSnafu, VectorShuffleSnafu,
+    VectorWidthMismatchSnafu,
+};
 use inkwell::builder::Builder;
+use inkwell::context::Context;
 use inkwell::values::BasicValueEnum;
 use inkwell::{FloatPredicate, IntPredicate};
 use morok_ir::BinaryOp;
 use snafu::ResultExt;
 
-/// Build an addition, dispatching on float/int.
-pub fn build_add<'ctx>(
-    builder: &Builder<'ctx>,
-    lhs: BasicValueEnum<'ctx>,
-    rhs: BasicValueEnum<'ctx>,
-    is_float: bool,
-) -> Result<BasicValueEnum<'ctx>> {
-    if is_float {
-        Ok(builder
-            .build_float_add(lhs.into_float_value(), rhs.into_float_value(), "add")
-            .context(ArithmeticSnafu)?
-            .into())
-    } else {
-        Ok(builder.build_int_add(lhs.into_int_value(), rhs.into_int_value(), "add").context(ArithmeticSnafu)?.into())
-    }
+// ============================================================================
+// Binary arithmetic operations (add, sub, mul)
+// ============================================================================
+
+/// Generate a binary arithmetic function that dispatches on float/int and scalar/vector.
+macro_rules! impl_binary_arith {
+    ($fn_name:ident, $float_method:ident, $int_method:ident, $name:literal) => {
+        pub fn $fn_name<'ctx>(
+            builder: &Builder<'ctx>,
+            lhs: BasicValueEnum<'ctx>,
+            rhs: BasicValueEnum<'ctx>,
+            is_float: bool,
+        ) -> Result<BasicValueEnum<'ctx>> {
+            if is_float {
+                if lhs.is_vector_value() {
+                    Ok(builder
+                        .$float_method(lhs.into_vector_value(), rhs.into_vector_value(), $name)
+                        .context(ArithmeticSnafu)?
+                        .into())
+                } else {
+                    Ok(builder
+                        .$float_method(lhs.into_float_value(), rhs.into_float_value(), $name)
+                        .context(ArithmeticSnafu)?
+                        .into())
+                }
+            } else if lhs.is_vector_value() {
+                Ok(builder
+                    .$int_method(lhs.into_vector_value(), rhs.into_vector_value(), $name)
+                    .context(ArithmeticSnafu)?
+                    .into())
+            } else {
+                Ok(builder
+                    .$int_method(lhs.into_int_value(), rhs.into_int_value(), $name)
+                    .context(ArithmeticSnafu)?
+                    .into())
+            }
+        }
+    };
 }
 
-/// Build a subtraction, dispatching on float/int.
-pub fn build_sub<'ctx>(
-    builder: &Builder<'ctx>,
-    lhs: BasicValueEnum<'ctx>,
-    rhs: BasicValueEnum<'ctx>,
-    is_float: bool,
-) -> Result<BasicValueEnum<'ctx>> {
-    if is_float {
-        Ok(builder
-            .build_float_sub(lhs.into_float_value(), rhs.into_float_value(), "sub")
-            .context(ArithmeticSnafu)?
-            .into())
-    } else {
-        Ok(builder.build_int_sub(lhs.into_int_value(), rhs.into_int_value(), "sub").context(ArithmeticSnafu)?.into())
-    }
-}
+impl_binary_arith!(build_add, build_float_add, build_int_add, "add");
+impl_binary_arith!(build_sub, build_float_sub, build_int_sub, "sub");
+impl_binary_arith!(build_mul, build_float_mul, build_int_mul, "mul");
 
-/// Build a multiplication, dispatching on float/int.
-pub fn build_mul<'ctx>(
-    builder: &Builder<'ctx>,
-    lhs: BasicValueEnum<'ctx>,
-    rhs: BasicValueEnum<'ctx>,
-    is_float: bool,
-) -> Result<BasicValueEnum<'ctx>> {
-    if is_float {
-        Ok(builder
-            .build_float_mul(lhs.into_float_value(), rhs.into_float_value(), "mul")
-            .context(ArithmeticSnafu)?
-            .into())
-    } else {
-        Ok(builder.build_int_mul(lhs.into_int_value(), rhs.into_int_value(), "mul").context(ArithmeticSnafu)?.into())
-    }
-}
+// ============================================================================
+// Unary operations
+// ============================================================================
 
-/// Build a negation, dispatching on float/int.
+/// Build a negation, dispatching on float/int and scalar/vector.
 pub fn build_neg<'ctx>(
     builder: &Builder<'ctx>,
     src: BasicValueEnum<'ctx>,
     is_float: bool,
 ) -> Result<BasicValueEnum<'ctx>> {
     if is_float {
-        Ok(builder.build_float_neg(src.into_float_value(), "neg").context(ArithmeticSnafu)?.into())
+        if src.is_vector_value() {
+            Ok(builder
+                .build_float_neg(src.into_vector_value(), "neg")
+                .context(ArithmeticSnafu)?
+                .into())
+        } else {
+            Ok(builder
+                .build_float_neg(src.into_float_value(), "neg")
+                .context(ArithmeticSnafu)?
+                .into())
+        }
+    } else if src.is_vector_value() {
+        Ok(builder
+            .build_int_neg(src.into_vector_value(), "neg")
+            .context(ArithmeticSnafu)?
+            .into())
     } else {
-        Ok(builder.build_int_neg(src.into_int_value(), "neg").context(ArithmeticSnafu)?.into())
+        Ok(builder
+            .build_int_neg(src.into_int_value(), "neg")
+            .context(ArithmeticSnafu)?
+            .into())
     }
 }
 
-/// Build an integer division, dispatching on signed/unsigned.
+// ============================================================================
+// Division and remainder
+// ============================================================================
+
+/// Build an integer division, dispatching on signed/unsigned and scalar/vector.
 pub fn build_int_div<'ctx>(
     builder: &Builder<'ctx>,
     lhs: BasicValueEnum<'ctx>,
@@ -81,8 +105,20 @@ pub fn build_int_div<'ctx>(
     is_signed: bool,
 ) -> Result<BasicValueEnum<'ctx>> {
     if is_signed {
+        if lhs.is_vector_value() {
+            Ok(builder
+                .build_int_signed_div(lhs.into_vector_value(), rhs.into_vector_value(), "idiv")
+                .context(ArithmeticSnafu)?
+                .into())
+        } else {
+            Ok(builder
+                .build_int_signed_div(lhs.into_int_value(), rhs.into_int_value(), "idiv")
+                .context(ArithmeticSnafu)?
+                .into())
+        }
+    } else if lhs.is_vector_value() {
         Ok(builder
-            .build_int_signed_div(lhs.into_int_value(), rhs.into_int_value(), "idiv")
+            .build_int_unsigned_div(lhs.into_vector_value(), rhs.into_vector_value(), "idiv")
             .context(ArithmeticSnafu)?
             .into())
     } else {
@@ -93,7 +129,7 @@ pub fn build_int_div<'ctx>(
     }
 }
 
-/// Build a remainder, dispatching on float/int and signed/unsigned.
+/// Build a remainder, dispatching on float/int, signed/unsigned, and scalar/vector.
 pub fn build_rem<'ctx>(
     builder: &Builder<'ctx>,
     lhs: BasicValueEnum<'ctx>,
@@ -102,13 +138,32 @@ pub fn build_rem<'ctx>(
     is_signed: bool,
 ) -> Result<BasicValueEnum<'ctx>> {
     if is_float {
-        Ok(builder
-            .build_float_rem(lhs.into_float_value(), rhs.into_float_value(), "mod")
-            .context(ArithmeticSnafu)?
-            .into())
+        if lhs.is_vector_value() {
+            Ok(builder
+                .build_float_rem(lhs.into_vector_value(), rhs.into_vector_value(), "mod")
+                .context(ArithmeticSnafu)?
+                .into())
+        } else {
+            Ok(builder
+                .build_float_rem(lhs.into_float_value(), rhs.into_float_value(), "mod")
+                .context(ArithmeticSnafu)?
+                .into())
+        }
     } else if is_signed {
+        if lhs.is_vector_value() {
+            Ok(builder
+                .build_int_signed_rem(lhs.into_vector_value(), rhs.into_vector_value(), "mod")
+                .context(ArithmeticSnafu)?
+                .into())
+        } else {
+            Ok(builder
+                .build_int_signed_rem(lhs.into_int_value(), rhs.into_int_value(), "mod")
+                .context(ArithmeticSnafu)?
+                .into())
+        }
+    } else if lhs.is_vector_value() {
         Ok(builder
-            .build_int_signed_rem(lhs.into_int_value(), rhs.into_int_value(), "mod")
+            .build_int_unsigned_rem(lhs.into_vector_value(), rhs.into_vector_value(), "mod")
             .context(ArithmeticSnafu)?
             .into())
     } else {
@@ -118,6 +173,10 @@ pub fn build_rem<'ctx>(
             .into())
     }
 }
+
+// ============================================================================
+// Comparisons
+// ============================================================================
 
 /// Get comparison predicates for a binary comparison op.
 /// Returns `(float_pred, signed_int_pred, unsigned_int_pred)`.
@@ -138,7 +197,7 @@ pub fn is_comparison(op: BinaryOp) -> bool {
     comparison_predicates(op).is_some()
 }
 
-/// Build a comparison operation with type dispatch.
+/// Build a comparison operation with type dispatch (scalar/vector).
 pub fn build_cmp<'ctx>(
     builder: &Builder<'ctx>,
     op: BinaryOp,
@@ -151,15 +210,107 @@ pub fn build_cmp<'ctx>(
         .ok_or_else(|| crate::llvm::error::Error::InvalidComparisonOp { op: format!("{:?}", op) })?;
 
     if is_float {
-        Ok(builder
-            .build_float_compare(float_pred, lhs.into_float_value(), rhs.into_float_value(), "cmp")
-            .context(ComparisonSnafu)?
-            .into())
+        if lhs.is_vector_value() {
+            Ok(builder
+                .build_float_compare(float_pred, lhs.into_vector_value(), rhs.into_vector_value(), "cmp")
+                .context(ComparisonSnafu)?
+                .into())
+        } else {
+            Ok(builder
+                .build_float_compare(float_pred, lhs.into_float_value(), rhs.into_float_value(), "cmp")
+                .context(ComparisonSnafu)?
+                .into())
+        }
     } else {
         let pred = if is_signed { signed_pred } else { unsigned_pred };
-        Ok(builder
-            .build_int_compare(pred, lhs.into_int_value(), rhs.into_int_value(), "cmp")
-            .context(ComparisonSnafu)?
-            .into())
+        if lhs.is_vector_value() {
+            Ok(builder
+                .build_int_compare(pred, lhs.into_vector_value(), rhs.into_vector_value(), "cmp")
+                .context(ComparisonSnafu)?
+                .into())
+        } else {
+            Ok(builder
+                .build_int_compare(pred, lhs.into_int_value(), rhs.into_int_value(), "cmp")
+                .context(ComparisonSnafu)?
+                .into())
+        }
+    }
+}
+
+// ============================================================================
+// Vector operations
+// ============================================================================
+
+/// Get vector element count from a value (1 for scalars).
+pub fn get_vector_count(value: BasicValueEnum<'_>) -> u32 {
+    if value.is_vector_value() {
+        value.into_vector_value().get_type().get_size()
+    } else {
+        1
+    }
+}
+
+/// Broadcast a scalar value to a vector of given count.
+///
+/// Uses insertelement + shufflevector pattern:
+/// 1. Insert scalar into poison vector at index 0
+/// 2. Shuffle with zeroinitializer mask to replicate element 0
+pub fn broadcast_to_vector<'ctx>(
+    builder: &Builder<'ctx>,
+    scalar: BasicValueEnum<'ctx>,
+    count: u32,
+    context: &'ctx Context,
+) -> Result<BasicValueEnum<'ctx>> {
+    use inkwell::types::VectorType;
+
+    // Get vector type based on scalar type
+    let vec_type: VectorType = if scalar.is_float_value() {
+        scalar.into_float_value().get_type().vec_type(count)
+    } else if scalar.is_int_value() {
+        scalar.into_int_value().get_type().vec_type(count)
+    } else {
+        // Fallback for other types - return as-is
+        return Ok(scalar);
+    };
+
+    // Insert scalar into poison vector at index 0
+    let poison = vec_type.get_poison();
+    let zero = context.i32_type().const_zero();
+    let single = builder
+        .build_insert_element(poison, scalar, zero, "bcast_insert")
+        .context(VectorInsertSnafu)?;
+
+    // Create mask of all zeros to replicate element 0 to all positions
+    let i32_type = context.i32_type();
+    let mask_values: Vec<_> = (0..count).map(|_| i32_type.const_zero()).collect();
+    let mask = VectorType::const_vector(&mask_values);
+
+    // Shuffle to broadcast
+    let result = builder
+        .build_shuffle_vector(single, poison, mask, "bcast_shuffle")
+        .context(VectorShuffleSnafu)?;
+
+    Ok(result.into())
+}
+
+/// Harmonize operands: broadcast scalar to match vector width.
+///
+/// - If both operands have the same vector width, return them unchanged.
+/// - If one is scalar (width 1) and the other is vector, broadcast the scalar.
+/// - If both are vectors with different widths, return an error.
+pub fn harmonize_operands<'ctx>(
+    builder: &Builder<'ctx>,
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+    context: &'ctx Context,
+) -> Result<(BasicValueEnum<'ctx>, BasicValueEnum<'ctx>)> {
+    let lhs_count = get_vector_count(lhs);
+    let rhs_count = get_vector_count(rhs);
+
+    match (lhs_count, rhs_count) {
+        (1, n) if n > 1 => Ok((broadcast_to_vector(builder, lhs, n, context)?, rhs)),
+        (n, 1) if n > 1 => Ok((lhs, broadcast_to_vector(builder, rhs, n, context)?)),
+        (l, r) if l == r => Ok((lhs, rhs)),
+        (l, r) => VectorWidthMismatchSnafu { lhs: l, rhs: r }.fail(),
     }
 }

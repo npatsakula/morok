@@ -42,51 +42,6 @@ use snafu::ResultExt;
 use crate::error::Result;
 use crate::execution_plan::PreparedKernel;
 
-// ============================================================================
-// Dependency Tracking Types (Tinygrad-Aligned)
-// ============================================================================
-
-/// A dependency token representing a completed operation.
-///
-/// Unlike timeline values, dependency tokens are opaque references to past operations.
-/// Only tokens from ALREADY-COMPLETED operations are returned by `query_resources`,
-/// ensuring we never wait on unsignaled timelines.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DependencyToken {
-    /// Unique operation identifier (kernel ID or transfer ID).
-    pub operation_id: u64,
-    /// Device that executed the operation.
-    pub device: DeviceSpec,
-    /// Timeline value that was signaled upon completion.
-    pub timeline: u64,
-}
-
-/// Query result from `query_resources` - dependencies to wait on.
-///
-/// This struct is returned by the pure query phase and contains only
-/// references to ALREADY-SIGNALED operations.
-#[derive(Debug, Default)]
-pub struct DependencyQuery {
-    /// Tokens of operations that must complete before the current operation.
-    /// All tokens in this list represent operations that have ALREADY been signaled.
-    pub wait_on: Vec<DependencyToken>,
-}
-
-/// Deferred update to apply AFTER operation completes and signals.
-///
-/// This struct captures the state changes that must be applied to dependency
-/// maps after an operation successfully completes. By deferring updates,
-/// we ensure parallel operations don't see incorrect state.
-#[derive(Debug)]
-pub struct DependencyUpdate {
-    /// Buffer IDs written by this operation.
-    writes: Vec<BufferId>,
-    /// Buffer IDs read by this operation.
-    reads: Vec<BufferId>,
-    /// Token representing this operation (to be stored in maps).
-    token: DependencyToken,
-}
-
 /// Per-device execution context.
 ///
 /// Each device has its own timeline signal, queue, and allocator.
@@ -375,32 +330,19 @@ impl ExecutionGraph {
 
 /// Unified executor for heterogeneous device execution.
 ///
-/// Manages device contexts and buffer dependencies to enable parallel
-/// execution across any mix of devices.
+/// Manages device contexts to enable parallel execution across any mix of devices.
+/// Uses timeline signals for cross-device synchronization.
 ///
-/// # Tinygrad-Aligned Dependency Model
+/// # Stateless Execution Model (Tinygrad-Aligned)
 ///
-/// The executor uses a split query/update pattern for dependency tracking:
-/// - `query_resources`: Pure function that returns dependencies without mutation
-/// - `update_resources`: Applies deferred updates AFTER operation signals completion
-///
-/// This separation prevents race conditions in parallel execution by ensuring:
-/// 1. All dependency queries happen before parallel execution starts
-/// 2. Map updates only occur after operations complete and signal
-/// 3. No operation ever waits on an unsignaled timeline
+/// The executor follows Tinygrad's stateless execution model where:
+/// - Dependencies are computed at schedule time, not runtime
+/// - ExecutionPlan pre-computes kernel order via topological sort
+/// - No runtime dependency tracking is needed (zero memory accumulation)
+/// - Timeline signals handle cross-device synchronization only
 pub struct UnifiedExecutor {
     /// Per-device execution contexts.
     contexts: HashMap<DeviceSpec, DeviceContext>,
-
-    /// Buffer write dependency map: BufferId → DependencyToken.
-    /// Tracks the last operation that wrote to each buffer.
-    /// Tokens are ONLY inserted after the operation signals completion.
-    write_deps: HashMap<BufferId, DependencyToken>,
-
-    /// Buffer read dependency map: BufferId → Vec<DependencyToken>.
-    /// Tracks all operations currently reading each buffer.
-    /// Tokens are ONLY inserted after operations signal completion.
-    read_deps: HashMap<BufferId, Vec<DependencyToken>>,
 
     /// Device registry for looking up allocators.
     registry: &'static DeviceRegistry,
@@ -408,18 +350,14 @@ pub struct UnifiedExecutor {
 
 impl std::fmt::Debug for UnifiedExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnifiedExecutor")
-            .field("contexts", &self.contexts.keys().collect::<Vec<_>>())
-            .field("write_deps", &self.write_deps.len())
-            .field("read_deps", &self.read_deps.len())
-            .finish()
+        f.debug_struct("UnifiedExecutor").field("contexts", &self.contexts.keys().collect::<Vec<_>>()).finish()
     }
 }
 
 impl UnifiedExecutor {
     /// Create a new unified executor.
     pub fn new(registry: &'static DeviceRegistry) -> Self {
-        Self { contexts: HashMap::new(), write_deps: HashMap::new(), read_deps: HashMap::new(), registry }
+        Self { contexts: HashMap::new(), registry }
     }
 
     /// Add a device to the executor.
@@ -474,124 +412,6 @@ impl UnifiedExecutor {
         }
     }
 
-    /// Query buffer dependencies for an operation (PURE - no state mutation).
-    ///
-    /// This is the first phase of the split query/update pattern. It returns:
-    /// 1. Dependencies to wait on (from ALREADY-COMPLETED operations)
-    /// 2. A deferred update to apply AFTER this operation completes
-    ///
-    /// # Arguments
-    ///
-    /// * `buffers` - All buffers accessed by this operation
-    /// * `output_indices` - Indices of buffers being written (outputs)
-    /// * `device` - Device executing this operation
-    /// * `operation_id` - Unique identifier for this operation
-    /// * `timeline` - Timeline value for this operation
-    /// * `skip_same_device` - When true, skip same-device deps (hardware queue ordering).
-    ///   Use `true` for sequential execution, `false` for parallel groups (rayon).
-    ///
-    /// # Returns
-    ///
-    /// Tuple of (DependencyQuery, DependencyUpdate).
-    /// - Query contains tokens to wait on (all already signaled)
-    /// - Update should be applied AFTER operation signals completion
-    pub fn query_resources(
-        &self,
-        buffer_ids: &[BufferId],
-        output_indices: &[usize],
-        device: &DeviceSpec,
-        operation_id: u64,
-        timeline: u64,
-        skip_same_device: bool,
-    ) -> (DependencyQuery, DependencyUpdate) {
-        let mut wait_on = Vec::new();
-        let mut writes = Vec::new();
-        let mut reads = Vec::new();
-
-        for (i, &buf_id) in buffer_ids.iter().enumerate() {
-            let is_output = output_indices.contains(&i);
-
-            // Collect EXISTING writer dependency (already completed)
-            if let Some(token) = self.write_deps.get(&buf_id) {
-                // Skip same-device deps only when hardware queue provides ordering
-                if !skip_same_device || &token.device != device {
-                    wait_on.push(token.clone());
-                }
-            }
-
-            if is_output {
-                writes.push(buf_id);
-                // If writing, also wait for all current readers (WAR hazard)
-                if let Some(readers) = self.read_deps.get(&buf_id) {
-                    for token in readers {
-                        if !skip_same_device || &token.device != device {
-                            wait_on.push(token.clone());
-                        }
-                    }
-                }
-            } else {
-                reads.push(buf_id);
-            }
-        }
-
-        // Deduplicate wait dependencies
-        let unique: HashSet<_> = wait_on.drain(..).collect();
-        wait_on.extend(unique);
-
-        let token = DependencyToken { operation_id, device: device.clone(), timeline };
-        (DependencyQuery { wait_on }, DependencyUpdate { writes, reads, token })
-    }
-
-    /// Apply deferred dependency updates AFTER operation completes and signals.
-    ///
-    /// This is the second phase of the split query/update pattern. Call this
-    /// ONLY after the operation has signaled completion via `signal_completion`.
-    ///
-    /// # Critical Ordering
-    ///
-    /// The call sequence MUST be:
-    /// 1. `query_resources` - get dependencies and prepare update
-    /// 2. Wait for dependencies (`wait_for_tokens`)
-    /// 3. Execute operation
-    /// 4. `signal_completion` - signal that operation is done
-    /// 5. `update_resources` - apply the deferred update
-    ///
-    /// This ordering ensures no operation ever waits on an unsignaled timeline.
-    pub fn update_resources(&mut self, update: DependencyUpdate) {
-        // Update write dependencies
-        for buf_id in update.writes {
-            self.write_deps.insert(buf_id, update.token.clone());
-            // Clear readers since we've overwritten the buffer
-            self.read_deps.remove(&buf_id);
-        }
-
-        // Update read dependencies
-        for buf_id in update.reads {
-            self.read_deps.entry(buf_id).or_default().push(update.token.clone());
-        }
-    }
-
-    /// Wait for all dependency tokens to be signaled.
-    ///
-    /// Since tokens only come from `query_resources` which returns tokens from
-    /// ALREADY-COMPLETED operations, this should never block indefinitely.
-    pub fn wait_for_tokens(&self, tokens: &[DependencyToken]) -> Result<()> {
-        for token in tokens {
-            if let Some(ctx) = self.contexts.get(&token.device) {
-                ctx.signal.wait(token.timeline, 0).context(crate::error::DeviceSnafu)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Clear all dependency tracking.
-    ///
-    /// Call this between independent execution batches.
-    pub fn clear_deps(&mut self) {
-        self.write_deps.clear();
-        self.read_deps.clear();
-    }
-
     /// Check if all operations on a single device.
     ///
     /// Returns `Some(device)` if all buffers are on the same device,
@@ -625,34 +445,20 @@ impl UnifiedExecutor {
         Ok(())
     }
 
-    /// Execute a kernel with dependency tracking (sequential execution).
+    /// Execute a kernel (sequential execution).
     ///
-    /// Uses the Tinygrad-aligned query/update pattern:
-    /// 1. Query dependencies (pure, no mutation)
-    /// 2. Wait for cross-device dependencies (same-device skipped - hardware queue ordering)
-    /// 3. Execute the kernel
-    /// 4. Signal completion
-    /// 5. Update dependency maps (AFTER signal)
+    /// ExecutionPlan pre-computes kernel order at schedule time, so no runtime
+    /// dependency tracking is needed. This follows Tinygrad's stateless execution model.
     ///
     /// # Arguments
     ///
-    /// * `kernel_id` - Unique identifier for this kernel execution
     /// * `device` - Device to execute on
-    /// * `buffers` - All buffers accessed by this kernel
-    /// * `output_indices` - Indices of output buffers in the buffers slice
     /// * `execute_fn` - Function that performs the actual kernel execution
     ///
     /// # Returns
     ///
-    /// The timeline value for this execution (can be used for synchronization).
-    pub fn execute_kernel<F>(
-        &mut self,
-        kernel_id: u64,
-        device: &DeviceSpec,
-        buffer_ids: &[BufferId],
-        output_indices: &[usize],
-        execute_fn: F,
-    ) -> Result<u64>
+    /// The timeline value for this execution (can be used for cross-device sync).
+    pub fn execute_kernel<F>(&mut self, device: &DeviceSpec, execute_fn: F) -> Result<u64>
     where
         F: FnOnce() -> Result<()>,
     {
@@ -664,42 +470,18 @@ impl UnifiedExecutor {
         // 2. Get next timeline value for this execution
         let timeline = self.contexts.get(device).unwrap().next_timeline();
 
-        // 3. Query dependencies (skip_same_device=true for sequential execution)
-        // Hardware queue provides ordering for same-device operations
-        let (query, update) = self.query_resources(
-            buffer_ids,
-            output_indices,
-            device,
-            kernel_id,
-            timeline,
-            true, // skip_same_device: hardware queue provides ordering
-        );
-
-        // 4. Wait for cross-device dependencies (all already signaled)
-        self.wait_for_tokens(&query.wait_on)?;
-
-        // 5. Execute the kernel
+        // 3. Execute the kernel
         execute_fn()?;
 
-        // 6. Signal completion
+        // 4. Signal completion (for cross-device synchronization)
         if let Some(ctx) = self.contexts.get(device) {
             ctx.signal_completion(timeline);
         }
 
-        // 7. Update maps AFTER signal (critical ordering!)
-        self.update_resources(update);
-
         Ok(timeline)
     }
 
-    /// Execute a buffer transfer (COPY operation) with dependency tracking.
-    ///
-    /// Uses the Tinygrad-aligned query/update pattern for transfers:
-    /// 1. Query dependencies for src (read) and dst (write)
-    /// 2. Wait for all dependencies
-    /// 3. Perform the transfer
-    /// 4. Signal completion
-    /// 5. Update dependency maps
+    /// Execute a buffer transfer (COPY operation).
     ///
     /// Handles cross-device transfers with appropriate synchronization:
     /// - Same device: Direct copy using device's copy queue
@@ -723,9 +505,6 @@ impl UnifiedExecutor {
         src_device: &DeviceSpec,
         dst_device: &DeviceSpec,
     ) -> Result<u64> {
-        // Use a unique transfer ID based on buffer IDs
-        let transfer_id = src.id().0.wrapping_add(dst.id().0);
-
         // Ensure both device contexts exist
         if !self.contexts.contains_key(src_device) {
             self.add_device(src_device.clone())?;
@@ -736,19 +515,6 @@ impl UnifiedExecutor {
 
         // Get timeline for destination device (where the result will be used)
         let timeline = self.contexts.get(dst_device).unwrap().next_timeline();
-
-        // Query dependencies using the new pattern
-        // For a transfer: src is input (index 0), dst is output (index 1)
-        // We pass buffer IDs for dependency tracking
-        let buffer_ids: [BufferId; 2] = [src.id(), dst.id()];
-        let output_indices = [1usize]; // dst is the output
-
-        // For transfers, we don't skip same-device since transfers are explicit synchronization points
-        let (query, update) =
-            self.query_resources(&buffer_ids, &output_indices, dst_device, transfer_id, timeline, false);
-
-        // Wait for all dependencies
-        self.wait_for_tokens(&query.wait_on)?;
 
         // Perform the transfer based on sync strategy
         match Self::sync_strategy(src_device, dst_device) {
@@ -784,13 +550,10 @@ impl UnifiedExecutor {
             }
         }
 
-        // Signal completion
+        // Signal completion (for cross-device synchronization)
         if let Some(ctx) = self.contexts.get(dst_device) {
             ctx.signal_completion(timeline);
         }
-
-        // Update dependency maps AFTER signal
-        self.update_resources(update);
 
         Ok(timeline)
     }
@@ -832,10 +595,8 @@ impl UnifiedExecutor {
 impl UnifiedExecutor {
     /// Execute kernels by indices using scoped parallelism.
     ///
-    /// This is the new clean API that:
-    /// - Uses `rayon::scope` for borrowed parallel execution (no cloning)
-    /// - Takes kernel indices instead of pre-built contexts
-    /// - Borrows all data from `PreparedKernel` (fixedvars, buffer_ptrs, etc.)
+    /// ExecutionPlan pre-computes kernel order at schedule time, so no runtime
+    /// dependency tracking is needed. This follows Tinygrad's stateless execution model.
     ///
     /// # Arguments
     ///
@@ -871,19 +632,6 @@ impl UnifiedExecutor {
             }
 
             let timeline = self.contexts.get(&kernel.device).unwrap().next_timeline();
-
-            // Query dependencies
-            let (query, update) = self.query_resources(
-                &kernel.buffer_ids,
-                &kernel.output_indices,
-                &kernel.device,
-                kernel.id,
-                timeline,
-                true, // skip_same_device for sequential
-            );
-
-            // Wait for dependencies
-            self.wait_for_tokens(&query.wait_on)?;
 
             // Execute kernel - borrow directly, no cloning!
             unsafe {
@@ -923,13 +671,10 @@ impl UnifiedExecutor {
                 }
             }
 
-            // Signal completion
+            // Signal completion (for cross-device synchronization)
             if let Some(ctx) = self.contexts.get(&kernel.device) {
                 ctx.signal_completion(timeline);
             }
-
-            // Update dependency maps
-            self.update_resources(update);
 
             return Ok(vec![(kernel.id, timeline)]);
         }
@@ -941,34 +686,17 @@ impl UnifiedExecutor {
             }
         }
 
-        // PHASE 1: Validate no buffer conflicts
+        // PHASE 1: Validate no buffer conflicts (safety check for parallel execution)
         self.validate_kernel_independence(&kernels, buffers)?;
 
-        // PHASE 2: Query dependencies for all kernels
-        let mut queries_updates: Vec<(DependencyQuery, DependencyUpdate)> = Vec::with_capacity(kernels.len());
+        // PHASE 2: Collect timelines for each kernel
         let mut timelines: Vec<(u64, DeviceSpec, u64)> = Vec::with_capacity(kernels.len());
-
         for kernel in &kernels {
             let timeline = self.contexts.get(&kernel.device).unwrap().next_timeline();
             timelines.push((kernel.id, kernel.device.clone(), timeline));
-
-            let (query, update) = self.query_resources(
-                &kernel.buffer_ids,
-                &kernel.output_indices,
-                &kernel.device,
-                kernel.id,
-                timeline,
-                false, // parallel execution needs ALL deps
-            );
-            queries_updates.push((query, update));
         }
 
-        // PHASE 3: Wait for all dependencies
-        for (query, _) in &queries_updates {
-            self.wait_for_tokens(&query.wait_on)?;
-        }
-
-        // PHASE 4: Execute in parallel using rayon::scope
+        // PHASE 3: Execute in parallel using rayon::scope
         //
         // Problem: *mut u8 is not Sync, so &[*mut u8] is not Send.
         // Solution: Transmute &[*mut u8] to &[usize] which IS Send.
@@ -1021,15 +749,11 @@ impl UnifiedExecutor {
             return Err(e);
         }
 
-        // PHASE 5: Signal completions and update state
+        // PHASE 4: Signal completions (for cross-device synchronization)
         for (_, device, timeline) in &timelines {
             if let Some(dev_ctx) = self.contexts.get(device) {
                 dev_ctx.signal_completion(*timeline);
             }
-        }
-
-        for (_, update) in queries_updates {
-            self.update_resources(update);
         }
 
         Ok(timelines.iter().map(|(id, _, t)| (*id, *t)).collect())

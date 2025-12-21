@@ -110,8 +110,8 @@ pub fn optimize_kernel_with_config(
     renderer: &Renderer,
     config: &OptimizerConfig,
 ) -> Arc<morok_ir::UOp> {
-    match config.strategy {
-        OptStrategy::None => ast,
+    let optimized = match config.strategy {
+        OptStrategy::None => return ast, // No optimization = no pre_expand needed
         OptStrategy::Heuristic => optimize_heuristic(ast, renderer, &config.heuristics),
         OptStrategy::Beam { .. } => {
             // Beam search requires a compile_and_time function.
@@ -119,7 +119,11 @@ pub fn optimize_kernel_with_config(
             // Fall back to heuristics for the simple API.
             optimize_heuristic(ast, renderer, &config.heuristics)
         }
-    }
+    };
+
+    // Post-optimization: Fix UNROLL substitutions in REDUCE ops
+    // This handles arithmetic expressions created by shift_to UNROLL
+    crate::expand::pre_expand(&optimized)
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).

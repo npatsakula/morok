@@ -34,8 +34,7 @@ pub use devices::cpu_queue::CpuQueue;
 pub use error::*;
 pub use execution_plan::{ExecutionPlan, ExecutionPlanBuilder, ParallelGroup, PreparedKernel};
 pub use executor::{
-    DependencyQuery, DependencyToken, DependencyUpdate, DeviceContext, ExecutionGraph, ExecutionNode,
-    KernelBufferAccess, SyncStrategy, UnifiedExecutor, global_executor,
+    DeviceContext, ExecutionGraph, ExecutionNode, KernelBufferAccess, SyncStrategy, UnifiedExecutor, global_executor,
 };
 pub use kernel::*;
 pub use kernel_cache::*;

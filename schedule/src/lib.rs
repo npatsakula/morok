@@ -11,12 +11,14 @@
 //!   - Phase 5: Kernel splitting at STORE boundaries
 //! - [`linearize`] - Priority-aware topological sort for GPU/NPU backends
 //! - [`optimizer`] - Kernel optimization layer (OptOps, Scheduler, heuristics)
+//! - [`expand`] - Pre-expansion pass for UNROLL/UPCAST range handling
 //!
 //! # Pattern Matching and Rewriting
 //!
 //! Pattern matching infrastructure has moved to `morok_ir::pattern` and `morok_ir::rewrite`.
 //! This crate re-exports these modules for convenience.
 
+pub mod expand;
 pub mod linearize;
 pub mod optimizer;
 pub mod rangeify;
@@ -38,6 +40,9 @@ pub use linearize::{CFGContext, linearize};
 pub use morok_ir::pattern::{PatternMatcher, UPat};
 pub use morok_ir::rewrite::graph_rewrite;
 pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, run_kernel_split_pipeline};
+
+// Re-export expand pass
+pub use expand::pre_expand;
 
 // Re-export optimizer entry points
 pub use optimizer::{
