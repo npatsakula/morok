@@ -12,12 +12,11 @@ pub static CACHE_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(()
 
 /// Setup function to call at the start of each test to ensure isolation.
 ///
-/// This acquires a mutex and cleans up global caches (UOp cache, buffer registry,
-/// kernel cache, executor state) to prevent cross-test contamination.
+/// This acquires a mutex and cleans up global caches to prevent cross-test contamination.
 ///
-/// For the UOp cache, we use `gc_unused_uops()` which only removes UOps that
-/// are not referenced elsewhere (strong_count == 1). This is safe because
-/// previous tests have released their references by the time this runs.
+/// Note: Both UOp cache and tensor registry use weak references (Tinygrad-aligned),
+/// so entries are automatically cleaned up when no longer referenced. We call
+/// gc_dead_refs() to proactively clean up dead weak refs in both caches.
 ///
 /// # Returns
 ///
@@ -25,11 +24,10 @@ pub static CACHE_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(()
 /// The guard will be dropped automatically at the end of the test function.
 pub fn test_setup() -> parking_lot::MutexGuard<'static, ()> {
     let guard = CACHE_TEST_MUTEX.lock();
-    morok_ir::uop::gc_unused_uops();
-    crate::buffer_registry::clear_all();
+    morok_ir::uop::gc_dead_refs(); // Clean up dead UOp weak refs
+    crate::tensor_registry::gc_dead_refs(); // Clean up dead tensor weak refs
+    crate::tensor_registry::clear_buffer_index();
     morok_runtime::kernel_cache::clear_all();
-    // Clear executor dependency state between tests
-    morok_runtime::global_executor().clear_deps();
     guard
 }
 

@@ -1,7 +1,6 @@
 use bon::bon;
 use snafu::ResultExt;
 use std::sync::Arc;
-use tracing::trace;
 
 use morok_device::{Buffer, registry};
 use morok_dtype::ext::HasDType;
@@ -14,7 +13,6 @@ pub mod activation;
 pub mod arithmetic;
 pub mod bitwise;
 pub mod broadcast;
-pub mod buffer_registry;
 pub mod conditional;
 pub mod math;
 pub mod matmul;
@@ -216,6 +214,7 @@ impl Tensor {
         let dtype = T::DTYPE;
 
         let buffer_uop = UOp::new_buffer(device.clone(), source.len(), dtype.clone());
+        let buffer_uop_id = buffer_uop.id;
 
         // Get allocator for specified device
         let allocator = match &device {
@@ -228,17 +227,13 @@ impl Tensor {
         let bytes = unsafe { std::slice::from_raw_parts(source.as_ptr() as *const u8, source.len() * dtype.bytes()) };
         buffer.copyin(bytes).expect("Buffer write always successful");
 
-        // RAII: Wrap buffer in Arc for ownership
+        // Wrap buffer in Arc for RAII ownership
         let buffer_arc = Arc::new(buffer);
-
-        // SECONDARY: Register for schedule lookup (backwards compat during migration)
-        buffer_registry::get_or_create_buffer(buffer_uop.id, || Ok((*buffer_arc).clone()))
-            .expect("Buffer registration failed");
 
         let uop = buffer_uop.try_reshape(&shape).expect("this reshape is always successful");
 
-        // PRIMARY: Create tensor with buffer (RAII ownership)
-        let entry = tensor_registry::register_tensor(uop);
+        // Register tensor with buffer (also adds to buffer index for schedule lookups)
+        let entry = tensor_registry::register_tensor_with_buffer(uop, buffer_arc.clone(), buffer_uop_id);
         Self::with_buffer(entry, buffer_arc)
     }
 

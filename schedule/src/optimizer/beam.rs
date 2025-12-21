@@ -252,6 +252,10 @@ where
 
         // 5. PRUNE: Keep top K by timing
         beam = sorted.into_iter().take(config.beam_width).collect();
+
+        // Memory management: With weak references in the UOp cache (Tinygrad-aligned),
+        // discarded candidates are automatically cleaned up when their Arcs are dropped.
+        // No manual GC calls needed.
     }
 
     // Return best result
@@ -329,6 +333,8 @@ where
         cutoff = best_new.saturating_mul(3);
 
         beam = sorted.into_iter().take(config.beam_width).collect();
+
+        // Memory management: With weak refs, discarded candidates are auto-cleaned.
     }
 
     let (best_scheduler, best_timing) = beam.into_iter().next().unwrap_or((scheduler, Duration::MAX));

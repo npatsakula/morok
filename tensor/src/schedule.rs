@@ -65,7 +65,7 @@ pub struct ScheduleItem {
     /// Device buffers for this kernel (in order expected by codegen)
     pub buffers: Vec<Buffer>,
 
-    /// UOp IDs under which each buffer was registered in buffer_registry.
+    /// UOp IDs under which each buffer was registered in buffer index.
     /// Same length as `buffers`. Used for cleanup - to remove buffers from
     /// the global registry, we need to know what key they were registered under.
     pub buffer_uop_ids: Vec<u64>,
@@ -82,7 +82,7 @@ pub struct ScheduleItem {
 
     /// Mapping from DEFINE_GLOBAL UOp ID to original BUFFER UOp (for input buffers).
     /// This allows reusing existing buffers instead of allocating new ones.
-    /// Key: DEFINE_GLOBAL UOp ID, Value: original BUFFER UOp for looking up in buffer_registry.
+    /// Key: DEFINE_GLOBAL UOp ID, Value: original BUFFER UOp for looking up in buffer index.
     pub source_buffers: HashMap<u64, Arc<UOp>>,
 
     /// KERNEL UOp IDs that must complete before this kernel can execute.
@@ -90,7 +90,7 @@ pub struct ScheduleItem {
     /// Populated from KernelContext.kernel_deps during schedule creation.
     pub dependencies: Vec<u64>,
 
-    /// Additional UOp IDs registered as aliases in buffer_registry.
+    /// Additional UOp IDs registered as aliases in buffer index.
     /// These are IDs where the same buffer was registered under a different key
     /// for lookup convenience. They need to be cleaned up along with buffer_uop_ids.
     pub alias_registered_ids: Vec<u64>,

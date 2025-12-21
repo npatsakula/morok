@@ -6,9 +6,8 @@
 //! Run with: `cargo bench -p morok-tensor`
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use morok_device::registry::registry;
 use morok_schedule::{OptStrategy, OptimizerConfig};
-use morok_tensor::{Tensor, buffer_registry};
+use morok_tensor::Tensor;
 
 /// Create a test matrix of given size with sequential values.
 fn create_matrix(rows: usize, cols: usize) -> Tensor {
@@ -30,30 +29,39 @@ fn bench_matmul(c: &mut Criterion) {
     let heuristic_config = OptimizerConfig::default();
     let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: 2 }).build();
 
-    for size in [32, 64, 128, 256, 512] {
+    for size in [64] {
         let flops = matmul_flops(size, size, size);
         group.throughput(Throughput::Elements(flops));
 
-        let a = create_matrix(size, size);
-        let b = create_matrix(size, size);
+        // Scope tensors and plans so they're dropped before cleanup
+        {
+            let a = create_matrix(size, size);
+            let b = create_matrix(size, size);
 
-        // HEURISTIC: Prepare OUTSIDE timing (compilation happens here)
-        let result_h = a.matmul(&b).expect("matmul should succeed");
-        let plan_h = result_h.prepare_with(&heuristic_config).expect("prepare should succeed");
+            // HEURISTIC: Prepare OUTSIDE timing (compilation happens here)
+            let result_h = a.matmul(&b).expect("matmul should succeed");
+            let plan_h = result_h.prepare_with(&heuristic_config).expect("prepare should succeed");
 
-        group.bench_with_input(BenchmarkId::new("heuristic", size), &size, |bencher, _| {
-            bencher.iter(|| plan_h.execute(&mut executor).expect("execute should succeed"));
-            buffer_registry::remove_buffer(result_h.uop().base().id);
-        });
+            group.bench_with_input(BenchmarkId::new("heuristic", size), &size, |bencher, _| {
+                bencher.iter(|| plan_h.execute(&mut executor).expect("execute should succeed"));
+            });
 
-        // BEAM: Prepare OUTSIDE timing (beam search + compilation happens here)
-        let result_b = a.matmul(&b).expect("matmul should succeed");
-        let plan_b = result_b.prepare_with(&beam_config).expect("prepare should succeed");
+            // BEAM: Prepare OUTSIDE timing (beam search + compilation happens here)
+            let result_b = a.matmul(&b).expect("matmul should succeed");
+            let plan_b = result_b.prepare_with(&beam_config).expect("prepare should succeed");
 
-        group.bench_with_input(BenchmarkId::new("beam_w2", size), &size, |bencher, _| {
-            bencher.iter(|| plan_b.execute(&mut executor).expect("execute should succeed"));
-            buffer_registry::remove_buffer(result_b.uop().base().id);
-        });
+            group.bench_with_input(BenchmarkId::new("beam_w2", size), &size, |bencher, _| {
+                bencher.iter(|| plan_b.execute(&mut executor).expect("execute should succeed"));
+            });
+        }
+
+        // Cleanup between sizes.
+        // With weak references in both UOp cache and tensor registry (Tinygrad-aligned),
+        // entries are auto-cleaned when dropped. We still clean up dead refs for hygiene.
+        morok_ir::uop::gc_dead_refs();
+        morok_tensor::tensor_registry::gc_dead_refs();
+        let live_ids = morok_ir::uop::live_uop_ids();
+        morok_runtime::kernel_cache::gc_unused_kernels(&live_ids);
     }
 
     group.finish();

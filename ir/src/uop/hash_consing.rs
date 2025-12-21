@@ -9,16 +9,19 @@
 //! Creating the same UOp in different threads returns the same `Arc<UOp>`, so
 //! `Arc::ptr_eq` works correctly across thread boundaries.
 //!
-//! # Memory Management
+//! # Memory Management (Tinygrad-aligned)
 //!
-//! UOps are stored as `Arc<UOp>` (not `Weak<UOp>`) for simpler atomic operations.
-//! This means UOps are kept alive by the cache until explicitly cleaned up via
-//! `gc_unused_uops()`. Call this after tensor operations complete to free memory.
+//! UOps are stored as `Weak<UOp>` references in the cache. When no strong references
+//! remain (outside the cache), the UOp is automatically eligible for cleanup.
+//! Dead weak references are cleaned up lazily on next access or via `gc_dead_refs()`.
+//!
+//! This matches Tinygrad's approach using `weakref.WeakKeyDictionary` - no manual
+//! cleanup calls required in user code.
 
 use std::hash::Hash;
 use std::mem::discriminant;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use papaya::HashMap;
 use smallvec::SmallVec;
@@ -211,39 +214,41 @@ impl UOpKey {
 
 // Global hash consing cache using lock-free concurrent HashMap.
 //
-// Design: Stores Arc<UOp> (not Weak) for simpler atomic get-or-insert operations.
+// Design: Stores Weak<UOp> for automatic memory management (Tinygrad-aligned).
 // - Cross-thread deduplication: same UOpKey → same Arc<UOp> across all threads
 // - Lock-free reads and writes via papaya's epoch-based reclamation
-// - Requires explicit GC via gc_unused_uops() after tensor operations
+// - Automatic cleanup: when no strong refs remain, weak ref becomes dead
+// - Dead refs cleaned lazily on next access or via gc_dead_refs()
 //
-// Memory lifecycle:
-// 1. UOps created via UOp::new() are cached indefinitely
-// 2. After tensor.realize(), call gc_unused_uops() to clean up
-// 3. UOps with strong_count == 1 (only cache holds them) are removed
-static UOPS: OnceLock<HashMap<UOpKey, Arc<UOp>>> = OnceLock::new();
+// Memory lifecycle (matches Tinygrad's weakref.WeakKeyDictionary):
+// 1. UOps created via UOp::new() store Weak refs in cache
+// 2. Strong refs held by Tensor, Scheduler, etc. keep UOps alive
+// 3. When all strong refs dropped, UOp deallocated, weak ref becomes dead
+// 4. Dead weak refs cleaned up lazily or via gc_dead_refs()
+static UOPS: OnceLock<HashMap<UOpKey, Weak<UOp>>> = OnceLock::new();
 
-fn uops() -> &'static HashMap<UOpKey, Arc<UOp>> {
+fn uops() -> &'static HashMap<UOpKey, Weak<UOp>> {
     UOPS.get_or_init(HashMap::new)
 }
 
-/// Remove UOps that are only referenced by the cache (strong_count == 1).
+/// Remove dead weak references from the cache.
 ///
-/// Call this after tensor operations complete to free memory.
-/// UOps still referenced elsewhere will be kept.
+/// This is optional - dead refs are also cleaned lazily on next access.
+/// Call this if you want to proactively free cache memory.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let result = tensor.realize()?;
-/// gc_unused_uops();  // Clean up intermediate UOps
+/// // After dropping many tensors, optionally clean up cache
+/// gc_dead_refs();
 /// ```
-pub fn gc_unused_uops() {
+pub fn gc_dead_refs() {
     let map = uops();
     let guard = map.guard();
 
-    // Collect keys to remove (can't mutate while iterating)
+    // Collect keys with dead weak refs
     let to_remove: Vec<UOpKey> =
-        map.iter(&guard).filter(|(_, arc)| Arc::strong_count(arc) == 1).map(|(k, _)| k.clone()).collect();
+        map.iter(&guard).filter(|(_, weak)| weak.upgrade().is_none()).map(|(k, _)| k.clone()).collect();
 
     // Remove dead entries
     for key in to_remove {
@@ -251,53 +256,115 @@ pub fn gc_unused_uops() {
     }
 }
 
+/// Legacy alias for gc_dead_refs (for compatibility).
+///
+/// With weak references, UOps are automatically cleaned up when no longer
+/// referenced. This function now just cleans up dead weak refs in the cache.
+#[deprecated(note = "UOp cache now uses weak refs - cleanup is automatic. Use gc_dead_refs() to clean cache.")]
+pub fn gc_unused_uops() {
+    gc_dead_refs();
+}
+
+/// Get the set of IDs for UOps currently alive in the cache.
+///
+/// This is used by kernel cache GC to determine which compiled kernels
+/// can be safely removed (those whose AST IDs are no longer live).
+///
+/// # Returns
+///
+/// A HashSet containing the IDs of all currently cached UOps (only live ones).
+pub fn live_uop_ids() -> std::collections::HashSet<u64> {
+    let map = uops();
+    let guard = map.guard();
+    map.iter(&guard).filter_map(|(_, weak)| weak.upgrade().map(|arc| arc.id)).collect()
+}
+
 impl UOp {
     /// Create a new UOp with hash consing.
     ///
-    /// If an identical UOp already exists (in any thread), returns a reference to it.
-    /// Otherwise, creates a new UOp and caches it globally.
+    /// If an identical UOp already exists (in any thread) and is still alive,
+    /// returns a reference to it. Otherwise, creates a new UOp and caches it.
     ///
     /// # Thread Safety
     ///
     /// This function is thread-safe. Creating the same UOp from different threads
     /// will return the same `Arc<UOp>`, so `Arc::ptr_eq` works across threads.
+    ///
+    /// # Memory Management
+    ///
+    /// The cache stores weak references. UOps are automatically cleaned up when
+    /// no strong references remain (Tinygrad-aligned behavior).
     #[track_caller]
     pub fn new(op: Op, dtype: DType) -> Arc<Self> {
+        use papaya::{Compute, Operation};
+
         // Capture caller location BEFORE entering any closures
-        // This is critical for #[track_caller] to work correctly
         let caller_location = std::panic::Location::caller();
         let key = UOpKey::new(&op, dtype.clone());
-
         let guard = uops().guard();
 
-        // Atomic get-or-insert: if another thread races us, we both get the same Arc
-        let uop = uops().get_or_insert_with(
+        // Fast path: check if valid entry exists
+        if let Some(weak) = uops().get(&key, &guard) {
+            if let Some(arc) = weak.upgrade() {
+                // Valid entry found - record provenance and return
+                use crate::provenance::PROVENANCE_TRACKER;
+                PROVENANCE_TRACKER.with(|tracker| {
+                    tracker.borrow_mut().capture(arc.id, caller_location);
+                });
+                return arc;
+            }
+            // Dead weak ref - will be replaced below
+        }
+
+        // Create new UOp (will be used if we win the race)
+        let new_arc = Arc::new(Self {
+            id: next_uop_id(),
+            op,
+            dtype,
+            shape_cache: std::sync::OnceLock::new(),
+            ranges_cache: std::sync::OnceLock::new(),
+            in_scope_ranges_cache: std::sync::OnceLock::new(),
+            vmin_vmax_cache: std::sync::OnceLock::new(),
+            metadata: None,
+        });
+        let new_weak = Arc::downgrade(&new_arc);
+
+        // Atomic insert: insert our weak ref, but if someone else has a valid one, use theirs
+        // Note: papaya's Insert replaces existing entries, which handles dead weak refs
+        let result = uops().compute(
             key,
-            || {
-                Arc::new(Self {
-                    id: next_uop_id(),
-                    op,
-                    dtype,
-                    shape_cache: std::sync::OnceLock::new(),
-                    ranges_cache: std::sync::OnceLock::new(),
-                    in_scope_ranges_cache: std::sync::OnceLock::new(),
-                    vmin_vmax_cache: std::sync::OnceLock::new(),
-                    metadata: None,
-                })
+            |entry| match entry {
+                Some((_, existing_weak)) => {
+                    if let Some(existing_arc) = existing_weak.upgrade() {
+                        // Valid entry exists - abort with it (reuse existing)
+                        Operation::Abort(existing_arc)
+                    } else {
+                        // Dead entry - replace with ours
+                        Operation::Insert(new_weak.clone())
+                    }
+                }
+                None => {
+                    // No entry - insert ours
+                    Operation::Insert(new_weak.clone())
+                }
             },
             &guard,
         );
 
-        // Record provenance in the creating thread (thread-local, debug only)
-        // Note: Only the thread that actually created the UOp should record provenance,
-        // but get_or_insert_with doesn't tell us if we inserted. For simplicity,
-        // we record on every call - duplicate entries are harmless for debugging.
+        // Determine which Arc to return based on compute result
+        let final_arc = match result {
+            Compute::Inserted(_, _) | Compute::Updated { .. } => new_arc,
+            Compute::Aborted(existing_arc) => existing_arc,
+            _ => new_arc, // Fallback for Unchanged/Removed (shouldn't happen)
+        };
+
+        // Record provenance
         use crate::provenance::PROVENANCE_TRACKER;
         PROVENANCE_TRACKER.with(|tracker| {
-            tracker.borrow_mut().capture(uop.id, caller_location);
+            tracker.borrow_mut().capture(final_arc.id, caller_location);
         });
 
-        Arc::clone(uop)
+        final_arc
     }
 
     /// Attach metadata to this UOp, creating a new instance.

@@ -28,4 +28,6 @@ pub mod tree;
 
 // Re-export the main types
 pub use core::{IntoUOp, UOp, UOpKey};
-pub use hash_consing::gc_unused_uops;
+#[allow(deprecated)]
+pub use hash_consing::gc_unused_uops; // Legacy, now just calls gc_dead_refs
+pub use hash_consing::{gc_dead_refs, live_uop_ids};
