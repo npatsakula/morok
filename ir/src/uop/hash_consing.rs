@@ -305,15 +305,16 @@ impl UOp {
 
         // Fast path: check if valid entry exists
         if let Some(weak) = uops().get(&key, &guard)
-            && let Some(arc) = weak.upgrade() {
-                // Valid entry found - record provenance and return
-                use crate::provenance::PROVENANCE_TRACKER;
-                PROVENANCE_TRACKER.with(|tracker| {
-                    tracker.borrow_mut().capture(arc.id, caller_location);
-                });
-                return arc;
-            }
-            // Dead weak ref - will be replaced below
+            && let Some(arc) = weak.upgrade()
+        {
+            // Valid entry found - record provenance and return
+            use crate::provenance::PROVENANCE_TRACKER;
+            PROVENANCE_TRACKER.with(|tracker| {
+                tracker.borrow_mut().capture(arc.id, caller_location);
+            });
+            return arc;
+        }
+        // Dead weak ref - will be replaced below
 
         // Create new UOp (will be used if we win the race)
         let new_arc = Arc::new(Self {

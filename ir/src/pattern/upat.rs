@@ -639,10 +639,7 @@ impl UPat {
     /// Match any UNROLL operation regardless of axes.
     pub fn unroll_any() -> Self {
         UPat::Match {
-            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Unroll {
-                src: UOp::noop(),
-                unroll_axes: vec![],
-            }))]),
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Unroll { src: UOp::noop(), unroll_axes: vec![] }))]),
             dtype: None,
             src: None,
             arg: None,

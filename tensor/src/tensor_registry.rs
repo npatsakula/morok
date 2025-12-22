@@ -263,8 +263,7 @@ pub fn gc_dead_refs() {
     // Clean dead tensor weak refs
     let map = tensors();
     let guard = map.guard();
-    let to_remove: Vec<u64> =
-        map.iter(&guard).filter(|(_, weak)| weak.upgrade().is_none()).map(|(k, _)| *k).collect();
+    let to_remove: Vec<u64> = map.iter(&guard).filter(|(_, weak)| weak.upgrade().is_none()).map(|(k, _)| *k).collect();
     for id in to_remove {
         map.remove(&id, &guard);
     }
@@ -285,8 +284,7 @@ pub fn gc_dead_refs() {
         .iter(&uop_guard)
         .filter(|(uop_id, tensor_id)| {
             // Remove if UOp is dead OR tensor is dead
-            !live_uop_ids.contains(uop_id)
-                || tensors().get(*tensor_id, &guard).is_none_or(|w| w.upgrade().is_none())
+            !live_uop_ids.contains(uop_id) || tensors().get(*tensor_id, &guard).is_none_or(|w| w.upgrade().is_none())
         })
         .map(|(uop_id, _)| *uop_id)
         .collect();

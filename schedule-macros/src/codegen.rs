@@ -706,7 +706,10 @@ fn generate_special_op_pattern(
 
         "StoreGated" => {
             if args.len() != 4 {
-                return Err(Error::new_spanned(op, "StoreGated requires exactly 4 arguments (buffer, index, value, gate)"));
+                return Err(Error::new_spanned(
+                    op,
+                    "StoreGated requires exactly 4 arguments (buffer, index, value, gate)",
+                ));
             }
             let buffer = &arg_codes[0];
             let index = &arg_codes[1];

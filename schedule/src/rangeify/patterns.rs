@@ -801,11 +801,20 @@ pub fn handle_after(after: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp
 }
 
 /// Remove BIND: extract var and track it.
+/// EXCEPTION: Preserve Bind for OUTER/GLOBAL/LOOP ranges - codegen needs these for loop generation.
 pub fn unbind_kernel(bind: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let (var, _value) = match bind.op() {
+    let (var, value) = match bind.op() {
         Op::Bind { var, value } => (var, value),
         _ => return None,
     };
+
+    // Preserve Bind for loop ranges - codegen needs these to generate for loops
+    if let Op::Range { axis_type, .. } = value.op() {
+        if matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop) {
+            ctx.add_var(var.clone());
+            return None; // Don't transform - keep the Bind as-is
+        }
+    }
 
     ctx.add_var(var.clone());
     Some(var.clone())
@@ -823,7 +832,10 @@ pub fn renumber_range(range: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<U
         AxisId::Renumbered(_) => return None,
     }
 
-    if axis_type == AxisType::Outer {
+    // Handle OUTER, GLOBAL, and LOOP ranges: create Bind(DefineVar, Range) patterns
+    // These will be inlined as for loops in CPU codegen
+    // LOOP is used for CPU (has_local=false), GLOBAL is used for GPU
+    if matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop) {
         let var_name = format!("range_{}", old_axis_id.value());
         let vmax = match end.vmax() {
             morok_ir::ConstValue::Int(v) => *v - 1,

@@ -4,8 +4,7 @@
 //! All arithmetic operations support both scalar and vector types.
 
 use crate::llvm::error::{
-    ArithmeticSnafu, ComparisonSnafu, Result, VectorInsertSnafu, VectorShuffleSnafu,
-    VectorWidthMismatchSnafu,
+    ArithmeticSnafu, ComparisonSnafu, Result, VectorInsertSnafu, VectorShuffleSnafu, VectorWidthMismatchSnafu,
 };
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -70,26 +69,14 @@ pub fn build_neg<'ctx>(
 ) -> Result<BasicValueEnum<'ctx>> {
     if is_float {
         if src.is_vector_value() {
-            Ok(builder
-                .build_float_neg(src.into_vector_value(), "neg")
-                .context(ArithmeticSnafu)?
-                .into())
+            Ok(builder.build_float_neg(src.into_vector_value(), "neg").context(ArithmeticSnafu)?.into())
         } else {
-            Ok(builder
-                .build_float_neg(src.into_float_value(), "neg")
-                .context(ArithmeticSnafu)?
-                .into())
+            Ok(builder.build_float_neg(src.into_float_value(), "neg").context(ArithmeticSnafu)?.into())
         }
     } else if src.is_vector_value() {
-        Ok(builder
-            .build_int_neg(src.into_vector_value(), "neg")
-            .context(ArithmeticSnafu)?
-            .into())
+        Ok(builder.build_int_neg(src.into_vector_value(), "neg").context(ArithmeticSnafu)?.into())
     } else {
-        Ok(builder
-            .build_int_neg(src.into_int_value(), "neg")
-            .context(ArithmeticSnafu)?
-            .into())
+        Ok(builder.build_int_neg(src.into_int_value(), "neg").context(ArithmeticSnafu)?.into())
     }
 }
 
@@ -243,11 +230,7 @@ pub fn build_cmp<'ctx>(
 
 /// Get vector element count from a value (1 for scalars).
 pub fn get_vector_count(value: BasicValueEnum<'_>) -> u32 {
-    if value.is_vector_value() {
-        value.into_vector_value().get_type().get_size()
-    } else {
-        1
-    }
+    if value.is_vector_value() { value.into_vector_value().get_type().get_size() } else { 1 }
 }
 
 /// Broadcast a scalar value to a vector of given count.
@@ -276,9 +259,7 @@ pub fn broadcast_to_vector<'ctx>(
     // Insert scalar into poison vector at index 0
     let poison = vec_type.get_poison();
     let zero = context.i32_type().const_zero();
-    let single = builder
-        .build_insert_element(poison, scalar, zero, "bcast_insert")
-        .context(VectorInsertSnafu)?;
+    let single = builder.build_insert_element(poison, scalar, zero, "bcast_insert").context(VectorInsertSnafu)?;
 
     // Create mask of all zeros to replicate element 0 to all positions
     let i32_type = context.i32_type();
@@ -286,9 +267,7 @@ pub fn broadcast_to_vector<'ctx>(
     let mask = VectorType::const_vector(&mask_values);
 
     // Shuffle to broadcast
-    let result = builder
-        .build_shuffle_vector(single, poison, mask, "bcast_shuffle")
-        .context(VectorShuffleSnafu)?;
+    let result = builder.build_shuffle_vector(single, poison, mask, "bcast_shuffle").context(VectorShuffleSnafu)?;
 
     Ok(result.into())
 }

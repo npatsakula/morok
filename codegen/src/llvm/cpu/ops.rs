@@ -941,10 +941,13 @@ fn codegen_loop<'ctx>(
             codegen_reduce(uop.id, src, ranges, *reduce_op, &uop.dtype(), context, module, builder, values)
         }
         Op::Bind { var, value } => {
-            // For OUTER ranges: Create the loop HERE (single responsibility)
+            // For OUTER/GLOBAL/LOOP ranges: Create the loop HERE (single responsibility)
             // This matches Tinygrad where loop creation happens at RANGE/BIND processing
-            if let Op::Range { end, axis_type: AxisType::Outer, .. } = value.op() {
-                trace!(var.id = var.id, value.id = value.id, "processing bind with outer range");
+            // LOOP is used for CPU (has_local=false), GLOBAL is used for GPU
+            if let Op::Range { end, axis_type, .. } = value.op()
+                && matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop)
+            {
+                trace!(var.id = var.id, value.id = value.id, axis_type = ?axis_type, "processing bind with loop range");
                 // Check if already created (idempotent)
                 if let Some(val) = values.get(value.id) {
                     trace!(value.id = value.id, "bind reusing existing counter");

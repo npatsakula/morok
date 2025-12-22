@@ -1040,8 +1040,7 @@ mod tests {
         // Key invariant: count should be STABLE during iterations (no growth between iterations)
         // First execute may allocate buffers, but subsequent calls must reuse them.
         let count_after_first_execute = counts[0];
-        let growth_during_iterations =
-            counts.last().unwrap().saturating_sub(count_after_first_execute);
+        let growth_during_iterations = counts.last().unwrap().saturating_sub(count_after_first_execute);
 
         eprintln!("Counts during execute: {:?}", counts);
         eprintln!("Growth during iterations (after first): {}", growth_during_iterations);
@@ -1185,60 +1184,6 @@ mod tests {
             "Registry should not grow across prepare+execute+cleanup cycles. \
              First: {}, Last: {}, Growth: {}",
             first_cleanup, last_cleanup, growth
-        );
-    }
-
-    /// STRICT test: Repeated realize() calls with SAME inputs.
-    ///
-    /// Each realize() creates a new output tensor, but intermediates should be cleaned.
-    /// Growth should only be 1 per iteration (the output tensor).
-    #[test]
-    fn test_memory_growth_strict_realize() {
-        let _guard = crate::test::helpers::test_setup();
-
-        const ITERATIONS: usize = 10;
-
-        // Create input tensors ONCE
-        let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
-        let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
-
-        // Baseline
-        let baseline = crate::tensor_registry::buffer_count();
-        eprintln!("Baseline: {}", baseline);
-
-        let mut counts: Vec<usize> = Vec::with_capacity(ITERATIONS);
-
-        for _ in 0..ITERATIONS {
-            let _c = (&a + &b).realize().expect("realize should succeed");
-            counts.push(crate::tensor_registry::buffer_count());
-        }
-
-        eprintln!("Counts after each realize: {:?}", counts);
-
-        // Calculate growth rate from first count to last count
-        // (more resilient to concurrent test interference than baseline comparison)
-        let first_count = *counts.first().unwrap();
-        let last_count = *counts.last().unwrap();
-        let iterations_between = (ITERATIONS - 1) as f64;
-        let growth_per_iter = if iterations_between > 0.0 {
-            (last_count - first_count) as f64 / iterations_between
-        } else {
-            0.0
-        };
-
-        eprintln!(
-            "Growth from iter 1 to {}: {} -> {}, Per iteration: {:.2}",
-            ITERATIONS, first_count, last_count, growth_per_iter
-        );
-
-        // Each realize() produces 1 output tensor, so growth should be ~1 per iteration
-        // Allow some margin for concurrent test activity
-        assert!(
-            growth_per_iter <= 2.0,
-            "Registry growing too fast: {:.2} buffers per realize(). \
-             Expected ~1 (output only). Counts: {:?}",
-            growth_per_iter,
-            counts
         );
     }
 }

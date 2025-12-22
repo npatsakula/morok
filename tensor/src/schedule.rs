@@ -605,25 +605,27 @@ fn collect_bound_ranges(ast: &Arc<UOp>) -> Result<Vec<BoundRange>> {
 
     let nodes = ast.toposort();
 
-    // Find DefineVar IDs that are bound to OUTER ranges (will be inlined as loops on CPU)
-    let mut bound_outer_vars: HashSet<u64> = HashSet::new();
+    // Find DefineVar IDs that are bound to OUTER, GLOBAL, or LOOP ranges (will be inlined as loops on CPU)
+    // LOOP is used for CPU (has_local=false), GLOBAL is used for GPU
+    let mut bound_loop_vars: HashSet<u64> = HashSet::new();
     for node in &nodes {
         if let Op::Bind { var, value } = node.op()
-            && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. })
+            && let Op::Range { axis_type, .. } = value.op()
+            && matches!(axis_type, morok_ir::AxisType::Outer | morok_ir::AxisType::Global | morok_ir::AxisType::Loop)
         {
-            // This DefineVar is bound to an OUTER range
-            bound_outer_vars.insert(var.id);
+            // This DefineVar is bound to a loop range
+            bound_loop_vars.insert(var.id);
         }
     }
 
     let mut bound_ranges = Vec::new();
 
-    // Only collect DEFINE_VAR nodes that are NOT bound to OUTER ranges
-    // BIND+OUTER DefineVars will be inlined as loops by CPU codegen
+    // Only collect DEFINE_VAR nodes that are NOT bound to loop ranges
+    // BIND+OUTER/GLOBAL/LOOP DefineVars will be inlined as loops by CPU codegen
     for node in &nodes {
         if let Op::DefineVar { name, max_val, .. } = node.op() {
-            // Skip DefineVars that are bound to OUTER ranges
-            if bound_outer_vars.contains(&node.id) {
+            // Skip DefineVars that are bound to loop ranges
+            if bound_loop_vars.contains(&node.id) {
                 continue;
             }
 
