@@ -66,7 +66,7 @@ fn test_renumber_range() {
 }
 
 #[test]
-fn test_renumber_range_loop_creates_bind() {
+fn test_renumber_range_loop_no_bind() {
     let mut ctx = KernelContext::new();
 
     // Create a LOOP RANGE with unrenumbered axis_id
@@ -76,24 +76,14 @@ fn test_renumber_range_loop_creates_bind() {
     // Apply renumber_range pattern
     let result = renumber_range(&range, &mut ctx);
 
-    // LOOP ranges should return a BIND(DefineVar, Range) pattern for CPU codegen
+    // LOOP ranges should be renumbered without BIND wrapper (Tinygrad approach)
+    // Codegen creates loops directly from RANGE ops
     let op = result.expect("Expected Some result");
-    if let Op::Bind { var, value } = op.op() {
-        // Var should be a DefineVar with name "range_5"
-        if let Op::DefineVar { name, .. } = var.op() {
-            assert_eq!(name, "range_5");
-        } else {
-            panic!("Expected DefineVar in Bind");
-        }
-        // Value should be a Range with renumbered axis_id
-        if let Op::Range { axis_id, axis_type, .. } = value.op() {
-            assert_eq!(*axis_id, AxisId::Renumbered(0));
-            assert_eq!(*axis_type, AxisType::Loop);
-        } else {
-            panic!("Expected Range in Bind");
-        }
+    if let Op::Range { axis_id, axis_type, .. } = op.op() {
+        assert_eq!(*axis_id, AxisId::Renumbered(0));
+        assert_eq!(*axis_type, AxisType::Loop);
     } else {
-        panic!("Expected BIND operation for LOOP range, got {:?}", op.op());
+        panic!("Expected RANGE operation for LOOP axis, got {:?}", op.op());
     }
 }
 
@@ -263,35 +253,19 @@ fn test_renumber_range_different_axis_types() {
     let end = UOp::index_const(10);
 
     // Test axis types with unrenumbered axis_ids
-    // LOOP and OUTER now return Bind(DefineVar, Range), Reduce returns plain Range
+    // All axis types now return plain Range without BIND wrapper (Tinygrad approach)
+    // Codegen creates loops directly from RANGE ops
     for (i, axis_type) in [AxisType::Loop, AxisType::Reduce, AxisType::Outer].iter().enumerate() {
         let range = UOp::range_axis(end.clone(), AxisId::Unrenumbered(i), *axis_type);
 
         let result = renumber_range(&range, &mut ctx);
 
         if let Some(r) = result {
-            match axis_type {
-                AxisType::Reduce => {
-                    // Reduce returns plain Range
-                    if let Op::Range { axis_type: new_type, .. } = r.op() {
-                        assert_eq!(*new_type, *axis_type);
-                    } else {
-                        panic!("Expected Range for Reduce");
-                    }
-                }
-                AxisType::Loop | AxisType::Outer | AxisType::Global => {
-                    // Loop/Outer/Global return Bind(DefineVar, Range)
-                    if let Op::Bind { value, .. } = r.op() {
-                        if let Op::Range { axis_type: new_type, .. } = value.op() {
-                            assert_eq!(*new_type, *axis_type);
-                        } else {
-                            panic!("Expected Range inside Bind");
-                        }
-                    } else {
-                        panic!("Expected Bind for {:?}", axis_type);
-                    }
-                }
-                _ => {}
+            // All axis types return plain Range
+            if let Op::Range { axis_type: new_type, .. } = r.op() {
+                assert_eq!(*new_type, *axis_type);
+            } else {
+                panic!("Expected Range for {:?}, got {:?}", axis_type, r.op());
             }
         } else {
             panic!("Expected Some result for {:?}", axis_type);
@@ -412,7 +386,7 @@ fn test_renumber_range_sequential() {
     let mut ctx = KernelContext::new();
 
     // Create ranges with unrenumbered axis_ids
-    // LOOP ranges return Bind(DefineVar, Range), Reduce returns plain Range
+    // All axis types now return plain Range without BIND wrapper (Tinygrad approach)
     let range0 = UOp::range_axis(UOp::index_const(10), AxisId::Unrenumbered(0), AxisType::Loop);
     let range1 = UOp::range_axis(UOp::index_const(20), AxisId::Unrenumbered(1), AxisType::Loop);
     let range2 = UOp::range_axis(UOp::index_const(30), AxisId::Unrenumbered(2), AxisType::Reduce);
@@ -421,16 +395,13 @@ fn test_renumber_range_sequential() {
 
     let result0 = renumber_range(&range0, &mut ctx);
     match result0 {
-        Some(bind) => {
-            // LOOP returns Bind(DefineVar, Range)
-            if let Op::Bind { value, .. } = bind.op() {
-                if let Op::Range { axis_id, .. } = value.op() {
-                    assert_eq!(*axis_id, AxisId::Renumbered(0));
-                } else {
-                    panic!("Expected RANGE inside Bind");
-                }
+        Some(new_range) => {
+            // LOOP returns plain Range (no BIND)
+            if let Op::Range { axis_id, axis_type, .. } = new_range.op() {
+                assert_eq!(*axis_id, AxisId::Renumbered(0));
+                assert_eq!(*axis_type, AxisType::Loop);
             } else {
-                panic!("Expected BIND operation for LOOP range");
+                panic!("Expected RANGE operation for LOOP");
             }
         }
         None => panic!("Expected renumbered range"),
@@ -438,16 +409,13 @@ fn test_renumber_range_sequential() {
 
     let result1 = renumber_range(&range1, &mut ctx);
     match result1 {
-        Some(bind) => {
-            // LOOP returns Bind(DefineVar, Range)
-            if let Op::Bind { value, .. } = bind.op() {
-                if let Op::Range { axis_id, .. } = value.op() {
-                    assert_eq!(*axis_id, AxisId::Renumbered(1));
-                } else {
-                    panic!("Expected RANGE inside Bind");
-                }
+        Some(new_range) => {
+            // LOOP returns plain Range (no BIND)
+            if let Op::Range { axis_id, axis_type, .. } = new_range.op() {
+                assert_eq!(*axis_id, AxisId::Renumbered(1));
+                assert_eq!(*axis_type, AxisType::Loop);
             } else {
-                panic!("Expected BIND operation for LOOP range");
+                panic!("Expected RANGE operation for LOOP");
             }
         }
         None => panic!("Expected renumbered range"),
@@ -459,7 +427,6 @@ fn test_renumber_range_sequential() {
             // Reduce returns plain Range
             if let Op::Range { axis_id, axis_type, .. } = new_range.op() {
                 assert_eq!(*axis_id, AxisId::Renumbered(2));
-                // Should preserve axis type
                 assert_eq!(*axis_type, AxisType::Reduce);
             } else {
                 panic!("Expected RANGE operation");
@@ -545,40 +512,28 @@ fn test_pattern_composition_sequence() {
 }
 
 #[test]
-fn test_pattern_composition_sequence_with_bind() {
+fn test_pattern_composition_sequence_no_bind() {
     let mut ctx = KernelContext::new();
 
-    // Test that LOOP ranges return Bind patterns
+    // Test that LOOP ranges return plain Range (no BIND wrapper, Tinygrad approach)
     let range_unnum = UOp::range_axis(UOp::index_const(15), AxisId::Unrenumbered(7), AxisType::Loop);
 
     // Apply renumber_range pattern
     let result1 = renumber_range(&range_unnum, &mut ctx);
 
     match result1 {
-        Some(bind) => {
-            // LOOP should return Bind(DefineVar, Range)
-            if let Op::Bind { var, value } = bind.op() {
-                // Var should be DefineVar with name "range_7"
-                if let Op::DefineVar { name, .. } = var.op() {
-                    assert_eq!(name, "range_7");
-                } else {
-                    panic!("Expected DefineVar in Bind");
-                }
+        Some(new_range) => {
+            // LOOP should return plain Range (codegen creates loops from RANGE ops)
+            if let Op::Range { axis_id, axis_type, end } = new_range.op() {
+                assert_eq!(*axis_id, AxisId::Renumbered(0));
+                assert_eq!(*axis_type, AxisType::Loop);
 
-                // Value should be Range with renumbered ID
-                if let Op::Range { axis_id, axis_type, end } = value.op() {
-                    assert_eq!(*axis_id, AxisId::Renumbered(0));
-                    assert_eq!(*axis_type, AxisType::Loop);
-
-                    // End should be preserved
-                    if let Op::Range { end: original_end, .. } = range_unnum.op() {
-                        assert!(std::sync::Arc::ptr_eq(end, original_end));
-                    }
-                } else {
-                    panic!("Expected RANGE inside Bind");
+                // End should be preserved
+                if let Op::Range { end: original_end, .. } = range_unnum.op() {
+                    assert!(std::sync::Arc::ptr_eq(end, original_end));
                 }
             } else {
-                panic!("Expected BIND operation for LOOP range");
+                panic!("Expected RANGE operation for LOOP axis, got {:?}", new_range.op());
             }
         }
         None => panic!("Expected Rewritten result"),

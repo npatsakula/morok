@@ -586,8 +586,10 @@ fn collect_kernel_buffers(
 
 /// Collect bound ranges from kernel AST.
 ///
-/// This walks the kernel AST and identifies BIND(DEFINE_VAR, RANGE) nodes.
-/// These represent OUTER ranges that need to be expanded into iterations.
+/// This walks the kernel AST and identifies DEFINE_VAR nodes that need schedule expansion.
+///
+/// Note: Loop ranges (OUTER/GLOBAL/LOOP) now generate inline for-loops directly in codegen,
+/// so they don't create DefineVars and don't need schedule expansion (Tinygrad approach).
 ///
 /// # Arguments
 ///
@@ -595,40 +597,15 @@ fn collect_kernel_buffers(
 ///
 /// # Returns
 ///
-/// A vector of BoundRange structs, one for each BIND node found.
-///
-/// # Errors
-///
-/// Returns error if BIND structure is malformed.
+/// A vector of BoundRange structs, one for each DefineVar found.
 fn collect_bound_ranges(ast: &Arc<UOp>) -> Result<Vec<BoundRange>> {
-    use std::collections::HashSet;
-
     let nodes = ast.toposort();
-
-    // Find DefineVar IDs that are bound to OUTER, GLOBAL, or LOOP ranges (will be inlined as loops on CPU)
-    // LOOP is used for CPU (has_local=false), GLOBAL is used for GPU
-    let mut bound_loop_vars: HashSet<u64> = HashSet::new();
-    for node in &nodes {
-        if let Op::Bind { var, value } = node.op()
-            && let Op::Range { axis_type, .. } = value.op()
-            && matches!(axis_type, morok_ir::AxisType::Outer | morok_ir::AxisType::Global | morok_ir::AxisType::Loop)
-        {
-            // This DefineVar is bound to a loop range
-            bound_loop_vars.insert(var.id);
-        }
-    }
-
     let mut bound_ranges = Vec::new();
 
-    // Only collect DEFINE_VAR nodes that are NOT bound to loop ranges
-    // BIND+OUTER/GLOBAL/LOOP DefineVars will be inlined as loops by CPU codegen
+    // Collect all DefineVar nodes - they need schedule expansion
+    // (Loop ranges no longer create DefineVars - they become inline loops)
     for node in &nodes {
         if let Op::DefineVar { name, max_val, .. } = node.op() {
-            // Skip DefineVars that are bound to loop ranges
-            if bound_loop_vars.contains(&node.id) {
-                continue;
-            }
-
             // Create a synthetic RANGE UOp for this variable
             // Range goes from 0 to max_val+1 (exclusive upper bound)
             let range_end = UOp::const_(

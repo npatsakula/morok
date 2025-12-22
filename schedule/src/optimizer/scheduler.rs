@@ -459,7 +459,7 @@ impl Scheduler {
     /// Get indices of axes that can be upcasted (vectorized).
     ///
     /// Upcastable axes are GLOBAL, LOCAL, or LOOP axes with size > 1.
-    /// These represent dimensions that can be combined via SIMD/vectorization.
+    /// Note: OUTER is excluded per Tinygrad's design - it's for schedule expansion, not vectorization.
     ///
     /// # Returns
     ///
@@ -470,7 +470,8 @@ impl Scheduler {
             .enumerate()
             .filter_map(|(i, rng)| {
                 if let Op::Range { axis_type, end, .. } = rng.op() {
-                    // Check type
+                    // Check type: GLOBAL/LOCAL/LOOP are upcastable
+                    // (OUTER excluded - it's for schedule expansion, not vectorization)
                     if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
                         return None;
                     }
@@ -935,6 +936,55 @@ impl Scheduler {
             use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ConvertLoopToGlobal);
+            });
+        }
+
+        self.clear_caches();
+
+        Ok(())
+    }
+
+    /// Convert OUTER axes to LOOP for CPU vectorization.
+    ///
+    /// For CPU backends (has_local=false), OUTER axes cannot be parallelized
+    /// externally but can be vectorized. Converting them to LOOP allows
+    /// the optimizer to apply UPCAST transformations for SIMD operations.
+    ///
+    /// This is the CPU counterpart to `convert_loop_to_global()` for GPU.
+    pub fn convert_outer_to_loop(&mut self) -> Result<(), OptError> {
+        // Only for CPU backends (no local memory = no GPU parallelization)
+        if self.ren.has_local {
+            return Ok(());
+        }
+
+        let outer_rngs: Vec<_> = self
+            .rngs()
+            .iter()
+            .filter(|rng| matches!(rng.op(), Op::Range { axis_type: AxisType::Outer, .. }))
+            .cloned()
+            .collect();
+
+        if outer_rngs.is_empty() {
+            return Ok(());
+        }
+
+        // Build substitution map: OUTER → LOOP
+        #[allow(clippy::mutable_key_type)]
+        let mut subst_map = std::collections::HashMap::new();
+        for rng in outer_rngs {
+            let new_rng = rng.with_axis_type(AxisType::Loop);
+            subst_map.insert(UOpKey(rng), new_rng);
+        }
+
+        // Apply substitution
+        let old_ast_id = self.ast.id;
+        self.ast = self.ast.substitute(&subst_map);
+
+        // Record high-level transformation
+        if old_ast_id != self.ast.id {
+            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
+            PROVENANCE_TRACKER.with(|tracker| {
+                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ConvertOuterToLoop);
             });
         }
 

@@ -65,6 +65,7 @@ fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
+    // Only GLOBAL/LOCAL/LOOP can be upcasted (Tinygrad design - OUTER is for schedule expansion)
     if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
         return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop axes" }.fail();
     }

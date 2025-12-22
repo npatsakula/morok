@@ -108,14 +108,17 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // its source is evaluated (e.g., INDEX needs the loop counter, not the end value)
         let reduce_src_nodes = find_reduce_source_nodes(&nodes);
 
-        // Pre-pass: Process BIND operations with OUTER ranges first
-        // This ensures outer loop counters are available before other operations that use them.
-        // Without this, DefineVar would have no value when operations reference it.
+        // Pre-pass: Process OUTER/GLOBAL/LOOP RANGE ops first to create loops
+        // This ensures loop counters are available before other operations that use them.
+        // Loops are created directly from RANGE ops (Tinygrad approach).
         for node in &nodes {
-            if let Op::Bind { value, .. } = node.op()
-                && matches!(value.op(), Op::Range { axis_type: morok_ir::AxisType::Outer, .. })
+            if let Op::Range { axis_type, .. } = node.op()
+                && matches!(
+                    axis_type,
+                    morok_ir::AxisType::Outer | morok_ir::AxisType::Global | morok_ir::AxisType::Loop
+                )
             {
-                trace!(bind.id = node.id, range.id = value.id, "Pre-pass: Processing BIND with OUTER Range");
+                trace!(range.id = node.id, axis_type = ?axis_type, "Pre-pass: Processing loop RANGE");
                 ops::codegen_uop(node, self.context, &module, &builder, &mut values)?;
             }
         }
@@ -228,12 +231,10 @@ impl<'ctx> Renderer for CpuLlvmRenderer<'ctx> {
 /// - Buffers: DEFINE_GLOBAL, DEFINE_LOCAL, BUFFER operations
 /// - Variables: DEFINE_VAR operations NOT in BIND+OUTER patterns (passed as i64 kernel params)
 ///
-/// DefineVars in BIND+OUTER patterns are handled as inlined loops, not kernel parameters.
+/// Loop ranges (OUTER/GLOBAL/LOOP) generate for-loops directly, no DefineVar needed.
 ///
 /// Returns (buffers, variables) sorted for deterministic function signatures.
 fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
-    use std::collections::HashSet;
-
     let nodes = root.toposort();
 
     // Collect buffers
@@ -255,24 +256,12 @@ fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
         _ => b.id,
     });
 
-    // Find DefineVar IDs that are bound to OUTER, GLOBAL, or LOOP ranges (will be inlined as loops)
-    // LOOP is used for CPU (has_local=false), GLOBAL is used for GPU
-    let mut bound_loop_vars: HashSet<u64> = HashSet::new();
-    for node in &nodes {
-        if let Op::Bind { var, value } = node.op()
-            && let Op::Range { axis_type, .. } = value.op()
-            && matches!(axis_type, morok_ir::AxisType::Outer | morok_ir::AxisType::Global | morok_ir::AxisType::Loop)
-        {
-            // This DefineVar is bound to a range that will be inlined as loop
-            bound_loop_vars.insert(var.id);
-        }
-    }
-
-    // Collect DefineVar nodes that are NOT bound to loop ranges
-    // Only these become i64 kernel parameters
+    // Collect DefineVar nodes - these become i64 kernel parameters
+    // Note: Loop ranges no longer create DefineVars (Tinygrad approach), so all DefineVars
+    // found here are user-provided or from schedule expansion and should be parameters.
     let mut variables = Vec::new();
     for node in &nodes {
-        if matches!(node.op(), Op::DefineVar { .. }) && !bound_loop_vars.contains(&node.id) {
+        if matches!(node.op(), Op::DefineVar { .. }) {
             variables.push(node.clone());
         }
     }

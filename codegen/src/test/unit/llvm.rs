@@ -41,11 +41,12 @@ fn test_range_end_basic() {
     let ir = &kernel.code;
 
     // Verify loop structure in generated IR
-    assert!(ir.contains("loop_entry_0"), "Missing entry block:\n{}", ir);
-    assert!(ir.contains("loop_latch_0"), "Missing latch block:\n{}", ir);
-    assert!(ir.contains("loop_body_0"), "Missing body block:\n{}", ir);
-    assert!(ir.contains("loop_footer_0"), "Missing footer block:\n{}", ir);
-    assert!(ir.contains("loop_exit_0"), "Missing exit block:\n{}", ir);
+    // Block names use uop_id which varies, so just check for the patterns
+    assert!(ir.contains("loop_entry_"), "Missing entry block:\n{}", ir);
+    assert!(ir.contains("loop_latch_"), "Missing latch block:\n{}", ir);
+    assert!(ir.contains("loop_body_"), "Missing body block:\n{}", ir);
+    assert!(ir.contains("loop_footer_"), "Missing footer block:\n{}", ir);
+    assert!(ir.contains("loop_exit_"), "Missing exit block:\n{}", ir);
     assert!(ir.contains("phi i64"), "Missing PHI node:\n{}", ir);
 }
 

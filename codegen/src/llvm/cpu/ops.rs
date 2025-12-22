@@ -941,54 +941,23 @@ fn codegen_loop<'ctx>(
             codegen_reduce(uop.id, src, ranges, *reduce_op, &uop.dtype(), context, module, builder, values)
         }
         Op::Bind { var, value } => {
-            // For OUTER/GLOBAL/LOOP ranges: Create the loop HERE (single responsibility)
-            // This matches Tinygrad where loop creation happens at RANGE/BIND processing
-            // LOOP is used for CPU (has_local=false), GLOBAL is used for GPU
-            if let Op::Range { end, axis_type, .. } = value.op()
-                && matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop)
-            {
-                trace!(var.id = var.id, value.id = value.id, axis_type = ?axis_type, "processing bind with loop range");
-                // Check if already created (idempotent)
-                if let Some(val) = values.get(value.id) {
-                    trace!(value.id = value.id, "bind reusing existing counter");
-                    values.insert(var.id, val);
-                    return Ok(Some(val));
-                }
-                trace!(range.id = value.id, "creating new loop for outer range");
+            // BIND is now only used for non-loop contexts (e.g., REDUCE ranges wrapped during optimization)
+            // Loop generation moved to codegen_range for OUTER/GLOBAL/LOOP ranges (Tinygrad approach)
+            trace!(var.id = var.id, value.id = value.id, "processing bind");
 
-                // Check for size-1 loop - no loop needed, just use 0
-                if is_const_one(end) {
-                    let zero = context.i64_type().const_int(0, false);
-                    values.insert(var.id, zero.into());
-                    values.insert(value.id, zero.into());
-                    // Don't insert loop context - mod.rs cleanup will skip it
-                    return Ok(Some(zero.into()));
-                }
-
-                // Generate end value
-                let end_val = require_value(end, context, module, builder, values)?;
-                let end_int = end_val.into_int_value();
-
-                // Get function for creating blocks
-                let current_block = builder.get_insert_block().context(NoInsertBlockSnafu)?;
-                let function = current_block.get_parent().context(NoParentFunctionSnafu)?;
-
-                // Build loop - use Range's uop_id for consistent lookup
-                let (loop_ctx, counter_val) = loop_gen::build_loop(context, builder, function, end_int, value.id)?;
-
-                // Store loop context under Range.id (for mod.rs cleanup to close)
-                values.insert_loop(value.id, loop_ctx);
-
-                // Map both var.id and value.id to counter
-                values.insert(var.id, counter_val.into());
-                values.insert(value.id, counter_val.into());
-
-                return Ok(Some(counter_val.into()));
+            // If value is already computed, map var to it
+            if let Some(val) = values.get(value.id) {
+                values.insert(var.id, val);
+                return Ok(Some(val));
             }
 
-            // Non-OUTER: just return variable value
-            let var_value = values.get(var.id).context(NotInValueMapSnafu { what: "BIND variable", id: var.id })?;
-            Ok(Some(var_value))
+            // Otherwise try to get var value directly
+            if let Some(var_value) = values.get(var.id) {
+                return Ok(Some(var_value));
+            }
+
+            // Neither available - this is a programming error
+            NotInValueMapSnafu { what: "BIND variable or value", id: var.id }.fail()
         }
         Op::Sink { sources } => {
             for src in sources {
@@ -1052,22 +1021,13 @@ fn codegen_loop<'ctx>(
 fn codegen_range<'ctx>(
     uop_id: u64,
     end: &Arc<UOp>,
-    axis_id: morok_ir::AxisId,
+    _axis_id: morok_ir::AxisId,
     axis_type: AxisType,
     context: &'ctx Context,
     module: &Module<'ctx>,
     builder: &Builder<'ctx>,
     values: &mut ValueMap<'ctx>,
 ) -> Result<Option<BasicValueEnum<'ctx>>> {
-    // Outer ranges: loop was created by BIND - return cached counter value
-    if axis_type == AxisType::Outer {
-        if let Some(val) = values.get(uop_id) {
-            return Ok(Some(val));
-        }
-        // Should have been created by BIND - error if not found
-        return NotInValueMapSnafu { what: "OUTER range (expected from BIND)", id: uop_id }.fail();
-    }
-
     // Reduce ranges are handled entirely by REDUCE codegen
     // DON'T return the end value here - that would be cached and used incorrectly
     // REDUCE will set up the loop counter and store it for its source subgraph
@@ -1075,38 +1035,49 @@ fn codegen_range<'ctx>(
         return Ok(None);
     }
 
-    // Loop ranges: if already processed by REDUCE, return cached value
-    // Otherwise create loop normally (will be closed by END)
-    if axis_type == AxisType::Loop
-        && let Some(val) = values.get(uop_id)
-    {
-        // Already processed by REDUCE - return cached counter value
+    // If already processed, return cached value (idempotent)
+    if let Some(val) = values.get(uop_id) {
         return Ok(Some(val));
     }
-    // Fall through to create loop - will be closed by END
 
-    // Check for size-1 loop - no loop needed, just use 0
+    // OUTER/GLOBAL/LOOP ranges: create for-loops directly (Tinygrad approach)
+    // These loops are closed by mod.rs cleanup at the end of kernel generation.
+    if matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop) {
+        trace!(uop_id, axis_type = ?axis_type, "creating loop for range");
+
+        // Check for size-1 loop - no loop needed, just use 0
+        if is_const_one(end) {
+            let zero = context.i64_type().const_int(0, false);
+            values.insert(uop_id, zero.into());
+            return Ok(Some(zero.into()));
+        }
+
+        // Generate end value BEFORE branching
+        let end_val = require_value(end, context, module, builder, values)?;
+        let end_int = end_val.into_int_value();
+
+        // Get function for creating blocks
+        let current_block = builder.get_insert_block().context(NoInsertBlockSnafu)?;
+        let function = current_block.get_parent().context(NoParentFunctionSnafu)?;
+
+        // Build loop using unified loop generation
+        let (loop_ctx, counter_val) = loop_gen::build_loop(context, builder, function, end_int, uop_id)?;
+
+        // Store loop context (closed by mod.rs cleanup)
+        values.insert_loop(uop_id, loop_ctx);
+        values.insert(uop_id, counter_val.into());
+
+        return Ok(Some(counter_val.into()));
+    }
+
+    // Other axis types (handled by pre_expand): check for size-1, otherwise error
     if is_const_one(end) {
         let zero = context.i64_type().const_int(0, false);
-        // Don't insert loop context - END will just skip it (take_loop returns None)
         return Ok(Some(zero.into()));
     }
 
-    // Generate end value BEFORE branching
-    let end_val = require_value(end, context, module, builder, values)?;
-    let end_int = end_val.into_int_value();
-
-    // Get function for creating blocks
-    let current_block = builder.get_insert_block().context(NoInsertBlockSnafu)?;
-    let function = current_block.get_parent().context(NoParentFunctionSnafu)?;
-
-    // Build loop using unified loop generation
-    let (loop_ctx, counter_val) = loop_gen::build_loop(context, builder, function, end_int, axis_id.value() as u64)?;
-
-    // Store loop context for END
-    values.insert_loop(uop_id, loop_ctx);
-
-    Ok(Some(counter_val.into()))
+    // UPCAST/UNROLL should have been converted to UNROLL ops by pre_expand
+    UnsupportedSnafu { what: "RANGE with non-loop axis_type should be handled by pre_expand" }.fail()
 }
 
 /// Check if a UOp is Const(1)

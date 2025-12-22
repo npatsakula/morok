@@ -801,26 +801,22 @@ pub fn handle_after(after: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp
 }
 
 /// Remove BIND: extract var and track it.
-/// EXCEPTION: Preserve Bind for OUTER/GLOBAL/LOOP ranges - codegen needs these for loop generation.
+///
+/// All BINDs are removed - loop generation comes from RANGE ops directly (Tinygrad approach).
 pub fn unbind_kernel(bind: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let (var, value) = match bind.op() {
+    let (var, _value) = match bind.op() {
         Op::Bind { var, value } => (var, value),
         _ => return None,
     };
-
-    // Preserve Bind for loop ranges - codegen needs these to generate for loops
-    if let Op::Range { axis_type, .. } = value.op() {
-        if matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop) {
-            ctx.add_var(var.clone());
-            return None; // Don't transform - keep the Bind as-is
-        }
-    }
 
     ctx.add_var(var.clone());
     Some(var.clone())
 }
 
 /// Renumber RANGE axis_id starting from 0 for kernel deduplication.
+///
+/// All ranges are renumbered uniformly - no BIND wrappers are created.
+/// CPU codegen generates for-loops directly from RANGE ops (matching Tinygrad's approach).
 pub fn renumber_range(range: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
     let (end, old_axis_id, axis_type) = match range.op() {
         Op::Range { end, axis_id, axis_type } => (end, *axis_id, *axis_type),
@@ -832,27 +828,7 @@ pub fn renumber_range(range: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<U
         AxisId::Renumbered(_) => return None,
     }
 
-    // Handle OUTER, GLOBAL, and LOOP ranges: create Bind(DefineVar, Range) patterns
-    // These will be inlined as for loops in CPU codegen
-    // LOOP is used for CPU (has_local=false), GLOBAL is used for GPU
-    if matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop) {
-        let var_name = format!("range_{}", old_axis_id.value());
-        let vmax = match end.vmax() {
-            morok_ir::ConstValue::Int(v) => *v - 1,
-            morok_ir::ConstValue::UInt(v) => (*v - 1) as i64,
-            _ => {
-                let new_axis_id = AxisId::Renumbered(ctx.next_range());
-                let new_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);
-                return Some(new_range);
-            }
-        };
-
-        let var = UOp::define_var(var_name, 0, vmax);
-        let new_axis_id = AxisId::Renumbered(ctx.next_range());
-        let renumbered_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);
-        return Some(UOp::bind(var, renumbered_range));
-    }
-
+    // All ranges are renumbered uniformly - codegen creates loops from RANGE ops directly
     let new_axis_id = AxisId::Renumbered(ctx.next_range());
     let new_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);
     Some(new_range)
