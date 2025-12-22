@@ -555,6 +555,22 @@ impl UPat {
         }
     }
 
+    /// Match gated STORE operation: `STORE_GATED(buffer, index, value, gate)`
+    pub fn store_gated(buffer: UPat, index: UPat, value: UPat, gate: UPat) -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::StoreGated {
+                buffer: UOp::noop(),
+                index: UOp::noop(),
+                value: UOp::noop(),
+                gate: UOp::noop(),
+            }))]),
+            dtype: None,
+            src: Some(SrcPattern::Tuple(vec![buffer, index, value, gate])),
+            arg: None,
+            name: None,
+        }
+    }
+
     upat_op_single!(end, Op::End { computation: UOp::noop(), ranges: SmallVec::new() });
 
     /// Match any END operation regardless of source count.
@@ -608,6 +624,40 @@ impl UPat {
                 src: UOp::noop(),
                 ranges: SmallVec::new(),
                 reduce_op: crate::ReduceOp::Add,
+            }))]),
+            dtype: None,
+            src: None,
+            arg: None,
+            name: None,
+        }
+    }
+
+    // ===== Vectorization Operation Helpers =====
+
+    upat_op_single!(unroll, Op::Unroll { src: UOp::noop(), unroll_axes: vec![] });
+
+    /// Match any UNROLL operation regardless of axes.
+    pub fn unroll_any() -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Unroll {
+                src: UOp::noop(),
+                unroll_axes: vec![],
+            }))]),
+            dtype: None,
+            src: None,
+            arg: None,
+            name: None,
+        }
+    }
+
+    upat_op_single!(contract, Op::Contract { src: UOp::noop(), upcast_ranges: vec![] });
+
+    /// Match any CONTRACT operation regardless of ranges.
+    pub fn contract_any() -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Contract {
+                src: UOp::noop(),
+                upcast_ranges: vec![],
             }))]),
             dtype: None,
             src: None,

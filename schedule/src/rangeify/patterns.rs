@@ -103,11 +103,6 @@ pub fn is_always_run_op(op: &Op) -> bool {
     matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Assign { .. })
 }
 
-/// Check if an INDEX operation has multiple indices.
-fn has_multiple_indices(idx: &Arc<UOp>) -> bool {
-    if let Op::Index { indices, .. } = idx.op() { indices.len() > 1 } else { false }
-}
-
 /// Check if an INDEX has another INDEX as its buffer.
 fn is_cascaded_index(idx: &Arc<UOp>) -> bool {
     if let Op::Index { buffer, .. } = idx.op() { matches!(buffer.op(), Op::Index { .. }) } else { false }
@@ -697,61 +692,6 @@ pub fn fix_after_broadcast(after: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(UOp::after(expand_src.clone(), deps.clone()))
 }
 
-/// Linearize multi-index INDEX to single-index INDEX.
-pub fn linearize_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Index { buffer, indices, gate } = idx.op() else {
-        return None;
-    };
-
-    if indices.len() <= 1 {
-        return None;
-    }
-
-    let dims: Vec<i64> = indices
-        .iter()
-        .map(|idx_uop| {
-            // Handle Range nodes
-            if let Op::Range { end, .. } = idx_uop.op()
-                && let Op::Const(cv) = end.op()
-                && let ConstValue::Int(size) = cv.0
-            {
-                return size;
-            }
-            // Handle DefineVar (from OUTER ranges converted to kernel parameters)
-            // max_val is the maximum value, size = max_val + 1
-            if let Op::DefineVar { max_val, .. } = idx_uop.op() {
-                return *max_val + 1;
-            }
-            1
-        })
-        .collect();
-
-    let mut strides = vec![1i64; dims.len()];
-    for i in (0..dims.len().saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * dims[i + 1];
-    }
-
-    trace!(
-        idx.id = idx.id,
-        dims = ?dims,
-        strides = ?strides,
-        num_indices = indices.len(),
-        "Linearizing index"
-    );
-
-    let mut linear = UOp::index_const(0);
-    for (idx_uop, &stride) in indices.iter().zip(strides.iter()) {
-        let stride_uop = UOp::index_const(stride);
-        let term = idx_uop.try_mul(&stride_uop).ok()?;
-        linear = linear.try_add(&term).ok()?;
-    }
-
-    match gate {
-        Some(g) => UOp::index_gated(buffer.clone(), vec![linear], g.clone()).ok(),
-        None => UOp::index(buffer.clone(), vec![linear]).ok(),
-    }
-}
-
 /// Flatten cascaded INDEX operations (INDEX of INDEX).
 pub fn flatten_cascaded_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Index { buffer: inner_idx, indices: outer_indices, gate: outer_gate } = idx.op() else {
@@ -775,13 +715,27 @@ pub fn flatten_cascaded_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 /// Create patterns for codegen preparation.
+///
+/// Note: Multi-index INDEX ops are preserved through the pipeline and
+/// linearized at codegen time (not here). This aligns with Tinygrad's
+/// architecture and prevents Binary(Range*stride) expressions in the IR.
 pub fn rangeify_codegen_patterns() -> PatternMatcher<()> {
     crate::patterns! {
         noop if matches!(noop.op(), Op::Noop) => remove_noop(noop),
         cont if matches!(cont.op(), Op::Contiguous { .. }) => get_contiguous(cont),
         after if matches!(after.op(), Op::After { .. }) => fix_after_broadcast(after),
-        idx if has_multiple_indices(idx) => linearize_index(idx),
         idx if is_cascaded_index(idx) => flatten_cascaded_index(idx),
+    }
+}
+
+/// Patterns to run after expand.
+///
+/// Note: linearize_index was removed - multi-index INDEX ops are now linearized
+/// at codegen time to align with Tinygrad's architecture. This prevents creating
+/// Binary(Range*stride) expressions in the IR that would be incorrectly vectorized.
+pub fn post_expand_patterns() -> PatternMatcher<()> {
+    crate::patterns! {
+        // Empty - linearization now happens at codegen time
     }
 }
 

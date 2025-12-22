@@ -119,13 +119,12 @@ fn classify_op(op: &Op) -> OpCategory {
         // Should be in ValueMap after Bind is processed. If not there, it's an error.
         Op::DefineVar { .. } => OpCategory::Meta,
 
-        Op::Sink { .. }
-        | Op::Barrier { .. }
-        | Op::Noop
-        | Op::Unique(_)
-        | Op::Device(_)
-        | Op::Vectorize { .. }
-        | Op::Kernel { .. } => OpCategory::Meta,
+        Op::Sink { .. } | Op::Barrier { .. } | Op::Noop | Op::Unique(_) | Op::Device(_) | Op::Kernel { .. } => {
+            OpCategory::Meta
+        }
+
+        // Vectorize creates vectors from elements - process in Loop handler
+        Op::Vectorize { .. } => OpCategory::Loop,
 
         Op::Reshape { .. }
         | Op::Permute { .. }
@@ -259,11 +258,7 @@ fn codegen_arithmetic<'ctx>(
             let c_val = auto_load_pointer(c_val, &c.dtype(), context, builder)?;
 
             // Harmonize all three operands to the maximum vector width
-            let max_count = [a_val, b_val, c_val]
-                .iter()
-                .map(|v| common::get_vector_count(*v))
-                .max()
-                .unwrap_or(1);
+            let max_count = [a_val, b_val, c_val].iter().map(|v| common::get_vector_count(*v)).max().unwrap_or(1);
 
             let a_val = if max_count > 1 && common::get_vector_count(a_val) == 1 {
                 common::broadcast_to_vector(builder, a_val, max_count, context)?
@@ -314,7 +309,7 @@ fn codegen_arithmetic<'ctx>(
                 let extracted = builder
                     .build_extract_element(vec_val.into_vector_value(), idx, "gep")
                     .context(VectorExtractSnafu)?;
-                Ok(Some(extracted.into()))
+                Ok(Some(extracted))
             } else {
                 // Multiple indices: build new vector with selected elements
                 let result_count = indices.len() as u32;
@@ -329,9 +324,8 @@ fn codegen_arithmetic<'ctx>(
                 let mut result: BasicValueEnum = result_type.get_poison().into();
                 for (i, &src_idx) in indices.iter().enumerate() {
                     let extract_idx = context.i32_type().const_int(src_idx as u64, false);
-                    let extracted = builder
-                        .build_extract_element(vec, extract_idx, "gep_elem")
-                        .context(VectorExtractSnafu)?;
+                    let extracted =
+                        builder.build_extract_element(vec, extract_idx, "gep_elem").context(VectorExtractSnafu)?;
                     let insert_idx = context.i32_type().const_int(i as u64, false);
                     result = builder
                         .build_insert_element(result.into_vector_value(), extracted, insert_idx, "gep_build")
@@ -355,10 +349,9 @@ fn codegen_arithmetic<'ctx>(
                     let count = vec.get_type().get_size();
                     for i in 0..count {
                         let idx = context.i32_type().const_int(i as u64, false);
-                        let elem = builder
-                            .build_extract_element(vec, idx, "cat_extract")
-                            .context(VectorExtractSnafu)?;
-                        all_elements.push(elem.into());
+                        let elem =
+                            builder.build_extract_element(vec, idx, "cat_extract").context(VectorExtractSnafu)?;
+                        all_elements.push(elem);
                     }
                 } else {
                     all_elements.push(val);
@@ -537,12 +530,20 @@ fn codegen_cast<'ctx>(
         let mut result: BasicValueEnum = dst_vec_type.get_poison().into();
         for i in 0..vec_len {
             let idx = context.i32_type().const_int(i as u64, false);
-            let elem = builder
-                .build_extract_element(vec, idx, "cast_extract")
-                .context(VectorExtractSnafu)?;
+            let elem = builder.build_extract_element(vec, idx, "cast_extract").context(VectorExtractSnafu)?;
 
             // Cast the scalar element
-            let casted = codegen_cast_scalar(elem, src_is_float, dst_is_float, src_is_signed, dst_is_signed, src_dtype, dst_dtype, context, builder)?;
+            let casted = codegen_cast_scalar(
+                elem,
+                src_is_float,
+                dst_is_float,
+                src_is_signed,
+                dst_is_signed,
+                src_dtype,
+                dst_dtype,
+                context,
+                builder,
+            )?;
 
             result = builder
                 .build_insert_element(result.into_vector_value(), casted, idx, "cast_insert")
@@ -554,9 +555,20 @@ fn codegen_cast<'ctx>(
     }
 
     // Scalar path
-    codegen_cast_scalar(src, src_is_float, dst_is_float, src_is_signed, dst_is_signed, src_dtype, dst_dtype, context, builder)
+    codegen_cast_scalar(
+        src,
+        src_is_float,
+        dst_is_float,
+        src_is_signed,
+        dst_is_signed,
+        src_dtype,
+        dst_dtype,
+        context,
+        builder,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn codegen_cast_scalar<'ctx>(
     src: BasicValueEnum<'ctx>,
     src_is_float: bool,
@@ -692,9 +704,8 @@ fn codegen_memory<'ctx>(
                         };
 
                         // Load element
-                        let elem_val = builder
-                            .build_load(element_type, elem_ptr, "gather_load")
-                            .context(BuildLoadSnafu)?;
+                        let elem_val =
+                            builder.build_load(element_type, elem_ptr, "gather_load").context(BuildLoadSnafu)?;
 
                         // Insert into result vector
                         result = builder
@@ -720,7 +731,129 @@ fn codegen_memory<'ctx>(
                 debug!(uop_id = uop.id, result_ptr = ?ptr, "index: computed pointer");
                 Ok(Some(ptr.into()))
             } else {
-                UnsupportedSnafu { what: "Multi-index INDEX" }.fail()
+                // Multi-index: linearize at codegen time
+                // Extract dimensions from Range.end or DefineVar.max_val
+                let dims: Vec<i64> = indices
+                    .iter()
+                    .map(|idx_uop| {
+                        if let Op::Range { end, .. } = idx_uop.op()
+                            && let Op::Const(cv) = end.op()
+                            && let ConstValue::Int(size) = cv.0
+                        {
+                            return size;
+                        }
+                        if let Op::DefineVar { max_val, .. } = idx_uop.op() {
+                            return *max_val + 1;
+                        }
+                        1 // fallback for unknown dimensions
+                    })
+                    .collect();
+
+                // Compute row-major strides
+                let mut strides = vec![1i64; dims.len()];
+                for i in (0..dims.len().saturating_sub(1)).rev() {
+                    strides[i] = strides[i + 1] * dims[i + 1];
+                }
+
+                debug!(
+                    uop_id = uop.id,
+                    buffer_id = buffer.id,
+                    num_indices = indices.len(),
+                    dims = ?dims,
+                    strides = ?strides,
+                    "INDEX: multi-index linearization at codegen"
+                );
+
+                // Generate index values
+                let index_vals: Vec<BasicValueEnum> = indices
+                    .iter()
+                    .map(|idx| require_value(idx, context, module, builder, values))
+                    .collect::<Result<Vec<_>>>()?;
+
+                // Check if any index is vectorized
+                let is_vectorized = index_vals.iter().any(|v| v.is_vector_value());
+
+                if is_vectorized {
+                    // Vectorized multi-index gather
+                    let vec_len = index_vals
+                        .iter()
+                        .find(|v| v.is_vector_value())
+                        .map(|v| v.into_vector_value().get_type().get_size())
+                        .unwrap_or(1);
+
+                    let element_type = match buffer.dtype() {
+                        DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
+                        _ => return UnsupportedSnafu { what: "INDEX buffer must be Ptr type" }.fail(),
+                    };
+
+                    let result_vec_type = match element_type {
+                        inkwell::types::BasicTypeEnum::FloatType(ft) => ft.vec_type(vec_len),
+                        inkwell::types::BasicTypeEnum::IntType(it) => it.vec_type(vec_len),
+                        _ => return UnsupportedSnafu { what: "Unsupported element type for vector gather" }.fail(),
+                    };
+
+                    let mut result: BasicValueEnum = result_vec_type.get_poison().into();
+                    let ptr_val = buffer_ptr.into_pointer_value();
+
+                    for lane in 0..vec_len {
+                        let lane_const = context.i32_type().const_int(lane as u64, false);
+
+                        // Compute linear index for this lane
+                        let mut linear = context.i64_type().const_int(0, false);
+                        for (idx_val, &stride) in index_vals.iter().zip(strides.iter()) {
+                            let scalar_idx = if idx_val.is_vector_value() {
+                                builder
+                                    .build_extract_element(idx_val.into_vector_value(), lane_const, "multi_idx")
+                                    .context(VectorExtractSnafu)?
+                                    .into_int_value()
+                            } else {
+                                idx_val.into_int_value()
+                            };
+                            let stride_val = context.i64_type().const_int(stride as u64, false);
+                            let term =
+                                builder.build_int_mul(scalar_idx, stride_val, "stride_mul").context(ArithmeticSnafu)?;
+                            linear = builder.build_int_add(linear, term, "linear_add").context(ArithmeticSnafu)?;
+                        }
+
+                        // GEP + load for this element
+                        let elem_ptr = unsafe {
+                            builder.build_gep(element_type, ptr_val, &[linear], "gather_gep").context(BuildGepSnafu)?
+                        };
+                        let elem_val =
+                            builder.build_load(element_type, elem_ptr, "gather_load").context(BuildLoadSnafu)?;
+
+                        result = builder
+                            .build_insert_element(result.into_vector_value(), elem_val, lane_const, "gather_insert")
+                            .context(VectorInsertSnafu)?
+                            .into();
+                    }
+
+                    debug!(uop_id = uop.id, result = ?result, "INDEX: multi-index vector gather complete");
+                    return Ok(Some(result));
+                }
+
+                // Scalar multi-index: linearize to single offset
+                let mut linear = context.i64_type().const_int(0, false);
+                for (idx_val, &stride) in index_vals.iter().zip(strides.iter()) {
+                    let stride_val = context.i64_type().const_int(stride as u64, false);
+                    let term = builder
+                        .build_int_mul(idx_val.into_int_value(), stride_val, "stride_mul")
+                        .context(ArithmeticSnafu)?;
+                    linear = builder.build_int_add(linear, term, "linear_add").context(ArithmeticSnafu)?;
+                }
+
+                // GEP with linear index
+                let element_type = match uop.dtype() {
+                    DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
+                    other => common::dtype_to_basic_type(&other, context)?,
+                };
+                let ptr = unsafe {
+                    builder
+                        .build_gep(element_type, buffer_ptr.into_pointer_value(), &[linear], "idx_linear")
+                        .context(BuildGepSnafu)?
+                };
+                debug!(uop_id = uop.id, result_ptr = ?ptr, "INDEX: multi-index linearized");
+                Ok(Some(ptr.into()))
             }
         }
         Op::Index { gate: Some(_), .. } => UnsupportedSnafu { what: "Gated INDEX" }.fail(),
@@ -885,12 +1018,7 @@ fn codegen_loop<'ctx>(
             // Check if all elements are the same UOp (broadcast case)
             let all_same = elements.iter().skip(1).all(|e| e.id == elements[0].id);
             if all_same {
-                return Ok(Some(common::broadcast_to_vector(
-                    builder,
-                    elem_vals[0],
-                    count,
-                    context,
-                )?));
+                return Ok(Some(common::broadcast_to_vector(builder, elem_vals[0], count, context)?));
             }
 
             // Build vector via insertelement chain
@@ -1494,11 +1622,8 @@ fn codegen_horizontal_reduce<'ctx>(
     let scalar_bits = result_dtype.base().bytes() * 8;
 
     // Build intrinsic name based on operation and type
-    let type_suffix = if is_float {
-        format!("v{}f{}", vec_size, scalar_bits)
-    } else {
-        format!("v{}i{}", vec_size, scalar_bits)
-    };
+    let type_suffix =
+        if is_float { format!("v{}f{}", vec_size, scalar_bits) } else { format!("v{}i{}", vec_size, scalar_bits) };
 
     let intrinsic_name = match (reduce_op, is_float, result_dtype.is_signed()) {
         (ReduceOp::Add, true, _) => format!("llvm.vector.reduce.fadd.{}", type_suffix),
@@ -1514,8 +1639,8 @@ fn codegen_horizontal_reduce<'ctx>(
     };
 
     // Get the intrinsic
-    let intrinsic = Intrinsic::find(&intrinsic_name)
-        .context(IntrinsicNotFoundSnafu { name: intrinsic_name.clone() })?;
+    let intrinsic =
+        Intrinsic::find(&intrinsic_name).context(IntrinsicNotFoundSnafu { name: intrinsic_name.clone() })?;
 
     // Get declaration with vector type
     let fn_val = intrinsic
@@ -1534,9 +1659,7 @@ fn codegen_horizontal_reduce<'ctx>(
 
     // Build call
     let args_meta: Vec<_> = args.iter().map(|a| (*a).into()).collect();
-    let call_site = builder
-        .build_call(fn_val, &args_meta, "hreduce")
-        .context(IntrinsicCallSnafu)?;
+    let call_site = builder.build_call(fn_val, &args_meta, "hreduce").context(IntrinsicCallSnafu)?;
 
     match call_site.try_as_basic_value() {
         ValueKind::Basic(v) => Ok(v),

@@ -393,6 +393,7 @@ fn find_first_input_buffer_device(
 ///
 /// Output/intermediate buffers are allocated on the same device as the first input buffer
 /// (following Tinygrad's pattern). Newly allocated buffers are tracked in `allocated_buffers`.
+#[allow(clippy::too_many_arguments)]
 fn collect_kernel_buffers(
     sources: &[Arc<UOp>],
     kernel: &Arc<UOp>,
@@ -413,8 +414,13 @@ fn collect_kernel_buffers(
 
     // Get target device from first input buffer (Tinygrad pattern: ctx[0].device)
     // Pass reverse_id_mapping to handle renumbered IDs
-    let target_device =
-        find_first_input_buffer_device(sources, define_to_buffer, reverse_id_mapping, input_buffers, allocated_buffers)?;
+    let target_device = find_first_input_buffer_device(
+        sources,
+        define_to_buffer,
+        reverse_id_mapping,
+        input_buffers,
+        allocated_buffers,
+    )?;
 
     let mut buffers = Vec::new();
     let mut uop_ids = Vec::new();

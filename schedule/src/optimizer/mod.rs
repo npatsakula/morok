@@ -123,7 +123,13 @@ pub fn optimize_kernel_with_config(
 
     // Post-optimization: Fix UNROLL substitutions in REDUCE ops
     // This handles arithmetic expressions created by shift_to UNROLL
-    crate::expand::pre_expand(&optimized)
+    let expanded = crate::expand::pre_expand(&optimized);
+
+    // Post-expand: Linearize multi-index INDEX ops
+    // This MUST run after pre_expand to avoid creating Binary(Range*stride) before expand.
+    // If linearized before expand, Range ops inside Binary get vectorized incorrectly.
+    let post_expand_matcher = crate::rangeify::post_expand_patterns();
+    crate::rewrite::graph_rewrite_bottom_up(&post_expand_matcher, expanded, &mut ())
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).

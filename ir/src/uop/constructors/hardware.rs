@@ -50,6 +50,33 @@ impl UOp {
         Self::new(Op::Vectorize { elements }, vec_dtype)
     }
 
+    /// Broadcast a scalar value to a vector by replication.
+    ///
+    /// Based on Tinygrad's UOp.broadcast() (ops.py:379-382).
+    /// Creates a VECTORIZE operation with `count` copies of the source.
+    ///
+    /// If `count == 1`, returns the source unchanged (optimization).
+    ///
+    /// # Arguments
+    ///
+    /// * `src` - The scalar value to broadcast
+    /// * `count` - The target vector width
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let scalar = UOp::const_(DType::Float32, 5.0);
+    /// let vector = UOp::broadcast(scalar, 4);
+    /// // Creates VECTORIZE(float32.vec(4), (scalar, scalar, scalar, scalar))
+    /// ```
+    pub fn broadcast(src: Arc<Self>, count: usize) -> Arc<Self> {
+        if count == 1 {
+            return src;
+        }
+        let elements: SmallVec<[Arc<Self>; 4]> = (0..count).map(|_| src.clone()).collect();
+        Self::vectorize(elements)
+    }
+
     /// Get element pointer (extract element(s) from vector).
     pub fn gep(vector: Arc<Self>, indices: Vec<usize>) -> Arc<Self> {
         let vector_dtype = vector.dtype();
@@ -105,7 +132,12 @@ impl UOp {
     /// Output dtype vcount = sum of all input vcounts.
     pub fn cat(sources: Vec<Arc<Self>>) -> Arc<Self> {
         assert!(!sources.is_empty(), "CAT requires at least one source");
-        let dtype = sources[0].dtype.clone();
+        let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
+        let dtype = if let Some(scalar) = sources[0].dtype.scalar() {
+            DType::Scalar(scalar).vec(total_count)
+        } else {
+            sources[0].dtype.clone()
+        };
         Self::new(Op::Cat { sources: SmallVec::from_vec(sources) }, dtype)
     }
 

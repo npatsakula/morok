@@ -489,6 +489,41 @@ impl Op {
         }
     }
 
+    /// Check if this operation should be expanded when it has UNROLL inputs.
+    ///
+    /// Based on Tinygrad's expander.py:97-98 pattern which expands:
+    /// - ALU ops (Unary, Binary, Ternary)
+    /// - Type ops (Cast, BitCast)
+    /// - Vector ops (Gep, Vectorize)
+    /// - Tensor core ops (Wmma)
+    /// - Memory ops (Load, LoadGated, Store, StoreGated, Index)
+    /// - Buffer ops (Bufferize)
+    /// - Control flow (Reduce, End, After)
+    ///
+    /// These operations propagate vectorization through the computation graph
+    /// when any of their sources is an UNROLL operation.
+    pub fn is_expandable(&self) -> bool {
+        matches!(
+            self,
+            // ALU operations
+            Self::Unary(..) | Self::Binary(..) | Self::Ternary(..) |
+            // Type operations
+            Self::Cast { .. } | Self::BitCast { .. } |
+            // Vector operations
+            Self::Gep { .. } | Self::Vectorize { .. } |
+            // Tensor core
+            Self::Wmma { .. } |
+            // Memory operations
+            Self::Load { .. } | Self::LoadGated { .. } |
+            Self::Store { .. } | Self::StoreGated { .. } |
+            Self::Index { .. } |
+            // Buffer operations
+            Self::Bufferize { .. } |
+            // Control flow (range-ending ops)
+            Self::Reduce { .. } | Self::End { .. } | Self::After { .. }
+        )
+    }
+
     /// Get the "ended ranges" for this operation.
     ///
     /// These are the RANGE operations (and operations containing ranges)

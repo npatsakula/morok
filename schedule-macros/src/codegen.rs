@@ -674,6 +674,47 @@ fn generate_special_op_pattern(
 
         "Const" => Err(Error::new_spanned(op, "Use Const(value) or Const(_) syntax for constants")),
 
+        "Unroll" => {
+            if rest {
+                Ok(quote! { morok_ir::pattern::UPat::unroll_any() })
+            } else {
+                if args.len() != 1 {
+                    return Err(Error::new_spanned(
+                        op,
+                        "Unroll requires exactly 1 argument (or use `..` for variable axes)",
+                    ));
+                }
+                let src = &arg_codes[0];
+                Ok(quote! { morok_ir::pattern::UPat::unroll(#src) })
+            }
+        }
+
+        "Contract" => {
+            if rest {
+                Ok(quote! { morok_ir::pattern::UPat::contract_any() })
+            } else {
+                if args.len() != 1 {
+                    return Err(Error::new_spanned(
+                        op,
+                        "Contract requires exactly 1 argument (or use `..` for variable ranges)",
+                    ));
+                }
+                let src = &arg_codes[0];
+                Ok(quote! { morok_ir::pattern::UPat::contract(#src) })
+            }
+        }
+
+        "StoreGated" => {
+            if args.len() != 4 {
+                return Err(Error::new_spanned(op, "StoreGated requires exactly 4 arguments (buffer, index, value, gate)"));
+            }
+            let buffer = &arg_codes[0];
+            let index = &arg_codes[1];
+            let value = &arg_codes[2];
+            let gate = &arg_codes[3];
+            Ok(quote! { morok_ir::pattern::UPat::store_gated(#buffer, #index, #value, #gate) })
+        }
+
         _ => Err(Error::new_spanned(op, format!("Unknown operation: {}", op_name))),
     }
 }

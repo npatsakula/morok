@@ -55,9 +55,6 @@ fn test_cross_thread_hash_consing() {
     // Serialize tests that manipulate cache to prevent races with parallel test execution
     let _lock = CACHE_TEST_MUTEX.lock().unwrap();
 
-    // Remove unused UOps from previous tests (those with strong_count == 1)
-    crate::uop::gc_unused_uops();
-
     let num_threads = 10;
     let barrier = Arc::new(Barrier::new(num_threads));
 
@@ -96,9 +93,6 @@ fn test_cross_thread_hash_consing_complex() {
 
     // Serialize tests that manipulate cache to prevent races with parallel test execution
     let _lock = CACHE_TEST_MUTEX.lock().unwrap();
-
-    // Remove unused UOps from previous tests (those with strong_count == 1)
-    crate::uop::gc_unused_uops();
 
     let num_threads = 8;
     let barrier = Arc::new(Barrier::new(num_threads));

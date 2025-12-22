@@ -304,8 +304,8 @@ impl UOp {
         let guard = uops().guard();
 
         // Fast path: check if valid entry exists
-        if let Some(weak) = uops().get(&key, &guard) {
-            if let Some(arc) = weak.upgrade() {
+        if let Some(weak) = uops().get(&key, &guard)
+            && let Some(arc) = weak.upgrade() {
                 // Valid entry found - record provenance and return
                 use crate::provenance::PROVENANCE_TRACKER;
                 PROVENANCE_TRACKER.with(|tracker| {
@@ -314,7 +314,6 @@ impl UOp {
                 return arc;
             }
             // Dead weak ref - will be replaced below
-        }
 
         // Create new UOp (will be used if we win the race)
         let new_arc = Arc::new(Self {
