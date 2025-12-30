@@ -42,6 +42,14 @@ fn bench_matmul(c: &mut Criterion) {
             let result_h = a.matmul(&b).expect("matmul should succeed");
             let plan_h = result_h.prepare_with(&heuristic_config).expect("prepare should succeed");
 
+            // DEBUG: Print kernel info for heuristic
+            eprintln!("\n=== HEURISTIC (size={}) ===", size);
+            eprintln!("Kernel count: {}", plan_h.kernels().count());
+            eprintln!("UOp tree:\n{}", result_h.uop().tree());
+            for (i, kernel) in plan_h.kernels().enumerate() {
+                eprintln!("  Kernel {}: {}", i, kernel.entry_point);
+            }
+
             group.bench_with_input(BenchmarkId::new("heuristic", size), &size, |bencher, _| {
                 bencher.iter(|| plan_h.execute(&mut executor).expect("execute should succeed"));
             });
@@ -49,6 +57,13 @@ fn bench_matmul(c: &mut Criterion) {
             // BEAM: Prepare OUTSIDE timing (beam search + compilation happens here)
             let result_b = a.matmul(&b).expect("matmul should succeed");
             let plan_b = result_b.prepare_with(&beam_config).expect("prepare should succeed");
+
+            // DEBUG: Print kernel info for beam
+            eprintln!("\n=== BEAM (size={}) ===", size);
+            eprintln!("Kernel count: {}", plan_b.kernels().count());
+            for (i, kernel) in plan_b.kernels().enumerate() {
+                eprintln!("  Kernel {}: {}", i, kernel.entry_point);
+            }
 
             group.bench_with_input(BenchmarkId::new("beam_w2", size), &size, |bencher, _| {
                 bencher.iter(|| plan_b.execute(&mut executor).expect("execute should succeed"));

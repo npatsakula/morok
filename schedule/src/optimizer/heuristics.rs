@@ -310,12 +310,20 @@ pub fn apply_threading(scheduler: &mut Scheduler) -> bool {
 // ============================================================================
 
 /// Heuristic upcasts based on stride analysis.
+///
+/// For matmul patterns, limits to single axis UPCAST to avoid vector width
+/// mismatches (A vectorized along rows, B vectorized along cols are incompatible).
 pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
     let mut applied = false;
     let upcastable = scheduler.upcastable_dims();
     if upcastable.is_empty() {
         return false;
     }
+
+    // Matmul pattern: limit to single axis to avoid incompatible vectorizations
+    // A[i,k] vectorized along i and B[k,j] vectorized along j can't multiply element-wise
+    let is_matmul = has_matmul_pattern(scheduler);
+    let max_upcast_axes = if is_matmul { 1 } else { usize::MAX };
 
     // Rank axes by desirability
     let mut ranked_axes: Vec<(usize, i32)> = upcastable
@@ -334,10 +342,11 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
     ranked_axes.sort_by(|a, b| b.1.cmp(&a.1));
 
     let mut upcast_product = 1;
+    let mut upcast_count = 0;
     let target_upcast = 8;
 
     for (axis_idx, _) in ranked_axes {
-        if upcast_product >= target_upcast {
+        if upcast_product >= target_upcast || upcast_count >= max_upcast_axes {
             break;
         }
         let rngs = scheduler.rngs();
@@ -363,6 +372,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             for factor in factors {
                 if size >= factor as i64 && apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true).is_ok() {
                     upcast_product *= factor;
+                    upcast_count += 1;
                     applied = true;
                     break;
                 }

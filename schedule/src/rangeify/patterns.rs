@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::{AddrSpace, DType};
-use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp, UOpKey};
+use morok_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, UOp, UOpKey, UnaryOp};
 use smallvec::SmallVec;
 use tracing::trace;
 
@@ -1102,6 +1102,180 @@ fn collect_ranges(src: &Arc<UOp>) -> Vec<Arc<UOp>> {
     ranges.retain(|r| seen.insert(UOpKey(Arc::clone(r))));
 
     ranges
+}
+
+// ============================================================================
+// PM_ADD_LOADS - Wrap INDEX with LOAD for arithmetic ops
+// ============================================================================
+
+/// Wrap an INDEX node with LOAD.
+///
+/// Returns None if the node is not an INDEX op.
+/// Handles vectorized indices by creating a LOAD with vector dtype.
+fn wrap_index_with_load(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Index { buffer, indices, .. } = idx.op() else {
+        return None;
+    };
+
+    // Check if any index is vectorized (has vector dtype)
+    let vec_count = indices.iter().find_map(|i| match i.dtype() {
+        DType::Vector { count, .. } => Some(count),
+        _ => None,
+    });
+
+    // Get element type from buffer
+    let element_dtype = match buffer.dtype() {
+        DType::Ptr { base, .. } => (*base).clone(),
+        other => other.clone(),
+    };
+
+    // If indices are vectorized, LOAD produces a vector
+    let result_dtype = match vec_count {
+        Some(count) => element_dtype.vec(count),
+        None => element_dtype,
+    };
+
+    // Create LOAD with correct dtype
+    Some(UOp::new(Op::Load { buffer: buffer.clone(), index: idx.clone() }, result_dtype))
+}
+
+/// Reconstruct a binary operation with new operands.
+fn reconstruct_binary(op: BinaryOp, lhs: Arc<UOp>, rhs: Arc<UOp>) -> Option<Arc<UOp>> {
+    match op {
+        BinaryOp::Add => lhs.try_add(&rhs).ok(),
+        BinaryOp::Sub => lhs.try_sub(&rhs).ok(),
+        BinaryOp::Mul => lhs.try_mul(&rhs).ok(),
+        BinaryOp::Idiv => lhs.try_div(&rhs).ok(),
+        BinaryOp::Fdiv => lhs.try_div(&rhs).ok(),
+        BinaryOp::Mod => lhs.try_mod(&rhs).ok(),
+        BinaryOp::Max => lhs.try_max(&rhs).ok(),
+        BinaryOp::Pow => lhs.try_pow(&rhs).ok(),
+        BinaryOp::Lt => lhs.try_cmplt(&rhs).ok(),
+        BinaryOp::Le => lhs.try_cmple(&rhs).ok(),
+        BinaryOp::Eq => lhs.try_cmpeq(&rhs).ok(),
+        BinaryOp::Ne => lhs.try_cmpne(&rhs).ok(),
+        BinaryOp::Gt => lhs.try_cmpgt(&rhs).ok(),
+        BinaryOp::Ge => lhs.try_cmpge(&rhs).ok(),
+        BinaryOp::And => lhs.try_and_op(&rhs).ok(),
+        BinaryOp::Or => lhs.try_or_op(&rhs).ok(),
+        BinaryOp::Xor => lhs.try_xor_op(&rhs).ok(),
+        BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Threefry => {
+            // These ops don't have try_ methods, construct directly
+            let dtype = lhs.dtype();
+            Some(UOp::new(Op::Binary(op, lhs, rhs), dtype))
+        }
+    }
+}
+
+/// Reconstruct a unary operation with new operand.
+fn reconstruct_unary(op: UnaryOp, src: Arc<UOp>) -> Option<Arc<UOp>> {
+    // Get dtype before moving src into Op::Unary
+    let dtype = src.dtype();
+    Some(UOp::new(Op::Unary(op, src), dtype))
+}
+
+/// Pattern matcher to wrap INDEX sources with LOAD for arithmetic operations.
+///
+/// Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
+/// - INDEX returns indices/pointer (for scatter in STORE)
+/// - LOAD wraps INDEX for arithmetic consumers (performs gather)
+///
+/// This ensures that:
+/// - Binary/Unary/Ternary ops receive gathered data via explicit LOAD
+/// - STORE keeps raw INDEX for scatter operations
+pub fn pm_add_loads() -> PatternMatcher<()> {
+    crate::patterns! {
+        // =====================================================================
+        // Binary ops with INDEX on left: op(INDEX, y) → op(LOAD(buf, INDEX), y)
+        // =====================================================================
+        for op in binary [Add, Sub, Mul, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
+            op(idx, y) if matches!(idx.op(), Op::Index { .. }) => {
+                let loaded = wrap_index_with_load(idx)?;
+                reconstruct_binary(op, loaded, y.clone())
+            },
+        },
+
+        // =====================================================================
+        // Binary ops with INDEX on right: op(x, INDEX) → op(x, LOAD(buf, INDEX))
+        // =====================================================================
+        for op in binary [Add, Sub, Mul, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
+            op(x, idx) if matches!(idx.op(), Op::Index { .. }) => {
+                let loaded = wrap_index_with_load(idx)?;
+                reconstruct_binary(op, x.clone(), loaded)
+            },
+        },
+
+        // =====================================================================
+        // Unary ops: op(INDEX) → op(LOAD(buf, INDEX))
+        // =====================================================================
+        for op in unary [Neg, Not, Abs, Sqrt, Exp, Log, Sin, Cos, Exp2, Log2, Tan, Rsqrt, Reciprocal, Trunc] {
+            op(idx) if matches!(idx.op(), Op::Index { .. }) => {
+                let loaded = wrap_index_with_load(idx)?;
+                reconstruct_unary(op, loaded)
+            },
+        },
+
+        // =====================================================================
+        // Ternary ops - Where: wrap INDEX sources with LOAD
+        // =====================================================================
+        Where(idx, t, f) if matches!(idx.op(), Op::Index { .. }) => {
+            let loaded = wrap_index_with_load(idx)?;
+            UOp::try_where(loaded, t.clone(), f.clone()).ok()
+        },
+        Where(cond, idx, f) if matches!(idx.op(), Op::Index { .. }) => {
+            let loaded = wrap_index_with_load(idx)?;
+            UOp::try_where(cond.clone(), loaded, f.clone()).ok()
+        },
+        Where(cond, t, idx) if matches!(idx.op(), Op::Index { .. }) => {
+            let loaded = wrap_index_with_load(idx)?;
+            UOp::try_where(cond.clone(), t.clone(), loaded).ok()
+        },
+
+        // =====================================================================
+        // Ternary ops - MulAcc: wrap INDEX sources with LOAD
+        // =====================================================================
+        MulAcc(idx, b, c) if matches!(idx.op(), Op::Index { .. }) => {
+            let loaded = wrap_index_with_load(idx)?;
+            UOp::try_mulacc(loaded, b.clone(), c.clone()).ok()
+        },
+        MulAcc(a, idx, c) if matches!(idx.op(), Op::Index { .. }) => {
+            let loaded = wrap_index_with_load(idx)?;
+            UOp::try_mulacc(a.clone(), loaded, c.clone()).ok()
+        },
+        MulAcc(a, b, idx) if matches!(idx.op(), Op::Index { .. }) => {
+            let loaded = wrap_index_with_load(idx)?;
+            UOp::try_mulacc(a.clone(), b.clone(), loaded).ok()
+        },
+
+        // =====================================================================
+        // REDUCE: wrap INDEX accumulator source with LOAD, propagate vector dtype
+        // =====================================================================
+        reduce if matches!(reduce.op(), Op::Reduce { .. }) => {
+            let Op::Reduce { src, ranges, reduce_op } = reduce.op() else { return None; };
+            if !matches!(src.op(), Op::Index { .. }) { return None; }
+            let loaded = wrap_index_with_load(src)?;
+            // If LOAD has vector dtype, REDUCE output should also be vector
+            // This enables element-wise reduction (4 separate accumulators)
+            let output_dtype = loaded.dtype().clone();
+            Some(UOp::new(
+                Op::Reduce { src: loaded, ranges: ranges.clone(), reduce_op: *reduce_op },
+                output_dtype,
+            ))
+        },
+
+        // =====================================================================
+        // Cast: wrap INDEX source with LOAD, propagate vector dtype
+        // =====================================================================
+        Cast { src: idx, dtype } if matches!(idx.op(), Op::Index { .. }) => {
+            let loaded = wrap_index_with_load(idx)?;
+            // If LOAD has vector dtype, Cast output should also be vector
+            let output_dtype = match loaded.dtype() {
+                DType::Vector { count, .. } => dtype.base().vec(count),
+                _ => dtype.clone(),
+            };
+            Some(UOp::cast(loaded, output_dtype))
+        },
+    }
 }
 
 // ============================================================================

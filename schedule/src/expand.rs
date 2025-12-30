@@ -329,8 +329,9 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 continue;
             }
 
-            // Case 3: INDEX non-pointer indices (i >= 1) pass through
-            if matches!(op, Op::Index { .. }) && i >= 1 && !matches!(uop.dtype(), DType::Ptr { .. }) {
+            // Case 3: INDEX indices (i >= 1) pass through when returning Ptr
+            // Don't vectorize indices for pointer computation (used by STORE for GEP)
+            if matches!(op, Op::Index { .. }) && i >= 1 && matches!(uop.dtype(), DType::Ptr { .. }) {
                 new_sources.push(src.clone());
                 continue;
             }

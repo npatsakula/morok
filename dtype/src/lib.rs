@@ -220,6 +220,11 @@ impl ScalarDType {
             Self::Index => "size_t",
         }
     }
+
+    /// Create a vector DType from this scalar type.
+    pub const fn vec(self, count: usize) -> DType {
+        DType::Vector { scalar: self, count }
+    }
 }
 
 impl From<ScalarDType> for DType {

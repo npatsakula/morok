@@ -822,9 +822,9 @@ mod tests {
         // Realize the computation
         let realized = sum_result.unwrap().realize();
         if let Err(ref e) = realized {
-            tracing::debug!(error = ?e, "realize failed");
+            eprintln!("realize failed: {e:?}");
         }
-        assert!(realized.is_ok(), "Realize should succeed");
+        assert!(realized.is_ok(), "Realize should succeed: {:?}", realized.err());
     }
 
     #[test]

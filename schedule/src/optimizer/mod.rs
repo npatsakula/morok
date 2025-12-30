@@ -121,9 +121,17 @@ pub fn optimize_kernel_with_config(
         }
     };
 
+    // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
+    // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
+    // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
+    // NOTE: Must run BEFORE pre_expand so that INDEX ops are still visible
+    // (after expand, INDEX is wrapped in UNROLL and patterns won't match).
+    let pm_loads = crate::rangeify::patterns::pm_add_loads();
+    let with_loads = crate::rewrite::graph_rewrite_bottom_up(&pm_loads, optimized, &mut ());
+
     // Post-optimization: Fix UNROLL substitutions in REDUCE ops
     // This handles arithmetic expressions created by shift_to UNROLL
-    let expanded = crate::expand::pre_expand(&optimized);
+    let expanded = crate::expand::pre_expand(&with_loads);
 
     // Post-expand: Linearize multi-index INDEX ops
     // This MUST run after pre_expand to avoid creating Binary(Range*stride) before expand.
@@ -233,8 +241,9 @@ fn optimize_heuristic(ast: Arc<morok_ir::UOp>, renderer: &Renderer, config: &Heu
     // Step 2: Create scheduler with backend capabilities
     let mut scheduler = Scheduler::new(simplified, renderer.clone());
 
-    // Step 3: Convert eligible LOOP axes to GLOBAL (for GPU parallelization)
-    let _ = scheduler.convert_loop_to_global();
+    // Step 3: Convert axes for parallelization/vectorization
+    let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
+    let _ = scheduler.convert_outer_to_loop(); // CPU: OUTER→LOOP (enables UPCAST)
 
     // Step 4: Apply hand-coded heuristics with config
     heuristics::hand_coded_optimizations(&mut scheduler, config);

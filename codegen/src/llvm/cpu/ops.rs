@@ -7,6 +7,7 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::Module;
+use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicValueEnum, CallSiteValue, FunctionValue, ValueKind};
 use inkwell::{FloatPredicate, IntPredicate};
 use snafu::{OptionExt, ResultExt};
@@ -444,10 +445,19 @@ fn codegen_binary<'ctx>(
         BinaryOp::Add => common::build_add(builder, lhs, rhs, is_float),
         BinaryOp::Sub => common::build_sub(builder, lhs, rhs, is_float),
         BinaryOp::Mul => common::build_mul(builder, lhs, rhs, is_float),
-        BinaryOp::Fdiv => Ok(builder
-            .build_float_div(lhs.into_float_value(), rhs.into_float_value(), "fdiv")
-            .context(ArithmeticSnafu)?
-            .into()),
+        BinaryOp::Fdiv => {
+            if lhs.is_vector_value() {
+                Ok(builder
+                    .build_float_div(lhs.into_vector_value(), rhs.into_vector_value(), "fdiv")
+                    .context(ArithmeticSnafu)?
+                    .into())
+            } else {
+                Ok(builder
+                    .build_float_div(lhs.into_float_value(), rhs.into_float_value(), "fdiv")
+                    .context(ArithmeticSnafu)?
+                    .into())
+            }
+        }
         BinaryOp::Idiv => common::build_int_div(builder, lhs, rhs, is_signed),
         BinaryOp::Mod => common::build_rem(builder, lhs, rhs, is_float, is_signed),
         BinaryOp::Max => {
@@ -505,10 +515,17 @@ fn codegen_cast<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>> {
-    let src_is_float = src_dtype.is_float();
-    let dst_is_float = dst_dtype.is_float();
-    let src_is_signed = src_dtype.is_signed();
-    let dst_is_signed = dst_dtype.is_signed();
+    // Extract scalar dtype from vector types for type checks
+    let scalar_src_dtype = match src_dtype {
+        DType::Vector { scalar, .. } => DType::Scalar(*scalar),
+        _ => src_dtype.clone(),
+    };
+    let scalar_dst_dtype = DType::Scalar(dst_dtype.base());
+
+    let src_is_float = scalar_src_dtype.is_float();
+    let dst_is_float = scalar_dst_dtype.is_float();
+    let src_is_signed = scalar_src_dtype.is_signed();
+    let dst_is_signed = scalar_dst_dtype.is_signed();
 
     // Handle vector types
     if src.is_vector_value() {
@@ -516,7 +533,6 @@ fn codegen_cast<'ctx>(
         let vec_len = vec.get_type().get_size();
 
         // Get scalar destination type
-        let scalar_dst_dtype = DType::Scalar(dst_dtype.base());
         let scalar_dst_type = common::dtype_to_basic_type(&scalar_dst_dtype, context)?;
 
         // Build vector type for destination
@@ -539,8 +555,8 @@ fn codegen_cast<'ctx>(
                 dst_is_float,
                 src_is_signed,
                 dst_is_signed,
-                src_dtype,
-                dst_dtype,
+                &scalar_src_dtype,
+                &scalar_dst_dtype,
                 context,
                 builder,
             )?;
@@ -667,55 +683,12 @@ fn codegen_memory<'ctx>(
                     "INDEX: buffer[index]"
                 );
 
-                // Handle vector indices (from UNROLL optimization) - perform gather
+                // Handle vector indices (from UPCAST optimization)
+                // Return the vector indices directly - LOAD will do gather, STORE will do scatter.
+                // This separates addressing (INDEX) from data movement (LOAD/STORE).
                 if index_val.is_vector_value() {
-                    let vec_indices = index_val.into_vector_value();
-                    let vec_len = vec_indices.get_type().get_size();
-
-                    // Get element type from buffer's dtype
-                    let element_type = match buffer.dtype() {
-                        DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
-                        _ => return UnsupportedSnafu { what: "INDEX buffer must be Ptr type" }.fail(),
-                    };
-
-                    // Build vector of loaded values using extractelement + GEP + load
-                    let result_vec_type = match element_type {
-                        inkwell::types::BasicTypeEnum::FloatType(ft) => ft.vec_type(vec_len),
-                        inkwell::types::BasicTypeEnum::IntType(it) => it.vec_type(vec_len),
-                        _ => return UnsupportedSnafu { what: "Unsupported element type for vector gather" }.fail(),
-                    };
-
-                    let mut result: BasicValueEnum = result_vec_type.get_poison().into();
-                    let ptr_val = buffer_ptr.into_pointer_value();
-
-                    for i in 0..vec_len {
-                        // Extract index
-                        let idx_const = context.i32_type().const_int(i as u64, false);
-                        let scalar_idx = builder
-                            .build_extract_element(vec_indices, idx_const, "gather_idx")
-                            .context(VectorExtractSnafu)?
-                            .into_int_value();
-
-                        // GEP to get pointer
-                        let elem_ptr = unsafe {
-                            builder
-                                .build_gep(element_type, ptr_val, &[scalar_idx], "gather_gep")
-                                .context(BuildGepSnafu)?
-                        };
-
-                        // Load element
-                        let elem_val =
-                            builder.build_load(element_type, elem_ptr, "gather_load").context(BuildLoadSnafu)?;
-
-                        // Insert into result vector
-                        result = builder
-                            .build_insert_element(result.into_vector_value(), elem_val, idx_const, "gather_insert")
-                            .context(VectorInsertSnafu)?
-                            .into();
-                    }
-
-                    debug!(uop_id = uop.id, result = ?result, "INDEX: vector gather complete");
-                    return Ok(Some(result));
+                    debug!(uop_id = uop.id, "INDEX: returning vector indices for gather/scatter");
+                    return Ok(Some(index_val));
                 }
 
                 // Scalar index - regular GEP
@@ -774,26 +747,17 @@ fn codegen_memory<'ctx>(
                 let is_vectorized = index_vals.iter().any(|v| v.is_vector_value());
 
                 if is_vectorized {
-                    // Vectorized multi-index gather
+                    // Vectorized multi-index - compute linearized vector indices
+                    // LOAD will do gather, STORE will do scatter
                     let vec_len = index_vals
                         .iter()
                         .find(|v| v.is_vector_value())
                         .map(|v| v.into_vector_value().get_type().get_size())
                         .unwrap_or(1);
 
-                    let element_type = match buffer.dtype() {
-                        DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
-                        _ => return UnsupportedSnafu { what: "INDEX buffer must be Ptr type" }.fail(),
-                    };
-
-                    let result_vec_type = match element_type {
-                        inkwell::types::BasicTypeEnum::FloatType(ft) => ft.vec_type(vec_len),
-                        inkwell::types::BasicTypeEnum::IntType(it) => it.vec_type(vec_len),
-                        _ => return UnsupportedSnafu { what: "Unsupported element type for vector gather" }.fail(),
-                    };
-
+                    // Build result vector of linearized indices
+                    let result_vec_type = context.i64_type().vec_type(vec_len);
                     let mut result: BasicValueEnum = result_vec_type.get_poison().into();
-                    let ptr_val = buffer_ptr.into_pointer_value();
 
                     for lane in 0..vec_len {
                         let lane_const = context.i32_type().const_int(lane as u64, false);
@@ -815,20 +779,14 @@ fn codegen_memory<'ctx>(
                             linear = builder.build_int_add(linear, term, "linear_add").context(ArithmeticSnafu)?;
                         }
 
-                        // GEP + load for this element
-                        let elem_ptr = unsafe {
-                            builder.build_gep(element_type, ptr_val, &[linear], "gather_gep").context(BuildGepSnafu)?
-                        };
-                        let elem_val =
-                            builder.build_load(element_type, elem_ptr, "gather_load").context(BuildLoadSnafu)?;
-
+                        // Insert linearized index into result vector
                         result = builder
-                            .build_insert_element(result.into_vector_value(), elem_val, lane_const, "gather_insert")
+                            .build_insert_element(result.into_vector_value(), linear, lane_const, "linear_insert")
                             .context(VectorInsertSnafu)?
                             .into();
                     }
 
-                    debug!(uop_id = uop.id, result = ?result, "INDEX: multi-index vector gather complete");
+                    debug!(uop_id = uop.id, "INDEX: returning linearized vector indices for gather/scatter");
                     return Ok(Some(result));
                 }
 
@@ -883,6 +841,56 @@ fn codegen_load<'ctx>(
     context: &'ctx Context,
     builder: &Builder<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>> {
+    // Handle vector indices (from UPCAST optimization) - perform gather
+    if index.is_vector_value() {
+        let vec_indices = index.into_vector_value();
+        let vec_len = vec_indices.get_type().get_size();
+        let ptr_val = buffer_ptr.into_pointer_value();
+
+        // Get scalar element type from result dtype (may be Vector or Scalar)
+        let scalar_dtype = match result_dtype {
+            DType::Vector { scalar, .. } => DType::Scalar(*scalar),
+            _ => result_dtype.clone(),
+        };
+        let element_type = common::dtype_to_basic_type(&scalar_dtype, context)?;
+
+        // Build result vector type
+        let result_vec_type = match element_type {
+            inkwell::types::BasicTypeEnum::FloatType(ft) => ft.vec_type(vec_len),
+            inkwell::types::BasicTypeEnum::IntType(it) => it.vec_type(vec_len),
+            _ => return UnsupportedSnafu { what: "Unsupported element type for vector gather" }.fail(),
+        };
+
+        let mut result: BasicValueEnum = result_vec_type.get_poison().into();
+
+        for i in 0..vec_len {
+            let i_const = context.i32_type().const_int(i as u64, false);
+
+            // Extract scalar index
+            let scalar_idx = builder
+                .build_extract_element(vec_indices, i_const, "gather_idx")
+                .context(VectorExtractSnafu)?
+                .into_int_value();
+
+            // GEP to get pointer
+            let elem_ptr = unsafe {
+                builder.build_gep(element_type, ptr_val, &[scalar_idx], "gather_gep").context(BuildGepSnafu)?
+            };
+
+            // Load element
+            let elem_val = builder.build_load(element_type, elem_ptr, "gather_load").context(BuildLoadSnafu)?;
+
+            // Insert into result vector
+            result = builder
+                .build_insert_element(result.into_vector_value(), elem_val, i_const, "gather_insert")
+                .context(VectorInsertSnafu)?
+                .into();
+        }
+
+        return Ok(result);
+    }
+
+    // Scalar path
     let element_ptr = if index.is_pointer_value() {
         index.into_pointer_value()
     } else {
@@ -902,6 +910,56 @@ fn codegen_store<'ctx>(
     value: BasicValueEnum<'ctx>,
     builder: &Builder<'ctx>,
 ) -> Result<()> {
+    // Handle vector indices (from UPCAST optimization) - perform scatter
+    if index.is_vector_value() {
+        let vec_indices = index.into_vector_value();
+        let vec_len = vec_indices.get_type().get_size();
+        let ptr_val = buffer_ptr.into_pointer_value();
+        let block = builder.get_insert_block().context(NoInsertBlockSnafu)?;
+        let context = block.get_context();
+
+        // Get element type from value's type
+        let element_type = if value.is_vector_value() {
+            value.into_vector_value().get_type().get_element_type()
+        } else {
+            value.get_type()
+        };
+
+        // If value is also a vector, scatter each element to its index
+        // If value is scalar, broadcast it to all indices (less common case)
+        let is_value_vec = value.is_vector_value();
+
+        for i in 0..vec_len {
+            let i_const = context.i32_type().const_int(i as u64, false);
+
+            // Extract scalar index
+            let scalar_idx = builder
+                .build_extract_element(vec_indices, i_const, "scatter_idx")
+                .context(VectorExtractSnafu)?
+                .into_int_value();
+
+            // Get scalar value (extract from vector or use scalar directly)
+            let scalar_val = if is_value_vec {
+                builder
+                    .build_extract_element(value.into_vector_value(), i_const, "scatter_val")
+                    .context(VectorExtractSnafu)?
+            } else {
+                value
+            };
+
+            // GEP to get pointer
+            let elem_ptr = unsafe {
+                builder.build_gep(element_type, ptr_val, &[scalar_idx], "scatter_gep").context(BuildGepSnafu)?
+            };
+
+            // Store element
+            builder.build_store(elem_ptr, scalar_val).context(BuildStoreSnafu)?;
+        }
+
+        return Ok(());
+    }
+
+    // Scalar path: existing logic
     let element_ptr = if index.is_pointer_value() {
         index.into_pointer_value()
     } else {
@@ -1028,16 +1086,18 @@ fn codegen_range<'ctx>(
     builder: &Builder<'ctx>,
     values: &mut ValueMap<'ctx>,
 ) -> Result<Option<BasicValueEnum<'ctx>>> {
+    // If already processed, return cached value (idempotent)
+    // This must come FIRST to handle Reduce ranges that were set up by REDUCE codegen
+    // and appear in INDEX indices (via shift_to substitution).
+    if let Some(val) = values.get(uop_id) {
+        return Ok(Some(val));
+    }
+
     // Reduce ranges are handled entirely by REDUCE codegen
     // DON'T return the end value here - that would be cached and used incorrectly
     // REDUCE will set up the loop counter and store it for its source subgraph
     if axis_type == AxisType::Reduce {
         return Ok(None);
-    }
-
-    // If already processed, return cached value (idempotent)
-    if let Some(val) = values.get(uop_id) {
-        return Ok(Some(val));
     }
 
     // OUTER/GLOBAL/LOOP ranges: create for-loops directly (Tinygrad approach)
@@ -1160,8 +1220,8 @@ fn codegen_reduce<'ctx>(
     // Use alloca-based approach for accumulator (like Tinygrad's DEFINE_REG)
     // This handles nested source loops correctly - PHI-based doesn't work when source creates loops
     // because SSA values defined inside loops aren't available at the loop exit block.
-    let acc_type = common::dtype_to_basic_type(result_dtype, context)?;
-    let acc_alloca = builder.build_alloca(acc_type, "reduce_acc").context(BuildAllocaSnafu)?;
+    let scalar_acc_type = common::dtype_to_basic_type(result_dtype, context)?;
+    let acc_alloca = builder.build_alloca(scalar_acc_type, "reduce_acc").context(BuildAllocaSnafu)?;
 
     // Initialize accumulator with identity
     builder.build_store(acc_alloca, identity).context(BuildStoreSnafu)?;
@@ -1215,22 +1275,79 @@ fn codegen_reduce<'ctx>(
     let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
     trace!(src_val_loaded = ?src_val, "reduce after auto_load");
 
-    // If source is vectorized (from UNROLL/CONTRACT), perform horizontal reduction first
-    // This collapses the vector to a scalar before accumulating
-    let src_val = if src_val.is_vector_value() {
-        trace!("vectorized source detected, performing horizontal reduction");
-        codegen_horizontal_reduce(reduce_op, src_val.into_vector_value(), result_dtype, context, module, builder)?
+    // Check if source is vectorized but our accumulator is scalar
+    // This happens when UPCAST is on a non-reduce axis (e.g., output row in matmul)
+    // We need element-wise reduction with a vector accumulator
+    let (final_acc_alloca, final_acc_type) = if src_val.is_vector_value() && !scalar_acc_type.is_vector_type() {
+        let vec_len = src_val.into_vector_value().get_type().get_size();
+        trace!(vec_len, "source is vector but accumulator is scalar, upgrading");
+
+        // Create vector accumulator type
+        let vec_acc_type: BasicTypeEnum = match scalar_acc_type {
+            inkwell::types::BasicTypeEnum::FloatType(ft) => ft.vec_type(vec_len).into(),
+            inkwell::types::BasicTypeEnum::IntType(it) => it.vec_type(vec_len).into(),
+            _ => scalar_acc_type,
+        };
+
+        // Create vector alloca at function ENTRY to ensure it dominates all uses
+        let current_block = builder.get_insert_block().context(NoInsertBlockSnafu)?;
+        let entry_block = function.get_first_basic_block().context(NoInsertBlockSnafu)?;
+
+        // Position at start of entry block (after any existing allocas)
+        if let Some(first_instr) = entry_block.get_first_instruction() {
+            builder.position_before(&first_instr);
+        } else {
+            builder.position_at_end(entry_block);
+        }
+
+        let vec_alloca = builder.build_alloca(vec_acc_type, "reduce_vec_acc").context(BuildAllocaSnafu)?;
+
+        // Initialize vector accumulator at entry block too (before any loops)
+        let vec_identity = match identity {
+            BasicValueEnum::FloatValue(f) => {
+                let vec_type = f.get_type().vec_type(vec_len);
+                let mut vec: BasicValueEnum = vec_type.get_poison().into();
+                for i in 0..vec_len {
+                    let idx = context.i32_type().const_int(i as u64, false);
+                    vec = builder
+                        .build_insert_element(vec.into_vector_value(), f, idx, "id_insert")
+                        .context(VectorInsertSnafu)?
+                        .into();
+                }
+                vec
+            }
+            BasicValueEnum::IntValue(iv) => {
+                let vec_type = iv.get_type().vec_type(vec_len);
+                let mut vec: BasicValueEnum = vec_type.get_poison().into();
+                for i in 0..vec_len {
+                    let idx = context.i32_type().const_int(i as u64, false);
+                    vec = builder
+                        .build_insert_element(vec.into_vector_value(), iv, idx, "id_insert")
+                        .context(VectorInsertSnafu)?
+                        .into();
+                }
+                vec
+            }
+            _ => identity,
+        };
+        builder.build_store(vec_alloca, vec_identity).context(BuildStoreSnafu)?;
+
+        // Restore position to continue codegen in the loop body
+        builder.position_at_end(current_block);
+
+        (vec_alloca, vec_acc_type)
     } else {
-        src_val
+        (acc_alloca, scalar_acc_type)
     };
 
     // Load accumulator AFTER source evaluation (inside any source loops)
     // This ensures we get the current value, not a stale one from before the source loops
-    let acc_val = builder.build_load(acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
+    let acc_val = builder.build_load(final_acc_type, final_acc_alloca, "acc_load").context(BuildLoadSnafu)?;
 
     // Do accumulation INSIDE the source loops (before closing them)
+    // For vector accumulator with vector source, this does element-wise reduction
     let new_acc = codegen_reduce_op(reduce_op, acc_val, src_val, result_dtype, module, builder)?;
-    builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
+    builder.build_store(final_acc_alloca, new_acc).context(BuildStoreSnafu)?;
 
     // Close any loops created during source evaluation (innermost first)
     let loops_after = values.remaining_loop_ids();
@@ -1255,7 +1372,7 @@ fn codegen_reduce<'ctx>(
     }
 
     // Load final result
-    let final_val = builder.build_load(acc_type, acc_alloca, "reduce_result").context(BuildLoadSnafu)?;
+    let final_val = builder.build_load(final_acc_type, final_acc_alloca, "reduce_result").context(BuildLoadSnafu)?;
     Ok(Some(final_val))
 }
 
