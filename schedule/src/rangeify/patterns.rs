@@ -1427,9 +1427,7 @@ fn horizontal_reduce(src: &Arc<UOp>, reduce_op: ReduceOp) -> Arc<UOp> {
     let scalar_dtype = DType::Scalar(src.dtype().base());
 
     // Extract each element with GEP
-    let elements: Vec<Arc<UOp>> = (0..vcount)
-        .map(|i| UOp::gep(src.clone(), vec![i]))
-        .collect();
+    let elements: Vec<Arc<UOp>> = (0..vcount).map(|i| UOp::gep(src.clone(), vec![i])).collect();
 
     // Chain with binary operations: elem0 op elem1 op elem2 op ...
     // This creates a left-associative tree: ((elem0 op elem1) op elem2) op elem3
@@ -1475,14 +1473,7 @@ fn transform_vectorized_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     let scalar_dtype = DType::Scalar(src.dtype().base());
 
     // Create new REDUCE with scalar source and scalar result
-    Some(UOp::new(
-        Op::Reduce {
-            src: horizontal_reduced,
-            ranges: ranges.clone(),
-            reduce_op: *reduce_op,
-        },
-        scalar_dtype,
-    ))
+    Some(UOp::new(Op::Reduce { src: horizontal_reduced, ranges: ranges.clone(), reduce_op: *reduce_op }, scalar_dtype))
 }
 
 /// Check if REDUCE has vectorized source that needs horizontal reduction.
