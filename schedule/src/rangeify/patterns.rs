@@ -1501,13 +1501,13 @@ fn needs_horizontal_reduce(reduce: &Arc<UOp>) -> bool {
 /// Pattern matcher for horizontal reduction of vectorized REDUCE sources.
 ///
 /// When UPCAST is applied to non-reduce axes, REDUCE receives vectorized inputs.
-/// This pass performs horizontal reduction first, extracting vector elements
-/// and chaining them with the reduce operation before the REDUCE loop.
+/// LLVM cannot handle `<N x i1>` vector accumulators (especially for bool).
+/// This pass performs horizontal reduction first, converting vectorized source
+/// to scalar before the REDUCE loop.
 ///
-/// Based on Tinygrad's devectorizer.py:283-289 (horizontal_reduce).
+/// Based on Tinygrad's devectorizer.py:horizontal_reduce + reduce_to_acc.
 ///
 /// Transforms:
-/// - REDUCE(Add, <4 x f32> src, ranges) → REDUCE(Add, e0+e1+e2+e3, ranges)
 /// - REDUCE(Max, <4 x bool> src, ranges) → REDUCE(Max, Max(Max(Max(e0,e1),e2),e3), ranges)
 pub fn pm_horizontal_reduce() -> PatternMatcher<()> {
     crate::patterns! {
