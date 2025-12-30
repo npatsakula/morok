@@ -133,11 +133,24 @@ pub fn optimize_kernel_with_config(
     // This handles arithmetic expressions created by shift_to UNROLL
     let expanded = crate::expand::pre_expand(&with_loads);
 
+    // Bool devectorization: Convert <N x i1> ALU ops to scalar ops + VECTORIZE.
+    // LLVM's bool vectors are broken (no formal ABI, segfaults in codegen).
+    // Based on Tinygrad's no_vectorized_alu approach.
+    let pm_devec = crate::rangeify::patterns::pm_bool_devectorize();
+    let devectorized = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, expanded, &mut ());
+
+    // Horizontal reduce: Convert REDUCE with vectorized source to scalar REDUCE.
+    // When UPCAST is on non-reduce axes, REDUCE receives vectorized inputs.
+    // This extracts elements and chains with ALU ops before the REDUCE loop.
+    // Based on Tinygrad's horizontal_reduce (devectorizer.py:289-316).
+    let pm_hreduce = crate::rangeify::patterns::pm_horizontal_reduce();
+    let hreduced = crate::rewrite::graph_rewrite_bottom_up(&pm_hreduce, devectorized, &mut ());
+
     // Post-expand: Linearize multi-index INDEX ops
     // This MUST run after pre_expand to avoid creating Binary(Range*stride) before expand.
     // If linearized before expand, Range ops inside Binary get vectorized incorrectly.
     let post_expand_matcher = crate::rangeify::post_expand_patterns();
-    crate::rewrite::graph_rewrite_bottom_up(&post_expand_matcher, expanded, &mut ())
+    crate::rewrite::graph_rewrite_bottom_up(&post_expand_matcher, hreduced, &mut ())
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).

@@ -950,10 +950,23 @@ impl Scheduler {
     /// externally but can be vectorized. Converting them to LOOP allows
     /// the optimizer to apply UPCAST transformations for SIMD operations.
     ///
+    /// **Important**: For reduce kernels, OUTER axes represent output dimensions
+    /// and should NOT be converted to LOOP. This aligns with Tinygrad's design
+    /// where OUTER axes remain non-upcastable in reduce kernels. Converting them
+    /// would cause incorrect vectorization across independent reduction lanes.
+    ///
     /// This is the CPU counterpart to `convert_loop_to_global()` for GPU.
     pub fn convert_outer_to_loop(&mut self) -> Result<(), OptError> {
         // Only for CPU backends (no local memory = no GPU parallelization)
         if self.ren.has_local {
+            return Ok(());
+        }
+
+        // Don't convert OUTER→LOOP in reduce kernels.
+        // In reduce kernels, OUTER axes are output dimensions that should not
+        // be vectorized (each output element needs its own independent reduction).
+        // This matches Tinygrad's architecture where OUTER is never upcastable.
+        if self.reduceop().is_some() {
             return Ok(());
         }
 

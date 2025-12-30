@@ -637,7 +637,16 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         UOp::contract(src.clone(), unroll_axes)
     };
 
-    Some(UOp::new(Op::Reduce { src: fixed_src, ranges: fixed_ranges, reduce_op: *reduce_op }, reduce.dtype()))
+    // Use source dtype for REDUCE result if source is vectorized.
+    // This handles UPCAST on parallel axes - the REDUCE should produce vector output
+    // with element-wise accumulation, not scalar output with horizontal reduction.
+    let result_dtype = if fixed_src.dtype().vcount() > 1 {
+        fixed_src.dtype()
+    } else {
+        reduce.dtype()
+    };
+
+    Some(UOp::new(Op::Reduce { src: fixed_src, ranges: fixed_ranges, reduce_op: *reduce_op }, result_dtype))
 }
 
 /// Extract Reduce and Unroll ranges from a shift_to arithmetic expression.
