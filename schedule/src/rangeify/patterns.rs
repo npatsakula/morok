@@ -1487,15 +1487,12 @@ fn transform_vectorized_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// Check if REDUCE has vectorized source that needs horizontal reduction.
 ///
-/// Horizontal reduction is ONLY needed for vectorized BOOL types.
-/// LLVM's `<N x i1>` vectors are fundamentally broken (no stable ABI, segfaults).
-/// For non-bool types, the existing REDUCE + UNROLL handling works correctly.
+/// Horizontal reduction is needed when source is vectorized but result is scalar.
+/// This matches Tinygrad's approach (devectorizer.py:285): `if inp.dtype != out_dtype`.
 fn needs_horizontal_reduce(reduce: &Arc<UOp>) -> bool {
     if let Op::Reduce { src, .. } = reduce.op() {
-        let src_vcount = src.dtype().vcount();
-
-        // Only horizontal reduce for vectorized bools - LLVM can't handle <N x i1>
-        src.dtype().base() == ScalarDType::Bool && src_vcount > 1
+        // Horizontal reduce when source is vectorized but result is scalar (or less vectorized)
+        src.dtype().vcount() > reduce.dtype().vcount()
     } else {
         false
     }
@@ -1504,13 +1501,13 @@ fn needs_horizontal_reduce(reduce: &Arc<UOp>) -> bool {
 /// Pattern matcher for horizontal reduction of vectorized REDUCE sources.
 ///
 /// When UPCAST is applied to non-reduce axes, REDUCE receives vectorized inputs.
-/// LLVM cannot handle `<N x i1>` vector accumulators (especially for bool).
-/// This pass performs horizontal reduction first, converting vectorized source
-/// to scalar before the REDUCE loop.
+/// This pass performs horizontal reduction first, extracting vector elements
+/// and chaining them with the reduce operation before the REDUCE loop.
 ///
-/// Based on Tinygrad's devectorizer.py:horizontal_reduce + reduce_to_acc.
+/// Based on Tinygrad's devectorizer.py:283-289 (horizontal_reduce).
 ///
 /// Transforms:
+/// - REDUCE(Add, <4 x f32> src, ranges) → REDUCE(Add, e0+e1+e2+e3, ranges)
 /// - REDUCE(Max, <4 x bool> src, ranges) → REDUCE(Max, Max(Max(Max(e0,e1),e2),e3), ranges)
 pub fn pm_horizontal_reduce() -> PatternMatcher<()> {
     crate::patterns! {

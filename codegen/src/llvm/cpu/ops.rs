@@ -7,7 +7,6 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::Module;
-use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicValueEnum, CallSiteValue, FunctionValue, ValueKind};
 use inkwell::{FloatPredicate, IntPredicate};
 use snafu::{OptionExt, ResultExt};
@@ -1275,79 +1274,13 @@ fn codegen_reduce<'ctx>(
     let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
     trace!(src_val_loaded = ?src_val, "reduce after auto_load");
 
-    // Check if source is vectorized but our accumulator is scalar
-    // This happens when UPCAST is on a non-reduce axis (e.g., output row in matmul)
-    // We need element-wise reduction with a vector accumulator
-    let (final_acc_alloca, final_acc_type) = if src_val.is_vector_value() && !scalar_acc_type.is_vector_type() {
-        let vec_len = src_val.into_vector_value().get_type().get_size();
-        trace!(vec_len, "source is vector but accumulator is scalar, upgrading");
-
-        // Create vector accumulator type
-        let vec_acc_type: BasicTypeEnum = match scalar_acc_type {
-            inkwell::types::BasicTypeEnum::FloatType(ft) => ft.vec_type(vec_len).into(),
-            inkwell::types::BasicTypeEnum::IntType(it) => it.vec_type(vec_len).into(),
-            _ => scalar_acc_type,
-        };
-
-        // Create vector alloca at function ENTRY to ensure it dominates all uses
-        let current_block = builder.get_insert_block().context(NoInsertBlockSnafu)?;
-        let entry_block = function.get_first_basic_block().context(NoInsertBlockSnafu)?;
-
-        // Position at start of entry block (after any existing allocas)
-        if let Some(first_instr) = entry_block.get_first_instruction() {
-            builder.position_before(&first_instr);
-        } else {
-            builder.position_at_end(entry_block);
-        }
-
-        let vec_alloca = builder.build_alloca(vec_acc_type, "reduce_vec_acc").context(BuildAllocaSnafu)?;
-
-        // Initialize vector accumulator at entry block too (before any loops)
-        let vec_identity = match identity {
-            BasicValueEnum::FloatValue(f) => {
-                let vec_type = f.get_type().vec_type(vec_len);
-                let mut vec: BasicValueEnum = vec_type.get_poison().into();
-                for i in 0..vec_len {
-                    let idx = context.i32_type().const_int(i as u64, false);
-                    vec = builder
-                        .build_insert_element(vec.into_vector_value(), f, idx, "id_insert")
-                        .context(VectorInsertSnafu)?
-                        .into();
-                }
-                vec
-            }
-            BasicValueEnum::IntValue(iv) => {
-                let vec_type = iv.get_type().vec_type(vec_len);
-                let mut vec: BasicValueEnum = vec_type.get_poison().into();
-                for i in 0..vec_len {
-                    let idx = context.i32_type().const_int(i as u64, false);
-                    vec = builder
-                        .build_insert_element(vec.into_vector_value(), iv, idx, "id_insert")
-                        .context(VectorInsertSnafu)?
-                        .into();
-                }
-                vec
-            }
-            _ => identity,
-        };
-        builder.build_store(vec_alloca, vec_identity).context(BuildStoreSnafu)?;
-
-        // Restore position to continue codegen in the loop body
-        builder.position_at_end(current_block);
-
-        (vec_alloca, vec_acc_type)
-    } else {
-        (acc_alloca, scalar_acc_type)
-    };
-
     // Load accumulator AFTER source evaluation (inside any source loops)
     // This ensures we get the current value, not a stale one from before the source loops
-    let acc_val = builder.build_load(final_acc_type, final_acc_alloca, "acc_load").context(BuildLoadSnafu)?;
+    let acc_val = builder.build_load(scalar_acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
 
     // Do accumulation INSIDE the source loops (before closing them)
-    // For vector accumulator with vector source, this does element-wise reduction
     let new_acc = codegen_reduce_op(reduce_op, acc_val, src_val, result_dtype, module, builder)?;
-    builder.build_store(final_acc_alloca, new_acc).context(BuildStoreSnafu)?;
+    builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
 
     // Close any loops created during source evaluation (innermost first)
     let loops_after = values.remaining_loop_ids();
@@ -1372,7 +1305,7 @@ fn codegen_reduce<'ctx>(
     }
 
     // Load final result
-    let final_val = builder.build_load(final_acc_type, final_acc_alloca, "reduce_result").context(BuildLoadSnafu)?;
+    let final_val = builder.build_load(scalar_acc_type, acc_alloca, "reduce_result").context(BuildLoadSnafu)?;
     Ok(Some(final_val))
 }
 
@@ -1693,67 +1626,5 @@ fn codegen_reduce_op<'ctx>(
                 call_intrinsic(&format!("llvm.umin.i{}", dtype.bytes() * 8), &[acc, src], "reduce_min", module, builder)
             }
         }
-    }
-}
-
-/// Perform horizontal reduction on a vector value using LLVM vector.reduce intrinsics.
-///
-/// This collapses a vector to a scalar using the specified reduce operation.
-/// Used when CONTRACT's source is vectorized (from UNROLL optimization).
-fn codegen_horizontal_reduce<'ctx>(
-    reduce_op: ReduceOp,
-    vector: inkwell::values::VectorValue<'ctx>,
-    result_dtype: &DType,
-    context: &'ctx Context,
-    module: &Module<'ctx>,
-    builder: &Builder<'ctx>,
-) -> Result<BasicValueEnum<'ctx>> {
-    let vec_size = vector.get_type().get_size();
-    let is_float = result_dtype.is_float();
-    let scalar_bits = result_dtype.base().bytes() * 8;
-
-    // Build intrinsic name based on operation and type
-    let type_suffix =
-        if is_float { format!("v{}f{}", vec_size, scalar_bits) } else { format!("v{}i{}", vec_size, scalar_bits) };
-
-    let intrinsic_name = match (reduce_op, is_float, result_dtype.is_signed()) {
-        (ReduceOp::Add, true, _) => format!("llvm.vector.reduce.fadd.{}", type_suffix),
-        (ReduceOp::Add, false, _) => format!("llvm.vector.reduce.add.{}", type_suffix),
-        (ReduceOp::Mul, true, _) => format!("llvm.vector.reduce.fmul.{}", type_suffix),
-        (ReduceOp::Mul, false, _) => format!("llvm.vector.reduce.mul.{}", type_suffix),
-        (ReduceOp::Max, true, _) => format!("llvm.vector.reduce.fmax.{}", type_suffix),
-        (ReduceOp::Max, false, true) => format!("llvm.vector.reduce.smax.{}", type_suffix),
-        (ReduceOp::Max, false, false) => format!("llvm.vector.reduce.umax.{}", type_suffix),
-        (ReduceOp::Min, true, _) => format!("llvm.vector.reduce.fmin.{}", type_suffix),
-        (ReduceOp::Min, false, true) => format!("llvm.vector.reduce.smin.{}", type_suffix),
-        (ReduceOp::Min, false, false) => format!("llvm.vector.reduce.umin.{}", type_suffix),
-    };
-
-    // Get the intrinsic
-    let intrinsic =
-        Intrinsic::find(&intrinsic_name).context(IntrinsicNotFoundSnafu { name: intrinsic_name.clone() })?;
-
-    // Get declaration with vector type
-    let fn_val = intrinsic
-        .get_declaration(module, &[vector.get_type().into()])
-        .context(IntrinsicDeclarationSnafu { name: intrinsic_name.clone() })?;
-
-    // fadd/fmul need identity value as first argument (ordered reduction)
-    let args: Vec<BasicValueEnum> = if is_float && matches!(reduce_op, ReduceOp::Add | ReduceOp::Mul) {
-        let identity = if reduce_op == ReduceOp::Add { 0.0 } else { 1.0 };
-        let scalar_type = common::dtype_to_basic_type(&DType::Scalar(result_dtype.base()), context)?;
-        let identity_val = scalar_type.into_float_type().const_float(identity);
-        vec![identity_val.into(), vector.into()]
-    } else {
-        vec![vector.into()]
-    };
-
-    // Build call
-    let args_meta: Vec<_> = args.iter().map(|a| (*a).into()).collect();
-    let call_site = builder.build_call(fn_val, &args_meta, "hreduce").context(IntrinsicCallSnafu)?;
-
-    match call_site.try_as_basic_value() {
-        ValueKind::Basic(v) => Ok(v),
-        ValueKind::Instruction(_) => IntrinsicNoReturnSnafu { name: intrinsic_name }.fail(),
     }
 }

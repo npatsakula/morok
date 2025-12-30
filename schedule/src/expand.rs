@@ -637,14 +637,9 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         UOp::contract(src.clone(), unroll_axes)
     };
 
-    // Use source dtype for REDUCE result if source is vectorized.
-    // This handles UPCAST on parallel axes - the REDUCE should produce vector output
-    // with element-wise accumulation, not scalar output with horizontal reduction.
-    let result_dtype = if fixed_src.dtype().vcount() > 1 {
-        fixed_src.dtype()
-    } else {
-        reduce.dtype()
-    };
+    // REDUCE always outputs scalar - horizontal_reduce handles vectorized sources.
+    // This matches Tinygrad's invariant (devectorizer.py:283-312).
+    let result_dtype = reduce.dtype();
 
     Some(UOp::new(Op::Reduce { src: fixed_src, ranges: fixed_ranges, reduce_op: *reduce_op }, result_dtype))
 }
