@@ -39,6 +39,9 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     // 3. Grouped reduction
     try_grouped_reduction(scheduler, config);
 
+    // 3.5. Matmul K-vectorization (CPU-only, after grouped reduction)
+    apply_matmul_k_vectorization(scheduler);
+
     // 4. Masked upcasts
     apply_masked_upcasts(scheduler);
 
@@ -174,10 +177,17 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
 }
 
 /// Unroll small reduction loops (size <= threshold).
+///
+/// Skips unrolling reduce axes if K-vectorization (UPCAST) has already been applied,
+/// to avoid deeply nested expressions that the expand pass can't handle.
 pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     let mut applied = false;
     let unrollable = scheduler.unrollable_dims();
     let threshold = config.unroll_threshold as i64;
+
+    // Check if K-vectorization was applied (Upcast axes exist)
+    // If so, skip unrolling reduce axes to avoid nested Range expressions
+    let has_upcast = !scheduler.axes_of(&[AxisType::Upcast]).is_empty();
 
     for axis_idx in unrollable {
         let rngs = scheduler.rngs();
@@ -185,12 +195,17 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
             continue;
         }
         let rng = &rngs[axis_idx];
-        if let Op::Range { end, .. } = rng.op()
+        if let Op::Range { axis_type, end, .. } = rng.op()
             && let Op::Const(cv) = end.op()
             && let morok_ir::ConstValue::Int(size) = cv.0
             && size > 1
             && size <= threshold
         {
+            // Skip reduce axes if upcast exists (K-vectorization already applied)
+            if has_upcast && matches!(axis_type, AxisType::Reduce) {
+                continue;
+            }
+
             let unroll_axes = scheduler.unrollable_dims();
             if let Some(logical) = unroll_axes.iter().position(|&a| a == axis_idx)
                 && apply_opt(scheduler, &Opt::unroll(logical, size as usize), true).is_ok()
@@ -274,6 +289,94 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
             return true;
         }
     }
+    false
+}
+
+/// Apply K-vectorization heuristic for matmul patterns.
+///
+/// For matmul C[i,j] += A[i,k] * B[k,j], applies UPCAST to the K (reduce) axis
+/// to create vectorized accumulators. This reduces loop iterations and enables
+/// SIMD accumulation.
+///
+/// Only applies when:
+/// - Matmul pattern detected (REDUCE(ADD) of MUL of INDEX)
+/// - No grouped reduction already applied
+/// - K dimension size >= 4 (for 4x vectorization)
+/// - CPU renderer (has_threads, no has_local) - GPU uses different strategies
+pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler) -> bool {
+    use tracing::{debug, trace};
+
+    trace!("apply_matmul_k_vectorization: entry");
+
+    // Only for CPU (has threads but no local memory/workgroups)
+    if scheduler.renderer().has_local {
+        trace!("apply_matmul_k_vectorization: skipped (has_local)");
+        return false;
+    }
+
+    // Check for matmul pattern
+    let has_matmul = has_matmul_pattern(scheduler);
+    trace!(has_matmul, "apply_matmul_k_vectorization: matmul pattern check");
+    if !has_matmul {
+        return false;
+    }
+
+    // Skip if grouped reduction already applied
+    let group_reduce_axes = scheduler.axes_of(&[AxisType::GroupReduce]);
+    trace!(num_group_reduce = group_reduce_axes.len(), "apply_matmul_k_vectorization: group reduce check");
+    if !group_reduce_axes.is_empty() {
+        return false;
+    }
+
+    // Get reduce axes (K dimension)
+    let reduce_axes = scheduler.axes_of(&[AxisType::Reduce]);
+    trace!(num_reduce_axes = reduce_axes.len(), "apply_matmul_k_vectorization: reduce axes");
+    if reduce_axes.is_empty() {
+        return false;
+    }
+
+    // Find innermost reduce axis with size >= 4
+    // Collect candidate (real_axis_idx, size) pairs first to avoid borrow issues
+    let candidates: Vec<(usize, i64)> = {
+        let rngs = scheduler.rngs();
+        reduce_axes
+            .iter()
+            .rev()
+            .filter_map(|&axis_idx| {
+                if axis_idx >= rngs.len() {
+                    return None;
+                }
+                let rng = &rngs[axis_idx];
+                if let Op::Range { end, .. } = rng.op()
+                    && let Op::Const(cv) = end.op()
+                    && let morok_ir::ConstValue::Int(size) = cv.0
+                    && size >= 4
+                {
+                    // Use real axis index directly (UPCAST uses direct axis index)
+                    Some((axis_idx, size))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    trace!(num_candidates = candidates.len(), candidates = ?candidates, "apply_matmul_k_vectorization: candidates");
+
+    // Try each candidate in order (innermost first)
+    for (axis_idx, size) in candidates {
+        trace!(axis_idx, size, "apply_matmul_k_vectorization: trying upcast");
+        if apply_opt(scheduler, &Opt::upcast(axis_idx, 4), true).is_ok() {
+            debug!(
+                axis_idx,
+                size, "apply_matmul_k_vectorization: SUCCESS - applied upcast(axis={}, factor=4)", axis_idx
+            );
+            return true;
+        } else {
+            trace!(axis_idx, size, "apply_matmul_k_vectorization: upcast failed");
+        }
+    }
+    trace!("apply_matmul_k_vectorization: no upcast applied");
     false
 }
 

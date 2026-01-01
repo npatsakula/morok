@@ -143,8 +143,10 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
 ///
 fn phase1_range_to_unroll() -> PatternMatcher {
     crate::patterns! {
-        // Convert Range(Unroll/Upcast) to UNROLL op with constant vector
-        range if matches!(range.op(), Op::Range { axis_type: AxisType::Unroll | AxisType::Upcast, .. }) => {
+        // Convert Range(Unroll) to UNROLL op with constant vector
+        // NOTE: Range(Upcast) is NOT converted here - it's preserved for fix_reduce_unroll
+        // to detect and set Vector dtype for K-vectorization. It gets converted in Phase 2.
+        range if matches!(range.op(), Op::Range { axis_type: AxisType::Unroll, .. }) => {
             convert_range_to_unroll(range)
         },
     }
@@ -156,6 +158,7 @@ fn phase1_range_to_unroll() -> PatternMatcher {
 fn phase2_expand() -> PatternMatcher {
     crate::patterns! {
         // Fix REDUCE with non-Range entries in ranges (use .. to match any ranges)
+        // This runs BEFORE Range(Upcast) conversion so it can detect Upcast and set Vector dtype
         reduce @ Reduce(_, ..) => fix_reduce_unroll(reduce),
 
         // Fix STORE with UNROLL in range args
@@ -170,6 +173,12 @@ fn phase2_expand() -> PatternMatcher {
 
         // Remove empty UNROLL: UNROLL(x, ()) → x
         unroll @ Unroll(_, ..) => unwrap_empty_unroll(unroll),
+
+        // Convert Range(Upcast) to UNROLL op (deferred from Phase 1 for K-vectorization)
+        // This runs AFTER fix_reduce_unroll has detected Upcast axes and set Vector dtype
+        range if matches!(range.op(), Op::Range { axis_type: AxisType::Upcast, .. }) => {
+            convert_range_to_unroll(range)
+        },
 
         // Main expansion: ALL expandable ops with UNROLL inputs
         // Uses is_expandable() check and range_ending_src_index() for proper range handling
@@ -563,6 +572,12 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     };
 
+    // Skip if src is already CONTRACT-wrapped (already processed)
+    // This prevents infinite rewrite loops when pattern matching
+    if matches!(src.op(), Op::Contract { .. }) {
+        return None;
+    }
+
     // Check if any range is not a simple Range(Reduce/Loop) op
     let has_non_reduce_range = ranges.iter().any(|r| {
         match r.op() {
@@ -576,7 +591,10 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     let mut fixed_ranges: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
+    // Separate Unroll (loop unrolling) from Upcast (vectorization)
+    // Only Upcast axes create vectorized accumulators
     let mut unroll_axes: Vec<(usize, usize)> = Vec::new();
+    let mut upcast_axes: Vec<(usize, usize)> = Vec::new();
 
     for range in ranges.iter() {
         match range.op() {
@@ -587,12 +605,19 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
                         // Keep in REDUCE.ranges
                         fixed_ranges.push(range.clone());
                     }
-                    AxisType::Unroll | AxisType::Upcast => {
-                        // Move to CONTRACT wrapper
+                    AxisType::Unroll => {
+                        // Loop unrolling - move to CONTRACT wrapper
                         if let Some(size) = extract_const_size(end) {
                             unroll_axes.push((axis_id.value(), size));
                         } else {
-                            // Can't extract size, keep as is
+                            fixed_ranges.push(range.clone());
+                        }
+                    }
+                    AxisType::Upcast => {
+                        // SIMD vectorization - creates vectorized accumulator
+                        if let Some(size) = extract_const_size(end) {
+                            upcast_axes.push((axis_id.value(), size));
+                        } else {
                             fixed_ranges.push(range.clone());
                         }
                     }
@@ -609,7 +634,12 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
                 if let Some((reduce_range, unroll_info)) = extract_ranges_from_expr(left, right) {
                     fixed_ranges.push(reduce_range);
                     if let Some((axis_id, size)) = unroll_info {
-                        unroll_axes.push((axis_id, size));
+                        // Check if the new range is Upcast or Unroll
+                        if is_upcast_range(right) || is_upcast_range(left) {
+                            upcast_axes.push((axis_id, size));
+                        } else {
+                            unroll_axes.push((axis_id, size));
+                        }
                     }
                 } else {
                     // Can't extract, keep as is
@@ -629,19 +659,38 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         }
     }
 
+    // Combine all axes for CONTRACT wrapper
+    let contract_axes: Vec<(usize, usize)> = unroll_axes.iter().chain(upcast_axes.iter()).copied().collect();
+
     // Build the fixed REDUCE
-    let fixed_src = if unroll_axes.is_empty() {
+    let fixed_src = if contract_axes.is_empty() {
         src.clone()
     } else {
-        // Wrap source in CONTRACT to document the unrolled axes
-        UOp::contract(src.clone(), unroll_axes)
+        // Wrap source in CONTRACT to document the unrolled/upcasted axes
+        UOp::contract(src.clone(), contract_axes)
     };
 
-    // REDUCE always outputs scalar - horizontal_reduce handles vectorized sources.
-    // This matches Tinygrad's invariant (devectorizer.py:283-312).
-    let result_dtype = reduce.dtype();
+    // Determine output dtype:
+    // - If Upcast axes exist (from UPCAST on reduce axis): output VECTOR dtype
+    //   This creates vectorized accumulators; horizontal reduction happens after END
+    // - Otherwise: output scalar (pm_horizontal_reduce handles vectorized sources)
+    let result_dtype = if !upcast_axes.is_empty() {
+        // Vectorized accumulator pattern: UPCAST was applied to reduce axis
+        // Output vector dtype so pm_horizontal_reduce skips this REDUCE
+        // Codegen will perform horizontal reduction after the reduce loop
+        let total_upcast: usize = upcast_axes.iter().map(|(_, sz)| sz).product();
+        DType::Vector { scalar: reduce.dtype().base(), count: total_upcast }
+    } else {
+        // Standard pattern: scalar output, horizontal reduce before loop if needed
+        reduce.dtype()
+    };
 
     Some(UOp::new(Op::Reduce { src: fixed_src, ranges: fixed_ranges, reduce_op: *reduce_op }, result_dtype))
+}
+
+/// Check if a UOp is a Range(Upcast) op.
+fn is_upcast_range(uop: &Arc<UOp>) -> bool {
+    matches!(uop.op(), Op::Range { axis_type: AxisType::Upcast, .. })
 }
 
 /// Extract Reduce and Unroll ranges from a shift_to arithmetic expression.
@@ -672,13 +721,14 @@ fn extract_ranges_from_expr(left: &Arc<UOp>, right: &Arc<UOp>) -> Option<(Arc<UO
     None
 }
 
-/// Extract unroll axis info (axis_id, size) from a Range op or UNROLL op.
+/// Extract unroll/upcast axis info (axis_id, size) from a Range op or UNROLL op.
 ///
 /// After Phase 1, Range(Unroll) has been converted to UNROLL, so we need
-/// to handle both cases.
+/// to handle both cases. Also handles Range(Upcast) for vectorized accumulators.
 fn extract_unroll_info(uop: &Arc<UOp>) -> Option<(usize, usize)> {
-    // Handle Range(Unroll) case (before Phase 1 conversion)
-    if let Op::Range { axis_type: AxisType::Unroll, axis_id, end } = uop.op()
+    // Handle Range(Unroll) or Range(Upcast) case (before Phase 1 conversion)
+    if let Op::Range { axis_type, axis_id, end } = uop.op()
+        && matches!(axis_type, AxisType::Unroll | AxisType::Upcast)
         && let Some(size) = extract_const_size(end)
     {
         return Some((axis_id.value(), size));

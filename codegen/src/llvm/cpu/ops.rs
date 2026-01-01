@@ -1189,7 +1189,14 @@ fn codegen_reduce<'ctx>(
         return codegen_uop(src, context, module, builder, values);
     }
 
-    let identity = codegen_reduce_identity(reduce_op, result_dtype, context)?;
+    // Detect vectorized accumulator pattern (UPCAST on reduce axis)
+    // When result_dtype is vector, we use vector accumulators and horizontal reduce at the end
+    let is_vector_accumulator = matches!(result_dtype, DType::Vector { .. });
+    let vec_len = result_dtype.vcount();
+    let scalar_dtype = DType::Scalar(result_dtype.base());
+
+    // For vector accumulators, we need the scalar identity to splat
+    let identity = codegen_reduce_identity(reduce_op, &scalar_dtype, context)?;
 
     let current_block = builder.get_insert_block().context(NoInsertBlockSnafu)?;
     let function = current_block.get_parent().context(NoParentFunctionSnafu)?;
@@ -1215,11 +1222,13 @@ fn codegen_reduce<'ctx>(
     // Use alloca-based approach for accumulator (like Tinygrad's DEFINE_REG)
     // This handles nested source loops correctly - PHI-based doesn't work when source creates loops
     // because SSA values defined inside loops aren't available at the loop exit block.
-    let scalar_acc_type = common::dtype_to_basic_type(result_dtype, context)?;
-    let acc_alloca = builder.build_alloca(scalar_acc_type, "reduce_acc").context(BuildAllocaSnafu)?;
+    let acc_type = common::dtype_to_basic_type(result_dtype, context)?;
+    let acc_alloca = builder.build_alloca(acc_type, "reduce_acc").context(BuildAllocaSnafu)?;
 
-    // Initialize accumulator with identity
-    builder.build_store(acc_alloca, identity).context(BuildStoreSnafu)?;
+    // Initialize accumulator with identity (splat to vector if needed)
+    let init_val =
+        if is_vector_accumulator { splat_scalar_to_vector(identity, vec_len, context, builder)? } else { identity };
+    builder.build_store(acc_alloca, init_val).context(BuildStoreSnafu)?;
 
     // Build nested counting loops for reduce ranges
     let mut loop_ctxs = Vec::new();
@@ -1272,10 +1281,16 @@ fn codegen_reduce<'ctx>(
 
     // Load accumulator AFTER source evaluation (inside any source loops)
     // This ensures we get the current value, not a stale one from before the source loops
-    let acc_val = builder.build_load(scalar_acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
+    let acc_val = builder.build_load(acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
 
     // Do accumulation INSIDE the source loops (before closing them)
-    let new_acc = codegen_reduce_op(reduce_op, acc_val, src_val, result_dtype, module, builder)?;
+    // For vector accumulators: if source is scalar, splat it to match accumulator width
+    let acc_src_val = if is_vector_accumulator && !src_val.is_vector_value() {
+        splat_scalar_to_vector(src_val, vec_len, context, builder)?
+    } else {
+        src_val
+    };
+    let new_acc = codegen_reduce_op(reduce_op, acc_val, acc_src_val, result_dtype, module, builder)?;
     builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
 
     // Close any loops created during source evaluation (innermost first)
@@ -1300,8 +1315,17 @@ fn codegen_reduce<'ctx>(
         values.remove(*id);
     }
 
-    // Load final result
-    let final_val = builder.build_load(scalar_acc_type, acc_alloca, "reduce_result").context(BuildLoadSnafu)?;
+    // Load final accumulator value
+    let acc_final = builder.build_load(acc_type, acc_alloca, "reduce_acc_final").context(BuildLoadSnafu)?;
+
+    // For vector accumulators: perform horizontal reduction to get scalar result
+    let final_val = if is_vector_accumulator {
+        trace!(vec_len, "performing horizontal reduction on vector accumulator");
+        codegen_horizontal_reduce(acc_final, reduce_op, &scalar_dtype, context, module, builder)?
+    } else {
+        acc_final
+    };
+
     Ok(Some(final_val))
 }
 
@@ -1596,8 +1620,10 @@ fn codegen_reduce_op<'ctx>(
     module: &Module<'ctx>,
     builder: &Builder<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>> {
-    let is_float = dtype.is_float();
-    let is_signed = dtype.is_signed();
+    // Use base() to get scalar type for vectors (e.g., Vector<Float32> -> Float32)
+    let base = dtype.base();
+    let is_float = base.is_float();
+    let is_signed = base.is_signed();
 
     match reduce_op {
         ReduceOp::Add => common::build_add(builder, acc, src, is_float),
@@ -1623,4 +1649,89 @@ fn codegen_reduce_op<'ctx>(
             }
         }
     }
+}
+
+// ============================================================================
+// Horizontal Reduction (Post-Loop Vector to Scalar)
+// ============================================================================
+
+/// Perform horizontal reduction on a vector accumulator to produce a scalar.
+///
+/// Used when UPCAST is applied to a reduce axis, creating vectorized accumulators.
+/// After the reduce loop ends, this function chains all vector lanes together
+/// using tree reduction to produce the final scalar result.
+///
+/// Example for 4-element float vector with Add:
+/// ```text
+/// [a, b, c, d] -> (a+b) + (c+d) -> result
+/// ```
+fn codegen_horizontal_reduce<'ctx>(
+    vec_val: BasicValueEnum<'ctx>,
+    reduce_op: ReduceOp,
+    scalar_dtype: &DType,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    builder: &Builder<'ctx>,
+) -> Result<BasicValueEnum<'ctx>> {
+    let vec = vec_val.into_vector_value();
+    let vec_len = vec.get_type().get_size() as usize;
+
+    // Base case: single element - just extract it
+    if vec_len == 1 {
+        let idx = context.i32_type().const_int(0, false);
+        return builder.build_extract_element(vec, idx, "horiz_single").context(VectorExtractSnafu);
+    }
+
+    // Extract all elements
+    let mut elements: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(vec_len);
+    for i in 0..vec_len {
+        let idx = context.i32_type().const_int(i as u64, false);
+        let elem = builder.build_extract_element(vec, idx, &format!("horiz_e{}", i)).context(VectorExtractSnafu)?;
+        elements.push(elem);
+    }
+
+    // Tree reduction: pairwise combine until one element remains
+    let mut level = elements;
+    while level.len() > 1 {
+        let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
+        for chunk in level.chunks(2) {
+            if chunk.len() == 2 {
+                let combined = codegen_reduce_op(reduce_op, chunk[0], chunk[1], scalar_dtype, module, builder)?;
+                next_level.push(combined);
+            } else {
+                // Odd element - carry forward
+                next_level.push(chunk[0]);
+            }
+        }
+        level = next_level;
+    }
+
+    Ok(level[0])
+}
+
+/// Create a vector with all lanes set to the same scalar value (splat/broadcast).
+fn splat_scalar_to_vector<'ctx>(
+    scalar: BasicValueEnum<'ctx>,
+    vec_len: usize,
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+) -> Result<BasicValueEnum<'ctx>> {
+    // Get appropriate vector type based on scalar type
+    let vec_type = if scalar.is_float_value() {
+        scalar.into_float_value().get_type().vec_type(vec_len as u32)
+    } else {
+        scalar.into_int_value().get_type().vec_type(vec_len as u32)
+    };
+
+    // Build the vector by inserting the scalar into each lane
+    let mut vec_val: BasicValueEnum = vec_type.get_poison().into();
+    for i in 0..vec_len {
+        let idx = context.i32_type().const_int(i as u64, false);
+        vec_val = builder
+            .build_insert_element(vec_val.into_vector_value(), scalar, idx, &format!("splat_{}", i))
+            .context(VectorInsertSnafu)?
+            .into();
+    }
+
+    Ok(vec_val)
 }

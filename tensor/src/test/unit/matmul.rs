@@ -182,6 +182,26 @@ fn test_print_matmul_ir() {
     }
 }
 
+#[test]
+#[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_64x64_ir -- --ignored --nocapture
+fn test_print_matmul_64x64_ir() {
+    // Create 64x64 matmul to see K-vectorization IR
+    let a =
+        Tensor::from_slice((0..64 * 64).map(|i| (i as f32) * 0.01).collect::<Vec<_>>()).try_reshape(&[64, 64]).unwrap();
+    let b =
+        Tensor::from_slice((0..64 * 64).map(|i| (i as f32) * 0.01).collect::<Vec<_>>()).try_reshape(&[64, 64]).unwrap();
+    let c = a.matmul(&b).unwrap();
+
+    let plan = c.prepare().expect("prepare should succeed");
+
+    println!("\n=== Generated Kernels (64x64 with K-vectorization) ===\n");
+    for kernel in plan.kernels() {
+        println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
+        println!("{}", kernel.code);
+        println!();
+    }
+}
+
 // ========== Linear Layer Tests ==========
 
 #[test]

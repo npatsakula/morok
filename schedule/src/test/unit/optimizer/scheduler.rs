@@ -693,18 +693,17 @@ fn test_upcast_basic() {
 
 #[test]
 fn test_upcast_invalid_axis_type() {
-    // Create a kernel with Reduce axis (cannot upcast reduce axes)
+    // Create a kernel with OUTER axis (cannot upcast OUTER axes - they are for schedule expansion)
     let end_32 = UOp::index_const(32);
-    let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
+    let r_outer = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Outer);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
-    let sink = UOp::sink(vec![reduce]);
+    let sink = UOp::sink(vec![compute, r_outer]);
 
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    // Try to upcast a Reduce axis (should fail)
+    // Try to upcast an OUTER axis (should fail - OUTER is for schedule expansion)
     let opt = Opt::upcast(0, 4);
     let result = apply_opt(&mut scheduler, &opt, false);
 

@@ -1481,9 +1481,24 @@ fn transform_vectorized_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Horizontal reduction is needed when source is vectorized but result is scalar.
 /// This matches Tinygrad's approach (devectorizer.py:285): `if inp.dtype != out_dtype`.
 fn needs_horizontal_reduce(reduce: &Arc<UOp>) -> bool {
+    use tracing::trace;
+
     if let Op::Reduce { src, .. } = reduce.op() {
-        // Horizontal reduce when source is vectorized but result is scalar (or less vectorized)
-        src.dtype().vcount() > reduce.dtype().vcount()
+        let src_vcount = src.dtype().vcount();
+        let reduce_vcount = reduce.dtype().vcount();
+        let needs_horiz = src_vcount > reduce_vcount;
+
+        trace!(
+            reduce_id = reduce.id,
+            src_vcount,
+            reduce_vcount,
+            needs_horiz,
+            src_dtype = ?src.dtype(),
+            reduce_dtype = ?reduce.dtype(),
+            "needs_horizontal_reduce check"
+        );
+
+        needs_horiz
     } else {
         false
     }

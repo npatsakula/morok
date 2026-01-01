@@ -59,15 +59,22 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
 // ============================================================================
 
 /// Split dimension into smaller range + UPCAST for vector operations.
+///
+/// For REDUCE axes, this creates vectorized accumulators that maintain
+/// vector width through the reduction loop, with horizontal reduction at the end.
+/// This enables efficient matmul register tiling patterns.
 fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     let axis_type = match rng.op() {
         Op::Range { axis_type, .. } => *axis_type,
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
-    // Only GLOBAL/LOCAL/LOOP can be upcasted (Tinygrad design - OUTER is for schedule expansion)
-    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
-        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop axes" }.fail();
+    // GLOBAL/LOCAL/LOOP/REDUCE can be upcasted
+    // - GLOBAL/LOCAL/LOOP: Standard vectorization of output dimensions
+    // - REDUCE: Creates vectorized accumulators for register tiling (e.g., matmul K-dimension)
+    // OUTER is for schedule expansion, not vectorization
+    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop | AxisType::Reduce) {
+        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop/Reduce axes" }.fail();
     }
 
     if amount > scheduler.ren.upcast_max {
