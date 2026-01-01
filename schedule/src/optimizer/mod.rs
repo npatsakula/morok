@@ -133,11 +133,18 @@ pub fn optimize_kernel_with_config(
     // This handles arithmetic expressions created by shift_to UNROLL
     let expanded = crate::expand::pre_expand(&with_loads);
 
+    // Scalar accumulator devectorization: Convert K-vectorized REDUCEs to scalar accumulators.
+    // When UPCAST is applied to reduce axes, REDUCE gets Vector dtype with CONTRACT source.
+    // This converts them to N independent scalar REDUCEs that SLP vectorizer can optimize.
+    // Benefits: FMA fusion, better register allocation, no horizontal reduce overhead.
+    let pm_scalar_acc = crate::rangeify::patterns::pm_scalar_accumulators();
+    let scalar_acc = crate::rewrite::graph_rewrite_bottom_up(&pm_scalar_acc, expanded, &mut ());
+
     // Bool devectorization: Convert <N x i1> ALU ops to scalar ops + VECTORIZE.
     // LLVM's bool vectors are broken (no formal ABI, segfaults in codegen).
     // Based on Tinygrad's no_vectorized_alu approach.
     let pm_devec = crate::rangeify::patterns::pm_bool_devectorize();
-    let devectorized = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, expanded, &mut ());
+    let devectorized = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, scalar_acc, &mut ());
 
     // Horizontal reduce: Convert REDUCE with vectorized source to scalar REDUCE.
     // When UPCAST is on non-reduce axes, REDUCE receives vectorized inputs.

@@ -1525,6 +1525,137 @@ pub fn pm_horizontal_reduce() -> PatternMatcher<()> {
 }
 
 // ============================================================================
+// SCALAR ACCUMULATOR DEVECTORIZATION (K-vectorization → SLP-friendly scalars)
+// ============================================================================
+
+/// Check if REDUCE is K-vectorized (Vector dtype with CONTRACT source).
+///
+/// K-vectorization pattern: UPCAST applied to reduce axis creates:
+/// - REDUCE with Vector output dtype
+/// - CONTRACT-wrapped source documenting upcast axes
+fn is_k_vectorized_reduce(reduce: &Arc<UOp>) -> bool {
+    if let Op::Reduce { src, .. } = reduce.op() {
+        // Check: Vector output dtype AND CONTRACT source
+        let has_vector_dtype = reduce.dtype().vcount() > 1;
+        let has_contract_src = matches!(src.op(), Op::Contract { .. });
+        has_vector_dtype && has_contract_src
+    } else {
+        false
+    }
+}
+
+/// Devectorize K-vectorized REDUCE to N scalar REDUCEs for SLP optimization.
+///
+/// This transforms vectorized accumulators (created by K-vectorization)
+/// into independent scalar accumulators that LLVM's SLP vectorizer can group.
+///
+/// Input:
+///   REDUCE(CONTRACT(vec_src<N>, upcast_axes), ranges, Add, Vector<N>)
+///
+/// Output:
+///   tree_reduce([
+///     REDUCE(GEP(vec_src, 0), ranges, Add, scalar),
+///     REDUCE(GEP(vec_src, 1), ranges, Add, scalar),
+///     ...
+///     REDUCE(GEP(vec_src, N-1), ranges, Add, scalar),
+///   ], Add)
+fn devectorize_to_scalar_accumulators(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
+    use tracing::trace;
+
+    let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
+        return None;
+    };
+
+    let vec_count = reduce.dtype().vcount();
+    if vec_count <= 1 {
+        return None;
+    }
+
+    // Unwrap CONTRACT to get vectorized source
+    let vec_src = if let Op::Contract { src: inner, .. } = src.op() {
+        inner.clone()
+    } else {
+        src.clone()
+    };
+
+    let scalar_dtype = DType::Scalar(reduce.dtype().base());
+
+    trace!(
+        vec_count,
+        reduce_op = ?reduce_op,
+        src_dtype = ?vec_src.dtype(),
+        "devectorizing K-vectorized REDUCE to scalar accumulators"
+    );
+
+    // Create N scalar REDUCEs, each extracting one lane from vectorized source
+    let scalar_reduces: Vec<Arc<UOp>> = (0..vec_count)
+        .map(|i| {
+            let src_elem = UOp::gep(vec_src.clone(), vec![i]);
+            UOp::new(
+                Op::Reduce {
+                    src: src_elem,
+                    ranges: ranges.clone(),
+                    reduce_op: *reduce_op,
+                },
+                scalar_dtype.clone(),
+            )
+        })
+        .collect();
+
+    // Tree reduction: combine scalar REDUCEs with binary ops
+    // ((r0 + r1) + (r2 + r3)) for balanced tree
+    Some(tree_reduce(&scalar_reduces, *reduce_op, &scalar_dtype))
+}
+
+/// Perform tree reduction on elements using binary reduce operations.
+///
+/// Creates balanced tree: ((e0 op e1) op (e2 op e3)) instead of linear chain.
+/// This is more efficient for parallel execution.
+fn tree_reduce(elements: &[Arc<UOp>], reduce_op: ReduceOp, dtype: &DType) -> Arc<UOp> {
+    if elements.len() == 1 {
+        return elements[0].clone();
+    }
+
+    // Pairwise combine for balanced tree
+    let mut level: Vec<Arc<UOp>> = elements.to_vec();
+    while level.len() > 1 {
+        let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
+        for chunk in level.chunks(2) {
+            if chunk.len() == 2 {
+                next_level.push(apply_reduce_binary(reduce_op, chunk[0].clone(), chunk[1].clone(), dtype));
+            } else {
+                next_level.push(chunk[0].clone());
+            }
+        }
+        level = next_level;
+    }
+    level.remove(0)
+}
+
+/// Pattern matcher for devectorizing K-vectorized REDUCEs to scalar accumulators.
+///
+/// When UPCAST is applied to reduce axes (K-vectorization), REDUCE gets Vector
+/// output dtype with CONTRACT source. This pass converts these to N independent
+/// scalar REDUCEs that LLVM's SLP vectorizer can optimize better.
+///
+/// Benefits over explicit vector accumulators:
+/// - SLP vectorizer can emit FMA (fused multiply-add) intrinsics
+/// - Better register allocation (scalar phi nodes group naturally)
+/// - No explicit horizontal reduction overhead
+///
+/// Transforms:
+/// - REDUCE(CONTRACT(src<4>), ranges, Add, Vector<4>)
+/// → ((REDUCE(GEP(src,0), Add) + REDUCE(GEP(src,1), Add)) +
+///    (REDUCE(GEP(src,2), Add) + REDUCE(GEP(src,3), Add)))
+pub fn pm_scalar_accumulators() -> PatternMatcher<()> {
+    crate::patterns! {
+        reduce if is_k_vectorized_reduce(reduce) => {
+            devectorize_to_scalar_accumulators(reduce)
+        },
+    }
+}
+
+// ============================================================================
 // DEPRECATED PATTERNS (for backwards compatibility)
 // ============================================================================
 
