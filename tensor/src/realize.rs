@@ -719,7 +719,7 @@ fn beam_search_optimize(
     device: &Device,
     buffers: &[Buffer],
 ) -> Result<Arc<UOp>> {
-    use morok_schedule::{BeamConfig, Scheduler, beam_search_cached, prepare_scheduler};
+    use morok_schedule::{BeamConfig, Scheduler, apply_post_optimization, beam_search_cached, prepare_scheduler};
 
     let mut config = BeamConfig::from_env();
     config.beam_width = beam_width;
@@ -743,7 +743,11 @@ fn beam_search_optimize(
 
     // Compile-and-time function: compilation is NOT timed, only execution
     let compile_and_time = |s: &Scheduler| -> Option<Duration> {
-        let optimized = s.get_optimized_ast(None);
+        let raw_ast = s.get_optimized_ast(None);
+
+        // Apply post-optimization passes for accurate timing
+        // This includes scalar accumulator devectorization which is critical for performance
+        let optimized = apply_post_optimization(raw_ast);
 
         // Apply decomposition
         let decomposed = match dev_renderer.decompositor() {
@@ -770,7 +774,9 @@ fn beam_search_optimize(
     // Run beam search with caching
     let result = beam_search_cached(scheduler, &config, compile_and_time).context(OptimizeSnafu)?;
 
-    Ok(result.scheduler.get_optimized_ast(None))
+    // Apply post-optimization to final result
+    let raw_ast = result.scheduler.get_optimized_ast(None);
+    Ok(apply_post_optimization(raw_ast))
 }
 
 #[cfg(test)]

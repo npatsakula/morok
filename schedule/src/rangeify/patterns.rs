@@ -1572,11 +1572,7 @@ fn devectorize_to_scalar_accumulators(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     // Unwrap CONTRACT to get vectorized source
-    let vec_src = if let Op::Contract { src: inner, .. } = src.op() {
-        inner.clone()
-    } else {
-        src.clone()
-    };
+    let vec_src = if let Op::Contract { src: inner, .. } = src.op() { inner.clone() } else { src.clone() };
 
     let scalar_dtype = DType::Scalar(reduce.dtype().base());
 
@@ -1591,14 +1587,7 @@ fn devectorize_to_scalar_accumulators(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     let scalar_reduces: Vec<Arc<UOp>> = (0..vec_count)
         .map(|i| {
             let src_elem = UOp::gep(vec_src.clone(), vec![i]);
-            UOp::new(
-                Op::Reduce {
-                    src: src_elem,
-                    ranges: ranges.clone(),
-                    reduce_op: *reduce_op,
-                },
-                scalar_dtype.clone(),
-            )
+            UOp::new(Op::Reduce { src: src_elem, ranges: ranges.clone(), reduce_op: *reduce_op }, scalar_dtype.clone())
         })
         .collect();
 

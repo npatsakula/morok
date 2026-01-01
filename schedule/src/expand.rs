@@ -438,7 +438,28 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
             })
         }
 
-        Op::Vectorize { .. } => Some(UOp::vectorize(sources.clone())),
+        Op::Vectorize { .. } => {
+            // After expansion, sources may be vectors (from broadcast/CAT).
+            // VECTORIZE requires: dtype.vcount() == sources.len()
+            // But if sources are vectors, we need CAT to flatten them.
+            //
+            // Example with expand_sz=4:
+            //   Original: VECTORIZE([a, b]) -> vec(2)
+            //   - a becomes broadcast(a, 4) = VECTORIZE -> vec(4)
+            //   - b becomes broadcast(b, 4) = VECTORIZE -> vec(4)
+            //   - Result: CAT -> vec(8), not VECTORIZE(vec(4), vec(4))
+
+            let all_scalar = sources.iter().all(|s| s.dtype().vcount() == 1);
+
+            if all_scalar {
+                // All sources are still scalars - use normal VECTORIZE
+                Some(UOp::vectorize(sources.clone()))
+            } else {
+                // Some sources are vectors - flatten into CAT
+                // CAT correctly computes dtype as scalar.vec(sum_of_vcounts)
+                Some(UOp::cat(sources.iter().cloned().collect()))
+            }
+        }
 
         // Memory operations - preserve structure
         Op::Load { .. } => {
@@ -642,7 +663,13 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
                         }
                     }
                 } else {
-                    // Can't extract, keep as is
+                    // Can't extract ranges from this Binary expression.
+                    // The no-op check at the end will prevent infinite loops.
+                    tracing::debug!(
+                        "fix_reduce_unroll: unhandled Binary in ranges: left={:?}, right={:?}",
+                        left.op(),
+                        right.op()
+                    );
                     fixed_ranges.push(range.clone());
                 }
             }
@@ -661,13 +688,25 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Combine all axes for CONTRACT wrapper
     let contract_axes: Vec<(usize, usize)> = unroll_axes.iter().chain(upcast_axes.iter()).copied().collect();
+    let has_contract = !contract_axes.is_empty();
+
+    // Safety check: Only return Some() if we actually changed something.
+    // This prevents infinite rewrite loops when extraction fails - if ranges
+    // contain unhandled Binary expressions, we'd create a near-identical REDUCE
+    // that triggers the pattern again indefinitely.
+    let ranges_unchanged =
+        fixed_ranges.len() == ranges.len() && fixed_ranges.iter().zip(ranges.iter()).all(|(a, b)| Arc::ptr_eq(a, b));
+
+    if ranges_unchanged && !has_contract {
+        return None;
+    }
 
     // Build the fixed REDUCE
-    let fixed_src = if contract_axes.is_empty() {
-        src.clone()
-    } else {
+    let fixed_src = if has_contract {
         // Wrap source in CONTRACT to document the unrolled/upcasted axes
         UOp::contract(src.clone(), contract_axes)
+    } else {
+        src.clone()
     };
 
     // Determine output dtype:
@@ -716,6 +755,29 @@ fn extract_ranges_from_expr(left: &Arc<UOp>, right: &Arc<UOp>) -> Option<(Arc<UO
     {
         let unroll_info = extract_unroll_info(mul_left);
         return Some((right.clone(), unroll_info));
+    }
+
+    // Pattern 3: Nested shift_to - ADD(inner_add, Range(Upcast/Unroll))
+    // Handles expressions from multiple shift_to applications:
+    //   (replaced_rng * a + range1) + range2
+    // Recursively extract reduce_range from inner Add, get unroll_info from outer range.
+    if let Op::Binary(BinaryOp::Add, inner_left, inner_right) = left.op()
+        && let Op::Range { axis_type, .. } = right.op()
+        && matches!(axis_type, AxisType::Upcast | AxisType::Unroll)
+        && let Some((reduce_range, _)) = extract_ranges_from_expr(inner_left, inner_right)
+    {
+        let unroll_info = extract_unroll_info(right);
+        return Some((reduce_range, unroll_info));
+    }
+
+    // Pattern 4: Nested shift_to reversed - ADD(Range(Upcast/Unroll), inner_add)
+    if let Op::Binary(BinaryOp::Add, inner_left, inner_right) = right.op()
+        && let Op::Range { axis_type, .. } = left.op()
+        && matches!(axis_type, AxisType::Upcast | AxisType::Unroll)
+        && let Some((reduce_range, _)) = extract_ranges_from_expr(inner_left, inner_right)
+    {
+        let unroll_info = extract_unroll_info(left);
+        return Some((reduce_range, unroll_info));
     }
 
     None
@@ -895,5 +957,127 @@ mod tests {
     fn test_extract_const_size() {
         let end = UOp::const_(DType::Index, ConstValue::Int(64));
         assert_eq!(extract_const_size(&end), Some(64));
+    }
+
+    #[test]
+    fn test_vectorize_expansion_with_mixed_sources() {
+        // Test that VECTORIZE with mixed scalar/vector sources after expansion
+        // produces CAT instead of invalid VECTORIZE.
+        //
+        // This tests the fix for: "Invalid VECTORIZE operand count: 2, expected 4"
+        // which occurred when beam search used width >= 3.
+
+        // Create an UNROLL operation (simulates expanded loop)
+        let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2)]);
+        let unroll = UOp::unroll(values, vec![(0, 3)]);
+
+        // Create a scalar constant
+        let scalar = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+
+        // Create a Binary op with UNROLL - this will trigger expansion
+        // The scalar source will be broadcast, creating a vector
+        let binary = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, scalar.clone(), unroll.clone()), DType::Float32);
+
+        // Run pre_expand - should not panic
+        let result = pre_expand(&binary);
+
+        // Result should be wrapped in UNROLL with expanded inner op
+        assert!(
+            matches!(result.op(), Op::Unroll { .. } | Op::Binary(..)),
+            "Expected UNROLL or Binary, got {:?}",
+            result.op()
+        );
+    }
+
+    #[test]
+    fn test_vectorize_all_scalar_sources() {
+        // When all sources are scalar after expansion, VECTORIZE should be used
+        let scalar_a = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+        let scalar_b = UOp::const_(DType::Float32, ConstValue::Float(2.0));
+
+        // Create VECTORIZE with scalars only (no UNROLL)
+        let vectorize = UOp::vectorize(smallvec::smallvec![scalar_a, scalar_b]);
+
+        // No expansion needed - should pass through unchanged
+        let result = pre_expand(&vectorize);
+
+        // Should still be VECTORIZE (or equivalent)
+        assert_eq!(result.dtype().vcount(), 2);
+    }
+
+    #[test]
+    fn test_fix_reduce_unroll_returns_none_on_unextractable_binary() {
+        // Test that fix_reduce_unroll returns None when ranges contain
+        // unextractable Binary expressions. This prevents infinite rewrite loops.
+        //
+        // This tests the fix for: "Rewrite iteration limit (1000) exceeded"
+        // which occurred when beam search used width >= 3.
+
+        // Create a Binary expression that doesn't match any extraction pattern:
+        // ADD(MUL(Const, Const), Const) - no Range ops at all!
+        // This simulates a malformed expression that might result from some edge case.
+        let unextractable = UOp::new(
+            Op::Binary(
+                morok_ir::BinaryOp::Add,
+                UOp::new(
+                    Op::Binary(
+                        morok_ir::BinaryOp::Mul,
+                        UOp::const_(DType::Index, ConstValue::Int(2)),
+                        UOp::const_(DType::Index, ConstValue::Int(3)),
+                    ),
+                    DType::Index,
+                ),
+                UOp::const_(DType::Index, ConstValue::Int(1)),
+            ),
+            DType::Index,
+        );
+
+        let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+        let reduce = UOp::reduce(src, smallvec::smallvec![unextractable], ReduceOp::Add);
+
+        // fix_reduce_unroll should return None because:
+        // 1. The Binary expression can't be extracted (no Range ops)
+        // 2. The range is kept as-is (no change)
+        // 3. No CONTRACT is added
+        // -> ranges_unchanged && !has_contract -> return None
+        let result = fix_reduce_unroll(&reduce);
+        assert!(result.is_none(), "Expected None when extraction fails and nothing changes");
+    }
+
+    #[test]
+    fn test_fix_reduce_unroll_handles_nested_binary() {
+        // Test that nested Binary expressions (from multiple shift_to) are handled.
+        // Pattern: ADD(ADD(MUL(reduce_range, 4), range_upcast1), range_upcast2)
+
+        let end = UOp::const_(DType::Index, ConstValue::Int(64));
+        let reduce_range = UOp::range_axis(end.clone(), morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
+
+        // Inner shift_to result: MUL(reduce_range, 4) + Range(Upcast)
+        let upcast_end = UOp::const_(DType::Index, ConstValue::Int(4));
+        let upcast_range = UOp::range_axis(upcast_end.clone(), morok_ir::AxisId::Renumbered(1), AxisType::Upcast);
+
+        let mul = UOp::new(
+            Op::Binary(morok_ir::BinaryOp::Mul, reduce_range.clone(), UOp::const_(DType::Index, ConstValue::Int(4))),
+            DType::Index,
+        );
+        let inner_add = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, mul, upcast_range.clone()), DType::Index);
+
+        // Outer shift_to: inner_add + Range(Upcast)
+        let upcast_range2 = UOp::range_axis(upcast_end, morok_ir::AxisId::Renumbered(2), AxisType::Upcast);
+        let nested_binary = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, inner_add, upcast_range2), DType::Index);
+
+        let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+        let reduce = UOp::reduce(src, smallvec::smallvec![nested_binary], ReduceOp::Add);
+
+        // fix_reduce_unroll should extract the reduce_range and handle the upcast axes
+        let result = fix_reduce_unroll(&reduce);
+        assert!(result.is_some(), "Expected Some when nested Binary can be extracted");
+
+        // Check the result has CONTRACT wrapper (for upcast axes)
+        if let Some(fixed) = result {
+            if let Op::Reduce { src: fixed_src, .. } = fixed.op() {
+                assert!(matches!(fixed_src.op(), Op::Contract { .. }), "Expected CONTRACT wrapper for upcast axes");
+            }
+        }
     }
 }

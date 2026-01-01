@@ -98,36 +98,25 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
     optimize_kernel_with_config(ast, renderer, &OptimizerConfig::from_env())
 }
 
-/// Apply optimizations with explicit configuration.
+/// Apply post-optimization passes to kernel AST.
 ///
-/// Use this when you need explicit control over the optimization settings.
+/// These passes run AFTER heuristic/beam optimization and BEFORE codegen:
+/// - pm_add_loads: Extract LOAD ops from INDEX
+/// - pre_expand: Convert Range(Unroll/Upcast) → UNROLL, expand operations
+/// - pm_scalar_accumulators: Convert K-vectorized REDUCEs to scalar accumulators
+/// - pm_bool_devectorize: Convert <N x i1> to scalar ops
+/// - pm_horizontal_reduce: Handle vectorized REDUCE sources
+/// - post_expand_patterns: Linearize INDEX ops
 ///
-/// Note: For beam search strategy, this falls back to heuristics because
-/// beam search requires a `compile_and_time` function from the runtime.
-/// Use `optimize_kernel_beam()` for actual beam search optimization.
-pub fn optimize_kernel_with_config(
-    ast: Arc<morok_ir::UOp>,
-    renderer: &Renderer,
-    config: &OptimizerConfig,
-) -> Arc<morok_ir::UOp> {
-    let optimized = match config.strategy {
-        OptStrategy::None => return ast, // No optimization = no pre_expand needed
-        OptStrategy::Heuristic => optimize_heuristic(ast, renderer, &config.heuristics),
-        OptStrategy::Beam { .. } => {
-            // Beam search requires a compile_and_time function.
-            // Use optimize_kernel_beam() for actual beam search.
-            // Fall back to heuristics for the simple API.
-            optimize_heuristic(ast, renderer, &config.heuristics)
-        }
-    };
-
+/// Called by both heuristic and beam search paths for consistent behavior.
+pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
     // NOTE: Must run BEFORE pre_expand so that INDEX ops are still visible
     // (after expand, INDEX is wrapped in UNROLL and patterns won't match).
     let pm_loads = crate::rangeify::patterns::pm_add_loads();
-    let with_loads = crate::rewrite::graph_rewrite_bottom_up(&pm_loads, optimized, &mut ());
+    let with_loads = crate::rewrite::graph_rewrite_bottom_up(&pm_loads, ast, &mut ());
 
     // Post-optimization: Fix UNROLL substitutions in REDUCE ops
     // This handles arithmetic expressions created by shift_to UNROLL
@@ -158,6 +147,32 @@ pub fn optimize_kernel_with_config(
     // If linearized before expand, Range ops inside Binary get vectorized incorrectly.
     let post_expand_matcher = crate::rangeify::post_expand_patterns();
     crate::rewrite::graph_rewrite_bottom_up(&post_expand_matcher, hreduced, &mut ())
+}
+
+/// Apply optimizations with explicit configuration.
+///
+/// Use this when you need explicit control over the optimization settings.
+///
+/// Note: For beam search strategy, this falls back to heuristics because
+/// beam search requires a `compile_and_time` function from the runtime.
+/// Use `optimize_kernel_beam()` for actual beam search optimization.
+pub fn optimize_kernel_with_config(
+    ast: Arc<morok_ir::UOp>,
+    renderer: &Renderer,
+    config: &OptimizerConfig,
+) -> Arc<morok_ir::UOp> {
+    let optimized = match config.strategy {
+        OptStrategy::None => return ast, // No optimization = no pre_expand needed
+        OptStrategy::Heuristic => optimize_heuristic(ast, renderer, &config.heuristics),
+        OptStrategy::Beam { .. } => {
+            // Beam search requires a compile_and_time function.
+            // Use optimize_kernel_beam() for actual beam search.
+            // Fall back to heuristics for the simple API.
+            optimize_heuristic(ast, renderer, &config.heuristics)
+        }
+    };
+
+    apply_post_optimization(optimized)
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).
@@ -249,7 +264,10 @@ where
 pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Scheduler {
     let simplified = graph_rewrite(&symbolic(), ast, &mut ());
     let mut scheduler = Scheduler::new(simplified, renderer.clone());
-    let _ = scheduler.convert_loop_to_global();
+    let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
+    // Note: Don't call convert_outer_to_loop() here - it expands beam search's
+    // action space significantly (more upcastable axes), hurting performance.
+    // Heuristics already call it in optimize_heuristic().
     scheduler
 }
 
