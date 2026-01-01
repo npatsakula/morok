@@ -32,26 +32,22 @@ pub fn codegen_uop<'ctx>(
     builder: &Builder<'ctx>,
     values: &mut ValueMap<'ctx>,
 ) -> Result<Option<BasicValueEnum<'ctx>>> {
-    // Check if already generated
+    // Range(Reduce) uses axis_id as the canonical identifier, not UOp ID.
+    // This is because graph_rewrite may create new Range nodes with different UOp IDs
+    // but the same axis_id. See: ir/src/uop/hash_consing.rs for why this happens.
+    // codegen_reduce creates the loop structure and inserts by axis_id.
+    if let Op::Range { axis_type: AxisType::Reduce, axis_id, .. } = uop.op() {
+        if let Some(val) = values.get_range_by_axis(axis_id.value()) {
+            return Ok(Some(val));
+        }
+        // Not yet generated - codegen_reduce will create it when processing REDUCE op
+        return Ok(None);
+    }
+
+    // Check if already generated (for non-Range ops)
     if values.contains(uop.id) {
         trace!(uop_id = uop.id, op = ?std::mem::discriminant(uop.op()), "codegen_uop: cache hit");
         return Ok(values.get(uop.id));
-    }
-
-    // REDUCE ranges must ONLY be handled by codegen_reduce which creates their loop structure.
-    // Don't process or cache them here - codegen_reduce will insert them into values when ready.
-    // This prevents LLVM dominator errors where range counters are used before defined.
-    //
-    // FALLBACK: After graph_rewrite in pre_expand, Range nodes may have different UOp IDs
-    // even though they're semantically equivalent (same axis_id). Try axis-based lookup first.
-    if let Op::Range { axis_type: AxisType::Reduce, axis_id, .. } = uop.op() {
-        // Try fallback: look for cached Range(Reduce) with same axis_id
-        if let Some(val) = values.get_reduce_by_axis(axis_id.value()) {
-            // Cache by this ID for future lookups
-            values.insert(uop.id, val);
-            return Ok(Some(val));
-        }
-        return Ok(None);
     }
 
     let category = classify_op(uop.op());
@@ -1235,8 +1231,8 @@ fn codegen_reduce<'ctx>(
         // Check for size-1 loop - no loop needed, just use 0
         if is_const_one(end) {
             let zero = context.i64_type().const_int(0, false);
-            // Use insert_reduce_range to allow axis-based fallback lookup
-            values.insert_reduce_range(range_uop.id, axis_id.value(), zero.into());
+            // Insert by axis_id (the canonical key for Range nodes)
+            values.insert_range(axis_id.value(), zero.into());
             // Don't push to loop_ctxs - no loop to close
             continue;
         }
@@ -1247,8 +1243,8 @@ fn codegen_reduce<'ctx>(
         let loop_id = reduce_id + i as u64;
         let (loop_ctx, counter_val) = loop_gen::build_loop(context, builder, function, end_int, loop_id)?;
 
-        // Use insert_reduce_range to allow axis-based fallback lookup
-        values.insert_reduce_range(range_uop.id, axis_id.value(), counter_val.into());
+        // Insert by axis_id (the canonical key for Range nodes)
+        values.insert_range(axis_id.value(), counter_val.into());
         loop_ctxs.push(loop_ctx);
     }
 

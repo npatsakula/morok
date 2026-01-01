@@ -38,15 +38,14 @@ pub struct LoopContext<'ctx> {
 /// This allows us to look up previously generated values when processing the graph.
 /// Also tracks loop contexts for RANGE/END pairs, and "processed but no value" UOps.
 ///
-/// ## Reduce Axis Tracking
+/// ## Range Lookup by axis_id
 ///
-/// After graph_rewrite in pre_expand, Range nodes may have different UOp IDs even
-/// though they're semantically equivalent (same axis_id). This causes lookup failures
-/// when codegen_reduce inserts a value for Range_A but the source expression contains
-/// Range_B with the same axis_id but different ID.
+/// Range(Reduce) nodes use `axis_id` as the canonical identifier, not UOp ID.
+/// This is because graph_rewrite may create new Range nodes with different UOp IDs
+/// but the same axis_id (when children change, the parent is reconstructed).
+/// See `ir/src/uop/hash_consing.rs` for details on why this happens.
 ///
-/// The `reduce_axis_values` map provides a fallback: when a Range(Reduce) lookup
-/// fails by UOp ID, we can look up by axis_id instead.
+/// The `range_axis_values` map indexes Range values by axis_id for correct lookup.
 pub struct ValueMap<'ctx> {
     uop_to_value: HashMap<u64, BasicValueEnum<'ctx>>,
     loop_contexts: HashMap<u64, LoopContext<'ctx>>,
@@ -55,9 +54,9 @@ pub struct ValueMap<'ctx> {
     /// UOps that were processed but don't produce a value (like END, SINK).
     /// This prevents re-processing when they're encountered again.
     processed_no_value: std::collections::HashSet<u64>,
-    /// Reduce range values indexed by axis_id (fallback for ID mismatches).
-    /// When graph_rewrite creates new Range nodes, their IDs change but axis_id stays the same.
-    reduce_axis_values: HashMap<usize, BasicValueEnum<'ctx>>,
+    /// Range values indexed by axis_id (canonical key for Range nodes).
+    /// UOp ID is not reliable because graph_rewrite can change it.
+    range_axis_values: HashMap<usize, BasicValueEnum<'ctx>>,
 }
 
 impl<'ctx> ValueMap<'ctx> {
@@ -67,7 +66,7 @@ impl<'ctx> ValueMap<'ctx> {
             loop_contexts: HashMap::new(),
             loop_order: Vec::new(),
             processed_no_value: std::collections::HashSet::new(),
-            reduce_axis_values: HashMap::new(),
+            range_axis_values: HashMap::new(),
         }
     }
 
@@ -81,22 +80,19 @@ impl<'ctx> ValueMap<'ctx> {
         self.uop_to_value.get(&uop_id).copied()
     }
 
-    /// Store a reduce range value with axis tracking.
+    /// Store a Range value by axis_id (the canonical identifier for Range nodes).
     ///
-    /// This inserts the value both by UOp ID and by axis_id, allowing
-    /// fallback lookups when graph_rewrite creates Range nodes with different IDs.
-    pub fn insert_reduce_range(&mut self, uop_id: u64, axis_id: usize, value: BasicValueEnum<'ctx>) {
-        self.uop_to_value.insert(uop_id, value);
-        self.reduce_axis_values.insert(axis_id, value);
+    /// Range(Reduce) nodes are indexed by axis_id, not UOp ID, because graph_rewrite
+    /// may create new Range nodes with different IDs but the same axis_id.
+    pub fn insert_range(&mut self, axis_id: usize, value: BasicValueEnum<'ctx>) {
+        self.range_axis_values.insert(axis_id, value);
     }
 
-    /// Look up a reduce range value by axis_id (fallback for ID mismatches).
+    /// Look up a Range value by axis_id (the canonical identifier).
     ///
-    /// After graph_rewrite, Range nodes may have different UOp IDs even though
-    /// they represent the same axis. This method allows codegen_uop to find the
-    /// value when the ID-based lookup fails.
-    pub fn get_reduce_by_axis(&self, axis_id: usize) -> Option<BasicValueEnum<'ctx>> {
-        self.reduce_axis_values.get(&axis_id).copied()
+    /// This is the primary lookup method for Range(Reduce) nodes.
+    pub fn get_range_by_axis(&self, axis_id: usize) -> Option<BasicValueEnum<'ctx>> {
+        self.range_axis_values.get(&axis_id).copied()
     }
 
     /// Check if a UOp has been compiled (either has value or was processed with no value).
