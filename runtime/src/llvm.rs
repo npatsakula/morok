@@ -7,6 +7,8 @@ use inkwell::OptimizationLevel;
 use inkwell::context::Context;
 use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
+use inkwell::passes::PassBuilderOptions;
+use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
 use tracing::{debug, instrument, trace};
 
 /// LLVM JIT-compiled kernel with proper context ownership.
@@ -70,14 +72,52 @@ impl LlvmKernel {
             return Err(crate::Error::JitCompilation { reason: format!("Module verification failed: {}", err) });
         }
 
-        // Dump LLVM IR at trace level
+        // Dump LLVM IR at trace level (before optimization)
         trace!(
             kernel.name = %name,
             llvm.ir = %module.print_to_string().to_string(),
-            "LLVM IR compiled"
+            "LLVM IR before optimization"
         );
 
-        // Create execution engine with optimization
+        // Initialize native target for optimization passes
+        Target::initialize_native(&InitializationConfig::default()).map_err(|e| crate::Error::JitCompilation {
+            reason: format!("Failed to initialize native target: {}", e),
+        })?;
+
+        // Create target machine for native CPU with aggressive optimization
+        let triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&triple)
+            .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to get target: {}", e) })?;
+        let target_machine = target
+            .create_target_machine(
+                &triple,
+                TargetMachine::get_host_cpu_name().to_str().unwrap_or("generic"),
+                TargetMachine::get_host_cpu_features().to_str().unwrap_or(""),
+                OptimizationLevel::Aggressive,
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .ok_or_else(|| crate::Error::JitCompilation { reason: "Failed to create target machine".to_string() })?;
+
+        // Configure pass options with explicit vectorization (like Tinygrad)
+        let pass_options = PassBuilderOptions::create();
+        pass_options.set_loop_vectorization(true);
+        pass_options.set_loop_slp_vectorization(true);
+        pass_options.set_loop_unrolling(true);
+
+        // Run optimization passes using the new PassBuilder API
+        module.run_passes("default<O3>", &target_machine, pass_options).map_err(|e| crate::Error::JitCompilation {
+            reason: format!("Failed to run optimization passes: {}", e),
+        })?;
+
+        // Dump optimized IR at debug level
+        debug!(
+            kernel.name = %name,
+            llvm.ir = %module.print_to_string().to_string(),
+            "LLVM IR after optimization"
+        );
+
+        // Create execution engine with Aggressive - the JIT engine may need to do its own codegen
         let execution_engine = module.create_jit_execution_engine(OptimizationLevel::Aggressive).map_err(|e| {
             crate::Error::JitCompilation { reason: format!("Failed to create execution engine: {}", e) }
         })?;
