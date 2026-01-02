@@ -27,9 +27,14 @@ use crate::optimizer::{Opt, Scheduler, apply_opt};
 /// 8. Local dims (GPU workgroup)
 /// 9. Threading (CPU parallel)
 pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsConfig) {
+    use tracing::debug;
+
+    debug!("hand_coded_optimizations: starting");
+
     // 1. Tensor cores (skip other opts if applied)
     if try_tensor_cores(scheduler, config) {
         apply_local_dims(scheduler, config);
+        debug!("hand_coded_optimizations: tensor cores applied, skipping remaining opts");
         return;
     }
 
@@ -60,7 +65,9 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     apply_local_dims(scheduler, config);
 
     // 9. Threading
-    apply_threading(scheduler);
+    debug!("hand_coded_optimizations: calling apply_threading with max_threads={}", config.thread_count);
+    let threading_applied = apply_threading(scheduler, config.thread_count);
+    debug!(threading_applied, "hand_coded_optimizations: apply_threading completed");
 }
 
 // ============================================================================
@@ -380,27 +387,48 @@ pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler) -> bool {
     false
 }
 
-/// CPU threading for outer global axes.
-pub fn apply_threading(scheduler: &mut Scheduler) -> bool {
-    if !scheduler.renderer().has_threads {
-        return false;
-    }
-    let global_axes = scheduler.axes_of(&[AxisType::Global]);
-    if global_axes.is_empty() {
+/// CPU threading for outer parallelizable axes.
+///
+/// Finds the outermost threadable axis and applies THREAD optimization.
+/// Threadable axes: Outer (reduce kernels), Loop, Global (elementwise kernels).
+///
+/// # Arguments
+///
+/// * `scheduler` - The scheduler to apply threading to
+/// * `max_threads` - Maximum thread count (from config.thread_count)
+///
+/// Note: Reduce kernels keep Outer axes (convert_outer_to_loop skips them),
+/// so we must check Outer in addition to Loop/Global.
+pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
+    if !scheduler.renderer().has_threads || max_threads <= 1 {
         return false;
     }
 
-    let axis_idx = global_axes[0];
+    // Threadable axes: Outer (reduce kernels), Loop/Global (elementwise)
+    // Reduce kernels keep Outer axes because convert_outer_to_loop() skips them
+    let threadable_axes = scheduler.axes_of(&[AxisType::Outer, AxisType::Loop, AxisType::Global]);
+    if threadable_axes.is_empty() {
+        return false;
+    }
+
+    // Apply to first (outermost) threadable axis
+    let axis_idx = threadable_axes[0];
     let rngs = scheduler.rngs();
     if axis_idx >= rngs.len() {
         return false;
     }
+
     let rng = &rngs[axis_idx];
     if let Op::Range { end, .. } = rng.op()
         && let Op::Const(cv) = end.op()
         && let morok_ir::ConstValue::Int(size) = cv.0
     {
-        let thread_count = (size as usize).min(8);
+        let size = size as usize;
+
+        // Find largest divisor of size that is <= max_threads
+        // This ensures even division (THREAD opt requires it)
+        let thread_count = (2..=max_threads).rev().find(|&t| size % t == 0).unwrap_or(1);
+
         if thread_count > 1 && apply_opt(scheduler, &Opt::thread(axis_idx, thread_count), true).is_ok() {
             return true;
         }

@@ -127,93 +127,13 @@ impl CraneliftKernel {
     /// - Buffer count matches expected parameters
     /// - Variable values are valid
     pub unsafe fn execute(&self, buffers: &[*mut u8], vars: &HashMap<String, i64>) -> Result<()> {
-        // The bootstrap function takes (ptr args_array, i64 var0, i64 var1, ...)
         // Build variable values in correct order
-        let mut var_values: Vec<i64> = Vec::with_capacity(self.var_names.len());
-        for name in &self.var_names {
-            let val = vars.get(name).copied().unwrap_or(0);
-            var_values.push(val);
-        }
+        let var_values: Vec<i64> = self.var_names.iter().map(|name| vars.get(name).copied().unwrap_or(0)).collect();
 
-        // Call the bootstrap function based on variable count
-        // The function signature is: fn(args_ptr: *const *mut u8, var0: i64, var1: i64, ...)
-        let args_ptr = buffers.as_ptr();
-
-        match self.var_names.len() {
-            0 => {
-                let func: extern "C" fn(*const *mut u8) = unsafe { std::mem::transmute(self.func_ptr) };
-                func(args_ptr);
-            }
-            1 => {
-                let func: extern "C" fn(*const *mut u8, i64) = unsafe { std::mem::transmute(self.func_ptr) };
-                func(args_ptr, var_values[0]);
-            }
-            2 => {
-                let func: extern "C" fn(*const *mut u8, i64, i64) = unsafe { std::mem::transmute(self.func_ptr) };
-                func(args_ptr, var_values[0], var_values[1]);
-            }
-            3 => {
-                let func: extern "C" fn(*const *mut u8, i64, i64, i64) = unsafe { std::mem::transmute(self.func_ptr) };
-                func(args_ptr, var_values[0], var_values[1], var_values[2]);
-            }
-            4 => {
-                let func: extern "C" fn(*const *mut u8, i64, i64, i64, i64) =
-                    unsafe { std::mem::transmute(self.func_ptr) };
-                func(args_ptr, var_values[0], var_values[1], var_values[2], var_values[3]);
-            }
-            5 => {
-                let func: extern "C" fn(*const *mut u8, i64, i64, i64, i64, i64) =
-                    unsafe { std::mem::transmute(self.func_ptr) };
-                func(args_ptr, var_values[0], var_values[1], var_values[2], var_values[3], var_values[4]);
-            }
-            6 => {
-                let func: extern "C" fn(*const *mut u8, i64, i64, i64, i64, i64, i64) =
-                    unsafe { std::mem::transmute(self.func_ptr) };
-                func(
-                    args_ptr,
-                    var_values[0],
-                    var_values[1],
-                    var_values[2],
-                    var_values[3],
-                    var_values[4],
-                    var_values[5],
-                );
-            }
-            7 => {
-                let func: extern "C" fn(*const *mut u8, i64, i64, i64, i64, i64, i64, i64) =
-                    unsafe { std::mem::transmute(self.func_ptr) };
-                func(
-                    args_ptr,
-                    var_values[0],
-                    var_values[1],
-                    var_values[2],
-                    var_values[3],
-                    var_values[4],
-                    var_values[5],
-                    var_values[6],
-                );
-            }
-            8 => {
-                let func: extern "C" fn(*const *mut u8, i64, i64, i64, i64, i64, i64, i64, i64) =
-                    unsafe { std::mem::transmute(self.func_ptr) };
-                func(
-                    args_ptr,
-                    var_values[0],
-                    var_values[1],
-                    var_values[2],
-                    var_values[3],
-                    var_values[4],
-                    var_values[5],
-                    var_values[6],
-                    var_values[7],
-                );
-            }
-            _ => {
-                return Err(crate::Error::JitCompilation {
-                    reason: format!("Unsupported number of variables: {}. Max supported is 8.", self.var_names.len()),
-                });
-            }
-        }
+        // Single function type: kernel(ptr* args, i64* vars)
+        type KernelFn = extern "C" fn(*const *mut u8, *const i64);
+        let func: KernelFn = unsafe { std::mem::transmute(self.func_ptr) };
+        func(buffers.as_ptr(), var_values.as_ptr());
 
         Ok(())
     }
@@ -224,14 +144,17 @@ impl CraneliftKernel {
     }
 }
 
-/// Build the bootstrap function that loads buffer pointers and calls kernel_impl.
+/// Build the bootstrap function that loads buffer pointers and variables, then calls kernel_impl.
 ///
 /// The bootstrap function signature is:
-///   fn kernel(args_ptr: i64, var0: i64, var1: i64, ...) -> ()
+///   fn kernel(args_ptr: i64, vars_ptr: i64) -> ()
 ///
 /// It performs:
 ///   buf0 = load(args_ptr[0])
 ///   buf1 = load(args_ptr[1])
+///   ...
+///   var0 = load(vars_ptr[0])
+///   var1 = load(vars_ptr[1])
 ///   ...
 ///   call kernel_impl(buf0, buf1, ..., var0, var1, ...)
 fn build_bootstrap_function(
@@ -242,17 +165,15 @@ fn build_bootstrap_function(
     buffer_count: usize,
     var_names: &[String],
 ) -> Result<FuncId> {
-    // Build bootstrap signature: (i64 args_ptr, i64 var0, i64 var1, ...)
+    // Build bootstrap signature: (i64 args_ptr, i64 vars_ptr)
     let mut bootstrap_sig = module.make_signature();
     bootstrap_sig.call_conv = CallConv::SystemV;
 
     // First param: args_ptr (pointer to array of buffer pointers)
     bootstrap_sig.params.push(AbiParam::new(types::I64));
 
-    // Variable parameters
-    for _ in var_names {
-        bootstrap_sig.params.push(AbiParam::new(types::I64));
-    }
+    // Second param: vars_ptr (pointer to array of i64 variable values)
+    bootstrap_sig.params.push(AbiParam::new(types::I64));
 
     // Declare bootstrap function
     let bootstrap_func_id = module
@@ -272,9 +193,9 @@ fn build_bootstrap_function(
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
 
-        // Get parameter values
+        // Get parameter values: (args_ptr, vars_ptr)
         let args_ptr = builder.block_params(entry_block)[0];
-        let var_values: Vec<_> = (0..var_names.len()).map(|i| builder.block_params(entry_block)[i + 1]).collect();
+        let vars_ptr = builder.block_params(entry_block)[1];
 
         // Load buffer pointers from args array
         let mut buf_values = Vec::with_capacity(buffer_count);
@@ -282,6 +203,14 @@ fn build_bootstrap_function(
             let offset = (i * 8) as i32; // 8 bytes per pointer
             let buf_ptr = builder.ins().load(types::I64, MemFlags::trusted(), args_ptr, offset);
             buf_values.push(buf_ptr);
+        }
+
+        // Load variable values from vars array
+        let mut var_values = Vec::with_capacity(var_names.len());
+        for i in 0..var_names.len() {
+            let offset = (i * 8) as i32; // 8 bytes per i64
+            let var_val = builder.ins().load(types::I64, MemFlags::trusted(), vars_ptr, offset);
+            var_values.push(var_val);
         }
 
         // Declare the impl function for calling

@@ -13,6 +13,7 @@ use tracing::{debug, trace};
 
 use morok_ir::{Op, UOp};
 
+use crate::common::collect_buffers_and_vars;
 use crate::llvm::error::*;
 use crate::llvm::helpers::ValueMap;
 use crate::{RenderedKernel, Renderer};
@@ -38,67 +39,129 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
     }
 
     /// Render a UOp graph into LLVM IR module.
-    fn render_to_module(&self, uop: &Arc<UOp>, name: &str) -> Result<Module<'ctx>> {
+    ///
+    /// Returns `(module, var_names, thread_count)` where:
+    /// - var_names: variable names in order (including thread_id if threading)
+    /// - thread_count > 1 indicates a threaded kernel
+    fn render_to_module(&self, uop: &Arc<UOp>, name: &str) -> Result<(Module<'ctx>, Vec<String>, usize)> {
         let module = self.context.create_module(name);
         let builder = self.context.create_builder();
 
         // Collect all buffers and variables from the graph
         let (buffers, variables) = collect_buffers_and_vars(uop);
 
-        debug!(num_buffers = buffers.len(), num_variables = variables.len(), "Collected kernel parameters");
+        // Detect Thread ranges - these become dispatch dimensions, not loops
+        // Thread ranges use thread_id parameter instead of creating loops
+        let nodes = uop.toposort();
+        let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
+            if let Op::Range { axis_type: morok_ir::AxisType::Thread, end, .. } = n.op() {
+                if let Op::Const(cv) = end.op() {
+                    if let morok_ir::ConstValue::Int(count) = cv.0 {
+                        return Some((n.clone(), count as usize));
+                    }
+                }
+            }
+            None
+        });
 
-        // Create kernel function signature: void kernel(ptr %buf0, ..., i64 %var0, ...)
+        let has_threading = thread_info.is_some();
+        let thread_count = thread_info.as_ref().map(|(_, c)| *c).unwrap_or(1);
+
+        // Calculate total vars count (variables + thread_id if threading)
+        let vars_count = variables.len() + if has_threading { 1 } else { 0 };
+
+        debug!(
+            num_buffers = buffers.len(),
+            num_variables = variables.len(),
+            has_threading,
+            vars_count,
+            "Collected kernel parameters"
+        );
+
+        // Create kernel function signature: void kernel(ptr %args, ptr %vars)
+        // - args: pointer to array of buffer pointers
+        // - vars: pointer to array of i64 values (variables + optional thread_id)
         let ptr_type = self.context.ptr_type(inkwell::AddressSpace::default());
         let i64_type = self.context.i64_type();
 
-        let mut param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
-
-        // Add buffer pointer parameters
-        for _ in &buffers {
-            param_types.push(ptr_type.into());
-        }
-
-        // Add variable i64 parameters
-        for _ in &variables {
-            param_types.push(i64_type.into());
-        }
+        let param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![ptr_type.into(), ptr_type.into()];
 
         let fn_type = self.context.void_type().fn_type(&param_types, false);
-        let kernel_name = format!("{}_impl", name);
-        let kernel_function = module.add_function(&kernel_name, fn_type, None);
+        let kernel_function = module.add_function(name, fn_type, None);
 
-        // Add LLVM attributes to buffer parameters only
-        add_buffer_param_attributes(kernel_function, buffers.len() as u32, self.context);
+        // Add function attributes
         add_kernel_function_attributes(kernel_function, self.context);
 
         // Create entry block for kernel
         let entry_block = self.context.append_basic_block(kernel_function, "entry");
         builder.position_at_end(entry_block);
 
-        // Create ValueMap and populate with buffer and variable parameters
+        // Get args and vars array pointers
+        let args_param = kernel_function
+            .get_nth_param(0)
+            .context(InvalidFunctionParameterSnafu { index: 0u32 })?
+            .into_pointer_value();
+        args_param.set_name("args");
+
+        let vars_param = kernel_function
+            .get_nth_param(1)
+            .context(InvalidFunctionParameterSnafu { index: 1u32 })?
+            .into_pointer_value();
+        vars_param.set_name("vars");
+
+        // Create ValueMap and populate with loaded buffer and variable values
         let mut values = ValueMap::new();
 
-        // Add buffer parameters
+        // Load buffer pointers from args array
         for (i, buffer_uop) in buffers.iter().enumerate() {
-            let param =
-                kernel_function.get_nth_param(i as u32).context(InvalidFunctionParameterSnafu { index: i as u32 })?;
-            param.set_name(&format!("buf{}", i));
-            values.insert(buffer_uop.id, param);
+            let index = i64_type.const_int(i as u64, false);
+            let ptr_to_ptr = unsafe {
+                builder.build_gep(ptr_type, args_param, &[index], &format!("buf{}_ptr", i)).context(BuildGepSnafu)?
+            };
+            let buffer_ptr = builder.build_load(ptr_type, ptr_to_ptr, &format!("buf{}", i)).context(BuildLoadSnafu)?;
+
+            // Add noalias metadata via assume (buffer pointers don't alias)
+            values.insert(buffer_uop.id, buffer_ptr);
         }
 
-        // Add variable parameters (DefineVar nodes become i64 kernel parameters)
+        // Load variable values from vars array
         for (i, var_uop) in variables.iter().enumerate() {
-            let param_idx = (buffers.len() + i) as u32;
-            let param =
-                kernel_function.get_nth_param(param_idx).context(InvalidFunctionParameterSnafu { index: param_idx })?;
-            if let Op::DefineVar { name, .. } = var_uop.op() {
-                param.set_name(name);
-            }
-            values.insert(var_uop.id, param);
+            let index = i64_type.const_int(i as u64, false);
+            let var_ptr = unsafe {
+                builder.build_gep(i64_type, vars_param, &[index], &format!("var{}_ptr", i)).context(BuildGepSnafu)?
+            };
+            let var_name = if let Op::DefineVar { name, .. } = var_uop.op() { name.as_str() } else { "var" };
+            let var_val = builder.build_load(i64_type, var_ptr, var_name).context(BuildLoadSnafu)?;
+            values.insert(var_uop.id, var_val);
         }
 
-        // Walk the UOp graph in topological order
-        let nodes = uop.toposort();
+        // Load thread_id from vars array if threading is used
+        // thread_id is at position variables.len() in the vars array
+        if let Some((thread_range, _)) = &thread_info {
+            let index = i64_type.const_int(variables.len() as u64, false);
+            let thread_id_ptr =
+                unsafe { builder.build_gep(i64_type, vars_param, &[index], "thread_id_ptr").context(BuildGepSnafu)? };
+            let thread_id_val = builder.build_load(i64_type, thread_id_ptr, "thread_id").context(BuildLoadSnafu)?;
+
+            // Store thread_id for Thread range lookup by axis_id
+            if let Op::Range { axis_id, .. } = thread_range.op() {
+                values.insert_range(axis_id.value(), thread_id_val);
+            }
+            // Also store by UOp ID for direct lookups
+            values.insert(thread_range.id, thread_id_val);
+        }
+
+        // Build var_names list for runtime (variables sorted by name + optional thread_id)
+        let mut var_names: Vec<String> = variables
+            .iter()
+            .filter_map(|v| if let Op::DefineVar { name, .. } = v.op() { Some(name.clone()) } else { None })
+            .collect();
+        if has_threading {
+            var_names.push("thread_id".to_string());
+        }
+
+        // Walk the UOp graph in topological order (already computed above for thread detection)
+        // Note: nodes was already computed above for thread detection
 
         debug!(num_nodes = nodes.len(), "walking toposort");
 
@@ -146,57 +209,7 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Return void
         builder.build_return(None).context(BuildReturnSnafu)?;
 
-        // Create bootstrap function: void kernel_bootstrap(ptr %args, i64 %var0, ...)
-        let mut bootstrap_param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
-        bootstrap_param_types.push(ptr_type.into()); // buffer array pointer
-
-        // Add variable parameters
-        for _ in &variables {
-            bootstrap_param_types.push(i64_type.into());
-        }
-
-        let bootstrap_fn_type = self.context.void_type().fn_type(&bootstrap_param_types, false);
-        let bootstrap_function = module.add_function(name, bootstrap_fn_type, None);
-
-        let bootstrap_entry = self.context.append_basic_block(bootstrap_function, "entry");
-        builder.position_at_end(bootstrap_entry);
-
-        let args_array = bootstrap_function
-            .get_first_param()
-            .context(InvalidFunctionParameterSnafu { index: 0u32 })?
-            .into_pointer_value();
-        args_array.set_name("args");
-
-        // Extract each buffer pointer from the array
-        let mut kernel_args: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
-        for i in 0..buffers.len() {
-            let index = self.context.i64_type().const_int(i as u64, false);
-            let ptr_to_ptr = unsafe {
-                builder.build_gep(ptr_type, args_array, &[index], &format!("arg{}_ptr", i)).context(BuildGepSnafu)?
-            };
-            let buffer_ptr = builder.build_load(ptr_type, ptr_to_ptr, &format!("arg{}", i)).context(BuildLoadSnafu)?;
-            kernel_args.push(buffer_ptr.into());
-        }
-
-        // Add variable parameters from bootstrap function parameters
-        for (i, var) in variables.iter().enumerate() {
-            let param_idx = (1 + i) as u32; // +1 because first param is buffer array
-            let var_param = bootstrap_function
-                .get_nth_param(param_idx)
-                .context(InvalidFunctionParameterSnafu { index: param_idx })?;
-            if let Op::DefineVar { name, .. } = var.op() {
-                var_param.set_name(name);
-            }
-            kernel_args.push(var_param.into());
-        }
-
-        // Call the kernel
-        builder
-            .build_call(kernel_function, &kernel_args, "")
-            .context(BuildCallSnafu { intrinsic: kernel_name.to_string() })?;
-
-        // Return void
-        builder.build_return(None).context(BuildReturnSnafu)?;
+        // No bootstrap function needed - kernel directly takes (ptr args, ptr vars)
 
         // Dump IR at trace level
         trace!(llvm.ir = %module.to_string(), "llvm ir before verification");
@@ -204,16 +217,29 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Verify the module
         module.verify().map_err(|err| Error::ModuleVerification { message: err.to_string() })?;
 
-        Ok(module)
+        Ok((module, var_names, thread_count))
     }
 }
 
 impl<'ctx> Renderer for CpuLlvmRenderer<'ctx> {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> crate::Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
-        let module = self.render_to_module(uop, kernel_name)?;
+        let (module, var_names, thread_count) = self.render_to_module(uop, kernel_name)?;
         let ir_string = module.print_to_string().to_string();
-        Ok(RenderedKernel::new(ir_string, kernel_name.to_string(), kernel_name.to_string()))
+
+        let mut rendered = RenderedKernel::new(ir_string, kernel_name.to_string());
+
+        // Set variable names for runtime to populate vars array
+        rendered.var_names = var_names;
+
+        // Set global_size for threaded kernels
+        // This will be passed through to runtime for parallel dispatch
+        if thread_count > 1 {
+            rendered.global_size = Some([thread_count, 1, 1]);
+            rendered.local_size = Some([1, 1, 1]);
+        }
+
+        Ok(rendered)
     }
 
     fn backend_name(&self) -> &str {
@@ -222,70 +248,6 @@ impl<'ctx> Renderer for CpuLlvmRenderer<'ctx> {
 
     fn decompositor(&self) -> Option<morok_ir::pattern::PatternMatcher<()>> {
         None
-    }
-}
-
-/// Collect buffer and variable parameters from a UOp graph.
-///
-/// Collects:
-/// - Buffers: DEFINE_GLOBAL, DEFINE_LOCAL, BUFFER operations
-/// - Variables: DEFINE_VAR operations NOT in BIND+OUTER patterns (passed as i64 kernel params)
-///
-/// Loop ranges (OUTER/GLOBAL/LOOP) generate for-loops directly, no DefineVar needed.
-///
-/// Returns (buffers, variables) sorted for deterministic function signatures.
-fn collect_buffers_and_vars(root: &Arc<UOp>) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
-    let nodes = root.toposort();
-
-    // Collect buffers
-    let mut buffers = Vec::new();
-    for node in &nodes {
-        match node.op() {
-            Op::Buffer { .. } | Op::DefineGlobal(_) | Op::DefineLocal(_) => {
-                buffers.push(node.clone());
-            }
-            _ => {}
-        }
-    }
-
-    // Sort buffers by internal ID (matches split_kernel.rs ordering)
-    buffers.sort_by_key(|b| match b.op() {
-        Op::DefineGlobal(id) => *id as u64,
-        Op::DefineLocal(id) => (*id as u64) + (1u64 << 32),
-        Op::Buffer { .. } => b.id + (1u64 << 48),
-        _ => b.id,
-    });
-
-    // Collect DefineVar nodes - these become i64 kernel parameters
-    // Note: Loop ranges no longer create DefineVars (Tinygrad approach), so all DefineVars
-    // found here are user-provided or from schedule expansion and should be parameters.
-    let mut variables = Vec::new();
-    for node in &nodes {
-        if matches!(node.op(), Op::DefineVar { .. }) {
-            variables.push(node.clone());
-        }
-    }
-
-    // Sort variables by name for deterministic function signatures
-    variables.sort_by_key(|v| if let Op::DefineVar { name, .. } = v.op() { name.clone() } else { String::new() });
-
-    (buffers, variables)
-}
-
-/// Add parameter attributes to buffer pointer parameters.
-fn add_buffer_param_attributes<'ctx>(
-    function: inkwell::values::FunctionValue<'ctx>,
-    buffer_count: u32,
-    context: &'ctx Context,
-) {
-    for i in 0..buffer_count {
-        let noalias_attr_id = inkwell::attributes::Attribute::get_named_enum_kind_id("noalias");
-        let noalias = context.create_enum_attribute(noalias_attr_id, 0);
-        function.add_attribute(AttributeLoc::Param(i), noalias);
-
-        let align_attr_id = inkwell::attributes::Attribute::get_named_enum_kind_id("align");
-        let align = context.create_enum_attribute(align_attr_id, 32);
-        function.add_attribute(AttributeLoc::Param(i), align);
     }
 }
 

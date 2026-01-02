@@ -27,7 +27,8 @@ fn bench_matmul(c: &mut Criterion) {
 
     // Typed optimizer configurations (no environment variables needed)
     let heuristic_config = OptimizerConfig::default();
-    let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: 5 }).build();
+    const BEAM_WIDTH: usize = 5;
+    let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build();
 
     for size in [512] {
         let flops = matmul_flops(size, size, size);
@@ -65,7 +66,7 @@ fn bench_matmul(c: &mut Criterion) {
                 eprintln!("  Kernel {}: {}", i, kernel.entry_point);
             }
 
-            group.bench_with_input(BenchmarkId::new("beam_w3", size), &size, |bencher, _| {
+            group.bench_with_input(BenchmarkId::new(format!("beam_w{BEAM_WIDTH}"), size), &size, |bencher, _| {
                 bencher.iter(|| plan_b.execute(&mut executor).expect("execute should succeed"));
             });
         }

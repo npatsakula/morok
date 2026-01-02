@@ -33,6 +33,11 @@ pub struct CachedKernel {
     pub code: String,
     /// Entry point name.
     pub entry_point: String,
+    /// Global work size for dispatch (GPU backends, CPU threading).
+    /// For CPU threading: [thread_count, 1, 1]
+    pub global_size: Option<[usize; 3]>,
+    /// Local work size for dispatch (GPU backends).
+    pub local_size: Option<[usize; 3]>,
 }
 
 // SAFETY: CachedKernel is Send + Sync because:

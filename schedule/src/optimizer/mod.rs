@@ -265,9 +265,8 @@ pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Schedu
     let simplified = graph_rewrite(&symbolic(), ast, &mut ());
     let mut scheduler = Scheduler::new(simplified, renderer.clone());
     let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
-    // Note: Don't call convert_outer_to_loop() here - it expands beam search's
-    // action space significantly (more upcastable axes), hurting performance.
-    // Heuristics already call it in optimize_heuristic().
+    // Note: Don't apply threading here - let beam search explore THREAD actions naturally.
+    // Heuristics apply threading via hand_coded_optimizations() with config.thread_count.
     scheduler
 }
 

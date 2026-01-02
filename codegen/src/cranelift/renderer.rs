@@ -10,8 +10,9 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use crate::{RenderedKernel, Result};
 use morok_ir::{Op, UOp};
 
-use super::helpers::{LoopContext, collect_buffers_and_vars};
+use super::helpers::LoopContext;
 use super::ops::codegen_uop;
+use crate::common::collect_buffers_and_vars;
 
 /// Cranelift code generator for CPU execution.
 pub struct CraneliftRenderer;
@@ -102,12 +103,14 @@ impl CraneliftRenderer {
         // NOTE: We only emit kernel_impl as CLIF text.
         // The runtime will programmatically build the bootstrap function
         // that loads buffer pointers from an array and calls kernel_impl.
-        let metadata = KernelMetadata { name: kernel_name.to_string(), buffer_count, var_names };
+        let metadata = KernelMetadata { name: kernel_name.to_string(), buffer_count, var_names: var_names.clone() };
 
         // Combine IR and metadata
         let combined = format!("{}METADATA:{}", impl_ir_text, serde_metadata(&metadata));
 
-        Ok(RenderedKernel::new(combined, kernel_name.to_string(), kernel_name.to_string()))
+        let mut rendered = RenderedKernel::new(combined, kernel_name.to_string());
+        rendered.var_names = var_names;
+        Ok(rendered)
     }
 }
 

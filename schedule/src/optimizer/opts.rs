@@ -45,6 +45,9 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
         OptOps::GROUPTOP => {
             apply_group(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?, true)?;
         }
+        OptOps::THREAD => {
+            apply_thread(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
+        }
         _ => return ValidationFailedSnafu { op: "apply_opt", reason: "operation not yet implemented" }.fail(),
     }
 
@@ -267,5 +270,61 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
         }
     }
     scheduler.dont_use_locals = true;
+    Ok(())
+}
+
+// ============================================================================
+// THREAD - CPU parallel dispatch
+// ============================================================================
+
+/// Split dimension into smaller range + THREAD for CPU parallel dispatch.
+///
+/// THREAD works like GPU's GLOBAL but for CPU: instead of GPU thread blocks,
+/// we use OS threads (via rayon). The work partition is baked into index
+/// expressions at optimization time - runtime just provides thread_id.
+///
+/// # Safety
+///
+/// Buffer safety is guaranteed by shift_to() transformation:
+/// - Each thread_id maps to disjoint output indices
+/// - Index formula: `output[thread_id * chunk_size + local_idx]`
+/// - Same buffer pointers can be safely passed to all threads
+fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
+    // Validate renderer supports threads
+    if !scheduler.ren.has_threads {
+        return UnsupportedFeatureSnafu { feature: "CPU threads" }.fail();
+    }
+
+    // Check if already threaded - make THREAD opt idempotent
+    // This allows replaying cached opts even when prepare_scheduler pre-applies threading
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    if !thread_axes.is_empty() {
+        tracing::debug!("THREAD opt skipped: scheduler already has Thread axis");
+        return Ok(());
+    }
+
+    // Validate thread count within limits
+    if let Some(global_max) = &scheduler.ren.global_max {
+        if let Some(&max_threads) = global_max.first() {
+            if amount > max_threads {
+                return DeviceLimitExceededSnafu { limit_type: "thread count", value: amount, max: max_threads }.fail();
+            }
+        }
+    }
+
+    // Validate axis type (must be parallelizable)
+    let axis_type = match rng.op() {
+        Op::Range { axis_type, .. } => *axis_type,
+        _ => return ExpectedRangeOperationSnafu.fail(),
+    };
+
+    // Outer, Global, Loop can be threaded
+    // Note: Reduce kernels keep Outer axes (convert_outer_to_loop skips them)
+    if !matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop) {
+        return ValidationFailedSnafu { op: "THREAD", reason: "can only thread Outer/Global/Loop axes" }.fail();
+    }
+
+    // Apply shift_to with top=true (outer-most position, like Tinygrad's core_id)
+    let _ = scheduler.shift_to(rng, amount, AxisType::Thread, true, None)?;
     Ok(())
 }

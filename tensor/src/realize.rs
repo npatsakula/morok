@@ -562,6 +562,8 @@ fn prepare_execution_plan(
                 device: device_str.clone(),
                 code: spec.src.clone(),
                 entry_point: spec.name.clone(),
+                global_size: spec.global_size,
+                local_size: spec.local_size,
             })
         })?;
 
@@ -763,9 +765,17 @@ fn beam_search_optimize(
         // Extract buffer pointers inside the closure (avoids Sync issue)
         let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
 
-        // Time ONLY execution
+        // Time ONLY execution (pass global/local size for threaded kernels)
         let result = unsafe {
-            morok_runtime::benchmark_kernel(program.as_ref(), &buffer_ptrs, &HashMap::new(), &bench_config).ok()?
+            morok_runtime::benchmark_kernel(
+                program.as_ref(),
+                &buffer_ptrs,
+                &HashMap::new(),
+                spec.global_size,
+                spec.local_size,
+                &bench_config,
+            )
+            .ok()?
         };
 
         Some(result.min)

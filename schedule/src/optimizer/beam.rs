@@ -36,6 +36,20 @@ use super::types::Opt;
 // ACTION SPACE
 // ============================================================================
 
+/// Generate thread counts that are likely to divide common tensor sizes.
+///
+/// Instead of fixed power-of-2, includes all values up to max_threads that
+/// divide common sizes (64, 128, 256, 512, 1024). This ensures beam search
+/// can find optimal thread counts for various tensor dimensions.
+fn thread_action_amounts(max_threads: usize) -> Vec<usize> {
+    const COMMON_SIZES: [usize; 5] = [64, 128, 256, 512, 1024];
+
+    let mut amounts: Vec<usize> = (2..=max_threads).filter(|&t| COMMON_SIZES.iter().any(|&sz| sz % t == 0)).collect();
+    amounts.sort_unstable();
+    amounts.dedup();
+    amounts
+}
+
 /// Pre-computed action space for beam search (~500 actions).
 ///
 /// Based on tinygrad's beam search action generation.
@@ -90,6 +104,16 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
     for a0 in 0..5 {
         for a1 in (a0 + 1)..5 {
             actions.push(Opt::swap(a0, a1));
+        }
+    }
+
+    // THREAD: CPU parallelization with smart divisor selection
+    // Include thread counts that divide common tensor sizes (64, 128, 256, 512, 1024)
+    let max_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8);
+    let thread_amounts = thread_action_amounts(max_threads);
+    for axis in 0..3 {
+        for &amt in &thread_amounts {
+            actions.push(Opt::thread(axis, amt));
         }
     }
 
@@ -764,5 +788,64 @@ mod tests {
         assert_eq!(result[1].op, OptOps::LOCAL);
         assert_eq!(result[2].op, OptOps::UNROLL);
         assert_eq!(result[3].op, OptOps::NOLOCALS);
+    }
+
+    #[test]
+    fn test_beam_actions_contains_thread() {
+        let has_thread = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::THREAD);
+        assert!(has_thread, "BEAM_ACTIONS should contain THREAD actions");
+
+        // Count thread actions
+        let thread_count = BEAM_ACTIONS.iter().filter(|a| a.op == OptOps::THREAD).count();
+        assert!(thread_count >= 6, "Expected at least 6 THREAD actions (3 axes × 2+ amounts), got {}", thread_count);
+    }
+
+    #[test]
+    fn test_thread_action_applied_to_outer_axis() {
+        use super::super::renderer::Renderer;
+        use morok_ir::{AxisId, AxisType, UOp};
+
+        // Create a kernel with Outer axis (like matmul reduce kernels)
+        let end_512 = UOp::index_const(512);
+        let r_outer = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Outer);
+        let compute = UOp::native_const(1.0f32);
+        let sink = UOp::sink(vec![compute, r_outer]);
+
+        let renderer = Renderer::cpu();
+        let scheduler = Scheduler::new(sink, renderer);
+
+        // Verify renderer supports threading
+        assert!(scheduler.renderer().has_threads, "CPU renderer should have has_threads=true");
+
+        // Try to apply THREAD opt
+        let mut test_scheduler = scheduler.clone();
+        let result = apply_opt(&mut test_scheduler, &Opt::thread(0, 8), true);
+        assert!(result.is_ok(), "THREAD(0, 8) should succeed on Outer axis: {:?}", result);
+
+        // Verify Thread axis was created
+        let thread_axes = test_scheduler.axes_of(&[AxisType::Thread]);
+        assert!(!thread_axes.is_empty(), "Should have Thread axis after THREAD opt");
+    }
+
+    #[test]
+    fn test_generate_actions_includes_thread_for_cpu() {
+        use super::super::renderer::Renderer;
+        use morok_ir::{AxisId, AxisType, UOp};
+
+        // Create a kernel with Outer axis
+        let end_512 = UOp::index_const(512);
+        let r_outer = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Outer);
+        let compute = UOp::native_const(1.0f32);
+        let sink = UOp::sink(vec![compute, r_outer]);
+
+        let renderer = Renderer::cpu();
+        let scheduler = Scheduler::new(sink, renderer);
+
+        let config = BeamConfig::default();
+        let candidates = generate_actions(&scheduler, &config);
+
+        // Check if any candidate has a Thread axis
+        let has_threaded = candidates.iter().any(|s| !s.axes_of(&[AxisType::Thread]).is_empty());
+        assert!(has_threaded, "generate_actions should produce candidates with Thread axes for CPU");
     }
 }

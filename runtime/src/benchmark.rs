@@ -59,25 +59,27 @@ impl BenchmarkResult {
 ///
 /// ```ignore
 /// let config = BenchmarkConfig::default();
-/// let result = unsafe { benchmark_kernel(&kernel, &buffers, &vars, &config)? };
+/// let result = unsafe { benchmark_kernel(&kernel, &buffers, &vars, None, None, &config)? };
 /// println!("Min time: {:?}", result.min);
 /// ```
 pub unsafe fn benchmark_kernel(
     kernel: &dyn Program,
     buffers: &[*mut u8],
     vars: &HashMap<String, i64>,
+    global_size: Option<[usize; 3]>,
+    local_size: Option<[usize; 3]>,
     config: &BenchmarkConfig,
 ) -> Result<BenchmarkResult> {
     // Warmup runs (discard timing)
     for _ in 0..config.warmup_runs {
-        unsafe { kernel.execute(buffers, vars, None, None)? };
+        unsafe { kernel.execute(buffers, vars, global_size, local_size)? };
     }
 
     // Timing runs
     let mut runs = Vec::with_capacity(config.timing_runs);
     for _ in 0..config.timing_runs {
         let start = Instant::now();
-        unsafe { kernel.execute(buffers, vars, None, None)? };
+        unsafe { kernel.execute(buffers, vars, global_size, local_size)? };
         runs.push(start.elapsed());
     }
 
@@ -100,17 +102,19 @@ pub unsafe fn benchmark_kernel_with_cutoff(
     kernel: &dyn Program,
     buffers: &[*mut u8],
     vars: &HashMap<String, i64>,
+    global_size: Option<[usize; 3]>,
+    local_size: Option<[usize; 3]>,
     config: &BenchmarkConfig,
     cutoff: Duration,
 ) -> Result<Option<BenchmarkResult>> {
     // Warmup runs
     for _ in 0..config.warmup_runs {
-        unsafe { kernel.execute(buffers, vars, None, None)? };
+        unsafe { kernel.execute(buffers, vars, global_size, local_size)? };
     }
 
     // First timing run - check against cutoff
     let start = Instant::now();
-    unsafe { kernel.execute(buffers, vars, None, None)? };
+    unsafe { kernel.execute(buffers, vars, global_size, local_size)? };
     let first = start.elapsed();
 
     // Early exit if clearly slower (3x cutoff)
@@ -122,7 +126,7 @@ pub unsafe fn benchmark_kernel_with_cutoff(
     let mut runs = vec![first];
     for _ in 1..config.timing_runs {
         let start = Instant::now();
-        unsafe { kernel.execute(buffers, vars, None, None)? };
+        unsafe { kernel.execute(buffers, vars, global_size, local_size)? };
         runs.push(start.elapsed());
     }
 
@@ -164,7 +168,7 @@ mod tests {
         let kernel = MockKernel { name: "test".into(), sleep_micros: 100 };
         let config = BenchmarkConfig { warmup_runs: 1, timing_runs: 3, take_minimum: true };
 
-        let result = unsafe { benchmark_kernel(&kernel, &[], &HashMap::new(), &config) }.unwrap();
+        let result = unsafe { benchmark_kernel(&kernel, &[], &HashMap::new(), None, None, &config) }.unwrap();
 
         assert_eq!(result.runs.len(), 3);
         assert!(result.min >= Duration::from_micros(100));
@@ -177,7 +181,9 @@ mod tests {
         let config = BenchmarkConfig::default();
         let cutoff = Duration::from_millis(1);
 
-        let result = unsafe { benchmark_kernel_with_cutoff(&kernel, &[], &HashMap::new(), &config, cutoff) }.unwrap();
+        let result =
+            unsafe { benchmark_kernel_with_cutoff(&kernel, &[], &HashMap::new(), None, None, &config, cutoff) }
+                .unwrap();
 
         assert!(result.is_some());
     }
@@ -188,7 +194,9 @@ mod tests {
         let config = BenchmarkConfig::default();
         let cutoff = Duration::from_micros(100); // Very tight cutoff
 
-        let result = unsafe { benchmark_kernel_with_cutoff(&kernel, &[], &HashMap::new(), &config, cutoff) }.unwrap();
+        let result =
+            unsafe { benchmark_kernel_with_cutoff(&kernel, &[], &HashMap::new(), None, None, &config, cutoff) }
+                .unwrap();
 
         assert!(result.is_none());
     }

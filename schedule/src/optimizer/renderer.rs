@@ -131,13 +131,14 @@ pub struct Renderer {
 impl Renderer {
     /// Create a CPU renderer configuration.
     pub fn cpu() -> Self {
+        let cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8);
         Self {
             device: "CPU".to_string(),
             has_local: false,
             has_shared: false,
             has_threads: true,
             shared_max: 0,
-            global_max: Some(vec![256]), // Typical thread pool size
+            global_max: Some(vec![cores]), // Actual available CPU cores
             local_max: None,
             upcast_max: 16, // AVX512 can do 16-wide float
             buffer_max: None,

@@ -17,6 +17,7 @@
 //! let kernel = llvm::render(&optimized_uop_graph, Some("kernel"))?;
 //! ```
 
+pub mod common;
 pub mod context;
 pub mod cranelift;
 pub mod error;
@@ -27,6 +28,7 @@ pub mod types;
 #[cfg(test)]
 pub mod test;
 
+pub use common::collect_buffers_and_vars;
 pub use context::*;
 pub use error::*;
 pub use traits::*;

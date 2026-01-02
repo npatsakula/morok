@@ -78,17 +78,47 @@ pub struct CompiledSpec {
 
     /// Original AST for cache key construction via hash consing
     pub ast: Arc<UOp>,
+
+    /// Variable names in order for populating vars array at runtime.
+    /// Includes thread_id at the end if threading is enabled.
+    pub var_names: Vec<String>,
+
+    /// Global work size for dispatch (GPU backends, CPU threading)
+    /// For CPU threading: [thread_count, 1, 1]
+    pub global_size: Option<[usize; 3]>,
+
+    /// Local work size for dispatch (GPU backends)
+    pub local_size: Option<[usize; 3]>,
 }
 
 impl CompiledSpec {
     /// Create a new CompiledSpec for JIT backends (source-based).
     pub fn from_source(name: String, src: String, ast: Arc<UOp>) -> Self {
-        Self { name, src: Some(src), bytes: Vec::new(), ast }
+        Self {
+            name,
+            src: Some(src),
+            bytes: Vec::new(),
+            ast,
+            var_names: Vec::new(),
+            global_size: None,
+            local_size: None,
+        }
     }
 
     /// Create a new CompiledSpec for AOT backends (bytecode-based).
     pub fn from_bytes(name: String, bytes: Vec<u8>, ast: Arc<UOp>) -> Self {
-        Self { name, src: None, bytes, ast }
+        Self { name, src: None, bytes, ast, var_names: Vec::new(), global_size: None, local_size: None }
+    }
+
+    /// Create a new CompiledSpec with work sizes for JIT backends.
+    pub fn from_source_with_sizes(
+        name: String,
+        src: String,
+        ast: Arc<UOp>,
+        global_size: Option<[usize; 3]>,
+        local_size: Option<[usize; 3]>,
+    ) -> Self {
+        Self { name, src: Some(src), bytes: Vec::new(), ast, var_names: Vec::new(), global_size, local_size }
     }
 }
 
@@ -300,12 +330,16 @@ pub struct ProgramSpec {
 
     /// Variable list (for symbolic shapes/strides)
     pub vars: Vec<Variable>,
+
+    /// Variable names in order for populating vars array at runtime.
+    /// Includes thread_id at the end if threading is enabled.
+    pub var_names: Vec<String>,
 }
 
 impl ProgramSpec {
     /// Create a new program specification.
     pub fn new(name: String, src: String, device: DeviceSpec, ast: Arc<UOp>) -> Self {
-        Self { name, src, device, ast, global_size: None, local_size: None, vars: Vec::new() }
+        Self { name, src, device, ast, global_size: None, local_size: None, vars: Vec::new(), var_names: Vec::new() }
     }
 
     /// Add a variable to the program.
@@ -317,6 +351,11 @@ impl ProgramSpec {
     pub fn set_work_sizes(&mut self, global: [usize; 3], local: [usize; 3]) {
         self.global_size = Some(global);
         self.local_size = Some(local);
+    }
+
+    /// Set variable names for populating vars array at runtime.
+    pub fn set_var_names(&mut self, var_names: Vec<String>) {
+        self.var_names = var_names;
     }
 }
 

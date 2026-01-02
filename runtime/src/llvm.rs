@@ -36,6 +36,15 @@ pub struct LlvmKernel {
 
     /// Kernel name for debugging.
     name: String,
+
+    /// Variable names in order (for populating vars array at runtime).
+    /// Includes thread_id at the end if threading is enabled.
+    var_names: Vec<String>,
+
+    /// Raw function pointer for thread-safe parallel execution.
+    /// SAFETY: This is a raw pointer to JIT-compiled code that remains valid
+    /// as long as the execution_engine is alive.
+    fn_ptr: *const u8,
 }
 
 impl LlvmKernel {
@@ -43,8 +52,19 @@ impl LlvmKernel {
     ///
     /// This parses the LLVM IR, verifies it, runs optimization passes,
     /// and JIT compiles using LLVM's MCJIT or ORC engine.
+    ///
+    /// # Arguments
+    /// * `ir` - LLVM IR source code
+    /// * `entry_point` - Name of the kernel entry point function
+    /// * `name` - Kernel name for debugging/caching
+    /// * `var_names` - Variable names in order for populating vars array at runtime
     #[instrument(skip_all, fields(kernel.entry_point, kernel.name))]
-    pub fn compile_ir(ir: &str, entry_point: impl Into<String>, name: impl Into<String>) -> Result<Self> {
+    pub fn compile_ir(
+        ir: &str,
+        entry_point: impl Into<String>,
+        name: impl Into<String>,
+        var_names: Vec<String>,
+    ) -> Result<Self> {
         let entry_point = entry_point.into();
         let name = name.into();
 
@@ -122,18 +142,42 @@ impl LlvmKernel {
             crate::Error::JitCompilation { reason: format!("Failed to create execution engine: {}", e) }
         })?;
 
+        // Cache function pointer for thread-safe parallel execution
+        let fn_ptr = execution_engine
+            .get_function_address(&entry_point)
+            .map_err(|e| crate::Error::FunctionNotFound { name: format!("{}: {}", entry_point, e) })?
+            as *const u8;
+
         Ok(Self {
             context,
             module: ManuallyDrop::new(module),
             execution_engine: ManuallyDrop::new(execution_engine),
             entry_point,
             name,
+            var_names,
+            fn_ptr,
         })
     }
 
     /// Compile a RenderedKernel from the codegen crate.
     pub fn compile(kernel: &morok_codegen::RenderedKernel) -> Result<Self> {
-        Self::compile_ir(&kernel.code, &kernel.entry_point, &kernel.name)
+        Self::compile_ir(&kernel.code, &kernel.name, &kernel.name, kernel.var_names.clone())
+    }
+
+    /// Get the variable names in order (thread-safe).
+    ///
+    /// Variable names are passed from codegen and cached for populating the vars array.
+    /// Includes thread_id at the end if threading is enabled.
+    pub fn var_names(&self) -> &[String] {
+        &self.var_names
+    }
+
+    /// Get the raw function pointer (thread-safe).
+    ///
+    /// The function pointer points to JIT-compiled machine code and is safe to call
+    /// from multiple threads concurrently (the compiled code is read-only).
+    pub fn fn_ptr(&self) -> *const u8 {
+        self.fn_ptr
     }
 }
 
@@ -143,120 +187,30 @@ impl CompiledKernel for LlvmKernel {
         buffers: &[*mut u8],
         vars: &std::collections::HashMap<String, i64>,
     ) -> Result<()> {
-        // Debug buffer contents helper
-        let debug_buffer_contents = |phase: &str, buffers: &[*mut u8]| {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                for (i, &ptr) in buffers.iter().enumerate() {
-                    if !ptr.is_null() {
-                        let float_ptr = ptr as *const f32;
-                        let float_vals: Vec<f32> = (0..5).map(|j| unsafe { *float_ptr.add(j) }).collect();
-                        let int_ptr = ptr as *const i32;
-                        let int_vals: Vec<i32> = (0..5).map(|j| unsafe { *int_ptr.add(j) }).collect();
-                        debug!(
-                            phase,
-                            buffer.index = i,
-                            buffer.ptr = ?ptr,
-                            buffer.as_f32 = ?float_vals,
-                            buffer.as_i32 = ?int_vals,
-                            "Buffer contents"
-                        );
-                    } else {
-                        debug!(phase, buffer.index = i, "buffer is null");
-                    }
-                }
-            }
-        };
-
         debug!(
             kernel.entry_point = %self.entry_point,
             kernel.num_buffers = buffers.len(),
+            kernel.num_vars = self.var_names.len(),
             "Executing LLVM kernel"
         );
-        debug_buffer_contents("before", buffers);
 
-        // Get the function from the module to inspect its signature
-        let function = self
-            .module
-            .get_function(&self.entry_point)
-            .ok_or_else(|| crate::Error::FunctionNotFound { name: self.entry_point.clone() })?;
+        // Build vars array in the order specified by var_names
+        let var_values: Vec<i64> = self.var_names.iter().map(|name| vars.get(name).copied().unwrap_or(0)).collect();
 
-        let param_count = function.count_params() as usize;
-        let var_count = param_count.saturating_sub(1); // Subtract 1 for buffer array pointer
+        // Kernel signature: void kernel(ptr %args, ptr %vars)
+        // - args: pointer to buffer array
+        // - vars: pointer to i64 array of variable values
+        type KernelFn = unsafe extern "C" fn(*const *mut u8, *const i64);
+        let func: JitFunction<KernelFn> = unsafe {
+            self.execution_engine
+                .get_function(&self.entry_point)
+                .map_err(|e| crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) })?
+        };
 
-        if var_count == 0 {
-            // No variables - use simple bootstrap function
-            type BootstrapFn0 = unsafe extern "C" fn(*const *mut u8);
-            let func: JitFunction<BootstrapFn0> = unsafe {
-                self.execution_engine
-                    .get_function(&self.entry_point)
-                    .map_err(|e| crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) })?
-            };
-            unsafe {
-                func.call(buffers.as_ptr());
-            }
-        } else {
-            // Extract variable values in parameter order
-            // The function parameters are ordered: (ptr %args, i64 %var0, i64 %var1, ...)
-            // We need to match variable names from the HashMap to parameter positions
-            let mut var_values = Vec::new();
-            for i in 1..param_count {
-                if let Some(param) = function.get_nth_param(i as u32) {
-                    let param_name = param.get_name().to_str().map_err(|_| crate::Error::JitCompilation {
-                        reason: format!("Invalid UTF-8 in parameter name at index {}", i),
-                    })?;
-
-                    let value = vars.get(param_name).copied().ok_or_else(|| crate::Error::JitCompilation {
-                        reason: format!("Missing variable value for parameter '{}'", param_name),
-                    })?;
-
-                    var_values.push(value);
-                }
-            }
-
-            // Call with the appropriate number of variable parameters
-            match var_count {
-                1 => {
-                    type BootstrapFn1 = unsafe extern "C" fn(*const *mut u8, i64);
-                    let func: JitFunction<BootstrapFn1> = unsafe {
-                        self.execution_engine.get_function(&self.entry_point).map_err(|e| {
-                            crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) }
-                        })?
-                    };
-                    unsafe {
-                        func.call(buffers.as_ptr(), var_values[0]);
-                    }
-                }
-                2 => {
-                    type BootstrapFn2 = unsafe extern "C" fn(*const *mut u8, i64, i64);
-                    let func: JitFunction<BootstrapFn2> = unsafe {
-                        self.execution_engine.get_function(&self.entry_point).map_err(|e| {
-                            crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) }
-                        })?
-                    };
-                    unsafe {
-                        func.call(buffers.as_ptr(), var_values[0], var_values[1]);
-                    }
-                }
-                3 => {
-                    type BootstrapFn3 = unsafe extern "C" fn(*const *mut u8, i64, i64, i64);
-                    let func: JitFunction<BootstrapFn3> = unsafe {
-                        self.execution_engine.get_function(&self.entry_point).map_err(|e| {
-                            crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) }
-                        })?
-                    };
-                    unsafe {
-                        func.call(buffers.as_ptr(), var_values[0], var_values[1], var_values[2]);
-                    }
-                }
-                _ => {
-                    return Err(crate::Error::JitCompilation {
-                        reason: format!("Unsupported number of variables: {}. Max supported is 3.", var_count),
-                    });
-                }
-            }
+        unsafe {
+            func.call(buffers.as_ptr(), var_values.as_ptr());
         }
 
-        debug_buffer_contents("after", buffers);
         Ok(())
     }
 
@@ -283,18 +237,14 @@ mod tests {
 
     #[test]
     fn test_llvm_kernel_no_args() {
+        // New signature: kernel(ptr %args, ptr %vars)
         let ir = r#"
-            define void @test_kernel_impl() {
-                ret void
-            }
-
-            define void @test_kernel(ptr %args) {
-                call void @test_kernel_impl()
+            define void @test_kernel(ptr %args, ptr %vars) {
                 ret void
             }
         "#;
 
-        let kernel = LlvmKernel::compile_ir(ir, "test_kernel", "test_kernel").unwrap();
+        let kernel = LlvmKernel::compile_ir(ir, "test_kernel", "test_kernel", vec![]).unwrap();
         assert_eq!(kernel.name(), "test_kernel");
 
         unsafe {
@@ -304,22 +254,15 @@ mod tests {
 
     #[test]
     fn test_llvm_kernel_with_args() {
+        // New signature: kernel(ptr %args, ptr %vars)
+        // This test just checks that buffers are passed correctly
         let ir = r#"
-            define void @add_kernel_impl(ptr %buf0, ptr %buf1) {
-                ret void
-            }
-
-            define void @add_kernel(ptr %args) {
-                %buf0_ptr = getelementptr ptr, ptr %args, i64 0
-                %buf0 = load ptr, ptr %buf0_ptr
-                %buf1_ptr = getelementptr ptr, ptr %args, i64 1
-                %buf1 = load ptr, ptr %buf1_ptr
-                call void @add_kernel_impl(ptr %buf0, ptr %buf1)
+            define void @add_kernel(ptr %args, ptr %vars) {
                 ret void
             }
         "#;
 
-        let kernel = LlvmKernel::compile_ir(ir, "add_kernel", "add_kernel").unwrap();
+        let kernel = LlvmKernel::compile_ir(ir, "add_kernel", "add_kernel", vec![]).unwrap();
 
         let mut data1 = vec![0u8; 16];
         let mut data2 = vec![0u8; 16];
@@ -335,12 +278,12 @@ mod tests {
         // This test verifies that Drop doesn't crash
         // (proper drop order prevents use-after-free)
         let ir = r#"
-            define void @test(ptr %args) {
+            define void @test(ptr %args, ptr %vars) {
                 ret void
             }
         "#;
 
-        let kernel = LlvmKernel::compile_ir(ir, "test", "test").unwrap();
+        let kernel = LlvmKernel::compile_ir(ir, "test", "test", vec![]).unwrap();
         drop(kernel); // Should not crash
     }
 }

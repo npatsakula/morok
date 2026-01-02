@@ -635,9 +635,18 @@ impl UnifiedExecutor {
 
             // Execute kernel - borrow directly, no cloning!
             unsafe {
-                kernel.kernel.program.execute(&kernel.buffer_ptrs, &kernel.fixedvars, None, None).map_err(|e| {
-                    crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) }
-                })?;
+                kernel
+                    .kernel
+                    .program
+                    .execute(
+                        &kernel.buffer_ptrs,
+                        &kernel.fixedvars,
+                        kernel.kernel.global_size,
+                        kernel.kernel.local_size,
+                    )
+                    .map_err(|e| crate::error::Error::Execution {
+                        reason: format!("Kernel {} failed: {}", kernel.id, e),
+                    })?;
             }
 
             // Debug buffer contents after kernel execution
@@ -731,7 +740,8 @@ impl UnifiedExecutor {
                     // Transmute back to pointer slice (zero-copy)
                     let ptrs: &[*mut u8] = unsafe { std::mem::transmute::<&[usize], &[*mut u8]>(usize_slice) };
 
-                    let result = unsafe { program.program.execute(ptrs, fixedvars, None, None) };
+                    let result =
+                        unsafe { program.program.execute(ptrs, fixedvars, program.global_size, program.local_size) };
 
                     if let Err(e) = result {
                         errors_ref

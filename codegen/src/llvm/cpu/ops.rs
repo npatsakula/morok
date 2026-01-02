@@ -1095,6 +1095,18 @@ fn codegen_range<'ctx>(
         return Ok(None);
     }
 
+    // THREAD ranges: Don't create loop, use thread_id parameter
+    // The thread_id was set by mod.rs during kernel function setup
+    if axis_type == AxisType::Thread {
+        // Thread range value comes from thread_id parameter (set in mod.rs)
+        // Already registered in values during kernel setup by axis_id
+        if let Some(val) = values.get_range_by_axis(_axis_id.value()) {
+            return Ok(Some(val));
+        }
+        // Thread range not yet set - this is an error in kernel setup
+        return UnsupportedSnafu { what: "Thread range not found in ValueMap - kernel setup error" }.fail();
+    }
+
     // OUTER/GLOBAL/LOOP ranges: create for-loops directly (Tinygrad approach)
     // These loops are closed by mod.rs cleanup at the end of kernel generation.
     if matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop) {

@@ -54,18 +54,113 @@ impl Program for LlvmProgram {
         &self,
         buffers: &[*mut u8],
         vars: &HashMap<String, i64>,
-        _global_size: Option<[usize; 3]>,
+        global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
     ) -> Result<()> {
-        // CPU execution ignores global/local size (those are for GPU kernels)
-        unsafe {
-            CompiledKernel::execute_with_vars(&self.kernel, buffers, vars)
-                .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM kernel execution failed: {}", e) })
+        // Check for CPU threading: global_size[0] > 1 indicates threaded kernel
+        let thread_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
+
+        if let Some(count) = thread_count {
+            // Parallel execution with static work partition
+            unsafe { self.execute_parallel(buffers, vars, count) }
+        } else {
+            // Single-threaded execution
+            unsafe {
+                CompiledKernel::execute_with_vars(&self.kernel, buffers, vars).map_err(|e| {
+                    morok_device::Error::Runtime { message: format!("LLVM kernel execution failed: {}", e) }
+                })
+            }
         }
     }
 
     fn name(&self) -> &str {
-        "llvm_cpu_kernel" // TODO: Extract from LlvmKernel
+        self.kernel.name()
+    }
+}
+
+impl LlvmProgram {
+    /// Parallel execution with static work partition.
+    ///
+    /// # Safety Contract
+    ///
+    /// Buffer safety is guaranteed by the shift_to() transformation:
+    /// - Each thread_id maps to disjoint output indices
+    /// - Index formula: `output[thread_id * chunk_size + local_idx]`
+    /// - Mathematical proof: different thread_id → different memory regions
+    ///
+    /// Same buffer pointers can be safely passed to all threads because:
+    /// 1. Input buffers: Read-only access (no data race)
+    /// 2. Output buffers: Disjoint write regions per thread
+    unsafe fn execute_parallel(
+        &self,
+        buffers: &[*mut u8],
+        vars: &HashMap<String, i64>,
+        thread_count: usize,
+    ) -> Result<()> {
+        use rayon::prelude::*;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Extract thread-safe data BEFORE parallel loop:
+        // - fn_ptr: raw pointer to JIT-compiled code (just machine code, thread-safe)
+        // - var_names: cached variable names in order
+        let fn_ptr = self.kernel.fn_ptr() as usize; // Convert to usize for Send+Sync
+        let var_names = self.kernel.var_names();
+
+        // Pre-build base var_values (thread_id placeholder = 0)
+        let mut base_var_values: Vec<i64> = Vec::with_capacity(var_names.len());
+        for name in var_names {
+            if name == "thread_id" {
+                base_var_values.push(0); // Placeholder, will be replaced per-thread
+            } else {
+                let value = vars.get(name).copied().ok_or_else(|| morok_device::Error::Runtime {
+                    message: format!("Missing variable value for parameter '{}'", name),
+                })?;
+                base_var_values.push(value);
+            }
+        }
+
+        // Find thread_id position in var_names
+        let thread_id_idx = var_names.iter().position(|n| n == "thread_id");
+
+        // Pre-convert buffer pointers for Send + Sync
+        let buffer_usizes: Vec<usize> = buffers.iter().map(|&ptr| ptr as usize).collect();
+
+        // Track first error
+        let has_error = AtomicBool::new(false);
+        let first_error: Mutex<Option<String>> = Mutex::new(None);
+
+        // Single function type: kernel(ptr* buffers, i64* vars)
+        type KernelFn = unsafe extern "C" fn(*const *mut u8, *const i64);
+
+        // Static dispatch: each thread gets its fixed ID
+        (0..thread_count).into_par_iter().for_each(|thread_id| {
+            if has_error.load(Ordering::Relaxed) {
+                return;
+            }
+
+            // Prepare this thread's var_values
+            let mut var_values = base_var_values.clone();
+            if let Some(idx) = thread_id_idx {
+                var_values[idx] = thread_id as i64;
+            }
+
+            // Reconstruct buffer pointer
+            let bufs_ptr = buffer_usizes.as_ptr() as *const *mut u8;
+
+            // Call the JIT function directly using the cached fn_ptr
+            // SAFETY: fn_ptr points to valid JIT-compiled code, buffers and vars are valid
+            unsafe {
+                let f: KernelFn = std::mem::transmute(fn_ptr);
+                f(bufs_ptr, var_values.as_ptr());
+            }
+        });
+
+        // Return first error if any
+        if let Some(msg) = first_error.into_inner().unwrap() {
+            return Err(morok_device::Error::Runtime { message: msg });
+        }
+        Ok(())
     }
 }
 
@@ -84,7 +179,12 @@ impl Compiler for LlvmCompiler {
         // For now, we trust that the renderer produces valid IR
 
         // Return CompiledSpec with source for JIT compilation
-        Ok(morok_device::device::CompiledSpec::from_source(spec.name.clone(), spec.src.clone(), spec.ast.clone()))
+        let mut compiled =
+            morok_device::device::CompiledSpec::from_source(spec.name.clone(), spec.src.clone(), spec.ast.clone());
+        compiled.var_names = spec.var_names.clone();
+        compiled.global_size = spec.global_size;
+        compiled.local_size = spec.local_size;
+        Ok(compiled)
     }
 
     fn cache_key(&self) -> Option<&str> {
@@ -114,9 +214,8 @@ impl Renderer for LlvmRendererWrapper {
             spec.set_work_sizes(global, local);
         }
 
-        // TODO: Extract variables from the kernel signature
-        // For now, we don't populate vars since the existing LLVM renderer
-        // doesn't extract them.
+        // Set var_names for populating vars array at runtime
+        spec.set_var_names(rendered.var_names.clone());
 
         Ok(spec)
     }
@@ -137,7 +236,7 @@ fn create_llvm_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<
     })?;
 
     // Use existing LlvmKernel to JIT compile the IR
-    let kernel = crate::LlvmKernel::compile_ir(src, &spec.name, &spec.name)
+    let kernel = crate::LlvmKernel::compile_ir(src, &spec.name, &spec.name, spec.var_names.clone())
         .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM JIT compilation failed: {}", e) })?;
 
     Ok(Box::new(LlvmProgram { kernel }))

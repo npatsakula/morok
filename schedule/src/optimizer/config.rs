@@ -268,9 +268,34 @@ pub struct HeuristicsConfig {
     /// Disable local memory globally.
     pub disable_locals: bool,
 
+    // Threading
+    /// Maximum thread count for CPU parallelization.
+    /// Default: std::thread::available_parallelism().
+    /// Set to 1 to disable threading.
+    pub thread_count: usize,
+
     // Debug
     /// Debug verbosity level.
     pub debug_level: u8,
+}
+
+/// Get default thread count from system (used by Default and builder).
+fn default_thread_count() -> usize {
+    std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8)
+}
+
+impl HeuristicsConfig {
+    /// Create configuration from environment variables.
+    ///
+    /// # Environment Variables
+    ///
+    /// * `MOROK_THREADS` - Maximum thread count (default: available_parallelism)
+    pub fn from_env() -> Self {
+        let thread_count =
+            std::env::var("MOROK_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
+
+        Self { thread_count, ..Default::default() }
+    }
 }
 
 impl Default for HeuristicsConfig {
@@ -284,6 +309,7 @@ impl Default for HeuristicsConfig {
             grouped_threshold: 256,
             unroll_threshold: 32,
             disable_locals: false,
+            thread_count: default_thread_count(),
             debug_level: 0,
         }
     }
@@ -302,6 +328,7 @@ impl HeuristicsConfig {
         #[builder(default = 256)] grouped_threshold: usize,
         #[builder(default = 32)] unroll_threshold: usize,
         #[builder(default = false)] disable_locals: bool,
+        #[builder(default = default_thread_count())] thread_count: usize,
         #[builder(default = 0)] debug_level: u8,
     ) -> Self {
         Self {
@@ -313,6 +340,7 @@ impl HeuristicsConfig {
             grouped_threshold,
             unroll_threshold,
             disable_locals,
+            thread_count,
             debug_level,
         }
     }
@@ -350,11 +378,11 @@ impl OptimizerConfig {
 
     /// Create configuration from environment variables.
     ///
-    /// Reads strategy from env, then populates beam config accordingly.
+    /// Reads strategy from env, then populates beam and heuristics config accordingly.
     pub fn from_env() -> Self {
         let strategy = OptStrategy::from_env();
         let beam = BeamConfig::from_env().with_strategy_width(&strategy);
-        let heuristics = HeuristicsConfig::default();
+        let heuristics = HeuristicsConfig::from_env();
 
         Self { strategy, beam, heuristics }
     }

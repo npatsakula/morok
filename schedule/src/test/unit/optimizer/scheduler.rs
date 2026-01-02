@@ -1398,3 +1398,80 @@ fn test_flatten_ranges_store() {
     let info = optimized.metadata::<KernelInfo>();
     assert!(info.is_some(), "STORE with nested REDUCE should be flattened successfully");
 }
+
+// ============================================================================
+// Threading Tests
+// ============================================================================
+
+#[test]
+fn test_thread_basic() {
+    // Create a kernel with Loop axis (what CPU uses after convert_outer_to_loop)
+    let end_64 = UOp::index_const(64);
+    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Loop);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_loop]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Apply THREAD optimization
+    let opt = Opt::thread(0, 8);
+    let result = apply_opt(&mut scheduler, &opt, true);
+    assert!(result.is_ok(), "THREAD opt should succeed: {:?}", result);
+
+    // Verify the shape changed: Loop(64) -> Loop(8) + Thread(8)
+    assert_eq!(scheduler.shape_len(), 2);
+
+    let rngs = scheduler.rngs();
+    // After split: original axis becomes inner loop (Loop), new axis is outer Thread
+    let types: Vec<AxisType> = rngs.iter().map(|r| get_axis_type(r)).collect();
+    assert!(types.contains(&AxisType::Thread), "Should have Thread axis: {:?}", types);
+    assert!(types.contains(&AxisType::Loop), "Should have Loop axis: {:?}", types);
+}
+
+#[test]
+fn test_apply_threading_heuristic_loop() {
+    use crate::optimizer::heuristics::apply_threading;
+
+    // Create a kernel with Loop axis
+    let end_512 = UOp::index_const(512);
+    let r_loop = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Loop);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_loop]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Apply threading heuristic (use 8 threads as test default)
+    let applied = apply_threading(&mut scheduler, 8);
+    assert!(applied, "apply_threading should succeed on Loop axis");
+
+    // Verify Thread axis was created
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading");
+}
+
+#[test]
+fn test_apply_threading_heuristic_outer() {
+    use crate::optimizer::heuristics::apply_threading;
+
+    // Create a kernel with Outer axis (like matmul reduce kernels)
+    let end_512 = UOp::index_const(512);
+    let r_outer = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Outer);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_outer]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Apply threading heuristic - should work on Outer axes too (use 8 threads)
+    let applied = apply_threading(&mut scheduler, 8);
+    assert!(applied, "apply_threading should succeed on Outer axis");
+
+    // Verify Thread axis was created
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading on Outer");
+}

@@ -12,14 +12,15 @@ pub struct RenderedKernel {
     /// The generated code (LLVM IR, CUDA C, etc.)
     pub code: String,
 
-    /// Entry point function name.
-    pub entry_point: String,
-
-    /// Kernel name (for debugging/caching).
+    /// Kernel name (used as entry point and for debugging/caching).
     pub name: String,
 
     /// Buffer argument information.
     pub buffer_args: Vec<BufferArg>,
+
+    /// Variable names in order (for populating vars array at runtime).
+    /// Includes thread_id at the end if threading is enabled.
+    pub var_names: Vec<String>,
 
     /// Global work size (for GPU backends).
     pub global_size: Option<[usize; 3]>,
@@ -46,8 +47,8 @@ pub struct BufferArg {
 
 impl RenderedKernel {
     /// Create a new rendered kernel.
-    pub fn new(code: String, entry_point: String, name: String) -> Self {
-        Self { code, entry_point, name, buffer_args: Vec::new(), global_size: None, local_size: None }
+    pub fn new(code: String, name: String) -> Self {
+        Self { code, name, buffer_args: Vec::new(), var_names: Vec::new(), global_size: None, local_size: None }
     }
 
     /// Add a buffer argument.
