@@ -441,17 +441,19 @@ fn codegen_binary<'ctx>(
         BinaryOp::Sub => common::build_sub(builder, lhs, rhs, is_float),
         BinaryOp::Mul => common::build_mul(builder, lhs, rhs, is_float),
         BinaryOp::Fdiv => {
-            if lhs.is_vector_value() {
-                Ok(builder
+            let result: BasicValueEnum<'ctx> = if lhs.is_vector_value() {
+                builder
                     .build_float_div(lhs.into_vector_value(), rhs.into_vector_value(), "fdiv")
                     .context(ArithmeticSnafu)?
-                    .into())
+                    .into()
             } else {
-                Ok(builder
+                builder
                     .build_float_div(lhs.into_float_value(), rhs.into_float_value(), "fdiv")
                     .context(ArithmeticSnafu)?
-                    .into())
-            }
+                    .into()
+            };
+            common::fast_math::apply_fast_math_flags(result);
+            Ok(result)
         }
         BinaryOp::Idiv => common::build_int_div(builder, lhs, rhs, is_signed),
         BinaryOp::Mod => common::build_rem(builder, lhs, rhs, is_float, is_signed),
@@ -1459,7 +1461,10 @@ fn codegen_rsqrt<'ctx>(
     let suffix = get_type_suffix(result_dtype)?;
     let sqrt_val = call_intrinsic(&format!("llvm.sqrt.{}", suffix), &[src], "sqrt", module, builder)?;
     let one = src.into_float_value().get_type().const_float(1.0);
-    Ok(builder.build_float_div(one, sqrt_val.into_float_value(), "rsqrt").context(ArithmeticSnafu)?.into())
+    let result: BasicValueEnum<'ctx> =
+        builder.build_float_div(one, sqrt_val.into_float_value(), "rsqrt").context(ArithmeticSnafu)?.into();
+    common::fast_math::apply_fast_math_flags(result);
+    Ok(result)
 }
 
 fn codegen_tan<'ctx>(
@@ -1471,15 +1476,20 @@ fn codegen_tan<'ctx>(
     let suffix = get_type_suffix(result_dtype)?;
     let sin_val = call_intrinsic(&format!("llvm.sin.{}", suffix), &[src], "sin", module, builder)?;
     let cos_val = call_intrinsic(&format!("llvm.cos.{}", suffix), &[src], "cos", module, builder)?;
-    Ok(builder
+    let result: BasicValueEnum<'ctx> = builder
         .build_float_div(sin_val.into_float_value(), cos_val.into_float_value(), "tan")
         .context(ArithmeticSnafu)?
-        .into())
+        .into();
+    common::fast_math::apply_fast_math_flags(result);
+    Ok(result)
 }
 
 fn codegen_reciprocal<'ctx>(src: BasicValueEnum<'ctx>, builder: &Builder<'ctx>) -> Result<BasicValueEnum<'ctx>> {
     let one = src.into_float_value().get_type().const_float(1.0);
-    Ok(builder.build_float_div(one, src.into_float_value(), "recip").context(ArithmeticSnafu)?.into())
+    let result: BasicValueEnum<'ctx> =
+        builder.build_float_div(one, src.into_float_value(), "recip").context(ArithmeticSnafu)?.into();
+    common::fast_math::apply_fast_math_flags(result);
+    Ok(result)
 }
 
 fn codegen_trunc<'ctx>(

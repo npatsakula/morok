@@ -142,11 +142,18 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     let pm_hreduce = crate::rangeify::patterns::pm_horizontal_reduce();
     let hreduced = crate::rewrite::graph_rewrite_bottom_up(&pm_hreduce, devectorized, &mut ());
 
+    // FMA decomposition: a*b+c → MulAcc(a,b,c) for float types.
+    // Applied late so optimizations can still see Add(Mul) structure.
+    // Must run AFTER horizontal reduce (which may create Add chains from GEPs).
+    // Based on Tinygrad's decompositions.py:362.
+    let pm_fma = crate::rangeify::patterns::pm_fma_decomposition();
+    let with_fma = crate::rewrite::graph_rewrite_bottom_up(&pm_fma, hreduced, &mut ());
+
     // Post-expand: Linearize multi-index INDEX ops
     // This MUST run after pre_expand to avoid creating Binary(Range*stride) before expand.
     // If linearized before expand, Range ops inside Binary get vectorized incorrectly.
     let post_expand_matcher = crate::rangeify::post_expand_patterns();
-    crate::rewrite::graph_rewrite_bottom_up(&post_expand_matcher, hreduced, &mut ())
+    crate::rewrite::graph_rewrite_bottom_up(&post_expand_matcher, with_fma, &mut ())
 }
 
 /// Apply optimizations with explicit configuration.

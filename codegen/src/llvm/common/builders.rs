@@ -18,6 +18,7 @@ use snafu::ResultExt;
 // ============================================================================
 
 /// Generate a binary arithmetic function that dispatches on float/int and scalar/vector.
+/// Float operations have fast-math flags applied for FMA fusion and other optimizations.
 macro_rules! impl_binary_arith {
     ($fn_name:ident, $float_method:ident, $int_method:ident, $name:literal) => {
         pub fn $fn_name<'ctx>(
@@ -27,17 +28,20 @@ macro_rules! impl_binary_arith {
             is_float: bool,
         ) -> Result<BasicValueEnum<'ctx>> {
             if is_float {
-                if lhs.is_vector_value() {
-                    Ok(builder
+                let result: BasicValueEnum<'ctx> = if lhs.is_vector_value() {
+                    builder
                         .$float_method(lhs.into_vector_value(), rhs.into_vector_value(), $name)
                         .context(ArithmeticSnafu)?
-                        .into())
+                        .into()
                 } else {
-                    Ok(builder
+                    builder
                         .$float_method(lhs.into_float_value(), rhs.into_float_value(), $name)
                         .context(ArithmeticSnafu)?
-                        .into())
-                }
+                        .into()
+                };
+                // Apply fast-math flags for FMA fusion and other float optimizations
+                fast_math::apply_fast_math_flags(result);
+                Ok(result)
             } else if lhs.is_vector_value() {
                 Ok(builder
                     .$int_method(lhs.into_vector_value(), rhs.into_vector_value(), $name)
@@ -62,17 +66,20 @@ impl_binary_arith!(build_mul, build_float_mul, build_int_mul, "mul");
 // ============================================================================
 
 /// Build a negation, dispatching on float/int and scalar/vector.
+/// Float operations have fast-math flags applied.
 pub fn build_neg<'ctx>(
     builder: &Builder<'ctx>,
     src: BasicValueEnum<'ctx>,
     is_float: bool,
 ) -> Result<BasicValueEnum<'ctx>> {
     if is_float {
-        if src.is_vector_value() {
-            Ok(builder.build_float_neg(src.into_vector_value(), "neg").context(ArithmeticSnafu)?.into())
+        let result: BasicValueEnum<'ctx> = if src.is_vector_value() {
+            builder.build_float_neg(src.into_vector_value(), "neg").context(ArithmeticSnafu)?.into()
         } else {
-            Ok(builder.build_float_neg(src.into_float_value(), "neg").context(ArithmeticSnafu)?.into())
-        }
+            builder.build_float_neg(src.into_float_value(), "neg").context(ArithmeticSnafu)?.into()
+        };
+        fast_math::apply_fast_math_flags(result);
+        Ok(result)
     } else if src.is_vector_value() {
         Ok(builder.build_int_neg(src.into_vector_value(), "neg").context(ArithmeticSnafu)?.into())
     } else {
@@ -117,6 +124,7 @@ pub fn build_int_div<'ctx>(
 }
 
 /// Build a remainder, dispatching on float/int, signed/unsigned, and scalar/vector.
+/// Float operations have fast-math flags applied.
 pub fn build_rem<'ctx>(
     builder: &Builder<'ctx>,
     lhs: BasicValueEnum<'ctx>,
@@ -125,17 +133,19 @@ pub fn build_rem<'ctx>(
     is_signed: bool,
 ) -> Result<BasicValueEnum<'ctx>> {
     if is_float {
-        if lhs.is_vector_value() {
-            Ok(builder
+        let result: BasicValueEnum<'ctx> = if lhs.is_vector_value() {
+            builder
                 .build_float_rem(lhs.into_vector_value(), rhs.into_vector_value(), "mod")
                 .context(ArithmeticSnafu)?
-                .into())
+                .into()
         } else {
-            Ok(builder
+            builder
                 .build_float_rem(lhs.into_float_value(), rhs.into_float_value(), "mod")
                 .context(ArithmeticSnafu)?
-                .into())
-        }
+                .into()
+        };
+        fast_math::apply_fast_math_flags(result);
+        Ok(result)
     } else if is_signed {
         if lhs.is_vector_value() {
             Ok(builder
@@ -291,5 +301,45 @@ pub fn harmonize_operands<'ctx>(
         (n, 1) if n > 1 => Ok((lhs, broadcast_to_vector(builder, rhs, n, context)?)),
         (l, r) if l == r => Ok((lhs, rhs)),
         (l, r) => VectorWidthMismatchSnafu { lhs: l, rhs: r }.fail(),
+    }
+}
+
+// ============================================================================
+// Fast-math flags
+// ============================================================================
+
+/// LLVM Fast-Math Flags for floating-point optimizations.
+///
+/// Following Tinygrad's approach (llvmir.py:69):
+/// `flags = " nsz arcp contract afn"`
+///
+/// Reference: https://llvm.org/docs/LangRef.html#fast-math-flags
+pub mod fast_math {
+    use inkwell::values::{BasicValue, BasicValueEnum};
+
+    /// NoSignedZeros (1 << 3): Treat -0 and +0 as equivalent.
+    pub const FMF_NSZ: u32 = 1 << 3;
+
+    /// AllowReciprocal (1 << 4): Allow optimizations using reciprocal (1/x approximation).
+    pub const FMF_ARCP: u32 = 1 << 4;
+
+    /// AllowContract (1 << 5): Allow floating-point contraction (e.g., fusing a*b+c into fma).
+    pub const FMF_CONTRACT: u32 = 1 << 5;
+
+    /// ApproxFunc (1 << 6): Allow substitution of approximate calculations for functions.
+    pub const FMF_AFN: u32 = 1 << 6;
+
+    /// Default fast-math flags for ML workloads, matching Tinygrad: nsz arcp contract afn.
+    pub const FMF_DEFAULT: u32 = FMF_NSZ | FMF_ARCP | FMF_CONTRACT | FMF_AFN;
+
+    /// Apply fast-math flags to a floating-point instruction result.
+    ///
+    /// This is safe to call on any value - non-FP instructions are silently ignored.
+    /// The flags enable LLVM to perform FMA fusion and other float optimizations.
+    #[inline]
+    pub fn apply_fast_math_flags(value: BasicValueEnum<'_>) {
+        if let Some(inst) = value.as_instruction_value() {
+            inst.set_fast_math_flags(FMF_DEFAULT);
+        }
     }
 }

@@ -1645,6 +1645,35 @@ pub fn pm_scalar_accumulators() -> PatternMatcher<()> {
 }
 
 // ============================================================================
+// FMA DECOMPOSITION (a*b+c → MulAcc)
+// ============================================================================
+
+/// FMA pattern detection: a*b+c → MulAcc(a,b,c)
+///
+/// Based on Tinygrad's decompositions.py:362:
+/// ```python
+/// if Ops.MULACC in ops: pat += [
+///     (UPat.var('a')*UPat.var('b')+UPat.var('c'),
+///      lambda a,b,c: a.alu(Ops.MULACC, b, c))
+/// ]
+/// ```
+///
+/// Applied late (post-optimization) so earlier passes can still work with Add(Mul) structure.
+/// Only matches float types where FMA provides benefit (maps to llvm.fma intrinsic).
+pub fn pm_fma_decomposition() -> PatternMatcher<()> {
+    crate::patterns! {
+        // Pattern 1: (a*b)+c → MulAcc(a,b,c)
+        Add(Mul(a, b), c) if a.dtype().is_float() => {
+            UOp::try_mulacc(a.clone(), b.clone(), c.clone()).ok()
+        },
+        // Pattern 2: c+(a*b) → MulAcc(a,b,c) (commutative)
+        Add(c, Mul(a, b)) if a.dtype().is_float() => {
+            UOp::try_mulacc(a.clone(), b.clone(), c.clone()).ok()
+        },
+    }
+}
+
+// ============================================================================
 // DEPRECATED PATTERNS (for backwards compatibility)
 // ============================================================================
 

@@ -33,8 +33,8 @@ pub use kernel::{PcontigConfig, SplitReduceOpConfig};
 // Pattern matchers
 pub use patterns::{
     apply_rangeify_patterns, buffer_folding, buffer_limit_patterns, buffer_removal, buffer_removal_with_pcontig,
-    dead_axis_removal, early_rewrites, movement_op_patterns, post_expand_patterns, rangeify_codegen_patterns,
-    reduction_simplify_patterns, split_reduceop_patterns, to_define_global_patterns,
+    dead_axis_removal, early_rewrites, movement_op_patterns, pm_fma_decomposition, post_expand_patterns,
+    rangeify_codegen_patterns, reduction_simplify_patterns, split_reduceop_patterns, to_define_global_patterns,
 };
 
 // Buffer cost analysis
