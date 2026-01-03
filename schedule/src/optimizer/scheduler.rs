@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use morok_ir::{AxisId, AxisType, Op, UOp, UOpKey};
+use smallvec::SmallVec;
 
 use super::error::*;
 use super::renderer::Renderer;
@@ -58,12 +59,15 @@ fn flatten_ranges(ast: Arc<UOp>) -> Arc<UOp> {
             // Recreate REDUCE with flattened ranges
             UOp::reduce(flattened_src, flattened.into(), *reduce_op)
         }
-        Op::Store { buffer, index, value } => {
+        Op::Store { buffer, index, value, ranges } => {
             // Recursively flatten value being stored
             let flattened_value = flatten_ranges(value.clone());
 
-            // Recreate STORE with flattened value
-            UOp::store(buffer.clone(), index.clone(), flattened_value)
+            // Also flatten ranges
+            let flattened_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|r| flatten_ranges(r.clone())).collect();
+
+            // Recreate STORE with flattened value and ranges
+            UOp::store_with_ranges(buffer.clone(), index.clone(), flattened_value, flattened_ranges)
         }
         _ => {
             // No flattening needed for other operations
@@ -367,15 +371,25 @@ impl Scheduler {
     ///
     /// # Returns
     ///
-    /// Product of all UPCAST dimension sizes, or 1 if no upcasts exist.
+    /// Product of all UPCAST and UNROLL dimension sizes, or 1 if none exist.
+    ///
+    /// # Note
+    ///
+    /// This matches Tinygrad's `upcast_size()` which computes:
+    /// `prod(self.full_shape[a] for a in self.axes_of(AxisType.UPCAST, AxisType.UNROLL))`
+    ///
+    /// Used as a generic guard to prevent exponential vector width growth from
+    /// multiple unroll sources (K-vectorization, output-upcast, general unrolling).
     pub fn upcast_size(&self) -> usize {
         self.rngs()
             .iter()
-            .filter(
-                |rng| {
-                    if let Op::Range { axis_type, .. } = rng.op() { *axis_type == AxisType::Upcast } else { false }
-                },
-            )
+            .filter(|rng| {
+                if let Op::Range { axis_type, .. } = rng.op() {
+                    matches!(axis_type, AxisType::Upcast | AxisType::Unroll)
+                } else {
+                    false
+                }
+            })
             .filter_map(|rng| {
                 if let Op::Range { end, .. } = rng.op()
                     && let Op::Const(cv) = end.op()

@@ -432,9 +432,15 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
         UOp::index_const(0)
     };
 
+    // Create STORE with empty ranges - iteration space ranges go on END wrapper.
+    // This matches Tinygrad's architecture: .store().end(*rngs)
+    //
+    // The END wrapper is critical because:
+    // 1. split_store looks for END { computation: STORE, ranges } pattern
+    // 2. END.ranges define the iteration space for the kernel
+    // 3. Without END wrapper, kernel splitting loses iteration info
     let store = UOp::store(buffer.clone(), store_target, compute.clone());
-
-    let mut do_store = if !ranges.is_empty() { UOp::end(store.clone(), ranges.clone()) } else { store };
+    let mut do_store = if !ranges.is_empty() { UOp::end(store, ranges.clone()) } else { store };
 
     if opts.addrspace == AddrSpace::Local {
         do_store = UOp::barrier(do_store, SmallVec::new());

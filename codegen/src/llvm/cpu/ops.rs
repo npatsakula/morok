@@ -654,7 +654,8 @@ fn codegen_memory<'ctx>(
             let index_val = require_value(index, context, module, builder, values)?;
             Ok(Some(codegen_load(buffer_ptr, index_val, &uop.dtype(), context, builder)?))
         }
-        Op::Store { buffer, index, value } => {
+        Op::Store { buffer, index, value, ranges: _ } => {
+            // ranges are handled in the expand pass - should be empty at codegen time
             let buffer_ptr = require_value(buffer, context, module, builder, values)?;
             let index_val = require_value(index, context, module, builder, values)?;
             let value_val = require_value(value, context, module, builder, values)?;

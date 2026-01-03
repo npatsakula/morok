@@ -540,13 +540,17 @@ impl UPat {
 
     // ===== Kernel Splitting Helpers =====
 
-    /// Match STORE operation: `STORE(buffer, index, value)`
+    /// Match STORE operation: `STORE(buffer, index, value, *ranges)`
+    ///
+    /// Note: This pattern matches stores with exactly 3 sources (no ranges).
+    /// For stores with ranges, use `store_any()`.
     pub fn store(buffer: UPat, index: UPat, value: UPat) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Store {
                 buffer: UOp::noop(),
                 index: UOp::noop(),
                 value: UOp::noop(),
+                ranges: SmallVec::new(),
             }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![buffer, index, value])),
@@ -555,7 +559,26 @@ impl UPat {
         }
     }
 
-    /// Match gated STORE operation: `STORE_GATED(buffer, index, value, gate)`
+    /// Match any STORE operation regardless of ranges.
+    pub fn store_any() -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Store {
+                buffer: UOp::noop(),
+                index: UOp::noop(),
+                value: UOp::noop(),
+                ranges: SmallVec::new(),
+            }))]),
+            dtype: None,
+            src: None,
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match gated STORE operation: `STORE_GATED(buffer, index, value, gate, *ranges)`
+    ///
+    /// Note: This pattern matches stores with exactly 4 sources (no ranges).
+    /// For stores with ranges, use `store_gated_any()`.
     pub fn store_gated(buffer: UPat, index: UPat, value: UPat, gate: UPat) -> Self {
         UPat::Match {
             op: Some(vec![OpFilter::Discriminant(discriminant(&Op::StoreGated {
@@ -563,9 +586,27 @@ impl UPat {
                 index: UOp::noop(),
                 value: UOp::noop(),
                 gate: UOp::noop(),
+                ranges: SmallVec::new(),
             }))]),
             dtype: None,
             src: Some(SrcPattern::Tuple(vec![buffer, index, value, gate])),
+            arg: None,
+            name: None,
+        }
+    }
+
+    /// Match any gated STORE operation regardless of ranges.
+    pub fn store_gated_any() -> Self {
+        UPat::Match {
+            op: Some(vec![OpFilter::Discriminant(discriminant(&Op::StoreGated {
+                buffer: UOp::noop(),
+                index: UOp::noop(),
+                value: UOp::noop(),
+                gate: UOp::noop(),
+                ranges: SmallVec::new(),
+            }))]),
+            dtype: None,
+            src: None,
             arg: None,
             name: None,
         }

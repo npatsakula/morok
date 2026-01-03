@@ -110,7 +110,12 @@ fn test_cranelift_bootstrap_pipeline() {
     let const_0 = UOp::index_const(0);
 
     let store = UOp::new(
-        Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: const_42.clone() },
+        Op::Store {
+            buffer: buf0.clone(),
+            index: const_0.clone(),
+            value: const_42.clone(),
+            ranges: smallvec::SmallVec::new(),
+        },
         DType::Scalar(ScalarDType::Void),
     );
 
@@ -165,7 +170,12 @@ fn test_cranelift_exp2_decomposition() {
 
     let const_0 = UOp::index_const(0);
     let store = UOp::new(
-        Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: exp2_result.clone() },
+        Op::Store {
+            buffer: buf0.clone(),
+            index: const_0.clone(),
+            value: exp2_result.clone(),
+            ranges: smallvec::SmallVec::new(),
+        },
         DType::Scalar(ScalarDType::Void),
     );
 
@@ -228,7 +238,12 @@ fn test_cranelift_simple_math() {
 
     let const_0 = UOp::index_const(0);
     let store = UOp::new(
-        Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: mul_result.clone() },
+        Op::Store {
+            buffer: buf0.clone(),
+            index: const_0.clone(),
+            value: mul_result.clone(),
+            ranges: smallvec::SmallVec::new(),
+        },
         DType::Scalar(ScalarDType::Void),
     );
 
@@ -273,7 +288,12 @@ fn test_cranelift_pow2if() {
 
     let const_0 = UOp::index_const(0);
     let store = UOp::new(
-        Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: pow2if_result.clone() },
+        Op::Store {
+            buffer: buf0.clone(),
+            index: const_0.clone(),
+            value: pow2if_result.clone(),
+            ranges: smallvec::SmallVec::new(),
+        },
         DType::Scalar(ScalarDType::Void),
     );
 
@@ -320,7 +340,12 @@ fn test_cranelift_ldexp2k() {
 
     let const_0 = UOp::index_const(0);
     let store = UOp::new(
-        Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: ldexp_result.clone() },
+        Op::Store {
+            buffer: buf0.clone(),
+            index: const_0.clone(),
+            value: ldexp_result.clone(),
+            ranges: smallvec::SmallVec::new(),
+        },
         DType::Scalar(ScalarDType::Void),
     );
 
@@ -367,7 +392,12 @@ fn test_cranelift_rintk() {
 
     let const_0 = UOp::index_const(0);
     let store = UOp::new(
-        Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: rintk_result.clone() },
+        Op::Store {
+            buffer: buf0.clone(),
+            index: const_0.clone(),
+            value: rintk_result.clone(),
+            ranges: smallvec::SmallVec::new(),
+        },
         DType::Scalar(ScalarDType::Void),
     );
 
@@ -432,7 +462,12 @@ fn test_cranelift_exp2_simple() {
 
     let const_0 = UOp::index_const(0);
     let store = UOp::new(
-        Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: result.clone() },
+        Op::Store {
+            buffer: buf0.clone(),
+            index: const_0.clone(),
+            value: result.clone(),
+            ranges: smallvec::SmallVec::new(),
+        },
         DType::Scalar(ScalarDType::Void),
     );
 
@@ -485,7 +520,12 @@ fn test_cranelift_ldexp_with_rintk() {
 
     let const_0 = UOp::index_const(0);
     let store = UOp::new(
-        Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: result.clone() },
+        Op::Store {
+            buffer: buf0.clone(),
+            index: const_0.clone(),
+            value: result.clone(),
+            ranges: smallvec::SmallVec::new(),
+        },
         DType::Scalar(ScalarDType::Void),
     );
 
@@ -530,7 +570,12 @@ fn test_cranelift_poly_at_zero() {
 
     let const_0 = UOp::index_const(0);
     let store = UOp::new(
-        Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: result.clone() },
+        Op::Store {
+            buffer: buf0.clone(),
+            index: const_0.clone(),
+            value: result.clone(),
+            ranges: smallvec::SmallVec::new(),
+        },
         DType::Scalar(ScalarDType::Void),
     );
 
@@ -589,7 +634,12 @@ fn test_cranelift_exp2_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let store = UOp::new(
-            Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: exp2_result.clone() },
+            Op::Store {
+                buffer: buf0.clone(),
+                index: const_0.clone(),
+                value: exp2_result.clone(),
+                ranges: smallvec::SmallVec::new(),
+            },
             DType::Scalar(ScalarDType::Void),
         );
 
@@ -668,7 +718,12 @@ fn test_cranelift_sin_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let store = UOp::new(
-            Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: sin_result.clone() },
+            Op::Store {
+                buffer: buf0.clone(),
+                index: const_0.clone(),
+                value: sin_result.clone(),
+                ranges: smallvec::SmallVec::new(),
+            },
             DType::Scalar(ScalarDType::Void),
         );
 
@@ -740,7 +795,12 @@ fn test_cranelift_cos_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let store = UOp::new(
-            Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: cos_result.clone() },
+            Op::Store {
+                buffer: buf0.clone(),
+                index: const_0.clone(),
+                value: cos_result.clone(),
+                ranges: smallvec::SmallVec::new(),
+            },
             DType::Scalar(ScalarDType::Void),
         );
 
@@ -806,7 +866,12 @@ fn test_cranelift_log2_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let store = UOp::new(
-            Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: log2_result.clone() },
+            Op::Store {
+                buffer: buf0.clone(),
+                index: const_0.clone(),
+                value: log2_result.clone(),
+                ranges: smallvec::SmallVec::new(),
+            },
             DType::Scalar(ScalarDType::Void),
         );
 
@@ -863,7 +928,12 @@ fn test_cranelift_exp_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let store = UOp::new(
-            Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: exp_result.clone() },
+            Op::Store {
+                buffer: buf0.clone(),
+                index: const_0.clone(),
+                value: exp_result.clone(),
+                ranges: smallvec::SmallVec::new(),
+            },
             DType::Scalar(ScalarDType::Void),
         );
 
@@ -920,7 +990,12 @@ fn test_cranelift_log_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let store = UOp::new(
-            Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: log_result.clone() },
+            Op::Store {
+                buffer: buf0.clone(),
+                index: const_0.clone(),
+                value: log_result.clone(),
+                ranges: smallvec::SmallVec::new(),
+            },
             DType::Scalar(ScalarDType::Void),
         );
 
@@ -989,7 +1064,12 @@ fn test_cranelift_tan_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let store = UOp::new(
-            Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: tan_result.clone() },
+            Op::Store {
+                buffer: buf0.clone(),
+                index: const_0.clone(),
+                value: tan_result.clone(),
+                ranges: smallvec::SmallVec::new(),
+            },
             DType::Scalar(ScalarDType::Void),
         );
 
@@ -1070,7 +1150,12 @@ fn test_cranelift_erf_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let store = UOp::new(
-            Op::Store { buffer: buf0.clone(), index: const_0.clone(), value: erf_result.clone() },
+            Op::Store {
+                buffer: buf0.clone(),
+                index: const_0.clone(),
+                value: erf_result.clone(),
+                ranges: smallvec::SmallVec::new(),
+            },
             DType::Scalar(ScalarDType::Void),
         );
 

@@ -167,19 +167,50 @@ impl UOp {
         Self::new(Op::LoadGated { buffer, index, gate }, dtype)
     }
 
-    /// Create a STORE operation.
+    /// Create a STORE operation without ranges.
     ///
     /// Stores a value to a buffer at the given index.
+    /// For stores with ranges (e.g., output upcasting), use `store_with_ranges`.
     pub fn store(buffer: Arc<Self>, index: Arc<Self>, value: Arc<Self>) -> Arc<Self> {
-        Self::new(Op::Store { buffer, index, value }, DType::Void)
+        Self::store_with_ranges(buffer, index, value, SmallVec::new())
     }
 
-    /// Create a gated STORE operation.
+    /// Create a STORE operation with ranges.
+    ///
+    /// Stores a value to a buffer at the given index, with explicit ranges
+    /// that define the scope of the store operation. This matches Tinygrad's
+    /// architecture where STORE sources include range arguments at index 3+.
+    ///
+    /// Ranges are used for output upcasting: Range(Upcast) becomes UNROLL
+    /// during expansion, which `fix_store_unroll` contracts via CONTRACT.
+    pub fn store_with_ranges(
+        buffer: Arc<Self>,
+        index: Arc<Self>,
+        value: Arc<Self>,
+        ranges: SmallVec<[Arc<Self>; 4]>,
+    ) -> Arc<Self> {
+        Self::new(Op::Store { buffer, index, value, ranges }, DType::Void)
+    }
+
+    /// Create a gated STORE operation without ranges.
     ///
     /// Stores a value to a buffer at the given index, conditionally based on gate.
     /// If gate is false, the store may be skipped.
     pub fn store_gated(buffer: Arc<Self>, index: Arc<Self>, value: Arc<Self>, gate: Arc<Self>) -> Arc<Self> {
-        Self::new(Op::StoreGated { buffer, index, value, gate }, DType::Void)
+        Self::store_gated_with_ranges(buffer, index, value, gate, SmallVec::new())
+    }
+
+    /// Create a gated STORE operation with ranges.
+    ///
+    /// Stores a value conditionally with explicit ranges for scope definition.
+    pub fn store_gated_with_ranges(
+        buffer: Arc<Self>,
+        index: Arc<Self>,
+        value: Arc<Self>,
+        gate: Arc<Self>,
+        ranges: SmallVec<[Arc<Self>; 4]>,
+    ) -> Arc<Self> {
+        Self::new(Op::StoreGated { buffer, index, value, gate, ranges }, DType::Void)
     }
 
     // =========================================================================

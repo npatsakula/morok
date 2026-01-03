@@ -63,22 +63,19 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
 
 /// Split dimension into smaller range + UPCAST for vector operations.
 ///
-/// For REDUCE axes, this creates vectorized accumulators that maintain
-/// vector width through the reduction loop, with horizontal reduction at the end.
-/// This enables efficient matmul register tiling patterns.
+/// UPCAST is for output dimension vectorization (GLOBAL/LOCAL/LOOP).
+/// For reduce axis unrolling, use UNROLL instead.
 fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     let axis_type = match rng.op() {
         Op::Range { axis_type, .. } => *axis_type,
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
-    // GLOBAL/LOCAL/LOOP/REDUCE/OUTER can be upcasted
-    // - GLOBAL/LOCAL/LOOP: Standard vectorization of output dimensions
-    // - OUTER: Output dimensions in reduce kernels (e.g., matmul M/N dimensions)
-    // - REDUCE: Creates vectorized accumulators for register tiling (e.g., matmul K-dimension)
-    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop | AxisType::Reduce | AxisType::Outer) {
-        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop/Reduce/Outer axes" }
-            .fail();
+    // Match Tinygrad: UPCAST is for output dimension vectorization only
+    // GLOBAL/LOCAL/LOOP can be upcasted (output dimensions)
+    // REDUCE/GROUP_REDUCE should use UNROLL instead
+    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
+        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop axes" }.fail();
     }
 
     if amount > scheduler.ren.upcast_max {
@@ -305,12 +302,11 @@ fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
     }
 
     // Validate thread count within limits
-    if let Some(global_max) = &scheduler.ren.global_max {
-        if let Some(&max_threads) = global_max.first() {
-            if amount > max_threads {
-                return DeviceLimitExceededSnafu { limit_type: "thread count", value: amount, max: max_threads }.fail();
-            }
-        }
+    if let Some(global_max) = &scheduler.ren.global_max
+        && let Some(&max_threads) = global_max.first()
+        && amount > max_threads
+    {
+        return DeviceLimitExceededSnafu { limit_type: "thread count", value: amount, max: max_threads }.fail();
     }
 
     // Validate axis type (must be parallelizable)

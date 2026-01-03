@@ -273,12 +273,14 @@ pub enum Op {
         buffer: Arc<UOp>,
         index: Arc<UOp>,
         value: Arc<UOp>,
+        ranges: SmallVec<[Arc<UOp>; 4]>,
     },
     StoreGated {
         buffer: Arc<UOp>,
         index: Arc<UOp>,
         value: Arc<UOp>,
         gate: Arc<UOp>,
+        ranges: SmallVec<[Arc<UOp>; 4]>,
     },
 }
 
@@ -403,8 +405,16 @@ impl Op {
             // Memory operations
             Self::Load { buffer, index } => SmallVec::from_slice(&[buffer, index]),
             Self::LoadGated { buffer, index, gate } => SmallVec::from_slice(&[buffer, index, gate]),
-            Self::Store { buffer, index, value } => SmallVec::from_slice(&[buffer, index, value]),
-            Self::StoreGated { buffer, index, value, gate } => SmallVec::from_slice(&[buffer, index, value, gate]),
+            Self::Store { buffer, index, value, ranges } => {
+                let mut children = SmallVec::from_slice(&[buffer, index, value]);
+                children.extend(ranges.iter());
+                children
+            }
+            Self::StoreGated { buffer, index, value, gate, ranges } => {
+                let mut children = SmallVec::from_slice(&[buffer, index, value, gate]);
+                children.extend(ranges.iter());
+                children
+            }
         }
     }
 
@@ -479,10 +489,18 @@ impl Op {
     /// assert_eq!(binary_op.range_ending_src_index(), None);
     /// ```
     pub fn range_ending_src_index(&self) -> Option<usize> {
+        // Source layout for range-ending ops:
+        // - BUFFERIZE: compute=0, ranges=1+
+        // - REDUCE: src=0, ranges=1+
+        // - STORE: buffer=0, index=1, value=2, ranges=3+
+        // - STOREGATED: buffer=0, index=1, value=2, gate=3, ranges=4+
+        // - WMMA: a=0, b=1, c=2, (ranges start at 3)
+        // - END: computation=0, ranges=1+
         match self {
             Self::Bufferize { .. } => Some(1),
             Self::Reduce { .. } => Some(1),
-            Self::Store { .. } | Self::StoreGated { .. } => Some(2),
+            Self::Store { .. } => Some(3),
+            Self::StoreGated { .. } => Some(4),
             Self::Wmma { .. } => Some(3),
             Self::End { .. } => Some(1),
             _ => None,
@@ -516,7 +534,7 @@ impl Op {
             // Memory operations
             Self::Load { .. } | Self::LoadGated { .. } |
             Self::Store { .. } | Self::StoreGated { .. } |
-            Self::Index { .. } |
+            Self::Index { .. } | Self::PointerIndex { .. } |
             // Buffer operations
             Self::Bufferize { .. } |
             // Control flow (range-ending ops)

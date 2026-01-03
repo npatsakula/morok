@@ -96,7 +96,7 @@ fn test_store() {
     assert_eq!(store.dtype(), DType::Void);
 
     // Should be Store op
-    if let Op::Store { buffer: b, index: i, value: v } = store.op() {
+    if let Op::Store { buffer: b, index: i, value: v, .. } = store.op() {
         assert!(std::sync::Arc::ptr_eq(b, &buffer));
         assert!(std::sync::Arc::ptr_eq(i, &index));
         assert!(std::sync::Arc::ptr_eq(v, &value));
@@ -118,7 +118,7 @@ fn test_store_gated() {
     assert_eq!(store.dtype(), DType::Void);
 
     // Should be StoreGated op
-    if let Op::StoreGated { buffer: b, index: i, value: v, gate: g } = store.op() {
+    if let Op::StoreGated { buffer: b, index: i, value: v, gate: g, .. } = store.op() {
         assert!(std::sync::Arc::ptr_eq(b, &buffer));
         assert!(std::sync::Arc::ptr_eq(i, &index));
         assert!(std::sync::Arc::ptr_eq(v, &value));

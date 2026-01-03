@@ -1156,6 +1156,7 @@ dependencies = [
  "papaya",
  "parking_lot 0.12.5",
  "rayon",
+ "smallvec",
  "snafu",
  "test-case",
  "tracing",

@@ -123,6 +123,18 @@ impl UOp {
         Self::new(Op::Unroll { src, unroll_axes }, dtype)
     }
 
+    /// Create UNROLL with explicit dtype (for do_contract pattern).
+    ///
+    /// Used when UNROLL dtype should differ from source dtype,
+    /// specifically when CONTRACT collapses UNROLL via GEP and
+    /// we need to preserve the per-iteration element type.
+    ///
+    /// Based on Tinygrad's pattern where partial contraction creates
+    /// UNROLL with remaining axes but CONTRACT's dtype.
+    pub fn unroll_with_dtype(src: Arc<Self>, unroll_axes: Vec<(usize, usize)>, dtype: DType) -> Arc<Self> {
+        Self::new(Op::Unroll { src, unroll_axes }, dtype)
+    }
+
     /// Create a CAT operation (concatenate vectors).
     ///
     /// Combines multiple scalar or vector values into a single larger vector.

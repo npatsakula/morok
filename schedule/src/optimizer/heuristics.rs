@@ -48,7 +48,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     apply_matmul_k_vectorization(scheduler, config);
 
     // 3.6. Matmul output dimension upcasting (CPU-only, creates register tiles)
-    // Skipped if K-vectorization was applied (expand/codegen interaction needs work)
+    // Both can run together - upcast_size() guards prevent exponential vector growth
     apply_matmul_output_upcasting(scheduler, config);
 
     // 4. Masked upcasts
@@ -57,7 +57,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     // 5. Heuristic upcasts
     apply_heuristic_upcasts(scheduler);
 
-    // 6. Unroll
+    // 6. Unroll (guarded by upcast_size() < 64 to prevent exponential vector growth)
     apply_unroll(scheduler, config);
 
     // 7. Default upcast
@@ -189,16 +189,12 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
 
 /// Unroll small reduction loops (size <= threshold).
 ///
-/// Skips unrolling reduce axes if K-vectorization (UPCAST) has already been applied,
-/// to avoid deeply nested expressions that the expand pass can't handle.
+/// Uses `upcast_size()` as a generic guard to prevent exponential vector width growth.
+/// This matches Tinygrad's approach (heuristic.py:138) of checking total vectorization width.
 pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     let mut applied = false;
     let unrollable = scheduler.unrollable_dims();
     let threshold = config.unroll_threshold as i64;
-
-    // Check if K-vectorization was applied (Upcast axes exist)
-    // If so, skip unrolling reduce axes to avoid nested Range expressions
-    let has_upcast = !scheduler.axes_of(&[AxisType::Upcast]).is_empty();
 
     for axis_idx in unrollable {
         let rngs = scheduler.rngs();
@@ -206,14 +202,16 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
             continue;
         }
         let rng = &rngs[axis_idx];
-        if let Op::Range { axis_type, end, .. } = rng.op()
+        if let Op::Range { end, .. } = rng.op()
             && let Op::Const(cv) = end.op()
             && let morok_ir::ConstValue::Int(size) = cv.0
             && size > 1
             && size <= threshold
         {
-            // Skip reduce axes if upcast exists (K-vectorization already applied)
-            if has_upcast && matches!(axis_type, AxisType::Reduce) {
+            // Generic guard: skip if combined upcast_size would exceed 32
+            // This prevents exponential vector width growth from multiple unroll sources
+            // (K-vectorization, output-upcast, general unrolling)
+            if scheduler.upcast_size() * (size as usize) > 32 {
                 continue;
             }
 
@@ -305,14 +303,16 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
 
 /// Apply K-vectorization heuristic for matmul patterns.
 ///
-/// For matmul C[i,j] += A[i,k] * B[k,j], applies UPCAST to the K (reduce) axis
-/// to create vectorized accumulators. This reduces loop iterations and enables
-/// SIMD accumulation.
+/// For matmul C[i,j] += A[i,k] * B[k,j], applies UNROLL to the K (reduce) axis
+/// to create unrolled accumulators. This is processed by fix_reduce_unroll
+/// during the expand pass.
+///
+/// Matches Tinygrad's heuristic.py which uses OptOps.UNROLL for REDUCE axes.
 ///
 /// Only applies when:
 /// - Matmul pattern detected (REDUCE(ADD) of MUL of INDEX)
 /// - No grouped reduction already applied
-/// - K dimension size >= 4 (for 4x vectorization)
+/// - K dimension size >= 4 (for 4x unrolling)
 /// - CPU renderer (has_threads, no has_local) - GPU uses different strategies
 pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use tracing::{debug, trace};
@@ -352,6 +352,11 @@ pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler, config: &Heuristi
         return false;
     }
 
+    // Get unrollable dims mapping (GROUP_REDUCE/REDUCE axes)
+    // This gives logical axis indices for the UNROLL opt
+    let unrollable = scheduler.unrollable_dims();
+    trace!(unrollable = ?unrollable, "apply_matmul_k_vectorization: unrollable dims");
+
     // Find innermost reduce axis with size >= 4
     // Collect candidate (real_axis_idx, size) pairs first to avoid borrow issues
     let candidates: Vec<(usize, i64)> = {
@@ -369,7 +374,6 @@ pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler, config: &Heuristi
                     && let morok_ir::ConstValue::Int(size) = cv.0
                     && size >= 4
                 {
-                    // Use real axis index directly (UPCAST uses direct axis index)
                     Some((axis_idx, size))
                 } else {
                     None
@@ -382,18 +386,24 @@ pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler, config: &Heuristi
 
     // Try each candidate in order (innermost first)
     for (axis_idx, size) in candidates {
-        trace!(axis_idx, size, "apply_matmul_k_vectorization: trying upcast");
-        if apply_opt(scheduler, &Opt::upcast(axis_idx, 4), true).is_ok() {
-            debug!(
-                axis_idx,
-                size, "apply_matmul_k_vectorization: SUCCESS - applied upcast(axis={}, factor=4)", axis_idx
-            );
-            return true;
+        // Find logical axis position in unrollable_dims()
+        if let Some(logical) = unrollable.iter().position(|&a| a == axis_idx) {
+            trace!(axis_idx, logical, size, "apply_matmul_k_vectorization: trying unroll");
+            // Use UNROLL instead of UPCAST (matches Tinygrad)
+            if apply_opt(scheduler, &Opt::unroll(logical, 4), true).is_ok() {
+                debug!(
+                    axis_idx,
+                    logical, size, "apply_matmul_k_vectorization: SUCCESS - applied unroll(axis={}, factor=4)", logical
+                );
+                return true;
+            } else {
+                trace!(axis_idx, logical, size, "apply_matmul_k_vectorization: unroll failed");
+            }
         } else {
-            trace!(axis_idx, size, "apply_matmul_k_vectorization: upcast failed");
+            trace!(axis_idx, size, "apply_matmul_k_vectorization: axis not in unrollable_dims");
         }
     }
-    trace!("apply_matmul_k_vectorization: no upcast applied");
+    trace!("apply_matmul_k_vectorization: no unroll applied");
     false
 }
 
@@ -429,17 +439,16 @@ pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &Heurist
         return false;
     }
 
-    // Skip if K-vectorization was already applied (creates vector accumulators)
-    // The interaction between K-vectorization and output upcasting is complex
-    // and can create excessively wide vectors. Apply only one at a time.
-    let upcast_axes = scheduler.axes_of(&[AxisType::Upcast]);
-    if !upcast_axes.is_empty() {
-        trace!("apply_matmul_output_upcasting: skipped (upcast already applied, likely K-vectorization)");
+    // Skip if already at max combined width (can't add more upcasts)
+    // upcast_size() includes both Upcast and Unroll axes
+    if scheduler.upcast_size() >= 16 {
+        trace!("apply_matmul_output_upcasting: skipped (upcast_size >= 16)");
         return false;
     }
 
-    // Get output axes (Global, Outer, Loop - not Reduce/GroupReduce)
-    let output_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Outer, AxisType::Loop]);
+    // Get output axes (Global, Loop - not Outer/Reduce/GroupReduce)
+    // Outer axes are for kernel splitting, not vectorization (matches Tinygrad)
+    let output_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Loop]);
     trace!(num_output_axes = output_axes.len(), "apply_matmul_output_upcasting: output axes");
     if output_axes.is_empty() {
         return false;
@@ -484,7 +493,9 @@ pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &Heurist
 
         // Try factors [4, 3, 2] in order (power-of-2 preferred)
         for factor in [4usize, 3, 2] {
-            if size >= factor as i64 && upcast_product * factor <= target_upcast {
+            // Check: size is large enough, local target not exceeded, AND combined width <= 16
+            let combined_ok = scheduler.upcast_size() * factor <= 16;
+            if size >= factor as i64 && upcast_product * factor <= target_upcast && combined_ok {
                 trace!(axis_idx, factor, "apply_matmul_output_upcasting: trying upcast");
                 match apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true) {
                     Ok(_) => {
@@ -547,7 +558,7 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
 
         // Find largest divisor of size that is <= max_threads
         // This ensures even division (THREAD opt requires it)
-        let thread_count = (2..=max_threads).rev().find(|&t| size % t == 0).unwrap_or(1);
+        let thread_count = (2..=max_threads).rev().find(|&t| size.is_multiple_of(t)).unwrap_or(1);
 
         if thread_count > 1 && apply_opt(scheduler, &Opt::thread(axis_idx, thread_count), true).is_ok() {
             return true;

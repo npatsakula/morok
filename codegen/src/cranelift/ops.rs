@@ -110,7 +110,8 @@ pub(crate) fn codegen_uop(
             Some(codegen_load(buffer_val, index_val, &uop.dtype(), builder)?)
         }
 
-        Op::Store { buffer, index, value } => {
+        Op::Store { buffer, index, value, ranges: _ } => {
+            // ranges are handled in the expand pass - should be empty at codegen time
             let buffer_val = get_value(buffer, builder, values, loop_contexts)?;
             let index_val = get_value(index, builder, values, loop_contexts)?;
             let value_val = get_value(value, builder, values, loop_contexts)?;

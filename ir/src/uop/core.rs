@@ -893,29 +893,41 @@ impl UOp {
                 }
                 Op::LoadGated { buffer: new_buffer, index: new_index, gate: new_gate }
             }
-            Op::Store { buffer, index, value } => {
+            Op::Store { buffer, index, value, ranges } => {
                 let new_buffer = buffer.substitute(map);
                 let new_index = index.substitute(map);
                 let new_value = value.substitute(map);
-                if Arc::ptr_eq(&new_buffer, buffer) && Arc::ptr_eq(&new_index, index) && Arc::ptr_eq(&new_value, value)
+                let new_ranges: SmallVec<[Arc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
+                if Arc::ptr_eq(&new_buffer, buffer)
+                    && Arc::ptr_eq(&new_index, index)
+                    && Arc::ptr_eq(&new_value, value)
+                    && ranges.iter().zip(&new_ranges).all(|(old, new)| Arc::ptr_eq(old, new))
                 {
                     return self.clone();
                 }
-                Op::Store { buffer: new_buffer, index: new_index, value: new_value }
+                Op::Store { buffer: new_buffer, index: new_index, value: new_value, ranges: new_ranges }
             }
-            Op::StoreGated { buffer, index, value, gate } => {
+            Op::StoreGated { buffer, index, value, gate, ranges } => {
                 let new_buffer = buffer.substitute(map);
                 let new_index = index.substitute(map);
                 let new_value = value.substitute(map);
                 let new_gate = gate.substitute(map);
+                let new_ranges: SmallVec<[Arc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
                 if Arc::ptr_eq(&new_buffer, buffer)
                     && Arc::ptr_eq(&new_index, index)
                     && Arc::ptr_eq(&new_value, value)
                     && Arc::ptr_eq(&new_gate, gate)
+                    && ranges.iter().zip(&new_ranges).all(|(old, new)| Arc::ptr_eq(old, new))
                 {
                     return self.clone();
                 }
-                Op::StoreGated { buffer: new_buffer, index: new_index, value: new_value, gate: new_gate }
+                Op::StoreGated {
+                    buffer: new_buffer,
+                    index: new_index,
+                    value: new_value,
+                    gate: new_gate,
+                    ranges: new_ranges,
+                }
             }
 
             // Variable-arity operations
@@ -1338,12 +1350,23 @@ impl UOp {
                 Op::LoadGated { buffer: src(0), index: src(1), gate: src(2) }
             }
             Op::Store { .. } => {
-                assert_eq!(new_srcs.len(), 3);
-                Op::Store { buffer: src(0), index: src(1), value: src(2) }
+                assert!(new_srcs.len() >= 3, "Store requires at least 3 sources (buffer, index, value)");
+                Op::Store {
+                    buffer: src(0),
+                    index: src(1),
+                    value: src(2),
+                    ranges: new_srcs[3..].iter().cloned().collect(),
+                }
             }
             Op::StoreGated { .. } => {
-                assert_eq!(new_srcs.len(), 4);
-                Op::StoreGated { buffer: src(0), index: src(1), value: src(2), gate: src(3) }
+                assert!(new_srcs.len() >= 4, "StoreGated requires at least 4 sources (buffer, index, value, gate)");
+                Op::StoreGated {
+                    buffer: src(0),
+                    index: src(1),
+                    value: src(2),
+                    gate: src(3),
+                    ranges: new_srcs[4..].iter().cloned().collect(),
+                }
             }
 
             // Graph organization

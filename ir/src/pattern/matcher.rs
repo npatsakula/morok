@@ -401,9 +401,18 @@ impl OpKey {
             // Memory operations
             m.insert(discriminant(&Op::Load { buffer: noop(), index: noop() }), OpKey::Load);
             m.insert(discriminant(&Op::LoadGated { buffer: noop(), index: noop(), gate: noop() }), OpKey::LoadGated);
-            m.insert(discriminant(&Op::Store { buffer: noop(), index: noop(), value: noop() }), OpKey::Store);
             m.insert(
-                discriminant(&Op::StoreGated { buffer: noop(), index: noop(), value: noop(), gate: noop() }),
+                discriminant(&Op::Store { buffer: noop(), index: noop(), value: noop(), ranges: SmallVec::new() }),
+                OpKey::Store,
+            );
+            m.insert(
+                discriminant(&Op::StoreGated {
+                    buffer: noop(),
+                    index: noop(),
+                    value: noop(),
+                    gate: noop(),
+                    ranges: SmallVec::new(),
+                }),
                 OpKey::StoreGated,
             );
 

@@ -54,13 +54,11 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // Thread ranges use thread_id parameter instead of creating loops
         let nodes = uop.toposort();
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
-            if let Op::Range { axis_type: morok_ir::AxisType::Thread, end, .. } = n.op() {
-                if let Op::Const(cv) = end.op() {
-                    if let morok_ir::ConstValue::Int(count) = cv.0 {
+            if let Op::Range { axis_type: morok_ir::AxisType::Thread, end, .. } = n.op()
+                && let Op::Const(cv) = end.op()
+                    && let morok_ir::ConstValue::Int(count) = cv.0 {
                         return Some((n.clone(), count as usize));
                     }
-                }
-            }
             None
         });
 

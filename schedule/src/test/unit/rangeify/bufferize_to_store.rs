@@ -20,7 +20,7 @@ fn test_bufferize_to_store_global() {
     let result = result.unwrap();
 
     // bufferize_to_store returns AFTER(passthrough=DEFINE_GLOBAL, deps=[END(STORE)])
-    // Following Tinygrad's pattern: return buf.after(do_store)
+    // Following Tinygrad's architecture: .store().end(*rngs)
     let Op::After { passthrough, deps } = result.op() else {
         panic!("Expected AFTER operation, got {:?}", result.op());
     };
@@ -29,19 +29,22 @@ fn test_bufferize_to_store_global() {
     assert!(matches!(passthrough.op(), Op::DefineGlobal(0)));
     assert_eq!(deps.len(), 1);
 
-    // Unwrap AFTER to get END
-    let Op::End { computation, ranges } = deps[0].op() else {
-        panic!("Expected END operation in deps");
+    // Deps should contain END wrapping STORE
+    let Op::End { computation, ranges: end_ranges } = deps[0].op() else {
+        panic!("Expected END operation in deps, got {:?}", deps[0].op());
     };
 
-    // Should have 1 range
-    assert_eq!(ranges.len(), 1);
-    assert!(std::sync::Arc::ptr_eq(&ranges[0], &range));
+    // END should have 1 range
+    assert_eq!(end_ranges.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&end_ranges[0], &range));
 
-    // Computation should be STORE
-    let Op::Store { buffer, index, value } = computation.op() else {
-        panic!("Expected STORE operation");
+    // Unwrap END to get STORE
+    let Op::Store { buffer, index, value, ranges } = computation.op() else {
+        panic!("Expected STORE operation inside END, got {:?}", computation.op());
     };
+
+    // STORE should have empty ranges (iteration space on END)
+    assert!(ranges.is_empty());
 
     // Buffer should be DEFINE_GLOBAL with ID 0
     assert!(matches!(buffer.op(), Op::DefineGlobal(0)));
@@ -88,19 +91,22 @@ fn test_bufferize_to_store_local_with_barrier() {
         panic!("Expected BARRIER operation in deps");
     };
 
-    // Unwrap BARRIER to check the END inside
-    let Op::End { computation, ranges } = src.op() else {
-        panic!("Expected END operation inside BARRIER");
+    // BARRIER wraps END(STORE)
+    let Op::End { computation, ranges: end_ranges } = src.op() else {
+        panic!("Expected END operation inside BARRIER, got {:?}", src.op());
     };
 
-    // Should have 1 range
-    assert_eq!(ranges.len(), 1);
-    assert!(std::sync::Arc::ptr_eq(&ranges[0], &range));
+    // END should have 1 range
+    assert_eq!(end_ranges.len(), 1);
+    assert!(std::sync::Arc::ptr_eq(&end_ranges[0], &range));
 
-    // Computation should be STORE with DEFINE_LOCAL(0)
-    let Op::Store { buffer, value, .. } = computation.op() else {
-        panic!("Expected STORE operation");
+    // Unwrap END to get STORE
+    let Op::Store { buffer, value, ranges, .. } = computation.op() else {
+        panic!("Expected STORE operation inside END, got {:?}", computation.op());
     };
+
+    // STORE should have empty ranges
+    assert!(ranges.is_empty());
 
     assert!(matches!(buffer.op(), Op::DefineLocal(0)));
     assert!(std::sync::Arc::ptr_eq(value, &compute));
@@ -137,20 +143,23 @@ fn test_bufferize_to_store_multiple_ranges() {
     assert!(matches!(passthrough.op(), Op::DefineGlobal(0)));
     assert_eq!(deps.len(), 1);
 
-    // Unwrap AFTER to get END
-    let Op::End { computation, ranges } = deps[0].op() else {
-        panic!("Expected END operation in deps");
+    // Deps should contain END wrapping STORE
+    let Op::End { computation, ranges: end_ranges } = deps[0].op() else {
+        panic!("Expected END operation in deps, got {:?}", deps[0].op());
     };
 
-    // Should have 2 ranges in the same order
-    assert_eq!(ranges.len(), 2);
-    assert!(std::sync::Arc::ptr_eq(&ranges[0], &range1));
-    assert!(std::sync::Arc::ptr_eq(&ranges[1], &range2));
+    // END should have 2 ranges in the same order
+    assert_eq!(end_ranges.len(), 2);
+    assert!(std::sync::Arc::ptr_eq(&end_ranges[0], &range1));
+    assert!(std::sync::Arc::ptr_eq(&end_ranges[1], &range2));
 
-    // Verify STORE structure
-    let Op::Store { buffer, index, value } = computation.op() else {
-        panic!("Expected STORE operation");
+    // Unwrap END to get STORE
+    let Op::Store { buffer, index, value, ranges } = computation.op() else {
+        panic!("Expected STORE operation inside END, got {:?}", computation.op());
     };
+
+    // STORE should have empty ranges
+    assert!(ranges.is_empty());
 
     // Buffer should be DEFINE_GLOBAL(0)
     assert!(matches!(buffer.op(), Op::DefineGlobal(0)));
@@ -337,10 +346,12 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
     assert_eq!(deps.len(), 1);
 
     // deps[0] should be END wrapping STORE
-    let Op::End { computation: store, .. } = deps[0].op() else {
-        panic!("Expected END in AFTER deps, got {:?}", deps[0].op());
+    let end_op = &deps[0];
+    let Op::End { computation, ranges: end_ranges } = end_op.op() else {
+        panic!("Expected END in AFTER deps, got {:?}", end_op.op());
     };
-    assert!(matches!(store.op(), Op::Store { .. }));
+    assert_eq!(end_ranges.len(), 1);
+    assert!(matches!(computation.op(), Op::Store { .. }), "Expected STORE inside END");
 
     // Stage 2: AFTER → AFTER(DEFINE_GLOBAL, [END(KERNEL)])
     // split_store transforms END(STORE) to END(KERNEL) but preserves AFTER wrapper

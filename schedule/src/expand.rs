@@ -156,33 +156,62 @@ fn phase1_range_to_unroll() -> PatternMatcher {
 ///
 /// Based on Tinygrad's expander PatternMatcher (expander.py:84-108).
 fn phase2_expand() -> PatternMatcher {
+    // Pattern order MUST match Tinygrad's pm_pre_expander + expander order:
+    // 1. convert_range_to_unroll (Range → UNROLL)
+    // 2. fix_reduce_unroll (REDUCE with UNROLL → CONTRACT(REDUCE))
+    // 3. fix_store_unroll (STORE with UNROLL → CONTRACT(STORE))  <- BEFORE do_expand!
+    // 4. do_expand (expand ops with UNROLL sources)
+    // 5. do_contract (CONTRACT(UNROLL) → GEP)
+    //
+    // Critical: fix_store_unroll MUST run BEFORE do_expand!
+    // Otherwise do_expand processes STORE first, changing the tree structure.
     crate::patterns! {
-        // Fix REDUCE with non-Range entries in ranges (use .. to match any ranges)
-        // This runs BEFORE Range(Upcast) conversion so it can detect Upcast and set Vector dtype
+        // =====================================================================
+        // Phase 2a: Range conversion (pm_pre_expander pattern 1)
+        // =====================================================================
+
+        // Convert Range(Upcast) or Range(Unroll) to UNROLL op
+        // This runs FIRST so that UNROLL is available for subsequent patterns
+        range if matches!(range.op(), Op::Range { axis_type: AxisType::Upcast | AxisType::Unroll, .. }) => {
+            convert_range_to_unroll(range)
+        },
+
+        // =====================================================================
+        // Phase 2b: Pre-expansion REDUCE/STORE fixes (pm_pre_expander patterns 2-3)
+        // =====================================================================
+
+        // Fix REDUCE with non-Range entries in ranges
+        // This detects Upcast axes and sets Vector dtype for K-vectorization
         reduce @ Reduce(_, ..) => fix_reduce_unroll(reduce),
 
-        // Fix STORE with UNROLL in range args
-        store @ Store(_, _, _) => fix_store_unroll(store),
-        store @ StoreGated(_, _, _, _) => fix_store_unroll(store),
+        // Fix STORE with UNROLL in ranges/index - wrap in CONTRACT
+        // MUST run BEFORE do_expand! Tinygrad's fix_store_unroll is in pm_pre_expander.
+        store if matches!(store.op(), Op::Store { .. }) => fix_store_unroll(store),
+        store if matches!(store.op(), Op::StoreGated { .. }) => fix_store_unroll(store),
 
         // Handle END with UNROLL ranges
         end @ End(_, ..) => end_unrolls(end),
+
+        // =====================================================================
+        // Phase 2c: Core expansion (expander patterns)
+        // =====================================================================
+
+        // Main expansion: ALL expandable ops with UNROLL inputs
+        // Uses is_expandable() check and range_ending_src_index() for proper range handling
+        op if op.op().is_expandable() && has_unroll_input(op) => do_expand(op),
+
+        // Contract UNROLL via GEP extraction
+        contract @ Contract(_, ..) => do_contract(contract),
+
+        // =====================================================================
+        // Phase 2d: Cleanup
+        // =====================================================================
 
         // Collapse nested UNROLL: UNROLL(UNROLL(x, inner), outer) → UNROLL(x, inner+outer)
         outer @ Unroll(Unroll(_, ..), ..) => collapse_double_unroll(outer),
 
         // Remove empty UNROLL: UNROLL(x, ()) → x
         unroll @ Unroll(_, ..) => unwrap_empty_unroll(unroll),
-
-        // Convert Range(Upcast) to UNROLL op (deferred from Phase 1 for K-vectorization)
-        // This runs AFTER fix_reduce_unroll has detected Upcast axes and set Vector dtype
-        range if matches!(range.op(), Op::Range { axis_type: AxisType::Upcast, .. }) => {
-            convert_range_to_unroll(range)
-        },
-
-        // Main expansion: ALL expandable ops with UNROLL inputs
-        // Uses is_expandable() check and range_ending_src_index() for proper range handling
-        op if op.op().is_expandable() && has_unroll_input(op) => do_expand(op),
     }
 }
 
@@ -191,6 +220,12 @@ fn convert_range_to_unroll(range: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Range { end, axis_id, axis_type } = range.op() else {
         return None;
     };
+
+    tracing::debug!(
+        axis_type = ?axis_type,
+        axis_id = ?axis_id,
+        "convert_range_to_unroll: checking Range"
+    );
 
     // Only convert Unroll/Upcast axis types
     if !matches!(axis_type, AxisType::Unroll | AxisType::Upcast) {
@@ -208,12 +243,35 @@ fn convert_range_to_unroll(range: &Arc<UOp>) -> Option<Arc<UOp>> {
     let vconst = UOp::vconst(values);
 
     // Wrap in UNROLL op with axis metadata
-    Some(UOp::unroll(vconst, vec![(axis_id.value(), size)]))
+    let unroll = UOp::unroll(vconst, vec![(axis_id.value(), size)]);
+
+    tracing::debug!(
+        axis_type = ?axis_type,
+        axis_id = ?axis_id,
+        size = size,
+        unroll_id = unroll.id,
+        "convert_range_to_unroll: CONVERTED Range to UNROLL"
+    );
+
+    Some(unroll)
 }
 
 /// Check if any input to this operation is an UNROLL op.
 fn has_unroll_input(uop: &Arc<UOp>) -> bool {
-    uop.op().sources().iter().any(|src| matches!(src.op(), Op::Unroll { .. }))
+    let sources = uop.op().sources();
+    let has_unroll = sources.iter().any(|src| matches!(src.op(), Op::Unroll { .. }));
+
+    // Debug: trace PointerIndex and Store ops
+    if matches!(uop.op(), Op::PointerIndex { .. } | Op::Store { .. } | Op::Index { .. }) {
+        tracing::debug!(
+            op = ?std::mem::discriminant(uop.op()),
+            has_unroll = has_unroll,
+            source_ops = ?sources.iter().map(|s| std::mem::discriminant(s.op())).collect::<Vec<_>>(),
+            "has_unroll_input: checking memory op"
+        );
+    }
+
+    has_unroll
 }
 
 /// Expand an operation that has UNROLL inputs.
@@ -242,6 +300,8 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     if matches!(op, Op::Index { .. }) && matches!(uop.dtype(), DType::Ptr { .. }) {
         return None;
     }
+
+    tracing::debug!(op_type = ?std::mem::discriminant(op), dtype = ?uop.dtype(), "do_expand: expanding op");
 
     let sources = op.sources();
 
@@ -280,6 +340,7 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         };
 
     let expand_sz: usize = expand_args.iter().map(|(_, sz)| sz).product();
+    tracing::debug!(expand_args = ?expand_args, expand_sz = expand_sz, "do_expand: computed expansion parameters");
     if expand_sz == 0 {
         return None;
     }
@@ -484,7 +545,12 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
         Op::Store { .. } => {
             if sources.len() >= 3 {
                 Some(UOp::new(
-                    Op::Store { buffer: sources[0].clone(), index: sources[1].clone(), value: sources[2].clone() },
+                    Op::Store {
+                        buffer: sources[0].clone(),
+                        index: sources[1].clone(),
+                        value: sources[2].clone(),
+                        ranges: sources[3..].iter().cloned().collect(),
+                    },
                     dtype.clone(),
                 ))
             } else {
@@ -500,6 +566,7 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
                         index: sources[1].clone(),
                         value: sources[2].clone(),
                         gate: sources[3].clone(),
+                        ranges: sources[4..].iter().cloned().collect(),
                     },
                     dtype.clone(),
                 ))
@@ -519,6 +586,15 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
                 };
                 let new_gate = if gate.is_some() { sources.last().cloned() } else { None };
                 Some(UOp::new(Op::Index { buffer, indices, gate: new_gate }, dtype.clone()))
+            } else {
+                None
+            }
+        }
+
+        Op::PointerIndex { .. } => {
+            // PointerIndex has (ptr, offset)
+            if sources.len() >= 2 {
+                Some(UOp::new(Op::PointerIndex { ptr: sources[0].clone(), offset: sources[1].clone() }, dtype.clone()))
             } else {
                 None
             }
@@ -592,6 +668,12 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Reduce { src, reduce_op, ranges } = reduce.op() else {
         return None;
     };
+
+    tracing::debug!(
+        src_op = ?std::mem::discriminant(src.op()),
+        ranges_len = ranges.len(),
+        "fix_reduce_unroll: checking REDUCE"
+    );
 
     // Skip if src is already CONTRACT-wrapped (already processed)
     // This prevents infinite rewrite loops when pattern matching
@@ -821,48 +903,137 @@ fn extract_const_size(end: &Arc<UOp>) -> Option<usize> {
 // Additional Expansion Patterns (from Tinygrad expander.py)
 // ============================================================================
 
-/// Fix a STORE operation that has UNROLL in its range arguments.
-///
-/// Based on Tinygrad's fix_store_unroll (expander.py:123-126).
-/// Wraps the STORE in CONTRACT with the UNROLL axes.
-fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let ranges = match store.op() {
-        Op::Store { .. } => {
-            // Store has no explicit ranges in our model
-            // But it might have UNROLL sources
-            return None;
+/// Fix STORE operations that have UNROLL in their ranges.
+/// Recursively collect all UNROLL ops from an expression tree.
+/// After shift_to, STORE.ranges may contain arithmetic expressions like
+/// `(outer_reduced * amount + UNROLL([0,1,2,3]))`. This finds nested UNROLLs.
+fn collect_unrolls_from_tree(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
+    let mut unrolls = Vec::new();
+    let mut stack = vec![uop.clone()];
+    let mut visited = std::collections::HashSet::new();
+
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.id) {
+            continue;
         }
-        Op::StoreGated { gate, .. } => {
-            // Check if gate is UNROLL
-            if matches!(gate.op(), Op::Unroll { .. }) {
-                vec![gate.clone()]
-            } else {
+
+        if matches!(node.op(), Op::Unroll { .. }) {
+            unrolls.push(node.clone());
+        } else {
+            // Visit children
+            node.op().map_child(|child| {
+                stack.push(child.clone());
+            });
+        }
+    }
+
+    // Detailed logging when searching Binary
+    if matches!(uop.op(), Op::Binary(_, _, _)) {
+        tracing::debug!(
+            root_id = uop.id,
+            root_op = ?std::mem::discriminant(uop.op()),
+            num_unrolls = unrolls.len(),
+            visited_count = visited.len(),
+            visited_ids = ?visited.iter().collect::<Vec<_>>(),
+            "collect_unrolls_from_tree: searched Binary tree"
+        );
+    }
+
+    unrolls
+}
+
+/// Check if an expression tree contains any UNROLL ops.
+fn contains_unroll(uop: &Arc<UOp>) -> bool {
+    !collect_unrolls_from_tree(uop).is_empty()
+}
+
+/// Based on Tinygrad's fix_store_unroll (expander.py:123-126).
+///
+/// Tinygrad's implementation:
+/// ```python
+/// def fix_store_unroll(x:UOp):
+///   store_expand, store_range = partition(x.src[2:], lambda y: y.op is Ops.UNROLL)
+///   if len(store_expand) == 0: return None
+///   return UOp(Ops.CONTRACT, dtypes.void, (x.replace(src=x.src[:2]+tuple(store_range)),),
+///              tuple(flatten(x.arg for x in store_expand)), tag=1)
+/// ```
+///
+/// This ONLY partitions DIRECT children in STORE.ranges (src[2:]).
+/// It does NOT search nested expressions or the index subtree.
+/// UNROLLs in the index/value are handled by do_expand, not here.
+fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
+    match store.op() {
+        Op::Store { buffer, index, value, ranges } => {
+            // Partition ranges into direct UNROLL ops vs non-UNROLL
+            // Matching Tinygrad: partition(x.src[2:], lambda y: y.op is Ops.UNROLL)
+            let (store_expand, store_range): (Vec<_>, Vec<_>) =
+                ranges.iter().partition(|r| matches!(r.op(), Op::Unroll { .. }));
+
+            if store_expand.is_empty() {
                 return None;
             }
+
+            // Collect axes from UNROLL ops
+            let contract_axes: Vec<(usize, usize)> = store_expand
+                .iter()
+                .filter_map(|u| match u.op() {
+                    Op::Unroll { unroll_axes, .. } => Some(unroll_axes.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+
+            tracing::debug!(
+                contract_axes = ?contract_axes,
+                num_store_range = store_range.len(),
+                num_store_expand = store_expand.len(),
+                "fix_store_unroll: partitioned STORE.ranges"
+            );
+
+            // Create new STORE with only non-UNROLL ranges
+            let new_store = UOp::store_with_ranges(
+                buffer.clone(),
+                index.clone(),
+                value.clone(),
+                store_range.into_iter().cloned().collect(),
+            );
+
+            // Wrap in CONTRACT with void dtype (matching Tinygrad)
+            Some(UOp::contract(new_store, contract_axes))
         }
-        _ => return None,
-    };
+        Op::StoreGated { buffer, index, value, gate, ranges } => {
+            // Partition ranges into direct UNROLL ops vs non-UNROLL
+            let (store_expand, store_range): (Vec<_>, Vec<_>) =
+                ranges.iter().partition(|r| matches!(r.op(), Op::Unroll { .. }));
 
-    // Collect UNROLL axes
-    let store_expand: Vec<_> = ranges.iter().filter(|r| matches!(r.op(), Op::Unroll { .. })).collect();
+            if store_expand.is_empty() {
+                return None;
+            }
 
-    if store_expand.is_empty() {
-        return None;
+            // Collect axes from UNROLL ops
+            let contract_axes: Vec<(usize, usize)> = store_expand
+                .iter()
+                .filter_map(|u| match u.op() {
+                    Op::Unroll { unroll_axes, .. } => Some(unroll_axes.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+
+            // Create new STORE with only non-UNROLL ranges
+            let new_store = UOp::store_gated_with_ranges(
+                buffer.clone(),
+                index.clone(),
+                value.clone(),
+                gate.clone(),
+                store_range.into_iter().cloned().collect(),
+            );
+
+            // Wrap in CONTRACT
+            Some(UOp::contract(new_store, contract_axes))
+        }
+        _ => None,
     }
-
-    // Collect all axes from UNROLL sources
-    let contract_axes: Vec<(usize, usize)> = store_expand
-        .iter()
-        .filter_map(|u| if let Op::Unroll { unroll_axes, .. } = u.op() { Some(unroll_axes.clone()) } else { None })
-        .flatten()
-        .collect();
-
-    if contract_axes.is_empty() {
-        return None;
-    }
-
-    // Wrap STORE in CONTRACT
-    Some(UOp::contract(store.clone(), contract_axes))
 }
 
 /// Handle END operations that have UNROLL in their ranges.
@@ -873,6 +1044,12 @@ fn end_unrolls(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::End { computation, ranges } = uop.op() else {
         return None;
     };
+
+    tracing::debug!(
+        ranges_len = ranges.len(),
+        has_unroll = ranges.iter().any(|r| matches!(r.op(), Op::Unroll { .. })),
+        "end_unrolls: checking END"
+    );
 
     // Partition ranges into UNROLL vs non-UNROLL
     let (unrolls, non_unrolls): (Vec<_>, Vec<_>) = ranges.iter().partition(|r| matches!(r.op(), Op::Unroll { .. }));
@@ -895,6 +1072,92 @@ fn end_unrolls(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let new_ranges: SmallVec<[Arc<UOp>; 4]> = non_unrolls.into_iter().cloned().collect();
 
     Some(UOp::new(Op::End { computation: contracted, ranges: new_ranges }, uop.dtype()))
+}
+
+/// Contract UNROLL to extract elements via GEP.
+///
+/// Based on Tinygrad's do_contract (expander.py:67-76).
+///
+/// CONTRACT(UNROLL(src, unroll_axes), contract_axes) transforms to:
+/// - If contract_axes covers all unroll_axes: GEP(src, indices)
+/// - If partially covers: UNROLL(GEP(src, indices), remaining_axes)
+///
+/// This prevents vector width multiplication by reorganizing the expanded data.
+fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Contract { src: contract_src, upcast_ranges: contract_axes } = uop.op() else {
+        return None;
+    };
+
+    tracing::debug!(
+        contract_axes = ?contract_axes,
+        contract_src_op = ?std::mem::discriminant(contract_src.op()),
+        "do_contract: matched CONTRACT op"
+    );
+
+    // Handle CONTRACT(UNROLL(...)) pattern
+    if let Op::Unroll { src: unroll_inner, unroll_axes } = contract_src.op() {
+        tracing::debug!(
+            unroll_axes = ?unroll_axes,
+            contract_axes = ?contract_axes,
+            "do_contract: CONTRACT(UNROLL(...)) pattern matched"
+        );
+
+        // Compute remaining axes (unroll_axes not in contract_axes)
+        let remaining_axes: Vec<(usize, usize)> =
+            unroll_axes.iter().filter(|(ax, _)| !contract_axes.iter().any(|(cax, _)| cax == ax)).cloned().collect();
+
+        tracing::debug!(
+            remaining_axes = ?remaining_axes,
+            "do_contract: computed remaining axes"
+        );
+
+        // Compute GEP indices using swizzle pattern
+        let gep_indices = if remaining_axes.is_empty() {
+            // Full contraction: sequential indices for contract_axes
+            swizzle_args(contract_axes, unroll_axes, &[])
+        } else {
+            // Partial contraction: indices accounting for remaining axes
+            let exclude: Vec<usize> = remaining_axes.iter().map(|(ax, _)| *ax).collect();
+            swizzle_args(contract_axes, unroll_axes, &exclude)
+        };
+
+        tracing::debug!(gep_indices_len = gep_indices.len(), "do_contract: computed GEP indices");
+
+        // Create GEP to extract elements
+        let gep_result = UOp::gep(unroll_inner.clone(), gep_indices);
+
+        // Return based on remaining axes
+        return if remaining_axes.is_empty() {
+            tracing::debug!("do_contract: full contraction -> GEP");
+            // Fully contracted: return GEP result
+            Some(gep_result)
+        } else {
+            tracing::debug!(remaining_axes = ?remaining_axes, "do_contract: partial contraction -> UNROLL(GEP)");
+            // Partially contracted: wrap in UNROLL with remaining axes
+            // Use CONTRACT's dtype for the per-iteration element type
+            Some(UOp::unroll_with_dtype(gep_result, remaining_axes, uop.dtype()))
+        };
+    }
+
+    // CONTRACT without UNROLL: convert to VECTORIZE (repeat elements)
+    // Based on Tinygrad's: if ex.op is not Ops.UNROLL: return UOp(Ops.VECTORIZE, ...)
+    if !matches!(contract_src.op(), Op::Unroll { .. }) {
+        // For void types (STORE), Tinygrad returns VECTORIZE(void, (src,) * count)
+        // For void with count=1, this is essentially identity. We unwrap to let
+        // the graph continue processing (STORE's sources may still need expansion).
+        if uop.dtype() == DType::Void {
+            tracing::debug!("do_contract: unwrapping CONTRACT for void type (STORE)");
+            return Some(contract_src.clone());
+        }
+
+        let count: usize = contract_axes.iter().map(|(_, sz)| sz).product();
+        if count > 1 {
+            let sources: SmallVec<[Arc<UOp>; 4]> = (0..count).map(|_| contract_src.clone()).collect();
+            return Some(UOp::vectorize(sources));
+        }
+    }
+
+    None
 }
 
 /// Collapse nested UNROLL operations.
@@ -1074,10 +1337,10 @@ mod tests {
         assert!(result.is_some(), "Expected Some when nested Binary can be extracted");
 
         // Check the result has CONTRACT wrapper (for upcast axes)
-        if let Some(fixed) = result {
-            if let Op::Reduce { src: fixed_src, .. } = fixed.op() {
+        if let Some(fixed) = result
+            && let Op::Reduce { src: fixed_src, .. } = fixed.op() {
                 assert!(matches!(fixed_src.op(), Op::Contract { .. }), "Expected CONTRACT wrapper for upcast axes");
             }
-        }
     }
 }
+// TEMP DEBUG: Add detailed tracing to do_expand

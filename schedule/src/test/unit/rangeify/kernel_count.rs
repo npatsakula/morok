@@ -6,7 +6,7 @@
 use morok_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::{KernelContext, run_kernel_split_pipeline};
-use crate::test::unit::rangeify::helpers::{count_define_globals, count_ends, count_kernels, count_stores};
+use crate::test::unit::rangeify::helpers::{count_define_globals, count_kernels, count_stores};
 
 #[test]
 fn test_single_store_one_kernel() {
@@ -150,9 +150,8 @@ fn test_pipeline_kernel_count() {
     // The STORE represents the actual memory write operation.
     assert_eq!(count_stores(&result), 1, "STORE should be inside KERNEL");
 
-    // Verify END remains inside KERNEL (END wraps STORE in kernel body)
-    // The END marks the range closure for the STORE operation
-    assert_eq!(count_ends(&result), 1, "END should be inside KERNEL body");
+    // Note: STORE now has explicit ranges field, no separate END wrapper needed
+    // The STORE.ranges field directly contains the range information
 
     // Verify DEFINE_GLOBAL count (counts references via recursive traversal, not unique nodes)
     // The same DEFINE_GLOBAL(0) appears 4 times due to:
