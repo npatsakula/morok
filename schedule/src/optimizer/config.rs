@@ -274,6 +274,13 @@ pub struct HeuristicsConfig {
     /// Set to 1 to disable threading.
     pub thread_count: usize,
 
+    // Vectorization
+    /// Enable K-axis vectorization for matmul.
+    /// When enabled, UPCAST is applied to the reduce (K) axis with scalar accumulators.
+    /// This enables SLP vectorization but prevents direct FMA intrinsic generation.
+    /// Default: true.
+    pub k_vectorize: bool,
+
     // Debug
     /// Debug verbosity level.
     pub debug_level: u8,
@@ -290,11 +297,13 @@ impl HeuristicsConfig {
     /// # Environment Variables
     ///
     /// * `MOROK_THREADS` - Maximum thread count (default: available_parallelism)
+    /// * `MOROK_NO_K_VECTORIZE` - Disable K-axis vectorization (enables direct FMA)
     pub fn from_env() -> Self {
         let thread_count =
             std::env::var("MOROK_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
+        let k_vectorize = std::env::var("MOROK_NO_K_VECTORIZE").is_err();
 
-        Self { thread_count, ..Default::default() }
+        Self { thread_count, k_vectorize, ..Default::default() }
     }
 }
 
@@ -310,6 +319,7 @@ impl Default for HeuristicsConfig {
             unroll_threshold: 32,
             disable_locals: false,
             thread_count: default_thread_count(),
+            k_vectorize: true,
             debug_level: 0,
         }
     }
@@ -329,6 +339,7 @@ impl HeuristicsConfig {
         #[builder(default = 32)] unroll_threshold: usize,
         #[builder(default = false)] disable_locals: bool,
         #[builder(default = default_thread_count())] thread_count: usize,
+        #[builder(default = true)] k_vectorize: bool,
         #[builder(default = 0)] debug_level: u8,
     ) -> Self {
         Self {
@@ -341,6 +352,7 @@ impl HeuristicsConfig {
             unroll_threshold,
             disable_locals,
             thread_count,
+            k_vectorize,
             debug_level,
         }
     }

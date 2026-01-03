@@ -274,3 +274,4 @@ fn test_matmul_64x64_vectorized() {
     assert_eq!(result.len(), 64 * 64);
     assert!((result[[0, 0]] - 64.0).abs() < 0.01, "Expected 64.0, got {}", result[[0, 0]]);
 }
+

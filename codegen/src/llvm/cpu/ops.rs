@@ -1281,31 +1281,85 @@ fn codegen_reduce<'ctx>(
 
     trace!(loops_before = ?loops_before, "about to evaluate reduce source");
 
-    // Evaluate source first - this may create nested loops
-    let src_val = require_value(src, context, module, builder, values)?;
-
-    trace!(
-        loops_after = ?values.remaining_loop_ids(),
-        src.dtype = ?src.dtype(),
-        src_val = ?src_val,
-        "REDUCE source evaluated"
-    );
-    let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
-    trace!(src_val_loaded = ?src_val, "reduce after auto_load");
-
-    // Load accumulator AFTER source evaluation (inside any source loops)
-    // This ensures we get the current value, not a stale one from before the source loops
-    let acc_val = builder.build_load(acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
-
-    // Do accumulation INSIDE the source loops (before closing them)
-    // For vector accumulators: if source is scalar, splat it to match accumulator width
-    let acc_src_val = if is_vector_accumulator && !src_val.is_vector_value() {
-        splat_scalar_to_vector(src_val, vec_len, context, builder)?
+    // Check for FMA pattern: REDUCE(Add, Mul(a, b), ...) where dtype is float
+    // FMA generates: acc = fma(a, b, acc) instead of acc = acc + (a * b)
+    let fma_operands = if reduce_op == ReduceOp::Add && result_dtype.base().is_float() {
+        let result = try_extract_fma_operands(src);
+        debug!(
+            src_op = ?std::mem::discriminant(src.op()),
+            src_dtype = ?src.dtype(),
+            fma_detected = result.is_some(),
+            "FMA detection for REDUCE source"
+        );
+        result
     } else {
-        src_val
+        None
     };
-    let new_acc = codegen_reduce_op(reduce_op, acc_val, acc_src_val, result_dtype, module, builder)?;
-    builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
+
+    if let Some((mul_a, mul_b)) = fma_operands {
+        // FMA path: compile Mul operands separately, use llvm.fma intrinsic
+        trace!("FMA path: detected Mul source for Add reduce");
+
+        // Compile Mul operands
+        let a_val = require_value(mul_a, context, module, builder, values)?;
+        let a_val = auto_load_pointer(a_val, &mul_a.dtype(), context, builder)?;
+
+        let b_val = require_value(mul_b, context, module, builder, values)?;
+        let b_val = auto_load_pointer(b_val, &mul_b.dtype(), context, builder)?;
+
+        // Handle vector splat if needed (same logic as standard path)
+        let (a_val, b_val) = if is_vector_accumulator {
+            let a_val = if !a_val.is_vector_value() {
+                splat_scalar_to_vector(a_val, vec_len, context, builder)?
+            } else {
+                a_val
+            };
+            let b_val = if !b_val.is_vector_value() {
+                splat_scalar_to_vector(b_val, vec_len, context, builder)?
+            } else {
+                b_val
+            };
+            (a_val, b_val)
+        } else {
+            (a_val, b_val)
+        };
+
+        // Load accumulator
+        let acc_val = builder.build_load(acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
+
+        // FMA: acc = a * b + acc
+        let suffix = get_type_suffix(result_dtype)?;
+        let new_acc = call_intrinsic(&format!("llvm.fma.{}", suffix), &[a_val, b_val, acc_val], "fma", module, builder)?;
+        builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
+
+        trace!("FMA intrinsic generated for reduce accumulation");
+    } else {
+        // Standard path: evaluate source, then accumulate
+        let src_val = require_value(src, context, module, builder, values)?;
+
+        trace!(
+            loops_after = ?values.remaining_loop_ids(),
+            src.dtype = ?src.dtype(),
+            src_val = ?src_val,
+            "REDUCE source evaluated"
+        );
+        let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
+        trace!(src_val_loaded = ?src_val, "reduce after auto_load");
+
+        // Load accumulator AFTER source evaluation (inside any source loops)
+        // This ensures we get the current value, not a stale one from before the source loops
+        let acc_val = builder.build_load(acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
+
+        // Do accumulation INSIDE the source loops (before closing them)
+        // For vector accumulators: if source is scalar, splat it to match accumulator width
+        let acc_src_val = if is_vector_accumulator && !src_val.is_vector_value() {
+            splat_scalar_to_vector(src_val, vec_len, context, builder)?
+        } else {
+            src_val
+        };
+        let new_acc = codegen_reduce_op(reduce_op, acc_val, acc_src_val, result_dtype, module, builder)?;
+        builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
+    }
 
     // Close any loops created during source evaluation (innermost first)
     let loops_after = values.remaining_loop_ids();
@@ -1631,6 +1685,34 @@ fn codegen_reduce_identity<'ctx>(
                 Ok(llvm_type.into_int_type().const_int(max_val, false).into())
             }
         }
+    }
+}
+
+/// Try to extract FMA operands from a REDUCE source.
+///
+/// For matmul: REDUCE(Add, CONTRACT?(Mul(a, b), ..), ranges)
+///
+/// Returns Some((a, b)) if FMA candidate, None otherwise.
+///
+/// NOTE: Does NOT unwrap GEP - after scalar devectorization (pm_scalar_accumulators),
+/// the Mul is vectorized but accumulator is scalar, so FMA can't be used.
+/// FMA only works when source Mul and accumulator have matching types.
+fn try_extract_fma_operands(src: &Arc<UOp>) -> Option<(&Arc<UOp>, &Arc<UOp>)> {
+    // Don't match GEP - that means scalar accumulator with vector source (incompatible)
+    if matches!(src.op(), Op::Gep { .. }) {
+        return None;
+    }
+
+    // Unwrap CONTRACT/UNROLL wrappers (they pass through in codegen)
+    let inner = match src.op() {
+        Op::Contract { src, .. } | Op::Unroll { src, .. } => src,
+        _ => src,
+    };
+
+    // Check for Mul pattern
+    match inner.op() {
+        Op::Binary(BinaryOp::Mul, a, b) => Some((a, b)),
+        _ => None,
     }
 }
 

@@ -45,7 +45,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     try_grouped_reduction(scheduler, config);
 
     // 3.5. Matmul K-vectorization (CPU-only, after grouped reduction)
-    apply_matmul_k_vectorization(scheduler);
+    apply_matmul_k_vectorization(scheduler, config);
 
     // 4. Masked upcasts
     apply_masked_upcasts(scheduler);
@@ -310,10 +310,16 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
 /// - No grouped reduction already applied
 /// - K dimension size >= 4 (for 4x vectorization)
 /// - CPU renderer (has_threads, no has_local) - GPU uses different strategies
-pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler) -> bool {
+pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use tracing::{debug, trace};
 
     trace!("apply_matmul_k_vectorization: entry");
+
+    // Check config
+    if !config.k_vectorize {
+        trace!("apply_matmul_k_vectorization: skipped (k_vectorize=false)");
+        return false;
+    }
 
     // Only for CPU (has threads but no local memory/workgroups)
     if scheduler.renderer().has_local {
