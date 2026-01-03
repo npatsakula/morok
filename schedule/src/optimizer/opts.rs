@@ -72,12 +72,13 @@ fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
-    // GLOBAL/LOCAL/LOOP/REDUCE can be upcasted
+    // GLOBAL/LOCAL/LOOP/REDUCE/OUTER can be upcasted
     // - GLOBAL/LOCAL/LOOP: Standard vectorization of output dimensions
+    // - OUTER: Output dimensions in reduce kernels (e.g., matmul M/N dimensions)
     // - REDUCE: Creates vectorized accumulators for register tiling (e.g., matmul K-dimension)
-    // OUTER is for schedule expansion, not vectorization
-    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop | AxisType::Reduce) {
-        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop/Reduce axes" }.fail();
+    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop | AxisType::Reduce | AxisType::Outer) {
+        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop/Reduce/Outer axes" }
+            .fail();
     }
 
     if amount > scheduler.ren.upcast_max {

@@ -1329,7 +1329,8 @@ fn codegen_reduce<'ctx>(
 
         // FMA: acc = a * b + acc
         let suffix = get_type_suffix(result_dtype)?;
-        let new_acc = call_intrinsic(&format!("llvm.fma.{}", suffix), &[a_val, b_val, acc_val], "fma", module, builder)?;
+        let new_acc =
+            call_intrinsic(&format!("llvm.fma.{}", suffix), &[a_val, b_val, acc_val], "fma", module, builder)?;
         builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
 
         trace!("FMA intrinsic generated for reduce accumulation");

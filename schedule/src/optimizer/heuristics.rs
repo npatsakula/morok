@@ -44,8 +44,12 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     // 3. Grouped reduction
     try_grouped_reduction(scheduler, config);
 
-    // 3.5. Matmul K-vectorization (CPU-only, after grouped reduction)
+    // 3.5. Matmul K-vectorization (CPU-only, vectorizes K axis)
     apply_matmul_k_vectorization(scheduler, config);
+
+    // 3.6. Matmul output dimension upcasting (CPU-only, creates register tiles)
+    // Skipped if K-vectorization was applied (expand/codegen interaction needs work)
+    apply_matmul_output_upcasting(scheduler, config);
 
     // 4. Masked upcasts
     apply_masked_upcasts(scheduler);
@@ -391,6 +395,116 @@ pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler, config: &Heuristi
     }
     trace!("apply_matmul_k_vectorization: no upcast applied");
     false
+}
+
+/// Apply UPCAST to matmul output dimensions (M, N axes).
+///
+/// Creates register tiling: each thread computes an MxN tile instead of single element.
+/// Combined with K-vectorization: 4x4 output tile × 4 scalar accumulators = 64 ops/K-iter.
+///
+/// Only applies when:
+/// - Matmul pattern detected (REDUCE(ADD) of MUL of INDEX)
+/// - CPU renderer (has_threads, no has_local)
+/// - Output dimensions have size >= 2
+pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    use tracing::{debug, trace};
+
+    trace!("apply_matmul_output_upcasting: entry");
+
+    // Check config
+    if !config.output_upcast {
+        trace!("apply_matmul_output_upcasting: skipped (output_upcast=false)");
+        return false;
+    }
+
+    // Only for CPU (same as K-vectorization)
+    if scheduler.renderer().has_local {
+        trace!("apply_matmul_output_upcasting: skipped (has_local)");
+        return false;
+    }
+
+    // Check for matmul pattern
+    if !has_matmul_pattern(scheduler) {
+        trace!("apply_matmul_output_upcasting: skipped (no matmul pattern)");
+        return false;
+    }
+
+    // Skip if K-vectorization was already applied (creates vector accumulators)
+    // The interaction between K-vectorization and output upcasting is complex
+    // and can create excessively wide vectors. Apply only one at a time.
+    let upcast_axes = scheduler.axes_of(&[AxisType::Upcast]);
+    if !upcast_axes.is_empty() {
+        trace!("apply_matmul_output_upcasting: skipped (upcast already applied, likely K-vectorization)");
+        return false;
+    }
+
+    // Get output axes (Global, Outer, Loop - not Reduce/GroupReduce)
+    let output_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Outer, AxisType::Loop]);
+    trace!(num_output_axes = output_axes.len(), "apply_matmul_output_upcasting: output axes");
+    if output_axes.is_empty() {
+        return false;
+    }
+
+    // Collect candidate (axis_idx, size) pairs
+    let candidates: Vec<(usize, i64)> = {
+        let rngs = scheduler.rngs();
+        output_axes
+            .iter()
+            .filter_map(|&axis_idx| {
+                if axis_idx >= rngs.len() {
+                    return None;
+                }
+                let rng = &rngs[axis_idx];
+                if let Op::Range { end, .. } = rng.op()
+                    && let Op::Const(cv) = end.op()
+                    && let morok_ir::ConstValue::Int(size) = cv.0
+                    && size >= 2
+                {
+                    Some((axis_idx, size))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    trace!(num_candidates = candidates.len(), ?candidates, "apply_matmul_output_upcasting: candidates");
+
+    // Apply UPCAST to output dimensions
+    // Target: upcast_product ~= 4 (2x2 tile)
+    // NOTE: Combined with K-vectorization (4x), keep this moderate to avoid excessive vector widths
+    let target_upcast = 4usize;
+    let mut upcast_product = 1usize;
+    let mut applied = false;
+
+    for (axis_idx, size) in candidates {
+        if upcast_product >= target_upcast {
+            break;
+        }
+
+        // Try factors [4, 3, 2] in order (power-of-2 preferred)
+        for factor in [4usize, 3, 2] {
+            if size >= factor as i64 && upcast_product * factor <= target_upcast {
+                trace!(axis_idx, factor, "apply_matmul_output_upcasting: trying upcast");
+                match apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true) {
+                    Ok(_) => {
+                        upcast_product *= factor;
+                        applied = true;
+                        debug!(axis_idx, factor, upcast_product, "apply_matmul_output_upcasting: applied upcast");
+                        break;
+                    }
+                    Err(e) => {
+                        trace!(axis_idx, factor, error = ?e, "apply_matmul_output_upcasting: upcast failed");
+                    }
+                }
+            }
+        }
+    }
+
+    if applied {
+        debug!(upcast_product, "apply_matmul_output_upcasting: SUCCESS");
+    }
+    applied
 }
 
 /// CPU threading for outer parallelizable axes.

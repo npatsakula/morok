@@ -281,6 +281,12 @@ pub struct HeuristicsConfig {
     /// Default: true.
     pub k_vectorize: bool,
 
+    /// Enable output dimension upcasting for matmul.
+    /// When enabled, UPCAST is applied to M/N axes creating register tiles.
+    /// Each thread computes an MxN tile instead of a single element.
+    /// Default: false (experimental - expand/codegen interaction needs work).
+    pub output_upcast: bool,
+
     // Debug
     /// Debug verbosity level.
     pub debug_level: u8,
@@ -298,12 +304,14 @@ impl HeuristicsConfig {
     ///
     /// * `MOROK_THREADS` - Maximum thread count (default: available_parallelism)
     /// * `MOROK_NO_K_VECTORIZE` - Disable K-axis vectorization (enables direct FMA)
+    /// * `MOROK_NO_OUTPUT_UPCAST` - Disable output dimension upcasting
     pub fn from_env() -> Self {
         let thread_count =
             std::env::var("MOROK_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
         let k_vectorize = std::env::var("MOROK_NO_K_VECTORIZE").is_err();
+        let output_upcast = std::env::var("MOROK_NO_OUTPUT_UPCAST").is_err();
 
-        Self { thread_count, k_vectorize, ..Default::default() }
+        Self { thread_count, k_vectorize, output_upcast, ..Default::default() }
     }
 }
 
@@ -320,6 +328,7 @@ impl Default for HeuristicsConfig {
             disable_locals: false,
             thread_count: default_thread_count(),
             k_vectorize: true,
+            output_upcast: false,
             debug_level: 0,
         }
     }
@@ -340,6 +349,7 @@ impl HeuristicsConfig {
         #[builder(default = false)] disable_locals: bool,
         #[builder(default = default_thread_count())] thread_count: usize,
         #[builder(default = true)] k_vectorize: bool,
+        #[builder(default = false)] output_upcast: bool,
         #[builder(default = 0)] debug_level: u8,
     ) -> Self {
         Self {
@@ -353,6 +363,7 @@ impl HeuristicsConfig {
             disable_locals,
             thread_count,
             k_vectorize,
+            output_upcast,
             debug_level,
         }
     }
