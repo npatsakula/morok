@@ -795,6 +795,12 @@ impl UPat {
     upat_fluent!(f_expand, Op::Expand { src: UOp::noop(), new_shape: UOp::noop() });
     upat_fluent!(f_reduce, Op::Reduce { src: UOp::noop(), ranges: SmallVec::new(), reduce_op: crate::ReduceOp::Add });
     upat_fluent!(f_copy, Op::Copy { src: UOp::noop(), device: UOp::noop() });
+    upat_fluent!(f_gep, Op::Gep { vector: UOp::noop(), indices: vec![] });
+    upat_fluent!(f_vectorize, Op::Vectorize { elements: SmallVec::new() });
+    upat_fluent!(f_vconst, Op::VConst { values: vec![] });
+    upat_fluent!(f_unroll, Op::Unroll { src: UOp::noop(), unroll_axes: vec![] });
+    upat_fluent!(f_ptrcat, Op::PtrCat { sources: SmallVec::new() });
+    upat_fluent!(f_cat, Op::Cat { sources: SmallVec::new() });
 
     /// Bind this pattern to a name.
     ///

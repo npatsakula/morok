@@ -1633,9 +1633,11 @@ fn tree_reduce(elements: &[Arc<UOp>], reduce_op: ReduceOp, dtype: &DType) -> Arc
 /// - No explicit horizontal reduction overhead
 ///
 /// Transforms:
+/// ```
 /// - REDUCE(CONTRACT(src<4>), ranges, Add, Vector<4>)
-/// → ((REDUCE(GEP(src,0), Add) + REDUCE(GEP(src,1), Add)) +
-///    (REDUCE(GEP(src,2), Add) + REDUCE(GEP(src,3), Add)))
+///   → ((REDUCE(GEP(src,0), Add) + REDUCE(GEP(src,1), Add)) +
+///     (REDUCE(GEP(src,2), Add) + REDUCE(GEP(src,3), Add)))
+/// ```
 pub fn pm_scalar_accumulators() -> PatternMatcher<()> {
     crate::patterns! {
         reduce if is_k_vectorized_reduce(reduce) => {

@@ -115,9 +115,13 @@ fn classify_op(op: &Op) -> OpCategory {
         // Should be in ValueMap after Bind is processed. If not there, it's an error.
         Op::DefineVar { .. } => OpCategory::Meta,
 
-        Op::Sink { .. } | Op::Barrier { .. } | Op::Noop | Op::Unique(_) | Op::Device(_) | Op::Kernel { .. } => {
-            OpCategory::Meta
-        }
+        Op::Sink { .. }
+        | Op::Group { .. }
+        | Op::Barrier { .. }
+        | Op::Noop
+        | Op::Unique(_)
+        | Op::Device(_)
+        | Op::Kernel { .. } => OpCategory::Meta,
 
         // Vectorize creates vectors from elements - process in Loop handler
         Op::Vectorize { .. } => OpCategory::Loop,
@@ -276,6 +280,19 @@ fn codegen_arithmetic<'ctx>(
         }
         Op::Cast { src, dtype } => {
             let src_val = require_value(src, context, module, builder, values)?;
+
+            // Pointer-to-pointer cast is a no-op (Tinygrad: devectorizer.py pattern).
+            // CAST(INDEX, vec_ptr_type) just passes the pointer through - the dtype
+            // annotation tells LOAD what vector width to use.
+            if matches!(dtype, DType::Ptr { .. }) && src_val.is_pointer_value() {
+                tracing::debug!(
+                    src_dtype = ?src.dtype(),
+                    dst_dtype = ?dtype,
+                    "CAST: pointer-to-pointer cast is no-op"
+                );
+                return Ok(Some(src_val));
+            }
+
             let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
             // Get actual source dtype after auto-load (dereference Ptr)
             let actual_src_dtype = match src.dtype() {
@@ -888,16 +905,25 @@ fn codegen_load<'ctx>(
         return Ok(result);
     }
 
-    // Scalar path
+    // Scalar/Vector contiguous path
+    // When result_dtype is Vector but index is scalar, this is a contiguous vector load.
+    // GEP must use SCALAR element type (not vector) to compute correct offset.
+    let scalar_dtype = match result_dtype {
+        DType::Vector { scalar, .. } => DType::Scalar(*scalar),
+        _ => result_dtype.clone(),
+    };
+
     let element_ptr = if index.is_pointer_value() {
         index.into_pointer_value()
     } else {
         let ptr_val = buffer_ptr.into_pointer_value();
         let index_val = index.into_int_value();
-        let element_type = common::dtype_to_basic_type(result_dtype, context)?;
-        unsafe { builder.build_gep(element_type, ptr_val, &[index_val], "gep").context(BuildGepSnafu)? }
+        // Use scalar element type for GEP to compute correct byte offset
+        let gep_element_type = common::dtype_to_basic_type(&scalar_dtype, context)?;
+        unsafe { builder.build_gep(gep_element_type, ptr_val, &[index_val], "gep").context(BuildGepSnafu)? }
     };
 
+    // Load uses full result type (may be vector for contiguous loads)
     let load_type = common::dtype_to_basic_type(result_dtype, context)?;
     builder.build_load(load_type, element_ptr, "load").context(BuildLoadSnafu)
 }
@@ -957,16 +983,24 @@ fn codegen_store<'ctx>(
         return Ok(());
     }
 
-    // Scalar path: existing logic
+    // Scalar/Vector contiguous path
+    // When value is a vector but index is scalar, this is a contiguous vector store.
+    // GEP must use SCALAR element type (not vector) to compute correct offset.
     let element_ptr = if index.is_pointer_value() {
         index.into_pointer_value()
     } else {
         let ptr_val = buffer_ptr.into_pointer_value();
         let index_val = index.into_int_value();
-        let block = builder.get_insert_block().context(NoInsertBlockSnafu)?;
-        unsafe {
-            builder.build_gep(block.get_context().i8_type(), ptr_val, &[index_val], "gep").context(BuildGepSnafu)?
-        }
+
+        // Get scalar element type for GEP (handles both scalar and vector values)
+        let gep_element_type = if value.is_vector_value() {
+            // For vector value, use scalar element type
+            value.into_vector_value().get_type().get_element_type()
+        } else {
+            value.get_type()
+        };
+
+        unsafe { builder.build_gep(gep_element_type, ptr_val, &[index_val], "gep").context(BuildGepSnafu)? }
     };
 
     builder.build_store(element_ptr, value).context(BuildStoreSnafu)?;
@@ -1015,7 +1049,7 @@ fn codegen_loop<'ctx>(
             // Neither available - this is a programming error
             NotInValueMapSnafu { what: "BIND variable or value", id: var.id }.fail()
         }
-        Op::Sink { sources } => {
+        Op::Sink { sources } | Op::Group { sources } => {
             for src in sources {
                 codegen_uop(src, context, module, builder, values)?;
             }

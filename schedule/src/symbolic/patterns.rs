@@ -216,6 +216,69 @@ pub fn range_based_mod_div_patterns() -> PatternMatcher {
                 }
             None
         },
+
+        // Idiv(add_chain, n) → Idiv(add_chain_minus_const, n) when the constant doesn't affect floor division
+        // This handles: Idiv(Add(Add(base, 1), inner), 64) → Idiv(Add(base, inner), 64)
+        // when base is aligned to 64 and 1 < 64
+        Idiv(x, n @const(n_val)) if matches!(x.op(), Op::Binary(BinaryOp::Add, ..)) => {
+            // Extract total constant offset from Add chain
+            fn extract_const_sum(uop: &Arc<UOp>) -> (Arc<UOp>, i64) {
+                match uop.op() {
+                    Op::Binary(BinaryOp::Add, left, right) => {
+                        if let Op::Const(cv) = right.op()
+                            && let ConstValue::Int(v) = cv.0 {
+                                let (inner, inner_sum) = extract_const_sum(left);
+                                return (inner, inner_sum + v);
+                            }
+                        if let Op::Const(cv) = left.op()
+                            && let ConstValue::Int(v) = cv.0 {
+                                let (inner, inner_sum) = extract_const_sum(right);
+                                return (inner, inner_sum + v);
+                        }
+                        // Recurse into both sides for nested adds
+                        let (left_inner, left_sum) = extract_const_sum(left);
+                        let (right_inner, right_sum) = extract_const_sum(right);
+                        if left_sum != 0 || right_sum != 0 {
+                            // Rebuild Add without the extracted constants
+                            let new_add = left_inner.try_add(&right_inner).ok();
+                            if let Some(rebuilt) = new_add {
+                                return (rebuilt, left_sum + right_sum);
+                            }
+                        }
+                        (Arc::clone(uop), 0)
+                    }
+                    _ => (Arc::clone(uop), 0),
+                }
+            }
+
+            let (x_without_const, const_sum) = extract_const_sum(x);
+            if const_sum == 0 {
+                return None;  // No constant to remove
+            }
+
+            let (vmin, vmax) = VminVmaxProperty::get(&x_without_const);
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
+                && n_int > 0 {
+                    // Check if adding const_sum doesn't change floor division result
+                    let min_div = *min / n_int;
+                    let max_div = *max / n_int;
+
+                    // CRITICAL: All values must be in the same bucket for safe removal
+                    // If min and max are in different buckets, intermediate values could cross
+                    // bucket boundaries when const_sum is added/removed
+                    if min_div != max_div {
+                        return None;
+                    }
+
+                    // Check that adding const_sum keeps values in the same bucket
+                    let min_c_div = (*min + const_sum) / n_int;
+                    let max_c_div = (*max + const_sum) / n_int;
+                    if min_div == min_c_div && max_div == max_c_div {
+                        return x_without_const.try_div(&Arc::clone(n)).ok();
+                    }
+                }
+            None
+        },
     }
 }
 
@@ -585,6 +648,107 @@ pub fn negation_dsl_patterns() -> PatternMatcher {
     patterns! {
         // Double arithmetic negation: -(-x) → x
         Neg(Neg(x)) ~> Arc::clone(x),
+    }
+}
+
+/// GEP pushing patterns for devectorize pass.
+///
+/// Push GEP through ALU operations to simplify vector index extraction.
+/// Based on Tinygrad's gep_pushing (symbolic.py:153-176).
+///
+/// - GEP(GEP(x, inner), outer) → GEP(x, composed)
+/// - GEP(VECTORIZE(elements), [i]) → elements[i]
+/// - GEP(scalar, [0]) → scalar
+/// - GEP(VConst([...]), indices) → extracted element(s)
+/// - GEP(Binary(op, a, b), indices) → Binary(op, GEP(a), GEP(b))
+/// - GEP(Unary(op, x), indices) → Unary(op, GEP(x))
+/// - GEP(UNROLL(x, ...), indices) → GEP(x, indices)
+/// - GEP(x, [0,1,2,...,n-1]) → x (identity)
+pub fn gep_pushing_patterns() -> PatternMatcher {
+    /// Check if VECTORIZE is a broadcast (all elements pointer-equal)
+    fn is_broadcast(elements: &SmallVec<[Arc<UOp>; 4]>) -> bool {
+        elements.first().is_some_and(|first| elements.iter().all(|e| Arc::ptr_eq(e, first)))
+    }
+
+    patterns! {
+        // 1. GEP composition: GEP(GEP(x, inner), outer) → GEP(x, inner[outer])
+        // Note: nested struct patterns require UOp first field, so we extract inner manually
+        Gep { vector, indices } if matches!(vector.op(), Op::Gep { .. }) => {
+            let Op::Gep { vector: inner_vec, indices: inner_indices } = vector.op() else { return None };
+            let composed: Vec<usize> = indices.iter()
+                .map(|&o| inner_indices.get(o).copied())
+                .collect::<Option<Vec<_>>>()?;
+            Some(UOp::gep(Arc::clone(inner_vec), composed))
+        },
+
+        // 2. GEP through BROADCAST: extract scalar (MUST be before general VECTORIZE!)
+        // BROADCAST = VECTORIZE with all identical elements → GEP([x,x,x,x], [i]) → x
+        Gep { vector, indices } if indices.len() == 1 && matches!(vector.op(), Op::Vectorize { .. }) => {
+            let Op::Vectorize { elements } = vector.op() else { return None };
+            is_broadcast(elements).then(|| elements.first().cloned()).flatten()
+        },
+
+        // 3. GEP through VECTORIZE: extract single element
+        Gep { vector, indices } if indices.len() == 1 && matches!(vector.op(), Op::Vectorize { .. }) => {
+            let Op::Vectorize { elements } = vector.op() else { return None };
+            elements.get(indices[0]).cloned()
+        },
+
+        // 4. GEP on scalar: GEP(x, [i]) where x is scalar → x
+        Gep { vector, indices } if vector.dtype().vcount() == 1 && indices.len() == 1 ~> Arc::clone(vector),
+
+        // 5. GEP through VConst: extract element(s)
+        Gep { vector, indices } if matches!(vector.op(), Op::VConst { .. }) => {
+            let Op::VConst { values } = vector.op() else { return None };
+            let scalar_dtype = vector.dtype().scalar().map(DType::Scalar).unwrap_or(DType::Index);
+            if indices.len() == 1 {
+                values.get(indices[0]).map(|v| UOp::const_(scalar_dtype.clone(), *v))
+            } else {
+                let selected: Vec<_> = indices.iter().filter_map(|&i| values.get(i).cloned()).collect();
+                (selected.len() == indices.len()).then(|| UOp::vconst(selected))
+            }
+        },
+
+        // 6. Push GEP through Binary: GEP(Binary(op, a, b), indices) → Binary(op, GEP(a), GEP(b))
+        Gep { vector, indices } if !indices.is_empty() && matches!(vector.op(), Op::Binary(..)) => {
+            let Op::Binary(bin_op, a, b) = vector.op() else { return None };
+            let gep_a = UOp::gep(Arc::clone(a), indices.clone());
+            let gep_b = UOp::gep(Arc::clone(b), indices.clone());
+            Some(UOp::new(Op::Binary(*bin_op, gep_a.clone(), gep_b), gep_a.dtype()))
+        },
+
+        // 7. Push GEP through Unary: GEP(Unary(op, x), indices) → Unary(op, GEP(x))
+        Gep { vector, indices } if !indices.is_empty() && matches!(vector.op(), Op::Unary(..)) => {
+            let Op::Unary(un_op, x) = vector.op() else { return None };
+            let gep_x = UOp::gep(Arc::clone(x), indices.clone());
+            Some(UOp::new(Op::Unary(*un_op, gep_x.clone()), gep_x.dtype()))
+        },
+
+        // 8. GEP through UNROLL: GEP(UNROLL(x, ...), indices) → GEP(x, indices)
+        Gep { vector, indices } if matches!(vector.op(), Op::Unroll { .. }) => {
+            let Op::Unroll { src, .. } = vector.op() else { return None };
+            Some(UOp::gep(Arc::clone(src), indices.clone()))
+        },
+
+        // 9. Identity GEP removal: GEP(x, [0,1,2,...,n-1]) → x
+        Gep { vector, indices }
+            if indices.iter().enumerate().all(|(i, &idx)| i == idx)
+                && indices.len() == vector.dtype().vcount()
+            ~> Arc::clone(vector),
+
+        // 10. GEP through PTRCAT: GEP(PTRCAT([a, b, c, d]), [1, 3]) → PTRCAT([b, d])
+        Gep { vector, indices } if matches!(vector.op(), Op::PtrCat { .. }) => {
+            let Op::PtrCat { sources } = vector.op() else { return None };
+            let reordered: Vec<_> = indices.iter().filter_map(|&idx| sources.get(idx).cloned()).collect();
+            (reordered.len() == indices.len()).then(|| UOp::ptrcat(reordered))
+        },
+
+        // 11. GEP through CAT: GEP(CAT([a, b, c, d]), [1, 3]) → CAT([b, d])
+        Gep { vector, indices } if matches!(vector.op(), Op::Cat { .. }) => {
+            let Op::Cat { sources } = vector.op() else { return None };
+            let reordered: Vec<_> = indices.iter().filter_map(|&idx| sources.get(idx).cloned()).collect();
+            (reordered.len() == indices.len()).then(|| UOp::cat(reordered))
+        },
     }
 }
 

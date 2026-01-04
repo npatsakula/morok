@@ -82,18 +82,15 @@ impl UOp {
         let vector_dtype = vector.dtype();
 
         // Extract scalar if single element, keep vector if multiple
+        // Use base() instead of scalar() to handle both Scalar and Vector dtypes
         let dtype = if indices.len() == 1 {
             // Extract single element -> scalar
-            match vector_dtype.scalar() {
-                Some(s) => DType::Scalar(s),
-                None => vector_dtype.clone(),
-            }
+            // For Scalar(s), base() returns s
+            // For Vector { scalar, .. }, base() returns scalar
+            DType::Scalar(vector_dtype.base())
         } else {
             // Extract multiple elements -> vector
-            match vector_dtype.scalar() {
-                Some(s) => DType::Scalar(s).vec(indices.len()),
-                None => vector_dtype.clone(),
-            }
+            DType::Scalar(vector_dtype.base()).vec(indices.len())
         };
 
         Self::new(Op::Gep { vector, indices }, dtype)

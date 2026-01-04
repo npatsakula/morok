@@ -122,12 +122,16 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     // This handles arithmetic expressions created by shift_to UNROLL
     let expanded = crate::expand::pre_expand(&with_loads);
 
+    // Devectorize pass: group contiguous memory accesses
+    // Uses direct vector index analysis (VConst/UNROLL patterns) for termination safety
+    let devectorized_mem = crate::devectorize::devectorize(&expanded);
+
     // Scalar accumulator devectorization: Convert K-vectorized REDUCEs to scalar accumulators.
     // When UPCAST is applied to reduce axes, REDUCE gets Vector dtype with CONTRACT source.
     // This converts them to N independent scalar REDUCEs that SLP vectorizer can optimize.
     // Benefits: FMA fusion, better register allocation, no horizontal reduce overhead.
     let pm_scalar_acc = crate::rangeify::patterns::pm_scalar_accumulators();
-    let scalar_acc = crate::rewrite::graph_rewrite_bottom_up(&pm_scalar_acc, expanded, &mut ());
+    let scalar_acc = crate::rewrite::graph_rewrite_bottom_up(&pm_scalar_acc, devectorized_mem, &mut ());
 
     // Bool devectorization: Convert <N x i1> ALU ops to scalar ops + VECTORIZE.
     // LLVM's bool vectors are broken (no formal ABI, segfaults in codegen).

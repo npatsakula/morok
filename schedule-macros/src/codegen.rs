@@ -759,6 +759,12 @@ fn generate_op_struct_pattern_with_depth(
         "Expand" => quote! { #first_code.f_expand() },
         "Reduce" => quote! { #first_code.f_reduce() },
         "Copy" => quote! { #first_code.f_copy() },
+        "Gep" => quote! { #first_code.f_gep() },
+        "Vectorize" => quote! { #first_code.f_vectorize() },
+        "VConst" => quote! { #first_code.f_vconst() },
+        "Unroll" => quote! { #first_code.f_unroll() },
+        "PtrCat" => quote! { #first_code.f_ptrcat() },
+        "Cat" => quote! { #first_code.f_cat() },
         "Detach" => quote! { morok_ir::pattern::UPat::detach(#first_code) },
         "ContiguousBackward" => quote! { morok_ir::pattern::UPat::contiguous_backward(#first_code) },
         _ => {
@@ -1159,7 +1165,22 @@ fn generate_fallible_rewrite(rhs: &RewriteExpr, guard: &Option<syn::Expr>) -> To
 }
 
 /// Operations that support field extraction in struct patterns.
-const EXTRACTABLE_OPS: &[&str] = &["Cast", "Permute", "Reduce", "Bufferize", "Reshape", "Expand", "Index", "Copy"];
+const EXTRACTABLE_OPS: &[&str] = &[
+    "Cast",
+    "Permute",
+    "Reduce",
+    "Bufferize",
+    "Reshape",
+    "Expand",
+    "Index",
+    "Copy",
+    "Gep",
+    "Vectorize",
+    "VConst",
+    "Unroll",
+    "PtrCat",
+    "Cat",
+];
 
 /// Generate field extraction code for a single field from a struct op.
 ///

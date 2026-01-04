@@ -197,7 +197,7 @@ fn phase2_expand() -> PatternMatcher {
         // =====================================================================
 
         // Main expansion: ALL expandable ops with UNROLL inputs
-        // Uses is_expandable() check and range_ending_src_index() for proper range handling
+        // Uses is_expandable() check and range_ending_src_index() for proper range handling.
         op if op.op().is_expandable() && has_unroll_input(op) => do_expand(op),
 
         // Contract UNROLL via GEP extraction
@@ -656,6 +656,7 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
     }
 }
 
+// ============================================================================
 /// Fix REDUCE operations that have non-Range entries in their ranges.
 ///
 /// This handles two scenarios:
@@ -897,54 +898,6 @@ fn extract_const_size(end: &Arc<UOp>) -> Option<usize> {
     } else {
         None
     }
-}
-
-// ============================================================================
-// Additional Expansion Patterns (from Tinygrad expander.py)
-// ============================================================================
-
-/// Fix STORE operations that have UNROLL in their ranges.
-/// Recursively collect all UNROLL ops from an expression tree.
-/// After shift_to, STORE.ranges may contain arithmetic expressions like
-/// `(outer_reduced * amount + UNROLL([0,1,2,3]))`. This finds nested UNROLLs.
-fn collect_unrolls_from_tree(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
-    let mut unrolls = Vec::new();
-    let mut stack = vec![uop.clone()];
-    let mut visited = std::collections::HashSet::new();
-
-    while let Some(node) = stack.pop() {
-        if !visited.insert(node.id) {
-            continue;
-        }
-
-        if matches!(node.op(), Op::Unroll { .. }) {
-            unrolls.push(node.clone());
-        } else {
-            // Visit children
-            node.op().map_child(|child| {
-                stack.push(child.clone());
-            });
-        }
-    }
-
-    // Detailed logging when searching Binary
-    if matches!(uop.op(), Op::Binary(_, _, _)) {
-        tracing::debug!(
-            root_id = uop.id,
-            root_op = ?std::mem::discriminant(uop.op()),
-            num_unrolls = unrolls.len(),
-            visited_count = visited.len(),
-            visited_ids = ?visited.iter().collect::<Vec<_>>(),
-            "collect_unrolls_from_tree: searched Binary tree"
-        );
-    }
-
-    unrolls
-}
-
-/// Check if an expression tree contains any UNROLL ops.
-fn contains_unroll(uop: &Arc<UOp>) -> bool {
-    !collect_unrolls_from_tree(uop).is_empty()
 }
 
 /// Based on Tinygrad's fix_store_unroll (expander.py:123-126).
@@ -1338,9 +1291,10 @@ mod tests {
 
         // Check the result has CONTRACT wrapper (for upcast axes)
         if let Some(fixed) = result
-            && let Op::Reduce { src: fixed_src, .. } = fixed.op() {
-                assert!(matches!(fixed_src.op(), Op::Contract { .. }), "Expected CONTRACT wrapper for upcast axes");
-            }
+            && let Op::Reduce { src: fixed_src, .. } = fixed.op()
+        {
+            assert!(matches!(fixed_src.op(), Op::Contract { .. }), "Expected CONTRACT wrapper for upcast axes");
+        }
     }
 }
 // TEMP DEBUG: Add detailed tracing to do_expand

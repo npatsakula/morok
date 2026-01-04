@@ -18,6 +18,7 @@
 //! Pattern matching infrastructure has moved to `morok_ir::pattern` and `morok_ir::rewrite`.
 //! This crate re-exports these modules for convenience.
 
+pub mod devectorize;
 pub mod expand;
 pub mod linearize;
 pub mod optimizer;
@@ -43,6 +44,9 @@ pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, run_kernel_split
 
 // Re-export expand pass
 pub use expand::pre_expand;
+
+// Re-export devectorize pass
+pub use devectorize::devectorize;
 
 // Re-export optimizer entry points
 pub use optimizer::{
