@@ -100,6 +100,36 @@ fn gep_ptrcat_patterns() -> PatternMatcher {
     crate::patterns! {
         gep if is_gep_ptrcat(gep) => gep_ptrcat(gep),
         gep if is_gep_cat(gep) => gep_cat(gep),
+
+        // Single-source Cat is identity: Cat([x]) → x
+        cat if matches!(cat.op(), Op::Cat { .. }) => {
+            let Op::Cat { sources } = cat.op() else { return None };
+            (sources.len() == 1).then(|| Arc::clone(&sources[0]))
+        },
+
+        // Single-source PtrCat is identity: PtrCat([x]) → x
+        ptrcat if matches!(ptrcat.op(), Op::PtrCat { .. }) => {
+            let Op::PtrCat { sources } = ptrcat.op() else { return None };
+            (sources.len() == 1).then(|| Arc::clone(&sources[0]))
+        },
+
+        // Identity CAT reconstruction: CAT(GEP(x,[0]), GEP(x,[1]), ...) → x
+        cat if matches!(cat.op(), Op::Cat { .. }) => {
+            let Op::Cat { sources } = cat.op() else { return None };
+            if sources.is_empty() { return None; }
+
+            let Op::Gep { vector: first_vec, indices: first_idx } = sources[0].op() else { return None };
+            if first_idx.len() != 1 || first_idx[0] != 0 { return None; }
+
+            for (i, src) in sources.iter().enumerate() {
+                let Op::Gep { vector, indices } = src.op() else { return None };
+                if !Arc::ptr_eq(vector, first_vec) { return None; }
+                if indices.len() != 1 || indices[0] != i { return None; }
+            }
+
+            if sources.len() != first_vec.dtype().vcount() { return None; }
+            Some(Arc::clone(first_vec))
+        },
     }
 }
 

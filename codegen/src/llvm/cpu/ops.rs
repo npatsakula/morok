@@ -536,6 +536,12 @@ fn codegen_cast<'ctx>(
     };
     let scalar_dst_dtype = DType::Scalar(dst_dtype.base());
 
+    // Early return if scalar types match - no conversion needed
+    // This avoids unnecessary extract/insert loops for same-type vector casts
+    if scalar_src_dtype == scalar_dst_dtype {
+        return Ok(src);
+    }
+
     let src_is_float = scalar_src_dtype.is_float();
     let dst_is_float = scalar_dst_dtype.is_float();
     let src_is_signed = scalar_src_dtype.is_signed();
