@@ -44,12 +44,15 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     // 3. Grouped reduction
     try_grouped_reduction(scheduler, config);
 
-    // 3.5. Matmul K-vectorization (CPU-only, vectorizes K axis)
-    apply_matmul_k_vectorization(scheduler, config);
+    // 3.5. Matmul output dimension upcasting (CPU-only, vectorizes along N)
+    // Output upcast preferred over K-vec: gives contiguous B matrix loads
+    let output_upcasted = apply_matmul_output_upcasting(scheduler, config);
 
-    // 3.6. Matmul output dimension upcasting (CPU-only, creates register tiles)
-    // Both can run together - upcast_size() guards prevent exponential vector growth
-    apply_matmul_output_upcasting(scheduler, config);
+    // 3.6. Matmul K-vectorization only if output upcast didn't apply
+    // K-vec creates non-contiguous B access patterns (stride-N between lanes)
+    if !output_upcasted {
+        apply_matmul_k_vectorization(scheduler, config);
+    }
 
     // 4. Masked upcasts
     apply_masked_upcasts(scheduler);
@@ -446,9 +449,10 @@ pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &Heurist
         return false;
     }
 
-    // Get output axes (Global, Loop - not Outer/Reduce/GroupReduce)
-    // Outer axes are for kernel splitting, not vectorization (matches Tinygrad)
-    let output_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Loop]);
+    // Get output axes (Outer, Global, Loop - not Reduce/GroupReduce)
+    // For reduce kernels (like matmul), output dimensions are OUTER type
+    // Note: Tinygrad uses GLOBAL/LOCAL/LOOP for output dims, but Morok uses OUTER
+    let output_axes = scheduler.axes_of(&[AxisType::Outer, AxisType::Global, AxisType::Loop]);
     trace!(num_output_axes = output_axes.len(), "apply_matmul_output_upcasting: output axes");
     if output_axes.is_empty() {
         return false;

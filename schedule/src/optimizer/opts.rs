@@ -63,7 +63,7 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
 
 /// Split dimension into smaller range + UPCAST for vector operations.
 ///
-/// UPCAST is for output dimension vectorization (GLOBAL/LOCAL/LOOP).
+/// UPCAST is for output dimension vectorization (OUTER/GLOBAL/LOCAL/LOOP).
 /// For reduce axis unrolling, use UNROLL instead.
 fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     let axis_type = match rng.op() {
@@ -71,11 +71,11 @@ fn apply_upcast(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
-    // Match Tinygrad: UPCAST is for output dimension vectorization only
-    // GLOBAL/LOCAL/LOOP can be upcasted (output dimensions)
-    // REDUCE/GROUP_REDUCE should use UNROLL instead
-    if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
-        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Global/Local/Loop axes" }.fail();
+    // UPCAST is for output dimension vectorization (parallel lanes compute different outputs)
+    // Allowed: OUTER (reduce kernel outputs), GLOBAL/LOCAL/LOOP (elementwise outputs)
+    // REDUCE/GROUP_REDUCE should use UNROLL instead (unrolled iterations, scalar accumulators)
+    if !matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Local | AxisType::Loop) {
+        return ValidationFailedSnafu { op: "UPCAST", reason: "can only upcast Outer/Global/Local/Loop axes" }.fail();
     }
 
     if amount > scheduler.ren.upcast_max {

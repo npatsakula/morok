@@ -1324,7 +1324,13 @@ fn codegen_reduce<'ctx>(
 
     // Check for FMA pattern: REDUCE(Add, Mul(a, b), ...) where dtype is float
     // FMA generates: acc = fma(a, b, acc) instead of acc = acc + (a * b)
-    let fma_operands = if reduce_op == ReduceOp::Add && result_dtype.base().is_float() {
+    // IMPORTANT: FMA only works when source and accumulator types match.
+    // If source is vectorized but accumulator is scalar, fall through to standard path.
+    let src_is_vectorized = src.dtype().vcount() > 1;
+    let fma_operands = if reduce_op == ReduceOp::Add
+        && result_dtype.base().is_float()
+        && !(src_is_vectorized && !is_vector_accumulator)
+    {
         let result = try_extract_fma_operands(src);
         debug!(
             src_op = ?std::mem::discriminant(src.op()),
@@ -1348,33 +1354,56 @@ fn codegen_reduce<'ctx>(
         let b_val = require_value(mul_b, context, module, builder, values)?;
         let b_val = auto_load_pointer(b_val, &mul_b.dtype(), context, builder)?;
 
-        // Handle vector splat if needed (same logic as standard path)
-        let (a_val, b_val) = if is_vector_accumulator {
-            let a_val = if !a_val.is_vector_value() {
-                splat_scalar_to_vector(a_val, vec_len, context, builder)?
-            } else {
-                a_val
-            };
-            let b_val = if !b_val.is_vector_value() {
-                splat_scalar_to_vector(b_val, vec_len, context, builder)?
-            } else {
-                b_val
-            };
-            (a_val, b_val)
+        // Check for type mismatch AFTER compilation (vectorization happens during require_value)
+        // FMA only works when all operands have matching types.
+        // If operands are vectors but accumulator is scalar, fall through to standard path.
+        let operand_is_vector = a_val.is_vector_value() || b_val.is_vector_value();
+        debug!(
+            a_is_vec = a_val.is_vector_value(),
+            b_is_vec = b_val.is_vector_value(),
+            operand_is_vector,
+            is_vector_accumulator,
+            "FMA type check"
+        );
+        if operand_is_vector && !is_vector_accumulator {
+            debug!("FMA rejected: vector operands with scalar accumulator, using standard path");
+            // Fall through to standard path - need to evaluate the full MUL
+            let src_val = require_value(src, context, module, builder, values)?;
+            let src_val = auto_load_pointer(src_val, &src.dtype(), context, builder)?;
+            let acc_val = builder.build_load(acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
+            // Harmonize types: broadcast scalar acc to match vector src
+            let (acc_val, src_val) = common::harmonize_operands(builder, acc_val, src_val, context)?;
+            let new_acc = codegen_reduce_op(reduce_op, acc_val, src_val, result_dtype, module, builder)?;
+            builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
         } else {
-            (a_val, b_val)
-        };
+            // Handle vector splat if needed (same logic as standard path)
+            let (a_val, b_val) = if is_vector_accumulator {
+                let a_val = if !a_val.is_vector_value() {
+                    splat_scalar_to_vector(a_val, vec_len, context, builder)?
+                } else {
+                    a_val
+                };
+                let b_val = if !b_val.is_vector_value() {
+                    splat_scalar_to_vector(b_val, vec_len, context, builder)?
+                } else {
+                    b_val
+                };
+                (a_val, b_val)
+            } else {
+                (a_val, b_val)
+            };
 
-        // Load accumulator
-        let acc_val = builder.build_load(acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
+            // Load accumulator
+            let acc_val = builder.build_load(acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
 
-        // FMA: acc = a * b + acc
-        let suffix = get_type_suffix(result_dtype)?;
-        let new_acc =
-            call_intrinsic(&format!("llvm.fma.{}", suffix), &[a_val, b_val, acc_val], "fma", module, builder)?;
-        builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
+            // FMA: acc = a * b + acc
+            let suffix = get_type_suffix(result_dtype)?;
+            let new_acc =
+                call_intrinsic(&format!("llvm.fma.{}", suffix), &[a_val, b_val, acc_val], "fma", module, builder)?;
+            builder.build_store(acc_alloca, new_acc).context(BuildStoreSnafu)?;
 
-        trace!("FMA intrinsic generated for reduce accumulation");
+            trace!("FMA intrinsic generated for reduce accumulation");
+        }
     } else {
         // Standard path: evaluate source, then accumulate
         let src_val = require_value(src, context, module, builder, values)?;
