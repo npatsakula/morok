@@ -43,6 +43,7 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
     /// Returns `(module, var_names, thread_count)` where:
     /// - var_names: variable names in order (including thread_id if threading)
     /// - thread_count > 1 indicates a threaded kernel
+    #[tracing::instrument(skip_all)]
     fn render_to_module(&self, uop: &Arc<UOp>, name: &str) -> Result<(Module<'ctx>, Vec<String>, usize)> {
         let module = self.context.create_module(name);
         let builder = self.context.create_builder();
@@ -211,7 +212,7 @@ impl<'ctx> CpuLlvmRenderer<'ctx> {
         // No bootstrap function needed - kernel directly takes (ptr args, ptr vars)
 
         // Dump IR at trace level
-        trace!(llvm.ir = %module.to_string(), "llvm ir before verification");
+        trace!(llvm.ir = module.to_string(), "llvm ir before verification");
 
         // Verify the module
         module.verify().map_err(|err| Error::ModuleVerification { message: err.to_string() })?;

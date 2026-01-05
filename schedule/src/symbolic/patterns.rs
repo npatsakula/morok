@@ -285,11 +285,10 @@ pub fn range_based_mod_div_patterns() -> PatternMatcher {
         // Using [] for both Add and Mul to match all permutations
         Idiv(Add[a, Mul[Idiv(x, n @const(n_val)), n]], n) => {
             let (vmin, vmax) = VminVmaxProperty::get(a);
-            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val) {
-                if *min >= 0 && *max < n_int && n_int > 0 {
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
+                && *min >= 0 && *max < n_int && n_int > 0 {
                     return x.try_div(n).ok();
                 }
-            }
             None
         },
     }

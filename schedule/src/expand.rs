@@ -31,7 +31,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_dtype::DType;
-use morok_ir::{AxisType, BinaryOp, ConstValue, Op, PatternMatcher, UOp};
+use morok_ir::prelude::*;
+use morok_ir::{AxisType, PatternMatcher};
 use smallvec::SmallVec;
 
 // ============================================================================
@@ -193,7 +194,14 @@ fn phase2_expand() -> PatternMatcher {
         end @ End(_, ..) => end_unrolls(end),
 
         // =====================================================================
-        // Phase 2c: Core expansion (expander patterns)
+        // Phase 2c: Lift UNROLL out of Binary for proper propagation
+        // =====================================================================
+        // Must run BEFORE do_expand so parent ops see UNROLL as direct source.
+        // Converts Binary(op, X, UNROLL) → UNROLL(Binary(op, X, unwrap))
+        binary if is_binary_with_single_unroll(binary) => lift_unroll_from_binary(binary),
+
+        // =====================================================================
+        // Phase 2d: Core expansion (expander patterns)
         // =====================================================================
 
         // Main expansion: ALL expandable ops with UNROLL inputs
@@ -204,7 +212,7 @@ fn phase2_expand() -> PatternMatcher {
         contract @ Contract(_, ..) => do_contract(contract),
 
         // =====================================================================
-        // Phase 2d: Cleanup
+        // Phase 2e: Cleanup
         // =====================================================================
 
         // Collapse nested UNROLL: UNROLL(UNROLL(x, inner), outer) → UNROLL(x, inner+outer)
@@ -296,12 +304,9 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Don't expand INDEX operations that return pointers (Tinygrad expander.py:84-86)
-    if matches!(op, Op::Index { .. }) && matches!(uop.dtype(), DType::Ptr { .. }) {
-        return None;
-    }
-
-    tracing::debug!(op_type = ?std::mem::discriminant(op), dtype = ?uop.dtype(), "do_expand: expanding op");
+    // NOTE: We previously skipped INDEX with Ptr dtype here, but that was incorrect.
+    // Tinygrad's do_expand (expander.py:97-98) DOES expand INDEX operations.
+    // The special handling at lines 50-51 only affects non-UNROLL sources for non-Ptr INDEX.
 
     let sources = op.sources();
 
@@ -446,6 +451,14 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Create the expanded operation
     let new_op = reconstruct_op_with_new_sources(op, &new_sources, &new_dtype)?;
 
+    // Store/StoreGated don't produce values, so don't wrap them in UNROLL
+    // (UNROLL implies a value that can be used by parent operations)
+    // Instead, just return the expanded Store directly with vectorized sources.
+    if matches!(op, Op::Store { .. } | Op::StoreGated { .. }) {
+        tracing::debug!(op_type = ?std::mem::discriminant(op), "do_expand: returning Store without UNROLL wrapper");
+        return Some(new_op);
+    }
+
     // Wrap result in UNROLL
     Some(UOp::unroll(new_op, expand_args))
 }
@@ -461,7 +474,13 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
 
         Op::Binary(binary_op, _, _) => {
             if sources.len() >= 2 {
-                Some(UOp::new(Op::Binary(*binary_op, sources[0].clone(), sources[1].clone()), dtype.clone()))
+                // Comparison operations always produce Bool dtype, vectorized if needed.
+                // This matches Tinygrad's behavior (uop/ops.py:412):
+                //   if op in {Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ}:
+                //       out_dtype = dtypes.bool.vec(out_dtype.count) if out_dtype.count > 1 else dtypes.bool
+                let result_dtype =
+                    if binary_op.is_comparison() { DType::Bool.vec(dtype.vcount()) } else { dtype.clone() };
+                Some(UOp::new(Op::Binary(*binary_op, sources[0].clone(), sources[1].clone()), result_dtype))
             } else {
                 None
             }
@@ -479,7 +498,9 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
         }
 
         // Type operations
-        Op::Cast { dtype: cast_dtype, .. } => sources.first().map(|s| UOp::cast(s.clone(), cast_dtype.clone())),
+        // NOTE: Use the vectorized `dtype` (new_dtype), not the original `cast_dtype`.
+        // When expanding with expand_sz=N, the output dtype becomes vec<N x T> not scalar T.
+        Op::Cast { .. } => sources.first().map(|s| UOp::cast(s.clone(), dtype.clone())),
 
         Op::BitCast { dtype: bitcast_dtype, .. } => sources
             .first()
@@ -1043,7 +1064,7 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     tracing::debug!(
         contract_axes = ?contract_axes,
-        contract_src_op = ?std::mem::discriminant(contract_src.op()),
+        contract_src_op = contract_src.op().as_ref(),
         "do_contract: matched CONTRACT op"
     );
 
@@ -1111,6 +1132,67 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     None
+}
+
+/// Check if Binary has exactly one UNROLL source (for pattern guard).
+fn is_binary_with_single_unroll(uop: &Arc<UOp>) -> bool {
+    if let Op::Binary(op, left, right) = uop.op() {
+        let left_is_unroll = matches!(left.op(), Op::Unroll { .. });
+        let right_is_unroll = matches!(right.op(), Op::Unroll { .. });
+        let result = left_is_unroll != right_is_unroll; // XOR: exactly one is UNROLL
+        if result {
+            tracing::debug!(
+                op = ?op,
+                left_is_unroll = left_is_unroll,
+                right_is_unroll = right_is_unroll,
+                "is_binary_with_single_unroll: MATCHED"
+            );
+        }
+        result
+    } else {
+        false
+    }
+}
+
+/// Lift UNROLL out of Binary expressions for proper expansion propagation.
+///
+/// Pattern: Binary(op, non_unroll, UNROLL(src, axes)) → UNROLL(Binary(op, non_unroll, src), axes)
+///
+/// This ensures UNROLL is at the outer level so has_unroll_input() can see it
+/// and do_expand() can propagate vectorization to parent operations.
+fn lift_unroll_from_binary(binary: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Binary(op, left, right) = binary.op() else { return None };
+
+    let left_is_unroll = matches!(left.op(), Op::Unroll { .. });
+    let right_is_unroll = matches!(right.op(), Op::Unroll { .. });
+
+    // Only handle single UNROLL case (both UNROLL is handled by do_expand)
+    if left_is_unroll == right_is_unroll {
+        return None;
+    }
+
+    let (unroll_axes, unroll_inner, non_unroll, unroll_on_left) = if left_is_unroll {
+        let Op::Unroll { src, unroll_axes } = left.op() else { return None };
+        (unroll_axes.clone(), src.clone(), right.clone(), true)
+    } else {
+        let Op::Unroll { src, unroll_axes } = right.op() else { return None };
+        (unroll_axes.clone(), src.clone(), left.clone(), false)
+    };
+
+    tracing::debug!(
+        op = ?op,
+        unroll_axes = ?unroll_axes,
+        unroll_on_left = unroll_on_left,
+        "lift_unroll_from_binary: LIFTING"
+    );
+
+    // Create new Binary with unwrapped UNROLL source (preserve operand order)
+    let (new_left, new_right) =
+        if unroll_on_left { (unroll_inner.clone(), non_unroll) } else { (non_unroll, unroll_inner.clone()) };
+
+    let new_binary = UOp::new(Op::Binary(*op, new_left, new_right), unroll_inner.dtype());
+
+    Some(UOp::unroll(new_binary, unroll_axes.to_vec()))
 }
 
 /// Collapse nested UNROLL operations.

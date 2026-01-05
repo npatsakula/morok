@@ -54,6 +54,7 @@ pub struct RangeifyResult {
 /// original nodes were transformed. This is essential for global graph
 /// coordination when multiple tensors share subgraphs.
 #[allow(clippy::mutable_key_type)]
+#[tracing::instrument(skip_all, fields(origin.tree = sink.tree()))]
 pub fn rangeify_with_map(
     sink: Arc<UOp>,
     pcontig_config: Option<&super::kernel::PcontigConfig>,
@@ -65,12 +66,14 @@ pub fn rangeify_with_map(
 
     // Step 1: Run range assignment to build IndexingContext
     let (mut sink, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
+    tracing::debug!(uop.tree = sink.tree(), "range assignment complete");
 
     // Step 2: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
     let early_matcher = super::patterns::early_rewrites();
     let result = graph_rewrite_bottom_up_with_map(&early_matcher, sink, &mut ());
     sink = result.root;
     all_becomes.extend(result.becomes_map);
+    tracing::debug!(uop.tree = sink.tree(), "early rewrites complete");
 
     // Step 2.5: Split large reductions BEFORE ReduceAxis → REDUCE conversion
     // split_reduceop needs ReduceAxis (not REDUCE), so it must run before Step 3
@@ -79,6 +82,7 @@ pub fn rangeify_with_map(
     let result = graph_rewrite_with_map(&split_matcher, sink, &mut split_config);
     sink = result.root;
     all_becomes.extend(result.becomes_map);
+    tracing::debug!(uop.tree = sink.tree(), "split reduceops complete");
 
     // Step 3: Apply core rangeify transformation (bottom-up)
     // This includes: bufferize transform, movement op removal, ReduceAxis → REDUCE conversion
@@ -86,29 +90,34 @@ pub fn rangeify_with_map(
     let result = graph_rewrite_bottom_up_with_map(&rangeify_matcher, sink, &mut indexing_ctx);
     sink = result.root;
     all_becomes.extend(result.becomes_map);
+    tracing::debug!(uop.tree = sink.tree(), "rangeify complete");
 
     // Step 4: Buffer simplification
     let buffer_simplify = super::patterns::buffer_folding() + super::patterns::dead_axis_removal();
     let result = graph_rewrite_with_map(&buffer_simplify, sink, &mut ());
     sink = result.root;
     all_becomes.extend(result.becomes_map);
+    tracing::debug!(uop.tree = sink.tree(), "buffer folding + dead axis removal complete");
 
     // Step 4.5: Apply early rewrites again for RESHAPE to scalar
     let result = graph_rewrite_bottom_up_with_map(&early_matcher, sink, &mut ());
     sink = result.root;
     all_becomes.extend(result.becomes_map);
+    tracing::debug!(uop.tree = sink.tree(), "reshape to scalar complete");
 
     // Step 5: Cost-based buffer removal with partial contiguous
     let mut pcontig = pcontig_config.cloned().unwrap_or_default();
     let buffer_removal_matcher = super::patterns::buffer_removal_with_pcontig();
     sink = apply_buffer_removal_protecting_sink(&sink, &buffer_removal_matcher, &mut pcontig);
     // Note: apply_buffer_removal_protecting_sink doesn't use _with_map yet, could add later
+    tracing::debug!(uop.tree = sink.tree(), "buffer removal complete");
 
     // Step 6: Symbolic simplification
     let symbolic_matcher = crate::symbolic::symbolic_simple();
     let result = graph_rewrite_with_map(&symbolic_matcher, sink, &mut ());
     sink = result.root;
     all_becomes.extend(result.becomes_map);
+    tracing::debug!(uop.tree = sink.tree(), "symbolic simplification complete");
 
     // Step 6.5: Buffer limit enforcement
     if let Some(device) = super::patterns::extract_device_from_graph(&sink)
@@ -118,6 +127,7 @@ pub fn rangeify_with_map(
         let result = graph_rewrite_with_map(&limit_matcher, sink, &mut ());
         sink = result.root;
         all_becomes.extend(result.becomes_map);
+        tracing::debug!(uop.tree = sink.tree(), "buffer limit enforcement complete");
     }
 
     // Step 7: Reduction simplifications (reduce_unparented, reduce_collapse)
@@ -126,6 +136,7 @@ pub fn rangeify_with_map(
     let result = graph_rewrite_with_map(&reduction_matcher, sink, &mut ());
     sink = result.root;
     all_becomes.extend(result.becomes_map);
+    tracing::debug!(uop.tree = sink.tree(), "reduction simplification complete");
 
     // Step 8: Build RangeifyContext for return
     let rangeify_ctx = RangeifyContext { range_counter: indexing_ctx.range_counter(), range_map: HashMap::new() };

@@ -1248,15 +1248,15 @@ pub fn pm_add_loads() -> PatternMatcher<()> {
         },
 
         // =====================================================================
-        // REDUCE: wrap INDEX accumulator source with LOAD, propagate vector dtype
+        // REDUCE: wrap INDEX accumulator source with LOAD, preserve REDUCE dtype
         // =====================================================================
         reduce if matches!(reduce.op(), Op::Reduce { .. }) => {
             let Op::Reduce { src, ranges, reduce_op } = reduce.op() else { return None; };
             if !matches!(src.op(), Op::Index { .. }) { return None; }
             let loaded = wrap_index_with_load(src)?;
-            // If LOAD has vector dtype, REDUCE output should also be vector
-            // This enables element-wise reduction (4 separate accumulators)
-            let output_dtype = loaded.dtype().clone();
+            // Preserve original REDUCE dtype - horizontal_reduce handles vectorized sources.
+            // LOAD may have vector dtype (for gather), but REDUCE output stays scalar.
+            let output_dtype = reduce.dtype().clone();
             Some(UOp::new(
                 Op::Reduce { src: loaded, ranges: ranges.clone(), reduce_op: *reduce_op },
                 output_dtype,
@@ -1335,8 +1335,14 @@ fn devectorize_unary_bool(op: &UnaryOp, src: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 /// Devectorize a comparison op that produces vectorized bools.
+///
+/// Handles comparisons where either operand is vectorized (or both).
+/// Broadcasts scalar operands to match the vector width.
 fn devectorize_comparison(op: &BinaryOp, a: &Arc<UOp>, b: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let vcount = a.dtype().vcount();
+    let a_vcount = a.dtype().vcount();
+    let b_vcount = b.dtype().vcount();
+    let vcount = a_vcount.max(b_vcount);
+
     if vcount <= 1 {
         return None;
     }
@@ -1345,8 +1351,9 @@ fn devectorize_comparison(op: &BinaryOp, a: &Arc<UOp>, b: &Arc<UOp>) -> Option<A
 
     let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
         .map(|i| {
-            let a_elem = UOp::gep(a.clone(), vec![i]);
-            let b_elem = UOp::gep(b.clone(), vec![i]);
+            // Extract element or clone scalar (GEP on scalar returns the scalar)
+            let a_elem = if a_vcount > 1 { UOp::gep(a.clone(), vec![i]) } else { a.clone() };
+            let b_elem = if b_vcount > 1 { UOp::gep(b.clone(), vec![i]) } else { b.clone() };
             UOp::new(Op::Binary(*op, a_elem, b_elem), scalar_dtype.clone())
         })
         .collect();
@@ -1361,13 +1368,16 @@ fn devectorize_comparison(op: &BinaryOp, a: &Arc<UOp>, b: &Arc<UOp>) -> Option<A
 /// VECTORIZE, following Tinygrad's approach (devectorizer.py:no_vectorized_alu).
 ///
 /// Transforms:
-/// - AND/OR/XOR on bool vectors → scalar ops + VECTORIZE
+/// - AND/OR/XOR/MAX on bool vectors → scalar ops + VECTORIZE
 /// - NOT on bool vectors → scalar ops + VECTORIZE
 /// - Comparisons producing bool vectors → scalar comparisons + VECTORIZE
+/// - WHERE with vectorized condition → scalar WHERE + VECTORIZE
 pub fn pm_bool_devectorize() -> PatternMatcher<()> {
     crate::patterns! {
-        // Binary bool ops: And, Or, Xor on vectorized bools
-        for op in binary [And, Or, Xor] {
+        // Binary bool ops: And, Or, Xor, Max on vectorized bools
+        // Max is created by horizontal_reduce for Max reductions
+        // (Min uses Where(a < b, a, b), which is handled separately)
+        for op in binary [And, Or, Xor, Max] {
             op(a, b) if is_vectorized_bool(&a.dtype()) => {
                 devectorize_binary_bool(&op, a, b)
             },
@@ -1379,12 +1389,43 @@ pub fn pm_bool_devectorize() -> PatternMatcher<()> {
         },
 
         // Comparison ops producing vectorized bools
+        // Check both operands since scalar-vector comparisons also produce vector bools
         for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            op(a, b) if a.dtype().vcount() > 1 => {
+            op(a, b) if a.dtype().vcount() > 1 || b.dtype().vcount() > 1 => {
                 devectorize_comparison(&op, a, b)
             },
         },
+
+        // WHERE with vectorized condition (from horizontal reduce's Min operation)
+        // Based on Tinygrad's no_vectorized_alu (devectorizer.py:219-223)
+        Where(cond, t, f) if cond.dtype().vcount() > 1 => {
+            devectorize_where(cond, t, f)
+        },
     }
+}
+
+/// Devectorize WHERE operation by extracting elements with GEP and rebuilding with VECTORIZE.
+///
+/// Transforms: WHERE(<N x i1>, <N x T>, <N x T>) → VECTORIZE(WHERE(i1, T, T), ...)
+fn devectorize_where(cond: &Arc<UOp>, t: &Arc<UOp>, f: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let vcount = cond.dtype().vcount();
+    if vcount <= 1 {
+        return None;
+    }
+
+    let t_vcount = t.dtype().vcount();
+    let f_vcount = f.dtype().vcount();
+
+    let scalar_wheres: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+        .map(|i| {
+            let cond_elem = UOp::gep(cond.clone(), vec![i]);
+            let t_elem = if t_vcount > 1 { UOp::gep(t.clone(), vec![i]) } else { t.clone() };
+            let f_elem = if f_vcount > 1 { UOp::gep(f.clone(), vec![i]) } else { f.clone() };
+            UOp::try_where(cond_elem, t_elem, f_elem).expect("WHERE construction should succeed")
+        })
+        .collect();
+
+    Some(UOp::vectorize(scalar_wheres))
 }
 
 // ============================================================================
@@ -1393,11 +1434,14 @@ pub fn pm_bool_devectorize() -> PatternMatcher<()> {
 
 use morok_ir::TernaryOp;
 
-/// Apply binary reduce operation between two scalar values.
+/// Apply binary reduce operation between two values (scalar or vector).
 ///
 /// Handles all ReduceOp types:
 /// - Add, Mul, Max: Direct binary ops
 /// - Min: Implemented as Where(a < b, a, b) since BinaryOp::Min doesn't exist
+///
+/// Works with both scalar and vector dtypes - `Op::Binary` preserves input dtype,
+/// performing element-wise operations for vectors.
 fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DType) -> Arc<UOp> {
     match reduce_op {
         ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, a, b), dtype.clone()),
@@ -1405,43 +1449,81 @@ fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DT
         ReduceOp::Max => UOp::new(Op::Binary(BinaryOp::Max, a, b), dtype.clone()),
         ReduceOp::Min => {
             // Min(a, b) = Where(a < b, a, b)
-            let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), DType::Bool);
+            // Comparison dtype must match operand vector width:
+            // - Scalar operands -> DType::Bool
+            // - Vector operands -> DType::Bool.vec(vcount)
+            let cond_dtype = DType::Bool.vec(dtype.vcount());
+            let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), cond_dtype);
             UOp::new(Op::Ternary(TernaryOp::Where, cond, a, b), dtype.clone())
         }
     }
 }
 
-/// Perform horizontal reduction on a vectorized source.
+/// Perform horizontal reduction from `src` dtype to `out_dtype`.
 ///
-/// Extracts each element from the vector and chains them with binary ALU ops.
-/// Based on Tinygrad's `horizontal_reduce` (devectorizer.py:289-294).
+/// Uses stride pattern GEPs when reducing from larger to smaller vector.
+/// Based on Tinygrad's `horizontal_reduce` (devectorizer.py:283-289).
 ///
-/// Input:  <4 x T> src
-/// Output: T (scalar) = elem0 op elem1 op elem2 op elem3
-fn horizontal_reduce(src: &Arc<UOp>, reduce_op: ReduceOp) -> Arc<UOp> {
-    let vcount = src.dtype().vcount();
-    if vcount <= 1 {
-        return src.clone();
+/// Example: `<16 x float>` → `<4 x float>`
+///   horizontal_amount = 16 / 4 = 4
+///   Creates 4 GEPs with stride pattern:
+///     gep([0, 4, 8, 12])  → `<4 x float>` (each output's 1st partial sum)
+///     gep([1, 5, 9, 13])  → `<4 x float>` (each output's 2nd partial sum)
+///     gep([2, 6, 10, 14]) → `<4 x float>` (each output's 3rd partial sum)
+///     gep([3, 7, 11, 15]) → `<4 x float>` (each output's 4th partial sum)
+///   Returns list of 4 `<4 x float>` vectors to be chained with ALU ops.
+///
+/// # Arguments
+/// * `src` - The vectorized source (e.g., `<16 x float>`)
+/// * `out_dtype` - Target output dtype (e.g., `<4 x float>` or scalar)
+/// * `reduce_op` - The reduction operation (Add, Mul, Max, Min)
+///
+/// # Returns
+/// A list of GEP operations, each producing `out_dtype` elements.
+/// If no horizontal reduction needed (src.dtype == out_dtype), returns `[src]`.
+fn horizontal_reduce(src: &Arc<UOp>, out_dtype: &DType, reduce_op: ReduceOp) -> Vec<Arc<UOp>> {
+    let src_count = src.dtype().vcount();
+    let out_count = out_dtype.vcount();
+
+    // No reduction needed if dtypes match
+    if src_count == out_count {
+        return vec![src.clone()];
     }
 
-    let scalar_dtype = DType::Scalar(src.dtype().base());
+    // Edge case: source is scalar
+    if src_count <= 1 {
+        return vec![src.clone()];
+    }
 
-    // Extract each element with GEP
-    let elements: Vec<Arc<UOp>> = (0..vcount).map(|i| UOp::gep(src.clone(), vec![i])).collect();
+    let horizontal_amount = src_count / out_count;
 
-    // Chain with binary operations: elem0 op elem1 op elem2 op ...
-    // This creates a left-associative tree: ((elem0 op elem1) op elem2) op elem3
-    elements
-        .into_iter()
-        .reduce(|acc, elem| apply_reduce_binary(reduce_op, acc, elem, &scalar_dtype))
-        .expect("vcount > 1 guarantees non-empty elements")
+    // Edge case: uneven division - fall back to full scalar reduction
+    if !src_count.is_multiple_of(out_count) || horizontal_amount == 0 {
+        let scalar_dtype = DType::Scalar(src.dtype().base());
+        let elements: Vec<Arc<UOp>> = (0..src_count).map(|i| UOp::gep(src.clone(), vec![i])).collect();
+        return vec![
+            elements
+                .into_iter()
+                .reduce(|acc, elem| apply_reduce_binary(reduce_op, acc, elem, &scalar_dtype))
+                .expect("src_count > 1"),
+        ];
+    }
+
+    // Create stride pattern GEPs: range(i, src_count, horizontal_amount) for each i
+    // This matches Tinygrad's: [inp.gep(tuple(range(i, inp.dtype.count, horizontal_amount))) for i in range(horizontal_amount)]
+    (0..horizontal_amount)
+        .map(|i| {
+            let indices: Vec<usize> = (i..src_count).step_by(horizontal_amount).collect();
+            UOp::gep(src.clone(), indices)
+        })
+        .collect()
 }
 
-/// Transform REDUCE with vectorized source to horizontal reduce + scalar REDUCE.
+/// Transform REDUCE with vectorized source to horizontal reduce + matching-dtype REDUCE.
 ///
-/// When REDUCE has a vectorized input but scalar output dtype, we need to:
-/// 1. First do horizontal reduction on the vector (extract elements, chain with ALU)
-/// 2. Then REDUCE the scalar result with the ranges
+/// When REDUCE has a vectorized input with different vcount than output dtype:
+/// 1. First do horizontal reduction on the vector (extract stride-pattern elements, chain with ALU)
+/// 2. Then REDUCE the result with the ranges (if any)
 ///
 /// Based on Tinygrad's `reduce_to_acc` (devectorizer.py:296-316).
 fn transform_vectorized_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -1450,42 +1532,64 @@ fn transform_vectorized_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     };
 
     let src_vcount = src.dtype().vcount();
-    let is_vectorized_bool = src.dtype().base() == ScalarDType::Bool && src_vcount > 1;
+    let out_vcount = reduce.dtype().vcount();
 
-    // Only transform if:
-    // 1. Source is vectorized and result is scalar/less vectorized, OR
-    // 2. Source is vectorized bool (LLVM can't handle <N x i1>)
-    if src_vcount <= 1 && !is_vectorized_bool {
+    // Only transform when source has more elements than output (need horizontal reduction).
+    // Vectorized bool REDUCEs with matching vcounts are handled by pm_devectorize_bool_reduce.
+    if src_vcount <= out_vcount {
         return None;
     }
 
+    // Preserve the REDUCE's declared output dtype
+    let out_dtype = reduce.dtype();
+
     trace!(
         src_vcount,
-        is_vectorized_bool,
+        out_vcount,
         reduce_op = ?reduce_op,
+        out_dtype = ?out_dtype,
         "horizontal reducing vectorized REDUCE source"
     );
 
-    // Horizontal reduce the source to scalar
-    let horizontal_reduced = horizontal_reduce(src, *reduce_op);
+    // Get stride pattern GEPs
+    let gep_list = horizontal_reduce(src, &out_dtype, *reduce_op);
 
-    // Result dtype is scalar (horizontal reduce produces scalar)
-    let scalar_dtype = DType::Scalar(src.dtype().base());
+    // Chain all GEPs: ((gep0 + gep1) + gep2) + gep3
+    let chained = gep_list
+        .into_iter()
+        .reduce(|acc, elem| apply_reduce_binary(*reduce_op, acc, elem, &out_dtype))
+        .expect("horizontal_reduce always returns non-empty list");
 
-    // Create new REDUCE with scalar source and scalar result
-    Some(UOp::new(Op::Reduce { src: horizontal_reduced, ranges: ranges.clone(), reduce_op: *reduce_op }, scalar_dtype))
+    // Wrap in REDUCE if ranges exist
+    if ranges.is_empty() {
+        Some(chained)
+    } else {
+        Some(UOp::new(Op::Reduce { src: chained, ranges: ranges.clone(), reduce_op: *reduce_op }, out_dtype))
+    }
 }
 
 /// Check if REDUCE has vectorized source that needs horizontal reduction.
 ///
-/// Horizontal reduction is needed when source is vectorized but result is scalar.
-/// This matches Tinygrad's approach (devectorizer.py:285): `if inp.dtype != out_dtype`.
+/// Horizontal reduction is needed when source vcount > output vcount,
+/// meaning we need to reduce multiple source elements into each output element.
+///
+/// NOTE: We use `src_vcount > reduce_vcount` (not `!=`) to avoid triggering
+/// on cases where src has FEWER elements than output (e.g., src_vcount=1,
+/// reduce_vcount=5), which would cause an infinite loop since horizontal_reduce
+/// returns the source unchanged when src_count <= 1.
+///
+/// Bool accumulators with matching vcounts are handled by `pm_devectorize_bool_reduce`
+/// which runs before this pass to avoid LLVM `<N x i1>` issues.
 fn needs_horizontal_reduce(reduce: &Arc<UOp>) -> bool {
     use tracing::trace;
 
     if let Op::Reduce { src, .. } = reduce.op() {
         let src_vcount = src.dtype().vcount();
         let reduce_vcount = reduce.dtype().vcount();
+
+        // Only reduce when source has MORE elements than output.
+        // Vectorized bool REDUCEs with matching vcounts are handled by
+        // pm_devectorize_bool_reduce which runs before this pass.
         let needs_horiz = src_vcount > reduce_vcount;
 
         trace!(
@@ -1521,6 +1625,113 @@ pub fn pm_horizontal_reduce() -> PatternMatcher<()> {
         reduce if needs_horizontal_reduce(reduce) => {
             transform_vectorized_reduce(reduce)
         },
+    }
+}
+
+// ============================================================================
+// BOOL REDUCE DEVECTORIZATION (avoid LLVM <N x i1> accumulators)
+// ============================================================================
+
+/// Check if REDUCE has vectorized bool output with matching source vcount.
+///
+/// This pattern applies when UPCAST is on a non-reduce axis, causing:
+/// - Source and output vcounts to match (each lane reduces independently)
+/// - Bool dtype (which LLVM can't handle as `<N x i1>` accumulators)
+///
+/// Does NOT match:
+/// - Scalar REDUCEs (already handled)
+/// - K-vectorized REDUCEs (CONTRACT source, different mechanism)
+/// - Non-bool REDUCEs (LLVM handles those fine)
+fn is_vectorized_bool_reduce(reduce: &Arc<UOp>) -> bool {
+    use tracing::trace;
+
+    if let Op::Reduce { src, .. } = reduce.op() {
+        let out_vcount = reduce.dtype().vcount();
+        let src_vcount = src.dtype().vcount();
+        let is_bool = reduce.dtype().base() == ScalarDType::Bool;
+        let has_contract = matches!(src.op(), Op::Contract { .. });
+
+        let matches = is_bool && out_vcount > 1 && src_vcount == out_vcount && !has_contract;
+
+        trace!(
+            reduce_id = reduce.id,
+            is_bool,
+            out_vcount,
+            src_vcount,
+            has_contract,
+            matches,
+            reduce_dtype = ?reduce.dtype(),
+            src_dtype = ?src.dtype(),
+            "is_vectorized_bool_reduce check"
+        );
+
+        matches
+    } else {
+        false
+    }
+}
+
+/// Devectorize REDUCE with vectorized bool output to N scalar REDUCEs.
+///
+/// This avoids LLVM's `<N x i1>` accumulator issues by creating independent
+/// scalar bool accumulators for each vector lane, then combining with VECTORIZE.
+///
+/// Transforms:
+/// ```text
+/// REDUCE(Min, <2 x bool> src, ranges)
+/// → VECTORIZE(
+///     REDUCE(Min, GEP(src, 0), ranges),  // lane 0: scalar bool accumulator
+///     REDUCE(Min, GEP(src, 1), ranges)   // lane 1: scalar bool accumulator
+///   )
+/// ```
+///
+/// Based on Tinygrad's `no_vectorized_alu` pattern which devectorizes ALU ops.
+fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
+    use tracing::trace;
+
+    let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
+        return None;
+    };
+
+    let vcount = reduce.dtype().vcount();
+    if vcount <= 1 {
+        return None;
+    }
+
+    let scalar_dtype = DType::Scalar(reduce.dtype().base());
+
+    trace!(
+        vcount,
+        reduce_op = ?reduce_op,
+        src_dtype = ?src.dtype(),
+        "devectorizing bool REDUCE to avoid <N x i1> accumulators"
+    );
+
+    // Create N scalar REDUCEs, one for each vector lane
+    let scalar_reduces: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+        .map(|i| {
+            let src_elem = UOp::gep(src.clone(), vec![i]);
+            UOp::new(Op::Reduce { src: src_elem, ranges: ranges.clone(), reduce_op: *reduce_op }, scalar_dtype.clone())
+        })
+        .collect();
+
+    // Wrap in VECTORIZE to produce the expected vector output
+    Some(UOp::vectorize(scalar_reduces))
+}
+
+/// Pattern matcher for devectorizing bool REDUCEs to avoid LLVM `<N x i1>` accumulators.
+///
+/// When UPCAST is applied to non-reduce axes with bool data, REDUCE would have
+/// `<N x bool>` output dtype. LLVM's handling of `<N x i1>` phi nodes and ALU
+/// operations is undefined/buggy.
+///
+/// This pattern transforms such REDUCEs into N independent scalar REDUCEs,
+/// each with a scalar bool accumulator, then wraps them in VECTORIZE.
+///
+/// Must run BEFORE `pm_horizontal_reduce` to handle the matching-vcount case.
+pub fn pm_devectorize_bool_reduce() -> PatternMatcher<()> {
+    crate::patterns! {
+        reduce if is_vectorized_bool_reduce(reduce) => devectorize_bool_reduce(reduce),
     }
 }
 
@@ -1633,7 +1844,7 @@ fn tree_reduce(elements: &[Arc<UOp>], reduce_op: ReduceOp, dtype: &DType) -> Arc
 /// - No explicit horizontal reduction overhead
 ///
 /// Transforms:
-/// ```
+/// ```text
 /// - REDUCE(CONTRACT(src<4>), ranges, Add, Vector<4>)
 ///   → ((REDUCE(GEP(src,0), Add) + REDUCE(GEP(src,1), Add)) +
 ///     (REDUCE(GEP(src,2), Add) + REDUCE(GEP(src,3), Add)))

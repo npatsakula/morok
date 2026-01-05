@@ -34,8 +34,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType};
-use morok_ir::{BinaryOp, ConstValue, Op, PatternMatcher, UOp};
+use morok_dtype::{AddrSpace, DType, ScalarDType};
+use morok_ir::{BinaryOp, ConstValue, Op, PatternMatcher, TernaryOp, UOp};
 use smallvec::SmallVec;
 
 use crate::rewrite::graph_rewrite_bottom_up;
@@ -57,7 +57,103 @@ pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
     // Phase 2: Distribute PTRCAT through LOAD/STORE and split by divisibility
     // Include GEP(PTRCAT/CAT) patterns to handle reordering
     let phase2 = gep_ptrcat_patterns() + load_store_patterns();
-    graph_rewrite_bottom_up(&phase2, ast, &mut ())
+    let ast = graph_rewrite_bottom_up(&phase2, ast, &mut ());
+
+    // Phase 3: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits
+    // LLVM's i1 type can have garbage in upper bits when stored to memory.
+    // By casting to uint8 before store and after load, we ensure clean 0/1 values.
+    // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
+    let phase3 = bool_storage_patterns();
+    graph_rewrite_bottom_up(&phase3, ast, &mut ())
+}
+
+/// Phase 3 patterns: Convert bool LOAD/STORE to use uint8 storage.
+///
+/// LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
+/// We cast bool→uint8 before storing and uint8→bool after loading.
+/// This matches Tinygrad's approach in PTX and NIR renderers.
+pub fn bool_storage_patterns() -> PatternMatcher {
+    crate::patterns! {
+        // STORE bool value: cast to uint8 before storing
+        store if is_bool_store(store) => rewrite_bool_store(store),
+
+        // LOAD bool value: load as uint8, then cast to bool
+        load if is_bool_load(load) => rewrite_bool_load(load),
+    }
+}
+
+/// Check if STORE has a bool-typed value.
+fn is_bool_store(uop: &Arc<UOp>) -> bool {
+    match uop.op() {
+        Op::Store { value, .. } => value.dtype().base().is_bool(),
+        Op::StoreGated { value, .. } => value.dtype().base().is_bool(),
+        _ => false,
+    }
+}
+
+/// Check if LOAD has bool result dtype.
+fn is_bool_load(uop: &Arc<UOp>) -> bool {
+    match uop.op() {
+        Op::Load { .. } | Op::LoadGated { .. } => uop.dtype().base().is_bool(),
+        _ => false,
+    }
+}
+
+/// Rewrite STORE of bool value to cast to uint8 first.
+/// STORE(buf, idx, bool_val) → STORE(buf, idx, cast(bool_val, uint8))
+fn rewrite_bool_store(store: &Arc<UOp>) -> Option<Arc<UOp>> {
+    match store.op() {
+        Op::Store { buffer, index, value, ranges } => {
+            tracing::debug!(value_dtype = ?value.dtype(), "rewrite_bool_store: casting bool to uint8");
+            // Cast bool value to uint8
+            let uint8_dtype = value.dtype().with_base(ScalarDType::UInt8);
+            let value_as_uint8 = UOp::cast(value.clone(), uint8_dtype);
+            Some(UOp::store_with_ranges(buffer.clone(), index.clone(), value_as_uint8, ranges.clone()))
+        }
+        Op::StoreGated { buffer, index, value, gate, ranges } => {
+            // Cast bool value to uint8
+            let uint8_dtype = value.dtype().with_base(ScalarDType::UInt8);
+            let value_as_uint8 = UOp::cast(value.clone(), uint8_dtype);
+            Some(UOp::store_gated_with_ranges(
+                buffer.clone(),
+                index.clone(),
+                value_as_uint8,
+                gate.clone(),
+                ranges.clone(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite LOAD of bool to load as uint8 and cast back to bool.
+/// LOAD(buf, idx) : bool → cast(LOAD(buf, idx) : uint8, bool)
+fn rewrite_bool_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
+    match load.op() {
+        Op::Load { buffer, index } => {
+            // Create a modified buffer with uint8 element type for loading
+            let bool_dtype = load.dtype();
+            let uint8_dtype = bool_dtype.with_base(ScalarDType::UInt8);
+
+            // Create load with uint8 dtype
+            let uint8_load = UOp::new(Op::Load { buffer: buffer.clone(), index: index.clone() }, uint8_dtype);
+
+            // Cast back to bool
+            Some(UOp::cast(uint8_load, bool_dtype))
+        }
+        Op::LoadGated { buffer, index, gate } => {
+            let bool_dtype = load.dtype();
+            let uint8_dtype = bool_dtype.with_base(ScalarDType::UInt8);
+
+            let uint8_load = UOp::new(
+                Op::LoadGated { buffer: buffer.clone(), index: index.clone(), gate: gate.clone() },
+                uint8_dtype,
+            );
+
+            Some(UOp::cast(uint8_load, bool_dtype))
+        }
+        _ => None,
+    }
 }
 
 /// GEP patterns for PTRCAT/CAT reordering only.
@@ -130,7 +226,52 @@ fn gep_ptrcat_patterns() -> PatternMatcher {
             if sources.len() != first_vec.dtype().vcount() { return None; }
             Some(Arc::clone(first_vec))
         },
+
+        // Devectorize WHERE with vector condition.
+        // Based on Tinygrad's no_vectorized_alu (devectorizer.py:219-223).
+        // WHERE(<N x i1>, <N x T>, <N x T>) → VECTORIZE(WHERE(i1, T, T), ...)
+        ternary if is_vectorized_where(ternary) => devectorize_where(ternary),
     }
+}
+
+/// Check if UOp is a WHERE with vector condition (vcount > 1).
+fn is_vectorized_where(uop: &Arc<UOp>) -> bool {
+    if let Op::Ternary(TernaryOp::Where, cond, _, _) = uop.op() { cond.dtype().vcount() > 1 } else { false }
+}
+
+/// Devectorize WHERE operation by extracting elements with GEP and rebuilding with VECTORIZE.
+///
+/// Based on Tinygrad's no_vectorized_alu (devectorizer.py:219-223):
+/// ```python
+/// def no_vectorized_alu(alu:UOp):
+///   if alu.dtype.vcount == 1: return None
+///   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg)
+///                for i in range(alu.dtype.vcount))
+///   return UOp(Ops.VECTORIZE, alu.dtype, alus)
+/// ```
+///
+/// Transforms: WHERE(<N x i1>, <N x T>, <N x T>) → VECTORIZE(WHERE(i1, T, T), ...)
+fn devectorize_where(ternary: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Ternary(TernaryOp::Where, cond, t, f) = ternary.op() else {
+        return None;
+    };
+
+    let vcount = cond.dtype().vcount();
+    if vcount <= 1 {
+        return None;
+    }
+
+    // Create scalar WHERE for each vector element
+    let scalar_wheres: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+        .map(|i| {
+            let cond_elem = UOp::gep(cond.clone(), vec![i]);
+            let t_elem = UOp::gep(t.clone(), vec![i]);
+            let f_elem = UOp::gep(f.clone(), vec![i]);
+            UOp::try_where(cond_elem, t_elem, f_elem).expect("WHERE construction should succeed")
+        })
+        .collect();
+
+    Some(UOp::vectorize(scalar_wheres))
 }
 
 /// Phase 1 patterns: expand vector INDEX into grouped PTRCAT.
@@ -906,8 +1047,15 @@ mod tests {
 
     #[test]
     fn test_extract_root_and_offset() {
-        // Test Add(root, const)
-        let root = UOp::const_(DType::Index, ConstValue::Int(100));
+        // Test Add(root, const) where root is a non-constant expression
+        let root = UOp::new(
+            Op::Range {
+                end: UOp::const_(DType::Index, ConstValue::Int(10)),
+                axis_id: morok_ir::AxisId::Renumbered(0),
+                axis_type: morok_ir::AxisType::Loop,
+            },
+            DType::Index,
+        );
         let offset_const = UOp::const_(DType::Index, ConstValue::Int(3));
         let add = UOp::new(Op::Binary(BinaryOp::Add, root.clone(), offset_const), DType::Index);
 
@@ -915,10 +1063,18 @@ mod tests {
         assert_eq!(offset, 3);
         assert!(matches!(key, RootKey::Expr { .. }));
 
-        // Test pure const
+        // Test pure const - when both operands are constants, sum them
         let pure_const = UOp::const_(DType::Index, ConstValue::Int(42));
         let (key, offset) = extract_root_and_offset(&pure_const, None);
         assert_eq!(offset, 42);
+        assert!(matches!(key, RootKey::Const));
+
+        // Test Add of two constants - should return total as offset
+        let const_a = UOp::const_(DType::Index, ConstValue::Int(100));
+        let const_b = UOp::const_(DType::Index, ConstValue::Int(3));
+        let add_consts = UOp::new(Op::Binary(BinaryOp::Add, const_a, const_b), DType::Index);
+        let (key, offset) = extract_root_and_offset(&add_consts, None);
+        assert_eq!(offset, 103); // Sum of both constants
         assert!(matches!(key, RootKey::Const));
     }
 }

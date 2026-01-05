@@ -180,14 +180,21 @@ pub fn apply_image_upcasts(_scheduler: &mut Scheduler) -> bool {
 
 /// Default upcast fallback: 4x vectorization on first upcastable axis.
 pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
+    use tracing::debug;
+
     if scheduler.upcasted() {
+        debug!("apply_default_upcast: skipping (already upcasted)");
         return false;
     }
     let upcastable = scheduler.upcastable_dims();
+    debug!(upcastable_dims = ?upcastable, "apply_default_upcast: checking upcastable dims");
     if upcastable.is_empty() {
+        debug!("apply_default_upcast: no upcastable dims");
         return false;
     }
-    apply_opt(scheduler, &Opt::upcast(upcastable[0], 4), true).is_ok()
+    let result = apply_opt(scheduler, &Opt::upcast(upcastable[0], 4), true);
+    debug!(?result, axis = upcastable[0], "apply_default_upcast: apply_opt result");
+    result.is_ok()
 }
 
 /// Unroll small reduction loops (size <= threshold).
@@ -580,9 +587,13 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
 /// For matmul patterns, limits to single axis UPCAST to avoid vector width
 /// mismatches (A vectorized along rows, B vectorized along cols are incompatible).
 pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
+    use tracing::debug;
+
     let mut applied = false;
     let upcastable = scheduler.upcastable_dims();
+    debug!(upcastable = ?upcastable, "apply_heuristic_upcasts: starting");
     if upcastable.is_empty() {
+        debug!("apply_heuristic_upcasts: no upcastable dims");
         return false;
     }
 
@@ -636,7 +647,10 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             };
 
             for factor in factors {
-                if size >= factor as i64 && apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true).is_ok() {
+                debug!(axis_idx, factor, size, "apply_heuristic_upcasts: trying upcast");
+                let result = apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true);
+                debug!(?result, axis_idx, factor, "apply_heuristic_upcasts: apply_opt result");
+                if size >= factor as i64 && result.is_ok() {
                     upcast_product *= factor;
                     upcast_count += 1;
                     applied = true;

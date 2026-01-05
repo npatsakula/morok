@@ -184,6 +184,7 @@ fn test_print_matmul_ir() {
 
 #[test]
 #[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_64x64_ir -- --ignored --nocapture
+#[tracing_test::traced_test]
 fn test_print_matmul_64x64_ir() {
     // Create 64x64 matmul to see vectorized IR (output upcast)
     let a =

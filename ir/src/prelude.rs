@@ -21,3 +21,5 @@ pub use crate::sint::SInt;
 // Re-exports from dependencies
 pub use morok_dtype::DType;
 pub use morok_dtype::DeviceSpec;
+
+pub use strum::AsRefStr;

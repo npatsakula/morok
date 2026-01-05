@@ -142,11 +142,8 @@ impl UOp {
     pub fn cat(sources: Vec<Arc<Self>>) -> Arc<Self> {
         assert!(!sources.is_empty(), "CAT requires at least one source");
         let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
-        let dtype = if let Some(scalar) = sources[0].dtype.scalar() {
-            DType::Scalar(scalar).vec(total_count)
-        } else {
-            sources[0].dtype.clone()
-        };
+        // Use base() instead of scalar() to handle both Scalar and Vector sources
+        let dtype = DType::Scalar(sources[0].dtype.base()).vec(total_count);
         Self::new(Op::Cat { sources: SmallVec::from_vec(sources) }, dtype)
     }
 

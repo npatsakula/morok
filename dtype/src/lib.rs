@@ -281,6 +281,18 @@ impl DType {
         }
     }
 
+    /// Create a new dtype with a different base scalar type, preserving vector count.
+    ///
+    /// Useful for type conversions like bool→uint8 where the structure is preserved.
+    pub fn with_base(&self, new_base: ScalarDType) -> Self {
+        let count = self.vcount();
+        if count > 1 {
+            Self::Scalar(new_base).vec(count)
+        } else {
+            Self::Scalar(new_base)
+        }
+    }
+
     /// Get the vector count (1 for scalars).
     pub fn count(&self) -> usize {
         match self {
@@ -312,23 +324,28 @@ impl DType {
     }
 
     pub fn is_bool(&self) -> bool {
-        matches!(self.scalar(), Some(ScalarDType::Bool))
+        // Use base() to handle both Scalar and Vector types
+        self.base() == ScalarDType::Bool
     }
 
     pub fn is_signed(&self) -> bool {
-        self.scalar().is_some_and(|s| s.is_signed())
+        // Use base() to handle both Scalar and Vector types
+        self.base().is_signed()
     }
 
     pub fn is_unsigned(&self) -> bool {
-        self.scalar().is_some_and(|s| s.is_unsigned())
+        // Use base() to handle both Scalar and Vector types
+        self.base().is_unsigned()
     }
 
     pub fn is_int(&self) -> bool {
-        self.scalar().is_some_and(|s| s.is_int())
+        // Use base() to handle both Scalar and Vector types
+        self.base().is_int()
     }
 
     pub fn is_float(&self) -> bool {
-        self.scalar().is_some_and(|s| s.is_float())
+        // Use base() to handle both Scalar and Vector types
+        self.base().is_float()
     }
 
     pub fn c_style(&self) -> String {

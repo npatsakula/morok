@@ -295,6 +295,7 @@ fn test_argmax_all_equal() {
 // ========== Sum Tests (from Tinygrad test_ops.py:1344-1380) ==========
 
 #[test]
+#[tracing_test::traced_test]
 fn test_sum_1d_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
@@ -472,6 +473,7 @@ fn test_argmax_debug_steps() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn test_argmax_full_steps() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0]);
@@ -481,44 +483,38 @@ fn test_argmax_full_steps() {
 
     // Step 2: expand max to original shape
     let max_broadcast = max_vals.try_expand(&[5]).unwrap();
-    println!("max_broadcast shape={:?}", max_broadcast.uop().shape());
 
     // Step 3: mask where values == max
     let mask = t.try_eq(&max_broadcast).unwrap();
     let mask_realized = mask.clone().realize().unwrap().to_ndarray::<bool>().unwrap();
-    println!("Mask (eq max): {:?}", mask_realized.as_slice().unwrap());
-    assert_eq!(mask_realized.as_slice().unwrap(), &[false, false, false, true, false], "Mask mismatch");
+    let mask_slice = mask_realized.as_slice().unwrap();
+    assert_eq!(mask_slice, &[false, false, false, true, false], "Mask mismatch");
 
     // Step 4: Create descending indices [5, 4, 3, 2, 1]
     let axis_size = 5;
     let indices = Tensor::arange(axis_size as i64, Some(0), Some(-1)).unwrap();
     let indices_realized = indices.clone().realize().unwrap().to_ndarray::<i32>().unwrap();
-    println!("Step 4 - Descending indices: {:?}", indices_realized.as_slice().unwrap());
     assert_eq!(indices_realized.as_slice().unwrap(), &[5i32, 4, 3, 2, 1], "Indices mismatch");
 
     // Step 5: Cast to int32
     let mask_int = mask.cast(DType::Int32).unwrap();
     let mask_int_realized = realize_i32(mask_int.clone());
-    println!("Step 5a - Mask as int32: {:?}", mask_int_realized.as_slice().unwrap());
     // Expected: [0, 0, 0, 1, 0]
     assert_eq!(mask_int_realized.as_slice().unwrap(), &[0, 0, 0, 1, 0], "Mask int mismatch");
 
     let indices_i32 = indices.cast(DType::Int32).unwrap();
     let indices_i32_realized = realize_i32(indices_i32.clone());
-    println!("Step 5b - Indices as int32: {:?}", indices_i32_realized.as_slice().unwrap());
     assert_eq!(indices_i32_realized.as_slice().unwrap(), &[5, 4, 3, 2, 1], "Indices int32 mismatch");
 
     // Step 6: Multiply mask by indices
     let masked_indices = mask_int.try_mul(&indices_i32).unwrap();
     let masked_realized = realize_i32(masked_indices.clone());
-    println!("Step 6 - Masked indices (mask * indices): {:?}", masked_realized.as_slice().unwrap());
     // Expected: [0, 0, 0, 2, 0]
     assert_eq!(masked_realized.as_slice().unwrap(), &[0, 0, 0, 2, 0], "Masked indices mismatch");
 
     // Step 7: max of masked indices
     let max_idx = masked_indices.max_with().axes(0).keepdim(false).call().unwrap();
     let max_idx_realized = realize_i32(max_idx.clone());
-    println!("Step 7 - Max of masked indices: {:?}", max_idx_realized.as_slice().unwrap());
     // Expected: [2]
     assert_eq!(max_idx_realized.as_slice().unwrap(), &[2], "Max idx mismatch");
 
@@ -527,13 +523,11 @@ fn test_argmax_full_steps() {
     let n_scalar = n_tensor.try_reshape(&[]).unwrap();
     let result = n_scalar.try_sub(&max_idx).unwrap();
     let result_realized = realize_i32(result);
-    println!("Step 8 - Final result (N - max_idx): {:?}", result_realized.as_slice().unwrap());
     // Expected: [3]
     assert_eq!(result_realized.as_slice().unwrap(), &[3], "Final result mismatch");
 }
 
 #[test]
-#[tracing_test::traced_test]
 fn test_argmax_value_1d() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0]);
@@ -720,6 +714,7 @@ fn test_all_value_all_false() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn test_all_2d_axis0_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([true, true, false, true]).try_reshape(&[2, 2]).unwrap();
@@ -729,6 +724,7 @@ fn test_all_2d_axis0_value() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn test_all_2d_axis1_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([true, true, true, false]).try_reshape(&[2, 2]).unwrap();

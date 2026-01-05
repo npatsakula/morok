@@ -18,6 +18,22 @@
   reading (e.g. 1000 line each chunk); don't play games with symbols searching, large
   files are source of grand knowledge.
 
+### Debugging
+
+If you don't know where error occured in pipeline you can walk three steps analysis:
+1. Check UOp structure before optimization: use `UOp::tree()` or just extract if from pipeline
+   using `RUST_LOG=morok_tensor::realize=debug` with filter `rg 'range assignment complete'`.
+2. Check UOp structure after optimization: use `UOp::tree()` or just extract if from pipeline
+   using `RUST_LOG=morok_tensor::realize=debug` with filter `rg 'reduction simplification complete'`.
+3. Check LLVM IR using `RUST_LOG=morok_codegen::llvm::cpu::render_to_module=debug` with filter `rg 'llvm ir before verification'`.
+
+You can compare trees and IR with Tinygrad's and spot the differences. It
+can help you isolate broken patterns or codegen parts.
+
+If you need to extract operation name from `UOp`, you can use
+`UOp::op().as_ref()` (you should import IR prelude by
+`use morok_ir::prelude::*;`).
+
 ## Task execution
 
 - If you revert the initial plan, you should stop what you're doing and go back to the planning phase.

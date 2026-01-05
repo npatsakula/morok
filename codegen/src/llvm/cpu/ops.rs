@@ -590,15 +590,15 @@ fn codegen_cast<'ctx>(
         return Ok(result);
     }
 
-    // Scalar path
+    // Scalar path - use scalar dtypes for type conversion
     codegen_cast_scalar(
         src,
         src_is_float,
         dst_is_float,
         src_is_signed,
         dst_is_signed,
-        src_dtype,
-        dst_dtype,
+        &scalar_src_dtype,
+        &scalar_dst_dtype,
         context,
         builder,
     )
@@ -649,12 +649,23 @@ fn codegen_cast_scalar<'ctx>(
         (false, false) => {
             let src_val = src.into_int_value();
             let dst_type = dst_type.into_int_type();
-            if src_dtype.bytes() > dst_dtype.bytes() {
+
+            // Compare actual bit widths, not bytes.
+            // Bool has bytes()=1 (for storage) but is only 1 bit in LLVM (i1).
+            let src_bits = src_val.get_type().get_bit_width();
+            let dst_bits = dst_type.get_bit_width();
+
+            if src_bits > dst_bits {
                 Ok(builder.build_int_truncate(src_val, dst_type, "trunc").context(CastSnafu)?.into())
-            } else if src_is_signed {
-                Ok(builder.build_int_s_extend(src_val, dst_type, "sext").context(CastSnafu)?.into())
+            } else if src_bits < dst_bits {
+                if src_is_signed {
+                    Ok(builder.build_int_s_extend(src_val, dst_type, "sext").context(CastSnafu)?.into())
+                } else {
+                    Ok(builder.build_int_z_extend(src_val, dst_type, "zext").context(CastSnafu)?.into())
+                }
             } else {
-                Ok(builder.build_int_z_extend(src_val, dst_type, "zext").context(CastSnafu)?.into())
+                // Same bit width - no conversion needed
+                Ok(src.into())
             }
         }
     }
@@ -1457,11 +1468,18 @@ fn codegen_reduce<'ctx>(
     // Load final accumulator value
     let acc_final = builder.build_load(acc_type, acc_alloca, "reduce_acc_final").context(BuildLoadSnafu)?;
 
-    // For vector accumulators: perform horizontal reduction to get scalar result
-    let final_val = if is_vector_accumulator {
-        trace!(vec_len, "performing horizontal reduction on vector accumulator");
+    // Determine if horizontal reduction is needed:
+    // - Output upcast: source is vector (src_is_vectorized), accumulator is vector
+    //   -> Each lane is an independent output, NO horizontal reduce (keep vector)
+    // - Reduce unroll: source is scalar, accumulator is vector (splatted scalars)
+    //   -> Each lane is a partial sum, DO horizontal reduce (combine to scalar)
+    let needs_horizontal_reduce = is_vector_accumulator && !src_is_vectorized;
+
+    let final_val = if needs_horizontal_reduce {
+        trace!(vec_len, "performing horizontal reduction on vector accumulator (reduce unroll)");
         codegen_horizontal_reduce(acc_final, reduce_op, &scalar_dtype, context, module, builder)?
     } else {
+        trace!(is_vector_accumulator, src_is_vectorized, "returning accumulator directly (output upcast or scalar)");
         acc_final
     };
 
@@ -1545,11 +1563,13 @@ fn call_intrinsic<'ctx>(
 }
 
 fn get_type_suffix(dtype: &DType) -> Result<String> {
-    match dtype.scalar() {
-        Some(morok_dtype::ScalarDType::Float16) => Ok("f16".to_string()),
-        Some(morok_dtype::ScalarDType::BFloat16) => Ok("f16".to_string()),
-        Some(morok_dtype::ScalarDType::Float32) => Ok("f32".to_string()),
-        Some(morok_dtype::ScalarDType::Float64) => Ok("f64".to_string()),
+    // Get the base scalar type (works for both Scalar and Vector types)
+    let base = dtype.base();
+    match base {
+        morok_dtype::ScalarDType::Float16 => Ok("f16".to_string()),
+        morok_dtype::ScalarDType::BFloat16 => Ok("f16".to_string()),
+        morok_dtype::ScalarDType::Float32 => Ok("f32".to_string()),
+        morok_dtype::ScalarDType::Float64 => Ok("f64".to_string()),
         _ => UnsupportedIntrinsicTypeSnafu { dtype: format!("{:?}", dtype) }.fail(),
     }
 }

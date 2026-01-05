@@ -27,6 +27,7 @@ use morok_dtype::DeviceSpec;
 /// Note: PartialEq, Eq, and Hash are NOT derived because Op contains Arc<UOp>.
 /// Hash consing uses UOpKey which compares by pointer equality instead.
 #[derive(Debug, Clone)]
+#[derive(strum::AsRefStr)]
 pub enum Op {
     // Nullary operations (7 variants)
     Const(ConstValueHash),

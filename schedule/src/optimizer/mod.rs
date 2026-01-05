@@ -139,12 +139,28 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     let pm_devec = crate::rangeify::patterns::pm_bool_devectorize();
     let devectorized = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, scalar_acc, &mut ());
 
+    // Bool REDUCE devectorization: Convert REDUCE with <N x bool> output to N scalar REDUCEs.
+    // When UPCAST is on non-reduce axes with bool data, REDUCE would have <N x bool> accumulator.
+    // LLVM's <N x i1> phi nodes have undefined behavior, so we split into scalar REDUCEs.
+    // Must run BEFORE horizontal_reduce to handle the matching-vcount case.
+    let pm_bool_reduce = crate::rangeify::patterns::pm_devectorize_bool_reduce();
+    let bool_reduce_devec = crate::rewrite::graph_rewrite_bottom_up(&pm_bool_reduce, devectorized, &mut ());
+
     // Horizontal reduce: Convert REDUCE with vectorized source to scalar REDUCE.
     // When UPCAST is on non-reduce axes, REDUCE receives vectorized inputs.
     // This extracts elements and chains with ALU ops before the REDUCE loop.
     // Based on Tinygrad's horizontal_reduce (devectorizer.py:289-316).
     let pm_hreduce = crate::rangeify::patterns::pm_horizontal_reduce();
-    let hreduced = crate::rewrite::graph_rewrite_bottom_up(&pm_hreduce, devectorized, &mut ());
+    let hreduced = crate::rewrite::graph_rewrite_bottom_up(&pm_hreduce, bool_reduce_devec, &mut ());
+
+    // Second pass of bool REDUCE devectorization: Handle REDUCEs created by horizontal reduce.
+    // When horizontal reduce transforms REDUCE(<4 x bool>) → REDUCE(<2 x bool>), we need
+    // to devectorize the resulting REDUCE to avoid LLVM <N x i1> accumulator issues.
+    let hreduced = crate::rewrite::graph_rewrite_bottom_up(&pm_bool_reduce, hreduced, &mut ());
+
+    // Second pass of bool ALU devectorization: Handle WHERE ops created by horizontal reduce.
+    // Min reduction creates WHERE(<N x i1>, ...) which needs devectorization.
+    let hreduced = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, hreduced, &mut ());
 
     // FMA decomposition: a*b+c → MulAcc(a,b,c) for float types.
     // Applied late so optimizations can still see Add(Mul) structure.
@@ -157,7 +173,14 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     // This MUST run after pre_expand to avoid creating Binary(Range*stride) before expand.
     // If linearized before expand, Range ops inside Binary get vectorized incorrectly.
     let post_expand_matcher = crate::rangeify::post_expand_patterns();
-    crate::rewrite::graph_rewrite_bottom_up(&post_expand_matcher, with_fma, &mut ())
+    let post_expanded = crate::rewrite::graph_rewrite_bottom_up(&post_expand_matcher, with_fma, &mut ());
+
+    // Bool storage: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits.
+    // LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
+    // Must run LAST, after all other transformations that might create bool stores.
+    // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
+    let pm_bool_storage = crate::devectorize::bool_storage_patterns();
+    crate::rewrite::graph_rewrite_bottom_up(&pm_bool_storage, post_expanded, &mut ())
 }
 
 /// Apply optimizations with explicit configuration.

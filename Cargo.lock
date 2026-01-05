@@ -1132,6 +1132,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "snafu",
+ "strum",
  "test-case",
  "tracing",
 ]

@@ -421,7 +421,7 @@ pub enum ReduceOp {
 /// Unary operation types.
 ///
 /// All unary operations preserve the input dtype.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr)]
 pub enum UnaryOp {
     /// Negation: -x
     Neg,
@@ -470,7 +470,7 @@ pub enum UnaryOp {
 /// Arithmetic operations (Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv) preserve the LHS dtype.
 /// Comparison operations (Lt, Eq, Ne) always return DType::Bool.
 /// Bitwise operations (And, Or, Xor, Shl, Shr) preserve dtype and require int/bool types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr)]
 pub enum BinaryOp {
     // Arithmetic operations
     /// Addition: a + b
@@ -541,7 +541,7 @@ pub enum BinaryOp {
 impl BinaryOp {
     /// Returns true if this is a comparison operation.
     pub fn is_comparison(self) -> bool {
-        matches!(self, Self::Lt | Self::Eq | Self::Ne)
+        matches!(self, Self::Lt | Self::Le | Self::Eq | Self::Ne | Self::Gt | Self::Ge)
     }
 
     /// Returns true if this is an arithmetic operation.
@@ -571,7 +571,7 @@ impl BinaryOp {
 }
 
 /// Ternary operation types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr)]
 pub enum TernaryOp {
     /// Conditional selection: condition ? true_val : false_val
     Where,

@@ -1079,6 +1079,12 @@ impl UOp {
                 DType::Ptr { base, .. } => (**base).clone(),
                 other => other.clone(),
             },
+            // CAT dtype = sum of source vcounts (must recalculate when sources change)
+            // Use base() instead of scalar() to handle both Scalar and Vector sources
+            Op::Cat { sources } => {
+                let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
+                DType::Scalar(sources[0].dtype.base()).vec(total_count)
+            }
             // All other operations preserve their original dtype
             _ => self.dtype.clone(),
         };
@@ -1389,6 +1395,12 @@ impl UOp {
                 DType::Ptr { base, .. } => (**base).clone(),
                 other => other.clone(),
             },
+            // CAT dtype = sum of source vcounts (must recalculate when sources change)
+            // Use base() instead of scalar() to handle both Scalar and Vector sources
+            Op::Cat { sources } => {
+                let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
+                DType::Scalar(sources[0].dtype.base()).vec(total_count)
+            }
             // All other operations preserve their original dtype
             _ => self.dtype.clone(),
         };

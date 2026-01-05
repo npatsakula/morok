@@ -61,9 +61,9 @@ fn test_gep_multiple_indices() {
         UOp::native_const(40i32),
     ]);
 
-    // Extract multiple elements -> keeps vector dtype (doesn't reduce count)
+    // Extract multiple elements -> produces vector of extracted elements
     let result = UOp::gep(vec, vec![0, 2]);
-    assert_eq!(result.dtype(), DType::Int32.vec(4));
+    assert_eq!(result.dtype(), DType::Int32.vec(2));
 }
 
 // =========================================================================
@@ -89,8 +89,8 @@ fn test_cat_basic() {
     let b = UOp::vectorize(smallvec![UOp::native_const(3.0f32), UOp::native_const(4.0f32),]);
 
     let result = UOp::cat(vec![a, b]);
-    // Cat concatenates vectors
-    assert_eq!(result.dtype(), DType::Float32.vec(2));
+    // Cat concatenates vectors: <2 x f32> + <2 x f32> = <4 x f32>
+    assert_eq!(result.dtype(), DType::Float32.vec(4));
 }
 
 // =========================================================================

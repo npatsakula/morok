@@ -971,8 +971,11 @@ impl Scheduler {
     ///
     /// This is the CPU counterpart to `convert_loop_to_global()` for GPU.
     pub fn convert_outer_to_loop(&mut self) -> Result<(), OptError> {
+        use tracing::debug;
+
         // Only for CPU backends (no local memory = no GPU parallelization)
         if self.ren.has_local {
+            debug!("convert_outer_to_loop: skipping (has_local=true)");
             return Ok(());
         }
 
@@ -981,7 +984,14 @@ impl Scheduler {
         // be vectorized (each output element needs its own independent reduction).
         // This matches Tinygrad's architecture where OUTER is never upcastable.
         if self.reduceop().is_some() {
+            debug!("convert_outer_to_loop: skipping (has reduceop)");
             return Ok(());
+        }
+
+        let all_rngs = self.rngs();
+        debug!(num_rngs = all_rngs.len(), "convert_outer_to_loop: checking rngs");
+        for (i, rng) in all_rngs.iter().enumerate() {
+            debug!(i, axis_type = ?rng.op(), "convert_outer_to_loop: rng");
         }
 
         let outer_rngs: Vec<_> = self
@@ -991,7 +1001,10 @@ impl Scheduler {
             .cloned()
             .collect();
 
+        debug!(num_outer = outer_rngs.len(), "convert_outer_to_loop: found outer ranges");
+
         if outer_rngs.is_empty() {
+            debug!("convert_outer_to_loop: no outer ranges to convert");
             return Ok(());
         }
 
@@ -1000,12 +1013,14 @@ impl Scheduler {
         let mut subst_map = std::collections::HashMap::new();
         for rng in outer_rngs {
             let new_rng = rng.with_axis_type(AxisType::Loop);
+            debug!("convert_outer_to_loop: converting {:?} -> {:?}", rng.op(), new_rng.op());
             subst_map.insert(UOpKey(rng), new_rng);
         }
 
         // Apply substitution
         let old_ast_id = self.ast.id;
         self.ast = self.ast.substitute(&subst_map);
+        debug!(old_id = old_ast_id, new_id = self.ast.id, "convert_outer_to_loop: substitution complete");
 
         // Record high-level transformation
         if old_ast_id != self.ast.id {
