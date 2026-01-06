@@ -1,4 +1,4 @@
-use crate::{pattern::matcher::RewriteResult, symbolic::symbolic_simple};
+use crate::{pattern::RewriteResult, symbolic::symbolic_simple};
 use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 use std::{f32::consts::PI, sync::Arc};
@@ -1176,7 +1176,7 @@ fn test_multiplication_chain_folding() {
     println!("=== MULTIPLICATION CHAIN TEST ===");
     println!("Input: (var(\"a\") * 2) * 2");
     match &result {
-        crate::pattern::matcher::RewriteResult::Rewritten(r) => {
+        crate::pattern::RewriteResult::Rewritten(r) => {
             println!("Result: {:?}", r.op());
         }
         _ => {
@@ -1184,9 +1184,9 @@ fn test_multiplication_chain_folding() {
         }
     }
 
-    assert!(matches!(result, crate::pattern::matcher::RewriteResult::Rewritten(_)));
+    assert!(matches!(result, crate::pattern::RewriteResult::Rewritten(_)));
 
-    if let crate::pattern::matcher::RewriteResult::Rewritten(rewritten) = result {
+    if let crate::pattern::RewriteResult::Rewritten(rewritten) = result {
         // Should be a * 4
         if let Op::Binary(BinaryOp::Mul, var, c) = rewritten.op() {
             assert!(Arc::ptr_eq(var, &a), "Variable should be unchanged");

@@ -3,7 +3,7 @@
 //! ## Module Structure (Consolidated from 19 → 5 files)
 //!
 //! - `indexing` - Range assignment and IndexingContext
-//! - `patterns` - All PatternMatcher constructors
+//! - `patterns` - All TypedPatternMatcher constructors
 //! - `transforms` - rangeify() entry point and transformation functions
 //! - `kernel` - KernelContext, kernel splitting, buffer cost analysis
 

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 
-use crate::pattern::matcher::RewriteResult;
+use crate::pattern::RewriteResult;
 use crate::rangeify::IndexingContext;
 use crate::rangeify::patterns;
 

@@ -2,7 +2,7 @@
 
 use crate::{RenderedKernel, Result};
 use morok_ir::UOp;
-use morok_ir::pattern::PatternMatcher;
+use morok_ir::pattern::TypedPatternMatcher;
 use std::sync::Arc;
 
 /// Backend-agnostic code generation interface.
@@ -38,10 +38,10 @@ pub trait Renderer {
     /// # Example
     ///
     /// ```ignore
-    /// fn decompositor(&self) -> Option<PatternMatcher<()>> {
+    /// fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
     ///     // LLVM has native transcendentals
     ///     None
     /// }
     /// ```
-    fn decompositor(&self) -> Option<PatternMatcher<()>>;
+    fn decompositor(&self) -> Option<TypedPatternMatcher<()>>;
 }

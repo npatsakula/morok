@@ -1,4 +1,4 @@
-use crate::parser::*;
+use crate::patterns::parser::*;
 
 /// Helper to extract a rule from items at a given index.
 fn get_rule(input: &PatternList, idx: usize) -> &PatternRule {
@@ -414,4 +414,63 @@ fn test_parse_no_rest_pattern() {
         }
         _ => panic!("Expected OpTuple"),
     }
+}
+
+// ========== Closure RHS Tests ==========
+
+#[test]
+fn test_parse_closure_simple() {
+    // Simple closure RHS
+    let input: PatternList = syn::parse_quote! {
+        Add(x, @zero) ~> |x| x.clone()
+    };
+    assert_eq!(input.items.len(), 1);
+    assert_eq!(get_rule(&input, 0).arrow, ArrowKind::Infallible);
+    assert!(matches!(get_rule(&input, 0).rhs, RewriteExpr::Closure(_)));
+}
+
+#[test]
+fn test_parse_closure_multiple_params() {
+    // Closure with multiple parameters
+    let input: PatternList = syn::parse_quote! {
+        Mul(a, Add(b, c)) ~> |a, b, c| a.try_mul(&b)
+    };
+    assert_eq!(input.items.len(), 1);
+    match &get_rule(&input, 0).rhs {
+        RewriteExpr::Closure(closure) => {
+            assert_eq!(closure.inputs.len(), 3);
+        }
+        _ => panic!("Expected Closure"),
+    }
+}
+
+#[test]
+fn test_parse_closure_with_type_annotation() {
+    // Closure with explicit type annotation
+    let input: PatternList = syn::parse_quote! {
+        Add(x, @zero) ~> |x: &Arc<UOp>| x.clone()
+    };
+    assert!(matches!(get_rule(&input, 0).rhs, RewriteExpr::Closure(_)));
+}
+
+#[test]
+fn test_parse_closure_fallible() {
+    // Fallible closure RHS
+    let input: PatternList = syn::parse_quote! {
+        Mod(x, y) => |x, y| x.try_mod(y).ok()
+    };
+    assert_eq!(get_rule(&input, 0).arrow, ArrowKind::Fallible);
+    assert!(matches!(get_rule(&input, 0).rhs, RewriteExpr::Closure(_)));
+}
+
+#[test]
+fn test_parse_closure_with_block_body() {
+    // Closure with block body
+    let input: PatternList = syn::parse_quote! {
+        Add(x, y) ~> |x, y, ctx| {
+            ctx.stats += 1;
+            x.clone()
+        }
+    };
+    assert!(matches!(get_rule(&input, 0).rhs, RewriteExpr::Closure(_)));
 }

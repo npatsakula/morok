@@ -28,12 +28,15 @@ use morok_dtype::DeviceSpec;
 /// Hash consing uses UOpKey which compares by pointer equality instead.
 #[derive(Debug, Clone)]
 #[derive(strum::AsRefStr)]
+#[derive(morok_macros::PatternEnum)]
+#[pattern(grouped = [Unary, Binary, Ternary])]
 pub enum Op {
     // Nullary operations (7 variants)
     Const(ConstValueHash),
     Unique(usize),
     Device(DeviceSpec),
     Noop,
+    #[pattern(skip)]
     Invalid,
     DefineGlobal(usize),
     DefineLocal(usize),

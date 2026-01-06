@@ -26,16 +26,16 @@ pub mod transcendentals;
 
 use std::sync::Arc;
 
-use crate::pattern::PatternMatcher;
+use crate::pattern::TypedPatternMatcher;
 use crate::rewrite::graph_rewrite_bottom_up;
 use crate::uop::UOp;
-use morok_schedule_macros::patterns;
+use morok_macros::patterns;
 
 use transcendentals::{xcos, xerf, xexp, xexp2, xlog, xlog2, xpow, xrsqrt, xsin, xsqrt, xtan};
 
 /// All decomposition patterns for transcendental operations.
 ///
-/// Returns a `PatternMatcher` that decomposes:
+/// Returns a `TypedPatternMatcher` that decomposes:
 /// - Unary: Exp2, Log2, Exp, Log, Sin, Cos, Tan, Sqrt, Rsqrt, Erf
 /// - Binary: Pow
 ///
@@ -46,27 +46,27 @@ use transcendentals::{xcos, xerf, xexp, xexp2, xlog, xlog2, xpow, xrsqrt, xsin, 
 ///
 /// ```ignore
 /// impl Renderer for CpuRenderer {
-///     fn decompositor(&self) -> Option<PatternMatcher<()>> {
+///     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
 ///         Some(all_decomposition_patterns())
 ///     }
 /// }
 /// ```
-pub fn all_decomposition_patterns() -> PatternMatcher<()> {
+pub fn all_decomposition_patterns() -> TypedPatternMatcher<()> {
     patterns! {
         // Transcendental unary ops
-        Exp2(src) ~> xexp2(src),
-        Log2(src) ~> xlog2(src),
-        Exp(src)  ~> xexp(src),
-        Log(src)  ~> xlog(src),
-        Sin(src)  ~> xsin(src),
-        Cos(src)  ~> xcos(src),
-        Tan(src)  ~> xtan(src),
-        Sqrt(src) ~> xsqrt(src),
-        Rsqrt(src) ~> xrsqrt(src),
-        Erf(src)  ~> xerf(src),
+        Exp2(src) ~> |src| xexp2(src),
+        Log2(src) ~> |src| xlog2(src),
+        Exp(src)  ~> |src| xexp(src),
+        Log(src)  ~> |src| xlog(src),
+        Sin(src)  ~> |src| xsin(src),
+        Cos(src)  ~> |src| xcos(src),
+        Tan(src)  ~> |src| xtan(src),
+        Sqrt(src) ~> |src| xsqrt(src),
+        Rsqrt(src) ~> |src| xrsqrt(src),
+        Erf(src)  ~> |src| xerf(src),
 
         // Binary pow: x^y = exp2(y * log2(x))
-        Pow(base, exp) ~> xpow(base, exp),
+        Pow(base, exp) ~> |base, exp| xpow(base, exp),
     }
 }
 
@@ -92,6 +92,6 @@ pub fn all_decomposition_patterns() -> PatternMatcher<()> {
 /// let matcher = all_decomposition_patterns();
 /// let decomposed = decompose_with(&kernel.ast, &matcher);
 /// ```
-pub fn decompose_with(root: &Arc<UOp>, matcher: &PatternMatcher<()>) -> Arc<UOp> {
+pub fn decompose_with(root: &Arc<UOp>, matcher: &TypedPatternMatcher<()>) -> Arc<UOp> {
     graph_rewrite_bottom_up(matcher, root.clone(), &mut ())
 }

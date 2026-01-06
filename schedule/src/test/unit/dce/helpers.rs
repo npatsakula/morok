@@ -4,11 +4,11 @@ use morok_ir::types::ConstValue;
 use morok_ir::{Op, UOp};
 use std::sync::Arc;
 
-use crate::pattern::PatternMatcher;
+use crate::TypedPatternMatcher;
 use crate::symbolic::symbolic_simple;
 
 /// Get the symbolic_simple pattern matcher (reduces duplication).
-pub fn get_matcher() -> PatternMatcher {
+pub fn get_matcher() -> TypedPatternMatcher {
     symbolic_simple()
 }
 

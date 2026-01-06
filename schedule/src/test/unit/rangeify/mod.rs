@@ -83,14 +83,14 @@ fn test_pattern_matchers_stub() {
     let x = UOp::native_const(1.0f32);
 
     // Should all return NoMatch since they're empty
-    use crate::pattern::matcher::RewriteResult;
+    use crate::pattern::RewriteResult;
     assert!(matches!(m3.rewrite(&x, &mut ()), RewriteResult::NoMatch));
     assert!(matches!(m4.rewrite(&x, &mut ()), RewriteResult::NoMatch));
 }
 
 #[test]
 fn test_early_rewrites_detach_removal() {
-    use crate::pattern::matcher::RewriteResult;
+    use crate::pattern::RewriteResult;
 
     let matcher = rangeify_patterns::early_rewrites();
 
@@ -107,7 +107,7 @@ fn test_early_rewrites_detach_removal() {
 
 #[test]
 fn test_early_rewrites_contiguous_backward_removal() {
-    use crate::pattern::matcher::RewriteResult;
+    use crate::pattern::RewriteResult;
 
     let matcher = rangeify_patterns::early_rewrites();
 

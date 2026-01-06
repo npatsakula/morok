@@ -16,7 +16,7 @@ use syn::{
 ///
 /// Optionally declares a context type with `@context Type;` at the start.
 /// When a context type is declared:
-/// - Generated `PatternMatcher<ContextType>` instead of `PatternMatcher<()>`
+/// - Generated `TypedPatternMatcher<ContextType>` instead of `TypedPatternMatcher<()>`
 /// - Pattern closures receive `ctx: &mut ContextType`
 /// - `ctx` is available in RHS expressions
 #[derive(Debug)]
@@ -230,6 +230,7 @@ fn parse_guard_expr(input: ParseStream) -> Result<syn::Expr> {
 
 /// A pattern in the LHS of a rule.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum Pattern {
     /// Wildcard: `_`
     Wildcard,
@@ -545,6 +546,8 @@ pub enum RewriteExpr {
     Var(Ident),
     /// Block expression: `{ ... }`
     Block(syn::ExprBlock),
+    /// Closure expression: `|x| x.clone()` or `|x, y, ctx| { ... }`
+    Closure(syn::ExprClosure),
     /// General expression: `Rc::clone(x)`, `foo.bar()`, etc.
     Expr(syn::Expr),
 }
@@ -555,6 +558,35 @@ impl Parse for RewriteExpr {
         if input.peek(token::Brace) {
             let block: syn::ExprBlock = input.parse()?;
             return Ok(RewriteExpr::Block(block));
+        }
+
+        // Check for closure: |...| ...
+        if input.peek(Token![|]) {
+            // Collect tokens for closure, tracking pipe count to find closure body
+            // A closure looks like: |params| body
+            // We need to find the second | then continue collecting the body
+            let mut tokens = proc_macro2::TokenStream::new();
+            let mut pipe_count = 0;
+
+            while !input.is_empty() {
+                // Only stop at comma if we've seen both pipes (past the params)
+                if pipe_count >= 2 && input.peek(Token![,]) {
+                    break;
+                }
+
+                let tt: proc_macro2::TokenTree = input.parse()?;
+
+                // Count pipe tokens to track closure structure
+                if let proc_macro2::TokenTree::Punct(ref p) = tt
+                    && p.as_char() == '|'
+                {
+                    pipe_count += 1;
+                }
+
+                tokens.extend(std::iter::once(tt));
+            }
+            let closure: syn::ExprClosure = syn::parse2(tokens)?;
+            return Ok(RewriteExpr::Closure(closure));
         }
 
         // Check for simple variable: ident followed by comma/end

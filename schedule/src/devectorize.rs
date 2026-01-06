@@ -35,7 +35,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{BinaryOp, ConstValue, Op, PatternMatcher, TernaryOp, UOp};
+use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp};
+
+use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
 
 use crate::rewrite::graph_rewrite_bottom_up;
@@ -72,13 +74,13 @@ pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
 /// LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
 /// We cast bool→uint8 before storing and uint8→bool after loading.
 /// This matches Tinygrad's approach in PTX and NIR renderers.
-pub fn bool_storage_patterns() -> PatternMatcher {
+pub fn bool_storage_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         // STORE bool value: cast to uint8 before storing
-        store if is_bool_store(store) => rewrite_bool_store(store),
+        store if is_bool_store(store) => |store| rewrite_bool_store(store),
 
         // LOAD bool value: load as uint8, then cast to bool
-        load if is_bool_load(load) => rewrite_bool_load(load),
+        load if is_bool_load(load) => |load| rewrite_bool_load(load),
     }
 }
 
@@ -158,7 +160,7 @@ fn rewrite_bool_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// GEP patterns for PTRCAT/CAT reordering only.
 /// More focused than full gep_pushing_patterns to avoid transforming unrelated GEPs.
-fn gep_ptrcat_patterns() -> PatternMatcher {
+fn gep_ptrcat_patterns() -> TypedPatternMatcher {
     fn is_gep_ptrcat(uop: &Arc<UOp>) -> bool {
         if let Op::Gep { vector, .. } = uop.op() {
             return matches!(vector.op(), Op::PtrCat { .. });
@@ -194,23 +196,23 @@ fn gep_ptrcat_patterns() -> PatternMatcher {
     }
 
     crate::patterns! {
-        gep if is_gep_ptrcat(gep) => gep_ptrcat(gep),
-        gep if is_gep_cat(gep) => gep_cat(gep),
+        gep if is_gep_ptrcat(gep) => |gep| gep_ptrcat(gep),
+        gep if is_gep_cat(gep) => |gep| gep_cat(gep),
 
         // Single-source Cat is identity: Cat([x]) → x
-        cat if matches!(cat.op(), Op::Cat { .. }) => {
+        cat if matches!(cat.op(), Op::Cat { .. }) => |cat| {
             let Op::Cat { sources } = cat.op() else { return None };
             (sources.len() == 1).then(|| Arc::clone(&sources[0]))
         },
 
         // Single-source PtrCat is identity: PtrCat([x]) → x
-        ptrcat if matches!(ptrcat.op(), Op::PtrCat { .. }) => {
+        ptrcat if matches!(ptrcat.op(), Op::PtrCat { .. }) => |ptrcat| {
             let Op::PtrCat { sources } = ptrcat.op() else { return None };
             (sources.len() == 1).then(|| Arc::clone(&sources[0]))
         },
 
         // Identity CAT reconstruction: CAT(GEP(x,[0]), GEP(x,[1]), ...) → x
-        cat if matches!(cat.op(), Op::Cat { .. }) => {
+        cat if matches!(cat.op(), Op::Cat { .. }) => |cat| {
             let Op::Cat { sources } = cat.op() else { return None };
             if sources.is_empty() { return None; }
 
@@ -230,7 +232,7 @@ fn gep_ptrcat_patterns() -> PatternMatcher {
         // Devectorize WHERE with vector condition.
         // Based on Tinygrad's no_vectorized_alu (devectorizer.py:219-223).
         // WHERE(<N x i1>, <N x T>, <N x T>) → VECTORIZE(WHERE(i1, T, T), ...)
-        ternary if is_vectorized_where(ternary) => devectorize_where(ternary),
+        ternary if is_vectorized_where(ternary) => |ternary| devectorize_where(ternary),
     }
 }
 
@@ -275,27 +277,27 @@ fn devectorize_where(ternary: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 /// Phase 1 patterns: expand vector INDEX into grouped PTRCAT.
-fn expand_index_patterns() -> PatternMatcher {
+fn expand_index_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         // INDEX(buffer, vector_index) with vector index → expand and group
-        index if is_vector_index(index) => expand_vector_index(index),
+        index if is_vector_index(index) => |index| expand_vector_index(index),
     }
 }
 
 /// Phase 2 patterns: distribute PTRCAT and split LOAD/STORE.
-fn load_store_patterns() -> PatternMatcher {
+fn load_store_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         // Distribute PTRCAT through LOAD: LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
-        load if is_ptrcat_load(load) => distribute_ptrcat_load(load),
+        load if is_ptrcat_load(load) => |load| distribute_ptrcat_load(load),
 
         // Distribute PTRCAT through STORE: STORE(PTRCAT(a,b), data) → GROUP(STORE(a, gep(data)), ...)
-        store if is_ptrcat_store(store) => distribute_ptrcat_store(store),
+        store if is_ptrcat_store(store) => |store| distribute_ptrcat_store(store),
 
         // Split LOAD(CAST(INDEX)) by divisibility
-        load if is_cast_index_load(load) => split_load(load),
+        load if is_cast_index_load(load) => |load| split_load(load),
 
         // Split STORE(CAST(INDEX), ...) by divisibility
-        store if is_cast_index_store(store) => split_store(store),
+        store if is_cast_index_store(store) => |store| split_store(store),
     }
 }
 

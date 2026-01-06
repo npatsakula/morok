@@ -665,7 +665,7 @@ fn codegen_cast_scalar<'ctx>(
                 }
             } else {
                 // Same bit width - no conversion needed
-                Ok(src.into())
+                Ok(src)
             }
         }
     }
@@ -1340,7 +1340,7 @@ fn codegen_reduce<'ctx>(
     let src_is_vectorized = src.dtype().vcount() > 1;
     let fma_operands = if reduce_op == ReduceOp::Add
         && result_dtype.base().is_float()
-        && !(src_is_vectorized && !is_vector_accumulator)
+        && (is_vector_accumulator || !src_is_vectorized)
     {
         let result = try_extract_fma_operands(src);
         debug!(

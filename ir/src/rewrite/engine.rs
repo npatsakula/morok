@@ -21,36 +21,35 @@
 //! ## Example
 //!
 //! ```ignore
+//! use morok_ir::pattern::SimplifiedPatternMatcher;
+//!
 //! // Create context
 //! let mut ctx = KernelContext::new();
 //!
-//! // Patterns are simple functions - no closure capture needed
-//! fn debuf(b: &BindingStore, i: &VarIntern, ctx: &mut KernelContext) -> RewriteResult {
-//!     let id = ctx.next_global();  // Direct mutable access
-//!     // ...
-//! }
-//!
-//! let matcher: PatternMatcher<KernelContext> = PatternMatcher::new(vec![
-//!     (pattern, Box::new(debuf)),
-//! ]);
+//! // Create matcher using the patterns! macro
+//! let matcher = patterns! {
+//!     Add(x, @zero) ~> |x| x.clone(),
+//!     Mul(x, @one) ~> |x| x.clone(),
+//! };
 //!
 //! // Pass context at rewrite time
 //! let result = graph_rewrite(&matcher, root, &mut ctx);
 //! ```
 //!
-//! Patterns that don't need context simply ignore the `_ctx` parameter:
+//! Patterns that don't need context use `()` as the context type:
 //!
 //! ```ignore
-//! fn add_zero<C>(b: &BindingStore, _: &VarIntern, _ctx: &mut C) -> RewriteResult {
-//!     // Don't use _ctx
-//! }
+//! let matcher = patterns! {
+//!     Add(x, @zero) ~> |x| x.clone(),
+//! };
+//! let result = graph_rewrite(&matcher, root, &mut ());
 //! ```
 
 use crate::{UOp, UOpKey};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::pattern::{PatternMatcher, RewriteResult};
+use crate::pattern::{Matcher, RewriteResult};
 
 /// Stage in the 2-stage rewrite algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,10 +173,13 @@ impl ResultMap {
 
 /// Internal rewrite engine that implements the 2-stage stack-based algorithm.
 ///
-/// Generic over context type `C` for compile-time type-safe context passing.
-struct RewriteEngine<'a, C> {
+/// Generic over matcher type `M` and context type `C` for compile-time type-safe matching.
+struct RewriteEngine<'a, M, C>
+where
+    M: Matcher<C>,
+{
     /// Pattern matcher for applying rewrite rules
-    matcher: &'a PatternMatcher<C>,
+    matcher: &'a M,
 
     /// Mutable reference to context passed through to patterns
     ctx: &'a mut C,
@@ -196,12 +198,15 @@ struct RewriteEngine<'a, C> {
     bottom_up: bool,
 }
 
-impl<'a, C> RewriteEngine<'a, C> {
-    fn new(matcher: &'a PatternMatcher<C>, ctx: &'a mut C) -> Self {
+impl<'a, M, C> RewriteEngine<'a, M, C>
+where
+    M: Matcher<C>,
+{
+    fn new(matcher: &'a M, ctx: &'a mut C) -> Self {
         Self { matcher, ctx, results: ResultMap::new(), pending: HashSet::new(), bottom_up: false }
     }
 
-    fn new_bottom_up(matcher: &'a PatternMatcher<C>, ctx: &'a mut C) -> Self {
+    fn new_bottom_up(matcher: &'a M, ctx: &'a mut C) -> Self {
         Self { matcher, ctx, results: ResultMap::new(), pending: HashSet::new(), bottom_up: true }
     }
 
@@ -466,19 +471,23 @@ impl<'a, C> RewriteEngine<'a, C> {
 /// # Example
 ///
 /// ```ignore
-/// use morok_ir::{PatternMatcher, graph_rewrite};
+/// use morok_ir::{TypedPatternMatcher, graph_rewrite};
 /// use morok_ir::UOp;
 ///
 /// // Patterns without context
-/// let matcher: PatternMatcher<()> = PatternMatcher::new(vec![/* patterns */]);
+/// let matcher = TypedPatternMatcher::<()>::new();
 /// let optimized = graph_rewrite(&matcher, root_uop, &mut ());
 ///
 /// // Patterns with context
-/// let matcher: PatternMatcher<KernelContext> = PatternMatcher::new(vec![/* patterns */]);
+/// let mut matcher = TypedPatternMatcher::<KernelContext>::new();
+/// // ... add patterns ...
 /// let mut ctx = KernelContext::new();
 /// let optimized = graph_rewrite(&matcher, root_uop, &mut ctx);
 /// ```
-pub fn graph_rewrite<C>(matcher: &PatternMatcher<C>, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+pub fn graph_rewrite<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
+where
+    M: Matcher<C>,
+{
     let mut engine = RewriteEngine::new(matcher, ctx);
     engine.rewrite(root)
 }
@@ -495,7 +504,10 @@ pub fn graph_rewrite<C>(matcher: &PatternMatcher<C>, root: Arc<UOp>, ctx: &mut C
 /// let matcher = to_define_global_patterns();
 /// let optimized = graph_rewrite_bottom_up(&matcher, root, &mut ctx);
 /// ```
-pub fn graph_rewrite_bottom_up<C>(matcher: &PatternMatcher<C>, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+pub fn graph_rewrite_bottom_up<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
+where
+    M: Matcher<C>,
+{
     let mut engine = RewriteEngine::new_bottom_up(matcher, ctx);
     engine.rewrite(root)
 }
@@ -526,7 +538,10 @@ pub struct GraphRewriteOutput {
 /// apply_map_to_tensors(&result.becomes_map);
 /// ```
 #[allow(clippy::mutable_key_type)]
-pub fn graph_rewrite_with_map<C>(matcher: &PatternMatcher<C>, root: Arc<UOp>, ctx: &mut C) -> GraphRewriteOutput {
+pub fn graph_rewrite_with_map<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> GraphRewriteOutput
+where
+    M: Matcher<C>,
+{
     let mut engine = RewriteEngine::new(matcher, ctx);
     let result_root = engine.rewrite(root.clone());
 
@@ -541,11 +556,10 @@ pub fn graph_rewrite_with_map<C>(matcher: &PatternMatcher<C>, root: Arc<UOp>, ct
 ///
 /// Like `graph_rewrite_bottom_up`, but also returns a `becomes_map`.
 #[allow(clippy::mutable_key_type)]
-pub fn graph_rewrite_bottom_up_with_map<C>(
-    matcher: &PatternMatcher<C>,
-    root: Arc<UOp>,
-    ctx: &mut C,
-) -> GraphRewriteOutput {
+pub fn graph_rewrite_bottom_up_with_map<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> GraphRewriteOutput
+where
+    M: Matcher<C>,
+{
     let mut engine = RewriteEngine::new_bottom_up(matcher, ctx);
     let result_root = engine.rewrite(root.clone());
 

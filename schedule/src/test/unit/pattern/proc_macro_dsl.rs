@@ -1,14 +1,14 @@
 //! Tests for the patterns! proc-macro DSL.
+//!
+//! These tests verify that the `patterns!` macro correctly generates
+//! `TypedPatternMatcher` instances for pattern-based UOp rewrites.
 
 use std::sync::Arc;
 
-use morok_dtype::DType;
-use morok_ir::{BinaryOp, ConstValue, Op, UOp};
-
-use crate::pattern::UPat;
-use crate::pattern::matcher::RewriteResult;
-use crate::pattern::{BindingStore, BindingStoreExt, VarIntern};
 use crate::patterns;
+use morok_dtype::DType;
+use morok_ir::pattern::RewriteResult;
+use morok_ir::{BinaryOp, ConstValue, Op, UOp};
 
 /// Helper to create a binary operation UOp
 fn binary(op: BinaryOp, lhs: Arc<UOp>, rhs: Arc<UOp>) -> Arc<UOp> {
@@ -285,6 +285,23 @@ fn test_auto_ptr_eq_three_args() {
         RewriteResult::NoMatch => {} // Expected
         _ => panic!("Where(a, a, b) should NOT match"),
     }
+
+    // Test Where(a, b, a) - should NOT match (middle differs)
+    // This case catches the DuplicateTracker shadowing bug where only first==third is checked
+    let where_middle_diff = UOp::try_where(a.clone(), b.clone(), a.clone()).unwrap();
+
+    match matcher.rewrite(&where_middle_diff, &mut ()) {
+        RewriteResult::NoMatch => {} // Expected
+        _ => panic!("Where(a, b, a) should NOT match Where(x, x, x)"),
+    }
+
+    // Test Where(b, a, a) - should NOT match (first differs)
+    let where_first_diff = UOp::try_where(b.clone(), a.clone(), a.clone()).unwrap();
+
+    match matcher.rewrite(&where_first_diff, &mut ()) {
+        RewriteResult::NoMatch => {} // Expected
+        _ => panic!("Where(b, a, a) should NOT match Where(x, x, x)"),
+    }
 }
 
 #[test]
@@ -448,165 +465,9 @@ fn test_identity_patterns_with_special_constants() {
     }
 }
 
-#[test]
-fn test_or_casted_method() {
-    // Test the .or_casted() convenience method
-    // This should match both constant and CAST(constant)
-    use crate::pattern::PatternMatcher;
-
-    // Create pattern: match constant or cast(constant)
-    // The "c" name binds to the inner constant in both cases
-    let pattern = UPat::cvar("c").or_casted();
-
-    // Build a matcher that returns the bound constant
-    let matcher = PatternMatcher::new(vec![(
-        pattern,
-        Box::new(|bindings: &BindingStore, intern: &VarIntern, _ctx: &mut ()| {
-            if let Some(c) = intern.get_index("c").and_then(|i| bindings.get_by_index(i)) {
-                RewriteResult::Rewritten(Arc::clone(c))
-            } else {
-                RewriteResult::NoMatch
-            }
-        }),
-    )]);
-
-    // Create a constant
-    let c = UOp::native_const(42i32);
-
-    // Test direct constant - should match and return the constant
-    match matcher.rewrite(&c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Direct constant should match .or_casted()"),
-    }
-
-    // Create CAST(constant)
-    let cast_c = UOp::cast(c.clone(), DType::Float32);
-
-    // Test cast(constant) - should match and return the inner constant
-    match matcher.rewrite(&cast_c, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
-        _ => panic!("Cast(constant) should match .or_casted()"),
-    }
-
-    // Create Add - should NOT match
-    let add = binary(BinaryOp::Add, c.clone(), c.clone());
-    match matcher.rewrite(&add, &mut ()) {
-        RewriteResult::NoMatch => {} // Expected
-        _ => panic!("Add should NOT match .or_casted()"),
-    }
-}
-
-#[test]
-fn test_or_detach_method() {
-    // Test the .or_detach() convenience method
-    use crate::pattern::PatternMatcher;
-
-    // Create pattern: match constant or detach(constant)
-    // The "c" name binds to the inner constant
-    let pattern = UPat::cvar("c").or_detach();
-
-    let matcher = PatternMatcher::new(vec![(
-        pattern,
-        Box::new(|bindings: &BindingStore, intern: &VarIntern, _ctx: &mut ()| {
-            if let Some(c) = intern.get_index("c").and_then(|i| bindings.get_by_index(i)) {
-                RewriteResult::Rewritten(Arc::clone(c))
-            } else {
-                RewriteResult::NoMatch
-            }
-        }),
-    )]);
-
-    // Create a constant
-    let x = UOp::native_const(42i32);
-
-    // Test direct constant - should match
-    match matcher.rewrite(&x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Direct value should match .or_detach()"),
-    }
-
-    // Create DETACH(x)
-    let detach_x = UOp::detach(x.clone());
-
-    // Test detach(x) - should also match
-    match matcher.rewrite(&detach_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Detach(x) should match .or_detach()"),
-    }
-}
-
-#[test]
-fn test_binary_commutative_pattern() {
-    // Test the binary_commutative method for matching both orderings
-    use crate::pattern::PatternMatcher;
-
-    // Create pattern: match x + 0 OR 0 + x (using permutation)
-    let pattern = UPat::binary_commutative(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::zero_const("zero")]);
-
-    let matcher = PatternMatcher::new(vec![(
-        pattern,
-        Box::new(|bindings: &BindingStore, intern: &VarIntern, _ctx: &mut ()| {
-            if let Some(x) = intern.get_index("x").and_then(|i| bindings.get_by_index(i)) {
-                RewriteResult::Rewritten(Arc::clone(x))
-            } else {
-                RewriteResult::NoMatch
-            }
-        }),
-    )]);
-
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-
-    // Test x + 0 - should match
-    let add_x_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
-    match matcher.rewrite(&add_x_zero, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(x, 0) should match binary_commutative"),
-    }
-
-    // Test 0 + x - should also match!
-    let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
-    match matcher.rewrite(&add_zero_x, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
-        _ => panic!("Add(0, x) should match binary_commutative"),
-    }
-}
-
-#[test]
-fn test_permute_pattern_with_three_sources() {
-    // Test permutation with 3 sources (6 orderings)
-    use crate::pattern::upat::{OpFilter, SrcPattern};
-
-    // Manually create a 3-source permutation pattern (ternary-like)
-    let pattern = UPat::Match {
-        op: Some(vec![OpFilter::Ternary(vec![morok_ir::TernaryOp::Where])]),
-        dtype: None,
-        src: Some(SrcPattern::Permute(vec![UPat::cvar("a"), UPat::cvar("b"), UPat::cvar("c")])),
-        arg: None,
-        name: None,
-    };
-
-    // Just test that the pattern matches - where(a, b, c) in any order
-    let a = UOp::native_const(1i32);
-    let b = UOp::native_const(2i32);
-    let c = UOp::native_const(3i32);
-
-    // Create where(a, b, c)
-    let where_abc = UOp::try_where(a.clone(), b.clone(), c.clone()).unwrap();
-
-    // Match and verify we get bindings
-    let results = pattern.match_uop(&where_abc);
-
-    // Should have 6 results (3! permutations), but we only need to check that at least one matches
-    // with the correct bindings
-    assert!(!results.is_empty(), "Permute pattern should match Where(a, b, c)");
-
-    // Verify at least one result has all three bindings
-    let has_all_bindings = results
-        .iter()
-        .any(|bindings| bindings.contains_key("a") && bindings.contains_key("b") && bindings.contains_key("c"));
-    assert!(has_all_bindings, "Should have bindings for a, b, c");
-}
+// NOTE: Tests for deprecated UPat API (test_or_casted_method, test_or_detach_method,
+// test_binary_commutative_pattern, test_permute_pattern_with_three_sources) were removed
+// during migration to TypedPatternMatcher infrastructure.
 
 #[test]
 fn test_struct_field_extraction() {
@@ -616,7 +477,7 @@ fn test_struct_field_extraction() {
     // Create pattern that matches Cast where dtype matches a specific value
     let matcher = patterns! {
         // Match Cast(x) where dtype is Float32, rewrite to x
-        Cast { src: x, dtype } if dtype == DType::Float32 ~> x
+        Cast { src: x, dtype } if *dtype == DType::Float32 ~> x
     };
 
     // Create an Int32 constant
@@ -679,7 +540,7 @@ fn test_nested_struct_pattern() {
     // Test nested struct patterns: Cast { src: Cast { src: x, .. }, dtype }
     // This matches a cast of a cast and extracts the innermost source
     let matcher = patterns! {
-        Cast { src: Cast { src: x, .. }, dtype } if dtype == DType::Float32 ~> x
+        Cast { src: Cast { src: x, .. }, dtype } if *dtype == DType::Float32 ~> x
     };
 
     // Create an Int32 constant
@@ -1057,7 +918,7 @@ fn test_const_with_value_extraction_fallible() {
     // Test ConstValue extraction with fallible pattern
     let matcher = patterns! {
         // Use cv in fallible expression with ?
-        Neg(c@const(cv)) => cv.cast(&DType::Float32).map(|casted| UOp::const_(DType::Float32, casted))
+        Neg(_c@const(cv)) => cv.cast(&DType::Float32).map(|casted| UOp::const_(DType::Float32, casted))
     };
 
     let c = UOp::native_const(42i32);
@@ -1303,47 +1164,7 @@ fn test_index_gate_bare_binding() {
     }
 }
 
-#[test]
-fn test_prefix_matching_minimum_children() {
-    use crate::pattern::upat::{OpFilter, SrcPattern};
-    use morok_ir::types::{AddrSpace, BufferizeOpts};
-    use std::mem::discriminant;
-
-    // Test that prefix matching enforces minimum children requirement
-    // A pattern requiring 2 sources should NOT match an op with only 1 source
-
-    // Create a pattern that explicitly requires 2 sources (compute + at least 1 range)
-    // by using a Tuple with 2 patterns
-    let pattern = UPat::Match {
-        op: Some(vec![OpFilter::Discriminant(discriminant(&Op::Bufferize {
-            compute: UOp::noop(),
-            ranges: smallvec::smallvec![],
-            opts: morok_ir::BufferizeOpts::local(),
-        }))]),
-        dtype: None,
-        src: Some(SrcPattern::Tuple(vec![UPat::cvar("c"), UPat::var("r")])), // Requires compute + 1 range
-        arg: None,
-        name: None,
-    };
-
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
-    let const_val = UOp::native_const(42.0f32);
-    let range1 = UOp::range(UOp::index_const(10), 0);
-
-    // Test with 0 ranges - the pattern requires at least 2 children (compute + range)
-    // Bufferize with 0 ranges has only 1 child (compute)
-    let buf0 = UOp::bufferize(const_val.clone(), vec![], opts.clone());
-    let results = pattern.match_uop(&buf0);
-    assert!(results.is_empty(), "Pattern requiring 2 sources should NOT match Bufferize with 0 ranges");
-
-    // Test with 1 range - should match (minimum satisfied: compute + range = 2 sources)
-    let buf1 = UOp::bufferize(const_val.clone(), vec![range1.clone()], opts);
-    let results = pattern.match_uop(&buf1);
-    assert!(!results.is_empty(), "Pattern requiring 2 sources should match Bufferize with 1 range");
-
-    // Verify binding
-    assert!(results.iter().any(|b| b.contains_key("c") && b.contains_key("r")));
-}
+// NOTE: test_prefix_matching_minimum_children was removed - it tested deprecated UPat API
 
 #[test]
 fn test_tuple_prefix_semantics_vs_exact() {
@@ -1386,7 +1207,7 @@ fn test_tuple_prefix_semantics_vs_exact() {
 fn test_alternative_patterns_basic() {
     // Test (Add | Mul) alternative matching
     let matcher = patterns! {
-        (Add(x, y) | Mul(x, y)) ~> x
+        (Add(x, _y) | Mul(x, _y)) ~> x
     };
 
     let a = UOp::native_const(5i32);
@@ -1451,7 +1272,7 @@ fn test_alternative_patterns_op_shorthand() {
 fn test_alternative_patterns_grouped() {
     // Test simpler alternative: both branches have same structure
     let matcher = patterns! {
-        (Add(x, y) | Mul(x, y)) ~> x
+        (Add(x, _y) | Mul(x, _y)) ~> x
     };
 
     let a = UOp::native_const(5i32);
@@ -1514,40 +1335,7 @@ fn test_alternative_patterns_with_special_const() {
     }
 }
 
-// ===== Direct API Tests (to isolate codegen vs runtime issues) =====
-
-#[test]
-fn test_upat_any_direct_api() {
-    // Test UPat::any() directly without using the patterns! macro
-    // This isolates whether the issue is in codegen or runtime
-    use crate::pattern::UPat;
-
-    // Build: UPat::any([Add(x, zero), Add(x, one)])
-    let pattern = UPat::any(vec![
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::zero_const("__zero")]),
-        UPat::binary(vec![BinaryOp::Add], vec![UPat::var("x"), UPat::one_const("__one")]),
-    ]);
-
-    let x = UOp::native_const(42i32);
-    let zero = UOp::native_const(0i32);
-    let one = UOp::native_const(1i32);
-    let two = UOp::native_const(2i32);
-
-    // Add(x, 0) should match the first alternative
-    let add0 = binary(BinaryOp::Add, x.clone(), zero);
-    let matches0 = pattern.match_uop(&add0);
-    assert!(!matches0.is_empty(), "Add(x, 0) should match UPat::any (direct API)");
-
-    // Add(x, 1) should match the second alternative
-    let add1 = binary(BinaryOp::Add, x.clone(), one);
-    let matches1 = pattern.match_uop(&add1);
-    assert!(!matches1.is_empty(), "Add(x, 1) should match UPat::any (direct API)");
-
-    // Add(x, 2) should NOT match
-    let add2 = binary(BinaryOp::Add, x.clone(), two);
-    let matches2 = pattern.match_uop(&add2);
-    assert!(matches2.is_empty(), "Add(x, 2) should NOT match UPat::any (direct API)");
-}
+// NOTE: test_upat_any_direct_api was removed - it tested deprecated UPat API
 
 // ===== Permutation Patterns (bracket syntax) Tests =====
 
@@ -1629,20 +1417,7 @@ fn test_copy_struct_pattern() {
     }
 }
 
-#[test]
-fn test_copy_f_copy_helper() {
-    use morok_device::DeviceSpec;
-
-    // Test f_copy() helper function for chaining
-    let pattern = UPat::cvar("c").f_copy();
-
-    let const_val = UOp::native_const(42.0f32);
-    let copy_op = const_val.copy_to_device(DeviceSpec::Cuda { device_id: 0 });
-
-    let results = pattern.match_uop(&copy_op);
-    assert!(!results.is_empty(), "f_copy() should match COPY operation");
-    assert!(results.iter().any(|b| b.contains_key("c")), "Should bind 'c' to the source");
-}
+// NOTE: test_copy_f_copy_helper was removed - it tested deprecated UPat API
 
 /// Test context type for `@context` DSL feature.
 #[derive(Default)]
@@ -1764,4 +1539,70 @@ fn test_context_pattern_composition() {
     let result2 = combined.rewrite(&mul_one, &mut ctx);
     assert!(matches!(result2, RewriteResult::Rewritten(_)));
     assert_eq!(ctx.counter, 3); // Mul pattern increments twice (1 + 2 = 3)
+}
+
+#[test]
+fn test_commutative_pattern_with_special_zero() {
+    // Test Add[x, @zero] commutative pattern - should match both orderings
+    let matcher = patterns! {
+        Add[x, @zero] ~> x
+    };
+
+    let x = UOp::var("a", morok_dtype::DType::Int32, 0, i64::MAX);
+    let zero = UOp::native_const(0i32);
+
+    // Add(x, 0) should match
+    let add_x_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
+    match matcher.rewrite(&add_x_zero, &mut ()) {
+        RewriteResult::Rewritten(r) => {
+            assert!(Arc::ptr_eq(&r, &x), "Add(x, 0) should rewrite to x");
+        }
+        _ => panic!("Add[x, @zero] should match Add(x, 0)"),
+    }
+
+    // Add(0, x) should also match (commutative)
+    let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
+    match matcher.rewrite(&add_zero_x, &mut ()) {
+        RewriteResult::Rewritten(r) => {
+            assert!(Arc::ptr_eq(&r, &x), "Add(0, x) should rewrite to x");
+        }
+        _ => panic!("Add[x, @zero] should match Add(0, x) via commutativity"),
+    }
+}
+
+#[test]
+fn test_commutative_pattern_with_graph_rewrite() {
+    use crate::rewrite::graph_rewrite;
+
+    // Test Add[x, @zero] with graph_rewrite - like the failing property test
+    let matcher = patterns! {
+        Add[x, @zero] ~> x
+    };
+
+    let x = UOp::var("a", morok_dtype::DType::Int32, 0, i64::MAX);
+    let zero = UOp::native_const(0i32);
+
+    // Add(0, x) via graph_rewrite
+    let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
+    let result = graph_rewrite(&matcher, add_zero_x, &mut ());
+
+    assert!(Arc::ptr_eq(&result, &x), "graph_rewrite(Add(0, x)) should simplify to x");
+}
+
+#[test]
+fn test_symbolic_simple_add_zero() {
+    use crate::rewrite::graph_rewrite;
+    use crate::symbolic::patterns::{constant_folding_dsl_patterns, identity_and_zero_patterns};
+
+    // Test combining two matchers
+    let matcher = constant_folding_dsl_patterns() + identity_and_zero_patterns();
+
+    let x = UOp::var("a", morok_dtype::DType::Int32, 0, i64::MAX);
+    let zero = UOp::native_const(0i32);
+
+    // Add(0, x) via graph_rewrite with combined patterns
+    let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
+    let result = graph_rewrite(&matcher, add_zero_x, &mut ());
+
+    assert!(Arc::ptr_eq(&result, &x), "combined patterns + graph_rewrite(Add(0, x)) should simplify to x");
 }

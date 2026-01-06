@@ -5,6 +5,7 @@ pub mod const_cast;
 pub mod control;
 pub mod memory;
 pub mod movement;
+pub mod pattern;
 pub mod reduction;
 pub mod shape;
 pub mod sint;

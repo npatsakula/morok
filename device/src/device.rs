@@ -208,7 +208,7 @@ pub trait Renderer: Send + Sync {
     /// Returns `None`, meaning no decomposition is needed (backend supports all ops).
     /// Backends that don't support certain operations (e.g., transcendentals on
     /// Cranelift) should override this to return appropriate patterns.
-    fn decompositor(&self) -> Option<morok_ir::pattern::PatternMatcher<()>> {
+    fn decompositor(&self) -> Option<morok_ir::pattern::TypedPatternMatcher<()>> {
         None
     }
 }

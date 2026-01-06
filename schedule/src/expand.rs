@@ -31,8 +31,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_dtype::DType;
+use morok_ir::AxisType;
 use morok_ir::prelude::*;
-use morok_ir::{AxisType, PatternMatcher};
+
+use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
 
 // ============================================================================
@@ -135,19 +137,19 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
 
 /// Phase 1: Convert Range(Unroll/Upcast) → UNROLL ops with constant vectors.
 ///
-/// Tinygrad pattern (expander.py:143-147):
-/// ```python
+/// Tinygrad pattern (expander.py:143-147, Python syntax):
+/// ```text
 /// (UPat(Ops.RANGE, name="r"),
 ///  lambda r: UOp(Ops.UNROLL, r.dtype, (UOp.const(r.dtype.vec(s), tuple(range(s))),), ((r.arg[0],s),))
 ///  if r.arg[1] in {AxisType.UNROLL, AxisType.UPCAST} else None)
 /// ```
 ///
-fn phase1_range_to_unroll() -> PatternMatcher {
+fn phase1_range_to_unroll() -> TypedPatternMatcher {
     crate::patterns! {
         // Convert Range(Unroll) to UNROLL op with constant vector
         // NOTE: Range(Upcast) is NOT converted here - it's preserved for fix_reduce_unroll
         // to detect and set Vector dtype for K-vectorization. It gets converted in Phase 2.
-        range if matches!(range.op(), Op::Range { axis_type: AxisType::Unroll, .. }) => {
+        range if matches!(range.op(), Op::Range { axis_type: AxisType::Unroll, .. }) => |range| {
             convert_range_to_unroll(range)
         },
     }
@@ -155,8 +157,8 @@ fn phase1_range_to_unroll() -> PatternMatcher {
 
 /// Phase 2: Fix REDUCE/STORE and expand all operations using UNROLL.
 ///
-/// Based on Tinygrad's expander PatternMatcher (expander.py:84-108).
-fn phase2_expand() -> PatternMatcher {
+/// Based on Tinygrad's expander TypedPatternMatcher (expander.py:84-108).
+fn phase2_expand() -> TypedPatternMatcher {
     // Pattern order MUST match Tinygrad's pm_pre_expander + expander order:
     // 1. convert_range_to_unroll (Range → UNROLL)
     // 2. fix_reduce_unroll (REDUCE with UNROLL → CONTRACT(REDUCE))
@@ -173,7 +175,7 @@ fn phase2_expand() -> PatternMatcher {
 
         // Convert Range(Upcast) or Range(Unroll) to UNROLL op
         // This runs FIRST so that UNROLL is available for subsequent patterns
-        range if matches!(range.op(), Op::Range { axis_type: AxisType::Upcast | AxisType::Unroll, .. }) => {
+        range if matches!(range.op(), Op::Range { axis_type: AxisType::Upcast | AxisType::Unroll, .. }) => |range| {
             convert_range_to_unroll(range)
         },
 
@@ -183,22 +185,22 @@ fn phase2_expand() -> PatternMatcher {
 
         // Fix REDUCE with non-Range entries in ranges
         // This detects Upcast axes and sets Vector dtype for K-vectorization
-        reduce @ Reduce(_, ..) => fix_reduce_unroll(reduce),
+        reduce @ Reduce(_, ..) => |reduce| fix_reduce_unroll(reduce),
 
         // Fix STORE with UNROLL in ranges/index - wrap in CONTRACT
         // MUST run BEFORE do_expand! Tinygrad's fix_store_unroll is in pm_pre_expander.
-        store if matches!(store.op(), Op::Store { .. }) => fix_store_unroll(store),
-        store if matches!(store.op(), Op::StoreGated { .. }) => fix_store_unroll(store),
+        store if matches!(store.op(), Op::Store { .. }) => |store| fix_store_unroll(store),
+        store if matches!(store.op(), Op::StoreGated { .. }) => |store| fix_store_unroll(store),
 
         // Handle END with UNROLL ranges
-        end @ End(_, ..) => end_unrolls(end),
+        end @ End(_, ..) => |end| end_unrolls(end),
 
         // =====================================================================
         // Phase 2c: Lift UNROLL out of Binary for proper propagation
         // =====================================================================
         // Must run BEFORE do_expand so parent ops see UNROLL as direct source.
         // Converts Binary(op, X, UNROLL) → UNROLL(Binary(op, X, unwrap))
-        binary if is_binary_with_single_unroll(binary) => lift_unroll_from_binary(binary),
+        binary if is_binary_with_single_unroll(binary) => |binary| lift_unroll_from_binary(binary),
 
         // =====================================================================
         // Phase 2d: Core expansion (expander patterns)
@@ -206,20 +208,20 @@ fn phase2_expand() -> PatternMatcher {
 
         // Main expansion: ALL expandable ops with UNROLL inputs
         // Uses is_expandable() check and range_ending_src_index() for proper range handling.
-        op if op.op().is_expandable() && has_unroll_input(op) => do_expand(op),
+        op if op.op().is_expandable() && has_unroll_input(op) => |op| do_expand(op),
 
         // Contract UNROLL via GEP extraction
-        contract @ Contract(_, ..) => do_contract(contract),
+        contract @ Contract(_, ..) => |contract| do_contract(contract),
 
         // =====================================================================
         // Phase 2e: Cleanup
         // =====================================================================
 
         // Collapse nested UNROLL: UNROLL(UNROLL(x, inner), outer) → UNROLL(x, inner+outer)
-        outer @ Unroll(Unroll(_, ..), ..) => collapse_double_unroll(outer),
+        outer @ Unroll(Unroll(_, ..), ..) => |outer| collapse_double_unroll(outer),
 
         // Remove empty UNROLL: UNROLL(x, ()) → x
-        unroll @ Unroll(_, ..) => unwrap_empty_unroll(unroll),
+        unroll @ Unroll(_, ..) => |unroll| unwrap_empty_unroll(unroll),
     }
 }
 

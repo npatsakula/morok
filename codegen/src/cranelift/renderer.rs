@@ -129,7 +129,7 @@ impl crate::Renderer for CraneliftRenderer {
         "cranelift"
     }
 
-    fn decompositor(&self) -> Option<morok_ir::pattern::PatternMatcher<()>> {
+    fn decompositor(&self) -> Option<morok_ir::pattern::TypedPatternMatcher<()>> {
         // Cranelift doesn't have native transcendentals - use all decomposition patterns
         Some(morok_ir::decompositions::all_decomposition_patterns())
     }

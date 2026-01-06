@@ -20,8 +20,7 @@ use morok_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, Reduce
 use smallvec::SmallVec;
 use tracing::trace;
 
-use crate::pattern::UPat;
-use crate::pattern::matcher::{PatternMatcher, RewriteFn, RewriteResult};
+use crate::TypedPatternMatcher;
 
 // Re-export from indexing for backwards compatibility
 pub use super::indexing::{is_dead_axis, ranges_equal};
@@ -124,11 +123,11 @@ pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
 /// - CONTIGUOUS_BACKWARD removal (gradient computation marker no longer needed)
 /// - RESHAPE to scalar (empty shape) removal
 /// - RESHAPE on REDUCE removal (REDUCE output doesn't need reshaping)
-pub fn early_rewrites() -> PatternMatcher {
+pub fn early_rewrites() -> TypedPatternMatcher {
     crate::patterns! {
-        Detach(x) ~> x,
-        ContiguousBackward(x) ~> x,
-        x => {
+        Detach(x) ~> |x| x.clone(),
+        ContiguousBackward(x) ~> |x| x.clone(),
+        x => |x| {
             if let Op::Reshape { src, new_shape } = x.op() {
                 // RESHAPE to scalar - always remove
                 if is_scalar_shape(new_shape) {
@@ -150,25 +149,25 @@ pub fn early_rewrites() -> PatternMatcher {
 // ============================================================================
 
 /// Pattern matcher for removing movement ops after rangeify transformation.
-pub fn movement_op_removal() -> PatternMatcher<IndexingContext> {
+pub fn movement_op_removal() -> TypedPatternMatcher<IndexingContext> {
     crate::patterns! {
         @context IndexingContext;
-        x if x.op().is_movement() => remove_movement_op(x, ctx),
+        x if x.op().is_movement() => |x, ctx| remove_movement_op(x, ctx),
     }
 }
 
 /// Create patterns for applying rangeify transformation with IndexingContext.
-pub fn apply_rangeify_patterns() -> PatternMatcher<IndexingContext> {
+pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
     crate::patterns! {
         @context IndexingContext;
         // ReduceAxis conversion MUST come first - before bufferize wraps it
-        x if matches!(x.op(), Op::ReduceAxis { .. }) => convert_reduceaxis_with_context(x, ctx),
+        x if matches!(x.op(), Op::ReduceAxis { .. }) => |x, ctx| convert_reduceaxis_with_context(x, ctx),
         // Movement ops should NOT be processed by bufferize transform - they'll be removed
         // and their consumers will create proper BUFFERIZE + INDEX with correct ranges.
         // Processing movement ops here creates INDEX with their conflicted ranges, which
         // breaks range consistency when the movement op is later removed.
-        x if !x.op().is_movement() => apply_bufferize_transform(x, ctx),
-        x if x.op().is_movement() => remove_movement_op(x, ctx),
+        x if !x.op().is_movement() => |x, ctx| apply_bufferize_transform(x, ctx),
+        x if x.op().is_movement() => |x, ctx| remove_movement_op(x, ctx),
     }
 }
 
@@ -373,21 +372,21 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
 // ============================================================================
 
 /// Pattern matcher for buffer folding and constant propagation.
-pub fn buffer_folding() -> PatternMatcher {
+pub fn buffer_folding() -> TypedPatternMatcher {
     crate::patterns! {
-        Bufferize { compute: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
-        Index { buffer: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
-        Copy { src: c, .. } if matches!(c.op(), Op::Const(_)) ~> c,
+        Bufferize { compute: c, .. } if matches!(c.op(), Op::Const(_)) ~> |c| c.clone(),
+        Index { buffer: c, .. } if matches!(c.op(), Op::Const(_)) ~> |c| c.clone(),
+        Copy { src: c, .. } if matches!(c.op(), Op::Const(_)) ~> |c| c.clone(),
         Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
-            if ranges_equal(&ranges, &indices) ~> compute,
+            if ranges_equal(ranges, indices) ~> |compute| compute.clone(),
     }
 }
 
 /// Pattern matcher for dead axis removal.
-pub fn dead_axis_removal() -> PatternMatcher {
+pub fn dead_axis_removal() -> TypedPatternMatcher {
     crate::patterns! {
-        buf if matches!(buf.op(), Op::Bufferize { .. }) => filter_dead_bufferize(buf),
-        idx if matches!(idx.op(), Op::Index { .. }) => adjust_index_for_dead_axes(idx),
+        buf if matches!(buf.op(), Op::Bufferize { .. }) => |buf| filter_dead_bufferize(buf),
+        idx if matches!(idx.op(), Op::Index { .. }) => |idx| adjust_index_for_dead_axes(idx),
     }
 }
 
@@ -447,27 +446,27 @@ fn adjust_index_for_dead_axes(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 ///
 /// Unary ops in reduce context are NOT inlined to avoid recomputing N times
 /// inside the reduction loop (e.g., argmax(-x) needs to compute -x once, not per element).
-pub fn buffer_removal() -> PatternMatcher {
+pub fn buffer_removal() -> TypedPatternMatcher {
     crate::patterns! {
         // Unary in REDUCE context must NOT be inlined - check FIRST
-        buf if unary_in_reduce_context_bufferize(buf) => block_reduce_unary_inline(buf),
+        buf if unary_in_reduce_context_bufferize(buf) => |buf| block_reduce_unary_inline(buf),
         // Other cheap ops (including non-reduce Unary) can inline
-        Bufferize { compute, .. } if is_cheap_to_inline(compute.op()) ~> compute,
-        Bufferize { compute, .. } if is_always_run_op(compute.op()) ~> compute,
+        Bufferize { compute, .. } if is_cheap_to_inline(compute.op()) ~> |compute| compute.clone(),
+        Bufferize { compute, .. } if is_always_run_op(compute.op()) ~> |compute| compute.clone(),
         Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
-            => Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
+            => |inner, ranges, opts| Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
     }
 }
 
 /// Pattern matcher for cost-based buffer removal with partial contiguous support.
-pub fn buffer_removal_with_pcontig() -> PatternMatcher<PcontigConfig> {
+pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
     crate::patterns! {
         @context PcontigConfig;
-        idx if matches!(idx.op(), Op::Index { .. }) => apply_pcontig_removal(idx, ctx),
-        buf if ctx.level > 0 && matches!(buf.op(), Op::Bufferize { .. }) => remove_cheap_bufferize(buf),
-        buf if ctx.level > 0 && matches!(buf.op(), Op::Bufferize { .. }) => remove_always_run_bufferize(buf),
+        idx if matches!(idx.op(), Op::Index { .. }) => |idx, ctx| apply_pcontig_removal(idx, ctx),
+        buf if ctx.level > 0 && matches!(buf.op(), Op::Bufferize { .. }) => |buf| remove_cheap_bufferize(buf),
+        buf if ctx.level > 0 && matches!(buf.op(), Op::Bufferize { .. }) => |buf| remove_always_run_bufferize(buf),
         Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
-            => Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
+            => |inner, ranges, opts| Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
     }
 }
 
@@ -566,19 +565,19 @@ fn apply_pcontig_removal(idx: &Arc<UOp>, config: &mut PcontigConfig) -> Option<A
 
 /// Pattern matcher for splitting large ReduceAxis operations.
 /// Must run BEFORE ReduceAxis → REDUCE conversion (Step 2.5).
-pub fn split_reduceop_patterns() -> PatternMatcher<SplitReduceOpConfig> {
+pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
     crate::patterns! {
         @context SplitReduceOpConfig;
-        reduce if matches!(reduce.op(), Op::ReduceAxis { .. }) => split_reduceop(reduce, ctx),
+        reduce if matches!(reduce.op(), Op::ReduceAxis { .. }) => |reduce, ctx| split_reduceop(reduce, ctx),
     }
 }
 
 /// Pattern matcher for reduction simplifications (reduce_unparented, reduce_collapse).
 /// Must run AFTER ReduceAxis → REDUCE conversion (Step 7) because these match Op::Reduce.
-pub fn reduction_simplify_patterns() -> PatternMatcher {
+pub fn reduction_simplify_patterns() -> TypedPatternMatcher {
     crate::patterns! {
-        x => reduce_unparented(x),
-        x => super::transforms::reduce_collapse(x),
+        x => |x| reduce_unparented(x),
+        x => |x| super::transforms::reduce_collapse(x),
     }
 }
 
@@ -587,15 +586,15 @@ pub fn reduction_simplify_patterns() -> PatternMatcher {
 // ============================================================================
 
 /// Create pattern matcher for pushing movement ops through INDEX operations.
-pub fn movement_op_patterns() -> PatternMatcher {
+pub fn movement_op_patterns() -> TypedPatternMatcher {
     crate::patterns! {
-        Index { buffer: mop, indices, gate } if mop.op().is_movement() => {
-            transform_movement_through_index(mop, &indices, &gate)
-        }
+        Index { buffer: mop, indices, gate } if mop.op().is_movement() => |mop, indices, gate| {
+            transform_movement_through_index(mop, indices, gate)
+        },
         Index { buffer: inner_idx, indices, gate: None }
-            if matches!(inner_idx.op(), morok_ir::Op::Index { .. }) => {
-            flatten_nested_index(inner_idx, &indices)
-        }
+            if matches!(inner_idx.op(), morok_ir::Op::Index { .. }) => |inner_idx, indices| {
+            flatten_nested_index(inner_idx, indices)
+        },
     }
 }
 
@@ -719,12 +718,12 @@ pub fn flatten_cascaded_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Note: Multi-index INDEX ops are preserved through the pipeline and
 /// linearized at codegen time (not here). This aligns with Tinygrad's
 /// architecture and prevents Binary(Range*stride) expressions in the IR.
-pub fn rangeify_codegen_patterns() -> PatternMatcher<()> {
+pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        noop if matches!(noop.op(), Op::Noop) => remove_noop(noop),
-        cont if matches!(cont.op(), Op::Contiguous { .. }) => get_contiguous(cont),
-        after if matches!(after.op(), Op::After { .. }) => fix_after_broadcast(after),
-        idx if is_cascaded_index(idx) => flatten_cascaded_index(idx),
+        noop if matches!(noop.op(), Op::Noop) => |noop| remove_noop(noop),
+        cont if matches!(cont.op(), Op::Contiguous { .. }) => |cont| get_contiguous(cont),
+        after if matches!(after.op(), Op::After { .. }) => |after| fix_after_broadcast(after),
+        idx if is_cascaded_index(idx) => |idx| flatten_cascaded_index(idx),
     }
 }
 
@@ -733,7 +732,7 @@ pub fn rangeify_codegen_patterns() -> PatternMatcher<()> {
 /// Note: linearize_index was removed - multi-index INDEX ops are now linearized
 /// at codegen time to align with Tinygrad's architecture. This prevents creating
 /// Binary(Range*stride) expressions in the IR that would be incorrectly vectorized.
-pub fn post_expand_patterns() -> PatternMatcher<()> {
+pub fn post_expand_patterns() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Empty - linearization now happens at codegen time
     }
@@ -880,17 +879,17 @@ pub fn remove_zero_range(range: &Arc<UOp>, _ctx: &mut KernelContext) -> Option<A
 }
 
 /// Create patterns for to_define_global transformation.
-pub fn to_define_global_patterns() -> PatternMatcher<KernelContext> {
+pub fn to_define_global_patterns() -> TypedPatternMatcher<KernelContext> {
     crate::patterns! {
         @context KernelContext;
-        buf if matches!(buf.op(), Op::Buffer { .. }) => debuf(buf, ctx),
-        b if matches!(b.op(), Op::Bind { .. }) => unbind_kernel(b, ctx),
-        after if matches!(after.op(), Op::After { .. }) => handle_after(after, ctx),
-        c if matches!(c.op(), Op::Const(_) | Op::DefineVar { .. }) => cleanup_const(c, ctx),
-        r if matches!(r.op(), Op::Range { .. }) => remove_zero_range(r, ctx),
-        r if matches!(r.op(), Op::Range { .. }) => renumber_range(r, ctx),
+        buf if matches!(buf.op(), Op::Buffer { .. }) => |buf, ctx| debuf(buf, ctx),
+        b if matches!(b.op(), Op::Bind { .. }) => |b, ctx| unbind_kernel(b, ctx),
+        after if matches!(after.op(), Op::After { .. }) => |after, ctx| handle_after(after, ctx),
+        c if matches!(c.op(), Op::Const(_) | Op::DefineVar { .. }) => |c, ctx| cleanup_const(c, ctx),
+        r if matches!(r.op(), Op::Range { .. }) => |r, ctx| remove_zero_range(r, ctx),
+        r if matches!(r.op(), Op::Range { .. }) => |r, ctx| renumber_range(r, ctx),
         // Replace KERNEL references with their output buffer
-        k if matches!(k.op(), Op::Kernel { .. }) => replace_kernel_with_buffer(k, ctx),
+        k if matches!(k.op(), Op::Kernel { .. }) => |k, ctx| replace_kernel_with_buffer(k, ctx),
     }
 }
 
@@ -965,100 +964,93 @@ pub fn extract_device_from_graph(root: &Arc<UOp>) -> Option<DeviceSpec> {
 }
 
 /// Create pattern matcher for buffer limit enforcement.
-pub fn buffer_limit_patterns(max_buffers: usize) -> PatternMatcher {
+pub fn buffer_limit_patterns(max_buffers: usize) -> TypedPatternMatcher {
     use super::kernel::collect_accessed_buffers;
-    use crate::pattern::{BindingStore, BindingStoreExt, VarIntern};
+    use morok_ir::pattern::RewriteResult;
 
-    let mut patterns = vec![];
+    let mut matcher = TypedPatternMatcher::new();
 
     let limit = max_buffers;
-    patterns.push((
-        UPat::var("op"),
-        Box::new(move |bindings: &BindingStore, intern: &VarIntern, _ctx: &mut ()| {
-            let Some(op) = intern.get_index("op").and_then(|i| bindings.get_by_index(i)) else {
-                return RewriteResult::NoMatch;
-            };
+    matcher.add_wildcard(move |op: &Arc<UOp>, _ctx: &mut ()| {
+        let sources = match op.op() {
+            Op::Binary(_, left, right) => vec![left.clone(), right.clone()],
+            Op::Ternary(_, cond, true_val, false_val) => {
+                vec![cond.clone(), true_val.clone(), false_val.clone()]
+            }
+            _ => return RewriteResult::NoMatch,
+        };
 
-            let sources = match op.op() {
-                Op::Binary(_, left, right) => vec![left.clone(), right.clone()],
-                Op::Ternary(_, cond, true_val, false_val) => {
-                    vec![cond.clone(), true_val.clone(), false_val.clone()]
-                }
-                _ => return RewriteResult::NoMatch,
-            };
+        let mut all_buffers = Vec::new();
+        for src in &sources {
+            all_buffers.extend(collect_accessed_buffers(src));
+        }
 
-            let mut all_buffers = Vec::new();
+        #[allow(clippy::mutable_key_type)]
+        let mut seen = HashSet::new();
+        all_buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
+
+        if all_buffers.len() > limit.saturating_sub(1) {
+            let mut new_sources = Vec::new();
+            let mut any_changed = false;
+
             for src in &sources {
-                all_buffers.extend(collect_accessed_buffers(src));
+                let new_src = if is_elementwise(src) { force_bufferize(src) } else { Arc::clone(src) };
+
+                if !Arc::ptr_eq(&new_src, src) {
+                    any_changed = true;
+                }
+                new_sources.push(new_src);
             }
 
-            #[allow(clippy::mutable_key_type)]
-            let mut seen = HashSet::new();
-            all_buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
-
-            if all_buffers.len() > limit.saturating_sub(1) {
-                let mut new_sources = Vec::new();
-                let mut any_changed = false;
-
-                for src in &sources {
-                    let new_src = if is_elementwise(src) { force_bufferize(src) } else { Arc::clone(src) };
-
-                    if !Arc::ptr_eq(&new_src, src) {
-                        any_changed = true;
-                    }
-                    new_sources.push(new_src);
-                }
-
-                if any_changed {
-                    let rewritten = match op.op() {
-                        Op::Binary(bin_op, _, _) => {
-                            let lhs = &new_sources[0];
-                            let rhs = &new_sources[1];
-                            match bin_op {
-                                morok_ir::BinaryOp::Add => lhs.try_add(rhs),
-                                morok_ir::BinaryOp::Sub => lhs.try_sub(rhs),
-                                morok_ir::BinaryOp::Mul => lhs.try_mul(rhs),
-                                morok_ir::BinaryOp::Idiv => lhs.try_div(rhs),
-                                morok_ir::BinaryOp::Fdiv => lhs.try_div(rhs),
-                                morok_ir::BinaryOp::Mod => lhs.try_mod(rhs),
-                                morok_ir::BinaryOp::And => lhs.try_and_op(rhs),
-                                morok_ir::BinaryOp::Or => lhs.try_or_op(rhs),
-                                morok_ir::BinaryOp::Xor => lhs.try_xor_op(rhs),
-                                morok_ir::BinaryOp::Lt => lhs.try_cmplt(rhs),
-                                morok_ir::BinaryOp::Le => lhs.try_cmple(rhs),
-                                morok_ir::BinaryOp::Eq => lhs.try_cmpeq(rhs),
-                                morok_ir::BinaryOp::Ne => lhs.try_cmpne(rhs),
-                                morok_ir::BinaryOp::Gt => lhs.try_cmpgt(rhs),
-                                morok_ir::BinaryOp::Ge => lhs.try_cmpge(rhs),
-                                morok_ir::BinaryOp::Max => lhs.try_max(rhs),
-                                morok_ir::BinaryOp::Pow => lhs.try_pow(rhs),
-                                morok_ir::BinaryOp::Shl | morok_ir::BinaryOp::Shr | morok_ir::BinaryOp::Threefry => {
-                                    Ok(UOp::new(Op::Binary(*bin_op, lhs.clone(), rhs.clone()), op.dtype()))
-                                }
+            if any_changed {
+                let rewritten = match op.op() {
+                    Op::Binary(bin_op, _, _) => {
+                        let lhs = &new_sources[0];
+                        let rhs = &new_sources[1];
+                        match bin_op {
+                            morok_ir::BinaryOp::Add => lhs.try_add(rhs),
+                            morok_ir::BinaryOp::Sub => lhs.try_sub(rhs),
+                            morok_ir::BinaryOp::Mul => lhs.try_mul(rhs),
+                            morok_ir::BinaryOp::Idiv => lhs.try_div(rhs),
+                            morok_ir::BinaryOp::Fdiv => lhs.try_div(rhs),
+                            morok_ir::BinaryOp::Mod => lhs.try_mod(rhs),
+                            morok_ir::BinaryOp::And => lhs.try_and_op(rhs),
+                            morok_ir::BinaryOp::Or => lhs.try_or_op(rhs),
+                            morok_ir::BinaryOp::Xor => lhs.try_xor_op(rhs),
+                            morok_ir::BinaryOp::Lt => lhs.try_cmplt(rhs),
+                            morok_ir::BinaryOp::Le => lhs.try_cmple(rhs),
+                            morok_ir::BinaryOp::Eq => lhs.try_cmpeq(rhs),
+                            morok_ir::BinaryOp::Ne => lhs.try_cmpne(rhs),
+                            morok_ir::BinaryOp::Gt => lhs.try_cmpgt(rhs),
+                            morok_ir::BinaryOp::Ge => lhs.try_cmpge(rhs),
+                            morok_ir::BinaryOp::Max => lhs.try_max(rhs),
+                            morok_ir::BinaryOp::Pow => lhs.try_pow(rhs),
+                            morok_ir::BinaryOp::Shl | morok_ir::BinaryOp::Shr | morok_ir::BinaryOp::Threefry => {
+                                Ok(UOp::new(Op::Binary(*bin_op, lhs.clone(), rhs.clone()), op.dtype()))
                             }
-                            .expect("Binary op reconstruction should succeed")
                         }
-                        Op::Ternary(tern_op, _, _, _) => match tern_op {
-                            morok_ir::TernaryOp::Where => {
-                                UOp::try_where(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
-                                    .unwrap()
-                            }
-                            morok_ir::TernaryOp::MulAcc => {
-                                UOp::try_mulacc(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
-                                    .expect("MulAcc reconstruction should succeed")
-                            }
-                        },
-                        _ => unreachable!(),
-                    };
-                    return RewriteResult::Rewritten(rewritten);
-                }
+                        .expect("Binary op reconstruction should succeed")
+                    }
+                    Op::Ternary(tern_op, _, _, _) => match tern_op {
+                        morok_ir::TernaryOp::Where => {
+                            UOp::try_where(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
+                                .unwrap()
+                        }
+                        morok_ir::TernaryOp::MulAcc => {
+                            UOp::try_mulacc(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
+                                .expect("MulAcc reconstruction should succeed")
+                        }
+                    },
+                    _ => unreachable!(),
+                };
+                return RewriteResult::Rewritten(rewritten);
             }
+        }
 
-            RewriteResult::NoMatch
-        }) as RewriteFn<()>,
-    ));
+        RewriteResult::NoMatch
+    });
 
-    PatternMatcher::new(patterns)
+    matcher
 }
 
 /// Force bufferization of a computation to GLOBAL memory.
@@ -1183,13 +1175,13 @@ fn reconstruct_unary(op: UnaryOp, src: Arc<UOp>) -> Option<Arc<UOp>> {
 /// This ensures that:
 /// - Binary/Unary/Ternary ops receive gathered data via explicit LOAD
 /// - STORE keeps raw INDEX for scatter operations
-pub fn pm_add_loads() -> PatternMatcher<()> {
+pub fn pm_add_loads() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // =====================================================================
         // Binary ops with INDEX on left: op(INDEX, y) → op(LOAD(buf, INDEX), y)
         // =====================================================================
         for op in binary [Add, Sub, Mul, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
-            op(idx, y) if matches!(idx.op(), Op::Index { .. }) => {
+            op(idx, y) if matches!(idx.op(), Op::Index { .. }) => |idx, y| {
                 let loaded = wrap_index_with_load(idx)?;
                 reconstruct_binary(op, loaded, y.clone())
             },
@@ -1199,7 +1191,7 @@ pub fn pm_add_loads() -> PatternMatcher<()> {
         // Binary ops with INDEX on right: op(x, INDEX) → op(x, LOAD(buf, INDEX))
         // =====================================================================
         for op in binary [Add, Sub, Mul, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
-            op(x, idx) if matches!(idx.op(), Op::Index { .. }) => {
+            op(x, idx) if matches!(idx.op(), Op::Index { .. }) => |x, idx| {
                 let loaded = wrap_index_with_load(idx)?;
                 reconstruct_binary(op, x.clone(), loaded)
             },
@@ -1209,7 +1201,7 @@ pub fn pm_add_loads() -> PatternMatcher<()> {
         // Unary ops: op(INDEX) → op(LOAD(buf, INDEX))
         // =====================================================================
         for op in unary [Neg, Not, Abs, Sqrt, Exp, Log, Sin, Cos, Exp2, Log2, Tan, Rsqrt, Reciprocal, Trunc] {
-            op(idx) if matches!(idx.op(), Op::Index { .. }) => {
+            op(idx) if matches!(idx.op(), Op::Index { .. }) => |idx| {
                 let loaded = wrap_index_with_load(idx)?;
                 reconstruct_unary(op, loaded)
             },
@@ -1218,15 +1210,15 @@ pub fn pm_add_loads() -> PatternMatcher<()> {
         // =====================================================================
         // Ternary ops - Where: wrap INDEX sources with LOAD
         // =====================================================================
-        Where(idx, t, f) if matches!(idx.op(), Op::Index { .. }) => {
+        Where(idx, t, f) if matches!(idx.op(), Op::Index { .. }) => |idx, t, f| {
             let loaded = wrap_index_with_load(idx)?;
             UOp::try_where(loaded, t.clone(), f.clone()).ok()
         },
-        Where(cond, idx, f) if matches!(idx.op(), Op::Index { .. }) => {
+        Where(cond, idx, f) if matches!(idx.op(), Op::Index { .. }) => |cond, idx, f| {
             let loaded = wrap_index_with_load(idx)?;
             UOp::try_where(cond.clone(), loaded, f.clone()).ok()
         },
-        Where(cond, t, idx) if matches!(idx.op(), Op::Index { .. }) => {
+        Where(cond, t, idx) if matches!(idx.op(), Op::Index { .. }) => |cond, t, idx| {
             let loaded = wrap_index_with_load(idx)?;
             UOp::try_where(cond.clone(), t.clone(), loaded).ok()
         },
@@ -1234,15 +1226,15 @@ pub fn pm_add_loads() -> PatternMatcher<()> {
         // =====================================================================
         // Ternary ops - MulAcc: wrap INDEX sources with LOAD
         // =====================================================================
-        MulAcc(idx, b, c) if matches!(idx.op(), Op::Index { .. }) => {
+        MulAcc(idx, b, c) if matches!(idx.op(), Op::Index { .. }) => |idx, b, c| {
             let loaded = wrap_index_with_load(idx)?;
             UOp::try_mulacc(loaded, b.clone(), c.clone()).ok()
         },
-        MulAcc(a, idx, c) if matches!(idx.op(), Op::Index { .. }) => {
+        MulAcc(a, idx, c) if matches!(idx.op(), Op::Index { .. }) => |a, idx, c| {
             let loaded = wrap_index_with_load(idx)?;
             UOp::try_mulacc(a.clone(), loaded, c.clone()).ok()
         },
-        MulAcc(a, b, idx) if matches!(idx.op(), Op::Index { .. }) => {
+        MulAcc(a, b, idx) if matches!(idx.op(), Op::Index { .. }) => |a, b, idx| {
             let loaded = wrap_index_with_load(idx)?;
             UOp::try_mulacc(a.clone(), b.clone(), loaded).ok()
         },
@@ -1250,7 +1242,7 @@ pub fn pm_add_loads() -> PatternMatcher<()> {
         // =====================================================================
         // REDUCE: wrap INDEX accumulator source with LOAD, preserve REDUCE dtype
         // =====================================================================
-        reduce if matches!(reduce.op(), Op::Reduce { .. }) => {
+        reduce if matches!(reduce.op(), Op::Reduce { .. }) => |reduce| {
             let Op::Reduce { src, ranges, reduce_op } = reduce.op() else { return None; };
             if !matches!(src.op(), Op::Index { .. }) { return None; }
             let loaded = wrap_index_with_load(src)?;
@@ -1266,7 +1258,7 @@ pub fn pm_add_loads() -> PatternMatcher<()> {
         // =====================================================================
         // Cast: wrap INDEX source with LOAD, propagate vector dtype
         // =====================================================================
-        Cast { src: idx, dtype } if matches!(idx.op(), Op::Index { .. }) => {
+        Cast { src: idx, dtype } if matches!(idx.op(), Op::Index { .. }) => |idx, dtype| {
             let loaded = wrap_index_with_load(idx)?;
             // If LOAD has vector dtype, Cast output should also be vector
             let output_dtype = match loaded.dtype() {
@@ -1372,33 +1364,33 @@ fn devectorize_comparison(op: &BinaryOp, a: &Arc<UOp>, b: &Arc<UOp>) -> Option<A
 /// - NOT on bool vectors → scalar ops + VECTORIZE
 /// - Comparisons producing bool vectors → scalar comparisons + VECTORIZE
 /// - WHERE with vectorized condition → scalar WHERE + VECTORIZE
-pub fn pm_bool_devectorize() -> PatternMatcher<()> {
+pub fn pm_bool_devectorize() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Binary bool ops: And, Or, Xor, Max on vectorized bools
         // Max is created by horizontal_reduce for Max reductions
         // (Min uses Where(a < b, a, b), which is handled separately)
         for op in binary [And, Or, Xor, Max] {
-            op(a, b) if is_vectorized_bool(&a.dtype()) => {
+            op(a, b) if is_vectorized_bool(&a.dtype()) => |a, b| {
                 devectorize_binary_bool(&op, a, b)
             },
         },
 
         // Unary bool ops: Not on vectorized bools
-        Not(src) if is_vectorized_bool(&src.dtype()) => {
+        Not(src) if is_vectorized_bool(&src.dtype()) => |src| {
             devectorize_unary_bool(&UnaryOp::Not, src)
         },
 
         // Comparison ops producing vectorized bools
         // Check both operands since scalar-vector comparisons also produce vector bools
         for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            op(a, b) if a.dtype().vcount() > 1 || b.dtype().vcount() > 1 => {
+            op(a, b) if a.dtype().vcount() > 1 || b.dtype().vcount() > 1 => |a, b| {
                 devectorize_comparison(&op, a, b)
             },
         },
 
         // WHERE with vectorized condition (from horizontal reduce's Min operation)
         // Based on Tinygrad's no_vectorized_alu (devectorizer.py:219-223)
-        Where(cond, t, f) if cond.dtype().vcount() > 1 => {
+        Where(cond, t, f) if cond.dtype().vcount() > 1 => |cond, t, f| {
             devectorize_where(cond, t, f)
         },
     }
@@ -1619,10 +1611,10 @@ fn needs_horizontal_reduce(reduce: &Arc<UOp>) -> bool {
 ///
 /// Transforms:
 /// - REDUCE(Max, <4 x bool> src, ranges) → REDUCE(Max, Max(Max(Max(e0,e1),e2),e3), ranges)
-pub fn pm_horizontal_reduce() -> PatternMatcher<()> {
+pub fn pm_horizontal_reduce() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Match REDUCE with vectorized source
-        reduce if needs_horizontal_reduce(reduce) => {
+        reduce if needs_horizontal_reduce(reduce) => |reduce| {
             transform_vectorized_reduce(reduce)
         },
     }
@@ -1729,9 +1721,9 @@ fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// each with a scalar bool accumulator, then wraps them in VECTORIZE.
 ///
 /// Must run BEFORE `pm_horizontal_reduce` to handle the matching-vcount case.
-pub fn pm_devectorize_bool_reduce() -> PatternMatcher<()> {
+pub fn pm_devectorize_bool_reduce() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        reduce if is_vectorized_bool_reduce(reduce) => devectorize_bool_reduce(reduce),
+        reduce if is_vectorized_bool_reduce(reduce) => |reduce| devectorize_bool_reduce(reduce),
     }
 }
 
@@ -1849,9 +1841,9 @@ fn tree_reduce(elements: &[Arc<UOp>], reduce_op: ReduceOp, dtype: &DType) -> Arc
 ///   → ((REDUCE(GEP(src,0), Add) + REDUCE(GEP(src,1), Add)) +
 ///     (REDUCE(GEP(src,2), Add) + REDUCE(GEP(src,3), Add)))
 /// ```
-pub fn pm_scalar_accumulators() -> PatternMatcher<()> {
+pub fn pm_scalar_accumulators() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        reduce if is_k_vectorized_reduce(reduce) => {
+        reduce if is_k_vectorized_reduce(reduce) => |reduce| {
             devectorize_to_scalar_accumulators(reduce)
         },
     }
@@ -1863,8 +1855,8 @@ pub fn pm_scalar_accumulators() -> PatternMatcher<()> {
 
 /// FMA pattern detection: a*b+c → MulAcc(a,b,c)
 ///
-/// Based on Tinygrad's decompositions.py:362:
-/// ```python
+/// Based on Tinygrad's decompositions.py:362 (Python syntax):
+/// ```text
 /// if Ops.MULACC in ops: pat += [
 ///     (UPat.var('a')*UPat.var('b')+UPat.var('c'),
 ///      lambda a,b,c: a.alu(Ops.MULACC, b, c))
@@ -1873,28 +1865,17 @@ pub fn pm_scalar_accumulators() -> PatternMatcher<()> {
 ///
 /// Applied late (post-optimization) so earlier passes can still work with Add(Mul) structure.
 /// Only matches float types where FMA provides benefit (maps to llvm.fma intrinsic).
-pub fn pm_fma_decomposition() -> PatternMatcher<()> {
+pub fn pm_fma_decomposition() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Pattern 1: (a*b)+c → MulAcc(a,b,c)
-        Add(Mul(a, b), c) if a.dtype().is_float() => {
+        Add(Mul(a, b), c) if a.dtype().is_float() => |a, b, c| {
             UOp::try_mulacc(a.clone(), b.clone(), c.clone()).ok()
         },
         // Pattern 2: c+(a*b) → MulAcc(a,b,c) (commutative)
-        Add(c, Mul(a, b)) if a.dtype().is_float() => {
+        Add(c, Mul(a, b)) if a.dtype().is_float() => |a, b, c| {
             UOp::try_mulacc(a.clone(), b.clone(), c.clone()).ok()
         },
     }
 }
 
 // ============================================================================
-// DEPRECATED PATTERNS (for backwards compatibility)
-// ============================================================================
-
-/// Pattern matcher for ReduceAxis → REDUCE conversion (deprecated).
-#[allow(dead_code)]
-pub fn reduceaxis_to_reduce_patterns() -> PatternMatcher<IndexingContext> {
-    crate::patterns! {
-        @context IndexingContext;
-        x => convert_reduceaxis_with_context(x, ctx),
-    }
-}

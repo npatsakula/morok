@@ -51,7 +51,7 @@ pub use types::{
 pub use uop::{IntoUOp, UOp, UOpKey};
 
 // Re-export pattern matching and rewriting infrastructure
-pub use pattern::{BindingStore, BindingStoreExt, PatternMatcher, UPat, VarIntern};
+pub use pattern::{Matcher, RewriteResult, TypedPatternMatcher};
 pub use rewrite::{graph_rewrite, graph_rewrite_bottom_up};
 
 // Re-export external types for convenience

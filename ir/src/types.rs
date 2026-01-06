@@ -194,6 +194,27 @@ impl ConstValue {
         }
     }
 
+    /// Try to extract an integer value (i64 or u64 as i64).
+    ///
+    /// Used for constant pattern matching with specific integer values.
+    pub const fn try_int(&self) -> Option<i64> {
+        match self {
+            Self::Int(v) => Some(*v),
+            Self::UInt(v) => Some(*v as i64),
+            _ => None,
+        }
+    }
+
+    /// Try to extract a float value (f64).
+    ///
+    /// Used for constant pattern matching with specific float values.
+    pub const fn try_float(&self) -> Option<f64> {
+        match self {
+            Self::Float(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     /// Truncate value to fit within dtype boundaries (two's complement wrapping).
     ///
     /// This is equivalent to Tinygrad's ctypes-based truncation. Used for constant
@@ -421,7 +442,7 @@ pub enum ReduceOp {
 /// Unary operation types.
 ///
 /// All unary operations preserve the input dtype.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames)]
 pub enum UnaryOp {
     /// Negation: -x
     Neg,
@@ -470,7 +491,7 @@ pub enum UnaryOp {
 /// Arithmetic operations (Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv) preserve the LHS dtype.
 /// Comparison operations (Lt, Eq, Ne) always return DType::Bool.
 /// Bitwise operations (And, Or, Xor, Shl, Shr) preserve dtype and require int/bool types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames)]
 pub enum BinaryOp {
     // Arithmetic operations
     /// Addition: a + b
@@ -571,7 +592,7 @@ impl BinaryOp {
 }
 
 /// Ternary operation types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames)]
 pub enum TernaryOp {
     /// Conditional selection: condition ? true_val : false_val
     Where,

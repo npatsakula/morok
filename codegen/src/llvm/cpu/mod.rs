@@ -246,7 +246,7 @@ impl<'ctx> Renderer for CpuLlvmRenderer<'ctx> {
         "llvm"
     }
 
-    fn decompositor(&self) -> Option<morok_ir::pattern::PatternMatcher<()>> {
+    fn decompositor(&self) -> Option<morok_ir::pattern::TypedPatternMatcher<()>> {
         None
     }
 }

@@ -286,11 +286,7 @@ impl DType {
     /// Useful for type conversions like bool→uint8 where the structure is preserved.
     pub fn with_base(&self, new_base: ScalarDType) -> Self {
         let count = self.vcount();
-        if count > 1 {
-            Self::Scalar(new_base).vec(count)
-        } else {
-            Self::Scalar(new_base)
-        }
+        if count > 1 { Self::Scalar(new_base).vec(count) } else { Self::Scalar(new_base) }
     }
 
     /// Get the vector count (1 for scalars).

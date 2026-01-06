@@ -38,7 +38,7 @@ pub use morok_ir::rewrite;
 
 // Re-export main types
 pub use linearize::{CFGContext, linearize};
-pub use morok_ir::pattern::{PatternMatcher, UPat};
+pub use morok_ir::pattern::{Matcher, RewriteResult, TypedPatternMatcher};
 pub use morok_ir::rewrite::graph_rewrite;
 pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, run_kernel_split_pipeline};
 
@@ -59,4 +59,4 @@ pub use optimizer::{
 pub use morok_ir::UOp;
 
 // Re-export the patterns! proc-macro
-pub use morok_schedule_macros::patterns;
+pub use morok_macros::patterns;

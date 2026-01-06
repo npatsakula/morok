@@ -349,7 +349,7 @@ pub fn should_remove_movement_op(x: &Arc<UOp>, ctx: &IndexingContext) -> bool {
 /// Apply buffer removal patterns while protecting SINK sources.
 fn apply_buffer_removal_protecting_sink(
     sink: &Arc<UOp>,
-    matcher: &crate::pattern::matcher::PatternMatcher<super::kernel::PcontigConfig>,
+    matcher: &crate::TypedPatternMatcher<super::kernel::PcontigConfig>,
     ctx: &mut super::kernel::PcontigConfig,
 ) -> Arc<UOp> {
     let Op::Sink { sources } = sink.op() else {

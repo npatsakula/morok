@@ -301,7 +301,7 @@ impl Renderer for CraneliftRendererWrapper {
         &self.device
     }
 
-    fn decompositor(&self) -> Option<morok_ir::pattern::PatternMatcher<()>> {
+    fn decompositor(&self) -> Option<morok_ir::pattern::TypedPatternMatcher<()>> {
         // Delegate to the codegen CraneliftRenderer
         let renderer = morok_codegen::cranelift::CraneliftRenderer::new();
         <morok_codegen::cranelift::CraneliftRenderer as morok_codegen::Renderer>::decompositor(&renderer)

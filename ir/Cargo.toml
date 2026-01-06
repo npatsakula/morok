@@ -6,7 +6,7 @@ edition.workspace = true
 
 [dependencies]
 morok-dtype = { path = "../dtype" }
-morok-schedule-macros = { path = "../schedule-macros" }
+morok-macros = { path = "../macros" }
 smallvec = { version = "1.15.1", features = [] }
 snafu = "0.8.9"
 itertools = "0.14.0"
