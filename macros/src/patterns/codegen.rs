@@ -307,7 +307,12 @@ fn collect_op_names_from_pattern(pattern: &Pattern, names: &mut std::collections
         // Constants, variables, wildcards, op variables don't have op names to validate
         // (OpVar uses iteration context which is separately validated)
         Pattern::Const(_) | Pattern::Var(_) | Pattern::OpVar { .. } |
-        Pattern::ConstWithValue { .. } | Pattern::Wildcard => {}
+        Pattern::ConstWithValue { .. } | Pattern::Wildcard |
+        Pattern::OptionNone => {}
+        // OptionSome has an inner pattern that may contain ops
+        Pattern::OptionSome(inner) => {
+            collect_op_names_from_pattern(inner, names);
+        }
     }
 }
 
@@ -428,6 +433,11 @@ fn compute_op_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<Tok
             let op_name = op.to_string();
             compute_op_key_for_op(&op_name)
         }
+
+        // Option patterns - these are for matching Option<T> fields, not top-level ops
+        // They act like wildcards at the top level (shouldn't be used as top-level patterns)
+        Pattern::OptionSome(inner) => compute_op_keys(inner, iter_ctx),
+        Pattern::OptionNone => vec![],
     }
 }
 
@@ -575,6 +585,43 @@ fn generate_inline_match(
 
         Pattern::OpPermute { op, args } => {
             generate_inline_commutative_match(op, args, tree_var, iter_ctx, dup_tracker)
+        }
+
+        Pattern::OptionNone => {
+            // Match Option::None - reject if value is Some
+            Ok(InlineMatchOutput {
+                match_code: quote! {
+                    if #tree_var.is_some() {
+                        return morok_ir::pattern::RewriteResult::NoMatch;
+                    }
+                },
+                bindings: vec![],
+                is_commutative: false,
+                alt_bindings: None,
+                child_match_code: None,
+                alt_child_match_code: None,
+            })
+        }
+
+        Pattern::OptionSome(inner) => {
+            // Match Option::Some and recursively match inner pattern
+            let inner_var = format_ident!("{}_some", tree_var);
+            let inner_match = generate_inline_match(inner, &inner_var, iter_ctx, dup_tracker)?;
+            let inner_code = &inner_match.match_code;
+
+            Ok(InlineMatchOutput {
+                match_code: quote! {
+                    let Some(#inner_var) = #tree_var else {
+                        return morok_ir::pattern::RewriteResult::NoMatch;
+                    };
+                    #inner_code
+                },
+                bindings: inner_match.bindings,
+                is_commutative: false,
+                alt_bindings: inner_match.alt_bindings,
+                child_match_code: inner_match.child_match_code,
+                alt_child_match_code: inner_match.alt_child_match_code,
+            })
         }
     }
 }
@@ -941,7 +988,8 @@ fn generate_inline_op_struct_match(
         fields.first().ok_or_else(|| Error::new_spanned(op, "Struct pattern must have at least one field"))?;
 
     let first_field_name = &first_field.name;
-    let first_var = format_ident!("__{}", first_field_name);
+    // Use tree_var prefix to avoid shadowing when patterns are nested
+    let first_var = format_ident!("{}_{}", tree_var, first_field_name);
 
     // Generate match for the struct
     let match_code = quote! {
@@ -962,33 +1010,49 @@ fn generate_inline_op_struct_match(
     };
 
     let mut bindings = first_match.bindings;
+    let mut additional_match_code = TokenStream2::new();
 
-    // Handle extractable fields (shorthand like `{ compute, ranges }`)
+    // Handle ALL remaining fields with their patterns
     for field in fields.iter().skip(1) {
-        if matches!(&field.pattern, Pattern::Var(var) if *var == field.name) {
-            let field_name = &field.name;
-            // Add binding for this field
-            bindings.push((
-                field_name.clone(),
-                quote! {
-                    {
-                        let morok_ir::Op::#op_ident { #field_name, .. } = #tree_var.op() else {
-                            unreachable!()
-                        };
-                        #field_name
-                    }
-                },
-            ));
+        let field_name = &field.name;
+
+        // Create a unique temp var for this field
+        let field_var = format_ident!("{}_{}", tree_var, field_name);
+
+        // Extract the field value
+        let extract_code = quote! {
+            let morok_ir::Op::#op_ident { #field_name: #field_var, .. } = #tree_var.op() else {
+                unreachable!()
+            };
+        };
+        additional_match_code.extend(extract_code);
+
+        // Generate match code for this field's pattern
+        let field_match = generate_inline_match(&field.pattern, &field_var, None, dup_tracker)?;
+
+        // Add any match code (e.g., for Option patterns or nested structs)
+        additional_match_code.extend(field_match.match_code);
+
+        if let Some(child_code) = field_match.child_match_code {
+            additional_match_code.extend(child_code);
         }
+
+        // Collect all bindings from this field's pattern
+        bindings.extend(field_match.bindings);
     }
 
+    let final_match = quote! {
+        #combined_match
+        #additional_match_code
+    };
+
     Ok(InlineMatchOutput {
-        match_code: combined_match,
+        match_code: final_match,
         bindings,
         is_commutative: false,
         alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
+        child_match_code: None,
+        alt_child_match_code: None,
     })
 }
 
@@ -1218,21 +1282,77 @@ fn generate_inline_op_var_match(
 
 /// Generate inline match for alternative patterns (A | B | C).
 ///
-/// Note: Top-level alternatives are handled specially in `generate_simplified_rule`.
-/// This function is only called for nested alternatives, which are not yet supported.
+/// Supports two cases:
+/// 1. Simple identifier alternatives in struct fields (e.g., `reduce_op: Add | Mul`)
+///    - All alternatives must be `Pattern::Var` (identifiers)
+///    - Generates `matches!(field, Enum::A | Enum::B)` check
+///    - Enum type is inferred from the tree_var name (e.g., `__tree_reduce_op` → `ReduceOp`)
+///    - Binds the field value as a closure parameter (e.g., `reduce_op`)
+///
+/// 2. Top-level alternatives are handled by `generate_simplified_alternatives_rule`
 fn generate_inline_alternatives_match(
-    _alternatives: &[Pattern],
-    _tree_var: &Ident,
+    alternatives: &[Pattern],
+    tree_var: &Ident,
     _iter_ctx: Option<&IterContext>,
-    _dup_tracker: &mut DuplicateTracker,
+    dup_tracker: &mut DuplicateTracker,
 ) -> Result<InlineMatchOutput> {
-    // Nested alternatives (alternatives inside other patterns) are not yet supported.
-    // Top-level alternatives like `(Add(x, y) | Mul(x, y)) ~> ...` are handled
-    // by generate_simplified_alternatives_rule in generate_simplified_rule.
-    Err(Error::new(
-        proc_macro2::Span::call_site(),
-        "Nested alternative patterns (|) are not yet supported. Move alternatives to the top level of the pattern.",
-    ))
+    // Check if all alternatives are simple Var patterns (enum discriminants)
+    let variant_names: Vec<&Ident> = alternatives
+        .iter()
+        .map(|p| match p {
+            Pattern::Var(ident) => Ok(ident),
+            _ => Err(Error::new(
+                proc_macro2::Span::call_site(),
+                "Nested alternatives must be simple identifiers (e.g., Add | Mul). Complex patterns in alternatives are not yet supported.",
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Infer enum type and field name from tree_var name (e.g., `__tree_reduce_op` → `ReduceOp`, `reduce_op`)
+    // Convention: field names like `reduce_op`, `unary_op`, `binary_op` map to their enum types
+    let tree_var_str = tree_var.to_string();
+    let (enum_type, field_name) = if tree_var_str.ends_with("_reduce_op") || tree_var_str == "reduce_op" {
+        (quote! { morok_ir::ReduceOp }, "reduce_op")
+    } else if tree_var_str.ends_with("_unary_op") || tree_var_str == "unary_op" {
+        (quote! { morok_ir::UnaryOp }, "unary_op")
+    } else if tree_var_str.ends_with("_binary_op") || tree_var_str == "binary_op" {
+        (quote! { morok_ir::BinaryOp }, "binary_op")
+    } else if tree_var_str.ends_with("_ternary_op") || tree_var_str == "ternary_op" {
+        (quote! { morok_ir::TernaryOp }, "ternary_op")
+    } else {
+        return Err(Error::new(
+            proc_macro2::Span::call_site(),
+            format!(
+                "Cannot infer enum type for field '{}'. Nested alternatives are only supported for known discriminant fields (reduce_op, unary_op, binary_op, ternary_op).",
+                tree_var_str
+            ),
+        ));
+    };
+
+    // Generate matches! check: matches!(field_var, Enum::A | Enum::B | ...)
+    let variant_patterns: Vec<TokenStream2> = variant_names
+        .iter()
+        .map(|name| quote! { #enum_type::#name })
+        .collect();
+
+    let match_code = quote! {
+        if !matches!(#tree_var, #(#variant_patterns)|*) {
+            return morok_ir::pattern::RewriteResult::NoMatch;
+        }
+    };
+
+    // Create binding for the field (e.g., reduce_op → &ReduceOp)
+    let actual_name = dup_tracker.process_name(field_name);
+    let binding_ident = Ident::new(&actual_name, proc_macro2::Span::call_site());
+
+    Ok(InlineMatchOutput {
+        match_code,
+        bindings: vec![(binding_ident, quote! { #tree_var })],
+        is_commutative: false,
+        alt_bindings: None,
+        child_match_code: None,
+        alt_child_match_code: None,
+    })
 }
 
 /// Generate inline match for commutative patterns [x, y].
@@ -1556,7 +1676,7 @@ fn generate_simplified_rule(rule: &PatternRule, iter_ctx: Option<&IterContext>, 
         // Wildcard pattern
         Ok(quote! {
             __matcher.add_wildcard(
-                |#tree_var: &std::sync::Arc<morok_ir::UOp>, #ctx_param| {
+                move |#tree_var: &std::sync::Arc<morok_ir::UOp>, #ctx_param| {
                     #body
                 }
             );
@@ -1565,7 +1685,7 @@ fn generate_simplified_rule(rule: &PatternRule, iter_ctx: Option<&IterContext>, 
         Ok(quote! {
             __matcher.add(
                 &[#(#op_keys),*],
-                |#tree_var: &std::sync::Arc<morok_ir::UOp>, #ctx_param| {
+                move |#tree_var: &std::sync::Arc<morok_ir::UOp>, #ctx_param| {
                     #body
                 }
             );
@@ -1682,13 +1802,27 @@ fn expand_simplified_for_block(for_block: &ForBlock, has_context: bool) -> Resul
     let var_name = &for_block.var;
     let mut results = Vec::new();
 
-    let (ops, kind) = match &for_block.iter_kind {
-        IterKind::Unary(ops) => (ops, OpKind::Unary),
-        IterKind::Binary(ops) => (ops, OpKind::Binary),
-        IterKind::Ternary(ops) => (ops, OpKind::Ternary),
+    // Resolve ops and kind - handle both explicit lists and wildcards
+    let (ops, kind): (Vec<Ident>, OpKind) = match &for_block.iter_kind {
+        IterKind::Unary(ops) => (ops.clone(), OpKind::Unary),
+        IterKind::Binary(ops) => (ops.clone(), OpKind::Binary),
+        IterKind::Ternary(ops) => (ops.clone(), OpKind::Ternary),
+        // Expand wildcards to full op lists
+        IterKind::UnaryAll => {
+            let ops = UNARY_OPS.iter().map(|s| format_ident!("{}", s)).collect();
+            (ops, OpKind::Unary)
+        }
+        IterKind::BinaryAll => {
+            let ops = BINARY_OPS.iter().map(|s| format_ident!("{}", s)).collect();
+            (ops, OpKind::Binary)
+        }
+        IterKind::TernaryAll => {
+            let ops = TERNARY_OPS.iter().map(|s| format_ident!("{}", s)).collect();
+            (ops, OpKind::Ternary)
+        }
     };
 
-    for op_ident in ops {
+    for op_ident in &ops {
         for rule in &for_block.body {
             let ctx = IterContext { var_name: var_name.clone(), op_ident: op_ident.clone(), op_kind: kind };
             results.push(generate_simplified_rule(rule, Some(&ctx), has_context)?);

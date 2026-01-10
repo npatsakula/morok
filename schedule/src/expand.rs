@@ -1165,6 +1165,12 @@ fn is_binary_with_single_unroll(uop: &Arc<UOp>) -> bool {
 fn lift_unroll_from_binary(binary: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Binary(op, left, right) = binary.op() else { return None };
 
+    // Skip comparisons - they need both operands expanded, which do_expand handles.
+    // If we lift UNROLL here, the non-UNROLL operand (e.g., input load) won't get expanded.
+    if op.is_comparison() {
+        return None;
+    }
+
     let left_is_unroll = matches!(left.op(), Op::Unroll { .. });
     let right_is_unroll = matches!(right.op(), Op::Unroll { .. });
 
@@ -1181,17 +1187,25 @@ fn lift_unroll_from_binary(binary: &Arc<UOp>) -> Option<Arc<UOp>> {
         (unroll_axes.clone(), src.clone(), left.clone(), false)
     };
 
+    // Compute expansion size from UNROLL inner dtype
+    let expand_sz = unroll_inner.dtype().vcount();
+
     tracing::debug!(
         op = ?op,
         unroll_axes = ?unroll_axes,
         unroll_on_left = unroll_on_left,
+        expand_sz = expand_sz,
+        binary_dtype = ?binary.dtype(),
+        unroll_inner_dtype = ?unroll_inner.dtype(),
+        non_unroll_dtype = ?non_unroll.dtype(),
         "lift_unroll_from_binary: LIFTING"
     );
 
     // Create new Binary with unwrapped UNROLL source (preserve operand order)
     let (new_left, new_right) =
-        if unroll_on_left { (unroll_inner.clone(), non_unroll) } else { (non_unroll, unroll_inner.clone()) };
+        if unroll_on_left { (unroll_inner.clone(), non_unroll.clone()) } else { (non_unroll.clone(), unroll_inner.clone()) };
 
+    // Use unroll_inner's dtype - for non-comparison ops, the result dtype matches operand dtype
     let new_binary = UOp::new(Op::Binary(*op, new_left, new_right), unroll_inner.dtype());
 
     Some(UOp::unroll(new_binary, unroll_axes.to_vec()))

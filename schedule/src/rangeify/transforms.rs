@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_ir::{AddrSpace, BufferizeOpts, ConstValue, DType, Op, ReduceOp, UOp, UOpKey};
+use morok_ir::{AddrSpace, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
 use smallvec::SmallVec;
 use tracing::{debug, trace};
 
@@ -331,21 +331,6 @@ pub(crate) fn transform_single_source(
     Arc::clone(src)
 }
 
-/// Check if a movement op should be removed.
-pub fn should_remove_movement_op(x: &Arc<UOp>, ctx: &IndexingContext) -> bool {
-    if ctx.range_map.contains_key(&UOpKey(Arc::clone(x))) {
-        return true;
-    }
-
-    if let Some(src) = x.op().sources().first()
-        && matches!(src.op(), Op::Index { .. })
-    {
-        return true;
-    }
-
-    false
-}
-
 /// Apply buffer removal patterns while protecting SINK sources.
 fn apply_buffer_removal_protecting_sink(
     sink: &Arc<UOp>,
@@ -467,59 +452,9 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
 // REDUCTION SIMPLIFICATIONS
 // ============================================================================
 
-/// Remove ranges from REDUCE that don't appear in source.
-#[allow(clippy::mutable_key_type)]
-pub fn reduce_unparented(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
-        return None;
-    };
-
-    if !matches!(reduce_op, ReduceOp::Add | ReduceOp::Mul | ReduceOp::Max | ReduceOp::Min) {
-        return None;
-    }
-
-    debug_assert!(
-        ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })),
-        "reduce_unparented: Some reduce srcs aren't ranges"
-    );
-
-    let src_ranges = src.in_scope_ranges();
-    let (parented, unparented) = partition_reduce_ranges(ranges, src_ranges);
-
-    if unparented.is_empty() {
-        return None;
-    }
-
-    let mut result = if !parented.is_empty() || reduce.dtype() != src.dtype() {
-        UOp::reduce(Arc::clone(src), parented, *reduce_op)
-    } else {
-        Arc::clone(src)
-    };
-
-    match reduce_op {
-        ReduceOp::Add => {
-            for range in &unparented {
-                let size = get_range_size(range)?;
-                let size_casted = cast_to_dtype(&size, &result.dtype())?;
-                result = result.try_mul(&size_casted).ok()?;
-            }
-        }
-        ReduceOp::Mul => {
-            for range in &unparented {
-                let size = get_range_size(range)?;
-                let size_casted = cast_to_dtype(&size, &result.dtype())?;
-                result = result.try_pow(&size_casted).ok()?;
-            }
-        }
-        ReduceOp::Max | ReduceOp::Min => {}
-    }
-
-    Some(result)
-}
-
 /// Partition ranges into parented and unparented.
 #[allow(clippy::mutable_key_type)]
-fn partition_reduce_ranges(
+pub(crate) fn partition_reduce_ranges(
     ranges: &SmallVec<[Arc<UOp>; 4]>,
     src_ranges: &HashSet<UOpKey>,
 ) -> (SmallVec<[Arc<UOp>; 4]>, Vec<Arc<UOp>>) {
@@ -538,17 +473,13 @@ fn partition_reduce_ranges(
     (parented, unparented)
 }
 
-fn get_range_size(range: &Arc<UOp>) -> Option<Arc<UOp>> {
+pub(crate) fn get_range_size(range: &Arc<UOp>) -> Option<Arc<UOp>> {
     if let Op::Range { end, .. } = range.op() { Some(Arc::clone(end)) } else { None }
 }
 
 /// Lift range-independent computations outside REDUCE via symbolic simplification.
 #[allow(clippy::mutable_key_type)]
-pub fn reduce_collapse(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Reduce { src, ranges, .. } = reduce.op() else {
-        return None;
-    };
-
+pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> {
     if ranges.is_empty() {
         return None;
     }
@@ -591,7 +522,7 @@ pub fn reduce_collapse(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(simplified.substitute(&reverse_map))
 }
 
-fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Arc<UOp>> {
+pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Arc<UOp>> {
     use morok_dtype::DType;
 
     let scalar_type = match target_dtype {

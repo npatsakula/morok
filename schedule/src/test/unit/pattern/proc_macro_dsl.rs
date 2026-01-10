@@ -1606,3 +1606,210 @@ fn test_symbolic_simple_add_zero() {
 
     assert!(Arc::ptr_eq(&result, &x), "combined patterns + graph_rewrite(Add(0, x)) should simplify to x");
 }
+
+// ===== Option Pattern Tests (gate: None, gate: Some(g)) =====
+
+#[test]
+fn test_option_none_pattern() {
+    // Test gate: None pattern matching
+    let matcher = patterns! {
+        Index { buffer: b, indices: _, gate: None } ~> b
+    };
+
+    let buffer = UOp::native_const(42.0f32);
+    let idx = UOp::index_const(0);
+
+    // Ungated index should match
+    let ungated = UOp::index(buffer.clone(), vec![idx.clone()]).unwrap();
+    match matcher.rewrite(&ungated, &mut ()) {
+        RewriteResult::Rewritten(r) => {
+            assert!(Arc::ptr_eq(&r, &buffer), "Should extract buffer from ungated Index");
+        }
+        _ => panic!("Index with gate: None should match"),
+    }
+
+    // Gated index should NOT match
+    let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
+    let gated = UOp::index_gated(buffer.clone(), vec![idx], gate).unwrap();
+    match matcher.rewrite(&gated, &mut ()) {
+        RewriteResult::NoMatch => {} // Expected
+        _ => panic!("Index with gate: Some(_) should NOT match gate: None pattern"),
+    }
+}
+
+#[test]
+fn test_option_some_pattern() {
+    // Test gate: Some(g) pattern matching
+    let matcher = patterns! {
+        Index { buffer: _, indices: _, gate: Some(g) } ~> g
+    };
+
+    let buffer = UOp::native_const(42.0f32);
+    let idx = UOp::index_const(0);
+    let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
+
+    // Gated index should match and extract the gate
+    let gated = UOp::index_gated(buffer.clone(), vec![idx.clone()], gate.clone()).unwrap();
+    match matcher.rewrite(&gated, &mut ()) {
+        RewriteResult::Rewritten(r) => {
+            assert!(Arc::ptr_eq(&r, &gate), "Should extract gate from gated Index");
+        }
+        _ => panic!("Index with gate: Some(g) should match"),
+    }
+
+    // Ungated index should NOT match
+    let ungated = UOp::index(buffer.clone(), vec![idx]).unwrap();
+    match matcher.rewrite(&ungated, &mut ()) {
+        RewriteResult::NoMatch => {} // Expected
+        _ => panic!("Index with gate: None should NOT match gate: Some(g) pattern"),
+    }
+}
+
+#[test]
+fn test_nested_index_with_gate_none() {
+    // Test the exact pattern from flatten_cascaded_index in DSL form
+    let matcher = patterns! {
+        Index {
+            buffer: Index { buffer: real_buffer, indices: inner_indices, gate: None },
+            indices: outer_indices,
+            gate: None
+        } if outer_indices.len() == 1 && inner_indices.len() == 1 => |real_buffer, inner_indices| {
+            UOp::index(real_buffer.clone(), vec![inner_indices[0].clone()]).ok()
+        }
+    };
+
+    let real_buffer = UOp::native_const(42.0f32);
+    let idx1 = UOp::index_const(5);
+    let idx2 = UOp::index_const(10);
+
+    // Create nested Index: INDEX(INDEX(real_buffer, [idx1]), [idx2])
+    let inner_idx = UOp::index(real_buffer.clone(), vec![idx1.clone()]).unwrap();
+    let outer_idx = UOp::index(inner_idx.clone(), vec![idx2.clone()]).unwrap();
+
+    // Should match and return INDEX(real_buffer, [idx1])
+    match matcher.rewrite(&outer_idx, &mut ()) {
+        RewriteResult::Rewritten(r) => {
+            // Result should be INDEX(real_buffer, [idx1])
+            if let Op::Index { buffer, indices, gate } = r.op() {
+                assert!(Arc::ptr_eq(buffer, &real_buffer), "Buffer should be real_buffer");
+                assert_eq!(indices.len(), 1, "Should have 1 index");
+                assert!(Arc::ptr_eq(&indices[0], &idx1), "Index should be idx1 from inner");
+                assert!(gate.is_none(), "Gate should be None");
+            } else {
+                panic!("Result should be Index op");
+            }
+        }
+        _ => panic!("Nested Index pattern should match"),
+    }
+
+    // With a gate on outer, should NOT match
+    let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
+    let gated_outer = UOp::index_gated(inner_idx.clone(), vec![idx2.clone()], gate).unwrap();
+    match matcher.rewrite(&gated_outer, &mut ()) {
+        RewriteResult::NoMatch => {} // Expected - outer gate is Some
+        _ => panic!("Should NOT match when outer gate is Some"),
+    }
+}
+
+// ===== Wildcard For-Loop Tests ([*] syntax) =====
+
+#[test]
+fn test_for_loop_binary_wildcard() {
+    // Test that `binary [*]` expands to ALL binary ops
+    #[allow(unused_variables)]
+    let matcher = patterns! {
+        for op in binary [*] {
+            op(x, @zero) ~> x
+        }
+    };
+
+    let x = UOp::native_const(42i32);
+    let zero = UOp::native_const(0i32);
+
+    // Test Add(x, 0) => x
+    let add_zero = binary(BinaryOp::Add, x.clone(), zero.clone());
+    match matcher.rewrite(&add_zero, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
+        _ => panic!("Add(x, 0) from binary [*] should match"),
+    }
+
+    // Test Mul(x, 0) => x
+    let mul_zero = binary(BinaryOp::Mul, x.clone(), zero.clone());
+    match matcher.rewrite(&mul_zero, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
+        _ => panic!("Mul(x, 0) from binary [*] should match"),
+    }
+
+    // Test Xor(x, 0) => x (less common op, but should match with [*])
+    let xor_zero = x.try_xor_op(&zero).unwrap();
+    match matcher.rewrite(&xor_zero, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &x)),
+        _ => panic!("Xor(x, 0) from binary [*] should match"),
+    }
+}
+
+#[test]
+fn test_for_loop_unary_wildcard() {
+    // Test that `unary [*]` expands to ALL unary ops
+    #[allow(unused_variables)]
+    let matcher = patterns! {
+        for op in unary [*] {
+            op(c) if matches!(c.op(), Op::Const(_)) ~> c
+        }
+    };
+
+    let c = UOp::native_const(42.0f32);
+
+    // Test Neg(const)
+    let neg_c = c.neg();
+    match matcher.rewrite(&neg_c, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
+        _ => panic!("Neg(const) from unary [*] should match"),
+    }
+
+    // Test Sqrt(const)
+    let sqrt_c = c.try_sqrt().unwrap();
+    match matcher.rewrite(&sqrt_c, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
+        _ => panic!("Sqrt(const) from unary [*] should match"),
+    }
+
+    // Test Exp2(const) - verifies [*] includes all ops
+    let exp2_c = c.try_exp2().unwrap();
+    match matcher.rewrite(&exp2_c, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &c)),
+        _ => panic!("Exp2(const) from unary [*] should match"),
+    }
+}
+
+#[test]
+fn test_for_loop_ternary_wildcard() {
+    // Test that `ternary [*]` expands to ALL ternary ops
+    #[allow(unused_variables)]
+    let matcher = patterns! {
+        for op in ternary [*] {
+            op(a, b, c) ~> {
+                // For testing, just return the first argument
+                Arc::clone(a)
+            }
+        }
+    };
+
+    let a = UOp::native_const(1.0f32);
+    let b = UOp::native_const(2.0f32);
+    let c = UOp::native_const(3.0f32);
+
+    // Test Where(a, b, c) => a
+    let where_abc = UOp::try_where(a.clone(), b.clone(), c.clone()).unwrap();
+    match matcher.rewrite(&where_abc, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
+        _ => panic!("Where from ternary [*] should match"),
+    }
+
+    // Test MulAcc(a, b, c) => a
+    let mulacc_abc = UOp::try_mulacc(a.clone(), b.clone(), c.clone()).unwrap();
+    match matcher.rewrite(&mulacc_abc, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
+        _ => panic!("MulAcc from ternary [*] should match"),
+    }
+}

@@ -3,7 +3,7 @@ use morok_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::{
     IndexingContext,
-    transforms::{should_remove_movement_op, transform_single_source, transform_sources_with_bufferize},
+    transforms::{transform_single_source, transform_sources_with_bufferize},
 };
 
 #[test]
@@ -60,26 +60,6 @@ fn test_transform_realizable_source() {
     } else {
         panic!("Expected INDEX operation");
     }
-}
-
-#[test]
-fn test_should_remove_movement_op() {
-    let src = UOp::define_global(0, DType::Float32);
-    let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
-
-    let mut ctx = IndexingContext::new();
-
-    // Initially should not remove
-    assert!(!should_remove_movement_op(&permute, &ctx));
-
-    // After assigning ranges, should remove
-    let range = UOp::new(
-        Op::Range { end: UOp::index_const(5), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
-        DType::Index,
-    );
-    ctx.set_ranges(&permute, vec![range.clone()], vec![range.clone()]);
-
-    assert!(should_remove_movement_op(&permute, &ctx));
 }
 
 #[test]

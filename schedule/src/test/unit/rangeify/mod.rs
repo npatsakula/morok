@@ -1,5 +1,4 @@
 pub mod advanced_edge_cases;
-pub mod buffer_cost;
 pub mod buffer_folding;
 pub mod buffer_limits;
 pub mod bufferize_to_store;

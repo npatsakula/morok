@@ -13,8 +13,17 @@ use morok_ir::{AxisId, AxisType, Op, UOp};
 
 use crate::rangeify::kernel::KernelContext;
 use crate::rangeify::kernel::split_store;
-use crate::rangeify::patterns::{fix_after_broadcast, get_contiguous, remove_noop};
+use crate::rangeify::patterns::rangeify_codegen_patterns;
 use crate::rangeify::transforms::find_bufs;
+
+/// Helper to apply rangeify_codegen patterns and return result
+fn apply_codegen_patterns(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let matcher = rangeify_codegen_patterns();
+    match matcher.rewrite(uop, &mut ()) {
+        morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
+        _ => None,
+    }
+}
 
 /// Test that remove_noop integrates correctly in pipeline context.
 ///
@@ -25,8 +34,8 @@ fn test_remove_noop_in_pipeline() {
     // Create a simple NOOP (Void dtype returns None)
     let noop = UOp::noop();
 
-    // remove_noop should return None for Void dtype
-    let result = remove_noop(&noop);
+    // Pattern should return None for Void dtype
+    let result = apply_codegen_patterns(&noop);
     assert!(result.is_none());
 
     // In actual pipeline, NOOPs with real dtypes would be replaced
@@ -43,7 +52,7 @@ fn test_get_contiguous_in_pipeline() {
     let contiguous = UOp::contiguous(value.clone());
 
     // Pattern should remove the CONTIGUOUS marker
-    let result = get_contiguous(&contiguous);
+    let result = apply_codegen_patterns(&contiguous);
     assert!(result.is_some());
 
     let unwrapped = result.unwrap();
@@ -65,7 +74,7 @@ fn test_fix_after_broadcast_in_pipeline() {
     let after = UOp::after(expand, smallvec::smallvec![computation]);
 
     // Pattern should unwrap EXPAND
-    let result = fix_after_broadcast(&after);
+    let result = apply_codegen_patterns(&after);
     assert!(result.is_some());
 
     let fixed = result.unwrap();
@@ -172,8 +181,8 @@ fn test_pattern_application_order() {
     let contiguous = UOp::contiguous(value);
 
     // In real pipeline, this would go through split_store
-    // For now, verify get_contiguous works
-    let result = get_contiguous(&contiguous);
+    // For now, verify pattern works via matcher
+    let result = apply_codegen_patterns(&contiguous);
     assert!(result.is_some());
 }
 

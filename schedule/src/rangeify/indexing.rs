@@ -24,10 +24,6 @@ pub struct IndexingContext {
     pub realize_map: HashMap<UOpKey, Option<Vec<usize>>>,
     /// Maps each UOp to its (input_ranges, output_ranges).
     pub range_map: HashMap<UOpKey, UOpRanges>,
-    /// Tracks ranges that are "ending" at each UOp (for nested reduction detection).
-    /// When EXPAND broadcasts to static dims, ranges are marked as ending.
-    /// When REDUCE_AXIS encounters ending ranges, it forces realization.
-    pub ending_ranges: HashMap<UOpKey, Vec<Arc<UOp>>>,
     /// Counter for generating unique range IDs.
     range_idx: usize,
 }
@@ -119,21 +115,6 @@ impl IndexingContext {
     /// Get the current range counter value.
     pub fn range_counter(&self) -> usize {
         self.range_idx
-    }
-
-    /// Get ending ranges for a UOp (ranges that "ended" at this point).
-    pub fn get_ending_ranges(&self, uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
-        self.ending_ranges.get(&UOpKey(Arc::clone(uop))).cloned().unwrap_or_default()
-    }
-
-    /// Set ending ranges for a UOp.
-    pub fn set_ending_ranges(&mut self, uop: &Arc<UOp>, ranges: Vec<Arc<UOp>>) {
-        self.ending_ranges.insert(UOpKey(Arc::clone(uop)), ranges);
-    }
-
-    /// Clear ending ranges for a UOp (after they've been handled).
-    pub fn clear_ending_ranges(&mut self, uop: &Arc<UOp>) {
-        self.ending_ranges.insert(UOpKey(Arc::clone(uop)), Vec::new());
     }
 }
 
@@ -313,6 +294,9 @@ fn assign_ranges(
     consumer_map: &HashMap<UOpKey, Vec<Arc<UOp>>>,
     ctx: &mut IndexingContext,
 ) -> morok_ir::Result<()> {
+    // Local variable for ending_ranges - only used within this function (like Tinygrad)
+    let mut ending_ranges: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
+
     for x in reverse_topo {
         if matches!(x.op(), Op::Device(_) | Op::Unique(_)) {
             continue;
@@ -339,7 +323,7 @@ fn assign_ranges(
         // ending_ranges propagate from consumers → producers (backward in data flow)
         let mut inherited_ending: Vec<Arc<UOp>> = Vec::new();
         for consumer in &consumers {
-            inherited_ending.extend(ctx.get_ending_ranges(consumer));
+            inherited_ending.extend(ending_ranges.get(&UOpKey(consumer.clone())).cloned().unwrap_or_default());
         }
         if !inherited_ending.is_empty() {
             debug!(
@@ -349,7 +333,7 @@ fn assign_ranges(
                 "ending_ranges: node inherits from consumers"
             );
         }
-        ctx.set_ending_ranges(x, inherited_ending);
+        ending_ranges.insert(UOpKey(x.clone()), inherited_ending);
 
         let mut out_rngs = if ctx.should_realize(x) {
             if let Some(shape) = x.shape()? {
@@ -357,7 +341,7 @@ fn assign_ranges(
                 let axes: Vec<usize> = (0..shape.len()).collect();
                 ctx.realize_map.insert(UOpKey(x.clone()), Some(axes));
                 // Clear ending_ranges when realized (like Tinygrad line 185)
-                ctx.clear_ending_ranges(x);
+                ending_ranges.insert(UOpKey(x.clone()), Vec::new());
                 rngs
             } else {
                 continue;
@@ -392,7 +376,7 @@ fn assign_ranges(
         // Check ending_ranges FIRST (before in_rngs computation)
         // Tinygrad lines 224-234: ending_ranges realization happens BEFORE input ranges
         // This is critical: in_rngs must be computed from the FINAL out_rngs after realization
-        let ending = ctx.get_ending_ranges(x);
+        let ending = ending_ranges.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
         if !ending.is_empty() {
             debug!(
                 ending_count = ending.len(),
@@ -456,7 +440,7 @@ fn assign_ranges(
                 );
 
                 // Clear ending_ranges after handling
-                ctx.clear_ending_ranges(x);
+                ending_ranges.insert(UOpKey(x.clone()), Vec::new());
 
                 if !realize_axes.is_empty() {
                     // Mark for realization
@@ -476,7 +460,7 @@ fn assign_ranges(
                         .collect();
                 }
             } else {
-                ctx.clear_ending_ranges(x);
+                ending_ranges.insert(UOpKey(x.clone()), Vec::new());
             }
         }
 
@@ -606,9 +590,9 @@ fn assign_ranges(
                         changed_range_ids = ?changed_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
                         "ending_ranges: EXPAND marking ranges as ending"
                     );
-                    let mut ending = ctx.get_ending_ranges(x);
+                    let mut ending = ending_ranges.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
                     ending.extend(changed_ranges);
-                    ctx.set_ending_ranges(x, ending);
+                    ending_ranges.insert(UOpKey(x.clone()), ending);
                 }
             }
         }

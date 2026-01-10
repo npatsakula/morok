@@ -21,6 +21,7 @@ use smallvec::SmallVec;
 use tracing::trace;
 
 use crate::TypedPatternMatcher;
+use crate::rangeify::transforms::{cast_to_dtype, get_range_size, partition_reduce_ranges};
 
 // Re-export from indexing for backwards compatibility
 pub use super::indexing::{is_dead_axis, ranges_equal};
@@ -29,7 +30,7 @@ pub use super::indexing::{is_dead_axis, ranges_equal};
 use super::indexing::IndexingContext;
 use super::kernel::KernelContext;
 use super::kernel::{PcontigConfig, SplitReduceOpConfig, split_reduceop};
-use super::transforms::{reduce_unparented, should_remove_movement_op, transform_sources_with_bufferize};
+use super::transforms::transform_sources_with_bufferize;
 
 // ============================================================================
 // HELPER FUNCTIONS (private)
@@ -86,11 +87,6 @@ fn unary_in_reduce_context(compute: &Arc<UOp>) -> bool {
         .any(|key| if let Op::Range { axis_type, .. } = key.0.op() { *axis_type == AxisType::Reduce } else { false })
 }
 
-/// Check if a BUFFERIZE wraps a Unary op in reduce context.
-fn unary_in_reduce_context_bufferize(buf: &Arc<UOp>) -> bool {
-    if let Op::Bufferize { compute, .. } = buf.op() { unary_in_reduce_context(compute) } else { false }
-}
-
 /// Block inlining of BUFFERIZE when it wraps a Unary op in reduce context.
 /// Returns None to keep the BUFFERIZE as-is (no transformation).
 fn block_reduce_unary_inline(_buf: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -100,11 +96,6 @@ fn block_reduce_unary_inline(_buf: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Check if an op must always run (shouldn't be buffered).
 pub fn is_always_run_op(op: &Op) -> bool {
     matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Assign { .. })
-}
-
-/// Check if an INDEX has another INDEX as its buffer.
-fn is_cascaded_index(idx: &Arc<UOp>) -> bool {
-    if let Op::Index { buffer, .. } = idx.op() { matches!(buffer.op(), Op::Index { .. }) } else { false }
 }
 
 /// Check if operation is elementwise (Binary or Ternary).
@@ -127,18 +118,18 @@ pub fn early_rewrites() -> TypedPatternMatcher {
     crate::patterns! {
         Detach(x) ~> |x| x.clone(),
         ContiguousBackward(x) ~> |x| x.clone(),
-        x => |x| {
-            if let Op::Reshape { src, new_shape } = x.op() {
-                // RESHAPE to scalar - always remove
-                if is_scalar_shape(new_shape) {
-                    return Some(src.clone());
-                }
-                // RESHAPE on REDUCE - the reduce output is already "indexed" by its ranges
-                // The reshape just changes the view of the buffer, which can be done in STORE indexing
-                if matches!(src.op(), Op::Reduce { .. }) {
-                    return Some(src.clone());
-                }
+        Reshape { src, new_shape } => |src, new_shape| {
+            // RESHAPE to scalar - always remove
+            if is_scalar_shape(new_shape) {
+                return Some(src.clone());
             }
+
+            // RESHAPE on REDUCE - the reduce output is already "indexed" by its ranges
+            // The reshape just changes the view of the buffer, which can be done in STORE indexing
+            if matches!(src.op(), Op::Reduce { .. }) {
+                return Some(src.clone());
+            }
+
             None
         }
     }
@@ -148,25 +139,21 @@ pub fn early_rewrites() -> TypedPatternMatcher {
 // RANGEIFY TRANSFORMATION PATTERNS
 // ============================================================================
 
-/// Pattern matcher for removing movement ops after rangeify transformation.
-pub fn movement_op_removal() -> TypedPatternMatcher<IndexingContext> {
-    crate::patterns! {
-        @context IndexingContext;
-        x if x.op().is_movement() => |x, ctx| remove_movement_op(x, ctx),
-    }
-}
-
 /// Create patterns for applying rangeify transformation with IndexingContext.
+///
+/// Pattern order (like Tinygrad's pm_apply_rangeify):
+/// 1. ReduceAxis → REDUCE conversion
+/// 2. ALL ops get source bufferization (including movement ops)
+/// 3. Movement ops get removed (simple - just return source)
 pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
     crate::patterns! {
         @context IndexingContext;
         // ReduceAxis conversion MUST come first - before bufferize wraps it
-        x if matches!(x.op(), Op::ReduceAxis { .. }) => |x, ctx| convert_reduceaxis_with_context(x, ctx),
-        // Movement ops should NOT be processed by bufferize transform - they'll be removed
-        // and their consumers will create proper BUFFERIZE + INDEX with correct ranges.
-        // Processing movement ops here creates INDEX with their conflicted ranges, which
-        // breaks range consistency when the movement op is later removed.
-        x if !x.op().is_movement() => |x, ctx| apply_bufferize_transform(x, ctx),
+        x @ ReduceAxis { src: _ } => |x, ctx| convert_reduceaxis_with_context(x, ctx),
+        // ALL ops (including movement) get source bufferization
+        // This matches Tinygrad's approach where bufferization runs on GroupOp.All
+        x => |x, ctx| apply_bufferize_transform(x, ctx),
+        // Movement ops get removed AFTER bufferization - simple logic
         x if x.op().is_movement() => |x, ctx| remove_movement_op(x, ctx),
     }
 }
@@ -179,123 +166,48 @@ fn apply_bufferize_transform(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<
     None
 }
 
-/// Remove movement ops after transformation has been applied.
+/// Remove movement ops after source bufferization.
 ///
-/// When removing a movement op, we check if the source needs realization.
-/// If so, we wrap it in BUFFERIZE + INDEX to ensure proper kernel splitting.
-/// This handles the identity mismatch where realize_map is keyed on the
-/// transformed REDUCE identity but movement op sources are the original identity.
+/// Simplified logic (like Tinygrad's remove_movement_op_after_rangeify):
+/// - Buffer-like source → add INDEX with movement op's ranges
+/// - Source is INDEX → return source (already processed by bufferize phase)
+/// - Movement op in range_map → return source
+///
+/// Realization/bufferization is handled by apply_bufferize_transform which
+/// runs BEFORE this pattern (like Tinygrad's create_bufferize_and_index_based_on_ranges).
 fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
-    if !should_remove_movement_op(x, ctx) {
-        return None;
-    }
-
     let src = x.op().sources().first()?.clone();
 
-    // Tinygrad pattern: explicit buffer-like check, separate from realize_map
-    // See tinygrad/schedule/indexing.py:61-62
-    // Buffer sources aren't in realize_map (they're pre-existing, not computed)
-    // So we need to add INDEX directly when the movement op is in range_map
+    // Case 1: Buffer-like source → add INDEX with movement op's input ranges
+    // Buffer sources aren't in realize_map, so we add INDEX directly
     if matches!(
         src.op(),
         Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
     ) {
-        // Use movement op's input ranges (from range_map, like Tinygrad's ctx.range_map[x][0])
         let (input_ranges, _) = ctx.get_ranges(x)?;
         return UOp::index(src, input_ranges.clone()).ok();
     }
 
-    trace!(
-        x.id = x.id,
-        x.op = ?std::mem::discriminant(x.op()),
-        src.id = src.id,
-        src.op = ?std::mem::discriminant(src.op()),
-        "Movement op removal"
-    );
-
-    // Check if source needs realization - wrap in BUFFERIZE if so
-    // But skip if source is a movement op whose inner source is also marked
-    // (the innermost marked op will be wrapped by transform_single_source)
-    let realize_axes = ctx.get_realize_axes(&src).cloned();
-
-    trace!(
-        src.id = src.id,
-        realize_axes = ?realize_axes,
-        should_realize = ctx.should_realize(&src),
-        "Realize lookup"
-    );
-
-    if let Some(axes) = realize_axes {
-        // Check if ANY source of this node is also marked for realization
-        // If so, skip wrapping here - the inner source should be wrapped first
-        // This ensures consistent computation: the innermost marked node is wrapped once
-        for inner_src in src.op().sources() {
-            if ctx.should_realize(&inner_src) {
-                trace!(src.id = src.id, inner_src.id = inner_src.id, "Skipping - inner source also needs realization");
-                // Return the raw source - let the rewrite continue
-                // The inner source will be wrapped when its consumers process it
-                return Some(src);
-            }
-        }
-
-        // Source needs realization - wrap in BUFFERIZE + INDEX
-        // Use movement op's input ranges (which are source's output from consumer perspective)
-        let x_ranges = ctx.get_ranges(x);
-        let src_ranges = ctx.get_ranges(&src);
-
-        trace!(
-            x_ranges = ?x_ranges.map(|(i, o)| (i.len(), o.len())),
-            src_ranges = ?src_ranges.map(|(i, o)| (i.len(), o.len())),
-            "Creating BUFFERIZE"
-        );
-
-        let input_ranges = x_ranges.map(|(i, _)| i.clone())?;
-        let src_output = src_ranges.map(|(_, o)| o.clone())?;
-
-        // Closed ranges are source's output ranges at realized axes
-        let closed_ranges: Vec<_> =
-            src_output.iter().enumerate().filter(|(i, _)| axes.contains(i)).map(|(_, r)| Arc::clone(r)).collect();
-
-        let opts = if src_output.len() == axes.len() {
-            BufferizeOpts { device: None, addrspace: AddrSpace::Global }
-        } else {
-            BufferizeOpts { device: None, addrspace: AddrSpace::Local }
-        };
-
-        trace!(
-            axes = ?axes,
-            closed_ranges.len = closed_ranges.len(),
-            input_ranges.len = input_ranges.len(),
-            src.id = src.id,
-            src.op = ?std::mem::discriminant(src.op()),
-            "Movement op realize params"
-        );
-
-        let bufferized = UOp::bufferize(src.clone(), closed_ranges, opts);
-
-        // Use input ranges AS-IS (Tinygrad indexing.py:78)
-        // Do NOT convert Reduce→Loop here - that only happens in limit_bufs for buffer overflow.
-        // REDUCE consumers need Reduce-type ranges to share the same loop counter with their source INDEX.
-        let index_ranges: Vec<_> =
-            input_ranges.iter().enumerate().filter(|(i, _)| axes.contains(i)).map(|(_, r)| Arc::clone(r)).collect();
-
-        trace!(index_ranges.len = index_ranges.len(), bufferized.id = bufferized.id, "Index ranges for bufferize");
-
-        if !index_ranges.is_empty() {
-            let result = UOp::index(bufferized.clone(), index_ranges);
-            trace!(result.id = ?result.as_ref().map(|r| r.id).ok(), "returning index result");
-            return result.ok();
-        } else {
-            trace!("returning bufferize only");
-            return Some(bufferized);
-        }
+    // Case 2: Source is INDEX → already processed by bufferize phase
+    if matches!(src.op(), Op::Index { .. }) {
+        return Some(src);
     }
 
-    // Source doesn't need realization - return as-is
-    Some(src)
+    // Case 3: Movement op in range_map → return source
+    // The source was transformed by apply_bufferize_transform
+    if ctx.get_ranges(x).is_some() {
+        return Some(src);
+    }
+
+    None
 }
 
 /// Convert ReduceAxis → REDUCE using IndexingContext.
+///
+/// Simplified logic (like Tinygrad's convert_reduce_axis_to_reduce_with_ranges):
+/// - Filter input ranges by axis index (no AxisType validation needed)
+/// - Create REDUCE if we have ranges, return source otherwise
+/// - Transfer range_map + realize_map to new identity
 fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
     let Op::ReduceAxis { src, reduce_op, axes } = x.op() else {
         return None;
@@ -303,68 +215,24 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
 
     let (input_ranges, output_ranges) = ctx.get_ranges(x)?;
 
-    trace!(
-        reduceaxis.id = x.id,
-        src.id = src.id,
-        src.op = ?std::mem::discriminant(src.op()),
-        input_ranges.len = input_ranges.len(),
-        "ReduceAxis to REDUCE conversion"
-    );
+    // Filter ranges by axis index (like Tinygrad - no AxisType check needed)
+    let reduce_ranges: SmallVec<[Arc<UOp>; 4]> =
+        input_ranges.iter().enumerate().filter(|(i, _)| axes.contains(i)).map(|(_, r)| Arc::clone(r)).collect();
 
-    let reduce_ranges: SmallVec<[Arc<UOp>; 4]> = input_ranges
-        .iter()
-        .enumerate()
-        .filter_map(|(i, range)| {
-            if axes.contains(&i) {
-                if let Op::Range { axis_type: AxisType::Reduce, .. } = range.op() {
-                    Some(Arc::clone(range))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if reduce_ranges.is_empty() {
-        // Transfer range context to src since we're returning it instead of REDUCE
-        // Without this, get_ranges(src) will return None in subsequent patterns
-        ctx.set_ranges(src, input_ranges.clone(), output_ranges.clone());
-        let ending = ctx.get_ending_ranges(x);
-        ctx.set_ending_ranges(src, ending);
-        if let Some(axes) = ctx.get_realize_axes(x).cloned() {
-            ctx.mark_realize(src, axes);
-        }
-        return Some(Arc::clone(src));
-    }
-
-    let ret = UOp::reduce(Arc::clone(src), reduce_ranges, *reduce_op);
-
-    // KEY: Transfer range_map to new UOp (like Tinygrad line 94)
-    // When graph_rewrite creates a new UOp, the old range_map entry becomes invalid.
-    // We must copy the ranges to the new UOp's identity.
-    ctx.set_ranges(&ret, input_ranges.clone(), output_ranges.clone());
-
-    // Also transfer ending_ranges to the new UOp
-    let ending = ctx.get_ending_ranges(x);
-    ctx.set_ending_ranges(&ret, ending);
-
-    // Transfer realize_map to new UOp - critical for nested reductions!
-    // If the original ReduceAxis was marked for realization, the new REDUCE must be too.
-    if let Some(axes) = ctx.get_realize_axes(x).cloned() {
-        tracing::debug!(
-            reduceaxis_id = x.id,
-            reduce_id = ret.id,
-            axes = ?axes,
-            "ReduceAxis→REDUCE: transferring realize_map"
-        );
-        ctx.mark_realize(&ret, axes);
+    // Determine target: REDUCE if we have ranges, source otherwise
+    let target = if reduce_ranges.is_empty() {
+        Arc::clone(src)
     } else {
-        tracing::debug!(reduceaxis_id = x.id, reduce_id = ret.id, "reduceaxis→reduce: no realize_map to transfer");
+        UOp::reduce(Arc::clone(src), reduce_ranges, *reduce_op)
+    };
+
+    // Transfer context to new identity (range_map + realize_map only)
+    ctx.set_ranges(&target, input_ranges.clone(), output_ranges.clone());
+    if let Some(realize_axes) = ctx.get_realize_axes(x).cloned() {
+        ctx.mark_realize(&target, realize_axes);
     }
 
-    Some(ret)
+    Some(target)
 }
 
 // ============================================================================
@@ -372,11 +240,12 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
 // ============================================================================
 
 /// Pattern matcher for buffer folding and constant propagation.
+#[tracing::instrument]
 pub fn buffer_folding() -> TypedPatternMatcher {
     crate::patterns! {
-        Bufferize { compute: c, .. } if matches!(c.op(), Op::Const(_)) ~> |c| c.clone(),
-        Index { buffer: c, .. } if matches!(c.op(), Op::Const(_)) ~> |c| c.clone(),
-        Copy { src: c, .. } if matches!(c.op(), Op::Const(_)) ~> |c| c.clone(),
+        Bufferize { compute: c @ Const(_), .. } ~> |c| c.clone(),
+        Index { buffer: c @ Const(_), .. } ~> |c| c.clone(),
+        Copy { src: c @ Const(_), .. } ~> |c| c.clone(),
         Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
             if ranges_equal(ranges, indices) ~> |compute| compute.clone(),
     }
@@ -385,57 +254,42 @@ pub fn buffer_folding() -> TypedPatternMatcher {
 /// Pattern matcher for dead axis removal.
 pub fn dead_axis_removal() -> TypedPatternMatcher {
     crate::patterns! {
-        buf if matches!(buf.op(), Op::Bufferize { .. }) => |buf| filter_dead_bufferize(buf),
-        idx if matches!(idx.op(), Op::Index { .. }) => |idx| adjust_index_for_dead_axes(idx),
-    }
-}
-
-/// Filter dead axes from BUFFERIZE operations.
-fn filter_dead_bufferize(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Bufferize { compute, ranges, opts } = buf.op() else {
-        return None;
-    };
-
-    let live_ranges: Vec<_> = ranges.iter().filter(|r| !is_dead_axis(r)).map(Arc::clone).collect();
-
-    if live_ranges.len() < ranges.len() {
-        if live_ranges.is_empty() {
-            return Some(Arc::clone(compute));
-        }
-        return Some(UOp::bufferize(Arc::clone(compute), live_ranges, opts.clone()));
-    }
-    None
-}
-
-/// Adjust INDEX indices when BUFFERIZE has dead axes removed.
-fn adjust_index_for_dead_axes(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Index { buffer, indices, gate: _ } = idx.op() else {
-        return None;
-    };
-    let Op::Bufferize { ranges: buf_ranges, .. } = buffer.op() else {
-        return None;
-    };
-
-    let mut new_indices = Vec::new();
-    let mut idx_iter = indices.iter();
-
-    for range in buf_ranges.iter() {
-        if !is_dead_axis(range) {
-            if let Some(idx_val) = idx_iter.next() {
-                new_indices.push(Arc::clone(idx_val));
+        // Filter dead axes from BUFFERIZE - inline the logic
+        Bufferize { compute, ranges, opts } => |compute, ranges, opts| {
+            let live_ranges: Vec<_> = ranges.iter().filter(|r| !is_dead_axis(r)).map(Arc::clone).collect();
+            if live_ranges.len() < ranges.len() {
+                if live_ranges.is_empty() {
+                    return Some(compute.clone());
+                }
+                return Some(UOp::bufferize(compute.clone(), live_ranges, opts.clone()));
             }
-        } else {
-            idx_iter.next();
-        }
-    }
+            None
+        },
+        // Adjust INDEX indices when BUFFERIZE has dead axes - use nested struct pattern
+        Index { buffer: buffer @ Bufferize { ranges: buf_ranges, .. }, indices, gate: _ }
+            => |buffer, buf_ranges, indices| {
+            let mut new_indices = Vec::new();
+            let mut idx_iter = indices.iter();
 
-    if new_indices.len() < indices.len() {
-        if new_indices.is_empty() {
-            return None;
-        }
-        return UOp::index(Arc::clone(buffer), new_indices).ok();
+            for range in buf_ranges.iter() {
+                if !is_dead_axis(range) {
+                    if let Some(idx_val) = idx_iter.next() {
+                        new_indices.push(Arc::clone(idx_val));
+                    }
+                } else {
+                    idx_iter.next();
+                }
+            }
+
+            if new_indices.len() < indices.len() {
+                if new_indices.is_empty() {
+                    return None;
+                }
+                return UOp::index(buffer.clone(), new_indices).ok();
+            }
+            None
+        },
     }
-    None
 }
 
 // ============================================================================
@@ -449,7 +303,7 @@ fn adjust_index_for_dead_axes(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 pub fn buffer_removal() -> TypedPatternMatcher {
     crate::patterns! {
         // Unary in REDUCE context must NOT be inlined - check FIRST
-        buf if unary_in_reduce_context_bufferize(buf) => |buf| block_reduce_unary_inline(buf),
+        buf @ Bufferize { compute } if unary_in_reduce_context(compute) => |buf| block_reduce_unary_inline(buf),
         // Other cheap ops (including non-reduce Unary) can inline
         Bufferize { compute, .. } if is_cheap_to_inline(compute.op()) ~> |compute| compute.clone(),
         Bufferize { compute, .. } if is_always_run_op(compute.op()) ~> |compute| compute.clone(),
@@ -462,101 +316,247 @@ pub fn buffer_removal() -> TypedPatternMatcher {
 pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
     crate::patterns! {
         @context PcontigConfig;
-        idx if matches!(idx.op(), Op::Index { .. }) => |idx, ctx| apply_pcontig_removal(idx, ctx),
-        buf if ctx.level > 0 && matches!(buf.op(), Op::Bufferize { .. }) => |buf| remove_cheap_bufferize(buf),
-        buf if ctx.level > 0 && matches!(buf.op(), Op::Bufferize { .. }) => |buf| remove_always_run_bufferize(buf),
+        // Partial contiguous removal - use nested struct + gate: None
+        Index {
+            buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
+            indices: idx_ranges,
+            gate: None
+        } => |buffer, src, buf_ranges, idx_ranges, ctx| {
+            apply_pcontig_removal_inner(buffer, src, buf_ranges, idx_ranges, ctx)
+        },
+
+        // Remove cheap bufferize - inline with compute extraction
+        Bufferize { compute, .. }
+            if ctx.level > 0 && is_cheap_to_inline(compute.op()) && !unary_in_reduce_context(compute)
+            => |compute| {
+                tracing::debug!(
+                    compute_id = compute.id,
+                    compute_op = ?std::mem::discriminant(compute.op()),
+                    "removing cheap bufferize"
+                );
+                Some(compute.clone())
+            },
+
+        // Remove always-run bufferize - inline with compute extraction
+        Bufferize { compute, .. } if ctx.level > 0 && is_always_run_op(compute.op()) ~> |compute| compute.clone(),
+
+        // Flatten nested Bufferize
         Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
             => |inner, ranges, opts| Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
     }
 }
 
-fn remove_cheap_bufferize(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
-    if let Op::Bufferize { compute, .. } = buf.op()
-        && is_cheap_to_inline(compute.op())
-        && !unary_in_reduce_context(compute)
-    // Don't inline Unary in reduce context
-    {
-        tracing::debug!(
-            bufferize_id = buf.id,
-            compute_id = compute.id,
-            compute_op = ?std::mem::discriminant(compute.op()),
-            "removing cheap bufferize"
-        );
-        return Some(compute.clone());
-    }
-    None
-}
+/// Apply partial contiguous buffer removal (inline, like Tinygrad's remove_bufferize).
+///
+/// This function decides whether to remove a BUFFERIZE+INDEX pair by analyzing:
+/// 1. Buffer count threshold (too many buffers → keep materialized)
+/// 2. Output/input ratio (wasteful expansion → keep materialized)
+/// 3. Buffer in reduce scope (needs partial contiguous handling)
+#[allow(clippy::mutable_key_type)]
+fn apply_pcontig_removal_inner(
+    buffer: &Arc<UOp>,
+    src: &Arc<UOp>,
+    buf_ranges: &SmallVec<[Arc<UOp>; 4]>,
+    idx_ranges: &SmallVec<[Arc<UOp>; 4]>,
+    config: &mut PcontigConfig,
+) -> Option<Arc<UOp>> {
+    use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue};
+    use std::collections::{HashMap, HashSet};
 
-fn remove_always_run_bufferize(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
-    if let Op::Bufferize { compute, .. } = buf.op()
-        && is_always_run_op(compute.op())
-    {
-        return Some(compute.clone());
-    }
-    None
-}
-
-/// Apply partial contiguous buffer removal.
-fn apply_pcontig_removal(idx: &Arc<UOp>, config: &mut PcontigConfig) -> Option<Arc<UOp>> {
-    use super::kernel::{
-        apply_partial_contiguous, calculate_buffer_size, calculate_out_in_ratio, collect_accessed_buffers,
-        collect_indexes, collect_local_indexes, collect_reduces, extract_exclude_ranges, has_buffer_in_reduce,
-        partition_ranges,
-    };
-
-    let Op::Index { buffer, indices: idx_ranges, gate: None } = idx.op() else {
-        return None;
-    };
-    let Op::Bufferize { compute: src, ranges: buf_ranges, .. } = buffer.op() else {
-        return None;
-    };
-
-    if config.level == 0 {
+    if config.level == 0 || is_always_run_op(src.op()) {
         return None;
     }
 
-    if is_always_run_op(src.op()) {
-        return None;
+    // Single-pass collection (like Tinygrad's gate approach)
+    let mut accessed_buffers = Vec::new();
+    let mut indexes = Vec::new();
+    let mut reduces = Vec::new();
+    let mut visited = HashSet::new();
+
+    fn collect(
+        uop: &Arc<UOp>,
+        buffers: &mut Vec<Arc<UOp>>,
+        indexes: &mut Vec<Arc<UOp>>,
+        reduces: &mut Vec<Arc<UOp>>,
+        visited: &mut HashSet<UOpKey>,
+    ) -> bool {
+        let key = UOpKey(Arc::clone(uop));
+        if !visited.insert(key) {
+            return true;
+        }
+
+        match uop.op() {
+            Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
+                buffers.push(Arc::clone(uop));
+                return false; // Stop traversing into GLOBAL bufferize
+            }
+            Op::Buffer { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
+                buffers.push(Arc::clone(uop));
+            }
+            Op::Index { .. } => indexes.push(Arc::clone(uop)),
+            Op::Reduce { .. } => reduces.push(Arc::clone(uop)),
+            _ => {}
+        }
+
+        for child in uop.op().sources() {
+            collect(&child, buffers, indexes, reduces, visited);
+        }
+        true
     }
 
-    let accessed_buffers = collect_accessed_buffers(src);
+    collect(src, &mut accessed_buffers, &mut indexes, &mut reduces, &mut visited);
+
+    // Deduplicate buffers
+    let mut seen = HashSet::new();
+    accessed_buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
+
+    // Buffer count threshold
     if accessed_buffers.len() > config.max_buffers_threshold {
         return None;
     }
 
-    if let Some(output_size) = calculate_buffer_size(buffer)
-        && let Some(ratio) = calculate_out_in_ratio(output_size, &accessed_buffers)
-        && ratio < config.out_in_ratio_threshold
-    {
+    // Output/input ratio check (applied to ALL cases, not just buffer_in_reduce)
+    let output_size = match buffer.op() {
+        Op::Bufferize { ranges, .. } => {
+            let mut product = 1usize;
+            for range in ranges {
+                if let Op::Range { end, .. } = range.op()
+                    && let Op::Const(cv) = end.op()
+                    && let ConstValue::Int(n) = cv.0
+                    && n > 0
+                {
+                    product = product.checked_mul(n as usize)?;
+                } else {
+                    return None;
+                }
+            }
+            let element_size = buffer.dtype().base().bytes();
+            product.checked_mul(element_size)?
+        }
+        Op::Buffer { size, .. } => *size,
+        _ => return None,
+    };
+
+    let input_size: usize = accessed_buffers
+        .iter()
+        .filter_map(|buf| match buf.op() {
+            Op::Bufferize { ranges, .. } => {
+                let mut product = 1usize;
+                for range in ranges {
+                    if let Op::Range { end, .. } = range.op()
+                        && let Op::Const(cv) = end.op()
+                        && let ConstValue::Int(n) = cv.0
+                        && n > 0
+                    {
+                        product = product.checked_mul(n as usize)?;
+                    }
+                }
+                let elem_size = buf.dtype().base().bytes();
+                product.checked_mul(elem_size)
+            }
+            Op::Buffer { size, .. } => Some(*size),
+            Op::MStack { .. } | Op::MSelect { .. } => Some(1),
+            _ => None,
+        })
+        .sum();
+
+    let ratio = (output_size + 1) as f64 / (input_size + 1) as f64;
+    if ratio < config.out_in_ratio_threshold {
         return None;
     }
 
-    let reduces = collect_reduces(src);
-    let buf_in_reduce = has_buffer_in_reduce(&reduces);
+    // Check if buffer accessed in reduce scope
+    let buffer_in_reduce = if reduces.is_empty() {
+        false
+    } else {
+        let reduce_sources: Vec<Arc<UOp>> = reduces
+            .iter()
+            .filter_map(|r| if let Op::Reduce { src, .. } = r.op() { Some(Arc::clone(src)) } else { None })
+            .collect();
 
-    if !buf_in_reduce {
-        use std::collections::HashMap;
-        #[allow(clippy::mutable_key_type)]
+        if reduce_sources.is_empty() {
+            false
+        } else {
+            let sink = UOp::sink(reduce_sources);
+            let mut found = false;
+            for node in sink.toposort() {
+                if matches!(node.op(), Op::Buffer { .. } | Op::Bufferize { .. }) {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        }
+    };
+
+    // Simple substitution path (no buffer in reduce)
+    if !buffer_in_reduce {
         let subs_map: HashMap<UOpKey, Arc<UOp>> =
             buf_ranges.iter().zip(idx_ranges.iter()).map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v))).collect();
         return Some(src.substitute(&subs_map));
     }
 
-    let indexes = collect_indexes(src);
-    let local_indexes = collect_local_indexes(&indexes);
-    #[allow(clippy::mutable_key_type)]
-    let exclude_ranges = extract_exclude_ranges(&local_indexes);
+    // Partial contiguous path: filter local indexes and extract exclude ranges
+    let local_indexes: Vec<_> = indexes
+        .iter()
+        .filter(|idx| {
+            matches!(idx.op(), Op::Index { buffer, .. }
+                if matches!(buffer.op(), Op::Bufferize { opts, .. }
+                    if opts.addrspace == AddrSpace::Local))
+        })
+        .collect();
 
-    let (materialize, substitute) = partition_ranges(buf_ranges, idx_ranges, &exclude_ranges);
-
-    if materialize.is_empty() {
-        use std::collections::HashMap;
-        #[allow(clippy::mutable_key_type)]
-        let subs_map: HashMap<UOpKey, Arc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
-        return Some(src.substitute(&subs_map));
+    let mut exclude_ranges = HashSet::new();
+    for idx in &local_indexes {
+        if let Op::Index { indices, .. } = idx.op() {
+            for range in indices {
+                for r in range.in_scope_ranges() {
+                    exclude_ranges.insert(r.clone());
+                }
+            }
+        }
     }
 
-    apply_partial_contiguous(src, materialize, substitute)
+    // Partition ranges into materialize vs substitute
+    let mut materialize = Vec::new();
+    let mut substitute = Vec::new();
+
+    for (buf_rng, idx_rng) in buf_ranges.iter().zip(idx_ranges.iter()) {
+        if matches!(buf_rng.op(), Op::Const(_)) {
+            continue;
+        }
+
+        let buf_key = UOpKey(Arc::clone(buf_rng));
+        let should_materialize = exclude_ranges.contains(&buf_key)
+            || idx_rng.in_scope_ranges().iter().any(|r| {
+                if let Op::Range { axis_type, .. } = r.0.op() { matches!(axis_type, AxisType::Reduce) } else { false }
+            });
+
+        if should_materialize {
+            materialize.push((Arc::clone(buf_rng), Arc::clone(idx_rng)));
+        } else {
+            substitute.push((Arc::clone(buf_rng), Arc::clone(idx_rng)));
+        }
+    }
+
+    if substitute.is_empty() {
+        return None;
+    }
+
+    // Apply substitution
+    let subs_map: HashMap<UOpKey, Arc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
+    let substituted = src.substitute(&subs_map);
+
+    if materialize.is_empty() {
+        return Some(substituted);
+    }
+
+    // Create partial bufferize + index
+    let (mat_buf_rngs, mat_idx_rngs): (Vec<_>, Vec<_>) = materialize.into_iter().unzip();
+    let opts = BufferizeOpts::local();
+    let bufferized = UOp::bufferize(substituted, mat_buf_rngs, opts);
+
+    UOp::index(bufferized, mat_idx_rngs).ok()
 }
 
 // ============================================================================
@@ -568,7 +568,7 @@ fn apply_pcontig_removal(idx: &Arc<UOp>, config: &mut PcontigConfig) -> Option<A
 pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
     crate::patterns! {
         @context SplitReduceOpConfig;
-        reduce if matches!(reduce.op(), Op::ReduceAxis { .. }) => |reduce, ctx| split_reduceop(reduce, ctx),
+        reduce @ ReduceAxis { src: _ } => |reduce, ctx| split_reduceop(reduce, ctx),
     }
 }
 
@@ -576,8 +576,42 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
 /// Must run AFTER ReduceAxis → REDUCE conversion (Step 7) because these match Op::Reduce.
 pub fn reduction_simplify_patterns() -> TypedPatternMatcher {
     crate::patterns! {
-        x => |x| reduce_unparented(x),
-        x => |x| super::transforms::reduce_collapse(x),
+        reduce @ Reduce { src, ranges, reduce_op: Add | Mul | Max | Min } => |reduce, src, ranges, reduce_op| {
+            #[allow(clippy::mutable_key_type)]
+            let src_ranges = src.in_scope_ranges();
+            let (parented, unparented) = partition_reduce_ranges(ranges, src_ranges);
+
+            if unparented.is_empty() {
+                return None;
+            }
+
+            let mut result = if !parented.is_empty() || reduce.dtype() != src.dtype() {
+                UOp::reduce(Arc::clone(src), parented, *reduce_op)
+            } else {
+                Arc::clone(src)
+            };
+
+            match reduce_op {
+                ReduceOp::Add => {
+                    for range in &unparented {
+                        let size = get_range_size(range)?;
+                        let size_casted = cast_to_dtype(&size, &result.dtype())?;
+                        result = result.try_mul(&size_casted).ok()?;
+                    }
+                }
+                ReduceOp::Mul => {
+                    for range in &unparented {
+                        let size = get_range_size(range)?;
+                        let size_casted = cast_to_dtype(&size, &result.dtype())?;
+                        result = result.try_pow(&size_casted).ok()?;
+                    }
+                }
+                ReduceOp::Max | ReduceOp::Min => {}
+            }
+
+            Some(result)
+        },
+        Reduce { src, ranges } => || super::transforms::reduce_collapse(src, ranges),
     }
 }
 
@@ -591,10 +625,14 @@ pub fn movement_op_patterns() -> TypedPatternMatcher {
         Index { buffer: mop, indices, gate } if mop.op().is_movement() => |mop, indices, gate| {
             transform_movement_through_index(mop, indices, gate)
         },
-        Index { buffer: inner_idx, indices, gate: None }
-            if matches!(inner_idx.op(), morok_ir::Op::Index { .. }) => |inner_idx, indices| {
-            flatten_nested_index(inner_idx, indices)
-        },
+        // Flatten nested INDEX when both have gate: None and matching single indices
+        Index {
+            buffer: inner @ Index { indices: inner_indices, gate: None },
+            indices: outer_indices,
+            gate: None
+        } if inner_indices.len() == 1 && outer_indices.len() == 1
+             && inner_indices[0].id == outer_indices[0].id
+            ~> |inner| inner.clone(),
     }
 }
 
@@ -617,100 +655,19 @@ fn transform_movement_through_index(
     .ok()
 }
 
-/// Flatten nested INDEX operations.
-fn flatten_nested_index(inner_idx: &Arc<UOp>, outer_indices: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
-    if let morok_ir::Op::Index { indices: inner_indices, gate: None, .. } = inner_idx.op()
-        && inner_indices.len() == 1
-        && outer_indices.len() == 1
-        && inner_indices[0].id == outer_indices[0].id
-    {
-        return Some(inner_idx.clone());
-    }
-    None
-}
-
 // ============================================================================
 // CODEGEN PREPARATION PATTERNS
 // ============================================================================
 
-/// Replace NOOP operations with actual zero values.
-pub fn remove_noop(noop: &Arc<UOp>) -> Option<Arc<UOp>> {
-    if !matches!(noop.op(), Op::Noop) {
-        return None;
-    }
-
-    let dtype = noop.dtype();
+/// Create zero UOp for a given dtype (scalar or vector).
+fn dtype_zero(dtype: DType) -> Arc<UOp> {
     let base = dtype.base();
-
-    if base == morok_dtype::ScalarDType::Void {
-        return None;
-    }
-
+    let zero = ConstValue::zero(base);
     if dtype.is_vector() {
-        let count = dtype.count();
-        let zero_value = ConstValue::zero(base);
-        let zeros: SmallVec<[Arc<UOp>; 4]> = (0..count).map(|_| UOp::const_(DType::Scalar(base), zero_value)).collect();
-        return Some(UOp::vectorize(zeros));
+        UOp::vectorize((0..dtype.count()).map(|_| UOp::const_(DType::Scalar(base), zero)).collect())
+    } else {
+        UOp::const_(dtype, zero)
     }
-
-    let zero_value = ConstValue::zero(base);
-    Some(UOp::const_(dtype, zero_value))
-}
-
-/// Remove CONTIGUOUS markers.
-pub fn get_contiguous(contiguous: &Arc<UOp>) -> Option<Arc<UOp>> {
-    if !matches!(contiguous.op(), Op::Contiguous { .. }) {
-        return None;
-    }
-    Some(contiguous.op().sources()[0].clone())
-}
-
-/// Fix AFTER operations wrapping EXPAND (broadcast).
-pub fn fix_after_broadcast(after: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let (passthrough, deps) = match after.op() {
-        Op::After { passthrough, deps } => (passthrough, deps),
-        _ => return None,
-    };
-
-    let expand_src = match passthrough.op() {
-        Op::Expand { src, .. } => src,
-        _ => return None,
-    };
-
-    #[allow(clippy::mutable_key_type)]
-    let consumer_map = expand_src.get_consumer_map();
-    let has_range_parents = consumer_map
-        .get(&UOpKey(expand_src.clone()))
-        .map(|consumers| consumers.iter().any(|c| matches!(c.op(), Op::Range { .. })))
-        .unwrap_or(false);
-
-    if has_range_parents {
-        panic!("can't have a local AFTER");
-    }
-
-    Some(UOp::after(expand_src.clone(), deps.clone()))
-}
-
-/// Flatten cascaded INDEX operations (INDEX of INDEX).
-pub fn flatten_cascaded_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Index { buffer: inner_idx, indices: outer_indices, gate: outer_gate } = idx.op() else {
-        return None;
-    };
-
-    let Op::Index { buffer: real_buffer, indices: inner_indices, gate: inner_gate } = inner_idx.op() else {
-        return None;
-    };
-
-    if outer_indices.len() != 1 || inner_indices.len() != 1 {
-        return None;
-    }
-
-    if outer_gate.is_some() || inner_gate.is_some() {
-        return None;
-    }
-
-    let inner_offset = &inner_indices[0];
-    UOp::index(real_buffer.clone(), vec![inner_offset.clone()]).ok()
 }
 
 /// Create patterns for codegen preparation.
@@ -720,21 +677,21 @@ pub fn flatten_cascaded_index(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// architecture and prevents Binary(Range*stride) expressions in the IR.
 pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        noop if matches!(noop.op(), Op::Noop) => |noop| remove_noop(noop),
-        cont if matches!(cont.op(), Op::Contiguous { .. }) => |cont| get_contiguous(cont),
-        after if matches!(after.op(), Op::After { .. }) => |after| fix_after_broadcast(after),
-        idx if is_cascaded_index(idx) => |idx| flatten_cascaded_index(idx),
-    }
-}
-
-/// Patterns to run after expand.
-///
-/// Note: linearize_index was removed - multi-index INDEX ops are now linearized
-/// at codegen time to align with Tinygrad's architecture. This prevents creating
-/// Binary(Range*stride) expressions in the IR that would be incorrectly vectorized.
-pub fn post_expand_patterns() -> TypedPatternMatcher<()> {
-    crate::patterns! {
-        // Empty - linearization now happens at codegen time
+        // NOOP → zero constant (scalar or vector)
+        noop @ Noop() if noop.dtype().base() != morok_dtype::ScalarDType::Void => |noop| {
+            Some(dtype_zero(noop.dtype()))
+        },
+        // CONTIGUOUS is a no-op at this stage
+        Contiguous { src } ~> |src| src.clone(),
+        // AFTER(EXPAND): validate no local AFTER, then strip EXPAND
+        After { passthrough: Expand { src, .. }, deps } => |src, deps| {
+            #[allow(clippy::mutable_key_type)]
+            let has_range = src.get_consumer_map()
+                .get(&UOpKey(src.clone()))
+                .is_some_and(|c| c.iter().any(|c| matches!(c.op(), Op::Range { .. })));
+            assert!(!has_range, "can't have a local AFTER");
+            Some(UOp::after(src.clone(), deps.clone()))
+        },
     }
 }
 
@@ -742,183 +699,86 @@ pub fn post_expand_patterns() -> TypedPatternMatcher<()> {
 // KERNEL SPLITTING PATTERNS
 // ============================================================================
 
-/// Replace BUFFER with DEFINE_GLOBAL or DEFINE_LOCAL.
-pub fn debuf(buf: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let (ptr_dtype, addrspace) = match buf.op() {
-        Op::Buffer { size, .. } => {
-            // Extract element type - handle case where dtype might be Ptr
-            let base_dtype = match buf.dtype() {
-                DType::Ptr { base, .. } => (*base).clone(),
-                other => other,
-            };
-            let ptr_dtype = base_dtype.ptr(Some(*size), AddrSpace::Global);
-            (ptr_dtype, AddrSpace::Global)
-        }
-        _ => return None,
-    };
-
-    let replacement = if addrspace == AddrSpace::Global {
-        let global_id = ctx.next_global();
-        UOp::define_global(global_id, ptr_dtype)
-    } else {
-        let local_id = ctx.next_local();
-        UOp::define_local(local_id, ptr_dtype)
-    };
-
-    tracing::debug!(
-        buf_id = buf.id,
-        replacement_id = replacement.id,
-        replacement_op = ?std::mem::discriminant(replacement.op()),
-        "buffer_to_define_global: mapping BUFFER to DefineGlobal"
-    );
-    // Track DefineGlobal → original BUFFER id (never overwritten)
-    // This is used to find input buffers when buffer_map entries are overwritten
-    ctx.define_to_buffer_id.insert(replacement.id, buf.id);
-    ctx.map_buffer(buf.clone(), replacement.clone());
-    Some(replacement)
+/// Extract base dtype from a Ptr type, or return the type as-is.
+fn extract_base_dtype(dtype: DType) -> DType {
+    match dtype {
+        DType::Ptr { base, .. } => (*base).clone(),
+        other => other,
+    }
 }
 
-/// Handle AFTER: extract buffer and track dependency.
-pub fn handle_after(after: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let passthrough = match after.op() {
-        Op::After { passthrough, .. } => passthrough,
-        _ => return None,
-    };
-
-    let buf = match passthrough.op() {
+/// Extract buffer from AFTER passthrough (handles MStack/MSelect).
+fn extract_buffer_from_after(passthrough: &Arc<UOp>) -> Arc<UOp> {
+    match passthrough.op() {
         Op::MStack { buffers } if !buffers.is_empty() => buffers[0].clone(),
         Op::MSelect { buffer, .. } => buffer.clone(),
         _ => passthrough.clone(),
-    };
-
-    if matches!(buf.dtype(), DType::Ptr { addrspace: AddrSpace::Local, .. }) {
-        return Some(buf);
     }
-
-    ctx.map_buffer(buf.clone(), after.clone());
-    Some(buf)
 }
 
-/// Remove BIND: extract var and track it.
-///
-/// All BINDs are removed - loop generation comes from RANGE ops directly (Tinygrad approach).
-pub fn unbind_kernel(bind: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let (var, _value) = match bind.op() {
-        Op::Bind { var, value } => (var, value),
-        _ => return None,
-    };
-
-    ctx.add_var(var.clone());
-    Some(var.clone())
-}
-
-/// Renumber RANGE axis_id starting from 0 for kernel deduplication.
-///
-/// All ranges are renumbered uniformly - no BIND wrappers are created.
-/// CPU codegen generates for-loops directly from RANGE ops (matching Tinygrad's approach).
-pub fn renumber_range(range: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let (end, old_axis_id, axis_type) = match range.op() {
-        Op::Range { end, axis_id, axis_type } => (end, *axis_id, *axis_type),
-        _ => return None,
-    };
-
-    match old_axis_id {
-        AxisId::Unrenumbered(_) => {}
-        AxisId::Renumbered(_) => return None,
+/// Find output DefineGlobal from KERNEL AST.
+fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
+    for node in ast.toposort() {
+        if let Op::Store { buffer, .. } = node.op() {
+            let output_buf = match buffer.op() {
+                Op::Index { buffer: inner_buf, .. } => inner_buf.clone(),
+                _ => buffer.clone(),
+            };
+            if matches!(output_buf.op(), Op::DefineGlobal(_)) {
+                return Some(output_buf);
+            }
+        }
     }
-
-    // All ranges are renumbered uniformly - codegen creates loops from RANGE ops directly
-    let new_axis_id = AxisId::Renumbered(ctx.next_range());
-    let new_range = UOp::range_axis(end.clone(), new_axis_id, axis_type);
-    Some(new_range)
-}
-
-/// Remove spurious sources from CONST and DEFINE_VAR.
-pub fn cleanup_const(op: &Arc<UOp>, _ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let should_clean = matches!(op.op(), Op::Const(_) | Op::DefineVar { .. });
-
-    if !should_clean {
-        return None;
-    }
-
-    let sources = op.op().sources();
-    if sources.is_empty() {
-        return None;
-    }
-
-    let cleaned = match op.op() {
-        Op::Const(val) => UOp::const_(op.dtype(), val.0),
-        Op::DefineVar { name, min_val, max_val } => UOp::var(name.clone(), op.dtype(), *min_val, *max_val),
-        _ => unreachable!(),
-    };
-
-    Some(cleaned)
-}
-
-/// Replace RANGE(end=0) with CONST(0).
-pub fn remove_zero_range(range: &Arc<UOp>, _ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let end = match range.op() {
-        Op::Range { end, .. } => end,
-        _ => return None,
-    };
-
-    let is_zero = match end.op() {
-        Op::Const(val) => match val.0 {
-            ConstValue::Int(i) => i == 0,
-            ConstValue::UInt(u) => u == 0,
-            _ => false,
-        },
-        _ => false,
-    };
-
-    if !is_zero {
-        return None;
-    }
-
-    Some(UOp::index_const(0))
+    None
 }
 
 /// Create patterns for to_define_global transformation.
 pub fn to_define_global_patterns() -> TypedPatternMatcher<KernelContext> {
     crate::patterns! {
         @context KernelContext;
-        buf if matches!(buf.op(), Op::Buffer { .. }) => |buf, ctx| debuf(buf, ctx),
-        b if matches!(b.op(), Op::Bind { .. }) => |b, ctx| unbind_kernel(b, ctx),
-        after if matches!(after.op(), Op::After { .. }) => |after, ctx| handle_after(after, ctx),
-        c if matches!(c.op(), Op::Const(_) | Op::DefineVar { .. }) => |c, ctx| cleanup_const(c, ctx),
-        r if matches!(r.op(), Op::Range { .. }) => |r, ctx| remove_zero_range(r, ctx),
-        r if matches!(r.op(), Op::Range { .. }) => |r, ctx| renumber_range(r, ctx),
-        // Replace KERNEL references with their output buffer
-        k if matches!(k.op(), Op::Kernel { .. }) => |k, ctx| replace_kernel_with_buffer(k, ctx),
-    }
-}
-
-/// Replace KERNEL node with its output buffer.
-/// When a kernel's AST contains a reference to another KERNEL (from nested reductions),
-/// we replace it with the DEFINE_GLOBAL buffer that the inner kernel writes to.
-/// The consuming operation should then INDEX+LOAD from this buffer.
-fn replace_kernel_with_buffer(kernel: &Arc<UOp>, _ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let Op::Kernel { ast, .. } = kernel.op() else {
-        return None;
-    };
-
-    // Find the output buffer by looking at STORE operations in the AST
-    for node in ast.toposort() {
-        if let Op::Store { buffer, .. } = node.op() {
-            // Get the base buffer (unwrap INDEX if present)
-            let output_buf = match buffer.op() {
-                Op::Index { buffer: inner_buf, .. } => inner_buf.clone(),
-                _ => buffer.clone(),
-            };
-
-            if matches!(output_buf.op(), Op::DefineGlobal(_)) {
-                return Some(output_buf);
+        // Buffer → DefineGlobal
+        buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
+            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
+            let replacement = UOp::define_global(ctx.next_global(), ptr_dtype);
+            ctx.define_to_buffer_id.insert(replacement.id, buf.id);
+            ctx.map_buffer(buf.clone(), replacement.clone());
+            Some(replacement)
+        },
+        // Remove BIND: extract var and track it
+        Bind { var, value: _ } => |var, ctx| {
+            ctx.add_var(var.clone());
+            Some(var.clone())
+        },
+        // Handle AFTER: extract buffer and track dependency
+        after @ After { passthrough } => |after, passthrough, ctx| {
+            let buf = extract_buffer_from_after(passthrough);
+            if matches!(buf.dtype(), DType::Ptr { addrspace: AddrSpace::Local, .. }) {
+                return Some(buf);
             }
-        }
+            ctx.map_buffer(buf.clone(), after.clone());
+            Some(buf)
+        },
+        // Remove spurious sources from CONST and DEFINE_VAR
+        c @ Const(_) | c @ DefineVar { name: _ } => |c, _ctx| {
+            let sources = c.op().sources();
+            if sources.is_empty() { return None; }
+            Some(match c.op() {
+                Op::Const(val) => UOp::const_(c.dtype(), val.0),
+                Op::DefineVar { name, min_val, max_val } => UOp::var(name.clone(), c.dtype(), *min_val, *max_val),
+                _ => return None,
+            })
+        },
+        // Replace RANGE(end=0) with CONST(0)
+        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => |_r, _ctx| {
+            Some(UOp::index_const(0))
+        },
+        // Renumber RANGE axis_id (Unrenumbered → Renumbered)
+        Range { end, axis_id, axis_type } if matches!(axis_id, AxisId::Unrenumbered(_)) => |_r, end, axis_type, ctx| {
+            Some(UOp::range_axis(end.clone(), AxisId::Renumbered(ctx.next_range()), *axis_type))
+        },
+        // Replace KERNEL references with their output buffer
+        Kernel { ast } => |_k, ast, _ctx| find_kernel_output(ast),
     }
-
-    // No output buffer found - this shouldn't happen for valid kernels
-    None
 }
 
 // ============================================================================
@@ -964,309 +824,165 @@ pub fn extract_device_from_graph(root: &Arc<UOp>) -> Option<DeviceSpec> {
 }
 
 /// Create pattern matcher for buffer limit enforcement.
-pub fn buffer_limit_patterns(max_buffers: usize) -> TypedPatternMatcher {
-    use super::kernel::collect_accessed_buffers;
-    use morok_ir::pattern::RewriteResult;
-
-    let mut matcher = TypedPatternMatcher::new();
-
-    let limit = max_buffers;
-    matcher.add_wildcard(move |op: &Arc<UOp>, _ctx: &mut ()| {
-        let sources = match op.op() {
-            Op::Binary(_, left, right) => vec![left.clone(), right.clone()],
-            Op::Ternary(_, cond, true_val, false_val) => {
-                vec![cond.clone(), true_val.clone(), false_val.clone()]
-            }
-            _ => return RewriteResult::NoMatch,
-        };
-
-        let mut all_buffers = Vec::new();
-        for src in &sources {
-            all_buffers.extend(collect_accessed_buffers(src));
+///
+/// Uses `binary [*]` and `ternary [*]` to match all binary/ternary ops,
+/// checks if they access too many buffers, and forces bufferization of
+/// elementwise sources to GLOBAL memory if so.
+#[allow(unused_variables)] // `op` is used by macro expansion
+pub fn buffer_limit_patterns(max_buffers: usize) -> TypedPatternMatcher<()> {
+    crate::patterns! {
+        for op in binary [*] {
+            tree@op(a, b) => |tree, a, b| {
+                check_buffer_limit(tree, &[a.clone(), b.clone()], max_buffers)
+            },
         }
 
-        #[allow(clippy::mutable_key_type)]
-        let mut seen = HashSet::new();
-        all_buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
-
-        if all_buffers.len() > limit.saturating_sub(1) {
-            let mut new_sources = Vec::new();
-            let mut any_changed = false;
-
-            for src in &sources {
-                let new_src = if is_elementwise(src) { force_bufferize(src) } else { Arc::clone(src) };
-
-                if !Arc::ptr_eq(&new_src, src) {
-                    any_changed = true;
-                }
-                new_sources.push(new_src);
-            }
-
-            if any_changed {
-                let rewritten = match op.op() {
-                    Op::Binary(bin_op, _, _) => {
-                        let lhs = &new_sources[0];
-                        let rhs = &new_sources[1];
-                        match bin_op {
-                            morok_ir::BinaryOp::Add => lhs.try_add(rhs),
-                            morok_ir::BinaryOp::Sub => lhs.try_sub(rhs),
-                            morok_ir::BinaryOp::Mul => lhs.try_mul(rhs),
-                            morok_ir::BinaryOp::Idiv => lhs.try_div(rhs),
-                            morok_ir::BinaryOp::Fdiv => lhs.try_div(rhs),
-                            morok_ir::BinaryOp::Mod => lhs.try_mod(rhs),
-                            morok_ir::BinaryOp::And => lhs.try_and_op(rhs),
-                            morok_ir::BinaryOp::Or => lhs.try_or_op(rhs),
-                            morok_ir::BinaryOp::Xor => lhs.try_xor_op(rhs),
-                            morok_ir::BinaryOp::Lt => lhs.try_cmplt(rhs),
-                            morok_ir::BinaryOp::Le => lhs.try_cmple(rhs),
-                            morok_ir::BinaryOp::Eq => lhs.try_cmpeq(rhs),
-                            morok_ir::BinaryOp::Ne => lhs.try_cmpne(rhs),
-                            morok_ir::BinaryOp::Gt => lhs.try_cmpgt(rhs),
-                            morok_ir::BinaryOp::Ge => lhs.try_cmpge(rhs),
-                            morok_ir::BinaryOp::Max => lhs.try_max(rhs),
-                            morok_ir::BinaryOp::Pow => lhs.try_pow(rhs),
-                            morok_ir::BinaryOp::Shl | morok_ir::BinaryOp::Shr | morok_ir::BinaryOp::Threefry => {
-                                Ok(UOp::new(Op::Binary(*bin_op, lhs.clone(), rhs.clone()), op.dtype()))
-                            }
-                        }
-                        .expect("Binary op reconstruction should succeed")
-                    }
-                    Op::Ternary(tern_op, _, _, _) => match tern_op {
-                        morok_ir::TernaryOp::Where => {
-                            UOp::try_where(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
-                                .unwrap()
-                        }
-                        morok_ir::TernaryOp::MulAcc => {
-                            UOp::try_mulacc(new_sources[0].clone(), new_sources[1].clone(), new_sources[2].clone())
-                                .expect("MulAcc reconstruction should succeed")
-                        }
-                    },
-                    _ => unreachable!(),
-                };
-                return RewriteResult::Rewritten(rewritten);
-            }
+        for op in ternary [*] {
+            tree@op(a, b, c) => |tree, a, b, c| {
+                check_buffer_limit(tree, &[a.clone(), b.clone(), c.clone()], max_buffers)
+            },
         }
-
-        RewriteResult::NoMatch
-    });
-
-    matcher
-}
-
-/// Force bufferization of a computation to GLOBAL memory.
-fn force_bufferize(src: &Arc<UOp>) -> Arc<UOp> {
-    let ranges = collect_ranges(src);
-
-    if ranges.is_empty() {
-        return Arc::clone(src);
     }
-
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
-    let bufferized = UOp::bufferize(Arc::clone(src), ranges.clone(), opts);
-
-    UOp::index(bufferized, ranges).unwrap_or_else(|_| Arc::clone(src))
 }
 
-/// Collect all RANGE operations from a computation tree.
-#[allow(clippy::mutable_key_type)]
-fn collect_ranges(src: &Arc<UOp>) -> Vec<Arc<UOp>> {
-    let mut ranges = Vec::new();
+/// Check buffer limit and force bufferization if exceeded.
+fn check_buffer_limit(tree: &Arc<UOp>, sources: &[Arc<UOp>], max_buffers: usize) -> Option<Arc<UOp>> {
+    let all_buffers = collect_accessed_buffers(sources);
+
+    if all_buffers.len() > max_buffers.saturating_sub(1) {
+        let mut any_changed = false;
+        let new_sources: Vec<_> = sources
+            .iter()
+            .map(|src| {
+                if is_elementwise(src) {
+                    let new = force_bufferize(src);
+                    if !Arc::ptr_eq(&new, src) {
+                        any_changed = true;
+                    }
+                    new
+                } else {
+                    src.clone()
+                }
+            })
+            .collect();
+
+        if any_changed {
+            return Some(tree.with_sources(new_sources));
+        }
+    }
+    None
+}
+
+/// Collect all accessed buffers from sources.
+fn collect_accessed_buffers(sources: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+    let mut all_buffers = Vec::new();
+    #[allow(clippy::mutable_key_type)]
     let mut visited = HashSet::new();
 
-    fn visit(uop: &Arc<UOp>, ranges: &mut Vec<Arc<UOp>>, visited: &mut HashSet<UOpKey>) {
+    #[allow(clippy::mutable_key_type)]
+    fn collect_recursive(uop: &Arc<UOp>, buffers: &mut Vec<Arc<UOp>>, visited: &mut HashSet<UOpKey>) {
         let key = UOpKey(Arc::clone(uop));
         if !visited.insert(key) {
             return;
         }
-
-        if matches!(uop.op(), Op::Range { .. }) {
-            ranges.push(Arc::clone(uop));
+        match uop.op() {
+            Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
+                buffers.push(Arc::clone(uop));
+                return; // Stop at GLOBAL bufferize
+            }
+            Op::Buffer { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
+                buffers.push(Arc::clone(uop));
+            }
+            _ => {}
         }
-
         for child in uop.op().sources() {
-            visit(&child, ranges, visited);
+            collect_recursive(&child, buffers, visited);
         }
     }
 
-    visit(src, &mut ranges, &mut visited);
+    for src in sources {
+        collect_recursive(src, &mut all_buffers, &mut visited);
+    }
 
+    // Deduplicate
+    #[allow(clippy::mutable_key_type)]
     let mut seen = HashSet::new();
-    ranges.retain(|r| seen.insert(UOpKey(Arc::clone(r))));
+    all_buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
+    all_buffers
+}
 
-    ranges
+/// Force bufferization of a computation to GLOBAL memory.
+fn force_bufferize(src: &Arc<UOp>) -> Arc<UOp> {
+    let ranges = src.ranges().clone();
+    if ranges.is_empty() {
+        return Arc::clone(src);
+    }
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let bufferized = UOp::bufferize(Arc::clone(src), ranges.clone(), opts);
+    UOp::index(bufferized, ranges).unwrap_or_else(|_| Arc::clone(src))
 }
 
 // ============================================================================
 // PM_ADD_LOADS - Wrap INDEX with LOAD for arithmetic ops
 // ============================================================================
 
-/// Wrap an INDEX node with LOAD.
-///
-/// Returns None if the node is not an INDEX op.
-/// Handles vectorized indices by creating a LOAD with vector dtype.
-fn wrap_index_with_load(idx: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Index { buffer, indices, .. } = idx.op() else {
-        return None;
-    };
-
-    // Check if any index is vectorized (has vector dtype)
-    let vec_count = indices.iter().find_map(|i| match i.dtype() {
-        DType::Vector { count, .. } => Some(count),
-        _ => None,
-    });
-
-    // Get element type from buffer
-    let element_dtype = match buffer.dtype() {
-        DType::Ptr { base, .. } => (*base).clone(),
-        other => other.clone(),
-    };
-
-    // If indices are vectorized, LOAD produces a vector
-    let result_dtype = match vec_count {
-        Some(count) => element_dtype.vec(count),
-        None => element_dtype,
-    };
-
-    // Create LOAD with correct dtype
-    Some(UOp::new(Op::Load { buffer: buffer.clone(), index: idx.clone() }, result_dtype))
-}
-
-/// Reconstruct a binary operation with new operands.
-fn reconstruct_binary(op: BinaryOp, lhs: Arc<UOp>, rhs: Arc<UOp>) -> Option<Arc<UOp>> {
-    match op {
-        BinaryOp::Add => lhs.try_add(&rhs).ok(),
-        BinaryOp::Sub => lhs.try_sub(&rhs).ok(),
-        BinaryOp::Mul => lhs.try_mul(&rhs).ok(),
-        BinaryOp::Idiv => lhs.try_div(&rhs).ok(),
-        BinaryOp::Fdiv => lhs.try_div(&rhs).ok(),
-        BinaryOp::Mod => lhs.try_mod(&rhs).ok(),
-        BinaryOp::Max => lhs.try_max(&rhs).ok(),
-        BinaryOp::Pow => lhs.try_pow(&rhs).ok(),
-        BinaryOp::Lt => lhs.try_cmplt(&rhs).ok(),
-        BinaryOp::Le => lhs.try_cmple(&rhs).ok(),
-        BinaryOp::Eq => lhs.try_cmpeq(&rhs).ok(),
-        BinaryOp::Ne => lhs.try_cmpne(&rhs).ok(),
-        BinaryOp::Gt => lhs.try_cmpgt(&rhs).ok(),
-        BinaryOp::Ge => lhs.try_cmpge(&rhs).ok(),
-        BinaryOp::And => lhs.try_and_op(&rhs).ok(),
-        BinaryOp::Or => lhs.try_or_op(&rhs).ok(),
-        BinaryOp::Xor => lhs.try_xor_op(&rhs).ok(),
-        BinaryOp::Shl | BinaryOp::Shr | BinaryOp::Threefry => {
-            // These ops don't have try_ methods, construct directly
-            let dtype = lhs.dtype();
-            Some(UOp::new(Op::Binary(op, lhs, rhs), dtype))
-        }
-    }
-}
-
-/// Reconstruct a unary operation with new operand.
-fn reconstruct_unary(op: UnaryOp, src: Arc<UOp>) -> Option<Arc<UOp>> {
-    // Get dtype before moving src into Op::Unary
-    let dtype = src.dtype();
-    Some(UOp::new(Op::Unary(op, src), dtype))
-}
-
 /// Pattern matcher to wrap INDEX sources with LOAD for arithmetic operations.
 ///
 /// Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
-/// - INDEX returns indices/pointer (for scatter in STORE)
-/// - LOAD wraps INDEX for arithmetic consumers (performs gather)
+/// Simplified approach: transform INDEX → LOAD(INDEX) at source, then cleanup STORE.
 ///
-/// This ensures that:
-/// - Binary/Unary/Ternary ops receive gathered data via explicit LOAD
-/// - STORE keeps raw INDEX for scatter operations
+/// Bottom-up rewriting propagates the transformation to all consumers automatically:
+/// 1. INDEX → LOAD(buffer, INDEX) - wrap every INDEX with LOAD
+/// 2. STORE cleanup - remove LOAD from index position (STORE needs raw INDEX)
 pub fn pm_add_loads() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        // =====================================================================
-        // Binary ops with INDEX on left: op(INDEX, y) → op(LOAD(buf, INDEX), y)
-        // =====================================================================
-        for op in binary [Add, Sub, Mul, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
-            op(idx, y) if matches!(idx.op(), Op::Index { .. }) => |idx, y| {
-                let loaded = wrap_index_with_load(idx)?;
-                reconstruct_binary(op, loaded, y.clone())
-            },
-        },
+        // Pattern 1: Every INDEX → LOAD(buffer, INDEX)
+        // Bottom-up rewriting propagates this to all consumers automatically
+        idx @ Index { buffer, indices } => |idx, buffer, indices| {
+            // Handle vectorized indices - if any index has vector dtype, LOAD produces vector
+            let vec_count = indices.iter().find_map(|i| match i.dtype() {
+                DType::Vector { count, .. } => Some(count),
+                _ => None,
+            });
 
-        // =====================================================================
-        // Binary ops with INDEX on right: op(x, INDEX) → op(x, LOAD(buf, INDEX))
-        // =====================================================================
-        for op in binary [Add, Sub, Mul, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr, Lt, Le, Eq, Ne, Gt, Ge] {
-            op(x, idx) if matches!(idx.op(), Op::Index { .. }) => |x, idx| {
-                let loaded = wrap_index_with_load(idx)?;
-                reconstruct_binary(op, x.clone(), loaded)
-            },
-        },
-
-        // =====================================================================
-        // Unary ops: op(INDEX) → op(LOAD(buf, INDEX))
-        // =====================================================================
-        for op in unary [Neg, Not, Abs, Sqrt, Exp, Log, Sin, Cos, Exp2, Log2, Tan, Rsqrt, Reciprocal, Trunc] {
-            op(idx) if matches!(idx.op(), Op::Index { .. }) => |idx| {
-                let loaded = wrap_index_with_load(idx)?;
-                reconstruct_unary(op, loaded)
-            },
-        },
-
-        // =====================================================================
-        // Ternary ops - Where: wrap INDEX sources with LOAD
-        // =====================================================================
-        Where(idx, t, f) if matches!(idx.op(), Op::Index { .. }) => |idx, t, f| {
-            let loaded = wrap_index_with_load(idx)?;
-            UOp::try_where(loaded, t.clone(), f.clone()).ok()
-        },
-        Where(cond, idx, f) if matches!(idx.op(), Op::Index { .. }) => |cond, idx, f| {
-            let loaded = wrap_index_with_load(idx)?;
-            UOp::try_where(cond.clone(), loaded, f.clone()).ok()
-        },
-        Where(cond, t, idx) if matches!(idx.op(), Op::Index { .. }) => |cond, t, idx| {
-            let loaded = wrap_index_with_load(idx)?;
-            UOp::try_where(cond.clone(), t.clone(), loaded).ok()
-        },
-
-        // =====================================================================
-        // Ternary ops - MulAcc: wrap INDEX sources with LOAD
-        // =====================================================================
-        MulAcc(idx, b, c) if matches!(idx.op(), Op::Index { .. }) => |idx, b, c| {
-            let loaded = wrap_index_with_load(idx)?;
-            UOp::try_mulacc(loaded, b.clone(), c.clone()).ok()
-        },
-        MulAcc(a, idx, c) if matches!(idx.op(), Op::Index { .. }) => |a, idx, c| {
-            let loaded = wrap_index_with_load(idx)?;
-            UOp::try_mulacc(a.clone(), loaded, c.clone()).ok()
-        },
-        MulAcc(a, b, idx) if matches!(idx.op(), Op::Index { .. }) => |a, b, idx| {
-            let loaded = wrap_index_with_load(idx)?;
-            UOp::try_mulacc(a.clone(), b.clone(), loaded).ok()
-        },
-
-        // =====================================================================
-        // REDUCE: wrap INDEX accumulator source with LOAD, preserve REDUCE dtype
-        // =====================================================================
-        reduce if matches!(reduce.op(), Op::Reduce { .. }) => |reduce| {
-            let Op::Reduce { src, ranges, reduce_op } = reduce.op() else { return None; };
-            if !matches!(src.op(), Op::Index { .. }) { return None; }
-            let loaded = wrap_index_with_load(src)?;
-            // Preserve original REDUCE dtype - horizontal_reduce handles vectorized sources.
-            // LOAD may have vector dtype (for gather), but REDUCE output stays scalar.
-            let output_dtype = reduce.dtype().clone();
-            Some(UOp::new(
-                Op::Reduce { src: loaded, ranges: ranges.clone(), reduce_op: *reduce_op },
-                output_dtype,
-            ))
-        },
-
-        // =====================================================================
-        // Cast: wrap INDEX source with LOAD, propagate vector dtype
-        // =====================================================================
-        Cast { src: idx, dtype } if matches!(idx.op(), Op::Index { .. }) => |idx, dtype| {
-            let loaded = wrap_index_with_load(idx)?;
-            // If LOAD has vector dtype, Cast output should also be vector
-            let output_dtype = match loaded.dtype() {
-                DType::Vector { count, .. } => dtype.base().vec(count),
-                _ => dtype.clone(),
+            let element_dtype = match buffer.dtype() {
+                DType::Ptr { base, .. } => (*base).clone(),
+                other => other.clone(),
             };
-            Some(UOp::cast(loaded, output_dtype))
+
+            let result_dtype = match vec_count {
+                Some(count) => element_dtype.vec(count),
+                None => element_dtype,
+            };
+
+            // Create FRESH INDEX to break self-reference (matches Tinygrad's idx.replace() approach).
+            // Without this, LOAD contains the ORIGINAL INDEX which has a cached result,
+            // causing Pattern 2's extracted INDEX to be re-substituted → oscillation.
+            let gate = match idx.op() {
+                Op::Index { gate, .. } => gate.clone(),
+                _ => None,
+            };
+            let fresh_index = UOp::new(
+                Op::Index { buffer: buffer.clone(), indices: indices.clone(), gate },
+                idx.dtype().clone(),
+            );
+
+            Some(UOp::new(Op::Load { buffer: buffer.clone(), index: fresh_index }, result_dtype))
         },
+
+        // Pattern 2: Cleanup STORE - remove LOAD from index position
+        Store { buffer, index: Load { index: real_index, .. }, value, ranges } =>
+            |buffer, real_index, value, ranges| {
+                Some(UOp::store_with_ranges(buffer.clone(), real_index.clone(), value.clone(), ranges.clone()))
+            },
+
+        // Pattern 3: Cleanup StoreGated - remove LOAD from index position
+        StoreGated { buffer, index: Load { index: real_index, .. }, value, gate, ranges } =>
+            |buffer, real_index, value, gate, ranges| {
+                Some(UOp::store_gated_with_ranges(
+                    buffer.clone(), real_index.clone(), value.clone(), gate.clone(), ranges.clone()
+                ))
+            },
     }
 }
 
@@ -1282,71 +998,45 @@ fn is_vectorized_bool(dtype: &DType) -> bool {
     dtype.base() == ScalarDType::Bool && dtype.vcount() > 1
 }
 
-/// Devectorize a binary bool op into scalar ops + VECTORIZE.
+/// Unified devectorize for any binary op producing vectorized output.
 ///
-/// Converts: AND(<4 x bool>, <4 x bool>)
-/// Into: VECTORIZE(AND(gep(a,0), gep(b,0)), AND(gep(a,1), gep(b,1)), ...)
-fn devectorize_binary_bool(op: &BinaryOp, a: &Arc<UOp>, b: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let dtype = a.dtype();
-    if !is_vectorized_bool(&dtype) {
+/// Handles scalar-vector operand mix (from comparisons like `vec < scalar`).
+/// Converts: OP(<N x T>, <N x T>) → VECTORIZE(OP(gep(a,0), gep(b,0)), ...)
+fn devectorize_binary(op: &BinaryOp, result: &Arc<UOp>, a: &Arc<UOp>, b: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let out_vcount = result.dtype().vcount();
+    if out_vcount <= 1 {
         return None;
     }
 
-    let vcount = dtype.vcount();
-    let scalar_dtype = DType::Scalar(ScalarDType::Bool);
-
-    let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
-        .map(|i| {
-            let a_elem = UOp::gep(a.clone(), vec![i]);
-            let b_elem = UOp::gep(b.clone(), vec![i]);
-            UOp::new(Op::Binary(*op, a_elem, b_elem), scalar_dtype.clone())
-        })
-        .collect();
-
-    Some(UOp::vectorize(scalar_ops))
-}
-
-/// Devectorize a unary bool op into scalar ops + VECTORIZE.
-fn devectorize_unary_bool(op: &UnaryOp, src: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let dtype = src.dtype();
-    if !is_vectorized_bool(&dtype) {
-        return None;
-    }
-
-    let vcount = dtype.vcount();
-    let scalar_dtype = DType::Scalar(ScalarDType::Bool);
-
-    let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
-        .map(|i| {
-            let elem = UOp::gep(src.clone(), vec![i]);
-            UOp::new(Op::Unary(*op, elem), scalar_dtype.clone())
-        })
-        .collect();
-
-    Some(UOp::vectorize(scalar_ops))
-}
-
-/// Devectorize a comparison op that produces vectorized bools.
-///
-/// Handles comparisons where either operand is vectorized (or both).
-/// Broadcasts scalar operands to match the vector width.
-fn devectorize_comparison(op: &BinaryOp, a: &Arc<UOp>, b: &Arc<UOp>) -> Option<Arc<UOp>> {
     let a_vcount = a.dtype().vcount();
     let b_vcount = b.dtype().vcount();
-    let vcount = a_vcount.max(b_vcount);
+    let scalar_dtype = DType::Scalar(result.dtype().base());
 
-    if vcount <= 1 {
-        return None;
-    }
-
-    let scalar_dtype = DType::Scalar(ScalarDType::Bool);
-
-    let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+    let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..out_vcount)
         .map(|i| {
-            // Extract element or clone scalar (GEP on scalar returns the scalar)
+            // Handle scalar-vector mix: only GEP if operand is vectorized
             let a_elem = if a_vcount > 1 { UOp::gep(a.clone(), vec![i]) } else { a.clone() };
             let b_elem = if b_vcount > 1 { UOp::gep(b.clone(), vec![i]) } else { b.clone() };
             UOp::new(Op::Binary(*op, a_elem, b_elem), scalar_dtype.clone())
+        })
+        .collect();
+
+    Some(UOp::vectorize(scalar_ops))
+}
+
+/// Unified devectorize for any unary op producing vectorized output.
+fn devectorize_unary(op: &UnaryOp, result: &Arc<UOp>, src: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let out_vcount = result.dtype().vcount();
+    if out_vcount <= 1 {
+        return None;
+    }
+
+    let scalar_dtype = DType::Scalar(result.dtype().base());
+
+    let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..out_vcount)
+        .map(|i| {
+            let elem = UOp::gep(src.clone(), vec![i]);
+            UOp::new(Op::Unary(*op, elem), scalar_dtype.clone())
         })
         .collect();
 
@@ -1360,35 +1050,27 @@ fn devectorize_comparison(op: &BinaryOp, a: &Arc<UOp>, b: &Arc<UOp>) -> Option<A
 /// VECTORIZE, following Tinygrad's approach (devectorizer.py:no_vectorized_alu).
 ///
 /// Transforms:
-/// - AND/OR/XOR/MAX on bool vectors → scalar ops + VECTORIZE
-/// - NOT on bool vectors → scalar ops + VECTORIZE
-/// - Comparisons producing bool vectors → scalar comparisons + VECTORIZE
+/// - Any binary op producing vectorized bool → scalar ops + VECTORIZE
+/// - Any unary op producing vectorized bool → scalar ops + VECTORIZE
 /// - WHERE with vectorized condition → scalar WHERE + VECTORIZE
 pub fn pm_bool_devectorize() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        // Binary bool ops: And, Or, Xor, Max on vectorized bools
-        // Max is created by horizontal_reduce for Max reductions
-        // (Min uses Where(a < b, a, b), which is handled separately)
-        for op in binary [And, Or, Xor, Max] {
-            op(a, b) if is_vectorized_bool(&a.dtype()) => |a, b| {
-                devectorize_binary_bool(&op, a, b)
+        // Any binary op that produces vectorized bool output
+        // Covers: And, Or, Xor, Max on bool vectors AND Lt, Le, Eq, Ne, Gt, Ge comparisons
+        for op in binary [*] {
+            result @ op(a, b) if is_vectorized_bool(&result.dtype()) => |result, a, b| {
+                devectorize_binary(&op, result, a, b)
             },
         },
 
-        // Unary bool ops: Not on vectorized bools
-        Not(src) if is_vectorized_bool(&src.dtype()) => |src| {
-            devectorize_unary_bool(&UnaryOp::Not, src)
-        },
-
-        // Comparison ops producing vectorized bools
-        // Check both operands since scalar-vector comparisons also produce vector bools
-        for op in binary [Lt, Le, Eq, Ne, Gt, Ge] {
-            op(a, b) if a.dtype().vcount() > 1 || b.dtype().vcount() > 1 => |a, b| {
-                devectorize_comparison(&op, a, b)
+        // Any unary op that produces vectorized bool (only Not applies)
+        for op in unary [*] {
+            result @ op(src) if is_vectorized_bool(&result.dtype()) => |result, src| {
+                devectorize_unary(&op, result, src)
             },
         },
 
-        // WHERE with vectorized condition (from horizontal reduce's Min operation)
+        // WHERE with vectorized condition (output may not be bool, but condition is)
         // Based on Tinygrad's no_vectorized_alu (devectorizer.py:219-223)
         Where(cond, t, f) if cond.dtype().vcount() > 1 => |cond, t, f| {
             devectorize_where(cond, t, f)
@@ -1424,8 +1106,6 @@ fn devectorize_where(cond: &Arc<UOp>, t: &Arc<UOp>, f: &Arc<UOp>) -> Option<Arc<
 // HORIZONTAL REDUCE (Tinygrad's devectorizer.py approach)
 // ============================================================================
 
-use morok_ir::TernaryOp;
-
 /// Apply binary reduce operation between two values (scalar or vector).
 ///
 /// Handles all ReduceOp types:
@@ -1446,7 +1126,7 @@ fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DT
             // - Vector operands -> DType::Bool.vec(vcount)
             let cond_dtype = DType::Bool.vec(dtype.vcount());
             let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), cond_dtype);
-            UOp::new(Op::Ternary(TernaryOp::Where, cond, a, b), dtype.clone())
+            UOp::try_where(cond, a, b).unwrap()
         }
     }
 }
@@ -1472,24 +1152,13 @@ fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DT
 ///
 /// # Returns
 /// A list of GEP operations, each producing `out_dtype` elements.
-/// If no horizontal reduction needed (src.dtype == out_dtype), returns `[src]`.
 fn horizontal_reduce(src: &Arc<UOp>, out_dtype: &DType, reduce_op: ReduceOp) -> Vec<Arc<UOp>> {
     let src_count = src.dtype().vcount();
     let out_count = out_dtype.vcount();
-
-    // No reduction needed if dtypes match
-    if src_count == out_count {
-        return vec![src.clone()];
-    }
-
-    // Edge case: source is scalar
-    if src_count <= 1 {
-        return vec![src.clone()];
-    }
-
     let horizontal_amount = src_count / out_count;
 
     // Edge case: uneven division - fall back to full scalar reduction
+    // (Can happen with non-power-of-2 upcast amounts like 3)
     if !src_count.is_multiple_of(out_count) || horizontal_amount == 0 {
         let scalar_dtype = DType::Scalar(src.dtype().base());
         let elements: Vec<Arc<UOp>> = (0..src_count).map(|i| UOp::gep(src.clone(), vec![i])).collect();
@@ -1497,7 +1166,7 @@ fn horizontal_reduce(src: &Arc<UOp>, out_dtype: &DType, reduce_op: ReduceOp) -> 
             elements
                 .into_iter()
                 .reduce(|acc, elem| apply_reduce_binary(reduce_op, acc, elem, &scalar_dtype))
-                .expect("src_count > 1"),
+                .expect("src_count >= 2 guaranteed by guard"),
         ];
     }
 
@@ -1527,7 +1196,7 @@ fn transform_vectorized_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     let out_vcount = reduce.dtype().vcount();
 
     // Only transform when source has more elements than output (need horizontal reduction).
-    // Vectorized bool REDUCEs with matching vcounts are handled by pm_devectorize_bool_reduce.
+    // Other cases (K-vectorized, bool reduce) are handled by pm_reduce_devectorize's branching.
     if src_vcount <= out_vcount {
         return None;
     }
@@ -1560,108 +1229,77 @@ fn transform_vectorized_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 }
 
-/// Check if REDUCE has vectorized source that needs horizontal reduction.
+/// Unified guard: check if REDUCE needs any form of devectorization.
 ///
-/// Horizontal reduction is needed when source vcount > output vcount,
-/// meaning we need to reduce multiple source elements into each output element.
-///
-/// NOTE: We use `src_vcount > reduce_vcount` (not `!=`) to avoid triggering
-/// on cases where src has FEWER elements than output (e.g., src_vcount=1,
-/// reduce_vcount=5), which would cause an infinite loop since horizontal_reduce
-/// returns the source unchanged when src_count <= 1.
-///
-/// Bool accumulators with matching vcounts are handled by `pm_devectorize_bool_reduce`
-/// which runs before this pass to avoid LLVM `<N x i1>` issues.
-fn needs_horizontal_reduce(reduce: &Arc<UOp>) -> bool {
-    use tracing::trace;
+/// Combines three mutually exclusive cases:
+/// 1. K-vectorized: CONTRACT source with vector output (SLP optimization)
+/// 2. Bool reduce: matching vcounts, bool dtype, no CONTRACT (LLVM `<N x i1>` workaround)
+/// 3. Horizontal: source has more elements than output (needs stride-pattern GEPs)
+fn needs_reduce_devectorize(reduce: &Arc<UOp>) -> bool {
+    let Op::Reduce { src, .. } = reduce.op() else {
+        return false;
+    };
 
-    if let Op::Reduce { src, .. } = reduce.op() {
-        let src_vcount = src.dtype().vcount();
-        let reduce_vcount = reduce.dtype().vcount();
+    let src_vcount = src.dtype().vcount();
+    let out_vcount = reduce.dtype().vcount();
+    let is_bool = reduce.dtype().base() == ScalarDType::Bool;
+    let has_contract = matches!(src.op(), Op::Contract { .. });
 
-        // Only reduce when source has MORE elements than output.
-        // Vectorized bool REDUCEs with matching vcounts are handled by
-        // pm_devectorize_bool_reduce which runs before this pass.
-        let needs_horiz = src_vcount > reduce_vcount;
-
-        trace!(
-            reduce_id = reduce.id,
-            src_vcount,
-            reduce_vcount,
-            needs_horiz,
-            src_dtype = ?src.dtype(),
-            reduce_dtype = ?reduce.dtype(),
-            "needs_horizontal_reduce check"
-        );
-
-        needs_horiz
-    } else {
-        false
-    }
+    // K-vectorized: CONTRACT source with vector output
+    has_contract && out_vcount > 1 || out_vcount > 1 && is_bool && src_vcount == out_vcount
 }
 
-/// Pattern matcher for horizontal reduction of vectorized REDUCE sources.
+/// Inline helper: check if REDUCE is K-vectorized (CONTRACT source).
+#[inline]
+fn is_k_vectorized(reduce: &Arc<UOp>, src: &Arc<UOp>) -> bool {
+    reduce.dtype().vcount() > 1 && matches!(src.op(), Op::Contract { .. })
+}
+
+/// Inline helper: check if REDUCE is vectorized bool with matching vcounts.
+#[inline]
+fn is_bool_reduce(reduce: &Arc<UOp>, src: &Arc<UOp>) -> bool {
+    let out_vcount = reduce.dtype().vcount();
+    out_vcount > 1
+        && reduce.dtype().base() == ScalarDType::Bool
+        && src.dtype().vcount() == out_vcount
+        && !matches!(src.op(), Op::Contract { .. })
+}
+
+/// Unified pattern matcher for REDUCE devectorization.
 ///
-/// When UPCAST is applied to non-reduce axes, REDUCE receives vectorized inputs.
-/// LLVM cannot handle `<N x i1>` vector accumulators (especially for bool).
-/// This pass performs horizontal reduction first, converting vectorized source
-/// to scalar before the REDUCE loop.
+/// Combines three mutually exclusive REDUCE devectorization transforms:
 ///
-/// Based on Tinygrad's devectorizer.py:horizontal_reduce + reduce_to_acc.
+/// 1. **K-vectorized** (CONTRACT source with vector output):
+///    Transforms to N scalar REDUCEs + tree_reduce for SLP optimization.
+///    Example: REDUCE(CONTRACT(src<4>), Add) → tree_reduce([REDUCE(gep(0)), ...])
 ///
-/// Transforms:
-/// - REDUCE(Max, <4 x bool> src, ranges) → REDUCE(Max, Max(Max(Max(e0,e1),e2),e3), ranges)
-pub fn pm_horizontal_reduce() -> TypedPatternMatcher<()> {
+/// 2. **Bool reduce** (matching vcounts, bool dtype, no CONTRACT):
+///    Transforms to N scalar REDUCEs + VECTORIZE to avoid LLVM `<N x i1>` bugs.
+///    Example: REDUCE(<2 x bool> src) → VECTORIZE(REDUCE(gep(0)), REDUCE(gep(1)))
+///
+/// 3. **Horizontal reduce** (src_vcount > out_vcount):
+///    Transforms using stride-pattern GEPs + ALU chain.
+///    Example: REDUCE(<16 x f32> → <4 x f32>) → chain(gep[0,4,8,12], gep[1,5,9,13], ...)
+///
+/// Based on Tinygrad's pm_reduce (devectorizer.py:283-316).
+pub fn pm_reduce_devectorize() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        // Match REDUCE with vectorized source
-        reduce if needs_horizontal_reduce(reduce) => |reduce| {
-            transform_vectorized_reduce(reduce)
+        reduce @ Reduce { src } if needs_reduce_devectorize(reduce) => |reduce, src| {
+            // Branch to appropriate transform based on case
+            if is_k_vectorized(reduce, src) {
+                devectorize_to_scalar_accumulators(reduce)
+            } else if is_bool_reduce(reduce, src) {
+                devectorize_bool_reduce(reduce)
+            } else {
+                transform_vectorized_reduce(reduce)
+            }
         },
     }
 }
 
 // ============================================================================
-// BOOL REDUCE DEVECTORIZATION (avoid LLVM <N x i1> accumulators)
+// REDUCE DEVECTORIZATION TRANSFORMS (used by pm_reduce_devectorize)
 // ============================================================================
-
-/// Check if REDUCE has vectorized bool output with matching source vcount.
-///
-/// This pattern applies when UPCAST is on a non-reduce axis, causing:
-/// - Source and output vcounts to match (each lane reduces independently)
-/// - Bool dtype (which LLVM can't handle as `<N x i1>` accumulators)
-///
-/// Does NOT match:
-/// - Scalar REDUCEs (already handled)
-/// - K-vectorized REDUCEs (CONTRACT source, different mechanism)
-/// - Non-bool REDUCEs (LLVM handles those fine)
-fn is_vectorized_bool_reduce(reduce: &Arc<UOp>) -> bool {
-    use tracing::trace;
-
-    if let Op::Reduce { src, .. } = reduce.op() {
-        let out_vcount = reduce.dtype().vcount();
-        let src_vcount = src.dtype().vcount();
-        let is_bool = reduce.dtype().base() == ScalarDType::Bool;
-        let has_contract = matches!(src.op(), Op::Contract { .. });
-
-        let matches = is_bool && out_vcount > 1 && src_vcount == out_vcount && !has_contract;
-
-        trace!(
-            reduce_id = reduce.id,
-            is_bool,
-            out_vcount,
-            src_vcount,
-            has_contract,
-            matches,
-            reduce_dtype = ?reduce.dtype(),
-            src_dtype = ?src.dtype(),
-            "is_vectorized_bool_reduce check"
-        );
-
-        matches
-    } else {
-        false
-    }
-}
 
 /// Devectorize REDUCE with vectorized bool output to N scalar REDUCEs.
 ///
@@ -1679,8 +1317,6 @@ fn is_vectorized_bool_reduce(reduce: &Arc<UOp>) -> bool {
 ///
 /// Based on Tinygrad's `no_vectorized_alu` pattern which devectorizes ALU ops.
 fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use tracing::trace;
-
     let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
         return None;
     };
@@ -1711,42 +1347,6 @@ fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(UOp::vectorize(scalar_reduces))
 }
 
-/// Pattern matcher for devectorizing bool REDUCEs to avoid LLVM `<N x i1>` accumulators.
-///
-/// When UPCAST is applied to non-reduce axes with bool data, REDUCE would have
-/// `<N x bool>` output dtype. LLVM's handling of `<N x i1>` phi nodes and ALU
-/// operations is undefined/buggy.
-///
-/// This pattern transforms such REDUCEs into N independent scalar REDUCEs,
-/// each with a scalar bool accumulator, then wraps them in VECTORIZE.
-///
-/// Must run BEFORE `pm_horizontal_reduce` to handle the matching-vcount case.
-pub fn pm_devectorize_bool_reduce() -> TypedPatternMatcher<()> {
-    crate::patterns! {
-        reduce if is_vectorized_bool_reduce(reduce) => |reduce| devectorize_bool_reduce(reduce),
-    }
-}
-
-// ============================================================================
-// SCALAR ACCUMULATOR DEVECTORIZATION (K-vectorization → SLP-friendly scalars)
-// ============================================================================
-
-/// Check if REDUCE is K-vectorized (Vector dtype with CONTRACT source).
-///
-/// K-vectorization pattern: UPCAST applied to reduce axis creates:
-/// - REDUCE with Vector output dtype
-/// - CONTRACT-wrapped source documenting upcast axes
-fn is_k_vectorized_reduce(reduce: &Arc<UOp>) -> bool {
-    if let Op::Reduce { src, .. } = reduce.op() {
-        // Check: Vector output dtype AND CONTRACT source
-        let has_vector_dtype = reduce.dtype().vcount() > 1;
-        let has_contract_src = matches!(src.op(), Op::Contract { .. });
-        has_vector_dtype && has_contract_src
-    } else {
-        false
-    }
-}
-
 /// Devectorize K-vectorized REDUCE to N scalar REDUCEs for SLP optimization.
 ///
 /// This transforms vectorized accumulators (created by K-vectorization)
@@ -1763,8 +1363,6 @@ fn is_k_vectorized_reduce(reduce: &Arc<UOp>) -> bool {
 ///     REDUCE(GEP(vec_src, N-1), ranges, Add, scalar),
 ///   ], Add)
 fn devectorize_to_scalar_accumulators(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use tracing::trace;
-
     let Op::Reduce { src, ranges, reduce_op } = reduce.op() else {
         return None;
     };
@@ -1824,31 +1422,6 @@ fn tree_reduce(elements: &[Arc<UOp>], reduce_op: ReduceOp, dtype: &DType) -> Arc
     level.remove(0)
 }
 
-/// Pattern matcher for devectorizing K-vectorized REDUCEs to scalar accumulators.
-///
-/// When UPCAST is applied to reduce axes (K-vectorization), REDUCE gets Vector
-/// output dtype with CONTRACT source. This pass converts these to N independent
-/// scalar REDUCEs that LLVM's SLP vectorizer can optimize better.
-///
-/// Benefits over explicit vector accumulators:
-/// - SLP vectorizer can emit FMA (fused multiply-add) intrinsics
-/// - Better register allocation (scalar phi nodes group naturally)
-/// - No explicit horizontal reduction overhead
-///
-/// Transforms:
-/// ```text
-/// - REDUCE(CONTRACT(src<4>), ranges, Add, Vector<4>)
-///   → ((REDUCE(GEP(src,0), Add) + REDUCE(GEP(src,1), Add)) +
-///     (REDUCE(GEP(src,2), Add) + REDUCE(GEP(src,3), Add)))
-/// ```
-pub fn pm_scalar_accumulators() -> TypedPatternMatcher<()> {
-    crate::patterns! {
-        reduce if is_k_vectorized_reduce(reduce) => |reduce| {
-            devectorize_to_scalar_accumulators(reduce)
-        },
-    }
-}
-
 // ============================================================================
 // FMA DECOMPOSITION (a*b+c → MulAcc)
 // ============================================================================
@@ -1867,12 +1440,8 @@ pub fn pm_scalar_accumulators() -> TypedPatternMatcher<()> {
 /// Only matches float types where FMA provides benefit (maps to llvm.fma intrinsic).
 pub fn pm_fma_decomposition() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        // Pattern 1: (a*b)+c → MulAcc(a,b,c)
-        Add(Mul(a, b), c) if a.dtype().is_float() => |a, b, c| {
-            UOp::try_mulacc(a.clone(), b.clone(), c.clone()).ok()
-        },
-        // Pattern 2: c+(a*b) → MulAcc(a,b,c) (commutative)
-        Add(c, Mul(a, b)) if a.dtype().is_float() => |a, b, c| {
+        // (a*b)+c or c+(a*b) → MulAcc(a,b,c) using commutative matching
+        Add[Mul(a, b), c] if a.dtype().is_float() => |a, b, c| {
             UOp::try_mulacc(a.clone(), b.clone(), c.clone()).ok()
         },
     }

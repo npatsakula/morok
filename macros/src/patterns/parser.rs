@@ -56,6 +56,12 @@ pub enum IterKind {
     Binary(Vec<Ident>),
     /// Iterate over ternary operations: `ternary [Where, MulAcc]`
     Ternary(Vec<Ident>),
+    /// Iterate over ALL unary operations: `unary [*]`
+    UnaryAll,
+    /// Iterate over ALL binary operations: `binary [*]`
+    BinaryAll,
+    /// Iterate over ALL ternary operations: `ternary [*]`
+    TernaryAll,
 }
 
 /// The kind of arrow in a pattern rule.
@@ -149,11 +155,25 @@ impl Parse for ForBlock {
 impl Parse for IterKind {
     fn parse(input: ParseStream) -> Result<Self> {
         // Expect: unary [Neg, Sqrt, ...] or binary [Add, Mul, ...] or ternary [Where, MulAcc]
+        // Also supports wildcard: unary [*] or binary [*] or ternary [*]
         let kind_ident: Ident = input.parse()?;
 
         // Parse the operation list in brackets
         let content;
         bracketed!(content in input);
+
+        // Check for wildcard: [*]
+        if content.peek(Token![*]) {
+            content.parse::<Token![*]>()?;
+            return match kind_ident.to_string().as_str() {
+                "unary" => Ok(IterKind::UnaryAll),
+                "binary" => Ok(IterKind::BinaryAll),
+                "ternary" => Ok(IterKind::TernaryAll),
+                _ => Err(syn::Error::new_spanned(kind_ident, "Expected 'unary', 'binary', or 'ternary'")),
+            };
+        }
+
+        // Parse explicit operation list
         let ops: Punctuated<Ident, Token![,]> = Punctuated::parse_terminated(&content)?;
         let ops: Vec<Ident> = ops.into_iter().collect();
 
@@ -253,6 +273,10 @@ pub enum Pattern {
     Any(Vec<Pattern>),
     /// Permutation pattern: `Add[x, y]` - tries all orderings of arguments
     OpPermute { op: Ident, args: Vec<Pattern> },
+    /// Option::Some pattern: `Some(inner_pattern)`
+    OptionSome(Box<Pattern>),
+    /// Option::None pattern: `None`
+    OptionNone,
 }
 
 /// A named field in a struct-style pattern.
@@ -355,6 +379,22 @@ fn parse_single_pattern(input: ParseStream) -> Result<Pattern> {
 
     // Parse identifier
     let ident: Ident = input.parse()?;
+    let ident_str = ident.to_string();
+
+    // Check for Option patterns: None and Some(pattern)
+    if ident_str == "None" {
+        return Ok(Pattern::OptionNone);
+    }
+    if ident_str == "Some" {
+        if input.peek(token::Paren) {
+            let content;
+            parenthesized!(content in input);
+            let inner = content.parse::<Pattern>()?;
+            return Ok(Pattern::OptionSome(Box::new(inner)));
+        } else {
+            return Err(syn::Error::new_spanned(ident, "Some requires an inner pattern: Some(pattern)"));
+        }
+    }
 
     // Check for name@const(value) or name @ pattern
     if input.peek(Token![@]) {

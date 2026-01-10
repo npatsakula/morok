@@ -8,9 +8,25 @@
 use std::{f32::consts::PI, sync::Arc};
 
 use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, UOp};
+use morok_ir::{pattern::RewriteResult, AxisId, AxisType, BinaryOp, Op, ReduceOp, UOp};
 
-use crate::rangeify::transforms::{reduce_collapse, reduce_unparented};
+use crate::rangeify::transforms::reduce_collapse as reduce_collapse_inner;
+
+/// Test helper - thin wrapper around pattern matcher for reduce_unparented tests.
+fn reduce_unparented(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
+    match crate::rangeify::patterns::reduction_simplify_patterns().rewrite(reduce, &mut ()) {
+        RewriteResult::Rewritten(r) => Some(r),
+        _ => None,
+    }
+}
+
+/// Test helper - wrapper for reduce_collapse that extracts src/ranges from REDUCE node.
+fn reduce_collapse(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Reduce { src, ranges, .. } = reduce.op() else {
+        return None;
+    };
+    reduce_collapse_inner(src, ranges)
+}
 
 // ===== Test Helper Functions =====
 

@@ -103,10 +103,10 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// These passes run AFTER heuristic/beam optimization and BEFORE codegen:
 /// - pm_add_loads: Extract LOAD ops from INDEX
 /// - pre_expand: Convert Range(Unroll/Upcast) → UNROLL, expand operations
-/// - pm_scalar_accumulators: Convert K-vectorized REDUCEs to scalar accumulators
+/// - pm_reduce_devectorize: Unified REDUCE devectorization (K-vec, bool, horizontal)
 /// - pm_bool_devectorize: Convert <N x i1> to scalar ops
-/// - pm_horizontal_reduce: Handle vectorized REDUCE sources
-/// - post_expand_patterns: Linearize INDEX ops
+/// - pm_fma_decomposition: a*b+c → MulAcc for float types
+/// - bool_storage_patterns: Convert bool LOAD/STORE to uint8
 ///
 /// Called by both heuristic and beam search paths for consistent behavior.
 pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
@@ -116,7 +116,11 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     // NOTE: Must run BEFORE pre_expand so that INDEX ops are still visible
     // (after expand, INDEX is wrapped in UNROLL and patterns won't match).
     let pm_loads = crate::rangeify::patterns::pm_add_loads();
-    let with_loads = crate::rewrite::graph_rewrite_bottom_up(&pm_loads, ast, &mut ());
+    // Use top-down rewrite (not bottom-up) to avoid infinite recursion:
+    // Pattern 1 creates FRESH_INDEX inside LOAD. Bottom-up would process FRESH_INDEX
+    // and Pattern 1 would match again → infinite loop. Top-down doesn't recurse into
+    // newly created children, matching Tinygrad's behavior.
+    let with_loads = graph_rewrite(&pm_loads, ast, &mut ());
 
     // Post-optimization: Fix UNROLL substitutions in REDUCE ops
     // This handles arithmetic expressions created by shift_to UNROLL
@@ -126,61 +130,43 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     // Uses direct vector index analysis (VConst/UNROLL patterns) for termination safety
     let devectorized_mem = crate::devectorize::devectorize(&expanded);
 
-    // Scalar accumulator devectorization: Convert K-vectorized REDUCEs to scalar accumulators.
-    // When UPCAST is applied to reduce axes, REDUCE gets Vector dtype with CONTRACT source.
-    // This converts them to N independent scalar REDUCEs that SLP vectorizer can optimize.
-    // Benefits: FMA fusion, better register allocation, no horizontal reduce overhead.
-    let pm_scalar_acc = crate::rangeify::patterns::pm_scalar_accumulators();
-    let scalar_acc = crate::rewrite::graph_rewrite_bottom_up(&pm_scalar_acc, devectorized_mem, &mut ());
-
     // Bool devectorization: Convert <N x i1> ALU ops to scalar ops + VECTORIZE.
     // LLVM's bool vectors are broken (no formal ABI, segfaults in codegen).
     // Based on Tinygrad's no_vectorized_alu approach.
+    // Must run BEFORE reduce devectorization so comparisons are already scalar.
     let pm_devec = crate::rangeify::patterns::pm_bool_devectorize();
-    let devectorized = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, scalar_acc, &mut ());
+    let devectorized = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, devectorized_mem, &mut ());
 
-    // Bool REDUCE devectorization: Convert REDUCE with <N x bool> output to N scalar REDUCEs.
-    // When UPCAST is on non-reduce axes with bool data, REDUCE would have <N x bool> accumulator.
-    // LLVM's <N x i1> phi nodes have undefined behavior, so we split into scalar REDUCEs.
-    // Must run BEFORE horizontal_reduce to handle the matching-vcount case.
-    let pm_bool_reduce = crate::rangeify::patterns::pm_devectorize_bool_reduce();
-    let bool_reduce_devec = crate::rewrite::graph_rewrite_bottom_up(&pm_bool_reduce, devectorized, &mut ());
-
-    // Horizontal reduce: Convert REDUCE with vectorized source to scalar REDUCE.
-    // When UPCAST is on non-reduce axes, REDUCE receives vectorized inputs.
-    // This extracts elements and chains with ALU ops before the REDUCE loop.
-    // Based on Tinygrad's horizontal_reduce (devectorizer.py:289-316).
-    let pm_hreduce = crate::rangeify::patterns::pm_horizontal_reduce();
-    let hreduced = crate::rewrite::graph_rewrite_bottom_up(&pm_hreduce, bool_reduce_devec, &mut ());
-
-    // Second pass of bool REDUCE devectorization: Handle REDUCEs created by horizontal reduce.
-    // When horizontal reduce transforms REDUCE(<4 x bool>) → REDUCE(<2 x bool>), we need
-    // to devectorize the resulting REDUCE to avoid LLVM <N x i1> accumulator issues.
-    let hreduced = crate::rewrite::graph_rewrite_bottom_up(&pm_bool_reduce, hreduced, &mut ());
+    // Unified REDUCE devectorization: Handles all 3 mutually exclusive cases:
+    // - K-vectorized: CONTRACT source → N scalar REDUCEs + tree_reduce (SLP optimization)
+    // - Bool reduce: matching vcounts, bool dtype → N scalar REDUCEs + VECTORIZE (<N x i1> workaround)
+    // - Horizontal: src_vcount > out_vcount → stride-pattern GEPs + ALU chain
+    // Based on Tinygrad's pm_reduce (devectorizer.py:283-316).
+    let pm_reduce = crate::rangeify::patterns::pm_reduce_devectorize();
+    let reduce_devec = crate::rewrite::graph_rewrite_bottom_up(&pm_reduce, devectorized, &mut ());
 
     // Second pass of bool ALU devectorization: Handle WHERE ops created by horizontal reduce.
     // Min reduction creates WHERE(<N x i1>, ...) which needs devectorization.
-    let hreduced = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, hreduced, &mut ());
+    let reduce_devec = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, reduce_devec, &mut ());
+
+    // Second pass of REDUCE devectorization: Handle REDUCEs created by horizontal reduce.
+    // When horizontal reduce transforms REDUCE(<4 x bool>) → REDUCE(<2 x bool>), we need
+    // to devectorize the resulting REDUCE to avoid LLVM <N x i1> accumulator issues.
+    let reduce_devec = crate::rewrite::graph_rewrite_bottom_up(&pm_reduce, reduce_devec, &mut ());
 
     // FMA decomposition: a*b+c → MulAcc(a,b,c) for float types.
     // Applied late so optimizations can still see Add(Mul) structure.
     // Must run AFTER horizontal reduce (which may create Add chains from GEPs).
     // Based on Tinygrad's decompositions.py:362.
     let pm_fma = crate::rangeify::patterns::pm_fma_decomposition();
-    let with_fma = crate::rewrite::graph_rewrite_bottom_up(&pm_fma, hreduced, &mut ());
-
-    // Post-expand: Linearize multi-index INDEX ops
-    // This MUST run after pre_expand to avoid creating Binary(Range*stride) before expand.
-    // If linearized before expand, Range ops inside Binary get vectorized incorrectly.
-    let post_expand_matcher = crate::rangeify::post_expand_patterns();
-    let post_expanded = crate::rewrite::graph_rewrite_bottom_up(&post_expand_matcher, with_fma, &mut ());
+    let with_fma = crate::rewrite::graph_rewrite_bottom_up(&pm_fma, reduce_devec, &mut ());
 
     // Bool storage: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits.
     // LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
     // Must run LAST, after all other transformations that might create bool stores.
     // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
     let pm_bool_storage = crate::devectorize::bool_storage_patterns();
-    crate::rewrite::graph_rewrite_bottom_up(&pm_bool_storage, post_expanded, &mut ())
+    crate::rewrite::graph_rewrite_bottom_up(&pm_bool_storage, with_fma, &mut ())
 }
 
 /// Apply optimizations with explicit configuration.

@@ -83,15 +83,19 @@ macro_rules! shift_ops {
 }
 
 /// Macro for comparison operations.
+/// Preserves vectorization: <N x T> cmp <N x T> → <N x bool>
 macro_rules! cmp_ops {
     ($($method:ident => $op:ident),+ $(,)?) => {
         $(
             #[track_caller]
             pub fn $method(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
                 // Use type promotion to validate types and find common type
-                let (lhs, rhs, _) = Self::promote_and_cast(self.clone(), rhs.clone())?;
+                let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
                 Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
-                Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), DType::Bool))
+                // Preserve vectorization: <N x T> cmp <N x T> → <N x bool>
+                let vcount = dtype.vcount();
+                let result_dtype = if vcount > 1 { DType::Bool.vec(vcount) } else { DType::Bool };
+                Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), result_dtype))
             }
         )+
     };

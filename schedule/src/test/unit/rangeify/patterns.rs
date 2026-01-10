@@ -374,10 +374,11 @@ fn test_buffer_removal_no_match_expensive_compute() {
 }
 
 // ===== Movement Op Removal Tests =====
+// These tests verify movement op removal behavior which is now integrated into apply_rangeify_patterns
 
 #[test]
 fn test_movement_op_removal_no_match_without_ranges() {
-    let matcher = patterns::movement_op_removal();
+    let matcher = patterns::apply_rangeify_patterns();
     let mut ctx = IndexingContext::new();
 
     // Create a PERMUTE operation (a movement op)
@@ -385,13 +386,14 @@ fn test_movement_op_removal_no_match_without_ranges() {
     let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
 
     // Without ranges assigned, should NOT remove
+    // (The bufferize pattern will try to match but return None without ranges)
     let result = matcher.rewrite(&permute, &mut ctx);
     assert!(matches!(result, RewriteResult::NoMatch), "Should NOT remove movement op without ranges assigned");
 }
 
 #[test]
 fn test_movement_op_removal_removes_with_ranges() {
-    let matcher = patterns::movement_op_removal();
+    let matcher = patterns::apply_rangeify_patterns();
     let mut ctx = IndexingContext::new();
 
     // Create a PERMUTE operation
@@ -417,7 +419,7 @@ fn test_movement_op_removal_removes_with_ranges() {
 
 #[test]
 fn test_movement_op_removal_reshape() {
-    let matcher = patterns::movement_op_removal();
+    let matcher = patterns::apply_rangeify_patterns();
     let mut ctx = IndexingContext::new();
 
     // Create a RESHAPE operation
@@ -444,7 +446,7 @@ fn test_movement_op_removal_reshape() {
 
 #[test]
 fn test_movement_op_removal_expand() {
-    let matcher = patterns::movement_op_removal();
+    let matcher = patterns::apply_rangeify_patterns();
     let mut ctx = IndexingContext::new();
 
     // Create an EXPAND operation
@@ -471,16 +473,18 @@ fn test_movement_op_removal_expand() {
 
 #[test]
 fn test_movement_op_removal_non_movement_op() {
-    let matcher = patterns::movement_op_removal();
+    let matcher = patterns::apply_rangeify_patterns();
     let mut ctx = IndexingContext::new();
 
     // Create a non-movement op (NEG)
     let src = UOp::define_global(0, DType::Float32);
     let neg = src.neg();
 
-    // Should NOT match non-movement ops
+    // Non-movement ops without ranges should not match the movement removal pattern
+    // (they may match other patterns like bufferize, but without ranges assigned,
+    // apply_bufferize_transform returns None)
     let result = matcher.rewrite(&neg, &mut ctx);
-    assert!(matches!(result, RewriteResult::NoMatch), "Should not match non-movement ops");
+    assert!(matches!(result, RewriteResult::NoMatch), "Should not match non-movement ops without ranges");
 }
 
 // ===== Integration Tests =====

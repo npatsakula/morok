@@ -310,6 +310,15 @@ where
         // current stack top, not on top.
         let mut needs_defer = false;
         for src in &sources {
+            // Skip if this source IS the original node we're transforming.
+            // This happens when a pattern creates a wrapper (e.g., INDEX → LOAD(buffer, INDEX)).
+            // The wrapper contains the original as a child, but we shouldn't wait for
+            // the original's result because WE ARE producing that result right now.
+            // This matches Tinygrad's `on_stack` skip behavior in unified_rewrite.
+            if Arc::ptr_eq(src, &original) {
+                continue;
+            }
+
             if !self.results.contains(src) {
                 // Source has no result yet - check if it was supposed to be processed
                 let src_key = UOpKey(src.clone());
@@ -326,7 +335,7 @@ where
         if needs_defer {
             const MAX_RETRIES: u32 = 10_000;
             if retry_count >= MAX_RETRIES {
-                panic!("Finalize stuck waiting for sources after {} retries: {:?}", MAX_RETRIES, working.op());
+                panic!("Finalize stuck waiting for sources after {} retries: {:?}", MAX_RETRIES, working.tree());
             }
             // Re-push this Finalize, but at a LOWER priority by inserting at the
             // FRONT of the stack (so it runs AFTER everything currently on the stack)
@@ -422,10 +431,11 @@ where
             iterations += 1;
             if iterations > MAX_TOTAL_ITERATIONS {
                 panic!(
-                    "Rewrite total iteration limit ({}) exceeded: likely infinite loop. Stack size: {}, results cached: {}",
-                    MAX_TOTAL_ITERATIONS,
+                    "Rewrite total iteration limit ({MAX_TOTAL_ITERATIONS}) exceeded: likely infinite loop. Stack size: {}, results cached: {}, original: {}, working: {}",
                     stack.len(),
-                    self.results.results.len()
+                    self.results.results.len(),
+                    original.tree(),
+                    working.tree(),
                 );
             }
 

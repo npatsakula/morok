@@ -606,6 +606,7 @@ fn test_argmin_2d_axis0_value() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn test_argmin_2d_axis1_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();

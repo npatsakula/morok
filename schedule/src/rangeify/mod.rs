@@ -33,19 +33,13 @@ pub use kernel::{PcontigConfig, SplitReduceOpConfig};
 // Pattern matchers
 pub use patterns::{
     apply_rangeify_patterns, buffer_folding, buffer_limit_patterns, buffer_removal, buffer_removal_with_pcontig,
-    dead_axis_removal, early_rewrites, movement_op_patterns, pm_fma_decomposition, post_expand_patterns,
+    dead_axis_removal, early_rewrites, movement_op_patterns, pm_fma_decomposition,
     rangeify_codegen_patterns, reduction_simplify_patterns, split_reduceop_patterns, to_define_global_patterns,
-};
-
-// Buffer cost analysis
-pub use kernel::{
-    apply_partial_contiguous, calculate_buffer_size, calculate_out_in_ratio, collect_accessed_buffers, collect_indexes,
-    collect_local_indexes, collect_reduces, extract_exclude_ranges, has_buffer_in_reduce, partition_ranges,
 };
 
 // Transforms
 pub use transforms::{
-    OpAccessType, bufferize_to_store, find_bufs, flatten_range_impl, flatten_ranges, reduce_collapse, reduce_unparented,
+    OpAccessType, bufferize_to_store, find_bufs, flatten_range_impl, flatten_ranges, reduce_collapse,
 };
 
 // Utilities (re-exported from indexing)

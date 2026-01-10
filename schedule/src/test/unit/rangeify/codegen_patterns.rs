@@ -1,20 +1,28 @@
 //! Tests for codegen preparation patterns.
 //!
-//! Validates that remove_noop, get_contiguous, and fix_after_broadcast correctly
-//! transform UOps for code generation.
+//! Validates that the rangeify_codegen_patterns correctly transform UOps for code generation.
 
 use std::sync::Arc;
 
 use morok_ir::{Op, UOp};
 
-use crate::rangeify::patterns::{fix_after_broadcast, get_contiguous, rangeify_codegen_patterns, remove_noop};
+use crate::rangeify::patterns::rangeify_codegen_patterns;
+
+/// Helper to apply rangeify_codegen patterns and return result
+fn apply_patterns(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let matcher = rangeify_codegen_patterns();
+    match matcher.rewrite(uop, &mut ()) {
+        morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
+        _ => None,
+    }
+}
 
 #[test]
 fn test_remove_noop_void_returns_none() {
     // Default NOOP has Void dtype, which should return None
     let noop = UOp::noop(); // DType::Void
 
-    let result = remove_noop(&noop);
+    let result = apply_patterns(&noop);
     // Should return None for Void dtype
     assert!(result.is_none());
 }
@@ -28,8 +36,8 @@ fn test_remove_noop_non_void() {
     // Verify it's a NOOP
     assert!(matches!(noop.op(), Op::Noop));
 
-    // Verify remove_noop handles it (returns None for Void)
-    let result = remove_noop(&noop);
+    // Verify pattern handles it (returns None for Void)
+    let result = apply_patterns(&noop);
     assert!(result.is_none()); // Because NOOP dtype is Void
 }
 
@@ -38,24 +46,24 @@ fn test_remove_noop_returns_none_for_non_noop() {
     // Test that non-NOOP operations return None
     let const_op = UOp::native_const(1.0f32);
 
-    let result = remove_noop(&const_op);
+    let result = apply_patterns(&const_op);
     assert!(result.is_none());
 }
 
 #[test]
 fn test_remove_noop_pattern_matching() {
-    // Verify remove_noop only matches NOOP operations
+    // Verify patterns only match NOOP operations
     let noop = UOp::noop();
     let const_op = UOp::native_const(0.0f32);
 
     // NOOP should be handled (returns None for Void dtype)
     assert!(matches!(noop.op(), Op::Noop));
-    let noop_result = remove_noop(&noop);
+    let noop_result = apply_patterns(&noop);
     assert!(noop_result.is_none()); // Void dtype
 
     // Non-NOOP should return None
     assert!(!matches!(const_op.op(), Op::Noop));
-    let const_result = remove_noop(&const_op);
+    let const_result = apply_patterns(&const_op);
     assert!(const_result.is_none());
 }
 
@@ -65,7 +73,7 @@ fn test_get_contiguous_removes_marker() {
     let tensor = UOp::native_const(1.0f32);
     let contiguous = UOp::contiguous(tensor.clone());
 
-    let result = get_contiguous(&contiguous);
+    let result = apply_patterns(&contiguous);
     assert!(result.is_some());
 
     let unwrapped = result.unwrap();
@@ -78,7 +86,7 @@ fn test_get_contiguous_returns_none_for_non_contiguous() {
     // Test that non-CONTIGUOUS operations return None
     let const_op = UOp::native_const(1.0f32);
 
-    let result = get_contiguous(&const_op);
+    let result = apply_patterns(&const_op);
     assert!(result.is_none());
 }
 
@@ -92,7 +100,7 @@ fn test_fix_after_broadcast_unwraps_expand() {
     let computation = UOp::noop();
     let after = UOp::after(expand, smallvec::smallvec![computation]);
 
-    let result = fix_after_broadcast(&after);
+    let result = apply_patterns(&after);
     assert!(result.is_some());
 
     let fixed = result.unwrap();
@@ -106,10 +114,10 @@ fn test_fix_after_broadcast_unwraps_expand() {
 
 #[test]
 fn test_fix_after_broadcast_returns_none_for_non_after() {
-    // Test that non-AFTER operations return None
+    // Test that non-AFTER operations return None (unless they match another pattern)
     let const_op = UOp::native_const(1.0f32);
 
-    let result = fix_after_broadcast(&const_op);
+    let result = apply_patterns(&const_op);
     assert!(result.is_none());
 }
 
@@ -120,7 +128,7 @@ fn test_fix_after_broadcast_returns_none_for_non_expand() {
     let computation = UOp::noop();
     let after = UOp::after(source, smallvec::smallvec![computation]);
 
-    let result = fix_after_broadcast(&after);
+    let result = apply_patterns(&after);
     assert!(result.is_none());
 }
 
@@ -136,7 +144,7 @@ fn test_fix_after_broadcast_no_panic_on_global() {
     let after = UOp::after(expand, smallvec::smallvec![computation]);
 
     // Should not panic for global (non-local) buffer
-    let result = fix_after_broadcast(&after);
+    let result = apply_patterns(&after);
     assert!(result.is_some());
 }
 

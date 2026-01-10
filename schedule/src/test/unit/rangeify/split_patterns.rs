@@ -4,10 +4,16 @@ use morok_dtype::{AddrSpace, DType, ScalarDType};
 use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
 
-use crate::rangeify::{
-    KernelContext,
-    patterns::{cleanup_const, debuf, handle_after, remove_zero_range, renumber_range, unbind_kernel},
-};
+use crate::rangeify::{KernelContext, patterns::to_define_global_patterns};
+
+/// Helper to apply to_define_global patterns and return result
+fn apply_patterns(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
+    let matcher = to_define_global_patterns();
+    match matcher.rewrite(uop, ctx) {
+        morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
+        _ => None,
+    }
+}
 
 #[test]
 fn test_debuf_global() {
@@ -18,8 +24,8 @@ fn test_debuf_global() {
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
 
-    // Apply debuf pattern
-    let result = debuf(&buffer, &mut ctx);
+    // Apply pattern via matcher
+    let result = apply_patterns(&buffer, &mut ctx);
 
     // Should return a DEFINE_GLOBAL
     let op = result.expect("Expected Some result");
@@ -36,8 +42,8 @@ fn test_unbind_kernel() {
     let value = UOp::index_const(5);
     let bind = UOp::bind(var.clone(), value);
 
-    // Apply unbind_kernel pattern
-    let result = unbind_kernel(&bind, &mut ctx);
+    // Apply pattern via matcher
+    let result = apply_patterns(&bind, &mut ctx);
 
     // Should return just the variable
     let op = result.expect("Expected Some result");
@@ -53,8 +59,8 @@ fn test_renumber_range() {
     let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Unrenumbered(5), AxisType::Reduce);
 
-    // Apply renumber_range pattern
-    let result = renumber_range(&range, &mut ctx);
+    // Apply pattern via matcher
+    let result = apply_patterns(&range, &mut ctx);
 
     // Should return a RANGE with axis_id=Renumbered(0) (renumbered)
     let op = result.expect("Expected Some result");
@@ -73,8 +79,8 @@ fn test_renumber_range_loop_no_bind() {
     let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Unrenumbered(5), AxisType::Loop);
 
-    // Apply renumber_range pattern
-    let result = renumber_range(&range, &mut ctx);
+    // Apply pattern via matcher
+    let result = apply_patterns(&range, &mut ctx);
 
     // LOOP ranges should be renumbered without BIND wrapper (Tinygrad approach)
     // Codegen creates loops directly from RANGE ops
@@ -95,8 +101,8 @@ fn test_renumber_range_already_numbered() {
     let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(5), AxisType::Loop);
 
-    // Apply renumber_range pattern - should return None (already numbered)
-    let result = renumber_range(&range, &mut ctx);
+    // Apply pattern via matcher - should return None (already numbered)
+    let result = apply_patterns(&range, &mut ctx);
     assert!(result.is_none(), "Already-numbered range should not be renumbered");
 }
 
@@ -108,8 +114,8 @@ fn test_remove_zero_range() {
     let end = UOp::index_const(0);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
-    // Apply remove_zero_range pattern
-    let result = remove_zero_range(&range, &mut ctx);
+    // Apply pattern via matcher
+    let result = apply_patterns(&range, &mut ctx);
 
     // Should return CONST(0)
     let op = result.expect("Expected Some result");
@@ -123,8 +129,8 @@ fn test_cleanup_const_with_sources() {
     // Create a CONST operation (normally has no sources)
     let const_op = UOp::native_const(42i32);
 
-    // Apply cleanup_const pattern (should not match since const has no sources normally)
-    let result = cleanup_const(&const_op, &mut ctx);
+    // Apply pattern via matcher (should not match since const has no sources normally)
+    let result = apply_patterns(&const_op, &mut ctx);
 
     // Should return None since the const has no sources
     assert!(result.is_none());
@@ -139,8 +145,8 @@ fn test_handle_after() {
     let store = UOp::noop();
     let after = UOp::after(buffer.clone(), smallvec::smallvec![store]);
 
-    // Apply handle_after pattern
-    let result = handle_after(&after, &mut ctx);
+    // Apply pattern via matcher
+    let result = apply_patterns(&after, &mut ctx);
 
     // Should return the buffer
     let op = result.expect("Expected Some result");
@@ -165,14 +171,14 @@ fn test_debuf_counter_increment() {
     let device2 = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer2 = UOp::new(Op::Buffer { unique: unique2, device: device2, size: 200 }, DType::Float32);
 
-    // Apply debuf to first buffer
-    let result1 = debuf(&buffer1, &mut ctx);
+    // Apply patterns to first buffer
+    let result1 = apply_patterns(&buffer1, &mut ctx);
 
     assert!(result1.is_some());
     assert_eq!(ctx.global_counter, 1);
 
-    // Apply debuf to second buffer
-    let result2 = debuf(&buffer2, &mut ctx);
+    // Apply patterns to second buffer
+    let result2 = apply_patterns(&buffer2, &mut ctx);
 
     assert!(result2.is_some());
     assert_eq!(ctx.global_counter, 2);
@@ -190,9 +196,9 @@ fn test_debuf_buffer_mapping() {
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     let buffer = UOp::new(Op::Buffer { unique, device, size: 100 }, DType::Float32);
 
-    let result = debuf(&buffer, &mut ctx);
+    let result = apply_patterns(&buffer, &mut ctx);
 
-    // debuf returns DEFINE_GLOBAL and maps BUFFER → DEFINE_GLOBAL
+    // Pattern returns DEFINE_GLOBAL and maps BUFFER → DEFINE_GLOBAL
     assert!(result.is_some());
     let define_global = result.unwrap();
     assert!(matches!(define_global.op(), Op::DefineGlobal(0)));
@@ -216,7 +222,7 @@ fn test_handle_after_mstack_unwrap() {
     let store = UOp::noop();
     let after = UOp::after(mstack, smallvec::smallvec![store]);
 
-    let result = handle_after(&after, &mut ctx);
+    let result = apply_patterns(&after, &mut ctx);
 
     // Should unwrap to first buffer of MSTACK
     let op = result.expect("Expected Some result");
@@ -238,7 +244,7 @@ fn test_handle_after_mselect_unwrap() {
     let store = UOp::noop();
     let after = UOp::after(mselect, smallvec::smallvec![store]);
 
-    let result = handle_after(&after, &mut ctx);
+    let result = apply_patterns(&after, &mut ctx);
 
     // Should unwrap to buffer
     let op = result.expect("Expected Some result");
@@ -258,7 +264,7 @@ fn test_renumber_range_different_axis_types() {
     for (i, axis_type) in [AxisType::Loop, AxisType::Reduce, AxisType::Outer].iter().enumerate() {
         let range = UOp::range_axis(end.clone(), AxisId::Unrenumbered(i), *axis_type);
 
-        let result = renumber_range(&range, &mut ctx);
+        let result = apply_patterns(&range, &mut ctx);
 
         if let Some(r) = result {
             // All axis types return plain Range
@@ -281,12 +287,12 @@ fn test_renumber_range_no_change_if_same() {
     let end = UOp::index_const(10);
     let range1 = UOp::range_axis(end.clone(), AxisId::Renumbered(5), AxisType::Loop);
 
-    renumber_range(&range1, &mut ctx);
+    apply_patterns(&range1, &mut ctx);
 
     // Now create a range that already has axis_id=Renumbered(1)
     let range2 = UOp::range_axis(end.clone(), AxisId::Renumbered(1), AxisType::Loop);
 
-    let result = renumber_range(&range2, &mut ctx);
+    let result = apply_patterns(&range2, &mut ctx);
 
     // Should return None since it's already renumbered
     assert!(result.is_none());
@@ -301,7 +307,7 @@ fn test_cleanup_const_define_var() {
     let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
 
     // Without sources, should not match
-    let result = cleanup_const(&define_var, &mut ctx);
+    let result = apply_patterns(&define_var, &mut ctx);
     assert!(result.is_none());
 
     // TODO: Test with spurious sources once we have a way to create them
@@ -315,7 +321,7 @@ fn test_remove_zero_range_uint() {
     let end = UOp::index_const(0);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
-    let result = remove_zero_range(&range, &mut ctx);
+    let result = apply_patterns(&range, &mut ctx);
 
     // Should return CONST(0)
     let op = result.expect("Expected Some result");
@@ -330,9 +336,9 @@ fn test_remove_zero_range_non_zero() {
     let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
-    let result = remove_zero_range(&range, &mut ctx);
+    let result = apply_patterns(&range, &mut ctx);
 
-    // Should return None
+    // Should renumber (since it's Renumbered already, no match for renumber; non-zero, no match for zero)
     assert!(result.is_none());
 }
 
@@ -350,7 +356,7 @@ fn test_handle_after_mstack_advanced() {
     // Note: AFTER has passthrough + deps, not src
     let after = UOp::after(mstack.clone(), smallvec::SmallVec::new());
 
-    let result = handle_after(&after, &mut ctx);
+    let result = apply_patterns(&after, &mut ctx);
 
     // Should unwrap MSTACK and return first buffer
     match result {
@@ -375,7 +381,7 @@ fn test_cleanup_const_with_spurious_sources() {
     // Create a CONST
     let const_op = UOp::native_const(42i32);
 
-    let result = cleanup_const(&const_op, &mut ctx);
+    let result = apply_patterns(&const_op, &mut ctx);
 
     // DEFINE_VAR shouldn't be cleaned up (it's not a CONST)
     assert!(result.is_none());
@@ -393,7 +399,7 @@ fn test_renumber_range_sequential() {
 
     // Process them in sequence - should get sequential IDs Renumbered(0), Renumbered(1), Renumbered(2)
 
-    let result0 = renumber_range(&range0, &mut ctx);
+    let result0 = apply_patterns(&range0, &mut ctx);
     match result0 {
         Some(new_range) => {
             // LOOP returns plain Range (no BIND)
@@ -407,7 +413,7 @@ fn test_renumber_range_sequential() {
         None => panic!("Expected renumbered range"),
     }
 
-    let result1 = renumber_range(&range1, &mut ctx);
+    let result1 = apply_patterns(&range1, &mut ctx);
     match result1 {
         Some(new_range) => {
             // LOOP returns plain Range (no BIND)
@@ -421,7 +427,7 @@ fn test_renumber_range_sequential() {
         None => panic!("Expected renumbered range"),
     }
 
-    let result2 = renumber_range(&range2, &mut ctx);
+    let result2 = apply_patterns(&range2, &mut ctx);
     match result2 {
         Some(new_range) => {
             // Reduce returns plain Range
@@ -447,7 +453,7 @@ fn test_remove_zero_range_verification() {
     let end = UOp::index_const(0);
     let range = UOp::range_axis(end.clone(), AxisId::Renumbered(0), AxisType::Loop);
 
-    let result = remove_zero_range(&range, &mut ctx);
+    let result = apply_patterns(&range, &mut ctx);
 
     // Should rewrite to CONST(0)
     match result {
@@ -476,13 +482,13 @@ fn test_pattern_composition_sequence() {
 
     // Test that patterns can be applied in sequence
     // 1. Create a RANGE with unrenumbered ID (use Reduce for plain Range output)
-    // 2. Apply renumber_range
+    // 2. Apply renumber pattern
     // 3. Verify the result
 
     let range_unnum = UOp::range_axis(UOp::index_const(15), AxisId::Unrenumbered(7), AxisType::Reduce);
 
-    // Apply renumber_range pattern
-    let result1 = renumber_range(&range_unnum, &mut ctx);
+    // Apply pattern
+    let result1 = apply_patterns(&range_unnum, &mut ctx);
 
     match result1 {
         Some(renumbered) => {
@@ -499,7 +505,7 @@ fn test_pattern_composition_sequence() {
                 // Now apply another pattern to the result
                 // For example, if the renumbered range has zero end, remove it
 
-                let result2 = remove_zero_range(&renumbered, &mut ctx);
+                let result2 = apply_patterns(&renumbered, &mut ctx);
 
                 // Should return NoMatch since end is 15, not 0
                 assert!(result2.is_none());
@@ -518,8 +524,8 @@ fn test_pattern_composition_sequence_no_bind() {
     // Test that LOOP ranges return plain Range (no BIND wrapper, Tinygrad approach)
     let range_unnum = UOp::range_axis(UOp::index_const(15), AxisId::Unrenumbered(7), AxisType::Loop);
 
-    // Apply renumber_range pattern
-    let result1 = renumber_range(&range_unnum, &mut ctx);
+    // Apply pattern
+    let result1 = apply_patterns(&range_unnum, &mut ctx);
 
     match result1 {
         Some(new_range) => {
@@ -562,8 +568,8 @@ fn test_handle_after_local_buffer_not_tracked() {
     let store = UOp::noop();
     let after = UOp::after(local_buf.clone(), smallvec![store]);
 
-    // Apply handle_after pattern
-    let result = handle_after(&after, &mut ctx);
+    // Apply pattern
+    let result = apply_patterns(&after, &mut ctx);
 
     // Should return the buffer unwrapped
     match result {
@@ -593,8 +599,8 @@ fn test_handle_after_global_buffer_tracked() {
     let store = UOp::noop();
     let after = UOp::after(global_buf.clone(), smallvec![store]);
 
-    // Apply handle_after pattern
-    let result = handle_after(&after, &mut ctx);
+    // Apply pattern
+    let result = apply_patterns(&after, &mut ctx);
 
     // Should return the buffer unwrapped
     match result {
@@ -629,8 +635,8 @@ fn test_handle_after_mstack_with_local_buffer() {
     let store = UOp::noop();
     let after = UOp::after(mstack, smallvec![store]);
 
-    // Apply handle_after pattern
-    let result = handle_after(&after, &mut ctx);
+    // Apply pattern
+    let result = apply_patterns(&after, &mut ctx);
 
     // Should unwrap to first buffer in MSTACK
     match result {
@@ -662,8 +668,8 @@ fn test_handle_after_mselect_with_local_buffer() {
     let store = UOp::noop();
     let after = UOp::after(mselect, smallvec![store]);
 
-    // Apply handle_after pattern
-    let result = handle_after(&after, &mut ctx);
+    // Apply pattern
+    let result = apply_patterns(&after, &mut ctx);
 
     // Should unwrap to the buffer in MSELECT
     match result {
@@ -704,9 +710,9 @@ fn test_handle_after_mixed_address_spaces() {
     let after_local = UOp::after(local_buf.clone(), smallvec![store1]);
     let after_global = UOp::after(global_buf.clone(), smallvec![store2]);
 
-    // Apply handle_after to both and validate return values
-    let result_local = handle_after(&after_local, &mut ctx);
-    let result_global = handle_after(&after_global, &mut ctx);
+    // Apply patterns to both and validate return values
+    let result_local = apply_patterns(&after_local, &mut ctx);
+    let result_global = apply_patterns(&after_global, &mut ctx);
 
     // Verify both returned Rewritten with correct buffers
     match result_local {
