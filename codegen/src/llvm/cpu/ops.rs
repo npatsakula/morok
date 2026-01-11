@@ -1433,10 +1433,19 @@ fn codegen_reduce<'ctx>(
         let acc_val = builder.build_load(acc_type, acc_alloca, "acc_load").context(BuildLoadSnafu)?;
 
         // Do accumulation INSIDE the source loops (before closing them)
-        // For vector accumulators: if source is scalar, splat it to match accumulator width
-        let acc_src_val = if is_vector_accumulator && !src_val.is_vector_value() {
+        // Handle type mismatches between source and accumulator:
+        let acc_src_val = if !is_vector_accumulator && src_val.is_vector_value() {
+            // Case: UNROLL expand - vector source, scalar accumulator
+            // Horizontal-reduce the source vector to scalar before accumulating
+            let src_vec_len = src.dtype().vcount();
+            trace!(src_vec_len, "REDUCE: horizontal reducing vector source to scalar");
+            codegen_horizontal_reduce(src_val, reduce_op, &scalar_dtype, context, module, builder)?
+        } else if is_vector_accumulator && !src_val.is_vector_value() {
+            // Case: Reduce unroll - scalar source, vector accumulator
+            // Splat source to match accumulator width
             splat_scalar_to_vector(src_val, vec_len, context, builder)?
         } else {
+            // Case: Both match (scalar-scalar or vector-vector)
             src_val
         };
         let new_acc = codegen_reduce_op(reduce_op, acc_val, acc_src_val, result_dtype, module, builder)?;
@@ -1468,11 +1477,13 @@ fn codegen_reduce<'ctx>(
     // Load final accumulator value
     let acc_final = builder.build_load(acc_type, acc_alloca, "reduce_acc_final").context(BuildLoadSnafu)?;
 
-    // Determine if horizontal reduction is needed:
-    // - Output upcast: source is vector (src_is_vectorized), accumulator is vector
-    //   -> Each lane is an independent output, NO horizontal reduce (keep vector)
-    // - Reduce unroll: source is scalar, accumulator is vector (splatted scalars)
-    //   -> Each lane is a partial sum, DO horizontal reduce (combine to scalar)
+    // Determine if final horizontal reduction is needed:
+    // - Output upcast (both vector): Each lane is independent output, NO horizontal reduce
+    // - Reduce unroll (scalar src, vector acc): Each lane is a partial sum, DO horizontal reduce
+    // - UNROLL expand (vector src, scalar acc): Already reduced per-iteration above, NO final reduce
+    // - Scalar (both scalar): Already scalar, NO horizontal reduce
+    //
+    // Only case: vector accumulator with scalar source (reduce unroll pattern)
     let needs_horizontal_reduce = is_vector_accumulator && !src_is_vectorized;
 
     let final_val = if needs_horizontal_reduce {

@@ -38,6 +38,28 @@ use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
 
 // ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Check if a UOp tree contains any output-dimension ranges (Loop, Global, Outer).
+fn contains_output_range(uop: &Arc<UOp>) -> bool {
+    match uop.op() {
+        Op::Range { axis_type, .. } => matches!(axis_type, AxisType::Loop | AxisType::Global | AxisType::Outer),
+        _ => uop.op().sources().iter().any(contains_output_range),
+    }
+}
+
+/// Check if a REDUCE is a full reduction (scalar output, no output dimensions).
+fn is_full_reduction_reduce(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>) -> bool {
+    if !matches!(op, Op::Reduce { .. }) {
+        return false;
+    }
+    let range_start = op.range_ending_src_index().unwrap_or(1);
+    let ranges = &sources[range_start..];
+    !ranges.iter().any(contains_output_range)
+}
+
+// ============================================================================
 // Swizzle Helpers (ported from Tinygrad's expander.py:8-20)
 // ============================================================================
 
@@ -429,6 +451,12 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 continue;
             }
 
+            // Case 3d: REDUCE source for full reductions - pass through without CAT
+            if i == 0 && is_full_reduction_reduce(op, &sources) {
+                new_sources.push(src.clone());
+                continue;
+            }
+
             // Case 4: Already vectorized (dtype.count > 1) -> CAT to replicate
             let src_count = src.dtype().vcount();
             if src_count > 1 {
@@ -442,12 +470,17 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     // Compute output dtype: vectorize by expand_sz
+    // REDUCE keeps original dtype - fix_reduce_unroll handles vectorization decision
     let base_dtype = uop.dtype();
-    let base_count = base_dtype.vcount();
-    let new_dtype = if let Some(scalar) = base_dtype.scalar() {
-        DType::Scalar(scalar).vec(base_count * expand_sz)
-    } else {
+    let new_dtype = if matches!(op, Op::Reduce { .. }) {
         base_dtype.clone()
+    } else {
+        let base_count = base_dtype.vcount();
+        if let Some(scalar) = base_dtype.scalar() {
+            DType::Scalar(scalar).vec(base_count * expand_sz)
+        } else {
+            base_dtype.clone()
+        }
     };
 
     // Create the expanded operation
@@ -819,19 +852,17 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         src.clone()
     };
 
-    // Determine output dtype:
-    // - If Upcast axes exist (from UPCAST on reduce axis): output VECTOR dtype
-    //   This creates vectorized accumulators; horizontal reduction happens after END
-    // - Otherwise: output scalar (pm_horizontal_reduce handles vectorized sources)
-    let result_dtype = if !upcast_axes.is_empty() {
-        // Vectorized accumulator pattern: UPCAST was applied to reduce axis
-        // Output vector dtype so pm_horizontal_reduce skips this REDUCE
-        // Codegen will perform horizontal reduction after the reduce loop
+    // Check if output-dimension ranges remain (Loop/Global/Outer)
+    let has_output_ranges = fixed_ranges
+        .iter()
+        .any(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Loop | AxisType::Global | AxisType::Outer, .. }));
+
+    // Vector dtype only if: upcast axes exist AND output dimensions remain
+    // Full reductions (no output dims) collapse to scalar via horizontal reduce
+    let result_dtype = if !upcast_axes.is_empty() && has_output_ranges {
         let total_upcast: usize = upcast_axes.iter().map(|(_, sz)| sz).product();
-        tracing::debug!(?upcast_axes, total_upcast, "fix_reduce_unroll: setting vector dtype for REDUCE");
         DType::Vector { scalar: reduce.dtype().base(), count: total_upcast }
     } else {
-        // Standard pattern: scalar output, horizontal reduce before loop if needed
         reduce.dtype()
     };
 

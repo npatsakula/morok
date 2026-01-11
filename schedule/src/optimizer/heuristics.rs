@@ -238,19 +238,12 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
     let unrollable = scheduler.unrollable_dims();
     let threshold = config.unroll_threshold as i64;
 
-    // Calculate output-per-thread when threading is active
-    // This determines how many elements each thread writes
-    //
-    // output_size = product of output axes (Outer, Loop, Global)
-    // thread_count = product of Thread axes
-    // output_per_thread = output_size / thread_count
+    // Calculate output-per-thread - determines how many elements each thread writes.
+    // For full reductions (no output axes), output_per_thread = 1, preventing UNROLL.
     //
     // When unrolling reduce, each thread writes Vector<N> where N = unroll factor.
     // We must ensure N <= output_per_thread to avoid overlapping writes.
-    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
-    let output_per_thread: usize = if thread_axes.is_empty() {
-        usize::MAX // No threading constraint
-    } else {
+    let output_per_thread: usize = {
         let rngs = scheduler.rngs();
 
         // Helper to extract constant size from a Range
@@ -265,20 +258,24 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
             None
         };
 
-        // Calculate thread count (product of Thread axis sizes)
-        let thread_count: usize = thread_axes.iter().filter_map(|&idx| get_axis_size(idx)).product();
-
-        // Calculate output size (product of output axis sizes: Outer, Loop, Global)
-        // These are the axes that contribute to the total output elements
+        // Calculate output size (product of output axes: Outer, Loop, Global)
+        // For full reductions (no output axes), this is 1
         let output_axes = scheduler.axes_of(&[AxisType::Outer, AxisType::Loop, AxisType::Global]);
-        let output_size: usize = output_axes.iter().filter_map(|&idx| get_axis_size(idx)).product::<usize>().max(1); // At least 1 if no output axes
+        let output_size: usize = output_axes.iter().filter_map(|&idx| get_axis_size(idx)).product::<usize>().max(1);
 
-        // Account for existing UPCAST on output (increases output-per-thread)
+        // Account for existing UPCAST on output
         let upcast_size = scheduler.upcast_size();
         let effective_output_size = output_size * upcast_size.max(1);
 
-        // output_per_thread = effective_output_size / thread_count
-        if thread_count > 0 { effective_output_size / thread_count } else { effective_output_size }
+        let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+        if thread_axes.is_empty() {
+            // No threading: use effective_output_size directly
+            // For full reductions, this is 1, preventing UNROLL
+            effective_output_size
+        } else {
+            let thread_count: usize = thread_axes.iter().filter_map(|&idx| get_axis_size(idx)).product();
+            if thread_count > 0 { effective_output_size / thread_count } else { effective_output_size }
+        }
     };
 
     for axis_idx in unrollable {

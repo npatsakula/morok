@@ -294,7 +294,6 @@ fn test_argmax_all_equal() {
 // ========== Sum Tests (from Tinygrad test_ops.py:1344-1380) ==========
 
 #[test]
-
 fn test_sum_1d_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
