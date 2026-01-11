@@ -47,11 +47,7 @@ impl DuplicateTracker {
         if self.seen.contains(name) {
             // Count existing duplicates of this name to generate unique suffix
             let count = self.duplicates.iter().filter(|(orig, _)| orig == name).count();
-            let dup_name = if count == 0 {
-                format!("{}_dup", name)
-            } else {
-                format!("{}_dup_{}", name, count + 1)
-            };
+            let dup_name = if count == 0 { format!("{}_dup", name) } else { format!("{}_dup_{}", name, count + 1) };
             self.duplicates.push((name.to_string(), dup_name.clone()));
             dup_name
         } else {
@@ -161,8 +157,26 @@ const BINARY_OPS: &[&str] = &[
 /// Unary IR operations.
 /// NOTE: Must stay in sync with morok_ir::types::UnaryOp variants.
 const UNARY_OPS: &[&str] = &[
-    "Neg", "Not", "Abs", "Sqrt", "Rsqrt", "Exp", "Exp2", "Log", "Log2", "Sin", "Cos", "Tan", "Reciprocal", "Trunc",
-    "Floor", "Ceil", "Round", "Sign", "Erf", "Square",
+    "Neg",
+    "Not",
+    "Abs",
+    "Sqrt",
+    "Rsqrt",
+    "Exp",
+    "Exp2",
+    "Log",
+    "Log2",
+    "Sin",
+    "Cos",
+    "Tan",
+    "Reciprocal",
+    "Trunc",
+    "Floor",
+    "Ceil",
+    "Round",
+    "Sign",
+    "Erf",
+    "Square",
 ];
 
 /// Ternary IR operations.
@@ -227,17 +241,14 @@ const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
     // WMMA
     ("Wmma", &["a", "b", "c"]),
     // Kernel
-    ("Kernel", &["ast"]),  // sources is variadic
+    ("Kernel", &["ast"]), // sources is variadic
 ];
 
 /// Get child field names for an operation.
 ///
 /// Returns the field names from OP_CHILD_FIELDS, or &["src"] for single-source ops.
 fn get_child_field_names(op_name: &str) -> Option<&'static [&'static str]> {
-    OP_CHILD_FIELDS
-        .iter()
-        .find(|(name, _)| *name == op_name)
-        .map(|(_, fields)| *fields)
+    OP_CHILD_FIELDS.iter().find(|(name, _)| *name == op_name).map(|(_, fields)| *fields)
 }
 
 /// Classify an operation name into its category.
@@ -306,9 +317,12 @@ fn collect_op_names_from_pattern(pattern: &Pattern, names: &mut std::collections
         }
         // Constants, variables, wildcards, op variables don't have op names to validate
         // (OpVar uses iteration context which is separately validated)
-        Pattern::Const(_) | Pattern::Var(_) | Pattern::OpVar { .. } |
-        Pattern::ConstWithValue { .. } | Pattern::Wildcard |
-        Pattern::OptionNone => {}
+        Pattern::Const(_)
+        | Pattern::Var(_)
+        | Pattern::OpVar { .. }
+        | Pattern::ConstWithValue { .. }
+        | Pattern::Wildcard
+        | Pattern::OptionNone => {}
         // OptionSome has an inner pattern that may contain ops
         Pattern::OptionSome(inner) => {
             collect_op_names_from_pattern(inner, names);
@@ -550,9 +564,7 @@ fn generate_inline_match(
             generate_inline_op_tuple_match(op, args, tree_var, iter_ctx, dup_tracker)
         }
 
-        Pattern::OpStruct { op, fields, rest: _ } => {
-            generate_inline_op_struct_match(op, fields, tree_var, dup_tracker)
-        }
+        Pattern::OpStruct { op, fields, rest: _ } => generate_inline_op_struct_match(op, fields, tree_var, dup_tracker),
 
         Pattern::Const(const_pat) => generate_inline_const_match(const_pat, tree_var),
 
@@ -579,13 +591,9 @@ fn generate_inline_match(
             generate_inline_op_var_match(var_name, args, tree_var, iter_ctx, dup_tracker)
         }
 
-        Pattern::Any(alternatives) => {
-            generate_inline_alternatives_match(alternatives, tree_var, iter_ctx, dup_tracker)
-        }
+        Pattern::Any(alternatives) => generate_inline_alternatives_match(alternatives, tree_var, iter_ctx, dup_tracker),
 
-        Pattern::OpPermute { op, args } => {
-            generate_inline_commutative_match(op, args, tree_var, iter_ctx, dup_tracker)
-        }
+        Pattern::OpPermute { op, args } => generate_inline_commutative_match(op, args, tree_var, iter_ctx, dup_tracker),
 
         Pattern::OptionNone => {
             // Match Option::None - reject if value is Some
@@ -892,8 +900,8 @@ fn generate_inline_special_op_match(
             bindings: vec![],
             is_commutative: false,
             alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
+            child_match_code: None,
+            alt_child_match_code: None,
         });
     }
 
@@ -923,7 +931,8 @@ fn generate_inline_special_op_match(
     }
 
     // Generate temp variables for each field (unique based on tree_var)
-    let field_vars: Vec<Ident> = field_names.iter().take(args.len()).map(|name| format_ident!("{}_{}", tree_var, name)).collect();
+    let field_vars: Vec<Ident> =
+        field_names.iter().take(args.len()).map(|name| format_ident!("{}_{}", tree_var, name)).collect();
 
     // Generate field bindings for the match pattern
     let field_bindings: Vec<TokenStream2> = field_names
@@ -1330,10 +1339,7 @@ fn generate_inline_alternatives_match(
     };
 
     // Generate matches! check: matches!(field_var, Enum::A | Enum::B | ...)
-    let variant_patterns: Vec<TokenStream2> = variant_names
-        .iter()
-        .map(|name| quote! { #enum_type::#name })
-        .collect();
+    let variant_patterns: Vec<TokenStream2> = variant_names.iter().map(|name| quote! { #enum_type::#name }).collect();
 
     let match_code = quote! {
         if !matches!(#tree_var, #(#variant_patterns)|*) {
@@ -1480,11 +1486,8 @@ fn generate_simplified_alternatives_rule(
         let child_code = alt_match.child_match_code.as_ref().cloned().unwrap_or_default();
 
         // Generate binding statements
-        let binding_stmts: Vec<TokenStream2> = alt_match
-            .bindings
-            .iter()
-            .map(|(name, expr)| quote! { let #name = #expr; })
-            .collect();
+        let binding_stmts: Vec<TokenStream2> =
+            alt_match.bindings.iter().map(|(name, expr)| quote! { let #name = #expr; }).collect();
 
         // Generate ptr_eq checks for duplicates (return NoMatch from inner closure)
         let duplicate_pairs = dup_tracker.get_duplicates();
@@ -1551,7 +1554,11 @@ fn generate_simplified_alternatives_rule(
 }
 
 /// Generate a rule for SimplifiedPatternMatcher with inline matching.
-fn generate_simplified_rule(rule: &PatternRule, iter_ctx: Option<&IterContext>, has_context: bool) -> Result<TokenStream2> {
+fn generate_simplified_rule(
+    rule: &PatternRule,
+    iter_ctx: Option<&IterContext>,
+    has_context: bool,
+) -> Result<TokenStream2> {
     // Check for alternative patterns at the top level - handle specially
     if let Pattern::Any(alternatives) = &rule.lhs {
         return generate_simplified_alternatives_rule(alternatives, rule, iter_ctx, has_context);

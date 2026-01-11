@@ -1202,8 +1202,11 @@ fn lift_unroll_from_binary(binary: &Arc<UOp>) -> Option<Arc<UOp>> {
     );
 
     // Create new Binary with unwrapped UNROLL source (preserve operand order)
-    let (new_left, new_right) =
-        if unroll_on_left { (unroll_inner.clone(), non_unroll.clone()) } else { (non_unroll.clone(), unroll_inner.clone()) };
+    let (new_left, new_right) = if unroll_on_left {
+        (unroll_inner.clone(), non_unroll.clone())
+    } else {
+        (non_unroll.clone(), unroll_inner.clone())
+    };
 
     // Use unroll_inner's dtype - for non-comparison ops, the result dtype matches operand dtype
     let new_binary = UOp::new(Op::Binary(*op, new_left, new_right), unroll_inner.dtype());

@@ -28,8 +28,9 @@ impl UOp {
 
     /// Create a buffer index operation for multi-dimensional access.
     ///
-    /// All indices must have Index dtype. Returns a Ptr to the element at specified position.
-    /// The result dtype is `Ptr<element_type>` to enable `auto_load_pointer` in codegen.
+    /// All indices must have Index dtype. Returns the element dtype (not Ptr).
+    /// This matches Tinygrad's `buf.index(idx)` which returns element dtype by default.
+    /// Use `pm_add_loads` pattern to wrap INDEX in LOAD for arithmetic contexts.
     pub fn index(buffer: Arc<Self>, indices: Vec<Arc<Self>>) -> Result<Arc<Self>> {
         // Validate that all indices have Index dtype
         for idx in &indices {
@@ -37,20 +38,18 @@ impl UOp {
             ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
         }
 
-        // Extract element type, then wrap in Ptr
+        // Extract element type - INDEX returns element dtype, not Ptr
+        // (Tinygrad: `self.dtype.base` when ptr=False)
         let element_dtype = match buffer.dtype() {
             DType::Ptr { base, .. } => base.as_ref().clone(),
             other => other,
         };
-        // Return Ptr dtype pointing to element (enables auto_load_pointer in codegen)
-        let ptr_dtype =
-            DType::Ptr { base: Box::new(element_dtype), size: None, addrspace: morok_dtype::AddrSpace::Global };
         let indices = SmallVec::from_vec(indices);
-        Ok(Self::new(Op::Index { buffer, indices, gate: None }, ptr_dtype))
+        Ok(Self::new(Op::Index { buffer, indices, gate: None }, element_dtype))
     }
 
     /// Create a gated index operation.
-    /// Returns a Ptr to the element at specified position (same as `index()`).
+    /// Returns the element dtype (not Ptr), same as `index()`.
     pub fn index_gated(buffer: Arc<Self>, indices: Vec<Arc<Self>>, gate: Arc<Self>) -> Result<Arc<Self>> {
         // Validate that all indices have Index dtype
         for idx in &indices {
@@ -58,16 +57,13 @@ impl UOp {
             ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
         }
 
-        // Extract element type, then wrap in Ptr
+        // Extract element type - INDEX returns element dtype, not Ptr
         let element_dtype = match buffer.dtype() {
             DType::Ptr { base, .. } => base.as_ref().clone(),
             other => other,
         };
-        // Return Ptr dtype pointing to element (enables auto_load_pointer in codegen)
-        let ptr_dtype =
-            DType::Ptr { base: Box::new(element_dtype), size: None, addrspace: morok_dtype::AddrSpace::Global };
         let indices = SmallVec::from_vec(indices);
-        Ok(Self::new(Op::Index { buffer, indices, gate: Some(gate) }, ptr_dtype))
+        Ok(Self::new(Op::Index { buffer, indices, gate: Some(gate) }, element_dtype))
     }
 
     /// Create a pointer index operation (pointer arithmetic).

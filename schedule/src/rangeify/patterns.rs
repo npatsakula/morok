@@ -936,9 +936,10 @@ fn force_bufferize(src: &Arc<UOp>) -> Arc<UOp> {
 /// 2. STORE cleanup - remove LOAD from index position (STORE needs raw INDEX)
 pub fn pm_add_loads() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        // Pattern 1: Every INDEX → LOAD(buffer, INDEX)
-        // Bottom-up rewriting propagates this to all consumers automatically
-        idx @ Index { buffer, indices } => |idx, buffer, indices| {
+        // Pattern 1: INDEX with non-Ptr dtype → LOAD(buffer, INDEX with Ptr dtype)
+        // Guard prevents re-matching: after transformation, INDEX has Ptr dtype.
+        // Based on Tinygrad's pm_add_loads (devectorizer.py:320-323).
+        idx @ Index { buffer, indices } if !matches!(idx.dtype(), DType::Ptr { .. }) => |idx, buffer, indices| {
             // Handle vectorized indices - if any index has vector dtype, LOAD produces vector
             let vec_count = indices.iter().find_map(|i| match i.dtype() {
                 DType::Vector { count, .. } => Some(count),
@@ -955,19 +956,18 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
                 None => element_dtype,
             };
 
-            // Create FRESH INDEX to break self-reference (matches Tinygrad's idx.replace() approach).
-            // Without this, LOAD contains the ORIGINAL INDEX which has a cached result,
-            // causing Pattern 2's extracted INDEX to be re-substituted → oscillation.
+            // Create INDEX with Ptr dtype (buffer's dtype) - won't match pattern again.
+            // This matches Tinygrad's idx.replace(dtype=idx.src[0].dtype) approach.
             let gate = match idx.op() {
                 Op::Index { gate, .. } => gate.clone(),
                 _ => None,
             };
-            let fresh_index = UOp::new(
+            let ptr_index = UOp::new(
                 Op::Index { buffer: buffer.clone(), indices: indices.clone(), gate },
-                idx.dtype().clone(),
+                buffer.dtype().clone(),  // Use buffer dtype (Ptr), not original INDEX dtype
             );
 
-            Some(UOp::new(Op::Load { buffer: buffer.clone(), index: fresh_index }, result_dtype))
+            Some(UOp::new(Op::Load { buffer: buffer.clone(), index: ptr_index }, result_dtype))
         },
 
         // Pattern 2: Cleanup STORE - remove LOAD from index position
@@ -1246,7 +1246,11 @@ fn needs_reduce_devectorize(reduce: &Arc<UOp>) -> bool {
     let has_contract = matches!(src.op(), Op::Contract { .. });
 
     // K-vectorized: CONTRACT source with vector output
-    has_contract && out_vcount > 1 || out_vcount > 1 && is_bool && src_vcount == out_vcount
+    // Bool reduce: matching vcounts, bool dtype, no CONTRACT
+    // Horizontal: source has more elements than output
+    has_contract && out_vcount > 1
+        || out_vcount > 1 && is_bool && src_vcount == out_vcount
+        || src_vcount > out_vcount && out_vcount >= 1
 }
 
 /// Inline helper: check if REDUCE is K-vectorized (CONTRACT source).

@@ -133,9 +133,7 @@ fn analyze_regular_variant(variant: VariantInfo) -> AnalyzedVariant {
 
 /// Group variants by kind for generation.
 pub fn group_by_kind(variants: &[AnalyzedVariant]) -> VariantGroups<'_> {
-    VariantGroups {
-        grouped: variants.iter().filter(|v| v.kind == VariantKind::Grouped).collect(),
-    }
+    VariantGroups { grouped: variants.iter().filter(|v| v.kind == VariantKind::Grouped).collect() }
 }
 
 /// Variants grouped by kind for code generation.

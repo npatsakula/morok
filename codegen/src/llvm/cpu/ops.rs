@@ -13,7 +13,7 @@ use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
 use tracing::{debug, trace};
 
-use morok_dtype::DType;
+use morok_dtype::{DType, ScalarDType};
 use morok_ir::{AxisType, ReduceOp, prelude::*};
 
 use crate::llvm::common::{self, loop_gen};
@@ -1718,6 +1718,7 @@ fn codegen_reduce_identity<'ctx>(
     let llvm_type = common::dtype_to_basic_type(dtype, context)?;
     let is_float = dtype.is_float();
     let is_signed = dtype.is_signed();
+    let is_bool = dtype.base() == ScalarDType::Bool;
 
     match reduce_op {
         ReduceOp::Add => {
@@ -1737,6 +1738,9 @@ fn codegen_reduce_identity<'ctx>(
         ReduceOp::Max => {
             if is_float {
                 Ok(llvm_type.into_float_type().const_float(f64::NEG_INFINITY).into())
+            } else if is_bool {
+                // Bool Max (OR) identity = false
+                Ok(llvm_type.into_int_type().const_int(0, false).into())
             } else if is_signed {
                 let bits = dtype.bytes() * 8;
                 let min_val = match bits {
@@ -1754,6 +1758,9 @@ fn codegen_reduce_identity<'ctx>(
         ReduceOp::Min => {
             if is_float {
                 Ok(llvm_type.into_float_type().const_float(f64::INFINITY).into())
+            } else if is_bool {
+                // Bool Min (AND) identity = true
+                Ok(llvm_type.into_int_type().const_int(1, false).into())
             } else if is_signed {
                 let bits = dtype.bytes() * 8;
                 let max_val = match bits {
@@ -1819,6 +1826,7 @@ fn codegen_reduce_op<'ctx>(
     let base = dtype.base();
     let is_float = base.is_float();
     let is_signed = base.is_signed();
+    let is_bool = base == ScalarDType::Bool;
 
     match reduce_op {
         ReduceOp::Add => common::build_add(builder, acc, src, is_float),
@@ -1827,6 +1835,9 @@ fn codegen_reduce_op<'ctx>(
             if is_float {
                 let suffix = get_type_suffix(dtype)?;
                 call_intrinsic(&format!("llvm.maxnum.{}", suffix), &[acc, src], "reduce_max", module, builder)
+            } else if is_bool {
+                // Bool Max = OR (any: at least one true → true)
+                common::build_or(builder, acc, src)
             } else if is_signed {
                 call_intrinsic(&format!("llvm.smax.i{}", dtype.bytes() * 8), &[acc, src], "reduce_max", module, builder)
             } else {
@@ -1837,6 +1848,9 @@ fn codegen_reduce_op<'ctx>(
             if is_float {
                 let suffix = get_type_suffix(dtype)?;
                 call_intrinsic(&format!("llvm.minnum.{}", suffix), &[acc, src], "reduce_min", module, builder)
+            } else if is_bool {
+                // Bool Min = AND (all: all true → true)
+                common::build_and(builder, acc, src)
             } else if is_signed {
                 call_intrinsic(&format!("llvm.smin.i{}", dtype.bytes() * 8), &[acc, src], "reduce_min", module, builder)
             } else {

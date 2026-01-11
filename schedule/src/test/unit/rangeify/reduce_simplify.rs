@@ -8,7 +8,7 @@
 use std::{f32::consts::PI, sync::Arc};
 
 use morok_dtype::DType;
-use morok_ir::{pattern::RewriteResult, AxisId, AxisType, BinaryOp, Op, ReduceOp, UOp};
+use morok_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, UOp, pattern::RewriteResult};
 
 use crate::rangeify::transforms::reduce_collapse as reduce_collapse_inner;
 

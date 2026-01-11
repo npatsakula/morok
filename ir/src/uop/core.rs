@@ -1066,14 +1066,12 @@ impl UOp {
 
         // Compute correct dtype for operations whose dtype depends on source dtypes
         let dtype = match &new_op {
-            // INDEX returns Ptr to element type (enables auto_load_pointer in codegen)
-            Op::Index { buffer, .. } => {
-                let element_dtype = match &buffer.dtype {
-                    DType::Ptr { base, .. } => (**base).clone(),
-                    other => other.clone(),
-                };
-                DType::Ptr { base: Box::new(element_dtype), size: None, addrspace: morok_dtype::AddrSpace::Global }
-            }
+            // INDEX returns element type (matching Tinygrad's buf.index(idx) semantics)
+            // pm_add_loads will wrap INDEX in LOAD for arithmetic contexts
+            Op::Index { buffer, .. } => match &buffer.dtype {
+                DType::Ptr { base, .. } => (**base).clone(),
+                other => other.clone(),
+            },
             // LOAD returns element type (actual value)
             Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } => match &buffer.dtype {
                 DType::Ptr { base, .. } => (**base).clone(),
@@ -1382,14 +1380,12 @@ impl UOp {
 
         // Compute correct dtype for operations whose dtype depends on source dtypes
         let dtype = match &new_op {
-            // INDEX returns Ptr to element type (enables auto_load_pointer in codegen)
-            Op::Index { buffer, .. } => {
-                let element_dtype = match &buffer.dtype {
-                    DType::Ptr { base, .. } => (**base).clone(),
-                    other => other.clone(),
-                };
-                DType::Ptr { base: Box::new(element_dtype), size: None, addrspace: morok_dtype::AddrSpace::Global }
-            }
+            // INDEX returns element type (matching Tinygrad's buf.index(idx) semantics)
+            // pm_add_loads will wrap INDEX in LOAD for arithmetic contexts
+            Op::Index { buffer, .. } => match &buffer.dtype {
+                DType::Ptr { base, .. } => (**base).clone(),
+                other => other.clone(),
+            },
             // LOAD returns element type (actual value)
             Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } => match &buffer.dtype {
                 DType::Ptr { base, .. } => (**base).clone(),

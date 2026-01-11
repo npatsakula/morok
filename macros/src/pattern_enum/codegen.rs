@@ -31,11 +31,7 @@ pub fn generate(input: &DeriveInput) -> Result<TokenStream> {
 }
 
 /// Generate the OpKey enum and from_op method.
-fn generate_op_key(
-    variants: &[AnalyzedVariant],
-    _groups: &VariantGroups,
-    enum_name: &Ident,
-) -> TokenStream {
+fn generate_op_key(variants: &[AnalyzedVariant], _groups: &VariantGroups, enum_name: &Ident) -> TokenStream {
     // Generate OpKey variants (including skipped ones so from_op can return a valid key)
     let key_variants: Vec<_> = variants
         .iter()

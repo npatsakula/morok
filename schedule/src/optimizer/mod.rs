@@ -109,22 +109,24 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// - bool_storage_patterns: Convert bool LOAD/STORE to uint8
 ///
 /// Called by both heuristic and beam search paths for consistent behavior.
+#[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
 pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
-    // NOTE: Must run BEFORE pre_expand so that INDEX ops are still visible
-    // (after expand, INDEX is wrapped in UNROLL and patterns won't match).
     let pm_loads = crate::rangeify::patterns::pm_add_loads();
-    // Use top-down rewrite (not bottom-up) to avoid infinite recursion:
-    // Pattern 1 creates FRESH_INDEX inside LOAD. Bottom-up would process FRESH_INDEX
-    // and Pattern 1 would match again → infinite loop. Top-down doesn't recurse into
-    // newly created children, matching Tinygrad's behavior.
+    // First pass: wrap existing INDEX ops before expansion.
+    // Pattern has guard (!Ptr dtype) and transforms INDEX dtype to Ptr, so safe for reuse.
     let with_loads = graph_rewrite(&pm_loads, ast, &mut ());
 
     // Post-optimization: Fix UNROLL substitutions in REDUCE ops
     // This handles arithmetic expressions created by shift_to UNROLL
     let expanded = crate::expand::pre_expand(&with_loads);
+
+    // Second pass of pm_add_loads: pre_expand creates new INDEX ops (via CAT expansion)
+    // that need LOAD wrapping. These weren't present before pre_expand.
+    // Safe for bottom-up: pattern guard (!Ptr) prevents re-matching transformed INDEX.
+    let expanded = crate::rewrite::graph_rewrite_bottom_up(&pm_loads, expanded, &mut ());
 
     // Devectorize pass: group contiguous memory accesses
     // Uses direct vector index analysis (VConst/UNROLL patterns) for termination safety

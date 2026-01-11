@@ -62,6 +62,38 @@ impl_binary_arith!(build_sub, build_float_sub, build_int_sub, "sub");
 impl_binary_arith!(build_mul, build_float_mul, build_int_mul, "mul");
 
 // ============================================================================
+// Bitwise operations (for Bool reduce: OR = any, AND = all)
+// ============================================================================
+
+/// Build a bitwise OR operation for integer types (scalar or vector).
+/// Used for Bool Max reduce (any: at least one true → true).
+pub fn build_or<'ctx>(
+    builder: &Builder<'ctx>,
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>> {
+    if lhs.is_vector_value() {
+        Ok(builder.build_or(lhs.into_vector_value(), rhs.into_vector_value(), "or").context(ArithmeticSnafu)?.into())
+    } else {
+        Ok(builder.build_or(lhs.into_int_value(), rhs.into_int_value(), "or").context(ArithmeticSnafu)?.into())
+    }
+}
+
+/// Build a bitwise AND operation for integer types (scalar or vector).
+/// Used for Bool Min reduce (all: all true → true).
+pub fn build_and<'ctx>(
+    builder: &Builder<'ctx>,
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>> {
+    if lhs.is_vector_value() {
+        Ok(builder.build_and(lhs.into_vector_value(), rhs.into_vector_value(), "and").context(ArithmeticSnafu)?.into())
+    } else {
+        Ok(builder.build_and(lhs.into_int_value(), rhs.into_int_value(), "and").context(ArithmeticSnafu)?.into())
+    }
+}
+
+// ============================================================================
 // Unary operations
 // ============================================================================
 
