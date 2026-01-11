@@ -694,8 +694,12 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     };
 
     tracing::debug!(
-        src_op = ?std::mem::discriminant(src.op()),
+        src_op = src.op().as_ref(),
         ranges_len = ranges.len(),
+        ranges_types = ?ranges.iter().map(|r| match r.op() {
+            Op::Range { axis_type, .. } => format!("Range({:?})", axis_type),
+            _ => r.op().as_ref().to_string(),
+        }).collect::<Vec<_>>(),
         "fix_reduce_unroll: checking REDUCE"
     );
 
@@ -824,6 +828,7 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         // Output vector dtype so pm_horizontal_reduce skips this REDUCE
         // Codegen will perform horizontal reduction after the reduce loop
         let total_upcast: usize = upcast_axes.iter().map(|(_, sz)| sz).product();
+        tracing::debug!(?upcast_axes, total_upcast, "fix_reduce_unroll: setting vector dtype for REDUCE");
         DType::Vector { scalar: reduce.dtype().base(), count: total_upcast }
     } else {
         // Standard pattern: scalar output, horizontal reduce before loop if needed

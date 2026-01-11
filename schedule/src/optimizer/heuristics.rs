@@ -11,6 +11,14 @@ use crate::optimizer::config::HeuristicsConfig;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
 
 // ============================================================================
+// CONSTANTS
+// ============================================================================
+
+/// Default vectorization factor for UPCAST when no other heuristic applies.
+/// Value 4 provides good SIMD utilization on most architectures (SSE/NEON).
+pub const DEFAULT_UPCAST_FACTOR: usize = 4;
+
+// ============================================================================
 // MAIN ENTRY POINT
 // ============================================================================
 
@@ -60,21 +68,22 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     // 5. Heuristic upcasts
     apply_heuristic_upcasts(scheduler);
 
-    // 6. Unroll (guarded by upcast_size() < 64 to prevent exponential vector growth)
-    apply_unroll(scheduler, config);
-
-    // 7. Default upcast
+    // 6. Default upcast
     if !scheduler.upcasted() {
         apply_default_upcast(scheduler);
     }
 
-    // 8. Local dims
+    // 7. Local dims
     apply_local_dims(scheduler, config);
 
-    // 9. Threading
+    // 8. Threading
     debug!("hand_coded_optimizations: calling apply_threading with max_threads={}", config.thread_count);
     let threading_applied = apply_threading(scheduler, config.thread_count);
     debug!(threading_applied, "hand_coded_optimizations: apply_threading completed");
+
+    // 9. Unroll (AFTER threading so we can check output-per-thread compatibility)
+    // Unrolling reduce creates vector accumulators; must ensure unroll factor <= output-per-thread
+    apply_unroll(scheduler, config);
 }
 
 // ============================================================================
@@ -180,6 +189,7 @@ pub fn apply_image_upcasts(_scheduler: &mut Scheduler) -> bool {
 
 /// Default upcast fallback: 4x vectorization on first upcastable axis.
 pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
+    use morok_ir::Op;
     use tracing::debug;
 
     if scheduler.upcasted() {
@@ -192,8 +202,23 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
         debug!("apply_default_upcast: no upcastable dims");
         return false;
     }
-    let result = apply_opt(scheduler, &Opt::upcast(upcastable[0], 4), true);
-    debug!(?result, axis = upcastable[0], "apply_default_upcast: apply_opt result");
+
+    let axis_idx = upcastable[0];
+    let rngs = scheduler.rngs();
+
+    // Get axis size and check divisibility (Tinygrad: k.full_shape[axis] % upcast_amount != 0)
+    if axis_idx < rngs.len()
+        && let Op::Range { end, .. } = rngs[axis_idx].op()
+        && let Op::Const(cv) = end.op()
+        && let morok_ir::ConstValue::Int(size) = cv.0
+        && size % DEFAULT_UPCAST_FACTOR as i64 != 0
+    {
+        debug!(axis_idx, size, factor = DEFAULT_UPCAST_FACTOR, "apply_default_upcast: skipping (size not divisible)");
+        return false;
+    }
+
+    let result = apply_opt(scheduler, &Opt::upcast(axis_idx, DEFAULT_UPCAST_FACTOR), true);
+    debug!(?result, axis = axis_idx, factor = DEFAULT_UPCAST_FACTOR, "apply_default_upcast: apply_opt result");
     result.is_ok()
 }
 
@@ -201,10 +226,60 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
 ///
 /// Uses `upcast_size()` as a generic guard to prevent exponential vector width growth.
 /// This matches Tinygrad's approach (heuristic.py:138) of checking total vectorization width.
+///
+/// When threading is active, unrolling reduce creates vectorized accumulators.
+/// We must ensure the unroll factor is compatible with output-per-thread:
+/// - output_per_thread = output_size / thread_count
+/// - If unroll_factor > output_per_thread, the vector store would overflow thread's output slice
 pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    use tracing::debug;
+
     let mut applied = false;
     let unrollable = scheduler.unrollable_dims();
     let threshold = config.unroll_threshold as i64;
+
+    // Calculate output-per-thread when threading is active
+    // This determines how many elements each thread writes
+    //
+    // output_size = product of output axes (Outer, Loop, Global)
+    // thread_count = product of Thread axes
+    // output_per_thread = output_size / thread_count
+    //
+    // When unrolling reduce, each thread writes Vector<N> where N = unroll factor.
+    // We must ensure N <= output_per_thread to avoid overlapping writes.
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    let output_per_thread: usize = if thread_axes.is_empty() {
+        usize::MAX // No threading constraint
+    } else {
+        let rngs = scheduler.rngs();
+
+        // Helper to extract constant size from a Range
+        let get_axis_size = |idx: usize| -> Option<usize> {
+            if idx < rngs.len()
+                && let Op::Range { end, .. } = rngs[idx].op()
+                && let Op::Const(cv) = end.op()
+                && let morok_ir::ConstValue::Int(sz) = cv.0
+            {
+                return Some(sz as usize);
+            }
+            None
+        };
+
+        // Calculate thread count (product of Thread axis sizes)
+        let thread_count: usize = thread_axes.iter().filter_map(|&idx| get_axis_size(idx)).product();
+
+        // Calculate output size (product of output axis sizes: Outer, Loop, Global)
+        // These are the axes that contribute to the total output elements
+        let output_axes = scheduler.axes_of(&[AxisType::Outer, AxisType::Loop, AxisType::Global]);
+        let output_size: usize = output_axes.iter().filter_map(|&idx| get_axis_size(idx)).product::<usize>().max(1); // At least 1 if no output axes
+
+        // Account for existing UPCAST on output (increases output-per-thread)
+        let upcast_size = scheduler.upcast_size();
+        let effective_output_size = output_size * upcast_size.max(1);
+
+        // output_per_thread = effective_output_size / thread_count
+        if thread_count > 0 { effective_output_size / thread_count } else { effective_output_size }
+    };
 
     for axis_idx in unrollable {
         let rngs = scheduler.rngs();
@@ -222,6 +297,14 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
             // This prevents exponential vector width growth from multiple unroll sources
             // (K-vectorization, output-upcast, general unrolling)
             if scheduler.upcast_size() * (size as usize) > 32 {
+                continue;
+            }
+
+            // Threading guard: skip if unroll factor exceeds output-per-thread
+            // Unrolling reduce creates Vector<N> accumulators; each thread must have
+            // enough output elements to store the vector without overlapping neighbors
+            if (size as usize) > output_per_thread {
+                debug!(axis_idx, size, output_per_thread, "apply_unroll: skipping (unroll factor > output_per_thread)");
                 continue;
             }
 
@@ -504,9 +587,11 @@ pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &Heurist
 
         // Try factors [4, 3, 2] in order (power-of-2 preferred)
         for factor in [4usize, 3, 2] {
-            // Check: size is large enough, local target not exceeded, AND combined width <= 16
+            // Check: size is large enough, divisible by factor (Tinygrad: k.full_shape[axis] % upcast_amount != 0),
+            // local target not exceeded, AND combined width <= 16
             let combined_ok = scheduler.upcast_size() * factor <= 16;
-            if size >= factor as i64 && upcast_product * factor <= target_upcast && combined_ok {
+            let divisible = size % factor as i64 == 0;
+            if size >= factor as i64 && divisible && upcast_product * factor <= target_upcast && combined_ok {
                 trace!(axis_idx, factor, "apply_matmul_output_upcasting: trying upcast");
                 match apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true) {
                     Ok(_) => {
@@ -647,6 +732,11 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             };
 
             for factor in factors {
+                // Skip factors that don't divide evenly (Tinygrad: k.full_shape[axis] % upcast_amount != 0)
+                if size % factor as i64 != 0 {
+                    debug!(axis_idx, factor, size, "apply_heuristic_upcasts: skipping (not divisible)");
+                    continue;
+                }
                 debug!(axis_idx, factor, size, "apply_heuristic_upcasts: trying upcast");
                 let result = apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true);
                 debug!(?result, axis_idx, factor, "apply_heuristic_upcasts: apply_opt result");

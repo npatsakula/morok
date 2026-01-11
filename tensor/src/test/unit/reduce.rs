@@ -2,7 +2,6 @@ use crate::reduce::AxisSpec;
 use crate::test::helpers::*;
 use crate::*;
 use morok_dtype::DType;
-use tracing_test::traced_test;
 
 #[test]
 fn test_axis_spec_all() {
@@ -295,7 +294,7 @@ fn test_argmax_all_equal() {
 // ========== Sum Tests (from Tinygrad test_ops.py:1344-1380) ==========
 
 #[test]
-#[tracing_test::traced_test]
+
 fn test_sum_1d_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
@@ -422,7 +421,7 @@ fn test_min_negative_value() {
 // ========== Argmax Tests (from Tinygrad test_ops.py:1087-1105) ==========
 
 #[test]
-#[traced_test]
+
 fn test_argmax_debug_steps() {
     let _guard = test_setup();
 
@@ -473,7 +472,7 @@ fn test_argmax_debug_steps() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+
 fn test_argmax_full_steps() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0]);
@@ -577,7 +576,7 @@ fn test_argmax_flatten_value() {
 // ========== Argmin Tests (from Tinygrad test_ops.py:1106-1122) ==========
 
 #[test]
-#[tracing_test::traced_test]
+
 fn test_argmin_value_1d() {
     let _guard = test_setup();
     let t = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
@@ -606,7 +605,7 @@ fn test_argmin_2d_axis0_value() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+
 fn test_argmin_2d_axis1_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
@@ -715,7 +714,7 @@ fn test_all_value_all_false() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+
 fn test_all_2d_axis0_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([true, true, false, true]).try_reshape(&[2, 2]).unwrap();
@@ -725,7 +724,7 @@ fn test_all_2d_axis0_value() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+
 fn test_all_2d_axis1_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([true, true, true, false]).try_reshape(&[2, 2]).unwrap();
@@ -807,7 +806,7 @@ fn test_debug_argmin_intermediate() {
 }
 
 #[test]
-#[traced_test]
+
 fn test_debug_lazy_neg_max() {
     let _guard = test_setup();
     let values = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
@@ -822,7 +821,7 @@ fn test_debug_lazy_neg_max() {
 }
 
 #[test]
-#[traced_test]
+
 fn test_debug_lazy_neg_argmax() {
     let _guard = test_setup();
     let values = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
