@@ -53,14 +53,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     try_grouped_reduction(scheduler, config);
 
     // 3.5. Matmul output dimension upcasting (CPU-only, vectorizes along N)
-    // Output upcast preferred over K-vec: gives contiguous B matrix loads
-    let output_upcasted = apply_matmul_output_upcasting(scheduler, config);
-
-    // 3.6. Matmul K-vectorization only if output upcast didn't apply
-    // K-vec creates non-contiguous B access patterns (stride-N between lanes)
-    if !output_upcasted {
-        apply_matmul_k_vectorization(scheduler, config);
-    }
+    apply_matmul_output_upcasting(scheduler, config);
 
     // 4. Masked upcasts
     apply_masked_upcasts(scheduler);
@@ -278,39 +271,78 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
         }
     };
 
-    for axis_idx in unrollable {
+    // Compute SIMD width from reduce dtype (assuming AVX 256-bit = 32 bytes)
+    // For f32: 32/4 = 8, for f64: 32/8 = 4, for f16: 32/2 = 16
+    let simd_width: usize = scheduler
+        .reduceop()
+        .map(|r| 32 / r.dtype().bytes().max(1))
+        .unwrap_or(8) // Default to f32 width if no reduce
+        .clamp(2, 16); // Reasonable bounds
+
+    // Iterate innermost first (like Tinygrad) to unroll inner reduce loops first
+    for axis_idx in unrollable.into_iter().rev() {
         let rngs = scheduler.rngs();
         if axis_idx >= rngs.len() {
             continue;
         }
         let rng = &rngs[axis_idx];
-        if let Op::Range { end, .. } = rng.op()
+        let size = if let Op::Range { end, .. } = rng.op()
             && let Op::Const(cv) = end.op()
-            && let morok_ir::ConstValue::Int(size) = cv.0
-            && size > 1
-            && size <= threshold
+            && let morok_ir::ConstValue::Int(sz) = cv.0
         {
-            // Generic guard: skip if combined upcast_size would exceed 32
-            // This prevents exponential vector width growth from multiple unroll sources
-            // (K-vectorization, output-upcast, general unrolling)
-            if scheduler.upcast_size() * (size as usize) > 32 {
-                continue;
-            }
+            sz
+        } else {
+            continue;
+        };
+        if size <= 1 {
+            continue;
+        }
 
-            // Threading guard: skip if unroll factor exceeds output-per-thread
-            // Unrolling reduce creates Vector<N> accumulators; each thread must have
-            // enough output elements to store the vector without overlapping neighbors
-            if (size as usize) > output_per_thread {
-                debug!(axis_idx, size, output_per_thread, "apply_unroll: skipping (unroll factor > output_per_thread)");
-                continue;
+        // Determine unroll factor:
+        // - Small dims (<= threshold): full unroll
+        // - Large dims (> threshold): largest SIMD-aligned divisor of size
+        let factor = if size <= threshold {
+            size as usize // Full unroll for small dimensions
+        } else if config.k_vectorize {
+            // Find largest divisor of size that fits in SIMD width
+            // Try simd_width, simd_width/2, simd_width/4, ... down to 2
+            let mut f = simd_width;
+            while f >= 2 {
+                if size % (f as i64) == 0 {
+                    break;
+                }
+                f /= 2;
             }
+            if f < 2 {
+                continue; // No suitable divisor found
+            }
+            f
+        } else {
+            continue;
+        };
 
-            let unroll_axes = scheduler.unrollable_dims();
-            if let Some(logical) = unroll_axes.iter().position(|&a| a == axis_idx)
-                && apply_opt(scheduler, &Opt::unroll(logical, size as usize), true).is_ok()
-            {
-                applied = true;
-            }
+        // Generic guard: skip if combined upcast_size would exceed 32
+        // This prevents exponential vector width growth from multiple unroll sources
+        if scheduler.upcast_size() * factor > 32 {
+            continue;
+        }
+
+        // Threading guard: skip if unroll factor exceeds output-per-thread
+        // Unrolling reduce creates Vector<N> accumulators; each thread must have
+        // enough output elements to store the vector without overlapping neighbors
+        if factor > output_per_thread {
+            debug!(
+                axis_idx,
+                size, factor, output_per_thread, "apply_unroll: skipping (unroll factor > output_per_thread)"
+            );
+            continue;
+        }
+
+        let unroll_axes = scheduler.unrollable_dims();
+        if let Some(logical) = unroll_axes.iter().position(|&a| a == axis_idx)
+            && apply_opt(scheduler, &Opt::unroll(logical, factor), true).is_ok()
+        {
+            applied = true;
         }
     }
     applied
@@ -388,112 +420,6 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
             return true;
         }
     }
-    false
-}
-
-/// Apply K-vectorization heuristic for matmul patterns.
-///
-/// For matmul C[i,j] += A[i,k] * B[k,j], applies UNROLL to the K (reduce) axis
-/// to create unrolled accumulators. This is processed by fix_reduce_unroll
-/// during the expand pass.
-///
-/// Matches Tinygrad's heuristic.py which uses OptOps.UNROLL for REDUCE axes.
-///
-/// Only applies when:
-/// - Matmul pattern detected (REDUCE(ADD) of MUL of INDEX)
-/// - No grouped reduction already applied
-/// - K dimension size >= 4 (for 4x unrolling)
-/// - CPU renderer (has_threads, no has_local) - GPU uses different strategies
-pub fn apply_matmul_k_vectorization(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
-    use tracing::{debug, trace};
-
-    trace!("apply_matmul_k_vectorization: entry");
-
-    // Check config
-    if !config.k_vectorize {
-        trace!("apply_matmul_k_vectorization: skipped (k_vectorize=false)");
-        return false;
-    }
-
-    // Only for CPU (has threads but no local memory/workgroups)
-    if scheduler.renderer().has_local {
-        trace!("apply_matmul_k_vectorization: skipped (has_local)");
-        return false;
-    }
-
-    // Check for matmul pattern
-    let has_matmul = has_matmul_pattern(scheduler);
-    trace!(has_matmul, "apply_matmul_k_vectorization: matmul pattern check");
-    if !has_matmul {
-        return false;
-    }
-
-    // Skip if grouped reduction already applied
-    let group_reduce_axes = scheduler.axes_of(&[AxisType::GroupReduce]);
-    trace!(num_group_reduce = group_reduce_axes.len(), "apply_matmul_k_vectorization: group reduce check");
-    if !group_reduce_axes.is_empty() {
-        return false;
-    }
-
-    // Get reduce axes (K dimension)
-    let reduce_axes = scheduler.axes_of(&[AxisType::Reduce]);
-    trace!(num_reduce_axes = reduce_axes.len(), "apply_matmul_k_vectorization: reduce axes");
-    if reduce_axes.is_empty() {
-        return false;
-    }
-
-    // Get unrollable dims mapping (GROUP_REDUCE/REDUCE axes)
-    // This gives logical axis indices for the UNROLL opt
-    let unrollable = scheduler.unrollable_dims();
-    trace!(unrollable = ?unrollable, "apply_matmul_k_vectorization: unrollable dims");
-
-    // Find innermost reduce axis with size >= 4
-    // Collect candidate (real_axis_idx, size) pairs first to avoid borrow issues
-    let candidates: Vec<(usize, i64)> = {
-        let rngs = scheduler.rngs();
-        reduce_axes
-            .iter()
-            .rev()
-            .filter_map(|&axis_idx| {
-                if axis_idx >= rngs.len() {
-                    return None;
-                }
-                let rng = &rngs[axis_idx];
-                if let Op::Range { end, .. } = rng.op()
-                    && let Op::Const(cv) = end.op()
-                    && let morok_ir::ConstValue::Int(size) = cv.0
-                    && size >= 4
-                {
-                    Some((axis_idx, size))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-
-    trace!(num_candidates = candidates.len(), candidates = ?candidates, "apply_matmul_k_vectorization: candidates");
-
-    // Try each candidate in order (innermost first)
-    for (axis_idx, size) in candidates {
-        // Find logical axis position in unrollable_dims()
-        if let Some(logical) = unrollable.iter().position(|&a| a == axis_idx) {
-            trace!(axis_idx, logical, size, "apply_matmul_k_vectorization: trying unroll");
-            // Use UNROLL instead of UPCAST (matches Tinygrad)
-            if apply_opt(scheduler, &Opt::unroll(logical, 4), true).is_ok() {
-                debug!(
-                    axis_idx,
-                    logical, size, "apply_matmul_k_vectorization: SUCCESS - applied unroll(axis={}, factor=4)", logical
-                );
-                return true;
-            } else {
-                trace!(axis_idx, logical, size, "apply_matmul_k_vectorization: unroll failed");
-            }
-        } else {
-            trace!(axis_idx, size, "apply_matmul_k_vectorization: axis not in unrollable_dims");
-        }
-    }
-    trace!("apply_matmul_k_vectorization: no unroll applied");
     false
 }
 
