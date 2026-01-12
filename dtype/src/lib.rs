@@ -10,6 +10,7 @@ pub mod test;
 /// It's used throughout the compilation pipeline for device selection and
 /// kernel caching.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DeviceSpec {
     /// CPU device (single-threaded or multi-threaded execution)
     Cpu,

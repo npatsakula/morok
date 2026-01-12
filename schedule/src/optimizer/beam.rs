@@ -18,8 +18,6 @@
 //! (ast_hash, beam_width, device_name). Caching can be disabled via
 //! the IGNORE_BEAM_CACHE environment variable.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
@@ -413,10 +411,10 @@ struct CacheKey {
 impl CacheKey {
     /// Create a cache key from a scheduler and config.
     fn from_scheduler(scheduler: &Scheduler, config: &BeamConfig) -> Self {
-        // Hash the AST using its ID (stable hash)
-        let mut hasher = DefaultHasher::new();
-        scheduler.ast().id.hash(&mut hasher);
-        let ast_hash = hasher.finish();
+        // Use content-based hash (stable across program runs)
+        // Unlike runtime UOp IDs which reset to 0 each run, content_hash
+        // is computed from AST structure and is deterministic.
+        let ast_hash = scheduler.ast().content_hash();
 
         Self { ast_hash, beam_width: config.beam_width, device: scheduler.ren.device.clone() }
     }
@@ -431,104 +429,14 @@ impl CacheKey {
     }
 }
 
-/// Serialize applied opts to bytes for caching.
-///
-/// Format: Each opt is stored as a line "OP:axis:arg" where:
-/// - OP is the OptOps variant name
-/// - axis is the axis index (or -1 if None)
-/// - arg is the OptArg serialization
+/// Serialize applied opts to bytes for caching using bincode.
 fn serialize_opts(opts: &[Opt]) -> Vec<u8> {
-    use super::types::{OptArg, OptOps};
-
-    let mut lines = Vec::new();
-
-    for opt in opts {
-        let op_str = match opt.op {
-            OptOps::TC => "TC",
-            OptOps::UPCAST => "UPCAST",
-            OptOps::UNROLL => "UNROLL",
-            OptOps::LOCAL => "LOCAL",
-            OptOps::THREAD => "THREAD",
-            OptOps::GROUP => "GROUP",
-            OptOps::GROUPTOP => "GROUPTOP",
-            OptOps::NOLOCALS => "NOLOCALS",
-            OptOps::PADTO => "PADTO",
-            OptOps::SWAP => "SWAP",
-        };
-
-        let axis_str = match opt.axis {
-            Some(a) => a.to_string(),
-            None => "-1".to_string(),
-        };
-
-        let arg_str = match &opt.arg {
-            OptArg::Int(v) => format!("I:{}", v),
-            OptArg::TensorCore { tc_select, opt_level, use_tc } => {
-                format!("T:{}:{}:{}", tc_select, opt_level, use_tc)
-            }
-            OptArg::Swap { other_axis } => format!("S:{}", other_axis),
-        };
-
-        lines.push(format!("{}:{}:{}", op_str, axis_str, arg_str));
-    }
-
-    lines.join("\n").into_bytes()
+    bincode::serialize(opts).expect("Opt serialization should not fail")
 }
 
-/// Deserialize opts from cached bytes.
+/// Deserialize opts from cached bytes using bincode.
 fn deserialize_opts(bytes: &[u8]) -> Option<Vec<Opt>> {
-    use super::types::{OptArg, OptOps};
-
-    let text = std::str::from_utf8(bytes).ok()?;
-    if text.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let mut opts = Vec::new();
-
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split(':').collect();
-        if parts.len() < 3 {
-            return None;
-        }
-
-        let op = match parts[0] {
-            "TC" => OptOps::TC,
-            "UPCAST" => OptOps::UPCAST,
-            "UNROLL" => OptOps::UNROLL,
-            "LOCAL" => OptOps::LOCAL,
-            "THREAD" => OptOps::THREAD,
-            "GROUP" => OptOps::GROUP,
-            "GROUPTOP" => OptOps::GROUPTOP,
-            "NOLOCALS" => OptOps::NOLOCALS,
-            "PADTO" => OptOps::PADTO,
-            "SWAP" => OptOps::SWAP,
-            _ => return None,
-        };
-
-        let axis: i32 = parts[1].parse().ok()?;
-        let axis = if axis < 0 { None } else { Some(axis as usize) };
-
-        let arg = if parts.len() >= 3 {
-            let arg_parts: Vec<&str> = parts[2..].iter().flat_map(|s| s.split(':')).collect();
-            match arg_parts.first().copied() {
-                Some("I") => OptArg::Int(arg_parts.get(1)?.parse().ok()?),
-                Some("T") => OptArg::TensorCore {
-                    tc_select: arg_parts.get(1)?.parse().ok()?,
-                    opt_level: arg_parts.get(2)?.parse().ok()?,
-                    use_tc: arg_parts.get(3)?.parse().ok()?,
-                },
-                Some("S") => OptArg::Swap { other_axis: arg_parts.get(1)?.parse().ok()? },
-                _ => return None,
-            }
-        } else {
-            return None;
-        };
-
-        opts.push(Opt::new(op, axis, arg));
-    }
-
-    Some(opts)
+    bincode::deserialize(bytes).ok()
 }
 
 /// Get cached beam search result.
@@ -540,8 +448,11 @@ fn cache_get(key: &CacheKey) -> Option<Vec<Opt>> {
 
 /// Store beam search result in cache.
 fn cache_put(key: &CacheKey, opts: &[Opt]) {
-    if let Some(db) = CACHE_DB.as_ref() {
-        let _ = db.insert(key.to_bytes(), serialize_opts(opts));
+    if let Some(db) = CACHE_DB.as_ref()
+        && db.insert(key.to_bytes(), serialize_opts(opts)).is_ok()
+    {
+        // Flush to disk to ensure persistence across runs
+        let _ = db.flush();
     }
 }
 
@@ -575,11 +486,13 @@ where
         && let Some(cached_opts) = cache_get(&key)
     {
         // Replay cached optimizations
+        tracing::info!(opts_count = cached_opts.len(), "Beam cache HIT - replaying opts");
         let replayed = replay_opts(scheduler.clone(), &cached_opts)?;
         let timing = compile_and_time(&replayed).unwrap_or(Duration::MAX);
         return Ok(BeamResult { scheduler: replayed, timing, iterations: 0, candidates_evaluated: 0 });
     }
 
+    tracing::info!("Beam cache MISS - running search");
     // Run beam search
     let result = beam_search(scheduler, config, compile_and_time)?;
 

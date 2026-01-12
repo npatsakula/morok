@@ -1,5 +1,6 @@
 use crate::*;
 use morok_dtype::DType;
+use morok_schedule::{OptStrategy, OptimizerConfig};
 
 // ========== Basic 2D x 2D Tests ==========
 
@@ -196,6 +197,32 @@ fn test_print_matmul_64x64_ir() {
     let plan = c.prepare().expect("prepare should succeed");
 
     println!("\n=== Generated Kernels (64x64 with output upcast) ===\n");
+    for kernel in plan.kernels() {
+        println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
+        println!("{}", kernel.code);
+        println!();
+    }
+}
+
+#[test]
+#[ignore] // Run with: cargo test -p morok-tensor test_beam_search_matmul -- --ignored --nocapture
+fn test_beam_search_matmul() {
+    // Test beam search optimization for matmul - reproduces float vector index bug
+    let size = 512; // Original size that triggered the bug
+    let a = Tensor::from_slice((0..size * size).map(|i| (i as f32) * 0.01).collect::<Vec<_>>())
+        .try_reshape(&[size as isize, size as isize])
+        .unwrap();
+    let b = Tensor::from_slice((0..size * size).map(|i| (i as f32) * 0.01).collect::<Vec<_>>())
+        .try_reshape(&[size as isize, size as isize])
+        .unwrap();
+    let c = a.matmul(&b).unwrap();
+
+    // Use width=2 for reasonable test time
+    let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: 2 }).build();
+
+    let plan = c.prepare_with(&beam_config).expect("beam search prepare should succeed");
+
+    println!("\n=== Beam Search Kernels ({}x{}) ===\n", size, size);
     for kernel in plan.kernels() {
         println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
         println!("{}", kernel.code);

@@ -382,6 +382,22 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     for (i, src) in sources.iter().enumerate() {
         if let Op::Unroll { src: inner, unroll_axes: src_axes } = src.op() {
+            // Check if this is a float UNROLL at Load/Store index position
+            // Load/Store index at position 1 should be integer. If UNROLL wraps float data,
+            // GEP swizzle would preserve float dtype, causing codegen panic.
+            // Only skip GEP when inner is float - integer UNROLL needs normal expansion.
+            let is_float_at_load_store_index = i == 1
+                && matches!(op, Op::Load { .. } | Op::LoadGated { .. } | Op::Store { .. } | Op::StoreGated { .. })
+                && !inner.dtype().base().is_int();
+
+            if is_float_at_load_store_index {
+                // Float data at index position - this is an upstream bug
+                // Unwrap without GEP swizzle to avoid making things worse
+                // Codegen's defensive check will catch this as an error
+                new_sources.push(inner.clone());
+                continue;
+            }
+
             if *src_axes == expand_args {
                 // Same expansion: unwrap
                 new_sources.push(inner.clone());

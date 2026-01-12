@@ -325,6 +325,7 @@ impl UOp {
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
             vmin_vmax_cache: std::sync::OnceLock::new(),
+            content_hash_cache: std::sync::OnceLock::new(),
             metadata: None,
         });
         let new_weak = Arc::downgrade(&new_arc);
@@ -388,6 +389,7 @@ impl UOp {
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
             vmin_vmax_cache: std::sync::OnceLock::new(),
+            content_hash_cache: std::sync::OnceLock::new(),
             metadata: Some(Arc::new(metadata)),
         })
     }

@@ -78,6 +78,10 @@ pub struct UOp {
     /// Computed lazily via range propagation through the computation graph.
     /// Returns (vmin, vmax) as ConstValue types.
     pub(crate) vmin_vmax_cache: std::sync::OnceLock<(ConstValue, ConstValue)>,
+    /// Cached content-based hash for stable caching across program runs.
+    /// Unlike the runtime `id`, this hash is computed from the UOp's structure
+    /// (op, dtype, args, child hashes) and is stable across process restarts.
+    pub(crate) content_hash_cache: std::sync::OnceLock<u64>,
     /// Optional metadata attached to this UOp.
     ///
     /// Metadata is NOT part of hash consing - attaching metadata creates a new UOp
@@ -88,6 +92,19 @@ pub struct UOp {
     /// dependencies (e.g., schedule::KernelInfo).
     #[debug(skip)]
     pub(crate) metadata: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// Hash implementation for UOp based on content (dtype + op).
+///
+/// This enables content-based hashing for cross-run caching. The hash traverses
+/// the DAG structure since Op contains Arc<UOp> children that also get hashed.
+/// Cache fields are intentionally skipped - they don't affect semantic identity.
+impl Hash for UOp {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.dtype.hash(state);
+        self.op.hash(state);
+        // Intentionally skip: id, caches, metadata
+    }
 }
 
 impl UOp {
@@ -160,6 +177,48 @@ impl UOp {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::VminVmaxProperty;
         &VminVmaxProperty::get(self).1
+    }
+
+    /// Compute a stable content-based hash for this UOp.
+    ///
+    /// Unlike the runtime `id` field which changes between program runs,
+    /// this hash is computed from the UOp's structural content:
+    /// - Operation type (discriminant)
+    /// - Data type
+    /// - Operation-specific arguments
+    /// - Recursive child content hashes
+    ///
+    /// This is used for cross-run caching (e.g., beam search optimization cache).
+    /// Based on Tinygrad's `key` property which uses SHA256 for the same purpose.
+    ///
+    /// # Performance
+    ///
+    /// Uses xxh64 for fast non-cryptographic hashing.
+    /// Result is cached in `content_hash_cache` for subsequent calls.
+    pub fn content_hash(self: &Arc<Self>) -> u64 {
+        // Fast path: return cached value
+        if let Some(&cached) = self.content_hash_cache.get() {
+            return cached;
+        }
+
+        // Compute hash
+        let hash = self.compute_content_hash();
+
+        // Cache and return (ignore race condition - same value will be computed)
+        let _ = self.content_hash_cache.set(hash);
+        hash
+    }
+
+    /// Internal: compute content hash without caching.
+    ///
+    /// Uses UOp's Hash impl with xxh64 hasher. The Hash impl traverses the DAG,
+    /// hashing dtype and op (which recursively hashes children).
+    fn compute_content_hash(self: &Arc<Self>) -> u64 {
+        use xxhash_rust::xxh64::Xxh64;
+
+        let mut hasher = Xxh64::new(0);
+        self.as_ref().hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Extract device specification from this UOp graph.
@@ -1415,6 +1474,7 @@ impl Clone for UOp {
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
             vmin_vmax_cache: std::sync::OnceLock::new(),
+            content_hash_cache: std::sync::OnceLock::new(),
             metadata: self.metadata.clone(),
         }
     }

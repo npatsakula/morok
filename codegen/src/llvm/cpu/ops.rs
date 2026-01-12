@@ -876,6 +876,13 @@ fn codegen_load<'ctx>(
     // Handle vector indices (from UPCAST optimization) - perform gather
     if index.is_vector_value() {
         let vec_indices = index.into_vector_value();
+
+        // Validate that indices are integer type (not float data)
+        // Float vectors as indices indicate an IR generation bug
+        if !matches!(vec_indices.get_type().get_element_type(), inkwell::types::BasicTypeEnum::IntType(_)) {
+            return UnsupportedSnafu { what: "Vector Load index must be integer type, got float vector" }.fail();
+        }
+
         let vec_len = vec_indices.get_type().get_size();
         let ptr_val = buffer_ptr.into_pointer_value();
 

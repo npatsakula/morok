@@ -1,5 +1,5 @@
 ---
-name: tinygrad
+name: tinygrad-debug
 description: Extract IR, AST, generated code, and patterns from the Tinygrad codebase at submodules/tinygrad. Use when comparing Morok with Tinygrad, debugging pipeline differences, or understanding Tinygrad's implementation.
 ---
 

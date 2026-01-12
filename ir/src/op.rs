@@ -24,9 +24,9 @@ use morok_dtype::DeviceSpec;
 /// - SmallVec avoids heap allocation for common cases (≤4 children)
 /// - Gated operations use separate variants (LoadGated vs Load) for type safety
 ///
-/// Note: PartialEq, Eq, and Hash are NOT derived because Op contains Arc<UOp>.
-/// Hash consing uses UOpKey which compares by pointer equality instead.
-#[derive(Debug, Clone)]
+/// Hash is derived and uses UOp's Hash impl for Arc<UOp> children.
+/// UOp hashes by content (dtype + op), enabling content-based hashing for caching.
+#[derive(Debug, Clone, Hash)]
 #[derive(strum::AsRefStr)]
 #[derive(morok_macros::PatternEnum)]
 #[pattern(grouped = [Unary, Binary, Ternary])]
