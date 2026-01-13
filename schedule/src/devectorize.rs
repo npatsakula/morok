@@ -276,6 +276,144 @@ fn devectorize_where(ternary: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(UOp::vectorize(scalar_wheres))
 }
 
+// ============================================================================
+// ALU Devectorization
+// ============================================================================
+
+/// Convert vectorized ALU ops to VECTORIZE of scalar ALU ops.
+///
+/// Based on Tinygrad's no_vectorized_alu (devectorizer.py:219-223):
+/// ```python
+/// def no_vectorized_alu(alu:UOp):
+///   if alu.dtype.vcount == 1: return None  # skip scalars
+///   alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg)
+///                for i in range(alu.dtype.vcount))
+///   return UOp(Ops.VECTORIZE, alu.dtype, alus)
+/// ```
+///
+/// Transforms:
+/// - Binary<vec32>(a, b) → VECTORIZE(Binary(GEP(a,0), GEP(b,0)), ..., Binary(GEP(a,31), GEP(b,31)))
+/// - Unary<vec32>(a) → VECTORIZE(Unary(GEP(a,0)), ..., Unary(GEP(a,31)))
+/// - Cast<vec32>(a) → VECTORIZE(Cast(GEP(a,0)), ..., Cast(GEP(a,31)))
+///
+/// This runs BEFORE pm_vectorize_normalize so that:
+/// - Parent VECTORIZE sees VECTORIZE children, not Binary/Unary children
+/// - No need to flatten Binary/Unary elements (already scalar)
+/// - Prevents exponential growth when gep_pushing interacts with flatten patterns
+///
+/// # Performance Note
+///
+/// This follows Tinygrad's default (DEVECTORIZE=1). LLVM's SLP vectorizer can
+/// re-vectorize the scalar ops when beneficial. Future work could add a flag
+/// to preserve vectors for performance-critical paths.
+pub fn no_vectorized_alu() -> TypedPatternMatcher {
+    crate::patterns! {
+        // Binary ops with vector dtype → VECTORIZE of scalar binaries
+        // Covers: Add, Mul, Sub, etc. on vector types
+        for op in binary [*] {
+            result @ op(lhs, rhs) if result.dtype().vcount() > 1 => |result, lhs, rhs| {
+                let vcount = result.dtype().vcount();
+                let scalar_dtype = result.dtype().scalar().map(DType::Scalar)?;
+                let alus: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
+                    let gep_lhs = UOp::gep(lhs.clone(), vec![i]);
+                    let gep_rhs = UOp::gep(rhs.clone(), vec![i]);
+                    UOp::new(Op::Binary(op, gep_lhs, gep_rhs), scalar_dtype.clone())
+                }).collect();
+                Some(UOp::vectorize(alus))
+            },
+        },
+
+        // Unary ops with vector dtype → VECTORIZE of scalar unaries
+        // Covers: Neg, Sqrt, Exp, etc. on vector types
+        for op in unary [*] {
+            result @ op(src) if result.dtype().vcount() > 1 => |result, src| {
+                let vcount = result.dtype().vcount();
+                let scalar_dtype = result.dtype().scalar().map(DType::Scalar)?;
+                let alus: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
+                    let gep_src = UOp::gep(src.clone(), vec![i]);
+                    UOp::new(Op::Unary(op, gep_src), scalar_dtype.clone())
+                }).collect();
+                Some(UOp::vectorize(alus))
+            },
+        },
+
+        // Cast with vector dtype → VECTORIZE of scalar casts
+        Cast { src, .. } if src.dtype().vcount() > 1 => |src| {
+            let vcount = src.dtype().vcount();
+            let src_scalar_dtype = src.dtype().scalar().map(DType::Scalar)?;
+            // Cast output dtype scalar version - infer from cast target
+            // NOTE: The cast target dtype comes from the Cast op's dtype field
+            let casts: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
+                let gep_src = UOp::gep(src.clone(), vec![i]);
+                // Cast to scalar version of the destination dtype
+                UOp::cast(gep_src, src_scalar_dtype.clone())
+            }).collect();
+            Some(UOp::vectorize(casts))
+        },
+
+        // WHERE with vector condition → VECTORIZE of scalar WHEREs
+        // (Already handled in pm_local_optimizations, but included for completeness)
+        Where(cond, t, f) if cond.dtype().vcount() > 1 => |cond, t, f| {
+            let vcount = cond.dtype().vcount();
+            let t_vcount = t.dtype().vcount();
+            let f_vcount = f.dtype().vcount();
+
+            let scalar_wheres: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+                .map(|i| {
+                    let cond_elem = UOp::gep(cond.clone(), vec![i]);
+                    let t_elem = if t_vcount > 1 { UOp::gep(t.clone(), vec![i]) } else { t.clone() };
+                    let f_elem = if f_vcount > 1 { UOp::gep(f.clone(), vec![i]) } else { f.clone() };
+                    UOp::try_where(cond_elem, t_elem, f_elem).expect("WHERE construction should succeed")
+                })
+                .collect();
+            Some(UOp::vectorize(scalar_wheres))
+        },
+    }
+}
+
+// ============================================================================
+// VECTORIZE Normalization
+// ============================================================================
+
+/// Normalize VECTORIZE and GEP for rendering.
+///
+/// Based on Tinygrad's pm_render (devectorizer.py:258-275):
+/// ```python
+/// pm_render = PatternMatcher([
+///   (UPat(Ops.GEP, name='gep'), lambda gep: UOp(Ops.VECTORIZE, gep.dtype,
+///        tuple(gep.src[0].gep(x) for x in gep.arg)) if len(gep.arg) > 1 else None),
+///   (UPat(Ops.GEP, name='gep'), lambda gep: gep.src[0] if gep.src[0].dtype.vcount == 1 and gep.arg == (0,) else None),
+///   (UPat(Ops.VECTORIZE, src=(UPat(name='x'),)), lambda x: x),
+/// ])
+/// ```
+///
+/// NOTE: With `no_vectorized_alu()` running first, all vector ALU ops are already
+/// converted to VECTORIZE(scalar_alu, ...). This pattern only needs to handle:
+/// - Multi-index GEP → VECTORIZE with single-index GEPs
+/// - GEP on scalar → identity
+/// - Single-source VECTORIZE → unwrap
+pub fn pm_vectorize_normalize() -> TypedPatternMatcher {
+    crate::patterns! {
+        // Multi-index GEP → VECTORIZE with single-index GEPs
+        // GEP(x, [0, 1, 2, 3]) → VECTORIZE(GEP(x, [0]), GEP(x, [1]), GEP(x, [2]), GEP(x, [3]))
+        Gep { vector, indices } if indices.len() > 1 => |vector, indices| {
+            let geps: SmallVec<[Arc<UOp>; 4]> = indices.iter()
+                .map(|&i| UOp::gep(vector.clone(), vec![i]))
+                .collect();
+            Some(UOp::vectorize(geps))
+        },
+
+        // GEP on scalar → identity (no elements to extract)
+        // GEP(scalar, [0]) → scalar
+        Gep { vector, indices } if vector.dtype().vcount() == 1 && indices.len() == 1 && indices[0] == 0
+            ~> |vector| Arc::clone(vector),
+
+        // Single-source VECTORIZE → unwrap
+        // VECTORIZE([x]) → x
+        Vectorize { elements } if elements.len() == 1 => |elements| Some(elements[0].clone()),
+    }
+}
+
 /// Phase 1 patterns: expand vector INDEX into grouped PTRCAT.
 fn expand_index_patterns() -> TypedPatternMatcher {
     crate::patterns! {

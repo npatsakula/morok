@@ -376,8 +376,7 @@ impl HeuristicsConfig {
 /// Top-level optimizer configuration.
 ///
 /// Combines strategy selection, beam search settings, and heuristic parameters.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct OptimizerConfig {
     /// Optimization strategy (None, Heuristic, or Beam).
     pub strategy: OptStrategy,
@@ -385,6 +384,18 @@ pub struct OptimizerConfig {
     pub beam: BeamConfig,
     /// Heuristics configuration (used when strategy is Heuristic).
     pub heuristics: HeuristicsConfig,
+    /// Devectorize ALU operations to scalar + VECTORIZE.
+    ///
+    /// When enabled, converts vector ALU ops (e.g., `Add<vec4>`) to
+    /// `VECTORIZE(Add<scalar>, Add<scalar>, ...)`. This is useful for:
+    /// - Backends without native vector support
+    /// - Debugging vectorization issues
+    ///
+    /// When disabled (default=false), preserves vector operations for backends
+    /// with sophisticated optimizers (like LLVM's SLP vectorizer).
+    ///
+    /// Environment: `MOROK_DEVECTORIZE=1` to enable.
+    pub devectorize_alu: bool,
 }
 
 #[bon]
@@ -395,19 +406,27 @@ impl OptimizerConfig {
         #[builder(default)] strategy: OptStrategy,
         #[builder(default)] beam: BeamConfig,
         #[builder(default)] heuristics: HeuristicsConfig,
+        #[builder(default = false)] devectorize_alu: bool,
     ) -> Self {
-        Self { strategy, beam, heuristics }
+        Self { strategy, beam, heuristics, devectorize_alu }
     }
 
     /// Create configuration from environment variables.
     ///
     /// Reads strategy from env, then populates beam and heuristics config accordingly.
+    ///
+    /// # Environment Variables
+    ///
+    /// * `MOROK_NOOPT=1` - Disable all optimizations
+    /// * `MOROK_BEAM=N` - Use beam search with width N
+    /// * `MOROK_DEVECTORIZE=1` - Convert vector ALU to scalar ops
     pub fn from_env() -> Self {
         let strategy = OptStrategy::from_env();
         let beam = BeamConfig::from_env().with_strategy_width(&strategy);
         let heuristics = HeuristicsConfig::from_env();
+        let devectorize_alu = std::env::var("MOROK_DEVECTORIZE").is_ok();
 
-        Self { strategy, beam, heuristics }
+        Self { strategy, beam, heuristics, devectorize_alu }
     }
 }
 

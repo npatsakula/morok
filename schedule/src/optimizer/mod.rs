@@ -67,7 +67,7 @@ pub use scheduler::clear_kernel_name_counts;
 pub use types::{AxisType, Opt, OptArg, OptOps};
 
 use crate::rewrite::graph_rewrite;
-use crate::symbolic::patterns::symbolic;
+use crate::symbolic::patterns::{gep_pushing_patterns, symbolic};
 use std::sync::Arc;
 
 /// Apply optimizations to a kernel AST.
@@ -103,14 +103,21 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// These passes run AFTER heuristic/beam optimization and BEFORE codegen:
 /// - pm_add_loads: Extract LOAD ops from INDEX
 /// - pre_expand: Convert Range(Unroll/Upcast) → UNROLL, expand operations
+/// - no_vectorized_alu (optional): Convert vector ALU to scalar + VECTORIZE
 /// - pm_reduce_devectorize: Unified REDUCE devectorization (K-vec, bool, horizontal)
 /// - pm_bool_devectorize: Convert <N x i1> to scalar ops
 /// - pm_fma_decomposition: a*b+c → MulAcc for float types
 /// - bool_storage_patterns: Convert bool LOAD/STORE to uint8
 ///
+/// # Arguments
+///
+/// * `ast` - The kernel AST to optimize
+/// * `devectorize_alu` - If true, convert vector ALU ops to scalar + VECTORIZE.
+///   Use for backends without native vector support. Default: false (preserve vectors).
+///
 /// Called by both heuristic and beam search paths for consistent behavior.
 #[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
-pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
+pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -> Arc<morok_ir::UOp> {
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
@@ -122,6 +129,38 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
     // Post-optimization: Fix UNROLL substitutions in REDUCE ops
     // This handles arithmetic expressions created by shift_to UNROLL
     let expanded = crate::expand::pre_expand(&with_loads);
+
+    // ALU Devectorization + VECTORIZE Normalization
+    //
+    // Two modes based on devectorize_alu flag:
+    //
+    // MODE 1 (devectorize_alu=true): Follow Tinygrad's DEVECTORIZE=1 pipeline
+    // 1. no_vectorized_alu: Convert ALL vector ALU to VECTORIZE(scalar)
+    // 2. gep_pushing: Simplify GEPs created by no_vectorized_alu
+    // 3. pm_vectorize_normalize: Handle remaining multi-index GEPs
+    // 4. gep_pushing: Cleanup
+    //
+    // MODE 2 (devectorize_alu=false, DEFAULT): Preserve vector operations
+    // Skip no_vectorized_alu, only normalize VECTORIZE/GEP patterns.
+    // Better for backends with sophisticated optimizers (LLVM SLP vectorizer).
+
+    let expanded = if devectorize_alu {
+        // Step 1: Devectorize ALL vector ALU ops to VECTORIZE(scalar)
+        let no_vec_alu = crate::devectorize::no_vectorized_alu();
+        let expanded = crate::rewrite::graph_rewrite_bottom_up(&no_vec_alu, expanded, &mut ());
+
+        // Step 2: Simplify GEPs created by no_vectorized_alu
+        crate::rewrite::graph_rewrite_bottom_up(&gep_pushing_patterns(), expanded, &mut ())
+    } else {
+        expanded
+    };
+
+    // Step 3: Normalize remaining VECTORIZE/GEP patterns (multi-index GEP, single-source VECTORIZE)
+    let expanded =
+        crate::rewrite::graph_rewrite_bottom_up(&crate::devectorize::pm_vectorize_normalize(), expanded, &mut ());
+
+    // Step 4: Cleanup GEPs from pm_vectorize_normalize
+    let expanded = crate::rewrite::graph_rewrite_bottom_up(&gep_pushing_patterns(), expanded, &mut ());
 
     // Second pass of pm_add_loads: pre_expand creates new INDEX ops (via CAT expansion)
     // that need LOAD wrapping. These weren't present before pre_expand.
@@ -194,7 +233,7 @@ pub fn optimize_kernel_with_config(
         }
     };
 
-    apply_post_optimization(optimized)
+    apply_post_optimization(optimized, config.devectorize_alu)
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).

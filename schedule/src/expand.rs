@@ -228,6 +228,11 @@ fn phase2_expand() -> TypedPatternMatcher {
         // Phase 2d: Core expansion (expander patterns)
         // =====================================================================
 
+        // Collapse nested UNROLL BEFORE do_expand (Tinygrad: expander.py:94-95)
+        // CRITICAL: Must run before do_expand to prevent exponential dtype growth.
+        // If do_expand sees UNROLL(UNROLL(x)), it processes incorrectly.
+        outer @ Unroll(Unroll(_, ..), ..) => |outer| collapse_double_unroll(outer),
+
         // Main expansion: ALL expandable ops with UNROLL inputs
         // Uses is_expandable() check and range_ending_src_index() for proper range handling.
         op if op.op().is_expandable() && has_unroll_input(op) => |op| do_expand(op),
@@ -238,9 +243,6 @@ fn phase2_expand() -> TypedPatternMatcher {
         // =====================================================================
         // Phase 2e: Cleanup
         // =====================================================================
-
-        // Collapse nested UNROLL: UNROLL(UNROLL(x, inner), outer) → UNROLL(x, inner+outer)
-        outer @ Unroll(Unroll(_, ..), ..) => |outer| collapse_double_unroll(outer),
 
         // Remove empty UNROLL: UNROLL(x, ()) → x
         unroll @ Unroll(_, ..) => |unroll| unwrap_empty_unroll(unroll),
@@ -405,12 +407,15 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 // Different expansion: GEP swizzle
                 let swizzle_indices = swizzle_args(&expand_args, src_axes, &exclude_args);
 
-                // If inner dtype has count > 1, adjust indices for interleaving
-                let inner_count = inner.dtype().vcount();
-                let final_indices: Vec<usize> = if inner_count > 1 {
+                // If UNROLL wrapper dtype has count > 1, adjust indices for interleaving.
+                // Tinygrad (expander.py:43): if src.dtype.count > 1 (src is UNROLL wrapper)
+                // This handles cases where the ORIGINAL operation had vector dtype.
+                // Use UNROLL wrapper's dtype (src.dtype()), NOT inner's vectorized dtype!
+                let wrapper_count = src.dtype().vcount();
+                let final_indices: Vec<usize> = if wrapper_count > 1 {
                     swizzle_indices
                         .iter()
-                        .flat_map(|&idx| (0..inner_count).map(move |j| idx * inner_count + j))
+                        .flat_map(|&idx| (0..wrapper_count).map(move |j| idx * wrapper_count + j))
                         .collect()
                 } else {
                     swizzle_indices
@@ -510,8 +515,11 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         return Some(new_op);
     }
 
-    // Wrap result in UNROLL
-    Some(UOp::unroll(new_op, expand_args))
+    // Wrap result in UNROLL with ORIGINAL dtype (not vectorized inner dtype!)
+    // Tinygrad (expander.py:65): UOp(Ops.UNROLL, root.dtype, (nsrc,), expand_args)
+    // The UNROLL wrapper dtype is the ELEMENT dtype (original scalar dtype).
+    // This is critical for swizzle adjustment in parent do_expand calls.
+    Some(UOp::unroll_with_dtype(new_op, expand_args, base_dtype.clone()))
 }
 
 /// Reconstruct an operation with new sources and dtype.
@@ -572,26 +580,16 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
         }
 
         Op::Vectorize { .. } => {
-            // After expansion, sources may be vectors (from broadcast/CAT).
-            // VECTORIZE requires: dtype.vcount() == sources.len()
-            // But if sources are vectors, we need CAT to flatten them.
+            // Match Tinygrad: keep VECTORIZE with expanded dtype.
+            // Unlike CAT which flattens, VECTORIZE with vector sources represents
+            // a logical grouping that will be flattened during codegen.
             //
-            // Example with expand_sz=4:
-            //   Original: VECTORIZE([a, b]) -> vec(2)
-            //   - a becomes broadcast(a, 4) = VECTORIZE -> vec(4)
-            //   - b becomes broadcast(b, 4) = VECTORIZE -> vec(4)
-            //   - Result: CAT -> vec(8), not VECTORIZE(vec(4), vec(4))
-
-            let all_scalar = sources.iter().all(|s| s.dtype().vcount() == 1);
-
-            if all_scalar {
-                // All sources are still scalars - use normal VECTORIZE
-                Some(UOp::vectorize(sources.clone()))
-            } else {
-                // Some sources are vectors - flatten into CAT
-                // CAT correctly computes dtype as scalar.vec(sum_of_vcounts)
-                Some(UOp::cat(sources.iter().cloned().collect()))
-            }
+            // Tinygrad (expander.py:64):
+            //   nsrc = UOp(root.op, root.dtype.scalar().vec(root.dtype.count*expand_sz), tuple(new_srcs), new_arg)
+            //
+            // The dtype parameter already has the correct expanded count.
+            // Codegen will handle extraction of vector elements.
+            Some(UOp::new(Op::Vectorize { elements: sources.clone() }, dtype.clone()))
         }
 
         // Memory operations - preserve structure

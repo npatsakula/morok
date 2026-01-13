@@ -748,8 +748,8 @@ fn beam_search_optimize(
         let raw_ast = s.get_optimized_ast(None);
 
         // Apply post-optimization passes for accurate timing
-        // This includes scalar accumulator devectorization which is critical for performance
-        let optimized = apply_post_optimization(raw_ast);
+        // Use devectorize_alu=false to preserve vectors for LLVM's SLP vectorizer
+        let optimized = apply_post_optimization(raw_ast, false);
 
         // Apply decomposition
         let decomposed = match dev_renderer.decompositor() {
@@ -785,8 +785,9 @@ fn beam_search_optimize(
     let result = beam_search_cached(scheduler, &config, compile_and_time).context(OptimizeSnafu)?;
 
     // Apply post-optimization to final result
+    // Use devectorize_alu=false to preserve vectors for LLVM's SLP vectorizer
     let raw_ast = result.scheduler.get_optimized_ast(None);
-    Ok(apply_post_optimization(raw_ast))
+    Ok(apply_post_optimization(raw_ast, false))
 }
 
 #[cfg(test)]

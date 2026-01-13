@@ -287,9 +287,25 @@ fn test_linear_1d_weight() {
     assert_eq!(result_shape[0].as_const().unwrap(), 3);
 }
 
+// ========== Minimal VECTORIZE Normalization Test ==========
+
+#[test]
+fn test_vectorize_normalize_minimal() {
+    // Try different sizes to find minimal reproduction
+    // 4x4, 16x16, 32x32 pass - try exact 64x64
+    let a = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
+    let b = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
+    let c = a.matmul(&b).unwrap();
+
+    // Just prepare - if infinite loop, this hangs
+    let plan = c.prepare();
+    assert!(plan.is_ok(), "prepare failed: {:?}", plan.err());
+}
+
 // ========== 64x64 Vectorized Test (for UPCAST debugging) ==========
 
 #[test]
+#[tracing_test::traced_test]
 fn test_matmul_64x64_vectorized() {
     // Create 64x64 matrices filled with 1.0
     let a = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
