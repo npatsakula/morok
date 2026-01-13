@@ -79,18 +79,53 @@ impl Tensor {
     ///
     /// Returns error if preparation or execution fails.
     pub fn realize(self) -> Result<Self> {
-        // Collect input buffer IDs BEFORE prepare() so we know which mappings to preserve
         let uop = self.uop();
         let input_buffer_ids: std::collections::HashSet<u64> = collect_input_buffers(&uop).keys().copied().collect();
 
-        // Prepare execution plan (compiles kernels, allocates buffers)
         let plan = self.prepare()?;
-
-        // Execute the plan
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
 
-        // Get output buffer and its properties
+        self.finalize_realize(&plan, &uop, &input_buffer_ids)
+    }
+
+    /// Realize tensor with custom optimizer configuration.
+    ///
+    /// Like [`realize()`](Self::realize) but allows specifying optimization strategy:
+    /// - Beam search width
+    /// - Devectorization settings
+    /// - Heuristics configuration
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use morok_schedule::{OptStrategy, OptimizerConfig};
+    ///
+    /// let c = a.matmul(&b)?;
+    /// let config = OptimizerConfig::builder()
+    ///     .strategy(OptStrategy::Beam { width: 4 })
+    ///     .devectorize_alu(false)
+    ///     .build();
+    /// let c = c.realize_with(&config)?;
+    /// ```
+    pub fn realize_with(self, config: &morok_schedule::OptimizerConfig) -> Result<Self> {
+        let uop = self.uop();
+        let input_buffer_ids: std::collections::HashSet<u64> = collect_input_buffers(&uop).keys().copied().collect();
+
+        let plan = self.prepare_with(config)?;
+        let mut executor = morok_runtime::global_executor();
+        plan.execute(&mut executor).context(ExecutionSnafu)?;
+
+        self.finalize_realize(&plan, &uop, &input_buffer_ids)
+    }
+
+    /// Finalize realization: bind output buffer to tensor and cleanup intermediates.
+    fn finalize_realize(
+        &self,
+        plan: &ExecutionPlan,
+        uop: &Arc<UOp>,
+        input_buffer_ids: &std::collections::HashSet<u64>,
+    ) -> Result<Self> {
         let output_buf = plan.output_buffer().clone();
 
         trace!(
@@ -99,28 +134,15 @@ impl Tensor {
             "Realized output buffer"
         );
 
-        // uop already captured above for input buffer collection
         let output_dtype = uop.dtype();
         let output_device = output_buf.allocator().device_spec();
-        // Buffer::size() returns bytes, convert to element count
         let num_elements = output_buf.size() / output_dtype.bytes();
 
-        // Create a new BUFFER UOp to represent the materialized data.
-        // This is critical: after realization, the tensor's UOp should be a BUFFER
-        // so that subsequent schedules know this tensor is already materialized
-        // and don't re-compute it.
         let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype.clone());
-
-        // RAII: Wrap output buffer in Arc for ownership
         let output_buf_arc = Arc::new(output_buf);
 
-        // Register buffer for subsequent schedule creation lookups.
-        // When this realized tensor is used as input to another operation,
-        // collect_input_buffers() needs to find this buffer by UOp ID.
-        // This sets the buffer on TensorEntry and creates UOp ID → Tensor ID mapping.
         crate::tensor_registry::register_buffer(buffer_uop.id, self.entry.id, output_buf_arc.clone());
 
-        // Get the tensor's shape and reshape the buffer to match
         let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
         let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
 
@@ -133,15 +155,9 @@ impl Tensor {
             "Tensor realized"
         );
 
-        // Update this tensor's UOp to point to the realized buffer
         self.set_uop(realized_uop);
-
-        // PRIMARY: Create NEW tensor with buffer (RAII ownership)
-        // Since realize(self) consumes self, we return a new Tensor with buffer set
         let result = Tensor::with_buffer(Arc::clone(&self.entry), output_buf_arc);
 
-        // Only clean up INTERMEDIATES (not inputs or output)
-        // Input buffer mappings must be preserved for subsequent realize() calls
         plan.release_intermediate_buffers(|uop_id| {
             if !input_buffer_ids.contains(&uop_id) {
                 crate::tensor_registry::remove_buffer(uop_id);

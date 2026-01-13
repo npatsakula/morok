@@ -305,13 +305,17 @@ fn test_vectorize_normalize_minimal() {
 // ========== 64x64 Vectorized Test (for UPCAST debugging) ==========
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_matmul_64x64_vectorized() {
     // Create 64x64 matrices filled with 1.0
     let a = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
     let b = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
     let c = a.matmul(&b).unwrap();
-    let result = c.realize().unwrap().to_ndarray::<f32>().unwrap();
+
+    // Use realize_with() for clean API with custom config
+    let config = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).devectorize_alu(false).build();
+    let c = c.realize_with(&config).unwrap();
+    let result = c.to_ndarray::<f32>().unwrap();
 
     // Each element should be 64 (sum of 64 ones)
     assert_eq!(result.len(), 64 * 64);
