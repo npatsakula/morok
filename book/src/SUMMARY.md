@@ -2,6 +2,10 @@
 
 [Introduction](./introduction.md)
 
+# Getting Started
+
+- [Hands-On Examples](./examples.md)
+
 # Architecture
 
 - [Execution Pipeline](./architecture/pipeline.md)
