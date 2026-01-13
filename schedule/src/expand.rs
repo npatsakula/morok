@@ -49,6 +49,15 @@ fn contains_output_range(uop: &Arc<UOp>) -> bool {
     }
 }
 
+/// Extract the scalar dtype from a dtype.
+/// For Vector types, returns the base scalar. For other types, returns as-is.
+fn to_scalar_dtype(dtype: DType) -> DType {
+    match dtype {
+        DType::Vector { scalar, .. } => DType::Scalar(scalar),
+        other => other,
+    }
+}
+
 /// Check if a REDUCE is a full reduction (scalar output, no output dimensions).
 fn is_full_reduction_reduce(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>) -> bool {
     if !matches!(op, Op::Reduce { .. }) {
@@ -449,20 +458,8 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 continue;
             }
 
-            // Case 3: INDEX indices (i >= 1) pass through when returning Ptr
-            // Don't vectorize indices for pointer computation (used by STORE for GEP)
-            if matches!(op, Op::Index { .. }) && i >= 1 && matches!(uop.dtype(), DType::Ptr { .. }) {
-                new_sources.push(src.clone());
-                continue;
-            }
-
-            // Case 3b: LOAD/STORE/LoadGated/StoreGated index (source 1) passes through
-            // Don't broadcast the index expression - it needs to remain as-is for linearization
-            if i == 1 && matches!(op, Op::Load { .. } | Op::LoadGated { .. } | Op::Store { .. } | Op::StoreGated { .. })
-            {
-                new_sources.push(src.clone());
-                continue;
-            }
+            // Note: Case 3b removed - let INDEX indices be vectorized by default broadcast logic
+            // This allows devectorize.expand_vector_index to use GEP extraction for strided access
 
             // Case 3c: Expressions containing runtime scalars (Range, DefineVar) pass through
             // These represent runtime values (loop counters, kernel params) - can't be vectorized.
@@ -515,11 +512,11 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         return Some(new_op);
     }
 
-    // Wrap result in UNROLL with ORIGINAL dtype (not vectorized inner dtype!)
+    // Wrap result in UNROLL with SCALAR dtype (not vectorized inner dtype!)
     // Tinygrad (expander.py:65): UOp(Ops.UNROLL, root.dtype, (nsrc,), expand_args)
     // The UNROLL wrapper dtype is the ELEMENT dtype (original scalar dtype).
     // This is critical for swizzle adjustment in parent do_expand calls.
-    Some(UOp::unroll_with_dtype(new_op, expand_args, base_dtype.clone()))
+    Some(UOp::unroll_with_dtype(new_op, expand_args, to_scalar_dtype(base_dtype.clone())))
 }
 
 /// Reconstruct an operation with new sources and dtype.
@@ -1160,8 +1157,8 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         } else {
             tracing::debug!(remaining_axes = ?remaining_axes, "do_contract: partial contraction -> UNROLL(GEP)");
             // Partially contracted: wrap in UNROLL with remaining axes
-            // Use CONTRACT's dtype for the per-iteration element type
-            Some(UOp::unroll_with_dtype(gep_result, remaining_axes, uop.dtype()))
+            // Use scalar dtype for UNROLL wrapper to avoid wrapper_count inflation
+            Some(UOp::unroll_with_dtype(gep_result, remaining_axes, to_scalar_dtype(uop.dtype())))
         };
     }
 
@@ -1259,9 +1256,11 @@ fn lift_unroll_from_binary(binary: &Arc<UOp>) -> Option<Arc<UOp>> {
     };
 
     // Use unroll_inner's dtype - for non-comparison ops, the result dtype matches operand dtype
+    let scalar_dtype = to_scalar_dtype(unroll_inner.dtype());
     let new_binary = UOp::new(Op::Binary(*op, new_left, new_right), unroll_inner.dtype());
 
-    Some(UOp::unroll(new_binary, unroll_axes.to_vec()))
+    // UNROLL wrapper must use scalar dtype to avoid wrapper_count inflation during GEP swizzle
+    Some(UOp::unroll_with_dtype(new_binary, unroll_axes.to_vec(), scalar_dtype))
 }
 
 /// Collapse nested UNROLL operations.
@@ -1280,7 +1279,8 @@ fn collapse_double_unroll(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Combine axes: inner + outer
     let combined: Vec<(usize, usize)> = inner_axes.iter().chain(outer_axes.iter()).cloned().collect();
 
-    Some(UOp::unroll(inner_src.clone(), combined))
+    // Use scalar dtype to be safe (should already be scalar from proper creation)
+    Some(UOp::unroll_with_dtype(inner_src.clone(), combined, to_scalar_dtype(uop.dtype())))
 }
 
 /// Remove empty UNROLL operations.

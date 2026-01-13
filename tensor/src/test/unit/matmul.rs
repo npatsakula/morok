@@ -184,14 +184,16 @@ fn test_print_matmul_ir() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_64x64_ir -- --ignored --nocapture
+#[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_512x512_ir -- --ignored --nocapture
 #[tracing_test::traced_test]
-fn test_print_matmul_64x64_ir() {
-    // Create 64x64 matmul to see vectorized IR (output upcast)
-    let a =
-        Tensor::from_slice((0..64 * 64).map(|i| (i as f32) * 0.01).collect::<Vec<_>>()).try_reshape(&[64, 64]).unwrap();
-    let b =
-        Tensor::from_slice((0..64 * 64).map(|i| (i as f32) * 0.01).collect::<Vec<_>>()).try_reshape(&[64, 64]).unwrap();
+fn test_print_matmul_512x512_ir() {
+    const SIZE: usize = 512;
+    let a = Tensor::from_slice((0..SIZE * SIZE).map(|i| (i as f32) * 0.01).collect::<Vec<_>>())
+        .try_reshape(&[SIZE as _, SIZE as _])
+        .unwrap();
+    let b = Tensor::from_slice((0..SIZE * SIZE).map(|i| (i as f32) * 0.01).collect::<Vec<_>>())
+        .try_reshape(&[SIZE as _, SIZE as _])
+        .unwrap();
     let c = a.matmul(&b).unwrap();
 
     let plan = c.prepare().expect("prepare should succeed");
@@ -291,33 +293,36 @@ fn test_linear_1d_weight() {
 
 #[test]
 fn test_vectorize_normalize_minimal() {
-    // Try different sizes to find minimal reproduction
-    // 4x4, 16x16, 32x32 pass - try exact 64x64
+    // Test 64x64 matmul with vectorization enabled
     let a = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
     let b = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
     let c = a.matmul(&b).unwrap();
 
-    // Just prepare - if infinite loop, this hangs
-    let plan = c.prepare();
-    assert!(plan.is_ok(), "prepare failed: {:?}", plan.err());
+    // Explicit config to avoid test pollution from shared global state
+    // Note: default config has devectorize_alu=false (vectorization enabled)
+    let config = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build();
+    let result = c.realize_with(&config);
+    assert!(result.is_ok(), "realize failed: {:?}", result.err());
 }
 
-// ========== 64x64 Vectorized Test (for UPCAST debugging) ==========
+// ========== 512x512 Vectorized Test (for UPCAST debugging) ==========
 
 #[test]
 #[tracing_test::traced_test]
-fn test_matmul_64x64_vectorized() {
-    // Create 64x64 matrices filled with 1.0
-    let a = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
-    let b = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
+fn test_matmul_512x512_vectorized() {
+    // Create 512x512 matrices filled with 1.0
+    const SIZE: usize = 512;
+    let a = Tensor::from_slice(vec![1.0f32; SIZE * SIZE]).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let b = Tensor::from_slice(vec![1.0f32; SIZE * SIZE]).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
     let c = a.matmul(&b).unwrap();
 
-    // Use realize_with() for clean API with custom config
-    let config = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).devectorize_alu(false).build();
+    // Explicit config to avoid test pollution from shared global state
+    // Note: default config has devectorize_alu=false (vectorization enabled)
+    let config = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build();
     let c = c.realize_with(&config).unwrap();
     let result = c.to_ndarray::<f32>().unwrap();
 
-    // Each element should be 64 (sum of 64 ones)
-    assert_eq!(result.len(), 64 * 64);
-    assert!((result[[0, 0]] - 64.0).abs() < 0.01, "Expected 64.0, got {}", result[[0, 0]]);
+    // Each element should be 512 (sum of 512 ones)
+    assert_eq!(result.len(), SIZE * SIZE);
+    assert!((result[[0, 0]] - SIZE as f32).abs() < 0.01, "Expected {}, got {}", SIZE, result[[0, 0]]);
 }

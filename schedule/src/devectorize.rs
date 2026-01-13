@@ -503,10 +503,7 @@ enum RootKey {
 impl RootKey {
     fn expr(root: &Arc<UOp>, gate: Option<&Arc<UOp>>) -> Self {
         // Use content_hash() for structural equality, not .id (pointer identity)
-        RootKey::Expr {
-            valid_id: gate.map(|g| g.content_hash()),
-            root_id: root.content_hash(),
-        }
+        RootKey::Expr { valid_id: gate.map(|g| g.content_hash()), root_id: root.content_hash() }
     }
 }
 
@@ -561,12 +558,16 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     // Step 1: Generate scalar INDEX ops via GEP for each lane
+    // Tinygrad: midx = graph_rewrite(UOp.sink(*[buf.index(vec.gep(i), ptr=True) for i in range(vec.dtype.count)]))
+    // Use GEP to extract each lane's index from the vectorized index
+    let scalar_idx_dtype = index.dtype().clone();
     let scalar_indices: Vec<Arc<UOp>> = (0..vec_count)
         .map(|i| {
+            // Extract lane i's index from vectorized index via GEP
             let scalar_idx = UOp::gep(vec_idx.clone(), vec![i]);
             UOp::new(
                 Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![scalar_idx], gate: gate.clone() },
-                index.dtype(),
+                scalar_idx_dtype.clone(),
             )
         })
         .collect();
@@ -694,16 +695,16 @@ fn extract_root_and_offset(idx: &Arc<UOp>, gate: Option<&Arc<UOp>>) -> (RootKey,
         // Add(root, CONST(offset)) or Add(CONST(offset), root)
         Op::Binary(BinaryOp::Add, left, right) => {
             // Check if right is a constant offset
-            if let Op::Const(cv) = right.op() {
-                if let ConstValue::Int(offset) = cv.0 {
-                    return (RootKey::expr(left, gate), offset);
-                }
+            if let Op::Const(cv) = right.op()
+                && let ConstValue::Int(offset) = cv.0
+            {
+                return (RootKey::expr(left, gate), offset);
             }
             // Check if left is a constant offset
-            if let Op::Const(cv) = left.op() {
-                if let ConstValue::Int(offset) = cv.0 {
-                    return (RootKey::expr(right, gate), offset);
-                }
+            if let Op::Const(cv) = left.op()
+                && let ConstValue::Int(offset) = cv.0
+            {
+                return (RootKey::expr(right, gate), offset);
             }
             // Neither side is a constant - no offset extracted
             (RootKey::expr(idx, gate), 0)

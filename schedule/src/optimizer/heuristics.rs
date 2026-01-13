@@ -225,8 +225,6 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
 /// - output_per_thread = output_size / thread_count
 /// - If unroll_factor > output_per_thread, the vector store would overflow thread's output slice
 pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
-    use tracing::debug;
-
     let mut applied = false;
     let unrollable = scheduler.unrollable_dims();
     let threshold = config.unroll_threshold as i64;
@@ -331,10 +329,6 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
         // Unrolling reduce creates Vector<N> accumulators; each thread must have
         // enough output elements to store the vector without overlapping neighbors
         if factor > output_per_thread {
-            debug!(
-                axis_idx,
-                size, factor, output_per_thread, "apply_unroll: skipping (unroll factor > output_per_thread)"
-            );
             continue;
         }
 

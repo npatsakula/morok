@@ -771,8 +771,10 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                     && *max < n
                 {
                     // x is always in range [0, n), so x % n = x
+                    tracing::trace!(n, min, max, "simplify_mod: SIMPLIFIED to identity");
                     return Arc::clone(x);
                 }
+                tracing::trace!(n, ?vmin, ?vmax, x.tree = %x.tree(), "simplify_mod: NOT simplified");
                 let n_uop = UOp::index_const(n);
                 x.try_mod(&n_uop).unwrap()
             }

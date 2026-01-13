@@ -488,20 +488,35 @@ fn compute_op_key_for_op(op_name: &str) -> Vec<TokenStream2> {
     }]
 }
 
+/// Represents one possible ordering for pattern matching.
+/// For non-commutative patterns, there's exactly 1 ordering.
+/// For commutative patterns, there are 2+ orderings (cross-product of nested commutative).
+#[derive(Clone)]
+struct Ordering {
+    /// Code to match children in this ordering
+    child_match_code: TokenStream2,
+    /// Variable bindings for this ordering
+    bindings: Vec<(Ident, TokenStream2)>,
+}
+
 /// Output from inline match generation.
 struct InlineMatchOutput {
-    /// Code to destructure the UOp and bind variables
+    /// Code to destructure the outer UOp (independent of orderings)
     match_code: TokenStream2,
-    /// Variable bindings extracted (name -> expression)
-    bindings: Vec<(Ident, TokenStream2)>,
-    /// Whether this is a commutative pattern needing both orderings
-    is_commutative: bool,
-    /// For commutative patterns: alternate bindings for swapped ordering
-    alt_bindings: Option<Vec<(Ident, TokenStream2)>>,
-    /// For commutative patterns: child match code for normal ordering
-    child_match_code: Option<TokenStream2>,
-    /// For commutative patterns: child match code for swapped ordering
-    alt_child_match_code: Option<TokenStream2>,
+    /// All possible orderings to try (1 for non-commutative, 2+ for commutative)
+    orderings: Vec<Ordering>,
+}
+
+impl InlineMatchOutput {
+    /// Create a simple non-commutative output with one ordering
+    fn simple(match_code: TokenStream2, bindings: Vec<(Ident, TokenStream2)>) -> Self {
+        Self { match_code, orderings: vec![Ordering { child_match_code: quote! {}, bindings }] }
+    }
+
+    /// Convenience: get bindings from first ordering (for non-commutative or normal ordering)
+    fn bindings(&self) -> &[(Ident, TokenStream2)] {
+        &self.orderings[0].bindings
+    }
 }
 
 /// Generate inline match code for a pattern.
@@ -519,26 +534,12 @@ fn generate_inline_match(
             // Variable binds the whole tree
             let actual_name = dup_tracker.process_name(&name.to_string());
             let name_ident = Ident::new(&actual_name, name.span());
-            Ok(InlineMatchOutput {
-                match_code: quote! {},
-                bindings: vec![(name_ident, quote! { #tree_var })],
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput::simple(quote! {}, vec![(name_ident, quote! { #tree_var })]))
         }
 
         Pattern::Wildcard => {
             // Wildcard matches anything, no bindings
-            Ok(InlineMatchOutput {
-                match_code: quote! {},
-                bindings: vec![],
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput::simple(quote! {}, vec![]))
         }
 
         Pattern::Binding { name, pattern } => {
@@ -547,17 +548,17 @@ fn generate_inline_match(
             let actual_name = dup_tracker.process_name(&name.to_string());
             let name_ident = Ident::new(&actual_name, name.span());
 
-            let mut bindings = inner.bindings;
-            bindings.push((name_ident, quote! { #tree_var }));
+            // Add the binding to all orderings
+            let orderings = inner
+                .orderings
+                .into_iter()
+                .map(|mut ord| {
+                    ord.bindings.push((name_ident.clone(), quote! { #tree_var }));
+                    ord
+                })
+                .collect();
 
-            Ok(InlineMatchOutput {
-                match_code: inner.match_code,
-                bindings,
-                is_commutative: inner.is_commutative,
-                alt_bindings: inner.alt_bindings,
-                child_match_code: inner.child_match_code,
-                alt_child_match_code: inner.alt_child_match_code,
-            })
+            Ok(InlineMatchOutput { match_code: inner.match_code, orderings })
         }
 
         Pattern::OpTuple { op, args, rest: _ } => {
@@ -572,19 +573,15 @@ fn generate_inline_match(
             // Match Const and extract both the UOp and the value
             let actual_name = dup_tracker.process_name(&uop_name.to_string());
             let uop_ident = Ident::new(&actual_name, uop_name.span());
-            Ok(InlineMatchOutput {
-                match_code: quote! {
+            Ok(InlineMatchOutput::simple(
+                quote! {
                     let morok_ir::Op::Const(__cv) = #tree_var.op() else {
                         return morok_ir::pattern::RewriteResult::NoMatch;
                     };
                     let #value_name = __cv.0.clone();
                 },
-                bindings: vec![(uop_ident, quote! { #tree_var })],
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+                vec![(uop_ident, quote! { #tree_var })],
+            ))
         }
 
         Pattern::OpVar { var_name, args } => {
@@ -597,18 +594,14 @@ fn generate_inline_match(
 
         Pattern::OptionNone => {
             // Match Option::None - reject if value is Some
-            Ok(InlineMatchOutput {
-                match_code: quote! {
+            Ok(InlineMatchOutput::simple(
+                quote! {
                     if #tree_var.is_some() {
                         return morok_ir::pattern::RewriteResult::NoMatch;
                     }
                 },
-                bindings: vec![],
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+                vec![],
+            ))
         }
 
         Pattern::OptionSome(inner) => {
@@ -617,19 +610,15 @@ fn generate_inline_match(
             let inner_match = generate_inline_match(inner, &inner_var, iter_ctx, dup_tracker)?;
             let inner_code = &inner_match.match_code;
 
-            Ok(InlineMatchOutput {
-                match_code: quote! {
-                    let Some(#inner_var) = #tree_var else {
-                        return morok_ir::pattern::RewriteResult::NoMatch;
-                    };
-                    #inner_code
-                },
-                bindings: inner_match.bindings,
-                is_commutative: false,
-                alt_bindings: inner_match.alt_bindings,
-                child_match_code: inner_match.child_match_code,
-                alt_child_match_code: inner_match.alt_child_match_code,
-            })
+            // Prepend the Option unwrap to match_code, keep inner's orderings
+            let match_code = quote! {
+                let Some(#inner_var) = #tree_var else {
+                    return morok_ir::pattern::RewriteResult::NoMatch;
+                };
+                #inner_code
+            };
+
+            Ok(InlineMatchOutput { match_code, orderings: inner_match.orderings })
         }
     }
 }
@@ -668,74 +657,32 @@ fn generate_inline_op_tuple_match(
 
             let left_code = &left_match.match_code;
             let right_code = &right_match.match_code;
-            let right_child = right_match.child_match_code.clone().unwrap_or_default();
 
-            // Handle nested commutative patterns: if a child is commutative,
-            // we need to propagate the alt_child_match_code for the caller to try
-            let (combined_match, bindings, child_match_code, alt_child_match_code) = if left_match.is_commutative {
-                // Left child is commutative - propagate both orderings to caller
-                let left_child_normal = left_match.child_match_code.clone().unwrap_or_default();
-                let left_child_swapped = left_match.alt_child_match_code.clone().unwrap_or_default();
+            // Cross-product all orderings from children
+            // For each left ordering × each right ordering, create a combined ordering
+            let orderings: Vec<Ordering> = left_match
+                .orderings
+                .iter()
+                .flat_map(|left_ord| {
+                    let left_child = &left_ord.child_match_code;
+                    right_match.orderings.iter().map(move |right_ord| {
+                        let right_child = &right_ord.child_match_code;
+                        let mut bindings = left_ord.bindings.clone();
+                        bindings.extend(right_ord.bindings.clone());
+                        Ordering {
+                            child_match_code: quote! {
+                                #left_code
+                                #left_child
+                                #right_code
+                                #right_child
+                            },
+                            bindings,
+                        }
+                    })
+                })
+                .collect();
 
-                // Combined match only includes the outer destructuring
-                let combined = quote! {
-                    #match_code
-                    #left_code
-                };
-
-                // Normal ordering child match
-                let normal_child = quote! {
-                    #left_child_normal
-                    #right_code
-                    #right_child
-                };
-
-                // Swapped ordering child match
-                let swapped_child = quote! {
-                    #left_child_swapped
-                    #right_code
-                    #right_child
-                };
-
-                let mut all_bindings = left_match.bindings.clone();
-                all_bindings.extend(right_match.bindings.clone());
-
-                let alt_bindings = if let Some(alt) = &left_match.alt_bindings {
-                    let mut combined = alt.clone();
-                    combined.extend(right_match.bindings.clone());
-                    Some(combined)
-                } else {
-                    None
-                };
-
-                (combined, all_bindings, Some(normal_child), Some((swapped_child, alt_bindings)))
-            } else {
-                // No nested commutative - standard matching
-                let left_child = left_match.child_match_code.clone().unwrap_or_default();
-                let combined = quote! {
-                    #match_code
-                    #left_code
-                    #left_child
-                    #right_code
-                    #right_child
-                };
-
-                let mut all_bindings = left_match.bindings;
-                all_bindings.extend(right_match.bindings);
-                (combined, all_bindings, None, None)
-            };
-
-            // If we detected nested commutative, propagate via is_commutative flag
-            let has_nested_comm = child_match_code.is_some();
-
-            Ok(InlineMatchOutput {
-                match_code: combined_match,
-                bindings,
-                is_commutative: has_nested_comm,
-                alt_bindings: alt_child_match_code.as_ref().and_then(|(_, b)| b.clone()),
-                child_match_code,
-                alt_child_match_code: alt_child_match_code.map(|(c, _)| c),
-            })
+            Ok(InlineMatchOutput { match_code, orderings })
         }
 
         OpClass::Unary => {
@@ -755,22 +702,24 @@ fn generate_inline_op_tuple_match(
 
             let src_match = generate_inline_match(&args[0], &src_var, iter_ctx, dup_tracker)?;
             let src_code = &src_match.match_code;
-            let src_child = src_match.child_match_code.clone().unwrap_or_default();
 
-            let combined_match = quote! {
-                #match_code
-                #src_code
-                #src_child
-            };
+            // Propagate all orderings from child, prepending its match_code
+            let orderings = src_match
+                .orderings
+                .into_iter()
+                .map(|ord| {
+                    let ord_child = &ord.child_match_code;
+                    Ordering {
+                        child_match_code: quote! {
+                            #src_code
+                            #ord_child
+                        },
+                        bindings: ord.bindings,
+                    }
+                })
+                .collect();
 
-            Ok(InlineMatchOutput {
-                match_code: combined_match,
-                bindings: src_match.bindings,
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput { match_code, orderings })
         }
 
         OpClass::Ternary => {
@@ -797,32 +746,34 @@ fn generate_inline_op_tuple_match(
             let a_code = &a_match.match_code;
             let b_code = &b_match.match_code;
             let c_code = &c_match.match_code;
-            let a_child = a_match.child_match_code.clone().unwrap_or_default();
-            let b_child = b_match.child_match_code.clone().unwrap_or_default();
-            let c_child = c_match.child_match_code.clone().unwrap_or_default();
 
-            let combined_match = quote! {
-                #match_code
-                #a_code
-                #a_child
-                #b_code
-                #b_child
-                #c_code
-                #c_child
-            };
+            // Cross-product all three children's orderings using explicit loops
+            let mut orderings = Vec::new();
+            for a_ord in &a_match.orderings {
+                let a_child = &a_ord.child_match_code;
+                for b_ord in &b_match.orderings {
+                    let b_child = &b_ord.child_match_code;
+                    for c_ord in &c_match.orderings {
+                        let c_child = &c_ord.child_match_code;
+                        let mut bindings = a_ord.bindings.clone();
+                        bindings.extend(b_ord.bindings.clone());
+                        bindings.extend(c_ord.bindings.clone());
+                        orderings.push(Ordering {
+                            child_match_code: quote! {
+                                #a_code
+                                #a_child
+                                #b_code
+                                #b_child
+                                #c_code
+                                #c_child
+                            },
+                            bindings,
+                        });
+                    }
+                }
+            }
 
-            let mut bindings = a_match.bindings;
-            bindings.extend(b_match.bindings);
-            bindings.extend(c_match.bindings);
-
-            Ok(InlineMatchOutput {
-                match_code: combined_match,
-                bindings,
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput { match_code, orderings })
         }
 
         OpClass::SingleSource => generate_inline_single_source_match(&op_name, args, tree_var, iter_ctx, dup_tracker),
@@ -855,22 +806,24 @@ fn generate_inline_single_source_match(
 
     let src_match = generate_inline_match(&args[0], &src_var, iter_ctx, dup_tracker)?;
     let src_code = &src_match.match_code;
-    let src_child = src_match.child_match_code.clone().unwrap_or_default();
 
-    let combined_match = quote! {
-        #match_code
-        #src_code
-        #src_child
-    };
+    // Propagate all orderings from child
+    let orderings = src_match
+        .orderings
+        .into_iter()
+        .map(|ord| {
+            let ord_child = &ord.child_match_code;
+            Ordering {
+                child_match_code: quote! {
+                    #src_code
+                    #ord_child
+                },
+                bindings: ord.bindings,
+            }
+        })
+        .collect();
 
-    Ok(InlineMatchOutput {
-        match_code: combined_match,
-        bindings: src_match.bindings,
-        is_commutative: false,
-        alt_bindings: None,
-        child_match_code: None,
-        alt_child_match_code: None,
-    })
+    Ok(InlineMatchOutput { match_code, orderings })
 }
 
 /// Generate inline match for special ops using field metadata from OP_CHILD_FIELDS.
@@ -895,14 +848,7 @@ fn generate_inline_special_op_match(
                 return morok_ir::pattern::RewriteResult::NoMatch;
             };
         };
-        return Ok(InlineMatchOutput {
-            match_code,
-            bindings: vec![],
-            is_commutative: false,
-            alt_bindings: None,
-            child_match_code: None,
-            alt_child_match_code: None,
-        });
+        return Ok(InlineMatchOutput::simple(match_code, vec![]));
     }
 
     // Look up field names for this op
@@ -952,34 +898,66 @@ fn generate_inline_special_op_match(
         };
     };
 
-    // Recursively match each child pattern
-    let mut all_bindings = Vec::new();
-    let mut child_match_codes = Vec::new();
-    let mut nested_child_codes = Vec::new();
-
+    // Recursively match each child pattern and collect their orderings
+    let mut child_matches: Vec<(TokenStream2, InlineMatchOutput)> = Vec::new();
     for (arg, var) in args.iter().zip(&field_vars) {
         let child_match = generate_inline_match(arg, var, iter_ctx, dup_tracker)?;
-        child_match_codes.push(child_match.match_code);
-        if let Some(nested) = child_match.child_match_code {
-            nested_child_codes.push(nested);
-        }
-        all_bindings.extend(child_match.bindings);
+        child_matches.push((child_match.match_code.clone(), child_match));
     }
 
-    let combined_match = quote! {
-        #match_code
-        #(#child_match_codes)*
-        #(#nested_child_codes)*
-    };
+    // Compute cross-product of all children's orderings
+    let orderings = compute_ordering_cross_product(&child_matches);
 
-    Ok(InlineMatchOutput {
-        match_code: combined_match,
-        bindings: all_bindings,
-        is_commutative: false,
-        alt_bindings: None,
-        child_match_code: None,
-        alt_child_match_code: None,
-    })
+    Ok(InlineMatchOutput { match_code, orderings })
+}
+
+/// Compute cross-product of orderings from multiple children.
+/// Each child has a match_code and N orderings. We produce all combinations.
+fn compute_ordering_cross_product(children: &[(TokenStream2, InlineMatchOutput)]) -> Vec<Ordering> {
+    if children.is_empty() {
+        return vec![Ordering { child_match_code: quote! {}, bindings: vec![] }];
+    }
+
+    // Start with orderings from first child
+    let (first_code, first_match) = &children[0];
+    let mut result: Vec<Ordering> = first_match
+        .orderings
+        .iter()
+        .map(|ord| {
+            let child_code = &ord.child_match_code;
+            Ordering {
+                child_match_code: quote! {
+                    #first_code
+                    #child_code
+                },
+                bindings: ord.bindings.clone(),
+            }
+        })
+        .collect();
+
+    // Cross with each subsequent child
+    for (child_code, child_match) in children.iter().skip(1) {
+        let mut new_result = Vec::new();
+        for existing in &result {
+            for child_ord in &child_match.orderings {
+                let existing_code = &existing.child_match_code;
+                let child_child = &child_ord.child_match_code;
+                let mut bindings = existing.bindings.clone();
+                bindings.extend(child_ord.bindings.clone());
+                new_result.push(Ordering {
+                    child_match_code: quote! {
+                        #existing_code
+                        #child_code
+                        #child_child
+                    },
+                    bindings,
+                });
+            }
+        }
+        result = new_result;
+    }
+
+    result
 }
 
 /// Generate inline match for struct-style ops like Bufferize { compute: x, .. }
@@ -992,77 +970,38 @@ fn generate_inline_op_struct_match(
     let op_name = op.to_string();
     let op_ident = format_ident!("{}", op_name);
 
-    // Get the first field (main source pattern)
-    let first_field =
-        fields.first().ok_or_else(|| Error::new_spanned(op, "Struct pattern must have at least one field"))?;
+    if fields.is_empty() {
+        return Err(Error::new_spanned(op, "Struct pattern must have at least one field"));
+    }
 
-    let first_field_name = &first_field.name;
-    // Use tree_var prefix to avoid shadowing when patterns are nested
-    let first_var = format_ident!("{}_{}", tree_var, first_field_name);
+    // Generate field extraction for all fields at once
+    let field_vars: Vec<Ident> = fields.iter().map(|f| format_ident!("{}_{}", tree_var, f.name)).collect();
+    let field_bindings: Vec<TokenStream2> = fields
+        .iter()
+        .zip(&field_vars)
+        .map(|(f, var)| {
+            let name = &f.name;
+            quote! { #name: #var }
+        })
+        .collect();
 
-    // Generate match for the struct
     let match_code = quote! {
-        let morok_ir::Op::#op_ident { #first_field_name: #first_var, .. } = #tree_var.op() else {
+        let morok_ir::Op::#op_ident { #(#field_bindings,)* .. } = #tree_var.op() else {
             return morok_ir::pattern::RewriteResult::NoMatch;
         };
     };
 
-    // Match the first field's pattern
-    let first_match = generate_inline_match(&first_field.pattern, &first_var, None, dup_tracker)?;
-    let first_code = &first_match.match_code;
-    let first_child = first_match.child_match_code.clone().unwrap_or_default();
-
-    let combined_match = quote! {
-        #match_code
-        #first_code
-        #first_child
-    };
-
-    let mut bindings = first_match.bindings;
-    let mut additional_match_code = TokenStream2::new();
-
-    // Handle ALL remaining fields with their patterns
-    for field in fields.iter().skip(1) {
-        let field_name = &field.name;
-
-        // Create a unique temp var for this field
-        let field_var = format_ident!("{}_{}", tree_var, field_name);
-
-        // Extract the field value
-        let extract_code = quote! {
-            let morok_ir::Op::#op_ident { #field_name: #field_var, .. } = #tree_var.op() else {
-                unreachable!()
-            };
-        };
-        additional_match_code.extend(extract_code);
-
-        // Generate match code for this field's pattern
-        let field_match = generate_inline_match(&field.pattern, &field_var, None, dup_tracker)?;
-
-        // Add any match code (e.g., for Option patterns or nested structs)
-        additional_match_code.extend(field_match.match_code);
-
-        if let Some(child_code) = field_match.child_match_code {
-            additional_match_code.extend(child_code);
-        }
-
-        // Collect all bindings from this field's pattern
-        bindings.extend(field_match.bindings);
+    // Collect matches for all fields
+    let mut child_matches: Vec<(TokenStream2, InlineMatchOutput)> = Vec::new();
+    for (field, var) in fields.iter().zip(&field_vars) {
+        let field_match = generate_inline_match(&field.pattern, var, None, dup_tracker)?;
+        child_matches.push((field_match.match_code.clone(), field_match));
     }
 
-    let final_match = quote! {
-        #combined_match
-        #additional_match_code
-    };
+    // Compute cross-product of all fields' orderings
+    let orderings = compute_ordering_cross_product(&child_matches);
 
-    Ok(InlineMatchOutput {
-        match_code: final_match,
-        bindings,
-        is_commutative: false,
-        alt_bindings: None,
-        child_match_code: None,
-        alt_child_match_code: None,
-    })
+    Ok(InlineMatchOutput { match_code, orderings })
 }
 
 /// Generate inline match for constant patterns.
@@ -1075,14 +1014,7 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
                 };
             };
             let const_ident = Ident::new(binding_names::CONST, proc_macro2::Span::call_site());
-            Ok(InlineMatchOutput {
-                match_code,
-                bindings: vec![(const_ident, quote! { #tree_var })],
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput::simple(match_code, vec![(const_ident, quote! { #tree_var })]))
         }
 
         ConstPattern::Zero | ConstPattern::Int(0) => {
@@ -1092,14 +1024,7 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
                 }
             };
             let zero_ident = Ident::new(binding_names::ZERO, proc_macro2::Span::call_site());
-            Ok(InlineMatchOutput {
-                match_code,
-                bindings: vec![(zero_ident, quote! { #tree_var })],
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput::simple(match_code, vec![(zero_ident, quote! { #tree_var })]))
         }
 
         ConstPattern::One => {
@@ -1109,14 +1034,7 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
                 }
             };
             let one_ident = Ident::new(binding_names::ONE, proc_macro2::Span::call_site());
-            Ok(InlineMatchOutput {
-                match_code,
-                bindings: vec![(one_ident, quote! { #tree_var })],
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput::simple(match_code, vec![(one_ident, quote! { #tree_var })]))
         }
 
         ConstPattern::Int(value) => {
@@ -1128,14 +1046,7 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
                     return morok_ir::pattern::RewriteResult::NoMatch;
                 }
             };
-            Ok(InlineMatchOutput {
-                match_code,
-                bindings: vec![],
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput::simple(match_code, vec![]))
         }
 
         ConstPattern::Float(value) => {
@@ -1147,14 +1058,7 @@ fn generate_inline_const_match(const_pat: &ConstPattern, tree_var: &Ident) -> Re
                     return morok_ir::pattern::RewriteResult::NoMatch;
                 }
             };
-            Ok(InlineMatchOutput {
-                match_code,
-                bindings: vec![],
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput::simple(match_code, vec![]))
         }
     }
 }
@@ -1193,19 +1097,23 @@ fn generate_inline_op_var_match(
             let src_match = generate_inline_match(&args[0], &src_var, iter_ctx, dup_tracker)?;
             let src_code = &src_match.match_code;
 
-            let combined_match = quote! {
-                #match_code
-                #src_code
-            };
+            // Propagate all orderings from child
+            let orderings = src_match
+                .orderings
+                .into_iter()
+                .map(|ord| {
+                    let ord_child = &ord.child_match_code;
+                    Ordering {
+                        child_match_code: quote! {
+                            #src_code
+                            #ord_child
+                        },
+                        bindings: ord.bindings,
+                    }
+                })
+                .collect();
 
-            Ok(InlineMatchOutput {
-                match_code: combined_match,
-                bindings: src_match.bindings,
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput { match_code, orderings })
         }
 
         OpKind::Binary => {
@@ -1226,23 +1134,30 @@ fn generate_inline_op_var_match(
             let left_code = &left_match.match_code;
             let right_code = &right_match.match_code;
 
-            let combined_match = quote! {
-                #match_code
-                #left_code
-                #right_code
-            };
+            // Cross-product orderings from children
+            let orderings: Vec<Ordering> = left_match
+                .orderings
+                .iter()
+                .flat_map(|left_ord| {
+                    let left_child = &left_ord.child_match_code;
+                    right_match.orderings.iter().map(move |right_ord| {
+                        let right_child = &right_ord.child_match_code;
+                        let mut bindings = left_ord.bindings.clone();
+                        bindings.extend(right_ord.bindings.clone());
+                        Ordering {
+                            child_match_code: quote! {
+                                #left_code
+                                #left_child
+                                #right_code
+                                #right_child
+                            },
+                            bindings,
+                        }
+                    })
+                })
+                .collect();
 
-            let mut bindings = left_match.bindings;
-            bindings.extend(right_match.bindings);
-
-            Ok(InlineMatchOutput {
-                match_code: combined_match,
-                bindings,
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput { match_code, orderings })
         }
 
         OpKind::Ternary => {
@@ -1266,25 +1181,33 @@ fn generate_inline_op_var_match(
             let b_code = &b_match.match_code;
             let c_code = &c_match.match_code;
 
-            let combined_match = quote! {
-                #match_code
-                #a_code
-                #b_code
-                #c_code
-            };
+            // Cross-product of all three children's orderings using explicit loops
+            let mut orderings = Vec::new();
+            for a_ord in &a_match.orderings {
+                let a_child = &a_ord.child_match_code;
+                for b_ord in &b_match.orderings {
+                    let b_child = &b_ord.child_match_code;
+                    for c_ord in &c_match.orderings {
+                        let c_child = &c_ord.child_match_code;
+                        let mut bindings = a_ord.bindings.clone();
+                        bindings.extend(b_ord.bindings.clone());
+                        bindings.extend(c_ord.bindings.clone());
+                        orderings.push(Ordering {
+                            child_match_code: quote! {
+                                #a_code
+                                #a_child
+                                #b_code
+                                #b_child
+                                #c_code
+                                #c_child
+                            },
+                            bindings,
+                        });
+                    }
+                }
+            }
 
-            let mut bindings = a_match.bindings;
-            bindings.extend(b_match.bindings);
-            bindings.extend(c_match.bindings);
-
-            Ok(InlineMatchOutput {
-                match_code: combined_match,
-                bindings,
-                is_commutative: false,
-                alt_bindings: None,
-                child_match_code: None,
-                alt_child_match_code: None,
-            })
+            Ok(InlineMatchOutput { match_code, orderings })
         }
     }
 }
@@ -1351,22 +1274,17 @@ fn generate_inline_alternatives_match(
     let actual_name = dup_tracker.process_name(field_name);
     let binding_ident = Ident::new(&actual_name, proc_macro2::Span::call_site());
 
-    Ok(InlineMatchOutput {
-        match_code,
-        bindings: vec![(binding_ident, quote! { #tree_var })],
-        is_commutative: false,
-        alt_bindings: None,
-        child_match_code: None,
-        alt_child_match_code: None,
-    })
+    Ok(InlineMatchOutput::simple(match_code, vec![(binding_ident, quote! { #tree_var })]))
 }
 
 /// Generate inline match for commutative patterns [x, y].
 ///
-/// For commutative patterns, we:
-/// 1. Include only the outer op destructuring in match_code
-/// 2. Store child match codes separately for each ordering
-/// 3. generate_simplified_rule uses child_match_code / alt_child_match_code to try both orderings
+/// For commutative patterns like `Add[Mul[a, b], c]`, we generate ALL possible orderings:
+/// - Outer Add: 2 orderings (left, right) and (right, left)
+/// - Inner Mul: 2 orderings (a, b) and (b, a)
+/// - Total: 2 × 2 = 4 orderings to try
+///
+/// This is computed as a cross-product of the outer ordering with all children's orderings.
 fn generate_inline_commutative_match(
     op: &Ident,
     args: &[Pattern],
@@ -1389,7 +1307,7 @@ fn generate_inline_commutative_match(
     let left_var = format_ident!("{}_left", tree_var);
     let right_var = format_ident!("{}_right", tree_var);
 
-    // Generate ONLY the outer op match
+    // Generate ONLY the outer op match (shared across all orderings)
     let match_code = quote! {
         let morok_ir::Op::Binary(morok_ir::BinaryOp::#binary_op, #left_var, #right_var) = #tree_var.op() else {
             return morok_ir::pattern::RewriteResult::NoMatch;
@@ -1401,56 +1319,71 @@ fn generate_inline_commutative_match(
     // from the same initial state (variables seen by parent patterns).
     let mut dup_tracker_swapped = dup_tracker.clone();
 
-    // Generate matches for normal ordering (left, right)
-    // Use the passed-in dup_tracker so duplicates across siblings and nested patterns are detected
+    // Generate matches for normal ordering: args[0] matches left, args[1] matches right
     let left_match = generate_inline_match(&args[0], &left_var, iter_ctx, dup_tracker)?;
     let right_match = generate_inline_match(&args[1], &right_var, iter_ctx, dup_tracker)?;
 
-    // Combine child match codes for normal ordering
-    // Include both match_code and any nested child_match_code (for nested commutative patterns)
     let left_code = &left_match.match_code;
-    let left_child = left_match.child_match_code.clone().unwrap_or_default();
     let right_code = &right_match.match_code;
-    let right_child = right_match.child_match_code.clone().unwrap_or_default();
-    let normal_child_match_code = quote! {
-        #left_code
-        #left_child
-        #right_code
-        #right_child
-    };
 
-    let mut normal_bindings = left_match.bindings;
-    normal_bindings.extend(right_match.bindings);
+    // Cross-product all orderings for normal outer ordering: left × right
+    let normal_orderings: Vec<Ordering> = left_match
+        .orderings
+        .iter()
+        .flat_map(|left_ord| {
+            let left_child = &left_ord.child_match_code;
+            right_match.orderings.iter().map(move |right_ord| {
+                let right_child = &right_ord.child_match_code;
+                let mut bindings = left_ord.bindings.clone();
+                bindings.extend(right_ord.bindings.clone());
+                Ordering {
+                    child_match_code: quote! {
+                        #left_code
+                        #left_child
+                        #right_code
+                        #right_child
+                    },
+                    bindings,
+                }
+            })
+        })
+        .collect();
 
-    // Generate matches for swapped ordering (right, left)
-    // Uses the cloned tracker from before normal ordering, so variables are named identically.
+    // Generate matches for swapped ordering: args[0] matches right, args[1] matches left
     let left_match_swap = generate_inline_match(&args[0], &right_var, iter_ctx, &mut dup_tracker_swapped)?;
     let right_match_swap = generate_inline_match(&args[1], &left_var, iter_ctx, &mut dup_tracker_swapped)?;
 
-    // Combine child match codes for swapped ordering
-    // Include both match_code and any nested child_match_code (for nested commutative patterns)
     let left_code_swap = &left_match_swap.match_code;
-    let left_child_swap = left_match_swap.child_match_code.clone().unwrap_or_default();
     let right_code_swap = &right_match_swap.match_code;
-    let right_child_swap = right_match_swap.child_match_code.clone().unwrap_or_default();
-    let swapped_child_match_code = quote! {
-        #left_code_swap
-        #left_child_swap
-        #right_code_swap
-        #right_child_swap
-    };
 
-    let mut swapped_bindings = left_match_swap.bindings;
-    swapped_bindings.extend(right_match_swap.bindings);
+    // Cross-product all orderings for swapped outer ordering: left_swap × right_swap
+    let swapped_orderings: Vec<Ordering> = left_match_swap
+        .orderings
+        .iter()
+        .flat_map(|left_ord| {
+            let left_child = &left_ord.child_match_code;
+            right_match_swap.orderings.iter().map(move |right_ord| {
+                let right_child = &right_ord.child_match_code;
+                let mut bindings = left_ord.bindings.clone();
+                bindings.extend(right_ord.bindings.clone());
+                Ordering {
+                    child_match_code: quote! {
+                        #left_code_swap
+                        #left_child
+                        #right_code_swap
+                        #right_child
+                    },
+                    bindings,
+                }
+            })
+        })
+        .collect();
 
-    Ok(InlineMatchOutput {
-        match_code,
-        bindings: normal_bindings,
-        is_commutative: true,
-        alt_bindings: Some(swapped_bindings),
-        child_match_code: Some(normal_child_match_code),
-        alt_child_match_code: Some(swapped_child_match_code),
-    })
+    // Combine all orderings: normal + swapped
+    let mut all_orderings = normal_orderings;
+    all_orderings.extend(swapped_orderings);
+
+    Ok(InlineMatchOutput { match_code, orderings: all_orderings })
 }
 
 // =============================================================================
@@ -1482,11 +1415,6 @@ fn generate_simplified_alternatives_rule(
         let alt_match = generate_inline_match(alt, &tree_var, iter_ctx, &mut dup_tracker)?;
 
         let match_code = &alt_match.match_code;
-        let child_code = alt_match.child_match_code.as_ref().cloned().unwrap_or_default();
-
-        // Generate binding statements
-        let binding_stmts: Vec<TokenStream2> =
-            alt_match.bindings.iter().map(|(name, expr)| quote! { let #name = #expr; }).collect();
 
         // Generate ptr_eq checks for duplicates (return NoMatch from inner closure)
         let duplicate_pairs = dup_tracker.get_duplicates();
@@ -1506,21 +1434,28 @@ fn generate_simplified_alternatives_rule(
         // Generate rewrite expression (same for all alternatives)
         let rewrite_expr = generate_simplified_rewrite_expr(&rule.rhs, &rule.guard, rule.arrow);
 
-        // Wrap alternative in a closure so `return NoMatch` only exits this attempt
-        alt_blocks.push(quote! {
-            {
-                let __try_result = (|| {
-                    #match_code
-                    #child_code
-                    #(#binding_stmts)*
-                    #(#ptr_eq_checks)*
-                    #rewrite_expr
-                })();
-                if !matches!(__try_result, morok_ir::pattern::RewriteResult::NoMatch) {
-                    return __try_result;
+        // For each alternative, try all its orderings (handles nested commutative)
+        for ord in &alt_match.orderings {
+            let child_code = &ord.child_match_code;
+            let binding_stmts: Vec<TokenStream2> =
+                ord.bindings.iter().map(|(name, expr)| quote! { let #name = #expr; }).collect();
+
+            // Wrap alternative in a closure so `return NoMatch` only exits this attempt
+            alt_blocks.push(quote! {
+                {
+                    let __try_result = (|| {
+                        #match_code
+                        #child_code
+                        #(#binding_stmts)*
+                        #(#ptr_eq_checks)*
+                        #rewrite_expr
+                    })();
+                    if !matches!(__try_result, morok_ir::pattern::RewriteResult::NoMatch) {
+                        return __try_result;
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     // Generate context parameter
@@ -1574,15 +1509,6 @@ fn generate_simplified_rule(
     // Get duplicate pairs for ptr_eq generation
     let duplicate_pairs: Vec<(String, String)> = dup_tracker.get_duplicates().to_vec();
 
-    // Generate binding statements
-    let binding_stmts: Vec<TokenStream2> = match_output
-        .bindings
-        .iter()
-        .map(|(name, expr)| {
-            quote! { let #name = #expr; }
-        })
-        .collect();
-
     // Generate ptr_eq checks for duplicates
     let ptr_eq_checks: Vec<TokenStream2> = duplicate_pairs
         .iter()
@@ -1610,10 +1536,10 @@ fn generate_simplified_rule(
         None
     };
 
-    // Validate closure params if RHS is a closure
+    // Validate closure params if RHS is a closure (use bindings from first ordering)
     if let RewriteExpr::Closure(closure) = &rule.rhs {
         let analysis = extract_closure_params(closure)?;
-        let var_names: Vec<Ident> = match_output.bindings.iter().map(|(n, _)| n.clone()).collect();
+        let var_names: Vec<Ident> = match_output.bindings().iter().map(|(n, _)| n.clone()).collect();
         validate_closure_params(&analysis, &var_names, has_context)?;
     }
 
@@ -1622,49 +1548,60 @@ fn generate_simplified_rule(
 
     let match_code = &match_output.match_code;
 
-    // Handle commutative patterns
-    let body = if match_output.is_commutative {
-        // For commutative patterns, try normal ordering first, then swapped
-        let alt_binding_stmts: Vec<TokenStream2> = match_output
-            .alt_bindings
-            .as_ref()
-            .unwrap_or(&vec![])
+    // Handle patterns with multiple orderings (commutative patterns)
+    let body = if match_output.orderings.len() > 1 {
+        // Multiple orderings - wrap each in closure, try in sequence
+        let num_orderings = match_output.orderings.len();
+        let try_blocks: Vec<TokenStream2> = match_output
+            .orderings
             .iter()
-            .map(|(name, expr)| {
-                quote! { let #name = #expr; }
+            .enumerate()
+            .map(|(i, ord)| {
+                let binding_stmts: Vec<TokenStream2> =
+                    ord.bindings.iter().map(|(name, expr)| quote! { let #name = #expr; }).collect();
+                let child_match = &ord.child_match_code;
+                let is_last = i == num_orderings - 1;
+
+                if is_last {
+                    // Last ordering: no closure wrapper
+                    quote! {
+                        #child_match
+                        #(#binding_stmts)*
+                        #(#ptr_eq_checks)*
+                        #rewrite_expr
+                    }
+                } else {
+                    // Non-last: wrap in closure so return NoMatch only exits this attempt
+                    quote! {
+                        let __result = (|| {
+                            #child_match
+                            #(#binding_stmts)*
+                            #(#ptr_eq_checks)*
+                            #rewrite_expr
+                        })();
+                        if !matches!(__result, morok_ir::pattern::RewriteResult::NoMatch) {
+                            return __result;
+                        }
+                    }
+                }
             })
             .collect();
 
-        // Use pre-computed child match codes from generate_inline_commutative_match
-        let normal_child_match = match_output.child_match_code.as_ref().cloned().unwrap_or_default();
-        let swapped_child_match = match_output.alt_child_match_code.as_ref().cloned().unwrap_or_default();
-
         quote! {
             #match_code
             #op_var_binding
-
-            // Try normal ordering
-            let __normal_result = (|| {
-                #normal_child_match
-                #(#binding_stmts)*
-                #(#ptr_eq_checks)*
-                #rewrite_expr
-            })();
-
-            if !matches!(__normal_result, morok_ir::pattern::RewriteResult::NoMatch) {
-                return __normal_result;
-            }
-
-            // Try swapped ordering
-            #swapped_child_match
-            #(#alt_binding_stmts)*
-            #(#ptr_eq_checks)*
-            #rewrite_expr
+            #(#try_blocks)*
         }
     } else {
+        // Single ordering - simple case
+        let ord = &match_output.orderings[0];
+        let binding_stmts: Vec<TokenStream2> =
+            ord.bindings.iter().map(|(name, expr)| quote! { let #name = #expr; }).collect();
+        let child_match = &ord.child_match_code;
         quote! {
             #match_code
             #op_var_binding
+            #child_match
             #(#binding_stmts)*
             #(#ptr_eq_checks)*
             #rewrite_expr

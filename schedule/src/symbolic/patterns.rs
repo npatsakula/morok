@@ -205,14 +205,103 @@ pub fn range_based_mod_div_patterns() -> TypedPatternMatcher {
             None
         },
 
-        // x / n → 0 when 0 <= vmin(x) && vmax(x) < n
-        // This handles cases like Range(3) / 3 → 0 (since Range(3) is 0,1,2 and all /3 = 0)
+        // (a * m + b) % n → b % n when m == n (factor out multiples of n)
+        // This handles matmul index expressions like: (row * 512 + col) % 512 → col % 512
+        // Since (a * n) % n = 0, the Mul term can be dropped.
+        // Using commutative [] for Add to match both orderings.
+        // Note: We compare m_val and n_val by VALUE, not pointer, since they may be separate UOps.
+        Mod(Add[Mul[_a, _m @const(m_val)], b], n @const(n_val)) => |b, n, m_val, n_val| {
+            trace!(
+                ?m_val,
+                ?n_val,
+                b.id = b.id,
+                "Mod factor-out CHECKING: m_val == n_val?"
+            );
+            if m_val != n_val { return None; }  // Multiplier must equal modulus
+            trace!(
+                ?n_val,
+                b.id = b.id,
+                "Mod factor-out SUCCESS: (a * n + b) % n → b % n"
+            );
+            b.try_mod(n).ok()
+        },
+
+        // Nested Add version: ((a * m) + b + c) % n → (b + c) % n when m == n
+        // Handles more complex expressions with additional terms.
+        Mod(Add[Add[Mul[_a, _m @const(m_val)], b], c], n @const(n_val)) => |b, c, n, m_val, n_val| {
+            if m_val != n_val { return None; }  // Multiplier must equal modulus
+            trace!(
+                ?n_val,
+                "Mod factor-out nested: ((a * n) + b + c) % n → (b + c) % n"
+            );
+            let bc = b.try_add(c).ok()?;
+            bc.try_mod(n).ok()
+        },
+
+        // (a * m + b) / n → a + b / n when m == n (distribute division over sum)
+        // When b is non-negative and small, this can enable further simplification.
+        // Specifically: (a * n + b) / n = a when 0 <= b < n
+        // Using commutative [] for Add to match both orderings.
+        // Note: We compare m_val and n_val by VALUE, not pointer, since they may be separate UOps.
+        Idiv(Add[Mul[a, _m @const(m_val)], b], n @const(n_val)) => |a, b, n, m_val, n_val| {
+            if m_val != n_val { return None; }  // Multiplier must equal divisor
+            let ConstValue::Int(n_int) = n_val else { return None };
+            if n_int <= 0 { return None; }
+
+            let (vmin, vmax) = VminVmaxProperty::get(b);
+            if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
+                && *min >= 0 && *max < n_int {
+                    // b is in [0, n), so (a * n + b) / n = a
+                    trace!(
+                        ?n_val,
+                        a.id = a.id,
+                        min = *min,
+                        max = *max,
+                        "Idiv factor-out: (a * n + b) / n → a (when 0 <= b < n)"
+                    );
+                    return Some(Arc::clone(a));
+                }
+            // Fall through: compute a + b / n
+            let b_div_n = b.try_div(n).ok()?;
+            trace!(
+                ?n_val,
+                "Idiv factor-out: (a * n + b) / n → a + b / n"
+            );
+            a.try_add(&b_div_n).ok()
+        },
+
+        // x / n → k when all values of x are in the same bucket [k*n, (k+1)*n)
+        // This is the "cancel divmod" rule from Tinygrad's fold_divmod_general.
+        // Examples:
+        //   Range(3) / 3 → 0 (since Range(3) is 0,1,2 and all /3 = 0)
+        //   (64 + Range(8)) / 64 → 1 (since 64..71 all /64 = 1)
         Idiv(x, _n @const(n_val)) => |x, n_val| {
             let (vmin, vmax) = VminVmaxProperty::get(x);
-            // Check if x is always non-negative and less than n
             if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
-                && *min >= 0 && *max < n_int && n_int > 0 {
-                    return Some(UOp::const_(x.dtype(), ConstValue::Int(0)));
+                && n_int > 0 {
+                    // Compute floor division for min and max
+                    let min_div = if *min >= 0 {
+                        *min / n_int
+                    } else {
+                        // For negative numbers: floor division rounds toward negative infinity
+                        (*min - n_int + 1) / n_int
+                    };
+                    let max_div = if *max >= 0 {
+                        *max / n_int
+                    } else {
+                        (*max - n_int + 1) / n_int
+                    };
+                    // If both endpoints divide to the same value, all values in range do too
+                    if min_div == max_div {
+                        trace!(
+                            min = *min,
+                            max = *max,
+                            n_int,
+                            result = min_div,
+                            "Idiv cancel: x / n → k (all values in same bucket)"
+                        );
+                        return Some(UOp::const_(x.dtype(), ConstValue::Int(min_div)));
+                    }
                 }
             None
         },
@@ -308,8 +397,8 @@ pub fn range_based_mod_div_patterns() -> TypedPatternMatcher {
                 // For correctness, we need: (v + c) // d == v // d for ALL v in [min, max]
                 // This is true iff adding c doesn't cause any value to cross a bucket boundary.
                 // Check at both endpoints (with overflow protection):
-                let Some(min_c) = min.checked_add(c_int) else { return None };
-                let Some(max_c) = max.checked_add(c_int) else { return None };
+                let min_c = min.checked_add(c_int)?;
+                let max_c = max.checked_add(c_int)?;
                 let min_bucket = *min / d_int;
                 let max_bucket = *max / d_int;
                 let min_c_bucket = min_c / d_int;
@@ -470,7 +559,7 @@ pub fn alu_folding_dsl_patterns() -> TypedPatternMatcher {
             // Create (x + y) directly preserving the inner Add's dtype
             let xy = UOp::new(Op::Binary(BinaryOp::Add, Arc::clone(x), Arc::clone(y)), inner.dtype());
             // Then add the constant
-            Some(UOp::new(Op::Binary(BinaryOp::Add, xy, UOp::const_(c.dtype(), c_val.clone())), inner.dtype()))
+            Some(UOp::new(Op::Binary(BinaryOp::Add, xy, UOp::const_(c.dtype(), c_val)), inner.dtype()))
         },
 
         // (x * c1) * c2 → x * (c1 * c2) - commutative outer Mul

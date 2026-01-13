@@ -27,7 +27,7 @@ fn bench_matmul(c: &mut Criterion) {
 
     // Typed optimizer configurations (no environment variables needed)
     let heuristic_config = OptimizerConfig::default();
-    const BEAM_WIDTH: usize = 5;
+    const BEAM_WIDTH: usize = 2;
     let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build();
 
     for size in [512] {
