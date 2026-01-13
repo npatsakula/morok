@@ -305,7 +305,7 @@ fn test_vectorize_normalize_minimal() {
 // ========== 64x64 Vectorized Test (for UPCAST debugging) ==========
 
 #[test]
-// #[tracing_test::traced_test]
+#[tracing_test::traced_test]
 fn test_matmul_64x64_vectorized() {
     // Create 64x64 matrices filled with 1.0
     let a = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();

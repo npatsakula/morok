@@ -489,10 +489,12 @@ fn is_cast_index_store(uop: &Arc<UOp>) -> bool {
 
 /// Key for grouping indices by root expression and validity.
 ///
-/// Tinygrad groups by (validity, root) tuple. We use UOp IDs for hashing.
+/// Tinygrad groups by (validity, root) tuple. We use content_hash() for structural
+/// equality - UOp IDs don't work because extract_root_and_offset rebuilds expressions
+/// and identical structures can have different IDs if they came from different code paths.
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 enum RootKey {
-    /// Expression-based root with optional gate (validity) ID
+    /// Expression-based root with optional gate (validity) hash
     Expr { valid_id: Option<u64>, root_id: u64 },
     /// Constant index
     Const,
@@ -500,7 +502,11 @@ enum RootKey {
 
 impl RootKey {
     fn expr(root: &Arc<UOp>, gate: Option<&Arc<UOp>>) -> Self {
-        RootKey::Expr { valid_id: gate.map(|g| g.id), root_id: root.id }
+        // Use content_hash() for structural equality, not .id (pointer identity)
+        RootKey::Expr {
+            valid_id: gate.map(|g| g.content_hash()),
+            root_id: root.content_hash(),
+        }
     }
 }
 
@@ -593,6 +599,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     // ensures identical subexpressions share the same UOp instance.
     let full_simplifier = gep_pushing_patterns() + symbolic();
     let simplified = graph_rewrite_bottom_up(&full_simplifier, current, &mut ());
+    tracing::trace!(simplified = %simplified.tree(), "expand_vector_index: after symbolic simplification");
 
     // Step 3: Extract (root, offset) from each simplified scalar INDEX
     let Op::Sink { sources } = simplified.op() else {
@@ -673,65 +680,44 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// Extract (root_key, offset) from a simplified scalar index.
 ///
+/// Matches Tinygrad's approach (devectorizer.py:68-72): only strip the OUTERMOST
+/// Add with a constant. This is simpler and works correctly with hash consing
+/// since we don't rebuild expressions.
+///
 /// Patterns:
 /// - Add(root, CONST(offset)) → (Expr(root), offset)
 /// - Add(CONST(offset), root) → (Expr(root), offset)
 /// - CONST(offset) → (Const, offset)
-/// - Invalid → (Invalid, 0)
 /// - other → (Expr(other), 0)
 fn extract_root_and_offset(idx: &Arc<UOp>, gate: Option<&Arc<UOp>>) -> (RootKey, i64) {
-    // Extract total constant offset from the entire Add chain
-    // E.g., Add(Add(base, 1), y) → (Add(base, y), 1)
-    fn extract_const_sum(uop: &Arc<UOp>) -> (Option<Arc<UOp>>, i64) {
-        match uop.op() {
-            Op::Binary(BinaryOp::Add, left, right) => {
-                // Check if right is const
-                if let Op::Const(cv) = right.op()
-                    && let ConstValue::Int(v) = cv.0
-                {
-                    let (inner, inner_sum) = extract_const_sum(left);
-                    return (inner, inner_sum + v);
-                }
-                // Check if left is const
-                if let Op::Const(cv) = left.op()
-                    && let ConstValue::Int(v) = cv.0
-                {
-                    let (inner, inner_sum) = extract_const_sum(right);
-                    return (inner, inner_sum + v);
-                }
-                // Recurse into both sides
-                let (left_inner, left_sum) = extract_const_sum(left);
-                let (right_inner, right_sum) = extract_const_sum(right);
-                if left_sum != 0 || right_sum != 0 {
-                    // Rebuild Add without the extracted constants
-                    match (left_inner, right_inner) {
-                        (Some(l), Some(r)) => {
-                            if let Ok(new_add) = l.try_add(&r) {
-                                return (Some(new_add), left_sum + right_sum);
-                            }
-                        }
-                        (Some(l), None) => return (Some(l), left_sum + right_sum),
-                        (None, Some(r)) => return (Some(r), left_sum + right_sum),
-                        (None, None) => return (None, left_sum + right_sum),
-                    }
-                }
-                (Some(Arc::clone(uop)), 0)
-            }
-            Op::Const(cv) => {
-                if let ConstValue::Int(v) = cv.0 {
-                    (None, v) // Pure constant - no root expression
-                } else {
-                    (Some(Arc::clone(uop)), 0)
+    match idx.op() {
+        // Add(root, CONST(offset)) or Add(CONST(offset), root)
+        Op::Binary(BinaryOp::Add, left, right) => {
+            // Check if right is a constant offset
+            if let Op::Const(cv) = right.op() {
+                if let ConstValue::Int(offset) = cv.0 {
+                    return (RootKey::expr(left, gate), offset);
                 }
             }
-            _ => (Some(Arc::clone(uop)), 0),
+            // Check if left is a constant offset
+            if let Op::Const(cv) = left.op() {
+                if let ConstValue::Int(offset) = cv.0 {
+                    return (RootKey::expr(right, gate), offset);
+                }
+            }
+            // Neither side is a constant - no offset extracted
+            (RootKey::expr(idx, gate), 0)
         }
-    }
-
-    let (root_opt, offset) = extract_const_sum(idx);
-    match root_opt {
-        Some(root) => (RootKey::expr(&root, gate), offset),
-        None => (RootKey::Const, offset), // Pure constant expression
+        // Pure CONST(offset)
+        Op::Const(cv) => {
+            if let ConstValue::Int(offset) = cv.0 {
+                (RootKey::Const, offset)
+            } else {
+                (RootKey::expr(idx, gate), 0)
+            }
+        }
+        // Anything else: no offset extracted
+        _ => (RootKey::expr(idx, gate), 0),
     }
 }
 
@@ -1209,12 +1195,18 @@ mod tests {
         assert_eq!(offset, 42);
         assert!(matches!(key, RootKey::Const));
 
-        // Test Add of two constants - should return total as offset
+        // Test Add of two constants - we only strip the outermost constant
+        // In practice, symbolic simplification would fold Add(100, 3) -> 103 before extraction.
+        // Here we test the un-simplified case: Add(100, 3) extracts (Expr(100), 3).
         let const_a = UOp::const_(DType::Index, ConstValue::Int(100));
         let const_b = UOp::const_(DType::Index, ConstValue::Int(3));
         let add_consts = UOp::new(Op::Binary(BinaryOp::Add, const_a, const_b), DType::Index);
         let (key, offset) = extract_root_and_offset(&add_consts, None);
-        assert_eq!(offset, 103); // Sum of both constants
-        assert!(matches!(key, RootKey::Const));
+        // With simplified extraction (only strip outermost const), we get the 3 as offset
+        // and the left side (100) as the "root" (which happens to be a constant but we don't fold)
+        assert_eq!(offset, 3);
+        // The root is the CONST(100) node, but RootKey::expr() will mark it as Expr
+        // This is fine because symbolic simplification should have already folded this case
+        assert!(matches!(key, RootKey::Expr { .. }));
     }
 }

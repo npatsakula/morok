@@ -29,7 +29,7 @@ mod binding_names {
 /// 2. Renames the second `x` to `x__dup` and records the pair
 ///
 /// The rewrite function then generates `Arc::ptr_eq(&x, &x__dup)` checks.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct DuplicateTracker {
     /// Variable names we've seen so far
     seen: std::collections::HashSet<String>,
@@ -1396,10 +1396,15 @@ fn generate_inline_commutative_match(
         };
     };
 
+    // Clone the tracker BEFORE processing either ordering.
+    // Both orderings need independent duplicate detection, and both should start
+    // from the same initial state (variables seen by parent patterns).
+    let mut dup_tracker_swapped = dup_tracker.clone();
+
     // Generate matches for normal ordering (left, right)
-    let mut dup_tracker_normal = DuplicateTracker::default();
-    let left_match = generate_inline_match(&args[0], &left_var, iter_ctx, &mut dup_tracker_normal)?;
-    let right_match = generate_inline_match(&args[1], &right_var, iter_ctx, &mut dup_tracker_normal)?;
+    // Use the passed-in dup_tracker so duplicates across siblings and nested patterns are detected
+    let left_match = generate_inline_match(&args[0], &left_var, iter_ctx, dup_tracker)?;
+    let right_match = generate_inline_match(&args[1], &right_var, iter_ctx, dup_tracker)?;
 
     // Combine child match codes for normal ordering
     // Include both match_code and any nested child_match_code (for nested commutative patterns)
@@ -1418,7 +1423,7 @@ fn generate_inline_commutative_match(
     normal_bindings.extend(right_match.bindings);
 
     // Generate matches for swapped ordering (right, left)
-    let mut dup_tracker_swapped = DuplicateTracker::default();
+    // Uses the cloned tracker from before normal ordering, so variables are named identically.
     let left_match_swap = generate_inline_match(&args[0], &right_var, iter_ctx, &mut dup_tracker_swapped)?;
     let right_match_swap = generate_inline_match(&args[1], &left_var, iter_ctx, &mut dup_tracker_swapped)?;
 
@@ -1437,12 +1442,6 @@ fn generate_inline_commutative_match(
 
     let mut swapped_bindings = left_match_swap.bindings;
     swapped_bindings.extend(right_match_swap.bindings);
-
-    // Merge duplicate tracking
-    for (orig, dup) in dup_tracker_normal.get_duplicates() {
-        dup_tracker.seen.insert(orig.clone());
-        dup_tracker.duplicates.push((orig.clone(), dup.clone()));
-    }
 
     Ok(InlineMatchOutput {
         match_code,

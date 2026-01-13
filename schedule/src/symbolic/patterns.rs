@@ -291,6 +291,65 @@ pub fn range_based_mod_div_patterns() -> TypedPatternMatcher {
                 }
             None
         },
+
+        // Phase 2: (x + c) // d → x // d when small offset c doesn't affect bucket
+        // This handles index canonicalization: (base + lane_offset) // n → base // n
+        // when ALL values of x + c remain in the same bucket as x.
+        // Condition: for all v in [vmin(x), vmax(x)]: (v + c) // d == v // d
+        // Using commutative [] to match both Add(x, c) and Add(c, x)
+        Idiv(Add[x, _c @const(c_val)], d @const(d_val)) => |x, c_val, d, d_val| {
+            let ConstValue::Int(c_int) = c_val else { return None };
+            let ConstValue::Int(d_int) = d_val else { return None };
+            // Only handle small positive offsets with positive divisor
+            if d_int <= 0 || c_int < 0 { return None; }
+
+            let (vmin, vmax) = VminVmaxProperty::get(x);
+            if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax) {
+                // For correctness, we need: (v + c) // d == v // d for ALL v in [min, max]
+                // This is true iff adding c doesn't cause any value to cross a bucket boundary.
+                // Check at both endpoints (with overflow protection):
+                let Some(min_c) = min.checked_add(c_int) else { return None };
+                let Some(max_c) = max.checked_add(c_int) else { return None };
+                let min_bucket = *min / d_int;
+                let max_bucket = *max / d_int;
+                let min_c_bucket = min_c / d_int;
+                let max_c_bucket = max_c / d_int;
+
+                if min_bucket == min_c_bucket && max_bucket == max_c_bucket {
+                    return x.try_div(d).ok();
+                }
+            }
+            None
+        },
+
+        // Phase 1: (x + c) // d → (x + (c % d)) // d + (c // d)
+        // When c >= d, split the offset into quotient and remainder parts.
+        // This canonicalizes large offsets, allowing further simplification.
+        // Based on Tinygrad's divandmod.py:101-104
+        Idiv(Add[x, _c @const(c_val)], d @const(d_val)) => |x, c_val, d, d_val| {
+            let ConstValue::Int(c_int) = c_val else { return None };
+            let ConstValue::Int(d_int) = d_val else { return None };
+            if d_int <= 0 { return None; }
+
+            let c_mod_d = c_int % d_int;
+            let c_div_d = c_int / d_int;
+
+            // Only apply if remainder differs from original (i.e., c >= d or c < 0)
+            if c_mod_d == c_int { return None; }
+
+            // Check x.vmin >= 0 for correctness (negative numerators have different semantics)
+            let (vmin, _) = VminVmaxProperty::get(x);
+            if let ConstValue::Int(min) = vmin {
+                if *min < 0 { return None; }
+            } else { return None; }
+
+            // Transform: (x + c) // d → (x + c%d) // d + c//d
+            let remainder_const = UOp::const_(d.dtype(), ConstValue::Int(c_mod_d));
+            let inner = x.try_add(&remainder_const).ok()?;
+            let div_result = inner.try_div(d).ok()?;
+            let quotient_const = UOp::const_(d.dtype(), ConstValue::Int(c_div_d));
+            div_result.try_add(&quotient_const).ok()
+        },
     }
 }
 
@@ -394,11 +453,25 @@ pub fn advanced_division_dsl_patterns() -> TypedPatternMatcher {
 /// - (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2)
 /// - (x + c1) - c2 → x + (c1 - c2) or x - (c2 - c1)
 /// - (x - c1) - c2 → x - (c1 + c2)
+/// - (x + c) + y → (x + y) + c (constant pushing, for index canonicalization)
 pub fn alu_folding_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // (x + c1) + c2 → x + (c1 + c2) - commutative outer Add
         Add[Add[x, c1 @const(c1_val)], _c2 @const(c2_val)]
           => x.try_add(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
+
+        // Constant pushing: (x + c) + y → (x + y) + c when y is NOT a const
+        // Based on Tinygrad's ((UPat.var("x") + UPat.cvar("c1")) + UPat.var("y"), lambda x,c1,y: (x+y)+c1)
+        // This ensures constants bubble to the outermost level for index extraction.
+        // Using commutative pattern to also match y + (x + c) and (c + x) + y cases.
+        // IMPORTANT: Use UOp::new directly instead of try_add() to avoid type promotion
+        // which could insert casts and create structurally different expressions.
+        Add[inner @ Add[x, c @const(c_val)], y] if !matches!(y.op(), Op::Const(_)) => {
+            // Create (x + y) directly preserving the inner Add's dtype
+            let xy = UOp::new(Op::Binary(BinaryOp::Add, Arc::clone(x), Arc::clone(y)), inner.dtype());
+            // Then add the constant
+            Some(UOp::new(Op::Binary(BinaryOp::Add, xy, UOp::const_(c.dtype(), c_val.clone())), inner.dtype()))
+        },
 
         // (x * c1) * c2 → x * (c1 * c2) - commutative outer Mul
         Mul[Mul[x, c1 @const(c1_val)], _c2 @const(c2_val)]
@@ -589,6 +662,25 @@ pub fn comparison_dsl_patterns() -> TypedPatternMatcher {
 
         // -x < -y → y < x (negation flip for Lt)
         Lt(Neg(x), Neg(y)) => |x, y| y.try_cmplt(x).ok(),
+
+        // Phase 6: (x // d) < c → x < (c * d) when d > 0
+        // This lifts division out of comparisons, enabling further simplification.
+        // Based on Tinygrad's symbolic.py:229-230
+        Lt(Idiv(x, _d @const(d_val)), _c @const(c_val)) => |x, d_val, c_val| {
+            let ConstValue::Int(d_int) = d_val else { return None };
+            let ConstValue::Int(c_int) = c_val else { return None };
+            if d_int <= 0 { return None; }
+
+            // For x // d < c:
+            // - If c > 0: equivalent to x < c * d
+            // - If c <= 0: equivalent to x < c * d - (d - 1) = c * d - d + 1
+            let bound = if c_int > 0 {
+                c_int * d_int
+            } else {
+                c_int * d_int - (d_int - 1)
+            };
+            x.try_cmplt(&UOp::const_(x.dtype(), ConstValue::Int(bound))).ok()
+        },
     }
 }
 
@@ -766,15 +858,51 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
 
 /// Div/Mod recombination patterns.
 ///
+/// Uses automatic ptr_eq checks via duplicate variable names in patterns.
 /// - x%n + (x//n)*n → x (div-mod identity)
-/// - (x//n)*n + x%n → x (commutative form)
+/// - ((x//a) % c) + (x // b) * c → x // a when a*c == b
+/// - (x % c1) * c2 + (x // c1) * c3 → x * c2 when c1*c2 == c3
+/// - y + (x % n) + (x // n) * n → y + x
 /// - (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division)
 pub fn div_mod_recombine_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // x%n + (x//n)*n → x (div-mod identity)
-        Add[Mod(x, n), Mul[Idiv(x2, n2), n3]]
-          if Arc::ptr_eq(x, x2) && Arc::ptr_eq(n, n2) && Arc::ptr_eq(n, n3)
+        // Note: duplicate variable names (x, n) auto-generate Arc::ptr_eq checks
+        Add[Mod(x, n), Mul[Idiv(x, n), n]]
           ~> |x| Arc::clone(x),
+
+        // ((x//a) % c) + (x // b) * c → x // a
+        // Condition: a * c == b (divisor composition)
+        // Note: x appears twice, c appears twice → auto ptr_eq checks
+        Add[Mod(Idiv(x, a @const(a_val)), c @const(c_val)), Mul[Idiv(x, _b @const(b_val)), c]]
+          => |x, a, a_val, c_val, b_val| {
+            let ConstValue::Int(a_int) = a_val else { return None };
+            let ConstValue::Int(c_int) = c_val else { return None };
+            let ConstValue::Int(b_int) = b_val else { return None };
+            if a_int * c_int == b_int {
+                return x.try_div(a).ok();
+            }
+            None
+        },
+
+        // (x % c1) * c2 + (x // c1) * c3 → x * c2
+        // Condition: c1 * c2 == c3
+        // Note: x appears twice, c1 appears twice → auto ptr_eq checks
+        Add[Mul[Mod(x, c1 @const(c1_val)), c2 @const(c2_val)], Mul[Idiv(x, c1), _c3 @const(c3_val)]]
+          => |x, c1_val, c2, c2_val, c3_val| {
+            let ConstValue::Int(c1_int) = c1_val else { return None };
+            let ConstValue::Int(c2_int) = c2_val else { return None };
+            let ConstValue::Int(c3_int) = c3_val else { return None };
+            if c1_int * c2_int == c3_int {
+                return x.try_mul(c2).ok();
+            }
+            None
+        },
+
+        // y + (x % n) + (x // n) * n → y + x
+        // Note: x appears twice, n appears 3 times → auto ptr_eq for all
+        Add[Add[y, Mod(x, n)], Mul[Idiv(x, n), n]]
+          => |y, x| y.try_add(x).ok(),
 
         // (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division simplification)
         // e.g., (a//2 + 1) // 2 → (a + 2) // 4
