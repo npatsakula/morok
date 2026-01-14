@@ -11,7 +11,7 @@
 //! universally to any UOp graph, not just during schedule transformation.
 
 use morok_dtype::DType;
-use morok_ir::types::{BinaryOp, ConstValue};
+use morok_ir::types::{BinaryOp, ConstValue, TernaryOp};
 use morok_ir::uop::cached_property::CachedProperty;
 use morok_ir::uop::comparison_analysis::ComparisonAnalyzer;
 use morok_ir::uop::eval::{eval_add_typed, eval_binary_op, eval_mul_typed, eval_sub_typed};
@@ -917,6 +917,21 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
             Some(UOp::new(Op::Unary(*un_op, gep_x.clone()), gep_x.dtype()))
         },
 
+        // 7b. Push GEP through Ternary: GEP(Ternary(op, a, b, c), indices) → Ternary(op, GEP(a), GEP(b), GEP(c))
+        // Required for MulAcc (FMA) and WHERE to work with split_load (which creates CAT of 4-element loads)
+        Gep { vector: Where(cond, t, f), indices } if !indices.is_empty() => |cond, t, f, indices| {
+            let gep_cond = UOp::gep(Arc::clone(cond), indices.clone());
+            let gep_t = UOp::gep(Arc::clone(t), indices.clone());
+            let gep_f = UOp::gep(Arc::clone(f), indices.clone());
+            Some(UOp::new(Op::Ternary(TernaryOp::Where, gep_cond.clone(), gep_t, gep_f), gep_cond.dtype()))
+        },
+        Gep { vector: MulAcc(a, b, c), indices } if !indices.is_empty() => |a, b, c, indices| {
+            let gep_a = UOp::gep(Arc::clone(a), indices.clone());
+            let gep_b = UOp::gep(Arc::clone(b), indices.clone());
+            let gep_c = UOp::gep(Arc::clone(c), indices.clone());
+            Some(UOp::new(Op::Ternary(TernaryOp::MulAcc, gep_a.clone(), gep_b, gep_c), gep_a.dtype()))
+        },
+
         // 8. GEP through UNROLL: GEP(UNROLL(x, ...), indices) → GEP(x, indices)
         Gep { vector, indices } if matches!(vector.op(), Op::Unroll { .. }) => |vector, indices| {
             let Op::Unroll { src, .. } = vector.op() else { return None };
@@ -936,11 +951,51 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
             (reordered.len() == indices.len()).then(|| UOp::ptrcat(reordered))
         },
 
-        // 11. GEP through CAT: GEP(CAT([a, b, c, d]), [1, 3]) → CAT([b, d])
+        // 11. GEP through CAT: Extract elements from concatenated vectors
+        // GEP(CAT([a<4>, b<4>]), [5]) → GEP(b, [1]) (element 5 = source 1, offset 1)
+        // Handles multi-element CAT sources by computing cumulative element offsets.
         Gep { vector, indices } if matches!(vector.op(), Op::Cat { .. }) => |vector, indices| {
             let Op::Cat { sources } = vector.op() else { return None };
-            let reordered: Vec<_> = indices.iter().filter_map(|&idx| sources.get(idx).cloned()).collect();
-            (reordered.len() == indices.len()).then(|| UOp::cat(reordered))
+
+            // Build cumulative element counts: [0, count(src0), count(src0)+count(src1), ...]
+            let mut cumulative = Vec::with_capacity(sources.len() + 1);
+            cumulative.push(0usize);
+            for src in sources.iter() {
+                let prev = *cumulative.last().unwrap();
+                cumulative.push(prev + src.dtype().vcount());
+            }
+
+            // Map each element index to (source_idx, element_offset_within_source)
+            let extracted: Vec<_> = indices
+                .iter()
+                .filter_map(|&elem_idx| {
+                    // Binary search for the source containing this element
+                    let src_idx = cumulative.partition_point(|&c| c <= elem_idx).saturating_sub(1);
+                    let src = sources.get(src_idx)?;
+                    let offset_in_src = elem_idx - cumulative[src_idx];
+
+                    // Bounds check
+                    if offset_in_src >= src.dtype().vcount() {
+                        return None;
+                    }
+
+                    if src.dtype().vcount() == 1 {
+                        Some(src.clone())
+                    } else {
+                        Some(UOp::gep(src.clone(), vec![offset_in_src]))
+                    }
+                })
+                .collect();
+
+            if extracted.len() != indices.len() {
+                return None;
+            }
+
+            if extracted.len() == 1 {
+                Some(extracted.into_iter().next().unwrap())
+            } else {
+                Some(UOp::vectorize(extracted.into_iter().collect()))
+            }
         },
     }
 }

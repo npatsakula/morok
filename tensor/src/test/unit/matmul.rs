@@ -295,6 +295,7 @@ fn test_linear_1d_weight() {
 // ========== Minimal VECTORIZE Normalization Test ==========
 
 #[test]
+#[tracing_test::traced_test]
 fn test_vectorize_normalize_minimal() {
     // Test 64x64 matmul with vectorization enabled
     let a = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
@@ -302,7 +303,7 @@ fn test_vectorize_normalize_minimal() {
     let c = a.matmul(&b).unwrap();
 
     // Explicit config to avoid test pollution from shared global state
-    // Note: default config has devectorize_alu=false (vectorization enabled)
+    // Note: default config has devectorize_alu=true (converts vector ALU to scalar)
     let config = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build();
     let result = c.realize_with(&config);
     assert!(result.is_ok(), "realize failed: {:?}", result.err());
@@ -328,4 +329,41 @@ fn test_matmul_512x512_vectorized() {
     // Each element should be 512 (sum of 512 ones)
     assert_eq!(result.len(), SIZE * SIZE);
     assert!((result[[0, 0]] - SIZE as f32).abs() < 0.01, "Expected {}, got {}", SIZE, result[[0, 0]]);
+}
+
+#[test]
+fn test_matmul_64x64_vectorized() {
+    // Create 64x64 matrices filled with 1.0
+    const SIZE: usize = 64;
+    let a = Tensor::from_slice(vec![1.0f32; SIZE * SIZE]).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let b = Tensor::from_slice(vec![1.0f32; SIZE * SIZE]).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let c = a.matmul(&b).unwrap();
+
+    let config = OptimizerConfig::from_env();
+    let c = c.realize_with(&config).unwrap();
+    let result = c.to_ndarray::<f32>().unwrap();
+
+    // Each element should be 64 (sum of 64 ones)
+    assert_eq!(result.len(), SIZE * SIZE);
+    assert!((result[[0, 0]] - SIZE as f32).abs() < 0.01, "Expected {}, got {}", SIZE, result[[0, 0]]);
+}
+
+#[test]
+#[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_64x64_ir -- --ignored --nocapture
+#[tracing_test::traced_test]
+fn test_print_matmul_64x64_ir() {
+    const SIZE: usize = 64;
+    let a = Tensor::from_slice(vec![1.0f32; SIZE * SIZE]).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let b = Tensor::from_slice(vec![1.0f32; SIZE * SIZE]).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let c = a.matmul(&b).unwrap();
+
+    let config = OptimizerConfig::from_env();
+    let plan = c.prepare_with(&config).expect("prepare should succeed");
+
+    println!("\n=== Generated Kernels (64x64 matmul) ===\n");
+    for kernel in plan.kernels() {
+        println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
+        println!("{}", kernel.code);
+        println!();
+    }
 }

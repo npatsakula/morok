@@ -57,19 +57,91 @@ pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
     let ast = graph_rewrite_bottom_up(&phase1, ast.clone(), &mut ());
 
     // Phase 2: Distribute PTRCAT through LOAD/STORE and split by divisibility
-    // Include GEP(PTRCAT/CAT) patterns to handle reordering
     let phase2 = gep_ptrcat_patterns() + load_store_patterns();
     let ast = graph_rewrite_bottom_up(&phase2, ast, &mut ());
 
-    // Phase 3: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits
+    // Phase 3: Eliminate CAT by expanding to VECTORIZE with GEPs
+    // CAT([a<4>, b<4>]) → VECTORIZE(a.gep(0), ..., a.gep(3), b.gep(0), ..., b.gep(3))
+    // This matches Tinygrad's approach (symbolic.py:169-171): CAT can't be rendered,
+    // so we expand it early to avoid GEP-on-CAT complexity.
+    let phase3 = cat_to_vectorize_patterns();
+    let ast = graph_rewrite_bottom_up(&phase3, ast, &mut ());
+
+    // Phase 4: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits
     // LLVM's i1 type can have garbage in upper bits when stored to memory.
     // By casting to uint8 before store and after load, we ensure clean 0/1 values.
     // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
-    let phase3 = bool_storage_patterns();
-    graph_rewrite_bottom_up(&phase3, ast, &mut ())
+    let phase4 = bool_storage_patterns();
+    graph_rewrite_bottom_up(&phase4, ast, &mut ())
 }
 
-/// Phase 3 patterns: Convert bool LOAD/STORE to use uint8 storage.
+/// Phase 3 patterns: Eliminate CAT by expanding to VECTORIZE with GEPs.
+///
+/// CAT can't be rendered directly. Following Tinygrad's approach (symbolic.py:169-171),
+/// we expand CAT to VECTORIZE with element-wise GEPs:
+///
+/// ```text
+/// CAT([a<4>, b<4>]) → VECTORIZE(a.gep(0), a.gep(1), a.gep(2), a.gep(3),
+///                               b.gep(0), b.gep(1), b.gep(2), b.gep(3))
+/// ```
+///
+/// Also handles GEP on VECTORIZE to extract elements directly:
+/// ```text
+/// GEP(VECTORIZE([e0, e1, ..., e63]), [5]) → e5
+/// ```
+fn cat_to_vectorize_patterns() -> TypedPatternMatcher {
+    crate::patterns! {
+        // CAT → VECTORIZE(GEPs): expand each source into its elements
+        cat if matches!(cat.op(), Op::Cat { .. }) => |cat| {
+            let Op::Cat { sources } = cat.op() else { return None };
+            if sources.is_empty() {
+                return None;
+            }
+
+            // Flatten all sources into individual elements via GEP
+            let elements: SmallVec<[Arc<UOp>; 4]> = sources
+                .iter()
+                .flat_map(|src| {
+                    let count = src.dtype().vcount();
+                    (0..count).map(move |i| {
+                        if count == 1 {
+                            src.clone()
+                        } else {
+                            UOp::gep(src.clone(), vec![i])
+                        }
+                    })
+                })
+                .collect();
+
+            Some(UOp::vectorize(elements))
+        },
+
+        // GEP on VECTORIZE: extract elements directly
+        // GEP(VECTORIZE([e0, e1, ..., en-1]), [i]) → ei
+        // GEP(VECTORIZE([e0, e1, ..., en-1]), [i, j, k]) → VECTORIZE([ei, ej, ek])
+        Gep { vector, indices } if matches!(vector.op(), Op::Vectorize { .. }) => |vector, indices| {
+            let Op::Vectorize { elements } = vector.op() else { return None };
+
+            // Extract elements at specified indices
+            let extracted: Vec<_> = indices
+                .iter()
+                .filter_map(|&idx| elements.get(idx).cloned())
+                .collect();
+
+            if extracted.len() != indices.len() {
+                return None; // Index out of bounds
+            }
+
+            if extracted.len() == 1 {
+                Some(extracted.into_iter().next().unwrap())
+            } else {
+                Some(UOp::vectorize(extracted.into_iter().collect()))
+            }
+        },
+    }
+}
+
+/// Phase 4 patterns: Convert bool LOAD/STORE to use uint8 storage.
 ///
 /// LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
 /// We cast bool→uint8 before storing and uint8→bool after loading.
@@ -185,14 +257,60 @@ fn gep_ptrcat_patterns() -> TypedPatternMatcher {
         false
     }
 
+    /// Push GEP through CAT by computing which source each index falls into.
+    ///
+    /// CAT sources can be multi-element vectors:
+    /// - CAT([a<4>, b<4>, c<4>]) has 12 elements total
+    /// - GEP(CAT, [5]) should extract element 5, which is in source b at offset 1
+    /// - Result: GEP(b, [1])
     fn gep_cat(gep: &Arc<UOp>) -> Option<Arc<UOp>> {
         let Op::Gep { vector, indices } = gep.op() else { return None };
         let Op::Cat { sources } = vector.op() else { return None };
-        let reordered: Vec<_> = indices.iter().filter_map(|&idx| sources.get(idx).cloned()).collect();
-        if reordered.len() != indices.len() {
-            return None;
+
+        // Build cumulative offsets: offset[i] is the starting element index of source[i]
+        let mut cumulative_offsets = Vec::with_capacity(sources.len() + 1);
+        let mut offset = 0usize;
+        for source in sources.iter() {
+            cumulative_offsets.push(offset);
+            offset += source.dtype().vcount();
         }
-        Some(UOp::cat(reordered))
+        cumulative_offsets.push(offset); // Total element count
+
+        // Map each GEP index to (source_idx, local_offset)
+        let mut extracted: Vec<Arc<UOp>> = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            // Binary search for which source contains this index
+            let source_idx = cumulative_offsets
+                .iter()
+                .position(|&start| idx < start)
+                .map(|p| p.saturating_sub(1))
+                .unwrap_or(sources.len().saturating_sub(1));
+
+            if source_idx >= sources.len() {
+                return None; // Index out of bounds
+            }
+
+            let source = &sources[source_idx];
+            let local_offset = idx - cumulative_offsets[source_idx];
+            let source_vcount = source.dtype().vcount();
+
+            // Extract element from source
+            let elem = if source_vcount == 1 {
+                // Source is scalar, return as-is
+                source.clone()
+            } else {
+                // Source is vector, GEP into it
+                UOp::gep(source.clone(), vec![local_offset])
+            };
+            extracted.push(elem);
+        }
+
+        // Return result based on number of extracted elements
+        if extracted.len() == 1 {
+            Some(extracted.pop().unwrap())
+        } else {
+            Some(UOp::vectorize(extracted.into_iter().collect()))
+        }
     }
 
     crate::patterns! {
@@ -367,6 +485,25 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
                 })
                 .collect();
             Some(UOp::vectorize(scalar_wheres))
+        },
+
+        // MulAcc (FMA) with vector dtype → VECTORIZE of scalar MulAccs
+        // Required for 8×8 matmul tiling to work with split_load (which creates 4-element chunks)
+        MulAcc(a, b, c) if a.dtype().vcount() > 1 => |a, b, c| {
+            let vcount = a.dtype().vcount();
+            let a_vcount = a.dtype().vcount();
+            let b_vcount = b.dtype().vcount();
+            let c_vcount = c.dtype().vcount();
+
+            let scalar_mulaccs: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+                .map(|i| {
+                    let a_elem = if a_vcount > 1 { UOp::gep(a.clone(), vec![i]) } else { a.clone() };
+                    let b_elem = if b_vcount > 1 { UOp::gep(b.clone(), vec![i]) } else { b.clone() };
+                    let c_elem = if c_vcount > 1 { UOp::gep(c.clone(), vec![i]) } else { c.clone() };
+                    UOp::try_mulacc(a_elem, b_elem, c_elem).expect("MulAcc construction should succeed")
+                })
+                .collect();
+            Some(UOp::vectorize(scalar_mulaccs))
         },
     }
 }

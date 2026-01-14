@@ -427,17 +427,15 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
 /// For matmul C[M,N] = A[M,K] @ B[K,N], this creates a tile of output elements
 /// that are computed together, amortizing memory loads across multiple outputs.
 ///
-/// Tinygrad achieves this via 4×4 register blocking:
-/// - 16 scalar accumulators (float acc0[16])
-/// - Each inner loop processes 4 elements of K
-/// - Each thread computes a 4×4 output tile per K-iteration
-///
+/// Tinygrad achieves 8×8 register blocking with 64 scalar accumulators.
 /// We achieve the same by applying UPCAST to both M and N output axes:
-/// - UPCAST M by 4 → 4 rows of output
-/// - UPCAST N by 4 → 4 cols of output → 4×4 = 16 outputs
+/// - UPCAST M by up to 8 → 8 rows of output
+/// - UPCAST N by up to 8 → 8 cols of output → up to 8×8 = 64 outputs
 ///
-/// The expansion phase (expand.rs) converts this to 16 independent scalar accumulators.
-/// K-vectorization is disabled by default to avoid strided B matrix access.
+/// The devectorize pass (no_vectorized_alu) converts these to independent scalar
+/// accumulators via MulAcc splitting, matching Tinygrad's `float acc0[64]` pattern.
+///
+/// Tile sizes are chosen flexibly based on divisibility: tries 8, 7, 6, 5, 4 in order.
 pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use tracing::debug;
 
@@ -463,9 +461,13 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
         return false;
     }
 
-    // Get sizes of first two upcastable axes
+    // Upcast factors in decreasing order of preference
+    // Larger tiles = more register blocking = better memory amortization
+    const UPCAST_FACTORS: [usize; 5] = [8, 7, 6, 5, 4];
+
+    // Collect axes with their sizes
     let rngs = scheduler.rngs();
-    let mut axes_to_upcast = Vec::new();
+    let mut axes_with_sizes: Vec<(usize, usize)> = Vec::new();
 
     for &axis_idx in output_axes.iter().take(2) {
         if axis_idx >= rngs.len() {
@@ -475,23 +477,25 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
             && let Op::Const(cv) = end.op()
             && let morok_ir::ConstValue::Int(size) = cv.0
             && size >= 4
-            && size % 4 == 0
         {
-            axes_to_upcast.push(axis_idx);
+            axes_with_sizes.push((axis_idx, size as usize));
         }
     }
 
-    if axes_to_upcast.len() < 2 {
-        debug!(found = axes_to_upcast.len(), "apply_matmul_tiling: not enough divisible-by-4 axes");
+    if axes_with_sizes.len() < 2 {
+        debug!(found = axes_with_sizes.len(), "apply_matmul_tiling: not enough output axes");
         return false;
     }
 
-    // Apply 4x UPCAST to both axes (creating 4×4 = 16 outputs)
+    // Apply UPCAST to each axis with the largest divisible factor
     let mut applied = false;
-    for &axis_idx in &axes_to_upcast {
-        if apply_opt(scheduler, &Opt::upcast(axis_idx, 4), true).is_ok() {
-            debug!(axis = axis_idx, "apply_matmul_tiling: applied UPCAST(4)");
-            applied = true;
+    for (axis_idx, size) in axes_with_sizes {
+        // Find largest factor that divides size evenly
+        if let Some(&factor) = UPCAST_FACTORS.iter().find(|&&f| size >= f && size % f == 0) {
+            if apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true).is_ok() {
+                debug!(axis = axis_idx, factor, size, "apply_matmul_tiling: applied UPCAST");
+                applied = true;
+            }
         }
     }
 

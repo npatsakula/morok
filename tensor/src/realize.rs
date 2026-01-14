@@ -550,7 +550,14 @@ fn prepare_execution_plan(
         // Step 2: Optimize OUTSIDE cache (enables beam search)
         let optimized_ast = if let morok_schedule::OptStrategy::Beam { width } = config.strategy {
             // Beam search: compile-and-time multiple candidates
-            beam_search_optimize(item.ast.clone(), &optimizer_renderer, width, &device, &item.buffers)?
+            beam_search_optimize(
+                item.ast.clone(),
+                &optimizer_renderer,
+                width,
+                &device,
+                &item.buffers,
+                config.devectorize_alu,
+            )?
         } else {
             // Heuristic optimization (default)
             morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, config)
@@ -736,6 +743,7 @@ fn beam_search_optimize(
     beam_width: usize,
     device: &Device,
     buffers: &[Buffer],
+    devectorize_alu: bool,
 ) -> Result<Arc<UOp>> {
     use morok_schedule::{
         BeamConfig, HeuristicsConfig, Scheduler, apply_post_optimization, beam_search_cached, hand_coded_optimizations,
@@ -772,8 +780,7 @@ fn beam_search_optimize(
         let raw_ast = s.get_optimized_ast(None);
 
         // Apply post-optimization passes for accurate timing
-        // Use devectorize_alu=false to preserve vectors for LLVM's SLP vectorizer
-        let optimized = apply_post_optimization(raw_ast, false);
+        let optimized = apply_post_optimization(raw_ast, devectorize_alu);
 
         // Apply decomposition
         let decomposed = match dev_renderer.decompositor() {
@@ -817,9 +824,8 @@ fn beam_search_optimize(
     );
 
     // Apply post-optimization to final result
-    // Use devectorize_alu=false to preserve vectors for LLVM's SLP vectorizer
     let raw_ast = result.scheduler.get_optimized_ast(None);
-    Ok(apply_post_optimization(raw_ast, false))
+    Ok(apply_post_optimization(raw_ast, devectorize_alu))
 }
 
 #[cfg(test)]

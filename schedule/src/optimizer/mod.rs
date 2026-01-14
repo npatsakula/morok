@@ -202,6 +202,17 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     let pm_fma = crate::rangeify::patterns::pm_fma_decomposition();
     let with_fma = crate::rewrite::graph_rewrite_bottom_up(&pm_fma, reduce_devec, &mut ());
 
+    // Second pass of ALU devectorization: MulAcc was created by pm_fma_decomposition AFTER
+    // the first no_vectorized_alu pass. Need to devectorize newly created MulAcc ops.
+    // This enables 8×8 matmul tiling: 64-element MulAcc → VECTORIZE of 64 scalar MulAccs.
+    let with_fma = if devectorize_alu {
+        let no_vec_alu = crate::devectorize::no_vectorized_alu();
+        let devec_fma = crate::rewrite::graph_rewrite_bottom_up(&no_vec_alu, with_fma, &mut ());
+        crate::rewrite::graph_rewrite_bottom_up(&gep_pushing_patterns(), devec_fma, &mut ())
+    } else {
+        with_fma
+    };
+
     // Bool storage: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits.
     // LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
     // Must run LAST, after all other transformations that might create bool stores.
