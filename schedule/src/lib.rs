@@ -51,8 +51,8 @@ pub use devectorize::devectorize;
 // Re-export optimizer entry points
 pub use optimizer::{
     BeamConfig, BeamResult, HeuristicsConfig, OptError, OptStrategy, OptimizerConfig, Renderer as OptimizerRenderer,
-    Scheduler, TcOptLevel, TcSelect, TcUsage, apply_post_optimization, beam_search_cached, optimize_kernel,
-    optimize_kernel_with_config, optimize_kernel_with_strategy, prepare_scheduler,
+    Scheduler, TcOptLevel, TcSelect, TcUsage, apply_post_optimization, beam_search_cached, hand_coded_optimizations,
+    optimize_kernel, optimize_kernel_with_config, optimize_kernel_with_strategy, prepare_scheduler,
 };
 
 // Re-export UOp for macro usage

@@ -329,7 +329,7 @@ impl Default for HeuristicsConfig {
             disable_locals: false,
             thread_count: default_thread_count(),
             k_vectorize: false,
-            output_upcast: false,
+            output_upcast: true,
             debug_level: 0,
         }
     }
@@ -350,7 +350,7 @@ impl HeuristicsConfig {
         #[builder(default = false)] disable_locals: bool,
         #[builder(default = default_thread_count())] thread_count: usize,
         #[builder(default = false)] k_vectorize: bool,
-        #[builder(default = false)] output_upcast: bool,
+        #[builder(default = true)] output_upcast: bool,
         #[builder(default = 0)] debug_level: u8,
     ) -> Self {
         Self {

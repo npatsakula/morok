@@ -737,13 +737,21 @@ fn beam_search_optimize(
     device: &Device,
     buffers: &[Buffer],
 ) -> Result<Arc<UOp>> {
-    use morok_schedule::{BeamConfig, Scheduler, apply_post_optimization, beam_search_cached, prepare_scheduler};
+    use morok_schedule::{
+        BeamConfig, HeuristicsConfig, Scheduler, apply_post_optimization, beam_search_cached, hand_coded_optimizations,
+        prepare_scheduler,
+    };
 
     let mut config = BeamConfig::from_env();
     config.beam_width = beam_width;
 
     // Prepare scheduler (applies symbolic simplification and loop→global)
-    let scheduler = prepare_scheduler(ast, renderer);
+    let mut scheduler = prepare_scheduler(ast, renderer);
+
+    // Apply hand-coded heuristics BEFORE beam search (like Tinygrad)
+    // This seeds beam with output_upcast for matmul patterns, TC opts, etc.
+    let heuristics_config = HeuristicsConfig::from_env();
+    hand_coded_optimizations(&mut scheduler, &heuristics_config);
 
     // Ensure all buffers are allocated for timing
     for buf in buffers {
@@ -799,6 +807,14 @@ fn beam_search_optimize(
 
     // Run beam search with caching
     let result = beam_search_cached(scheduler, &config, compile_and_time).context(OptimizeSnafu)?;
+
+    // Debug: log beam search results
+    tracing::debug!(
+        opts = ?result.scheduler.applied_opts,
+        timing = ?result.timing,
+        iterations = result.iterations,
+        "beam_search_optimize: completed"
+    );
 
     // Apply post-optimization to final result
     // Use devectorize_alu=false to preserve vectors for LLVM's SLP vectorizer

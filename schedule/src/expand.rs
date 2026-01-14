@@ -339,22 +339,6 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Skip expanding INDEX operations that return element dtype (not Ptr dtype).
-    // In Morok, INDEX returns element dtype (e.g., Float32 for float buffers).
-    // If we expand it, the dtype becomes <16 x float> which breaks codegen
-    // (expects integer indices, not float vectors).
-    //
-    // This matches Tinygrad's expander.py lines 50-51:
-    //   elif root.op is Ops.INDEX and i >= 1 and not isinstance(root.dtype, PtrDType):
-    //       new_srcs.append(src)  # Pass through without vectorization
-    //
-    // The key insight: Index computes an address (scalar), only Load/Store
-    // handle vectorization of the actual data.
-    if matches!(op, Op::Index { .. }) && !matches!(uop.dtype(), DType::Ptr { .. }) {
-        tracing::debug!("do_expand: skipping INDEX with non-Ptr dtype {:?}", uop.dtype());
-        return None;
-    }
-
     let sources = op.sources();
 
     // Collect all UNROLL sources with their indices
@@ -470,8 +454,13 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 continue;
             }
 
-            // Note: Case 3b removed - let INDEX indices be vectorized by default broadcast logic
-            // This allows devectorize.expand_vector_index to use GEP extraction for strided access
+            // Case 3b: INDEX indices (sources at i >= 1) pass through when INDEX has element dtype
+            // Tinygrad expander.py:50-51: INDEX indices are not vectorized when dtype is not PtrDType
+            // This preserves the memory access pattern - each expanded INDEX uses the same indices
+            if i >= 1 && matches!(op, Op::Index { .. }) && !matches!(uop.dtype(), DType::Ptr { .. }) {
+                new_sources.push(src.clone());
+                continue;
+            }
 
             // Case 3c: Expressions containing runtime scalars (Range, DefineVar) pass through
             // These represent runtime values (loop counters, kernel params) - can't be vectorized.

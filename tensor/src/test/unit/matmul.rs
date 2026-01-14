@@ -210,6 +210,7 @@ fn test_print_matmul_512x512_ir() {
 
 #[test]
 #[ignore] // Run with: cargo test -p morok-tensor test_beam_search_matmul -- --ignored --nocapture
+#[tracing_test::traced_test]
 fn test_beam_search_matmul() {
     // Test beam search optimization for matmul - reproduces float vector index bug
     let size = 512; // Original size that triggered the bug
@@ -318,10 +319,9 @@ fn test_matmul_512x512_vectorized() {
     let b = Tensor::from_slice(vec![1.0f32; SIZE * SIZE]).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
     let c = a.matmul(&b).unwrap();
 
-    // Explicit config to avoid test pollution from shared global state
-    // Note: default config has devectorize_alu=false (vectorization enabled)
+    // Use from_env() to respect MOROK_OUTPUT_UPCAST and other env vars
     // Note: Beam search has a pre-existing bug with horizontal reduction, using Heuristic
-    let config = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build();
+    let config = OptimizerConfig::from_env();
     let c = c.realize_with(&config).unwrap();
     let result = c.to_ndarray::<f32>().unwrap();
 

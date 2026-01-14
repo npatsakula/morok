@@ -452,12 +452,14 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
         return false;
     }
 
-    let upcastable = scheduler.upcastable_dims();
-    debug!(upcastable = ?upcastable, "apply_matmul_tiling: upcastable dims");
+    // Get output axes directly - include OUTER for reduce kernels (matmul)
+    // Note: upcastable_dims() excludes Outer, but matmul needs it
+    let output_axes = scheduler.axes_of(&[AxisType::Outer, AxisType::Global, AxisType::Loop]);
+    debug!(output_axes = ?output_axes, "apply_matmul_tiling: output axes");
 
     // Need at least 2 output axes for 2D tiling
-    if upcastable.len() < 2 {
-        debug!("apply_matmul_tiling: not enough upcastable dims (need 2)");
+    if output_axes.len() < 2 {
+        debug!("apply_matmul_tiling: not enough output axes (need 2)");
         return false;
     }
 
@@ -465,7 +467,7 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
     let rngs = scheduler.rngs();
     let mut axes_to_upcast = Vec::new();
 
-    for &axis_idx in upcastable.iter().take(2) {
+    for &axis_idx in output_axes.iter().take(2) {
         if axis_idx >= rngs.len() {
             continue;
         }
