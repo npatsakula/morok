@@ -305,12 +305,13 @@ impl HeuristicsConfig {
     ///
     /// * `MOROK_THREADS` - Maximum thread count (default: available_parallelism)
     /// * `MOROK_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
-    /// * `MOROK_OUTPUT_UPCAST` - Enable output dimension upcasting (default: disabled)
+    /// * `MOROK_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
     pub fn from_env() -> Self {
         let thread_count =
             std::env::var("MOROK_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
         let k_vectorize = std::env::var("MOROK_K_VECTORIZE").is_ok();
-        let output_upcast = std::env::var("MOROK_OUTPUT_UPCAST").is_ok();
+        // Default enabled, use MOROK_NO_OUTPUT_UPCAST to disable
+        let output_upcast = std::env::var("MOROK_NO_OUTPUT_UPCAST").is_err();
 
         Self { thread_count, k_vectorize, output_upcast, ..Default::default() }
     }

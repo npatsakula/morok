@@ -491,11 +491,11 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
     let mut applied = false;
     for (axis_idx, size) in axes_with_sizes {
         // Find largest factor that divides size evenly
-        if let Some(&factor) = UPCAST_FACTORS.iter().find(|&&f| size >= f && size % f == 0) {
-            if apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true).is_ok() {
-                debug!(axis = axis_idx, factor, size, "apply_matmul_tiling: applied UPCAST");
-                applied = true;
-            }
+        if let Some(&factor) = UPCAST_FACTORS.iter().find(|&&f| size >= f && size % f == 0)
+            && apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true).is_ok()
+        {
+            debug!(axis = axis_idx, factor, size, "apply_matmul_tiling: applied UPCAST");
+            applied = true;
         }
     }
 
