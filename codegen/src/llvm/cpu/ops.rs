@@ -7,7 +7,8 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::Module;
-use inkwell::values::{BasicValueEnum, CallSiteValue, FunctionValue, ValueKind};
+use inkwell::types::{BasicType, VectorType};
+use inkwell::values::{BasicValueEnum, CallSiteValue, FunctionValue, ValueKind, VectorValue};
 use inkwell::{FloatPredicate, IntPredicate};
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
@@ -158,8 +159,6 @@ fn codegen_constant<'ctx>(uop: &Arc<UOp>, context: &'ctx Context) -> Result<Opti
             Ok(Some(value))
         }
         Op::VConst { values } => {
-            use inkwell::types::VectorType;
-
             if values.is_empty() {
                 return Ok(None);
             }
@@ -350,57 +349,131 @@ fn codegen_arithmetic<'ctx>(
         }
         // Cat concatenates vectors into a larger vector
         Op::Cat { sources } | Op::PtrCat { sources } => {
-            // Flatten all source elements into a single vector
-            let mut all_elements: Vec<BasicValueEnum> = Vec::new();
+            // Load all source values
+            let mut source_values: Vec<BasicValueEnum> = Vec::new();
             for src in sources.iter() {
                 let val = require_value(src, context, module, builder, values)?;
                 let val = auto_load_pointer(val, &src.dtype(), context, builder)?;
-
-                if val.is_vector_value() {
-                    // Extract all elements from vector
-                    let vec = val.into_vector_value();
-                    let count = vec.get_type().get_size();
-                    for i in 0..count {
-                        let idx = context.i32_type().const_int(i as u64, false);
-                        let elem =
-                            builder.build_extract_element(vec, idx, "cat_extract").context(VectorExtractSnafu)?;
-                        all_elements.push(elem);
-                    }
-                } else {
-                    all_elements.push(val);
-                }
+                source_values.push(val);
             }
 
-            if all_elements.is_empty() {
+            if source_values.is_empty() {
                 return Ok(None);
             }
 
-            if all_elements.len() == 1 {
-                return Ok(Some(all_elements[0]));
+            if source_values.len() == 1 {
+                return Ok(Some(source_values[0]));
             }
 
-            // Build result vector
-            let count = all_elements.len() as u32;
-            let vec_type = if all_elements[0].is_float_value() {
-                all_elements[0].into_float_value().get_type().vec_type(count)
-            } else if all_elements[0].is_int_value() {
-                all_elements[0].into_int_value().get_type().vec_type(count)
-            } else {
-                return Ok(Some(all_elements[0]));
-            };
-
-            let mut result: BasicValueEnum = vec_type.get_poison().into();
-            for (i, elem) in all_elements.into_iter().enumerate() {
-                let idx = context.i32_type().const_int(i as u64, false);
-                result = builder
-                    .build_insert_element(result.into_vector_value(), elem, idx, "cat_build")
-                    .context(VectorInsertSnafu)?
-                    .into();
+            // Try optimized shufflevector path for all-vector sources
+            if source_values.iter().all(|v| v.is_vector_value()) {
+                return cat_vectors_with_shuffle(&source_values, context, builder);
             }
-            Ok(Some(result))
+
+            // Fallback: extract all elements and build result
+            cat_elements_fallback(&source_values, context, builder)
         }
         _ => Ok(None),
     }
+}
+
+/// Concatenate vectors using shufflevector instructions.
+///
+/// For two same-size vectors, uses a single shufflevector.
+/// For multiple vectors, recursively combines pairs.
+/// This is much more efficient than extracting all elements and reinserting.
+fn cat_vectors_with_shuffle<'ctx>(
+    sources: &[BasicValueEnum<'ctx>],
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+) -> Result<Option<BasicValueEnum<'ctx>>> {
+    if sources.is_empty() {
+        return Ok(None);
+    }
+
+    if sources.len() == 1 {
+        return Ok(Some(sources[0]));
+    }
+
+    // Recursively combine pairs using shufflevector
+    let mut current = sources.to_vec();
+    while current.len() > 1 {
+        let mut next = Vec::with_capacity(current.len().div_ceil(2));
+        for chunk in current.chunks(2) {
+            if chunk.len() == 2 {
+                let left = chunk[0].into_vector_value();
+                let right = chunk[1].into_vector_value();
+                let left_size = left.get_type().get_size();
+                let right_size = right.get_type().get_size();
+                let total_size = left_size + right_size;
+
+                // Create shuffle mask: [0, 1, ..., left_size-1, left_size, left_size+1, ..., total-1]
+                let i32_type = context.i32_type();
+                let mask_values: Vec<_> = (0..total_size).map(|i| i32_type.const_int(i as u64, false)).collect();
+                let mask = VectorType::const_vector(&mask_values);
+
+                let shuffled =
+                    builder.build_shuffle_vector(left, right, mask, "cat_shuffle").context(VectorShuffleSnafu)?;
+                next.push(shuffled.into());
+            } else {
+                next.push(chunk[0]);
+            }
+        }
+        current = next;
+    }
+
+    Ok(Some(current[0]))
+}
+
+/// Fallback CAT implementation using extract/insert for mixed scalar/vector sources.
+fn cat_elements_fallback<'ctx>(
+    sources: &[BasicValueEnum<'ctx>],
+    context: &'ctx Context,
+    builder: &Builder<'ctx>,
+) -> Result<Option<BasicValueEnum<'ctx>>> {
+    // Flatten all source elements into a single vector
+    let mut all_elements: Vec<BasicValueEnum> = Vec::new();
+    for val in sources.iter() {
+        if val.is_vector_value() {
+            let vec = val.into_vector_value();
+            let count = vec.get_type().get_size();
+            for i in 0..count {
+                let idx = context.i32_type().const_int(i as u64, false);
+                let elem = builder.build_extract_element(vec, idx, "cat_extract").context(VectorExtractSnafu)?;
+                all_elements.push(elem);
+            }
+        } else {
+            all_elements.push(*val);
+        }
+    }
+
+    if all_elements.is_empty() {
+        return Ok(None);
+    }
+
+    if all_elements.len() == 1 {
+        return Ok(Some(all_elements[0]));
+    }
+
+    // Build result vector
+    let count = all_elements.len() as u32;
+    let vec_type = if all_elements[0].is_float_value() {
+        all_elements[0].into_float_value().get_type().vec_type(count)
+    } else if all_elements[0].is_int_value() {
+        all_elements[0].into_int_value().get_type().vec_type(count)
+    } else {
+        return Ok(Some(all_elements[0]));
+    };
+
+    let mut result: BasicValueEnum = vec_type.get_poison().into();
+    for (i, elem) in all_elements.into_iter().enumerate() {
+        let idx = context.i32_type().const_int(i as u64, false);
+        result = builder
+            .build_insert_element(result.into_vector_value(), elem, idx, "cat_build")
+            .context(VectorInsertSnafu)?
+            .into();
+    }
+    Ok(Some(result))
 }
 
 fn codegen_unary<'ctx>(
@@ -1885,12 +1958,14 @@ fn codegen_reduce_op<'ctx>(
 /// Perform horizontal reduction on a vector accumulator to produce a scalar.
 ///
 /// Used when UPCAST is applied to a reduce axis, creating vectorized accumulators.
-/// After the reduce loop ends, this function chains all vector lanes together
-/// using tree reduction to produce the final scalar result.
+/// After the reduce loop ends, this function reduces all vector lanes to a single scalar.
+///
+/// Uses LLVM's `@llvm.vector.reduce.*` intrinsics for optimal performance when available.
+/// Falls back to scalar tree reduction otherwise.
 ///
 /// Example for 4-element float vector with Add:
 /// ```text
-/// [a, b, c, d] -> (a+b) + (c+d) -> result
+/// [a, b, c, d] -> @llvm.vector.reduce.fadd -> a+b+c+d
 /// ```
 fn codegen_horizontal_reduce<'ctx>(
     vec_val: BasicValueEnum<'ctx>,
@@ -1908,6 +1983,97 @@ fn codegen_horizontal_reduce<'ctx>(
         let idx = context.i32_type().const_int(0, false);
         return builder.build_extract_element(vec, idx, "horiz_single").context(VectorExtractSnafu);
     }
+
+    // Try LLVM vector reduce intrinsics first (optimal for all vector sizes)
+    if let Some(result) = try_vector_reduce_intrinsic(vec, reduce_op, scalar_dtype, module, builder)? {
+        return Ok(result);
+    }
+
+    // Fallback: scalar tree reduction for unsupported cases
+    codegen_horizontal_reduce_scalar(vec, reduce_op, scalar_dtype, context, module, builder)
+}
+
+/// Try to use LLVM vector reduce intrinsics for horizontal reduction.
+///
+/// Returns `Ok(Some(result))` if intrinsic is available and successful,
+/// `Ok(None)` if intrinsic is not available for this operation/type,
+/// `Err(_)` on unexpected errors.
+fn try_vector_reduce_intrinsic<'ctx>(
+    vec: VectorValue<'ctx>,
+    reduce_op: ReduceOp,
+    scalar_dtype: &DType,
+    module: &Module<'ctx>,
+    builder: &Builder<'ctx>,
+) -> Result<Option<BasicValueEnum<'ctx>>> {
+    let is_float = scalar_dtype.is_float();
+    let is_signed = scalar_dtype.is_signed();
+
+    // Determine intrinsic name based on reduce operation and type
+    let intrinsic_name = match (reduce_op, is_float) {
+        (ReduceOp::Add, true) => "llvm.vector.reduce.fadd",
+        (ReduceOp::Add, false) => "llvm.vector.reduce.add",
+        (ReduceOp::Mul, true) => "llvm.vector.reduce.fmul",
+        (ReduceOp::Mul, false) => "llvm.vector.reduce.mul",
+        (ReduceOp::Max, true) => "llvm.vector.reduce.fmax",
+        (ReduceOp::Max, false) if is_signed => "llvm.vector.reduce.smax",
+        (ReduceOp::Max, false) => "llvm.vector.reduce.umax",
+        (ReduceOp::Min, true) => "llvm.vector.reduce.fmin",
+        (ReduceOp::Min, false) if is_signed => "llvm.vector.reduce.smin",
+        (ReduceOp::Min, false) => "llvm.vector.reduce.umin",
+    };
+
+    // Find the intrinsic
+    let intrinsic = match Intrinsic::find(intrinsic_name) {
+        Some(i) => i,
+        None => return Ok(None), // Intrinsic not available, use fallback
+    };
+
+    // Get intrinsic declaration - vector reduce intrinsics are overloaded on the vector type
+    let vec_type = vec.get_type();
+    let intrinsic_fn = match intrinsic.get_declaration(module, &[vec_type.as_basic_type_enum()]) {
+        Some(f) => f,
+        None => return Ok(None), // Declaration failed, use fallback
+    };
+
+    // For fadd and fmul, the intrinsic takes a starting value as the first argument
+    // We use identity elements (0.0 for add, 1.0 for mul).
+    let result = if is_float && matches!(reduce_op, ReduceOp::Add | ReduceOp::Mul) {
+        let elem_type = vec_type.get_element_type().into_float_type();
+        let identity = match reduce_op {
+            ReduceOp::Add => elem_type.const_float(0.0),
+            ReduceOp::Mul => elem_type.const_float(1.0),
+            _ => unreachable!(),
+        };
+
+        builder
+            .build_call(intrinsic_fn, &[identity.into(), vec.into()], "reduce_intrinsic")
+            .context(BuildCallSnafu { intrinsic: intrinsic_name.to_string() })?
+    } else {
+        // Non-float or max/min: single vector argument
+        builder
+            .build_call(intrinsic_fn, &[vec.into()], "reduce_intrinsic")
+            .context(BuildCallSnafu { intrinsic: intrinsic_name.to_string() })?
+    };
+
+    // Extract scalar result from call
+    let scalar = match result.try_as_basic_value() {
+        ValueKind::Basic(v) => v,
+        ValueKind::Instruction(_) => return Ok(None), // Unexpected, fall back to scalar
+    };
+
+    Ok(Some(scalar))
+}
+
+/// Fallback scalar tree reduction for cases where intrinsics are unavailable.
+fn codegen_horizontal_reduce_scalar<'ctx>(
+    vec: VectorValue<'ctx>,
+    reduce_op: ReduceOp,
+    scalar_dtype: &DType,
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    builder: &Builder<'ctx>,
+) -> Result<BasicValueEnum<'ctx>> {
+    let vec_len = vec.get_type().get_size() as usize;
 
     // Extract all elements
     let mut elements: Vec<BasicValueEnum<'ctx>> = Vec::with_capacity(vec_len);

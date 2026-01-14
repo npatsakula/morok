@@ -1247,10 +1247,10 @@ fn needs_reduce_devectorize(reduce: &Arc<UOp>) -> bool {
 
     // K-vectorized: CONTRACT source with vector output
     // Bool reduce: matching vcounts, bool dtype, no CONTRACT
-    // Horizontal: source has more elements than output
+    // Horizontal: source has more elements than output (but NOT vector→scalar, codegen handles that)
     has_contract && out_vcount > 1
         || out_vcount > 1 && is_bool && src_vcount == out_vcount
-        || src_vcount > out_vcount && out_vcount >= 1
+        || src_vcount > out_vcount && out_vcount > 1
 }
 
 /// Inline helper: check if REDUCE is K-vectorized (CONTRACT source).
