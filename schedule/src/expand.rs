@@ -339,9 +339,21 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // NOTE: We previously skipped INDEX with Ptr dtype here, but that was incorrect.
-    // Tinygrad's do_expand (expander.py:97-98) DOES expand INDEX operations.
-    // The special handling at lines 50-51 only affects non-UNROLL sources for non-Ptr INDEX.
+    // Skip expanding INDEX operations that return element dtype (not Ptr dtype).
+    // In Morok, INDEX returns element dtype (e.g., Float32 for float buffers).
+    // If we expand it, the dtype becomes <16 x float> which breaks codegen
+    // (expects integer indices, not float vectors).
+    //
+    // This matches Tinygrad's expander.py lines 50-51:
+    //   elif root.op is Ops.INDEX and i >= 1 and not isinstance(root.dtype, PtrDType):
+    //       new_srcs.append(src)  # Pass through without vectorization
+    //
+    // The key insight: Index computes an address (scalar), only Load/Store
+    // handle vectorization of the actual data.
+    if matches!(op, Op::Index { .. }) && !matches!(uop.dtype(), DType::Ptr { .. }) {
+        tracing::debug!("do_expand: skipping INDEX with non-Ptr dtype {:?}", uop.dtype());
+        return None;
+    }
 
     let sources = op.sources();
 
@@ -488,17 +500,22 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     // Compute output dtype: vectorize by expand_sz
-    // REDUCE keeps original dtype - fix_reduce_unroll handles vectorization decision
+    // ALL ops (including REDUCE) get vectorized dtype when expanded.
+    // This matches Tinygrad's do_expand (expander.py:64):
+    //   nsrc = UOp(root.op, root.dtype.scalar().vec(root.dtype.count*expand_sz), ...)
+    //
+    // For REDUCE: Creates N independent accumulators (register blocking).
+    // Each lane accumulates independently, producing N output values.
+    //
+    // NOTE: With K-vectorization disabled, this is the only vectorization path.
+    // fix_reduce_unroll may still set Vector dtype for K-axis UPCAST if enabled,
+    // but that's now opt-in via MOROK_K_VECTORIZE.
     let base_dtype = uop.dtype();
-    let new_dtype = if matches!(op, Op::Reduce { .. }) {
-        base_dtype.clone()
+    let base_count = base_dtype.vcount();
+    let new_dtype = if let Some(scalar) = base_dtype.scalar() {
+        DType::Scalar(scalar).vec(base_count * expand_sz)
     } else {
-        let base_count = base_dtype.vcount();
-        if let Some(scalar) = base_dtype.scalar() {
-            DType::Scalar(scalar).vec(base_count * expand_sz)
-        } else {
-            base_dtype.clone()
-        }
+        base_dtype.clone()
     };
 
     // Create the expanded operation

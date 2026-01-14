@@ -224,6 +224,11 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
 /// We must ensure the unroll factor is compatible with output-per-thread:
 /// - output_per_thread = output_size / thread_count
 /// - If unroll_factor > output_per_thread, the vector store would overflow thread's output slice
+///
+/// When register blocking (4×4 output tiling) is active:
+/// - upcast_size() is already 16 (4×4)
+/// - K-vectorization would create 16×K wide vectors, causing strided B access
+/// - We skip K-unrolling entirely; LLVM can unroll the scalar K loop if beneficial
 pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     let mut applied = false;
     let unrollable = scheduler.unrollable_dims();
@@ -417,118 +422,83 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
     false
 }
 
-/// Apply UPCAST to matmul output dimensions (M, N axes).
+/// Apply matmul-specific 2D output tiling (register blocking).
 ///
-/// Creates register tiling: each thread computes an MxN tile instead of single element.
-/// Combined with K-vectorization: 4x4 output tile × 4 scalar accumulators = 64 ops/K-iter.
+/// For matmul C[M,N] = A[M,K] @ B[K,N], this creates a tile of output elements
+/// that are computed together, amortizing memory loads across multiple outputs.
 ///
-/// Only applies when:
-/// - Matmul pattern detected (REDUCE(ADD) of MUL of INDEX)
-/// - CPU renderer (has_threads, no has_local)
-/// - Output dimensions have size >= 2
-pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
-    use tracing::{debug, trace};
+/// Tinygrad achieves this via 4×4 register blocking:
+/// - 16 scalar accumulators (float acc0[16])
+/// - Each inner loop processes 4 elements of K
+/// - Each thread computes a 4×4 output tile per K-iteration
+///
+/// We achieve the same by applying UPCAST to both M and N output axes:
+/// - UPCAST M by 4 → 4 rows of output
+/// - UPCAST N by 4 → 4 cols of output → 4×4 = 16 outputs
+///
+/// The expansion phase (expand.rs) converts this to 16 independent scalar accumulators.
+/// K-vectorization is disabled by default to avoid strided B matrix access.
+pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    use tracing::debug;
 
-    trace!("apply_matmul_output_upcasting: entry");
-
-    // Check config
-    if !config.output_upcast {
-        trace!("apply_matmul_output_upcasting: skipped (output_upcast=false)");
-        return false;
-    }
-
-    // Only for CPU (same as K-vectorization)
-    if scheduler.renderer().has_local {
-        trace!("apply_matmul_output_upcasting: skipped (has_local)");
-        return false;
-    }
-
-    // Check for matmul pattern
+    // Only apply to matmul patterns
     if !has_matmul_pattern(scheduler) {
-        trace!("apply_matmul_output_upcasting: skipped (no matmul pattern)");
         return false;
     }
 
-    // Skip if already at max combined width (can't add more upcasts)
-    // upcast_size() includes both Upcast and Unroll axes
-    if scheduler.upcast_size() >= 16 {
-        trace!("apply_matmul_output_upcasting: skipped (upcast_size >= 16)");
+    // Skip if output_upcast is disabled in config
+    if !config.output_upcast {
+        debug!("apply_matmul_tiling: skipped (output_upcast disabled)");
         return false;
     }
 
-    // Get output axes (Outer, Global, Loop - not Reduce/GroupReduce)
-    // For reduce kernels (like matmul), output dimensions are OUTER type
-    // Note: Tinygrad uses GLOBAL/LOCAL/LOOP for output dims, but Morok uses OUTER
-    let output_axes = scheduler.axes_of(&[AxisType::Outer, AxisType::Global, AxisType::Loop]);
-    trace!(num_output_axes = output_axes.len(), "apply_matmul_output_upcasting: output axes");
-    if output_axes.is_empty() {
+    let upcastable = scheduler.upcastable_dims();
+    debug!(upcastable = ?upcastable, "apply_matmul_tiling: upcastable dims");
+
+    // Need at least 2 output axes for 2D tiling
+    if upcastable.len() < 2 {
+        debug!("apply_matmul_tiling: not enough upcastable dims (need 2)");
         return false;
     }
 
-    // Collect candidate (axis_idx, size) pairs
-    let candidates: Vec<(usize, i64)> = {
-        let rngs = scheduler.rngs();
-        output_axes
-            .iter()
-            .filter_map(|&axis_idx| {
-                if axis_idx >= rngs.len() {
-                    return None;
-                }
-                let rng = &rngs[axis_idx];
-                if let Op::Range { end, .. } = rng.op()
-                    && let Op::Const(cv) = end.op()
-                    && let morok_ir::ConstValue::Int(size) = cv.0
-                    && size >= 2
-                {
-                    Some((axis_idx, size))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
+    // Get sizes of first two upcastable axes
+    let rngs = scheduler.rngs();
+    let mut axes_to_upcast = Vec::new();
 
-    trace!(num_candidates = candidates.len(), ?candidates, "apply_matmul_output_upcasting: candidates");
+    for &axis_idx in upcastable.iter().take(2) {
+        if axis_idx >= rngs.len() {
+            continue;
+        }
+        if let Op::Range { end, .. } = rngs[axis_idx].op()
+            && let Op::Const(cv) = end.op()
+            && let morok_ir::ConstValue::Int(size) = cv.0
+            && size >= 4
+            && size % 4 == 0
+        {
+            axes_to_upcast.push(axis_idx);
+        }
+    }
 
-    // Apply UPCAST to output dimensions
-    // Target: upcast_product ~= 4 (2x2 tile)
-    // NOTE: Combined with K-vectorization (4x), keep this moderate to avoid excessive vector widths
-    let target_upcast = 4usize;
-    let mut upcast_product = 1usize;
+    if axes_to_upcast.len() < 2 {
+        debug!(found = axes_to_upcast.len(), "apply_matmul_tiling: not enough divisible-by-4 axes");
+        return false;
+    }
+
+    // Apply 4x UPCAST to both axes (creating 4×4 = 16 outputs)
     let mut applied = false;
-
-    for (axis_idx, size) in candidates {
-        if upcast_product >= target_upcast {
-            break;
-        }
-
-        // Try factors [4, 3, 2] in order (power-of-2 preferred)
-        for factor in [4usize, 3, 2] {
-            // Check: size is large enough, divisible by factor (Tinygrad: k.full_shape[axis] % upcast_amount != 0),
-            // local target not exceeded, AND combined width <= 16
-            let combined_ok = scheduler.upcast_size() * factor <= 16;
-            let divisible = size % factor as i64 == 0;
-            if size >= factor as i64 && divisible && upcast_product * factor <= target_upcast && combined_ok {
-                trace!(axis_idx, factor, "apply_matmul_output_upcasting: trying upcast");
-                match apply_opt(scheduler, &Opt::upcast(axis_idx, factor), true) {
-                    Ok(_) => {
-                        upcast_product *= factor;
-                        applied = true;
-                        debug!(axis_idx, factor, upcast_product, "apply_matmul_output_upcasting: applied upcast");
-                        break;
-                    }
-                    Err(e) => {
-                        trace!(axis_idx, factor, error = ?e, "apply_matmul_output_upcasting: upcast failed");
-                    }
-                }
-            }
+    for &axis_idx in &axes_to_upcast {
+        if apply_opt(scheduler, &Opt::upcast(axis_idx, 4), true).is_ok() {
+            debug!(axis = axis_idx, "apply_matmul_tiling: applied UPCAST(4)");
+            applied = true;
         }
     }
 
-    if applied {
-        debug!(upcast_product, "apply_matmul_output_upcasting: SUCCESS");
-    }
     applied
+}
+
+/// Legacy function for compatibility - calls apply_matmul_tiling
+pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    apply_matmul_tiling(scheduler, config)
 }
 
 /// CPU threading for outer parallelizable axes.

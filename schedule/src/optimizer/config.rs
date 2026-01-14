@@ -276,15 +276,16 @@ pub struct HeuristicsConfig {
 
     // Vectorization
     /// Enable K-axis vectorization for matmul.
-    /// When enabled, UPCAST is applied to the reduce (K) axis with scalar accumulators.
-    /// This enables SLP vectorization but prevents direct FMA intrinsic generation.
-    /// Default: true.
+    /// When enabled, UPCAST is applied to the reduce (K) axis creating vector accumulators.
+    /// Disabled by default: K-vectorization complicates output tiling and horizontal reduce.
+    /// Tinygrad doesn't use K-vectorization - they rely on output tiling (register blocking).
+    /// Default: false.
     pub k_vectorize: bool,
 
-    /// Enable output dimension upcasting for matmul.
+    /// Enable output dimension upcasting for matmul (register blocking).
     /// When enabled, UPCAST is applied to M/N axes creating register tiles.
     /// Each thread computes an MxN tile instead of a single element.
-    /// Default: false (experimental - expand/codegen interaction needs work).
+    /// Default: false (blocked by vector width mismatch issue in expand.rs).
     pub output_upcast: bool,
 
     // Debug
@@ -303,13 +304,13 @@ impl HeuristicsConfig {
     /// # Environment Variables
     ///
     /// * `MOROK_THREADS` - Maximum thread count (default: available_parallelism)
-    /// * `MOROK_NO_K_VECTORIZE` - Disable K-axis vectorization (enables direct FMA)
-    /// * `MOROK_NO_OUTPUT_UPCAST` - Disable output dimension upcasting
+    /// * `MOROK_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
+    /// * `MOROK_OUTPUT_UPCAST` - Enable output dimension upcasting (default: disabled)
     pub fn from_env() -> Self {
         let thread_count =
             std::env::var("MOROK_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
-        let k_vectorize = std::env::var("MOROK_NO_K_VECTORIZE").is_err();
-        let output_upcast = std::env::var("MOROK_NO_OUTPUT_UPCAST").is_err();
+        let k_vectorize = std::env::var("MOROK_K_VECTORIZE").is_ok();
+        let output_upcast = std::env::var("MOROK_OUTPUT_UPCAST").is_ok();
 
         Self { thread_count, k_vectorize, output_upcast, ..Default::default() }
     }
@@ -327,7 +328,7 @@ impl Default for HeuristicsConfig {
             unroll_threshold: 32,
             disable_locals: false,
             thread_count: default_thread_count(),
-            k_vectorize: true,
+            k_vectorize: false,
             output_upcast: false,
             debug_level: 0,
         }
@@ -348,7 +349,7 @@ impl HeuristicsConfig {
         #[builder(default = 32)] unroll_threshold: usize,
         #[builder(default = false)] disable_locals: bool,
         #[builder(default = default_thread_count())] thread_count: usize,
-        #[builder(default = true)] k_vectorize: bool,
+        #[builder(default = false)] k_vectorize: bool,
         #[builder(default = false)] output_upcast: bool,
         #[builder(default = 0)] debug_level: u8,
     ) -> Self {

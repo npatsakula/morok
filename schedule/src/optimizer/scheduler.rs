@@ -485,7 +485,8 @@ impl Scheduler {
             .filter_map(|(i, rng)| {
                 if let Op::Range { axis_type, end, .. } = rng.op() {
                     // Check type: GLOBAL/LOCAL/LOOP are upcastable
-                    // (OUTER excluded - it's for schedule expansion, not vectorization)
+                    // (OUTER should be converted to LOOP via convert_outer_to_loop before upcasting)
+                    // (REDUCE axes should use UNROLL instead, not UPCAST)
                     if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
                         return None;
                     }
@@ -965,9 +966,8 @@ impl Scheduler {
     /// the optimizer to apply UPCAST transformations for SIMD operations.
     ///
     /// **Important**: For reduce kernels, OUTER axes represent output dimensions
-    /// and should NOT be converted to LOOP. This aligns with Tinygrad's design
-    /// where OUTER axes remain non-upcastable in reduce kernels. Converting them
-    /// would cause incorrect vectorization across independent reduction lanes.
+    /// and should NOT be converted to LOOP. Converting them causes a vector width
+    /// mismatch in expand.rs when multiple UPCAST axes combine (16 vs 64).
     ///
     /// This is the CPU counterpart to `convert_loop_to_global()` for GPU.
     pub fn convert_outer_to_loop(&mut self) -> Result<(), OptError> {
@@ -980,9 +980,8 @@ impl Scheduler {
         }
 
         // Don't convert OUTER→LOOP in reduce kernels.
-        // In reduce kernels, OUTER axes are output dimensions that should not
-        // be vectorized (each output element needs its own independent reduction).
-        // This matches Tinygrad's architecture where OUTER is never upcastable.
+        // This would enable output tiling, but causes vector width mismatch (16 vs 64)
+        // when multiple UPCAST axes combine in expand.rs.
         if self.reduceop().is_some() {
             debug!("convert_outer_to_loop: skipping (has reduceop)");
             return Ok(());
