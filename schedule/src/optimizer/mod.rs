@@ -234,7 +234,7 @@ pub fn optimize_kernel_with_config(
     config: &OptimizerConfig,
 ) -> Arc<morok_ir::UOp> {
     let optimized = match config.strategy {
-        OptStrategy::None => return ast, // No optimization = no pre_expand needed
+        OptStrategy::None => ast, // No heuristic optimization, but post-optimization still needed
         OptStrategy::Heuristic => optimize_heuristic(ast, renderer, &config.heuristics),
         OptStrategy::Beam { .. } => {
             // Beam search requires a compile_and_time function.
@@ -244,6 +244,8 @@ pub fn optimize_kernel_with_config(
         }
     };
 
+    // apply_post_optimization contains correctness transforms (pm_add_loads wraps INDEX
+    // with LOAD for arithmetic ops) and must run even when optimizations are disabled.
     apply_post_optimization(optimized, config.devectorize_alu)
 }
 

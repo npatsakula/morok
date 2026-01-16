@@ -367,3 +367,320 @@ fn test_print_matmul_64x64_ir() {
         println!();
     }
 }
+
+// ========== Validated Matmul Tests (against ndarray reference) ==========
+
+use ndarray::{Array2, ArrayD};
+
+/// Helper to compare morok result against ndarray reference with tolerance.
+fn assert_matmul_close(actual: &ArrayD<f32>, expected: &Array2<f32>, tol: f32) {
+    let expected_shape: Vec<usize> = expected.shape().to_vec();
+    assert_eq!(actual.shape(), expected_shape.as_slice(), "Shape mismatch");
+
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (a - e).abs() < tol,
+            "Mismatch at index {}: morok={} vs ndarray={} (diff: {})",
+            i,
+            a,
+            e,
+            (a - e).abs()
+        );
+    }
+}
+
+#[test]
+#[tracing_test::traced_test]
+fn test_matmul_validated_2x2() {
+    // Simple 2x2 matmul with known values
+    let a_data = [1.0f32, 2.0, 3.0, 4.0];
+    let b_data = [5.0f32, 6.0, 7.0, 8.0];
+
+    // Compute with morok
+    let a = Tensor::from_slice(a_data).try_reshape(&[2, 2]).unwrap();
+    let b = Tensor::from_slice(b_data).try_reshape(&[2, 2]).unwrap();
+    let c = a.matmul(&b).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    // Compute reference with ndarray
+    let a_nd = Array2::from_shape_vec((2, 2), a_data.to_vec()).unwrap();
+    let b_nd = Array2::from_shape_vec((2, 2), b_data.to_vec()).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    // Expected: [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]] = [[19, 22], [43, 50]]
+    assert_matmul_close(&morok_result, &expected, 1e-5);
+}
+
+#[test]
+fn test_matmul_validated_3x3() {
+    // 3x3 matmul with sequential values
+    let a_data: Vec<f32> = (1..=9).map(|x| x as f32).collect();
+    let b_data: Vec<f32> = (10..=18).map(|x| x as f32).collect();
+
+    let a = Tensor::from_slice(&a_data).try_reshape(&[3, 3]).unwrap();
+    let b = Tensor::from_slice(&b_data).try_reshape(&[3, 3]).unwrap();
+    let c = a.matmul(&b).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let a_nd = Array2::from_shape_vec((3, 3), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((3, 3), b_data).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    assert_matmul_close(&morok_result, &expected, 1e-4);
+}
+
+#[test]
+fn test_matmul_validated_2x3_3x4() {
+    // [2, 3] @ [3, 4] -> [2, 4]
+    let a_data: Vec<f32> = (1..=6).map(|x| x as f32).collect();
+    let b_data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+
+    let a = Tensor::from_slice(&a_data).try_reshape(&[2, 3]).unwrap();
+    let b = Tensor::from_slice(&b_data).try_reshape(&[3, 4]).unwrap();
+    let c = a.matmul(&b).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let a_nd = Array2::from_shape_vec((2, 3), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((3, 4), b_data).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    assert_matmul_close(&morok_result, &expected, 1e-4);
+}
+
+#[test]
+fn test_matmul_validated_tall_wide() {
+    // [4, 2] @ [2, 5] -> [4, 5]
+    let a_data: Vec<f32> = (1..=8).map(|x| x as f32 * 0.5).collect();
+    let b_data: Vec<f32> = (1..=10).map(|x| x as f32 * 0.3).collect();
+
+    let a = Tensor::from_slice(&a_data).try_reshape(&[4, 2]).unwrap();
+    let b = Tensor::from_slice(&b_data).try_reshape(&[2, 5]).unwrap();
+    let c = a.matmul(&b).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let a_nd = Array2::from_shape_vec((4, 2), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((2, 5), b_data).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    assert_matmul_close(&morok_result, &expected, 1e-5);
+}
+
+#[test]
+fn test_matmul_validated_16x16() {
+    // Larger matrix to test vectorization paths
+    const SIZE: usize = 16;
+    let a_data: Vec<f32> = (0..SIZE * SIZE).map(|x| (x as f32) * 0.1).collect();
+    let b_data: Vec<f32> = (0..SIZE * SIZE).map(|x| (x as f32) * 0.05 + 1.0).collect();
+
+    let a = Tensor::from_slice(&a_data).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let b = Tensor::from_slice(&b_data).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let c = a.matmul(&b).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let a_nd = Array2::from_shape_vec((SIZE, SIZE), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((SIZE, SIZE), b_data).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    assert_matmul_close(&morok_result, &expected, 1e-3);
+}
+
+#[test]
+fn test_matmul_validated_32x32() {
+    // Test with 32x32 to exercise more optimization paths
+    const SIZE: usize = 32;
+    let a_data: Vec<f32> = (0..SIZE * SIZE).map(|x| ((x % 17) as f32) * 0.1 - 0.8).collect();
+    let b_data: Vec<f32> = (0..SIZE * SIZE).map(|x| ((x % 13) as f32) * 0.15 - 0.5).collect();
+
+    let a = Tensor::from_slice(&a_data).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let b = Tensor::from_slice(&b_data).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let c = a.matmul(&b).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let a_nd = Array2::from_shape_vec((SIZE, SIZE), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((SIZE, SIZE), b_data).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    assert_matmul_close(&morok_result, &expected, 1e-2);
+}
+
+#[test]
+fn test_matmul_validated_64x64() {
+    // 64x64 test with varied data
+    const SIZE: usize = 64;
+    let a_data: Vec<f32> = (0..SIZE * SIZE).map(|x| ((x as f32) * 0.01).sin()).collect();
+    let b_data: Vec<f32> = (0..SIZE * SIZE).map(|x| ((x as f32) * 0.02).cos()).collect();
+
+    let a = Tensor::from_slice(&a_data).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+    let b = Tensor::from_slice(&b_data).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
+
+    let config = OptimizerConfig::from_env();
+    let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let a_nd = Array2::from_shape_vec((SIZE, SIZE), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((SIZE, SIZE), b_data).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    // Larger tolerance for accumulated floating point error
+    assert_matmul_close(&morok_result, &expected, 1e-1);
+}
+
+#[test]
+fn test_dot_product_validated() {
+    // 1D @ 1D dot product
+    let a_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+    let b_data = [2.0f32, 3.0, 4.0, 5.0, 6.0];
+
+    let a = Tensor::from_slice(a_data);
+    let b = Tensor::from_slice(b_data);
+    let c = a.dot(&b).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    // Expected: 1*2 + 2*3 + 3*4 + 4*5 + 5*6 = 2 + 6 + 12 + 20 + 30 = 70
+    let expected: f32 = a_data.iter().zip(b_data.iter()).map(|(a, b)| a * b).sum();
+
+    assert_eq!(morok_result.ndim(), 0, "Dot product should be scalar");
+    assert!((morok_result[[]] - expected).abs() < 1e-5, "Expected {}, got {}", expected, morok_result[[]]);
+}
+
+#[test]
+fn test_vector_matrix_validated() {
+    // [4] @ [4, 3] -> [3]
+    let v_data = [1.0f32, 2.0, 3.0, 4.0];
+    let m_data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+
+    let v = Tensor::from_slice(v_data);
+    let m = Tensor::from_slice(&m_data).try_reshape(&[4, 3]).unwrap();
+    let c = v.dot(&m).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    // ndarray: need to treat vector as [1, 4] @ [4, 3] -> [1, 3], then squeeze
+    let v_nd = ndarray::Array1::from_vec(v_data.to_vec());
+    let m_nd = Array2::from_shape_vec((4, 3), m_data).unwrap();
+    let expected = v_nd.dot(&m_nd);
+
+    assert_eq!(morok_result.shape(), &[3]);
+    for (i, (a, e)) in morok_result.iter().zip(expected.iter()).enumerate() {
+        assert!((a - e).abs() < 1e-5, "Mismatch at index {}: {} != {}", i, a, e);
+    }
+}
+
+#[test]
+fn test_matrix_vector_validated() {
+    // [3, 4] @ [4] -> [3]
+    let m_data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+    let v_data = [1.0f32, 2.0, 3.0, 4.0];
+
+    let m = Tensor::from_slice(&m_data).try_reshape(&[3, 4]).unwrap();
+    let v = Tensor::from_slice(v_data);
+    let c = m.dot(&v).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let m_nd = Array2::from_shape_vec((3, 4), m_data).unwrap();
+    let v_nd = ndarray::Array1::from_vec(v_data.to_vec());
+    let expected = m_nd.dot(&v_nd);
+
+    assert_eq!(morok_result.shape(), &[3]);
+    for (i, (a, e)) in morok_result.iter().zip(expected.iter()).enumerate() {
+        assert!((a - e).abs() < 1e-5, "Mismatch at index {}: {} != {}", i, a, e);
+    }
+}
+
+#[test]
+fn test_matmul_identity_validated() {
+    // A @ I = A
+    let a_data: Vec<f32> = (1..=16).map(|x| x as f32).collect();
+    let identity = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+    let a = Tensor::from_slice(&a_data).try_reshape(&[4, 4]).unwrap();
+    let i = Tensor::from_slice(identity).try_reshape(&[4, 4]).unwrap();
+    let c = a.matmul(&i).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    // Result should equal original A
+    for (i, (actual, expected)) in morok_result.iter().zip(a_data.iter()).enumerate() {
+        assert!((actual - expected).abs() < 1e-5, "Mismatch at index {}: {} != {}", i, actual, expected);
+    }
+}
+
+#[test]
+fn test_matmul_negative_values_validated() {
+    // Test with negative values to ensure sign handling
+    let a_data = [-1.0f32, 2.0, -3.0, 4.0, -5.0, 6.0];
+    let b_data = [1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0];
+
+    let a = Tensor::from_slice(a_data).try_reshape(&[2, 3]).unwrap();
+    let b = Tensor::from_slice(b_data).try_reshape(&[3, 2]).unwrap().try_transpose(0, 1).unwrap();
+    let b = b.try_transpose(0, 1).unwrap(); // Back to [3, 2] but contiguous
+    let c = a.matmul(&b).unwrap().realize().unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let a_nd = Array2::from_shape_vec((2, 3), a_data.to_vec()).unwrap();
+    let b_nd = Array2::from_shape_vec((3, 2), b_data.to_vec()).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    assert_matmul_close(&morok_result, &expected, 1e-5);
+}
+
+// ========== Large Dimension Validated Tests ==========
+
+use test_case::test_case;
+
+/// Helper to run validated square matmul test for a given size.
+fn run_validated_square_matmul(size: usize, tol: f32) {
+    // Use prime modulos to create varied but reproducible data
+    let a_data: Vec<f32> = (0..size * size).map(|x| ((x % 31) as f32) * 0.05 - 0.8).collect();
+    let b_data: Vec<f32> = (0..size * size).map(|x| ((x % 37) as f32) * 0.04 - 0.7).collect();
+
+    let a = Tensor::from_slice(&a_data).try_reshape(&[size as isize, size as isize]).unwrap();
+    let b = Tensor::from_slice(&b_data).try_reshape(&[size as isize, size as isize]).unwrap();
+
+    let config = OptimizerConfig::from_env();
+    let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let a_nd = Array2::from_shape_vec((size, size), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((size, size), b_data).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    assert_matmul_close(&morok_result, &expected, tol);
+}
+
+/// Helper to run validated non-square matmul test.
+fn run_validated_matmul(m: usize, k: usize, n: usize, tol: f32) {
+    let a_data: Vec<f32> = (0..m * k).map(|x| ((x % 41) as f32) * 0.04 - 0.8).collect();
+    let b_data: Vec<f32> = (0..k * n).map(|x| ((x % 43) as f32) * 0.035 - 0.7).collect();
+
+    let a = Tensor::from_slice(&a_data).try_reshape(&[m as isize, k as isize]).unwrap();
+    let b = Tensor::from_slice(&b_data).try_reshape(&[k as isize, n as isize]).unwrap();
+
+    let config = OptimizerConfig::from_env();
+    let c = a.matmul(&b).unwrap().realize_with(&config).unwrap();
+    let morok_result = c.to_ndarray::<f32>().unwrap();
+
+    let a_nd = Array2::from_shape_vec((m, k), a_data).unwrap();
+    let b_nd = Array2::from_shape_vec((k, n), b_data).unwrap();
+    let expected = a_nd.dot(&b_nd);
+
+    assert_eq!(morok_result.shape(), &[m, n], "Output shape mismatch");
+    assert_matmul_close(&morok_result, &expected, tol);
+}
+
+// Square matrix tests with increasing sizes
+#[test_case(128, 0.5; "128x128")]
+#[test_case(256, 1.0; "256x256")]
+#[test_case(500, 1.5; "500x500 non-power-of-2")]
+#[test_case(512, 2.0; "512x512")]
+#[test_case(1024, 3.0; "1024x1024")]
+fn test_matmul_validated_square(size: usize, tol: f32) {
+    run_validated_square_matmul(size, tol);
+}
+
+// Non-square matrix tests
+#[test_case(512, 256, 384, 2.0; "512x256 @ 256x384")]
+#[test_case(1024, 64, 128, 1.0; "1024x64 @ 64x128 tall-skinny")]
+#[test_case(64, 512, 64, 1.5; "64x512 @ 512x64 wide")]
+#[test_case(256, 1024, 256, 2.5; "256x1024 @ 1024x256 large-K")]
+fn test_matmul_validated_non_square(m: usize, k: usize, n: usize, tol: f32) {
+    run_validated_matmul(m, k, n, tol);
+}

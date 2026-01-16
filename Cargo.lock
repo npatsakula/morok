@@ -1705,6 +1705,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "smallvec",
  "snafu",
+ "test-case",
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",

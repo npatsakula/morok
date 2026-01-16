@@ -748,6 +748,49 @@ fn codegen_cast_scalar<'ctx>(
 // Memory Operations
 // ============================================================================
 
+/// Extract the effective dimension size from an index expression.
+///
+/// After scheduling transforms (shift_to), indices become expressions like:
+/// - `Add(Mul(Thread, stride), Loop)`
+/// - `Add(Mul(Loop, stride), Upcast)`
+///
+/// For such expressions, we need to find all RANGE ops and multiply their sizes
+/// to get the total iteration count for this index dimension.
+fn extract_index_dimension(idx_uop: &Arc<UOp>) -> i64 {
+    use morok_ir::ConstValue;
+
+    // Case 1: Direct RANGE - use its size directly
+    if let Op::Range { end, .. } = idx_uop.op()
+        && let Op::Const(cv) = end.op()
+        && let ConstValue::Int(size) = cv.0
+    {
+        return size;
+    }
+
+    // Case 2: DefineVar - use max_val + 1
+    if let Op::DefineVar { max_val, .. } = idx_uop.op() {
+        return *max_val + 1;
+    }
+
+    // Case 3: Expression containing RANGE ops (from shift_to transforms)
+    // Multiply all RANGE sizes in the expression to get total iteration count
+    let mut product = 1i64;
+    for node in idx_uop.toposort() {
+        if let Op::Range { end, .. } = node.op()
+            && let Op::Const(cv) = end.op()
+            && let ConstValue::Int(size) = cv.0
+        {
+            product *= size;
+        }
+    }
+
+    if product > 1 {
+        return product;
+    }
+
+    // Fallback: unknown dimension (single element)
+    1
+}
 fn codegen_memory<'ctx>(
     uop: &Arc<UOp>,
     context: &'ctx Context,
@@ -810,22 +853,8 @@ fn codegen_memory<'ctx>(
                 Ok(Some(ptr.into()))
             } else {
                 // Multi-index: linearize at codegen time
-                // Extract dimensions from Range.end or DefineVar.max_val
-                let dims: Vec<i64> = indices
-                    .iter()
-                    .map(|idx_uop| {
-                        if let Op::Range { end, .. } = idx_uop.op()
-                            && let Op::Const(cv) = end.op()
-                            && let ConstValue::Int(size) = cv.0
-                        {
-                            return size;
-                        }
-                        if let Op::DefineVar { max_val, .. } = idx_uop.op() {
-                            return *max_val + 1;
-                        }
-                        1 // fallback for unknown dimensions
-                    })
-                    .collect();
+                // Extract dimensions from Range.end, DefineVar.max_val, or expressions
+                let dims: Vec<i64> = indices.iter().map(extract_index_dimension).collect();
 
                 // Compute row-major strides
                 let mut strides = vec![1i64; dims.len()];

@@ -257,7 +257,9 @@ impl Tensor {
                     SInt::Const(n) => UOp::index_const(*n as i64),
                     SInt::Symbolic(var) => var.clone(),
                 };
-                UOp::range_axis(end, AxisId::Unrenumbered(i), AxisType::Outer)
+                // Use Loop type (not Outer) so ranges are compatible with rangeify.
+                // Outer is for special cases like vmap batching, not normal computation.
+                UOp::range_axis(end, AxisId::Unrenumbered(i), AxisType::Loop)
             })
             .collect();
 
