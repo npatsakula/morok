@@ -175,7 +175,7 @@ fn rewrite_bool_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 2. GEP(VECTORIZE) → element extraction (simplifies GEPs on VECTORIZE)
 /// 3. GEP(CAT) → reorder (only scalar sources after step 1)
 /// 4. GEP(PTRCAT) → reorder pointers
-fn gep_ptrcat_patterns() -> TypedPatternMatcher {
+pub(crate) fn gep_ptrcat_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         // === CAT → VECTORIZE (Tinygrad symbolic.py:169-171) ===
         // CAT can't be rendered. Expand to VECTORIZE with element-wise GEPs.
@@ -459,7 +459,7 @@ pub fn pm_vectorize_normalize() -> TypedPatternMatcher {
 }
 
 /// Phase 1 patterns: expand vector INDEX into grouped PTRCAT.
-fn expand_index_patterns() -> TypedPatternMatcher {
+pub(crate) fn expand_index_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         // INDEX(buffer, vector_index) with vector index → expand and group
         index if is_vector_index(index) => |index| expand_vector_index(index),
@@ -467,7 +467,7 @@ fn expand_index_patterns() -> TypedPatternMatcher {
 }
 
 /// Phase 2 patterns: distribute PTRCAT and split LOAD/STORE.
-fn load_store_patterns() -> TypedPatternMatcher {
+pub(crate) fn load_store_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         // Distribute PTRCAT through LOAD: LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
         load if is_ptrcat_load(load) => |load| distribute_ptrcat_load(load),

@@ -1,4 +1,5 @@
 pub mod dce;
+pub mod devectorize;
 pub mod expand;
 pub mod optimizer;
 pub mod pattern;
