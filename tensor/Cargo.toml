@@ -18,7 +18,7 @@ smallvec = "1.15"
 ndarray.workspace = true
 papaya = "0.2.3"
 parking_lot = "0.12"
-tracing = "0.1.43"
+tracing = "0.1"
 tikv-jemallocator = "0.6.1"
 
 [features]
@@ -27,7 +27,7 @@ default = []
 tracing-verbose = []
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 tracing-subscriber = "0.3.22"
 tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
 

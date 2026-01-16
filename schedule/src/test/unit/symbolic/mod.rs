@@ -429,28 +429,43 @@ fn test_noop_cast_same_dtype() {
 }
 
 #[test]
-fn test_double_cast_collapse() {
-    // Test: x.cast(Float32).cast(Int32) -> x.cast(Int32)
+fn test_double_cast_collapse_safe() {
+    // Test: x.cast(Int32).cast(Int16) -> x.cast(Int16)
+    // This is SAFE because Int32 can represent all Int16 values.
     let matcher = symbolic_simple();
-    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let x = UOp::var("x", DType::Int16, 0, i16::MAX as i64);
 
-    // First cast: Int32 -> Float32
-    let inner_cast = UOp::cast(x.clone(), DType::Float32);
+    // First cast: Int16 -> Int32 (widening, safe)
+    let inner_cast = UOp::cast(x.clone(), DType::Int32);
 
-    // Second cast: Float32 -> Int32
-    let outer_cast = UOp::cast(inner_cast, DType::Int32);
+    // Second cast: Int32 -> Int16 (narrowing back)
+    let outer_cast = UOp::cast(inner_cast, DType::Int16);
 
     let result = matcher.rewrite(&outer_cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be a single cast from x to Int32
-        if let Op::Cast { src, dtype } = rewritten.op() {
-            assert!(std::sync::Arc::ptr_eq(src, &x));
-            assert_eq!(*dtype, DType::Int32);
-        } else {
-            panic!("Expected Cast, got {:?}", rewritten.op());
-        }
+        // Should simplify to just x (since x is already Int16 and intermediate was safe)
+        assert!(std::sync::Arc::ptr_eq(&rewritten, &x), "Expected x, got {:?}", rewritten.op());
     }
+}
+
+#[test]
+fn test_double_cast_no_collapse_unsafe() {
+    // Test: x.cast(Float32).cast(Int32) should NOT collapse
+    // This is UNSAFE because Float32 cannot exactly represent all Int32 values
+    // (Float32 has only 23 mantissa bits, so integers > 2^24 may lose precision)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+
+    // First cast: Int32 -> Float32 (potential precision loss for large integers)
+    let inner_cast = UOp::cast(x.clone(), DType::Float32);
+
+    // Second cast: Float32 -> Int32
+    let outer_cast = UOp::cast(inner_cast.clone(), DType::Int32);
+
+    let result = matcher.rewrite(&outer_cast, &mut ());
+    // Should NOT be rewritten because the intermediate Float32 can't hold all Int32 values
+    assert!(matches!(result, RewriteResult::NoMatch), "Unsafe double cast should NOT collapse: Int32->Float32->Int32");
 }
 
 #[test]

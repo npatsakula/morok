@@ -252,18 +252,14 @@ pub fn buffer_folding() -> TypedPatternMatcher {
 }
 
 /// Pattern matcher for dead axis removal.
+///
+/// Based on Tinygrad's cleanup_dead_axes (rangeify.py:123-142).
+/// When dead axes are removed from BUFFERIZE, preserves shape via RESHAPE + EXPAND.
 pub fn dead_axis_removal() -> TypedPatternMatcher {
     crate::patterns! {
-        // Filter dead axes from BUFFERIZE - inline the logic
-        Bufferize { compute, ranges, opts } => |compute, ranges, opts| {
-            let live_ranges: Vec<_> = ranges.iter().filter(|r| !is_dead_axis(r)).map(Arc::clone).collect();
-            if live_ranges.len() < ranges.len() {
-                if live_ranges.is_empty() {
-                    return Some(compute.clone());
-                }
-                return Some(UOp::bufferize(compute.clone(), live_ranges, opts.clone()));
-            }
-            None
+        // Filter dead axes from BUFFERIZE with shape preservation
+        bufferize @ Bufferize { compute, ranges, opts } => |bufferize, compute, ranges, opts| {
+            cleanup_dead_axes_bufferize(bufferize, compute, ranges, opts)
         },
         // Adjust INDEX indices when BUFFERIZE has dead axes - use nested struct pattern
         Index { buffer: buffer @ Bufferize { ranges: buf_ranges, .. }, indices, gate: _ }
@@ -290,6 +286,88 @@ pub fn dead_axis_removal() -> TypedPatternMatcher {
             None
         },
     }
+}
+
+/// Clean up dead axes from BUFFERIZE with shape preservation.
+///
+/// Based on Tinygrad's cleanup_dead_axes (rangeify.py:123-142).
+/// When removing dead axes (ranges with size 1 or ranges not used by compute):
+/// 1. Create new BUFFERIZE with only live ranges
+/// 2. RESHAPE to insert size-1 dims for dead axes
+/// 3. EXPAND to restore original shape
+///
+/// This preserves shape semantics for downstream operations.
+fn cleanup_dead_axes_bufferize(
+    bufferize: &Arc<UOp>,
+    compute: &Arc<UOp>,
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
+    opts: &BufferizeOpts,
+) -> Option<Arc<UOp>> {
+    use morok_ir::SInt;
+    use morok_ir::shape::Shape;
+
+    // Don't optimize ALWAYS_RUN_OPS (CONTIGUOUS, COPY, ASSIGN)
+    if matches!(compute.op(), Op::Contiguous { .. } | Op::Copy { .. } | Op::Assign { .. }) {
+        return None;
+    }
+
+    // Get original BUFFERIZE shape (now available after Fix 1)
+    let original_shape = bufferize.shape().ok().flatten()?;
+
+    // Get compute's ranges to check if a range is used
+    let compute_ranges = compute.ranges();
+
+    let mut new_ranges = Vec::new();
+    let mut reshape_dims: Shape = SmallVec::new();
+    let mut had_dead = false;
+
+    for (i, range) in ranges.iter().enumerate() {
+        // Skip symbolic ranges (non-const end) - Tinygrad TODO
+        if let Op::Range { end, .. } = range.op()
+            && !matches!(end.op(), Op::Const(_))
+        {
+            return None;
+        }
+
+        // A range is dead if:
+        // 1. It's a CONST (already dead)
+        // 2. OR it's a RANGE with size 1
+        // 3. OR it's a RANGE not in compute's ranges
+        let is_const = matches!(range.op(), Op::Const(_));
+        let is_size_one = is_dead_axis(range);
+        let is_unused = matches!(range.op(), Op::Range { .. }) && !compute_ranges.iter().any(|r| Arc::ptr_eq(r, range));
+
+        if is_const || is_size_one || is_unused {
+            reshape_dims.push(SInt::Const(1)); // Dead axis → size 1
+            had_dead = true;
+        } else {
+            // Live axis: keep range and original dimension
+            new_ranges.push(Arc::clone(range));
+            if let Some(dim) = original_shape.get(i) {
+                reshape_dims.push(dim.clone());
+            } else {
+                return None; // Shape mismatch
+            }
+        }
+    }
+
+    if !had_dead {
+        return None;
+    }
+
+    // If all ranges are dead, just return compute
+    if new_ranges.is_empty() {
+        return Some(compute.clone());
+    }
+
+    // Create BUFFERIZE with fewer ranges
+    let reduced = UOp::bufferize(compute.clone(), new_ranges, opts.clone());
+
+    // RESHAPE to insert size-1 dims for dead axes
+    let reshaped = reduced.try_reshape(&reshape_dims).ok()?;
+
+    // EXPAND to restore original shape
+    reshaped.try_expand(original_shape).ok()
 }
 
 // ============================================================================

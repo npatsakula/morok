@@ -36,41 +36,38 @@ fn test_bufferize_all_dead_axes() {
 }
 
 #[test]
-fn test_bufferize_mixed_live_dead() {
-    // BUFFERIZE(x, [RANGE(10), RANGE(1), RANGE(20)]) should keep only live axes
+fn test_bufferize_mixed_live_dead_simple_compute() {
+    // When compute is DEFINE_GLOBAL (has no ranges), ALL ranges are considered dead
+    // because compute doesn't depend on any of them. This matches Tinygrad's behavior.
+    // BUFFERIZE(DEFINE_GLOBAL, [RANGE(10), RANGE(1), RANGE(20)]) → DEFINE_GLOBAL
     let x = UOp::define_global(1, DType::Float32);
-    let live_range1 = UOp::range_const(10, 0);
-    let dead_range = UOp::range_const(1, 1); // Dead
-    let live_range2 = UOp::range_const(20, 2);
+    let range1 = UOp::range_const(10, 0);
+    let dead_range = UOp::range_const(1, 1);
+    let range2 = UOp::range_const(20, 2);
 
-    let bufferized = UOp::bufferize_global(x.clone(), vec![live_range1.clone(), dead_range, live_range2.clone()]);
+    let bufferized = UOp::bufferize_global(x.clone(), vec![range1, dead_range, range2]);
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
-    // Result should be BUFFERIZE with only live ranges
-    if let Op::Bufferize { ranges, .. } = result.op() {
-        assert_eq!(ranges.len(), 2, "Should have 2 live ranges");
-        assert!(Arc::ptr_eq(&ranges[0], &live_range1), "First live range should be preserved");
-        assert!(Arc::ptr_eq(&ranges[1], &live_range2), "Second live range should be preserved");
-    } else {
-        panic!("Expected BUFFERIZE after dead axis removal");
-    }
+    // All ranges are dead (compute doesn't use them), so return compute directly
+    assert!(Arc::ptr_eq(&result, &x), "When compute has no ranges, all BUFFERIZE ranges are dead → return compute");
 }
 
 #[test]
-fn test_bufferize_no_dead_axes() {
-    // BUFFERIZE(x, [RANGE(10), RANGE(20)]) should remain unchanged
+fn test_bufferize_no_dead_axes_simple_compute() {
+    // With DEFINE_GLOBAL compute (no ranges), ALL BUFFERIZE ranges are dead
+    // because compute doesn't depend on them. This matches Tinygrad's behavior.
     let x = UOp::define_global(1, DType::Float32);
-    let live_ranges = vec![UOp::range_const(10, 0), UOp::range_const(20, 1)];
+    let ranges = vec![UOp::range_const(10, 0), UOp::range_const(20, 1)];
 
-    let bufferized = UOp::bufferize_global(x.clone(), live_ranges);
+    let bufferized = UOp::bufferize_global(x.clone(), ranges);
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
-    // Should remain unchanged (no dead axes to remove)
-    assert!(Arc::ptr_eq(&result, &bufferized), "No dead axes means no changes");
+    // All ranges are dead → return compute directly
+    assert!(Arc::ptr_eq(&result, &x), "When compute has no ranges, all BUFFERIZE ranges are dead");
 }
 
 // Pattern 2: INDEX Adjustment Tests
@@ -124,6 +121,7 @@ fn test_bufferize_dead_axis_with_constants() {
 #[test]
 fn test_multiple_dead_axis_removal_passes() {
     // Test that multiple passes of dead axis removal work correctly
+    // With DEFINE_GLOBAL compute (no ranges), ALL ranges are dead → returns compute
     let x = UOp::define_global(1, DType::Float32);
     let live_range = UOp::range_const(10, 0);
     let dead_range1 = UOp::range_const(1, 1);
@@ -139,13 +137,8 @@ fn test_multiple_dead_axis_removal_passes() {
     // Both should produce same result (idempotent)
     assert!(Arc::ptr_eq(&result1, &result2), "Dead axis removal should be idempotent");
 
-    // Result should have only the live range
-    if let Op::Bufferize { ranges, .. } = result1.op() {
-        assert_eq!(ranges.len(), 1, "Should have 1 live range");
-        assert!(Arc::ptr_eq(&ranges[0], &live_range), "Live range should be preserved");
-    } else {
-        panic!("Expected BUFFERIZE after dead axis removal");
-    }
+    // All ranges are dead (compute doesn't use them) → return compute directly
+    assert!(Arc::ptr_eq(&result1, &x), "When compute has no ranges, all BUFFERIZE ranges are dead → return compute");
 }
 
 #[test]

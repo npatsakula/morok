@@ -60,7 +60,11 @@ pub fn constant_folding_dsl_patterns() -> TypedPatternMatcher {
 /// Identity and zero propagation patterns.
 ///
 /// - Identity folding: x + 0 → x, 0 + x → x, x * 1 → x, 1 * x → x, etc.
-/// - Zero propagation: x * 0 → 0, 0 * x → 0, x & 0 → 0, 0 & x → 0
+/// - Zero propagation: x * 0 → 0 (non-float only), x & 0 → 0
+///
+/// NOTE: For floats, x * 0 is NOT simplified because IEEE 754 requires:
+/// - NaN * 0 = NaN
+/// - Inf * 0 = NaN
 pub fn identity_and_zero_patterns() -> TypedPatternMatcher {
     patterns! {
         // ========== Identity folding (commutative) ==========
@@ -75,7 +79,12 @@ pub fn identity_and_zero_patterns() -> TypedPatternMatcher {
         Fdiv(x, @one) ~> |x| x.clone(),
 
         // ========== Zero propagation ==========
-        Mul[_, zero @ @zero] ~> |zero| zero.clone(),
+        // NOTE: For floats, x * 0 is NOT always 0 due to IEEE 754 special values:
+        //   - NaN * 0 = NaN
+        //   - Inf * 0 = NaN
+        // Therefore we only apply this optimization for non-float types.
+        // Integer and boolean types are safe since they have no special values.
+        Mul[x, zero @ @zero] if !x.dtype().is_float() ~> |zero| zero.clone(),
         And[_, zero @ @zero] ~> |zero| zero.clone(),
     }
 }
@@ -444,11 +453,20 @@ pub fn range_based_mod_div_patterns() -> TypedPatternMatcher {
 
 /// Division simplification patterns.
 ///
+/// - 0 / 0 → NaN (float division by zero of zero)
+/// - (x * 0) / 0 → NaN (any expression that reduces to 0/0)
 /// - x / x → 1.0 (float division)
 /// - (x * y) / y → x
 /// - (x * y) // y → x
 pub fn division_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
+        // 0 / 0 → NaN (IEEE 754: 0/0 is indeterminate)
+        // NOTE: This must come before x/x → 1 pattern to take priority
+        Fdiv(zero1 @ @zero, @zero) if zero1.dtype().is_float()
+            => |zero1| Some(UOp::const_(zero1.dtype(), ConstValue::Float(f64::NAN))),
+        // (x * 0) / 0 → NaN (anything times zero divided by zero is NaN)
+        Fdiv(Mul[_, zero1 @ @zero], @zero) if zero1.dtype().is_float()
+            => |zero1| Some(UOp::const_(zero1.dtype(), ConstValue::Float(f64::NAN))),
         // x / x → 1.0 (float division)
         Fdiv(x, x) => |x| x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
         // (x * y) / y → x
@@ -458,19 +476,115 @@ pub fn division_dsl_patterns() -> TypedPatternMatcher {
     }
 }
 
+/// Check if casting from `from` to `to` can safely preserve all values.
+///
+/// Returns true if all values representable in `to` can be represented in `from`.
+/// This is used for double-cast optimization: x.cast(a).cast(b) → x.cast(b)
+/// is only safe if `a` can hold all values of `b` (so no truncation occurs in `a`).
+fn can_safe_cast(to: &DType, from: &DType) -> bool {
+    use morok_dtype::ScalarDType;
+
+    // Get base scalar types for comparison
+    let to_scalar = match to {
+        DType::Scalar(s) => *s,
+        DType::Vector { scalar, .. } => *scalar,
+        _ => return false,
+    };
+    let from_scalar = match from {
+        DType::Scalar(s) => *s,
+        DType::Vector { scalar, .. } => *scalar,
+        _ => return false,
+    };
+
+    // Same type is always safe
+    if to_scalar == from_scalar {
+        return true;
+    }
+
+    // Get bit widths and signedness
+    let (to_bits, to_signed, to_float) = match to_scalar {
+        ScalarDType::Bool => (1, false, false),
+        ScalarDType::Int8 => (8, true, false),
+        ScalarDType::Int16 => (16, true, false),
+        ScalarDType::Int32 => (32, true, false),
+        ScalarDType::Int64 => (64, true, false),
+        ScalarDType::UInt8 => (8, false, false),
+        ScalarDType::UInt16 => (16, false, false),
+        ScalarDType::UInt32 => (32, false, false),
+        ScalarDType::UInt64 => (64, false, false),
+        ScalarDType::Float16 | ScalarDType::BFloat16 => (16, true, true),
+        ScalarDType::Float32 => (32, true, true),
+        ScalarDType::Float64 => (64, true, true),
+        _ => return false,
+    };
+    let (from_bits, from_signed, from_float) = match from_scalar {
+        ScalarDType::Bool => (1, false, false),
+        ScalarDType::Int8 => (8, true, false),
+        ScalarDType::Int16 => (16, true, false),
+        ScalarDType::Int32 => (32, true, false),
+        ScalarDType::Int64 => (64, true, false),
+        ScalarDType::UInt8 => (8, false, false),
+        ScalarDType::UInt16 => (16, false, false),
+        ScalarDType::UInt32 => (32, false, false),
+        ScalarDType::UInt64 => (64, false, false),
+        ScalarDType::Float16 | ScalarDType::BFloat16 => (16, true, true),
+        ScalarDType::Float32 => (32, true, true),
+        ScalarDType::Float64 => (64, true, true),
+        _ => return false,
+    };
+
+    // Float <-> int conversions are not safe
+    if to_float != from_float {
+        return false;
+    }
+
+    // For floats: larger precision can hold smaller
+    if to_float {
+        return from_bits >= to_bits;
+    }
+
+    // For integers:
+    // - Same signedness: larger width can hold smaller
+    // - Unsigned to signed: need one extra bit (e.g., u8 fits in i16)
+    // - Signed to unsigned: never safe (negative values lost)
+    if to_signed == from_signed {
+        return from_bits >= to_bits;
+    }
+
+    if !to_signed && from_signed {
+        // unsigned → signed: from needs to be at least 1 bit larger
+        return from_bits > to_bits;
+    }
+
+    // signed → unsigned: never safe
+    false
+}
+
 /// Cast optimization patterns.
 ///
 /// - cast(const) → const (constant folding)
 /// - x.cast(dtype) → x if same dtype (noop cast)
-/// - x.cast(a).cast(b) → x.cast(b) (collapse double cast)
+/// - x.cast(a).cast(b) → x.cast(b) when safe (collapse double cast)
+///
+/// NOTE: Double cast is only safe when the intermediate type `a` can hold all
+/// values of the final type `b`. Example of UNSAFE collapse:
+///   int64.cast(int8).cast(int64) → int64  // WRONG: loses truncation!
 pub fn cast_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // cast(const) → const
         Cast { src: _c @const(c_val), dtype } => |c_val, dtype| c_val.cast(dtype).map(|v| UOp::const_(dtype.clone(), v)),
         // x.cast(dtype) → x if same dtype
         Cast { src: x, dtype } if x.dtype() == *dtype ~> |x| x.clone(),
-        // x.cast(a).cast(b) → x.cast(b)
-        Cast { src: Cast { src: x, .. }, dtype } ~> |x, dtype| UOp::cast(x.clone(), dtype.clone()),
+        // x.cast(a).cast(b) → x when x.dtype == b and a preserves all values of b
+        // This handles cases like: bool.cast(int32).cast(bool) → bool
+        Cast { src: Cast { src: x, dtype: intermediate }, dtype: outer }
+            if x.dtype() == *outer && can_safe_cast(outer, intermediate)
+            ~> |x| x.clone(),
+        // x.cast(a).cast(b) → x.cast(b) when a doesn't narrow x
+        // This handles widening chains: int8.cast(int32).cast(int64) → int8.cast(int64)
+        Cast { src: Cast { src: x, dtype: intermediate }, dtype: outer }
+            if can_safe_cast(&x.dtype(), intermediate)
+            ~> |x, outer| UOp::cast(x.clone(), outer.clone()),
     }
 }
 

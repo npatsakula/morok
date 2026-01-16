@@ -68,6 +68,157 @@ fn is_full_reduction_reduce(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>) -> bool 
     !ranges.iter().any(contains_output_range)
 }
 
+/// Check if a VECTORIZE represents a broadcast (all elements are identical).
+///
+/// A broadcast VECTORIZE has the form: VECTORIZE([x, x, x, ...]) where all elements
+/// point to the same UOp.
+fn is_broadcast_vectorize(uop: &Arc<UOp>) -> bool {
+    let Op::Vectorize { elements } = uop.op() else {
+        return false;
+    };
+    if elements.is_empty() {
+        return false;
+    }
+    let first = &elements[0];
+    elements.iter().skip(1).all(|e| Arc::ptr_eq(e, first))
+}
+
+/// Extract the source and count from a broadcast VECTORIZE.
+///
+/// Returns (source, count) if this is a broadcast VECTORIZE, None otherwise.
+fn get_broadcast_source_and_count(uop: &Arc<UOp>) -> Option<(Arc<UOp>, usize)> {
+    let Op::Vectorize { elements } = uop.op() else {
+        return None;
+    };
+    if elements.is_empty() {
+        return None;
+    }
+    let first = &elements[0];
+    if elements.iter().skip(1).all(|e| Arc::ptr_eq(e, first)) { Some((first.clone(), elements.len())) } else { None }
+}
+
+/// Check if an END op's computation is a broadcast VECTORIZE.
+fn is_broadcast_vectorize_computation(end: &Arc<UOp>) -> bool {
+    let Op::End { computation, .. } = end.op() else {
+        return false;
+    };
+    is_broadcast_vectorize(computation)
+}
+
+/// Push AFTER inside broadcast: AFTER(VECTORIZE([x;n]), deps) → VECTORIZE([AFTER(x, deps);n])
+///
+/// Based on Tinygrad expander.py:84:
+///   (UPat.var("x").broadcast(name="b").after(name="a", allow_any_len=True),
+///    lambda x,b,a: x.after(*a.src[1:]).broadcast(len(b.src)))
+fn push_broadcast_through_after(after: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::After { passthrough, deps } = after.op() else {
+        return None;
+    };
+
+    // Check if passthrough is a broadcast VECTORIZE
+    let (src, count) = get_broadcast_source_and_count(passthrough)?;
+
+    // Create AFTER(src, deps) and broadcast it
+    let inner_after = UOp::after(src, deps.clone());
+
+    // Create VECTORIZE with count copies of inner_after
+    let elements: SmallVec<[Arc<UOp>; 4]> = std::iter::repeat_n(inner_after, count).collect();
+    Some(UOp::vectorize(elements))
+}
+
+/// Push END inside broadcast: END(VECTORIZE([x;n]), ranges) → VECTORIZE([END(x, ranges);n])
+///
+/// Based on Tinygrad expander.py:85:
+///   (UPat.var("x").broadcast(name="b").end(name="a", allow_any_len=True),
+///    lambda x,b,a: x.end(*a.src[1:]).broadcast(len(b.src)))
+fn push_broadcast_through_end(end: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::End { computation, ranges } = end.op() else {
+        return None;
+    };
+
+    // Check if computation is a broadcast VECTORIZE
+    let (src, count) = get_broadcast_source_and_count(computation)?;
+
+    // Create END(src, ranges) and broadcast it
+    let inner_end = UOp::end(src, ranges.clone());
+
+    // Create VECTORIZE with count copies of inner_end
+    let elements: SmallVec<[Arc<UOp>; 4]> = std::iter::repeat_n(inner_end, count).collect();
+    Some(UOp::vectorize(elements))
+}
+
+/// Expand BARRIER with UNROLL source: push BARRIER inside UNROLL.
+///
+/// Based on Tinygrad expander.py:101-102:
+///   (UPat(Ops.BARRIER, src=(UPat(Ops.UNROLL, name="ex"),)),
+///    lambda ex: UOp(Ops.UNROLL, src=(UOp(Ops.BARRIER, src=ex.src),)*len(ex.src), arg=ex.arg))
+///
+/// BARRIERs aren't expanded like other ops - instead the BARRIER is moved inside the UNROLL.
+fn expand_barrier_unroll(barrier: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Barrier { src, deps } = barrier.op() else {
+        return None;
+    };
+
+    // Check if src is UNROLL
+    let Op::Unroll { src: inner, unroll_axes } = src.op() else {
+        return None;
+    };
+
+    // Create BARRIER wrapping the inner source
+    let inner_barrier = UOp::new(Op::Barrier { src: inner.clone(), deps: deps.clone() }, inner.dtype());
+
+    // Wrap in UNROLL with same axes
+    Some(UOp::unroll(inner_barrier, unroll_axes.clone()))
+}
+
+/// Fix BUFFERIZE with UNROLL sources by wrapping them in CONTRACT.
+///
+/// Based on Tinygrad expander.py:91-92:
+///   (UPat(Ops.BUFFERIZE, src=(UPat(Ops.UNROLL), UPat(Ops.UNROLL)), name="x"),
+///    lambda x: x.replace(src=tuple(UOp(Ops.CONTRACT, dtype=s.dtype.vec(x.src[1].src[0].dtype.count),
+///                                      src=(s,), arg=x.src[1].arg) for s in x.src)))
+///
+/// When BUFFERIZE has two UNROLL sources, wrap each in CONTRACT using the second UNROLL's axes.
+fn fix_bufferize_unroll(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Bufferize { compute, ranges, opts } = bufferize.op() else {
+        return None;
+    };
+
+    // Check if compute is UNROLL
+    let Op::Unroll { src: _, unroll_axes: _ } = compute.op() else {
+        return None;
+    };
+
+    // Check if we have at least one range that is UNROLL
+    let unroll_range = ranges.iter().find(|r| matches!(r.op(), Op::Unroll { .. }))?;
+    let Op::Unroll { src: _, unroll_axes: range_axes } = unroll_range.op() else {
+        return None;
+    };
+
+    // Get the contract axes from the range UNROLL
+    let contract_axes = range_axes.clone();
+
+    // Wrap compute in CONTRACT
+    let contracted_compute = UOp::contract(compute.clone(), contract_axes.clone());
+
+    // Wrap each UNROLL range in CONTRACT, pass through non-UNROLL ranges
+    let contracted_ranges: SmallVec<[Arc<UOp>; 4]> = ranges
+        .iter()
+        .map(|r| {
+            if matches!(r.op(), Op::Unroll { .. }) {
+                UOp::contract(r.clone(), contract_axes.clone())
+            } else {
+                r.clone()
+            }
+        })
+        .collect();
+
+    Some(UOp::new(
+        Op::Bufferize { compute: contracted_compute, ranges: contracted_ranges, opts: opts.clone() },
+        bufferize.dtype(),
+    ))
+}
+
 // ============================================================================
 // Swizzle Helpers (ported from Tinygrad's expander.py:8-20)
 // ============================================================================
@@ -75,7 +226,7 @@ fn is_full_reduction_reduce(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>) -> bool 
 /// Compute linear index from axis positions (row-major, reverse iteration).
 ///
 /// Based on Tinygrad's `_expand_arg_to_idx` (expander.py:8-13).
-fn expand_arg_to_idx(args: &[(usize, usize)], rpk: &HashMap<usize, usize>) -> usize {
+pub fn expand_arg_to_idx(args: &[(usize, usize)], rpk: &HashMap<usize, usize>) -> usize {
     let mut idx = 0;
     let mut mul = 1;
     for &(axis, m) in args.iter().rev() {
@@ -90,7 +241,7 @@ fn expand_arg_to_idx(args: &[(usize, usize)], rpk: &HashMap<usize, usize>) -> us
 /// Based on Tinygrad's `_choices_from_args` (expander.py:15-16).
 /// For args = [(0, 2), (1, 3)], generates:
 /// [{0: 0, 1: 0}, {0: 0, 1: 1}, {0: 0, 1: 2}, {0: 1, 1: 0}, ...]
-fn choices_from_args(args: &[(usize, usize)]) -> Vec<HashMap<usize, usize>> {
+pub fn choices_from_args(args: &[(usize, usize)]) -> Vec<HashMap<usize, usize>> {
     let mut result = vec![HashMap::new()];
     for &(axis, m) in args {
         result = result
@@ -112,7 +263,7 @@ fn choices_from_args(args: &[(usize, usize)]) -> Vec<HashMap<usize, usize>> {
 /// Based on Tinygrad's `_swizzle_args` (expander.py:18-20).
 /// Maps indices from expansion layout (cargs) to source layout (eargs),
 /// zeroing out any axes in exclude_args.
-fn swizzle_args(cargs: &[(usize, usize)], eargs: &[(usize, usize)], exclude_args: &[usize]) -> Vec<usize> {
+pub fn swizzle_args(cargs: &[(usize, usize)], eargs: &[(usize, usize)], exclude_args: &[usize]) -> Vec<usize> {
     choices_from_args(cargs)
         .into_iter()
         .map(|rpk| {
@@ -189,7 +340,7 @@ fn phase1_range_to_unroll() -> TypedPatternMatcher {
 /// Phase 2: Fix REDUCE/STORE and expand all operations using UNROLL.
 ///
 /// Based on Tinygrad's expander TypedPatternMatcher (expander.py:84-108).
-fn phase2_expand() -> TypedPatternMatcher {
+pub fn phase2_expand() -> TypedPatternMatcher {
     // Pattern order MUST match Tinygrad's pm_pre_expander + expander order:
     // 1. convert_range_to_unroll (Range → UNROLL)
     // 2. fix_reduce_unroll (REDUCE with UNROLL → CONTRACT(REDUCE))
@@ -201,7 +352,23 @@ fn phase2_expand() -> TypedPatternMatcher {
     // Otherwise do_expand processes STORE first, changing the tree structure.
     crate::patterns! {
         // =====================================================================
-        // Phase 2a: Range conversion (pm_pre_expander pattern 1)
+        // Phase 2a: Push broadcast through AFTER/END (Tinygrad expander.py:84-85)
+        // =====================================================================
+        // These patterns push AFTER and END inside broadcast (VECTORIZE with all same elements).
+        // This is necessary for WMMA and complex kernel generation.
+
+        // Push AFTER inside broadcast: AFTER(VECTORIZE([x;n]), deps) → VECTORIZE([AFTER(x, deps);n])
+        after if matches!(after.op(), Op::After { .. }) => |after| {
+            push_broadcast_through_after(after)
+        },
+
+        // Push END inside broadcast: END(VECTORIZE([x;n]), ranges) → VECTORIZE([END(x, ranges);n])
+        end if matches!(end.op(), Op::End { .. }) && is_broadcast_vectorize_computation(end) => |end| {
+            push_broadcast_through_end(end)
+        },
+
+        // =====================================================================
+        // Phase 2b: Range conversion (pm_pre_expander pattern 1)
         // =====================================================================
 
         // Convert Range(Upcast) or Range(Unroll) to UNROLL op
@@ -226,15 +393,14 @@ fn phase2_expand() -> TypedPatternMatcher {
         // Handle END with UNROLL ranges
         end @ End(_, ..) => |end| end_unrolls(end),
 
-        // =====================================================================
-        // Phase 2c: Lift UNROLL out of Binary for proper propagation
-        // =====================================================================
-        // Must run BEFORE do_expand so parent ops see UNROLL as direct source.
-        // Converts Binary(op, X, UNROLL) → UNROLL(Binary(op, X, unwrap))
-        binary if is_binary_with_single_unroll(binary) => |binary| lift_unroll_from_binary(binary),
+        // BUFFERIZE with two UNROLL sources: wrap both in CONTRACT
+        // (Tinygrad expander.py:91-92)
+        bufferize if matches!(bufferize.op(), Op::Bufferize { .. }) => |bufferize| {
+            fix_bufferize_unroll(bufferize)
+        },
 
         // =====================================================================
-        // Phase 2d: Core expansion (expander patterns)
+        // Phase 2c: Core expansion (expander patterns)
         // =====================================================================
 
         // Collapse nested UNROLL BEFORE do_expand (Tinygrad: expander.py:94-95)
@@ -248,6 +414,12 @@ fn phase2_expand() -> TypedPatternMatcher {
 
         // Contract UNROLL via GEP extraction
         contract @ Contract(_, ..) => |contract| do_contract(contract),
+
+        // BARRIER with UNROLL source: push BARRIER inside UNROLL
+        // (Tinygrad expander.py:101-102 - "BARRIERs aren't actually expanded")
+        barrier if matches!(barrier.op(), Op::Barrier { .. }) => |barrier| {
+            expand_barrier_unroll(barrier)
+        },
 
         // =====================================================================
         // Phase 2e: Cleanup
@@ -1187,86 +1359,6 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     None
-}
-
-/// Check if Binary has exactly one UNROLL source (for pattern guard).
-fn is_binary_with_single_unroll(uop: &Arc<UOp>) -> bool {
-    if let Op::Binary(op, left, right) = uop.op() {
-        let left_is_unroll = matches!(left.op(), Op::Unroll { .. });
-        let right_is_unroll = matches!(right.op(), Op::Unroll { .. });
-        let result = left_is_unroll != right_is_unroll; // XOR: exactly one is UNROLL
-        if result {
-            tracing::debug!(
-                op = ?op,
-                left_is_unroll = left_is_unroll,
-                right_is_unroll = right_is_unroll,
-                "is_binary_with_single_unroll: MATCHED"
-            );
-        }
-        result
-    } else {
-        false
-    }
-}
-
-/// Lift UNROLL out of Binary expressions for proper expansion propagation.
-///
-/// Pattern: Binary(op, non_unroll, UNROLL(src, axes)) → UNROLL(Binary(op, non_unroll, src), axes)
-///
-/// This ensures UNROLL is at the outer level so has_unroll_input() can see it
-/// and do_expand() can propagate vectorization to parent operations.
-fn lift_unroll_from_binary(binary: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Binary(op, left, right) = binary.op() else { return None };
-
-    // Skip comparisons - they need both operands expanded, which do_expand handles.
-    // If we lift UNROLL here, the non-UNROLL operand (e.g., input load) won't get expanded.
-    if op.is_comparison() {
-        return None;
-    }
-
-    let left_is_unroll = matches!(left.op(), Op::Unroll { .. });
-    let right_is_unroll = matches!(right.op(), Op::Unroll { .. });
-
-    // Only handle single UNROLL case (both UNROLL is handled by do_expand)
-    if left_is_unroll == right_is_unroll {
-        return None;
-    }
-
-    let (unroll_axes, unroll_inner, non_unroll, unroll_on_left) = if left_is_unroll {
-        let Op::Unroll { src, unroll_axes } = left.op() else { return None };
-        (unroll_axes.clone(), src.clone(), right.clone(), true)
-    } else {
-        let Op::Unroll { src, unroll_axes } = right.op() else { return None };
-        (unroll_axes.clone(), src.clone(), left.clone(), false)
-    };
-
-    // Compute expansion size from UNROLL inner dtype
-    let expand_sz = unroll_inner.dtype().vcount();
-
-    tracing::debug!(
-        op = ?op,
-        unroll_axes = ?unroll_axes,
-        unroll_on_left = unroll_on_left,
-        expand_sz = expand_sz,
-        binary_dtype = ?binary.dtype(),
-        unroll_inner_dtype = ?unroll_inner.dtype(),
-        non_unroll_dtype = ?non_unroll.dtype(),
-        "lift_unroll_from_binary: LIFTING"
-    );
-
-    // Create new Binary with unwrapped UNROLL source (preserve operand order)
-    let (new_left, new_right) = if unroll_on_left {
-        (unroll_inner.clone(), non_unroll.clone())
-    } else {
-        (non_unroll.clone(), unroll_inner.clone())
-    };
-
-    // Use unroll_inner's dtype - for non-comparison ops, the result dtype matches operand dtype
-    let scalar_dtype = to_scalar_dtype(unroll_inner.dtype());
-    let new_binary = UOp::new(Op::Binary(*op, new_left, new_right), unroll_inner.dtype());
-
-    // UNROLL wrapper must use scalar dtype to avoid wrapper_count inflation during GEP swizzle
-    Some(UOp::unroll_with_dtype(new_binary, unroll_axes.to_vec(), scalar_dtype))
 }
 
 /// Collapse nested UNROLL operations.

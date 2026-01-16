@@ -598,13 +598,54 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             None => None,
         },
 
+        // BUFFERIZE shape is derived from ranges (like Tinygrad)
+        // Shape = [end_0, end_1, ...] where end_i is the size of each range
+        Op::Bufferize { ranges, .. } => {
+            let mut dims: Shape = SmallVec::new();
+            for range in ranges.iter() {
+                match range.op() {
+                    // Range: shape dim = end (the upper bound)
+                    Op::Range { end, .. } => {
+                        // Try to get constant value from end
+                        if let Op::Const(val) = end.op() {
+                            match val.0 {
+                                ConstValue::Int(v) if v >= 0 => {
+                                    dims.push(SInt::Const(v as usize));
+                                    continue;
+                                }
+                                ConstValue::UInt(v) => {
+                                    dims.push(SInt::Const(v as usize));
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Fall back to symbolic
+                        dims.push(SInt::Symbolic(end.clone()));
+                    }
+                    // CONST range (already dead axis) has size from vmax+1
+                    Op::Const(val) => {
+                        match val.0 {
+                            ConstValue::Int(v) if v >= 0 => {
+                                dims.push(SInt::Const((v + 1) as usize)); // vmax+1 for shape
+                            }
+                            ConstValue::UInt(v) => {
+                                dims.push(SInt::Const((v + 1) as usize)); // vmax+1 for shape
+                            }
+                            _ => return Ok(None), // Can't determine shape
+                        }
+                    }
+                    // Other range types: use symbolic
+                    _ => {
+                        dims.push(SInt::Symbolic(range.clone()));
+                    }
+                }
+            }
+            Some(dims)
+        }
+
         // These have no shape
-        Op::Bufferize { .. }
-        | Op::Index { .. }
-        | Op::Load { .. }
-        | Op::LoadGated { .. }
-        | Op::Store { .. }
-        | Op::StoreGated { .. } => None,
+        Op::Index { .. } | Op::Load { .. } | Op::LoadGated { .. } | Op::Store { .. } | Op::StoreGated { .. } => None,
 
         // =====================================================================
         // Control flow - no static shape

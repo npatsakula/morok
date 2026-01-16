@@ -224,6 +224,8 @@ fn test_dead_axis_removal_mixed_axes() {
     let matcher = patterns::dead_axis_removal();
 
     // Create BUFFERIZE with mix of live and dead axes
+    // NOTE: When compute is native_const (no ranges), ALL ranges are dead
+    // because compute doesn't depend on any of them (Tinygrad behavior)
     let x = UOp::native_const(1.0f32);
     let live_range_end = UOp::index_const(10);
     let live_range = UOp::range_axis(live_range_end, AxisId::Renumbered(0), AxisType::Loop);
@@ -231,29 +233,32 @@ fn test_dead_axis_removal_mixed_axes() {
     let dead_range_end = UOp::index_const(1);
     let dead_range = UOp::range_axis(dead_range_end, AxisId::Renumbered(1), AxisType::Loop);
 
-    let bufferize = UOp::bufferize(x, vec![live_range.clone(), dead_range], BufferizeOpts::local());
+    let bufferize = UOp::bufferize(x.clone(), vec![live_range.clone(), dead_range], BufferizeOpts::local());
 
     let result = matcher.rewrite(&bufferize, &mut ());
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            if let Op::Bufferize { ranges, .. } = rewritten.op() {
-                // Should have removed the dead axis
-                assert!(ranges.len() <= 2, "Should have at most the same number of ranges");
-                // Ideally should have 1 range (live_range only)
-            }
+            // Since compute has no ranges, ALL ranges are dead → return compute directly
+            assert!(
+                Arc::ptr_eq(&rewritten, &x),
+                "When compute has no ranges, all BUFFERIZE ranges are dead → return compute"
+            );
         }
         _ => {
-            // Also acceptable depending on implementation
+            // Pattern should match and rewrite when there are dead axes
+            panic!("Expected pattern to match and rewrite");
         }
     }
 }
 
 #[test]
-fn test_dead_axis_removal_no_dead_axes() {
+fn test_dead_axis_removal_no_dead_axes_simple_compute() {
     let matcher = patterns::dead_axis_removal();
 
-    // Create BUFFERIZE with all live axes
+    // Create BUFFERIZE with "live" axes (size > 1), but simple compute (no ranges)
+    // NOTE: When compute is native_const (no ranges), ALL ranges are dead
+    // because compute doesn't depend on any of them (Tinygrad behavior)
     let x = UOp::native_const(1.0f32);
     let range1_end = UOp::index_const(10);
     let range1 = UOp::range_axis(range1_end, AxisId::Renumbered(0), AxisType::Loop);
@@ -261,12 +266,20 @@ fn test_dead_axis_removal_no_dead_axes() {
     let range2_end = UOp::index_const(20);
     let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
-    let bufferize = UOp::bufferize(x, vec![range1, range2], BufferizeOpts::local());
+    let bufferize = UOp::bufferize(x.clone(), vec![range1, range2], BufferizeOpts::local());
 
     let result = matcher.rewrite(&bufferize, &mut ());
 
-    // Should not match since there are no dead axes
-    assert!(matches!(result, RewriteResult::NoMatch), "Should not match when no dead axes");
+    // All ranges are dead (compute has no ranges) → should return compute directly
+    match result {
+        RewriteResult::Rewritten(rewritten) => {
+            assert!(
+                Arc::ptr_eq(&rewritten, &x),
+                "When compute has no ranges, all BUFFERIZE ranges are dead → return compute"
+            );
+        }
+        _ => panic!("Expected pattern to match and rewrite when all ranges are dead"),
+    }
 }
 
 // ===== buffer_removal Pattern Tests =====

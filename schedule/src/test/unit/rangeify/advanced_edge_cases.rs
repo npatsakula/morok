@@ -123,6 +123,9 @@ fn test_deeply_nested_bufferize() {
 
 #[test]
 fn test_bufferize_multiple_consumers() {
+    use morok_ir::SInt;
+    use morok_ir::shape::Shape;
+
     // Test single BUFFERIZE with multiple consumers
     // Pattern: buf = BUFFERIZE(x); y = f(buf); z = g(buf)
 
@@ -130,10 +133,17 @@ fn test_bufferize_multiple_consumers() {
     let range = create_range(10, 0);
     let buf = create_bufferize(compute, vec![range]);
 
-    // Two independent consumers of the same buffer
-    let consumer1 = buf.try_add(&UOp::native_const(2.0f32)).unwrap();
+    // Get BUFFERIZE shape and broadcast constants to match
+    // BUFFERIZE now has shape [10], so we need to reshape [] -> [1] -> expand [10]
+    let buf_shape = buf.shape().unwrap().unwrap();
+    let ones_shape: Shape = buf_shape.iter().map(|_| SInt::Const(1)).collect();
 
-    let consumer2 = buf.try_mul(&UOp::native_const(3.0f32)).unwrap();
+    // Two independent consumers of the same buffer
+    let const2 = UOp::native_const(2.0f32).try_reshape(&ones_shape).unwrap().try_expand(buf_shape).unwrap();
+    let consumer1 = buf.try_add(&const2).unwrap();
+
+    let const3 = UOp::native_const(3.0f32).try_reshape(&ones_shape).unwrap().try_expand(buf_shape).unwrap();
+    let consumer2 = buf.try_mul(&const3).unwrap();
 
     // Combine consumers with SINK
     let sink = UOp::sink(vec![consumer1, consumer2]);

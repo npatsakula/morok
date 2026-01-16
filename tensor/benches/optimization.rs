@@ -6,7 +6,7 @@
 //! Run with: `cargo bench -p morok-tensor`
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use morok_schedule::{OptStrategy, OptimizerConfig};
+use morok_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig};
 use morok_tensor::Tensor;
 
 /// Create a test matrix of given size with sequential values.
@@ -26,7 +26,10 @@ fn bench_matmul(c: &mut Criterion) {
     let mut executor = morok_runtime::global_executor();
 
     // Typed optimizer configurations (no environment variables needed)
-    let heuristic_config = OptimizerConfig::default();
+    let heuristic_config = OptimizerConfig::builder()
+        .strategy(OptStrategy::Heuristic)
+        .heuristics(HeuristicsConfig::builder().thread_count(4).build())
+        .build();
     const BEAM_WIDTH: usize = 3;
     let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build();
 

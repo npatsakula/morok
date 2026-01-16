@@ -14,8 +14,8 @@ enum_delegate.workspace = true
 
 snafu = "0.8"
 parking_lot = "0.12"
-once_cell = "1.20"
-smallvec = "1.13"
+once_cell = "1.21"
+smallvec = "1.15"
 tracing = "0.1"
 cudarc = { version = "0.17", features = ["cuda-13000"], optional = true }
 

@@ -915,6 +915,33 @@ fn ptr_element_count(ptr: &Arc<UOp>) -> usize {
 // split_load_store: Split by fold length divisibility
 // ============================================================================
 
+/// Get device-specific fold lengths for vectorized memory operations.
+///
+/// Based on Tinygrad's devectorizer.py:138-155 which uses different fold lengths
+/// based on device capabilities:
+/// - DSP: [128, 64, 32, 16, 8, 4] for high-throughput DSP operations
+/// - AMX: [16, 8, 4, 2] for Apple AMX matrix coprocessor
+/// - Image dtypes: [4] for image memory operations
+/// - Default: [4, 2] for float4 support on most GPUs
+///
+/// TODO: Add device parameter when device context is threaded through patterns.
+/// For now, uses conservative default that works across devices.
+fn get_device_fold_lengths(load_dtype: &DType) -> Vec<usize> {
+    // Check for image dtype (always use [4] for image operations)
+    if let DType::Ptr { base, .. } = load_dtype
+        && matches!(base.as_ref(), DType::Image { .. })
+    {
+        return vec![4, 1];
+    }
+
+    // Default fold lengths for float4 support
+    // TODO: When device info is available, use device-specific lengths:
+    // - DSP: [128, 64, 32, 16, 8, 4]
+    // - AMX: [16, 8, 4, 2]
+    // - Half precision with ALLOW_HALF8: [8, 4, 2]
+    vec![4, 2, 1]
+}
+
 /// Split LOAD based on fold length divisibility.
 ///
 /// Based on Tinygrad's split_load_store (devectorizer.py:130-174).
@@ -939,9 +966,8 @@ fn split_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     tracing::debug!(sz = sz, "split_load: processing LOAD(CAST(INDEX))");
 
-    // Determine fold lengths (based on device capability)
-    // Default: [4, 2, 1] for float4 support
-    let mut lengths: Vec<usize> = vec![4, 2, 1];
+    // Determine fold lengths (based on device capability and dtype)
+    let mut lengths = get_device_fold_lengths(&load.dtype());
 
     // Filter by offset divisibility (Issue 4: conservative default)
     if let Some(offset) = indices.first() {
@@ -1020,8 +1046,8 @@ fn split_store(store: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     tracing::debug!(sz = sz, "split_store: processing STORE(CAST(INDEX), ...)");
 
-    // Determine fold lengths
-    let mut lengths: Vec<usize> = vec![4, 2, 1];
+    // Determine fold lengths (based on device capability and dtype)
+    let mut lengths = get_device_fold_lengths(&value.dtype());
 
     // Filter by offset divisibility (Issue 4: conservative default)
     if let Some(offset) = indices.first() {
