@@ -118,6 +118,97 @@ impl UOp {
         self.dtype.clone()
     }
 
+    /// Get pointer dtype components if this UOp has a Ptr dtype.
+    ///
+    /// Returns `(base, addrspace, size)` for Ptr types, None otherwise.
+    /// This simplifies pattern matching on pointer types.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use morok_ir::UOp;
+    /// # use morok_dtype::{DType, AddrSpace, DeviceSpec};
+    /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
+    /// if let Some((base, addrspace, size)) = buffer.ptrdtype() {
+    ///     assert_eq!(*base, DType::Float32);
+    ///     assert_eq!(addrspace, AddrSpace::Global);
+    /// }
+    /// ```
+    pub fn ptrdtype(&self) -> Option<(&DType, morok_dtype::AddrSpace, Option<usize>)> {
+        match &self.dtype {
+            DType::Ptr { base, addrspace, size, .. } => Some((base.as_ref(), *addrspace, *size)),
+            _ => None,
+        }
+    }
+
+    /// Create a copy of this UOp with a different dtype.
+    ///
+    /// If the dtype is unchanged, returns self (clone of Arc).
+    /// This is the Rust equivalent of Tinygrad's `buf.replace(dtype=x)`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use morok_ir::UOp;
+    /// # use morok_dtype::DType;
+    /// let int_const = UOp::const_(DType::Int32, morok_ir::ConstValue::Int(5));
+    /// let float_const = int_const.with_dtype(DType::Float32);
+    /// assert_eq!(float_const.dtype(), DType::Float32);
+    /// ```
+    pub fn with_dtype(self: &Arc<Self>, dtype: DType) -> Arc<Self> {
+        if self.dtype == dtype {
+            return self.clone();
+        }
+        Self::new(self.op.clone(), dtype)
+    }
+
+    /// Walk through AFTER nodes to get the passthrough value.
+    ///
+    /// This is the Rust equivalent of Tinygrad's `.or_after()` pattern.
+    /// Recursively unwraps AFTER nodes to find the underlying value.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Given: AFTER(AFTER(value, [dep1]), [dep2])
+    /// // Returns: value
+    /// let inner = wrapped.unwrap_after();
+    /// ```
+    pub fn unwrap_after(self: &Arc<Self>) -> Arc<Self> {
+        match self.op() {
+            Op::After { passthrough, .. } => passthrough.unwrap_after(),
+            _ => self.clone(),
+        }
+    }
+
+    /// Walk through CAST nodes to get the inner value.
+    ///
+    /// This is the Rust equivalent of Tinygrad's `.or_casted()` pattern.
+    /// Recursively unwraps CAST nodes to find the underlying value.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Given: CAST(CAST(value, dtype1), dtype2)
+    /// // Returns: value
+    /// let inner = casted.unwrap_cast();
+    /// ```
+    pub fn unwrap_cast(self: &Arc<Self>) -> Arc<Self> {
+        match self.op() {
+            Op::Cast { src, .. } => src.unwrap_cast(),
+            _ => self.clone(),
+        }
+    }
+
+    /// Alias for `with_sources()` for Tinygrad API parity.
+    ///
+    /// Creates a new UOp with the same operation type and dtype, but with
+    /// the provided sources replacing the original ones.
+    pub fn with_src(self: &Arc<Self>, new_srcs: Vec<Arc<Self>>) -> Arc<Self> {
+        self.with_sources(new_srcs)
+    }
+
     /// Get the shape of this UOp.
     ///
     /// Shape is computed lazily on first access and cached.
@@ -943,15 +1034,6 @@ impl UOp {
                 }
                 Op::Wmma { a: new_a, b: new_b, c: new_c, metadata: metadata.clone() }
             }
-            Op::LoadGated { buffer, index, gate } => {
-                let new_buffer = buffer.substitute(map);
-                let new_index = index.substitute(map);
-                let new_gate = gate.substitute(map);
-                if Arc::ptr_eq(&new_buffer, buffer) && Arc::ptr_eq(&new_index, index) && Arc::ptr_eq(&new_gate, gate) {
-                    return self.clone();
-                }
-                Op::LoadGated { buffer: new_buffer, index: new_index, gate: new_gate }
-            }
             Op::Store { buffer, index, value, ranges } => {
                 let new_buffer = buffer.substitute(map);
                 let new_index = index.substitute(map);
@@ -965,28 +1047,6 @@ impl UOp {
                     return self.clone();
                 }
                 Op::Store { buffer: new_buffer, index: new_index, value: new_value, ranges: new_ranges }
-            }
-            Op::StoreGated { buffer, index, value, gate, ranges } => {
-                let new_buffer = buffer.substitute(map);
-                let new_index = index.substitute(map);
-                let new_value = value.substitute(map);
-                let new_gate = gate.substitute(map);
-                let new_ranges: SmallVec<[Arc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
-                if Arc::ptr_eq(&new_buffer, buffer)
-                    && Arc::ptr_eq(&new_index, index)
-                    && Arc::ptr_eq(&new_value, value)
-                    && Arc::ptr_eq(&new_gate, gate)
-                    && ranges.iter().zip(&new_ranges).all(|(old, new)| Arc::ptr_eq(old, new))
-                {
-                    return self.clone();
-                }
-                Op::StoreGated {
-                    buffer: new_buffer,
-                    index: new_index,
-                    value: new_value,
-                    gate: new_gate,
-                    ranges: new_ranges,
-                }
             }
 
             // Variable-arity operations
@@ -1132,7 +1192,7 @@ impl UOp {
                 other => other.clone(),
             },
             // LOAD returns element type (actual value)
-            Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } => match &buffer.dtype {
+            Op::Load { buffer, .. } => match &buffer.dtype {
                 DType::Ptr { base, .. } => (**base).clone(),
                 other => other.clone(),
             },
@@ -1408,10 +1468,6 @@ impl UOp {
                 assert_eq!(new_srcs.len(), 2);
                 Op::Load { buffer: src(0), index: src(1) }
             }
-            Op::LoadGated { .. } => {
-                assert_eq!(new_srcs.len(), 3);
-                Op::LoadGated { buffer: src(0), index: src(1), gate: src(2) }
-            }
             Op::Store { .. } => {
                 assert!(new_srcs.len() >= 3, "Store requires at least 3 sources (buffer, index, value)");
                 Op::Store {
@@ -1419,16 +1475,6 @@ impl UOp {
                     index: src(1),
                     value: src(2),
                     ranges: new_srcs[3..].iter().cloned().collect(),
-                }
-            }
-            Op::StoreGated { .. } => {
-                assert!(new_srcs.len() >= 4, "StoreGated requires at least 4 sources (buffer, index, value, gate)");
-                Op::StoreGated {
-                    buffer: src(0),
-                    index: src(1),
-                    value: src(2),
-                    gate: src(3),
-                    ranges: new_srcs[4..].iter().cloned().collect(),
                 }
             }
 
@@ -1446,7 +1492,7 @@ impl UOp {
                 other => other.clone(),
             },
             // LOAD returns element type (actual value)
-            Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } => match &buffer.dtype {
+            Op::Load { buffer, .. } => match &buffer.dtype {
                 DType::Ptr { base, .. } => (**base).clone(),
                 other => other.clone(),
             },

@@ -557,11 +557,7 @@ fn test_handle_after_local_buffer_not_tracked() {
     let mut ctx = KernelContext::new();
 
     // Create a local buffer (DEFINE_LOCAL with Ptr{Local} dtype)
-    let local_dtype = DType::Ptr {
-        base: Box::new(DType::Scalar(ScalarDType::Float32)),
-        addrspace: AddrSpace::Local,
-        size: Some(1024),
-    };
+    let local_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Local);
     let local_buf = UOp::define_local(1, local_dtype);
 
     // Wrap in AFTER operation
@@ -588,11 +584,7 @@ fn test_handle_after_global_buffer_tracked() {
     let mut ctx = KernelContext::new();
 
     // Create a global buffer (DEFINE_GLOBAL with Ptr{Global} dtype)
-    let global_dtype = DType::Ptr {
-        base: Box::new(DType::Scalar(ScalarDType::Float32)),
-        addrspace: AddrSpace::Global,
-        size: Some(1024),
-    };
+    let global_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global);
     let global_buf = UOp::define_global(1, global_dtype);
 
     // Wrap in AFTER operation
@@ -620,11 +612,7 @@ fn test_handle_after_mstack_with_local_buffer() {
     let mut ctx = KernelContext::new();
 
     // Create local buffer
-    let local_dtype = DType::Ptr {
-        base: Box::new(DType::Scalar(ScalarDType::Float32)),
-        addrspace: AddrSpace::Local,
-        size: Some(512),
-    };
+    let local_dtype = DType::Float32.ptr(Some(512), AddrSpace::Local);
     let local_buf1 = UOp::define_local(1, local_dtype.clone());
     let local_buf2 = UOp::define_local(2, local_dtype.clone());
 
@@ -657,8 +645,7 @@ fn test_handle_after_mselect_with_local_buffer() {
     let mut ctx = KernelContext::new();
 
     // Create local buffer
-    let local_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Int32)), addrspace: AddrSpace::Local, size: Some(256) };
+    let local_dtype = DType::Int32.ptr(Some(256), AddrSpace::Local);
     let local_buf = UOp::define_local(3, local_dtype.clone());
 
     // Create MSELECT
@@ -690,16 +677,8 @@ fn test_handle_after_mixed_address_spaces() {
     let mut ctx = KernelContext::new();
 
     // Create both local and global buffers
-    let local_dtype = DType::Ptr {
-        base: Box::new(DType::Scalar(ScalarDType::Float32)),
-        addrspace: AddrSpace::Local,
-        size: Some(128),
-    };
-    let global_dtype = DType::Ptr {
-        base: Box::new(DType::Scalar(ScalarDType::Float32)),
-        addrspace: AddrSpace::Global,
-        size: Some(128),
-    };
+    let local_dtype = DType::Float32.ptr(Some(128), AddrSpace::Local);
+    let global_dtype = DType::Float32.ptr(Some(128), AddrSpace::Global);
 
     let local_buf = UOp::define_local(10, local_dtype);
     let global_buf = UOp::define_global(11, global_dtype);

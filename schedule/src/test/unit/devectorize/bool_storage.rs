@@ -48,31 +48,6 @@ fn test_bool_load_to_uint8() {
     }
 }
 
-/// Test: LoadGated<bool> converts to CAST(LoadGated<uint8>, bool).
-#[test]
-fn test_bool_load_gated() {
-    let buffer = create_bool_buffer(64);
-    let gate = create_bool_const(true);
-    let index = create_index(buffer.clone(), 0);
-
-    // Create gated bool load
-    let load = UOp::load_gated(buffer.clone(), index, gate);
-    assert_eq!(load.dtype().base(), ScalarDType::Bool);
-
-    let result = apply_phase3(&load);
-
-    // Should be CAST(LoadGated<uint8>, bool)
-    match result.op() {
-        Op::Cast { src, dtype } => {
-            assert_eq!(dtype.base(), ScalarDType::Bool);
-            assert!(matches!(src.op(), Op::LoadGated { .. }));
-            assert_eq!(src.dtype().base(), ScalarDType::UInt8);
-        }
-        Op::LoadGated { .. } => {}
-        other => panic!("Expected CAST(LoadGated) or LoadGated, got {:?}", other),
-    }
-}
-
 /// Test: Non-bool LOAD remains unchanged.
 #[test]
 fn test_non_bool_load_unchanged() {
@@ -132,33 +107,6 @@ fn test_bool_store_to_uint8() {
             }
         }
         other => panic!("Expected STORE, got {:?}", other),
-    }
-}
-
-/// Test: StoreGated with bool value converts correctly.
-#[test]
-fn test_bool_store_gated() {
-    let buffer = create_bool_buffer(64);
-    let gate = create_bool_const(true);
-    let index = create_index(buffer.clone(), 0);
-    let bool_val = create_bool_const(false);
-
-    let store = UOp::store_gated(buffer.clone(), index, bool_val, gate);
-
-    let result = apply_phase3(&store);
-
-    match result.op() {
-        Op::StoreGated { value, .. } => {
-            // Value should be cast to uint8
-            match value.op() {
-                Op::Cast { dtype, .. } => {
-                    assert_eq!(dtype.base(), ScalarDType::UInt8);
-                }
-                Op::Const(_) => {}
-                other => panic!("Expected CAST or Const value, got {:?}", other),
-            }
-        }
-        other => panic!("Expected StoreGated, got {:?}", other),
     }
 }
 

@@ -2,7 +2,7 @@
 //!
 //! This module contains operations for memory access:
 //! - Indexing: index, index_gated, pointer_index, slice
-//! - Memory access: load, load_gated, store, store_gated
+//! - Memory access: load, store (gate is on INDEX, not LOAD/STORE)
 //! - Device operations: copy, copy_to_device
 //! - Bufferization: bufferize, bufferize_global, bufferize_local
 //! - Memory definitions: define_global, define_local, define_reg
@@ -64,6 +64,23 @@ impl UOp {
         };
         let indices = SmallVec::from_vec(indices);
         Ok(Self::new(Op::Index { buffer, indices, gate: Some(gate) }, element_dtype))
+    }
+
+    /// Create an INDEX that returns the buffer's pointer dtype (Tinygrad's `ptr=True`).
+    ///
+    /// Unlike `index()` which returns the element dtype, this returns the full
+    /// pointer dtype. Used in devectorize when building PTRCAT chains.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // buf.index(idx, ptr=True) in Tinygrad
+    /// let ptr_index = UOp::index_ptr(buffer, vec![idx], None);
+    /// assert!(matches!(ptr_index.dtype(), DType::Ptr { .. }));
+    /// ```
+    pub fn index_ptr(buffer: Arc<Self>, indices: Vec<Arc<Self>>, gate: Option<Arc<Self>>) -> Arc<Self> {
+        let ptr_dtype = buffer.dtype();
+        Self::new(Op::Index { buffer, indices: SmallVec::from_vec(indices), gate }, ptr_dtype)
     }
 
     /// Create a pointer index operation (pointer arithmetic).
@@ -131,6 +148,26 @@ impl UOp {
     }
 
     // =========================================================================
+    // Index Helpers
+    // =========================================================================
+
+    /// Wrap index with validity condition.
+    ///
+    /// This is the Rust equivalent of Tinygrad's `idx.valid(cond)`.
+    /// Creates WHERE(cond, self, Invalid) to mark conditional index validity.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Create a conditionally valid index
+    /// let valid_idx = idx.valid(cond);
+    /// // Equivalent to: WHERE(cond, idx, INVALID)
+    /// ```
+    pub fn valid(self: &Arc<Self>, cond: Arc<Self>) -> Arc<Self> {
+        UOp::try_where(cond, self.clone(), UOp::invalid_marker()).expect("valid: WHERE construction failed")
+    }
+
+    // =========================================================================
     // Memory Access Operations
     // =========================================================================
 
@@ -138,6 +175,8 @@ impl UOp {
     ///
     /// Loads a value from a buffer at the given index.
     /// The result dtype is the element type (base of the Ptr dtype).
+    ///
+    /// For gated loads, use an INDEX with a gate (INDEX has optional gate field).
     pub fn load(buffer: Arc<Self>, index: Arc<Self>) -> Arc<Self> {
         // Get the element type from the buffer's Ptr dtype
         let dtype = match &buffer.dtype {
@@ -148,25 +187,12 @@ impl UOp {
         Self::new(Op::Load { buffer, index }, dtype)
     }
 
-    /// Create a gated LOAD operation.
-    ///
-    /// Loads a value from a buffer at the given index, conditionally based on gate.
-    /// If gate is false, the load may be skipped or return undefined.
-    /// The result dtype is the element type (base of the Ptr dtype).
-    pub fn load_gated(buffer: Arc<Self>, index: Arc<Self>, gate: Arc<Self>) -> Arc<Self> {
-        // Get the element type from the buffer's Ptr dtype
-        let dtype = match &buffer.dtype {
-            DType::Ptr { base, .. } => (**base).clone(),
-            // Fallback: if buffer isn't a Ptr, use its dtype directly
-            other => other.clone(),
-        };
-        Self::new(Op::LoadGated { buffer, index, gate }, dtype)
-    }
-
     /// Create a STORE operation without ranges.
     ///
     /// Stores a value to a buffer at the given index.
     /// For stores with ranges (e.g., output upcasting), use `store_with_ranges`.
+    ///
+    /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
     pub fn store(buffer: Arc<Self>, index: Arc<Self>, value: Arc<Self>) -> Arc<Self> {
         Self::store_with_ranges(buffer, index, value, SmallVec::new())
     }
@@ -179,6 +205,8 @@ impl UOp {
     ///
     /// Ranges are used for output upcasting: Range(Upcast) becomes UNROLL
     /// during expansion, which `fix_store_unroll` contracts via CONTRACT.
+    ///
+    /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
     pub fn store_with_ranges(
         buffer: Arc<Self>,
         index: Arc<Self>,
@@ -186,27 +214,6 @@ impl UOp {
         ranges: SmallVec<[Arc<Self>; 4]>,
     ) -> Arc<Self> {
         Self::new(Op::Store { buffer, index, value, ranges }, DType::Void)
-    }
-
-    /// Create a gated STORE operation without ranges.
-    ///
-    /// Stores a value to a buffer at the given index, conditionally based on gate.
-    /// If gate is false, the store may be skipped.
-    pub fn store_gated(buffer: Arc<Self>, index: Arc<Self>, value: Arc<Self>, gate: Arc<Self>) -> Arc<Self> {
-        Self::store_gated_with_ranges(buffer, index, value, gate, SmallVec::new())
-    }
-
-    /// Create a gated STORE operation with ranges.
-    ///
-    /// Stores a value conditionally with explicit ranges for scope definition.
-    pub fn store_gated_with_ranges(
-        buffer: Arc<Self>,
-        index: Arc<Self>,
-        value: Arc<Self>,
-        gate: Arc<Self>,
-        ranges: SmallVec<[Arc<Self>; 4]>,
-    ) -> Arc<Self> {
-        Self::new(Op::StoreGated { buffer, index, value, gate, ranges }, DType::Void)
     }
 
     // =========================================================================

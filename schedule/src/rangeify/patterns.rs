@@ -1053,14 +1053,6 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
             |buffer, real_index, value, ranges| {
                 Some(UOp::store_with_ranges(buffer.clone(), real_index.clone(), value.clone(), ranges.clone()))
             },
-
-        // Pattern 3: Cleanup StoreGated - remove LOAD from index position
-        StoreGated { buffer, index: Load { index: real_index, .. }, value, gate, ranges } =>
-            |buffer, real_index, value, gate, ranges| {
-                Some(UOp::store_gated_with_ranges(
-                    buffer.clone(), real_index.clone(), value.clone(), gate.clone(), ranges.clone()
-                ))
-            },
     }
 }
 

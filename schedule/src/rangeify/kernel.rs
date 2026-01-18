@@ -197,7 +197,7 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
                     // Already END(Kernel) - keep as is
                     new_deps.push(dep.clone());
                 }
-                Op::Store { .. } | Op::StoreGated { .. } => {
+                Op::Store { .. } => {
                     // Transform STORE to KERNEL, wrap in END
                     if let Some(kernel) = split_store(dep, ctx) {
                         let end = UOp::end(kernel, SmallVec::new());
@@ -207,9 +207,7 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
                         new_deps.push(dep.clone());
                     }
                 }
-                Op::End { computation, ranges }
-                    if matches!(computation.op(), Op::Store { .. } | Op::StoreGated { .. }) =>
-                {
+                Op::End { computation, ranges } if matches!(computation.op(), Op::Store { .. }) => {
                     // Transform END(STORE) to END(KERNEL)
                     if let Some(kernel) = split_store(computation, ctx) {
                         let end = UOp::end(kernel, ranges.clone());
@@ -222,7 +220,7 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
                 Op::Barrier { src, deps: barrier_deps } => {
                     // Handle BARRIER wrapping END(STORE)
                     let transformed_src = if let Op::End { computation, ranges } = src.op()
-                        && matches!(computation.op(), Op::Store { .. } | Op::StoreGated { .. })
+                        && matches!(computation.op(), Op::Store { .. })
                     {
                         if let Some(kernel) = split_store(computation, ctx) {
                             let end = UOp::end(kernel, ranges.clone());
@@ -231,7 +229,7 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
                         } else {
                             src.clone()
                         }
-                    } else if matches!(src.op(), Op::Store { .. } | Op::StoreGated { .. }) {
+                    } else if matches!(src.op(), Op::Store { .. }) {
                         if let Some(kernel) = split_store(src, ctx) {
                             let end = UOp::end(kernel, SmallVec::new());
                             any_transformed = true;
@@ -265,7 +263,7 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
     // Verify operation type
     let computation = match uop.op() {
         Op::End { computation, ranges } => match computation.op() {
-            Op::Store { .. } | Op::StoreGated { .. } => {
+            Op::Store { .. } => {
                 for r in ranges.iter() {
                     if let Op::Range { axis_type, .. } = r.op()
                         && *axis_type == AxisType::Outer
@@ -277,7 +275,7 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
             }
             _ => return None,
         },
-        Op::Store { .. } | Op::StoreGated { .. } => uop.clone(),
+        Op::Store { .. } => uop.clone(),
         _ => return None,
     };
 
@@ -344,7 +342,7 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
                     _ => None,
                 }
             }
-            Op::Store { buffer, .. } | Op::StoreGated { buffer, .. } => {
+            Op::Store { buffer, .. } => {
                 // Get output buffer from Store
                 match buffer.op() {
                     Op::DefineGlobal(_) | Op::DefineLocal(_) => Some(buffer.clone()),

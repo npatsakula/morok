@@ -185,7 +185,7 @@ fn test_print_matmul_ir() {
 
 #[test]
 #[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_512x512_ir -- --ignored --nocapture
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_print_matmul_512x512_ir() {
     const SIZE: usize = 512;
     let a = Tensor::from_slice((0..SIZE * SIZE).map(|i| (i as f32) * 0.01).collect::<Vec<_>>())
@@ -210,7 +210,7 @@ fn test_print_matmul_512x512_ir() {
 
 #[test]
 #[ignore] // Run with: cargo test -p morok-tensor test_beam_search_matmul -- --ignored --nocapture
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_beam_search_matmul() {
     // Test beam search optimization for matmul - reproduces float vector index bug
     let size = 512; // Original size that triggered the bug
@@ -295,7 +295,7 @@ fn test_linear_1d_weight() {
 // ========== Minimal VECTORIZE Normalization Test ==========
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_vectorize_normalize_minimal() {
     // Test 64x64 matmul with vectorization enabled
     let a = Tensor::from_slice([1.0f32; 64 * 64]).try_reshape(&[64, 64]).unwrap();
@@ -312,7 +312,7 @@ fn test_vectorize_normalize_minimal() {
 // ========== 512x512 Vectorized Test (for UPCAST debugging) ==========
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_matmul_512x512_vectorized() {
     // Create 512x512 matrices filled with 1.0
     const SIZE: usize = 512;
@@ -350,7 +350,7 @@ fn test_matmul_64x64_vectorized() {
 
 #[test]
 #[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_64x64_ir -- --ignored --nocapture
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_print_matmul_64x64_ir() {
     const SIZE: usize = 64;
     let a = Tensor::from_slice(vec![1.0f32; SIZE * SIZE]).try_reshape(&[SIZE as _, SIZE as _]).unwrap();
@@ -383,7 +383,7 @@ fn assert_matmul_close(actual: &ArrayD<f32>, expected: &Array2<f32>, tol: f32) {
 }
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_matmul_validated_2x2() {
     // Simple 2x2 matmul with known values
     let a_data = [1.0f32, 2.0, 3.0, 4.0];

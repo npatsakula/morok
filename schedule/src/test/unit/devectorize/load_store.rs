@@ -161,15 +161,11 @@ fn test_split_load_vec8_to_vec4() {
 
     // Create CAST(INDEX) with vec8 pointer dtype (simulating expand_index output)
     let idx = create_index(buffer.clone(), 0);
-    let vec8_ptr_dtype = DType::Ptr {
-        base: Box::new(DType::Vector { scalar: ScalarDType::Float32, count: 8 }),
-        addrspace: AddrSpace::Global,
-        size: Some(8),
-    };
+    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
     let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
 
     // LOAD with vec8 result dtype
-    let load_dtype = DType::Vector { scalar: ScalarDType::Float32, count: 8 };
+    let load_dtype = DType::Float32.vec(8);
     let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
 
     let result = apply_phase2(&load);
@@ -203,14 +199,10 @@ fn test_split_load_vec6_mixed() {
     let buffer = create_buffer(128);
 
     let idx = create_index(buffer.clone(), 0);
-    let vec6_ptr_dtype = DType::Ptr {
-        base: Box::new(DType::Vector { scalar: ScalarDType::Float32, count: 6 }),
-        addrspace: AddrSpace::Global,
-        size: Some(6),
-    };
+    let vec6_ptr_dtype = DType::Float32.vec(6).ptr(Some(6), AddrSpace::Global);
     let cast_idx = UOp::cast(idx, vec6_ptr_dtype);
 
-    let load_dtype = DType::Vector { scalar: ScalarDType::Float32, count: 6 };
+    let load_dtype = DType::Float32.vec(6);
     let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
 
     let result = apply_phase2(&load);
@@ -238,11 +230,7 @@ fn test_split_store_vec8() {
     let value = create_vector_float_iota(8);
 
     let idx = create_index(buffer.clone(), 0);
-    let vec8_ptr_dtype = DType::Ptr {
-        base: Box::new(DType::Vector { scalar: ScalarDType::Float32, count: 8 }),
-        addrspace: AddrSpace::Global,
-        size: Some(8),
-    };
+    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
     let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
 
     let store = UOp::store(buffer.clone(), cast_idx, value);
@@ -272,11 +260,7 @@ fn test_split_preserves_ranges() {
     let value = create_vector_float_iota(8);
 
     let idx = create_index(buffer.clone(), 0);
-    let vec8_ptr_dtype = DType::Ptr {
-        base: Box::new(DType::Vector { scalar: ScalarDType::Float32, count: 8 }),
-        addrspace: AddrSpace::Global,
-        size: Some(8),
-    };
+    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
     let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
 
     // Create range for the store
@@ -367,14 +351,10 @@ fn test_split_load_divisibility() {
     )
     .unwrap();
 
-    let vec8_ptr_dtype = DType::Ptr {
-        base: Box::new(DType::Vector { scalar: ScalarDType::Float32, count: 8 }),
-        addrspace: AddrSpace::Global,
-        size: Some(8),
-    };
+    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
     let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
 
-    let load_dtype = DType::Vector { scalar: ScalarDType::Float32, count: 8 };
+    let load_dtype = DType::Float32.vec(8);
     let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
 
     let result = apply_phase2(&load);
@@ -416,14 +396,10 @@ fn test_split_load_not_divisible() {
     )
     .unwrap();
 
-    let vec8_ptr_dtype = DType::Ptr {
-        base: Box::new(DType::Vector { scalar: ScalarDType::Float32, count: 8 }),
-        addrspace: AddrSpace::Global,
-        size: Some(8),
-    };
+    let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
     let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
 
-    let load_dtype = DType::Vector { scalar: ScalarDType::Float32, count: 8 };
+    let load_dtype = DType::Float32.vec(8);
     let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
 
     let result = apply_phase2(&load);
@@ -446,34 +422,34 @@ fn test_split_load_not_divisible() {
 }
 
 // =============================================================================
-// Fold Gated Load Test (Tinygrad port)
+// Gated Index Load Test
 // =============================================================================
 
-/// Test: Fold gated load pattern.
+/// Test: Load from gated index.
 ///
-/// Ported from Tinygrad's test_fold_gated_load (test_uop_graph.py).
-/// Tests that gated loads are properly handled through devectorization.
+/// In Tinygrad's model, gates are on INDEX, not LOAD/STORE.
+/// Tests that loads from gated indices are properly handled.
 #[test]
-fn test_fold_gated_load() {
+fn test_gated_index_load() {
     let buffer = create_buffer(64);
     let gate = create_bool_const(true);
 
-    // Create gated index
+    // Create gated index (gate is on INDEX, not LOAD)
     let idx = UOp::const_(DType::Index, ConstValue::Int(0));
     let gated_index = UOp::new(
         Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx], gate: Some(gate.clone()) },
         DType::Float32,
     );
 
-    // Create gated load
-    let load = UOp::load_gated(buffer.clone(), gated_index, gate);
+    // Create load from gated index
+    let load = UOp::load(buffer.clone(), gated_index);
 
-    // Apply devectorization should handle gated loads
+    // Apply devectorization should handle gated indices
     let result = apply_devectorize(&load);
 
-    // Should produce valid output (gated load may remain as-is)
+    // Should produce valid output
     assert!(
-        matches!(result.op(), Op::Load { .. } | Op::LoadGated { .. } | Op::Cat { .. } | Op::Vectorize { .. }),
+        matches!(result.op(), Op::Load { .. } | Op::Cat { .. } | Op::Vectorize { .. }),
         "Should produce valid load structure"
     );
 }

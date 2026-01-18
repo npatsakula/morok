@@ -388,7 +388,6 @@ pub fn phase2_expand() -> TypedPatternMatcher {
         // Fix STORE with UNROLL in ranges/index - wrap in CONTRACT
         // MUST run BEFORE do_expand! Tinygrad's fix_store_unroll is in pm_pre_expander.
         store if matches!(store.op(), Op::Store { .. }) => |store| fix_store_unroll(store),
-        store if matches!(store.op(), Op::StoreGated { .. }) => |store| fix_store_unroll(store),
 
         // Handle END with UNROLL ranges
         end @ End(_, ..) => |end| end_unrolls(end),
@@ -565,9 +564,8 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
             // Load/Store index at position 1 should be integer. If UNROLL wraps float data,
             // GEP swizzle would preserve float dtype, causing codegen panic.
             // Only skip GEP when inner is float - integer UNROLL needs normal expansion.
-            let is_float_at_load_store_index = i == 1
-                && matches!(op, Op::Load { .. } | Op::LoadGated { .. } | Op::Store { .. } | Op::StoreGated { .. })
-                && !inner.dtype().base().is_int();
+            let is_float_at_load_store_index =
+                i == 1 && matches!(op, Op::Load { .. } | Op::Store { .. }) && !inner.dtype().base().is_int();
 
             if is_float_at_load_store_index {
                 // Float data at index position - this is an upstream bug
@@ -612,16 +610,7 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 
             // Case 2: Buffer (source 0) for memory ops passes through unchanged
             // Don't broadcast pointers - INDEX, LOAD, STORE all have buffer as source 0
-            if i == 0
-                && matches!(
-                    op,
-                    Op::Index { .. }
-                        | Op::Load { .. }
-                        | Op::LoadGated { .. }
-                        | Op::Store { .. }
-                        | Op::StoreGated { .. }
-                )
-            {
+            if i == 0 && matches!(op, Op::Index { .. } | Op::Load { .. } | Op::Store { .. }) {
                 new_sources.push(src.clone());
                 continue;
             }
@@ -682,10 +671,10 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Create the expanded operation
     let new_op = reconstruct_op_with_new_sources(op, &new_sources, &new_dtype)?;
 
-    // Store/StoreGated don't produce values, so don't wrap them in UNROLL
+    // Store doesn't produce a value, so don't wrap it in UNROLL
     // (UNROLL implies a value that can be used by parent operations)
     // Instead, just return the expanded Store directly with vectorized sources.
-    if matches!(op, Op::Store { .. } | Op::StoreGated { .. }) {
+    if matches!(op, Op::Store { .. }) {
         tracing::debug!(op_type = ?std::mem::discriminant(op), "do_expand: returning Store without UNROLL wrapper");
         return Some(new_op);
     }
@@ -776,17 +765,6 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
             }
         }
 
-        Op::LoadGated { .. } => {
-            if sources.len() >= 3 {
-                Some(UOp::new(
-                    Op::LoadGated { buffer: sources[0].clone(), index: sources[1].clone(), gate: sources[2].clone() },
-                    dtype.clone(),
-                ))
-            } else {
-                None
-            }
-        }
-
         Op::Store { .. } => {
             if sources.len() >= 3 {
                 Some(UOp::new(
@@ -795,23 +773,6 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
                         index: sources[1].clone(),
                         value: sources[2].clone(),
                         ranges: sources[3..].iter().cloned().collect(),
-                    },
-                    dtype.clone(),
-                ))
-            } else {
-                None
-            }
-        }
-
-        Op::StoreGated { .. } => {
-            if sources.len() >= 4 {
-                Some(UOp::new(
-                    Op::StoreGated {
-                        buffer: sources[0].clone(),
-                        index: sources[1].clone(),
-                        value: sources[2].clone(),
-                        gate: sources[3].clone(),
-                        ranges: sources[4..].iter().cloned().collect(),
                     },
                     dtype.clone(),
                 ))
@@ -1200,37 +1161,6 @@ fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
             );
 
             // Wrap in CONTRACT with void dtype (matching Tinygrad)
-            Some(UOp::contract(new_store, contract_axes))
-        }
-        Op::StoreGated { buffer, index, value, gate, ranges } => {
-            // Partition ranges into direct UNROLL ops vs non-UNROLL
-            let (store_expand, store_range): (Vec<_>, Vec<_>) =
-                ranges.iter().partition(|r| matches!(r.op(), Op::Unroll { .. }));
-
-            if store_expand.is_empty() {
-                return None;
-            }
-
-            // Collect axes from UNROLL ops
-            let contract_axes: Vec<(usize, usize)> = store_expand
-                .iter()
-                .filter_map(|u| match u.op() {
-                    Op::Unroll { unroll_axes, .. } => Some(unroll_axes.clone()),
-                    _ => None,
-                })
-                .flatten()
-                .collect();
-
-            // Create new STORE with only non-UNROLL ranges
-            let new_store = UOp::store_gated_with_ranges(
-                buffer.clone(),
-                index.clone(),
-                value.clone(),
-                gate.clone(),
-                store_range.into_iter().cloned().collect(),
-            );
-
-            // Wrap in CONTRACT
             Some(UOp::contract(new_store, contract_axes))
         }
         _ => None,

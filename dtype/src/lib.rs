@@ -151,7 +151,9 @@ pub enum DType {
     Vector { scalar: ScalarDType, count: usize },
 
     /// Pointer type.
-    Ptr { base: Box<DType>, addrspace: AddrSpace, size: Option<usize> },
+    /// `vcount` is the vector count of the pointer itself (1 = scalar pointer, >1 = vector of pointers).
+    /// This matches Tinygrad's PtrDType.v field.
+    Ptr { base: Box<DType>, addrspace: AddrSpace, size: Option<usize>, vcount: usize },
 
     /// Image type (for texture operations).
     Image { kind: ImageKind, shape: Vec<usize> },
@@ -248,6 +250,10 @@ impl DType {
         match self {
             Self::Scalar(s) if !matches!(s, ScalarDType::Void) => Self::Vector { scalar: *s, count },
             Self::Vector { .. } => panic!("Cannot vectorize an already vectorized type"),
+            Self::Ptr { vcount: 1, base, addrspace, size } => {
+                Self::Ptr { base: base.clone(), addrspace: addrspace.clone(), size: *size, vcount: count }
+            }
+            Self::Ptr { vcount, .. } => panic!("Cannot vectorize an already vectorized pointer (vcount={vcount})"),
             _ => self.clone(),
         }
     }
@@ -256,7 +262,7 @@ impl DType {
     pub fn ptr(self, size: Option<usize>, addrspace: AddrSpace) -> Self {
         match self {
             Self::Ptr { .. } => panic!("Cannot make a pointer from a pointer"),
-            _ => Self::Ptr { base: Box::new(self), addrspace, size },
+            _ => Self::Ptr { base: Box::new(self), addrspace, size, vcount: 1 },
         }
     }
 
@@ -302,7 +308,7 @@ impl DType {
     pub fn vcount(&self) -> usize {
         match self {
             Self::Vector { count, .. } => *count,
-            Self::Ptr { base, .. } => base.count(),
+            Self::Ptr { vcount, .. } => *vcount,
             _ => 1,
         }
     }

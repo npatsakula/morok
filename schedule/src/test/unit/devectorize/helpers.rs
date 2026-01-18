@@ -11,7 +11,8 @@ use morok_ir::{Op, UOp};
 use smallvec::SmallVec;
 
 use crate::devectorize::{
-    bool_storage_patterns, devectorize, gep_ptrcat_patterns, no_vectorized_alu, pm_vectorize_normalize,
+    bool_storage_patterns, devectorize, gep_ptrcat_patterns, load_store_indexing_patterns, no_vectorized_alu,
+    pm_vectorize_normalize,
 };
 use crate::rewrite::graph_rewrite_bottom_up;
 
@@ -71,6 +72,19 @@ pub fn apply_vectorize_normalize(uop: &Arc<UOp>) -> Arc<UOp> {
     graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
 }
 
+/// Apply load_store_indexing patterns (gate dropping).
+pub fn apply_load_store_indexing(uop: &Arc<UOp>) -> Arc<UOp> {
+    let patterns = load_store_indexing_patterns();
+    graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
+}
+
+/// Apply cast_after pattern.
+pub fn apply_cast_after(uop: &Arc<UOp>) -> Arc<UOp> {
+    use crate::devectorize::devectorize_patterns;
+    let patterns = devectorize_patterns();
+    graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
+}
+
 // =============================================================================
 // Buffer Builders
 // =============================================================================
@@ -84,15 +98,13 @@ pub fn create_buffer(size: usize) -> Arc<UOp> {
 
 /// Create a global buffer with specified element type.
 pub fn create_buffer_typed(size: usize, scalar: ScalarDType) -> Arc<UOp> {
-    let base = DType::Scalar(scalar);
-    let dtype = DType::Ptr { base: Box::new(base), addrspace: AddrSpace::Global, size: Some(size) };
+    let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Global);
     UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, size, dtype)
 }
 
 /// Create a local (shared) memory buffer.
 pub fn create_buffer_local(size: usize, scalar: ScalarDType) -> Arc<UOp> {
-    let base = DType::Scalar(scalar);
-    let dtype = DType::Ptr { base: Box::new(base), addrspace: AddrSpace::Local, size: Some(size) };
+    let dtype = DType::Scalar(scalar).ptr(Some(size), AddrSpace::Local);
     UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, size, dtype)
 }
 

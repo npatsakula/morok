@@ -127,6 +127,29 @@ macro_rules! scalar_ops {
     };
 }
 
+// =========================================================================
+// Panicking Wrapper Macro
+// =========================================================================
+
+/// Macro to generate panicking wrappers for try_* binary methods.
+///
+/// These are for use in pattern rewrites where types are already validated.
+/// Each method panics on type mismatch with a clear error message and location.
+macro_rules! panicking_binary_wrapper {
+    ($($method:ident => $try_method:ident),+ $(,)?) => {
+        $(
+            #[doc = concat!("Panicking version of `", stringify!($try_method), "`.")]
+            #[doc = ""]
+            #[doc = "For use in pattern rewrites where types are validated."]
+            #[doc = "Panics on type mismatch."]
+            #[track_caller]
+            pub fn $method(self: &Arc<Self>, rhs: &Arc<Self>) -> Arc<Self> {
+                self.$try_method(rhs).expect(concat!(stringify!($method), ": type mismatch"))
+            }
+        )+
+    };
+}
+
 impl UOp {
     // =========================================================================
     // Arithmetic Operations
@@ -326,6 +349,42 @@ impl UOp {
         Self::validate_ternary_shapes(&a, &b)?;
         Self::validate_ternary_shapes(&a, &c)?;
         Ok(Self::new(Op::Ternary(TernaryOp::MulAcc, a, b, c), dtype))
+    }
+
+    // =========================================================================
+    // Panicking Wrappers (for pattern rewrites)
+    // =========================================================================
+    //
+    // These methods are for use in pattern rewrites where types are already
+    // validated by the pattern matcher. They panic on type mismatch, which
+    // indicates a bug in the pattern rather than a user error.
+    //
+    // Note: Using trailing underscore for `and_`, `or_`, `mod_` to avoid
+    // Rust keyword conflicts.
+
+    panicking_binary_wrapper! {
+        // Arithmetic
+        add => try_add,
+        sub => try_sub,
+        mul => try_mul,
+        idiv => try_div,
+        mod_ => try_mod,
+        max => try_max,
+
+        // Bitwise
+        and_ => try_and_op,
+        or_ => try_or_op,
+        xor => try_xor_op,
+        shl => try_shl_op,
+        shr => try_shr_op,
+
+        // Comparison
+        lt => try_cmplt,
+        le => try_cmple,
+        gt => try_cmpgt,
+        ge => try_cmpge,
+        eq => try_cmpeq,
+        ne => try_cmpne,
     }
 
     // =========================================================================

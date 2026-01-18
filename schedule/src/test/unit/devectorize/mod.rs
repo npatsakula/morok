@@ -24,4 +24,5 @@ pub mod expand_index;
 pub mod gep_patterns;
 pub mod helpers;
 pub mod load_store;
+pub mod new_patterns;
 pub mod pipeline;

@@ -22,6 +22,7 @@ z3 = { version = "0.19", optional = true }
 proptest-derive = { version = "0.7", optional = true }
 snafu = "0.8.9"
 tracing = "0.1"
+itertools = "0.14.0"
 
 [features]
 default = []

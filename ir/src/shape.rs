@@ -645,7 +645,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         }
 
         // These have no shape
-        Op::Index { .. } | Op::Load { .. } | Op::LoadGated { .. } | Op::Store { .. } | Op::StoreGated { .. } => None,
+        Op::Index { .. } | Op::Load { .. } | Op::Store { .. } => None,
 
         // =====================================================================
         // Control flow - no static shape

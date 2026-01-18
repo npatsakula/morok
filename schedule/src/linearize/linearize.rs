@@ -241,8 +241,8 @@ fn get_priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
         Op::DefineReg { .. } => (priority::DEFINE_REG, None),
         Op::Const(_) | Op::VConst { .. } => (priority::CONST, None),
         Op::End { .. } => (priority::END, None),
-        Op::Load { .. } | Op::LoadGated { .. } => (priority::LOAD, None),
-        Op::Store { .. } | Op::StoreGated { .. } => (priority::STORE, None),
+        Op::Load { .. } => (priority::LOAD, None),
+        Op::Store { .. } => (priority::STORE, None),
         Op::Range { axis_id, .. } => (priority::RANGE, Some(axis_id.value() as i64)),
         _ => (priority::DEFAULT, None),
     }

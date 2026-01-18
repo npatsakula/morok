@@ -99,18 +99,23 @@ fn test_find_bufs_multiple_buffers() {
 }
 
 #[test]
-fn test_find_bufs_gated_operations() {
-    // Test with LoadGated and StoreGated
+fn test_find_bufs_with_gated_index() {
+    // Test with gated INDEX (gates are now on INDEX, not LOAD/STORE)
     let in_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
     let gate = UOp::native_const(true);
 
-    // LoadGated from input
-    let loaded = UOp::load_gated(in_buf.clone(), index.clone(), gate.clone());
+    // Create gated index for load (gate is on INDEX)
+    let gated_in_index = UOp::index_gated(in_buf.clone(), vec![UOp::index_const(0)], gate.clone()).unwrap();
 
-    // StoreGated to output
-    let store = UOp::store_gated(out_buf.clone(), index, loaded, gate);
+    // Load from gated index
+    let loaded = UOp::load(in_buf.clone(), gated_in_index);
+
+    // Create gated index for store
+    let gated_out_index = UOp::index_gated(out_buf.clone(), vec![UOp::index_const(0)], gate).unwrap();
+
+    // Store to gated index
+    let store = UOp::store(out_buf.clone(), gated_out_index, loaded);
 
     // Should succeed
     #[allow(clippy::mutable_key_type)]

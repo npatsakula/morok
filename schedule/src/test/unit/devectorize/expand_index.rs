@@ -14,6 +14,16 @@ use smallvec::smallvec;
 
 use super::helpers::*;
 
+/// Unwrap GEP if present to get the inner PTRCAT or other node.
+/// expand_vector_index returns GEP(PTRCAT(...)) to handle lane reordering;
+/// the identity GEP is simplified later by gep_pushing_patterns.
+fn unwrap_gep(uop: &Arc<UOp>) -> Arc<UOp> {
+    match uop.op() {
+        Op::Gep { vector, .. } => vector.clone(),
+        _ => uop.clone(),
+    }
+}
+
 // =============================================================================
 // Contiguous Access Tests
 // =============================================================================
@@ -29,21 +39,31 @@ fn test_expand_contiguous_vec4() {
 
     let result = apply_phase1(&index);
 
-    // Result should be PTRCAT with a single CAST(INDEX) pointer
-    // representing a contiguous 4-element access
+    // Result should be GEP(PTRCAT(...)) or PTRCAT with a single CAST(INDEX) pointer
+    // representing a contiguous 4-element access.
+    // The GEP reorders lanes; identity GEP is simplified by gep_pushing_patterns later.
     match result.op() {
+        Op::Gep { vector, indices } => {
+            // GEP wrapping PTRCAT - check inner PTRCAT has single CAST(INDEX) source
+            assert_eq!(indices.len(), 4, "GEP should have 4 indices for vec4");
+            match vector.op() {
+                Op::PtrCat { sources } => {
+                    assert_eq!(sources.len(), 1, "Contiguous indices should form single group");
+                    assert_is_cast(&sources[0]);
+                }
+                other => panic!("Expected PTRCAT inside GEP, got {:?}", other),
+            }
+        }
         Op::PtrCat { sources } => {
             assert_eq!(sources.len(), 1, "Contiguous indices should form single group");
-            // The source should be CAST(INDEX) with vector pointer dtype
             assert_is_cast(&sources[0]);
             let (src, _dtype) = unwrap_cast(&sources[0]);
             assert_is_index(&src);
         }
-        // Could also be CAST(INDEX) directly without PTRCAT wrapper
         Op::Cast { src, .. } => {
             assert_is_index(src);
         }
-        other => panic!("Expected PTRCAT or CAST, got {:?}", other),
+        other => panic!("Expected GEP, PTRCAT or CAST, got {:?}", other),
     }
 }
 
@@ -53,7 +73,7 @@ fn test_expand_contiguous_vec8() {
     let buffer = create_buffer(128);
     let index = create_vector_index_iota(buffer.clone(), 8);
 
-    let result = apply_phase1(&index);
+    let result = unwrap_gep(&apply_phase1(&index));
 
     match result.op() {
         Op::PtrCat { sources } => {
@@ -72,7 +92,7 @@ fn test_expand_contiguous_with_offset() {
     let buffer = create_buffer(64);
     let index = create_vector_index_offset(buffer.clone(), 4, 10);
 
-    let result = apply_phase1(&index);
+    let result = unwrap_gep(&apply_phase1(&index));
 
     // Should still form a single contiguous group
     match result.op() {
@@ -312,7 +332,7 @@ fn test_expand_range_based_index() {
     let vec_idx = UOp::vectorize(indices);
     let index = UOp::new(Op::Index { buffer, indices: smallvec![vec_idx], gate: None }, DType::Float32);
 
-    let result = apply_phase1(&index);
+    let result = unwrap_gep(&apply_phase1(&index));
 
     // Should form a single contiguous group
     match result.op() {
@@ -445,7 +465,7 @@ fn test_expand_int32_buffer() {
     let buffer = create_buffer_typed(64, ScalarDType::Int32);
     let index = create_vector_index_iota(buffer.clone(), 4);
 
-    let result = apply_phase1(&index);
+    let result = unwrap_gep(&apply_phase1(&index));
 
     // Should work with int32 dtype
     match result.op() {
@@ -463,7 +483,7 @@ fn test_expand_half_buffer() {
     let buffer = create_buffer_typed(64, ScalarDType::Float16);
     let index = create_vector_index_iota(buffer.clone(), 4);
 
-    let result = apply_phase1(&index);
+    let result = unwrap_gep(&apply_phase1(&index));
 
     match result.op() {
         Op::PtrCat { sources } => {

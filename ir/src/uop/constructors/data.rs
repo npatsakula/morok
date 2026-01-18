@@ -40,6 +40,26 @@ impl UOp {
         Self::const_(DType::Index, ConstValue::Int(value))
     }
 
+    /// Create a constant with the same dtype as self.
+    ///
+    /// This is the Rust equivalent of Tinygrad's `x.const_like(value)`.
+    /// Useful for creating identity elements, zeros, or other constants
+    /// that match an existing UOp's type.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use morok_ir::UOp;
+    /// # use morok_dtype::DType;
+    /// let x = UOp::const_(DType::Float32, morok_ir::ConstValue::Float(5.0));
+    /// let zero = x.const_like(0.0);
+    /// assert_eq!(zero.dtype(), DType::Float32);
+    /// ```
+    pub fn const_like<T: crate::IntoUOp>(self: &Arc<Self>, value: T) -> Arc<Self> {
+        value.into_uop(self.dtype())
+    }
+
     /// Create a vector constant from multiple values.
     ///
     /// Dtype is inferred from the first value; all values must be same type.

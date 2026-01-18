@@ -97,26 +97,6 @@ fn test_split_store_end_non_store_returns_none() {
 }
 
 #[test]
-fn test_split_store_gated() {
-    let mut ctx = KernelContext::new();
-
-    // Create a STORE_GATED operation
-    let buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
-    let value = UOp::native_const(1.0f32);
-    let gate = UOp::native_const(true);
-    let store_gated = UOp::store_gated(buffer, index, value, gate);
-
-    // Try to split
-    let result = split_store(&store_gated, &mut ctx);
-
-    // Should return a KERNEL
-    assert!(result.is_some());
-    let kernel = result.unwrap();
-    assert!(matches!(kernel.op(), Op::Kernel { .. }));
-}
-
-#[test]
 fn test_split_store_creates_sink() {
     let mut ctx = KernelContext::new();
 

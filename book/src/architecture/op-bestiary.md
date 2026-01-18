@@ -218,24 +218,16 @@ Direct pointer arithmetic. Used after linearization when indices are flattened.
 
 > **Compatibility:** Tinygrad uses `INDEX` with a `ptr=True` flag instead of a separate operation.
 
-### LOAD / LOAD_GATED — Memory Read
+### LOAD — Memory Read
 
 ```rust
 Load {
     buffer: Arc<UOp>,        // buffer or pointer
     index: Arc<UOp>,         // INDEX op
 }
-
-LoadGated {
-    buffer: Arc<UOp>,
-    index: Arc<UOp>,
-    gate: Arc<UOp>,          // only load if true
-}
 ```
 
-Read value from buffer at index. `LoadGated` returns undefined value when gate is false.
-
-> **Compatibility:** `LoadGated` and `StoreGated` are Morok extensions. Tinygrad uses `WHERE` (ternary select) for conditional memory operations.
+Read value from buffer at index. For gated loads, use an INDEX with a gate (INDEX has an optional `gate` field).
 
 **Example:**
 ```text
@@ -247,7 +239,7 @@ LOAD : Float32
     └── RANGE(R2)
 ```
 
-### STORE / STORE_GATED — Memory Write
+### STORE — Memory Write
 
 ```rust
 Store {
@@ -256,17 +248,11 @@ Store {
     value: Arc<UOp>,                    // value to write
     ranges: SmallVec<[Arc<UOp>; 4]>,    // ranges being closed
 }
-
-StoreGated {
-    buffer: Arc<UOp>,
-    index: Arc<UOp>,
-    value: Arc<UOp>,
-    gate: Arc<UOp>,          // only store if true
-    ranges: SmallVec<[Arc<UOp>; 4]>,
-}
 ```
 
 Write value to buffer. STORE closes the specified ranges, which represent output iteration dimensions. The ranges field is used for output upcasting: when a `Range(Upcast)` is included, it becomes `UNROLL` during expansion, then contracted via `CONTRACT`.
+
+For gated stores, use an INDEX with a gate (INDEX has an optional `gate` field).
 
 > **Compatibility:** Morok's STORE has an explicit `index` field (sources: buffer=0, index=1, value=2, ranges=3+). Tinygrad's STORE combines buffer and value differently (range_start=2).
 
@@ -666,7 +652,7 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 |----------|------------|
 | **Loop Control** | `RANGE`, `END` |
 | **Reduction** | `REDUCE_AXIS`, `REDUCE`, `ALLREDUCE` |
-| **Memory** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `LOAD_GATED`, `STORE`, `STORE_GATED` |
+| **Memory** | `BUFFER`, `BUFFERIZE`, `INDEX`, `POINTER_INDEX`, `LOAD`, `STORE` |
 | **Kernel** | `KERNEL`, `SINK`, `AFTER`, `BARRIER` |
 | **Vector** | `VECTORIZE`, `GEP`, `VCONST`, `CAT`, `PTRCAT` |
 | **Expansion** | `UNROLL`, `CONTRACT` |
@@ -685,7 +671,6 @@ Operations that close RANGE scopes (remove ranges from active set):
 | `BUFFERIZE` | 1 (compute=0, ranges=1+) |
 | `REDUCE` | 1 (src=0, ranges=1+) |
 | `STORE` | 3 (buffer=0, index=1, value=2, ranges=3+) |
-| `STORE_GATED` | 4 (buffer=0, index=1, value=2, gate=3, ranges=4+) |
 | `WMMA` | 3 (a=0, b=1, c=2) |
 | `END` | 1 (computation=0, ranges=1+) |
 
@@ -696,7 +681,7 @@ Operations that propagate UNROLL through the computation graph:
 - ALU: `Unary`, `Binary`, `Ternary`
 - Type: `Cast`, `BitCast`
 - Vector: `Gep`, `Vectorize`
-- Memory: `Load`, `LoadGated`, `Store`, `StoreGated`, `Index`, `PointerIndex`
+- Memory: `Load`, `Store`, `Index`, `PointerIndex`
 - Control: `Reduce`, `End`, `After`
 - Buffer: `Bufferize`
 - Hardware: `Wmma`

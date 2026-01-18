@@ -674,7 +674,7 @@ pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
     let nodes = store.toposort_filtered(|uop| !matches!(uop.op(), Op::After { .. }));
 
     for node in nodes {
-        if let Op::Load { buffer, .. } | Op::LoadGated { buffer, .. } = node.op() {
+        if let Op::Load { buffer, .. } = node.op() {
             let buf = as_buf(buffer);
             let buf_key = UOpKey(buf.clone());
 
@@ -692,7 +692,7 @@ pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
             ret.insert(buf_key, OpAccessType::Load);
         }
 
-        if let Op::Store { buffer, .. } | Op::StoreGated { buffer, .. } = node.op() {
+        if let Op::Store { buffer, .. } = node.op() {
             let buf = as_buf(buffer);
             let buf_key = UOpKey(buf.clone());
 

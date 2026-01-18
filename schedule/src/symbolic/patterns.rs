@@ -137,7 +137,7 @@ pub fn symbolic_simple() -> TypedPatternMatcher {
 /// - Boolean patterns
 /// - Dead code elimination
 pub fn symbolic() -> TypedPatternMatcher {
-    symbolic_simple()
+    symbolic_simple() + gep_pushing_patterns()
 }
 
 /// Self-folding patterns.

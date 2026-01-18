@@ -22,7 +22,7 @@ use morok_dtype::DeviceSpec;
 /// - Special ops with extra data remain separate: Cast (dtype), MSelect (device_index)
 /// - Variable-arity ops use SmallVec: Index { indices: SmallVec<[Arc<UOp>; 4]> }
 /// - SmallVec avoids heap allocation for common cases (≤4 children)
-/// - Gated operations use separate variants (LoadGated vs Load) for type safety
+/// - Gate is on INDEX (not LOAD/STORE) following Tinygrad's model
 ///
 /// Hash is derived and uses UOp's Hash impl for Arc<UOp> children.
 /// UOp hashes by content (dtype + op), enabling content-based hashing for caching.
@@ -263,27 +263,16 @@ pub enum Op {
         code: String,
     },
 
-    // Memory operations (low-level, after kernel splitting, 4 variants)
+    // Memory operations (low-level, after kernel splitting, 2 variants)
+    // Gate is on INDEX, not LOAD/STORE (following Tinygrad's model)
     Load {
         buffer: Arc<UOp>,
         index: Arc<UOp>,
-    },
-    LoadGated {
-        buffer: Arc<UOp>,
-        index: Arc<UOp>,
-        gate: Arc<UOp>,
     },
     Store {
         buffer: Arc<UOp>,
         index: Arc<UOp>,
         value: Arc<UOp>,
-        ranges: SmallVec<[Arc<UOp>; 4]>,
-    },
-    StoreGated {
-        buffer: Arc<UOp>,
-        index: Arc<UOp>,
-        value: Arc<UOp>,
-        gate: Arc<UOp>,
         ranges: SmallVec<[Arc<UOp>; 4]>,
     },
 }
@@ -408,14 +397,8 @@ impl Op {
 
             // Memory operations
             Self::Load { buffer, index } => SmallVec::from_slice(&[buffer, index]),
-            Self::LoadGated { buffer, index, gate } => SmallVec::from_slice(&[buffer, index, gate]),
             Self::Store { buffer, index, value, ranges } => {
                 let mut children = SmallVec::from_slice(&[buffer, index, value]);
-                children.extend(ranges.iter());
-                children
-            }
-            Self::StoreGated { buffer, index, value, gate, ranges } => {
-                let mut children = SmallVec::from_slice(&[buffer, index, value, gate]);
                 children.extend(ranges.iter());
                 children
             }
@@ -497,14 +480,12 @@ impl Op {
         // - BUFFERIZE: compute=0, ranges=1+
         // - REDUCE: src=0, ranges=1+
         // - STORE: buffer=0, index=1, value=2, ranges=3+
-        // - STOREGATED: buffer=0, index=1, value=2, gate=3, ranges=4+
         // - WMMA: a=0, b=1, c=2, (ranges start at 3)
         // - END: computation=0, ranges=1+
         match self {
             Self::Bufferize { .. } => Some(1),
             Self::Reduce { .. } => Some(1),
             Self::Store { .. } => Some(3),
-            Self::StoreGated { .. } => Some(4),
             Self::Wmma { .. } => Some(3),
             Self::End { .. } => Some(1),
             _ => None,
@@ -518,7 +499,7 @@ impl Op {
     /// - Type ops (Cast, BitCast)
     /// - Vector ops (Gep, Vectorize)
     /// - Tensor core ops (Wmma)
-    /// - Memory ops (Load, LoadGated, Store, StoreGated, Index)
+    /// - Memory ops (Load, Store, Index)
     /// - Buffer ops (Bufferize)
     /// - Control flow (Reduce, End, After)
     ///
@@ -536,8 +517,7 @@ impl Op {
             // Tensor core
             Self::Wmma { .. } |
             // Memory operations
-            Self::Load { .. } | Self::LoadGated { .. } |
-            Self::Store { .. } | Self::StoreGated { .. } |
+            Self::Load { .. } | Self::Store { .. } |
             Self::Index { .. } | Self::PointerIndex { .. } |
             // Buffer operations
             Self::Bufferize { .. } |

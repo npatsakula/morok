@@ -403,7 +403,7 @@ fn detect_output_indices(kernel: &Arc<UOp>, buffers: &[Buffer]) -> Vec<usize> {
 
     for node in ast.toposort() {
         match node.op() {
-            Op::Store { buffer, .. } | Op::StoreGated { buffer, .. } => {
+            Op::Store { buffer, .. } => {
                 // Get the buffer's DefineGlobal ID
                 let buf_id = match buffer.op() {
                     Op::DefineGlobal(_) | Op::DefineLocal(_) => buffer.id,

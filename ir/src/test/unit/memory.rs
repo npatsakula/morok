@@ -64,27 +64,6 @@ fn test_load() {
 }
 
 #[test]
-fn test_load_gated() {
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
-    let gate = UOp::native_const(true);
-
-    let load = UOp::load_gated(buffer.clone(), index.clone(), gate.clone());
-
-    // Should have same dtype as buffer
-    assert_eq!(load.dtype(), DType::Float32);
-
-    // Should be LoadGated op
-    if let Op::LoadGated { buffer: b, index: i, gate: g } = load.op() {
-        assert!(std::sync::Arc::ptr_eq(b, &buffer));
-        assert!(std::sync::Arc::ptr_eq(i, &index));
-        assert!(std::sync::Arc::ptr_eq(g, &gate));
-    } else {
-        panic!("Expected LoadGated op");
-    }
-}
-
-#[test]
 fn test_store() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let index = UOp::index_const(0);
@@ -102,29 +81,6 @@ fn test_store() {
         assert!(std::sync::Arc::ptr_eq(v, &value));
     } else {
         panic!("Expected Store op");
-    }
-}
-
-#[test]
-fn test_store_gated() {
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
-    let value = UOp::native_const(42.0f32);
-    let gate = UOp::native_const(true);
-
-    let store = UOp::store_gated(buffer.clone(), index.clone(), value.clone(), gate.clone());
-
-    // Store should have Void dtype
-    assert_eq!(store.dtype(), DType::Void);
-
-    // Should be StoreGated op
-    if let Op::StoreGated { buffer: b, index: i, value: v, gate: g, .. } = store.op() {
-        assert!(std::sync::Arc::ptr_eq(b, &buffer));
-        assert!(std::sync::Arc::ptr_eq(i, &index));
-        assert!(std::sync::Arc::ptr_eq(v, &value));
-        assert!(std::sync::Arc::ptr_eq(g, &gate));
-    } else {
-        panic!("Expected StoreGated op");
     }
 }
 

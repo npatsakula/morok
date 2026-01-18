@@ -103,7 +103,7 @@ fn test_cranelift_bootstrap_pipeline() {
     // Create a simple kernel that stores a constant to a buffer:
     // buf0[0] = 42
     let ptr_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Int32)), addrspace: AddrSpace::Global, size: None };
+        DType::Scalar(ScalarDType::Int32).ptr(None, AddrSpace::Global);
     let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
     let const_42 = UOp::const_(DType::Scalar(ScalarDType::Int32), ConstValue::Int(42));
@@ -161,7 +161,7 @@ fn test_cranelift_exp2_decomposition() {
     // Create a kernel that computes exp2(2.0) and stores to buffer:
     // buf0[0] = exp2(2.0) = 4.0
     let ptr_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Float32)), addrspace: AddrSpace::Global, size: None };
+        DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
     let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
     // Create exp2(2.0)
@@ -229,7 +229,7 @@ fn test_cranelift_simple_math() {
 
     // Create a kernel that computes 2.0 * 3.0 = 6.0 and stores to buffer
     let ptr_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Float32)), addrspace: AddrSpace::Global, size: None };
+        DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
     let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
     let const_2 = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(2.0));
@@ -279,7 +279,7 @@ fn test_cranelift_pow2if() {
 
     // Create a kernel that computes pow2if(2) = 4.0 and stores to buffer
     let ptr_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Float32)), addrspace: AddrSpace::Global, size: None };
+        DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
     let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
     // Create pow2if(2) using the helper function
@@ -330,7 +330,7 @@ fn test_cranelift_ldexp2k() {
 
     // Create a kernel that computes ldexp2k(1.0, 2) = 1.0 * 2^2 = 4.0
     let ptr_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Float32)), addrspace: AddrSpace::Global, size: None };
+        DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
     let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
     // Create ldexp2k(1.0, 2)
@@ -383,7 +383,7 @@ fn test_cranelift_rintk() {
     // Create a kernel that computes rintk(2.0) and stores to buffer
     // Note: rintk returns Int32, but we're storing to f32 buffer for simplicity
     let ptr_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Int32)), addrspace: AddrSpace::Global, size: None };
+        DType::Scalar(ScalarDType::Int32).ptr(None, AddrSpace::Global);
     let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
     // Create rintk(2.0)
@@ -436,7 +436,7 @@ fn test_cranelift_exp2_simple() {
         .expect("Failed to create CPU device with Cranelift");
 
     let ptr_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Float32)), addrspace: AddrSpace::Global, size: None };
+        DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
     let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
     // Build exp2(2.0) step by step:
@@ -509,7 +509,7 @@ fn test_cranelift_ldexp_with_rintk() {
         .expect("Failed to create CPU device with Cranelift");
 
     let ptr_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Float32)), addrspace: AddrSpace::Global, size: None };
+        DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
     let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
     // ldexp2k(1.0, rintk(2.0)) = 1.0 * 2^2 = 4.0
@@ -559,7 +559,7 @@ fn test_cranelift_poly_at_zero() {
         .expect("Failed to create CPU device with Cranelift");
 
     let ptr_dtype =
-        DType::Ptr { base: Box::new(DType::Scalar(ScalarDType::Float32)), addrspace: AddrSpace::Global, size: None };
+        DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
     let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
     // poly_n(0.0, coeffs) should return a0 (the first coefficient = 1.0 in exp2 case)
@@ -622,11 +622,7 @@ fn test_cranelift_exp2_accuracy() {
     let test_values: &[f32] = &[-10.0, -5.0, -2.0, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0];
 
     for &input in test_values {
-        let ptr_dtype = DType::Ptr {
-            base: Box::new(DType::Scalar(ScalarDType::Float32)),
-            addrspace: AddrSpace::Global,
-            size: None,
-        };
+        let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
         let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
         let const_input = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(input as f64));
@@ -706,11 +702,7 @@ fn test_cranelift_sin_accuracy() {
     ];
 
     for &input in test_values {
-        let ptr_dtype = DType::Ptr {
-            base: Box::new(DType::Scalar(ScalarDType::Float32)),
-            addrspace: AddrSpace::Global,
-            size: None,
-        };
+        let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
         let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
         let const_input = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(input as f64));
@@ -783,11 +775,7 @@ fn test_cranelift_cos_accuracy() {
         &[0.0, pi / 6.0, pi / 4.0, pi / 3.0, pi / 2.0, pi, 3.0 * pi / 2.0, 2.0 * pi, -pi / 2.0, -pi];
 
     for &input in test_values {
-        let ptr_dtype = DType::Ptr {
-            base: Box::new(DType::Scalar(ScalarDType::Float32)),
-            addrspace: AddrSpace::Global,
-            size: None,
-        };
+        let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
         let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
         let const_input = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(input as f64));
@@ -854,11 +842,7 @@ fn test_cranelift_log2_accuracy() {
     let test_values: &[f32] = &[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 0.1, 0.3, 0.7, 1.5, 3.0, 10.0, 100.0];
 
     for &input in test_values {
-        let ptr_dtype = DType::Ptr {
-            base: Box::new(DType::Scalar(ScalarDType::Float32)),
-            addrspace: AddrSpace::Global,
-            size: None,
-        };
+        let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
         let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
         let const_input = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(input as f64));
@@ -916,11 +900,7 @@ fn test_cranelift_exp_accuracy() {
     let test_values: &[f32] = &[-5.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 5.0];
 
     for &input in test_values {
-        let ptr_dtype = DType::Ptr {
-            base: Box::new(DType::Scalar(ScalarDType::Float32)),
-            addrspace: AddrSpace::Global,
-            size: None,
-        };
+        let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
         let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
         let const_input = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(input as f64));
@@ -978,11 +958,7 @@ fn test_cranelift_log_accuracy() {
     let test_values: &[f32] = &[0.1, 0.5, 1.0, 2.0, std::f32::consts::E, 10.0, 100.0];
 
     for &input in test_values {
-        let ptr_dtype = DType::Ptr {
-            base: Box::new(DType::Scalar(ScalarDType::Float32)),
-            addrspace: AddrSpace::Global,
-            size: None,
-        };
+        let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
         let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
         let const_input = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(input as f64));
@@ -1052,11 +1028,7 @@ fn test_cranelift_tan_accuracy() {
     ];
 
     for &input in test_values {
-        let ptr_dtype = DType::Ptr {
-            base: Box::new(DType::Scalar(ScalarDType::Float32)),
-            addrspace: AddrSpace::Global,
-            size: None,
-        };
+        let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
         let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
         let const_input = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(input as f64));
@@ -1138,11 +1110,7 @@ fn test_cranelift_erf_accuracy() {
     ];
 
     for &(input, expected) in test_cases {
-        let ptr_dtype = DType::Ptr {
-            base: Box::new(DType::Scalar(ScalarDType::Float32)),
-            addrspace: AddrSpace::Global,
-            size: None,
-        };
+        let ptr_dtype = DType::Scalar(ScalarDType::Float32).ptr(None, AddrSpace::Global);
         let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
         let const_input = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(input as f64));
