@@ -378,14 +378,7 @@ fn assert_matmul_close(actual: &ArrayD<f32>, expected: &Array2<f32>, tol: f32) {
     assert_eq!(actual.shape(), expected_shape.as_slice(), "Shape mismatch");
 
     for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
-        assert!(
-            (a - e).abs() < tol,
-            "Mismatch at index {}: morok={} vs ndarray={} (diff: {})",
-            i,
-            a,
-            e,
-            (a - e).abs()
-        );
+        assert!((a - e).abs() < tol, "Mismatch at index {}: morok={} vs ndarray={} (diff: {})", i, a, e, (a - e).abs());
     }
 }
 

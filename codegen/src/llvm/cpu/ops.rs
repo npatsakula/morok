@@ -747,50 +747,6 @@ fn codegen_cast_scalar<'ctx>(
 // ============================================================================
 // Memory Operations
 // ============================================================================
-
-/// Extract the effective dimension size from an index expression.
-///
-/// After scheduling transforms (shift_to), indices become expressions like:
-/// - `Add(Mul(Thread, stride), Loop)`
-/// - `Add(Mul(Loop, stride), Upcast)`
-///
-/// For such expressions, we need to find all RANGE ops and multiply their sizes
-/// to get the total iteration count for this index dimension.
-fn extract_index_dimension(idx_uop: &Arc<UOp>) -> i64 {
-    use morok_ir::ConstValue;
-
-    // Case 1: Direct RANGE - use its size directly
-    if let Op::Range { end, .. } = idx_uop.op()
-        && let Op::Const(cv) = end.op()
-        && let ConstValue::Int(size) = cv.0
-    {
-        return size;
-    }
-
-    // Case 2: DefineVar - use max_val + 1
-    if let Op::DefineVar { max_val, .. } = idx_uop.op() {
-        return *max_val + 1;
-    }
-
-    // Case 3: Expression containing RANGE ops (from shift_to transforms)
-    // Multiply all RANGE sizes in the expression to get total iteration count
-    let mut product = 1i64;
-    for node in idx_uop.toposort() {
-        if let Op::Range { end, .. } = node.op()
-            && let Op::Const(cv) = end.op()
-            && let ConstValue::Int(size) = cv.0
-        {
-            product *= size;
-        }
-    }
-
-    if product > 1 {
-        return product;
-    }
-
-    // Fallback: unknown dimension (single element)
-    1
-}
 fn codegen_memory<'ctx>(
     uop: &Arc<UOp>,
     context: &'ctx Context,
@@ -815,138 +771,50 @@ fn codegen_memory<'ctx>(
             Ok(None)
         }
         Op::Index { buffer, indices, gate: None } => {
-            trace!(index.id = uop.id, buffer.id = buffer.id, num_indices = indices.len(), "INDEX operation");
+            // Multi-index linearization now happens in schedule (pm_linearize_multi_index).
+            // Codegen only handles single-index case.
+            if indices.len() != 1 {
+                return UnsupportedSnafu {
+                    what: "Multi-index INDEX - should be linearized in schedule before codegen",
+                }
+                .fail();
+            }
+
+            trace!(index.id = uop.id, buffer.id = buffer.id, "INDEX operation");
 
             let buffer_ptr = require_value(buffer, context, module, builder, values)?;
-            if indices.len() == 1 {
-                let index_val = require_value(&indices[0], context, module, builder, values)?;
-                debug!(
-                    uop_id = uop.id,
-                    buffer_id = buffer.id,
-                    index_id = indices[0].id,
-                    index_op = ?indices[0].op(),
-                    buffer_ptr = ?buffer_ptr,
-                    index_val = ?index_val,
-                    result_dtype = ?uop.dtype(),
-                    "INDEX: buffer[index]"
-                );
+            let index_val = require_value(&indices[0], context, module, builder, values)?;
+            debug!(
+                uop_id = uop.id,
+                buffer_id = buffer.id,
+                index_id = indices[0].id,
+                index_op = ?indices[0].op(),
+                buffer_ptr = ?buffer_ptr,
+                index_val = ?index_val,
+                result_dtype = ?uop.dtype(),
+                "INDEX: buffer[index]"
+            );
 
-                // Handle vector indices (from UPCAST optimization)
-                // Return the vector indices directly - LOAD will do gather, STORE will do scatter.
-                // This separates addressing (INDEX) from data movement (LOAD/STORE).
-                if index_val.is_vector_value() {
-                    debug!(uop_id = uop.id, "INDEX: returning vector indices for gather/scatter");
-                    return Ok(Some(index_val));
-                }
-
-                // Scalar index - regular GEP
-                let element_type = match uop.dtype() {
-                    DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
-                    other => common::dtype_to_basic_type(&other, context)?,
-                };
-                let ptr = unsafe {
-                    builder
-                        .build_gep(element_type, buffer_ptr.into_pointer_value(), &[index_val.into_int_value()], "idx")
-                        .context(BuildGepSnafu)?
-                };
-                debug!(uop_id = uop.id, result_ptr = ?ptr, "index: computed pointer");
-                Ok(Some(ptr.into()))
-            } else {
-                // Multi-index: linearize at codegen time
-                // Extract dimensions from Range.end, DefineVar.max_val, or expressions
-                let dims: Vec<i64> = indices.iter().map(extract_index_dimension).collect();
-
-                // Compute row-major strides
-                let mut strides = vec![1i64; dims.len()];
-                for i in (0..dims.len().saturating_sub(1)).rev() {
-                    strides[i] = strides[i + 1] * dims[i + 1];
-                }
-
-                debug!(
-                    uop_id = uop.id,
-                    buffer_id = buffer.id,
-                    num_indices = indices.len(),
-                    dims = ?dims,
-                    strides = ?strides,
-                    "INDEX: multi-index linearization at codegen"
-                );
-
-                // Generate index values
-                let index_vals: Vec<BasicValueEnum> = indices
-                    .iter()
-                    .map(|idx| require_value(idx, context, module, builder, values))
-                    .collect::<Result<Vec<_>>>()?;
-
-                // Check if any index is vectorized
-                let is_vectorized = index_vals.iter().any(|v| v.is_vector_value());
-
-                if is_vectorized {
-                    // Vectorized multi-index - compute linearized vector indices
-                    // LOAD will do gather, STORE will do scatter
-                    let vec_len = index_vals
-                        .iter()
-                        .find(|v| v.is_vector_value())
-                        .map(|v| v.into_vector_value().get_type().get_size())
-                        .unwrap_or(1);
-
-                    // Build result vector of linearized indices
-                    let result_vec_type = context.i64_type().vec_type(vec_len);
-                    let mut result: BasicValueEnum = result_vec_type.get_poison().into();
-
-                    for lane in 0..vec_len {
-                        let lane_const = context.i32_type().const_int(lane as u64, false);
-
-                        // Compute linear index for this lane
-                        let mut linear = context.i64_type().const_int(0, false);
-                        for (idx_val, &stride) in index_vals.iter().zip(strides.iter()) {
-                            let scalar_idx = if idx_val.is_vector_value() {
-                                builder
-                                    .build_extract_element(idx_val.into_vector_value(), lane_const, "multi_idx")
-                                    .context(VectorExtractSnafu)?
-                                    .into_int_value()
-                            } else {
-                                idx_val.into_int_value()
-                            };
-                            let stride_val = context.i64_type().const_int(stride as u64, false);
-                            let term =
-                                builder.build_int_mul(scalar_idx, stride_val, "stride_mul").context(ArithmeticSnafu)?;
-                            linear = builder.build_int_add(linear, term, "linear_add").context(ArithmeticSnafu)?;
-                        }
-
-                        // Insert linearized index into result vector
-                        result = builder
-                            .build_insert_element(result.into_vector_value(), linear, lane_const, "linear_insert")
-                            .context(VectorInsertSnafu)?
-                            .into();
-                    }
-
-                    debug!(uop_id = uop.id, "INDEX: returning linearized vector indices for gather/scatter");
-                    return Ok(Some(result));
-                }
-
-                // Scalar multi-index: linearize to single offset
-                let mut linear = context.i64_type().const_int(0, false);
-                for (idx_val, &stride) in index_vals.iter().zip(strides.iter()) {
-                    let stride_val = context.i64_type().const_int(stride as u64, false);
-                    let term = builder
-                        .build_int_mul(idx_val.into_int_value(), stride_val, "stride_mul")
-                        .context(ArithmeticSnafu)?;
-                    linear = builder.build_int_add(linear, term, "linear_add").context(ArithmeticSnafu)?;
-                }
-
-                // GEP with linear index
-                let element_type = match uop.dtype() {
-                    DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
-                    other => common::dtype_to_basic_type(&other, context)?,
-                };
-                let ptr = unsafe {
-                    builder
-                        .build_gep(element_type, buffer_ptr.into_pointer_value(), &[linear], "idx_linear")
-                        .context(BuildGepSnafu)?
-                };
-                debug!(uop_id = uop.id, result_ptr = ?ptr, "INDEX: multi-index linearized");
-                Ok(Some(ptr.into()))
+            // Handle vector indices (from UPCAST optimization)
+            // Return the vector indices directly - LOAD will do gather, STORE will do scatter.
+            // This separates addressing (INDEX) from data movement (LOAD/STORE).
+            if index_val.is_vector_value() {
+                debug!(uop_id = uop.id, "INDEX: returning vector indices for gather/scatter");
+                return Ok(Some(index_val));
             }
+
+            // Scalar index - regular GEP
+            let element_type = match uop.dtype() {
+                DType::Ptr { base, .. } => common::dtype_to_basic_type(&base, context)?,
+                other => common::dtype_to_basic_type(&other, context)?,
+            };
+            let ptr = unsafe {
+                builder
+                    .build_gep(element_type, buffer_ptr.into_pointer_value(), &[index_val.into_int_value()], "idx")
+                    .context(BuildGepSnafu)?
+            };
+            debug!(uop_id = uop.id, result_ptr = ?ptr, "index: computed pointer");
+            Ok(Some(ptr.into()))
         }
         Op::Index { gate: Some(_), .. } => UnsupportedSnafu { what: "Gated INDEX" }.fail(),
         Op::PointerIndex { ptr, offset } => {

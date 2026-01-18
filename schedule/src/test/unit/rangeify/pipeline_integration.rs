@@ -263,11 +263,15 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
         println!("  {} [{:?}]", op_name, node.dtype());
     }
 
-    // Check that INDEX operations on DEFINE_GLOBAL have Ptr dtype
+    // Check that INDEX operations on DEFINE_GLOBAL exist and have element dtype
     // NOTE: The rangeify pipeline no longer wraps INDEX in LOAD.
     // Instead, codegen auto-loads pointer values when they are used as operands
     // in arithmetic (e.g., ADD). This avoids the issue where STORE's index
     // was incorrectly wrapped in LOAD, causing "buffer accessed with conflicting ops" errors.
+    //
+    // INDEX dtype is the element type (from UOp::index constructor), not Ptr.
+    // The Ptr dtype transformation happens in pm_add_loads during post-optimization,
+    // which is NOT part of run_kernel_split_pipeline.
     let topo = kernelized.toposort();
     let index_on_define_global = topo
         .iter()
@@ -276,11 +280,12 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
         })
         .collect::<Vec<_>>();
 
-    // All INDEX on DEFINE_GLOBAL should have Ptr dtype
+    // All INDEX on DEFINE_GLOBAL should have element dtype (not Ptr)
+    // pm_add_loads transforms this to Ptr later in post-optimization
     for index_node in &index_on_define_global {
         assert!(
-            matches!(index_node.dtype(), DType::Ptr { .. }),
-            "INDEX on DEFINE_GLOBAL should have Ptr dtype, got {:?}",
+            !matches!(index_node.dtype(), DType::Ptr { .. }),
+            "INDEX on DEFINE_GLOBAL should have element dtype (before pm_add_loads), got {:?}",
             index_node.dtype()
         );
     }

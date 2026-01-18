@@ -161,46 +161,18 @@ pub(crate) fn codegen_uop(
         }
 
         Op::Index { buffer, indices, gate: None } => {
+            // Multi-index linearization now happens in schedule (pm_linearize_multi_index).
+            // Codegen only handles single-index case.
+            if indices.len() != 1 {
+                return UnsupportedSnafu {
+                    what: "Multi-index INDEX - should be linearized in schedule before codegen",
+                }
+                .fail()
+                .map_err(Into::into);
+            }
+
             let buffer_val = get_value(buffer, builder, values, loop_contexts)?;
-
-            let linear_index = if indices.len() == 1 {
-                // Single-index case: use directly
-                get_value(&indices[0], builder, values, loop_contexts)?
-            } else {
-                // Multi-index: linearize at codegen time
-                // Extract dimensions from Range.end or DefineVar.max_val
-                let dims: Vec<i64> = indices
-                    .iter()
-                    .map(|idx_uop| {
-                        if let Op::Range { end, .. } = idx_uop.op()
-                            && let Op::Const(cv) = end.op()
-                            && let ConstValue::Int(size) = cv.0
-                        {
-                            return size;
-                        }
-                        if let Op::DefineVar { max_val, .. } = idx_uop.op() {
-                            return *max_val + 1;
-                        }
-                        1 // fallback for unknown dimensions
-                    })
-                    .collect();
-
-                // Compute row-major strides
-                let mut strides = vec![1i64; dims.len()];
-                for i in (0..dims.len().saturating_sub(1)).rev() {
-                    strides[i] = strides[i + 1] * dims[i + 1];
-                }
-
-                // Build linear index: sum(idx[i] * stride[i])
-                let mut linear = builder.ins().iconst(cl_types::I64, 0);
-                for (idx_uop, &stride) in indices.iter().zip(strides.iter()) {
-                    let idx_val = get_value(idx_uop, builder, values, loop_contexts)?;
-                    let stride_val = builder.ins().iconst(cl_types::I64, stride);
-                    let term = builder.ins().imul(idx_val, stride_val);
-                    linear = builder.ins().iadd(linear, term);
-                }
-                linear
-            };
+            let linear_index = get_value(&indices[0], builder, values, loop_contexts)?;
 
             // Compute byte offset
             let element_size = match uop.dtype() {

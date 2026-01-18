@@ -118,13 +118,21 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// Called by both heuristic and beam search paths for consistent behavior.
 #[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
 pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -> Arc<morok_ir::UOp> {
+    // Multi-index linearization: INDEX(buf, [i,j,k]) → INDEX(buf, [linear])
+    // Moves row-major linearization from codegen to schedule, eliminating
+    // duplicated logic in LLVM and Cranelift backends.
+    // Must run BEFORE pm_add_loads (which transforms INDEX dtype to Ptr).
+    // Uses bottom-up traversal to ensure children are processed before parents.
+    let pm_linearize = crate::passes::pm_linearize_multi_index();
+    let linearized = crate::rewrite::graph_rewrite_bottom_up(&pm_linearize, ast, &mut ());
+
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
     let pm_loads = crate::rangeify::patterns::pm_add_loads();
     // First pass: wrap existing INDEX ops before expansion.
     // Pattern has guard (!Ptr dtype) and transforms INDEX dtype to Ptr, so safe for reuse.
-    let with_loads = graph_rewrite(&pm_loads, ast, &mut ());
+    let with_loads = graph_rewrite(&pm_loads, linearized, &mut ());
 
     // Post-optimization: Fix UNROLL substitutions in REDUCE ops
     // This handles arithmetic expressions created by shift_to UNROLL

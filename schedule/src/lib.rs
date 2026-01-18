@@ -22,6 +22,7 @@ pub mod devectorize;
 pub mod expand;
 pub mod linearize;
 pub mod optimizer;
+pub mod passes;
 pub mod rangeify;
 pub mod symbolic;
 
@@ -47,6 +48,9 @@ pub use expand::pre_expand;
 
 // Re-export devectorize pass
 pub use devectorize::devectorize;
+
+// Re-export backend-agnostic passes
+pub use passes::pm_linearize_multi_index;
 
 // Re-export optimizer entry points
 pub use optimizer::{
