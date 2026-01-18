@@ -19,7 +19,7 @@ use smallvec::SmallVec;
 use tracing::{debug, trace};
 
 use super::context::RangeifyContext;
-use super::indexing::{range_size_as_i64, IndexingContext};
+use super::indexing::{IndexingContext, range_size_as_i64};
 use super::kernel::KernelContext;
 use crate::passes::linearize_index::{build_linear_index, compute_row_major_strides};
 
@@ -433,10 +433,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
         // later passes (pm_linearize_multi_index) only see the 1D buffer shape.
         if ranges.len() > 1 {
             // Extract sizes from each RANGE
-            let dims: Vec<i64> = ranges
-                .iter()
-                .filter_map(|r| range_size_as_i64(r))
-                .collect();
+            let dims: Vec<i64> = ranges.iter().filter_map(|r| range_size_as_i64(r)).collect();
 
             if dims.len() == ranges.len() {
                 // All ranges have concrete sizes - linearize

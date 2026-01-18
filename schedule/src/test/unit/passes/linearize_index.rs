@@ -22,11 +22,7 @@ fn make_bufferize(dims: &[i64]) -> Arc<UOp> {
     let compute = UOp::const_(DType::Float32, morok_ir::ConstValue::Float(0.0));
 
     // Create ranges for each dimension
-    let ranges: Vec<Arc<UOp>> = dims
-        .iter()
-        .enumerate()
-        .map(|(i, &size)| make_range(size, i))
-        .collect();
+    let ranges: Vec<Arc<UOp>> = dims.iter().enumerate().map(|(i, &size)| make_range(size, i)).collect();
 
     UOp::bufferize_global(compute, ranges)
 }

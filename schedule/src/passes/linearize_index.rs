@@ -82,9 +82,7 @@ fn extract_index_dimension(idx_uop: &Arc<UOp>) -> Option<i64> {
         // Fallback: try vmin/vmax range analysis
         // vmin/vmax give bounds [min, max], so dimension is max - min + 1
         match (idx_uop.vmin(), idx_uop.vmax()) {
-            (ConstValue::Int(min), ConstValue::Int(max)) if max >= min => {
-                Some(max - min + 1)
-            }
+            (ConstValue::Int(min), ConstValue::Int(max)) if max >= min => Some(max - min + 1),
             _ => None,
         }
     }

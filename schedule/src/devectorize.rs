@@ -54,26 +54,22 @@ use crate::symbolic::patterns::{gep_pushing_patterns, symbolic};
 ///
 /// Matches Tinygrad's devectorizer pipeline (devectorizer.py):
 /// - Phase 1: expand_index → PTRCAT grouping
-/// - Phase 2: load_store_folding + split_load + CAT→VECTORIZE (all together)
-/// - Phase 3: bool storage conversion
+/// - Phase 2: load_store_folding (GEP movement + PTRCAT distribution + split)
+///
+/// Note: Bool storage conversion (`bool_storage_patterns()`) is called separately
+/// from `optimizer/mod.rs` as it's backend-specific (LLVM/PTX).
 pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
     // Phase 1: Expand vector indices into grouped PTRCAT
     let phase1 = expand_index_patterns();
     let ast = graph_rewrite_bottom_up(&phase1, ast.clone(), &mut ());
 
-    // Phase 2: Distribute PTRCAT through LOAD/STORE, split by divisibility, and CAT→VECTORIZE
-    // All patterns run together so when split_load creates CAT([LOAD<4>×16]),
-    // CAT→VECTORIZE immediately fires to convert it before GEP(CAT) can see multi-element sources.
+    // Phase 2: GEP movement + PTRCAT distribution + LOAD/STORE splitting + CAT→VECTORIZE
+    // All patterns run together so:
+    // - LOAD(GEP(PTRCAT)) → GEP(LOAD(PTRCAT)) → GEP(CAT(LOADs))
+    // - split_load creates CAT([LOAD<4>×N]), CAT→VECTORIZE converts it
     // This matches Tinygrad where gep_pushing (with CAT→VECTORIZE) is part of symbolic.
     let phase2 = gep_ptrcat_patterns() + load_store_patterns();
-    let ast = graph_rewrite_bottom_up(&phase2, ast, &mut ());
-
-    // Phase 3: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits
-    // LLVM's i1 type can have garbage in upper bits when stored to memory.
-    // By casting to uint8 before store and after load, we ensure clean 0/1 values.
-    // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
-    let phase3 = bool_storage_patterns();
-    graph_rewrite_bottom_up(&phase3, ast, &mut ())
+    graph_rewrite_bottom_up(&phase2, ast, &mut ())
 }
 /// Phase 3 patterns: Convert bool LOAD/STORE to use uint8 storage.
 ///
@@ -466,20 +462,49 @@ pub(crate) fn expand_index_patterns() -> TypedPatternMatcher {
     }
 }
 
-/// Phase 2 patterns: distribute PTRCAT and split LOAD/STORE.
+/// Phase 2 patterns: GEP movement, PTRCAT distribution, and LOAD/STORE splitting.
+///
+/// Based on Tinygrad's load_store_folding (devectorizer.py:114-126).
+/// Pattern order matters:
+/// 1. Move GEP after LOAD/STORE (enables PTRCAT distribution)
+/// 2. Distribute PTRCAT through LOAD/STORE
+/// 3. Split LOAD/STORE by fold length
 pub(crate) fn load_store_patterns() -> TypedPatternMatcher {
     crate::patterns! {
-        // Distribute PTRCAT through LOAD: LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
-        load if is_ptrcat_load(load) => |load| distribute_ptrcat_load(load),
+        // === GEP Movement (Tinygrad devectorizer.py:117-120) ===
+        // These MUST come first to transform LOAD(GEP(PTRCAT)) → GEP(LOAD(PTRCAT))
+        // so that PTRCAT distribution can fire.
 
-        // Distribute PTRCAT through STORE: STORE(PTRCAT(a,b), data) → GROUP(STORE(a, gep(data)), ...)
-        store if is_ptrcat_store(store) => |store| distribute_ptrcat_store(store),
+        // LOAD(GEP(x)) → GEP(LOAD(x))
+        // Tinygrad: ld.replace(dtype=ld.dtype.scalar().vec(gep.dtype.count), src=(gep.src[0],)+ld.src[1:]).gep(gep.arg)
+        load @ Load { buffer, index: Gep { vector, indices } }
+            => |load, buffer, vector, indices| move_gep_after_load(load, buffer, vector, indices),
 
-        // Split LOAD(CAST(INDEX)) by divisibility
-        load if is_cast_index_load(load) => |load| split_load(load),
+        // STORE(GEP(x), data) → STORE(x, GEP⁻¹(data))
+        // Tinygrad: gep_on_store (devectorizer.py:106-113) - preserves sto.src[2:]
+        Store { buffer, index: Gep { vector, indices }, value, ranges }
+            => |buffer, vector, indices, value, ranges| move_gep_on_store(buffer, vector, indices, value, ranges),
 
-        // Split STORE(CAST(INDEX), ...) by divisibility
-        store if is_cast_index_store(store) => |store| split_store(store),
+        // === PTRCAT Distribution (Tinygrad devectorizer.py:122-125) ===
+
+        // LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
+        Load { buffer, index: PtrCat { sources } }
+            => |buffer, sources| distribute_ptrcat_load(buffer, sources),
+
+        // STORE(PTRCAT(a,b), data) → GROUP(STORE(a, gep(data,0..n)), ...)
+        // Tinygrad: cat_after_store preserves sto.src[2:] (ranges)
+        Store { buffer, index: PtrCat { sources }, value, ranges }
+            => |buffer, sources, value, ranges| distribute_ptrcat_store(buffer, sources, value, ranges),
+
+        // === Split by Fold Length (Tinygrad correct_load_store) ===
+
+        // LOAD(CAST(INDEX)) → split by fold length
+        Load { buffer, index: Cast { src: idx @ Index { buffer: _b, indices: _i, gate: _g }, dtype: cast_dtype } }
+            => |buffer, idx, cast_dtype| split_load(buffer, idx, cast_dtype),
+
+        // STORE(CAST(INDEX), data) → split by fold length
+        Store { buffer, index: Cast { src: idx @ Index { buffer: _b, indices: _i, gate: _g }, dtype: cast_dtype }, value, ranges }
+            => |buffer, idx, cast_dtype, value, ranges| split_store(buffer, idx, cast_dtype, value, ranges),
     }
 }
 
@@ -497,34 +522,82 @@ fn is_vector_index(uop: &Arc<UOp>) -> bool {
     false
 }
 
-/// Check if LOAD has PTRCAT as its index.
-fn is_ptrcat_load(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Load { index, .. } if matches!(index.op(), Op::PtrCat { .. }))
+// ============================================================================
+// GEP Movement Patterns (Tinygrad devectorizer.py:117-120, 106-113)
+// ============================================================================
+
+/// Move GEP after LOAD: LOAD(GEP(ptr, indices)) → GEP(LOAD(ptr), indices)
+///
+/// Tinygrad (devectorizer.py:117-118):
+/// ```python
+/// lambda gep, ld: ld.replace(dtype=ld.dtype.scalar().vec(gep.dtype.count),
+///                            src=(gep.src[0],)+ld.src[1:]).gep(gep.arg)
+/// ```
+///
+/// Key insight: new LOAD dtype = `ld.dtype.scalar().vec(gep.dtype.count)`
+/// - Uses the LOAD's dtype scalar base, NOT the buffer's dtype
+/// - Vector count = number of elements GEP selects (gep_indices.len())
+///
+/// This enables PTRCAT distribution: LOAD(GEP(PTRCAT)) → GEP(LOAD(PTRCAT)) → GEP(CAT(LOADs))
+fn move_gep_after_load(
+    load: &Arc<UOp>,
+    buffer: &Arc<UOp>,
+    gep_inner: &Arc<UOp>,
+    gep_indices: &[usize],
+) -> Option<Arc<UOp>> {
+    // Tinygrad: ld.dtype.scalar().vec(gep.dtype.count)
+    // Use the LOAD's dtype to get the scalar base, not the buffer's dtype
+    let gep_count = gep_indices.len();
+    let scalar_base = load.dtype().scalar()?;
+    let inner_load_dtype = if gep_count > 1 {
+        DType::Vector { scalar: scalar_base, count: gep_count }
+    } else {
+        DType::Scalar(scalar_base)
+    };
+
+    // Create the inner LOAD with dtype matching GEP's output size
+    // Tinygrad: src=(gep.src[0],)+ld.src[1:] - we use gep_inner as the new index
+    let inner_load = UOp::new(Op::Load { buffer: buffer.clone(), index: gep_inner.clone() }, inner_load_dtype);
+
+    // Apply GEP to the loaded result (this may become identity if indices are [0,1,2,...])
+    Some(UOp::gep(inner_load, gep_indices.to_vec()))
 }
 
-/// Check if STORE has PTRCAT as its index.
-fn is_ptrcat_store(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Store { index, .. } if matches!(index.op(), Op::PtrCat { .. }))
-}
+/// Move GEP on STORE: STORE(GEP(ptr, indices), data) → STORE(ptr, GEP⁻¹(data))
+///
+/// Tinygrad (devectorizer.py:106-113):
+/// ```python
+/// def gep_on_store(gep:UOp, st:UOp, sto:UOp):
+///   # NOTE: we need to invert the gep here, but it may be an expanding gep
+///   # fake argsort. TODO: handle duplicates
+///   a = {}
+///   for i,x in enumerate(gep.arg): a[x] = i
+///   new_arg = tuple(x[1] for x in sorted(a.items()))
+///   return gep.src[0].store(st.gep(new_arg), *sto.src[2:])  # preserves ranges
+/// ```
+fn move_gep_on_store(
+    buffer: &Arc<UOp>,
+    gep_inner: &Arc<UOp>,
+    gep_indices: &[usize],
+    value: &Arc<UOp>,
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
+) -> Option<Arc<UOp>> {
+    // Invert the GEP indices: build a map from output position to input position
+    // GEP([2,0,1]) means: result[0]=src[2], result[1]=src[0], result[2]=src[1]
+    // Inverse: to write result, we need src[gep_idx[i]] = input[i]
+    // So inverse_gep[gep_idx[i]] = i, i.e., inverse[2]=0, inverse[0]=1, inverse[1]=2
+    // Sorted by key: [(0,1), (1,2), (2,0)] → [1, 2, 0]
 
-/// Check if LOAD has CAST(INDEX) as its index.
-fn is_cast_index_load(uop: &Arc<UOp>) -> bool {
-    if let Op::Load { index, .. } = uop.op()
-        && let Op::Cast { src, .. } = index.op()
-    {
-        return matches!(src.op(), Op::Index { .. });
-    }
-    false
-}
+    let mut inverse_map: Vec<(usize, usize)> = gep_indices.iter().enumerate().map(|(i, &x)| (x, i)).collect();
+    inverse_map.sort_by_key(|&(x, _)| x);
+    let inverse_indices: Vec<usize> = inverse_map.iter().map(|&(_, i)| i).collect();
 
-/// Check if STORE has CAST(INDEX) as its index.
-fn is_cast_index_store(uop: &Arc<UOp>) -> bool {
-    if let Op::Store { index, .. } = uop.op()
-        && let Op::Cast { src, .. } = index.op()
-    {
-        return matches!(src.op(), Op::Index { .. });
-    }
-    false
+    // Apply inverse GEP to the value
+    let reordered_value = UOp::gep(value.clone(), inverse_indices);
+
+    // Create STORE to the inner pointer with reordered value, preserving ranges
+    // Tinygrad: *sto.src[2:] preserves additional store arguments
+    Some(UOp::store_with_ranges(buffer.clone(), gep_inner.clone(), reordered_value, ranges.clone()))
 }
 
 // ============================================================================
@@ -824,15 +897,7 @@ fn make_vec_ptr_dtype(buffer: &Arc<UOp>, vec_len: usize) -> DType {
 ///
 /// Based on Tinygrad's load_store_folding pattern (devectorizer.py:122-123).
 /// LOAD(PTRCAT(a, b, c)) → CAT(LOAD(a), LOAD(b), LOAD(c))
-fn distribute_ptrcat_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Load { buffer, index } = load.op() else {
-        return None;
-    };
-
-    let Op::PtrCat { sources } = index.op() else {
-        return None;
-    };
-
+fn distribute_ptrcat_load(buffer: &Arc<UOp>, sources: &[Arc<UOp>]) -> Option<Arc<UOp>> {
     tracing::debug!(num_sources = sources.len(), "distribute_ptrcat_load: distributing PTRCAT through LOAD");
 
     // Create individual LOADs for each pointer
@@ -851,17 +916,24 @@ fn distribute_ptrcat_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// Distribute PTRCAT through STORE.
 ///
-/// Based on Tinygrad's cat_after_store (devectorizer.py:97-104).
+/// Based on Tinygrad's cat_after_store (devectorizer.py:97-104):
+/// ```python
+/// def cat_after_store(cat:UOp, data:UOp, sto:UOp):
+///   offset = 0
+///   ret: list[UOp] = []
+///   for s in cat.src:
+///     ret.append(s.store(data.gep(tuple(range(offset, offset+s.dtype.count))), *sto.src[2:]))
+///     offset += s.dtype.count
+///   return UOp.group(*ret)
+/// ```
+///
 /// STORE(PTRCAT(a, b), data) → GROUP(STORE(a, gep(data, 0..n)), STORE(b, gep(data, n..)))
-fn distribute_ptrcat_store(store: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Store { buffer, index, value, ranges } = store.op() else {
-        return None;
-    };
-
-    let Op::PtrCat { sources } = index.op() else {
-        return None;
-    };
-
+fn distribute_ptrcat_store(
+    buffer: &Arc<UOp>,
+    sources: &[Arc<UOp>],
+    value: &Arc<UOp>,
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
+) -> Option<Arc<UOp>> {
     tracing::debug!(num_sources = sources.len(), "distribute_ptrcat_store: distributing PTRCAT through STORE");
 
     // Create individual STOREs for each pointer
@@ -872,10 +944,12 @@ fn distribute_ptrcat_store(store: &Arc<UOp>) -> Option<Arc<UOp>> {
         let ptr_count = ptr_element_count(ptr);
 
         // GEP to extract data elements for this store
+        // Tinygrad: data.gep(tuple(range(offset, offset+s.dtype.count)))
         let gep_indices: Vec<usize> = (offset..offset + ptr_count).collect();
         let store_value = UOp::gep(value.clone(), gep_indices);
 
-        // Create STORE
+        // Create STORE with preserved ranges
+        // Tinygrad: *sto.src[2:] preserves additional store arguments
         let store_op = UOp::store_with_ranges(buffer.clone(), ptr.clone(), store_value, ranges.clone());
         stores.push(store_op);
 
@@ -946,28 +1020,30 @@ fn get_device_fold_lengths(load_dtype: &DType) -> Vec<usize> {
 ///
 /// Based on Tinygrad's split_load_store (devectorizer.py:130-174).
 /// For LOAD(CAST(INDEX)), determine maximum fold length based on offset divisibility.
-fn split_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Load { buffer, index } = load.op() else {
+fn split_load(buffer: &Arc<UOp>, idx: &Arc<UOp>, cast_dtype: &DType) -> Option<Arc<UOp>> {
+    let Op::Index { indices, .. } = idx.op() else {
         return None;
     };
 
-    let Op::Cast { src: inner_idx, dtype: _cast_dtype } = index.op() else {
-        return None;
+    // Get vector size from the cast pointer dtype
+    let sz = match cast_dtype {
+        DType::Ptr { size: Some(sz), .. } => *sz,
+        DType::Ptr { base, .. } => base.vcount(),
+        _ => return None,
     };
 
-    let Op::Index { indices, .. } = inner_idx.op() else {
-        return None;
-    };
-
-    let sz = load.dtype().vcount();
     if sz <= 1 {
         return None;
     }
 
     tracing::debug!(sz = sz, "split_load: processing LOAD(CAST(INDEX))");
 
+    // Get scalar base type from buffer
+    let scalar_base = buffer.dtype().base();
+
     // Determine fold lengths (based on device capability and dtype)
-    let mut lengths = get_device_fold_lengths(&load.dtype());
+    let load_dtype = DType::Vector { scalar: scalar_base, count: sz };
+    let mut lengths = get_device_fold_lengths(&load_dtype);
 
     // Filter by offset divisibility (Issue 4: conservative default)
     if let Some(offset) = indices.first() {
@@ -990,7 +1066,7 @@ fn split_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
             }
 
             // Create INDEX for this chunk
-            let chunk_idx = if pos == 0 { inner_idx.clone() } else { offset_index(inner_idx, pos as i64) };
+            let chunk_idx = if pos == 0 { idx.clone() } else { offset_index(idx, pos as i64) };
 
             // CAST to vector pointer if fold_len > 1
             let chunk_ptr = if fold_len > 1 {
@@ -1002,9 +1078,9 @@ fn split_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
 
             // Create LOAD with appropriate dtype
             let chunk_dtype = if fold_len > 1 {
-                DType::Vector { scalar: load.dtype().base(), count: fold_len }
+                DType::Vector { scalar: scalar_base, count: fold_len }
             } else {
-                DType::Scalar(load.dtype().base())
+                DType::Scalar(scalar_base)
             };
 
             let chunk_load = UOp::new(Op::Load { buffer: buffer.clone(), index: chunk_ptr }, chunk_dtype);
@@ -1026,20 +1102,24 @@ fn split_load(load: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 /// Split STORE based on fold length divisibility.
-fn split_store(store: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Store { buffer, index, value, ranges } = store.op() else {
+fn split_store(
+    buffer: &Arc<UOp>,
+    idx: &Arc<UOp>,
+    cast_dtype: &DType,
+    value: &Arc<UOp>,
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
+) -> Option<Arc<UOp>> {
+    let Op::Index { indices, .. } = idx.op() else {
         return None;
     };
 
-    let Op::Cast { src: inner_idx, .. } = index.op() else {
-        return None;
-    };
+    // Get vector size from the value dtype or cast pointer dtype
+    let sz = value.dtype().vcount().max(match cast_dtype {
+        DType::Ptr { size: Some(sz), .. } => *sz,
+        DType::Ptr { base, .. } => base.vcount(),
+        _ => 1,
+    });
 
-    let Op::Index { indices, .. } = inner_idx.op() else {
-        return None;
-    };
-
-    let sz = value.dtype().vcount();
     if sz <= 1 {
         return None;
     }
@@ -1069,7 +1149,7 @@ fn split_store(store: &Arc<UOp>) -> Option<Arc<UOp>> {
             }
 
             // Create INDEX for this chunk
-            let chunk_idx = if pos == 0 { inner_idx.clone() } else { offset_index(inner_idx, pos as i64) };
+            let chunk_idx = if pos == 0 { idx.clone() } else { offset_index(idx, pos as i64) };
 
             // CAST to vector pointer if fold_len > 1
             let chunk_ptr = if fold_len > 1 {
@@ -1083,7 +1163,7 @@ fn split_store(store: &Arc<UOp>) -> Option<Arc<UOp>> {
             let gep_indices: Vec<usize> = (pos..pos + fold_len).collect();
             let chunk_value = UOp::gep(value.clone(), gep_indices);
 
-            // Create STORE
+            // Create STORE with preserved ranges
             let chunk_store = UOp::store_with_ranges(buffer.clone(), chunk_ptr, chunk_value, ranges.clone());
             stores.push(chunk_store);
 
