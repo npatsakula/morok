@@ -850,6 +850,8 @@ fn codegen_load<'ctx>(
         // Validate that indices are integer type (not float data)
         // Float vectors as indices indicate an IR generation bug
         if !matches!(vec_indices.get_type().get_element_type(), inkwell::types::BasicTypeEnum::IntType(_)) {
+            // NOTE: This error occurs when a float vector is passed as index to codegen_load.
+            // The caller should have passed an integer index. Check the INDEX operation in the IR.
             return UnsupportedSnafu { what: "Vector Load index must be integer type, got float vector" }.fail();
         }
 

@@ -167,7 +167,8 @@ fn test_bufferize_to_store_multiple_ranges() {
     // Value should be the compute
     assert!(std::sync::Arc::ptr_eq(value, &compute));
 
-    // Index should be INDEX with both ranges
+    // Index should be INDEX with linearized index (2 ranges → 1 linear index)
+    // For dims [4, 8], strides are [8, 1], so linear = range1 * 8 + range2
     let Op::Index { buffer: idx_buffer, indices, .. } = index.op() else {
         panic!("Expected INDEX operation");
     };
@@ -175,8 +176,8 @@ fn test_bufferize_to_store_multiple_ranges() {
     // Buffer should match the STORE buffer
     assert!(std::sync::Arc::ptr_eq(idx_buffer, buffer));
 
-    // Should have 2 indices
-    assert_eq!(indices.len(), 2);
+    // Should have 1 linearized index (not 2 separate ranges)
+    assert_eq!(indices.len(), 1, "Multi-index should be linearized to single index");
 
     // Verify context
     assert_eq!(ctx.global_counter, 1);

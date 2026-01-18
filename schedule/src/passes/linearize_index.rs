@@ -12,6 +12,14 @@
 //! - Strides: `[D1*D2, D2, 1]`
 //! - Linear offset: `i*(D1*D2) + j*D2 + k`
 //!
+//! # Dimension Extraction
+//!
+//! Dimensions are extracted from index expressions, not buffer shape:
+//! - Direct RANGE: use `RANGE.end`
+//! - DefineVar: use `max_val + 1`
+//! - Complex expressions: multiply all contained RANGE sizes
+//! - Fallback: vmin/vmax range analysis
+//!
 //! # Vectorized Indices
 //!
 //! When any index is vectorized (from UPCAST), the linearization is applied
@@ -25,35 +33,59 @@ use tracing::trace;
 
 use crate::TypedPatternMatcher;
 
-/// Extract the dimension (iteration count) from an index UOp.
+/// Extract dimension from an index expression.
 ///
-/// Uses vmin/vmax properties to determine the range of values an index can take.
-/// This is more robust than pattern matching on specific op types.
-pub(crate) fn extract_index_dimension(idx_uop: &Arc<UOp>) -> i64 {
-    use morok_ir::uop::cached_property::CachedProperty;
-    use morok_ir::uop::properties::VminVmaxProperty;
-
-    let (vmin, vmax) = VminVmaxProperty::get(idx_uop);
-
-    match (vmin, vmax) {
-        (ConstValue::Int(min), ConstValue::Int(max)) => {
-            // Dimension is the number of distinct values: max - min + 1
-            // But for strides, we need the "size" which is typically max + 1 for 0-based indices
-            // Since most indices are 0-based (vmin=0), this gives max + 1
-            (max - min + 1).max(1)
+/// Index expressions can be:
+/// - Direct RANGE - use its size
+/// - DefineVar - use max_val + 1
+/// - Complex expression with RANGE ops (from shift_to) - multiply all RANGE sizes
+///
+/// This handles the transformation output from rangeify where indices
+/// become expressions like `Add(Mul(Thread, stride), Loop)`.
+fn extract_index_dimension(idx_uop: &Arc<UOp>) -> Option<i64> {
+    // Case 1: Direct RANGE - use its size directly
+    if let Op::Range { end, .. } = idx_uop.op() {
+        if let Op::Const(cv) = end.op() {
+            if let ConstValue::Int(size) = cv.0 {
+                return Some(size);
+            }
         }
-        _ => {
-            // Fallback for non-integer types or unknown bounds.
-            // This mirrors Tinygrad which throws RuntimeError for missing shapes,
-            // but we warn instead to avoid breaking compilation.
-            // TODO: Consider making this an ICE once all index sources have proper bounds.
-            trace!(
-                uop_id = idx_uop.id,
-                vmin = ?vmin,
-                vmax = ?vmax,
-                "extract_index_dimension: fallback to 1 for unknown bounds"
-            );
-            1
+        return None; // Symbolic range size
+    }
+
+    // Case 2: DefineVar - use max_val + 1
+    if let Op::DefineVar { max_val, .. } = idx_uop.op() {
+        return Some(*max_val + 1);
+    }
+
+    // Case 3: Expression containing RANGE ops (from shift_to transforms)
+    // Multiply all RANGE sizes in the expression to get total iteration count
+    let mut product = 1i64;
+    let mut found_range = false;
+
+    for node in idx_uop.toposort() {
+        if let Op::Range { end, .. } = node.op() {
+            if let Op::Const(cv) = end.op() {
+                if let ConstValue::Int(size) = cv.0 {
+                    product *= size;
+                    found_range = true;
+                }
+            } else {
+                return None; // Symbolic range size
+            }
+        }
+    }
+
+    if found_range && product > 0 {
+        Some(product)
+    } else {
+        // Fallback: try vmin/vmax range analysis
+        // vmin/vmax give bounds [min, max], so dimension is max - min + 1
+        match (idx_uop.vmin(), idx_uop.vmax()) {
+            (ConstValue::Int(min), ConstValue::Int(max)) if max >= min => {
+                Some(max - min + 1)
+            }
+            _ => None,
         }
     }
 }
@@ -159,12 +191,32 @@ pub fn pm_linearize_multi_index() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Match INDEX with multiple indices
         idx @ Index { buffer, indices, gate } if indices.len() > 1 => |idx, buffer, indices, gate| {
-            // Extract dimensions from each index
-            let dims: Vec<i64> = indices.iter().map(extract_index_dimension).collect();
+            // Extract dimensions from index expressions.
+            // Unlike Tinygrad which uses buffer.shape, we extract dimensions from:
+            // - Direct RANGE ops: RANGE.end
+            // - DefineVar: max_val + 1
+            // - Complex expressions: multiply all contained RANGE sizes
+            // - Fallback: vmin/vmax range analysis
+            let dims: Option<Vec<i64>> = indices
+                .iter()
+                .map(|idx_uop| extract_index_dimension(idx_uop))
+                .collect();
+
+            let dims = match dims {
+                Some(d) => d,
+                None => {
+                    trace!(
+                        uop_id = idx.id,
+                        buffer_id = buffer.id,
+                        "linearize_multi_index: couldn't extract all dimensions, skipping"
+                    );
+                    return None;
+                }
+            };
 
             trace!(
                 uop_id = idx.id,
-                dims = ?dims,
+                index_dims = ?dims,
                 "linearize_multi_index: linearizing {}-dimensional index",
                 indices.len()
             );
@@ -200,25 +252,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_dimension_from_range() {
-        use morok_ir::{AxisId, AxisType};
-        let end = UOp::index_const(10);
-        let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-        assert_eq!(extract_index_dimension(&range), 10);
-    }
-
-    #[test]
-    fn test_extract_dimension_from_define_var() {
-        // DefineVar with min=1, max=99 has 99 distinct values (1..=99)
-        let var = UOp::new(Op::DefineVar { name: "n".to_string(), min_val: 1, max_val: 99 }, DType::Index);
-        assert_eq!(extract_index_dimension(&var), 99);
-
-        // DefineVar with min=0, max=9 has 10 distinct values (0..=9)
-        let var_zero_based = UOp::new(Op::DefineVar { name: "m".to_string(), min_val: 0, max_val: 9 }, DType::Index);
-        assert_eq!(extract_index_dimension(&var_zero_based), 10);
-    }
-
-    #[test]
     fn test_compute_row_major_strides() {
         // 3D tensor [2, 3, 4]: strides should be [12, 4, 1]
         assert_eq!(compute_row_major_strides(&[2, 3, 4]), vec![12, 4, 1]);
@@ -238,5 +271,31 @@ mod tests {
 
         // Should produce: 2*10 + 3 = Add(Mul(2, 10), 3)
         assert!(matches!(linear.op(), Op::Binary(BinaryOp::Add, _, _)));
+    }
+
+    #[test]
+    fn test_extract_index_dimension_range() {
+        use morok_ir::AxisId;
+        // Create a RANGE with size 10
+        let end = UOp::index_const(10);
+        let range = UOp::range_axis(end, AxisId::Renumbered(0), morok_ir::AxisType::Loop);
+
+        let dim = extract_index_dimension(&range);
+        assert_eq!(dim, Some(10));
+    }
+
+    #[test]
+    fn test_extract_index_dimension_complex_expression() {
+        use morok_ir::AxisId;
+        // Create Add(Mul(Range(4), stride), Range(8))
+        // Should multiply all range sizes: 4 * 8 = 32
+        let r1 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), morok_ir::AxisType::Loop);
+        let r2 = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), morok_ir::AxisType::Loop);
+        let stride = UOp::index_const(8);
+        let mul = UOp::new(Op::Binary(BinaryOp::Mul, r1, stride), DType::Index);
+        let add = UOp::new(Op::Binary(BinaryOp::Add, mul, r2), DType::Index);
+
+        let dim = extract_index_dimension(&add);
+        assert_eq!(dim, Some(32));
     }
 }

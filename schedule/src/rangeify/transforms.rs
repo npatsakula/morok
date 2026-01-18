@@ -19,8 +19,9 @@ use smallvec::SmallVec;
 use tracing::{debug, trace};
 
 use super::context::RangeifyContext;
-use super::indexing::IndexingContext;
+use super::indexing::{range_size_as_i64, IndexingContext};
 use super::kernel::KernelContext;
+use crate::passes::linearize_index::{build_linear_index, compute_row_major_strides};
 
 // ============================================================================
 // PUBLIC API
@@ -422,7 +423,51 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
     };
 
     let store_target = if !ranges.is_empty() {
-        UOp::index(buffer.clone(), ranges.to_vec()).expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
+        // Linearize multi-dimensional ranges into single linear index.
+        // Buffer is 1D (DEFINE_GLOBAL with total size), so we compute:
+        //   linear = r0 * (s1*s2*...) + r1 * (s2*s3*...) + ... + rN
+        // using row-major stride calculation.
+        //
+        // We have direct access to RANGE operations here, so we can extract
+        // concrete dimensions. This is the proper place to linearize because
+        // later passes (pm_linearize_multi_index) only see the 1D buffer shape.
+        if ranges.len() > 1 {
+            // Extract sizes from each RANGE
+            let dims: Vec<i64> = ranges
+                .iter()
+                .filter_map(|r| range_size_as_i64(r))
+                .collect();
+
+            if dims.len() == ranges.len() {
+                // All ranges have concrete sizes - linearize
+                let strides = compute_row_major_strides(&dims);
+                let indices: Vec<Arc<UOp>> = ranges.iter().cloned().collect();
+                trace!(
+                    "bufferize_to_store: linearizing {} ranges with dims {:?}, strides {:?}",
+                    ranges.len(),
+                    dims,
+                    strides
+                );
+                let linear_index = build_linear_index(&indices, &strides);
+                UOp::index(buffer.clone(), vec![linear_index])
+                    .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
+            } else {
+                // Symbolic ranges - can't linearize at compile time
+                // Create multi-index INDEX and let pm_linearize_multi_index handle it
+                // (which may use vmin/vmax fallback or fail at codegen)
+                debug!(
+                    "bufferize_to_store: symbolic ranges, creating multi-index INDEX (dims resolved: {}/{})",
+                    dims.len(),
+                    ranges.len()
+                );
+                UOp::index(buffer.clone(), ranges.to_vec())
+                    .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
+            }
+        } else {
+            // Single range - use directly
+            UOp::index(buffer.clone(), ranges.to_vec())
+                .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
+        }
     } else {
         // Scalar store: use index 0 (not the buffer pointer itself)
         UOp::index_const(0)

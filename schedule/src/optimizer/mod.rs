@@ -66,7 +66,7 @@ pub use scheduler::Scheduler;
 pub use scheduler::clear_kernel_name_counts;
 pub use types::{AxisType, Opt, OptArg, OptOps};
 
-use crate::rewrite::graph_rewrite;
+use crate::rewrite::{graph_rewrite, graph_rewrite_bottom_up};
 use crate::symbolic::patterns::{gep_pushing_patterns, symbolic};
 use std::sync::Arc;
 
@@ -116,15 +116,19 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 ///   Use for backends without native vector support. Default: false (preserve vectors).
 ///
 /// Called by both heuristic and beam search paths for consistent behavior.
-#[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
+#[tracing::instrument(skip_all, fields(ast.initial = %ast.tree()))]
 pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -> Arc<morok_ir::UOp> {
+    tracing::debug!(ast_before_linearize = %ast.tree(), "post_optimization: input AST");
+
     // Multi-index linearization: INDEX(buf, [i,j,k]) → INDEX(buf, [linear])
     // Moves row-major linearization from codegen to schedule, eliminating
     // duplicated logic in LLVM and Cranelift backends.
     // Must run BEFORE pm_add_loads (which transforms INDEX dtype to Ptr).
     // Uses bottom-up traversal to ensure children are processed before parents.
     let pm_linearize = crate::passes::pm_linearize_multi_index();
-    let linearized = crate::rewrite::graph_rewrite_bottom_up(&pm_linearize, ast, &mut ());
+    let linearized = graph_rewrite_bottom_up(&pm_linearize, ast, &mut ());
+
+    tracing::debug!(ast_after_linearize = %linearized.tree(), "post_optimization: after pm_linearize_multi_index");
 
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
@@ -155,25 +159,24 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     let expanded = if devectorize_alu {
         // Step 1: Devectorize ALL vector ALU ops to VECTORIZE(scalar)
         let no_vec_alu = crate::devectorize::no_vectorized_alu();
-        let expanded = crate::rewrite::graph_rewrite_bottom_up(&no_vec_alu, expanded, &mut ());
+        let expanded = graph_rewrite_bottom_up(&no_vec_alu, expanded, &mut ());
 
         // Step 2: Simplify GEPs created by no_vectorized_alu
-        crate::rewrite::graph_rewrite_bottom_up(&gep_pushing_patterns(), expanded, &mut ())
+        graph_rewrite_bottom_up(&gep_pushing_patterns(), expanded, &mut ())
     } else {
         expanded
     };
 
     // Step 3: Normalize remaining VECTORIZE/GEP patterns (multi-index GEP, single-source VECTORIZE)
-    let expanded =
-        crate::rewrite::graph_rewrite_bottom_up(&crate::devectorize::pm_vectorize_normalize(), expanded, &mut ());
+    let expanded = graph_rewrite_bottom_up(&crate::devectorize::pm_vectorize_normalize(), expanded, &mut ());
 
     // Step 4: Cleanup GEPs from pm_vectorize_normalize
-    let expanded = crate::rewrite::graph_rewrite_bottom_up(&gep_pushing_patterns(), expanded, &mut ());
+    let expanded = graph_rewrite_bottom_up(&gep_pushing_patterns(), expanded, &mut ());
 
     // Second pass of pm_add_loads: pre_expand creates new INDEX ops (via CAT expansion)
     // that need LOAD wrapping. These weren't present before pre_expand.
     // Safe for bottom-up: pattern guard (!Ptr) prevents re-matching transformed INDEX.
-    let expanded = crate::rewrite::graph_rewrite_bottom_up(&pm_loads, expanded, &mut ());
+    let expanded = graph_rewrite_bottom_up(&pm_loads, expanded, &mut ());
 
     // Devectorize pass: group contiguous memory accesses
     // Uses direct vector index analysis (VConst/UNROLL patterns) for termination safety
@@ -184,7 +187,7 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     // Based on Tinygrad's no_vectorized_alu approach.
     // Must run BEFORE reduce devectorization so comparisons are already scalar.
     let pm_devec = crate::rangeify::patterns::pm_bool_devectorize();
-    let devectorized = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, devectorized_mem, &mut ());
+    let devectorized = graph_rewrite_bottom_up(&pm_devec, devectorized_mem, &mut ());
 
     // Unified REDUCE devectorization: Handles all 3 mutually exclusive cases:
     // - K-vectorized: CONTRACT source → N scalar REDUCEs + tree_reduce (SLP optimization)
@@ -192,31 +195,31 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     // - Horizontal: src_vcount > out_vcount → stride-pattern GEPs + ALU chain
     // Based on Tinygrad's pm_reduce (devectorizer.py:283-316).
     let pm_reduce = crate::rangeify::patterns::pm_reduce_devectorize();
-    let reduce_devec = crate::rewrite::graph_rewrite_bottom_up(&pm_reduce, devectorized, &mut ());
+    let reduce_devec = graph_rewrite_bottom_up(&pm_reduce, devectorized, &mut ());
 
     // Second pass of bool ALU devectorization: Handle WHERE ops created by horizontal reduce.
     // Min reduction creates WHERE(<N x i1>, ...) which needs devectorization.
-    let reduce_devec = crate::rewrite::graph_rewrite_bottom_up(&pm_devec, reduce_devec, &mut ());
+    let reduce_devec = graph_rewrite_bottom_up(&pm_devec, reduce_devec, &mut ());
 
     // Second pass of REDUCE devectorization: Handle REDUCEs created by horizontal reduce.
     // When horizontal reduce transforms REDUCE(<4 x bool>) → REDUCE(<2 x bool>), we need
     // to devectorize the resulting REDUCE to avoid LLVM <N x i1> accumulator issues.
-    let reduce_devec = crate::rewrite::graph_rewrite_bottom_up(&pm_reduce, reduce_devec, &mut ());
+    let reduce_devec = graph_rewrite_bottom_up(&pm_reduce, reduce_devec, &mut ());
 
     // FMA decomposition: a*b+c → MulAcc(a,b,c) for float types.
     // Applied late so optimizations can still see Add(Mul) structure.
     // Must run AFTER horizontal reduce (which may create Add chains from GEPs).
     // Based on Tinygrad's decompositions.py:362.
     let pm_fma = crate::rangeify::patterns::pm_fma_decomposition();
-    let with_fma = crate::rewrite::graph_rewrite_bottom_up(&pm_fma, reduce_devec, &mut ());
+    let with_fma = graph_rewrite_bottom_up(&pm_fma, reduce_devec, &mut ());
 
     // Second pass of ALU devectorization: MulAcc was created by pm_fma_decomposition AFTER
     // the first no_vectorized_alu pass. Need to devectorize newly created MulAcc ops.
     // This enables 8×8 matmul tiling: 64-element MulAcc → VECTORIZE of 64 scalar MulAccs.
     let with_fma = if devectorize_alu {
         let no_vec_alu = crate::devectorize::no_vectorized_alu();
-        let devec_fma = crate::rewrite::graph_rewrite_bottom_up(&no_vec_alu, with_fma, &mut ());
-        crate::rewrite::graph_rewrite_bottom_up(&gep_pushing_patterns(), devec_fma, &mut ())
+        let devec_fma = graph_rewrite_bottom_up(&no_vec_alu, with_fma, &mut ());
+        graph_rewrite_bottom_up(&gep_pushing_patterns(), devec_fma, &mut ())
     } else {
         with_fma
     };
@@ -226,7 +229,7 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     // Must run LAST, after all other transformations that might create bool stores.
     // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
     let pm_bool_storage = crate::devectorize::bool_storage_patterns();
-    crate::rewrite::graph_rewrite_bottom_up(&pm_bool_storage, with_fma, &mut ())
+    graph_rewrite_bottom_up(&pm_bool_storage, with_fma, &mut ())
 }
 
 /// Apply optimizations with explicit configuration.

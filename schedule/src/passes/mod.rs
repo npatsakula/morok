@@ -12,3 +12,4 @@
 pub mod linearize_index;
 
 pub use linearize_index::pm_linearize_multi_index;
+// build_linear_index and compute_row_major_strides are pub(crate) - use directly from linearize_index
