@@ -30,7 +30,7 @@ fn test_cat_vec4_to_vectorize() {
     let a = create_vector_float_iota(4);
     let b = create_vector_float_values(vec![10.0, 11.0, 12.0, 13.0]);
 
-    let cat = UOp::cat(vec![a, b]);
+    let cat = UOp::cat().sources(vec![a, b]).call();
     assert_vcount(&cat, 8);
 
     let result = apply_gep_ptrcat_patterns(&cat);
@@ -62,7 +62,7 @@ fn test_cat_scalar_unchanged() {
     let c = create_float_const(3.0);
     let d = create_float_const(4.0);
 
-    let cat = UOp::cat(vec![a, b, c, d]);
+    let cat = UOp::cat().sources(vec![a, b, c, d]).call();
 
     let result = apply_gep_ptrcat_patterns(&cat);
 
@@ -88,7 +88,7 @@ fn test_cat_scalar_unchanged() {
 #[test]
 fn test_cat_single_source_unwrap() {
     let a = create_vector_float_iota(4);
-    let cat = UOp::cat(vec![a.clone()]);
+    let cat = UOp::cat().sources(vec![a.clone()]).call();
 
     let result = apply_gep_ptrcat_patterns(&cat);
 
@@ -190,7 +190,7 @@ fn test_gep_cat_reorder() {
     let b = create_float_const(2.0);
     let c = create_float_const(3.0);
 
-    let cat = UOp::cat(vec![a, b.clone(), c.clone()]);
+    let cat = UOp::cat().sources(vec![a, b.clone(), c.clone()]).call();
     let gep = UOp::gep(cat, vec![1, 2]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
@@ -215,7 +215,7 @@ fn test_gep_cat_single() {
     let b = create_float_const(2.0);
     let c = create_float_const(3.0);
 
-    let cat = UOp::cat(vec![a, b.clone(), c]);
+    let cat = UOp::cat().sources(vec![a, b.clone(), c]).call();
     let gep = UOp::gep(cat, vec![1]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
@@ -239,7 +239,7 @@ fn test_gep_ptrcat_reorder() {
     let p2 = create_index(buffer.clone(), 1);
     let p3 = create_index(buffer.clone(), 2);
 
-    let ptrcat = UOp::ptrcat(vec![p1.clone(), p2, p3.clone()]);
+    let ptrcat = UOp::ptrcat().sources(vec![p1.clone(), p2, p3.clone()]).call();
     let gep = UOp::gep(ptrcat, vec![0, 2]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
@@ -261,7 +261,7 @@ fn test_ptrcat_single_unwrap() {
     let buffer = create_buffer(64);
     let p = create_index(buffer.clone(), 0);
 
-    let ptrcat = UOp::ptrcat(vec![p.clone()]);
+    let ptrcat = UOp::ptrcat().sources(vec![p.clone()]).call();
 
     let result = apply_gep_ptrcat_patterns(&ptrcat);
 
@@ -280,7 +280,7 @@ fn test_cat_gep_identity() {
 
     // Create CAT(GEP(x,[0]), GEP(x,[1]), GEP(x,[2]), GEP(x,[3]))
     let geps: Vec<Arc<UOp>> = (0..4).map(|i| UOp::gep(x.clone(), vec![i])).collect();
-    let cat = UOp::cat(geps);
+    let cat = UOp::cat().sources(geps).call();
 
     let result = apply_gep_ptrcat_patterns(&cat);
 
@@ -425,7 +425,7 @@ fn test_single_element_vectorize_unwrap() {
 #[should_panic]
 fn test_empty_ptrcat_panics() {
     // PTRCAT requires at least one source
-    let _ptrcat = UOp::ptrcat(vec![]);
+    let _ptrcat = UOp::ptrcat().sources(vec![]).call();
 }
 
 /// Test: Empty CAT sources (should not happen but handle gracefully).
@@ -433,7 +433,7 @@ fn test_empty_ptrcat_panics() {
 #[should_panic]
 fn test_empty_cat_panics() {
     // CAT requires at least one source
-    let _cat = UOp::cat(vec![]);
+    let _cat = UOp::cat().sources(vec![]).call();
 }
 
 /// Test: GEP with out-of-bounds index.

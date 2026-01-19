@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType, ScalarDType};
+use morok_dtype::{AddrSpace, DType};
 use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
 

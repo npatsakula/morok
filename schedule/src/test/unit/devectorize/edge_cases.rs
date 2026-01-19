@@ -21,7 +21,7 @@ use super::helpers::*;
 fn test_devectorize_scalar_passthrough() {
     let buffer = create_buffer(64);
     let index = create_index(buffer.clone(), 0);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -89,7 +89,7 @@ fn test_devectorize_sink_noop() {
 fn test_devectorize_half_precision() {
     let buffer = create_buffer_typed(64, ScalarDType::Float16);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -104,7 +104,7 @@ fn test_devectorize_half_precision() {
 fn test_devectorize_int8() {
     let buffer = create_buffer_typed(64, ScalarDType::Int8);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -117,7 +117,7 @@ fn test_devectorize_int8() {
 fn test_devectorize_uint8() {
     let buffer = create_buffer_typed(64, ScalarDType::UInt8);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -137,11 +137,11 @@ fn test_devectorize_mixed_dtypes() {
 
     // Load f32
     let index_f32 = create_vector_index_iota(buffer_f32.clone(), 4);
-    let load_f32 = UOp::load(buffer_f32.clone(), index_f32);
+    let load_f32 = UOp::load().buffer(buffer_f32.clone()).index(index_f32).call();
 
     // Load i32
     let index_i32 = create_vector_index_iota(buffer_i32.clone(), 4);
-    let load_i32 = UOp::load(buffer_i32.clone(), index_i32);
+    let load_i32 = UOp::load().buffer(buffer_i32.clone()).index(index_i32).call();
 
     // Process both
     let result_f32 = apply_devectorize(&load_f32);
@@ -160,7 +160,7 @@ fn test_devectorize_mixed_dtypes() {
 fn test_devectorize_local_memory() {
     let buffer = create_buffer_local(64, ScalarDType::Float32);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -177,10 +177,10 @@ fn test_devectorize_mixed_addrspaces() {
     let buffer_local = create_buffer_local(64, ScalarDType::Float32);
 
     let index_global = create_vector_index_iota(buffer_global.clone(), 4);
-    let load_global = UOp::load(buffer_global.clone(), index_global);
+    let load_global = UOp::load().buffer(buffer_global.clone()).index(index_global).call();
 
     let index_local = create_vector_index_iota(buffer_local.clone(), 4);
-    let load_local = UOp::load(buffer_local.clone(), index_local);
+    let load_local = UOp::load().buffer(buffer_local.clone()).index(index_local).call();
 
     let result_global = apply_devectorize(&load_global);
     let result_local = apply_devectorize(&load_local);
@@ -210,7 +210,7 @@ fn test_devectorize_very_large_vector() {
         DType::Float32,
     );
 
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -233,7 +233,7 @@ fn test_devectorize_vec32() {
         DType::Float32,
     );
 
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -252,7 +252,7 @@ fn test_devectorize_unaligned_access() {
 
     // Index starting at 3 (not aligned to 4)
     let index = create_vector_index_offset(buffer.clone(), 4, 3);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -274,7 +274,7 @@ fn test_devectorize_vec3() {
         DType::Float32,
     );
 
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -296,7 +296,7 @@ fn test_devectorize_vec5() {
         DType::Float32,
     );
 
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -314,7 +314,7 @@ fn test_devectorize_vec5() {
 fn test_devectorize_zero_index() {
     let buffer = create_buffer(64);
     let index = create_vector_index_offset(buffer.clone(), 4, 0);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -327,7 +327,7 @@ fn test_devectorize_zero_index() {
 fn test_devectorize_large_offset() {
     let buffer = create_buffer(10000);
     let index = create_vector_index_offset(buffer.clone(), 4, 9000);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -344,7 +344,7 @@ fn test_devectorize_large_offset() {
 fn test_devectorize_idempotent() {
     let buffer = create_buffer(64);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result1 = apply_devectorize(&load);
     let result2 = apply_devectorize(&result1);
@@ -385,7 +385,7 @@ fn test_regression_ptrcat_sources() {
     let idx3 = create_index(buffer.clone(), 2);
     let idx4 = create_index(buffer.clone(), 3);
 
-    let ptrcat = UOp::ptrcat(vec![idx1, idx2, idx3, idx4]);
+    let ptrcat = UOp::ptrcat().sources(vec![idx1, idx2, idx3, idx4]).call();
 
     // PTRCAT should have 4 sources
     let sources = unwrap_ptrcat(&ptrcat);

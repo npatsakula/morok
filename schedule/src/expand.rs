@@ -641,7 +641,7 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
             let src_count = src.dtype().vcount();
             if src_count > 1 {
                 let cat_sources: Vec<Arc<UOp>> = (0..expand_sz).map(|_| src.clone()).collect();
-                new_sources.push(UOp::cat(cat_sources));
+                new_sources.push(UOp::cat().sources(cat_sources).call());
             } else {
                 // Case 4: Scalar -> broadcast
                 new_sources.push(UOp::broadcast(src.clone(), expand_sz));

@@ -165,7 +165,7 @@ fn test_kernel_split_pipeline_load_store() {
     let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let index = UOp::index_const(0);
 
-    let load = UOp::load(in_buf, index.clone());
+    let load = UOp::load().buffer(in_buf).index(index.clone()).call();
     let store = UOp::store(out_buf, index, load);
 
     let (result, _context) = run_kernel_split_pipeline(store);
@@ -182,8 +182,8 @@ fn test_kernel_split_pipeline_multiple_loads() {
     let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let index = UOp::index_const(0);
 
-    let load1 = UOp::load(buf1, index.clone());
-    let load2 = UOp::load(buf2, index.clone());
+    let load1 = UOp::load().buffer(buf1).index(index.clone()).call();
+    let load2 = UOp::load().buffer(buf2).index(index.clone()).call();
     let sum = load1.try_add(&load2).unwrap();
     let store = UOp::store(out_buf, index, sum);
 

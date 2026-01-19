@@ -34,7 +34,7 @@ fn test_find_bufs_load_only() {
     // Create a computation that only LOADs from a buffer
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let index = UOp::index_const(0);
-    let loaded = UOp::load(buffer.clone(), index.clone());
+    let loaded = UOp::load().buffer(buffer.clone()).index(index.clone()).call();
 
     // Wrap in a STORE to a different buffer (kernel output)
     let out_buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
@@ -60,7 +60,7 @@ fn test_find_bufs_conflicting_access() {
     let index = UOp::index_const(0);
 
     // First LOAD from the buffer
-    let loaded = UOp::load(buffer.clone(), index.clone());
+    let loaded = UOp::load().buffer(buffer.clone()).index(index.clone()).call();
 
     // Then STORE back to the same buffer (conflict!)
     let store = UOp::store(buffer.clone(), index, loaded);
@@ -78,8 +78,8 @@ fn test_find_bufs_multiple_buffers() {
     let index = UOp::index_const(0);
 
     // LOAD from both input buffers
-    let load1 = UOp::load(buf1.clone(), index.clone());
-    let load2 = UOp::load(buf2.clone(), index.clone());
+    let load1 = UOp::load().buffer(buf1.clone()).index(index.clone()).call();
+    let load2 = UOp::load().buffer(buf2.clone()).index(index.clone()).call();
 
     // Add them together
     let sum = load1.try_add(&load2).unwrap();
@@ -109,7 +109,7 @@ fn test_find_bufs_with_gated_index() {
     let gated_in_index = UOp::index_gated(in_buf.clone(), vec![UOp::index_const(0)], gate.clone()).unwrap();
 
     // Load from gated index
-    let loaded = UOp::load(in_buf.clone(), gated_in_index);
+    let loaded = UOp::load().buffer(in_buf.clone()).index(gated_in_index).call();
 
     // Create gated index for store
     let gated_out_index = UOp::index_gated(out_buf.clone(), vec![UOp::index_const(0)], gate).unwrap();

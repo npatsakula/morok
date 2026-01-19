@@ -11,8 +11,8 @@ use morok_ir::{Op, UOp};
 use smallvec::SmallVec;
 
 use crate::devectorize::{
-    bool_storage_patterns, devectorize, gep_ptrcat_patterns, load_store_indexing_patterns, no_vectorized_alu,
-    pm_vectorize_normalize,
+    bool_storage_patterns, correct_load_store_patterns, devectorize, load_store_folding_patterns,
+    load_store_indexing_patterns, no_vectorized_alu, pm_render,
 };
 use crate::rewrite::graph_rewrite_bottom_up;
 
@@ -22,41 +22,43 @@ use crate::rewrite::graph_rewrite_bottom_up;
 
 /// Apply full devectorize pass to a UOp.
 ///
-/// Runs all three phases:
-/// 1. expand_index patterns (vector INDEX -> PTRCAT grouping)
-/// 2. load_store patterns (PTRCAT distribution + split)
-/// 3. bool_storage patterns (bool -> uint8 conversion)
+/// Now uses single-pass rewriting (aligned with Tinygrad), followed by pm_render
+/// to convert CAT to VECTORIZE for rendering.
 pub fn apply_devectorize(uop: &Arc<UOp>) -> Arc<UOp> {
-    devectorize(uop)
+    let devectorized = devectorize(uop);
+    // Also run pm_render to convert CAT to VECTORIZE (required for codegen)
+    graph_rewrite_bottom_up(&pm_render(), devectorized, &mut ())
 }
 
-/// Apply Phase 1 only: expand_index patterns.
+/// Apply load_store_folding patterns only.
 ///
-/// Transforms vector INDEX into grouped PTRCAT.
-pub fn apply_phase1(uop: &Arc<UOp>) -> Arc<UOp> {
-    let phase1 = crate::devectorize::expand_index_patterns();
-    graph_rewrite_bottom_up(&phase1, uop.clone(), &mut ())
+/// Includes: expand_index, GEP movement, PTRCAT distribution.
+pub fn apply_load_store_folding(uop: &Arc<UOp>) -> Arc<UOp> {
+    let patterns = load_store_folding_patterns();
+    graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
 }
 
-/// Apply Phase 2 only: GEP/PTRCAT + load/store patterns.
+/// Apply correct_load_store patterns only.
 ///
-/// Distributes PTRCAT through LOAD/STORE and splits by divisibility.
-pub fn apply_phase2(uop: &Arc<UOp>) -> Arc<UOp> {
-    let phase2 = gep_ptrcat_patterns() + crate::devectorize::load_store_patterns();
-    graph_rewrite_bottom_up(&phase2, uop.clone(), &mut ())
+/// Includes: split_load, split_store (CAST(INDEX) patterns).
+pub fn apply_correct_load_store(uop: &Arc<UOp>) -> Arc<UOp> {
+    let patterns = correct_load_store_patterns();
+    graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
 }
 
-/// Apply Phase 3 only: bool storage patterns.
+/// Apply bool storage patterns only.
 ///
 /// Converts bool LOAD/STORE to uint8.
-pub fn apply_phase3(uop: &Arc<UOp>) -> Arc<UOp> {
+pub fn apply_bool_storage(uop: &Arc<UOp>) -> Arc<UOp> {
     let phase3 = bool_storage_patterns();
     graph_rewrite_bottom_up(&phase3, uop.clone(), &mut ())
 }
 
-/// Apply GEP/PTRCAT patterns only.
-pub fn apply_gep_ptrcat_patterns(uop: &Arc<UOp>) -> Arc<UOp> {
-    let patterns = gep_ptrcat_patterns();
+/// Apply pm_render patterns (post-devectorize rendering).
+///
+/// Includes: CAT→VECTORIZE, multi-index GEP→VECTORIZE, unwrap single-element.
+pub fn apply_pm_render(uop: &Arc<UOp>) -> Arc<UOp> {
+    let patterns = pm_render();
     graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
 }
 
@@ -66,10 +68,11 @@ pub fn apply_no_vectorized_alu(uop: &Arc<UOp>) -> Arc<UOp> {
     graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
 }
 
-/// Apply VECTORIZE normalization patterns.
+/// Apply pm_render patterns for VECTORIZE normalization.
+///
+/// (Legacy name for compatibility - now uses pm_render)
 pub fn apply_vectorize_normalize(uop: &Arc<UOp>) -> Arc<UOp> {
-    let patterns = pm_vectorize_normalize();
-    graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
+    apply_pm_render(uop)
 }
 
 /// Apply load_store_indexing patterns (gate dropping).
@@ -83,6 +86,37 @@ pub fn apply_cast_after(uop: &Arc<UOp>) -> Arc<UOp> {
     use crate::devectorize::devectorize_patterns;
     let patterns = devectorize_patterns();
     graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
+}
+
+// =============================================================================
+// Legacy Phase Names (Backward Compatibility)
+// =============================================================================
+
+/// Legacy name for load_store_folding patterns (Phase 1).
+///
+/// Includes expand_index patterns.
+pub fn apply_phase1(uop: &Arc<UOp>) -> Arc<UOp> {
+    apply_load_store_folding(uop)
+}
+
+/// Legacy name for load_store_folding + correct_load_store + pm_render patterns (Phase 2).
+///
+/// Includes: GEP movement, PTRCAT distribution, split patterns, and GEP/CAT normalization.
+pub fn apply_phase2(uop: &Arc<UOp>) -> Arc<UOp> {
+    let patterns = load_store_folding_patterns() + correct_load_store_patterns() + pm_render();
+    graph_rewrite_bottom_up(&patterns, uop.clone(), &mut ())
+}
+
+/// Legacy name for bool_storage patterns (Phase 3).
+pub fn apply_phase3(uop: &Arc<UOp>) -> Arc<UOp> {
+    apply_bool_storage(uop)
+}
+
+/// Legacy name for pm_render patterns.
+///
+/// (Was gep_ptrcat_patterns)
+pub fn apply_gep_ptrcat_patterns(uop: &Arc<UOp>) -> Arc<UOp> {
+    apply_pm_render(uop)
 }
 
 // =============================================================================
@@ -212,7 +246,7 @@ pub fn create_index_with_range(buffer: Arc<UOp>, axis_id: usize, bound: i64, sca
 
 /// Create a LOAD operation.
 pub fn create_load(buffer: Arc<UOp>, index: Arc<UOp>) -> Arc<UOp> {
-    UOp::load(buffer, index)
+    UOp::load().buffer(buffer).index(index).call()
 }
 
 /// Create a STORE operation.
@@ -223,7 +257,7 @@ pub fn create_store(buffer: Arc<UOp>, index: Arc<UOp>, value: Arc<UOp>) -> Arc<U
 /// Create a vector LOAD with iota index.
 pub fn create_vector_load_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
     let index = create_vector_index_iota(buffer.clone(), count);
-    UOp::load(buffer, index)
+    UOp::load().buffer(buffer).index(index).call()
 }
 
 /// Create a vector STORE with iota index.

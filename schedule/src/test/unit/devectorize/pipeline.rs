@@ -22,7 +22,7 @@ use super::helpers::*;
 fn test_devectorize_contiguous_load() {
     let buffer = create_buffer(64);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -55,7 +55,7 @@ fn test_devectorize_strided_load() {
     let buffer = create_buffer(128);
     // Strided access: [0, 2, 4, 6]
     let index = create_vector_index_scaled(buffer.clone(), 4, 2);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -73,13 +73,20 @@ fn test_devectorize_strided_load() {
 /// Simulates typical tiled matmul memory access with output upcast.
 #[test]
 fn test_devectorize_matmul_pattern() {
+    use crate::devectorize::{devectorize, pm_render};
+    use crate::rewrite::graph_rewrite_bottom_up;
+
     let buffer = create_buffer(256);
 
     // Create 8 contiguous accesses (simulating 8-wide output upcast)
     let index = create_vector_index_iota(buffer.clone(), 8);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
-    let result = apply_devectorize(&load);
+    // Step 1: Run devectorize (without pm_render)
+    let after_devectorize = devectorize(&load);
+
+    // Step 2: Run pm_render
+    let result = graph_rewrite_bottom_up(&pm_render(), after_devectorize, &mut ());
 
     // Should produce vec8 result through devectorization
     assert_eq!(result.dtype().vcount(), 8, "Total vcount should be 8");
@@ -94,7 +101,7 @@ fn test_devectorize_reduction_accumulator() {
 
     // Load vec4 accumulator
     let acc_index = create_vector_index_iota(buffer.clone(), 4);
-    let acc_load = UOp::load(buffer.clone(), acc_index);
+    let acc_load = UOp::load().buffer(buffer.clone()).index(acc_index).call();
 
     // Add to accumulator
     let values = create_vector_float_iota(4);
@@ -121,11 +128,11 @@ fn test_devectorize_multiple_buffers() {
 
     // Load from A
     let index_a = create_vector_index_iota(buffer_a.clone(), 4);
-    let load_a = UOp::load(buffer_a.clone(), index_a);
+    let load_a = UOp::load().buffer(buffer_a.clone()).index(index_a).call();
 
     // Load from B
     let index_b = create_vector_index_iota(buffer_b.clone(), 4);
-    let load_b = UOp::load(buffer_b.clone(), index_b);
+    let load_b = UOp::load().buffer(buffer_b.clone()).index(index_b).call();
 
     // Compute A + B
     let add = UOp::new(Op::Binary(BinaryOp::Add, load_a, load_b), DType::Float32.vec(4));
@@ -156,7 +163,7 @@ fn test_devectorize_after_pre_expand() {
 
     // Create a simple kernel pattern that would come from pre_expand
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
     let value = create_vector_float_iota(4);
     let add = UOp::new(Op::Binary(BinaryOp::Add, load, value), DType::Float32.vec(4));
 
@@ -229,7 +236,7 @@ fn test_devectorize_loop_index() {
         DType::Float32,
     );
 
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
     let result = apply_devectorize(&load);
 
     // Should produce valid vectorized load with vec4
@@ -276,7 +283,7 @@ fn test_devectorize_sink_multiple_stores() {
 fn test_devectorize_float16() {
     let buffer = create_buffer_typed(64, ScalarDType::Float16);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -289,7 +296,7 @@ fn test_devectorize_float16() {
 fn test_devectorize_int32() {
     let buffer = create_buffer_typed(64, ScalarDType::Int32);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -301,7 +308,7 @@ fn test_devectorize_int32() {
 fn test_devectorize_bool_pipeline() {
     let buffer = create_bool_buffer(64);
     let index = create_index(buffer.clone(), 0); // Scalar index for bool
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     let result = apply_devectorize(&load);
 

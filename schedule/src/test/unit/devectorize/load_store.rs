@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType, ScalarDType};
+use morok_dtype::{AddrSpace, DType};
 use morok_ir::types::ConstValue;
 use morok_ir::{Op, UOp};
 
@@ -30,10 +30,10 @@ fn test_distribute_ptrcat_load_dual() {
     let idx2 = create_index(buffer.clone(), 1);
 
     // PTRCAT(idx1, idx2)
-    let ptrcat = UOp::ptrcat(vec![idx1, idx2]);
+    let ptrcat = UOp::ptrcat().sources(vec![idx1, idx2]).call();
 
     // LOAD(buffer, ptrcat)
-    let load = UOp::load(buffer.clone(), ptrcat);
+    let load = UOp::load().buffer(buffer.clone()).index(ptrcat).call();
 
     let result = apply_phase2(&load);
 
@@ -60,8 +60,8 @@ fn test_distribute_ptrcat_load_quad() {
     let buffer = create_buffer(64);
 
     let indices: Vec<Arc<UOp>> = (0..4).map(|i| create_index(buffer.clone(), i)).collect();
-    let ptrcat = UOp::ptrcat(indices);
-    let load = UOp::load(buffer.clone(), ptrcat);
+    let ptrcat = UOp::ptrcat().sources(indices).call();
+    let load = UOp::load().buffer(buffer.clone()).index(ptrcat).call();
 
     let result = apply_phase2(&load);
 
@@ -83,8 +83,8 @@ fn test_distribute_ptrcat_preserves_buffer() {
 
     let idx1 = create_index(buffer.clone(), 0);
     let idx2 = create_index(buffer.clone(), 1);
-    let ptrcat = UOp::ptrcat(vec![idx1, idx2]);
-    let load = UOp::load(buffer.clone(), ptrcat);
+    let ptrcat = UOp::ptrcat().sources(vec![idx1, idx2]).call();
+    let load = UOp::load().buffer(buffer.clone()).index(ptrcat).call();
 
     let result = apply_phase2(&load);
 
@@ -108,7 +108,7 @@ fn test_distribute_ptrcat_store() {
 
     let idx1 = create_index(buffer.clone(), 0);
     let idx2 = create_index(buffer.clone(), 1);
-    let ptrcat = UOp::ptrcat(vec![idx1, idx2]);
+    let ptrcat = UOp::ptrcat().sources(vec![idx1, idx2]).call();
     let store = UOp::store(buffer.clone(), ptrcat, value);
 
     let result = apply_phase2(&store);
@@ -134,7 +134,7 @@ fn test_distribute_ptrcat_store_quad() {
     let value = create_vector_float_iota(4);
 
     let indices: Vec<Arc<UOp>> = (0..4).map(|i| create_index(buffer.clone(), i)).collect();
-    let ptrcat = UOp::ptrcat(indices);
+    let ptrcat = UOp::ptrcat().sources(indices).call();
     let store = UOp::store(buffer.clone(), ptrcat, value);
 
     let result = apply_phase2(&store);
@@ -305,7 +305,7 @@ fn test_split_preserves_ranges() {
 fn test_load_after_expand_index() {
     let buffer = create_buffer(64);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let load = UOp::load(buffer.clone(), index);
+    let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     // Apply Phase 1 first
     let after_phase1 = apply_phase1(&load);
@@ -442,7 +442,7 @@ fn test_gated_index_load() {
     );
 
     // Create load from gated index
-    let load = UOp::load(buffer.clone(), gated_index);
+    let load = UOp::load().buffer(buffer.clone()).index(gated_index).call();
 
     // Apply devectorization should handle gated indices
     let result = apply_devectorize(&load);

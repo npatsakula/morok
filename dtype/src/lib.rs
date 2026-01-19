@@ -251,7 +251,7 @@ impl DType {
             Self::Scalar(s) if !matches!(s, ScalarDType::Void) => Self::Vector { scalar: *s, count },
             Self::Vector { .. } => panic!("Cannot vectorize an already vectorized type"),
             Self::Ptr { vcount: 1, base, addrspace, size } => {
-                Self::Ptr { base: base.clone(), addrspace: addrspace.clone(), size: *size, vcount: count }
+                Self::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: count }
             }
             Self::Ptr { vcount, .. } => panic!("Cannot vectorize an already vectorized pointer (vcount={vcount})"),
             _ => self.clone(),

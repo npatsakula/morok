@@ -6,7 +6,7 @@
 //! Based on Tinygrad's PTX/NIR bool->uint8 patterns.
 
 use morok_dtype::ScalarDType;
-use morok_ir::{Op, UOp};
+use morok_ir::Op;
 
 use super::helpers::*;
 

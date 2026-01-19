@@ -45,10 +45,10 @@ use crate::TypedPatternMatcher;
 fn extract_index_dimension(idx_uop: &Arc<UOp>) -> Option<i64> {
     // Case 1: Direct RANGE - use its size directly
     if let Op::Range { end, .. } = idx_uop.op() {
-        if let Op::Const(cv) = end.op() {
-            if let ConstValue::Int(size) = cv.0 {
-                return Some(size);
-            }
+        if let Op::Const(cv) = end.op()
+            && let ConstValue::Int(size) = cv.0
+        {
+            return Some(size);
         }
         return None; // Symbolic range size
     }
@@ -197,7 +197,7 @@ pub fn pm_linearize_multi_index() -> TypedPatternMatcher<()> {
             // - Fallback: vmin/vmax range analysis
             let dims: Option<Vec<i64>> = indices
                 .iter()
-                .map(|idx_uop| extract_index_dimension(idx_uop))
+                .map(extract_index_dimension)
                 .collect();
 
             let dims = match dims {

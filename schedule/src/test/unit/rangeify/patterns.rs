@@ -374,7 +374,7 @@ fn test_buffer_removal_no_match_expensive_compute() {
     // LOAD is typically considered expensive and should not be inlined
     let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
-    let load = UOp::load(buffer, index);
+    let load = UOp::load().buffer(buffer).index(index).call();
 
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);

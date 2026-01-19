@@ -96,7 +96,7 @@ fn test_no_cycle_valid_access_pattern() {
     let index = UOp::index_const(0);
 
     // LOAD from input
-    let loaded = UOp::load(in_buf.clone(), index.clone());
+    let loaded = UOp::load().buffer(in_buf.clone()).index(index.clone()).call();
 
     // Compute something
     let const_val = UOp::native_const(2.0f32);
@@ -198,8 +198,8 @@ fn test_multiple_buffer_integration() {
     let index = UOp::index_const(0);
 
     // LOAD from both inputs
-    let load1 = UOp::load(buf1.clone(), index.clone());
-    let load2 = UOp::load(buf2.clone(), index.clone());
+    let load1 = UOp::load().buffer(buf1.clone()).index(index.clone()).call();
+    let load2 = UOp::load().buffer(buf2.clone()).index(index.clone()).call();
 
     // Compute sum
     let sum = load1.try_add(&load2).unwrap();

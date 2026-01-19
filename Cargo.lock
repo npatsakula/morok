@@ -1606,6 +1606,7 @@ dependencies = [
 name = "morok-ir"
 version = "0.1.0"
 dependencies = [
+ "bon",
  "derive_more",
  "half",
  "itertools 0.14.0",

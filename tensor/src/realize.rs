@@ -402,23 +402,20 @@ fn detect_output_indices(kernel: &Arc<UOp>, buffers: &[Buffer]) -> Vec<usize> {
     let mut output_buffer_uop_ids: HashSet<u64> = HashSet::new();
 
     for node in ast.toposort() {
-        match node.op() {
-            Op::Store { buffer, .. } => {
-                // Get the buffer's DefineGlobal ID
-                let buf_id = match buffer.op() {
-                    Op::DefineGlobal(_) | Op::DefineLocal(_) => buffer.id,
-                    Op::Index { buffer: inner, .. } => {
-                        if matches!(inner.op(), Op::DefineGlobal(_) | Op::DefineLocal(_)) {
-                            inner.id
-                        } else {
-                            continue;
-                        }
+        if let Op::Store { buffer, .. } = node.op() {
+            // Get the buffer's DefineGlobal ID
+            let buf_id = match buffer.op() {
+                Op::DefineGlobal(_) | Op::DefineLocal(_) => buffer.id,
+                Op::Index { buffer: inner, .. } => {
+                    if matches!(inner.op(), Op::DefineGlobal(_) | Op::DefineLocal(_)) {
+                        inner.id
+                    } else {
+                        continue;
                     }
-                    _ => continue,
-                };
-                output_buffer_uop_ids.insert(buf_id);
-            }
-            _ => {}
+                }
+                _ => continue,
+            };
+            output_buffer_uop_ids.insert(buf_id);
         }
     }
 

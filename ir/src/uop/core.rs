@@ -1183,30 +1183,9 @@ impl UOp {
             }
         };
 
-        // Compute correct dtype for operations whose dtype depends on source dtypes
-        let dtype = match &new_op {
-            // INDEX returns element type (matching Tinygrad's buf.index(idx) semantics)
-            // pm_add_loads will wrap INDEX in LOAD for arithmetic contexts
-            Op::Index { buffer, .. } => match &buffer.dtype {
-                DType::Ptr { base, .. } => (**base).clone(),
-                other => other.clone(),
-            },
-            // LOAD returns element type (actual value)
-            Op::Load { buffer, .. } => match &buffer.dtype {
-                DType::Ptr { base, .. } => (**base).clone(),
-                other => other.clone(),
-            },
-            // CAT dtype = sum of source vcounts (must recalculate when sources change)
-            // Use base() instead of scalar() to handle both Scalar and Vector sources
-            Op::Cat { sources } => {
-                let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
-                DType::Scalar(sources[0].dtype.base()).vec(total_count)
-            }
-            // All other operations preserve their original dtype
-            _ => self.dtype.clone(),
-        };
-
-        let new_uop = Self::new(new_op, dtype);
+        // Preserve original dtype like Tinygrad - dtype is explicitly set at creation
+        // If you need a different dtype, create a new UOp explicitly
+        let new_uop = Self::new(new_op, self.dtype.clone());
 
         // Record transformation in provenance tracker
         use crate::provenance::{PROVENANCE_TRACKER, PassName};
@@ -1483,30 +1462,9 @@ impl UOp {
             Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
         };
 
-        // Compute correct dtype for operations whose dtype depends on source dtypes
-        let dtype = match &new_op {
-            // INDEX returns element type (matching Tinygrad's buf.index(idx) semantics)
-            // pm_add_loads will wrap INDEX in LOAD for arithmetic contexts
-            Op::Index { buffer, .. } => match &buffer.dtype {
-                DType::Ptr { base, .. } => (**base).clone(),
-                other => other.clone(),
-            },
-            // LOAD returns element type (actual value)
-            Op::Load { buffer, .. } => match &buffer.dtype {
-                DType::Ptr { base, .. } => (**base).clone(),
-                other => other.clone(),
-            },
-            // CAT dtype = sum of source vcounts (must recalculate when sources change)
-            // Use base() instead of scalar() to handle both Scalar and Vector sources
-            Op::Cat { sources } => {
-                let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
-                DType::Scalar(sources[0].dtype.base()).vec(total_count)
-            }
-            // All other operations preserve their original dtype
-            _ => self.dtype.clone(),
-        };
-
-        Self::new(new_op, dtype)
+        // Preserve original dtype like Tinygrad - dtype is explicitly set at creation
+        // If you need a different dtype, create a new UOp explicitly
+        Self::new(new_op, self.dtype.clone())
     }
 }
 

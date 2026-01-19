@@ -433,7 +433,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
         // later passes (pm_linearize_multi_index) only see the 1D buffer shape.
         if ranges.len() > 1 {
             // Extract sizes from each RANGE
-            let dims: Vec<i64> = ranges.iter().filter_map(|r| range_size_as_i64(r)).collect();
+            let dims: Vec<i64> = ranges.iter().filter_map(range_size_as_i64).collect();
 
             if dims.len() == ranges.len() {
                 // All ranges have concrete sizes - linearize

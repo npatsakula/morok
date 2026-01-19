@@ -88,7 +88,7 @@ fn test_cat_basic() {
     let a = UOp::vectorize(smallvec![UOp::native_const(1.0f32), UOp::native_const(2.0f32),]);
     let b = UOp::vectorize(smallvec![UOp::native_const(3.0f32), UOp::native_const(4.0f32),]);
 
-    let result = UOp::cat(vec![a, b]);
+    let result = UOp::cat().sources(vec![a, b]).call();
     // Cat concatenates vectors: <2 x f32> + <2 x f32> = <4 x f32>
     assert_eq!(result.dtype(), DType::Float32.vec(4));
 }
@@ -103,6 +103,6 @@ fn test_ptrcat_basic() {
     let a = UOp::const_(ptr_dtype.clone(), ConstValue::Int(0));
     let b = UOp::const_(ptr_dtype.clone(), ConstValue::Int(0));
 
-    let result = UOp::ptrcat(vec![a, b]);
+    let result = UOp::ptrcat().sources(vec![a, b]).call();
     assert_eq!(result.dtype(), ptr_dtype);
 }

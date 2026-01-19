@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use bon::bon;
 use morok_dtype::DType;
 use morok_dtype::DeviceSpec;
 use smallvec::SmallVec;
@@ -21,6 +22,7 @@ use crate::op::Op;
 use crate::types::{AddrSpace, BufferizeOpts};
 use crate::uop::UOp;
 
+#[bon]
 impl UOp {
     // =========================================================================
     // Indexing Operations
@@ -173,17 +175,20 @@ impl UOp {
 
     /// Create a LOAD operation.
     ///
-    /// Loads a value from a buffer at the given index.
-    /// The result dtype is the element type (base of the Ptr dtype).
+    /// # Example
+    /// ```ignore
+    /// // Infer dtype from buffer
+    /// UOp::load().buffer(buf).index(idx).call()
     ///
-    /// For gated loads, use an INDEX with a gate (INDEX has optional gate field).
-    pub fn load(buffer: Arc<Self>, index: Arc<Self>) -> Arc<Self> {
-        // Get the element type from the buffer's Ptr dtype
-        let dtype = match &buffer.dtype {
+    /// // Explicit dtype for vector loads
+    /// UOp::load().buffer(buf).index(idx).dtype(vec4_dtype).call()
+    /// ```
+    #[builder]
+    pub fn load(buffer: Arc<Self>, index: Arc<Self>, dtype: Option<DType>) -> Arc<Self> {
+        let dtype = dtype.unwrap_or_else(|| match &buffer.dtype {
             DType::Ptr { base, .. } => (**base).clone(),
-            // Fallback: if buffer isn't a Ptr, use its dtype directly
             other => other.clone(),
-        };
+        });
         Self::new(Op::Load { buffer, index }, dtype)
     }
 

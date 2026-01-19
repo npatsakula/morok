@@ -49,7 +49,7 @@ fn test_load() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let index = UOp::index_const(0);
 
-    let load = UOp::load(buffer.clone(), index.clone());
+    let load = UOp::load().buffer(buffer.clone()).index(index.clone()).call();
 
     // Should have same dtype as buffer
     assert_eq!(load.dtype(), DType::Float32);

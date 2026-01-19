@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use bon::bon;
 use morok_dtype::DType;
 use smallvec::SmallVec;
 
@@ -15,6 +16,7 @@ use crate::op::Op;
 use crate::types::WmmaMetadata;
 use crate::uop::UOp;
 
+#[bon]
 impl UOp {
     // =========================================================================
     // Tensor Core Operations
@@ -134,26 +136,34 @@ impl UOp {
 
     /// Create a CAT operation (concatenate vectors).
     ///
-    /// Combines multiple scalar or vector values into a single larger vector.
-    /// This is an expander-level operation used during kernel optimization.
+    /// # Example
+    /// ```ignore
+    /// // Infer dtype (sum of vcounts)
+    /// UOp::cat().sources(vec![a, b]).call()
     ///
-    /// Like VECTORIZE but sources can be vectors themselves.
-    /// Output dtype vcount = sum of all input vcounts.
-    pub fn cat(sources: Vec<Arc<Self>>) -> Arc<Self> {
+    /// // Explicit dtype
+    /// UOp::cat().sources(vec![a, b]).dtype(vec8_dtype).call()
+    /// ```
+    #[builder]
+    pub fn cat(sources: Vec<Arc<Self>>, dtype: Option<DType>) -> Arc<Self> {
         assert!(!sources.is_empty(), "CAT requires at least one source");
-        let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
-        // Use base() instead of scalar() to handle both Scalar and Vector sources
-        let dtype = DType::Scalar(sources[0].dtype.base()).vec(total_count);
+        let dtype = dtype.unwrap_or_else(|| {
+            let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
+            DType::Scalar(sources[0].dtype.base()).vec(total_count)
+        });
         Self::new(Op::Cat { sources: SmallVec::from_vec(sources) }, dtype)
     }
 
     /// Create a PTRCAT operation (concatenate pointers).
     ///
-    /// Combines multiple pointer indices into a vectorized pointer.
-    /// This is an expander-level operation used in devectorizer for grouping memory accesses.
-    pub fn ptrcat(sources: Vec<Arc<Self>>) -> Arc<Self> {
+    /// # Example
+    /// ```ignore
+    /// UOp::ptrcat().sources(vec![a, b]).dtype(ptr_dtype).call()
+    /// ```
+    #[builder]
+    pub fn ptrcat(sources: Vec<Arc<Self>>, dtype: Option<DType>) -> Arc<Self> {
         assert!(!sources.is_empty(), "PTRCAT requires at least one source");
-        let dtype = sources[0].dtype.clone();
+        let dtype = dtype.unwrap_or_else(|| sources[0].dtype.clone());
         Self::new(Op::PtrCat { sources: SmallVec::from_vec(sources) }, dtype)
     }
 

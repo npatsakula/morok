@@ -1062,7 +1062,7 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
         Gep { vector, indices } if matches!(vector.op(), Op::PtrCat { .. }) => |vector, indices| {
             let Op::PtrCat { sources } = vector.op() else { return None };
             let reordered: Vec<_> = indices.iter().filter_map(|&idx| sources.get(idx).cloned()).collect();
-            (reordered.len() == indices.len()).then(|| UOp::ptrcat(reordered))
+            (reordered.len() == indices.len()).then(|| UOp::ptrcat().sources(reordered).call())
         },
 
         // 11. GEP through CAT: Extract elements from concatenated vectors
