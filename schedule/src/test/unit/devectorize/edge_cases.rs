@@ -201,16 +201,20 @@ fn test_devectorize_mixed_addrspaces() {
 fn test_devectorize_very_large_vector() {
     let buffer = create_buffer(512);
 
+    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
+    let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let define = UOp::define_global(def_id, buffer.dtype());
+    let buf_vec = UOp::broadcast(define.clone(), 64);
+
     // Create vec64 index
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..64).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
     let vec_idx = UOp::vectorize(indices);
 
-    let index = UOp::new(
-        Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![vec_idx], gate: None },
-        DType::Float32,
-    );
+    let index =
+        UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Float32);
 
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().buffer(define).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -225,15 +229,19 @@ fn test_devectorize_very_large_vector() {
 fn test_devectorize_vec32() {
     let buffer = create_buffer(256);
 
+    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(11000);
+    let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let define = UOp::define_global(def_id, buffer.dtype());
+    let buf_vec = UOp::broadcast(define.clone(), 32);
+
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..32).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
     let vec_idx = UOp::vectorize(indices);
 
-    let index = UOp::new(
-        Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![vec_idx], gate: None },
-        DType::Float32,
-    );
+    let index =
+        UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Float32);
 
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().buffer(define).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -266,15 +274,19 @@ fn test_devectorize_unaligned_access() {
 fn test_devectorize_vec3() {
     let buffer = create_buffer(64);
 
+    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(12000);
+    let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let define = UOp::define_global(def_id, buffer.dtype());
+    let buf_vec = UOp::broadcast(define.clone(), 3);
+
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..3).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
     let vec_idx = UOp::vectorize(indices);
 
-    let index = UOp::new(
-        Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![vec_idx], gate: None },
-        DType::Float32,
-    );
+    let index =
+        UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Float32);
 
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().buffer(define).index(index).call();
 
     let result = apply_devectorize(&load);
 
@@ -288,15 +300,19 @@ fn test_devectorize_vec3() {
 fn test_devectorize_vec5() {
     let buffer = create_buffer(64);
 
+    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(13000);
+    let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let define = UOp::define_global(def_id, buffer.dtype());
+    let buf_vec = UOp::broadcast(define.clone(), 5);
+
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..5).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
     let vec_idx = UOp::vectorize(indices);
 
-    let index = UOp::new(
-        Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![vec_idx], gate: None },
-        DType::Float32,
-    );
+    let index =
+        UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Float32);
 
-    let load = UOp::load().buffer(buffer.clone()).index(index).call();
+    let load = UOp::load().buffer(define).index(index).call();
 
     let result = apply_devectorize(&load);
 

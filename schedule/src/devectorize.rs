@@ -70,6 +70,28 @@ pub fn bool_storage_patterns() -> TypedPatternMatcher {
 /// Called during codegen, NOT part of pm_devectorize.
 pub fn pm_render() -> TypedPatternMatcher {
     crate::patterns! {
+        // Vector CONST → VECTORIZE of scalar CONST (devectorizer.py:260-261)
+        c @ Const(_) if c.dtype().vcount() > 1 => |c| {
+            let vcount = c.dtype().vcount();
+            let Op::Const(cv) = c.op() else { return None };
+            let scalar_dtype = DType::Scalar(c.dtype().scalar()?);
+            let scalar_const = UOp::const_(scalar_dtype, cv.0.clone());
+            let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+                .map(|_| scalar_const.clone())
+                .collect();
+            Some(UOp::vectorize(elements))
+        },
+
+        // VCONST → VECTORIZE of scalar CONSTs (devectorizer.py:262)
+        vc @ VConst { values } => |vc, values| {
+            // VConst stores different values per lane - convert each to scalar CONST
+            let scalar_dtype = DType::Scalar(vc.dtype().scalar()?);
+            let elements: SmallVec<[Arc<UOp>; 4]> = values.iter()
+                .map(|v| UOp::const_(scalar_dtype.clone(), v.clone()))
+                .collect();
+            Some(UOp::vectorize(elements))
+        },
+
         // CAT → VECTORIZE (CAT can't be rendered)
         Cat { sources } if sources.len() == 1 => Some(sources[0].clone()),
         Cat { sources } => {
@@ -168,6 +190,17 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
                 UOp::cast(gep_src, src_scalar_dtype.clone())
             }).collect();
             Some(UOp::vectorize(casts))
+        },
+
+        // BITCAST devectorization (Tinygrad devectorizer.py:254 includes BITCAST)
+        BitCast { src, dtype } if src.dtype().vcount() > 1 => |src, dtype| {
+            let vcount = src.dtype().vcount();
+            let scalar_dtype = dtype.scalar().map(DType::Scalar)?;
+            let bitcasts: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
+                let gep_src = UOp::gep(src.clone(), vec![i]);
+                UOp::bitcast(gep_src, scalar_dtype.clone())
+            }).collect();
+            Some(UOp::vectorize(bitcasts))
         },
 
         // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:221)
@@ -494,6 +527,62 @@ pub fn load_store_indexing_patterns() -> TypedPatternMatcher {
 }
 
 // ============================================================================
+// Add Loads Patterns (devectorizer.py:320-326)
+// ============================================================================
+
+/// Add LOAD to non-pointer INDEX, remove LOAD wrapper from STORE.
+pub fn pm_add_loads() -> TypedPatternMatcher {
+    crate::patterns! {
+        // Add LOAD to non-ptr INDEX: INDEX(buf, idx) → LOAD(INDEX(buf, idx))
+        // Skip if dtype is already Ptr (devectorizer.py:322-323)
+        idx @ Index { buffer, .. } if !is_ptr_or_image_dtype(&idx.dtype()) => {
+            let new_idx = idx.with_dtype(buffer.dtype());
+            let load_dtype = DType::Scalar(idx.dtype().base());
+            Some(UOp::load().buffer(buffer.clone()).index(new_idx).dtype(load_dtype).call())
+        },
+
+        // Remove LOAD wrapper from STORE: STORE(LOAD(x), ...) → STORE(x, ...)
+        // (devectorizer.py:325)
+        Store { buffer, index: Load { index: inner_idx, .. }, value, ranges }
+            => Some(UOp::store_with_ranges(buffer.clone(), inner_idx.clone(), value.clone(), ranges.clone())),
+    }
+}
+
+fn is_ptr_or_image_dtype(dtype: &DType) -> bool {
+    matches!(dtype, DType::Ptr { .. } | DType::Image { .. })
+}
+
+// ============================================================================
+// WMMA Accumulation Patterns (devectorizer.py:314-315)
+// ============================================================================
+
+/// Fuse Add into WMMA's accumulator: WMMA(a,b,c) + add → WMMA(a,b,c+add)
+/// Tensor cores have built-in accumulation, so this is more efficient.
+pub fn pm_wmma_accumulate() -> TypedPatternMatcher {
+    crate::patterns! {
+        // WMMA + add → WMMA with fused accumulator (devectorizer.py:314-315)
+        // Pattern: Add(WMMA(a, b, c), add) → WMMA(a, b, Add(c, add))
+        Add(wmma @ Wmma { a, b, c, metadata }, add) => |wmma, a, b, c, metadata, add| {
+            // Only fuse if types match
+            if wmma.dtype() != add.dtype() {
+                return None;
+            }
+            let new_c = c.add(add);
+            Some(UOp::wmma(a.clone(), b.clone(), new_c, metadata.clone()))
+        },
+
+        // Commutative: add + WMMA → WMMA with fused accumulator
+        Add(add, wmma @ Wmma { a, b, c, metadata }) => |wmma, add, a, b, c, metadata| {
+            if wmma.dtype() != add.dtype() {
+                return None;
+            }
+            let new_c = c.add(add);
+            Some(UOp::wmma(a.clone(), b.clone(), new_c, metadata.clone()))
+        },
+    }
+}
+
+// ============================================================================
 // Load Store Folding Patterns (devectorizer.py:114-126)
 // ============================================================================
 
@@ -544,25 +633,27 @@ fn is_define_or_after(uop: &Arc<UOp>) -> bool {
     matches!(uop.unwrap_after().op(), Op::DefineLocal(_) | Op::DefineReg { .. } | Op::DefineGlobal(_))
 }
 
+/// Matches INDEX(VECTORIZE(Defines.or_after()), vec_idx) only.
+/// Tinygrad devectorizer.py:115 - expand_index only matches VECTORIZE of defines.
 fn is_vector_index(uop: &Arc<UOp>) -> bool {
     let Op::Index { buffer, indices, .. } = uop.op() else { return false };
+
+    // Index must be vector
     let Some(idx) = indices.first() else { return false };
     if idx.dtype().vcount() <= 1 {
         return false;
     }
 
-    // Extract actual buffer from VECTORIZE if present
-    let actual_buf = if let Op::Vectorize { elements } = buffer.op() {
-        if elements.is_empty() || !elements.iter().all(is_define_or_after) {
-            return false;
-        }
-        &elements[0]
-    } else {
-        buffer
-    };
+    // Buffer MUST be VECTORIZE (not bare buffer) - Tinygrad line 115
+    let Op::Vectorize { elements } = buffer.op() else { return false };
+
+    // Elements must be Defines.or_after()
+    if elements.is_empty() || !elements.iter().all(is_define_or_after) {
+        return false;
+    }
 
     // Don't vectorize bool loads (LLVM i1 vector load is broken)
-    !actual_buf.dtype().base().is_bool()
+    !elements[0].dtype().base().is_bool()
 }
 
 // ============================================================================

@@ -161,13 +161,30 @@ pub fn create_index(buffer: Arc<UOp>, idx: i64) -> Arc<UOp> {
 
 /// Create a vector INDEX with iota pattern: [0, 1, 2, ..., count-1].
 ///
-/// INDEX(buffer, VECTORIZE([0, 1, 2, ..., count-1]))
+/// Creates INDEX(VECTORIZE([def, def, ...]), VECTORIZE([0, 1, ..., count-1]))
+/// which matches Tinygrad's expand_index pattern (devectorizer.py:115).
 pub fn create_vector_index_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
     let indices: SmallVec<[Arc<UOp>; 4]> =
         (0..count).map(|i| UOp::const_(DType::Index, ConstValue::Int(i as i64))).collect();
     let vec_idx = UOp::vectorize(indices);
     let idx_dtype = buffer.dtype().base();
-    UOp::new(Op::Index { buffer, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
+
+    // Wrap buffer in VECTORIZE to match Tinygrad's expand_index pattern:
+    // INDEX(VECTORIZE(Defines.or_after()), vec_idx)
+    let define = buffer_to_define(&buffer);
+    let buf_vec = UOp::broadcast(define, count);
+
+    UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
+}
+
+/// Convert a BUFFER to DEFINE_GLOBAL for testing.
+///
+/// In real code, this conversion happens during lowering. For tests,
+/// we create DEFINE_GLOBAL directly to match the expected input structure.
+fn buffer_to_define(buffer: &Arc<UOp>) -> Arc<UOp> {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    UOp::define_global(id, buffer.dtype())
 }
 
 /// Create a vector INDEX with offset: [offset, offset+1, offset+2, ..., offset+count-1].
@@ -176,7 +193,11 @@ pub fn create_vector_index_offset(buffer: Arc<UOp>, count: usize, offset: i64) -
         (0..count).map(|i| UOp::const_(DType::Index, ConstValue::Int(offset + i as i64))).collect();
     let vec_idx = UOp::vectorize(indices);
     let idx_dtype = buffer.dtype().base();
-    UOp::new(Op::Index { buffer, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
+
+    let define = buffer_to_define(&buffer);
+    let buf_vec = UOp::broadcast(define, count);
+
+    UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
 }
 
 /// Create a vector INDEX with scaled pattern: [0*scale, 1*scale, 2*scale, ..., (count-1)*scale].
@@ -187,7 +208,11 @@ pub fn create_vector_index_scaled(buffer: Arc<UOp>, count: usize, scale: i64) ->
         (0..count).map(|i| UOp::const_(DType::Index, ConstValue::Int(i as i64 * scale))).collect();
     let vec_idx = UOp::vectorize(indices);
     let idx_dtype = buffer.dtype().base();
-    UOp::new(Op::Index { buffer, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
+
+    let define = buffer_to_define(&buffer);
+    let buf_vec = UOp::broadcast(define, count);
+
+    UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
 }
 
 /// Create a vector INDEX with explicit values.
@@ -196,7 +221,12 @@ pub fn create_vector_index_values(buffer: Arc<UOp>, values: Vec<i64>) -> Arc<UOp
         values.iter().map(|&v| UOp::const_(DType::Index, ConstValue::Int(v))).collect();
     let vec_idx = UOp::vectorize(indices);
     let idx_dtype = buffer.dtype().base();
-    UOp::new(Op::Index { buffer, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
+    let count = values.len();
+
+    let define = buffer_to_define(&buffer);
+    let buf_vec = UOp::broadcast(define, count);
+
+    UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
 }
 
 /// Create a gated vector INDEX.
@@ -205,7 +235,14 @@ pub fn create_vector_index_gated(buffer: Arc<UOp>, count: usize, gate: Arc<UOp>)
         (0..count).map(|i| UOp::const_(DType::Index, ConstValue::Int(i as i64))).collect();
     let vec_idx = UOp::vectorize(indices);
     let idx_dtype = buffer.dtype().base();
-    UOp::new(Op::Index { buffer, indices: smallvec::smallvec![vec_idx], gate: Some(gate) }, DType::Scalar(idx_dtype))
+
+    let define = buffer_to_define(&buffer);
+    let buf_vec = UOp::broadcast(define, count);
+
+    UOp::new(
+        Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: Some(gate) },
+        DType::Scalar(idx_dtype),
+    )
 }
 
 /// Create an INDEX with symbolic root + offset pattern.

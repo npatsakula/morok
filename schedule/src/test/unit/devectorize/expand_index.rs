@@ -106,7 +106,10 @@ fn test_expand_contiguous_with_offset() {
     }
 }
 
-/// Test: Contiguous expansion preserves buffer reference.
+/// Test: Contiguous expansion contains DEFINE_GLOBAL references.
+///
+/// After conversion to Tinygrad's structure (VECTORIZE(DEFINE_GLOBAL)),
+/// the result should contain DEFINE_GLOBAL references.
 #[test]
 fn test_expand_contiguous_preserves_buffer() {
     let buffer = create_buffer(64);
@@ -114,10 +117,9 @@ fn test_expand_contiguous_preserves_buffer() {
 
     let result = apply_phase1(&index);
 
-    // Verify buffer is preserved somewhere in the result tree
-    let buffer_count =
-        count_ops(&result, |u| if let Op::Buffer { .. } = u.op() { Arc::ptr_eq(u, &buffer) } else { false });
-    assert!(buffer_count > 0, "Buffer reference should be preserved");
+    // Verify DEFINE_GLOBAL is present in the result tree
+    let define_count = count_ops(&result, |u| matches!(u.op(), Op::DefineGlobal(_)));
+    assert!(define_count > 0, "DEFINE_GLOBAL reference should be present");
 }
 
 // =============================================================================
@@ -297,11 +299,17 @@ fn test_expand_multi_index_unsupported() {
 
 /// Test: Range-based index with symbolic root.
 ///
-/// INDEX(buffer, [range*4 + 0, range*4 + 1, range*4 + 2, range*4 + 3])
+/// INDEX(VECTORIZE([def]*4), [range*4 + 0, range*4 + 1, range*4 + 2, range*4 + 3])
 /// Should detect common root and group offsets.
 #[test]
 fn test_expand_range_based_index() {
     let buffer = create_buffer(256);
+
+    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1000);
+    let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let define = UOp::define_global(def_id, buffer.dtype());
+    let buf_vec = UOp::broadcast(define, 4);
 
     // Create vector index: VECTORIZE([range*4+0, range*4+1, range*4+2, range*4+3])
     let range = UOp::new(
@@ -330,7 +338,7 @@ fn test_expand_range_based_index() {
         .collect();
 
     let vec_idx = UOp::vectorize(indices);
-    let index = UOp::new(Op::Index { buffer, indices: smallvec![vec_idx], gate: None }, DType::Float32);
+    let index = UOp::new(Op::Index { buffer: buf_vec, indices: smallvec![vec_idx], gate: None }, DType::Float32);
 
     let result = unwrap_gep(&apply_phase1(&index));
 
@@ -350,6 +358,12 @@ fn test_expand_range_based_index() {
 #[test]
 fn test_expand_symbolic_root_grouping() {
     let buffer = create_buffer(256);
+
+    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2000);
+    let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let define = UOp::define_global(def_id, buffer.dtype());
+    let buf_vec = UOp::broadcast(define, 4);
 
     // Create two groups with same root but different base offsets
     let range = UOp::new(
@@ -378,7 +392,7 @@ fn test_expand_symbolic_root_grouping() {
         .collect();
 
     let vec_idx = UOp::vectorize(indices);
-    let index = UOp::new(Op::Index { buffer, indices: smallvec![vec_idx], gate: None }, DType::Float32);
+    let index = UOp::new(Op::Index { buffer: buf_vec, indices: smallvec![vec_idx], gate: None }, DType::Float32);
 
     let result = apply_phase1(&index);
 
@@ -400,6 +414,12 @@ fn test_expand_symbolic_root_grouping() {
 #[test]
 fn test_expand_different_roots_separate() {
     let buffer = create_buffer(256);
+
+    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(3000);
+    let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let define = UOp::define_global(def_id, buffer.dtype());
+    let buf_vec = UOp::broadcast(define, 4);
 
     // Two different range variables
     let range1 = UOp::new(
@@ -437,7 +457,7 @@ fn test_expand_different_roots_separate() {
     .collect();
 
     let vec_idx = UOp::vectorize(indices);
-    let index = UOp::new(Op::Index { buffer, indices: smallvec![vec_idx], gate: None }, DType::Float32);
+    let index = UOp::new(Op::Index { buffer: buf_vec, indices: smallvec![vec_idx], gate: None }, DType::Float32);
 
     let result = apply_phase1(&index);
 
