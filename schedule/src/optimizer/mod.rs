@@ -130,13 +130,21 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
 
     tracing::debug!(ast_after_linearize = %linearized.tree(), "post_optimization: after pm_linearize_multi_index");
 
+    // pm_reduce: Convert REDUCE → DEFINE_REG + accumulator pattern (Tinygrad devectorizer.py:310-316)
+    // This runs EARLY (before pm_add_loads, before devectorize) to eliminate REDUCE ops.
+    // After this pass, ALL RANGE ops (including AxisType::Reduce) create loops uniformly in codegen.
+    // Note: codegen_reduce still exists for backward compatibility but won't be called if no REDUCE ops.
+    let pm_reduce = crate::devectorize::pm_reduce();
+    let reduced = graph_rewrite(&pm_reduce, linearized, &mut ());
+    tracing::debug!(ast_after_pm_reduce = %reduced.tree(), "post_optimization: after pm_reduce");
+
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
     let pm_loads = crate::rangeify::patterns::pm_add_loads();
     // First pass: wrap existing INDEX ops before expansion.
     // Pattern has guard (!Ptr dtype) and transforms INDEX dtype to Ptr, so safe for reuse.
-    let with_loads = graph_rewrite(&pm_loads, linearized, &mut ());
+    let with_loads = graph_rewrite(&pm_loads, reduced, &mut ());
 
     // Post-optimization: Fix UNROLL substitutions in REDUCE ops
     // This handles arithmetic expressions created by shift_to UNROLL

@@ -107,6 +107,9 @@ fn classify_op(op: &Op) -> OpCategory {
 
         Op::Load { .. } | Op::Store { .. } | Op::Index { .. } | Op::PointerIndex { .. } => OpCategory::Memory,
 
+        // DefineReg creates register accumulator (alloca) - handled in Memory
+        Op::DefineReg { .. } => OpCategory::Memory,
+
         Op::Range { .. } | Op::End { .. } | Op::Reduce { .. } | Op::Bind { .. } => OpCategory::Loop,
 
         // Buffer/DefineGlobal/DefineLocal should already be in ValueMap from renderer
@@ -115,6 +118,9 @@ fn classify_op(op: &Op) -> OpCategory {
         // DefineVar: For inlined outer loops, value comes from Bind (loop counter)
         // Should be in ValueMap after Bind is processed. If not there, it's an error.
         Op::DefineVar { .. } => OpCategory::Meta,
+
+        // After is a passthrough with ordering dependency - processed in Arithmetic
+        Op::After { .. } => OpCategory::Arithmetic,
 
         Op::Sink { .. }
         | Op::Group { .. }
@@ -372,6 +378,15 @@ fn codegen_arithmetic<'ctx>(
 
             // Fallback: extract all elements and build result
             cat_elements_fallback(&source_values, context, builder)
+        }
+        // After ensures passthrough is evaluated after deps - just return passthrough value
+        Op::After { passthrough, deps } => {
+            // Evaluate deps first to ensure ordering
+            for dep in deps.iter() {
+                codegen_uop(dep, context, module, builder, values)?;
+            }
+            // Return passthrough value
+            require_value(passthrough, context, module, builder, values).map(Some)
         }
         _ => Ok(None),
     }
@@ -832,6 +847,31 @@ fn codegen_memory<'ctx>(
             };
             Ok(Some(result.into()))
         }
+        Op::DefineReg { size } => {
+            // Create alloca for register accumulator
+            // Element type comes from the pointer's base dtype
+            let element_dtype = match uop.dtype() {
+                DType::Ptr { base, .. } => base.as_ref().clone(),
+                _ => {
+                    // Fallback: use i64 for untyped (Void) pointers
+                    // This happens with define_reg(size) without explicit type
+                    DType::Int64
+                }
+            };
+
+            let element_type = common::dtype_to_basic_type(&element_dtype, context)?;
+
+            // Create array alloca if size > 1, otherwise single element
+            let alloca = if *size > 1 {
+                let array_type = element_type.array_type(*size as u32);
+                builder.build_alloca(array_type, "reg_acc").context(BuildAllocaSnafu)?
+            } else {
+                builder.build_alloca(element_type, "reg_acc").context(BuildAllocaSnafu)?
+            };
+
+            trace!(uop_id = uop.id, size = size, element_dtype = ?element_dtype, "DefineReg: created alloca");
+            Ok(Some(alloca.into()))
+        }
         _ => Ok(None),
     }
 }
@@ -1121,12 +1161,11 @@ fn codegen_range<'ctx>(
         return Ok(Some(val));
     }
 
-    // Reduce ranges are handled entirely by REDUCE codegen
-    // DON'T return the end value here - that would be cached and used incorrectly
-    // REDUCE will set up the loop counter and store it for its source subgraph
-    if axis_type == AxisType::Reduce {
-        return Ok(None);
-    }
+    // NOTE: When pm_reduce is NOT used, REDUCE codegen handles Reduce ranges inline.
+    // When pm_reduce IS used, REDUCE ops are removed and Reduce ranges need loops here.
+    // The pre-pass in mod.rs and find_reduce_source_nodes handle this correctly:
+    // - With REDUCE ops: Reduce ranges are skipped (in source subgraph)
+    // - Without REDUCE ops: Reduce ranges are processed normally
 
     // THREAD ranges: Don't create loop, use thread_id parameter
     // The thread_id was set by mod.rs during kernel function setup
@@ -1140,9 +1179,11 @@ fn codegen_range<'ctx>(
         return UnsupportedSnafu { what: "Thread range not found in ValueMap - kernel setup error" }.fail();
     }
 
-    // OUTER/GLOBAL/LOOP ranges: create for-loops directly (Tinygrad approach)
-    // These loops are closed by mod.rs cleanup at the end of kernel generation.
-    if matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop) {
+    // OUTER/GLOBAL/LOOP/REDUCE ranges: create for-loops directly (Tinygrad approach)
+    // These loops are closed by END operations or mod.rs cleanup at the end of kernel generation.
+    // NOTE: Reduce ranges are only processed here when pm_reduce is used (REDUCE ops removed).
+    // When REDUCE ops exist, Reduce ranges are in the source subgraph and skipped by main pass.
+    if matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop | AxisType::Reduce) {
         trace!(uop_id, axis_type = ?axis_type, "creating loop for range");
 
         // Check for size-1 loop - no loop needed, just use 0

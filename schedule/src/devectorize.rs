@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{BinaryOp, ConstValue, Op, UOp, WmmaMetadata};
+use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, UOp, WmmaMetadata};
 
 use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
@@ -1043,6 +1043,141 @@ fn offset_index(idx: &Arc<UOp>, offset: i64) -> Arc<UOp> {
         .collect();
 
     UOp::new(Op::Index { buffer: buffer.clone(), indices: new_indices, gate: gate.clone() }, idx.dtype())
+}
+
+// ============================================================================
+// pm_reduce: Convert REDUCE to explicit accumulator pattern (Tinygrad devectorizer.py:310-316)
+// ============================================================================
+
+use crate::symbolic::dce::reduce_identity;
+
+/// Convert REDUCE to explicit DEFINE_REG + LOAD/STORE accumulation pattern.
+///
+/// Transforms:
+/// ```text
+/// REDUCE(src, ranges, Add) with dtype Float32
+/// ```
+///
+/// To:
+/// ```text
+/// acc = DEFINE_REG_TYPED(1, Float32)
+/// idx = INDEX(acc, [0])
+/// store_init = STORE(acc, idx, identity)  // Initialize with 0 for Add
+/// // Loop body (ranges provide iteration):
+/// acc_after = AFTER(acc, [store_init, ranges...])
+/// idx_loop = INDEX(acc_after, [0])
+/// val = LOAD(acc, idx_loop)
+/// new_val = val + src
+/// store_loop = STORE(acc, idx_loop, new_val)
+/// // After loop:
+/// end = END(store_loop, ranges)
+/// acc_final = AFTER(acc, [end])
+/// idx_final = INDEX(acc_final, [0])
+/// result = LOAD(acc, idx_final)
+/// ```
+///
+/// This runs EARLY (before pm_add_loads, before main devectorize) to eliminate
+/// REDUCE before other patterns see it. Matches Tinygrad's pm_reduce.
+pub fn pm_reduce() -> TypedPatternMatcher {
+    crate::patterns! {
+        // Convert REDUCE to accumulator pattern
+        // Skip if ranges are empty (handled by codegen or identity)
+        red @ Reduce { src, ranges, reduce_op } if !ranges.is_empty() => |red, src, ranges, reduce_op| {
+            reduce_to_acc(red, src, ranges, reduce_op)
+        },
+    }
+}
+
+/// Convert a REDUCE operation to explicit accumulator pattern.
+///
+/// Note: This creates INDEX ops with element dtype. pm_add_loads will:
+/// 1. Wrap INDEX with LOAD for values used in arithmetic
+/// 2. STORE cleanup will remove LOAD from STORE's index position
+fn reduce_to_acc(
+    red: &Arc<UOp>,
+    src: &Arc<UOp>,
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
+    reduce_op: &ReduceOp,
+) -> Option<Arc<UOp>> {
+    let result_dtype = red.dtype();
+    let scalar_dtype = DType::Scalar(result_dtype.scalar()?);
+
+    // 1. Create identity element for the reduction
+    let identity = reduce_identity(*reduce_op, scalar_dtype.clone());
+
+    // 2. Create DEFINE_REG accumulator with explicit element type
+    let acc = UOp::define_reg_typed(1, scalar_dtype.clone());
+
+    // 3. Create index into accumulator (always index 0 for single-element acc)
+    // INDEX dtype is element dtype (scalar_dtype), not Ptr dtype.
+    // pm_add_loads will transform INDEX dtype to Ptr and wrap with LOAD.
+    let zero_idx = UOp::index_const(0);
+    let idx_init = UOp::new(
+        Op::Index {
+            buffer: acc.clone(),
+            indices: smallvec::smallvec![zero_idx.clone()],
+            gate: None,
+        },
+        scalar_dtype.clone(),
+    );
+
+    // 4. Initialize accumulator with identity value
+    let store_init = UOp::store(acc.clone(), idx_init, identity);
+
+    // 5. Create accumulator access for loop body
+    // acc_after depends on init store AND the ranges (to be inside the loop)
+    let mut init_deps: SmallVec<[Arc<UOp>; 4]> = smallvec::smallvec![store_init.clone()];
+    init_deps.extend(ranges.iter().cloned());
+    let acc_after_init = UOp::after(acc.clone(), init_deps);
+
+    let idx_loop = UOp::new(
+        Op::Index {
+            buffer: acc_after_init,
+            indices: smallvec::smallvec![zero_idx.clone()],
+            gate: None,
+        },
+        scalar_dtype.clone(),
+    );
+
+    // 6. Apply reduce operation: new_val = op(idx_loop, src)
+    // Note: We use idx_loop directly (not wrapped in LOAD). pm_add_loads will add LOAD.
+    let new_val = apply_reduce_binary(*reduce_op, idx_loop.clone(), src.clone(), &scalar_dtype);
+
+    // 7. Store new value back to accumulator
+    let store_loop = UOp::store(acc.clone(), idx_loop, new_val);
+
+    // 8. End the ranges after the store
+    let end = UOp::end(store_loop, ranges.clone());
+
+    // 9. Final value after loop completes
+    // Create INDEX that will be wrapped with LOAD by pm_add_loads
+    let acc_after_end = UOp::after(acc.clone(), smallvec::smallvec![end]);
+    let idx_final = UOp::new(
+        Op::Index {
+            buffer: acc_after_end,
+            indices: smallvec::smallvec![zero_idx],
+            gate: None,
+        },
+        scalar_dtype,
+    );
+
+    // Return INDEX directly - pm_add_loads will wrap with LOAD
+    Some(idx_final)
+}
+
+/// Apply binary reduce operation between two values.
+fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DType) -> Arc<UOp> {
+    match reduce_op {
+        ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, a, b), dtype.clone()),
+        ReduceOp::Mul => UOp::new(Op::Binary(BinaryOp::Mul, a, b), dtype.clone()),
+        ReduceOp::Max => UOp::new(Op::Binary(BinaryOp::Max, a, b), dtype.clone()),
+        ReduceOp::Min => {
+            // Min(a, b) = Where(a < b, a, b)
+            let cond_dtype = DType::Bool.vec(dtype.vcount());
+            let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), cond_dtype);
+            UOp::try_where(cond, a, b).expect("WHERE construction should succeed")
+        }
+    }
 }
 
 #[cfg(test)]

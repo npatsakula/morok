@@ -45,8 +45,16 @@ pub fn reduce_identity(op: morok_ir::types::ReduceOp, dtype: morok_dtype::DType)
     use morok_ir::types::ReduceOp;
 
     match op {
-        ReduceOp::Add => UOp::const_(dtype, Int(0)),
-        ReduceOp::Mul => UOp::const_(dtype, Int(1)),
+        ReduceOp::Add => {
+            // 0 is identity for addition (x + 0 = x)
+            let zero = if dtype.is_float() { Float(0.0) } else { Int(0) };
+            UOp::const_(dtype, zero)
+        }
+        ReduceOp::Mul => {
+            // 1 is identity for multiplication (x * 1 = x)
+            let one = if dtype.is_float() { Float(1.0) } else { Int(1) };
+            UOp::const_(dtype, one)
+        }
         ReduceOp::Max => {
             // Return dtype minimum value
             let min_val = if dtype == DType::Int8 {
