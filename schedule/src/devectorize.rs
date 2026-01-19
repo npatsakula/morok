@@ -74,7 +74,7 @@ pub fn pm_render() -> TypedPatternMatcher {
         c @ Const(_) if c.dtype().vcount() > 1 => |c| {
             let vcount = c.dtype().vcount();
             let Op::Const(cv) = c.op() else { return None };
-            let scalar_dtype = DType::Scalar(c.dtype().scalar()?);
+            let scalar_dtype = DType::Scalar(c.dtype().base());
             let scalar_const = UOp::const_(scalar_dtype, cv.0.clone());
             let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
                 .map(|_| scalar_const.clone())
@@ -85,7 +85,7 @@ pub fn pm_render() -> TypedPatternMatcher {
         // VCONST → VECTORIZE of scalar CONSTs (devectorizer.py:262)
         vc @ VConst { values } => |vc, values| {
             // VConst stores different values per lane - convert each to scalar CONST
-            let scalar_dtype = DType::Scalar(vc.dtype().scalar()?);
+            let scalar_dtype = DType::Scalar(vc.dtype().base());
             let elements: SmallVec<[Arc<UOp>; 4]> = values.iter()
                 .map(|v| UOp::const_(scalar_dtype.clone(), v.clone()))
                 .collect();

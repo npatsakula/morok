@@ -150,6 +150,8 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     // This handles arithmetic expressions created by shift_to UNROLL
     let expanded = crate::expand::pre_expand(&with_loads);
 
+    tracing::debug!(ast_after_pre_expand = %expanded.tree(), "post_optimization: after pre_expand");
+
     // ALU Devectorization + VECTORIZE Normalization
     //
     // Two modes based on devectorize_alu flag:
@@ -189,6 +191,8 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     // Devectorize pass: group contiguous memory accesses
     // Uses direct vector index analysis (VConst/UNROLL patterns) for termination safety
     let devectorized_mem = crate::devectorize::devectorize(&expanded);
+
+    tracing::debug!(ast_after_devectorize = %devectorized_mem.tree(), "post_optimization: after devectorize");
 
     // Bool devectorization: Convert <N x i1> ALU ops to scalar ops + VECTORIZE.
     // LLVM's bool vectors are broken (no formal ABI, segfaults in codegen).

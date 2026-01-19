@@ -67,10 +67,14 @@ fn test_reduce_add_basic() {
     let range =
         UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
 
-    let reduce = UOp::reduce(const_val, smallvec::smallvec![range], ReduceOp::Add);
+    let reduce = UOp::reduce(const_val, smallvec::smallvec![range.clone()], ReduceOp::Add);
+
+    // END op closes the loop - required for proper codegen
+    let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
+    let end_op = UOp::end(reduce, ranges);
 
     // Wrap in SINK
-    let sink = UOp::sink(vec![reduce]);
+    let sink = UOp::sink(vec![end_op]);
 
     // Render to LLVM IR
     let result = render(&sink, Some("test_reduce_add"));
@@ -86,8 +90,8 @@ fn test_reduce_add_basic() {
     assert!(ir.contains("loop_latch_"), "Missing loop latch block:\n{}", ir);
     assert!(ir.contains("loop_body_"), "Missing loop body block:\n{}", ir);
     assert!(ir.contains("loop_exit_"), "Missing loop exit block:\n{}", ir);
-    // Verify accumulator alloca (used instead of PHI for nested loop support)
-    assert!(ir.contains("reduce_acc"), "Missing reduce accumulator alloca:\n{}", ir);
+    // Verify accumulator alloca
+    assert!(ir.contains("alloca float"), "Missing reduce accumulator alloca:\n{}", ir);
     // Verify reduce add operation
     assert!(ir.contains("fadd"), "Missing fadd instruction:\n{}", ir);
 }
@@ -99,8 +103,12 @@ fn test_reduce_max() {
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(3.0));
     let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(5)), AxisId::Renumbered(0), AxisType::Reduce);
 
-    let reduce = UOp::reduce(const_val, smallvec::smallvec![range], ReduceOp::Max);
-    let sink = UOp::sink(vec![reduce]);
+    let reduce = UOp::reduce(const_val, smallvec::smallvec![range.clone()], ReduceOp::Max);
+
+    // END op closes the loop
+    let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
+    let end_op = UOp::end(reduce, ranges);
+    let sink = UOp::sink(vec![end_op]);
 
     let result = render(&sink, Some("test_reduce_max"));
     assert!(result.is_ok(), "Codegen failed: {:?}", result.err());
@@ -109,7 +117,7 @@ fn test_reduce_max() {
     let ir = &kernel.code;
 
     // Verify max intrinsic is called
-    assert!(ir.contains("llvm.maxnum.f32") || ir.contains("maxnum"), "Missing maxnum intrinsic:\n{}", ir);
+    assert!(ir.contains("llvm.maxnum.f") || ir.contains("maxnum"), "Missing maxnum intrinsic:\n{}", ir);
 }
 
 /// Test REDUCE codegen with empty ranges (no reduction).

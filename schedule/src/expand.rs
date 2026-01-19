@@ -277,21 +277,6 @@ pub fn swizzle_args(cargs: &[(usize, usize)], eargs: &[(usize, usize)], exclude_
 }
 
 // ============================================================================
-// Range Detection Helper
-// ============================================================================
-
-/// Check if a UOp contains any runtime scalar ops (Range or DefineVar).
-///
-/// Expressions containing Range or DefineVar ops must not be broadcast/vectorized,
-/// as they represent runtime scalar values (loop counters, kernel parameters).
-fn contains_runtime_scalar(uop: &Arc<UOp>) -> bool {
-    match uop.op() {
-        Op::Range { .. } | Op::DefineVar { .. } => true,
-        op => op.sources().iter().any(contains_runtime_scalar),
-    }
-}
-
-// ============================================================================
 // Main Expansion Pass
 // ============================================================================
 
@@ -608,9 +593,10 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 continue;
             }
 
-            // Case 2: Buffer (source 0) for memory ops passes through unchanged
-            // Don't broadcast pointers - INDEX, LOAD, STORE all have buffer as source 0
-            if i == 0 && matches!(op, Op::Index { .. } | Op::Load { .. } | Op::Store { .. }) {
+            // Case 2: Buffer (source 0) for LOAD/STORE passes through unchanged
+            // INDEX buffer is broadcast to enable devectorize expand_index pattern matching
+            // (Tinygrad expander.py:56-58 broadcasts scalar sources including buffer)
+            if i == 0 && matches!(op, Op::Load { .. } | Op::Store { .. }) {
                 new_sources.push(src.clone());
                 continue;
             }
@@ -619,14 +605,6 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
             // Tinygrad expander.py:50-51: INDEX indices are not vectorized when dtype is not PtrDType
             // This preserves the memory access pattern - each expanded INDEX uses the same indices
             if i >= 1 && matches!(op, Op::Index { .. }) && !matches!(uop.dtype(), DType::Ptr { .. }) {
-                new_sources.push(src.clone());
-                continue;
-            }
-
-            // Case 3c: Expressions containing runtime scalars (Range, DefineVar) pass through
-            // These represent runtime values (loop counters, kernel params) - can't be vectorized.
-            // This handles shift_to expressions like `Binary(Range[Reduce] * 4)`
-            if contains_runtime_scalar(src) {
                 new_sources.push(src.clone());
                 continue;
             }
