@@ -838,6 +838,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[tracing_test::traced_test]
     fn test_realize_simple_add() {
         let _guard = crate::test::helpers::test_setup();
 
@@ -866,6 +867,7 @@ mod tests {
     /// - ReduceAxis → REDUCE transformation following Tinygrad's approach
     /// - REDUCE codegen generates correct LLVM IR
     #[test]
+    #[tracing_test::traced_test]
     fn test_realize_sum() {
         let _guard = crate::test::helpers::test_setup();
 

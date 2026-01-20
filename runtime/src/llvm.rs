@@ -81,6 +81,13 @@ impl LlvmKernel {
         // 3. Module/Engine never outlive the context
         let context_ref: &'static Context = unsafe { &*(context.as_ref() as *const Context) };
 
+        // Dump raw IR before parsing for debugging
+        trace!(
+            kernel.name = %name,
+            ir.length = ir.len(),
+            "Raw LLVM IR before parsing:\n{}", ir
+        );
+
         // Parse LLVM IR into a module
         let mem_buffer = inkwell::memory_buffer::MemoryBuffer::create_from_memory_range_copy(ir.as_bytes(), &name);
         let module = context_ref

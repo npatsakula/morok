@@ -23,6 +23,7 @@ proptest-derive = { version = "0.7", optional = true }
 snafu = "0.8.9"
 tracing = "0.1"
 itertools = "0.14.0"
+indexmap = "2.13.0"
 
 [features]
 default = []

@@ -30,59 +30,46 @@ impl UOp {
 
     /// Create a buffer index operation for multi-dimensional access.
     ///
-    /// All indices must have Index dtype. Returns the element dtype (not Ptr).
-    /// This matches Tinygrad's `buf.index(idx)` which returns element dtype by default.
-    /// Use `pm_add_loads` pattern to wrap INDEX in LOAD for arithmetic contexts.
-    pub fn index(buffer: Arc<Self>, indices: Vec<Arc<Self>>) -> Result<Arc<Self>> {
-        // Validate that all indices have Index dtype
-        for idx in &indices {
-            let idx_dtype = idx.dtype();
-            ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
-        }
-
-        // Extract element type - INDEX returns element dtype, not Ptr
-        // (Tinygrad: `self.dtype.base` when ptr=False)
-        let element_dtype = match buffer.dtype() {
-            DType::Ptr { base, .. } => base.as_ref().clone(),
-            other => other,
-        };
-        let indices = SmallVec::from_vec(indices);
-        Ok(Self::new(Op::Index { buffer, indices, gate: None }, element_dtype))
-    }
-
-    /// Create a gated index operation.
-    /// Returns the element dtype (not Ptr), same as `index()`.
-    pub fn index_gated(buffer: Arc<Self>, indices: Vec<Arc<Self>>, gate: Arc<Self>) -> Result<Arc<Self>> {
-        // Validate that all indices have Index dtype
-        for idx in &indices {
-            let idx_dtype = idx.dtype();
-            ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
-        }
-
-        // Extract element type - INDEX returns element dtype, not Ptr
-        let element_dtype = match buffer.dtype() {
-            DType::Ptr { base, .. } => base.as_ref().clone(),
-            other => other,
-        };
-        let indices = SmallVec::from_vec(indices);
-        Ok(Self::new(Op::Index { buffer, indices, gate: Some(gate) }, element_dtype))
-    }
-
-    /// Create an INDEX that returns the buffer's pointer dtype (Tinygrad's `ptr=True`).
+    /// All indices must have Index dtype.
     ///
-    /// Unlike `index()` which returns the element dtype, this returns the full
-    /// pointer dtype. Used in devectorize when building PTRCAT chains.
+    /// # Dtype behavior (matches Tinygrad's `buf.index(idx, ptr=False, dtype=None)`)
+    /// - If `dtype` is provided: use it directly (for STORE targets, use Ptr dtype)
+    /// - Otherwise: derive element dtype from buffer (default, for LOAD sources)
     ///
     /// # Examples
-    ///
     /// ```ignore
-    /// // buf.index(idx, ptr=True) in Tinygrad
-    /// let ptr_index = UOp::index_ptr(buffer, vec![idx], None);
-    /// assert!(matches!(ptr_index.dtype(), DType::Ptr { .. }));
+    /// // Element dtype (default) - for LOAD
+    /// UOp::index().buffer(buf).indices(vec![idx]).call()?
+    ///
+    /// // Explicit Ptr dtype - for STORE
+    /// let ptr_dtype = DType::Float32.ptr(Some(size), AddrSpace::Global);
+    /// UOp::index().buffer(buf).indices(vec![idx]).dtype(ptr_dtype).call()?
+    ///
+    /// // With gate
+    /// UOp::index().buffer(buf).indices(vec![idx]).gate(gate_uop).call()?
     /// ```
-    pub fn index_ptr(buffer: Arc<Self>, indices: Vec<Arc<Self>>, gate: Option<Arc<Self>>) -> Arc<Self> {
-        let ptr_dtype = buffer.dtype();
-        Self::new(Op::Index { buffer, indices: SmallVec::from_vec(indices), gate }, ptr_dtype)
+    #[builder]
+    pub fn index(
+        buffer: Arc<Self>,
+        indices: Vec<Arc<Self>>,
+        gate: Option<Arc<Self>>,
+        dtype: Option<DType>,
+    ) -> Result<Arc<Self>> {
+        // Validate that all indices have Index dtype
+        for idx in &indices {
+            let idx_dtype = idx.dtype();
+            ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
+        }
+
+        // Use provided dtype or derive element type from buffer
+        // (Tinygrad: `self.dtype.base` when ptr=False, or explicit dtype)
+        let result_dtype = dtype.unwrap_or_else(|| match buffer.dtype() {
+            DType::Ptr { base, .. } => base.as_ref().clone(),
+            other => other,
+        });
+
+        let indices = SmallVec::from_vec(indices);
+        Ok(Self::new(Op::Index { buffer, indices, gate }, result_dtype))
     }
 
     /// Create a pointer index operation (pointer arithmetic).
@@ -130,7 +117,7 @@ impl UOp {
             // No actual indexing, just return buffer
             Ok(buffer)
         } else {
-            Self::index(buffer, indices)
+            Self::index().buffer(buffer).indices(indices).call()
         }
     }
 
@@ -146,7 +133,7 @@ impl UOp {
             }
         }
 
-        if indices.is_empty() { Ok(buffer) } else { Self::index_gated(buffer, indices, gate) }
+        if indices.is_empty() { Ok(buffer) } else { Self::index().buffer(buffer).indices(indices).gate(gate).call() }
     }
 
     // =========================================================================

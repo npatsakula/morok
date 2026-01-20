@@ -394,6 +394,37 @@ impl UOp {
         }
     }
 
+    /// Get the underlying buffer UOp, walking through AFTER/MSELECT/MSTACK chains.
+    ///
+    /// Based on Tinygrad's `buf_uop` property (ops.py:601-606).
+    /// This recursively unwraps AFTER chains to find the actual buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use morok_ir::UOp;
+    ///
+    /// // AFTER wrapping a buffer
+    /// let buffer = UOp::new_buffer(...);
+    /// let after = UOp::after(buffer.clone(), deps);
+    ///
+    /// // buf_uop() walks through AFTER to get the underlying buffer
+    /// assert!(Arc::ptr_eq(&after.buf_uop(), &buffer));
+    /// ```
+    pub fn buf_uop(self: &Arc<Self>) -> Arc<Self> {
+        match self.op() {
+            Op::Buffer { .. } => self.clone(),
+            Op::MSelect { buffer, .. } => buffer.buf_uop(),
+            Op::MStack { buffers } if !buffers.is_empty() => buffers[0].buf_uop(),
+            Op::After { passthrough, .. } => passthrough.buf_uop(),
+            _ => {
+                // For other ops, check if base is AFTER
+                let base = self.base();
+                if matches!(base.op(), Op::After { .. }) { base.buf_uop() } else { self.clone() }
+            }
+        }
+    }
+
     /// Topological sort of the computation graph.
     ///
     /// Returns nodes in an order where all dependencies come before their dependents.

@@ -64,6 +64,11 @@ impl Renderer for LlvmTextRenderer {
         // (Tinygrad linearizer.py assigns RANGE priority 5, END priority -5)
         let nodes = linearize(uop);
 
+        // DEBUG: Log linearization order
+        for (i, node) in nodes.iter().enumerate() {
+            tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "linearized node");
+        }
+
         let mut ctx = RenderContext::new();
         let mut kernel: Vec<String> = Vec::new();
         let mut buffer_args: Vec<BufferArg> = Vec::new();
@@ -165,7 +170,7 @@ impl Renderer for LlvmTextRenderer {
                 let identity = ops::reduce_identity(*reduce_op, &node.dtype());
                 let acc_name = format!("%reduce_{}", node.id);
                 kernel.push(format!("  {acc_name} = alloca {dtype}"));
-                kernel.push(format!("  store {dtype} {identity}, {dtype}* {acc_name}"));
+                kernel.push(format!("  store {dtype} {identity}, ptr {acc_name}"));
                 // Pre-register the accumulator name for REDUCE
                 ctx.register(node.id, acc_name);
             }
@@ -344,9 +349,9 @@ mod tests {
         let out = UOp::define_global(2, DType::Float32.ptr(Some(1), AddrSpace::Global));
 
         let idx = UOp::index_const(0);
-        let a_idx = UOp::index(a.clone(), vec![idx.clone()]).unwrap();
-        let b_idx = UOp::index(b.clone(), vec![idx.clone()]).unwrap();
-        let out_idx = UOp::index(out.clone(), vec![idx.clone()]).unwrap();
+        let a_idx = UOp::index().buffer(a.clone()).indices(vec![idx.clone()]).call().unwrap();
+        let b_idx = UOp::index().buffer(b.clone()).indices(vec![idx.clone()]).call().unwrap();
+        let out_idx = UOp::index().buffer(out.clone()).indices(vec![idx.clone()]).call().unwrap();
 
         let a_load = UOp::load().buffer(a.clone()).index(a_idx).call();
         let b_load = UOp::load().buffer(b.clone()).index(b_idx).call();

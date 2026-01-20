@@ -1670,6 +1670,7 @@ dependencies = [
  "bincode",
  "bon",
  "dirs",
+ "indexmap",
  "itertools 0.14.0",
  "morok-device",
  "morok-dtype",

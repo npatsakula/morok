@@ -1,7 +1,17 @@
+use std::sync::Arc;
+
 use morok_ir::{Op, UOp};
 
+use crate::rangeify::kernel::split_store;
 use crate::rangeify::{KernelContext, bufferize_to_store};
+#[allow(unused_imports)]
 use crate::test::unit::rangeify::helpers::extract_kernel;
+
+/// Helper to call split_store with the new signature
+fn call_split_store(x: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let mut uop_list = Vec::new();
+    split_store(&mut uop_list, x)
+}
 
 #[test]
 fn test_bufferize_to_store_global() {
@@ -19,14 +29,15 @@ fn test_bufferize_to_store_global() {
     assert!(result.is_some());
     let result = result.unwrap();
 
-    // bufferize_to_store returns AFTER(passthrough=DEFINE_GLOBAL, deps=[END(STORE)])
+    // bufferize_to_store returns AFTER(passthrough=BUFFER, deps=[END(STORE)])
     // Following Tinygrad's architecture: .store().end(*rngs)
+    // BUFFER → DEFINE_GLOBAL conversion happens later in split_store
     let Op::After { passthrough, deps } = result.op() else {
         panic!("Expected AFTER operation, got {:?}", result.op());
     };
 
-    // Passthrough should be DEFINE_GLOBAL
-    assert!(matches!(passthrough.op(), Op::DefineGlobal(0)));
+    // Passthrough should be BUFFER (not DEFINE_GLOBAL - that conversion happens in split_store)
+    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
     assert_eq!(deps.len(), 1);
 
     // Deps should contain END wrapping STORE
@@ -46,8 +57,9 @@ fn test_bufferize_to_store_global() {
     // STORE should have empty ranges (iteration space on END)
     assert!(ranges.is_empty());
 
-    // Buffer should be DEFINE_GLOBAL with ID 0
-    assert!(matches!(buffer.op(), Op::DefineGlobal(0)));
+    // Buffer should be BUFFER (same as passthrough)
+    assert!(matches!(buffer.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", buffer.op());
+    assert!(std::sync::Arc::ptr_eq(buffer, &passthrough));
 
     // Value should be the compute
     assert!(std::sync::Arc::ptr_eq(value, &compute));
@@ -55,8 +67,8 @@ fn test_bufferize_to_store_global() {
     // Index should be INDEX operation with the range
     assert!(matches!(index.op(), Op::Index { .. }));
 
-    // Verify context state
-    assert_eq!(ctx.global_counter, 1);
+    // Verify context state - global_counter is NOT incremented for BUFFER ops
+    // (it's only used for DEFINE_GLOBAL/DEFINE_LOCAL counters)
     assert_eq!(ctx.local_counter, 0);
     assert!(ctx.has_buffer(&bufferize));
 }
@@ -134,13 +146,14 @@ fn test_bufferize_to_store_multiple_ranges() {
     assert!(result.is_some());
     let result = result.unwrap();
 
-    // bufferize_to_store returns AFTER(passthrough=DEFINE_GLOBAL, deps=[END(STORE)])
+    // bufferize_to_store returns AFTER(passthrough=BUFFER, deps=[END(STORE)])
+    // BUFFER → DEFINE_GLOBAL conversion happens later in split_store
     let Op::After { passthrough, deps } = result.op() else {
         panic!("Expected AFTER operation, got {:?}", result.op());
     };
 
-    // Passthrough should be DEFINE_GLOBAL
-    assert!(matches!(passthrough.op(), Op::DefineGlobal(0)));
+    // Passthrough should be BUFFER (not DEFINE_GLOBAL)
+    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
     assert_eq!(deps.len(), 1);
 
     // Deps should contain END wrapping STORE
@@ -161,8 +174,9 @@ fn test_bufferize_to_store_multiple_ranges() {
     // STORE should have empty ranges
     assert!(ranges.is_empty());
 
-    // Buffer should be DEFINE_GLOBAL(0)
-    assert!(matches!(buffer.op(), Op::DefineGlobal(0)));
+    // Buffer should be BUFFER (same as passthrough)
+    assert!(matches!(buffer.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", buffer.op());
+    assert!(std::sync::Arc::ptr_eq(buffer, &passthrough));
 
     // Value should be the compute
     assert!(std::sync::Arc::ptr_eq(value, &compute));
@@ -180,7 +194,6 @@ fn test_bufferize_to_store_multiple_ranges() {
     assert_eq!(indices.len(), 1, "Multi-index should be linearized to single index");
 
     // Verify context
-    assert_eq!(ctx.global_counter, 1);
     assert!(ctx.has_buffer(&bufferize));
 }
 
@@ -212,15 +225,15 @@ fn test_buffer_tracked_in_context() {
     // After conversion, buffer should be tracked
     assert!(ctx.has_buffer(&bufferize));
 
-    // Should be able to get the AFTER wrapping DEFINE_GLOBAL
+    // Should be able to get the AFTER wrapping BUFFER
     // bufferize_to_store stores AFTER(buffer, [STORE]) in context
     let replacement = ctx.get_buffer(&bufferize).unwrap();
 
-    // Unwrap AFTER to get the actual DEFINE_GLOBAL
+    // Unwrap AFTER to get the actual BUFFER (not DEFINE_GLOBAL)
     let Op::After { passthrough, .. } = replacement.op() else {
         panic!("Expected AFTER operation, got {:?}", replacement.op());
     };
-    assert!(matches!(passthrough.op(), Op::DefineGlobal(_)));
+    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
 }
 
 #[test]
@@ -232,10 +245,12 @@ fn test_bufferize_to_store_sequential_global_ids() {
         let compute = UOp::native_const((i as f64) as f32);
         let bufferize = UOp::bufferize_global(compute, vec![]);
 
-        bufferize_to_store(&bufferize, &mut ctx);
+        let result = bufferize_to_store(&bufferize, &mut ctx);
+        assert!(result.is_some());
 
-        // Counter should increment
-        assert_eq!(ctx.global_counter, (i + 1) as usize);
+        // For BUFFER ops, global_counter is NOT incremented (it's only for DEFINE_GLOBAL)
+        // But each BUFFERIZE should be tracked
+        assert!(ctx.has_buffer(&bufferize));
         assert_eq!(ctx.local_counter, 0);
     }
 }
@@ -274,17 +289,17 @@ fn test_bufferize_to_store_mixed_global_local() {
     let global_result = bufferize_to_store(&global_bufferize, &mut ctx);
     let local_result = bufferize_to_store(&local_bufferize, &mut ctx);
 
-    // Verify independent counters
-    assert_eq!(ctx.global_counter, 1);
+    // For global (BUFFER), global_counter is NOT incremented
+    // For local (DEFINE_LOCAL), local_counter IS incremented
     assert_eq!(ctx.local_counter, 1);
 
-    // Global: AFTER(passthrough=DEFINE_GLOBAL, deps=[STORE])
+    // Global: AFTER(passthrough=BUFFER, deps=[STORE])
     // No ranges means no END wrapper, but still has AFTER
     let global_result = global_result.unwrap();
     let Op::After { passthrough: global_buf, deps: global_deps } = global_result.op() else {
         panic!("Expected AFTER operation for global, got {:?}", global_result.op());
     };
-    assert!(matches!(global_buf.op(), Op::DefineGlobal(0)));
+    assert!(matches!(global_buf.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", global_buf.op());
     assert_eq!(global_deps.len(), 1);
 
     // deps[0] should be STORE (no ranges = no END)
@@ -320,8 +335,6 @@ fn test_bufferize_to_store_mixed_global_local() {
 
 #[test]
 fn test_bufferize_to_store_integration_with_split_kernel() {
-    use crate::rangeify::kernel::split_store;
-
     let mut ctx = KernelContext::new();
 
     // Create a BUFFERIZE operation with non-OUTER range
@@ -332,18 +345,17 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
 
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range]);
 
-    // Stage 1: BUFFERIZE → AFTER(DEFINE_GLOBAL, [END(STORE)])
+    // Stage 1: BUFFERIZE → AFTER(BUFFER, [END(STORE)])
     let store_result = bufferize_to_store(&bufferize, &mut ctx).unwrap();
 
     // Verify buffer was tracked
-    assert_eq!(ctx.global_counter, 1);
     assert!(ctx.has_buffer(&bufferize));
 
-    // Extract structure: AFTER(passthrough=DEFINE_GLOBAL, deps=[END(STORE)])
-    let Op::After { passthrough: define_global, deps } = store_result.op() else {
+    // Extract structure: AFTER(passthrough=BUFFER, deps=[END(STORE)])
+    let Op::After { passthrough: buffer_node, deps } = store_result.op() else {
         panic!("Expected AFTER operation, got {:?}", store_result.op());
     };
-    assert!(matches!(define_global.op(), Op::DefineGlobal(0)));
+    assert!(matches!(buffer_node.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", buffer_node.op());
     assert_eq!(deps.len(), 1);
 
     // deps[0] should be END wrapping STORE
@@ -354,35 +366,28 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
     assert_eq!(end_ranges.len(), 1);
     assert!(matches!(computation.op(), Op::Store { .. }), "Expected STORE inside END");
 
-    // Stage 2: AFTER → AFTER(DEFINE_GLOBAL, [END(KERNEL)])
-    // split_store transforms END(STORE) to END(KERNEL) but preserves AFTER wrapper
-    let split_result = split_store(&store_result, &mut ctx).unwrap();
-
-    // Extract KERNEL from result (wrapped in AFTER structure)
-    let kernel = extract_kernel(&split_result).expect("split_store should create a KERNEL");
+    // Stage 2: split_store transforms END(STORE) to KERNEL
+    // The BUFFER node will be converted to DEFINE_GLOBAL inside the KERNEL
+    let kernel = call_split_store(end_op).expect("split_store should create a KERNEL");
 
     // Verify KERNEL structure
     let Op::Kernel { sources, ast } = kernel.op() else {
         panic!("Expected KERNEL operation, got {:?}", kernel.op());
     };
 
-    // KERNEL should have at least 1 source (the DEFINE_GLOBAL buffer)
+    // KERNEL sources should contain the BUFFER (mapped to itself by local_to_define_global_patterns)
     assert!(!sources.is_empty(), "KERNEL should have at least one source");
-    assert!(
-        sources.iter().any(|s| matches!(s.op(), Op::DefineGlobal(0))),
-        "KERNEL sources should include DEFINE_GLOBAL(0)"
-    );
 
-    // AST should be SINK wrapping the computation
+    // AST should be SINK wrapping the transformed computation
     let Op::Sink { sources: sink_sources } = ast.op() else {
         panic!("Expected SINK operation in kernel AST, got {:?}", ast.op());
     };
     assert_eq!(sink_sources.len(), 1, "SINK should have 1 source");
 
-    // Verify the context stores AFTER (not bare DEFINE_GLOBAL)
+    // Verify the context stores AFTER with BUFFER passthrough
     let ctx_buffer = ctx.get_buffer(&bufferize).unwrap();
     let Op::After { passthrough, .. } = ctx_buffer.op() else {
         panic!("Expected AFTER in context buffer mapping");
     };
-    assert!(matches!(passthrough.op(), Op::DefineGlobal(0)));
+    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
 }

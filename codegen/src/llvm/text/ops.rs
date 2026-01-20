@@ -236,12 +236,27 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let buf = ctx.get(buffer);
             let buf_type = ldt(&buffer.dtype());
 
+            tracing::debug!(
+                index_id = uop.id,
+                buffer_id = buffer.id,
+                uop_dtype = ?uop.dtype(),
+                buffer_dtype = ?buffer.dtype(),
+                elem_type = %ldt(&uop.dtype()),
+                buf_type = %buf_type,
+                "INDEX codegen"
+            );
+
             if indices.is_empty() {
                 // No indices - just return the buffer pointer
                 kernel.push(format!("  {dst} = bitcast {buf_type} {buf} to {}", ldt(&uop.dtype())));
             } else {
                 let idx = ctx.get(&indices[0]);
-                let elem_type = ldt(&uop.dtype());
+                // For opaque pointers (LLVM 15+), use base type for GEP element type, not pointer type.
+                // GEP element type determines stride: float → 4 bytes, ptr → 8 bytes.
+                let elem_type = match uop.dtype() {
+                    morok_dtype::DType::Ptr { ref base, .. } => ldt(base),
+                    other => ldt(&other),
+                };
                 let idx_type = ldt(&indices[0].dtype());
 
                 if gate.is_some() {
@@ -249,18 +264,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                     let gate_val = ctx.get(gate.as_ref().unwrap());
                     let null_ptr = format!("{dst}.null");
                     let gep_ptr = format!("{dst}.gep");
-                    kernel.push(format!(
-                        "  {gep_ptr} = getelementptr inbounds {elem_type}, {buf_type} {buf}, {idx_type} {idx}"
-                    ));
+                    kernel
+                        .push(format!("  {gep_ptr} = getelementptr inbounds {elem_type}, ptr {buf}, {idx_type} {idx}"));
                     // null pointer for the false branch
-                    kernel.push(format!("  {null_ptr} = inttoptr i64 0 to {elem_type}*"));
-                    kernel.push(format!(
-                        "  {dst} = select i1 {gate_val}, {elem_type}* {gep_ptr}, {elem_type}* {null_ptr}"
-                    ));
+                    kernel.push(format!("  {null_ptr} = inttoptr i64 0 to ptr"));
+                    kernel.push(format!("  {dst} = select i1 {gate_val}, ptr {gep_ptr}, ptr {null_ptr}"));
                 } else {
-                    kernel.push(format!(
-                        "  {dst} = getelementptr inbounds {elem_type}, {buf_type} {buf}, {idx_type} {idx}"
-                    ));
+                    kernel.push(format!("  {dst} = getelementptr inbounds {elem_type}, ptr {buf}, {idx_type} {idx}"));
                 }
             }
             Some(())
@@ -284,9 +294,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Load { index, .. } => {
             let idx = ctx.get(index);
             let dtype = ldt(&uop.dtype());
-            let idx_type = ldt(&index.dtype());
 
-            kernel.push(format!("  {dst} = load {dtype}, {idx_type} {idx}"));
+            // Use opaque pointer type (ptr) for LLVM 15+
+            kernel.push(format!("  {dst} = load {dtype}, ptr {idx}"));
             Some(())
         }
 
@@ -295,9 +305,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let idx = ctx.get(index);
             let val = ctx.get(value);
             let val_type = ldt(&value.dtype());
-            let idx_type = ldt(&index.dtype());
 
-            kernel.push(format!("  store {val_type} {val}, {idx_type} {idx}"));
+            // Use opaque pointer type (ptr) for LLVM 15+
+            kernel.push(format!("  store {val_type} {val}, ptr {idx}"));
             Some(())
         }
 
@@ -515,7 +525,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let pending = ctx.take_pending_reduces();
             for (reduce_id, info) in pending {
                 let result_name = format!("%reduce_{reduce_id}.final");
-                kernel.push(format!("  {result_name} = load {}, {}* {}", info.dtype, info.dtype, info.acc_ptr));
+                kernel.push(format!("  {result_name} = load {}, ptr {}", info.dtype, info.acc_ptr));
                 // Register the final value as the REDUCE's result
                 ctx.register(reduce_id, result_name);
             }
@@ -539,7 +549,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 let instr = reduce_instr(*reduce_op, &uop.dtype());
 
                 // Load current accumulator value
-                kernel.push(format!("  {acc_load} = load {dtype}, {dtype}* {acc_ptr}"));
+                kernel.push(format!("  {acc_load} = load {dtype}, ptr {acc_ptr}"));
 
                 // Apply reduce operation
                 if matches!(reduce_op, ReduceOp::Max | ReduceOp::Min) {
@@ -549,7 +559,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 }
 
                 // Store updated accumulator
-                kernel.push(format!("  store {dtype} {acc_new}, {dtype}* {acc_ptr}"));
+                kernel.push(format!("  store {dtype} {acc_new}, ptr {acc_ptr}"));
 
                 // Register the final load operation for after loop exit
                 // The actual load happens after END closes the loop
@@ -720,8 +730,20 @@ fn render_reduce_minmax(
 /// Get identity element for reduce operation.
 pub fn reduce_identity(op: ReduceOp, dtype: &DType) -> String {
     match op {
-        ReduceOp::Add => "0".to_string(),
-        ReduceOp::Mul => "1".to_string(),
+        ReduceOp::Add => {
+            if dtype.is_float() {
+                "0.0".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        ReduceOp::Mul => {
+            if dtype.is_float() {
+                "1.0".to_string()
+            } else {
+                "1".to_string()
+            }
+        }
         ReduceOp::Max => {
             if dtype.is_float() {
                 "-0x7FF0000000000000".to_string() // -inf

@@ -135,7 +135,7 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     // After this pass, ALL RANGE ops (including AxisType::Reduce) create loops uniformly in codegen.
     // Note: codegen_reduce still exists for backward compatibility but won't be called if no REDUCE ops.
     let pm_reduce = crate::devectorize::pm_reduce();
-    let reduced = graph_rewrite(&pm_reduce, linearized, &mut ());
+    let reduced = graph_rewrite_bottom_up(&pm_reduce, linearized, &mut ());
     tracing::debug!(ast_after_pm_reduce = %reduced.tree(), "post_optimization: after pm_reduce");
 
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
@@ -144,7 +144,8 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     let pm_loads = crate::rangeify::patterns::pm_add_loads();
     // First pass: wrap existing INDEX ops before expansion.
     // Pattern has guard (!Ptr dtype) and transforms INDEX dtype to Ptr, so safe for reuse.
-    let with_loads = graph_rewrite(&pm_loads, reduced, &mut ());
+    // Uses bottom-up to reach INDEX nodes deep in the tree.
+    let with_loads = graph_rewrite_bottom_up(&pm_loads, reduced, &mut ());
 
     // Post-optimization: Fix UNROLL substitutions in REDUCE ops
     // This handles arithmetic expressions created by shift_to UNROLL

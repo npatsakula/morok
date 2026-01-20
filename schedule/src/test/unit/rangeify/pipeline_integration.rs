@@ -58,12 +58,10 @@ fn test_pipeline_preserves_structure() {
         // AST should be a SINK
         assert!(matches!(ast.op(), Op::Sink { .. }));
 
-        // Sources should contain a DEFINE_GLOBAL
+        // Sources contain BUFFER nodes (the original buffers from lctx.map)
+        // The DEFINE_GLOBAL conversion happens in the AST, not the sources
         assert!(!sources.is_empty(), "KERNEL should have sources");
-        assert!(
-            sources.iter().any(|s| matches!(s.op(), Op::DefineGlobal(_))),
-            "KERNEL sources should include DEFINE_GLOBAL"
-        );
+        assert!(sources.iter().any(|s| matches!(s.op(), Op::Buffer { .. })), "KERNEL sources should include BUFFER");
     } else {
         panic!("Expected KERNEL operation, got {:?}", kernel.op());
     }
@@ -80,16 +78,16 @@ fn test_pipeline_context_threading() {
     let (result, _context) = run_kernel_split_pipeline(bufferize);
 
     // After pipeline:
-    // - Stage 1 (bufferize_to_store) creates DEFINE_GLOBAL and tracks in context
-    // - Stage 2 (split_store) uses context to populate KERNEL sources
+    // - Stage 1 (bufferize_to_store) creates BUFFER and tracks in context
+    // - Stage 2 (split_store) uses context to populate KERNEL sources with BUFFER
 
     // Extract KERNEL from result (may be wrapped in AFTER structure)
     let kernel = extract_kernel(&result).expect("Pipeline should create a KERNEL");
 
     if let Op::Kernel { sources, .. } = kernel.op() {
-        // Sources should include the DEFINE_GLOBAL created in stage 1
+        // Sources contain BUFFER nodes from lctx.map (not DEFINE_GLOBAL)
         assert_eq!(sources.len(), 1, "KERNEL should have 1 source (the buffer from stage 1)");
-        assert!(matches!(sources[0].op(), Op::DefineGlobal(0)), "Source should be DEFINE_GLOBAL(0)");
+        assert!(matches!(sources[0].op(), Op::Buffer { .. }), "Source should be BUFFER, got {:?}", sources[0].op());
     } else {
         panic!("Expected KERNEL operation, got {:?}", kernel.op());
     }
@@ -263,35 +261,38 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
         println!("  {} [{:?}]", op_name, node.dtype());
     }
 
-    // Check that INDEX operations on DEFINE_GLOBAL exist and have element dtype
-    // NOTE: The rangeify pipeline no longer wraps INDEX in LOAD.
-    // Instead, codegen auto-loads pointer values when they are used as operands
-    // in arithmetic (e.g., ADD). This avoids the issue where STORE's index
-    // was incorrectly wrapped in LOAD, causing "buffer accessed with conflicting ops" errors.
+    // Check that INDEX operations exist and have element dtype
+    // NOTE: After aligning with Tinygrad, INDEX operations may reference BUFFER nodes
+    // directly (the BUFFER → DEFINE_GLOBAL conversion happens in the AST but the
+    // kernel sources maintain the original BUFFER references).
     //
     // INDEX dtype is the element type (from UOp::index constructor), not Ptr.
     // The Ptr dtype transformation happens in pm_add_loads during post-optimization,
     // which is NOT part of run_kernel_split_pipeline.
     let topo = kernelized.toposort();
-    let index_on_define_global = topo
+    let index_on_buffer = topo
         .iter()
         .filter(|node| {
-            if let Op::Index { buffer, .. } = node.op() { matches!(buffer.op(), Op::DefineGlobal(_)) } else { false }
+            if let Op::Index { buffer, .. } = node.op() {
+                matches!(buffer.op(), Op::Buffer { .. } | Op::DefineGlobal(_))
+            } else {
+                false
+            }
         })
         .collect::<Vec<_>>();
 
-    // All INDEX on DEFINE_GLOBAL should have element dtype (not Ptr)
+    // All INDEX nodes should have element dtype (not Ptr)
     // pm_add_loads transforms this to Ptr later in post-optimization
-    for index_node in &index_on_define_global {
+    for index_node in &index_on_buffer {
         assert!(
             !matches!(index_node.dtype(), DType::Ptr { .. }),
-            "INDEX on DEFINE_GLOBAL should have element dtype (before pm_add_loads), got {:?}",
+            "INDEX should have element dtype (before pm_add_loads), got {:?}",
             index_node.dtype()
         );
     }
 
     // There should be INDEX operations for input buffers
-    assert!(!index_on_define_global.is_empty(), "Pipeline should create INDEX operations for input buffers");
+    assert!(!index_on_buffer.is_empty(), "Pipeline should create INDEX operations for input buffers");
 }
 
 #[test]

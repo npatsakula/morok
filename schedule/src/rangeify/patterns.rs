@@ -28,7 +28,7 @@ pub use super::indexing::{is_dead_axis, ranges_equal};
 
 // Forward declarations for types from other modules
 use super::indexing::IndexingContext;
-use super::kernel::KernelContext;
+use super::kernel::{KernelContext, LocalAddBufferContext};
 use super::kernel::{PcontigConfig, SplitReduceOpConfig, split_reduceop};
 use super::transforms::transform_sources_with_bufferize;
 
@@ -185,7 +185,7 @@ fn remove_movement_op(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp
         Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
     ) {
         let (input_ranges, _) = ctx.get_ranges(x)?;
-        return UOp::index(src, input_ranges.clone()).ok();
+        return UOp::index().buffer(src).indices(input_ranges.clone()).call().ok();
     }
 
     // Case 2: Source is INDEX → already processed by bufferize phase
@@ -281,7 +281,7 @@ pub fn dead_axis_removal() -> TypedPatternMatcher {
                 if new_indices.is_empty() {
                     return None;
                 }
-                return UOp::index(buffer.clone(), new_indices).ok();
+                return UOp::index().buffer(buffer.clone()).indices(new_indices).call().ok();
             }
             None
         },
@@ -634,7 +634,7 @@ fn apply_pcontig_removal_inner(
     let opts = BufferizeOpts::local();
     let bufferized = UOp::bufferize(substituted, mat_buf_rngs, opts);
 
-    UOp::index(bufferized, mat_idx_rngs).ok()
+    UOp::index().buffer(bufferized).indices(mat_idx_rngs).call().ok()
 }
 
 // ============================================================================
@@ -727,8 +727,8 @@ fn transform_movement_through_index(
     let transformed = apply_movement_op(mop.op(), src_shape, indices.as_slice());
 
     match gate {
-        Some(g) => UOp::index_gated(src.clone(), transformed, g.clone()),
-        None => UOp::index(src.clone(), transformed),
+        Some(g) => UOp::index().buffer(src.clone()).indices(transformed).gate(g.clone()).call(),
+        None => UOp::index().buffer(src.clone()).indices(transformed).call(),
     }
     .ok()
 }
@@ -856,6 +856,87 @@ pub fn to_define_global_patterns() -> TypedPatternMatcher<KernelContext> {
         },
         // Replace KERNEL references with their output buffer
         Kernel { ast } => |_k, ast, _ctx| find_kernel_output(ast),
+    }
+}
+
+/// Create patterns for to_define_global transformation using LocalAddBufferContext.
+///
+/// Based on Tinygrad's to_define_global (rangeify.py:419-434).
+/// This version uses the per-kernel LocalAddBufferContext instead of global KernelContext.
+pub fn local_to_define_global_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
+    crate::patterns! {
+        @context LocalAddBufferContext;
+        // Buffer → DefineGlobal (like Tinygrad's debuf, rangeify.py:385-389)
+        // Creates DEFINE_GLOBAL and maps buf → buf (tracking original BUFFER)
+        buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
+            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
+            let replacement = UOp::define_global(ctx.next_dg(), ptr_dtype);
+            // Map buffer to itself (like Tinygrad: if buf not in ctx.map: ctx.map[buf] = buf)
+            if !ctx.has_buffer(buf) {
+                ctx.map_buffer(buf.clone(), buf.clone());
+            }
+            Some(replacement)
+        },
+        // Remove BIND: extract var and track it (like Tinygrad's unbind_kernel)
+        Bind { var, value: _ } => |var, ctx| {
+            ctx.add_var(var.clone());
+            Some(var.clone())
+        },
+        // Handle AFTER: extract buffer and track dependency (like Tinygrad's handle_after, rangeify.py:395-402)
+        // Maps buf → after (so kernel sources will include AFTER wrappers)
+        after @ After { passthrough } => |after, passthrough, ctx| {
+            // Skip local address space AFTERs (like Tinygrad)
+            if matches!(passthrough.dtype(), DType::Ptr { addrspace: AddrSpace::Local, .. }) {
+                return None;
+            }
+            // Use buf_uop() to get underlying buffer (like Tinygrad's after.as_buf())
+            let buf = after.buf_uop();
+            // HACK: Handle MSTACK/MSELECT like Tinygrad
+            let buf = match buf.op() {
+                Op::MStack { buffers } if !buffers.is_empty() => buffers[0].clone(),
+                Op::MSelect { buffer, .. } => buffer.clone(),
+                _ => buf,
+            };
+            // Skip if buffer already mapped
+            if ctx.has_buffer(&buf) {
+                return None;
+            }
+            // Map buf → after (kernel sources will be AFTERs)
+            ctx.map_buffer(buf.clone(), after.clone());
+            // Return the buffer to replace AFTER in the AST
+            Some(buf)
+        },
+        // Remove spurious sources from CONST and DEFINE_VAR
+        c @ Const(_) | c @ DefineVar { name: _ } => |c, _ctx| {
+            let sources = c.op().sources();
+            if sources.is_empty() { return None; }
+            Some(match c.op() {
+                Op::Const(val) => UOp::const_(c.dtype(), val.0),
+                Op::DefineVar { name, min_val, max_val } => UOp::var(name.clone(), c.dtype(), *min_val, *max_val),
+                _ => return None,
+            })
+        },
+        // Replace RANGE(end=0) with CONST(0)
+        Range { end } if matches!(end.op(), Op::Const(v) if v.0.is_zero()) => |_r, _ctx| {
+            Some(UOp::index_const(0))
+        },
+        // Renumber RANGE axis_id (like Tinygrad's renumber_range)
+        Range { end, axis_id, axis_type } if matches!(axis_id, AxisId::Unrenumbered(_)) => |_r, end, axis_type, ctx| {
+            Some(UOp::range_axis(end.clone(), AxisId::Renumbered(ctx.next_range()), *axis_type))
+        },
+    }
+}
+
+/// Create pattern matcher for split_kernels.
+///
+/// Based on Tinygrad's split_kernels (rangeify.py:509-511).
+/// This matches STORE and END operations and calls split_store on them.
+pub fn split_kernels_pattern() -> TypedPatternMatcher<Vec<Arc<UOp>>> {
+    use super::kernel::split_store;
+    crate::patterns! {
+        @context Vec<Arc<UOp>>;
+        x @ Store { buffer: _, index: _, value: _ } => |x, ctx| split_store(ctx, x),
+        x @ End { computation: _ } => |x, ctx| split_store(ctx, x),
     }
 }
 
@@ -997,7 +1078,7 @@ fn force_bufferize(src: &Arc<UOp>) -> Arc<UOp> {
     }
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(Arc::clone(src), ranges.clone(), opts);
-    UOp::index(bufferized, ranges).unwrap_or_else(|_| Arc::clone(src))
+    UOp::index().buffer(bufferized).indices(ranges).call().unwrap_or_else(|_| Arc::clone(src))
 }
 
 // ============================================================================

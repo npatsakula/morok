@@ -21,7 +21,7 @@ pub mod transforms;
 // Context types
 pub use context::RangeifyContext;
 pub use indexing::{IndexingContext, run_rangeify};
-pub use kernel::{KernelContext, KernelDependency};
+pub use kernel::{KernelContext, LocalAddBufferContext};
 
 // Entry points
 pub use kernel::run_kernel_split_pipeline;

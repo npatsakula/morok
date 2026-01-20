@@ -11,10 +11,15 @@ use morok_device::DeviceSpec;
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, Op, UOp};
 
-use crate::rangeify::kernel::KernelContext;
 use crate::rangeify::kernel::split_store;
 use crate::rangeify::patterns::rangeify_codegen_patterns;
 use crate::rangeify::transforms::find_bufs;
+
+/// Helper to call split_store with the new signature
+fn call_split_store(x: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let mut uop_list = Vec::new();
+    split_store(&mut uop_list, x)
+}
 
 /// Helper to apply rangeify_codegen patterns and return result
 fn apply_codegen_patterns(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -124,10 +129,8 @@ fn test_split_store_simple_kernel() {
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(buffer.clone(), index, value);
 
-    let mut ctx = KernelContext::new();
-
     // split_store may succeed if the STORE has no non-OUTER ranges in scope
-    let result = split_store(&store, &mut ctx);
+    let result = call_split_store(&store);
 
     // Verify result is a KERNEL operation if successful
     if let Some(kernel) = result {
@@ -154,10 +157,8 @@ fn test_split_store_with_loop_ranges() {
     let loop_range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let end = UOp::end(store, vec![loop_range].into());
 
-    let mut ctx = KernelContext::new();
-
     // Try to split - behavior depends on has_non_outer_ranges() implementation
-    let result = split_store(&end, &mut ctx);
+    let result = call_split_store(&end);
 
     // If successful, verify it's a KERNEL
     if let Some(kernel) = result {
@@ -237,8 +238,7 @@ fn test_end_store_structure() {
     }
 
     // split_store should handle END(STORE) structure
-    let mut ctx = KernelContext::new();
-    let result = split_store(&end, &mut ctx);
+    let result = call_split_store(&end);
 
     // If successful, verify it's a KERNEL
     if let Some(kernel) = result {

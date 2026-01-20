@@ -47,13 +47,14 @@ fn test_empty_bufferize() {
     let result = bufferize_to_store(&bufferize, &mut ctx);
     assert!(result.is_some());
 
-    // Result should be AFTER(passthrough=DEFINE_GLOBAL, deps=[STORE])
+    // Result should be AFTER(passthrough=BUFFER, deps=[STORE])
     // No ranges means no END wrapper, but still AFTER structure
+    // BUFFER → DEFINE_GLOBAL conversion happens later in split_store
     let result = result.unwrap();
     let Op::After { passthrough, deps } = result.op() else {
         panic!("Expected AFTER operation, got {:?}", result.op());
     };
-    assert!(matches!(passthrough.op(), Op::DefineGlobal(_)));
+    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
     assert_eq!(deps.len(), 1);
 
     // deps[0] should be STORE (no ranges = no END)

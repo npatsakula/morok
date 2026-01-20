@@ -198,7 +198,11 @@ pub(crate) fn transform_single_source(
         Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
     ) {
         trace!(src.id = src.id, case = "buffer-like", "adding index");
-        return UOp::index(Arc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for buffer source");
+        return UOp::index()
+            .buffer(Arc::clone(src))
+            .indices(input_ranges.to_vec())
+            .call()
+            .expect("Failed to create INDEX for buffer source");
     }
 
     // Case 1.5: Movement op → transform indices through it and recurse
@@ -224,7 +228,11 @@ pub(crate) fn transform_single_source(
 
         // Fallback: if we can't get shape, create INDEX on the movement chain
         // (will be handled by pattern matcher later)
-        return UOp::index(Arc::clone(src), input_ranges.to_vec()).expect("Failed to create INDEX for movement source");
+        return UOp::index()
+            .buffer(Arc::clone(src))
+            .indices(input_ranges.to_vec())
+            .call()
+            .expect("Failed to create INDEX for movement source");
     }
 
     // Check for REDUCE op that might have been converted from ReduceAxis
@@ -286,7 +294,11 @@ pub(crate) fn transform_single_source(
             .collect();
 
         if !index_ranges.is_empty() {
-            return UOp::index(bufferized, index_ranges).expect("Failed to create INDEX after BUFFERIZE");
+            return UOp::index()
+                .buffer(bufferized)
+                .indices(index_ranges)
+                .call()
+                .expect("Failed to create INDEX after BUFFERIZE");
         } else {
             return bufferized;
         }
@@ -402,25 +414,32 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
         _ => return None,
     };
 
+    // Calculate size and base dtype upfront (needed for both buffer creation and INDEX dtype)
+    let size = calculate_size_from_ranges(ranges);
+    let base_dtype = match bufferize_op.dtype() {
+        DType::Ptr { base, .. } => (*base).clone(),
+        other => other,
+    };
+
     let buffer = if let Some(existing_buffer) = ctx.get_buffer(bufferize_op) {
         existing_buffer.clone()
     } else {
-        let size = calculate_size_from_ranges(ranges);
-        // Extract element type - handle case where BUFFERIZE wraps INDEX (which now has Ptr dtype)
-        let base_dtype = match bufferize_op.dtype() {
-            DType::Ptr { base, .. } => (*base).clone(),
-            other => other,
-        };
-        let ptr_dtype = base_dtype.ptr(Some(size), opts.addrspace);
-
         if opts.addrspace == AddrSpace::Global {
-            let global_id = ctx.next_global();
-            UOp::define_global(global_id, ptr_dtype)
+            // Create BUFFER node (like Tinygrad's UOp.new_buffer)
+            // The BUFFER → DEFINE_GLOBAL conversion happens later in split_store
+            let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
+            UOp::new_buffer(device, size, base_dtype.clone())
         } else {
+            // For local address space, create DEFINE_LOCAL directly (like Tinygrad)
+            let local_ptr_dtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
             let local_id = ctx.next_local();
-            UOp::define_local(local_id, ptr_dtype)
+            UOp::define_local(local_id, local_ptr_dtype)
         }
     };
+
+    // Create Ptr dtype for STORE target (like Tinygrad's sdtype = x.dtype.ptr(size, addrspace))
+    // This ensures INDEX returns pointer type, which STORE codegen expects.
+    let ptr_dtype = base_dtype.ptr(Some(size), opts.addrspace);
 
     let store_target = if !ranges.is_empty() {
         // Linearize multi-dimensional ranges into single linear index.
@@ -446,7 +465,11 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
                     strides
                 );
                 let linear_index = build_linear_index(&indices, &strides);
-                UOp::index(buffer.clone(), vec![linear_index])
+                UOp::index()
+                    .buffer(buffer.clone())
+                    .indices(vec![linear_index])
+                    .dtype(ptr_dtype.clone())
+                    .call()
                     .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
             } else {
                 // Symbolic ranges - can't linearize at compile time
@@ -457,28 +480,55 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
                     dims.len(),
                     ranges.len()
                 );
-                UOp::index(buffer.clone(), ranges.to_vec())
+                UOp::index()
+                    .buffer(buffer.clone())
+                    .indices(ranges.to_vec())
+                    .dtype(ptr_dtype.clone())
+                    .call()
                     .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
             }
         } else {
             // Single range - use directly
-            UOp::index(buffer.clone(), ranges.to_vec())
+            UOp::index()
+                .buffer(buffer.clone())
+                .indices(ranges.to_vec())
+                .dtype(ptr_dtype.clone())
+                .call()
                 .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
         }
     } else {
-        // Scalar store: use index 0 (not the buffer pointer itself)
-        UOp::index_const(0)
+        // Scalar store: create INDEX with buffer + index 0 and explicit Ptr dtype
+        UOp::index()
+            .buffer(buffer.clone())
+            .indices(vec![UOp::index_const(0)])
+            .dtype(ptr_dtype)
+            .call()
+            .expect("Failed to create INDEX for scalar STORE")
     };
 
-    // Create STORE with empty ranges - iteration space ranges go on END wrapper.
+    // Create STORE and wrap with END if there are output ranges.
     // This matches Tinygrad's architecture: .store().end(*rngs)
     //
     // The END wrapper is critical because:
     // 1. split_store looks for END { computation: STORE, ranges } pattern
-    // 2. END.ranges define the iteration space for the kernel
-    // 3. Without END wrapper, kernel splitting loses iteration info
+    // 2. END.ranges define the iteration space for the OUTPUT (not internal computations)
+    // 3. For scalar stores (e.g., REDUCE results), no END wrapping (ranges is empty)
+    // 4. REDUCE's loop is handled by pm_reduce which creates its own END internally
     let store = UOp::store(buffer.clone(), store_target, compute.clone());
-    let mut do_store = if !ranges.is_empty() { UOp::end(store, ranges.clone()) } else { store };
+
+    // Determine END ranges: use ONLY the output's ranges (from BUFFERIZE).
+    //
+    // This matches Tinygrad's approach in rangeify.py:303,337 where:
+    // - rngs = sorted(idx.ranges, key=lambda x: x.arg)
+    // - do_store = buf.index(idx, dtype=sdtype).store(x.src[0]).end(*rngs)
+    //
+    // For scalar stores (e.g., REDUCE results), ranges is empty, so END wraps with no ranges.
+    // The REDUCE's loop is handled separately by pm_reduce which creates its own END.
+    // We must NOT fallback to compute.in_scope_ranges() because that would put the
+    // OUTPUT STORE inside the reduce loop (wrong!).
+    let end_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.clone();
+
+    let mut do_store = if !end_ranges.is_empty() { UOp::end(store, end_ranges) } else { store };
 
     if opts.addrspace == AddrSpace::Local {
         do_store = UOp::barrier(do_store, SmallVec::new());
@@ -712,4 +762,25 @@ pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
     }
 
     ret
+}
+
+// ============================================================================
+// PM_ADD_BUFFERS PATTERNS
+// ============================================================================
+
+/// Create pattern matcher for adding buffers (BUFFERIZE → STORE conversion).
+///
+/// Based on Tinygrad's pm_add_buffers (rangeify.py:358-367).
+pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<()> {
+    use super::kernel::KernelContext;
+
+    // This is a workaround - we create a temporary KernelContext for each match
+    // The original code used a shared context, but the new pipeline uses graph_rewrite
+    crate::patterns! {
+        // BUFFERIZE → STORE conversion
+        buf @ Bufferize { compute: _ } => |buf| {
+            let mut temp_ctx = KernelContext::new();
+            bufferize_to_store(buf, &mut temp_ctx)
+        },
+    }
 }
