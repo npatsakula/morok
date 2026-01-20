@@ -48,7 +48,7 @@ pub fn clear_kernel_name_counts() {
 fn flatten_ranges(ast: Arc<UOp>) -> Arc<UOp> {
     match ast.op() {
         Op::Reduce { reduce_op, ranges, src } => {
-            // Flatten REDUCE ranges
+            // Flatten REDUCE ranges - extract actual RANGE nodes from expressions
             let sink = UOp::sink(ranges.iter().cloned().collect());
             let flattened: Vec<_> =
                 sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
@@ -68,6 +68,32 @@ fn flatten_ranges(ast: Arc<UOp>) -> Arc<UOp> {
 
             // Recreate STORE with flattened value and ranges
             UOp::store_with_ranges(buffer.clone(), index.clone(), flattened_value, flattened_ranges)
+        }
+        Op::End { computation, ranges } => {
+            // Flatten END ranges - extract actual RANGE nodes from expressions
+            // (After shift_to substitution, ranges may contain Add/Mul expressions
+            // instead of direct RANGE nodes)
+            let sink = UOp::sink(ranges.iter().cloned().collect());
+            let flattened: SmallVec<[Arc<UOp>; 4]> =
+                sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
+
+            // Recursively flatten the computation
+            let flattened_computation = flatten_ranges(computation.clone());
+
+            // Recreate END with flattened ranges
+            UOp::end(flattened_computation, flattened)
+        }
+        Op::Sink { sources } => {
+            // Recursively flatten children of SINK
+            let flattened_sources: SmallVec<[Arc<UOp>; 4]> =
+                sources.iter().map(|s| flatten_ranges(s.clone())).collect();
+
+            // Check if any changed
+            if flattened_sources.iter().zip(sources.iter()).all(|(a, b)| Arc::ptr_eq(a, b)) {
+                ast
+            } else {
+                UOp::sink(flattened_sources.to_vec())
+            }
         }
         _ => {
             // No flattening needed for other operations

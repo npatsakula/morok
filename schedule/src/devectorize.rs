@@ -75,7 +75,7 @@ pub fn pm_render() -> TypedPatternMatcher {
             let vcount = c.dtype().vcount();
             let Op::Const(cv) = c.op() else { return None };
             let scalar_dtype = DType::Scalar(c.dtype().base());
-            let scalar_const = UOp::const_(scalar_dtype, cv.0.clone());
+            let scalar_const = UOp::const_(scalar_dtype, cv.0);
             let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
                 .map(|_| scalar_const.clone())
                 .collect();
@@ -87,7 +87,7 @@ pub fn pm_render() -> TypedPatternMatcher {
             // VConst stores different values per lane - convert each to scalar CONST
             let scalar_dtype = DType::Scalar(vc.dtype().base());
             let elements: SmallVec<[Arc<UOp>; 4]> = values.iter()
-                .map(|v| UOp::const_(scalar_dtype.clone(), v.clone()))
+                .map(|v| UOp::const_(scalar_dtype.clone(), *v))
                 .collect();
             Some(UOp::vectorize(elements))
         },
@@ -1113,11 +1113,7 @@ fn reduce_to_acc(
     // pm_add_loads will transform INDEX dtype to Ptr and wrap with LOAD.
     let zero_idx = UOp::index_const(0);
     let idx_init = UOp::new(
-        Op::Index {
-            buffer: acc.clone(),
-            indices: smallvec::smallvec![zero_idx.clone()],
-            gate: None,
-        },
+        Op::Index { buffer: acc.clone(), indices: smallvec::smallvec![zero_idx.clone()], gate: None },
         scalar_dtype.clone(),
     );
 
@@ -1131,11 +1127,7 @@ fn reduce_to_acc(
     let acc_after_init = UOp::after(acc.clone(), init_deps);
 
     let idx_loop = UOp::new(
-        Op::Index {
-            buffer: acc_after_init,
-            indices: smallvec::smallvec![zero_idx.clone()],
-            gate: None,
-        },
+        Op::Index { buffer: acc_after_init, indices: smallvec::smallvec![zero_idx.clone()], gate: None },
         scalar_dtype.clone(),
     );
 
@@ -1152,14 +1144,8 @@ fn reduce_to_acc(
     // 9. Final value after loop completes
     // Create INDEX that will be wrapped with LOAD by pm_add_loads
     let acc_after_end = UOp::after(acc.clone(), smallvec::smallvec![end]);
-    let idx_final = UOp::new(
-        Op::Index {
-            buffer: acc_after_end,
-            indices: smallvec::smallvec![zero_idx],
-            gate: None,
-        },
-        scalar_dtype,
-    );
+    let idx_final =
+        UOp::new(Op::Index { buffer: acc_after_end, indices: smallvec::smallvec![zero_idx], gate: None }, scalar_dtype);
 
     // Return INDEX directly - pm_add_loads will wrap with LOAD
     Some(idx_final)

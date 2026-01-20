@@ -207,33 +207,33 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
                         new_deps.push(dep.clone());
                     }
                 }
-                Op::End { computation, ranges } if matches!(computation.op(), Op::Store { .. }) => {
-                    // Transform END(STORE) to END(KERNEL)
-                    if let Some(kernel) = split_store(computation, ctx) {
-                        let end = UOp::end(kernel, ranges.clone());
-                        new_deps.push(end);
+                Op::End { computation, .. } if matches!(computation.op(), Op::Store { .. }) => {
+                    // Transform END(STORE) to KERNEL with END inside AST
+                    // Pass the whole END to split_store so END is included in kernel AST
+                    // This ensures RANGE/END ordering is preserved inside the kernel
+                    if let Some(kernel) = split_store(dep, ctx) {
+                        new_deps.push(kernel);
                         any_transformed = true;
                     } else {
                         new_deps.push(dep.clone());
                     }
                 }
                 Op::Barrier { src, deps: barrier_deps } => {
-                    // Handle BARRIER wrapping END(STORE)
-                    let transformed_src = if let Op::End { computation, ranges } = src.op()
+                    // Handle BARRIER wrapping END(STORE) or STORE
+                    let transformed_src = if let Op::End { computation, .. } = src.op()
                         && matches!(computation.op(), Op::Store { .. })
                     {
-                        if let Some(kernel) = split_store(computation, ctx) {
-                            let end = UOp::end(kernel, ranges.clone());
+                        // Pass whole END to split_store so END is inside kernel AST
+                        if let Some(kernel) = split_store(src, ctx) {
                             any_transformed = true;
-                            end
+                            kernel
                         } else {
                             src.clone()
                         }
                     } else if matches!(src.op(), Op::Store { .. }) {
                         if let Some(kernel) = split_store(src, ctx) {
-                            let end = UOp::end(kernel, SmallVec::new());
                             any_transformed = true;
-                            end
+                            kernel
                         } else {
                             src.clone()
                         }
@@ -260,11 +260,20 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
     // - Loop/Reduce ranges on END(STORE) are valid kernel bodies
     // - Only OUTER ranges on END should be skipped (control flow markers, checked below)
 
-    // Verify operation type
+    // Verify operation type and extract computation
+    // - END(STORE): pass whole END to preserve loop structure in kernel AST
+    // - Plain STORE: create kernel, AFTER handler will wrap with END externally
     let computation = match uop.op() {
         Op::End { computation, ranges } => match computation.op() {
             Op::Store { .. } => {
-                for r in ranges.iter() {
+                // Extract actual RANGE nodes from ranges (which may contain expressions
+                // after shift_to substitution). Use toposort + filter like Tinygrad.
+                let sink = UOp::sink(ranges.iter().cloned().collect());
+                let actual_ranges: Vec<_> =
+                    sink.toposort().into_iter().filter(|n| matches!(n.op(), Op::Range { .. })).collect();
+
+                // Check if any range has Outer axis type (skip those)
+                for r in actual_ranges.iter() {
                     if let Op::Range { axis_type, .. } = r.op()
                         && *axis_type == AxisType::Outer
                     {
@@ -275,6 +284,7 @@ pub fn split_store(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> 
             }
             _ => return None,
         },
+        // Plain STORE without END wrapper - create kernel, AFTER handler wraps with END
         Op::Store { .. } => uop.clone(),
         _ => return None,
     };

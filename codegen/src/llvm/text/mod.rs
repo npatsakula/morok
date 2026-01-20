@@ -23,6 +23,7 @@ use morok_ir::rewrite::graph_rewrite_bottom_up;
 use morok_ir::{AxisType, ConstValue, Op, prelude::*};
 use morok_schedule::devectorize::pm_render;
 use morok_schedule::linearize::linearize;
+use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
 use crate::{BufferArg, RenderedKernel, Renderer, Result};
 use ctx::RenderContext;
@@ -55,6 +56,10 @@ impl Renderer for LlvmTextRenderer {
         // This ensures type-safe rendering (Tinygrad devectorizer.py:258-275)
         let uop = graph_rewrite_bottom_up(&pm_render(), uop.clone(), &mut ());
 
+        // Apply pm_bool_devectorize after pm_render to catch any vectorized bool ops
+        // that were created or exposed by pm_render. This matches Tinygrad's approach
+        let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop, &mut ());
+
         // Use priority-based linearizer for proper RANGE → body → END ordering
         // (Tinygrad linearizer.py assigns RANGE priority 5, END priority -5)
         let nodes = linearize(uop);
@@ -80,6 +85,10 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
+        // Sort buffers by DefineGlobal id to ensure consistent argument order
+        // This matches Tinygrad's behavior where buffers are passed in order of their id
+        buffers.sort_by_key(|b| if let Op::DefineGlobal(id) = b.op() { *id } else { usize::MAX });
+
         // Detect Thread ranges - these become dispatch dimensions, not loops
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
             if let Op::Range { axis_type: AxisType::Thread, end, .. } = n.op()
@@ -98,12 +107,7 @@ impl Renderer for LlvmTextRenderer {
         for (i, buf) in buffers.iter().enumerate() {
             if let Op::DefineGlobal(id) = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
-                buffer_args.push(BufferArg {
-                    index: *id,
-                    name: format!("data{i}"),
-                    dtype: buf.dtype(),
-                    is_output,
-                });
+                buffer_args.push(BufferArg { index: *id, name: format!("data{i}"), dtype: buf.dtype(), is_output });
             }
         }
 
@@ -130,11 +134,8 @@ impl Renderer for LlvmTextRenderer {
         kernel.push("  ; Load variable values from vars array".to_string());
         for (i, var) in variables.iter().enumerate() {
             let var_ptr_name = format!("%var{i}_ptr");
-            let var_val_name = if let Op::DefineVar { name, .. } = var.op() {
-                format!("%{name}")
-            } else {
-                format!("%var{i}")
-            };
+            let var_val_name =
+                if let Op::DefineVar { name, .. } = var.op() { format!("%{name}") } else { format!("%var{i}") };
             kernel.push(format!("  {var_ptr_name} = getelementptr i64, ptr %vars, i64 {i}"));
             kernel.push(format!("  {var_val_name} = load i64, ptr {var_ptr_name}"));
             ctx.register(var.id, var_val_name);

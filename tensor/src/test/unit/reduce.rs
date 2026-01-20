@@ -713,7 +713,7 @@ fn test_all_value_all_false() {
 }
 
 #[test]
-
+#[tracing_test::traced_test]
 fn test_all_2d_axis0_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([true, true, false, true]).try_reshape(&[2, 2]).unwrap();

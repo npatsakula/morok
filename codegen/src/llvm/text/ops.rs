@@ -515,10 +515,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let pending = ctx.take_pending_reduces();
             for (reduce_id, info) in pending {
                 let result_name = format!("%reduce_{reduce_id}.final");
-                kernel.push(format!(
-                    "  {result_name} = load {}, {}* {}",
-                    info.dtype, info.dtype, info.acc_ptr
-                ));
+                kernel.push(format!("  {result_name} = load {}, {}* {}", info.dtype, info.dtype, info.acc_ptr));
                 // Register the final value as the REDUCE's result
                 ctx.register(reduce_id, result_name);
             }
