@@ -584,6 +584,7 @@ fn prepare_execution_plan(
                 device: device_str.clone(),
                 code: spec.src.clone(),
                 entry_point: spec.name.clone(),
+                var_names: spec.var_names.clone(),
                 global_size: spec.global_size,
                 local_size: spec.local_size,
             })
@@ -597,13 +598,17 @@ fn prepare_execution_plan(
 
         // Create PreparedKernel
         // Note: buffer_ptrs and buffer_ids will be computed in ExecutionPlanBuilder::build()
+        // Convert fixedvars HashMap to vals Vec using var_names order from CachedKernel
+        let vals: Vec<i64> =
+            cached.var_names.iter().map(|name| item.fixedvars.get(name).copied().unwrap_or(0)).collect();
+
         let prepared = PreparedKernel {
             id: item.ast.id,
             kernel: cached,
             device: device.device.clone(),
             buffer_indices,
             output_indices: vec![0], // First buffer is typically output
-            fixedvars: item.fixedvars.clone(),
+            vals,
             dependencies: item.dependencies.clone(),
             buffer_ptrs: Vec::new(), // Computed in build()
             buffer_ids: Vec::new(),  // Computed in build()
@@ -796,11 +801,12 @@ fn beam_search_optimize(
         let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
 
         // Time ONLY execution (pass global/local size for threaded kernels)
+        // Note: Empty vals slice since benchmark kernels don't have symbolic variables
         let result = unsafe {
             morok_runtime::benchmark_kernel(
                 program.as_ref(),
                 &buffer_ptrs,
-                &HashMap::new(),
+                &[],
                 spec.global_size,
                 spec.local_size,
                 &bench_config,

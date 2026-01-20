@@ -56,6 +56,12 @@ use crate::kernel_cache::CachedKernel;
 ///
 /// This is the "lowered" form of a `ScheduleItem` - all compilation is complete,
 /// only buffer binding and execution remain.
+///
+/// # Tinygrad Alignment
+///
+/// Variable values are stored as positional `vals: Vec<i64>` rather than a named
+/// HashMap, matching Tinygrad's `vals: tuple[int, ...]` parameter style.
+/// The order matches `var_names` in the `CachedKernel`.
 #[derive(Clone)]
 pub struct PreparedKernel {
     /// Unique identifier (from original AST).
@@ -75,9 +81,9 @@ pub struct PreparedKernel {
     /// Used for dependency tracking.
     pub output_indices: Vec<usize>,
 
-    /// Fixed variable values for this kernel invocation.
+    /// Variable values in positional order (matches `var_names` in CachedKernel).
     /// Pre-expanded from bound_ranges during preparation.
-    pub fixedvars: HashMap<String, i64>,
+    pub vals: Vec<i64>,
 
     /// Kernel IDs that must complete before this one (dependencies).
     pub dependencies: Vec<u64>,
@@ -307,6 +313,7 @@ impl std::fmt::Debug for PreparedKernel {
             .field("device", &self.device)
             .field("buffer_indices", &self.buffer_indices)
             .field("output_indices", &self.output_indices)
+            .field("vals", &self.vals)
             .field("dependencies", &self.dependencies)
             .finish()
     }

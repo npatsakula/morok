@@ -298,12 +298,8 @@ impl UOp {
     /// The element_dtype specifies the type of each element (e.g., Float32 for a float accumulator).
     pub fn define_reg_typed(size: usize, element_dtype: DType) -> Arc<Self> {
         use morok_dtype::AddrSpace;
-        let ptr_dtype = DType::Ptr {
-            base: Box::new(element_dtype),
-            addrspace: AddrSpace::Reg,
-            size: Some(size),
-            vcount: 1,
-        };
+        let ptr_dtype =
+            DType::Ptr { base: Box::new(element_dtype), addrspace: AddrSpace::Reg, size: Some(size), vcount: 1 };
         Self::new(Op::DefineReg { size }, ptr_dtype)
     }
 }

@@ -33,6 +33,9 @@ pub struct CachedKernel {
     pub code: String,
     /// Entry point name.
     pub entry_point: String,
+    /// Variable names in order for converting HashMap to positional vals.
+    /// Matches the order expected by the compiled program.
+    pub var_names: Vec<String>,
     /// Global work size for dispatch (GPU backends, CPU threading).
     /// For CPU threading: [thread_count, 1, 1]
     pub global_size: Option<[usize; 3]>,

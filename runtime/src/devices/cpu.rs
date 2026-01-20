@@ -8,7 +8,6 @@
 //! - `MOROK_CPU_BACKEND` environment variable ("llvm" or "cranelift")
 //! - Explicit `create_cpu_device_with_backend()` call
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_device::Result;
@@ -17,7 +16,7 @@ use morok_device::registry::DeviceRegistry;
 use morok_dtype::DeviceSpec;
 use morok_ir::UOp;
 
-use crate::{CompiledKernel, LlvmKernel};
+use crate::LlvmKernel;
 
 /// CPU backend selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,7 +52,7 @@ impl Program for LlvmProgram {
     unsafe fn execute(
         &self,
         buffers: &[*mut u8],
-        vars: &HashMap<String, i64>,
+        vals: &[i64],
         global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
     ) -> Result<()> {
@@ -62,14 +61,11 @@ impl Program for LlvmProgram {
 
         if let Some(count) = thread_count {
             // Parallel execution with static work partition
-            unsafe { self.execute_parallel(buffers, vars, count) }
+            unsafe { self.execute_parallel(buffers, vals, count) }
         } else {
             // Single-threaded execution
-            unsafe {
-                CompiledKernel::execute_with_vars(&self.kernel, buffers, vars).map_err(|e| {
-                    morok_device::Error::Runtime { message: format!("LLVM kernel execution failed: {}", e) }
-                })
-            }
+            unsafe { self.kernel.execute_with_vals(buffers, vals) }
+                .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM kernel execution failed: {}", e) })
         }
     }
 
@@ -91,36 +87,18 @@ impl LlvmProgram {
     /// Same buffer pointers can be safely passed to all threads because:
     /// 1. Input buffers: Read-only access (no data race)
     /// 2. Output buffers: Disjoint write regions per thread
-    unsafe fn execute_parallel(
-        &self,
-        buffers: &[*mut u8],
-        vars: &HashMap<String, i64>,
-        thread_count: usize,
-    ) -> Result<()> {
+    unsafe fn execute_parallel(&self, buffers: &[*mut u8], vals: &[i64], thread_count: usize) -> Result<()> {
         use rayon::prelude::*;
         use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         // Extract thread-safe data BEFORE parallel loop:
         // - fn_ptr: raw pointer to JIT-compiled code (just machine code, thread-safe)
-        // - var_names: cached variable names in order
+        // - var_names: for finding thread_id position
         let fn_ptr = self.kernel.fn_ptr() as usize; // Convert to usize for Send+Sync
         let var_names = self.kernel.var_names();
 
-        // Pre-build base var_values (thread_id placeholder = 0)
-        let mut base_var_values: Vec<i64> = Vec::with_capacity(var_names.len());
-        for name in var_names {
-            if name == "thread_id" {
-                base_var_values.push(0); // Placeholder, will be replaced per-thread
-            } else {
-                let value = vars.get(name).copied().ok_or_else(|| morok_device::Error::Runtime {
-                    message: format!("Missing variable value for parameter '{}'", name),
-                })?;
-                base_var_values.push(value);
-            }
-        }
-
-        // Find thread_id position in var_names
+        // Find thread_id position in var_names (typically at the end)
         let thread_id_idx = var_names.iter().position(|n| n == "thread_id");
 
         // Pre-convert buffer pointers for Send + Sync
@@ -139,20 +117,20 @@ impl LlvmProgram {
                 return;
             }
 
-            // Prepare this thread's var_values
-            let mut var_values = base_var_values.clone();
+            // Prepare this thread's vals (clone and set thread_id)
+            let mut thread_vals = vals.to_vec();
             if let Some(idx) = thread_id_idx {
-                var_values[idx] = thread_id as i64;
+                thread_vals[idx] = thread_id as i64;
             }
 
             // Reconstruct buffer pointer
             let bufs_ptr = buffer_usizes.as_ptr() as *const *mut u8;
 
             // Call the JIT function directly using the cached fn_ptr
-            // SAFETY: fn_ptr points to valid JIT-compiled code, buffers and vars are valid
+            // SAFETY: fn_ptr points to valid JIT-compiled code, buffers and vals are valid
             unsafe {
                 let f: KernelFn = std::mem::transmute(fn_ptr);
-                f(bufs_ptr, var_values.as_ptr());
+                f(bufs_ptr, thread_vals.as_ptr());
             }
         });
 
@@ -257,13 +235,15 @@ impl Program for CraneliftProgram {
     unsafe fn execute(
         &self,
         buffers: &[*mut u8],
-        vars: &HashMap<String, i64>,
+        vals: &[i64],
         _global_size: Option<[usize; 3]>,
         _local_size: Option<[usize; 3]>,
     ) -> Result<()> {
         // SAFETY: Caller ensures buffers are valid
         unsafe {
-            self.kernel.execute(buffers, vars).map_err(|e| morok_device::Error::Runtime { message: format!("{}", e) })
+            self.kernel
+                .execute_with_vals(buffers, vals)
+                .map_err(|e| morok_device::Error::Runtime { message: format!("{}", e) })
         }
     }
 

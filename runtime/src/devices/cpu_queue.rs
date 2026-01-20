@@ -3,7 +3,6 @@
 //! The `CpuQueue` batches kernel executions and submits them to rayon's
 //! thread pool for parallel execution.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_device::device::Program as DeviceProgram;
@@ -23,7 +22,7 @@ enum PendingOp {
     Exec {
         program: Arc<dyn DeviceProgram>,
         buffer_ptrs: Vec<*mut u8>,
-        vars: HashMap<String, i64>,
+        vals: Vec<i64>,
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
     },
@@ -69,11 +68,11 @@ impl CpuQueue {
             PendingOp::Signal { signal, value } => {
                 signal.set(value);
             }
-            PendingOp::Exec { program, buffer_ptrs, vars, global_size, local_size } => {
+            PendingOp::Exec { program, buffer_ptrs, vals, global_size, local_size } => {
                 // SAFETY: Scheduler guarantees exclusive access during execution
                 unsafe {
                     program
-                        .execute(&buffer_ptrs, &vars, global_size, local_size)
+                        .execute(&buffer_ptrs, &vals, global_size, local_size)
                         .map_err(|e| crate::Error::Device { source: e })?;
                 }
             }

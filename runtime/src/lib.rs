@@ -20,7 +20,6 @@ pub mod devices;
 pub mod error;
 pub mod execution_plan;
 pub mod executor;
-pub mod kernel;
 pub mod kernel_cache;
 pub mod llvm;
 
@@ -36,6 +35,5 @@ pub use execution_plan::{ExecutionPlan, ExecutionPlanBuilder, ParallelGroup, Pre
 pub use executor::{
     DeviceContext, ExecutionGraph, ExecutionNode, KernelBufferAccess, SyncStrategy, UnifiedExecutor, global_executor,
 };
-pub use kernel::*;
 pub use kernel_cache::*;
 pub use llvm::*;

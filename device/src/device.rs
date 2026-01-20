@@ -9,7 +9,6 @@
 //! This design allows multiple backends (LLVM, CUDA, Metal, WebGPU) to coexist
 //! and share compiled kernels via the method cache.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_dtype::DeviceSpec;
@@ -26,13 +25,19 @@ use crate::error::Result;
 /// Note: This trait does not require Send + Sync because some backends (like LLVM JIT)
 /// use non-thread-safe types. Programs are typically executed on the same thread where
 /// they were compiled, and caching/sharing is handled at a higher level.
+///
+/// # Tinygrad Alignment
+///
+/// This trait follows Tinygrad's `Program` interface where variable values are
+/// passed as a positional tuple/array (`vals`) rather than a named HashMap.
+/// The order matches `var_names` in `CompiledSpec`.
 pub trait Program {
     /// Execute the kernel with given buffers and variable values.
     ///
     /// # Arguments
     ///
     /// * `buffers` - Raw pointers to buffer data (input and output buffers)
-    /// * `vars` - Variable values (for symbolic shapes/strides)
+    /// * `vals` - Variable values in positional order (matches `var_names` in CompiledSpec)
     /// * `global_size` - Global work size (for GPU backends, None for CPU)
     /// * `local_size` - Local work size (for GPU backends, None for CPU)
     ///
@@ -45,7 +50,7 @@ pub trait Program {
     unsafe fn execute(
         &self,
         buffers: &[*mut u8],
-        vars: &HashMap<String, i64>,
+        vals: &[i64],
         global_size: Option<[usize; 3]>,
         local_size: Option<[usize; 3]>,
     ) -> Result<()>;
@@ -242,7 +247,7 @@ pub type CompilerPair = (Arc<dyn Renderer>, Arc<dyn Compiler>);
 /// let spec = cpu_device.renderer.render(&kernel_ast)?;
 /// let compiled = cpu_device.compiler.compile(&spec)?;
 /// let program = (cpu_device.runtime)(&compiled)?;
-/// unsafe { program.execute(&buffers, &vars, None, None)?; }
+/// unsafe { program.execute(&buffers, &vals, None, None)?; }
 /// ```
 pub struct Device {
     /// Device specification
@@ -308,6 +313,13 @@ impl Device {
 ///
 /// This is returned by Renderer::render() and consumed by Compiler::compile().
 /// It bridges the gap between UOp graphs and compiled executables.
+///
+/// # Tinygrad Alignment
+///
+/// Buffer metadata (`globals`, `outs`, `ins`) matches Tinygrad's Program class:
+/// - `globals`: Buffer indices from DefineGlobal ops
+/// - `outs`: Output buffer indices (written by STORE ops)
+/// - `ins`: Input buffer indices (read by LOAD ops)
 #[derive(Debug, Clone)]
 pub struct ProgramSpec {
     /// Kernel name (for debugging/profiling)
@@ -334,12 +346,36 @@ pub struct ProgramSpec {
     /// Variable names in order for populating vars array at runtime.
     /// Includes thread_id at the end if threading is enabled.
     pub var_names: Vec<String>,
+
+    /// Global buffer indices (from DefineGlobal argument values).
+    /// Matches Tinygrad's `globals` field.
+    pub globals: Vec<usize>,
+
+    /// Output buffer indices (written by STORE ops).
+    /// Matches Tinygrad's `outs` field.
+    pub outs: Vec<usize>,
+
+    /// Input buffer indices (read by LOAD ops, excluding outputs).
+    /// Matches Tinygrad's `ins` field.
+    pub ins: Vec<usize>,
 }
 
 impl ProgramSpec {
     /// Create a new program specification.
     pub fn new(name: String, src: String, device: DeviceSpec, ast: Arc<UOp>) -> Self {
-        Self { name, src, device, ast, global_size: None, local_size: None, vars: Vec::new(), var_names: Vec::new() }
+        Self {
+            name,
+            src,
+            device,
+            ast,
+            global_size: None,
+            local_size: None,
+            vars: Vec::new(),
+            var_names: Vec::new(),
+            globals: Vec::new(),
+            outs: Vec::new(),
+            ins: Vec::new(),
+        }
     }
 
     /// Add a variable to the program.
@@ -356,6 +392,13 @@ impl ProgramSpec {
     /// Set variable names for populating vars array at runtime.
     pub fn set_var_names(&mut self, var_names: Vec<String>) {
         self.var_names = var_names;
+    }
+
+    /// Set buffer metadata (globals, outs, ins).
+    pub fn set_buffer_metadata(&mut self, globals: Vec<usize>, outs: Vec<usize>, ins: Vec<usize>) {
+        self.globals = globals;
+        self.outs = outs;
+        self.ins = ins;
     }
 }
 

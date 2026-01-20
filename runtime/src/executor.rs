@@ -638,12 +638,7 @@ impl UnifiedExecutor {
                 kernel
                     .kernel
                     .program
-                    .execute(
-                        &kernel.buffer_ptrs,
-                        &kernel.fixedvars,
-                        kernel.kernel.global_size,
-                        kernel.kernel.local_size,
-                    )
+                    .execute(&kernel.buffer_ptrs, &kernel.vals, kernel.kernel.global_size, kernel.kernel.local_size)
                     .map_err(|e| crate::error::Error::Execution {
                         reason: format!("Kernel {} failed: {}", kernel.id, e),
                     })?;
@@ -719,29 +714,24 @@ impl UnifiedExecutor {
 
         // Pre-transmute pointer slices to usize slices (zero-copy, zero-alloc)
         #[allow(clippy::type_complexity)]
-        let ptr_slices: Vec<(
-            &[usize],
-            u64,
-            &std::sync::Arc<crate::kernel_cache::CachedKernel>,
-            &std::collections::HashMap<String, i64>,
-        )> = kernels
+        let ptr_slices: Vec<(&[usize], u64, &std::sync::Arc<crate::kernel_cache::CachedKernel>, &[i64])> = kernels
             .iter()
             .map(|k| {
                 let usize_slice: &[usize] =
                     unsafe { std::mem::transmute::<&[*mut u8], &[usize]>(k.buffer_ptrs.as_slice()) };
-                (usize_slice, k.id, &k.kernel, &k.fixedvars)
+                (usize_slice, k.id, &k.kernel, k.vals.as_slice())
             })
             .collect();
 
         rayon::scope(|s| {
-            for &(usize_slice, id, program, fixedvars) in &ptr_slices {
+            for &(usize_slice, id, program, vals) in &ptr_slices {
                 let errors_ref = &errors;
                 s.spawn(move |_| {
                     // Transmute back to pointer slice (zero-copy)
                     let ptrs: &[*mut u8] = unsafe { std::mem::transmute::<&[usize], &[*mut u8]>(usize_slice) };
 
                     let result =
-                        unsafe { program.program.execute(ptrs, fixedvars, program.global_size, program.local_size) };
+                        unsafe { program.program.execute(ptrs, vals, program.global_size, program.local_size) };
 
                     if let Err(e) = result {
                         errors_ref

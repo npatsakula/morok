@@ -1,7 +1,5 @@
 //! Cranelift JIT compilation and execution.
 
-use std::collections::HashMap;
-
 use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, MemFlags, Signature, UserFuncName, types};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
@@ -118,7 +116,7 @@ impl CraneliftKernel {
         Ok(Self { module, func_ptr, buffer_count, var_names, name })
     }
 
-    /// Execute the kernel with the given buffers and variables.
+    /// Execute the kernel with the given buffers and variables (HashMap version).
     ///
     /// # Safety
     ///
@@ -126,15 +124,26 @@ impl CraneliftKernel {
     /// - Buffer pointers are valid and properly aligned
     /// - Buffer count matches expected parameters
     /// - Variable values are valid
-    pub unsafe fn execute(&self, buffers: &[*mut u8], vars: &HashMap<String, i64>) -> Result<()> {
+    #[allow(dead_code)]
+    pub unsafe fn execute(&self, buffers: &[*mut u8], vars: &std::collections::HashMap<String, i64>) -> Result<()> {
         // Build variable values in correct order
         let var_values: Vec<i64> = self.var_names.iter().map(|name| vars.get(name).copied().unwrap_or(0)).collect();
+        unsafe { self.execute_with_vals(buffers, &var_values) }
+    }
 
+    /// Execute the kernel with positional variable values.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure:
+    /// - Buffer pointers are valid and properly aligned
+    /// - Buffer count matches expected parameters
+    /// - `vals` has the correct length matching variable count
+    pub unsafe fn execute_with_vals(&self, buffers: &[*mut u8], vals: &[i64]) -> Result<()> {
         // Single function type: kernel(ptr* args, i64* vars)
         type KernelFn = extern "C" fn(*const *mut u8, *const i64);
         let func: KernelFn = unsafe { std::mem::transmute(self.func_ptr) };
-        func(buffers.as_ptr(), var_values.as_ptr());
-
+        func(buffers.as_ptr(), vals.as_ptr());
         Ok(())
     }
 
@@ -248,17 +257,5 @@ fn get_function_name(func: &Function) -> String {
     match &func.name {
         cranelift_codegen::ir::UserFuncName::Testcase(name) => name.to_string(),
         cranelift_codegen::ir::UserFuncName::User(user_ref) => format!("user_{}", user_ref.index),
-    }
-}
-
-/// CompiledKernel implementation for Cranelift kernels.
-impl crate::CompiledKernel for CraneliftKernel {
-    unsafe fn execute_with_vars(&self, buffers: &[*mut u8], vars: &HashMap<String, i64>) -> Result<()> {
-        // SAFETY: Caller ensures buffers are valid
-        unsafe { self.execute(buffers, vars) }
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 }

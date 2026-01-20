@@ -26,12 +26,7 @@ pub struct RenderContext {
 
 impl RenderContext {
     pub fn new() -> Self {
-        Self {
-            names: HashMap::new(),
-            range_values: HashMap::new(),
-            counter: 0,
-            pending_reduces: HashMap::new(),
-        }
+        Self { names: HashMap::new(), range_values: HashMap::new(), counter: 0, pending_reduces: HashMap::new() }
     }
 
     /// Get or create variable name for UOp.

@@ -2,10 +2,10 @@
 
 use std::mem::ManuallyDrop;
 
-use crate::{CompiledKernel, Result};
+use crate::Result;
 use inkwell::OptimizationLevel;
 use inkwell::context::Context;
-use inkwell::execution_engine::{ExecutionEngine, JitFunction};
+use inkwell::execution_engine::ExecutionEngine;
 use inkwell::module::Module;
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, InitializationConfig, RelocMode, Target, TargetMachine};
@@ -179,43 +179,35 @@ impl LlvmKernel {
     pub fn fn_ptr(&self) -> *const u8 {
         self.fn_ptr
     }
-}
 
-impl CompiledKernel for LlvmKernel {
-    unsafe fn execute_with_vars(
-        &self,
-        buffers: &[*mut u8],
-        vars: &std::collections::HashMap<String, i64>,
-    ) -> Result<()> {
-        debug!(
+    /// Get the kernel name (for debugging/profiling).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Execute the kernel with positional variable values.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure:
+    /// - Buffer pointers are valid and properly aligned
+    /// - `vals` has the correct length matching `var_names`
+    pub unsafe fn execute_with_vals(&self, buffers: &[*mut u8], vals: &[i64]) -> Result<()> {
+        tracing::debug!(
             kernel.entry_point = %self.entry_point,
             kernel.num_buffers = buffers.len(),
-            kernel.num_vars = self.var_names.len(),
+            kernel.num_vals = vals.len(),
             "Executing LLVM kernel"
         );
 
-        // Build vars array in the order specified by var_names
-        let var_values: Vec<i64> = self.var_names.iter().map(|name| vars.get(name).copied().unwrap_or(0)).collect();
-
         // Kernel signature: void kernel(ptr %args, ptr %vars)
-        // - args: pointer to buffer array
-        // - vars: pointer to i64 array of variable values
         type KernelFn = unsafe extern "C" fn(*const *mut u8, *const i64);
-        let func: JitFunction<KernelFn> = unsafe {
-            self.execution_engine
-                .get_function(&self.entry_point)
-                .map_err(|e| crate::Error::FunctionNotFound { name: format!("{}: {}", self.entry_point, e) })?
-        };
-
         unsafe {
-            func.call(buffers.as_ptr(), var_values.as_ptr());
+            let f: KernelFn = std::mem::transmute(self.fn_ptr);
+            f(buffers.as_ptr(), vals.as_ptr());
         }
 
         Ok(())
-    }
-
-    fn name(&self) -> &str {
-        &self.name
     }
 }
 
@@ -248,7 +240,7 @@ mod tests {
         assert_eq!(kernel.name(), "test_kernel");
 
         unsafe {
-            kernel.execute(&[]).unwrap();
+            kernel.execute_with_vals(&[], &[]).unwrap();
         }
     }
 
@@ -269,7 +261,7 @@ mod tests {
         let buffers = vec![data1.as_mut_ptr(), data2.as_mut_ptr()];
 
         unsafe {
-            kernel.execute(&buffers).unwrap();
+            kernel.execute_with_vals(&buffers, &[]).unwrap();
         }
     }
 

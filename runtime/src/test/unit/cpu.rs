@@ -34,7 +34,6 @@ fn test_cpu_device_creation_llvm() {
 fn test_compile_and_runtime_pipeline_llvm() {
     use morok_device::device::ProgramSpec;
     use morok_dtype::DeviceSpec;
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Llvm).unwrap();
@@ -64,10 +63,9 @@ entry:
 
     // Test 3: Execute (no buffers needed for this kernel)
     let pointers: Vec<*mut u8> = vec![];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 }
 
@@ -94,7 +92,6 @@ fn test_compile_invalid_ir() {
 fn test_cranelift_bootstrap_pipeline() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -136,10 +133,9 @@ fn test_cranelift_bootstrap_pipeline() {
     // Execute with a buffer
     let mut buffer: [i32; 1] = [0];
     let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 
     // Verify the buffer was written correctly
@@ -151,7 +147,6 @@ fn test_cranelift_exp2_decomposition() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -198,10 +193,9 @@ fn test_cranelift_exp2_decomposition() {
     // Execute with a buffer
     let mut buffer: [f32; 1] = [0.0];
     let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 
     // Verify exp2(2.0) = 4.0 with some tolerance
@@ -219,7 +213,6 @@ fn test_cranelift_exp2_decomposition() {
 fn test_cranelift_simple_math() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -254,10 +247,9 @@ fn test_cranelift_simple_math() {
 
     let mut buffer: [f32; 1] = [0.0];
     let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 
     assert_eq!(buffer[0], 6.0, "2.0 * 3.0 should be 6.0");
@@ -268,7 +260,6 @@ fn test_cranelift_pow2if() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions::helpers;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -303,10 +294,9 @@ fn test_cranelift_pow2if() {
 
     let mut buffer: [f32; 1] = [0.0];
     let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 
     // pow2if(2) = 2^2 = 4.0
@@ -318,7 +308,6 @@ fn test_cranelift_ldexp2k() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions::helpers;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -354,10 +343,9 @@ fn test_cranelift_ldexp2k() {
 
     let mut buffer: [f32; 1] = [0.0];
     let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 
     // ldexp2k(1.0, 2) = 1.0 * 2^2 = 4.0
@@ -369,7 +357,6 @@ fn test_cranelift_rintk() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions::helpers;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -405,10 +392,9 @@ fn test_cranelift_rintk() {
 
     let mut buffer: [i32; 1] = [0];
     let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 
     // rintk(2.0) = 2
@@ -420,7 +406,6 @@ fn test_cranelift_exp2_simple() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions::helpers::{ldexp2k, poly_n, rintk};
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     // Manually build the exp2(2.0) computation step by step
     // to isolate the issue
@@ -474,10 +459,9 @@ fn test_cranelift_exp2_simple() {
 
     let mut buffer: [f32; 1] = [0.0];
     let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 
     let expected = 4.0f32;
@@ -495,7 +479,6 @@ fn test_cranelift_ldexp_with_rintk() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions::helpers::{float_const, ldexp2k, rintk};
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -530,10 +513,9 @@ fn test_cranelift_ldexp_with_rintk() {
 
     let mut buffer: [f32; 1] = [0.0];
     let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 
     assert!((buffer[0] - 4.0).abs() < 1e-6, "ldexp2k(1.0, rintk(2.0)) should be 4.0, got {}", buffer[0]);
@@ -544,7 +526,6 @@ fn test_cranelift_poly_at_zero() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions::helpers::poly_n;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -579,10 +560,9 @@ fn test_cranelift_poly_at_zero() {
 
     let mut buffer: [f32; 1] = [0.0];
     let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-    let vars = HashMap::new();
 
     unsafe {
-        program.execute(&pointers, &vars, None, None).expect("Execution should succeed");
+        program.execute(&pointers, &[], None, None).expect("Execution should succeed");
     }
 
     // poly(0) should be the LAST coefficient = 1.0
@@ -603,7 +583,6 @@ fn test_cranelift_exp2_accuracy() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -644,10 +623,9 @@ fn test_cranelift_exp2_accuracy() {
 
         let mut buffer: [f32; 1] = [0.0];
         let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-        let vars = HashMap::new();
 
         unsafe {
-            program.execute(&pointers, &vars, None, None).expect("execute failed");
+            program.execute(&pointers, &[], None, None).expect("execute failed");
         }
 
         let expected = (2.0_f32).powf(input);
@@ -670,7 +648,6 @@ fn test_cranelift_sin_accuracy() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -723,10 +700,9 @@ fn test_cranelift_sin_accuracy() {
 
         let mut buffer: [f32; 1] = [0.0];
         let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-        let vars = HashMap::new();
 
         unsafe {
-            program.execute(&pointers, &vars, None, None).expect("execute failed");
+            program.execute(&pointers, &[], None, None).expect("execute failed");
         }
 
         let expected = input.sin();
@@ -755,7 +731,6 @@ fn test_cranelift_cos_accuracy() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -796,10 +771,9 @@ fn test_cranelift_cos_accuracy() {
 
         let mut buffer: [f32; 1] = [0.0];
         let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-        let vars = HashMap::new();
 
         unsafe {
-            program.execute(&pointers, &vars, None, None).expect("execute failed");
+            program.execute(&pointers, &[], None, None).expect("execute failed");
         }
 
         let expected = input.cos();
@@ -823,7 +797,6 @@ fn test_cranelift_log2_accuracy() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -863,10 +836,9 @@ fn test_cranelift_log2_accuracy() {
 
         let mut buffer: [f32; 1] = [0.0];
         let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-        let vars = HashMap::new();
 
         unsafe {
-            program.execute(&pointers, &vars, None, None).expect("execute failed");
+            program.execute(&pointers, &[], None, None).expect("execute failed");
         }
 
         let expected = input.log2();
@@ -882,7 +854,6 @@ fn test_cranelift_exp_accuracy() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -921,10 +892,9 @@ fn test_cranelift_exp_accuracy() {
 
         let mut buffer: [f32; 1] = [0.0];
         let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-        let vars = HashMap::new();
 
         unsafe {
-            program.execute(&pointers, &vars, None, None).expect("execute failed");
+            program.execute(&pointers, &[], None, None).expect("execute failed");
         }
 
         let expected = input.exp();
@@ -940,7 +910,6 @@ fn test_cranelift_log_accuracy() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -979,10 +948,9 @@ fn test_cranelift_log_accuracy() {
 
         let mut buffer: [f32; 1] = [0.0];
         let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-        let vars = HashMap::new();
 
         unsafe {
-            program.execute(&pointers, &vars, None, None).expect("execute failed");
+            program.execute(&pointers, &[], None, None).expect("execute failed");
         }
 
         let expected = input.ln();
@@ -998,7 +966,6 @@ fn test_cranelift_tan_accuracy() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -1049,10 +1016,9 @@ fn test_cranelift_tan_accuracy() {
 
         let mut buffer: [f32; 1] = [0.0];
         let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-        let vars = HashMap::new();
 
         unsafe {
-            program.execute(&pointers, &vars, None, None).expect("execute failed");
+            program.execute(&pointers, &[], None, None).expect("execute failed");
         }
 
         let expected = input.tan();
@@ -1081,7 +1047,6 @@ fn test_cranelift_erf_accuracy() {
     use morok_dtype::{AddrSpace, DType, ScalarDType};
     use morok_ir::decompositions;
     use morok_ir::{ConstValue, Op};
-    use std::collections::HashMap;
 
     let registry = DeviceRegistry::default();
     let device = create_cpu_device_with_backend(&registry, CpuBackend::Cranelift)
@@ -1131,10 +1096,9 @@ fn test_cranelift_erf_accuracy() {
 
         let mut buffer: [f32; 1] = [0.0];
         let pointers: Vec<*mut u8> = vec![buffer.as_mut_ptr() as *mut u8];
-        let vars = HashMap::new();
 
         unsafe {
-            program.execute(&pointers, &vars, None, None).expect("execute failed");
+            program.execute(&pointers, &[], None, None).expect("execute failed");
         }
 
         // Allow 1e-5 absolute error (the approximation has ~1.5e-7 max error)
