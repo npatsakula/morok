@@ -402,7 +402,8 @@ fn detect_output_indices(kernel: &Arc<UOp>, buffers: &[Buffer]) -> Vec<usize> {
     let mut output_buffer_uop_ids: HashSet<u64> = HashSet::new();
 
     for node in ast.toposort() {
-        if let Op::Store { buffer, .. } = node.op() {
+        // Use store_buffer() helper to get buffer from STORE via its INDEX child
+        if let Some(buffer) = node.store_buffer() {
             // Get the buffer's DefineGlobal ID
             let buf_id = match buffer.op() {
                 Op::DefineGlobal(_) | Op::DefineLocal(_) => buffer.id,

@@ -52,9 +52,9 @@ pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
 pub fn bool_storage_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         // STORE bool: cast to uint8 before storing
-        Store { buffer, index, value, ranges } if value.dtype().base().is_bool() => {
+        Store { index, value, ranges } if value.dtype().base().is_bool() => {
             let uint8_dtype = value.dtype().with_base(ScalarDType::UInt8);
-            Some(UOp::store_with_ranges(buffer.clone(), index.clone(), UOp::cast(value.clone(), uint8_dtype), ranges.clone()))
+            Some(UOp::store_with_ranges(index.clone(), UOp::cast(value.clone(), uint8_dtype), ranges.clone()))
         },
 
         // LOAD bool: load as uint8, then cast to bool
@@ -543,8 +543,8 @@ pub fn pm_add_loads() -> TypedPatternMatcher {
 
         // Remove LOAD wrapper from STORE: STORE(LOAD(x), ...) → STORE(x, ...)
         // (devectorizer.py:325)
-        Store { buffer, index: Load { index: inner_idx, .. }, value, ranges }
-            => Some(UOp::store_with_ranges(buffer.clone(), inner_idx.clone(), value.clone(), ranges.clone())),
+        Store { index: Load { index: inner_idx, .. }, value, ranges }
+            => Some(UOp::store_with_ranges(inner_idx.clone(), value.clone(), ranges.clone())),
     }
 }
 
@@ -597,16 +597,16 @@ pub fn load_store_folding_patterns() -> TypedPatternMatcher {
             => move_gep_after_load(load, buffer, vector, indices),
 
         // GEP on STORE: STORE(GEP(x), data) → STORE(x, GEP⁻¹(data))
-        Store { buffer, index: Gep { vector, indices }, value, ranges }
-            => move_gep_on_store(buffer, vector, indices, value, ranges),
+        Store { index: Gep { vector, indices }, value, ranges }
+            => move_gep_on_store(vector, indices, value, ranges),
 
         // PTRCAT after LOAD: LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
         load @ Load { buffer, index: ptrcat @ PtrCat { sources } }
             => distribute_ptrcat_load(load, buffer, ptrcat, sources),
 
         // PTRCAT after STORE
-        Store { buffer, index: PtrCat { sources }, value, ranges }
-            => distribute_ptrcat_store(buffer, sources, value, ranges),
+        Store { index: PtrCat { sources }, value, ranges }
+            => distribute_ptrcat_store(sources, value, ranges),
     }
 }
 
@@ -620,8 +620,8 @@ pub fn correct_load_store_patterns() -> TypedPatternMatcher {
         Load { buffer, index: Cast { src: idx @ Index { buffer: _, .. }, dtype: cast_dtype } }
             => split_load(buffer, idx, cast_dtype),
 
-        Store { buffer, index: Cast { src: idx @ Index { buffer: _, .. }, dtype: cast_dtype }, value, ranges }
-            => split_store(buffer, idx, cast_dtype, value, ranges),
+        Store { index: Cast { src: idx @ Index { buffer: idx_buffer, .. }, dtype: cast_dtype }, value, ranges }
+            => split_store(idx_buffer, idx, cast_dtype, value, ranges),
     }
 }
 
@@ -681,7 +681,6 @@ fn move_gep_after_load(
 
 /// STORE(GEP(ptr), data) → STORE(ptr, GEP⁻¹(data)). Inverts GEP indices.
 fn move_gep_on_store(
-    buffer: &Arc<UOp>,
     gep_inner: &Arc<UOp>,
     gep_indices: &[usize],
     value: &Arc<UOp>,
@@ -693,7 +692,7 @@ fn move_gep_on_store(
     let inverse_indices: Vec<usize> = inverse_map.iter().map(|&(_, i)| i).collect();
 
     let reordered_value = UOp::gep(value.clone(), inverse_indices);
-    Some(UOp::store_with_ranges(buffer.clone(), gep_inner.clone(), reordered_value, ranges.clone()))
+    Some(UOp::store_with_ranges(gep_inner.clone(), reordered_value, ranges.clone()))
 }
 
 // ============================================================================
@@ -853,7 +852,6 @@ fn distribute_ptrcat_load(
 
 /// STORE(PTRCAT, data) → GROUP(STOREs with GEP-sliced data)
 fn distribute_ptrcat_store(
-    buffer: &Arc<UOp>,
     sources: &[Arc<UOp>],
     value: &Arc<UOp>,
     ranges: &SmallVec<[Arc<UOp>; 4]>,
@@ -867,7 +865,7 @@ fn distribute_ptrcat_store(
         let ptr_count = ptr_element_count(ptr);
         let gep_indices: Vec<usize> = (offset..offset + ptr_count).collect();
         let store_value = UOp::gep(value.clone(), gep_indices);
-        stores.push(UOp::store_with_ranges(buffer.clone(), ptr.clone(), store_value, ranges.clone()));
+        stores.push(UOp::store_with_ranges(ptr.clone(), store_value, ranges.clone()));
         offset += ptr_count;
     }
 
@@ -957,7 +955,7 @@ fn split_load(buffer: &Arc<UOp>, idx: &Arc<UOp>, cast_dtype: &DType) -> Option<A
 }
 
 fn split_store(
-    buffer: &Arc<UOp>,
+    idx_buffer: &Arc<UOp>,
     idx: &Arc<UOp>,
     cast_dtype: &DType,
     value: &Arc<UOp>,
@@ -998,10 +996,10 @@ fn split_store(
 
             let chunk_idx = if pos == 0 { idx.clone() } else { offset_index(idx, pos as i64) };
             let chunk_ptr =
-                if fold_len > 1 { UOp::cast(chunk_idx, make_vec_ptr_dtype(buffer, fold_len)) } else { chunk_idx };
+                if fold_len > 1 { UOp::cast(chunk_idx, make_vec_ptr_dtype(idx_buffer, fold_len)) } else { chunk_idx };
             let gep_indices: Vec<usize> = (pos..pos + fold_len).collect();
             let chunk_value = UOp::gep(value.clone(), gep_indices);
-            stores.push(UOp::store_with_ranges(buffer.clone(), chunk_ptr, chunk_value, ranges.clone()));
+            stores.push(UOp::store_with_ranges(chunk_ptr, chunk_value, ranges.clone()));
 
             pos += fold_len;
             break;
@@ -1152,7 +1150,7 @@ fn reduce_to_acc(
             Op::Index { buffer: acc.clone(), indices: smallvec::smallvec![zero_idx.clone()], gate: None },
             scalar_dtype.clone(),
         );
-        UOp::store(acc.clone(), idx_init, identity)
+        idx_init.store_value(identity)
     } else {
         // Has outer ranges: acc.after(*input_ranges).index(0).store(identity)
         let acc_after_outer = UOp::after(acc.clone(), input_ranges);
@@ -1160,7 +1158,7 @@ fn reduce_to_acc(
             Op::Index { buffer: acc_after_outer, indices: smallvec::smallvec![zero_idx.clone()], gate: None },
             scalar_dtype.clone(),
         );
-        UOp::store(acc.clone(), idx_init, identity)
+        idx_init.store_value(identity)
     };
 
     // 6. Create accumulator access INSIDE the reduce loop
@@ -1177,8 +1175,8 @@ fn reduce_to_acc(
     // 7. Apply reduce operation: new_val = op(idx_loop, src)
     let new_val = apply_reduce_binary(*reduce_op, idx_loop.clone(), src.clone(), &scalar_dtype);
 
-    // 8. Store new value back to accumulator
-    let store_loop = UOp::store(acc.clone(), idx_loop, new_val);
+    // 8. Store new value back to accumulator (idx_loop contains the INDEX, not acc directly)
+    let store_loop = idx_loop.store_value(new_val);
 
     // 9. End the reduce ranges after the store
     let end = UOp::end(store_loop, ranges.clone());

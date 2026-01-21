@@ -423,18 +423,16 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
 
     let buffer = if let Some(existing_buffer) = ctx.get_buffer(bufferize_op) {
         existing_buffer.clone()
+    } else if opts.addrspace == AddrSpace::Global {
+        // Create BUFFER node (like Tinygrad's UOp.new_buffer)
+        // The BUFFER → DEFINE_GLOBAL conversion happens later in split_store
+        let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
+        UOp::new_buffer(device, size, base_dtype.clone())
     } else {
-        if opts.addrspace == AddrSpace::Global {
-            // Create BUFFER node (like Tinygrad's UOp.new_buffer)
-            // The BUFFER → DEFINE_GLOBAL conversion happens later in split_store
-            let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
-            UOp::new_buffer(device, size, base_dtype.clone())
-        } else {
-            // For local address space, create DEFINE_LOCAL directly (like Tinygrad)
-            let local_ptr_dtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
-            let local_id = ctx.next_local();
-            UOp::define_local(local_id, local_ptr_dtype)
-        }
+        // For local address space, create DEFINE_LOCAL directly (like Tinygrad)
+        let local_ptr_dtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
+        let local_id = ctx.next_local();
+        UOp::define_local(local_id, local_ptr_dtype)
     };
 
     // Create Ptr dtype for STORE target (like Tinygrad's sdtype = x.dtype.ptr(size, addrspace))
@@ -514,7 +512,8 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
     // 2. END.ranges define the iteration space for the OUTPUT (not internal computations)
     // 3. For scalar stores (e.g., REDUCE results), no END wrapping (ranges is empty)
     // 4. REDUCE's loop is handled by pm_reduce which creates its own END internally
-    let store = UOp::store(buffer.clone(), store_target, compute.clone());
+    // NOTE: STORE takes (index, value) - buffer is accessed via index.buffer
+    let store = store_target.store_value(compute.clone());
 
     // Determine END ranges: use ONLY the output's ranges (from BUFFERIZE).
     //
@@ -642,7 +641,7 @@ pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType)
 pub fn flatten_range_impl(r: &Arc<UOp>) -> Option<Arc<UOp>> {
     let off = match r.op() {
         Op::Reduce { .. } => 1,
-        Op::Store { .. } => 3,
+        Op::Store { .. } => 2, // (index, value, ranges...) - ranges start at index 2
         Op::End { .. } => 1,
         _ => return None,
     };
@@ -742,7 +741,7 @@ pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
             ret.insert(buf_key, OpAccessType::Load);
         }
 
-        if let Op::Store { buffer, .. } = node.op() {
+        if let Some(buffer) = node.store_buffer() {
             let buf = as_buf(buffer);
             let buf_key = UOpKey(buf.clone());
 

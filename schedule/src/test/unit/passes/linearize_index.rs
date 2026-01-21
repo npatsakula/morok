@@ -35,7 +35,7 @@ fn test_linearize_pattern_2d() {
     let j = make_range(8, 1);
 
     // Create INDEX(buffer, [i, j])
-    let multi_index = UOp::index(buffer.clone(), vec![i.clone(), j.clone()]).unwrap();
+    let multi_index = UOp::index().buffer(buffer.clone()).indices(vec![i.clone(), j.clone()]).call().unwrap();
     assert_eq!(multi_index.op().sources().len(), 3); // buffer, i, j
 
     // Apply linearization pattern
@@ -58,7 +58,7 @@ fn test_linearize_pattern_3d() {
     let j = make_range(3, 1);
     let k = make_range(4, 2);
 
-    let multi_index = UOp::index(buffer.clone(), vec![i, j, k]).unwrap();
+    let multi_index = UOp::index().buffer(buffer.clone()).indices(vec![i, j, k]).call().unwrap();
 
     let pattern = pm_linearize_multi_index();
     let result = crate::rewrite::graph_rewrite_bottom_up(&pattern, multi_index.clone(), &mut ());
@@ -76,7 +76,7 @@ fn test_single_index_unchanged() {
     let buffer = make_bufferize(&[10]);
     let i = make_range(10, 0);
 
-    let single_index = UOp::index(buffer.clone(), vec![i.clone()]).unwrap();
+    let single_index = UOp::index().buffer(buffer.clone()).indices(vec![i.clone()]).call().unwrap();
 
     let pattern = pm_linearize_multi_index();
     let result = crate::rewrite::graph_rewrite_bottom_up(&pattern, single_index.clone(), &mut ());
@@ -94,7 +94,7 @@ fn test_linearize_pattern_4d() {
     let k = make_range(4, 2);
     let l = make_range(5, 3);
 
-    let multi_index = UOp::index(buffer.clone(), vec![i, j, k, l]).unwrap();
+    let multi_index = UOp::index().buffer(buffer.clone()).indices(vec![i, j, k, l]).call().unwrap();
 
     let pattern = pm_linearize_multi_index();
     let result = crate::rewrite::graph_rewrite_bottom_up(&pattern, multi_index.clone(), &mut ());
@@ -116,7 +116,7 @@ fn test_unbounded_buffer_still_linearizes() {
     let i = make_range(4, 0);
     let j = make_range(8, 1);
 
-    let multi_index = UOp::index(buffer.clone(), vec![i, j]).unwrap();
+    let multi_index = UOp::index().buffer(buffer.clone()).indices(vec![i, j]).call().unwrap();
 
     let pattern = pm_linearize_multi_index();
     let result = crate::rewrite::graph_rewrite_bottom_up(&pattern, multi_index.clone(), &mut ());

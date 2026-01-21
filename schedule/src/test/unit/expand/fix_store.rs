@@ -5,7 +5,7 @@
 //! - Wraps result in CONTRACT with collected axes
 
 use super::helpers::*;
-use morok_dtype::{DType, DeviceSpec};
+use morok_dtype::DType;
 use morok_ir::types::ConstValue;
 use morok_ir::{AxisId, AxisType, Op, UOp};
 use smallvec::smallvec;
@@ -19,8 +19,7 @@ use smallvec::smallvec;
 /// Based on Tinygrad's fix_store_unroll (expander.py:123-126).
 #[test]
 fn test_fix_store_partition() {
-    // Create buffer and index
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 1024, DType::Float32);
+    // Create index and value
     let index = UOp::index_const(0);
     let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
@@ -28,7 +27,7 @@ fn test_fix_store_partition() {
     let unroll = create_unroll_iota(0, 4);
 
     // Create STORE with UNROLL in ranges
-    let store = UOp::store_with_ranges(buffer, index, value, smallvec![unroll]);
+    let store = UOp::store_with_ranges(index, value, smallvec![unroll]);
 
     // Apply expander
     let result = phase2_only(&store);
@@ -63,8 +62,7 @@ fn test_fix_store_partition() {
 /// Partitions correctly, keeping non-UNROLL ranges in STORE.
 #[test]
 fn test_fix_store_mixed_ranges() {
-    // Create buffer and index
-    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 1024, DType::Float32);
+    // Create index and value
     let index = UOp::index_const(0);
     let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
@@ -76,7 +74,7 @@ fn test_fix_store_mixed_ranges() {
     let loop_range = UOp::range_axis(end, AxisId::Renumbered(1), AxisType::Loop);
 
     // Create STORE with both UNROLL and non-UNROLL ranges
-    let store = UOp::store_with_ranges(buffer, index, value, smallvec![unroll, loop_range.clone()]);
+    let store = UOp::store_with_ranges(index, value, smallvec![unroll, loop_range.clone()]);
 
     // Apply expander
     let result = phase2_only(&store);

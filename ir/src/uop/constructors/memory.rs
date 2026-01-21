@@ -181,31 +181,27 @@ impl UOp {
 
     /// Create a STORE operation without ranges.
     ///
-    /// Stores a value to a buffer at the given index.
+    /// Stores a value at the given INDEX location.
+    /// The buffer is accessed indirectly through the INDEX node.
     /// For stores with ranges (e.g., output upcasting), use `store_with_ranges`.
     ///
     /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
-    pub fn store(buffer: Arc<Self>, index: Arc<Self>, value: Arc<Self>) -> Arc<Self> {
-        Self::store_with_ranges(buffer, index, value, SmallVec::new())
+    pub fn store(index: Arc<Self>, value: Arc<Self>) -> Arc<Self> {
+        Self::store_with_ranges(index, value, SmallVec::new())
     }
 
     /// Create a STORE operation with ranges.
     ///
-    /// Stores a value to a buffer at the given index, with explicit ranges
+    /// Stores a value at the given INDEX location, with explicit ranges
     /// that define the scope of the store operation. This matches Tinygrad's
-    /// architecture where STORE sources include range arguments at index 3+.
+    /// architecture where STORE sources are `(index, value, *ranges)`.
     ///
     /// Ranges are used for output upcasting: Range(Upcast) becomes UNROLL
     /// during expansion, which `fix_store_unroll` contracts via CONTRACT.
     ///
     /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
-    pub fn store_with_ranges(
-        buffer: Arc<Self>,
-        index: Arc<Self>,
-        value: Arc<Self>,
-        ranges: SmallVec<[Arc<Self>; 4]>,
-    ) -> Arc<Self> {
-        Self::new(Op::Store { buffer, index, value, ranges }, DType::Void)
+    pub fn store_with_ranges(index: Arc<Self>, value: Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        Self::new(Op::Store { index, value, ranges }, DType::Void)
     }
 
     // =========================================================================

@@ -105,15 +105,8 @@ fn test_cranelift_bootstrap_pipeline() {
     let const_42 = UOp::const_(DType::Scalar(ScalarDType::Int32), ConstValue::Int(42));
     let const_0 = UOp::index_const(0);
 
-    let store = UOp::new(
-        Op::Store {
-            buffer: buf0.clone(),
-            index: const_0.clone(),
-            value: const_42.clone(),
-            ranges: smallvec::SmallVec::new(),
-        },
-        DType::Scalar(ScalarDType::Void),
-    );
+    let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+    let store = UOp::store(idx, const_42.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -162,15 +155,8 @@ fn test_cranelift_exp2_decomposition() {
     let exp2_result = const_2.try_exp2().expect("exp2 should succeed");
 
     let const_0 = UOp::index_const(0);
-    let store = UOp::new(
-        Op::Store {
-            buffer: buf0.clone(),
-            index: const_0.clone(),
-            value: exp2_result.clone(),
-            ranges: smallvec::SmallVec::new(),
-        },
-        DType::Scalar(ScalarDType::Void),
-    );
+    let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+    let store = UOp::store(idx, exp2_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -227,15 +213,8 @@ fn test_cranelift_simple_math() {
     let mul_result = const_2.try_mul(&const_3).expect("mul should succeed");
 
     let const_0 = UOp::index_const(0);
-    let store = UOp::new(
-        Op::Store {
-            buffer: buf0.clone(),
-            index: const_0.clone(),
-            value: mul_result.clone(),
-            ranges: smallvec::SmallVec::new(),
-        },
-        DType::Scalar(ScalarDType::Void),
-    );
+    let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+    let store = UOp::store(idx, mul_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -274,15 +253,8 @@ fn test_cranelift_pow2if() {
     let pow2if_result = helpers::pow2if(&q, &DType::Scalar(ScalarDType::Float32));
 
     let const_0 = UOp::index_const(0);
-    let store = UOp::new(
-        Op::Store {
-            buffer: buf0.clone(),
-            index: const_0.clone(),
-            value: pow2if_result.clone(),
-            ranges: smallvec::SmallVec::new(),
-        },
-        DType::Scalar(ScalarDType::Void),
-    );
+    let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+    let store = UOp::store(idx, pow2if_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -323,15 +295,8 @@ fn test_cranelift_ldexp2k() {
     let ldexp_result = helpers::ldexp2k(&d, &e);
 
     let const_0 = UOp::index_const(0);
-    let store = UOp::new(
-        Op::Store {
-            buffer: buf0.clone(),
-            index: const_0.clone(),
-            value: ldexp_result.clone(),
-            ranges: smallvec::SmallVec::new(),
-        },
-        DType::Scalar(ScalarDType::Void),
-    );
+    let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+    let store = UOp::store(idx, ldexp_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -372,15 +337,8 @@ fn test_cranelift_rintk() {
     let rintk_result = helpers::rintk(&d);
 
     let const_0 = UOp::index_const(0);
-    let store = UOp::new(
-        Op::Store {
-            buffer: buf0.clone(),
-            index: const_0.clone(),
-            value: rintk_result.clone(),
-            ranges: smallvec::SmallVec::new(),
-        },
-        DType::Scalar(ScalarDType::Void),
-    );
+    let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+    let store = UOp::store(idx, rintk_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -439,15 +397,8 @@ fn test_cranelift_exp2_simple() {
     let result = ldexp2k(&u, &q);
 
     let const_0 = UOp::index_const(0);
-    let store = UOp::new(
-        Op::Store {
-            buffer: buf0.clone(),
-            index: const_0.clone(),
-            value: result.clone(),
-            ranges: smallvec::SmallVec::new(),
-        },
-        DType::Scalar(ScalarDType::Void),
-    );
+    let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+    let store = UOp::store(idx, result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -494,15 +445,8 @@ fn test_cranelift_ldexp_with_rintk() {
     let result = ldexp2k(&one, &q);
 
     let const_0 = UOp::index_const(0);
-    let store = UOp::new(
-        Op::Store {
-            buffer: buf0.clone(),
-            index: const_0.clone(),
-            value: result.clone(),
-            ranges: smallvec::SmallVec::new(),
-        },
-        DType::Scalar(ScalarDType::Void),
-    );
+    let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+    let store = UOp::store(idx, result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -541,15 +485,8 @@ fn test_cranelift_poly_at_zero() {
     let result = poly_n(&x, coeffs);
 
     let const_0 = UOp::index_const(0);
-    let store = UOp::new(
-        Op::Store {
-            buffer: buf0.clone(),
-            index: const_0.clone(),
-            value: result.clone(),
-            ranges: smallvec::SmallVec::new(),
-        },
-        DType::Scalar(ScalarDType::Void),
-    );
+    let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+    let store = UOp::store(idx, result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -599,15 +536,8 @@ fn test_cranelift_exp2_accuracy() {
         let exp2_result = const_input.try_exp2().expect("exp2 should succeed");
 
         let const_0 = UOp::index_const(0);
-        let store = UOp::new(
-            Op::Store {
-                buffer: buf0.clone(),
-                index: const_0.clone(),
-                value: exp2_result.clone(),
-                ranges: smallvec::SmallVec::new(),
-            },
-            DType::Scalar(ScalarDType::Void),
-        );
+        let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+        let store = UOp::store(idx, exp2_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -677,15 +607,8 @@ fn test_cranelift_sin_accuracy() {
         let sin_result = const_input.try_sin().expect("sin should succeed");
 
         let const_0 = UOp::index_const(0);
-        let store = UOp::new(
-            Op::Store {
-                buffer: buf0.clone(),
-                index: const_0.clone(),
-                value: sin_result.clone(),
-                ranges: smallvec::SmallVec::new(),
-            },
-            DType::Scalar(ScalarDType::Void),
-        );
+        let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+        let store = UOp::store(idx, sin_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -748,15 +671,8 @@ fn test_cranelift_cos_accuracy() {
         let cos_result = const_input.try_cos().expect("cos should succeed");
 
         let const_0 = UOp::index_const(0);
-        let store = UOp::new(
-            Op::Store {
-                buffer: buf0.clone(),
-                index: const_0.clone(),
-                value: cos_result.clone(),
-                ranges: smallvec::SmallVec::new(),
-            },
-            DType::Scalar(ScalarDType::Void),
-        );
+        let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+        let store = UOp::store(idx, cos_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -813,15 +729,8 @@ fn test_cranelift_log2_accuracy() {
         let log2_result = const_input.try_log2().expect("log2 should succeed");
 
         let const_0 = UOp::index_const(0);
-        let store = UOp::new(
-            Op::Store {
-                buffer: buf0.clone(),
-                index: const_0.clone(),
-                value: log2_result.clone(),
-                ranges: smallvec::SmallVec::new(),
-            },
-            DType::Scalar(ScalarDType::Void),
-        );
+        let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+        let store = UOp::store(idx, log2_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -869,15 +778,8 @@ fn test_cranelift_exp_accuracy() {
         let exp_result = const_input.try_exp().expect("exp should succeed");
 
         let const_0 = UOp::index_const(0);
-        let store = UOp::new(
-            Op::Store {
-                buffer: buf0.clone(),
-                index: const_0.clone(),
-                value: exp_result.clone(),
-                ranges: smallvec::SmallVec::new(),
-            },
-            DType::Scalar(ScalarDType::Void),
-        );
+        let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+        let store = UOp::store(idx, exp_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -925,15 +827,8 @@ fn test_cranelift_log_accuracy() {
         let log_result = const_input.try_log().expect("log should succeed");
 
         let const_0 = UOp::index_const(0);
-        let store = UOp::new(
-            Op::Store {
-                buffer: buf0.clone(),
-                index: const_0.clone(),
-                value: log_result.clone(),
-                ranges: smallvec::SmallVec::new(),
-            },
-            DType::Scalar(ScalarDType::Void),
-        );
+        let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+        let store = UOp::store(idx, log_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -993,15 +888,8 @@ fn test_cranelift_tan_accuracy() {
         let tan_result = const_input.try_tan().expect("tan should succeed");
 
         let const_0 = UOp::index_const(0);
-        let store = UOp::new(
-            Op::Store {
-                buffer: buf0.clone(),
-                index: const_0.clone(),
-                value: tan_result.clone(),
-                ranges: smallvec::SmallVec::new(),
-            },
-            DType::Scalar(ScalarDType::Void),
-        );
+        let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+        let store = UOp::store(idx, tan_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -1073,15 +961,8 @@ fn test_cranelift_erf_accuracy() {
         let erf_result = UOp::erf(const_input).expect("erf should succeed");
 
         let const_0 = UOp::index_const(0);
-        let store = UOp::new(
-            Op::Store {
-                buffer: buf0.clone(),
-                index: const_0.clone(),
-                value: erf_result.clone(),
-                ranges: smallvec::SmallVec::new(),
-            },
-            DType::Scalar(ScalarDType::Void),
-        );
+        let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
+        let store = UOp::store(idx, erf_result.clone());
 
         let sink = UOp::sink(vec![store]);
 

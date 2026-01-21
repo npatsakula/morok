@@ -201,6 +201,37 @@ impl UOp {
         }
     }
 
+    /// Get the buffer from a STORE operation (via its INDEX child).
+    ///
+    /// STORE operations reference the buffer indirectly through an INDEX node.
+    /// This helper extracts the buffer from `STORE.index.buffer`.
+    ///
+    /// Returns `None` if:
+    /// - This is not a STORE operation
+    /// - The STORE's index is not an INDEX operation
+    pub fn store_buffer(&self) -> Option<&Arc<UOp>> {
+        match self.op() {
+            Op::Store { index, .. } => match index.op() {
+                Op::Index { buffer, .. } => Some(buffer),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Store a value at this INDEX node.
+    ///
+    /// Convenience method for `UOp::store(self, value)`.
+    /// Matches Tinygrad's `idx.store(val)` pattern.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that self is an INDEX operation.
+    pub fn store_value(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
+        debug_assert!(matches!(self.op(), Op::Index { .. }), "store_value requires INDEX");
+        Self::store(self.clone(), value)
+    }
+
     /// Alias for `with_sources()` for Tinygrad API parity.
     ///
     /// Creates a new UOp with the same operation type and dtype, but with
@@ -1065,19 +1096,17 @@ impl UOp {
                 }
                 Op::Wmma { a: new_a, b: new_b, c: new_c, metadata: metadata.clone() }
             }
-            Op::Store { buffer, index, value, ranges } => {
-                let new_buffer = buffer.substitute(map);
+            Op::Store { index, value, ranges } => {
                 let new_index = index.substitute(map);
                 let new_value = value.substitute(map);
                 let new_ranges: SmallVec<[Arc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
-                if Arc::ptr_eq(&new_buffer, buffer)
-                    && Arc::ptr_eq(&new_index, index)
+                if Arc::ptr_eq(&new_index, index)
                     && Arc::ptr_eq(&new_value, value)
                     && ranges.iter().zip(&new_ranges).all(|(old, new)| Arc::ptr_eq(old, new))
                 {
                     return self.clone();
                 }
-                Op::Store { buffer: new_buffer, index: new_index, value: new_value, ranges: new_ranges }
+                Op::Store { index: new_index, value: new_value, ranges: new_ranges }
             }
 
             // Variable-arity operations
@@ -1479,13 +1508,8 @@ impl UOp {
                 Op::Load { buffer: src(0), index: src(1) }
             }
             Op::Store { .. } => {
-                assert!(new_srcs.len() >= 3, "Store requires at least 3 sources (buffer, index, value)");
-                Op::Store {
-                    buffer: src(0),
-                    index: src(1),
-                    value: src(2),
-                    ranges: new_srcs[3..].iter().cloned().collect(),
-                }
+                assert!(new_srcs.len() >= 2, "Store requires at least 2 sources (index, value)");
+                Op::Store { index: src(0), value: src(1), ranges: new_srcs[2..].iter().cloned().collect() }
             }
 
             // Graph organization

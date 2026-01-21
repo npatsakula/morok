@@ -28,7 +28,7 @@ fn test_noop_bufferize_same_ranges() {
     let ranges = vec![range.clone()];
 
     let bufferized = create_bufferize(x.clone(), ranges.clone());
-    let indexed = UOp::index(bufferized, ranges).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(bufferized).indices(ranges).call().unwrap();
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, indexed, &mut ());
@@ -45,7 +45,7 @@ fn test_noop_bufferize_different_ranges() {
     let range2 = create_range(10, 1); // Different axis_id
 
     let bufferized = create_bufferize(x.clone(), vec![range1]);
-    let indexed = UOp::index(bufferized.clone(), vec![range2]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(bufferized.clone()).indices(vec![range2]).call().unwrap();
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, indexed.clone(), &mut ());
@@ -63,7 +63,7 @@ fn test_noop_bufferize_multiple_ranges() {
     let ranges = vec![range1.clone(), range2.clone()];
 
     let bufferized = create_bufferize(x.clone(), ranges.clone());
-    let indexed = UOp::index(bufferized, ranges).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(bufferized).indices(ranges).call().unwrap();
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, indexed, &mut ());
@@ -119,7 +119,7 @@ fn test_index_const_folding() {
     let const_val = create_const(7);
     let range = create_range(10, 0);
 
-    let indexed = UOp::index(const_val.clone(), vec![range]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(const_val.clone()).indices(vec![range]).call().unwrap();
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, indexed, &mut ());
@@ -134,7 +134,7 @@ fn test_index_const_multiple_indices() {
     let const_val = UOp::native_const(2.5f32);
     let ranges = vec![create_range(10, 0), create_range(20, 1), create_range(30, 2)];
 
-    let indexed = UOp::index(const_val.clone(), ranges).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(const_val.clone()).indices(ranges).call().unwrap();
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, indexed, &mut ());
@@ -186,7 +186,7 @@ fn test_nested_constant_folding() {
     let range = create_range(15, 0);
 
     let bufferized = create_bufferize(const_val.clone(), vec![range.clone()]);
-    let indexed = UOp::index(bufferized, vec![range]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(bufferized).indices(vec![range]).call().unwrap();
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, indexed, &mut ());
@@ -206,7 +206,7 @@ fn test_noop_fold_non_const_operations() {
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(add.clone(), vec![range.clone()]);
-    let indexed = UOp::index(bufferized.clone(), vec![range]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(bufferized.clone()).indices(vec![range]).call().unwrap();
 
     let matcher = buffer_folding();
     let result = graph_rewrite(&matcher, indexed.clone(), &mut ());

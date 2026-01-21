@@ -127,13 +127,12 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
                 _ => None,
             });
 
-            if let Some(k) = kernel {
-                if let Some(&idx) = kernel_idx.get(&k.id) {
+            if let Some(k) = kernel
+                && let Some(&idx) = kernel_idx.get(&k.id) {
                     // Use buf_uop() to get underlying buffer ID (handles AFTER chains)
                     let buf_id = passthrough.buf_uop().id;
                     buf_to_writer.insert(buf_id, idx);
                 }
-            }
         }
     }
 
@@ -151,11 +150,10 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
                 };
 
                 // If another kernel writes this buffer, we depend on it
-                if let Some(&writer_idx) = buf_to_writer.get(&buf_id) {
-                    if writer_idx != idx {
+                if let Some(&writer_idx) = buf_to_writer.get(&buf_id)
+                    && writer_idx != idx {
                         dependencies[idx].insert(writer_idx);
                     }
-                }
             }
         }
     }
@@ -822,9 +820,10 @@ mod tests {
 
         // Create a simple kernel for testing
         let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
-        let index = UOp::const_(DType::Int32, ConstValue::Int(0));
+        let idx = UOp::index_const(0);
         let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let store = UOp::store(buffer.clone(), index, value);
+        let index = UOp::index().buffer(buffer.clone()).indices(vec![idx]).call().unwrap();
+        let store = UOp::store(index, value);
         let sink = UOp::sink(vec![store]);
 
         let mut sources = SmallVec::new();

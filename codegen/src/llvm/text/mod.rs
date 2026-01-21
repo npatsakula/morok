@@ -202,26 +202,11 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
-        // Pre-pass: Process RANGE ops to create loops
-        // Include Reduce type so reduction loops are created
-        for node in &nodes {
-            if let Op::Range { axis_type, .. } = node.op()
-                && matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop | AxisType::Reduce)
-            {
-                render_uop(node, &mut ctx, &mut kernel);
-            }
-        }
-
-        // Main pass: process all remaining nodes
+        // Single pass: process all nodes in linearization order
+        // This ensures DefineReg allocas are emitted before any RANGE loops that use them
         for node in &nodes {
             // Skip Thread ranges (handled via thread_id parameter)
             if let Op::Range { axis_type: AxisType::Thread, .. } = node.op() {
-                continue;
-            }
-            // Skip RANGE ops that were already processed in pre-pass
-            if let Op::Range { axis_type, .. } = node.op()
-                && matches!(axis_type, AxisType::Outer | AxisType::Global | AxisType::Loop | AxisType::Reduce)
-            {
                 continue;
             }
             render_uop(node, &mut ctx, &mut kernel);
@@ -277,7 +262,8 @@ fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
     let buffer_id = def_global.id;
 
     for node in nodes {
-        if let Op::Store { buffer, .. } = node.op() {
+        // Use store_buffer() helper to get buffer from STORE via its INDEX child
+        if let Some(buffer) = node.store_buffer() {
             if buffer.id == buffer_id {
                 return true;
             }
@@ -291,27 +277,65 @@ fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
     false
 }
 
+/// Convert LLVM type syntax to mangled intrinsic suffix.
+/// E.g., "<2 x float>" -> "v2f32", "float" -> "f32"
+fn mangle_type(llvm_type: &str) -> String {
+    match llvm_type {
+        "float" => "f32".to_string(),
+        "double" => "f64".to_string(),
+        "half" => "f16".to_string(),
+        "i8" => "i8".to_string(),
+        "i16" => "i16".to_string(),
+        "i32" => "i32".to_string(),
+        "i64" => "i64".to_string(),
+        _ if llvm_type.starts_with('<') && llvm_type.ends_with('>') => {
+            // Parse vector type: "<N x type>"
+            let inner = &llvm_type[1..llvm_type.len() - 1];
+            let parts: Vec<&str> = inner.split(" x ").collect();
+            if parts.len() == 2 {
+                let count = parts[0].trim();
+                let base = mangle_type(parts[1].trim());
+                format!("v{count}{base}")
+            } else {
+                llvm_type.to_string() // fallback
+            }
+        }
+        _ => llvm_type.to_string(),
+    }
+}
+
 /// Generate LLVM intrinsic declarations used in the kernel.
 fn generate_intrinsic_declarations(kernel: &[String]) -> String {
     let mut decls = Vec::new();
     let kernel_str = kernel.join("\n");
 
-    // Float intrinsics
+    // Float intrinsics - check for both scalar and vector types
     for intrinsic in &[
         "sqrt", "exp", "exp2", "log", "log2", "sin", "cos", "pow", "fabs", "floor", "ceil", "trunc", "round", "maxnum",
         "minnum", "fmuladd", "erf",
     ] {
-        for llvm_type in &["float", "double", "half", "<4 x float>", "<8 x float>", "<4 x double>"] {
-            let pattern = format!("@llvm.{intrinsic}.{llvm_type}");
+        // Scalar and vector types to check
+        for llvm_type in &[
+            "float",
+            "double",
+            "half",
+            "<2 x float>",
+            "<4 x float>",
+            "<8 x float>",
+            "<2 x double>",
+            "<4 x double>",
+        ] {
+            let mangled = mangle_type(llvm_type);
+            let pattern = format!("@llvm.{intrinsic}.{mangled}");
             if kernel_str.contains(&pattern) {
                 let decl = match *intrinsic {
                     "fmuladd" => format!(
-                        "declare {llvm_type} @llvm.{intrinsic}.{llvm_type}({llvm_type}, {llvm_type}, {llvm_type})"
+                        "declare {llvm_type} @llvm.{intrinsic}.{mangled}({llvm_type}, {llvm_type}, {llvm_type})"
                     ),
                     "pow" | "maxnum" | "minnum" => {
-                        format!("declare {llvm_type} @llvm.{intrinsic}.{llvm_type}({llvm_type}, {llvm_type})")
+                        format!("declare {llvm_type} @llvm.{intrinsic}.{mangled}({llvm_type}, {llvm_type})")
                     }
-                    _ => format!("declare {llvm_type} @llvm.{intrinsic}.{llvm_type}({llvm_type})"),
+                    _ => format!("declare {llvm_type} @llvm.{intrinsic}.{mangled}({llvm_type})"),
                 };
                 decls.push(decl);
             }
@@ -358,7 +382,7 @@ mod tests {
 
         let add = UOp::new(Op::Binary(BinaryOp::Add, a_load, b_load), DType::Float32);
 
-        let store = UOp::store(out, out_idx, add);
+        let store = UOp::store(out_idx, add);
         let sink = UOp::sink(vec![store]);
 
         let result = render(&sink, Some("test_add")).unwrap();

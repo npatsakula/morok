@@ -261,14 +261,14 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
         println!("  {} [{:?}]", op_name, node.dtype());
     }
 
-    // Check that INDEX operations exist and have element dtype
+    // Check that INDEX operations exist for buffer access.
     // NOTE: After aligning with Tinygrad, INDEX operations may reference BUFFER nodes
     // directly (the BUFFER → DEFINE_GLOBAL conversion happens in the AST but the
     // kernel sources maintain the original BUFFER references).
     //
-    // INDEX dtype is the element type (from UOp::index constructor), not Ptr.
-    // The Ptr dtype transformation happens in pm_add_loads during post-optimization,
-    // which is NOT part of run_kernel_split_pipeline.
+    // INDEX dtype can be either:
+    // - Element dtype (for LOAD sources, before pm_add_loads transforms them)
+    // - Ptr dtype (for STORE targets, created in bufferize_to_store)
     let topo = kernelized.toposort();
     let index_on_buffer = topo
         .iter()
@@ -280,16 +280,6 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
             }
         })
         .collect::<Vec<_>>();
-
-    // All INDEX nodes should have element dtype (not Ptr)
-    // pm_add_loads transforms this to Ptr later in post-optimization
-    for index_node in &index_on_buffer {
-        assert!(
-            !matches!(index_node.dtype(), DType::Ptr { .. }),
-            "INDEX should have element dtype (before pm_add_loads), got {:?}",
-            index_node.dtype()
-        );
-    }
 
     // There should be INDEX operations for input buffers
     assert!(!index_on_buffer.is_empty(), "Pipeline should create INDEX operations for input buffers");

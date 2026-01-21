@@ -40,7 +40,7 @@ fn create_index_bufferize(
     opts: BufferizeOpts,
 ) -> Arc<UOp> {
     let bufferized = UOp::bufferize(src, buf_ranges, opts);
-    UOp::index(bufferized, idx_ranges).expect("Failed to create INDEX")
+    UOp::index().buffer(bufferized).indices(idx_ranges).call().expect("Failed to create INDEX")
 }
 
 /// Create a simple computation graph for testing.
@@ -55,7 +55,11 @@ fn create_simple_graph(ctx: &mut IndexingContext) -> (Arc<UOp>, Arc<UOp>, Arc<UO
     let range2 = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create INDEX(buffer, [r1, r2])
-    let indexed = UOp::index(buffer.clone(), vec![range1.clone(), range2.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index()
+        .buffer(buffer.clone())
+        .indices(vec![range1.clone(), range2.clone()])
+        .call()
+        .expect("Failed to create INDEX");
 
     // Create simple ADD operation
     let one = UOp::native_const(1.0f32);
@@ -85,7 +89,8 @@ fn create_multi_buffer_graph(
     // Create buffers and index them
     let mut compute = {
         let buffer = create_test_buffer(100, DType::Float32, 0);
-        let indexed = UOp::index(buffer.clone(), ranges.clone()).expect("Failed to create INDEX");
+        let indexed =
+            UOp::index().buffer(buffer.clone()).indices(ranges.clone()).call().expect("Failed to create INDEX");
         buffers.push(buffer);
         indexed
     };
@@ -93,7 +98,8 @@ fn create_multi_buffer_graph(
     // Add more buffers to the computation
     for i in 1..num_buffers {
         let buffer = create_test_buffer(100, DType::Float32, i);
-        let indexed = UOp::index(buffer.clone(), ranges.clone()).expect("Failed to create INDEX");
+        let indexed =
+            UOp::index().buffer(buffer.clone()).indices(ranges.clone()).call().expect("Failed to create INDEX");
         compute = compute.try_add(&indexed).expect("Failed to create ADD");
         buffers.push(buffer);
     }
@@ -131,7 +137,8 @@ fn create_ratio_test_graph(
     let ranges = vec![range1, range2];
 
     // Create simple computation: just index the buffer
-    let compute = UOp::index(input_buffer.clone(), ranges.clone()).expect("Failed to create INDEX");
+    let compute =
+        UOp::index().buffer(input_buffer.clone()).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     (input_buffer, output_size, ranges, compute)
 }
@@ -150,7 +157,7 @@ fn create_reduce_graph(ctx: &mut IndexingContext, has_buffer_access: bool) -> (V
     let compute = if has_buffer_access {
         // Create computation that accesses a buffer
         let buffer = create_test_buffer(800, DType::Float32, 1); // 10 * 20 * 4 bytes
-        let indexed = UOp::index(buffer, all_ranges.clone()).expect("Failed to create INDEX");
+        let indexed = UOp::index().buffer(buffer).indices(all_ranges.clone()).call().expect("Failed to create INDEX");
 
         // Create REDUCE operation that accesses the buffer
         // Op::Reduce takes: src, ranges (the reduce axes), reduce_op
@@ -352,9 +359,9 @@ fn test_accessed_buffers_with_duplicates() {
     let ranges = vec![range1.clone(), range2.clone()];
 
     // Access the same buffer multiple times
-    let idx1 = UOp::index(buffer.clone(), ranges.clone()).expect("Failed to create INDEX");
-    let idx2 = UOp::index(buffer.clone(), ranges.clone()).expect("Failed to create INDEX");
-    let idx3 = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
+    let idx1 = UOp::index().buffer(buffer.clone()).indices(ranges.clone()).call().expect("Failed to create INDEX");
+    let idx2 = UOp::index().buffer(buffer.clone()).indices(ranges.clone()).call().expect("Failed to create INDEX");
+    let idx3 = UOp::index().buffer(buffer).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     // Create compute: idx1 + idx2 + idx3 (all same buffer)
     let compute = idx1.try_add(&idx2).expect("Failed to create ADD").try_add(&idx3).expect("Failed to create ADD");
@@ -388,10 +395,10 @@ fn test_accessed_buffers_nested_computation() {
     let buf3 = create_test_buffer(100, DType::Float32, 3);
     let buf4 = create_test_buffer(100, DType::Float32, 4);
 
-    let idx1 = UOp::index(buf1, ranges.clone()).expect("Failed to create INDEX");
-    let idx2 = UOp::index(buf2, ranges.clone()).expect("Failed to create INDEX");
-    let idx3 = UOp::index(buf3, ranges.clone()).expect("Failed to create INDEX");
-    let idx4 = UOp::index(buf4, ranges.clone()).expect("Failed to create INDEX");
+    let idx1 = UOp::index().buffer(buf1).indices(ranges.clone()).call().expect("Failed to create INDEX");
+    let idx2 = UOp::index().buffer(buf2).indices(ranges.clone()).call().expect("Failed to create INDEX");
+    let idx3 = UOp::index().buffer(buf3).indices(ranges.clone()).call().expect("Failed to create INDEX");
+    let idx4 = UOp::index().buffer(buf4).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     let left = idx1.try_add(&idx2).expect("Failed to create ADD");
     let right = idx3.try_add(&idx4).expect("Failed to create ADD");
@@ -522,7 +529,7 @@ fn test_out_in_ratio_flash_attention_simulation() {
     let ranges = vec![range1, range2];
 
     // Simple computation accessing the large buffer
-    let compute = UOp::index(input_buffer, ranges.clone()).expect("Failed to create INDEX");
+    let compute = UOp::index().buffer(input_buffer).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -554,7 +561,7 @@ fn test_out_in_ratio_symbolic_sizes() {
     let ranges = vec![range.clone()];
 
     // Create computation
-    let compute = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
+    let compute = UOp::index().buffer(buffer).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -616,7 +623,7 @@ fn test_buffer_not_in_reduce_full_removal() {
     let ranges = vec![range1.clone(), range2.clone()];
 
     // Just index + add (no reduce)
-    let indexed = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(ranges.clone()).call().expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
@@ -677,7 +684,7 @@ fn test_reduce_without_buffer_access_full_removal() {
 
     // Create a separate buffer access
     let buffer = create_test_buffer(100, DType::Float32, 2);
-    let buffer_indexed = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
+    let buffer_indexed = UOp::index().buffer(buffer).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     // Combine: buffer_access + reduce_const
     let compute = buffer_indexed.try_add(&reduce_compute).expect("Failed to create ADD");
@@ -711,7 +718,7 @@ fn test_multiple_reduces_with_buffer() {
     let ranges = vec![loop_range.clone(), reduce_range1.clone(), reduce_range2.clone()];
 
     // Create INDEX(buffer, ranges)
-    let indexed = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     // Create nested REDUCE: reduce over axis1, then axis2
     let reduce1 = UOp::new(
@@ -750,7 +757,7 @@ fn test_nested_reduce_with_buffer() {
     let outer_reduce_range = ctx.new_range(&SInt::Const(10), AxisType::Reduce);
     let ranges = vec![outer_reduce_range.clone()];
 
-    let indexed = UOp::index(buffer, ranges.clone()).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     // Inner reduce (on the indexed buffer)
     let inner_reduce_range = ctx.new_range(&SInt::Const(5), AxisType::Reduce);
@@ -853,7 +860,7 @@ fn test_pattern4_full_removal_with_permissive_config() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Compute: just index the buffer
-    let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
     let compute = indexed;
 
     // Create INDEX(BUFFERIZE(compute, [range]), [range])
@@ -891,7 +898,8 @@ fn test_pattern4_keeps_efficient_buffer() {
     let input_buffer = create_test_buffer(40, DType::Float32, 1);
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop); // 10 * 4 = 40 bytes
 
-    let indexed = UOp::index(input_buffer, vec![range.clone()]).expect("Failed to create INDEX");
+    let indexed =
+        UOp::index().buffer(input_buffer).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
     let compute = indexed;
 
     // Create INDEX(BUFFERIZE(compute, [range]), [range])
@@ -975,7 +983,7 @@ fn test_partial_contiguous_single_reduce() {
     let all_ranges = vec![loop_range.clone(), reduce_range.clone()];
 
     // Create computation: REDUCE(INDEX(buffer, [loop, reduce]), [reduce])
-    let indexed = UOp::index(buffer, all_ranges.clone()).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(all_ranges.clone()).call().expect("Failed to create INDEX");
     let reduce = UOp::new(
         Op::Reduce { src: indexed, ranges: vec![reduce_range.clone()].into(), reduce_op: morok_ir::ReduceOp::Add },
         DType::Float32,
@@ -984,7 +992,7 @@ fn test_partial_contiguous_single_reduce() {
     // Create INDEX(BUFFERIZE(reduce, [loop]), [loop])
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(reduce.clone(), vec![loop_range.clone()], opts);
-    let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
+    let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
     // Apply rewrite - should apply partial contiguous
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
@@ -1011,7 +1019,7 @@ fn test_partial_contiguous_local_axis() {
     let all_ranges = vec![loop_range.clone(), local_range.clone()];
 
     // Create computation that indexes buffer with both dimensions
-    let indexed = UOp::index(buffer, all_ranges.clone()).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(all_ranges.clone()).call().expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
     let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
@@ -1043,7 +1051,7 @@ fn test_partial_contiguous_mixed_axes() {
     let all_ranges = vec![loop_range.clone(), reduce_range.clone()];
 
     // Create REDUCE accessing buffer
-    let indexed = UOp::index(buffer, all_ranges.clone()).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(all_ranges.clone()).call().expect("Failed to create INDEX");
     let reduce = UOp::new(
         Op::Reduce { src: indexed, ranges: vec![reduce_range].into(), reduce_op: morok_ir::ReduceOp::Max },
         DType::Float32,
@@ -1052,7 +1060,7 @@ fn test_partial_contiguous_mixed_axes() {
     // Create INDEX(BUFFERIZE(reduce, [loop]), [loop])
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);
-    let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
+    let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
     // Apply rewrite
     let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
@@ -1078,13 +1086,16 @@ fn test_partial_contiguous_different_reduce_ops() {
         let loop_range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
         let reduce_range = ctx.new_range(&SInt::Const(10), AxisType::Reduce);
 
-        let indexed =
-            UOp::index(buffer, vec![loop_range.clone(), reduce_range.clone()]).expect("Failed to create INDEX");
+        let indexed = UOp::index()
+            .buffer(buffer)
+            .indices(vec![loop_range.clone(), reduce_range.clone()])
+            .call()
+            .expect("Failed to create INDEX");
         let reduce = UOp::reduce(indexed, smallvec::smallvec![reduce_range], reduce_op);
 
         let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
         let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);
-        let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
+        let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
         // Apply rewrite - should not panic regardless of reduce op
         let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
@@ -1108,7 +1119,10 @@ fn test_partial_contiguous_multi_dimensional_reduce() {
     let reduce_range2 = ctx.new_range(&SInt::Const(10), AxisType::Reduce);
 
     // Index buffer with all three dimensions
-    let indexed = UOp::index(buffer, vec![loop_range.clone(), reduce_range1.clone(), reduce_range2.clone()])
+    let indexed = UOp::index()
+        .buffer(buffer)
+        .indices(vec![loop_range.clone(), reduce_range1.clone(), reduce_range2.clone()])
+        .call()
         .expect("Failed to create INDEX");
 
     // Reduce over both reduce dimensions
@@ -1124,7 +1138,7 @@ fn test_partial_contiguous_multi_dimensional_reduce() {
     // Create INDEX(BUFFERIZE(reduce, [loop]), [loop])
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);
-    let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
+    let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
     // Apply rewrite
     let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
@@ -1151,10 +1165,10 @@ fn test_partial_contiguous_blocked_by_heuristics() {
     let reduce_range = ctx.new_range(&SInt::Const(10), AxisType::Reduce);
 
     // Index all buffers
-    let idx1 = UOp::index(buf1, vec![loop_range.clone()]).expect("Failed to create INDEX");
-    let idx2 = UOp::index(buf2, vec![loop_range.clone()]).expect("Failed to create INDEX");
-    let idx3 = UOp::index(buf3, vec![loop_range.clone()]).expect("Failed to create INDEX");
-    let idx4 = UOp::index(buf4, vec![loop_range.clone()]).expect("Failed to create INDEX");
+    let idx1 = UOp::index().buffer(buf1).indices(vec![loop_range.clone()]).call().expect("Failed to create INDEX");
+    let idx2 = UOp::index().buffer(buf2).indices(vec![loop_range.clone()]).call().expect("Failed to create INDEX");
+    let idx3 = UOp::index().buffer(buf3).indices(vec![loop_range.clone()]).call().expect("Failed to create INDEX");
+    let idx4 = UOp::index().buffer(buf4).indices(vec![loop_range.clone()]).call().expect("Failed to create INDEX");
 
     // Combine them
     let add1 = idx1.try_add(&idx2).expect("Failed to create ADD");
@@ -1170,7 +1184,7 @@ fn test_partial_contiguous_blocked_by_heuristics() {
     // Create INDEX(BUFFERIZE(reduce, [loop]), [loop])
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);
-    let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
+    let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
     // Apply rewrite - should be blocked by accessed_buffers heuristic
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
@@ -1196,7 +1210,7 @@ fn test_edge_case_empty_computation() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create INDEX(buffer) - minimal computation
-    let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
 
     // Bufferize it
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
@@ -1274,7 +1288,7 @@ fn test_edge_case_zero_sized_range() {
     let zero_range = ctx.new_range(&SInt::Const(0), AxisType::Loop);
 
     // Create computation with zero-sized range
-    let indexed = UOp::index(buffer, vec![zero_range.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![zero_range.clone()]).call().expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
     let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
@@ -1333,7 +1347,7 @@ fn test_config_custom_ratio_threshold() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create simple computation: INDEX(buffer) + const
-    let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
@@ -1374,7 +1388,7 @@ fn test_config_level_0_vs_2() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create INDEX(BUFFERIZE(...)) pattern that triggers Pattern 4
-    let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
@@ -1487,7 +1501,7 @@ fn test_pipeline_preserves_graph_structure() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create a computation chain: INDEX(buf) → MUL → ADD
-    let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
     let mul = indexed.try_mul(&two).expect("Failed to create MUL");
     let one = UOp::native_const(1.0f32);
@@ -1554,14 +1568,14 @@ fn test_symbolic_buffer_size_handling() {
         DType::Index,
     );
 
-    let indexed = UOp::index(buffer, vec![concrete_range]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![concrete_range]).call().expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     // Bufferize with symbolic range
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(compute, vec![symbolic_range.clone()], opts);
-    let idx_buf = UOp::index(bufferized, vec![symbolic_range]).expect("Failed to create INDEX");
+    let idx_buf = UOp::index().buffer(bufferized).indices(vec![symbolic_range]).call().expect("Failed to create INDEX");
 
     // Apply rewrite - should handle gracefully (ratio calculation returns None)
     let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
@@ -1585,14 +1599,14 @@ fn test_all_symbolic_sizes() {
     // Create symbolic buffer (we can't, so use concrete buffer)
     let buffer = create_test_buffer(4096, DType::Float32, 1);
 
-    let indexed = UOp::index(buffer, vec![range_n.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![range_n.clone()]).call().expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
     let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
     // Bufferize with symbolic ranges
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(compute, vec![range_m.clone()], opts);
-    let idx_buf = UOp::index(bufferized, vec![range_m]).expect("Failed to create INDEX");
+    let idx_buf = UOp::index().buffer(bufferized).indices(vec![range_m]).call().expect("Failed to create INDEX");
 
     // Apply rewrite - should not crash with symbolic sizes
     let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
@@ -1618,14 +1632,19 @@ fn test_mixed_concrete_symbolic_sizes() {
     let symbolic_range = UOp::range_axis(batch, AxisId::Renumbered(1), AxisType::Loop);
 
     let buffer = create_test_buffer(40, DType::Float32, 1);
-    let indexed = UOp::index(buffer, vec![concrete_range.clone()]).expect("Failed to create INDEX");
+    let indexed =
+        UOp::index().buffer(buffer).indices(vec![concrete_range.clone()]).call().expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     // Bufferize with mixed ranges
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(compute, vec![concrete_range.clone(), symbolic_range.clone()], opts);
-    let idx_buf = UOp::index(bufferized, vec![concrete_range, symbolic_range]).expect("Failed to create INDEX");
+    let idx_buf = UOp::index()
+        .buffer(bufferized)
+        .indices(vec![concrete_range, symbolic_range])
+        .call()
+        .expect("Failed to create INDEX");
 
     // Apply rewrite
     let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
@@ -1649,7 +1668,8 @@ fn test_complex_diamond_pattern() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create diamond: indexed → mul1, mul2 → add
-    let indexed = UOp::index(buffer.clone(), vec![range.clone()]).expect("Failed to create INDEX");
+    let indexed =
+        UOp::index().buffer(buffer.clone()).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
     let three = UOp::native_const(3.0f32);
 
@@ -1679,7 +1699,7 @@ fn test_complex_deep_computation_chain() {
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
     // Create chain: INDEX(buf) → +1 → +2 → +3 → +4 → +5
-    let indexed = UOp::index(buffer, vec![range.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
     let mut current = indexed;
 
     for i in 1..=5 {
@@ -1711,7 +1731,7 @@ fn test_complex_multiple_independent_buffers() {
     let mut adds = vec![];
     for i in 0..5 {
         let buf = create_test_buffer(40, DType::Float32, i);
-        let idx = UOp::index(buf, vec![range.clone()]).expect("Failed to create INDEX");
+        let idx = UOp::index().buffer(buf).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
         adds.push(idx);
     }
 
@@ -1746,15 +1766,22 @@ fn test_complex_multiple_sequential_reduces() {
     let reduce_range2 = ctx.new_range(&SInt::Const(40), AxisType::Reduce);
 
     // First reduce
-    let indexed1 =
-        UOp::index(buffer.clone(), vec![loop_range.clone(), reduce_range1.clone()]).expect("Failed to create INDEX");
+    let indexed1 = UOp::index()
+        .buffer(buffer.clone())
+        .indices(vec![loop_range.clone(), reduce_range1.clone()])
+        .call()
+        .expect("Failed to create INDEX");
     let reduce1 = UOp::new(
         Op::Reduce { src: indexed1, ranges: vec![reduce_range1].into(), reduce_op: morok_ir::ReduceOp::Add },
         DType::Float32,
     );
 
     // Second reduce (conceptually, though this doesn't make practical sense)
-    let indexed2 = UOp::index(buffer, vec![loop_range.clone(), reduce_range2.clone()]).expect("Failed to create INDEX");
+    let indexed2 = UOp::index()
+        .buffer(buffer)
+        .indices(vec![loop_range.clone(), reduce_range2.clone()])
+        .call()
+        .expect("Failed to create INDEX");
     let reduce2 = UOp::new(
         Op::Reduce { src: indexed2, ranges: vec![reduce_range2].into(), reduce_op: morok_ir::ReduceOp::Max },
         DType::Float32,
@@ -1766,7 +1793,7 @@ fn test_complex_multiple_sequential_reduces() {
     // Bufferize
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(combined, vec![loop_range.clone()], opts);
-    let idx_buf = UOp::index(bufferized, vec![loop_range]).expect("Failed to create INDEX");
+    let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
     // Apply rewrite
     let rewritten = graph_rewrite(&matcher, idx_buf, &mut config);
@@ -1791,7 +1818,8 @@ fn test_boundary_very_large_buffer() {
     let large_range = ctx.new_range(&SInt::Const(10000), AxisType::Loop);
     let buffer = create_test_buffer(40000, DType::Float32, 1);
 
-    let indexed = UOp::index(buffer, vec![large_range.clone()]).expect("Failed to create INDEX");
+    let indexed =
+        UOp::index().buffer(buffer).indices(vec![large_range.clone()]).call().expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
@@ -1815,7 +1843,7 @@ fn test_boundary_size_one_dimension() {
     let range1 = ctx.new_range(&SInt::Const(1), AxisType::Loop);
     let buffer = create_test_buffer(4, DType::Float32, 1);
 
-    let indexed = UOp::index(buffer, vec![range1.clone()]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![range1.clone()]).call().expect("Failed to create INDEX");
     let two = UOp::native_const(2.0f32);
     let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
@@ -1844,7 +1872,7 @@ fn test_boundary_exact_threshold_values() {
     let input_range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
     let output_range = ctx.new_range(&SInt::Const(102), AxisType::Loop); // 102 * 4 = 408 bytes
 
-    let indexed = UOp::index(buffer, vec![input_range]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(buffer).indices(vec![input_range]).call().expect("Failed to create INDEX");
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 

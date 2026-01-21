@@ -44,7 +44,7 @@ fn create_multi_buffer_computation(num_buffers: usize, device: DeviceSpec) -> (V
     // Create first buffer and index it
     let mut buffers = Vec::new();
     let buffer0 = create_test_buffer(40, DType::Float32, 0, device.clone());
-    let indexed0 = UOp::index(buffer0.clone(), ranges.clone()).expect("Failed to create INDEX");
+    let indexed0 = UOp::index().buffer(buffer0.clone()).indices(ranges.clone()).call().unwrap();
     buffers.push(buffer0);
 
     let mut computation = indexed0;
@@ -52,7 +52,7 @@ fn create_multi_buffer_computation(num_buffers: usize, device: DeviceSpec) -> (V
     // Chain additional buffers with ADD operations
     for i in 1..num_buffers {
         let buffer = create_test_buffer(40, DType::Float32, i, device.clone());
-        let indexed = UOp::index(buffer.clone(), ranges.clone()).expect("Failed to create INDEX");
+        let indexed = UOp::index().buffer(buffer.clone()).indices(ranges.clone()).call().unwrap();
         computation = computation.try_add(&indexed).expect("Failed to create ADD");
         buffers.push(buffer);
     }
@@ -349,12 +349,12 @@ fn test_no_double_materialization() {
     let ranges = vec![range.clone()];
 
     // Access first buffer
-    let indexed1 = UOp::index(buffers[0].clone(), ranges.clone()).expect("Failed to create INDEX");
+    let indexed1 = UOp::index().buffer(buffers[0].clone()).indices(ranges.clone()).call().unwrap();
 
     // Materialize it
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let materialized = UOp::bufferize(indexed1, ranges.clone(), opts);
-    let indexed_materialized = UOp::index(materialized, ranges).expect("Failed to create INDEX");
+    let indexed_materialized = UOp::index().buffer(materialized).indices(ranges).call().unwrap();
 
     // Count BUFFERIZE operations before
     let before_count = count_bufferizes(&indexed_materialized);
@@ -401,11 +401,11 @@ fn test_multiple_binary_ops() {
     }
 
     // Create a complex expression: ((((b0 + b1) + b2) + b3) + ...)
-    let indexed0 = UOp::index(buffers[0].clone(), ranges.clone()).expect("Failed");
+    let indexed0 = UOp::index().buffer(buffers[0].clone()).indices(ranges.clone()).call().unwrap();
     let mut expr = indexed0;
 
     for buffer in buffers.iter().skip(1) {
-        let indexed = UOp::index(buffer.clone(), ranges.clone()).expect("Failed");
+        let indexed = UOp::index().buffer(buffer.clone()).indices(ranges.clone()).call().unwrap();
         expr = expr.try_add(&indexed).expect("Failed to create ADD");
     }
 
@@ -435,22 +435,22 @@ fn test_ternary_op_materialization() {
 
     // Create ternary WHERE operation accessing many buffers
     // cond = (b0 > b1 && b2 > b3 && ... b8 > b9)
-    let indexed0 = UOp::index(buffers[0].clone(), ranges.clone()).expect("Failed");
-    let indexed1 = UOp::index(buffers[1].clone(), ranges.clone()).expect("Failed");
+    let indexed0 = UOp::index().buffer(buffers[0].clone()).indices(ranges.clone()).call().unwrap();
+    let indexed1 = UOp::index().buffer(buffers[1].clone()).indices(ranges.clone()).call().unwrap();
     let mut cond = indexed1.try_cmplt(&indexed0).unwrap(); // indexed0 > indexed1 => indexed1 < indexed0
 
     for i in (2..10).step_by(2) {
-        let left = UOp::index(buffers[i].clone(), ranges.clone()).expect("Failed");
-        let right = UOp::index(buffers[i + 1].clone(), ranges.clone()).expect("Failed");
+        let left = UOp::index().buffer(buffers[i].clone()).indices(ranges.clone()).call().unwrap();
+        let right = UOp::index().buffer(buffers[i + 1].clone()).indices(ranges.clone()).call().unwrap();
         let cmp = right.try_cmplt(&left).unwrap(); // a > b => b < a
         cond = cond.try_and_op(&cmp).unwrap();
     }
 
     // true_val and false_val access more buffers
-    let true_val = UOp::index(buffers[10].clone(), ranges.clone()).expect("Failed");
+    let true_val = UOp::index().buffer(buffers[10].clone()).indices(ranges.clone()).call().unwrap();
     let false_val = {
-        let b11 = UOp::index(buffers[11].clone(), ranges.clone()).expect("Failed");
-        let b12 = UOp::index(buffers[12].clone(), ranges.clone()).expect("Failed");
+        let b11 = UOp::index().buffer(buffers[11].clone()).indices(ranges.clone()).call().unwrap();
+        let b12 = UOp::index().buffer(buffers[12].clone()).indices(ranges.clone()).call().unwrap();
         b11.try_add(&b12).expect("Failed to create ADD")
     };
 

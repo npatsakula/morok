@@ -50,14 +50,17 @@ fn test_bufferize_to_store_global() {
     assert!(std::sync::Arc::ptr_eq(&end_ranges[0], &range));
 
     // Unwrap END to get STORE
-    let Op::Store { buffer, index, value, ranges } = computation.op() else {
+    let Op::Store { index, value, ranges } = computation.op() else {
         panic!("Expected STORE operation inside END, got {:?}", computation.op());
     };
 
     // STORE should have empty ranges (iteration space on END)
     assert!(ranges.is_empty());
 
-    // Buffer should be BUFFER (same as passthrough)
+    // Index should contain the buffer reference
+    let Op::Index { buffer, .. } = index.op() else {
+        panic!("Expected INDEX operation, got {:?}", index.op());
+    };
     assert!(matches!(buffer.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", buffer.op());
     assert!(std::sync::Arc::ptr_eq(buffer, &passthrough));
 
@@ -113,13 +116,17 @@ fn test_bufferize_to_store_local_with_barrier() {
     assert!(std::sync::Arc::ptr_eq(&end_ranges[0], &range));
 
     // Unwrap END to get STORE
-    let Op::Store { buffer, value, ranges, .. } = computation.op() else {
+    let Op::Store { index, value, ranges } = computation.op() else {
         panic!("Expected STORE operation inside END, got {:?}", computation.op());
     };
 
     // STORE should have empty ranges
     assert!(ranges.is_empty());
 
+    // Index should contain the buffer reference
+    let Op::Index { buffer, .. } = index.op() else {
+        panic!("Expected INDEX operation, got {:?}", index.op());
+    };
     assert!(matches!(buffer.op(), Op::DefineLocal(0)));
     assert!(std::sync::Arc::ptr_eq(value, &compute));
 
@@ -167,16 +174,12 @@ fn test_bufferize_to_store_multiple_ranges() {
     assert!(std::sync::Arc::ptr_eq(&end_ranges[1], &range2));
 
     // Unwrap END to get STORE
-    let Op::Store { buffer, index, value, ranges } = computation.op() else {
+    let Op::Store { index, value, ranges } = computation.op() else {
         panic!("Expected STORE operation inside END, got {:?}", computation.op());
     };
 
     // STORE should have empty ranges
     assert!(ranges.is_empty());
-
-    // Buffer should be BUFFER (same as passthrough)
-    assert!(matches!(buffer.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", buffer.op());
-    assert!(std::sync::Arc::ptr_eq(buffer, &passthrough));
 
     // Value should be the compute
     assert!(std::sync::Arc::ptr_eq(value, &compute));
@@ -187,8 +190,9 @@ fn test_bufferize_to_store_multiple_ranges() {
         panic!("Expected INDEX operation");
     };
 
-    // Buffer should match the STORE buffer
-    assert!(std::sync::Arc::ptr_eq(idx_buffer, buffer));
+    // Buffer should be BUFFER (same as passthrough)
+    assert!(matches!(idx_buffer.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", idx_buffer.op());
+    assert!(std::sync::Arc::ptr_eq(idx_buffer, &passthrough));
 
     // Should have 1 linearized index (not 2 separate ranges)
     assert_eq!(indices.len(), 1, "Multi-index should be linearized to single index");
@@ -303,8 +307,12 @@ fn test_bufferize_to_store_mixed_global_local() {
     assert_eq!(global_deps.len(), 1);
 
     // deps[0] should be STORE (no ranges = no END)
-    let Op::Store { buffer, value, .. } = global_deps[0].op() else {
+    let Op::Store { index, value, .. } = global_deps[0].op() else {
         panic!("Expected STORE in global AFTER deps, got {:?}", global_deps[0].op());
+    };
+    // Index should contain the buffer reference
+    let Op::Index { buffer, .. } = index.op() else {
+        panic!("Expected INDEX operation, got {:?}", index.op());
     };
     assert!(std::sync::Arc::ptr_eq(buffer, global_buf));
     assert!(std::sync::Arc::ptr_eq(value, &global_compute));
@@ -322,8 +330,12 @@ fn test_bufferize_to_store_mixed_global_local() {
     let Op::Barrier { src, .. } = local_deps[0].op() else {
         panic!("Expected BARRIER in local AFTER deps, got {:?}", local_deps[0].op());
     };
-    let Op::Store { buffer, value, .. } = src.op() else {
+    let Op::Store { index, value, .. } = src.op() else {
         panic!("Expected STORE inside BARRIER, got {:?}", src.op());
+    };
+    // Index should contain the buffer reference
+    let Op::Index { buffer, .. } = index.op() else {
+        panic!("Expected INDEX operation, got {:?}", index.op());
     };
     assert!(std::sync::Arc::ptr_eq(buffer, local_buf));
     assert!(std::sync::Arc::ptr_eq(value, &local_compute));

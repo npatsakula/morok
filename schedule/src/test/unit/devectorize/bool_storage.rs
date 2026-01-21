@@ -88,7 +88,7 @@ fn test_bool_store_to_uint8() {
     let index = create_index(buffer.clone(), 0);
     let bool_val = create_bool_const(true);
 
-    let store = create_store(buffer.clone(), index, bool_val);
+    let store = create_store(index, bool_val);
 
     let result = apply_phase3(&store);
 
@@ -117,7 +117,7 @@ fn test_non_bool_store_unchanged() {
     let index = create_index(buffer.clone(), 0);
     let float_val = create_float_const(3.0);
 
-    let store = create_store(buffer.clone(), index, float_val.clone());
+    let store = create_store(index, float_val.clone());
 
     let result = apply_phase3(&store);
 
@@ -143,7 +143,7 @@ fn test_bool_roundtrip() {
     let bool_val = create_bool_const(true);
 
     // Store bool value
-    let store = create_store(buffer.clone(), index.clone(), bool_val);
+    let store = create_store(index.clone(), bool_val);
     let store_result = apply_phase3(&store);
 
     // Load bool value
@@ -214,7 +214,7 @@ fn test_vector_bool_store() {
     let index = create_index(buffer.clone(), 0);
     let bool_vec = create_vector_bool(vec![true, false, true, false]);
 
-    let store = create_store(buffer.clone(), index, bool_vec);
+    let store = create_store(index, bool_vec);
 
     let result = apply_phase3(&store);
 

@@ -140,7 +140,7 @@ fn test_no_gate_unchanged() {
     let buffer = create_buffer(64);
     let idx = UOp::const_(DType::Index, ConstValue::Int(0));
 
-    let index = UOp::index(buffer, vec![idx]).unwrap();
+    let index = UOp::index().buffer(buffer).indices(vec![idx]).call().unwrap();
 
     let result = apply_load_store_indexing(&index);
 

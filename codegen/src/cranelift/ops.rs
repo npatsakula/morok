@@ -110,8 +110,12 @@ pub(crate) fn codegen_uop(
             Some(codegen_load(buffer_val, index_val, &uop.dtype(), builder)?)
         }
 
-        Op::Store { buffer, index, value, ranges: _ } => {
+        Op::Store { index, value, ranges: _ } => {
             // ranges are handled in the expand pass - should be empty at codegen time
+            // Get buffer from index (STORE.index is an INDEX op containing the buffer)
+            let buffer = uop
+                .store_buffer()
+                .ok_or_else(|| UnsupportedSnafu { what: "STORE index is not an INDEX op" }.build())?;
             let buffer_val = get_value(buffer, builder, values, loop_contexts)?;
             let index_val = get_value(index, builder, values, loop_contexts)?;
             let value_val = get_value(value, builder, values, loop_contexts)?;
@@ -125,7 +129,7 @@ pub(crate) fn codegen_uop(
 
             // Check if index is already an indexed pointer (from INDEX op)
             // If so, use it directly as the store address without recomputing the offset
-            // This is the common pattern: STORE { buffer: DefineGlobal, index: INDEX(...) }
+            // This is the common pattern: STORE { index: INDEX(...), ... }
             if let Op::Index { .. } = index.op() {
                 // Index is already a computed pointer - store directly to it
                 let flags = MemFlags::new();

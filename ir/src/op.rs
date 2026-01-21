@@ -270,7 +270,6 @@ pub enum Op {
         index: Arc<UOp>,
     },
     Store {
-        buffer: Arc<UOp>,
         index: Arc<UOp>,
         value: Arc<UOp>,
         ranges: SmallVec<[Arc<UOp>; 4]>,
@@ -397,8 +396,8 @@ impl Op {
 
             // Memory operations
             Self::Load { buffer, index } => SmallVec::from_slice(&[buffer, index]),
-            Self::Store { buffer, index, value, ranges } => {
-                let mut children = SmallVec::from_slice(&[buffer, index, value]);
+            Self::Store { index, value, ranges } => {
+                let mut children = SmallVec::from_slice(&[index, value]);
                 children.extend(ranges.iter());
                 children
             }
@@ -454,7 +453,7 @@ impl Op {
     /// Operations that end ranges:
     /// - BUFFERIZE: ranges start at index 1 (compute is 0, ranges are 1+)
     /// - REDUCE: ranges start at index 1 (src is 0, ranges are 1+)
-    /// - STORE: ranges start at index 2 (buffer=0, index=1, value=2)
+    /// - STORE: ranges start at index 2 (index=0, value=1, ranges=2+)
     /// - WMMA: ranges start at index 3 (a=0, b=1, c=2)
     /// - END: ranges start at index 1 (computation=0, ranges=1+)
     ///
@@ -479,13 +478,13 @@ impl Op {
         // Source layout for range-ending ops:
         // - BUFFERIZE: compute=0, ranges=1+
         // - REDUCE: src=0, ranges=1+
-        // - STORE: buffer=0, index=1, value=2, ranges=3+
+        // - STORE: index=0, value=1, ranges=2+
         // - WMMA: a=0, b=1, c=2, (ranges start at 3)
         // - END: computation=0, ranges=1+
         match self {
             Self::Bufferize { .. } => Some(1),
             Self::Reduce { .. } => Some(1),
-            Self::Store { .. } => Some(3),
+            Self::Store { .. } => Some(2),
             Self::Wmma { .. } => Some(3),
             Self::End { .. } => Some(1),
             _ => None,

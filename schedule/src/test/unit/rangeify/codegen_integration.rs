@@ -98,17 +98,19 @@ fn test_no_cycle_valid_access_pattern() {
     // Create a valid pattern: LOAD from input buffer, STORE to output buffer
     let in_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
+    let const_idx = UOp::index_const(0);
 
-    // LOAD from input
-    let loaded = UOp::load().buffer(in_buf.clone()).index(index.clone()).call();
+    // LOAD from input using INDEX node
+    let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let loaded = UOp::load().buffer(in_buf.clone()).index(load_idx).call();
 
     // Compute something
     let const_val = UOp::native_const(2.0f32);
     let computed = loaded.try_mul(&const_val).unwrap();
 
-    // STORE to output
-    let store = UOp::store(out_buf.clone(), index, computed);
+    // STORE to output using INDEX node
+    let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![const_idx]).call().unwrap();
+    let store = UOp::store(store_idx, computed);
 
     // Should not panic - valid access pattern
     #[allow(clippy::mutable_key_type)]
@@ -124,10 +126,11 @@ fn test_no_cycle_valid_access_pattern() {
 #[test]
 fn test_split_store_simple_kernel() {
     // Create a simple STORE operation
-    let buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(buffer.clone(), index, value);
+    let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
+    let store = UOp::store(store_idx, value);
 
     // split_store may succeed if the STORE has no non-OUTER ranges in scope
     let result = call_split_store(&store);
@@ -147,10 +150,11 @@ fn test_split_store_simple_kernel() {
 #[test]
 fn test_split_store_with_loop_ranges() {
     // Create a STORE with LOOP ranges
-    let buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(buffer, index, value);
+    let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
+    let store = UOp::store(store_idx, value);
 
     // Wrap in END with LOOP range
     let range_end = UOp::index_const(10);
@@ -196,17 +200,20 @@ fn test_multiple_buffer_integration() {
     let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
+    let const_idx = UOp::index_const(0);
 
-    // LOAD from both inputs
-    let load1 = UOp::load().buffer(buf1.clone()).index(index.clone()).call();
-    let load2 = UOp::load().buffer(buf2.clone()).index(index.clone()).call();
+    // LOAD from both inputs using INDEX nodes
+    let load1_idx = UOp::index().buffer(buf1.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let load1 = UOp::load().buffer(buf1.clone()).index(load1_idx).call();
+    let load2_idx = UOp::index().buffer(buf2.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let load2 = UOp::load().buffer(buf2.clone()).index(load2_idx).call();
 
     // Compute sum
     let sum = load1.try_add(&load2).unwrap();
 
-    // STORE to output
-    let store = UOp::store(out_buf.clone(), index, sum);
+    // STORE to output using INDEX node
+    let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![const_idx]).call().unwrap();
+    let store = UOp::store(store_idx, sum);
 
     // Verify cycle detection works
     #[allow(clippy::mutable_key_type)]
@@ -220,15 +227,16 @@ fn test_multiple_buffer_integration() {
 #[test]
 fn test_end_store_structure() {
     // Create STORE
-    let buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(buffer, index, value);
+    let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
+    let store = UOp::store(store_idx, value);
 
     // Wrap in END (normal pipeline output)
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::end(store.clone(), vec![range].into());
+    let end = UOp::end(store, vec![range].into());
 
     // Verify END wraps STORE correctly before transformation
     if let Op::End { computation, .. } = end.op() {

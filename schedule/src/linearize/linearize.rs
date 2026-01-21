@@ -3,7 +3,6 @@
 //! Converts a UOp DAG into a linear instruction sequence suitable for
 //! GPU/NPU backends that require sequential instruction streams.
 
-use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
@@ -157,8 +156,10 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
     }
 
     // Step 4: Heap-based linearization
-    // Use just OrderKey in heap (it's fully Ord), look up UOp by ID
-    let mut heap: BinaryHeap<Reverse<OrderKey>> = BinaryHeap::new();
+    // Use MAX-heap: larger OrderKey (worse priority) popped first.
+    // After reversal, better priority nodes appear earlier in output.
+    // This matches Tinygrad's use of -nkey in a min-heap.
+    let mut heap: BinaryHeap<OrderKey> = BinaryHeap::new();
 
     let sink_key = priorities.get(&UOpKey(sink.clone())).cloned().unwrap_or(OrderKey {
         run_count: 0,
@@ -167,12 +168,12 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
         ideal_pos: 0,
         id: sink.id,
     });
-    heap.push(Reverse(sink_key));
+    heap.push(sink_key);
 
     let mut result = Vec::with_capacity(nodes.len());
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    while let Some(Reverse(order_key)) = heap.pop() {
+    while let Some(order_key) = heap.pop() {
         let u_id = order_key.id;
 
         // Skip if already processed (can happen with diamond dependencies)
@@ -197,7 +198,7 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
                 if *deg == 0 && !visited.contains(&src.id) {
                     // All consumers processed, add to heap
                     if let Some(src_order_key) = priorities.get(&src_key) {
-                        heap.push(Reverse(src_order_key.clone()));
+                        heap.push(src_order_key.clone());
                     }
                 }
             }

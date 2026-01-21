@@ -744,13 +744,12 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
         }
 
         Op::Store { .. } => {
-            if sources.len() >= 3 {
+            if sources.len() >= 2 {
                 Some(UOp::new(
                     Op::Store {
-                        buffer: sources[0].clone(),
-                        index: sources[1].clone(),
-                        value: sources[2].clone(),
-                        ranges: sources[3..].iter().cloned().collect(),
+                        index: sources[0].clone(),
+                        value: sources[1].clone(),
+                        ranges: sources[2..].iter().cloned().collect(),
                     },
                     dtype.clone(),
                 ))
@@ -1103,7 +1102,7 @@ fn extract_const_size(end: &Arc<UOp>) -> Option<usize> {
 /// UNROLLs in the index/value are handled by do_expand, not here.
 fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
     match store.op() {
-        Op::Store { buffer, index, value, ranges } => {
+        Op::Store { index, value, ranges } => {
             // Partition ranges into direct UNROLL ops vs non-UNROLL
             // Matching Tinygrad: partition(x.src[2:], lambda y: y.op is Ops.UNROLL)
             let (store_expand, store_range): (Vec<_>, Vec<_>) =
@@ -1131,12 +1130,8 @@ fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
             );
 
             // Create new STORE with only non-UNROLL ranges
-            let new_store = UOp::store_with_ranges(
-                buffer.clone(),
-                index.clone(),
-                value.clone(),
-                store_range.into_iter().cloned().collect(),
-            );
+            let new_store =
+                UOp::store_with_ranges(index.clone(), value.clone(), store_range.into_iter().cloned().collect());
 
             // Wrap in CONTRACT with void dtype (matching Tinygrad)
             Some(UOp::contract(new_store, contract_axes))

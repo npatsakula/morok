@@ -589,7 +589,7 @@ fn test_nested_struct_field_extraction() {
 
     // Create: INDEX(BUFFERIZE(compute, [r1, r2]), [r1, r2])
     let buf = UOp::bufferize(compute.clone(), vec![range1.clone(), range2.clone()], opts);
-    let idx = UOp::index(buf, vec![range1.clone(), range2.clone()]).unwrap();
+    let idx = UOp::index().buffer(buf).indices(vec![range1.clone(), range2.clone()]).call().unwrap();
 
     // Should match and return compute (ranges.len() == indices.len())
     match matcher.rewrite(&idx, &mut ()) {
@@ -617,7 +617,7 @@ fn test_nested_struct_field_extraction_mismatch() {
 
     // Create: INDEX(BUFFERIZE(compute, [r1, r2]), [r1]) - different lengths
     let buf = UOp::bufferize(compute.clone(), vec![range1.clone(), range2], opts);
-    let idx = UOp::index(buf, vec![range1]).unwrap();
+    let idx = UOp::index().buffer(buf).indices(vec![range1]).call().unwrap();
 
     // Should NOT match because ranges.len() (2) != indices.len() (1)
     match matcher.rewrite(&idx, &mut ()) {
@@ -1098,7 +1098,7 @@ fn test_index_variable_indices() {
     let idx2 = UOp::index_const(1);
 
     // Test with 1 index (minimum for Index)
-    let index1 = UOp::index(const_val.clone(), vec![idx1.clone()]).unwrap();
+    let index1 = UOp::index().buffer(const_val.clone()).indices(vec![idx1.clone()]).call().unwrap();
     match matcher.rewrite(&index1, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 1 index");
@@ -1107,7 +1107,7 @@ fn test_index_variable_indices() {
     }
 
     // Test with 2 indices
-    let index2 = UOp::index(const_val.clone(), vec![idx1.clone(), idx2.clone()]).unwrap();
+    let index2 = UOp::index().buffer(const_val.clone()).indices(vec![idx1.clone(), idx2.clone()]).call().unwrap();
     match matcher.rewrite(&index2, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with 2 indices");
@@ -1117,7 +1117,7 @@ fn test_index_variable_indices() {
 
     // Test with gate (optional field) - use index_gated constructor
     let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
-    let index_gated = UOp::index_gated(const_val.clone(), vec![idx1], gate).unwrap();
+    let index_gated = UOp::index().buffer(const_val.clone()).indices(vec![idx1]).gate(gate).call().unwrap();
     match matcher.rewrite(&index_gated, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &const_val), "Should rewrite to const_val with gate");
@@ -1146,7 +1146,7 @@ fn test_index_gate_bare_binding() {
     let gate_val = UOp::const_(DType::Bool, ConstValue::Int(1));
 
     // Test ungated index
-    let ungated = UOp::index(buffer.clone(), vec![idx.clone()]).unwrap();
+    let ungated = UOp::index().buffer(buffer.clone()).indices(vec![idx.clone()]).call().unwrap();
     match matcher.rewrite(&ungated, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &buffer), "Should return buffer when no gate");
@@ -1155,7 +1155,7 @@ fn test_index_gate_bare_binding() {
     }
 
     // Test gated index
-    let gated = UOp::index_gated(buffer.clone(), vec![idx], gate_val.clone()).unwrap();
+    let gated = UOp::index().buffer(buffer.clone()).indices(vec![idx]).gate(gate_val.clone()).call().unwrap();
     match matcher.rewrite(&gated, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &gate_val), "Should return gate when present");
@@ -1620,7 +1620,7 @@ fn test_option_none_pattern() {
     let idx = UOp::index_const(0);
 
     // Ungated index should match
-    let ungated = UOp::index(buffer.clone(), vec![idx.clone()]).unwrap();
+    let ungated = UOp::index().buffer(buffer.clone()).indices(vec![idx.clone()]).call().unwrap();
     match matcher.rewrite(&ungated, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &buffer), "Should extract buffer from ungated Index");
@@ -1630,7 +1630,7 @@ fn test_option_none_pattern() {
 
     // Gated index should NOT match
     let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
-    let gated = UOp::index_gated(buffer.clone(), vec![idx], gate).unwrap();
+    let gated = UOp::index().buffer(buffer.clone()).indices(vec![idx]).gate(gate).call().unwrap();
     match matcher.rewrite(&gated, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
         _ => panic!("Index with gate: Some(_) should NOT match gate: None pattern"),
@@ -1649,7 +1649,7 @@ fn test_option_some_pattern() {
     let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
 
     // Gated index should match and extract the gate
-    let gated = UOp::index_gated(buffer.clone(), vec![idx.clone()], gate.clone()).unwrap();
+    let gated = UOp::index().buffer(buffer.clone()).indices(vec![idx.clone()]).gate(gate.clone()).call().unwrap();
     match matcher.rewrite(&gated, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &gate), "Should extract gate from gated Index");
@@ -1658,7 +1658,7 @@ fn test_option_some_pattern() {
     }
 
     // Ungated index should NOT match
-    let ungated = UOp::index(buffer.clone(), vec![idx]).unwrap();
+    let ungated = UOp::index().buffer(buffer.clone()).indices(vec![idx]).call().unwrap();
     match matcher.rewrite(&ungated, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
         _ => panic!("Index with gate: None should NOT match gate: Some(g) pattern"),
@@ -1674,7 +1674,7 @@ fn test_nested_index_with_gate_none() {
             indices: outer_indices,
             gate: None
         } if outer_indices.len() == 1 && inner_indices.len() == 1 => |real_buffer, inner_indices| {
-            UOp::index(real_buffer.clone(), vec![inner_indices[0].clone()]).ok()
+            UOp::index().buffer(real_buffer.clone()).indices(vec![inner_indices[0].clone()]).call().ok()
         }
     };
 
@@ -1683,8 +1683,8 @@ fn test_nested_index_with_gate_none() {
     let idx2 = UOp::index_const(10);
 
     // Create nested Index: INDEX(INDEX(real_buffer, [idx1]), [idx2])
-    let inner_idx = UOp::index(real_buffer.clone(), vec![idx1.clone()]).unwrap();
-    let outer_idx = UOp::index(inner_idx.clone(), vec![idx2.clone()]).unwrap();
+    let inner_idx = UOp::index().buffer(real_buffer.clone()).indices(vec![idx1.clone()]).call().unwrap();
+    let outer_idx = UOp::index().buffer(inner_idx.clone()).indices(vec![idx2.clone()]).call().unwrap();
 
     // Should match and return INDEX(real_buffer, [idx1])
     match matcher.rewrite(&outer_idx, &mut ()) {
@@ -1704,7 +1704,7 @@ fn test_nested_index_with_gate_none() {
 
     // With a gate on outer, should NOT match
     let gate = UOp::const_(DType::Bool, ConstValue::Int(1));
-    let gated_outer = UOp::index_gated(inner_idx.clone(), vec![idx2.clone()], gate).unwrap();
+    let gated_outer = UOp::index().buffer(inner_idx.clone()).indices(vec![idx2.clone()]).gate(gate).call().unwrap();
     match matcher.rewrite(&gated_outer, &mut ()) {
         RewriteResult::NoMatch => {} // Expected - outer gate is Some
         _ => panic!("Should NOT match when outer gate is Some"),

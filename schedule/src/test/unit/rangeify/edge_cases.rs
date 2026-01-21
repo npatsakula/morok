@@ -58,9 +58,11 @@ fn test_empty_bufferize() {
     assert_eq!(deps.len(), 1);
 
     // deps[0] should be STORE (no ranges = no END)
-    let Op::Store { value, .. } = deps[0].op() else {
+    let Op::Store { index, value, .. } = deps[0].op() else {
         panic!("Expected STORE in AFTER deps, got {:?}", deps[0].op());
     };
+    // Index should be present even though ranges is empty
+    let _ = index;
     assert!(std::sync::Arc::ptr_eq(value, &compute));
 }
 
@@ -70,7 +72,7 @@ fn test_zero_size_index() {
     let buffer = UOp::define_global(0, DType::Float32);
 
     // Create INDEX with empty indices
-    let index = UOp::index(buffer.clone(), vec![]).expect("INDEX with no indices should work");
+    let index = UOp::index().buffer(buffer.clone()).indices(vec![]).call().expect("INDEX with no indices should work");
 
     // Should be a valid INDEX
     if let Op::Index { buffer: idx_buf, indices, .. } = index.op() {

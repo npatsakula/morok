@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use morok_dtype::DType;
-use morok_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
+use morok_ir::{AxisType, BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
 use super::ctx::RenderContext;
 use super::types::{lcast, ldt};
@@ -509,9 +509,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 
         // END → loop footer
         Op::End { ranges, .. } => {
-            // Close all ranges
+            // Close all ranges (skip Thread ranges - they're handled via thread_id, not loops)
             for range in ranges.iter() {
-                if let Op::Range { axis_id, .. } = range.op() {
+                if let Op::Range { axis_id, axis_type, .. } = range.op() {
+                    // Skip Thread ranges - they don't generate actual loop structures
+                    if matches!(axis_type, AxisType::Thread) {
+                        continue;
+                    }
                     let id = axis_id.value();
                     kernel.push(format!("  br label %loop_footer_{id}"));
                     kernel.push(format!("loop_footer_{id}:"));
@@ -648,11 +652,39 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
     }
 }
 
+/// Convert LLVM type syntax to mangled intrinsic suffix.
+/// E.g., "<2 x float>" -> "v2f32", "float" -> "f32"
+fn mangle_type(llvm_type: &str) -> String {
+    match llvm_type {
+        "float" => "f32".to_string(),
+        "double" => "f64".to_string(),
+        "half" => "f16".to_string(),
+        "i8" => "i8".to_string(),
+        "i16" => "i16".to_string(),
+        "i32" => "i32".to_string(),
+        "i64" => "i64".to_string(),
+        _ if llvm_type.starts_with('<') && llvm_type.ends_with('>') => {
+            // Parse vector type: "<N x type>"
+            let inner = &llvm_type[1..llvm_type.len() - 1];
+            let parts: Vec<&str> = inner.split(" x ").collect();
+            if parts.len() == 2 {
+                let count = parts[0].trim();
+                let base = mangle_type(parts[1].trim());
+                format!("v{count}{base}")
+            } else {
+                llvm_type.to_string() // fallback
+            }
+        }
+        _ => llvm_type.to_string(),
+    }
+}
+
 /// Render an LLVM intrinsic call.
 fn render_intrinsic(dst: &str, name: &str, args: &[(&str, &str)], ret_type: &str, kernel: &mut Vec<String>) {
     let args_str: String = args.iter().map(|(ty, val)| format!("{ty} {val}")).collect::<Vec<_>>().join(", ");
+    let mangled = mangle_type(ret_type);
 
-    kernel.push(format!("  {dst} = call {ret_type} @llvm.{name}.{ret_type}({args_str})"));
+    kernel.push(format!("  {dst} = call {ret_type} @llvm.{name}.{mangled}({args_str})"));
 }
 
 /// Render binary max using intrinsic.
@@ -812,7 +844,7 @@ fn render_vectorize(dst: &str, elements: &[Arc<UOp>], ctx: &RenderContext, kerne
     let vec_type = format!("<{count} x {scalar_type}>");
 
     // Start with undef as inline value (not as separate instruction)
-    let mut prev = format!("undef");
+    let mut prev = "undef".to_string();
     for (i, elem) in elements.iter().enumerate() {
         let val = ctx.get(elem);
         let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.v{i}") };

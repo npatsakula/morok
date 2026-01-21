@@ -24,7 +24,7 @@ fn test_flatten_range_impl_no_ranges() {
     let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(buffer, index, value);
+    let store = UOp::store(index, value);
 
     let result = flatten_range_impl(&store);
     assert!(result.is_none());

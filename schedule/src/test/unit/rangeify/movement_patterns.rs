@@ -49,7 +49,7 @@ fn test_expand_index_transformation() {
     let r0 = create_range(10, 0);
     let r1 = create_range(5, 1);
     let r2 = create_range(20, 2);
-    let indexed = UOp::index(expanded, vec![r0.clone(), r1.clone(), r2.clone()]).unwrap();
+    let indexed = UOp::index().buffer(expanded).indices(vec![r0.clone(), r1.clone(), r2.clone()]).call().unwrap();
 
     // Apply pattern
     let pm = movement_op_patterns();
@@ -90,7 +90,7 @@ fn test_permute_index_transformation() {
     let r0 = create_range(20, 0); // Now indexing dimension 1 of original
     let r1 = create_range(30, 1); // Now indexing dimension 2 of original
     let r2 = create_range(10, 2); // Now indexing dimension 0 of original
-    let indexed = UOp::index(permuted, vec![r0.clone(), r1.clone(), r2.clone()]).unwrap();
+    let indexed = UOp::index().buffer(permuted).indices(vec![r0.clone(), r1.clone(), r2.clone()]).call().unwrap();
 
     // Apply pattern
     let pm = movement_op_patterns();
@@ -125,7 +125,7 @@ fn test_reshape_index_transformation() {
     // Create INDEX
     let r0 = create_range(10, 0);
     let r1 = create_range(20, 1);
-    let indexed = UOp::index(reshaped, vec![r0, r1]).unwrap();
+    let indexed = UOp::index().buffer(reshaped).indices(vec![r0, r1]).call().unwrap();
 
     // Apply pattern
     let pm = movement_op_patterns();
@@ -160,7 +160,7 @@ fn test_shrink_index_transformation() {
     // Create INDEX
     let r0 = create_range(5, 0);
     let r1 = create_range(20, 1);
-    let indexed = UOp::index(shrunk, vec![r0, r1]).unwrap();
+    let indexed = UOp::index().buffer(shrunk).indices(vec![r0, r1]).call().unwrap();
 
     // Apply pattern
     let pm = movement_op_patterns();
@@ -186,7 +186,7 @@ fn test_flip_index_transformation() {
     // Create INDEX
     let r0 = create_range(10, 0);
     let r1 = create_range(20, 1);
-    let indexed = UOp::index(flipped, vec![r0, r1]).unwrap();
+    let indexed = UOp::index().buffer(flipped).indices(vec![r0, r1]).call().unwrap();
 
     // Apply pattern
     let pm = movement_op_patterns();
@@ -214,7 +214,7 @@ fn test_pad_index_transformation() {
     // Create INDEX
     let r0 = create_range(12, 0); // 10 + 1 + 1
     let r1 = create_range(24, 1); // 20 + 2 + 2
-    let indexed = UOp::index(padded, vec![r0, r1]).unwrap();
+    let indexed = UOp::index().buffer(padded).indices(vec![r0, r1]).call().unwrap();
 
     // Apply pattern
     let pm = movement_op_patterns();
@@ -237,7 +237,7 @@ fn test_non_movement_op_no_match() {
 
     // Create INDEX
     let r0 = create_range(100, 0);
-    let indexed = UOp::index(negated, vec![r0]).unwrap();
+    let indexed = UOp::index().buffer(negated).indices(vec![r0]).call().unwrap();
 
     // Apply pattern
     let pm = movement_op_patterns();
@@ -275,7 +275,7 @@ fn test_nested_movement_ops() {
 
     // Create INDEX
     let r0 = create_range(50, 0);
-    let indexed = UOp::index(reshaped2, vec![r0]).unwrap();
+    let indexed = UOp::index().buffer(reshaped2).indices(vec![r0]).call().unwrap();
 
     // Apply pattern (should iterate multiple times)
     let pm = movement_op_patterns();

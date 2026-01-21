@@ -87,7 +87,7 @@ fn test_index_after_dead_axis_removal() {
     let idx1 = UOp::index_const(5);
     let idx2 = UOp::index_const(0);
 
-    let indexed = UOp::index(bufferized, vec![idx1.clone(), idx2]).expect("Failed to create INDEX");
+    let indexed = UOp::index().buffer(bufferized).indices(vec![idx1.clone(), idx2]).call().unwrap();
 
     let matcher = dead_axis_removal();
     let result = graph_rewrite(&matcher, indexed, &mut ());

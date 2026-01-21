@@ -156,7 +156,7 @@ pub fn create_bool_buffer(size: usize) -> Arc<UOp> {
 /// INDEX(buffer, [idx]) with scalar index.
 pub fn create_index(buffer: Arc<UOp>, idx: i64) -> Arc<UOp> {
     let idx_uop = UOp::const_(DType::Index, ConstValue::Int(idx));
-    UOp::index(buffer, vec![idx_uop]).expect("index creation should succeed")
+    UOp::index().buffer(buffer).indices(vec![idx_uop]).call().unwrap()
 }
 
 /// Create a vector INDEX with iota pattern: [0, 1, 2, ..., count-1].
@@ -274,7 +274,7 @@ pub fn create_index_with_range(buffer: Arc<UOp>, axis_id: usize, bound: i64, sca
         UOp::new(Op::Binary(BinaryOp::Add, scaled, UOp::const_(DType::Index, ConstValue::Int(offset))), DType::Index)
     };
 
-    UOp::index(buffer, vec![idx]).expect("index creation should succeed")
+    UOp::index().buffer(buffer).indices(vec![idx]).call().unwrap()
 }
 
 // =============================================================================
@@ -287,8 +287,10 @@ pub fn create_load(buffer: Arc<UOp>, index: Arc<UOp>) -> Arc<UOp> {
 }
 
 /// Create a STORE operation.
-pub fn create_store(buffer: Arc<UOp>, index: Arc<UOp>, value: Arc<UOp>) -> Arc<UOp> {
-    UOp::store(buffer, index, value)
+///
+/// Note: `index` must be an INDEX operation that references the buffer.
+pub fn create_store(index: Arc<UOp>, value: Arc<UOp>) -> Arc<UOp> {
+    UOp::store(index, value)
 }
 
 /// Create a vector LOAD with iota index.
@@ -299,8 +301,8 @@ pub fn create_vector_load_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
 
 /// Create a vector STORE with iota index.
 pub fn create_vector_store_iota(buffer: Arc<UOp>, count: usize, value: Arc<UOp>) -> Arc<UOp> {
-    let index = create_vector_index_iota(buffer.clone(), count);
-    UOp::store(buffer, index, value)
+    let index = create_vector_index_iota(buffer, count);
+    UOp::store(index, value)
 }
 
 // =============================================================================
@@ -576,10 +578,13 @@ pub fn unwrap_load(uop: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
     }
 }
 
-/// Unwrap STORE and return (buffer, index, value).
-pub fn unwrap_store(uop: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>, Arc<UOp>) {
+/// Unwrap STORE and return (index, value).
+///
+/// The buffer can be accessed via `index.op()` (which should be an INDEX op)
+/// or use the `store_buffer()` helper on the store UOp.
+pub fn unwrap_store(uop: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
     match uop.op() {
-        Op::Store { buffer, index, value, .. } => (buffer.clone(), index.clone(), value.clone()),
+        Op::Store { index, value, .. } => (index.clone(), value.clone()),
         other => panic!("Expected STORE, got {:?}", other),
     }
 }

@@ -249,7 +249,7 @@ fn test_index_operation() {
     let buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let idx = UOp::const_(DType::Index, ConstValue::UInt(10));
 
-    let indexed = UOp::index(buf, vec![idx]).expect("index should succeed");
+    let indexed = UOp::index().buffer(buf).indices(vec![idx]).call().expect("index should succeed");
     assert!(matches!(indexed.op(), Op::Index { .. }));
     assert_eq!(indexed.op().children().len(), 2); // buffer + 1 index
 }

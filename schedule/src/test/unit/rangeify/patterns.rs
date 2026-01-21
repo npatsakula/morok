@@ -97,7 +97,7 @@ fn test_buffer_folding_noop_bufferize() {
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x.clone(), vec![range.clone()], BufferizeOpts::local());
-    let index = UOp::index(bufferize, vec![range]).unwrap();
+    let index = UOp::index().buffer(bufferize).indices(vec![range]).call().unwrap();
 
     let result = matcher.rewrite(&index, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove noop BUFFERIZE");
@@ -133,7 +133,7 @@ fn test_buffer_folding_index_const() {
     let const_val = UOp::native_const(PI);
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let index = UOp::index(const_val.clone(), vec![range]).unwrap();
+    let index = UOp::index().buffer(const_val.clone()).indices(vec![range]).call().unwrap();
 
     let result = matcher.rewrite(&index, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove INDEX from CONST");
@@ -173,7 +173,7 @@ fn test_buffer_folding_no_match_different_ranges() {
     let range2 = UOp::range_axis(range2_end, AxisId::Renumbered(1), AxisType::Loop);
 
     let bufferize = UOp::bufferize(x, vec![range1], BufferizeOpts::local());
-    let index = UOp::index(bufferize, vec![range2]).unwrap();
+    let index = UOp::index().buffer(bufferize).indices(vec![range2]).call().unwrap();
 
     let result = matcher.rewrite(&index, &mut ());
     // This might match or not depending on implementation details,

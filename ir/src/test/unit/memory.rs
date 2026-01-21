@@ -66,19 +66,24 @@ fn test_load() {
 #[test]
 fn test_store() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
+    let index_offset = UOp::index_const(0);
     let value = UOp::native_const(42.0f32);
 
-    let store = UOp::store(buffer.clone(), index.clone(), value.clone());
+    // Create INDEX op first (STORE's index field is an INDEX op)
+    let index = UOp::index().buffer(buffer.clone()).indices(vec![index_offset]).call().unwrap();
+
+    // Use store_value() on INDEX (preferred API)
+    let store = index.store_value(value.clone());
 
     // Store should have Void dtype
     assert_eq!(store.dtype(), DType::Void);
 
-    // Should be Store op
-    if let Op::Store { buffer: b, index: i, value: v, .. } = store.op() {
-        assert!(std::sync::Arc::ptr_eq(b, &buffer));
+    // Should be Store op with index pointing to buffer
+    if let Op::Store { index: i, value: v, .. } = store.op() {
         assert!(std::sync::Arc::ptr_eq(i, &index));
         assert!(std::sync::Arc::ptr_eq(v, &value));
+        // Verify buffer can be accessed via store_buffer()
+        assert!(std::sync::Arc::ptr_eq(store.store_buffer().unwrap(), &buffer));
     } else {
         panic!("Expected Store op");
     }

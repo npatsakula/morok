@@ -106,8 +106,10 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// - no_vectorized_alu (optional): Convert vector ALU to scalar + VECTORIZE
 /// - pm_reduce_devectorize: Unified REDUCE devectorization (K-vec, bool, horizontal)
 /// - pm_bool_devectorize: Convert <N x i1> to scalar ops
-/// - pm_fma_decomposition: a*b+c → MulAcc for float types
 /// - bool_storage_patterns: Convert bool LOAD/STORE to uint8
+///
+/// NOTE: We do NOT apply FMA decomposition (a*b+c → MulAcc). Following Tinygrad's
+/// approach, we let LLVM's optimizer fuse MUL+ADD into FMA when beneficial.
 ///
 /// # Arguments
 ///
@@ -219,30 +221,19 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     // to devectorize the resulting REDUCE to avoid LLVM <N x i1> accumulator issues.
     let reduce_devec = graph_rewrite_bottom_up(&pm_reduce, reduce_devec, &mut ());
 
-    // FMA decomposition: a*b+c → MulAcc(a,b,c) for float types.
-    // Applied late so optimizations can still see Add(Mul) structure.
-    // Must run AFTER horizontal reduce (which may create Add chains from GEPs).
-    // Based on Tinygrad's decompositions.py:362.
-    let pm_fma = crate::rangeify::patterns::pm_fma_decomposition();
-    let with_fma = graph_rewrite_bottom_up(&pm_fma, reduce_devec, &mut ());
-
-    // Second pass of ALU devectorization: MulAcc was created by pm_fma_decomposition AFTER
-    // the first no_vectorized_alu pass. Need to devectorize newly created MulAcc ops.
-    // This enables 8×8 matmul tiling: 64-element MulAcc → VECTORIZE of 64 scalar MulAccs.
-    let with_fma = if devectorize_alu {
-        let no_vec_alu = crate::devectorize::no_vectorized_alu();
-        let devec_fma = graph_rewrite_bottom_up(&no_vec_alu, with_fma, &mut ());
-        graph_rewrite_bottom_up(&gep_pushing_patterns(), devec_fma, &mut ())
-    } else {
-        with_fma
-    };
+    // NOTE: We intentionally do NOT create MulAcc (FMA) ops here.
+    // Tinygrad only creates MULACC if the backend explicitly supports it (via code_for_op).
+    // For LLVM/CPU backends, MULACC is not in code_for_op, so Tinygrad keeps a*b+c as
+    // separate MUL+ADD operations and lets LLVM's optimizer fuse them into FMA when beneficial.
+    // This avoids devectorization complexity and lets LLVM make optimal FMA decisions.
+    // See: tinygrad/uop/decompositions.py:362 - "if Ops.MULACC in ops: ..."
 
     // Bool storage: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits.
     // LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
     // Must run LAST, after all other transformations that might create bool stores.
     // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
     let pm_bool_storage = crate::devectorize::bool_storage_patterns();
-    graph_rewrite_bottom_up(&pm_bool_storage, with_fma, &mut ())
+    graph_rewrite_bottom_up(&pm_bool_storage, reduce_devec, &mut ())
 }
 
 /// Apply optimizations with explicit configuration.

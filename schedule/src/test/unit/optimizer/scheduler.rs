@@ -1382,9 +1382,8 @@ fn test_flatten_ranges_store() {
     let reduce = UOp::reduce(val.clone(), vec![r_reduce].into(), ReduceOp::Add);
 
     // Create a STORE operation with the reduce as its value
-    let buffer = UOp::index_const(0); // Dummy buffer
     let index = UOp::index_const(0); // Dummy index
-    let store = UOp::store(buffer, index, reduce);
+    let store = UOp::store(index, reduce);
 
     let ren = Renderer::cuda();
     let scheduler = Scheduler::new(store, ren);

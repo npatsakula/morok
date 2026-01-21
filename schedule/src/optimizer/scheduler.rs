@@ -59,7 +59,7 @@ fn flatten_ranges(ast: Arc<UOp>) -> Arc<UOp> {
             // Recreate REDUCE with flattened ranges
             UOp::reduce(flattened_src, flattened.into(), *reduce_op)
         }
-        Op::Store { buffer, index, value, ranges } => {
+        Op::Store { index, value, ranges } => {
             // Recursively flatten value being stored
             let flattened_value = flatten_ranges(value.clone());
 
@@ -67,7 +67,7 @@ fn flatten_ranges(ast: Arc<UOp>) -> Arc<UOp> {
             let flattened_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|r| flatten_ranges(r.clone())).collect();
 
             // Recreate STORE with flattened value and ranges
-            UOp::store_with_ranges(buffer.clone(), index.clone(), flattened_value, flattened_ranges)
+            UOp::store_with_ranges(index.clone(), flattened_value, flattened_ranges)
         }
         Op::End { computation, ranges } => {
             // Flatten END ranges - extract actual RANGE nodes from expressions

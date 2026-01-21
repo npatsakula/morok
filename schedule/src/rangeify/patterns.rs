@@ -797,7 +797,8 @@ fn extract_buffer_from_after(passthrough: &Arc<UOp>) -> Arc<UOp> {
 /// Find output DefineGlobal from KERNEL AST.
 fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
     for node in ast.toposort() {
-        if let Op::Store { buffer, .. } = node.op() {
+        // Use store_buffer() helper to get buffer from STORE via its INDEX child
+        if let Some(buffer) = node.store_buffer() {
             let output_buf = match buffer.op() {
                 Op::Index { buffer: inner_buf, .. } => inner_buf.clone(),
                 _ => buffer.clone(),
@@ -935,7 +936,7 @@ pub fn split_kernels_pattern() -> TypedPatternMatcher<Vec<Arc<UOp>>> {
     use super::kernel::split_store;
     crate::patterns! {
         @context Vec<Arc<UOp>>;
-        x @ Store { buffer: _, index: _, value: _ } => |x, ctx| split_store(ctx, x),
+        x @ Store { index: _, value: _, .. } => |x, ctx| split_store(ctx, x),
         x @ End { computation: _ } => |x, ctx| split_store(ctx, x),
     }
 }
@@ -1130,9 +1131,9 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
         },
 
         // Pattern 2: Cleanup STORE - remove LOAD from index position
-        Store { buffer, index: Load { index: real_index, .. }, value, ranges } =>
-            |buffer, real_index, value, ranges| {
-                Some(UOp::store_with_ranges(buffer.clone(), real_index.clone(), value.clone(), ranges.clone()))
+        Store { index: Load { index: real_index, .. }, value, ranges } =>
+            |real_index, value, ranges| {
+                Some(UOp::store_with_ranges(real_index.clone(), value.clone(), ranges.clone()))
             },
     }
 }
