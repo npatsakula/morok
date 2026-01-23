@@ -1177,6 +1177,115 @@ pub fn pm_add_thread_dims() -> TypedPatternMatcher {
     }
 }
 
+/// Filter non-RANGE ops from END/REDUCE/STORE ranges.
+///
+/// Based on Tinygrad's `pm_flatten_range` (simplify.py:7-16).
+///
+/// # Problem
+///
+/// The `dead_loop_patterns()` in symbolic/patterns.rs converts trivial RANGE(end=1)
+/// nodes to CONST(0) when vmin == vmax. When these RANGEs are referenced in END.ranges,
+/// the graph rewrite substitutes the CONST, causing END to have `ranges: [CONST, CONST]`
+/// instead of `ranges: [RANGE, RANGE]`. This breaks linearization.
+///
+/// # Solution
+///
+/// This pattern filters END/REDUCE/STORE ranges to keep only actual RANGE ops,
+/// removing any CONST substitutions that occurred during symbolic simplification.
+///
+/// ```python
+/// # Tinygrad simplify.py:7-16
+/// def flatten_range(r:UOp):
+///   off = range_start[r.op]
+///   rngs = r.src[off:]
+///   if not len(rngs): return None
+///   new_rngs = [x for x in UOp.sink(*rngs).toposort() if x.op is Ops.RANGE]
+///   return r.replace(src=r.src[:off]+tuple(new_rngs))
+/// ```
+pub fn pm_flatten_range() -> TypedPatternMatcher {
+    /// Extract actual RANGE ops from a list of range sources.
+    /// Creates a sink, toposorts, and filters to only RANGE ops.
+    fn extract_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> SmallVec<[Arc<UOp>; 4]> {
+        if ranges.is_empty() {
+            return SmallVec::new();
+        }
+        let sink = UOp::sink(ranges.iter().cloned().collect());
+        sink.toposort()
+            .into_iter()
+            .filter(|node| matches!(node.op(), Op::Range { .. }))
+            .collect()
+    }
+
+    /// Check if ranges changed (optimization to avoid unnecessary rewrites).
+    fn ranges_unchanged(original: &SmallVec<[Arc<UOp>; 4]>, filtered: &SmallVec<[Arc<UOp>; 4]>) -> bool {
+        original.len() == filtered.len()
+            && original.iter().zip(filtered.iter()).all(|(a, b)| a.id == b.id)
+    }
+
+    crate::patterns! {
+        // END: Filter ranges to only RANGE ops
+        end @ End { computation, ranges } => |end, computation, ranges| {
+            let actual_ranges = extract_ranges(ranges);
+
+            if ranges_unchanged(ranges, &actual_ranges) {
+                return None; // No change needed
+            }
+
+            tracing::debug!(
+                end_id = end.id,
+                original_len = ranges.len(),
+                filtered_len = actual_ranges.len(),
+                "pm_flatten_range: filtering END ranges"
+            );
+
+            if actual_ranges.is_empty() {
+                // All ranges were non-RANGE (e.g., all CONST) - unwrap END
+                Some(computation.clone())
+            } else {
+                Some(UOp::end(computation.clone(), actual_ranges))
+            }
+        },
+
+        // REDUCE: Filter ranges to only RANGE ops
+        reduce @ Reduce { src, ranges, reduce_op } => |reduce, src, ranges, reduce_op| {
+            let actual_ranges = extract_ranges(ranges);
+
+            if ranges_unchanged(ranges, &actual_ranges) {
+                return None;
+            }
+
+            tracing::debug!(
+                reduce_id = reduce.id,
+                original_len = ranges.len(),
+                filtered_len = actual_ranges.len(),
+                "pm_flatten_range: filtering REDUCE ranges"
+            );
+
+            Some(UOp::new(
+                Op::Reduce { src: src.clone(), ranges: actual_ranges, reduce_op: *reduce_op },
+                reduce.dtype(),
+            ))
+        },
+
+        // STORE: Filter ranges to only RANGE ops
+        Store { index, value, ranges } => |index, value, ranges| {
+            let actual_ranges = extract_ranges(ranges);
+
+            if ranges_unchanged(ranges, &actual_ranges) {
+                return None;
+            }
+
+            tracing::debug!(
+                original_len = ranges.len(),
+                filtered_len = actual_ranges.len(),
+                "pm_flatten_range: filtering STORE ranges"
+            );
+
+            Some(UOp::store_with_ranges(index.clone(), value.clone(), actual_ranges))
+        },
+    }
+}
+
 /// Convert a REDUCE operation to explicit accumulator pattern.
 ///
 /// Follows Tinygrad's approach (devectorizer.py:reduce_to_acc):

@@ -203,12 +203,23 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
 
     tracing::debug!(ast_after_devectorize = %devectorized_mem.tree(), "post_optimization: after devectorize");
 
+    // Flatten range: Filter non-RANGE ops from END/REDUCE/STORE ranges.
+    // The symbolic pass (included in devectorize) converts trivial RANGE(end=1) to CONST(0).
+    // When these RANGEs are referenced in END.ranges, the rewrite substitutes CONST,
+    // causing END to have `ranges: [CONST, CONST]` instead of `ranges: [RANGE, RANGE]`.
+    // This pattern filters END/REDUCE/STORE ranges to keep only actual RANGE ops.
+    // Based on Tinygrad's pm_flatten_range (simplify.py:7-16).
+    let pm_flatten = crate::devectorize::pm_flatten_range();
+    let flattened = graph_rewrite_bottom_up(&pm_flatten, devectorized_mem, &mut ());
+
+    tracing::debug!(ast_after_pm_flatten_range = %flattened.tree(), "post_optimization: after pm_flatten_range");
+
     // Bool devectorization: Convert <N x i1> ALU ops to scalar ops + VECTORIZE.
     // LLVM's bool vectors are broken (no formal ABI, segfaults in codegen).
     // Based on Tinygrad's no_vectorized_alu approach.
     // Must run BEFORE reduce devectorization so comparisons are already scalar.
     let pm_devec = crate::rangeify::patterns::pm_bool_devectorize();
-    let devectorized = graph_rewrite_bottom_up(&pm_devec, devectorized_mem, &mut ());
+    let devectorized = graph_rewrite_bottom_up(&pm_devec, flattened, &mut ());
 
     // Unified REDUCE devectorization: Handles all 3 mutually exclusive cases:
     // - K-vectorized: CONTRACT source → N scalar REDUCEs + tree_reduce (SLP optimization)
