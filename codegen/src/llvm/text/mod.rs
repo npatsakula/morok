@@ -22,7 +22,7 @@ use morok_ir::pattern::TypedPatternMatcher;
 use morok_ir::rewrite::graph_rewrite_bottom_up;
 use morok_ir::{AxisType, ConstValue, Op, prelude::*};
 use morok_schedule::devectorize::pm_render;
-use morok_schedule::linearize::linearize;
+use morok_schedule::linearize::linearize_with_cfg;
 use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
 use crate::{BufferArg, RenderedKernel, Renderer, Result};
@@ -56,13 +56,18 @@ impl Renderer for LlvmTextRenderer {
         // This ensures type-safe rendering (Tinygrad devectorizer.py:258-275)
         let uop = graph_rewrite_bottom_up(&pm_render(), uop.clone(), &mut ());
 
+        tracing::debug!(ast_after_pm_render = %uop.tree(), "codegen: after pm_render");
+
         // Apply pm_bool_devectorize after pm_render to catch any vectorized bool ops
         // that were created or exposed by pm_render. This matches Tinygrad's approach
         let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop, &mut ());
 
-        // Use priority-based linearizer for proper RANGE → body → END ordering
-        // (Tinygrad linearizer.py assigns RANGE priority 5, END priority -5)
-        let nodes = linearize(uop);
+        tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "codegen: after pm_bool_devectorize");
+
+        // Use priority-based linearizer with CFG control flow edges for proper
+        // RANGE → body → END ordering. This applies CFGContext edges to ensure
+        // sibling loops are ordered correctly.
+        let nodes = linearize_with_cfg(uop);
 
         // DEBUG: Log linearization order
         for (i, node) in nodes.iter().enumerate() {
@@ -95,8 +100,10 @@ impl Renderer for LlvmTextRenderer {
         buffers.sort_by_key(|b| if let Op::DefineGlobal(id) = b.op() { *id } else { usize::MAX });
 
         // Detect Thread ranges - these become dispatch dimensions, not loops
+        // Also accept ThreadScheduled defensively (should be converted by pm_add_thread_dims, but be safe)
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
-            if let Op::Range { axis_type: AxisType::Thread, end, .. } = n.op()
+            if let Op::Range { axis_type, end, .. } = n.op()
+                && matches!(axis_type, AxisType::Thread | AxisType::ThreadScheduled)
                 && let Op::Const(cv) = end.op()
                 && let ConstValue::Int(count) = cv.0
             {
@@ -194,8 +201,8 @@ impl Renderer for LlvmTextRenderer {
         // Pre-register Range variables by axis_id
         for node in &nodes {
             if let Op::Range { axis_id, axis_type, .. } = node.op() {
-                // Thread ranges already registered above
-                if !matches!(axis_type, AxisType::Thread) {
+                // Thread/ThreadScheduled ranges already registered above via thread_id parameter
+                if !matches!(axis_type, AxisType::Thread | AxisType::ThreadScheduled) {
                     let name = format!("%r{}", axis_id.value());
                     ctx.register(node.id, name);
                 }
@@ -205,8 +212,10 @@ impl Renderer for LlvmTextRenderer {
         // Single pass: process all nodes in linearization order
         // This ensures DefineReg allocas are emitted before any RANGE loops that use them
         for node in &nodes {
-            // Skip Thread ranges (handled via thread_id parameter)
-            if let Op::Range { axis_type: AxisType::Thread, .. } = node.op() {
+            // Skip Thread/ThreadScheduled ranges (handled via thread_id parameter)
+            if let Op::Range { axis_type, .. } = node.op()
+                && matches!(axis_type, AxisType::Thread | AxisType::ThreadScheduled)
+            {
                 continue;
             }
             render_uop(node, &mut ctx, &mut kernel);
@@ -315,16 +324,9 @@ fn generate_intrinsic_declarations(kernel: &[String]) -> String {
         "minnum", "fmuladd", "erf",
     ] {
         // Scalar and vector types to check
-        for llvm_type in &[
-            "float",
-            "double",
-            "half",
-            "<2 x float>",
-            "<4 x float>",
-            "<8 x float>",
-            "<2 x double>",
-            "<4 x double>",
-        ] {
+        for llvm_type in
+            &["float", "double", "half", "<2 x float>", "<4 x float>", "<8 x float>", "<2 x double>", "<4 x double>"]
+        {
             let mangled = mangle_type(llvm_type);
             let pattern = format!("@llvm.{intrinsic}.{mangled}");
             if kernel_str.contains(&pattern) {

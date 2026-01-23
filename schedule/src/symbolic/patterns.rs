@@ -748,9 +748,32 @@ pub fn dead_loop_patterns() -> TypedPatternMatcher {
         reduce_identity(*op, reduce_op.dtype())
     }
 
+    /// Check if a Range is trivial (vmin == vmax), meaning only one value.
+    /// This matches Tinygrad's simplification: Range(Const) → Const when vmin == vmax.
+    fn is_trivial_range(uop: &Arc<UOp>) -> bool {
+        if let Op::Range { end, .. } = uop.op() {
+            // Only simplify when end is a constant
+            if matches!(end.op(), Op::Const(_)) {
+                let (vmin, vmax) = VminVmaxProperty::get(uop);
+                return vmin == vmax;
+            }
+        }
+        false
+    }
+
+    /// Get the constant value for a trivial range (vmin which equals vmax).
+    fn trivial_range_value(uop: &Arc<UOp>) -> Arc<UOp> {
+        let (vmin, _) = VminVmaxProperty::get(uop);
+        UOp::const_(uop.dtype(), *vmin)
+    }
+
     patterns! {
-        // RANGE with vmax ≤ 0 → Const(0)
+        // RANGE with vmax < 0 (empty/dead) → Const(0)
         r @ Range(_) if is_empty_range(r) ~> UOp::index_const(0),
+
+        // RANGE(Const) with vmin == vmax (trivial, e.g., end=1) → Const(vmin)
+        // Matches Tinygrad symbolic.py:211
+        r @ Range(_) if is_trivial_range(r) ~> trivial_range_value(r),
 
         // END with dead ranges → filter or unwrap
         end_op @ End(_, ..) if has_dead_ranges(end_op) ~> filter_dead_ranges(end_op),

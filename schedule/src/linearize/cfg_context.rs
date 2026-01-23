@@ -2,8 +2,10 @@
 //!
 //! CFGContext analyzes the control flow structure of a kernel AST and computes
 //! ordering edges between sibling RANGE operations at the same nesting level.
+//!
+//! This implementation matches Tinygrad's CFGContext (linearizer.py:59-91).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_ir::UOp;
@@ -15,27 +17,32 @@ use morok_ir::uop::core::UOpKey;
 /// Tracks ordering edges between sibling RANGE operations to ensure
 /// proper linearization order when loops are at the same nesting level.
 ///
+/// Based on Tinygrad's CFGContext which tracks three relationships between ranges:
+/// - **nested**: END y is a dependency of END x AND RANGE x is a dependency of END y
+/// - **dependent**: END y is a dependency of END x AND RANGE x is NOT a dependency of END y
+/// - **independent**: END y is NOT a dependency of END x
+///
 /// # Control Flow Edges
 ///
-/// When multiple RANGEs exist at the same nesting level, they need to be
+/// When multiple ENDs exist at the same nesting level (siblings), they need to be
 /// ordered consistently. CFGContext computes edges where:
-/// - Each RANGE points to its predecessor (another RANGE or END)
+/// - Each RANGE points to its predecessor (either the parent's RANGE or another END)
 /// - Edges ensure sequential execution of sibling loops
 ///
 /// # Example
 ///
 /// ```text
-/// RANGE(i) → END(body1)
-/// RANGE(j) → END(body2)   // j comes after i
-/// RANGE(k) → END(body3)   // k comes after j
+/// RANGE(i) → ... → END(i)   // first loop
+/// RANGE(j) → ... → END(j)   // second loop (sibling)
+/// RANGE(k) → ... → END(k)   // third loop (sibling)
 ///
 /// CFGContext edges:
-///   RANGE(j) → RANGE(i)   // j depends on i
-///   RANGE(k) → RANGE(j)   // k depends on j
+///   RANGE(j) → END(i)    // j's RANGE depends on i's END
+///   RANGE(k) → END(j)    // k's RANGE depends on j's END
 /// ```
 #[derive(Debug, Default)]
 pub struct CFGContext {
-    /// Maps RANGE → predecessor (previous sibling RANGE or END).
+    /// Maps RANGE → predecessor (previous sibling END or parent's RANGE).
     ///
     /// The predecessor is the operation that must complete before
     /// this RANGE can begin execution.
@@ -46,119 +53,148 @@ pub struct CFGContext {
 impl CFGContext {
     /// Build a control flow context from a kernel AST.
     ///
-    /// Analyzes the graph to find sibling RANGEs at the same nesting level
-    /// and creates ordering edges between them.
+    /// Analyzes the graph to find sibling ENDs at the same nesting level
+    /// and creates ordering edges between their RANGEs.
     ///
-    /// # Algorithm
+    /// # Algorithm (from Tinygrad linearizer.py:59-91)
     ///
-    /// 1. Build a dependency set for each UOp (all transitive dependencies)
-    /// 2. For each END, find all RANGEs in its ranges list
-    /// 3. Determine parent END for each RANGE (if nested)
-    /// 4. Group sibling RANGEs by their parent
-    /// 5. Order siblings by dependency count (fewer deps = earlier)
-    /// 6. Create edges between consecutive siblings
+    /// 1. Build transitive deps map (RANGE/END add themselves to deps)
+    /// 2. Build nesting map: which END/SINK nests each END
+    /// 3. Group siblings by parent
+    /// 4. Order siblings by dependency count (fewer deps = earlier)
+    /// 5. Create edges: RANGE of later sibling → predecessor (END or parent's RANGE)
     pub fn new(sink: &Arc<UOp>) -> Self {
         let mut ctx = Self::default();
 
-        // Step 1: Collect all nodes via toposort
+        // Collect all nodes via toposort
         let nodes = sink.toposort();
 
-        // Step 2: Build dependency sets for each node
-        // deps[u] = set of all UOps that u transitively depends on
+        // Step 1: Build dependency sets for each node
+        // RANGE and END add themselves to deps
+        // deps[u] = set of RANGE/END UOps that u transitively depends on
         #[allow(clippy::mutable_key_type)]
-        let mut deps: HashMap<UOpKey, HashSet<UOpKey>> = HashMap::new();
+        let mut deps: HashMap<UOpKey, HashMap<UOpKey, ()>> = HashMap::new();
 
         for node in &nodes {
+            // Get deps from sources
             #[allow(clippy::mutable_key_type)]
-            let mut node_deps = HashSet::new();
-
-            // Add direct children's dependencies
-            node.op().map_child(|child| {
-                // Add the child itself
-                node_deps.insert(UOpKey(child.clone()));
-                // Add all of child's dependencies
-                if let Some(child_deps) = deps.get(&UOpKey(child.clone())) {
-                    node_deps.extend(child_deps.iter().cloned());
+            let mut node_deps: HashMap<UOpKey, ()> = HashMap::new();
+            node.op().map_child(|src| {
+                if let Some(src_deps) = deps.get(&UOpKey(src.clone())) {
+                    node_deps.extend(src_deps.iter().map(|(k, v)| (k.clone(), *v)));
                 }
             });
+
+            // RANGE and END add themselves
+            if matches!(node.op(), Op::Range { .. } | Op::End { .. }) {
+                node_deps.insert(UOpKey(node.clone()), ());
+            }
 
             deps.insert(UOpKey(node.clone()), node_deps);
         }
 
-        // Step 3: Collect all ENDs and their associated RANGEs
+        // Step 2: Build nesting map
+        // For each END, find which END/SINK it is nested inside
+        // END x is nested in END/SINK u if:
+        //   - u depends on x (x is in deps[u])
+        //   - u is SINK, OR u's RANGE (u.src[1]) is in deps[x]
+        //   - x hasn't been assigned a nesting parent yet
         #[allow(clippy::mutable_key_type)]
-        let mut end_to_ranges: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
+        let mut nesting: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
         for node in &nodes {
-            if let Op::End { ranges, .. } = node.op() {
-                let range_list: Vec<Arc<UOp>> = ranges.iter().cloned().collect();
-                end_to_ranges.insert(UOpKey(node.clone()), range_list);
-            }
-        }
+            if matches!(node.op(), Op::End { .. } | Op::Sink { .. })
+                && let Some(node_deps) = deps.get(&UOpKey(node.clone())) {
+                    for dep_key in node_deps.keys() {
+                        // Only consider END nodes
+                        if !matches!(dep_key.0.op(), Op::End { .. }) {
+                            continue;
+                        }
 
-        // Step 4: For each RANGE, find its parent END (if nested)
-        // A RANGE X is nested in END Y if END(Y) depends on X
-        #[allow(clippy::mutable_key_type)]
-        let mut range_parent: HashMap<UOpKey, Option<Arc<UOp>>> = HashMap::new();
+                        // Skip if already assigned
+                        if nesting.contains_key(dep_key) {
+                            continue;
+                        }
 
-        for node in &nodes {
-            if let Op::Range { .. } = node.op() {
-                let range_key = UOpKey(node.clone());
-
-                // Find the innermost END that contains this RANGE
-                let mut parent: Option<Arc<UOp>> = None;
-
-                for end_key in end_to_ranges.keys() {
-                    if let Some(end_deps) = deps.get(end_key) {
-                        // Check if this END depends on our RANGE (meaning RANGE is inside END)
-                        if end_deps.contains(&range_key) {
-                            // Check if this is a more specific (nested) parent
-                            if let Some(ref current_parent) = parent {
-                                // If current parent depends on new END, then new END is more nested
-                                // (new END is inside current parent, so it's more specific)
-                                let current_deps = deps.get(&UOpKey(current_parent.clone()));
-                                if let Some(current_deps) = current_deps
-                                    && current_deps.contains(end_key)
-                                {
-                                    // current_parent depends on end_key, so end_key is inside current_parent
-                                    // This makes end_key a more specific (closer) parent
-                                    parent = Some(end_key.0.clone());
-                                }
+                        // Check nesting condition
+                        let is_nested = if matches!(node.op(), Op::Sink { .. }) {
+                            true
+                        } else if let Op::End { ranges, .. } = node.op() {
+                            // Check if node's RANGE is in dep's dependencies
+                            // node.src[1] in Tinygrad is the RANGE - we get it from ranges
+                            if let Some(range) = ranges.first() {
+                                deps.get(dep_key).is_some_and(|dep_deps| dep_deps.contains_key(&UOpKey(range.clone())))
                             } else {
-                                parent = Some(end_key.0.clone());
+                                false
                             }
+                        } else {
+                            false
+                        };
+
+                        if is_nested {
+                            nesting.insert(dep_key.clone(), node.clone());
                         }
                     }
                 }
-
-                range_parent.insert(range_key, parent);
-            }
         }
 
-        // Step 5: Group siblings by parent END
-        // Siblings are RANGEs that share the same parent (or both have no parent)
+        // Step 3: Group siblings by parent
         #[allow(clippy::mutable_key_type)]
-        let mut siblings: HashMap<Option<UOpKey>, Vec<Arc<UOp>>> = HashMap::new();
-
-        for (range_key, parent) in &range_parent {
-            let parent_key = parent.as_ref().map(|p| UOpKey(p.clone()));
-            siblings.entry(parent_key).or_default().push(range_key.0.clone());
+        let mut siblings: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
+        for (end_key, parent) in &nesting {
+            siblings.entry(UOpKey(parent.clone())).or_default().push(end_key.0.clone());
         }
 
-        // Step 6: Order siblings and create edges
-        for (_parent, mut sibling_ranges) in siblings {
-            if sibling_ranges.len() <= 1 {
-                continue; // No ordering needed for single RANGE
+        // Step 4 & 5: Order siblings and create edges
+        for (parent, sibling_ends) in siblings {
+            if sibling_ends.is_empty() {
+                continue;
             }
 
-            // Order by dependency count (fewer deps = earlier in sequence)
-            sibling_ranges.sort_by_key(|r| deps.get(&UOpKey(r.clone())).map_or(0, |d| d.len()));
+            // Order by dependency count on other siblings (fewer deps = earlier)
+            let mut ordered: Vec<Arc<UOp>> = sibling_ends.clone();
+            ordered.sort_by_key(|end| {
+                if let Some(end_deps) = deps.get(&UOpKey(end.clone())) {
+                    sibling_ends.iter().filter(|sib| end_deps.contains_key(&UOpKey((*sib).clone()))).count()
+                } else {
+                    0
+                }
+            });
 
-            // Create edges: each RANGE points to its predecessor
-            for window in sibling_ranges.windows(2) {
-                let prev = &window[0];
-                let curr = &window[1];
-                ctx.edges.insert(UOpKey(curr.clone()), prev.clone());
+            // Create edges
+            // If parent is SINK: zip(order, order[1:])
+            // If parent is END: zip([parent.src[1]] + order, order)
+            //   where parent.src[1] is the parent's RANGE
+            let zipped: Vec<(Arc<UOp>, Arc<UOp>)> = if matches!(parent.0.op(), Op::Sink { .. }) {
+                // Pair consecutive siblings
+                ordered.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect()
+            } else {
+                // Get parent's RANGE
+                if let Op::End { ranges, .. } = parent.0.op() {
+                    if let Some(parent_range) = ranges.first() {
+                        // Pair: parent_range → first, then consecutive siblings
+                        let mut pairs = vec![(parent_range.clone(), ordered[0].clone())];
+                        pairs.extend(ordered.windows(2).map(|w| (w[0].clone(), w[1].clone())));
+                        pairs
+                    } else {
+                        ordered.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect()
+                    }
+                } else {
+                    ordered.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect()
+                }
+            };
+
+            // Create edges: y's RANGE → x (predecessor)
+            for (x, y) in zipped {
+                // y is an END, get its RANGE from y.src[1] (or ranges field)
+                let y_range = if let Op::End { ranges, .. } = y.op() { ranges.first().cloned() } else { None };
+
+                if let Some(range) = y_range {
+                    // Skip self-referential edges (can happen when parent and child END the same range)
+                    if range.id != x.id {
+                        ctx.edges.insert(UOpKey(range), x);
+                    }
+                }
             }
         }
 

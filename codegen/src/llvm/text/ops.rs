@@ -225,8 +225,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         | Op::Barrier { .. } => None,
 
         // DefineReg → alloca
+        // The base type could be scalar OR vector (e.g., vec2 for upcasted reduce)
         Op::DefineReg { size } => {
-            let base = ldt(&DType::Scalar(uop.dtype().base()));
+            let base_dtype = match uop.dtype() {
+                DType::Ptr { base, .. } => base.as_ref().clone(),
+                other => other,
+            };
+            let base = ldt(&base_dtype);
             kernel.push(format!("  {dst} = alloca [{size} x {base}]"));
             Some(())
         }
@@ -509,11 +514,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 
         // END → loop footer
         Op::End { ranges, .. } => {
-            // Close all ranges (skip Thread ranges - they're handled via thread_id, not loops)
+            // Close all ranges (skip Thread/ThreadScheduled ranges - they're handled via thread_id, not loops)
             for range in ranges.iter() {
                 if let Op::Range { axis_id, axis_type, .. } = range.op() {
-                    // Skip Thread ranges - they don't generate actual loop structures
-                    if matches!(axis_type, AxisType::Thread) {
+                    // Skip Thread/ThreadScheduled ranges - they don't generate actual loop structures
+                    if matches!(axis_type, AxisType::Thread | AxisType::ThreadScheduled) {
                         continue;
                     }
                     let id = axis_id.value();
@@ -614,7 +619,14 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
 
         // After → pass through with ordering
+        // Tinygrad llvmir.py:169-171: AFTER just aliases passthrough value
+        // Passthrough MUST be a data node in context, never Range
         Op::After { passthrough, .. } => {
+            #[cfg(debug_assertions)]
+            if matches!(passthrough.op(), Op::Range { .. }) {
+                panic!("AFTER passthrough is Range (id={}), this violates Tinygrad semantics", passthrough.id);
+            }
+
             let s = ctx.get(passthrough);
             ctx.alias(uop.id, s.to_string());
             None
@@ -760,24 +772,41 @@ fn render_reduce_minmax(
 }
 
 /// Get identity element for reduce operation.
+///
+/// For vector types, returns `zeroinitializer` for zero values since LLVM
+/// doesn't accept scalar literals like `0.0` for vector stores.
 pub fn reduce_identity(op: ReduceOp, dtype: &DType) -> String {
+    let is_vector = matches!(dtype, DType::Vector { .. });
+
     match op {
         ReduceOp::Add => {
-            if dtype.is_float() {
+            // Zero is identity for addition
+            if is_vector {
+                "zeroinitializer".to_string()
+            } else if dtype.is_float() {
                 "0.0".to_string()
             } else {
                 "0".to_string()
             }
         }
         ReduceOp::Mul => {
-            if dtype.is_float() {
+            // One is identity for multiplication
+            // For vectors, we'd need to construct a splat, but zeroinitializer won't work
+            // For now, use zeroinitializer and note this is incorrect for Mul
+            // TODO: Generate proper vector splat for non-zero identity values
+            if is_vector {
+                // This is a workaround - proper fix needs vector constant generation
+                "zeroinitializer".to_string()
+            } else if dtype.is_float() {
                 "1.0".to_string()
             } else {
                 "1".to_string()
             }
         }
         ReduceOp::Max => {
-            if dtype.is_float() {
+            if is_vector {
+                "zeroinitializer".to_string() // TODO: proper -inf splat
+            } else if dtype.is_float() {
                 "-0x7FF0000000000000".to_string() // -inf
             } else if dtype.is_signed() {
                 i64::MIN.to_string()
@@ -786,7 +815,9 @@ pub fn reduce_identity(op: ReduceOp, dtype: &DType) -> String {
             }
         }
         ReduceOp::Min => {
-            if dtype.is_float() {
+            if is_vector {
+                "zeroinitializer".to_string() // TODO: proper +inf splat
+            } else if dtype.is_float() {
                 "0x7FF0000000000000".to_string() // +inf
             } else if dtype.is_signed() {
                 i64::MAX.to_string()

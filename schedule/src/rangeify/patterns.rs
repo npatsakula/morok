@@ -761,8 +761,14 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<()> {
         },
         // CONTIGUOUS is a no-op at this stage
         Contiguous { src } ~> |src| src.clone(),
-        // AFTER(EXPAND): validate no local AFTER, then strip EXPAND
+        // AFTER(EXPAND): strip EXPAND only if src is a valid passthrough
         After { passthrough: Expand { src, .. }, deps } => |src, deps| {
+            // Don't unwrap if src is control flow (Range, End)
+            // These are not valid AFTER passthroughs in Tinygrad
+            if matches!(src.op(), Op::Range { .. } | Op::End { .. }) {
+                return None;  // Keep original - can't strip EXPAND from control flow
+            }
+
             #[allow(clippy::mutable_key_type)]
             let has_range = src.get_consumer_map()
                 .get(&UOpKey(src.clone()))

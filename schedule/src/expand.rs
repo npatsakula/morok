@@ -358,6 +358,8 @@ pub fn phase2_expand() -> TypedPatternMatcher {
 
         // Convert Range(Upcast) or Range(Unroll) to UNROLL op
         // This runs FIRST so that UNROLL is available for subsequent patterns
+        // NOTE: REDUCE ranges are NOT converted here - they're handled by pm_reduce
+        // which transforms REDUCE ops to accumulator patterns with END(ranges)
         range if matches!(range.op(), Op::Range { axis_type: AxisType::Upcast | AxisType::Unroll, .. }) => |range| {
             convert_range_to_unroll(range)
         },
@@ -426,8 +428,11 @@ fn convert_range_to_unroll(range: &Arc<UOp>) -> Option<Arc<UOp>> {
         "convert_range_to_unroll: checking Range"
     );
 
-    // Only convert Unroll/Upcast axis types
-    if !matches!(axis_type, AxisType::Unroll | AxisType::Upcast) {
+    // Convert Unroll, Upcast, and Reduce axis types to UNROLL op
+    // Tinygrad applies OptOps.UNROLL to REDUCE axes (changing type to UNROLL),
+    // then expander eliminates the Range. Morok handles this directly by
+    // converting REDUCE ranges here, achieving the same result.
+    if !matches!(axis_type, AxisType::Unroll | AxisType::Upcast | AxisType::Reduce) {
         return None;
     }
 
@@ -593,10 +598,13 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 continue;
             }
 
-            // Case 2: Buffer (source 0) for LOAD/STORE passes through unchanged
+            // Case 2: Buffer (source 0) for LOAD passes through unchanged
             // INDEX buffer is broadcast to enable devectorize expand_index pattern matching
             // (Tinygrad expander.py:56-58 broadcasts scalar sources including buffer)
-            if i == 0 && matches!(op, Op::Load { .. } | Op::Store { .. }) {
+            //
+            // NOTE: This does NOT apply to STORE! For STORE, sources are [index, value, ranges...]
+            // and the index (source 0) needs normal expansion. Only LOAD has buffer as source 0.
+            if i == 0 && matches!(op, Op::Load { .. }) {
                 new_sources.push(src.clone());
                 continue;
             }
@@ -709,14 +717,27 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
 
         // Vector operations
         Op::Gep { indices, .. } => {
-            // For GEP, recalculate indices for expanded vector
+            // For GEP, recalculate indices for expanded vector.
+            //
+            // The source has been expanded by CAT'ing `expand_sz` copies of the original vector.
+            // We need to extract the corresponding elements from each copy.
+            //
+            // Tinygrad (expander.py:60-63):
+            //   assert root.dtype.count == 1
+            //   new_arg = tuple(range(root.arg[0], new_srcs[0].dtype.count, new_srcs[0].dtype.count // expand_sz))
+            //
+            // For multi-index GEPs (Morok extension), we apply the same logic per index.
+            // The stride is the original source count (before CAT), which equals src_count / expand_sz.
             sources.first().map(|s| {
                 let src_count = s.dtype().vcount();
-                let expand_sz = dtype.vcount() / src_count.max(1);
-                let new_indices: Vec<usize> = indices
-                    .iter()
-                    .flat_map(|&idx| (0..expand_sz).map(move |e| idx + e * (src_count / expand_sz.max(1))))
-                    .collect();
+                let output_count = dtype.vcount();
+                // expand_sz = how many copies of the original output we need
+                let expand_sz = output_count / indices.len().max(1);
+                // stride = original source count = src_count / expand_sz
+                let stride = src_count / expand_sz.max(1);
+
+                let new_indices: Vec<usize> =
+                    indices.iter().flat_map(|&idx| (0..expand_sz).map(move |e| idx + e * stride)).collect();
                 UOp::gep(s.clone(), new_indices)
             })
         }
@@ -808,8 +829,17 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
         Op::End { .. } => {
             if !sources.is_empty() {
                 let computation = sources[0].clone();
-                let ranges: SmallVec<[Arc<UOp>; 4]> = sources[1..].iter().cloned().collect();
-                Some(UOp::new(Op::End { computation, ranges }, dtype.clone()))
+                // Filter to only include actual RANGE ops in the ranges field.
+                // During expansion, non-RANGE ops (CONST, Add, etc.) may be present
+                // from broadcast/CAT transformations. END.ranges must only contain RANGEs.
+                let ranges: SmallVec<[Arc<UOp>; 4]> =
+                    sources[1..].iter().filter(|s| matches!(s.op(), Op::Range { .. })).cloned().collect();
+                // If no ranges remain, just return the computation
+                if ranges.is_empty() {
+                    Some(computation)
+                } else {
+                    Some(UOp::new(Op::End { computation, ranges }, dtype.clone()))
+                }
             } else {
                 None
             }
@@ -818,8 +848,12 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
         Op::After { .. } => {
             if !sources.is_empty() {
                 let passthrough = sources[0].clone();
+                // Don't create AFTER with Range/End passthrough (violates Tinygrad semantics)
+                if matches!(passthrough.op(), Op::Range { .. } | Op::End { .. }) {
+                    return None;
+                }
                 let deps: SmallVec<[Arc<UOp>; 4]> = sources[1..].iter().cloned().collect();
-                Some(UOp::new(Op::After { passthrough, deps }, dtype.clone()))
+                Some(UOp::after(passthrough, deps))
             } else {
                 None
             }

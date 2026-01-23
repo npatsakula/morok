@@ -132,28 +132,35 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
 
     tracing::debug!(ast_after_linearize = %linearized.tree(), "post_optimization: after pm_linearize_multi_index");
 
+    // UNROLL expansion: Expand UNROLL ops to vectorized operations (Tinygrad expander.py)
+    // CRITICAL: Must run BEFORE pm_reduce so that REDUCE sees its actual vectorized dtype.
+    // In Tinygrad, expander runs first, then pm_reduce sees the expanded REDUCE with vec2 dtype.
+    // This allows reduce_to_acc to create accumulators with the correct vector dtype.
+    let expanded = crate::expand::pre_expand(&linearized);
+    tracing::debug!(ast_after_pre_expand = %expanded.tree(), "post_optimization: after pre_expand");
+
     // pm_reduce: Convert REDUCE → DEFINE_REG + accumulator pattern (Tinygrad devectorizer.py:310-316)
-    // This runs EARLY (before pm_add_loads, before devectorize) to eliminate REDUCE ops.
-    // After this pass, ALL RANGE ops (including AxisType::Reduce) create loops uniformly in codegen.
-    // Note: codegen_reduce still exists for backward compatibility but won't be called if no REDUCE ops.
+    // Now that UNROLL is expanded, REDUCE has its final dtype (e.g., vec2 if upcasted).
+    // This creates accumulators with matching vector dtype.
+    // IMPORTANT: ThreadScheduled axes are excluded from reduce_to_acc's input_ranges via is_parallel().
     let pm_reduce = crate::devectorize::pm_reduce();
-    let reduced = graph_rewrite_bottom_up(&pm_reduce, linearized, &mut ());
+    let reduced = graph_rewrite_bottom_up(&pm_reduce, expanded, &mut ());
     tracing::debug!(ast_after_pm_reduce = %reduced.tree(), "post_optimization: after pm_reduce");
+
+    // pm_add_thread_dims: Convert ThreadScheduled → Thread
+    // Runs AFTER pm_reduce, matching Tinygrad's pm_add_gpudims ordering.
+    // This ensures reduce_to_acc never sees Thread ranges (only ThreadScheduled, which is excluded).
+    // NOTE: Uses top-down graph_rewrite (not bottom_up) because pattern matches on SINK and
+    // returns a completely new graph via substitute(). Top-down processes root first.
+    let pm_threads = crate::devectorize::pm_add_thread_dims();
+    let with_threads = graph_rewrite(&pm_threads, reduced, &mut ());
+    tracing::debug!(ast_after_pm_add_thread_dims = %with_threads.tree(), "post_optimization: after pm_add_thread_dims");
 
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
     let pm_loads = crate::rangeify::patterns::pm_add_loads();
-    // First pass: wrap existing INDEX ops before expansion.
-    // Pattern has guard (!Ptr dtype) and transforms INDEX dtype to Ptr, so safe for reuse.
-    // Uses bottom-up to reach INDEX nodes deep in the tree.
-    let with_loads = graph_rewrite_bottom_up(&pm_loads, reduced, &mut ());
-
-    // Post-optimization: Fix UNROLL substitutions in REDUCE ops
-    // This handles arithmetic expressions created by shift_to UNROLL
-    let expanded = crate::expand::pre_expand(&with_loads);
-
-    tracing::debug!(ast_after_pre_expand = %expanded.tree(), "post_optimization: after pre_expand");
+    let with_loads = graph_rewrite_bottom_up(&pm_loads, with_threads, &mut ());
 
     // ALU Devectorization + VECTORIZE Normalization
     //
@@ -169,31 +176,30 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     // Skip no_vectorized_alu, only normalize VECTORIZE/GEP patterns.
     // Better for backends with sophisticated optimizers (LLVM SLP vectorizer).
 
-    let expanded = if devectorize_alu {
+    let processed = if devectorize_alu {
         // Step 1: Devectorize ALL vector ALU ops to VECTORIZE(scalar)
         let no_vec_alu = crate::devectorize::no_vectorized_alu();
-        let expanded = graph_rewrite_bottom_up(&no_vec_alu, expanded, &mut ());
+        let devec = graph_rewrite_bottom_up(&no_vec_alu, with_loads, &mut ());
 
         // Step 2: Simplify GEPs created by no_vectorized_alu
-        graph_rewrite_bottom_up(&gep_pushing_patterns(), expanded, &mut ())
+        graph_rewrite_bottom_up(&gep_pushing_patterns(), devec, &mut ())
     } else {
-        expanded
+        with_loads
     };
 
     // Step 3: Normalize remaining VECTORIZE/GEP patterns (multi-index GEP, single-source VECTORIZE)
-    let expanded = graph_rewrite_bottom_up(&crate::devectorize::pm_vectorize_normalize(), expanded, &mut ());
+    let normalized = graph_rewrite_bottom_up(&crate::devectorize::pm_vectorize_normalize(), processed, &mut ());
 
     // Step 4: Cleanup GEPs from pm_vectorize_normalize
-    let expanded = graph_rewrite_bottom_up(&gep_pushing_patterns(), expanded, &mut ());
+    let cleaned = graph_rewrite_bottom_up(&gep_pushing_patterns(), normalized, &mut ());
 
-    // Second pass of pm_add_loads: pre_expand creates new INDEX ops (via CAT expansion)
-    // that need LOAD wrapping. These weren't present before pre_expand.
-    // Safe for bottom-up: pattern guard (!Ptr) prevents re-matching transformed INDEX.
-    let expanded = graph_rewrite_bottom_up(&pm_loads, expanded, &mut ());
+    // Second pass of pm_add_loads: expansion may create new INDEX ops that need LOAD wrapping.
+    // NOTE: Uses top-down graph_rewrite to match Tinygrad's approach.
+    let with_loads2 = graph_rewrite(&pm_loads, cleaned, &mut ());
 
     // Devectorize pass: group contiguous memory accesses
     // Uses direct vector index analysis (VConst/UNROLL patterns) for termination safety
-    let devectorized_mem = crate::devectorize::devectorize(&expanded);
+    let devectorized_mem = crate::devectorize::devectorize(&with_loads2);
 
     tracing::debug!(ast_after_devectorize = %devectorized_mem.tree(), "post_optimization: after devectorize");
 

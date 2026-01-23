@@ -18,11 +18,13 @@
 //! - Single-element VECTORIZE/PTRCAT → unwrap
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use itertools::Itertools;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, UOp, WmmaMetadata};
+use morok_ir::{AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, WmmaMetadata};
+use tracing::debug;
 
 use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
@@ -74,8 +76,8 @@ pub fn pm_render() -> TypedPatternMatcher {
         c @ Const(_) if c.dtype().vcount() > 1 => |c| {
             let vcount = c.dtype().vcount();
             let Op::Const(cv) = c.op() else { return None };
-            let scalar_dtype = DType::Scalar(c.dtype().base());
-            let scalar_const = UOp::const_(scalar_dtype, cv.0);
+            let result_dtype = DType::Scalar(c.dtype().base());
+            let scalar_const = UOp::const_(result_dtype, cv.0);
             let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
                 .map(|_| scalar_const.clone())
                 .collect();
@@ -85,9 +87,9 @@ pub fn pm_render() -> TypedPatternMatcher {
         // VCONST → VECTORIZE of scalar CONSTs (devectorizer.py:262)
         vc @ VConst { values } => |vc, values| {
             // VConst stores different values per lane - convert each to scalar CONST
-            let scalar_dtype = DType::Scalar(vc.dtype().base());
+            let result_dtype = DType::Scalar(vc.dtype().base());
             let elements: SmallVec<[Arc<UOp>; 4]> = values.iter()
-                .map(|v| UOp::const_(scalar_dtype.clone(), *v))
+                .map(|v| UOp::const_(result_dtype.clone(), *v))
                 .collect();
             Some(UOp::vectorize(elements))
         },
@@ -160,11 +162,11 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
         for op in binary [*] {
             result @ op(lhs, rhs) if result.dtype().vcount() > 1 => |result, lhs, rhs| {
                 let vcount = result.dtype().vcount();
-                let scalar_dtype = result.dtype().scalar().map(DType::Scalar)?;
+                let result_dtype = result.dtype().scalar().map(DType::Scalar)?;
                 let alus: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
                     let gep_lhs = UOp::gep(lhs.clone(), vec![i]);
                     let gep_rhs = UOp::gep(rhs.clone(), vec![i]);
-                    UOp::new(Op::Binary(op, gep_lhs, gep_rhs), scalar_dtype.clone())
+                    UOp::new(Op::Binary(op, gep_lhs, gep_rhs), result_dtype.clone())
                 }).collect();
                 Some(UOp::vectorize(alus))
             },
@@ -173,10 +175,10 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
         for op in unary [*] {
             result @ op(src) if result.dtype().vcount() > 1 => |result, src| {
                 let vcount = result.dtype().vcount();
-                let scalar_dtype = result.dtype().scalar().map(DType::Scalar)?;
+                let result_dtype = result.dtype().scalar().map(DType::Scalar)?;
                 let alus: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
                     let gep_src = UOp::gep(src.clone(), vec![i]);
-                    UOp::new(Op::Unary(op, gep_src), scalar_dtype.clone())
+                    UOp::new(Op::Unary(op, gep_src), result_dtype.clone())
                 }).collect();
                 Some(UOp::vectorize(alus))
             },
@@ -184,10 +186,10 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
 
         Cast { src, .. } if src.dtype().vcount() > 1 => |src| {
             let vcount = src.dtype().vcount();
-            let src_scalar_dtype = src.dtype().scalar().map(DType::Scalar)?;
+            let src_result_dtype = src.dtype().scalar().map(DType::Scalar)?;
             let casts: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
                 let gep_src = UOp::gep(src.clone(), vec![i]);
-                UOp::cast(gep_src, src_scalar_dtype.clone())
+                UOp::cast(gep_src, src_result_dtype.clone())
             }).collect();
             Some(UOp::vectorize(casts))
         },
@@ -195,10 +197,10 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
         // BITCAST devectorization (Tinygrad devectorizer.py:254 includes BITCAST)
         BitCast { src, dtype } if src.dtype().vcount() > 1 => |src, dtype| {
             let vcount = src.dtype().vcount();
-            let scalar_dtype = dtype.scalar().map(DType::Scalar)?;
+            let result_dtype = dtype.scalar().map(DType::Scalar)?;
             let bitcasts: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
                 let gep_src = UOp::gep(src.clone(), vec![i]);
-                UOp::bitcast(gep_src, scalar_dtype.clone())
+                UOp::bitcast(gep_src, result_dtype.clone())
             }).collect();
             Some(UOp::vectorize(bitcasts))
         },
@@ -856,13 +858,26 @@ fn distribute_ptrcat_store(
     value: &Arc<UOp>,
     ranges: &SmallVec<[Arc<UOp>; 4]>,
 ) -> Option<Arc<UOp>> {
-    tracing::debug!(num_sources = sources.len(), "distribute_ptrcat_store");
-
+    let value_vcount = value.dtype().vcount();
     let mut stores = Vec::new();
     let mut offset = 0usize;
 
     for ptr in sources.iter() {
         let ptr_count = ptr_element_count(ptr);
+
+        // Safety check: GEP indices must not exceed value's element count
+        // If this triggers, there's a bug in earlier passes that created mismatched shapes
+        if offset + ptr_count > value_vcount {
+            panic!(
+                "ICE: incorrect Morok IR produced; PTRCAT size mismatch in distribute_ptrcat_store: \
+                 offset={}, ptr_count={}, value_vcount={} (expected value_vcount >= {})",
+                offset,
+                ptr_count,
+                value_vcount,
+                offset + ptr_count
+            );
+        }
+
         let gep_indices: Vec<usize> = (offset..offset + ptr_count).collect();
         let store_value = UOp::gep(value.clone(), gep_indices);
         stores.push(UOp::store_with_ranges(ptr.clone(), store_value, ranges.clone()));
@@ -872,9 +887,16 @@ fn distribute_ptrcat_store(
     Some(UOp::group(stores.into_iter().collect()))
 }
 
+/// Get the element count for a PTRCAT source pointer.
+///
+/// This should return the vcount of the base type, NOT the buffer size.
+/// For `Ptr { base: Scalar(Float32), size: Some(4), .. }` → 1 (scalar access)
+/// For `Ptr { base: Vector { count: 2, .. }, size: Some(2), .. }` → 2 (vec2 access)
+///
+/// Tinygrad uses `dtype.count` which returns the base type's element count.
 fn ptr_element_count(ptr: &Arc<UOp>) -> usize {
     match ptr.dtype() {
-        DType::Ptr { size, .. } => size.unwrap_or(1),
+        DType::Ptr { base, .. } => base.vcount(),
         _ => 1,
     }
 }
@@ -965,11 +987,24 @@ fn split_store(
         return None;
     };
 
-    let sz = value.dtype().vcount().max(match cast_dtype {
+    // Use the VALUE's vcount - we can only extract elements that exist in the value.
+    // Tinygrad uses the pointer type's count (devectorizer.py:132) but ensures earlier
+    // passes make value and pointer types match.
+    let sz = value.dtype().vcount();
+
+    // ICE check: pointer type should not expect more elements than value provides
+    let ptr_sz = match cast_dtype {
         DType::Ptr { size: Some(sz), .. } => *sz,
         DType::Ptr { base, .. } => base.vcount(),
         _ => 1,
-    });
+    };
+    if ptr_sz > sz {
+        panic!(
+            "ICE: incorrect Morok IR produced; split_store pointer/value size mismatch: \
+             ptr expects {} elements but value only has {}",
+            ptr_sz, sz
+        );
+    }
 
     if sz <= 1 {
         return None;
@@ -1086,6 +1121,62 @@ pub fn pm_reduce() -> TypedPatternMatcher {
     }
 }
 
+/// Convert ThreadScheduled ranges to Thread ranges.
+///
+/// Runs AFTER pm_reduce, matching Tinygrad's pm_add_gpudims ordering.
+/// This ensures reduce_to_acc never sees Thread ranges in its input_ranges,
+/// fixing incorrect accumulator placement for threaded reduce kernels.
+///
+/// # Implementation
+///
+/// Follows Tinygrad's `pm_add_gpudims` approach:
+/// 1. Match on SINK (root node) to process the entire graph at once
+/// 2. Collect all ThreadScheduled ranges from toposort
+/// 3. Build a substitution map: ThreadScheduled → Thread
+/// 4. Call `sink.substitute(&map)` to atomically replace all references
+///
+/// This is necessary because per-node pattern matching doesn't propagate
+/// substitutions correctly through the DAG (same node referenced multiple times).
+///
+/// # Pipeline Position
+///
+/// ```text
+/// 1. pm_reduce          → REDUCE → accumulator pattern (ThreadScheduled excluded from input_ranges)
+/// 2. pm_add_thread_dims → ThreadScheduled → Thread
+/// 3. pm_add_loads       → Add LOAD wrappers
+/// ```
+pub fn pm_add_thread_dims() -> TypedPatternMatcher {
+    use morok_ir::UOpKey;
+
+    crate::patterns! {
+        // Match on SINK to process the entire graph at once (like Tinygrad's pm_add_gpudims)
+        sink @ Sink { sources } => |sink, sources| {
+            let _ = sources; // Suppress unused warning
+            let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+
+            // Collect all ThreadScheduled ranges from toposort
+            for node in sink.toposort() {
+                if let Op::Range { axis_type, end, axis_id } = node.op()
+                    && *axis_type == AxisType::ThreadScheduled {
+                        let new_range = UOp::range_axis(end.clone(), *axis_id, AxisType::Thread);
+                        debug!(old_id = node.id, new_id = new_range.id, "pm_add_thread_dims: converting ThreadScheduled -> Thread");
+                        subs.insert(UOpKey(node.clone()), new_range);
+                    }
+            }
+
+            if subs.is_empty() {
+                debug!("pm_add_thread_dims: no ThreadScheduled ranges found");
+                None // No transformation needed
+            } else {
+                debug!(num_substitutions = subs.len(), "pm_add_thread_dims: applying substitutions");
+                let result = sink.substitute(&subs);
+                debug!(old_sink_id = sink.id, new_sink_id = result.id, "pm_add_thread_dims: substitution complete");
+                Some(result)
+            }
+        },
+    }
+}
+
 /// Convert a REDUCE operation to explicit accumulator pattern.
 ///
 /// Follows Tinygrad's approach (devectorizer.py:reduce_to_acc):
@@ -1103,10 +1194,9 @@ fn reduce_to_acc(
     ranges: &SmallVec<[Arc<UOp>; 4]>,
     reduce_op: &ReduceOp,
 ) -> Option<Arc<UOp>> {
-    use std::collections::HashSet;
-
+    // Use the REDUCE's actual output dtype (could be vec2 if upcasted)
+    // Tinygrad: acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, ...), ...)
     let result_dtype = red.dtype();
-    let scalar_dtype = DType::Scalar(result_dtype.scalar()?);
 
     // 1. Find input_ranges: outer ranges that are NOT the reduce ranges
     // These are ranges from the input that we need to preserve (nested loops)
@@ -1125,18 +1215,33 @@ fn reduce_to_acc(
     let input_ranges: SmallVec<[Arc<UOp>; 4]> = topo
         .iter()
         .filter(|node| {
-            matches!(node.op(), Op::Range { .. })
-                && !reduce_range_set.contains(&node.id)
-                && !ended_ranges.contains(&node.id)
+            if let Op::Range { axis_type, .. } = node.op() {
+                // Exclude parallel dispatch axes (Thread, ThreadScheduled, Global, Local, Warp)
+                // These don't represent sequential iterations for accumulator placement.
+                // This is critical for Tinygrad alignment: pm_reduce runs BEFORE pm_add_gpudims,
+                // so Thread axes shouldn't exist yet. ThreadScheduled exists but is excluded.
+                !axis_type.is_parallel() && !reduce_range_set.contains(&node.id) && !ended_ranges.contains(&node.id)
+            } else {
+                false
+            }
         })
         .cloned()
         .collect();
 
+    debug!(
+        reduce_id = red.id,
+        reduce_ranges = ?ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
+        input_ranges = ?input_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
+        ended_ranges = ?ended_ranges.iter().collect::<Vec<_>>(),
+        src_id = src.id,
+        "reduce_to_acc: processing REDUCE"
+    );
+
     // 2. Create identity element for the reduction
-    let identity = reduce_identity(*reduce_op, scalar_dtype.clone());
+    let identity = reduce_identity(*reduce_op, result_dtype.clone());
 
     // 3. Create DEFINE_REG accumulator with explicit element type
-    let acc = UOp::define_reg_typed(1, scalar_dtype.clone());
+    let acc = UOp::define_reg_typed(1, result_dtype.clone());
 
     // 4. Create index into accumulator (always index 0 for single-element acc)
     let zero_idx = UOp::index_const(0);
@@ -1148,7 +1253,7 @@ fn reduce_to_acc(
         // No outer ranges: acc.index(0).store(identity)
         let idx_init = UOp::new(
             Op::Index { buffer: acc.clone(), indices: smallvec::smallvec![zero_idx.clone()], gate: None },
-            scalar_dtype.clone(),
+            result_dtype.clone(),
         );
         idx_init.store_value(identity)
     } else {
@@ -1156,7 +1261,7 @@ fn reduce_to_acc(
         let acc_after_outer = UOp::after(acc.clone(), input_ranges);
         let idx_init = UOp::new(
             Op::Index { buffer: acc_after_outer, indices: smallvec::smallvec![zero_idx.clone()], gate: None },
-            scalar_dtype.clone(),
+            result_dtype.clone(),
         );
         idx_init.store_value(identity)
     };
@@ -1168,24 +1273,38 @@ fn reduce_to_acc(
     let acc_inside_loop = UOp::after(acc.clone(), loop_deps);
 
     let idx_loop = UOp::new(
-        Op::Index { buffer: acc_inside_loop, indices: smallvec::smallvec![zero_idx.clone()], gate: None },
-        scalar_dtype.clone(),
+        Op::Index { buffer: acc_inside_loop.clone(), indices: smallvec::smallvec![zero_idx.clone()], gate: None },
+        result_dtype.clone(),
     );
 
     // 7. Apply reduce operation: new_val = op(idx_loop, src)
-    let new_val = apply_reduce_binary(*reduce_op, idx_loop.clone(), src.clone(), &scalar_dtype);
+    let new_val = apply_reduce_binary(*reduce_op, idx_loop.clone(), src.clone(), &result_dtype);
 
     // 8. Store new value back to accumulator (idx_loop contains the INDEX, not acc directly)
     let store_loop = idx_loop.store_value(new_val);
 
     // 9. End the reduce ranges after the store
-    let end = UOp::end(store_loop, ranges.clone());
+    let end = UOp::end(store_loop.clone(), ranges.clone());
 
     // 10. Final value AFTER loop completes
     // acc.after(end).index(0)
-    let acc_after_end = UOp::after(acc.clone(), smallvec::smallvec![end]);
-    let idx_final =
-        UOp::new(Op::Index { buffer: acc_after_end, indices: smallvec::smallvec![zero_idx], gate: None }, scalar_dtype);
+    let acc_after_end = UOp::after(acc.clone(), smallvec::smallvec![end.clone()]);
+    let idx_final = UOp::new(
+        Op::Index { buffer: acc_after_end.clone(), indices: smallvec::smallvec![zero_idx], gate: None },
+        result_dtype,
+    );
+
+    debug!(
+        acc_id = acc.id,
+        store_init_id = store_init.id,
+        acc_inside_loop_id = acc_inside_loop.id,
+        idx_loop_id = idx_loop.id,
+        store_loop_id = store_loop.id,
+        end_id = end.id,
+        acc_after_end_id = acc_after_end.id,
+        idx_final_id = idx_final.id,
+        "reduce_to_acc: created accumulator pattern"
+    );
 
     Some(idx_final)
 }

@@ -230,9 +230,13 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
 /// - K-vectorization would create 16×K wide vectors, causing strided B access
 /// - We skip K-unrolling entirely; LLVM can unroll the scalar K loop if beneficial
 pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    use tracing::debug;
+
     let mut applied = false;
     let unrollable = scheduler.unrollable_dims();
     let threshold = config.unroll_threshold as i64;
+
+    debug!(?unrollable, threshold, "apply_unroll: starting");
 
     // Calculate output-per-thread - determines how many elements each thread writes.
     // For full reductions (no output axes), output_per_thread = 1, preventing UNROLL.
@@ -273,6 +277,8 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
             if thread_count > 0 { effective_output_size / thread_count } else { effective_output_size }
         }
     };
+
+    debug!(output_per_thread, upcast_size = scheduler.upcast_size(), "apply_unroll: calculated output_per_thread");
 
     // Compute SIMD width from reduce dtype (assuming AVX 256-bit = 32 bytes)
     // For f32: 32/4 = 8, for f64: 32/8 = 4, for f16: 32/2 = 16
@@ -327,6 +333,12 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
         // Generic guard: skip if combined upcast_size would exceed 32
         // This prevents exponential vector width growth from multiple unroll sources
         if scheduler.upcast_size() * factor > 32 {
+            debug!(
+                axis_idx,
+                factor,
+                upcast_size = scheduler.upcast_size(),
+                "apply_unroll: skipping (upcast would exceed 32)"
+            );
             continue;
         }
 
@@ -334,14 +346,17 @@ pub fn apply_unroll(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> boo
         // Unrolling reduce creates Vector<N> accumulators; each thread must have
         // enough output elements to store the vector without overlapping neighbors
         if factor > output_per_thread {
+            debug!(axis_idx, factor, output_per_thread, "apply_unroll: skipping (factor > output_per_thread)");
             continue;
         }
 
+        debug!(axis_idx, factor, "apply_unroll: applying unroll");
         let unroll_axes = scheduler.unrollable_dims();
         if let Some(logical) = unroll_axes.iter().position(|&a| a == axis_idx)
             && apply_opt(scheduler, &Opt::unroll(logical, factor), true).is_ok()
         {
             applied = true;
+            debug!(axis_idx, factor, "apply_unroll: successfully applied");
         }
     }
     applied

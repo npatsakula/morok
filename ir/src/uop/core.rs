@@ -1225,6 +1225,13 @@ impl UOp {
                 {
                     return self.clone();
                 }
+                // Validate: AFTER passthrough must not be control flow (Tinygrad semantics)
+                debug_assert!(
+                    !matches!(new_passthrough.op(), Op::Range { .. } | Op::End { .. }),
+                    "substitute: AFTER passthrough became {:?} (id={}), violates Tinygrad semantics",
+                    new_passthrough.op(),
+                    new_passthrough.id
+                );
                 Op::After { passthrough: new_passthrough, deps: new_deps }
             }
             Op::Custom { code, deps } => {
@@ -1493,7 +1500,15 @@ impl UOp {
             }
             Op::After { .. } => {
                 assert!(!new_srcs.is_empty());
-                Op::After { passthrough: src(0), deps: new_srcs[1..].iter().cloned().collect() }
+                let passthrough = src(0);
+                // Validate: AFTER passthrough must not be control flow (Tinygrad semantics)
+                debug_assert!(
+                    !matches!(passthrough.op(), Op::Range { .. } | Op::End { .. }),
+                    "reconstruct_sources: AFTER passthrough is {:?} (id={}), violates Tinygrad semantics",
+                    passthrough.op(),
+                    passthrough.id
+                );
+                Op::After { passthrough, deps: new_srcs[1..].iter().cloned().collect() }
             }
             Op::Precast { .. } => {
                 assert_eq!(new_srcs.len(), 1);

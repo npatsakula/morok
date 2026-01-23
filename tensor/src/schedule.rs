@@ -128,11 +128,12 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
             });
 
             if let Some(k) = kernel
-                && let Some(&idx) = kernel_idx.get(&k.id) {
-                    // Use buf_uop() to get underlying buffer ID (handles AFTER chains)
-                    let buf_id = passthrough.buf_uop().id;
-                    buf_to_writer.insert(buf_id, idx);
-                }
+                && let Some(&idx) = kernel_idx.get(&k.id)
+            {
+                // Use buf_uop() to get underlying buffer ID (handles AFTER chains)
+                let buf_id = passthrough.buf_uop().id;
+                buf_to_writer.insert(buf_id, idx);
+            }
         }
     }
 
@@ -151,9 +152,10 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
 
                 // If another kernel writes this buffer, we depend on it
                 if let Some(&writer_idx) = buf_to_writer.get(&buf_id)
-                    && writer_idx != idx {
-                        dependencies[idx].insert(writer_idx);
-                    }
+                    && writer_idx != idx
+                {
+                    dependencies[idx].insert(writer_idx);
+                }
             }
         }
     }

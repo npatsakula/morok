@@ -328,6 +328,7 @@ fn test_sum_axis1_value() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn test_sum_keepdim_value() {
     let _guard = test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();

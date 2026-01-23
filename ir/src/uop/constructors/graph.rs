@@ -52,7 +52,22 @@ impl UOp {
     // =========================================================================
 
     /// Ordering constraint: passthrough depends on deps.
+    ///
+    /// # Arguments
+    /// * `passthrough` - The value being passed through (must be data-producing node)
+    /// * `deps` - Dependencies that must complete before this value is used
+    ///
+    /// # Panics (debug only)
+    /// Panics if passthrough is a control flow node (Range, End)
     pub fn after(passthrough: Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            !matches!(passthrough.op(), Op::Range { .. } | Op::End { .. }),
+            "AFTER passthrough must be data-producing node, got {:?} (id={})",
+            passthrough.op(),
+            passthrough.id
+        );
+
         let dtype = passthrough.dtype();
         Self::new(Op::After { passthrough, deps }, dtype)
     }

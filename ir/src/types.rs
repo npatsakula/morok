@@ -306,6 +306,12 @@ pub enum AxisType {
     Unroll,
     /// Thread dimension.
     Thread,
+    /// Thread dimension scheduled for deferred conversion.
+    ///
+    /// Created by apply_thread() and converted to Thread by pm_add_thread_dims()
+    /// AFTER pm_reduce runs. This ensures reduce_to_acc never sees Thread ranges,
+    /// matching Tinygrad's pm_add_gpudims ordering.
+    ThreadScheduled,
 }
 
 impl AxisType {
@@ -326,7 +332,7 @@ impl AxisType {
     /// **Priority Order:**
     /// - Outer: -2 (kernel-level boundary)
     /// - Loop: -1 (not yet parallelized)
-    /// - Global/Thread: 0 (outer parallelism)
+    /// - Global/Thread/ThreadScheduled: 0 (outer parallelism)
     /// - Warp: 1 (sub-group parallelism)
     /// - Local/GroupReduce: 2 (workgroup parallelism + synchronization)
     /// - Upcast: 3 (vectorization)
@@ -336,7 +342,7 @@ impl AxisType {
         match self {
             Self::Outer => -2,
             Self::Loop => -1,
-            Self::Global | Self::Thread => 0,
+            Self::Global | Self::Thread | Self::ThreadScheduled => 0,
             Self::Warp => 1,
             Self::Local | Self::GroupReduce => 2,
             Self::Upcast => 3,
@@ -354,6 +360,7 @@ impl AxisType {
     /// - L: Loop
     /// - g: Global
     /// - t: Thread
+    /// - S: ThreadScheduled (temporary, before conversion to Thread)
     /// - w: Warp
     /// - l: Local
     /// - G: GroupReduce
@@ -366,6 +373,7 @@ impl AxisType {
             Self::Loop => 'L',
             Self::Global => 'g',
             Self::Thread => 't',
+            Self::ThreadScheduled => 'S',
             Self::Warp => 'w',
             Self::Local => 'l',
             Self::GroupReduce => 'G',
@@ -376,8 +384,11 @@ impl AxisType {
     }
 
     /// Returns true if this is a parallelizable axis type.
+    ///
+    /// Parallel axes represent GPU/thread dispatch dimensions that don't
+    /// contribute to accumulator placement in reduce_to_acc.
     pub const fn is_parallel(self) -> bool {
-        matches!(self, Self::Global | Self::Thread | Self::Local | Self::Warp)
+        matches!(self, Self::Global | Self::Thread | Self::ThreadScheduled | Self::Local | Self::Warp)
     }
 
     /// Returns true if this is a reduction axis type.

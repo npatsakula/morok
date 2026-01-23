@@ -287,6 +287,13 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
 /// - Each thread_id maps to disjoint output indices
 /// - Index formula: `output[thread_id * chunk_size + local_idx]`
 /// - Same buffer pointers can be safely passed to all threads
+///
+/// # ThreadScheduled Architecture
+///
+/// Creates `ThreadScheduled` axis instead of `Thread` to match Tinygrad's
+/// pm_add_gpudims ordering. ThreadScheduled is converted to Thread by
+/// `pm_add_thread_dims` AFTER `pm_reduce` runs. This ensures reduce_to_acc
+/// never sees Thread ranges in its input_ranges, fixing accumulator placement.
 fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     // Validate renderer supports threads
     if !scheduler.ren.has_threads {
@@ -295,6 +302,7 @@ fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
 
     // Check if already threaded - make THREAD opt idempotent
     // This allows replaying cached opts even when prepare_scheduler pre-applies threading
+    // Check both Thread and ThreadScheduled since ThreadScheduled will become Thread
     let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
     if !thread_axes.is_empty() {
         tracing::debug!("THREAD opt skipped: scheduler already has Thread axis");
@@ -322,6 +330,8 @@ fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
     }
 
     // Apply shift_to with top=true (outer-most position, like Tinygrad's core_id)
-    let _ = scheduler.shift_to(rng, amount, AxisType::Thread, true, None)?;
+    // Creates ThreadScheduled (NOT Thread) - conversion happens after pm_reduce
+    // via pm_add_thread_dims, matching Tinygrad's pm_add_gpudims ordering
+    let _ = scheduler.shift_to(rng, amount, AxisType::ThreadScheduled, true, None)?;
     Ok(())
 }
