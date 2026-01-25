@@ -104,38 +104,39 @@ impl CFGContext {
 
         for node in &nodes {
             if matches!(node.op(), Op::End { .. } | Op::Sink { .. })
-                && let Some(node_deps) = deps.get(&UOpKey(node.clone())) {
-                    for dep_key in node_deps.keys() {
-                        // Only consider END nodes
-                        if !matches!(dep_key.0.op(), Op::End { .. }) {
-                            continue;
-                        }
+                && let Some(node_deps) = deps.get(&UOpKey(node.clone()))
+            {
+                for dep_key in node_deps.keys() {
+                    // Only consider END nodes
+                    if !matches!(dep_key.0.op(), Op::End { .. }) {
+                        continue;
+                    }
 
-                        // Skip if already assigned
-                        if nesting.contains_key(dep_key) {
-                            continue;
-                        }
+                    // Skip if already assigned
+                    if nesting.contains_key(dep_key) {
+                        continue;
+                    }
 
-                        // Check nesting condition
-                        let is_nested = if matches!(node.op(), Op::Sink { .. }) {
-                            true
-                        } else if let Op::End { ranges, .. } = node.op() {
-                            // Check if node's RANGE is in dep's dependencies
-                            // node.src[1] in Tinygrad is the RANGE - we get it from ranges
-                            if let Some(range) = ranges.first() {
-                                deps.get(dep_key).is_some_and(|dep_deps| dep_deps.contains_key(&UOpKey(range.clone())))
-                            } else {
-                                false
-                            }
+                    // Check nesting condition
+                    let is_nested = if matches!(node.op(), Op::Sink { .. }) {
+                        true
+                    } else if let Op::End { ranges, .. } = node.op() {
+                        // Check if node's RANGE is in dep's dependencies
+                        // node.src[1] in Tinygrad is the RANGE - we get it from ranges
+                        if let Some(range) = ranges.first() {
+                            deps.get(dep_key).is_some_and(|dep_deps| dep_deps.contains_key(&UOpKey(range.clone())))
                         } else {
                             false
-                        };
-
-                        if is_nested {
-                            nesting.insert(dep_key.clone(), node.clone());
                         }
+                    } else {
+                        false
+                    };
+
+                    if is_nested {
+                        nesting.insert(dep_key.clone(), node.clone());
                     }
                 }
+            }
         }
 
         // Step 3: Group siblings by parent

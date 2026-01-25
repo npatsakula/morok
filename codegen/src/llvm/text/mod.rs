@@ -100,10 +100,9 @@ impl Renderer for LlvmTextRenderer {
         buffers.sort_by_key(|b| if let Op::DefineGlobal(id) = b.op() { *id } else { usize::MAX });
 
         // Detect Thread ranges - these become dispatch dimensions, not loops
-        // Also accept ThreadScheduled defensively (should be converted by pm_add_thread_dims, but be safe)
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
             if let Op::Range { axis_type, end, .. } = n.op()
-                && matches!(axis_type, AxisType::Thread | AxisType::ThreadScheduled)
+                && matches!(axis_type, AxisType::Thread)
                 && let Op::Const(cv) = end.op()
                 && let ConstValue::Int(count) = cv.0
             {
@@ -201,8 +200,8 @@ impl Renderer for LlvmTextRenderer {
         // Pre-register Range variables by axis_id
         for node in &nodes {
             if let Op::Range { axis_id, axis_type, .. } = node.op() {
-                // Thread/ThreadScheduled ranges already registered above via thread_id parameter
-                if !matches!(axis_type, AxisType::Thread | AxisType::ThreadScheduled) {
+                // Thread ranges already registered above via thread_id parameter
+                if !matches!(axis_type, AxisType::Thread) {
                     let name = format!("%r{}", axis_id.value());
                     ctx.register(node.id, name);
                 }
@@ -212,9 +211,9 @@ impl Renderer for LlvmTextRenderer {
         // Single pass: process all nodes in linearization order
         // This ensures DefineReg allocas are emitted before any RANGE loops that use them
         for node in &nodes {
-            // Skip Thread/ThreadScheduled ranges (handled via thread_id parameter)
+            // Skip Thread ranges (handled via thread_id parameter)
             if let Op::Range { axis_type, .. } = node.op()
-                && matches!(axis_type, AxisType::Thread | AxisType::ThreadScheduled)
+                && matches!(axis_type, AxisType::Thread)
             {
                 continue;
             }

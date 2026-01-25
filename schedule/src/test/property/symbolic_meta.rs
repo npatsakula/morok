@@ -10,7 +10,7 @@ use proptest::prelude::*;
 use morok_dtype::DType;
 use morok_ir::UOp;
 
-use crate::rewrite::graph_rewrite;
+use crate::rewrite::graph_rewrite_top_down;
 use crate::symbolic::symbolic_simple;
 
 // Import generators and utilities from ir crate
@@ -31,8 +31,8 @@ proptest! {
     fn symbolic_idempotent(graph in arb_arithmetic_tree_up_to(DType::Int32, 4)) {
         let matcher = symbolic_simple();
 
-        let once = graph_rewrite(&matcher, graph.clone(), &mut ());
-        let twice = graph_rewrite(&matcher, once.clone(), &mut ());
+        let once = graph_rewrite_top_down(&matcher, graph.clone(), &mut ());
+        let twice = graph_rewrite_top_down(&matcher, once.clone(), &mut ());
 
         prop_assert!(Arc::ptr_eq(&once, &twice),
             "Optimizing twice should give same result as optimizing once");
@@ -44,8 +44,8 @@ proptest! {
         let graph = kpg.build();
         let matcher = symbolic_simple();
 
-        let once = graph_rewrite(&matcher, graph, &mut ());
-        let twice = graph_rewrite(&matcher, once.clone(), &mut ());
+        let once = graph_rewrite_top_down(&matcher, graph, &mut ());
+        let twice = graph_rewrite_top_down(&matcher, once.clone(), &mut ());
 
         prop_assert!(Arc::ptr_eq(&once, &twice),
             "Known property graphs should be idempotent");
@@ -68,7 +68,7 @@ proptest! {
         let original_count = uop_op_count(&graph);
 
         let matcher = symbolic_simple();
-        let optimized = graph_rewrite(&matcher, graph, &mut ());
+        let optimized = graph_rewrite_top_down(&matcher, graph, &mut ());
 
         let optimized_count = uop_op_count(&optimized);
 
@@ -87,7 +87,7 @@ proptest! {
         let original_depth = uop_depth(&graph);
 
         let matcher = symbolic_simple();
-        let optimized = graph_rewrite(&matcher, graph, &mut ());
+        let optimized = graph_rewrite_top_down(&matcher, graph, &mut ());
 
         let optimized_depth = uop_depth(&optimized);
 
@@ -111,7 +111,7 @@ proptest! {
         let original_dtype = graph.dtype().clone();
 
         let matcher = symbolic_simple();
-        let optimized = graph_rewrite(&matcher, graph, &mut ());
+        let optimized = graph_rewrite_top_down(&matcher, graph, &mut ());
 
         let optimized_dtype = optimized.dtype().clone();
 
@@ -123,7 +123,7 @@ proptest! {
     #[test]
     fn constants_properly_typed(graph in arb_arithmetic_tree_up_to(DType::Int32, 4)) {
         let matcher = symbolic_simple();
-        let optimized = graph_rewrite(&matcher, graph, &mut ());
+        let optimized = graph_rewrite_top_down(&matcher, graph, &mut ());
 
         // Walk the graph and verify all constants have matching dtypes
         verify_constant_dtypes(&optimized)?;
@@ -135,7 +135,7 @@ proptest! {
     #[test]
     fn no_cycles_created(graph in arb_arithmetic_tree_up_to(DType::Int32, 4)) {
         let matcher = symbolic_simple();
-        let optimized = graph_rewrite(&matcher, graph, &mut ());
+        let optimized = graph_rewrite_top_down(&matcher, graph, &mut ());
 
         // Use toposort to detect cycles - it will panic if graph has cycles
         let _topo = optimized.toposort();
@@ -167,8 +167,8 @@ proptest! {
         let matcher = symbolic_simple();
 
         // Optimize subexpressions first
-        let opt_a = graph_rewrite(&matcher, a.clone(), &mut ());
-        let opt_b = graph_rewrite(&matcher, b.clone(), &mut ());
+        let opt_a = graph_rewrite_top_down(&matcher, a.clone(), &mut ());
+        let opt_b = graph_rewrite_top_down(&matcher, b.clone(), &mut ());
 
         // Build expression with optimized subexpressions
         let expr_opt_subs = UOp::new(
@@ -177,7 +177,7 @@ proptest! {
         );
 
         // Optimize the composed expression
-        let final_opt = graph_rewrite(&matcher, expr_opt_subs, &mut ());
+        let final_opt = graph_rewrite_top_down(&matcher, expr_opt_subs, &mut ());
 
         // Operation count of final result should be minimal
         let final_count = uop_op_count(&final_opt);
@@ -187,7 +187,7 @@ proptest! {
             morok_ir::Op::Binary(op, a, b),
             DType::Int32,
         );
-        let direct_opt = graph_rewrite(&matcher, expr_unopt, &mut ());
+        let direct_opt = graph_rewrite_top_down(&matcher, expr_unopt, &mut ());
         let direct_count = uop_op_count(&direct_opt);
 
         // Both approaches should give similar results

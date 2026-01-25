@@ -21,7 +21,6 @@ fn test_flatten_range_impl_non_supported_op() {
 #[test]
 fn test_flatten_range_impl_no_ranges() {
     // STORE operation with no ranges should return None
-    let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = UOp::store(index, value);

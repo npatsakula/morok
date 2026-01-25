@@ -33,7 +33,7 @@
 //! };
 //!
 //! // Pass context at rewrite time
-//! let result = graph_rewrite(&matcher, root, &mut ctx);
+//! let result = graph_rewrite_top_down(&matcher, root, &mut ctx);
 //! ```
 //!
 //! Patterns that don't need context use `()` as the context type:
@@ -42,8 +42,10 @@
 //! let matcher = patterns! {
 //!     Add(x, @zero) ~> |x| x.clone(),
 //! };
-//! let result = graph_rewrite(&matcher, root, &mut ());
+//! let result = graph_rewrite_top_down(&matcher, root, &mut ());
 //! ```
+
+use bon::Builder;
 
 use crate::{UOp, UOpKey};
 use std::collections::{HashMap, HashSet};
@@ -104,16 +106,13 @@ impl StackEntry {
 /// Provides O(α(n)) amortized lookup via path compression, where α is the
 /// inverse Ackermann function (practically constant). This is much faster
 /// than the O(chain_length) traversal of naive chain following.
+#[derive(Default)]
 struct ResultMap {
     /// Maps each node to its final result (with path compression on lookup)
     results: HashMap<UOpKey, Arc<UOp>>,
 }
 
 impl ResultMap {
-    fn new() -> Self {
-        Self { results: HashMap::new() }
-    }
-
     /// Get the final result for a node with path compression.
     ///
     /// Follows the chain of rewrites and compresses the path so future
@@ -174,6 +173,8 @@ impl ResultMap {
 /// Internal rewrite engine that implements the 2-stage stack-based algorithm.
 ///
 /// Generic over matcher type `M` and context type `C` for compile-time type-safe matching.
+#[derive(Builder)]
+#[allow(clippy::mutable_key_type)]
 struct RewriteEngine<'a, M, C>
 where
     M: Matcher<C>,
@@ -186,15 +187,18 @@ where
 
     /// Final results cache: maps original node → optimized result
     /// Uses path compression for O(α(n)) amortized lookups
+    #[builder(default = ResultMap::default())]
     results: ResultMap,
 
     /// Nodes pending processing (prevents duplicate pushes in DAGs).
     /// A node is in this set if it's currently on the stack or being processed.
+    #[builder(default = HashSet::default())]
     pending: HashSet<UOpKey>,
 
     /// Whether to always process children (bottom-up traversal).
     /// When true, all nodes have their children processed first.
     /// When false (default), only patterns returning Gate trigger child processing.
+    #[builder(default = true)]
     bottom_up: bool,
 }
 
@@ -202,14 +206,6 @@ impl<'a, M, C> RewriteEngine<'a, M, C>
 where
     M: Matcher<C>,
 {
-    fn new(matcher: &'a M, ctx: &'a mut C) -> Self {
-        Self { matcher, ctx, results: ResultMap::new(), pending: HashSet::new(), bottom_up: false }
-    }
-
-    fn new_bottom_up(matcher: &'a M, ctx: &'a mut C) -> Self {
-        Self { matcher, ctx, results: ResultMap::new(), pending: HashSet::new(), bottom_up: true }
-    }
-
     /// Stage 0: Bottom-up fixed-point pattern matching.
     ///
     /// Applies patterns to the node until no more rewrites are possible.
@@ -454,72 +450,20 @@ where
     }
 }
 
-// Note: UOpKey uses stable UOp.id for hashing/equality, avoiding pointer-based ABA issues.
-
 /// Apply graph rewriting to a UOp graph using the given pattern matcher.
 ///
 /// This is the main entry point for graph rewriting. It applies a 2-stage
 /// stack-based algorithm with fixed-point iteration.
-///
-/// # Type Parameters
-///
-/// * `C` - Context type passed through to pattern rewrite functions.
-///   Use `()` for patterns that don't need context.
-///
-/// # Algorithm
-///
-/// 1. **Stage 0** (Rewrite): Try to match patterns against the current node.
-///    - Apply patterns in fixed-point loop until no more matches
-///    - If `Gate` is returned, push children for processing first (bottom-up)
-///    - Otherwise, patterns see original children (top-down)
-///
-/// 2. **Stage 1** (Finalize): Reconstruct with children's results
-///    - If reconstruction creates a new node, it's pushed back for rewriting
-///    - Enables multi-stage optimizations (e.g., `WHERE(Lt(x,y),t,f) → WHERE(false,t,f) → f`)
-///    - Link original node to final result
-///
-/// # Example
-///
-/// ```ignore
-/// use morok_ir::{TypedPatternMatcher, graph_rewrite};
-/// use morok_ir::UOp;
-///
-/// // Patterns without context
-/// let matcher = TypedPatternMatcher::<()>::new();
-/// let optimized = graph_rewrite(&matcher, root_uop, &mut ());
-///
-/// // Patterns with context
-/// let mut matcher = TypedPatternMatcher::<KernelContext>::new();
-/// // ... add patterns ...
-/// let mut ctx = KernelContext::new();
-/// let optimized = graph_rewrite(&matcher, root_uop, &mut ctx);
-/// ```
-pub fn graph_rewrite<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
-where
-    M: Matcher<C>,
-{
-    let mut engine = RewriteEngine::new(matcher, ctx);
-    engine.rewrite(root)
+pub fn graph_rewrite_top_down<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+    RewriteEngine::builder().matcher(matcher).ctx(ctx).bottom_up(false).build().rewrite(root)
 }
 
 /// Apply graph rewriting with bottom-up traversal.
 ///
-/// Like `graph_rewrite`, but always processes children before parents.
+/// Like `graph_rewrite_top_down`, but always processes children before parents.
 /// Use this for patterns that need to transform deep nodes in the graph.
-///
-/// # Example
-///
-/// ```ignore
-/// // Use bottom-up for patterns that need to transform deep nodes
-/// let matcher = to_define_global_patterns();
-/// let optimized = graph_rewrite_bottom_up(&matcher, root, &mut ctx);
-/// ```
-pub fn graph_rewrite_bottom_up<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
-where
-    M: Matcher<C>,
-{
-    let mut engine = RewriteEngine::new_bottom_up(matcher, ctx);
-    engine.rewrite(root)
+pub fn graph_rewrite_bottom_up<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+    RewriteEngine::builder().matcher(matcher).ctx(ctx).bottom_up(true).build().rewrite(root)
 }
 
 /// Result of graph rewriting including the transformation map.
@@ -539,26 +483,15 @@ pub struct GraphRewriteOutput {
 /// Like `graph_rewrite`, but also returns a `becomes_map` that tracks which
 /// original nodes were transformed to which new nodes. This is essential for
 /// global graph coordination where multiple tensors share subgraphs.
-///
-/// # Example
-///
-/// ```ignore
-/// let result = graph_rewrite_with_map(&matcher, root, &mut ctx);
-/// // Apply transformations globally
-/// apply_map_to_tensors(&result.becomes_map);
-/// ```
 #[allow(clippy::mutable_key_type)]
-pub fn graph_rewrite_with_map<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> GraphRewriteOutput
+pub fn graph_rewrite_top_down_with_map<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> GraphRewriteOutput
 where
     M: Matcher<C>,
 {
-    let mut engine = RewriteEngine::new(matcher, ctx);
+    let mut engine = RewriteEngine::builder().matcher(matcher).ctx(ctx).bottom_up(false).build();
     let result_root = engine.rewrite(root.clone());
-
     // Extract becomes_map: only include entries where the result differs from original
-    let becomes_map: HashMap<UOpKey, Arc<UOp>> =
-        engine.results.results.into_iter().filter(|(k, v)| !Arc::ptr_eq(&k.0, v)).collect();
-
+    let becomes_map = engine.results.results.into_iter().filter(|(k, v)| !Arc::ptr_eq(&k.0, v)).collect();
     GraphRewriteOutput { root: result_root, becomes_map }
 }
 
@@ -570,12 +503,9 @@ pub fn graph_rewrite_bottom_up_with_map<M, C>(matcher: &M, root: Arc<UOp>, ctx: 
 where
     M: Matcher<C>,
 {
-    let mut engine = RewriteEngine::new_bottom_up(matcher, ctx);
+    let mut engine = RewriteEngine::builder().matcher(matcher).ctx(ctx).bottom_up(true).build();
     let result_root = engine.rewrite(root.clone());
-
     // Extract becomes_map: only include entries where the result differs from original
-    let becomes_map: HashMap<UOpKey, Arc<UOp>> =
-        engine.results.results.into_iter().filter(|(k, v)| !Arc::ptr_eq(&k.0, v)).collect();
-
+    let becomes_map = engine.results.results.into_iter().filter(|(k, v)| !Arc::ptr_eq(&k.0, v)).collect();
     GraphRewriteOutput { root: result_root, becomes_map }
 }

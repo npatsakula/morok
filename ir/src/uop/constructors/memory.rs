@@ -49,12 +49,13 @@ impl UOp {
     /// UOp::index().buffer(buf).indices(vec![idx]).gate(gate_uop).call()?
     /// ```
     #[builder]
-    pub fn index(
+    pub fn index<I: Into<SmallVec<[Arc<Self>; 4]>>>(
         buffer: Arc<Self>,
-        indices: Vec<Arc<Self>>,
+        indices: I,
         gate: Option<Arc<Self>>,
         dtype: Option<DType>,
     ) -> Result<Arc<Self>> {
+        let indices = indices.into();
         // Validate that all indices have Index dtype
         for idx in &indices {
             let idx_dtype = idx.dtype();
@@ -68,7 +69,6 @@ impl UOp {
             other => other,
         });
 
-        let indices = SmallVec::from_vec(indices);
         Ok(Self::new(Op::Index { buffer, indices, gate }, result_dtype))
     }
 

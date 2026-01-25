@@ -457,12 +457,6 @@ impl Scheduler {
     ///
     /// Vector of indices into `rngs()` for matching axes.
     ///
-    /// # Note
-    ///
-    /// `ThreadScheduled` is treated as `Thread` for optimizer queries. This allows
-    /// heuristics that query for Thread axes to find ThreadScheduled axes before
-    /// they are converted by pm_add_thread_dims.
-    ///
     /// # Example
     ///
     /// ```ignore
@@ -479,11 +473,7 @@ impl Scheduler {
             .enumerate()
             .filter_map(|(i, rng)| {
                 if let Op::Range { axis_type, .. } = rng.op() {
-                    // Treat ThreadScheduled as Thread for optimizer queries
-                    // This ensures heuristics see ThreadScheduled axes when querying for Thread
-                    let effective_type =
-                        if *axis_type == AxisType::ThreadScheduled { AxisType::Thread } else { *axis_type };
-                    if types.contains(&effective_type) { Some(i) } else { None }
+                    if types.contains(axis_type) { Some(i) } else { None }
                 } else {
                     None
                 }
@@ -1127,7 +1117,6 @@ impl Scheduler {
                             AxisType::Unroll => "r",
                             AxisType::Warp => "w",
                             AxisType::Thread => "t",
-                            AxisType::ThreadScheduled => "S",
                             AxisType::Outer => "O",
                         };
 

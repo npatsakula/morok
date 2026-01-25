@@ -62,7 +62,7 @@ fn test_bufferize_to_store_global() {
         panic!("Expected INDEX operation, got {:?}", index.op());
     };
     assert!(matches!(buffer.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", buffer.op());
-    assert!(std::sync::Arc::ptr_eq(buffer, &passthrough));
+    assert!(std::sync::Arc::ptr_eq(buffer, passthrough));
 
     // Value should be the compute
     assert!(std::sync::Arc::ptr_eq(value, &compute));
@@ -192,7 +192,7 @@ fn test_bufferize_to_store_multiple_ranges() {
 
     // Buffer should be BUFFER (same as passthrough)
     assert!(matches!(idx_buffer.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", idx_buffer.op());
-    assert!(std::sync::Arc::ptr_eq(idx_buffer, &passthrough));
+    assert!(std::sync::Arc::ptr_eq(idx_buffer, passthrough));
 
     // Should have 1 linearized index (not 2 separate ranges)
     assert_eq!(indices.len(), 1, "Multi-index should be linearized to single index");

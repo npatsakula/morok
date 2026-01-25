@@ -10,7 +10,7 @@ use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, Op, SInt, UOp};
 
 use crate::rangeify::patterns::movement_op_patterns;
-use crate::rewrite::graph_rewrite;
+use crate::rewrite::graph_rewrite_top_down;
 
 // ===== Helper Functions =====
 
@@ -53,7 +53,7 @@ fn test_expand_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
+    let result = graph_rewrite_top_down(&pm, indexed, &mut ());
 
     // Verify: should transform all movement ops through INDEX
     // Final result: buffer.INDEX([flattened_index])
@@ -94,7 +94,7 @@ fn test_permute_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
+    let result = graph_rewrite_top_down(&pm, indexed, &mut ());
 
     // Verify transformation
     assert!(matches!(result.op(), Op::Index { .. }));
@@ -129,7 +129,7 @@ fn test_reshape_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
+    let result = graph_rewrite_top_down(&pm, indexed, &mut ());
 
     // Verify: should have INDEX with combined indices
     assert!(matches!(result.op(), Op::Index { .. }));
@@ -164,7 +164,7 @@ fn test_shrink_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
+    let result = graph_rewrite_top_down(&pm, indexed, &mut ());
 
     // Verify transformation
     assert!(matches!(result.op(), Op::Index { .. }));
@@ -190,7 +190,7 @@ fn test_flip_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
+    let result = graph_rewrite_top_down(&pm, indexed, &mut ());
 
     // Verify transformation
     assert!(matches!(result.op(), Op::Index { .. }));
@@ -218,7 +218,7 @@ fn test_pad_index_transformation() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
+    let result = graph_rewrite_top_down(&pm, indexed, &mut ());
 
     // Verify transformation
     assert!(matches!(result.op(), Op::Index { .. }));
@@ -241,7 +241,7 @@ fn test_non_movement_op_no_match() {
 
     // Apply pattern
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
+    let result = graph_rewrite_top_down(&pm, indexed, &mut ());
 
     // Should NOT transform (no movement op)
     // The result should still have the NEG operation somewhere in the tree
@@ -279,7 +279,7 @@ fn test_nested_movement_ops() {
 
     // Apply pattern (should iterate multiple times)
     let pm = movement_op_patterns();
-    let result = graph_rewrite(&pm, indexed, &mut ());
+    let result = graph_rewrite_top_down(&pm, indexed, &mut ());
 
     // Verify: should have transformed through all movement ops
     assert!(matches!(result.op(), Op::Index { .. }));

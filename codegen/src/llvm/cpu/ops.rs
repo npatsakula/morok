@@ -1171,10 +1171,9 @@ fn codegen_range<'ctx>(
     // - With REDUCE ops: Reduce ranges are skipped (in source subgraph)
     // - Without REDUCE ops: Reduce ranges are processed normally
 
-    // THREAD/ThreadScheduled ranges: Don't create loop, use thread_id parameter
+    // Thread ranges: Don't create loop, use thread_id parameter
     // The thread_id was set by mod.rs during kernel function setup
-    // ThreadScheduled should be converted by pm_add_thread_dims, but handle defensively
-    if matches!(axis_type, AxisType::Thread | AxisType::ThreadScheduled) {
+    if matches!(axis_type, AxisType::Thread) {
         // Thread range value comes from thread_id parameter (set in mod.rs)
         // Already registered in values during kernel setup by axis_id
         if let Some(val) = values.get_range_by_axis(_axis_id.value()) {

@@ -5,7 +5,7 @@ use morok_ir::types::TernaryOp;
 use morok_ir::{Op, UOp};
 use std::sync::Arc;
 
-use crate::rewrite::graph_rewrite;
+use crate::rewrite::graph_rewrite_top_down;
 use crate::symbolic::symbolic_simple;
 
 #[test]
@@ -18,7 +18,7 @@ fn test_where_always_true() {
     let where_op = UOp::try_where(cond, true_branch.clone(), false_branch).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op, &mut ());
+    let result = graph_rewrite_top_down(&matcher, where_op, &mut ());
 
     // Should eliminate to true branch
     assert!(Arc::ptr_eq(&result, &true_branch));
@@ -34,7 +34,7 @@ fn test_where_always_false() {
     let where_op = UOp::try_where(cond, true_branch, false_branch.clone()).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op, &mut ());
+    let result = graph_rewrite_top_down(&matcher, where_op, &mut ());
 
     // Should eliminate to false branch
     assert!(Arc::ptr_eq(&result, &false_branch));
@@ -53,7 +53,7 @@ fn test_where_range_based_true() {
     let where_op = UOp::try_where(cond, true_branch.clone(), false_branch).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op, &mut ());
+    let result = graph_rewrite_top_down(&matcher, where_op, &mut ());
 
     // The comparison should be folded to true, then WHERE should select true branch
     assert!(Arc::ptr_eq(&result, &true_branch));
@@ -72,7 +72,7 @@ fn test_where_unknown_condition() {
     let where_op = UOp::try_where(cond.clone(), true_branch.clone(), false_branch.clone()).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op, &mut ());
+    let result = graph_rewrite_top_down(&matcher, where_op, &mut ());
 
     // Should not be eliminated (condition is not constant)
     match result.op() {
@@ -103,7 +103,7 @@ fn test_nested_where_elimination() {
     let outer = UOp::try_where(cond1, inner, val3).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, outer, &mut ());
+    let result = graph_rewrite_top_down(&matcher, outer, &mut ());
 
     // Should eliminate to val2
     assert!(Arc::ptr_eq(&result, &val2));

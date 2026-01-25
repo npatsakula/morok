@@ -60,7 +60,7 @@ pub fn rangeify_with_map(
     sink: Arc<UOp>,
     pcontig_config: Option<&super::kernel::PcontigConfig>,
 ) -> morok_ir::Result<RangeifyResult> {
-    use morok_ir::rewrite::{graph_rewrite_bottom_up_with_map, graph_rewrite_with_map};
+    use morok_ir::rewrite::{graph_rewrite_bottom_up_with_map, graph_rewrite_top_down_with_map};
 
     // Aggregate all becomes_maps from rewrite passes
     let mut all_becomes: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
@@ -80,7 +80,7 @@ pub fn rangeify_with_map(
     // split_reduceop needs ReduceAxis (not REDUCE), so it must run before Step 3
     let mut split_config = super::kernel::SplitReduceOpConfig::default();
     let split_matcher = super::patterns::split_reduceop_patterns();
-    let result = graph_rewrite_with_map(&split_matcher, sink, &mut split_config);
+    let result = graph_rewrite_top_down_with_map(&split_matcher, sink, &mut split_config);
     sink = result.root;
     all_becomes.extend(result.becomes_map);
     tracing::debug!(uop.tree = sink.tree(), "split reduceops complete");
@@ -95,7 +95,7 @@ pub fn rangeify_with_map(
 
     // Step 4: Buffer simplification
     let buffer_simplify = super::patterns::buffer_folding() + super::patterns::dead_axis_removal();
-    let result = graph_rewrite_with_map(&buffer_simplify, sink, &mut ());
+    let result = graph_rewrite_bottom_up_with_map(&buffer_simplify, sink, &mut ());
     sink = result.root;
     all_becomes.extend(result.becomes_map);
     tracing::debug!(uop.tree = sink.tree(), "buffer folding + dead axis removal complete");
@@ -115,7 +115,7 @@ pub fn rangeify_with_map(
 
     // Step 6: Symbolic simplification
     let symbolic_matcher = crate::symbolic::symbolic_simple();
-    let result = graph_rewrite_with_map(&symbolic_matcher, sink, &mut ());
+    let result = graph_rewrite_bottom_up_with_map(&symbolic_matcher, sink, &mut ());
     sink = result.root;
     all_becomes.extend(result.becomes_map);
     tracing::debug!(uop.tree = sink.tree(), "symbolic simplification complete");
@@ -125,7 +125,7 @@ pub fn rangeify_with_map(
         && let Some(limit) = device.max_buffers()
     {
         let limit_matcher = super::patterns::buffer_limit_patterns(limit);
-        let result = graph_rewrite_with_map(&limit_matcher, sink, &mut ());
+        let result = graph_rewrite_bottom_up_with_map(&limit_matcher, sink, &mut ());
         sink = result.root;
         all_becomes.extend(result.becomes_map);
         tracing::debug!(uop.tree = sink.tree(), "buffer limit enforcement complete");
@@ -134,7 +134,7 @@ pub fn rangeify_with_map(
     // Step 7: Reduction simplifications (reduce_unparented, reduce_collapse)
     // These match Op::Reduce, so must run AFTER ReduceAxis → REDUCE conversion
     let reduction_matcher = super::patterns::reduction_simplify_patterns();
-    let result = graph_rewrite_with_map(&reduction_matcher, sink, &mut ());
+    let result = graph_rewrite_bottom_up_with_map(&reduction_matcher, sink, &mut ());
     sink = result.root;
     all_becomes.extend(result.becomes_map);
     tracing::debug!(uop.tree = sink.tree(), "reduction simplification complete");
@@ -351,17 +351,17 @@ fn apply_buffer_removal_protecting_sink(
     ctx: &mut super::kernel::PcontigConfig,
 ) -> Arc<UOp> {
     let Op::Sink { sources } = sink.op() else {
-        return crate::rewrite::graph_rewrite(matcher, sink.clone(), ctx);
+        return crate::rewrite::graph_rewrite_top_down(matcher, sink.clone(), ctx);
     };
 
     let mut new_sources = Vec::with_capacity(sources.len());
     for src in sources.iter() {
         if let Op::Bufferize { compute, ranges, opts } = src.op() {
-            let optimized_compute = crate::rewrite::graph_rewrite(matcher, compute.clone(), ctx);
+            let optimized_compute = crate::rewrite::graph_rewrite_top_down(matcher, compute.clone(), ctx);
             let new_bufferize = UOp::bufferize(optimized_compute, ranges.to_vec(), opts.clone());
             new_sources.push(new_bufferize);
         } else {
-            let optimized = crate::rewrite::graph_rewrite(matcher, src.clone(), ctx);
+            let optimized = crate::rewrite::graph_rewrite_top_down(matcher, src.clone(), ctx);
             new_sources.push(optimized);
         }
     }
@@ -592,7 +592,7 @@ pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> 
 
     let substituted = src.substitute(&substitute_map);
     let matcher = crate::symbolic::symbolic_simple();
-    let simplified = crate::rewrite::graph_rewrite(&matcher, substituted, &mut ());
+    let simplified = crate::rewrite::graph_rewrite_top_down(&matcher, substituted, &mut ());
 
     let vars_in_simplified: HashSet<UOpKey> =
         simplified.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::DefineVar { .. })).map(UOpKey).collect();

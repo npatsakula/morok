@@ -9,7 +9,7 @@ use morok_ir::types::ConstValue;
 use morok_ir::{Op, UOp};
 use std::sync::Arc;
 
-use crate::rewrite::graph_rewrite;
+use crate::rewrite::graph_rewrite_top_down;
 use crate::symbolic::symbolic_simple;
 use crate::z3::verify::verify_equivalence;
 
@@ -25,7 +25,7 @@ fn test_identity_add_zero() {
     let expr = x.try_add(&zero).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Should simplify to x
     assert!(Arc::ptr_eq(&simplified, &x), "x + 0 should simplify to x");
@@ -42,7 +42,7 @@ fn test_identity_mul_one() {
     let expr = x.try_mul(&one).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     assert!(Arc::ptr_eq(&simplified, &x), "x * 1 should simplify to x");
     verify_equivalence(&expr, &simplified).expect("x * 1 should equal x");
@@ -56,7 +56,7 @@ fn test_identity_sub_zero() {
     let expr = x.try_sub(&zero).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     assert!(Arc::ptr_eq(&simplified, &x), "x - 0 should simplify to x");
     verify_equivalence(&expr, &simplified).expect("x - 0 should equal x");
@@ -70,7 +70,7 @@ fn test_identity_div_one() {
     let expr = x.try_div(&one).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     assert!(Arc::ptr_eq(&simplified, &x), "x / 1 should simplify to x");
     verify_equivalence(&expr, &simplified).expect("x / 1 should equal x");
@@ -100,7 +100,7 @@ fn test_zero_mul_zero() {
     let expr = x.try_mul(&zero).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
     assert!(Arc::ptr_eq(&simplified, &zero), "x * 0 should simplify to 0");
@@ -115,7 +115,7 @@ fn test_zero_and_zero() {
     let expr = x.try_and_op(&zero).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
     assert!(Arc::ptr_eq(&simplified, &zero), "x & 0 should simplify to 0");
@@ -157,7 +157,7 @@ fn test_self_div_one() {
     let expr = x.try_div(&x).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 1
     match simplified.op() {
@@ -175,7 +175,7 @@ fn test_self_mod_zero() {
     let expr = x.try_mod(&x).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
     match simplified.op() {
@@ -193,7 +193,7 @@ fn test_self_and_identity() {
     let expr = x.try_and_op(&x).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Should simplify to x
     assert!(Arc::ptr_eq(&simplified, &x), "x & x should simplify to x");
@@ -215,7 +215,7 @@ fn test_div_cancel_mul() {
     let expr = a_mul_b.try_div(&b).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Should simplify to a
     assert!(Arc::ptr_eq(&simplified, &a), "(a * b) / b should simplify to a");
@@ -232,7 +232,7 @@ fn test_div_chain() {
     let expr = a_div_b.try_div(&c).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Verify semantically (structure might differ)
     verify_equivalence(&expr, &simplified).expect("(a / b) / c should be semantically equivalent");
@@ -250,7 +250,7 @@ fn test_div_gcd_factor() {
     let expr = a_mul_6.try_div(&b_mul_6).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Verify semantically
     verify_equivalence(&expr, &simplified).expect("(a * c) / (b * c) should be semantically equivalent");
@@ -263,7 +263,7 @@ fn test_mod_self_zero() {
     let expr = a.try_mod(&a).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
     match simplified.op() {
@@ -285,7 +285,7 @@ fn test_term_combine_add() {
     let expr = x.try_add(&x).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Verify semantically (might be 2*x or x*2 or x+x)
     verify_equivalence(&expr, &simplified).expect("x + x should be semantically equivalent to 2 * x");
@@ -303,7 +303,7 @@ fn test_term_combine_coefficients() {
     let expr = two_x.try_add(&three_x).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Verify semantically
     verify_equivalence(&expr, &simplified).expect("(2 * x) + (3 * x) should equal 5 * x");
@@ -320,7 +320,7 @@ fn test_const_folding_add() {
     let expr = x_plus_3.try_add(&five).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Verify semantically
     verify_equivalence(&expr, &simplified).expect("(x + 3) + 5 should equal x + 8");
@@ -337,7 +337,7 @@ fn test_const_folding_mul() {
     let expr = x_mul_2.try_mul(&three).unwrap();
 
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
 
     // Verify semantically
     verify_equivalence(&expr, &simplified).expect("(x * 2) * 3 should equal x * 6");

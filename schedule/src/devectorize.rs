@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, WmmaMetadata};
+use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, UOp, WmmaMetadata};
 use tracing::debug;
 
 use crate::TypedPatternMatcher;
@@ -430,10 +430,15 @@ fn no_vectorized_index(
     let final_idx = idx_broadcast.mul(&cnt_broadcast).add(&offset_vec);
 
     let buf_dtype = buf_broadcast.dtype();
-    Some(UOp::new(
-        Op::Index { buffer: buf_broadcast, indices: smallvec::smallvec![final_idx], gate: gate.clone() },
-        buf_dtype,
-    ))
+    Some(
+        UOp::index()
+            .buffer(buf_broadcast)
+            .indices(vec![final_idx])
+            .maybe_gate(gate.clone())
+            .call()
+            .expect("ICE unable to create index")
+            .with_dtype(buf_dtype),
+    )
 }
 
 fn create_index_vector(cnt: usize) -> Arc<UOp> {
@@ -470,10 +475,15 @@ fn no_vectorized_index_broadcast(
     let final_idx = idx_gep.mul(&cnt_broadcast).add(&sum_vec);
 
     let buf_dtype = buf_broadcast.dtype();
-    Some(UOp::new(
-        Op::Index { buffer: buf_broadcast, indices: smallvec::smallvec![final_idx], gate: gate.clone() },
-        buf_dtype,
-    ))
+    Some(
+        UOp::index()
+            .buffer(buf_broadcast)
+            .indices(vec![final_idx])
+            .maybe_gate(gate.clone())
+            .call()
+            .expect("ICE: unabel to create index")
+            .with_dtype(buf_dtype),
+    )
 }
 
 fn create_const_index_vector(values: &[i64]) -> Arc<UOp> {
@@ -509,10 +519,15 @@ fn no_vectorized_index_gep(
     let final_idx = idx_gep.mul(&cnt_broadcast).add(&sum_vec);
 
     let buf_dtype = buf_broadcast.dtype();
-    Some(UOp::new(
-        Op::Index { buffer: buf_broadcast, indices: smallvec::smallvec![final_idx], gate: gate.clone() },
-        buf_dtype,
-    ))
+    Some(
+        UOp::index()
+            .buffer(buf_broadcast)
+            .indices(vec![final_idx])
+            .maybe_gate(gate.clone())
+            .call()
+            .expect("ICE: unabel to create index")
+            .with_dtype(buf_dtype),
+    )
 }
 
 // ============================================================================
@@ -524,7 +539,7 @@ pub fn load_store_indexing_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         index @ Index { buffer, indices, gate: Some(g) }
             if matches!(g.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Bool(true)))
-            => Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.clone(), gate: None }, index.dtype())),
+            ~> UOp::index().buffer(buffer.clone()).indices(indices.clone()).call().expect("ICE: unable to crate index").with_dtype(index.dtype())
     }
 }
 
@@ -712,14 +727,13 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Generate scalar INDEX ops and simplify
     let scalar_indices: Vec<_> = (0..count)
         .map(|i| {
-            UOp::new(
-                Op::Index {
-                    buffer: buf.clone(),
-                    indices: smallvec::smallvec![UOp::gep(vec.clone(), vec![i])],
-                    gate: gate.clone(),
-                },
-                buf.dtype().clone(),
-            )
+            UOp::index()
+                .buffer(buf.clone())
+                .indices(vec![UOp::gep(vec.clone(), vec![i])])
+                .maybe_gate(gate.clone())
+                .call()
+                .expect("ICE: unable to create index")
+                .with_dtype(buf.dtype().clone())
         })
         .collect();
 
@@ -1075,7 +1089,13 @@ fn offset_index(idx: &Arc<UOp>, offset: i64) -> Arc<UOp> {
         .map(|(i, index_expr)| if i == 0 { index_expr.add(&index_expr.const_like(offset)) } else { index_expr.clone() })
         .collect();
 
-    UOp::new(Op::Index { buffer: buffer.clone(), indices: new_indices, gate: gate.clone() }, idx.dtype())
+    UOp::index()
+        .buffer(buffer.clone())
+        .indices(new_indices)
+        .maybe_gate(gate.clone())
+        .call()
+        .expect("ICE: unabel to create index")
+        .with_dtype(idx.dtype())
 }
 
 // ============================================================================
@@ -1121,62 +1141,6 @@ pub fn pm_reduce() -> TypedPatternMatcher {
     }
 }
 
-/// Convert ThreadScheduled ranges to Thread ranges.
-///
-/// Runs AFTER pm_reduce, matching Tinygrad's pm_add_gpudims ordering.
-/// This ensures reduce_to_acc never sees Thread ranges in its input_ranges,
-/// fixing incorrect accumulator placement for threaded reduce kernels.
-///
-/// # Implementation
-///
-/// Follows Tinygrad's `pm_add_gpudims` approach:
-/// 1. Match on SINK (root node) to process the entire graph at once
-/// 2. Collect all ThreadScheduled ranges from toposort
-/// 3. Build a substitution map: ThreadScheduled → Thread
-/// 4. Call `sink.substitute(&map)` to atomically replace all references
-///
-/// This is necessary because per-node pattern matching doesn't propagate
-/// substitutions correctly through the DAG (same node referenced multiple times).
-///
-/// # Pipeline Position
-///
-/// ```text
-/// 1. pm_reduce          → REDUCE → accumulator pattern (ThreadScheduled excluded from input_ranges)
-/// 2. pm_add_thread_dims → ThreadScheduled → Thread
-/// 3. pm_add_loads       → Add LOAD wrappers
-/// ```
-pub fn pm_add_thread_dims() -> TypedPatternMatcher {
-    use morok_ir::UOpKey;
-
-    crate::patterns! {
-        // Match on SINK to process the entire graph at once (like Tinygrad's pm_add_gpudims)
-        sink @ Sink { sources } => |sink, sources| {
-            let _ = sources; // Suppress unused warning
-            let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
-
-            // Collect all ThreadScheduled ranges from toposort
-            for node in sink.toposort() {
-                if let Op::Range { axis_type, end, axis_id } = node.op()
-                    && *axis_type == AxisType::ThreadScheduled {
-                        let new_range = UOp::range_axis(end.clone(), *axis_id, AxisType::Thread);
-                        debug!(old_id = node.id, new_id = new_range.id, "pm_add_thread_dims: converting ThreadScheduled -> Thread");
-                        subs.insert(UOpKey(node.clone()), new_range);
-                    }
-            }
-
-            if subs.is_empty() {
-                debug!("pm_add_thread_dims: no ThreadScheduled ranges found");
-                None // No transformation needed
-            } else {
-                debug!(num_substitutions = subs.len(), "pm_add_thread_dims: applying substitutions");
-                let result = sink.substitute(&subs);
-                debug!(old_sink_id = sink.id, new_sink_id = result.id, "pm_add_thread_dims: substitution complete");
-                Some(result)
-            }
-        },
-    }
-}
-
 /// Filter non-RANGE ops from END/REDUCE/STORE ranges.
 ///
 /// Based on Tinygrad's `pm_flatten_range` (simplify.py:7-16).
@@ -1202,6 +1166,7 @@ pub fn pm_add_thread_dims() -> TypedPatternMatcher {
 ///   new_rngs = [x for x in UOp.sink(*rngs).toposort() if x.op is Ops.RANGE]
 ///   return r.replace(src=r.src[:off]+tuple(new_rngs))
 /// ```
+#[tracing::instrument]
 pub fn pm_flatten_range() -> TypedPatternMatcher {
     /// Extract actual RANGE ops from a list of range sources.
     /// Creates a sink, toposorts, and filters to only RANGE ops.
@@ -1210,21 +1175,17 @@ pub fn pm_flatten_range() -> TypedPatternMatcher {
             return SmallVec::new();
         }
         let sink = UOp::sink(ranges.iter().cloned().collect());
-        sink.toposort()
-            .into_iter()
-            .filter(|node| matches!(node.op(), Op::Range { .. }))
-            .collect()
+        sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect()
     }
 
     /// Check if ranges changed (optimization to avoid unnecessary rewrites).
     fn ranges_unchanged(original: &SmallVec<[Arc<UOp>; 4]>, filtered: &SmallVec<[Arc<UOp>; 4]>) -> bool {
-        original.len() == filtered.len()
-            && original.iter().zip(filtered.iter()).all(|(a, b)| a.id == b.id)
+        original.len() == filtered.len() && original.iter().zip(filtered.iter()).all(|(a, b)| a.id == b.id)
     }
 
     crate::patterns! {
         // END: Filter ranges to only RANGE ops
-        end @ End { computation, ranges } => |end, computation, ranges| {
+        end @ End { computation, ranges } => {
             let actual_ranges = extract_ranges(ranges);
 
             if ranges_unchanged(ranges, &actual_ranges) {
@@ -1232,10 +1193,8 @@ pub fn pm_flatten_range() -> TypedPatternMatcher {
             }
 
             tracing::debug!(
-                end_id = end.id,
-                original_len = ranges.len(),
-                filtered_len = actual_ranges.len(),
-                "pm_flatten_range: filtering END ranges"
+                end_id = end.id, original_len = ranges.len(), filtered_len = actual_ranges.len(),
+                "filtering END ranges"
             );
 
             if actual_ranges.is_empty() {
@@ -1249,28 +1208,21 @@ pub fn pm_flatten_range() -> TypedPatternMatcher {
         // REDUCE: Filter ranges to only RANGE ops
         reduce @ Reduce { src, ranges, reduce_op } => |reduce, src, ranges, reduce_op| {
             let actual_ranges = extract_ranges(ranges);
-
             if ranges_unchanged(ranges, &actual_ranges) {
                 return None;
             }
 
             tracing::debug!(
-                reduce_id = reduce.id,
-                original_len = ranges.len(),
-                filtered_len = actual_ranges.len(),
+                reduce_id = reduce.id, original_len = ranges.len(), filtered_len = actual_ranges.len(),
                 "pm_flatten_range: filtering REDUCE ranges"
             );
 
-            Some(UOp::new(
-                Op::Reduce { src: src.clone(), ranges: actual_ranges, reduce_op: *reduce_op },
-                reduce.dtype(),
-            ))
+            Some(UOp::reduce(src.clone(), actual_ranges, *reduce_op).with_dtype(reduce.dtype()))
         },
 
         // STORE: Filter ranges to only RANGE ops
         Store { index, value, ranges } => |index, value, ranges| {
             let actual_ranges = extract_ranges(ranges);
-
             if ranges_unchanged(ranges, &actual_ranges) {
                 return None;
             }
@@ -1297,6 +1249,7 @@ pub fn pm_flatten_range() -> TypedPatternMatcher {
 /// Note: This creates INDEX ops with element dtype. pm_add_loads will:
 /// 1. Wrap INDEX with LOAD for values used in arithmetic
 /// 2. STORE cleanup will remove LOAD from STORE's index position
+#[tracing::instrument(skip_all)]
 fn reduce_to_acc(
     red: &Arc<UOp>,
     src: &Arc<UOp>,
@@ -1343,35 +1296,35 @@ fn reduce_to_acc(
         input_ranges = ?input_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
         ended_ranges = ?ended_ranges.iter().collect::<Vec<_>>(),
         src_id = src.id,
-        "reduce_to_acc: processing REDUCE"
+        "processing REDUCE"
     );
 
     // 2. Create identity element for the reduction
     let identity = reduce_identity(*reduce_op, result_dtype.clone());
-
     // 3. Create DEFINE_REG accumulator with explicit element type
     let acc = UOp::define_reg_typed(1, result_dtype.clone());
-
     // 4. Create index into accumulator (always index 0 for single-element acc)
     let zero_idx = UOp::index_const(0);
-
     // 5. Initialize accumulator BEFORE the reduce loop
     // If there are outer ranges, initialization happens after those start
     // If no outer ranges, initialization happens directly (no AFTER needed)
     let store_init = if input_ranges.is_empty() {
         // No outer ranges: acc.index(0).store(identity)
-        let idx_init = UOp::new(
-            Op::Index { buffer: acc.clone(), indices: smallvec::smallvec![zero_idx.clone()], gate: None },
-            result_dtype.clone(),
-        );
+        let idx_init = UOp::index()
+            .buffer(acc.clone())
+            .indices(vec![zero_idx.clone()])
+            .call()
+            .expect("ICE: unable to create index")
+            .with_dtype(result_dtype.clone());
         idx_init.store_value(identity)
     } else {
         // Has outer ranges: acc.after(*input_ranges).index(0).store(identity)
-        let acc_after_outer = UOp::after(acc.clone(), input_ranges);
-        let idx_init = UOp::new(
-            Op::Index { buffer: acc_after_outer, indices: smallvec::smallvec![zero_idx.clone()], gate: None },
-            result_dtype.clone(),
-        );
+        let idx_init = UOp::index()
+            .buffer(UOp::after(acc.clone(), input_ranges))
+            .indices(vec![zero_idx.clone()])
+            .call()
+            .expect("ICE: unable to create index")
+            .with_dtype(result_dtype.clone());
         idx_init.store_value(identity)
     };
 
@@ -1380,28 +1333,23 @@ fn reduce_to_acc(
     let mut loop_deps: SmallVec<[Arc<UOp>; 4]> = smallvec::smallvec![store_init.clone()];
     loop_deps.extend(ranges.iter().cloned());
     let acc_inside_loop = UOp::after(acc.clone(), loop_deps);
-
-    let idx_loop = UOp::new(
-        Op::Index { buffer: acc_inside_loop.clone(), indices: smallvec::smallvec![zero_idx.clone()], gate: None },
-        result_dtype.clone(),
-    );
-
+    let idx_loop = UOp::index()
+        .buffer(acc_inside_loop.clone())
+        .indices(vec![zero_idx.clone()])
+        .call()
+        .expect("ICE: unable to build index")
+        .with_dtype(result_dtype.clone());
     // 7. Apply reduce operation: new_val = op(idx_loop, src)
     let new_val = apply_reduce_binary(*reduce_op, idx_loop.clone(), src.clone(), &result_dtype);
-
     // 8. Store new value back to accumulator (idx_loop contains the INDEX, not acc directly)
     let store_loop = idx_loop.store_value(new_val);
-
     // 9. End the reduce ranges after the store
     let end = UOp::end(store_loop.clone(), ranges.clone());
-
     // 10. Final value AFTER loop completes
     // acc.after(end).index(0)
     let acc_after_end = UOp::after(acc.clone(), smallvec::smallvec![end.clone()]);
-    let idx_final = UOp::new(
-        Op::Index { buffer: acc_after_end.clone(), indices: smallvec::smallvec![zero_idx], gate: None },
-        result_dtype,
-    );
+    let idx_final =
+        UOp::index().buffer(acc_after_end.clone()).indices(vec![zero_idx]).call().expect("ICE: unable to build index");
 
     debug!(
         acc_id = acc.id,
@@ -1412,7 +1360,7 @@ fn reduce_to_acc(
         end_id = end.id,
         acc_after_end_id = acc_after_end.id,
         idx_final_id = idx_final.id,
-        "reduce_to_acc: created accumulator pattern"
+        "created accumulator pattern"
     );
 
     Some(idx_final)
@@ -1430,86 +1378,5 @@ fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DT
             let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), cond_dtype);
             UOp::try_where(cond, a, b).expect("WHERE construction should succeed")
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_group_consecutive_offsets_from_map_contiguous() {
-        let mut offsets_map = HashMap::new();
-        offsets_map.insert(0, vec![0]);
-        offsets_map.insert(1, vec![1]);
-        offsets_map.insert(2, vec![2]);
-        offsets_map.insert(3, vec![3]);
-
-        let groups = group_consecutive_offsets_from_map(&offsets_map);
-
-        // Should be one contiguous group
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].0, 0); // first_offset = 0
-        assert_eq!(groups[0].1, vec![0, 1, 2, 3]); // lanes
-    }
-
-    #[test]
-    fn test_group_consecutive_offsets_from_map_non_contiguous() {
-        let mut offsets_map = HashMap::new();
-        offsets_map.insert(0, vec![0]);
-        offsets_map.insert(2, vec![1]);
-        offsets_map.insert(4, vec![2]);
-        offsets_map.insert(6, vec![3]);
-
-        let groups = group_consecutive_offsets_from_map(&offsets_map);
-
-        // Should be four separate groups (no consecutive offsets)
-        assert_eq!(groups.len(), 4);
-        assert_eq!(groups[0].0, 0);
-        assert_eq!(groups[0].1, vec![0]);
-        assert_eq!(groups[1].0, 2);
-        assert_eq!(groups[1].1, vec![1]);
-    }
-
-    #[test]
-    fn test_group_consecutive_offsets_from_map_mixed() {
-        let mut offsets_map = HashMap::new();
-        offsets_map.insert(0, vec![0]);
-        offsets_map.insert(1, vec![1]);
-        offsets_map.insert(2, vec![2]);
-        offsets_map.insert(5, vec![3]);
-        offsets_map.insert(6, vec![4]);
-
-        let groups = group_consecutive_offsets_from_map(&offsets_map);
-
-        // [0,1,2] consecutive, [5,6] consecutive
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].0, 0);
-        assert_eq!(groups[0].1, vec![0, 1, 2]);
-        assert_eq!(groups[1].0, 5);
-        assert_eq!(groups[1].1, vec![3, 4]);
-    }
-
-    #[test]
-    fn test_offset_divides_evenly() {
-        let offset_4 = UOp::index_const(4);
-        assert!(offset_divides_evenly(&offset_4, 4));
-        assert!(offset_divides_evenly(&offset_4, 2));
-        assert!(offset_divides_evenly(&offset_4, 1));
-        assert!(!offset_divides_evenly(&offset_4, 3));
-
-        let offset_0 = UOp::index_const(0);
-        assert!(offset_divides_evenly(&offset_0, 4));
-
-        // Unknown expression should return false (conservative)
-        let range_var = UOp::new(
-            Op::Range {
-                end: UOp::index_const(10),
-                axis_id: morok_ir::AxisId::Renumbered(0),
-                axis_type: morok_ir::AxisType::Loop,
-            },
-            DType::Index,
-        );
-        assert!(!offset_divides_evenly(&range_var, 4));
     }
 }

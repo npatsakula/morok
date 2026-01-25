@@ -521,10 +521,10 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
     let substituted = indexed.substitute(&substitutions);
 
     use super::patterns::movement_op_patterns;
-    use crate::rewrite::graph_rewrite;
+    use crate::rewrite::graph_rewrite_top_down;
 
     let pm_mops = movement_op_patterns();
-    let transformed = graph_rewrite(&pm_mops, substituted, &mut ());
+    let transformed = graph_rewrite_top_down(&pm_mops, substituted, &mut ());
 
     let surviving_range_ids = collect_range_ids(&transformed);
     let surviving_set: HashSet<usize> = surviving_range_ids.into_iter().collect();

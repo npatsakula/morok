@@ -1419,7 +1419,7 @@ fn test_thread_basic() {
     let result = apply_opt(&mut scheduler, &opt, true);
     assert!(result.is_ok(), "THREAD opt should succeed: {:?}", result);
 
-    // Verify the shape changed: Loop(64) -> Loop(8) + Thread(8)
+    // Verify shape changed: Loop(64) -> Loop(8) + Thread(8)
     assert_eq!(scheduler.shape_len(), 2);
 
     let rngs = scheduler.rngs();

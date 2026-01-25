@@ -417,7 +417,8 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                             // Unsigned can't be less than 0
                             kernel.push(format!("  {lt_zero} = icmp eq {stype} {s}, 0"));
                             kernel.push(format!("  {lt_zero} = xor i1 {lt_zero}, 1"));
-                            kernel.push(format!("  {lt_zero} = and i1 {lt_zero}, 0")); // Always false
+                            kernel.push(format!("  {lt_zero} = and i1 {lt_zero}, 0"));
+                            // Always false
                         }
                         kernel.push(format!("  {gt_ext} = zext i1 {gt_zero} to {stype}"));
                         kernel.push(format!("  {lt_ext} = zext i1 {lt_zero} to {stype}"));
@@ -514,11 +515,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 
         // END → loop footer
         Op::End { ranges, .. } => {
-            // Close all ranges (skip Thread/ThreadScheduled ranges - they're handled via thread_id, not loops)
+            // Close all ranges (skip Thread ranges - they're handled via thread_id, not loops)
             for range in ranges.iter() {
                 if let Op::Range { axis_id, axis_type, .. } = range.op() {
-                    // Skip Thread/ThreadScheduled ranges - they don't generate actual loop structures
-                    if matches!(axis_type, AxisType::Thread | AxisType::ThreadScheduled) {
+                    // Skip Thread ranges - they don't generate actual loop structures
+                    if matches!(axis_type, AxisType::Thread) {
                         continue;
                     }
                     let id = axis_id.value();

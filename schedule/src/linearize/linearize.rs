@@ -389,10 +389,12 @@ pub fn linearize_with_edges(sink: Arc<UOp>, edges: &HashMap<UOpKey, Arc<UOp>>) -
                         "linearize_with_edges: decrementing Range out_degree"
                     );
                 }
-                if *deg == 0 && !visited.contains(&src.id)
-                    && let Some(src_order_key) = priorities.get(&src_key) {
-                        heap.push(src_order_key.clone());
-                    }
+                if *deg == 0
+                    && !visited.contains(&src.id)
+                    && let Some(src_order_key) = priorities.get(&src_key)
+                {
+                    heap.push(src_order_key.clone());
+                }
             }
         }
 
@@ -403,10 +405,12 @@ pub fn linearize_with_edges(sink: Arc<UOp>, edges: &HashMap<UOpKey, Arc<UOp>>) -
             let pred_key = UOpKey(predecessor.clone());
             if let Some(deg) = out_degree.get_mut(&pred_key) {
                 *deg = deg.saturating_sub(1);
-                if *deg == 0 && !visited.contains(&predecessor.id)
-                    && let Some(pred_order_key) = priorities.get(&pred_key) {
-                        heap.push(pred_order_key.clone());
-                    }
+                if *deg == 0
+                    && !visited.contains(&predecessor.id)
+                    && let Some(pred_order_key) = priorities.get(&pred_key)
+                {
+                    heap.push(pred_order_key.clone());
+                }
             }
         }
     }

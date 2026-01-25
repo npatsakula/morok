@@ -142,7 +142,7 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
 
     // Step 4: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
     let early_matcher = super::patterns::early_rewrites();
-    let transformed_sink = crate::rewrite::graph_rewrite(&early_matcher, sink, &mut ());
+    let transformed_sink = crate::rewrite::graph_rewrite_top_down(&early_matcher, sink, &mut ());
 
     Ok((transformed_sink, ctx))
 }
