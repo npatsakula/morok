@@ -16,12 +16,12 @@ RUST_LOG=morok_schedule::rangeify=debug cargo test test_name 2>&1 | rg 'range as
 
 ### Step 2: Check IR after optimization
 ```bash
-RUST_LOG=morok_schedule::rangeify=debug cargo test test_name 2>&1 | rg 'reduction simplification complete'
+RUST_LOG=morok_schedule::optimizer=debug cargo test test_name 2>&1 | rg 'optimization complete'
 ```
 
 ### Step 3: Check LLVM IR
 ```bash
-RUST_LOG=morok_codegen::llvm::cpu=debug cargo test test_name 2>&1 | rg 'llvm ir before verification'
+RUST_LOG=morok_codegen::llvm::text=debug cargo test test_name 2>&1 | rg 'linearized node'
 ```
 
 Compare with Tinygrad's output using the `/tinygrad` skill to isolate broken patterns.
@@ -30,7 +30,7 @@ Compare with Tinygrad's output using the `/tinygrad` skill to isolate broken pat
 
 ### Why traces don't appear
 
-`RUST_LOG` sets the filter level but requires a tracing subscriber. Tests don't have one by default.
+`RUST_LOG` sets a filter level but requires a tracing subscriber. Tests don't have one by default.
 
 ### Add traced_test attribute
 ```rust
@@ -78,24 +78,11 @@ println!("{}", uop.tree_full());
     └── [35] → (see above)
 ```
 
-## Better Op Labels in Tracing
-
-### Use as_ref() not discriminant
-```rust
-// GOOD: Clean variant name
-tracing::debug!(op = uop.op().as_ref(), "processing");
-// Output: op="Binary"
-
-// BAD: Opaque discriminant
-tracing::debug!(op = ?std::mem::discriminant(uop.op()), "processing");
-// Output: op=Discriminant(...)
-```
-
 ## Programmatic LLVM IR Extraction
 
 ### Using render() API
 ```rust
-use morok_codegen::llvm::render;
+use morok_codegen::llvm::text::render;
 
 let rendered = render(&uop_graph, Some("my_kernel"))?;
 
@@ -126,11 +113,10 @@ for kernel in plan.kernels() {
 | `morok_schedule::expand=debug` | UNROLL/UPCAST expansion |
 | `morok_schedule::devectorize=debug` | Memory access optimization |
 | `morok_schedule::optimizer=debug` | Post-optimization passes |
-| `morok_codegen::llvm::cpu=debug` | LLVM rendering |
+| `morok_codegen::llvm::text=debug` | LLVM rendering (IR generation) |
 | `morok_ir::pattern::simplified=trace` | Pattern matching details |
 
 ### Pipeline stage markers (filter with rg)
-
 ```
 "range assignment complete"
 "early rewrites complete"
@@ -140,36 +126,97 @@ for kernel in plan.kernels() {
 "reshape to scalar complete"
 "buffer removal complete"
 "symbolic simplification complete"
-"buffer limit enforcement complete"
 "reduction simplification complete"
 ```
 
 ## Common Debug Scenarios
 
 ### Wrong numerical result
+
 1. Extract IR before/after optimization
 2. Check if UNROLL/UPCAST expansion is correct
 3. Compare vector widths with expected
 4. Check LLVM IR for correct horizontal reduce
 
 ### SIGSEGV / Memory error
+
 1. Check buffer sizes and indices
 2. Look for mismatched vector widths
 3. Check CAT expansion creating oversized vectors
 
 ### Pattern not matching
+
 ```bash
 RUST_LOG=morok_ir::pattern::simplified=trace cargo test test_name 2>&1 | rg 'pattern'
+```
+
+## Better Op Labels in Tracing
+
+### Use as_ref() not discriminant
+```rust
+// GOOD: Clean variant name
+tracing::debug!(op = uop.op().as_ref(), "processing");
+// Output: op="Binary"
+
+// BAD: Opaque discriminant
+tracing::debug!(op = ?std::mem::discriminant(uop.op()), "processing");
+// Output: op=Discriminant(...)
+```
+
+## Programmatic LLVM IR Extraction
+
+### Using render() API
+```rust
+use morok_codegen::llvm::text::render;
+
+let rendered = render(&uop_graph, Some("my_kernel"))?;
+
+// Access LLVM IR as string
+println!("{}", rendered.code);
 ```
 
 ## Key Files
 
 | File | Purpose |
-|------|---------|
+|------|----------|
 | `ir/src/uop/tree.rs` | UOp tree visualization, format_node() |
 | `ir/src/op.rs` | Op enum with AsRefStr derive |
 | `schedule/src/rangeify/transforms.rs` | Main pipeline with stage markers |
 | `schedule/src/expand.rs` | UNROLL/UPCAST expansion |
 | `schedule/src/optimizer/heuristics.rs` | Optimization decisions |
-| `codegen/src/llvm/cpu/ops.rs` | LLVM IR generation |
+| `codegen/src/llvm/text/mod.rs` | LLVM IR generation (render() function) |
+| `codegen/src/llvm/cpu/ops.rs` | CPU operation rendering |
 | `codegen/src/types.rs` | RenderedKernel struct |
+
+## Module Structure
+
+After refactoring, LLVM codegen is organized as:
+```
+codegen/src/llvm/
+├── common/           # Shared utilities (types, ctx)
+│   ├── mod.rs
+│   ├── ctx.rs      # RenderContext
+│   └── types.rs     # ldt, lconst, lcast, addr_space_num
+├── cpu/              # CPU-specific rendering
+│   ├── mod.rs       # Exports render_uop, reduce_identity
+│   └── ops.rs       # CPU operation rendering
+├── gpu/              # Future GPU support (placeholder)
+│   ├── mod.rs
+│   └── ops.rs       # Stub returns None
+└── text/             # Main entry point
+    └── mod.rs       # LlvmTextRenderer, render() function
+```
+
+## Tracing Output Examples
+
+### Enable codegen tracing
+```bash
+RUST_LOG=morok_codegen::llvm::text=debug cargo test test_name
+```
+
+### Sample output showing linearization and IR generation
+```
+[2026-01-26...] DEBUG morok_codegen::llvm::text::linearized node: position=0, op=DefineGlobal, id=42 "codegen: after pm_render"
+[2026-01-26...] DEBUG morok_codegen::llvm::text::linearized node: position=1, op=Index, id=35
+[2026-01-26...] DEBUG morok_codegen::llvm::text::linearized node: position=2, op=Range, id=30
+```
