@@ -18,7 +18,6 @@
 //! ```
 
 pub mod common;
-pub mod context;
 pub mod cranelift;
 pub mod error;
 pub mod llvm;
@@ -29,7 +28,6 @@ pub mod types;
 pub mod test;
 
 pub use common::collect_buffers_and_vars;
-pub use context::*;
 pub use error::*;
 pub use traits::*;
 pub use types::*;

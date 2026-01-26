@@ -4,35 +4,22 @@
 //!
 //! # Module Structure
 //!
-//! - `common/`: Shared infrastructure (types, builders, intrinsics, loop generation)
-//! - `cpu/`: CPU-specific renderer and ops (inkwell-based)
+//! - `cpu/`: CPU-specific renderer wrapper (delegates to text-based codegen)
 //! - `text/`: Text-based LLVM IR generation (string-based, Tinygrad-style)
 //! - `gpu/`: GPU-specific renderer stubs (for future use)
-//! - `error`: Error types
-//! - `helpers`: ValueMap and LoopContext
 
-pub mod common;
 pub mod cpu;
-pub mod error;
 pub mod gpu;
-pub mod helpers;
 pub mod text;
 
-// Re-export CPU renderer as LlvmRenderer for backward compatibility
 pub use cpu::CpuLlvmRenderer as LlvmRenderer;
-pub use error::{Error, Result};
-
-// Re-export text renderer
 pub use text::LlvmTextRenderer;
 
-use crate::{RenderedKernel, with_context};
+use crate::{RenderedKernel, Renderer};
 use morok_ir::UOp;
 use std::sync::Arc;
 
-/// Render a UOp graph to LLVM IR using the thread-local context.
+/// Render a UOp graph to LLVM IR.
 pub fn render(uop: &Arc<UOp>, name: Option<&str>) -> crate::Result<RenderedKernel> {
-    with_context(|context| {
-        let renderer = cpu::CpuLlvmRenderer::new(context);
-        crate::Renderer::render(&renderer, uop, name)
-    })
+    cpu::CpuLlvmRenderer::render(&cpu::CpuLlvmRenderer, uop, name)
 }

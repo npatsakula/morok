@@ -1559,7 +1559,6 @@ dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-native",
- "inkwell",
  "itertools 0.14.0",
  "morok-device",
  "morok-dtype",
