@@ -1,4 +1,4 @@
-//! GPU-specific LLVM IR text generation.
+//! GPU-specific LLVM IR operation rendering.
 //!
 //! Placeholder for future GPU backends (HIP, CUDA, Metal).
 //! When implementing GPU support, see Tinygrad's AMDLLVMRenderer for patterns:
@@ -7,6 +7,13 @@
 //! - Shared memory: addrspace(3) global
 //! - WMMA: @llvm.amdgcn.wmma / @llvm.amdgcn.mfma intrinsics
 
-pub mod ops;
+use crate::llvm::common::RenderContext;
+use morok_ir::UOp;
+use std::sync::Arc;
 
-pub use ops::render_uop;
+/// Render a UOp to LLVM IR string for GPU backend.
+///
+/// Currently unimplemented - returns None for all ops.
+pub fn render_uop(_uop: &Arc<UOp>, _ctx: &mut RenderContext, _kernel: &mut Vec<String>) -> Option<()> {
+    None
+}

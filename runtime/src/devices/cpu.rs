@@ -172,7 +172,7 @@ impl Compiler for LlvmCompiler {
 
 /// LLVM renderer wrapper implementing the Renderer trait.
 ///
-/// This wraps `morok_codegen::llvm::render` to provide a unified rendering interface.
+/// This wraps `morok_codegen::llvm::text::render` to provide a unified rendering interface.
 struct LlvmRendererWrapper {
     device: DeviceSpec,
 }
@@ -180,7 +180,7 @@ struct LlvmRendererWrapper {
 impl Renderer for LlvmRendererWrapper {
     fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec> {
         // Call the existing LLVM renderer
-        let rendered = morok_codegen::llvm::render(ast, Some("kernel"))
+        let rendered = morok_codegen::llvm::text::render(ast, Some("kernel"))
             .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM rendering failed: {}", e) })?;
 
         // Convert RenderedKernel to ProgramSpec

@@ -14,7 +14,7 @@
 //! ```ignore
 //! use morok_codegen::llvm;
 //!
-//! let kernel = llvm::render(&optimized_uop_graph, Some("kernel"))?;
+//! let kernel = llvm::text::render(&optimized_uop_graph, Some("kernel"))?;
 //! ```
 
 pub mod common;

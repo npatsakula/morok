@@ -1,39 +1,34 @@
-//! Text-based LLVM IR code generation.
+//! Text-based LLVM IR code generation (main entry point).
 //!
 //! This module generates LLVM IR as plain strings using `format!` macros,
 //! following Tinygrad's approach in `renderer/llvmir.py`.
 //!
 //! # Kernel Signature
 //!
-//! The generated kernel uses the same signature as the inkwell-based renderer:
+//! The generated kernel uses CPU signature:
 //! ```llvm
 //! void @kernel(ptr %args, ptr %vars)
 //! ```
 //! - `args`: pointer to array of buffer pointers
 //! - `vars`: pointer to array of i64 values (variables + optional thread_id)
 
-pub mod ctx;
-pub mod ops;
-pub mod types;
-
 use std::sync::Arc;
 
 use morok_ir::pattern::TypedPatternMatcher;
 use morok_ir::rewrite::graph_rewrite_bottom_up;
-use morok_ir::{AxisType, ConstValue, Op, prelude::*};
+use morok_ir::{AxisType, Op, prelude::*};
 use morok_schedule::devectorize::pm_render;
 use morok_schedule::linearize::linearize_with_cfg;
 use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
+use crate::llvm::common::{RenderContext, ldt};
+use crate::llvm::cpu::{reduce_identity, render_uop};
 use crate::{BufferArg, RenderedKernel, Renderer, Result};
-use ctx::RenderContext;
-use ops::render_uop;
 
 /// Text-based LLVM IR renderer.
 ///
 /// Generates LLVM IR as strings, suitable for compilation via inkwell's IR parser.
-/// Produces the same kernel signature as the inkwell-based CpuLlvmRenderer:
-/// `void @kernel(ptr %args, ptr %vars)`
+/// Produces kernel signature: `void @kernel(ptr %args, ptr %vars)`
 pub struct LlvmTextRenderer;
 
 impl LlvmTextRenderer {
@@ -52,24 +47,16 @@ impl Renderer for LlvmTextRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        // Apply pm_render to convert VConst/vector CONST to VECTORIZE before codegen
-        // This ensures type-safe rendering (Tinygrad devectorizer.py:258-275)
         let uop = graph_rewrite_bottom_up(&pm_render(), uop.clone(), &mut ());
 
         tracing::debug!(ast_after_pm_render = %uop.tree(), "codegen: after pm_render");
 
-        // Apply pm_bool_devectorize after pm_render to catch any vectorized bool ops
-        // that were created or exposed by pm_render. This matches Tinygrad's approach
         let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop, &mut ());
 
         tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "codegen: after pm_bool_devectorize");
 
-        // Use priority-based linearizer with CFG control flow edges for proper
-        // RANGE → body → END ordering. This applies CFGContext edges to ensure
-        // sibling loops are ordered correctly.
         let nodes = linearize_with_cfg(uop);
 
-        // DEBUG: Log linearization order
         for (i, node) in nodes.iter().enumerate() {
             tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "linearized node");
         }
@@ -79,7 +66,6 @@ impl Renderer for LlvmTextRenderer {
         let mut buffer_args: Vec<BufferArg> = Vec::new();
         let mut var_names: Vec<String> = Vec::new();
 
-        // Collect buffers and variables
         let mut buffers: Vec<Arc<UOp>> = Vec::new();
         let mut variables: Vec<Arc<UOp>> = Vec::new();
 
@@ -95,11 +81,8 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
-        // Sort buffers by DefineGlobal id to ensure consistent argument order
-        // This matches Tinygrad's behavior where buffers are passed in order of their id
         buffers.sort_by_key(|b| if let Op::DefineGlobal(id) = b.op() { *id } else { usize::MAX });
 
-        // Detect Thread ranges - these become dispatch dimensions, not loops
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
             if let Op::Range { axis_type, end, .. } = n.op()
                 && matches!(axis_type, AxisType::Thread)
@@ -114,7 +97,6 @@ impl Renderer for LlvmTextRenderer {
         let has_threading = thread_info.is_some();
         let thread_count = thread_info.as_ref().map(|(_, c)| *c).unwrap_or(1);
 
-        // Build buffer args list
         for (i, buf) in buffers.iter().enumerate() {
             if let Op::DefineGlobal(id) = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
@@ -122,7 +104,6 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
-        // Build var_names list for runtime
         for var in &variables {
             if let Op::DefineVar { name, .. } = var.op() {
                 var_names.push(name.clone());
@@ -132,7 +113,6 @@ impl Renderer for LlvmTextRenderer {
             var_names.push("thread_id".to_string());
         }
 
-        // Generate prologue: load buffers and vars from arrays
         kernel.push("  ; Load buffer pointers from args array".to_string());
         for (i, buf) in buffers.iter().enumerate() {
             let ptr_name = format!("%buf{i}_ptr");
@@ -152,42 +132,36 @@ impl Renderer for LlvmTextRenderer {
             ctx.register(var.id, var_val_name);
         }
 
-        // Load thread_id if threading is used
         if let Some((thread_range, _)) = &thread_info {
             let thread_idx = variables.len();
             kernel.push(format!("  %thread_id_ptr = getelementptr i64, ptr %vars, i64 {thread_idx}"));
             kernel.push("  %thread_id = load i64, ptr %thread_id_ptr".to_string());
 
-            // Register thread_id for the Thread range
             if let Op::Range { axis_id, .. } = thread_range.op() {
                 ctx.register(thread_range.id, "%thread_id".to_string());
                 ctx.register_range(axis_id.value(), "%thread_id".to_string());
             }
         }
 
-        kernel.push("".to_string()); // Empty line for readability
+        kernel.push("".to_string());
 
-        // Pre-pass: Emit REDUCE allocas before loop structures
-        // Allocas must be at function entry, before any loops
         kernel.push("  ; Reduction accumulators".to_string());
         for node in &nodes {
             if let Op::Reduce { reduce_op, .. } = node.op() {
-                let dtype = types::ldt(&node.dtype());
-                let identity = ops::reduce_identity(*reduce_op, &node.dtype());
+                let dtype = ldt(&node.dtype());
+                let identity = reduce_identity(*reduce_op, &node.dtype());
                 let acc_name = format!("%reduce_{}", node.id);
                 kernel.push(format!("  {acc_name} = alloca {dtype}"));
                 kernel.push(format!("  store {dtype} {identity}, ptr {acc_name}"));
-                // Pre-register the accumulator name for REDUCE
                 ctx.register(node.id, acc_name);
             }
         }
         kernel.push("".to_string());
 
-        // Pre-register constants
         for node in &nodes {
             match node.op() {
                 Op::Const(cv) => {
-                    let val = types::lconst(&cv.0, &node.dtype());
+                    let val = crate::llvm::common::lconst(&cv.0, &node.dtype());
                     ctx.register(node.id, val);
                 }
                 Op::VConst { .. } => {
@@ -197,21 +171,15 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
-        // Pre-register Range variables by axis_id
         for node in &nodes {
-            if let Op::Range { axis_id, axis_type, .. } = node.op() {
-                // Thread ranges already registered above via thread_id parameter
-                if !matches!(axis_type, AxisType::Thread) {
+            if let Op::Range { axis_id, axis_type, .. } = node.op()
+                && !matches!(axis_type, AxisType::Thread) {
                     let name = format!("%r{}", axis_id.value());
                     ctx.register(node.id, name);
                 }
-            }
         }
 
-        // Single pass: process all nodes in linearization order
-        // This ensures DefineReg allocas are emitted before any RANGE loops that use them
         for node in &nodes {
-            // Skip Thread ranges (handled via thread_id parameter)
             if let Op::Range { axis_type, .. } = node.op()
                 && matches!(axis_type, AxisType::Thread)
             {
@@ -220,10 +188,8 @@ impl Renderer for LlvmTextRenderer {
             render_uop(node, &mut ctx, &mut kernel);
         }
 
-        // Add return void at the end
         kernel.push("  ret void".to_string());
 
-        // Build complete IR
         let ir = format!(
             r#"; ModuleID = '{kernel_name}'
 source_filename = "{kernel_name}"
@@ -247,7 +213,6 @@ attributes #0 = {{ alwaysinline nounwind "no-builtins" "no-trapping-math"="true"
         result.buffer_args = buffer_args;
         result.var_names = var_names;
 
-        // Set global_size for threaded kernels
         if thread_count > 1 {
             result.global_size = Some([thread_count, 1, 1]);
             result.local_size = Some([1, 1, 1]);
@@ -265,12 +230,10 @@ attributes #0 = {{ alwaysinline nounwind "no-builtins" "no-trapping-math"="true"
     }
 }
 
-/// Determine if a buffer is an output (written to).
 fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
     let buffer_id = def_global.id;
 
     for node in nodes {
-        // Use store_buffer() helper to get buffer from STORE via its INDEX child
         if let Some(buffer) = node.store_buffer() {
             if buffer.id == buffer_id {
                 return true;
@@ -285,8 +248,6 @@ fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
     false
 }
 
-/// Convert LLVM type syntax to mangled intrinsic suffix.
-/// E.g., "<2 x float>" -> "v2f32", "float" -> "f32"
 fn mangle_type(llvm_type: &str) -> String {
     match llvm_type {
         "float" => "f32".to_string(),
@@ -297,7 +258,6 @@ fn mangle_type(llvm_type: &str) -> String {
         "i32" => "i32".to_string(),
         "i64" => "i64".to_string(),
         _ if llvm_type.starts_with('<') && llvm_type.ends_with('>') => {
-            // Parse vector type: "<N x type>"
             let inner = &llvm_type[1..llvm_type.len() - 1];
             let parts: Vec<&str> = inner.split(" x ").collect();
             if parts.len() == 2 {
@@ -305,24 +265,21 @@ fn mangle_type(llvm_type: &str) -> String {
                 let base = mangle_type(parts[1].trim());
                 format!("v{count}{base}")
             } else {
-                llvm_type.to_string() // fallback
+                llvm_type.to_string()
             }
         }
         _ => llvm_type.to_string(),
     }
 }
 
-/// Generate LLVM intrinsic declarations used in the kernel.
 fn generate_intrinsic_declarations(kernel: &[String]) -> String {
     let mut decls = Vec::new();
     let kernel_str = kernel.join("\n");
 
-    // Float intrinsics - check for both scalar and vector types
     for intrinsic in &[
         "sqrt", "exp", "exp2", "log", "log2", "sin", "cos", "pow", "fabs", "floor", "ceil", "trunc", "round", "maxnum",
         "minnum", "fmuladd", "erf",
     ] {
-        // Scalar and vector types to check
         for llvm_type in
             &["float", "double", "half", "<2 x float>", "<4 x float>", "<8 x float>", "<2 x double>", "<4 x double>"]
         {
@@ -343,7 +300,6 @@ fn generate_intrinsic_declarations(kernel: &[String]) -> String {
         }
     }
 
-    // Integer intrinsics
     for bits in &["i8", "i16", "i32", "i64"] {
         let pattern = format!("@llvm.abs.{bits}");
         if kernel_str.contains(&pattern) {
@@ -354,7 +310,6 @@ fn generate_intrinsic_declarations(kernel: &[String]) -> String {
     decls.join("\n")
 }
 
-/// Render a kernel using the text-based LLVM renderer.
 pub fn render(uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
     let renderer = LlvmTextRenderer::new();
     renderer.render(uop, name)
@@ -368,7 +323,6 @@ mod tests {
 
     #[test]
     fn test_simple_add() {
-        // Create a simple add operation
         let a = UOp::define_global(0, DType::Float32.ptr(Some(1), AddrSpace::Global));
         let b = UOp::define_global(1, DType::Float32.ptr(Some(1), AddrSpace::Global));
         let out = UOp::define_global(2, DType::Float32.ptr(Some(1), AddrSpace::Global));
@@ -389,9 +343,7 @@ mod tests {
         let result = render(&sink, Some("test_add")).unwrap();
         println!("{}", result.code);
 
-        // Check for args/vars signature
         assert!(result.code.contains("define void @test_add(ptr %args, ptr %vars)"));
-        // Check for buffer loading
         assert!(result.code.contains("getelementptr ptr, ptr %args"));
         assert!(result.code.contains("fadd"));
         assert!(result.code.contains("load"));

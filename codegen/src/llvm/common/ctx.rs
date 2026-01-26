@@ -1,6 +1,7 @@
 //! Render context for LLVM IR text generation.
 //!
 //! Maps UOp IDs to LLVM variable names and manages naming.
+//! Shared between CPU and GPU backends.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,8 +32,8 @@ impl RenderContext {
 
     /// Get or create variable name for UOp.
     ///
-    /// For constants, returns the literal value.
-    /// For definitions, returns the argument name.
+    /// For constants, returns literal value.
+    /// For definitions, returns argument name.
     /// For other ops, returns a generated variable name.
     pub fn name(&mut self, uop: &Arc<UOp>) -> String {
         if let Some(name) = self.names.get(&uop.id) {
@@ -109,7 +110,7 @@ impl RenderContext {
         self.names.insert(id, name);
     }
 
-    /// Get the current variable counter.
+    /// Get current variable counter.
     pub fn counter(&self) -> usize {
         self.counter
     }
@@ -129,7 +130,7 @@ impl RenderContext {
         self.pending_reduces.insert(reduce_id, PendingReduce { acc_ptr, dtype });
     }
 
-    /// Take all pending reduces (empties the map).
+    /// Take all pending reduces (empties map).
     pub fn take_pending_reduces(&mut self) -> HashMap<u64, PendingReduce> {
         std::mem::take(&mut self.pending_reduces)
     }

@@ -4,7 +4,7 @@ use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, ConstValue, ReduceOp, UOp};
 use smallvec::SmallVec;
 
-use crate::llvm::render;
+use crate::llvm::text::render;
 
 /// Test basic RANGE/END loop codegen.
 ///
