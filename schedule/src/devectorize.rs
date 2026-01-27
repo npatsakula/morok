@@ -2,14 +2,20 @@
 //!
 //! Transforms vectorized INDEX into grouped consecutive accesses (PTRCAT) after expansion.
 //!
-//! # Pipeline (Tinygrad codegen/__init__.py:79)
+//! # Multi-Pass Architecture
 //!
-//! Single pass: `sym + devectorize + load_store_folding + correct_load_store + load_store_indexing`
+//! The devectorize pass uses a multi-pass architecture to ensure pattern dependencies
+//! are respected by the bottom-up rewrite engine:
 //!
-//! - `devectorize`: cast_after, no_vectorized_alu, no_vectorized_wmma, devectorize_buf_and_index
-//! - `load_store_folding`: expand_index, GEP/PTRCAT distribution
-//! - `correct_load_store`: split_load_store by device fold lengths
-//! - `load_store_indexing`: drop true gates
+//! - **Phase 1**: Devectorize ALU/WMMA/buffers + expand vector INDEX → GEP(PTRCAT)
+//! - **Phase 2**: Move GEP through LOAD/STORE → creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT))
+//! - **Phase 3**: Distribute PTRCAT through LOAD/STORE → LOAD(PTRCAT) → CAT(LOADs)
+//! - **Phase 4**: Split loads/stores by device fold lengths + drop true gates
+//!
+//! This separation is necessary because the bottom-up rewrite engine processes children
+//! first, then does fixed-point matching on the result. When `move_gep_after_load`
+//! transforms `LOAD(GEP(PTRCAT))` to `GEP(LOAD(PTRCAT))`, the inner `LOAD(PTRCAT)` needs
+//! to be matched by `distribute_ptrcat_load` in a subsequent pass.
 //!
 //! # pm_render (called AFTER devectorize)
 //!
@@ -38,16 +44,30 @@ use crate::symbolic::patterns::symbolic;
 
 /// Run devectorize pass. Call AFTER `pre_expand`, BEFORE codegen.
 ///
+/// Uses multi-pass architecture to ensure pattern dependencies are respected:
+/// - Phase 1: Devectorize ALU/WMMA/buffers + expand vector INDEX → GEP(PTRCAT)
+/// - Phase 2: Move GEP through LOAD/STORE (creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT)))
+/// - Phase 3: Distribute PTRCAT through LOAD/STORE (LOAD(PTRCAT) → CAT(LOADs))
+/// - Phase 4: Split loads/stores by device fold lengths + drop true gates
+///
 /// Note: `bool_storage_patterns()` called separately (backend-specific).
 /// Note: `pm_render()` should be applied AFTER this pass.
 pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
-    let pm_devectorize = symbolic()
-        + devectorize_patterns()
-        + load_store_folding_patterns()
-        + correct_load_store_patterns()
-        + load_store_indexing_patterns();
+    // Phase 1: Devectorize ALU, WMMA, buffers, and expand vector indices
+    let pm_phase1 = symbolic() + devectorize_patterns() + expand_index_patterns();
+    let ast = graph_rewrite_bottom_up(&pm_phase1, ast.clone(), &mut ());
 
-    graph_rewrite_bottom_up(&pm_devectorize, ast.clone(), &mut ())
+    // Phase 2: Move GEP through LOAD/STORE AND distribute PTRCAT
+    // These must be in the same pass because:
+    // - move_gep_after_load creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT))
+    // - distribute_ptrcat_load needs to match the newly created LOAD(PTRCAT)
+    // - The rewrite engine's fixed-point matching allows this in a single pass
+    let pm_phase2 = symbolic() + gep_movement_patterns() + ptrcat_distribution_patterns();
+    let ast = graph_rewrite_bottom_up(&pm_phase2, ast, &mut ());
+
+    // Phase 3: Split loads/stores by device fold lengths, drop true gates
+    let pm_phase3 = symbolic() + correct_load_store_patterns() + load_store_indexing_patterns();
+    graph_rewrite_bottom_up(&pm_phase3, ast, &mut ())
 }
 
 /// Bool LOAD/STORE via uint8. LLVM i1 can have garbage in upper bits.
@@ -56,14 +76,14 @@ pub fn bool_storage_patterns() -> TypedPatternMatcher {
         // STORE bool: cast to uint8 before storing
         Store { index, value, ranges } if value.dtype().base().is_bool() => {
             let uint8_dtype = value.dtype().with_base(ScalarDType::UInt8);
-            Some(UOp::store_with_ranges(index.clone(), UOp::cast(value.clone(), uint8_dtype), ranges.clone()))
+            Some(UOp::store_with_ranges(index.clone(), value.cast(uint8_dtype), ranges.clone()))
         },
 
         // LOAD bool: load as uint8, then cast to bool
         load @ Load { buffer, index } if load.dtype().base().is_bool() => {
             let uint8_dtype = load.dtype().with_base(ScalarDType::UInt8);
             let uint8_load = UOp::load().buffer(buffer.clone()).index(index.clone()).dtype(uint8_dtype).call();
-            Some(UOp::cast(uint8_load, load.dtype()))
+            Some(uint8_load.cast(load.dtype()))
         },
     }
 }
@@ -100,7 +120,7 @@ pub fn pm_render() -> TypedPatternMatcher {
             let elements: SmallVec<[Arc<UOp>; 4]> = sources.iter()
                 .flat_map(|src| {
                     let n = src.dtype().vcount();
-                    (0..n).map(move |i| if n == 1 { src.clone() } else { UOp::gep(src.clone(), vec![i]) })
+                    (0..n).map(move |i| if n == 1 { src.clone() } else { src.gep(vec![i]) })
                 })
                 .collect();
             Some(UOp::vectorize(elements))
@@ -122,19 +142,63 @@ pub fn pm_render() -> TypedPatternMatcher {
             Some(if extracted.len() == 1 { extracted[0].clone() } else { UOp::vectorize(extracted) })
         },
 
-        // GEP(PTRCAT) → reorder (must be before multi-index GEP)
+        // GEP(PTRCAT) → distribute element indices across sources
+        // PTRCAT vcount = total elements, NOT source count. GEP indices are element indices.
+        // Example: PTRCAT with 8 sources (each ptr<vec4<float>>) has vcount=32
+        // GEP([0..31]) should extract elements across all sources
         Gep { vector: PtrCat { sources }, indices } => {
-            let reordered: SmallVec<[Arc<UOp>; 4]> = indices.iter()
-                .filter_map(|&i| sources.get(i).cloned())
-                .collect();
-            if reordered.len() != indices.len() { return None; }
-            Some(if reordered.len() == 1 { reordered[0].clone() } else { UOp::ptrcat().sources(reordered.to_vec()).call() })
+            // Build element-to-source mapping: element_idx -> (source_idx, offset_in_source)
+            let mut element_map: Vec<(usize, usize)> = Vec::new();
+            for (src_idx, src) in sources.iter().enumerate() {
+                let src_count = ptr_element_count(src);
+                for offset in 0..src_count {
+                    element_map.push((src_idx, offset));
+                }
+            }
+
+            // Fast path: if indices match sources 1:1, just reorder sources
+            if element_map.len() == sources.len() && element_map.iter().all(|(_, off)| *off == 0) {
+                let reordered: SmallVec<[Arc<UOp>; 4]> = indices.iter()
+                    .filter_map(|&i| sources.get(i).cloned())
+                    .collect();
+                if reordered.len() == indices.len() {
+                    return Some(if reordered.len() == 1 {
+                        reordered[0].clone()
+                    } else {
+                        UOp::ptrcat().sources(reordered.to_vec()).call()
+                    });
+                }
+            }
+
+            // General case: distribute element indices across sources
+            let mut result_elements: Vec<Arc<UOp>> = Vec::with_capacity(indices.len());
+            for &elem_idx in indices.iter() {
+                if elem_idx >= element_map.len() {
+                    return None; // Index out of bounds
+                }
+                let (src_idx, offset) = element_map[elem_idx];
+                let src = &sources[src_idx];
+                let src_count = ptr_element_count(src);
+                let elem = if src_count == 1 {
+                    src.clone()
+                } else {
+                    src.gep(vec![offset])
+                };
+                result_elements.push(elem);
+            }
+
+            Some(if result_elements.len() == 1 {
+                result_elements[0].clone()
+            } else {
+                // Result is VECTORIZE of extracted pointer elements
+                UOp::vectorize(result_elements.into_iter().collect())
+            })
         },
 
         // Multi-index GEP → VECTORIZE (fallback, must be last GEP pattern)
         Gep { vector, indices } if indices.len() > 1 => |vector, indices| {
             let geps: SmallVec<[Arc<UOp>; 4]> = indices.iter()
-                .map(|&i| UOp::gep(vector.clone(), vec![i]))
+                .map(|&i| vector.gep(vec![i]))
                 .collect();
             Some(UOp::vectorize(geps))
         },
@@ -164,8 +228,8 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
                 let vcount = result.dtype().vcount();
                 let result_dtype = result.dtype().scalar().map(DType::Scalar)?;
                 let alus: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
-                    let gep_lhs = UOp::gep(lhs.clone(), vec![i]);
-                    let gep_rhs = UOp::gep(rhs.clone(), vec![i]);
+                    let gep_lhs = lhs.gep(vec![i]);
+                    let gep_rhs = rhs.gep(vec![i]);
                     UOp::new(Op::Binary(op, gep_lhs, gep_rhs), result_dtype.clone())
                 }).collect();
                 Some(UOp::vectorize(alus))
@@ -177,7 +241,7 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
                 let vcount = result.dtype().vcount();
                 let result_dtype = result.dtype().scalar().map(DType::Scalar)?;
                 let alus: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
-                    let gep_src = UOp::gep(src.clone(), vec![i]);
+                    let gep_src = src.gep(vec![i]);
                     UOp::new(Op::Unary(op, gep_src), result_dtype.clone())
                 }).collect();
                 Some(UOp::vectorize(alus))
@@ -188,8 +252,8 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
             let vcount = src.dtype().vcount();
             let src_result_dtype = src.dtype().scalar().map(DType::Scalar)?;
             let casts: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
-                let gep_src = UOp::gep(src.clone(), vec![i]);
-                UOp::cast(gep_src, src_result_dtype.clone())
+                let gep_src = src.gep(vec![i]);
+                gep_src.cast(src_result_dtype.clone())
             }).collect();
             Some(UOp::vectorize(casts))
         },
@@ -199,8 +263,8 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
             let vcount = src.dtype().vcount();
             let result_dtype = dtype.scalar().map(DType::Scalar)?;
             let bitcasts: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
-                let gep_src = UOp::gep(src.clone(), vec![i]);
-                UOp::bitcast(gep_src, result_dtype.clone())
+                let gep_src = src.gep(vec![i]);
+                gep_src.bitcast(result_dtype.clone())
             }).collect();
             Some(UOp::vectorize(bitcasts))
         },
@@ -213,9 +277,9 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
 
             let scalar_wheres: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
                 .map(|i| {
-                    let cond_elem = UOp::gep(cond.clone(), vec![i]);
-                    let t_elem = if t_vcount > 1 { UOp::gep(t.clone(), vec![i]) } else { t.clone() };
-                    let f_elem = if f_vcount > 1 { UOp::gep(f.clone(), vec![i]) } else { f.clone() };
+                    let cond_elem = cond.gep(vec![i]);
+                    let t_elem = if t_vcount > 1 { t.gep(vec![i]) } else { t.clone() };
+                    let f_elem = if f_vcount > 1 { f.gep(vec![i]) } else { f.clone() };
                     UOp::try_where(cond_elem, t_elem, f_elem).expect("WHERE construction should succeed")
                 })
                 .collect();
@@ -231,9 +295,9 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
 
             let scalar_mulaccs: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
                 .map(|i| {
-                    let a_elem = if a_vcount > 1 { UOp::gep(a.clone(), vec![i]) } else { a.clone() };
-                    let b_elem = if b_vcount > 1 { UOp::gep(b.clone(), vec![i]) } else { b.clone() };
-                    let c_elem = if c_vcount > 1 { UOp::gep(c.clone(), vec![i]) } else { c.clone() };
+                    let a_elem = if a_vcount > 1 { a.gep(vec![i]) } else { a.clone() };
+                    let b_elem = if b_vcount > 1 { b.gep(vec![i]) } else { b.clone() };
+                    let c_elem = if c_vcount > 1 { c.gep(vec![i]) } else { c.clone() };
                     UOp::try_mulacc(a_elem, b_elem, c_elem).expect("MulAcc construction should succeed")
                 })
                 .collect();
@@ -251,7 +315,7 @@ pub fn pm_vectorize_normalize() -> TypedPatternMatcher {
     crate::patterns! {
         Gep { vector, indices } if indices.len() > 1 => |vector, indices| {
             let geps: SmallVec<[Arc<UOp>; 4]> = indices.iter()
-                .map(|&i| UOp::gep(vector.clone(), vec![i]))
+                .map(|&i| vector.gep(vec![i]))
                 .collect();
             Some(UOp::vectorize(geps))
         },
@@ -304,7 +368,7 @@ fn devectorize_wmma(
         let src_count = src.dtype().vcount();
         for grp in (0..src_count).step_by(out_sz) {
             let gep_indices: Vec<usize> = (grp..grp + out_sz.min(src_count - grp)).collect();
-            tsrcs[i].push(UOp::gep((*src).clone(), gep_indices));
+            tsrcs[i].push((*src).gep(gep_indices));
         }
     }
 
@@ -321,7 +385,7 @@ fn devectorize_wmma(
         .collect();
 
     let wmma_ex: SmallVec<[Arc<UOp>; 4]> =
-        wmmas.iter().flat_map(|w| (0..out_sz).map(move |i| UOp::gep(w.clone(), vec![i]))).collect();
+        wmmas.iter().flat_map(|w| (0..out_sz).map(move |i| w.gep(vec![i]))).collect();
 
     Some(UOp::vectorize(wmma_ex))
 }
@@ -332,7 +396,7 @@ fn cast_after_pattern() -> TypedPatternMatcher {
         After { passthrough: Cast { src, dtype }, deps }
             => |src, dtype, deps| {
                 let new_after = UOp::after(src.clone(), deps.clone());
-                Some(UOp::cast(new_after, dtype.clone()))
+                Some(new_after.cast(dtype.clone()))
             },
     }
 }
@@ -406,7 +470,7 @@ fn no_vectorized_buf(buf: &Arc<UOp>) -> Option<Arc<UOp>> {
         DType::Ptr { base: Box::new(DType::Scalar(scalar_base)), addrspace, size: new_size, vcount: 1 };
 
     let scalar_def = buf.with_dtype(scalar_ptr_dtype);
-    Some(UOp::cast(scalar_def, buf.dtype()))
+    Some(scalar_def.cast(buf.dtype()))
 }
 
 /// INDEX(CAST(buf), scalar_idx) → INDEX(VECTORIZE([buf,...]), scaled_vec_idx) (devectorizer.py:228-231)
@@ -423,10 +487,10 @@ fn no_vectorized_index(
         return None;
     }
 
-    let buf_broadcast = UOp::broadcast(buf.clone(), cnt);
-    let idx_broadcast = UOp::broadcast(idx.clone(), cnt);
+    let buf_broadcast = buf.broadcast(cnt);
+    let idx_broadcast = idx.broadcast(cnt);
     let offset_vec = create_index_vector(cnt);
-    let cnt_broadcast = UOp::broadcast(idx.const_like(cnt as i64), cnt);
+    let cnt_broadcast = idx.const_like(cnt as i64).broadcast(cnt);
     let final_idx = idx_broadcast.mul(&cnt_broadcast).add(&offset_vec);
 
     let buf_dtype = buf_broadcast.dtype();
@@ -468,9 +532,9 @@ fn no_vectorized_index_broadcast(
     let sum_arg: Vec<i64> = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64)).collect();
 
     let total_cnt = cnt * precnt;
-    let buf_broadcast = UOp::broadcast(buf.clone(), total_cnt);
-    let idx_gep = UOp::gep(idx.clone(), gep_arg);
-    let cnt_broadcast = UOp::broadcast(idx.const_like(cnt as i64), total_cnt);
+    let buf_broadcast = buf.broadcast(total_cnt);
+    let idx_gep = idx.gep(gep_arg);
+    let cnt_broadcast = idx.const_like(cnt as i64).broadcast(total_cnt);
     let sum_vec = create_const_index_vector(&sum_arg);
     let final_idx = idx_gep.mul(&cnt_broadcast).add(&sum_vec);
 
@@ -512,9 +576,9 @@ fn no_vectorized_index_gep(
     let sum_arg: Vec<i64> = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64)).collect();
 
     let total_cnt = cnt * precnt;
-    let buf_broadcast = UOp::broadcast(buf.clone(), total_cnt);
-    let idx_gep = UOp::gep(idx.clone(), gep_arg);
-    let cnt_broadcast = UOp::broadcast(idx.const_like(cnt as i64), total_cnt);
+    let buf_broadcast = buf.broadcast(total_cnt);
+    let idx_gep = idx.gep(gep_arg);
+    let cnt_broadcast = idx.const_like(cnt as i64).broadcast(total_cnt);
     let sum_vec = create_const_index_vector(&sum_arg);
     let final_idx = idx_gep.mul(&cnt_broadcast).add(&sum_vec);
 
@@ -602,13 +666,27 @@ pub fn pm_wmma_accumulate() -> TypedPatternMatcher {
 // ============================================================================
 // Load Store Folding Patterns (devectorizer.py:114-126)
 // ============================================================================
+//
+// Multi-pass architecture: The patterns are split into phases because the
+// bottom-up rewrite engine processes children before parents and does fixed-point
+// matching on the result. When patterns create nested structures (e.g., GEP(LOAD(PTRCAT))),
+// inner patterns may not match if they're in the same pass.
+//
+// Phase order:
+// 1. expand_index: vector INDEX → GEP(PTRCAT)
+// 2. gep_movement: LOAD(GEP(PTRCAT)) → GEP(LOAD(PTRCAT))
+// 3. ptrcat_distribution: LOAD(PTRCAT) → CAT(LOADs)
 
-/// expand_index, GEP movement, PTRCAT distribution.
-pub fn load_store_folding_patterns() -> TypedPatternMatcher {
+/// Phase 1: Expand vector INDEX into GEP(PTRCAT) groupings.
+fn expand_index_patterns() -> TypedPatternMatcher {
     crate::patterns! {
-        // expand_index: vector INDEX → PTRCAT grouping
         index if is_vector_index(index) => expand_vector_index(index),
+    }
+}
 
+/// Phase 2: Move GEP through LOAD/STORE.
+fn gep_movement_patterns() -> TypedPatternMatcher {
+    crate::patterns! {
         // GEP after LOAD: LOAD(GEP(x)) → GEP(LOAD(x))
         load @ Load { buffer, index: Gep { vector, indices } }
             => move_gep_after_load(load, buffer, vector, indices),
@@ -616,7 +694,12 @@ pub fn load_store_folding_patterns() -> TypedPatternMatcher {
         // GEP on STORE: STORE(GEP(x), data) → STORE(x, GEP⁻¹(data))
         Store { index: Gep { vector, indices }, value, ranges }
             => move_gep_on_store(vector, indices, value, ranges),
+    }
+}
 
+/// Phase 3: Distribute PTRCAT through LOAD/STORE.
+fn ptrcat_distribution_patterns() -> TypedPatternMatcher {
+    crate::patterns! {
         // PTRCAT after LOAD: LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
         load @ Load { buffer, index: ptrcat @ PtrCat { sources } }
             => distribute_ptrcat_load(load, buffer, ptrcat, sources),
@@ -625,6 +708,12 @@ pub fn load_store_folding_patterns() -> TypedPatternMatcher {
         Store { index: PtrCat { sources }, value, ranges }
             => distribute_ptrcat_store(sources, value, ranges),
     }
+}
+
+/// Combined load/store folding patterns (for backward compatibility).
+/// Prefer using `devectorize()` which applies these in proper phase order.
+pub fn load_store_folding_patterns() -> TypedPatternMatcher {
+    expand_index_patterns() + gep_movement_patterns() + ptrcat_distribution_patterns()
 }
 
 // ============================================================================
@@ -657,27 +746,48 @@ fn is_vector_index(uop: &Arc<UOp>) -> bool {
 
     // Index must be vector
     let Some(idx) = indices.first() else { return false };
-    if idx.dtype().vcount() <= 1 {
+    let idx_vcount = idx.dtype().vcount();
+    if idx_vcount <= 1 {
+        tracing::trace!(idx_vcount = idx_vcount, "is_vector_index: idx not vector");
         return false;
     }
 
     // Buffer MUST be VECTORIZE (not bare buffer) - Tinygrad line 115
-    let Op::Vectorize { elements } = buffer.op() else { return false };
+    let Op::Vectorize { elements } = buffer.op() else {
+        tracing::trace!("is_vector_index: buffer not VECTORIZE");
+        return false;
+    };
 
     // Elements must be Defines.or_after()
     if elements.is_empty() || !elements.iter().all(is_define_or_after) {
+        tracing::trace!("is_vector_index: elements not defines");
         return false;
     }
 
     // Don't vectorize bool loads (LLVM i1 vector load is broken)
-    !elements[0].dtype().base().is_bool()
+    let is_bool = elements[0].dtype().base().is_bool();
+    if is_bool {
+        tracing::trace!("is_vector_index: bool type, skipping");
+        return false;
+    }
+
+    true
 }
 
 // ============================================================================
 // GEP Movement Patterns (devectorizer.py:106-120)
 // ============================================================================
 
-/// LOAD(GEP(ptr)) → GEP(LOAD(ptr)). LOAD dtype = ld.dtype.scalar().vec(gep.dtype.count)
+/// LOAD(GEP(ptr)) → GEP(LOAD(ptr)).
+///
+/// Tinygrad (devectorizer.py:117-118):
+/// ```python
+/// (UPat(Ops.LOAD, src=(UPat(Ops.GEP, name="gep"),), name="ld", allow_any_len=True),
+///  lambda gep, ld: ld.replace(dtype=ld.dtype.scalar().vec(gep.dtype.count), src=(gep.src[0],)+ld.src[1:]).gep(gep.arg))
+/// ```
+///
+/// Inner LOAD dtype = load.dtype.scalar().vec(gep.dtype.count)
+/// Note: Morok's scalar() only works on Scalar dtypes, so we use base() which works on both.
 fn move_gep_after_load(
     load: &Arc<UOp>,
     buffer: &Arc<UOp>,
@@ -685,7 +795,9 @@ fn move_gep_after_load(
     gep_indices: &[usize],
 ) -> Option<Arc<UOp>> {
     let gep_count = gep_indices.len();
-    let scalar_base = load.dtype().scalar()?;
+    // Tinygrad: ld.dtype.scalar().vec(gep.dtype.count)
+    // Use base() instead of scalar() - load.dtype() may be Vector, not Scalar
+    let scalar_base = load.dtype().base();
     let inner_load_dtype = if gep_count > 1 {
         DType::Vector { scalar: scalar_base, count: gep_count }
     } else {
@@ -693,7 +805,7 @@ fn move_gep_after_load(
     };
 
     let inner_load = UOp::load().buffer(buffer.clone()).index(gep_inner.clone()).dtype(inner_load_dtype).call();
-    Some(UOp::gep(inner_load, gep_indices.to_vec()))
+    Some(inner_load.gep(gep_indices.to_vec()))
 }
 
 /// STORE(GEP(ptr), data) → STORE(ptr, GEP⁻¹(data)). Inverts GEP indices.
@@ -708,7 +820,7 @@ fn move_gep_on_store(
     inverse_map.sort_by_key(|&(x, _)| x);
     let inverse_indices: Vec<usize> = inverse_map.iter().map(|&(_, i)| i).collect();
 
-    let reordered_value = UOp::gep(value.clone(), inverse_indices);
+    let reordered_value = value.gep(inverse_indices);
     Some(UOp::store_with_ranges(gep_inner.clone(), reordered_value, ranges.clone()))
 }
 
@@ -729,7 +841,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         .map(|i| {
             UOp::index()
                 .buffer(buf.clone())
-                .indices(vec![UOp::gep(vec.clone(), vec![i])])
+                .indices(vec![vec.gep(vec![i])])
                 .maybe_gate(gate.clone())
                 .call()
                 .expect("ICE: unable to create index")
@@ -782,7 +894,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         let groups = group_consecutive_offsets_from_map(offsets);
         for (_, lanes) in groups {
             let lidx = sources[lanes[0]].clone();
-            let ptr = if lanes.len() > 1 { UOp::cast(lidx, make_vec_ptr_dtype(&buf, lanes.len())) } else { lidx };
+            let ptr = if lanes.len() > 1 { lidx.cast(make_vec_ptr_dtype(&buf, lanes.len())) } else { lidx };
             for (i, &lane) in lanes.iter().enumerate() {
                 idxs[lane] = Some(global_offset + i);
             }
@@ -802,7 +914,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let ptrcat = UOp::ptrcat().sources(ret).dtype(ptrcat_dtype).call();
     let gep_indices: Vec<usize> = idxs.into_iter().map(|x| x.unwrap()).collect();
 
-    Some(UOp::gep(ptrcat, gep_indices))
+    Some(ptrcat.gep(gep_indices))
 }
 
 /// Groups offsets where `offset - index` is constant. Breaks on multi-lane offsets.
@@ -851,6 +963,8 @@ fn distribute_ptrcat_load(
     let loads: Vec<Arc<UOp>> = sources
         .iter()
         .map(|ptr| {
+            // Tinygrad: ld.replace(dtype=x.dtype.base, ...) - preserves vec type
+            // If ptr is ptr<vec4<float>>, load dtype should be vec4<float>, NOT scalar float
             let load_dtype = match ptr.dtype() {
                 DType::Ptr { base, .. } => base.as_ref().clone(),
                 other => other.clone(),
@@ -893,7 +1007,7 @@ fn distribute_ptrcat_store(
         }
 
         let gep_indices: Vec<usize> = (offset..offset + ptr_count).collect();
-        let store_value = UOp::gep(value.clone(), gep_indices);
+        let store_value = value.gep(gep_indices);
         stores.push(UOp::store_with_ranges(ptr.clone(), store_value, ranges.clone()));
         offset += ptr_count;
     }
@@ -968,8 +1082,7 @@ fn split_load(buffer: &Arc<UOp>, idx: &Arc<UOp>, cast_dtype: &DType) -> Option<A
             }
 
             let chunk_idx = if pos == 0 { idx.clone() } else { offset_index(idx, pos as i64) };
-            let chunk_ptr =
-                if fold_len > 1 { UOp::cast(chunk_idx, make_vec_ptr_dtype(buffer, fold_len)) } else { chunk_idx };
+            let chunk_ptr = if fold_len > 1 { chunk_idx.cast(make_vec_ptr_dtype(buffer, fold_len)) } else { chunk_idx };
             let chunk_dtype = if fold_len > 1 {
                 DType::Vector { scalar: scalar_base, count: fold_len }
             } else {
@@ -1045,9 +1158,9 @@ fn split_store(
 
             let chunk_idx = if pos == 0 { idx.clone() } else { offset_index(idx, pos as i64) };
             let chunk_ptr =
-                if fold_len > 1 { UOp::cast(chunk_idx, make_vec_ptr_dtype(idx_buffer, fold_len)) } else { chunk_idx };
+                if fold_len > 1 { chunk_idx.cast(make_vec_ptr_dtype(idx_buffer, fold_len)) } else { chunk_idx };
             let gep_indices: Vec<usize> = (pos..pos + fold_len).collect();
-            let chunk_value = UOp::gep(value.clone(), gep_indices);
+            let chunk_value = value.gep(gep_indices);
             stores.push(UOp::store_with_ranges(chunk_ptr, chunk_value, ranges.clone()));
 
             pos += fold_len;

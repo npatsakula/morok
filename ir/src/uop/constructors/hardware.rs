@@ -54,48 +54,41 @@ impl UOp {
 
     /// Broadcast a scalar value to a vector by replication.
     ///
-    /// Based on Tinygrad's UOp.broadcast() (ops.py:379-382).
     /// Creates a VECTORIZE operation with `count` copies of the source.
-    ///
-    /// If `count == 1`, returns the source unchanged (optimization).
-    ///
-    /// # Arguments
-    ///
-    /// * `src` - The scalar value to broadcast
-    /// * `count` - The target vector width
+    /// If `count == 1`, returns the source unchanged.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let scalar = UOp::const_(DType::Float32, 5.0);
-    /// let vector = UOp::broadcast(scalar, 4);
-    /// // Creates VECTORIZE(float32.vec(4), (scalar, scalar, scalar, scalar))
+    /// let vector = scalar.broadcast(4);
     /// ```
-    pub fn broadcast(src: Arc<Self>, count: usize) -> Arc<Self> {
+    pub fn broadcast(self: &Arc<Self>, count: usize) -> Arc<Self> {
         if count == 1 {
-            return src;
+            return self.clone();
         }
-        let elements: SmallVec<[Arc<Self>; 4]> = (0..count).map(|_| src.clone()).collect();
+        let elements: SmallVec<[Arc<Self>; 4]> = (0..count).map(|_| self.clone()).collect();
         Self::vectorize(elements)
     }
 
-    /// Get element pointer (extract element(s) from vector).
-    pub fn gep(vector: Arc<Self>, indices: Vec<usize>) -> Arc<Self> {
-        let vector_dtype = vector.dtype();
+    /// Extract element(s) from vector (Get Element Pointer).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let elem = vector.gep(vec![0]);      // Extract single element
+    /// let sub = vector.gep(vec![0, 2]);    // Extract multiple elements
+    /// ```
+    pub fn gep(self: &Arc<Self>, indices: Vec<usize>) -> Arc<Self> {
+        let vector_dtype = self.dtype();
 
         // Extract scalar if single element, keep vector if multiple
-        // Use base() instead of scalar() to handle both Scalar and Vector dtypes
         let dtype = if indices.len() == 1 {
-            // Extract single element -> scalar
-            // For Scalar(s), base() returns s
-            // For Vector { scalar, .. }, base() returns scalar
             DType::Scalar(vector_dtype.base())
         } else {
-            // Extract multiple elements -> vector
             DType::Scalar(vector_dtype.base()).vec(indices.len())
         };
 
-        Self::new(Op::Gep { vector, indices }, dtype)
+        Self::new(Op::Gep { vector: self.clone(), indices }, dtype)
     }
 
     /// Contract unrolled values back into vectorized form.

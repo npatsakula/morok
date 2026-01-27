@@ -48,7 +48,7 @@ fn test_gep_basic() {
     ]);
 
     // GEP operation exists (actual behavior may vary based on implementation)
-    let _elem = UOp::gep(vec, vec![0]);
+    let _elem = vec.gep(vec![0]);
     // Just verify it compiles and creates a UOp
 }
 
@@ -62,7 +62,7 @@ fn test_gep_multiple_indices() {
     ]);
 
     // Extract multiple elements -> produces vector of extracted elements
-    let result = UOp::gep(vec, vec![0, 2]);
+    let result = vec.gep(vec![0, 2]);
     assert_eq!(result.dtype(), DType::Int32.vec(2));
 }
 

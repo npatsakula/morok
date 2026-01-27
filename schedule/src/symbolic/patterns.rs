@@ -584,7 +584,7 @@ pub fn cast_dsl_patterns() -> TypedPatternMatcher {
         // This handles widening chains: int8.cast(int32).cast(int64) → int8.cast(int64)
         Cast { src: Cast { src: x, dtype: intermediate }, dtype: outer }
             if can_safe_cast(&x.dtype(), intermediate)
-            ~> |x, outer| UOp::cast(x.clone(), outer.clone()),
+            ~> |x, outer| x.cast(outer.clone()),
     }
 }
 
@@ -834,8 +834,8 @@ pub fn cast_where_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // cast(where(s, a, b), dtype) → where(s, cast(a, dtype), cast(b, dtype))
         Cast { src: Where(s, a, b), dtype } => |s, a, b, dtype| {
-            let cast_a = UOp::cast(a.clone(), dtype.clone());
-            let cast_b = UOp::cast(b.clone(), dtype.clone());
+            let cast_a = a.cast(dtype.clone());
+            let cast_b = b.cast(dtype.clone());
             UOp::try_where(s.clone(), cast_a, cast_b).ok()
         },
     }
@@ -1008,7 +1008,7 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
             let composed: Vec<usize> = indices.iter()
                 .map(|&o| inner_indices.get(o).copied())
                 .collect::<Option<Vec<_>>>()?;
-            Some(UOp::gep(Arc::clone(inner_vec), composed))
+            Some(inner_vec.gep(composed))
         },
 
         // 2. GEP through BROADCAST: extract scalar (MUST be before general VECTORIZE!)
@@ -1042,37 +1042,37 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
         // 6. Push GEP through Binary: GEP(Binary(op, a, b), indices) → Binary(op, GEP(a), GEP(b))
         Gep { vector, indices } if !indices.is_empty() && matches!(vector.op(), Op::Binary(..)) => |vector, indices| {
             let Op::Binary(bin_op, a, b) = vector.op() else { return None };
-            let gep_a = UOp::gep(Arc::clone(a), indices.clone());
-            let gep_b = UOp::gep(Arc::clone(b), indices.clone());
+            let gep_a = a.gep(indices.clone());
+            let gep_b = b.gep(indices.clone());
             Some(UOp::new(Op::Binary(*bin_op, gep_a.clone(), gep_b), gep_a.dtype()))
         },
 
         // 7. Push GEP through Unary: GEP(Unary(op, x), indices) → Unary(op, GEP(x))
         Gep { vector, indices } if !indices.is_empty() && matches!(vector.op(), Op::Unary(..)) => |vector, indices| {
             let Op::Unary(un_op, x) = vector.op() else { return None };
-            let gep_x = UOp::gep(Arc::clone(x), indices.clone());
+            let gep_x = x.gep(indices.clone());
             Some(UOp::new(Op::Unary(*un_op, gep_x.clone()), gep_x.dtype()))
         },
 
         // 7b. Push GEP through Ternary: GEP(Ternary(op, a, b, c), indices) → Ternary(op, GEP(a), GEP(b), GEP(c))
         // Required for MulAcc (FMA) and WHERE to work with split_load (which creates CAT of 4-element loads)
         Gep { vector: Where(cond, t, f), indices } if !indices.is_empty() => |cond, t, f, indices| {
-            let gep_cond = UOp::gep(Arc::clone(cond), indices.clone());
-            let gep_t = UOp::gep(Arc::clone(t), indices.clone());
-            let gep_f = UOp::gep(Arc::clone(f), indices.clone());
+            let gep_cond = cond.gep(indices.clone());
+            let gep_t = t.gep(indices.clone());
+            let gep_f = f.gep(indices.clone());
             Some(UOp::new(Op::Ternary(TernaryOp::Where, gep_cond.clone(), gep_t, gep_f), gep_cond.dtype()))
         },
         Gep { vector: MulAcc(a, b, c), indices } if !indices.is_empty() => |a, b, c, indices| {
-            let gep_a = UOp::gep(Arc::clone(a), indices.clone());
-            let gep_b = UOp::gep(Arc::clone(b), indices.clone());
-            let gep_c = UOp::gep(Arc::clone(c), indices.clone());
+            let gep_a = a.gep(indices.clone());
+            let gep_b = b.gep(indices.clone());
+            let gep_c = c.gep(indices.clone());
             Some(UOp::new(Op::Ternary(TernaryOp::MulAcc, gep_a.clone(), gep_b, gep_c), gep_a.dtype()))
         },
 
         // 8. GEP through UNROLL: GEP(UNROLL(x, ...), indices) → GEP(x, indices)
         Gep { vector, indices } if matches!(vector.op(), Op::Unroll { .. }) => |vector, indices| {
             let Op::Unroll { src, .. } = vector.op() else { return None };
-            Some(UOp::gep(Arc::clone(src), indices.clone()))
+            Some(src.gep(indices.clone()))
         },
 
         // 9. Identity GEP removal: GEP(x, [0,1,2,...,n-1]) → x
@@ -1119,7 +1119,7 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
                     if src.dtype().vcount() == 1 {
                         Some(src.clone())
                     } else {
-                        Some(UOp::gep(src.clone(), vec![offset_in_src]))
+                        Some(src.gep(vec![offset_in_src]))
                     }
                 })
                 .collect();

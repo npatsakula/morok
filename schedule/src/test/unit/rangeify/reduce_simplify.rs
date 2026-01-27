@@ -119,7 +119,7 @@ fn test_reduce_unparented_mixed_ranges() {
     let range_1 = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(1), AxisType::Reduce);
 
     let x = UOp::native_const(3i32);
-    let src = x.try_add(&UOp::cast(range_0.clone(), DType::Int32)).unwrap();
+    let src = x.try_add(&range_0.cast(DType::Int32)).unwrap();
 
     let reduce = UOp::reduce(src, vec![range_0.clone(), range_1].into(), ReduceOp::Add);
 
@@ -201,7 +201,7 @@ fn test_reduce_collapse_with_range_dependency() {
     // Expected: reduce_collapse may succeed (substitution works), but won't eliminate the REDUCE
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
     let one = UOp::native_const(1i32);
-    let range_int = UOp::cast(range.clone(), DType::Int32);
+    let range_int = range.cast(DType::Int32);
     let src = range_int.try_add(&one).unwrap();
 
     let reduce = UOp::reduce(src, vec![range].into(), ReduceOp::Add);
@@ -345,7 +345,7 @@ fn test_no_range_with_ranges() {
     let const_5 = UOp::native_const(5i32);
 
     // Create expression that depends on range: range + 5
-    let sum = UOp::cast(range.clone(), DType::Int32).try_add(&const_5).unwrap();
+    let sum = range.cast(DType::Int32).try_add(&const_5).unwrap();
 
     // Should return false because sum depends on range
     assert!(!crate::rangeify::indexing::no_range(&sum));

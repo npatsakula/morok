@@ -162,7 +162,7 @@ fn build_vectorized_linear_index(indices: &[Arc<UOp>], strides: &[i64], vcount: 
                 .map(|idx| {
                     if idx.dtype().vcount() > 1 {
                         // Extract scalar from vector
-                        UOp::gep(idx.clone(), vec![lane])
+                        idx.gep(vec![lane])
                     } else {
                         // Scalar index, use directly
                         idx.clone()

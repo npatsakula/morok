@@ -54,7 +54,7 @@ pub fn scalar_dtype(dtype: &DType) -> DType {
 pub fn ensure_scalar(d: &Arc<UOp>) -> Arc<UOp> {
     let dtype = d.dtype();
     let scalar = scalar_dtype(&dtype);
-    if dtype != scalar { UOp::cast(d.clone(), scalar) } else { d.clone() }
+    if dtype != scalar { d.cast(scalar) } else { d.clone() }
 }
 
 // ============================================================================
@@ -231,7 +231,7 @@ pub fn rintk(d: &Arc<UOp>) -> Arc<UOp> {
     let adjusted = d.try_add(&adjustment).expect("rintk: add failed");
 
     // cast to int
-    UOp::cast(adjusted, int_dtype)
+    adjusted.cast(int_dtype)
 }
 
 /// pow2if: cast(2^q, float_dtype) where q is an integer in [-126, 127] range.
@@ -245,14 +245,14 @@ pub fn pow2if(q: &Arc<UOp>, float_dtype: &DType) -> Arc<UOp> {
 
     // q + bias
     let bias_const = int_const(&int_dtype, bias);
-    let q_int = if q.dtype() == int_dtype { q.clone() } else { UOp::cast(q.clone(), int_dtype.clone()) };
+    let q_int = if q.dtype() == int_dtype { q.clone() } else { q.cast(int_dtype.clone()) };
     let biased = q_int.try_add(&bias_const).expect("pow2if: add failed");
 
     // (q + bias) << mantissa_bits
     let shifted = shl(&biased, mantissa);
 
     // bitcast to float
-    UOp::bitcast(shifted, float_dtype.clone())
+    shifted.bitcast(float_dtype.clone())
 }
 
 /// ldexp2k: d * 2^e where d > 0 and d is not denormal.
@@ -291,17 +291,17 @@ pub fn ldexp3k(d: &Arc<UOp>, e: &Arc<UOp>) -> Arc<UOp> {
     let mantissa = mantissa_bits(&float_dtype);
 
     // Bitcast d to int
-    let d_bits = UOp::bitcast(d.clone(), int_dtype.clone());
+    let d_bits = d.bitcast(int_dtype.clone());
 
     // Cast e to int and shift
-    let e_int = UOp::cast(e.clone(), int_dtype.clone());
+    let e_int = e.cast(int_dtype.clone());
     let e_shifted = shl(&e_int, mantissa);
 
     // Add exponent bits
     let result_bits = d_bits.try_add(&e_shifted).expect("ldexp3k: add failed");
 
     // Bitcast back to float - no need for cast since bitcast already produces correct dtype
-    UOp::bitcast(result_bits, float_dtype)
+    result_bits.bitcast(float_dtype)
 }
 
 /// ilogb2k: Integer part of log2(d), where d is normalized fp in [0, +inf).
@@ -317,7 +317,7 @@ pub fn ilogb2k(d: &Arc<UOp>) -> Arc<UOp> {
     let bias = exponent_bias(&float_dtype);
 
     // Bitcast to int
-    let d_bits = UOp::bitcast(d.clone(), int_dtype.clone());
+    let d_bits = d.bitcast(int_dtype.clone());
 
     // (bits >> mantissa_bits) & exponent_mask
     let shifted = shr(&d_bits, mantissa);

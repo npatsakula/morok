@@ -292,7 +292,7 @@ impl Tensor {
     /// let t_int = t.cast(DType::Int32)?;
     /// ```
     pub fn cast(&self, dtype: morok_dtype::DType) -> Result<Self> {
-        let casted = UOp::cast(self.uop(), dtype);
+        let casted = self.uop().cast(dtype);
         Ok(Self::new(casted))
     }
 

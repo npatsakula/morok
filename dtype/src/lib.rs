@@ -288,6 +288,27 @@ impl DType {
         }
     }
 
+    /// Get scalar DType (works on both Scalar and Vector).
+    ///
+    /// Unlike `base()` which returns `ScalarDType`, this returns `DType`.
+    /// This enables chaining with `.vec()`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use morok_dtype::DType;
+    ///
+    /// let vec_dtype = DType::Float32.vec(4);
+    /// assert_eq!(vec_dtype.scalar_dtype(), DType::Float32);
+    ///
+    /// // Enable chaining: dtype.scalar_dtype().vec(new_count)
+    /// let new_vec = vec_dtype.scalar_dtype().vec(8);
+    /// assert_eq!(new_vec, DType::Float32.vec(8));
+    /// ```
+    pub fn scalar_dtype(&self) -> DType {
+        DType::Scalar(self.base())
+    }
+
     /// Create a new dtype with a different base scalar type, preserving vector count.
     ///
     /// Useful for type conversions like bool→uint8 where the structure is preserved.

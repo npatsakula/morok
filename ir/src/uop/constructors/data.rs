@@ -118,13 +118,13 @@ impl UOp {
         Self::new(Op::Noop, DType::Void)
     }
 
-    /// Create a cast operation.
-    pub fn cast(src: Arc<Self>, dtype: DType) -> Arc<Self> {
-        Self::new(Op::Cast { src, dtype: dtype.clone() }, dtype)
+    /// Cast to a different dtype.
+    pub fn cast(self: &Arc<Self>, dtype: DType) -> Arc<Self> {
+        Self::new(Op::Cast { src: self.clone(), dtype: dtype.clone() }, dtype)
     }
 
     /// Bitcast: reinterpret bits as different type.
-    pub fn bitcast(src: Arc<Self>, dtype: DType) -> Arc<Self> {
-        Self::new(Op::BitCast { src, dtype: dtype.clone() }, dtype)
+    pub fn bitcast(self: &Arc<Self>, dtype: DType) -> Arc<Self> {
+        Self::new(Op::BitCast { src: self.clone(), dtype: dtype.clone() }, dtype)
     }
 }

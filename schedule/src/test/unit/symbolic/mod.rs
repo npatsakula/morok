@@ -363,7 +363,7 @@ fn test_cast_int_to_float_constant() {
     // Test: cast(int_const) -> float_const
     let matcher = symbolic_simple();
     let int_val = UOp::native_const(42i32);
-    let cast = UOp::cast(int_val, DType::Float32);
+    let cast = int_val.cast(DType::Float32);
 
     let result = matcher.rewrite(&cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -382,7 +382,7 @@ fn test_cast_float_to_int_constant() {
     // Test: cast(float_const) -> int_const
     let matcher = symbolic_simple();
     let float_val = UOp::native_const(PI);
-    let cast = UOp::cast(float_val, DType::Int32);
+    let cast = float_val.cast(DType::Int32);
 
     let result = matcher.rewrite(&cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -401,7 +401,7 @@ fn test_cast_bool_to_int_constant() {
     // Test: cast(bool_const) -> int_const
     let matcher = symbolic_simple();
     let bool_val = UOp::native_const(true);
-    let cast = UOp::cast(bool_val, DType::Int32);
+    let cast = bool_val.cast(DType::Int32);
 
     let result = matcher.rewrite(&cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -419,7 +419,7 @@ fn test_noop_cast_same_dtype() {
     // Test: x.cast(dtype) -> x if same dtype
     let matcher = symbolic_simple();
     let x = UOp::var("x", DType::Int32, 0, i64::MAX);
-    let cast = UOp::cast(x.clone(), DType::Int32);
+    let cast = x.cast(DType::Int32);
 
     let result = matcher.rewrite(&cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -436,10 +436,10 @@ fn test_double_cast_collapse_safe() {
     let x = UOp::var("x", DType::Int16, 0, i16::MAX as i64);
 
     // First cast: Int16 -> Int32 (widening, safe)
-    let inner_cast = UOp::cast(x.clone(), DType::Int32);
+    let inner_cast = x.cast(DType::Int32);
 
     // Second cast: Int32 -> Int16 (narrowing back)
-    let outer_cast = UOp::cast(inner_cast, DType::Int16);
+    let outer_cast = inner_cast.cast(DType::Int16);
 
     let result = matcher.rewrite(&outer_cast, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -458,10 +458,10 @@ fn test_double_cast_no_collapse_unsafe() {
     let x = UOp::var("x", DType::Int32, 0, i64::MAX);
 
     // First cast: Int32 -> Float32 (potential precision loss for large integers)
-    let inner_cast = UOp::cast(x.clone(), DType::Float32);
+    let inner_cast = x.cast(DType::Float32);
 
     // Second cast: Float32 -> Int32
-    let outer_cast = UOp::cast(inner_cast.clone(), DType::Int32);
+    let outer_cast = inner_cast.cast(DType::Int32);
 
     let result = matcher.rewrite(&outer_cast, &mut ());
     // Should NOT be rewritten because the intermediate Float32 can't hold all Int32 values
@@ -473,7 +473,7 @@ fn test_cast_non_constant_no_fold() {
     // Test: cast(variable) -> no constant folding (only dtype change)
     let matcher = symbolic_simple();
     let x = UOp::var("x", DType::Int32, 0, i64::MAX);
-    let cast = UOp::cast(x.clone(), DType::Float32);
+    let cast = x.cast(DType::Float32);
 
     let result = matcher.rewrite(&cast, &mut ());
     // Should not match constant folding pattern (not a constant)
@@ -2240,7 +2240,7 @@ fn test_cast_where_push() {
 
     // Build: cast(where(s, a, b), f32)
     let where_op = UOp::try_where(s.clone(), a.clone(), b.clone()).unwrap();
-    let cast_where = UOp::cast(where_op, DType::Float32);
+    let cast_where = where_op.cast(DType::Float32);
 
     let result = matcher.rewrite(&cast_where, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));

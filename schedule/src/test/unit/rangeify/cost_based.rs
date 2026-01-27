@@ -60,7 +60,7 @@ fn test_remove_bufferize_cheap_binary() {
 fn test_remove_bufferize_cast() {
     // BUFFERIZE(CAST(x), ranges) should inline (cheap operation)
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let cast = UOp::cast(x, DType::Float32);
+    let cast = x.cast(DType::Float32);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(cast.clone(), vec![range]);

@@ -309,7 +309,7 @@ fn test_expand_range_based_index() {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::define_global(def_id, buffer.dtype());
-    let buf_vec = UOp::broadcast(define, 4);
+    let buf_vec = define.broadcast(4);
 
     // Create vector index: VECTORIZE([range*4+0, range*4+1, range*4+2, range*4+3])
     let range = UOp::new(
@@ -363,7 +363,7 @@ fn test_expand_symbolic_root_grouping() {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::define_global(def_id, buffer.dtype());
-    let buf_vec = UOp::broadcast(define, 4);
+    let buf_vec = define.broadcast(4);
 
     // Create two groups with same root but different base offsets
     let range = UOp::new(
@@ -419,7 +419,7 @@ fn test_expand_different_roots_separate() {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(3000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::define_global(def_id, buffer.dtype());
-    let buf_vec = UOp::broadcast(define, 4);
+    let buf_vec = define.broadcast(4);
 
     // Two different range variables
     let range1 = UOp::new(

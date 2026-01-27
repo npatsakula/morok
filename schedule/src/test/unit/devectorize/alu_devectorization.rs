@@ -188,7 +188,7 @@ fn test_unary_scalar_unchanged() {
 fn test_cast_vec4_devectorize() {
     let a = create_vector_float_iota(4);
 
-    let cast = UOp::cast(a, DType::Int64.vec(4));
+    let cast = a.cast(DType::Int64.vec(4));
 
     let result = apply_no_vectorized_alu(&cast);
 
@@ -210,7 +210,7 @@ fn test_cast_vec4_devectorize() {
 fn test_cast_scalar_unchanged() {
     let a = create_float_const(3.0);
 
-    let cast = UOp::cast(a, DType::Int64);
+    let cast = a.cast(DType::Int64);
 
     let result = apply_no_vectorized_alu(&cast);
 
@@ -318,7 +318,7 @@ fn test_mulacc_scalar_unchanged() {
 fn test_binary_mixed_operands() {
     let a = create_vector_float_iota(4);
     let scalar = create_float_const(10.0);
-    let b = UOp::broadcast(scalar, 4);
+    let b = scalar.broadcast(4);
 
     let add = UOp::new(Op::Binary(BinaryOp::Add, a, b), DType::Float32.vec(4));
 

@@ -60,8 +60,8 @@ impl UOp {
             .ok_or(Error::TypePromotionFailed { lhs: lhs_dtype.clone(), rhs: rhs_dtype.clone() })?;
 
         // Cast if needed
-        let lhs = if lhs_dtype != target_dtype { Self::cast(lhs, target_dtype.clone()) } else { lhs };
-        let rhs = if rhs_dtype != target_dtype { Self::cast(rhs, target_dtype.clone()) } else { rhs };
+        let lhs = if lhs_dtype != target_dtype { lhs.cast(target_dtype.clone()) } else { lhs };
+        let rhs = if rhs_dtype != target_dtype { rhs.cast(target_dtype.clone()) } else { rhs };
 
         Ok((lhs, rhs, target_dtype))
     }

@@ -151,7 +151,7 @@ impl SInt {
             SInt::Const(v) => UOp::const_(dtype, crate::ConstValue::Int(*v as i64)),
             SInt::Symbolic(uop) => {
                 if uop.dtype() != dtype {
-                    UOp::cast(uop.clone(), dtype)
+                    uop.cast(dtype)
                 } else {
                     uop.clone()
                 }

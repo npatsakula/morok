@@ -172,7 +172,7 @@ pub fn create_vector_index_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
     // Wrap buffer in VECTORIZE to match Tinygrad's expand_index pattern:
     // INDEX(VECTORIZE(Defines.or_after()), vec_idx)
     let define = buffer_to_define(&buffer);
-    let buf_vec = UOp::broadcast(define, count);
+    let buf_vec = define.broadcast(count);
 
     UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
 }
@@ -195,7 +195,7 @@ pub fn create_vector_index_offset(buffer: Arc<UOp>, count: usize, offset: i64) -
     let idx_dtype = buffer.dtype().base();
 
     let define = buffer_to_define(&buffer);
-    let buf_vec = UOp::broadcast(define, count);
+    let buf_vec = define.broadcast(count);
 
     UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
 }
@@ -210,7 +210,7 @@ pub fn create_vector_index_scaled(buffer: Arc<UOp>, count: usize, scale: i64) ->
     let idx_dtype = buffer.dtype().base();
 
     let define = buffer_to_define(&buffer);
-    let buf_vec = UOp::broadcast(define, count);
+    let buf_vec = define.broadcast(count);
 
     UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
 }
@@ -224,7 +224,7 @@ pub fn create_vector_index_values(buffer: Arc<UOp>, values: Vec<i64>) -> Arc<UOp
     let count = values.len();
 
     let define = buffer_to_define(&buffer);
-    let buf_vec = UOp::broadcast(define, count);
+    let buf_vec = define.broadcast(count);
 
     UOp::new(Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: None }, DType::Scalar(idx_dtype))
 }
@@ -237,7 +237,7 @@ pub fn create_vector_index_gated(buffer: Arc<UOp>, count: usize, gate: Arc<UOp>)
     let idx_dtype = buffer.dtype().base();
 
     let define = buffer_to_define(&buffer);
-    let buf_vec = UOp::broadcast(define, count);
+    let buf_vec = define.broadcast(count);
 
     UOp::new(
         Op::Index { buffer: buf_vec, indices: smallvec::smallvec![vec_idx], gate: Some(gate) },

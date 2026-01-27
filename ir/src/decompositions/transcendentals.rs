@@ -105,7 +105,7 @@ pub fn xexp2(d: &Arc<UOp>) -> Arc<UOp> {
     let q = rintk(&x);
 
     // s = x - q (fractional part)
-    let q_float = UOp::cast(q.clone(), dtype.clone());
+    let q_float = q.cast(dtype.clone());
     let s = x.try_sub(&q_float).expect("xexp2: sub failed");
 
     // Polynomial approximation of 2^s
@@ -160,9 +160,9 @@ pub fn xlog2(d: &Arc<UOp>) -> Arc<UOp> {
 
     // For float16, upcast to float32 for precision
     if dtype.scalar() == Some(ScalarDType::Float16) {
-        let d_f32 = UOp::cast(d.clone(), DType::Float32);
+        let d_f32 = d.cast(DType::Float32);
         let result_f32 = xlog2(&d_f32);
-        return UOp::cast(result_f32, dtype);
+        return result_f32.cast(dtype);
     }
 
     let flt_min = match dtype.scalar() {
@@ -183,7 +183,7 @@ pub fn xlog2(d: &Arc<UOp>) -> Arc<UOp> {
     let inv_0_75 = float_const(&dtype, 1.0 / 0.75);
     let a_scaled = a.try_mul(&inv_0_75).expect("xlog2: mul inv_0_75");
     let e = ilogb2k(&a_scaled);
-    let e_float = UOp::cast(e.clone(), dtype.clone());
+    let e_float = e.cast(dtype.clone());
 
     // Mantissa: m = ldexp3k(a, -e)
     let neg_e = e_float.neg();
@@ -194,7 +194,7 @@ pub fn xlog2(d: &Arc<UOp>) -> Arc<UOp> {
     let sixty_four = int_const(&int_dtype, 64);
     let e_adjusted = e.try_sub(&sixty_four).expect("xlog2: sub 64");
     let e = UOp::try_where(is_denormal, e_adjusted, e).expect("xlog2: where e adjust");
-    let e_float = UOp::cast(e, dtype.clone());
+    let e_float = e.cast(dtype.clone());
 
     // Transform: x = (m - 1) / (m + 1)
     let one = float_const(&dtype, 1.0);
@@ -465,21 +465,21 @@ pub fn xpow(base: &Arc<UOp>, exponent: &Arc<UOp>) -> Arc<UOp> {
 
     // Check if exponent is integer: exp != cast(cast(exp, int), float)
     let int_dtype = float_to_int_dtype(&dtype);
-    let exp_int = UOp::cast(exponent.clone(), int_dtype.clone());
-    let exp_back = UOp::cast(exp_int.clone(), dtype.clone());
+    let exp_int = exponent.cast(int_dtype.clone());
+    let exp_back = exp_int.cast(dtype.clone());
     let non_int = exponent.try_cmpne(&exp_back).expect("xpow: cmpne int");
 
     // For negative base: nan if non-integer exponent, else check odd/even
     // |exp| as int
     let exp_abs = exponent.abs();
-    let exp_abs_int = UOp::cast(exp_abs, int_dtype.clone());
+    let exp_abs_int = exp_abs.cast(int_dtype.clone());
 
     // exp % 2 (check if odd)
     let two = int_const(&int_dtype, 2);
     let exp_mod_2 = exp_abs_int.try_mod(&two).expect("xpow: mod 2");
     let zero_int = int_const(&int_dtype, 0);
     let is_odd = exp_mod_2.try_cmpne(&zero_int).expect("xpow: cmpne odd");
-    let is_odd_bool = UOp::cast(is_odd, DType::Bool);
+    let is_odd_bool = is_odd.cast(DType::Bool);
 
     // Adjustment for negative base: -1 if odd exponent, 1 otherwise
     let odd_adj = UOp::try_where(is_odd_bool, neg_one, one.clone()).expect("xpow: where odd");
@@ -512,7 +512,7 @@ fn cody_waite_reduction(d: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
     let m_1_pi_const = float_const(&dtype, m_1_pi);
     let d_over_pi = d.try_mul(&m_1_pi_const).expect("cody_waite: d/pi");
     let quadrant = rintk(&d_over_pi);
-    let q_float = UOp::cast(quadrant.clone(), dtype.clone());
+    let q_float = quadrant.cast(dtype.clone());
 
     // Reduce: d - quadrant * π (using extended precision constants)
     let reduced = if dtype.scalar() == Some(ScalarDType::Float64) {
@@ -530,10 +530,10 @@ fn cody_waite_reduction(d: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
         r
     } else if dtype.scalar() == Some(ScalarDType::Float16) {
         // Float16 needs float32 precision
-        let d_f32 = UOp::cast(d.clone(), DType::Float32);
-        let q_f32 = UOp::cast(q_float.clone(), DType::Float32);
+        let d_f32 = d.cast(DType::Float32);
+        let q_f32 = q_float.cast(DType::Float32);
         let (r_f32, _) = cody_waite_reduction_f32(&d_f32, &q_f32);
-        UOp::cast(r_f32, dtype.clone())
+        r_f32.cast(dtype.clone())
     } else {
         // Float32 reduction
         let (r, _) = cody_waite_reduction_f32(d, &q_float);

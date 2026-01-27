@@ -155,7 +155,7 @@ fn test_infer_binary_shape() {
 #[test]
 fn test_infer_cast_shape() {
     let val = UOp::native_const(1.5f32);
-    let cast = UOp::cast(val, DType::Int32);
+    let cast = val.cast(DType::Int32);
     let shape = cast.shape().unwrap().expect("Cast should preserve shape");
     assert_eq!(shape.len(), 0);
 }

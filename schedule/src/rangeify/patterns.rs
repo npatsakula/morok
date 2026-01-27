@@ -1173,8 +1173,8 @@ fn devectorize_binary(op: &BinaryOp, result: &Arc<UOp>, a: &Arc<UOp>, b: &Arc<UO
     let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..out_vcount)
         .map(|i| {
             // Handle scalar-vector mix: only GEP if operand is vectorized
-            let a_elem = if a_vcount > 1 { UOp::gep(a.clone(), vec![i]) } else { a.clone() };
-            let b_elem = if b_vcount > 1 { UOp::gep(b.clone(), vec![i]) } else { b.clone() };
+            let a_elem = if a_vcount > 1 { a.gep(vec![i]) } else { a.clone() };
+            let b_elem = if b_vcount > 1 { b.gep(vec![i]) } else { b.clone() };
             UOp::new(Op::Binary(*op, a_elem, b_elem), scalar_dtype.clone())
         })
         .collect();
@@ -1193,7 +1193,7 @@ fn devectorize_unary(op: &UnaryOp, result: &Arc<UOp>, src: &Arc<UOp>) -> Option<
 
     let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..out_vcount)
         .map(|i| {
-            let elem = UOp::gep(src.clone(), vec![i]);
+            let elem = src.gep(vec![i]);
             UOp::new(Op::Unary(*op, elem), scalar_dtype.clone())
         })
         .collect();
@@ -1250,9 +1250,9 @@ fn devectorize_where(cond: &Arc<UOp>, t: &Arc<UOp>, f: &Arc<UOp>) -> Option<Arc<
 
     let scalar_wheres: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
         .map(|i| {
-            let cond_elem = UOp::gep(cond.clone(), vec![i]);
-            let t_elem = if t_vcount > 1 { UOp::gep(t.clone(), vec![i]) } else { t.clone() };
-            let f_elem = if f_vcount > 1 { UOp::gep(f.clone(), vec![i]) } else { f.clone() };
+            let cond_elem = cond.gep(vec![i]);
+            let t_elem = if t_vcount > 1 { t.gep(vec![i]) } else { t.clone() };
+            let f_elem = if f_vcount > 1 { f.gep(vec![i]) } else { f.clone() };
             UOp::try_where(cond_elem, t_elem, f_elem).expect("WHERE construction should succeed")
         })
         .collect();
@@ -1319,7 +1319,7 @@ fn horizontal_reduce(src: &Arc<UOp>, out_dtype: &DType, reduce_op: ReduceOp) -> 
     // (Can happen with non-power-of-2 upcast amounts like 3)
     if !src_count.is_multiple_of(out_count) || horizontal_amount == 0 {
         let scalar_dtype = DType::Scalar(src.dtype().base());
-        let elements: Vec<Arc<UOp>> = (0..src_count).map(|i| UOp::gep(src.clone(), vec![i])).collect();
+        let elements: Vec<Arc<UOp>> = (0..src_count).map(|i| src.gep(vec![i])).collect();
         return vec![
             elements
                 .into_iter()
@@ -1333,7 +1333,7 @@ fn horizontal_reduce(src: &Arc<UOp>, out_dtype: &DType, reduce_op: ReduceOp) -> 
     (0..horizontal_amount)
         .map(|i| {
             let indices: Vec<usize> = (i..src_count).step_by(horizontal_amount).collect();
-            UOp::gep(src.clone(), indices)
+            src.gep(indices)
         })
         .collect()
 }
@@ -1500,7 +1500,7 @@ fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Create N scalar REDUCEs, one for each vector lane
     let scalar_reduces: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
         .map(|i| {
-            let src_elem = UOp::gep(src.clone(), vec![i]);
+            let src_elem = src.gep(vec![i]);
             UOp::new(Op::Reduce { src: src_elem, ranges: ranges.clone(), reduce_op: *reduce_op }, scalar_dtype.clone())
         })
         .collect();
@@ -1549,7 +1549,7 @@ fn devectorize_to_scalar_accumulators(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Create N scalar REDUCEs, each extracting one lane from vectorized source
     let scalar_reduces: Vec<Arc<UOp>> = (0..vec_count)
         .map(|i| {
-            let src_elem = UOp::gep(vec_src.clone(), vec![i]);
+            let src_elem = vec_src.gep(vec![i]);
             UOp::new(Op::Reduce { src: src_elem, ranges: ranges.clone(), reduce_op: *reduce_op }, scalar_dtype.clone())
         })
         .collect();

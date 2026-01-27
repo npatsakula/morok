@@ -585,7 +585,7 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 } else {
                     swizzle_indices
                 };
-                new_sources.push(UOp::gep(inner.clone(), final_indices));
+                new_sources.push(inner.gep(final_indices));
             }
         } else {
             // Non-UNROLL source: check special cases
@@ -630,7 +630,7 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 new_sources.push(UOp::cat().sources(cat_sources).call());
             } else {
                 // Case 4: Scalar -> broadcast
-                new_sources.push(UOp::broadcast(src.clone(), expand_sz));
+                new_sources.push(src.broadcast(expand_sz));
             }
         }
     }
@@ -709,7 +709,7 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
         // Type operations
         // NOTE: Use the vectorized `dtype` (new_dtype), not the original `cast_dtype`.
         // When expanding with expand_sz=N, the output dtype becomes vec<N x T> not scalar T.
-        Op::Cast { .. } => sources.first().map(|s| UOp::cast(s.clone(), dtype.clone())),
+        Op::Cast { .. } => sources.first().map(|s| s.cast(dtype.clone())),
 
         Op::BitCast { dtype: bitcast_dtype, .. } => sources
             .first()
@@ -738,7 +738,7 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
 
                 let new_indices: Vec<usize> =
                     indices.iter().flat_map(|&idx| (0..expand_sz).map(move |e| idx + e * stride)).collect();
-                UOp::gep(s.clone(), new_indices)
+                s.gep(new_indices)
             })
         }
 
@@ -1262,7 +1262,7 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         tracing::debug!(gep_indices_len = gep_indices.len(), "do_contract: computed GEP indices");
 
         // Create GEP to extract elements
-        let gep_result = UOp::gep(unroll_inner.clone(), gep_indices);
+        let gep_result = unroll_inner.gep(gep_indices);
 
         // Return based on remaining axes
         return if remaining_axes.is_empty() {

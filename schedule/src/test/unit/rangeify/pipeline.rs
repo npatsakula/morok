@@ -575,7 +575,7 @@ fn test_pipeline_reduce_collapse_preserves_dependent_reductions() {
 
     // Create expression that depends on range: range + 1
     let one = UOp::native_const(1i32);
-    let range_int = UOp::cast(range.clone(), DType::Int32);
+    let range_int = range.cast(DType::Int32);
     let src = range_int.try_add(&one).unwrap();
 
     let reduce = UOp::reduce(src, vec![range].into(), ReduceOp::Add);

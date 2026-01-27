@@ -110,7 +110,7 @@ fn test_gep_vectorize_single() {
     let e2 = create_float_const(2.0);
 
     let vec = UOp::vectorize([e0, e1.clone(), e2].into_iter().collect());
-    let gep = UOp::gep(vec, vec![1]);
+    let gep = vec.gep(vec![1]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
 
@@ -138,7 +138,7 @@ fn test_gep_vectorize_multi() {
     let elements: smallvec::SmallVec<[Arc<UOp>; 4]> = (0..4).map(|i| create_float_const(i as f64)).collect();
 
     let vec = UOp::vectorize(elements);
-    let gep = UOp::gep(vec, vec![0, 2]);
+    let gep = vec.gep(vec![0, 2]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
 
@@ -158,8 +158,8 @@ fn test_gep_vectorize_multi() {
 #[test]
 fn test_gep_broadcast_extraction() {
     let x = create_float_const(42.0);
-    let vec = UOp::broadcast(x.clone(), 4);
-    let gep = UOp::gep(vec, vec![2]);
+    let vec = x.broadcast(4);
+    let gep = vec.gep(vec![2]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
 
@@ -191,7 +191,7 @@ fn test_gep_cat_reorder() {
     let c = create_float_const(3.0);
 
     let cat = UOp::cat().sources(vec![a, b.clone(), c.clone()]).call();
-    let gep = UOp::gep(cat, vec![1, 2]);
+    let gep = cat.gep(vec![1, 2]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
 
@@ -216,7 +216,7 @@ fn test_gep_cat_single() {
     let c = create_float_const(3.0);
 
     let cat = UOp::cat().sources(vec![a, b.clone(), c]).call();
-    let gep = UOp::gep(cat, vec![1]);
+    let gep = cat.gep(vec![1]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
 
@@ -240,7 +240,7 @@ fn test_gep_ptrcat_reorder() {
     let p3 = create_index(buffer.clone(), 2);
 
     let ptrcat = UOp::ptrcat().sources(vec![p1.clone(), p2, p3.clone()]).call();
-    let gep = UOp::gep(ptrcat, vec![0, 2]);
+    let gep = ptrcat.gep(vec![0, 2]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
 
@@ -279,7 +279,7 @@ fn test_cat_gep_identity() {
     let x = create_vector_float_iota(4);
 
     // Create CAT(GEP(x,[0]), GEP(x,[1]), GEP(x,[2]), GEP(x,[3]))
-    let geps: Vec<Arc<UOp>> = (0..4).map(|i| UOp::gep(x.clone(), vec![i])).collect();
+    let geps: Vec<Arc<UOp>> = (0..4).map(|i| x.gep(vec![i])).collect();
     let cat = UOp::cat().sources(geps).call();
 
     let result = apply_gep_ptrcat_patterns(&cat);
@@ -351,8 +351,8 @@ fn test_where_scalar_unchanged() {
 #[test]
 fn test_gep_through_cast() {
     let vec = create_vector_float_iota(4);
-    let cast = UOp::cast(vec.clone(), DType::Int64.vec(4));
-    let gep = UOp::gep(cast, vec![1]);
+    let cast = vec.cast(DType::Int64.vec(4));
+    let gep = cast.gep(vec![1]);
 
     let result = apply_gep_ptrcat_patterns(&gep);
 
@@ -370,7 +370,7 @@ fn test_gep_through_cast() {
 #[test]
 fn test_multi_index_gep_normalizes() {
     let x = create_vector_float_iota(8);
-    let gep = UOp::gep(x.clone(), vec![0, 1, 2, 3]);
+    let gep = x.gep(vec![0, 1, 2, 3]);
 
     let result = apply_vectorize_normalize(&gep);
 
@@ -394,7 +394,7 @@ fn test_multi_index_gep_normalizes() {
 #[test]
 fn test_gep_scalar_identity() {
     let scalar = create_float_const(42.0);
-    let gep = UOp::gep(scalar.clone(), vec![0]);
+    let gep = scalar.gep(vec![0]);
 
     let result = apply_vectorize_normalize(&gep);
 
@@ -440,7 +440,7 @@ fn test_empty_cat_panics() {
 #[test]
 fn test_gep_out_of_bounds() {
     let vec = create_vector_float_iota(4);
-    let gep = UOp::gep(vec, vec![10]); // Index 10 is out of bounds
+    let gep = vec.gep(vec![10]); // Index 10 is out of bounds
 
     // Should not panic, but may produce invalid result
     let _result = apply_gep_ptrcat_patterns(&gep);

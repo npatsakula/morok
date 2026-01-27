@@ -7,3 +7,6 @@
 [submodule "submodules/wasmtime"]
 	path = submodules/wasmtime
 	url = https://github.com/bytecodealliance/wasmtime.git
+[submodule "submodules/melior"]
+	path = submodules/melior
+	url = https://github.com/mlir-rs/melior.git

@@ -145,7 +145,7 @@ fn test_unary_operations() {
 #[test]
 fn test_cast() {
     let a = UOp::native_const(1.5f32);
-    let cast = UOp::cast(a.clone(), DType::Int32);
+    let cast = a.cast(DType::Int32);
 
     assert_eq!(cast.dtype(), DType::Int32);
 }
@@ -358,7 +358,7 @@ fn test_ranges_property_with_range() {
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     // Create some computation that uses the range
-    let idx = UOp::cast(range.clone(), DType::Float32);
+    let idx = range.cast(DType::Float32);
 
     let ranges = idx.ranges();
     assert_eq!(ranges.len(), 1, "Should find one RANGE op");
@@ -373,7 +373,7 @@ fn test_ranges_property_lazy_evaluation() {
 
     let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-    let idx = UOp::cast(range.clone(), DType::Float32);
+    let idx = range.cast(DType::Float32);
 
     // VERIFY: Cache is empty before first access (lazy evaluation)
     assert!(RangesProperty::cache(&idx).get().is_none(), "Cache should be empty before first access");
@@ -406,7 +406,7 @@ fn test_in_scope_ranges_simple() {
     assert_eq!(in_scope.len(), 1, "RANGE should have itself in scope");
 
     // Create computation that uses the range
-    let idx = UOp::cast(range.clone(), DType::Float32);
+    let idx = range.cast(DType::Float32);
     let in_scope_idx = idx.in_scope_ranges();
     assert_eq!(in_scope_idx.len(), 1, "Computation should inherit RANGE scope");
 }
@@ -419,7 +419,7 @@ fn test_in_scope_ranges_lazy_evaluation() {
 
     let end = UOp::index_const(10);
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
-    let idx = UOp::cast(range.clone(), DType::Float32);
+    let idx = range.cast(DType::Float32);
 
     // VERIFY: Cache is empty before first access (lazy evaluation)
     assert!(InScopeRangesProperty::cache(&idx).get().is_none(), "Cache should be empty before first access");

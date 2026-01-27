@@ -23,7 +23,7 @@ fn test_cast_after_basic() {
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
     // CAST(src, Float64)
-    let cast = UOp::cast(src.clone(), DType::Float64);
+    let cast = src.cast(DType::Float64);
 
     // AFTER(cast, [])
     let after = UOp::after(cast.clone(), smallvec![]);
@@ -53,7 +53,7 @@ fn test_cast_after_basic() {
 fn test_cast_after_with_deps() {
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let dep = UOp::const_(DType::Int32, ConstValue::Int(42));
-    let cast = UOp::cast(src.clone(), DType::Float64);
+    let cast = src.cast(DType::Float64);
     let after = UOp::after(cast, smallvec![dep.clone()]);
 
     let result = apply_cast_after(&after);
@@ -235,7 +235,7 @@ fn test_devectorize_non_contiguous() {
 fn test_cast_after_in_full_pipeline() {
     let buffer = create_buffer(64);
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let cast = UOp::cast(src.clone(), DType::Float64);
+    let cast = src.cast(DType::Float64);
     let after = UOp::after(cast, smallvec![]);
 
     // Create a load that depends on the after

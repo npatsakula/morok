@@ -385,7 +385,7 @@ fn test_cranelift_exp2_simple() {
 
     let d = UOp::const_(DType::Float32, ConstValue::Float(2.0));
     let q = rintk(&d);
-    let q_float = UOp::cast(q.clone(), DType::Float32);
+    let q_float = q.cast(DType::Float32);
     let s = d.try_sub(&q_float).expect("sub failed");
 
     // Use the polynomial (just for s=0, should return 1.0)

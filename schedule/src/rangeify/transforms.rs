@@ -622,7 +622,7 @@ pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType)
         _ => return None,
     };
 
-    let casted = UOp::cast(Arc::clone(value), scalar_type);
+    let casted = value.cast(scalar_type);
 
     if target_dtype.is_vector() {
         let count = target_dtype.count();

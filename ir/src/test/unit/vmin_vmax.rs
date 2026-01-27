@@ -241,7 +241,7 @@ fn test_vmin_vmax_range() {
 #[test]
 fn test_vmin_vmax_cast() {
     let float_val = UOp::native_const(5.7f32);
-    let int_val = UOp::cast(float_val.clone(), DType::Int32);
+    let int_val = float_val.cast(DType::Int32);
 
     // Cast from 5.7 to int = 5
     assert_eq!(int_val.vmin(), &ConstValue::Int(5));
@@ -252,7 +252,7 @@ fn test_vmin_vmax_cast() {
 fn test_vmin_vmax_cast_range() {
     let var = UOp::define_var("x".to_string(), 0, 1000);
     // Cast to Int8 which has range [-128, 127]
-    let casted = UOp::cast(var.clone(), DType::Int8);
+    let casted = var.cast(DType::Int8);
 
     // Should be clamped to Int8 bounds
     assert_eq!(casted.vmin(), &ConstValue::Int(0));

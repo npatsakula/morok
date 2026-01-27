@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use bon::bon;
+
 use crate::op::Op;
 use crate::shape;
 use crate::types::{AxisType, ConstValue};
@@ -232,7 +234,7 @@ impl UOp {
         Self::store(self.clone(), value)
     }
 
-    /// Alias for `with_sources()` for Tinygrad API parity.
+    /// Alias for `with_sources()`.
     ///
     /// Creates a new UOp with the same operation type and dtype, but with
     /// the provided sources replacing the original ones.
@@ -1535,6 +1537,37 @@ impl UOp {
         // Preserve original dtype like Tinygrad - dtype is explicitly set at creation
         // If you need a different dtype, create a new UOp explicitly
         Self::new(new_op, self.dtype.clone())
+    }
+}
+
+#[bon]
+impl UOp {
+    /// Create a modified copy with optional field overrides.
+    ///
+    /// Enables concise pattern implementations by allowing selective field modification.
+    /// Returns `self.clone()` if nothing changed (optimization for hash consing).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let new_load = load.replace().dtype(new_dtype).src(new_sources).call();
+    /// let dtype_only = load.replace().dtype(new_dtype).call();
+    /// ```
+    #[builder]
+    pub fn replace(self: &Arc<Self>, dtype: Option<DType>, src: Option<Vec<Arc<Self>>>) -> Arc<Self> {
+        let new_dtype = dtype.unwrap_or_else(|| self.dtype());
+        let new_sources = src.unwrap_or_else(|| self.op().sources().to_vec());
+
+        // Short-circuit if nothing changed
+        let old_sources = self.op().sources();
+        let sources_unchanged = new_sources.len() == old_sources.len()
+            && new_sources.iter().zip(old_sources.iter()).all(|(a, b)| Arc::ptr_eq(a, b));
+
+        if new_dtype == self.dtype() && sources_unchanged {
+            return self.clone();
+        }
+
+        self.with_sources(new_sources).with_dtype(new_dtype)
     }
 }
 

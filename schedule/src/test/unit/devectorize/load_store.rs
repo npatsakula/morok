@@ -162,7 +162,7 @@ fn test_split_load_vec8_to_vec4() {
     // Create CAST(INDEX) with vec8 pointer dtype (simulating expand_index output)
     let idx = create_index(buffer.clone(), 0);
     let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
-    let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
+    let cast_idx = idx.cast(vec8_ptr_dtype);
 
     // LOAD with vec8 result dtype
     let load_dtype = DType::Float32.vec(8);
@@ -200,7 +200,7 @@ fn test_split_load_vec6_mixed() {
 
     let idx = create_index(buffer.clone(), 0);
     let vec6_ptr_dtype = DType::Float32.vec(6).ptr(Some(6), AddrSpace::Global);
-    let cast_idx = UOp::cast(idx, vec6_ptr_dtype);
+    let cast_idx = idx.cast(vec6_ptr_dtype);
 
     let load_dtype = DType::Float32.vec(6);
     let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
@@ -231,7 +231,7 @@ fn test_split_store_vec8() {
 
     let idx = create_index(buffer.clone(), 0);
     let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
-    let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
+    let cast_idx = idx.cast(vec8_ptr_dtype);
 
     let store = UOp::store(cast_idx, value);
 
@@ -261,7 +261,7 @@ fn test_split_preserves_ranges() {
 
     let idx = create_index(buffer.clone(), 0);
     let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
-    let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
+    let cast_idx = idx.cast(vec8_ptr_dtype);
 
     // Create range for the store
     let range = UOp::new(
@@ -352,7 +352,7 @@ fn test_split_load_divisibility() {
         .unwrap();
 
     let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
-    let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
+    let cast_idx = idx.cast(vec8_ptr_dtype);
 
     let load_dtype = DType::Float32.vec(8);
     let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
@@ -397,7 +397,7 @@ fn test_split_load_not_divisible() {
         .unwrap();
 
     let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
-    let cast_idx = UOp::cast(idx, vec8_ptr_dtype);
+    let cast_idx = idx.cast(vec8_ptr_dtype);
 
     let load_dtype = DType::Float32.vec(8);
     let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);

@@ -205,7 +205,7 @@ fn test_devectorize_very_large_vector() {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::define_global(def_id, buffer.dtype());
-    let buf_vec = UOp::broadcast(define.clone(), 64);
+    let buf_vec = define.broadcast(64);
 
     // Create vec64 index
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..64).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
@@ -233,7 +233,7 @@ fn test_devectorize_vec32() {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(11000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::define_global(def_id, buffer.dtype());
-    let buf_vec = UOp::broadcast(define.clone(), 32);
+    let buf_vec = define.broadcast(32);
 
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..32).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
     let vec_idx = UOp::vectorize(indices);
@@ -278,7 +278,7 @@ fn test_devectorize_vec3() {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(12000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::define_global(def_id, buffer.dtype());
-    let buf_vec = UOp::broadcast(define.clone(), 3);
+    let buf_vec = define.broadcast(3);
 
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..3).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
     let vec_idx = UOp::vectorize(indices);
@@ -304,7 +304,7 @@ fn test_devectorize_vec5() {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(13000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::define_global(def_id, buffer.dtype());
-    let buf_vec = UOp::broadcast(define.clone(), 5);
+    let buf_vec = define.broadcast(5);
 
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..5).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
     let vec_idx = UOp::vectorize(indices);
@@ -412,7 +412,7 @@ fn test_regression_ptrcat_sources() {
 #[test]
 fn test_regression_gep_indices_preserved() {
     let vec = create_vector_float_iota(8);
-    let gep = UOp::gep(vec, vec![1, 3, 5, 7]);
+    let gep = vec.gep(vec![1, 3, 5, 7]);
 
     let (_, indices) = unwrap_gep(&gep);
     assert_eq!(indices, vec![1, 3, 5, 7]);

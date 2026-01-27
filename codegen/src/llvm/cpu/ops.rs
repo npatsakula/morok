@@ -698,7 +698,15 @@ fn render_multi_gep(
     kernel: &mut Vec<String>,
 ) {
     let vec_type = ldt(vec_dtype);
-    let scalar_type = ldt(&DType::Scalar(vec_dtype.base()));
+
+    let elem_dtype = match vec_dtype {
+        DType::Ptr { base, addrspace, size, .. } => {
+            DType::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: 1 }
+        }
+        DType::Vector { scalar, .. } => DType::Scalar(*scalar),
+        _ => DType::Scalar(vec_dtype.base()),
+    };
+    let elem_type = ldt(&elem_dtype);
 
     for (i, &idx) in indices.iter().enumerate() {
         let elem = format!("{dst}.e{i}");
@@ -706,15 +714,15 @@ fn render_multi_gep(
     }
 
     if indices.len() == 1 {
-        kernel.push(format!("  {dst} = bitcast {scalar_type} {dst}.e0 to {out_type}"));
+        kernel.push(format!("  {dst} = bitcast {elem_type} {dst}.e0 to {out_type}"));
     } else {
         let count = indices.len();
-        kernel.push(format!("  {dst}.undef = undef <{count} x {scalar_type}>"));
+        kernel.push(format!("  {dst}.undef = undef <{count} x {elem_type}>"));
         let mut prev = format!("{dst}.undef");
         for i in 0..count {
             let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.v{i}") };
             kernel.push(format!(
-                "  {next} = insertelement <{count} x {scalar_type}> {prev}, {scalar_type} {dst}.e{i}, i32 {i}"
+                "  {next} = insertelement <{count} x {elem_type}> {prev}, {elem_type} {dst}.e{i}, i32 {i}"
             ));
             prev = next;
         }

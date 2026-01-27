@@ -173,10 +173,11 @@ impl Renderer for LlvmTextRenderer {
 
         for node in &nodes {
             if let Op::Range { axis_id, axis_type, .. } = node.op()
-                && !matches!(axis_type, AxisType::Thread) {
-                    let name = format!("%r{}", axis_id.value());
-                    ctx.register(node.id, name);
-                }
+                && !matches!(axis_type, AxisType::Thread)
+            {
+                let name = format!("%r{}", axis_id.value());
+                ctx.register(node.id, name);
+            }
         }
 
         for node in &nodes {

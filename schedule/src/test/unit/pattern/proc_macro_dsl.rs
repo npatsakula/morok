@@ -484,7 +484,7 @@ fn test_struct_field_extraction() {
     let x_int = UOp::native_const(42i32);
 
     // Create Cast(x_int) to Float32
-    let cast_to_f32 = UOp::cast(x_int.clone(), DType::Float32);
+    let cast_to_f32 = x_int.cast(DType::Float32);
 
     // This should match (cast to Float32)
     match matcher.rewrite(&cast_to_f32, &mut ()) {
@@ -493,7 +493,7 @@ fn test_struct_field_extraction() {
     }
 
     // Create Cast(x_int) to Int64
-    let cast_to_i64 = UOp::cast(x_int.clone(), DType::Int64);
+    let cast_to_i64 = x_int.cast(DType::Int64);
 
     // This should NOT match (cast to Int64, not Float32)
     match matcher.rewrite(&cast_to_i64, &mut ()) {
@@ -547,10 +547,10 @@ fn test_nested_struct_pattern() {
     let x_int = UOp::native_const(42i32);
 
     // Create inner cast: Cast(x_int) to Int64
-    let inner_cast = UOp::cast(x_int.clone(), DType::Int64);
+    let inner_cast = x_int.cast(DType::Int64);
 
     // Create outer cast: Cast(inner_cast) to Float32
-    let outer_cast = UOp::cast(inner_cast, DType::Float32);
+    let outer_cast = inner_cast.cast(DType::Float32);
 
     // This should match (outer cast to Float32)
     match matcher.rewrite(&outer_cast, &mut ()) {
@@ -561,7 +561,7 @@ fn test_nested_struct_pattern() {
     }
 
     // Single cast should NOT match
-    let single_cast = UOp::cast(x_int.clone(), DType::Float32);
+    let single_cast = x_int.cast(DType::Float32);
     match matcher.rewrite(&single_cast, &mut ()) {
         RewriteResult::NoMatch => {} // Expected - not nested
         _ => panic!("Single Cast should NOT match nested pattern"),
