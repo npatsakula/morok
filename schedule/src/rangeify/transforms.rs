@@ -527,13 +527,13 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
     // OUTPUT STORE inside the reduce loop (wrong!).
     let end_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.clone();
 
-    let mut do_store = if !end_ranges.is_empty() { UOp::end(store, end_ranges) } else { store };
+    let mut do_store = if !end_ranges.is_empty() { store.end(end_ranges) } else { store };
 
     if opts.addrspace == AddrSpace::Local {
-        do_store = UOp::barrier(do_store, SmallVec::new());
+        do_store = do_store.barrier(SmallVec::new());
     }
 
-    let result = UOp::after(buffer.clone(), SmallVec::from_elem(do_store, 1));
+    let result = buffer.after(SmallVec::from_elem(do_store, 1));
     ctx.map_buffer(bufferize_op.clone(), result.clone());
 
     Some(result)

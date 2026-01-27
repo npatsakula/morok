@@ -338,7 +338,7 @@ mod tests {
 
         let add = UOp::new(Op::Binary(BinaryOp::Add, a_load, b_load), DType::Float32);
 
-        let store = UOp::store(out_idx, add);
+        let store = out_idx.store(add);
         let sink = UOp::sink(vec![store]);
 
         let result = render(&sink, Some("test_add")).unwrap();

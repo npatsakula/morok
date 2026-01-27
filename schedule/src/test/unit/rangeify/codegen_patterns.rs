@@ -71,7 +71,7 @@ fn test_remove_noop_pattern_matching() {
 fn test_get_contiguous_removes_marker() {
     // Test that CONTIGUOUS marker is removed
     let tensor = UOp::native_const(1.0f32);
-    let contiguous = UOp::contiguous(tensor.clone());
+    let contiguous = tensor.contiguous();
 
     let result = apply_patterns(&contiguous);
     assert!(result.is_some());
@@ -98,7 +98,7 @@ fn test_fix_after_broadcast_unwraps_expand() {
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();
-    let after = UOp::after(expand, smallvec::smallvec![computation]);
+    let after = expand.after(smallvec::smallvec![computation]);
 
     let result = apply_patterns(&after);
     assert!(result.is_some());
@@ -126,7 +126,7 @@ fn test_fix_after_broadcast_returns_none_for_non_expand() {
     // Test that AFTER not wrapping EXPAND returns None
     let source = UOp::native_const(1.0f32);
     let computation = UOp::noop();
-    let after = UOp::after(source, smallvec::smallvec![computation]);
+    let after = source.after(smallvec::smallvec![computation]);
 
     let result = apply_patterns(&after);
     assert!(result.is_none());
@@ -141,7 +141,7 @@ fn test_fix_after_broadcast_no_panic_on_global() {
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();
-    let after = UOp::after(expand, smallvec::smallvec![computation]);
+    let after = expand.after(smallvec::smallvec![computation]);
 
     // Should not panic for global (non-local) buffer
     let result = apply_patterns(&after);

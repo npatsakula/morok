@@ -75,13 +75,13 @@ impl UOp {
     /// Create a pointer index operation (pointer arithmetic).
     ///
     /// Performs pointer + offset arithmetic for address calculation in kernels.
-    /// Both ptr and offset should have Index dtype.
-    pub fn pointer_index(ptr: Arc<Self>, offset: Arc<Self>) -> Result<Arc<Self>> {
-        let ptr_dtype = ptr.dtype();
+    /// Both self (ptr) and offset should have Index dtype.
+    pub fn pointer_index(self: &Arc<Self>, offset: Arc<Self>) -> Result<Arc<Self>> {
+        let ptr_dtype = self.dtype();
         let offset_dtype = offset.dtype();
         ensure!(ptr_dtype == DType::Index, IndexTypeMismatchSnafu { actual: ptr_dtype });
         ensure!(offset_dtype == DType::Index, IndexTypeMismatchSnafu { actual: offset_dtype });
-        Ok(Self::new(Op::PointerIndex { ptr, offset }, DType::Index))
+        Ok(Self::new(Op::PointerIndex { ptr: self.clone(), offset }, DType::Index))
     }
 
     /// Multi-dimensional slicing with IndexSpec.
@@ -181,18 +181,18 @@ impl UOp {
 
     /// Create a STORE operation without ranges.
     ///
-    /// Stores a value at the given INDEX location.
+    /// Stores a value at self (INDEX location).
     /// The buffer is accessed indirectly through the INDEX node.
     /// For stores with ranges (e.g., output upcasting), use `store_with_ranges`.
     ///
     /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
-    pub fn store(index: Arc<Self>, value: Arc<Self>) -> Arc<Self> {
-        Self::store_with_ranges(index, value, SmallVec::new())
+    pub fn store(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
+        self.store_with_ranges(value, SmallVec::new())
     }
 
     /// Create a STORE operation with ranges.
     ///
-    /// Stores a value at the given INDEX location, with explicit ranges
+    /// Stores a value at self (INDEX location), with explicit ranges
     /// that define the scope of the store operation. This matches Tinygrad's
     /// architecture where STORE sources are `(index, value, *ranges)`.
     ///
@@ -200,8 +200,8 @@ impl UOp {
     /// during expansion, which `fix_store_unroll` contracts via CONTRACT.
     ///
     /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
-    pub fn store_with_ranges(index: Arc<Self>, value: Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        Self::new(Op::Store { index, value, ranges }, DType::Void)
+    pub fn store_with_ranges(self: &Arc<Self>, value: Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        Self::new(Op::Store { index: self.clone(), value, ranges }, DType::Void)
     }
 
     // =========================================================================
@@ -218,9 +218,9 @@ impl UOp {
     ///
     /// Unlike `copy_to_device` which takes a `DeviceSpec`, this takes
     /// a device UOp directly (useful when you already have one).
-    pub fn copy(src: Arc<Self>, device: Arc<Self>) -> Arc<Self> {
-        let dtype = src.dtype.clone();
-        Self::new(Op::Copy { src, device }, dtype)
+    pub fn copy(self: &Arc<Self>, device: Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype.clone();
+        Self::new(Op::Copy { src: self.clone(), device }, dtype)
     }
 
     // =========================================================================

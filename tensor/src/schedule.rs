@@ -825,7 +825,7 @@ mod tests {
         let idx = UOp::index_const(0);
         let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
         let index = UOp::index().buffer(buffer.clone()).indices(vec![idx]).call().unwrap();
-        let store = UOp::store(index, value);
+        let store = index.store(value);
         let sink = UOp::sink(vec![store]);
 
         let mut sources = SmallVec::new();

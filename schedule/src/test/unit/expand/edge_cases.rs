@@ -25,7 +25,7 @@ fn test_empty_unroll_unwrap() {
     let scalar = UOp::const_(DType::Float32, ConstValue::Float(42.0));
 
     // Wrap in UNROLL with empty axes
-    let unroll = UOp::unroll(scalar.clone(), vec![]);
+    let unroll = scalar.unroll(vec![]);
 
     // Apply expander
     let result = phase2_only(&unroll);
@@ -57,10 +57,10 @@ fn test_empty_unroll_unwrap() {
 fn test_double_unroll_collapse() {
     // Create inner UNROLL
     let values = create_vconst_int(vec![0, 1, 2, 3]);
-    let inner_unroll = UOp::unroll(values, vec![(0, 4)]);
+    let inner_unroll = values.unroll(vec![(0, 4)]);
 
     // Wrap in outer UNROLL
-    let outer_unroll = UOp::unroll(inner_unroll, vec![(1, 2)]);
+    let outer_unroll = inner_unroll.unroll(vec![(1, 2)]);
 
     // Apply expander
     let result = phase2_only(&outer_unroll);
@@ -89,7 +89,7 @@ fn test_double_unroll_collapse() {
 fn test_barrier_with_unroll() {
     // Create UNROLL
     let values = create_vconst_int(vec![0, 1, 2, 3]);
-    let unroll = UOp::unroll(values.clone(), vec![(0, 4)]);
+    let unroll = values.unroll(vec![(0, 4)]);
 
     // Create BARRIER wrapping UNROLL
     let barrier = UOp::new(Op::Barrier { src: unroll, deps: smallvec![] }, DType::Int64.vec(4));
@@ -125,7 +125,7 @@ fn test_contract_void_store() {
     let void_op = UOp::noop();
 
     // Wrap in CONTRACT
-    let contract = UOp::contract(void_op.clone(), vec![(0, 4)]);
+    let contract = void_op.contract(vec![(0, 4)]);
     assert_eq!(contract.dtype(), DType::Void, "CONTRACT of void should be void");
 
     // Apply expander

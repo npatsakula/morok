@@ -49,15 +49,6 @@ fn contains_output_range(uop: &Arc<UOp>) -> bool {
     }
 }
 
-/// Extract the scalar dtype from a dtype.
-/// For Vector types, returns the base scalar. For other types, returns as-is.
-fn to_scalar_dtype(dtype: DType) -> DType {
-    match dtype {
-        DType::Vector { scalar, .. } => DType::Scalar(scalar),
-        other => other,
-    }
-}
-
 /// Check if a REDUCE is a full reduction (scalar output, no output dimensions).
 fn is_full_reduction_reduce(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>) -> bool {
     if !matches!(op, Op::Reduce { .. }) {
@@ -119,7 +110,7 @@ fn push_broadcast_through_after(after: &Arc<UOp>) -> Option<Arc<UOp>> {
     let (src, count) = get_broadcast_source_and_count(passthrough)?;
 
     // Create AFTER(src, deps) and broadcast it
-    let inner_after = UOp::after(src, deps.clone());
+    let inner_after = src.after(deps.clone());
 
     // Create VECTORIZE with count copies of inner_after
     let elements: SmallVec<[Arc<UOp>; 4]> = std::iter::repeat_n(inner_after, count).collect();
@@ -140,7 +131,7 @@ fn push_broadcast_through_end(end: &Arc<UOp>) -> Option<Arc<UOp>> {
     let (src, count) = get_broadcast_source_and_count(computation)?;
 
     // Create END(src, ranges) and broadcast it
-    let inner_end = UOp::end(src, ranges.clone());
+    let inner_end = src.end(ranges.clone());
 
     // Create VECTORIZE with count copies of inner_end
     let elements: SmallVec<[Arc<UOp>; 4]> = std::iter::repeat_n(inner_end, count).collect();
@@ -168,7 +159,7 @@ fn expand_barrier_unroll(barrier: &Arc<UOp>) -> Option<Arc<UOp>> {
     let inner_barrier = UOp::new(Op::Barrier { src: inner.clone(), deps: deps.clone() }, inner.dtype());
 
     // Wrap in UNROLL with same axes
-    Some(UOp::unroll(inner_barrier, unroll_axes.clone()))
+    Some(inner_barrier.unroll(unroll_axes.clone()))
 }
 
 /// Fix BUFFERIZE with UNROLL sources by wrapping them in CONTRACT.
@@ -199,18 +190,12 @@ fn fix_bufferize_unroll(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
     let contract_axes = range_axes.clone();
 
     // Wrap compute in CONTRACT
-    let contracted_compute = UOp::contract(compute.clone(), contract_axes.clone());
+    let contracted_compute = compute.contract(contract_axes.clone());
 
     // Wrap each UNROLL range in CONTRACT, pass through non-UNROLL ranges
     let contracted_ranges: SmallVec<[Arc<UOp>; 4]> = ranges
         .iter()
-        .map(|r| {
-            if matches!(r.op(), Op::Unroll { .. }) {
-                UOp::contract(r.clone(), contract_axes.clone())
-            } else {
-                r.clone()
-            }
-        })
+        .map(|r| if matches!(r.op(), Op::Unroll { .. }) { r.contract(contract_axes.clone()) } else { r.clone() })
         .collect();
 
     Some(UOp::new(
@@ -447,7 +432,7 @@ fn convert_range_to_unroll(range: &Arc<UOp>) -> Option<Arc<UOp>> {
     let vconst = UOp::vconst(values);
 
     // Wrap in UNROLL op with axis metadata
-    let unroll = UOp::unroll(vconst, vec![(axis_id.value(), size)]);
+    let unroll = vconst.unroll(vec![(axis_id.value(), size)]);
 
     tracing::debug!(
         axis_type = ?axis_type,
@@ -669,7 +654,7 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Tinygrad (expander.py:65): UOp(Ops.UNROLL, root.dtype, (nsrc,), expand_args)
     // The UNROLL wrapper dtype is the ELEMENT dtype (original scalar dtype).
     // This is critical for swizzle adjustment in parent do_expand calls.
-    Some(UOp::unroll_with_dtype(new_op, expand_args, to_scalar_dtype(base_dtype.clone())))
+    Some(new_op.unroll_with_dtype(expand_args, base_dtype.scalar_dtype()))
 }
 
 /// Reconstruct an operation with new sources and dtype.
@@ -853,7 +838,7 @@ fn reconstruct_op_with_new_sources(op: &Op, sources: &SmallVec<[Arc<UOp>; 4]>, d
                     return None;
                 }
                 let deps: SmallVec<[Arc<UOp>; 4]> = sources[1..].iter().cloned().collect();
-                Some(UOp::after(passthrough, deps))
+                Some(passthrough.after(deps))
             } else {
                 None
             }
@@ -1008,7 +993,7 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Build the fixed REDUCE
     let fixed_src = if has_contract {
         // Wrap source in CONTRACT to document the unrolled/upcasted axes
-        UOp::contract(src.clone(), contract_axes)
+        src.contract(contract_axes)
     } else {
         src.clone()
     };
@@ -1022,7 +1007,7 @@ fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Full reductions (no output dims) collapse to scalar via horizontal reduce
     let result_dtype = if !upcast_axes.is_empty() && has_output_ranges {
         let total_upcast: usize = upcast_axes.iter().map(|(_, sz)| sz).product();
-        DType::Vector { scalar: reduce.dtype().base(), count: total_upcast }
+        reduce.dtype().scalar_dtype().vec(total_upcast)
     } else {
         reduce.dtype()
     };
@@ -1164,11 +1149,10 @@ fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
             );
 
             // Create new STORE with only non-UNROLL ranges
-            let new_store =
-                UOp::store_with_ranges(index.clone(), value.clone(), store_range.into_iter().cloned().collect());
+            let new_store = index.store_with_ranges(value.clone(), store_range.into_iter().cloned().collect());
 
             // Wrap in CONTRACT with void dtype (matching Tinygrad)
-            Some(UOp::contract(new_store, contract_axes))
+            Some(new_store.contract(contract_axes))
         }
         _ => None,
     }
@@ -1204,7 +1188,7 @@ fn end_unrolls(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         .collect();
 
     // Wrap computation in CONTRACT
-    let contracted = UOp::contract(computation.clone(), all_axes);
+    let contracted = computation.contract(all_axes);
 
     // Create new END with contracted computation and non-UNROLL ranges
     let new_ranges: SmallVec<[Arc<UOp>; 4]> = non_unrolls.into_iter().cloned().collect();
@@ -1273,7 +1257,7 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
             tracing::debug!(remaining_axes = ?remaining_axes, "do_contract: partial contraction -> UNROLL(GEP)");
             // Partially contracted: wrap in UNROLL with remaining axes
             // Use scalar dtype for UNROLL wrapper to avoid wrapper_count inflation
-            Some(UOp::unroll_with_dtype(gep_result, remaining_axes, to_scalar_dtype(uop.dtype())))
+            Some(gep_result.unroll_with_dtype(remaining_axes, uop.dtype().scalar_dtype()))
         };
     }
 
@@ -1315,7 +1299,7 @@ fn collapse_double_unroll(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let combined: Vec<(usize, usize)> = inner_axes.iter().chain(outer_axes.iter()).cloned().collect();
 
     // Use scalar dtype to be safe (should already be scalar from proper creation)
-    Some(UOp::unroll_with_dtype(inner_src.clone(), combined, to_scalar_dtype(uop.dtype())))
+    Some(inner_src.unroll_with_dtype(combined, uop.dtype().scalar_dtype()))
 }
 
 /// Remove empty UNROLL operations.
@@ -1342,7 +1326,7 @@ mod tests {
         let end = UOp::const_(DType::Index, ConstValue::Int(32));
         let range = UOp::range_axis(end, morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
         let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-        let reduce = UOp::reduce(src, smallvec::smallvec![range.clone()], ReduceOp::Add);
+        let reduce = src.reduce(smallvec::smallvec![range.clone()], ReduceOp::Add);
 
         let result = pre_expand(&reduce);
 
@@ -1371,7 +1355,7 @@ mod tests {
 
         // Create an UNROLL operation (simulates expanded loop)
         let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2)]);
-        let unroll = UOp::unroll(values, vec![(0, 3)]);
+        let unroll = values.unroll(vec![(0, 3)]);
 
         // Create a scalar constant
         let scalar = UOp::const_(DType::Float32, ConstValue::Float(1.0));
@@ -1435,7 +1419,7 @@ mod tests {
         );
 
         let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-        let reduce = UOp::reduce(src, smallvec::smallvec![unextractable], ReduceOp::Add);
+        let reduce = src.reduce(smallvec::smallvec![unextractable], ReduceOp::Add);
 
         // fix_reduce_unroll should return None because:
         // 1. The Binary expression can't be extracted (no Range ops)
@@ -1469,7 +1453,7 @@ mod tests {
         let nested_binary = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, inner_add, upcast_range2), DType::Index);
 
         let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-        let reduce = UOp::reduce(src, smallvec::smallvec![nested_binary], ReduceOp::Add);
+        let reduce = src.reduce(smallvec::smallvec![nested_binary], ReduceOp::Add);
 
         // fix_reduce_unroll should extract the reduce_range and handle the upcast axes
         let result = fix_reduce_unroll(&reduce);

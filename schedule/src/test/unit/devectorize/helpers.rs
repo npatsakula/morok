@@ -290,7 +290,7 @@ pub fn create_load(buffer: Arc<UOp>, index: Arc<UOp>) -> Arc<UOp> {
 ///
 /// Note: `index` must be an INDEX operation that references the buffer.
 pub fn create_store(index: Arc<UOp>, value: Arc<UOp>) -> Arc<UOp> {
-    UOp::store(index, value)
+    index.store(value)
 }
 
 /// Create a vector LOAD with iota index.
@@ -302,7 +302,7 @@ pub fn create_vector_load_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
 /// Create a vector STORE with iota index.
 pub fn create_vector_store_iota(buffer: Arc<UOp>, count: usize, value: Arc<UOp>) -> Arc<UOp> {
     let index = create_vector_index_iota(buffer, count);
-    UOp::store(index, value)
+    index.store(value)
 }
 
 // =============================================================================

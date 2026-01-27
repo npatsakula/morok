@@ -51,25 +51,24 @@ impl UOp {
     // Dependencies
     // =========================================================================
 
-    /// Ordering constraint: passthrough depends on deps.
+    /// Ordering constraint: self depends on deps.
     ///
     /// # Arguments
-    /// * `passthrough` - The value being passed through (must be data-producing node)
     /// * `deps` - Dependencies that must complete before this value is used
     ///
     /// # Panics (debug only)
-    /// Panics if passthrough is a control flow node (Range, End)
-    pub fn after(passthrough: Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+    /// Panics if self is a control flow node (Range, End)
+    pub fn after(self: &Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
         #[cfg(debug_assertions)]
         debug_assert!(
-            !matches!(passthrough.op(), Op::Range { .. } | Op::End { .. }),
+            !matches!(self.op(), Op::Range { .. } | Op::End { .. }),
             "AFTER passthrough must be data-producing node, got {:?} (id={})",
-            passthrough.op(),
-            passthrough.id
+            self.op(),
+            self.id
         );
 
-        let dtype = passthrough.dtype();
-        Self::new(Op::After { passthrough, deps }, dtype)
+        let dtype = self.dtype();
+        Self::new(Op::After { passthrough: self.clone(), deps }, dtype)
     }
 
     // =========================================================================
@@ -77,21 +76,21 @@ impl UOp {
     // =========================================================================
 
     /// Detach from gradient flow / force materialization.
-    pub fn detach(src: Arc<Self>) -> Arc<Self> {
-        let dtype = src.dtype();
-        Self::new(Op::Detach { src }, dtype)
+    pub fn detach(self: &Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Detach { src: self.clone() }, dtype)
     }
 
     /// Ensure contiguous memory layout.
-    pub fn contiguous(src: Arc<Self>) -> Arc<Self> {
-        let dtype = src.dtype();
-        Self::new(Op::Contiguous { src }, dtype)
+    pub fn contiguous(self: &Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Contiguous { src: self.clone() }, dtype)
     }
 
     /// Contiguous backward pass.
-    pub fn contiguous_backward(src: Arc<Self>) -> Arc<Self> {
-        let dtype = src.dtype();
-        Self::new(Op::ContiguousBackward { src }, dtype)
+    pub fn contiguous_backward(self: &Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::ContiguousBackward { src: self.clone() }, dtype)
     }
 
     // =========================================================================
@@ -102,9 +101,9 @@ impl UOp {
     ///
     /// Inserted before BITCAST to ensure the source is rendered separately
     /// in codegen (prevents invalid cast fusion).
-    pub fn precast(src: Arc<Self>) -> Arc<Self> {
-        let dtype = src.dtype();
-        Self::new(Op::Precast { src }, dtype)
+    pub fn precast(self: &Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Precast { src: self.clone() }, dtype)
     }
 
     // =========================================================================

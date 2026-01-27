@@ -58,9 +58,9 @@ impl UOp {
     ///
     /// Unlike `try_reduce_axis` (operates on tensor axes), this reduces
     /// values accumulated across RANGE loop iterations.
-    pub fn reduce(src: Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>, reduce_op: ReduceOp) -> Arc<Self> {
-        let dtype = src.dtype();
-        Self::new(Op::Reduce { src, ranges, reduce_op }, dtype)
+    pub fn reduce(self: &Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>, reduce_op: ReduceOp) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Reduce { src: self.clone(), ranges, reduce_op }, dtype)
     }
 
     /// All-reduce across multiple devices.

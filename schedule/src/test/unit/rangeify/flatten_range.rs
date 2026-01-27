@@ -23,7 +23,7 @@ fn test_flatten_range_impl_no_ranges() {
     // STORE operation with no ranges should return None
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(index, value);
+    let store = index.store(value);
 
     let result = flatten_range_impl(&store);
     assert!(result.is_none());
@@ -52,8 +52,8 @@ fn test_flatten_range_nested_end() {
     let r2 = UOp::range(UOp::index_const(20), 1);
 
     // Create nested END: END(END(computation, [r1]), [r2])
-    let inner_end = UOp::end(computation.clone(), smallvec![r1.clone()]);
-    let outer_end = UOp::end(inner_end, smallvec![r2.clone()]);
+    let inner_end = computation.clone().end(smallvec![r1.clone()]);
+    let outer_end = inner_end.end(smallvec![r2.clone()]);
 
     // Flatten
     let flattened = flatten_range_impl(&outer_end);
@@ -82,9 +82,9 @@ fn test_flatten_range_deeply_nested() {
     let r3 = UOp::range(UOp::index_const(30), 2);
 
     // Create 3-level nesting
-    let end1 = UOp::end(computation.clone(), smallvec![r1.clone()]);
-    let end2 = UOp::end(end1, smallvec![r2.clone()]);
-    let end3 = UOp::end(end2, smallvec![r3.clone()]);
+    let end1 = computation.clone().end(smallvec![r1.clone()]);
+    let end2 = end1.end(smallvec![r2.clone()]);
+    let end3 = end2.end(smallvec![r3.clone()]);
 
     // Flatten
     let flattened = flatten_range_impl(&end3);
@@ -114,8 +114,8 @@ fn test_flatten_range_preserves_computation() {
     let r2 = UOp::range(UOp::index_const(20), 1);
 
     // END(END(add, [r1]), [r2])
-    let inner_end = UOp::end(add.clone(), smallvec![r1.clone()]);
-    let outer_end = UOp::end(inner_end, smallvec![r2.clone()]);
+    let inner_end = add.clone().end(smallvec![r1.clone()]);
+    let outer_end = inner_end.end(smallvec![r2.clone()]);
 
     let flattened = flatten_range_impl(&outer_end);
 
@@ -149,8 +149,8 @@ fn test_flatten_ranges_full_graph() {
     let r2 = UOp::range(UOp::index_const(20), 1);
 
     // Create nested structure
-    let inner_end = UOp::end(computation.clone(), smallvec![r1.clone()]);
-    let outer_end = UOp::end(inner_end, smallvec![r2.clone()]);
+    let inner_end = computation.clone().end(smallvec![r1.clone()]);
+    let outer_end = inner_end.end(smallvec![r2.clone()]);
 
     // Full graph flattening
     let flattened = flatten_ranges(&outer_end);
@@ -171,7 +171,7 @@ fn test_flatten_range_single_range() {
     let computation = UOp::native_const(1.0f32);
     let r1 = UOp::range(UOp::index_const(10), 0);
 
-    let end = UOp::end(computation.clone(), smallvec![r1.clone()]);
+    let end = computation.clone().end(smallvec![r1.clone()]);
 
     let flattened = flatten_range_impl(&end);
 

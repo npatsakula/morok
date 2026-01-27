@@ -56,7 +56,7 @@ fn test_end_all_dead_ranges_unwrapped() {
     // END(store, [RANGE(0)]) → store
     let store = UOp::noop();
     let dead_range = UOp::range_const(0, 0);
-    let end = UOp::end(Arc::clone(&store), smallvec![dead_range]);
+    let end = Arc::clone(&store).end(smallvec![dead_range]);
 
     let matcher = get_matcher();
     let result = graph_rewrite_top_down(&matcher, end, &mut ());
@@ -74,7 +74,7 @@ fn test_end_partial_dead_ranges_removed() {
     let live1 = UOp::range_const(10, 0);
     let dead = UOp::range_const(0, 0);
     let live2 = UOp::range_const(5, 0);
-    let end = UOp::end(Arc::clone(&store), smallvec![Arc::clone(&live1), dead, Arc::clone(&live2)]);
+    let end = Arc::clone(&store).end(smallvec![Arc::clone(&live1), dead, Arc::clone(&live2)]);
 
     let matcher = get_matcher();
     let result = graph_rewrite_top_down(&matcher, end, &mut ());
@@ -99,7 +99,7 @@ fn test_reduce_add_empty_to_zero() {
     // REDUCE(x, [RANGE(0)], Add) → Const(0)
     let src = UOp::var("x", DType::Int32, 0, 100);
     let dead_range = UOp::range_const(0, 0);
-    let reduce = UOp::reduce(src, smallvec![dead_range], ReduceOp::Add);
+    let reduce = src.reduce(smallvec![dead_range], ReduceOp::Add);
 
     let matcher = get_matcher();
     let result = graph_rewrite_top_down(&matcher, reduce, &mut ());
@@ -112,7 +112,7 @@ fn test_reduce_mul_empty_to_one() {
     // REDUCE(x, [RANGE(-5)], Mul) → Const(1)
     let src = UOp::var("x", DType::Int32, 0, 100);
     let dead_range = UOp::range_const(-5, 0);
-    let reduce = UOp::reduce(src, smallvec![dead_range], ReduceOp::Mul);
+    let reduce = src.reduce(smallvec![dead_range], ReduceOp::Mul);
 
     let matcher = get_matcher();
     let result = graph_rewrite_top_down(&matcher, reduce, &mut ());
@@ -125,7 +125,7 @@ fn test_reduce_max_empty_to_min() {
     // REDUCE(x, [RANGE(0)], Max) → Const(INT32_MIN)
     let src = UOp::var("x", DType::Int32, 0, 100);
     let dead_range = UOp::range_const(0, 0);
-    let reduce = UOp::reduce(src, smallvec![dead_range], ReduceOp::Max);
+    let reduce = src.reduce(smallvec![dead_range], ReduceOp::Max);
 
     let matcher = get_matcher();
     let result = graph_rewrite_top_down(&matcher, reduce, &mut ());
@@ -179,7 +179,7 @@ fn test_range_boundary_vmax_zero() {
 fn test_end_empty_ranges_unchanged() {
     // END(store, []) should remain unchanged
     let store = UOp::noop();
-    let end = UOp::end(Arc::clone(&store), smallvec![]);
+    let end = Arc::clone(&store).end(smallvec![]);
 
     let matcher = get_matcher();
     let result = graph_rewrite_top_down(&matcher, end, &mut ());
@@ -200,7 +200,7 @@ fn test_end_multiple_dead_ranges_unwrapped() {
     let store = UOp::noop();
     let dead1 = UOp::range_const(0, 0);
     let dead2 = UOp::range_const(-5, 0);
-    let end = UOp::end(Arc::clone(&store), smallvec![dead1, dead2]);
+    let end = Arc::clone(&store).end(smallvec![dead1, dead2]);
 
     let matcher = get_matcher();
     let result = graph_rewrite_top_down(&matcher, end, &mut ());
@@ -220,7 +220,7 @@ fn test_reduce_multiple_dead_ranges() {
     let src = UOp::var("x", DType::Int32, 0, 100);
     let dead1 = UOp::range_const(0, 0);
     let dead2 = UOp::range_const(-5, 0);
-    let reduce = UOp::reduce(src, smallvec![dead1, dead2], ReduceOp::Add);
+    let reduce = src.reduce(smallvec![dead1, dead2], ReduceOp::Add);
 
     let matcher = get_matcher();
     let result = graph_rewrite_top_down(&matcher, reduce, &mut ());

@@ -95,9 +95,9 @@ impl UOp {
     }
 
     /// Create a buffer view.
-    pub fn buffer_view(buffer: Arc<Self>, size: usize, offset: usize) -> Arc<Self> {
-        let dtype = buffer.dtype.clone();
-        Self::new(Op::BufferView { buffer, size, offset }, dtype)
+    pub fn view(self: &Arc<Self>, size: usize, offset: usize) -> Arc<Self> {
+        let dtype = self.dtype.clone();
+        Self::new(Op::BufferView { buffer: self.clone(), size, offset }, dtype)
     }
 
     // =========================================================================

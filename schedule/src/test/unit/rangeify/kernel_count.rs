@@ -108,8 +108,8 @@ fn test_nested_end_operations() {
     let range2 = UOp::range_const(8, 1);
 
     // Create nested ENDs (unusual but should handle)
-    let end1 = UOp::end(store, smallvec::smallvec![range1.clone()]);
-    let end2 = UOp::end(end1.clone(), smallvec::smallvec![range2.clone()]);
+    let end1 = store.end(smallvec::smallvec![range1.clone()]);
+    let end2 = end1.clone().end(smallvec::smallvec![range2.clone()]);
 
     // Verify structure
     if let Op::End { computation, ranges } = end2.op() {

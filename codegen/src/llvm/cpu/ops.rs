@@ -753,7 +753,7 @@ fn render_cat(dst: &str, sources: &[Arc<UOp>], ctx: &RenderContext, kernel: &mut
     }
 
     let total_count: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
-    let scalar_type = ldt(&DType::Scalar(sources[0].dtype().base()));
+    let scalar_type = ldt(&sources[0].dtype().scalar_dtype());
     let out_type = format!("<{total_count} x {scalar_type}>");
 
     let mut out_idx = 0;

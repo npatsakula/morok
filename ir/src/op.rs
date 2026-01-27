@@ -545,7 +545,7 @@ impl Op {
     /// // END operation ends its range arguments
     /// let range = UOp::range(/* ... */);
     /// let computation = UOp::const_(/* ... */);
-    /// let end_op = UOp::end(computation, vec![range.clone()]);
+    /// let end_op = computation.end(vec![range.clone()]);
     ///
     /// // ended_ranges() returns the ranges that are closed
     /// let ended = end_op.op().ended_ranges();

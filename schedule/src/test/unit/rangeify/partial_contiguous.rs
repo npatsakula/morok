@@ -1091,7 +1091,7 @@ fn test_partial_contiguous_different_reduce_ops() {
             .indices(vec![loop_range.clone(), reduce_range.clone()])
             .call()
             .expect("Failed to create INDEX");
-        let reduce = UOp::reduce(indexed, smallvec::smallvec![reduce_range], reduce_op);
+        let reduce = indexed.reduce(smallvec::smallvec![reduce_range], reduce_op);
 
         let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
         let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);

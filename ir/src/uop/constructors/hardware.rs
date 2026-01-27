@@ -95,24 +95,24 @@ impl UOp {
     ///
     /// Pairs with UNROLL: UNROLL expands loops for optimization,
     /// CONTRACT combines the results. Used in WMMA and vectorization passes.
-    pub fn contract(src: Arc<Self>, upcast_ranges: Vec<(usize, usize)>) -> Arc<Self> {
-        let base_dtype = src.dtype();
+    pub fn contract(self: &Arc<Self>, upcast_ranges: Vec<(usize, usize)>) -> Arc<Self> {
+        let base_dtype = self.dtype();
 
         // Calculate vector size from upcast ranges (product of all range sizes)
         let vec_size = upcast_ranges.iter().map(|(_, size)| size).product::<usize>();
 
         let dtype = if vec_size > 1 { base_dtype.vec(vec_size) } else { base_dtype };
 
-        Self::new(Op::Contract { src, upcast_ranges }, dtype)
+        Self::new(Op::Contract { src: self.clone(), upcast_ranges }, dtype)
     }
 
     /// Expand a value across unrolled loop iterations.
     ///
     /// Creates multiple versions of the computation for each unroll axis.
     /// Pairs with CONTRACT which combines results back together.
-    pub fn unroll(src: Arc<Self>, unroll_axes: Vec<(usize, usize)>) -> Arc<Self> {
-        let dtype = src.dtype();
-        Self::new(Op::Unroll { src, unroll_axes }, dtype)
+    pub fn unroll(self: &Arc<Self>, unroll_axes: Vec<(usize, usize)>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Unroll { src: self.clone(), unroll_axes }, dtype)
     }
 
     /// Create UNROLL with explicit dtype (for do_contract pattern).
@@ -123,8 +123,8 @@ impl UOp {
     ///
     /// Based on Tinygrad's pattern where partial contraction creates
     /// UNROLL with remaining axes but CONTRACT's dtype.
-    pub fn unroll_with_dtype(src: Arc<Self>, unroll_axes: Vec<(usize, usize)>, dtype: DType) -> Arc<Self> {
-        Self::new(Op::Unroll { src, unroll_axes }, dtype)
+    pub fn unroll_with_dtype(self: &Arc<Self>, unroll_axes: Vec<(usize, usize)>, dtype: DType) -> Arc<Self> {
+        Self::new(Op::Unroll { src: self.clone(), unroll_axes }, dtype)
     }
 
     /// Create a CAT operation (concatenate vectors).
@@ -176,9 +176,9 @@ impl UOp {
     /// Select buffer by device index (multi-device access).
     ///
     /// MSelect retrieves a specific device's buffer from a multi-device tensor.
-    pub fn mselect(buffer: Arc<Self>, device_index: usize) -> Arc<Self> {
-        let dtype = buffer.dtype();
-        Self::new(Op::MSelect { buffer, device_index }, dtype)
+    pub fn mselect(self: &Arc<Self>, device_index: usize) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::MSelect { buffer: self.clone(), device_index }, dtype)
     }
 
     // =========================================================================

@@ -209,7 +209,7 @@ fn test_print_matmul_512x512_ir() {
 }
 
 #[test]
-#[ignore] // Run with: cargo test -p morok-tensor test_beam_search_matmul -- --ignored --nocapture
+// #[ignore] // Run with: cargo test -p morok-tensor test_beam_search_matmul -- --ignored --nocapture
 // #[tracing_test::traced_test]
 fn test_beam_search_matmul() {
     // Test beam search optimization for matmul - reproduces float vector index bug

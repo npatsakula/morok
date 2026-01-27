@@ -220,11 +220,7 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
         input_ranges.iter().enumerate().filter(|(i, _)| axes.contains(i)).map(|(_, r)| Arc::clone(r)).collect();
 
     // Determine target: REDUCE if we have ranges, source otherwise
-    let target = if reduce_ranges.is_empty() {
-        Arc::clone(src)
-    } else {
-        UOp::reduce(Arc::clone(src), reduce_ranges, *reduce_op)
-    };
+    let target = if reduce_ranges.is_empty() { Arc::clone(src) } else { src.reduce(reduce_ranges, *reduce_op) };
 
     // Transfer context to new identity (range_map + realize_map only)
     ctx.set_ranges(&target, input_ranges.clone(), output_ranges.clone());
@@ -664,7 +660,7 @@ pub fn reduction_simplify_patterns() -> TypedPatternMatcher {
             }
 
             let mut result = if !parented.is_empty() || reduce.dtype() != src.dtype() {
-                UOp::reduce(Arc::clone(src), parented, *reduce_op)
+                src.reduce(parented, *reduce_op)
             } else {
                 Arc::clone(src)
             };
@@ -774,7 +770,7 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<()> {
                 .get(&UOpKey(src.clone()))
                 .is_some_and(|c| c.iter().any(|c| matches!(c.op(), Op::Range { .. })));
             assert!(!has_range, "can't have a local AFTER");
-            Some(UOp::after(src.clone(), deps.clone()))
+            Some(src.after(deps.clone()))
         },
     }
 }
@@ -1139,7 +1135,7 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
         // Pattern 2: Cleanup STORE - remove LOAD from index position
         Store { index: Load { index: real_index, .. }, value, ranges } =>
             |real_index, value, ranges| {
-                Some(UOp::store_with_ranges(real_index.clone(), value.clone(), ranges.clone()))
+                Some(real_index.store_with_ranges(value.clone(), ranges.clone()))
             },
     }
 }
@@ -1168,7 +1164,7 @@ fn devectorize_binary(op: &BinaryOp, result: &Arc<UOp>, a: &Arc<UOp>, b: &Arc<UO
 
     let a_vcount = a.dtype().vcount();
     let b_vcount = b.dtype().vcount();
-    let scalar_dtype = DType::Scalar(result.dtype().base());
+    let scalar_dtype = result.dtype().scalar_dtype();
 
     let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..out_vcount)
         .map(|i| {
@@ -1189,7 +1185,7 @@ fn devectorize_unary(op: &UnaryOp, result: &Arc<UOp>, src: &Arc<UOp>) -> Option<
         return None;
     }
 
-    let scalar_dtype = DType::Scalar(result.dtype().base());
+    let scalar_dtype = result.dtype().scalar_dtype();
 
     let scalar_ops: SmallVec<[Arc<UOp>; 4]> = (0..out_vcount)
         .map(|i| {
@@ -1318,7 +1314,7 @@ fn horizontal_reduce(src: &Arc<UOp>, out_dtype: &DType, reduce_op: ReduceOp) -> 
     // Edge case: uneven division - fall back to full scalar reduction
     // (Can happen with non-power-of-2 upcast amounts like 3)
     if !src_count.is_multiple_of(out_count) || horizontal_amount == 0 {
-        let scalar_dtype = DType::Scalar(src.dtype().base());
+        let scalar_dtype = src.dtype().scalar_dtype();
         let elements: Vec<Arc<UOp>> = (0..src_count).map(|i| src.gep(vec![i])).collect();
         return vec![
             elements
@@ -1488,7 +1484,7 @@ fn devectorize_bool_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    let scalar_dtype = DType::Scalar(reduce.dtype().base());
+    let scalar_dtype = reduce.dtype().scalar_dtype();
 
     trace!(
         vcount,
@@ -1537,7 +1533,7 @@ fn devectorize_to_scalar_accumulators(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Unwrap CONTRACT to get vectorized source
     let vec_src = if let Op::Contract { src: inner, .. } = src.op() { inner.clone() } else { src.clone() };
 
-    let scalar_dtype = DType::Scalar(reduce.dtype().base());
+    let scalar_dtype = reduce.dtype().scalar_dtype();
 
     trace!(
         vec_count,

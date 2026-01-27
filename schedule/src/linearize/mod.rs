@@ -91,7 +91,7 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
 
     // Single RANGE - create simple single-range END
     if actual_ranges.len() == 1 {
-        let new_end = UOp::end(computation.clone(), SmallVec::from_elem(actual_ranges[0].clone(), 1));
+        let new_end = computation.end(SmallVec::from_elem(actual_ranges[0].clone(), 1));
         // Only return Some if this is different from the original
         if ranges.len() == 1 && ranges[0].id == actual_ranges[0].id {
             return None; // No change needed
@@ -121,7 +121,7 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
     // Step 3: Wrap computation in nested single-range ENDs
     let mut result = computation.clone();
     for range in sorted_ranges {
-        result = UOp::end(result, SmallVec::from_elem(range, 1));
+        result = result.end(SmallVec::from_elem(range, 1));
     }
 
     Some(result)

@@ -48,7 +48,7 @@ fn test_reduce_unparented_add_basic() {
     // Expected: CONST(5) * 10
     let const_val = UOp::native_const(5i32);
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(const_val, vec![range].into(), ReduceOp::Add);
+    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Add);
 
     let result = reduce_unparented(&reduce).expect("Should simplify");
 
@@ -62,7 +62,7 @@ fn test_reduce_unparented_mul() {
     // Expected: CONST(2)^3
     let const_val = UOp::native_const(2i32);
     let range = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(const_val, vec![range].into(), ReduceOp::Mul);
+    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Mul);
 
     let result = reduce_unparented(&reduce).expect("Should simplify");
 
@@ -76,7 +76,7 @@ fn test_reduce_unparented_max() {
     // Expected: CONST(42)
     let const_val = UOp::native_const(42i32);
     let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(const_val.clone(), vec![range].into(), ReduceOp::Max);
+    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Max);
 
     let result = reduce_unparented(&reduce).expect("Should simplify");
 
@@ -90,7 +90,7 @@ fn test_reduce_unparented_min() {
     // Expected: CONST(42)
     let const_val = UOp::native_const(42i32);
     let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(const_val.clone(), vec![range].into(), ReduceOp::Min);
+    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Min);
 
     let result = reduce_unparented(&reduce).expect("Should simplify");
 
@@ -102,7 +102,7 @@ fn test_reduce_unparented_min() {
 fn test_reduce_unparented_all_parented() {
     // Input: REDUCE(range, [range], ADD) - can't optimize
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(Arc::clone(&range), vec![range].into(), ReduceOp::Add);
+    let reduce = Arc::clone(&range).reduce(vec![range].into(), ReduceOp::Add);
 
     let result = reduce_unparented(&reduce);
 
@@ -121,7 +121,7 @@ fn test_reduce_unparented_mixed_ranges() {
     let x = UOp::native_const(3i32);
     let src = x.try_add(&range_0.cast(DType::Int32)).unwrap();
 
-    let reduce = UOp::reduce(src, vec![range_0.clone(), range_1].into(), ReduceOp::Add);
+    let reduce = src.reduce(vec![range_0.clone(), range_1].into(), ReduceOp::Add);
 
     let result = reduce_unparented(&reduce).expect("Should simplify");
 
@@ -148,7 +148,7 @@ fn test_reduce_unparented_multiple_unparented() {
     let range_0 = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(0), AxisType::Reduce);
     let range_1 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(1), AxisType::Reduce);
 
-    let reduce = UOp::reduce(const_val, vec![range_0, range_1].into(), ReduceOp::Add);
+    let reduce = const_val.reduce(vec![range_0, range_1].into(), ReduceOp::Add);
 
     let result = reduce_unparented(&reduce).expect("Should simplify");
 
@@ -180,7 +180,7 @@ fn test_reduce_collapse_basic() {
     // Note: This is a simple case - reduce_unparented would also handle this
     let const_val = UOp::native_const(5i32);
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(const_val.clone(), vec![range].into(), ReduceOp::Add);
+    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Add);
 
     let result = reduce_collapse(&reduce).expect("reduce_collapse should succeed on constant");
 
@@ -204,7 +204,7 @@ fn test_reduce_collapse_with_range_dependency() {
     let range_int = range.cast(DType::Int32);
     let src = range_int.try_add(&one).unwrap();
 
-    let reduce = UOp::reduce(src, vec![range].into(), ReduceOp::Add);
+    let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
 
     let result = reduce_collapse(&reduce);
 
@@ -225,7 +225,7 @@ fn test_reduce_collapse_non_reduce_returns_none() {
 fn test_reduce_collapse_empty_ranges() {
     // REDUCE with no ranges should return None
     let const_val = UOp::native_const(5i32);
-    let reduce = UOp::reduce(const_val, vec![].into(), ReduceOp::Add);
+    let reduce = const_val.reduce(vec![].into(), ReduceOp::Add);
 
     let result = reduce_collapse(&reduce);
     assert!(result.is_none(), "reduce_collapse should return None for empty ranges");
@@ -238,7 +238,7 @@ fn test_reduce_collapse_multiple_ranges_all_independent() {
     let range1 = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
     let range2 = UOp::range_axis(UOp::index_const(20), AxisId::Renumbered(1), AxisType::Reduce);
 
-    let reduce = UOp::reduce(const_val.clone(), vec![range1, range2].into(), ReduceOp::Add);
+    let reduce = const_val.clone().reduce(vec![range1, range2].into(), ReduceOp::Add);
 
     let result = reduce_collapse(&reduce);
 
@@ -261,7 +261,7 @@ fn test_reduce_collapse_algebraic_simplification() {
 
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
 
-    let reduce = UOp::reduce(x_plus_0, vec![range].into(), ReduceOp::Add);
+    let reduce = x_plus_0.reduce(vec![range].into(), ReduceOp::Add);
 
     let result = reduce_collapse(&reduce).expect("reduce_collapse should succeed after x+0 simplification");
 
@@ -283,7 +283,7 @@ fn test_reduce_collapse_multiplication_by_one() {
 
     let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
 
-    let reduce = UOp::reduce(x_times_1, vec![range].into(), ReduceOp::Mul);
+    let reduce = x_times_1.reduce(vec![range].into(), ReduceOp::Mul);
 
     let result = reduce_collapse(&reduce).expect("reduce_collapse should succeed after x*1 simplification");
 
@@ -301,7 +301,7 @@ fn test_reduce_collapse_preserves_dtype() {
     // Verify that reduce_collapse preserves data types correctly
     let const_val = UOp::native_const(2.5f64);
     let range = UOp::range_axis(UOp::index_const(100), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(const_val.clone(), vec![range].into(), ReduceOp::Add);
+    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Add);
 
     let result = reduce_collapse(&reduce);
 
@@ -320,19 +320,19 @@ fn test_reduce_collapse_different_reduce_ops() {
     let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
 
     // Test ADD
-    let reduce_add = UOp::reduce(const_val.clone(), vec![range.clone()].into(), ReduceOp::Add);
+    let reduce_add = const_val.clone().reduce(vec![range.clone()].into(), ReduceOp::Add);
     assert!(reduce_collapse(&reduce_add).is_some(), "reduce_collapse should work with ReduceOp::Add");
 
     // Test MUL
-    let reduce_mul = UOp::reduce(const_val.clone(), vec![range.clone()].into(), ReduceOp::Mul);
+    let reduce_mul = const_val.clone().reduce(vec![range.clone()].into(), ReduceOp::Mul);
     assert!(reduce_collapse(&reduce_mul).is_some(), "reduce_collapse should work with ReduceOp::Mul");
 
     // Test MAX
-    let reduce_max = UOp::reduce(const_val.clone(), vec![range.clone()].into(), ReduceOp::Max);
+    let reduce_max = const_val.clone().reduce(vec![range.clone()].into(), ReduceOp::Max);
     assert!(reduce_collapse(&reduce_max).is_some(), "reduce_collapse should work with ReduceOp::Max");
 
     // Test MIN
-    let reduce_min = UOp::reduce(const_val, vec![range].into(), ReduceOp::Min);
+    let reduce_min = const_val.reduce(vec![range].into(), ReduceOp::Min);
     assert!(reduce_collapse(&reduce_min).is_some(), "reduce_collapse should work with ReduceOp::Min");
 }
 

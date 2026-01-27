@@ -106,7 +106,7 @@ fn test_cranelift_bootstrap_pipeline() {
     let const_0 = UOp::index_const(0);
 
     let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-    let store = UOp::store(idx, const_42.clone());
+    let store = idx.store(const_42.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -156,7 +156,7 @@ fn test_cranelift_exp2_decomposition() {
 
     let const_0 = UOp::index_const(0);
     let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-    let store = UOp::store(idx, exp2_result.clone());
+    let store = idx.store(exp2_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -214,7 +214,7 @@ fn test_cranelift_simple_math() {
 
     let const_0 = UOp::index_const(0);
     let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-    let store = UOp::store(idx, mul_result.clone());
+    let store = idx.store(mul_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -254,7 +254,7 @@ fn test_cranelift_pow2if() {
 
     let const_0 = UOp::index_const(0);
     let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-    let store = UOp::store(idx, pow2if_result.clone());
+    let store = idx.store(pow2if_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -296,7 +296,7 @@ fn test_cranelift_ldexp2k() {
 
     let const_0 = UOp::index_const(0);
     let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-    let store = UOp::store(idx, ldexp_result.clone());
+    let store = idx.store(ldexp_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -338,7 +338,7 @@ fn test_cranelift_rintk() {
 
     let const_0 = UOp::index_const(0);
     let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-    let store = UOp::store(idx, rintk_result.clone());
+    let store = idx.store(rintk_result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -398,7 +398,7 @@ fn test_cranelift_exp2_simple() {
 
     let const_0 = UOp::index_const(0);
     let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-    let store = UOp::store(idx, result.clone());
+    let store = idx.store(result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -446,7 +446,7 @@ fn test_cranelift_ldexp_with_rintk() {
 
     let const_0 = UOp::index_const(0);
     let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-    let store = UOp::store(idx, result.clone());
+    let store = idx.store(result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -486,7 +486,7 @@ fn test_cranelift_poly_at_zero() {
 
     let const_0 = UOp::index_const(0);
     let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-    let store = UOp::store(idx, result.clone());
+    let store = idx.store(result.clone());
 
     let sink = UOp::sink(vec![store]);
 
@@ -537,7 +537,7 @@ fn test_cranelift_exp2_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-        let store = UOp::store(idx, exp2_result.clone());
+        let store = idx.store(exp2_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -608,7 +608,7 @@ fn test_cranelift_sin_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-        let store = UOp::store(idx, sin_result.clone());
+        let store = idx.store(sin_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -672,7 +672,7 @@ fn test_cranelift_cos_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-        let store = UOp::store(idx, cos_result.clone());
+        let store = idx.store(cos_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -730,7 +730,7 @@ fn test_cranelift_log2_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-        let store = UOp::store(idx, log2_result.clone());
+        let store = idx.store(log2_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -779,7 +779,7 @@ fn test_cranelift_exp_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-        let store = UOp::store(idx, exp_result.clone());
+        let store = idx.store(exp_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -828,7 +828,7 @@ fn test_cranelift_log_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-        let store = UOp::store(idx, log_result.clone());
+        let store = idx.store(log_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -889,7 +889,7 @@ fn test_cranelift_tan_accuracy() {
 
         let const_0 = UOp::index_const(0);
         let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-        let store = UOp::store(idx, tan_result.clone());
+        let store = idx.store(tan_result.clone());
 
         let sink = UOp::sink(vec![store]);
 
@@ -958,11 +958,11 @@ fn test_cranelift_erf_accuracy() {
         let buf0 = UOp::new(Op::DefineGlobal(0), ptr_dtype);
 
         let const_input = UOp::const_(DType::Scalar(ScalarDType::Float32), ConstValue::Float(input as f64));
-        let erf_result = UOp::erf(const_input).expect("erf should succeed");
+        let erf_result = const_input.erf().expect("erf should succeed");
 
         let const_0 = UOp::index_const(0);
         let idx = UOp::index().buffer(buf0.clone()).indices(vec![const_0.clone()]).call().unwrap();
-        let store = UOp::store(idx, erf_result.clone());
+        let store = idx.store(erf_result.clone());
 
         let sink = UOp::sink(vec![store]);
 

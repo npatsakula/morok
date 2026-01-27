@@ -736,7 +736,7 @@ pub fn dead_loop_patterns() -> TypedPatternMatcher {
             Arc::clone(computation)
         } else {
             // Some ranges dead - create new END with only live ranges
-            UOp::end(Arc::clone(computation), live_ranges)
+            computation.end(live_ranges)
         }
     }
 

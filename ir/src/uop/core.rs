@@ -223,7 +223,7 @@ impl UOp {
 
     /// Store a value at this INDEX node.
     ///
-    /// Convenience method for `UOp::store(self, value)`.
+    /// Convenience method for `self.store(value)`.
     /// Matches Tinygrad's `idx.store(val)` pattern.
     ///
     /// # Panics
@@ -231,7 +231,7 @@ impl UOp {
     /// Debug-asserts that self is an INDEX operation.
     pub fn store_value(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
         debug_assert!(matches!(self.op(), Op::Index { .. }), "store_value requires INDEX");
-        Self::store(self.clone(), value)
+        self.store(value)
     }
 
     /// Alias for `with_sources()`.
@@ -407,7 +407,7 @@ impl UOp {
     /// # use morok_dtype::DeviceSpec;
     /// let buffer = UOp::new_buffer(DeviceSpec::Cpu, 10, DType::Float32);
     /// let shape = Shape::from_iter([SInt::Const(2), SInt::Const(5)]);
-    /// let reshaped = UOp::try_reshape(buffer.clone(), &shape).unwrap();
+    /// let reshaped = buffer.try_reshape(&shape).unwrap();
     ///
     /// // base() walks through RESHAPE to get the original BUFFER
     /// assert!(std::sync::Arc::ptr_eq(&reshaped.base(), &buffer));
@@ -439,7 +439,7 @@ impl UOp {
     ///
     /// // AFTER wrapping a buffer
     /// let buffer = UOp::new_buffer(...);
-    /// let after = UOp::after(buffer.clone(), deps);
+    /// let after = buffer.after(deps);
     ///
     /// // buf_uop() walks through AFTER to get the underlying buffer
     /// assert!(Arc::ptr_eq(&after.buf_uop(), &buffer));
@@ -624,7 +624,7 @@ impl UOp {
     /// // A simple computation inside a range
     /// let range = UOp::range(end, 0, AxisType::Loop);
     /// let value = UOp::const_(...);
-    /// let end_op = UOp::end(value, vec![range.clone()]);
+    /// let end_op = value.end(vec![range.clone()]);
     ///
     /// // Value has range in scope
     /// assert!(value.in_scope_ranges().contains(&range));

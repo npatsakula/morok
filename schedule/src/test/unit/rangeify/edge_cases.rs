@@ -87,7 +87,7 @@ fn test_zero_size_index() {
 fn test_zero_size_end() {
     // END with zero ranges
     let store = UOp::noop();
-    let end = UOp::end(store.clone(), SmallVec::new());
+    let end = store.clone().end(SmallVec::new());
 
     // Should create valid END
     if let Op::End { computation, ranges } = end.op() {

@@ -22,7 +22,7 @@ fn test_fix_reduce_simple_passthrough() {
     let end = UOp::const_(DType::Index, ConstValue::Int(32));
     let range = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Reduce);
     let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = UOp::reduce(src, smallvec![range.clone()], ReduceOp::Add);
+    let reduce = src.reduce(smallvec![range.clone()], ReduceOp::Add);
 
     // Apply expander
     let result = expander_rewrite(&reduce);
@@ -53,7 +53,7 @@ fn test_fix_reduce_range_unroll() {
     let reduce_range =
         UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(32)), AxisId::Renumbered(0), AxisType::Reduce);
     let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = UOp::reduce(src, smallvec![reduce_range, unroll_range], ReduceOp::Add);
+    let reduce = src.reduce(smallvec![reduce_range, unroll_range], ReduceOp::Add);
 
     // Apply expander
     let result = expander_rewrite(&reduce);
@@ -94,7 +94,7 @@ fn test_fix_reduce_range_upcast() {
     let loop_end = UOp::const_(DType::Index, ConstValue::Int(16));
     let loop_range = UOp::range_axis(loop_end, AxisId::Renumbered(2), AxisType::Loop);
     let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = UOp::reduce(src, smallvec![upcast_range, loop_range], ReduceOp::Add);
+    let reduce = src.reduce(smallvec![upcast_range, loop_range], ReduceOp::Add);
 
     // Apply expander
     let result = expander_rewrite(&reduce);
@@ -145,7 +145,7 @@ fn test_fix_reduce_arithmetic_expr() {
     let nested_binary = UOp::new(Op::Binary(BinaryOp::Add, inner_add, upcast_range2), DType::Index);
 
     let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = UOp::reduce(src, smallvec![nested_binary], ReduceOp::Add);
+    let reduce = src.reduce(smallvec![nested_binary], ReduceOp::Add);
 
     // Apply expander
     let result = expander_rewrite(&reduce);

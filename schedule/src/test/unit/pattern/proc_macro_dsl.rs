@@ -956,7 +956,7 @@ fn test_rest_pattern_end() {
     let range2 = UOp::range(UOp::index_const(20), 1);
 
     // END with 1 range - should match
-    let end1 = UOp::end(computation.clone(), smallvec![range1.clone()]);
+    let end1 = computation.end(smallvec![range1.clone()]);
     match matcher.rewrite(&end1, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &computation), "Should rewrite to computation");
@@ -965,7 +965,7 @@ fn test_rest_pattern_end() {
     }
 
     // END with 2 ranges - should also match (that's the point of `..`)
-    let end2 = UOp::end(computation.clone(), smallvec![range1.clone(), range2.clone()]);
+    let end2 = computation.end(smallvec![range1.clone(), range2.clone()]);
     match matcher.rewrite(&end2, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(Arc::ptr_eq(&r, &computation), "Should rewrite to computation");
@@ -990,7 +990,7 @@ fn test_rest_pattern_reduce() {
     let range2 = UOp::range(UOp::index_const(20), 1);
 
     // REDUCE with 1 range - should match
-    let reduce1 = UOp::reduce(src.clone(), smallvec![range1.clone()], ReduceOp::Add);
+    let reduce1 = src.reduce(smallvec![range1.clone()], ReduceOp::Add);
     match matcher.rewrite(&reduce1, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(matches!(r.op(), Op::Const(_)));
@@ -999,7 +999,7 @@ fn test_rest_pattern_reduce() {
     }
 
     // REDUCE with 2 ranges - should also match (that's the point of `..`)
-    let reduce2 = UOp::reduce(src.clone(), smallvec![range1.clone(), range2.clone()], ReduceOp::Add);
+    let reduce2 = src.reduce(smallvec![range1.clone(), range2.clone()], ReduceOp::Add);
     match matcher.rewrite(&reduce2, &mut ()) {
         RewriteResult::Rewritten(r) => {
             assert!(matches!(r.op(), Op::Const(_)));
@@ -1025,14 +1025,14 @@ fn test_rest_pattern_with_guard() {
     let range = UOp::range(UOp::index_const(10), 0);
 
     // REDUCE with Add - should match
-    let reduce_add = UOp::reduce(src.clone(), smallvec![range.clone()], ReduceOp::Add);
+    let reduce_add = src.reduce(smallvec![range.clone()], ReduceOp::Add);
     match matcher.rewrite(&reduce_add, &mut ()) {
         RewriteResult::Rewritten(_) => {}
         _ => panic!("Should match REDUCE Add"),
     }
 
     // REDUCE with Mul - should NOT match (guard fails)
-    let reduce_mul = UOp::reduce(src.clone(), smallvec![range.clone()], ReduceOp::Mul);
+    let reduce_mul = src.reduce(smallvec![range.clone()], ReduceOp::Mul);
     match matcher.rewrite(&reduce_mul, &mut ()) {
         RewriteResult::NoMatch => {} // Expected
         _ => panic!("Should NOT match REDUCE Mul"),

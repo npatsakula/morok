@@ -26,7 +26,7 @@ fn test_early_rewrites_detach_removal() {
 
     // Test: DETACH(x) → x
     let x = UOp::native_const(42.0f32);
-    let detach = UOp::detach(x.clone());
+    let detach = x.detach();
 
     let result = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite DETACH");
@@ -42,7 +42,7 @@ fn test_early_rewrites_contiguous_backward_removal() {
 
     // Test: CONTIGUOUS_BACKWARD(x) → x
     let x = UOp::native_const(PI);
-    let contiguous = UOp::contiguous_backward(x.clone());
+    let contiguous = x.contiguous_backward();
 
     let result = matcher.rewrite(&contiguous, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should rewrite CONTIGUOUS_BACKWARD");
@@ -74,8 +74,8 @@ fn test_early_rewrites_nested_detach() {
 
     // Test: DETACH(DETACH(x)) should rewrite outer DETACH to DETACH(x)
     let x = UOp::native_const(1.0f32);
-    let inner_detach = UOp::detach(x.clone());
-    let outer_detach = UOp::detach(inner_detach.clone());
+    let inner_detach = x.detach();
+    let outer_detach = inner_detach.detach();
 
     let result = matcher.rewrite(&outer_detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -150,7 +150,7 @@ fn test_buffer_folding_copy_const() {
     // Test: COPY(CONST, device) → CONST
     let const_val = UOp::native_const(1.0f32);
     let device = UOp::device(morok_ir::DeviceSpec::Cpu);
-    let copy = UOp::copy(const_val.clone(), device);
+    let copy = const_val.copy(device);
 
     let result = matcher.rewrite(&copy, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)), "Should remove COPY from CONST");
@@ -315,7 +315,7 @@ fn test_buffer_removal_always_run_ops() {
 
     // Test: BUFFERIZE(CONTIGUOUS) should be removed (always-run op)
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let contiguous = UOp::contiguous(src.clone());
+    let contiguous = src.contiguous();
 
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
@@ -509,7 +509,7 @@ fn test_pattern_composition() {
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
     // First apply DETACH
-    let detach = UOp::detach(x.clone());
+    let detach = x.detach();
 
     // Then apply early_rewrites to remove DETACH
     let early = patterns::early_rewrites();
@@ -546,7 +546,7 @@ fn test_idempotent_patterns() {
     // Test that applying patterns multiple times doesn't cause issues
 
     let x = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let detach = UOp::detach(x.clone());
+    let detach = x.detach();
 
     let matcher = patterns::early_rewrites();
 

@@ -235,7 +235,7 @@ mod tests {
         let end_val = UOp::index_const(10);
         let range = UOp::range(end_val, 0);
         let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let end = UOp::end(value, smallvec::smallvec![range]);
+        let end = value.end(smallvec::smallvec![range]);
         let sink = UOp::sink(vec![end]);
 
         let ctx = CFGContext::new(&sink);
@@ -250,7 +250,7 @@ mod tests {
         let range2 = UOp::range(end_val, 1);
 
         let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let end = UOp::end(value, smallvec::smallvec![range1.clone(), range2.clone()]);
+        let end = value.end(smallvec::smallvec![range1.clone(), range2.clone()]);
         let sink = UOp::sink(vec![end]);
 
         let ctx = CFGContext::new(&sink);
@@ -266,11 +266,11 @@ mod tests {
         // Inner range
         let inner_range = UOp::range(end_val.clone(), 0);
         let inner_value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let inner_end = UOp::end(inner_value, smallvec::smallvec![inner_range.clone()]);
+        let inner_end = inner_value.end(smallvec::smallvec![inner_range.clone()]);
 
         // Outer range containing inner
         let outer_range = UOp::range(end_val, 1);
-        let outer_end = UOp::end(inner_end, smallvec::smallvec![outer_range.clone()]);
+        let outer_end = inner_end.end(smallvec::smallvec![outer_range.clone()]);
 
         let sink = UOp::sink(vec![outer_end]);
 

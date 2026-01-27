@@ -117,7 +117,7 @@ fn test_device_propagation_through_ops() {
 fn test_buffer_view_inherits_device() {
     // Buffer view should reference original buffer's device
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let view = UOp::buffer_view(buffer.clone(), 50, 10);
+    let view = buffer.view(50, 10);
 
     // View contains reference to original buffer
     if let Op::BufferView { buffer: ref_buf, .. } = view.op() {

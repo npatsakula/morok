@@ -18,7 +18,7 @@ fn test_find_bufs_store_only() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer.clone()).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value);
+    let store = store_idx.store(value);
 
     // Should succeed - only STORE access
     #[allow(clippy::mutable_key_type)]
@@ -41,7 +41,7 @@ fn test_find_bufs_load_only() {
     // Wrap in a STORE to a different buffer (kernel output)
     let out_buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let store_idx = UOp::index().buffer(out_buffer.clone()).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, loaded);
+    let store = store_idx.store(loaded);
 
     // Should succeed - input buffer only LOADed, output buffer only STOREd
     #[allow(clippy::mutable_key_type)]
@@ -68,7 +68,7 @@ fn test_find_bufs_conflicting_access() {
 
     // Then STORE back to the same buffer (conflict!) using INDEX node
     let store_idx = UOp::index().buffer(buffer.clone()).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, loaded);
+    let store = store_idx.store(loaded);
 
     // Should panic with "buffer accessed with conflicting ops"
     find_bufs(&store);
@@ -93,7 +93,7 @@ fn test_find_bufs_multiple_buffers() {
 
     // STORE to output buffer using INDEX node
     let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, sum);
+    let store = store_idx.store(sum);
 
     // Should succeed
     #[allow(clippy::mutable_key_type)]
@@ -125,7 +125,7 @@ fn test_find_bufs_with_gated_index() {
         UOp::index().buffer(out_buf.clone()).indices(vec![UOp::index_const(0)]).gate(gate).call().unwrap();
 
     // Store to gated index
-    let store = UOp::store(gated_out_index, loaded);
+    let store = gated_out_index.store(loaded);
 
     // Should succeed
     #[allow(clippy::mutable_key_type)]
@@ -141,7 +141,7 @@ fn test_find_bufs_with_gated_index() {
 fn test_as_buf_mselect() {
     // Test as_buf extracts buffer from MSelect
     let buffer = UOp::buffer_id(Some(0));
-    let mselect = UOp::mselect(buffer.clone(), 0);
+    let mselect = buffer.mselect(0);
 
     let extracted = as_buf(&mselect);
     assert!(Arc::ptr_eq(&extracted, &buffer));
@@ -163,7 +163,7 @@ fn test_as_buf_after() {
     // Test as_buf extracts passthrough from After
     let buffer = UOp::buffer_id(Some(0));
     let computation = UOp::noop();
-    let after = UOp::after(buffer.clone(), smallvec::smallvec![computation]);
+    let after = buffer.after(smallvec::smallvec![computation]);
 
     let extracted = as_buf(&after);
     assert!(Arc::ptr_eq(&extracted, &buffer));

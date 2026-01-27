@@ -343,11 +343,11 @@ pub fn apply(
             reduce_axes: vec![],
         };
 
-        let a_contract = UOp::contract(pattern.in0.clone(), a_axes);
-        let b_contract = UOp::contract(pattern.in1.clone(), b_axes);
+        let a_contract = pattern.in0.contract(a_axes);
+        let b_contract = pattern.in1.contract(b_axes);
         let zero_acc = UOp::const_(tc.dtype_out.clone(), ConstValue::Float(0.0));
         let wmma = UOp::wmma(a_contract, b_contract, zero_acc, metadata);
-        let tc_uop = UOp::unroll(wmma, c_axes);
+        let tc_uop = wmma.unroll(c_axes);
 
         #[allow(clippy::mutable_key_type)]
         let mut subst_map = HashMap::new();

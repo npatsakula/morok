@@ -20,7 +20,7 @@ fn test_detect_matmul_basic() {
     let mul = a_val.try_mul(&b_val).unwrap();
 
     // Reduce over k
-    let reduce = UOp::reduce(mul, vec![k].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, i, j]);
 
     // Create scheduler
@@ -54,7 +54,7 @@ fn test_detect_matmul_not_mul() {
     // REDUCE but not of MUL
     let k = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Reduce);
     let val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(val, vec![k].into(), ReduceOp::Add);
+    let reduce = val.reduce(vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cuda();
@@ -77,7 +77,7 @@ fn test_select_tensor_core_auto() {
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
     let mul = a_val.try_mul(&b_val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k.clone()].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k.clone()].into(), ReduceOp::Add);
 
     let pattern = matching::MatmulPattern {
         reduce_op: reduce,
@@ -106,7 +106,7 @@ fn test_select_tensor_core_specific() {
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
     let mul = a_val.try_mul(&b_val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k.clone()].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k.clone()].into(), ReduceOp::Add);
 
     let pattern = matching::MatmulPattern {
         reduce_op: reduce,
@@ -134,7 +134,7 @@ fn test_select_tensor_core_out_of_bounds() {
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
     let mul = a_val.try_mul(&b_val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k.clone()].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k.clone()].into(), ReduceOp::Add);
 
     let pattern = matching::MatmulPattern {
         reduce_op: reduce,
@@ -223,7 +223,7 @@ fn test_apply_tc_basic() {
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
     let mul = a_val.try_mul(&b_val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, i, j]);
 
     let ren = Renderer::cuda();
@@ -255,7 +255,7 @@ fn test_apply_tc_invalid_use_tc() {
 
     let val = UOp::native_const(1.0f32);
     let mul = val.try_mul(&val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, i]);
 
     let ren = Renderer::cuda();

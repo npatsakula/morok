@@ -95,7 +95,7 @@ fn test_early_rewrites_detach_removal() {
 
     // Test: DETACH(x) -> x
     let x = UOp::native_const(1.0f32);
-    let detach = UOp::detach(x.clone());
+    let detach = x.detach();
 
     let result = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
@@ -112,7 +112,7 @@ fn test_early_rewrites_contiguous_backward_removal() {
 
     // Test: CONTIGUOUS_BACKWARD(x) -> x
     let x = UOp::native_const(1.0f32);
-    let contiguous = UOp::contiguous_backward(x.clone());
+    let contiguous = x.contiguous_backward();
 
     let result = matcher.rewrite(&contiguous, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));

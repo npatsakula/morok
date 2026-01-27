@@ -355,7 +355,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
             if let Op::After { passthrough: a_passthrough, deps: a_deps } = a.op() {
                 let mut new_deps = a_deps.clone();
                 new_deps.push(u.clone());
-                let new_a = UOp::after(a_passthrough.clone(), new_deps);
+                let new_a = a_passthrough.after(new_deps);
                 assign_rep.insert(UOpKey(a.clone()), new_a.clone());
                 kernel_assign.insert(s_buf_id, new_a);
             }
@@ -428,7 +428,7 @@ fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
             }
 
             if any_changed {
-                let new_after = UOp::after(passthrough.clone(), new_deps);
+                let new_after = passthrough.after(new_deps);
                 replacements.insert(UOpKey(node.clone()), new_after);
             }
         }
@@ -443,7 +443,7 @@ fn transform_store_to_kernel(node: &Arc<UOp>, ctx: &mut Vec<Arc<UOp>>) -> Arc<UO
         Op::Store { .. } => {
             if let Some(kernel) = split_store(ctx, node) {
                 // Wrap kernel in END for proper structure
-                UOp::end(kernel, SmallVec::new())
+                kernel.end(SmallVec::new())
             } else {
                 node.clone()
             }
@@ -452,7 +452,7 @@ fn transform_store_to_kernel(node: &Arc<UOp>, ctx: &mut Vec<Arc<UOp>>) -> Arc<UO
             if matches!(computation.op(), Op::Store { .. }) {
                 if let Some(kernel) = split_store(ctx, node) {
                     // Keep END wrapper with original ranges
-                    UOp::end(kernel, ranges.clone())
+                    kernel.end(ranges.clone())
                 } else {
                     node.clone()
                 }
@@ -463,7 +463,7 @@ fn transform_store_to_kernel(node: &Arc<UOp>, ctx: &mut Vec<Arc<UOp>>) -> Arc<UO
         Op::Barrier { src, deps } => {
             // Recursively transform the barrier source
             let transformed_src = transform_store_to_kernel(src, ctx);
-            if Arc::ptr_eq(&transformed_src, src) { node.clone() } else { UOp::barrier(transformed_src, deps.clone()) }
+            if Arc::ptr_eq(&transformed_src, src) { node.clone() } else { transformed_src.barrier(deps.clone()) }
         }
         _ => node.clone(),
     }
@@ -629,7 +629,7 @@ fn apply_split_transformation(
 
     let first_reduce = permuted.try_reduce_axis(*reduce_op, permuted_axes).ok()?;
 
-    let contiguous = UOp::contiguous(first_reduce);
+    let contiguous = first_reduce.contiguous();
 
     let output_shape = contiguous.shape().ok()??;
     let split_axis = output_shape.len() - 1;

@@ -27,7 +27,7 @@ fn test_fix_store_partition() {
     let unroll = create_unroll_iota(0, 4);
 
     // Create STORE with UNROLL in ranges
-    let store = UOp::store_with_ranges(index, value, smallvec![unroll]);
+    let store = index.store_with_ranges(value, smallvec![unroll]);
 
     // Apply expander
     let result = phase2_only(&store);
@@ -74,7 +74,7 @@ fn test_fix_store_mixed_ranges() {
     let loop_range = UOp::range_axis(end, AxisId::Renumbered(1), AxisType::Loop);
 
     // Create STORE with both UNROLL and non-UNROLL ranges
-    let store = UOp::store_with_ranges(index, value, smallvec![unroll, loop_range.clone()]);
+    let store = index.store_with_ranges(value, smallvec![unroll, loop_range.clone()]);
 
     // Apply expander
     let result = phase2_only(&store);

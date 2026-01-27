@@ -149,7 +149,7 @@ impl Tensor {
     /// Returns error if dtype is not float.
     #[track_caller]
     pub fn erf(&self) -> Result<Tensor> {
-        UOp::erf(self.uop()).map(Self::new).context(UOpSnafu)
+        self.uop().erf().map(Self::new).context(UOpSnafu)
     }
 
     /// Reciprocal: 1/x.
@@ -177,7 +177,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn square(&self) -> Result<Tensor> {
-        Ok(Self::new(UOp::square(self.uop())))
+        Ok(Self::new(self.uop().square()))
     }
 
     /// Sign function: -1 for negative, 0 for zero, 1 for positive.
@@ -191,6 +191,6 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn sign(&self) -> Result<Tensor> {
-        Ok(Self::new(UOp::sign(self.uop())))
+        Ok(Self::new(self.uop().sign()))
     }
 }

@@ -231,7 +231,7 @@ fn test_buffer_hash_consing() {
 #[test]
 fn test_buffer_view() {
     let buf = UOp::new_buffer(DeviceSpec::Cpu, 1000, DType::Float32);
-    let view = UOp::buffer_view(buf, 100, 50);
+    let view = buf.view(100, 50);
 
     assert!(matches!(view.op(), Op::BufferView { .. }));
     assert_eq!(view.dtype(), DType::Float32);
@@ -449,7 +449,7 @@ fn test_in_scope_ranges_after_end() {
     let compute = UOp::native_const(1.0f32);
 
     // Create END operation
-    let end_op = UOp::end(compute.clone(), smallvec![range.clone()]);
+    let end_op = compute.end(smallvec![range.clone()]);
 
     // After END, the range should no longer be in scope
     let in_scope = end_op.in_scope_ranges();
@@ -476,7 +476,7 @@ fn test_in_scope_ranges_nested() {
     assert_eq!(in_scope.len(), 0, "Const has no ranges in scope initially");
 
     // After ending range2, only range1 should be in scope
-    let after_end2 = UOp::end(compute.clone(), smallvec![range2.clone()]);
+    let after_end2 = compute.end(smallvec![range2.clone()]);
     let in_scope_after = after_end2.in_scope_ranges();
     assert_eq!(in_scope_after.len(), 0, "After END, ranges are not propagated to parent");
 }

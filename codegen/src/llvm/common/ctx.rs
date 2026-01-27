@@ -68,7 +68,7 @@ impl RenderContext {
 
     /// Render a vector constant.
     fn render_vconst(&self, values: &[ConstValue], uop: &Arc<UOp>) -> String {
-        let scalar_type = ldt(&morok_dtype::DType::Scalar(uop.dtype().base()));
+        let scalar_type = ldt(&uop.dtype().scalar_dtype());
 
         // Format as LLVM vector constant: <type val, type val, ...>
         let elements: Vec<String> = values

@@ -54,7 +54,7 @@ fn test_remove_noop_in_pipeline() {
 fn test_get_contiguous_in_pipeline() {
     // Create a computation with CONTIGUOUS marker
     let value = UOp::native_const(42.0f32);
-    let contiguous = UOp::contiguous(value.clone());
+    let contiguous = value.contiguous();
 
     // Pattern should remove the CONTIGUOUS marker
     let result = apply_codegen_patterns(&contiguous);
@@ -76,7 +76,7 @@ fn test_fix_after_broadcast_in_pipeline() {
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();
-    let after = UOp::after(expand, smallvec::smallvec![computation]);
+    let after = expand.after(smallvec::smallvec![computation]);
 
     // Pattern should unwrap EXPAND
     let result = apply_codegen_patterns(&after);
@@ -110,7 +110,7 @@ fn test_no_cycle_valid_access_pattern() {
 
     // STORE to output using INDEX node
     let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, computed);
+    let store = store_idx.store(computed);
 
     // Should not panic - valid access pattern
     #[allow(clippy::mutable_key_type)]
@@ -130,7 +130,7 @@ fn test_split_store_simple_kernel() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value);
+    let store = store_idx.store(value);
 
     // split_store may succeed if the STORE has no non-OUTER ranges in scope
     let result = call_split_store(&store);
@@ -154,12 +154,12 @@ fn test_split_store_with_loop_ranges() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value);
+    let store = store_idx.store(value);
 
     // Wrap in END with LOOP range
     let range_end = UOp::index_const(10);
     let loop_range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::end(store, vec![loop_range].into());
+    let end = store.end(vec![loop_range].into());
 
     // Try to split - behavior depends on has_non_outer_ranges() implementation
     let result = call_split_store(&end);
@@ -183,7 +183,7 @@ fn test_pattern_application_order() {
     let value = UOp::native_const(1.0f32);
 
     // Wrap in CONTIGUOUS (should be removed by get_contiguous)
-    let contiguous = UOp::contiguous(value);
+    let contiguous = value.contiguous();
 
     // In real pipeline, this would go through split_store
     // For now, verify pattern works via matcher
@@ -213,7 +213,7 @@ fn test_multiple_buffer_integration() {
 
     // STORE to output using INDEX node
     let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, sum);
+    let store = store_idx.store(sum);
 
     // Verify cycle detection works
     #[allow(clippy::mutable_key_type)]
@@ -231,12 +231,12 @@ fn test_end_store_structure() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value);
+    let store = store_idx.store(value);
 
     // Wrap in END (normal pipeline output)
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::end(store, vec![range].into());
+    let end = store.end(vec![range].into());
 
     // Verify END wraps STORE correctly before transformation
     if let Op::End { computation, .. } = end.op() {

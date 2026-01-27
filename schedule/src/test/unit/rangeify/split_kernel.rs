@@ -19,7 +19,7 @@ fn test_split_store_basic() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value);
+    let store = store_idx.store(value);
 
     // Try to split
     let result = call_split_store(&store);
@@ -55,9 +55,9 @@ fn test_split_store_end_operation() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value);
+    let store = store_idx.store(value);
     let range = UOp::range_const(10, 0);
-    let end = UOp::end(store.clone(), smallvec![range.clone()]);
+    let end = store.clone().end(smallvec![range.clone()]);
 
     // Try to split
     let result = call_split_store(&end);
@@ -94,7 +94,7 @@ fn test_split_store_end_non_store_returns_none() {
     // Create an END operation wrapping non-STORE (control flow marker)
     let noop = UOp::noop();
     let range = UOp::range_const(10, 0);
-    let end = UOp::end(noop, smallvec![range]);
+    let end = noop.end(smallvec![range]);
 
     // Try to split
     let result = call_split_store(&end);
@@ -110,7 +110,7 @@ fn test_split_store_creates_sink() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value.clone());
+    let store = store_idx.store(value.clone());
 
     let result = call_split_store(&store).unwrap();
 
@@ -168,7 +168,7 @@ fn test_split_store_preserves_computation() {
             _ => panic!("Unsupported dtype index"),
         };
         let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-        let store = UOp::store(store_idx, value.clone());
+        let store = store_idx.store(value.clone());
 
         let result = call_split_store(&store);
 
@@ -195,13 +195,13 @@ fn test_split_store_multiple_calls_independent() {
     let idx_offset1 = UOp::index_const(0);
     let value1 = UOp::native_const(1.0f32);
     let index1 = UOp::index().buffer(buffer1).indices(vec![idx_offset1]).call().unwrap();
-    let store1 = UOp::store(index1, value1);
+    let store1 = index1.store(value1);
 
     let buffer2 = UOp::new_buffer(DeviceSpec::Cpu, 200, DType::Float32);
     let idx_offset2 = UOp::index_const(0);
     let value2 = UOp::native_const(2.0f32);
     let index2 = UOp::index().buffer(buffer2).indices(vec![idx_offset2]).call().unwrap();
-    let store2 = UOp::store(index2, value2);
+    let store2 = index2.store(value2);
 
     // Split both
     let kernel1 = call_split_store(&store1).unwrap();
@@ -222,10 +222,10 @@ fn test_split_store_end_with_multiple_ranges() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value);
+    let store = store_idx.store(value);
     let range1 = UOp::range_const(4, 0);
     let range2 = UOp::range_const(8, 1);
-    let end = UOp::end(store.clone(), smallvec![range1.clone(), range2.clone()]);
+    let end = store.clone().end(smallvec![range1.clone(), range2.clone()]);
 
     let result = call_split_store(&end);
 
@@ -262,9 +262,9 @@ fn test_split_store_end_with_outer_range() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value);
+    let store = store_idx.store(value);
     let range_outer = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Outer);
-    let end = UOp::end(store, smallvec![range_outer]);
+    let end = store.end(smallvec![range_outer]);
 
     let result = call_split_store(&end);
 
@@ -280,10 +280,10 @@ fn test_split_store_end_with_mixed_ranges() {
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value);
+    let store = store_idx.store(value);
     let range_loop = UOp::range_const(4, 0);
     let range_outer = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), AxisType::Outer);
-    let end = UOp::end(store, smallvec![range_loop, range_outer]);
+    let end = store.end(smallvec![range_loop, range_outer]);
 
     let result = call_split_store(&end);
 
@@ -305,7 +305,7 @@ fn test_split_store_with_copy() {
     let output_buffer = UOp::new_buffer(DeviceSpec::Cuda { device_id: 0 }, 100, DType::Float32);
     let const_idx = UOp::index_const(0);
     let store_idx = UOp::index().buffer(output_buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, copy.clone());
+    let store = store_idx.store(copy.clone());
 
     let result = call_split_store(&store);
 
@@ -324,13 +324,13 @@ fn test_split_store_with_copy() {
 fn test_split_store_with_buffer_view() {
     // Create a BUFFER_VIEW operation with proper BUFFER
     let base_buffer = UOp::new_buffer(DeviceSpec::Cpu, 512, DType::Float32);
-    let buffer_view = UOp::buffer_view(base_buffer, 256, 128);
+    let buffer_view = base_buffer.view(256, 128);
 
     // Create STORE using the BUFFER_VIEW result with proper BUFFER
     let output_buffer = UOp::new_buffer(DeviceSpec::Cpu, 256, DType::Float32);
     let const_idx = UOp::index_const(0);
     let store_idx = UOp::index().buffer(output_buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, buffer_view.clone());
+    let store = store_idx.store(buffer_view.clone());
 
     let result = call_split_store(&store);
 
@@ -361,7 +361,7 @@ fn test_split_store_normal_computation_uses_sink() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let const_idx = UOp::index_const(0);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, value.clone());
+    let store = store_idx.store(value.clone());
 
     let result = call_split_store(&store);
 
@@ -393,10 +393,10 @@ fn test_split_store_nested_copy_in_store() {
     let output_buffer = UOp::new_buffer(DeviceSpec::Cuda { device_id: 0 }, 100, DType::Float32);
     let const_idx = UOp::index_const(0);
     let store_idx = UOp::index().buffer(output_buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, copy.clone());
+    let store = store_idx.store(copy.clone());
 
     let range = UOp::range_const(10, 0);
-    let end = UOp::end(store, smallvec![range]);
+    let end = store.end(smallvec![range]);
 
     let result = call_split_store(&end);
 
@@ -438,7 +438,7 @@ fn test_split_store_copy_precedence_documented() {
     let output_buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let const_idx = UOp::index_const(0);
     let store_idx = UOp::index().buffer(output_buffer).indices(vec![const_idx]).call().unwrap();
-    let store = UOp::store(store_idx, copy2.clone());
+    let store = store_idx.store(copy2.clone());
 
     let result = call_split_store(&store);
 

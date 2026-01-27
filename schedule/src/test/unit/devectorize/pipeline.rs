@@ -40,7 +40,7 @@ fn test_devectorize_contiguous_store() {
     let buffer = create_buffer(64);
     let value = create_vector_float_iota(4);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let store = UOp::store(index, value);
+    let store = index.store(value);
 
     let result = apply_devectorize(&store);
 
@@ -109,7 +109,7 @@ fn test_devectorize_reduction_accumulator() {
 
     // Store back
     let store_index = create_vector_index_iota(buffer.clone(), 4);
-    let store = UOp::store(store_index, add);
+    let store = store_index.store(add);
 
     let result = apply_devectorize(&store);
 
@@ -139,7 +139,7 @@ fn test_devectorize_multiple_buffers() {
 
     // Store to C
     let index_c = create_vector_index_iota(buffer_c.clone(), 4);
-    let store = UOp::store(index_c, add);
+    let store = index_c.store(add);
 
     let result = apply_devectorize(&store);
 
@@ -168,7 +168,7 @@ fn test_devectorize_after_pre_expand() {
     let add = UOp::new(Op::Binary(BinaryOp::Add, load, value), DType::Float32.vec(4));
 
     let store_index = create_vector_index_iota(buffer.clone(), 4);
-    let store = UOp::store(store_index, add);
+    let store = store_index.store(add);
 
     // Apply devectorize
     let result = apply_devectorize(&store);
@@ -187,7 +187,7 @@ fn test_devectorize_with_output_upcast() {
     // Create output upcast pattern: store vec8 to consecutive locations
     let index = create_vector_index_iota(buffer.clone(), 8);
     let value = create_vector_float_iota(8);
-    let store = UOp::store(index, value);
+    let store = index.store(value);
 
     let result = apply_devectorize(&store);
 
@@ -261,12 +261,12 @@ fn test_devectorize_sink_multiple_stores() {
     // Store to A
     let index_a = create_vector_index_iota(buffer_a.clone(), 4);
     let value_a = create_vector_float_iota(4);
-    let store_a = UOp::store(index_a, value_a);
+    let store_a = index_a.store(value_a);
 
     // Store to B
     let index_b = create_vector_index_iota(buffer_b.clone(), 4);
     let value_b = create_vector_float_values(vec![10.0, 11.0, 12.0, 13.0]);
-    let store_b = UOp::store(index_b, value_b);
+    let store_b = index_b.store(value_b);
 
     // SINK both stores
     let sink = UOp::sink(vec![store_a, store_b]);

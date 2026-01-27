@@ -511,7 +511,7 @@ mod tests {
         let end_val = UOp::index_const(10);
         let range = UOp::range(end_val, 0);
         let value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let end = UOp::end(value, smallvec![range.clone()]);
+        let end = value.end(smallvec![range.clone()]);
         let sink = UOp::sink(vec![end]);
 
         let result = linearize(sink);

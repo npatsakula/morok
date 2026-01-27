@@ -109,7 +109,7 @@ fn test_distribute_ptrcat_store() {
     let idx1 = create_index(buffer.clone(), 0);
     let idx2 = create_index(buffer.clone(), 1);
     let ptrcat = UOp::ptrcat().sources(vec![idx1, idx2]).call();
-    let store = UOp::store(ptrcat, value);
+    let store = ptrcat.store(value);
 
     let result = apply_phase2(&store);
 
@@ -135,7 +135,7 @@ fn test_distribute_ptrcat_store_quad() {
 
     let indices: Vec<Arc<UOp>> = (0..4).map(|i| create_index(buffer.clone(), i)).collect();
     let ptrcat = UOp::ptrcat().sources(indices).call();
-    let store = UOp::store(ptrcat, value);
+    let store = ptrcat.store(value);
 
     let result = apply_phase2(&store);
 
@@ -233,7 +233,7 @@ fn test_split_store_vec8() {
     let vec8_ptr_dtype = DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global);
     let cast_idx = idx.cast(vec8_ptr_dtype);
 
-    let store = UOp::store(cast_idx, value);
+    let store = cast_idx.store(value);
 
     let result = apply_phase2(&store);
 
@@ -273,7 +273,7 @@ fn test_split_preserves_ranges() {
         DType::Index,
     );
 
-    let store = UOp::store_with_ranges(cast_idx, value, smallvec![range.clone()]);
+    let store = cast_idx.store_with_ranges(value, smallvec![range.clone()]);
 
     let result = apply_phase2(&store);
 
@@ -325,7 +325,7 @@ fn test_store_after_expand_index() {
     let buffer = create_buffer(64);
     let value = create_vector_float_iota(4);
     let index = create_vector_index_iota(buffer.clone(), 4);
-    let store = UOp::store(index, value);
+    let store = index.store(value);
 
     let after_phase1 = apply_phase1(&store);
     let result = apply_phase2(&after_phase1);

@@ -210,15 +210,15 @@ impl UOp {
 
     /// Square: x².
     #[track_caller]
-    pub fn square(operand: Arc<Self>) -> Arc<Self> {
-        let dtype = operand.dtype();
-        Self::new(Op::Unary(UnaryOp::Square, operand), dtype)
+    pub fn square(self: &Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Unary(UnaryOp::Square, self.clone()), dtype)
     }
 
     /// Sign: -1 for negative, 0 for zero, 1 for positive.
-    pub fn sign(operand: Arc<Self>) -> Arc<Self> {
-        let dtype = operand.dtype();
-        Self::new(Op::Unary(UnaryOp::Sign, operand), dtype)
+    pub fn sign(self: &Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Unary(UnaryOp::Sign, self.clone()), dtype)
     }
 
     // =========================================================================
@@ -250,10 +250,10 @@ impl UOp {
 
     /// Error function: erf(x) - requires float dtype.
     #[track_caller]
-    pub fn erf(operand: Arc<Self>) -> Result<Arc<Self>> {
-        let dtype = operand.dtype();
+    pub fn erf(self: &Arc<Self>) -> Result<Arc<Self>> {
+        let dtype = self.dtype();
         ensure!(dtype.is_float(), InvalidDTypeForUnaryOpSnafu { operation: UnaryOp::Erf, dtype });
-        Ok(Self::new(Op::Unary(UnaryOp::Erf, operand), dtype))
+        Ok(Self::new(Op::Unary(UnaryOp::Erf, self.clone()), dtype))
     }
 
     /// Reciprocal: 1/x - requires float dtype.

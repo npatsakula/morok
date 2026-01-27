@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, UOp, WmmaMetadata};
+use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, WmmaMetadata};
 use tracing::debug;
 
 use crate::TypedPatternMatcher;
@@ -76,7 +76,7 @@ pub fn bool_storage_patterns() -> TypedPatternMatcher {
         // STORE bool: cast to uint8 before storing
         Store { index, value, ranges } if value.dtype().base().is_bool() => {
             let uint8_dtype = value.dtype().with_base(ScalarDType::UInt8);
-            Some(UOp::store_with_ranges(index.clone(), value.cast(uint8_dtype), ranges.clone()))
+            Some(index.store_with_ranges(value.cast(uint8_dtype), ranges.clone()))
         },
 
         // LOAD bool: load as uint8, then cast to bool
@@ -96,20 +96,16 @@ pub fn pm_render() -> TypedPatternMatcher {
         c @ Const(_) if c.dtype().vcount() > 1 => |c| {
             let vcount = c.dtype().vcount();
             let Op::Const(cv) = c.op() else { return None };
-            let result_dtype = DType::Scalar(c.dtype().base());
-            let scalar_const = UOp::const_(result_dtype, cv.0);
-            let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
-                .map(|_| scalar_const.clone())
-                .collect();
+            let scalar_const = UOp::const_(c.dtype().scalar_dtype(), cv.0);
+            let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|_| scalar_const.clone()).collect();
             Some(UOp::vectorize(elements))
         },
 
         // VCONST → VECTORIZE of scalar CONSTs (devectorizer.py:262)
         vc @ VConst { values } => |vc, values| {
-            // VConst stores different values per lane - convert each to scalar CONST
-            let result_dtype = DType::Scalar(vc.dtype().base());
+            let scalar_dtype = vc.dtype().scalar_dtype();
             let elements: SmallVec<[Arc<UOp>; 4]> = values.iter()
-                .map(|v| UOp::const_(result_dtype.clone(), *v))
+                .map(|v| UOp::const_(scalar_dtype.clone(), *v))
                 .collect();
             Some(UOp::vectorize(elements))
         },
@@ -219,90 +215,62 @@ fn is_identity_gep(vector: &Arc<UOp>, indices: &[usize]) -> bool {
 // ALU Devectorization
 // ============================================================================
 
+/// Generic ALU devectorization: Vector ALU → VECTORIZE of scalar ALU.
+///
+/// Mirrors Tinygrad's `no_vectorized_alu` (devectorizer.py:219-223):
+/// ```python
+/// alus = tuple(UOp(alu.op, alu.dtype.scalar(), tuple(s.gep(i) for s in alu.src), alu.arg)
+///              for i in range(alu.dtype.vcount))
+/// return UOp(Ops.VECTORIZE, alu.dtype, alus)
+/// ```
+fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let vcount = alu.dtype().vcount();
+    if vcount <= 1 {
+        return None;
+    }
+
+    // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:221)
+    if let Op::Ternary(TernaryOp::Where, _, _, f) = alu.op() {
+        if matches!(f.op(), Op::Invalid) {
+            return None;
+        }
+    }
+
+    let scalar_dtype = alu.dtype().scalar_dtype();
+    let sources = alu.op().sources();
+
+    let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+        .map(|i| {
+            // Apply GEP to each source, broadcasting scalars
+            let new_sources: Vec<Arc<UOp>> =
+                sources.iter().map(|s| if s.dtype().vcount() > 1 { s.gep(vec![i]) } else { s.clone() }).collect();
+            alu.replace().dtype(scalar_dtype.clone()).src(new_sources).call()
+        })
+        .collect();
+
+    Some(UOp::vectorize(elements))
+}
+
 /// Vector ALU → VECTORIZE of scalar ALU (devectorizer.py:219-223).
 /// LLVM SLP can re-vectorize when beneficial.
+#[allow(unused_variables)]
 pub fn no_vectorized_alu() -> TypedPatternMatcher {
     crate::patterns! {
+        // All binary ops
         for op in binary [*] {
-            result @ op(lhs, rhs) if result.dtype().vcount() > 1 => |result, lhs, rhs| {
-                let vcount = result.dtype().vcount();
-                let result_dtype = result.dtype().scalar().map(DType::Scalar)?;
-                let alus: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
-                    let gep_lhs = lhs.gep(vec![i]);
-                    let gep_rhs = rhs.gep(vec![i]);
-                    UOp::new(Op::Binary(op, gep_lhs, gep_rhs), result_dtype.clone())
-                }).collect();
-                Some(UOp::vectorize(alus))
-            },
+            alu @ op(_, _) if alu.dtype().vcount() > 1 => devectorize_alu(alu),
         },
-
+        // All unary ops
         for op in unary [*] {
-            result @ op(src) if result.dtype().vcount() > 1 => |result, src| {
-                let vcount = result.dtype().vcount();
-                let result_dtype = result.dtype().scalar().map(DType::Scalar)?;
-                let alus: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
-                    let gep_src = src.gep(vec![i]);
-                    UOp::new(Op::Unary(op, gep_src), result_dtype.clone())
-                }).collect();
-                Some(UOp::vectorize(alus))
-            },
+            alu @ op(_) if alu.dtype().vcount() > 1 => devectorize_alu(alu),
         },
-
-        Cast { src, .. } if src.dtype().vcount() > 1 => |src| {
-            let vcount = src.dtype().vcount();
-            let src_result_dtype = src.dtype().scalar().map(DType::Scalar)?;
-            let casts: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
-                let gep_src = src.gep(vec![i]);
-                gep_src.cast(src_result_dtype.clone())
-            }).collect();
-            Some(UOp::vectorize(casts))
+        // All ternary ops (Where, MulAcc)
+        for op in ternary [*] {
+            alu @ op(_, _, _) if alu.dtype().vcount() > 1 => devectorize_alu(alu),
         },
-
-        // BITCAST devectorization (Tinygrad devectorizer.py:254 includes BITCAST)
-        BitCast { src, dtype } if src.dtype().vcount() > 1 => |src, dtype| {
-            let vcount = src.dtype().vcount();
-            let result_dtype = dtype.scalar().map(DType::Scalar)?;
-            let bitcasts: SmallVec<[Arc<UOp>; 4]> = (0..vcount).map(|i| {
-                let gep_src = src.gep(vec![i]);
-                gep_src.bitcast(result_dtype.clone())
-            }).collect();
-            Some(UOp::vectorize(bitcasts))
-        },
-
-        // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:221)
-        Where(cond, t, f) if cond.dtype().vcount() > 1 && !matches!(f.op(), Op::Invalid) => |cond, t, f| {
-            let vcount = cond.dtype().vcount();
-            let t_vcount = t.dtype().vcount();
-            let f_vcount = f.dtype().vcount();
-
-            let scalar_wheres: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
-                .map(|i| {
-                    let cond_elem = cond.gep(vec![i]);
-                    let t_elem = if t_vcount > 1 { t.gep(vec![i]) } else { t.clone() };
-                    let f_elem = if f_vcount > 1 { f.gep(vec![i]) } else { f.clone() };
-                    UOp::try_where(cond_elem, t_elem, f_elem).expect("WHERE construction should succeed")
-                })
-                .collect();
-            Some(UOp::vectorize(scalar_wheres))
-        },
-
-        // MulAcc (FMA) - required for matmul tiling with split_load
-        MulAcc(a, b, c) if a.dtype().vcount() > 1 => |a, b, c| {
-            let vcount = a.dtype().vcount();
-            let a_vcount = a.dtype().vcount();
-            let b_vcount = b.dtype().vcount();
-            let c_vcount = c.dtype().vcount();
-
-            let scalar_mulaccs: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
-                .map(|i| {
-                    let a_elem = if a_vcount > 1 { a.gep(vec![i]) } else { a.clone() };
-                    let b_elem = if b_vcount > 1 { b.gep(vec![i]) } else { b.clone() };
-                    let c_elem = if c_vcount > 1 { c.gep(vec![i]) } else { c.clone() };
-                    UOp::try_mulacc(a_elem, b_elem, c_elem).expect("MulAcc construction should succeed")
-                })
-                .collect();
-            Some(UOp::vectorize(scalar_mulaccs))
-        },
+        // Cast and BitCast
+        alu @ Cast { src: _, .. } if alu.dtype().vcount() > 1 => devectorize_alu(alu),
+        alu @ BitCast { src: _, .. } if alu.dtype().vcount() > 1 => devectorize_alu(alu),
     }
 }
 
@@ -395,7 +363,7 @@ fn cast_after_pattern() -> TypedPatternMatcher {
     crate::patterns! {
         After { passthrough: Cast { src, dtype }, deps }
             => |src, dtype, deps| {
-                let new_after = UOp::after(src.clone(), deps.clone());
+                let new_after = src.after(deps.clone());
                 Some(new_after.cast(dtype.clone()))
             },
     }
@@ -618,14 +586,13 @@ pub fn pm_add_loads() -> TypedPatternMatcher {
         // Skip if dtype is already Ptr (devectorizer.py:322-323)
         idx @ Index { buffer, .. } if !is_ptr_or_image_dtype(&idx.dtype()) => {
             let new_idx = idx.with_dtype(buffer.dtype());
-            let load_dtype = DType::Scalar(idx.dtype().base());
-            Some(UOp::load().buffer(buffer.clone()).index(new_idx).dtype(load_dtype).call())
+            Some(UOp::load().buffer(buffer.clone()).index(new_idx).dtype(idx.dtype().scalar_dtype()).call())
         },
 
         // Remove LOAD wrapper from STORE: STORE(LOAD(x), ...) → STORE(x, ...)
         // (devectorizer.py:325)
         Store { index: Load { index: inner_idx, .. }, value, ranges }
-            => Some(UOp::store_with_ranges(inner_idx.clone(), value.clone(), ranges.clone())),
+            => Some(inner_idx.store_with_ranges(value.clone(), ranges.clone())),
     }
 }
 
@@ -782,29 +749,17 @@ fn is_vector_index(uop: &Arc<UOp>) -> bool {
 ///
 /// Tinygrad (devectorizer.py:117-118):
 /// ```python
-/// (UPat(Ops.LOAD, src=(UPat(Ops.GEP, name="gep"),), name="ld", allow_any_len=True),
-///  lambda gep, ld: ld.replace(dtype=ld.dtype.scalar().vec(gep.dtype.count), src=(gep.src[0],)+ld.src[1:]).gep(gep.arg))
+/// lambda gep, ld: ld.replace(dtype=ld.dtype.scalar().vec(gep.dtype.count),
+///                            src=(gep.src[0],)+ld.src[1:]).gep(gep.arg)
 /// ```
-///
-/// Inner LOAD dtype = load.dtype.scalar().vec(gep.dtype.count)
-/// Note: Morok's scalar() only works on Scalar dtypes, so we use base() which works on both.
 fn move_gep_after_load(
     load: &Arc<UOp>,
     buffer: &Arc<UOp>,
     gep_inner: &Arc<UOp>,
     gep_indices: &[usize],
 ) -> Option<Arc<UOp>> {
-    let gep_count = gep_indices.len();
-    // Tinygrad: ld.dtype.scalar().vec(gep.dtype.count)
-    // Use base() instead of scalar() - load.dtype() may be Vector, not Scalar
-    let scalar_base = load.dtype().base();
-    let inner_load_dtype = if gep_count > 1 {
-        DType::Vector { scalar: scalar_base, count: gep_count }
-    } else {
-        DType::Scalar(scalar_base)
-    };
-
-    let inner_load = UOp::load().buffer(buffer.clone()).index(gep_inner.clone()).dtype(inner_load_dtype).call();
+    let new_dtype = load.dtype().scalar_dtype().vec(gep_indices.len());
+    let inner_load = load.replace().dtype(new_dtype).src(vec![buffer.clone(), gep_inner.clone()]).call();
     Some(inner_load.gep(gep_indices.to_vec()))
 }
 
@@ -821,7 +776,7 @@ fn move_gep_on_store(
     let inverse_indices: Vec<usize> = inverse_map.iter().map(|&(_, i)| i).collect();
 
     let reordered_value = value.gep(inverse_indices);
-    Some(UOp::store_with_ranges(gep_inner.clone(), reordered_value, ranges.clone()))
+    Some(gep_inner.store_with_ranges(reordered_value, ranges.clone()))
 }
 
 // ============================================================================
@@ -1008,7 +963,7 @@ fn distribute_ptrcat_store(
 
         let gep_indices: Vec<usize> = (offset..offset + ptr_count).collect();
         let store_value = value.gep(gep_indices);
-        stores.push(UOp::store_with_ranges(ptr.clone(), store_value, ranges.clone()));
+        stores.push(ptr.store_with_ranges(store_value, ranges.clone()));
         offset += ptr_count;
     }
 
@@ -1061,9 +1016,8 @@ fn split_load(buffer: &Arc<UOp>, idx: &Arc<UOp>, cast_dtype: &DType) -> Option<A
 
     tracing::debug!(sz = sz, "split_load");
 
-    let scalar_base = buffer.dtype().base();
-    let load_dtype = DType::Vector { scalar: scalar_base, count: sz };
-    let mut lengths = get_device_fold_lengths(&load_dtype);
+    let scalar_dtype = buffer.dtype().scalar_dtype();
+    let mut lengths = get_device_fold_lengths(&scalar_dtype.vec(sz));
 
     if let Some(offset) = indices.first() {
         lengths.retain(|&len| offset_divides_evenly(offset, len));
@@ -1083,11 +1037,7 @@ fn split_load(buffer: &Arc<UOp>, idx: &Arc<UOp>, cast_dtype: &DType) -> Option<A
 
             let chunk_idx = if pos == 0 { idx.clone() } else { offset_index(idx, pos as i64) };
             let chunk_ptr = if fold_len > 1 { chunk_idx.cast(make_vec_ptr_dtype(buffer, fold_len)) } else { chunk_idx };
-            let chunk_dtype = if fold_len > 1 {
-                DType::Vector { scalar: scalar_base, count: fold_len }
-            } else {
-                DType::Scalar(scalar_base)
-            };
+            let chunk_dtype = scalar_dtype.vec(fold_len);
 
             chunks.push(UOp::load().buffer(buffer.clone()).index(chunk_ptr).dtype(chunk_dtype).call());
             pos += fold_len;
@@ -1099,8 +1049,7 @@ fn split_load(buffer: &Arc<UOp>, idx: &Arc<UOp>, cast_dtype: &DType) -> Option<A
         return None;
     }
 
-    let cat_dtype = DType::Vector { scalar: scalar_base, count: sz };
-    Some(UOp::cat().sources(chunks).dtype(cat_dtype).call())
+    Some(UOp::cat().sources(chunks).dtype(scalar_dtype.vec(sz)).call())
 }
 
 fn split_store(
@@ -1161,7 +1110,7 @@ fn split_store(
                 if fold_len > 1 { chunk_idx.cast(make_vec_ptr_dtype(idx_buffer, fold_len)) } else { chunk_idx };
             let gep_indices: Vec<usize> = (pos..pos + fold_len).collect();
             let chunk_value = value.gep(gep_indices);
-            stores.push(UOp::store_with_ranges(chunk_ptr, chunk_value, ranges.clone()));
+            stores.push(chunk_ptr.store_with_ranges(chunk_value, ranges.clone()));
 
             pos += fold_len;
             break;
@@ -1314,7 +1263,7 @@ pub fn pm_flatten_range() -> TypedPatternMatcher {
                 // All ranges were non-RANGE (e.g., all CONST) - unwrap END
                 Some(computation.clone())
             } else {
-                Some(UOp::end(computation.clone(), actual_ranges))
+                Some(computation.end(actual_ranges))
             }
         },
 
@@ -1330,7 +1279,7 @@ pub fn pm_flatten_range() -> TypedPatternMatcher {
                 "pm_flatten_range: filtering REDUCE ranges"
             );
 
-            Some(UOp::reduce(src.clone(), actual_ranges, *reduce_op).with_dtype(reduce.dtype()))
+            Some(src.reduce(actual_ranges, *reduce_op).with_dtype(reduce.dtype()))
         },
 
         // STORE: Filter ranges to only RANGE ops
@@ -1346,7 +1295,7 @@ pub fn pm_flatten_range() -> TypedPatternMatcher {
                 "pm_flatten_range: filtering STORE ranges"
             );
 
-            Some(UOp::store_with_ranges(index.clone(), value.clone(), actual_ranges))
+            Some(index.store_with_ranges(value.clone(), actual_ranges))
         },
     }
 }
@@ -1433,7 +1382,7 @@ fn reduce_to_acc(
     } else {
         // Has outer ranges: acc.after(*input_ranges).index(0).store(identity)
         let idx_init = UOp::index()
-            .buffer(UOp::after(acc.clone(), input_ranges))
+            .buffer(acc.after(input_ranges))
             .indices(vec![zero_idx.clone()])
             .call()
             .expect("ICE: unable to create index")
@@ -1445,7 +1394,7 @@ fn reduce_to_acc(
     // acc.after(store_init, *reduce_range).index(0)
     let mut loop_deps: SmallVec<[Arc<UOp>; 4]> = smallvec::smallvec![store_init.clone()];
     loop_deps.extend(ranges.iter().cloned());
-    let acc_inside_loop = UOp::after(acc.clone(), loop_deps);
+    let acc_inside_loop = acc.after(loop_deps);
     let idx_loop = UOp::index()
         .buffer(acc_inside_loop.clone())
         .indices(vec![zero_idx.clone()])
@@ -1457,10 +1406,10 @@ fn reduce_to_acc(
     // 8. Store new value back to accumulator (idx_loop contains the INDEX, not acc directly)
     let store_loop = idx_loop.store_value(new_val);
     // 9. End the reduce ranges after the store
-    let end = UOp::end(store_loop.clone(), ranges.clone());
+    let end = store_loop.end(ranges.clone());
     // 10. Final value AFTER loop completes
     // acc.after(end).index(0)
-    let acc_after_end = UOp::after(acc.clone(), smallvec::smallvec![end.clone()]);
+    let acc_after_end = acc.after(smallvec::smallvec![end.clone()]);
     let idx_final =
         UOp::index().buffer(acc_after_end.clone()).indices(vec![zero_idx]).call().expect("ICE: unable to build index");
 

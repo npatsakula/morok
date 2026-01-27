@@ -25,7 +25,7 @@ fn test_range_end_basic() {
 
     // End the loop - END wraps computation and references the range
     let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
-    let end_op = UOp::end(noop, ranges);
+    let end_op = noop.end(ranges);
 
     // Wrap in SINK
     let sink = UOp::sink(vec![end_op]);
@@ -67,11 +67,11 @@ fn test_reduce_add_basic() {
     let range =
         UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(10)), AxisId::Renumbered(0), AxisType::Reduce);
 
-    let reduce = UOp::reduce(const_val, smallvec::smallvec![range.clone()], ReduceOp::Add);
+    let reduce = const_val.reduce(smallvec::smallvec![range.clone()], ReduceOp::Add);
 
     // END op closes the loop - required for proper codegen
     let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
-    let end_op = UOp::end(reduce, ranges);
+    let end_op = reduce.end(ranges);
 
     // Wrap in SINK
     let sink = UOp::sink(vec![end_op]);
@@ -103,11 +103,11 @@ fn test_reduce_max() {
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(3.0));
     let range = UOp::range_axis(UOp::const_(DType::Index, ConstValue::Int(5)), AxisId::Renumbered(0), AxisType::Reduce);
 
-    let reduce = UOp::reduce(const_val, smallvec::smallvec![range.clone()], ReduceOp::Max);
+    let reduce = const_val.reduce(smallvec::smallvec![range.clone()], ReduceOp::Max);
 
     // END op closes the loop
     let ranges: SmallVec<[_; 4]> = smallvec::smallvec![range];
-    let end_op = UOp::end(reduce, ranges);
+    let end_op = reduce.end(ranges);
     let sink = UOp::sink(vec![end_op]);
 
     let result = render(&sink, Some("test_reduce_max"));
@@ -125,7 +125,7 @@ fn test_reduce_max() {
 fn test_reduce_empty_ranges() {
     // Create reduction with empty ranges - should just return source
     let const_val = UOp::const_(DType::Float32, ConstValue::Float(42.0));
-    let reduce = UOp::reduce(const_val, smallvec::smallvec![], ReduceOp::Add);
+    let reduce = const_val.reduce(smallvec::smallvec![], ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let result = render(&sink, Some("test_reduce_empty"));

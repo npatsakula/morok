@@ -99,7 +99,7 @@ fn test_keep_bufferize_expensive() {
 fn test_remove_bufferize_contiguous() {
     // BUFFERIZE(CONTIGUOUS(x), ranges) should be removed (always-run op)
     let x = UOp::var("x", DType::Float32, 0, 100);
-    let contiguous = UOp::contiguous(x);
+    let contiguous = x.contiguous();
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(contiguous.clone(), vec![range]);
@@ -116,7 +116,7 @@ fn test_remove_bufferize_copy() {
     // BUFFERIZE(COPY(x, device), ranges) should be removed (always-run op)
     let x = UOp::var("x", DType::Float32, 0, 100);
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
-    let copy = UOp::copy(x, device);
+    let copy = x.copy(device);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(copy.clone(), vec![range]);

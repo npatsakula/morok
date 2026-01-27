@@ -150,7 +150,7 @@ fn test_copy_const_folding() {
     let const_val = create_const(99);
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
 
-    let copy = UOp::copy(const_val.clone(), device);
+    let copy = const_val.copy(device);
 
     let matcher = buffer_folding();
     let result = graph_rewrite_top_down(&matcher, copy, &mut ());
@@ -168,7 +168,7 @@ fn test_copy_const_different_devices() {
 
     for device_spec in devices {
         let device = UOp::device(device_spec);
-        let copy = UOp::copy(const_val.clone(), device);
+        let copy = const_val.copy(device);
 
         let matcher = buffer_folding();
         let result = graph_rewrite_top_down(&matcher, copy, &mut ());

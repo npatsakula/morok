@@ -85,7 +85,7 @@ fn test_scheduler_helper_properties() {
 
     // Create a simple reduction: value to reduce
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value.clone(), vec![r_reduce.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.clone().reduce(vec![r_reduce.clone()].into(), ReduceOp::Add);
 
     // Wrap in sink with all ranges
     let sink = UOp::sink(vec![reduce_op, r_global, r_local, r_reduce]);
@@ -227,7 +227,7 @@ fn test_scheduler_unrollable_dims() {
 
     // Create reduction
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value, vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.reduce(vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_global, r_reduce1, r_reduce2, r_reduce_size1]);
 
@@ -253,7 +253,7 @@ fn test_scheduler_real_axis() {
     let r_reduce2 = UOp::range_axis(end_16, AxisId::Renumbered(3), AxisType::Reduce);
 
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value, vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.reduce(vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_global, r_loop, r_reduce1, r_reduce2]);
 
@@ -298,7 +298,7 @@ fn test_scheduler_colored_shape() {
     let r_upcast = UOp::range_axis(end_4, AxisId::Renumbered(3), AxisType::Upcast);
 
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value, vec![r_reduce.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.reduce(vec![r_reduce.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_global, r_local, r_reduce, r_upcast]);
 
@@ -361,7 +361,7 @@ fn test_scheduler_display_complex() {
     let r_unroll = UOp::range_axis(end_8, AxisId::Renumbered(5), AxisType::Unroll);
 
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value, vec![r_reduce.clone(), r_unroll.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.reduce(vec![r_reduce.clone(), r_unroll.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_loop, r_global, r_local, r_reduce, r_upcast, r_unroll]);
 
@@ -792,7 +792,7 @@ fn test_local_invalid_axis_type() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cuda();
@@ -815,7 +815,7 @@ fn test_unroll_basic() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -848,7 +848,7 @@ fn test_unroll_axis_out_of_bounds() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -871,7 +871,7 @@ fn test_unroll_excessive_amount() {
     let r_reduce = UOp::range_axis(end_128, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -897,7 +897,7 @@ fn test_apply_opt_multiple_operations() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_global, r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_global, r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -1075,7 +1075,7 @@ fn test_swap_non_global_axis() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_global.clone(), r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_global.clone(), r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -1097,7 +1097,7 @@ fn test_group_basic() {
     let r_reduce = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cuda();
@@ -1124,7 +1124,7 @@ fn test_group_no_shared_memory() {
     let r_reduce = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -1200,7 +1200,7 @@ fn test_get_optimized_ast_reduce_kernel() {
     let r_upcast = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(3), AxisType::Upcast);
 
     let val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(val, vec![r_reduce.clone()].into(), ReduceOp::Add);
+    let reduce = val.reduce(vec![r_reduce.clone()].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, r_global, r_local, r_upcast]);
 
     let ren = Renderer::cuda();
@@ -1379,11 +1379,11 @@ fn test_flatten_ranges_store() {
     let r_reduce = UOp::range_axis(UOp::index_const(32), AxisId::Renumbered(0), AxisType::Reduce);
 
     let val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(val.clone(), vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = val.clone().reduce(vec![r_reduce].into(), ReduceOp::Add);
 
     // Create a STORE operation with the reduce as its value
     let index = UOp::index_const(0); // Dummy index
-    let store = UOp::store(index, reduce);
+    let store = index.store(reduce);
 
     let ren = Renderer::cuda();
     let scheduler = Scheduler::new(store, ren);

@@ -45,7 +45,7 @@ fn test_run_rangeify_simple_const() {
 fn test_run_rangeify_detach_removal() {
     // Test: DETACH should be removed by early_rewrites
     let x = UOp::native_const(1.0f32);
-    let detach = UOp::detach(x.clone());
+    let detach = x.detach();
 
     let result = run_rangeify(detach);
     assert!(result.is_ok(), "rangeify should succeed");
@@ -70,7 +70,7 @@ fn test_run_rangeify_detach_removal() {
 fn test_run_rangeify_contiguous_backward_removal() {
     // Test: CONTIGUOUS_BACKWARD should be removed
     let x = UOp::native_const(PI);
-    let contiguous = UOp::contiguous_backward(x.clone());
+    let contiguous = x.contiguous_backward();
 
     let rangeified = rangeify_unwrap(contiguous);
 
@@ -131,7 +131,7 @@ fn test_kernel_split_pipeline_simple_store() {
     let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(index, value);
+    let store = index.store(value);
 
     let (result, _context) = run_kernel_split_pipeline(store);
 
@@ -146,11 +146,11 @@ fn test_kernel_split_pipeline_with_end() {
     let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(index, value);
+    let store = index.store(value);
 
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::end(store, vec![range].into());
+    let end = store.end(vec![range].into());
 
     let (result, _context) = run_kernel_split_pipeline(end);
 
@@ -166,7 +166,7 @@ fn test_kernel_split_pipeline_load_store() {
     let index = UOp::index_const(0);
 
     let load = UOp::load().buffer(in_buf).index(index.clone()).call();
-    let store = UOp::store(index, load);
+    let store = index.store(load);
 
     let (result, _context) = run_kernel_split_pipeline(store);
 
@@ -185,7 +185,7 @@ fn test_kernel_split_pipeline_multiple_loads() {
     let load1 = UOp::load().buffer(buf1).index(index.clone()).call();
     let load2 = UOp::load().buffer(buf2).index(index.clone()).call();
     let sum = load1.try_add(&load2).unwrap();
-    let store = UOp::store(index, sum);
+    let store = index.store(sum);
 
     let (result, _context) = run_kernel_split_pipeline(store);
 
@@ -207,7 +207,7 @@ fn test_end_to_end_simple_computation() {
     // Step 2: Wrap in STORE
     let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
-    let store = UOp::store(index, sum);
+    let store = index.store(sum);
 
     // Step 3: Apply rangeify
     let rangeified = rangeify_unwrap(store);
@@ -226,12 +226,12 @@ fn test_end_to_end_with_ranges() {
     let buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(index, value);
+    let store = index.store(value);
 
     // Wrap in END with ranges
     let range_end = UOp::index_const(100);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::end(store, vec![range].into());
+    let end = store.end(vec![range].into());
 
     let rangeified = rangeify_unwrap(end);
     let (kernel, _context) = run_kernel_split_pipeline(rangeified);
@@ -330,7 +330,7 @@ fn test_pipeline_wide_tree() {
 fn test_pipeline_applies_early_rewrites_first() {
     // Test: early_rewrites should be applied before other patterns
     let x = UOp::native_const(1.0f32);
-    let detach = UOp::detach(x.clone());
+    let detach = x.detach();
 
     let rangeified = rangeify_unwrap(detach);
 
@@ -393,7 +393,7 @@ fn test_pipeline_reduce_unparented_add() {
 
     let const_val = UOp::native_const(5i32);
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(const_val, vec![range].into(), ReduceOp::Add);
+    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Add);
 
     let rangeified = rangeify_unwrap(reduce);
 
@@ -424,7 +424,7 @@ fn test_pipeline_reduce_unparented_max() {
 
     let const_val = UOp::native_const(42i32);
     let range = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(const_val.clone(), vec![range].into(), ReduceOp::Max);
+    let reduce = const_val.clone().reduce(vec![range].into(), ReduceOp::Max);
 
     let rangeified = rangeify_unwrap(reduce);
 
@@ -503,7 +503,7 @@ fn test_pipeline_reduction_optimizations_dont_break_graph() {
     let range2 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(1), AxisType::Reduce);
 
     // Create a multi-range reduction
-    let reduce = UOp::reduce(data, vec![range1, range2].into(), ReduceOp::Add);
+    let reduce = data.reduce(vec![range1, range2].into(), ReduceOp::Add);
 
     // Apply full pipeline
     let result = run_rangeify(reduce);
@@ -525,7 +525,7 @@ fn test_pipeline_reduce_collapse_constant() {
     // after symbolic simplification eliminates range dependency
     let const_val = UOp::native_const(42i32);
     let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
-    let reduce = UOp::reduce(const_val, vec![range].into(), ReduceOp::Add);
+    let reduce = const_val.reduce(vec![range].into(), ReduceOp::Add);
 
     let result = rangeify_unwrap(reduce);
 
@@ -542,7 +542,7 @@ fn test_pipeline_reduce_collapse_multiple_ranges() {
     let range1 = UOp::range_axis(UOp::index_const(5), AxisId::Renumbered(0), AxisType::Reduce);
     let range2 = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(1), AxisType::Reduce);
 
-    let reduce = UOp::reduce(const_val, vec![range1, range2].into(), ReduceOp::Add);
+    let reduce = const_val.reduce(vec![range1, range2].into(), ReduceOp::Add);
 
     let result = rangeify_unwrap(reduce);
 
@@ -559,7 +559,7 @@ fn test_pipeline_reduce_collapse_with_algebraic_simplification() {
 
     let range = UOp::range_axis(UOp::index_const(20), AxisId::Renumbered(0), AxisType::Reduce);
 
-    let reduce = UOp::reduce(x_plus_0, vec![range].into(), ReduceOp::Add);
+    let reduce = x_plus_0.reduce(vec![range].into(), ReduceOp::Add);
 
     let result = rangeify_unwrap(reduce);
 
@@ -578,7 +578,7 @@ fn test_pipeline_reduce_collapse_preserves_dependent_reductions() {
     let range_int = range.cast(DType::Int32);
     let src = range_int.try_add(&one).unwrap();
 
-    let reduce = UOp::reduce(src, vec![range].into(), ReduceOp::Add);
+    let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
 
     let result = rangeify_unwrap(reduce);
 
@@ -594,12 +594,12 @@ fn test_pipeline_reduce_collapse_different_ops() {
     let range = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(0), AxisType::Reduce);
 
     // Test with MAX
-    let reduce_max = UOp::reduce(const_val.clone(), vec![range.clone()].into(), ReduceOp::Max);
+    let reduce_max = const_val.clone().reduce(vec![range.clone()].into(), ReduceOp::Max);
     let result_max = rangeify_unwrap(reduce_max);
     assert_eq!(result_max.dtype(), DType::Float32, "MAX reduce should work");
 
     // Test with MIN
-    let reduce_min = UOp::reduce(const_val, vec![range].into(), ReduceOp::Min);
+    let reduce_min = const_val.reduce(vec![range].into(), ReduceOp::Min);
     let result_min = rangeify_unwrap(reduce_min);
     assert_eq!(result_min.dtype(), DType::Float32, "MIN reduce should work");
 }
@@ -615,7 +615,7 @@ fn test_pipeline_reduce_collapse_integration_with_unparented() {
     let range2 = UOp::range_axis(UOp::index_const(3), AxisId::Renumbered(1), AxisType::Reduce);
 
     // Const doesn't depend on either range
-    let reduce = UOp::reduce(const_val, vec![range1, range2].into(), ReduceOp::Add);
+    let reduce = const_val.reduce(vec![range1, range2].into(), ReduceOp::Add);
 
     let result = rangeify_unwrap(reduce);
 

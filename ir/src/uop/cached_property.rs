@@ -70,7 +70,7 @@ use crate::UOp;
 /// 3. Computes properties bottom-up, caching each result
 /// 4. Returns the final cached value
 ///
-/// ```rust
+/// ```ignore
 /// impl CachedProperty for MyProperty {
 ///     fn get(uop: &Arc<UOp>) -> &Self::Value {
 ///         // Fast path: already cached

@@ -69,15 +69,14 @@ impl UOp {
 
     /// End of range or reduce scope.
     ///
-    /// Wraps a computation and closes the specified ranges.
+    /// Wraps self (the computation) and closes the specified ranges.
     /// This marks the end of RANGE or REDUCE loops.
     ///
     /// # Arguments
     ///
-    /// * `computation` - The computation being performed (e.g., STORE)
     /// * `ranges` - The RANGE or REDUCE operations being closed
-    pub fn end(computation: Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        Self::new(Op::End { computation, ranges }, DType::Void)
+    pub fn end(self: &Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        Self::new(Op::End { computation: self.clone(), ranges }, DType::Void)
     }
 
     // =========================================================================
@@ -86,11 +85,11 @@ impl UOp {
 
     /// Insert a synchronization barrier.
     ///
-    /// `src` passes through; `deps` are operations that must complete before
+    /// Self passes through; `deps` are operations that must complete before
     /// any consumer of this barrier executes.
-    pub fn barrier(src: Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
-        let dtype = src.dtype();
-        Self::new(Op::Barrier { src, deps }, dtype)
+    pub fn barrier(self: &Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Barrier { src: self.clone(), deps }, dtype)
     }
 
     // =========================================================================
@@ -113,9 +112,9 @@ impl UOp {
     }
 
     /// Bind concrete value to symbolic variable.
-    pub fn bind(var: Arc<Self>, value: Arc<Self>) -> Arc<Self> {
-        let dtype = var.dtype();
-        Self::new(Op::Bind { var, value }, dtype)
+    pub fn bind(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Bind { var: self.clone(), value }, dtype)
     }
 
     // =========================================================================

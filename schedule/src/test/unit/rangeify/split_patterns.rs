@@ -40,7 +40,7 @@ fn test_unbind_kernel() {
     // Create a BIND operation
     let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
     let value = UOp::index_const(5);
-    let bind = UOp::bind(var.clone(), value);
+    let bind = var.bind(value);
 
     // Apply pattern via matcher
     let result = apply_patterns(&bind, &mut ctx);
@@ -143,7 +143,7 @@ fn test_handle_after() {
     // Create an AFTER operation
     let buffer = UOp::buffer_id(Some(0));
     let store = UOp::noop();
-    let after = UOp::after(buffer.clone(), smallvec::smallvec![store]);
+    let after = buffer.after(smallvec::smallvec![store]);
 
     // Apply pattern via matcher
     let result = apply_patterns(&after, &mut ctx);
@@ -220,7 +220,7 @@ fn test_handle_after_mstack_unwrap() {
 
     // Create AFTER wrapping MSTACK
     let store = UOp::noop();
-    let after = UOp::after(mstack, smallvec::smallvec![store]);
+    let after = mstack.after(smallvec::smallvec![store]);
 
     let result = apply_patterns(&after, &mut ctx);
 
@@ -242,7 +242,7 @@ fn test_handle_after_mselect_unwrap() {
 
     // Create AFTER wrapping MSELECT
     let store = UOp::noop();
-    let after = UOp::after(mselect, smallvec::smallvec![store]);
+    let after = mselect.after(smallvec::smallvec![store]);
 
     let result = apply_patterns(&after, &mut ctx);
 
@@ -354,7 +354,7 @@ fn test_handle_after_mstack_advanced() {
 
     // Create AFTER wrapping MSTACK
     // Note: AFTER has passthrough + deps, not src
-    let after = UOp::after(mstack.clone(), smallvec::SmallVec::new());
+    let after = mstack.after(smallvec::SmallVec::new());
 
     let result = apply_patterns(&after, &mut ctx);
 
@@ -562,7 +562,7 @@ fn test_handle_after_local_buffer_not_tracked() {
 
     // Wrap in AFTER operation
     let store = UOp::noop();
-    let after = UOp::after(local_buf.clone(), smallvec![store]);
+    let after = local_buf.after(smallvec![store]);
 
     // Apply pattern
     let result = apply_patterns(&after, &mut ctx);
@@ -589,7 +589,7 @@ fn test_handle_after_global_buffer_tracked() {
 
     // Wrap in AFTER operation
     let store = UOp::noop();
-    let after = UOp::after(global_buf.clone(), smallvec![store]);
+    let after = global_buf.after(smallvec![store]);
 
     // Apply pattern
     let result = apply_patterns(&after, &mut ctx);
@@ -621,7 +621,7 @@ fn test_handle_after_mstack_with_local_buffer() {
 
     // Wrap in AFTER
     let store = UOp::noop();
-    let after = UOp::after(mstack, smallvec![store]);
+    let after = mstack.after(smallvec![store]);
 
     // Apply pattern
     let result = apply_patterns(&after, &mut ctx);
@@ -653,7 +653,7 @@ fn test_handle_after_mselect_with_local_buffer() {
 
     // Wrap in AFTER
     let store = UOp::noop();
-    let after = UOp::after(mselect, smallvec![store]);
+    let after = mselect.after(smallvec![store]);
 
     // Apply pattern
     let result = apply_patterns(&after, &mut ctx);
@@ -686,8 +686,8 @@ fn test_handle_after_mixed_address_spaces() {
     // Wrap both in AFTER
     let store1 = UOp::noop();
     let store2 = UOp::noop();
-    let after_local = UOp::after(local_buf.clone(), smallvec![store1]);
-    let after_global = UOp::after(global_buf.clone(), smallvec![store2]);
+    let after_local = local_buf.after(smallvec![store1]);
+    let after_global = global_buf.after(smallvec![store2]);
 
     // Apply patterns to both and validate return values
     let result_local = apply_patterns(&after_local, &mut ctx);

@@ -26,7 +26,7 @@ fn test_cast_after_basic() {
     let cast = src.cast(DType::Float64);
 
     // AFTER(cast, [])
-    let after = UOp::after(cast.clone(), smallvec![]);
+    let after = cast.after(smallvec![]);
 
     // Apply pattern
     let result = apply_cast_after(&after);
@@ -54,7 +54,7 @@ fn test_cast_after_with_deps() {
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let dep = UOp::const_(DType::Int32, ConstValue::Int(42));
     let cast = src.cast(DType::Float64);
-    let after = UOp::after(cast, smallvec![dep.clone()]);
+    let after = cast.after(smallvec![dep.clone()]);
 
     let result = apply_cast_after(&after);
 
@@ -72,7 +72,7 @@ fn test_cast_after_with_deps() {
 #[test]
 fn test_after_without_cast_unchanged() {
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-    let after = UOp::after(src.clone(), smallvec![]);
+    let after = src.after(smallvec![]);
 
     let result = apply_cast_after(&after);
 
@@ -236,7 +236,7 @@ fn test_cast_after_in_full_pipeline() {
     let buffer = create_buffer(64);
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let cast = src.cast(DType::Float64);
-    let after = UOp::after(cast, smallvec![]);
+    let after = cast.after(smallvec![]);
 
     // Create a load that depends on the after
     let idx = create_index(buffer.clone(), 0);
