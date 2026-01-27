@@ -230,11 +230,10 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:221)
-    if let Op::Ternary(TernaryOp::Where, _, _, f) = alu.op() {
-        if matches!(f.op(), Op::Invalid) {
+    if let Op::Ternary(TernaryOp::Where, _, _, f) = alu.op()
+        && matches!(f.op(), Op::Invalid) {
             return None;
         }
-    }
 
     let scalar_dtype = alu.dtype().scalar_dtype();
     let sources = alu.op().sources();
