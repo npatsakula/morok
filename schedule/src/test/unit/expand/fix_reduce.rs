@@ -1,14 +1,15 @@
-//! Tests for fix_reduce_unroll (REDUCE with UNROLL/Upcast handling).
+//! Tests for fix_reduce_unroll (REDUCE with UNROLL handling).
 //!
-//! fix_reduce_unroll handles REDUCE operations with non-Range entries in their ranges:
-//! - Range(Unroll/Upcast) → move to CONTRACT wrapper
-//! - Arithmetic expressions from shift_to → extract the Reduce range
-//! - Sets Vector dtype for Upcast axes when output dimensions remain
+//! fix_reduce_unroll handles REDUCE operations with UNROLL ops in their ranges.
+//! After Phase 1 converts Range(Unroll/Upcast) → UNROLL ops, fix_reduce_unroll:
+//! - Partitions ranges into RANGE ops vs UNROLL ops
+//! - Moves UNROLL ops to CONTRACT wrapper on source
+//! - Returns REDUCE with only RANGE ops in ranges
 
 use super::helpers::*;
 use morok_dtype::DType;
 use morok_ir::types::ConstValue;
-use morok_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, UOp};
+use morok_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
 use smallvec::smallvec;
 
 // =============================================================================
@@ -118,55 +119,3 @@ fn test_fix_reduce_range_upcast() {
     }
 }
 
-// =============================================================================
-// Arithmetic Expression Tests
-// =============================================================================
-
-/// Test: REDUCE with nested Binary expression from shift_to.
-///
-/// Pattern: ADD(ADD(MUL(reduce_range, 4), range_upcast1), range_upcast2)
-#[test]
-fn test_fix_reduce_arithmetic_expr() {
-    // Create nested shift_to expression
-    let end = UOp::const_(DType::Index, ConstValue::Int(64));
-    let reduce_range = UOp::range_axis(end.clone(), AxisId::Renumbered(0), AxisType::Reduce);
-
-    // Inner shift_to: MUL(reduce_range, 4) + Range(Upcast)
-    let upcast_end = UOp::const_(DType::Index, ConstValue::Int(4));
-    let upcast_range = UOp::range_axis(upcast_end.clone(), AxisId::Renumbered(1), AxisType::Upcast);
-    let mul = UOp::new(
-        Op::Binary(BinaryOp::Mul, reduce_range.clone(), UOp::const_(DType::Index, ConstValue::Int(4))),
-        DType::Index,
-    );
-    let inner_add = UOp::new(Op::Binary(BinaryOp::Add, mul, upcast_range), DType::Index);
-
-    // Outer shift_to: inner_add + Range(Upcast)
-    let upcast_range2 = UOp::range_axis(upcast_end, AxisId::Renumbered(2), AxisType::Upcast);
-    let nested_binary = UOp::new(Op::Binary(BinaryOp::Add, inner_add, upcast_range2), DType::Index);
-
-    let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = src.reduce(smallvec![nested_binary], ReduceOp::Add);
-
-    // Apply expander
-    let result = expander_rewrite(&reduce);
-
-    // Should extract the reduce_range and handle upcast axes
-    // Note: fix_reduce_unroll extracts ranges from arithmetic expressions
-    // CONTRACT(Const) → VECTORIZE after do_contract
-    match result.op() {
-        Op::Reduce { src: fixed_src, ranges, .. } => {
-            // Source should be expanded (CONTRACT → VECTORIZE for Const source)
-            assert!(
-                matches!(fixed_src.op(), Op::Contract { .. } | Op::Vectorize { .. }),
-                "Source should be CONTRACT or VECTORIZE (expanded), got {:?}",
-                fixed_src.op()
-            );
-            // Ranges should contain the extracted reduce_range
-            assert!(
-                ranges.iter().any(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Reduce, .. })),
-                "Should extract Reduce range from expression"
-            );
-        }
-        other => panic!("Expected REDUCE, got {:?}", other),
-    }
-}

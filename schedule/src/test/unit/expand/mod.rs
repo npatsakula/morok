@@ -81,77 +81,36 @@ fn test_vectorize_all_scalar_sources() {
 }
 
 #[test]
-fn test_fix_reduce_unroll_returns_none_on_unextractable_binary() {
-    // Test that fix_reduce_unroll returns None when ranges contain
-    // unextractable Binary expressions. This prevents infinite rewrite loops.
+fn test_fix_reduce_unroll_with_unroll_ops() {
+    // Test the new Tinygrad-aligned behavior: fix_reduce_unroll partitions
+    // REDUCE.ranges into RANGE ops vs UNROLL ops, moving UNROLL to CONTRACT.
     //
-    // This tests the fix for: "Rewrite iteration limit (1000) exceeded"
-    // which occurred when beam search used width >= 3.
+    // This tests the simplified partition-based logic.
 
-    // Create a Binary expression that doesn't match any extraction pattern:
-    // ADD(MUL(Const, Const), Const) - no Range ops at all!
-    // This simulates a malformed expression that might result from some edge case.
-    let unextractable = UOp::new(
-        Op::Binary(
-            morok_ir::BinaryOp::Add,
-            UOp::new(
-                Op::Binary(
-                    morok_ir::BinaryOp::Mul,
-                    UOp::const_(DType::Index, ConstValue::Int(2)),
-                    UOp::const_(DType::Index, ConstValue::Int(3)),
-                ),
-                DType::Index,
-            ),
-            UOp::const_(DType::Index, ConstValue::Int(1)),
-        ),
-        DType::Index,
-    );
+    // Create an UNROLL op (simulates what Phase 1 produces from Range(Unroll))
+    let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2), ConstValue::Int(3)]);
+    let unroll = values.unroll(vec![(1, 4)]);
+
+    // Create a Reduce range
+    let reduce_end = UOp::const_(DType::Index, ConstValue::Int(16));
+    let reduce_range = UOp::range_axis(reduce_end, morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
 
     let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = src.reduce(smallvec::smallvec![unextractable], ReduceOp::Add);
+    let reduce = src.reduce(smallvec::smallvec![reduce_range.clone(), unroll], ReduceOp::Add);
 
-    // fix_reduce_unroll should return None because:
-    // 1. The Binary expression can't be extracted (no Range ops)
-    // 2. The range is kept as-is (no change)
-    // 3. No CONTRACT is added
-    // -> ranges_unchanged && !has_contract -> return None
+    // fix_reduce_unroll should:
+    // 1. Partition ranges into [Range(Reduce)] and [UNROLL]
+    // 2. Create CONTRACT wrapper on source with UNROLL axes
+    // 3. Return REDUCE with only Range ops
     let result = fix_reduce_unroll(&reduce);
-    assert!(result.is_none(), "Expected None when extraction fails and nothing changes");
-}
+    assert!(result.is_some(), "Expected Some when UNROLL is in ranges");
 
-#[test]
-fn test_fix_reduce_unroll_handles_nested_binary() {
-    // Test that nested Binary expressions (from multiple shift_to) are handled.
-    // Pattern: ADD(ADD(MUL(reduce_range, 4), range_upcast1), range_upcast2)
-
-    let end = UOp::const_(DType::Index, ConstValue::Int(64));
-    let reduce_range = UOp::range_axis(end.clone(), morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
-
-    // Inner shift_to result: MUL(reduce_range, 4) + Range(Upcast)
-    let upcast_end = UOp::const_(DType::Index, ConstValue::Int(4));
-    let upcast_range = UOp::range_axis(upcast_end.clone(), morok_ir::AxisId::Renumbered(1), AxisType::Upcast);
-
-    let mul = UOp::new(
-        Op::Binary(morok_ir::BinaryOp::Mul, reduce_range.clone(), UOp::const_(DType::Index, ConstValue::Int(4))),
-        DType::Index,
-    );
-    let inner_add = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, mul, upcast_range.clone()), DType::Index);
-
-    // Outer shift_to: inner_add + Range(Upcast)
-    let upcast_range2 = UOp::range_axis(upcast_end, morok_ir::AxisId::Renumbered(2), AxisType::Upcast);
-    let nested_binary = UOp::new(Op::Binary(morok_ir::BinaryOp::Add, inner_add, upcast_range2), DType::Index);
-
-    let src = UOp::const_(DType::Float32, ConstValue::Float(0.0));
-    let reduce = src.reduce(smallvec::smallvec![nested_binary], ReduceOp::Add);
-
-    // fix_reduce_unroll should extract the reduce_range and handle the upcast axes
-    let result = fix_reduce_unroll(&reduce);
-    assert!(result.is_some(), "Expected Some when nested Binary can be extracted");
-
-    // Check the result has CONTRACT wrapper (for upcast axes)
     if let Some(fixed) = result
-        && let Op::Reduce { src: fixed_src, .. } = fixed.op()
+        && let Op::Reduce { src: fixed_src, ranges, .. } = fixed.op()
     {
-        assert!(matches!(fixed_src.op(), Op::Contract { .. }), "Expected CONTRACT wrapper for upcast axes");
+        // Source should be wrapped in CONTRACT
+        assert!(matches!(fixed_src.op(), Op::Contract { .. }), "Expected CONTRACT wrapper");
+        // Ranges should only contain Range ops (UNROLL moved to CONTRACT)
+        assert!(ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })), "All ranges should be Range ops");
     }
 }

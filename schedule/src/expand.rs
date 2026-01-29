@@ -635,246 +635,72 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 }
 
 // ============================================================================
-/// Fix REDUCE operations that have non-Range entries in their ranges.
+/// Fix REDUCE operations with UNROLL ranges.
 ///
-/// This handles two scenarios:
-/// - Range ops with Unroll/Upcast axis_type → move to CONTRACT wrapper
-/// - Arithmetic expressions from shift_to substitution → extract the Reduce range
-///
-/// NOTE: This is more complex than Tinygrad's fix_reduce_unroll because we're NOT
-/// running Phase 1 (Range→UNROLL conversion), so we handle Range(Unroll) directly.
+/// Matches Tinygrad expander.py:112-121 exactly:
+/// ```python
+/// def fix_reduce_unroll(x:UOp):
+///   reduce_range, reduce_expand = partition(x.src[1:], lambda y: y.op is Ops.RANGE)
+///   if len(reduce_expand) == 0: return None
+///   reduce_expand = [x for x in reduce_expand if x.op is not Ops.CONST]
+///   assert all(x.op is Ops.UNROLL for x in reduce_expand), f"not all UNROLLS in {reduce_expand}"
+///   ret = x.src[0]
+///   if len(contract_axis:=flatten(x.arg for x in reduce_expand)):
+///     ret = UOp(Ops.CONTRACT, x.dtype.vec(prod(x[1] for x in contract_axis)), (ret,), tuple(contract_axis), tag=1)
+///   return x.replace(src=(ret,)+tuple(reduce_range))
+/// ```
 pub(crate) fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Reduce { src, reduce_op, ranges } = reduce.op() else {
         return None;
     };
 
-    tracing::debug!(
-        src_op = src.op().as_ref(),
-        ranges_len = ranges.len(),
-        ranges_types = ?ranges.iter().map(|r| match r.op() {
-            Op::Range { axis_type, .. } => format!("Range({:?})", axis_type),
-            _ => r.op().as_ref().to_string(),
-        }).collect::<Vec<_>>(),
-        "fix_reduce_unroll: checking REDUCE"
-    );
+    // Partition: RANGE ops vs everything else
+    let (reduce_range, reduce_expand): (Vec<_>, Vec<_>) =
+        ranges.iter().partition(|r| matches!(r.op(), Op::Range { .. }));
 
-    // Skip if src is already CONTRACT-wrapped (already processed)
-    // This prevents infinite rewrite loops when pattern matching
-    if matches!(src.op(), Op::Contract { .. }) {
+    if reduce_expand.is_empty() {
         return None;
     }
 
-    // Check if any range is not a simple Range(Reduce/Loop) op
-    let has_non_reduce_range = ranges.iter().any(|r| {
-        match r.op() {
-            Op::Range { axis_type, .. } => !matches!(axis_type, AxisType::Reduce | AxisType::Loop),
-            _ => true, // Arithmetic expressions or other ops need fixing
-        }
-    });
+    // Filter out CONST
+    let reduce_expand: Vec<_> = reduce_expand.into_iter().filter(|r| !matches!(r.op(), Op::Const(_))).collect();
 
-    if !has_non_reduce_range {
-        return None; // Nothing to fix
+    if reduce_expand.is_empty() {
+        return None;
     }
 
-    let mut fixed_ranges: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
-    // Separate Unroll (loop unrolling) from Upcast (vectorization)
-    // Only Upcast axes create vectorized accumulators
-    let mut unroll_axes: Vec<(usize, usize)> = Vec::new();
-    let mut upcast_axes: Vec<(usize, usize)> = Vec::new();
-
-    for range in ranges.iter() {
-        match range.op() {
-            // Range op - check axis type
-            Op::Range { axis_type, axis_id, end } => {
-                match axis_type {
-                    AxisType::Reduce | AxisType::Loop => {
-                        // Keep in REDUCE.ranges
-                        fixed_ranges.push(range.clone());
-                    }
-                    AxisType::Unroll => {
-                        // Loop unrolling - move to CONTRACT wrapper
-                        if let Some(size) = extract_const_size(end) {
-                            unroll_axes.push((axis_id.value(), size));
-                        } else {
-                            fixed_ranges.push(range.clone());
-                        }
-                    }
-                    AxisType::Upcast => {
-                        // SIMD vectorization - creates vectorized accumulator
-                        if let Some(size) = extract_const_size(end) {
-                            upcast_axes.push((axis_id.value(), size));
-                        } else {
-                            fixed_ranges.push(range.clone());
-                        }
-                    }
-                    _ => {
-                        // Other axis types (Global, Local, etc.) - keep as is
-                        fixed_ranges.push(range.clone());
-                    }
-                }
-            }
-
-            // Arithmetic expression from shift_to substitution
-            // Pattern: ADD(MUL(replaced_rng, Const), new_rng)
-            Op::Binary(BinaryOp::Add, left, right) => {
-                if let Some((reduce_range, unroll_info)) = extract_ranges_from_expr(left, right) {
-                    fixed_ranges.push(reduce_range);
-                    if let Some((axis_id, size)) = unroll_info {
-                        // Check if the new range is Upcast or Unroll
-                        if is_upcast_range(right) || is_upcast_range(left) {
-                            upcast_axes.push((axis_id, size));
-                        } else {
-                            unroll_axes.push((axis_id, size));
-                        }
-                    }
-                } else {
-                    // Can't extract ranges from this Binary expression.
-                    // The no-op check at the end will prevent infinite loops.
-                    tracing::debug!(
-                        "fix_reduce_unroll: unhandled Binary in ranges: left={:?}, right={:?}",
-                        left.op(),
-                        right.op()
-                    );
-                    fixed_ranges.push(range.clone());
-                }
-            }
-
-            // UNROLL op (from Phase 1 if it were enabled)
-            Op::Unroll { unroll_axes: axes, .. } => {
-                unroll_axes.extend(axes.iter().cloned());
-            }
-
-            // Unknown pattern - keep as is
-            _ => {
-                fixed_ranges.push(range.clone());
-            }
-        }
-    }
-
-    // Combine all axes for CONTRACT wrapper
-    let contract_axes: Vec<(usize, usize)> = unroll_axes.iter().chain(upcast_axes.iter()).copied().collect();
-    let has_contract = !contract_axes.is_empty();
-
-    // Assertion from Tinygrad expander.py:116 - verify axes are valid
-    // (All axis sizes must be > 0 and the product must be reasonable)
+    // All non-Range, non-Const must be UNROLL (Tinygrad assertion)
     debug_assert!(
-        contract_axes.iter().all(|(_, sz)| *sz > 0),
-        "CONTRACT axes must have positive sizes: {:?}",
-        contract_axes
+        reduce_expand.iter().all(|r| matches!(r.op(), Op::Unroll { .. })),
+        "not all UNROLLS in {:?}",
+        reduce_expand.iter().map(|r| r.op().as_ref()).collect::<Vec<_>>()
     );
 
-    // Safety check: Only return Some() if we actually changed something.
-    // This prevents infinite rewrite loops when extraction fails - if ranges
-    // contain unhandled Binary expressions, we'd create a near-identical REDUCE
-    // that triggers the pattern again indefinitely.
-    let ranges_unchanged =
-        fixed_ranges.len() == ranges.len() && fixed_ranges.iter().zip(ranges.iter()).all(|(a, b)| Arc::ptr_eq(a, b));
+    // Collect contract axes from UNROLL ops
+    let contract_axes: Vec<(usize, usize)> = reduce_expand
+        .iter()
+        .filter_map(|u| match u.op() {
+            Op::Unroll { unroll_axes, .. } => Some(unroll_axes.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
 
-    if ranges_unchanged && !has_contract {
-        return None;
-    }
-
-    // Build the fixed REDUCE
-    let fixed_src = if has_contract {
-        // Wrap source in CONTRACT to document the unrolled/upcasted axes
-        src.contract(contract_axes)
+    // Wrap source in CONTRACT if axes exist
+    let contracted_src = if !contract_axes.is_empty() {
+        let total: usize = contract_axes.iter().map(|(_, sz)| sz).product();
+        UOp::new(Op::Contract { src: src.clone(), upcast_ranges: contract_axes }, reduce.dtype().vec(total))
     } else {
         src.clone()
     };
 
-    // Check if output-dimension ranges remain (Loop/Global/Outer)
-    let has_output_ranges = fixed_ranges
-        .iter()
-        .any(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Loop | AxisType::Global | AxisType::Outer, .. }));
-
-    // Vector dtype only if: upcast axes exist AND output dimensions remain
-    // Full reductions (no output dims) collapse to scalar via horizontal reduce
-    let result_dtype = if !upcast_axes.is_empty() && has_output_ranges {
-        let total_upcast: usize = upcast_axes.iter().map(|(_, sz)| sz).product();
-        reduce.dtype().scalar_dtype().vec(total_upcast)
-    } else {
-        reduce.dtype()
-    };
-
-    Some(UOp::new(Op::Reduce { src: fixed_src, ranges: fixed_ranges, reduce_op: *reduce_op }, result_dtype))
+    // Return REDUCE with only Range ops (Tinygrad: x.replace(src=(ret,)+tuple(reduce_range)))
+    Some(UOp::new(
+        Op::Reduce { src: contracted_src, ranges: reduce_range.into_iter().cloned().collect(), reduce_op: *reduce_op },
+        reduce.dtype(),
+    ))
 }
 
-/// Check if a UOp is a Range(Upcast) op.
-fn is_upcast_range(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Range { axis_type: AxisType::Upcast, .. })
-}
-
-/// Extract Reduce and Unroll ranges from a shift_to arithmetic expression.
-///
-/// shift_to creates expressions like:
-/// - top=false: `replaced_rng * amount + new_rng`
-/// - top=true:  `new_rng * old_sz + replaced_rng`
-///
-/// Returns (reduce_range, Option<(axis_id, size)>) for the unroll axis.
-#[allow(clippy::type_complexity)]
-fn extract_ranges_from_expr(left: &Arc<UOp>, right: &Arc<UOp>) -> Option<(Arc<UOp>, Option<(usize, usize)>)> {
-    // Pattern 1 (top=false): ADD(MUL(replaced_rng, Const), new_rng)
-    if let Op::Binary(BinaryOp::Mul, mul_left, _mul_right) = left.op()
-        && let Op::Range { axis_type: AxisType::Reduce, .. } = mul_left.op()
-    {
-        let unroll_info = extract_unroll_info(right);
-        return Some((mul_left.clone(), unroll_info));
-    }
-
-    // Pattern 2 (top=true): ADD(MUL(new_rng, Const), replaced_rng)
-    if let Op::Range { axis_type: AxisType::Reduce, .. } = right.op()
-        && let Op::Binary(BinaryOp::Mul, mul_left, _) = left.op()
-    {
-        let unroll_info = extract_unroll_info(mul_left);
-        return Some((right.clone(), unroll_info));
-    }
-
-    // Pattern 3: Nested shift_to - ADD(inner_add, Range(Upcast/Unroll))
-    // Handles expressions from multiple shift_to applications:
-    //   (replaced_rng * a + range1) + range2
-    // Recursively extract reduce_range from inner Add, get unroll_info from outer range.
-    if let Op::Binary(BinaryOp::Add, inner_left, inner_right) = left.op()
-        && let Op::Range { axis_type, .. } = right.op()
-        && matches!(axis_type, AxisType::Upcast | AxisType::Unroll)
-        && let Some((reduce_range, _)) = extract_ranges_from_expr(inner_left, inner_right)
-    {
-        let unroll_info = extract_unroll_info(right);
-        return Some((reduce_range, unroll_info));
-    }
-
-    // Pattern 4: Nested shift_to reversed - ADD(Range(Upcast/Unroll), inner_add)
-    if let Op::Binary(BinaryOp::Add, inner_left, inner_right) = right.op()
-        && let Op::Range { axis_type, .. } = left.op()
-        && matches!(axis_type, AxisType::Upcast | AxisType::Unroll)
-        && let Some((reduce_range, _)) = extract_ranges_from_expr(inner_left, inner_right)
-    {
-        let unroll_info = extract_unroll_info(left);
-        return Some((reduce_range, unroll_info));
-    }
-
-    None
-}
-
-/// Extract unroll/upcast axis info (axis_id, size) from a Range op or UNROLL op.
-///
-/// After Phase 1, Range(Unroll) has been converted to UNROLL, so we need
-/// to handle both cases. Also handles Range(Upcast) for vectorized accumulators.
-fn extract_unroll_info(uop: &Arc<UOp>) -> Option<(usize, usize)> {
-    // Handle Range(Unroll) or Range(Upcast) case (before Phase 1 conversion)
-    if let Op::Range { axis_type, axis_id, end } = uop.op()
-        && matches!(axis_type, AxisType::Unroll | AxisType::Upcast)
-        && let Some(size) = extract_const_size(end)
-    {
-        return Some((axis_id.value(), size));
-    }
-    // Handle UNROLL op case (after Phase 1 conversion)
-    if let Op::Unroll { unroll_axes, .. } = uop.op()
-        && let Some(&(axis_id, size)) = unroll_axes.first()
-    {
-        return Some((axis_id, size));
-    }
-    None
-}
 
 /// Extract constant size from a Range's end value.
 fn extract_const_size(end: &Arc<UOp>) -> Option<usize> {
@@ -1078,5 +904,3 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     None
 }
-
-
