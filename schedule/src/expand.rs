@@ -1,31 +1,21 @@
-//! Pre-expander pass for UNROLL/UPCAST range handling.
+//! Pre-expander pass for UNROLL/CONTRACT expansion.
 //!
-//! Transforms the kernel AST before codegen to properly handle UNROLL optimization.
+//! Transforms kernel AST before codegen to handle UNROLL optimization.
 //!
-//! # Problem
-//!
-//! When `shift_to` applies UNROLL optimization, it substitutes Range ops
-//! with arithmetic expressions like `replaced_rng * amount + new_rng`.
-//! This creates two issues:
-//! 1. REDUCE.ranges contains arithmetic expressions instead of Range ops
-//! 2. Range(Unroll) ops in expressions try to create loops without ENDs
-//!
-//! # Solution (Tinygrad-aligned)
+//! # Pipeline (Tinygrad-aligned)
 //!
 //! Two-phase expansion:
-//! 1. **Pre-expansion**: Convert Range(Unroll/Upcast) → UNROLL op with constant vector
-//! 2. **Main expansion**: Propagate vectorization through operations using UNROLL
+//! 1. **Range conversion**: Range(Unroll/Upcast) → UNROLL(VCONST([0..N]))
+//! 2. **Expansion**:
+//!    - fix_reduce_unroll: Partition REDUCE.ranges, move UNROLL to CONTRACT
+//!    - fix_store_unroll: Partition STORE.ranges, wrap in CONTRACT
+//!    - do_expand: Propagate vectorization through ops with UNROLL inputs
+//!    - do_contract: CONTRACT(UNROLL) → GEP extraction
 //!
-//! The key insight from Tinygrad's expander.py:
-//! - UNROLL(src=VCONST([0,1,...,N-1]), axes=[(axis_id, N)]) holds all iterations as a vector
-//! - Operations using UNROLL get replicated/vectorized via do_expand
-//! - CONTRACT collapses vectorized results back to scalar for REDUCE/STORE
+//! # Key Insight
 //!
-//! # Implementation
-//!
-//! - `convert_range_to_unroll`: Range(Unroll) → UNROLL(VCONST([0..N]))
-//! - `fix_reduce_unroll`: Extract ranges from arithmetic expressions in REDUCE
-//! - `do_expand`: Replicate operations that use UNROLL inputs
+//! UNROLL holds all loop iterations as a vector. Operations using UNROLL
+//! get replicated/vectorized. CONTRACT collapses back to scalar for output.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,11 +25,20 @@ use morok_ir::AxisType;
 use morok_ir::prelude::*;
 
 use crate::TypedPatternMatcher;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Convert ConstValue to usize (for Range end values).
+fn const_to_usize(cv: &ConstValue) -> Option<usize> {
+    match cv {
+        ConstValue::Int(i) if *i > 0 => Some(*i as usize),
+        ConstValue::UInt(u) => Some(*u as usize),
+        _ => None,
+    }
+}
 
 /// Extract broadcast info: (source, count) if VECTORIZE has all identical elements.
 ///
@@ -58,37 +57,44 @@ fn broadcast_info(uop: &Arc<UOp>) -> Option<(Arc<UOp>, usize)> {
 ///    lambda x: x.replace(src=tuple(UOp(Ops.CONTRACT, dtype=s.dtype.vec(x.src[1].src[0].dtype.count),
 ///                                      src=(s,), arg=x.src[1].arg) for s in x.src)))
 ///
-/// When BUFFERIZE has two UNROLL sources, wrap each in CONTRACT using the second UNROLL's axes.
+/// Matches BUFFERIZE with compute=UNROLL and exactly one range that is UNROLL.
+/// Wraps BOTH in CONTRACT using the range UNROLL's axes.
 fn fix_bufferize_unroll(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Bufferize { compute, ranges, opts } = bufferize.op() else {
         return None;
     };
 
     // Check if compute is UNROLL
-    let Op::Unroll { src: _, unroll_axes: _ } = compute.op() else {
+    let Op::Unroll { .. } = compute.op() else {
         return None;
     };
 
-    // Check if we have at least one range that is UNROLL
-    let unroll_range = ranges.iter().find(|r| matches!(r.op(), Op::Unroll { .. }))?;
-    let Op::Unroll { src: _, unroll_axes: range_axes } = unroll_range.op() else {
+    // Must have exactly one range that is UNROLL (Tinygrad: src=(UNROLL, UNROLL))
+    if ranges.len() != 1 {
+        return None;
+    }
+    let Op::Unroll { src: range_inner, unroll_axes: contract_axes } = ranges[0].op() else {
         return None;
     };
 
-    // Get the contract axes from the range UNROLL
-    let contract_axes = range_axes.clone();
+    // Contract dtype: s.dtype.vec(x.src[1].src[0].dtype.count)
+    // = source dtype vectorized by second UNROLL's inner count
+    let inner_count = range_inner.dtype().vcount();
 
     // Wrap compute in CONTRACT
-    let contracted_compute = compute.contract(contract_axes.clone());
+    let contracted_compute = UOp::new(
+        Op::Contract { src: compute.clone(), upcast_ranges: contract_axes.clone() },
+        compute.dtype().vec(inner_count),
+    );
 
-    // Wrap each UNROLL range in CONTRACT, pass through non-UNROLL ranges
-    let contracted_ranges: SmallVec<[Arc<UOp>; 4]> = ranges
-        .iter()
-        .map(|r| if matches!(r.op(), Op::Unroll { .. }) { r.contract(contract_axes.clone()) } else { r.clone() })
-        .collect();
+    // Wrap range in CONTRACT
+    let contracted_range = UOp::new(
+        Op::Contract { src: ranges[0].clone(), upcast_ranges: contract_axes.clone() },
+        ranges[0].dtype().vec(inner_count),
+    );
 
     Some(UOp::new(
-        Op::Bufferize { compute: contracted_compute, ranges: contracted_ranges, opts: opts.clone() },
+        Op::Bufferize { compute: contracted_compute, ranges: smallvec![contracted_range], opts: opts.clone() },
         bufferize.dtype(),
     ))
 }
@@ -190,8 +196,12 @@ fn phase1_range_to_unroll() -> TypedPatternMatcher {
         // Convert Range(Unroll) to UNROLL op with constant vector
         // NOTE: Range(Upcast) is NOT converted here - it's preserved for fix_reduce_unroll
         // to detect and set Vector dtype for K-vectorization. It gets converted in Phase 2.
-        range if matches!(range.op(), Op::Range { axis_type: AxisType::Unroll, .. }) => |range| {
-            convert_range_to_unroll(range)
+        range @ Range { end: _end @const(cv), axis_id, axis_type }
+            if matches!(axis_type, AxisType::Unroll) => |range| {
+            let size = const_to_usize(&cv)?;
+            let values: Vec<ConstValue> = (0..size as i64).map(ConstValue::Int).collect();
+            let vconst = UOp::vconst(values);
+            Some(vconst.unroll_with_dtype(vec![(axis_id.value(), size)], range.dtype()))
         },
     }
 }
@@ -234,12 +244,15 @@ pub fn phase2_expand() -> TypedPatternMatcher {
         // Phase 2b: Range conversion (pm_pre_expander pattern 1)
         // =====================================================================
 
-        // Convert Range(Upcast) or Range(Unroll) to UNROLL op
+        // Convert Range(Upcast/Unroll) to UNROLL op
         // This runs FIRST so that UNROLL is available for subsequent patterns
-        // NOTE: REDUCE ranges are NOT converted here - they're handled by pm_reduce
-        // which transforms REDUCE ops to accumulator patterns with END(ranges)
-        range if matches!(range.op(), Op::Range { axis_type: AxisType::Upcast | AxisType::Unroll, .. }) => |range| {
-            convert_range_to_unroll(range)
+        // NOTE: Reduce ranges are NOT converted here - they remain as ranges for REDUCE.ranges
+        range @ Range { end: _end @const(cv), axis_id, axis_type }
+            if matches!(axis_type, AxisType::Upcast | AxisType::Unroll) => |range| {
+            let size = const_to_usize(&cv)?;
+            let values: Vec<ConstValue> = (0..size as i64).map(ConstValue::Int).collect();
+            let vconst = UOp::vconst(values);
+            Some(vconst.unroll_with_dtype(vec![(axis_id.value(), size)], range.dtype()))
         },
 
         // =====================================================================
@@ -267,13 +280,11 @@ pub fn phase2_expand() -> TypedPatternMatcher {
         // Phase 2c: Core expansion (expander patterns)
         // =====================================================================
 
-        // Collapse nested UNROLL BEFORE do_expand (Tinygrad: expander.py:94-95)
-        // CRITICAL: Must run before do_expand to prevent exponential dtype growth.
-        // If do_expand sees UNROLL(UNROLL(x)), it processes incorrectly.
+        // Collapse nested UNROLL BEFORE do_expand (Tinygrad expander.py:94-95)
         // UNROLL(UNROLL(x, inner), outer) → UNROLL(x, inner + outer)
         outer @ Unroll { src: Unroll { src: inner_src, unroll_axes: inner_axes, .. }, unroll_axes: outer_axes, .. } => |outer| {
             let combined: Vec<(usize, usize)> = inner_axes.iter().chain(outer_axes.iter()).cloned().collect();
-            Some(inner_src.unroll_with_dtype(combined, outer.dtype().scalar_dtype()))
+            Some(inner_src.unroll_with_dtype(combined, outer.dtype()))
         },
 
         // Main expansion: ALL expandable ops with UNROLL inputs
@@ -299,68 +310,9 @@ pub fn phase2_expand() -> TypedPatternMatcher {
     }
 }
 
-/// Convert Range(Unroll/Upcast) to UNROLL op with constant vector [0, 1, ..., N-1].
-fn convert_range_to_unroll(range: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Range { end, axis_id, axis_type } = range.op() else {
-        return None;
-    };
-
-    tracing::debug!(
-        axis_type = ?axis_type,
-        axis_id = ?axis_id,
-        "convert_range_to_unroll: checking Range"
-    );
-
-    // Convert Unroll, Upcast, and Reduce axis types to UNROLL op
-    // Tinygrad applies OptOps.UNROLL to REDUCE axes (changing type to UNROLL),
-    // then expander eliminates the Range. Morok handles this directly by
-    // converting REDUCE ranges here, achieving the same result.
-    if !matches!(axis_type, AxisType::Unroll | AxisType::Upcast | AxisType::Reduce) {
-        return None;
-    }
-
-    // Extract constant size
-    let size = extract_const_size(end)?;
-    if size == 0 {
-        return None;
-    }
-
-    // Create constant vector [0, 1, 2, ..., size-1]
-    let values: Vec<ConstValue> = (0..size as i64).map(ConstValue::Int).collect();
-    let vconst = UOp::vconst(values);
-
-    // Wrap in UNROLL op with axis metadata
-    // Use the Range's dtype for the wrapper (matching Tinygrad: r.dtype).
-    // This preserves type information through the expansion phase.
-    let unroll = vconst.unroll_with_dtype(vec![(axis_id.value(), size)], range.dtype());
-
-    tracing::debug!(
-        axis_type = ?axis_type,
-        axis_id = ?axis_id,
-        size = size,
-        unroll_id = unroll.id,
-        "convert_range_to_unroll: CONVERTED Range to UNROLL"
-    );
-
-    Some(unroll)
-}
-
 /// Check if any input to this operation is an UNROLL op.
 fn has_unroll_input(uop: &Arc<UOp>) -> bool {
-    let sources = uop.op().sources();
-    let has_unroll = sources.iter().any(|src| matches!(src.op(), Op::Unroll { .. }));
-
-    // Debug: trace PointerIndex and Store ops
-    if matches!(uop.op(), Op::PointerIndex { .. } | Op::Store { .. } | Op::Index { .. }) {
-        tracing::debug!(
-            op = ?std::mem::discriminant(uop.op()),
-            has_unroll = has_unroll,
-            source_ops = ?sources.iter().map(|s| std::mem::discriminant(s.op())).collect::<Vec<_>>(),
-            "has_unroll_input: checking memory op"
-        );
-    }
-
-    has_unroll
+    uop.op().sources().iter().any(|src| matches!(src.op(), Op::Unroll { .. }))
 }
 
 /// Expand an operation that has UNROLL inputs.
@@ -422,7 +374,6 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         };
 
     let expand_sz: usize = expand_args.iter().map(|(_, sz)| sz).product();
-    tracing::debug!(expand_args = ?expand_args, expand_sz = expand_sz, "do_expand: computed expansion parameters");
     if expand_sz == 0 {
         return None;
     }
@@ -435,21 +386,6 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     for (i, src) in sources.iter().enumerate() {
         if let Op::Unroll { src: inner, unroll_axes: src_axes } = src.op() {
-            // Check if this is a float UNROLL at Load/Store index position
-            // Load/Store index at position 1 should be integer. If UNROLL wraps float data,
-            // GEP swizzle would preserve float dtype, causing codegen panic.
-            // Only skip GEP when inner is float - integer UNROLL needs normal expansion.
-            let is_float_at_load_store_index =
-                i == 1 && matches!(op, Op::Load { .. } | Op::Store { .. }) && !inner.dtype().base().is_int();
-
-            if is_float_at_load_store_index {
-                // Float data at index position - this is an upstream bug
-                // Unwrap without GEP swizzle to avoid making things worse
-                // Codegen's defensive check will catch this as an error
-                new_sources.push(inner.clone());
-                continue;
-            }
-
             if *src_axes == expand_args {
                 // Same expansion: unwrap
                 new_sources.push(inner.clone());
@@ -476,6 +412,7 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
             // Non-UNROLL source: check special cases
 
             // Case 1: Range-position sources pass through unchanged
+            // Tinygrad expander.py:47-49
             if let Some(range_idx) = range_start_idx
                 && i >= range_idx
             {
@@ -483,45 +420,15 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
                 continue;
             }
 
-            // Case 2: Buffer (source 0) for LOAD passes through unchanged
-            // INDEX buffer is broadcast to enable devectorize expand_index pattern matching
-            // (Tinygrad expander.py:56-58 broadcasts scalar sources including buffer)
-            //
-            // NOTE: This does NOT apply to STORE! For STORE, sources are [index, value, ranges...]
-            // and the index (source 0) needs normal expansion. Only LOAD has buffer as source 0.
-            if i == 0 && matches!(op, Op::Load { .. }) {
-                new_sources.push(src.clone());
-                continue;
-            }
-
-            // Case 3b: INDEX indices (sources at i >= 1) pass through when INDEX has element dtype
+            // Case 2: INDEX indices (sources at i >= 1) pass through when INDEX has element dtype
             // Tinygrad expander.py:50-51: INDEX indices are not vectorized when dtype is not PtrDType
-            // This preserves the memory access pattern - each expanded INDEX uses the same indices
             if i >= 1 && matches!(op, Op::Index { .. }) && !matches!(uop.dtype(), DType::Ptr { .. }) {
                 new_sources.push(src.clone());
                 continue;
             }
 
-            // Case 3d: REDUCE source for full reductions - pass through without CAT
-            // A full reduction has no output-dimension ranges (Loop, Global, Outer).
-            if i == 0 && matches!(op, Op::Reduce { .. }) {
-                let range_start = op.range_ending_src_index().unwrap_or(1);
-                fn contains_output_range(uop: &Arc<UOp>) -> bool {
-                    match uop.op() {
-                        Op::Range { axis_type, .. } => {
-                            matches!(axis_type, AxisType::Loop | AxisType::Global | AxisType::Outer)
-                        }
-                        _ => uop.op().sources().iter().any(contains_output_range),
-                    }
-                }
-                let is_full_reduction = !sources[range_start..].iter().any(contains_output_range);
-                if is_full_reduction {
-                    new_sources.push(src.clone());
-                    continue;
-                }
-            }
-
-            // Case 4: Already vectorized (dtype.count > 1) -> CAT to replicate
+            // Case 3: Already vectorized (dtype.count > 1) -> CAT to replicate
+            // Tinygrad expander.py:52-54
             let src_count = src.dtype().vcount();
             if src_count > 1 {
                 let cat_sources: Vec<Arc<UOp>> = (0..expand_sz).map(|_| src.clone()).collect();
@@ -552,86 +459,28 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         base_dtype.clone()
     };
 
-    // =========================================================================
-    // Special Case 1: GEP needs index recalculation
-    // =========================================================================
-    // For GEP, recalculate indices for expanded vector.
-    // The source has been expanded by CAT'ing `expand_sz` copies of the original vector.
-    // We need to extract the corresponding elements from each copy.
+    // GEP: recalculate indices for expanded vector
+    // Tinygrad expander.py:60-63
     if let Op::Gep { indices, .. } = op {
+        debug_assert_eq!(base_dtype.vcount(), 1, "GEP expansion expects scalar output dtype");
         let src = new_sources.first()?;
         let src_count = src.dtype().vcount();
-        let output_count = new_dtype.vcount();
-        // Tinygrad alignment: GEP expansion expects scalar output dtype or multiple indices
-        debug_assert!(
-            new_dtype.vcount() == 1 || indices.len() > 1,
-            "GEP expansion expects scalar output or multi-index, got vcount={} with {} indices",
-            new_dtype.vcount(),
-            indices.len()
-        );
-        // expand_sz = how many copies of the original output we need
-        let gep_expand_sz = output_count / indices.len().max(1);
-        // stride = original source count = src_count / expand_sz
-        let stride = src_count / gep_expand_sz.max(1);
+        // Tinygrad: tuple(range(arg[0], src_count, src_count // expand_sz))
+        let stride = src_count / expand_sz;
         let new_indices: Vec<usize> =
-            indices.iter().flat_map(|&idx| (0..gep_expand_sz).map(move |e| idx + e * stride)).collect();
+            indices.iter().flat_map(|&idx| (0..expand_sz).map(move |e| idx + e * stride)).collect();
+        // Fall through to normal path with modified arg
         let gep_result = src.gep(new_indices);
-        return Some(gep_result.unroll_with_dtype(expand_args, base_dtype.scalar_dtype()));
+        return Some(gep_result.unroll(expand_args));
     }
-
-    // =========================================================================
-    // Special Case 2: END needs range filtering
-    // =========================================================================
-    // Filter to only include actual RANGE ops in the ranges field.
-    // During expansion, non-RANGE ops (CONST, Add, etc.) may be present
-    // from broadcast/CAT transformations. END.ranges must only contain RANGEs.
-    if matches!(op, Op::End { .. }) {
-        let computation = new_sources.first()?.clone();
-        let ranges: SmallVec<[Arc<UOp>; 4]> =
-            new_sources[1..].iter().filter(|s| matches!(s.op(), Op::Range { .. })).cloned().collect();
-        // If no ranges remain, just return the computation wrapped in UNROLL
-        if ranges.is_empty() {
-            return Some(computation.unroll_with_dtype(expand_args, base_dtype.scalar_dtype()));
-        }
-        let end_op = UOp::new(Op::End { computation, ranges }, new_dtype.clone());
-        return Some(end_op.unroll_with_dtype(expand_args, base_dtype.scalar_dtype()));
-    }
-
-    // =========================================================================
-    // Special Case 3: AFTER validation
-    // =========================================================================
-    // Don't create AFTER with Range/End passthrough (violates Tinygrad semantics)
-    if matches!(op, Op::After { .. }) {
-        let passthrough = new_sources.first()?;
-        if matches!(passthrough.op(), Op::Range { .. } | Op::End { .. }) {
-            return None;
-        }
-    }
-
-    // =========================================================================
-    // Special Case 4: Comparison dtype override
-    // =========================================================================
-    // Comparison operations always produce Bool dtype, vectorized if needed.
-    // This matches Tinygrad's behavior (uop/ops.py:412).
-    let final_dtype = match op {
-        Op::Binary(kind, _, _) if kind.is_comparison() => DType::Bool.vec(new_dtype.vcount()),
-        _ => new_dtype.clone(),
-    };
 
     // Create the expanded operation using replace() infrastructure
-    let new_op = uop.replace().dtype(final_dtype).src(new_sources.to_vec()).call();
+    // Tinygrad expander.py:64
+    let new_op = uop.replace().dtype(new_dtype.clone()).src(new_sources.to_vec()).call();
 
-    // Store doesn't produce a value, so don't wrap it in UNROLL
-    // (UNROLL implies a value that can be used by parent operations)
-    if matches!(op, Op::Store { .. }) {
-        return Some(new_op);
-    }
-
-    // Wrap result in UNROLL with SCALAR dtype (not vectorized inner dtype!)
-    // Tinygrad (expander.py:65): UOp(Ops.UNROLL, root.dtype, (nsrc,), expand_args)
-    // The UNROLL wrapper dtype is the ELEMENT dtype (original scalar dtype).
-    // This is critical for swizzle adjustment in parent do_expand calls.
-    Some(new_op.unroll_with_dtype(expand_args, base_dtype.scalar_dtype()))
+    // Wrap result in UNROLL with original dtype
+    // Tinygrad expander.py:65: UOp(Ops.UNROLL, root.dtype, (nsrc,), expand_args)
+    Some(new_op.unroll_with_dtype(expand_args, base_dtype))
 }
 
 // ============================================================================
@@ -701,20 +550,6 @@ pub(crate) fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
     ))
 }
 
-
-/// Extract constant size from a Range's end value.
-fn extract_const_size(end: &Arc<UOp>) -> Option<usize> {
-    if let Op::Const(cv) = end.op() {
-        match cv.0 {
-            ConstValue::Int(i) if i > 0 => Some(i as usize),
-            ConstValue::UInt(u) => Some(u as usize),
-            _ => None,
-        }
-    } else {
-        None
-    }
-}
-
 /// Based on Tinygrad's fix_store_unroll (expander.py:123-126).
 ///
 /// Tinygrad's implementation:
@@ -751,13 +586,6 @@ fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
                 .flatten()
                 .collect();
 
-            tracing::debug!(
-                contract_axes = ?contract_axes,
-                num_store_range = store_range.len(),
-                num_store_expand = store_expand.len(),
-                "fix_store_unroll: partitioned STORE.ranges"
-            );
-
             // Create new STORE with only non-UNROLL ranges
             let new_store = index.store_with_ranges(value.clone(), store_range.into_iter().cloned().collect());
 
@@ -771,136 +599,65 @@ fn fix_store_unroll(store: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Handle END operations that have UNROLL in their ranges.
 ///
 /// Based on Tinygrad's end_unrolls (expander.py:78-82).
-/// Converts UNROLL ranges to CONTRACT wrapper.
 fn end_unrolls(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::End { computation, ranges } = uop.op() else {
-        return None;
-    };
+    let Op::End { computation, ranges } = uop.op() else { return None };
 
-    tracing::debug!(
-        ranges_len = ranges.len(),
-        has_unroll = ranges.iter().any(|r| matches!(r.op(), Op::Unroll { .. })),
-        "end_unrolls: checking END"
-    );
-
-    // Partition ranges into UNROLL vs non-UNROLL
     let (unrolls, non_unrolls): (Vec<_>, Vec<_>) = ranges.iter().partition(|r| matches!(r.op(), Op::Unroll { .. }));
-
     if unrolls.is_empty() {
         return None;
     }
 
-    // Collect all axes from UNROLLs
     let all_axes: Vec<(usize, usize)> = unrolls
         .iter()
-        .filter_map(|u| if let Op::Unroll { unroll_axes, .. } = u.op() { Some(unroll_axes.clone()) } else { None })
+        .filter_map(|u| match u.op() {
+            Op::Unroll { unroll_axes, .. } => Some(unroll_axes.clone()),
+            _ => None,
+        })
         .flatten()
         .collect();
 
-    // Wrap computation in CONTRACT
     let contracted = computation.contract(all_axes);
-
-    // Create new END with contracted computation and non-UNROLL ranges
-    let new_ranges: SmallVec<[Arc<UOp>; 4]> = non_unrolls.into_iter().cloned().collect();
-
-    Some(UOp::new(Op::End { computation: contracted, ranges: new_ranges }, uop.dtype()))
+    Some(UOp::new(
+        Op::End { computation: contracted, ranges: non_unrolls.into_iter().cloned().collect() },
+        uop.dtype(),
+    ))
 }
 
 /// Contract UNROLL to extract elements via GEP.
 ///
 /// Based on Tinygrad's do_contract (expander.py:67-76).
-///
-/// CONTRACT(UNROLL(src, unroll_axes), contract_axes) transforms to:
-/// - If contract_axes covers all unroll_axes: GEP(src, indices)
-/// - If partially covers: UNROLL(GEP(src, indices), remaining_axes)
-///
-/// This prevents vector width multiplication by reorganizing the expanded data.
 fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Contract { src: contract_src, upcast_ranges: contract_axes } = uop.op() else {
         return None;
     };
 
-    tracing::debug!(
-        contract_axes = ?contract_axes,
-        contract_src_op = contract_src.op().as_ref(),
-        "do_contract: matched CONTRACT op"
-    );
-
-    // Assertion from Tinygrad expander.py:72
-    // Contract dtype count should match axis product (unless void for STORE)
-    let axis_product: usize = contract_axes.iter().map(|(_, sz)| sz).product();
-    debug_assert!(
-        uop.dtype() == DType::Void || uop.dtype().vcount() == axis_product,
-        "Contract dtype count {} != axis product {}",
-        uop.dtype().vcount(),
-        axis_product
-    );
-
-    // Handle CONTRACT(UNROLL(...)) pattern
-    if let Op::Unroll { src: unroll_inner, unroll_axes } = contract_src.op() {
-        tracing::debug!(
-            unroll_axes = ?unroll_axes,
-            contract_axes = ?contract_axes,
-            "do_contract: CONTRACT(UNROLL(...)) pattern matched"
-        );
-
-        // Compute remaining axes (unroll_axes not in contract_axes)
-        let remaining_axes: Vec<(usize, usize)> =
-            unroll_axes.iter().filter(|(ax, _)| !contract_axes.iter().any(|(cax, _)| cax == ax)).cloned().collect();
-
-        tracing::debug!(
-            remaining_axes = ?remaining_axes,
-            "do_contract: computed remaining axes"
-        );
-
-        // Compute GEP indices using swizzle pattern
-        let gep_indices = if remaining_axes.is_empty() {
-            // Full contraction: sequential indices for contract_axes
-            swizzle_args(contract_axes, unroll_axes, &[])
-        } else {
-            // Partial contraction: indices accounting for remaining axes
-            let exclude: Vec<usize> = remaining_axes.iter().map(|(ax, _)| *ax).collect();
-            swizzle_args(contract_axes, unroll_axes, &exclude)
-        };
-
-        tracing::debug!(gep_indices_len = gep_indices.len(), "do_contract: computed GEP indices");
-
-        // Create GEP to extract elements
-        let gep_result = unroll_inner.gep(gep_indices);
-
-        // Return based on remaining axes
-        return if remaining_axes.is_empty() {
-            tracing::debug!("do_contract: full contraction -> GEP");
-            // Fully contracted: return GEP result
-            Some(gep_result)
-        } else {
-            tracing::debug!(remaining_axes = ?remaining_axes, "do_contract: partial contraction -> UNROLL(GEP)");
-            // Partially contracted: wrap in UNROLL with remaining axes
-            // Use scalar dtype for UNROLL wrapper to avoid wrapper_count inflation
-            Some(gep_result.unroll_with_dtype(remaining_axes, uop.dtype().scalar_dtype()))
-        };
-    }
-
-    // CONTRACT without UNROLL: convert to VECTORIZE (repeat elements)
-    // Based on Tinygrad's do_contract (expander.py:70):
-    //   if ex.op is not Ops.UNROLL: return UOp(Ops.VECTORIZE, con.dtype, con.src*con.dtype.count)
-    //
-    // IMPORTANT: Tinygrad uses dtype.count (vector count), NOT axis product!
-    // For non-void, dtype.count == axis_product (enforced by assertion above).
-    //
-    // Special case for void: STORE and other void ops are side-effects, not values.
-    // VECTORIZE of void doesn't make sense semantically. Just unwrap the CONTRACT.
-    // This matches Tinygrad where void.count=1 creates single-element VECTORIZE
-    // which is immediately simplified to the source.
-    if !matches!(contract_src.op(), Op::Unroll { .. }) {
+    // CONTRACT without UNROLL → VECTORIZE
+    let Op::Unroll { src: unroll_inner, unroll_axes } = contract_src.op() else {
         let count = uop.dtype().vcount();
         if count == 1 {
-            // Void or scalar: just unwrap CONTRACT (equivalent to identity VECTORIZE)
             return Some(contract_src.clone());
         }
         let sources: SmallVec<[Arc<UOp>; 4]> = (0..count).map(|_| contract_src.clone()).collect();
         return Some(UOp::vectorize(sources));
-    }
+    };
 
-    None
+    // Assertion from Tinygrad expander.py:72
+    debug_assert!(
+        uop.dtype() == DType::Void || uop.dtype().vcount() == contract_axes.iter().map(|(_, sz)| sz).product::<usize>(),
+        "Contract dtype count mismatch"
+    );
+
+    // Compute remaining axes and GEP indices
+    let remaining_axes: Vec<_> = unroll_axes
+        .iter()
+        .filter(|(ax, _)| !contract_axes.iter().any(|(cax, _)| cax == ax))
+        .cloned()
+        .collect();
+
+    let exclude: Vec<usize> = remaining_axes.iter().map(|(ax, _)| *ax).collect();
+    let gep_indices = swizzle_args(contract_axes, unroll_axes, &exclude);
+    let gep_result = unroll_inner.gep(gep_indices);
+
+    // Tinygrad expander.py:76: UOp(Ops.UNROLL, con.dtype, (ex.src[0].gep(...),), new_ex_args)
+    Some(gep_result.unroll_with_dtype(remaining_axes, uop.dtype()))
 }
