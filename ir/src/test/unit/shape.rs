@@ -175,22 +175,6 @@ fn test_shape_caching() {
 // =====================================================================
 
 #[test]
-fn test_shape_to_uop_empty() {
-    use crate::op::Op;
-
-    // Empty shape should create Vectorize with empty elements
-    let empty_shape = smallvec![];
-    let shape_uop = shape_to_uop(&empty_shape);
-
-    // Should be Vectorize, not VConst
-    if let Op::Vectorize { elements } = shape_uop.op() {
-        assert_eq!(elements.len(), 0, "Empty shape should have empty Vectorize");
-    } else {
-        panic!("Expected Vectorize for empty shape, got {:?}", shape_uop.op());
-    }
-}
-
-#[test]
 fn test_shape_to_uop_non_empty() {
     use crate::op::Op;
 
@@ -204,20 +188,4 @@ fn test_shape_to_uop_non_empty() {
     } else {
         panic!("Expected Vectorize, got {:?}", shape_uop.op());
     }
-}
-
-#[test]
-fn test_shape_to_uop_consistency() {
-    use crate::op::Op;
-
-    // Both empty and non-empty shapes should use Vectorize
-    let empty = smallvec![];
-    let non_empty = smallvec![SInt::from(5)];
-
-    let empty_uop = shape_to_uop(&empty);
-    let non_empty_uop = shape_to_uop(&non_empty);
-
-    // Both should be Vectorize operations
-    assert!(matches!(empty_uop.op(), Op::Vectorize { .. }), "Empty should be Vectorize");
-    assert!(matches!(non_empty_uop.op(), Op::Vectorize { .. }), "Non-empty should be Vectorize");
 }

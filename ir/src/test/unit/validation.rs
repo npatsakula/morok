@@ -230,13 +230,18 @@ fn test_comparison_bool_dtype_result() {
 
 #[test]
 fn test_where_condition_must_be_bool() {
-    // Note: Tinygrad allows non-bool conditions (C-style: 0 = false, non-zero = true)
-    // Morok currently follows this behavior and doesn't enforce Bool dtype for conditions
-    // This test documents that non-bool conditions are accepted
+    // WHERE condition must be bool dtype - non-bool conditions should fail
+    let result =
+        UOp::try_where(UOp::native_const(1i32), UOp::native_const(1.0f32), UOp::native_const(0.0f32));
+    assert!(result.is_err(), "Non-bool condition should fail");
 
-    // Should succeed - non-bool conditions are allowed (interpreted as C-style boolean)
-    let _result =
-        UOp::try_where(UOp::native_const(1i32), UOp::native_const(1.0f32), UOp::native_const(0.0f32)).unwrap();
+    // Bool condition should succeed
+    let bool_result = UOp::try_where(
+        UOp::const_(DType::Bool, ConstValue::Bool(true)),
+        UOp::native_const(1.0f32),
+        UOp::native_const(0.0f32),
+    );
+    assert!(bool_result.is_ok(), "Bool condition should succeed");
 }
 
 #[test]

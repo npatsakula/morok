@@ -15,7 +15,7 @@ use std::sync::Arc;
 use morok_dtype::DType;
 use snafu::ensure;
 
-use crate::error::InvalidDTypeForUnaryOpSnafu;
+use crate::error::{InvalidDTypeForUnaryOpSnafu, WhereConditionNotBoolSnafu};
 use crate::op::Op;
 use crate::types::{BinaryOp, TernaryOp, UnaryOp};
 use crate::uop::UOp;
@@ -335,8 +335,14 @@ impl UOp {
     // =========================================================================
 
     /// Conditional selection: condition ? true_val : false_val.
+    ///
+    /// # Errors
+    /// - `WhereConditionNotBool` if condition dtype is not bool
     #[track_caller]
     pub fn try_where(condition: Arc<Self>, true_val: Arc<Self>, false_val: Arc<Self>) -> Result<Arc<Self>> {
+        let cond_dtype = condition.dtype();
+        ensure!(cond_dtype.is_bool(), WhereConditionNotBoolSnafu { actual: cond_dtype });
+
         let dtype = true_val.dtype(); // Result has same dtype as branches
         Self::validate_ternary_shapes(&true_val, &false_val)?;
         Ok(Self::new(Op::Ternary(TernaryOp::Where, condition, true_val, false_val), dtype))

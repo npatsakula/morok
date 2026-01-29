@@ -283,8 +283,10 @@ fn test_vmin_vmax_where_false() {
 
 #[test]
 fn test_vmin_vmax_where_range() {
-    // Condition can be either true or false
-    let cond = UOp::define_var("cond".to_string(), 0, 1);
+    // Condition can be either true or false - use a comparison to get bool dtype
+    let var = UOp::define_var("cond".to_string(), 0, 1);
+    let zero = UOp::const_(DType::Index, ConstValue::Int(0));
+    let cond = var.try_cmpgt(&zero).unwrap();
     let true_val = UOp::native_const(10i32);
     let false_val = UOp::native_const(5i32);
     let where_op = UOp::try_where(cond, true_val, false_val).unwrap();

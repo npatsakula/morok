@@ -110,6 +110,23 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let l = ctx.get(lhs);
             let r = ctx.get(rhs);
             let ltype = ldt(&lhs.dtype());
+            let rtype = ldt(&rhs.dtype());
+
+            // Debug: detect type mismatch (logged via tracing)
+            if ltype != rtype {
+                tracing::error!(
+                    uop_id = uop.id,
+                    uop_dtype = ?uop.dtype(),
+                    op = ?op,
+                    lhs_id = lhs.id,
+                    rhs_id = rhs.id,
+                    lhs_dtype = ?lhs.dtype(),
+                    rhs_dtype = ?rhs.dtype(),
+                    lhs_op = ?lhs.op().as_ref(),
+                    rhs_op = ?rhs.op().as_ref(),
+                    "Binary op type mismatch - lhs and rhs have different dtypes"
+                );
+            }
 
             if matches!(op, BinaryOp::Max) {
                 render_binary_max(&dst, lhs, l, r, &ltype, kernel);

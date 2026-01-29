@@ -1113,9 +1113,11 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
                 other => other.clone(),
             };
 
+            // Compute result dtype based on vectorized indices
+            // If element_dtype is already vectorized, use it as-is to avoid double-vectorization
             let result_dtype = match vec_count {
-                Some(count) => element_dtype.vec(count),
-                None => element_dtype,
+                Some(count) if element_dtype.vcount() == 1 => element_dtype.vec(count),
+                _ => element_dtype,
             };
 
             // Create INDEX with Ptr dtype (buffer's dtype) - won't match pattern again.
@@ -1269,6 +1271,14 @@ fn devectorize_where(cond: &Arc<UOp>, t: &Arc<UOp>, f: &Arc<UOp>) -> Option<Arc<
 /// Works with both scalar and vector dtypes - `Op::Binary` preserves input dtype,
 /// performing element-wise operations for vectors.
 fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DType) -> Arc<UOp> {
+    // Tinygrad alignment: verify operand dtypes match for reduction chaining
+    debug_assert!(
+        a.dtype() == b.dtype(),
+        "apply_reduce_binary: dtype mismatch between operands: a={:?}, b={:?}",
+        a.dtype(),
+        b.dtype()
+    );
+
     match reduce_op {
         ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, a, b), dtype.clone()),
         ReduceOp::Mul => UOp::new(Op::Binary(BinaryOp::Mul, a, b), dtype.clone()),

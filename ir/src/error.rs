@@ -130,6 +130,41 @@ pub enum Error {
         "{op} must have Ptr dtype (following Tinygrad spec), got {dtype:?}. Use DefineVar for scalar variables."
     ))]
     DefineGlobalRequiresPtrDType { op: &'static str, dtype: DType },
+
+    // =========================================================================
+    // UOp Builder Guards (user-facing API for kernel implementation)
+    // =========================================================================
+    /// VECTORIZE requires at least one element.
+    #[snafu(display("VECTORIZE requires at least one element"))]
+    VectorizeEmpty,
+
+    /// VECTORIZE elements have mismatched dtypes.
+    #[snafu(display("VECTORIZE elements have mismatched dtypes: expected {expected:?}, got {actual:?}"))]
+    VectorizeDTypeMismatch { expected: DType, actual: DType },
+
+    /// GEP index out of bounds.
+    #[snafu(display("GEP index {index} out of bounds for vector with {vcount} elements"))]
+    GepIndexOutOfBounds { index: usize, vcount: usize },
+
+    /// GEP requires vector source.
+    #[snafu(display("GEP requires vector source (vcount > 1), got {dtype:?}"))]
+    GepRequiresVector { dtype: DType },
+
+    /// CONTRACT dtype count != axis product.
+    #[snafu(display("CONTRACT dtype count {dtype_count} != axis product {axis_product}"))]
+    ContractCountMismatch { dtype_count: usize, axis_product: usize },
+
+    /// UNROLL src dtype count != axis product.
+    #[snafu(display("UNROLL src dtype count {dtype_count} != axis product {axis_product}"))]
+    UnrollCountMismatch { dtype_count: usize, axis_product: usize },
+
+    /// WHERE condition must be bool.
+    #[snafu(display("WHERE condition must be bool, got {actual:?}"))]
+    WhereConditionNotBool { actual: DType },
+
+    /// BROADCAST requires scalar source.
+    #[snafu(display("BROADCAST requires scalar source (vcount=1), got {dtype:?}"))]
+    BroadcastRequiresScalar { dtype: DType },
 }
 
 /// Enhance an error with provenance information for a UOp.

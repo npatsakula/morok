@@ -163,6 +163,11 @@ impl UOp {
         use crate::shape::ranges_to_uops;
         use snafu::ensure;
 
+        // Empty padding (scalar) → identity
+        if padding.is_empty() {
+            return Ok(self.clone());
+        }
+
         // Check for symbolic padding values
         for (begin, end) in padding {
             ensure!(begin.is_const(), SymbolicPaddingUnsupportedSnafu);
@@ -192,6 +197,11 @@ impl UOp {
         use crate::error::{ShrinkBoundsViolationSnafu, SymbolicShrinkingUnsupportedSnafu};
         use crate::shape::ranges_to_uops;
         use snafu::ensure;
+
+        // Empty ranges (scalar) → identity
+        if ranges.is_empty() {
+            return Ok(self.clone());
+        }
 
         // Check for symbolic range values
         for (begin, end) in ranges {

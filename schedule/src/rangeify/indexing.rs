@@ -257,7 +257,15 @@ pub(crate) fn merge_consumer_ranges(
         let indices: Vec<_> = dim_ranges.iter().map(|r| r.get_idx()).collect();
         let valids: Vec<_> = dim_ranges.iter().map(|r| r.get_valid()).collect();
 
-        if all_ranges_same(&indices) {
+        let ranges_same = all_ranges_same(&indices);
+        debug!(
+            dim_idx = dim_idx,
+            ranges_same = ranges_same,
+            index_count = indices.len(),
+            "merge_consumer_ranges: all_ranges_same result"
+        );
+
+        if ranges_same {
             let merged_idx = Arc::clone(&indices[0]);
             let merged_valid = if valids.len() == 1 {
                 Arc::clone(&valids[0])
@@ -273,6 +281,7 @@ pub(crate) fn merge_consumer_ranges(
 
             out_rngs.push(merged_range);
         } else {
+            debug!(dim_idx = dim_idx, "merge_consumer_ranges: creating NEW Loop range (ranges not compatible)");
             out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Loop));
             realize_axes.push(dim_idx);
         }
@@ -896,6 +905,9 @@ pub fn ranges_equal(ranges1: &[Arc<UOp>], ranges2: &[Arc<UOp>]) -> bool {
 /// 1. They are pointer-equal
 /// 2. They are structurally equal (same UOp graph)
 /// 3. They are both REDUCE ranges with the same `end` value (different axis_ids are OK)
+/// 4. They both contain the same REDUCE range in their expression graph
+///    (handles cases where movement ops create different expression structures
+///    but preserve the underlying Range identity)
 fn ranges_compatible(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
     if Arc::ptr_eq(a, b) {
         return true;
@@ -909,9 +921,70 @@ fn ranges_compatible(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
         (
             Op::Range { axis_type: AxisType::Reduce, end: end_a, .. },
             Op::Range { axis_type: AxisType::Reduce, end: end_b, .. },
-        ) => Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b),
-        _ => false,
+        ) => {
+            return Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b);
+        }
+        _ => {}
     }
+
+    // NEW: Check if both expressions contain the same Reduce range
+    // This handles cases where movement ops (Reshape, etc.) wrap the Range in
+    // different expression structures, but the underlying Range is shared.
+    // For matmul, both A and B's k-dimension indices should contain the same
+    // Reduce Range even after different movement operation chains.
+    contains_same_reduce_range(a, b)
+}
+
+/// Check if two expressions contain at least one shared Reduce range.
+///
+/// Uses the `.ranges()` property to extract all Range ops from each expression,
+/// then checks if any Reduce ranges match by pointer equality or end value.
+fn contains_same_reduce_range(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
+    let a_ranges = a.ranges();
+    let b_ranges = b.ranges();
+
+    // Extract Reduce ranges from each expression
+    let a_reduce_ranges: Vec<_> =
+        a_ranges.iter().filter(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Reduce, .. })).collect();
+
+    let b_reduce_ranges: Vec<_> =
+        b_ranges.iter().filter(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Reduce, .. })).collect();
+
+    trace!(
+        a_id = a.id,
+        b_id = b.id,
+        a_reduce_count = a_reduce_ranges.len(),
+        b_reduce_count = b_reduce_ranges.len(),
+        a_reduce_ids = ?a_reduce_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
+        b_reduce_ids = ?b_reduce_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
+        "contains_same_reduce_range: checking"
+    );
+
+    // Check if any Reduce range from a matches any from b
+    for a_rng in &a_reduce_ranges {
+        for b_rng in &b_reduce_ranges {
+            // Pointer equality: same Range object
+            if Arc::ptr_eq(a_rng, b_rng) {
+                trace!(range_id = a_rng.id, "contains_same_reduce_range: MATCH by pointer equality");
+                return true;
+            }
+
+            // End value equality: different Range objects but same dimension
+            if let (Op::Range { end: end_a, .. }, Op::Range { end: end_b, .. }) = (a_rng.op(), b_rng.op()) {
+                if Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b) {
+                    trace!(
+                        a_range_id = a_rng.id,
+                        b_range_id = b_rng.id,
+                        "contains_same_reduce_range: MATCH by end value equality"
+                    );
+                    return true;
+                }
+            }
+        }
+    }
+
+    trace!("contains_same_reduce_range: NO MATCH");
+    false
 }
 
 /// Check if all ranges have identical index expressions (ignoring validity masks).

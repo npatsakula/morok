@@ -267,8 +267,10 @@ fn test_auto_ptr_eq_three_args() {
         Where(x, x, x) ~> x
     };
 
-    let a = UOp::native_const(42i32);
-    let b = UOp::native_const(99i32);
+    // Use bool values since WHERE condition must be bool
+    // Create distinct bool constants for testing pointer equality
+    let a = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let b = UOp::const_(DType::Bool, ConstValue::Bool(false));
 
     // Test Where(a, a, a) - should match
     let where_same = UOp::try_where(a.clone(), a.clone(), a.clone()).unwrap();
@@ -722,16 +724,22 @@ fn test_for_loop_ternary_expansion() {
         }
     };
 
+    // WHERE condition must be bool, branches can be any type
+    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let true_val = UOp::native_const(2.0f32);
+    let false_val = UOp::native_const(3.0f32);
+
+    // Test Where(cond, true_val, false_val) => cond
+    let where_abc = UOp::try_where(cond.clone(), true_val.clone(), false_val.clone()).unwrap();
+    match matcher.rewrite(&where_abc, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &cond)),
+        _ => panic!("Where pattern from for-loop should match"),
+    }
+
+    // MulAcc uses numeric types
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
     let c = UOp::native_const(3.0f32);
-
-    // Test Where(a, b, c) => a
-    let where_abc = UOp::try_where(a.clone(), b.clone(), c.clone()).unwrap();
-    match matcher.rewrite(&where_abc, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
-        _ => panic!("Where pattern from for-loop should match"),
-    }
 
     // Test MulAcc(a, b, c) => a
     let mulacc_abc = UOp::try_mulacc(a.clone(), b.clone(), c.clone()).unwrap();
@@ -1795,16 +1803,22 @@ fn test_for_loop_ternary_wildcard() {
         }
     };
 
+    // WHERE condition must be bool
+    let cond = UOp::const_(DType::Bool, ConstValue::Bool(true));
+    let true_val = UOp::native_const(2.0f32);
+    let false_val = UOp::native_const(3.0f32);
+
+    // Test Where(cond, true_val, false_val) => cond
+    let where_abc = UOp::try_where(cond.clone(), true_val.clone(), false_val.clone()).unwrap();
+    match matcher.rewrite(&where_abc, &mut ()) {
+        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &cond)),
+        _ => panic!("Where from ternary [*] should match"),
+    }
+
+    // MulAcc uses numeric types
     let a = UOp::native_const(1.0f32);
     let b = UOp::native_const(2.0f32);
     let c = UOp::native_const(3.0f32);
-
-    // Test Where(a, b, c) => a
-    let where_abc = UOp::try_where(a.clone(), b.clone(), c.clone()).unwrap();
-    match matcher.rewrite(&where_abc, &mut ()) {
-        RewriteResult::Rewritten(r) => assert!(Arc::ptr_eq(&r, &a)),
-        _ => panic!("Where from ternary [*] should match"),
-    }
 
     // Test MulAcc(a, b, c) => a
     let mulacc_abc = UOp::try_mulacc(a.clone(), b.clone(), c.clone()).unwrap();

@@ -35,6 +35,12 @@ use tracing::debug;
 use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
 
+/// Context for REDUCE transformation (Tinygrad devectorizer.py:280-281)
+#[derive(Debug, Default)]
+pub struct ReduceContext {
+    pub acc_num: u32,
+}
+
 use crate::rewrite::graph_rewrite_bottom_up;
 use crate::symbolic::patterns::symbolic;
 
@@ -231,9 +237,10 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:221)
     if let Op::Ternary(TernaryOp::Where, _, _, f) = alu.op()
-        && matches!(f.op(), Op::Invalid) {
-            return None;
-        }
+        && matches!(f.op(), Op::Invalid)
+    {
+        return None;
+    }
 
     let scalar_dtype = alu.dtype().scalar_dtype();
     let sources = alu.op().sources();
@@ -448,6 +455,14 @@ fn no_vectorized_index(
     cast_dtype: &DType,
 ) -> Option<Arc<UOp>> {
     let idx = indices.first()?;
+
+    // Tinygrad alignment: devectorizer.py expects scalar index
+    debug_assert!(
+        idx.dtype().vcount() == 1,
+        "no_vectorized_index: expected scalar index, got vcount={}",
+        idx.dtype().vcount()
+    );
+
     let DType::Ptr { base, .. } = cast_dtype else { return None };
     let cnt = base.vcount();
     if cnt <= 1 {
@@ -486,6 +501,13 @@ fn no_vectorized_index_broadcast(
     let first = elements.first()?;
     let Op::Cast { src: buf, dtype: cast_dtype } = first.op() else { return None };
     let idx = indices.first()?;
+
+    // Tinygrad alignment: devectorizer.py expects scalar index
+    debug_assert!(
+        idx.dtype().vcount() == 1,
+        "no_vectorized_index_broadcast: expected scalar index, got vcount={}",
+        idx.dtype().vcount()
+    );
 
     let DType::Ptr { base, .. } = cast_dtype else { return None };
     let cnt = base.vcount();
@@ -531,6 +553,14 @@ fn no_vectorized_index_gep(
     gep_indices: &[usize],
 ) -> Option<Arc<UOp>> {
     let idx = indices.first()?;
+
+    // Tinygrad alignment: devectorizer.py expects scalar index
+    debug_assert!(
+        idx.dtype().vcount() == 1,
+        "no_vectorized_index_gep: expected scalar index, got vcount={}",
+        idx.dtype().vcount()
+    );
+
     let DType::Ptr { base, .. } = cast_dtype else { return None };
     let cnt = base.vcount();
     let precnt = gep_indices.len();
@@ -1197,6 +1227,16 @@ pub fn pm_reduce() -> TypedPatternMatcher {
         // Convert REDUCE to accumulator pattern
         // Skip if ranges are empty (handled by codegen or identity)
         red @ Reduce { src, ranges, reduce_op } if !ranges.is_empty() => |red, src, ranges, reduce_op| {
+            tracing::debug!(
+                red_id = red.id,
+                red_dtype = ?red.dtype(),
+                red_dtype_vcount = red.dtype().vcount(),
+                src_id = src.id,
+                src_op = src.op().as_ref(),
+                src_dtype = ?src.dtype(),
+                src_dtype_vcount = src.dtype().vcount(),
+                "pm_reduce: REDUCE pattern matched"
+            );
             reduce_to_acc(red, src, ranges, reduce_op)
         },
     }
@@ -1299,13 +1339,73 @@ pub fn pm_flatten_range() -> TypedPatternMatcher {
     }
 }
 
+/// Horizontal reduce for accumulator pattern.
+///
+/// If src dtype matches out_dtype, returns `vec![src]`.
+/// Otherwise, creates stride-pattern GEPs to reduce src to out_dtype elements.
+///
+/// Based on Tinygrad's horizontal_reduce (devectorizer.py:284-289):
+/// ```python
+/// def horizontal_reduce(inp, out_dtype):
+///   if inp.dtype != out_dtype:
+///     horizontal_amount = inp.dtype.count // out_dtype.count
+///     return [inp.gep(tuple(range(i, inp.dtype.count, horizontal_amount))) for i in range(horizontal_amount)]
+///   return [inp]
+/// ```
+fn horizontal_reduce_for_acc(src: &Arc<UOp>, out_dtype: &DType, reduce_op: ReduceOp) -> Vec<Arc<UOp>> {
+    let src_count = src.dtype().vcount();
+    let out_count = out_dtype.vcount();
+
+    tracing::debug!(
+        src_id = src.id,
+        src_op = src.op().as_ref(),
+        src_dtype = ?src.dtype(),
+        src_count = src_count,
+        out_dtype = ?out_dtype,
+        out_count = out_count,
+        "horizontal_reduce_for_acc: checking dtype match"
+    );
+
+    // Types already match - return single-element list
+    if src_count == out_count {
+        tracing::debug!("horizontal_reduce_for_acc: dtypes match, returning src as-is");
+        return vec![src.clone()];
+    }
+
+    // Need horizontal reduction
+    let horizontal_amount = src_count / out_count;
+
+    // Edge case: uneven division - fall back to full scalar reduction
+    if !src_count.is_multiple_of(out_count) || horizontal_amount == 0 {
+        let scalar_dtype = src.dtype().scalar_dtype();
+        let elements: Vec<Arc<UOp>> = (0..src_count).map(|i| src.gep(vec![i])).collect();
+        return vec![
+            elements
+                .into_iter()
+                .reduce(|acc, elem| apply_reduce_binary(reduce_op, acc, elem, &scalar_dtype))
+                .expect("src_count >= 1"),
+        ];
+    }
+
+    // Create stride pattern GEPs
+    // e.g., for src=vec8 -> out=vec2, horizontal_amount=4:
+    //   GEP([0,4]), GEP([1,5]), GEP([2,6]), GEP([3,7])
+    (0..horizontal_amount)
+        .map(|i| {
+            let indices: Vec<usize> = (i..src_count).step_by(horizontal_amount).collect();
+            src.gep(indices)
+        })
+        .collect()
+}
+
 /// Convert a REDUCE operation to explicit accumulator pattern.
 ///
 /// Follows Tinygrad's approach (devectorizer.py:reduce_to_acc):
-/// 1. Find input_ranges (outer ranges that are NOT the reduce ranges)
-/// 2. Initialize accumulator BEFORE reduce loop (depends only on input_ranges)
-/// 3. Access accumulator INSIDE reduce loop (depends on reduce ranges)
-/// 4. Read final value AFTER reduce loop completes
+/// 1. First call horizontal_reduce to ensure src matches result dtype
+/// 2. Find input_ranges (outer ranges that are NOT the reduce ranges)
+/// 3. Initialize accumulator BEFORE reduce loop (depends only on input_ranges)
+/// 4. Access accumulator INSIDE reduce loop (depends on reduce ranges)
+/// 5. Read final value AFTER reduce loop completes
 ///
 /// Note: This creates INDEX ops with element dtype. pm_add_loads will:
 /// 1. Wrap INDEX with LOAD for values used in arithmetic
@@ -1320,6 +1420,28 @@ fn reduce_to_acc(
     // Use the REDUCE's actual output dtype (could be vec2 if upcasted)
     // Tinygrad: acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, ...), ...)
     let result_dtype = red.dtype();
+
+    // Step 0: Apply horizontal_reduce to ensure src dtype matches result dtype
+    // This handles vectorized sources (e.g., src=vec20, result=scalar).
+    // Tinygrad (devectorizer.py:293): lst = horizontal_reduce(inp, red.dtype)
+    let src_list = horizontal_reduce_for_acc(src, &result_dtype, *reduce_op);
+
+    // Tinygrad alignment: devectorizer.py:294
+    // assert all(x.dtype == red.dtype for x in lst)
+    debug_assert!(
+        src_list.iter().all(|x| x.dtype() == result_dtype),
+        "horizontal reduction dtype mismatch: expected {:?}, got {:?}",
+        result_dtype,
+        src_list.first().map(|x| x.dtype())
+    );
+
+    debug!(
+        src_id = src.id,
+        src_dtype = ?src.dtype(),
+        result_dtype = ?result_dtype,
+        src_list_len = src_list.len(),
+        "horizontal_reduce applied"
+    );
 
     // 1. Find input_ranges: outer ranges that are NOT the reduce ranges
     // These are ranges from the input that we need to preserve (nested loops)
@@ -1400,8 +1522,18 @@ fn reduce_to_acc(
         .call()
         .expect("ICE: unable to build index")
         .with_dtype(result_dtype.clone());
-    // 7. Apply reduce operation: new_val = op(idx_loop, src)
-    let new_val = apply_reduce_binary(*reduce_op, idx_loop.clone(), src.clone(), &result_dtype);
+
+    // 7. Chain accumulator with all horizontal-reduced elements
+    // Tinygrad: lst = [acc...] + horizontal_reduce_list
+    //           ret = functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
+    let mut chain_elements: Vec<Arc<UOp>> = vec![idx_loop.clone()];
+    chain_elements.extend(src_list);
+
+    let new_val = chain_elements
+        .into_iter()
+        .reduce(|acc_val, elem| apply_reduce_binary(*reduce_op, acc_val, elem, &result_dtype))
+        .expect("chain_elements should have at least one element (acc)");
+
     // 8. Store new value back to accumulator (idx_loop contains the INDEX, not acc directly)
     let store_loop = idx_loop.store_value(new_val);
     // 9. End the reduce ranges after the store
@@ -1429,6 +1561,14 @@ fn reduce_to_acc(
 
 /// Apply binary reduce operation between two values.
 fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DType) -> Arc<UOp> {
+    // Tinygrad alignment: verify operand dtypes match for reduction chaining
+    debug_assert!(
+        a.dtype() == b.dtype(),
+        "apply_reduce_binary: dtype mismatch between operands: a={:?}, b={:?}",
+        a.dtype(),
+        b.dtype()
+    );
+
     match reduce_op {
         ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, a, b), dtype.clone()),
         ReduceOp::Mul => UOp::new(Op::Binary(BinaryOp::Mul, a, b), dtype.clone()),

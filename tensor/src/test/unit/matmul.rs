@@ -185,7 +185,7 @@ fn test_print_matmul_ir() {
 
 #[test]
 #[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_512x512_ir -- --ignored --nocapture
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_print_matmul_512x512_ir() {
     const SIZE: usize = 512;
     let a = Tensor::from_slice((0..SIZE * SIZE).map(|i| (i as f32) * 0.01).collect::<Vec<_>>())

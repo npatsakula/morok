@@ -142,7 +142,13 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     // Now that UNROLL is expanded, REDUCE has its final dtype (e.g., vec2 if upcasted).
     // This creates accumulators with matching vector dtype.
     // IMPORTANT: Thread axes are excluded from reduce_to_acc's input_ranges via is_parallel().
-    let reduced = graph_rewrite_bottom_up(&pm_reduce(), expanded, &mut ());
+    //
+    // Tinygrad alignment: Combine pm_reduce + gep_pushing in single pass
+    // (Tinygrad: graph_rewrite(sink, pm_reduce+gep_pushing, ctx=ReduceContext()))
+    // This ensures GEP simplification happens atomically with REDUCE transformation,
+    // preventing dtype mismatches in horizontal reduction.
+    let pm_reduce_combined = pm_reduce() + gep_pushing_patterns();
+    let reduced = graph_rewrite_bottom_up(&pm_reduce_combined, expanded, &mut ());
     tracing::debug!(ast.optimized = reduced.tree(), "after pm_reduce");
 
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.

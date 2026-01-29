@@ -339,23 +339,25 @@ pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
     use morok_dtype::DType;
     use smallvec::SmallVec;
 
-    // Use Vectorize for all shapes (including empty)
-    // Empty shape → Vectorize { elements: [] }
-    // This is consistent with non-empty path and compatible with extract_shape_from_uop
-    let elements: SmallVec<[Arc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
+    assert!(!shape.is_empty(), "shape_to_uop does not support empty shapes (scalars); handle at callsite");
 
+    let elements: SmallVec<[Arc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
     UOp::vectorize(elements)
 }
 
 /// Convert a vector of (begin, end) ranges to two UOps for Pad/Shrink operations.
 ///
 /// Returns (begins_uop, ends_uop) as VECTORIZE UOps.
+///
+/// # Panics
+/// Panics if `ranges` is empty; handle scalars at the callsite.
 pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Arc<UOp>, Arc<UOp>) {
     use morok_dtype::DType;
     use smallvec::SmallVec;
 
-    let begins: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::Index)).collect();
+    assert!(!ranges.is_empty(), "ranges_to_uops does not support empty ranges (scalars); handle at callsite");
 
+    let begins: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::Index)).collect();
     let ends: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::Index)).collect();
 
     (UOp::vectorize(begins), UOp::vectorize(ends))
