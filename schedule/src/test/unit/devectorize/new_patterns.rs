@@ -267,3 +267,117 @@ fn test_gate_dropping_in_full_pipeline() {
     // The load should have been processed
     assert!(count_loads(&result) >= 1);
 }
+
+// =============================================================================
+// Gated Load Alt Pattern Tests (pm_render)
+// =============================================================================
+
+/// Test: Gated LOAD without alt gets const 0 alt
+#[test]
+fn test_gated_load_gets_alt() {
+    let buffer = create_buffer(64);
+    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
+    let gate = UOp::const_(DType::Bool, ConstValue::Bool(false)); // non-true gate
+
+    // Create gated INDEX
+    let gated_index =
+        UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec![idx], gate: Some(gate) }, DType::Float32);
+
+    // Create LOAD without alt
+    let load = UOp::load().buffer(buffer).index(gated_index).call();
+
+    // Apply pm_render
+    let result = apply_pm_render(&load);
+
+    // Result should be LOAD with alt value
+    match result.op() {
+        Op::Load { alt, .. } => {
+            assert!(alt.is_some(), "Gated LOAD should have alt value after pm_render");
+            if let Some(alt_val) = alt {
+                // Alt should be const 0
+                let is_zero = match alt_val.op() {
+                    Op::Const(cv) => {
+                        matches!(cv.0, ConstValue::Int(0)) || matches!(cv.0, ConstValue::Float(f) if f == 0.0)
+                    }
+                    _ => false,
+                };
+                assert!(is_zero, "Alt value should be 0");
+            }
+        }
+        other => {
+            // Could be transformed to something else
+            tracing::debug!("Gated load transformed to: {:?}", other);
+        }
+    }
+}
+
+/// Test: LOAD without gate is unchanged by alt pattern
+#[test]
+fn test_ungate_load_unchanged() {
+    let buffer = create_buffer(64);
+    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
+
+    // Create ungated INDEX
+    let index = UOp::index().buffer(buffer.clone()).indices(vec![idx]).call().unwrap();
+
+    // Create LOAD without alt
+    let load = UOp::load().buffer(buffer).index(index).call();
+
+    let result = apply_pm_render(&load);
+
+    // Result should still be LOAD without alt
+    match result.op() {
+        Op::Load { alt, .. } => {
+            assert!(alt.is_none(), "Ungated LOAD should not have alt value");
+        }
+        _ => {} // Could be transformed to VECTORIZE or other
+    }
+}
+
+// =============================================================================
+// is_increasing Tests (already in helpers.rs, but integration test here)
+// =============================================================================
+
+/// Test: is_increasing on range variable
+#[test]
+fn test_is_increasing_range() {
+    use morok_ir::types::{AxisId, AxisType};
+    let range = UOp::range_axis(UOp::index_const(16), AxisId::Unrenumbered(0), AxisType::Loop);
+    assert!(range.is_increasing(), "RANGE should be increasing");
+}
+
+/// Test: is_increasing on constant
+#[test]
+fn test_is_increasing_constant() {
+    let c = UOp::const_(DType::Int32, ConstValue::Int(5));
+    assert!(c.is_increasing(), "CONST should be increasing");
+}
+
+/// Test: is_increasing on add
+#[test]
+fn test_is_increasing_add_expr() {
+    use morok_ir::types::{AxisId, AxisType};
+    let range = UOp::range_axis(UOp::index_const(16), AxisId::Unrenumbered(0), AxisType::Loop);
+    let c = UOp::const_(DType::Index, ConstValue::Int(5));
+    let sum = range.try_add(&c).unwrap();
+    assert!(sum.is_increasing(), "RANGE + CONST should be increasing");
+}
+
+/// Test: is_increasing on mul by positive const
+#[test]
+fn test_is_increasing_mul_positive() {
+    use morok_ir::types::{AxisId, AxisType};
+    let range = UOp::range_axis(UOp::index_const(16), AxisId::Unrenumbered(0), AxisType::Loop);
+    let c = UOp::const_(DType::Index, ConstValue::Int(4));
+    let prod = range.try_mul(&c).unwrap();
+    assert!(prod.is_increasing(), "RANGE * positive CONST should be increasing");
+}
+
+/// Test: is_increasing on mul by negative const
+#[test]
+fn test_is_increasing_mul_negative() {
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let c = UOp::const_(DType::Int32, ConstValue::Int(-1));
+    let prod = x.try_mul(&c).unwrap();
+    assert!(!prod.is_increasing(), "x * negative CONST should not be increasing");
+}

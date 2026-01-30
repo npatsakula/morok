@@ -917,14 +917,12 @@ fn ranges_compatible(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
     }
     // Special case: Two REDUCE ranges with same end value are compatible
     // (they represent iteration over the same axis dimension, just from different contexts)
-    match (a.op(), b.op()) {
-        (
-            Op::Range { axis_type: AxisType::Reduce, end: end_a, .. },
-            Op::Range { axis_type: AxisType::Reduce, end: end_b, .. },
-        ) => {
-            return Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b);
-        }
-        _ => {}
+    if let (
+        Op::Range { axis_type: AxisType::Reduce, end: end_a, .. },
+        Op::Range { axis_type: AxisType::Reduce, end: end_b, .. },
+    ) = (a.op(), b.op())
+    {
+        return Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b);
     }
 
     // NEW: Check if both expressions contain the same Reduce range
@@ -970,15 +968,15 @@ fn contains_same_reduce_range(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
             }
 
             // End value equality: different Range objects but same dimension
-            if let (Op::Range { end: end_a, .. }, Op::Range { end: end_b, .. }) = (a_rng.op(), b_rng.op()) {
-                if Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b) {
-                    trace!(
-                        a_range_id = a_rng.id,
-                        b_range_id = b_rng.id,
-                        "contains_same_reduce_range: MATCH by end value equality"
-                    );
-                    return true;
-                }
+            if let (Op::Range { end: end_a, .. }, Op::Range { end: end_b, .. }) = (a_rng.op(), b_rng.op())
+                && (Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b))
+            {
+                trace!(
+                    a_range_id = a_rng.id,
+                    b_range_id = b_rng.id,
+                    "contains_same_reduce_range: MATCH by end value equality"
+                );
+                return true;
             }
         }
     }

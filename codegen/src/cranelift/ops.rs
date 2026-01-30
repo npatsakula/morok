@@ -104,7 +104,8 @@ pub(crate) fn codegen_uop(
             Some(codegen_bitcast(src_val, &src.dtype(), dtype, builder)?)
         }
 
-        Op::Load { buffer, index } => {
+        Op::Load { buffer, index, alt: _ } => {
+            // TODO: Handle alt value for gated loads when gate is false
             let buffer_val = get_value(buffer, builder, values, loop_contexts)?;
             let index_val = get_value(index, builder, values, loop_contexts)?;
             Some(codegen_load(buffer_val, index_val, &uop.dtype(), builder)?)

@@ -120,6 +120,7 @@ pub fn symbolic_simple() -> TypedPatternMatcher {
         + range_based_mod_div_patterns()
         + dce_dsl_patterns()
         + dead_loop_patterns()
+        + after_simplification_patterns()
 }
 
 /// Full symbolic simplification matcher.
@@ -824,6 +825,16 @@ pub fn dce_dsl_patterns() -> TypedPatternMatcher {
             let combined_cond = a.try_and_op(b).ok()?;
             UOp::try_where(combined_cond, Arc::clone(c), Arc::clone(d)).ok()
         },
+    }
+}
+
+/// AFTER simplification patterns (Tinygrad symbolic.py:256).
+///
+/// - AFTER(x, []) → x (empty deps, just passthrough)
+pub fn after_simplification_patterns() -> TypedPatternMatcher {
+    patterns! {
+        // AFTER(x, []) → x: empty dependencies means no ordering constraint
+        After { passthrough, deps } if deps.is_empty() ~> |passthrough| Arc::clone(passthrough),
     }
 }
 

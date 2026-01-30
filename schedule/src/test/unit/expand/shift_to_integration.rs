@@ -50,9 +50,8 @@ fn test_scheduler_shift_to_integration() {
     let mut scheduler = Scheduler::new(ast.clone(), renderer);
 
     // Get the reduce range
-    let reduce_range = scheduler.rngs().iter().find(|r| {
-        matches!(r.op(), Op::Range { axis_type: AxisType::Reduce, .. })
-    }).cloned();
+    let reduce_range =
+        scheduler.rngs().iter().find(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Reduce, .. })).cloned();
 
     if let Some(rng) = reduce_range {
         // Apply shift_to with UNROLL

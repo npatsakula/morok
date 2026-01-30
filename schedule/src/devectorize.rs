@@ -29,8 +29,7 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, WmmaMetadata};
-use tracing::debug;
+use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, UnaryOp, WmmaMetadata};
 
 use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
@@ -144,59 +143,6 @@ pub fn pm_render() -> TypedPatternMatcher {
             Some(if extracted.len() == 1 { extracted[0].clone() } else { UOp::vectorize(extracted) })
         },
 
-        // GEP(PTRCAT) → distribute element indices across sources
-        // PTRCAT vcount = total elements, NOT source count. GEP indices are element indices.
-        // Example: PTRCAT with 8 sources (each ptr<vec4<float>>) has vcount=32
-        // GEP([0..31]) should extract elements across all sources
-        Gep { vector: PtrCat { sources }, indices } => {
-            // Build element-to-source mapping: element_idx -> (source_idx, offset_in_source)
-            let mut element_map: Vec<(usize, usize)> = Vec::new();
-            for (src_idx, src) in sources.iter().enumerate() {
-                let src_count = ptr_element_count(src);
-                for offset in 0..src_count {
-                    element_map.push((src_idx, offset));
-                }
-            }
-
-            // Fast path: if indices match sources 1:1, just reorder sources
-            if element_map.len() == sources.len() && element_map.iter().all(|(_, off)| *off == 0) {
-                let reordered: SmallVec<[Arc<UOp>; 4]> = indices.iter()
-                    .filter_map(|&i| sources.get(i).cloned())
-                    .collect();
-                if reordered.len() == indices.len() {
-                    return Some(if reordered.len() == 1 {
-                        reordered[0].clone()
-                    } else {
-                        UOp::ptrcat().sources(reordered.to_vec()).call()
-                    });
-                }
-            }
-
-            // General case: distribute element indices across sources
-            let mut result_elements: Vec<Arc<UOp>> = Vec::with_capacity(indices.len());
-            for &elem_idx in indices.iter() {
-                if elem_idx >= element_map.len() {
-                    return None; // Index out of bounds
-                }
-                let (src_idx, offset) = element_map[elem_idx];
-                let src = &sources[src_idx];
-                let src_count = ptr_element_count(src);
-                let elem = if src_count == 1 {
-                    src.clone()
-                } else {
-                    src.gep(vec![offset])
-                };
-                result_elements.push(elem);
-            }
-
-            Some(if result_elements.len() == 1 {
-                result_elements[0].clone()
-            } else {
-                // Result is VECTORIZE of extracted pointer elements
-                UOp::vectorize(result_elements.into_iter().collect())
-            })
-        },
-
         // Multi-index GEP → VECTORIZE (fallback, must be last GEP pattern)
         Gep { vector, indices } if indices.len() > 1 => |vector, indices| {
             let geps: SmallVec<[Arc<UOp>; 4]> = indices.iter()
@@ -208,6 +154,47 @@ pub fn pm_render() -> TypedPatternMatcher {
         // Single-element unwrap
         Vectorize { elements } if elements.len() == 1 => Some(elements[0].clone()),
         PtrCat { sources } if sources.len() == 1 => Some(sources[0].clone()),
+
+        // =========================================================================
+        // Gated Load Alt Patterns (devectorizer.py:266-274)
+        // =========================================================================
+
+        // Give any gated LOADs without alt a const 0 alt value (devectorizer.py:267-269)
+        // LOAD(INDEX(buf, idx, gate)) where alt is None → LOAD with alt=0
+        load @ Load { index, alt: None, .. } if has_gate(index) => |load, index| {
+            let alt_value = load.const_like(ConstValue::Int(0));
+            Some(UOp::load().buffer(load.load_buffer()?).index(index.clone()).alt(alt_value).dtype(load.dtype()).call())
+        },
+
+        // WHERE(c, LOAD(INDEX(buf, idx, c)), alt) → LOAD with alt value (devectorizer.py:271-272)
+        // The load's gate matches the WHERE condition
+        Where(cond, load @ Load { index, alt: None, .. }, alt)
+            if index_has_gate_matching(index, cond)
+            => |cond, load, index, alt| {
+                let casted_alt = alt.cast(load.dtype());
+                let new_load = UOp::load()
+                    .buffer(load.load_buffer()?)
+                    .index(index.clone())
+                    .alt(casted_alt)
+                    .dtype(load.dtype())
+                    .call();
+                Some(new_load.cast(alt.dtype()))
+            },
+
+        // WHERE(c, alt, LOAD(INDEX(buf, idx, !c))) → LOAD with alt value (devectorizer.py:273-274)
+        // Same pattern but with inverted condition in WHERE
+        Where(cond, alt, load @ Load { index, alt: None, .. })
+            if index_has_inverted_gate_matching(index, cond)
+            => |cond, alt, load, index| {
+                let casted_alt = alt.cast(load.dtype());
+                let new_load = UOp::load()
+                    .buffer(load.load_buffer()?)
+                    .index(index.clone())
+                    .alt(casted_alt)
+                    .dtype(load.dtype())
+                    .call();
+                Some(new_load.cast(alt.dtype()))
+            },
     }
 }
 
@@ -215,6 +202,37 @@ pub fn pm_render() -> TypedPatternMatcher {
 fn is_identity_gep(vector: &Arc<UOp>, indices: &[usize]) -> bool {
     let vcount = vector.dtype().vcount();
     indices.len() == vcount && indices.iter().enumerate().all(|(i, &j)| i == j)
+}
+
+/// Check if index (or casted index) has a gate.
+fn has_gate(index: &Arc<UOp>) -> bool {
+    match index.op() {
+        Op::Index { gate: Some(_), .. } => true,
+        Op::Cast { src, .. } => has_gate(src),
+        _ => false,
+    }
+}
+
+/// Check if index has a gate that matches the given condition (pointer equality).
+fn index_has_gate_matching(index: &Arc<UOp>, cond: &Arc<UOp>) -> bool {
+    match index.op() {
+        Op::Index { gate: Some(g), .. } => Arc::ptr_eq(g, cond),
+        Op::Cast { src, .. } => index_has_gate_matching(src, cond),
+        _ => false,
+    }
+}
+
+/// Check if index has an inverted gate that matches the given condition.
+/// Matches INDEX(..., NOT(cond)) where cond is the WHERE condition.
+fn index_has_inverted_gate_matching(index: &Arc<UOp>, cond: &Arc<UOp>) -> bool {
+    match index.op() {
+        Op::Index { gate: Some(g), .. } => {
+            // Check if gate is NOT(cond)
+            if let Op::Unary(UnaryOp::Not, inner) = g.op() { Arc::ptr_eq(inner, cond) } else { false }
+        }
+        Op::Cast { src, .. } => index_has_inverted_gate_matching(src, cond),
+        _ => false,
+    }
 }
 
 // ============================================================================
@@ -281,27 +299,6 @@ pub fn no_vectorized_alu() -> TypedPatternMatcher {
 }
 
 // ============================================================================
-// VECTORIZE Normalization
-// ============================================================================
-
-/// Normalize VECTORIZE and GEP for rendering (subset of pm_render).
-pub fn pm_vectorize_normalize() -> TypedPatternMatcher {
-    crate::patterns! {
-        Gep { vector, indices } if indices.len() > 1 => |vector, indices| {
-            let geps: SmallVec<[Arc<UOp>; 4]> = indices.iter()
-                .map(|&i| vector.gep(vec![i]))
-                .collect();
-            Some(UOp::vectorize(geps))
-        },
-
-        Gep { vector, indices } if vector.dtype().vcount() == 1 && indices.len() == 1 && indices[0] == 0
-            ~> |vector| Arc::clone(vector),
-
-        Vectorize { elements } if elements.len() == 1 => |elements| Some(elements[0].clone()),
-    }
-}
-
-// ============================================================================
 // Devectorize Patterns (devectorizer.py:250-256)
 // ============================================================================
 
@@ -335,16 +332,13 @@ fn devectorize_wmma(
     }
 
     // Split each source by out_sz
-    let sources = [a, b, c];
-    let mut tsrcs: Vec<Vec<Arc<UOp>>> = vec![Vec::new(), Vec::new(), Vec::new()];
-
-    for (i, src) in sources.iter().enumerate() {
-        let src_count = src.dtype().vcount();
-        for grp in (0..src_count).step_by(out_sz) {
-            let gep_indices: Vec<usize> = (grp..grp + out_sz.min(src_count - grp)).collect();
-            tsrcs[i].push((*src).gep(gep_indices));
-        }
-    }
+    let tsrcs: Vec<Vec<Arc<UOp>>> = [a, b, c]
+        .iter()
+        .map(|src| {
+            let n = src.dtype().vcount();
+            (0..n).step_by(out_sz).map(|g| src.gep((g..g + out_sz.min(n - g)).collect())).collect()
+        })
+        .collect();
 
     // Verify all sources have same number of groups
     let num_groups = tsrcs[0].len();
@@ -354,12 +348,12 @@ fn devectorize_wmma(
     }
 
     // Create new WMMA for each group, flatten with GEP
-    let wmmas: Vec<Arc<UOp>> = (0..num_groups)
-        .map(|g| UOp::wmma(tsrcs[0][g].clone(), tsrcs[1][g].clone(), tsrcs[2][g].clone(), metadata.clone()))
+    let wmma_ex: SmallVec<[Arc<UOp>; 4]> = (0..num_groups)
+        .flat_map(|g| {
+            let w = UOp::wmma(tsrcs[0][g].clone(), tsrcs[1][g].clone(), tsrcs[2][g].clone(), metadata.clone());
+            (0..out_sz).map(move |i| w.gep(vec![i]))
+        })
         .collect();
-
-    let wmma_ex: SmallVec<[Arc<UOp>; 4]> =
-        wmmas.iter().flat_map(|w| (0..out_sz).map(move |i| w.gep(vec![i]))).collect();
 
     Some(UOp::vectorize(wmma_ex))
 }
@@ -379,7 +373,9 @@ fn cast_after_pattern() -> TypedPatternMatcher {
 fn devectorize_buf_and_index_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         // DEFINE_LOCAL/REG with vector pointer → scalar pointer + CAST
-        def if is_vectorized_define_local_or_reg(def) => no_vectorized_buf(def),
+        def if matches!(def.op(), Op::DefineLocal(_) | Op::DefineReg { .. })
+            && def.ptrdtype().is_some_and(|(base, _, _)| base.vcount() > 1)
+            => no_vectorized_buf(def),
 
         // INDEX(CAST(DEFINE_LOCAL/REG), scalar_idx) → scaled vector index
         Index { buffer: Cast { src: buf, dtype: cast_dtype }, indices, gate }
@@ -389,24 +385,22 @@ fn devectorize_buf_and_index_patterns() -> TypedPatternMatcher {
         // INDEX(BROADCAST(CAST(...)), scalar_idx)
         Index { buffer: Vectorize { elements }, indices, gate }
             if is_scalar_index(indices) && is_vectorized_broadcast_cast(elements)
-            => no_vectorized_index_broadcast(elements, indices, gate),
+            => {
+                let first = elements.first()?;
+                let Op::Cast { src: buf, dtype: DType::Ptr { base, .. } } = first.op() else { return None };
+                let idx = indices.first()?;
+                no_vectorized_index_precnt(buf, idx, gate, base.vcount(), &vec![0; elements.len()])
+            },
 
         // INDEX(GEP(CAST(...)), scalar_idx)
         Index { buffer: Gep { vector: Cast { src: buf, dtype: cast_dtype }, indices: gep_indices }, indices, gate }
             if is_scalar_index(indices) && is_vectorized_local_reg_cast(buf, cast_dtype)
-            => no_vectorized_index_gep(buf, indices, gate, cast_dtype, gep_indices),
+            => {
+                let DType::Ptr { base, .. } = cast_dtype else { return None };
+                let idx = indices.first()?;
+                no_vectorized_index_precnt(buf, idx, gate, base.vcount(), gep_indices)
+            },
     }
-}
-
-fn is_vectorized_define_local_or_reg(uop: &Arc<UOp>) -> bool {
-    match uop.op() {
-        Op::DefineLocal(_) | Op::DefineReg { .. } => has_vectorized_ptr(uop),
-        _ => false,
-    }
-}
-
-fn has_vectorized_ptr(uop: &Arc<UOp>) -> bool {
-    uop.ptrdtype().is_some_and(|(base, _, _)| base.vcount() > 1)
 }
 
 fn is_scalar_index(indices: &SmallVec<[Arc<UOp>; 4]>) -> bool {
@@ -414,15 +408,14 @@ fn is_scalar_index(indices: &SmallVec<[Arc<UOp>; 4]>) -> bool {
 }
 
 fn is_vectorized_local_reg_cast(buf: &Arc<UOp>, cast_dtype: &DType) -> bool {
-    let DType::Ptr { base, .. } = cast_dtype else { return false };
-    base.vcount() > 1 && is_define_local_or_reg_or_after(buf)
+    matches!(cast_dtype, DType::Ptr { base, .. } if base.vcount() > 1) && is_define_local_or_reg_or_after(buf)
 }
 
 fn is_vectorized_broadcast_cast(elements: &SmallVec<[Arc<UOp>; 4]>) -> bool {
-    let Some(first) = elements.first() else { return false };
-    let Op::Cast { src: inner, dtype: cast_dtype } = first.op() else { return false };
-    let DType::Ptr { base, .. } = cast_dtype else { return false };
-    base.vcount() > 1 && is_define_local_or_reg_or_after(inner)
+    elements.first().is_some_and(|f| {
+        matches!(f.op(), Op::Cast { dtype: DType::Ptr { base, .. }, src }
+        if base.vcount() > 1 && is_define_local_or_reg_or_after(src))
+    })
 }
 
 /// Uses `unwrap_after()` to handle `.or_after()` pattern.
@@ -455,14 +448,6 @@ fn no_vectorized_index(
     cast_dtype: &DType,
 ) -> Option<Arc<UOp>> {
     let idx = indices.first()?;
-
-    // Tinygrad alignment: devectorizer.py expects scalar index
-    debug_assert!(
-        idx.dtype().vcount() == 1,
-        "no_vectorized_index: expected scalar index, got vcount={}",
-        idx.dtype().vcount()
-    );
-
     let DType::Ptr { base, .. } = cast_dtype else { return None };
     let cnt = base.vcount();
     if cnt <= 1 {
@@ -471,7 +456,7 @@ fn no_vectorized_index(
 
     let buf_broadcast = buf.broadcast(cnt);
     let idx_broadcast = idx.broadcast(cnt);
-    let offset_vec = create_index_vector(cnt);
+    let offset_vec = create_index_vector(0..cnt as i64);
     let cnt_broadcast = idx.const_like(cnt as i64).broadcast(cnt);
     let final_idx = idx_broadcast.mul(&cnt_broadcast).add(&offset_vec);
 
@@ -487,107 +472,36 @@ fn no_vectorized_index(
     )
 }
 
-fn create_index_vector(cnt: usize) -> Arc<UOp> {
-    let elements: SmallVec<[Arc<UOp>; 4]> = (0..cnt).map(|i| UOp::index_const(i as i64)).collect();
+fn create_index_vector(values: impl IntoIterator<Item = i64>) -> Arc<UOp> {
+    let elements: SmallVec<[Arc<UOp>; 4]> = values.into_iter().map(UOp::index_const).collect();
     UOp::vectorize(elements)
 }
 
-/// INDEX(BROADCAST(CAST(buf)), scalar_idx) → scaled vec idx (devectorizer.py:233-239)
-fn no_vectorized_index_broadcast(
-    elements: &SmallVec<[Arc<UOp>; 4]>,
-    indices: &SmallVec<[Arc<UOp>; 4]>,
-    gate: &Option<Arc<UOp>>,
-) -> Option<Arc<UOp>> {
-    let first = elements.first()?;
-    let Op::Cast { src: buf, dtype: cast_dtype } = first.op() else { return None };
-    let idx = indices.first()?;
-
-    // Tinygrad alignment: devectorizer.py expects scalar index
-    debug_assert!(
-        idx.dtype().vcount() == 1,
-        "no_vectorized_index_broadcast: expected scalar index, got vcount={}",
-        idx.dtype().vcount()
-    );
-
-    let DType::Ptr { base, .. } = cast_dtype else { return None };
-    let cnt = base.vcount();
-    let precnt = elements.len();
-    if cnt <= 1 {
-        return None;
-    }
-
-    let input_gep: Vec<usize> = vec![0; precnt];
-    let gep_arg: Vec<usize> = (0..cnt).flat_map(|_| 0..precnt).collect();
-    let sum_arg: Vec<i64> = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64)).collect();
-
-    let total_cnt = cnt * precnt;
-    let buf_broadcast = buf.broadcast(total_cnt);
-    let idx_gep = idx.gep(gep_arg);
-    let cnt_broadcast = idx.const_like(cnt as i64).broadcast(total_cnt);
-    let sum_vec = create_const_index_vector(&sum_arg);
-    let final_idx = idx_gep.mul(&cnt_broadcast).add(&sum_vec);
-
-    let buf_dtype = buf_broadcast.dtype();
-    Some(
-        UOp::index()
-            .buffer(buf_broadcast)
-            .indices(vec![final_idx])
-            .maybe_gate(gate.clone())
-            .call()
-            .expect("ICE: unabel to create index")
-            .with_dtype(buf_dtype),
-    )
-}
-
-fn create_const_index_vector(values: &[i64]) -> Arc<UOp> {
-    let elements: SmallVec<[Arc<UOp>; 4]> = values.iter().map(|&v| UOp::index_const(v)).collect();
-    UOp::vectorize(elements)
-}
-
-/// INDEX(GEP(CAST(buf)), scalar_idx) → scaled vec idx
-fn no_vectorized_index_gep(
+/// INDEX with precnt multiplier (broadcast or gep case) (devectorizer.py:233-239)
+fn no_vectorized_index_precnt(
     buf: &Arc<UOp>,
-    indices: &SmallVec<[Arc<UOp>; 4]>,
+    idx: &Arc<UOp>,
     gate: &Option<Arc<UOp>>,
-    cast_dtype: &DType,
-    gep_indices: &[usize],
+    cnt: usize,
+    input_gep: &[usize],
 ) -> Option<Arc<UOp>> {
-    let idx = indices.first()?;
-
-    // Tinygrad alignment: devectorizer.py expects scalar index
-    debug_assert!(
-        idx.dtype().vcount() == 1,
-        "no_vectorized_index_gep: expected scalar index, got vcount={}",
-        idx.dtype().vcount()
-    );
-
-    let DType::Ptr { base, .. } = cast_dtype else { return None };
-    let cnt = base.vcount();
-    let precnt = gep_indices.len();
-    if cnt <= 1 {
-        return None;
-    }
-
-    let input_gep: Vec<usize> = gep_indices.to_vec();
+    let precnt = input_gep.len();
+    let total = cnt * precnt;
     let gep_arg: Vec<usize> = (0..cnt).flat_map(|_| 0..precnt).collect();
-    let sum_arg: Vec<i64> = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64)).collect();
+    let sum_arg = (0..cnt).flat_map(|i| input_gep.iter().map(move |&y| (i + y) as i64));
 
-    let total_cnt = cnt * precnt;
-    let buf_broadcast = buf.broadcast(total_cnt);
-    let idx_gep = idx.gep(gep_arg);
-    let cnt_broadcast = idx.const_like(cnt as i64).broadcast(total_cnt);
-    let sum_vec = create_const_index_vector(&sum_arg);
-    let final_idx = idx_gep.mul(&cnt_broadcast).add(&sum_vec);
+    let buf_broadcast = buf.broadcast(total);
+    let final_idx =
+        idx.gep(gep_arg).mul(&idx.const_like(cnt as i64).broadcast(total)).add(&create_index_vector(sum_arg));
 
-    let buf_dtype = buf_broadcast.dtype();
     Some(
         UOp::index()
-            .buffer(buf_broadcast)
+            .buffer(buf_broadcast.clone())
             .indices(vec![final_idx])
             .maybe_gate(gate.clone())
             .call()
-            .expect("ICE: unabel to create index")
-            .with_dtype(buf_dtype),
+            .expect("ICE: unable to create index")
+            .with_dtype(buf_broadcast.dtype()),
     )
 }
 
@@ -716,14 +630,19 @@ pub fn load_store_folding_patterns() -> TypedPatternMatcher {
 // Correct Load Store Patterns (devectorizer.py:198-203)
 // ============================================================================
 
-/// LOAD/STORE(CAST(INDEX)) → split by device fold lengths.
+/// LOAD/STORE(CAST(INDEX)) → split by device fold lengths + image fixup.
 pub fn correct_load_store_patterns() -> TypedPatternMatcher {
     crate::patterns! {
-        Load { buffer, index: Cast { src: idx @ Index { buffer: _, .. }, dtype: cast_dtype } }
-            => split_load(buffer, idx, cast_dtype),
+        // Split LOAD/STORE by device fold lengths
+        ls @ Load { index: Cast { src: idx @ Index { buffer: _, .. }, .. }, .. }
+            => split_load_store(ls, idx),
 
-        Store { index: Cast { src: idx @ Index { buffer: idx_buffer, .. }, dtype: cast_dtype }, value, ranges }
-            => split_store(idx_buffer, idx, cast_dtype, value, ranges),
+        ls @ Store { index: Cast { src: idx @ Index { buffer: _, .. }, .. }, .. }
+            => split_load_store(ls, idx),
+
+        // Image fixup patterns (devectorizer.py:176-196)
+        ls @ Load { buffer: _, index: _, alt: _ } => image_fixup(ls),
+        ls @ Store { index: _, value: _, ranges: _ } => image_fixup(ls),
     }
 }
 
@@ -739,35 +658,12 @@ fn is_define_or_after(uop: &Arc<UOp>) -> bool {
 /// Tinygrad devectorizer.py:115 - expand_index only matches VECTORIZE of defines.
 fn is_vector_index(uop: &Arc<UOp>) -> bool {
     let Op::Index { buffer, indices, .. } = uop.op() else { return false };
-
-    // Index must be vector
     let Some(idx) = indices.first() else { return false };
-    let idx_vcount = idx.dtype().vcount();
-    if idx_vcount <= 1 {
-        tracing::trace!(idx_vcount = idx_vcount, "is_vector_index: idx not vector");
+    if idx.dtype().vcount() <= 1 {
         return false;
     }
-
-    // Buffer MUST be VECTORIZE (not bare buffer) - Tinygrad line 115
-    let Op::Vectorize { elements } = buffer.op() else {
-        tracing::trace!("is_vector_index: buffer not VECTORIZE");
-        return false;
-    };
-
-    // Elements must be Defines.or_after()
-    if elements.is_empty() || !elements.iter().all(is_define_or_after) {
-        tracing::trace!("is_vector_index: elements not defines");
-        return false;
-    }
-
-    // Don't vectorize bool loads (LLVM i1 vector load is broken)
-    let is_bool = elements[0].dtype().base().is_bool();
-    if is_bool {
-        tracing::trace!("is_vector_index: bool type, skipping");
-        return false;
-    }
-
-    true
+    let Op::Vectorize { elements } = buffer.op() else { return false };
+    !elements.is_empty() && elements.iter().all(is_define_or_after)
 }
 
 // ============================================================================
@@ -976,20 +872,7 @@ fn distribute_ptrcat_store(
 
     for ptr in sources.iter() {
         let ptr_count = ptr_element_count(ptr);
-
-        // Safety check: GEP indices must not exceed value's element count
-        // If this triggers, there's a bug in earlier passes that created mismatched shapes
-        if offset + ptr_count > value_vcount {
-            panic!(
-                "ICE: incorrect Morok IR produced; PTRCAT size mismatch in distribute_ptrcat_store: \
-                 offset={}, ptr_count={}, value_vcount={} (expected value_vcount >= {})",
-                offset,
-                ptr_count,
-                value_vcount,
-                offset + ptr_count
-            );
-        }
-
+        debug_assert!(offset + ptr_count <= value_vcount, "PTRCAT size mismatch");
         let gep_indices: Vec<usize> = (offset..offset + ptr_count).collect();
         let store_value = value.gep(gep_indices);
         stores.push(ptr.store_with_ranges(store_value, ranges.clone()));
@@ -1017,45 +900,39 @@ fn ptr_element_count(ptr: &Arc<UOp>) -> usize {
 // split_load_store (devectorizer.py:130-174)
 // ============================================================================
 
-/// Device fold lengths: Image=[4], Default=[4,2,1]. TODO: device-specific (DSP, AMX).
-fn get_device_fold_lengths(load_dtype: &DType) -> Vec<usize> {
-    if let DType::Ptr { base, .. } = load_dtype
-        && matches!(base.as_ref(), DType::Image { .. })
-    {
-        return vec![4, 1];
-    }
-    vec![4, 2, 1]
-}
+/// Split LOAD/STORE into multiple chunks by device fold lengths (devectorizer.py:130-174).
+fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Index { buffer: buf, indices, .. } = idx.op() else { return None };
 
-/// Split LOAD by fold length divisibility.
-fn split_load(buffer: &Arc<UOp>, idx: &Arc<UOp>, cast_dtype: &DType) -> Option<Arc<UOp>> {
-    let Op::Index { indices, .. } = idx.op() else {
-        return None;
-    };
-
-    let sz = match cast_dtype {
-        DType::Ptr { size: Some(sz), .. } => *sz,
-        DType::Ptr { base, .. } => base.vcount(),
+    // sz = ls.src[0].dtype.count (Tinygrad: size from index dtype)
+    let sz = match ls.op() {
+        Op::Load { index, .. } | Op::Store { index, .. } => index.dtype().vcount(),
         _ => return None,
     };
-
-    if sz <= 1 {
+    if sz == 1 {
         return None;
     }
 
-    tracing::debug!(sz = sz, "split_load");
+    // Fold lengths (devectorizer.py:138-152)
+    let buf_dtype = buf.dtype();
+    let no_fold = (!buf_dtype.base().is_float() && !matches!(buf_dtype, DType::Image { .. }))
+        || matches!(buf_dtype, DType::Ptr { addrspace: AddrSpace::Reg, .. });
+    let mut lengths = if no_fold {
+        vec![1]
+    } else if matches!(buf_dtype, DType::Image { .. }) {
+        vec![4, 1]
+    } else {
+        vec![4, 2, 1] // ctx.supports_float4
+    };
 
-    let scalar_dtype = buffer.dtype().scalar_dtype();
-    let mut lengths = get_device_fold_lengths(&scalar_dtype.vec(sz));
-
+    // Filter by divisibility (devectorizer.py:155-156)
     if let Some(offset) = indices.first() {
         lengths.retain(|&len| offset_divides_evenly(offset, len));
     }
-    if !lengths.contains(&1) {
-        lengths.push(1);
-    }
 
-    let mut chunks = Vec::new();
+    // Split loop (devectorizer.py:159-170)
+    let scalar_dtype = buf_dtype.scalar_dtype();
+    let mut ret = Vec::new();
     let mut pos = 0usize;
 
     while pos < sz {
@@ -1063,95 +940,32 @@ fn split_load(buffer: &Arc<UOp>, idx: &Arc<UOp>, cast_dtype: &DType) -> Option<A
             if pos + fold_len > sz {
                 continue;
             }
+            let lidx = if pos == 0 { idx.clone() } else { offset_index(idx, pos as i64) };
+            let lidx = if fold_len > 1 { lidx.cast(make_vec_ptr_dtype(buf, fold_len)) } else { lidx };
 
-            let chunk_idx = if pos == 0 { idx.clone() } else { offset_index(idx, pos as i64) };
-            let chunk_ptr = if fold_len > 1 { chunk_idx.cast(make_vec_ptr_dtype(buffer, fold_len)) } else { chunk_idx };
-            let chunk_dtype = scalar_dtype.vec(fold_len);
-
-            chunks.push(UOp::load().buffer(buffer.clone()).index(chunk_ptr).dtype(chunk_dtype).call());
-            pos += fold_len;
-            break;
-        }
-    }
-
-    if chunks.len() <= 1 {
-        return None;
-    }
-
-    Some(UOp::cat().sources(chunks).dtype(scalar_dtype.vec(sz)).call())
-}
-
-fn split_store(
-    idx_buffer: &Arc<UOp>,
-    idx: &Arc<UOp>,
-    cast_dtype: &DType,
-    value: &Arc<UOp>,
-    ranges: &SmallVec<[Arc<UOp>; 4]>,
-) -> Option<Arc<UOp>> {
-    let Op::Index { indices, .. } = idx.op() else {
-        return None;
-    };
-
-    // Use the VALUE's vcount - we can only extract elements that exist in the value.
-    // Tinygrad uses the pointer type's count (devectorizer.py:132) but ensures earlier
-    // passes make value and pointer types match.
-    let sz = value.dtype().vcount();
-
-    // ICE check: pointer type should not expect more elements than value provides
-    let ptr_sz = match cast_dtype {
-        DType::Ptr { size: Some(sz), .. } => *sz,
-        DType::Ptr { base, .. } => base.vcount(),
-        _ => 1,
-    };
-    if ptr_sz > sz {
-        panic!(
-            "ICE: incorrect Morok IR produced; split_store pointer/value size mismatch: \
-             ptr expects {} elements but value only has {}",
-            ptr_sz, sz
-        );
-    }
-
-    if sz <= 1 {
-        return None;
-    }
-
-    tracing::debug!(sz = sz, "split_store");
-
-    let mut lengths = get_device_fold_lengths(&value.dtype());
-    if let Some(offset) = indices.first() {
-        lengths.retain(|&len| offset_divides_evenly(offset, len));
-    }
-    if !lengths.contains(&1) {
-        lengths.push(1);
-    }
-
-    let mut stores = Vec::new();
-    let mut pos = 0usize;
-
-    while pos < sz {
-        for &fold_len in &lengths {
-            if pos + fold_len > sz {
-                continue;
+            match ls.op() {
+                Op::Store { value, ranges, .. } => {
+                    ret.push(lidx.store_with_ranges(value.gep((pos..pos + fold_len).collect()), ranges.clone()));
+                }
+                Op::Load { buffer, .. } => {
+                    ret.push(UOp::load().buffer(buffer.clone()).index(lidx).dtype(scalar_dtype.vec(fold_len)).call());
+                }
+                _ => return None,
             }
-
-            let chunk_idx = if pos == 0 { idx.clone() } else { offset_index(idx, pos as i64) };
-            let chunk_ptr =
-                if fold_len > 1 { chunk_idx.cast(make_vec_ptr_dtype(idx_buffer, fold_len)) } else { chunk_idx };
-            let gep_indices: Vec<usize> = (pos..pos + fold_len).collect();
-            let chunk_value = value.gep(gep_indices);
-            stores.push(chunk_ptr.store_with_ranges(chunk_value, ranges.clone()));
-
             pos += fold_len;
             break;
         }
     }
 
-    if stores.len() <= 1 {
+    if ret.len() <= 1 {
         return None;
     }
 
-    tracing::debug!(num_stores = stores.len(), "split_store");
-    Some(UOp::group(stores.into_iter().collect()))
+    match ls.op() {
+        Op::Load { .. } => Some(UOp::cat().sources(ret).dtype(scalar_dtype.vec(sz)).call()),
+        Op::Store { .. } => Some(UOp::group(ret.into_iter().collect())),
+        _ => None,
+    }
 }
 
 /// Conservative: false for unknown expressions (devectorizer.py:156).
@@ -1190,6 +1004,148 @@ fn offset_index(idx: &Arc<UOp>, offset: i64) -> Arc<UOp> {
 }
 
 // ============================================================================
+// image_fixup (devectorizer.py:176-196)
+// ============================================================================
+
+/// Convert linear image index to 2D (x, y) coordinates.
+///
+/// For images with shape [height, width]:
+///   x_coord = (linear_idx // 4) % width
+///   y_coord = linear_idx // (4 * width)
+///
+/// Handles two cases:
+/// 1. Normal image load/store with CAST from expand_index (dtype.count == 4)
+/// 2. Unfoldable image load (no CAST, direct INDEX with ImageDType)
+fn image_fixup(ls: &Arc<UOp>) -> Option<Arc<UOp>> {
+    // Case 1: LOAD/STORE(CAST(INDEX)) where INDEX.buffer is ImageDType
+    // The CAST should be to a vec4 pointer
+    let (index, is_load) = match ls.op() {
+        Op::Load { index, .. } => (index, true),
+        Op::Store { index, .. } => (index, false),
+        _ => return None,
+    };
+
+    // Check for CAST(INDEX) pattern
+    if let Op::Cast { src: inner_idx, dtype: cast_dtype } = index.op()
+        && let Op::Index { buffer: img_buf, indices, gate } = inner_idx.op() {
+            // Check if buffer is ImageDType
+            let DType::Image { shape, .. } = img_buf.dtype() else { return None };
+
+            // Image must be casted to vec4 (RGBA)
+            if cast_dtype.vcount() != 4 {
+                return None;
+            }
+
+            // Get the first index (linear index)
+            let lin_idx = indices.first()?;
+            let x = lin_idx.get_idx();
+            let valid = lin_idx.get_valid();
+
+            // Get image width (shape[1])
+            let width = shape.get(1).copied().unwrap_or(1) as i64;
+
+            // Create 2D index: x_coord = (x // 4) % width, y_coord = x // (4 * width)
+            let four = UOp::index_const(4);
+            let width_const = UOp::index_const(width);
+            let stride = UOp::index_const(4 * width);
+
+            let x_coord = x.idiv(&four).mod_(&width_const);
+            let y_coord = x.idiv(&stride);
+
+            // Create vec2 index
+            let oidx = UOp::vectorize(smallvec::smallvec![x_coord, y_coord]);
+
+            // Apply validity if not always true
+            let new_idx_expr = if matches!(valid.op(), Op::Const(cv) if cv.0 == ConstValue::Bool(true)) {
+                oidx
+            } else {
+                oidx.valid(valid)
+            };
+
+            // Create new INDEX with 2D coordinates
+            let new_idx = UOp::index()
+                .buffer(img_buf.clone())
+                .indices(vec![new_idx_expr])
+                .maybe_gate(gate.clone())
+                .call()
+                .ok()?
+                .with_dtype(inner_idx.dtype());
+
+            // Replace the index in LOAD/STORE
+            return Some(ls.replace().src(vec![new_idx]).call());
+        }
+
+    // Case 2: Direct INDEX with ImageDType (unfoldable image, no CAST)
+    if let Op::Index { buffer: img_buf, indices, gate } = index.op() {
+        let DType::Image { shape, .. } = img_buf.dtype() else { return None };
+
+        // Get the first index
+        let lin_idx = indices.first()?;
+        let x = lin_idx.get_idx();
+
+        // Check if it's already a 2D index (vec2)
+        if x.dtype().vcount() == 2 {
+            return None; // Already converted
+        }
+
+        // Only LOAD is supported for unfoldable images
+        if !is_load {
+            tracing::warn!("image_fixup: STORE with unfoldable image not supported");
+            return None;
+        }
+
+        let valid = lin_idx.get_valid();
+
+        // Get image width
+        let width = shape.get(1).copied().unwrap_or(1) as i64;
+
+        // Create 2D index
+        let four = UOp::index_const(4);
+        let width_const = UOp::index_const(width);
+        let stride = UOp::index_const(4 * width);
+
+        let x_coord = x.idiv(&four).mod_(&width_const);
+        let y_coord = x.idiv(&stride);
+
+        let oidx = UOp::vectorize(smallvec::smallvec![x_coord, y_coord]);
+
+        let new_idx_expr = if matches!(valid.op(), Op::Const(cv) if cv.0 == ConstValue::Bool(true)) {
+            oidx
+        } else {
+            oidx.valid(valid)
+        };
+
+        let new_idx = UOp::index()
+            .buffer(img_buf.clone())
+            .indices(vec![new_idx_expr])
+            .maybe_gate(gate.clone())
+            .call()
+            .ok()?
+            .with_dtype(index.dtype());
+
+        // For unfoldable images: load vec4, then select correct element
+        // result = reduce(lambda ret, i: (x % 4).ne(i).where(ret, vec_load.gep(i)), range(4), nan)
+        let vec4_dtype = ls.dtype().vec(4);
+        let vec_load = UOp::load().buffer(ls.load_buffer()?).index(new_idx).dtype(vec4_dtype).call();
+
+        // Build: WHERE(x%4 != 0, WHERE(x%4 != 1, WHERE(x%4 != 2, WHERE(x%4 != 3, nan, gep3), gep2), gep1), gep0)
+        let x_mod_4 = x.mod_(&four);
+        let nan = ls.const_like(ConstValue::Float(f64::NAN));
+
+        let result = (0..4).rev().fold(nan, |ret, i| {
+            let i_const = UOp::index_const(i);
+            let not_eq = x_mod_4.ne(&i_const);
+            let gep_i = vec_load.gep(vec![i as usize]);
+            UOp::try_where(not_eq, ret, gep_i).expect("WHERE")
+        });
+
+        return Some(result);
+    }
+
+    None
+}
+
+// ============================================================================
 // pm_reduce: Convert REDUCE to explicit accumulator pattern (Tinygrad devectorizer.py:310-316)
 // ============================================================================
 
@@ -1224,360 +1180,80 @@ use crate::symbolic::dce::reduce_identity;
 /// REDUCE before other patterns see it. Matches Tinygrad's pm_reduce.
 pub fn pm_reduce() -> TypedPatternMatcher {
     crate::patterns! {
-        // Convert REDUCE to accumulator pattern
-        // Skip if ranges are empty (handled by codegen or identity)
-        red @ Reduce { src, ranges, reduce_op } if !ranges.is_empty() => |red, src, ranges, reduce_op| {
-            tracing::debug!(
-                red_id = red.id,
-                red_dtype = ?red.dtype(),
-                red_dtype_vcount = red.dtype().vcount(),
-                src_id = src.id,
-                src_op = src.op().as_ref(),
-                src_dtype = ?src.dtype(),
-                src_dtype_vcount = src.dtype().vcount(),
-                "pm_reduce: REDUCE pattern matched"
-            );
-            reduce_to_acc(red, src, ranges, reduce_op)
-        },
+        // Match ALL REDUCEs - empty ranges handled by returning reduced value directly
+        red @ Reduce(_, ..) => |red| reduce_to_acc(red),
     }
 }
 
-/// Filter non-RANGE ops from END/REDUCE/STORE ranges.
-///
-/// Based on Tinygrad's `pm_flatten_range` (simplify.py:7-16).
-///
-/// # Problem
-///
-/// The `dead_loop_patterns()` in symbolic/patterns.rs converts trivial RANGE(end=1)
-/// nodes to CONST(0) when vmin == vmax. When these RANGEs are referenced in END.ranges,
-/// the graph rewrite substitutes the CONST, causing END to have `ranges: [CONST, CONST]`
-/// instead of `ranges: [RANGE, RANGE]`. This breaks linearization.
-///
-/// # Solution
-///
-/// This pattern filters END/REDUCE/STORE ranges to keep only actual RANGE ops,
-/// removing any CONST substitutions that occurred during symbolic simplification.
-///
-/// ```python
-/// # Tinygrad simplify.py:7-16
-/// def flatten_range(r:UOp):
-///   off = range_start[r.op]
-///   rngs = r.src[off:]
-///   if not len(rngs): return None
-///   new_rngs = [x for x in UOp.sink(*rngs).toposort() if x.op is Ops.RANGE]
-///   return r.replace(src=r.src[:off]+tuple(new_rngs))
-/// ```
-#[tracing::instrument]
-pub fn pm_flatten_range() -> TypedPatternMatcher {
-    /// Extract actual RANGE ops from a list of range sources.
-    /// Creates a sink, toposorts, and filters to only RANGE ops.
-    fn extract_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> SmallVec<[Arc<UOp>; 4]> {
-        if ranges.is_empty() {
-            return SmallVec::new();
-        }
-        let sink = UOp::sink(ranges.iter().cloned().collect());
-        sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect()
+/// Horizontal reduce for accumulator pattern (devectorizer.py:283-289).
+fn horizontal_reduce(inp: &Arc<UOp>, out_dtype: &DType) -> Vec<Arc<UOp>> {
+    if inp.dtype() == *out_dtype {
+        return vec![inp.clone()];
     }
-
-    /// Check if ranges changed (optimization to avoid unnecessary rewrites).
-    fn ranges_unchanged(original: &SmallVec<[Arc<UOp>; 4]>, filtered: &SmallVec<[Arc<UOp>; 4]>) -> bool {
-        original.len() == filtered.len() && original.iter().zip(filtered.iter()).all(|(a, b)| a.id == b.id)
-    }
-
-    crate::patterns! {
-        // END: Filter ranges to only RANGE ops
-        end @ End { computation, ranges } => {
-            let actual_ranges = extract_ranges(ranges);
-
-            if ranges_unchanged(ranges, &actual_ranges) {
-                return None; // No change needed
-            }
-
-            tracing::debug!(
-                end_id = end.id, original_len = ranges.len(), filtered_len = actual_ranges.len(),
-                "filtering END ranges"
-            );
-
-            if actual_ranges.is_empty() {
-                // All ranges were non-RANGE (e.g., all CONST) - unwrap END
-                Some(computation.clone())
-            } else {
-                Some(computation.end(actual_ranges))
-            }
-        },
-
-        // REDUCE: Filter ranges to only RANGE ops
-        reduce @ Reduce { src, ranges, reduce_op } => |reduce, src, ranges, reduce_op| {
-            let actual_ranges = extract_ranges(ranges);
-            if ranges_unchanged(ranges, &actual_ranges) {
-                return None;
-            }
-
-            tracing::debug!(
-                reduce_id = reduce.id, original_len = ranges.len(), filtered_len = actual_ranges.len(),
-                "pm_flatten_range: filtering REDUCE ranges"
-            );
-
-            Some(src.reduce(actual_ranges, *reduce_op).with_dtype(reduce.dtype()))
-        },
-
-        // STORE: Filter ranges to only RANGE ops
-        Store { index, value, ranges } => |index, value, ranges| {
-            let actual_ranges = extract_ranges(ranges);
-            if ranges_unchanged(ranges, &actual_ranges) {
-                return None;
-            }
-
-            tracing::debug!(
-                original_len = ranges.len(),
-                filtered_len = actual_ranges.len(),
-                "pm_flatten_range: filtering STORE ranges"
-            );
-
-            Some(index.store_with_ranges(value.clone(), actual_ranges))
-        },
-    }
+    let horizontal_amount = inp.dtype().vcount() / out_dtype.vcount();
+    debug_assert!(inp.dtype().vcount().is_multiple_of(out_dtype.vcount()), "horizontal mismatch");
+    (0..horizontal_amount).map(|i| inp.gep((i..inp.dtype().vcount()).step_by(horizontal_amount).collect())).collect()
 }
 
-/// Horizontal reduce for accumulator pattern.
-///
-/// If src dtype matches out_dtype, returns `vec![src]`.
-/// Otherwise, creates stride-pattern GEPs to reduce src to out_dtype elements.
-///
-/// Based on Tinygrad's horizontal_reduce (devectorizer.py:284-289):
-/// ```python
-/// def horizontal_reduce(inp, out_dtype):
-///   if inp.dtype != out_dtype:
-///     horizontal_amount = inp.dtype.count // out_dtype.count
-///     return [inp.gep(tuple(range(i, inp.dtype.count, horizontal_amount))) for i in range(horizontal_amount)]
-///   return [inp]
-/// ```
-fn horizontal_reduce_for_acc(src: &Arc<UOp>, out_dtype: &DType, reduce_op: ReduceOp) -> Vec<Arc<UOp>> {
-    let src_count = src.dtype().vcount();
-    let out_count = out_dtype.vcount();
+/// Convert REDUCE to explicit accumulator pattern (devectorizer.py:291-308).
+fn reduce_to_acc(red: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Reduce { src: inp, ranges: reduce_range, reduce_op } = red.op() else { return None };
 
-    tracing::debug!(
-        src_id = src.id,
-        src_op = src.op().as_ref(),
-        src_dtype = ?src.dtype(),
-        src_count = src_count,
-        out_dtype = ?out_dtype,
-        out_count = out_count,
-        "horizontal_reduce_for_acc: checking dtype match"
-    );
+    let lst = horizontal_reduce(inp, &red.dtype());
+    debug_assert!(lst.iter().all(|x| x.dtype() == red.dtype()), "horizontal reduction mismatch");
 
-    // Types already match - return single-element list
-    if src_count == out_count {
-        tracing::debug!("horizontal_reduce_for_acc: dtypes match, returning src as-is");
-        return vec![src.clone()];
+    // No ranges → just horizontal reduction
+    if reduce_range.is_empty() {
+        return lst.into_iter().reduce(|a, b| apply_reduce_binary(*reduce_op, a, b, &red.dtype()));
     }
 
-    // Need horizontal reduction
-    let horizontal_amount = src_count / out_count;
-
-    // Edge case: uneven division - fall back to full scalar reduction
-    if !src_count.is_multiple_of(out_count) || horizontal_amount == 0 {
-        let scalar_dtype = src.dtype().scalar_dtype();
-        let elements: Vec<Arc<UOp>> = (0..src_count).map(|i| src.gep(vec![i])).collect();
-        return vec![
-            elements
-                .into_iter()
-                .reduce(|acc, elem| apply_reduce_binary(reduce_op, acc, elem, &scalar_dtype))
-                .expect("src_count >= 1"),
-        ];
-    }
-
-    // Create stride pattern GEPs
-    // e.g., for src=vec8 -> out=vec2, horizontal_amount=4:
-    //   GEP([0,4]), GEP([1,5]), GEP([2,6]), GEP([3,7])
-    (0..horizontal_amount)
-        .map(|i| {
-            let indices: Vec<usize> = (i..src_count).step_by(horizontal_amount).collect();
-            src.gep(indices)
-        })
-        .collect()
-}
-
-/// Convert a REDUCE operation to explicit accumulator pattern.
-///
-/// Follows Tinygrad's approach (devectorizer.py:reduce_to_acc):
-/// 1. First call horizontal_reduce to ensure src matches result dtype
-/// 2. Find input_ranges (outer ranges that are NOT the reduce ranges)
-/// 3. Initialize accumulator BEFORE reduce loop (depends only on input_ranges)
-/// 4. Access accumulator INSIDE reduce loop (depends on reduce ranges)
-/// 5. Read final value AFTER reduce loop completes
-///
-/// Note: This creates INDEX ops with element dtype. pm_add_loads will:
-/// 1. Wrap INDEX with LOAD for values used in arithmetic
-/// 2. STORE cleanup will remove LOAD from STORE's index position
-#[tracing::instrument(skip_all)]
-fn reduce_to_acc(
-    red: &Arc<UOp>,
-    src: &Arc<UOp>,
-    ranges: &SmallVec<[Arc<UOp>; 4]>,
-    reduce_op: &ReduceOp,
-) -> Option<Arc<UOp>> {
-    // Use the REDUCE's actual output dtype (could be vec2 if upcasted)
-    // Tinygrad: acc = UOp(Ops.DEFINE_REG, red.dtype.ptr(size=1, ...), ...)
-    let result_dtype = red.dtype();
-
-    // Step 0: Apply horizontal_reduce to ensure src dtype matches result dtype
-    // This handles vectorized sources (e.g., src=vec20, result=scalar).
-    // Tinygrad (devectorizer.py:293): lst = horizontal_reduce(inp, red.dtype)
-    let src_list = horizontal_reduce_for_acc(src, &result_dtype, *reduce_op);
-
-    // Tinygrad alignment: devectorizer.py:294
-    // assert all(x.dtype == red.dtype for x in lst)
-    debug_assert!(
-        src_list.iter().all(|x| x.dtype() == result_dtype),
-        "horizontal reduction dtype mismatch: expected {:?}, got {:?}",
-        result_dtype,
-        src_list.first().map(|x| x.dtype())
-    );
-
-    debug!(
-        src_id = src.id,
-        src_dtype = ?src.dtype(),
-        result_dtype = ?result_dtype,
-        src_list_len = src_list.len(),
-        "horizontal_reduce applied"
-    );
-
-    // 1. Find input_ranges: outer ranges that are NOT the reduce ranges
-    // These are ranges from the input that we need to preserve (nested loops)
-    let reduce_range_set: HashSet<u64> = ranges.iter().map(|r| r.id).collect();
-
-    // Get all ranges from input's toposort that aren't reduce ranges or ended
-    let topo = src.toposort();
-    let ended_ranges: HashSet<u64> =
-        topo.iter()
-            .filter_map(|node| {
-                if let Op::End { ranges: ended, .. } = node.op() { Some(ended.iter().map(|r| r.id)) } else { None }
-            })
-            .flatten()
-            .collect();
-
+    // Find input_ranges: ranges in topo that are not reduce_range and not ended
+    let topo = inp.toposort();
+    let ended: HashSet<u64> = topo
+        .iter()
+        .filter_map(|n| if let Op::End { ranges, .. } = n.op() { Some(ranges.iter().map(|r| r.id)) } else { None })
+        .flatten()
+        .collect();
+    let reduce_ids: HashSet<u64> = reduce_range.iter().map(|r| r.id).collect();
     let input_ranges: SmallVec<[Arc<UOp>; 4]> = topo
         .iter()
-        .filter(|node| {
-            if let Op::Range { axis_type, .. } = node.op() {
-                // Exclude parallel dispatch axes (Thread, ThreadScheduled, Global, Local, Warp)
-                // These don't represent sequential iterations for accumulator placement.
-                // This is critical for Tinygrad alignment: pm_reduce runs BEFORE pm_add_gpudims,
-                // so Thread axes shouldn't exist yet. ThreadScheduled exists but is excluded.
-                !axis_type.is_parallel() && !reduce_range_set.contains(&node.id) && !ended_ranges.contains(&node.id)
-            } else {
-                false
-            }
-        })
+        .filter(|n| matches!(n.op(), Op::Range { .. }) && !reduce_ids.contains(&n.id) && !ended.contains(&n.id))
         .cloned()
         .collect();
 
-    debug!(
-        reduce_id = red.id,
-        reduce_ranges = ?ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
-        input_ranges = ?input_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
-        ended_ranges = ?ended_ranges.iter().collect::<Vec<_>>(),
-        src_id = src.id,
-        "processing REDUCE"
-    );
+    // Set up accumulator
+    let identity = reduce_identity(*reduce_op, red.dtype());
+    let acc = UOp::define_reg_typed(1, red.dtype());
+    let zero = UOp::index_const(0);
+    let make_idx = |buf: Arc<UOp>| UOp::index().buffer(buf).indices(vec![zero.clone()]).call().expect("index");
 
-    // 2. Create identity element for the reduction
-    let identity = reduce_identity(*reduce_op, result_dtype.clone());
-    // 3. Create DEFINE_REG accumulator with explicit element type
-    let acc = UOp::define_reg_typed(1, result_dtype.clone());
-    // 4. Create index into accumulator (always index 0 for single-element acc)
-    let zero_idx = UOp::index_const(0);
-    // 5. Initialize accumulator BEFORE the reduce loop
-    // If there are outer ranges, initialization happens after those start
-    // If no outer ranges, initialization happens directly (no AFTER needed)
-    let store_init = if input_ranges.is_empty() {
-        // No outer ranges: acc.index(0).store(identity)
-        let idx_init = UOp::index()
-            .buffer(acc.clone())
-            .indices(vec![zero_idx.clone()])
-            .call()
-            .expect("ICE: unable to create index")
-            .with_dtype(result_dtype.clone());
-        idx_init.store_value(identity)
-    } else {
-        // Has outer ranges: acc.after(*input_ranges).index(0).store(identity)
-        let idx_init = UOp::index()
-            .buffer(acc.after(input_ranges))
-            .indices(vec![zero_idx.clone()])
-            .call()
-            .expect("ICE: unable to create index")
-            .with_dtype(result_dtype.clone());
-        idx_init.store_value(identity)
-    };
+    // acc_init = acc.after(*input_ranges).index(0).store(identity)
+    let acc_init = make_idx(acc.after(input_ranges)).store_value(identity);
 
-    // 6. Create accumulator access INSIDE the reduce loop
-    // acc.after(store_init, *reduce_range).index(0)
-    let mut loop_deps: SmallVec<[Arc<UOp>; 4]> = smallvec::smallvec![store_init.clone()];
-    loop_deps.extend(ranges.iter().cloned());
-    let acc_inside_loop = acc.after(loop_deps);
-    let idx_loop = UOp::index()
-        .buffer(acc_inside_loop.clone())
-        .indices(vec![zero_idx.clone()])
-        .call()
-        .expect("ICE: unable to build index")
-        .with_dtype(result_dtype.clone());
+    // lst = [acc.after(acc_init, *reduce_range).index(0)] + lst
+    let mut loop_deps: SmallVec<[Arc<UOp>; 4]> = smallvec::smallvec![acc_init];
+    loop_deps.extend(reduce_range.iter().cloned());
+    let acc_loop = make_idx(acc.after(loop_deps));
+    let lst_with_acc = std::iter::once(acc_loop).chain(lst);
 
-    // 7. Chain accumulator with all horizontal-reduced elements
-    // Tinygrad: lst = [acc...] + horizontal_reduce_list
-    //           ret = functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
-    let mut chain_elements: Vec<Arc<UOp>> = vec![idx_loop.clone()];
-    chain_elements.extend(src_list);
+    // ret = functools.reduce(lambda x,y: x.alu(red.arg, y), lst)
+    let ret = lst_with_acc.reduce(|a, b| apply_reduce_binary(*reduce_op, a, b, &red.dtype()))?;
 
-    let new_val = chain_elements
-        .into_iter()
-        .reduce(|acc_val, elem| apply_reduce_binary(*reduce_op, acc_val, elem, &result_dtype))
-        .expect("chain_elements should have at least one element (acc)");
-
-    // 8. Store new value back to accumulator (idx_loop contains the INDEX, not acc directly)
-    let store_loop = idx_loop.store_value(new_val);
-    // 9. End the reduce ranges after the store
-    let end = store_loop.end(ranges.clone());
-    // 10. Final value AFTER loop completes
-    // acc.after(end).index(0)
-    let acc_after_end = acc.after(smallvec::smallvec![end.clone()]);
-    let idx_final =
-        UOp::index().buffer(acc_after_end.clone()).indices(vec![zero_idx]).call().expect("ICE: unable to build index");
-
-    debug!(
-        acc_id = acc.id,
-        store_init_id = store_init.id,
-        acc_inside_loop_id = acc_inside_loop.id,
-        idx_loop_id = idx_loop.id,
-        store_loop_id = store_loop.id,
-        end_id = end.id,
-        acc_after_end_id = acc_after_end.id,
-        idx_final_id = idx_final.id,
-        "created accumulator pattern"
-    );
-
-    Some(idx_final)
+    // return acc.after(acc.index(0).store(ret).end(*reduce_range)).index(0)
+    let store_end = make_idx(acc.clone()).store_value(ret).end(reduce_range.clone());
+    Some(make_idx(acc.after(smallvec::smallvec![store_end])))
 }
 
 /// Apply binary reduce operation between two values.
 fn apply_reduce_binary(reduce_op: ReduceOp, a: Arc<UOp>, b: Arc<UOp>, dtype: &DType) -> Arc<UOp> {
-    // Tinygrad alignment: verify operand dtypes match for reduction chaining
-    debug_assert!(
-        a.dtype() == b.dtype(),
-        "apply_reduce_binary: dtype mismatch between operands: a={:?}, b={:?}",
-        a.dtype(),
-        b.dtype()
-    );
-
+    debug_assert!(a.dtype() == b.dtype(), "reduce operand dtype mismatch");
     match reduce_op {
         ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, a, b), dtype.clone()),
         ReduceOp::Mul => UOp::new(Op::Binary(BinaryOp::Mul, a, b), dtype.clone()),
         ReduceOp::Max => UOp::new(Op::Binary(BinaryOp::Max, a, b), dtype.clone()),
         ReduceOp::Min => {
-            // Min(a, b) = Where(a < b, a, b)
-            let cond_dtype = DType::Bool.vec(dtype.vcount());
-            let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), cond_dtype);
-            UOp::try_where(cond, a, b).expect("WHERE construction should succeed")
+            let cond = UOp::new(Op::Binary(BinaryOp::Lt, a.clone(), b.clone()), DType::Bool.vec(dtype.vcount()));
+            UOp::try_where(cond, a, b).expect("WHERE")
         }
     }
 }

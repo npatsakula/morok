@@ -375,22 +375,6 @@ fn test_devectorize_idempotent() {
 // Regression Tests
 // =============================================================================
 
-/// Regression: Bool buffer should NOT be devectorized.
-///
-/// LLVM i1 vector loads read N bits, not N bytes.
-#[test]
-fn test_regression_bool_no_vector_load() {
-    let buffer = create_bool_buffer(64);
-
-    // Vector index should NOT be expanded for bool buffers
-    let index = create_vector_index_iota(buffer.clone(), 4);
-
-    let result = apply_phase1(&index);
-
-    // Should remain as INDEX (not PTRCAT) because bool can't be vector loaded
-    assert_is_index(&result);
-}
-
 /// Regression: Ensure PTRCAT sources are preserved correctly.
 #[test]
 fn test_regression_ptrcat_sources() {

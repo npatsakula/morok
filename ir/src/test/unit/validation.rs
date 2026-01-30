@@ -231,8 +231,7 @@ fn test_comparison_bool_dtype_result() {
 #[test]
 fn test_where_condition_must_be_bool() {
     // WHERE condition must be bool dtype - non-bool conditions should fail
-    let result =
-        UOp::try_where(UOp::native_const(1i32), UOp::native_const(1.0f32), UOp::native_const(0.0f32));
+    let result = UOp::try_where(UOp::native_const(1i32), UOp::native_const(1.0f32), UOp::native_const(0.0f32));
     assert!(result.is_err(), "Non-bool condition should fail");
 
     // Bool condition should succeed

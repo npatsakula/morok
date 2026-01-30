@@ -241,3 +241,153 @@ pub fn assert_dtype(uop: &Arc<UOp>, expected: DType) {
 pub fn assert_vcount(uop: &Arc<UOp>, expected: usize) {
     assert_eq!(uop.dtype().vcount(), expected, "vcount mismatch: expected {}, got {}", expected, uop.dtype().vcount());
 }
+
+// =============================================================================
+// BUFFERIZE Builders
+// =============================================================================
+
+use morok_ir::BufferizeOpts;
+
+/// Create a BUFFERIZE operation.
+pub fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>, opts: BufferizeOpts) -> Arc<UOp> {
+    UOp::new(Op::Bufferize { compute, ranges: ranges.into_iter().collect(), opts }, DType::Void)
+}
+
+/// Create a BUFFERIZE with global memory target.
+pub fn create_bufferize_global(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
+    use morok_dtype::DeviceSpec;
+    create_bufferize(compute, ranges, BufferizeOpts::new(DeviceSpec::Cpu))
+}
+
+// =============================================================================
+// BUFFERIZE Assertion Helpers
+// =============================================================================
+
+/// Assert that a UOp is a BUFFERIZE.
+pub fn assert_is_bufferize(uop: &Arc<UOp>) {
+    assert!(matches!(uop.op(), Op::Bufferize { .. }), "Expected BUFFERIZE, got {:?}", uop.op());
+}
+
+/// Assert that a BUFFERIZE has CONTRACT as its compute source.
+pub fn assert_bufferize_compute_is_contract(uop: &Arc<UOp>) {
+    match uop.op() {
+        Op::Bufferize { compute, .. } => {
+            assert!(
+                matches!(compute.op(), Op::Contract { .. }),
+                "Expected BUFFERIZE.compute to be CONTRACT, got {:?}",
+                compute.op()
+            );
+        }
+        other => panic!("Expected BUFFERIZE, got {:?}", other),
+    }
+}
+
+/// Unwrap BUFFERIZE and return (compute, ranges, opts).
+pub fn unwrap_bufferize(uop: &Arc<UOp>) -> (Arc<UOp>, smallvec::SmallVec<[Arc<UOp>; 4]>, BufferizeOpts) {
+    match uop.op() {
+        Op::Bufferize { compute, ranges, opts } => (compute.clone(), ranges.clone(), opts.clone()),
+        other => panic!("Expected BUFFERIZE, got {:?}", other),
+    }
+}
+
+// =============================================================================
+// END Builders
+// =============================================================================
+
+/// Create an END operation.
+pub fn create_end(computation: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
+    computation.end(ranges.into_iter().collect())
+}
+
+// =============================================================================
+// END Assertion Helpers
+// =============================================================================
+
+/// Assert that a UOp is an END.
+pub fn assert_is_end(uop: &Arc<UOp>) {
+    assert!(matches!(uop.op(), Op::End { .. }), "Expected END, got {:?}", uop.op());
+}
+
+/// Assert that an END has CONTRACT as its computation.
+pub fn assert_is_end_with_contract(uop: &Arc<UOp>) {
+    match uop.op() {
+        Op::End { computation, .. } => {
+            assert!(
+                matches!(computation.op(), Op::Contract { .. }),
+                "Expected END.computation to be CONTRACT, got {:?}",
+                computation.op()
+            );
+        }
+        other => panic!("Expected END, got {:?}", other),
+    }
+}
+
+/// Assert that an END has the expected number of ranges.
+pub fn assert_end_ranges_count(uop: &Arc<UOp>, expected: usize) {
+    match uop.op() {
+        Op::End { ranges, .. } => {
+            assert_eq!(
+                ranges.len(),
+                expected,
+                "END ranges count mismatch: expected {}, got {}",
+                expected,
+                ranges.len()
+            );
+        }
+        other => panic!("Expected END, got {:?}", other),
+    }
+}
+
+/// Unwrap END and return (computation, ranges).
+pub fn unwrap_end(uop: &Arc<UOp>) -> (Arc<UOp>, smallvec::SmallVec<[Arc<UOp>; 4]>) {
+    match uop.op() {
+        Op::End { computation, ranges } => (computation.clone(), ranges.clone()),
+        other => panic!("Expected END, got {:?}", other),
+    }
+}
+
+// =============================================================================
+// Op Counting Helpers
+// =============================================================================
+
+/// Count operations matching a predicate in the UOp tree.
+pub fn count_ops<F>(uop: &Arc<UOp>, predicate: F) -> usize
+where
+    F: Fn(&Arc<UOp>) -> bool,
+{
+    let mut count = 0;
+    count_ops_recursive(uop, &predicate, &mut count);
+    count
+}
+
+fn count_ops_recursive<F>(uop: &Arc<UOp>, predicate: &F, count: &mut usize)
+where
+    F: Fn(&Arc<UOp>) -> bool,
+{
+    if predicate(uop) {
+        *count += 1;
+    }
+    for child in uop.op().children() {
+        count_ops_recursive(child, predicate, count);
+    }
+}
+
+/// Count BUFFERIZE operations in the tree.
+pub fn count_bufferizes(uop: &Arc<UOp>) -> usize {
+    count_ops(uop, |u| matches!(u.op(), Op::Bufferize { .. }))
+}
+
+/// Count END operations in the tree.
+pub fn count_ends(uop: &Arc<UOp>) -> usize {
+    count_ops(uop, |u| matches!(u.op(), Op::End { .. }))
+}
+
+/// Count CONTRACT operations in the tree.
+pub fn count_contracts(uop: &Arc<UOp>) -> usize {
+    count_ops(uop, |u| matches!(u.op(), Op::Contract { .. }))
+}
+
+/// Count UNROLL operations in the tree.
+pub fn count_unrolls(uop: &Arc<UOp>) -> usize {
+    count_ops(uop, |u| matches!(u.op(), Op::Unroll { .. }))
+}

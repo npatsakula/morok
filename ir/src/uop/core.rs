@@ -221,6 +221,16 @@ impl UOp {
         }
     }
 
+    /// Get the buffer from a LOAD operation.
+    ///
+    /// Returns `None` if this is not a LOAD operation.
+    pub fn load_buffer(&self) -> Option<Arc<UOp>> {
+        match self.op() {
+            Op::Load { buffer, .. } => Some(buffer.clone()),
+            _ => None,
+        }
+    }
+
     /// Store a value at this INDEX node.
     ///
     /// Convenience method for `self.store(value)`.
@@ -1051,13 +1061,19 @@ impl UOp {
                 }
                 Op::Assign { target: new_target, value: new_value }
             }
-            Op::Load { buffer, index } => {
+            Op::Load { buffer, index, alt } => {
                 let new_buffer = buffer.substitute(map);
                 let new_index = index.substitute(map);
-                if Arc::ptr_eq(&new_buffer, buffer) && Arc::ptr_eq(&new_index, index) {
+                let new_alt = alt.as_ref().map(|a| a.substitute(map));
+                let alt_changed = match (&new_alt, alt) {
+                    (Some(na), Some(a)) => !Arc::ptr_eq(na, a),
+                    (None, None) => false,
+                    _ => true,
+                };
+                if Arc::ptr_eq(&new_buffer, buffer) && Arc::ptr_eq(&new_index, index) && !alt_changed {
                     return self.clone();
                 }
-                Op::Load { buffer: new_buffer, index: new_index }
+                Op::Load { buffer: new_buffer, index: new_index, alt: new_alt }
             }
 
             // Ternary operations
@@ -1520,9 +1536,11 @@ impl UOp {
             Op::CustomI { code, .. } => Op::CustomI { deps: new_srcs.iter().cloned().collect(), code: code.clone() },
 
             // Memory operations
-            Op::Load { .. } => {
-                assert_eq!(new_srcs.len(), 2);
-                Op::Load { buffer: src(0), index: src(1) }
+            Op::Load { alt, .. } => {
+                // Load has 2-3 sources: buffer, index, and optionally alt
+                assert!(new_srcs.len() >= 2 && new_srcs.len() <= 3, "Load requires 2-3 sources");
+                let new_alt = if new_srcs.len() == 3 { Some(src(2)) } else { alt.clone() };
+                Op::Load { buffer: src(0), index: src(1), alt: new_alt }
             }
             Op::Store { .. } => {
                 assert!(new_srcs.len() >= 2, "Store requires at least 2 sources (index, value)");

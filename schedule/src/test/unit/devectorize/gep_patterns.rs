@@ -224,35 +224,6 @@ fn test_gep_cat_single() {
     assert_eq!(result.dtype().vcount(), 1);
 }
 
-// =============================================================================
-// GEP(PTRCAT) Tests
-// =============================================================================
-
-/// Test: GEP on PTRCAT reorders pointers.
-///
-/// GEP(PTRCAT([p1, p2, p3]), [0, 2]) -> PTRCAT([p1, p3])
-#[test]
-fn test_gep_ptrcat_reorder() {
-    let buffer = create_buffer(64);
-
-    let p1 = create_index(buffer.clone(), 0);
-    let p2 = create_index(buffer.clone(), 1);
-    let p3 = create_index(buffer.clone(), 2);
-
-    let ptrcat = UOp::ptrcat().sources(vec![p1.clone(), p2, p3.clone()]).call();
-    let gep = ptrcat.gep(vec![0, 2]);
-
-    let result = apply_gep_ptrcat_patterns(&gep);
-
-    // Should produce PTRCAT([p1, p3])
-    match result.op() {
-        Op::PtrCat { sources } => {
-            assert_eq!(sources.len(), 2);
-        }
-        other => panic!("Expected PTRCAT, got {:?}", other),
-    }
-}
-
 /// Test: Single-source PTRCAT unwraps.
 ///
 /// PTRCAT([p]) -> p

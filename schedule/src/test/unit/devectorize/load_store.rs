@@ -166,7 +166,7 @@ fn test_split_load_vec8_to_vec4() {
 
     // LOAD with vec8 result dtype
     let load_dtype = DType::Float32.vec(8);
-    let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
+    let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
     let result = apply_phase2(&load);
 
@@ -203,7 +203,7 @@ fn test_split_load_vec6_mixed() {
     let cast_idx = idx.cast(vec6_ptr_dtype);
 
     let load_dtype = DType::Float32.vec(6);
-    let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
+    let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
     let result = apply_phase2(&load);
 
@@ -355,7 +355,7 @@ fn test_split_load_divisibility() {
     let cast_idx = idx.cast(vec8_ptr_dtype);
 
     let load_dtype = DType::Float32.vec(8);
-    let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
+    let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
     let result = apply_phase2(&load);
 
@@ -400,7 +400,7 @@ fn test_split_load_not_divisible() {
     let cast_idx = idx.cast(vec8_ptr_dtype);
 
     let load_dtype = DType::Float32.vec(8);
-    let load = UOp::new(Op::Load { buffer: buffer.clone(), index: cast_idx }, load_dtype);
+    let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
     let result = apply_phase2(&load);
 

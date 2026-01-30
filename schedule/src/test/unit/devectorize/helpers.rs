@@ -573,7 +573,7 @@ pub fn unwrap_vectorize(uop: &Arc<UOp>) -> SmallVec<[Arc<UOp>; 4]> {
 /// Unwrap LOAD and return (buffer, index).
 pub fn unwrap_load(uop: &Arc<UOp>) -> (Arc<UOp>, Arc<UOp>) {
     match uop.op() {
-        Op::Load { buffer, index } => (buffer.clone(), index.clone()),
+        Op::Load { buffer, index, .. } => (buffer.clone(), index.clone()),
         other => panic!("Expected LOAD, got {:?}", other),
     }
 }
@@ -619,4 +619,176 @@ pub fn unwrap_group(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
         Op::Group { sources } => sources.to_vec(),
         other => panic!("Expected GROUP, got {:?}", other),
     }
+}
+
+// =============================================================================
+// REDUCE/GEP Test Helpers
+// =============================================================================
+
+use morok_ir::{AxisId, AxisType, ReduceOp};
+
+/// Apply pm_reduce patterns to a UOp.
+///
+/// This runs the REDUCE → accumulator transformation (reduce_to_acc).
+pub fn apply_pm_reduce(uop: &Arc<UOp>) -> Arc<UOp> {
+    use crate::devectorize::pm_reduce;
+    graph_rewrite_bottom_up(&pm_reduce(), uop.clone(), &mut ())
+}
+
+/// Apply GEP movement and related load/store folding patterns.
+///
+/// This uses load_store_folding_patterns which includes:
+/// - expand_index patterns
+/// - gep_movement patterns (move_gep_after_load, move_gep_on_store)
+/// - ptrcat_distribution patterns
+///
+/// For isolated GEP movement testing, the patterns still apply correctly
+/// because the other patterns won't fire on inputs that don't match.
+pub fn apply_gep_movement(uop: &Arc<UOp>) -> Arc<UOp> {
+    apply_load_store_folding(uop)
+}
+
+// =============================================================================
+// REDUCE Builders
+// =============================================================================
+
+/// Create a REDUCE operation with specified ranges and operation.
+pub fn create_reduce(src: Arc<UOp>, ranges: Vec<Arc<UOp>>, reduce_op: ReduceOp) -> Arc<UOp> {
+    src.reduce(ranges.into_iter().collect(), reduce_op)
+}
+
+/// Create a Range with Loop axis type.
+pub fn create_range_loop(end: i64, axis_id: u32) -> Arc<UOp> {
+    let end_uop = UOp::const_(DType::Index, ConstValue::Int(end));
+    UOp::range_axis(end_uop, AxisId::Renumbered(axis_id as usize), AxisType::Loop)
+}
+
+/// Create a Range with Reduce axis type.
+pub fn create_range_reduce(end: i64, axis_id: u32) -> Arc<UOp> {
+    let end_uop = UOp::const_(DType::Index, ConstValue::Int(end));
+    UOp::range_axis(end_uop, AxisId::Renumbered(axis_id as usize), AxisType::Reduce)
+}
+
+/// Create a Range with Thread axis type (parallel).
+pub fn create_range_thread(end: i64, axis_id: u32) -> Arc<UOp> {
+    let end_uop = UOp::const_(DType::Index, ConstValue::Int(end));
+    UOp::range_axis(end_uop, AxisId::Renumbered(axis_id as usize), AxisType::Thread)
+}
+
+/// Create a Range with Global axis type (parallel).
+pub fn create_range_global(end: i64, axis_id: u32) -> Arc<UOp> {
+    let end_uop = UOp::const_(DType::Index, ConstValue::Int(end));
+    UOp::range_axis(end_uop, AxisId::Renumbered(axis_id as usize), AxisType::Global)
+}
+
+/// Create a Range with Local axis type (parallel).
+pub fn create_range_local(end: i64, axis_id: u32) -> Arc<UOp> {
+    let end_uop = UOp::const_(DType::Index, ConstValue::Int(end));
+    UOp::range_axis(end_uop, AxisId::Renumbered(axis_id as usize), AxisType::Local)
+}
+
+// =============================================================================
+// REDUCE Assertion Helpers
+// =============================================================================
+
+/// Assert that a UOp is a DEFINE_REG.
+pub fn assert_is_define_reg(uop: &Arc<UOp>) {
+    assert!(matches!(uop.op(), Op::DefineReg { .. }), "Expected DEFINE_REG, got {:?}", uop.op());
+}
+
+/// Assert that a UOp has the specified number of AFTER dependencies.
+pub fn assert_has_after_deps(uop: &Arc<UOp>, count: usize) {
+    match uop.op() {
+        Op::After { deps, .. } => {
+            assert_eq!(deps.len(), count, "Expected {} AFTER deps, got {}", count, deps.len());
+        }
+        other => panic!("Expected AFTER, got {:?}", other),
+    }
+}
+
+/// Assert that a UOp is an END.
+pub fn assert_is_end(uop: &Arc<UOp>) {
+    assert!(matches!(uop.op(), Op::End { .. }), "Expected END, got {:?}", uop.op());
+}
+
+/// Assert that a UOp is a REDUCE.
+pub fn assert_is_reduce(uop: &Arc<UOp>) {
+    assert!(matches!(uop.op(), Op::Reduce { .. }), "Expected REDUCE, got {:?}", uop.op());
+}
+
+/// Unwrap REDUCE and return (src, ranges, reduce_op).
+pub fn unwrap_reduce(uop: &Arc<UOp>) -> (Arc<UOp>, SmallVec<[Arc<UOp>; 4]>, ReduceOp) {
+    match uop.op() {
+        Op::Reduce { src, ranges, reduce_op } => (src.clone(), ranges.clone(), *reduce_op),
+        other => panic!("Expected REDUCE, got {:?}", other),
+    }
+}
+
+// =============================================================================
+// GEP Builders
+// =============================================================================
+
+/// Create a GEP operation with explicit indices.
+pub fn create_gep(vector: Arc<UOp>, indices: Vec<usize>) -> Arc<UOp> {
+    vector.gep(indices)
+}
+
+/// Create a LOAD with GEP on the index.
+///
+/// LOAD(buffer, GEP(index, indices))
+pub fn create_load_with_gep_index(buffer: Arc<UOp>, index: Arc<UOp>, gep_indices: Vec<usize>) -> Arc<UOp> {
+    let gep_index = index.gep(gep_indices);
+    UOp::load().buffer(buffer).index(gep_index).call()
+}
+
+/// Create a STORE with GEP on the index.
+///
+/// STORE(GEP(index, indices), value, ranges)
+pub fn create_store_with_gep_index(
+    index: Arc<UOp>,
+    gep_indices: Vec<usize>,
+    value: Arc<UOp>,
+    ranges: SmallVec<[Arc<UOp>; 4]>,
+) -> Arc<UOp> {
+    let gep_index = index.gep(gep_indices);
+    gep_index.store_with_ranges(value, ranges)
+}
+
+/// Compute the inverse permutation for GEP indices.
+///
+/// Given indices [2,0,1], returns [1,2,0] such that applying the inverse
+/// permutation to a vector reordered by the original undoes the reorder.
+pub fn compute_inverse_permutation(indices: &[usize]) -> Vec<usize> {
+    let mut inverse_map: Vec<(usize, usize)> = indices.iter().enumerate().map(|(i, &x)| (x, i)).collect();
+    inverse_map.sort_by_key(|&(x, _)| x);
+    inverse_map.iter().map(|&(_, i)| i).collect()
+}
+
+// =============================================================================
+// Op Counting Helpers (REDUCE/GEP specific)
+// =============================================================================
+
+/// Count REDUCE operations in the tree.
+pub fn count_reduces(uop: &Arc<UOp>) -> usize {
+    count_ops(uop, |u| matches!(u.op(), Op::Reduce { .. }))
+}
+
+/// Count DEFINE_REG operations in the tree.
+pub fn count_define_regs(uop: &Arc<UOp>) -> usize {
+    count_ops(uop, |u| matches!(u.op(), Op::DefineReg { .. }))
+}
+
+/// Count END operations in the tree.
+pub fn count_ends(uop: &Arc<UOp>) -> usize {
+    count_ops(uop, |u| matches!(u.op(), Op::End { .. }))
+}
+
+/// Count Range operations in the tree.
+pub fn count_ranges(uop: &Arc<UOp>) -> usize {
+    count_ops(uop, |u| matches!(u.op(), Op::Range { .. }))
+}
+
+/// Count Range operations with specific axis type.
+pub fn count_ranges_by_type(uop: &Arc<UOp>, target_type: AxisType) -> usize {
+    count_ops(uop, |u| matches!(u.op(), Op::Range { axis_type, .. } if *axis_type == target_type))
 }

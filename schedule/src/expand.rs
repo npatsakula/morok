@@ -617,10 +617,7 @@ fn end_unrolls(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         .collect();
 
     let contracted = computation.contract(all_axes);
-    Some(UOp::new(
-        Op::End { computation: contracted, ranges: non_unrolls.into_iter().cloned().collect() },
-        uop.dtype(),
-    ))
+    Some(UOp::new(Op::End { computation: contracted, ranges: non_unrolls.into_iter().cloned().collect() }, uop.dtype()))
 }
 
 /// Contract UNROLL to extract elements via GEP.
@@ -648,11 +645,8 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     );
 
     // Compute remaining axes and GEP indices
-    let remaining_axes: Vec<_> = unroll_axes
-        .iter()
-        .filter(|(ax, _)| !contract_axes.iter().any(|(cax, _)| cax == ax))
-        .cloned()
-        .collect();
+    let remaining_axes: Vec<_> =
+        unroll_axes.iter().filter(|(ax, _)| !contract_axes.iter().any(|(cax, _)| cax == ax)).cloned().collect();
 
     let exclude: Vec<usize> = remaining_axes.iter().map(|(ax, _)| *ax).collect();
     let gep_indices = swizzle_args(contract_axes, unroll_axes, &exclude);

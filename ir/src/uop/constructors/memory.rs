@@ -169,14 +169,17 @@ impl UOp {
     ///
     /// // Explicit dtype for vector loads
     /// UOp::load().buffer(buf).index(idx).dtype(vec4_dtype).call()
+    ///
+    /// // With alt value for gated loads
+    /// UOp::load().buffer(buf).index(idx).alt(zero).call()
     /// ```
     #[builder]
-    pub fn load(buffer: Arc<Self>, index: Arc<Self>, dtype: Option<DType>) -> Arc<Self> {
+    pub fn load(buffer: Arc<Self>, index: Arc<Self>, dtype: Option<DType>, alt: Option<Arc<Self>>) -> Arc<Self> {
         let dtype = dtype.unwrap_or_else(|| match &buffer.dtype {
             DType::Ptr { base, .. } => (**base).clone(),
             other => other.clone(),
         });
-        Self::new(Op::Load { buffer, index }, dtype)
+        Self::new(Op::Load { buffer, index, alt }, dtype)
     }
 
     /// Create a STORE operation without ranges.

@@ -243,19 +243,6 @@ fn test_expand_scalar_index_no_change() {
     assert_eq!(result.dtype().vcount(), 1, "Should remain scalar");
 }
 
-/// Test: Bool buffer should be skipped (LLVM i1 vector load issue).
-#[test]
-fn test_expand_bool_buffer_skipped() {
-    let buffer = create_bool_buffer(64);
-    let index = create_vector_index_iota(buffer.clone(), 4);
-
-    let result = apply_phase1(&index);
-
-    // Bool buffers should NOT be devectorized due to LLVM i1 issues
-    // Result should be unchanged INDEX
-    assert_is_index(&result);
-}
-
 /// Test: Gated index preserves gate.
 #[test]
 fn test_expand_gated_index() {

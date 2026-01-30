@@ -265,9 +265,18 @@ pub enum Op {
 
     // Memory operations (low-level, after kernel splitting, 2 variants)
     // Gate is on INDEX, not LOAD/STORE (following Tinygrad's model)
+    /// Load from buffer at index.
+    ///
+    /// - `buffer`: The buffer to load from
+    /// - `index`: The INDEX operation specifying where to load (may be gated)
+    /// - `alt`: Optional alternative value for gated loads (used when gate is false)
+    ///
+    /// When `alt` is Some, the load behaves as: `if gate { load(index) } else { alt }`.
+    /// This is used for masked loads in image processing and padding scenarios.
     Load {
         buffer: Arc<UOp>,
         index: Arc<UOp>,
+        alt: Option<Arc<UOp>>,
     },
     Store {
         index: Arc<UOp>,
@@ -395,7 +404,11 @@ impl Op {
             Self::Custom { deps, .. } | Self::CustomI { deps, .. } => deps.iter().collect(),
 
             // Memory operations
-            Self::Load { buffer, index } => SmallVec::from_slice(&[buffer, index]),
+            Self::Load { buffer, index, alt } => {
+                let mut children = SmallVec::from_slice(&[buffer, index]);
+                children.extend(alt);
+                children
+            }
             Self::Store { index, value, ranges } => {
                 let mut children = SmallVec::from_slice(&[index, value]);
                 children.extend(ranges.iter());

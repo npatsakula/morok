@@ -1131,7 +1131,7 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
                 buffer.dtype().clone(),  // Use buffer dtype (Ptr), not original INDEX dtype
             );
 
-            Some(UOp::new(Op::Load { buffer: buffer.clone(), index: ptr_index }, result_dtype))
+            Some(UOp::load().buffer(buffer.clone()).index(ptr_index).dtype(result_dtype).call())
         },
 
         // Pattern 2: Cleanup STORE - remove LOAD from index position
@@ -1199,16 +1199,40 @@ fn devectorize_unary(op: &UnaryOp, result: &Arc<UOp>, src: &Arc<UOp>) -> Option<
     Some(UOp::vectorize(scalar_ops))
 }
 
+/// Generic devectorize for any op (INDEX, CAST, BITCAST, etc).
+/// Mirrors Tinygrad's no_vectorized_alu (devectorizer.py:219-223).
+fn devectorize_generic(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let vcount = uop.dtype().vcount();
+    if vcount <= 1 {
+        return None;
+    }
+
+    let scalar_dtype = uop.dtype().scalar_dtype();
+    let sources = uop.op().sources();
+
+    let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
+        .map(|i| {
+            let new_sources: Vec<Arc<UOp>> =
+                sources.iter().map(|s| if s.dtype().vcount() > 1 { s.gep(vec![i]) } else { s.clone() }).collect();
+            uop.replace().dtype(scalar_dtype.clone()).src(new_sources).call()
+        })
+        .collect();
+
+    Some(UOp::vectorize(elements))
+}
+
 /// Pattern matcher for bool devectorization.
 ///
 /// LLVM's `<N x i1>` vectors are broken (no formal ABI, segfaults in codegen).
 /// This pass converts vectorized bool operations into scalar ops wrapped in
-/// VECTORIZE, following Tinygrad's approach (devectorizer.py:no_vectorized_alu).
+/// VECTORIZE, following Tinygrad's approach (cstyle.py:62-68, devectorizer.py:no_vectorized_alu).
 ///
 /// Transforms:
 /// - Any binary op producing vectorized bool → scalar ops + VECTORIZE
 /// - Any unary op producing vectorized bool → scalar ops + VECTORIZE
 /// - WHERE with vectorized condition → scalar WHERE + VECTORIZE
+/// - INDEX with vectorized bool dtype → scalar INDEX + VECTORIZE
+/// - CAST to/from vectorized bool → scalar CAST + VECTORIZE
 pub fn pm_bool_devectorize() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Any binary op that produces vectorized bool output
@@ -1231,6 +1255,18 @@ pub fn pm_bool_devectorize() -> TypedPatternMatcher<()> {
         Where(cond, t, f) if cond.dtype().vcount() > 1 => |cond, t, f| {
             devectorize_where(cond, t, f)
         },
+
+        // INDEX with vectorized bool dtype (cstyle.py:64)
+        idx @ Index { buffer: _, .. } if is_vectorized_bool(&idx.dtype()) => devectorize_generic(idx),
+
+        // CAST producing vectorized bool (cstyle.py:64)
+        c @ Cast { src: _, .. } if is_vectorized_bool(&c.dtype()) => devectorize_generic(c),
+
+        // CAST from vectorized bool (cstyle.py:66)
+        c @ Cast { src, .. } if is_vectorized_bool(&src.dtype()) => devectorize_generic(c),
+
+        // BITCAST with vectorized bool (cstyle.py:64)
+        bc @ BitCast { src: _, .. } if is_vectorized_bool(&bc.dtype()) => devectorize_generic(bc),
     }
 }
 

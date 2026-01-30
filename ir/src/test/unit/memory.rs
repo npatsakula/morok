@@ -55,7 +55,7 @@ fn test_load() {
     assert_eq!(load.dtype(), DType::Float32);
 
     // Should be Load op
-    if let Op::Load { buffer: b, index: i } = load.op() {
+    if let Op::Load { buffer: b, index: i, .. } = load.op() {
         assert!(std::sync::Arc::ptr_eq(b, &buffer));
         assert!(std::sync::Arc::ptr_eq(i, &index));
     } else {

@@ -395,6 +395,56 @@ impl UOp {
         // Invalid marker for out-of-bounds indices (used in padding/masking)
         Self::new(Op::Invalid, DType::Index)
     }
+
+    /// Check if this UOp is a monotonically increasing function of its inputs.
+    ///
+    /// Returns true for:
+    /// - Irreducible ops (RANGE, CONST, DEFINE_VAR)
+    /// - ADD of increasing ops
+    /// - MUL/IDIV by non-negative constants
+    ///
+    /// Based on Tinygrad's `is_increasing()` (ops.py:689-694).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Constants are increasing
+    /// let c = UOp::const_(DType::Int32, ConstValue::Int(5));
+    /// assert!(c.is_increasing());
+    ///
+    /// // Range variables are increasing
+    /// let range = UOp::range_axis(UOp::index_const(16), 0, AxisType::Loop);
+    /// assert!(range.is_increasing());
+    ///
+    /// // x + y is increasing if both x and y are increasing
+    /// let sum = range.try_add(&c).unwrap();
+    /// assert!(sum.is_increasing());
+    ///
+    /// // x * 2 is increasing if x is increasing
+    /// let two = UOp::const_(DType::Index, ConstValue::Int(2));
+    /// let scaled = range.try_mul(&two).unwrap();
+    /// assert!(scaled.is_increasing());
+    /// ```
+    pub fn is_increasing(self: &Arc<Self>) -> bool {
+        match self.op() {
+            // Irreducible: RANGE, CONST, DEFINE_VAR
+            Op::Range { .. } | Op::Const(_) | Op::DefineVar { .. } => true,
+
+            // ADD: both operands must be increasing
+            Op::Binary(BinaryOp::Add, a, b) => a.is_increasing() && b.is_increasing(),
+
+            // MUL/IDIV by non-negative constant
+            Op::Binary(BinaryOp::Mul | BinaryOp::Idiv, a, b) => {
+                if let Op::Const(cv) = b.op() {
+                    matches!(cv.0, ConstValue::Int(n) if n >= 0) && a.is_increasing()
+                } else {
+                    false
+                }
+            }
+
+            _ => false,
+        }
+    }
 }
 
 /// Computes the greatest common divisor using Euclid's algorithm.
@@ -537,5 +587,57 @@ mod tests {
         assert_eq!(gcd(12, 8), 4);
         assert_eq!(gcd(17, 19), 1);
         assert_eq!(gcd(100, 50), 50);
+    }
+
+    #[test]
+    fn test_is_increasing_const() {
+        let c = UOp::const_(DType::Int32, ConstValue::Int(5));
+        assert!(c.is_increasing());
+
+        let neg = UOp::const_(DType::Int32, ConstValue::Int(-5));
+        assert!(neg.is_increasing()); // Constants are always "increasing" (irreducible)
+    }
+
+    #[test]
+    fn test_is_increasing_add() {
+        let a = UOp::const_(DType::Int32, ConstValue::Int(5));
+        let b = UOp::const_(DType::Int32, ConstValue::Int(3));
+        let sum = a.try_add(&b).unwrap();
+        assert!(sum.is_increasing());
+    }
+
+    #[test]
+    fn test_is_increasing_mul_positive_const() {
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+        let scaled = x.try_mul(&two).unwrap();
+        assert!(scaled.is_increasing());
+    }
+
+    #[test]
+    fn test_is_increasing_mul_negative_const() {
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let neg = UOp::const_(DType::Int32, ConstValue::Int(-2));
+        let scaled = x.try_mul(&neg).unwrap();
+        assert!(!scaled.is_increasing()); // Multiplying by negative is not increasing
+    }
+
+    #[test]
+    fn test_is_increasing_idiv_positive_const() {
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+        let divided = x.idiv(&two);
+        assert!(divided.is_increasing());
+    }
+
+    #[test]
+    fn test_is_increasing_complex() {
+        // (x + 5) * 2 should be increasing
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let five = UOp::const_(DType::Int32, ConstValue::Int(5));
+        let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+        let sum = x.try_add(&five).unwrap();
+        let scaled = sum.try_mul(&two).unwrap();
+        assert!(scaled.is_increasing());
     }
 }

@@ -118,4 +118,3 @@ fn test_fix_reduce_range_upcast() {
         other => panic!("Expected REDUCE, got {:?}", other),
     }
 }
-

@@ -66,7 +66,7 @@ pub use scheduler::Scheduler;
 pub use scheduler::clear_kernel_name_counts;
 pub use types::{AxisType, Opt, OptArg, OptOps};
 
-use crate::devectorize::{bool_storage_patterns, pm_flatten_range, pm_reduce, pm_vectorize_normalize};
+use crate::devectorize::{bool_storage_patterns, pm_reduce};
 use crate::passes::pm_linearize_multi_index;
 use crate::rangeify::patterns::{pm_add_loads, pm_bool_devectorize, pm_reduce_devectorize};
 use crate::rewrite::{graph_rewrite_bottom_up, graph_rewrite_top_down};
@@ -181,12 +181,8 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
         with_loads
     };
 
-    // Step 3: Normalize remaining VECTORIZE/GEP patterns (multi-index GEP, single-source VECTORIZE)
-    let normalized = graph_rewrite_bottom_up(&pm_vectorize_normalize(), processed, &mut ());
-    tracing::debug!(ast.optimized = normalized.tree(), "after pm_vectorize_normalize");
-
-    // Step 4: Cleanup GEPs from pm_vectorize_normalize
-    let cleaned = graph_rewrite_bottom_up(&gep_pushing_patterns(), normalized, &mut ());
+    // Step 3: Cleanup GEPs
+    let cleaned = graph_rewrite_bottom_up(&gep_pushing_patterns(), processed, &mut ());
     tracing::debug!(ast.optimized = cleaned.tree(), "after pm_pushing_patterns");
 
     // Second pass of pm_add_loads: expansion may create new INDEX ops that need LOAD wrapping.
@@ -199,20 +195,11 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     let devectorized_mem = crate::devectorize::devectorize(&with_loads2);
     tracing::debug!(ast.optimized = devectorized_mem.tree(), "after devectorize");
 
-    // Flatten range: Filter non-RANGE ops from END/REDUCE/STORE ranges.
-    // The symbolic pass (included in devectorize) converts trivial RANGE(end=1) to CONST(0).
-    // When these RANGEs are referenced in END.ranges, the rewrite substitutes CONST,
-    // causing END to have `ranges: [CONST, CONST]` instead of `ranges: [RANGE, RANGE]`.
-    // This pattern filters END/REDUCE/STORE ranges to keep only actual RANGE ops.
-    // Based on Tinygrad's pm_flatten_range (simplify.py:7-16).
-    let flattened = graph_rewrite_bottom_up(&pm_flatten_range(), devectorized_mem, &mut ());
-    tracing::debug!(ast.optimized = flattened.tree(), "after pm_flatten_range");
-
     // Bool devectorization: Convert <N x i1> ALU ops to scalar ops + VECTORIZE.
     // LLVM's bool vectors are broken (no formal ABI, segfaults in codegen).
     // Based on Tinygrad's no_vectorized_alu approach.
     // Must run BEFORE reduce devectorization so comparisons are already scalar.
-    let devectorized = graph_rewrite_bottom_up(&pm_bool_devectorize(), flattened, &mut ());
+    let devectorized = graph_rewrite_bottom_up(&pm_bool_devectorize(), devectorized_mem, &mut ());
     tracing::debug!(ast.optimized = devectorized.tree(), "after pm_bool_devectorize");
 
     // Unified REDUCE devectorization: Handles all 3 mutually exclusive cases:
