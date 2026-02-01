@@ -164,8 +164,8 @@ fn test_flatten_ranges_full_graph() {
 
 #[test]
 fn test_flatten_range_single_range() {
-    // END with single range should still work
-    use morok_ir::Op;
+    // END with single range that's already flat returns None (no change needed)
+    // This is important for the rewrite engine to avoid infinite loops
     use smallvec::smallvec;
 
     let computation = UOp::native_const(1.0f32);
@@ -175,10 +175,7 @@ fn test_flatten_range_single_range() {
 
     let flattened = flatten_range_impl(&end);
 
-    // Should succeed (single range is still valid)
-    assert!(flattened.is_some());
-
-    if let Op::End { ranges, .. } = flattened.unwrap().op() {
-        assert_eq!(ranges.len(), 1);
-    }
+    // Should return None because nothing changed (single range, already flat)
+    // Returning Some with unchanged value would cause infinite loops in rewrite engine
+    assert!(flattened.is_none());
 }

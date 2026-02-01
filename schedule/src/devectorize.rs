@@ -1027,53 +1027,54 @@ fn image_fixup(ls: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Check for CAST(INDEX) pattern
     if let Op::Cast { src: inner_idx, dtype: cast_dtype } = index.op()
-        && let Op::Index { buffer: img_buf, indices, gate } = inner_idx.op() {
-            // Check if buffer is ImageDType
-            let DType::Image { shape, .. } = img_buf.dtype() else { return None };
+        && let Op::Index { buffer: img_buf, indices, gate } = inner_idx.op()
+    {
+        // Check if buffer is ImageDType
+        let DType::Image { shape, .. } = img_buf.dtype() else { return None };
 
-            // Image must be casted to vec4 (RGBA)
-            if cast_dtype.vcount() != 4 {
-                return None;
-            }
-
-            // Get the first index (linear index)
-            let lin_idx = indices.first()?;
-            let x = lin_idx.get_idx();
-            let valid = lin_idx.get_valid();
-
-            // Get image width (shape[1])
-            let width = shape.get(1).copied().unwrap_or(1) as i64;
-
-            // Create 2D index: x_coord = (x // 4) % width, y_coord = x // (4 * width)
-            let four = UOp::index_const(4);
-            let width_const = UOp::index_const(width);
-            let stride = UOp::index_const(4 * width);
-
-            let x_coord = x.idiv(&four).mod_(&width_const);
-            let y_coord = x.idiv(&stride);
-
-            // Create vec2 index
-            let oidx = UOp::vectorize(smallvec::smallvec![x_coord, y_coord]);
-
-            // Apply validity if not always true
-            let new_idx_expr = if matches!(valid.op(), Op::Const(cv) if cv.0 == ConstValue::Bool(true)) {
-                oidx
-            } else {
-                oidx.valid(valid)
-            };
-
-            // Create new INDEX with 2D coordinates
-            let new_idx = UOp::index()
-                .buffer(img_buf.clone())
-                .indices(vec![new_idx_expr])
-                .maybe_gate(gate.clone())
-                .call()
-                .ok()?
-                .with_dtype(inner_idx.dtype());
-
-            // Replace the index in LOAD/STORE
-            return Some(ls.replace().src(vec![new_idx]).call());
+        // Image must be casted to vec4 (RGBA)
+        if cast_dtype.vcount() != 4 {
+            return None;
         }
+
+        // Get the first index (linear index)
+        let lin_idx = indices.first()?;
+        let x = lin_idx.get_idx();
+        let valid = lin_idx.get_valid();
+
+        // Get image width (shape[1])
+        let width = shape.get(1).copied().unwrap_or(1) as i64;
+
+        // Create 2D index: x_coord = (x // 4) % width, y_coord = x // (4 * width)
+        let four = UOp::index_const(4);
+        let width_const = UOp::index_const(width);
+        let stride = UOp::index_const(4 * width);
+
+        let x_coord = x.idiv(&four).mod_(&width_const);
+        let y_coord = x.idiv(&stride);
+
+        // Create vec2 index
+        let oidx = UOp::vectorize(smallvec::smallvec![x_coord, y_coord]);
+
+        // Apply validity if not always true
+        let new_idx_expr = if matches!(valid.op(), Op::Const(cv) if cv.0 == ConstValue::Bool(true)) {
+            oidx
+        } else {
+            oidx.valid(valid)
+        };
+
+        // Create new INDEX with 2D coordinates
+        let new_idx = UOp::index()
+            .buffer(img_buf.clone())
+            .indices(vec![new_idx_expr])
+            .maybe_gate(gate.clone())
+            .call()
+            .ok()?
+            .with_dtype(inner_idx.dtype());
+
+        // Replace the index in LOAD/STORE
+        return Some(ls.replace().src(vec![new_idx]).call());
+    }
 
     // Case 2: Direct INDEX with ImageDType (unfoldable image, no CAST)
     if let Op::Index { buffer: img_buf, indices, gate } = index.op() {

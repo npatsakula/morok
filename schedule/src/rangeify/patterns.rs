@@ -694,6 +694,8 @@ pub fn reduction_simplify_patterns() -> TypedPatternMatcher {
 // ============================================================================
 
 /// Create pattern matcher for pushing movement ops through INDEX operations.
+///
+/// Based on Tinygrad's `pm_mops` (rangeify.py:18-25).
 pub fn movement_op_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         Index { buffer: mop, indices, gate } if mop.op().is_movement() => |mop, indices, gate| {
@@ -707,6 +709,57 @@ pub fn movement_op_patterns() -> TypedPatternMatcher {
         } if inner_indices.len() == 1 && outer_indices.len() == 1
              && inner_indices[0].id == outer_indices[0].id
             ~> |inner| inner.clone(),
+    }
+}
+
+/// Pattern matcher for INDEX concatenation.
+///
+/// Based on Tinygrad's `pm_syntactic_sugar` (codegen/__init__.py:22-26).
+///
+/// Matches INDEX on ptr INDEX and concatenates their indices:
+/// ```text
+/// INDEX(INDEX(buffer, indices1..., gate1?), indices2..., gate2?)
+/// → INDEX(buffer, indices1... + indices2..., combined_gate?)
+/// ```
+///
+/// This only applies when:
+/// - Inner INDEX has PtrDType (is a pointer)
+/// - Outer INDEX doesn't have PtrDType (is an element access)
+pub fn pm_syntactic_sugar() -> TypedPatternMatcher {
+    crate::patterns! {
+        // INDEX on ptr INDEX concats them
+        outer @ Index { buffer: inner @ Index { buffer: base_buffer, indices: inner_indices, gate: inner_gate }, indices: outer_indices, gate: outer_gate }
+            if matches!(inner.dtype(), DType::Ptr { .. }) && !matches!(outer.dtype(), DType::Ptr { .. })
+            => |outer, inner, base_buffer, inner_indices, outer_indices, inner_gate, outer_gate| {
+                concat_index_indices(base_buffer, inner_indices, outer_indices, inner_gate, outer_gate, outer.dtype())
+            },
+    }
+}
+
+/// Concatenate indices from nested INDEX operations.
+fn concat_index_indices(
+    base_buffer: &Arc<UOp>,
+    inner_indices: &SmallVec<[Arc<UOp>; 4]>,
+    outer_indices: &SmallVec<[Arc<UOp>; 4]>,
+    inner_gate: &Option<Arc<UOp>>,
+    outer_gate: &Option<Arc<UOp>>,
+    result_dtype: DType,
+) -> Option<Arc<UOp>> {
+    // Concatenate: inner indices + outer indices
+    let mut combined: SmallVec<[Arc<UOp>; 4]> = inner_indices.clone();
+    combined.extend(outer_indices.iter().cloned());
+
+    // Combine gates: if both exist, AND them; if one exists, use that; if neither, None
+    let combined_gate = match (inner_gate, outer_gate) {
+        (Some(g1), Some(g2)) => Some(g1.and_(g2)),
+        (Some(g), None) | (None, Some(g)) => Some(g.clone()),
+        (None, None) => None,
+    };
+
+    // Build new INDEX with combined indices
+    match combined_gate {
+        Some(g) => UOp::index().buffer(base_buffer.clone()).indices(combined).dtype(result_dtype).gate(g).call().ok(),
+        None => UOp::index().buffer(base_buffer.clone()).indices(combined).dtype(result_dtype).call().ok(),
     }
 }
 
@@ -1647,6 +1700,298 @@ pub fn pm_fma_decomposition() -> TypedPatternMatcher<()> {
         // (a*b)+c or c+(a*b) → MulAcc(a,b,c) using commutative matching
         Add[Mul(a, b), c] if a.dtype().is_float() => |a, b, c| {
             UOp::try_mulacc(a.clone(), b.clone(), c.clone()).ok()
+        },
+    }
+}
+
+// ============================================================================
+// PM_LOAD_COLLAPSE - Collapse REDUCE with conditional loads
+// ============================================================================
+// Based on Tinygrad's pm_load_collapse (simplify.py)
+
+/// Check if UOp has no RANGE in backward slice (loop-invariant).
+fn no_range(u: &Arc<UOp>) -> bool {
+    !u.toposort().iter().any(|x| matches!(x.op(), Op::Range { .. }))
+}
+
+/// Check if a UOp represents a zero constant.
+fn is_const_zero(u: &Arc<UOp>) -> bool {
+    if let Op::Const(cv) = u.op() { cv.0.is_zero() } else { false }
+}
+
+/// Get constant i64 value from UOp.
+fn const_to_i64(u: &Arc<UOp>) -> Option<i64> {
+    if let Op::Const(cv) = u.op() {
+        match cv.0 {
+            ConstValue::Int(v) => Some(v),
+            ConstValue::UInt(v) => Some(v as i64),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Get range end as i64.
+fn range_end_i64(r: &Arc<UOp>) -> Option<i64> {
+    if let Op::Range { end, .. } = r.op() { const_to_i64(end) } else { None }
+}
+
+/// Try to collapse a REDUCE with conditional/gated patterns.
+///
+/// This implements three reduction collapse patterns from Tinygrad:
+/// 1. Sum of `where(r < cut, 0, val)` → `clamp(end-cut, 0, end) * val`
+/// 2. Sum of `where(r < cut, val, 0)` → `clamp(cut, 0, end) * val`
+/// 3. Sum of `where(idx != r, 0, expr)` → `where(in_bounds, expr[r:=idx], 0)`
+fn try_reduce_collapse(
+    _reduce: &Arc<UOp>,
+    src: &Arc<UOp>,
+    ranges: &SmallVec<[Arc<UOp>; 4]>,
+    reduce_op: ReduceOp,
+) -> Option<Arc<UOp>> {
+    // Only handle Add for now (like Tinygrad)
+    if reduce_op != ReduceOp::Add {
+        return None;
+    }
+
+    // Must have exactly one range
+    if ranges.len() != 1 {
+        return None;
+    }
+
+    let range = &ranges[0];
+    let range_end = range_end_i64(range)?;
+
+    // Pattern: WHERE(Lt(range, cut), true_val, false_val)
+    if let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = src.op() {
+        // Pattern 1: where(r < cut, 0, val) → (end - cut).clamp(0, end) * val
+        if let Op::Binary(BinaryOp::Lt, lt_lhs, cut) = cond.op()
+            && Arc::ptr_eq(lt_lhs, range)
+            && is_const_zero(true_val)
+            && no_range(false_val)
+        {
+            let cut_val = const_to_i64(cut)?;
+            // count = max(0, min(end - cut, end))
+            let count = (range_end - cut_val).max(0).min(range_end);
+            let count_uop = UOp::const_(false_val.dtype(), ConstValue::Int(count));
+            return count_uop.try_mul(false_val).ok();
+        }
+
+        // Pattern 2: where(r < cut, val, 0) → cut.clamp(0, end) * val
+        if let Op::Binary(BinaryOp::Lt, lt_lhs, cut) = cond.op()
+            && Arc::ptr_eq(lt_lhs, range)
+            && is_const_zero(false_val)
+            && no_range(true_val)
+        {
+            let cut_val = const_to_i64(cut)?;
+            // count = max(0, min(cut, end))
+            let count = cut_val.max(0).min(range_end);
+            let count_uop = UOp::const_(true_val.dtype(), ConstValue::Int(count));
+            return count_uop.try_mul(true_val).ok();
+        }
+
+        // Pattern 3: where(idx != r, 0, expr) → where(in_bounds(idx), expr[r:=idx], 0)
+        // This eliminates reduces over tensor indexing!
+        if let Op::Binary(BinaryOp::Ne, idx, ne_range) = cond.op()
+            && Arc::ptr_eq(ne_range, range)
+            && is_const_zero(true_val)
+        {
+            // Check: idx must not depend on range
+            if !no_range(idx) {
+                return None;
+            }
+
+            // Build bounds check: 0 <= idx < end
+            let zero = UOp::index_const(0);
+            let end = match range.op() {
+                Op::Range { end, .. } => end.clone(),
+                _ => return None,
+            };
+            let ge_zero = idx.try_cmpge(&zero).ok()?;
+            let lt_end = idx.try_cmplt(&end).ok()?;
+            let in_bounds = ge_zero.try_and_op(&lt_end).ok()?;
+
+            // Substitute range with idx in the expression
+            #[allow(clippy::mutable_key_type)]
+            let subs: std::collections::HashMap<UOpKey, Arc<UOp>> =
+                [(UOpKey(range.clone()), idx.clone())].into_iter().collect();
+            let substituted = false_val.substitute(&subs);
+
+            // where(in_bounds, substituted, 0)
+            let zero_like = UOp::const_(false_val.dtype(), ConstValue::zero(false_val.dtype().base()));
+            return UOp::try_where(in_bounds, substituted, zero_like).ok();
+        }
+    }
+
+    None
+}
+
+/// Arithmetic lifting for comparisons.
+///
+/// Lifts operations out of Lt comparisons when they don't depend on ranges:
+/// - (x + y) < c → x < (c - y) when y, c are range-free
+/// - (x * y) < c → x < ceil(c/y) when y > 0, y, c range-free
+fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Binary(BinaryOp::Lt, lhs, rhs) = cond.op() else {
+        return None;
+    };
+
+    // Both rhs must be range-free for lifting
+    if !no_range(rhs) {
+        return None;
+    }
+
+    // Pattern: (x + y) < c → x < (c - y)
+    if let Op::Binary(BinaryOp::Add, x, y) = lhs.op()
+        && no_range(y)
+    {
+        let new_rhs = rhs.try_sub(y).ok()?;
+        return x.try_cmplt(&new_rhs).ok();
+    }
+
+    // Pattern: (x * y) < c → x < ceil(c/y) when y > 0
+    if let Op::Binary(BinaryOp::Mul, x, y) = lhs.op()
+        && no_range(y)
+    {
+        // Check y > 0 via vmin
+        if let ConstValue::Int(ymin) = y.vmin()
+            && *ymin > 0
+        {
+            // ceil(c/y) = (c + y - 1) / y
+            let one = UOp::index_const(1);
+            let c_plus_y = rhs.try_add(y).ok()?;
+            let c_plus_y_minus_1 = c_plus_y.try_sub(&one).ok()?;
+            let new_rhs = c_plus_y_minus_1.try_div(y).ok()?;
+            return x.try_cmplt(&new_rhs).ok();
+        }
+    }
+
+    None
+}
+
+/// Pattern matcher for load collapse optimizations.
+///
+/// Based on Tinygrad's pm_load_collapse (simplify.py).
+/// Collapses REDUCE operations with gated/conditional loads.
+///
+/// Key optimizations:
+/// 1. Bounded sum reduction: `sum(1 for i in range(n) if i >= k)` → `n - k`
+/// 2. Gated load collapse: `sum(where(idx == r, val, 0))` → direct indexed load
+/// 3. Arithmetic lifting: push comparisons through arithmetic operations
+pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
+    crate::patterns! {
+        // Main pattern: REDUCE with WHERE condition - only Add reduces
+        reduce @ Reduce { src, ranges, reduce_op }
+            if !ranges.is_empty() && *reduce_op == ReduceOp::Add
+            => |reduce, src, ranges| {
+                try_reduce_collapse(reduce, src, ranges, ReduceOp::Add)
+            },
+
+        // Arithmetic lifting: (x + y) < c or (x * y) < c
+        cond @ Lt(_lhs @ Add(_, _), rhs) if no_range(rhs) => |cond| {
+            try_lift_arithmetic_from_lt(cond)
+        },
+        cond @ Lt(_lhs @ Mul(_, _), rhs) if no_range(rhs) => |cond| {
+            try_lift_arithmetic_from_lt(cond)
+        },
+    }
+}
+
+// ============================================================================
+// LATE DECOMPOSITION PATTERNS (get_late_rewrite_patterns)
+// ============================================================================
+// Based on Tinygrad's decompositions.py:321-367
+
+/// MOD → AND optimization for power-of-two modulus.
+///
+/// x % 2^n → x & (2^n - 1)
+///
+/// This is a common optimization that converts expensive modulo operations
+/// into cheap bitwise AND when the divisor is a power of two.
+/// Only applies to integer types.
+pub fn pm_mod_to_and() -> TypedPatternMatcher<()> {
+    use morok_ir::types::ConstValue;
+    crate::patterns! {
+        // x % c where c is power of two → x & (c - 1)
+        Mod(x, _c @const(c_val)) => |x, c_val| {
+            // Only apply to integer types
+            if !x.dtype().is_int() { return None; }
+
+            let n = match c_val {
+                ConstValue::Int(v) if v > 0 && (v as u64).is_power_of_two() => v,
+                ConstValue::UInt(v) if v > 0 && v.is_power_of_two() => v as i64,
+                _ => return None,
+            };
+            // x % n → x & (n - 1)
+            let mask = UOp::const_(x.dtype(), ConstValue::Int(n - 1));
+            x.try_and_op(&mask).ok()
+        },
+    }
+}
+
+/// Multiply → Shift optimization for power-of-two multiplier.
+///
+/// x * 2^n → x << n
+///
+/// Converts multiplication by power-of-two into left shift.
+/// Only applies to integer types.
+pub fn pm_mul_to_shl() -> TypedPatternMatcher<()> {
+    use morok_ir::types::ConstValue;
+    crate::patterns! {
+        // x * c where c is power of two → x << log2(c)
+        // Note: Only applies to integer types, but we check inside the closure
+        Mul[x, _c @const(c_val)] => |x, c_val| {
+            // Only apply to integer types
+            if !x.dtype().is_int() { return None; }
+
+            let (n, shift) = match c_val {
+                ConstValue::Int(v) if v > 0 && (v as u64).is_power_of_two() => (v as u64, (v as u64).trailing_zeros()),
+                ConstValue::UInt(v) if v > 0 && v.is_power_of_two() => (v, v.trailing_zeros()),
+                _ => return None,
+            };
+            if n == 1 { return Some(x.clone()); } // x * 1 → x (handled elsewhere but be safe)
+            let shift_amount = UOp::const_(x.dtype(), ConstValue::Int(shift as i64));
+            x.try_shl_op(&shift_amount).ok()
+        },
+    }
+}
+
+/// Negate from multiply: x * -1 → NEG(x)
+///
+/// Converts multiplication by -1 into negation operation.
+pub fn pm_neg_from_mul() -> TypedPatternMatcher<()> {
+    crate::patterns! {
+        // x * -1 → NEG(x)
+        Mul[x, _c @const(c_val)] if c_val.is_neg_one() => |x| {
+            Some(x.neg())
+        },
+    }
+}
+
+/// MAX decomposition: MAX(a, b) → (a < b).where(b, a)
+///
+/// For backends that don't have native MAX support, decompose into
+/// comparison and conditional select.
+pub fn pm_max_decomposition() -> TypedPatternMatcher<()> {
+    crate::patterns! {
+        // MAX(a, b) → (a < b).where(b, a)
+        Max(a, b) => |a, b| {
+            let cond = a.try_cmplt(b).ok()?;
+            UOp::try_where(cond, b.clone(), a.clone()).ok()
+        },
+    }
+}
+
+/// SQRT decomposition: SQRT(x) → POW(x, 0.5)
+///
+/// For backends that don't have native SQRT support, decompose into
+/// power operation with exponent 0.5.
+pub fn pm_sqrt_decomposition() -> TypedPatternMatcher<()> {
+    crate::patterns! {
+        // SQRT(x) → POW(x, 0.5)
+        Sqrt(x) if x.dtype().is_float() => |x| {
+            let half = UOp::const_(x.dtype(), morok_ir::types::ConstValue::Float(0.5));
+            x.try_pow(&half).ok()
         },
     }
 }

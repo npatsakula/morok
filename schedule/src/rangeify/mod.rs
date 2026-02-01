@@ -33,13 +33,15 @@ pub use kernel::{PcontigConfig, SplitReduceOpConfig};
 // Pattern matchers
 pub use patterns::{
     apply_rangeify_patterns, buffer_folding, buffer_limit_patterns, buffer_removal, buffer_removal_with_pcontig,
-    dead_axis_removal, early_rewrites, movement_op_patterns, pm_fma_decomposition, rangeify_codegen_patterns,
-    reduction_simplify_patterns, split_reduceop_patterns, to_define_global_patterns,
+    dead_axis_removal, early_rewrites, movement_op_patterns, pm_fma_decomposition, pm_load_collapse,
+    pm_max_decomposition, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_sqrt_decomposition, pm_syntactic_sugar,
+    rangeify_codegen_patterns, reduction_simplify_patterns, split_reduceop_patterns, to_define_global_patterns,
 };
 
 // Transforms
 pub use transforms::{
-    OpAccessType, bufferize_to_store, find_bufs, flatten_range_impl, flatten_ranges, reduce_collapse,
+    OpAccessType, SplitRangesContext, SplitStoreContext, bufferize_to_store, find_bufs, flatten_range_impl,
+    flatten_ranges, pm_simplify_ranges, pm_split_ranges, pm_split_store, reduce_collapse, simplify_merge_adjacent,
 };
 
 // Utilities (re-exported from indexing)

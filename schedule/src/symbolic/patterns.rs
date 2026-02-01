@@ -121,6 +121,7 @@ pub fn symbolic_simple() -> TypedPatternMatcher {
         + dce_dsl_patterns()
         + dead_loop_patterns()
         + after_simplification_patterns()
+        + pm_move_where_on_load()
 }
 
 /// Full symbolic simplification matcher.
@@ -836,6 +837,193 @@ pub fn after_simplification_patterns() -> TypedPatternMatcher {
         // AFTER(x, []) → x: empty dependencies means no ordering constraint
         After { passthrough, deps } if deps.is_empty() ~> |passthrough| Arc::clone(passthrough),
     }
+}
+
+/// Move WHERE condition to LOAD gate patterns (Tinygrad symbolic.py:360).
+///
+/// Transforms `WHERE(cond, LOAD(INDEX(buf, idx)), 0)` to `LOAD(INDEX(buf, idx, gate=cond), alt=0)`
+/// when the condition can be safely moved into the INDEX's gate field.
+///
+/// This optimization:
+/// 1. Eliminates the WHERE operation overhead
+/// 2. Enables hardware predication for masked loads
+/// 3. Allows the backend to generate efficient conditional load instructions
+///
+/// The condition can be moved if:
+/// - The INDEX doesn't already have a gate (or the condition matches it)
+/// - All RANGE dependencies in the condition are within the INDEX's range scope
+/// - The condition doesn't depend on other INDEX operations (avoids speculative loads)
+pub fn pm_move_where_on_load() -> TypedPatternMatcher {
+    patterns! {
+        // Pattern 1: WHERE(cond, LOAD(INDEX(buf, idx, None)), 0)
+        // Move cond into INDEX gate, set LOAD alt to 0
+        Where(cond, Load { buffer, index: _idx @ Index { buffer: idx_buf, indices, gate: None }, alt: None }, false_val)
+            if is_const_zero(false_val)
+            => |cond, buffer, idx_buf, indices, false_val| {
+                where_on_load_transform(cond, buffer, idx_buf, indices, None, false_val)
+            },
+
+        // Pattern 2: WHERE(cond, 0, LOAD(INDEX(buf, idx, None))) - inverted pattern
+        // Use !cond as the gate
+        Where(cond, false_val, Load { buffer, index: _idx @ Index { buffer: idx_buf, indices, gate: None }, alt: None })
+            if is_const_zero(false_val)
+            => |cond, false_val, buffer, idx_buf, indices| {
+                let not_cond = cond.not();
+                where_on_load_transform(&not_cond, buffer, idx_buf, indices, None, false_val)
+            },
+
+        // Pattern 3: WHERE(cond, LOAD(INDEX(buf, idx, existing_gate)), 0)
+        // Combine cond with existing gate if they're compatible
+        Where(cond, Load { buffer, index: _idx @ Index { buffer: idx_buf, indices, gate: Some(existing_gate) }, alt: None }, false_val)
+            if is_const_zero(false_val) && can_combine_gates(cond, existing_gate)
+            => |cond, buffer, idx_buf, indices, existing_gate, false_val| {
+                where_on_load_transform(cond, buffer, idx_buf, indices, Some(existing_gate), false_val)
+            },
+    }
+}
+
+/// Check if a value is constant zero.
+fn is_const_zero(val: &Arc<UOp>) -> bool {
+    match val.op() {
+        Op::Const(c) => match c.0 {
+            ConstValue::Int(0) => true,
+            ConstValue::UInt(0) => true,
+            ConstValue::Float(f) => f == 0.0,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Check if two gate conditions can be combined.
+///
+/// Gates can be combined if the new condition is a subset of or equal to the existing gate.
+/// For simplicity, we allow combination when:
+/// - The conditions are identical (Arc::ptr_eq)
+/// - The new condition implies the existing one (cond → existing)
+fn can_combine_gates(cond: &Arc<UOp>, existing_gate: &Arc<UOp>) -> bool {
+    // Same condition - already handled, no change needed
+    if Arc::ptr_eq(cond, existing_gate) {
+        return true;
+    }
+    // For now, be conservative - only combine identical gates
+    // A more sophisticated implementation would check implication
+    false
+}
+
+/// Transform WHERE(cond, LOAD(INDEX(buf, idx)), alt) to LOAD(INDEX(buf, idx, gate=cond), alt).
+///
+/// # Safety Checks
+///
+/// The transformation is rejected if any of the following conditions are true:
+/// 1. **Duplicate AND clauses**: The condition contains duplicate clauses in AND chains
+///    (e.g., `a AND a AND b`), which indicates redundant/malformed conditions
+/// 2. **Out-of-scope ranges**: The condition references RANGE ops that are not in the
+///    INDEX's scope (i.e., not reachable from the indices)
+/// 3. **Load dependencies**: The condition depends on other LOAD/INDEX operations,
+///    which could cause speculative load side effects
+fn where_on_load_transform(
+    cond: &Arc<UOp>,
+    buffer: &Arc<UOp>,
+    idx_buf: &Arc<UOp>,
+    indices: &SmallVec<[Arc<UOp>; 4]>,
+    existing_gate: Option<&Arc<UOp>>,
+    alt: &Arc<UOp>,
+) -> Option<Arc<UOp>> {
+    // Safety check 1: No duplicate AND clauses
+    if has_duplicate_and_clauses(cond) {
+        return None;
+    }
+
+    // Safety check 2: Condition ranges must be within INDEX scope
+    if !condition_ranges_in_index_scope(cond, indices) {
+        return None;
+    }
+
+    // Safety check 3: No load dependencies in condition
+    if has_load_dependency(cond) {
+        return None;
+    }
+
+    // Create new gate: combine with existing if present
+    // Using and_() panicking wrapper - types are validated by pattern matcher
+    let new_gate = match existing_gate {
+        Some(existing) if !Arc::ptr_eq(cond, existing) => cond.and_(existing),
+        _ => cond.clone(),
+    };
+
+    // Create new INDEX with gate using builder pattern
+    // .expect() is safe here because pattern already validated the types
+    let new_index = UOp::index()
+        .buffer(idx_buf.clone())
+        .indices(indices.clone())
+        .gate(new_gate)
+        .call()
+        .expect("where_on_load: INDEX construction failed - types validated by pattern");
+
+    // Infer load dtype from buffer (like UOp::load does)
+    let load_dtype = match buffer.dtype() {
+        DType::Ptr { base, .. } => base.as_ref().clone(),
+        other => other,
+    };
+
+    // Cast alt value to match load dtype
+    let alt_casted = alt.cast(load_dtype.clone());
+
+    // Create new LOAD with alt value using builder pattern
+    Some(UOp::load().buffer(buffer.clone()).index(new_index).dtype(load_dtype).alt(alt_casted).call())
+}
+
+/// Check if condition has duplicate clauses in AND chains.
+///
+/// Splits the condition into AND clauses and checks for duplicates by UOp ID.
+fn has_duplicate_and_clauses(cond: &Arc<UOp>) -> bool {
+    let clauses = split_and_clauses(cond);
+    let mut seen = std::collections::HashSet::new();
+    clauses.iter().any(|c| !seen.insert(c.id))
+}
+
+/// Split a condition into its AND clauses recursively.
+fn split_and_clauses(cond: &Arc<UOp>) -> Vec<Arc<UOp>> {
+    match cond.op() {
+        Op::Binary(BinaryOp::And, left, right) => {
+            let mut result = split_and_clauses(left);
+            result.extend(split_and_clauses(right));
+            result
+        }
+        _ => vec![cond.clone()],
+    }
+}
+
+/// Check if all RANGE ops in the condition are within the INDEX's scope.
+///
+/// The INDEX's scope includes all RANGE ops reachable from its indices.
+fn condition_ranges_in_index_scope(cond: &Arc<UOp>, indices: &SmallVec<[Arc<UOp>; 4]>) -> bool {
+    // Collect all RANGEs reachable from indices
+    let mut index_ranges = std::collections::HashSet::new();
+    for idx in indices {
+        for node in idx.toposort() {
+            if matches!(node.op(), Op::Range { .. }) {
+                index_ranges.insert(node.id);
+            }
+        }
+    }
+
+    // Check all RANGEs in condition are in scope
+    for node in cond.toposort() {
+        if matches!(node.op(), Op::Range { .. }) && !index_ranges.contains(&node.id) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Check if the condition has any LOAD or INDEX dependencies.
+///
+/// Moving such conditions to a gate could cause speculative load side effects.
+fn has_load_dependency(cond: &Arc<UOp>) -> bool {
+    cond.toposort().iter().any(|n| matches!(n.op(), Op::Load { .. } | Op::Index { .. }))
 }
 
 /// Cast pushing through WHERE patterns.

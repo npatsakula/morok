@@ -73,7 +73,8 @@ impl UOp {
     /// # Errors
     /// Returns `InvalidDTypeForOp` if dtype is not int or bool
     pub(crate) fn check_bitwise_dtype(dtype: DType, operation: BinaryOp) -> Result<()> {
-        let is_valid = dtype.is_bool() || dtype.is_signed() || dtype.is_unsigned();
+        // Allow bool and all integer types (signed, unsigned, AND Index for loop counters)
+        let is_valid = dtype.is_bool() || dtype.is_int();
         if !is_valid { Err(Error::InvalidDTypeForBinaryOp { operation, dtypes: smallvec![dtype] }) } else { Ok(()) }
     }
 

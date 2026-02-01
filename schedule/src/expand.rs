@@ -163,22 +163,35 @@ pub fn swizzle_args(cargs: &[(usize, usize)], eargs: &[(usize, usize)], exclude_
 /// Run pre-expansion pass on kernel AST.
 ///
 /// Call this AFTER optimization but BEFORE codegen.
-/// Two phases:
-/// 1. Convert Range(Unroll/Upcast) → UNROLL ops with constant vectors
-/// 2. Fix REDUCE operations with arithmetic expressions in ranges
-/// 3. Expand operations that use UNROLL inputs
 ///
-/// Uses bottom-up traversal to ensure all nodes are visited, including
-/// REDUCE nodes nested inside KERNEL/STORE structures.
+/// # Tinygrad Pipeline Alignment (Stage 9)
+///
+/// Tinygrad: `sym + pm_pre_expander + pm_group_for_reduce + expander`
+///
+/// Our phases:
+/// 1. Convert Range(Unroll/Upcast) → UNROLL ops with constant vectors
+/// 2. Apply expansion patterns with symbolic simplification
+///
+/// # Traversal Direction
+///
+/// Uses bottom-up traversal. Note that Tinygrad's `bottom_up=False` is actually
+/// a hybrid that processes children first, then applies patterns - it's NOT
+/// purely top-down. Morok's bottom-up matches this behavior better because:
+/// - Range(Upcast) → UNROLL conversion must complete before fix_reduce_unroll
+/// - Pattern dependencies require children to be transformed first
 pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     use crate::rewrite::graph_rewrite_bottom_up;
+    use crate::symbolic::symbolic_simple;
 
     // Phase 1: Convert Range(Unroll/Upcast) to UNROLL ops
     let phase1 = phase1_range_to_unroll();
     let ast = graph_rewrite_bottom_up(&phase1, ast.clone(), &mut ());
 
-    // Phase 2: Fix REDUCE with non-Range entries and expand operations
-    let phase2 = phase2_expand();
+    // Phase 2: Expander + symbolic (Tinygrad: sym + pm_pre_expander + expander)
+    // Combines symbolic simplification with expansion for single-pass efficiency.
+    // Uses bottom-up: children transformed before parents, matching Tinygrad's
+    // actual behavior (despite their "bottom_up=False" naming).
+    let phase2 = symbolic_simple() + phase2_expand();
     graph_rewrite_bottom_up(&phase2, ast, &mut ())
 }
 

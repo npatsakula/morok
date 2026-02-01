@@ -20,6 +20,7 @@
 
 pub mod devectorize;
 pub mod expand;
+pub mod gpudims;
 pub mod linearize;
 pub mod optimizer;
 pub mod passes;
@@ -49,14 +50,18 @@ pub use expand::pre_expand;
 // Re-export devectorize pass
 pub use devectorize::devectorize;
 
+// Re-export gpudims pass
+pub use gpudims::pm_add_gpudims;
+
 // Re-export backend-agnostic passes
 pub use passes::pm_linearize_multi_index;
 
 // Re-export optimizer entry points
 pub use optimizer::{
     BeamConfig, BeamResult, HeuristicsConfig, OptError, OptStrategy, OptimizerConfig, Renderer as OptimizerRenderer,
-    Scheduler, TcOptLevel, TcSelect, TcUsage, apply_post_optimization, beam_search_cached, hand_coded_optimizations,
-    optimize_kernel, optimize_kernel_with_config, optimize_kernel_with_strategy, prepare_scheduler,
+    Scheduler, TcOptLevel, TcSelect, TcUsage, apply_post_optimization, apply_post_optimization_with_renderer,
+    beam_search_cached, hand_coded_optimizations, optimize_kernel, optimize_kernel_with_config,
+    optimize_kernel_with_strategy, prepare_scheduler,
 };
 
 // Re-export UOp for macro usage

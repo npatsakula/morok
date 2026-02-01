@@ -17,6 +17,8 @@ pub mod helpers;
 pub mod indexing;
 pub mod kernel_context;
 pub mod kernel_count;
+pub mod late_decompositions;
+pub mod load_collapse;
 pub mod movement_patterns;
 pub mod partial_contiguous;
 pub mod patterns;
@@ -27,6 +29,7 @@ pub mod reduce_simplify;
 pub mod split_kernel;
 pub mod split_patterns;
 pub mod split_reduceop;
+pub mod split_store;
 pub mod transform;
 
 use morok_ir::UOp;

@@ -223,7 +223,9 @@ fn find_copy_or_buffer_view(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Based on Tinygrad's split_store (rangeify.py:480-507).
 /// Simplified from 280 lines to ~80 lines using LocalAddBufferContext.
 pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use super::patterns::{local_to_define_global_patterns, movement_op_patterns, rangeify_codegen_patterns};
+    use super::patterns::{
+        local_to_define_global_patterns, movement_op_patterns, pm_syntactic_sugar, rangeify_codegen_patterns,
+    };
     use crate::rewrite::graph_rewrite_bottom_up;
 
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
@@ -266,9 +268,10 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         graph_rewrite_bottom_up(&matcher, x.clone(), &mut lctx)
     };
 
-    // 2. movement_op_patterns (pm_mops equivalent)
+    // 2. movement_op_patterns + pm_syntactic_sugar (pm_mops + pm_syntactic_sugar equivalent)
+    // Tinygrad: graph_rewrite(sink, pm_mops+pm_syntactic_sugar, name="early movement ops", bottom_up=True)
     let ret = {
-        let matcher = movement_op_patterns();
+        let matcher = movement_op_patterns() + pm_syntactic_sugar();
         graph_rewrite_bottom_up(&matcher, ret, &mut ())
     };
 
@@ -520,10 +523,11 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
 
     let substituted = indexed.substitute(&substitutions);
 
-    use super::patterns::movement_op_patterns;
+    use super::patterns::{movement_op_patterns, pm_syntactic_sugar};
     use crate::rewrite::graph_rewrite_top_down;
 
-    let pm_mops = movement_op_patterns();
+    // Tinygrad: pm_mops + pm_syntactic_sugar (early movement ops)
+    let pm_mops = movement_op_patterns() + pm_syntactic_sugar();
     let transformed = graph_rewrite_top_down(&pm_mops, substituted, &mut ());
 
     let surviving_range_ids = collect_range_ids(&transformed);

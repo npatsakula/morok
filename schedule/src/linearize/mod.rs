@@ -3,16 +3,18 @@
 //! This module implements priority-aware topological sorting for control flow,
 //! primarily for future GPU/NPU backends that require linear instruction streams.
 //!
-//! # Architecture
+//! # Architecture (Tinygrad-aligned)
 //!
 //! ```text
 //! Kernel AST (Arc<UOp>)
 //!     ↓
 //! pm_split_ends                  → Split multi-range ENDs into nested single-range ENDs
 //!     ↓
-//! CFGContext::new(sink)         → Compute control flow edges
+//! CFGContext::new(sink)          → Compute control flow edges
 //!     ↓
-//! linearize_with_cfg(sink)      → Priority-aware toposort with CFG edges
+//! linearize_with_edges(sink)     → Priority-aware toposort with CFG edge constraints
+//!     ↓
+//! pm_linearize_cleanups          → Inject IF/ENDIF for gated stores (line rewrite)
 //!     ↓
 //! Vec<Arc<UOp>>                  → Linear instruction sequence
 //! ```
@@ -32,20 +34,21 @@
 //! # Control Flow Edges
 //!
 //! When sibling loops exist at the same nesting level, CFGContext computes
-//! ordering edges to ensure proper linearization. These edges are passed
-//! directly to the linearizer rather than modifying the UOp graph.
+//! ordering edges to ensure proper linearization. These edges are passed to
+//! linearize_with_edges which treats them as additional dependencies.
 
 mod cfg_context;
 #[allow(clippy::module_inception)]
 mod linearize;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_ir::UOp;
 use morok_ir::op::Op;
 use morok_ir::pattern::TypedPatternMatcher;
 use morok_ir::rewrite::graph_rewrite_bottom_up;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 
 pub use cfg_context::CFGContext;
 pub use linearize::{linearize, linearize_with_edges};
@@ -130,9 +133,10 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
 /// Linearize a UOp DAG with proper control flow ordering.
 ///
 /// This is the preferred entry point for linearization. It:
-/// 1. Builds CFGContext to compute control flow edges
-/// 2. Passes edges directly to the linearizer for dependency tracking
-/// 3. Runs the priority-aware linearizer
+/// 1. Splits multi-range ENDs into nested single-range ENDs
+/// 2. Builds CFGContext to compute control flow edges
+/// 3. Applies pm_add_control_flow to add edges to RANGE ops (BOTTOM_UP)
+/// 4. Runs the priority-aware linearizer
 ///
 /// # Example
 ///
@@ -142,10 +146,118 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
 /// let instructions = linearize_with_cfg(kernel_ast);
 /// ```
 pub fn linearize_with_cfg(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
-    // Split multi-range ENDs into nested single-range ENDs.
+    // Stage 19 (partial): Split multi-range ENDs into nested single-range ENDs.
     // Required for proper linearization ordering. (Tinygrad linearizer.py:93-100)
     let sink = graph_rewrite_bottom_up(&pm_split_ends(), sink, &mut ());
 
+    // Stage 20-21: Build CFG context and linearize with edges
+    // CFGContext computes control flow edges for sibling loops.
+    // linearize_with_edges treats these edges as virtual consumer relationships,
+    // ensuring proper ordering without modifying RANGE sources (which would panic).
     let cfg = CFGContext::new(&sink);
     linearize_with_edges(sink, &cfg.edges)
+}
+
+/// Line rewrite infrastructure for operating on linearized instruction lists.
+///
+/// Unlike DAG-based graph_rewrite, this operates on the linear instruction sequence
+/// and can output multiple instructions for a single input instruction.
+///
+/// Based on Tinygrad's `line_rewrite` (linearizer.py).
+///
+/// # Arguments
+///
+/// * `lst` - The linearized instruction list
+/// * `rewrite_fn` - Function that returns (replacement, outputs) for each UOp.
+///   - `replacement`: The UOp to use in subsequent source substitutions
+///   - `outputs`: The UOps to emit in the output list
+fn line_rewrite<F>(lst: Vec<Arc<UOp>>, rewrite_fn: F) -> Vec<Arc<UOp>>
+where
+    F: Fn(&Arc<UOp>, &HashMap<u64, Arc<UOp>>) -> Option<(Arc<UOp>, Vec<Arc<UOp>>)>,
+{
+    let mut newlst = Vec::with_capacity(lst.len() * 2);
+    let mut replaced: HashMap<u64, Arc<UOp>> = HashMap::new();
+
+    for u in lst {
+        let nu = replace_sources_from_map(&u, &replaced);
+        let (replacement, outputs) = match rewrite_fn(&nu, &replaced) {
+            Some((repl, outs)) => (repl, outs),
+            None => (nu.clone(), vec![nu]),
+        };
+        replaced.insert(u.id, replacement);
+        newlst.extend(outputs);
+    }
+    newlst
+}
+
+/// Replace sources of a UOp using a substitution map.
+fn replace_sources_from_map(uop: &Arc<UOp>, replaced: &HashMap<u64, Arc<UOp>>) -> Arc<UOp> {
+    let sources = uop.op().sources();
+    if sources.is_empty() {
+        return uop.clone();
+    }
+
+    let new_sources: Vec<Arc<UOp>> =
+        sources.iter().map(|src| replaced.get(&src.id).cloned().unwrap_or_else(|| src.clone())).collect();
+
+    if sources.iter().zip(&new_sources).all(|(old, new)| old.id == new.id) {
+        return uop.clone();
+    }
+    uop.replace().src(new_sources).call()
+}
+
+/// Pattern for converting gated STORE to IF/STORE/ENDIF.
+///
+/// Based on Tinygrad's `pm_linearize_cleanups` (codegen/__init__.py:107-113).
+///
+/// Transforms:
+/// ```text
+/// STORE(INDEX(buf, idx, gate), value) → IF(gate) + STORE(INDEX(buf, idx), value) + ENDIF
+/// ```
+fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>) -> Option<(Arc<UOp>, Vec<Arc<UOp>>)> {
+    // Panic if IF/ENDIF already present
+    if matches!(uop.op(), Op::If { .. } | Op::EndIf { .. }) {
+        panic!("IF/ENDIF not allowed in graph before line_rewrite_cleanups");
+    }
+
+    // Match STORE with gated INDEX
+    let Op::Store { index, value, ranges } = uop.op() else {
+        return None;
+    };
+    let Op::Index { buffer, indices, gate: Some(gate) } = index.op() else {
+        return None;
+    };
+
+    // Create ungated INDEX and STORE
+    let ungated_index = UOp::index().buffer(buffer.clone()).indices(indices.clone()).call().expect("ungated INDEX");
+    let ungated_store = ungated_index.store_with_ranges(value.clone(), ranges.clone());
+
+    // Wrap in IF/ENDIF
+    let if_op = UOp::if_(gate.clone(), smallvec![ungated_index.clone()]);
+    let endif_op = UOp::endif(if_op.clone());
+
+    Some((ungated_store.clone(), vec![if_op, ungated_store, endif_op]))
+}
+
+/// Line rewrite for injecting IF/ENDIF around gated stores.
+///
+/// Based on Tinygrad's `pm_linearize_cleanups` (codegen/__init__.py:107-113).
+///
+/// This operates on the linearized instruction list (not the DAG) to convert:
+/// ```text
+/// STORE(INDEX(buf, idx, gate), value) → IF(gate) + STORE(INDEX(buf, idx), value) + ENDIF
+/// ```
+///
+/// Only needed for backends that don't support gated stores natively.
+/// LLVM, CUDA, and Metal support predicated stores, so this may be a no-op for them.
+///
+/// # Arguments
+///
+/// * `lst` - The linearized instruction list
+///
+/// # Returns
+///
+/// Modified instruction list with IF/ENDIF injected around gated stores.
+pub fn line_rewrite_cleanups(lst: Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
+    line_rewrite(lst, linearize_cleanup_pattern)
 }

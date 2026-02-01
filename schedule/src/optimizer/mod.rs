@@ -66,11 +66,15 @@ pub use scheduler::Scheduler;
 pub use scheduler::clear_kernel_name_counts;
 pub use types::{AxisType, Opt, OptArg, OptOps};
 
-use crate::devectorize::{bool_storage_patterns, pm_reduce};
+use crate::devectorize::{bool_storage_patterns, pm_reduce, pm_wmma_accumulate};
+use crate::gpudims::pm_add_gpudims;
 use crate::passes::pm_linearize_multi_index;
-use crate::rangeify::patterns::{pm_add_loads, pm_bool_devectorize, pm_reduce_devectorize};
+use crate::rangeify::patterns::{
+    pm_add_loads, pm_bool_devectorize, pm_fma_decomposition, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,
+    pm_reduce_devectorize,
+};
 use crate::rewrite::{graph_rewrite_bottom_up, graph_rewrite_top_down};
-use crate::symbolic::patterns::{gep_pushing_patterns, symbolic};
+use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
 use std::sync::Arc;
 
 /// Apply optimizations to a kernel AST.
@@ -106,6 +110,7 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// These passes run AFTER heuristic/beam optimization and BEFORE codegen:
 /// - pm_add_loads: Extract LOAD ops from INDEX
 /// - pre_expand: Convert Range(Unroll/Upcast) → UNROLL, expand operations
+/// - pm_add_gpudims (GPU only): Convert GLOBAL/LOCAL RANGE to SPECIAL thread indices
 /// - no_vectorized_alu (optional): Convert vector ALU to scalar + VECTORIZE
 /// - pm_reduce_devectorize: Unified REDUCE devectorization (K-vec, bool, horizontal)
 /// - pm_bool_devectorize: Convert <N x i1> to scalar ops
@@ -121,8 +126,29 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 ///   Use for backends without native vector support. Default: false (preserve vectors).
 ///
 /// Called by both heuristic and beam search paths for consistent behavior.
+/// For GPU pipelines, use `apply_post_optimization_with_renderer` to enable GPU dimension injection.
 #[tracing::instrument(skip_all, fields(ast.initial = %ast.tree()))]
 pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -> Arc<morok_ir::UOp> {
+    apply_post_optimization_with_renderer(ast, devectorize_alu, None)
+}
+
+/// Apply post-optimization passes with renderer context.
+///
+/// Same as `apply_post_optimization` but accepts an optional renderer for GPU-specific passes.
+/// When a renderer with GPU capabilities (has_local) is provided, `pm_add_gpudims` is applied
+/// to convert GLOBAL/LOCAL RANGE operations to SPECIAL thread indices.
+///
+/// # Arguments
+///
+/// * `ast` - The kernel AST to optimize
+/// * `devectorize_alu` - If true, convert vector ALU ops to scalar + VECTORIZE
+/// * `renderer` - Optional renderer for GPU dimension injection
+#[tracing::instrument(skip_all, fields(ast.initial = %ast.tree()))]
+pub fn apply_post_optimization_with_renderer(
+    ast: Arc<morok_ir::UOp>,
+    devectorize_alu: bool,
+    renderer: Option<&Renderer>,
+) -> Arc<morok_ir::UOp> {
     // Multi-index linearization: INDEX(buf, [i,j,k]) → INDEX(buf, [linear])
     // Moves row-major linearization from codegen to schedule, eliminating
     // duplicated logic in LLVM and Cranelift backends.
@@ -131,30 +157,60 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     let linearized = graph_rewrite_bottom_up(&pm_linearize_multi_index(), ast, &mut ());
     tracing::debug!(ast.optimized = linearized.tree(), "after pm_linearize_multi_index");
 
+    // =========================================================================
+    // Stage 8: Post-opt symbolic + WHERE movement (Tinygrad: sym + pm_move_where_on_load)
+    // This MUST run BEFORE expander to optimize conditionals before expansion.
+    // =========================================================================
+    let post_opt_symbolic = symbolic();
+    let with_symbolic = graph_rewrite_top_down(&post_opt_symbolic, linearized, &mut ());
+    tracing::debug!(ast.optimized = with_symbolic.tree(), "Stage 8: after post-opt symbolic");
+
+    // =========================================================================
+    // Stage 9: Expander (Tinygrad: sym + pm_pre_expander + pm_group_for_reduce + expander)
+    // =========================================================================
     // UNROLL expansion: Expand UNROLL ops to vectorized operations (Tinygrad expander.py)
     // CRITICAL: Must run BEFORE pm_reduce so that REDUCE sees its actual vectorized dtype.
     // In Tinygrad, expander runs first, then pm_reduce sees the expanded REDUCE with vec2 dtype.
     // This allows reduce_to_acc to create accumulators with the correct vector dtype.
-    let expanded = crate::expand::pre_expand(&linearized);
-    tracing::debug!(ast.optimized = expanded.tree(), "after pre_expand");
+    let expanded = crate::expand::pre_expand(&with_symbolic);
+    tracing::debug!(ast.optimized = expanded.tree(), "Stage 9: after pre_expand");
 
     // pm_reduce: Convert REDUCE → DEFINE_REG + accumulator pattern (Tinygrad devectorizer.py:310-316)
     // Now that UNROLL is expanded, REDUCE has its final dtype (e.g., vec2 if upcasted).
     // This creates accumulators with matching vector dtype.
     // IMPORTANT: Thread axes are excluded from reduce_to_acc's input_ranges via is_parallel().
     //
-    // Tinygrad alignment: Combine pm_reduce + gep_pushing in single pass
+    // Tinygrad alignment: Combine pm_reduce + pm_wmma_accumulate + gep_pushing in single pass
     // (Tinygrad: graph_rewrite(sink, pm_reduce+gep_pushing, ctx=ReduceContext()))
     // This ensures GEP simplification happens atomically with REDUCE transformation,
     // preventing dtype mismatches in horizontal reduction.
-    let pm_reduce_combined = pm_reduce() + gep_pushing_patterns();
+    //
+    // pm_wmma_accumulate fuses Add into WMMA's accumulator: WMMA(a,b,c) + add → WMMA(a,b,c+add)
+    // Tensor cores have built-in accumulation, so this is more efficient.
+    let pm_reduce_combined = pm_reduce() + pm_wmma_accumulate() + gep_pushing_patterns();
     let reduced = graph_rewrite_bottom_up(&pm_reduce_combined, expanded, &mut ());
     tracing::debug!(ast.optimized = reduced.tree(), "after pm_reduce");
+
+    // pm_add_gpudims: Convert GLOBAL/LOCAL RANGE → SPECIAL thread indices (Tinygrad gpudims.py)
+    // Only applies for GPU backends (has_local). Must run AFTER pm_reduce (which handles accumulator
+    // placement based on range types) and BEFORE pm_add_loads.
+    // Creates SPECIAL ops named "gidx0", "lidx0", etc. with dimension limiting for hardware constraints.
+    let with_gpudims = if let Some(ren) = renderer {
+        if ren.has_local {
+            // GPU backend: inject thread indices
+            graph_rewrite_top_down(&pm_add_gpudims(), reduced, &mut ren.clone())
+        } else {
+            reduced
+        }
+    } else {
+        reduced
+    };
+    tracing::debug!(ast.optimized = with_gpudims.tree(), "after pm_add_gpudims");
 
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
-    let with_loads = graph_rewrite_bottom_up(&pm_add_loads(), reduced, &mut ());
+    let with_loads = graph_rewrite_bottom_up(&pm_add_loads(), with_gpudims, &mut ());
 
     // ALU Devectorization + VECTORIZE Normalization
     //
@@ -210,20 +266,74 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
     let reduce_devec = graph_rewrite_bottom_up(&pm_reduce_devectorize(), devectorized, &mut ());
     tracing::debug!(ast.optimized = reduce_devec.tree(), "after pm_reduce_devectorize");
 
-    // NOTE: We intentionally do NOT create MulAcc (FMA) ops here.
-    // Tinygrad only creates MULACC if the backend explicitly supports it (via code_for_op).
-    // For LLVM/CPU backends, MULACC is not in code_for_op, so Tinygrad keeps a*b+c as
-    // separate MUL+ADD operations and lets LLVM's optimizer fuse them into FMA when beneficial.
-    // This avoids devectorization complexity and lets LLVM make optimal FMA decisions.
-    // See: tinygrad/uop/decompositions.py:362 - "if Ops.MULACC in ops: ..."
+    // =========================================================================
+    // Stage 18: Late rewrite patterns (Tinygrad: pm_decomp = symbolic_simple + get_late_rewrite_patterns)
+    // =========================================================================
+    // Apply decomposition patterns based on renderer capabilities.
+    // Tinygrad: graph_rewrite(sink, pm_decomp, ctx=ren.device, name="decompositions")
+    //
+    // Key patterns:
+    // - MULACC (FMA): a*b+c → MulAcc(a,b,c) if backend supports it
+    // - Transcendental decompositions (EXP2, LOG2, SIN) if backend lacks native support
+    // - MAX → CMPLT + WHERE if backend lacks native MAX
+    //
+    // Currently we always apply FMA decomposition for float types since most
+    // backends benefit from explicit FMA ops (LLVM generates fma intrinsics).
+    let pm_decomp = symbolic_simple() + get_late_rewrite_patterns(renderer);
+    let decomposed = graph_rewrite_bottom_up(&pm_decomp, reduce_devec, &mut ());
+    tracing::debug!(ast.optimized = decomposed.tree(), "Stage 18: after pm_decomp");
 
     // Bool storage: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits.
     // LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
     // Must run LAST, after all other transformations that might create bool stores.
     // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
-    let bs = graph_rewrite_bottom_up(&bool_storage_patterns(), reduce_devec, &mut ());
+    let bs = graph_rewrite_bottom_up(&bool_storage_patterns(), decomposed, &mut ());
     tracing::debug!(ast.optimized = bs.tree(), "after bool_storage_pattern");
     bs
+}
+
+/// Get late rewrite patterns based on renderer capabilities.
+///
+/// Based on Tinygrad's `get_late_rewrite_patterns` (decompositions.py:320-367).
+///
+/// Returns patterns for:
+/// - MULACC (FMA): `a*b+c → MulAcc(a,b,c)` for float types
+/// - MOD → AND: `x % 2^n → x & (2^n-1)` for power-of-two modulus
+/// - MUL → SHL: `x * 2^n → x << n` for power-of-two multiplier
+/// - NEG from MUL: `x * -1 → NEG(x)`
+/// - MAX decomposition: `MAX(a,b) → (a<b).where(b,a)` if backend lacks native MAX
+/// - SQRT decomposition: `SQRT(x) → POW(x, 0.5)` if backend lacks native SQRT
+///
+/// # Arguments
+///
+/// * `renderer` - Optional renderer to check supported ops. If None, applies all patterns
+///   except conditional decompositions (MAX, SQRT).
+fn get_late_rewrite_patterns(renderer: Option<&Renderer>) -> crate::TypedPatternMatcher {
+    // Start with FMA decomposition - most backends benefit from explicit FMA ops
+    // (LLVM generates fma intrinsics, GPUs have native FMA support)
+    let mut patterns = pm_fma_decomposition();
+
+    // Always apply pure optimizations that generate cheaper instructions:
+    // - MOD → AND for power-of-2 (bitwise cheaper than modulo)
+    // - MUL → SHL for power-of-2 (shift cheaper than multiply)
+    // - NEG from MUL (negation cheaper than multiply by -1)
+    patterns = patterns + pm_mod_to_and() + pm_mul_to_shl() + pm_neg_from_mul();
+
+    // Conditional decompositions based on backend capabilities.
+    // These only apply if the backend lacks native support for the operation.
+    // For now, we assume all backends support MAX and SQRT natively (LLVM, CUDA, Metal all do).
+    // When we add backends that lack support, we can check renderer capabilities.
+    //
+    // Future: Add renderer.supports_max() / renderer.supports_sqrt() checks:
+    // if !renderer.map_or(true, |r| r.supports_max()) {
+    //     patterns = patterns + pm_max_decomposition();
+    // }
+    // if !renderer.map_or(true, |r| r.supports_sqrt()) {
+    //     patterns = patterns + pm_sqrt_decomposition();
+    // }
+    let _ = renderer; // Will be used for capability checks when needed
+
+    patterns
 }
 
 /// Apply optimizations with explicit configuration.
@@ -251,7 +361,8 @@ pub fn optimize_kernel_with_config(
 
     // apply_post_optimization contains correctness transforms (pm_add_loads wraps INDEX
     // with LOAD for arithmetic ops) and must run even when optimizations are disabled.
-    apply_post_optimization(optimized, config.devectorize_alu)
+    // Pass the renderer to enable GPU dimension injection for GPU backends.
+    apply_post_optimization_with_renderer(optimized, config.devectorize_alu, Some(renderer))
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).
