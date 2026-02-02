@@ -55,9 +55,13 @@ impl UOp {
     pub fn try_vectorize(elements: SmallVec<[Arc<Self>; 4]>) -> Result<Arc<Self>> {
         ensure!(!elements.is_empty(), VectorizeEmptySnafu);
 
-        let expected_dtype = elements[0].dtype().scalar_dtype();
+        // Use full dtype (not scalar_dtype) to preserve Ptr type for pointer vectors.
+        // This matches Tinygrad's broadcast: `UOp(Ops.VECTORIZE, self.dtype.vec(count), ...)`
+        // For Ptr types: Ptr{vcount:1}.vec(N) → Ptr{vcount:N} (vector of pointers)
+        // For Scalar types: Scalar(Float32).vec(N) → Vector{Float32, N}
+        let expected_dtype = elements[0].dtype();
         for elem in elements.iter().skip(1) {
-            let actual = elem.dtype().scalar_dtype();
+            let actual = elem.dtype();
             ensure!(expected_dtype == actual, VectorizeDTypeMismatchSnafu { expected: expected_dtype, actual });
         }
 

@@ -383,7 +383,7 @@ fn assert_matmul_close(actual: &ArrayD<f32>, expected: &Array2<f32>, tol: f32) {
 }
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_matmul_validated_2x2() {
     // Simple 2x2 matmul with known values
     let a_data = [1.0f32, 2.0, 3.0, 4.0];
@@ -479,6 +479,7 @@ fn test_matmul_validated_16x16() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn test_matmul_validated_32x32() {
     // Test with 32x32 to exercise more optimization paths
     const SIZE: usize = 32;
