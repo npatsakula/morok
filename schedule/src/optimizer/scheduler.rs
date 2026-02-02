@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use morok_ir::{AxisId, AxisType, Op, UOp, UOpKey};
-use smallvec::SmallVec;
 
 use super::error::*;
 use super::renderer::Renderer;
@@ -32,73 +31,6 @@ fn kernel_name_counts() -> &'static Mutex<HashMap<String, usize>> {
 pub fn clear_kernel_name_counts() {
     if let Some(counts) = KERNEL_NAME_COUNTS.get() {
         counts.lock().unwrap().clear();
-    }
-}
-
-/// Flatten nested ranges in REDUCE and STORE operations.
-///
-/// Ensures ranges are stored in canonical flat order by collecting all
-/// RANGE operations via toposort and replacing them in sorted order.
-///
-/// Based on Tinygrad's `pm_flatten_range` pattern.
-///
-/// Note: In Morok's IR, ranges are typically already flat. This function
-/// ensures canonical ordering for REDUCE operations and recursively
-/// processes STORE operations.
-fn flatten_ranges(ast: Arc<UOp>) -> Arc<UOp> {
-    match ast.op() {
-        Op::Reduce { reduce_op, ranges, src } => {
-            // Flatten REDUCE ranges - extract actual RANGE nodes from expressions
-            let sink = UOp::sink(ranges.iter().cloned().collect());
-            let flattened: Vec<_> =
-                sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
-
-            // Recursively flatten the src
-            let flattened_src = flatten_ranges(src.clone());
-
-            // Recreate REDUCE with flattened ranges
-            flattened_src.reduce(flattened.into(), *reduce_op)
-        }
-        Op::Store { index, value, ranges } => {
-            // Recursively flatten value being stored
-            let flattened_value = flatten_ranges(value.clone());
-
-            // Also flatten ranges
-            let flattened_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|r| flatten_ranges(r.clone())).collect();
-
-            // Recreate STORE with flattened value and ranges
-            index.store_with_ranges(flattened_value, flattened_ranges)
-        }
-        Op::End { computation, ranges } => {
-            // Flatten END ranges - extract actual RANGE nodes from expressions
-            // (After shift_to substitution, ranges may contain Add/Mul expressions
-            // instead of direct RANGE nodes)
-            let sink = UOp::sink(ranges.iter().cloned().collect());
-            let flattened: SmallVec<[Arc<UOp>; 4]> =
-                sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
-
-            // Recursively flatten the computation
-            let flattened_computation = flatten_ranges(computation.clone());
-
-            // Recreate END with flattened ranges
-            flattened_computation.end(flattened)
-        }
-        Op::Sink { sources } => {
-            // Recursively flatten children of SINK
-            let flattened_sources: SmallVec<[Arc<UOp>; 4]> =
-                sources.iter().map(|s| flatten_ranges(s.clone())).collect();
-
-            // Check if any changed
-            if flattened_sources.iter().zip(sources.iter()).all(|(a, b)| Arc::ptr_eq(a, b)) {
-                ast
-            } else {
-                UOp::sink(flattened_sources.to_vec())
-            }
-        }
-        _ => {
-            // No flattening needed for other operations
-            ast
-        }
     }
 }
 
@@ -1138,8 +1070,10 @@ impl Scheduler {
             if *count > 1 { format!("{}n{}", name, *count - 1) } else { name }
         };
 
-        // 2. Flatten ranges
-        let flattened_ast = flatten_ranges(self.ast.clone());
+        // 2. Flatten ranges (using graph_rewrite like Tinygrad)
+        // Note: Tinygrad's default bottom_up=False ≈ Morok's graph_rewrite_bottom_up
+        let flattened_ast =
+            crate::rewrite::graph_rewrite_bottom_up(&crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
 
         // 3. Attach metadata
         let info = KernelInfo { name, applied_opts: self.applied_opts.clone(), dont_use_locals: self.dont_use_locals };
