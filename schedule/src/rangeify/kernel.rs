@@ -167,6 +167,8 @@ pub struct LocalAddBufferContext {
     pub vars: HashMap<UOpKey, ()>,
     /// Range renumber counter
     pub range: usize,
+    /// Optimization hints extracted from CONTIGUOUS.opts (Tinygrad: ctx.opts)
+    pub opts: Vec<morok_ir::ContiguousHint>,
 }
 
 impl LocalAddBufferContext {
@@ -275,10 +277,10 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
         graph_rewrite_bottom_up(&matcher, ret, &mut ())
     };
 
-    // 3. rangeify_codegen (CONTIGUOUS removal, NOOP → zero, etc.)
+    // 3. rangeify_codegen (CONTIGUOUS removal, NOOP → zero, hint extraction)
     let ret = {
         let matcher = rangeify_codegen_patterns();
-        graph_rewrite_bottom_up(&matcher, ret, &mut ())
+        graph_rewrite_bottom_up(&matcher, ret, &mut lctx)
     };
 
     // Find COPY/BUFFER_VIEW or wrap in SINK (like Tinygrad rangeify.py:495-501)
@@ -380,14 +382,17 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
 /// # Returns
 /// Returns `(result, KernelContext)` tuple for backward compatibility with 30+ callers.
 pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
-    use super::transforms::pm_add_buffers_patterns;
+    use super::transforms::pm_add_buffers_local_patterns;
     use crate::rewrite::graph_rewrite_bottom_up;
 
     let ctx = KernelContext::new(); // Keep for compatibility
 
     // Phase 1: bufferize -> store (like Tinygrad rangeify.py:565)
+    // Using pm_add_buffers_local_patterns (allow_locals=true) to create DEFINE_LOCAL
+    // for local address space BUFFERIZE ops. The raw stage (allow_locals=false)
+    // is used in the full optimizer pipeline after filtering.
     let after_buffers = {
-        let matcher = pm_add_buffers_patterns();
+        let matcher = pm_add_buffers_local_patterns();
         graph_rewrite_bottom_up(&matcher, root, &mut ())
     };
 

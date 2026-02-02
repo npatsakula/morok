@@ -84,7 +84,19 @@ impl UOp {
     /// Ensure contiguous memory layout.
     pub fn contiguous(self: &Arc<Self>) -> Arc<Self> {
         let dtype = self.dtype();
-        Self::new(Op::Contiguous { src: self.clone() }, dtype)
+        Self::new(Op::Contiguous { src: self.clone(), opts: smallvec::SmallVec::new() }, dtype)
+    }
+
+    /// Ensure contiguous memory layout with optimization hints.
+    ///
+    /// The hints are extracted during rangeify and passed to the optimizer.
+    /// Based on Tinygrad's CONTIGUOUS.arg which carries Opt tuples.
+    pub fn contiguous_with_opts(
+        self: &Arc<Self>,
+        opts: smallvec::SmallVec<[crate::types::ContiguousHint; 4]>,
+    ) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Contiguous { src: self.clone(), opts }, dtype)
     }
 
     /// Contiguous backward pass.

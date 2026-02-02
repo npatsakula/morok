@@ -816,16 +816,33 @@ fn dtype_zero(dtype: DType) -> Arc<UOp> {
 /// Note: Multi-index INDEX ops are preserved through the pipeline and
 /// linearized at codegen time (not here). This aligns with Tinygrad's
 /// architecture and prevents Binary(Range*stride) expressions in the IR.
-pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<()> {
+///
+/// # CONTIGUOUS Hint Extraction
+///
+/// Based on Tinygrad's `get_contiguous` (rangeify.py:436-438):
+/// ```python
+/// def get_contiguous(ctx:LocalAddBufferContext, x:UOp):
+///   if isinstance(x.arg, tuple) and all(isinstance(y, Opt) for y in x.arg): ctx.opts = x.arg
+///   return x.src[0]
+/// ```
+///
+/// Extracts optimization hints from CONTIGUOUS.opts into ctx.opts for later use.
+pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
     crate::patterns! {
+        @context LocalAddBufferContext;
         // NOOP → zero constant (scalar or vector)
-        noop @ Noop() if noop.dtype().base() != morok_dtype::ScalarDType::Void => |noop| {
+        noop @ Noop() if noop.dtype().base() != morok_dtype::ScalarDType::Void => |noop, _ctx| {
             Some(dtype_zero(noop.dtype()))
         },
-        // CONTIGUOUS is a no-op at this stage
-        Contiguous { src } ~> |src| src.clone(),
+        // CONTIGUOUS: extract hints and return source (Tinygrad: get_contiguous)
+        Contiguous { src, opts } => |src, opts, ctx| {
+            if !opts.is_empty() {
+                ctx.opts.extend(opts.iter().cloned());
+            }
+            Some(src.clone())
+        },
         // AFTER(EXPAND): strip EXPAND only if src is a valid passthrough
-        After { passthrough: Expand { src, .. }, deps } => |src, deps| {
+        After { passthrough: Expand { src, .. }, deps } => |src, deps, _ctx| {
             // Don't unwrap if src is control flow (Range, End)
             // These are not valid AFTER passthroughs in Tinygrad
             if matches!(src.op(), Op::Range { .. } | Op::End { .. }) {

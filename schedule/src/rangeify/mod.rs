@@ -42,7 +42,8 @@ pub use patterns::{
 // Transforms
 pub use transforms::{
     OpAccessType, SplitRangesContext, SplitStoreContext, bufferize_to_store, find_bufs, flatten_range_impl,
-    flatten_ranges, pm_simplify_ranges, pm_split_ranges, pm_split_store, reduce_collapse, simplify_merge_adjacent,
+    flatten_ranges, pm_add_buffers_local_patterns, pm_add_buffers_patterns, pm_simplify_ranges, pm_split_ranges,
+    pm_split_store, reduce_collapse, simplify_merge_adjacent,
 };
 
 // Utilities (re-exported from indexing)

@@ -44,7 +44,7 @@ fn test_empty_bufferize() {
     );
 
     // Should convert successfully
-    let result = bufferize_to_store(&bufferize, &mut ctx);
+    let result = bufferize_to_store(&bufferize, &mut ctx, true);
     assert!(result.is_some());
 
     // Result should be AFTER(passthrough=BUFFER, deps=[STORE])
@@ -140,7 +140,7 @@ fn test_bufferize_with_zero_range_inside() {
     );
 
     // Should panic because zero-sized buffers are not allowed
-    let _result = bufferize_to_store(&bufferize, &mut ctx);
+    let _result = bufferize_to_store(&bufferize, &mut ctx, true);
 }
 
 #[test]
@@ -164,5 +164,5 @@ fn test_multiple_zero_ranges() {
     );
 
     // Should panic because zero-sized buffers are not allowed
-    let _result = bufferize_to_store(&bufferize, &mut ctx);
+    let _result = bufferize_to_store(&bufferize, &mut ctx, true);
 }

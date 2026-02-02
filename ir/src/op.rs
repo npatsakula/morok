@@ -243,6 +243,8 @@ pub enum Op {
     },
     Contiguous {
         src: Arc<UOp>,
+        /// Optimization hints (Tinygrad: CONTIGUOUS.arg)
+        opts: SmallVec<[crate::types::ContiguousHint; 4]>,
     },
     ContiguousBackward {
         src: Arc<UOp>,
@@ -387,7 +389,7 @@ impl Op {
             Self::Contract { src, .. }
             | Self::Unroll { src, .. }
             | Self::Detach { src }
-            | Self::Contiguous { src }
+            | Self::Contiguous { src, .. }
             | Self::ContiguousBackward { src }
             | Self::Precast { src } => SmallVec::from_slice(&[src]),
             Self::Kernel { sources, ast } => {

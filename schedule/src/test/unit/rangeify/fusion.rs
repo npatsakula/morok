@@ -150,7 +150,7 @@ fn test_contiguous_forces_realization() {
     // CONTIGUOUS should force a realization point
     let a = create_buffer(100);
 
-    let contiguous = UOp::new(Op::Contiguous { src: a }, DType::Float32);
+    let contiguous = UOp::new(Op::Contiguous { src: a, opts: smallvec::smallvec![] }, DType::Float32);
 
     let sink = UOp::sink(vec![contiguous]);
 

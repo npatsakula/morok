@@ -127,6 +127,9 @@ enum OpData {
     UnrollAxes(Vec<(usize, usize)>),
     CustomCode(String),
 
+    // Movement operations with extra data
+    ContiguousOpts(Vec<crate::types::ContiguousHint>),
+
     // Operations with only children (no extra semantic data)
     None,
 }
@@ -203,6 +206,9 @@ impl UOpKey {
             Op::Contract { upcast_ranges, .. } => OpData::ContractRanges(upcast_ranges.clone()),
             Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
+
+            // Movement operations with extra data
+            Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
 
             // All other operations have no semantic data beyond children and discriminant
             _ => OpData::None,

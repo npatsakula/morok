@@ -278,6 +278,24 @@ impl BufferizeOpts {
     }
 }
 
+/// Optimization hint carried by CONTIGUOUS ops.
+///
+/// This is a simplified representation of optimizer hints that can be
+/// converted to/from the full `Opt` type in the schedule crate.
+/// Keeps the IR layer decoupled from optimizer-specific types.
+///
+/// Based on Tinygrad's CONTIGUOUS.arg which carries Opt tuples.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ContiguousHint {
+    /// Operation name (e.g., "UPCAST", "LOCAL", "UNROLL")
+    pub op: String,
+    /// Target axis index (if applicable)
+    pub axis: Option<usize>,
+    /// Integer argument (amount, size, etc.)
+    pub arg: Option<i64>,
+}
+
 /// Axis type for loop ranges and reductions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]

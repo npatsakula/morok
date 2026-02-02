@@ -45,8 +45,8 @@ pub use indexing::IndexSpec;
 pub use op::Op;
 pub use sint::{SInt, sint_max, sint_min, sint_prod};
 pub use types::{
-    AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, ConstValueHash, ReduceOp, TernaryOp, UnaryOp,
-    WmmaMetadata,
+    AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, ConstValueHash, ContiguousHint, ReduceOp,
+    TernaryOp, UnaryOp, WmmaMetadata,
 };
 pub use uop::{IntoUOp, UOp, UOpKey};
 

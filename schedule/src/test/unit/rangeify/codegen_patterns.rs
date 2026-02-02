@@ -4,17 +4,25 @@
 
 use std::sync::Arc;
 
-use morok_ir::{Op, UOp};
+use morok_ir::{ContiguousHint, Op, UOp};
 
+use crate::rangeify::kernel::LocalAddBufferContext;
 use crate::rangeify::patterns::rangeify_codegen_patterns;
 
 /// Helper to apply rangeify_codegen patterns and return result
 fn apply_patterns(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let matcher = rangeify_codegen_patterns();
-    match matcher.rewrite(uop, &mut ()) {
-        morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
-        _ => None,
-    }
+    let mut ctx = LocalAddBufferContext::new();
+    let result = crate::rewrite::graph_rewrite_bottom_up(&matcher, uop.clone(), &mut ctx);
+    if Arc::ptr_eq(&result, uop) { None } else { Some(result) }
+}
+
+/// Helper to apply patterns and return both result and context (for opts inspection)
+fn apply_patterns_with_ctx(uop: &Arc<UOp>) -> (Arc<UOp>, LocalAddBufferContext) {
+    let matcher = rangeify_codegen_patterns();
+    let mut ctx = LocalAddBufferContext::new();
+    let result = crate::rewrite::graph_rewrite_bottom_up(&matcher, uop.clone(), &mut ctx);
+    (result, ctx)
 }
 
 #[test]
@@ -161,4 +169,131 @@ fn test_codegen_patterns_creates_matcher() {
     // Verify the matcher was created successfully
     // We can't access the patterns field (it's private), but we can verify
     // the function doesn't panic
+}
+
+// ============================================================================
+// CONTIGUOUS OPTS EXTRACTION TESTS
+// ============================================================================
+// Based on Tinygrad's test_rangeify.py which tests CONTIGUOUS with Opt hints.
+// These tests verify that optimization hints flow through the pipeline correctly.
+
+#[test]
+fn test_contiguous_opts_empty() {
+    // CONTIGUOUS without opts should not populate ctx.opts
+    let tensor = UOp::native_const(1.0f32);
+    let contiguous = tensor.contiguous(); // No opts
+
+    let (_result, ctx) = apply_patterns_with_ctx(&contiguous);
+    assert!(ctx.opts.is_empty(), "ctx.opts should be empty when CONTIGUOUS has no hints");
+}
+
+#[test]
+fn test_contiguous_opts_single_hint() {
+    // CONTIGUOUS with single opt should extract to ctx.opts
+    // Mirrors Tinygrad: tensor.contiguous(arg=(Opt(OptOps.UPCAST, 0, 4),))
+    let tensor = UOp::native_const(1.0f32);
+
+    let opts = smallvec::smallvec![ContiguousHint { op: "UPCAST".to_string(), axis: Some(0), arg: Some(4) }];
+    let contiguous = tensor.contiguous_with_opts(opts);
+
+    let (_result, ctx) = apply_patterns_with_ctx(&contiguous);
+    assert_eq!(ctx.opts.len(), 1, "ctx.opts should have 1 hint");
+    assert_eq!(ctx.opts[0].op, "UPCAST");
+    assert_eq!(ctx.opts[0].axis, Some(0));
+    assert_eq!(ctx.opts[0].arg, Some(4));
+}
+
+#[test]
+fn test_contiguous_opts_multiple_hints() {
+    // CONTIGUOUS with multiple opts should extract all to ctx.opts
+    // Mirrors Tinygrad: tensor.contiguous(arg=(Opt(OptOps.UPCAST, 0, 4), Opt(OptOps.UPCAST, 1, 4)))
+    let tensor = UOp::native_const(1.0f32);
+
+    let opts = smallvec::smallvec![
+        ContiguousHint { op: "UPCAST".to_string(), axis: Some(0), arg: Some(4) },
+        ContiguousHint { op: "UPCAST".to_string(), axis: Some(1), arg: Some(4) },
+    ];
+    let contiguous = tensor.contiguous_with_opts(opts);
+
+    let (_result, ctx) = apply_patterns_with_ctx(&contiguous);
+    assert_eq!(ctx.opts.len(), 2, "ctx.opts should have 2 hints");
+    assert_eq!(ctx.opts[0].op, "UPCAST");
+    assert_eq!(ctx.opts[0].axis, Some(0));
+    assert_eq!(ctx.opts[1].op, "UPCAST");
+    assert_eq!(ctx.opts[1].axis, Some(1));
+}
+
+#[test]
+fn test_contiguous_opts_mixed_hint_types() {
+    // CONTIGUOUS with mixed opt types (UPCAST + UNROLL)
+    // Mirrors Tinygrad: tensor.contiguous(arg=(Opt(OptOps.UPCAST, 0, 4), Opt(OptOps.UNROLL, 1, 4)))
+    let tensor = UOp::native_const(1.0f32);
+
+    let opts = smallvec::smallvec![
+        ContiguousHint { op: "UPCAST".to_string(), axis: Some(0), arg: Some(4) },
+        ContiguousHint { op: "UNROLL".to_string(), axis: Some(1), arg: Some(4) },
+    ];
+    let contiguous = tensor.contiguous_with_opts(opts);
+
+    let (_result, ctx) = apply_patterns_with_ctx(&contiguous);
+    assert_eq!(ctx.opts.len(), 2);
+    assert_eq!(ctx.opts[0].op, "UPCAST");
+    assert_eq!(ctx.opts[1].op, "UNROLL");
+}
+
+#[test]
+fn test_contiguous_opts_four_hints() {
+    // CONTIGUOUS with 4 opts (max typical usage from Tinygrad tests)
+    // Mirrors Tinygrad: test_upcast_01_unroll_01
+    let tensor = UOp::native_const(1.0f32);
+
+    let opts = smallvec::smallvec![
+        ContiguousHint { op: "UPCAST".to_string(), axis: Some(0), arg: Some(4) },
+        ContiguousHint { op: "UPCAST".to_string(), axis: Some(1), arg: Some(4) },
+        ContiguousHint { op: "UNROLL".to_string(), axis: Some(0), arg: Some(4) },
+        ContiguousHint { op: "UNROLL".to_string(), axis: Some(1), arg: Some(4) },
+    ];
+    let contiguous = tensor.contiguous_with_opts(opts);
+
+    let (_result, ctx) = apply_patterns_with_ctx(&contiguous);
+    assert_eq!(ctx.opts.len(), 4, "ctx.opts should have 4 hints");
+
+    // Verify order is preserved
+    assert_eq!(ctx.opts[0].op, "UPCAST");
+    assert_eq!(ctx.opts[0].axis, Some(0));
+    assert_eq!(ctx.opts[1].op, "UPCAST");
+    assert_eq!(ctx.opts[1].axis, Some(1));
+    assert_eq!(ctx.opts[2].op, "UNROLL");
+    assert_eq!(ctx.opts[2].axis, Some(0));
+    assert_eq!(ctx.opts[3].op, "UNROLL");
+    assert_eq!(ctx.opts[3].axis, Some(1));
+}
+
+#[test]
+fn test_contiguous_opts_returns_source() {
+    // Verify CONTIGUOUS with opts still returns the source tensor
+    let tensor = UOp::native_const(42.0f32);
+
+    let opts = smallvec::smallvec![ContiguousHint { op: "LOCAL".to_string(), axis: Some(2), arg: Some(8) }];
+    let contiguous = tensor.contiguous_with_opts(opts);
+
+    let (result, _ctx) = apply_patterns_with_ctx(&contiguous);
+
+    // Should return the original tensor (CONTIGUOUS is stripped)
+    assert!(Arc::ptr_eq(&result, &tensor));
+}
+
+#[test]
+fn test_contiguous_opts_hint_without_axis() {
+    // Some opts like NOLOCALS don't have an axis
+    let tensor = UOp::native_const(1.0f32);
+
+    let opts = smallvec::smallvec![ContiguousHint { op: "NOLOCALS".to_string(), axis: None, arg: None }];
+    let contiguous = tensor.contiguous_with_opts(opts);
+
+    let (_result, ctx) = apply_patterns_with_ctx(&contiguous);
+    assert_eq!(ctx.opts.len(), 1);
+    assert_eq!(ctx.opts[0].op, "NOLOCALS");
+    assert_eq!(ctx.opts[0].axis, None);
+    assert_eq!(ctx.opts[0].arg, None);
 }

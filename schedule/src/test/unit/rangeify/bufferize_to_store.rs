@@ -24,7 +24,7 @@ fn test_bufferize_to_store_global() {
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range.clone()]);
 
     // Convert to STORE
-    let result = bufferize_to_store(&bufferize, &mut ctx);
+    let result = bufferize_to_store(&bufferize, &mut ctx, true);
 
     assert!(result.is_some());
     let result = result.unwrap();
@@ -87,7 +87,7 @@ fn test_bufferize_to_store_local_with_barrier() {
     let bufferize = UOp::bufferize_local(compute.clone(), vec![range.clone()]);
 
     // Convert to STORE
-    let result = bufferize_to_store(&bufferize, &mut ctx);
+    let result = bufferize_to_store(&bufferize, &mut ctx, true);
 
     assert!(result.is_some());
     let result = result.unwrap();
@@ -148,7 +148,7 @@ fn test_bufferize_to_store_multiple_ranges() {
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range1.clone(), range2.clone()]);
 
     // Convert to STORE
-    let result = bufferize_to_store(&bufferize, &mut ctx);
+    let result = bufferize_to_store(&bufferize, &mut ctx, true);
 
     assert!(result.is_some());
     let result = result.unwrap();
@@ -209,7 +209,7 @@ fn test_non_bufferize_returns_none() {
     let const_op = UOp::native_const(1.0f32);
 
     // Should return None
-    let result = bufferize_to_store(&const_op, &mut ctx);
+    let result = bufferize_to_store(&const_op, &mut ctx, true);
     assert!(result.is_none());
 }
 
@@ -224,7 +224,7 @@ fn test_buffer_tracked_in_context() {
     assert!(!ctx.has_buffer(&bufferize));
 
     // Convert to STORE
-    bufferize_to_store(&bufferize, &mut ctx);
+    bufferize_to_store(&bufferize, &mut ctx, true);
 
     // After conversion, buffer should be tracked
     assert!(ctx.has_buffer(&bufferize));
@@ -249,7 +249,7 @@ fn test_bufferize_to_store_sequential_global_ids() {
         let compute = UOp::native_const((i as f64) as f32);
         let bufferize = UOp::bufferize_global(compute, vec![]);
 
-        let result = bufferize_to_store(&bufferize, &mut ctx);
+        let result = bufferize_to_store(&bufferize, &mut ctx, true);
         assert!(result.is_some());
 
         // For BUFFER ops, global_counter is NOT incremented (it's only for DEFINE_GLOBAL)
@@ -268,7 +268,7 @@ fn test_bufferize_to_store_sequential_local_ids() {
         let compute = UOp::native_const((i as f64) as f32);
         let bufferize = UOp::bufferize_local(compute, vec![]);
 
-        bufferize_to_store(&bufferize, &mut ctx);
+        bufferize_to_store(&bufferize, &mut ctx, true);
 
         // Counter should increment
         assert_eq!(ctx.global_counter, 0);
@@ -290,8 +290,8 @@ fn test_bufferize_to_store_mixed_global_local() {
     let local_bufferize = UOp::bufferize_local(local_compute.clone(), vec![]);
 
     // Convert both
-    let global_result = bufferize_to_store(&global_bufferize, &mut ctx);
-    let local_result = bufferize_to_store(&local_bufferize, &mut ctx);
+    let global_result = bufferize_to_store(&global_bufferize, &mut ctx, true);
+    let local_result = bufferize_to_store(&local_bufferize, &mut ctx, true);
 
     // For global (BUFFER), global_counter is NOT incremented
     // For local (DEFINE_LOCAL), local_counter IS incremented
@@ -358,7 +358,7 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range]);
 
     // Stage 1: BUFFERIZE → AFTER(BUFFER, [END(STORE)])
-    let store_result = bufferize_to_store(&bufferize, &mut ctx).unwrap();
+    let store_result = bufferize_to_store(&bufferize, &mut ctx, true).unwrap();
 
     // Verify buffer was tracked
     assert!(ctx.has_buffer(&bufferize));

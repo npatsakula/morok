@@ -11,7 +11,7 @@ use morok_device::DeviceSpec;
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, Op, UOp};
 
-use crate::rangeify::kernel::split_store;
+use crate::rangeify::kernel::{LocalAddBufferContext, split_store};
 use crate::rangeify::patterns::rangeify_codegen_patterns;
 use crate::rangeify::transforms::find_bufs;
 
@@ -24,7 +24,8 @@ fn call_split_store(x: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Helper to apply rangeify_codegen patterns and return result
 fn apply_codegen_patterns(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let matcher = rangeify_codegen_patterns();
-    match matcher.rewrite(uop, &mut ()) {
+    let mut ctx = LocalAddBufferContext::new();
+    match matcher.rewrite(uop, &mut ctx) {
         morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
         _ => None,
     }

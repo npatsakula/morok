@@ -57,8 +57,8 @@ fn test_shared_buffer_one_kernel() {
     // Convert to STORE twice (simulating reuse)
     use crate::rangeify::transforms::bufferize_to_store;
 
-    let _result1 = bufferize_to_store(&bufferize, &mut ctx);
-    let _result2 = bufferize_to_store(&bufferize, &mut ctx);
+    let _result1 = bufferize_to_store(&bufferize, &mut ctx, true);
+    let _result2 = bufferize_to_store(&bufferize, &mut ctx, true);
 
     // For BUFFER ops (global address space), global_counter is NOT incremented
     // But the buffer should still be tracked and reused
@@ -86,8 +86,8 @@ fn test_independent_buffers_separate() {
 
     use crate::rangeify::transforms::bufferize_to_store;
 
-    bufferize_to_store(&bufferize1, &mut ctx);
-    bufferize_to_store(&bufferize2, &mut ctx);
+    bufferize_to_store(&bufferize1, &mut ctx, true);
+    bufferize_to_store(&bufferize2, &mut ctx, true);
 
     // For BUFFER ops, global_counter is NOT incremented
     // But both should be tracked separately

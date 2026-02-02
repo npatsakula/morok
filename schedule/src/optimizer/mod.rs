@@ -220,6 +220,17 @@ pub fn apply_post_optimization_with_renderer(
     let with_lowered_idx = graph_rewrite_bottom_up(&crate::symbolic::pm_lower_index_dtype(), with_gpudims, &mut ());
     tracing::debug!(ast.optimized = with_lowered_idx.tree(), "Stage 15: after pm_lower_index_dtype");
 
+    // =========================================================================
+    // Stage 16: Post-Index Symbolic (simplified - no GEP pushing)
+    // =========================================================================
+    // Constant folding after index lowering - CONST(Index) → CONST(i32) simplifications.
+    // Uses symbolic_simple() (not full symbolic()) because:
+    // - GEP pushing already runs after pm_reduce (line 191)
+    // - GEP pushing runs again in cleanup (line 254)
+    // - Index lowering doesn't create GEPs - those come from devectorization later
+    let with_lowered_idx = graph_rewrite_bottom_up(&symbolic_simple(), with_lowered_idx, &mut ());
+    tracing::debug!(ast.optimized = with_lowered_idx.tree(), "Stage 16: after post-index symbolic");
+
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).

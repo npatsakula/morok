@@ -792,13 +792,21 @@ fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
 }
 
 /// Convert BUFFERIZE operation to STORE with buffer allocation and END wrapping.
-pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
+///
+/// # Arguments
+///
+/// * `bufferize_op` - The BUFFERIZE UOp to convert
+/// * `ctx` - Kernel context for tracking buffers and generating IDs
+/// * `allow_locals` - If false, treat local address space as global (Tinygrad: pm_add_buffers)
+///                    If true, create DEFINE_LOCAL for local address space (Tinygrad: pm_add_buffers_local)
+pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allow_locals: bool) -> Option<Arc<UOp>> {
     let (compute, ranges, opts) = match bufferize_op.op() {
         Op::Bufferize { compute, ranges, opts } => {
             tracing::debug!(
                 bufferize_id = bufferize_op.id,
                 compute_id = compute.id,
                 ranges_len = ranges.len(),
+                allow_locals = allow_locals,
                 "bufferize_to_store: CONVERTING BUFFERIZE to STORE→AFTER"
             );
             (compute, ranges, opts)
@@ -813,15 +821,21 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext) -> O
         other => other,
     };
 
+    // Determine effective address space based on allow_locals parameter
+    // Tinygrad has two matchers:
+    // - pm_add_buffers (allow_locals=False): treats local as global
+    // - pm_add_buffers_local (allow_locals=True): creates DEFINE_LOCAL for local
+    let effective_addrspace = if allow_locals { opts.addrspace } else { AddrSpace::Global };
+
     let buffer = if let Some(existing_buffer) = ctx.get_buffer(bufferize_op) {
         existing_buffer.clone()
-    } else if opts.addrspace == AddrSpace::Global {
+    } else if effective_addrspace == AddrSpace::Global {
         // Create BUFFER node (like Tinygrad's UOp.new_buffer)
         // The BUFFER → DEFINE_GLOBAL conversion happens later in split_store
         let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
         UOp::new_buffer(device, size, base_dtype.clone())
     } else {
-        // For local address space, create DEFINE_LOCAL directly (like Tinygrad)
+        // For local address space (only when allow_locals=true), create DEFINE_LOCAL directly (like Tinygrad)
         let local_ptr_dtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
         let local_id = ctx.next_local();
         UOp::define_local(local_id, local_ptr_dtype)
@@ -1333,17 +1347,35 @@ pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
 
 /// Create pattern matcher for adding buffers (BUFFERIZE → STORE conversion).
 ///
-/// Based on Tinygrad's pm_add_buffers (rangeify.py:358-367).
+/// Based on Tinygrad's pm_add_buffers (rangeify.py:358-367) with `allow_locals=False`.
+/// This treats all BUFFERIZE ops as global buffers, regardless of their addrspace.
+/// Use `pm_add_buffers_local()` when local buffers should be created for local addrspace.
 pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<()> {
     use super::kernel::KernelContext;
 
     // This is a workaround - we create a temporary KernelContext for each match
     // The original code used a shared context, but the new pipeline uses graph_rewrite
     crate::patterns! {
-        // BUFFERIZE → STORE conversion
+        // BUFFERIZE → STORE conversion (allow_locals=false: treat local as global)
         buf @ Bufferize { compute: _ } => |buf| {
             let mut temp_ctx = KernelContext::new();
-            bufferize_to_store(buf, &mut temp_ctx)
+            bufferize_to_store(buf, &mut temp_ctx, false)
+        },
+    }
+}
+
+/// Create pattern matcher for adding buffers with local buffer support.
+///
+/// Based on Tinygrad's pm_add_buffers_local (rangeify.py:358-367) with `allow_locals=True`.
+/// This creates DEFINE_LOCAL buffers for local addrspace BUFFERIZE ops.
+pub fn pm_add_buffers_local_patterns() -> crate::TypedPatternMatcher<()> {
+    use super::kernel::KernelContext;
+
+    crate::patterns! {
+        // BUFFERIZE → STORE conversion (allow_locals=true: create DEFINE_LOCAL for local addrspace)
+        buf @ Bufferize { compute: _ } => |buf| {
+            let mut temp_ctx = KernelContext::new();
+            bufferize_to_store(buf, &mut temp_ctx, true)
         },
     }
 }

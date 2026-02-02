@@ -692,7 +692,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         Op::Assign { target, .. } => target.shape()?.cloned(),
 
-        Op::Detach { src } | Op::Contiguous { src } | Op::ContiguousBackward { src } | Op::Precast { src } => {
+        Op::Detach { src } | Op::Contiguous { src, .. } | Op::ContiguousBackward { src } | Op::Precast { src } => {
             src.shape()?.cloned()
         }
 

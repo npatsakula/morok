@@ -982,12 +982,12 @@ impl UOp {
                 }
                 Op::Detach { src: new_src }
             }
-            Op::Contiguous { src } => {
+            Op::Contiguous { src, opts } => {
                 let new_src = src.substitute(map);
                 if Arc::ptr_eq(&new_src, src) {
                     return self.clone();
                 }
-                Op::Contiguous { src: new_src }
+                Op::Contiguous { src: new_src, opts: opts.clone() }
             }
             Op::ContiguousBackward { src } => {
                 let new_src = src.substitute(map);
@@ -1508,9 +1508,9 @@ impl UOp {
                 assert_eq!(new_srcs.len(), 1);
                 Op::Detach { src: src(0) }
             }
-            Op::Contiguous { .. } => {
+            Op::Contiguous { opts, .. } => {
                 assert_eq!(new_srcs.len(), 1);
-                Op::Contiguous { src: src(0) }
+                Op::Contiguous { src: src(0), opts: opts.clone() }
             }
             Op::ContiguousBackward { .. } => {
                 assert_eq!(new_srcs.len(), 1);
