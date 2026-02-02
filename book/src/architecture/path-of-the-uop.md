@@ -744,26 +744,26 @@ ADD(vec4_a, vec4_b) → [ADD(a[0], b[0]), ADD(a[1], b[1]), ...]
 
 ---
 
-### Stage 15: Lower Index Dtype (Tinygrad-specific)
+### Stage 15: Lower Index Dtype
 
 > **Stage at a Glance**
 >
-> **Goal**: Convert abstract Index type to concrete integers (Tinygrad approach)
-> **Key Patterns**: Operation-specific lowering
-> **Impact**: Indices use hardware-native integer types
+> **Goal**: Convert abstract Index type to concrete integers
+> **Key Patterns**: Operation-specific lowering based on value bounds
+> **Impact**: Indices use hardware-native integer types (i32 or i64)
 
 **What This Does**: Converts abstract `Index` type to concrete integers.
 
 **Why This Matters**: The Index type is abstract—hardware doesn't have it. We need to convert to i32 or i64, which the hardware actually supports.
 
-**Pattern**: `pm_lower_index_dtype + load_store_indexing` (Tinygrad)
+**Pattern**: `pm_lower_index_dtype`
 
 ```text
 // Before: abstract index type
 idx: Index
 
 // After: concrete type
-idx: i32  // or i64
+idx: i32  // or i64, based on bounds
 ```
 
 **Operation-Specific Lowering**:
@@ -772,23 +772,21 @@ Index type lowering is NOT a single cast—each operation type has specific patt
 
 | Operation | Before | After |
 |-----------|--------|-------|
-| Binary ops | `INDEX(ADD(a, b))` | `ADD(CAST(INDEX(a)), CAST(INDEX(b)))` |
-| WHERE | `WHERE(c, INDEX(x), INDEX(y))` | `WHERE(c, CAST(INDEX(x)), CAST(INDEX(y)))` |
-| RANGE | `RANGE(end: Index)` | Adopts end's concrete dtype |
-| SPECIAL | `SPECIAL(gidx)` | Always int32 |
-| VECTORIZE | `VECTORIZE(idx...)` | Cast each to scalar concrete type |
-| Invalid | `WHERE(idx, Invalid)` | `INDEX(idx, gate=valid)` |
+| Binary ops | `ADD(Index, Index)` | `ADD(i32, i32)` with casts |
+| CONST | `CONST(5): Index` | `CONST(5): i32` |
+| WHERE | `WHERE(c, Index, Index)` | `WHERE(c, i32, i32)` |
+| RANGE | `RANGE(end: Index)` | `RANGE(end: i32)` with cast |
+| SPECIAL | `SPECIAL(gidx)` | Always i32 (GPU indices are 32-bit) |
+| DEFINE_VAR | `DEFINE_VAR: Index` | i32 if bounds fit, else i64 |
+| VECTORIZE | `VECTORIZE(Index...)` | Cast each to concrete scalar |
+| CAST cleanup | `CAST(i32, Index)` | Just `i32` (remove redundant cast) |
 
-**Note**: The actual pattern matches operations with children cast to index type, performs the operation in concrete types, then casts back to index. The notation above is simplified for clarity.
-
-The `select_dtype()` function determines int32 vs int64:
+The `select_concrete_dtype()` function determines i32 vs i64 using vmin/vmax bounds analysis:
 ```text
-dtype = i64 if value.overflows(i32) else i32
+dtype = i32 if bounds fit in [-2^31, 2^31-1] else i64
 ```
 
-**Double-cast pattern**: Some operations don't support Index types. We cast Index to integer, operate, then cast back: Index → i32 → ADD → i32 → Index. Later stages optimize away redundant casts.
-
-**Morok implementation**: Morok handles Index types differently. Index lowering happens during code generation in LLVM/Cranelift backends (Index → i64), not as a separate stage.
+**Morok**: `symbolic/index_lowering.rs`
 
 ---
 
@@ -860,10 +858,15 @@ Most backends (CPU, GPU) don't need this. Only specialized hardware uses it.
 |----------|---------|----------|
 | `MOD → AND` | `x % 8 → x & 7` | Power-of-2 divisor |
 | `MUL → SHL` | `x * 16 → x << 4` | Power-of-2 multiplier |
+| `DIV → SHR` | `x // 8 → x >> 3` | Power-of-2 divisor |
+| `FDIV → MUL` | `x / 2.0 → x * 0.5` | Float constant divisor |
 | `NEG` | `x * -1 → NEG(x)` | When NEG supported |
 | `MULACC` | `a * b + c → MULACC(a, b, c)` | When FMA supported |
+| Fast integer division | `x // 7 → (x * M) >> S` | Non-power-of-2 divisor |
+| De Morgan's laws | `(!x) & (!y) → !(x \| y)` | Boolean simplification |
+| Comparison negations | `!(x < c) → (c-1) < x` | Integer comparisons |
 
-**Note**: Tinygrad implements additional decomposition patterns (DIV→SHR for power-of-2 division, FDIV→MUL for reciprocal optimization, comparison simplifications including De Morgan's laws, fast integer division via magic numbers). Transcendental function approximations (SIN, EXP, LOG, etc.) are implemented in Morok via the `decompositor()` pathway (see `ir/src/decompositions/transcendentals.rs`).
+Transcendental function approximations (SIN, EXP, LOG, etc.) are implemented via the `decompositor()` pathway (see `ir/src/decompositions/transcendentals.rs`).
 
 **Morok**: `optimizer/mod.rs`
 
@@ -1199,16 +1202,23 @@ Each stage has a single responsibility. Each builds on the last. The result: hig
 
 ## Tinygrad vs Morok: Architectural Differences
 
-This chapter describes the "ideal" 22-stage pipeline based on Tinygrad's implementation. Morok follows the same overall design, but some architectural differences exist. These are deliberate design choices, not bugs.
+This chapter describes the "ideal" 22-stage pipeline based on Tinygrad's implementation. Morok now closely follows this design with minimal differences.
 
-### Valid Architectural Differences
+### Remaining Architectural Differences
 
 | Stage | Tinygrad | Morok | Notes |
 |--------|-----------|-------|--------|
 | 1: Early Movement Ops | Moves movement ops through AFTER/END wrappers | Removes movement ops during bufferization | Both approaches achieve functional equivalence; Morok's is cleaner |
-| 15: Index Dtype Lowering | Separate stage converts Index → i32/i64 | Index lowered at codegen time (Index → i64) | Both valid; Morok trades runtime cost (always i64) for pipeline simplicity |
-| 18: Decompositions | Transcendentals in Stage 18 | Transcendentals via `decompositor()` | Both valid; Morok's approach separates generic patterns from backend-specific decompositions |
-| 19: Final Rewrite | `pm_render` applied in Stage 19 | `pm_render` applied during codegen | Functionally equivalent; Morok applies rendering transformations during rendering |
+
+### Aligned Stages (Previously Different)
+
+The following stages were aligned with Tinygrad as of this implementation:
+
+| Stage | What Changed |
+|-------|--------------|
+| 15: Index Dtype Lowering | Morok now has `pm_lower_index_dtype()` with full pattern coverage: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup |
+| 18: Decompositions | Added: `fast_division_patterns()`, `pm_div_to_shr()`, `pm_fdiv_to_mul()`, `pm_comparison_negations()`, De Morgan's laws |
+| 19: Final Rewrite | `pm_render()` moved from codegen to Stage 19 in schedule pipeline |
 
 ### Tinygrad-Only Patterns
 
@@ -1217,6 +1227,7 @@ Morok intentionally does not implement these Tinygrad-specific patterns:
 | Pattern | Purpose | Why Morok Doesn't Need It |
 |----------|-----------|-----------------------------|
 | `to_bufferview` | Avoid disk buffer copies for DISK/TINYFS devices | Morok doesn't support DISK/TINYFS; in-memory backends don't need this |
+| AFTER/END movement patterns | Move movement ops through timing wrappers | Morok removes movement ops during bufferization instead |
 
 ### Morok Enhancements
 
@@ -1224,9 +1235,11 @@ Morok has some patterns/enhancements not in Tinygrad:
 
 | Enhancement | Location | Purpose |
 |-------------|---------|---------|
-| Nested INDEX flattening with identical indices | `movement_op_patterns()` (lines 699-713) | Removes redundant `INDEX(INDEX(ptr, [i]), [i])` |
+| Nested INDEX flattening with identical indices | `movement_op_patterns()` | Removes redundant `INDEX(INDEX(ptr, [i]), [i])` |
 | CAT → VECTORIZE | `pm_render` | Converts CAT to explicit VECTORIZE (can't render CAT directly) |
 | PTRCAT([x]) unwrap | `pm_render` | Removes single-element PTRCAT wrappers |
+| GEP through CAST/BITCAST | `gep_pushing_patterns()` | Pushes GEP through type casts for better optimization |
+| Image dtype guard | `pm_add_loads()` | Skips LOAD wrapping for Image dtype (handled in codegen) |
 
 ---
 

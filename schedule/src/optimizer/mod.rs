@@ -66,12 +66,12 @@ pub use scheduler::Scheduler;
 pub use scheduler::clear_kernel_name_counts;
 pub use types::{AxisType, Opt, OptArg, OptOps};
 
-use crate::devectorize::{bool_storage_patterns, pm_reduce, pm_wmma_accumulate};
+use crate::devectorize::{bool_storage_patterns, pm_reduce, pm_render, pm_wmma_accumulate};
 use crate::gpudims::pm_add_gpudims;
 use crate::passes::pm_linearize_multi_index;
 use crate::rangeify::patterns::{
-    pm_add_loads, pm_bool_devectorize, pm_fma_decomposition, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,
-    pm_reduce_devectorize,
+    pm_add_loads, pm_bool_devectorize, pm_comparison_negations, pm_div_to_shr, pm_fdiv_to_mul, pm_fma_decomposition,
+    pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_reduce_devectorize,
 };
 use crate::rewrite::{graph_rewrite_bottom_up, graph_rewrite_top_down};
 use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
@@ -207,10 +207,23 @@ pub fn apply_post_optimization_with_renderer(
     };
     tracing::debug!(ast.optimized = with_gpudims.tree(), "after pm_add_gpudims");
 
+    // =========================================================================
+    // Stage 15: Index dtype lowering (Tinygrad: pm_lower_index_dtype)
+    // =========================================================================
+    // Convert abstract Index dtype to concrete i32/i64 based on value bounds.
+    // - CONST with Index → CONST with i32/i64 based on value
+    // - SPECIAL (gidx, lidx) → always i32 (GPU indices are 32-bit)
+    // - DEFINE_VAR → i32 if bounds fit, else i64
+    // - RANGE end → lowered based on bounds
+    //
+    // Must run AFTER pm_add_gpudims (which creates SPECIAL ops) and BEFORE pm_add_loads.
+    let with_lowered_idx = graph_rewrite_bottom_up(&crate::symbolic::pm_lower_index_dtype(), with_gpudims, &mut ());
+    tracing::debug!(ast.optimized = with_lowered_idx.tree(), "Stage 15: after pm_lower_index_dtype");
+
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
-    let with_loads = graph_rewrite_bottom_up(&pm_add_loads(), with_gpudims, &mut ());
+    let with_loads = graph_rewrite_bottom_up(&pm_add_loads(), with_lowered_idx, &mut ());
 
     // ALU Devectorization + VECTORIZE Normalization
     //
@@ -283,11 +296,25 @@ pub fn apply_post_optimization_with_renderer(
     let decomposed = graph_rewrite_bottom_up(&pm_decomp, reduce_devec, &mut ());
     tracing::debug!(ast.optimized = decomposed.tree(), "Stage 18: after pm_decomp");
 
+    // =========================================================================
+    // Stage 19: Final rewrite / Render preparation (Tinygrad: pm_render)
+    // =========================================================================
+    // Prepare AST for codegen by converting vector constants and normalizing patterns.
+    // Key patterns:
+    // - Vector CONST → VECTORIZE of scalar CONSTs
+    // - VCONST → VECTORIZE of scalar CONSTs
+    // - CAT → VECTORIZE (for uniform elements)
+    // - Single-element VECTORIZE unwrapping
+    //
+    // This moves pm_render from codegen to schedule pipeline for proper stage alignment.
+    let rendered = graph_rewrite_bottom_up(&pm_render(), decomposed, &mut ());
+    tracing::debug!(ast.optimized = rendered.tree(), "Stage 19: after pm_render");
+
     // Bool storage: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits.
     // LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
     // Must run LAST, after all other transformations that might create bool stores.
     // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
-    let bs = graph_rewrite_bottom_up(&bool_storage_patterns(), decomposed, &mut ());
+    let bs = graph_rewrite_bottom_up(&bool_storage_patterns(), rendered, &mut ());
     tracing::debug!(ast.optimized = bs.tree(), "after bool_storage_pattern");
     bs
 }
@@ -316,8 +343,19 @@ fn get_late_rewrite_patterns(renderer: Option<&Renderer>) -> crate::TypedPattern
     // Always apply pure optimizations that generate cheaper instructions:
     // - MOD → AND for power-of-2 (bitwise cheaper than modulo)
     // - MUL → SHL for power-of-2 (shift cheaper than multiply)
+    // - DIV → SHR for power-of-2 (shift cheaper than divide) - Tinygrad: decompositions.py:340-344
+    // - FDIV → MUL for float constant divisor (multiply cheaper than divide) - Tinygrad: decompositions.py:364-366
     // - NEG from MUL (negation cheaper than multiply by -1)
-    patterns = patterns + pm_mod_to_and() + pm_mul_to_shl() + pm_neg_from_mul();
+    // - Comparison negations: !(x<c) → (c-1)<x, etc. - Tinygrad: decompositions.py:354-361
+    // - Fast division: x//d → (x*M)>>S for non-power-of-2 constants - Tinygrad: decompositions.py fast_idiv
+    patterns = patterns
+        + pm_mod_to_and()
+        + pm_mul_to_shl()
+        + pm_div_to_shr()
+        + pm_fdiv_to_mul()
+        + pm_neg_from_mul()
+        + pm_comparison_negations()
+        + crate::symbolic::fast_division_patterns();
 
     // Conditional decompositions based on backend capabilities.
     // These only apply if the backend lacks native support for the operation.

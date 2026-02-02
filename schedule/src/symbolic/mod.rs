@@ -5,7 +5,9 @@
 
 pub mod dce;
 pub mod fast_div;
+pub mod index_lowering;
 pub mod patterns;
 
 pub use fast_div::fast_division_patterns;
+pub use index_lowering::pm_lower_index_dtype;
 pub use patterns::{symbolic, symbolic_simple};

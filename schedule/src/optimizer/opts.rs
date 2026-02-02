@@ -48,7 +48,9 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
         OptOps::THREAD => {
             apply_thread(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
         }
-        _ => return ValidationFailedSnafu { op: "apply_opt", reason: "operation not yet implemented" }.fail(),
+        OptOps::PADTO => {
+            apply_padto(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
+        }
     }
 
     if append_opt {
@@ -269,6 +271,166 @@ fn apply_nolocals(scheduler: &mut Scheduler) -> Result<(), OptError> {
     }
     scheduler.dont_use_locals = true;
     Ok(())
+}
+
+// ============================================================================
+// THREAD - CPU parallel dispatch
+// ============================================================================
+
+// ============================================================================
+// PADTO - Tensor core alignment padding
+// ============================================================================
+
+/// Pad dimension to alignment for tensor core compatibility.
+///
+/// PADTO rounds up a loop dimension to enable tensor core alignment.
+/// Based on Tinygrad's PADTO (kernel.py).
+///
+/// # Constraints
+///
+/// - Only pad constant-sized axes
+/// - Cannot pad UPCAST/UNROLL/THREAD axes (already vectorized/expanded)
+/// - For REDUCE axes: only with ADD reduction and no unsafe ops before reduce
+/// - Don't add more than 4x work (padding 1→5 rejected)
+///
+/// # Algorithm
+///
+/// 1. Round up range size to alignment
+/// 2. Create validity condition: idx < old_size
+/// 3. Add validity gate to all INDEX ops using this range
+fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Result<(), OptError> {
+    use morok_ir::ReduceOp;
+
+    let (end, axis_id, axis_type) = match rng.op() {
+        Op::Range { end, axis_id, axis_type } => (end.clone(), *axis_id, *axis_type),
+        _ => return ExpectedRangeOperationSnafu.fail(),
+    };
+
+    // Constraint 1: only pad constant-sized axes
+    let old_sz = match end.op() {
+        Op::Const(cv) => match cv.0 {
+            ConstValue::Int(v) if v > 0 => v as usize,
+            _ => return ValidationFailedSnafu { op: "PADTO", reason: "range end must be positive integer" }.fail(),
+        },
+        _ => return ValidationFailedSnafu { op: "PADTO", reason: "can only pad constant-sized axes" }.fail(),
+    };
+
+    // Constraint 2: cannot pad UPCAST/UNROLL/THREAD axes
+    if matches!(axis_type, AxisType::Upcast | AxisType::Unroll | AxisType::Thread) {
+        return ValidationFailedSnafu { op: "PADTO", reason: "cannot pad vectorized/unrolled/thread axes" }.fail();
+    }
+
+    // Calculate new padded size
+    let new_sz = old_sz.div_ceil(alignment) * alignment;
+
+    // No-op if already aligned
+    if new_sz == old_sz {
+        return Ok(());
+    }
+
+    // Constraint 4: don't add more than 4x work
+    if old_sz * 4 < new_sz {
+        return ValidationFailedSnafu { op: "PADTO", reason: "padding would add more than 4x work" }.fail();
+    }
+
+    // Constraint 3: for REDUCE axes, only with ADD and no unsafe ops
+    if matches!(axis_type, AxisType::Reduce | AxisType::GroupReduce)
+        && let Some(reduce_op) = scheduler.reduceop()
+    {
+        // Check reduce operation is ADD
+        if let Op::Reduce { reduce_op: op, .. } = reduce_op.op()
+            && *op != ReduceOp::Add
+        {
+            return ValidationFailedSnafu { op: "PADTO", reason: "can only pad ADD reductions (not MAX/MUL)" }.fail();
+        }
+        // Check for unsafe operations before reduce
+        if has_unsafe_ops_before_reduce(&reduce_op) {
+            return ValidationFailedSnafu {
+                op: "PADTO",
+                reason: "cannot pad with unsafe ops (EXP, LOG, DIV, comparisons) before reduce",
+            }
+            .fail();
+        }
+    }
+
+    // Create new padded range
+    let new_end = UOp::index_const(new_sz as i64);
+    let new_rng = UOp::range_axis(new_end, axis_id, axis_type);
+
+    // Create validity condition: new_rng < old_size
+    let old_sz_const = UOp::index_const(old_sz as i64);
+    let valid = new_rng
+        .try_cmplt(&old_sz_const)
+        .map_err(|_| ValidationFailedSnafu { op: "PADTO", reason: "failed to create validity condition" }.build())?;
+
+    // Build substitution map
+    #[allow(clippy::mutable_key_type)]
+    let mut subst_map = HashMap::new();
+    subst_map.insert(UOpKey(rng.clone()), new_rng.clone());
+
+    // Update INDEX operations that use this range - add validity gate
+    for buf_op in scheduler.bufs() {
+        if buf_uses_range(&buf_op, &rng)
+            && let Op::Index { buffer, indices, gate } = buf_op.op()
+        {
+            // Combine validity condition with existing gate if present
+            let combined_gate = match gate {
+                Some(existing) => valid
+                    .try_and_op(existing)
+                    .map_err(|_| ValidationFailedSnafu { op: "PADTO", reason: "failed to combine gates" }.build())?,
+                None => valid.clone(),
+            };
+            // Create new INDEX with combined gate
+            let new_index =
+                UOp::index().buffer(buffer.clone()).indices(indices.clone()).gate(combined_gate).call().map_err(
+                    |_| ValidationFailedSnafu { op: "PADTO", reason: "failed to create gated INDEX" }.build(),
+                )?;
+            subst_map.insert(UOpKey(buf_op.clone()), new_index);
+        }
+    }
+
+    // Apply substitutions
+    let new_ast = scheduler.ast().substitute(&subst_map);
+    scheduler.set_ast(new_ast);
+
+    Ok(())
+}
+
+/// Check if a buffer INDEX operation uses a specific range.
+fn buf_uses_range(buf_op: &Arc<UOp>, rng: &Arc<UOp>) -> bool {
+    if let Op::Index { indices, .. } = buf_op.op() {
+        // Check if the range appears in the indices dependency graph
+        for idx in indices {
+            for node in idx.toposort() {
+                if Arc::ptr_eq(&node, rng) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check for unsafe operations before reduce that prevent PADTO.
+///
+/// Tinygrad's UnsafePad group - cannot pad reduce axes if these appear before reduction:
+/// - RECIPROCAL, LOG2, EXP2, IDIV, POW (non-linear ops where padding zeros changes result)
+/// - Comparisons (LT, etc.) that could mask valid data
+fn has_unsafe_ops_before_reduce(reduce_op: &Arc<UOp>) -> bool {
+    use morok_ir::types::{BinaryOp, UnaryOp};
+
+    for node in reduce_op.toposort() {
+        match node.op() {
+            // Unsafe unary ops
+            Op::Unary(UnaryOp::Reciprocal | UnaryOp::Log2 | UnaryOp::Exp2, _) => return true,
+            // Unsafe binary ops
+            Op::Binary(BinaryOp::Idiv | BinaryOp::Pow, _, _) => return true,
+            // Comparisons before sum are unsafe (padding zeros would add false comparisons)
+            Op::Binary(BinaryOp::Lt, _, _) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 // ============================================================================

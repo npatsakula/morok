@@ -158,9 +158,10 @@ pub fn fast_division_patterns() -> TypedPatternMatcher {
                 return None;
             }
 
-            // Create constants
-            let m_const = UOp::index_const(m);
-            let s_const = UOp::index_const(s as i64);
+            // Create constants with same dtype as dividend
+            let dtype = x.dtype();
+            let m_const = UOp::const_(dtype.clone(), ConstValue::Int(m));
+            let s_const = UOp::const_(dtype.clone(), ConstValue::Int(s as i64));
 
             if vmin >= 0 {
                 // Unsigned case: (x * m) >> s
@@ -173,8 +174,8 @@ pub fn fast_division_patterns() -> TypedPatternMatcher {
                 let base = mul_result.shr(&s_const);
 
                 // Compute adjustment: (x < 0) ? 1 : 0
-                let zero = UOp::index_const(0);
-                let one = UOp::index_const(1);
+                let zero = UOp::const_(dtype.clone(), ConstValue::Int(0));
+                let one = UOp::const_(dtype, ConstValue::Int(1));
                 let is_negative = x.try_cmplt(&zero).ok()?;
                 let adjustment = UOp::try_where(is_negative, one, zero).ok()?;
 

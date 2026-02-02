@@ -1117,6 +1117,8 @@ pub fn comparison_dsl_patterns() -> TypedPatternMatcher {
 /// - x & !x → false (contradiction)
 /// - true | x → true, false & x → false
 /// - true & x → x, false | x → x (identity)
+/// - (!x) & (!y) → !(x | y) (De Morgan's law)
+/// - (!x) | (!y) → !(x & y) (De Morgan's law)
 pub fn boolean_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // !!x → x
@@ -1143,6 +1145,17 @@ pub fn boolean_dsl_patterns() -> TypedPatternMatcher {
 
         // false | x → x (identity, commutative)
         Or[_c @const(c_val), x] if c_val == ConstValue::Bool(false) ~> |x| x.clone(),
+
+        // De Morgan's laws (Tinygrad: decompositions.py)
+        // (!x) & (!y) → !(x | y)
+        And[Not(x), Not(y)] => |x, y| {
+            Some(x.try_or_op(y).ok()?.not())
+        },
+
+        // (!x) | (!y) → !(x & y)
+        Or[Not(x), Not(y)] => |x, y| {
+            Some(x.try_and_op(y).ok()?.not())
+        },
     }
 }
 
@@ -1355,6 +1368,26 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
             } else {
                 Some(UOp::vectorize(extracted.into_iter().collect()))
             }
+        },
+
+        // 12. GEP through CAST: GEP(CAST(x, dtype), indices) → CAST(GEP(x, indices), scalar_dtype)
+        // Allows GEP to propagate through type casts for better optimization.
+        Gep { vector, indices } if matches!(vector.op(), Op::Cast { .. }) => |vector, indices| {
+            let Op::Cast { src, dtype } = vector.op() else { return None };
+            let inner_gep = src.gep(indices.clone());
+            // Compute result dtype: apply same scalar cast to extracted element type
+            let result_scalar = dtype.scalar().map(DType::Scalar)?;
+            Some(inner_gep.cast(result_scalar))
+        },
+
+        // 13. GEP through BITCAST: GEP(BITCAST(x, dtype), indices) → BITCAST(GEP(x, indices), scalar_dtype)
+        // Allows GEP to propagate through bitcasts for better optimization.
+        Gep { vector, indices } if matches!(vector.op(), Op::BitCast { .. }) => |vector, indices| {
+            let Op::BitCast { src, dtype } = vector.op() else { return None };
+            let inner_gep = src.gep(indices.clone());
+            // Compute result dtype: apply same scalar bitcast to extracted element type
+            let result_scalar = dtype.scalar().map(DType::Scalar)?;
+            Some(inner_gep.bitcast(result_scalar))
         },
     }
 }

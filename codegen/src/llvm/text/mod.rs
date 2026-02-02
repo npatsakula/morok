@@ -17,7 +17,6 @@ use std::sync::Arc;
 use morok_ir::pattern::TypedPatternMatcher;
 use morok_ir::rewrite::graph_rewrite_bottom_up;
 use morok_ir::{AxisType, Op, prelude::*};
-use morok_schedule::devectorize::pm_render;
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
 use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
@@ -107,11 +106,9 @@ impl Renderer for LlvmTextRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        let uop = graph_rewrite_bottom_up(&pm_render(), uop.clone(), &mut ());
-
-        tracing::debug!(ast_after_pm_render = %uop.tree(), "codegen: after pm_render");
-
-        let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop, &mut ());
+        // NOTE: pm_render() is now called in schedule/optimizer Stage 19.
+        // Keeping pm_bool_devectorize as safety fallback for direct codegen paths.
+        let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop.clone(), &mut ());
 
         tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "codegen: after pm_bool_devectorize");
 

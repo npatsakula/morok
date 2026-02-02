@@ -1167,8 +1167,9 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Pattern 1: INDEX with non-Ptr dtype → LOAD(buffer, INDEX with Ptr dtype)
         // Guard prevents re-matching: after transformation, INDEX has Ptr dtype.
+        // Also skip Image dtype - image access handled separately in codegen.
         // Based on Tinygrad's pm_add_loads (devectorizer.py:320-323).
-        idx @ Index { buffer, indices } if !matches!(idx.dtype(), DType::Ptr { .. }) => |idx, buffer, indices| {
+        idx @ Index { buffer, indices } if !matches!(idx.dtype(), DType::Ptr { .. } | DType::Image { .. }) => |idx, buffer, indices| {
             // Handle vectorized indices - if any index has vector dtype, LOAD produces vector
             let vec_count = indices.iter().find_map(|i| match i.dtype() {
                 DType::Vector { count, .. } => Some(count),
@@ -1982,6 +1983,64 @@ pub fn pm_neg_from_mul() -> TypedPatternMatcher<()> {
     }
 }
 
+/// Divide → Shift optimization for power-of-two divisor.
+///
+/// Tinygrad: decompositions.py:340-344
+///
+/// For unsigned integers: x // 2^n → x >> n
+/// For signed integers: (x + (x<0).where(n-1, 0)) >> n
+///   (handles rounding towards zero for negative dividends)
+///
+/// Shifts are typically 2-5x faster than divisions on modern CPUs and GPUs.
+pub fn pm_div_to_shr() -> TypedPatternMatcher<()> {
+    use morok_ir::types::ConstValue;
+    use morok_ir::uop::cached_property::CachedProperty;
+    use morok_ir::uop::properties::VminVmaxProperty;
+
+    crate::patterns! {
+        // x // c where c is power of two → x >> log2(c)
+        Idiv(x, _c @const(c_val)) => |x, c_val| {
+            // Only apply to integer types
+            if !x.dtype().is_int() { return None; }
+
+            let n = match c_val {
+                ConstValue::Int(v) if v > 0 && (v as u64).is_power_of_two() => v,
+                ConstValue::UInt(v) if v > 0 && v.is_power_of_two() => v as i64,
+                _ => return None,
+            };
+
+            // Skip trivial case: x // 1 → x (handled elsewhere)
+            if n == 1 { return None; }
+
+            let shift = (n as u64).trailing_zeros() as i64;
+            let shift_const = UOp::const_(x.dtype(), ConstValue::Int(shift));
+
+            // Check if x is always non-negative via vmin/vmax analysis
+            let (vmin, _) = VminVmaxProperty::get(x);
+            let is_non_negative = match vmin {
+                ConstValue::Int(v) => *v >= 0,
+                ConstValue::UInt(_) => true, // unsigned always non-negative
+                _ => false,
+            };
+
+            if is_non_negative || x.dtype().is_unsigned() {
+                // Unsigned case: x // 2^n → x >> n
+                x.try_shr_op(&shift_const).ok()
+            } else {
+                // Signed case with potentially negative dividend:
+                // (x + (x < 0).where(n - 1, 0)) >> n
+                // This bias corrects for rounding towards zero
+                let zero = UOp::const_(x.dtype(), ConstValue::Int(0));
+                let bias = UOp::const_(x.dtype(), ConstValue::Int(n - 1));
+                let x_neg = x.try_cmplt(&zero).ok()?;
+                let adjustment = UOp::try_where(x_neg, bias, zero).ok()?;
+                let adjusted = x.try_add(&adjustment).ok()?;
+                adjusted.try_shr_op(&shift_const).ok()
+            }
+        },
+    }
+}
+
 /// MAX decomposition: MAX(a, b) → (a < b).where(b, a)
 ///
 /// For backends that don't have native MAX support, decompose into
@@ -2006,6 +2065,149 @@ pub fn pm_sqrt_decomposition() -> TypedPatternMatcher<()> {
         Sqrt(x) if x.dtype().is_float() => |x| {
             let half = UOp::const_(x.dtype(), morok_ir::types::ConstValue::Float(0.5));
             x.try_pow(&half).ok()
+        },
+    }
+}
+
+/// FDIV → MUL reciprocal optimization for floating-point division by constant.
+///
+/// Tinygrad: decompositions.py:364-366
+///
+/// x / c → x * (1/c) for float constants
+///
+/// Multiplication is typically 2-3x faster than division on modern CPUs and GPUs.
+/// Guards against divide by zero (leaves as FDIV to preserve IEEE 754 semantics).
+pub fn pm_fdiv_to_mul() -> TypedPatternMatcher<()> {
+    use morok_ir::types::ConstValue;
+    crate::patterns! {
+        // x / c → x * (1/c) for float constants
+        Fdiv(x, _c @const(c_val)) => |x, c_val| {
+            // Only apply to float types
+            if !x.dtype().is_float() { return None; }
+
+            let f = match c_val {
+                ConstValue::Float(v) => v,
+                _ => return None,
+            };
+
+            // Guard against divide by zero - leave as FDIV to preserve IEEE 754 semantics
+            if f == 0.0 { return None; }
+
+            // Also guard against denormalized reciprocals that could cause precision loss
+            let recip = 1.0 / f;
+            if !recip.is_finite() { return None; }
+
+            let recip_const = UOp::const_(x.dtype(), ConstValue::Float(recip));
+            x.try_mul(&recip_const).ok()
+        },
+    }
+}
+
+/// Comparison negation patterns for integers.
+///
+/// Tinygrad: decompositions.py:354-361
+///
+/// These patterns simplify negated comparisons into equivalent direct comparisons:
+/// - !(x < c) → (c-1) < x  (for integers)
+/// - !(c < x) → x < (c+1)  (for integers)
+/// - (c1 < x) & (x < c2) → x == (c1+1)  (when c2 == c1+2, range compression)
+pub fn pm_comparison_negations() -> TypedPatternMatcher<()> {
+    use morok_ir::types::ConstValue;
+
+    crate::patterns! {
+        // !(x < c) → (c-1) < x for integers
+        // When x >= c, that's equivalent to (c-1) < x
+        Not(Lt(x, _c @const(c_val))) if x.dtype().is_int() => |x, c_val| {
+            let v = match c_val {
+                ConstValue::Int(v) => v,
+                ConstValue::UInt(v) => i64::try_from(v).ok()?,
+                _ => return None,
+            };
+            // Guard against underflow
+            let c_minus_1 = v.checked_sub(1)?;
+            let c_minus_1_const = UOp::const_(x.dtype(), ConstValue::Int(c_minus_1));
+            c_minus_1_const.try_cmplt(x).ok()
+        },
+
+        // !(c < x) → x < (c+1) for integers
+        // When x <= c, that's equivalent to x < (c+1)
+        Not(Lt(_c @const(c_val), x)) if x.dtype().is_int() => |x, c_val| {
+            let v = match c_val {
+                ConstValue::Int(v) => v,
+                ConstValue::UInt(v) => i64::try_from(v).ok()?,
+                _ => return None,
+            };
+            // Guard against overflow
+            let c_plus_1 = v.checked_add(1)?;
+            let c_plus_1_const = UOp::const_(x.dtype(), ConstValue::Int(c_plus_1));
+            x.try_cmplt(&c_plus_1_const).ok()
+        },
+
+        // Range compression: (c1 < x) & (x < c2) → x == (c1+1) when c2 == c1+2
+        // When x is in the open interval (c1, c2) and c2 - c1 == 2, x must be c1+1
+        And[Lt(_c1 @const(c1_val), x), Lt(x2, _c2 @const(c2_val))]
+            if x.dtype().is_int() && Arc::ptr_eq(x, x2)
+            => |x, c1_val, c2_val| {
+                let v1 = match c1_val {
+                    ConstValue::Int(v) => v,
+                    ConstValue::UInt(v) => i64::try_from(v).ok()?,
+                    _ => return None,
+                };
+                let v2 = match c2_val {
+                    ConstValue::Int(v) => v,
+                    ConstValue::UInt(v) => i64::try_from(v).ok()?,
+                    _ => return None,
+                };
+                // Only apply if c2 == c1 + 2 (single value in range)
+                if v2 != v1.checked_add(2)? { return None; }
+                let target = UOp::const_(x.dtype(), ConstValue::Int(v1 + 1));
+                x.try_cmpeq(&target).ok()
+            },
+
+        // x*-1 < c → -c < x for integers
+        // Tinygrad: decompositions.py:354-361
+        // When comparing negated value with constant, flip the comparison
+        Lt(Mul(x, _neg1 @const(neg_val)), _c @const(c_val)) if x.dtype().is_int() => |x, neg_val, c_val| {
+            // Check that we're multiplying by -1
+            let is_neg_one = match neg_val {
+                ConstValue::Int(-1) => true,
+                _ => false,
+            };
+            if !is_neg_one { return None; }
+
+            let c = match c_val {
+                ConstValue::Int(v) => v,
+                ConstValue::UInt(v) => i64::try_from(v).ok()?,
+                _ => return None,
+            };
+
+            // x*-1 < c → -c < x
+            let neg_c = c.checked_neg()?;
+            let neg_c_const = UOp::const_(x.dtype(), ConstValue::Int(neg_c));
+            neg_c_const.try_cmplt(x).ok()
+        },
+
+        // x*-1 < y*c → y*(-c) < x for integers
+        // When comparing negated x with scaled y, flip and negate scale
+        Lt(Mul(x, _neg1 @const(neg_val)), Mul(y, _c @const(c_val))) if x.dtype().is_int() => |x, neg_val, y, c_val| {
+            // Check that we're multiplying x by -1
+            let is_neg_one = match neg_val {
+                ConstValue::Int(-1) => true,
+                _ => false,
+            };
+            if !is_neg_one { return None; }
+
+            let c = match c_val {
+                ConstValue::Int(v) => v,
+                ConstValue::UInt(v) => i64::try_from(v).ok()?,
+                _ => return None,
+            };
+
+            // x*-1 < y*c → y*(-c) < x
+            let neg_c = c.checked_neg()?;
+            let neg_c_const = UOp::const_(y.dtype(), ConstValue::Int(neg_c));
+            let y_neg_c = y.try_mul(&neg_c_const).ok()?;
+            y_neg_c.try_cmplt(x).ok()
         },
     }
 }
