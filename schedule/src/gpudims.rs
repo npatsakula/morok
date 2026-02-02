@@ -227,9 +227,10 @@ fn compute_store_masks(
             continue;
         }
 
-        // Find local ranges NOT used in the index computation
-        let index_ranges: HashSet<u64> =
-            index.toposort().iter().filter(|u| matches!(u.op(), Op::Range { .. })).map(|u| u.id).collect();
+        // Find local ranges NOT used in the index computation.
+        // Use in_scope_ranges() to get only active (not ended) ranges,
+        // rather than toposort().filter(Range) which returns ALL ranges in the graph.
+        let index_ranges: HashSet<u64> = index.in_scope_ranges().iter().map(|key| key.0.id).collect();
 
         let mut missing_locals: Vec<Arc<UOp>> = Vec::new();
         for (i, (axis_id, axis_type)) in local_dims.iter().enumerate() {

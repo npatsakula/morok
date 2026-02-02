@@ -665,8 +665,24 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let gep_indices = swizzle_args(contract_axes, unroll_axes, &exclude);
     let gep_result = unroll_inner.gep(gep_indices);
 
-    // Tinygrad expander.py:76: UOp(Ops.UNROLL, con.dtype, (ex.src[0].gep(...),), new_ex_args)
-    Some(gep_result.unroll_with_dtype(remaining_axes, uop.dtype()))
+    // Compute UNROLL wrapper dtype based on remaining axes, not contract axes.
+    // Tinygrad expander.py:76 uses con.dtype, but for partial contraction the UNROLL dtype
+    // should match the remaining axes product (the number of unroll iterations).
+    let remaining_product: usize = remaining_axes.iter().map(|(_, sz)| sz).product();
+    let wrapper_dtype = if remaining_product == 1 {
+        // Full contraction: use output dtype (scalar from CONTRACT)
+        uop.dtype()
+    } else {
+        // Partial contraction: vectorize by remaining axes product
+        let dt = uop.dtype();
+        if dt == DType::Void {
+            DType::Void // Preserve void for STORE
+        } else {
+            dt.scalar_dtype().vec(remaining_product)
+        }
+    };
+
+    Some(gep_result.unroll_with_dtype(remaining_axes, wrapper_dtype))
 }
 
 // ============================================================================

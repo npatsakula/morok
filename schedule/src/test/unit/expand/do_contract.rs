@@ -276,3 +276,84 @@ fn test_contract_partial_expansion() {
         other => panic!("Expected GEP, got {:?}", other),
     }
 }
+
+// =============================================================================
+// Dtype Validation Tests
+// =============================================================================
+
+/// Test: Partial contraction dtype matches remaining axes product.
+///
+/// Bug fix: UNROLL wrapper dtype should match remaining_axes product,
+/// not the CONTRACT axes product.
+#[test]
+fn test_contract_partial_dtype_validation() {
+    // UNROLL with axes [(1,4), (2,2)] → 8 elements
+    // CONTRACT with axes [(1,4)] → contract dtype vec4
+    // remaining_axes = [(2,2)] → remaining_product = 2
+    let unroll = create_unroll_multi_axis(vec![(1, 4), (2, 2)]);
+    let contract = create_contract(unroll, vec![(1, 4)]);
+
+    let result = phase2_only(&contract);
+
+    // Validate dtype matches remaining axes product (2), not contract axes product (4)
+    assert_vcount(&result, 2);
+
+    let (_, remaining_axes) = unwrap_unroll(&result);
+    assert_eq!(remaining_axes, vec![(2, 2)]);
+}
+
+/// Test: Partial contraction with equal axis sizes validates dtype correctly.
+///
+/// This test would pass even with the bug since contract_product == remaining_product.
+/// Included for completeness.
+#[test]
+fn test_contract_partial_dtype_same_sizes() {
+    // UNROLL with axes [(1,4), (2,4)] → 16 elements
+    // CONTRACT with axes [(1,4)] → contract dtype vec4
+    // remaining_axes = [(2,4)] → remaining_product = 4
+    let unroll = create_unroll_multi_axis(vec![(1, 4), (2, 4)]);
+    let contract = create_contract(unroll, vec![(1, 4)]);
+
+    let result = phase2_only(&contract);
+
+    // Both products are 4, so this validates correctly with or without the fix
+    assert_vcount(&result, 4);
+
+    let (_, remaining_axes) = unwrap_unroll(&result);
+    assert_eq!(remaining_axes, vec![(2, 4)]);
+}
+
+/// Test: Void dtype is preserved for STORE-like operations.
+#[test]
+fn test_contract_void_dtype_preserved() {
+    use super::helpers::create_contract_void;
+    use super::helpers::create_unroll_multi_axis_with_dtype;
+    use morok_dtype::DType;
+
+    // UNROLL with Void dtype (like STORE)
+    let unroll = create_unroll_multi_axis_with_dtype(vec![(1, 4), (2, 4)], DType::Void);
+    let contract = create_contract_void(unroll, vec![(1, 4)]);
+
+    let result = phase2_only(&contract);
+
+    // Void dtype should be preserved
+    assert_eq!(result.dtype(), DType::Void);
+
+    let (_, remaining_axes) = unwrap_unroll(&result);
+    assert_eq!(remaining_axes, vec![(2, 4)]);
+}
+
+/// Test: Full contraction uses output dtype (scalar).
+#[test]
+fn test_contract_full_uses_output_dtype() {
+    // UNROLL with axes [(1,4)]
+    // CONTRACT with same axes [(1,4)] → full contraction
+    let unroll = create_unroll_iota(1, 4);
+    let contract = create_contract(unroll, vec![(1, 4)]);
+
+    let result = phase2_only(&contract);
+
+    // Full contraction produces GEP (no UNROLL wrapper)
+    // The result should be the vectorized dtype from CONTRACT
+    assert_vcount(&result, 4);
+}

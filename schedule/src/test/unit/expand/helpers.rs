@@ -76,6 +76,14 @@ pub fn create_unroll_multi_axis(axes: Vec<(usize, usize)>) -> Arc<UOp> {
     vconst.unroll_with_dtype(axes, DType::Int64)
 }
 
+/// Create UNROLL with multiple axes and custom dtype.
+pub fn create_unroll_multi_axis_with_dtype(axes: Vec<(usize, usize)>, dtype: DType) -> Arc<UOp> {
+    let total_count: usize = axes.iter().map(|(_, sz)| sz).product();
+    let values: Vec<ConstValue> = (0..total_count as i64).map(ConstValue::Int).collect();
+    let vconst = UOp::vconst(values);
+    vconst.unroll_with_dtype(axes, dtype)
+}
+
 /// Create a simple integer VCONST.
 pub fn create_vconst_int(values: Vec<i64>) -> Arc<UOp> {
     let const_values: Vec<ConstValue> = values.into_iter().map(ConstValue::Int).collect();
@@ -85,6 +93,11 @@ pub fn create_vconst_int(values: Vec<i64>) -> Arc<UOp> {
 /// Create a CONTRACT operation.
 pub fn create_contract(src: Arc<UOp>, axes: Vec<(usize, usize)>) -> Arc<UOp> {
     src.contract(axes)
+}
+
+/// Create a CONTRACT operation with explicit void dtype (for STORE-like operations).
+pub fn create_contract_void(src: Arc<UOp>, axes: Vec<(usize, usize)>) -> Arc<UOp> {
+    UOp::new(morok_ir::Op::Contract { src: src.clone(), upcast_ranges: axes }, DType::Void)
 }
 
 // =============================================================================
