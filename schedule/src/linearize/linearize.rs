@@ -439,6 +439,7 @@ fn compute_run_count(uop: &Arc<UOp>) -> u64 {
     use morok_ir::uop::cached_property::CachedProperty;
     use morok_ir::uop::properties::InScopeRangesProperty;
 
+    #[allow(clippy::mutable_key_type)] // UOpKey uses Arc<UOp> which has interior mutability but is hashed by id
     let in_scope = InScopeRangesProperty::get(uop);
     if in_scope.is_empty() {
         return 1;

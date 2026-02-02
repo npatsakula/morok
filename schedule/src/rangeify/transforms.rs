@@ -797,8 +797,8 @@ fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
 ///
 /// * `bufferize_op` - The BUFFERIZE UOp to convert
 /// * `ctx` - Kernel context for tracking buffers and generating IDs
-/// * `allow_locals` - If false, treat local address space as global (Tinygrad: pm_add_buffers)
-///                    If true, create DEFINE_LOCAL for local address space (Tinygrad: pm_add_buffers_local)
+/// * `allow_locals` - If false, treat local address space as global (Tinygrad: pm_add_buffers).
+///   If true, create DEFINE_LOCAL for local address space (Tinygrad: pm_add_buffers_local).
 pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allow_locals: bool) -> Option<Arc<UOp>> {
     let (compute, ranges, opts) = match bufferize_op.op() {
         Op::Bufferize { compute, ranges, opts } => {

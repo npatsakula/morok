@@ -1,3 +1,5 @@
+mod index_lowering;
+
 use crate::{pattern::RewriteResult, symbolic::symbolic_simple};
 use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};

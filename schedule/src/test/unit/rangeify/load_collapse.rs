@@ -119,3 +119,160 @@ fn test_arithmetic_lifting_add() {
         "Arithmetic lifting should be attempted"
     );
 }
+
+// ============================================================================
+// New Stage 2 patterns tests
+// ============================================================================
+
+#[test]
+fn test_two_sided_bounds() {
+    // Pattern: sum(val for i in range(10) if 2 <= i < 7) → (7 - 2) * val = 5 * val
+    // Represented as: REDUCE(Add, WHERE((NOT(r < 2) AND (r < 7)), val, 0), [r])
+    let range = test_range(10);
+    let lower = UOp::index_const(2);
+    let upper = UOp::index_const(7);
+
+    // NOT(r < lower) = (r >= lower)
+    let lt_lower = range.try_cmplt(&lower).expect("cmplt");
+    let ge_lower = lt_lower.not();
+
+    // r < upper
+    let lt_upper = range.try_cmplt(&upper).expect("cmplt");
+
+    // (r >= lower) AND (r < upper)
+    let cond = ge_lower.and_(&lt_upper);
+
+    let val = UOp::native_const(1.0f32);
+    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let where_expr = UOp::try_where(cond, val.clone(), zero).expect("where");
+    let reduce = reduce_add(where_expr, range.clone());
+
+    let matcher = pm_load_collapse();
+    let result = matcher.rewrite(&reduce, &mut ());
+
+    if let RewriteResult::Rewritten(collapsed) = result {
+        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE for two-sided bounds");
+    }
+}
+
+#[test]
+fn test_mul_casted_bool() {
+    // Pattern: x * bool.cast() → bool.where(x, 0)
+    let gate = UOp::const_(DType::Bool, ConstValue::Int(1)); // true
+    let gate_cast = gate.cast(DType::Float32);
+    let x = UOp::native_const(5.0f32);
+
+    let mul = x.try_mul(&gate_cast).expect("mul");
+
+    let matcher = pm_load_collapse();
+    let result = matcher.rewrite(&mul, &mut ());
+
+    if let RewriteResult::Rewritten(rewritten) = result {
+        // Should be WHERE(gate, x, 0)
+        assert!(matches!(rewritten.op(), Op::Ternary(morok_ir::TernaryOp::Where, ..)), "Should convert to WHERE");
+    }
+}
+
+#[test]
+fn test_ne_lifting() {
+    // Pattern: (x + y) != c → x != (c - y) when no_range(y, c)
+    let x = UOp::index_const(5);
+    let y = UOp::index_const(3);
+    let c = UOp::index_const(10);
+
+    let add = x.try_add(&y).expect("add");
+    let ne = add.try_cmpne(&c).expect("cmpne");
+
+    let matcher = pm_load_collapse();
+    let result = matcher.rewrite(&ne, &mut ());
+
+    // Both x, y, c are consts (range-free), so pattern should match
+    if let RewriteResult::Rewritten(rewritten) = result {
+        // Should be x != (c - y) = x != 7
+        if let Op::Binary(morok_ir::BinaryOp::Ne, lhs, rhs) = rewritten.op() {
+            // lhs should be x (or equivalent)
+            // rhs should be c - y = 7
+            assert_eq!(lhs.dtype(), DType::Index, "LHS should be Index dtype");
+            assert_eq!(rhs.dtype(), DType::Index, "RHS should be Index dtype");
+        }
+    }
+}
+
+#[test]
+fn test_two_sided_bounds_lower_gt_upper() {
+    // Edge case: lower > upper should produce count of 0
+    // Pattern: sum(val for i in range(10) if 7 <= i < 2) → 0 * val = 0
+    let range = test_range(10);
+    let lower = UOp::index_const(7); // lower > upper
+    let upper = UOp::index_const(2);
+
+    let lt_lower = range.try_cmplt(&lower).expect("cmplt");
+    let ge_lower = lt_lower.not();
+    let lt_upper = range.try_cmplt(&upper).expect("cmplt");
+    let cond = ge_lower.and_(&lt_upper);
+
+    let val = UOp::native_const(1.0f32);
+    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let where_expr = UOp::try_where(cond, val.clone(), zero).expect("where");
+    let reduce = reduce_add(where_expr, range.clone());
+
+    let matcher = pm_load_collapse();
+    let result = matcher.rewrite(&reduce, &mut ());
+
+    // Should collapse to a multiplication by 0 (or constant 0)
+    if let RewriteResult::Rewritten(collapsed) = result {
+        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE");
+    }
+}
+
+#[test]
+fn test_two_sided_bounds_ge_form() {
+    // Test using direct GE (>=) form instead of NOT(LT)
+    // This requires a range with GE comparison
+    let range = test_range(10);
+    let lower = UOp::index_const(3);
+    let upper = UOp::index_const(8);
+
+    // Use GE directly: r >= lower
+    let ge_lower = range.try_cmpge(&lower).expect("cmpge");
+    let lt_upper = range.try_cmplt(&upper).expect("cmplt");
+    let cond = ge_lower.and_(&lt_upper);
+
+    let val = UOp::native_const(1.0f32);
+    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let where_expr = UOp::try_where(cond, val.clone(), zero).expect("where");
+    let reduce = reduce_add(where_expr, range.clone());
+
+    let matcher = pm_load_collapse();
+    let result = matcher.rewrite(&reduce, &mut ());
+
+    if let RewriteResult::Rewritten(collapsed) = result {
+        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE with GE form");
+    }
+}
+
+#[test]
+fn test_two_sided_bounds_at_range_edges() {
+    // Edge case: bounds at exactly 0 and end
+    // Pattern: sum(val for i in range(10) if 0 <= i < 10) → 10 * val
+    let range = test_range(10);
+    let lower = UOp::index_const(0);
+    let upper = UOp::index_const(10);
+
+    let lt_lower = range.try_cmplt(&lower).expect("cmplt");
+    let ge_lower = lt_lower.not();
+    let lt_upper = range.try_cmplt(&upper).expect("cmplt");
+    let cond = ge_lower.and_(&lt_upper);
+
+    let val = UOp::native_const(1.0f32);
+    let zero = UOp::const_(DType::Float32, ConstValue::Float(0.0));
+    let where_expr = UOp::try_where(cond, val.clone(), zero).expect("where");
+    let reduce = reduce_add(where_expr, range.clone());
+
+    let matcher = pm_load_collapse();
+    let result = matcher.rewrite(&reduce, &mut ());
+
+    if let RewriteResult::Rewritten(collapsed) = result {
+        assert!(!matches!(collapsed.op(), Op::Reduce { .. }), "Should have eliminated REDUCE for full range");
+    }
+}

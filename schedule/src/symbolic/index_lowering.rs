@@ -198,5 +198,108 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             // by the operations that consume this value
             Some(src.clone())
         },
+
+        // ====================================================================
+        // Pattern 9: BIND with Index casts
+        // ====================================================================
+        // BIND(var.cast(index), val.cast(index)) → var.bind(val).cast(index)
+        Bind { var: Cast { src: var_inner, dtype: idx_dtype }, value: Cast { src: val_inner, dtype: idx_dtype2 } }
+            if *idx_dtype == DType::Index && *idx_dtype2 == DType::Index
+            => |var_inner, val_inner| {
+                let bound = var_inner.bind(val_inner.clone());
+                Some(bound.cast(DType::Index))
+            },
+
+        // ====================================================================
+        // Pattern 10: INDEX cleanup (ungated) - Invalid lowering + hanging cast
+        // ====================================================================
+        // Combines two patterns to avoid duplicate matching:
+        // - buf.index(cond.where(idx, Invalid)) → INDEX(buf, idx, gate=cond)
+        // - INDEX(buf, idx.cast(index)) → INDEX(buf, idx) when idx is concrete int
+        Index { buffer, indices, gate: None }
+            if indices.len() == 1 => |buffer, indices| {
+                let idx_uop = &indices[0];
+                // Derive element type from buffer's pointer type
+                let result_dtype = match buffer.dtype() {
+                    DType::Ptr { base, .. } => base.as_ref().clone(),
+                    other => other,
+                };
+
+                // Try pattern A: WHERE(cond, idx, Invalid) → INDEX with gate
+                if let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op()
+                    && matches!(false_val.op(), Op::Invalid) {
+                        return Some(UOp::new(
+                            Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(cond.clone()) },
+                            result_dtype,
+                        ));
+                    }
+
+                // Try pattern B: idx.cast(index) → idx when idx is concrete int
+                if let Op::Cast { src: idx, dtype: idx_dtype } = idx_uop.op()
+                    && *idx_dtype == DType::Index && idx.dtype().is_int() {
+                        return Some(UOp::new(
+                            Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: None },
+                            result_dtype,
+                        ));
+                    }
+
+                None
+            },
+
+        // ====================================================================
+        // Pattern 12: Hanging cast cleanup (3-arg INDEX with valid)
+        // ====================================================================
+        // INDEX(buf, idx.cast(index), valid) where idx is concrete int → INDEX(buf, idx, valid)
+        Index { buffer, indices, gate: Some(valid) }
+            if indices.len() == 1 => |buffer, indices, valid| {
+                let idx_uop = &indices[0];
+                let Op::Cast { src: idx, dtype: idx_dtype } = idx_uop.op() else {
+                    return None;
+                };
+                if *idx_dtype != DType::Index || !idx.dtype().is_int() {
+                    return None;
+                }
+                // Derive element type from buffer's pointer type
+                let result_dtype = match buffer.dtype() {
+                    DType::Ptr { base, .. } => base.as_ref().clone(),
+                    other => other,
+                };
+                Some(UOp::new(
+                    Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(valid.clone()) },
+                    result_dtype,
+                ))
+            },
+
+        // ====================================================================
+        // Pattern 13: SINK cast strip
+        // ====================================================================
+        // Strip .cast(index) from sources in SINK
+        Sink { sources } => |sources| {
+            let mut changed = false;
+            let new_sources: Vec<Arc<UOp>> = sources.iter()
+                .map(|s| {
+                    if let Op::Cast { src, dtype } = s.op()
+                        && *dtype == DType::Index {
+                            changed = true;
+                            return src.clone();
+                        }
+                    s.clone()
+                })
+                .collect();
+            if !changed { return None; }
+            Some(UOp::sink(new_sources))
+        },
+
+        // ====================================================================
+        // Pattern 14: END cast strip
+        // ====================================================================
+        // Strip .cast(index) from computation in END
+        End { computation, ranges } => |computation, ranges| {
+            if let Op::Cast { src, dtype } = computation.op()
+                && *dtype == DType::Index {
+                    return Some(UOp::new(Op::End { computation: src.clone(), ranges: ranges.clone() }, DType::Void));
+                }
+            None
+        },
     }
 }

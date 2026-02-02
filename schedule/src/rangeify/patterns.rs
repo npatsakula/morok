@@ -1746,6 +1746,14 @@ fn no_range(u: &Arc<UOp>) -> bool {
     !u.toposort().iter().any(|x| matches!(x.op(), Op::Range { .. }))
 }
 
+/// Check if UOp has no INDEX (load) in backward slice.
+///
+/// Used for index overflow protection pattern - we want to ensure
+/// we don't do math on a loaded index since that can cause overflow.
+fn no_load(u: &Arc<UOp>) -> bool {
+    !u.toposort().iter().any(|x| matches!(x.op(), Op::Index { .. }))
+}
+
 /// Check if a UOp represents a zero constant.
 fn is_const_zero(u: &Arc<UOp>) -> bool {
     if let Op::Const(cv) = u.op() { cv.0.is_zero() } else { false }
@@ -1764,17 +1772,19 @@ fn const_to_i64(u: &Arc<UOp>) -> Option<i64> {
     }
 }
 
-/// Get range end as i64.
-fn range_end_i64(r: &Arc<UOp>) -> Option<i64> {
-    if let Op::Range { end, .. } = r.op() { const_to_i64(end) } else { None }
+/// Compute minimum of two UOps: min(a, b) = where(a < b, a, b)
+fn uop_min(a: &Arc<UOp>, b: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let cond = a.try_cmplt(b).ok()?;
+    UOp::try_where(cond, a.clone(), b.clone()).ok()
 }
 
 /// Try to collapse a REDUCE with conditional/gated patterns.
 ///
-/// This implements three reduction collapse patterns from Tinygrad:
+/// This implements reduction collapse patterns from Tinygrad (simplify.py:93-108):
 /// 1. Sum of `where(r < cut, 0, val)` → `clamp(end-cut, 0, end) * val`
 /// 2. Sum of `where(r < cut, val, 0)` → `clamp(cut, 0, end) * val`
 /// 3. Sum of `where(idx != r, 0, expr)` → `where(in_bounds, expr[r:=idx], 0)`
+/// 4. Sum of `where((r >= lower) & (r < upper), val, 0)` → two-sided bounds
 fn try_reduce_collapse(
     _reduce: &Arc<UOp>,
     src: &Arc<UOp>,
@@ -1792,70 +1802,160 @@ fn try_reduce_collapse(
     }
 
     let range = &ranges[0];
-    let range_end = range_end_i64(range)?;
+    let Op::Range { end, .. } = range.op() else {
+        return None;
+    };
 
-    // Pattern: WHERE(Lt(range, cut), true_val, false_val)
-    if let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = src.op() {
-        // Pattern 1: where(r < cut, 0, val) → (end - cut).clamp(0, end) * val
-        if let Op::Binary(BinaryOp::Lt, lt_lhs, cut) = cond.op()
-            && Arc::ptr_eq(lt_lhs, range)
-            && is_const_zero(true_val)
-            && no_range(false_val)
+    // Pattern: WHERE(cond, true_val, false_val)
+    let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = src.op() else {
+        return None;
+    };
+
+    // Pattern 1: where(r < cut, 0, val) → (end - cut).clamp(0, end) * val
+    if let Op::Binary(BinaryOp::Lt, lt_lhs, cut) = cond.op()
+        && Arc::ptr_eq(lt_lhs, range)
+        && is_const_zero(true_val)
+        && no_range(false_val)
+        && let Some(range_end) = const_to_i64(end)
+    {
+        let cut_val = const_to_i64(cut)?;
+        // count = max(0, min(end - cut, end))
+        let count = (range_end - cut_val).max(0).min(range_end);
+        let count_uop = UOp::const_(false_val.dtype(), ConstValue::Int(count));
+        return count_uop.try_mul(false_val).ok();
+    }
+
+    // Pattern 2: where(r < cut, val, 0) → cut.clamp(0, end) * val
+    if let Op::Binary(BinaryOp::Lt, lt_lhs, cut) = cond.op()
+        && Arc::ptr_eq(lt_lhs, range)
+        && is_const_zero(false_val)
+        && no_range(true_val)
+        && let Some(range_end) = const_to_i64(end)
+    {
+        let cut_val = const_to_i64(cut)?;
+        // count = max(0, min(cut, end))
+        let count = cut_val.max(0).min(range_end);
+        let count_uop = UOp::const_(true_val.dtype(), ConstValue::Int(count));
+        return count_uop.try_mul(true_val).ok();
+    }
+
+    // Pattern 3: where(idx != r, 0, expr) → where(in_bounds(idx), expr[r:=idx], 0)
+    // This eliminates reduces over tensor indexing!
+    if let Op::Binary(BinaryOp::Ne, idx, ne_range) = cond.op()
+        && Arc::ptr_eq(ne_range, range)
+        && is_const_zero(true_val)
+        && no_range(idx)
+    {
+        // Build bounds check: 0 <= idx < end
+        let zero = UOp::index_const(0);
+        let ge_zero = idx.try_cmpge(&zero).ok()?;
+        let lt_end = idx.try_cmplt(end).ok()?;
+        let in_bounds = ge_zero.try_and_op(&lt_end).ok()?;
+
+        // Substitute range with idx in the expression
+        #[allow(clippy::mutable_key_type)]
+        let subs: std::collections::HashMap<UOpKey, Arc<UOp>> =
+            [(UOpKey(range.clone()), idx.clone())].into_iter().collect();
+        let substituted = false_val.substitute(&subs);
+
+        // where(in_bounds, substituted, 0)
+        let zero_like = UOp::const_(false_val.dtype(), ConstValue::zero(false_val.dtype().base()));
+        return UOp::try_where(in_bounds, substituted, zero_like).ok();
+    }
+
+    // Pattern 4: Two-sided bounds
+    // where((r >= lower) & (r < upper), val, 0) → (upper.min(end) - lower.max(0)).max(0).min(end) * val
+    // Handles two AST representations:
+    //   A: ((r < lower).logical_not() & (r < upper)) - NOT(LT) form
+    //   B: ((r >= lower) & (r < upper)) - direct GE form
+    if let Op::Binary(BinaryOp::And, lhs_cond, rhs_cond) = cond.op()
+        && is_const_zero(false_val)
+        && no_range(true_val)
+    {
+        // Try to extract (r >= lower) from lhs_cond - either NOT(LT) or GE form
+        let lower_bound = extract_ge_lower_bound(lhs_cond, range).or_else(|| extract_ge_lower_bound(rhs_cond, range));
+
+        // Try to extract (r < upper) from rhs_cond or lhs_cond
+        let upper_bound = extract_lt_upper_bound(rhs_cond, range).or_else(|| extract_lt_upper_bound(lhs_cond, range));
+
+        if let (Some(lower), Some(upper)) = (lower_bound, upper_bound)
+            && no_range(&lower)
+            && no_range(&upper)
         {
-            let cut_val = const_to_i64(cut)?;
-            // count = max(0, min(end - cut, end))
-            let count = (range_end - cut_val).max(0).min(range_end);
-            let count_uop = UOp::const_(false_val.dtype(), ConstValue::Int(count));
-            return count_uop.try_mul(false_val).ok();
-        }
-
-        // Pattern 2: where(r < cut, val, 0) → cut.clamp(0, end) * val
-        if let Op::Binary(BinaryOp::Lt, lt_lhs, cut) = cond.op()
-            && Arc::ptr_eq(lt_lhs, range)
-            && is_const_zero(false_val)
-            && no_range(true_val)
-        {
-            let cut_val = const_to_i64(cut)?;
-            // count = max(0, min(cut, end))
-            let count = cut_val.max(0).min(range_end);
-            let count_uop = UOp::const_(true_val.dtype(), ConstValue::Int(count));
-            return count_uop.try_mul(true_val).ok();
-        }
-
-        // Pattern 3: where(idx != r, 0, expr) → where(in_bounds(idx), expr[r:=idx], 0)
-        // This eliminates reduces over tensor indexing!
-        if let Op::Binary(BinaryOp::Ne, idx, ne_range) = cond.op()
-            && Arc::ptr_eq(ne_range, range)
-            && is_const_zero(true_val)
-        {
-            // Check: idx must not depend on range
-            if !no_range(idx) {
-                return None;
-            }
-
-            // Build bounds check: 0 <= idx < end
+            // (upper.min(end) - lower.max(0)).max(0).min(end) * val
             let zero = UOp::index_const(0);
-            let end = match range.op() {
-                Op::Range { end, .. } => end.clone(),
-                _ => return None,
-            };
-            let ge_zero = idx.try_cmpge(&zero).ok()?;
-            let lt_end = idx.try_cmplt(&end).ok()?;
-            let in_bounds = ge_zero.try_and_op(&lt_end).ok()?;
-
-            // Substitute range with idx in the expression
-            #[allow(clippy::mutable_key_type)]
-            let subs: std::collections::HashMap<UOpKey, Arc<UOp>> =
-                [(UOpKey(range.clone()), idx.clone())].into_iter().collect();
-            let substituted = false_val.substitute(&subs);
-
-            // where(in_bounds, substituted, 0)
-            let zero_like = UOp::const_(false_val.dtype(), ConstValue::zero(false_val.dtype().base()));
-            return UOp::try_where(in_bounds, substituted, zero_like).ok();
+            let clamped_upper = uop_min(&upper, end)?;
+            let clamped_lower = lower.try_max(&zero).ok()?;
+            let diff = clamped_upper.try_sub(&clamped_lower).ok()?;
+            let non_negative = diff.try_max(&zero).ok()?;
+            let count = uop_min(&non_negative, end)?;
+            let count_casted = count.cast(true_val.dtype());
+            return count_casted.try_mul(true_val).ok();
         }
     }
 
     None
+}
+
+/// Extract lower bound from (r >= lower) condition.
+/// Handles both NOT(r < lower) and (r >= lower) forms.
+fn extract_ge_lower_bound(cond: &Arc<UOp>, range: &Arc<UOp>) -> Option<Arc<UOp>> {
+    // Form A: NOT(r < lower)
+    if let Op::Unary(UnaryOp::Not, lt_cond) = cond.op()
+        && let Op::Binary(BinaryOp::Lt, lt_lhs, lower) = lt_cond.op()
+        && Arc::ptr_eq(lt_lhs, range)
+    {
+        return Some(lower.clone());
+    }
+    // Form B: r >= lower (represented as NOT(r < lower) or Ge(r, lower))
+    if let Op::Binary(BinaryOp::Ge, ge_lhs, lower) = cond.op()
+        && Arc::ptr_eq(ge_lhs, range)
+    {
+        return Some(lower.clone());
+    }
+    None
+}
+
+/// Extract upper bound from (r < upper) condition.
+fn extract_lt_upper_bound(cond: &Arc<UOp>, range: &Arc<UOp>) -> Option<Arc<UOp>> {
+    if let Op::Binary(BinaryOp::Lt, lt_lhs, upper) = cond.op()
+        && Arc::ptr_eq(lt_lhs, range)
+    {
+        return Some(upper.clone());
+    }
+    None
+}
+
+/// Try to collapse a REDUCE when DEFINE_VAR can be factored out.
+///
+/// Pattern: (DEFINE_VAR & y).where(c, 0).reduce(ADD) → y.where(c, 0).reduce(ADD) * DEFINE_VAR.cast(c.dtype)
+fn try_define_var_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+    // Pattern: WHERE((DEFINE_VAR & y), c, 0)
+    let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = src.op() else {
+        return None;
+    };
+    if !is_const_zero(false_val) {
+        return None;
+    }
+
+    // Match AND(DEFINE_VAR, y) or AND(y, DEFINE_VAR)
+    let Op::Binary(BinaryOp::And, and_lhs, and_rhs) = cond.op() else {
+        return None;
+    };
+
+    let (define_var, other) = if matches!(and_lhs.op(), Op::DefineVar { .. }) {
+        (and_lhs.clone(), and_rhs.clone())
+    } else if matches!(and_rhs.op(), Op::DefineVar { .. }) {
+        (and_rhs.clone(), and_lhs.clone())
+    } else {
+        return None;
+    };
+
+    // Build: other.where(c, 0).reduce(ADD) * DEFINE_VAR.cast(c.dtype)
+    let inner_where = UOp::try_where(other, true_val.clone(), false_val.clone()).ok()?;
+    let inner_reduce = inner_where.reduce(ranges.clone(), ReduceOp::Add);
+    let casted_var = define_var.cast(true_val.dtype());
+    inner_reduce.try_mul(&casted_var).ok()
 }
 
 /// Arithmetic lifting for comparisons.
@@ -1908,8 +2008,13 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 ///
 /// Key optimizations:
 /// 1. Bounded sum reduction: `sum(1 for i in range(n) if i >= k)` → `n - k`
-/// 2. Gated load collapse: `sum(where(idx == r, val, 0))` → direct indexed load
-/// 3. Arithmetic lifting: push comparisons through arithmetic operations
+/// 2. Two-sided bounds: `sum(1 for i in range(n) if lower <= i < upper)` → clamped count
+/// 3. Gated load collapse: `sum(where(idx == r, val, 0))` → direct indexed load
+/// 4. Arithmetic lifting: push comparisons through arithmetic operations
+/// 5. DEFINE_VAR factoring: `(dv & y).where(c, 0).reduce(ADD)` → `y.where(c,0).reduce(ADD) * dv`
+/// 6. MUL casted bool: `x * gate:bool.cast()` → `gate.where(x, 0)`
+/// 7. NE lifting: `(x + y) != c` → `x != (c - y)`
+/// 8. Index overflow protection: `(x:index + y) < c` → `x < (c - y)` when x has loads
 pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Main pattern: REDUCE with WHERE condition - only Add reduces
@@ -1917,6 +2022,7 @@ pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
             if !ranges.is_empty() && *reduce_op == ReduceOp::Add
             => |reduce, src, ranges| {
                 try_reduce_collapse(reduce, src, ranges, ReduceOp::Add)
+                    .or_else(|| try_define_var_factor(src, ranges))
             },
 
         // Arithmetic lifting: (x + y) < c or (x * y) < c
@@ -1926,6 +2032,28 @@ pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
         cond @ Lt(_lhs @ Mul(_, _), rhs) if no_range(rhs) => |cond| {
             try_lift_arithmetic_from_lt(cond)
         },
+
+        // MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
+        // Matches x * gate.cast() where gate is bool
+        Mul[x, Cast { src: gate, .. }] if gate.dtype() == DType::Bool => |x, gate| {
+            let zero = UOp::const_(x.dtype(), ConstValue::zero(x.dtype().base()));
+            UOp::try_where(gate.clone(), x.clone(), zero).ok()
+        },
+
+        // NE lifting: (x + y) != c → x != (c - y) when no_range(y, c)
+        Ne(Add(x, y), c) if no_range(y) && no_range(c) => |x, y, c| {
+            let new_c = c.try_sub(y).ok()?;
+            x.try_cmpne(&new_c).ok()
+        },
+
+        // Index overflow protection: (x:index + y) < c → x < (c - y)
+        // Only when x has loads but y, c don't - prevents overflow on loaded indices
+        Lt(Add(x, y), c)
+            if x.dtype() == DType::Index && !no_load(x) && no_load(y) && no_load(c)
+            => |x, y, c| {
+                let new_c = c.try_sub(y).ok()?;
+                x.try_cmplt(&new_c).ok()
+            },
     }
 }
 
@@ -2186,11 +2314,7 @@ pub fn pm_comparison_negations() -> TypedPatternMatcher<()> {
         // When comparing negated value with constant, flip the comparison
         Lt(Mul(x, _neg1 @const(neg_val)), _c @const(c_val)) if x.dtype().is_int() => |x, neg_val, c_val| {
             // Check that we're multiplying by -1
-            let is_neg_one = match neg_val {
-                ConstValue::Int(-1) => true,
-                _ => false,
-            };
-            if !is_neg_one { return None; }
+            if !matches!(neg_val, ConstValue::Int(-1)) { return None; }
 
             let c = match c_val {
                 ConstValue::Int(v) => v,
@@ -2208,11 +2332,7 @@ pub fn pm_comparison_negations() -> TypedPatternMatcher<()> {
         // When comparing negated x with scaled y, flip and negate scale
         Lt(Mul(x, _neg1 @const(neg_val)), Mul(y, _c @const(c_val))) if x.dtype().is_int() => |x, neg_val, y, c_val| {
             // Check that we're multiplying x by -1
-            let is_neg_one = match neg_val {
-                ConstValue::Int(-1) => true,
-                _ => false,
-            };
-            if !is_neg_one { return None; }
+            if !matches!(neg_val, ConstValue::Int(-1)) { return None; }
 
             let c = match c_val {
                 ConstValue::Int(v) => v,

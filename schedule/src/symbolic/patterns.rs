@@ -913,15 +913,18 @@ fn can_combine_gates(cond: &Arc<UOp>, existing_gate: &Arc<UOp>) -> bool {
 
 /// Transform WHERE(cond, LOAD(INDEX(buf, idx)), alt) to LOAD(INDEX(buf, idx, gate=cond), alt).
 ///
-/// # Safety Checks
+/// Supports **partial clause movement** (Tinygrad: pm_move_where_on_load):
+/// - Splits condition into AND clauses
+/// - Moves only clauses where ALL ranges are within index scope AND no load dependencies
+/// - Keeps remaining clauses in outer WHERE
+/// - Removes duplicate clauses (already present in existing gate)
 ///
-/// The transformation is rejected if any of the following conditions are true:
-/// 1. **Duplicate AND clauses**: The condition contains duplicate clauses in AND chains
-///    (e.g., `a AND a AND b`), which indicates redundant/malformed conditions
-/// 2. **Out-of-scope ranges**: The condition references RANGE ops that are not in the
-///    INDEX's scope (i.e., not reachable from the indices)
-/// 3. **Load dependencies**: The condition depends on other LOAD/INDEX operations,
-///    which could cause speculative load side effects
+/// # Safety Checks per clause
+///
+/// A clause can be moved if:
+/// 1. No duplicate with existing gate clauses (prevents redundant checks)
+/// 2. All RANGE ops in the clause are in the INDEX's scope
+/// 3. No LOAD/INDEX dependencies (prevents speculative load side effects)
 fn where_on_load_transform(
     cond: &Arc<UOp>,
     buffer: &Arc<UOp>,
@@ -930,57 +933,91 @@ fn where_on_load_transform(
     existing_gate: Option<&Arc<UOp>>,
     alt: &Arc<UOp>,
 ) -> Option<Arc<UOp>> {
-    // Safety check 1: No duplicate AND clauses
-    if has_duplicate_and_clauses(cond) {
-        return None;
+    // Step 1: Split condition into AND clauses
+    let c1_clauses = split_and_clauses(cond);
+
+    // Step 2: Get existing gate clauses (if any)
+    let c2_clauses: Vec<Arc<UOp>> = existing_gate.map(split_and_clauses).unwrap_or_default();
+
+    // Step 3: Find duplicate clauses (already in existing gate)
+    let duplicate_ids: std::collections::HashSet<u64> =
+        c1_clauses.iter().filter(|c| c2_clauses.iter().any(|c2| c.id == c2.id)).map(|c| c.id).collect();
+
+    // Step 4: Collect all RANGE ids reachable from indices (index scope)
+    let mut index_ranges = std::collections::HashSet::new();
+    for idx in indices {
+        for node in idx.toposort() {
+            if matches!(node.op(), Op::Range { .. }) {
+                index_ranges.insert(node.id);
+            }
+        }
     }
 
-    // Safety check 2: Condition ranges must be within INDEX scope
-    if !condition_ranges_in_index_scope(cond, indices) {
-        return None;
+    // Step 5: Partition clauses into moveable vs remaining
+    let (moved_clauses, remaining_clauses): (Vec<_>, Vec<_>) = c1_clauses.iter().cloned().partition(|clause| {
+        // Skip duplicates
+        if duplicate_ids.contains(&clause.id) {
+            return true; // Treat as "moved" (but won't add to gate)
+        }
+
+        // Check all ranges in clause are within index scope
+        let clause_ranges_in_scope = clause
+            .toposort()
+            .iter()
+            .filter(|n| matches!(n.op(), Op::Range { .. }))
+            .all(|r| index_ranges.contains(&r.id));
+
+        if !clause_ranges_in_scope {
+            return false; // Cannot move - out of scope ranges
+        }
+
+        // Check no load dependencies
+        let has_loads = clause.toposort().iter().any(|n| matches!(n.op(), Op::Load { .. } | Op::Index { .. }));
+
+        !has_loads // Can move if no loads
+    });
+
+    // Step 6: If no movement possible and no duplicates removed, return None
+    let actually_moved: Vec<_> = moved_clauses.into_iter().filter(|c| !duplicate_ids.contains(&c.id)).collect();
+
+    if actually_moved.is_empty() && duplicate_ids.is_empty() {
+        return None; // Nothing to move or deduplicate
     }
 
-    // Safety check 3: No load dependencies in condition
-    if has_load_dependency(cond) {
-        return None;
+    // Step 7: Build new gate (moved clauses + existing gate clauses)
+    let mut gate_clauses: Vec<Arc<UOp>> = actually_moved;
+    gate_clauses.extend(c2_clauses);
+
+    let new_gate =
+        if gate_clauses.is_empty() { None } else { Some(gate_clauses.into_iter().reduce(|a, b| a.and_(&b)).unwrap()) };
+
+    // Step 8: Create new INDEX with gate
+    let new_index = match new_gate {
+        Some(gate) => UOp::index().buffer(idx_buf.clone()).indices(indices.clone()).gate(gate).call(),
+        None => UOp::index().buffer(idx_buf.clone()).indices(indices.clone()).call(),
     }
+    .expect("where_on_load: INDEX construction failed - types validated by pattern");
 
-    // Create new gate: combine with existing if present
-    // Using and_() panicking wrapper - types are validated by pattern matcher
-    let new_gate = match existing_gate {
-        Some(existing) if !Arc::ptr_eq(cond, existing) => cond.and_(existing),
-        _ => cond.clone(),
-    };
-
-    // Create new INDEX with gate using builder pattern
-    // .expect() is safe here because pattern already validated the types
-    let new_index = UOp::index()
-        .buffer(idx_buf.clone())
-        .indices(indices.clone())
-        .gate(new_gate)
-        .call()
-        .expect("where_on_load: INDEX construction failed - types validated by pattern");
-
-    // Infer load dtype from buffer (like UOp::load does)
+    // Step 9: Infer load dtype from buffer
     let load_dtype = match buffer.dtype() {
         DType::Ptr { base, .. } => base.as_ref().clone(),
         other => other,
     };
 
-    // Cast alt value to match load dtype
+    // Step 10: Cast alt value to match load dtype
     let alt_casted = alt.cast(load_dtype.clone());
 
-    // Create new LOAD with alt value using builder pattern
-    Some(UOp::load().buffer(buffer.clone()).index(new_index).dtype(load_dtype).alt(alt_casted).call())
-}
+    // Step 11: Create new LOAD with alt value
+    let new_load = UOp::load().buffer(buffer.clone()).index(new_index).dtype(load_dtype).alt(alt_casted).call();
 
-/// Check if condition has duplicate clauses in AND chains.
-///
-/// Splits the condition into AND clauses and checks for duplicates by UOp ID.
-fn has_duplicate_and_clauses(cond: &Arc<UOp>) -> bool {
-    let clauses = split_and_clauses(cond);
-    let mut seen = std::collections::HashSet::new();
-    clauses.iter().any(|c| !seen.insert(c.id))
+    // Step 12: Wrap in remaining WHERE if there are non-moved clauses
+    if remaining_clauses.is_empty() {
+        Some(new_load)
+    } else {
+        // Build remaining condition from non-moved clauses
+        let remaining_cond = remaining_clauses.into_iter().reduce(|a, b| a.and_(&b)).unwrap();
+        UOp::try_where(remaining_cond, new_load, alt.clone()).ok()
+    }
 }
 
 /// Split a condition into its AND clauses recursively.
@@ -993,37 +1030,6 @@ fn split_and_clauses(cond: &Arc<UOp>) -> Vec<Arc<UOp>> {
         }
         _ => vec![cond.clone()],
     }
-}
-
-/// Check if all RANGE ops in the condition are within the INDEX's scope.
-///
-/// The INDEX's scope includes all RANGE ops reachable from its indices.
-fn condition_ranges_in_index_scope(cond: &Arc<UOp>, indices: &SmallVec<[Arc<UOp>; 4]>) -> bool {
-    // Collect all RANGEs reachable from indices
-    let mut index_ranges = std::collections::HashSet::new();
-    for idx in indices {
-        for node in idx.toposort() {
-            if matches!(node.op(), Op::Range { .. }) {
-                index_ranges.insert(node.id);
-            }
-        }
-    }
-
-    // Check all RANGEs in condition are in scope
-    for node in cond.toposort() {
-        if matches!(node.op(), Op::Range { .. }) && !index_ranges.contains(&node.id) {
-            return false;
-        }
-    }
-
-    true
-}
-
-/// Check if the condition has any LOAD or INDEX dependencies.
-///
-/// Moving such conditions to a gate could cause speculative load side effects.
-fn has_load_dependency(cond: &Arc<UOp>) -> bool {
-    cond.toposort().iter().any(|n| matches!(n.op(), Op::Load { .. } | Op::Index { .. }))
 }
 
 /// Cast pushing through WHERE patterns.
