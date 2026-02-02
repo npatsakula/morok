@@ -1206,8 +1206,6 @@ This chapter describes the "ideal" 22-stage pipeline based on Tinygrad's impleme
 | Stage | Tinygrad | Morok | Notes |
 |--------|-----------|-------|--------|
 | 1: Early Movement Ops | Moves movement ops through AFTER/END wrappers | Removes movement ops during bufferization | Both approaches achieve functional equivalence; Morok's is cleaner |
-| 4: Initial Symbolic | GEP pushing in `sym` | GEP pushing only in Stage 8 and 11 | Morok may miss some GEP optimization opportunities; consider adding to `symbolic_simple()` |
-| 11: Remove Reduce | Includes distributive pattern `(x+y).reduce() → x.reduce() + y.reduce()` | Missing distributive pattern | Morok's `reduce_collapse()` is a subset; no correctness impact, potential performance difference |
 | 15: Index Dtype Lowering | Separate stage converts Index → i32/i64 | Index lowered at codegen time (Index → i64) | Both valid; Morok trades runtime cost (always i64) for pipeline simplicity |
 | 18: Decompositions | Transcendentals in Stage 18 | Transcendentals via `decompositor()` | Both valid; Morok's approach separates generic patterns from backend-specific decompositions |
 | 19: Final Rewrite | `pm_render` applied in Stage 19 | `pm_render` applied during codegen | Functionally equivalent; Morok applies rendering transformations during rendering |

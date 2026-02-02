@@ -214,26 +214,42 @@ fn replace_sources_from_map(uop: &Arc<UOp>, replaced: &HashMap<u64, Arc<UOp>>) -
 /// ```text
 /// STORE(INDEX(buf, idx, gate), value) → IF(gate) + STORE(INDEX(buf, idx), value) + ENDIF
 /// ```
+///
+/// Also handles Cast-wrapped INDEX:
+/// ```text
+/// STORE(Cast(INDEX(buf, idx, gate)), value) → IF(gate) + STORE(Cast(INDEX(buf, idx)), value) + ENDIF
+/// ```
 fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>) -> Option<(Arc<UOp>, Vec<Arc<UOp>>)> {
     // Panic if IF/ENDIF already present
     if matches!(uop.op(), Op::If { .. } | Op::EndIf { .. }) {
         panic!("IF/ENDIF not allowed in graph before line_rewrite_cleanups");
     }
 
-    // Match STORE with gated INDEX
+    // Match STORE with gated INDEX (possibly wrapped in Cast)
     let Op::Store { index, value, ranges } = uop.op() else {
         return None;
     };
-    let Op::Index { buffer, indices, gate: Some(gate) } = index.op() else {
+
+    // Unwrap Cast if present, tracking whether we need to rewrap
+    let (actual_index, cast_dtype) = match index.op() {
+        Op::Cast { src, dtype } => (src, Some(dtype.clone())),
+        _ => (index, None),
+    };
+
+    let Op::Index { buffer, indices, gate: Some(gate) } = actual_index.op() else {
         return None;
     };
 
-    // Create ungated INDEX and STORE
+    // Create ungated INDEX
     let ungated_index = UOp::index().buffer(buffer.clone()).indices(indices.clone()).call().expect("ungated INDEX");
-    let ungated_store = ungated_index.store_with_ranges(value.clone(), ranges.clone());
+
+    // Rewrap in Cast if the original was Cast-wrapped
+    let final_index = if let Some(dtype) = cast_dtype { ungated_index.cast(dtype) } else { ungated_index.clone() };
+
+    let ungated_store = final_index.store_with_ranges(value.clone(), ranges.clone());
 
     // Wrap in IF/ENDIF
-    let if_op = UOp::if_(gate.clone(), smallvec![ungated_index.clone()]);
+    let if_op = UOp::if_(gate.clone(), smallvec![ungated_index]);
     let endif_op = UOp::endif(if_op.clone());
 
     Some((ungated_store.clone(), vec![if_op, ungated_store, endif_op]))

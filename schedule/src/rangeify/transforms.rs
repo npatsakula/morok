@@ -160,8 +160,10 @@ pub fn rangeify_with_map(
     // =========================================================================
     // Stage 4: Initial symbolic - Tinygrad: sym + pm_flatten_range (TOP_DOWN)
     // CRITICAL: Must run BEFORE pm_simplify_ranges
+    // NOTE: Using symbolic() (not symbolic_simple()) to include gep_pushing_patterns
+    //       This aligns with Tinygrad's sym which includes GEP pushing at every stage.
     // =========================================================================
-    let symbolic_with_flatten = crate::symbolic::symbolic_simple() + flatten_matcher;
+    let symbolic_with_flatten = crate::symbolic::symbolic() + flatten_matcher;
     sink = graph_rewrite_top_down(&symbolic_with_flatten, sink, &mut ());
     tracing::debug!(uop.tree = sink.tree(), "Stage 4: initial symbolic complete");
 
@@ -354,6 +356,10 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
     // Collect all UOps to find the marked ranges
     let topo = sink.toposort();
     for uop in &topo {
+        // Skip protected ranges (e.g., used in ImageDType stores)
+        if ctx.protected_ranges.contains(&uop.id) {
+            continue;
+        }
         if let Some(&mod_val) = ctx.marked_ranges.get(&uop.id)
             && let Op::Range { end, axis_id, axis_type } = uop.op()
         {
@@ -1108,42 +1114,36 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
             continue;
         }
 
-        // Get constant sizes
-        let s0 = match r0_end.op() {
-            Op::Const(c) => match c.0 {
-                ConstValue::Int(v) => v,
-                ConstValue::UInt(v) => v as i64,
-                _ => continue,
-            },
-            _ => continue, // Skip non-constant ranges
-        };
-        let s1 = match r1_end.op() {
-            Op::Const(c) => match c.0 {
-                ConstValue::Int(v) => v,
-                ConstValue::UInt(v) => v as i64,
-                _ => continue,
-            },
-            _ => continue,
-        };
-
-        if s0 <= 0 || s1 <= 0 {
+        // Get range sizes as UOps (supports both constant and symbolic sizes)
+        // Skip obviously invalid cases (constant <= 0)
+        if let Some(v) = const_uop_to_i64(r0_end)
+            && v <= 0
+        {
+            continue;
+        }
+        if let Some(v) = const_uop_to_i64(r1_end)
+            && v <= 0
+        {
             continue;
         }
 
-        // Check for overflow
-        let merged_size = match s0.checked_mul(s1) {
-            Some(s) => s,
-            None => continue,
-        };
+        // For constant sizes, check overflow
+        if let (Some(s0), Some(s1)) = (const_uop_to_i64(r0_end), const_uop_to_i64(r1_end))
+            && s0.checked_mul(s1).is_none()
+        {
+            continue;
+        }
 
-        // Create merged range (Tinygrad simplify.py:28)
-        let merged_range = r0.with_sources(vec![UOp::index_const(merged_size)]);
+        // Create merged size symbolically: s0 * s1 (Tinygrad simplify.py:28)
+        let merged_size_uop = r0_end.mul(r1_end);
+
+        // Create merged range with symbolic size
+        let merged_range = r0.with_sources(vec![merged_size_uop]);
 
         // Create substitutions: r0 = merged // s1, r1 = merged % s1 (Tinygrad simplify.py:29)
-        // Using idiv/mod_ helpers instead of raw UOp::new
-        let s1_const = UOp::index_const(s1);
-        let new_r0 = merged_range.idiv(&s1_const);
-        let new_r1 = merged_range.mod_(&s1_const);
+        // Using s1 as UOp for symbolic support
+        let new_r0 = merged_range.idiv(r1_end);
+        let new_r1 = merged_range.mod_(r1_end);
 
         // Create substitution map
         #[allow(clippy::mutable_key_type)]

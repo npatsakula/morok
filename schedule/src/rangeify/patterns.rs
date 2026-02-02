@@ -685,6 +685,20 @@ pub fn reduction_simplify_patterns() -> TypedPatternMatcher {
 
             Some(result)
         },
+
+        // Reduce distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
+        // Based on Tinygrad pm_reduce_collapse (simplify.py:104-105)
+        // This enables optimization when sum terms have different loop dependencies.
+        // NOTE: Pattern DSL cannot match nested struct in head, so we check src.op() in closure.
+        Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add => |src, ranges| {
+            // Check if src is an ADD operation
+            let Op::Binary(BinaryOp::Add, x, y) = src.op() else { return None };
+
+            let x_reduced = x.reduce(ranges.clone(), ReduceOp::Add);
+            let y_reduced = y.reduce(ranges.clone(), ReduceOp::Add);
+            x_reduced.try_add(&y_reduced).ok()
+        },
+
         Reduce { src, ranges } => || super::transforms::reduce_collapse(src, ranges),
     }
 }

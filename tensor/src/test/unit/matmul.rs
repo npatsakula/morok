@@ -601,7 +601,7 @@ fn test_matmul_identity_validated() {
 fn test_matmul_negative_values_validated() {
     // Test with negative values to ensure sign handling
     let a_data = [-1.0f32, 2.0, -3.0, 4.0, -5.0, 6.0];
-    let b_data = [1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0];
+    let b_data = [1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0]; // [3, 2] = 6 elements
 
     let a = Tensor::from_slice(a_data).try_reshape(&[2, 3]).unwrap();
     let b = Tensor::from_slice(b_data).try_reshape(&[3, 2]).unwrap().try_transpose(0, 1).unwrap();

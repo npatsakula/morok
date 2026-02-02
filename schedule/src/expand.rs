@@ -21,8 +21,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_dtype::DType;
-use morok_ir::AxisType;
 use morok_ir::prelude::*;
+use morok_ir::{AxisId, AxisType};
 
 use crate::TypedPatternMatcher;
 use smallvec::{SmallVec, smallvec};
@@ -667,4 +667,107 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Tinygrad expander.py:76: UOp(Ops.UNROLL, con.dtype, (ex.src[0].gep(...),), new_ex_args)
     Some(gep_result.unroll_with_dtype(remaining_axes, uop.dtype()))
+}
+
+// ============================================================================
+// GROUP_REDUCE Pattern (pm_group_for_reduce)
+// ============================================================================
+
+/// Transform REDUCE with GROUP_REDUCE ranges to shared memory pattern.
+///
+/// Based on Tinygrad's fix_group_for_reduce (expander.py:128-141):
+/// ```python
+/// def fix_group_for_reduce(x:UOp):
+///   reduce_gfr, reduce_r = partition(x.src[1:], lambda u: u.op is Ops.RANGE and u.arg[1] == AxisType.GROUP_REDUCE)
+///   if len(reduce_gfr) == 0: return None
+///
+///   upstream_locals = [u for u in x.toposort() if u.op is Ops.RANGE and u.arg[1] == AxisType.LOCAL]
+///
+///   ret = x.replace(src=(x.src[0],)+tuple(reduce_r))
+///   reduce_loop = [x.replace(arg=(x.arg[0]+100, AxisType.REDUCE)) for x in reduce_gfr]
+///   buf = ret.bufferize(*upstream_locals, *reduce_gfr, arg=BufferizeOpts(reduce_gfr[0].arg[0], AddrSpace.LOCAL))
+///            .index(*upstream_locals, *reduce_loop)
+///
+///   return buf.reduce(*reduce_loop, arg=x.arg)
+/// ```
+///
+/// # Transformation
+///
+/// GROUP_REDUCE enables two-stage reduction:
+/// 1. First reduce within each group (normal REDUCE with non-GROUP_REDUCE ranges)
+/// 2. Store to shared memory indexed by LOCAL + GROUP_REDUCE ranges
+/// 3. Load from shared memory indexed by LOCAL + new REDUCE ranges
+/// 4. Final reduce across the new REDUCE ranges
+///
+/// # Why Shared Memory?
+///
+/// Tensor core operations produce partial results that need cross-warp reduction.
+/// GROUP_REDUCE stages this through shared memory for efficient communication.
+fn fix_group_for_reduce(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Reduce { src, reduce_op, ranges } = reduce.op() else {
+        return None;
+    };
+
+    // Partition ranges into GROUP_REDUCE vs other
+    let (reduce_gfr, reduce_r): (Vec<_>, Vec<_>) =
+        ranges.iter().partition(|r| matches!(r.op(), Op::Range { axis_type: AxisType::GroupReduce, .. }));
+
+    if reduce_gfr.is_empty() {
+        return None;
+    }
+
+    // Find upstream LOCAL ranges in the computation graph
+    let upstream_locals: Vec<Arc<UOp>> = reduce
+        .toposort()
+        .into_iter()
+        .filter(|u| matches!(u.op(), Op::Range { axis_type: AxisType::Local, .. }))
+        .collect();
+
+    // Step 1: Create partial reduce with non-GROUP_REDUCE ranges
+    // Tinygrad: ret = x.replace(src=(x.src[0],)+tuple(reduce_r))
+    let partial_reduce = if reduce_r.is_empty() {
+        src.clone()
+    } else {
+        UOp::new(
+            Op::Reduce { src: src.clone(), ranges: reduce_r.into_iter().cloned().collect(), reduce_op: *reduce_op },
+            reduce.dtype(),
+        )
+    };
+
+    // Step 2: Create renumbered REDUCE ranges (axis_id + 100)
+    // Tinygrad: reduce_loop = [x.replace(arg=(x.arg[0]+100, AxisType.REDUCE)) for x in reduce_gfr]
+    let reduce_loops: Vec<Arc<UOp>> = reduce_gfr
+        .iter()
+        .filter_map(|r| {
+            let Op::Range { end, axis_id, .. } = r.op() else { return None };
+            Some(UOp::range_axis(end.clone(), AxisId::Renumbered(axis_id.value() + 100), AxisType::Reduce))
+        })
+        .collect();
+
+    // Step 3: Create BUFFERIZE → INDEX → REDUCE
+    // Buffer ranges: [LOCAL...] + [GROUP_REDUCE...]
+    let buf_ranges: Vec<Arc<UOp>> =
+        upstream_locals.iter().cloned().chain(reduce_gfr.iter().map(|r| (*r).clone())).collect();
+
+    let buf = UOp::bufferize_local(partial_reduce, buf_ranges);
+
+    // Index ranges: [LOCAL...] + [new REDUCE...]
+    let idx_ranges: Vec<Arc<UOp>> = upstream_locals.iter().cloned().chain(reduce_loops.iter().cloned()).collect();
+
+    let indexed = UOp::index().buffer(buf).indices(idx_ranges).call().ok()?;
+
+    // Step 4: Final reduction
+    Some(indexed.reduce(reduce_loops.into_iter().collect(), *reduce_op))
+}
+
+/// Pattern matcher for GROUP_REDUCE transformation.
+///
+/// Based on Tinygrad's pm_group_for_reduce (expander.py:153-156).
+///
+/// This should be applied AFTER pm_pre_expander but BEFORE the main expander.
+pub fn pm_group_for_reduce() -> TypedPatternMatcher {
+    crate::patterns! {
+        // Match REDUCE ops and transform GROUP_REDUCE ranges
+        reduce @ Reduce(_, ..) => |reduce| fix_group_for_reduce(reduce),
+    }
 }

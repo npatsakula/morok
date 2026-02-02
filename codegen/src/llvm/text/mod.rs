@@ -18,7 +18,7 @@ use morok_ir::pattern::TypedPatternMatcher;
 use morok_ir::rewrite::graph_rewrite_bottom_up;
 use morok_ir::{AxisType, Op, prelude::*};
 use morok_schedule::devectorize::pm_render;
-use morok_schedule::linearize::linearize_with_cfg;
+use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
 use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
 use crate::llvm::common::{RenderContext, ldt};
@@ -116,6 +116,11 @@ impl Renderer for LlvmTextRenderer {
         tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "codegen: after pm_bool_devectorize");
 
         let nodes = linearize_with_cfg(uop);
+
+        // Stage 22: Apply line rewrite cleanups to handle gated INDEX operations.
+        // Converts gated STOREs to IF/STORE/ENDIF sequences.
+        // Based on Tinygrad's pm_linearize_cleanups (codegen/__init__.py:107-113).
+        let nodes = line_rewrite_cleanups(nodes);
 
         for (i, node) in nodes.iter().enumerate() {
             tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "linearized node");

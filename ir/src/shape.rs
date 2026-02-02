@@ -334,12 +334,21 @@ fn extract_ranges_from_uops(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Optio
 /// let shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
 /// let shape_uop = shape_to_uop(&shape);
 /// assert_eq!(shape_uop.dtype(), DType::Index.vec(3));
+///
+/// // Scalar (empty shape) is supported
+/// let scalar_shape: smallvec::SmallVec<[SInt; 4]> = smallvec![];
+/// let scalar_uop = shape_to_uop(&scalar_shape);
+/// // VConst with empty values represents scalar
 /// ```
 pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
     use morok_dtype::DType;
     use smallvec::SmallVec;
 
-    assert!(!shape.is_empty(), "shape_to_uop does not support empty shapes (scalars); handle at callsite");
+    // Empty shape = scalar: use VConst with empty values
+    // extract_shape_from_uop will decode this back to empty Shape
+    if shape.is_empty() {
+        return UOp::vconst(vec![]);
+    }
 
     let elements: SmallVec<[Arc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
     UOp::vectorize(elements)

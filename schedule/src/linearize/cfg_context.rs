@@ -191,8 +191,10 @@ impl CFGContext {
                 let y_range = if let Op::End { ranges, .. } = y.op() { ranges.first().cloned() } else { None };
 
                 if let Some(range) = y_range {
-                    // Skip self-referential edges (can happen when parent and child END the same range)
-                    if range.id != x.id {
+                    // Skip edges that would create cycles (transitive check)
+                    // Check if x is in range's backward slice (i.e., range depends on x)
+                    let would_cycle = range.backward_slice().iter().any(|node| node.id == x.id);
+                    if !would_cycle {
                         ctx.edges.insert(UOpKey(range), x);
                     }
                 }

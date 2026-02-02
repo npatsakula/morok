@@ -153,8 +153,12 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
     });
 
     // Assign ideal positions
+    // Use reversed position so that nodes earlier in sorted order have larger ideal_pos.
+    // Since BinaryHeap is a max-heap, larger values are popped first,
+    // ensuring earlier nodes are processed first (consistent with sorted order).
     #[allow(clippy::mutable_key_type)]
-    let nkey: HashMap<UOpKey, usize> = sorted.iter().enumerate().map(|(i, u)| (UOpKey(u.clone()), i)).collect();
+    let nkey: HashMap<UOpKey, usize> =
+        sorted.iter().enumerate().map(|(i, u)| (UOpKey(u.clone()), sorted.len() - 1 - i)).collect();
 
     // Update priorities with ideal positions
     for (key, pos) in &nkey {
@@ -311,8 +315,12 @@ pub fn linearize_with_edges(sink: Arc<UOp>, edges: &HashMap<UOpKey, Arc<UOp>>) -
     });
 
     // Assign ideal positions
+    // Use reversed position so that nodes earlier in sorted order have larger ideal_pos.
+    // Since BinaryHeap is a max-heap, larger values are popped first,
+    // ensuring earlier nodes are processed first (consistent with sorted order).
     #[allow(clippy::mutable_key_type)]
-    let nkey: HashMap<UOpKey, usize> = sorted.iter().enumerate().map(|(i, u)| (UOpKey(u.clone()), i)).collect();
+    let nkey: HashMap<UOpKey, usize> =
+        sorted.iter().enumerate().map(|(i, u)| (UOpKey(u.clone()), sorted.len() - 1 - i)).collect();
 
     // Update priorities with ideal positions
     for (key, pos) in &nkey {

@@ -878,6 +878,16 @@ fn extract_shape_from_uop(uop: &Arc<UOp>) -> Vec<SInt> {
             ConstValue::Int(n) => vec![SInt::Const(n as usize)],
             _ => panic!("Expected int constant for shape"),
         },
+        // VConst with empty values = scalar (0-d tensor)
+        Op::VConst { values } if values.is_empty() => vec![],
+        Op::VConst { values } => values
+            .iter()
+            .map(|cv| match cv {
+                ConstValue::Int(n) => SInt::Const(*n as usize),
+                ConstValue::UInt(n) => SInt::Const(*n as usize),
+                _ => panic!("Expected int/uint constant in VConst shape"),
+            })
+            .collect(),
         _ => panic!("Expected vectorize or constant for shape, got {:?}", uop.op()),
     }
 }

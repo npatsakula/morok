@@ -1239,34 +1239,57 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
         },
 
         // 6. Push GEP through Binary: GEP(Binary(op, a, b), indices) → Binary(op, GEP(a), GEP(b))
-        Gep { vector, indices } if !indices.is_empty() && matches!(vector.op(), Op::Binary(..)) => |vector, indices| {
-            let Op::Binary(bin_op, a, b) = vector.op() else { return None };
-            let gep_a = a.gep(indices.clone());
-            let gep_b = b.gep(indices.clone());
-            Some(UOp::new(Op::Binary(*bin_op, gep_a.clone(), gep_b), gep_a.dtype()))
-        },
+        // Guard: skip pointer types to avoid creating invalid pointer ALU ops
+        Gep { vector, indices }
+            if !indices.is_empty()
+            && matches!(vector.op(), Op::Binary(..))
+            && !matches!(vector.dtype(), DType::Ptr { .. })
+            => |vector, indices| {
+                let Op::Binary(bin_op, a, b) = vector.op() else { return None };
+                let gep_a = a.gep(indices.clone());
+                let gep_b = b.gep(indices.clone());
+                // Guard: skip if result would be pointer type (edge case: vector of pointers)
+                if matches!(gep_a.dtype(), DType::Ptr { .. }) { return None; }
+                Some(UOp::new(Op::Binary(*bin_op, gep_a.clone(), gep_b), gep_a.dtype()))
+            },
 
         // 7. Push GEP through Unary: GEP(Unary(op, x), indices) → Unary(op, GEP(x))
-        Gep { vector, indices } if !indices.is_empty() && matches!(vector.op(), Op::Unary(..)) => |vector, indices| {
-            let Op::Unary(un_op, x) = vector.op() else { return None };
-            let gep_x = x.gep(indices.clone());
-            Some(UOp::new(Op::Unary(*un_op, gep_x.clone()), gep_x.dtype()))
-        },
+        // Guard: skip pointer types to avoid creating invalid pointer ALU ops
+        Gep { vector, indices }
+            if !indices.is_empty()
+            && matches!(vector.op(), Op::Unary(..))
+            && !matches!(vector.dtype(), DType::Ptr { .. })
+            => |vector, indices| {
+                let Op::Unary(un_op, x) = vector.op() else { return None };
+                let gep_x = x.gep(indices.clone());
+                // Guard: skip if result would be pointer type (edge case: vector of pointers)
+                if matches!(gep_x.dtype(), DType::Ptr { .. }) { return None; }
+                Some(UOp::new(Op::Unary(*un_op, gep_x.clone()), gep_x.dtype()))
+            },
 
         // 7b. Push GEP through Ternary: GEP(Ternary(op, a, b, c), indices) → Ternary(op, GEP(a), GEP(b), GEP(c))
         // Required for MulAcc (FMA) and WHERE to work with split_load (which creates CAT of 4-element loads)
-        Gep { vector: Where(cond, t, f), indices } if !indices.is_empty() => |cond, t, f, indices| {
-            let gep_cond = cond.gep(indices.clone());
-            let gep_t = t.gep(indices.clone());
-            let gep_f = f.gep(indices.clone());
-            Some(UOp::new(Op::Ternary(TernaryOp::Where, gep_cond.clone(), gep_t, gep_f), gep_cond.dtype()))
-        },
-        Gep { vector: MulAcc(a, b, c), indices } if !indices.is_empty() => |a, b, c, indices| {
-            let gep_a = a.gep(indices.clone());
-            let gep_b = b.gep(indices.clone());
-            let gep_c = c.gep(indices.clone());
-            Some(UOp::new(Op::Ternary(TernaryOp::MulAcc, gep_a.clone(), gep_b, gep_c), gep_a.dtype()))
-        },
+        // Guard: skip pointer types to avoid creating invalid pointer ALU ops
+        Gep { vector: Where(cond, t, f), indices }
+            if !indices.is_empty() && !matches!(cond.dtype(), DType::Ptr { .. })
+            => |cond, t, f, indices| {
+                let gep_cond = cond.gep(indices.clone());
+                let gep_t = t.gep(indices.clone());
+                let gep_f = f.gep(indices.clone());
+                // Guard: skip if result would be pointer type (edge case: vector of pointers)
+                if matches!(gep_cond.dtype(), DType::Ptr { .. }) { return None; }
+                Some(UOp::new(Op::Ternary(TernaryOp::Where, gep_cond.clone(), gep_t, gep_f), gep_cond.dtype()))
+            },
+        Gep { vector: MulAcc(a, b, c), indices }
+            if !indices.is_empty() && !matches!(a.dtype(), DType::Ptr { .. })
+            => |a, b, c, indices| {
+                let gep_a = a.gep(indices.clone());
+                let gep_b = b.gep(indices.clone());
+                let gep_c = c.gep(indices.clone());
+                // Guard: skip if result would be pointer type (edge case: vector of pointers)
+                if matches!(gep_a.dtype(), DType::Ptr { .. }) { return None; }
+                Some(UOp::new(Op::Ternary(TernaryOp::MulAcc, gep_a.clone(), gep_b, gep_c), gep_a.dtype()))
+            },
 
         // 8. GEP through UNROLL: GEP(UNROLL(x, ...), indices) → GEP(x, indices)
         Gep { vector, indices } if matches!(vector.op(), Op::Unroll { .. }) => |vector, indices| {
