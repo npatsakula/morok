@@ -8,7 +8,7 @@ use morok_ir::{BinaryOp, Op, UOp, UnaryOp};
 use crate::rangeify::patterns::{
     pm_comparison_negations, pm_div_to_shr, pm_fdiv_to_mul, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul,
 };
-use crate::rewrite::graph_rewrite_bottom_up;
+use crate::rewrite::graph_rewrite;
 
 // ============================================================================
 // MOD → AND PATTERNS
@@ -22,7 +22,7 @@ fn test_mod_power_of_two_becomes_and() {
     let x = UOp::range(UOp::index_const(100), 0);
     let modulo = x.mod_(&UOp::index_const(8));
 
-    let result = graph_rewrite_bottom_up(&matcher, modulo, &mut ());
+    let result = graph_rewrite(&matcher, modulo, &mut ());
 
     // Should be And(x, 7)
     if let Op::Binary(BinaryOp::And, lhs, rhs) = result.op() {
@@ -45,7 +45,7 @@ fn test_mod_non_power_of_two_unchanged() {
     let x = UOp::range(UOp::index_const(100), 0);
     let modulo = x.mod_(&UOp::index_const(7));
 
-    let result = graph_rewrite_bottom_up(&matcher, modulo.clone(), &mut ());
+    let result = graph_rewrite(&matcher, modulo.clone(), &mut ());
 
     // Should still be Mod
     assert!(matches!(result.op(), Op::Binary(BinaryOp::Mod, _, _)), "x % 7 should remain Mod");
@@ -59,7 +59,7 @@ fn test_mod_power_of_two_various_sizes() {
         let x = UOp::range(UOp::index_const(10000), 0);
         let modulo = x.mod_(&UOp::index_const(power));
 
-        let result = graph_rewrite_bottom_up(&matcher, modulo, &mut ());
+        let result = graph_rewrite(&matcher, modulo, &mut ());
 
         if let Op::Binary(BinaryOp::And, _, rhs) = result.op() {
             if let Op::Const(c) = rhs.op() {
@@ -83,7 +83,7 @@ fn test_mul_power_of_two_becomes_shl() {
     let x = UOp::range(UOp::index_const(100), 0);
     let mul = x.mul(&UOp::index_const(8));
 
-    let result = graph_rewrite_bottom_up(&matcher, mul, &mut ());
+    let result = graph_rewrite(&matcher, mul, &mut ());
 
     // Should be Shl(x, 3)
     if let Op::Binary(BinaryOp::Shl, lhs, rhs) = result.op() {
@@ -106,7 +106,7 @@ fn test_mul_non_power_of_two_unchanged() {
     let x = UOp::range(UOp::index_const(100), 0);
     let mul = x.mul(&UOp::index_const(7));
 
-    let result = graph_rewrite_bottom_up(&matcher, mul.clone(), &mut ());
+    let result = graph_rewrite(&matcher, mul.clone(), &mut ());
 
     // Should still be Mul
     assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)), "x * 7 should remain Mul");
@@ -120,7 +120,7 @@ fn test_mul_by_one_returns_identity() {
     let x = UOp::range(UOp::index_const(100), 0);
     let mul = x.mul(&UOp::index_const(1));
 
-    let result = graph_rewrite_bottom_up(&matcher, mul, &mut ());
+    let result = graph_rewrite(&matcher, mul, &mut ());
 
     assert!(std::sync::Arc::ptr_eq(&result, &x), "x * 1 should return x");
 }
@@ -137,7 +137,7 @@ fn test_mul_neg_one_becomes_neg() {
     let x = UOp::range(UOp::index_const(100), 0);
     let mul = x.mul(&UOp::index_const(-1));
 
-    let result = graph_rewrite_bottom_up(&matcher, mul, &mut ());
+    let result = graph_rewrite(&matcher, mul, &mut ());
 
     // Should be Neg(x)
     if let Op::Unary(UnaryOp::Neg, inner) = result.op() {
@@ -155,7 +155,7 @@ fn test_mul_pos_one_unchanged_by_neg_pattern() {
     let x = UOp::range(UOp::index_const(100), 0);
     let mul = x.mul(&UOp::index_const(1));
 
-    let result = graph_rewrite_bottom_up(&matcher, mul.clone(), &mut ());
+    let result = graph_rewrite(&matcher, mul.clone(), &mut ());
 
     // Should still be Mul
     assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)), "x * 1 should remain Mul");
@@ -174,7 +174,7 @@ fn test_div_power_of_two_becomes_shr() {
     let x = UOp::range(UOp::index_const(100), 0);
     let div = x.idiv(&UOp::index_const(8));
 
-    let result = graph_rewrite_bottom_up(&matcher, div, &mut ());
+    let result = graph_rewrite(&matcher, div, &mut ());
 
     // Should be Shr(x, 3)
     if let Op::Binary(BinaryOp::Shr, lhs, rhs) = result.op() {
@@ -197,7 +197,7 @@ fn test_div_non_power_of_two_unchanged() {
     let x = UOp::range(UOp::index_const(100), 0);
     let div = x.idiv(&UOp::index_const(7));
 
-    let result = graph_rewrite_bottom_up(&matcher, div.clone(), &mut ());
+    let result = graph_rewrite(&matcher, div.clone(), &mut ());
 
     // Should still be Idiv
     assert!(matches!(result.op(), Op::Binary(BinaryOp::Idiv, _, _)), "x // 7 should remain Idiv");
@@ -211,7 +211,7 @@ fn test_div_by_one_unchanged() {
     let x = UOp::range(UOp::index_const(100), 0);
     let div = x.idiv(&UOp::index_const(1));
 
-    let result = graph_rewrite_bottom_up(&matcher, div.clone(), &mut ());
+    let result = graph_rewrite(&matcher, div.clone(), &mut ());
 
     // Should still be Idiv (trivial case skipped)
     assert!(matches!(result.op(), Op::Binary(BinaryOp::Idiv, _, _)), "x // 1 should remain Idiv");
@@ -225,7 +225,7 @@ fn test_div_power_of_two_various_sizes() {
         let x = UOp::range(UOp::index_const(10000), 0);
         let div = x.idiv(&UOp::index_const(power));
 
-        let result = graph_rewrite_bottom_up(&matcher, div, &mut ());
+        let result = graph_rewrite(&matcher, div, &mut ());
 
         if let Op::Binary(BinaryOp::Shr, _, rhs) = result.op() {
             if let Op::Const(c) = rhs.op() {
@@ -249,7 +249,7 @@ fn test_fdiv_constant_becomes_mul_reciprocal() {
     let x = UOp::native_const(10.0f32);
     let div = x.try_div(&UOp::native_const(2.0f32)).unwrap();
 
-    let result = graph_rewrite_bottom_up(&matcher, div, &mut ());
+    let result = graph_rewrite(&matcher, div, &mut ());
 
     // Should be Mul(x, 0.5)
     if let Op::Binary(BinaryOp::Mul, _, rhs) = result.op() {
@@ -284,7 +284,7 @@ fn test_fdiv_various_constants() {
         let x = UOp::native_const(100.0f32);
         let div = x.try_div(&UOp::native_const(divisor)).unwrap();
 
-        let result = graph_rewrite_bottom_up(&matcher, div, &mut ());
+        let result = graph_rewrite(&matcher, div, &mut ());
 
         if let Op::Binary(BinaryOp::Mul, _, rhs) = result.op() {
             if let Op::Const(c) = rhs.op() {
@@ -315,7 +315,7 @@ fn test_not_lt_becomes_reversed_lt() {
     let lt = x.try_cmplt(&five).unwrap();
     let not_lt = lt.not();
 
-    let result = graph_rewrite_bottom_up(&matcher, not_lt, &mut ());
+    let result = graph_rewrite(&matcher, not_lt, &mut ());
 
     // Should be Lt(4, x)
     if let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() {
@@ -342,7 +342,7 @@ fn test_not_reversed_lt_becomes_lt() {
     let lt = five.try_cmplt(&x).unwrap();
     let not_lt = lt.not();
 
-    let result = graph_rewrite_bottom_up(&matcher, not_lt, &mut ());
+    let result = graph_rewrite(&matcher, not_lt, &mut ());
 
     // Should be Lt(x, 6)
     if let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() {
@@ -372,7 +372,7 @@ fn test_range_compression() {
     let lt_five = x.try_cmplt(&five).unwrap(); // x < 5
     let combined = gt_three.try_and_op(&lt_five).unwrap();
 
-    let result = graph_rewrite_bottom_up(&matcher, combined, &mut ());
+    let result = graph_rewrite(&matcher, combined, &mut ());
 
     // Should be Eq(x, 4)
     if let Op::Binary(BinaryOp::Eq, lhs, rhs) = result.op() {
@@ -402,7 +402,7 @@ fn test_negated_mul_comparison() {
     let neg_x = x.mul(&neg_one);
     let lt = neg_x.try_cmplt(&five).unwrap();
 
-    let result = graph_rewrite_bottom_up(&matcher, lt, &mut ());
+    let result = graph_rewrite(&matcher, lt, &mut ());
 
     // Should be Lt(-5, x)
     if let Op::Binary(BinaryOp::Lt, lhs, rhs) = result.op() {

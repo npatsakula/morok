@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::rangeify::patterns::dead_axis_removal;
-use crate::rewrite::graph_rewrite_top_down;
+use crate::rewrite::graph_rewrite_bottom_up;
 use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp};
 
@@ -14,7 +14,7 @@ fn test_bufferize_with_size_1_range() {
     let bufferized = UOp::bufferize_global(x.clone(), vec![dead_range]);
 
     let matcher = dead_axis_removal();
-    let result = graph_rewrite_top_down(&matcher, bufferized, &mut ());
+    let result = graph_rewrite_bottom_up(&matcher, bufferized, &mut ());
 
     // Should return compute directly since all axes are dead
     assert!(Arc::ptr_eq(&result, &x), "BUFFERIZE with only dead axis should return compute");
@@ -29,7 +29,7 @@ fn test_bufferize_all_dead_axes() {
     let bufferized = UOp::bufferize_global(x.clone(), dead_ranges);
 
     let matcher = dead_axis_removal();
-    let result = graph_rewrite_top_down(&matcher, bufferized, &mut ());
+    let result = graph_rewrite_bottom_up(&matcher, bufferized, &mut ());
 
     // All axes dead → return compute directly
     assert!(Arc::ptr_eq(&result, &x), "All dead axes should be removed, returning compute");
@@ -48,7 +48,7 @@ fn test_bufferize_mixed_live_dead_simple_compute() {
     let bufferized = UOp::bufferize_global(x.clone(), vec![range1, dead_range, range2]);
 
     let matcher = dead_axis_removal();
-    let result = graph_rewrite_top_down(&matcher, bufferized.clone(), &mut ());
+    let result = graph_rewrite_bottom_up(&matcher, bufferized.clone(), &mut ());
 
     // All ranges are dead (compute doesn't use them), so return compute directly
     assert!(Arc::ptr_eq(&result, &x), "When compute has no ranges, all BUFFERIZE ranges are dead → return compute");
@@ -64,7 +64,7 @@ fn test_bufferize_no_dead_axes_simple_compute() {
     let bufferized = UOp::bufferize_global(x.clone(), ranges);
 
     let matcher = dead_axis_removal();
-    let result = graph_rewrite_top_down(&matcher, bufferized.clone(), &mut ());
+    let result = graph_rewrite_bottom_up(&matcher, bufferized.clone(), &mut ());
 
     // All ranges are dead → return compute directly
     assert!(Arc::ptr_eq(&result, &x), "When compute has no ranges, all BUFFERIZE ranges are dead");
@@ -90,7 +90,7 @@ fn test_index_after_dead_axis_removal() {
     let indexed = UOp::index().buffer(bufferized).indices(vec![idx1.clone(), idx2]).call().unwrap();
 
     let matcher = dead_axis_removal();
-    let result = graph_rewrite_top_down(&matcher, indexed, &mut ());
+    let result = graph_rewrite_bottom_up(&matcher, indexed, &mut ());
 
     // After dead axis removal, the INDEX should have fewer indices
     if let Op::Index { indices, .. } = result.op() {
@@ -112,7 +112,7 @@ fn test_bufferize_dead_axis_with_constants() {
     let bufferized = UOp::bufferize_global(x.clone(), vec![dead_range_const]);
 
     let matcher = dead_axis_removal();
-    let result = graph_rewrite_top_down(&matcher, bufferized, &mut ());
+    let result = graph_rewrite_bottom_up(&matcher, bufferized, &mut ());
 
     // Should return compute directly
     assert!(Arc::ptr_eq(&result, &x), "Dead axis with constant 1 should be removed");
@@ -131,8 +131,8 @@ fn test_multiple_dead_axis_removal_passes() {
 
     let matcher = dead_axis_removal();
     // Run multiple times to ensure idempotence
-    let result1 = graph_rewrite_top_down(&matcher, bufferized.clone(), &mut ());
-    let result2 = graph_rewrite_top_down(&matcher, result1.clone(), &mut ());
+    let result1 = graph_rewrite_bottom_up(&matcher, bufferized.clone(), &mut ());
+    let result2 = graph_rewrite_bottom_up(&matcher, result1.clone(), &mut ());
 
     // Both should produce same result (idempotent)
     assert!(Arc::ptr_eq(&result1, &result2), "Dead axis removal should be idempotent");
@@ -152,7 +152,7 @@ fn test_dead_axis_uint_constant() {
     let bufferized = UOp::bufferize_global(x.clone(), vec![dead_range]);
 
     let matcher = dead_axis_removal();
-    let result = graph_rewrite_top_down(&matcher, bufferized, &mut ());
+    let result = graph_rewrite_bottom_up(&matcher, bufferized, &mut ());
 
     // Should return compute directly
     assert!(Arc::ptr_eq(&result, &x), "Dead axis with UInt(1) should be removed");

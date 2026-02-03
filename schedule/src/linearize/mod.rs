@@ -47,7 +47,7 @@ use std::sync::Arc;
 use morok_ir::UOp;
 use morok_ir::op::Op;
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::rewrite::graph_rewrite_bottom_up;
+use morok_ir::rewrite::graph_rewrite;
 use smallvec::{SmallVec, smallvec};
 
 pub use cfg_context::CFGContext;
@@ -148,7 +148,7 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
 pub fn linearize_with_cfg(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
     // Stage 19 (partial): Split multi-range ENDs into nested single-range ENDs.
     // Required for proper linearization ordering. (Tinygrad linearizer.py:93-100)
-    let sink = graph_rewrite_bottom_up(&pm_split_ends(), sink, &mut ());
+    let sink = graph_rewrite(&pm_split_ends(), sink, &mut ());
 
     // Stage 20-21: Build CFG context and linearize with edges
     // CFGContext computes control flow edges for sibling loops.

@@ -52,7 +52,7 @@ pub use uop::{IntoUOp, UOp, UOpKey};
 
 // Re-export pattern matching and rewriting infrastructure
 pub use pattern::{Matcher, RewriteResult, TypedPatternMatcher};
-pub use rewrite::{graph_rewrite_bottom_up, graph_rewrite_top_down};
+pub use rewrite::graph_rewrite;
 
 // Re-export external types for convenience
 pub use morok_dtype::DType;

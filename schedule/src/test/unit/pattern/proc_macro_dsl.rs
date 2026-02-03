@@ -1480,7 +1480,7 @@ fn test_context_declaration() {
 
 #[test]
 fn test_context_with_graph_rewrite() {
-    use crate::rewrite::graph_rewrite_top_down;
+    use crate::rewrite::graph_rewrite;
 
     // Test @context with the full graph_rewrite pipeline
     let matcher = patterns! {
@@ -1498,7 +1498,7 @@ fn test_context_with_graph_rewrite() {
     let add = binary(BinaryOp::Add, x.clone(), zero);
 
     let mut ctx = TestContext::default();
-    let result = graph_rewrite_top_down(&matcher, add, &mut ctx);
+    let result = graph_rewrite(&matcher, add, &mut ctx);
 
     // Should have rewritten Add(5, 0) to 5
     assert!(Arc::ptr_eq(&result, &x));
@@ -1580,7 +1580,7 @@ fn test_commutative_pattern_with_special_zero() {
 
 #[test]
 fn test_commutative_pattern_with_graph_rewrite() {
-    use crate::rewrite::graph_rewrite_top_down;
+    use crate::rewrite::graph_rewrite;
 
     // Test Add[x, @zero] with graph_rewrite - like the failing property test
     let matcher = patterns! {
@@ -1592,14 +1592,14 @@ fn test_commutative_pattern_with_graph_rewrite() {
 
     // Add(0, x) via graph_rewrite
     let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
-    let result = graph_rewrite_top_down(&matcher, add_zero_x, &mut ());
+    let result = graph_rewrite(&matcher, add_zero_x, &mut ());
 
     assert!(Arc::ptr_eq(&result, &x), "graph_rewrite(Add(0, x)) should simplify to x");
 }
 
 #[test]
 fn test_symbolic_simple_add_zero() {
-    use crate::rewrite::graph_rewrite_top_down;
+    use crate::rewrite::graph_rewrite;
     use crate::symbolic::patterns::{constant_folding_dsl_patterns, identity_and_zero_patterns};
 
     // Test combining two matchers
@@ -1610,7 +1610,7 @@ fn test_symbolic_simple_add_zero() {
 
     // Add(0, x) via graph_rewrite with combined patterns
     let add_zero_x = binary(BinaryOp::Add, zero.clone(), x.clone());
-    let result = graph_rewrite_top_down(&matcher, add_zero_x, &mut ());
+    let result = graph_rewrite(&matcher, add_zero_x, &mut ());
 
     assert!(Arc::ptr_eq(&result, &x), "combined patterns + graph_rewrite(Add(0, x)) should simplify to x");
 }

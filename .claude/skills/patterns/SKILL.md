@@ -242,6 +242,21 @@ Reduce, AllReduce, Wmma, Kernel, Sink, Vectorize, GEP
 
 ## Rewrite Engine API
 
+### 3-Stage Algorithm (Tinygrad-aligned)
+
+The rewrite engine uses a 3-stage algorithm matching Tinygrad's `unified_rewrite`:
+
+| Stage | Name | What Happens | Patterns See |
+|-------|------|--------------|--------------|
+| 0 | PushChildren | Apply `bpm` patterns (if any), push children | ORIGINAL children |
+| 1 | ApplyPatterns | Reconstruct with optimized children, apply `pm` patterns | OPTIMIZED children |
+| 2 | Link | Link original node to final result | N/A |
+
+**Key insight**: The semantic difference between `graph_rewrite()` and `graph_rewrite_bottom_up()` is WHEN patterns are applied:
+
+- `graph_rewrite()`: Patterns applied in **Stage 1** (after children processed) → see OPTIMIZED children
+- `graph_rewrite_bottom_up()`: Patterns applied in **Stage 0** (before children processed) → see ORIGINAL children
+
 ### Creating Pattern Matchers
 
 ```rust
@@ -265,9 +280,9 @@ let combined = identity_patterns() + constant_folding_patterns();
 
 ### Graph Rewrite Functions
 
-#### `graph_rewrite()`
+#### `graph_rewrite()` - Default (patterns see OPTIMIZED children)
 
-Default top-down rewrite:
+Patterns are applied in Stage 1, after children have been processed. Use this when patterns need to see the already-optimized children.
 
 ```rust
 use morok_schedule::rewrite::graph_rewrite;
@@ -279,16 +294,35 @@ let mut ctx = MyContext::new();
 let result = graph_rewrite(&matcher, root, &mut ctx);
 ```
 
-#### `graph_rewrite_bottom_up()`
+**Example**: For `Add(Add(UNROLL_a, UNROLL_b), UNROLL_c)`, the `do_expand` pattern sees:
+1. Inner `Add` already transformed to `UNROLL_ab`
+2. Outer `Add` sees `Add(UNROLL_ab, UNROLL_c)` → correctly expands all 3 axes
 
-Always processes children before parents:
+#### `graph_rewrite_bottom_up()` - Patterns see ORIGINAL children
+
+Patterns are applied in Stage 0, before children are processed. Use this when patterns need to see the original graph structure.
 
 ```rust
 use morok_schedule::rewrite::graph_rewrite_bottom_up;
 
 let result = graph_rewrite_bottom_up(&matcher, root, &mut ctx);
+```
 
-// Use when patterns need to transform deep nodes first
+**Use cases**:
+- Patterns that match nested structures like `Index { buffer: Bufferize { ... } ... }`
+- Patterns that need to see the original child structure before optimization
+- Dead axis removal, buffer removal heuristics
+
+#### `graph_rewrite_with_bpm()` - Both stages
+
+Use both `pm` (Stage 1) and `bpm` (Stage 0) patterns:
+
+```rust
+use morok_schedule::rewrite::graph_rewrite_with_bpm;
+
+// bpm patterns see ORIGINAL children (Stage 0)
+// pm patterns see OPTIMIZED children (Stage 1)
+let result = graph_rewrite_with_bpm(&pm, &bpm, root, &mut ctx);
 ```
 
 #### `graph_rewrite_with_map()`
@@ -302,6 +336,16 @@ let output = graph_rewrite_with_map(&matcher, root, &mut ctx);
 // output.root - the rewritten root
 // output.becomes_map - HashMap<UOpKey, Arc<UOp>> of transformations
 ```
+
+### Choosing the Right Rewrite Function
+
+| Scenario | Function | Reason |
+|----------|----------|--------|
+| Algebraic simplification | `graph_rewrite()` | Patterns like `x + 0 → x` work on any children |
+| Expansion (UNROLL propagation) | `graph_rewrite()` | Need to see already-expanded children |
+| Nested structure matching | `graph_rewrite_bottom_up()` | Need original `Index { buffer: Bufferize { ... } }` |
+| Dead axis removal | `graph_rewrite_bottom_up()` | Need original BUFFERIZE ranges |
+| Buffer removal heuristics | `graph_rewrite_bottom_up()` | Need to count original buffers |
 
 ### Running Optimization Passes
 
@@ -356,6 +400,18 @@ let result = graph_rewrite(&full_pipeline, graph, &mut ctx);
 4. **Division distribution** - `(a+b)//c → a//c + b//c` only when values in same bucket.
 5. **GEP pattern ordering** - BROADCAST GEP must come BEFORE general VECTORIZE GEP.
 
+### Tinygrad Semantic Alignment
+
+The rewrite engine semantics match Tinygrad's `unified_rewrite` (ops.py:1177-1234):
+
+| Tinygrad | Morok | Patterns See |
+|----------|-------|--------------|
+| `graph_rewrite(pm, bottom_up=False)` | `graph_rewrite(pm)` | OPTIMIZED children |
+| `graph_rewrite(pm, bottom_up=True)` | `graph_rewrite_bottom_up(bpm)` | ORIGINAL children |
+| `RewriteContext(pm, bpm, ctx)` | `graph_rewrite_with_bpm(pm, bpm)` | Both stages |
+
+**Migration note**: If patterns stop matching after this change, check if they need to see ORIGINAL children (use `graph_rewrite_bottom_up`) or OPTIMIZED children (use `graph_rewrite`).
+
 ### Common Pitfalls
 
 1. **`~>` vs `=>`**: `~>` is infallible (returns `Arc<UOp>`), `=>` is fallible (returns `Option`)
@@ -363,6 +419,7 @@ let result = graph_rewrite(&full_pipeline, graph, &mut ctx);
 3. **Commutative**: `Add[x, y]` tries both orderings - use `Add(x, y)` when ordering matters
 4. **Duplicate detection**: `Add(x, x)` auto-generates `Arc::ptr_eq` - only identical variable names
 5. **Guard placement**: Guard goes AFTER pattern, BEFORE arrow: `Pattern if cond ~> rewrite`
+6. **Rewrite function semantics**: `graph_rewrite()` patterns see OPTIMIZED children; use `graph_rewrite_bottom_up()` for patterns that need ORIGINAL structure (e.g., nested `Index { buffer: Bufferize { ... } }`)
 
 ### Debugging
 

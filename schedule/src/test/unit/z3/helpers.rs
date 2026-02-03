@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use morok_ir::UOp;
 
-use crate::rewrite::graph_rewrite_top_down;
+use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
 use crate::z3::verify::verify_equivalence;
 
@@ -16,7 +16,7 @@ use crate::z3::verify::verify_equivalence;
 /// 3. Returns the simplified expression for further assertions
 pub fn verify_simplifies_to(expr: Arc<UOp>, expected: Arc<UOp>) -> Arc<UOp> {
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Verify semantic equivalence
     verify_equivalence(&expr, &simplified).expect("Simplification should preserve semantics");
@@ -33,7 +33,7 @@ pub fn verify_simplifies_to(expr: Arc<UOp>, expected: Arc<UOp>) -> Arc<UOp> {
 /// Verify that simplification preserves semantics (even if structure changes).
 pub fn verify_preserves_semantics(expr: Arc<UOp>) -> Arc<UOp> {
     let matcher = symbolic_simple();
-    let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
+    let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     verify_equivalence(&expr, &simplified).expect("Simplification should preserve semantics");
 

@@ -2,15 +2,24 @@
 //!
 //! Implements the core graph rewriting algorithm with fixed-point iteration.
 //!
-//! # Algorithm
+//! # Algorithm (Tinygrad-aligned)
 //!
-//! The algorithm operates in 2 stages:
-//! - Stage 0 (Rewrite): Fixed-point pattern matching on the current node
-//! - Stage 1 (Finalize): Reconstruct with children's results + link result
+//! The algorithm operates in 3 stages, matching Tinygrad's `unified_rewrite`:
 //!
-//! By default, patterns see the **original** children (top-down style). If a
-//! pattern needs optimized children first (bottom-up style), it should return
-//! `RewriteResult::Gate` to trigger child processing before finalization.
+//! - **Stage 0 (PushChildren)**: Apply `bpm` patterns (if present), then push children
+//!   - `bpm` patterns see **ORIGINAL** children
+//!   - Used for bottom-up patterns that need to transform before descent
+//!
+//! - **Stage 1 (ApplyPatterns)**: Reconstruct with optimized children, then apply `pm` patterns
+//!   - `pm` patterns see **OPTIMIZED** children
+//!   - This is the default mode - patterns run after children are processed
+//!
+//! - **Stage 2 (Link)**: Link original node to final result
+//!
+//! # API
+//!
+//! - `graph_rewrite(pm, root, ctx)` - Default: patterns see optimized children (Stage 1)
+//! - `graph_rewrite_bottom_up(bpm, root, ctx)` - Patterns see original children (Stage 0)
 //!
 //! # Pattern Context
 //!
@@ -32,8 +41,8 @@
 //!     Mul(x, @one) ~> |x| x.clone(),
 //! };
 //!
-//! // Pass context at rewrite time
-//! let result = graph_rewrite_top_down(&matcher, root, &mut ctx);
+//! // Pass context at rewrite time - patterns see OPTIMIZED children
+//! let result = graph_rewrite(&matcher, root, &mut ctx);
 //! ```
 //!
 //! Patterns that don't need context use `()` as the context type:
@@ -42,10 +51,8 @@
 //! let matcher = patterns! {
 //!     Add(x, @zero) ~> |x| x.clone(),
 //! };
-//! let result = graph_rewrite_top_down(&matcher, root, &mut ());
+//! let result = graph_rewrite(&matcher, root, &mut ());
 //! ```
-
-use bon::Builder;
 
 use crate::{UOp, UOpKey};
 use std::collections::{HashMap, HashSet};
@@ -53,16 +60,20 @@ use std::sync::Arc;
 
 use crate::pattern::{Matcher, RewriteResult};
 
-/// Stage in the 2-stage rewrite algorithm.
+/// Stage in the 3-stage rewrite algorithm (Tinygrad-aligned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
-    /// Stage 0: Bottom-up fixed-point pattern matching
-    Rewrite,
-    /// Stage 1: Reconstruct with optimized children, then link result
-    Finalize,
+    /// Stage 0: Apply bpm patterns (if present), then push children for processing.
+    /// bpm patterns see ORIGINAL children.
+    PushChildren,
+    /// Stage 1: After children processed, reconstruct and apply pm patterns.
+    /// pm patterns see OPTIMIZED children.
+    ApplyPatterns,
+    /// Stage 2: Link original node to final result.
+    Link,
 }
 
-/// Stack entry for the 2-stage rewrite algorithm.
+/// Stack entry for the 3-stage rewrite algorithm.
 ///
 /// The separation of `original` and `working` is crucial for result linking:
 /// - `original`: The node that consumers reference (used as key in results cache)
@@ -75,29 +86,34 @@ struct StackEntry {
     stage: Stage,
     /// The node we're actively working with (may differ after rewrites)
     working: Arc<UOp>,
-    /// Retry count for Finalize stage (to detect infinite loops)
+    /// Retry count for ApplyPatterns stage (to detect infinite loops)
     retry_count: u32,
 }
 
 impl StackEntry {
-    /// Create entry for a fresh node starting at Rewrite stage.
+    /// Create entry for a fresh node starting at PushChildren stage.
     fn new(node: Arc<UOp>) -> Self {
-        Self { original: node.clone(), stage: Stage::Rewrite, working: node, retry_count: 0 }
+        Self { original: node.clone(), stage: Stage::PushChildren, working: node, retry_count: 0 }
     }
 
-    /// Create entry for Finalize stage with potentially different working node.
-    fn finalize(original: Arc<UOp>, working: Arc<UOp>) -> Self {
-        Self { original, stage: Stage::Finalize, working, retry_count: 0 }
+    /// Create entry for PushChildren stage where original == working.
+    fn push_children(node: Arc<UOp>) -> Self {
+        Self { original: node.clone(), stage: Stage::PushChildren, working: node, retry_count: 0 }
     }
 
-    /// Create entry for Finalize stage with retry count (for re-pushed entries).
-    fn finalize_retry(original: Arc<UOp>, working: Arc<UOp>, retry_count: u32) -> Self {
-        Self { original, stage: Stage::Finalize, working, retry_count }
+    /// Create entry for ApplyPatterns stage with potentially different working node.
+    fn apply_patterns(original: Arc<UOp>, working: Arc<UOp>) -> Self {
+        Self { original, stage: Stage::ApplyPatterns, working, retry_count: 0 }
     }
 
-    /// Create entry for Rewrite stage where original == working.
-    fn rewrite(node: Arc<UOp>) -> Self {
-        Self { original: node.clone(), stage: Stage::Rewrite, working: node, retry_count: 0 }
+    /// Create entry for ApplyPatterns stage with retry count (for re-pushed entries).
+    fn apply_patterns_retry(original: Arc<UOp>, working: Arc<UOp>, retry_count: u32) -> Self {
+        Self { original, stage: Stage::ApplyPatterns, working, retry_count }
+    }
+
+    /// Create entry for Link stage.
+    fn link(original: Arc<UOp>, working: Arc<UOp>) -> Self {
+        Self { original, stage: Stage::Link, working, retry_count: 0 }
     }
 }
 
@@ -170,119 +186,112 @@ impl ResultMap {
     }
 }
 
-/// Internal rewrite engine that implements the 2-stage stack-based algorithm.
+/// Internal rewrite engine that implements the 3-stage stack-based algorithm.
 ///
-/// Generic over matcher type `M` and context type `C` for compile-time type-safe matching.
-#[derive(Builder)]
+/// Generic over matcher types and context type for compile-time type-safe matching.
+/// Supports separate `pm` (top-down) and `bpm` (bottom-up) matchers, matching Tinygrad's
+/// `RewriteContext(pm, bpm, ctx)` structure.
 #[allow(clippy::mutable_key_type)]
-struct RewriteEngine<'a, M, C>
+struct RewriteEngine<'a, PM, BPM, C>
 where
-    M: Matcher<C>,
+    PM: Matcher<C>,
+    BPM: Matcher<C>,
 {
-    /// Pattern matcher for applying rewrite rules
-    matcher: &'a M,
+    /// Top-down pattern matcher: applied in Stage 1 (ApplyPatterns)
+    /// Patterns see OPTIMIZED children
+    pm: Option<&'a PM>,
+
+    /// Bottom-up pattern matcher: applied in Stage 0 (PushChildren)
+    /// Patterns see ORIGINAL children
+    bpm: Option<&'a BPM>,
 
     /// Mutable reference to context passed through to patterns
     ctx: &'a mut C,
 
     /// Final results cache: maps original node → optimized result
     /// Uses path compression for O(α(n)) amortized lookups
-    #[builder(default = ResultMap::default())]
     results: ResultMap,
 
     /// Nodes pending processing (prevents duplicate pushes in DAGs).
     /// A node is in this set if it's currently on the stack or being processed.
-    #[builder(default = HashSet::default())]
     pending: HashSet<UOpKey>,
-
-    /// Whether to always process children (bottom-up traversal).
-    /// When true, all nodes have their children processed first.
-    /// When false (default), only patterns returning Gate trigger child processing.
-    #[builder(default = true)]
-    bottom_up: bool,
 }
 
-impl<'a, M, C> RewriteEngine<'a, M, C>
+impl<'a, PM, BPM, C> RewriteEngine<'a, PM, BPM, C>
 where
-    M: Matcher<C>,
+    PM: Matcher<C>,
+    BPM: Matcher<C>,
 {
-    /// Stage 0: Bottom-up fixed-point pattern matching.
-    ///
-    /// Applies patterns to the node until no more rewrites are possible.
-    /// Children are only pushed for processing when a Gate is returned,
-    /// matching Tinygrad's behavior where patterns control child processing.
-    fn handle_rewrite(&mut self, stack: &mut Vec<StackEntry>, original: Arc<UOp>, working: Arc<UOp>) {
-        // Fixed-point pattern matching with iteration limit (panic if exceeded)
-        const MAX_ITERATIONS: usize = 1000;
-        let mut node = working;
-        let mut needs_children = false;
+    fn new(pm: Option<&'a PM>, bpm: Option<&'a BPM>, ctx: &'a mut C) -> Self {
+        Self { pm, bpm, ctx, results: ResultMap::default(), pending: HashSet::default() }
+    }
+}
 
-        for i in 0..MAX_ITERATIONS {
-            match self.matcher.rewrite(&node, self.ctx) {
-                RewriteResult::Rewritten(new_node) => {
-                    node = new_node;
+impl<'a, PM, BPM, C> RewriteEngine<'a, PM, BPM, C>
+where
+    PM: Matcher<C>,
+    BPM: Matcher<C>,
+{
+    /// Stage 0 (PushChildren): Apply bpm patterns (if present), then push children.
+    ///
+    /// This matches Tinygrad's unified_rewrite Stage 0:
+    /// - If bpm is present, apply patterns in fixed-point (sees ORIGINAL children)
+    /// - Push children for processing
+    /// - Schedule Stage 1 (ApplyPatterns) for after children are done
+    fn handle_push_children(&mut self, stack: &mut Vec<StackEntry>, original: Arc<UOp>, working: Arc<UOp>) {
+        let mut node = working;
+
+        // Apply bpm patterns if present (sees ORIGINAL children)
+        // Tinygrad: "if bottom up, we rewrite this node early"
+        if let Some(bpm) = &self.bpm {
+            const MAX_ITERATIONS: usize = 1000;
+            for i in 0..MAX_ITERATIONS {
+                match bpm.rewrite(&node, self.ctx) {
+                    RewriteResult::Rewritten(new_node) => {
+                        node = new_node;
+                    }
+                    RewriteResult::Gate(_) => {
+                        // Gate in bpm means "stop descent, result is ready"
+                        // Tinygrad: "if the bpm matching raised a gate, we are done with this node"
+                        self.link_result(original, node);
+                        return;
+                    }
+                    RewriteResult::NoMatch => {
+                        break;
+                    }
                 }
-                RewriteResult::Gate(_) => {
-                    needs_children = true;
-                    break;
+                if i == MAX_ITERATIONS - 1 {
+                    panic!(
+                        "BPM rewrite iteration limit ({}) exceeded: patterns may be creating an infinite loop. Node: {:?}",
+                        MAX_ITERATIONS,
+                        node.op()
+                    );
                 }
-                RewriteResult::NoMatch => {
-                    break;
-                }
-            }
-            if i == MAX_ITERATIONS - 1 {
-                panic!(
-                    "Rewrite iteration limit ({}) exceeded: patterns may be creating an infinite loop. Node: {:?}",
-                    MAX_ITERATIONS,
-                    node.op()
-                );
             }
         }
 
-        // Schedule: Finalize (after children are done if needed)
-        stack.push(StackEntry::finalize(original, node.clone()));
+        // Schedule Stage 1 (ApplyPatterns) for after children are processed
+        stack.push(StackEntry::apply_patterns(original, node.clone()));
 
-        // Push children for processing when:
-        // 1. Gate was explicitly returned by a pattern, OR
-        // 2. Bottom-up traversal is enabled (always process children)
-        //
-        // The `bottom_up` flag is set on the engine, not on individual patterns.
-        // When false (default), only patterns returning Gate trigger child processing.
-        // When true, all nodes have their children processed first.
-        //
-        // Use bottom_up=true for patterns like to_define_global that need to transform
-        // deep nodes (e.g., BUFFER inside INDEX inside ADD inside STORE).
-        // Use bottom_up=false for patterns like buffer_removal that need parent context.
-        if needs_children || self.bottom_up {
-            // Push children for processing in REVERSE order
-            // Stack is LIFO, so reverse order means they're processed in original order
-            let sources = node.op().sources();
-            for child in sources.iter().rev() {
-                let child_key = UOpKey(child.clone());
-                if !self.pending.contains(&child_key) && !self.results.contains(child) {
-                    self.pending.insert(child_key);
-                    stack.push(StackEntry::rewrite(child.clone()));
-                }
+        // Push children for processing (always, matching Tinygrad's unified_rewrite)
+        let sources = node.op().sources();
+        for child in sources.iter().rev() {
+            let child_key = UOpKey(child.clone());
+            if !self.pending.contains(&child_key) && !self.results.contains(child) {
+                self.pending.insert(child_key);
+                stack.push(StackEntry::push_children(child.clone()));
             }
         }
     }
 
-    /// Stage 1: Reconstruct with optimized children and link result.
+    /// Stage 1 (ApplyPatterns): Reconstruct with optimized children, then apply pm patterns.
     ///
-    /// Collects optimized children from results cache, reconstructs the node
-    /// if any children changed, and caches the final result.
-    ///
-    /// If reconstruction creates a new node, we push it back to Rewrite stage
-    /// to ensure any new patterns are applied and new children are processed.
-    ///
-    /// **Shared Children Handling:**
-    /// When multiple nodes share a child (e.g., REDUCE and INDEX both reference
-    /// the same RANGE), there's a risk that a parent's Finalize runs before the
-    /// shared child has been fully processed. We detect this by checking if any
-    /// source is still pending (in `pending` set but not in `results`). If so,
-    /// we push the pending source's Finalize first (if not already on stack),
-    /// then re-push this Finalize to try again after the source completes.
-    fn handle_finalize(
+    /// This matches Tinygrad's unified_rewrite Stage 1:
+    /// - Wait for all children to be processed
+    /// - Reconstruct node if any children changed
+    /// - Apply pm patterns (sees OPTIMIZED children)
+    /// - If patterns produce new node, process it through Stage 0
+    fn handle_apply_patterns(
         &mut self,
         stack: &mut Vec<StackEntry>,
         original: Arc<UOp>,
@@ -291,55 +300,55 @@ where
     ) {
         let sources = working.op().sources();
 
-        // For leaf nodes, just link and return
+        // For leaf nodes, apply pm patterns directly
         if sources.is_empty() {
-            self.link_result(original, working);
+            let final_node = self.apply_pm_patterns(&working);
+            if Arc::ptr_eq(&final_node, &working) {
+                // No change - link directly
+                self.link_result(original, working);
+            } else {
+                // Pattern produced new node - process it
+                let key = UOpKey(final_node.clone());
+                if !self.results.contains(&final_node) && !self.pending.contains(&key) {
+                    stack.push(StackEntry::link(original, final_node.clone()));
+                    self.pending.insert(key);
+                    stack.push(StackEntry::push_children(final_node));
+                } else {
+                    // Already processed - link to its result
+                    let result = self.results.get(&final_node);
+                    self.link_result(original, result);
+                }
+            }
             return;
         }
 
-        // Check if all sources have been fully processed.
-        // A source is ready if it has a result in the cache.
-        //
-        // If any source has no result yet, we must defer this Finalize until
-        // after that source completes. To avoid priority inversion (where this
-        // node's re-push keeps blocking the source), we push re-try BEFORE the
-        // current stack top, not on top.
+        // Check if all sources have been fully processed
         let mut needs_defer = false;
         for src in &sources {
-            // Skip if this source IS the original node we're transforming.
-            // This happens when a pattern creates a wrapper (e.g., INDEX → LOAD(buffer, INDEX)).
-            // The wrapper contains the original as a child, but we shouldn't wait for
-            // the original's result because WE ARE producing that result right now.
-            // This matches Tinygrad's `on_stack` skip behavior in unified_rewrite.
+            // Skip self-references (pattern created wrapper containing original)
             if Arc::ptr_eq(src, &original) {
                 continue;
             }
 
             if !self.results.contains(src) {
-                // Source has no result yet - check if it was supposed to be processed
                 let src_key = UOpKey(src.clone());
                 if self.pending.contains(&src_key) {
-                    // Source was pushed but hasn't completed - we need to wait
                     needs_defer = true;
                     break;
                 }
-                // Source was never pushed (not in pending) - it won't change,
-                // so we can use it as-is
             }
         }
 
         if needs_defer {
             const MAX_RETRIES: u32 = 10_000;
             if retry_count >= MAX_RETRIES {
-                panic!("Finalize stuck waiting for sources after {} retries: {:?}", MAX_RETRIES, working.tree());
+                panic!("ApplyPatterns stuck waiting for sources after {} retries: {:?}", MAX_RETRIES, working.tree());
             }
-            // Re-push this Finalize, but at a LOWER priority by inserting at the
-            // FRONT of the stack (so it runs AFTER everything currently on the stack)
-            stack.insert(0, StackEntry::finalize_retry(original, working, retry_count + 1));
+            stack.insert(0, StackEntry::apply_patterns_retry(original, working, retry_count + 1));
             return;
         }
 
-        // All sources ready - collect optimized children
+        // Collect optimized children
         let mut new_sources = Vec::with_capacity(sources.len());
         let mut any_changed = false;
 
@@ -351,39 +360,83 @@ where
             new_sources.push(optimized);
         }
 
-        if !any_changed {
-            // No children changed - link working to its final result (following chain)
-            let final_result = self.results.get(&working);
-            self.link_result(original, final_result);
+        // Reconstruct if children changed
+        let node = if any_changed { working.with_sources(new_sources) } else { working };
+
+        // Apply pm patterns (sees OPTIMIZED children!)
+        // This is the key semantic difference from the old implementation
+        let final_node = self.apply_pm_patterns(&node);
+
+        // If pattern produced new node, process it through Stage 0
+        if !Arc::ptr_eq(&final_node, &node) {
+            let key = UOpKey(final_node.clone());
+            if !self.results.contains(&final_node) && !self.pending.contains(&key) {
+                // Schedule: Link after processing the new node
+                stack.push(StackEntry::link(original, final_node.clone()));
+                self.pending.insert(key);
+                stack.push(StackEntry::push_children(final_node));
+                return;
+            }
+            // New node already processed - link to its result
+            let result = self.results.get(&final_node);
+            self.link_result(original, result);
             return;
         }
 
-        // Reconstruct with optimized children
-        let reconstructed = working.with_sources(new_sources);
-
-        // Reconstructed node may need its own rewrite pass if it hasn't been seen.
-        //
-        // Stack operations (LIFO execution order):
-        //   1. Push: (original, Finalize, reconstructed) - runs SECOND
-        //   2. Push: (reconstructed, Rewrite, reconstructed) - runs FIRST
-        //
-        // Execution order:
-        //   - First: Rewrite reconstructed node (may trigger more rewrites)
-        //   - Second: Link original → reconstructed's final result
-        let recon_key = UOpKey(reconstructed.clone());
-        if !self.results.contains(&reconstructed) && !self.pending.contains(&recon_key) {
-            // Step 1: Link original to reconstructed's result (runs second due to LIFO)
-            stack.push(StackEntry::finalize(original, reconstructed.clone()));
-
-            // Step 2: Process reconstructed node first (runs first due to LIFO)
-            self.pending.insert(recon_key);
-            stack.push(StackEntry::rewrite(reconstructed));
+        // If reconstruction created new node, check if already processed
+        if any_changed {
+            let recon_key = UOpKey(node.clone());
+            if !self.results.contains(&node) && !self.pending.contains(&recon_key) {
+                // Reconstructed node not seen - process it
+                stack.push(StackEntry::link(original, node.clone()));
+                self.pending.insert(recon_key);
+                stack.push(StackEntry::push_children(node));
+                return;
+            }
+            // Already processed - link to its result
+            let result = self.results.get(&node);
+            self.link_result(original, result);
             return;
         }
 
-        // Reconstructed node already processed - link to its result
-        let final_result = self.results.get(&reconstructed);
-        self.link_result(original, final_result);
+        // No changes - link original to working
+        self.link_result(original, node);
+    }
+
+    /// Stage 2 (Link): Link original node to the result of working node.
+    fn handle_link(&mut self, original: Arc<UOp>, working: Arc<UOp>) {
+        let result = self.results.get(&working);
+        self.link_result(original, result);
+    }
+
+    /// Apply pm patterns in fixed-point loop.
+    fn apply_pm_patterns(&mut self, node: &Arc<UOp>) -> Arc<UOp> {
+        let Some(pm) = &self.pm else {
+            return node.clone();
+        };
+
+        const MAX_ITERATIONS: usize = 1000;
+        let mut current = node.clone();
+
+        for i in 0..MAX_ITERATIONS {
+            match pm.rewrite(&current, self.ctx) {
+                RewriteResult::Rewritten(new_node) => {
+                    current = new_node;
+                }
+                RewriteResult::Gate(_) | RewriteResult::NoMatch => {
+                    break;
+                }
+            }
+            if i == MAX_ITERATIONS - 1 {
+                panic!(
+                    "PM rewrite iteration limit ({}) exceeded: patterns may be creating an infinite loop. Node: {:?}",
+                    MAX_ITERATIONS,
+                    current.op()
+                );
+            }
+        }
+
+        current
     }
 
     /// Link original node to its final result in the cache.
@@ -402,12 +455,13 @@ where
         self.results.link(original, result);
     }
 
-    /// Main rewrite method: Stack-based 2-stage traversal.
+    /// Main rewrite method: Stack-based 3-stage traversal.
     ///
     /// Traverses the graph in a stack-based manner, processing each node
-    /// through 2 stages:
-    /// 1. Stage 0 (Rewrite): Bottom-up pattern matching with fixed-point iteration
-    /// 2. Stage 1 (Finalize): Source reconstruction + link final replacement
+    /// through 3 stages (matching Tinygrad's unified_rewrite):
+    /// 1. Stage 0 (PushChildren): Apply bpm patterns, push children
+    /// 2. Stage 1 (ApplyPatterns): Reconstruct, apply pm patterns
+    /// 3. Stage 2 (Link): Link original to final result
     fn rewrite(&mut self, root: Arc<UOp>) -> Arc<UOp> {
         let root_key = UOpKey(root.clone());
 
@@ -441,8 +495,9 @@ where
             }
 
             match stage {
-                Stage::Rewrite => self.handle_rewrite(&mut stack, original, working),
-                Stage::Finalize => self.handle_finalize(&mut stack, original, working, retry_count),
+                Stage::PushChildren => self.handle_push_children(&mut stack, original, working),
+                Stage::ApplyPatterns => self.handle_apply_patterns(&mut stack, original, working, retry_count),
+                Stage::Link => self.handle_link(original, working),
             }
         }
 
@@ -450,20 +505,56 @@ where
     }
 }
 
-/// Apply graph rewriting to a UOp graph using the given pattern matcher.
+/// Marker type for "no matcher" in generic contexts.
 ///
-/// This is the main entry point for graph rewriting. It applies a 2-stage
-/// stack-based algorithm with fixed-point iteration.
-pub fn graph_rewrite_top_down<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
-    RewriteEngine::builder().matcher(matcher).ctx(ctx).bottom_up(false).build().rewrite(root)
+/// Used when only pm or only bpm is needed.
+pub struct NoMatcher;
+
+impl<C> Matcher<C> for NoMatcher {
+    fn rewrite(&self, _node: &Arc<UOp>, _ctx: &mut C) -> RewriteResult {
+        RewriteResult::NoMatch
+    }
 }
 
-/// Apply graph rewriting with bottom-up traversal.
+/// Apply graph rewriting to a UOp graph using the given pattern matcher.
 ///
-/// Like `graph_rewrite_top_down`, but always processes children before parents.
-/// Use this for patterns that need to transform deep nodes in the graph.
+/// This is the main entry point for graph rewriting. Patterns see **OPTIMIZED**
+/// children (applied in Stage 1 after children are processed).
+///
+/// Matches Tinygrad's `graph_rewrite(sink, pm, ctx, bottom_up=False)`.
+pub fn graph_rewrite<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+    RewriteEngine::new(Some(matcher), None::<&NoMatcher>, ctx).rewrite(root)
+}
+
+/// Apply graph rewriting with bottom-up pattern application.
+///
+/// Patterns see **ORIGINAL** children (applied in Stage 0 before children are processed).
+/// Use this for patterns that need to transform nodes before their children are optimized.
+///
+/// Matches Tinygrad's `graph_rewrite(sink, pm, ctx, bottom_up=True)`.
 pub fn graph_rewrite_bottom_up<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
-    RewriteEngine::builder().matcher(matcher).ctx(ctx).bottom_up(true).build().rewrite(root)
+    RewriteEngine::new(None::<&NoMatcher>, Some(matcher), ctx).rewrite(root)
+}
+
+/// Apply graph rewriting with both top-down and bottom-up patterns.
+///
+/// - `bpm` patterns see ORIGINAL children (Stage 0)
+/// - `pm` patterns see OPTIMIZED children (Stage 1)
+///
+/// Matches Tinygrad's `graph_rewrite(sink, pm, ctx, bpm=bpm)`.
+pub fn graph_rewrite_with_bpm<PM, BPM, C>(pm: &PM, bpm: &BPM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
+where
+    PM: Matcher<C>,
+    BPM: Matcher<C>,
+{
+    RewriteEngine::new(Some(pm), Some(bpm), ctx).rewrite(root)
+}
+
+// Backward compatibility aliases
+#[doc(hidden)]
+#[deprecated(since = "0.2.0", note = "Use graph_rewrite instead")]
+pub fn graph_rewrite_top_down<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+    graph_rewrite(matcher, root, ctx)
 }
 
 /// Result of graph rewriting including the transformation map.
@@ -484,11 +575,11 @@ pub struct GraphRewriteOutput {
 /// original nodes were transformed to which new nodes. This is essential for
 /// global graph coordination where multiple tensors share subgraphs.
 #[allow(clippy::mutable_key_type)]
-pub fn graph_rewrite_top_down_with_map<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> GraphRewriteOutput
+pub fn graph_rewrite_with_map<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> GraphRewriteOutput
 where
     M: Matcher<C>,
 {
-    let mut engine = RewriteEngine::builder().matcher(matcher).ctx(ctx).bottom_up(false).build();
+    let mut engine = RewriteEngine::new(Some(matcher), None::<&NoMatcher>, ctx);
     let result_root = engine.rewrite(root.clone());
     // Extract becomes_map: only include entries where the result differs from original
     let becomes_map = engine.results.results.into_iter().filter(|(k, v)| !Arc::ptr_eq(&k.0, v)).collect();
@@ -503,9 +594,20 @@ pub fn graph_rewrite_bottom_up_with_map<M, C>(matcher: &M, root: Arc<UOp>, ctx: 
 where
     M: Matcher<C>,
 {
-    let mut engine = RewriteEngine::builder().matcher(matcher).ctx(ctx).bottom_up(true).build();
+    let mut engine = RewriteEngine::new(None::<&NoMatcher>, Some(matcher), ctx);
     let result_root = engine.rewrite(root.clone());
     // Extract becomes_map: only include entries where the result differs from original
     let becomes_map = engine.results.results.into_iter().filter(|(k, v)| !Arc::ptr_eq(&k.0, v)).collect();
     GraphRewriteOutput { root: result_root, becomes_map }
+}
+
+// Backward compatibility aliases for _with_map functions
+#[doc(hidden)]
+#[deprecated(since = "0.2.0", note = "Use graph_rewrite_with_map instead")]
+#[allow(clippy::mutable_key_type)]
+pub fn graph_rewrite_top_down_with_map<M, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> GraphRewriteOutput
+where
+    M: Matcher<C>,
+{
+    graph_rewrite_with_map(matcher, root, ctx)
 }

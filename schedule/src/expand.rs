@@ -180,12 +180,13 @@ pub fn swizzle_args(cargs: &[(usize, usize)], eargs: &[(usize, usize)], exclude_
 /// - Range(Upcast) → UNROLL conversion must complete before fix_reduce_unroll
 /// - Pattern dependencies require children to be transformed first
 pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
-    use crate::rewrite::graph_rewrite_bottom_up;
+    use crate::rewrite::graph_rewrite;
     use crate::symbolic::symbolic_simple;
 
     // Phase 1: Convert Range(Unroll/Upcast) to UNROLL ops
+    // Uses default graph_rewrite (patterns see optimized children)
     let phase1 = phase1_range_to_unroll();
-    let ast = graph_rewrite_bottom_up(&phase1, ast.clone(), &mut ());
+    let ast = graph_rewrite(&phase1, ast.clone(), &mut ());
 
     // Phase 2: Expander + symbolic (Tinygrad: sym + pm_pre_expander + pm_group_for_reduce + expander)
     //
@@ -195,11 +196,11 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     // 3. pm_group_for_reduce() - GROUP_REDUCE → shared memory pattern
     // 4. expander() - do_expand, do_contract, BARRIER handling
     //
-    // CRITICAL: pm_pre_expander MUST run BEFORE pm_group_for_reduce!
-    // fix_reduce_unroll partitions REDUCE ranges (wraps UNROLL in CONTRACT),
-    // which must happen before fix_group_for_reduce transforms GROUP_REDUCE.
+    // CRITICAL: Uses graph_rewrite (not bottom_up) so do_expand sees OPTIMIZED children.
+    // This ensures nested expressions like Add(Add(UNROLL, UNROLL), UNROLL) are
+    // correctly expanded - inner Add becomes UNROLL before outer Add is processed.
     let phase2 = symbolic_simple() + pm_pre_expander() + pm_group_for_reduce() + expander();
-    graph_rewrite_bottom_up(&phase2, ast, &mut ())
+    graph_rewrite(&phase2, ast, &mut ())
 }
 
 /// Phase 1: Convert Range(Unroll/Upcast) → UNROLL ops with constant vectors.

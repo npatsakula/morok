@@ -13,7 +13,7 @@ use crate::rangeify::patterns::rangeify_codegen_patterns;
 fn apply_patterns(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let matcher = rangeify_codegen_patterns();
     let mut ctx = LocalAddBufferContext::new();
-    let result = crate::rewrite::graph_rewrite_bottom_up(&matcher, uop.clone(), &mut ctx);
+    let result = crate::rewrite::graph_rewrite(&matcher, uop.clone(), &mut ctx);
     if Arc::ptr_eq(&result, uop) { None } else { Some(result) }
 }
 
@@ -21,7 +21,7 @@ fn apply_patterns(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 fn apply_patterns_with_ctx(uop: &Arc<UOp>) -> (Arc<UOp>, LocalAddBufferContext) {
     let matcher = rangeify_codegen_patterns();
     let mut ctx = LocalAddBufferContext::new();
-    let result = crate::rewrite::graph_rewrite_bottom_up(&matcher, uop.clone(), &mut ctx);
+    let result = crate::rewrite::graph_rewrite(&matcher, uop.clone(), &mut ctx);
     (result, ctx)
 }
 

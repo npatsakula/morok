@@ -328,7 +328,7 @@ fn test_input_ranges_mixed_axis_types() {
 #[test]
 fn test_reduce_in_full_pipeline() {
     use crate::devectorize::pm_reduce;
-    use crate::rewrite::graph_rewrite_bottom_up;
+    use crate::rewrite::graph_rewrite;
     use crate::symbolic::patterns::gep_pushing_patterns;
     use morok_dtype::{AddrSpace, DeviceSpec};
 
@@ -347,7 +347,7 @@ fn test_reduce_in_full_pipeline() {
 
     // Apply pm_reduce + gep_pushing (as done in optimizer)
     let combined = pm_reduce() + gep_pushing_patterns();
-    let result = graph_rewrite_bottom_up(&combined, reduce, &mut ());
+    let result = graph_rewrite(&combined, reduce, &mut ());
 
     // Should transform REDUCE to accumulator pattern
     assert!(!matches!(result.op(), Op::Reduce { .. }), "REDUCE should be transformed");

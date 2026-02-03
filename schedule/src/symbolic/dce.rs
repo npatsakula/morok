@@ -12,24 +12,34 @@ use std::sync::Arc;
 /// - vmax = 0: 1 iteration (valid, e.g., after full unroll splits REDUCE axis)
 /// - vmax = -1: 0 iterations (truly empty/dead)
 /// - vmax < 0: unreachable/dead code
+///
+/// Also recognizes `Const(0)` with Index dtype as a dead range marker.
+/// This happens after the rewrite engine transforms dead RANGE → Const(0).
 pub fn is_empty_range(uop: &Arc<UOp>) -> bool {
+    use morok_dtype::DType;
     use morok_ir::types::ConstValue;
     use morok_ir::uop::cached_property::CachedProperty;
     use morok_ir::uop::properties::VminVmaxProperty;
 
-    if matches!(uop.op(), Op::Range { .. }) {
-        // Get the RANGE's vmin_vmax (not the end's!)
-        // RANGE vmax = end_max - 1, so:
-        // - end=0 → vmax=-1 (empty, 0 iterations)
-        // - end=1 → vmax=0 (one iteration: [0])
-        // - end=2 → vmax=1 (two iterations: [0, 1])
-        let (_, vmax) = VminVmaxProperty::get(uop);
-        // Only treat as empty if vmax < 0 (truly unreachable)
-        // NOT vmax == 0 (which is valid single iteration)
-        matches!(vmax, ConstValue::Int(v) if *v < 0)
-        // Note: UInt cannot be negative, so no UInt case needed for "empty"
-    } else {
-        false
+    match uop.op() {
+        Op::Range { .. } => {
+            // Get the RANGE's vmin_vmax (not the end's!)
+            // RANGE vmax = end_max - 1, so:
+            // - end=0 → vmax=-1 (empty, 0 iterations)
+            // - end=1 → vmax=0 (one iteration: [0])
+            // - end=2 → vmax=1 (two iterations: [0, 1])
+            let (_, vmax) = VminVmaxProperty::get(uop);
+            // Only treat as empty if vmax < 0 (truly unreachable)
+            // NOT vmax == 0 (which is valid single iteration)
+            matches!(vmax, ConstValue::Int(v) if *v < 0)
+            // Note: UInt cannot be negative, so no UInt case needed for "empty"
+        }
+        Op::Const(cv) if uop.dtype() == DType::Index => {
+            // Dead ranges become Const(0) after rewrite engine processes them.
+            // Recognize this pattern in END/REDUCE ranges.
+            matches!(cv.0, ConstValue::Int(0) | ConstValue::UInt(0))
+        }
+        _ => false,
     }
 }
 

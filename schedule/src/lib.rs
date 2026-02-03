@@ -41,7 +41,7 @@ pub use morok_ir::rewrite;
 // Re-export main types
 pub use linearize::{CFGContext, linearize, linearize_with_cfg};
 pub use morok_ir::pattern::{Matcher, RewriteResult, TypedPatternMatcher};
-pub use morok_ir::rewrite::graph_rewrite_top_down;
+pub use morok_ir::rewrite::graph_rewrite;
 pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, run_kernel_split_pipeline};
 
 // Re-export expand pass

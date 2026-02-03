@@ -40,7 +40,7 @@ pub struct ReduceContext {
     pub acc_num: u32,
 }
 
-use crate::rewrite::graph_rewrite_bottom_up;
+use crate::rewrite::graph_rewrite;
 use crate::symbolic::patterns::symbolic;
 
 // ============================================================================
@@ -60,7 +60,7 @@ use crate::symbolic::patterns::symbolic;
 pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
     // Phase 1: Devectorize ALU, WMMA, buffers, and expand vector indices
     let pm_phase1 = symbolic() + devectorize_patterns() + expand_index_patterns();
-    let ast = graph_rewrite_bottom_up(&pm_phase1, ast.clone(), &mut ());
+    let ast = graph_rewrite(&pm_phase1, ast.clone(), &mut ());
 
     // Phase 2: Move GEP through LOAD/STORE AND distribute PTRCAT
     // These must be in the same pass because:
@@ -68,11 +68,11 @@ pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
     // - distribute_ptrcat_load needs to match the newly created LOAD(PTRCAT)
     // - The rewrite engine's fixed-point matching allows this in a single pass
     let pm_phase2 = symbolic() + gep_movement_patterns() + ptrcat_distribution_patterns();
-    let ast = graph_rewrite_bottom_up(&pm_phase2, ast, &mut ());
+    let ast = graph_rewrite(&pm_phase2, ast, &mut ());
 
     // Phase 3: Split loads/stores by device fold lengths, drop true gates
     let pm_phase3 = symbolic() + correct_load_store_patterns() + load_store_indexing_patterns();
-    graph_rewrite_bottom_up(&pm_phase3, ast, &mut ())
+    graph_rewrite(&pm_phase3, ast, &mut ())
 }
 
 /// Bool LOAD/STORE via uint8. LLVM i1 can have garbage in upper bits.
@@ -730,7 +730,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         .collect();
 
     let midx =
-        graph_rewrite_bottom_up(&(symbolic() + load_store_indexing_patterns()), UOp::sink(scalar_indices), &mut ());
+        graph_rewrite(&(symbolic() + load_store_indexing_patterns()), UOp::sink(scalar_indices), &mut ());
     let Op::Sink { sources } = midx.op() else { return None };
 
     // Extract (valid, root, offset) for each lane

@@ -1112,7 +1112,7 @@ fn test_compositional_optimization_minimal_failure() {
     // NOTE: This test is ignored for the same reason as compositional_subexpr_optimization:
     // distribution patterns increase operation count but may enable other optimizations.
 
-    use crate::rewrite::graph_rewrite_top_down;
+    use crate::rewrite::graph_rewrite;
     let matcher = symbolic_simple();
 
     // Build the expression: (0 + var("a")) * 2
@@ -1126,18 +1126,18 @@ fn test_compositional_optimization_minimal_failure() {
     // === DIRECT PATH ===
     // Build expression with un-optimized subexpressions and optimize
     let expr_unopt = a.try_mul(&b).unwrap();
-    let direct_opt = graph_rewrite_top_down(&matcher, expr_unopt, &mut ());
+    let direct_opt = graph_rewrite(&matcher, expr_unopt, &mut ());
 
     // === COMPOSITIONAL PATH ===
     // Optimize subexpressions first
-    let opt_a = graph_rewrite_top_down(&matcher, a.clone(), &mut ());
-    let opt_b = graph_rewrite_top_down(&matcher, b.clone(), &mut ());
+    let opt_a = graph_rewrite(&matcher, a.clone(), &mut ());
+    let opt_b = graph_rewrite(&matcher, b.clone(), &mut ());
 
     // Build expression with optimized subexpressions
     let expr_opt_subs = opt_a.try_mul(&opt_b).unwrap();
 
     // Optimize the composed expression
-    let final_opt = graph_rewrite_top_down(&matcher, expr_opt_subs, &mut ());
+    let final_opt = graph_rewrite(&matcher, expr_opt_subs, &mut ());
 
     // Count operations
     fn count_ops(uop: &Arc<UOp>) -> usize {

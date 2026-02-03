@@ -12,7 +12,7 @@ use morok_ir::uop::cached_property::CachedProperty;
 use morok_ir::uop::properties::VminVmaxProperty;
 use morok_ir::{Op, UOp};
 
-use crate::rewrite::graph_rewrite_top_down;
+use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
 
 // Import generators from ir crate
@@ -32,7 +32,7 @@ proptest! {
         let expr = x.try_add(&zero).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x + 0 should simplify to x");
@@ -45,7 +45,7 @@ proptest! {
         let expr = zero.try_add(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "0 + x should simplify to x");
@@ -58,7 +58,7 @@ proptest! {
         let expr = x.try_sub(&zero).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x - 0 should simplify to x");
@@ -71,7 +71,7 @@ proptest! {
         let expr = x.try_mul(&one).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x * 1 should simplify to x");
@@ -84,7 +84,7 @@ proptest! {
         let expr = one.try_mul(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "1 * x should simplify to x");
@@ -97,7 +97,7 @@ proptest! {
         let expr = x.try_div(&one).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x / 1 should simplify to x");
@@ -110,7 +110,7 @@ proptest! {
         let expr = x.try_or_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x | 0 should simplify to x");
@@ -123,7 +123,7 @@ proptest! {
         let expr = x.try_xor_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x ^ 0 should simplify to x");
@@ -144,7 +144,7 @@ proptest! {
         let expr = x.try_mul(&zero).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &zero),
             "x * 0 should simplify to 0");
@@ -157,7 +157,7 @@ proptest! {
         let expr = zero.try_mul(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &zero),
             "0 * x should simplify to 0");
@@ -170,7 +170,7 @@ proptest! {
         let expr = x.try_and_op(&zero).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &zero),
             "x & 0 should simplify to 0");
@@ -183,7 +183,7 @@ proptest! {
         let expr = zero.try_and_op(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &zero),
             "0 & x should simplify to 0");
@@ -203,7 +203,7 @@ proptest! {
         let expr = x.try_div(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         // Should simplify to constant 1
         match simplified.op() {
@@ -219,7 +219,7 @@ proptest! {
         let expr = x.try_and_op(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x & x should simplify to x");
@@ -231,7 +231,7 @@ proptest! {
         let expr = x.try_or_op(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         prop_assert!(Arc::ptr_eq(&simplified, &x),
             "x | x should simplify to x");
@@ -243,7 +243,7 @@ proptest! {
         let expr = x.try_cmplt(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         match simplified.op() {
             Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Bool(false),
@@ -258,7 +258,7 @@ proptest! {
         let expr = x.try_cmpeq(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         match simplified.op() {
             Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Bool(true),
@@ -273,7 +273,7 @@ proptest! {
         let expr = x.try_cmpne(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         match simplified.op() {
             Op::Const(cv) => prop_assert_eq!(cv.0, ConstValue::Bool(false),
@@ -298,7 +298,7 @@ proptest! {
         let expr = a_uop.try_add(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         // Should be a constant
         match simplified.op() {
@@ -324,7 +324,7 @@ proptest! {
         let expr = a_uop.try_mul(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         // Should be a constant
         prop_assert!(matches!(simplified.op(), Op::Const(_)),
@@ -339,7 +339,7 @@ proptest! {
         let expr = a_uop.try_div(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr, &mut ());
+        let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         // Should be a constant
         prop_assert!(matches!(simplified.op(), Op::Const(_)),
@@ -364,8 +364,8 @@ proptest! {
         let yx = y.try_add(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let opt_xy = graph_rewrite_top_down(&matcher, xy, &mut ());
-        let opt_yx = graph_rewrite_top_down(&matcher, yx, &mut ());
+        let opt_xy = graph_rewrite(&matcher, xy, &mut ());
+        let opt_yx = graph_rewrite(&matcher, yx, &mut ());
 
         // Both should optimize to same structure (either both to x+y or both simplified)
         // We verify this by checking if optimization preserves commutativity
@@ -386,8 +386,8 @@ proptest! {
         let x_and_x_and_x = x_and_x.try_and_op(&x).unwrap();
 
         let matcher = symbolic_simple();
-        let opt1 = graph_rewrite_top_down(&matcher, x_and_x, &mut ());
-        let opt2 = graph_rewrite_top_down(&matcher, x_and_x_and_x, &mut ());
+        let opt1 = graph_rewrite(&matcher, x_and_x, &mut ());
+        let opt2 = graph_rewrite(&matcher, x_and_x_and_x, &mut ());
 
         // Both should simplify to the same form (ideally to x, but constants may fold differently)
         // The key property is idempotence: applying & with self gives same result
@@ -427,7 +427,7 @@ proptest! {
         let div2 = div1.try_div(&c_uop).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, div2, &mut ());
+        let simplified = graph_rewrite(&matcher, div2, &mut ());
 
         // Should simplify to a // (b * c)
         if let Op::Binary(BinaryOp::Idiv, var, divisor) = simplified.op() {
@@ -458,7 +458,7 @@ proptest! {
         let mul2 = mul1.try_mul(&c_uop).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, mul2, &mut ());
+        let simplified = graph_rewrite(&matcher, mul2, &mut ());
 
         // Should simplify to a * (b * c)
         if let Op::Binary(BinaryOp::Mul, var, multiplier) = simplified.op() {
@@ -495,7 +495,7 @@ proptest! {
         let mod2 = mod1.try_mod(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, mod2, &mut ());
+        let simplified = graph_rewrite(&matcher, mod2, &mut ());
 
         // Should simplify to a % b
         if let Op::Binary(BinaryOp::Mod, var, divisor) = simplified.op() {
@@ -519,7 +519,7 @@ proptest! {
         let add2 = add1.try_add(&c_uop).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, add2, &mut ());
+        let simplified = graph_rewrite(&matcher, add2, &mut ());
 
         // Should simplify to a + (b + c), a - |b+c|, or just a when b+c=0
         let expected_sum = (b as i64) + (c as i64);
@@ -562,7 +562,7 @@ proptest! {
         let sub2 = sub1.try_sub(&c_uop).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, sub2, &mut ());
+        let simplified = graph_rewrite(&matcher, sub2, &mut ());
 
         // Should simplify to a - (b + c)
         if let Op::Binary(BinaryOp::Sub, var, subtrahend) = simplified.op() {
@@ -590,7 +590,7 @@ proptest! {
         let div = mul.try_div(&b_uop).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, div, &mut ());
+        let simplified = graph_rewrite(&matcher, div, &mut ());
 
         // Should simplify back to a
         prop_assert!(Arc::ptr_eq(&simplified, &a),

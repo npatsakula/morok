@@ -11,7 +11,7 @@ use morok_dtype::DType;
 use morok_ir::UOp;
 use morok_ir::types::ConstValue;
 
-use crate::rewrite::graph_rewrite_top_down;
+use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
 use crate::z3::verify_equivalence;
 
@@ -35,7 +35,7 @@ proptest! {
         let matcher = symbolic_simple();
 
         // Oracle 1: Known property - verify expected simplification (if it happens)
-        let simplified = graph_rewrite_top_down(&matcher, graph.clone(), &mut ());
+        let simplified = graph_rewrite(&matcher, graph.clone(), &mut ());
 
         // Note: Not all patterns are implemented, so we don't require simplification
         // We just verify that IF simplification occurs, it's correct
@@ -81,7 +81,7 @@ proptest! {
         );
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
+        let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
         // Should simplify to x
         prop_assert!(Arc::ptr_eq(&simplified, &x));
@@ -98,7 +98,7 @@ proptest! {
         let expr = x.try_mul(&zero).unwrap();
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
+        let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
         // Should simplify to 0
         prop_assert!(Arc::ptr_eq(&simplified, &zero));
@@ -120,7 +120,7 @@ proptest! {
         );
 
         let matcher = symbolic_simple();
-        let simplified = graph_rewrite_top_down(&matcher, expr.clone(), &mut ());
+        let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
         // Should simplify to 1
         match simplified.op() {
@@ -142,7 +142,7 @@ proptest! {
     #[test]
     fn z3_verify_arithmetic_optimization(graph in arb_arithmetic_tree_bounded_up_to(DType::Int32, 3)) {
         let matcher = symbolic_simple();
-        let optimized = graph_rewrite_top_down(&matcher, graph.clone(), &mut ());
+        let optimized = graph_rewrite(&matcher, graph.clone(), &mut ());
 
         // Z3 should verify equivalence
         let result = verify_equivalence(&graph, &optimized);
@@ -192,8 +192,8 @@ proptest! {
         let matcher = symbolic_simple();
 
         // Optimize both
-        let narrow_opt = graph_rewrite_top_down(&matcher, narrow_graph.clone(), &mut ());
-        let wide_opt = graph_rewrite_top_down(&matcher, wide_graph.clone(), &mut ());
+        let narrow_opt = graph_rewrite(&matcher, narrow_graph.clone(), &mut ());
+        let wide_opt = graph_rewrite(&matcher, wide_graph.clone(), &mut ());
 
         // Both should have same structure (just different dtypes)
         // We verify this by checking if they simplify to the same form

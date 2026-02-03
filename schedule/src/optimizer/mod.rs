@@ -73,7 +73,7 @@ use crate::rangeify::patterns::{
     pm_add_loads, pm_bool_devectorize, pm_comparison_negations, pm_div_to_shr, pm_fdiv_to_mul, pm_fma_decomposition,
     pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_reduce_devectorize,
 };
-use crate::rewrite::{graph_rewrite_bottom_up, graph_rewrite_top_down};
+use crate::rewrite::graph_rewrite;
 use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
 use std::sync::Arc;
 
@@ -154,7 +154,7 @@ pub fn apply_post_optimization_with_renderer(
     // duplicated logic in LLVM and Cranelift backends.
     // Must run BEFORE pm_add_loads (which transforms INDEX dtype to Ptr).
     // Uses bottom-up traversal to ensure children are processed before parents.
-    let linearized = graph_rewrite_bottom_up(&pm_linearize_multi_index(), ast, &mut ());
+    let linearized = graph_rewrite(&pm_linearize_multi_index(), ast, &mut ());
     tracing::debug!(ast.optimized = linearized.tree(), "after pm_linearize_multi_index");
 
     // =========================================================================
@@ -162,7 +162,7 @@ pub fn apply_post_optimization_with_renderer(
     // This MUST run BEFORE expander to optimize conditionals before expansion.
     // =========================================================================
     let post_opt_symbolic = symbolic();
-    let with_symbolic = graph_rewrite_top_down(&post_opt_symbolic, linearized, &mut ());
+    let with_symbolic = graph_rewrite(&post_opt_symbolic, linearized, &mut ());
     tracing::debug!(ast.optimized = with_symbolic.tree(), "Stage 8: after post-opt symbolic");
 
     // =========================================================================
@@ -188,7 +188,7 @@ pub fn apply_post_optimization_with_renderer(
     // pm_wmma_accumulate fuses Add into WMMA's accumulator: WMMA(a,b,c) + add → WMMA(a,b,c+add)
     // Tensor cores have built-in accumulation, so this is more efficient.
     let pm_reduce_combined = pm_reduce() + pm_wmma_accumulate() + gep_pushing_patterns();
-    let reduced = graph_rewrite_bottom_up(&pm_reduce_combined, expanded, &mut ());
+    let reduced = graph_rewrite(&pm_reduce_combined, expanded, &mut ());
     tracing::debug!(ast.optimized = reduced.tree(), "after pm_reduce");
 
     // pm_add_gpudims: Convert GLOBAL/LOCAL RANGE → SPECIAL thread indices (Tinygrad gpudims.py)
@@ -198,7 +198,7 @@ pub fn apply_post_optimization_with_renderer(
     let with_gpudims = if let Some(ren) = renderer {
         if ren.has_local {
             // GPU backend: inject thread indices
-            graph_rewrite_top_down(&pm_add_gpudims(), reduced, &mut ren.clone())
+            graph_rewrite(&pm_add_gpudims(), reduced, &mut ren.clone())
         } else {
             reduced
         }
@@ -217,7 +217,7 @@ pub fn apply_post_optimization_with_renderer(
     // - RANGE end → lowered based on bounds
     //
     // Must run AFTER pm_add_gpudims (which creates SPECIAL ops) and BEFORE pm_add_loads.
-    let with_lowered_idx = graph_rewrite_bottom_up(&crate::symbolic::pm_lower_index_dtype(), with_gpudims, &mut ());
+    let with_lowered_idx = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), with_gpudims, &mut ());
     tracing::debug!(ast.optimized = with_lowered_idx.tree(), "Stage 15: after pm_lower_index_dtype");
 
     // =========================================================================
@@ -228,13 +228,13 @@ pub fn apply_post_optimization_with_renderer(
     // - GEP pushing already runs after pm_reduce (line 191)
     // - GEP pushing runs again in cleanup (line 254)
     // - Index lowering doesn't create GEPs - those come from devectorization later
-    let with_lowered_idx = graph_rewrite_bottom_up(&symbolic_simple(), with_lowered_idx, &mut ());
+    let with_lowered_idx = graph_rewrite(&symbolic_simple(), with_lowered_idx, &mut ());
     tracing::debug!(ast.optimized = with_lowered_idx.tree(), "Stage 16: after post-index symbolic");
 
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
-    let with_loads = graph_rewrite_bottom_up(&pm_add_loads(), with_lowered_idx, &mut ());
+    let with_loads = graph_rewrite(&pm_add_loads(), with_lowered_idx, &mut ());
 
     // ALU Devectorization + VECTORIZE Normalization
     //
@@ -253,21 +253,21 @@ pub fn apply_post_optimization_with_renderer(
     let processed = if devectorize_alu {
         // Step 1: Devectorize ALL vector ALU ops to VECTORIZE(scalar)
         let no_vec_alu = crate::devectorize::no_vectorized_alu();
-        let devec = graph_rewrite_bottom_up(&no_vec_alu, with_loads, &mut ());
+        let devec = graph_rewrite(&no_vec_alu, with_loads, &mut ());
 
         // Step 2: Simplify GEPs created by no_vectorized_alu
-        graph_rewrite_bottom_up(&gep_pushing_patterns(), devec, &mut ())
+        graph_rewrite(&gep_pushing_patterns(), devec, &mut ())
     } else {
         with_loads
     };
 
     // Step 3: Cleanup GEPs
-    let cleaned = graph_rewrite_bottom_up(&gep_pushing_patterns(), processed, &mut ());
+    let cleaned = graph_rewrite(&gep_pushing_patterns(), processed, &mut ());
     tracing::debug!(ast.optimized = cleaned.tree(), "after pm_pushing_patterns");
 
     // Second pass of pm_add_loads: expansion may create new INDEX ops that need LOAD wrapping.
     // NOTE: Uses top-down graph_rewrite to match Tinygrad's approach.
-    let with_loads2 = graph_rewrite_top_down(&pm_add_loads(), cleaned, &mut ());
+    let with_loads2 = graph_rewrite(&pm_add_loads(), cleaned, &mut ());
     tracing::debug!(ast.optimized = with_loads2.tree(), "after pm_add_loads");
 
     // Devectorize pass: group contiguous memory accesses
@@ -279,7 +279,7 @@ pub fn apply_post_optimization_with_renderer(
     // LLVM's bool vectors are broken (no formal ABI, segfaults in codegen).
     // Based on Tinygrad's no_vectorized_alu approach.
     // Must run BEFORE reduce devectorization so comparisons are already scalar.
-    let devectorized = graph_rewrite_bottom_up(&pm_bool_devectorize(), devectorized_mem, &mut ());
+    let devectorized = graph_rewrite(&pm_bool_devectorize(), devectorized_mem, &mut ());
     tracing::debug!(ast.optimized = devectorized.tree(), "after pm_bool_devectorize");
 
     // Unified REDUCE devectorization: Handles all 3 mutually exclusive cases:
@@ -287,7 +287,7 @@ pub fn apply_post_optimization_with_renderer(
     // - Bool reduce: matching vcounts, bool dtype → N scalar REDUCEs + VECTORIZE (<N x i1> workaround)
     // - Horizontal: src_vcount > out_vcount → stride-pattern GEPs + ALU chain
     // Based on Tinygrad's pm_reduce (devectorizer.py:283-316).
-    let reduce_devec = graph_rewrite_bottom_up(&pm_reduce_devectorize(), devectorized, &mut ());
+    let reduce_devec = graph_rewrite(&pm_reduce_devectorize(), devectorized, &mut ());
     tracing::debug!(ast.optimized = reduce_devec.tree(), "after pm_reduce_devectorize");
 
     // =========================================================================
@@ -304,7 +304,7 @@ pub fn apply_post_optimization_with_renderer(
     // Currently we always apply FMA decomposition for float types since most
     // backends benefit from explicit FMA ops (LLVM generates fma intrinsics).
     let pm_decomp = symbolic_simple() + get_late_rewrite_patterns(renderer);
-    let decomposed = graph_rewrite_bottom_up(&pm_decomp, reduce_devec, &mut ());
+    let decomposed = graph_rewrite(&pm_decomp, reduce_devec, &mut ());
     tracing::debug!(ast.optimized = decomposed.tree(), "Stage 18: after pm_decomp");
 
     // =========================================================================
@@ -318,14 +318,14 @@ pub fn apply_post_optimization_with_renderer(
     // - Single-element VECTORIZE unwrapping
     //
     // This moves pm_render from codegen to schedule pipeline for proper stage alignment.
-    let rendered = graph_rewrite_bottom_up(&pm_render(), decomposed, &mut ());
+    let rendered = graph_rewrite(&pm_render(), decomposed, &mut ());
     tracing::debug!(ast.optimized = rendered.tree(), "Stage 19: after pm_render");
 
     // Bool storage: Convert bool LOAD/STORE to uint8 to avoid LLVM i1 garbage bits.
     // LLVM's i1 type when stored to memory can have garbage in upper 7 bits.
     // Must run LAST, after all other transformations that might create bool stores.
     // Based on Tinygrad's PTX/NIR bool→uint8 patterns.
-    let bs = graph_rewrite_bottom_up(&bool_storage_patterns(), rendered, &mut ());
+    let bs = graph_rewrite(&bool_storage_patterns(), rendered, &mut ());
     tracing::debug!(ast.optimized = bs.tree(), "after bool_storage_pattern");
     bs
 }
@@ -471,11 +471,11 @@ pub fn optimize_kernel_beam<F>(
 where
     F: Fn(&Scheduler) -> Option<std::time::Duration> + Sync,
 {
-    use crate::rewrite::graph_rewrite_top_down;
+    use crate::rewrite::graph_rewrite;
     use crate::symbolic::patterns::symbolic;
 
     // Step 1: Symbolic simplification
-    let simplified = graph_rewrite_top_down(&symbolic(), ast, &mut ());
+    let simplified = graph_rewrite(&symbolic(), ast, &mut ());
 
     // Step 2: Create scheduler
     let mut scheduler = Scheduler::new(simplified, renderer.clone());
@@ -501,7 +501,7 @@ where
 ///
 /// A `Scheduler` with loops converted to globals (if applicable).
 pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Scheduler {
-    let simplified = graph_rewrite_top_down(&symbolic(), ast, &mut ());
+    let simplified = graph_rewrite(&symbolic(), ast, &mut ());
     let mut scheduler = Scheduler::new(simplified, renderer.clone());
     let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
     // Note: Don't apply threading here - let beam search explore THREAD actions naturally.
@@ -512,7 +512,7 @@ pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Schedu
 /// Apply heuristic-based optimizations.
 fn optimize_heuristic(ast: Arc<morok_ir::UOp>, renderer: &Renderer, config: &HeuristicsConfig) -> Arc<morok_ir::UOp> {
     // Step 1: Symbolic simplification
-    let simplified = graph_rewrite_top_down(&symbolic(), ast, &mut ());
+    let simplified = graph_rewrite(&symbolic(), ast, &mut ());
 
     // Step 2: Create scheduler with backend capabilities
     let mut scheduler = Scheduler::new(simplified, renderer.clone());

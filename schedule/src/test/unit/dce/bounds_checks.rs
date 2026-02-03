@@ -5,7 +5,7 @@ use morok_ir::types::{BinaryOp, ConstValue};
 use morok_ir::{Op, UOp};
 use std::sync::Arc;
 
-use crate::rewrite::graph_rewrite_top_down;
+use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
 
 #[test]
@@ -17,7 +17,7 @@ fn test_lt_always_true() {
     let check = idx.try_cmplt(&size).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite_top_down(&matcher, check, &mut ());
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant true
     match result.op() {
@@ -35,7 +35,7 @@ fn test_lt_unknown() {
     let check = idx.try_cmplt(&size).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite_top_down(&matcher, check, &mut ());
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should not be constant
     match result.op() {
@@ -54,7 +54,7 @@ fn test_eq_same_var() {
     let check = x.try_cmpeq(&x).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite_top_down(&matcher, check, &mut ());
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant true
     match result.op() {
@@ -70,7 +70,7 @@ fn test_ne_same_var() {
     let check = x.try_cmpne(&x).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite_top_down(&matcher, check, &mut ());
+    let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant false
     match result.op() {
@@ -94,7 +94,7 @@ fn test_cascading_bounds_elimination() {
     let where_op = UOp::try_where(bounds_check, safe_val.clone(), error_val).unwrap();
 
     let matcher = symbolic_simple();
-    let result = graph_rewrite_top_down(&matcher, where_op, &mut ());
+    let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // Should eliminate to safe_val
     assert!(Arc::ptr_eq(&result, &safe_val));

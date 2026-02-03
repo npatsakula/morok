@@ -10,7 +10,7 @@ use morok_ir::types::ConstValue;
 use morok_ir::{Op, UOp};
 
 use crate::expand::pre_expand;
-use crate::rewrite::graph_rewrite_bottom_up;
+use crate::rewrite::graph_rewrite;
 
 /// Apply expander rewrite to a UOp (main entry point for tests).
 ///
@@ -29,10 +29,12 @@ pub fn expander_rewrite(uop: &Arc<UOp>) -> Arc<UOp> {
 /// NOTE: Does NOT include symbolic_simple() to preserve REDUCE structure
 /// for fix_reduce tests. Use extract_result_values() to evaluate Binary
 /// operations on constants for value assertions.
+///
+/// Uses graph_rewrite (not bottom_up) so do_expand sees OPTIMIZED children.
 pub fn phase2_only(uop: &Arc<UOp>) -> Arc<UOp> {
     // Combine all phase2 patterns: pm_pre_expander + pm_group_for_reduce + expander
     let phase2 = crate::expand::pm_pre_expander() + crate::expand::pm_group_for_reduce() + crate::expand::expander();
-    graph_rewrite_bottom_up(&phase2, uop.clone(), &mut ())
+    graph_rewrite(&phase2, uop.clone(), &mut ())
 }
 
 // =============================================================================

@@ -529,11 +529,11 @@ fn detect_expanded_dimensions(source: &Arc<UOp>, input_shape: &[SInt]) -> Vec<bo
     let substituted = indexed.substitute(&substitutions);
 
     use super::patterns::{movement_op_patterns, pm_syntactic_sugar};
-    use crate::rewrite::graph_rewrite_top_down;
+    use crate::rewrite::graph_rewrite_bottom_up;
 
-    // Tinygrad: pm_mops + pm_syntactic_sugar (early movement ops)
+    // Tinygrad: pm_mops + pm_syntactic_sugar (early movement ops, bottom_up=True)
     let pm_mops = movement_op_patterns() + pm_syntactic_sugar();
-    let transformed = graph_rewrite_top_down(&pm_mops, substituted, &mut ());
+    let transformed = graph_rewrite_bottom_up(&pm_mops, substituted, &mut ());
 
     let surviving_range_ids = collect_range_ids(&transformed);
     let surviving_set: HashSet<usize> = surviving_range_ids.into_iter().collect();

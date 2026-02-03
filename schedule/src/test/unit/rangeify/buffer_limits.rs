@@ -17,7 +17,7 @@ use test_case::test_case;
 
 use crate::rangeify::indexing::IndexingContext;
 use crate::rangeify::patterns::{buffer_limit_patterns, extract_device_from_graph, is_elementwise};
-use crate::rewrite::graph_rewrite_top_down;
+use crate::rewrite::graph_rewrite;
 
 // ============================================================================
 // Helper Functions
@@ -139,7 +139,7 @@ fn test_metal_limit_at_threshold() {
     let (_, computation) = create_multi_buffer_computation(30, device.clone());
 
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite_top_down(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
 
     // Should NOT materialize (30 <= 30, within limit)
     assert!(
@@ -158,7 +158,7 @@ fn test_metal_limit_exceeded() {
 
     let before_count = count_bufferizes(&computation);
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite_top_down(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some operations
@@ -177,7 +177,7 @@ fn test_webgpu_limit_at_threshold() {
     let (_, computation) = create_multi_buffer_computation(7, device);
 
     let matcher = buffer_limit_patterns(8);
-    let result = graph_rewrite_top_down(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
 
     // Should NOT materialize (7 <= 7, within limit)
     assert!(
@@ -196,7 +196,7 @@ fn test_webgpu_limit_exceeded() {
 
     let before_count = count_bufferizes(&computation);
     let matcher = buffer_limit_patterns(8);
-    let result = graph_rewrite_top_down(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some operations
@@ -281,7 +281,7 @@ fn test_materialize_only_elementwise() {
 
     // The computation is a chain of ADD operations (elementwise)
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite_top_down(&matcher, computation, &mut ());
+    let result = graph_rewrite(&matcher, computation, &mut ());
 
     // Should have created BUFFERIZE operations for elementwise ops
     let bufferize_count = count_bufferizes(&result);
@@ -301,7 +301,7 @@ fn test_output_buffer_accounting(num_buffers: usize, should_materialize: bool) {
 
     let before_count = count_bufferizes(&computation);
     let matcher = buffer_limit_patterns(31); // Metal limit
-    let result = graph_rewrite_top_down(&matcher, computation.clone(), &mut ());
+    let result = graph_rewrite(&matcher, computation.clone(), &mut ());
     let after_count = count_bufferizes(&result);
 
     if should_materialize {
@@ -361,7 +361,7 @@ fn test_no_double_materialization() {
 
     // Apply pattern (shouldn't double-materialize)
     let matcher = buffer_limit_patterns(31);
-    let result = graph_rewrite_top_down(&matcher, indexed_materialized, &mut ());
+    let result = graph_rewrite(&matcher, indexed_materialized, &mut ());
 
     let after_count = count_bufferizes(&result);
     assert_eq!(before_count, after_count, "Should not double-materialize already-materialized operations");
@@ -412,7 +412,7 @@ fn test_multiple_binary_ops() {
     // Apply buffer limit (10 buffer limit)
     let before_count = count_bufferizes(&expr);
     let matcher = buffer_limit_patterns(10);
-    let result = graph_rewrite_top_down(&matcher, expr, &mut ());
+    let result = graph_rewrite(&matcher, expr, &mut ());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some intermediate results
@@ -459,7 +459,7 @@ fn test_ternary_op_materialization() {
     // Apply buffer limit (10 buffer limit)
     let before_count = count_bufferizes(&where_op);
     let matcher = buffer_limit_patterns(10);
-    let result = graph_rewrite_top_down(&matcher, where_op, &mut ());
+    let result = graph_rewrite(&matcher, where_op, &mut ());
     let after_count = count_bufferizes(&result);
 
     // Should have materialized some intermediate results

@@ -142,7 +142,7 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
 
     // Step 4: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
     let early_matcher = super::patterns::early_rewrites();
-    let transformed_sink = crate::rewrite::graph_rewrite_top_down(&early_matcher, sink, &mut ());
+    let transformed_sink = crate::rewrite::graph_rewrite(&early_matcher, sink, &mut ());
 
     Ok((transformed_sink, ctx))
 }
@@ -824,10 +824,10 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             // This is critical for simplifying Range(n) % n → Range(n) and Range(n) / n → 0
             // Like Tinygrad: graph_rewrite(UOp.sink(*axes_out), symbolic+pm_simplify_valid, name="reshape").src
             use crate::symbolic::patterns::symbolic_simple;
-            use morok_ir::rewrite::graph_rewrite_bottom_up;
+            use morok_ir::rewrite::graph_rewrite;
 
             let sink = UOp::sink(axes_out);
-            let simplified_sink = graph_rewrite_bottom_up(&symbolic_simple(), sink, &mut ());
+            let simplified_sink = graph_rewrite(&symbolic_simple(), sink, &mut ());
 
             // Extract simplified sources
             match simplified_sink.op() {

@@ -11,7 +11,7 @@ use morok_ir::{Op, UOp};
 use smallvec::smallvec;
 use std::sync::Arc;
 
-use crate::rewrite::graph_rewrite_top_down;
+use crate::rewrite::graph_rewrite;
 
 use super::helpers::{assert_const_value, assert_end_range_count, assert_end_unwrapped, get_matcher};
 
@@ -30,7 +30,7 @@ fn test_range_zero_to_const() {
     let range = UOp::range(zero, 0);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, range, &mut ());
+    let result = graph_rewrite(&matcher, range, &mut ());
 
     assert_const_value(&result, ConstValue::Int(0));
 }
@@ -42,7 +42,7 @@ fn test_range_negative_to_const() {
     let range = UOp::range(neg_five, 0);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, range, &mut ());
+    let result = graph_rewrite(&matcher, range, &mut ());
 
     assert_const_value(&result, ConstValue::Int(0));
 }
@@ -59,7 +59,7 @@ fn test_end_all_dead_ranges_unwrapped() {
     let end = Arc::clone(&store).end(smallvec![dead_range]);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, end, &mut ());
+    let result = graph_rewrite(&matcher, end, &mut ());
 
     // Should unwrap to just the store
     let unwrapped = assert_end_unwrapped(&result);
@@ -77,7 +77,7 @@ fn test_end_partial_dead_ranges_removed() {
     let end = Arc::clone(&store).end(smallvec![Arc::clone(&live1), dead, Arc::clone(&live2)]);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, end, &mut ());
+    let result = graph_rewrite(&matcher, end, &mut ());
 
     // Should have exactly 2 ranges (dead one removed)
     let (computation, ranges) = assert_end_range_count(&result, 2);
@@ -102,7 +102,7 @@ fn test_reduce_add_empty_to_zero() {
     let reduce = src.reduce(smallvec![dead_range], ReduceOp::Add);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, reduce, &mut ());
+    let result = graph_rewrite(&matcher, reduce, &mut ());
 
     assert_const_value(&result, ConstValue::Int(0));
 }
@@ -115,7 +115,7 @@ fn test_reduce_mul_empty_to_one() {
     let reduce = src.reduce(smallvec![dead_range], ReduceOp::Mul);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, reduce, &mut ());
+    let result = graph_rewrite(&matcher, reduce, &mut ());
 
     assert_const_value(&result, ConstValue::Int(1));
 }
@@ -128,7 +128,7 @@ fn test_reduce_max_empty_to_min() {
     let reduce = src.reduce(smallvec![dead_range], ReduceOp::Max);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, reduce, &mut ());
+    let result = graph_rewrite(&matcher, reduce, &mut ());
 
     assert_const_value(&result, ConstValue::Int(i32::MIN as i64));
 }
@@ -151,7 +151,7 @@ fn test_range_symbolic_dead() {
     let range = UOp::range(count, 0);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, range, &mut ());
+    let result = graph_rewrite(&matcher, range, &mut ());
 
     assert_const_value(&result, ConstValue::Int(0));
 }
@@ -166,7 +166,7 @@ fn test_range_boundary_vmax_zero() {
     let range = UOp::range(max_val, 0);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, range, &mut ());
+    let result = graph_rewrite(&matcher, range, &mut ());
 
     assert_const_value(&result, ConstValue::Int(0));
 }
@@ -182,7 +182,7 @@ fn test_end_empty_ranges_unchanged() {
     let end = Arc::clone(&store).end(smallvec![]);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, end, &mut ());
+    let result = graph_rewrite(&matcher, end, &mut ());
 
     // Should remain an END with empty ranges
     match result.op() {
@@ -203,7 +203,7 @@ fn test_end_multiple_dead_ranges_unwrapped() {
     let end = Arc::clone(&store).end(smallvec![dead1, dead2]);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, end, &mut ());
+    let result = graph_rewrite(&matcher, end, &mut ());
 
     // Should unwrap completely
     let unwrapped = assert_end_unwrapped(&result);
@@ -223,7 +223,7 @@ fn test_reduce_multiple_dead_ranges() {
     let reduce = src.reduce(smallvec![dead1, dead2], ReduceOp::Add);
 
     let matcher = get_matcher();
-    let result = graph_rewrite_top_down(&matcher, reduce, &mut ());
+    let result = graph_rewrite(&matcher, reduce, &mut ());
 
     assert_const_value(&result, ConstValue::Int(0));
 }

@@ -74,7 +74,7 @@ pub fn rangeify_with_map(
     pcontig_config: Option<&super::kernel::PcontigConfig>,
 ) -> morok_ir::Result<RangeifyResult> {
     use morok_ir::rewrite::{
-        graph_rewrite_bottom_up_with_map, graph_rewrite_top_down, graph_rewrite_top_down_with_map,
+        graph_rewrite_bottom_up_with_map, graph_rewrite, graph_rewrite_with_map,
     };
 
     // Aggregate all becomes_maps from rewrite passes
@@ -96,7 +96,7 @@ pub fn rangeify_with_map(
     // Split large reductions BEFORE ReduceAxis → REDUCE conversion
     let mut split_config = super::kernel::SplitReduceOpConfig::default();
     let split_matcher = super::patterns::split_reduceop_patterns();
-    let result = graph_rewrite_top_down_with_map(&split_matcher, sink, &mut split_config);
+    let result = graph_rewrite_with_map(&split_matcher, sink, &mut split_config);
     sink = result.root;
     all_becomes.extend(result.becomes_map);
     tracing::debug!(uop.tree = sink.tree(), "split reduceops complete");
@@ -132,7 +132,7 @@ pub fn rangeify_with_map(
     // =========================================================================
     // First: apply pm_load_collapse for gated load patterns
     let load_collapse_matcher = super::patterns::pm_load_collapse();
-    sink = graph_rewrite_top_down(&load_collapse_matcher, sink, &mut ());
+    sink = graph_rewrite(&load_collapse_matcher, sink, &mut ());
     tracing::debug!(uop.tree = sink.tree(), "Stage 2a: load collapse complete");
 
     // Then: apply reduction simplify patterns (reduce_unparented, reduce_collapse)
@@ -149,12 +149,12 @@ pub fn rangeify_with_map(
     // First: mark RANGE % const patterns and substitute at SINK
     let split_matcher = pm_split_ranges();
     let mut split_ctx = SplitRangesContext::default();
-    sink = graph_rewrite_top_down(&split_matcher, sink, &mut split_ctx);
+    sink = graph_rewrite(&split_matcher, sink, &mut split_ctx);
     tracing::debug!(uop.tree = sink.tree(), "Stage 3a: split ranges complete");
 
     // Then: flatten nested ranges on REDUCE/STORE/END
     let flatten_matcher = pm_flatten_range();
-    sink = graph_rewrite_top_down(&flatten_matcher, sink, &mut ());
+    sink = graph_rewrite(&flatten_matcher, sink, &mut ());
     tracing::debug!(uop.tree = sink.tree(), "Stage 3b: flatten ranges complete");
 
     // =========================================================================
@@ -164,14 +164,14 @@ pub fn rangeify_with_map(
     //       This aligns with Tinygrad's sym which includes GEP pushing at every stage.
     // =========================================================================
     let symbolic_with_flatten = crate::symbolic::symbolic() + flatten_matcher;
-    sink = graph_rewrite_top_down(&symbolic_with_flatten, sink, &mut ());
+    sink = graph_rewrite(&symbolic_with_flatten, sink, &mut ());
     tracing::debug!(uop.tree = sink.tree(), "Stage 4: initial symbolic complete");
 
     // =========================================================================
     // Stage 5: Simplify ranges - Tinygrad: pm_simplify_ranges
     // Merge adjacent ranges to reduce divmod operations
     // =========================================================================
-    sink = graph_rewrite_top_down(&pm_simplify_ranges(), sink, &mut ());
+    sink = graph_rewrite(&pm_simplify_ranges(), sink, &mut ());
     tracing::debug!(uop.tree = sink.tree(), "Stage 5: simplify ranges complete");
 
     // =========================================================================
@@ -183,7 +183,7 @@ pub fn rangeify_with_map(
     {
         let mut split_store_ctx = SplitStoreContext::for_device(device);
         let split_store_matcher = pm_split_store();
-        sink = graph_rewrite_top_down(&split_store_matcher, sink, &mut split_store_ctx);
+        sink = graph_rewrite(&split_store_matcher, sink, &mut split_store_ctx);
         tracing::debug!(uop.tree = sink.tree(), "Stage 6: split store complete");
     }
 
@@ -743,17 +743,17 @@ fn apply_buffer_removal_protecting_sink(
     ctx: &mut super::kernel::PcontigConfig,
 ) -> Arc<UOp> {
     let Op::Sink { sources } = sink.op() else {
-        return crate::rewrite::graph_rewrite_top_down(matcher, sink.clone(), ctx);
+        return crate::rewrite::graph_rewrite(matcher, sink.clone(), ctx);
     };
 
     let mut new_sources = Vec::with_capacity(sources.len());
     for src in sources.iter() {
         if let Op::Bufferize { compute, ranges, opts } = src.op() {
-            let optimized_compute = crate::rewrite::graph_rewrite_top_down(matcher, compute.clone(), ctx);
+            let optimized_compute = crate::rewrite::graph_rewrite(matcher, compute.clone(), ctx);
             let new_bufferize = UOp::bufferize(optimized_compute, ranges.to_vec(), opts.clone());
             new_sources.push(new_bufferize);
         } else {
-            let optimized = crate::rewrite::graph_rewrite_top_down(matcher, src.clone(), ctx);
+            let optimized = crate::rewrite::graph_rewrite(matcher, src.clone(), ctx);
             new_sources.push(optimized);
         }
     }
@@ -998,7 +998,7 @@ pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> 
 
     let substituted = src.substitute(&substitute_map);
     let matcher = crate::symbolic::symbolic_simple();
-    let simplified = crate::rewrite::graph_rewrite_top_down(&matcher, substituted, &mut ());
+    let simplified = crate::rewrite::graph_rewrite(&matcher, substituted, &mut ());
 
     let vars_in_simplified: HashSet<UOpKey> =
         simplified.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::DefineVar { .. })).map(UOpKey).collect();
@@ -1168,7 +1168,7 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         // Apply substitution and simplify (Tinygrad simplify.py:30-31)
         let rewritten = u.substitute(&subs);
         let matcher = crate::symbolic::symbolic_simple();
-        let simplified = crate::rewrite::graph_rewrite_top_down(&matcher, rewritten, &mut ());
+        let simplified = crate::rewrite::graph_rewrite(&matcher, rewritten, &mut ());
 
         // Count divmod operations (Tinygrad simplify.py:34-36)
         let original_divmod = count_divmod(u);
