@@ -187,11 +187,11 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     let phase1 = phase1_range_to_unroll();
     let ast = graph_rewrite_bottom_up(&phase1, ast.clone(), &mut ());
 
-    // Phase 2: Expander + symbolic (Tinygrad: sym + pm_pre_expander + expander)
+    // Phase 2: Expander + symbolic (Tinygrad: sym + pm_pre_expander + pm_group_for_reduce + expander)
     // Combines symbolic simplification with expansion for single-pass efficiency.
     // Uses bottom-up: children transformed before parents, matching Tinygrad's
     // actual behavior (despite their "bottom_up=False" naming).
-    let phase2 = symbolic_simple() + phase2_expand();
+    let phase2 = symbolic_simple() + pm_group_for_reduce() + phase2_expand();
     graph_rewrite_bottom_up(&phase2, ast, &mut ())
 }
 

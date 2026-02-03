@@ -10,6 +10,7 @@ pub mod edge_cases;
 pub mod end_unrolls;
 pub mod fix_reduce;
 pub mod fix_store;
+pub mod group_reduce;
 pub mod helpers;
 pub mod shift_to_integration;
 pub mod swizzle;

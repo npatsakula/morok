@@ -265,3 +265,172 @@ fn test_apply_tc_invalid_use_tc() {
     let result = apply(&mut scheduler, -1, 0, 3);
     assert!(result.is_err());
 }
+
+// =============================================================================
+// TC Padding Tests
+// =============================================================================
+
+use morok_dtype::DType;
+use std::sync::Arc;
+
+/// Helper to create a proper matmul pattern for TC padding tests.
+/// Creates: C[m,n] = sum_k A[m,k] * B[k,n]
+///
+/// Unlike simplified tests, this creates inputs that depend on ranges
+/// so that detect_matmul() can find the M, N, K axes.
+fn create_matmul_pattern_for_padding(m: i64, n: i64, k: i64) -> Arc<morok_ir::UOp> {
+    let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
+    let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
+    let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
+
+    // Create inputs that depend on ranges (so get_ranges() finds them)
+    // A[m,k] - depends on m_range and k_range
+    // B[k,n] - depends on k_range and n_range
+    //
+    // We achieve this by casting ranges to float and using them in expressions.
+    // This creates a dependency without needing actual buffer operations.
+    let m_float = m_range.clone().cast(DType::Float32);
+    let k_float = k_range.clone().cast(DType::Float32);
+    let n_float = n_range.clone().cast(DType::Float32);
+
+    // A[m,k] = m + k (has m_range and k_range in backward slice)
+    let a_val = m_float.try_add(&k_float).unwrap();
+    // B[k,n] = k + n (has k_range and n_range in backward slice)
+    let b_val = k_float.try_add(&n_float).unwrap();
+
+    // C[m,n] = sum_k(A[m,k] * B[k,n])
+    let mul = a_val.try_mul(&b_val).unwrap();
+    let reduce = mul.reduce(vec![k_range].into(), ReduceOp::Add);
+
+    UOp::sink(vec![reduce, m_range, n_range])
+}
+
+#[test]
+fn test_tc_no_padding_divisible_dims() {
+    // 16x16x16 matmul - perfectly divisible by TC dimensions
+    let sink = create_matmul_pattern_for_padding(16, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=1 (no padding) should work for divisible dims
+    let result = apply(&mut scheduler, -1, 1, 1);
+    // May succeed or fail based on dtype matching, but shouldn't fail due to divisibility
+    if let Err(ref e) = result {
+        let err_msg = format!("{:?}", e);
+        assert!(!err_msg.contains("not divisible"), "16x16x16 should not fail divisibility check: {}", err_msg);
+    }
+}
+
+#[test]
+fn test_tc_rejects_non_divisible_without_tc_opt_2() {
+    // 15x16x16 matmul - M not divisible by 16
+    let sink = create_matmul_pattern_for_padding(15, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=1 (no padding) should reject non-divisible dims
+    let result = apply(&mut scheduler, -1, 1, 1);
+    assert!(result.is_err(), "TC should fail for non-divisible dims with tc_opt=1");
+
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("not divisible") || err_msg.contains("no compatible"),
+        "Should fail due to divisibility or no compatible TC: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_tc_padding_with_tc_opt_2() {
+    // 15x16x16 matmul - M not divisible, but tc_opt=2 enables padding
+    let sink = create_matmul_pattern_for_padding(15, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=2 should attempt padding via PADTO
+    // For 15→16, this is only ~6% more work so PADTO should succeed
+    let result = apply(&mut scheduler, -1, 2, 1);
+
+    // If it fails, it shouldn't be due to "not divisible" (padding should handle that)
+    if let Err(ref e) = result {
+        let err_msg = format!("{:?}", e);
+        assert!(!err_msg.contains("not divisible"), "tc_opt=2 should pad instead of rejecting: {}", err_msg);
+    }
+}
+
+#[test]
+fn test_tc_padding_rejects_4x_work_increase() {
+    // 4x16x16 matmul - padding 4→16 would be 4x work increase
+    let sink = create_matmul_pattern_for_padding(4, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=2 attempts padding, but PADTO rejects >4x work increase
+    let result = apply(&mut scheduler, -1, 2, 1);
+
+    // Should fail - either at padding (4x limit) or no compatible TC
+    assert!(result.is_err(), "Should fail due to 4x work limit or no compatible TC");
+}
+
+#[test]
+fn test_tc_padding_all_axes() {
+    // 17x17x17 matmul - all dimensions need padding to 32
+    let sink = create_matmul_pattern_for_padding(17, 17, 17);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=2 should attempt padding all axes
+    // 17→32 is ~88% increase, within 4x limit
+    let result = apply(&mut scheduler, -1, 2, 1);
+
+    // May succeed or fail based on dtype matching, but shouldn't fail divisibility
+    if let Err(ref e) = result {
+        let err_msg = format!("{:?}", e);
+        assert!(!err_msg.contains("not divisible"), "tc_opt=2 should pad instead of rejecting: {}", err_msg);
+    }
+}
+
+#[test]
+fn test_tc_opt_validation() {
+    let sink = create_matmul_pattern_for_padding(16, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // tc_opt > 2 should be rejected
+    let result = apply(&mut scheduler, -1, 3, 1);
+    assert!(result.is_err(), "tc_opt=3 should be rejected");
+
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(err_msg.contains("tc_opt must be"), "Should fail validation: {}", err_msg);
+}

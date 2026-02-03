@@ -279,12 +279,48 @@ pub fn apply(
         .find_map(|axis_choice| select_tensor_core(&pattern, &scheduler.ren, tc_select, axis_choice).ok().flatten())
         .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "no compatible tensor core found" }.build())?;
 
-    let tc = &scheduler.ren.tensor_cores[tc_selection.tc_index];
+    // Clone the TensorCore to avoid borrow conflicts when applying PADTO
+    let tc = scheduler.ren.tensor_cores[tc_selection.tc_index].clone();
     let (n_range, m_range, k_range) = &tc_selection.axes;
-    let axes = [n_range.clone(), m_range.clone(), k_range.clone()];
+    // Mutable axes array - may be updated after PADTO
+    let mut axes = [n_range.clone(), m_range.clone(), k_range.clone()];
 
-    // Padding check (tc_opt >= 2)
+    // Padding check and application (tc_opt >= 2)
+    // When tc_opt >= 2, we use PADTO to align non-divisible dimensions
+    // instead of rejecting them outright.
     if tc_opt >= 2 {
+        // Collect padding operations needed (can't mutate axes while iterating)
+        let tc_dims = [tc.dims.0, tc.dims.1, tc.dims.2];
+        let mut padding_ops: Vec<(usize, usize, usize)> = Vec::new(); // (axes_idx, scheduler_idx, tc_dim)
+
+        for (i, (axis, &tc_dim)) in axes.iter().zip(&tc_dims).enumerate() {
+            let dim_size = get_range_size(axis);
+            if let Some(size) = dim_size
+                && !(size as usize).is_multiple_of(tc_dim)
+            {
+                let axis_idx = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, axis)).ok_or_else(|| {
+                    ValidationFailedSnafu { op: "TC", reason: "axis not found in scheduler ranges" }.build()
+                })?;
+                padding_ops.push((i, axis_idx, tc_dim));
+            }
+        }
+
+        // Apply padding operations sequentially
+        for (axes_idx, scheduler_idx, tc_dim) in padding_ops {
+            crate::optimizer::opts::apply_opt(scheduler, &crate::optimizer::Opt::padto(scheduler_idx, tc_dim), false)
+                .map_err(|_| {
+                ValidationFailedSnafu {
+                    op: "TC",
+                    reason: "padding failed (may exceed 4x work limit or have unsafe ops)",
+                }
+                .build()
+            })?;
+
+            // Update axes to the new padded range (PADTO substitutes the old range)
+            axes[axes_idx] = scheduler.rngs()[scheduler_idx].clone();
+        }
+    } else {
+        // Without tc_opt >= 2, reject non-divisible dimensions
         for (i, axis) in axes.iter().enumerate() {
             let dim_size = get_range_size(axis);
             let tc_dim = match i {
@@ -295,7 +331,7 @@ pub fn apply(
             if let Some(size) = dim_size
                 && !(size as usize).is_multiple_of(tc_dim)
             {
-                return ValidationFailedSnafu { op: "TC", reason: "dimension not divisible (padding not implemented)" }
+                return ValidationFailedSnafu { op: "TC", reason: "dimension not divisible by tensor core size" }
                     .fail();
             }
         }
@@ -331,7 +367,7 @@ pub fn apply(
 
     // Build WMMA UOp (if use_tensor_cores == 1)
     if use_tensor_cores == 1 {
-        let (a_axes, b_axes, c_axes) = build_upcast_axes(tc, &new_ranges);
+        let (a_axes, b_axes, c_axes) = build_upcast_axes(&tc, &new_ranges);
         let metadata = WmmaMetadata {
             name: format!("WMMA_{}x{}x{}", tc.dims.0, tc.dims.1, tc.dims.2),
             dims: tc.dims,
