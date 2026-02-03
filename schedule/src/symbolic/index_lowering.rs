@@ -138,11 +138,17 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         // ====================================================================
         // Pattern 4: SPECIAL (gidx, lidx) - always i32
         // ====================================================================
-        // GPU thread indices are always 32-bit
+        // GPU thread indices are always 32-bit.
+        // IMPORTANT: We must lower the SPECIAL's dtype, not just its end parameter.
+        // UOp::special() hardcodes DType::Index, so we use UOp::new() directly.
         special @ Special { name, end } if special.dtype() == DType::Index => |name, end| {
             let i32_dtype = DType::Scalar(ScalarDType::Int32);
-            let new_end = end.cast(i32_dtype);
-            Some(UOp::special(new_end, name.clone()))
+            let new_end = end.cast(i32_dtype.clone());
+            // Create SPECIAL with i32 dtype, not Index
+            Some(UOp::new(
+                Op::Special { end: new_end, name: name.clone() },
+                i32_dtype,
+            ))
         },
 
         // ====================================================================
@@ -162,19 +168,28 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         },
 
         // ====================================================================
-        // Pattern 6: RANGE end - if end is Index, lower based on bounds
+        // Pattern 6: RANGE - lower both end AND the RANGE's dtype
         // ====================================================================
+        // IMPORTANT: We must lower the RANGE's dtype, not just its end parameter.
+        // UOp::range_axis() hardcodes DType::Index, so we use UOp::new() directly.
+        // This matches Tinygrad's approach: r.replace(dtype=end.dtype, src=(end,))
         Range { end, axis_id, axis_type } if end.dtype() == DType::Index => |end, axis_id, axis_type| {
             let target_dtype = select_concrete_dtype(end);
-            let lowered_end = end.cast(target_dtype);
-            Some(UOp::range_axis(lowered_end, *axis_id, *axis_type))
+            let lowered_end = end.cast(target_dtype.clone());
+            // Create RANGE with concrete dtype, not Index
+            Some(UOp::new(
+                Op::Range { end: lowered_end, axis_id: *axis_id, axis_type: *axis_type },
+                target_dtype,
+            ))
         },
 
         // ====================================================================
         // Pattern 7: VECTORIZE of Index elements
         // ====================================================================
         // VECTORIZE(Index_a, Index_b, ...) → VECTORIZE(concrete_a, concrete_b, ...)
-        vec @ Vectorize { elements } if vec.dtype() == DType::Index => |vec, elements| {
+        // Note: VECTORIZE dtype is Vector { scalar: Index, count: N }, not DType::Index.
+        // Use .base() to extract the scalar type for comparison.
+        vec @ Vectorize { elements } if vec.dtype().base() == ScalarDType::Index => |vec, elements| {
             // Select dtype based on entire vector's bounds
             let target_dtype = select_concrete_dtype(vec);
 

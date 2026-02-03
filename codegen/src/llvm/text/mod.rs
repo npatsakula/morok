@@ -187,21 +187,43 @@ impl Renderer for LlvmTextRenderer {
         kernel.push("  ; Load variable values from vars array".to_string());
         for (i, var) in variables.iter().enumerate() {
             let var_ptr_name = format!("%var{i}_ptr");
-            let var_val_name =
-                if let Op::DefineVar { name, .. } = var.op() { format!("%{name}") } else { format!("%var{i}") };
+            let var_base_name =
+                if let Op::DefineVar { name, .. } = var.op() { name.clone() } else { format!("var{i}") };
             kernel.push(format!("  {var_ptr_name} = getelementptr i64, ptr %vars, i64 {i}"));
-            kernel.push(format!("  {var_val_name} = load i64, ptr {var_ptr_name}"));
+            kernel.push(format!("  %{var_base_name}_i64 = load i64, ptr {var_ptr_name}"));
+
+            // Cast variable to its expected dtype (i32 or i64 after Index lowering)
+            let var_dtype = var.dtype();
+            let var_dtype_str = ldt(&var_dtype);
+            let var_val_name = if var_dtype_str == "i64" {
+                format!("%{var_base_name}_i64")
+            } else {
+                // Trunc from i64 to i32 (or other narrower type)
+                kernel.push(format!("  %{var_base_name} = trunc i64 %{var_base_name}_i64 to {var_dtype_str}"));
+                format!("%{var_base_name}")
+            };
             ctx.register(var.id, var_val_name);
         }
 
         if let Some((thread_range, _)) = &thread_info {
             let thread_idx = variables.len();
             kernel.push(format!("  %thread_id_ptr = getelementptr i64, ptr %vars, i64 {thread_idx}"));
-            kernel.push("  %thread_id = load i64, ptr %thread_id_ptr".to_string());
+            kernel.push("  %thread_id_i64 = load i64, ptr %thread_id_ptr".to_string());
+
+            // Cast thread_id to the thread_range's dtype (i32 after Index lowering)
+            let range_dtype = thread_range.dtype();
+            let range_dtype_str = ldt(&range_dtype);
+            let thread_id_name = if range_dtype_str == "i64" {
+                "%thread_id_i64".to_string()
+            } else {
+                // Trunc from i64 to i32 (or other narrower type)
+                kernel.push(format!("  %thread_id = trunc i64 %thread_id_i64 to {range_dtype_str}"));
+                "%thread_id".to_string()
+            };
 
             if let Op::Range { axis_id, .. } = thread_range.op() {
-                ctx.register(thread_range.id, "%thread_id".to_string());
-                ctx.register_range(axis_id.value(), "%thread_id".to_string());
+                ctx.register(thread_range.id, thread_id_name.clone());
+                ctx.register_range(axis_id.value(), thread_id_name);
             }
         }
 

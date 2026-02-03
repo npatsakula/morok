@@ -161,7 +161,8 @@ pub fn lcast(from: &DType, to: &DType) -> &'static str {
         return if to_scalar.bytes() < from_scalar.bytes() { "trunc" } else { "zext" };
     }
 
-    if from_scalar.is_signed() {
+    // Index type is treated as signed integer for casting purposes
+    if from_scalar.is_signed() || from_scalar == ScalarDType::Index {
         return if to_scalar.bytes() < from_scalar.bytes() { "trunc" } else { "sext" };
     }
 
@@ -218,5 +219,15 @@ mod tests {
         assert_eq!(lcast(&DType::Int64, &DType::Int32), "trunc");
         assert_eq!(lcast(&DType::Int32, &DType::Int64), "sext");
         assert_eq!(lcast(&DType::UInt32, &DType::UInt64), "zext");
+    }
+
+    #[test]
+    fn test_lcast_index_type() {
+        // Index type (i64) should be treated as signed integer for casting
+        assert_eq!(lcast(&DType::Index, &DType::Int32), "trunc");
+        assert_eq!(lcast(&DType::Index, &DType::Int64), "sext"); // same size, but sext is valid
+        assert_eq!(lcast(&DType::Int32, &DType::Index), "sext");
+        // Float to Index
+        assert_eq!(lcast(&DType::Float32, &DType::Index), "fptosi");
     }
 }
