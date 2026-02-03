@@ -112,6 +112,11 @@ impl CFGContext {
                         continue;
                     }
 
+                    // Skip self-references (END cannot be nested inside itself)
+                    if dep_key.0.id == node.id {
+                        continue;
+                    }
+
                     // Skip if already assigned
                     if nesting.contains_key(dep_key) {
                         continue;
@@ -191,11 +196,46 @@ impl CFGContext {
                 let y_range = if let Op::End { ranges, .. } = y.op() { ranges.first().cloned() } else { None };
 
                 if let Some(range) = y_range {
-                    // Skip edges that would create cycles (transitive check)
-                    // Check if x is in range's backward slice (i.e., range depends on x)
-                    let would_cycle = range.backward_slice().iter().any(|node| node.id == x.id);
+                    // Skip edges that would create cycles.
+                    // Cycle condition: x depends on range (adding range → x would create x → ... → range → x)
+                    // Check: is range in x's backward slice?
+                    let would_cycle = x.backward_slice().iter().any(|node| node.id == range.id);
                     if !would_cycle {
+                        tracing::trace!(range_id = range.id, predecessor_id = x.id, "CFGContext: creating edge");
                         ctx.edges.insert(UOpKey(range), x);
+                    } else {
+                        tracing::warn!(
+                            range_id = range.id,
+                            predecessor_id = x.id,
+                            "CFGContext: skipped edge (would create cycle)"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Step 6: Create edges for reduce RANGEs to wait for their init STOREs.
+        //
+        // When AFTER(passthrough, [init_store, reduce_range]) appears (from reduce_to_acc),
+        // the heap-based linearization may schedule RANGE before STORE due to priority
+        // tie-breaking (RANGE +5 vs STORE +1). This edge ensures zero-init STORE appears
+        // before the reduce loop, which is required for correctness.
+        //
+        // NOTE: Tinygrad's linearizer.py lacks this fix and has known issues
+        // (see comment at line 85-86: "TODO: this can happen! it causes infinite loop
+        // in shufflenet"). Our explicit edge creation is more robust.
+        for node in &nodes {
+            if let Op::After { deps, .. } = node.op() {
+                let stores: Vec<_> = deps.iter().filter(|d| matches!(d.op(), Op::Store { .. })).collect();
+                let ranges: Vec<_> = deps.iter().filter(|d| matches!(d.op(), Op::Range { .. })).collect();
+
+                for store in &stores {
+                    for range in &ranges {
+                        let would_cycle = store.backward_slice().iter().any(|n| n.id == range.id);
+                        if !would_cycle {
+                            tracing::trace!(range_id = range.id, store_id = store.id, "CFGContext: reduce init edge");
+                            ctx.edges.insert(UOpKey((*range).clone()), (*store).clone());
+                        }
                     }
                 }
             }
@@ -262,23 +302,30 @@ mod tests {
 
     #[test]
     fn test_cfg_context_nested_ranges() {
-        // Nested RANGEs: outer contains inner
+        // Nested RANGEs: inner loop runs inside outer loop.
+        // For inner_end to be nested inside outer_end, inner_end must depend on outer_range.
         let end_val = UOp::index_const(10);
 
+        // Outer range first (so inner can depend on it)
+        let outer_range = UOp::range(end_val.clone(), 1);
+
         // Inner range
-        let inner_range = UOp::range(end_val.clone(), 0);
-        let inner_value = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+        let inner_range = UOp::range(end_val, 0);
+
+        // Inner value that depends on outer_range (so it runs inside outer loop)
+        // Use outer_range as part of the computation to create the dependency
+        let outer_idx = outer_range.cast(DType::Float32);
+        let inner_value = UOp::const_(DType::Float32, ConstValue::Float(1.0)).add(&outer_idx);
         let inner_end = inner_value.end(smallvec::smallvec![inner_range.clone()]);
 
-        // Outer range containing inner
-        let outer_range = UOp::range(end_val, 1);
+        // Outer END
         let outer_end = inner_end.end(smallvec::smallvec![outer_range.clone()]);
 
         let sink = UOp::sink(vec![outer_end]);
 
         let ctx = CFGContext::new(&sink);
-        // Nested ranges at different levels shouldn't have edges between them
-        // (they're not siblings)
+        // inner_end is nested inside outer_end (not siblings), so outer_range
+        // should have no predecessor edge
         assert!(ctx.get_predecessor(&outer_range).is_none());
     }
 }

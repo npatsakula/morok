@@ -26,6 +26,207 @@ RUST_LOG=morok_codegen::llvm::text=debug cargo test test_name 2>&1 | rg 'lineari
 
 Compare with Tinygrad's output using the `/tinygrad` skill to isolate broken patterns.
 
+---
+
+## Stage-by-Stage Tree Extraction
+
+### Quick Reference Table
+
+| Pipeline Phase | Stage | RUST_LOG Target | Debug Marker | What to Extract |
+|----------------|--------|-------------------|--------------|------------------|
+| **RANGEIFY** | 0: Range Assignment | `morok_schedule::rangeify=debug` | `"range assignment complete"` | Initial IR with movement ops |
+| | 1: Early Movement Ops | Same as Stage 0 | `"early rewrites complete"` | After movement op cleanup |
+| | 2: Load Collapse | Same as Stage 0 | `"Stage 2a: load collapse complete"` | After REDUCE elimination |
+| | 2b: Reduction Simplify | Same as Stage 0 | `"Stage 2b: reduction simplify complete"` | After reduction patterns |
+| | 3: Split Ranges | Same as Stage 0 | `"Stage 3a: split ranges complete"` | After range splitting |
+| | 3b: Flatten Ranges | Same as Stage 0 | `"Stage 3b: flatten ranges complete"` | After flattening |
+| | 4: Initial Symbolic | Same as Stage 0 | `"Stage 4: initial symbolic complete"` | After constant folding |
+| | 5: Simplify Ranges | Same as Stage 0 | `"Stage 5: simplify ranges complete"` | After range merging |
+| | 6: Split Store | Same as Stage 0 | `"Stage 6: split store complete"` | After store splitting (CPU) |
+| | 7: Buffer Removal | Same as Stage 0 | `"Stage 7: buffer removal complete"` | After buffer optimization |
+| | 7b: Buffer Limits | Same as Stage 0 | `"Stage 7b: buffer limit enforcement complete"` | After limit enforcement |
+| **EXPANDER** | 8: Post-Opt Symbolic | (not logged separately) | After WHERE movement |
+| | 9: Expander | `morok_schedule::expand=debug` | `"Stage 9: expander complete"` | After UNROLL/UPCAST expansion |
+| | 10: Add Local Buffers | `morok_schedule::rangeify=debug` | `"buffer folding + dead axis removal complete"` | After bufferization |
+| **DEVECTORIZER** | 11: Remove Reduce | `morok_schedule::devectorize=debug` | `"Stage 11: remove reduce complete"` | After REDUCE→ACCUMULATOR |
+| | 12: Add GPU Dims | Same as Stage 11 | `"Stage 12: add gpudims complete"` | After SPECIAL injection |
+| | 13: Add Loads | Same as Stage 11 | `"Stage 13: add loads complete"` | After LOAD wrapping |
+| | 14: Devectorize | Same as Stage 11 | `"Stage 14: devectorize complete"` | After hardware lowering |
+| | 15: Lower Index Dtype | (not logged separately) | After Index→i32/i64 |
+| **LINEARIZER** | 16: Post-Index Symbolic | (not logged separately) | Final cleanup |
+| | 17: Pre-Matcher | (not logged separately) | Backend-specific patterns |
+| | 18: Decompositions | (not logged separately) | Late rewrites |
+| | 19: Final Rewrite | `morok_schedule::optimizer=debug` | `"Stage 19: final rewrite complete"` | Before linearization |
+| | 20: Add Control Flow | `morok_schedule::linearize=debug` | `"Stage 20: add control flow complete"` | After CFG edges |
+| | 21: Linearize | Same as Stage 20 | `"Stage 21: linearize complete"` | Topological sort |
+| | 22: Cleanup IF/ENDIF | (not logged separately) | Final cleanup |
+
+### Extract All Stages at Once
+
+```bash
+# Capture all pipeline stages in a single command
+RUST_LOG='morok_schedule::rangeify|morok_schedule::expand|morok_schedule::devectorize|morok_schedule::gpudims|morok_schedule::optimizer|morok_schedule::linearize=debug' \
+  cargo test test_name -- --nocapture 2>&1 | rg -E 'complete' --color=always
+```
+
+This shows tree output with markers for all stages with their corresponding UOp trees.
+
+### Method 1: In-Code Tree Extraction
+
+Add temporary debugging code directly in your test or tensor operation:
+
+```rust
+use morok_ir::prelude::*;
+
+// After each pipeline stage
+println!("--- After Stage N ---");
+println!("{}", uop.tree());  // Compact tree with back-references
+// println!("{}", uop.tree_full());  // Full tree expanding all nodes
+```
+
+**Note**: You'll need to manually insert these print statements at the appropriate stage location in the pipeline code (`schedule/src/rangeify/transforms.rs`, `schedule/src/expand.rs`, etc.).
+
+### Method 2: Programmatic IR Extraction
+
+For debugging existing tests, use the tensor `prepare()` API:
+
+```rust
+let plan = tensor.prepare().expect("prepare should succeed");
+
+for kernel in plan.kernels() {
+    println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
+    println!("{}", kernel.code);  // LLVM IR or device code
+}
+```
+
+See `tensor/src/test/unit/matmul.rs:180` for a complete example.
+
+### Method 3: Tracing with Tree Output
+
+Enable RUST_LOG to see tree structure at specific stages:
+
+```bash
+# Extract IR after Stage 0-7 (Rangeify)
+RUST_LOG=morok_schedule::rangeify=debug cargo test test_name 2>&1 | rg -A5 'range assignment complete' | head -50
+
+# Extract IR after Stage 9 (Expander)
+RUST_LOG=morok_schedule::expand=debug cargo test test_name 2>&1 | rg -A5 'Stage 9: expander complete' | head -50
+
+# Extract IR after Stage 19 (Final Rewrite)
+RUST_LOG=morok_schedule::optimizer=debug cargo test test_name 2>&1 | rg -A5 'Stage 19: final rewrite complete' | head -50
+```
+
+The `-A5` option shows 5 lines of context after each match, helping you see the tree structure.
+
+### Stage-Specific Debugging Commands
+
+#### Rangeify Phase (Stages 0-7)
+
+```bash
+# Stage 0: Range assignment
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'range assignment complete'
+
+# Stage 1: Early movement ops
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'early rewrites complete'
+
+# Stage 2a: Load collapse
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'Stage 2a: load collapse complete'
+
+# Stage 2b: Reduction simplify
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'Stage 2b: reduction simplify complete'
+
+# Stage 3a: Split ranges
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'Stage 3a: split ranges complete'
+
+# Stage 3b: Flatten ranges
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'Stage 3b: flatten ranges complete'
+
+# Stage 4: Initial symbolic
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'Stage 4: initial symbolic complete'
+
+# Stage 5: Simplify ranges
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'Stage 5: simplify ranges complete'
+
+# Stage 6: Split store (CPU only)
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'Stage 6: split store complete'
+
+# Stage 7: Buffer removal
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'Stage 7: buffer removal complete'
+
+# Stage 7b: Buffer limits
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'Stage 7b: buffer limit enforcement complete'
+```
+
+#### Expander Phase (Stages 8-10)
+
+```bash
+# Stage 9: UNROLL/UPCAST expansion
+RUST_LOG=morok_schedule::expand=debug cargo test_name 2>&1 | rg 'Stage 9: expander complete'
+
+# Stage 10: Add local buffers
+RUST_LOG=morok_schedule::rangeify=debug cargo test_name 2>&1 | rg 'buffer folding + dead axis removal complete'
+```
+
+#### Devectorizer Phase (Stages 11-15)
+
+```bash
+# Stage 11: Remove Reduce (REDUCE→ACCUMULATOR)
+RUST_LOG=morok_schedule::devectorize=debug cargo test_name 2>&1 | rg 'Stage 11: remove reduce complete'
+
+# Stage 12: Add GPU Dims
+RUST_LOG=morok_schedule::devectorize=debug cargo test_name 2>&1 | rg 'Stage 12: add gpudims complete'
+
+# Stage 13: Add Loads
+RUST_LOG=morok_schedule::devectorize=debug cargo test_name 2>&1 | rg 'Stage 13: add loads complete'
+
+# Stage 14: Devectorize
+RUST_LOG=morok_schedule::devectorize=debug cargo test_name 2>&1 | rg 'Stage 14: devectorize complete'
+
+# Stage 15: Lower Index Dtype (no explicit marker)
+# Check IR after Stage 14 to see Index→i32/i64 conversion
+```
+
+#### Linearizer Phase (Stages 16-22)
+
+```bash
+# Stage 19: Final Rewrite
+RUST_LOG=morok_schedule::optimizer=debug cargo test_name 2>&1 | rg 'Stage 19: final rewrite complete'
+
+# Stage 20: Add Control Flow
+RUST_LOG=morok_schedule::linearize=debug cargo test_name 2>&1 | rg 'Stage 20: add control flow complete'
+
+# Stage 21: Linearize (topological sort)
+RUST_LOG=morok_schedule::linearize=debug cargo test_name 2>&1 | rg 'Stage 21: linearize complete'
+
+# Stage 22: Cleanup IF/ENDIF (no explicit marker)
+# Check linearized instruction list after Stage 21
+```
+
+### Example: Debugging a Vectorization Issue
+
+```bash
+# 1. Check IR before expander (Stage 8)
+RUST_LOG=morok_schedule::rangeify=debug cargo test_vectorize 2>&1 | rg -A5 'Stage 4: initial symbolic complete'
+
+# 2. Check IR after expander (Stage 9)
+RUST_LOG=morok_schedule::expand=debug cargo test_vectorize 2>&1 | rg -A5 'Stage 9: expander complete'
+
+# 3. Compare to see if UNROLL→CONTRACT is correct
+```
+
+### Linking to Documentation
+
+Each stage corresponds to a chapter in `book/src/architecture/path-of-the-uop.md`:
+
+- **Stages 1-7**: See "Phase 1: Rangeify" section
+- **Stages 8-10**: See "Phase 2: Expander" section  
+- **Stages 11-15**: See "Phase 3: Devectorizer" section
+- **Stages 16-22**: See "Phase 4: Linearizer" section
+
+When you identify which stage has the issue, read the corresponding section to understand the transformation rules and expected behavior.
+
+---
+
 ## Enabling Traces in Tests
 
 ### Why traces don't appear
