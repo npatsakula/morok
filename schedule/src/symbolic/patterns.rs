@@ -14,7 +14,10 @@ use morok_dtype::DType;
 use morok_ir::types::{BinaryOp, ConstValue, TernaryOp};
 use morok_ir::uop::cached_property::CachedProperty;
 use morok_ir::uop::comparison_analysis::ComparisonAnalyzer;
-use morok_ir::uop::eval::{eval_add_typed, eval_binary_op, eval_mul_typed, eval_sub_typed};
+use morok_ir::uop::eval::{
+    eval_add_typed, eval_binary_op, eval_binary_op_broadcast_typed, eval_mul_typed, eval_sub_typed,
+    eval_unary_op_vec_typed,
+};
 use morok_ir::uop::properties::VminVmaxProperty;
 use morok_ir::{IntoUOp, Op, UOp};
 
@@ -53,6 +56,46 @@ pub fn constant_folding_dsl_patterns() -> TypedPatternMatcher {
             // For MulAcc: use first operand's dtype (all same dtype)
             op(_a @const(a_val), b @const(b_val), _c @const(c_val))
               => |a_val, b, b_val, c_val| eval_ternary_op_typed(op, a_val, b_val, c_val, b.dtype().base()).map(|r| UOp::const_(b.dtype(), r)),
+        },
+    }
+}
+
+/// VConst constant folding patterns.
+///
+/// Folds VConst expressions at compile time:
+/// - Binary operations on VConst pairs: VConst op VConst → VConst
+/// - Binary operations mixing Const and VConst (with broadcast)
+/// - Unary operations on VConst
+///
+/// Based on Tinygrad's exec_alu for VCONST handling.
+pub fn vconst_folding_patterns() -> TypedPatternMatcher {
+    patterns! {
+        // Binary VConst folding: VConst op VConst → VConst
+        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
+            op(a @vconst(vals_a), _b @vconst(vals_b))
+              => |a, vals_a, vals_b| {
+                  eval_binary_op_broadcast_typed(op, &vals_a, &vals_b, a.dtype().base())
+                      .map(UOp::vconst)
+              },
+        },
+
+        // Mixed Const + VConst folding (broadcast): Const op VConst → VConst
+        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
+            op(a @anyconst(vals_a), _b @anyconst(vals_b))
+              if vals_a.len() != vals_b.len() // Only when broadcasting needed
+              => |a, vals_a, vals_b| {
+                  eval_binary_op_broadcast_typed(op, &vals_a, &vals_b, a.dtype().base())
+                      .map(UOp::vconst)
+              },
+        },
+
+        // Unary VConst folding
+        for op in unary [Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
+            op(a @vconst(vals))
+              => |a, vals| {
+                  eval_unary_op_vec_typed(op, &vals, a.dtype().base())
+                      .map(UOp::vconst)
+              },
         },
     }
 }
@@ -102,6 +145,7 @@ pub fn identity_and_zero_patterns() -> TypedPatternMatcher {
 /// - x & 0 → 0, 0 & x → 0
 pub fn symbolic_simple() -> TypedPatternMatcher {
     constant_folding_dsl_patterns()
+        + vconst_folding_patterns()
         + identity_and_zero_patterns()
         + self_folding_dsl_patterns()
         + zero_folding_dsl_patterns()
@@ -722,9 +766,15 @@ pub fn dead_loop_patterns() -> TypedPatternMatcher {
         if let Op::End { ranges, .. } = end_op.op() { ranges.iter().any(is_empty_range) } else { false }
     }
 
-    /// Check if all REDUCE ranges are empty (for guard).
+    /// Check if all REDUCE ranges are empty/dead (for guard).
+    /// Note: Empty ranges list means "no dimensions to reduce", NOT "all dead ranges".
+    /// We only return true when there ARE ranges and all of them are dead.
     fn all_ranges_empty(reduce_op: &Arc<UOp>) -> bool {
-        if let Op::Reduce { ranges, .. } = reduce_op.op() { ranges.iter().all(is_empty_range) } else { false }
+        if let Op::Reduce { ranges, .. } = reduce_op.op() {
+            !ranges.is_empty() && ranges.iter().all(is_empty_range)
+        } else {
+            false
+        }
     }
 
     /// Filter dead ranges from END, or unwrap if all dead.

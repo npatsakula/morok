@@ -42,6 +42,37 @@ pub fn try_const(uop: &Arc<UOp>) -> Option<&ConstValue> {
     }
 }
 
+/// Check if a UOp is a VConst (vector constant).
+#[inline]
+pub fn is_vconst(uop: &Arc<UOp>) -> bool {
+    matches!(uop.op(), Op::VConst { .. })
+}
+
+/// Check if a UOp is any constant (Const or VConst).
+#[inline]
+pub fn is_any_const(uop: &Arc<UOp>) -> bool {
+    matches!(uop.op(), Op::Const(_) | Op::VConst { .. })
+}
+
+/// Extract VConst values if present.
+#[inline]
+pub fn try_vconst(uop: &Arc<UOp>) -> Option<&Vec<ConstValue>> {
+    match uop.op() {
+        Op::VConst { values } => Some(values),
+        _ => None,
+    }
+}
+
+/// Extract values from any constant (Const returns single-element slice, VConst returns full slice).
+#[inline]
+pub fn try_any_const_values(uop: &Arc<UOp>) -> Option<Vec<ConstValue>> {
+    match uop.op() {
+        Op::Const(cv) => Some(vec![cv.0]),
+        Op::VConst { values } => Some(values.clone()),
+        _ => None,
+    }
+}
+
 /// Check if a UOp matches a constant predicate.
 #[inline]
 pub fn const_matches<F>(uop: &Arc<UOp>, predicate: F) -> bool

@@ -11,8 +11,8 @@
 
 use super::helpers::*;
 use morok_dtype::DType;
-use morok_ir::types::ConstValue;
 use morok_ir::UOp;
+use morok_ir::types::ConstValue;
 
 // =============================================================================
 // Broadcast Expansion Tests

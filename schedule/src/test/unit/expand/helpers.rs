@@ -31,9 +31,7 @@ pub fn expander_rewrite(uop: &Arc<UOp>) -> Arc<UOp> {
 /// operations on constants for value assertions.
 pub fn phase2_only(uop: &Arc<UOp>) -> Arc<UOp> {
     // Combine all phase2 patterns: pm_pre_expander + pm_group_for_reduce + expander
-    let phase2 = crate::expand::pm_pre_expander()
-        + crate::expand::pm_group_for_reduce()
-        + crate::expand::expander();
+    let phase2 = crate::expand::pm_pre_expander() + crate::expand::pm_group_for_reduce() + crate::expand::expander();
     graph_rewrite_bottom_up(&phase2, uop.clone(), &mut ())
 }
 
@@ -470,11 +468,7 @@ pub fn extract_result_values(uop: &Arc<UOp>) -> Vec<i64> {
                 (a, b) => panic!("Mismatched vector lengths: {} vs {}", a, b),
             };
 
-            lhs_vals
-                .iter()
-                .zip(rhs_vals.iter())
-                .map(|(&l, &r)| eval_binary_i64(*op, l, r))
-                .collect()
+            lhs_vals.iter().zip(rhs_vals.iter()).map(|(&l, &r)| eval_binary_i64(*op, l, r)).collect()
         }
         // Scalar constant (for broadcast cases)
         Op::Const(cv) => vec![match cv.0 {

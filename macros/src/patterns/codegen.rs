@@ -321,6 +321,8 @@ fn collect_op_names_from_pattern(pattern: &Pattern, names: &mut std::collections
         | Pattern::Var(_)
         | Pattern::OpVar { .. }
         | Pattern::ConstWithValue { .. }
+        | Pattern::VConstWithValue { .. }
+        | Pattern::AnyConstWithValue { .. }
         | Pattern::Wildcard
         | Pattern::OptionNone => {}
         // OptionSome has an inner pattern that may contain ops
@@ -404,6 +406,19 @@ fn compute_op_keys(pattern: &Pattern, iter_ctx: Option<&IterContext>) -> Vec<Tok
         // Constants - OpKey::Const
         Pattern::Const(_) | Pattern::ConstWithValue { .. } => {
             vec![quote! { morok_ir::op::pattern_derived::OpKey::Const }]
+        }
+
+        // VConst - OpKey::VConst
+        Pattern::VConstWithValue { .. } => {
+            vec![quote! { morok_ir::op::pattern_derived::OpKey::VConst }]
+        }
+
+        // AnyConst - matches both Const and VConst
+        Pattern::AnyConstWithValue { .. } => {
+            vec![
+                quote! { morok_ir::op::pattern_derived::OpKey::Const },
+                quote! { morok_ir::op::pattern_derived::OpKey::VConst },
+            ]
         }
 
         // Op variable (in for-loop) - get OpKey from iteration context
@@ -579,6 +594,37 @@ fn generate_inline_match(
                         return morok_ir::pattern::RewriteResult::NoMatch;
                     };
                     let #value_name = __cv.0.clone();
+                },
+                vec![(uop_ident, quote! { #tree_var })],
+            ))
+        }
+
+        Pattern::VConstWithValue { uop_name, values_name } => {
+            // Match VConst and extract both the UOp and the values
+            let actual_name = dup_tracker.process_name(&uop_name.to_string());
+            let uop_ident = Ident::new(&actual_name, uop_name.span());
+            Ok(InlineMatchOutput::simple(
+                quote! {
+                    let morok_ir::Op::VConst { values: __vconst_values } = #tree_var.op() else {
+                        return morok_ir::pattern::RewriteResult::NoMatch;
+                    };
+                    let #values_name = __vconst_values.clone();
+                },
+                vec![(uop_ident, quote! { #tree_var })],
+            ))
+        }
+
+        Pattern::AnyConstWithValue { uop_name, values_name } => {
+            // Match either Const or VConst and extract values as Vec<ConstValue>
+            let actual_name = dup_tracker.process_name(&uop_name.to_string());
+            let uop_ident = Ident::new(&actual_name, uop_name.span());
+            Ok(InlineMatchOutput::simple(
+                quote! {
+                    let #values_name: Vec<morok_ir::ConstValue> = match #tree_var.op() {
+                        morok_ir::Op::Const(cv) => vec![cv.0.clone()],
+                        morok_ir::Op::VConst { values } => values.clone(),
+                        _ => return morok_ir::pattern::RewriteResult::NoMatch,
+                    };
                 },
                 vec![(uop_ident, quote! { #tree_var })],
             ))

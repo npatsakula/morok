@@ -269,6 +269,12 @@ pub enum Pattern {
     /// Constant with value extraction: `name@const(value_name)`
     /// Binds both the UOp (to uop_name) and the extracted ConstValue (to value_name)
     ConstWithValue { uop_name: Ident, value_name: Ident },
+    /// VConst with values extraction: `name@vconst(values_name)`
+    /// Binds both the UOp (to uop_name) and the extracted Vec<ConstValue> (to values_name)
+    VConstWithValue { uop_name: Ident, values_name: Ident },
+    /// AnyConst (matches both Const and VConst): `name@anyconst(values_name)`
+    /// Binds the UOp and extracts values as Vec<ConstValue> (Const → single-element Vec)
+    AnyConstWithValue { uop_name: Ident, values_name: Ident },
     /// Alternative patterns: `pat1 | pat2 | pat3` - matches if ANY alternative matches
     Any(Vec<Pattern>),
     /// Permutation pattern: `Add[x, y]` - tries all orderings of arguments
@@ -396,16 +402,19 @@ fn parse_single_pattern(input: ParseStream) -> Result<Pattern> {
         }
     }
 
-    // Check for name@const(value) or name @ pattern
+    // Check for name@const(value), name@vconst(values), name@anyconst(values), or name @ pattern
     if input.peek(Token![@]) {
-        // Use lookahead to check for @const(value) syntax
+        // Use lookahead to check for @const/@vconst/@anyconst(value) syntax
         let lookahead = input.fork();
         lookahead.parse::<Token![@]>()?;
 
-        // Check if next is "const" keyword followed by parentheses
+        // Check if next is a known keyword followed by parentheses
         if lookahead.peek(Ident::peek_any) {
-            let maybe_const: Ident = Ident::parse_any(&lookahead)?;
-            if maybe_const == "const" && lookahead.peek(token::Paren) {
+            let maybe_keyword: Ident = Ident::parse_any(&lookahead)?;
+            let keyword_str = maybe_keyword.to_string();
+
+            // Handle @const(value)
+            if keyword_str == "const" && lookahead.peek(token::Paren) {
                 // Consume @ and const from real stream
                 input.parse::<Token![@]>()?;
                 let _: Ident = Ident::parse_any(input)?; // "const"
@@ -416,6 +425,34 @@ fn parse_single_pattern(input: ParseStream) -> Result<Pattern> {
                 let value_name: Ident = content.parse()?;
 
                 return Ok(Pattern::ConstWithValue { uop_name: ident, value_name });
+            }
+
+            // Handle @vconst(values)
+            if keyword_str == "vconst" && lookahead.peek(token::Paren) {
+                // Consume @ and vconst from real stream
+                input.parse::<Token![@]>()?;
+                let _: Ident = Ident::parse_any(input)?; // "vconst"
+
+                // Parse (values_name)
+                let content;
+                parenthesized!(content in input);
+                let values_name: Ident = content.parse()?;
+
+                return Ok(Pattern::VConstWithValue { uop_name: ident, values_name });
+            }
+
+            // Handle @anyconst(values)
+            if keyword_str == "anyconst" && lookahead.peek(token::Paren) {
+                // Consume @ and anyconst from real stream
+                input.parse::<Token![@]>()?;
+                let _: Ident = Ident::parse_any(input)?; // "anyconst"
+
+                // Parse (values_name)
+                let content;
+                parenthesized!(content in input);
+                let values_name: Ident = content.parse()?;
+
+                return Ok(Pattern::AnyConstWithValue { uop_name: ident, values_name });
             }
         }
 

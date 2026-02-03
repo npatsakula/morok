@@ -1193,7 +1193,14 @@ fn horizontal_reduce(inp: &Arc<UOp>, out_dtype: &DType) -> Vec<Arc<UOp>> {
     }
     let inp_vcount = inp.dtype().vcount();
     let out_vcount = out_dtype.vcount();
-    assert!(inp_vcount.is_multiple_of(out_vcount), "horizontal mismatch: inp.dtype={:?} (vcount={}), out_dtype={:?} (vcount={})", inp.dtype(), inp_vcount, out_dtype, out_vcount);
+    assert!(
+        inp_vcount.is_multiple_of(out_vcount),
+        "horizontal mismatch: inp.dtype={:?} (vcount={}), out_dtype={:?} (vcount={})",
+        inp.dtype(),
+        inp_vcount,
+        out_dtype,
+        out_vcount
+    );
     let horizontal_amount = inp_vcount / out_vcount;
     (0..horizontal_amount).map(|i| inp.gep((i..inp_vcount).step_by(horizontal_amount).collect())).collect()
 }
