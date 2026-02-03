@@ -73,9 +73,7 @@ pub fn rangeify_with_map(
     sink: Arc<UOp>,
     pcontig_config: Option<&super::kernel::PcontigConfig>,
 ) -> morok_ir::Result<RangeifyResult> {
-    use morok_ir::rewrite::{
-        graph_rewrite_bottom_up_with_map, graph_rewrite, graph_rewrite_with_map,
-    };
+    use morok_ir::rewrite::{graph_rewrite, graph_rewrite_bottom_up_with_map, graph_rewrite_with_map};
 
     // Aggregate all becomes_maps from rewrite passes
     let mut all_becomes: HashMap<UOpKey, Arc<UOp>> = HashMap::new();

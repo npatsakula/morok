@@ -270,7 +270,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let s = ctx.get(src);
             let cast_instr = lcast(&src.dtype(), dtype);
 
-            if src.dtype() == *dtype {
+            if ldt(&src.dtype()) == ldt(dtype) {
                 kernel.push(format!("  {dst} = bitcast {} {s} to {}", ldt(&src.dtype()), ldt(dtype)));
             } else {
                 kernel.push(format!("  {dst} = {cast_instr} {} {s} to {}", ldt(&src.dtype()), ldt(dtype)));

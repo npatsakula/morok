@@ -729,8 +729,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         })
         .collect();
 
-    let midx =
-        graph_rewrite(&(symbolic() + load_store_indexing_patterns()), UOp::sink(scalar_indices), &mut ());
+    let midx = graph_rewrite(&(symbolic() + load_store_indexing_patterns()), UOp::sink(scalar_indices), &mut ());
     let Op::Sink { sources } = midx.op() else { return None };
 
     // Extract (valid, root, offset) for each lane

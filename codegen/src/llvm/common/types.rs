@@ -225,7 +225,7 @@ mod tests {
     fn test_lcast_index_type() {
         // Index type (i64) should be treated as signed integer for casting
         assert_eq!(lcast(&DType::Index, &DType::Int32), "trunc");
-        assert_eq!(lcast(&DType::Index, &DType::Int64), "sext"); // same size, but sext is valid
+        assert_eq!(lcast(&DType::Index, &DType::Int64), "sext"); // same size - will be skipped in codegen via ldt() check
         assert_eq!(lcast(&DType::Int32, &DType::Index), "sext");
         // Float to Index
         assert_eq!(lcast(&DType::Float32, &DType::Index), "fptosi");

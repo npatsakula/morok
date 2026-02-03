@@ -1269,6 +1269,11 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
     }
 
     patterns! {
+        // 0. GEP on void: GEP(x, _) where x is void → x
+        // Removes GEP on GROUP, STORE, and other void-typed nodes.
+        // Matches Tinygrad: (UPat(Ops.GEP, src=(UPat(dtype=dtypes.void),)), lambda x: x)
+        Gep { vector, .. } if vector.dtype() == DType::Void ~> |vector| Arc::clone(vector),
+
         // 1. GEP composition: GEP(GEP(x, inner), outer) → GEP(x, inner[outer])
         // Note: nested struct patterns require UOp first field, so we extract inner manually
         Gep { vector, indices } if matches!(vector.op(), Op::Gep { .. }) => |vector, indices| {

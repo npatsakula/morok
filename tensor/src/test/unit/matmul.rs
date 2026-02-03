@@ -383,7 +383,7 @@ fn assert_matmul_close(actual: &ArrayD<f32>, expected: &Array2<f32>, tol: f32) {
 }
 
 #[test]
-// #[tracing_test::traced_test]
+#[tracing_test::traced_test]
 fn test_matmul_validated_2x2() {
     // Simple 2x2 matmul with known values
     let a_data = [1.0f32, 2.0, 3.0, 4.0];
