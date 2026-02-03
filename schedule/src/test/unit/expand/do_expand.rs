@@ -6,11 +6,13 @@
 //! - Broadcasts scalar operands
 //! - Swizzles UNROLL operands with different axes
 //! - Wraps results in UNROLL
+//!
+//! Value assertions match Tinygrad's exact test expectations.
 
 use super::helpers::*;
 use morok_dtype::DType;
 use morok_ir::types::ConstValue;
-use morok_ir::{BinaryOp, Op, UOp};
+use morok_ir::UOp;
 
 // =============================================================================
 // Broadcast Expansion Tests
@@ -20,57 +22,28 @@ use morok_ir::{BinaryOp, Op, UOp};
 ///
 /// Tinygrad: test_expand_add_broadcast
 /// ```python
-/// a = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(range(4))),), ((0,4),))
-/// b = a + 3
-/// # Result VCONST: (3, 4, 5, 6)
+/// e1 = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(range(4))),), ((1,4),))
+/// sink = expander_rewrite(e1+3)
+/// self.assertTupleEqual(sink.src[0].arg, (3,4,5,6))
 /// ```
 #[test]
-#[tracing_test::traced_test]
 fn test_expand_add_broadcast() {
-    // Create UNROLL(VCONST([0,1,2,3]), [(0,4)])
-    let unroll = create_unroll_iota(0, 4);
+    // Create UNROLL(VCONST([0,1,2,3]), [(1,4)])
+    let unroll = create_unroll_iota(1, 4);
 
     // Add scalar constant 3
     let scalar = UOp::const_(DType::Int64, ConstValue::Int(3));
-    let add = UOp::new(Op::Binary(BinaryOp::Add, unroll, scalar), DType::Int64);
+    let add = unroll.try_add(&scalar).unwrap();
 
     // Apply expander
     let result = phase2_only(&add);
 
-    // Result should be UNROLL(VCONST([3,4,5,6]) or Binary with vectorized sources)
-    // After expansion: the scalar is broadcast, the Binary operates on vectors
-    match result.op() {
-        Op::Unroll { src, unroll_axes } => {
-            assert_eq!(unroll_axes, &[(0, 4)], "Should preserve axis");
-            // Inner should be Binary with vectorized operands
-            match src.op() {
-                Op::Binary(BinaryOp::Add, left, right) => {
-                    // Left should be VCONST([0,1,2,3]) or similar
-                    // Right should be broadcast VECTORIZE([3,3,3,3])
-                    assert_eq!(left.dtype().vcount(), 4, "Left operand should be vec4");
-                    assert_eq!(right.dtype().vcount(), 4, "Right operand should be vec4");
-                }
-                // Could also be optimized to VCONST directly
-                Op::VConst { values } => {
-                    let ints: Vec<i64> = values
-                        .iter()
-                        .map(|v| match v {
-                            ConstValue::Int(i) => *i,
-                            _ => panic!("Expected Int"),
-                        })
-                        .collect();
-                    assert_eq!(ints, vec![3, 4, 5, 6]);
-                }
-                other => panic!("Expected Binary or VConst, got {:?}", other),
-            }
-        }
-        // If no UNROLL wrapping, check for direct result
-        Op::Binary(BinaryOp::Add, _, _) => {
-            // Expansion happened but lifted UNROLL
-            assert_eq!(result.dtype().vcount(), 4, "Result should be vec4");
-        }
-        other => panic!("Expected UNROLL or Binary, got {:?}", other),
-    }
+    // Assert exact values like Tinygrad: (3, 4, 5, 6)
+    assert_result_values(&result, &[3, 4, 5, 6]);
+
+    // Also verify UNROLL structure
+    let (_, axes) = unwrap_unroll(&result);
+    assert_eq!(axes, vec![(1, 4)], "Should preserve axis");
 }
 
 // =============================================================================
@@ -81,49 +54,31 @@ fn test_expand_add_broadcast() {
 ///
 /// Tinygrad: test_expand_same_axis
 /// ```python
-/// a = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(range(4))),), ((0,4),))
-/// b = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(x*5 for x in range(4))),), ((0,4),))
-/// c = a + b
-/// # Result: (0, 6, 12, 18) = (0+0, 1+5, 2+10, 3+15)
+/// e1 = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(range(4))),), ((1,4),))
+/// e2 = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(x*4 for x in range(4))),), ((1,4),))
+/// sink = expander_rewrite(e1+e2)
+/// self.assertTupleEqual(sink.src[0].arg, (0, 5, 10, 15))
 /// ```
 #[test]
 fn test_expand_same_axis() {
-    // Create UNROLL(VCONST([0,1,2,3]), [(0,4)])
-    let unroll_a = create_unroll_iota(0, 4);
+    // Create UNROLL(VCONST([0,1,2,3]), [(1,4)])
+    let e1 = create_unroll_iota(1, 4);
 
-    // Create UNROLL(VCONST([0,5,10,15]), [(0,4)])
-    let unroll_b = create_unroll_scaled(0, 4, 5);
+    // Create UNROLL(VCONST([0,4,8,12]), [(1,4)])
+    let e2 = create_unroll_scaled(1, 4, 4);
 
     // Add them
-    let add = UOp::new(Op::Binary(BinaryOp::Add, unroll_a, unroll_b), DType::Int64);
+    let add = e1.try_add(&e2).unwrap();
 
     // Apply expander
     let result = phase2_only(&add);
 
-    // Result should be UNROLL with sum [0, 6, 12, 18]
-    // (0+0=0, 1+5=6, 2+10=12, 3+15=18)
-    match result.op() {
-        Op::Unroll { src, unroll_axes } => {
-            assert_eq!(unroll_axes, &[(0, 4)], "Should preserve axis");
-            match src.op() {
-                Op::Binary(BinaryOp::Add, _, _) => {
-                    assert_eq!(src.dtype().vcount(), 4, "Inner binary should be vec4");
-                }
-                Op::VConst { values } => {
-                    let ints: Vec<i64> = values
-                        .iter()
-                        .map(|v| match v {
-                            ConstValue::Int(i) => *i,
-                            _ => panic!("Expected Int"),
-                        })
-                        .collect();
-                    assert_eq!(ints, vec![0, 6, 12, 18]);
-                }
-                other => panic!("Expected Binary or VConst, got {:?}", other),
-            }
-        }
-        other => panic!("Expected UNROLL, got {:?}", other),
-    }
+    // Assert exact values: 0+0=0, 1+4=5, 2+8=10, 3+12=15
+    assert_result_values(&result, &[0, 5, 10, 15]);
+
+    // Verify UNROLL structure
+    let (_, axes) = unwrap_unroll(&result);
+    assert_eq!(axes, vec![(1, 4)], "Should preserve axis");
 }
 
 // =============================================================================
@@ -134,66 +89,178 @@ fn test_expand_same_axis() {
 ///
 /// Tinygrad: test_expand_different_axis
 /// ```python
-/// a = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(range(4))),), ((1,4),))
-/// b = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(range(4))),), ((2,4),))
-/// c = a + b
-/// # Result: axes=((1,4),(2,4)), values=(0..16)
+/// e1 = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(x*4 for x in range(4))),), ((1,4),))
+/// e2 = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(4), tuple(range(4))),), ((2,4),))
+/// sink = expander_rewrite(e1+e2)
+/// self.assertTupleEqual(sink.arg, ((1, 4), (2, 4)))
+/// self.assertTupleEqual(sink.src[0].arg, tuple(range(16)))
 /// ```
 #[test]
 fn test_expand_different_axis() {
-    // Create UNROLL(VCONST([0,1,2,3]), [(1,4)])
-    let unroll_a = create_unroll_iota(1, 4);
+    // Create UNROLL(VCONST([0,4,8,12]), [(1,4)])
+    let e1 = create_unroll_scaled(1, 4, 4);
 
     // Create UNROLL(VCONST([0,1,2,3]), [(2,4)])
-    let unroll_b = create_unroll_iota(2, 4);
+    let e2 = create_unroll_iota(2, 4);
 
     // Add them
-    let add = UOp::new(Op::Binary(BinaryOp::Add, unroll_a, unroll_b), DType::Int64);
+    let add = e1.try_add(&e2).unwrap();
 
     // Apply expander
     let result = phase2_only(&add);
 
-    // When combining different axes, the result has both axes
-    // The expansion size is 4*4=16
-    match result.op() {
-        Op::Unroll { src, unroll_axes } => {
-            // Combined axes should be [(1,4), (2,4)] (sorted by axis id)
-            assert_eq!(unroll_axes.len(), 2, "Should have two axes");
-            assert!(unroll_axes.contains(&(1, 4)), "Should contain axis 1");
-            assert!(unroll_axes.contains(&(2, 4)), "Should contain axis 2");
-            // Inner should be vec16
-            assert_eq!(src.dtype().vcount(), 16, "Inner should be vec16");
-        }
-        other => panic!("Expected UNROLL, got {:?}", other),
-    }
+    // When combining different axes, the result expands to 4*4=16 values.
+    // Values follow the pattern: axis1_val + axis2_val
+    // Row-major iteration: axis 1 is outer (slower), axis 2 is inner (faster)
+    // (0,0)=0, (0,1)=1, (0,2)=2, (0,3)=3, (1,0)=4, (1,1)=5, ...
+    // = 0+0, 0+1, 0+2, 0+3, 4+0, 4+1, 4+2, 4+3, 8+0, 8+1, 8+2, 8+3, 12+0, 12+1, 12+2, 12+3
+    let expected: Vec<i64> = (0..16).collect();
+    assert_result_values(&result, &expected);
+
+    // Verify axes
+    let (_, axes) = unwrap_unroll(&result);
+    assert_eq!(axes, vec![(1, 4), (2, 4)], "Should have both axes");
 }
 
 /// Test: Two UNROLLs with different axes (operands flipped)
 ///
 /// Tinygrad: test_expand_different_axis_flip
-/// Same as above but with operand order reversed - result should be identical.
+/// Same values but operands reversed.
 #[test]
 fn test_expand_different_axis_flip() {
     // Create UNROLL(VCONST([0,1,2,3]), [(2,4)])
-    let unroll_b = create_unroll_iota(2, 4);
+    let e2 = create_unroll_iota(2, 4);
 
-    // Create UNROLL(VCONST([0,1,2,3]), [(1,4)])
-    let unroll_a = create_unroll_iota(1, 4);
+    // Create UNROLL(VCONST([0,4,8,12]), [(1,4)])
+    let e1 = create_unroll_scaled(1, 4, 4);
 
-    // Add them (flipped order vs test_expand_different_axis)
-    let add = UOp::new(Op::Binary(BinaryOp::Add, unroll_b, unroll_a), DType::Int64);
+    // Add them (flipped order)
+    let add = e2.try_add(&e1).unwrap();
 
     // Apply expander
     let result = phase2_only(&add);
 
-    // Same result as test_expand_different_axis
-    match result.op() {
-        Op::Unroll { src, unroll_axes } => {
-            assert_eq!(unroll_axes.len(), 2, "Should have two axes");
-            assert!(unroll_axes.contains(&(1, 4)), "Should contain axis 1");
-            assert!(unroll_axes.contains(&(2, 4)), "Should contain axis 2");
-            assert_eq!(src.dtype().vcount(), 16, "Inner should be vec16");
-        }
-        other => panic!("Expected UNROLL, got {:?}", other),
-    }
+    // Same result as test_expand_different_axis (addition is commutative)
+    let expected: Vec<i64> = (0..16).collect();
+    assert_result_values(&result, &expected);
+
+    // Verify axes
+    let (_, axes) = unwrap_unroll(&result);
+    assert_eq!(axes, vec![(1, 4), (2, 4)], "Should have both axes");
+}
+
+// =============================================================================
+// Three-Axis Expansion Tests
+// =============================================================================
+
+/// Test: Three UNROLLs with different axes
+///
+/// This extends Tinygrad's pattern to verify 3D expansion.
+#[test]
+fn test_expand_three_axes() {
+    // Create UNROLL with axis 1 (stride 4): [0, 4, 8, 12]
+    let e1 = create_unroll_scaled(1, 4, 4);
+
+    // Create UNROLL with axis 2 (stride 1): [0, 1, 2, 3]
+    let e2 = create_unroll_iota(2, 4);
+
+    // Create UNROLL with axis 3 (stride 16): [0, 16, 32, 48]
+    let e3 = create_unroll_scaled(3, 4, 16);
+
+    // Build: e1 + e2 + e3
+    let sum = e1.try_add(&e2).unwrap().try_add(&e3).unwrap();
+
+    // Apply expander
+    let result = phase2_only(&sum);
+
+    // Result should have 4*4*4=64 elements
+    // Verify axes
+    let (src, axes) = unwrap_unroll(&result);
+    assert_eq!(axes, vec![(1, 4), (2, 4), (3, 4)], "Should have three axes");
+    assert_eq!(src.dtype().vcount(), 64, "Inner should be vec64");
+}
+
+// =============================================================================
+// Multiplication Expansion Tests
+// =============================================================================
+
+/// Test: UNROLL * scalar
+#[test]
+fn test_expand_mul_broadcast() {
+    // Create UNROLL(VCONST([0,1,2,3]), [(1,4)])
+    let unroll = create_unroll_iota(1, 4);
+
+    // Multiply by scalar 2
+    let scalar = UOp::const_(DType::Int64, ConstValue::Int(2));
+    let mul = unroll.try_mul(&scalar).unwrap();
+
+    // Apply expander
+    let result = phase2_only(&mul);
+
+    // Expected: [0*2, 1*2, 2*2, 3*2] = [0, 2, 4, 6]
+    assert_result_values(&result, &[0, 2, 4, 6]);
+}
+
+/// Test: Two UNROLLs multiplied (same axis)
+#[test]
+fn test_expand_mul_same_axis() {
+    // Create UNROLL(VCONST([1,2,3,4]), [(1,4)])
+    let e1 = create_unroll_values(1, vec![1, 2, 3, 4]);
+
+    // Create UNROLL(VCONST([1,2,3,4]), [(1,4)])
+    let e2 = create_unroll_values(1, vec![1, 2, 3, 4]);
+
+    // Multiply them
+    let mul = e1.try_mul(&e2).unwrap();
+
+    // Apply expander
+    let result = phase2_only(&mul);
+
+    // Expected: [1*1, 2*2, 3*3, 4*4] = [1, 4, 9, 16]
+    assert_result_values(&result, &[1, 4, 9, 16]);
+}
+
+// =============================================================================
+// Subtraction Expansion Tests
+// =============================================================================
+
+/// Test: UNROLL - scalar
+#[test]
+fn test_expand_sub_broadcast() {
+    // Create UNROLL(VCONST([10,20,30,40]), [(1,4)])
+    let unroll = create_unroll_values(1, vec![10, 20, 30, 40]);
+
+    // Subtract scalar 5
+    let scalar = UOp::const_(DType::Int64, ConstValue::Int(5));
+    let sub = unroll.try_sub(&scalar).unwrap();
+
+    // Apply expander
+    let result = phase2_only(&sub);
+
+    // Expected: [10-5, 20-5, 30-5, 40-5] = [5, 15, 25, 35]
+    assert_result_values(&result, &[5, 15, 25, 35]);
+}
+
+// =============================================================================
+// Mixed Operations Expansion Tests
+// =============================================================================
+
+/// Test: (UNROLL + scalar) * UNROLL
+///
+/// Verifies that compound expressions expand correctly.
+#[test]
+fn test_expand_compound_expression() {
+    // Create UNROLL(VCONST([0,1,2,3]), [(1,4)])
+    let e1 = create_unroll_iota(1, 4);
+
+    // Create UNROLL(VCONST([2,2,2,2]), [(1,4)])
+    let e2 = create_unroll_values(1, vec![2, 2, 2, 2]);
+
+    // Build: (e1 + 1) * e2 = ([0,1,2,3] + 1) * [2,2,2,2]
+    let scalar = UOp::const_(DType::Int64, ConstValue::Int(1));
+    let sum = e1.try_add(&scalar).unwrap();
+    let result = phase2_only(&sum.try_mul(&e2).unwrap());
+
+    // Expected: [1*2, 2*2, 3*2, 4*2] = [2, 4, 6, 8]
+    assert_result_values(&result, &[2, 4, 6, 8]);
 }

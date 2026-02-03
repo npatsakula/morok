@@ -13,7 +13,7 @@ use crate::{
 // ============================================================================
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_add_f32_simple() {
     let _guard = test_setup();
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);

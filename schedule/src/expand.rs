@@ -188,10 +188,17 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     let ast = graph_rewrite_bottom_up(&phase1, ast.clone(), &mut ());
 
     // Phase 2: Expander + symbolic (Tinygrad: sym + pm_pre_expander + pm_group_for_reduce + expander)
-    // Combines symbolic simplification with expansion for single-pass efficiency.
-    // Uses bottom-up: children transformed before parents, matching Tinygrad's
-    // actual behavior (despite their "bottom_up=False" naming).
-    let phase2 = symbolic_simple() + pm_group_for_reduce() + phase2_expand();
+    //
+    // Pattern order matches Tinygrad exactly:
+    // 1. symbolic_simple() - algebraic simplifications
+    // 2. pm_pre_expander() - Range→UNROLL, fix_reduce_unroll, fix_store_unroll
+    // 3. pm_group_for_reduce() - GROUP_REDUCE → shared memory pattern
+    // 4. expander() - do_expand, do_contract, BARRIER handling
+    //
+    // CRITICAL: pm_pre_expander MUST run BEFORE pm_group_for_reduce!
+    // fix_reduce_unroll partitions REDUCE ranges (wraps UNROLL in CONTRACT),
+    // which must happen before fix_group_for_reduce transforms GROUP_REDUCE.
+    let phase2 = symbolic_simple() + pm_pre_expander() + pm_group_for_reduce() + expander();
     graph_rewrite_bottom_up(&phase2, ast, &mut ())
 }
 
@@ -219,22 +226,66 @@ fn phase1_range_to_unroll() -> TypedPatternMatcher {
     }
 }
 
-/// Phase 2: Fix REDUCE/STORE and expand all operations using UNROLL.
+/// Pre-expander patterns that run BEFORE pm_group_for_reduce.
 ///
-/// Based on Tinygrad's expander TypedPatternMatcher (expander.py:84-108).
-pub fn phase2_expand() -> TypedPatternMatcher {
-    // Pattern order MUST match Tinygrad's pm_pre_expander + expander order:
-    // 1. convert_range_to_unroll (Range → UNROLL)
-    // 2. fix_reduce_unroll (REDUCE with UNROLL → CONTRACT(REDUCE))
-    // 3. fix_store_unroll (STORE with UNROLL → CONTRACT(STORE))  <- BEFORE do_expand!
-    // 4. do_expand (expand ops with UNROLL sources)
-    // 5. do_contract (CONTRACT(UNROLL) → GEP)
-    //
-    // Critical: fix_store_unroll MUST run BEFORE do_expand!
-    // Otherwise do_expand processes STORE first, changing the tree structure.
+/// Based on Tinygrad's pm_pre_expander (expander.py:143-151):
+/// - Range(Upcast/Unroll) → UNROLL conversion
+/// - fix_reduce_unroll: partition REDUCE ranges, wrap UNROLL in CONTRACT
+/// - fix_store_unroll: partition STORE ranges, wrap in CONTRACT
+///
+/// These patterns prepare REDUCE/STORE for the main expander by:
+/// 1. Converting Upcast/Unroll ranges to UNROLL ops with const vectors
+/// 2. Partitioning REDUCE ranges so only Range ops remain (UNROLL → CONTRACT)
+/// 3. Partitioning STORE ranges similarly
+pub fn pm_pre_expander() -> TypedPatternMatcher {
     crate::patterns! {
         // =====================================================================
-        // Phase 2a: Push broadcast through AFTER/END (Tinygrad expander.py:84-85)
+        // Range conversion (pm_pre_expander pattern 1)
+        // =====================================================================
+
+        // Convert Range(Upcast/Unroll) to UNROLL op
+        // This runs FIRST so that UNROLL is available for subsequent patterns
+        // NOTE: Reduce ranges are NOT converted here - they remain as ranges for REDUCE.ranges
+        range @ Range { end: _end @const(cv), axis_id, axis_type }
+            if matches!(axis_type, AxisType::Upcast | AxisType::Unroll) => |range| {
+            let size = const_to_usize(&cv)?;
+            let values: Vec<ConstValue> = (0..size as i64).map(ConstValue::Int).collect();
+            let vconst = UOp::vconst(values);
+            Some(vconst.unroll_with_dtype(vec![(axis_id.value(), size)], range.dtype()))
+        },
+
+        // =====================================================================
+        // Pre-expansion REDUCE/STORE fixes (pm_pre_expander patterns 2-3)
+        // =====================================================================
+
+        // Fix REDUCE with non-Range entries in ranges
+        // This detects Upcast axes and sets Vector dtype for K-vectorization
+        reduce @ Reduce(_, ..) => |reduce| fix_reduce_unroll(reduce),
+
+        // Fix STORE with UNROLL in ranges/index - wrap in CONTRACT
+        // MUST run BEFORE do_expand! Tinygrad's fix_store_unroll is in pm_pre_expander.
+        store if matches!(store.op(), Op::Store { .. }) => |store| fix_store_unroll(store),
+
+        // Handle END with UNROLL ranges
+        end @ End(_, ..) => |end| end_unrolls(end),
+    }
+}
+
+/// Main expander patterns that run AFTER pm_group_for_reduce.
+///
+/// Based on Tinygrad's expander (expander.py:84-108):
+/// - Push AFTER/END through broadcast VECTORIZE
+/// - Collapse nested UNROLL
+/// - do_expand: expand ops with UNROLL inputs
+/// - do_contract: CONTRACT(UNROLL) → GEP
+/// - Handle BARRIER with UNROLL
+///
+/// These patterns propagate UNROLL through the computation graph,
+/// vectorizing operations and collapsing via CONTRACT when needed.
+pub fn expander() -> TypedPatternMatcher {
+    crate::patterns! {
+        // =====================================================================
+        // Push broadcast through AFTER/END (Tinygrad expander.py:84-85)
         // =====================================================================
         // These patterns push AFTER and END inside broadcast (VECTORIZE with all same elements).
         // This is necessary for WMMA and complex kernel generation.
@@ -254,43 +305,16 @@ pub fn phase2_expand() -> TypedPatternMatcher {
         },
 
         // =====================================================================
-        // Phase 2b: Range conversion (pm_pre_expander pattern 1)
+        // BUFFERIZE with UNROLL (Tinygrad expander.py:91-92)
         // =====================================================================
-
-        // Convert Range(Upcast/Unroll) to UNROLL op
-        // This runs FIRST so that UNROLL is available for subsequent patterns
-        // NOTE: Reduce ranges are NOT converted here - they remain as ranges for REDUCE.ranges
-        range @ Range { end: _end @const(cv), axis_id, axis_type }
-            if matches!(axis_type, AxisType::Upcast | AxisType::Unroll) => |range| {
-            let size = const_to_usize(&cv)?;
-            let values: Vec<ConstValue> = (0..size as i64).map(ConstValue::Int).collect();
-            let vconst = UOp::vconst(values);
-            Some(vconst.unroll_with_dtype(vec![(axis_id.value(), size)], range.dtype()))
-        },
-
-        // =====================================================================
-        // Phase 2b: Pre-expansion REDUCE/STORE fixes (pm_pre_expander patterns 2-3)
-        // =====================================================================
-
-        // Fix REDUCE with non-Range entries in ranges
-        // This detects Upcast axes and sets Vector dtype for K-vectorization
-        reduce @ Reduce(_, ..) => |reduce| fix_reduce_unroll(reduce),
-
-        // Fix STORE with UNROLL in ranges/index - wrap in CONTRACT
-        // MUST run BEFORE do_expand! Tinygrad's fix_store_unroll is in pm_pre_expander.
-        store if matches!(store.op(), Op::Store { .. }) => |store| fix_store_unroll(store),
-
-        // Handle END with UNROLL ranges
-        end @ End(_, ..) => |end| end_unrolls(end),
 
         // BUFFERIZE with two UNROLL sources: wrap both in CONTRACT
-        // (Tinygrad expander.py:91-92)
         bufferize if matches!(bufferize.op(), Op::Bufferize { .. }) => |bufferize| {
             fix_bufferize_unroll(bufferize)
         },
 
         // =====================================================================
-        // Phase 2c: Core expansion (expander patterns)
+        // Core expansion patterns
         // =====================================================================
 
         // Collapse nested UNROLL BEFORE do_expand (Tinygrad expander.py:94-95)
@@ -315,7 +339,7 @@ pub fn phase2_expand() -> TypedPatternMatcher {
         },
 
         // =====================================================================
-        // Phase 2e: Cleanup
+        // Cleanup
         // =====================================================================
 
         // Remove empty UNROLL: UNROLL(x, ()) → x

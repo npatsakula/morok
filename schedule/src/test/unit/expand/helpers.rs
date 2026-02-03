@@ -25,8 +25,15 @@ pub fn expander_rewrite(uop: &Arc<UOp>) -> Arc<UOp> {
 ///
 /// Useful for testing do_expand, do_contract directly when starting
 /// from manually constructed UNROLL/CONTRACT operations.
+///
+/// NOTE: Does NOT include symbolic_simple() to preserve REDUCE structure
+/// for fix_reduce tests. Use extract_result_values() to evaluate Binary
+/// operations on constants for value assertions.
 pub fn phase2_only(uop: &Arc<UOp>) -> Arc<UOp> {
-    let phase2 = crate::expand::phase2_expand();
+    // Combine all phase2 patterns: pm_pre_expander + pm_group_for_reduce + expander
+    let phase2 = crate::expand::pm_pre_expander()
+        + crate::expand::pm_group_for_reduce()
+        + crate::expand::expander();
     graph_rewrite_bottom_up(&phase2, uop.clone(), &mut ())
 }
 
@@ -403,4 +410,158 @@ pub fn count_contracts(uop: &Arc<UOp>) -> usize {
 /// Count UNROLL operations in the tree.
 pub fn count_unrolls(uop: &Arc<UOp>) -> usize {
     count_ops(uop, |u| matches!(u.op(), Op::Unroll { .. }))
+}
+
+// =============================================================================
+// Value Extraction Helpers (for Tinygrad-style value assertions)
+// =============================================================================
+
+/// Extract integer values from expanded result.
+///
+/// Handles the common result patterns after expansion:
+/// - VCONST: direct values
+/// - UNROLL(VCONST): unwrap and extract values
+/// - GEP(VCONST, indices): extract values at indices
+/// - UNROLL(GEP(...)): unwrap UNROLL, then extract GEP
+/// - Binary(VCONST, VCONST): evaluate operation (constant folding)
+/// - Binary(VCONST, Const): broadcast scalar and evaluate
+///
+/// # Panics
+/// Panics if the UOp structure doesn't match expected patterns.
+pub fn extract_result_values(uop: &Arc<UOp>) -> Vec<i64> {
+    use morok_ir::types::BinaryOp;
+
+    match uop.op() {
+        Op::VConst { values } => extract_const_values(values),
+        Op::Unroll { src, .. } => extract_result_values(src),
+        Op::Gep { vector, indices } => {
+            let src_values = extract_result_values(vector);
+            indices.iter().map(|&i| src_values[i]).collect()
+        }
+        Op::Vectorize { elements } => {
+            // VECTORIZE of scalar constants
+            elements
+                .iter()
+                .map(|e| match e.op() {
+                    Op::Const(cv) => match cv.0 {
+                        ConstValue::Int(i) => i,
+                        ConstValue::UInt(u) => u as i64,
+                        _ => panic!("Expected integer constant in VECTORIZE"),
+                    },
+                    // Recurse for nested structures
+                    _ => {
+                        let vals = extract_result_values(e);
+                        assert_eq!(vals.len(), 1, "Expected scalar in VECTORIZE element");
+                        vals[0]
+                    }
+                })
+                .collect()
+        }
+        // Binary operations: evaluate if operands are extractable
+        Op::Binary(op, lhs, rhs) => {
+            let lhs_vals = extract_result_values(lhs);
+            let rhs_vals = extract_result_values(rhs);
+
+            // Handle broadcast: scalar applied to vector
+            let (lhs_vals, rhs_vals) = match (lhs_vals.len(), rhs_vals.len()) {
+                (1, n) => (vec![lhs_vals[0]; n], rhs_vals),
+                (n, 1) => (lhs_vals, vec![rhs_vals[0]; n]),
+                (a, b) if a == b => (lhs_vals, rhs_vals),
+                (a, b) => panic!("Mismatched vector lengths: {} vs {}", a, b),
+            };
+
+            lhs_vals
+                .iter()
+                .zip(rhs_vals.iter())
+                .map(|(&l, &r)| eval_binary_i64(*op, l, r))
+                .collect()
+        }
+        // Scalar constant (for broadcast cases)
+        Op::Const(cv) => vec![match cv.0 {
+            ConstValue::Int(i) => i,
+            ConstValue::UInt(u) => u as i64,
+            _ => panic!("Expected integer constant"),
+        }],
+        _ => panic!("Cannot extract values from {:?}", uop.op().as_ref()),
+    }
+}
+
+/// Evaluate binary operation on i64 values.
+fn eval_binary_i64(op: morok_ir::types::BinaryOp, lhs: i64, rhs: i64) -> i64 {
+    use morok_ir::types::BinaryOp;
+    match op {
+        BinaryOp::Add => lhs.wrapping_add(rhs),
+        BinaryOp::Sub => lhs.wrapping_sub(rhs),
+        BinaryOp::Mul => lhs.wrapping_mul(rhs),
+        BinaryOp::Idiv => lhs / rhs,
+        BinaryOp::Mod => lhs % rhs,
+        BinaryOp::Max => lhs.max(rhs),
+        BinaryOp::And => lhs & rhs,
+        BinaryOp::Or => lhs | rhs,
+        BinaryOp::Xor => lhs ^ rhs,
+        BinaryOp::Shl => lhs << rhs,
+        BinaryOp::Shr => lhs >> rhs,
+        _ => panic!("Unsupported binary op for i64 eval: {:?}", op),
+    }
+}
+
+/// Extract i64 values from ConstValue slice.
+fn extract_const_values(values: &[ConstValue]) -> Vec<i64> {
+    values
+        .iter()
+        .map(|v| match v {
+            ConstValue::Int(i) => *i,
+            ConstValue::UInt(u) => *u as i64,
+            other => panic!("Expected integer in VCONST, got {:?}", other),
+        })
+        .collect()
+}
+
+/// Assert exact output values after expansion.
+///
+/// Extracts values from the result and compares against expected.
+/// This enables Tinygrad-style value assertions like:
+/// `assertTupleEqual(sink.src[0].arg, (3,4,5,6))`
+///
+/// # Example
+/// ```ignore
+/// let unroll = create_unroll_iota(0, 4);  // [0,1,2,3]
+/// let scalar = UOp::const_(DType::Int64, ConstValue::Int(3));
+/// let add = unroll.try_add(&scalar).unwrap();
+/// let result = expander_rewrite(&add);
+/// assert_result_values(&result, &[3, 4, 5, 6]);
+/// ```
+pub fn assert_result_values(uop: &Arc<UOp>, expected: &[i64]) {
+    let actual = extract_result_values(uop);
+    assert_eq!(actual, expected, "Result values mismatch");
+}
+
+/// Try to extract values, returning None if structure doesn't match.
+///
+/// Unlike extract_result_values, this doesn't panic on unsupported patterns.
+pub fn try_extract_values(uop: &Arc<UOp>) -> Option<Vec<i64>> {
+    match uop.op() {
+        Op::VConst { values } => Some(extract_const_values(values)),
+        Op::Unroll { src, .. } => try_extract_values(src),
+        Op::Gep { vector, indices } => {
+            let src_values = try_extract_values(vector)?;
+            Some(indices.iter().map(|&i| src_values[i]).collect())
+        }
+        Op::Vectorize { elements } => {
+            let mut values = Vec::with_capacity(elements.len());
+            for e in elements.iter() {
+                if let Op::Const(cv) = e.op() {
+                    match cv.0 {
+                        ConstValue::Int(i) => values.push(i),
+                        ConstValue::UInt(u) => values.push(u as i64),
+                        _ => return None,
+                    }
+                } else {
+                    return None;
+                }
+            }
+            Some(values)
+        }
+        _ => None,
+    }
 }

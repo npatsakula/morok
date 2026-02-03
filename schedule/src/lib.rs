@@ -45,7 +45,7 @@ pub use morok_ir::rewrite::graph_rewrite_top_down;
 pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, run_kernel_split_pipeline};
 
 // Re-export expand pass
-pub use expand::{pm_group_for_reduce, pre_expand};
+pub use expand::{expander, pm_group_for_reduce, pm_pre_expander, pre_expand};
 
 // Re-export devectorize pass
 pub use devectorize::devectorize;

@@ -479,7 +479,7 @@ fn test_matmul_validated_16x16() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_matmul_validated_32x32() {
     // Test with 32x32 to exercise more optimization paths
     const SIZE: usize = 32;
