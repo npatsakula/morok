@@ -52,7 +52,7 @@ Compare with Tinygrad's output using the `/tinygrad` skill to isolate broken pat
 | | 12: Add GPU Dims | Same as Stage 11 | `"Stage 12: add gpudims complete"` | After SPECIAL injection |
 | | 13: Add Loads | Same as Stage 11 | `"Stage 13: add loads complete"` | After LOAD wrapping |
 | | 14: Devectorize | Same as Stage 11 | `"Stage 14: devectorize complete"` | After hardware lowering |
-| | 15: Lower Index Dtype | (not logged separately) | After Index→i32/i64 |
+| | 15: Lower Index Dtype | `morok_schedule::optimizer=debug` | `"after pm_lower_index_dtype"` | After Index→i32/i64 |
 | **LINEARIZER** | 16: Post-Index Symbolic | (not logged separately) | Final cleanup |
 | | 17: Pre-Matcher | (not logged separately) | Backend-specific patterns |
 | | 18: Decompositions | (not logged separately) | Late rewrites |

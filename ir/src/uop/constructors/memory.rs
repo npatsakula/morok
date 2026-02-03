@@ -59,7 +59,7 @@ impl UOp {
         // Validate that all indices have Index dtype
         for idx in &indices {
             let idx_dtype = idx.dtype();
-            ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
+            ensure!([DType::Index, DType::Int64].contains(&idx_dtype), IndexTypeMismatchSnafu { actual: idx_dtype });
         }
 
         // Use provided dtype or derive element type from buffer

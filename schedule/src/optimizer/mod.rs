@@ -207,34 +207,10 @@ pub fn apply_post_optimization_with_renderer(
     };
     tracing::debug!(ast.optimized = with_gpudims.tree(), "after pm_add_gpudims");
 
-    // =========================================================================
-    // Stage 15: Index dtype lowering (Tinygrad: pm_lower_index_dtype)
-    // =========================================================================
-    // Convert abstract Index dtype to concrete i32/i64 based on value bounds.
-    // - CONST with Index → CONST with i32/i64 based on value
-    // - SPECIAL (gidx, lidx) → always i32 (GPU indices are 32-bit)
-    // - DEFINE_VAR → i32 if bounds fit, else i64
-    // - RANGE end → lowered based on bounds
-    //
-    // Must run AFTER pm_add_gpudims (which creates SPECIAL ops) and BEFORE pm_add_loads.
-    let with_lowered_idx = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), with_gpudims, &mut ());
-    tracing::debug!(ast.optimized = with_lowered_idx.tree(), "Stage 15: after pm_lower_index_dtype");
-
-    // =========================================================================
-    // Stage 16: Post-Index Symbolic (simplified - no GEP pushing)
-    // =========================================================================
-    // Constant folding after index lowering - CONST(Index) → CONST(i32) simplifications.
-    // Uses symbolic_simple() (not full symbolic()) because:
-    // - GEP pushing already runs after pm_reduce (line 191)
-    // - GEP pushing runs again in cleanup (line 254)
-    // - Index lowering doesn't create GEPs - those come from devectorization later
-    let with_lowered_idx = graph_rewrite(&symbolic_simple(), with_lowered_idx, &mut ());
-    tracing::debug!(ast.optimized = with_lowered_idx.tree(), "Stage 16: after post-index symbolic");
-
     // Add explicit LOAD ops for INDEX sources consumed by arithmetic ops.
     // This separates INDEX (returns indices for STORE scatter) from LOAD (performs gather).
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
-    let with_loads = graph_rewrite(&pm_add_loads(), with_lowered_idx, &mut ());
+    let with_loads = graph_rewrite(&pm_add_loads(), with_gpudims, &mut ());
 
     // ALU Devectorization + VECTORIZE Normalization
     //
@@ -291,6 +267,21 @@ pub fn apply_post_optimization_with_renderer(
     tracing::debug!(ast.optimized = reduce_devec.tree(), "after pm_reduce_devectorize");
 
     // =========================================================================
+    // Index dtype lowering (Tinygrad: pm_lower_index_dtype)
+    // =========================================================================
+    // Convert abstract Index dtype to concrete i32/i64 based on value bounds.
+    // Must run AFTER devectorize (which creates VECTORIZE nodes with Index dtype)
+    // so that all Index operations are properly lowered before codegen.
+    //
+    // Tinygrad runs devectorize BEFORE pm_lower_index_dtype for this reason.
+    let with_lowered_idx = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), reduce_devec, &mut ());
+    tracing::debug!(ast.optimized = with_lowered_idx.tree(), "after pm_lower_index_dtype");
+
+    // Post-Index Symbolic: Constant folding after index lowering.
+    let with_lowered_idx = graph_rewrite(&symbolic_simple(), with_lowered_idx, &mut ());
+    tracing::debug!(ast.optimized = with_lowered_idx.tree(), "after post-index symbolic");
+
+    // =========================================================================
     // Stage 18: Late rewrite patterns (Tinygrad: pm_decomp = symbolic_simple + get_late_rewrite_patterns)
     // =========================================================================
     // Apply decomposition patterns based on renderer capabilities.
@@ -304,7 +295,7 @@ pub fn apply_post_optimization_with_renderer(
     // Currently we always apply FMA decomposition for float types since most
     // backends benefit from explicit FMA ops (LLVM generates fma intrinsics).
     let pm_decomp = symbolic_simple() + get_late_rewrite_patterns(renderer);
-    let decomposed = graph_rewrite(&pm_decomp, reduce_devec, &mut ());
+    let decomposed = graph_rewrite(&pm_decomp, with_lowered_idx, &mut ());
     tracing::debug!(ast.optimized = decomposed.tree(), "Stage 18: after pm_decomp");
 
     // =========================================================================

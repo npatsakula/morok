@@ -6,6 +6,7 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
+use morok_ir::AxisType;
 use morok_ir::UOp;
 use morok_ir::op::Op;
 use morok_ir::types::ConstValue;
@@ -433,6 +434,10 @@ pub fn linearize_with_edges(sink: Arc<UOp>, edges: &HashMap<UOpKey, Arc<UOp>>) -
 /// The run count estimates how many times this operation executes,
 /// based on the loop bounds of enclosing ranges that are CURRENTLY ACTIVE.
 ///
+/// Thread ranges are EXCLUDED because they're pseudo-loops for codegen
+/// structure, not actual loops. Instructions that depend on thread_id
+/// should still be placed in the entry block.
+///
 /// This matches Tinygrad's linearizer where `run_count = prod([int(r.vmax)+1 for r in u.ranges])`
 /// and `u.ranges` returns only ranges that haven't been ended yet at that point.
 fn compute_run_count(uop: &Arc<UOp>) -> u64 {
@@ -447,12 +452,17 @@ fn compute_run_count(uop: &Arc<UOp>) -> u64 {
 
     in_scope
         .iter()
-        .map(|key| {
+        .filter_map(|key| {
+            // Exclude Thread ranges - they're pseudo-loops, not real loops
+            if let Op::Range { axis_type, .. } = key.0.op()
+                && matches!(axis_type, AxisType::Thread) {
+                    return None;
+                }
             // Get the maximum value of the range
             match key.0.vmax() {
-                ConstValue::Int(v) => (v + 1) as u64,
-                ConstValue::UInt(v) => v + 1,
-                _ => 1,
+                ConstValue::Int(v) => Some((v + 1) as u64),
+                ConstValue::UInt(v) => Some(v + 1),
+                _ => Some(1),
             }
         })
         .product()

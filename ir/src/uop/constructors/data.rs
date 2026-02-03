@@ -119,7 +119,22 @@ impl UOp {
     }
 
     /// Cast to a different dtype.
+    ///
+    /// If casting a vector to a scalar type, automatically promotes the target
+    /// dtype to a matching vector type. This prevents invalid scalar-to-vector
+    /// casts in the IR. (Matches Tinygrad's cast behavior.)
     pub fn cast(self: &Arc<Self>, dtype: DType) -> Arc<Self> {
+        let src_vcount = self.dtype().vcount();
+        let dst_vcount = dtype.vcount();
+
+        // Auto-promote scalar target to vector if source is vector
+        let dtype = if dst_vcount == 1 && src_vcount > 1 { dtype.vec(src_vcount) } else { dtype };
+
+        // No-op if types match
+        if self.dtype() == dtype {
+            return self.clone();
+        }
+
         Self::new(Op::Cast { src: self.clone(), dtype: dtype.clone() }, dtype)
     }
 
