@@ -33,15 +33,19 @@ impl UOp {
     /// All indices must have Index dtype.
     ///
     /// # Dtype behavior (matches Tinygrad's `buf.index(idx, ptr=False, dtype=None)`)
-    /// - If `dtype` is provided: use it directly (for STORE targets, use Ptr dtype)
-    /// - Otherwise: derive element dtype from buffer (default, for LOAD sources)
+    /// - If `dtype` is provided: use it directly (explicit dtype takes precedence)
+    /// - If `ptr` is true: keep the buffer's Ptr dtype (for STORE targets)
+    /// - Otherwise (ptr=false, default): extract element type from buffer (for LOAD sources)
     ///
     /// # Examples
     /// ```ignore
     /// // Element dtype (default) - for LOAD
     /// UOp::index().buffer(buf).indices(vec![idx]).call()?
     ///
-    /// // Explicit Ptr dtype - for STORE
+    /// // Ptr dtype via ptr=true - for STORE (preferred, Tinygrad-aligned)
+    /// UOp::index().buffer(buf).indices(vec![idx]).ptr(true).call()?
+    ///
+    /// // Explicit Ptr dtype - for STORE (legacy, works but prefer .ptr(true))
     /// let ptr_dtype = DType::Float32.ptr(Some(size), AddrSpace::Global);
     /// UOp::index().buffer(buf).indices(vec![idx]).dtype(ptr_dtype).call()?
     ///
@@ -54,6 +58,10 @@ impl UOp {
         indices: I,
         gate: Option<Arc<Self>>,
         dtype: Option<DType>,
+        /// When true, keep buffer's Ptr dtype (for STORE targets).
+        /// When false (default), extract element type (for LOAD sources).
+        /// Matches Tinygrad's `buf.index(idx, ptr=True/False)`.
+        ptr: Option<bool>,
     ) -> Result<Arc<Self>> {
         let indices = indices.into();
         // Validate that all indices have Index dtype
@@ -62,12 +70,17 @@ impl UOp {
             ensure!([DType::Index, DType::Int64].contains(&idx_dtype), IndexTypeMismatchSnafu { actual: idx_dtype });
         }
 
-        // Use provided dtype or derive element type from buffer
-        // (Tinygrad: `self.dtype.base` when ptr=False, or explicit dtype)
-        let result_dtype = dtype.unwrap_or_else(|| match buffer.dtype() {
-            DType::Ptr { base, .. } => base.as_ref().clone(),
-            other => other,
-        });
+        // Determine result dtype based on (dtype, ptr) parameters
+        // Priority: explicit dtype > ptr flag > default (element type)
+        let result_dtype = match (dtype, ptr.unwrap_or(false)) {
+            (Some(d), _) => d,              // Explicit dtype takes precedence
+            (None, true) => buffer.dtype(), // ptr=true: keep Ptr dtype
+            (None, false) => match buffer.dtype() {
+                // ptr=false: extract element type
+                DType::Ptr { base, .. } => base.as_ref().clone(),
+                other => other,
+            },
+        };
 
         Ok(Self::new(Op::Index { buffer, indices, gate }, result_dtype))
     }

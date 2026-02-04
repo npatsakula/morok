@@ -460,15 +460,14 @@ fn no_vectorized_index(
     let cnt_broadcast = idx.const_like(cnt as i64).broadcast(cnt);
     let final_idx = idx_broadcast.mul(&cnt_broadcast).add(&offset_vec);
 
-    let buf_dtype = buf_broadcast.dtype();
     Some(
         UOp::index()
             .buffer(buf_broadcast)
             .indices(vec![final_idx])
             .maybe_gate(gate.clone())
+            .ptr(true)
             .call()
-            .expect("ICE unable to create index")
-            .with_dtype(buf_dtype),
+            .expect("ICE unable to create index"),
     )
 }
 
@@ -499,9 +498,9 @@ fn no_vectorized_index_precnt(
             .buffer(buf_broadcast.clone())
             .indices(vec![final_idx])
             .maybe_gate(gate.clone())
+            .ptr(true)
             .call()
-            .expect("ICE: unable to create index")
-            .with_dtype(buf_broadcast.dtype()),
+            .expect("ICE: unable to create index"),
     )
 }
 
@@ -514,7 +513,7 @@ pub fn load_store_indexing_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         index @ Index { buffer, indices, gate: Some(g) }
             if matches!(g.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Bool(true)))
-            ~> UOp::index().buffer(buffer.clone()).indices(indices.clone()).call().expect("ICE: unable to crate index").with_dtype(index.dtype())
+            ~> UOp::index().buffer(buffer.clone()).indices(indices.clone()).dtype(index.dtype()).call().expect("ICE: unable to crate index")
     }
 }
 
@@ -723,9 +722,9 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
                 .buffer(buf.clone())
                 .indices(vec![vec.gep(vec![i])])
                 .maybe_gate(gate.clone())
+                .ptr(true)
                 .call()
                 .expect("ICE: unable to create index")
-                .with_dtype(buf.dtype().clone())
         })
         .collect();
 
@@ -997,9 +996,9 @@ fn offset_index(idx: &Arc<UOp>, offset: i64) -> Arc<UOp> {
         .buffer(buffer.clone())
         .indices(new_indices)
         .maybe_gate(gate.clone())
+        .ptr(true)
         .call()
-        .expect("ICE: unabel to create index")
-        .with_dtype(idx.dtype())
+        .expect("ICE: unable to create index")
 }
 
 // ============================================================================
@@ -1063,13 +1062,24 @@ fn image_fixup(ls: &Arc<UOp>) -> Option<Arc<UOp>> {
         };
 
         // Create new INDEX with 2D coordinates
-        let new_idx = UOp::index()
-            .buffer(img_buf.clone())
-            .indices(vec![new_idx_expr])
-            .maybe_gate(gate.clone())
-            .call()
-            .ok()?
-            .with_dtype(inner_idx.dtype());
+        // Use ptr(true) when inner_idx has Ptr dtype, otherwise preserve element dtype
+        let new_idx = if matches!(inner_idx.dtype(), DType::Ptr { .. }) {
+            UOp::index()
+                .buffer(img_buf.clone())
+                .indices(vec![new_idx_expr])
+                .maybe_gate(gate.clone())
+                .ptr(true)
+                .call()
+                .ok()?
+        } else {
+            UOp::index()
+                .buffer(img_buf.clone())
+                .indices(vec![new_idx_expr])
+                .maybe_gate(gate.clone())
+                .dtype(inner_idx.dtype())
+                .call()
+                .ok()?
+        };
 
         // Replace the index in LOAD/STORE
         return Some(ls.replace().src(vec![new_idx]).call());
@@ -1115,13 +1125,24 @@ fn image_fixup(ls: &Arc<UOp>) -> Option<Arc<UOp>> {
             oidx.valid(valid)
         };
 
-        let new_idx = UOp::index()
-            .buffer(img_buf.clone())
-            .indices(vec![new_idx_expr])
-            .maybe_gate(gate.clone())
-            .call()
-            .ok()?
-            .with_dtype(index.dtype());
+        // Use ptr(true) when index has Ptr dtype, otherwise preserve element dtype
+        let new_idx = if matches!(index.dtype(), DType::Ptr { .. }) {
+            UOp::index()
+                .buffer(img_buf.clone())
+                .indices(vec![new_idx_expr])
+                .maybe_gate(gate.clone())
+                .ptr(true)
+                .call()
+                .ok()?
+        } else {
+            UOp::index()
+                .buffer(img_buf.clone())
+                .indices(vec![new_idx_expr])
+                .maybe_gate(gate.clone())
+                .dtype(index.dtype())
+                .call()
+                .ok()?
+        };
 
         // For unfoldable images: load vec4, then select correct element
         // result = reduce(lambda ret, i: (x % 4).ne(i).where(ret, vec_load.gep(i)), range(4), nan)

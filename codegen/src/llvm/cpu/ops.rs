@@ -268,12 +268,27 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
 
         Op::Cast { src, dtype } => {
             let s = ctx.get(src);
-            let cast_instr = lcast(&src.dtype(), dtype);
 
-            if ldt(&src.dtype()) == ldt(dtype) {
-                kernel.push(format!("  {dst} = bitcast {} {s} to {}", ldt(&src.dtype()), ldt(dtype)));
+            // INDEX always produces ptr in LLVM (via GEP), regardless of Morok dtype.
+            // When source is INDEX, treat source LLVM type as ptr for cast selection.
+            let is_index_src = matches!(src.op(), Op::Index { .. });
+            let src_llvm_type = if is_index_src { "ptr".to_string() } else { ldt(&src.dtype()) };
+            let dst_llvm_type = ldt(dtype);
+
+            // CAST(INDEX) to Ptr is a no-op - INDEX already produces ptr via GEP.
+            // This matches Tinygrad's approach (llvmir.py:189) where CAST to PtrDType
+            // is register aliasing: r[u] = r[u.src[0]]
+            if is_index_src && matches!(dtype, DType::Ptr { .. }) {
+                // Emit a bitcast as a named no-op to maintain SSA form
+                kernel.push(format!("  {dst} = bitcast ptr {s} to ptr"));
+                return Some(());
+            }
+
+            if src_llvm_type == dst_llvm_type {
+                kernel.push(format!("  {dst} = bitcast {src_llvm_type} {s} to {dst_llvm_type}"));
             } else {
-                kernel.push(format!("  {dst} = {cast_instr} {} {s} to {}", ldt(&src.dtype()), ldt(dtype)));
+                let cast_instr = lcast(&src.dtype(), dtype);
+                kernel.push(format!("  {dst} = {cast_instr} {src_llvm_type} {s} to {dst_llvm_type}"));
             }
             Some(())
         }

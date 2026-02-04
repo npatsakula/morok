@@ -455,9 +455,10 @@ fn compute_run_count(uop: &Arc<UOp>) -> u64 {
         .filter_map(|key| {
             // Exclude Thread ranges - they're pseudo-loops, not real loops
             if let Op::Range { axis_type, .. } = key.0.op()
-                && matches!(axis_type, AxisType::Thread) {
-                    return None;
-                }
+                && matches!(axis_type, AxisType::Thread)
+            {
+                return None;
+            }
             // Get the maximum value of the range
             match key.0.vmax() {
                 ConstValue::Int(v) => Some((v + 1) as u64),

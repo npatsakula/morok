@@ -839,9 +839,10 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
         UOp::define_local(local_id, local_ptr_dtype)
     };
 
-    // Create Ptr dtype for STORE target (like Tinygrad's sdtype = x.dtype.ptr(size, addrspace))
+    // Use ptr=true to keep Ptr dtype for STORE targets (Tinygrad-aligned).
     // This ensures INDEX returns pointer type, which STORE codegen expects.
-    let ptr_dtype = base_dtype.ptr(Some(size), opts.addrspace);
+    // ptr=true is equivalent to setting dtype to buffer.dtype(), but is the
+    // idiomatic way per Tinygrad's buf.index(idx, ptr=True).
 
     let store_target = if !ranges.is_empty() {
         // Linearize multi-dimensional ranges into single linear index.
@@ -870,7 +871,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
                 UOp::index()
                     .buffer(buffer.clone())
                     .indices(vec![linear_index])
-                    .dtype(ptr_dtype.clone())
+                    .ptr(true)
                     .call()
                     .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
             } else {
@@ -885,7 +886,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
                 UOp::index()
                     .buffer(buffer.clone())
                     .indices(ranges.to_vec())
-                    .dtype(ptr_dtype.clone())
+                    .ptr(true)
                     .call()
                     .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
             }
@@ -894,16 +895,16 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
             UOp::index()
                 .buffer(buffer.clone())
                 .indices(ranges.to_vec())
-                .dtype(ptr_dtype.clone())
+                .ptr(true)
                 .call()
                 .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
         }
     } else {
-        // Scalar store: create INDEX with buffer + index 0 and explicit Ptr dtype
+        // Scalar store: create INDEX with buffer + index 0 and ptr=true for Ptr dtype
         UOp::index()
             .buffer(buffer.clone())
             .indices(vec![UOp::index_const(0)])
-            .dtype(ptr_dtype)
+            .ptr(true)
             .call()
             .expect("Failed to create INDEX for scalar STORE")
     };

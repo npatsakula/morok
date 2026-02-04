@@ -240,8 +240,13 @@ fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>)
         return None;
     };
 
-    // Create ungated INDEX
-    let ungated_index = UOp::index().buffer(buffer.clone()).indices(indices.clone()).call().expect("ungated INDEX");
+    // Create ungated INDEX, preserving the original dtype
+    let ungated_index = UOp::index()
+        .buffer(buffer.clone())
+        .indices(indices.clone())
+        .call()
+        .expect("ungated INDEX")
+        .with_dtype(actual_index.dtype());
 
     // Rewrap in Cast if the original was Cast-wrapped
     let final_index = if let Some(dtype) = cast_dtype { ungated_index.cast(dtype) } else { ungated_index.clone() };
