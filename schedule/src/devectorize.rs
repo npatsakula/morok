@@ -966,18 +966,34 @@ fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 }
 
-/// Conservative: false for unknown expressions (devectorizer.py:156).
+/// Check if offset expression divides evenly by len (devectorizer.py:703-711).
+/// Conservative: false for unknown expressions.
 fn offset_divides_evenly(offset: &Arc<UOp>, len: usize) -> bool {
     if len <= 1 {
         return true;
     }
+    let v = len as i64;
+
     match offset.op() {
-        Op::Const(cv) => matches!(cv.0, ConstValue::Int(n) if n % (len as i64) == 0),
-        Op::Binary(BinaryOp::Mul, left, right) => {
-            let check = |c: &Arc<UOp>| matches!(c.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(n) if n >= len as i64 && n % (len as i64) == 0));
-            check(left) || check(right)
+        // CONST: check modulo
+        Op::Const(cv) => matches!(cv.0, ConstValue::Int(n) if n % v == 0),
+
+        // VCONST: all elements must divide evenly
+        Op::VConst { values } => values.iter().all(|val| matches!(val, ConstValue::Int(n) if n % v == 0)),
+
+        // ADD: both operands must divide
+        Op::Binary(BinaryOp::Add, left, right) => {
+            offset_divides_evenly(left, len) && offset_divides_evenly(right, len)
         }
-        Op::Binary(BinaryOp::Add, left, right) => offset_divides_evenly(left, len) && offset_divides_evenly(right, len),
+
+        // MUL: either operand divides (matching Tinygrad - no n >= len check!)
+        Op::Binary(BinaryOp::Mul, left, right) => {
+            let check_const = |c: &Arc<UOp>| {
+                matches!(c.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(n) if n % v == 0))
+            };
+            check_const(left) || check_const(right) || offset_divides_evenly(left, len) || offset_divides_evenly(right, len)
+        }
+
         _ => false,
     }
 }

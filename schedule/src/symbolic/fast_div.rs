@@ -142,6 +142,49 @@ pub fn fast_division_patterns() -> TypedPatternMatcher {
                 return None;
             }
 
+            // Factor out largest power of two to reduce overflow risk (decompositions.py:292-293)
+            // For d = 6 = 2 * 3, we compute x // 6 = (x >> 1) // 3
+            let pow2_factor = d_int & (-d_int);  // Isolates lowest set bit (largest power of 2 dividing d)
+            if pow2_factor > 1 {
+                let reduced_divisor = d_int / pow2_factor;
+                let shift_amount = (pow2_factor as u64).trailing_zeros() as i64;
+                // x // d == (x >> shift) // (d // pow2_factor)
+                let shift_const = UOp::index_const(shift_amount);
+                let shifted = x.shr(&shift_const);
+                // Recursive pattern match will handle the reduced divisor
+                // We return None to let the pattern reapply to the shifted value
+                // But since patterns don't auto-recurse, we need to compute directly
+                let reduced_vmin = vmin_as_i64(&shifted).unwrap_or(0);
+                let reduced_vmax = vmax_as_i64(&shifted).unwrap_or(vmax_as_i64(x)? >> shift_amount);
+
+                if reduced_divisor > 1 && !is_power_of_two(reduced_divisor) {
+                    let max_abs = reduced_vmax.max(reduced_vmin.abs());
+                    if let Some((m, s)) = magic_unsigned(max_abs, reduced_divisor) {
+                        if m.checked_mul(reduced_vmin).is_some() && m.checked_mul(reduced_vmax).is_some() {
+                            let dtype = x.dtype();
+                            let m_const = UOp::const_(dtype.clone(), ConstValue::Int(m));
+                            let s_const = UOp::const_(dtype.clone(), ConstValue::Int(s as i64));
+
+                            if reduced_vmin >= 0 {
+                                let mul_result = shifted.mul(&m_const);
+                                return Some(mul_result.shr(&s_const));
+                            } else {
+                                let mul_result = shifted.mul(&m_const);
+                                let base = mul_result.shr(&s_const);
+                                let zero = UOp::const_(dtype.clone(), ConstValue::Int(0));
+                                let one = UOp::const_(dtype, ConstValue::Int(1));
+                                let is_negative = shifted.try_cmplt(&zero).ok()?;
+                                let adjustment = UOp::try_where(is_negative, one, zero).ok()?;
+                                return Some(base.add(&adjustment));
+                            }
+                        }
+                    }
+                } else if reduced_divisor == 1 {
+                    // d was a power of 2, just shift (shouldn't reach here due to guard above)
+                    return Some(shifted);
+                }
+            }
+
             // Get value bounds
             let vmin = vmin_as_i64(x)?;
             let vmax = vmax_as_i64(x)?;
@@ -254,5 +297,41 @@ mod tests {
 
         // Negative divisor
         assert!(magic_unsigned(100, -5).is_none());
+    }
+
+    #[test]
+    fn test_magic_unsigned_div_6_factorization() {
+        // x / 6 for x in 0..=1000
+        // Tests power-of-two factorization: 6 = 2 * 3
+        // Division by 6 should become: (x >> 1) / 3
+        let result = magic_unsigned(500, 3); // After shift, max is 500
+        assert!(result.is_some());
+        let (m, s) = result.unwrap();
+
+        for x in 0..=1000 {
+            let expected = x / 6;
+            // Simulate factorization: (x >> 1) then magic divide by 3
+            let shifted = x >> 1;
+            let actual = ((shifted as i128 * m as i128) >> s) as i64;
+            assert_eq!(expected, actual, "Failed for x = {}", x);
+        }
+    }
+
+    #[test]
+    fn test_magic_unsigned_div_12_factorization() {
+        // x / 12 for x in 0..=1200
+        // Tests power-of-two factorization: 12 = 4 * 3
+        // Division by 12 should become: (x >> 2) / 3
+        let result = magic_unsigned(300, 3); // After shift by 2, max is 300
+        assert!(result.is_some());
+        let (m, s) = result.unwrap();
+
+        for x in 0..=1200 {
+            let expected = x / 12;
+            // Simulate factorization: (x >> 2) then magic divide by 3
+            let shifted = x >> 2;
+            let actual = ((shifted as i128 * m as i128) >> s) as i64;
+            assert_eq!(expected, actual, "Failed for x = {}", x);
+        }
     }
 }

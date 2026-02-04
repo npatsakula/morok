@@ -168,6 +168,19 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             Some(UOp::vectorize(casted.into()).cast(vec_index_dt))
         },
 
+        // BIND(var.cast(Index), val.cast(Index)) → var.bind(val).cast(Index)
+        // Tinygrad: (UPat(Ops.BIND, src=(var.cast(index), val.cast(index))), lambda var,val: var.bind(val).cast(index))
+        Bind { var, value } if var.dtype() == DType::Index => |var, value| {
+            let Op::Cast { src: var_inner, dtype: var_dt } = var.op() else { return None };
+            let Op::Cast { src: val_inner, dtype: val_dt } = value.op() else { return None };
+            if *var_dt != DType::Index || *val_dt != DType::Index { return None; }
+
+            // Compute common dtype for the binding
+            let dt = least_upper_dtype(&var_inner.dtype(), &val_inner.dtype());
+            let bound = var_inner.cast(dt.clone()).bind(val_inner.cast(dt));
+            Some(bound.cast(DType::Index))
+        },
+
         // ================================================================
         // PHASE 3: Cleanup - strip wrappers at terminal nodes
         // ================================================================
