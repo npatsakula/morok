@@ -43,13 +43,12 @@ fn test_contract_simple() {
 // Partial Contraction Tests (with exact swizzle verification)
 // =============================================================================
 
-/// Test: CONTRACT axis 1 of 2-axis UNROLL → stride-4 swizzle
+/// Test: CONTRACT axis 1 of 2-axis UNROLL → nested iteration over remaining × contract
 ///
 /// Tinygrad: test_contract_axis_1
 /// ```python
 /// a = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(16), tuple(range(16))),), ((1,4),(2,4)))
 /// c = UOp(Ops.CONTRACT, dtypes.int.vec(4), (a,), ((1,4),))
-/// # Inner GEP indices: (0, 4, 8, 12)
 /// # After full contraction, values per axis-2 position:
 /// # axis2=0: [0,4,8,12], axis2=1: [1,5,9,13], axis2=2: [2,6,10,14], axis2=3: [3,7,11,15]
 /// ```
@@ -67,24 +66,31 @@ fn test_contract_partial_axis_1() {
     let (gep, remaining_axes) = unwrap_unroll(&result);
     assert_eq!(remaining_axes, vec![(2, 4)], "Should have axis 2 remaining");
 
-    // GEP indices for axis 1 contraction (axis 2 zeroed):
-    // Iterates {1:0}, {1:1}, {1:2}, {1:3} with axis 2 = 0
-    // → indices: 0*4+0=0, 1*4+0=4, 2*4+0=8, 3*4+0=12
+    // GEP indices for axis 1 contraction (nested iteration: remaining × contract):
+    // remaining=[(2,4)], contract=[(1,4)]
+    // For each axis2 value, iterate all axis1 values:
+    // axis2=0: {2:0,1:0}→0, {2:0,1:1}→4, {2:0,1:2}→8, {2:0,1:3}→12
+    // axis2=1: {2:1,1:0}→1, {2:1,1:1}→5, {2:1,1:2}→9, {2:1,1:3}→13
+    // axis2=2: {2:2,1:0}→2, {2:2,1:1}→6, {2:2,1:2}→10, {2:2,1:3}→14
+    // axis2=3: {2:3,1:0}→3, {2:3,1:1}→7, {2:3,1:2}→11, {2:3,1:3}→15
     let (_, indices) = unwrap_gep(&gep);
-    assert_eq!(indices, vec![0, 4, 8, 12], "GEP indices for axis 1 contraction");
+    assert_eq!(
+        indices,
+        vec![0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15],
+        "GEP indices for axis 1 contraction"
+    );
 
-    // Verify extracted values: [0, 4, 8, 12]
+    // Verify extracted values
     let values = extract_result_values(&gep);
-    assert_eq!(values, vec![0, 4, 8, 12], "Contracted values from axis 1");
+    assert_eq!(values, vec![0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15], "Contracted values from axis 1");
 }
 
-/// Test: CONTRACT axis 2 of 2-axis UNROLL → sequential swizzle
+/// Test: CONTRACT axis 2 of 2-axis UNROLL → nested iteration over remaining × contract
 ///
 /// Tinygrad: test_contract_axis_2
 /// ```python
 /// a = UOp(Ops.UNROLL, dtypes.int, (UOp.const(dtypes.int.vec(16), tuple(range(16))),), ((1,4),(2,4)))
 /// c = UOp(Ops.CONTRACT, dtypes.int.vec(4), (a,), ((2,4),))
-/// # Inner GEP indices: (0, 1, 2, 3)
 /// ```
 #[test]
 fn test_contract_partial_axis_2() {
@@ -100,15 +106,23 @@ fn test_contract_partial_axis_2() {
     let (gep, remaining_axes) = unwrap_unroll(&result);
     assert_eq!(remaining_axes, vec![(1, 4)], "Should have axis 1 remaining");
 
-    // GEP indices for axis 2 contraction (axis 1 zeroed):
-    // Iterates {2:0}, {2:1}, {2:2}, {2:3} with axis 1 = 0
-    // → indices: 0*4+0=0, 0*4+1=1, 0*4+2=2, 0*4+3=3
+    // GEP indices for axis 2 contraction (nested iteration: remaining × contract):
+    // remaining=[(1,4)], contract=[(2,4)]
+    // For each axis1 value, iterate all axis2 values:
+    // axis1=0: {1:0,2:0}→0, {1:0,2:1}→1, {1:0,2:2}→2, {1:0,2:3}→3
+    // axis1=1: {1:1,2:0}→4, {1:1,2:1}→5, {1:1,2:2}→6, {1:1,2:3}→7
+    // axis1=2: {1:2,2:0}→8, {1:2,2:1}→9, {1:2,2:2}→10, {1:2,2:3}→11
+    // axis1=3: {1:3,2:0}→12, {1:3,2:1}→13, {1:3,2:2}→14, {1:3,2:3}→15
     let (_, indices) = unwrap_gep(&gep);
-    assert_eq!(indices, vec![0, 1, 2, 3], "GEP indices for axis 2 contraction");
+    assert_eq!(
+        indices,
+        vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "GEP indices for axis 2 contraction"
+    );
 
-    // Verify extracted values: [0, 1, 2, 3]
+    // Verify extracted values
     let values = extract_result_values(&gep);
-    assert_eq!(values, vec![0, 1, 2, 3], "Contracted values from axis 2");
+    assert_eq!(values, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "Contracted values from axis 2");
 }
 
 /// Test: CONTRACT axis 2 of 4-axis UNROLL
@@ -205,15 +219,20 @@ fn test_contract_middle_axis() {
     let (gep, remaining_axes) = unwrap_unroll(&result);
     assert_eq!(remaining_axes, vec![(1, 2), (3, 2)], "Should have axes 1, 3 remaining");
 
-    // GEP indices for middle axis contraction:
-    // swizzle_args([(2,2)], [(1,2),(2,2),(3,2)], [1,3])
-    // Contract axis 2, exclude axes 1 and 3 (zeroed)
+    // GEP indices for middle axis contraction (nested iteration: remaining × contract):
+    // remaining=[(1,2),(3,2)], contract=[(2,2)]
+    // For each remaining combo, iterate contract combo:
+    // {1:0,3:0}×{2:0,1} = {1:0,2:0,3:0}→0, {1:0,2:1,3:0}→2
+    // {1:0,3:1}×{2:0,1} = {1:0,2:0,3:1}→1, {1:0,2:1,3:1}→3
+    // {1:1,3:0}×{2:0,1} = {1:1,2:0,3:0}→4, {1:1,2:1,3:0}→6
+    // {1:1,3:1}×{2:0,1} = {1:1,2:0,3:1}→5, {1:1,2:1,3:1}→7
+    // Result: [0, 2, 1, 3, 4, 6, 5, 7] (matches Tinygrad comment above)
     let (_, indices) = unwrap_gep(&gep);
-    assert_eq!(indices, vec![0, 2], "GEP indices for middle axis contraction");
+    assert_eq!(indices, vec![0, 2, 1, 3, 4, 6, 5, 7], "GEP indices for middle axis contraction");
 
-    // Verify extracted values: indices [0, 2] from [0..7] = [0, 2]
+    // Verify extracted values: indices from [0..7]
     let values = extract_result_values(&gep);
-    assert_eq!(values, vec![0, 2], "Contracted values from middle axis");
+    assert_eq!(values, vec![0, 2, 1, 3, 4, 6, 5, 7], "Contracted values from middle axis");
 }
 
 // =============================================================================
@@ -280,10 +299,10 @@ fn test_contract_partial_expansion() {
 // Dtype Validation Tests
 // =============================================================================
 
-/// Test: Partial contraction dtype matches remaining axes product.
+/// Test: Partial contraction dtype uses CONTRACT's dtype (Tinygrad alignment).
 ///
-/// Bug fix: UNROLL wrapper dtype should match remaining_axes product,
-/// not the CONTRACT axes product.
+/// Tinygrad: `gep_result.unroll(*remaining_axes).with_dtype(uop.dtype)`
+/// The UNROLL wrapper uses the CONTRACT's dtype, not remaining_axes product.
 #[test]
 fn test_contract_partial_dtype_validation() {
     // UNROLL with axes [(1,4), (2,2)] → 8 elements
@@ -294,8 +313,8 @@ fn test_contract_partial_dtype_validation() {
 
     let result = phase2_only(&contract);
 
-    // Validate dtype matches remaining axes product (2), not contract axes product (4)
-    assert_vcount(&result, 2);
+    // Tinygrad: wrapper dtype = CONTRACT's dtype (vec4), not remaining_product (2)
+    assert_vcount(&result, 4);
 
     let (_, remaining_axes) = unwrap_unroll(&result);
     assert_eq!(remaining_axes, vec![(2, 2)]);

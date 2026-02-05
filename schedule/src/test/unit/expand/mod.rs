@@ -85,10 +85,10 @@ fn test_vectorize_all_scalar_sources() {
 
 #[test]
 fn test_fix_reduce_unroll_with_unroll_ops() {
-    // Test the new Tinygrad-aligned behavior: fix_reduce_unroll partitions
+    // Test new Tinygrad-aligned behavior: fix_reduce_unroll partitions
     // REDUCE.ranges into RANGE ops vs UNROLL ops, moving UNROLL to CONTRACT.
     //
-    // This tests the simplified partition-based logic.
+    // This tests simplified partition-based logic.
 
     // Create an UNROLL op (simulates what Phase 1 produces from Range(Unroll))
     let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2), ConstValue::Int(3)]);
@@ -115,5 +115,60 @@ fn test_fix_reduce_unroll_with_unroll_ops() {
         assert!(matches!(fixed_src.op(), Op::Contract { .. }), "Expected CONTRACT wrapper");
         // Ranges should only contain Range ops (UNROLL moved to CONTRACT)
         assert!(ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })), "All ranges should be Range ops");
+    }
+}
+
+/// Test REDUCE bug: ranges=[] after fix_reduce_unroll when Range(Reduce) is in ranges.
+///
+/// Problem: When REDUCE has Range(Reduce) and UNROLL in its ranges, fix_reduce_unroll
+/// should partition into reduce_range (Range ops) and reduce_expand (UNROLL ops).
+/// The bug is that Range(Reduce) is being lost, resulting in ranges=[].
+///
+/// Example:
+/// - Before: REDUCE(ranges=[Range(R0, Reduce), RANGE(R3, Unroll)])
+/// - Expected after fix_reduce_unroll: REDUCE(ranges=[Range(R0, Reduce)], src=CONTRACT(...))
+/// - Actual: REDUCE(ranges=[]) → horizontal_reduce returns input unchanged (wrong dtype)
+#[test]
+#[tracing_test::traced_test]
+fn test_reduce_empty_ranges_bug() {
+    // Create data buffer representing [[1.0, 2.0], [3.0, 4.0]]
+    // Layout: [1.0, 2.0, 3.0, 4.0]
+    let data_buf = UOp::buffer_id(Some(0));
+    let data_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+
+    // Create INDEX to access elements
+    // Simulating axis 1 reduction: for each row, sum columns 0 and 1
+    // After reduce, should have 2 elements (one per row)
+    let index = UOp::index().buffer(data_buf).indices(vec![UOp::index_const(0)]).call().expect("index");
+
+    // Create REDUCE with both Range(Reduce) and UNROLL
+    // Range(R0, Reduce): the reduce axis (axis 1)
+    // RANGE(R3, Unroll): unrolled axis (axis 0)
+    let reduce_end = UOp::const_(DType::Index, ConstValue::Int(2));
+    let reduce_range = UOp::range_axis(reduce_end, morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
+
+    // Create UNROLL for axis 0 (keepdim behavior)
+    let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1)]);
+    let unroll = values.unroll(vec![(1, 2)]);
+
+    // REDUCE with both Range and UNROLL
+    let reduce = index.reduce(smallvec::smallvec![reduce_range.clone(), unroll], ReduceOp::Add);
+
+    println!("BEFORE pre_expand:");
+    println!("REDUCE: {}", reduce.tree());
+
+    // Run pre_expand (which calls fix_reduce_unroll)
+    let result = pre_expand(&reduce);
+
+    println!("AFTER pre_expand:");
+    println!("RESULT: {}", result.tree());
+
+    // The bug manifests when result has empty ranges
+    if let Op::Reduce { ranges, .. } = result.op() {
+        if ranges.is_empty() {
+            panic!(
+                "BUG: REDUCE has empty ranges after pre_expand - this causes horizontal_reduce to return unchanged input"
+            );
+        }
     }
 }

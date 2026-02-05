@@ -549,7 +549,7 @@ pub(crate) fn fix_reduce_unroll(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Filter out CONST
+    // Filter out CONST (Tinygrad: reduce_expand = [x for x in reduce_expand if x.op is not Ops.CONST])
     let reduce_expand: Vec<_> = reduce_expand.into_iter().filter(|r| !matches!(r.op(), Op::Const(_))).collect();
 
     if reduce_expand.is_empty() {
@@ -661,6 +661,19 @@ fn end_unrolls(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Contract UNROLL to extract elements via GEP.
 ///
 /// Based on Tinygrad's do_contract (expander.py:67-76).
+///
+/// Key insight: When CONTRACT axes differ from UNROLL axes (partial contraction),
+/// we need NESTED iteration over remaining_axes × contract_axes to generate
+/// all GEP indices. This differs from do_expand's swizzle_args which zeros out
+/// excluded axes.
+///
+/// Tinygrad's algorithm (lines 74-75):
+/// ```python
+/// idxs = []
+/// for rpk in _choices_from_args(new_ex_args):  # remaining axes
+///     idxs += [_expand_arg_to_idx(ex.arg, {**rpk, **lrpk})
+///              for lrpk in _choices_from_args(con.arg)]  # contract axes
+/// ```
 fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Contract { src: contract_src, upcast_ranges: contract_axes } = uop.op() else {
         return None;
@@ -682,32 +695,52 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         "Contract dtype count mismatch"
     );
 
-    // Compute remaining axes and GEP indices
+    // Compute remaining axes (axes in UNROLL but not in CONTRACT)
+    // Tinygrad: new_ex_args:=tuple(x for x in ex.arg if x not in con.arg)
     let remaining_axes: Vec<_> =
         unroll_axes.iter().filter(|(ax, _)| !contract_axes.iter().any(|(cax, _)| cax == ax)).cloned().collect();
 
-    let exclude: Vec<usize> = remaining_axes.iter().map(|(ax, _)| *ax).collect();
-    let gep_indices = swizzle_args(contract_axes, unroll_axes, &exclude);
+    // Compute GEP indices using NESTED iteration: remaining_axes × contract_axes
+    // This matches Tinygrad's do_contract (expander.py:74-75)
+    let gep_indices = contract_gep_indices(contract_axes, unroll_axes, &remaining_axes);
     let gep_result = unroll_inner.gep(gep_indices);
 
-    // Compute UNROLL wrapper dtype based on remaining axes, not contract axes.
-    // Tinygrad expander.py:76 uses con.dtype, but for partial contraction the UNROLL dtype
-    // should match the remaining axes product (the number of unroll iterations).
-    let remaining_product: usize = remaining_axes.iter().map(|(_, sz)| sz).product();
-    let wrapper_dtype = if remaining_product == 1 {
-        // Full contraction: use output dtype (scalar from CONTRACT)
-        uop.dtype()
-    } else {
-        // Partial contraction: vectorize by remaining axes product
-        let dt = uop.dtype();
-        if dt == DType::Void {
-            DType::Void // Preserve void for STORE
-        } else {
-            dt.scalar_dtype().vec(remaining_product)
-        }
-    };
+    // Return UNROLL with CONTRACT's dtype (Tinygrad: UOp(Ops.UNROLL, con.dtype, ...))
+    Some(gep_result.unroll_with_dtype(remaining_axes, uop.dtype()))
+}
 
-    Some(gep_result.unroll_with_dtype(remaining_axes, wrapper_dtype))
+/// Compute GEP indices for CONTRACT by nested iteration over remaining × contract axes.
+///
+/// This matches Tinygrad's do_contract (expander.py:74-75):
+/// ```python
+/// for rpk in _choices_from_args(new_ex_args):      # outer: remaining axes
+///     idxs += [_expand_arg_to_idx(ex.arg, {**rpk, **lrpk})
+///              for lrpk in _choices_from_args(con.arg)]  # inner: contract axes
+/// ```
+///
+/// For example with unroll_axes=[(2,2), (3,2)], contract_axes=[(3,2)], remaining=[(2,2)]:
+/// - Outer loop: {2:0}, {2:1}
+/// - Inner loop: {3:0}, {3:1}
+/// - Merged indices: {2:0,3:0}=0, {2:0,3:1}=1, {2:1,3:0}=2, {2:1,3:1}=3
+/// - Result: [0, 1, 2, 3]
+fn contract_gep_indices(
+    contract_axes: &[(usize, usize)],
+    unroll_axes: &[(usize, usize)],
+    remaining_axes: &[(usize, usize)],
+) -> Vec<usize> {
+    let remaining_choices = choices_from_args(remaining_axes);
+    let contract_choices = choices_from_args(contract_axes);
+
+    let mut indices = Vec::new();
+    for rpk in &remaining_choices {
+        for lrpk in &contract_choices {
+            // Merge remaining and contract axis values
+            let mut merged = rpk.clone();
+            merged.extend(lrpk);
+            indices.push(expand_arg_to_idx(unroll_axes, &merged));
+        }
+    }
+    indices
 }
 
 // ============================================================================
