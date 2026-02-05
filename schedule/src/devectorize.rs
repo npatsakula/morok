@@ -969,7 +969,12 @@ fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Check if offset expression divides evenly by len (devectorizer.py:703-711).
 /// Conservative: false for unknown expressions.
 fn offset_divides_evenly(offset: &Arc<UOp>, len: usize) -> bool {
-    if len <= 1 {
+    // len==0 is invalid (can't divide by zero), return false defensively
+    if len == 0 {
+        return false;
+    }
+    // len==1 means no vectorization, trivially true
+    if len == 1 {
         return true;
     }
     let v = len as i64;

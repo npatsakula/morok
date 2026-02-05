@@ -94,7 +94,8 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Load { index, .. } => {
             let idx = ctx.get(index);
             let dtype = ldt(&uop.dtype());
-            kernel.push(format!("  {dst} = load {dtype}, ptr {idx}"));
+            let idx_type = ldt(&index.dtype());
+            kernel.push(format!("  {dst} = load {dtype}, {idx_type} {idx}"));
             Some(())
         }
 
@@ -102,7 +103,8 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let idx = ctx.get(index);
             let val = ctx.get(value);
             let val_type = ldt(&value.dtype());
-            kernel.push(format!("  store {val_type} {val}, ptr {idx}"));
+            let idx_type = ldt(&index.dtype());
+            kernel.push(format!("  store {val_type} {val}, {idx_type} {idx}"));
             Some(())
         }
 

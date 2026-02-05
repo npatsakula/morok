@@ -911,6 +911,44 @@ fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
         .product()
 }
 
+/// Sort ranges by (axis_id, axis_type) for correct row-major linearization.
+///
+/// Tinygrad reference (rangeify.py:303):
+///   rngs = sorted(idx.ranges, key=lambda x: x.arg)
+///
+/// Tinygrad's RANGE.arg is (axis_id, axis_type), so sorting uses both.
+/// This ensures that multi-dimensional ranges are linearized in the correct
+/// order regardless of their insertion order in the graph.
+fn sort_ranges_by_axis_id(ranges: &SmallVec<[Arc<UOp>; 4]>) -> SmallVec<[Arc<UOp>; 4]> {
+    let mut sorted: Vec<_> = ranges.iter().cloned().collect();
+    sorted.sort_by_key(|r| {
+        if let Op::Range { axis_id, axis_type, .. } = r.op() {
+            // Sort by (axis_id, axis_type) to match Tinygrad's sorting by x.arg
+            (axis_id.value(), axis_type_ordinal(*axis_type))
+        } else {
+            (usize::MAX, u8::MAX)
+        }
+    });
+    sorted.into()
+}
+
+/// Convert AxisType to ordinal for consistent sorting.
+/// Order matches enum definition order in ir/src/types.rs.
+fn axis_type_ordinal(at: AxisType) -> u8 {
+    match at {
+        AxisType::Outer => 0,
+        AxisType::Global => 1,
+        AxisType::Warp => 2,
+        AxisType::Local => 3,
+        AxisType::Loop => 4,
+        AxisType::GroupReduce => 5,
+        AxisType::Reduce => 6,
+        AxisType::Upcast => 7,
+        AxisType::Unroll => 8,
+        AxisType::Thread => 9,
+    }
+}
+
 /// Convert BUFFERIZE operation to STORE with buffer allocation and END wrapping.
 ///
 /// # Arguments
@@ -992,68 +1030,71 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
         // Tinygrad: len(x.src[0].src) == 2 means src + 1 range
         if reduce_ranges.len() == 1
             && let Op::Range { axis_type, .. } = reduce_ranges[0].op()
-                && *axis_type == AxisType::Outer {
-                    // Must be global address space
-                    if opts.addrspace != AddrSpace::Global {
-                        return None;
-                    }
+            && *axis_type == AxisType::Outer
+        {
+            // Must be global address space
+            if opts.addrspace != AddrSpace::Global {
+                return None;
+            }
 
-                    let outer_range = reduce_ranges[0].clone();
-                    let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
+            let outer_range = reduce_ranges[0].clone();
+            let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
 
-                    // Create buffer
-                    let buf = UOp::new_buffer(device, size, base_dtype.clone());
+            // Create buffer
+            let buf = UOp::new_buffer(device, size, base_dtype.clone());
 
-                    // Create zero-init range (same axis_id but AxisType::Loop)
-                    let zero_range = create_loop_range_from_outer(&outer_range, size)?;
+            // Create zero-init range (same axis_id but AxisType::Loop)
+            let zero_range = create_loop_range_from_outer(&outer_range, size)?;
 
-                    // Get identity value for reduce op
-                    use crate::symbolic::dce::reduce_identity;
-                    let identity = reduce_identity(*reduce_op, base_dtype.clone());
+            // Get identity value for reduce op
+            use crate::symbolic::dce::reduce_identity;
+            let identity = reduce_identity(*reduce_op, base_dtype.clone());
 
-                    // Zero-initialize: buf[zero_range] = identity
-                    let zero_idx = UOp::index()
-                        .buffer(buf.clone())
-                        .indices(vec![zero_range.clone()])
-                        .dtype(sdtype.clone())
-                        .call()
-                        .ok()?;
-                    let zero_store = zero_idx.store_value(identity).end(smallvec![zero_range.clone()]);
-                    let buf_zeroed = buf.after(smallvec![zero_store]);
+            // Zero-initialize: buf[zero_range] = identity
+            let zero_idx =
+                UOp::index().buffer(buf.clone()).indices(vec![zero_range.clone()]).dtype(sdtype.clone()).call().ok()?;
+            let zero_store = zero_idx.store_value(identity).end(smallvec![zero_range.clone()]);
+            let buf_zeroed = buf.after(smallvec![zero_store]);
 
-                    // Build linear index from BUFFERIZE ranges (not reduce ranges)
-                    let linear_index = if ranges.len() > 1 {
-                        let dims: Vec<i64> = ranges.iter().filter_map(range_size_as_i64).collect();
-                        if dims.len() == ranges.len() {
-                            let strides = compute_row_major_strides(&dims);
-                            let indices: Vec<Arc<UOp>> = ranges.iter().cloned().collect();
-                            build_linear_index(&indices, &strides)
-                        } else {
-                            ranges[0].clone() // Fallback for symbolic
-                        }
-                    } else if !ranges.is_empty() {
-                        ranges[0].clone()
-                    } else {
-                        UOp::index_const(0)
-                    };
-
-                    // Accumulation: buf[idx] = buf[idx] OP reduce_src (Tinygrad: bufi = buf.index(idx, dtype=sdtype))
-                    let buf_idx = UOp::index()
-                        .buffer(buf_zeroed.clone())
-                        .indices(vec![linear_index])
-                        .dtype(sdtype.clone())
-                        .call()
-                        .ok()?;
-                    let loaded = UOp::load().buffer(buf_zeroed.clone()).index(buf_idx.clone()).call();
-                    let accumulated = reduce_op_to_binary(*reduce_op, &loaded, reduce_src)?;
-
-                    // Wrap store with both end_ranges AND outer_range
-                    let do_store = buf_idx.store_value(accumulated).end(end_ranges.clone()).end(smallvec![outer_range]);
-
-                    let result = buf_zeroed.after(smallvec![do_store]);
-                    ctx.map_buffer(bufferize_op.clone(), result.clone());
-                    return Some(result);
+            // Build linear index from BUFFERIZE ranges (not reduce ranges)
+            // Sort ranges by axis_id for correct row-major linearization (Tinygrad: rangeify.py:303)
+            let sorted_ranges = sort_ranges_by_axis_id(ranges);
+            let linear_index = if sorted_ranges.len() > 1 {
+                let dims: Vec<i64> = sorted_ranges.iter().filter_map(range_size_as_i64).collect();
+                if dims.len() != sorted_ranges.len() {
+                    panic!(
+                        "ICE: symbolic ranges in OUTER REDUCE bufferize_to_store \
+                                 (resolved {}/{} dims). Symbolic buffer sizes are not supported.",
+                        dims.len(),
+                        sorted_ranges.len()
+                    );
                 }
+                let strides = compute_row_major_strides(&dims);
+                let indices: Vec<Arc<UOp>> = sorted_ranges.iter().cloned().collect();
+                build_linear_index(&indices, &strides)
+            } else if !sorted_ranges.is_empty() {
+                sorted_ranges[0].clone()
+            } else {
+                UOp::index_const(0)
+            };
+
+            // Accumulation: buf[idx] = buf[idx] OP reduce_src (Tinygrad: bufi = buf.index(idx, dtype=sdtype))
+            let buf_idx = UOp::index()
+                .buffer(buf_zeroed.clone())
+                .indices(vec![linear_index])
+                .dtype(sdtype.clone())
+                .call()
+                .ok()?;
+            let loaded = UOp::load().buffer(buf_zeroed.clone()).index(buf_idx.clone()).call();
+            let accumulated = reduce_op_to_binary(*reduce_op, &loaded, reduce_src)?;
+
+            // Wrap store with both end_ranges AND outer_range
+            let do_store = buf_idx.store_value(accumulated).end(end_ranges.clone()).end(smallvec![outer_range]);
+
+            let result = buf_zeroed.after(smallvec![do_store]);
+            ctx.map_buffer(bufferize_op.clone(), result.clone());
+            return Some(result);
+        }
     }
 
     // Determine effective address space based on allow_locals parameter
@@ -1088,7 +1129,10 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
     // ptr=true is equivalent to setting dtype to buffer.dtype(), but is the
     // idiomatic way per Tinygrad's buf.index(idx, ptr=True).
 
-    let store_target = if !ranges.is_empty() {
+    // Sort ranges by axis_id for correct row-major linearization (Tinygrad: rangeify.py:303)
+    let sorted_ranges = sort_ranges_by_axis_id(ranges);
+
+    let store_target = if !sorted_ranges.is_empty() {
         // Linearize multi-dimensional ranges into single linear index.
         // Buffer is 1D (DEFINE_GLOBAL with total size), so we compute:
         //   linear = r0 * (s1*s2*...) + r1 * (s2*s3*...) + ... + rN
@@ -1097,48 +1141,40 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
         // We have direct access to RANGE operations here, so we can extract
         // concrete dimensions. This is the proper place to linearize because
         // later passes (pm_linearize_multi_index) only see the 1D buffer shape.
-        if ranges.len() > 1 {
+        if sorted_ranges.len() > 1 {
             // Extract sizes from each RANGE
-            let dims: Vec<i64> = ranges.iter().filter_map(range_size_as_i64).collect();
+            let dims: Vec<i64> = sorted_ranges.iter().filter_map(range_size_as_i64).collect();
 
-            if dims.len() == ranges.len() {
-                // All ranges have concrete sizes - linearize
-                let strides = compute_row_major_strides(&dims);
-                let indices: Vec<Arc<UOp>> = ranges.iter().cloned().collect();
-                trace!(
-                    "bufferize_to_store: linearizing {} ranges with dims {:?}, strides {:?}",
-                    ranges.len(),
-                    dims,
-                    strides
-                );
-                let linear_index = build_linear_index(&indices, &strides);
-                UOp::index()
-                    .buffer(buffer.clone())
-                    .indices(vec![linear_index])
-                    .dtype(sdtype.clone())
-                    .call()
-                    .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
-            } else {
-                // Symbolic ranges - can't linearize at compile time
-                // Create multi-index INDEX and let pm_linearize_multi_index handle it
-                // (which may use vmin/vmax fallback or fail at codegen)
-                debug!(
-                    "bufferize_to_store: symbolic ranges, creating multi-index INDEX (dims resolved: {}/{})",
+            if dims.len() != sorted_ranges.len() {
+                panic!(
+                    "ICE: symbolic ranges in bufferize_to_store \
+                     (resolved {}/{} dims). Symbolic buffer sizes are not supported.",
                     dims.len(),
-                    ranges.len()
+                    sorted_ranges.len()
                 );
-                UOp::index()
-                    .buffer(buffer.clone())
-                    .indices(ranges.to_vec())
-                    .dtype(sdtype.clone())
-                    .call()
-                    .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
             }
+
+            // All ranges have concrete sizes - linearize
+            let strides = compute_row_major_strides(&dims);
+            let indices: Vec<Arc<UOp>> = sorted_ranges.iter().cloned().collect();
+            trace!(
+                "bufferize_to_store: linearizing {} ranges with dims {:?}, strides {:?}",
+                sorted_ranges.len(),
+                dims,
+                strides
+            );
+            let linear_index = build_linear_index(&indices, &strides);
+            UOp::index()
+                .buffer(buffer.clone())
+                .indices(vec![linear_index])
+                .dtype(sdtype.clone())
+                .call()
+                .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
         } else {
             // Single range - use directly
             UOp::index()
                 .buffer(buffer.clone())
-                .indices(ranges.to_vec())
+                .indices(sorted_ranges.to_vec())
                 .dtype(sdtype.clone())
                 .call()
                 .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")

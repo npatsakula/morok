@@ -55,9 +55,9 @@ fn format_float(f: f64, dtype: &DType) -> String {
     let scalar = dtype.base();
 
     if f.is_nan() {
+        // LLVM expects NaN in double-precision hex format for all float types
         return match scalar {
-            ScalarDType::Float64 => "0x7FF8000000000000".to_string(),
-            ScalarDType::Float32 => "0x7FF8000000000000".to_string(),
+            ScalarDType::Float64 | ScalarDType::Float32 => "0x7FF8000000000000".to_string(),
             ScalarDType::Float16 => "0xH7E00".to_string(),
             ScalarDType::BFloat16 => "0xR7FC0".to_string(),
             _ => "nan".to_string(),
@@ -65,10 +65,10 @@ fn format_float(f: f64, dtype: &DType) -> String {
     }
 
     if f.is_infinite() {
+        // LLVM expects infinity in double-precision hex format for all float types
         let sign = if f.is_sign_positive() { "" } else { "-" };
         return match scalar {
-            ScalarDType::Float64 => format!("{}0x7FF0000000000000", sign),
-            ScalarDType::Float32 => format!("{}0x7FF0000000000000", sign),
+            ScalarDType::Float64 | ScalarDType::Float32 => format!("{}0x7FF0000000000000", sign),
             ScalarDType::Float16 => format!("{}0xH7C00", sign),
             ScalarDType::BFloat16 => format!("{}0xR7F80", sign),
             _ => format!("{}inf", sign),
@@ -80,6 +80,8 @@ fn format_float(f: f64, dtype: &DType) -> String {
             format!("0x{:016X}", f.to_bits())
         }
         ScalarDType::Float32 => {
+            // LLVM expects float32 constants in double-precision hex format
+            // Convert to f32 for precision, then back to f64 for LLVM encoding
             let f32_val = f as f32;
             let f64_val = f32_val as f64;
             format!("0x{:016X}", f64_val.to_bits())
@@ -157,13 +159,28 @@ pub fn lcast(from: &DType, to: &DType) -> &'static str {
         return "fptosi";
     }
 
+    // Integer-to-integer casts
+    let from_bytes = from_scalar.bytes();
+    let to_bytes = to_scalar.bytes();
+
+    // Same size: bitcast (handles signed↔unsigned same-size casts)
+    if from_bytes == to_bytes {
+        return "bitcast";
+    }
+
+    // Narrowing: always trunc
+    if to_bytes < from_bytes {
+        return "trunc";
+    }
+
+    // Widening: use zext for unsigned/bool, sext for signed/Index
     if from_scalar.is_unsigned() || from_scalar.is_bool() {
-        return if to_scalar.bytes() < from_scalar.bytes() { "trunc" } else { "zext" };
+        return "zext";
     }
 
     // Index type is treated as signed integer for casting purposes
     if from_scalar.is_signed() || from_scalar == ScalarDType::Index {
-        return if to_scalar.bytes() < from_scalar.bytes() { "trunc" } else { "sext" };
+        return "sext";
     }
 
     "bitcast"

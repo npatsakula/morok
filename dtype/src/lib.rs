@@ -199,7 +199,7 @@ impl ScalarDType {
     }
 
     pub const fn is_float(&self) -> bool {
-        matches!(self, Self::Float16 | Self::Float32 | Self::Float64)
+        matches!(self, Self::FP8E4M3 | Self::FP8E5M2 | Self::Float16 | Self::BFloat16 | Self::Float32 | Self::Float64)
     }
 
     pub const fn c_style(&self) -> &'static str {
