@@ -185,33 +185,28 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         // PHASE 3: Cleanup - strip wrappers at terminal nodes
         // ================================================================
 
-        // INDEX(buf, idx.cast(Index)) → INDEX(buf, idx)
+        // INDEX(buf, idx.cast(Index)) → INDEX(buf, idx) with Ptr dtype
+        // Tinygrad: buf.index(idx, ptr=True) - preserves buffer's Ptr dtype
         Index { buffer, indices, gate: None } if indices.len() == 1 => |buffer, indices| {
             let idx = &indices[0];
             let Op::Cast { src, dtype } = idx.op() else { return None };
             if *dtype != DType::Index || !src.dtype().is_int() { return None; }
 
-            let result_dt = match buffer.dtype() {
-                DType::Ptr { base, .. } => base.as_ref().clone(),
-                other => other,
-            };
-            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![src.clone()], gate: None }, result_dt))
+            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![src.clone()], gate: None }, buffer.dtype()))
         },
 
-        // INDEX(buf, idx.cast(Index), valid) → INDEX(buf, idx, valid)
+        // INDEX(buf, idx.cast(Index), valid) → INDEX(buf, idx, valid) with Ptr dtype
+        // Tinygrad: buf.index(idx, valid, ptr=True)
         Index { buffer, indices, gate: Some(valid) } if indices.len() == 1 => |buffer, indices, valid| {
             let idx = &indices[0];
             let Op::Cast { src, dtype } = idx.op() else { return None };
             if *dtype != DType::Index || !src.dtype().is_int() { return None; }
 
-            let result_dt = match buffer.dtype() {
-                DType::Ptr { base, .. } => base.as_ref().clone(),
-                other => other,
-            };
-            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![src.clone()], gate: Some(valid.clone()) }, result_dt))
+            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![src.clone()], gate: Some(valid.clone()) }, buffer.dtype()))
         },
 
-        // INDEX with Invalid: buf.index(cond.where(idx, Invalid)) → INDEX(buf, idx, gate=cond)
+        // INDEX(buf, WHERE(cond, idx, Invalid)) → INDEX(buf, idx, gate=cond) with Ptr dtype
+        // Tinygrad: buf.index(idx, cond, ptr=True)
         Index { buffer, indices, gate: None } if indices.len() == 1 => |buffer, indices| {
             let idx_uop = &indices[0];
             let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
@@ -219,11 +214,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             };
             if !matches!(false_val.op(), Op::Invalid) { return None; }
 
-            let result_dt = match buffer.dtype() {
-                DType::Ptr { base, .. } => base.as_ref().clone(),
-                other => other,
-            };
-            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(cond.clone()) }, result_dt))
+            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(cond.clone()) }, buffer.dtype()))
         },
 
         // SINK - strip .cast(Index) from sources
