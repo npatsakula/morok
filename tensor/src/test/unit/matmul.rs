@@ -459,7 +459,6 @@ fn test_matmul_validated_tall_wide() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_matmul_validated_16x16() {
     // Larger matrix to test vectorization paths
     const SIZE: usize = 16;

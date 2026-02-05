@@ -248,7 +248,17 @@ impl UOp {
     #[builder]
     pub fn ptrcat(sources: Vec<Arc<Self>>, dtype: Option<DType>) -> Arc<Self> {
         assert!(!sources.is_empty(), "PTRCAT requires at least one source");
-        let dtype = dtype.unwrap_or_else(|| sources[0].dtype.clone());
+        let dtype = dtype.unwrap_or_else(|| {
+            // Compute vcount from total source pointer vcount, matching CAT's approach.
+            let total_vcount: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
+            let base = &sources[0].dtype;
+            match base {
+                DType::Ptr { base, addrspace, size, .. } => {
+                    DType::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: total_vcount }
+                }
+                _ => base.clone(),
+            }
+        });
         Self::new(Op::PtrCat { sources: SmallVec::from_vec(sources) }, dtype)
     }
 

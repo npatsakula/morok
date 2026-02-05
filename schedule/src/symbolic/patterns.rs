@@ -1372,7 +1372,8 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
                 let gep_c = c.gep(indices.clone());
                 // Guard: skip if result would be pointer type (edge case: vector of pointers)
                 if matches!(gep_a.dtype(), DType::Ptr { .. }) { return None; }
-                Some(UOp::new(Op::Ternary(TernaryOp::MulAcc, gep_a.clone(), gep_b, gep_c), gep_a.dtype()))
+                // try_mulacc validates matching dtypes; returns None if mismatched
+                UOp::try_mulacc(gep_a, gep_b, gep_c).ok()
             },
 
         // 8. GEP through UNROLL: GEP(UNROLL(x, ...), indices) → GEP(x, indices)

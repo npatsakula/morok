@@ -210,8 +210,11 @@ fn test_dead_axis_removal_single_dead_axis() {
             // Should be EXPAND(RESHAPE(BUFFERIZE_no_ranges))
             if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
                 if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
-                    assert!(matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
-                        "Inner should be BUFFERIZE with no ranges, got: {}", rewritten.tree());
+                    assert!(
+                        matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
+                        "Inner should be BUFFERIZE with no ranges, got: {}",
+                        rewritten.tree()
+                    );
                 } else {
                     panic!("Expected RESHAPE inside EXPAND, got: {}", rewritten.tree());
                 }
@@ -249,8 +252,11 @@ fn test_dead_axis_removal_mixed_axes() {
             // Result is EXPAND(RESHAPE(BUFFERIZE_no_ranges)) - Tinygrad behavior
             if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
                 if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
-                    assert!(matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
-                        "Inner should be BUFFERIZE with no ranges, got: {}", rewritten.tree());
+                    assert!(
+                        matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
+                        "Inner should be BUFFERIZE with no ranges, got: {}",
+                        rewritten.tree()
+                    );
                 } else {
                     panic!("Expected RESHAPE inside EXPAND, got: {}", rewritten.tree());
                 }
@@ -289,8 +295,11 @@ fn test_dead_axis_removal_no_dead_axes_simple_compute() {
             // Result is EXPAND(RESHAPE(BUFFERIZE_no_ranges)) - Tinygrad behavior
             if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
                 if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
-                    assert!(matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
-                        "Inner should be BUFFERIZE with no ranges, got: {}", rewritten.tree());
+                    assert!(
+                        matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
+                        "Inner should be BUFFERIZE with no ranges, got: {}",
+                        rewritten.tree()
+                    );
                 } else {
                     panic!("Expected RESHAPE inside EXPAND, got: {}", rewritten.tree());
                 }

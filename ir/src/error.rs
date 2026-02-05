@@ -165,6 +165,12 @@ pub enum Error {
     /// BROADCAST requires scalar source.
     #[snafu(display("BROADCAST requires scalar source (vcount=1), got {dtype:?}"))]
     BroadcastRequiresScalar { dtype: DType },
+
+    /// MulAcc operands must have matching dtypes.
+    #[snafu(display(
+        "MulAcc operands must have matching dtypes (including vcount): a={a_dtype:?}, b={b_dtype:?}, c={c_dtype:?}"
+    ))]
+    MulAccDtypeMismatch { a_dtype: DType, b_dtype: DType, c_dtype: DType },
 }
 
 /// Enhance an error with provenance information for a UOp.

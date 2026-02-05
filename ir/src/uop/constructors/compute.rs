@@ -349,8 +349,20 @@ impl UOp {
     }
 
     /// Multiply-accumulate: a * b + c (fused operation).
+    ///
+    /// All operands must have matching dtypes (including vcount) for valid codegen.
+    /// Returns None if vcounts don't match - caller should fall back to Add(Mul(a,b), c).
     pub fn try_mulacc(a: Arc<Self>, b: Arc<Self>, c: Arc<Self>) -> Result<Arc<Self>> {
-        let dtype = a.dtype(); // Preserve first operand dtype
+        // Validate all operands have matching dtypes (including vcount) for valid fmuladd
+        if a.dtype() != b.dtype() || a.dtype() != c.dtype() {
+            return crate::error::MulAccDtypeMismatchSnafu {
+                a_dtype: a.dtype(),
+                b_dtype: b.dtype(),
+                c_dtype: c.dtype(),
+            }
+            .fail();
+        }
+        let dtype = a.dtype();
         // Validate all three operands have matching shapes
         Self::validate_ternary_shapes(&a, &b)?;
         Self::validate_ternary_shapes(&a, &c)?;

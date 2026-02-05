@@ -1738,7 +1738,8 @@ fn tree_reduce(elements: &[Arc<UOp>], reduce_op: ReduceOp, dtype: &DType) -> Arc
 pub fn pm_fma_decomposition() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // (a*b)+c or c+(a*b) → MulAcc(a,b,c) using commutative matching
-        Add[Mul(a, b), c] if a.dtype().is_float() => |a, b, c| {
+        // Dtype equality guard is an early-out; try_mulacc also validates matching dtypes.
+        Add[Mul(a, b), c] if a.dtype().is_float() && a.dtype() == b.dtype() && a.dtype() == c.dtype() => |a, b, c| {
             UOp::try_mulacc(a.clone(), b.clone(), c.clone()).ok()
         },
     }

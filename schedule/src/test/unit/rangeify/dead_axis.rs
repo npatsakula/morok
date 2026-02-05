@@ -33,11 +33,7 @@ fn get_inner_bufferize(result: &Arc<UOp>) -> Option<&Arc<UOp>> {
     let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() else {
         return None;
     };
-    if matches!(bufferize_op.op(), Op::Bufferize { .. }) {
-        Some(bufferize_op)
-    } else {
-        None
-    }
+    if matches!(bufferize_op.op(), Op::Bufferize { .. }) { Some(bufferize_op) } else { None }
 }
 
 #[test]
@@ -198,11 +194,7 @@ fn test_multiple_dead_axis_removal_passes() {
     let result2 = graph_rewrite_bottom_up(&matcher, result1.clone(), &mut ());
 
     // Both should produce same result (idempotent) - comparing tree structure
-    assert_eq!(
-        result1.tree(),
-        result2.tree(),
-        "Dead axis removal should be idempotent"
-    );
+    assert_eq!(result1.tree(), result2.tree(), "Dead axis removal should be idempotent");
 
     // Result should be EXPAND(RESHAPE(BUFFERIZE_no_ranges))
     assert!(

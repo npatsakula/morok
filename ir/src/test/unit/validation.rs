@@ -258,10 +258,17 @@ fn test_where_branch_dtype_compatibility() {
 
 #[test]
 fn test_mulacc_preserves_first_operand_dtype() {
-    // MulAcc preserves first operand dtype (a in a*b+c)
+    // MulAcc requires all operands to have matching dtypes
     let result =
-        UOp::try_mulacc(UOp::native_const(2.0f32), UOp::native_const(3.0f32), UOp::native_const(4i32)).unwrap();
+        UOp::try_mulacc(UOp::native_const(2.0f32), UOp::native_const(3.0f32), UOp::native_const(4.0f32)).unwrap();
     assert_eq!(result.dtype(), DType::Float32);
+}
+
+#[test]
+fn test_mulacc_rejects_mismatched_dtypes() {
+    // MulAcc with mismatched dtypes (Float32 vs Int32) should fail
+    let result = UOp::try_mulacc(UOp::native_const(2.0f32), UOp::native_const(3.0f32), UOp::native_const(4i32));
+    assert!(result.is_err());
 }
 
 // =========================================================================

@@ -104,5 +104,6 @@ fn test_ptrcat_basic() {
     let b = UOp::const_(ptr_dtype.clone(), ConstValue::Int(0));
 
     let result = UOp::ptrcat().sources(vec![a, b]).call();
-    assert_eq!(result.dtype(), ptr_dtype);
+    // PTRCAT of 2 scalar pointers → vcount=2
+    assert_eq!(result.dtype(), ptr_dtype.vec(2));
 }
