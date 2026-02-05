@@ -178,6 +178,17 @@ pub fn lcast(from: &DType, to: &DType) -> &'static str {
     let from_bytes = from_scalar.bytes();
     let to_bytes = to_scalar.bytes();
 
+    // Bool (i1) to any integer type needs zext - i1 is always smaller than i8+
+    // Note: Bool.bytes() returns 1 (storage size) but LLVM i1 is 1 bit, not 1 byte
+    if from_scalar.is_bool() && !to_scalar.is_bool() {
+        return "zext";
+    }
+
+    // Any integer to Bool needs trunc - truncate to 1 bit
+    if !from_scalar.is_bool() && to_scalar.is_bool() {
+        return "trunc";
+    }
+
     // Same size: bitcast (handles signed↔unsigned same-size casts)
     if from_bytes == to_bytes {
         return "bitcast";

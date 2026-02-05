@@ -268,7 +268,15 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
             // Apply GEP to each source, broadcasting scalars
             let new_sources: Vec<Arc<UOp>> =
                 sources.iter().map(|s| if s.dtype().vcount() > 1 { s.gep(vec![i]) } else { s.clone() }).collect();
-            alu.replace().dtype(scalar_dtype.clone()).src(new_sources).call()
+
+            // CAST and BITCAST need special handling: Op::Cast/BitCast has its own dtype field
+            // that must be updated to scalar, not just the UOp's result dtype.
+            // The generic replace chain doesn't update Op::Cast::dtype.
+            match alu.op() {
+                Op::Cast { .. } => new_sources[0].cast(scalar_dtype.clone()),
+                Op::BitCast { .. } => new_sources[0].bitcast(scalar_dtype.clone()),
+                _ => alu.replace().dtype(scalar_dtype.clone()).src(new_sources).call(),
+            }
         })
         .collect();
 

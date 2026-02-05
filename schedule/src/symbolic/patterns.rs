@@ -1313,6 +1313,7 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
         },
 
         // 6. Push GEP through Binary: GEP(Binary(op, a, b), indices) → Binary(op, GEP(a), GEP(b))
+        // Follows Tinygrad's approach (symbolic.py:165-168): result dtype is alu.dtype.scalar().vec(gep_count)
         // Guard: skip pointer types to avoid creating invalid pointer ALU ops
         Gep { vector, indices }
             if !indices.is_empty()
@@ -1324,7 +1325,15 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
                 let gep_b = b.gep(indices.clone());
                 // Guard: skip if result would be pointer type (edge case: vector of pointers)
                 if matches!(gep_a.dtype(), DType::Ptr { .. }) { return None; }
-                Some(UOp::new(Op::Binary(*bin_op, gep_a.clone(), gep_b), gep_a.dtype()))
+                // Result dtype: derived from original op's dtype (works for comparisons and all other ops)
+                let gep_count = indices.len();
+                let scalar_base = vector.dtype().base();
+                let result_dtype = if gep_count > 1 {
+                    DType::Scalar(scalar_base).vec(gep_count)
+                } else {
+                    DType::Scalar(scalar_base)
+                };
+                Some(UOp::new(Op::Binary(*bin_op, gep_a, gep_b), result_dtype))
             },
 
         // 7. Push GEP through Unary: GEP(Unary(op, x), indices) → Unary(op, GEP(x))
@@ -1351,8 +1360,9 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
                 let gep_t = t.gep(indices.clone());
                 let gep_f = f.gep(indices.clone());
                 // Guard: skip if result would be pointer type (edge case: vector of pointers)
-                if matches!(gep_cond.dtype(), DType::Ptr { .. }) { return None; }
-                Some(UOp::new(Op::Ternary(TernaryOp::Where, gep_cond.clone(), gep_t, gep_f), gep_cond.dtype()))
+                if matches!(gep_t.dtype(), DType::Ptr { .. }) { return None; }
+                // WHERE dtype comes from true_val (same as false_val), not from condition
+                Some(UOp::new(Op::Ternary(TernaryOp::Where, gep_cond, gep_t.clone(), gep_f), gep_t.dtype()))
             },
         Gep { vector: MulAcc(a, b, c), indices }
             if !indices.is_empty() && !matches!(a.dtype(), DType::Ptr { .. })
@@ -1436,8 +1446,9 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
         Gep { vector, indices } if matches!(vector.op(), Op::Cast { .. }) => |vector, indices| {
             let Op::Cast { src, dtype } = vector.op() else { return None };
             let inner_gep = src.gep(indices.clone());
-            // Compute result dtype: apply same scalar cast to extracted element type
-            let result_scalar = dtype.scalar().map(DType::Scalar)?;
+            // Compute result dtype: use scalar version of target dtype
+            // (scalar_dtype() works for both Scalar and Vector, unlike scalar())
+            let result_scalar = dtype.scalar_dtype();
             Some(inner_gep.cast(result_scalar))
         },
 
@@ -1446,8 +1457,8 @@ pub fn gep_pushing_patterns() -> TypedPatternMatcher {
         Gep { vector, indices } if matches!(vector.op(), Op::BitCast { .. }) => |vector, indices| {
             let Op::BitCast { src, dtype } = vector.op() else { return None };
             let inner_gep = src.gep(indices.clone());
-            // Compute result dtype: apply same scalar bitcast to extracted element type
-            let result_scalar = dtype.scalar().map(DType::Scalar)?;
+            // Compute result dtype: use scalar version of target dtype
+            let result_scalar = dtype.scalar_dtype();
             Some(inner_gep.bitcast(result_scalar))
         },
     }
