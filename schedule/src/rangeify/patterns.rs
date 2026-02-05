@@ -351,12 +351,12 @@ fn cleanup_dead_axes_bufferize(
         return None;
     }
 
-    // If all ranges are dead, just return compute
-    if new_ranges.is_empty() {
-        return Some(compute.clone());
-    }
+    // NOTE: Even when ALL ranges are dead (scalar output), we MUST keep the BUFFERIZE.
+    // Tinygrad keeps the BUFFERIZE with empty ranges, wraps with RESHAPE+EXPAND.
+    // The BUFFERIZE will be converted to STORE by pm_add_buffers_local_patterns later.
+    // Removing it here would cause NoKernelsFound since no STORE gets created.
 
-    // Create BUFFERIZE with fewer ranges
+    // Create BUFFERIZE with fewer (or zero) ranges
     let reduced = UOp::bufferize(compute.clone(), new_ranges, opts.clone());
 
     // RESHAPE to insert size-1 dims for dead axes

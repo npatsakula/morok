@@ -422,7 +422,7 @@ fn test_min_negative_value() {
 // ========== Argmax Tests (from Tinygrad test_ops.py:1087-1105) ==========
 
 #[test]
-
+#[tracing_test::traced_test]
 fn test_argmax_debug_steps() {
     let _guard = test_setup();
 

@@ -203,15 +203,21 @@ fn test_dead_axis_removal_single_dead_axis() {
 
     let result = matcher.rewrite(&bufferize, &mut ());
 
-    // Should remove the dead axis and return compute directly
+    // Should restructure to EXPAND(RESHAPE(BUFFERIZE_no_ranges)) - Tinygrad behavior
+    // The BUFFERIZE is KEPT (not removed) so it can be converted to STORE later.
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            // Either returns compute directly or BUFFERIZE with no ranges
-            // Since all ranges are dead, should return compute directly
-            assert!(
-                Arc::ptr_eq(&rewritten, &x) || matches!(rewritten.op(), Op::Bufferize { .. }),
-                "Should either return compute or empty BUFFERIZE"
-            );
+            // Should be EXPAND(RESHAPE(BUFFERIZE_no_ranges))
+            if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
+                if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
+                    assert!(matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
+                        "Inner should be BUFFERIZE with no ranges, got: {}", rewritten.tree());
+                } else {
+                    panic!("Expected RESHAPE inside EXPAND, got: {}", rewritten.tree());
+                }
+            } else {
+                panic!("Expected EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}", rewritten.tree());
+            }
         }
         _ => {
             // This is also acceptable if dead axis detection has specific conditions
@@ -239,11 +245,18 @@ fn test_dead_axis_removal_mixed_axes() {
 
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            // Since compute has no ranges, ALL ranges are dead → return compute directly
-            assert!(
-                Arc::ptr_eq(&rewritten, &x),
-                "When compute has no ranges, all BUFFERIZE ranges are dead → return compute"
-            );
+            // Since compute has no ranges, ALL ranges are dead
+            // Result is EXPAND(RESHAPE(BUFFERIZE_no_ranges)) - Tinygrad behavior
+            if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
+                if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
+                    assert!(matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
+                        "Inner should be BUFFERIZE with no ranges, got: {}", rewritten.tree());
+                } else {
+                    panic!("Expected RESHAPE inside EXPAND, got: {}", rewritten.tree());
+                }
+            } else {
+                panic!("Expected EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}", rewritten.tree());
+            }
         }
         _ => {
             // Pattern should match and rewrite when there are dead axes
@@ -270,13 +283,20 @@ fn test_dead_axis_removal_no_dead_axes_simple_compute() {
 
     let result = matcher.rewrite(&bufferize, &mut ());
 
-    // All ranges are dead (compute has no ranges) → should return compute directly
+    // All ranges are dead (compute has no ranges) → EXPAND(RESHAPE(BUFFERIZE_no_ranges))
     match result {
         RewriteResult::Rewritten(rewritten) => {
-            assert!(
-                Arc::ptr_eq(&rewritten, &x),
-                "When compute has no ranges, all BUFFERIZE ranges are dead → return compute"
-            );
+            // Result is EXPAND(RESHAPE(BUFFERIZE_no_ranges)) - Tinygrad behavior
+            if let Op::Expand { src: reshape_op, .. } = rewritten.op() {
+                if let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() {
+                    assert!(matches!(bufferize_op.op(), Op::Bufferize { ranges, .. } if ranges.is_empty()),
+                        "Inner should be BUFFERIZE with no ranges, got: {}", rewritten.tree());
+                } else {
+                    panic!("Expected RESHAPE inside EXPAND, got: {}", rewritten.tree());
+                }
+            } else {
+                panic!("Expected EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}", rewritten.tree());
+            }
         }
         _ => panic!("Expected pattern to match and rewrite when all ranges are dead"),
     }

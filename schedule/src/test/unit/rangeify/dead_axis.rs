@@ -5,9 +5,45 @@ use crate::rewrite::graph_rewrite_bottom_up;
 use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp};
 
+/// Helper to check if result is EXPAND(RESHAPE(BUFFERIZE_no_ranges, ...), ...)
+fn is_expand_reshape_bufferize(result: &Arc<UOp>) -> bool {
+    // Result should be EXPAND
+    let Op::Expand { src: reshape_op, .. } = result.op() else {
+        return false;
+    };
+
+    // Inner should be RESHAPE
+    let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() else {
+        return false;
+    };
+
+    // Innermost should be BUFFERIZE with empty ranges
+    let Op::Bufferize { ranges, .. } = bufferize_op.op() else {
+        return false;
+    };
+
+    ranges.is_empty()
+}
+
+/// Helper to get the innermost BUFFERIZE from EXPAND(RESHAPE(BUFFERIZE))
+fn get_inner_bufferize(result: &Arc<UOp>) -> Option<&Arc<UOp>> {
+    let Op::Expand { src: reshape_op, .. } = result.op() else {
+        return None;
+    };
+    let Op::Reshape { src: bufferize_op, .. } = reshape_op.op() else {
+        return None;
+    };
+    if matches!(bufferize_op.op(), Op::Bufferize { .. }) {
+        Some(bufferize_op)
+    } else {
+        None
+    }
+}
+
 #[test]
 fn test_bufferize_with_size_1_range() {
-    // BUFFERIZE(x, [RANGE(1)]) should have the dead axis removed
+    // BUFFERIZE(x, [RANGE(1)]) should be restructured to EXPAND(RESHAPE(BUFFERIZE(x, [])))
+    // This matches Tinygrad's behavior where BUFFERIZE is kept for later STORE creation.
     let x = UOp::define_global(1, DType::Float32);
     let dead_range = UOp::range_const(1, 0); // Size 1 = dead axis
 
@@ -16,13 +52,25 @@ fn test_bufferize_with_size_1_range() {
     let matcher = dead_axis_removal();
     let result = graph_rewrite_bottom_up(&matcher, bufferized, &mut ());
 
-    // Should return compute directly since all axes are dead
-    assert!(Arc::ptr_eq(&result, &x), "BUFFERIZE with only dead axis should return compute");
+    // Result should be EXPAND(RESHAPE(BUFFERIZE_no_ranges))
+    // The BUFFERIZE is KEPT (not removed) so it can be converted to STORE later.
+    assert!(
+        is_expand_reshape_bufferize(&result),
+        "BUFFERIZE with dead axis should be restructured to EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}",
+        result.tree()
+    );
+
+    // Verify the inner BUFFERIZE has the same compute
+    if let Some(inner_buf) = get_inner_bufferize(&result) {
+        if let Op::Bufferize { compute, .. } = inner_buf.op() {
+            assert!(Arc::ptr_eq(compute, &x), "Inner BUFFERIZE should have original compute");
+        }
+    }
 }
 
 #[test]
 fn test_bufferize_all_dead_axes() {
-    // BUFFERIZE(x, [RANGE(1), RANGE(1), RANGE(1)]) → x
+    // BUFFERIZE(x, [RANGE(1), RANGE(1), RANGE(1)]) → EXPAND(RESHAPE(BUFFERIZE(x, [])))
     let x = UOp::define_global(1, DType::Float32);
     let dead_ranges = vec![UOp::range_const(1, 0), UOp::range_const(1, 1), UOp::range_const(1, 2)];
 
@@ -31,15 +79,19 @@ fn test_bufferize_all_dead_axes() {
     let matcher = dead_axis_removal();
     let result = graph_rewrite_bottom_up(&matcher, bufferized, &mut ());
 
-    // All axes dead → return compute directly
-    assert!(Arc::ptr_eq(&result, &x), "All dead axes should be removed, returning compute");
+    // All axes dead → EXPAND(RESHAPE(BUFFERIZE_no_ranges))
+    assert!(
+        is_expand_reshape_bufferize(&result),
+        "All dead axes should produce EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}",
+        result.tree()
+    );
 }
 
 #[test]
 fn test_bufferize_mixed_live_dead_simple_compute() {
     // When compute is DEFINE_GLOBAL (has no ranges), ALL ranges are considered dead
     // because compute doesn't depend on any of them. This matches Tinygrad's behavior.
-    // BUFFERIZE(DEFINE_GLOBAL, [RANGE(10), RANGE(1), RANGE(20)]) → DEFINE_GLOBAL
+    // BUFFERIZE(DEFINE_GLOBAL, [RANGE(10), RANGE(1), RANGE(20)]) → EXPAND(RESHAPE(BUFFERIZE_no_ranges))
     let x = UOp::define_global(1, DType::Float32);
     let range1 = UOp::range_const(10, 0);
     let dead_range = UOp::range_const(1, 1);
@@ -50,8 +102,12 @@ fn test_bufferize_mixed_live_dead_simple_compute() {
     let matcher = dead_axis_removal();
     let result = graph_rewrite_bottom_up(&matcher, bufferized.clone(), &mut ());
 
-    // All ranges are dead (compute doesn't use them), so return compute directly
-    assert!(Arc::ptr_eq(&result, &x), "When compute has no ranges, all BUFFERIZE ranges are dead → return compute");
+    // All ranges are dead (compute doesn't use them) → EXPAND(RESHAPE(BUFFERIZE_no_ranges))
+    assert!(
+        is_expand_reshape_bufferize(&result),
+        "When compute has no ranges, result should be EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}",
+        result.tree()
+    );
 }
 
 #[test]
@@ -66,8 +122,12 @@ fn test_bufferize_no_dead_axes_simple_compute() {
     let matcher = dead_axis_removal();
     let result = graph_rewrite_bottom_up(&matcher, bufferized.clone(), &mut ());
 
-    // All ranges are dead → return compute directly
-    assert!(Arc::ptr_eq(&result, &x), "When compute has no ranges, all BUFFERIZE ranges are dead");
+    // All ranges are dead → EXPAND(RESHAPE(BUFFERIZE_no_ranges))
+    assert!(
+        is_expand_reshape_bufferize(&result),
+        "When compute has no ranges, result should be EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}",
+        result.tree()
+    );
 }
 
 // Pattern 2: INDEX Adjustment Tests
@@ -103,7 +163,7 @@ fn test_index_after_dead_axis_removal() {
 
 #[test]
 fn test_bufferize_dead_axis_with_constants() {
-    // Dead axes with CONST ranges should be removed
+    // Dead axes with CONST ranges should be removed, result wrapped in EXPAND(RESHAPE(...))
     let x = UOp::define_global(1, DType::Float32);
 
     // Create range with constant end = 1
@@ -114,14 +174,17 @@ fn test_bufferize_dead_axis_with_constants() {
     let matcher = dead_axis_removal();
     let result = graph_rewrite_bottom_up(&matcher, bufferized, &mut ());
 
-    // Should return compute directly
-    assert!(Arc::ptr_eq(&result, &x), "Dead axis with constant 1 should be removed");
+    // Should be EXPAND(RESHAPE(BUFFERIZE_no_ranges))
+    assert!(
+        is_expand_reshape_bufferize(&result),
+        "Dead axis with constant 1 should produce EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}",
+        result.tree()
+    );
 }
 
 #[test]
 fn test_multiple_dead_axis_removal_passes() {
     // Test that multiple passes of dead axis removal work correctly
-    // With DEFINE_GLOBAL compute (no ranges), ALL ranges are dead → returns compute
     let x = UOp::define_global(1, DType::Float32);
     let live_range = UOp::range_const(10, 0);
     let dead_range1 = UOp::range_const(1, 1);
@@ -134,11 +197,19 @@ fn test_multiple_dead_axis_removal_passes() {
     let result1 = graph_rewrite_bottom_up(&matcher, bufferized.clone(), &mut ());
     let result2 = graph_rewrite_bottom_up(&matcher, result1.clone(), &mut ());
 
-    // Both should produce same result (idempotent)
-    assert!(Arc::ptr_eq(&result1, &result2), "Dead axis removal should be idempotent");
+    // Both should produce same result (idempotent) - comparing tree structure
+    assert_eq!(
+        result1.tree(),
+        result2.tree(),
+        "Dead axis removal should be idempotent"
+    );
 
-    // All ranges are dead (compute doesn't use them) → return compute directly
-    assert!(Arc::ptr_eq(&result1, &x), "When compute has no ranges, all BUFFERIZE ranges are dead → return compute");
+    // Result should be EXPAND(RESHAPE(BUFFERIZE_no_ranges))
+    assert!(
+        is_expand_reshape_bufferize(&result1),
+        "Result should be EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}",
+        result1.tree()
+    );
 }
 
 #[test]
@@ -154,6 +225,10 @@ fn test_dead_axis_uint_constant() {
     let matcher = dead_axis_removal();
     let result = graph_rewrite_bottom_up(&matcher, bufferized, &mut ());
 
-    // Should return compute directly
-    assert!(Arc::ptr_eq(&result, &x), "Dead axis with UInt(1) should be removed");
+    // Should be EXPAND(RESHAPE(BUFFERIZE_no_ranges))
+    assert!(
+        is_expand_reshape_bufferize(&result),
+        "Dead axis with UInt(1) should produce EXPAND(RESHAPE(BUFFERIZE_no_ranges)), got: {}",
+        result.tree()
+    );
 }
