@@ -48,84 +48,82 @@ pub fn is_empty_range(uop: &Arc<UOp>) -> bool {
 /// The identity element is the value that has no effect in the reduction:
 /// - Add: 0 (x + 0 = x)
 /// - Mul: 1 (x * 1 = x)
-/// - Max: minimum value for dtype (max(x, MIN) = x)
+/// - Max: minimum value for dtype (max(x, -∞) = x)
+/// - Min: maximum value for dtype (min(x, +∞) = x)
+///
+/// Follows Tinygrad's approach (dtype.py:134-141): floats use ±inf,
+/// integers use type bounds, bools use false/true.
 pub fn reduce_identity(op: morok_ir::types::ReduceOp, dtype: morok_dtype::DType) -> Arc<UOp> {
-    use morok_dtype::DType;
-    use morok_ir::types::ConstValue::*;
+    use morok_ir::types::ConstValue::{Float, Int};
     use morok_ir::types::ReduceOp;
 
-    match op {
+    let val = match op {
         ReduceOp::Add => {
-            // 0 is identity for addition (x + 0 = x)
-            let zero = if dtype.is_float() { Float(0.0) } else { Int(0) };
-            UOp::const_(dtype, zero)
+            if dtype.is_float() {
+                Float(0.0)
+            } else {
+                Int(0)
+            }
         }
         ReduceOp::Mul => {
-            // 1 is identity for multiplication (x * 1 = x)
-            let one = if dtype.is_float() { Float(1.0) } else { Int(1) };
-            UOp::const_(dtype, one)
-        }
-        ReduceOp::Max => {
-            // Return dtype minimum value
-            let min_val = if dtype == DType::Int8 {
-                Int(i8::MIN as i64)
-            } else if dtype == DType::Int16 {
-                Int(i16::MIN as i64)
-            } else if dtype == DType::Int32 {
-                Int(i32::MIN as i64)
-            } else if dtype == DType::Int64 {
-                Int(i64::MIN)
-            } else if dtype == DType::UInt8 {
-                UInt(u8::MIN as u64)
-            } else if dtype == DType::UInt16 {
-                UInt(u16::MIN as u64)
-            } else if dtype == DType::UInt32 {
-                UInt(u32::MIN as u64)
-            } else if dtype == DType::UInt64 {
-                UInt(u64::MIN)
-            } else if dtype == DType::Float16 {
-                Float(-65504.0)
-            } else if dtype == DType::BFloat16 {
-                Float(-3.38953e38)
-            } else if dtype == DType::Float32 {
-                Float(f32::MIN as f64)
-            } else if dtype == DType::Float64 {
-                Float(f64::MIN)
+            if dtype.is_float() {
+                Float(1.0)
             } else {
-                Int(0) // Fallback for unsupported types
-            };
-            UOp::const_(dtype, min_val)
+                Int(1)
+            }
         }
-        ReduceOp::Min => {
-            // Return dtype maximum value
-            let max_val = if dtype == DType::Int8 {
-                Int(i8::MAX as i64)
-            } else if dtype == DType::Int16 {
-                Int(i16::MAX as i64)
-            } else if dtype == DType::Int32 {
-                Int(i32::MAX as i64)
-            } else if dtype == DType::Int64 {
-                Int(i64::MAX)
-            } else if dtype == DType::UInt8 {
-                UInt(u8::MAX as u64)
-            } else if dtype == DType::UInt16 {
-                UInt(u16::MAX as u64)
-            } else if dtype == DType::UInt32 {
-                UInt(u32::MAX as u64)
-            } else if dtype == DType::UInt64 {
-                UInt(u64::MAX)
-            } else if dtype == DType::Float16 {
-                Float(65504.0)
-            } else if dtype == DType::BFloat16 {
-                Float(3.38953e38)
-            } else if dtype == DType::Float32 {
-                Float(f32::MAX as f64)
-            } else if dtype == DType::Float64 {
-                Float(f64::MAX)
-            } else {
-                Int(0) // Fallback for unsupported types
-            };
-            UOp::const_(dtype, max_val)
-        }
+        ReduceOp::Max => dtype_min(&dtype),
+        ReduceOp::Min => dtype_max(&dtype),
+    };
+    UOp::const_(dtype, val)
+}
+
+/// Return the minimum value for a dtype (Tinygrad: dtypes.min).
+fn dtype_min(dtype: &morok_dtype::DType) -> morok_ir::types::ConstValue {
+    use morok_dtype::ScalarDType;
+    use morok_ir::types::ConstValue::{Bool, Float, Int, UInt};
+
+    if dtype.is_float() {
+        return Float(f64::NEG_INFINITY);
+    }
+    if dtype.is_bool() {
+        return Bool(false);
+    }
+    // Integer types: signed use MIN, unsigned use 0
+    match dtype.base() {
+        ScalarDType::Int8 => Int(i8::MIN as i64),
+        ScalarDType::Int16 => Int(i16::MIN as i64),
+        ScalarDType::Int32 => Int(i32::MIN as i64),
+        ScalarDType::Int64 | ScalarDType::Index => Int(i64::MIN),
+        ScalarDType::UInt8 => UInt(0),
+        ScalarDType::UInt16 => UInt(0),
+        ScalarDType::UInt32 => UInt(0),
+        ScalarDType::UInt64 => UInt(0),
+        _ => Int(0),
+    }
+}
+
+/// Return the maximum value for a dtype (Tinygrad: dtypes.max).
+fn dtype_max(dtype: &morok_dtype::DType) -> morok_ir::types::ConstValue {
+    use morok_dtype::ScalarDType;
+    use morok_ir::types::ConstValue::{Bool, Float, Int, UInt};
+
+    if dtype.is_float() {
+        return Float(f64::INFINITY);
+    }
+    if dtype.is_bool() {
+        return Bool(true);
+    }
+    // Integer types
+    match dtype.base() {
+        ScalarDType::Int8 => Int(i8::MAX as i64),
+        ScalarDType::Int16 => Int(i16::MAX as i64),
+        ScalarDType::Int32 => Int(i32::MAX as i64),
+        ScalarDType::Int64 | ScalarDType::Index => Int(i64::MAX),
+        ScalarDType::UInt8 => UInt(u8::MAX as u64),
+        ScalarDType::UInt16 => UInt(u16::MAX as u64),
+        ScalarDType::UInt32 => UInt(u32::MAX as u64),
+        ScalarDType::UInt64 => UInt(u64::MAX),
+        _ => Int(0),
     }
 }

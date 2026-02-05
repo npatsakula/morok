@@ -65,13 +65,28 @@ fn format_float(f: f64, dtype: &DType) -> String {
     }
 
     if f.is_infinite() {
-        // LLVM expects infinity in double-precision hex format for all float types
-        let sign = if f.is_sign_positive() { "" } else { "-" };
+        // LLVM expects infinity in hex format with sign encoded in bits
         return match scalar {
-            ScalarDType::Float64 | ScalarDType::Float32 => format!("{}0x7FF0000000000000", sign),
-            ScalarDType::Float16 => format!("{}0xH7C00", sign),
-            ScalarDType::BFloat16 => format!("{}0xR7F80", sign),
-            _ => format!("{}inf", sign),
+            ScalarDType::Float64 | ScalarDType::Float32 => {
+                // Use bit representation (sign is encoded in the high bit)
+                // +inf = 0x7FF0000000000000, -inf = 0xFFF0000000000000
+                format!("0x{:016X}", f.to_bits())
+            }
+            ScalarDType::Float16 => {
+                // Half precision: +inf = 0x7C00, -inf = 0xFC00
+                if f.is_sign_positive() { "0xH7C00".to_string() } else { "0xHFC00".to_string() }
+            }
+            ScalarDType::BFloat16 => {
+                // BFloat16: +inf = 0x7F80, -inf = 0xFF80
+                if f.is_sign_positive() { "0xR7F80".to_string() } else { "0xRFF80".to_string() }
+            }
+            _ => {
+                if f.is_sign_positive() {
+                    "inf".to_string()
+                } else {
+                    "-inf".to_string()
+                }
+            }
         };
     }
 
