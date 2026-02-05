@@ -14,8 +14,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use morok_ir::{AddrSpace, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
-use smallvec::SmallVec;
+use morok_ir::shape::Shape;
+use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
+use smallvec::{SmallVec, smallvec};
 use tracing::{debug, trace};
 
 use super::context::RangeifyContext;
@@ -763,6 +764,127 @@ fn apply_buffer_removal_protecting_sink(
 // BUFFERIZE TO STORE CONVERSION
 // ============================================================================
 
+// ============================================================================
+// HELPER FUNCTIONS FOR BUFFERIZE_TO_STORE
+// ============================================================================
+
+/// Apply movement ops chain in reverse order.
+/// Walks from chain root to base using pattern matching.
+/// Uses existing .base() method at ir/src/uop/core.rs:425-438.
+fn apply_movement_ops_chain(result: &Arc<UOp>, chain: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let mut mops = Vec::new();
+    let mut walk = chain.clone();
+
+    // Walk chain collecting movement ops using pattern matching
+    while walk.op().is_movement() {
+        mops.push(walk.clone());
+        // Extract src via pattern matching
+        walk = match walk.op() {
+            Op::Reshape { src, .. }
+            | Op::Permute { src, .. }
+            | Op::Expand { src, .. }
+            | Op::Pad { src, .. }
+            | Op::Shrink { src, .. }
+            | Op::Flip { src, .. } => src.clone(),
+            _ => break,
+        };
+    }
+
+    // Apply in reverse order
+    let mut current = result.clone();
+    for mop in mops.into_iter().rev() {
+        current = apply_single_movement_op(&current, mop.op())?;
+    }
+
+    Some(current)
+}
+
+/// Apply a single movement operation.
+///
+/// Note: This extracts shape from the movement op's stored source (which has the
+/// target shape after the movement) rather than from UOp shape metadata.
+fn apply_single_movement_op(uop: &Arc<UOp>, op: &Op) -> Option<Arc<UOp>> {
+    match op {
+        Op::Reshape { new_shape, .. } => {
+            let shape = extract_shape_from_uop(new_shape)?;
+            uop.try_reshape(&shape).ok()
+        }
+        Op::Permute { axes, .. } => uop.try_permute(axes.clone()).ok(),
+        Op::Expand { new_shape, .. } => {
+            let shape = extract_shape_from_uop(new_shape)?;
+            uop.try_expand(&shape).ok()
+        }
+        Op::Pad { begin_pads, end_pads, .. } => {
+            let begins = extract_shape_from_uop(begin_pads)?;
+            let ends = extract_shape_from_uop(end_pads)?;
+            let padding: Vec<_> = begins.into_iter().zip(ends).collect();
+            uop.try_pad(&padding).ok()
+        }
+        Op::Shrink { begins, ends, .. } => {
+            let begin_shape = extract_shape_from_uop(begins)?;
+            let end_shape = extract_shape_from_uop(ends)?;
+            let ranges: Vec<_> = begin_shape.into_iter().zip(end_shape).collect();
+            uop.try_shrink(&ranges).ok()
+        }
+        Op::Flip { axes, .. } => uop.try_flip(axes.clone()).ok(),
+        _ => None,
+    }
+}
+
+/// Extract shape from a UOp (for movement op parameters).
+/// Handles VECTORIZE, CONST, and VCONST patterns.
+fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
+    use morok_ir::SInt;
+    match shape_uop.op() {
+        // VECTORIZE with Index-typed elements
+        Op::Vectorize { elements } => Some(elements.iter().cloned().map(SInt::from).collect()),
+        // Single CONST value (for 1D shapes)
+        Op::Const(const_hash) => match const_hash.0 {
+            ConstValue::Int(v) if v >= 0 => Some(smallvec![SInt::from(v as usize)]),
+            ConstValue::UInt(v) => Some(smallvec![SInt::from(v as usize)]),
+            _ => None,
+        },
+        // VConst for multiple concrete dimensions
+        Op::VConst { values } => {
+            let mut dims = smallvec![];
+            for val in values {
+                match val {
+                    ConstValue::Int(v) if *v >= 0 => dims.push(SInt::from(*v as usize)),
+                    ConstValue::UInt(v) => dims.push(SInt::from(*v as usize)),
+                    _ => return None,
+                }
+            }
+            Some(dims)
+        }
+        _ => None,
+    }
+}
+
+/// Create a LOOP range from an OUTER range with the same axis_id.
+fn create_loop_range_from_outer(outer: &Arc<UOp>, size: usize) -> Option<Arc<UOp>> {
+    use morok_ir::AxisType;
+    let Op::Range { axis_id, .. } = outer.op() else {
+        return None;
+    };
+    Some(UOp::range_axis(UOp::index_const(size as i64), *axis_id, AxisType::Loop))
+}
+
+/// Convert ReduceOp to binary operation.
+fn reduce_op_to_binary(op: morok_ir::ReduceOp, lhs: &Arc<UOp>, rhs: &Arc<UOp>) -> Option<Arc<UOp>> {
+    use morok_ir::types::{BinaryOp, ReduceOp};
+    let dtype = lhs.dtype();
+    Some(match op {
+        ReduceOp::Add => UOp::new(Op::Binary(BinaryOp::Add, lhs.clone(), rhs.clone()), dtype),
+        ReduceOp::Mul => UOp::new(Op::Binary(BinaryOp::Mul, lhs.clone(), rhs.clone()), dtype),
+        ReduceOp::Max => UOp::new(Op::Binary(BinaryOp::Max, lhs.clone(), rhs.clone()), dtype),
+        ReduceOp::Min => {
+            // Min uses WHERE(a < b, a, b) pattern
+            let cond = UOp::new(Op::Binary(BinaryOp::Lt, lhs.clone(), rhs.clone()), morok_dtype::DType::Bool);
+            UOp::try_where(cond, lhs.clone(), rhs.clone()).ok()?
+        }
+    })
+}
+
 /// Calculate buffer size from RANGE operations.
 fn calculate_size_from_ranges(ranges: &SmallVec<[Arc<UOp>; 4]>) -> usize {
     if ranges.is_empty() {
@@ -819,6 +941,121 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
         other => other,
     };
 
+    // Calculate sdtype explicitly like Tinygrad (rangeify.py:306):
+    //   sdtype = x.dtype.ptr(size=size, addrspace=x.arg.addrspace)
+    // This is the pointer type used for STORE targets, ensuring consistent
+    // size and addrspace across all INDEX operations in this function.
+    let sdtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
+
+    // Get end_ranges for wrapping stores
+    let end_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.clone();
+
+    // =========================================================================
+    // Case 1: ASSIGN → STORE (reuse existing buffer from ASSIGN target)
+    // Tinygrad reference: rangeify.py:307-320
+    // =========================================================================
+    if let Op::Assign { target, value, movement_ops } = compute.op() {
+        // Target must be an INDEX pointing to a buffer
+        let Op::Index { buffer, indices, gate } = target.op() else {
+            return None;
+        };
+
+        // Create store target with explicit sdtype (Tinygrad: assign_target.replace(dtype=sdtype))
+        let store_target = UOp::index()
+            .buffer(buffer.clone())
+            .indices(indices.to_vec())
+            .maybe_gate(gate.clone())
+            .dtype(sdtype.clone())
+            .call()
+            .ok()?;
+
+        // Create STORE and wrap with END
+        let store = store_target.store_value(value.clone());
+        let do_store = if end_ranges.is_empty() { store } else { store.end(end_ranges.clone()) };
+
+        // Apply movement ops in reverse order
+        let mut result = buffer.after(smallvec![do_store]);
+        if let Some(mops_chain) = movement_ops {
+            result = apply_movement_ops_chain(&result, mops_chain)?;
+        }
+
+        ctx.map_buffer(bufferize_op.clone(), result.clone());
+        return Some(result);
+    }
+
+    // =========================================================================
+    // Case 2: OUTER REDUCE with zero initialization
+    // Tinygrad reference: rangeify.py:323-332
+    // =========================================================================
+    if let Op::Reduce { src: reduce_src, ranges: reduce_ranges, reduce_op } = compute.op() {
+        // OUTER reduce case: exactly ONE range that is OUTER type
+        // Tinygrad: len(x.src[0].src) == 2 means src + 1 range
+        if reduce_ranges.len() == 1
+            && let Op::Range { axis_type, .. } = reduce_ranges[0].op()
+                && *axis_type == AxisType::Outer {
+                    // Must be global address space
+                    if opts.addrspace != AddrSpace::Global {
+                        return None;
+                    }
+
+                    let outer_range = reduce_ranges[0].clone();
+                    let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
+
+                    // Create buffer
+                    let buf = UOp::new_buffer(device, size, base_dtype.clone());
+
+                    // Create zero-init range (same axis_id but AxisType::Loop)
+                    let zero_range = create_loop_range_from_outer(&outer_range, size)?;
+
+                    // Get identity value for reduce op
+                    use crate::symbolic::dce::reduce_identity;
+                    let identity = reduce_identity(*reduce_op, base_dtype.clone());
+
+                    // Zero-initialize: buf[zero_range] = identity
+                    let zero_idx = UOp::index()
+                        .buffer(buf.clone())
+                        .indices(vec![zero_range.clone()])
+                        .dtype(sdtype.clone())
+                        .call()
+                        .ok()?;
+                    let zero_store = zero_idx.store_value(identity).end(smallvec![zero_range.clone()]);
+                    let buf_zeroed = buf.after(smallvec![zero_store]);
+
+                    // Build linear index from BUFFERIZE ranges (not reduce ranges)
+                    let linear_index = if ranges.len() > 1 {
+                        let dims: Vec<i64> = ranges.iter().filter_map(range_size_as_i64).collect();
+                        if dims.len() == ranges.len() {
+                            let strides = compute_row_major_strides(&dims);
+                            let indices: Vec<Arc<UOp>> = ranges.iter().cloned().collect();
+                            build_linear_index(&indices, &strides)
+                        } else {
+                            ranges[0].clone() // Fallback for symbolic
+                        }
+                    } else if !ranges.is_empty() {
+                        ranges[0].clone()
+                    } else {
+                        UOp::index_const(0)
+                    };
+
+                    // Accumulation: buf[idx] = buf[idx] OP reduce_src (Tinygrad: bufi = buf.index(idx, dtype=sdtype))
+                    let buf_idx = UOp::index()
+                        .buffer(buf_zeroed.clone())
+                        .indices(vec![linear_index])
+                        .dtype(sdtype.clone())
+                        .call()
+                        .ok()?;
+                    let loaded = UOp::load().buffer(buf_zeroed.clone()).index(buf_idx.clone()).call();
+                    let accumulated = reduce_op_to_binary(*reduce_op, &loaded, reduce_src)?;
+
+                    // Wrap store with both end_ranges AND outer_range
+                    let do_store = buf_idx.store_value(accumulated).end(end_ranges.clone()).end(smallvec![outer_range]);
+
+                    let result = buf_zeroed.after(smallvec![do_store]);
+                    ctx.map_buffer(bufferize_op.clone(), result.clone());
+                    return Some(result);
+                }
+    }
+
     // Determine effective address space based on allow_locals parameter
     // Tinygrad has two matchers:
     // - pm_add_buffers (allow_locals=False): treats local as global
@@ -836,7 +1073,14 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
         // For local address space (only when allow_locals=true), create DEFINE_LOCAL directly (like Tinygrad)
         let local_ptr_dtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
         let local_id = ctx.next_local();
-        UOp::define_local(local_id, local_ptr_dtype)
+        let local_buf = UOp::define_local(local_id, local_ptr_dtype);
+
+        // Broadcast to vector count if needed (Tinygrad: rangeify.py:343)
+        // Tinygrad uses x.src[1].dtype.count (the idx's vcount). In Morok, we use
+        // compute.dtype().vcount() which should match since the stored value's
+        // vectorization determines the indexing granularity.
+        let vcount = compute.dtype().vcount();
+        if vcount > 1 { local_buf.broadcast(vcount) } else { local_buf }
     };
 
     // Use ptr=true to keep Ptr dtype for STORE targets (Tinygrad-aligned).
@@ -871,7 +1115,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
                 UOp::index()
                     .buffer(buffer.clone())
                     .indices(vec![linear_index])
-                    .ptr(true)
+                    .dtype(sdtype.clone())
                     .call()
                     .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
             } else {
@@ -886,7 +1130,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
                 UOp::index()
                     .buffer(buffer.clone())
                     .indices(ranges.to_vec())
-                    .ptr(true)
+                    .dtype(sdtype.clone())
                     .call()
                     .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
             }
@@ -895,16 +1139,16 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
             UOp::index()
                 .buffer(buffer.clone())
                 .indices(ranges.to_vec())
-                .ptr(true)
+                .dtype(sdtype.clone())
                 .call()
                 .expect("Failed to create INDEX for BUFFERIZE-to-STORE conversion")
         }
     } else {
-        // Scalar store: create INDEX with buffer + index 0 and ptr=true for Ptr dtype
+        // Scalar store: create INDEX with buffer + index 0 and explicit sdtype
         UOp::index()
             .buffer(buffer.clone())
             .indices(vec![UOp::index_const(0)])
-            .ptr(true)
+            .dtype(sdtype.clone())
             .call()
             .expect("Failed to create INDEX for scalar STORE")
     };

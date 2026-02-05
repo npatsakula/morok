@@ -1053,13 +1053,23 @@ impl UOp {
                 }
                 Op::Bind { var: new_var, value: new_value }
             }
-            Op::Assign { target, value } => {
+            Op::Assign { target, value, movement_ops } => {
                 let new_target = target.substitute(map);
                 let new_value = value.substitute(map);
-                if Arc::ptr_eq(&new_target, target) && Arc::ptr_eq(&new_value, value) {
+                let new_mops = movement_ops.as_ref().map(|m| m.substitute(map));
+
+                let target_same = Arc::ptr_eq(&new_target, target);
+                let value_same = Arc::ptr_eq(&new_value, value);
+                let mops_same = match (movement_ops, &new_mops) {
+                    (None, None) => true,
+                    (Some(old), Some(new)) => Arc::ptr_eq(old, new),
+                    _ => false,
+                };
+
+                if target_same && value_same && mops_same {
                     return self.clone();
                 }
-                Op::Assign { target: new_target, value: new_value }
+                Op::Assign { target: new_target, value: new_value, movement_ops: new_mops }
             }
             Op::Load { buffer, index, alt } => {
                 let new_buffer = buffer.substitute(map);
@@ -1501,8 +1511,12 @@ impl UOp {
                 }
             }
             Op::Assign { .. } => {
-                assert_eq!(new_srcs.len(), 2);
-                Op::Assign { target: src(0), value: src(1) }
+                assert!(new_srcs.len() >= 2 && new_srcs.len() <= 3, "Assign requires 2-3 sources");
+                Op::Assign {
+                    target: src(0),
+                    value: src(1),
+                    movement_ops: if new_srcs.len() > 2 { Some(src(2)) } else { None },
+                }
             }
             Op::Detach { .. } => {
                 assert_eq!(new_srcs.len(), 1);

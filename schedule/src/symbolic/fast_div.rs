@@ -159,8 +159,8 @@ pub fn fast_division_patterns() -> TypedPatternMatcher {
 
                 if reduced_divisor > 1 && !is_power_of_two(reduced_divisor) {
                     let max_abs = reduced_vmax.max(reduced_vmin.abs());
-                    if let Some((m, s)) = magic_unsigned(max_abs, reduced_divisor) {
-                        if m.checked_mul(reduced_vmin).is_some() && m.checked_mul(reduced_vmax).is_some() {
+                    if let Some((m, s)) = magic_unsigned(max_abs, reduced_divisor)
+                        && m.checked_mul(reduced_vmin).is_some() && m.checked_mul(reduced_vmax).is_some() {
                             let dtype = x.dtype();
                             let m_const = UOp::const_(dtype.clone(), ConstValue::Int(m));
                             let s_const = UOp::const_(dtype.clone(), ConstValue::Int(s as i64));
@@ -178,7 +178,6 @@ pub fn fast_division_patterns() -> TypedPatternMatcher {
                                 return Some(base.add(&adjustment));
                             }
                         }
-                    }
                 } else if reduced_divisor == 1 {
                     // d was a power of 2, just shift (shouldn't reach here due to guard above)
                     return Some(shifted);

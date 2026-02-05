@@ -42,9 +42,22 @@ impl UOp {
     // =========================================================================
 
     /// In-place assignment.
+    ///
+    /// # Arguments
+    /// * `target` - The INDEX operation for the assignment destination
+    /// * `value` - The value to assign
     pub fn assign(target: Arc<Self>, value: Arc<Self>) -> Arc<Self> {
+        Self::assign_with_mops(target, value, None)
+    }
+
+    /// In-place assignment with movement ops chain.
+    ///
+    /// The `movement_ops` parameter captures shape transformations from the
+    /// original target, used during bufferize_to_store to apply the same
+    /// transformations to the result buffer.
+    pub fn assign_with_mops(target: Arc<Self>, value: Arc<Self>, movement_ops: Option<Arc<Self>>) -> Arc<Self> {
         let dtype = target.dtype();
-        Self::new(Op::Assign { target, value }, dtype)
+        Self::new(Op::Assign { target, value, movement_ops }, dtype)
     }
 
     // =========================================================================

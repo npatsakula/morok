@@ -982,16 +982,16 @@ fn offset_divides_evenly(offset: &Arc<UOp>, len: usize) -> bool {
         Op::VConst { values } => values.iter().all(|val| matches!(val, ConstValue::Int(n) if n % v == 0)),
 
         // ADD: both operands must divide
-        Op::Binary(BinaryOp::Add, left, right) => {
-            offset_divides_evenly(left, len) && offset_divides_evenly(right, len)
-        }
+        Op::Binary(BinaryOp::Add, left, right) => offset_divides_evenly(left, len) && offset_divides_evenly(right, len),
 
         // MUL: either operand divides (matching Tinygrad - no n >= len check!)
         Op::Binary(BinaryOp::Mul, left, right) => {
-            let check_const = |c: &Arc<UOp>| {
-                matches!(c.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(n) if n % v == 0))
-            };
-            check_const(left) || check_const(right) || offset_divides_evenly(left, len) || offset_divides_evenly(right, len)
+            let check_const =
+                |c: &Arc<UOp>| matches!(c.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(n) if n % v == 0));
+            check_const(left)
+                || check_const(right)
+                || offset_divides_evenly(left, len)
+                || offset_divides_evenly(right, len)
         }
 
         _ => false,
