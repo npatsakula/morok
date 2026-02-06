@@ -12,7 +12,12 @@ fn create_const(val: i64) -> Arc<UOp> {
 
 fn create_range(end: i64, axis_id: usize) -> Arc<UOp> {
     UOp::new(
-        Op::Range { end: create_const(end), axis_id: AxisId::Renumbered(axis_id), axis_type: AxisType::Loop },
+        Op::Range {
+            end: create_const(end),
+            axis_id: AxisId::Renumbered(axis_id),
+            axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Index,
     )
 }

@@ -41,7 +41,12 @@ fn test_transform_realizable_source() {
 
     // Create ranges
     let range = UOp::new(
-        Op::Range { end: UOp::index_const(5), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::index_const(5),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Index,
     );
 

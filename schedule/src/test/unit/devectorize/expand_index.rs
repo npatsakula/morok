@@ -304,6 +304,7 @@ fn test_expand_range_based_index() {
             end: UOp::const_(DType::Index, ConstValue::Int(64)),
             axis_id: AxisId::Renumbered(0),
             axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
         },
         DType::Index,
     );
@@ -358,6 +359,7 @@ fn test_expand_symbolic_root_grouping() {
             end: UOp::const_(DType::Index, ConstValue::Int(64)),
             axis_id: AxisId::Renumbered(0),
             axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
         },
         DType::Index,
     );
@@ -414,6 +416,7 @@ fn test_expand_different_roots_separate() {
             end: UOp::const_(DType::Index, ConstValue::Int(64)),
             axis_id: AxisId::Renumbered(0),
             axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
         },
         DType::Index,
     );
@@ -423,6 +426,7 @@ fn test_expand_different_roots_separate() {
             end: UOp::const_(DType::Index, ConstValue::Int(64)),
             axis_id: AxisId::Renumbered(1),
             axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
         },
         DType::Index,
     );

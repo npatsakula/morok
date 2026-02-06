@@ -257,6 +257,7 @@ pub fn create_index_with_range(buffer: Arc<UOp>, axis_id: usize, bound: i64, sca
             end: UOp::const_(DType::Index, ConstValue::Int(bound)),
             axis_id: AxisId::Renumbered(axis_id),
             axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
         },
         DType::Index,
     );

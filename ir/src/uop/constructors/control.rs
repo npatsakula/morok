@@ -23,7 +23,7 @@ impl UOp {
 
     /// Create a Range operation with specified axis type.
     pub fn range_axis(end: Arc<Self>, axis_id: AxisId, axis_type: AxisType) -> Arc<Self> {
-        Self::new(Op::Range { end, axis_id, axis_type }, DType::Index)
+        Self::new(Op::Range { end, axis_id, axis_type, deps: SmallVec::new() }, DType::Index)
     }
 
     /// Create a RANGE operation with Loop axis type (convenience for tests).

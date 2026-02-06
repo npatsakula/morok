@@ -404,7 +404,7 @@ fn test_shift_to_basic_split() {
     let (replaced_rng, new_rng) = result.unwrap();
 
     // Verify the reduced range has size 4 (16 / 4)
-    if let Op::Range { end, axis_id, axis_type } = replaced_rng.op() {
+    if let Op::Range { end, axis_id, axis_type, .. } = replaced_rng.op() {
         assert_eq!(axis_id, &AxisId::Renumbered(0)); // Same axis_id
         assert_eq!(axis_type, &AxisType::Global); // Same type
         if let Op::Const(cv) = end.op()
@@ -419,7 +419,7 @@ fn test_shift_to_basic_split() {
     }
 
     // Verify the new range has size 4 and type Upcast
-    if let Op::Range { end, axis_id, axis_type } = new_rng.op() {
+    if let Op::Range { end, axis_id, axis_type, .. } = new_rng.op() {
         assert_eq!(axis_id, &AxisId::Renumbered(1)); // New axis_id = maxarg + 1
         assert_eq!(axis_type, &AxisType::Upcast);
         if let Op::Const(cv) = end.op()

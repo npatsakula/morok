@@ -493,7 +493,7 @@ fn test_pattern_composition_sequence() {
     match result1 {
         Some(renumbered) => {
             // Should be renumbered to ID 0 (first in sequence)
-            if let Op::Range { axis_id, end, axis_type } = renumbered.op() {
+            if let Op::Range { axis_id, end, axis_type, .. } = renumbered.op() {
                 assert_eq!(*axis_id, AxisId::Renumbered(0));
                 assert_eq!(*axis_type, AxisType::Reduce);
 
@@ -530,7 +530,7 @@ fn test_pattern_composition_sequence_no_bind() {
     match result1 {
         Some(new_range) => {
             // LOOP should return plain Range (codegen creates loops from RANGE ops)
-            if let Op::Range { axis_id, axis_type, end } = new_range.op() {
+            if let Op::Range { axis_id, axis_type, end, .. } = new_range.op() {
                 assert_eq!(*axis_id, AxisId::Renumbered(0));
                 assert_eq!(*axis_type, AxisType::Loop);
 

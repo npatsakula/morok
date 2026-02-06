@@ -229,7 +229,7 @@ impl UOp {
     /// ```
     pub fn divisible_by(self: &Arc<Self>, amount: usize) -> Option<usize> {
         // For RANGE operations, check the end (size) field
-        if let Op::Range { end, axis_id: _, axis_type: _ } = self.op() {
+        if let Op::Range { end, .. } = self.op() {
             // Check if end is a constant
             if let Op::Const(cv) = end.op()
                 && let ConstValue::Int(sz) = cv.0
@@ -275,7 +275,7 @@ impl UOp {
     /// // global_range has same size and axis_id, but different axis type
     /// ```
     pub fn with_axis_type(self: &Arc<Self>, new_type: AxisType) -> Arc<Self> {
-        if let Op::Range { end, axis_id, axis_type: _ } = self.op() {
+        if let Op::Range { end, axis_id, .. } = self.op() {
             Self::range_axis(end.clone(), *axis_id, new_type)
         } else {
             panic!("with_axis_type() called on non-RANGE operation: {:?}", self.op);

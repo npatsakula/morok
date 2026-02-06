@@ -269,6 +269,7 @@ fn test_split_preserves_ranges() {
             end: UOp::const_(DType::Index, ConstValue::Int(10)),
             axis_id: AxisId::Renumbered(0),
             axis_type: morok_ir::AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
         },
         DType::Index,
     );

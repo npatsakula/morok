@@ -241,12 +241,12 @@ fn apply_swap(scheduler: &mut Scheduler, axis: usize, other_axis: usize) -> Resu
     let (rng1, rng2) = (&rngs[axis], &rngs[other_axis]);
 
     let (end1, axis_id1, axis_type1) = match rng1.op() {
-        Op::Range { end, axis_id, axis_type } => (end.clone(), *axis_id, *axis_type),
+        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
     let (end2, axis_id2, axis_type2) = match rng2.op() {
-        Op::Range { end, axis_id, axis_type } => (end.clone(), *axis_id, *axis_type),
+        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 
@@ -317,7 +317,7 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
     use morok_ir::ReduceOp;
 
     let (end, axis_id, axis_type) = match rng.op() {
-        Op::Range { end, axis_id, axis_type } => (end.clone(), *axis_id, *axis_type),
+        Op::Range { end, axis_id, axis_type, .. } => (end.clone(), *axis_id, *axis_type),
         _ => return ExpectedRangeOperationSnafu.fail(),
     };
 

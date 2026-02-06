@@ -91,14 +91,6 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
     // Step 1: Toposort from sink
     let nodes = sink.toposort();
 
-    // Debug: Log all nodes in toposort
-    let range_ids: Vec<u64> = nodes.iter().filter(|n| matches!(n.op(), Op::Range { .. })).map(|n| n.id).collect();
-    tracing::debug!(
-        toposort_count = nodes.len(),
-        range_ids = ?range_ids,
-        "linearize: toposort completed"
-    );
-
     if nodes.is_empty() {
         return vec![sink];
     }
@@ -223,212 +215,6 @@ pub fn linearize(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
     result
 }
 
-/// Linearize a UOp DAG with additional control flow edges.
-///
-/// Like `linearize`, but also respects control flow edges from CFGContext.
-/// These edges create additional dependencies: if edge[RANGE] = predecessor,
-/// then RANGE can't be scheduled until predecessor is processed.
-///
-/// # Arguments
-///
-/// * `sink` - The root UOp (typically a SINK operation)
-/// * `edges` - Control flow edges from CFGContext (RANGE → predecessor)
-///
-/// # Algorithm
-///
-/// The edges are treated as additional "virtual consumers":
-/// - For each edge (RANGE → predecessor), RANGE acts as a consumer of predecessor
-/// - This ensures predecessor is processed before RANGE in the linearized output
-#[allow(clippy::mutable_key_type)]
-pub fn linearize_with_edges(sink: Arc<UOp>, edges: &HashMap<UOpKey, Arc<UOp>>) -> Vec<Arc<UOp>> {
-    // Step 1: Toposort from sink
-    let nodes = sink.toposort();
-
-    // Debug: Log all nodes in toposort
-    let range_ids: Vec<u64> = nodes.iter().filter(|n| matches!(n.op(), Op::Range { .. })).map(|n| n.id).collect();
-    tracing::debug!(
-        toposort_count = nodes.len(),
-        range_ids = ?range_ids,
-        "linearize_with_edges: toposort completed"
-    );
-
-    if nodes.is_empty() {
-        return vec![sink];
-    }
-
-    // Step 2: Build consumer graph + priorities
-    // CRITICAL: Must iterate in REVERSE order for correct consumer counting
-    #[allow(clippy::mutable_key_type)]
-    let mut consumers: HashMap<UOpKey, Vec<Arc<UOp>>> = HashMap::new();
-    #[allow(clippy::mutable_key_type)]
-    let mut out_degree: HashMap<UOpKey, usize> = HashMap::new();
-    #[allow(clippy::mutable_key_type)]
-    let mut priorities: HashMap<UOpKey, OrderKey> = HashMap::new();
-    // Map from UOp ID to Arc<UOp> for lookup
-    let mut id_to_uop: HashMap<u64, Arc<UOp>> = HashMap::new();
-
-    for u in nodes.iter().rev() {
-        id_to_uop.insert(u.id, u.clone());
-
-        // Build consumer graph from regular sources
-        for src in u.op().sources() {
-            consumers.entry(UOpKey(src.clone())).or_default().push(u.clone());
-        }
-
-        // Compute run count from ranges
-        let run_count = compute_run_count(u);
-
-        // Assign priority based on operation type
-        let (base_priority, arg_value) = get_priority(u);
-
-        priorities.insert(
-            UOpKey(u.clone()),
-            OrderKey { run_count, priority: base_priority, arg_value, ideal_pos: 0, id: u.id },
-        );
-    }
-
-    // Add CFG edges as virtual consumer relationships
-    // If edge[RANGE] = predecessor, then RANGE "consumes" predecessor
-    for (range_key, predecessor) in edges {
-        // Only process if both nodes are in our toposort
-        if id_to_uop.contains_key(&range_key.0.id) && id_to_uop.contains_key(&predecessor.id) {
-            consumers.entry(UOpKey(predecessor.clone())).or_default().push(range_key.0.clone());
-        }
-    }
-
-    // Initialize out_degree (number of consumers)
-    for node in &nodes {
-        let key = UOpKey(node.clone());
-        let degree = consumers.get(&key).map_or(0, |c| c.len());
-        out_degree.insert(key, degree);
-    }
-
-    // Step 3: Create ideal ordering sorted by priority
-    let mut sorted: Vec<_> = nodes.to_vec();
-    sorted.sort_by_key(|u| {
-        priorities.get(&UOpKey(u.clone())).cloned().unwrap_or(OrderKey {
-            run_count: 0,
-            priority: priority::DEFAULT,
-            arg_value: None,
-            ideal_pos: 0,
-            id: u.id,
-        })
-    });
-
-    // Assign ideal positions
-    // Use reversed position so that nodes earlier in sorted order have larger ideal_pos.
-    // Since BinaryHeap is a max-heap, larger values are popped first,
-    // ensuring earlier nodes are processed first (consistent with sorted order).
-    #[allow(clippy::mutable_key_type)]
-    let nkey: HashMap<UOpKey, usize> =
-        sorted.iter().enumerate().map(|(i, u)| (UOpKey(u.clone()), sorted.len() - 1 - i)).collect();
-
-    // Update priorities with ideal positions
-    for (key, pos) in &nkey {
-        if let Some(order_key) = priorities.get_mut(key) {
-            order_key.ideal_pos = *pos;
-        }
-    }
-
-    // Debug: Log out_degree for Range nodes
-    for (key, degree) in &out_degree {
-        if matches!(key.0.op(), Op::Range { .. }) {
-            tracing::debug!(range_id = key.0.id, out_degree = *degree, "linearize_with_edges: Range out_degree");
-        }
-    }
-
-    // Debug: Log all consumers of Range 169
-    for (key, cons) in &consumers {
-        if key.0.id == 169 {
-            let consumer_ids: Vec<u64> = cons.iter().map(|c| c.id).collect();
-            tracing::debug!(
-                range_id = 169,
-                consumer_ids = ?consumer_ids,
-                "linearize_with_edges: Range 169 consumers"
-            );
-        }
-    }
-
-    // Step 4: Heap-based linearization
-    let mut heap: BinaryHeap<OrderKey> = BinaryHeap::new();
-
-    let sink_key = priorities.get(&UOpKey(sink.clone())).cloned().unwrap_or(OrderKey {
-        run_count: 0,
-        priority: priority::DEFAULT,
-        arg_value: None,
-        ideal_pos: 0,
-        id: sink.id,
-    });
-    heap.push(sink_key);
-
-    let mut result = Vec::with_capacity(nodes.len());
-    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-    while let Some(order_key) = heap.pop() {
-        let u_id = order_key.id;
-
-        // Skip if already processed
-        if visited.contains(&u_id) {
-            continue;
-        }
-        visited.insert(u_id);
-
-        // Look up the UOp
-        let u = match id_to_uop.get(&u_id) {
-            Some(uop) => uop.clone(),
-            None => continue,
-        };
-
-        result.push(u.clone());
-
-        // Decrement out_degree for all sources
-        for src in u.op().sources() {
-            let src_key = UOpKey(src.clone());
-            if let Some(deg) = out_degree.get_mut(&src_key) {
-                let old_deg = *deg;
-                *deg = deg.saturating_sub(1);
-                // Debug: Track specific Range IDs
-                if src.id == 169 || src.id == 205 {
-                    tracing::debug!(
-                        range_id = src.id,
-                        consumer_id = u_id,
-                        consumer_op = ?u.op().as_ref(),
-                        old_degree = old_deg,
-                        new_degree = *deg,
-                        "linearize_with_edges: decrementing Range out_degree"
-                    );
-                }
-                if *deg == 0
-                    && !visited.contains(&src.id)
-                    && let Some(src_order_key) = priorities.get(&src_key)
-                {
-                    heap.push(src_order_key.clone());
-                }
-            }
-        }
-
-        // Also decrement out_degree for CFG edge predecessors
-        // (if this RANGE has a predecessor edge)
-        let u_key = UOpKey(u.clone());
-        if let Some(predecessor) = edges.get(&u_key) {
-            let pred_key = UOpKey(predecessor.clone());
-            if let Some(deg) = out_degree.get_mut(&pred_key) {
-                *deg = deg.saturating_sub(1);
-                if *deg == 0
-                    && !visited.contains(&predecessor.id)
-                    && let Some(pred_order_key) = priorities.get(&pred_key)
-                {
-                    heap.push(pred_order_key.clone());
-                }
-            }
-        }
-    }
-
-    // Step 5: Reverse result (we built backwards from sink)
-    result.reverse();
-    result
-}
-
 /// Compute the "run count" for a UOp based on its IN-SCOPE ranges.
 ///
 /// The run count estimates how many times this operation executes,
@@ -438,14 +224,20 @@ pub fn linearize_with_edges(sink: Arc<UOp>, edges: &HashMap<UOpKey, Arc<UOp>>) -
 /// structure, not actual loops. Instructions that depend on thread_id
 /// should still be placed in the entry block.
 ///
+/// CFG predecessors are propagated via the `deps` field on `Op::Range`,
+/// which makes `InScopeRangesProperty` accumulate parent loop ranges
+/// naturally through `children()`. This matches Tinygrad's
+/// `pm_add_control_flow` behavior.
+///
 /// This matches Tinygrad's linearizer where `run_count = prod([int(r.vmax)+1 for r in u.ranges])`
 /// and `u.ranges` returns only ranges that haven't been ended yet at that point.
 fn compute_run_count(uop: &Arc<UOp>) -> u64 {
     use morok_ir::uop::cached_property::CachedProperty;
     use morok_ir::uop::properties::InScopeRangesProperty;
 
-    #[allow(clippy::mutable_key_type)] // UOpKey uses Arc<UOp> which has interior mutability but is hashed by id
+    #[allow(clippy::mutable_key_type)]
     let in_scope = InScopeRangesProperty::get(uop);
+
     if in_scope.is_empty() {
         return 1;
     }

@@ -444,7 +444,12 @@ fn test_movement_op_removal_removes_with_ranges() {
 
     // Assign ranges to the movement op (simulating transformation has been applied)
     let range = UOp::new(
-        Op::Range { end: UOp::index_const(5), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::index_const(5),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Index,
     );
     ctx.set_ranges(&permute, vec![range.clone()], vec![range.clone()]);
@@ -471,7 +476,12 @@ fn test_movement_op_removal_reshape() {
 
     // Assign ranges
     let range = UOp::new(
-        Op::Range { end: UOp::index_const(4), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::index_const(4),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Index,
     );
     ctx.set_ranges(&reshape, vec![range.clone()], vec![range.clone()]);
@@ -498,7 +508,12 @@ fn test_movement_op_removal_expand() {
 
     // Assign ranges
     let range = UOp::new(
-        Op::Range { end: UOp::index_const(4), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::index_const(4),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Index,
     );
     ctx.set_ranges(&expand, vec![range.clone()], vec![range.clone()]);

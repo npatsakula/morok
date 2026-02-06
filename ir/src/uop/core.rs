@@ -936,12 +936,13 @@ impl UOp {
                 }
                 Op::Gep { vector: new_vector, indices: indices.clone() }
             }
-            Op::Range { end, axis_id, axis_type } => {
+            Op::Range { end, axis_id, axis_type, deps } => {
                 let new_end = end.substitute(map);
-                if Arc::ptr_eq(&new_end, end) {
+                let new_deps: SmallVec<[Arc<Self>; 2]> = deps.iter().map(|d| d.substitute(map)).collect();
+                if Arc::ptr_eq(&new_end, end) && deps.iter().zip(&new_deps).all(|(o, n)| Arc::ptr_eq(o, n)) {
                     return self.clone();
                 }
-                Op::Range { end: new_end, axis_id: *axis_id, axis_type: *axis_type }
+                Op::Range { end: new_end, axis_id: *axis_id, axis_type: *axis_type, deps: new_deps }
             }
             Op::EndIf { if_op } => {
                 let new_if_op = if_op.substitute(map);
@@ -1463,8 +1464,13 @@ impl UOp {
                 Op::EndIf { if_op: src(0) }
             }
             Op::Range { axis_id, axis_type, .. } => {
-                assert_eq!(new_srcs.len(), 1);
-                Op::Range { end: src(0), axis_id: *axis_id, axis_type: *axis_type }
+                assert!(!new_srcs.is_empty());
+                Op::Range {
+                    end: src(0),
+                    axis_id: *axis_id,
+                    axis_type: *axis_type,
+                    deps: new_srcs[1..].iter().cloned().collect(),
+                }
             }
             Op::End { .. } => {
                 assert!(!new_srcs.is_empty());

@@ -360,7 +360,7 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
             continue;
         }
         if let Some(&mod_val) = ctx.marked_ranges.get(&uop.id)
-            && let Op::Range { end, axis_id, axis_type } = uop.op()
+            && let Op::Range { end, axis_id, axis_type, .. } = uop.op()
         {
             let Some(end_val) = const_uop_to_i64(end) else {
                 continue;
@@ -450,7 +450,7 @@ pub fn cut_store_range(ctx: &mut SplitStoreContext, store: &Arc<UOp>, range: &Ar
     }
 
     // Guard 2: Range end must be constant
-    let Op::Range { end, axis_id: _, axis_type } = range.op() else {
+    let Op::Range { end, axis_type, .. } = range.op() else {
         return None;
     };
     let range_end = const_uop_to_i64(end)?;

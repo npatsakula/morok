@@ -1022,8 +1022,8 @@ pub fn uop_equal(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
         return cv_a.0 == cv_b.0;
     }
     if let (
-        Op::Range { end: end_a, axis_id: id_a, axis_type: type_a },
-        Op::Range { end: end_b, axis_id: id_b, axis_type: type_b },
+        Op::Range { end: end_a, axis_id: id_a, axis_type: type_a, .. },
+        Op::Range { end: end_b, axis_id: id_b, axis_type: type_b, .. },
     ) = (a.op(), b.op())
     {
         return id_a == id_b && type_a == type_b && uop_equal(end_a, end_b);

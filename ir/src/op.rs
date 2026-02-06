@@ -168,6 +168,7 @@ pub enum Op {
         end: Arc<UOp>,
         axis_id: AxisId,
         axis_type: AxisType,
+        deps: SmallVec<[Arc<UOp>; 2]>,
     },
     End {
         computation: Arc<UOp>,
@@ -369,7 +370,11 @@ impl Op {
                 children
             }
             Self::EndIf { if_op } => SmallVec::from_slice(&[if_op]),
-            Self::Range { end, .. } => SmallVec::from_slice(&[end]),
+            Self::Range { end, deps, .. } => {
+                let mut children = SmallVec::from_slice(&[end]);
+                children.extend(deps.iter());
+                children
+            }
             Self::End { computation, ranges } => {
                 let mut children = SmallVec::from_slice(&[computation]);
                 children.extend(ranges.iter());

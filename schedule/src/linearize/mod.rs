@@ -12,7 +12,9 @@
 //!     ↓
 //! CFGContext::new(sink)          → Compute control flow edges
 //!     ↓
-//! linearize_with_edges(sink)     → Priority-aware toposort with CFG edge constraints
+//! pm_add_control_flow (bpm)      → Embed CFG edges as deps on RANGE nodes
+//!     ↓
+//! linearize(sink)                → Priority-aware toposort
 //!     ↓
 //! pm_linearize_cleanups          → Inject IF/ENDIF for gated stores (line rewrite)
 //!     ↓
@@ -34,8 +36,8 @@
 //! # Control Flow Edges
 //!
 //! When sibling loops exist at the same nesting level, CFGContext computes
-//! ordering edges to ensure proper linearization. These edges are passed to
-//! linearize_with_edges which treats them as additional dependencies.
+//! ordering edges to ensure proper linearization. These edges are embedded
+//! as deps on RANGE nodes via `pm_add_control_flow` with `graph_rewrite_bottom_up`.
 
 mod cfg_context;
 #[allow(clippy::module_inception)]
@@ -47,11 +49,11 @@ use std::sync::Arc;
 use morok_ir::UOp;
 use morok_ir::op::Op;
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::rewrite::graph_rewrite;
+use morok_ir::rewrite::{graph_rewrite, graph_rewrite_bottom_up};
 use smallvec::{SmallVec, smallvec};
 
 pub use cfg_context::CFGContext;
-pub use linearize::{linearize, linearize_with_edges};
+pub use linearize::linearize;
 
 /// Split multi-range ENDs into nested single-range ENDs.
 ///
@@ -130,32 +132,51 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
     Some(result)
 }
 
+/// Pattern matcher for adding control flow dependencies to RANGE operations.
+///
+/// Matches Tinygrad's `pm_add_control_flow` (linearizer.py:89-91) which adds
+/// CFG predecessors as extra sources to RANGE nodes via `x.replace(src=x.src+(y,))`.
+///
+/// In Morok, we add predecessors to the `deps` field of `Op::Range`, which makes
+/// `InScopeRangesProperty` (via `children()`) naturally accumulate parent loop
+/// ranges. This gives nested RANGE nodes a higher `run_count`, ensuring they
+/// sort after operations that must appear outside them.
+///
+/// Used with `graph_rewrite_bottom_up` so patterns see original RANGE nodes
+/// (matching `cfg.edges` keys), while the engine handles transitive rewrites
+/// automatically — eliminating stale reference issues from manual substitution.
+fn pm_add_control_flow() -> TypedPatternMatcher<CFGContext> {
+    crate::patterns! {
+        @context CFGContext;
+        // Mirrors Tinygrad's: x.replace(src=x.src+(y,)) if (y:=ctx.edges.get(x)) is not None
+        range @ Range { end: _, .. } => {
+            let pred = ctx.get_predecessor(range)?;
+            let mut srcs = range.op().sources().to_vec();
+            srcs.push(pred.clone());
+            Some(range.with_sources(srcs))
+        },
+    }
+}
+
 /// Linearize a UOp DAG with proper control flow ordering.
 ///
 /// This is the preferred entry point for linearization. It:
 /// 1. Splits multi-range ENDs into nested single-range ENDs
 /// 2. Builds CFGContext to compute control flow edges
-/// 3. Applies pm_add_control_flow to add edges to RANGE ops (BOTTOM_UP)
+/// 3. Rewrites RANGE nodes to include CFG predecessors in their deps
 /// 4. Runs the priority-aware linearizer
 ///
-/// # Example
-///
-/// ```ignore
-/// use morok_schedule::linearize::linearize_with_cfg;
-///
-/// let instructions = linearize_with_cfg(kernel_ast);
+/// Matches Tinygrad's approach (linearizer.py:89-100):
+/// ```python
+/// sink = graph_rewrite(sink, pm_split_ends)
+/// sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), bottom_up=True)
+/// linearize(sink)
 /// ```
 pub fn linearize_with_cfg(sink: Arc<UOp>) -> Vec<Arc<UOp>> {
-    // Stage 19 (partial): Split multi-range ENDs into nested single-range ENDs.
-    // Required for proper linearization ordering. (Tinygrad linearizer.py:93-100)
     let sink = graph_rewrite(&pm_split_ends(), sink, &mut ());
-
-    // Stage 20-21: Build CFG context and linearize with edges
-    // CFGContext computes control flow edges for sibling loops.
-    // linearize_with_edges treats these edges as virtual consumer relationships,
-    // ensuring proper ordering without modifying RANGE sources (which would panic).
-    let cfg = CFGContext::new(&sink);
-    linearize_with_edges(sink, &cfg.edges)
+    let mut cfg = CFGContext::new(&sink);
+    let sink = graph_rewrite_bottom_up(&pm_add_control_flow(), sink, &mut cfg);
+    linearize(sink)
 }
 
 /// Line rewrite infrastructure for operating on linearized instruction lists.

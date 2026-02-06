@@ -229,7 +229,12 @@ fn test_vmin_vmax_define_var_with_min() {
 fn test_vmin_vmax_range() {
     let end = UOp::native_const(10i32);
     let range = UOp::new(
-        Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: crate::types::AxisType::Loop },
+        Op::Range {
+            end,
+            axis_id: AxisId::Renumbered(0),
+            axis_type: crate::types::AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Int32,
     );
 

@@ -1586,7 +1586,12 @@ fn test_symbolic_buffer_size_handling() {
 
     // Create computation with symbolic output range
     let concrete_range = UOp::new(
-        Op::Range { end: UOp::index_const(10), axis_id: AxisId::Renumbered(1), axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::index_const(10),
+            axis_id: AxisId::Renumbered(1),
+            axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Index,
     );
 
@@ -1645,7 +1650,12 @@ fn test_mixed_concrete_symbolic_sizes() {
 
     // Concrete range
     let concrete_range = UOp::new(
-        Op::Range { end: UOp::index_const(10), axis_id: AxisId::Renumbered(0), axis_type: AxisType::Loop },
+        Op::Range {
+            end: UOp::index_const(10),
+            axis_id: AxisId::Renumbered(0),
+            axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Index,
     );
 
