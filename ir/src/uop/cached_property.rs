@@ -44,14 +44,14 @@
 //!
 //! // Use it in UOp's public API
 //! impl UOp {
-//!     pub fn my_property(&self: &Rc<Self>) -> &MyType {
+//!     pub fn my_property(&self: &Arc<Self>) -> &MyType {
 //!         MyProperty::get(self)
 //!     }
 //! }
 //! ```
 
-use std::cell::OnceCell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::UOp;
 
@@ -60,7 +60,7 @@ use crate::UOp;
 /// Properties are computed bottom-up via filtered toposort, ensuring:
 /// 1. Dependencies are computed before dependents (toposort order)
 /// 2. Already-cached nodes are skipped (filtered toposort)
-/// 3. Each node's property is computed exactly once (OnceCell)
+/// 3. Each node's property is computed exactly once (OnceLock)
 ///
 /// # Implementation Pattern
 ///
@@ -70,9 +70,9 @@ use crate::UOp;
 /// 3. Computes properties bottom-up, caching each result
 /// 4. Returns the final cached value
 ///
-/// ```rust
+/// ```ignore
 /// impl CachedProperty for MyProperty {
-///     fn get(uop: &Rc<UOp>) -> &Self::Value {
+///     fn get(uop: &Arc<UOp>) -> &Self::Value {
 ///         // Fast path: already cached
 ///         if let Some(val) = Self::cache(uop).get() {
 ///             return val;
@@ -103,7 +103,7 @@ pub trait CachedProperty: Sized + 'static {
     /// # Example
     ///
     /// ```ignore
-    /// fn compute(uop: &Rc<UOp>) -> Self::Value {
+    /// fn compute(uop: &Arc<UOp>) -> Self::Value {
     ///     match &uop.op {
     ///         Op::Unary(_, src) => {
     ///             // Safe: src is a child, so it's already computed
@@ -114,20 +114,20 @@ pub trait CachedProperty: Sized + 'static {
     ///     }
     /// }
     /// ```
-    fn compute(uop: &Rc<UOp>) -> Self::Value;
+    fn compute(uop: &Arc<UOp>) -> Self::Value;
 
     /// Get the cache cell for this property.
     ///
-    /// The cache field must be a `OnceCell<Self::Value>` field in the UOp struct.
+    /// The cache field must be a `OnceLock<Self::Value>` field in the UOp struct.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// fn cache(uop: &Rc<UOp>) -> &OnceCell<Self::Value> {
+    /// fn cache(uop: &Arc<UOp>) -> &OnceLock<Self::Value> {
     ///     &uop.my_property_cache
     /// }
     /// ```
-    fn cache(uop: &Rc<UOp>) -> &OnceCell<Self::Value>;
+    fn cache(uop: &Arc<UOp>) -> &OnceLock<Self::Value>;
 
     /// Get cached value, computing if needed via filtered toposort.
     ///
@@ -147,7 +147,7 @@ pub trait CachedProperty: Sized + 'static {
     /// let shape = ShapeProperty::get(&uop);  // Computes if needed
     /// let shape_again = ShapeProperty::get(&uop);  // Instant (cached)
     /// ```
-    fn get(uop: &Rc<UOp>) -> &Self::Value {
+    fn get(uop: &Arc<UOp>) -> &Self::Value {
         // Fast path: already cached
         if let Some(val) = Self::cache(uop).get() {
             return val;
@@ -185,8 +185,8 @@ pub trait CachedProperty: Sized + 'static {
 ///
 /// # Requirements
 ///
-/// 1. The `cache_field` must exist in the UOp struct as `OnceCell<ReturnType>`
-/// 2. The `compute` closure must have signature `Fn(&Rc<UOp>) -> ReturnType`
+/// 1. The `cache_field` must exist in the UOp struct as `OnceLock<ReturnType>`
+/// 2. The `compute` closure must have signature `Fn(&Arc<UOp>) -> ReturnType`
 /// 3. `ReturnType` must implement `Clone`
 ///
 /// # Example
@@ -216,11 +216,11 @@ pub trait CachedProperty: Sized + 'static {
 /// impl CachedProperty for ShapeProperty {
 ///     type Value = Option<Shape>;
 ///
-///     fn compute(uop: &Rc<UOp>) -> Self::Value {
+///     fn compute(uop: &Arc<UOp>) -> Self::Value {
 ///         (|uop| crate::shape::infer_shape_from_op(uop))(uop)
 ///     }
 ///
-///     fn cache(uop: &Rc<UOp>) -> &OnceCell<Self::Value> {
+///     fn cache(uop: &Arc<UOp>) -> &OnceCell<Self::Value> {
 ///         &uop.shape_cache
 ///     }
 /// }
@@ -240,12 +240,12 @@ macro_rules! cached_property {
         impl $crate::uop::cached_property::CachedProperty for $name {
             type Value = $value_type;
 
-            fn compute(uop: &std::rc::Rc<$crate::UOp>) -> Self::Value {
-                let compute_fn: fn(&std::rc::Rc<$crate::UOp>) -> Self::Value = $compute;
+            fn compute(uop: &std::sync::Arc<$crate::UOp>) -> Self::Value {
+                let compute_fn: fn(&std::sync::Arc<$crate::UOp>) -> Self::Value = $compute;
                 compute_fn(uop)
             }
 
-            fn cache(uop: &std::rc::Rc<$crate::UOp>) -> &std::cell::OnceCell<Self::Value> {
+            fn cache(uop: &std::sync::Arc<$crate::UOp>) -> &std::sync::OnceLock<Self::Value> {
                 &uop.$cache_field
             }
         }

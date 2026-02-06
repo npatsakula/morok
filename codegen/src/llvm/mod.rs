@@ -1,10 +1,18 @@
 //! LLVM IR code generation.
 //!
-//! This module generates LLVM IR code from optimized UOp graphs for CPU execution.
+//! This module generates LLVM IR code from optimized UOp graphs.
+//!
+//! # Module Structure
+//!
+//! - `common/`: Shared utilities (types, ctx) for CPU and GPU
+//! - `cpu/`: CPU-specific rendering
+//! - `gpu/`: Future GPU-specific rendering (HIP, CUDA, Metal)
+//! - `text/`: Main entry point that orchestrates rendering
 
-pub mod helpers;
-pub mod ops;
-pub mod renderer;
-pub mod types;
+pub mod common;
+pub mod cpu;
+pub mod gpu;
+pub mod text;
 
-pub use renderer::{LlvmRenderer, render};
+pub use cpu::render_uop as cpu_render_uop;
+pub use text::LlvmTextRenderer;

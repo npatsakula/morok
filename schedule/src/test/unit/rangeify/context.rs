@@ -6,7 +6,7 @@
 //! - Edge cases and large-scale scenarios
 //! - Thread-safety considerations
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::{BufferizeOpts, ConstValue, Op, UOp};
@@ -50,7 +50,7 @@ fn test_record_and_retrieve_transform() {
 
     let retrieved = ctx.get_rangeified(&original);
     assert!(retrieved.is_some(), "Should find recorded transformation");
-    assert!(Rc::ptr_eq(retrieved.unwrap(), &rangeified), "Retrieved value should be the same Rc as recorded");
+    assert!(Arc::ptr_eq(retrieved.unwrap(), &rangeified), "Retrieved value should be the same Rc as recorded");
 }
 
 #[test]
@@ -83,9 +83,9 @@ fn test_multiple_transforms() {
     assert_eq!(ctx.range_map.len(), 3, "Should have 3 recorded transforms");
 
     // Verify each transform is independently retrievable
-    assert!(Rc::ptr_eq(ctx.get_rangeified(&original1).unwrap(), &rangeified1));
-    assert!(Rc::ptr_eq(ctx.get_rangeified(&original2).unwrap(), &rangeified2));
-    assert!(Rc::ptr_eq(ctx.get_rangeified(&original3).unwrap(), &rangeified3));
+    assert!(Arc::ptr_eq(ctx.get_rangeified(&original1).unwrap(), &rangeified1));
+    assert!(Arc::ptr_eq(ctx.get_rangeified(&original2).unwrap(), &rangeified2));
+    assert!(Arc::ptr_eq(ctx.get_rangeified(&original3).unwrap(), &rangeified3));
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn test_overwrite_transform() {
 
     // Should have the second value
     let retrieved = ctx.get_rangeified(&original).unwrap();
-    assert!(Rc::ptr_eq(retrieved, &rangeified2), "Should retrieve the most recently recorded transform");
+    assert!(Arc::ptr_eq(retrieved, &rangeified2), "Should retrieve the most recently recorded transform");
     assert_eq!(ctx.range_map.len(), 1, "Should still have only 1 entry (overwritten)");
 }
 
@@ -122,7 +122,7 @@ fn test_transform_with_binary_ops() {
     ctx.record_transform(original.clone(), rangeified.clone());
 
     let retrieved = ctx.get_rangeified(&original).unwrap();
-    assert!(Rc::ptr_eq(retrieved, &rangeified));
+    assert!(Arc::ptr_eq(retrieved, &rangeified));
 }
 
 #[test]
@@ -143,7 +143,7 @@ fn test_transform_with_nested_structure() {
     ctx.record_transform(original.clone(), rangeified.clone());
 
     let retrieved = ctx.get_rangeified(&original).unwrap();
-    assert!(Rc::ptr_eq(retrieved, &rangeified));
+    assert!(Arc::ptr_eq(retrieved, &rangeified));
 }
 
 // ===== Edge Case Tests =====
@@ -158,7 +158,7 @@ fn test_transform_same_value() {
     ctx.record_transform(value.clone(), value.clone());
 
     let retrieved = ctx.get_rangeified(&value).unwrap();
-    assert!(Rc::ptr_eq(retrieved, &value), "Should correctly handle self-transform");
+    assert!(Arc::ptr_eq(retrieved, &value), "Should correctly handle self-transform");
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn test_many_transforms() {
     for (i, (original, rangeified)) in originals.iter().zip(rangeifieds.iter()).enumerate() {
         let retrieved = ctx.get_rangeified(original);
         assert!(retrieved.is_some(), "Transform {} should be retrievable", i);
-        assert!(Rc::ptr_eq(retrieved.unwrap(), rangeified), "Transform {} should match", i);
+        assert!(Arc::ptr_eq(retrieved.unwrap(), rangeified), "Transform {} should match", i);
     }
 }
 
@@ -218,12 +218,12 @@ fn test_transform_with_equivalent_uops() {
 
     // Since original1 and original2 are structurally equal and use hash consing,
     // they should be the same Rc
-    assert!(Rc::ptr_eq(&original1, &original2), "Hash consing should make equivalent UOps share the same Rc");
+    assert!(Arc::ptr_eq(&original1, &original2), "Hash consing should make equivalent UOps share the same Rc");
 
     // So we should be able to retrieve using original2
     let retrieved = ctx.get_rangeified(&original2);
     assert!(retrieved.is_some(), "Should find transform using equivalent UOp");
-    assert!(Rc::ptr_eq(retrieved.unwrap(), &rangeified));
+    assert!(Arc::ptr_eq(retrieved.unwrap(), &rangeified));
 }
 
 // ===== Integration with Real Operations =====
@@ -241,7 +241,7 @@ fn test_transform_with_reshape() {
     ctx.record_transform(reshape.clone(), rangeified.clone());
 
     let retrieved = ctx.get_rangeified(&reshape).unwrap();
-    assert!(Rc::ptr_eq(retrieved, &rangeified));
+    assert!(Arc::ptr_eq(retrieved, &rangeified));
 }
 
 #[test]
@@ -257,7 +257,7 @@ fn test_transform_with_bufferize() {
     ctx.record_transform(bufferize.clone(), rangeified.clone());
 
     let retrieved = ctx.get_rangeified(&bufferize).unwrap();
-    assert!(Rc::ptr_eq(retrieved, &rangeified));
+    assert!(Arc::ptr_eq(retrieved, &rangeified));
 }
 
 // ===== Counter Independence Tests =====
@@ -318,7 +318,7 @@ fn test_interleaved_operations() {
 
         // Verify immediate retrieval
         let retrieved = ctx.get_rangeified(&original).unwrap();
-        assert!(Rc::ptr_eq(retrieved, &rangeified));
+        assert!(Arc::ptr_eq(retrieved, &rangeified));
     }
 
     assert_eq!(ctx.range_counter, 50);

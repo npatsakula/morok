@@ -14,7 +14,11 @@
 //! - [`shape`] - Shape inference utilities
 //! - [`sint`] - Symbolic integers
 
+// Make this crate available as `morok_ir` for proc-macro generated code
+extern crate self as morok_ir;
+
 // Module declarations
+pub mod decompositions;
 pub mod error;
 pub mod indexing;
 pub mod kernel_info;
@@ -27,6 +31,10 @@ pub mod uop;
 
 pub mod provenance;
 
+#[macro_use]
+pub mod pattern;
+pub mod rewrite;
+
 #[cfg(any(test, feature = "proptest"))]
 pub mod test;
 
@@ -37,11 +45,15 @@ pub use indexing::IndexSpec;
 pub use op::Op;
 pub use sint::{SInt, sint_max, sint_min, sint_prod};
 pub use types::{
-    AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, ConstValueHash, ReduceOp, TernaryOp, UnaryOp,
-    WmmaMetadata,
+    AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, ConstValueHash, ContiguousHint, ReduceOp,
+    TernaryOp, UnaryOp, WmmaMetadata,
 };
 pub use uop::{IntoUOp, UOp, UOpKey};
 
+// Re-export pattern matching and rewriting infrastructure
+pub use pattern::{Matcher, RewriteResult, TypedPatternMatcher};
+pub use rewrite::graph_rewrite;
+
 // Re-export external types for convenience
-pub use morok_device::DeviceSpec;
 pub use morok_dtype::DType;
+pub use morok_dtype::DeviceSpec;

@@ -10,12 +10,12 @@
 //! - Random: threefry
 //! - Scalar convenience: add_scalar, sub_scalar, mul_scalar, mod_scalar
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use snafu::ensure;
 
-use crate::error::InvalidDTypeForUnaryOpSnafu;
+use crate::error::{InvalidDTypeForUnaryOpSnafu, WhereConditionNotBoolSnafu};
 use crate::op::Op;
 use crate::types::{BinaryOp, TernaryOp, UnaryOp};
 use crate::uop::UOp;
@@ -30,7 +30,7 @@ macro_rules! binary_arith_ops {
     ($($method:ident => $op:ident),+ $(,)?) => {
         $(
             #[track_caller]
-            pub fn $method(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+            pub fn $method(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
                 let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
                 Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
                 Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), dtype))
@@ -44,7 +44,7 @@ macro_rules! division_ops {
     ($($method:ident => $op:ident),+ $(,)?) => {
         $(
             #[track_caller]
-            pub fn $method(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+            pub fn $method(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
                 Self::check_division_by_zero(rhs)?;
                 let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
                 Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
@@ -58,7 +58,7 @@ macro_rules! division_ops {
 macro_rules! bitwise_binary_ops {
     ($($method:ident => $op:ident),+ $(,)?) => {
         $(
-            pub fn $method(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+            pub fn $method(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
                 let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
                 Self::check_bitwise_dtype(dtype.clone(), BinaryOp::$op)?;
                 Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
@@ -72,7 +72,7 @@ macro_rules! bitwise_binary_ops {
 macro_rules! shift_ops {
     ($($method:ident => $op:ident),+ $(,)?) => {
         $(
-            pub fn $method(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+            pub fn $method(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
                 let dtype = self.dtype();
                 Self::check_bitwise_dtype(dtype.clone(), BinaryOp::$op)?;
                 Self::validate_binary_shapes(self, rhs, BinaryOp::$op)?;
@@ -83,15 +83,19 @@ macro_rules! shift_ops {
 }
 
 /// Macro for comparison operations.
+/// Preserves vectorization: <N x T> cmp <N x T> → <N x bool>
 macro_rules! cmp_ops {
     ($($method:ident => $op:ident),+ $(,)?) => {
         $(
             #[track_caller]
-            pub fn $method(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+            pub fn $method(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
                 // Use type promotion to validate types and find common type
-                let (lhs, rhs, _) = Self::promote_and_cast(self.clone(), rhs.clone())?;
+                let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
                 Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::$op)?;
-                Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), DType::Bool))
+                // Preserve vectorization: <N x T> cmp <N x T> → <N x bool>
+                let vcount = dtype.vcount();
+                let result_dtype = if vcount > 1 { DType::Bool.vec(vcount) } else { DType::Bool };
+                Ok(Self::new(Op::Binary(BinaryOp::$op, lhs, rhs), result_dtype))
             }
         )+
     };
@@ -102,7 +106,7 @@ macro_rules! transcendental_ops {
     ($($method:ident => $op:ident),+ $(,)?) => {
         $(
             #[track_caller]
-            pub fn $method(self: &Rc<Self>) -> Result<Rc<Self>> {
+            pub fn $method(self: &Arc<Self>) -> Result<Arc<Self>> {
                 let dtype = self.dtype();
                 ensure!(dtype.is_float(), InvalidDTypeForUnaryOpSnafu { operation: UnaryOp::$op, dtype });
                 Ok(Self::new(Op::Unary(UnaryOp::$op, self.clone()), dtype))
@@ -115,9 +119,32 @@ macro_rules! transcendental_ops {
 macro_rules! scalar_ops {
     ($($method:ident => $op_method:ident),+ $(,)?) => {
         $(
-            pub fn $method<T: IntoUOp>(lhs: Rc<Self>, rhs: T) -> Result<Rc<Self>> {
+            pub fn $method<T: IntoUOp>(lhs: Arc<Self>, rhs: T) -> Result<Arc<Self>> {
                 let rhs_uop = rhs.into_uop(lhs.dtype());
                 lhs.$op_method(&rhs_uop)
+            }
+        )+
+    };
+}
+
+// =========================================================================
+// Panicking Wrapper Macro
+// =========================================================================
+
+/// Macro to generate panicking wrappers for try_* binary methods.
+///
+/// These are for use in pattern rewrites where types are already validated.
+/// Each method panics on type mismatch with a clear error message and location.
+macro_rules! panicking_binary_wrapper {
+    ($($method:ident => $try_method:ident),+ $(,)?) => {
+        $(
+            #[doc = concat!("Panicking version of `", stringify!($try_method), "`.")]
+            #[doc = ""]
+            #[doc = "For use in pattern rewrites where types are validated."]
+            #[doc = "Panics on type mismatch."]
+            #[track_caller]
+            pub fn $method(self: &Arc<Self>, rhs: &Arc<Self>) -> Arc<Self> {
+                self.$try_method(rhs).expect(concat!(stringify!($method), ": type mismatch"))
             }
         )+
     };
@@ -142,7 +169,7 @@ impl UOp {
     ///
     /// Uses Idiv for integer types and Fdiv for float types.
     #[track_caller]
-    pub fn try_div(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+    pub fn try_div(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
         Self::check_division_by_zero(rhs)?;
         let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
 
@@ -154,14 +181,14 @@ impl UOp {
     }
 
     /// Maximum of two values: max(a, b).
-    pub fn try_max(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+    pub fn try_max(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
         let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
         Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Max)?;
         Ok(Self::new(Op::Binary(BinaryOp::Max, lhs, rhs), dtype))
     }
 
     /// Power: a^b.
-    pub fn try_pow(self: &Rc<Self>, rhs: &Rc<Self>) -> Result<Rc<Self>> {
+    pub fn try_pow(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
         let (lhs, rhs, dtype) = Self::promote_and_cast(self.clone(), rhs.clone())?;
         Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Pow)?;
         Ok(Self::new(Op::Binary(BinaryOp::Pow, lhs, rhs), dtype))
@@ -169,29 +196,29 @@ impl UOp {
 
     /// Negation: -x.
     #[track_caller]
-    pub fn neg(self: &Rc<Self>) -> Rc<Self> {
+    pub fn neg(self: &Arc<Self>) -> Arc<Self> {
         let dtype = self.dtype.clone();
         Self::new(Op::Unary(UnaryOp::Neg, self.clone()), dtype)
     }
 
     /// Absolute value: |x|.
     #[track_caller]
-    pub fn abs(self: &Rc<Self>) -> Rc<Self> {
+    pub fn abs(self: &Arc<Self>) -> Arc<Self> {
         let dtype = self.dtype.clone();
         Self::new(Op::Unary(UnaryOp::Abs, self.clone()), dtype)
     }
 
     /// Square: x².
     #[track_caller]
-    pub fn square(operand: Rc<Self>) -> Rc<Self> {
-        let dtype = operand.dtype();
-        Self::new(Op::Unary(UnaryOp::Square, operand), dtype)
+    pub fn square(self: &Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Unary(UnaryOp::Square, self.clone()), dtype)
     }
 
     /// Sign: -1 for negative, 0 for zero, 1 for positive.
-    pub fn sign(operand: Rc<Self>) -> Rc<Self> {
-        let dtype = operand.dtype();
-        Self::new(Op::Unary(UnaryOp::Sign, operand), dtype)
+    pub fn sign(self: &Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Unary(UnaryOp::Sign, self.clone()), dtype)
     }
 
     // =========================================================================
@@ -223,15 +250,15 @@ impl UOp {
 
     /// Error function: erf(x) - requires float dtype.
     #[track_caller]
-    pub fn erf(operand: Rc<Self>) -> Result<Rc<Self>> {
-        let dtype = operand.dtype();
+    pub fn erf(self: &Arc<Self>) -> Result<Arc<Self>> {
+        let dtype = self.dtype();
         ensure!(dtype.is_float(), InvalidDTypeForUnaryOpSnafu { operation: UnaryOp::Erf, dtype });
-        Ok(Self::new(Op::Unary(UnaryOp::Erf, operand), dtype))
+        Ok(Self::new(Op::Unary(UnaryOp::Erf, self.clone()), dtype))
     }
 
     /// Reciprocal: 1/x - requires float dtype.
     #[track_caller]
-    pub fn try_reciprocal(operand: &Rc<Self>) -> Result<Rc<Self>> {
+    pub fn try_reciprocal(operand: &Arc<Self>) -> Result<Arc<Self>> {
         let dtype = operand.dtype();
         ensure!(dtype.is_float(), InvalidDTypeForUnaryOpSnafu { operation: UnaryOp::Reciprocal, dtype });
         Ok(Self::new(Op::Unary(UnaryOp::Reciprocal, operand.clone()), dtype))
@@ -243,27 +270,27 @@ impl UOp {
 
     /// Truncate towards zero.
     #[track_caller]
-    pub fn trunc(operand: Rc<Self>) -> Rc<Self> {
+    pub fn trunc(operand: Arc<Self>) -> Arc<Self> {
         let dtype = operand.dtype();
         Self::new(Op::Unary(UnaryOp::Trunc, operand), dtype)
     }
 
     /// Floor: round towards -∞.
     #[track_caller]
-    pub fn floor(operand: Rc<Self>) -> Rc<Self> {
+    pub fn floor(operand: Arc<Self>) -> Arc<Self> {
         let dtype = operand.dtype();
         Self::new(Op::Unary(UnaryOp::Floor, operand), dtype)
     }
 
     /// Ceiling: round towards +∞.
     #[track_caller]
-    pub fn ceil(operand: Rc<Self>) -> Rc<Self> {
+    pub fn ceil(operand: Arc<Self>) -> Arc<Self> {
         let dtype = operand.dtype();
         Self::new(Op::Unary(UnaryOp::Ceil, operand), dtype)
     }
 
     /// Round: round to nearest integer (half to even).
-    pub fn round(operand: Rc<Self>) -> Rc<Self> {
+    pub fn round(operand: Arc<Self>) -> Arc<Self> {
         let dtype = operand.dtype();
         Self::new(Op::Unary(UnaryOp::Round, operand), dtype)
     }
@@ -285,7 +312,7 @@ impl UOp {
 
     /// Logical not: !x.
     #[track_caller]
-    pub fn not(self: &Rc<Self>) -> Rc<Self> {
+    pub fn not(self: &Arc<Self>) -> Arc<Self> {
         let dtype = self.dtype.clone();
         Self::new(Op::Unary(UnaryOp::Not, self.clone()), dtype)
     }
@@ -308,16 +335,34 @@ impl UOp {
     // =========================================================================
 
     /// Conditional selection: condition ? true_val : false_val.
+    ///
+    /// # Errors
+    /// - `WhereConditionNotBool` if condition dtype is not bool
     #[track_caller]
-    pub fn try_where(condition: Rc<Self>, true_val: Rc<Self>, false_val: Rc<Self>) -> Result<Rc<Self>> {
+    pub fn try_where(condition: Arc<Self>, true_val: Arc<Self>, false_val: Arc<Self>) -> Result<Arc<Self>> {
+        let cond_dtype = condition.dtype();
+        ensure!(cond_dtype.is_bool(), WhereConditionNotBoolSnafu { actual: cond_dtype });
+
         let dtype = true_val.dtype(); // Result has same dtype as branches
         Self::validate_ternary_shapes(&true_val, &false_val)?;
         Ok(Self::new(Op::Ternary(TernaryOp::Where, condition, true_val, false_val), dtype))
     }
 
     /// Multiply-accumulate: a * b + c (fused operation).
-    pub fn try_mulacc(a: Rc<Self>, b: Rc<Self>, c: Rc<Self>) -> Result<Rc<Self>> {
-        let dtype = a.dtype(); // Preserve first operand dtype
+    ///
+    /// All operands must have matching dtypes (including vcount) for valid codegen.
+    /// Returns None if vcounts don't match - caller should fall back to Add(Mul(a,b), c).
+    pub fn try_mulacc(a: Arc<Self>, b: Arc<Self>, c: Arc<Self>) -> Result<Arc<Self>> {
+        // Validate all operands have matching dtypes (including vcount) for valid fmuladd
+        if a.dtype() != b.dtype() || a.dtype() != c.dtype() {
+            return crate::error::MulAccDtypeMismatchSnafu {
+                a_dtype: a.dtype(),
+                b_dtype: b.dtype(),
+                c_dtype: c.dtype(),
+            }
+            .fail();
+        }
+        let dtype = a.dtype();
         // Validate all three operands have matching shapes
         Self::validate_ternary_shapes(&a, &b)?;
         Self::validate_ternary_shapes(&a, &c)?;
@@ -325,11 +370,47 @@ impl UOp {
     }
 
     // =========================================================================
+    // Panicking Wrappers (for pattern rewrites)
+    // =========================================================================
+    //
+    // These methods are for use in pattern rewrites where types are already
+    // validated by the pattern matcher. They panic on type mismatch, which
+    // indicates a bug in the pattern rather than a user error.
+    //
+    // Note: Using trailing underscore for `and_`, `or_`, `mod_` to avoid
+    // Rust keyword conflicts.
+
+    panicking_binary_wrapper! {
+        // Arithmetic
+        add => try_add,
+        sub => try_sub,
+        mul => try_mul,
+        idiv => try_div,
+        mod_ => try_mod,
+        max => try_max,
+
+        // Bitwise
+        and_ => try_and_op,
+        or_ => try_or_op,
+        xor => try_xor_op,
+        shl => try_shl_op,
+        shr => try_shr_op,
+
+        // Comparison
+        lt => try_cmplt,
+        le => try_cmple,
+        gt => try_cmpgt,
+        ge => try_cmpge,
+        eq => try_cmpeq,
+        ne => try_cmpne,
+    }
+
+    // =========================================================================
     // Random Operations
     // =========================================================================
 
     /// Threefry PRNG: threefry(x, key).
-    pub fn threefry(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<Rc<Self>> {
+    pub fn threefry(lhs: Arc<Self>, rhs: Arc<Self>) -> Result<Arc<Self>> {
         let dtype = DType::UInt64; // Threefry always returns uint64
         Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Threefry)?;
         Ok(Self::new(Op::Binary(BinaryOp::Threefry, lhs, rhs), dtype))

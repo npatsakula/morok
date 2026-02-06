@@ -4,7 +4,7 @@
 //! Uses z3 crate v0.19.4's global context model.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::types::{BinaryOp, ConstValue, TernaryOp, UnaryOp};
@@ -35,7 +35,7 @@ impl Z3Context {
     ///
     /// Processes UOps in topological order (bottom-up) to ensure dependencies
     /// are converted before they're used.
-    pub fn convert_uop(&mut self, uop: &Rc<UOp>) -> Result<Dynamic, ConversionError> {
+    pub fn convert_uop(&mut self, uop: &Arc<UOp>) -> Result<Dynamic, ConversionError> {
         let mut cache = HashMap::new();
         self.convert_uop_cached(uop, &mut cache)
     }
@@ -43,11 +43,11 @@ impl Z3Context {
     /// Convert UOp with caching to avoid redundant conversion.
     fn convert_uop_cached(
         &mut self,
-        uop: &Rc<UOp>,
+        uop: &Arc<UOp>,
         cache: &mut HashMap<usize, Dynamic>,
     ) -> Result<Dynamic, ConversionError> {
         // Use pointer address as cache key
-        let key = Rc::as_ptr(uop) as usize;
+        let key = Arc::as_ptr(uop) as usize;
 
         // Check cache first
         if let Some(z3_expr) = cache.get(&key) {

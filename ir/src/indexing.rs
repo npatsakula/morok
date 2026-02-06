@@ -4,7 +4,7 @@
 //!
 //! For UOp slice methods, see [`crate::uop::constructors::memory`].
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::uop::UOp;
 
@@ -34,10 +34,10 @@ use crate::uop::UOp;
 #[derive(Debug, Clone)]
 pub enum IndexSpec {
     /// Single integer index - selects one element and removes dimension.
-    Single(Rc<UOp>),
+    Single(Arc<UOp>),
 
     /// Range with optional step - selects multiple elements.
-    Range { start: Rc<UOp>, end: Rc<UOp>, step: Option<Rc<UOp>> },
+    Range { start: Arc<UOp>, end: Arc<UOp>, step: Option<Arc<UOp>> },
 
     /// Full slice - selects all elements along this dimension.
     Full,

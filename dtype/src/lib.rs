@@ -4,6 +4,86 @@ pub mod ext;
 #[cfg(any(test, feature = "proptest"))]
 pub mod test;
 
+/// Device specification parsed from a device string.
+///
+/// This enum represents different compute devices that can execute kernels.
+/// It's used throughout the compilation pipeline for device selection and
+/// kernel caching.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DeviceSpec {
+    /// CPU device (single-threaded or multi-threaded execution)
+    Cpu,
+    /// CUDA GPU device with specific device ID
+    Cuda { device_id: usize },
+    /// Metal GPU device (Apple Silicon) with specific device ID
+    Metal { device_id: usize },
+    /// WebGPU device (browser or native WebGPU)
+    WebGpu,
+}
+
+impl DeviceSpec {
+    /// Canonicalize the device spec to a standard string representation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use morok_dtype::DeviceSpec;
+    ///
+    /// assert_eq!(DeviceSpec::Cpu.canonicalize(), "CPU");
+    /// assert_eq!(DeviceSpec::Cuda { device_id: 0 }.canonicalize(), "CUDA:0");
+    /// assert_eq!(DeviceSpec::Cuda { device_id: 1 }.canonicalize(), "CUDA:1");
+    /// ```
+    pub fn canonicalize(&self) -> String {
+        match self {
+            DeviceSpec::Cpu => "CPU".to_string(),
+            DeviceSpec::Cuda { device_id } => format!("CUDA:{}", device_id),
+            DeviceSpec::Metal { device_id } => format!("Metal:{}", device_id),
+            DeviceSpec::WebGpu => "WebGPU".to_string(),
+        }
+    }
+
+    /// Get maximum buffer count for this device.
+    ///
+    /// Returns None if the device has no buffer limit (effectively unlimited).
+    ///
+    /// Known limits:
+    /// - Metal: 31 buffers (Apple Silicon hardware limit)
+    /// - WebGPU: 8 buffers (WebGPU specification limit)
+    /// - CPU/CUDA: None (no practical limit)
+    pub fn max_buffers(&self) -> Option<usize> {
+        match self {
+            DeviceSpec::Cpu => None,
+            DeviceSpec::Cuda { .. } => Some(128),
+            DeviceSpec::Metal { .. } => Some(31),
+            DeviceSpec::WebGpu => Some(8),
+        }
+    }
+
+    /// Get the base device type string (strips device ID).
+    ///
+    /// Used for device factory lookup and cache key construction.
+    /// Unlike `canonicalize()`, this returns a static string without device ID.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use morok_dtype::DeviceSpec;
+    ///
+    /// assert_eq!(DeviceSpec::Cpu.base_type(), "CPU");
+    /// assert_eq!(DeviceSpec::Cuda { device_id: 0 }.base_type(), "CUDA");
+    /// assert_eq!(DeviceSpec::Cuda { device_id: 1 }.base_type(), "CUDA");
+    /// ```
+    pub fn base_type(&self) -> &'static str {
+        match self {
+            DeviceSpec::Cpu => "CPU",
+            DeviceSpec::Cuda { .. } => "CUDA",
+            DeviceSpec::Metal { .. } => "METAL",
+            DeviceSpec::WebGpu => "WEBGPU",
+        }
+    }
+}
+
 /// Address space for pointer types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -71,7 +151,9 @@ pub enum DType {
     Vector { scalar: ScalarDType, count: usize },
 
     /// Pointer type.
-    Ptr { base: Box<DType>, addrspace: AddrSpace, size: Option<usize> },
+    /// `vcount` is the vector count of the pointer itself (1 = scalar pointer, >1 = vector of pointers).
+    /// This matches Tinygrad's PtrDType.v field.
+    Ptr { base: Box<DType>, addrspace: AddrSpace, size: Option<usize>, vcount: usize },
 
     /// Image type (for texture operations).
     Image { kind: ImageKind, shape: Vec<usize> },
@@ -117,7 +199,7 @@ impl ScalarDType {
     }
 
     pub const fn is_float(&self) -> bool {
-        matches!(self, Self::Float16 | Self::Float32 | Self::Float64)
+        matches!(self, Self::FP8E4M3 | Self::FP8E5M2 | Self::Float16 | Self::BFloat16 | Self::Float32 | Self::Float64)
     }
 
     pub const fn c_style(&self) -> &'static str {
@@ -141,6 +223,11 @@ impl ScalarDType {
             Self::Index => "size_t",
         }
     }
+
+    /// Create a vector DType from this scalar type.
+    pub const fn vec(self, count: usize) -> DType {
+        DType::Vector { scalar: self, count }
+    }
 }
 
 impl From<ScalarDType> for DType {
@@ -163,6 +250,10 @@ impl DType {
         match self {
             Self::Scalar(s) if !matches!(s, ScalarDType::Void) => Self::Vector { scalar: *s, count },
             Self::Vector { .. } => panic!("Cannot vectorize an already vectorized type"),
+            Self::Ptr { vcount: 1, base, addrspace, size } => {
+                Self::Ptr { base: base.clone(), addrspace: *addrspace, size: *size, vcount: count }
+            }
+            Self::Ptr { vcount, .. } => panic!("Cannot vectorize an already vectorized pointer (vcount={vcount})"),
             _ => self.clone(),
         }
     }
@@ -171,7 +262,7 @@ impl DType {
     pub fn ptr(self, size: Option<usize>, addrspace: AddrSpace) -> Self {
         match self {
             Self::Ptr { .. } => panic!("Cannot make a pointer from a pointer"),
-            _ => Self::Ptr { base: Box::new(self), addrspace, size },
+            _ => Self::Ptr { base: Box::new(self), addrspace, size, vcount: 1 },
         }
     }
 
@@ -197,6 +288,35 @@ impl DType {
         }
     }
 
+    /// Get scalar DType (works on both Scalar and Vector).
+    ///
+    /// Unlike `base()` which returns `ScalarDType`, this returns `DType`.
+    /// This enables chaining with `.vec()`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use morok_dtype::DType;
+    ///
+    /// let vec_dtype = DType::Float32.vec(4);
+    /// assert_eq!(vec_dtype.scalar_dtype(), DType::Float32);
+    ///
+    /// // Enable chaining: dtype.scalar_dtype().vec(new_count)
+    /// let new_vec = vec_dtype.scalar_dtype().vec(8);
+    /// assert_eq!(new_vec, DType::Float32.vec(8));
+    /// ```
+    pub fn scalar_dtype(&self) -> DType {
+        DType::Scalar(self.base())
+    }
+
+    /// Create a new dtype with a different base scalar type, preserving vector count.
+    ///
+    /// Useful for type conversions like bool→uint8 where the structure is preserved.
+    pub fn with_base(&self, new_base: ScalarDType) -> Self {
+        let count = self.vcount();
+        if count > 1 { Self::Scalar(new_base).vec(count) } else { Self::Scalar(new_base) }
+    }
+
     /// Get the vector count (1 for scalars).
     pub fn count(&self) -> usize {
         match self {
@@ -209,7 +329,7 @@ impl DType {
     pub fn vcount(&self) -> usize {
         match self {
             Self::Vector { count, .. } => *count,
-            Self::Ptr { base, .. } => base.count(),
+            Self::Ptr { vcount, .. } => *vcount,
             _ => 1,
         }
     }
@@ -228,23 +348,28 @@ impl DType {
     }
 
     pub fn is_bool(&self) -> bool {
-        matches!(self.scalar(), Some(ScalarDType::Bool))
+        // Use base() to handle both Scalar and Vector types
+        self.base() == ScalarDType::Bool
     }
 
     pub fn is_signed(&self) -> bool {
-        self.scalar().is_some_and(|s| s.is_signed())
+        // Use base() to handle both Scalar and Vector types
+        self.base().is_signed()
     }
 
     pub fn is_unsigned(&self) -> bool {
-        self.scalar().is_some_and(|s| s.is_unsigned())
+        // Use base() to handle both Scalar and Vector types
+        self.base().is_unsigned()
     }
 
     pub fn is_int(&self) -> bool {
-        self.scalar().is_some_and(|s| s.is_int())
+        // Use base() to handle both Scalar and Vector types
+        self.base().is_int()
     }
 
     pub fn is_float(&self) -> bool {
-        self.scalar().is_some_and(|s| s.is_float())
+        // Use base() to handle both Scalar and Vector types
+        self.base().is_float()
     }
 
     pub fn c_style(&self) -> String {
@@ -336,4 +461,55 @@ impl DType {
     pub const Float64: Self = Self::Scalar(ScalarDType::Float64);
     pub const Void: Self = Self::Scalar(ScalarDType::Void);
     pub const Index: Self = Self::Scalar(ScalarDType::Index);
+}
+
+/// Trait for types that have an associated DType.
+///
+/// This trait is used for type-safe tensor data extraction (e.g., to_ndarray<T>()).
+pub trait HasDType: Clone + Default {
+    const DTYPE: DType;
+}
+
+impl HasDType for f32 {
+    const DTYPE: DType = DType::Float32;
+}
+
+impl HasDType for f64 {
+    const DTYPE: DType = DType::Float64;
+}
+
+impl HasDType for i8 {
+    const DTYPE: DType = DType::Int8;
+}
+
+impl HasDType for i16 {
+    const DTYPE: DType = DType::Int16;
+}
+
+impl HasDType for i32 {
+    const DTYPE: DType = DType::Int32;
+}
+
+impl HasDType for i64 {
+    const DTYPE: DType = DType::Int64;
+}
+
+impl HasDType for u8 {
+    const DTYPE: DType = DType::UInt8;
+}
+
+impl HasDType for u16 {
+    const DTYPE: DType = DType::UInt16;
+}
+
+impl HasDType for u32 {
+    const DTYPE: DType = DType::UInt32;
+}
+
+impl HasDType for u64 {
+    const DTYPE: DType = DType::UInt64;
+}
+
+impl HasDType for bool {
+    const DTYPE: DType = DType::Bool;
 }

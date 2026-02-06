@@ -7,7 +7,7 @@
 //! - Symbolic variables: var, define_var, bind
 //! - Special: special (GPU dimension index)
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_dtype::DType;
 use smallvec::SmallVec;
@@ -22,23 +22,33 @@ impl UOp {
     // =========================================================================
 
     /// Create a Range operation with specified axis type.
-    pub fn range_axis(end: Rc<Self>, axis_id: AxisId, axis_type: AxisType) -> Rc<Self> {
-        Self::new(Op::Range { end, axis_id, axis_type }, DType::Index)
+    pub fn range_axis(end: Arc<Self>, axis_id: AxisId, axis_type: AxisType) -> Arc<Self> {
+        Self::new(Op::Range { end, axis_id, axis_type, deps: SmallVec::new() }, DType::Index)
     }
 
     /// Create a RANGE operation with Loop axis type (convenience for tests).
     ///
     /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
-    pub fn range(end: Rc<Self>, axis_id: usize) -> Rc<Self> {
+    pub fn range(end: Arc<Self>, axis_id: usize) -> Arc<Self> {
         Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
     }
 
     /// Create a RANGE operation with constant end value (convenience for tests).
     ///
     /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
-    pub fn range_const(end_value: i64, axis_id: usize) -> Rc<Self> {
+    /// Creates a `Loop` range (inside kernels).
+    pub fn range_const(end_value: i64, axis_id: usize) -> Arc<Self> {
         let end = Self::const_(DType::Index, ConstValue::Int(end_value));
         Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
+    }
+
+    /// Create an OUTER RANGE operation with constant end value (convenience for tests).
+    ///
+    /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
+    /// Creates an `Outer` range (wraps entire kernels).
+    pub fn range_outer_const(end_value: i64, axis_id: usize) -> Arc<Self> {
+        let end = Self::const_(DType::Index, ConstValue::Int(end_value));
+        Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Outer)
     }
 
     // =========================================================================
@@ -48,26 +58,25 @@ impl UOp {
     /// Create a conditional block that executes body when condition is true.
     ///
     /// Body contains operations to execute; use `endif` to close the block.
-    pub fn if_(condition: Rc<Self>, body: SmallVec<[Rc<Self>; 4]>) -> Rc<Self> {
+    pub fn if_(condition: Arc<Self>, body: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
         Self::new(Op::If { condition, body }, DType::Void)
     }
 
     /// End if block.
-    pub fn endif(if_op: Rc<Self>) -> Rc<Self> {
+    pub fn endif(if_op: Arc<Self>) -> Arc<Self> {
         Self::new(Op::EndIf { if_op }, DType::Void)
     }
 
     /// End of range or reduce scope.
     ///
-    /// Wraps a computation and closes the specified ranges.
+    /// Wraps self (the computation) and closes the specified ranges.
     /// This marks the end of RANGE or REDUCE loops.
     ///
     /// # Arguments
     ///
-    /// * `computation` - The computation being performed (e.g., STORE)
     /// * `ranges` - The RANGE or REDUCE operations being closed
-    pub fn end(computation: Rc<Self>, ranges: SmallVec<[Rc<Self>; 4]>) -> Rc<Self> {
-        Self::new(Op::End { computation, ranges }, DType::Void)
+    pub fn end(self: &Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        Self::new(Op::End { computation: self.clone(), ranges }, DType::Void)
     }
 
     // =========================================================================
@@ -76,11 +85,11 @@ impl UOp {
 
     /// Insert a synchronization barrier.
     ///
-    /// `src` passes through; `deps` are operations that must complete before
+    /// Self passes through; `deps` are operations that must complete before
     /// any consumer of this barrier executes.
-    pub fn barrier(src: Rc<Self>, deps: SmallVec<[Rc<Self>; 4]>) -> Rc<Self> {
-        let dtype = src.dtype();
-        Self::new(Op::Barrier { src, deps }, dtype)
+    pub fn barrier(self: &Arc<Self>, deps: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Barrier { src: self.clone(), deps }, dtype)
     }
 
     // =========================================================================
@@ -90,22 +99,22 @@ impl UOp {
     /// Create a DefineVar operation for range-bounded variables.
     ///
     /// Used in testing and symbolic analysis to define variables with known ranges.
-    /// This significantly reduces boilerplate compared to manual Op construction.
-    pub fn var(name: impl Into<String>, dtype: DType, min_val: i64, max_val: i64) -> Rc<Self> {
+    /// Range is [min_val, max_val] inclusive.
+    pub fn var(name: impl Into<String>, dtype: DType, min_val: i64, max_val: i64) -> Arc<Self> {
         Self::new(Op::DefineVar { name: name.into(), min_val, max_val }, dtype)
     }
 
     /// Define a symbolic variable with known bounds for range analysis.
     ///
-    /// Bounds enable vmin/vmax computation and Z3 verification.
-    pub fn define_var(name: String, min_val: i64, max_val: i64) -> Rc<Self> {
+    /// Range is [min_val, max_val] inclusive.
+    pub fn define_var(name: String, min_val: i64, max_val: i64) -> Arc<Self> {
         Self::new(Op::DefineVar { name, min_val, max_val }, DType::Index)
     }
 
     /// Bind concrete value to symbolic variable.
-    pub fn bind(var: Rc<Self>, value: Rc<Self>) -> Rc<Self> {
-        let dtype = var.dtype();
-        Self::new(Op::Bind { var, value }, dtype)
+    pub fn bind(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype();
+        Self::new(Op::Bind { var: self.clone(), value }, dtype)
     }
 
     // =========================================================================
@@ -116,7 +125,7 @@ impl UOp {
     ///
     /// Unlike RANGE which is a loop, SPECIAL represents hardware-provided indices.
     /// The `name` identifies the dimension (rendered as-is in codegen).
-    pub fn special(end: Rc<Self>, name: String) -> Rc<Self> {
+    pub fn special(end: Arc<Self>, name: String) -> Arc<Self> {
         Self::new(Op::Special { end, name }, DType::Index)
     }
 }

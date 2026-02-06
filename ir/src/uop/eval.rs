@@ -571,3 +571,72 @@ pub fn eval_mul_typed(a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Optio
 pub fn eval_sub_typed(a: ConstValue, b: ConstValue, dtype: ScalarDType) -> Option<ConstValue> {
     eval_sub(a, b).map(|r| r.truncate(dtype))
 }
+
+// ============================================================================
+// Vector Constant Evaluation
+// ============================================================================
+
+/// Evaluate binary op element-wise on vector constants.
+///
+/// Both vectors must have the same length.
+/// Returns `None` if lengths differ or any element operation fails.
+#[inline]
+pub fn eval_binary_op_vec(op: BinaryOp, a: &[ConstValue], b: &[ConstValue]) -> Option<Vec<ConstValue>> {
+    if a.len() != b.len() {
+        return None;
+    }
+    a.iter().zip(b.iter()).map(|(av, bv)| eval_binary_op(op, *av, *bv)).collect()
+}
+
+/// Evaluate binary op with broadcast support (Const + VConst mixing).
+///
+/// Handles three cases:
+/// - Both single element: returns single element result
+/// - One single, one vector: broadcasts the single element
+/// - Both same length vectors: element-wise operation
+///
+/// Returns `None` for mismatched non-broadcast lengths or failed operations.
+#[inline]
+pub fn eval_binary_op_broadcast(op: BinaryOp, a: &[ConstValue], b: &[ConstValue]) -> Option<Vec<ConstValue>> {
+    match (a.len(), b.len()) {
+        (1, 1) => eval_binary_op(op, a[0], b[0]).map(|v| vec![v]),
+        (n, 1) if n > 1 => a.iter().map(|av| eval_binary_op(op, *av, b[0])).collect(),
+        (1, m) if m > 1 => b.iter().map(|bv| eval_binary_op(op, a[0], *bv)).collect(),
+        (n, m) if n == m => eval_binary_op_vec(op, a, b),
+        _ => None, // Mismatched non-broadcast lengths
+    }
+}
+
+/// Evaluate binary op element-wise with dtype-aware truncation.
+#[inline]
+pub fn eval_binary_op_vec_typed(
+    op: BinaryOp,
+    a: &[ConstValue],
+    b: &[ConstValue],
+    dtype: ScalarDType,
+) -> Option<Vec<ConstValue>> {
+    eval_binary_op_vec(op, a, b).map(|vs| vs.into_iter().map(|v| v.truncate(dtype)).collect())
+}
+
+/// Evaluate binary op with broadcast and dtype-aware truncation.
+#[inline]
+pub fn eval_binary_op_broadcast_typed(
+    op: BinaryOp,
+    a: &[ConstValue],
+    b: &[ConstValue],
+    dtype: ScalarDType,
+) -> Option<Vec<ConstValue>> {
+    eval_binary_op_broadcast(op, a, b).map(|vs| vs.into_iter().map(|v| v.truncate(dtype)).collect())
+}
+
+/// Evaluate unary op element-wise on vector constants.
+#[inline]
+pub fn eval_unary_op_vec(op: UnaryOp, values: &[ConstValue]) -> Option<Vec<ConstValue>> {
+    values.iter().map(|v| eval_unary_op(op, *v)).collect()
+}
+
+/// Evaluate unary op element-wise with dtype-aware truncation.
+#[inline]
+pub fn eval_unary_op_vec_typed(op: UnaryOp, values: &[ConstValue], dtype: ScalarDType) -> Option<Vec<ConstValue>> {
+    eval_unary_op_vec(op, values).map(|vs| vs.into_iter().map(|v| v.truncate(dtype)).collect())
+}

@@ -373,7 +373,7 @@ impl Tensor {
     /// - Integer dtypes: ~self (bitwise NOT)
     /// - Bool dtype: logical_not(self)
     fn inverse(&self) -> Result<Self> {
-        let dtype = self.uop.dtype();
+        let dtype = self.uop().dtype();
         if dtype.is_float() {
             self.try_neg()
         } else if dtype.is_int() {
@@ -541,18 +541,21 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
 
     // Broadcast n_tensor to match max_idx shape if needed
     let max_idx_shape = max_idx.shape()?;
-    if !max_idx_shape.is_empty() {
+    let result = if !max_idx_shape.is_empty() {
         // Non-scalar result: broadcast n_tensor
         let max_idx_shape_vec: Vec<isize> = max_idx_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
         let ones_shape = vec![1isize; max_idx_shape.len()];
         let n_reshaped = n_tensor.try_reshape(&ones_shape)?;
         let n_broadcast = n_reshaped.try_expand(&max_idx_shape_vec)?;
-        n_broadcast.try_sub(&max_idx)
+        n_broadcast.try_sub(&max_idx)?
     } else {
         // Scalar result: reshape n_tensor to scalar too
         let n_scalar = n_tensor.try_reshape(&[])?;
-        n_scalar.try_sub(&max_idx)
-    }
+        n_scalar.try_sub(&max_idx)?
+    };
+
+    // Cast final result to Int32 (like Tinygrad)
+    result.cast(DType::Int32)
 }
 
 /// Internal argmin implementation.
@@ -598,7 +601,7 @@ fn reduce_internal(
     let resolved_axes = Tensor::resolve_axis_spec(&axes, shape.len())?;
 
     // Determine accumulation dtype
-    let original_dtype = tensor.uop.dtype();
+    let original_dtype = tensor.uop().dtype();
     let acc_dtype = if let Some(ref dt) = dtype {
         // Explicit dtype takes precedence
         dt.clone()
@@ -614,7 +617,7 @@ fn reduce_internal(
     let working_tensor = if acc_dtype != original_dtype { tensor.cast(acc_dtype.clone())? } else { tensor.clone() };
 
     // Perform reduction
-    let reduced = working_tensor.uop.try_reduce_axis(op, resolved_axes.clone()).context(UOpSnafu)?;
+    let reduced = working_tensor.uop().try_reduce_axis(op, resolved_axes.clone()).context(UOpSnafu)?;
 
     // Handle keepdim
     let result = if keepdim {
@@ -649,7 +652,7 @@ fn mean_impl(tensor: &Tensor, axes: impl Into<AxisSpec>, keepdim: bool) -> Resul
     }
 
     // Determine output dtype (integers → float32, floats preserve)
-    let dtype = tensor.uop.dtype();
+    let dtype = tensor.uop().dtype();
     let output_dtype = if Tensor::is_integer_dtype(&dtype) { DType::Float32 } else { dtype };
 
     // Sum with explicit accumulation dtype (no promotion needed, dtype is explicit)
@@ -688,7 +691,7 @@ fn var_mean_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<(Tens
     }
 
     // Determine output dtype (integers → float32, floats preserve)
-    let dtype = tensor.uop.dtype();
+    let dtype = tensor.uop().dtype();
     let output_dtype = if Tensor::is_integer_dtype(&dtype) { DType::Float32 } else { dtype.clone() };
 
     // Compute mean: E[X]

@@ -4,4 +4,5 @@ ir/src/test/
 schedule/src/test/
 schedule-macros/src/test/
 tensor/src/test/
+tensor/benches/
 submodules/

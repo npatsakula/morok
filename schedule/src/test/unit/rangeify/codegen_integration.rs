@@ -5,16 +5,31 @@
 //!
 //! Adapted from Tinygrad's test_rangeify.py and test_assign.py.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, Op, UOp};
 
-use crate::rangeify::codegen_patterns::{fix_after_broadcast, get_contiguous, remove_noop};
-use crate::rangeify::cycle_detection::find_bufs;
-use crate::rangeify::kernel_context::KernelContext;
-use crate::rangeify::split_kernel::split_store;
+use crate::rangeify::kernel::{LocalAddBufferContext, split_store};
+use crate::rangeify::patterns::rangeify_codegen_patterns;
+use crate::rangeify::transforms::find_bufs;
+
+/// Helper to call split_store with the new signature
+fn call_split_store(x: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let mut uop_list = Vec::new();
+    split_store(&mut uop_list, x)
+}
+
+/// Helper to apply rangeify_codegen patterns and return result
+fn apply_codegen_patterns(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let matcher = rangeify_codegen_patterns();
+    let mut ctx = LocalAddBufferContext::new();
+    match matcher.rewrite(uop, &mut ctx) {
+        morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
+        _ => None,
+    }
+}
 
 /// Test that remove_noop integrates correctly in pipeline context.
 ///
@@ -25,8 +40,8 @@ fn test_remove_noop_in_pipeline() {
     // Create a simple NOOP (Void dtype returns None)
     let noop = UOp::noop();
 
-    // remove_noop should return None for Void dtype
-    let result = remove_noop(&noop);
+    // Pattern should return None for Void dtype
+    let result = apply_codegen_patterns(&noop);
     assert!(result.is_none());
 
     // In actual pipeline, NOOPs with real dtypes would be replaced
@@ -40,14 +55,14 @@ fn test_remove_noop_in_pipeline() {
 fn test_get_contiguous_in_pipeline() {
     // Create a computation with CONTIGUOUS marker
     let value = UOp::native_const(42.0f32);
-    let contiguous = UOp::contiguous(value.clone());
+    let contiguous = value.contiguous();
 
     // Pattern should remove the CONTIGUOUS marker
-    let result = get_contiguous(&contiguous);
+    let result = apply_codegen_patterns(&contiguous);
     assert!(result.is_some());
 
     let unwrapped = result.unwrap();
-    assert!(Rc::ptr_eq(&unwrapped, &value));
+    assert!(Arc::ptr_eq(&unwrapped, &value));
 }
 
 /// Test that fix_after_broadcast handles AFTER+EXPAND correctly.
@@ -62,15 +77,15 @@ fn test_fix_after_broadcast_in_pipeline() {
     let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
 
     let computation = UOp::noop();
-    let after = UOp::after(expand, smallvec::smallvec![computation]);
+    let after = expand.after(smallvec::smallvec![computation]);
 
     // Pattern should unwrap EXPAND
-    let result = fix_after_broadcast(&after);
+    let result = apply_codegen_patterns(&after);
     assert!(result.is_some());
 
     let fixed = result.unwrap();
     if let Op::After { passthrough, .. } = fixed.op() {
-        assert!(Rc::ptr_eq(passthrough, &source));
+        assert!(Arc::ptr_eq(passthrough, &source));
     } else {
         panic!("Expected AFTER operation");
     }
@@ -84,17 +99,19 @@ fn test_no_cycle_valid_access_pattern() {
     // Create a valid pattern: LOAD from input buffer, STORE to output buffer
     let in_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
+    let const_idx = UOp::index_const(0);
 
-    // LOAD from input
-    let loaded = UOp::load(in_buf.clone(), index.clone());
+    // LOAD from input using INDEX node
+    let load_idx = UOp::index().buffer(in_buf.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let loaded = UOp::load().buffer(in_buf.clone()).index(load_idx).call();
 
     // Compute something
     let const_val = UOp::native_const(2.0f32);
     let computed = loaded.try_mul(&const_val).unwrap();
 
-    // STORE to output
-    let store = UOp::store(out_buf.clone(), index, computed);
+    // STORE to output using INDEX node
+    let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![const_idx]).call().unwrap();
+    let store = store_idx.store(computed);
 
     // Should not panic - valid access pattern
     #[allow(clippy::mutable_key_type)]
@@ -110,15 +127,14 @@ fn test_no_cycle_valid_access_pattern() {
 #[test]
 fn test_split_store_simple_kernel() {
     // Create a simple STORE operation
-    let buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(buffer.clone(), index, value);
-
-    let mut ctx = KernelContext::new();
+    let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
+    let store = store_idx.store(value);
 
     // split_store may succeed if the STORE has no non-OUTER ranges in scope
-    let result = split_store(&store, &mut ctx);
+    let result = call_split_store(&store);
 
     // Verify result is a KERNEL operation if successful
     if let Some(kernel) = result {
@@ -135,20 +151,19 @@ fn test_split_store_simple_kernel() {
 #[test]
 fn test_split_store_with_loop_ranges() {
     // Create a STORE with LOOP ranges
-    let buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(buffer, index, value);
+    let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
+    let store = store_idx.store(value);
 
     // Wrap in END with LOOP range
     let range_end = UOp::index_const(10);
     let loop_range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::end(store, vec![loop_range].into());
-
-    let mut ctx = KernelContext::new();
+    let end = store.end(vec![loop_range].into());
 
     // Try to split - behavior depends on has_non_outer_ranges() implementation
-    let result = split_store(&end, &mut ctx);
+    let result = call_split_store(&end);
 
     // If successful, verify it's a KERNEL
     if let Some(kernel) = result {
@@ -169,11 +184,11 @@ fn test_pattern_application_order() {
     let value = UOp::native_const(1.0f32);
 
     // Wrap in CONTIGUOUS (should be removed by get_contiguous)
-    let contiguous = UOp::contiguous(value);
+    let contiguous = value.contiguous();
 
     // In real pipeline, this would go through split_store
-    // For now, verify get_contiguous works
-    let result = get_contiguous(&contiguous);
+    // For now, verify pattern works via matcher
+    let result = apply_codegen_patterns(&contiguous);
     assert!(result.is_some());
 }
 
@@ -186,17 +201,20 @@ fn test_multiple_buffer_integration() {
     let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
+    let const_idx = UOp::index_const(0);
 
-    // LOAD from both inputs
-    let load1 = UOp::load(buf1.clone(), index.clone());
-    let load2 = UOp::load(buf2.clone(), index.clone());
+    // LOAD from both inputs using INDEX nodes
+    let load1_idx = UOp::index().buffer(buf1.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let load1 = UOp::load().buffer(buf1.clone()).index(load1_idx).call();
+    let load2_idx = UOp::index().buffer(buf2.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let load2 = UOp::load().buffer(buf2.clone()).index(load2_idx).call();
 
     // Compute sum
     let sum = load1.try_add(&load2).unwrap();
 
-    // STORE to output
-    let store = UOp::store(out_buf.clone(), index, sum);
+    // STORE to output using INDEX node
+    let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![const_idx]).call().unwrap();
+    let store = store_idx.store(sum);
 
     // Verify cycle detection works
     #[allow(clippy::mutable_key_type)]
@@ -210,15 +228,16 @@ fn test_multiple_buffer_integration() {
 #[test]
 fn test_end_store_structure() {
     // Create STORE
-    let buffer = UOp::buffer_id(Some(0));
-    let index = UOp::index_const(0);
+    let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(buffer, index, value);
+    let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
+    let store = store_idx.store(value);
 
     // Wrap in END (normal pipeline output)
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let end = UOp::end(store.clone(), vec![range].into());
+    let end = store.end(vec![range].into());
 
     // Verify END wraps STORE correctly before transformation
     if let Op::End { computation, .. } = end.op() {
@@ -228,8 +247,7 @@ fn test_end_store_structure() {
     }
 
     // split_store should handle END(STORE) structure
-    let mut ctx = KernelContext::new();
-    let result = split_store(&end, &mut ctx);
+    let result = call_split_store(&end);
 
     // If successful, verify it's a KERNEL
     if let Some(kernel) = result {

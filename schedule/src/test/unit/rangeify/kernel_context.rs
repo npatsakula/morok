@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::UOp;
 
@@ -52,7 +52,7 @@ fn test_buffer_mapping() {
     ctx.map_buffer(original.clone(), replacement.clone());
 
     assert!(ctx.has_buffer(&original));
-    assert!(Rc::ptr_eq(ctx.get_buffer(&original).unwrap(), &replacement));
+    assert!(Arc::ptr_eq(ctx.get_buffer(&original).unwrap(), &replacement));
 }
 
 #[test]

@@ -2,7 +2,8 @@
 
 use crate::{RenderedKernel, Result};
 use morok_ir::UOp;
-use std::rc::Rc;
+use morok_ir::pattern::TypedPatternMatcher;
+use std::sync::Arc;
 
 /// Backend-agnostic code generation interface.
 ///
@@ -23,11 +24,24 @@ pub trait Renderer {
     /// # Returns
     ///
     /// A `RenderedKernel` containing the generated code and metadata.
-    fn render(&self, uop: &Rc<UOp>, name: Option<&str>) -> Result<RenderedKernel>;
+    fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel>;
 
     /// Get the backend name (e.g., "llvm", "cuda", "metal").
     fn backend_name(&self) -> &str;
 
-    /// Check if the backend supports a specific operation.
-    fn supports_op(&self, op: &morok_ir::Op) -> bool;
+    /// Returns decomposition patterns for operations this backend doesn't support.
+    ///
+    /// Backends that support all transcendental operations natively (e.g., LLVM)
+    /// should return `None`. Backends that need decomposition (e.g., CPU interpreter)
+    /// should return a `PatternMatcher` containing the decomposition rules.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
+    ///     // LLVM has native transcendentals
+    ///     None
+    /// }
+    /// ```
+    fn decompositor(&self) -> Option<TypedPatternMatcher<()>>;
 }

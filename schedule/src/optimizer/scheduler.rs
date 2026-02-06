@@ -6,7 +6,7 @@
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use morok_ir::{AxisId, AxisType, Op, UOp, UOpKey};
@@ -31,44 +31,6 @@ fn kernel_name_counts() -> &'static Mutex<HashMap<String, usize>> {
 pub fn clear_kernel_name_counts() {
     if let Some(counts) = KERNEL_NAME_COUNTS.get() {
         counts.lock().unwrap().clear();
-    }
-}
-
-/// Flatten nested ranges in REDUCE and STORE operations.
-///
-/// Ensures ranges are stored in canonical flat order by collecting all
-/// RANGE operations via toposort and replacing them in sorted order.
-///
-/// Based on Tinygrad's `pm_flatten_range` pattern.
-///
-/// Note: In Morok's IR, ranges are typically already flat. This function
-/// ensures canonical ordering for REDUCE operations and recursively
-/// processes STORE operations.
-fn flatten_ranges(ast: Rc<UOp>) -> Rc<UOp> {
-    match ast.op() {
-        Op::Reduce { reduce_op, ranges, src } => {
-            // Flatten REDUCE ranges
-            let sink = UOp::sink(ranges.iter().cloned().collect());
-            let flattened: Vec<_> =
-                sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
-
-            // Recursively flatten the src
-            let flattened_src = flatten_ranges(src.clone());
-
-            // Recreate REDUCE with flattened ranges
-            UOp::reduce(flattened_src, flattened.into(), *reduce_op)
-        }
-        Op::Store { buffer, index, value } => {
-            // Recursively flatten value being stored
-            let flattened_value = flatten_ranges(value.clone());
-
-            // Recreate STORE with flattened value
-            UOp::store(buffer.clone(), index.clone(), flattened_value)
-        }
-        _ => {
-            // No flattening needed for other operations
-            ast
-        }
     }
 }
 
@@ -110,7 +72,7 @@ pub struct Scheduler {
     ///
     /// This is the root UOp representing the computation. Immutable during the lifetime
     /// of a Scheduler instance - transformations create new ASTs.
-    ast: Rc<UOp>,
+    ast: Arc<UOp>,
 
     /// Backend renderer capabilities.
     ///
@@ -129,7 +91,7 @@ pub struct Scheduler {
 
     // Cached properties (computed lazily)
     /// Cached list of all RANGE operations, sorted by (axis_type.priority(), axis_id).
-    rngs_cache: OnceCell<Vec<Rc<UOp>>>,
+    rngs_cache: OnceCell<Vec<Arc<UOp>>>,
 
     /// Cached maximum axis_id used in any RANGE.
     maxarg_cache: OnceCell<usize>,
@@ -146,7 +108,7 @@ impl Scheduler {
     /// # Returns
     ///
     /// A new Scheduler with empty optimization history and cleared caches.
-    pub fn new(ast: Rc<UOp>, ren: Renderer) -> Self {
+    pub fn new(ast: Arc<UOp>, ren: Renderer) -> Self {
         Self {
             ast,
             ren,
@@ -158,14 +120,14 @@ impl Scheduler {
     }
 
     /// Get a reference to the current AST.
-    pub fn ast(&self) -> &Rc<UOp> {
+    pub fn ast(&self) -> &Arc<UOp> {
         &self.ast
     }
 
     /// Set the AST to a new value and clear caches.
     ///
     /// Used by optimization operations that transform the AST.
-    pub(crate) fn set_ast(&mut self, ast: Rc<UOp>) {
+    pub(crate) fn set_ast(&mut self, ast: Arc<UOp>) {
         self.ast = ast;
         self.clear_caches();
     }
@@ -199,18 +161,18 @@ impl Scheduler {
     ///     println!("Axis {}: {:?} size={}", i, rng.axis_type(), rng.size());
     /// }
     /// ```
-    pub fn rngs(&self) -> &[Rc<UOp>] {
+    pub fn rngs(&self) -> &[Arc<UOp>] {
         self.rngs_cache.get_or_init(|| self.compute_rngs())
     }
 
     /// Compute the list of RANGE operations and sort them.
     ///
     /// This is called lazily the first time `rngs()` is accessed.
-    fn compute_rngs(&self) -> Vec<Rc<UOp>> {
+    fn compute_rngs(&self) -> Vec<Arc<UOp>> {
         // Collect all RANGE nodes via toposort
         // Filter out size-1 ranges (where vmax == 0) to match Tinygrad's behavior
         // This causes Global(1), Local(1), etc. axes to be excluded from rngs()
-        let mut ranges: Vec<Rc<UOp>> = self
+        let mut ranges: Vec<Arc<UOp>> = self
             .ast
             .toposort()
             .into_iter()
@@ -271,7 +233,7 @@ impl Scheduler {
     /// # Returns
     ///
     /// The first REDUCE UOp found via toposort, or None if no reductions exist.
-    pub fn reduceop(&self) -> Option<Rc<UOp>> {
+    pub fn reduceop(&self) -> Option<Arc<UOp>> {
         self.ast.toposort().into_iter().find(|node| matches!(node.op(), Op::Reduce { .. }))
     }
 
@@ -282,7 +244,7 @@ impl Scheduler {
     /// # Returns
     ///
     /// Vector of all REDUCE UOps found via toposort.
-    pub fn reduceops(&self) -> Vec<Rc<UOp>> {
+    pub fn reduceops(&self) -> Vec<Arc<UOp>> {
         self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Reduce { .. })).collect()
     }
 
@@ -296,7 +258,7 @@ impl Scheduler {
     /// # Returns
     ///
     /// Vector of all INDEX UOps found via toposort.
-    pub fn bufs(&self) -> Vec<Rc<UOp>> {
+    pub fn bufs(&self) -> Vec<Arc<UOp>> {
         self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Index { .. })).collect()
     }
 
@@ -367,15 +329,25 @@ impl Scheduler {
     ///
     /// # Returns
     ///
-    /// Product of all UPCAST dimension sizes, or 1 if no upcasts exist.
+    /// Product of all UPCAST and UNROLL dimension sizes, or 1 if none exist.
+    ///
+    /// # Note
+    ///
+    /// This matches Tinygrad's `upcast_size()` which computes:
+    /// `prod(self.full_shape[a] for a in self.axes_of(AxisType.UPCAST, AxisType.UNROLL))`
+    ///
+    /// Used as a generic guard to prevent exponential vector width growth from
+    /// multiple unroll sources (K-vectorization, output-upcast, general unrolling).
     pub fn upcast_size(&self) -> usize {
         self.rngs()
             .iter()
-            .filter(
-                |rng| {
-                    if let Op::Range { axis_type, .. } = rng.op() { *axis_type == AxisType::Upcast } else { false }
-                },
-            )
+            .filter(|rng| {
+                if let Op::Range { axis_type, .. } = rng.op() {
+                    matches!(axis_type, AxisType::Upcast | AxisType::Unroll)
+                } else {
+                    false
+                }
+            })
             .filter_map(|rng| {
                 if let Op::Range { end, .. } = rng.op()
                     && let Op::Const(cv) = end.op()
@@ -452,14 +424,14 @@ impl Scheduler {
     /// # Returns
     ///
     /// Vector of Range UOps with matching axis types.
-    pub fn ranges_of(&self, types: &[AxisType]) -> Vec<Rc<UOp>> {
+    pub fn ranges_of(&self, types: &[AxisType]) -> Vec<Arc<UOp>> {
         self.axes_of(types).into_iter().map(|i| self.rngs()[i].clone()).collect()
     }
 
     /// Get indices of axes that can be upcasted (vectorized).
     ///
     /// Upcastable axes are GLOBAL, LOCAL, or LOOP axes with size > 1.
-    /// These represent dimensions that can be combined via SIMD/vectorization.
+    /// Note: OUTER is excluded per Tinygrad's design - it's for schedule expansion, not vectorization.
     ///
     /// # Returns
     ///
@@ -470,7 +442,9 @@ impl Scheduler {
             .enumerate()
             .filter_map(|(i, rng)| {
                 if let Op::Range { axis_type, end, .. } = rng.op() {
-                    // Check type
+                    // Check type: GLOBAL/LOCAL/LOOP are upcastable
+                    // (OUTER should be converted to LOOP via convert_outer_to_loop before upcasting)
+                    // (REDUCE axes should use UNROLL instead, not UPCAST)
                     if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
                         return None;
                     }
@@ -720,15 +694,14 @@ impl Scheduler {
     /// )?;
     /// // Result: iteration order is [0,1,2,3, 4,5,6,7, 8,9,10,11, 12,13,14,15]
     /// ```
-    #[allow(dead_code)] // Will be used in Phase 4 (OptOps implementation)
     pub(crate) fn shift_to(
         &mut self,
-        rng: Rc<UOp>,
+        rng: Arc<UOp>,
         amount: usize,
         new_type: AxisType,
         top: bool,
-        input_new_rng: Option<Rc<UOp>>,
-    ) -> Result<(Rc<UOp>, Rc<UOp>), OptError> {
+        input_new_rng: Option<Arc<UOp>>,
+    ) -> Result<(Arc<UOp>, Arc<UOp>), OptError> {
         use morok_ir::{ConstValue, UOpKey};
         use std::collections::HashMap;
 
@@ -814,7 +787,7 @@ impl Scheduler {
     /// parallelization since they represent independent output elements.
     ///
     /// Based on Tinygrad's `_output_rngs()`.
-    fn output_rngs(&self) -> Vec<Rc<UOp>> {
+    fn output_rngs(&self) -> Vec<Arc<UOp>> {
         // Find all STORE operations (outputs)
         let stores: Vec<_> = self
             .ast
@@ -837,7 +810,7 @@ impl Scheduler {
                     // Include all non-REDUCE ranges
                     if *axis_type != AxisType::Reduce {
                         // Only add if not already in list (use pointer equality)
-                        if !output_ranges.iter().any(|r: &Rc<UOp>| Rc::ptr_eq(r, &dep)) {
+                        if !output_ranges.iter().any(|r: &Arc<UOp>| Arc::ptr_eq(r, &dep)) {
                             output_ranges.push(dep);
                         }
                     }
@@ -857,7 +830,7 @@ impl Scheduler {
     /// This ensures parallelizing the range won't cause race conditions.
     ///
     /// Based on Tinygrad's `_globalizable_rngs()`.
-    fn globalizable_rngs(&self) -> Vec<Rc<UOp>> {
+    fn globalizable_rngs(&self) -> Vec<Arc<UOp>> {
         // Start with LOOP axes from outputs
         let mut candidates: Vec<_> = self
             .output_rngs()
@@ -884,7 +857,7 @@ impl Scheduler {
                 store_deps.into_iter().filter(|dep| matches!(dep.op(), Op::Range { .. })).collect();
 
             // Filter candidates to keep only those in this store's ranges
-            candidates.retain(|candidate| store_ranges.iter().any(|r| Rc::ptr_eq(r, candidate)));
+            candidates.retain(|candidate| store_ranges.iter().any(|r| Arc::ptr_eq(r, candidate)));
         }
 
         candidates
@@ -943,6 +916,81 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Convert OUTER axes to LOOP for CPU vectorization.
+    ///
+    /// For CPU backends (has_local=false), OUTER axes cannot be parallelized
+    /// externally but can be vectorized. Converting them to LOOP allows
+    /// the optimizer to apply UPCAST transformations for SIMD operations.
+    ///
+    /// **Important**: For reduce kernels, OUTER axes represent output dimensions
+    /// and should NOT be converted to LOOP. Converting them causes a vector width
+    /// mismatch in expand.rs when multiple UPCAST axes combine (16 vs 64).
+    ///
+    /// This is the CPU counterpart to `convert_loop_to_global()` for GPU.
+    pub fn convert_outer_to_loop(&mut self) -> Result<(), OptError> {
+        use tracing::debug;
+
+        // Only for CPU backends (no local memory = no GPU parallelization)
+        if self.ren.has_local {
+            debug!("convert_outer_to_loop: skipping (has_local=true)");
+            return Ok(());
+        }
+
+        // Don't convert OUTER→LOOP in reduce kernels.
+        // This would enable output tiling, but causes vector width mismatch (16 vs 64)
+        // when multiple UPCAST axes combine in expand.rs.
+        if self.reduceop().is_some() {
+            debug!("convert_outer_to_loop: skipping (has reduceop)");
+            return Ok(());
+        }
+
+        let all_rngs = self.rngs();
+        debug!(num_rngs = all_rngs.len(), "convert_outer_to_loop: checking rngs");
+        for (i, rng) in all_rngs.iter().enumerate() {
+            debug!(i, axis_type = ?rng.op(), "convert_outer_to_loop: rng");
+        }
+
+        let outer_rngs: Vec<_> = self
+            .rngs()
+            .iter()
+            .filter(|rng| matches!(rng.op(), Op::Range { axis_type: AxisType::Outer, .. }))
+            .cloned()
+            .collect();
+
+        debug!(num_outer = outer_rngs.len(), "convert_outer_to_loop: found outer ranges");
+
+        if outer_rngs.is_empty() {
+            debug!("convert_outer_to_loop: no outer ranges to convert");
+            return Ok(());
+        }
+
+        // Build substitution map: OUTER → LOOP
+        #[allow(clippy::mutable_key_type)]
+        let mut subst_map = std::collections::HashMap::new();
+        for rng in outer_rngs {
+            let new_rng = rng.with_axis_type(AxisType::Loop);
+            debug!("convert_outer_to_loop: converting {:?} -> {:?}", rng.op(), new_rng.op());
+            subst_map.insert(UOpKey(rng), new_rng);
+        }
+
+        // Apply substitution
+        let old_ast_id = self.ast.id;
+        self.ast = self.ast.substitute(&subst_map);
+        debug!(old_id = old_ast_id, new_id = self.ast.id, "convert_outer_to_loop: substitution complete");
+
+        // Record high-level transformation
+        if old_ast_id != self.ast.id {
+            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
+            PROVENANCE_TRACKER.with(|tracker| {
+                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ConvertOuterToLoop);
+            });
+        }
+
+        self.clear_caches();
+
+        Ok(())
+    }
+
     /// Get the optimized AST with kernel metadata attached.
     ///
     /// This is the final step of optimization, which:
@@ -965,7 +1013,7 @@ impl Scheduler {
     /// let info = optimized.metadata::<KernelInfo>().unwrap();
     /// println!("Kernel: {}", info.name); // "r_g16l16R32u4"
     /// ```
-    pub fn get_optimized_ast(&self, name_override: Option<String>) -> Rc<UOp> {
+    pub fn get_optimized_ast(&self, name_override: Option<String>) -> Arc<UOp> {
         use crate::optimizer::KernelInfo;
 
         // 1. Generate kernel name
@@ -1022,8 +1070,10 @@ impl Scheduler {
             if *count > 1 { format!("{}n{}", name, *count - 1) } else { name }
         };
 
-        // 2. Flatten ranges
-        let flattened_ast = flatten_ranges(self.ast.clone());
+        // 2. Flatten ranges (using graph_rewrite like Tinygrad)
+        // Note: Tinygrad's default bottom_up=False ≈ Morok's graph_rewrite_bottom_up
+        let flattened_ast =
+            crate::rewrite::graph_rewrite_bottom_up(&crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
 
         // 3. Attach metadata
         let info = KernelInfo { name, applied_opts: self.applied_opts.clone(), dont_use_locals: self.dont_use_locals };
@@ -1041,5 +1091,22 @@ impl fmt::Display for Scheduler {
     /// - "E_g256g256" - Elementwise kernel with 2D Global shape
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}_{}", self.kernel_type(), self.colored_shape())
+    }
+}
+
+impl Clone for Scheduler {
+    /// Clone the scheduler state.
+    ///
+    /// Note: Caches are cleared in the clone to ensure correct behavior.
+    fn clone(&self) -> Self {
+        Self {
+            ast: self.ast.clone(),
+            ren: self.ren.clone(),
+            dont_use_locals: self.dont_use_locals,
+            applied_opts: self.applied_opts.clone(),
+            // Clear caches in clone - they'll be recomputed on demand
+            rngs_cache: OnceCell::new(),
+            maxarg_cache: OnceCell::new(),
+        }
     }
 }

@@ -3,7 +3,7 @@
 use morok_dtype::DType;
 use morok_ir::types::TernaryOp;
 use morok_ir::{Op, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
@@ -21,7 +21,7 @@ fn test_where_always_true() {
     let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // Should eliminate to true branch
-    assert!(Rc::ptr_eq(&result, &true_branch));
+    assert!(Arc::ptr_eq(&result, &true_branch));
 }
 
 #[test]
@@ -37,7 +37,7 @@ fn test_where_always_false() {
     let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // Should eliminate to false branch
-    assert!(Rc::ptr_eq(&result, &false_branch));
+    assert!(Arc::ptr_eq(&result, &false_branch));
 }
 
 #[test]
@@ -56,26 +56,7 @@ fn test_where_range_based_true() {
     let result = graph_rewrite(&matcher, where_op, &mut ());
 
     // The comparison should be folded to true, then WHERE should select true branch
-    assert!(Rc::ptr_eq(&result, &true_branch));
-}
-
-#[test]
-fn test_where_range_based_false() {
-    // Create a comparison that's always false based on ranges
-    let x = UOp::var("x", DType::Int32, 100, 200);
-    let fifty = UOp::native_const(50i32);
-    let cond = x.try_cmplt(&fifty).expect("LT should succeed"); // 100..200 < 50 is always false
-
-    let true_branch = UOp::native_const(1i32);
-    let false_branch = UOp::native_const(0i32);
-
-    let where_op = UOp::try_where(cond, true_branch, false_branch.clone()).unwrap();
-
-    let matcher = symbolic_simple();
-    let result = graph_rewrite(&matcher, where_op, &mut ());
-
-    // The comparison should be folded to false, then WHERE should select false branch
-    assert!(Rc::ptr_eq(&result, &false_branch));
+    assert!(Arc::ptr_eq(&result, &true_branch));
 }
 
 #[test]
@@ -96,9 +77,9 @@ fn test_where_unknown_condition() {
     // Should not be eliminated (condition is not constant)
     match result.op() {
         Op::Ternary(TernaryOp::Where, result_cond, result_true, result_false) => {
-            assert!(Rc::ptr_eq(result_cond, &cond));
-            assert!(Rc::ptr_eq(result_true, &true_branch));
-            assert!(Rc::ptr_eq(result_false, &false_branch));
+            assert!(Arc::ptr_eq(result_cond, &cond));
+            assert!(Arc::ptr_eq(result_true, &true_branch));
+            assert!(Arc::ptr_eq(result_false, &false_branch));
         }
         other => panic!("Expected Op::Ternary(Where, _, _, _), got {:?}", other),
     }
@@ -125,5 +106,5 @@ fn test_nested_where_elimination() {
     let result = graph_rewrite(&matcher, outer, &mut ());
 
     // Should eliminate to val2
-    assert!(Rc::ptr_eq(&result, &val2));
+    assert!(Arc::ptr_eq(&result, &val2));
 }

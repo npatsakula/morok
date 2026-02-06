@@ -5,7 +5,7 @@
 //! and provides tensor core configurations for hardware-accelerated matrix multiplication.
 
 use morok_dtype::DType;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 /// Tensor core optimization operation.
 ///
@@ -131,13 +131,14 @@ pub struct Renderer {
 impl Renderer {
     /// Create a CPU renderer configuration.
     pub fn cpu() -> Self {
+        let cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8);
         Self {
             device: "CPU".to_string(),
             has_local: false,
             has_shared: false,
             has_threads: true,
             shared_max: 0,
-            global_max: Some(vec![256]), // Typical thread pool size
+            global_max: Some(vec![cores]), // Actual available CPU cores
             local_max: None,
             upcast_max: 16, // AVX512 can do 16-wide float
             buffer_max: None,
@@ -399,407 +400,158 @@ pub struct TensorCore {
     ),
 }
 
+// ============================================================================
+// TENSOR CORE CONFIGURATION (Static Const Data)
+// ============================================================================
+
+/// Static tensor core configuration for const definitions.
+///
+/// Uses static slices instead of SmallVec for const-compatibility.
+/// Use `build()` to convert to runtime `TensorCore`.
+pub struct TcConfig {
+    dims: (usize, usize, usize),
+    threads: usize,
+    ept: (usize, usize, usize),
+    opts: &'static [TcOpt],
+    swizzle_a: (&'static [SwizzleAxis], &'static [SwizzleAxis], &'static [SwizzleAxis]),
+    swizzle_b: (&'static [SwizzleAxis], &'static [SwizzleAxis], &'static [SwizzleAxis]),
+}
+
+impl TcConfig {
+    /// Build a TensorCore from static config with specified dtypes.
+    pub fn build(&self, dtype_in: DType, dtype_out: DType) -> TensorCore {
+        TensorCore {
+            dims: self.dims,
+            threads: self.threads,
+            elements_per_thread: self.ept,
+            dtype_in,
+            dtype_out,
+            opts: self.opts.iter().copied().collect(),
+            swizzle: (
+                (
+                    self.swizzle_a.0.iter().copied().collect(),
+                    self.swizzle_a.1.iter().copied().collect(),
+                    self.swizzle_a.2.iter().copied().collect(),
+                ),
+                (
+                    self.swizzle_b.0.iter().copied().collect(),
+                    self.swizzle_b.1.iter().copied().collect(),
+                    self.swizzle_b.2.iter().copied().collect(),
+                ),
+            ),
+        }
+    }
+}
+
+// Aliases for brevity in const definitions
+use SwizzleAxis::{Local as SL, Reduce as R, Upcast as SU};
+use TcOpt::{Local as L, Upcast as U};
+
+// NVIDIA CUDA Tensor Cores
+pub const CUDA_81616: TcConfig = TcConfig {
+    dims: (8, 16, 16),
+    threads: 32,
+    ept: (8, 4, 4),
+    opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
+    swizzle_a: (&[R(1), R(2), SL(2), SL(3), SL(4)], &[SU(1), R(3)], &[SL(0), SL(1), SU(0), R(0)]),
+    swizzle_b: (&[R(1), R(2), SU(0), SL(0), SL(1)], &[R(0), R(3)], &[SL(2), SL(3), SL(4), SU(1)]),
+};
+
+pub const CUDA_81632: TcConfig = TcConfig {
+    dims: (8, 16, 32),
+    threads: 32,
+    ept: (16, 8, 4),
+    opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
+    swizzle_a: (&[R(2), R(3), SL(2), SL(3), SL(4)], &[SU(1), R(4)], &[SL(0), SL(1), SU(0), R(0), R(1)]),
+    swizzle_b: (&[R(2), R(3), SU(0), SL(0), SL(1)], &[R(1), R(4)], &[SL(2), SL(3), SL(4), SU(1), R(0)]),
+};
+
+pub const CUDA_8168: TcConfig = TcConfig {
+    dims: (8, 16, 8),
+    threads: 32,
+    ept: (4, 2, 4),
+    opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
+    swizzle_a: (&[R(1), R(2), SL(2), SL(3), SL(4)], &[R(0), SU(1)], &[SL(0), SL(1), SU(0)]),
+    swizzle_b: (&[R(1), R(2), SU(0), SL(0), SL(1)], &[SU(1), R(0)], &[SL(2), SL(3), SL(4)]),
+};
+
+pub const CUDA_8168_TF32: TcConfig = TcConfig {
+    dims: (8, 16, 8),
+    threads: 32,
+    ept: (4, 2, 4),
+    opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
+    swizzle_a: (&[R(0), R(1), SL(2), SL(3), SL(4)], &[SU(1), R(2)], &[SL(0), SL(1), SU(0)]),
+    swizzle_b: (&[R(0), R(1), SU(0), SL(0), SL(1)], &[SU(1), R(2)], &[SL(2), SL(3), SL(4)]),
+};
+
+// AMD Tensor Cores
+pub const AMD_RDNA3: TcConfig = TcConfig {
+    dims: (16, 16, 16),
+    threads: 32,
+    ept: (16, 16, 8),
+    opts: &[L(0), L(0), L(0), L(0), L(1), U(1), U(1), U(1)],
+    swizzle_a: (&[SL(4), SU(0), SU(1), SU(2), SL(0)], &[R(1), R(2), R(3)], &[SL(1), SL(2), SL(3), R(0)]),
+    swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), SL(4)], &[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2), R(0)]),
+};
+
+pub const AMD_RDNA4: TcConfig = TcConfig {
+    dims: (16, 16, 16),
+    threads: 32,
+    ept: (8, 8, 8),
+    opts: &[L(0), L(0), L(0), L(0), U(1), U(1), U(1), L(1)],
+    swizzle_a: (&[SU(0), SU(1), SU(2), SL(4), R(2)], &[R(0), R(1), R(3)], &[SL(0), SL(1), SL(2), SL(3)]),
+    swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2)], &[R(0), R(1), R(3)], &[SL(4), SU(0), SU(1), SU(2)]),
+};
+
+pub const AMD_CDNA_161616: TcConfig = TcConfig {
+    dims: (16, 16, 16),
+    threads: 64,
+    ept: (4, 4, 4),
+    opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
+    swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(2), R(3)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3)]),
+    swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2), R(3)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1)]),
+};
+
+pub const AMD_CDNA_161632: TcConfig = TcConfig {
+    dims: (16, 16, 32),
+    threads: 64,
+    ept: (8, 8, 4),
+    opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
+    swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(3), R(4)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3), R(2)]),
+    swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(3), R(4)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1), R(2)]),
+};
+
+// Apple Metal Tensor Cores
+pub const METAL_888: TcConfig = TcConfig {
+    dims: (8, 8, 8),
+    threads: 32,
+    ept: (2, 2, 2),
+    opts: &[U(0), L(0), L(1), L(1), L(0), L(1)],
+    swizzle_a: (&[R(1), SL(1), SL(2), R(2), SL(4)], &[R(0)], &[SU(0), SL(0), SL(3)]),
+    swizzle_b: (&[SL(0), R(0), R(1), SL(3), R(2)], &[SU(0)], &[SL(1), SL(2), SL(4)]),
+};
+
+// Apple AMX
+pub const APPLE_AMX: TcConfig = TcConfig {
+    dims: (64, 64, 1),
+    threads: 1,
+    ept: (64, 64, 4096),
+    opts: &[U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1)],
+    swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7)], &[]),
+    swizzle_b: (&[], &[SU(4), SU(5), SU(6), SU(7), SU(0), SU(1), SU(2), SU(3)], &[]),
+};
+
+// Intel Xe Tensor Cores
+pub const INTEL_XE_8816: TcConfig = TcConfig {
+    dims: (8, 8, 16),
+    threads: 8,
+    ept: (16, 16, 8),
+    opts: &[L(0), L(0), L(0), U(1), U(1), U(1)],
+    swizzle_a: (&[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2)], &[SL(0), SL(1), SL(2), R(0)]),
+    swizzle_b: (&[SL(0), SL(1), SL(2)], &[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2), R(0)]),
+};
+
 impl TensorCore {
-    // ===== NVIDIA CUDA Tensor Cores =====
-
-    /// NVIDIA 8x16x16 FP16 tensor core (SM75+).
-    pub fn cuda_81616_f16_f32() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (8, 16, 16),
-            threads: 32,
-            elements_per_thread: (8, 4, 4),
-            dtype_in: DType::Float16,
-            dtype_out: DType::Float32,
-            opts: smallvec![Upcast(0), Local(0), Local(0), Local(1), Local(1), Local(1), Upcast(1)],
-            swizzle: (
-                (smallvec![R(1), R(2), L(2), L(3), L(4)], smallvec![U(1), R(3)], smallvec![L(0), L(1), U(0), R(0)]),
-                (smallvec![R(1), R(2), U(0), L(0), L(1)], smallvec![R(0), R(3)], smallvec![L(2), L(3), L(4), U(1)]),
-            ),
-        }
-    }
-
-    /// NVIDIA 8x16x16 BFloat16 tensor core.
-    pub fn cuda_81616_bf16_f32() -> Self {
-        let mut tc = Self::cuda_81616_f16_f32();
-        tc.dtype_in = DType::BFloat16;
-        tc
-    }
-
-    /// NVIDIA 8x16x16 FP16 tensor core with FP16 accumulation.
-    pub fn cuda_81616_f16_f16() -> Self {
-        let mut tc = Self::cuda_81616_f16_f32();
-        tc.dtype_out = DType::Float16;
-        tc
-    }
-
-    /// NVIDIA 8x16x32 FP8 tensor core (SM89+).
-    pub fn cuda_81632_fp8e4m3() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (8, 16, 32),
-            threads: 32,
-            elements_per_thread: (16, 8, 4),
-            dtype_in: DType::FP8E4M3,
-            dtype_out: DType::Float32,
-            opts: smallvec![Upcast(0), Local(0), Local(0), Local(1), Local(1), Local(1), Upcast(1)],
-            swizzle: (
-                (
-                    smallvec![R(2), R(3), L(2), L(3), L(4)],
-                    smallvec![U(1), R(4)],
-                    smallvec![L(0), L(1), U(0), R(0), R(1)],
-                ),
-                (
-                    smallvec![R(2), R(3), U(0), L(0), L(1)],
-                    smallvec![R(1), R(4)],
-                    smallvec![L(2), L(3), L(4), U(1), R(0)],
-                ),
-            ),
-        }
-    }
-
-    /// NVIDIA 8x16x32 FP8E5M2 tensor core.
-    pub fn cuda_81632_fp8e5m2() -> Self {
-        let mut tc = Self::cuda_81632_fp8e4m3();
-        tc.dtype_in = DType::FP8E5M2;
-        tc
-    }
-
-    /// NVIDIA 8x16x8 FP16 tensor core.
-    pub fn cuda_8168_f16_f32() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (8, 16, 8),
-            threads: 32,
-            elements_per_thread: (4, 2, 4),
-            dtype_in: DType::Float16,
-            dtype_out: DType::Float32,
-            opts: smallvec![Upcast(0), Local(0), Local(0), Local(1), Local(1), Local(1), Upcast(1)],
-            swizzle: (
-                (smallvec![R(1), R(2), L(2), L(3), L(4)], smallvec![R(0), U(1)], smallvec![L(0), L(1), U(0)]),
-                (smallvec![R(1), R(2), U(0), L(0), L(1)], smallvec![U(1), R(0)], smallvec![L(2), L(3), L(4)]),
-            ),
-        }
-    }
-
-    /// NVIDIA 8x16x8 FP16 with FP16 accumulation.
-    pub fn cuda_8168_f16_f16() -> Self {
-        let mut tc = Self::cuda_8168_f16_f32();
-        tc.dtype_out = DType::Float16;
-        tc
-    }
-
-    /// NVIDIA 8x16x8 TF32 tensor core (SM80+).
-    pub fn cuda_8168_tf32() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (8, 16, 8),
-            threads: 32,
-            elements_per_thread: (4, 2, 4),
-            dtype_in: DType::Float32,
-            dtype_out: DType::Float32,
-            opts: smallvec![Upcast(0), Local(0), Local(0), Local(1), Local(1), Local(1), Upcast(1)],
-            swizzle: (
-                (smallvec![R(0), R(1), L(2), L(3), L(4)], smallvec![U(1), R(2)], smallvec![L(0), L(1), U(0)]),
-                (smallvec![R(0), R(1), U(0), L(0), L(1)], smallvec![U(1), R(2)], smallvec![L(2), L(3), L(4)]),
-            ),
-        }
-    }
-
-    // ===== AMD Tensor Cores =====
-
-    /// AMD RDNA3 16x16x16 FP16 tensor core.
-    pub fn amd_rdna3_f16_f32() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (16, 16, 16),
-            threads: 32,
-            elements_per_thread: (16, 16, 8),
-            dtype_in: DType::Float16,
-            dtype_out: DType::Float32,
-            opts: smallvec![Local(0), Local(0), Local(0), Local(0), Local(1), Upcast(1), Upcast(1), Upcast(1)],
-            swizzle: (
-                (
-                    smallvec![L(4), U(0), U(1), U(2), L(0)],
-                    smallvec![R(1), R(2), R(3)],
-                    smallvec![L(1), L(2), L(3), R(0)],
-                ),
-                (
-                    smallvec![L(0), L(1), L(2), L(3), L(4)],
-                    smallvec![R(1), R(2), R(3)],
-                    smallvec![U(0), U(1), U(2), R(0)],
-                ),
-            ),
-        }
-    }
-
-    /// AMD RDNA3 16x16x16 FP16 with FP16 accumulation.
-    pub fn amd_rdna3_f16_f16() -> Self {
-        let mut tc = Self::amd_rdna3_f16_f32();
-        tc.dtype_out = DType::Float16;
-        tc
-    }
-
-    /// AMD RDNA3 16x16x16 BFloat16 tensor core.
-    pub fn amd_rdna3_bf16_f32() -> Self {
-        let mut tc = Self::amd_rdna3_f16_f32();
-        tc.dtype_in = DType::BFloat16;
-        tc
-    }
-
-    /// AMD RDNA4 16x16x16 FP16 tensor core.
-    pub fn amd_rdna4_f16_f32() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (16, 16, 16),
-            threads: 32,
-            elements_per_thread: (8, 8, 8),
-            dtype_in: DType::Float16,
-            dtype_out: DType::Float32,
-            opts: smallvec![Local(0), Local(0), Local(0), Local(0), Upcast(1), Upcast(1), Upcast(1), Local(1)],
-            swizzle: (
-                (
-                    smallvec![U(0), U(1), U(2), L(4), R(2)],
-                    smallvec![R(0), R(1), R(3)],
-                    smallvec![L(0), L(1), L(2), L(3)],
-                ),
-                (
-                    smallvec![L(0), L(1), L(2), L(3), R(2)],
-                    smallvec![R(0), R(1), R(3)],
-                    smallvec![L(4), U(0), U(1), U(2)],
-                ),
-            ),
-        }
-    }
-
-    /// AMD RDNA4 16x16x16 FP16 with FP16 accumulation.
-    pub fn amd_rdna4_f16_f16() -> Self {
-        let mut tc = Self::amd_rdna4_f16_f32();
-        tc.dtype_out = DType::Float16;
-        tc
-    }
-
-    /// AMD RDNA4 16x16x16 BFloat16 tensor core.
-    pub fn amd_rdna4_bf16_f32() -> Self {
-        let mut tc = Self::amd_rdna4_f16_f32();
-        tc.dtype_in = DType::BFloat16;
-        tc
-    }
-
-    /// AMD RDNA4 16x16x16 BFloat16 with BFloat16 accumulation.
-    pub fn amd_rdna4_bf16_bf16() -> Self {
-        let mut tc = Self::amd_rdna4_f16_f32();
-        tc.dtype_in = DType::BFloat16;
-        tc.dtype_out = DType::BFloat16;
-        tc
-    }
-
-    /// AMD CDNA 16x16x16 FP16 tensor core (MI100/MI200).
-    pub fn amd_cdna_161616_f16() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (16, 16, 16),
-            threads: 64,
-            elements_per_thread: (4, 4, 4),
-            dtype_in: DType::Float16,
-            dtype_out: DType::Float32,
-            opts: smallvec![Local(0), Local(0), Local(0), Local(0), Upcast(1), Upcast(1), Local(1), Local(1)],
-            swizzle: (
-                (
-                    smallvec![U(0), U(1), L(4), L(5), R(2), R(3)],
-                    smallvec![R(0), R(1)],
-                    smallvec![L(0), L(1), L(2), L(3)],
-                ),
-                (
-                    smallvec![L(0), L(1), L(2), L(3), R(2), R(3)],
-                    smallvec![R(0), R(1)],
-                    smallvec![L(4), L(5), U(0), U(1)],
-                ),
-            ),
-        }
-    }
-
-    /// AMD CDNA 16x16x16 BFloat16 tensor core.
-    pub fn amd_cdna_161616_bf16() -> Self {
-        let mut tc = Self::amd_cdna_161616_f16();
-        tc.dtype_in = DType::BFloat16;
-        tc
-    }
-
-    /// AMD CDNA 16x16x32 FP8E5M2 tensor core (MI300+).
-    pub fn amd_cdna_161632_fp8e5m2() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (16, 16, 32),
-            threads: 64,
-            elements_per_thread: (8, 8, 4),
-            dtype_in: DType::FP8E5M2,
-            dtype_out: DType::Float32,
-            opts: smallvec![Local(0), Local(0), Local(0), Local(0), Upcast(1), Upcast(1), Local(1), Local(1)],
-            swizzle: (
-                (
-                    smallvec![U(0), U(1), L(4), L(5), R(3), R(4)],
-                    smallvec![R(0), R(1)],
-                    smallvec![L(0), L(1), L(2), L(3), R(2)],
-                ),
-                (
-                    smallvec![L(0), L(1), L(2), L(3), R(3), R(4)],
-                    smallvec![R(0), R(1)],
-                    smallvec![L(4), L(5), U(0), U(1), R(2)],
-                ),
-            ),
-        }
-    }
-
-    /// AMD CDNA 16x16x32 FP8E4M3 tensor core.
-    pub fn amd_cdna_161632_fp8e4m3() -> Self {
-        let mut tc = Self::amd_cdna_161632_fp8e5m2();
-        tc.dtype_in = DType::FP8E4M3;
-        tc
-    }
-
-    /// AMD CDNA 16x16x32 FP16 tensor core.
-    pub fn amd_cdna_161632_f16() -> Self {
-        let mut tc = Self::amd_cdna_161632_fp8e5m2();
-        tc.dtype_in = DType::Float16;
-        tc
-    }
-
-    /// AMD CDNA 16x16x32 BFloat16 tensor core.
-    pub fn amd_cdna_161632_bf16() -> Self {
-        let mut tc = Self::amd_cdna_161632_fp8e5m2();
-        tc.dtype_in = DType::BFloat16;
-        tc
-    }
-
-    // ===== Apple Metal Tensor Cores =====
-
-    /// Apple Metal 8x8x8 Float32 tensor core.
-    pub fn metal_888_f32() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (8, 8, 8),
-            threads: 32,
-            elements_per_thread: (2, 2, 2),
-            dtype_in: DType::Float32,
-            dtype_out: DType::Float32,
-            opts: smallvec![Upcast(0), Local(0), Local(1), Local(1), Local(0), Local(1)],
-            swizzle: (
-                (smallvec![R(1), L(1), L(2), R(2), L(4)], smallvec![R(0)], smallvec![U(0), L(0), L(3)]),
-                (smallvec![L(0), R(0), R(1), L(3), R(2)], smallvec![U(0)], smallvec![L(1), L(2), L(4)]),
-            ),
-        }
-    }
-
-    /// Apple Metal 8x8x8 FP16 → FP32 tensor core.
-    pub fn metal_888_f16_f32() -> Self {
-        let mut tc = Self::metal_888_f32();
-        tc.dtype_in = DType::Float16;
-        tc
-    }
-
-    /// Apple Metal 8x8x8 FP16 tensor core.
-    pub fn metal_888_f16_f16() -> Self {
-        let mut tc = Self::metal_888_f32();
-        tc.dtype_in = DType::Float16;
-        tc.dtype_out = DType::Float16;
-        tc
-    }
-
-    /// Apple Metal 8x8x8 BFloat16 → FP32 tensor core.
-    pub fn metal_888_bf16_f32() -> Self {
-        let mut tc = Self::metal_888_f32();
-        tc.dtype_in = DType::BFloat16;
-        tc
-    }
-
-    /// Apple Metal 8x8x8 BFloat16 tensor core.
-    pub fn metal_888_bf16_bf16() -> Self {
-        let mut tc = Self::metal_888_f32();
-        tc.dtype_in = DType::BFloat16;
-        tc.dtype_out = DType::BFloat16;
-        tc
-    }
-
-    // ===== Apple AMX =====
-
-    /// Apple AMX 64x64x1 Float32 tensor core.
-    pub fn apple_amx_64x64x1_f32() -> Self {
-        use SwizzleAxis::Upcast as U;
-        use TcOpt::*;
-        Self {
-            dims: (64, 64, 1),
-            threads: 1,
-            elements_per_thread: (64, 64, 4096),
-            dtype_in: DType::Float32,
-            dtype_out: DType::Float32,
-            opts: smallvec![Upcast(0), Upcast(0), Upcast(0), Upcast(0), Upcast(1), Upcast(1), Upcast(1), Upcast(1),],
-            swizzle: (
-                (smallvec![], smallvec![U(0), U(1), U(2), U(3), U(4), U(5), U(6), U(7)], smallvec![]),
-                (smallvec![], smallvec![U(4), U(5), U(6), U(7), U(0), U(1), U(2), U(3)], smallvec![]),
-            ),
-        }
-    }
-
-    // ===== Intel Tensor Cores =====
-
-    /// Intel Xe 8x8x16 FP16 tensor core.
-    pub fn intel_xe_8816_f16() -> Self {
-        use SwizzleAxis::{Local as L, Reduce as R, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (8, 8, 16),
-            threads: 8,
-            elements_per_thread: (16, 16, 8),
-            dtype_in: DType::Float16,
-            dtype_out: DType::Float32,
-            opts: smallvec![Local(0), Local(0), Local(0), Upcast(1), Upcast(1), Upcast(1)],
-            swizzle: (
-                (smallvec![R(1), R(2), R(3)], smallvec![U(0), U(1), U(2)], smallvec![L(0), L(1), L(2), R(0)]),
-                (smallvec![L(0), L(1), L(2)], smallvec![R(1), R(2), R(3)], smallvec![U(0), U(1), U(2), R(0)]),
-            ),
-        }
-    }
-
-    // ===== Legacy Alias =====
-
-    /// NVIDIA WMMA 16×16×16 configuration for FP16 inputs.
-    ///
-    /// Standard tensor core configuration for NVIDIA GPUs with Tensor Cores.
-    /// - 16×16 output matrix
-    /// - Accumulates across 16 FP16 elements
-    /// - Uses 32 threads (CUDA warp)
-    /// - FP32 accumulation
-    ///
-    /// **Legacy:** Use `cuda_81616_f16_f32()` for new code.
-    pub fn wmma_16x16x16_f16() -> Self {
-        // This was the old name - map to equivalent CUDA config
-        // Note: The old swizzle was simpler, but for compatibility we keep this as-is
-        use SwizzleAxis::{Local as L, Upcast as U};
-        use TcOpt::*;
-        Self {
-            dims: (16, 16, 16),
-            threads: 32,
-            elements_per_thread: (1, 1, 8),
-            dtype_in: DType::Float16,
-            dtype_out: DType::Float32,
-            opts: smallvec![Upcast(0), Local(0), Local(0), Local(1), Local(1), Local(1), Upcast(1),],
-            swizzle: (
-                (smallvec![U(1)], smallvec![L(1), L(1), L(1)], smallvec![]),
-                (smallvec![U(0)], smallvec![L(0), L(0)], smallvec![]),
-            ),
-        }
-    }
-
     // ===== Helper Methods =====
 
     /// Get the axes for reduction unrolling.
@@ -826,22 +578,20 @@ impl TensorCore {
 
     /// Get all tensor cores for NVIDIA SM75 architecture (Turing).
     pub fn sm75_tensor_cores() -> Vec<TensorCore> {
-        vec![TensorCore::cuda_8168_f16_f32(), TensorCore::cuda_8168_f16_f16()]
+        vec![CUDA_8168.build(DType::Float16, DType::Float32), CUDA_8168.build(DType::Float16, DType::Float16)]
     }
 
     /// Get all tensor cores for NVIDIA SM80 architecture (Ampere).
-    ///
-    /// Includes optional TF32 support via `allow_tf32` parameter.
     pub fn sm80_tensor_cores(allow_tf32: bool) -> Vec<TensorCore> {
         let mut tcs = vec![
-            TensorCore::cuda_81616_f16_f32(),
-            TensorCore::cuda_81616_bf16_f32(),
-            TensorCore::cuda_81616_f16_f16(),
-            TensorCore::cuda_8168_f16_f32(),
-            TensorCore::cuda_8168_f16_f16(),
+            CUDA_81616.build(DType::Float16, DType::Float32),
+            CUDA_81616.build(DType::BFloat16, DType::Float32),
+            CUDA_81616.build(DType::Float16, DType::Float16),
+            CUDA_8168.build(DType::Float16, DType::Float32),
+            CUDA_8168.build(DType::Float16, DType::Float16),
         ];
         if allow_tf32 {
-            tcs.push(TensorCore::cuda_8168_tf32());
+            tcs.push(CUDA_8168_TF32.build(DType::Float32, DType::Float32));
         }
         tcs
     }
@@ -849,66 +599,71 @@ impl TensorCore {
     /// Get all tensor cores for NVIDIA SM89 architecture (Hopper).
     pub fn sm89_tensor_cores(allow_tf32: bool) -> Vec<TensorCore> {
         let mut tcs = Self::sm80_tensor_cores(allow_tf32);
-        tcs.extend([TensorCore::cuda_81632_fp8e4m3(), TensorCore::cuda_81632_fp8e5m2()]);
+        tcs.push(CUDA_81632.build(DType::FP8E4M3, DType::Float32));
+        tcs.push(CUDA_81632.build(DType::FP8E5M2, DType::Float32));
         tcs
     }
 
     /// Get all tensor cores for AMD RDNA3 architecture (RX 7000 series).
     pub fn rdna3_tensor_cores() -> Vec<TensorCore> {
-        vec![TensorCore::amd_rdna3_f16_f32(), TensorCore::amd_rdna3_f16_f16(), TensorCore::amd_rdna3_bf16_f32()]
+        vec![
+            AMD_RDNA3.build(DType::Float16, DType::Float32),
+            AMD_RDNA3.build(DType::Float16, DType::Float16),
+            AMD_RDNA3.build(DType::BFloat16, DType::Float32),
+        ]
     }
 
     /// Get all tensor cores for AMD RDNA4 architecture.
     pub fn rdna4_tensor_cores() -> Vec<TensorCore> {
         vec![
-            TensorCore::amd_rdna4_f16_f32(),
-            TensorCore::amd_rdna4_f16_f16(),
-            TensorCore::amd_rdna4_bf16_f32(),
-            TensorCore::amd_rdna4_bf16_bf16(),
+            AMD_RDNA4.build(DType::Float16, DType::Float32),
+            AMD_RDNA4.build(DType::Float16, DType::Float16),
+            AMD_RDNA4.build(DType::BFloat16, DType::Float32),
+            AMD_RDNA4.build(DType::BFloat16, DType::BFloat16),
         ]
     }
 
     /// Get all tensor cores for AMD CDNA3 architecture (MI300).
     pub fn cdna3_tensor_cores() -> Vec<TensorCore> {
         vec![
-            TensorCore::amd_cdna_161632_fp8e5m2(),
-            TensorCore::amd_cdna_161632_fp8e4m3(),
-            TensorCore::amd_cdna_161616_f16(),
-            TensorCore::amd_cdna_161616_bf16(),
+            AMD_CDNA_161632.build(DType::FP8E5M2, DType::Float32),
+            AMD_CDNA_161632.build(DType::FP8E4M3, DType::Float32),
+            AMD_CDNA_161616.build(DType::Float16, DType::Float32),
+            AMD_CDNA_161616.build(DType::BFloat16, DType::Float32),
         ]
     }
 
     /// Get all tensor cores for AMD CDNA4 architecture.
     pub fn cdna4_tensor_cores() -> Vec<TensorCore> {
         vec![
-            TensorCore::amd_cdna_161632_fp8e5m2(),
-            TensorCore::amd_cdna_161632_fp8e4m3(),
-            TensorCore::amd_cdna_161632_f16(),
-            TensorCore::amd_cdna_161632_bf16(),
-            TensorCore::amd_cdna_161616_f16(),
-            TensorCore::amd_cdna_161616_bf16(),
+            AMD_CDNA_161632.build(DType::FP8E5M2, DType::Float32),
+            AMD_CDNA_161632.build(DType::FP8E4M3, DType::Float32),
+            AMD_CDNA_161632.build(DType::Float16, DType::Float32),
+            AMD_CDNA_161632.build(DType::BFloat16, DType::Float32),
+            AMD_CDNA_161616.build(DType::Float16, DType::Float32),
+            AMD_CDNA_161616.build(DType::BFloat16, DType::Float32),
         ]
     }
 
     /// Get all tensor cores for Apple Metal (M1/M2/M3).
     pub fn metal_tensor_cores() -> Vec<TensorCore> {
         vec![
-            TensorCore::metal_888_f32(),
-            TensorCore::metal_888_f16_f32(),
-            TensorCore::metal_888_f16_f16(),
-            TensorCore::metal_888_bf16_f32(),
-            TensorCore::metal_888_bf16_bf16(),
+            METAL_888.build(DType::Float32, DType::Float32),
+            METAL_888.build(DType::Float16, DType::Float32),
+            METAL_888.build(DType::Float16, DType::Float16),
+            METAL_888.build(DType::BFloat16, DType::Float32),
+            METAL_888.build(DType::BFloat16, DType::BFloat16),
         ]
     }
 
     /// Get all tensor cores for Apple AMX (M1/M2/M3 matrix accelerators).
     pub fn amx_tensor_cores() -> Vec<TensorCore> {
-        vec![TensorCore::apple_amx_64x64x1_f32()]
+        vec![APPLE_AMX.build(DType::Float32, DType::Float32)]
     }
 
     /// Get all tensor cores for Intel Xe architecture.
     pub fn intel_tensor_cores() -> Vec<TensorCore> {
-        vec![TensorCore::intel_xe_8816_f16()]
+        vec![INTEL_XE_8816.build(DType::Float16, DType::Float32)]
     }
 }
 
@@ -937,9 +692,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tensor_core_wmma() {
-        let tc = TensorCore::wmma_16x16x16_f16();
-        assert_eq!(tc.dims, (16, 16, 16));
+    fn test_tensor_core_cuda() {
+        let tc = CUDA_81616.build(DType::Float16, DType::Float32);
+        assert_eq!(tc.dims, (8, 16, 16));
         assert_eq!(tc.threads, 32);
         assert_eq!(tc.dtype_in, DType::Float16);
         assert_eq!(tc.dtype_out, DType::Float32);
