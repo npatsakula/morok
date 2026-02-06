@@ -10,21 +10,21 @@ morok-dtype = { path = "../dtype" }
 morok-device = { path = "../device" }
 morok-ir = { path = "../ir" }
 morok-codegen = { path = "../codegen" }
-inkwell = { version = "0.7.1", features = ["llvm21-1"] }
+inkwell = { version = "0.8.0", features = ["llvm21-1"] }
 snafu = "0.8.9"
 parking_lot = "0.12"
 once_cell = "1.21"
-cranelift-jit = "0.127"
-cranelift-module = "0.127"
-cranelift-codegen = "0.127"
-cranelift-frontend = "0.127"
-cranelift-native = "0.127"
-cranelift-reader = "0.127"
+cranelift-jit = "0.128"
+cranelift-module = "0.128"
+cranelift-codegen = "0.128"
+cranelift-frontend = "0.128"
+cranelift-native = "0.128"
+cranelift-reader = "0.128"
 libc = "0.2"
 papaya = "0.2.3"
 rayon = "1.11"
 tracing = "0.1"
-libloading = "0.8"
+libloading = "0.9"
 tempfile = "3"
 
 [dev-dependencies]

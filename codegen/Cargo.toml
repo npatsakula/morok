@@ -11,9 +11,9 @@ morok-device = { path = "../device" }
 morok-schedule = { path = "../schedule" }
 snafu = "0.8.9"
 itertools = "0.14.0"
-cranelift-codegen = "0.127"
-cranelift-frontend = "0.127"
-cranelift-native = "0.127"
+cranelift-codegen = "0.128"
+cranelift-frontend = "0.128"
+cranelift-native = "0.128"
 tracing = "0.1"
 
 [features]
