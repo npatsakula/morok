@@ -14,6 +14,7 @@
 //! execution performance, used by beam search auto-tuning.
 
 pub mod benchmark;
+pub mod clang;
 pub mod cranelift;
 pub mod device_registry;
 pub mod devices;
