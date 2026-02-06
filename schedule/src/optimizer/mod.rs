@@ -212,32 +212,23 @@ pub fn apply_post_optimization_with_renderer(
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
     let with_loads = graph_rewrite(&pm_add_loads(), with_gpudims, &mut ());
 
-    // ALU Devectorization + VECTORIZE Normalization
+    // ALU Devectorization + GEP Simplification
     //
-    // Two modes based on devectorize_alu flag:
-    //
-    // MODE 1 (devectorize_alu=true): Follow Tinygrad's DEVECTORIZE=1 pipeline
-    // 1. no_vectorized_alu: Convert ALL vector ALU to VECTORIZE(scalar)
-    // 2. gep_pushing: Simplify GEPs created by no_vectorized_alu
-    // 3. pm_vectorize_normalize: Handle remaining multi-index GEPs
-    // 4. gep_pushing: Cleanup
-    //
-    // MODE 2 (devectorize_alu=false, DEFAULT): Preserve vector operations
-    // Skip no_vectorized_alu, only normalize VECTORIZE/GEP patterns.
-    // Better for backends with sophisticated optimizers (LLVM SLP vectorizer).
+    // Tinygrad runs no_vectorized_alu + gep_pushing in a SINGLE graph_rewrite call
+    // (codegen/__init__.py:78-81: pm_devectorize = sym+devectorize+load_store_folding+...).
+    // This is critical: gep_pushing resolves GEPs incrementally as no_vectorized_alu
+    // creates them, preventing graph explosion. Running them separately causes
+    // no_vectorized_alu to materialize ALL GEPs first, then gep_pushing processes
+    // the massive graph in bulk, hitting the 100k iteration limit.
 
     let processed = if devectorize_alu {
-        // Step 1: Devectorize ALL vector ALU ops to VECTORIZE(scalar)
-        let no_vec_alu = crate::devectorize::no_vectorized_alu();
-        let devec = graph_rewrite(&no_vec_alu, with_loads, &mut ());
-
-        // Step 2: Simplify GEPs created by no_vectorized_alu
-        graph_rewrite(&gep_pushing_patterns(), devec, &mut ())
+        let combined = crate::devectorize::no_vectorized_alu() + gep_pushing_patterns();
+        graph_rewrite(&combined, with_loads, &mut ())
     } else {
         with_loads
     };
 
-    // Step 3: Cleanup GEPs
+    // Cleanup remaining GEPs (always runs, handles non-devectorize paths too)
     let cleaned = graph_rewrite(&gep_pushing_patterns(), processed, &mut ());
     tracing::debug!(ast.optimized = cleaned.tree(), "after pm_pushing_patterns");
 

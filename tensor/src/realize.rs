@@ -779,43 +779,60 @@ fn beam_search_optimize(
     let dev_renderer = device.renderer.clone();
     let dev_compiler = device.compiler.clone();
     let dev_runtime = device.runtime.clone();
+    let max_uops = config.max_uops;
 
-    // Compile-and-time function: compilation is NOT timed, only execution
+    // Compile-and-time function: compilation is NOT timed, only execution.
+    // Wrapped in catch_unwind because beam search explores speculative candidates
+    // that may trigger rewrite engine limits or other panics. Matches Tinygrad's
+    // try/except in _try_compile (codegen/opt/search.py:67-82).
     let compile_and_time = |s: &Scheduler| -> Option<Duration> {
-        let raw_ast = s.get_optimized_ast(None);
+        use std::panic::{AssertUnwindSafe, catch_unwind};
 
-        // Apply post-optimization passes for accurate timing
-        let optimized = apply_post_optimization(raw_ast, devectorize_alu);
+        catch_unwind(AssertUnwindSafe(|| {
+            let raw_ast = s.get_optimized_ast(None);
 
-        // Apply decomposition
-        let decomposed = match dev_renderer.decompositor() {
-            Some(m) => morok_ir::decompositions::decompose_with(&optimized, &m),
-            None => optimized,
-        };
+            // Apply post-optimization passes for accurate timing
+            let optimized = apply_post_optimization(raw_ast, devectorize_alu);
 
-        // Render and compile (NOT timed)
-        let spec = dev_renderer.render(&decomposed).ok()?;
-        let compiled = dev_compiler.compile(&spec).ok()?;
-        let program = (dev_runtime)(&compiled).ok()?;
+            // Post-optimization UOp count filter (matches Tinygrad's BEAM_UOPS_MAX).
+            // validate_limits checks pre-optimization AST size, but devectorization
+            // can massively expand the graph (e.g., 256-wide UPCAST -> 4096 GEP indices).
+            if optimized.toposort().len() > max_uops {
+                return None;
+            }
 
-        // Extract buffer pointers inside the closure (avoids Sync issue)
-        let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
+            // Apply decomposition
+            let decomposed = match dev_renderer.decompositor() {
+                Some(m) => morok_ir::decompositions::decompose_with(&optimized, &m),
+                None => optimized,
+            };
 
-        // Time ONLY execution (pass global/local size for threaded kernels)
-        // Note: Empty vals slice since benchmark kernels don't have symbolic variables
-        let result = unsafe {
-            morok_runtime::benchmark_kernel(
-                program.as_ref(),
-                &buffer_ptrs,
-                &[],
-                spec.global_size,
-                spec.local_size,
-                &bench_config,
-            )
-            .ok()?
-        };
+            // Render and compile (NOT timed)
+            let spec = dev_renderer.render(&decomposed).ok()?;
+            let compiled = dev_compiler.compile(&spec).ok()?;
+            let program = (dev_runtime)(&compiled).ok()?;
 
-        Some(result.min)
+            // Extract buffer pointers inside the closure (avoids Sync issue)
+            let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
+
+            // Time ONLY execution (pass global/local size for threaded kernels)
+            // Note: Empty vals slice since benchmark kernels don't have symbolic variables
+            let result = unsafe {
+                morok_runtime::benchmark_kernel(
+                    program.as_ref(),
+                    &buffer_ptrs,
+                    &[],
+                    spec.global_size,
+                    spec.local_size,
+                    &bench_config,
+                )
+                .ok()?
+            };
+
+            Some(result.min)
+        }))
+        .ok()
+        .flatten()
     };
 
     // Run beam search with caching

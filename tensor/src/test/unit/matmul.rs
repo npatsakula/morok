@@ -1,6 +1,6 @@
 use crate::*;
 use morok_dtype::DType;
-use morok_schedule::{OptStrategy, OptimizerConfig};
+use morok_schedule::{BeamConfig, OptStrategy, OptimizerConfig};
 
 // ========== Basic 2D x 2D Tests ==========
 
@@ -222,8 +222,13 @@ fn test_beam_search_matmul() {
         .unwrap();
     let c = a.matmul(&b).unwrap();
 
-    // Use width=2 for reasonable test time
-    let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: 2 }).build();
+    // Use width=2 for reasonable test time. Disable disk cache to avoid stale results
+    // from previous runs affecting correctness (beam cache is keyed by AST hash, but
+    // the post-optimization pipeline may have changed).
+    let beam_config = OptimizerConfig::builder()
+        .strategy(OptStrategy::Beam { width: 2 })
+        .beam(BeamConfig::builder().disable_cache(true).build())
+        .build();
 
     let plan = c.prepare_with(&beam_config).expect("beam search prepare should succeed");
 
