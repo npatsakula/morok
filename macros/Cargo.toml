@@ -1,0 +1,14 @@
+[package]
+name = "morok-macros"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits", "parsing", "visit"] }
+quote = "1"
+proc-macro2 = "1"
+convert_case = "0.10"

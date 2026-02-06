@@ -3,14 +3,14 @@
 //! The [`Op`] enum defines all possible operations in the IR, from basic arithmetic
 //! to complex control flow and memory operations.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
 use crate::types::*;
 use crate::uop::UOp;
-use morok_device::DeviceSpec;
 use morok_dtype::DType;
+use morok_dtype::DeviceSpec;
 
 /// Operation type with typed operands.
 ///
@@ -20,166 +20,171 @@ use morok_dtype::DType;
 /// Design choices:
 /// - Fixed-arity ops grouped by arity: Unary, Binary, Ternary
 /// - Special ops with extra data remain separate: Cast (dtype), MSelect (device_index)
-/// - Variable-arity ops use SmallVec: Index { indices: SmallVec<[Rc<UOp>; 4]> }
+/// - Variable-arity ops use SmallVec: Index { indices: SmallVec<[Arc<UOp>; 4]> }
 /// - SmallVec avoids heap allocation for common cases (≤4 children)
-/// - Gated operations use separate variants (LoadGated vs Load) for type safety
+/// - Gate is on INDEX (not LOAD/STORE) following Tinygrad's model
 ///
-/// Note: PartialEq, Eq, and Hash are NOT derived because Op contains Rc<UOp>.
-/// Hash consing uses UOpKey which compares by pointer equality instead.
-#[derive(Debug, Clone)]
+/// Hash is derived and uses UOp's Hash impl for Arc<UOp> children.
+/// UOp hashes by content (dtype + op), enabling content-based hashing for caching.
+#[derive(Debug, Clone, Hash)]
+#[derive(strum::AsRefStr)]
+#[derive(morok_macros::PatternEnum)]
+#[pattern(grouped = [Unary, Binary, Ternary])]
 pub enum Op {
     // Nullary operations (7 variants)
     Const(ConstValueHash),
     Unique(usize),
     Device(DeviceSpec),
     Noop,
+    #[pattern(skip)]
     Invalid,
     DefineGlobal(usize),
     DefineLocal(usize),
 
     // Graph organization operations (2 variants)
     Sink {
-        sources: SmallVec<[Rc<UOp>; 4]>,
+        sources: SmallVec<[Arc<UOp>; 4]>,
     },
     Group {
-        sources: SmallVec<[Rc<UOp>; 4]>,
+        sources: SmallVec<[Arc<UOp>; 4]>,
     },
 
     // Grouped operations (3 variants)
-    Unary(UnaryOp, Rc<UOp>),
-    Binary(BinaryOp, Rc<UOp>, Rc<UOp>),
-    Ternary(TernaryOp, Rc<UOp>, Rc<UOp>, Rc<UOp>),
+    Unary(UnaryOp, Arc<UOp>),
+    Binary(BinaryOp, Arc<UOp>, Arc<UOp>),
+    Ternary(TernaryOp, Arc<UOp>, Arc<UOp>, Arc<UOp>),
 
     // Type operations (2 variants)
     Cast {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
         dtype: DType,
     },
     BitCast {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
         dtype: DType,
     },
 
     // Special operations (2 variants)
     MSelect {
-        buffer: Rc<UOp>,
+        buffer: Arc<UOp>,
         device_index: usize,
     },
     Special {
-        end: Rc<UOp>,
+        end: Arc<UOp>,
         name: String,
     },
 
     // Buffer operations (high-level, 7 variants)
     Buffer {
-        unique: Rc<UOp>,
-        device: Rc<UOp>,
+        unique: Arc<UOp>,
+        device: Arc<UOp>,
         size: usize,
     },
     BufferView {
-        buffer: Rc<UOp>,
+        buffer: Arc<UOp>,
         size: usize,
         offset: usize,
     },
     Bufferize {
-        compute: Rc<UOp>,
-        ranges: SmallVec<[Rc<UOp>; 4]>,
+        compute: Arc<UOp>,
+        ranges: SmallVec<[Arc<UOp>; 4]>,
         opts: BufferizeOpts,
     },
     Index {
-        buffer: Rc<UOp>,
-        indices: SmallVec<[Rc<UOp>; 4]>,
-        gate: Option<Rc<UOp>>,
+        buffer: Arc<UOp>,
+        indices: SmallVec<[Arc<UOp>; 4]>,
+        gate: Option<Arc<UOp>>,
     },
     PointerIndex {
-        ptr: Rc<UOp>,
-        offset: Rc<UOp>,
+        ptr: Arc<UOp>,
+        offset: Arc<UOp>,
     },
     Copy {
-        src: Rc<UOp>,
-        device: Rc<UOp>,
+        src: Arc<UOp>,
+        device: Arc<UOp>,
     },
     MStack {
-        buffers: SmallVec<[Rc<UOp>; 4]>,
+        buffers: SmallVec<[Arc<UOp>; 4]>,
     },
 
     // Movement/Reshape operations (7 variants)
     Reshape {
-        src: Rc<UOp>,
-        new_shape: Rc<UOp>,
+        src: Arc<UOp>,
+        new_shape: Arc<UOp>,
     },
     Permute {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
         axes: Vec<usize>,
     },
     Expand {
-        src: Rc<UOp>,
-        new_shape: Rc<UOp>,
+        src: Arc<UOp>,
+        new_shape: Arc<UOp>,
     },
     Pad {
-        src: Rc<UOp>,
-        begin_pads: Rc<UOp>,
-        end_pads: Rc<UOp>,
+        src: Arc<UOp>,
+        begin_pads: Arc<UOp>,
+        end_pads: Arc<UOp>,
     },
     Shrink {
-        src: Rc<UOp>,
-        begins: Rc<UOp>,
-        ends: Rc<UOp>,
+        src: Arc<UOp>,
+        begins: Arc<UOp>,
+        ends: Arc<UOp>,
     },
     Flip {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
         axes: Vec<bool>,
     },
     Multi {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
         axis: usize,
     },
 
     // Reduction operations (3 variants)
     ReduceAxis {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
         reduce_op: ReduceOp,
         axes: Vec<usize>,
     },
     Reduce {
-        src: Rc<UOp>,
-        ranges: SmallVec<[Rc<UOp>; 4]>,
+        src: Arc<UOp>,
+        ranges: SmallVec<[Arc<UOp>; 4]>,
         reduce_op: ReduceOp,
     },
     AllReduce {
-        src: Rc<UOp>,
-        device: Rc<UOp>,
+        src: Arc<UOp>,
+        device: Arc<UOp>,
         reduce_op: ReduceOp,
     },
 
     // Control flow operations (5 variants)
     If {
-        condition: Rc<UOp>,
-        body: SmallVec<[Rc<UOp>; 4]>,
+        condition: Arc<UOp>,
+        body: SmallVec<[Arc<UOp>; 4]>,
     },
     EndIf {
-        if_op: Rc<UOp>,
+        if_op: Arc<UOp>,
     },
     Range {
-        end: Rc<UOp>,
+        end: Arc<UOp>,
         axis_id: AxisId,
         axis_type: AxisType,
+        deps: SmallVec<[Arc<UOp>; 2]>,
     },
     End {
-        computation: Rc<UOp>,
-        ranges: SmallVec<[Rc<UOp>; 4]>,
+        computation: Arc<UOp>,
+        ranges: SmallVec<[Arc<UOp>; 4]>,
     },
     Barrier {
-        src: Rc<UOp>,
-        deps: SmallVec<[Rc<UOp>; 4]>,
+        src: Arc<UOp>,
+        deps: SmallVec<[Arc<UOp>; 4]>,
     },
 
     // Vector operations (5 variants)
     Vectorize {
-        elements: SmallVec<[Rc<UOp>; 4]>,
+        elements: SmallVec<[Arc<UOp>; 4]>,
     },
     Gep {
-        vector: Rc<UOp>,
+        vector: Arc<UOp>,
         indices: Vec<usize>,
     },
     VConst {
@@ -189,12 +194,12 @@ pub enum Op {
     /// Like VECTORIZE but sources can be vectors themselves.
     /// Output vcount = sum of all input vcounts.
     Cat {
-        sources: SmallVec<[Rc<UOp>; 4]>,
+        sources: SmallVec<[Arc<UOp>; 4]>,
     },
     /// Concatenate pointers into vectorized pointer (expander op).
     /// Used for grouping memory accesses in devectorizer.
     PtrCat {
-        sources: SmallVec<[Rc<UOp>; 4]>,
+        sources: SmallVec<[Arc<UOp>; 4]>,
     },
 
     // Symbolic/Define operations (3 variants)
@@ -204,8 +209,8 @@ pub enum Op {
         max_val: i64,
     },
     Bind {
-        var: Rc<UOp>,
-        value: Rc<UOp>,
+        var: Arc<UOp>,
+        value: Arc<UOp>,
     },
     DefineReg {
         size: usize,
@@ -213,72 +218,78 @@ pub enum Op {
 
     // Advanced operations (12 variants)
     Wmma {
-        a: Rc<UOp>,
-        b: Rc<UOp>,
-        c: Rc<UOp>,
+        a: Arc<UOp>,
+        b: Arc<UOp>,
+        c: Arc<UOp>,
         metadata: WmmaMetadata,
     },
     Contract {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
         upcast_ranges: Vec<(usize, usize)>,
     },
     Unroll {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
         unroll_axes: Vec<(usize, usize)>,
     },
     Kernel {
-        sources: SmallVec<[Rc<UOp>; 4]>,
-        ast: Rc<UOp>,
+        sources: SmallVec<[Arc<UOp>; 4]>,
+        ast: Arc<UOp>,
     },
     Assign {
-        target: Rc<UOp>,
-        value: Rc<UOp>,
+        target: Arc<UOp>,
+        value: Arc<UOp>,
+        /// Movement ops chain for shape tracking (third source in Tinygrad).
+        /// This is a UOp chain where each node is a movement op, and walking
+        /// via src[0] reaches the base INDEX operation. Used during
+        /// bufferize_to_store to apply the same transformations to the result buffer.
+        movement_ops: Option<Arc<UOp>>,
     },
     Detach {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
     },
     Contiguous {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
+        /// Optimization hints (Tinygrad: CONTIGUOUS.arg)
+        opts: SmallVec<[crate::types::ContiguousHint; 4]>,
     },
     ContiguousBackward {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
     },
     After {
-        passthrough: Rc<UOp>,
-        deps: SmallVec<[Rc<UOp>; 4]>,
+        passthrough: Arc<UOp>,
+        deps: SmallVec<[Arc<UOp>; 4]>,
     },
     Precast {
-        src: Rc<UOp>,
+        src: Arc<UOp>,
     },
     Custom {
-        deps: SmallVec<[Rc<UOp>; 4]>,
+        deps: SmallVec<[Arc<UOp>; 4]>,
         code: String,
     },
     CustomI {
-        deps: SmallVec<[Rc<UOp>; 4]>,
+        deps: SmallVec<[Arc<UOp>; 4]>,
         code: String,
     },
 
-    // Memory operations (low-level, after kernel splitting, 4 variants)
+    // Memory operations (low-level, after kernel splitting, 2 variants)
+    // Gate is on INDEX, not LOAD/STORE (following Tinygrad's model)
+    /// Load from buffer at index.
+    ///
+    /// - `buffer`: The buffer to load from
+    /// - `index`: The INDEX operation specifying where to load (may be gated)
+    /// - `alt`: Optional alternative value for gated loads (used when gate is false)
+    ///
+    /// When `alt` is Some, the load behaves as: `if gate { load(index) } else { alt }`.
+    /// This is used for masked loads in image processing and padding scenarios.
     Load {
-        buffer: Rc<UOp>,
-        index: Rc<UOp>,
-    },
-    LoadGated {
-        buffer: Rc<UOp>,
-        index: Rc<UOp>,
-        gate: Rc<UOp>,
+        buffer: Arc<UOp>,
+        index: Arc<UOp>,
+        alt: Option<Arc<UOp>>,
     },
     Store {
-        buffer: Rc<UOp>,
-        index: Rc<UOp>,
-        value: Rc<UOp>,
-    },
-    StoreGated {
-        buffer: Rc<UOp>,
-        index: Rc<UOp>,
-        value: Rc<UOp>,
-        gate: Rc<UOp>,
+        index: Arc<UOp>,
+        value: Arc<UOp>,
+        ranges: SmallVec<[Arc<UOp>; 4]>,
     },
 }
 
@@ -287,7 +298,7 @@ impl Op {
     ///
     /// This is the convenient API for traversing the graph.
     /// Allocates a Vec but is simple to use.
-    pub fn children(&self) -> SmallVec<[&Rc<UOp>; 4]> {
+    pub fn children(&self) -> SmallVec<[&Arc<UOp>; 4]> {
         match self {
             // Nullary operations
             Self::Const(_)
@@ -359,7 +370,11 @@ impl Op {
                 children
             }
             Self::EndIf { if_op } => SmallVec::from_slice(&[if_op]),
-            Self::Range { end, .. } => SmallVec::from_slice(&[end]),
+            Self::Range { end, deps, .. } => {
+                let mut children = SmallVec::from_slice(&[end]);
+                children.extend(deps.iter());
+                children
+            }
             Self::End { computation, ranges } => {
                 let mut children = SmallVec::from_slice(&[computation]);
                 children.extend(ranges.iter());
@@ -384,15 +399,21 @@ impl Op {
             Self::Contract { src, .. }
             | Self::Unroll { src, .. }
             | Self::Detach { src }
-            | Self::Contiguous { src }
+            | Self::Contiguous { src, .. }
             | Self::ContiguousBackward { src }
             | Self::Precast { src } => SmallVec::from_slice(&[src]),
             Self::Kernel { sources, ast } => {
-                let mut children: SmallVec<[&Rc<UOp>; 4]> = sources.iter().collect();
+                let mut children: SmallVec<[&Arc<UOp>; 4]> = sources.iter().collect();
                 children.push(ast);
                 children
             }
-            Self::Assign { target, value } => SmallVec::from_slice(&[target, value]),
+            Self::Assign { target, value, movement_ops } => {
+                let mut children = SmallVec::from_slice(&[target, value]);
+                if let Some(mops) = movement_ops {
+                    children.push(mops);
+                }
+                children
+            }
             Self::After { passthrough, deps } => {
                 let mut children = SmallVec::from_slice(&[passthrough]);
                 children.extend(deps.iter());
@@ -401,10 +422,16 @@ impl Op {
             Self::Custom { deps, .. } | Self::CustomI { deps, .. } => deps.iter().collect(),
 
             // Memory operations
-            Self::Load { buffer, index } => SmallVec::from_slice(&[buffer, index]),
-            Self::LoadGated { buffer, index, gate } => SmallVec::from_slice(&[buffer, index, gate]),
-            Self::Store { buffer, index, value } => SmallVec::from_slice(&[buffer, index, value]),
-            Self::StoreGated { buffer, index, value, gate } => SmallVec::from_slice(&[buffer, index, value, gate]),
+            Self::Load { buffer, index, alt } => {
+                let mut children = SmallVec::from_slice(&[buffer, index]);
+                children.extend(alt);
+                children
+            }
+            Self::Store { index, value, ranges } => {
+                let mut children = SmallVec::from_slice(&[index, value]);
+                children.extend(ranges.iter());
+                children
+            }
         }
     }
 
@@ -412,14 +439,14 @@ impl Op {
     ///
     /// Similar to `children()` but returns owned Rcs instead of references.
     /// Useful when you need to reconstruct nodes or store sources.
-    pub fn sources(&self) -> SmallVec<[Rc<UOp>; 4]> {
+    pub fn sources(&self) -> SmallVec<[Arc<UOp>; 4]> {
         self.children().iter().map(|rc| (*rc).clone()).collect()
     }
 
     /// Apply a function to each child UOp.
     pub fn map_child<F>(&self, mut f: F)
     where
-        F: FnMut(&Rc<UOp>),
+        F: FnMut(&Arc<UOp>),
     {
         for child in self.children() {
             f(child);
@@ -457,7 +484,7 @@ impl Op {
     /// Operations that end ranges:
     /// - BUFFERIZE: ranges start at index 1 (compute is 0, ranges are 1+)
     /// - REDUCE: ranges start at index 1 (src is 0, ranges are 1+)
-    /// - STORE: ranges start at index 2 (buffer=0, index=1, value=2)
+    /// - STORE: ranges start at index 2 (index=0, value=1, ranges=2+)
     /// - WMMA: ranges start at index 3 (a=0, b=1, c=2)
     /// - END: ranges start at index 1 (computation=0, ranges=1+)
     ///
@@ -479,14 +506,54 @@ impl Op {
     /// assert_eq!(binary_op.range_ending_src_index(), None);
     /// ```
     pub fn range_ending_src_index(&self) -> Option<usize> {
+        // Source layout for range-ending ops:
+        // - BUFFERIZE: compute=0, ranges=1+
+        // - REDUCE: src=0, ranges=1+
+        // - STORE: index=0, value=1, ranges=2+
+        // - WMMA: a=0, b=1, c=2, (ranges start at 3)
+        // - END: computation=0, ranges=1+
         match self {
             Self::Bufferize { .. } => Some(1),
             Self::Reduce { .. } => Some(1),
-            Self::Store { .. } | Self::StoreGated { .. } => Some(2),
+            Self::Store { .. } => Some(2),
             Self::Wmma { .. } => Some(3),
             Self::End { .. } => Some(1),
             _ => None,
         }
+    }
+
+    /// Check if this operation should be expanded when it has UNROLL inputs.
+    ///
+    /// Based on Tinygrad's expander.py:97-98 pattern which expands:
+    /// - ALU ops (Unary, Binary, Ternary)
+    /// - Type ops (Cast, BitCast)
+    /// - Vector ops (Gep, Vectorize)
+    /// - Tensor core ops (Wmma)
+    /// - Memory ops (Load, Store, Index)
+    /// - Buffer ops (Bufferize)
+    /// - Control flow (Reduce, End, After)
+    ///
+    /// These operations propagate vectorization through the computation graph
+    /// when any of their sources is an UNROLL operation.
+    pub fn is_expandable(&self) -> bool {
+        matches!(
+            self,
+            // ALU operations
+            Self::Unary(..) | Self::Binary(..) | Self::Ternary(..) |
+            // Type operations
+            Self::Cast { .. } | Self::BitCast { .. } |
+            // Vector operations
+            Self::Gep { .. } | Self::Vectorize { .. } |
+            // Tensor core
+            Self::Wmma { .. } |
+            // Memory operations
+            Self::Load { .. } | Self::Store { .. } |
+            Self::Index { .. } | Self::PointerIndex { .. } |
+            // Buffer operations
+            Self::Bufferize { .. } |
+            // Control flow (range-ending ops)
+            Self::Reduce { .. } | Self::End { .. } | Self::After { .. }
+        )
     }
 
     /// Get the "ended ranges" for this operation.
@@ -509,13 +576,13 @@ impl Op {
     /// // END operation ends its range arguments
     /// let range = UOp::range(/* ... */);
     /// let computation = UOp::const_(/* ... */);
-    /// let end_op = UOp::end(computation, vec![range.clone()]);
+    /// let end_op = computation.end(vec![range.clone()]);
     ///
     /// // ended_ranges() returns the ranges that are closed
     /// let ended = end_op.op().ended_ranges();
     /// assert_eq!(ended.len(), 1);
     /// ```
-    pub fn ended_ranges(&self) -> SmallVec<[&Rc<UOp>; 4]> {
+    pub fn ended_ranges(&self) -> SmallVec<[&Arc<UOp>; 4]> {
         if let Some(start_idx) = self.range_ending_src_index() {
             let children = self.children();
             children.into_iter().skip(start_idx).collect()

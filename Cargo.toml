@@ -1,15 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
-  "codegen",
-  "device",
-  "dtype",
-  "ir",
-  "runtime",
-  "schedule",
-  "schedule-macros",
-  "tensor",
-]
+members = ["codegen", "device", "dtype", "ir", "macros", "runtime", "schedule", "tensor"]
 exclude = ["submodules"]
 
 [workspace.metadata.crane]

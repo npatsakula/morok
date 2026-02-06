@@ -11,7 +11,7 @@
 //! - [`hardware`] - Hardware-specific (WMMA, vectorize, kernel)
 //! - [`graph`] - Graph organization (sink, group, assign)
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use smallvec::smallvec;
 
@@ -46,7 +46,7 @@ impl UOp {
     /// # Errors
     /// - Returns `VoidTypeInOp` if either operand has Void dtype
     /// - Returns `TypePromotionFailed` if no common type exists
-    pub(crate) fn promote_and_cast(lhs: Rc<Self>, rhs: Rc<Self>) -> Result<(Rc<Self>, Rc<Self>, DType)> {
+    pub(crate) fn promote_and_cast(lhs: Arc<Self>, rhs: Arc<Self>) -> Result<(Arc<Self>, Arc<Self>, DType)> {
         let lhs_dtype = lhs.dtype();
         let rhs_dtype = rhs.dtype();
 
@@ -60,8 +60,8 @@ impl UOp {
             .ok_or(Error::TypePromotionFailed { lhs: lhs_dtype.clone(), rhs: rhs_dtype.clone() })?;
 
         // Cast if needed
-        let lhs = if lhs_dtype != target_dtype { Self::cast(lhs, target_dtype.clone()) } else { lhs };
-        let rhs = if rhs_dtype != target_dtype { Self::cast(rhs, target_dtype.clone()) } else { rhs };
+        let lhs = if lhs_dtype != target_dtype { lhs.cast(target_dtype.clone()) } else { lhs };
+        let rhs = if rhs_dtype != target_dtype { rhs.cast(target_dtype.clone()) } else { rhs };
 
         Ok((lhs, rhs, target_dtype))
     }
@@ -73,7 +73,8 @@ impl UOp {
     /// # Errors
     /// Returns `InvalidDTypeForOp` if dtype is not int or bool
     pub(crate) fn check_bitwise_dtype(dtype: DType, operation: BinaryOp) -> Result<()> {
-        let is_valid = dtype.is_bool() || dtype.is_signed() || dtype.is_unsigned();
+        // Allow bool and all integer types (signed, unsigned, AND Index for loop counters)
+        let is_valid = dtype.is_bool() || dtype.is_int();
         if !is_valid { Err(Error::InvalidDTypeForBinaryOp { operation, dtypes: smallvec![dtype] }) } else { Ok(()) }
     }
 
@@ -84,7 +85,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `DivisionByZero` if divisor is a constant zero
-    pub(crate) fn check_division_by_zero(divisor: &Rc<Self>) -> Result<()> {
+    pub(crate) fn check_division_by_zero(divisor: &Arc<Self>) -> Result<()> {
         use crate::ConstValue;
         use crate::error::DivisionByZeroSnafu;
         use snafu::ensure;
@@ -115,7 +116,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `BinaryShapeMismatch` if both operands have shapes and they differ
-    pub(crate) fn validate_binary_shapes(lhs: &Rc<Self>, rhs: &Rc<Self>, op: crate::BinaryOp) -> Result<()> {
+    pub(crate) fn validate_binary_shapes(lhs: &Arc<Self>, rhs: &Arc<Self>, op: crate::BinaryOp) -> Result<()> {
         use crate::error::BinaryShapeMismatchSnafu;
         use crate::shape::shapes_equal;
 
@@ -144,7 +145,7 @@ impl UOp {
     ///
     /// # Errors
     /// Returns `TernaryBranchShapeMismatch` if both branches have shapes and they differ
-    pub(crate) fn validate_ternary_shapes(true_val: &Rc<Self>, false_val: &Rc<Self>) -> Result<()> {
+    pub(crate) fn validate_ternary_shapes(true_val: &Arc<Self>, false_val: &Arc<Self>) -> Result<()> {
         use crate::error::TernaryBranchShapeMismatchSnafu;
         use crate::shape::shapes_equal;
 

@@ -21,7 +21,7 @@ use super::error::*;
 /// - Layout: `SWAP`, `PADTO`
 /// - Hardware acceleration: `TC` (Tensor Cores)
 /// - Configuration: `NOLOCALS`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OptOps {
     /// Apply tensor core optimization (hardware matrix multiplication).
     TC,
@@ -66,7 +66,7 @@ impl fmt::Display for OptOps {
 ///
 /// Some operations take a single integer argument (amount, axis, size),
 /// while TC takes a tuple of configuration parameters.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum OptArg {
     /// Single integer argument (amount, axis index, size).
     Int(usize),
@@ -132,7 +132,7 @@ impl From<usize> for OptArg {
 ///     use_tc: 1,
 /// });
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Opt {
     /// The optimization operation to perform.
     pub op: OptOps,

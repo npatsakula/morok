@@ -115,6 +115,10 @@ pub enum Error {
     #[snafu(display("symbolic shape is not supported for {operation}: shape dimensions must be concrete values"))]
     SymbolicShapeUnsupported { operation: String },
 
+    /// Symbolic buffer size unsupported.
+    #[snafu(display("cannot allocate buffer with symbolic size: range bound resolved to {bound:?}"))]
+    SymbolicBufferSize { bound: crate::ConstValue },
+
     /// Ternary branch shape mismatch.
     #[snafu(display(
         "ternary operation branches have mismatched shapes: true branch {true_branch:?} vs false branch {false_branch:?}"
@@ -126,11 +130,52 @@ pub enum Error {
         "{op} must have Ptr dtype (following Tinygrad spec), got {dtype:?}. Use DefineVar for scalar variables."
     ))]
     DefineGlobalRequiresPtrDType { op: &'static str, dtype: DType },
+
+    // =========================================================================
+    // UOp Builder Guards (user-facing API for kernel implementation)
+    // =========================================================================
+    /// VECTORIZE requires at least one element.
+    #[snafu(display("VECTORIZE requires at least one element"))]
+    VectorizeEmpty,
+
+    /// VECTORIZE elements have mismatched dtypes.
+    #[snafu(display("VECTORIZE elements have mismatched dtypes: expected {expected:?}, got {actual:?}"))]
+    VectorizeDTypeMismatch { expected: DType, actual: DType },
+
+    /// GEP index out of bounds.
+    #[snafu(display("GEP index {index} out of bounds for vector with {vcount} elements"))]
+    GepIndexOutOfBounds { index: usize, vcount: usize },
+
+    /// GEP requires vector source.
+    #[snafu(display("GEP requires vector source (vcount > 1), got {dtype:?}"))]
+    GepRequiresVector { dtype: DType },
+
+    /// CONTRACT dtype count != axis product.
+    #[snafu(display("CONTRACT dtype count {dtype_count} != axis product {axis_product}"))]
+    ContractCountMismatch { dtype_count: usize, axis_product: usize },
+
+    /// UNROLL src dtype count != axis product.
+    #[snafu(display("UNROLL src dtype count {dtype_count} != axis product {axis_product}"))]
+    UnrollCountMismatch { dtype_count: usize, axis_product: usize },
+
+    /// WHERE condition must be bool.
+    #[snafu(display("WHERE condition must be bool, got {actual:?}"))]
+    WhereConditionNotBool { actual: DType },
+
+    /// BROADCAST requires scalar source.
+    #[snafu(display("BROADCAST requires scalar source (vcount=1), got {dtype:?}"))]
+    BroadcastRequiresScalar { dtype: DType },
+
+    /// MulAcc operands must have matching dtypes.
+    #[snafu(display(
+        "MulAcc operands must have matching dtypes (including vcount): a={a_dtype:?}, b={b_dtype:?}, c={c_dtype:?}"
+    ))]
+    MulAccDtypeMismatch { a_dtype: DType, b_dtype: DType, c_dtype: DType },
 }
 
 /// Enhance an error with provenance information for a UOp.
 ///
-/// This function retrieves the provenance chain for a UOp and prints it to stderr,
+/// This function retrieves the provenance chain for a UOp and logs it,
 /// providing detailed debugging information about the operation's origin and
 /// transformation history.
 pub fn log_provenance(uop_id: u64, error: &Error) {
@@ -139,9 +184,12 @@ pub fn log_provenance(uop_id: u64, error: &Error) {
     PROVENANCE_TRACKER.with(|tracker| {
         let chain = tracker.borrow().get_chain(uop_id);
         if !chain.is_empty() {
-            eprintln!("\nError in UOp {} with provenance:", uop_id);
-            eprintln!("{}", error);
-            eprintln!("\nProvenance chain:{}", format_chain(&chain));
+            tracing::error!(
+                uop.id = uop_id,
+                error = %error,
+                provenance_chain = %format_chain(&chain),
+                "uop error with provenance"
+            );
         }
     });
 }

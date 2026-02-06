@@ -2,15 +2,16 @@
 //!
 //! This module contains operations for memory access:
 //! - Indexing: index, index_gated, pointer_index, slice
-//! - Memory access: load, load_gated, store, store_gated
+//! - Memory access: load, store (gate is on INDEX, not LOAD/STORE)
 //! - Device operations: copy, copy_to_device
 //! - Bufferization: bufferize, bufferize_global, bufferize_local
 //! - Memory definitions: define_global, define_local, define_reg
 
-use std::rc::Rc;
+use std::sync::Arc;
 
-use morok_device::DeviceSpec;
+use bon::bon;
 use morok_dtype::DType;
+use morok_dtype::DeviceSpec;
 use smallvec::SmallVec;
 use snafu::ensure;
 
@@ -21,6 +22,7 @@ use crate::op::Op;
 use crate::types::{AddrSpace, BufferizeOpts};
 use crate::uop::UOp;
 
+#[bon]
 impl UOp {
     // =========================================================================
     // Indexing Operations
@@ -28,49 +30,78 @@ impl UOp {
 
     /// Create a buffer index operation for multi-dimensional access.
     ///
-    /// All indices must have Index dtype. Returns element at specified position.
-    pub fn index(buffer: Rc<Self>, indices: Vec<Rc<Self>>) -> Result<Rc<Self>> {
+    /// All indices must have Index dtype.
+    ///
+    /// # Dtype behavior (matches Tinygrad's `buf.index(idx, ptr=False, dtype=None)`)
+    /// - If `dtype` is provided: use it directly (explicit dtype takes precedence)
+    /// - If `ptr` is true: keep the buffer's Ptr dtype (for STORE targets)
+    /// - Otherwise (ptr=false, default): extract element type from buffer (for LOAD sources)
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Element dtype (default) - for LOAD
+    /// UOp::index().buffer(buf).indices(vec![idx]).call()?
+    ///
+    /// // Ptr dtype via ptr=true - for STORE (preferred, Tinygrad-aligned)
+    /// UOp::index().buffer(buf).indices(vec![idx]).ptr(true).call()?
+    ///
+    /// // Explicit Ptr dtype - for STORE (legacy, works but prefer .ptr(true))
+    /// let ptr_dtype = DType::Float32.ptr(Some(size), AddrSpace::Global);
+    /// UOp::index().buffer(buf).indices(vec![idx]).dtype(ptr_dtype).call()?
+    ///
+    /// // With gate
+    /// UOp::index().buffer(buf).indices(vec![idx]).gate(gate_uop).call()?
+    /// ```
+    #[builder]
+    pub fn index<I: Into<SmallVec<[Arc<Self>; 4]>>>(
+        buffer: Arc<Self>,
+        indices: I,
+        gate: Option<Arc<Self>>,
+        dtype: Option<DType>,
+        /// When true, keep buffer's Ptr dtype (for STORE targets).
+        /// When false (default), extract element type (for LOAD sources).
+        /// Matches Tinygrad's `buf.index(idx, ptr=True/False)`.
+        ptr: Option<bool>,
+    ) -> Result<Arc<Self>> {
+        let indices = indices.into();
         // Validate that all indices have Index dtype
         for idx in &indices {
             let idx_dtype = idx.dtype();
-            ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
+            ensure!([DType::Index, DType::Int64].contains(&idx_dtype), IndexTypeMismatchSnafu { actual: idx_dtype });
         }
 
-        let dtype = buffer.dtype.clone();
-        let indices = SmallVec::from_vec(indices);
-        Ok(Self::new(Op::Index { buffer, indices, gate: None }, dtype))
-    }
+        // Determine result dtype based on (dtype, ptr) parameters
+        // Priority: explicit dtype > ptr flag > default (element type)
+        let result_dtype = match (dtype, ptr.unwrap_or(false)) {
+            (Some(d), _) => d,              // Explicit dtype takes precedence
+            (None, true) => buffer.dtype(), // ptr=true: keep Ptr dtype
+            (None, false) => match buffer.dtype() {
+                // ptr=false: extract element type
+                DType::Ptr { base, .. } => base.as_ref().clone(),
+                other => other,
+            },
+        };
 
-    /// Create a gated index operation.
-    pub fn index_gated(buffer: Rc<Self>, indices: Vec<Rc<Self>>, gate: Rc<Self>) -> Result<Rc<Self>> {
-        // Validate that all indices have Index dtype
-        for idx in &indices {
-            let idx_dtype = idx.dtype();
-            ensure!(idx_dtype == DType::Index, IndexTypeMismatchSnafu { actual: idx_dtype });
-        }
-
-        let dtype = buffer.dtype.clone();
-        let indices = SmallVec::from_vec(indices);
-        Ok(Self::new(Op::Index { buffer, indices, gate: Some(gate) }, dtype))
+        Ok(Self::new(Op::Index { buffer, indices, gate }, result_dtype))
     }
 
     /// Create a pointer index operation (pointer arithmetic).
     ///
     /// Performs pointer + offset arithmetic for address calculation in kernels.
-    /// Both ptr and offset should have Index dtype.
-    pub fn pointer_index(ptr: Rc<Self>, offset: Rc<Self>) -> Result<Rc<Self>> {
-        let ptr_dtype = ptr.dtype();
+    /// Both self (ptr) and offset should have Index dtype.
+    pub fn pointer_index(self: &Arc<Self>, offset: Arc<Self>) -> Result<Arc<Self>> {
+        let ptr_dtype = self.dtype();
         let offset_dtype = offset.dtype();
         ensure!(ptr_dtype == DType::Index, IndexTypeMismatchSnafu { actual: ptr_dtype });
         ensure!(offset_dtype == DType::Index, IndexTypeMismatchSnafu { actual: offset_dtype });
-        Ok(Self::new(Op::PointerIndex { ptr, offset }, DType::Index))
+        Ok(Self::new(Op::PointerIndex { ptr: self.clone(), offset }, DType::Index))
     }
 
     /// Multi-dimensional slicing with IndexSpec.
     ///
     /// **Note**: Range and NewAxis specs are not fully implemented;
     /// currently only Single indices are properly supported.
-    pub fn slice(buffer: Rc<Self>, specs: Vec<IndexSpec>) -> Result<Rc<Self>> {
+    pub fn slice(buffer: Arc<Self>, specs: Vec<IndexSpec>) -> Result<Arc<Self>> {
         let mut indices = Vec::new();
 
         for spec in specs {
@@ -99,12 +130,12 @@ impl UOp {
             // No actual indexing, just return buffer
             Ok(buffer)
         } else {
-            Self::index(buffer, indices)
+            Self::index().buffer(buffer).indices(indices).call()
         }
     }
 
     /// Gated slicing - conditional access with gate.
-    pub fn slice_gated(buffer: Rc<Self>, specs: Vec<IndexSpec>, gate: Rc<Self>) -> Result<Rc<Self>> {
+    pub fn slice_gated(buffer: Arc<Self>, specs: Vec<IndexSpec>, gate: Arc<Self>) -> Result<Arc<Self>> {
         let mut indices = Vec::new();
 
         for spec in specs {
@@ -115,7 +146,27 @@ impl UOp {
             }
         }
 
-        if indices.is_empty() { Ok(buffer) } else { Self::index_gated(buffer, indices, gate) }
+        if indices.is_empty() { Ok(buffer) } else { Self::index().buffer(buffer).indices(indices).gate(gate).call() }
+    }
+
+    // =========================================================================
+    // Index Helpers
+    // =========================================================================
+
+    /// Wrap index with validity condition.
+    ///
+    /// This is the Rust equivalent of Tinygrad's `idx.valid(cond)`.
+    /// Creates WHERE(cond, self, Invalid) to mark conditional index validity.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Create a conditionally valid index
+    /// let valid_idx = idx.valid(cond);
+    /// // Equivalent to: WHERE(cond, idx, INVALID)
+    /// ```
+    pub fn valid(self: &Arc<Self>, cond: Arc<Self>) -> Arc<Self> {
+        UOp::try_where(cond, self.clone(), UOp::invalid_marker()).expect("valid: WHERE construction failed")
     }
 
     // =========================================================================
@@ -124,34 +175,49 @@ impl UOp {
 
     /// Create a LOAD operation.
     ///
-    /// Loads a value from a buffer at the given index.
-    pub fn load(buffer: Rc<Self>, index: Rc<Self>) -> Rc<Self> {
-        let dtype = buffer.dtype.clone();
-        Self::new(Op::Load { buffer, index }, dtype)
+    /// # Example
+    /// ```ignore
+    /// // Infer dtype from buffer
+    /// UOp::load().buffer(buf).index(idx).call()
+    ///
+    /// // Explicit dtype for vector loads
+    /// UOp::load().buffer(buf).index(idx).dtype(vec4_dtype).call()
+    ///
+    /// // With alt value for gated loads
+    /// UOp::load().buffer(buf).index(idx).alt(zero).call()
+    /// ```
+    #[builder]
+    pub fn load(buffer: Arc<Self>, index: Arc<Self>, dtype: Option<DType>, alt: Option<Arc<Self>>) -> Arc<Self> {
+        let dtype = dtype.unwrap_or_else(|| match &buffer.dtype {
+            DType::Ptr { base, .. } => (**base).clone(),
+            other => other.clone(),
+        });
+        Self::new(Op::Load { buffer, index, alt }, dtype)
     }
 
-    /// Create a gated LOAD operation.
+    /// Create a STORE operation without ranges.
     ///
-    /// Loads a value from a buffer at the given index, conditionally based on gate.
-    /// If gate is false, the load may be skipped or return undefined.
-    pub fn load_gated(buffer: Rc<Self>, index: Rc<Self>, gate: Rc<Self>) -> Rc<Self> {
-        let dtype = buffer.dtype.clone();
-        Self::new(Op::LoadGated { buffer, index, gate }, dtype)
+    /// Stores a value at self (INDEX location).
+    /// The buffer is accessed indirectly through the INDEX node.
+    /// For stores with ranges (e.g., output upcasting), use `store_with_ranges`.
+    ///
+    /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
+    pub fn store(self: &Arc<Self>, value: Arc<Self>) -> Arc<Self> {
+        self.store_with_ranges(value, SmallVec::new())
     }
 
-    /// Create a STORE operation.
+    /// Create a STORE operation with ranges.
     ///
-    /// Stores a value to a buffer at the given index.
-    pub fn store(buffer: Rc<Self>, index: Rc<Self>, value: Rc<Self>) -> Rc<Self> {
-        Self::new(Op::Store { buffer, index, value }, DType::Void)
-    }
-
-    /// Create a gated STORE operation.
+    /// Stores a value at self (INDEX location), with explicit ranges
+    /// that define the scope of the store operation. This matches Tinygrad's
+    /// architecture where STORE sources are `(index, value, *ranges)`.
     ///
-    /// Stores a value to a buffer at the given index, conditionally based on gate.
-    /// If gate is false, the store may be skipped.
-    pub fn store_gated(buffer: Rc<Self>, index: Rc<Self>, value: Rc<Self>, gate: Rc<Self>) -> Rc<Self> {
-        Self::new(Op::StoreGated { buffer, index, value, gate }, DType::Void)
+    /// Ranges are used for output upcasting: Range(Upcast) becomes UNROLL
+    /// during expansion, which `fix_store_unroll` contracts via CONTRACT.
+    ///
+    /// For gated stores, use an INDEX with a gate (INDEX has optional gate field).
+    pub fn store_with_ranges(self: &Arc<Self>, value: Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        Self::new(Op::Store { index: self.clone(), value, ranges }, DType::Void)
     }
 
     // =========================================================================
@@ -159,7 +225,7 @@ impl UOp {
     // =========================================================================
 
     /// Copy to a different device.
-    pub fn copy_to_device(self: &Rc<Self>, device: DeviceSpec) -> Rc<Self> {
+    pub fn copy_to_device(self: &Arc<Self>, device: DeviceSpec) -> Arc<Self> {
         let dev = Self::device(device);
         Self::new(Op::Copy { src: self.clone(), device: dev }, self.dtype.clone())
     }
@@ -168,9 +234,9 @@ impl UOp {
     ///
     /// Unlike `copy_to_device` which takes a `DeviceSpec`, this takes
     /// a device UOp directly (useful when you already have one).
-    pub fn copy(src: Rc<Self>, device: Rc<Self>) -> Rc<Self> {
-        let dtype = src.dtype.clone();
-        Self::new(Op::Copy { src, device }, dtype)
+    pub fn copy(self: &Arc<Self>, device: Arc<Self>) -> Arc<Self> {
+        let dtype = self.dtype.clone();
+        Self::new(Op::Copy { src: self.clone(), device }, dtype)
     }
 
     // =========================================================================
@@ -181,7 +247,7 @@ impl UOp {
     ///
     /// Marks a computation to be materialized into a buffer.
     /// The computation is evaluated over the given ranges and stored.
-    pub fn bufferize(compute: Rc<Self>, ranges: Vec<Rc<Self>>, opts: BufferizeOpts) -> Rc<Self> {
+    pub fn bufferize(compute: Arc<Self>, ranges: Vec<Arc<Self>>, opts: BufferizeOpts) -> Arc<Self> {
         let dtype = compute.dtype.clone();
         Self::new(Op::Bufferize { compute, ranges: SmallVec::from_vec(ranges), opts }, dtype)
     }
@@ -189,14 +255,14 @@ impl UOp {
     /// Create a BUFFERIZE operation with Global address space.
     ///
     /// This is the most common pattern - bufferize to global memory.
-    pub fn bufferize_global(compute: Rc<Self>, ranges: Vec<Rc<Self>>) -> Rc<Self> {
+    pub fn bufferize_global(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
         Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
     }
 
     /// Create a BUFFERIZE operation with Local address space.
     ///
     /// For shared/local memory bufferization.
-    pub fn bufferize_local(compute: Rc<Self>, ranges: Vec<Rc<Self>>) -> Rc<Self> {
+    pub fn bufferize_local(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
         Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Local })
     }
 
@@ -207,21 +273,32 @@ impl UOp {
     /// Create a DEFINE_GLOBAL operation.
     ///
     /// Defines a global memory allocation with the given ID.
-    pub fn define_global(id: usize, dtype: DType) -> Rc<Self> {
+    pub fn define_global(id: usize, dtype: DType) -> Arc<Self> {
         Self::new(Op::DefineGlobal(id), dtype)
     }
 
     /// Create a DEFINE_LOCAL operation.
     ///
     /// Defines a local (shared) memory allocation with the given ID.
-    pub fn define_local(id: usize, dtype: DType) -> Rc<Self> {
+    pub fn define_local(id: usize, dtype: DType) -> Arc<Self> {
         Self::new(Op::DefineLocal(id), dtype)
     }
 
-    /// Define register memory.
-    pub fn define_reg(size: usize) -> Rc<Self> {
+    /// Define register memory (void pointer - type determined by usage).
+    pub fn define_reg(size: usize) -> Arc<Self> {
         use morok_dtype::AddrSpace;
         let ptr_dtype = DType::Void.ptr(Some(size), AddrSpace::Reg);
+        Self::new(Op::DefineReg { size }, ptr_dtype)
+    }
+
+    /// Define register memory with explicit element type.
+    ///
+    /// Creates a typed register accumulator for use in reductions.
+    /// The element_dtype specifies the type of each element (e.g., Float32 for a float accumulator).
+    pub fn define_reg_typed(size: usize, element_dtype: DType) -> Arc<Self> {
+        use morok_dtype::AddrSpace;
+        let ptr_dtype =
+            DType::Ptr { base: Box::new(element_dtype), addrspace: AddrSpace::Reg, size: Some(size), vcount: 1 };
         Self::new(Op::DefineReg { size }, ptr_dtype)
     }
 }

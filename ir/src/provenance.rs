@@ -97,6 +97,9 @@ pub enum PassName {
     /// Loop to global parallelization conversion
     #[display("convert_loop_to_global")]
     ConvertLoopToGlobal,
+    /// Outer to loop conversion for CPU vectorization
+    #[display("convert_outer_to_loop")]
+    ConvertOuterToLoop,
     /// Pattern-based graph rewriting
     #[display("rewrite_pattern")]
     RewritePattern,

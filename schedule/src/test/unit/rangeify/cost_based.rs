@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::rangeify::patterns::buffer_removal;
 use crate::rewrite::graph_rewrite;
@@ -6,18 +6,23 @@ use morok_dtype::{AddrSpace as DTypeAddrSpace, DType};
 use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, UOp};
 
 // Helper functions
-fn create_const(val: i64) -> Rc<UOp> {
+fn create_const(val: i64) -> Arc<UOp> {
     UOp::native_const(val as i32)
 }
 
-fn create_range(end: i64, axis_id: usize) -> Rc<UOp> {
+fn create_range(end: i64, axis_id: usize) -> Arc<UOp> {
     UOp::new(
-        Op::Range { end: create_const(end), axis_id: AxisId::Renumbered(axis_id), axis_type: AxisType::Loop },
+        Op::Range {
+            end: create_const(end),
+            axis_id: AxisId::Renumbered(axis_id),
+            axis_type: AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Index,
     )
 }
 
-fn create_bufferize(compute: Rc<UOp>, ranges: Vec<Rc<UOp>>) -> Rc<UOp> {
+fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
     UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
 }
 
@@ -36,7 +41,7 @@ fn test_remove_bufferize_cheap_unary() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return the cheap operation
-    assert!(Rc::ptr_eq(&result, &neg), "Cheap unary op should be inlined");
+    assert!(Arc::ptr_eq(&result, &neg), "Cheap unary op should be inlined");
 }
 
 #[test]
@@ -53,14 +58,14 @@ fn test_remove_bufferize_cheap_binary() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return the cheap operation
-    assert!(Rc::ptr_eq(&result, &add), "Cheap binary op should be inlined");
+    assert!(Arc::ptr_eq(&result, &add), "Cheap binary op should be inlined");
 }
 
 #[test]
 fn test_remove_bufferize_cast() {
     // BUFFERIZE(CAST(x), ranges) should inline (cheap operation)
     let x = UOp::var("x", DType::Int32, 0, 100);
-    let cast = UOp::cast(x, DType::Float32);
+    let cast = x.cast(DType::Float32);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(cast.clone(), vec![range]);
@@ -69,7 +74,7 @@ fn test_remove_bufferize_cast() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return the cast
-    assert!(Rc::ptr_eq(&result, &cast), "CAST should be inlined");
+    assert!(Arc::ptr_eq(&result, &cast), "CAST should be inlined");
 }
 
 #[test]
@@ -90,7 +95,7 @@ fn test_keep_bufferize_expensive() {
     let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
     // Should NOT remove BUFFERIZE (reduce is expensive)
-    assert!(Rc::ptr_eq(&result, &bufferized), "REDUCE should remain buffered");
+    assert!(Arc::ptr_eq(&result, &bufferized), "REDUCE should remain buffered");
 }
 
 // Pattern 2: Always-Run Ops Tests
@@ -99,7 +104,7 @@ fn test_keep_bufferize_expensive() {
 fn test_remove_bufferize_contiguous() {
     // BUFFERIZE(CONTIGUOUS(x), ranges) should be removed (always-run op)
     let x = UOp::var("x", DType::Float32, 0, 100);
-    let contiguous = UOp::contiguous(x);
+    let contiguous = x.contiguous();
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(contiguous.clone(), vec![range]);
@@ -108,7 +113,7 @@ fn test_remove_bufferize_contiguous() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return CONTIGUOUS
-    assert!(Rc::ptr_eq(&result, &contiguous), "CONTIGUOUS shouldn't be buffered");
+    assert!(Arc::ptr_eq(&result, &contiguous), "CONTIGUOUS shouldn't be buffered");
 }
 
 #[test]
@@ -116,7 +121,7 @@ fn test_remove_bufferize_copy() {
     // BUFFERIZE(COPY(x, device), ranges) should be removed (always-run op)
     let x = UOp::var("x", DType::Float32, 0, 100);
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
-    let copy = UOp::copy(x, device);
+    let copy = x.copy(device);
 
     let range = create_range(10, 0);
     let bufferized = create_bufferize(copy.clone(), vec![range]);
@@ -125,7 +130,7 @@ fn test_remove_bufferize_copy() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return COPY
-    assert!(Rc::ptr_eq(&result, &copy), "COPY shouldn't be buffered");
+    assert!(Arc::ptr_eq(&result, &copy), "COPY shouldn't be buffered");
 }
 
 #[test]
@@ -142,7 +147,7 @@ fn test_remove_bufferize_assign() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return ASSIGN
-    assert!(Rc::ptr_eq(&result, &assign), "ASSIGN shouldn't be buffered");
+    assert!(Arc::ptr_eq(&result, &assign), "ASSIGN shouldn't be buffered");
 }
 
 #[test]
@@ -157,7 +162,7 @@ fn test_remove_bufferize_noop() {
     let result = graph_rewrite(&matcher, bufferized, &mut ());
 
     // Should remove BUFFERIZE and return NOOP
-    assert!(Rc::ptr_eq(&result, &noop), "NOOP shouldn't be buffered");
+    assert!(Arc::ptr_eq(&result, &noop), "NOOP shouldn't be buffered");
 }
 
 // Pattern 3: Nested Buffer Removal Tests
@@ -179,9 +184,9 @@ fn test_flatten_nested_bufferize() {
 
     // Should flatten to single BUFFERIZE with outer ranges
     if let Op::Bufferize { compute, ranges, .. } = result.op() {
-        assert!(Rc::ptr_eq(compute, &x), "Should unwrap to original compute");
+        assert!(Arc::ptr_eq(compute, &x), "Should unwrap to original compute");
         assert_eq!(ranges.len(), 1, "Should have outer ranges only");
-        assert!(Rc::ptr_eq(&ranges[0], &outer_range), "Should preserve outer range");
+        assert!(Arc::ptr_eq(&ranges[0], &outer_range), "Should preserve outer range");
     } else {
         panic!("Expected BUFFERIZE after flattening");
     }
@@ -204,10 +209,10 @@ fn test_nested_bufferize_multiple_ranges() {
 
     // Should flatten to single BUFFERIZE with outer ranges
     if let Op::Bufferize { compute, ranges, .. } = result.op() {
-        assert!(Rc::ptr_eq(compute, &x), "Should unwrap to original compute");
+        assert!(Arc::ptr_eq(compute, &x), "Should unwrap to original compute");
         assert_eq!(ranges.len(), 2, "Should have 2 outer ranges");
-        assert!(Rc::ptr_eq(&ranges[0], &outer_ranges[0]), "First outer range preserved");
-        assert!(Rc::ptr_eq(&ranges[1], &outer_ranges[1]), "Second outer range preserved");
+        assert!(Arc::ptr_eq(&ranges[0], &outer_ranges[0]), "First outer range preserved");
+        assert!(Arc::ptr_eq(&ranges[1], &outer_ranges[1]), "Second outer range preserved");
     } else {
         panic!("Expected BUFFERIZE after flattening");
     }
@@ -229,7 +234,7 @@ fn test_multiple_cheap_ops_inline() {
     for op in test_ops {
         let bufferized = create_bufferize(op.clone(), vec![range.clone()]);
         let result = graph_rewrite(&matcher, bufferized, &mut ());
-        assert!(Rc::ptr_eq(&result, &op), "All cheap ops should inline");
+        assert!(Arc::ptr_eq(&result, &op), "All cheap ops should inline");
     }
 }
 

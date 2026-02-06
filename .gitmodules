@@ -4,3 +4,9 @@
 [submodule "submodules/inkwell"]
 	path = submodules/inkwell
 	url = https://github.com/TheDan64/inkwell.git
+[submodule "submodules/wasmtime"]
+	path = submodules/wasmtime
+	url = https://github.com/bytecodealliance/wasmtime.git
+[submodule "submodules/melior"]
+	path = submodules/melior
+	url = https://github.com/mlir-rs/melior.git

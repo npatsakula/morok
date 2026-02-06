@@ -4,7 +4,7 @@
 //! (reduces, matmul, etc.) and assertion utilities for validating scheduler state.
 
 use morok_ir::{AxisId, AxisType, Op, ReduceOp, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::optimizer::Scheduler;
 
@@ -26,14 +26,14 @@ use crate::optimizer::Scheduler;
 ///
 /// # Returns
 /// A UOp representing the reduction sink
-pub fn create_simple_reduce(size: i64, reduce_op: ReduceOp) -> Rc<UOp> {
+pub fn create_simple_reduce(size: i64, reduce_op: ReduceOp) -> Arc<UOp> {
     use smallvec::smallvec;
 
     let size_uop = UOp::native_const(size as i32 as i64);
     // Use Reduce axis type for reduction dimensions
     let range = UOp::range_axis(size_uop, AxisId::Renumbered(0), AxisType::Reduce);
     let const_val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(const_val, smallvec![range], reduce_op);
+    let reduce = const_val.reduce(smallvec![range], reduce_op);
     UOp::sink(vec![reduce])
 }
 
@@ -61,7 +61,7 @@ pub fn create_simple_reduce(size: i64, reduce_op: ReduceOp) -> Rc<UOp> {
 ///
 /// # Returns
 /// A UOp representing the reduction with global axes
-pub fn create_reduce_with_globals(global_sizes: &[i64], reduce_size: i64, reduce_op: ReduceOp) -> Rc<UOp> {
+pub fn create_reduce_with_globals(global_sizes: &[i64], reduce_size: i64, reduce_op: ReduceOp) -> Arc<UOp> {
     use smallvec::smallvec;
 
     // Create Global axes
@@ -78,7 +78,7 @@ pub fn create_reduce_with_globals(global_sizes: &[i64], reduce_size: i64, reduce
 
     // Create reduction
     let const_val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(const_val, smallvec![reduce_axis], reduce_op);
+    let reduce = const_val.reduce(smallvec![reduce_axis], reduce_op);
 
     // Add all axes to sink
     all_axes.insert(0, reduce);
@@ -113,7 +113,7 @@ pub fn create_reduce_with_globals(global_sizes: &[i64], reduce_size: i64, reduce
 ///
 /// # Returns
 /// A UOp representing the matmul sink
-pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Rc<UOp> {
+pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Arc<UOp> {
     use smallvec::smallvec;
 
     // Create ranges for M, N, K dimensions
@@ -130,7 +130,7 @@ pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Rc<UOp> {
     let add_expr = m_range.try_add(&k_range).expect("ADD should succeed with same dtype");
 
     // Create reduction over K
-    let reduce = UOp::reduce(add_expr, smallvec![k_range], ReduceOp::Add);
+    let reduce = add_expr.reduce(smallvec![k_range], ReduceOp::Add);
 
     // Create sink with all ranges
     UOp::sink(vec![reduce, m_range, n_range])
@@ -156,7 +156,7 @@ pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Rc<UOp> {
 ///
 /// # Returns
 /// A UOp representing the double reduction sink
-pub fn create_double_reduce(size1: i64, size2: i64, reduce_op: ReduceOp) -> Rc<UOp> {
+pub fn create_double_reduce(size1: i64, size2: i64, reduce_op: ReduceOp) -> Arc<UOp> {
     use smallvec::smallvec;
 
     let size1_uop = UOp::native_const(size1 as i32 as i64);
@@ -167,7 +167,7 @@ pub fn create_double_reduce(size1: i64, size2: i64, reduce_op: ReduceOp) -> Rc<U
     let range2 = UOp::range_axis(size2_uop, AxisId::Renumbered(1), AxisType::Reduce);
 
     let const_val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(const_val, smallvec![range1, range2], reduce_op);
+    let reduce = const_val.reduce(smallvec![range1, range2], reduce_op);
 
     UOp::sink(vec![reduce])
 }
@@ -198,7 +198,7 @@ pub fn create_double_reduce(size1: i64, size2: i64, reduce_op: ReduceOp) -> Rc<U
 ///
 /// # Returns
 /// A UOp representing the double reduction with globals
-pub fn create_double_reduce_with_globals(global_sizes: &[i64], reduce_sizes: &[i64], reduce_op: ReduceOp) -> Rc<UOp> {
+pub fn create_double_reduce_with_globals(global_sizes: &[i64], reduce_sizes: &[i64], reduce_op: ReduceOp) -> Arc<UOp> {
     use smallvec::smallvec;
 
     assert_eq!(global_sizes.len(), 2, "Expected 2 global dimensions for double reduce");
@@ -226,7 +226,7 @@ pub fn create_double_reduce_with_globals(global_sizes: &[i64], reduce_sizes: &[i
 
     // Create reduction
     let const_val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(const_val, reduce_axes, reduce_op);
+    let reduce = const_val.reduce(reduce_axes, reduce_op);
 
     // Build sink with reduce first, then global axes
     all_axes.insert(0, reduce);
@@ -250,7 +250,7 @@ pub fn create_double_reduce_with_globals(global_sizes: &[i64], reduce_sizes: &[i
 ///
 /// # Returns
 /// A UOp representing the elementwise sink
-pub fn create_elementwise_pattern(sizes: &[i64]) -> Rc<UOp> {
+pub fn create_elementwise_pattern(sizes: &[i64]) -> Arc<UOp> {
     let const_val = UOp::native_const(1.0f32);
 
     let mut ops = vec![const_val];

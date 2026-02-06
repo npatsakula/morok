@@ -6,16 +6,31 @@
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 
-use morok_device::DeviceSpec;
+use morok_dtype::DeviceSpec;
 use morok_dtype::{DType, ScalarDType};
 
 /// Constant value that can be stored in a UOp.
 #[derive(Debug, Clone, Copy, PartialEq, derive_more::From)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum ConstValue {
     Int(i64),
     UInt(u64),
     Float(f64),
     Bool(bool),
+}
+
+/// Manual Hash impl because f64 doesn't implement Hash.
+/// Uses to_bits() for floats, which means NaN values with identical bit patterns hash equally.
+impl Hash for ConstValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        discriminant(self).hash(state);
+        match self {
+            ConstValue::Int(v) => v.hash(state),
+            ConstValue::UInt(v) => v.hash(state),
+            ConstValue::Float(v) => v.to_bits().hash(state),
+            ConstValue::Bool(v) => v.hash(state),
+        }
+    }
 }
 
 /// Helper macro to cast to target width and back to storage type (for proper truncation/extension).
@@ -194,6 +209,27 @@ impl ConstValue {
         }
     }
 
+    /// Try to extract an integer value (i64 or u64 as i64).
+    ///
+    /// Used for constant pattern matching with specific integer values.
+    pub const fn try_int(&self) -> Option<i64> {
+        match self {
+            Self::Int(v) => Some(*v),
+            Self::UInt(v) => Some(*v as i64),
+            _ => None,
+        }
+    }
+
+    /// Try to extract a float value (f64).
+    ///
+    /// Used for constant pattern matching with specific float values.
+    pub const fn try_float(&self) -> Option<f64> {
+        match self {
+            Self::Float(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     /// Truncate value to fit within dtype boundaries (two's complement wrapping).
     ///
     /// This is equivalent to Tinygrad's ctypes-based truncation. Used for constant
@@ -219,19 +255,12 @@ impl ConstValue {
     }
 }
 
-/// Memory address space for buffer allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AddrSpace {
-    /// Global/device memory.
-    Global,
-    /// Local/shared memory.
-    Local,
-    /// Register memory.
-    Reg,
-}
+// Re-export AddrSpace from dtype to avoid duplication
+pub use morok_dtype::AddrSpace;
 
 /// Options for BUFFERIZE operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct BufferizeOpts {
     /// Device specification or None for local buffers.
     pub device: Option<DeviceSpec>,
@@ -249,8 +278,27 @@ impl BufferizeOpts {
     }
 }
 
+/// Optimization hint carried by CONTIGUOUS ops.
+///
+/// This is a simplified representation of optimizer hints that can be
+/// converted to/from the full `Opt` type in the schedule crate.
+/// Keeps the IR layer decoupled from optimizer-specific types.
+///
+/// Based on Tinygrad's CONTIGUOUS.arg which carries Opt tuples.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ContiguousHint {
+    /// Operation name (e.g., "UPCAST", "LOCAL", "UNROLL")
+    pub op: String,
+    /// Target axis index (if applicable)
+    pub axis: Option<usize>,
+    /// Integer argument (amount, size, etc.)
+    pub arg: Option<i64>,
+}
+
 /// Axis type for loop ranges and reductions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum AxisType {
     /// Outer kernel-level scheduling dimension (doesn't go inside kernels).
     ///
@@ -346,6 +394,9 @@ impl AxisType {
     }
 
     /// Returns true if this is a parallelizable axis type.
+    ///
+    /// Parallel axes represent GPU/thread dispatch dimensions that don't
+    /// contribute to accumulator placement in reduce_to_acc.
     pub const fn is_parallel(self) -> bool {
         matches!(self, Self::Global | Self::Thread | Self::Local | Self::Warp)
     }
@@ -383,6 +434,7 @@ impl std::fmt::Display for AxisType {
 /// The enum makes the renumber_range pattern naturally idempotent:
 /// it only matches `Unrenumbered` variants and produces `Renumbered` variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum AxisId {
     /// Range created during rangeify, not yet renumbered.
     Unrenumbered(usize),
@@ -415,6 +467,7 @@ impl std::fmt::Display for AxisId {
 
 /// Reduction operation types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum ReduceOp {
     /// Sum reduction (a + b).
     Add,
@@ -429,7 +482,8 @@ pub enum ReduceOp {
 /// Unary operation types.
 ///
 /// All unary operations preserve the input dtype.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     /// Negation: -x
     Neg,
@@ -478,7 +532,8 @@ pub enum UnaryOp {
 /// Arithmetic operations (Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv) preserve the LHS dtype.
 /// Comparison operations (Lt, Eq, Ne) always return DType::Bool.
 /// Bitwise operations (And, Or, Xor, Shl, Shr) preserve dtype and require int/bool types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum BinaryOp {
     // Arithmetic operations
     /// Addition: a + b
@@ -549,7 +604,7 @@ pub enum BinaryOp {
 impl BinaryOp {
     /// Returns true if this is a comparison operation.
     pub fn is_comparison(self) -> bool {
-        matches!(self, Self::Lt | Self::Eq | Self::Ne)
+        matches!(self, Self::Lt | Self::Le | Self::Eq | Self::Ne | Self::Gt | Self::Ge)
     }
 
     /// Returns true if this is an arithmetic operation.
@@ -579,7 +634,8 @@ impl BinaryOp {
 }
 
 /// Ternary operation types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::AsRefStr, strum::VariantNames)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum TernaryOp {
     /// Conditional selection: condition ? true_val : false_val
     Where,
@@ -589,6 +645,7 @@ pub enum TernaryOp {
 
 /// Metadata for WMMA (Warp Matrix Multiply-Accumulate) operations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct WmmaMetadata {
     /// Operation name (e.g., "WMMA_INSTRUCTION").
     pub name: String,
@@ -617,6 +674,7 @@ pub struct WmmaMetadata {
 /// - Different NaN representations are not equal
 /// - This is consistent with hash consing requirements
 #[derive(Debug, Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ConstValueHash(pub ConstValue);
 
 impl PartialEq for ConstValueHash {

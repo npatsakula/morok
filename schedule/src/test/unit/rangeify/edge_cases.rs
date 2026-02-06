@@ -7,7 +7,8 @@ use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use smallvec::SmallVec;
 
-use crate::rangeify::{KernelContext, bufferize_to_store::bufferize_to_store, pipeline::run_kernel_split_pipeline};
+use crate::rangeify::{KernelContext, bufferize_to_store, run_kernel_split_pipeline};
+use crate::test::unit::rangeify::helpers::extract_kernel;
 
 #[test]
 fn test_zero_size_range() {
@@ -43,15 +44,26 @@ fn test_empty_bufferize() {
     );
 
     // Should convert successfully
-    let result = bufferize_to_store(&bufferize, &mut ctx);
+    let result = bufferize_to_store(&bufferize, &mut ctx, true);
     assert!(result.is_some());
 
-    // Result should be a STORE (no END wrapper since no ranges)
-    if let Op::Store { value, .. } = result.unwrap().op() {
-        assert!(std::rc::Rc::ptr_eq(value, &compute));
-    } else {
-        panic!("Expected STORE operation for empty ranges");
-    }
+    // Result should be AFTER(passthrough=BUFFER, deps=[STORE])
+    // No ranges means no END wrapper, but still AFTER structure
+    // BUFFER → DEFINE_GLOBAL conversion happens later in split_store
+    let result = result.unwrap();
+    let Op::After { passthrough, deps } = result.op() else {
+        panic!("Expected AFTER operation, got {:?}", result.op());
+    };
+    assert!(matches!(passthrough.op(), Op::Buffer { .. }), "Expected BUFFER, got {:?}", passthrough.op());
+    assert_eq!(deps.len(), 1);
+
+    // deps[0] should be STORE (no ranges = no END)
+    let Op::Store { index, value, .. } = deps[0].op() else {
+        panic!("Expected STORE in AFTER deps, got {:?}", deps[0].op());
+    };
+    // Index should be present even though ranges is empty
+    let _ = index;
+    assert!(std::sync::Arc::ptr_eq(value, &compute));
 }
 
 #[test]
@@ -60,11 +72,11 @@ fn test_zero_size_index() {
     let buffer = UOp::define_global(0, DType::Float32);
 
     // Create INDEX with empty indices
-    let index = UOp::index(buffer.clone(), vec![]).expect("INDEX with no indices should work");
+    let index = UOp::index().buffer(buffer.clone()).indices(vec![]).call().expect("INDEX with no indices should work");
 
     // Should be a valid INDEX
     if let Op::Index { buffer: idx_buf, indices, .. } = index.op() {
-        assert!(std::rc::Rc::ptr_eq(idx_buf, &buffer));
+        assert!(std::sync::Arc::ptr_eq(idx_buf, &buffer));
         assert_eq!(indices.len(), 0);
     } else {
         panic!("Expected INDEX operation");
@@ -75,11 +87,11 @@ fn test_zero_size_index() {
 fn test_zero_size_end() {
     // END with zero ranges
     let store = UOp::noop();
-    let end = UOp::end(store.clone(), SmallVec::new());
+    let end = store.clone().end(SmallVec::new());
 
     // Should create valid END
     if let Op::End { computation, ranges } = end.op() {
-        assert!(std::rc::Rc::ptr_eq(computation, &store));
+        assert!(std::sync::Arc::ptr_eq(computation, &store));
         assert_eq!(ranges.len(), 0);
     } else {
         panic!("Expected END operation");
@@ -100,17 +112,21 @@ fn test_zero_size_pipeline() {
     );
 
     // Run through pipeline
-    let result = run_kernel_split_pipeline(bufferize);
+    let (result, _context) = run_kernel_split_pipeline(bufferize);
 
     // Should create a KERNEL even with zero ranges
-    assert!(matches!(result.op(), Op::Kernel { .. }));
+    // Extract KERNEL from result (may be wrapped in AFTER structure)
+    let kernel = extract_kernel(&result).expect("Pipeline should create a KERNEL");
+    assert!(matches!(kernel.op(), Op::Kernel { .. }));
 }
 
 #[test]
+#[should_panic(expected = "Cannot allocate buffer with symbolic size")]
 fn test_bufferize_with_zero_range_inside() {
     let mut ctx = KernelContext::new();
 
     // Create BUFFERIZE with a zero-sized range
+    // Zero-sized buffers are invalid (Tinygrad: "assert size > 0")
     let compute = UOp::native_const(1.0f32);
     let range_zero = UOp::range_const(0, 0);
 
@@ -123,24 +139,17 @@ fn test_bufferize_with_zero_range_inside() {
         DType::Float32,
     );
 
-    // Should convert (even though range is zero)
-    let result = bufferize_to_store(&bufferize, &mut ctx);
-    assert!(result.is_some());
-
-    // Should create END with the zero range
-    if let Op::End { ranges, .. } = result.unwrap().op() {
-        assert_eq!(ranges.len(), 1);
-        assert!(std::rc::Rc::ptr_eq(&ranges[0], &range_zero));
-    } else {
-        panic!("Expected END operation");
-    }
+    // Should panic because zero-sized buffers are not allowed
+    let _result = bufferize_to_store(&bufferize, &mut ctx, true);
 }
 
 #[test]
+#[should_panic(expected = "Cannot allocate buffer with symbolic size")]
 fn test_multiple_zero_ranges() {
     let mut ctx = KernelContext::new();
 
     // Create BUFFERIZE with multiple zero-sized ranges
+    // Zero-sized buffers are invalid (Tinygrad: "assert size > 0")
     let compute = UOp::native_const(true);
     let range1 = UOp::range_const(0, 0);
     let range2 = UOp::range_const(0, 1);
@@ -154,18 +163,6 @@ fn test_multiple_zero_ranges() {
         DType::Bool,
     );
 
-    // Should convert and preserve both ranges
-    let result = bufferize_to_store(&bufferize, &mut ctx);
-    assert!(result.is_some());
-
-    // Should be BARRIER wrapping END with 2 ranges
-    if let Op::Barrier { src, .. } = result.unwrap().op() {
-        if let Op::End { ranges, .. } = src.op() {
-            assert_eq!(ranges.len(), 2);
-        } else {
-            panic!("Expected END inside BARRIER");
-        }
-    } else {
-        panic!("Expected BARRIER for local buffer");
-    }
+    // Should panic because zero-sized buffers are not allowed
+    let _result = bufferize_to_store(&bufferize, &mut ctx, true);
 }

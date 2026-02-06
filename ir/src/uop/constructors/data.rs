@@ -6,10 +6,10 @@
 //! - Device specifications
 //! - No-op and cast operations
 
-use std::rc::Rc;
+use std::sync::Arc;
 
-use morok_device::DeviceSpec;
 use morok_dtype::DType;
+use morok_dtype::DeviceSpec;
 use morok_dtype::ext::HasDType;
 
 use crate::IntoUOp;
@@ -26,24 +26,44 @@ impl UOp {
     /// Create a constant UOp with explicit dtype and value.
     ///
     /// Use `native_const` for type-inferred constants from Rust values.
-    pub fn const_(dtype: DType, value: ConstValue) -> Rc<Self> {
+    pub fn const_(dtype: DType, value: ConstValue) -> Arc<Self> {
         Self::new(Op::Const(ConstValueHash(value)), dtype)
     }
 
     /// Create a constant UOp from a Rust native value with automatic dtype inference.
-    pub fn native_const<T: HasDType + IntoUOp>(value: T) -> Rc<Self> {
+    pub fn native_const<T: HasDType + IntoUOp>(value: T) -> Arc<Self> {
         value.into_uop(T::DTYPE)
     }
 
     /// Create an index constant.
-    pub fn index_const(value: i64) -> Rc<Self> {
+    pub fn index_const(value: i64) -> Arc<Self> {
         Self::const_(DType::Index, ConstValue::Int(value))
+    }
+
+    /// Create a constant with the same dtype as self.
+    ///
+    /// This is the Rust equivalent of Tinygrad's `x.const_like(value)`.
+    /// Useful for creating identity elements, zeros, or other constants
+    /// that match an existing UOp's type.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use morok_ir::UOp;
+    /// # use morok_dtype::DType;
+    /// let x = UOp::const_(DType::Float32, morok_ir::ConstValue::Float(5.0));
+    /// let zero = x.const_like(0.0);
+    /// assert_eq!(zero.dtype(), DType::Float32);
+    /// ```
+    pub fn const_like<T: crate::IntoUOp>(self: &Arc<Self>, value: T) -> Arc<Self> {
+        value.into_uop(self.dtype())
     }
 
     /// Create a vector constant from multiple values.
     ///
     /// Dtype is inferred from the first value; all values must be same type.
-    pub fn vconst(values: Vec<ConstValue>) -> Rc<Self> {
+    pub fn vconst(values: Vec<ConstValue>) -> Arc<Self> {
         let scalar_dtype = match values.first() {
             Some(ConstValue::Int(_)) => DType::Int64,
             Some(ConstValue::UInt(_)) => DType::UInt64,
@@ -60,7 +80,7 @@ impl UOp {
     // =========================================================================
 
     /// Create a unique buffer identifier.
-    pub fn buffer_id(num: Option<usize>) -> Rc<Self> {
+    pub fn buffer_id(num: Option<usize>) -> Arc<Self> {
         let id = num.unwrap_or_else(next_unique_id);
         Self::new(Op::Unique(id), DType::Void)
     }
@@ -68,16 +88,16 @@ impl UOp {
     /// Create a new buffer.
     ///
     /// Equivalent to: `UOp(Ops.BUFFER, dtype, (unique(), device(device_spec)), size)`
-    pub fn new_buffer(device: DeviceSpec, size: usize, dtype: DType) -> Rc<Self> {
+    pub fn new_buffer(device: DeviceSpec, size: usize, dtype: DType) -> Arc<Self> {
         let unique = Self::buffer_id(None);
         let dev = Self::device(device);
         Self::new(Op::Buffer { unique, device: dev, size }, dtype)
     }
 
     /// Create a buffer view.
-    pub fn buffer_view(buffer: Rc<Self>, size: usize, offset: usize) -> Rc<Self> {
-        let dtype = buffer.dtype.clone();
-        Self::new(Op::BufferView { buffer, size, offset }, dtype)
+    pub fn view(self: &Arc<Self>, size: usize, offset: usize) -> Arc<Self> {
+        let dtype = self.dtype.clone();
+        Self::new(Op::BufferView { buffer: self.clone(), size, offset }, dtype)
     }
 
     // =========================================================================
@@ -85,7 +105,7 @@ impl UOp {
     // =========================================================================
 
     /// Create a device specification.
-    pub fn device(device: DeviceSpec) -> Rc<Self> {
+    pub fn device(device: DeviceSpec) -> Arc<Self> {
         Self::new(Op::Device(device), DType::Void)
     }
 
@@ -94,17 +114,32 @@ impl UOp {
     // =========================================================================
 
     /// Create a no-op.
-    pub fn noop() -> Rc<Self> {
+    pub fn noop() -> Arc<Self> {
         Self::new(Op::Noop, DType::Void)
     }
 
-    /// Create a cast operation.
-    pub fn cast(src: Rc<Self>, dtype: DType) -> Rc<Self> {
-        Self::new(Op::Cast { src, dtype: dtype.clone() }, dtype)
+    /// Cast to a different dtype.
+    ///
+    /// If casting a vector to a scalar type, automatically promotes the target
+    /// dtype to a matching vector type. This prevents invalid scalar-to-vector
+    /// casts in the IR. (Matches Tinygrad's cast behavior.)
+    pub fn cast(self: &Arc<Self>, dtype: DType) -> Arc<Self> {
+        let src_vcount = self.dtype().vcount();
+        let dst_vcount = dtype.vcount();
+
+        // Auto-promote scalar target to vector if source is vector
+        let dtype = if dst_vcount == 1 && src_vcount > 1 { dtype.vec(src_vcount) } else { dtype };
+
+        // No-op if types match
+        if self.dtype() == dtype {
+            return self.clone();
+        }
+
+        Self::new(Op::Cast { src: self.clone(), dtype: dtype.clone() }, dtype)
     }
 
     /// Bitcast: reinterpret bits as different type.
-    pub fn bitcast(src: Rc<Self>, dtype: DType) -> Rc<Self> {
-        Self::new(Op::BitCast { src, dtype: dtype.clone() }, dtype)
+    pub fn bitcast(self: &Arc<Self>, dtype: DType) -> Arc<Self> {
+        Self::new(Op::BitCast { src: self.clone(), dtype: dtype.clone() }, dtype)
     }
 }

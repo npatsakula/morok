@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc a6d87876ec949e44869c5bb9fe7d2b8fd62f331db933ecca8386c9bdb1969a87 # shrinks to x = UOp { id: 84, op: Const(ConstValueHash(Int(-1))), dtype: Scalar(Int32), shape_cache: OnceCell(<uninit>), ranges_cache: OnceCell(<uninit>), in_scope_ranges_cache: OnceCell(<uninit>), vmin_vmax_cache: OnceCell(<uninit>) }
+cc 62cb5491a6f2d9463bf81d0c4093063453d9033f3e66d460e42c42a49e78b2e6 # shrinks to a = UOp { id: 4684, op: DefineVar { name: "a", max_val: 1 }, dtype: Scalar(Int32), shape_cache: OnceLock(Ok(Some([]))), vmin_vmax_cache: OnceLock(<uninit>), .. }, b = 30, c = -30
