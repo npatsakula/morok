@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "morok-device"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "cudarc",
  "enum_delegate",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "morok-dtype"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "enumset",
  "proptest",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "morok-ir"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "derive_more",
  "half",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "morok-runtime"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "inkwell",
  "morok-codegen",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "morok-schedule"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "morok-device",
  "morok-dtype",
@@ -559,7 +559,7 @@ dependencies = [
 
 [[package]]
 name = "morok-tensor"
-version = "0.1.0"
+version = "0.1.0-alpha.0"
 dependencies = [
  "bon",
  "morok-codegen",
