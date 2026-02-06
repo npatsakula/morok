@@ -190,11 +190,26 @@ fn find_reduce_using_range(scheduler: &Scheduler, rng: &Arc<UOp>) -> Result<Arc<
 // ============================================================================
 
 /// Split reduction into smaller range + UNROLL for compile-time expansion.
+/// When `amount == 0`, the entire axis is unrolled (full unroll), matching Tinygrad's convention.
 fn apply_unroll(scheduler: &mut Scheduler, axis: usize, amount: usize) -> Result<(), OptError> {
     let unrollable = scheduler.unrollable_dims();
     let real_axis =
         *unrollable.get(axis).ok_or_else(|| AxisOutOfBoundsSnafu { axis, max: unrollable.len() }.build())?;
     let rng = scheduler.rngs()[real_axis].clone();
+
+    // Resolve amount=0 to full axis size (full unroll, matching Tinygrad's convention)
+    let amount = if amount == 0 {
+        if let Op::Range { end, .. } = rng.op()
+            && let Op::Const(cv) = end.op()
+            && let morok_ir::ConstValue::Int(sz) = cv.0
+        {
+            sz as usize
+        } else {
+            return ValidationFailedSnafu { op: "UNROLL", reason: "full unroll requires constant axis size" }.fail();
+        }
+    } else {
+        amount
+    };
 
     const MAX_UNROLL: usize = 32;
     if amount > MAX_UNROLL {

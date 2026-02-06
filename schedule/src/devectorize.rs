@@ -911,8 +911,10 @@ fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Index { buffer: buf, indices, .. } = idx.op() else { return None };
 
     // sz = ls.src[0].dtype.count (Tinygrad: size from index dtype)
+    // For Ptr types, we need base.vcount() — the pointee's vector count.
+    // index.dtype().vcount() returns the pointer's vector count (always 1 for CAST'd pointers).
     let sz = match ls.op() {
-        Op::Load { index, .. } | Op::Store { index, .. } => index.dtype().vcount(),
+        Op::Load { index, .. } | Op::Store { index, .. } => ptr_element_count(index),
         _ => return None,
     };
     if sz == 1 {

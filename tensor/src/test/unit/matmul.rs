@@ -383,7 +383,7 @@ fn assert_matmul_close(actual: &ArrayD<f32>, expected: &Array2<f32>, tol: f32) {
 }
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_matmul_validated_2x2() {
     // Simple 2x2 matmul with known values
     let a_data = [1.0f32, 2.0, 3.0, 4.0];
@@ -498,6 +498,7 @@ fn test_matmul_validated_32x32() {
 }
 
 #[test]
+// #[tracing_test::traced_test]
 fn test_matmul_validated_64x64() {
     // 64x64 test with varied data
     const SIZE: usize = 64;
@@ -598,6 +599,7 @@ fn test_matmul_identity_validated() {
 }
 
 #[test]
+// #[tracing_test::traced_test]
 fn test_matmul_negative_values_validated() {
     // Test with negative values to ensure sign handling
     let a_data = [-1.0f32, 2.0, -3.0, 4.0, -5.0, 6.0];
