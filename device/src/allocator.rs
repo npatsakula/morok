@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -13,35 +13,70 @@ use crate::error::*;
 
 /// Opaque handle to device memory.
 ///
-/// Uses `RefCell` for interior mutability with runtime borrow checking.
-/// Safe for single-threaded use (Buffer is !Send + !Sync).
-#[derive(Debug)]
+/// # Safety
+///
+/// `RawBuffer` uses `UnsafeCell` for interior mutability without locking overhead.
+/// Thread safety is guaranteed at a higher level by the scheduler:
+///
+/// 1. **Allocation**: `OnceLock` in `BufferData` ensures single initialization
+/// 2. **Buffer Access**: The scheduler guarantees exclusive access to each buffer
+///    during kernel execution - no two kernels access the same buffer concurrently
+/// 3. **Kernel Execution**: Raw pointers passed to JIT code; Rust doesn't access
+///    buffer data during execution
+///
+/// This design follows Tinygrad's approach where buffer synchronization is the
+/// scheduler's responsibility, not the buffer's.
 pub enum RawBuffer {
     Cpu {
-        data: RefCell<Box<[u8]>>,
+        data: UnsafeCell<Box<[u8]>>,
         cpu_accessible: bool,
     },
     #[cfg(feature = "cuda")]
     CudaDevice {
-        data: RefCell<CudaSlice<u8>>,
+        data: UnsafeCell<CudaSlice<u8>>,
         device: Arc<CudaContext>,
     },
     #[cfg(feature = "cuda")]
     CudaUnified {
-        data: RefCell<UnifiedSlice<u8>>,
+        data: UnsafeCell<UnifiedSlice<u8>>,
         device: Arc<CudaContext>,
     },
+}
+
+// SAFETY: RawBuffer access is synchronized by the scheduler at a higher level.
+// See RawBuffer documentation for detailed safety invariants.
+unsafe impl Send for RawBuffer {}
+unsafe impl Sync for RawBuffer {}
+
+// UnsafeCell doesn't implement Debug, so we implement it manually
+impl std::fmt::Debug for RawBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RawBuffer::Cpu { cpu_accessible, .. } => {
+                f.debug_struct("Cpu").field("cpu_accessible", cpu_accessible).finish_non_exhaustive()
+            }
+            #[cfg(feature = "cuda")]
+            RawBuffer::CudaDevice { device, .. } => {
+                f.debug_struct("CudaDevice").field("device", device).finish_non_exhaustive()
+            }
+            #[cfg(feature = "cuda")]
+            RawBuffer::CudaUnified { device, .. } => {
+                f.debug_struct("CudaUnified").field("device", device).finish_non_exhaustive()
+            }
+        }
+    }
 }
 
 impl RawBuffer {
     /// Get the size of the buffer in bytes.
     pub fn size(&self) -> usize {
+        // SAFETY: Reading .len() doesn't alias with content access and is immutable after allocation
         match self {
-            RawBuffer::Cpu { data, .. } => data.borrow().len(),
+            RawBuffer::Cpu { data, .. } => unsafe { (&*data.get()).len() },
             #[cfg(feature = "cuda")]
-            RawBuffer::CudaDevice { data, .. } => data.borrow().len(),
+            RawBuffer::CudaDevice { data, .. } => unsafe { (&*data.get()).len() },
             #[cfg(feature = "cuda")]
-            RawBuffer::CudaUnified { data, .. } => data.borrow().len(),
+            RawBuffer::CudaUnified { data, .. } => unsafe { (&*data.get()).len() },
         }
     }
 
@@ -77,6 +112,9 @@ pub trait Allocator: Send + Sync + std::fmt::Debug {
         Ok(())
     }
     fn name(&self) -> &str;
+
+    /// Get the device specification for this allocator.
+    fn device_spec(&self) -> morok_dtype::DeviceSpec;
 }
 
 /// CPU allocator using system memory.
@@ -86,11 +124,15 @@ pub struct CpuAllocator;
 impl Allocator for CpuAllocator {
     fn alloc(&self, size: usize, options: &BufferOptions) -> Result<RawBuffer> {
         let data = vec![0u8; size].into_boxed_slice();
-        Ok(RawBuffer::Cpu { data: RefCell::new(data), cpu_accessible: options.cpu_accessible })
+        Ok(RawBuffer::Cpu { data: UnsafeCell::new(data), cpu_accessible: options.cpu_accessible })
     }
 
     fn name(&self) -> &str {
         "CPU"
+    }
+
+    fn device_spec(&self) -> morok_dtype::DeviceSpec {
+        morok_dtype::DeviceSpec::Cpu
     }
 }
 
@@ -125,7 +167,7 @@ impl Allocator for CudaAllocator {
                 self.device.default_stream().memset_zeros(&mut data).context(CudaSnafu)?;
             }
 
-            Ok(RawBuffer::CudaUnified { data: RefCell::new(data), device: Arc::clone(&self.device) })
+            Ok(RawBuffer::CudaUnified { data: UnsafeCell::new(data), device: Arc::clone(&self.device) })
         } else {
             // Allocate device-only memory (faster GPU access)
             let stream = self.device.default_stream();
@@ -133,7 +175,7 @@ impl Allocator for CudaAllocator {
                 if options.zero_init { stream.alloc_zeros::<u8>(size) } else { unsafe { stream.alloc::<u8>(size) } }
                     .context(CudaSnafu)?;
 
-            Ok(RawBuffer::CudaDevice { data: RefCell::new(data), device: Arc::clone(&self.device) })
+            Ok(RawBuffer::CudaDevice { data: UnsafeCell::new(data), device: Arc::clone(&self.device) })
         }
     }
 
@@ -143,6 +185,10 @@ impl Allocator for CudaAllocator {
 
     fn name(&self) -> &str {
         "CUDA"
+    }
+
+    fn device_spec(&self) -> morok_dtype::DeviceSpec {
+        morok_dtype::DeviceSpec::Cuda { device_id: self.device_id }
     }
 }
 
@@ -224,19 +270,20 @@ impl Allocator for LruAllocator {
         if let Some(buffer) = buffer {
             if options.zero_init {
                 // Zero the cached buffer if requested
+                // SAFETY: Buffer just retrieved from cache, not yet returned - no other references exist
                 match &buffer {
                     RawBuffer::Cpu { data, .. } => {
-                        data.borrow_mut().fill(0);
+                        unsafe { (*data.get()).fill(0) };
                     }
                     #[cfg(feature = "cuda")]
                     RawBuffer::CudaDevice { data, device } => {
-                        let mut cuda_data = data.borrow_mut();
-                        device.default_stream().memset_zeros(&mut *cuda_data).context(CudaSnafu)?;
+                        let cuda_data = unsafe { &mut *data.get() };
+                        device.default_stream().memset_zeros(cuda_data).context(CudaSnafu)?;
                     }
                     #[cfg(feature = "cuda")]
                     RawBuffer::CudaUnified { data, device } => {
-                        let mut unified_data = data.borrow_mut();
-                        device.default_stream().memset_zeros(&mut *unified_data).context(CudaSnafu)?;
+                        let unified_data = unsafe { &mut *data.get() };
+                        device.default_stream().memset_zeros(unified_data).context(CudaSnafu)?;
                     }
                 }
             }
@@ -270,5 +317,9 @@ impl Allocator for LruAllocator {
 
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn device_spec(&self) -> morok_dtype::DeviceSpec {
+        self.inner.device_spec()
     }
 }

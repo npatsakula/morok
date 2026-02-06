@@ -10,7 +10,7 @@
 //! - Explicit Result types instead of exceptions
 //! - Non-automatic broadcasting (must be explicit)
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use smallvec::{SmallVec, smallvec};
 use snafu::ensure;
@@ -277,7 +277,7 @@ pub fn to_vec_usize(shape: &Shape) -> Result<Vec<usize>> {
 /// dimensions from the UOp used to store shape information.
 ///
 /// Returns None if the UOp is not in the expected format.
-fn extract_shape_from_uop(shape_uop: &Rc<UOp>) -> Option<Shape> {
+fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
     match shape_uop.op() {
         // VECTORIZE with Index-typed elements
         Op::Vectorize { elements } => Some(elements.into_iter().cloned().map(SInt::from).collect()),
@@ -309,7 +309,7 @@ fn extract_shape_from_uop(shape_uop: &Rc<UOp>) -> Option<Shape> {
 /// Extract padding/shrink ranges from UOps.
 ///
 /// Returns pairs of (begin, end) for each dimension.
-fn extract_ranges_from_uops(begins_uop: &Rc<UOp>, ends_uop: &Rc<UOp>) -> Option<Vec<(SInt, SInt)>> {
+fn extract_ranges_from_uops(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Option<Vec<(SInt, SInt)>> {
     let begins = extract_shape_from_uop(begins_uop)?;
     let ends = extract_shape_from_uop(ends_uop)?;
 
@@ -334,33 +334,40 @@ fn extract_ranges_from_uops(begins_uop: &Rc<UOp>, ends_uop: &Rc<UOp>) -> Option<
 /// let shape = smallvec![SInt::from(3), SInt::from(4), SInt::from(5)];
 /// let shape_uop = shape_to_uop(&shape);
 /// assert_eq!(shape_uop.dtype(), DType::Index.vec(3));
+///
+/// // Scalar (empty shape) is supported
+/// let scalar_shape: smallvec::SmallVec<[SInt; 4]> = smallvec![];
+/// let scalar_uop = shape_to_uop(&scalar_shape);
+/// // VConst with empty values represents scalar
 /// ```
-pub fn shape_to_uop(shape: &Shape) -> Rc<UOp> {
+pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
     use morok_dtype::DType;
     use smallvec::SmallVec;
 
+    // Empty shape = scalar: use VConst with empty values
+    // extract_shape_from_uop will decode this back to empty Shape
     if shape.is_empty() {
-        // Empty shape - return a const 0 or empty vectorize?
-        // Following Tinygrad, empty shape might use VConst with empty vec
         return UOp::vconst(vec![]);
     }
 
-    // Convert each SInt to a UOp
-    let elements: SmallVec<[Rc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
-
+    let elements: SmallVec<[Arc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
     UOp::vectorize(elements)
 }
 
 /// Convert a vector of (begin, end) ranges to two UOps for Pad/Shrink operations.
 ///
 /// Returns (begins_uop, ends_uop) as VECTORIZE UOps.
-pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Rc<UOp>, Rc<UOp>) {
+///
+/// # Panics
+/// Panics if `ranges` is empty; handle scalars at the callsite.
+pub fn ranges_to_uops(ranges: &[(SInt, SInt)]) -> (Arc<UOp>, Arc<UOp>) {
     use morok_dtype::DType;
     use smallvec::SmallVec;
 
-    let begins: SmallVec<[Rc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::Index)).collect();
+    assert!(!ranges.is_empty(), "ranges_to_uops does not support empty ranges (scalars); handle at callsite");
 
-    let ends: SmallVec<[Rc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::Index)).collect();
+    let begins: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(begin, _)| begin.to_uop(DType::Index)).collect();
+    let ends: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|(_, end)| end.to_uop(DType::Index)).collect();
 
     (UOp::vectorize(begins), UOp::vectorize(ends))
 }
@@ -602,13 +609,54 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             None => None,
         },
 
+        // BUFFERIZE shape is derived from ranges (like Tinygrad)
+        // Shape = [end_0, end_1, ...] where end_i is the size of each range
+        Op::Bufferize { ranges, .. } => {
+            let mut dims: Shape = SmallVec::new();
+            for range in ranges.iter() {
+                match range.op() {
+                    // Range: shape dim = end (the upper bound)
+                    Op::Range { end, .. } => {
+                        // Try to get constant value from end
+                        if let Op::Const(val) = end.op() {
+                            match val.0 {
+                                ConstValue::Int(v) if v >= 0 => {
+                                    dims.push(SInt::Const(v as usize));
+                                    continue;
+                                }
+                                ConstValue::UInt(v) => {
+                                    dims.push(SInt::Const(v as usize));
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Fall back to symbolic
+                        dims.push(SInt::Symbolic(end.clone()));
+                    }
+                    // CONST range (already dead axis) has size from vmax+1
+                    Op::Const(val) => {
+                        match val.0 {
+                            ConstValue::Int(v) if v >= 0 => {
+                                dims.push(SInt::Const((v + 1) as usize)); // vmax+1 for shape
+                            }
+                            ConstValue::UInt(v) => {
+                                dims.push(SInt::Const((v + 1) as usize)); // vmax+1 for shape
+                            }
+                            _ => return Ok(None), // Can't determine shape
+                        }
+                    }
+                    // Other range types: use symbolic
+                    _ => {
+                        dims.push(SInt::Symbolic(range.clone()));
+                    }
+                }
+            }
+            Some(dims)
+        }
+
         // These have no shape
-        Op::Bufferize { .. }
-        | Op::Index { .. }
-        | Op::Load { .. }
-        | Op::LoadGated { .. }
-        | Op::Store { .. }
-        | Op::StoreGated { .. } => None,
+        Op::Index { .. } | Op::Load { .. } | Op::Store { .. } => None,
 
         // =====================================================================
         // Control flow - no static shape
@@ -644,7 +692,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         Op::Assign { target, .. } => target.shape()?.cloned(),
 
-        Op::Detach { src } | Op::Contiguous { src } | Op::ContiguousBackward { src } | Op::Precast { src } => {
+        Op::Detach { src } | Op::Contiguous { src, .. } | Op::ContiguousBackward { src } | Op::Precast { src } => {
             src.shape()?.cloned()
         }
 

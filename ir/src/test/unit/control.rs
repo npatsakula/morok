@@ -183,7 +183,7 @@ fn test_end_of_range() {
     let computation = UOp::noop();
 
     // Create END with computation and ranges
-    let end_op = UOp::end(computation, smallvec![range_op]);
+    let end_op = computation.end(smallvec![range_op]);
 
     assert_eq!(end_op.dtype(), DType::Void);
 }
@@ -198,7 +198,7 @@ fn test_end_preserves_dtype() {
     let computation = UOp::noop();
 
     // Create END with computation and ranges
-    let end_op = UOp::end(computation, smallvec![range_op]);
+    let end_op = computation.end(smallvec![range_op]);
 
     assert_eq!(end_op.dtype(), DType::Void);
 }
@@ -212,7 +212,7 @@ fn test_end_returns_void() {
     let computation = UOp::noop();
 
     // Create END with computation and ranges
-    let end_op = UOp::end(computation, smallvec![range_op]);
+    let end_op = computation.end(smallvec![range_op]);
 
     // Verify End has DType::Void
     assert_eq!(end_op.dtype(), DType::Void);
@@ -226,7 +226,7 @@ fn test_end_returns_void() {
 fn test_barrier_basic() {
     let src = UOp::native_const(1.0f32);
 
-    let barrier = UOp::barrier(src.clone(), smallvec![]);
+    let barrier = src.barrier(smallvec![]);
 
     // Barrier preserves src dtype
     assert_eq!(barrier.dtype(), DType::Float32);
@@ -237,7 +237,7 @@ fn test_barrier_with_single_dep() {
     let src = UOp::native_const(42i32);
     let dep = UOp::native_const(PI);
 
-    let barrier = UOp::barrier(src.clone(), smallvec![dep]);
+    let barrier = src.barrier(smallvec![dep]);
 
     assert_eq!(barrier.dtype(), DType::Int32);
 }
@@ -249,7 +249,7 @@ fn test_barrier_with_multiple_deps() {
     let dep2 = UOp::native_const(2i32);
     let dep3 = UOp::native_const(3i32);
 
-    let barrier = UOp::barrier(src.clone(), smallvec![dep1, dep2, dep3]);
+    let barrier = src.barrier(smallvec![dep1, dep2, dep3]);
 
     assert_eq!(barrier.dtype(), DType::Float64);
 }
@@ -267,7 +267,7 @@ fn test_barrier_preserves_dtype() {
 
     for (dtype, value) in dtypes {
         let src = UOp::const_(dtype.clone(), value);
-        let barrier = UOp::barrier(src, smallvec![]);
+        let barrier = src.barrier(smallvec![]);
 
         assert_eq!(barrier.dtype(), dtype);
     }
@@ -367,7 +367,7 @@ fn test_end_dtype_is_void() {
     let computation = UOp::noop();
 
     // Create END with computation and ranges
-    let end_op = UOp::end(computation, smallvec![range_op]);
+    let end_op = computation.end(smallvec![range_op]);
 
     // Confirm End dtype
     assert_eq!(end_op.dtype(), DType::Void);
@@ -377,10 +377,10 @@ fn test_end_dtype_is_void() {
 fn test_barrier_dtype_preservation() {
     // Test that Barrier preserves src dtype across different types
     let int_src = UOp::native_const(42i32);
-    let int_barrier = UOp::barrier(int_src, smallvec![]);
+    let int_barrier = int_src.barrier(smallvec![]);
     assert_eq!(int_barrier.dtype(), DType::Int32);
 
     let float_src = UOp::native_const(PI);
-    let float_barrier = UOp::barrier(float_src, smallvec![]);
+    let float_barrier = float_src.barrier(smallvec![]);
     assert_eq!(float_barrier.dtype(), DType::Float32);
 }

@@ -59,13 +59,14 @@ fn test_vmin_vmax_mul() {
 #[test]
 fn test_vmin_vmax_mul_range() {
     // Test multiplication with ranges
-    let a = UOp::define_var("a".to_string(), -2, 3);
-    let b = UOp::define_var("b".to_string(), -1, 4);
+    let a = UOp::define_var("a".to_string(), 0, 3);
+    let b = UOp::define_var("b".to_string(), 0, 4);
     let prod = a.try_mul(&b).unwrap();
 
-    // Check all 4 corners: -2*-1=2, -2*4=-8, 3*-1=-3, 3*4=12
-    // Min is -8, max is 12
-    assert_eq!(prod.vmin(), &ConstValue::Int(-8));
+    // a ∈ [0, 3], b ∈ [0, 4]
+    // Check all 4 corners: 0*0=0, 0*4=0, 3*0=0, 3*4=12
+    // Min is 0, max is 12
+    assert_eq!(prod.vmin(), &ConstValue::Int(0));
     assert_eq!(prod.vmax(), &ConstValue::Int(12));
 }
 
@@ -114,12 +115,12 @@ fn test_vmin_vmax_neg() {
 
 #[test]
 fn test_vmin_vmax_neg_range() {
-    let var = UOp::define_var("x".to_string(), -3, 5);
+    let var = UOp::define_var("x".to_string(), 0, 5);
     let neg = var.neg();
 
-    // Negation flips the range
+    // var ∈ [0, 5], so neg(var) ∈ [-5, 0]
     assert_eq!(neg.vmin(), &ConstValue::Int(-5));
-    assert_eq!(neg.vmax(), &ConstValue::Int(3));
+    assert_eq!(neg.vmax(), &ConstValue::Int(0));
 }
 
 // ============================================================================
@@ -209,9 +210,18 @@ fn test_vmin_vmax_shr() {
 
 #[test]
 fn test_vmin_vmax_define_var() {
-    let var = UOp::define_var("x".to_string(), -10, 20);
+    let var = UOp::define_var("x".to_string(), 0, 20);
 
-    assert_eq!(var.vmin(), &ConstValue::Int(-10));
+    assert_eq!(var.vmin(), &ConstValue::Int(0));
+    assert_eq!(var.vmax(), &ConstValue::Int(20));
+}
+
+#[test]
+fn test_vmin_vmax_define_var_with_min() {
+    // Test variable with non-zero min_val
+    let var = UOp::define_var("x".to_string(), 5, 20);
+
+    assert_eq!(var.vmin(), &ConstValue::Int(5));
     assert_eq!(var.vmax(), &ConstValue::Int(20));
 }
 
@@ -219,7 +229,12 @@ fn test_vmin_vmax_define_var() {
 fn test_vmin_vmax_range() {
     let end = UOp::native_const(10i32);
     let range = UOp::new(
-        Op::Range { end, axis_id: AxisId::Renumbered(0), axis_type: crate::types::AxisType::Loop },
+        Op::Range {
+            end,
+            axis_id: AxisId::Renumbered(0),
+            axis_type: crate::types::AxisType::Loop,
+            deps: smallvec::SmallVec::new(),
+        },
         DType::Int32,
     );
 
@@ -231,7 +246,7 @@ fn test_vmin_vmax_range() {
 #[test]
 fn test_vmin_vmax_cast() {
     let float_val = UOp::native_const(5.7f32);
-    let int_val = UOp::cast(float_val.clone(), DType::Int32);
+    let int_val = float_val.cast(DType::Int32);
 
     // Cast from 5.7 to int = 5
     assert_eq!(int_val.vmin(), &ConstValue::Int(5));
@@ -240,12 +255,12 @@ fn test_vmin_vmax_cast() {
 
 #[test]
 fn test_vmin_vmax_cast_range() {
-    let var = UOp::define_var("x".to_string(), -1000, 1000);
+    let var = UOp::define_var("x".to_string(), 0, 1000);
     // Cast to Int8 which has range [-128, 127]
-    let casted = UOp::cast(var.clone(), DType::Int8);
+    let casted = var.cast(DType::Int8);
 
     // Should be clamped to Int8 bounds
-    assert_eq!(casted.vmin(), &ConstValue::Int(-128));
+    assert_eq!(casted.vmin(), &ConstValue::Int(0));
     assert_eq!(casted.vmax(), &ConstValue::Int(127));
 }
 
@@ -273,8 +288,10 @@ fn test_vmin_vmax_where_false() {
 
 #[test]
 fn test_vmin_vmax_where_range() {
-    // Condition can be either true or false
-    let cond = UOp::define_var("cond".to_string(), 0, 1);
+    // Condition can be either true or false - use a comparison to get bool dtype
+    let var = UOp::define_var("cond".to_string(), 0, 1);
+    let zero = UOp::const_(DType::Index, ConstValue::Int(0));
+    let cond = var.try_cmpgt(&zero).unwrap();
     let true_val = UOp::native_const(10i32);
     let false_val = UOp::native_const(5i32);
     let where_op = UOp::try_where(cond, true_val, false_val).unwrap();
@@ -367,7 +384,7 @@ fn test_vmin_vmax_float_ops() {
 fn test_vmin_vmax_division_by_zero_range() {
     // Test division when divisor range includes zero
     let a = UOp::native_const(10i32);
-    let b = UOp::var("b", DType::Int32, -1, 1); // Includes zero!
+    let b = UOp::var("b", DType::Int32, 0, 1); // Includes zero!
     let div = a.try_div(&b).unwrap();
 
     // Division by zero range returns dtype bounds
@@ -379,7 +396,7 @@ fn test_vmin_vmax_division_by_zero_range() {
 fn test_vmin_vmax_mod_by_zero_range() {
     // Test modulo when divisor range includes zero
     let a = UOp::native_const(10i32);
-    let b = UOp::var("b", DType::Int32, -1, 1); // Includes zero!
+    let b = UOp::var("b", DType::Int32, 0, 1); // Includes zero!
     let modulo = a.try_mod(&b).unwrap();
 
     // Modulo by zero range returns dtype bounds

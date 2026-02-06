@@ -48,7 +48,7 @@ fn test_gep_basic() {
     ]);
 
     // GEP operation exists (actual behavior may vary based on implementation)
-    let _elem = UOp::gep(vec, vec![0]);
+    let _elem = vec.gep(vec![0]);
     // Just verify it compiles and creates a UOp
 }
 
@@ -61,9 +61,9 @@ fn test_gep_multiple_indices() {
         UOp::native_const(40i32),
     ]);
 
-    // Extract multiple elements -> keeps vector dtype (doesn't reduce count)
-    let result = UOp::gep(vec, vec![0, 2]);
-    assert_eq!(result.dtype(), DType::Int32.vec(4));
+    // Extract multiple elements -> produces vector of extracted elements
+    let result = vec.gep(vec![0, 2]);
+    assert_eq!(result.dtype(), DType::Int32.vec(2));
 }
 
 // =========================================================================
@@ -88,9 +88,9 @@ fn test_cat_basic() {
     let a = UOp::vectorize(smallvec![UOp::native_const(1.0f32), UOp::native_const(2.0f32),]);
     let b = UOp::vectorize(smallvec![UOp::native_const(3.0f32), UOp::native_const(4.0f32),]);
 
-    let result = UOp::cat(vec![a, b]);
-    // Cat concatenates vectors
-    assert_eq!(result.dtype(), DType::Float32.vec(2));
+    let result = UOp::cat().sources(vec![a, b]).call();
+    // Cat concatenates vectors: <2 x f32> + <2 x f32> = <4 x f32>
+    assert_eq!(result.dtype(), DType::Float32.vec(4));
 }
 
 // =========================================================================
@@ -103,6 +103,7 @@ fn test_ptrcat_basic() {
     let a = UOp::const_(ptr_dtype.clone(), ConstValue::Int(0));
     let b = UOp::const_(ptr_dtype.clone(), ConstValue::Int(0));
 
-    let result = UOp::ptrcat(vec![a, b]);
-    assert_eq!(result.dtype(), ptr_dtype);
+    let result = UOp::ptrcat().sources(vec![a, b]).call();
+    // PTRCAT of 2 scalar pointers → vcount=2
+    assert_eq!(result.dtype(), ptr_dtype.vec(2));
 }

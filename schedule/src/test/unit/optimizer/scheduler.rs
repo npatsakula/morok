@@ -1,6 +1,6 @@
 //! Unit tests for the Scheduler (kernel optimization state manager).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::{AxisId, AxisType, ConstValue, Op, ReduceOp, UOp};
 
@@ -85,7 +85,7 @@ fn test_scheduler_helper_properties() {
 
     // Create a simple reduction: value to reduce
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value.clone(), vec![r_reduce.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.clone().reduce(vec![r_reduce.clone()].into(), ReduceOp::Add);
 
     // Wrap in sink with all ranges
     let sink = UOp::sink(vec![reduce_op, r_global, r_local, r_reduce]);
@@ -227,7 +227,7 @@ fn test_scheduler_unrollable_dims() {
 
     // Create reduction
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value, vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.reduce(vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_global, r_reduce1, r_reduce2, r_reduce_size1]);
 
@@ -253,7 +253,7 @@ fn test_scheduler_real_axis() {
     let r_reduce2 = UOp::range_axis(end_16, AxisId::Renumbered(3), AxisType::Reduce);
 
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value, vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.reduce(vec![r_reduce1.clone(), r_reduce2.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_global, r_loop, r_reduce1, r_reduce2]);
 
@@ -298,7 +298,7 @@ fn test_scheduler_colored_shape() {
     let r_upcast = UOp::range_axis(end_4, AxisId::Renumbered(3), AxisType::Upcast);
 
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value, vec![r_reduce.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.reduce(vec![r_reduce.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_global, r_local, r_reduce, r_upcast]);
 
@@ -361,7 +361,7 @@ fn test_scheduler_display_complex() {
     let r_unroll = UOp::range_axis(end_8, AxisId::Renumbered(5), AxisType::Unroll);
 
     let value = UOp::native_const(1.0f32);
-    let reduce_op = UOp::reduce(value, vec![r_reduce.clone(), r_unroll.clone()].into(), ReduceOp::Add);
+    let reduce_op = value.reduce(vec![r_reduce.clone(), r_unroll.clone()].into(), ReduceOp::Add);
 
     let sink = UOp::sink(vec![reduce_op, r_loop, r_global, r_local, r_reduce, r_upcast, r_unroll]);
 
@@ -404,7 +404,7 @@ fn test_shift_to_basic_split() {
     let (replaced_rng, new_rng) = result.unwrap();
 
     // Verify the reduced range has size 4 (16 / 4)
-    if let Op::Range { end, axis_id, axis_type } = replaced_rng.op() {
+    if let Op::Range { end, axis_id, axis_type, .. } = replaced_rng.op() {
         assert_eq!(axis_id, &AxisId::Renumbered(0)); // Same axis_id
         assert_eq!(axis_type, &AxisType::Global); // Same type
         if let Op::Const(cv) = end.op()
@@ -419,7 +419,7 @@ fn test_shift_to_basic_split() {
     }
 
     // Verify the new range has size 4 and type Upcast
-    if let Op::Range { end, axis_id, axis_type } = new_rng.op() {
+    if let Op::Range { end, axis_id, axis_type, .. } = new_rng.op() {
         assert_eq!(axis_id, &AxisId::Renumbered(1)); // New axis_id = maxarg + 1
         assert_eq!(axis_type, &AxisType::Upcast);
         if let Op::Const(cv) = end.op()
@@ -693,18 +693,17 @@ fn test_upcast_basic() {
 
 #[test]
 fn test_upcast_invalid_axis_type() {
-    // Create a kernel with Reduce axis (cannot upcast reduce axes)
+    // Create a kernel with REDUCE axis (cannot upcast REDUCE axes - use UNROLL instead)
     let end_32 = UOp::index_const(32);
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
-    let sink = UOp::sink(vec![reduce]);
+    let sink = UOp::sink(vec![compute, r_reduce]);
 
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    // Try to upcast a Reduce axis (should fail)
+    // Try to upcast a REDUCE axis (should fail - REDUCE should use UNROLL instead)
     let opt = Opt::upcast(0, 4);
     let result = apply_opt(&mut scheduler, &opt, false);
 
@@ -793,7 +792,7 @@ fn test_local_invalid_axis_type() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cuda();
@@ -816,7 +815,7 @@ fn test_unroll_basic() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -849,7 +848,7 @@ fn test_unroll_axis_out_of_bounds() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -872,7 +871,7 @@ fn test_unroll_excessive_amount() {
     let r_reduce = UOp::range_axis(end_128, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -898,7 +897,7 @@ fn test_apply_opt_multiple_operations() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_global, r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_global, r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -1017,7 +1016,7 @@ fn test_swap_basic() {
 
     // Get sizes of ranges before swap
     let rngs_before = scheduler.rngs();
-    let get_size = |rng: &Rc<UOp>| -> i64 {
+    let get_size = |rng: &Arc<UOp>| -> i64 {
         if let Op::Range { end, .. } = rng.op()
             && let Op::Const(cv) = end.op()
             && let morok_ir::ConstValue::Int(sz) = cv.0
@@ -1076,7 +1075,7 @@ fn test_swap_non_global_axis() {
     let r_reduce = UOp::range_axis(end_32, AxisId::Renumbered(1), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_global.clone(), r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_global.clone(), r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -1098,7 +1097,7 @@ fn test_group_basic() {
     let r_reduce = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cuda();
@@ -1125,7 +1124,7 @@ fn test_group_no_shared_memory() {
     let r_reduce = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Reduce);
 
     let compute = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(compute, vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = compute.reduce(vec![r_reduce].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cpu();
@@ -1201,7 +1200,7 @@ fn test_get_optimized_ast_reduce_kernel() {
     let r_upcast = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(3), AxisType::Upcast);
 
     let val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(val, vec![r_reduce.clone()].into(), ReduceOp::Add);
+    let reduce = val.reduce(vec![r_reduce.clone()].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, r_global, r_local, r_upcast]);
 
     let ren = Renderer::cuda();
@@ -1380,12 +1379,11 @@ fn test_flatten_ranges_store() {
     let r_reduce = UOp::range_axis(UOp::index_const(32), AxisId::Renumbered(0), AxisType::Reduce);
 
     let val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(val.clone(), vec![r_reduce].into(), ReduceOp::Add);
+    let reduce = val.clone().reduce(vec![r_reduce].into(), ReduceOp::Add);
 
     // Create a STORE operation with the reduce as its value
-    let buffer = UOp::index_const(0); // Dummy buffer
     let index = UOp::index_const(0); // Dummy index
-    let store = UOp::store(buffer, index, reduce);
+    let store = index.store(reduce);
 
     let ren = Renderer::cuda();
     let scheduler = Scheduler::new(store, ren);
@@ -1398,4 +1396,81 @@ fn test_flatten_ranges_store() {
     use crate::optimizer::KernelInfo;
     let info = optimized.metadata::<KernelInfo>();
     assert!(info.is_some(), "STORE with nested REDUCE should be flattened successfully");
+}
+
+// ============================================================================
+// Threading Tests
+// ============================================================================
+
+#[test]
+fn test_thread_basic() {
+    // Create a kernel with Loop axis (what CPU uses after convert_outer_to_loop)
+    let end_64 = UOp::index_const(64);
+    let r_loop = UOp::range_axis(end_64, AxisId::Renumbered(0), AxisType::Loop);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_loop]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Apply THREAD optimization
+    let opt = Opt::thread(0, 8);
+    let result = apply_opt(&mut scheduler, &opt, true);
+    assert!(result.is_ok(), "THREAD opt should succeed: {:?}", result);
+
+    // Verify shape changed: Loop(64) -> Loop(8) + Thread(8)
+    assert_eq!(scheduler.shape_len(), 2);
+
+    let rngs = scheduler.rngs();
+    // After split: original axis becomes inner loop (Loop), new axis is outer Thread
+    let types: Vec<AxisType> = rngs.iter().map(|r| get_axis_type(r)).collect();
+    assert!(types.contains(&AxisType::Thread), "Should have Thread axis: {:?}", types);
+    assert!(types.contains(&AxisType::Loop), "Should have Loop axis: {:?}", types);
+}
+
+#[test]
+fn test_apply_threading_heuristic_loop() {
+    use crate::optimizer::heuristics::apply_threading;
+
+    // Create a kernel with Loop axis
+    let end_512 = UOp::index_const(512);
+    let r_loop = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Loop);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_loop]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Apply threading heuristic (use 8 threads as test default)
+    let applied = apply_threading(&mut scheduler, 8);
+    assert!(applied, "apply_threading should succeed on Loop axis");
+
+    // Verify Thread axis was created
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading");
+}
+
+#[test]
+fn test_apply_threading_heuristic_outer() {
+    use crate::optimizer::heuristics::apply_threading;
+
+    // Create a kernel with Outer axis (like matmul reduce kernels)
+    let end_512 = UOp::index_const(512);
+    let r_outer = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Outer);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_outer]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Apply threading heuristic - should work on Outer axes too (use 8 threads)
+    let applied = apply_threading(&mut scheduler, 8);
+    assert!(applied, "apply_threading should succeed on Outer axis");
+
+    // Verify Thread axis was created
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading on Outer");
 }

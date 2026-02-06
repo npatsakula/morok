@@ -3,21 +3,22 @@
 //! Validates that find_bufs correctly detects buffer access conflicts and that
 //! as_buf properly extracts buffers from wrapper operations.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
 use morok_ir::{UOp, UOpKey};
 
-use crate::rangeify::cycle_detection::{OpAccessType, as_buf, find_bufs};
+use crate::rangeify::transforms::{OpAccessType, as_buf, find_bufs};
 
 #[test]
 fn test_find_bufs_store_only() {
     // Create a kernel that only STOREs to a buffer
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
+    let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
-    let store = UOp::store(buffer.clone(), index, value);
+    let store_idx = UOp::index().buffer(buffer.clone()).indices(vec![const_idx]).call().unwrap();
+    let store = store_idx.store(value);
 
     // Should succeed - only STORE access
     #[allow(clippy::mutable_key_type)]
@@ -33,12 +34,14 @@ fn test_find_bufs_store_only() {
 fn test_find_bufs_load_only() {
     // Create a computation that only LOADs from a buffer
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
-    let loaded = UOp::load(buffer.clone(), index.clone());
+    let const_idx = UOp::index_const(0);
+    let load_idx = UOp::index().buffer(buffer.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let loaded = UOp::load().buffer(buffer.clone()).index(load_idx).call();
 
     // Wrap in a STORE to a different buffer (kernel output)
     let out_buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let store = UOp::store(out_buffer.clone(), index, loaded);
+    let store_idx = UOp::index().buffer(out_buffer.clone()).indices(vec![const_idx]).call().unwrap();
+    let store = store_idx.store(loaded);
 
     // Should succeed - input buffer only LOADed, output buffer only STOREd
     #[allow(clippy::mutable_key_type)]
@@ -57,13 +60,15 @@ fn test_find_bufs_load_only() {
 fn test_find_bufs_conflicting_access() {
     // Create a kernel that both LOADs and STOREs to the same buffer
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
+    let const_idx = UOp::index_const(0);
 
-    // First LOAD from the buffer
-    let loaded = UOp::load(buffer.clone(), index.clone());
+    // First LOAD from the buffer using INDEX node
+    let load_idx = UOp::index().buffer(buffer.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let loaded = UOp::load().buffer(buffer.clone()).index(load_idx).call();
 
-    // Then STORE back to the same buffer (conflict!)
-    let store = UOp::store(buffer.clone(), index, loaded);
+    // Then STORE back to the same buffer (conflict!) using INDEX node
+    let store_idx = UOp::index().buffer(buffer.clone()).indices(vec![const_idx]).call().unwrap();
+    let store = store_idx.store(loaded);
 
     // Should panic with "buffer accessed with conflicting ops"
     find_bufs(&store);
@@ -75,17 +80,20 @@ fn test_find_bufs_multiple_buffers() {
     let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
+    let const_idx = UOp::index_const(0);
 
-    // LOAD from both input buffers
-    let load1 = UOp::load(buf1.clone(), index.clone());
-    let load2 = UOp::load(buf2.clone(), index.clone());
+    // LOAD from both input buffers using INDEX nodes
+    let load1_idx = UOp::index().buffer(buf1.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let load1 = UOp::load().buffer(buf1.clone()).index(load1_idx).call();
+    let load2_idx = UOp::index().buffer(buf2.clone()).indices(vec![const_idx.clone()]).call().unwrap();
+    let load2 = UOp::load().buffer(buf2.clone()).index(load2_idx).call();
 
     // Add them together
     let sum = load1.try_add(&load2).unwrap();
 
-    // STORE to output buffer
-    let store = UOp::store(out_buf.clone(), index, sum);
+    // STORE to output buffer using INDEX node
+    let store_idx = UOp::index().buffer(out_buf.clone()).indices(vec![const_idx]).call().unwrap();
+    let store = store_idx.store(sum);
 
     // Should succeed
     #[allow(clippy::mutable_key_type)]
@@ -99,18 +107,25 @@ fn test_find_bufs_multiple_buffers() {
 }
 
 #[test]
-fn test_find_bufs_gated_operations() {
-    // Test with LoadGated and StoreGated
+fn test_find_bufs_with_gated_index() {
+    // Test with gated INDEX (gates are now on INDEX, not LOAD/STORE)
     let in_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let index = UOp::index_const(0);
     let gate = UOp::native_const(true);
 
-    // LoadGated from input
-    let loaded = UOp::load_gated(in_buf.clone(), index.clone(), gate.clone());
+    // Create gated index for load (gate is on INDEX)
+    let gated_in_index =
+        UOp::index().buffer(in_buf.clone()).indices(vec![UOp::index_const(0)]).gate(gate.clone()).call().unwrap();
 
-    // StoreGated to output
-    let store = UOp::store_gated(out_buf.clone(), index, loaded, gate);
+    // Load from gated index
+    let loaded = UOp::load().buffer(in_buf.clone()).index(gated_in_index).call();
+
+    // Create gated index for store
+    let gated_out_index =
+        UOp::index().buffer(out_buf.clone()).indices(vec![UOp::index_const(0)]).gate(gate).call().unwrap();
+
+    // Store to gated index
+    let store = gated_out_index.store(loaded);
 
     // Should succeed
     #[allow(clippy::mutable_key_type)]
@@ -126,10 +141,10 @@ fn test_find_bufs_gated_operations() {
 fn test_as_buf_mselect() {
     // Test as_buf extracts buffer from MSelect
     let buffer = UOp::buffer_id(Some(0));
-    let mselect = UOp::mselect(buffer.clone(), 0);
+    let mselect = buffer.mselect(0);
 
     let extracted = as_buf(&mselect);
-    assert!(Rc::ptr_eq(&extracted, &buffer));
+    assert!(Arc::ptr_eq(&extracted, &buffer));
 }
 
 #[test]
@@ -140,7 +155,7 @@ fn test_as_buf_mstack() {
     let mstack = UOp::mstack(vec![buf1.clone(), buf2].into());
 
     let extracted = as_buf(&mstack);
-    assert!(Rc::ptr_eq(&extracted, &buf1));
+    assert!(Arc::ptr_eq(&extracted, &buf1));
 }
 
 #[test]
@@ -148,8 +163,8 @@ fn test_as_buf_after() {
     // Test as_buf extracts passthrough from After
     let buffer = UOp::buffer_id(Some(0));
     let computation = UOp::noop();
-    let after = UOp::after(buffer.clone(), smallvec::smallvec![computation]);
+    let after = buffer.after(smallvec::smallvec![computation]);
 
     let extracted = as_buf(&after);
-    assert!(Rc::ptr_eq(&extracted, &buffer));
+    assert!(Arc::ptr_eq(&extracted, &buffer));
 }

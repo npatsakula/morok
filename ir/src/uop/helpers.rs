@@ -3,7 +3,7 @@
 //! These methods support symbolic pattern matching, based on Tinygrad's ops.py.
 
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::op::Op;
 use crate::types::{AxisType, BinaryOp, ConstValue};
@@ -75,7 +75,7 @@ impl UOp {
     /// // (6*x).divides(3) = Some(2*x)
     /// // (5*x).divides(3) = None
     /// ```
-    pub fn divides(self: &Rc<Self>, v: &Rc<Self>) -> Option<Rc<Self>> {
+    pub fn divides(self: &Arc<Self>, v: &Arc<Self>) -> Option<Arc<Self>> {
         // If v is a constant, check if const_factor is divisible
         if let Op::Const(cv) = v.op()
             && let ConstValue::Int(divisor) = cv.0
@@ -127,7 +127,7 @@ impl UOp {
     /// // (x + y).pop_const(ADD) = (x + y, None)
     /// // x.pop_const(ADD) = (x, None)
     /// ```
-    pub fn pop_const(self: &Rc<Self>, op: BinaryOp) -> (Rc<Self>, Option<ConstValue>) {
+    pub fn pop_const(self: &Arc<Self>, op: BinaryOp) -> (Arc<Self>, Option<ConstValue>) {
         if let Op::Binary(self_op, a, b) = self.op()
             && *self_op == op
         {
@@ -157,7 +157,7 @@ impl UOp {
     /// // (x + y).split_uop(ADD) = [x, y]
     /// // x.split_uop(ADD) = [x]
     /// ```
-    pub fn split_uop(self: &Rc<Self>, sep: BinaryOp) -> Vec<Rc<Self>> {
+    pub fn split_uop(self: &Arc<Self>, sep: BinaryOp) -> Vec<Arc<Self>> {
         let mut result = Vec::new();
         let mut stack = vec![self.clone()];
 
@@ -189,15 +189,15 @@ impl UOp {
     ///
     /// let deps = expr.backward_slice();
     /// // Check if x is in dependencies using pointer equality
-    /// assert!(deps.iter().any(|d| Rc::ptr_eq(d, &x)));
+    /// assert!(deps.iter().any(|d| Arc::ptr_eq(d, &x)));
     /// ```
-    pub fn backward_slice(self: &Rc<Self>) -> Vec<Rc<Self>> {
+    pub fn backward_slice(self: &Arc<Self>) -> Vec<Arc<Self>> {
         let mut visited = HashSet::new();
         let mut result = Vec::new();
         let mut stack = vec![self.clone()];
 
         while let Some(node) = stack.pop() {
-            let ptr = Rc::as_ptr(&node);
+            let ptr = Arc::as_ptr(&node);
 
             if visited.contains(&ptr) {
                 continue;
@@ -227,9 +227,9 @@ impl UOp {
     /// assert_eq!(range.divisible_by(4), Some(4)); // 16 / 4 = 4
     /// assert_eq!(range.divisible_by(5), None);    // 16 not divisible by 5
     /// ```
-    pub fn divisible_by(self: &Rc<Self>, amount: usize) -> Option<usize> {
+    pub fn divisible_by(self: &Arc<Self>, amount: usize) -> Option<usize> {
         // For RANGE operations, check the end (size) field
-        if let Op::Range { end, axis_id: _, axis_type: _ } = self.op() {
+        if let Op::Range { end, .. } = self.op() {
             // Check if end is a constant
             if let Op::Const(cv) = end.op()
                 && let ConstValue::Int(sz) = cv.0
@@ -274,8 +274,8 @@ impl UOp {
     /// let global_range = loop_range.with_axis_type(AxisType::Global);
     /// // global_range has same size and axis_id, but different axis type
     /// ```
-    pub fn with_axis_type(self: &Rc<Self>, new_type: AxisType) -> Rc<Self> {
-        if let Op::Range { end, axis_id, axis_type: _ } = self.op() {
+    pub fn with_axis_type(self: &Arc<Self>, new_type: AxisType) -> Arc<Self> {
+        if let Op::Range { end, axis_id, .. } = self.op() {
             Self::range_axis(end.clone(), *axis_id, new_type)
         } else {
             panic!("with_axis_type() called on non-RANGE operation: {:?}", self.op);
@@ -297,13 +297,13 @@ impl UOp {
     /// ```ignore
     /// // Range with padding: WHERE(i < 5, i, SENTINEL)
     /// let padded_range = UOp::where_op(valid, idx.clone(), invalid_marker)?;
-    /// assert!(Rc::ptr_eq(&padded_range.get_idx(), &idx));
+    /// assert!(Arc::ptr_eq(&padded_range.get_idx(), &idx));
     ///
     /// // Plain range: returns itself
     /// let plain_range = UOp::range_axis(...);
-    /// assert!(Rc::ptr_eq(&plain_range.get_idx(), &plain_range));
+    /// assert!(Arc::ptr_eq(&plain_range.get_idx(), &plain_range));
     /// ```
-    pub fn get_idx(self: &Rc<Self>) -> Rc<Self> {
+    pub fn get_idx(self: &Arc<Self>) -> Arc<Self> {
         use crate::types::TernaryOp;
 
         match self.op() {
@@ -330,7 +330,7 @@ impl UOp {
     /// ```ignore
     /// // Range with padding: WHERE(i < 5, i, SENTINEL)
     /// let padded_range = UOp::where_op(valid.clone(), idx, invalid_marker)?;
-    /// assert!(Rc::ptr_eq(&padded_range.get_valid(), &valid));
+    /// assert!(Arc::ptr_eq(&padded_range.get_valid(), &valid));
     ///
     /// // Plain range: returns constant true
     /// let plain_range = UOp::range_axis(...);
@@ -338,7 +338,7 @@ impl UOp {
     ///     assert_eq!(cv.0, ConstValue::Bool(true));
     /// }
     /// ```
-    pub fn get_valid(self: &Rc<Self>) -> Rc<Self> {
+    pub fn get_valid(self: &Arc<Self>) -> Arc<Self> {
         use crate::types::TernaryOp;
         use morok_dtype::DType;
 
@@ -368,7 +368,7 @@ impl UOp {
     /// let valid_idx = UOp::index_const(5);
     /// assert!(!UOp::is_invalid_marker(&valid_idx));
     /// ```
-    fn is_invalid_marker(uop: &Rc<Self>) -> bool {
+    fn is_invalid_marker(uop: &Arc<Self>) -> bool {
         matches!(uop.op(), Op::Invalid)
     }
 
@@ -389,11 +389,61 @@ impl UOp {
     /// let invalid = UOp::invalid_marker();
     /// let padded = UOp::where_op(valid, actual_idx, invalid)?;
     /// ```
-    pub fn invalid_marker() -> Rc<Self> {
+    pub fn invalid_marker() -> Arc<Self> {
         use morok_dtype::DType;
 
         // Invalid marker for out-of-bounds indices (used in padding/masking)
         Self::new(Op::Invalid, DType::Index)
+    }
+
+    /// Check if this UOp is a monotonically increasing function of its inputs.
+    ///
+    /// Returns true for:
+    /// - Irreducible ops (RANGE, CONST, DEFINE_VAR)
+    /// - ADD of increasing ops
+    /// - MUL/IDIV by non-negative constants
+    ///
+    /// Based on Tinygrad's `is_increasing()` (ops.py:689-694).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// // Constants are increasing
+    /// let c = UOp::const_(DType::Int32, ConstValue::Int(5));
+    /// assert!(c.is_increasing());
+    ///
+    /// // Range variables are increasing
+    /// let range = UOp::range_axis(UOp::index_const(16), 0, AxisType::Loop);
+    /// assert!(range.is_increasing());
+    ///
+    /// // x + y is increasing if both x and y are increasing
+    /// let sum = range.try_add(&c).unwrap();
+    /// assert!(sum.is_increasing());
+    ///
+    /// // x * 2 is increasing if x is increasing
+    /// let two = UOp::const_(DType::Index, ConstValue::Int(2));
+    /// let scaled = range.try_mul(&two).unwrap();
+    /// assert!(scaled.is_increasing());
+    /// ```
+    pub fn is_increasing(self: &Arc<Self>) -> bool {
+        match self.op() {
+            // Irreducible: RANGE, CONST, DEFINE_VAR
+            Op::Range { .. } | Op::Const(_) | Op::DefineVar { .. } => true,
+
+            // ADD: both operands must be increasing
+            Op::Binary(BinaryOp::Add, a, b) => a.is_increasing() && b.is_increasing(),
+
+            // MUL/IDIV by non-negative constant
+            Op::Binary(BinaryOp::Mul | BinaryOp::Idiv, a, b) => {
+                if let Op::Const(cv) = b.op() {
+                    matches!(cv.0, ConstValue::Int(n) if n >= 0) && a.is_increasing()
+                } else {
+                    false
+                }
+            }
+
+            _ => false,
+        }
     }
 }
 
@@ -489,7 +539,7 @@ mod tests {
 
         let (rest, const_val) = add.pop_const(BinaryOp::Add);
 
-        assert!(Rc::ptr_eq(&rest, &x));
+        assert!(Arc::ptr_eq(&rest, &x));
         assert_eq!(const_val, Some(ConstValue::Int(5)));
     }
 
@@ -501,7 +551,7 @@ mod tests {
 
         let (rest, const_val) = add.pop_const(BinaryOp::Add);
 
-        assert!(Rc::ptr_eq(&rest, &add));
+        assert!(Arc::ptr_eq(&rest, &add));
         assert_eq!(const_val, None);
     }
 
@@ -518,9 +568,9 @@ mod tests {
         let terms = xyz.split_uop(BinaryOp::Add);
 
         assert_eq!(terms.len(), 3);
-        assert!(Rc::ptr_eq(&terms[0], &x));
-        assert!(Rc::ptr_eq(&terms[1], &y));
-        assert!(Rc::ptr_eq(&terms[2], &z));
+        assert!(Arc::ptr_eq(&terms[0], &x));
+        assert!(Arc::ptr_eq(&terms[1], &y));
+        assert!(Arc::ptr_eq(&terms[2], &z));
     }
 
     #[test]
@@ -529,7 +579,7 @@ mod tests {
         let terms = x.split_uop(BinaryOp::Add);
 
         assert_eq!(terms.len(), 1);
-        assert!(Rc::ptr_eq(&terms[0], &x));
+        assert!(Arc::ptr_eq(&terms[0], &x));
     }
 
     #[test]
@@ -537,5 +587,57 @@ mod tests {
         assert_eq!(gcd(12, 8), 4);
         assert_eq!(gcd(17, 19), 1);
         assert_eq!(gcd(100, 50), 50);
+    }
+
+    #[test]
+    fn test_is_increasing_const() {
+        let c = UOp::const_(DType::Int32, ConstValue::Int(5));
+        assert!(c.is_increasing());
+
+        let neg = UOp::const_(DType::Int32, ConstValue::Int(-5));
+        assert!(neg.is_increasing()); // Constants are always "increasing" (irreducible)
+    }
+
+    #[test]
+    fn test_is_increasing_add() {
+        let a = UOp::const_(DType::Int32, ConstValue::Int(5));
+        let b = UOp::const_(DType::Int32, ConstValue::Int(3));
+        let sum = a.try_add(&b).unwrap();
+        assert!(sum.is_increasing());
+    }
+
+    #[test]
+    fn test_is_increasing_mul_positive_const() {
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+        let scaled = x.try_mul(&two).unwrap();
+        assert!(scaled.is_increasing());
+    }
+
+    #[test]
+    fn test_is_increasing_mul_negative_const() {
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let neg = UOp::const_(DType::Int32, ConstValue::Int(-2));
+        let scaled = x.try_mul(&neg).unwrap();
+        assert!(!scaled.is_increasing()); // Multiplying by negative is not increasing
+    }
+
+    #[test]
+    fn test_is_increasing_idiv_positive_const() {
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+        let divided = x.idiv(&two);
+        assert!(divided.is_increasing());
+    }
+
+    #[test]
+    fn test_is_increasing_complex() {
+        // (x + 5) * 2 should be increasing
+        let x = UOp::var("x", DType::Int32, 0, 100);
+        let five = UOp::const_(DType::Int32, ConstValue::Int(5));
+        let two = UOp::const_(DType::Int32, ConstValue::Int(2));
+        let sum = x.try_add(&five).unwrap();
+        let scaled = sum.try_mul(&two).unwrap();
+        assert!(scaled.is_increasing());
     }
 }

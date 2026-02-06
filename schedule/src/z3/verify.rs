@@ -2,7 +2,7 @@
 //!
 //! Provides equivalence checking for symbolic rewrites with counterexample extraction.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use morok_ir::UOp;
 
@@ -47,7 +47,7 @@ impl std::error::Error for CounterExample {}
 /// - Expressions are not equivalent (Z3 returns SAT)
 /// - Z3 times out (returns UNKNOWN)
 /// - Conversion to Z3 fails
-pub fn verify_equivalence(original: &Rc<UOp>, simplified: &Rc<UOp>) -> VerificationResult {
+pub fn verify_equivalence(original: &Arc<UOp>, simplified: &Arc<UOp>) -> VerificationResult {
     // Create Z3 context
     let mut z3ctx = Z3Context::new();
 
@@ -165,7 +165,7 @@ mod tests {
         assert!(result.is_err(), "x + 1 should not equal x");
 
         if let Err(CounterExample::Found { message, model }) = result {
-            println!("Counterexample: {}\nModel: {}", message, model);
+            tracing::debug!(message = %message, model = %model, "z3 counterexample found");
         }
     }
 

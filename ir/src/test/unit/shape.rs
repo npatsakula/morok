@@ -155,7 +155,7 @@ fn test_infer_binary_shape() {
 #[test]
 fn test_infer_cast_shape() {
     let val = UOp::native_const(1.5f32);
-    let cast = UOp::cast(val, DType::Int32);
+    let cast = val.cast(DType::Int32);
     let shape = cast.shape().unwrap().expect("Cast should preserve shape");
     assert_eq!(shape.len(), 0);
 }
@@ -168,4 +168,24 @@ fn test_shape_caching() {
     // Second access uses cached value (same pointer)
     let shape2 = val.shape().unwrap().expect("Should have cached shape");
     assert!(std::ptr::eq(shape1, shape2), "Shape should be cached");
+}
+
+// =====================================================================
+// shape_to_uop Tests
+// =====================================================================
+
+#[test]
+fn test_shape_to_uop_non_empty() {
+    use crate::op::Op;
+
+    // Non-empty shape should create Vectorize with elements
+    let shape = smallvec![SInt::from(3), SInt::from(4)];
+    let shape_uop = shape_to_uop(&shape);
+
+    // Should be Vectorize with correct number of elements
+    if let Op::Vectorize { elements } = shape_uop.op() {
+        assert_eq!(elements.len(), 2, "Shape [3, 4] should have 2 elements");
+    } else {
+        panic!("Expected Vectorize, got {:?}", shape_uop.op());
+    }
 }

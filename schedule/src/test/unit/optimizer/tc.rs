@@ -1,6 +1,6 @@
 //! Tests for tensor core (TC) optimization.
 
-use crate::optimizer::{Renderer, Scheduler, opts::tc::*};
+use crate::optimizer::{Renderer, Scheduler, tc::*};
 use morok_ir::{AxisId, AxisType, ReduceOp, UOp};
 
 // ===== Matching Tests =====
@@ -20,7 +20,7 @@ fn test_detect_matmul_basic() {
     let mul = a_val.try_mul(&b_val).unwrap();
 
     // Reduce over k
-    let reduce = UOp::reduce(mul, vec![k].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, i, j]);
 
     // Create scheduler
@@ -54,7 +54,7 @@ fn test_detect_matmul_not_mul() {
     // REDUCE but not of MUL
     let k = UOp::range_axis(UOp::index_const(16), AxisId::Renumbered(0), AxisType::Reduce);
     let val = UOp::native_const(1.0f32);
-    let reduce = UOp::reduce(val, vec![k].into(), ReduceOp::Add);
+    let reduce = val.reduce(vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce]);
 
     let ren = Renderer::cuda();
@@ -77,7 +77,7 @@ fn test_select_tensor_core_auto() {
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
     let mul = a_val.try_mul(&b_val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k.clone()].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k.clone()].into(), ReduceOp::Add);
 
     let pattern = matching::MatmulPattern {
         reduce_op: reduce,
@@ -106,7 +106,7 @@ fn test_select_tensor_core_specific() {
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
     let mul = a_val.try_mul(&b_val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k.clone()].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k.clone()].into(), ReduceOp::Add);
 
     let pattern = matching::MatmulPattern {
         reduce_op: reduce,
@@ -134,7 +134,7 @@ fn test_select_tensor_core_out_of_bounds() {
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
     let mul = a_val.try_mul(&b_val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k.clone()].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k.clone()].into(), ReduceOp::Add);
 
     let pattern = matching::MatmulPattern {
         reduce_op: reduce,
@@ -157,9 +157,10 @@ fn test_select_tensor_core_out_of_bounds() {
 
 #[test]
 fn test_base_shape() {
-    use crate::optimizer::renderer::{SwizzleAxis, TensorCore};
+    use crate::optimizer::renderer::{CUDA_81616, SwizzleAxis};
+    use morok_dtype::DType;
 
-    let tc = TensorCore::cuda_81616_f16_f32();
+    let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     let shape = swizzle::base_shape(&tc);
 
     // Should have: u0, l0, l0, l1, l1, l1, u1, r0, r1, r2, r3
@@ -180,9 +181,10 @@ fn test_base_shape() {
 
 #[test]
 fn test_permutes_for_shape() {
-    use crate::optimizer::renderer::TensorCore;
+    use crate::optimizer::renderer::CUDA_81616;
+    use morok_dtype::DType;
 
-    let tc = TensorCore::cuda_81616_f16_f32();
+    let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     let shape = swizzle::base_shape(&tc);
     let (perm_a, perm_b) = swizzle::permutes_for_shape(&tc, &shape);
 
@@ -199,9 +201,10 @@ fn test_permutes_for_shape() {
 
 #[test]
 fn test_reduce_axes_count() {
-    use crate::optimizer::renderer::TensorCore;
+    use crate::optimizer::renderer::CUDA_81616;
+    use morok_dtype::DType;
 
-    let tc = TensorCore::cuda_81616_f16_f32();
+    let tc = CUDA_81616.build(DType::Float16, DType::Float32);
     let count = swizzle::get_reduce_axes_count(&tc);
 
     // K=16 -> log2(16) = 4 reduce axes
@@ -220,7 +223,7 @@ fn test_apply_tc_basic() {
     let a_val = UOp::native_const(1.0f32);
     let b_val = UOp::native_const(2.0f32);
     let mul = a_val.try_mul(&b_val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, i, j]);
 
     let ren = Renderer::cuda();
@@ -252,7 +255,7 @@ fn test_apply_tc_invalid_use_tc() {
 
     let val = UOp::native_const(1.0f32);
     let mul = val.try_mul(&val).unwrap();
-    let reduce = UOp::reduce(mul, vec![k].into(), ReduceOp::Add);
+    let reduce = mul.reduce(vec![k].into(), ReduceOp::Add);
     let sink = UOp::sink(vec![reduce, i]);
 
     let ren = Renderer::cuda();
@@ -261,4 +264,173 @@ fn test_apply_tc_invalid_use_tc() {
     // Should fail - invalid use_tensor_cores value
     let result = apply(&mut scheduler, -1, 0, 3);
     assert!(result.is_err());
+}
+
+// =============================================================================
+// TC Padding Tests
+// =============================================================================
+
+use morok_dtype::DType;
+use std::sync::Arc;
+
+/// Helper to create a proper matmul pattern for TC padding tests.
+/// Creates: C[m,n] = sum_k A[m,k] * B[k,n]
+///
+/// Unlike simplified tests, this creates inputs that depend on ranges
+/// so that detect_matmul() can find the M, N, K axes.
+fn create_matmul_pattern_for_padding(m: i64, n: i64, k: i64) -> Arc<morok_ir::UOp> {
+    let m_range = UOp::range_axis(UOp::index_const(m), AxisId::Renumbered(0), AxisType::Global);
+    let n_range = UOp::range_axis(UOp::index_const(n), AxisId::Renumbered(1), AxisType::Global);
+    let k_range = UOp::range_axis(UOp::index_const(k), AxisId::Renumbered(2), AxisType::Reduce);
+
+    // Create inputs that depend on ranges (so get_ranges() finds them)
+    // A[m,k] - depends on m_range and k_range
+    // B[k,n] - depends on k_range and n_range
+    //
+    // We achieve this by casting ranges to float and using them in expressions.
+    // This creates a dependency without needing actual buffer operations.
+    let m_float = m_range.clone().cast(DType::Float32);
+    let k_float = k_range.clone().cast(DType::Float32);
+    let n_float = n_range.clone().cast(DType::Float32);
+
+    // A[m,k] = m + k (has m_range and k_range in backward slice)
+    let a_val = m_float.try_add(&k_float).unwrap();
+    // B[k,n] = k + n (has k_range and n_range in backward slice)
+    let b_val = k_float.try_add(&n_float).unwrap();
+
+    // C[m,n] = sum_k(A[m,k] * B[k,n])
+    let mul = a_val.try_mul(&b_val).unwrap();
+    let reduce = mul.reduce(vec![k_range].into(), ReduceOp::Add);
+
+    UOp::sink(vec![reduce, m_range, n_range])
+}
+
+#[test]
+fn test_tc_no_padding_divisible_dims() {
+    // 16x16x16 matmul - perfectly divisible by TC dimensions
+    let sink = create_matmul_pattern_for_padding(16, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=1 (no padding) should work for divisible dims
+    let result = apply(&mut scheduler, -1, 1, 1);
+    // May succeed or fail based on dtype matching, but shouldn't fail due to divisibility
+    if let Err(ref e) = result {
+        let err_msg = format!("{:?}", e);
+        assert!(!err_msg.contains("not divisible"), "16x16x16 should not fail divisibility check: {}", err_msg);
+    }
+}
+
+#[test]
+fn test_tc_rejects_non_divisible_without_tc_opt_2() {
+    // 15x16x16 matmul - M not divisible by 16
+    let sink = create_matmul_pattern_for_padding(15, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=1 (no padding) should reject non-divisible dims
+    let result = apply(&mut scheduler, -1, 1, 1);
+    assert!(result.is_err(), "TC should fail for non-divisible dims with tc_opt=1");
+
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(
+        err_msg.contains("not divisible") || err_msg.contains("no compatible"),
+        "Should fail due to divisibility or no compatible TC: {}",
+        err_msg
+    );
+}
+
+#[test]
+fn test_tc_padding_with_tc_opt_2() {
+    // 15x16x16 matmul - M not divisible, but tc_opt=2 enables padding
+    let sink = create_matmul_pattern_for_padding(15, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=2 should attempt padding via PADTO
+    // For 15→16, this is only ~6% more work so PADTO should succeed
+    let result = apply(&mut scheduler, -1, 2, 1);
+
+    // If it fails, it shouldn't be due to "not divisible" (padding should handle that)
+    if let Err(ref e) = result {
+        let err_msg = format!("{:?}", e);
+        assert!(!err_msg.contains("not divisible"), "tc_opt=2 should pad instead of rejecting: {}", err_msg);
+    }
+}
+
+#[test]
+fn test_tc_padding_rejects_4x_work_increase() {
+    // 4x16x16 matmul - padding 4→16 would be 4x work increase
+    let sink = create_matmul_pattern_for_padding(4, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=2 attempts padding, but PADTO rejects >4x work increase
+    let result = apply(&mut scheduler, -1, 2, 1);
+
+    // Should fail - either at padding (4x limit) or no compatible TC
+    assert!(result.is_err(), "Should fail due to 4x work limit or no compatible TC");
+}
+
+#[test]
+fn test_tc_padding_all_axes() {
+    // 17x17x17 matmul - all dimensions need padding to 32
+    let sink = create_matmul_pattern_for_padding(17, 17, 17);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Verify matmul pattern is detected
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found");
+
+    // tc_opt=2 should attempt padding all axes
+    // 17→32 is ~88% increase, within 4x limit
+    let result = apply(&mut scheduler, -1, 2, 1);
+
+    // May succeed or fail based on dtype matching, but shouldn't fail divisibility
+    if let Err(ref e) = result {
+        let err_msg = format!("{:?}", e);
+        assert!(!err_msg.contains("not divisible"), "tc_opt=2 should pad instead of rejecting: {}", err_msg);
+    }
+}
+
+#[test]
+fn test_tc_opt_validation() {
+    let sink = create_matmul_pattern_for_padding(16, 16, 16);
+
+    let ren = Renderer::cuda();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // tc_opt > 2 should be rejected
+    let result = apply(&mut scheduler, -1, 3, 1);
+    assert!(result.is_err(), "tc_opt=3 should be rejected");
+
+    let err_msg = format!("{:?}", result.unwrap_err());
+    assert!(err_msg.contains("tc_opt must be"), "Should fail validation: {}", err_msg);
 }

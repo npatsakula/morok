@@ -1,5 +1,4 @@
 pub mod advanced_edge_cases;
-pub mod buffer_cost;
 pub mod buffer_folding;
 pub mod buffer_limits;
 pub mod bufferize_to_store;
@@ -9,12 +8,17 @@ pub mod context;
 pub mod cost_based;
 pub mod cycle_detection;
 pub mod dead_axis;
+pub mod deduplication;
+pub mod device_semantics;
 pub mod edge_cases;
 pub mod flatten_range;
+pub mod fusion;
 pub mod helpers;
 pub mod indexing;
 pub mod kernel_context;
 pub mod kernel_count;
+pub mod late_decompositions;
+pub mod load_collapse;
 pub mod movement_patterns;
 pub mod partial_contiguous;
 pub mod patterns;
@@ -25,6 +29,7 @@ pub mod reduce_simplify;
 pub mod split_kernel;
 pub mod split_patterns;
 pub mod split_reduceop;
+pub mod split_store;
 pub mod transform;
 
 use morok_ir::UOp;
@@ -60,7 +65,7 @@ fn test_rangeify_context_record_transform() {
 
     let retrieved = ctx.get_rangeified(&original);
     assert!(retrieved.is_some());
-    assert!(std::rc::Rc::ptr_eq(retrieved.unwrap(), &rangeified));
+    assert!(std::sync::Arc::ptr_eq(retrieved.unwrap(), &rangeified));
 }
 
 #[test]
@@ -80,41 +85,41 @@ fn test_pattern_matchers_stub() {
     let x = UOp::native_const(1.0f32);
 
     // Should all return NoMatch since they're empty
-    use crate::pattern::matcher::RewriteResult;
+    use crate::pattern::RewriteResult;
     assert!(matches!(m3.rewrite(&x, &mut ()), RewriteResult::NoMatch));
     assert!(matches!(m4.rewrite(&x, &mut ()), RewriteResult::NoMatch));
 }
 
 #[test]
 fn test_early_rewrites_detach_removal() {
-    use crate::pattern::matcher::RewriteResult;
+    use crate::pattern::RewriteResult;
 
     let matcher = rangeify_patterns::early_rewrites();
 
     // Test: DETACH(x) -> x
     let x = UOp::native_const(1.0f32);
-    let detach = UOp::detach(x.clone());
+    let detach = x.detach();
 
     let result = matcher.rewrite(&detach, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
+        assert!(std::sync::Arc::ptr_eq(&rewritten, &x));
     }
 }
 
 #[test]
 fn test_early_rewrites_contiguous_backward_removal() {
-    use crate::pattern::matcher::RewriteResult;
+    use crate::pattern::RewriteResult;
 
     let matcher = rangeify_patterns::early_rewrites();
 
     // Test: CONTIGUOUS_BACKWARD(x) -> x
     let x = UOp::native_const(1.0f32);
-    let contiguous = UOp::contiguous_backward(x.clone());
+    let contiguous = x.contiguous_backward();
 
     let result = matcher.rewrite(&contiguous, &mut ());
     assert!(matches!(result, RewriteResult::Rewritten(_)));
     if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(std::rc::Rc::ptr_eq(&rewritten, &x));
+        assert!(std::sync::Arc::ptr_eq(&rewritten, &x));
     }
 }

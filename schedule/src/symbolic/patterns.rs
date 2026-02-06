@@ -11,47 +11,91 @@
 //! universally to any UOp graph, not just during schedule transformation.
 
 use morok_dtype::DType;
-use morok_ir::types::{BinaryOp, ConstValue};
+use morok_ir::types::{BinaryOp, ConstValue, TernaryOp};
 use morok_ir::uop::cached_property::CachedProperty;
 use morok_ir::uop::comparison_analysis::ComparisonAnalyzer;
-use morok_ir::uop::eval::{eval_add_typed, eval_binary_op, eval_mul_typed, eval_sub_typed};
+use morok_ir::uop::eval::{
+    eval_add_typed, eval_binary_op, eval_binary_op_broadcast_typed, eval_mul_typed, eval_sub_typed,
+    eval_unary_op_vec_typed,
+};
 use morok_ir::uop::properties::VminVmaxProperty;
 use morok_ir::{IntoUOp, Op, UOp};
 
-use crate::pattern::matcher::PatternMatcher;
+use crate::TypedPatternMatcher;
 use crate::patterns;
-use crate::rangeify::helpers::get_const_value;
+use crate::rangeify::indexing::get_const_value;
 use crate::symbolic::dce::is_empty_range;
 
 use smallvec::SmallVec;
-use std::rc::Rc;
+use std::sync::Arc;
+use tracing::trace;
 
 /// Constant folding patterns.
 ///
 /// Folds constant expressions at compile time for unary, binary, and ternary operations.
 /// Uses dtype-aware evaluation to ensure results respect type boundaries (e.g., Int32 wraps at 32 bits).
-pub fn constant_folding_dsl_patterns() -> PatternMatcher {
+pub fn constant_folding_dsl_patterns() -> TypedPatternMatcher {
     use morok_ir::uop::eval::{eval_binary_op_typed, eval_ternary_op_typed, eval_unary_op_typed};
 
     patterns! {
         // Unary constant folding - 7 operations in one declaration
         for op in unary [Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
             op(c @const(c_val))
-              => eval_unary_op_typed(op, c_val, c.dtype().base()).map(|r| UOp::const_(c.dtype(), r)),
+              => |c, c_val| eval_unary_op_typed(op, c_val, c.dtype().base()).map(|r| UOp::const_(c.dtype(), r)),
         },
 
         // Binary constant folding - 13 operations in one declaration
         for op in binary [Add, Mul, Sub, Mod, Max, Pow, Idiv, Fdiv, And, Or, Xor, Shl, Shr] {
-            op(a @const(a_val), b @const(b_val))
-              => eval_binary_op_typed(op, a_val, b_val, a.dtype().base()).map(|r| UOp::const_(a.dtype(), r)),
+            op(a @const(a_val), _b @const(b_val))
+              => |a, a_val, b_val| eval_binary_op_typed(op, a_val, b_val, a.dtype().base()).map(|r| UOp::const_(a.dtype(), r)),
         },
 
         // Ternary constant folding - 2 operations in one declaration
         for op in ternary [Where, MulAcc] {
             // For Where: use second operand's dtype (true branch)
             // For MulAcc: use first operand's dtype (all same dtype)
-            op(a @const(a_val), b @const(b_val), c @const(c_val))
-              => eval_ternary_op_typed(op, a_val, b_val, c_val, b.dtype().base()).map(|r| UOp::const_(b.dtype(), r)),
+            op(_a @const(a_val), b @const(b_val), _c @const(c_val))
+              => |a_val, b, b_val, c_val| eval_ternary_op_typed(op, a_val, b_val, c_val, b.dtype().base()).map(|r| UOp::const_(b.dtype(), r)),
+        },
+    }
+}
+
+/// VConst constant folding patterns.
+///
+/// Folds VConst expressions at compile time:
+/// - Binary operations on VConst pairs: VConst op VConst → VConst
+/// - Binary operations mixing Const and VConst (with broadcast)
+/// - Unary operations on VConst
+///
+/// Based on Tinygrad's exec_alu for VCONST handling.
+pub fn vconst_folding_patterns() -> TypedPatternMatcher {
+    patterns! {
+        // Binary VConst folding: VConst op VConst → VConst
+        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
+            op(a @vconst(vals_a), _b @vconst(vals_b))
+              => |a, vals_a, vals_b| {
+                  eval_binary_op_broadcast_typed(op, &vals_a, &vals_b, a.dtype().base())
+                      .map(UOp::vconst)
+              },
+        },
+
+        // Mixed Const + VConst folding (broadcast): Const op VConst → VConst
+        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
+            op(a @anyconst(vals_a), _b @anyconst(vals_b))
+              if vals_a.len() != vals_b.len() // Only when broadcasting needed
+              => |a, vals_a, vals_b| {
+                  eval_binary_op_broadcast_typed(op, &vals_a, &vals_b, a.dtype().base())
+                      .map(UOp::vconst)
+              },
+        },
+
+        // Unary VConst folding
+        for op in unary [Neg, Sqrt, Exp2, Log2, Sin, Reciprocal, Trunc] {
+            op(a @vconst(vals))
+              => |a, vals| {
+                  eval_unary_op_vec_typed(op, &vals, a.dtype().base())
+                      .map(UOp::vconst)
+              },
         },
     }
 }
@@ -59,23 +103,32 @@ pub fn constant_folding_dsl_patterns() -> PatternMatcher {
 /// Identity and zero propagation patterns.
 ///
 /// - Identity folding: x + 0 → x, 0 + x → x, x * 1 → x, 1 * x → x, etc.
-/// - Zero propagation: x * 0 → 0, 0 * x → 0, x & 0 → 0, 0 & x → 0
-pub fn identity_and_zero_patterns() -> PatternMatcher {
+/// - Zero propagation: x * 0 → 0 (non-float only), x & 0 → 0
+///
+/// NOTE: For floats, x * 0 is NOT simplified because IEEE 754 requires:
+/// - NaN * 0 = NaN
+/// - Inf * 0 = NaN
+pub fn identity_and_zero_patterns() -> TypedPatternMatcher {
     patterns! {
         // ========== Identity folding (commutative) ==========
-        Add[x, @zero] ~> x,
-        Mul[x, @one] ~> x,
-        Or[x, @zero] ~> x,
-        Xor[x, @zero] ~> x,
+        Add[x, @zero] ~> |x| x.clone(),
+        Mul[x, @one] ~> |x| x.clone(),
+        Or[x, @zero] ~> |x| x.clone(),
+        Xor[x, @zero] ~> |x| x.clone(),
 
         // ========== Identity folding (non-commutative) ==========
-        Sub(x, @zero) ~> x,
-        Idiv(x, @one) ~> x,
-        Fdiv(x, @one) ~> x,
+        Sub(x, @zero) ~> |x| x.clone(),
+        Idiv(x, @one) ~> |x| x.clone(),
+        Fdiv(x, @one) ~> |x| x.clone(),
 
         // ========== Zero propagation ==========
-        Mul[_, zero @ @zero] ~> zero,
-        And[_, zero @ @zero] ~> zero,
+        // NOTE: For floats, x * 0 is NOT always 0 due to IEEE 754 special values:
+        //   - NaN * 0 = NaN
+        //   - Inf * 0 = NaN
+        // Therefore we only apply this optimization for non-float types.
+        // Integer and boolean types are safe since they have no special values.
+        Mul[x, zero @ @zero] if !x.dtype().is_float() ~> |zero| zero.clone(),
+        And[_, zero @ @zero] ~> |zero| zero.clone(),
     }
 }
 
@@ -90,28 +143,47 @@ pub fn identity_and_zero_patterns() -> PatternMatcher {
 /// - x ^ 0 → x, 0 ^ x → x
 /// - x * 0 → 0, 0 * x → 0
 /// - x & 0 → 0, 0 & x → 0
-pub fn symbolic_simple() -> PatternMatcher {
+pub fn symbolic_simple() -> TypedPatternMatcher {
     constant_folding_dsl_patterns()
+        + vconst_folding_patterns()
         + identity_and_zero_patterns()
         + self_folding_dsl_patterns()
         + zero_folding_dsl_patterns()
         + division_dsl_patterns()
         + cast_dsl_patterns()
+        + cast_where_dsl_patterns()
         + term_combining_dsl_patterns()
         + alu_folding_dsl_patterns()
         + advanced_division_dsl_patterns()
+        + div_mod_recombine_dsl_patterns()
         + comparison_dsl_patterns()
         + boolean_dsl_patterns()
         + minmax_dsl_patterns()
         + power_dsl_patterns()
         + negation_dsl_patterns()
+        + range_based_mod_div_patterns()
         + dce_dsl_patterns()
         + dead_loop_patterns()
+        + after_simplification_patterns()
+        + pm_move_where_on_load()
 }
 
-pub fn symbolic() -> PatternMatcher {
-    // TODO: Add more complex symbolic patterns
-    PatternMatcher::new(vec![])
+/// Full symbolic simplification matcher.
+///
+/// Combines all symbolic patterns for comprehensive algebraic optimization:
+/// - Constant folding (unary, binary, ternary ops)
+/// - Identity folding (x+0→x, x*1→x)
+/// - Zero propagation (x*0→0, x&0→0)
+/// - Self-folding (x/x→1, x&x→x)
+/// - Division simplification
+/// - Cast optimization
+/// - Term combining
+/// - ALU folding
+/// - Comparison patterns
+/// - Boolean patterns
+/// - Dead code elimination
+pub fn symbolic() -> TypedPatternMatcher {
+    symbolic_simple() + gep_pushing_patterns()
 }
 
 /// Self-folding patterns.
@@ -122,18 +194,18 @@ pub fn symbolic() -> PatternMatcher {
 /// - (x % y) % y → x % y
 /// - x & x → x
 /// - x | x → x
-pub fn self_folding_dsl_patterns() -> PatternMatcher {
+pub fn self_folding_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // x // x → 1
-        Idiv(x, x) ~> 1.into_uop(x.dtype()),
+        Idiv(x, x) ~> |x| 1.into_uop(x.dtype()),
         // x // -1 → -x
-        Idiv(x, c @const(c_val)) if c_val.is_neg_one() ~> UOp::neg(x),
+        Idiv(x, _c @const(c_val)) if c_val.is_neg_one() ~> |x| UOp::neg(x),
         // (x % y) % y → x % y
-        Mod(Mod(x, y), y) => x.try_mod(y).ok(),
+        Mod(Mod(x, y), y) => |x, y| x.try_mod(y).ok(),
         // x & x → x
-        And(x, x) ~> Rc::clone(x),
+        And(x, x) ~> |x| x.clone(),
         // x | x → x
-        Or(x, x) ~> Rc::clone(x),
+        Or(x, x) ~> |x| x.clone(),
     }
 }
 
@@ -143,46 +215,422 @@ pub fn self_folding_dsl_patterns() -> PatternMatcher {
 /// - x < x → False (non-float only)
 /// - x % x → 0
 /// - x != x → False (int only)
-pub fn zero_folding_dsl_patterns() -> PatternMatcher {
+pub fn zero_folding_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // x % x → 0
-        Mod(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+        Mod(x, x) => |x| x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
         // x < x → False (non-float only)
-        Lt(x, x) if !x.dtype().is_float() ~> false.into_uop(DType::Bool),
+        Lt(x, x) if !x.dtype().is_float() ~> |_x| false.into_uop(DType::Bool),
         // x != x → False (int only)
-        Ne(x, x) if x.dtype().is_int() ~> false.into_uop(DType::Bool),
+        Ne(x, x) if x.dtype().is_int() ~> |_x| false.into_uop(DType::Bool),
+    }
+}
+
+/// Range-based modulo and division simplification patterns.
+///
+/// Uses vmin/vmax analysis to simplify:
+/// - x % n → x when 0 <= vmin(x) && vmax(x) < n
+/// - x / n → 0 when 0 <= vmin(x) && vmax(x) < n
+///
+/// This is critical for RESHAPE range propagation where Range(n) % n should simplify to Range(n).
+pub fn range_based_mod_div_patterns() -> TypedPatternMatcher {
+    patterns! {
+        // x % n → x when 0 <= vmin(x) && vmax(x) < n
+        // This handles cases like Range(3) % 3 → Range(3)
+        Mod(x, _n @const(n_val)) => |x, n_val| {
+            let (vmin, vmax) = VminVmaxProperty::get(x);
+            trace!(
+                x.id = x.id,
+                vmin = ?vmin,
+                vmax = ?vmax,
+                n_val = ?n_val,
+                "Mod simplification check"
+            );
+            // Check if x is always non-negative and less than n
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
+                && *min >= 0 && *max < n_int {
+                    trace!(
+                        n_int,
+                        min = *min,
+                        max = *max,
+                        "Simplifying x % n → x"
+                    );
+                    return Some(Arc::clone(x));
+                }
+            None
+        },
+
+        // (a * m + b) % n → b % n when m == n (factor out multiples of n)
+        // This handles matmul index expressions like: (row * 512 + col) % 512 → col % 512
+        // Since (a * n) % n = 0, the Mul term can be dropped.
+        // Using commutative [] for Add to match both orderings.
+        // Note: We compare m_val and n_val by VALUE, not pointer, since they may be separate UOps.
+        Mod(Add[Mul[_a, _m @const(m_val)], b], n @const(n_val)) => |b, n, m_val, n_val| {
+            trace!(
+                ?m_val,
+                ?n_val,
+                b.id = b.id,
+                "Mod factor-out CHECKING: m_val == n_val?"
+            );
+            if m_val != n_val { return None; }  // Multiplier must equal modulus
+            trace!(
+                ?n_val,
+                b.id = b.id,
+                "Mod factor-out SUCCESS: (a * n + b) % n → b % n"
+            );
+            b.try_mod(n).ok()
+        },
+
+        // Nested Add version: ((a * m) + b + c) % n → (b + c) % n when m == n
+        // Handles more complex expressions with additional terms.
+        Mod(Add[Add[Mul[_a, _m @const(m_val)], b], c], n @const(n_val)) => |b, c, n, m_val, n_val| {
+            if m_val != n_val { return None; }  // Multiplier must equal modulus
+            trace!(
+                ?n_val,
+                "Mod factor-out nested: ((a * n) + b + c) % n → (b + c) % n"
+            );
+            let bc = b.try_add(c).ok()?;
+            bc.try_mod(n).ok()
+        },
+
+        // (a * m + b) / n → a + b / n when m == n (distribute division over sum)
+        // When b is non-negative and small, this can enable further simplification.
+        // Specifically: (a * n + b) / n = a when 0 <= b < n
+        // Using commutative [] for Add to match both orderings.
+        // Note: We compare m_val and n_val by VALUE, not pointer, since they may be separate UOps.
+        Idiv(Add[Mul[a, _m @const(m_val)], b], n @const(n_val)) => |a, b, n, m_val, n_val| {
+            if m_val != n_val { return None; }  // Multiplier must equal divisor
+            let ConstValue::Int(n_int) = n_val else { return None };
+            if n_int <= 0 { return None; }
+
+            let (vmin, vmax) = VminVmaxProperty::get(b);
+            if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
+                && *min >= 0 && *max < n_int {
+                    // b is in [0, n), so (a * n + b) / n = a
+                    trace!(
+                        ?n_val,
+                        a.id = a.id,
+                        min = *min,
+                        max = *max,
+                        "Idiv factor-out: (a * n + b) / n → a (when 0 <= b < n)"
+                    );
+                    return Some(Arc::clone(a));
+                }
+            // Fall through: compute a + b / n
+            let b_div_n = b.try_div(n).ok()?;
+            trace!(
+                ?n_val,
+                "Idiv factor-out: (a * n + b) / n → a + b / n"
+            );
+            a.try_add(&b_div_n).ok()
+        },
+
+        // x / n → k when all values of x are in the same bucket [k*n, (k+1)*n)
+        // This is the "cancel divmod" rule from Tinygrad's fold_divmod_general.
+        // Examples:
+        //   Range(3) / 3 → 0 (since Range(3) is 0,1,2 and all /3 = 0)
+        //   (64 + Range(8)) / 64 → 1 (since 64..71 all /64 = 1)
+        Idiv(x, _n @const(n_val)) => |x, n_val| {
+            let (vmin, vmax) = VminVmaxProperty::get(x);
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
+                && n_int > 0 {
+                    // Compute floor division for min and max
+                    let min_div = if *min >= 0 {
+                        *min / n_int
+                    } else {
+                        // For negative numbers: floor division rounds toward negative infinity
+                        (*min - n_int + 1) / n_int
+                    };
+                    let max_div = if *max >= 0 {
+                        *max / n_int
+                    } else {
+                        (*max - n_int + 1) / n_int
+                    };
+                    // If both endpoints divide to the same value, all values in range do too
+                    if min_div == max_div {
+                        trace!(
+                            min = *min,
+                            max = *max,
+                            n_int,
+                            result = min_div,
+                            "Idiv cancel: x / n → k (all values in same bucket)"
+                        );
+                        return Some(UOp::const_(x.dtype(), ConstValue::Int(min_div)));
+                    }
+                }
+            None
+        },
+
+        // Idiv(add_chain, n) → Idiv(add_chain_minus_const, n) when the constant doesn't affect floor division
+        // This handles: Idiv(Add(Add(base, 1), inner), 64) → Idiv(Add(base, inner), 64)
+        // when base is aligned to 64 and 1 < 64
+        Idiv(x, n @const(n_val)) if matches!(x.op(), Op::Binary(BinaryOp::Add, ..)) => |x, n, n_val| {
+            // Extract total constant offset from Add chain
+            fn extract_const_sum(uop: &Arc<UOp>) -> (Arc<UOp>, i64) {
+                match uop.op() {
+                    Op::Binary(BinaryOp::Add, left, right) => {
+                        if let Op::Const(cv) = right.op()
+                            && let ConstValue::Int(v) = cv.0 {
+                                let (inner, inner_sum) = extract_const_sum(left);
+                                return (inner, inner_sum + v);
+                            }
+                        if let Op::Const(cv) = left.op()
+                            && let ConstValue::Int(v) = cv.0 {
+                                let (inner, inner_sum) = extract_const_sum(right);
+                                return (inner, inner_sum + v);
+                        }
+                        // Recurse into both sides for nested adds
+                        let (left_inner, left_sum) = extract_const_sum(left);
+                        let (right_inner, right_sum) = extract_const_sum(right);
+                        if left_sum != 0 || right_sum != 0 {
+                            // Rebuild Add without the extracted constants
+                            let new_add = left_inner.try_add(&right_inner).ok();
+                            if let Some(rebuilt) = new_add {
+                                return (rebuilt, left_sum + right_sum);
+                            }
+                        }
+                        (Arc::clone(uop), 0)
+                    }
+                    _ => (Arc::clone(uop), 0),
+                }
+            }
+
+            let (x_without_const, const_sum) = extract_const_sum(x);
+            if const_sum == 0 {
+                return None;  // No constant to remove
+            }
+
+            let (vmin, vmax) = VminVmaxProperty::get(&x_without_const);
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
+                && n_int > 0 {
+                    // Check if adding const_sum doesn't change floor division result
+                    let min_div = *min / n_int;
+                    let max_div = *max / n_int;
+
+                    // CRITICAL: All values must be in the same bucket for safe removal
+                    // If min and max are in different buckets, intermediate values could cross
+                    // bucket boundaries when const_sum is added/removed
+                    if min_div != max_div {
+                        return None;
+                    }
+
+                    // Check that adding const_sum keeps values in the same bucket
+                    let min_c_div = (*min + const_sum) / n_int;
+                    let max_c_div = (*max + const_sum) / n_int;
+                    if min_div == min_c_div && max_div == max_c_div {
+                        return x_without_const.try_div(&Arc::clone(n)).ok();
+                    }
+                }
+            None
+        },
+
+        // (a + (x // n) * n) // n → x // n  when 0 <= vmin(a) and vmax(a) < n
+        // This eliminates redundant idiv chains in address calculations
+        // Using [] for both Add and Mul to match all permutations
+        Idiv(Add[a, Mul[Idiv(x, n @const(n_val)), n]], n) => |a, x, n, n_val| {
+            let (vmin, vmax) = VminVmaxProperty::get(a);
+            if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
+                && *min >= 0 && *max < n_int && n_int > 0 {
+                    return x.try_div(n).ok();
+                }
+            None
+        },
+
+        // Phase 2: (x + c) // d → x // d when small offset c doesn't affect bucket
+        // This handles index canonicalization: (base + lane_offset) // n → base // n
+        // when ALL values of x + c remain in the same bucket as x.
+        // Condition: for all v in [vmin(x), vmax(x)]: (v + c) // d == v // d
+        // Using commutative [] to match both Add(x, c) and Add(c, x)
+        Idiv(Add[x, _c @const(c_val)], d @const(d_val)) => |x, c_val, d, d_val| {
+            let ConstValue::Int(c_int) = c_val else { return None };
+            let ConstValue::Int(d_int) = d_val else { return None };
+            // Only handle small positive offsets with positive divisor
+            if d_int <= 0 || c_int < 0 { return None; }
+
+            let (vmin, vmax) = VminVmaxProperty::get(x);
+            if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax) {
+                // For correctness, we need: (v + c) // d == v // d for ALL v in [min, max]
+                // This is true iff adding c doesn't cause any value to cross a bucket boundary.
+                // Check at both endpoints (with overflow protection):
+                let min_c = min.checked_add(c_int)?;
+                let max_c = max.checked_add(c_int)?;
+                let min_bucket = *min / d_int;
+                let max_bucket = *max / d_int;
+                let min_c_bucket = min_c / d_int;
+                let max_c_bucket = max_c / d_int;
+
+                if min_bucket == min_c_bucket && max_bucket == max_c_bucket {
+                    return x.try_div(d).ok();
+                }
+            }
+            None
+        },
+
+        // Phase 1: (x + c) // d → (x + (c % d)) // d + (c // d)
+        // When c >= d, split the offset into quotient and remainder parts.
+        // This canonicalizes large offsets, allowing further simplification.
+        // Based on Tinygrad's divandmod.py:101-104
+        Idiv(Add[x, _c @const(c_val)], d @const(d_val)) => |x, c_val, d, d_val| {
+            let ConstValue::Int(c_int) = c_val else { return None };
+            let ConstValue::Int(d_int) = d_val else { return None };
+            if d_int <= 0 { return None; }
+
+            let c_mod_d = c_int % d_int;
+            let c_div_d = c_int / d_int;
+
+            // Only apply if remainder differs from original (i.e., c >= d or c < 0)
+            if c_mod_d == c_int { return None; }
+
+            // Check x.vmin >= 0 for correctness (negative numerators have different semantics)
+            let (vmin, _) = VminVmaxProperty::get(x);
+            if let ConstValue::Int(min) = vmin {
+                if *min < 0 { return None; }
+            } else { return None; }
+
+            // Transform: (x + c) // d → (x + c%d) // d + c//d
+            let remainder_const = UOp::const_(d.dtype(), ConstValue::Int(c_mod_d));
+            let inner = x.try_add(&remainder_const).ok()?;
+            let div_result = inner.try_div(d).ok()?;
+            let quotient_const = UOp::const_(d.dtype(), ConstValue::Int(c_div_d));
+            div_result.try_add(&quotient_const).ok()
+        },
     }
 }
 
 /// Division simplification patterns.
 ///
+/// - 0 / 0 → NaN (float division by zero of zero)
+/// - (x * 0) / 0 → NaN (any expression that reduces to 0/0)
 /// - x / x → 1.0 (float division)
 /// - (x * y) / y → x
 /// - (x * y) // y → x
-pub fn division_dsl_patterns() -> PatternMatcher {
+pub fn division_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
+        // 0 / 0 → NaN (IEEE 754: 0/0 is indeterminate)
+        // NOTE: This must come before x/x → 1 pattern to take priority
+        Fdiv(zero1 @ @zero, @zero) if zero1.dtype().is_float()
+            => |zero1| Some(UOp::const_(zero1.dtype(), ConstValue::Float(f64::NAN))),
+        // (x * 0) / 0 → NaN (anything times zero divided by zero is NaN)
+        Fdiv(Mul[_, zero1 @ @zero], @zero) if zero1.dtype().is_float()
+            => |zero1| Some(UOp::const_(zero1.dtype(), ConstValue::Float(f64::NAN))),
         // x / x → 1.0 (float division)
-        Fdiv(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
+        Fdiv(x, x) => |x| x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
         // (x * y) / y → x
-        Fdiv(Mul(x, y), y) ~> Rc::clone(x),
+        Fdiv(Mul(x, y), y) ~> |x| x.clone(),
         // (x * y) // y → x
-        Idiv(Mul(x, y), y) ~> Rc::clone(x),
+        Idiv(Mul(x, y), y) ~> |x| x.clone(),
     }
+}
+
+/// Check if casting from `from` to `to` can safely preserve all values.
+///
+/// Returns true if all values representable in `to` can be represented in `from`.
+/// This is used for double-cast optimization: x.cast(a).cast(b) → x.cast(b)
+/// is only safe if `a` can hold all values of `b` (so no truncation occurs in `a`).
+fn can_safe_cast(to: &DType, from: &DType) -> bool {
+    use morok_dtype::ScalarDType;
+
+    // Get base scalar types for comparison
+    let to_scalar = match to {
+        DType::Scalar(s) => *s,
+        DType::Vector { scalar, .. } => *scalar,
+        _ => return false,
+    };
+    let from_scalar = match from {
+        DType::Scalar(s) => *s,
+        DType::Vector { scalar, .. } => *scalar,
+        _ => return false,
+    };
+
+    // Same type is always safe
+    if to_scalar == from_scalar {
+        return true;
+    }
+
+    // Get bit widths and signedness
+    let (to_bits, to_signed, to_float) = match to_scalar {
+        ScalarDType::Bool => (1, false, false),
+        ScalarDType::Int8 => (8, true, false),
+        ScalarDType::Int16 => (16, true, false),
+        ScalarDType::Int32 => (32, true, false),
+        ScalarDType::Int64 => (64, true, false),
+        ScalarDType::UInt8 => (8, false, false),
+        ScalarDType::UInt16 => (16, false, false),
+        ScalarDType::UInt32 => (32, false, false),
+        ScalarDType::UInt64 => (64, false, false),
+        ScalarDType::Float16 | ScalarDType::BFloat16 => (16, true, true),
+        ScalarDType::Float32 => (32, true, true),
+        ScalarDType::Float64 => (64, true, true),
+        _ => return false,
+    };
+    let (from_bits, from_signed, from_float) = match from_scalar {
+        ScalarDType::Bool => (1, false, false),
+        ScalarDType::Int8 => (8, true, false),
+        ScalarDType::Int16 => (16, true, false),
+        ScalarDType::Int32 => (32, true, false),
+        ScalarDType::Int64 => (64, true, false),
+        ScalarDType::UInt8 => (8, false, false),
+        ScalarDType::UInt16 => (16, false, false),
+        ScalarDType::UInt32 => (32, false, false),
+        ScalarDType::UInt64 => (64, false, false),
+        ScalarDType::Float16 | ScalarDType::BFloat16 => (16, true, true),
+        ScalarDType::Float32 => (32, true, true),
+        ScalarDType::Float64 => (64, true, true),
+        _ => return false,
+    };
+
+    // Float <-> int conversions are not safe
+    if to_float != from_float {
+        return false;
+    }
+
+    // For floats: larger precision can hold smaller
+    if to_float {
+        return from_bits >= to_bits;
+    }
+
+    // For integers:
+    // - Same signedness: larger width can hold smaller
+    // - Unsigned to signed: need one extra bit (e.g., u8 fits in i16)
+    // - Signed to unsigned: never safe (negative values lost)
+    if to_signed == from_signed {
+        return from_bits >= to_bits;
+    }
+
+    if !to_signed && from_signed {
+        // unsigned → signed: from needs to be at least 1 bit larger
+        return from_bits > to_bits;
+    }
+
+    // signed → unsigned: never safe
+    false
 }
 
 /// Cast optimization patterns.
 ///
 /// - cast(const) → const (constant folding)
 /// - x.cast(dtype) → x if same dtype (noop cast)
-/// - x.cast(a).cast(b) → x.cast(b) (collapse double cast)
-pub fn cast_dsl_patterns() -> PatternMatcher {
+/// - x.cast(a).cast(b) → x.cast(b) when safe (collapse double cast)
+///
+/// NOTE: Double cast is only safe when the intermediate type `a` can hold all
+/// values of the final type `b`. Example of UNSAFE collapse:
+///   int64.cast(int8).cast(int64) → int64  // WRONG: loses truncation!
+pub fn cast_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // cast(const) → const
-        Cast { src: c @const(c_val), dtype } => c_val.cast(&dtype).map(|v| UOp::const_(dtype.clone(), v)),
+        Cast { src: _c @const(c_val), dtype } => |c_val, dtype| c_val.cast(dtype).map(|v| UOp::const_(dtype.clone(), v)),
         // x.cast(dtype) → x if same dtype
-        Cast { src: x, dtype } if x.dtype() == dtype ~> Rc::clone(x),
-        // x.cast(a).cast(b) → x.cast(b)
-        Cast { src: Cast { src: x, .. }, dtype } ~> UOp::cast(Rc::clone(x), dtype.clone()),
+        Cast { src: x, dtype } if x.dtype() == *dtype ~> |x| x.clone(),
+        // x.cast(a).cast(b) → x when x.dtype == b and a preserves all values of b
+        // This handles cases like: bool.cast(int32).cast(bool) → bool
+        Cast { src: Cast { src: x, dtype: intermediate }, dtype: outer }
+            if x.dtype() == *outer && can_safe_cast(outer, intermediate)
+            ~> |x| x.clone(),
+        // x.cast(a).cast(b) → x.cast(b) when a doesn't narrow x
+        // This handles widening chains: int8.cast(int32).cast(int64) → int8.cast(int64)
+        Cast { src: Cast { src: x, dtype: intermediate }, dtype: outer }
+            if can_safe_cast(&x.dtype(), intermediate)
+            ~> |x, outer| x.cast(outer.clone()),
     }
 }
 
@@ -191,16 +639,16 @@ pub fn cast_dsl_patterns() -> PatternMatcher {
 /// - x + x → 2*x
 /// - (c1 * x) + (c2 * x) → (c1 + c2) * x
 /// - (x * c1) + (x * c2) → x * (c1 + c2)
-pub fn term_combining_dsl_patterns() -> PatternMatcher {
+pub fn term_combining_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // x + x → 2*x
-        Add(x, x) => 2.into_uop(x.dtype()).try_mul(x).ok(),
+        Add(x, x) => |x| 2.into_uop(x.dtype()).try_mul(x).ok(),
         // (c1 * x) + (c2 * x) → (c1 + c2) * x
-        Add(Mul(c1 @const(c1_val), x), Mul(c2 @const(c2_val), x))
-          => eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype()).try_mul(x).ok(),
+        Add(Mul(c1 @const(c1_val), x), Mul(_c2 @const(c2_val), x))
+          => |c1, c1_val, c2_val, x| eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype()).try_mul(x).ok(),
         // (x * c1) + (x * c2) → x * (c1 + c2)
-        Add(Mul(x, c1 @const(c1_val)), Mul(x, c2 @const(c2_val)))
-          => x.try_mul(&eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype())).ok(),
+        Add(Mul(x, c1 @const(c1_val)), Mul(x, _c2 @const(c2_val)))
+          => |x, c1, c1_val, c2_val| x.try_mul(&eval_add_typed(c1_val, c2_val, c1.dtype().base())?.into_uop(c1.dtype())).ok(),
     }
 }
 
@@ -213,16 +661,16 @@ pub fn term_combining_dsl_patterns() -> PatternMatcher {
 /// - (a - b) // c → (a // c) - (b // c) when both divide evenly
 /// - c * (a + b) → (c * a) + (c * b)
 /// - (a + b) * c → (a * c) + (b * c)
-pub fn advanced_division_dsl_patterns() -> PatternMatcher {
+pub fn advanced_division_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // (a // b) // c → a // (b * c) if b,c non-zero
-        Idiv(Idiv(a, b @const(b_val)), c @const(c_val)) if !b_val.is_zero() && !c_val.is_zero() => {
+        Idiv(Idiv(a, b @const(b_val)), _c @const(c_val)) if !b_val.is_zero() && !c_val.is_zero() => |a, b, b_val, c_val| {
             a.try_div(&UOp::const_(b.dtype(), eval_mul_typed(b_val, c_val, b.dtype().base())?)).ok()
         },
         // expr // divisor → expr.divides(divisor) (generic exact division)
-        Idiv(expr, divisor @ @const) => expr.divides(divisor),
+        Idiv(expr, divisor @ @const) => |expr, divisor| expr.divides(divisor),
         // (a + b) % c → simplify when one operand is multiple of c
-        Mod(Add(a, b), c @const(c_val)) => {
+        Mod(Add(a, b), c @const(c_val)) => |a, b, c, c_val| {
             let ConstValue::Int(modulus) = c_val else { return None };
             (modulus > 0 && modulus <= 256).then(|| {
                 let (af, bf) = (a.const_factor(), b.const_factor());
@@ -236,13 +684,13 @@ pub fn advanced_division_dsl_patterns() -> PatternMatcher {
             }).flatten()
         },
         // (a + b) // c → (a // c) + (b // c) when both divide evenly
-        Idiv(Add(a, b), c @ @const) => a.divides(c)?.try_add(&b.divides(c)?).ok(),
+        Idiv(Add(a, b), c @ @const) => |a, b, c| a.divides(c)?.try_add(&b.divides(c)?).ok(),
         // (a - b) // c → (a // c) - (b // c) when both divide evenly
-        Idiv(Sub(a, b), c @ @const) => a.divides(c)?.try_sub(&b.divides(c)?).ok(),
+        Idiv(Sub(a, b), c @ @const) => |a, b, c| a.divides(c)?.try_sub(&b.divides(c)?).ok(),
         // c * (a + b) → (c * a) + (c * b)
-        Mul(c @ @const, Add(a, b)) => c.try_mul(a).ok()?.try_add(&c.try_mul(b).ok()?).ok(),
+        Mul(c @ @const, Add(a, b)) => |c, a, b| c.try_mul(a).ok()?.try_add(&c.try_mul(b).ok()?).ok(),
         // (a + b) * c → (a * c) + (b * c)
-        Mul(Add(a, b), c @ @const) => a.try_mul(c).ok()?.try_add(&b.try_mul(c).ok()?).ok(),
+        Mul(Add(a, b), c @ @const) => |a, b, c| a.try_mul(c).ok()?.try_add(&b.try_mul(c).ok()?).ok(),
     }
 }
 
@@ -253,18 +701,33 @@ pub fn advanced_division_dsl_patterns() -> PatternMatcher {
 /// - (x * c1) * c2 → x * (c1 * c2)
 /// - (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2)
 /// - (x + c1) - c2 → x + (c1 - c2) or x - (c2 - c1)
-pub fn alu_folding_dsl_patterns() -> PatternMatcher {
+/// - (x - c1) - c2 → x - (c1 + c2)
+/// - (x + c) + y → (x + y) + c (constant pushing, for index canonicalization)
+pub fn alu_folding_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
-        // (x + c1) + c2 → x + (c1 + c2)
-        Add(Add(x, c1 @const(c1_val)), c2 @const(c2_val))
+        // (x + c1) + c2 → x + (c1 + c2) - commutative outer Add
+        Add[Add[x, c1 @const(c1_val)], _c2 @const(c2_val)]
           => x.try_add(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
-        // (x * c1) * c2 → x * (c1 * c2)
-        Mul(Mul(x, c1 @const(c1_val)), c2 @const(c2_val))
+        // Constant pushing: (x + c) + y → (x + y) + c when y is NOT a const
+        // Based on Tinygrad's ((UPat.var("x") + UPat.cvar("c1")) + UPat.var("y"), lambda x,c1,y: (x+y)+c1)
+        // This ensures constants bubble to the outermost level for index extraction.
+        // Using commutative pattern to also match y + (x + c) and (c + x) + y cases.
+        // IMPORTANT: Use UOp::new directly instead of try_add() to avoid type promotion
+        // which could insert casts and create structurally different expressions.
+        Add[inner @ Add[x, c @const(c_val)], y] if !matches!(y.op(), Op::Const(_)) => {
+            // Create (x + y) directly preserving the inner Add's dtype
+            let xy = UOp::new(Op::Binary(BinaryOp::Add, Arc::clone(x), Arc::clone(y)), inner.dtype());
+            // Then add the constant
+            Some(UOp::new(Op::Binary(BinaryOp::Add, xy, UOp::const_(c.dtype(), c_val)), inner.dtype()))
+        },
+
+        // (x * c1) * c2 → x * (c1 * c2) - commutative outer Mul
+        Mul[Mul[x, c1 @const(c1_val)], _c2 @const(c2_val)]
           => x.try_mul(&UOp::const_(c1.dtype(), eval_mul_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
 
-        // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2) when result is negative
-        Add(Sub(x, c1 @const(c1_val)), c2 @const(c2_val)) => {
+        // (x - c1) + c2 → x + (c2 - c1) or x - (c1 - c2) - commutative outer Add
+        Add[Sub(x, c1 @const(c1_val)), _c2 @const(c2_val)] => {
             let diff_val = eval_sub_typed(c2_val, c1_val, c1.dtype().base())?;
             // Normalize: prefer x - |c| over x + (-c)
             if let ConstValue::Int(v) = diff_val && v < 0 {
@@ -275,7 +738,7 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
         },
 
         // (x + c1) - c2 → x + (c1 - c2) or x - (c2 - c1) when result is negative
-        Sub(Add(x, c1 @const(c1_val)), c2 @const(c2_val)) => {
+        Sub(Add(x, c1 @const(c1_val)), _c2 @const(c2_val)) => {
             let diff_val = eval_sub_typed(c1_val, c2_val, c1.dtype().base())?;
             // Normalize: prefer x - |c| over x + (-c)
             if let ConstValue::Int(v) = diff_val && v < 0 {
@@ -283,6 +746,10 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
             }
             x.try_add(&UOp::const_(c1.dtype(), diff_val)).ok()
         },
+
+        // (x - c1) - c2 → x - (c1 + c2)
+        Sub(Sub(x, c1 @const(c1_val)), _c2 @const(c2_val))
+          => x.try_sub(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
     }
 }
 
@@ -291,45 +758,74 @@ pub fn alu_folding_dsl_patterns() -> PatternMatcher {
 /// - RANGE with vmax ≤ 0 → Const(0)
 /// - END with dead ranges → remove dead ranges
 /// - REDUCE with all empty ranges → identity element
-pub fn dead_loop_patterns() -> PatternMatcher {
+pub fn dead_loop_patterns() -> TypedPatternMatcher {
     use crate::symbolic::dce::reduce_identity;
 
     /// Check if END has any dead ranges (for guard).
-    fn has_dead_ranges(end_op: &Rc<UOp>) -> bool {
+    fn has_dead_ranges(end_op: &Arc<UOp>) -> bool {
         if let Op::End { ranges, .. } = end_op.op() { ranges.iter().any(is_empty_range) } else { false }
     }
 
-    /// Check if all REDUCE ranges are empty (for guard).
-    fn all_ranges_empty(reduce_op: &Rc<UOp>) -> bool {
-        if let Op::Reduce { ranges, .. } = reduce_op.op() { ranges.iter().all(is_empty_range) } else { false }
+    /// Check if all REDUCE ranges are empty/dead (for guard).
+    /// Note: Empty ranges list means "no dimensions to reduce", NOT "all dead ranges".
+    /// We only return true when there ARE ranges and all of them are dead.
+    fn all_ranges_empty(reduce_op: &Arc<UOp>) -> bool {
+        if let Op::Reduce { ranges, .. } = reduce_op.op() {
+            !ranges.is_empty() && ranges.iter().all(is_empty_range)
+        } else {
+            false
+        }
     }
 
     /// Filter dead ranges from END, or unwrap if all dead.
-    fn filter_dead_ranges(end_op: &Rc<UOp>) -> Rc<UOp> {
+    fn filter_dead_ranges(end_op: &Arc<UOp>) -> Arc<UOp> {
         let Op::End { computation, ranges } = end_op.op() else { unreachable!("filter_dead_ranges called on non-End") };
 
-        let live_ranges: SmallVec<[Rc<UOp>; 4]> = ranges.iter().filter(|r| !is_empty_range(r)).cloned().collect();
+        let live_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.iter().filter(|r| !is_empty_range(r)).cloned().collect();
 
         if live_ranges.is_empty() {
             // All ranges dead - return computation directly
-            Rc::clone(computation)
+            Arc::clone(computation)
         } else {
             // Some ranges dead - create new END with only live ranges
-            UOp::end(Rc::clone(computation), live_ranges)
+            computation.end(live_ranges)
         }
     }
 
     /// Get identity element for REDUCE with all empty ranges.
-    fn reduce_to_identity(reduce_op: &Rc<UOp>) -> Rc<UOp> {
+    fn reduce_to_identity(reduce_op: &Arc<UOp>) -> Arc<UOp> {
         let Op::Reduce { reduce_op: op, .. } = reduce_op.op() else {
             unreachable!("reduce_to_identity called on non-Reduce")
         };
         reduce_identity(*op, reduce_op.dtype())
     }
 
+    /// Check if a Range is trivial (vmin == vmax), meaning only one value.
+    /// This matches Tinygrad's simplification: Range(Const) → Const when vmin == vmax.
+    fn is_trivial_range(uop: &Arc<UOp>) -> bool {
+        if let Op::Range { end, .. } = uop.op() {
+            // Only simplify when end is a constant
+            if matches!(end.op(), Op::Const(_)) {
+                let (vmin, vmax) = VminVmaxProperty::get(uop);
+                return vmin == vmax;
+            }
+        }
+        false
+    }
+
+    /// Get the constant value for a trivial range (vmin which equals vmax).
+    fn trivial_range_value(uop: &Arc<UOp>) -> Arc<UOp> {
+        let (vmin, _) = VminVmaxProperty::get(uop);
+        UOp::const_(uop.dtype(), *vmin)
+    }
+
     patterns! {
-        // RANGE with vmax ≤ 0 → Const(0)
+        // RANGE with vmax < 0 (empty/dead) → Const(0)
         r @ Range(_) if is_empty_range(r) ~> UOp::index_const(0),
+
+        // RANGE(Const) with vmin == vmax (trivial, e.g., end=1) → Const(vmin)
+        // Matches Tinygrad symbolic.py:211
+        r @ Range(_) if is_trivial_range(r) ~> trivial_range_value(r),
 
         // END with dead ranges → filter or unwrap
         end_op @ End(_, ..) if has_dead_ranges(end_op) ~> filter_dead_ranges(end_op),
@@ -348,32 +844,255 @@ pub fn dead_loop_patterns() -> PatternMatcher {
 /// - WHERE(x, true, false) → x (bool)
 /// - WHERE(x, false, true) → !x (bool)
 /// - WHERE(!cond, t, f) → WHERE(cond, f, t)
-pub fn dce_dsl_patterns() -> PatternMatcher {
+pub fn dce_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // WHERE with constant condition → select appropriate branch
-        Where(cond, true_val, false_val) => {
+        Where(cond, true_val, false_val) => |cond, true_val, false_val| {
             match VminVmaxProperty::get(cond) {
-                (ConstValue::Bool(true), ConstValue::Bool(true)) => Some(Rc::clone(true_val)),
-                (ConstValue::Bool(false), ConstValue::Bool(false)) => Some(Rc::clone(false_val)),
+                (ConstValue::Bool(true), ConstValue::Bool(true)) => Some(Arc::clone(true_val)),
+                (ConstValue::Bool(false), ConstValue::Bool(false)) => Some(Arc::clone(false_val)),
                 _ => None,
             }
         },
 
         // WHERE(_, same, same) → same
-        Where(_, t, t) ~> Rc::clone(t),
+        Where(_, t, t) ~> |t| Arc::clone(t),
 
         // WHERE(x, true, false) → x (for bool x)
-        Where(x, t @const(t_val), f @const(f_val))
+        Where(x, _t @const(t_val), _f @const(f_val))
           if x.dtype() == DType::Bool && t_val == ConstValue::Bool(true) && f_val == ConstValue::Bool(false)
-          ~> Rc::clone(x),
+          ~> |x| Arc::clone(x),
 
         // WHERE(x, false, true) → !x (for bool x)
-        Where(x, t @const(t_val), f @const(f_val))
+        Where(x, _t @const(t_val), _f @const(f_val))
           if x.dtype() == DType::Bool && t_val == ConstValue::Bool(false) && f_val == ConstValue::Bool(true)
-          ~> x.not(),
+          ~> |x| x.not(),
 
         // WHERE(!cond, t, f) → WHERE(cond, f, t) - negated condition swap
-        Where(Not(cond), t, f) => UOp::try_where(Rc::clone(cond), Rc::clone(f), Rc::clone(t)).ok(),
+        Where(Not(cond), t, f) => |cond, t, f| UOp::try_where(Arc::clone(cond), Arc::clone(f), Arc::clone(t)).ok(),
+
+        // WHERE(a, WHERE(b, c, d), d) → WHERE(a & b, c, d) - branch merging
+        Where(a, Where(b, c, d), d2) if Arc::ptr_eq(d, d2) => |a, b, c, d| {
+            let combined_cond = a.try_and_op(b).ok()?;
+            UOp::try_where(combined_cond, Arc::clone(c), Arc::clone(d)).ok()
+        },
+    }
+}
+
+/// AFTER simplification patterns (Tinygrad symbolic.py:256).
+///
+/// - AFTER(x, []) → x (empty deps, just passthrough)
+pub fn after_simplification_patterns() -> TypedPatternMatcher {
+    patterns! {
+        // AFTER(x, []) → x: empty dependencies means no ordering constraint
+        After { passthrough, deps } if deps.is_empty() ~> |passthrough| Arc::clone(passthrough),
+    }
+}
+
+/// Move WHERE condition to LOAD gate patterns (Tinygrad symbolic.py:360).
+///
+/// Transforms `WHERE(cond, LOAD(INDEX(buf, idx)), 0)` to `LOAD(INDEX(buf, idx, gate=cond), alt=0)`
+/// when the condition can be safely moved into the INDEX's gate field.
+///
+/// This optimization:
+/// 1. Eliminates the WHERE operation overhead
+/// 2. Enables hardware predication for masked loads
+/// 3. Allows the backend to generate efficient conditional load instructions
+///
+/// The condition can be moved if:
+/// - The INDEX doesn't already have a gate (or the condition matches it)
+/// - All RANGE dependencies in the condition are within the INDEX's range scope
+/// - The condition doesn't depend on other INDEX operations (avoids speculative loads)
+pub fn pm_move_where_on_load() -> TypedPatternMatcher {
+    patterns! {
+        // Pattern 1: WHERE(cond, LOAD(INDEX(buf, idx, None)), 0)
+        // Move cond into INDEX gate, set LOAD alt to 0
+        Where(cond, Load { buffer, index: _idx @ Index { buffer: idx_buf, indices, gate: None }, alt: None }, false_val)
+            if is_const_zero(false_val)
+            => |cond, buffer, idx_buf, indices, false_val| {
+                where_on_load_transform(cond, buffer, idx_buf, indices, None, false_val)
+            },
+
+        // Pattern 2: WHERE(cond, 0, LOAD(INDEX(buf, idx, None))) - inverted pattern
+        // Use !cond as the gate
+        Where(cond, false_val, Load { buffer, index: _idx @ Index { buffer: idx_buf, indices, gate: None }, alt: None })
+            if is_const_zero(false_val)
+            => |cond, false_val, buffer, idx_buf, indices| {
+                let not_cond = cond.not();
+                where_on_load_transform(&not_cond, buffer, idx_buf, indices, None, false_val)
+            },
+
+        // Pattern 3: WHERE(cond, LOAD(INDEX(buf, idx, existing_gate)), 0)
+        // Combine cond with existing gate if they're compatible
+        Where(cond, Load { buffer, index: _idx @ Index { buffer: idx_buf, indices, gate: Some(existing_gate) }, alt: None }, false_val)
+            if is_const_zero(false_val) && can_combine_gates(cond, existing_gate)
+            => |cond, buffer, idx_buf, indices, existing_gate, false_val| {
+                where_on_load_transform(cond, buffer, idx_buf, indices, Some(existing_gate), false_val)
+            },
+    }
+}
+
+/// Check if a value is constant zero.
+fn is_const_zero(val: &Arc<UOp>) -> bool {
+    match val.op() {
+        Op::Const(c) => match c.0 {
+            ConstValue::Int(0) => true,
+            ConstValue::UInt(0) => true,
+            ConstValue::Float(f) => f == 0.0,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Check if two gate conditions can be combined.
+///
+/// Gates can be combined if the new condition is a subset of or equal to the existing gate.
+/// For simplicity, we allow combination when:
+/// - The conditions are identical (Arc::ptr_eq)
+/// - The new condition implies the existing one (cond → existing)
+fn can_combine_gates(cond: &Arc<UOp>, existing_gate: &Arc<UOp>) -> bool {
+    // Same condition - already handled, no change needed
+    if Arc::ptr_eq(cond, existing_gate) {
+        return true;
+    }
+    // For now, be conservative - only combine identical gates
+    // A more sophisticated implementation would check implication
+    false
+}
+
+/// Transform WHERE(cond, LOAD(INDEX(buf, idx)), alt) to LOAD(INDEX(buf, idx, gate=cond), alt).
+///
+/// Supports **partial clause movement** (Tinygrad: pm_move_where_on_load):
+/// - Splits condition into AND clauses
+/// - Moves only clauses where ALL ranges are within index scope AND no load dependencies
+/// - Keeps remaining clauses in outer WHERE
+/// - Removes duplicate clauses (already present in existing gate)
+///
+/// # Safety Checks per clause
+///
+/// A clause can be moved if:
+/// 1. No duplicate with existing gate clauses (prevents redundant checks)
+/// 2. All RANGE ops in the clause are in the INDEX's scope
+/// 3. No LOAD/INDEX dependencies (prevents speculative load side effects)
+fn where_on_load_transform(
+    cond: &Arc<UOp>,
+    buffer: &Arc<UOp>,
+    idx_buf: &Arc<UOp>,
+    indices: &SmallVec<[Arc<UOp>; 4]>,
+    existing_gate: Option<&Arc<UOp>>,
+    alt: &Arc<UOp>,
+) -> Option<Arc<UOp>> {
+    // Step 1: Split condition into AND clauses
+    let c1_clauses = split_and_clauses(cond);
+
+    // Step 2: Get existing gate clauses (if any)
+    let c2_clauses: Vec<Arc<UOp>> = existing_gate.map(split_and_clauses).unwrap_or_default();
+
+    // Step 3: Find duplicate clauses (already in existing gate)
+    let duplicate_ids: std::collections::HashSet<u64> =
+        c1_clauses.iter().filter(|c| c2_clauses.iter().any(|c2| c.id == c2.id)).map(|c| c.id).collect();
+
+    // Step 4: Collect all RANGE ids reachable from indices (index scope)
+    let mut index_ranges = std::collections::HashSet::new();
+    for idx in indices {
+        for node in idx.toposort() {
+            if matches!(node.op(), Op::Range { .. }) {
+                index_ranges.insert(node.id);
+            }
+        }
+    }
+
+    // Step 5: Partition clauses into moveable vs remaining
+    let (moved_clauses, remaining_clauses): (Vec<_>, Vec<_>) = c1_clauses.iter().cloned().partition(|clause| {
+        // Skip duplicates
+        if duplicate_ids.contains(&clause.id) {
+            return true; // Treat as "moved" (but won't add to gate)
+        }
+
+        // Check all ranges in clause are within index scope
+        let clause_ranges_in_scope = clause
+            .toposort()
+            .iter()
+            .filter(|n| matches!(n.op(), Op::Range { .. }))
+            .all(|r| index_ranges.contains(&r.id));
+
+        if !clause_ranges_in_scope {
+            return false; // Cannot move - out of scope ranges
+        }
+
+        // Check no load dependencies
+        let has_loads = clause.toposort().iter().any(|n| matches!(n.op(), Op::Load { .. } | Op::Index { .. }));
+
+        !has_loads // Can move if no loads
+    });
+
+    // Step 6: If no movement possible and no duplicates removed, return None
+    let actually_moved: Vec<_> = moved_clauses.into_iter().filter(|c| !duplicate_ids.contains(&c.id)).collect();
+
+    if actually_moved.is_empty() && duplicate_ids.is_empty() {
+        return None; // Nothing to move or deduplicate
+    }
+
+    // Step 7: Build new gate (moved clauses + existing gate clauses)
+    let mut gate_clauses: Vec<Arc<UOp>> = actually_moved;
+    gate_clauses.extend(c2_clauses);
+
+    let new_gate =
+        if gate_clauses.is_empty() { None } else { Some(gate_clauses.into_iter().reduce(|a, b| a.and_(&b)).unwrap()) };
+
+    // Step 8: Create new INDEX with gate
+    let new_index = match new_gate {
+        Some(gate) => UOp::index().buffer(idx_buf.clone()).indices(indices.clone()).gate(gate).call(),
+        None => UOp::index().buffer(idx_buf.clone()).indices(indices.clone()).call(),
+    }
+    .expect("where_on_load: INDEX construction failed - types validated by pattern");
+
+    // Step 9: Infer load dtype from buffer
+    let load_dtype = match buffer.dtype() {
+        DType::Ptr { base, .. } => base.as_ref().clone(),
+        other => other,
+    };
+
+    // Step 10: Cast alt value to match load dtype
+    let alt_casted = alt.cast(load_dtype.clone());
+
+    // Step 11: Create new LOAD with alt value
+    let new_load = UOp::load().buffer(buffer.clone()).index(new_index).dtype(load_dtype).alt(alt_casted).call();
+
+    // Step 12: Wrap in remaining WHERE if there are non-moved clauses
+    if remaining_clauses.is_empty() {
+        Some(new_load)
+    } else {
+        // Build remaining condition from non-moved clauses
+        let remaining_cond = remaining_clauses.into_iter().reduce(|a, b| a.and_(&b)).unwrap();
+        UOp::try_where(remaining_cond, new_load, alt.clone()).ok()
+    }
+}
+
+/// Split a condition into its AND clauses recursively.
+fn split_and_clauses(cond: &Arc<UOp>) -> Vec<Arc<UOp>> {
+    match cond.op() {
+        Op::Binary(BinaryOp::And, left, right) => {
+            let mut result = split_and_clauses(left);
+            result.extend(split_and_clauses(right));
+            result
+        }
+        _ => vec![cond.clone()],
+    }
+}
+
+/// Cast pushing through WHERE patterns.
+///
+/// - where(s, a, b).cast(dtype) → where(s, a.cast(dtype), b.cast(dtype))
+pub fn cast_where_dsl_patterns() -> TypedPatternMatcher {
+    patterns! {
+        // cast(where(s, a, b), dtype) → where(s, cast(a, dtype), cast(b, dtype))
+        Cast { src: Where(s, a, b), dtype } => |s, a, b, dtype| {
+            let cast_a = a.cast(dtype.clone());
+            let cast_b = b.cast(dtype.clone());
+            UOp::try_where(s.clone(), cast_a, cast_b).ok()
+        },
     }
 }
 
@@ -383,12 +1102,14 @@ pub fn dce_dsl_patterns() -> PatternMatcher {
 /// - Self-comparison fast path (x op x)
 /// - Constant folding
 /// - Range-based analysis via vmin/vmax
-pub fn comparison_dsl_patterns() -> PatternMatcher {
+/// - Const offset: (c0 + x) < c1 → x < (c1 - c0)
+/// - Negation flip: -x < -y → y < x
+pub fn comparison_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         for op in binary [Lt, Eq, Ne] {
-            op(x, y) => {
+            op(x, y) => |x, y| {
                 // 1. Self-comparison fast path (non-float only)
-                if Rc::ptr_eq(x, y) && !x.dtype().is_float() {
+                if Arc::ptr_eq(x, y) && !x.dtype().is_float() {
                     let result = match op {
                         BinaryOp::Lt => ConstValue::Bool(false),
                         BinaryOp::Eq => ConstValue::Bool(true),
@@ -411,8 +1132,36 @@ pub fn comparison_dsl_patterns() -> PatternMatcher {
                 }
 
                 None
-            }
-        }
+            },
+        },
+
+        // (c0 + x) < c1 → x < (c1 - c0) for integers - commutative
+        Lt(Add[c0 @const(c0_val), x], _c1 @const(c1_val)) => |c0, c0_val, x, c1_val| {
+            let diff = eval_sub_typed(c1_val, c0_val, c0.dtype().base())?;
+            x.try_cmplt(&UOp::const_(c0.dtype(), diff)).ok()
+        },
+
+        // -x < -y → y < x (negation flip for Lt)
+        Lt(Neg(x), Neg(y)) => |x, y| y.try_cmplt(x).ok(),
+
+        // Phase 6: (x // d) < c → x < (c * d) when d > 0
+        // This lifts division out of comparisons, enabling further simplification.
+        // Based on Tinygrad's symbolic.py:229-230
+        Lt(Idiv(x, _d @const(d_val)), _c @const(c_val)) => |x, d_val, c_val| {
+            let ConstValue::Int(d_int) = d_val else { return None };
+            let ConstValue::Int(c_int) = c_val else { return None };
+            if d_int <= 0 { return None; }
+
+            // For x // d < c:
+            // - If c > 0: equivalent to x < c * d
+            // - If c <= 0: equivalent to x < c * d - (d - 1) = c * d - d + 1
+            let bound = if c_int > 0 {
+                c_int * d_int
+            } else {
+                c_int * d_int - (d_int - 1)
+            };
+            x.try_cmplt(&UOp::const_(x.dtype(), ConstValue::Int(bound))).ok()
+        },
     }
 }
 
@@ -420,12 +1169,49 @@ pub fn comparison_dsl_patterns() -> PatternMatcher {
 ///
 /// - !!x → x (double negation elimination)
 /// - x ^ x → 0 (xor self-cancellation)
-pub fn boolean_dsl_patterns() -> PatternMatcher {
+/// - x | !x → true (tautology)
+/// - x & !x → false (contradiction)
+/// - true | x → true, false & x → false
+/// - true & x → x, false | x → x (identity)
+/// - (!x) & (!y) → !(x | y) (De Morgan's law)
+/// - (!x) | (!y) → !(x & y) (De Morgan's law)
+pub fn boolean_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // !!x → x
-        Not(Not(x)) ~> Rc::clone(x),
+        Not(Not(x)) ~> |x| x.clone(),
         // x ^ x → 0
-        Xor(x, x) => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+        Xor(x, x) => |x| x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
+
+        // x | !x → true (tautology) - commutative
+        Or[x, Not(y)] if Arc::ptr_eq(x, y) && x.dtype() == DType::Bool
+          => |_x| Some(UOp::const_(DType::Bool, ConstValue::Bool(true))),
+
+        // x & !x → false (contradiction) - commutative
+        And[x, Not(y)] if Arc::ptr_eq(x, y) && x.dtype() == DType::Bool
+          => |_x| Some(UOp::const_(DType::Bool, ConstValue::Bool(false))),
+
+        // true | x → true (commutative)
+        Or[t @const(t_val), _] if t_val == ConstValue::Bool(true) ~> |t| t.clone(),
+
+        // false & x → false (commutative)
+        And[f @const(f_val), _] if f_val == ConstValue::Bool(false) ~> |f| f.clone(),
+
+        // true & x → x (identity, commutative)
+        And[_c @const(c_val), x] if c_val == ConstValue::Bool(true) ~> |x| x.clone(),
+
+        // false | x → x (identity, commutative)
+        Or[_c @const(c_val), x] if c_val == ConstValue::Bool(false) ~> |x| x.clone(),
+
+        // De Morgan's laws (Tinygrad: decompositions.py)
+        // (!x) & (!y) → !(x | y)
+        And[Not(x), Not(y)] => |x, y| {
+            Some(x.try_or_op(y).ok()?.not())
+        },
+
+        // (!x) | (!y) → !(x & y)
+        Or[Not(x), Not(y)] => |x, y| {
+            Some(x.try_and_op(y).ok()?.not())
+        },
     }
 }
 
@@ -433,10 +1219,10 @@ pub fn boolean_dsl_patterns() -> PatternMatcher {
 ///
 /// - max(x, x) → x
 /// - min(x, x) → x (via Min = negated Max)
-pub fn minmax_dsl_patterns() -> PatternMatcher {
+pub fn minmax_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // max(x, x) → x
-        Max(x, x) ~> Rc::clone(x),
+        Max(x, x) ~> |x| x.clone(),
     }
 }
 
@@ -444,21 +1230,298 @@ pub fn minmax_dsl_patterns() -> PatternMatcher {
 ///
 /// - x ** 0 → 1
 /// - x ** 1 → x
-pub fn power_dsl_patterns() -> PatternMatcher {
+pub fn power_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // x ** 0 → 1
-        Pow(x, c @const(c_val)) if c_val.is_zero() => x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
+        Pow(x, _c @const(c_val)) if c_val.is_zero() => |x| x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::one(dt))),
         // x ** 1 → x
-        Pow(x, c @const(c_val)) if c_val.is_one() ~> Rc::clone(x),
+        Pow(x, _c @const(c_val)) if c_val.is_one() ~> |x| x.clone(),
     }
 }
 
 /// Negation patterns.
 ///
 /// - -(-x) → x (double negation for arithmetic)
-pub fn negation_dsl_patterns() -> PatternMatcher {
+pub fn negation_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
         // Double arithmetic negation: -(-x) → x
-        Neg(Neg(x)) ~> Rc::clone(x),
+        Neg(Neg(x)) ~> |x| x.clone(),
+    }
+}
+
+/// GEP pushing patterns for devectorize pass.
+///
+/// Push GEP through ALU operations to simplify vector index extraction.
+/// Based on Tinygrad's gep_pushing (symbolic.py:153-176).
+///
+/// - GEP(GEP(x, inner), outer) → GEP(x, composed)
+/// - GEP(VECTORIZE(elements), [i]) → elements[i]
+/// - GEP(scalar, [0]) → scalar
+/// - GEP(VConst([...]), indices) → extracted element(s)
+/// - GEP(Binary(op, a, b), indices) → Binary(op, GEP(a), GEP(b))
+/// - GEP(Unary(op, x), indices) → Unary(op, GEP(x))
+/// - GEP(UNROLL(x, ...), indices) → GEP(x, indices)
+/// - GEP(x, [0,1,2,...,n-1]) → x (identity)
+pub fn gep_pushing_patterns() -> TypedPatternMatcher {
+    /// Check if VECTORIZE is a broadcast (all elements pointer-equal)
+    fn is_broadcast(elements: &SmallVec<[Arc<UOp>; 4]>) -> bool {
+        elements.first().is_some_and(|first| elements.iter().all(|e| Arc::ptr_eq(e, first)))
+    }
+
+    patterns! {
+        // 0. GEP on void: GEP(x, _) where x is void → x
+        // Removes GEP on GROUP, STORE, and other void-typed nodes.
+        // Matches Tinygrad: (UPat(Ops.GEP, src=(UPat(dtype=dtypes.void),)), lambda x: x)
+        Gep { vector, .. } if vector.dtype() == DType::Void ~> |vector| Arc::clone(vector),
+
+        // 1. GEP composition: GEP(GEP(x, inner), outer) → GEP(x, inner[outer])
+        // Note: nested struct patterns require UOp first field, so we extract inner manually
+        Gep { vector, indices } if matches!(vector.op(), Op::Gep { .. }) => |vector, indices| {
+            let Op::Gep { vector: inner_vec, indices: inner_indices } = vector.op() else { return None };
+            let composed: Vec<usize> = indices.iter()
+                .map(|&o| inner_indices.get(o).copied())
+                .collect::<Option<Vec<_>>>()?;
+            Some(inner_vec.gep(composed))
+        },
+
+        // 2. GEP through BROADCAST: extract scalar (MUST be before general VECTORIZE!)
+        // BROADCAST = VECTORIZE with all identical elements → GEP([x,x,x,x], [i]) → x
+        Gep { vector, indices } if indices.len() == 1 && matches!(vector.op(), Op::Vectorize { .. }) => |vector| {
+            let Op::Vectorize { elements } = vector.op() else { return None };
+            is_broadcast(elements).then(|| elements.first().cloned()).flatten()
+        },
+
+        // 3. GEP through VECTORIZE: extract single element
+        Gep { vector, indices } if indices.len() == 1 && matches!(vector.op(), Op::Vectorize { .. }) => |vector, indices| {
+            let Op::Vectorize { elements } = vector.op() else { return None };
+            elements.get(indices[0]).cloned()
+        },
+
+        // 4. GEP on scalar: GEP(x, [i]) where x is scalar → x
+        Gep { vector, indices } if vector.dtype().vcount() == 1 && indices.len() == 1 ~> |vector| Arc::clone(vector),
+
+        // 5. GEP through VConst: extract element(s)
+        Gep { vector, indices } if matches!(vector.op(), Op::VConst { .. }) => |vector, indices| {
+            let Op::VConst { values } = vector.op() else { return None };
+            let scalar_dtype = vector.dtype().scalar().map(DType::Scalar).unwrap_or(DType::Index);
+            if indices.len() == 1 {
+                values.get(indices[0]).map(|v| UOp::const_(scalar_dtype.clone(), *v))
+            } else {
+                let selected: Vec<_> = indices.iter().filter_map(|&i| values.get(i).cloned()).collect();
+                (selected.len() == indices.len()).then(|| UOp::vconst(selected))
+            }
+        },
+
+        // 6. Push GEP through Binary: GEP(Binary(op, a, b), indices) → Binary(op, GEP(a), GEP(b))
+        // Follows Tinygrad's approach (symbolic.py:165-168): result dtype is alu.dtype.scalar().vec(gep_count)
+        // Guard: skip pointer types to avoid creating invalid pointer ALU ops
+        Gep { vector, indices }
+            if !indices.is_empty()
+            && matches!(vector.op(), Op::Binary(..))
+            && !matches!(vector.dtype(), DType::Ptr { .. })
+            => |vector, indices| {
+                let Op::Binary(bin_op, a, b) = vector.op() else { return None };
+                let gep_a = a.gep(indices.clone());
+                let gep_b = b.gep(indices.clone());
+                // Guard: skip if result would be pointer type (edge case: vector of pointers)
+                if matches!(gep_a.dtype(), DType::Ptr { .. }) { return None; }
+                // Result dtype: derived from original op's dtype (works for comparisons and all other ops)
+                let gep_count = indices.len();
+                let scalar_base = vector.dtype().base();
+                let result_dtype = if gep_count > 1 {
+                    DType::Scalar(scalar_base).vec(gep_count)
+                } else {
+                    DType::Scalar(scalar_base)
+                };
+                Some(UOp::new(Op::Binary(*bin_op, gep_a, gep_b), result_dtype))
+            },
+
+        // 7. Push GEP through Unary: GEP(Unary(op, x), indices) → Unary(op, GEP(x))
+        // Guard: skip pointer types to avoid creating invalid pointer ALU ops
+        Gep { vector, indices }
+            if !indices.is_empty()
+            && matches!(vector.op(), Op::Unary(..))
+            && !matches!(vector.dtype(), DType::Ptr { .. })
+            => |vector, indices| {
+                let Op::Unary(un_op, x) = vector.op() else { return None };
+                let gep_x = x.gep(indices.clone());
+                // Guard: skip if result would be pointer type (edge case: vector of pointers)
+                if matches!(gep_x.dtype(), DType::Ptr { .. }) { return None; }
+                Some(UOp::new(Op::Unary(*un_op, gep_x.clone()), gep_x.dtype()))
+            },
+
+        // 7b. Push GEP through Ternary: GEP(Ternary(op, a, b, c), indices) → Ternary(op, GEP(a), GEP(b), GEP(c))
+        // Required for MulAcc (FMA) and WHERE to work with split_load (which creates CAT of 4-element loads)
+        // Guard: skip pointer types to avoid creating invalid pointer ALU ops
+        Gep { vector: Where(cond, t, f), indices }
+            if !indices.is_empty() && !matches!(cond.dtype(), DType::Ptr { .. })
+            => |cond, t, f, indices| {
+                let gep_cond = cond.gep(indices.clone());
+                let gep_t = t.gep(indices.clone());
+                let gep_f = f.gep(indices.clone());
+                // Guard: skip if result would be pointer type (edge case: vector of pointers)
+                if matches!(gep_t.dtype(), DType::Ptr { .. }) { return None; }
+                // WHERE dtype comes from true_val (same as false_val), not from condition
+                Some(UOp::new(Op::Ternary(TernaryOp::Where, gep_cond, gep_t.clone(), gep_f), gep_t.dtype()))
+            },
+        Gep { vector: MulAcc(a, b, c), indices }
+            if !indices.is_empty() && !matches!(a.dtype(), DType::Ptr { .. })
+            => |a, b, c, indices| {
+                let gep_a = a.gep(indices.clone());
+                let gep_b = b.gep(indices.clone());
+                let gep_c = c.gep(indices.clone());
+                // Guard: skip if result would be pointer type (edge case: vector of pointers)
+                if matches!(gep_a.dtype(), DType::Ptr { .. }) { return None; }
+                // try_mulacc validates matching dtypes; returns None if mismatched
+                UOp::try_mulacc(gep_a, gep_b, gep_c).ok()
+            },
+
+        // 8. GEP through UNROLL: GEP(UNROLL(x, ...), indices) → GEP(x, indices)
+        Gep { vector, indices } if matches!(vector.op(), Op::Unroll { .. }) => |vector, indices| {
+            let Op::Unroll { src, .. } = vector.op() else { return None };
+            Some(src.gep(indices.clone()))
+        },
+
+        // 9. Identity GEP removal: GEP(x, [0,1,2,...,n-1]) → x
+        Gep { vector, indices }
+            if indices.iter().enumerate().all(|(i, &idx)| i == idx)
+                && indices.len() == vector.dtype().vcount()
+            ~> |vector| Arc::clone(vector),
+
+        // 10. GEP through PTRCAT: GEP(PTRCAT([a, b, c, d]), [1, 3]) → PTRCAT([b, d])
+        Gep { vector, indices } if matches!(vector.op(), Op::PtrCat { .. }) => |vector, indices| {
+            let Op::PtrCat { sources } = vector.op() else { return None };
+            let reordered: Vec<_> = indices.iter().filter_map(|&idx| sources.get(idx).cloned()).collect();
+            (reordered.len() == indices.len()).then(|| UOp::ptrcat().sources(reordered).call())
+        },
+
+        // 11. GEP through CAT: Extract elements from concatenated vectors
+        // GEP(CAT([a<4>, b<4>]), [5]) → GEP(b, [1]) (element 5 = source 1, offset 1)
+        // Handles multi-element CAT sources by computing cumulative element offsets.
+        Gep { vector, indices } if matches!(vector.op(), Op::Cat { .. }) => |vector, indices| {
+            let Op::Cat { sources } = vector.op() else { return None };
+
+            // Build cumulative element counts: [0, count(src0), count(src0)+count(src1), ...]
+            let mut cumulative = Vec::with_capacity(sources.len() + 1);
+            cumulative.push(0usize);
+            for src in sources.iter() {
+                let prev = *cumulative.last().unwrap();
+                cumulative.push(prev + src.dtype().vcount());
+            }
+
+            // Map each element index to (source_idx, element_offset_within_source)
+            let extracted: Vec<_> = indices
+                .iter()
+                .filter_map(|&elem_idx| {
+                    // Binary search for the source containing this element
+                    let src_idx = cumulative.partition_point(|&c| c <= elem_idx).saturating_sub(1);
+                    let src = sources.get(src_idx)?;
+                    let offset_in_src = elem_idx - cumulative[src_idx];
+
+                    // Bounds check
+                    if offset_in_src >= src.dtype().vcount() {
+                        return None;
+                    }
+
+                    if src.dtype().vcount() == 1 {
+                        Some(src.clone())
+                    } else {
+                        Some(src.gep(vec![offset_in_src]))
+                    }
+                })
+                .collect();
+
+            if extracted.len() != indices.len() {
+                return None;
+            }
+
+            if extracted.len() == 1 {
+                Some(extracted.into_iter().next().unwrap())
+            } else {
+                Some(UOp::vectorize(extracted.into_iter().collect()))
+            }
+        },
+
+        // 12. GEP through CAST: GEP(CAST(x, dtype), indices) → CAST(GEP(x, indices), scalar_dtype)
+        // Allows GEP to propagate through type casts for better optimization.
+        Gep { vector, indices } if matches!(vector.op(), Op::Cast { .. }) => |vector, indices| {
+            let Op::Cast { src, dtype } = vector.op() else { return None };
+            let inner_gep = src.gep(indices.clone());
+            // Compute result dtype: use scalar version of target dtype
+            // (scalar_dtype() works for both Scalar and Vector, unlike scalar())
+            let result_scalar = dtype.scalar_dtype();
+            Some(inner_gep.cast(result_scalar))
+        },
+
+        // 13. GEP through BITCAST: GEP(BITCAST(x, dtype), indices) → BITCAST(GEP(x, indices), scalar_dtype)
+        // Allows GEP to propagate through bitcasts for better optimization.
+        Gep { vector, indices } if matches!(vector.op(), Op::BitCast { .. }) => |vector, indices| {
+            let Op::BitCast { src, dtype } = vector.op() else { return None };
+            let inner_gep = src.gep(indices.clone());
+            // Compute result dtype: use scalar version of target dtype
+            let result_scalar = dtype.scalar_dtype();
+            Some(inner_gep.bitcast(result_scalar))
+        },
+    }
+}
+
+/// Div/Mod recombination patterns.
+///
+/// Uses automatic ptr_eq checks via duplicate variable names in patterns.
+/// - x%n + (x//n)*n → x (div-mod identity)
+/// - ((x//a) % c) + (x // b) * c → x // a when a*c == b
+/// - (x % c1) * c2 + (x // c1) * c3 → x * c2 when c1*c2 == c3
+/// - y + (x % n) + (x // n) * n → y + x
+/// - (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division)
+pub fn div_mod_recombine_dsl_patterns() -> TypedPatternMatcher {
+    patterns! {
+        // x%n + (x//n)*n → x (div-mod identity)
+        // Note: duplicate variable names (x, n) auto-generate Arc::ptr_eq checks
+        Add[Mod(x, n), Mul[Idiv(x, n), n]]
+          ~> |x| Arc::clone(x),
+
+        // ((x//a) % c) + (x // b) * c → x // a
+        // Condition: a * c == b (divisor composition)
+        // Note: x appears twice, c appears twice → auto ptr_eq checks
+        Add[Mod(Idiv(x, a @const(a_val)), c @const(c_val)), Mul[Idiv(x, _b @const(b_val)), c]]
+          => |x, a, a_val, c_val, b_val| {
+            let ConstValue::Int(a_int) = a_val else { return None };
+            let ConstValue::Int(c_int) = c_val else { return None };
+            let ConstValue::Int(b_int) = b_val else { return None };
+            if a_int * c_int == b_int {
+                return x.try_div(a).ok();
+            }
+            None
+        },
+
+        // (x % c1) * c2 + (x // c1) * c3 → x * c2
+        // Condition: c1 * c2 == c3
+        // Note: x appears twice, c1 appears twice → auto ptr_eq checks
+        Add[Mul[Mod(x, c1 @const(c1_val)), c2 @const(c2_val)], Mul[Idiv(x, c1), _c3 @const(c3_val)]]
+          => |x, c1_val, c2, c2_val, c3_val| {
+            let ConstValue::Int(c1_int) = c1_val else { return None };
+            let ConstValue::Int(c2_int) = c2_val else { return None };
+            let ConstValue::Int(c3_int) = c3_val else { return None };
+            if c1_int * c2_int == c3_int {
+                return x.try_mul(c2).ok();
+            }
+            None
+        },
+
+        // y + (x % n) + (x // n) * n → y + x
+        // Note: x appears twice, n appears 3 times → auto ptr_eq for all
+        Add[Add[y, Mod(x, n)], Mul[Idiv(x, n), n]]
+          => |y, x| y.try_add(x).ok(),
+
+        // (a//c1 + c2) // c3 → (a + c1*c2) // (c1*c3) (nested division simplification)
+        // e.g., (a//2 + 1) // 2 → (a + 2) // 4
+        Idiv(Add[Idiv(a, c1 @const(c1_val)), _c2 @const(c2_val)], _c3 @const(c3_val)) => |a, c1, c1_val, c2_val, c3_val| {
+            // Compute c1 * c2 and c1 * c3
+            let c1_times_c2 = eval_mul_typed(c1_val, c2_val, c1.dtype().base())?;
+            let c1_times_c3 = eval_mul_typed(c1_val, c3_val, c1.dtype().base())?;
+            // (a + c1*c2) // (c1*c3)
+            a.try_add(&UOp::const_(c1.dtype(), c1_times_c2)).ok()?
+             .try_div(&UOp::const_(c1.dtype(), c1_times_c3)).ok()
+        },
     }
 }

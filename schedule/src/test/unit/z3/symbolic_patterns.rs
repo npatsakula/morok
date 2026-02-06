@@ -7,7 +7,7 @@
 use morok_dtype::DType;
 use morok_ir::types::ConstValue;
 use morok_ir::{Op, UOp};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::symbolic_simple;
@@ -28,7 +28,7 @@ fn test_identity_add_zero() {
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to x
-    assert!(Rc::ptr_eq(&simplified, &x), "x + 0 should simplify to x");
+    assert!(Arc::ptr_eq(&simplified, &x), "x + 0 should simplify to x");
 
     // Z3 verification
     verify_equivalence(&expr, &simplified).expect("x + 0 should equal x");
@@ -44,7 +44,7 @@ fn test_identity_mul_one() {
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
-    assert!(Rc::ptr_eq(&simplified, &x), "x * 1 should simplify to x");
+    assert!(Arc::ptr_eq(&simplified, &x), "x * 1 should simplify to x");
     verify_equivalence(&expr, &simplified).expect("x * 1 should equal x");
 }
 
@@ -58,7 +58,7 @@ fn test_identity_sub_zero() {
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
-    assert!(Rc::ptr_eq(&simplified, &x), "x - 0 should simplify to x");
+    assert!(Arc::ptr_eq(&simplified, &x), "x - 0 should simplify to x");
     verify_equivalence(&expr, &simplified).expect("x - 0 should equal x");
 }
 
@@ -72,7 +72,7 @@ fn test_identity_div_one() {
     let matcher = symbolic_simple();
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
-    assert!(Rc::ptr_eq(&simplified, &x), "x / 1 should simplify to x");
+    assert!(Arc::ptr_eq(&simplified, &x), "x / 1 should simplify to x");
     verify_equivalence(&expr, &simplified).expect("x / 1 should equal x");
 }
 
@@ -103,7 +103,7 @@ fn test_zero_mul_zero() {
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
-    assert!(Rc::ptr_eq(&simplified, &zero), "x * 0 should simplify to 0");
+    assert!(Arc::ptr_eq(&simplified, &zero), "x * 0 should simplify to 0");
     verify_equivalence(&expr, &simplified).expect("x * 0 should equal 0");
 }
 
@@ -118,7 +118,7 @@ fn test_zero_and_zero() {
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to 0
-    assert!(Rc::ptr_eq(&simplified, &zero), "x & 0 should simplify to 0");
+    assert!(Arc::ptr_eq(&simplified, &zero), "x & 0 should simplify to 0");
 
     // Note: Z3 verification for bitwise AND is not implemented in convert.rs
     // We skip Z3 verification for this test
@@ -127,7 +127,7 @@ fn test_zero_and_zero() {
 #[test]
 fn test_zero_div_x() {
     // 0 / x → 0 (verify semantically, for x ≠ 0)
-    let x = UOp::var("x", DType::Int32, 1, 100); // x ≠ 0
+    let x = UOp::var("x", DType::Int32, 1, 100); // x in [1, 100], avoiding div by zero
     let zero = UOp::native_const(0i32);
     let expr = zero.try_div(&x).unwrap();
 
@@ -153,7 +153,7 @@ fn test_self_sub_zero() {
 #[test]
 fn test_self_div_one() {
     // x / x → 1 (for x ≠ 0)
-    let x = UOp::var("x", DType::Int32, 1, 100); // x ≠ 0
+    let x = UOp::var("x", DType::Int32, 1, 100); // x in [1, 100], avoiding div by zero
     let expr = x.try_div(&x).unwrap();
 
     let matcher = symbolic_simple();
@@ -171,7 +171,7 @@ fn test_self_div_one() {
 #[test]
 fn test_self_mod_zero() {
     // x % x → 0 (for x ≠ 0)
-    let x = UOp::var("x", DType::Int32, 1, 100); // x ≠ 0
+    let x = UOp::var("x", DType::Int32, 1, 100); // x in [1, 100], avoiding div by zero
     let expr = x.try_mod(&x).unwrap();
 
     let matcher = symbolic_simple();
@@ -196,7 +196,7 @@ fn test_self_and_identity() {
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to x
-    assert!(Rc::ptr_eq(&simplified, &x), "x & x should simplify to x");
+    assert!(Arc::ptr_eq(&simplified, &x), "x & x should simplify to x");
 
     // Note: Z3 verification for bitwise AND is not implemented
     // We skip Z3 verification for this test
@@ -210,7 +210,7 @@ fn test_self_and_identity() {
 fn test_div_cancel_mul() {
     // (a * b) / b → a (for b ≠ 0)
     let a = UOp::var("a", DType::Int32, 0, 100);
-    let b = UOp::var("b", DType::Int32, 1, 100); // b ≠ 0
+    let b = UOp::var("b", DType::Int32, 1, 100); // b in [1, 100], avoiding div by zero
     let a_mul_b = a.try_mul(&b).unwrap();
     let expr = a_mul_b.try_div(&b).unwrap();
 
@@ -218,7 +218,7 @@ fn test_div_cancel_mul() {
     let simplified = graph_rewrite(&matcher, expr.clone(), &mut ());
 
     // Should simplify to a
-    assert!(Rc::ptr_eq(&simplified, &a), "(a * b) / b should simplify to a");
+    assert!(Arc::ptr_eq(&simplified, &a), "(a * b) / b should simplify to a");
     verify_equivalence(&expr, &simplified).expect("(a * b) / b should equal a");
 }
 
@@ -226,8 +226,8 @@ fn test_div_cancel_mul() {
 fn test_div_chain() {
     // (a / b) / c → a / (b * c) (for b, c ≠ 0)
     let a = UOp::var("a", DType::Int32, 0, 100);
-    let b = UOp::var("b", DType::Int32, 1, 10); // b ≠ 0
-    let c = UOp::var("c", DType::Int32, 1, 10); // c ≠ 0
+    let b = UOp::var("b", DType::Int32, 1, 10); // b in [1, 10], avoiding div by zero
+    let c = UOp::var("c", DType::Int32, 1, 10); // c in [1, 10], avoiding div by zero
     let a_div_b = a.try_div(&b).unwrap();
     let expr = a_div_b.try_div(&c).unwrap();
 
@@ -242,7 +242,7 @@ fn test_div_chain() {
 fn test_div_gcd_factor() {
     // (a * 6) / (b * 6) → a / b (for b ≠ 0)
     let a = UOp::var("a", DType::Int32, 0, 60);
-    let b = UOp::var("b", DType::Int32, 1, 10); // b ≠ 0
+    let b = UOp::var("b", DType::Int32, 0, 10); // b ≠ 0
     let six = UOp::native_const(6i32);
 
     let a_mul_6 = a.try_mul(&six).unwrap();
@@ -259,7 +259,7 @@ fn test_div_gcd_factor() {
 #[test]
 fn test_mod_self_zero() {
     // a % a → 0 (for a ≠ 0)
-    let a = UOp::var("a", DType::Int32, 1, 100); // a ≠ 0
+    let a = UOp::var("a", DType::Int32, 0, 100); // a ≠ 0
     let expr = a.try_mod(&a).unwrap();
 
     let matcher = symbolic_simple();
