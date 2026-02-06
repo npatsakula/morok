@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "rust";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-9ce5fe74.js";
+            window.path_to_searchindex_js = "../searchindex-403a6f69.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-23939a7d.js"></script>
+        <script src="../toc-6f19a375.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -180,129 +180,405 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="optimization-system"><a class="header" href="#optimization-system">Optimization System</a></h1>
-<p>Morok’s optimizer is built on pattern matching and graph rewriting.</p>
-<h2 id="upat-universal-pattern"><a class="header" href="#upat-universal-pattern">UPat: Universal Pattern</a></h2>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub enum UPat {
-    Match {
-        op: Option&lt;Vec&lt;OpFilter&gt;&gt;,      // Operations to match
-        dtype: Option&lt;Vec&lt;DType&gt;&gt;,      // Types to match
-        src: Option&lt;SrcPattern&gt;,        // Child patterns
-        arg: Option&lt;ArgPattern&gt;,        // Argument constraints
-        name: Option&lt;String&gt;,           // Binding name
-    },
-    Any(Vec&lt;UPat&gt;),  // OR-pattern
-}
-<span class="boring">}</span></code></pre>
-<h3 id="source-pattern-variants"><a class="header" href="#source-pattern-variants">Source Pattern Variants</a></h3>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub enum SrcPattern {
-    Tuple(Vec&lt;UPat&gt;),      // Fixed arity: Add(x, y)
-    Repeat(Box&lt;UPat&gt;),     // All match: Sink(stores..)
-    Fork(Vec&lt;Vec&lt;UPat&gt;&gt;),  // OR over arities
-    Permute(Vec&lt;UPat&gt;),    // Commutative: Add[x, y]
-}
-<span class="boring">}</span></code></pre>
-<h2 id="pattern-matching-algorithm"><a class="header" href="#pattern-matching-algorithm">Pattern Matching Algorithm</a></h2>
-<ol>
-<li><strong>Check operation type</strong> against <code>OpFilter</code></li>
-<li><strong>Check dtype</strong> against allowed list</li>
-<li><strong>Check argument</strong> via <code>ArgPredicate</code> (IsZero, IsOne, etc.)</li>
-<li><strong>Bind or verify</strong> named variables (pointer equality)</li>
-<li><strong>Match sources</strong> recursively based on <code>SrcPattern</code></li>
-</ol>
-<h3 id="commutative-matching"><a class="header" href="#commutative-matching">Commutative Matching</a></h3>
-<p>For <code>Add[x, @zero]</code>, both orderings are tried:</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>// Fast path for binary (n=2)
-if patterns[0].matches(children[0]) &amp;&amp; patterns[1].matches(children[1]) { return true; }
-if patterns[0].matches(children[1]) &amp;&amp; patterns[1].matches(children[0]) { return true; }
-<span class="boring">}</span></code></pre>
-<h2 id="patternmatcher-indexing"><a class="header" href="#patternmatcher-indexing">PatternMatcher Indexing</a></h2>
-<p>Patterns indexed by operation for O(1) lookup:</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>struct PatternMatcher&lt;C&gt; {
-    patterns: Vec&lt;(UPat, VarIntern, RewriteFn&lt;C&gt;)&gt;,
-    pdict: HashMap&lt;OpKey, Vec&lt;usize&gt;&gt;,  // op -&gt; pattern indices
-    wildcard_indices: Vec&lt;usize&gt;,       // patterns matching any op
-}
-<span class="boring">}</span></code></pre>
-<h2 id="rewrite-engine"><a class="header" href="#rewrite-engine">Rewrite Engine</a></h2>
-<p>Fixed-point iteration with 2-stage algorithm:</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>enum Stage { BottomUp, SourceReconstruction }
-
-fn rewrite(&amp;mut self, root: Rc&lt;UOp&gt;) -&gt; Rc&lt;UOp&gt; {
-    let mut stack = vec![(root, Stage::BottomUp)];
-    while let Some((uop, stage)) = stack.pop() {
-        match stage {
-            Stage::BottomUp =&gt; {
-                // Apply patterns, push children
-            }
-            Stage::SourceReconstruction =&gt; {
-                // Rebuild with rewritten children
-                // Apply patterns again (enables multi-stage opts)
-            }
-        }
-    }
-}
-<span class="boring">}</span></code></pre>
-<h3 id="multi-stage-example"><a class="header" href="#multi-stage-example">Multi-Stage Example</a></h3>
-<pre><code>WHERE(Lt(3, 5), t, f)
-  → [constant fold Lt] → WHERE(true, t, f)
-  → [DCE] → t
+                        <h1 id="pattern-based-optimization"><a class="header" href="#pattern-based-optimization">Pattern-Based Optimization</a></h1>
+<p>Open any production ML compiler and you’ll find dozens of optimization passes: constant folding, dead code elimination, operator fusion, loop tiling, vectorization, memory layout optimization. Each pass has its own data structures, its own traversal logic, its own bugs.</p>
+<p>Morok takes a different approach: <strong>one mechanism for everything</strong>.</p>
+<pre><code class="language-text">Traditional Compiler:              Morok:
+┌─────────────────────────┐       ┌─────────────────────────┐
+│  Constant Folding       │       │                         │
+│  Dead Code Elimination  │       │   patterns! {           │
+│  Loop Unrolling         │       │       Add[x, @zero] ~&gt; x│
+│  Operator Fusion        │       │       Mul[x, @zero] ~&gt; 0│
+│  Vectorization          │       │       // ...more        │
+│  Memory Planning        │       │   }                     │
+│  ...20 more passes      │       │                         │
+└─────────────────────────┘       │   graph_rewrite(...)    │
+     Custom logic each            └─────────────────────────┘
+                                       One mechanism
 </code></pre>
-<p>The reconstruction stage re-applies patterns, enabling cascading optimizations.</p>
+<p>Every optimization in Morok is expressed as a <strong>pattern</strong>: “when you see this structure, replace it with that structure.” The same <code>graph_rewrite()</code> function applies constant folding, converts movement ops to loops, optimizes memory access patterns, and lowers to hardware primitives.</p>
+<p>This chapter explains how pattern-based optimization works and why it’s powerful.</p>
+<hr>
 <h2 id="the-patterns-dsl"><a class="header" href="#the-patterns-dsl">The <code>patterns!</code> DSL</a></h2>
-<p>Proc-macro generates efficient Rust code:</p>
+<p>Morok provides a domain-specific language for writing optimization patterns. Here’s what it looks like:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>let matcher = patterns! {
-    // Commutative identity
-    Add[x, @zero] ~&gt; x,
+</span>patterns! {
+    // Identity folding: x + 0 → x
+    Add[x, @zero] ~&gt; |x| x.clone(),
 
-    // Constant folding with for-loop
-    for op in binary [Add, Mul, Sub] {
-        op(a @const(av), b @const(bv))
-          =&gt; eval_binary_op(op, av, bv).map(|r| UOp::const_(a.dtype(), r)),
-    },
+    // Constant folding: 3 + 4 → 7
+    Add(a @const(a_val), b @const(b_val))
+        =&gt; |a, a_val, b_val| eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
 
-    // Self-pattern (auto ptr_eq)
-    And(x, x) ~&gt; Rc::clone(x),
-};
+    // Self-folding: x / x → 1
+    Idiv(x, x) ~&gt; |x| UOp::one(x.dtype()),
+
+    // Dead code elimination: if(true) { t } else { f } → t
+    Where(@true, t, _f) ~&gt; |t| t.clone(),
+}
 <span class="boring">}</span></code></pre>
-<h3 id="compile-time-optimizations"><a class="header" href="#compile-time-optimizations">Compile-Time Optimizations</a></h3>
-<ol>
-<li><strong>Variable Index Resolution:</strong> Names → u8 indices at macro expansion</li>
-<li><strong>Duplicate Detection:</strong> <code>Add(x, x)</code> generates <code>Rc::ptr_eq</code> check</li>
-<li><strong>Binding Storage:</strong> <code>SmallVec&lt;[(u8, Rc&lt;UOp&gt;); 4]&gt;</code> (stack for ≤4 bindings)</li>
-</ol>
-<h2 id="optimization-categories"><a class="header" href="#optimization-categories">Optimization Categories</a></h2>
+<p>The macro compiles these patterns into efficient Rust code. Let’s break down the syntax:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Category</th><th>Patterns</th><th>Examples</th></tr>
+<tr><th>Syntax</th><th>Meaning</th><th>Example</th></tr>
 </thead>
 <tbody>
-<tr><td><strong>Constant Folding</strong></td><td>22</td><td><code>Add(3, 5) → 8</code></td></tr>
-<tr><td><strong>Identity</strong></td><td>8</td><td><code>x + 0 → x</code>, <code>x * 1 → x</code></td></tr>
-<tr><td><strong>Zero Propagation</strong></td><td>4</td><td><code>x * 0 → 0</code></td></tr>
-<tr><td><strong>Self-Folding</strong></td><td>6</td><td><code>x / x → 1</code>, <code>x &amp; x → x</code></td></tr>
-<tr><td><strong>ALU Folding</strong></td><td>4</td><td><code>(x + c1) + c2 → x + (c1+c2)</code></td></tr>
-<tr><td><strong>Division</strong></td><td>5</td><td><code>(a*b)/b → a</code></td></tr>
-<tr><td><strong>DCE</strong></td><td>6</td><td><code>WHERE(true, t, f) → t</code></td></tr>
-<tr><td><strong>Tensor Core</strong></td><td>3</td><td>TC matching, swizzle, apply</td></tr>
-<tr><td><strong>Vectorization</strong></td><td>-</td><td>Upcasting to float4, etc.</td></tr>
-<tr><td><strong>Loop Unrolling</strong></td><td>-</td><td>Reductions ≤ 32</td></tr>
+<tr><td><code>(x, y)</code></td><td><strong>Ordered.</strong> Match in exact order.</td><td><code>Sub(x, @zero) ~&gt; x</code></td></tr>
+<tr><td><code>[x, y]</code></td><td><strong>Commutative.</strong> Try both orderings.</td><td><code>Add[x, @zero] ~&gt; x</code></td></tr>
+<tr><td><code>@zero</code></td><td><strong>Zero constant.</strong> Matches 0 or 0.0.</td><td><code>Mul[_, z @ @zero] ~&gt; z</code></td></tr>
+<tr><td><code>@one</code></td><td><strong>One constant.</strong> Matches 1 or 1.0.</td><td><code>Mul[x, @one] ~&gt; x</code></td></tr>
+<tr><td><code>@const(val)</code></td><td><strong>Extract constant.</strong> Binds the value.</td><td><code>Add(@const(a), @const(b))</code></td></tr>
+<tr><td><code>x, x</code></td><td><strong>Same operand.</strong> Auto-generates ptr_eq check.</td><td><code>Idiv(x, x) ~&gt; UOp::one(...)</code></td></tr>
+<tr><td><code>~&gt;</code></td><td><strong>Infallible.</strong> Always succeeds, returns <code>Arc&lt;UOp&gt;</code>.</td><td><code>Add[x, @zero] ~&gt; x</code></td></tr>
+<tr><td><code>=&gt;</code></td><td><strong>Fallible.</strong> May fail, returns <code>Option&lt;Arc&lt;UOp&gt;&gt;</code>.</td><td><code>=&gt; eval(...).map(...)</code></td></tr>
+<tr><td><code>for op in binary [...]</code></td><td><strong>Template.</strong> Generate patterns for multiple ops.</td><td>See below</td></tr>
+<tr><td><code>@context Type</code></td><td><strong>Stateful.</strong> Access mutable context in patterns.</td><td>See below</td></tr>
 </tbody>
 </table>
 </div>
+<h3 id="template-expansion"><a class="header" href="#template-expansion">Template Expansion</a></h3>
+<p>Instead of writing the same pattern for every binary operation, use a for-loop:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>patterns! {
+    for op in binary [Add, Mul, Sub, Idiv, Fdiv, Max] {
+        op(a @const(a_val), b @const(b_val))
+            =&gt; |a, a_val, b_val| eval_binary(op, a_val, b_val)
+                .map(|r| UOp::const_(a.dtype(), r))
+    }
+}
+<span class="boring">}</span></code></pre>
+<p>This expands to six separate patterns at compile time—one for each operation.</p>
+<h3 id="stateful-patterns"><a class="header" href="#stateful-patterns">Stateful Patterns</a></h3>
+<p>Some optimizations need context (e.g., which kernel we’re in, what ranges are active). Declare a context type:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>patterns! {
+    @context KernelContext;
+
+    ReduceAxis { src } =&gt; |reduce, src, ctx| {
+        ctx.record_reduction(reduce);
+        transform_reduce(reduce, src, ctx)
+    }
+}
+<span class="boring">}</span></code></pre>
+<p>The context is passed as the last argument to pattern closures.</p>
+<hr>
+<h2 id="how-pattern-matching-works"><a class="header" href="#how-pattern-matching-works">How Pattern Matching Works</a></h2>
+<p>The <code>patterns!</code> macro generates a <code>SimplifiedPatternMatcher</code> that dispatches patterns in <strong>O(1)</strong> time.</p>
+<h3 id="the-opkey-index"><a class="header" href="#the-opkey-index">The OpKey Index</a></h3>
+<p>Every UOp has an operation type (Add, Mul, Load, etc.). The <code>#[derive(PatternEnum)]</code> macro generates an <code>OpKey</code> enum that maps operations to hashable keys:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub enum OpKey {
+    Binary(BinaryOp),    // Add, Mul, Sub, ...
+    Unary(UnaryOp),      // Neg, Sqrt, Exp, ...
+    Ternary(TernaryOp),  // Where, MulAcc
+    Const,
+    Load,
+    Store,
+    // ... one variant per operation category
+}
+<span class="boring">}</span></code></pre>
+<h3 id="the-matcher-structure"><a class="header" href="#the-matcher-structure">The Matcher Structure</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct SimplifiedPatternMatcher&lt;C = ()&gt; {
+    indexed: HashMap&lt;OpKey, Vec&lt;PatternClosure&lt;C&gt;&gt;&gt;,  // O(1) lookup
+    wildcards: Vec&lt;PatternClosure&lt;C&gt;&gt;,                 // patterns matching any op
+}
+<span class="boring">}</span></code></pre>
+<p>When matching a UOp:</p>
+<ol>
+<li><strong>Extract OpKey</strong> from the UOp’s operation</li>
+<li><strong>Lookup</strong> in the HashMap—O(1)</li>
+<li><strong>Try each closure</strong> until one matches</li>
+<li><strong>Fall back</strong> to wildcards if no indexed pattern matches</li>
+</ol>
+<p>This is 5-10x faster than scanning all patterns linearly.</p>
+<h3 id="commutative-handling"><a class="header" href="#commutative-handling">Commutative Handling</a></h3>
+<p>For patterns like <code>Add[x, @zero]</code>, the macro generates code that tries both orderings:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Try (x, @zero)
+if let Some(result) = try_match_ordered(&amp;children[0], &amp;children[1]) {
+    return result;
+}
+// Try (@zero, x)
+if let Some(result) = try_match_ordered(&amp;children[1], &amp;children[0]) {
+    return result;
+}
+<span class="boring">}</span></code></pre>
+<h3 id="duplicate-detection"><a class="header" href="#duplicate-detection">Duplicate Detection</a></h3>
+<p>When you write <code>Idiv(x, x)</code>, the pattern should only match if both operands are the <em>same</em> UOp (pointer equality, not structural equality). The macro automatically generates this check:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Generated code for Idiv(x, x)
+let x = &amp;children[0];
+let x_dup = &amp;children[1];
+if !Arc::ptr_eq(x, x_dup) {
+    return NoMatch;
+}
+// ... rest of pattern
+<span class="boring">}</span></code></pre>
+<p>This leverages hash consing—identical subexpressions share the same pointer.</p>
+<hr>
+<h2 id="the-rewrite-engine-two-stage-algorithm"><a class="header" href="#the-rewrite-engine-two-stage-algorithm">The Rewrite Engine: Two-Stage Algorithm</a></h2>
+<p>Pattern matching alone isn’t enough. Consider this expression:</p>
+<pre><code class="language-text">WHERE(Lt(3, 5), t, f)
+</code></pre>
+<p>To simplify it, we need two steps:</p>
+<ol>
+<li><code>Lt(3, 5)</code> → <code>true</code> (constant folding)</li>
+<li><code>WHERE(true, t, f)</code> → <code>t</code> (dead code elimination)</li>
+</ol>
+<p>But the <code>WHERE</code> pattern won’t match until its child is simplified. The rewrite engine solves this with a <strong>two-stage algorithm</strong>.</p>
+<h3 id="stage-0-pattern-application"><a class="header" href="#stage-0-pattern-application">Stage 0: Pattern Application</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>fn rewrite_stage0(&amp;mut self, uop: &amp;Arc&lt;UOp&gt;) -&gt; RewriteResult {
+    match self.matcher.try_match(uop) {
+        Some(replacement) =&gt; RewriteResult::Rewritten(replacement),
+        None =&gt; RewriteResult::Gate(uop.clone()),  // process children
+    }
+}
+<span class="boring">}</span></code></pre>
+<p>If no pattern matches, return <code>Gate</code>—a signal to process children first.</p>
+<h3 id="stage-1-source-reconstruction"><a class="header" href="#stage-1-source-reconstruction">Stage 1: Source Reconstruction</a></h3>
+<p>After children are rewritten, rebuild the node with new children and try patterns again:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>fn rewrite_stage1(&amp;mut self, uop: &amp;Arc&lt;UOp&gt;, new_children: Vec&lt;Arc&lt;UOp&gt;&gt;) {
+    // Rebuild with optimized children
+    let rebuilt = uop.with_sources(new_children);
+
+    // Try patterns again—might match now!
+    match self.matcher.try_match(&amp;rebuilt) {
+        Some(replacement) =&gt; replacement,
+        None =&gt; rebuilt,
+    }
+}
+<span class="boring">}</span></code></pre>
+<h3 id="the-magic-cascading-optimizations"><a class="header" href="#the-magic-cascading-optimizations">The Magic: Cascading Optimizations</a></h3>
+<pre><code class="language-text">Stage 0: WHERE(Lt(3, 5), t, f)     → Gate (no match, process children)
+         └── Lt(3, 5)              → true (constant folding matches!)
+
+Stage 1: WHERE(true, t, f)         → t (dead code elimination matches!)
+</code></pre>
+<p>The reconstruction stage re-applies patterns, enabling multi-step optimizations in a single traversal.</p>
+<h3 id="safety-limits"><a class="header" href="#safety-limits">Safety Limits</a></h3>
+<p>To prevent infinite loops, the engine has limits:</p>
+<ul>
+<li><strong>1000 iterations</strong> per node maximum</li>
+<li><strong>100,000 iterations</strong> total maximum</li>
+<li>Panics with diagnostic info if limits exceeded</li>
+</ul>
+<p>In practice, well-formed patterns converge quickly.</p>
+<hr>
+<h2 id="the-full-optimization-pipeline"><a class="header" href="#the-full-optimization-pipeline">The Full Optimization Pipeline</a></h2>
+<p>Pattern matching is one part of a larger pipeline. When you call <code>tensor.realize()</code>, here’s what happens:</p>
+<pre><code class="language-text">Tensor.realize()
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  RANGEIFY                                               │
+│  Convert movement ops (RESHAPE, PERMUTE, EXPAND)        │
+│  into explicit RANGE loops with INDEX operations        │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  KERNEL SPLITTING                                       │
+│  Split computation graph at STORE boundaries            │
+│  Each STORE becomes a separate kernel                   │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  FOR EACH KERNEL:                                       │
+│                                                         │
+│  1. Symbolic Simplification (algebraic patterns)        │
+│                                                         │
+│  2. Scheduler Creation                                  │
+│     └── Convert LOOP → GLOBAL for GPU parallelization   │
+│                                                         │
+│  3. Kernel Optimization (heuristic OR beam search)      │
+│     ├── Tensor Cores (WMMA) for matmul                  │
+│     ├── Vectorization (UPCAST)                          │
+│     ├── Loop Unrolling (UNROLL)                         │
+│     ├── GPU Local Memory (LOCAL)                        │
+│     ├── Grouped Reductions (GROUP)                      │
+│     └── Threading (THREAD) for CPU                      │
+│                                                         │
+│  4. Post-Optimization Passes                            │
+│     ├── Devectorize (memory coalescing)                 │
+│     ├── Expand (UNROLL → vector operations)             │
+│     ├── FMA Decomposition (a*b+c → MulAcc)              │
+│     └── Bool Storage (cast bool↔uint8 for memory)       │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  CODE GENERATION                                        │
+│  Render optimized AST to LLVM IR, compile, execute      │
+└─────────────────────────────────────────────────────────┘
+</code></pre>
+<p>Each box uses pattern-based rewriting. The difference is which patterns are applied:</p>
+<ul>
+<li><strong>Rangeify</strong>: Movement op → BUFFERIZE + INDEX patterns</li>
+<li><strong>Symbolic</strong>: Algebraic simplification patterns</li>
+<li><strong>Post-opt</strong>: Memory access optimization patterns</li>
+</ul>
+<hr>
+<h2 id="kernel-optimization-heuristics-vs-beam-search"><a class="header" href="#kernel-optimization-heuristics-vs-beam-search">Kernel Optimization: Heuristics vs Beam Search</a></h2>
+<p>After symbolic simplification, each kernel needs <em>scheduling decisions</em>: how to tile loops, where to parallelize, whether to use tensor cores. Morok offers two strategies.</p>
+<h3 id="heuristics-default"><a class="header" href="#heuristics-default">Heuristics (Default)</a></h3>
+<p>The heuristic optimizer applies optimizations in a fixed order:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub fn hand_coded_optimizations(scheduler: &amp;mut Scheduler) {
+    // 1. Tensor cores (if matmul pattern detected)
+    if let Some(tc) = detect_tensor_core_pattern(scheduler) {
+        apply_tensor_core(scheduler, tc);
+        return;  // TC handles everything
+    }
+
+    // 2. Grouped reductions (two-stage for large reductions)
+    apply_grouped_reduction_if_needed(scheduler);
+
+    // 3. Vectorization (UPCAST output dimensions)
+    apply_upcast(scheduler, 4);
+
+    // 4. GPU local memory (workgroup dimensions)
+    apply_local_dims(scheduler);
+
+    // 5. CPU threading
+    apply_threading(scheduler);
+}
+<span class="boring">}</span></code></pre>
+<p><strong>Pros</strong>: Fast (~50ms per kernel), predictable, no hardware measurement needed.</p>
+<p><strong>Cons</strong>: May miss optimization opportunities, fixed heuristics don’t adapt to workload.</p>
+<h3 id="beam-search-optional"><a class="header" href="#beam-search-optional">Beam Search (Optional)</a></h3>
+<p>For production workloads, beam search finds better schedules:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub fn beam_search(scheduler: Scheduler, config: BeamConfig) -&gt; Scheduler {
+    let mut beam = vec![scheduler];
+
+    for iteration in 0..config.max_iterations {
+        let mut candidates = vec![];
+
+        for state in &amp;beam {
+            // Generate all valid next actions
+            for action in generate_actions(state) {
+                if let Ok(next) = state.apply(action) {
+                    candidates.push(next);
+                }
+            }
+        }
+
+        // Compile and time each candidate
+        let timed: Vec&lt;_&gt; = candidates.par_iter()
+            .map(|c| (c, measure_kernel_time(c)))
+            .collect();
+
+        // Keep top K by execution time
+        beam = timed.into_iter()
+            .sorted_by_key(|(_, time)| *time)
+            .take(config.beam_width)
+            .map(|(c, _)| c)
+            .collect();
+    }
+
+    beam.into_iter().next().unwrap()
+}
+<span class="boring">}</span></code></pre>
+<p>The action space includes ~500 predefined actions:</p>
+<ul>
+<li><code>UPCAST(axis, amount)</code> — vectorize output dimension</li>
+<li><code>UNROLL(axis, amount)</code> — unroll reduction loop</li>
+<li><code>LOCAL(axis, amount)</code> — use GPU shared memory</li>
+<li><code>GROUP(axis, amount)</code> — two-stage reduction</li>
+<li><code>THREAD(axis, amount)</code> — CPU parallelization</li>
+<li><code>SWAP(axis1, axis2)</code> — reorder global dimensions</li>
+</ul>
+<p><strong>Pros</strong>: Finds near-optimal schedules, adapts to hardware.</p>
+<p><strong>Cons</strong>: Minutes per kernel (but results are cached by AST hash).</p>
+<h3 id="configuration"><a class="header" href="#configuration">Configuration</a></h3>
+<pre><code class="language-bash"># Disable optimization (debugging)
+MOROK_NOOPT=1 cargo run
+
+# Enable beam search with width 8
+MOROK_BEAM=8 cargo run
+</code></pre>
+<p>Or programmatically:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let config = OptimizerConfig::builder()
+    .strategy(OptStrategy::Beam { width: 8 })
+    .build();
+
+tensor.realize_with(config)?;
+<span class="boring">}</span></code></pre>
+<hr>
+<h2 id="comparison-how-other-compilers-optimize"><a class="header" href="#comparison-how-other-compilers-optimize">Comparison: How Other Compilers Optimize</a></h2>
+<p>Different ML compilers take different approaches to optimization:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Aspect</th><th>XLA</th><th>TVM/Ansor</th><th>Triton</th><th><strong>Morok</strong></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Philosophy</strong></td><td>Fixed heuristics</td><td>Search-based</td><td>Programmer-guided</td><td>Pattern-based</td></tr>
+<tr><td><strong>Fusion</strong></td><td>Conservative rules</td><td>Tile-and-fuse</td><td>Block-level</td><td>Graph rewriting</td></tr>
+<tr><td><strong>Auto-tuning</strong></td><td>None</td><td>Evolutionary + cost model</td><td>Grid search</td><td>Beam search</td></tr>
+<tr><td><strong>Tuning cost</strong></td><td>0</td><td>Hours</td><td>Minutes</td><td>Minutes (cached)</td></tr>
+<tr><td><strong>Flexibility</strong></td><td>Low</td><td>High</td><td>Medium</td><td>High</td></tr>
+<tr><td><strong>Transparency</strong></td><td>Low (C++ passes)</td><td>Medium (Python)</td><td>Medium (DSL)</td><td>High (patterns!)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="xla--production-conservative"><a class="header" href="#xla--production-conservative">XLA — Production Conservative</a></h3>
+<p>XLA uses fixed heuristics for fusion decisions. Safe and predictable, but leaves performance on the table. The fusion rules are hard-coded in C++—extending them requires deep compiler knowledge.</p>
+<h3 id="tvmansor--maximum-auto-tuning"><a class="header" href="#tvmansor--maximum-auto-tuning">TVM/Ansor — Maximum Auto-Tuning</a></h3>
+<p>TVM separates <em>what</em> to compute from <em>how</em> to compute it. Ansor uses evolutionary search with a learned cost model to explore the schedule space. Can achieve best-in-class performance, but tuning takes hours per model.</p>
+<h3 id="triton--programmer-guided"><a class="header" href="#triton--programmer-guided">Triton — Programmer-Guided</a></h3>
+<p>Triton exposes a Python-like DSL where you write blocked algorithms explicitly. The compiler handles register allocation and memory management. Good balance of control and automation, but requires GPU programming expertise.</p>
+<h3 id="morok--pattern-composition"><a class="header" href="#morok--pattern-composition">Morok — Pattern Composition</a></h3>
+<p>Morok’s insight: express optimizations as composable patterns. Each pattern is local and verifiable. Complex optimizations emerge from composition. Beam search adds auto-tuning when needed, with results cached for reuse.</p>
+<hr>
+<h2 id="why-this-matters-practical-benefits"><a class="header" href="#why-this-matters-practical-benefits">Why This Matters: Practical Benefits</a></h2>
+<p>Pattern-based optimization has concrete advantages for developers:</p>
+<p><strong>Debugging is direct.</strong> Patterns are readable code. Add a <code>println!</code> to any pattern to trace when it fires:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>patterns! {
+    Add[x, @zero] ~&gt; |x| {
+        println!("Folding add-zero: {:?}", x);
+        x.clone()
+    }
+}
+<span class="boring">}</span></code></pre>
+<p><strong>Extensibility is easy.</strong> Adding a custom optimization is two lines:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>patterns! {
+    // Your domain-specific optimization
+    MyOp(x, y) if is_special_case(x, y) ~&gt; transform(x, y)
+}
+<span class="boring">}</span></code></pre>
+<p>No need to understand compiler internals, write visitors, or modify pass managers.</p>
+<p><strong>Correctness is local.</strong> Each pattern is a small theorem: “if this structure appears, replacing it with that structure preserves semantics.” Verify each pattern independently. Composition of correct patterns yields correct programs.</p>
+<p><strong>Performance is tunable.</strong> O(1) pattern dispatch is fast by default. Enable beam search for production workloads. Cache results by AST hash—tune once, benefit forever.</p>
+<hr>
+<h2 id="the-deeper-insight"><a class="header" href="#the-deeper-insight">The Deeper Insight</a></h2>
+<p>Pattern matching trades generality for composability.</p>
+<p>A general-purpose optimization pass can do anything—but that’s exactly the problem. It’s hard to verify, hard to extend, hard to compose with other passes. Ordering matters. Interactions are subtle.</p>
+<p>A pattern is constrained: it matches a specific structure and produces a specific replacement. But constraints enable composition. Run patterns in any order—the result converges to the same fixed point. Add new patterns without breaking existing ones. Delete patterns without cascading failures.</p>
+<p>Each pattern is a theorem about semantic equivalence. The rewrite engine is a theorem prover, finding derivations from input to optimized output. Correctness follows from the correctness of individual steps.</p>
+<p>This is the Unix philosophy applied to compilers: small, focused tools that compose. Pattern-based optimization won’t solve every problem—but for the problems it solves, it solves them elegantly.</p>
 
                     </main>
 
@@ -312,6 +588,9 @@ fn rewrite(&amp;mut self, root: Rc&lt;UOp&gt;) -&gt; Rc&lt;UOp&gt; {
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
+                            <a rel="next prefetch" href="../architecture/op-bestiary.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
 
                         <div style="clear: both"></div>
                     </nav>
@@ -323,6 +602,9 @@ fn rewrite(&amp;mut self, root: Rc&lt;UOp&gt;) -&gt; Rc&lt;UOp&gt; {
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
+                    <a rel="next prefetch" href="../architecture/op-bestiary.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
             </nav>
 
         </div>

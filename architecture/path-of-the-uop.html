@@ -1,0 +1,1297 @@
+<!DOCTYPE HTML>
+<html lang="en" class="rust sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Path of the UOp - Morok</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "rust";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-403a6f69.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-6f19a375.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('rust')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Morok</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/patsak/morok" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/patsak/morok/edit/main/book/src/architecture/path-of-the-uop.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="path-of-the-uop-the-22-stage-codegen-pipeline"><a class="header" href="#path-of-the-uop-the-22-stage-codegen-pipeline">Path of the UOp: The 22-Stage Codegen Pipeline</a></h1>
+<p>A UOp starts as a high-level tensor expression. By the time it reaches the hardware, it has been transformed through 22 distinct stages—each with a specific purpose, each building on the last. This chapter traces that journey.</p>
+<p>The pipeline is a proven design for tensor compilation. Understanding it means understanding how tensor expressions become machine code.</p>
+<hr>
+<h2 id="how-to-read-this-chapter"><a class="header" href="#how-to-read-this-chapter">How to Read This Chapter</a></h2>
+<p>If you’re not a compiler engineer, this chapter might seem intimidating. Here’s what you need to understand before diving in.</p>
+<h3 id="key-concepts"><a class="header" href="#key-concepts">Key Concepts</a></h3>
+<p><strong>UOp (Micro-Operation)</strong></p>
+<ul>
+<li>Think of it as a node in a flowchart representing one computation</li>
+<li>Example: <code>ADD(a, b)</code> means “add a and b”</li>
+</ul>
+<p><strong>Pattern</strong></p>
+<ul>
+<li>A find-and-replace rule for code structures (not text)</li>
+<li>Example: “If you see ADD(x, 0), replace with x”</li>
+<li>Patterns fire repeatedly until no more matches (fixpoint)</li>
+</ul>
+<p><strong>Range</strong></p>
+<ul>
+<li>A loop iteration: <code>RANGE(0..10)</code> means “for i from 0 to 10”</li>
+</ul>
+<p><strong>AxisType</strong></p>
+<ul>
+<li>What kind of loop is this?
+<ul>
+<li>Global: Parallel across GPU blocks / CPU threads</li>
+<li>Local: Parallel within a workgroup</li>
+<li>Reduce: Accumulator (sum, max, etc.)</li>
+<li>Loop: Sequential iteration</li>
+</ul>
+</li>
+</ul>
+<p><strong>Stage</strong></p>
+<ul>
+<li>One transformation pass through the code</li>
+<li>Patterns fire until fixpoint, then move to the next stage</li>
+</ul>
+<h3 id="reading-strategy"><a class="header" href="#reading-strategy">Reading Strategy</a></h3>
+<ol>
+<li><strong>First pass</strong>: Read just the “What This Does” and “Why This Matters” sections</li>
+<li><strong>Second pass</strong>: Look at the diagrams and examples</li>
+<li><strong>Third pass</strong> (if you want details): Read the pattern descriptions</li>
+</ol>
+<h3 id="questions-to-ask"><a class="header" href="#questions-to-ask">Questions to Ask</a></h3>
+<p>For each stage, ask:</p>
+<ul>
+<li>What does this stage accomplish? (High-level goal)</li>
+<li>Why do we need this stage? (Motivation)</li>
+<li>What would go wrong without it? (Consequences)</li>
+</ul>
+<hr>
+<h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
+<p>The 22 stages fall into four phases:</p>
+<pre><code class="language-text">Tensor Expression
+       │
+       ▼
+┌─────────────────────────────────────┐
+│ RANGEIFY (Stages 1-7)               │
+│ Movement ops → Explicit loops       │
+│                                     │
+│ [Make iteration explicit,           │
+│  optimize ranges]                   │
+└─────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────┐
+│ EXPANDER (Stages 8-10)              │
+│ UNROLL/UPCAST → Explicit vectors    │
+│                                     │
+│ [Expand optimization primitives]    │
+└─────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────┐
+│ DEVECTORIZER (Stages 11-15)         │
+│ Vector ops → Scalar code            │
+│                                     │
+│ [Lower to hardware-specific ops]    │
+└─────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────┐
+│ LINEARIZER (Stages 16-22)           │
+│ IR → Linear instruction sequence    │
+│                                     │
+│ [Serialize to executable code]      │
+└─────────────────────────────────────┘
+       │
+       ▼
+  Machine Code
+</code></pre>
+<p>Each stage applies pattern-based rewrites. Patterns fire until fixpoint, then the next stage begins.</p>
+<hr>
+<h2 id="phase-1-rangeify"><a class="header" href="#phase-1-rangeify">Phase 1: Rangeify</a></h2>
+<p><strong>Goal</strong>: Transform high-level movement operations into explicit loop structures and optimize ranges.</p>
+<hr>
+<h3 id="stage-1-early-movement-ops"><a class="header" href="#stage-1-early-movement-ops">Stage 1: Early Movement Ops</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Clean up movement operations before range assignment
+<strong>Key Patterns</strong>: Movement on INDEX, movement through wrappers, nested INDEX simplification
+<strong>Impact</strong>: Prevents missed optimizations later in the pipeline</p>
+</blockquote>
+<p><strong>What This Does</strong>: This stage cleans up movement operations by pushing index manipulations into places where they’re actually needed. Think of it as organizing your desk before filing papers—move instructions closer to where the data is used.</p>
+<p><strong>Why This Matters</strong>: Movement operations (RESHAPE, PERMUTE, etc.) are convenient abstractions, but the hardware needs concrete index calculations. By cleaning them up early, we ensure patterns in later stages can match correctly.</p>
+<p><strong>Pattern</strong>: <code>pm_mops + pm_syntactic_sugar</code> (bottom-up)</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Pattern</th><th>Transformation</th><th>Visual</th><th>Location</th></tr>
+</thead>
+<tbody>
+<tr><td>Movement on INDEX</td><td>Apply movement to index expressions</td><td><code>INDEX(PERMUTE(arr), [i, j]) → INDEX(arr, [j, i])</code></td><td><code>movement_op_patterns()</code></td></tr>
+<tr><td>Movement through AFTER</td><td>Move RESHAPE through timing wrapper (Tinygrad-specific)</td><td><code>AFTER(RESHAPE(x, arg), [dep1, dep2]) → RESHAPE(AFTER(x, [dep2]), arg)</code></td><td>Tinygrad only</td></tr>
+<tr><td>Movement through END</td><td>Unwrap movement from END wrapper (Tinygrad-specific)</td><td><code>END(RESHAPE(x), ranges) → END(x, ranges)</code></td><td>Tinygrad only</td></tr>
+<tr><td>Nested INDEX simplification</td><td>Remove redundant nested INDEX (Morok)</td><td><code>INDEX(INDEX(ptr, [i]), [i]) → INDEX(ptr, [i])</code></td><td><code>movement_op_patterns()</code></td></tr>
+<tr><td>Nested INDEX concat</td><td>Flatten nested INDEX for PtrDType</td><td><code>INDEX(INDEX(ptr, i), j) → INDEX(ptr, i, j)</code></td><td><code>pm_syntactic_sugar</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Why bottom-up?</strong> Child nodes must be clean before parents can match. Movement ops nest deeply; cleaning from bottom prevents missed patterns.</p>
+<p><strong>Note</strong>: Tinygrad and Morok have different approaches here. Tinygrad moves movement ops through wrappers (AFTER, END) because it re-applies movement ops during bufferization. Morok removes movement ops entirely by transforming indices during bufferization, so AFTER/END patterns are not needed.</p>
+<p><strong>Morok</strong>: <code>movement_op_patterns()</code> in <code>rangeify/patterns.rs</code></p>
+<hr>
+<h3 id="stage-2-load-collapse"><a class="header" href="#stage-2-load-collapse">Stage 2: Load Collapse</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Eliminate REDUCE operations by detecting range-independent computation
+<strong>Key Patterns</strong>: Bounded sum, gated load collapse, general reduce elimination
+<strong>Impact</strong>: Converts loop iterations to arithmetic operations</p>
+</blockquote>
+<p><strong>What This Does</strong>: Eliminates REDUCE operations by recognizing when the computation can be done without iteration. Uses range-independent computation detection and symbolic simplification.</p>
+<p><strong>Why This Matters</strong>: Reducing iterations to arithmetic operations eliminates loop overhead. Instead of running a loop 1000 times, compute the answer directly.</p>
+<p><strong>Pattern</strong>: <code>pm_load_collapse</code></p>
+<pre><code class="language-text">// Before: Sum with bounds check
+sum(1 for k in 0..64 if k &gt;= length)
+
+// After: Compute count directly (NO LOOP!)
+count = clamp(64 - length, 0, 64)
+</code></pre>
+<p>The mechanism works by:</p>
+<ol>
+<li>Identifying subexpressions that don’t depend on the REDUCE range</li>
+<li>Creating DEFINE_VAR for those subexpressions (treats as loop-invariant)</li>
+<li>Substituting the range with DEFINE_VAR and running symbolic simplification</li>
+<li>If the simplified expression has no more ranges, the REDUCE is eliminated</li>
+</ol>
+<p><strong>Note</strong>: WHERE movement through INDEX (<code>pm_move_where_on_load</code> in Stage 8) is a separate optimization that places conditionals before loads to skip memory accesses, but it doesn’t eliminate REDUCE operations.</p>
+<p><strong>Morok</strong>: <code>pm_load_collapse()</code> in <code>rangeify/patterns.rs</code></p>
+<hr>
+<h3 id="stage-3-split-ranges"><a class="header" href="#stage-3-split-ranges">Stage 3: Split Ranges</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Enable better optimization through divmod decomposition
+<strong>Key Patterns</strong>: Split ranges with modulo, flatten ranges
+<strong>Impact</strong>: Inner ranges can vectorize, outer can parallelize</p>
+</blockquote>
+<p><strong>What This Does</strong>: Handles modulo patterns by splitting a range into outer and inner components.</p>
+<p><strong>Why This Matters</strong>: Splitting ranges is like dividing a large task among team members. If you have 12 items and each person does 4, you get 3 people × 4 items. Inner loops (one person’s 4 items) can be fast; outer loops (3 people) can run in parallel.</p>
+<p><strong>Pattern</strong>: <code>pm_split_ranges + pm_flatten_range</code></p>
+<pre><code class="language-text">Before:  RANGE(end=12) % 4  // One loop with modulo (slow)
+             ↓ [Split into outer × inner]
+After:   RANGE(end=3) * 4 + RANGE(end=4)
+            ↑outer        ↑inner
+            Parallel      Sequential
+</code></pre>
+<p>This enables:</p>
+<ul>
+<li>Inner ranges can vectorize (SIMD)</li>
+<li>Outer ranges can parallelize (GPU blocks / CPU threads)</li>
+</ul>
+<p><code>pm_flatten_range</code> merges nested ranges on REDUCE/STORE/END when beneficial.</p>
+<p><strong>Context</strong>: Requires dictionary context (<code>ctx={}</code>) to track substitutions at SINK.</p>
+<p><strong>Note</strong>: The split only applies when <code>end % mod == 0</code> (divisibility check).</p>
+<p><strong>Morok</strong>: <code>pm_split_ranges()</code> + <code>pm_flatten_range()</code> in <code>rangeify/transforms.rs</code></p>
+<hr>
+<h3 id="stage-4-initial-symbolic"><a class="header" href="#stage-4-initial-symbolic">Stage 4: Initial Symbolic</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Simplify expressions using algebra rules
+<strong>Key Patterns</strong>: Constant folding, identity removal, div-mod recombine
+<strong>Impact</strong>: Eliminates expensive operations, reduces code size</p>
+</blockquote>
+<p><strong>What This Does</strong>: Applies 100+ constant folding and algebraic simplification rules.</p>
+<p><strong>Why This Matters</strong>: Computers are fast at simple math. Dividing and taking remainders are slow operations. This stage uses algebra rules to eliminate slow operations whenever possible.</p>
+<p><strong>Pattern</strong>: <code>sym + pm_flatten_range</code></p>
+<p><strong>Constant folding</strong>:</p>
+<pre><code class="language-text">ADD(CONST(2), CONST(3)) → CONST(5)
+MUL(x, CONST(1)) → x
+ADD(x, CONST(0)) → x
+</code></pre>
+<p><strong>Div-mod recombination</strong>:</p>
+<pre><code class="language-text">(x / c) * c + (x % c) → x
+</code></pre>
+<p><em>Why?</em> Computes the same value as <code>x</code> but with 3 operations instead of 1. This pattern finds and removes the redundancy (common in stride calculations).</p>
+<p><strong>Boolean algebra</strong>:</p>
+<pre><code class="language-text">x AND x → x
+x OR FALSE → x
+NOT(NOT(x)) → x
+</code></pre>
+<p><strong>Additional categories</strong>:</p>
+<ul>
+<li>Identity removal (self-folding, redundant operations)</li>
+<li>Comparison simplification</li>
+<li>Cast optimization</li>
+<li>GEP pushing (move address calculations through ALUs)</li>
+<li>Where folding (combine WHERE with same conditions)</li>
+<li>Reduce mul chain (move multiplications outside reduce)</li>
+</ul>
+<p><strong>Morok</strong>: <code>symbolic_patterns()</code> in <code>symbolic/patterns.rs</code></p>
+<hr>
+<h3 id="stage-5-simplify-ranges"><a class="header" href="#stage-5-simplify-ranges">Stage 5: Simplify Ranges</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Merge adjacent ranges to reduce loop overhead
+<strong>Key Patterns</strong>: Range merging with cost analysis
+<strong>Impact</strong>: Fewer loops = less overhead</p>
+</blockquote>
+<p><strong>What This Does</strong>: Merges adjacent ranges when profitable.</p>
+<p><strong>Why This Matters</strong>: Merging ranges is like combining multiple small trips into one big one. Instead of going to the store 4 times for 4 items, go once for all 4 items. Saves the overhead of starting and stopping.</p>
+<p><strong>Pattern</strong>: <code>pm_simplify_ranges</code></p>
+<pre><code class="language-text">// Before: two separate ranges
+RANGE(0..4), RANGE(0..8)
+
+// After: merged (if compatible)
+RANGE(0..32)
+</code></pre>
+<p>Merge criteria:</p>
+<ol>
+<li>Axis types must be compatible (both output, both reduce, etc.)</li>
+<li>REDUCE scope must remain consistent</li>
+<li><strong>Cost-based</strong>: Accept only if divmod operation count does not increase</li>
+</ol>
+<p>The compiler only merges if it saves operations. Merging might require division/modulo to recalculate indices. If that costs more than it saves, merge is skipped.</p>
+<p><strong>Morok</strong>: <code>simplify_merge_adjacent()</code> in <code>rangeify/transforms.rs</code></p>
+<hr>
+<h3 id="stage-6-split-store-cpu-only"><a class="header" href="#stage-6-split-store-cpu-only">Stage 6: Split Store (CPU-only)</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Avoid branch misprediction by splitting conditional stores
+<strong>Key Patterns</strong>: Split store ranges at comparison boundaries
+<strong>Impact</strong>: More predictable CPU execution</p>
+</blockquote>
+<p><strong>What This Does</strong>: Splits store ranges at conditional boundaries when there are <code>CMPLT(range, const)</code> comparisons in the store’s consumer map.</p>
+<p><strong>Why This Matters</strong>: Branch misprediction slows down CPUs. Instead of one loop with an <code>if</code> statement that the CPU can’t predict, we create two loops without conditionals. Each loop does predictable work, so the CPU stays fast.</p>
+<p><strong>Pattern</strong>: <code>pm_split_store</code></p>
+<pre><code class="language-text">// Before: Store with conditional (branch misprediction risk)
+for i in 0..100:
+    if i &lt; 50:
+        output[i] = data[i]
+
+// After: Two unconditional stores (predictable)
+for i in 0..50:   // First loop
+    output[i] = data[i]
+for i in 50..100: // Second loop
+    output[i] = data[i]
+</code></pre>
+<p>The transformation finds constant comparison points in the store’s consumer map and creates disjoint ranges for each segment.</p>
+<p>Skipped for GPU devices—they handle conditionals differently.</p>
+<p><strong>Morok</strong>: <code>pm_split_store()</code> in <code>rangeify/transforms.rs</code></p>
+<hr>
+<h3 id="stage-7-apply-opts"><a class="header" href="#stage-7-apply-opts">Stage 7: Apply Opts</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Find optimal combination of vectorization, unrolling, memory usage
+<strong>Key Algorithm</strong>: Beam search or heuristics
+<strong>Impact</strong>: Can significantly improve performance</p>
+</blockquote>
+<p><strong>What This Does</strong>: The optimization search—either beam search or heuristic—explores different combinations of optimization actions.</p>
+<p><strong>Why This Matters</strong>: The compiler tries different combinations of optimizations (vectorize here? unroll there?) and picks the fastest. Finding the right combination can make code 10x faster.</p>
+<p><strong>Function</strong>: <code>apply_opts(sink, renderer)</code></p>
+<p><strong>Optimization actions</strong>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Action</th><th>Effect</th><th>Hardware Target</th></tr>
+</thead>
+<tbody>
+<tr><td></td><td>TC</td><td>Enable tensor core usage</td></tr>
+<tr><td></td><td>UPCAST</td><td>Vectorize a dimension</td></tr>
+<tr><td></td><td>LOCAL</td><td>Use local/shared memory</td></tr>
+<tr><td></td><td>UNROLL</td><td>Unroll a loop dimension</td></tr>
+<tr><td></td><td>GROUP</td><td>Group operations for cache</td></tr>
+<tr><td></td><td>GROUPTOP</td><td>Group for reduce ops</td></tr>
+<tr><td></td><td>THREAD</td><td>Thread-based parallelism</td></tr>
+<tr><td></td><td>NOLOCALS</td><td>Disable local memory usage</td></tr>
+<tr><td></td><td>SWAP</td><td>Swap range assignments</td></tr>
+<tr><td></td><td>PADTO</td><td>Pad for alignment</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Optimization Search Explained</strong>:</p>
+<p>The compiler searches for the best combination:</p>
+<ul>
+<li><strong>Heuristic mode</strong> (BEAM=0): Fast hand-coded optimization patterns, no compilation</li>
+<li><strong>Beam search</strong> (BEAM≥1): Compiles and runs candidates to measure actual performance</li>
+</ul>
+<pre><code class="language-text">Optimization Search:
+├── Heuristic mode (BEAM=0): Hand-coded optimizations
+└── Beam search (BEAM≥1):
+    ├── Generate all possible actions (193 combinations)
+    ├── Apply to all top-K candidates in parallel
+    ├── Filter based on constraints
+    ├── Compile and run each candidate → Measure actual time
+    └── Pick fastest
+</code></pre>
+<p><strong>Note</strong>: NOLOCALS is a constraint that sets <code>dont_use_locals = True</code>, preventing further LOCAL actions and affecting shared memory usage decisions.</p>
+<p><strong>Morok</strong>: <code>optimizer/mod.rs</code>, <code>optimizer/opts.rs</code></p>
+<hr>
+<h2 id="phase-2-expander"><a class="header" href="#phase-2-expander">Phase 2: Expander</a></h2>
+<p><strong>Goal</strong>: Transform optimization primitives (UNROLL/UPCAST) into explicit operations.</p>
+<hr>
+<h3 id="stage-8-post-opt-symbolic"><a class="header" href="#stage-8-post-opt-symbolic">Stage 8: Post-Opt Symbolic</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Symbolic simplification after optimization
+<strong>Key Patterns</strong>: WHERE movement, constant folding
+<strong>Impact</strong>: Enables better load combining and vectorization</p>
+</blockquote>
+<p><strong>What This Does</strong>: Symbolic simplification after optimization, plus WHERE movement.</p>
+<p><strong>Why This Matters</strong>: WHERE operations are like <code>if</code> statements. This stage moves <code>if</code> checks from after a load to before the load. Hardware can skip loading when the condition is false, saving memory bandwidth.</p>
+<p><strong>Pattern</strong>: <code>sym + pm_move_where_on_load</code></p>
+<pre><code class="language-text">// Before: WHERE guards a load
+WHERE(valid, LOAD(index), alt)
+
+// After: validity moved to INDEX
+LOAD(INDEX(ptr, idx, valid=valid), alt)
+</code></pre>
+<p>Moving validity into INDEX enables better load combining and vectorization.</p>
+<p><strong>Note</strong>: This pattern only matches when the alternative value is <code>0</code>. The transformation involves complex clause analysis: duplicate detection, range dependency checks, and data-dependent load verification.</p>
+<p><strong>Note</strong>: The Morok implementation uses <code>gate=</code> instead of <code>valid=</code> (the Index struct has a <code>gate</code> field). The concept is identical.</p>
+<p><strong>Morok</strong>: <code>pm_move_where_on_load()</code> in <code>symbolic/patterns.rs</code></p>
+<hr>
+<h3 id="stage-9-expander"><a class="header" href="#stage-9-expander">Stage 9: Expander</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Convert UNROLL/UPCAST to explicit operations
+<strong>Key Concepts</strong>: UNROLL, CONTRACT, pattern order
+<strong>Impact</strong>: Makes vectorization explicit and ready for hardware</p>
+</blockquote>
+<p><strong>What This Does</strong>: Transforms UNROLL/UPCAST optimization primitives into explicit operations.</p>
+<p><strong>Why This Matters</strong>: UPCAST and UNROLL mark intent—what we want to do. This stage makes that intent explicit so the hardware can actually do it.</p>
+<p><strong>Pattern</strong>: <code>sym + pm_pre_expander + pm_group_for_reduce + expander</code></p>
+<p>⚠️ <strong>Important: Pattern Precedence</strong></p>
+<p>The patterns are combined and run to fixpoint. The order affects which pattern is tried first when multiple could match:</p>
+<ol>
+<li><code>sym</code> first (symbolic simplification)</li>
+<li><code>pm_pre_expander</code> second (converts UPCAST/UNROLL ranges)</li>
+<li><code>pm_group_for_reduce</code> third (handles GROUP_REDUCE axis)</li>
+<li><code>expander</code> last (main expansion)</li>
+</ol>
+<p>Wrong precedence can cause incorrect vectorization or reduction scoping.</p>
+<p><strong>UNROLL and CONTRACT</strong>:</p>
+<p>UNROLL and CONTRACT work together:</p>
+<pre><code class="language-text">UNROLL: "Take this one thing and make N copies for different positions"
+Example:  x → [x_0, x_1, x_2, x_3]
+
+CONTRACT: "Take these N things and combine them back"
+Example:  [a, b, c, d] → one vector containing all four
+</code></pre>
+<p>Together: UPCAST marks intent to vectorize → UNROLL expands → CONTRACT combines.</p>
+<p><strong>UPCAST range → VECTORIZE</strong>:</p>
+<pre><code class="language-text">// Before: UPCAST marks vectorization intent
+RANGE(end=4, UPCAST)
+      ↓ [pm_pre_expander]
+// Step 1: Convert to UNROLL with constant indices
+UNROLL(VCONST([0, 1, 2, 3]))
+      ↓ [expander]
+// Step 2: Expand operations with UNROLL sources
+// Operations now have unrolled sources
+      ↓ [CONTRACT or implicit]
+// After: explicit VECTORIZE
+VECTORIZE(op[0], op[1], op[2], op[3])
+</code></pre>
+<p><strong>UNROLL range → repeated operations</strong>:</p>
+<p>When we say “operations duplicated,” it sounds like copy-paste. But that’s not what happens. The compiler creates a single SIMD instruction that processes all N elements together. Think of a SIMD register as a box holding 4 numbers; adding two boxes adds all 8 numbers at once.</p>
+<pre><code class="language-text">// Before: UPCAST marks vectorization intent
+RANGE(end=3, UPCAST)
+      ↓ [pm_pre_expander]
+// Step 1: Convert to UNROLL
+UNROLL(VCONST([0, 1, 2]))
+      ↓ [expander]
+// Step 2: Operations expand to handle all positions
+// After: operations processed together (not duplicated)
+UNROLL([op_at_0, op_at_1, op_at_2])
+</code></pre>
+<p><strong>UNROLL/END/CONTRACT interaction</strong>:</p>
+<pre><code class="language-text">Before: END(STORE(...), [RANGE(UPCAST)])
+             ↓ [pm_pre_expander]
+Step 1: END(STORE(...), [UNROLL(VCONST([0,1,2,3]))])
+             ↓ [expander]
+Step 2: END(CONTRACT(STORE(...×4)), [])
+</code></pre>
+<p><strong>Broadcast through AFTER/END</strong>:</p>
+<pre><code class="language-text">// Broadcast VECTORIZE (all elements identical)
+AFTER(VECTORIZE([x, x, x, x]), deps) → VECTORIZE([AFTER(x, deps), AFTER(x, deps), ...])
+</code></pre>
+<p><strong>GROUP_REDUCE Handling</strong> (<code>pm_group_for_reduce</code>):</p>
+<p>GROUP_REDUCE is a special axis type for tensor core reductions:</p>
+<pre><code class="language-text">// Before: REDUCE with GROUP_REDUCE ranges
+REDUCE(src, [range(GROUP_REDUCE)])
+           ↓ [pm_group_for_reduce]
+// After: Shared memory reduction pattern
+1. Track upstream LOCAL ranges
+2. BUFFERIZE result with group ranges (AddrSpace.LOCAL)
+3. INDEX into buffer with transformed ranges
+4. Final REDUCE with axes (range_id+100, AxisType.REDUCE)
+</code></pre>
+<p>This enables efficient tensor core accumulation via shared memory.</p>
+<p><strong>Morok</strong>: <code>expand.rs</code></p>
+<hr>
+<h3 id="stage-10-add-local-buffers"><a class="header" href="#stage-10-add-local-buffers">Stage 10: Add Local Buffers</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Prepare buffers for fast memory (shared / L1)
+<strong>Key Patterns</strong>: Bufferize with locals, extract hints
+<strong>Impact</strong>: Frequently-accessed data stays in fast memory</p>
+</blockquote>
+<p><strong>What This Does</strong>: Prepares buffers for local memory usage and applies codegen-specific cleanups.</p>
+<p><strong>Why This Matters</strong>: <strong>Local buffers</strong> = fast memory close to the compute unit:</p>
+<ul>
+<li>GPU: Shared memory (LDS) — 100x faster than global memory</li>
+<li>CPU: L1 cache — 10x faster than main memory</li>
+</ul>
+<p>The compiler moves frequently-accessed data to local buffers, similar to keeping important files on your desktop instead of a network drive.</p>
+<p><strong>Pattern</strong>: <code>pm_add_buffers_local + rangeify_codegen</code></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Transform</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>bufferize_to_store</code></td><td>Convert BUFFERIZE with <code>allow_locals=true</code></td></tr>
+<tr><td><code>get_contiguous</code></td><td>Extract optimization hints from CONTIGUOUS</td></tr>
+<tr><td>NOOP removal</td><td>Clean up no-op operations</td></tr>
+<tr><td>Strip arg from STORE</td><td>Remove redundant arguments</td></tr>
+<tr><td>Fix broadcast dtype</td><td>Ensure consistent types in broadcasts</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Morok</strong>: <code>rangeify/kernel.rs</code></p>
+<hr>
+<h2 id="phase-3-devectorizer"><a class="header" href="#phase-3-devectorizer">Phase 3: Devectorizer</a></h2>
+<p><strong>Goal</strong>: Lower from hardware-agnostic vectors to hardware-specific instructions.</p>
+<hr>
+<h3 id="stage-11-remove-reduce"><a class="header" href="#stage-11-remove-reduce">Stage 11: Remove Reduce</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Convert declarative REDUCE to imperative accumulation
+<strong>Key Patterns</strong>: Reduce to accumulator, horizontal reduction
+<strong>Impact</strong>: Maps to hardware reduction instructions</p>
+</blockquote>
+<p><strong>What This Does</strong>: Converts high-level REDUCE to accumulator pattern.</p>
+<p><strong>Why This Matters</strong>: A declarative “sum these values” needs to become imperative instructions: initialize accumulator, loop, add each value.</p>
+<p><strong>Pattern</strong>: <code>pm_reduce + gep_pushing</code></p>
+<pre><code class="language-text">// Before: declarative reduction
+REDUCE(Add, values, range)
+
+// After: imperative accumulation
+acc = DEFINE_REG(0.0)
+for i in range:
+    acc = ADD(acc, values[i])
+</code></pre>
+<p><strong>Horizontal reduction</strong>:</p>
+<p>Before we loop through a reduction dimension, we first combine neighboring values. This creates larger reductions that map better to hardware instructions.</p>
+<pre><code class="language-text">Before:  [a, b, c, d, e, f, g, h]  // 8 values
+             ↓ [Horizontal reduction]
+Step 1:  [a+e, b+f, c+g, d+h]      // 4 partial sums
+             ↓ [Accumulator pattern]
+After:   acc = acc + (a+e) + (b+f) + (c+g) + (d+h)
+</code></pre>
+<p><strong>GEP pushing</strong> pushes GEP (get element pointer) operations through ALUs for better vectorization:</p>
+<pre><code class="language-text">GEP(ADD(ptr_a, ptr_b), idx) → ADD(GEP(ptr_a, idx), GEP(ptr_b, idx))
+</code></pre>
+<p><em>Why?</em> Enables SIMD on the two GEPs (can be computed in parallel).</p>
+<p><strong>WMMA Tensor Core Fusion</strong>:</p>
+<pre><code class="language-text">// Fuse tensor core accumulation inline
+WMMA(a, b, c) + add → WMMA(a, b, c + add)
+</code></pre>
+<p>This pattern enables efficient FMA-style accumulation on NVIDIA tensor cores.</p>
+<p><strong>Morok</strong>: <code>devectorize.rs</code></p>
+<hr>
+<h3 id="stage-12-add-gpu-dims"><a class="header" href="#stage-12-add-gpu-dims">Stage 12: Add GPU Dims</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Map abstract ranges to GPU thread indices
+<strong>Key Patterns</strong>: Range to SPECIAL replacement
+<strong>Impact</strong>: Enables parallel execution on GPU</p>
+</blockquote>
+<p><strong>What This Does</strong>: Replaces ranges with GPU thread indices.</p>
+<p><strong>Why This Matters</strong>: GPUs have hard limits: max 1024 threads per block, max 48KB shared memory. If your computation needs 2000 threads, the compiler must split it into multiple blocks. Dimension limiting handles this automatically.</p>
+<p><strong>Pattern</strong>: <code>pm_add_gpudims</code></p>
+<pre><code class="language-text">// Before: abstract range
+RANGE(end=256, Global)
+
+// After: GPU-specific
+SPECIAL(gidx0)  // global thread index
+</code></pre>
+<p><strong>Mapping</strong>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Range Type</th><th>GPU Equivalent</th></tr>
+</thead>
+<tbody>
+<tr><td>Global, THREAD</td><td><code>gidx</code> (global index)</td></tr>
+<tr><td>Local, WARP, GROUP_REDUCE</td><td><code>lidx</code> (local/workgroup index)</td></tr>
+<tr><td>Reduce</td><td>Loop (no mapping)</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Dimension Limiting</strong>:</p>
+<p>GPUs have hardware limits (e.g., max 1024 threads per block). When ranges exceed these limits, the compiler:</p>
+<ol>
+<li><strong>Groups</strong> adjacent dimensions: <code>[256, 256, 256]</code> with max <code>[256, 256]</code> → <code>[65536, 256]</code></li>
+<li><strong>Splits</strong> large dimensions: <code>[2048]</code> with max <code>[1024]</code> → <code>[2, 1024]</code></li>
+<li><strong>Reconstructs</strong> indices via divmod</li>
+</ol>
+<p><strong>Store Masking</strong>:</p>
+<p>Global stores that don’t use all local dimensions are masked:</p>
+<pre><code class="language-text">// If STORE doesn't use lidx1, mask it:
+STORE(INDEX(...), value) → STORE(INDEX(..., gate=(lidx1 == 0)), value)
+</code></pre>
+<p>This ensures stores only execute when unused local indices are 0.</p>
+<p><strong>Morok</strong>: <code>gpudims.rs</code></p>
+<hr>
+<h3 id="stage-13-add-loads"><a class="header" href="#stage-13-add-loads">Stage 13: Add Loads</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Wrap INDEX operations in explicit LOAD
+<strong>Key Patterns</strong>: Add LOAD, remove redundant loads
+<strong>Impact</strong>: Makes memory operations explicit for codegen</p>
+</blockquote>
+<p><strong>What This Does</strong>: Wraps INDEX operations in explicit LOAD.</p>
+<p><strong>Why This Matters</strong>: Index operations compute addresses. LOAD actually reads memory. Making this explicit helps the code generator understand what memory accesses are needed.</p>
+<p><strong>Pattern</strong>: <code>pm_add_loads</code></p>
+<pre><code class="language-text">// Before: bare index
+INDEX(ptr, i)
+
+// After: explicit load
+LOAD(INDEX(ptr, i))
+</code></pre>
+<p>Also removes redundant loads from stores (write-only access).</p>
+<p>Note: Not all INDEX operations get wrapped in LOAD. Pointer types (already addresses) and image textures (special hardware) use different access methods.</p>
+<p><strong>Morok</strong>: <code>devectorize.rs</code></p>
+<hr>
+<h3 id="stage-14-devectorize"><a class="header" href="#stage-14-devectorize">Stage 14: Devectorize</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Convert abstract vectors to match hardware capabilities
+<strong>Key Phases</strong>: 4 coordinated passes
+<strong>Impact</strong>: Vectors work with actual hardware width</p>
+</blockquote>
+<p><strong>What This Does</strong>: Handles the transition from abstract vectors to hardware operations.</p>
+<p><strong>Why This Matters</strong>: Devectorize uses 4 conceptual phases within a single <code>graph_rewrite</code>:</p>
+<ol>
+<li><strong>Phase 1</strong>: Create PTRCAT to group consecutive pointer accesses, devectorize ALU/WMMA/buffers, expand vector INDEX → GEP(PTRCAT)</li>
+<li><strong>Phase 2</strong>: Move GEP through LOAD/STORE</li>
+<li><strong>Phase 3</strong>: Distribute PTRCAT through LOAD/STORE, creating CAT(LOADs), fix image buffers</li>
+<li><strong>Phase 4</strong>: Split CAT(LOADs) into smaller chunks matching hardware width</li>
+</ol>
+<p><strong>PTRCAT Construction</strong>:</p>
+<p>PTRCAT groups consecutive pointer accesses:</p>
+<ol>
+<li>Generate individual indexes for each vector element</li>
+<li>Extract (valid, root_src) → [offsets] mapping</li>
+<li>Group consecutive offsets by validity and source</li>
+<li>Create PTRCAT from grouped pointers</li>
+<li>Return with GEP permutation for correct element order</li>
+</ol>
+<p>This reduces memory bus transactions.</p>
+<p><strong>Device-Specific Fold Lengths</strong>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Device</th><th>Fold Lengths</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>DSP</td><td>128, 64, 32, 16, 8, 4</td><td>Large vectors for DSP SIMD</td></tr>
+<tr><td>GPU (float4)</td><td>4, 2</td><td>Standard GPU vectorization</td></tr>
+<tr><td>GPU (half + ALLOW_HALF8)</td><td>8, 4, 2</td><td>Half precision with env var</td></tr>
+<tr><td>GPU (AMX)</td><td>16, 8, 4, 2</td><td>Apple AMX support</td></tr>
+<tr><td>Image</td><td>4</td><td>Fixed for image textures</td></tr>
+<tr><td>Default</td><td>1</td><td>Scalar fallback</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Environment Variable</strong>: <code>DEVECTORIZE</code></p>
+<ul>
+<li><code>0</code>: Skip <code>devectorize</code> only (keeps <code>correct_load_store</code>)</li>
+<li><code>1</code>: Full devectorization (default)</li>
+<li><code>≥2</code>: Skip both <code>devectorize</code> and <code>correct_load_store</code></li>
+</ul>
+<p><strong>Pattern</strong>: <code>devectorize + load_store_folding + correct_load_store + load_store_indexing</code></p>
+<p><strong>Split vectorized ALUs</strong>:</p>
+<pre><code class="language-text">// If hardware doesn't support vec4 add
+ADD(vec4_a, vec4_b) → [ADD(a[0], b[0]), ADD(a[1], b[1]), ...]
+</code></pre>
+<p><strong>Load/store chunk splitting</strong>: Match hardware memory width.</p>
+<p><strong>Image fixup</strong>: Special handling for image tensor buffers.</p>
+<p><strong>Morok</strong>: <code>devectorize.rs</code></p>
+<hr>
+<h3 id="stage-15-lower-index-dtype"><a class="header" href="#stage-15-lower-index-dtype">Stage 15: Lower Index Dtype</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Convert abstract Index type to concrete integers
+<strong>Key Patterns</strong>: Operation-specific lowering based on value bounds
+<strong>Impact</strong>: Indices use hardware-native integer types (i32 or i64)</p>
+</blockquote>
+<p><strong>What This Does</strong>: Converts abstract <code>Index</code> type to concrete integers.</p>
+<p><strong>Why This Matters</strong>: The Index type is abstract—hardware doesn’t have it. We need to convert to i32 or i64, which the hardware actually supports.</p>
+<p><strong>Pattern</strong>: <code>pm_lower_index_dtype</code></p>
+<pre><code class="language-text">// Before: abstract index type
+idx: Index
+
+// After: concrete type
+idx: i32  // or i64, based on bounds
+</code></pre>
+<p><strong>Operation-Specific Lowering</strong>:</p>
+<p>Index type lowering is NOT a single cast—each operation type has specific patterns:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Before</th><th>After</th></tr>
+</thead>
+<tbody>
+<tr><td>Binary ops</td><td><code>ADD(Index, Index)</code></td><td><code>ADD(i32, i32)</code> with casts</td></tr>
+<tr><td>CONST</td><td><code>CONST(5): Index</code></td><td><code>CONST(5): i32</code></td></tr>
+<tr><td>WHERE</td><td><code>WHERE(c, Index, Index)</code></td><td><code>WHERE(c, i32, i32)</code></td></tr>
+<tr><td>RANGE</td><td><code>RANGE(end: Index)</code></td><td><code>RANGE(end: i32)</code> with cast</td></tr>
+<tr><td>SPECIAL</td><td><code>SPECIAL(gidx)</code></td><td>Always i32 (GPU indices are 32-bit)</td></tr>
+<tr><td>DEFINE_VAR</td><td><code>DEFINE_VAR: Index</code></td><td>i32 if bounds fit, else i64</td></tr>
+<tr><td>VECTORIZE</td><td><code>VECTORIZE(Index...)</code></td><td>Cast each to concrete scalar</td></tr>
+<tr><td>CAST cleanup</td><td><code>CAST(i32, Index)</code></td><td>Just <code>i32</code> (remove redundant cast)</td></tr>
+</tbody>
+</table>
+</div>
+<p>The <code>select_concrete_dtype()</code> function determines i32 vs i64 using vmin/vmax bounds analysis:</p>
+<pre><code class="language-text">dtype = i32 if bounds fit in [-2^31, 2^31-1] else i64
+</code></pre>
+<p><strong>Morok</strong>: <code>symbolic/index_lowering.rs</code></p>
+<hr>
+<h2 id="phase-4-linearizer"><a class="header" href="#phase-4-linearizer">Phase 4: Linearizer</a></h2>
+<p><strong>Goal</strong>: Convert the DAG to a linear instruction sequence.</p>
+<hr>
+<h3 id="stage-16-post-index-symbolic"><a class="header" href="#stage-16-post-index-symbolic">Stage 16: Post-Index Symbolic</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Full symbolic simplification after index lowering
+<strong>Key Patterns</strong>: All symbolic rules (140+)
+<strong>Impact</strong>: Final cleanup before serialization</p>
+</blockquote>
+<p><strong>What This Does</strong>: Full symbolic simplification after index lowering.</p>
+<p><strong>Why This Matters</strong>: Now that indices are concrete integers (i32/i64), arithmetic can fully simplify. This is the last chance to clean up expressions before linearization.</p>
+<p><strong>Pattern</strong>: <code>symbolic</code></p>
+<p>Includes GEP pushing patterns—move address calculations through arithmetic:</p>
+<pre><code class="language-text">Before:  GEP(ADD(arr_a, arr_b), idx)
+              ↓ [Push GEP through ADD]
+After:   ADD(GEP(arr_a, idx), GEP(arr_b, idx))
+</code></pre>
+<p><em>Why?</em> Enables parallel computation of GEPs and may enable downstream vectorization. (Note: The pattern only applies when GEP’s dtype and ALU’s dtype are NOT pointers.)</p>
+<hr>
+<h3 id="stage-17-pre-matcher-optional"><a class="header" href="#stage-17-pre-matcher-optional">Stage 17: Pre-Matcher (Optional)</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Backend-specific patterns before decomposition
+<strong>Key Patterns</strong>: Renderer-specific
+<strong>Impact</strong>: Hardware-specific optimizations</p>
+</blockquote>
+<p><strong>What This Does</strong>: Renderer-specific patterns applied before decomposition.</p>
+<p><strong>Why This Matters</strong>: Each backend can add its own patterns. For example, DSP backends use this to replace generic patterns with DSP-specific SIMD intrinsics. This allows hardware-specific optimizations without changing the generic pipeline.</p>
+<p><strong>Pattern</strong>: <code>renderer.pre_matcher</code></p>
+<p>Most backends (CPU, GPU) don’t need this. Only specialized hardware uses it.</p>
+<p><strong>Note</strong>: Morok does not currently implement this stage. The <code>Renderer</code> trait has only a <code>decompositor()</code> method. This is a future enhancement for DSP and other specialized backends.</p>
+<hr>
+<h3 id="stage-18-decompositions"><a class="header" href="#stage-18-decompositions">Stage 18: Decompositions</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Rewrite operations the target doesn’t support
+<strong>Key Patterns</strong>: Power-of-2, transcendental approximations
+<strong>Impact</strong>: Maps high-level ops to hardware instructions</p>
+</blockquote>
+<p><strong>What This Does</strong>: Late rewrites for operations the target doesn’t support.</p>
+<p><strong>Why This Matters</strong>: Hardware doesn’t have every operation. For example, most CPUs don’t have a direct <code>sin</code> instruction. We approximate it with operations that do exist (addition, multiplication, etc.).</p>
+<p><strong>Pattern</strong>: <code>symbolic_simple + get_late_rewrite_patterns</code></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Pattern</th><th>Example</th><th>When Used</th></tr>
+</thead>
+<tbody>
+<tr><td><code>MOD → AND</code></td><td><code>x % 8 → x &amp; 7</code></td><td>Power-of-2 divisor</td></tr>
+<tr><td><code>MUL → SHL</code></td><td><code>x * 16 → x &lt;&lt; 4</code></td><td>Power-of-2 multiplier</td></tr>
+<tr><td><code>DIV → SHR</code></td><td><code>x // 8 → x &gt;&gt; 3</code></td><td>Power-of-2 divisor</td></tr>
+<tr><td><code>FDIV → MUL</code></td><td><code>x / 2.0 → x * 0.5</code></td><td>Float constant divisor</td></tr>
+<tr><td><code>NEG</code></td><td><code>x * -1 → NEG(x)</code></td><td>When NEG supported</td></tr>
+<tr><td><code>MULACC</code></td><td><code>a * b + c → MULACC(a, b, c)</code></td><td>When FMA supported</td></tr>
+<tr><td>Fast integer division</td><td><code>x // 7 → (x * M) &gt;&gt; S</code></td><td>Non-power-of-2 divisor</td></tr>
+<tr><td>De Morgan’s laws</td><td><code>(!x) &amp; (!y) → !(x | y)</code></td><td>Boolean simplification</td></tr>
+<tr><td>Comparison negations</td><td><code>!(x &lt; c) → (c-1) &lt; x</code></td><td>Integer comparisons</td></tr>
+</tbody>
+</table>
+</div>
+<p>Transcendental function approximations (SIN, EXP, LOG, etc.) are implemented via the <code>decompositor()</code> pathway (see <code>ir/src/decompositions/transcendentals.rs</code>).</p>
+<p><strong>Morok</strong>: <code>optimizer/mod.rs</code></p>
+<hr>
+<h3 id="stage-19-final-rewrite"><a class="header" href="#stage-19-final-rewrite">Stage 19: Final Rewrite</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Prepare for linearization
+<strong>Key Patterns</strong>: CONST vectorization, GEP resolution, END splitting
+<strong>Impact</strong>: Clean representation ready for linearization</p>
+</blockquote>
+<p><strong>What This Does</strong>: Prepare for linearization.</p>
+<p><strong>Why This Matters</strong>: Some patterns are easier to apply after decomposition. This stage does final cleanup before converting to a linear sequence.</p>
+<p><strong>Pattern</strong>: <code>pm_decomp + pm_render + extra_matcher + pm_split_ends</code></p>
+<p><strong>CONST vectorization</strong>:</p>
+<pre><code class="language-text">// Make vector constants explicit
+CONST(1.0) used as vec4 → VECTORIZE(1.0, 1.0, 1.0, 1.0)
+</code></pre>
+<p><strong>CAT to VECTORIZE</strong> (via <code>gep_pushing</code> in <code>symbolic</code>):</p>
+<pre><code class="language-text">CAT(a, b, c, d) → VECTORIZE(a, b, c, d)
+</code></pre>
+<p>CAT cannot be rendered directly; explicit VECTORIZE is required for codegen.</p>
+<p><strong>GEP resolution</strong>: Convert remaining GEP operations.</p>
+<p><strong>Split multi-range ENDs</strong>:</p>
+<pre><code class="language-text">// Before: END closing multiple ranges
+END(op, [range_a, range_b])
+
+// After: nested single ENDs
+END(END(op, range_a), range_b)
+</code></pre>
+<p><strong>extra_matcher</strong>: Each backend can add its own final patterns. This allows hardware-specific optimizations without changing the generic pipeline.</p>
+<p><strong>Morok</strong>: <code>devectorize.rs</code>, <code>linearize/mod.rs</code>, <code>optimizer/mod.rs</code></p>
+<hr>
+<h3 id="stage-20-add-control-flow"><a class="header" href="#stage-20-add-control-flow">Stage 20: Add Control Flow</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Build control flow graph and add range dependencies
+<strong>Key Concept</strong>: Three relationship types (nested, dependent, independent)
+<strong>Impact</strong>: Correct instruction ordering</p>
+</blockquote>
+<p><strong>What This Does</strong>: Builds the control flow graph and adds range dependencies.</p>
+<p><strong>Why This Matters</strong>: Operations must execute in a valid order. If a load uses a RANGE’s value, the RANGE must come first. This stage tracks and enforces these dependencies.</p>
+<p><strong>Pattern</strong>: <code>pm_add_control_flow</code> (bottom-up)</p>
+<pre><code class="language-text">// Analyze which END operations depend on which
+END(computation, [RANGE_A]) and END(other_computation, [RANGE_B]) are siblings
+→ Creates edge: RANGE_B.src += END(computation)
+
+// Add explicit dependency
+RANGE_B waits for RANGE_A to complete
+</code></pre>
+<p><strong>Three relationship types</strong>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Relationship</th><th>Example</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td>Nested</td><td>RANGE_A inside RANGE_B</td><td>A must complete before B starts</td></tr>
+<tr><td>Dependent</td><td>LOAD_A uses RANGE_A</td><td>RANGE_A must precede LOAD_A</td></tr>
+<tr><td>Independent</td><td>RANGE_X and RANGE_Y don’t interact</td><td>Can run in parallel</td></tr>
+</tbody>
+</table>
+</div>
+<p>Bottom-up traversal ensures dependencies flow correctly from leaves to roots.</p>
+<p><strong>Morok</strong>: <code>schedule/src/linearize/mod.rs</code></p>
+<hr>
+<h3 id="stage-21-linearize"><a class="header" href="#stage-21-linearize">Stage 21: Linearize</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Convert DAG to linear instruction sequence
+<strong>Key Algorithm</strong>: Priority-aware topological sort
+<strong>Impact</strong>: Valid execution order</p>
+</blockquote>
+<p><strong>What This Does</strong>: Converts the DAG to a linear instruction sequence via priority-aware topological sort.</p>
+<p><strong>Why This Matters</strong>: The graph structure doesn’t specify execution order. We need to flatten it while respecting dependencies. Priorities ensure sensible ordering (definitions before uses, loads before computation, stores after).</p>
+<p><strong>Function</strong>: <code>linearize(sink)</code></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Priority</th><th>Why</th></tr>
+</thead>
+<tbody>
+<tr><td>DEFINE_GLOBAL</td><td>-20</td><td>Arguments must be defined first</td></tr>
+<tr><td>DEFINE_VAR</td><td>-19</td><td>Variables must be defined first</td></tr>
+<tr><td>DEFINE_LOCAL</td><td>-18</td><td>Allocations first</td></tr>
+<tr><td>DEFINE_REG</td><td>-17</td><td>Registers first</td></tr>
+<tr><td>CONST</td><td>-10</td><td>Constants early for reuse</td></tr>
+<tr><td>LOAD</td><td>-1</td><td>Loads before use</td></tr>
+<tr><td>END</td><td>-5</td><td>Closes ranges</td></tr>
+<tr><td>STORE</td><td>+1</td><td>Stores after computation</td></tr>
+<tr><td>RANGE</td><td>+5</td><td>Ranges open before use</td></tr>
+</tbody>
+</table>
+</div>
+<p>Lower priority = earlier in sequence. This ensures:</p>
+<ul>
+<li>Definitions come first</li>
+<li>Loads happen before computation</li>
+<li>Stores happen last</li>
+<li>Ranges open before their contents, close after</li>
+</ul>
+<p><strong>Run_count ordering</strong>: Operations are sorted primarily by execution frequency (run_count), then by priority. Operations with lower execution frequency (outside inner loops) are scheduled first, while operations in inner loops (higher run_count) are scheduled later. Example: A CONST executed 100 times appears before a CONST executed 1M times.</p>
+<p><strong>run_count Calculation</strong>:</p>
+<pre><code class="language-text">run_count = prod(int(r.vmax) + 1 for r in u.ranges)
+</code></pre>
+<p>This computes how many times an operation executes based on its enclosing ranges.</p>
+<p><strong>Morok</strong>: <code>schedule/src/linearize/mod.rs</code></p>
+<hr>
+<h3 id="stage-22-cleanup-ifendif"><a class="header" href="#stage-22-cleanup-ifendif">Stage 22: Cleanup IF/ENDIF</a></h3>
+<blockquote>
+<p><strong>Stage at a Glance</strong></p>
+<p><strong>Goal</strong>: Final cleanup of linear instruction list
+<strong>Key Transformation</strong>: Gated INDEX → IF/STORE/ENDIF
+<strong>Impact</strong>: Handles hardware without predicated stores</p>
+</blockquote>
+<p><strong>What This Does</strong>: Final cleanup of the linear instruction list.</p>
+<p><strong>Why This Matters</strong>: Some hardware (modern GPUs) supports “predicated stores”—write to memory only if condition is true. Older hardware doesn’t. For those, we wrap store in an IF statement. This stage ONLY runs when hardware lacks predicated store support.</p>
+<p><strong>Pattern</strong>: <code>pm_linearize_cleanups</code> (via <code>line_rewrite</code>, not <code>graph_rewrite</code>)</p>
+<pre><code class="language-text">// Gated INDEX in STORE becomes conditional store
+STORE(INDEX(ptr, idx, valid=cond), value)
+→ IF(cond) { STORE(INDEX(ptr, idx), value) } ENDIF
+</code></pre>
+<p><strong>Note</strong>: This stage uses <code>line_rewrite</code> instead of <code>graph_rewrite</code> because it operates on the already-linearized instruction list rather than a DAG.</p>
+<p>At this point, the instruction list is ready for code generation.</p>
+<p><strong>Morok</strong>: <code>schedule/src/linearize/mod.rs</code> (predicated stores path)</p>
+<hr>
+<h2 id="worked-example-tracing-through-all-22-stages"><a class="header" href="#worked-example-tracing-through-all-22-stages">Worked Example: Tracing Through All 22 Stages</a></h2>
+<p>Let’s trace <code>c = a + b</code> (where a, b are [100, 100] tensors) through the pipeline.</p>
+<h3 id="initial-tensor-graph"><a class="header" href="#initial-tensor-graph">Initial Tensor Graph</a></h3>
+<pre><code>[ADD]
+├── [BUFFER(a)] : Float32
+└── [BUFFER(b)] : Float32
+</code></pre>
+<h3 id="after-stage-1-early-movement-ops"><a class="header" href="#after-stage-1-early-movement-ops">After Stage 1: Early Movement Ops</a></h3>
+<p>(No change—no movement ops in this example)</p>
+<h3 id="after-stage-2-load-collapse"><a class="header" href="#after-stage-2-load-collapse">After Stage 2: Load Collapse</a></h3>
+<p>(No change—no reductions in this example)</p>
+<h3 id="after-stage-3-split-ranges"><a class="header" href="#after-stage-3-split-ranges">After Stage 3: Split Ranges</a></h3>
+<p>(No change—no modulo operations)</p>
+<h3 id="after-stage-4-initial-symbolic"><a class="header" href="#after-stage-4-initial-symbolic">After Stage 4: Initial Symbolic</a></h3>
+<p>(No change—no simplification needed)</p>
+<h3 id="after-stage-5-simplify-ranges"><a class="header" href="#after-stage-5-simplify-ranges">After Stage 5: Simplify Ranges</a></h3>
+<p>(No change—no adjacent ranges yet)</p>
+<h3 id="after-stage-6-split-store"><a class="header" href="#after-stage-6-split-store">After Stage 6: Split Store</a></h3>
+<p>(Not applicable—GPU backend)</p>
+<h3 id="after-stage-7-apply-opts"><a class="header" href="#after-stage-7-apply-opts">After Stage 7: Apply Opts</a></h3>
+<p>Optimization actions applied:</p>
+<ul>
+<li>UPCAST j dimension by 4 (vectorization)</li>
+<li>LOCAL for input buffers (if beneficial)</li>
+</ul>
+<h3 id="after-stage-8-post-opt-symbolic"><a class="header" href="#after-stage-8-post-opt-symbolic">After Stage 8: Post-Opt Symbolic</a></h3>
+<p>No changes—symbolic already clean.</p>
+<h3 id="after-stage-9-expander"><a class="header" href="#after-stage-9-expander">After Stage 9: Expander</a></h3>
+<p>UPCAST → UNROLL → CONTRACT:</p>
+<pre><code>[VECTORIZE]
+├── [ADD]
+│   ├── [LOAD(a)]
+│   │   └── [INDEX]
+│   │       ├── [BUFFER(a)]
+│   │       ├── [RANGE(i, Global, 0..100)]
+│   │       └── [UNROLL(VCONST([0,1,2,3]))]  // Converted from RANGE(j, UPCAST)
+│   └── [LOAD(b)]
+│       └── [INDEX]
+│           ├── [BUFFER(b)]
+│           ├── [RANGE(i)]  // Same RANGE via hash consing
+│           └── [UNROLL(VCONST([0,1,2,3]))]  // Same UNROLL via hash consing
+</code></pre>
+<h3 id="after-stage-10-add-local-buffers"><a class="header" href="#after-stage-10-add-local-buffers">After Stage 10: Add Local Buffers</a></h3>
+<p>(If LOCAL opt was chosen)</p>
+<h3 id="after-stage-11-remove-reduce"><a class="header" href="#after-stage-11-remove-reduce">After Stage 11: Remove Reduce</a></h3>
+<p>(No change—no reductions)</p>
+<h3 id="after-stage-12-add-gpu-dims"><a class="header" href="#after-stage-12-add-gpu-dims">After Stage 12: Add GPU Dims</a></h3>
+<pre><code>[SPECIAL(gidx0)] : Index  // replaces RANGE(i)
+</code></pre>
+<h3 id="after-stage-13-add-loads"><a class="header" href="#after-stage-13-add-loads">After Stage 13: Add Loads</a></h3>
+<p>(No change—loads already present)</p>
+<h3 id="after-stage-14-devectorize"><a class="header" href="#after-stage-14-devectorize">After Stage 14: Devectorize</a></h3>
+<p>Vector split to match hardware width:</p>
+<pre><code>[VECTORIZE] : &lt;4 x Float32&gt;
+├── [ADD(a[0], b[0])]
+├── [ADD(a[1], b[1])]
+├── [ADD(a[2], b[2])]
+└── [ADD(a[3], b[3])]
+</code></pre>
+<h3 id="after-stage-15-lower-index-dtype"><a class="header" href="#after-stage-15-lower-index-dtype">After Stage 15: Lower Index Dtype</a></h3>
+<pre><code>[SPECIAL(gidx0)] : i32  // concrete type
+</code></pre>
+<h3 id="after-stage-16-post-index-symbolic"><a class="header" href="#after-stage-16-post-index-symbolic">After Stage 16: Post-Index Symbolic</a></h3>
+<p>No changes needed.</p>
+<h3 id="after-stage-17-pre-matcher"><a class="header" href="#after-stage-17-pre-matcher">After Stage 17: Pre-Matcher</a></h3>
+<p>(No patterns for standard backends)</p>
+<h3 id="after-stage-18-decompositions"><a class="header" href="#after-stage-18-decompositions">After Stage 18: Decompositions</a></h3>
+<p>No decompositions needed—all ops supported.</p>
+<h3 id="after-stage-19-final-rewrite"><a class="header" href="#after-stage-19-final-rewrite">After Stage 19: Final Rewrite</a></h3>
+<p>No changes needed.</p>
+<h3 id="after-stage-20-add-control-flow"><a class="header" href="#after-stage-20-add-control-flow">After Stage 20: Add Control Flow</a></h3>
+<p>Dependencies tracked—no issues.</p>
+<h3 id="after-stage-21-linearize"><a class="header" href="#after-stage-21-linearize">After Stage 21: Linearize</a></h3>
+<p>Linear instruction sequence (simplified):</p>
+<pre><code>1. DEFINE_GLOBAL(0)  // Output buffer c
+2. DEFINE_GLOBAL(1)  // Input buffer a
+3. DEFINE_GLOBAL(2)  // Input buffer b
+4. RANGE(i, 0..100, Global)  // gidx0
+5. RANGE(j, 0..25, Loop)  // Unrolled /4
+6. LOAD(a, i, j*4+0)  // Vector load
+7. LOAD(b, i, j*4+0)  // Vector load
+8. ADD(vec_a, vec_b)  // Vector add
+9. STORE(c, i, j*4+0, result)
+10. END(RANGE(j))
+11. END(RANGE(i))
+</code></pre>
+<h3 id="after-stage-22-cleanup-ifendif"><a class="header" href="#after-stage-22-cleanup-ifendif">After Stage 22: Cleanup IF/ENDIF</a></h3>
+<p>No changes needed—no gated stores.</p>
+<p><strong>Result</strong>: Ready for code generation! The LLVM/CUDA/other backend will compile this to actual machine code.</p>
+<hr>
+<h2 id="pattern-application-strategy"><a class="header" href="#pattern-application-strategy">Pattern Application Strategy</a></h2>
+<p>Each stage uses one of two rewrite strategies:</p>
+<p><strong>Top-down</strong> (default): Process parents before children. Use when transformations create new matchable subterms.</p>
+<p><strong>Bottom-up</strong>: Process children before parents. Use when child state affects parent matching (stages 1, 20).</p>
+<p>Both iterate to fixpoint—patterns fire until no more match.</p>
+<hr>
+<h2 id="debugging-the-pipeline"><a class="header" href="#debugging-the-pipeline">Debugging the Pipeline</a></h2>
+<p>When a kernel produces wrong results, the bug lives in one of these 22 stages. Use environment variables to extract IR at each stage:</p>
+<pre><code class="language-bash"># See IR after each transformation
+MOROK_DEBUG=ir cargo test failing_test
+</code></pre>
+<h3 id="quick-reference"><a class="header" href="#quick-reference">Quick Reference</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Symptom</th><th>Likely Stages</th><th>What to Check</th></tr>
+</thead>
+<tbody>
+<tr><td>Wrong values in output</td><td>4, 9, 11, 18</td><td>Symbolic simplification, expansion, devectorization</td></tr>
+<tr><td>Slow performance</td><td>7, 9, 14, 21</td><td>Optimization, expansion, devectorization, linearization</td></tr>
+<tr><td>Crashes/panics</td><td>11, 12</td><td>Reduce, GPU dims</td></tr>
+<tr><td>Wrong loop count</td><td>3, 5, 12</td><td>Split ranges, simplify ranges, GPU dims</td></tr>
+<tr><td>Missing vectorization</td><td>9, 14</td><td>Expander, devectorize</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="common-issues"><a class="header" href="#common-issues">Common Issues</a></h3>
+<ol>
+<li><strong>Stage 3-4</strong>: Range splitting/symbolic may lose constraints</li>
+<li><strong>Stage 9</strong>: Expansion order affects vectorization correctness</li>
+<li><strong>Stage 11</strong>: Accumulator initialization must match reduction identity</li>
+<li><strong>Stage 14</strong>: Hardware width mismatch—check vector fold length</li>
+<li><strong>Stage 18</strong>: Missing decomposition—check supported_ops list for backend</li>
+<li><strong>Stage 21</strong>: Priority bugs cause data races—verify dependencies</li>
+</ol>
+<hr>
+<h2 id="summary"><a class="header" href="#summary">Summary</a></h2>
+<p>The 22-stage pipeline transforms tensor expressions into machine code through systematic refinement:</p>
+<ol>
+<li><strong>Stages 1-7</strong>: Make iteration explicit, optimize ranges</li>
+<li><strong>Stages 8-10</strong>: Expand optimization primitives</li>
+<li><strong>Stages 11-15</strong>: Lower to hardware-specific operations</li>
+<li><strong>Stages 16-22</strong>: Serialize to executable instructions</li>
+</ol>
+<p>Each stage has a single responsibility. Each builds on the last. The result: high-level tensor code runs at near-optimal speed on diverse hardware.</p>
+<hr>
+<h2 id="tinygrad-vs-morok-architectural-differences"><a class="header" href="#tinygrad-vs-morok-architectural-differences">Tinygrad vs Morok: Architectural Differences</a></h2>
+<p>This chapter describes the “ideal” 22-stage pipeline based on Tinygrad’s implementation. Morok now closely follows this design with minimal differences.</p>
+<h3 id="remaining-architectural-differences"><a class="header" href="#remaining-architectural-differences">Remaining Architectural Differences</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Stage</th><th>Tinygrad</th><th>Morok</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td>1: Early Movement Ops</td><td>Moves movement ops through AFTER/END wrappers</td><td>Removes movement ops during bufferization</td><td>Both approaches achieve functional equivalence; Morok’s is cleaner</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="aligned-stages-previously-different"><a class="header" href="#aligned-stages-previously-different">Aligned Stages (Previously Different)</a></h3>
+<p>The following stages were aligned with Tinygrad as of this implementation:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Stage</th><th>What Changed</th></tr>
+</thead>
+<tbody>
+<tr><td>15: Index Dtype Lowering</td><td>Morok now has <code>pm_lower_index_dtype()</code> with full pattern coverage: Binary ops, CONST, WHERE, VECTORIZE, SPECIAL, DEFINE_VAR, RANGE, CAST cleanup</td></tr>
+<tr><td>18: Decompositions</td><td>Added: <code>fast_division_patterns()</code>, <code>pm_div_to_shr()</code>, <code>pm_fdiv_to_mul()</code>, <code>pm_comparison_negations()</code>, De Morgan’s laws</td></tr>
+<tr><td>19: Final Rewrite</td><td><code>pm_render()</code> moved from codegen to Stage 19 in schedule pipeline</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="tinygrad-only-patterns"><a class="header" href="#tinygrad-only-patterns">Tinygrad-Only Patterns</a></h3>
+<p>Morok intentionally does not implement these Tinygrad-specific patterns:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Pattern</th><th>Purpose</th><th>Why Morok Doesn’t Need It</th></tr>
+</thead>
+<tbody>
+<tr><td><code>to_bufferview</code></td><td>Avoid disk buffer copies for DISK/TINYFS devices</td><td>Morok doesn’t support DISK/TINYFS; in-memory backends don’t need this</td></tr>
+<tr><td>AFTER/END movement patterns</td><td>Move movement ops through timing wrappers</td><td>Morok removes movement ops during bufferization instead</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="morok-enhancements"><a class="header" href="#morok-enhancements">Morok Enhancements</a></h3>
+<p>Morok has some patterns/enhancements not in Tinygrad:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Enhancement</th><th>Location</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td>Nested INDEX flattening with identical indices</td><td><code>movement_op_patterns()</code></td><td>Removes redundant <code>INDEX(INDEX(ptr, [i]), [i])</code></td></tr>
+<tr><td>CAT → VECTORIZE</td><td><code>pm_render</code></td><td>Converts CAT to explicit VECTORIZE (can’t render CAT directly)</td></tr>
+<tr><td>PTRCAT([x]) unwrap</td><td><code>pm_render</code></td><td>Removes single-element PTRCAT wrappers</td></tr>
+<tr><td>GEP through CAST/BITCAST</td><td><code>gep_pushing_patterns()</code></td><td>Pushes GEP through type casts for better optimization</td></tr>
+<tr><td>Image dtype guard</td><td><code>pm_add_loads()</code></td><td>Skips LOAD wrapping for Image dtype (handled in codegen)</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="glossary"><a class="header" href="#glossary">Glossary</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Term</th><th>Simple Definition</th><th>Example</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Accumulator</strong></td><td>Variable holding running total</td><td><code>acc = acc + value</code> (in reduction)</td></tr>
+<tr><td><strong>Axis</strong></td><td>One dimension of a tensor</td><td>Shape [100, 200] has 2 axes</td></tr>
+<tr><td><strong>AxisType</strong></td><td>How a loop executes</td><td>Global=parallel, Reduce=accumulate</td></tr>
+<tr><td><strong>Buffer</strong></td><td>Allocated memory holding data</td><td>A tensor’s data lives in a buffer</td></tr>
+<tr><td><strong>Bufferize</strong></td><td>Store result in memory instead of computing on-demand</td><td>Materialize intermediate value</td></tr>
+<tr><td><strong>CONTRACT</strong></td><td>Combine multiple values into one vector</td><td><code>[a, b, c, d] → vec4(a,b,c,d)</code></td></tr>
+<tr><td><strong>Devectorize</strong></td><td>Split vectors to match hardware</td><td><code>vec8 → vec4, vec4</code></td></tr>
+<tr><td><strong>Divmod</strong></td><td>Division and remainder operations</td><td><code>x // 7, x % 7</code></td></tr>
+<tr><td><strong>Fixpoint</strong></td><td>When applying patterns no longer changes anything</td><td>Patterns fire until fixpoint</td></tr>
+<tr><td><strong>GEP</strong></td><td>Get Element Pointer—compute address from indices</td><td><code>arr[i][j] → base + i*stride + j</code></td></tr>
+<tr><td><strong>Hash consing</strong></td><td>Reuse identical expressions</td><td><code>ADD(x, 0) + ADD(x, 0)</code> shares memory</td></tr>
+<tr><td><strong>Index</strong></td><td>Integer type for array indices</td><td>i32 or i64, depending on device</td></tr>
+<tr><td><strong>Load</strong></td><td>Read from memory</td><td><code>value = arr[i]</code></td></tr>
+<tr><td><strong>Pattern</strong></td><td>Find-and-replace rule for code</td><td><code>ADD(x, 0) → x</code></td></tr>
+<tr><td><strong>Predicated store</strong></td><td>Write to memory conditionally</td><td>Write if valid else skip</td></tr>
+<tr><td><strong>Range</strong></td><td>Loop iteration specification</td><td><code>for i in 0..100</code></td></tr>
+<tr><td><strong>Reduction</strong></td><td>Combine many values into one</td><td>Sum, max, min</td></tr>
+<tr><td><strong>Store</strong></td><td>Write to memory</td><td><code>arr[i] = value</code></td></tr>
+<tr><td><strong>Symbolic</strong></td><td>Simplify using algebra rules</td><td><code>(x/4)*4 → x</code> (when <code>x%4=0</code>)</td></tr>
+<tr><td><strong>Tensor core</strong></td><td>Hardware for fast matrix multiply</td><td>NVIDIA GPUs only</td></tr>
+<tr><td><strong>Topological sort</strong></td><td>Order nodes respecting dependencies</td><td>A before B if B uses A’s result</td></tr>
+<tr><td><strong>UNROLL</strong></td><td>Expand one op into multiple positions</td><td><code>x → [x_0, x_1, x_2, x_3]</code></td></tr>
+<tr><td><strong>UPCAST</strong></td><td>Mark intent to vectorize</td><td><code>RANGE(0..4, UPCAST)</code></td></tr>
+<tr><td><strong>Vectorize</strong></td><td>Process multiple values together</td><td>SIMD: add 4 numbers at once</td></tr>
+<tr><td><strong>WHERE</strong></td><td>Conditional selection</td><td><code>WHERE(cond, x, y) = x if cond else y</code></td></tr>
+</tbody>
+</table>
+</div>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../architecture/pipeline.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../architecture/ir-design.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../architecture/pipeline.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../architecture/ir-design.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

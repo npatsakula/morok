@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "rust";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-9ce5fe74.js";
+            window.path_to_searchindex_js = "../searchindex-403a6f69.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-23939a7d.js"></script>
+        <script src="../toc-6f19a375.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -180,122 +180,472 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="execution-pipeline"><a class="header" href="#execution-pipeline">Execution Pipeline</a></h1>
-<p>From tensor definition to kernel execution, morok follows a multi-stage compilation pipeline inspired by Tinygrad.</p>
-<h2 id="stage-overview"><a class="header" href="#stage-overview">Stage Overview</a></h2>
-<pre><code>Tensor API → UOp DAG → Rangeify → Kernel Split → Schedule → Codegen → Execute
+                        <h1 id="from-tensor-to-machine-code"><a class="header" href="#from-tensor-to-machine-code">From Tensor to Machine Code</a></h1>
+<p>In most ML frameworks, computation happens immediately. Write <code>a + b</code> in PyTorch and it runs <em>now</em>—the GPU crunches numbers before you can even inspect the result. This eager execution is simple to understand, but it leaves optimization opportunities on the table. How can a compiler optimize a computation it hasn’t seen yet?</p>
+<p>Morok takes the opposite approach: <strong>lazy evaluation</strong>. When you write <code>a.try_add(&amp;b)?</code>, nothing computes. Morok builds a graph describing <em>what</em> to compute, not <em>when</em>. The magic happens when you call <code>realize()</code>—that single method triggers the entire compilation pipeline, from high-level tensor operations down to JIT-compiled machine code.</p>
+<p>This chapter traces that journey.</p>
+<pre><code class="language-text">tensor.realize()
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  LAZY GRAPH                                             │
+│  Tensor ops build UOp DAG (no computation yet)          │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  RANGEIFY                                               │
+│  Movement ops → explicit RANGE loops                    │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  KERNEL SPLITTING                                       │
+│  Split at STORE boundaries → multiple KERNELs          │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  OPTIMIZATION &amp; CODEGEN                                 │
+│  Heuristics/beam → LLVM IR → JIT compile               │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  EXECUTION                                              │
+│  Parallel kernel launch → result buffer                │
+└─────────────────────────────────────────────────────────┘
 </code></pre>
-<h2 id="stage-0-tensor-creation"><a class="header" href="#stage-0-tensor-creation">Stage 0: Tensor Creation</a></h2>
-<p><strong>Input:</strong> Rust slice or data
-<strong>Output:</strong> <code>Tensor { uop: Rc&lt;UOp&gt; }</code></p>
+<p>Each box is a distinct phase. Let’s walk through them.</p>
+<hr>
+<h2 id="lazy-evaluation-building-the-graph"><a class="header" href="#lazy-evaluation-building-the-graph">Lazy Evaluation: Building the Graph</a></h2>
+<p>A <code>Tensor</code> in Morok is surprisingly lightweight:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct Tensor {
+    entry: Arc&lt;TensorEntry&gt;,      // Computation graph
+    buffer: Option&lt;Arc&lt;Buffer&gt;&gt;,  // Materialized data (if any)
+}
+<span class="boring">}</span></code></pre>
+<p>The <code>entry</code> holds a <code>TensorEntry</code> containing the UOp graph—the computation this tensor represents. The <code>buffer</code> is optional: lazy tensors don’t have one, only realized tensors do.</p>
+<h3 id="three-ways-to-create-tensors"><a class="header" href="#three-ways-to-create-tensors">Three Ways to Create Tensors</a></h3>
+<p><strong>1. Input tensors</strong> — buffer allocated immediately:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>let a = Tensor::from_slice(&amp;[1.0, 2.0, 3.0], &amp;[3])?;
+// `a.buffer` = Some(Arc&lt;Buffer&gt;) with actual data
 <span class="boring">}</span></code></pre>
-<p>The tensor creates a <code>BUFFER</code> UOp and registers the actual device buffer in a thread-local registry. No computation happens yet.</p>
-<h2 id="stage-1-lazy-operation-building"><a class="header" href="#stage-1-lazy-operation-building">Stage 1: Lazy Operation Building</a></h2>
-<p><strong>Input:</strong> Tensor operations
-<strong>Output:</strong> UOp DAG (Directed Acyclic Graph)</p>
+<p>When you create a tensor from data, Morok allocates device memory and copies your bytes. The UOp graph contains a <code>BUFFER</code> node pointing to this allocation.</p>
+<p><strong>2. Lazy operations</strong> — no buffer, only graph:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>let c = a.try_add(&amp;b)?;  // Builds UOp graph, no execution
-let d = c.sum();         // Adds REDUCE node to graph
+</span>let b = a.try_add(&amp;a)?;   // b.buffer = None
+let c = b.try_mul(&amp;a)?;   // c.buffer = None
 <span class="boring">}</span></code></pre>
-<p>Each operation appends nodes to the UOp graph. The graph captures:</p>
-<ul>
-<li>Arithmetic operations (ADD, MUL, etc.)</li>
-<li>Movement operations (RESHAPE, PERMUTE, EXPAND, PAD, SHRINK, FLIP)</li>
-<li>Reductions (SUM, MAX, etc.)</li>
-</ul>
-<h2 id="stage-2-rangeify"><a class="header" href="#stage-2-rangeify">Stage 2: Rangeify</a></h2>
-<p><strong>Input:</strong> UOp DAG with movement ops
-<strong>Output:</strong> UOp DAG with BUFFERIZE + INDEX + explicit RANGE loops</p>
-<p><strong>File:</strong> <code>schedule/src/rangeify/transform.rs</code></p>
-<p>This is the core transformation that converts high-level tensor operations into explicit loop nests:</p>
-<ol>
-<li><strong>Range Assignment:</strong> Create RANGE UOps for each dimension</li>
-<li><strong>Movement Op Transformation:</strong> Convert movement ops to index expressions
-<ul>
-<li><code>SHRINK</code> → offset adjustment</li>
-<li><code>PERMUTE</code> → axis reordering</li>
-<li><code>EXPAND</code> → broadcast (index becomes 0)</li>
-<li><code>PAD</code> → conditional with WHERE</li>
-<li><code>RESHAPE</code> → axis combinatorics</li>
-</ul>
-</li>
-<li><strong>Buffer Simplification:</strong> Remove unnecessary intermediate buffers</li>
-<li><strong>Symbolic Simplification:</strong> Apply algebraic identities</li>
-</ol>
-<pre><code># Before rangeify:
-BUFFER.reshape([2,3]).expand([4,2,3]).sum(axis=0)
-
-# After rangeify:
-RANGE(4) -&gt; RANGE(2) -&gt; RANGE(3) -&gt;
-  LOAD(buffer, index_expr) -&gt; REDUCE(ADD) -&gt; STORE
-</code></pre>
-<h2 id="stage-3-kernel-splitting"><a class="header" href="#stage-3-kernel-splitting">Stage 3: Kernel Splitting</a></h2>
-<p><strong>Input:</strong> Rangeified UOp DAG
-<strong>Output:</strong> Multiple KERNEL UOps</p>
-<p><strong>File:</strong> <code>schedule/src/rangeify/pipeline.rs</code></p>
-<p>Splits the graph at STORE boundaries into separate kernels:</p>
-<ol>
-<li><strong>BUFFERIZE → STORE:</strong> Convert buffer materializations to explicit stores</li>
-<li><strong>STORE → KERNEL:</strong> Group related stores into kernel operations</li>
-<li><strong>Dependency Tracking:</strong> AFTER operations mark cross-kernel dependencies</li>
-</ol>
-<h2 id="stage-4-schedule-creation"><a class="header" href="#stage-4-schedule-creation">Stage 4: Schedule Creation</a></h2>
-<p><strong>Input:</strong> KERNEL UOps
-<strong>Output:</strong> <code>Vec&lt;ScheduleItem&gt;</code> with ordered kernels</p>
-<p>Collects kernels in execution order, gathering:</p>
-<ul>
-<li>Kernel AST (the computation graph)</li>
-<li>Buffer arguments (inputs/outputs)</li>
-<li>Symbolic variable values</li>
-</ul>
-<h2 id="stage-5-codegen"><a class="header" href="#stage-5-codegen">Stage 5: Codegen</a></h2>
-<p><strong>Input:</strong> Kernel AST
-<strong>Output:</strong> LLVM IR</p>
-<p><strong>File:</strong> <code>codegen/src/llvm/renderer.rs</code></p>
-<p>Currently implements direct rendering to LLVM IR. Tinygrad has 16+ optimization passes here that morok is still developing:</p>
-<ul>
-<li>Range splitting/flattening</li>
-<li>GPU dimension assignment</li>
-<li>Load/store optimization</li>
-<li>Devectorization</li>
-<li>Control flow insertion</li>
-</ul>
-<h2 id="stage-6-execution"><a class="header" href="#stage-6-execution">Stage 6: Execution</a></h2>
-<p><strong>Input:</strong> LLVM IR
-<strong>Output:</strong> Computed result</p>
-<p><strong>File:</strong> <code>runtime/src/llvm.rs</code></p>
-<p>JIT compiles the LLVM IR and executes with buffer pointers.</p>
-<h2 id="gap-analysis-vs-tinygrad"><a class="header" href="#gap-analysis-vs-tinygrad">Gap Analysis vs Tinygrad</a></h2>
+<p>Arithmetic operations don’t compute anything. They build a UOp graph: <code>Binary(Add, a.uop, a.uop)</code>. The tensor exists purely as a description of future work.</p>
+<p><strong>3. Movement operations</strong> — shares the original buffer:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let d = a.try_reshape(&amp;[1, 3])?;  // d.buffer = same as a.buffer
+<span class="boring">}</span></code></pre>
+<p>Reshape, permute, and similar operations create new <em>views</em> of existing data. The buffer is shared; only the UOp graph changes to describe the new indexing.</p>
+<h3 id="the-global-registry"><a class="header" href="#the-global-registry">The Global Registry</a></h3>
+<p>Morok maintains three global maps (lock-free, thread-safe):</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Stage</th><th>Morok Status</th><th>Missing</th></tr>
+<tr><th>Map</th><th>Key → Value</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td>Tensor Creation</td><td>Basic</td><td>numpy, URL, disk loading</td></tr>
-<tr><td>Lazy Ops</td><td>Partial</td><td>Many advanced ops</td></tr>
-<tr><td>Rangeify</td><td>7 passes</td><td>13+ in Tinygrad</td></tr>
-<tr><td>Kernel Split</td><td>Basic</td><td>Dependency-aware BFS</td></tr>
-<tr><td>Schedule</td><td>Basic</td><td>Memory planning, var tracking</td></tr>
-<tr><td>Codegen</td><td>Direct render</td><td>16+ optimization passes</td></tr>
-<tr><td>Execute</td><td>LLVM only</td><td>CUDA, Metal, WebGPU</td></tr>
+<tr><td><code>TENSORS</code></td><td>tensor_id → <code>Weak&lt;TensorEntry&gt;</code></td><td>Track all tensors for graph substitution</td></tr>
+<tr><td><code>BUFFERS</code></td><td>uop_id → <code>Arc&lt;Buffer&gt;</code></td><td>Find buffers during scheduling</td></tr>
+<tr><td><code>UOP_TO_TENSOR</code></td><td>uop_id → tensor_id</td><td>Secondary index for lookups</td></tr>
 </tbody>
 </table>
 </div>
+<p>This registry enables a critical feature: <strong>global graph substitution</strong>. When an optimization transforms a UOp, all tensors referencing that UOp automatically see the updated version. No stale references, no manual updates.</p>
+<h3 id="hash-consing-in-action"><a class="header" href="#hash-consing-in-action">Hash Consing in Action</a></h3>
+<p>Because UOps use hash consing (content-based deduplication), identical computations share memory:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let x = a.try_add(&amp;b)?;
+let y = a.try_add(&amp;b)?;
+// x.uop() and y.uop() point to the SAME Arc&lt;UOp&gt;
+<span class="boring">}</span></code></pre>
+<p>This matters for caching: when we compile kernels, we cache by UOp ID. Hash consing means identical computations automatically hit the cache, even if constructed separately.</p>
+<hr>
+<h2 id="rangeify-making-loops-explicit"><a class="header" href="#rangeify-making-loops-explicit">Rangeify: Making Loops Explicit</a></h2>
+<p>When you write <code>tensor.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)</code>, those movement operations (reshape, expand) are high-level descriptions. To generate actual loops, we need explicit iteration structure.</p>
+<p><strong>Rangeify</strong> transforms movement operations into <code>RANGE</code> loops and <code>INDEX</code> arithmetic. The entry point is <code>rangeify()</code> in <code>schedule/src/rangeify/transforms.rs</code>.</p>
+<h3 id="the-8-pass-pipeline"><a class="header" href="#the-8-pass-pipeline">The 8-Pass Pipeline</a></h3>
+<p>Rangeify isn’t a single transformation—it’s eight coordinated passes:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Pass</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>1. Range Assignment</strong></td><td>Create RANGE UOps for each tensor dimension</td></tr>
+<tr><td><strong>2. Early Rewrites</strong></td><td>Remove DETACH, clean up trivial RESHAPE</td></tr>
+<tr><td><strong>3. Split Large Reductions</strong></td><td>Two-stage reduce for huge arrays (ratio &gt; 32768)</td></tr>
+<tr><td><strong>4. Core Rangeify</strong></td><td>ReduceAxis → REDUCE, bufferization, movement removal</td></tr>
+<tr><td><strong>5. Buffer Folding</strong></td><td>Constant propagation through buffer expressions</td></tr>
+<tr><td><strong>6. Dead Axis Removal</strong></td><td>Filter ranges that don’t affect the output</td></tr>
+<tr><td><strong>7. Cost-Based Buffer Removal</strong></td><td>Inline buffers when profitable (PContig optimization)</td></tr>
+<tr><td><strong>8. Reduction Simplification</strong></td><td>Lift range-independent code out of reductions</td></tr>
+</tbody>
+</table>
+</div>
+<p>Each pass uses pattern-based rewriting (see the <a href="./optimizations.html">Pattern-Based Optimization</a> chapter). Patterns fire until no more match, then the next pass begins.</p>
+<h3 id="before-and-after"><a class="header" href="#before-and-after">Before and After</a></h3>
+<p>Consider this tensor expression:</p>
+<pre><code class="language-text">Before: BUFFER.reshape([2, 3]).expand([4, 2, 3]).sum(axis=0)
+</code></pre>
+<p>After rangeify, movement ops become explicit index computations:</p>
+<pre><code class="language-text">After:
+STORE
+├── INDEX[RANGE(0..2), RANGE(0..3)]
+└── REDUCE(Add)
+    ├── LOAD
+    │   └── INDEX[RANGE(0..4), RANGE(0..2), RANGE(0..3)]
+    └── RANGE(0..4, Reduce)
+</code></pre>
+<p>The <code>EXPAND</code> became a <code>RANGE(0..4)</code> that doesn’t affect the buffer index—broadcasting. The <code>RESHAPE</code> became different index arithmetic. The <code>SUM</code> became <code>REDUCE(Add)</code> with the first range marked as <code>Reduce</code> type.</p>
+<h3 id="movement--index-arithmetic"><a class="header" href="#movement--index-arithmetic">Movement → Index Arithmetic</a></h3>
+<p>Each movement operation has a specific transformation:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Transformation</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>RESHAPE</strong></td><td>Flatten/unflatten index expressions</td></tr>
+<tr><td><strong>PERMUTE</strong></td><td>Reorder dimensions in INDEX</td></tr>
+<tr><td><strong>EXPAND</strong></td><td>Index becomes 0 (or range doesn’t affect index)</td></tr>
+<tr><td><strong>PAD</strong></td><td>WHERE(in_bounds, LOAD, pad_value)</td></tr>
+<tr><td><strong>SHRINK</strong></td><td>Offset adjustment in INDEX</td></tr>
+<tr><td><strong>FLIP</strong></td><td><code>size - 1 - index</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>After rangeify, there are no more movement ops—just arithmetic operations on indices.</p>
+<hr>
+<h2 id="kernel-splitting-finding-the-boundaries"><a class="header" href="#kernel-splitting-finding-the-boundaries">Kernel Splitting: Finding the Boundaries</a></h2>
+<p>A computation graph might have multiple outputs, or intermediate values that need materialization. <strong>Kernel splitting</strong> identifies these boundaries and creates separate kernels.</p>
+<p>The entry point is <code>run_kernel_split_pipeline()</code> in <code>schedule/src/rangeify/kernel.rs</code>.</p>
+<h3 id="two-phase-transformation"><a class="header" href="#two-phase-transformation">Two-Phase Transformation</a></h3>
+<p><strong>Phase 1: BUFFERIZE → STORE</strong></p>
+<p><code>BUFFERIZE</code> nodes mark where values should materialize. Phase 1 converts them to explicit <code>STORE</code> operations:</p>
+<pre><code class="language-text">Before: BUFFERIZE(computation, ranges)
+After:  END(STORE(buffer, INDEX(...), computation), ranges)
+</code></pre>
+<p>The <code>END</code> wrapper captures which ranges scope this store. Buffers are allocated and assigned IDs during this phase.</p>
+<p><strong>Phase 2: STORE → KERNEL</strong></p>
+<p>Each <code>STORE</code> becomes its own kernel:</p>
+<pre><code class="language-text">Before: END(STORE(...), ranges)
+After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
+</code></pre>
+<p>The <code>KERNEL</code> node wraps everything: the computation (as a <code>SINK</code>), the iteration ranges, and the list of buffers this kernel reads and writes.</p>
+<h3 id="tracking-dependencies"><a class="header" href="#tracking-dependencies">Tracking Dependencies</a></h3>
+<p>When one kernel’s output feeds another kernel’s input, we need dependency tracking:</p>
+<ol>
+<li><code>fix_assign()</code> maps each buffer_id to the kernel that writes it</li>
+<li>When kernel B reads a buffer written by kernel A, B depends on A</li>
+<li><code>resolve_kernel_dependencies()</code> builds the dependency graph</li>
+</ol>
+<p>Dependencies appear as <code>AFTER</code> nodes in the IR, ensuring kernels execute in valid order.</p>
+<h3 id="buffer-renumbering"><a class="header" href="#buffer-renumbering">Buffer Renumbering</a></h3>
+<p>Each kernel sees buffers in a specific order (outputs first, then inputs). <code>renumber_define_globals()</code> remaps buffer IDs to match this ordering:</p>
+<pre><code class="language-text">Original: buffer_3, buffer_1, buffer_7
+Kernel view: buffer_0 (output), buffer_1, buffer_2 (inputs)
+</code></pre>
+<p>This simplifies code generation—buffer <code>N</code> is always argument <code>N</code>.</p>
+<hr>
+<h2 id="schedule-creation-preparing-for-execution"><a class="header" href="#schedule-creation-preparing-for-execution">Schedule Creation: Preparing for Execution</a></h2>
+<p>Once kernels are split, we need to <strong>schedule</strong> them: determine execution order, allocate buffers, and prepare for compilation.</p>
+<p><code>create_schedule()</code> in <code>tensor/src/schedule.rs</code> produces a <code>Vec&lt;ScheduleItem&gt;</code>:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct ScheduleItem {
+    pub kernel: Arc&lt;UOp&gt;,              // KERNEL wrapper
+    pub ast: Arc&lt;UOp&gt;,                 // Inner computation (for codegen)
+    pub buffers: Vec&lt;Buffer&gt;,          // Device buffers
+    pub dependencies: Vec&lt;u64&gt;,        // Producer kernel IDs
+    pub fixedvars: HashMap&lt;String, i64&gt;,  // Bound iteration variables
+}
+<span class="boring">}</span></code></pre>
+<h3 id="buffer-allocation-strategy"><a class="header" href="#buffer-allocation-strategy">Buffer Allocation Strategy</a></h3>
+<ul>
+<li><strong>Input buffers</strong>: Already allocated (from <code>Tensor::from_slice</code>)</li>
+<li><strong>Intermediate buffers</strong>: Allocated during scheduling (for kernel outputs that feed other kernels)</li>
+<li><strong>Output buffer</strong>: Allocated and registered with the final tensor</li>
+</ul>
+<h3 id="parallel-group-analysis"><a class="header" href="#parallel-group-analysis">Parallel Group Analysis</a></h3>
+<p>Not all kernels need sequential execution. Independent kernels can run in parallel:</p>
+<pre><code class="language-text">Kernel A (writes buf0)
+Kernel B (writes buf1)  ─── no dependency ─── can run in parallel
+Kernel C (reads buf0, buf1)  ─── depends on A and B
+</code></pre>
+<p>The scheduler uses <strong>Kahn’s algorithm</strong> to find parallel groups:</p>
+<ol>
+<li>Build the kernel dependency DAG</li>
+<li>Find all kernels with no incoming edges → Group 1</li>
+<li>Remove Group 1, repeat → Group 2, etc.</li>
+</ol>
+<p>Each group’s kernels execute in parallel, then the next group starts.</p>
+<hr>
+<h2 id="code-generation-from-uop-to-llvm-ir"><a class="header" href="#code-generation-from-uop-to-llvm-ir">Code Generation: From UOp to LLVM IR</a></h2>
+<p>With kernels scheduled, we generate actual code. Morok currently supports two backends:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Backend</th><th>Compile Speed</th><th>Output Quality</th><th>Use Case</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>LLVM</strong></td><td>Slower</td><td>Highly optimized</td><td>Production</td></tr>
+<tr><td><strong>Cranelift</strong></td><td>Faster</td><td>Good</td><td>Development/testing</td></tr>
+</tbody>
+</table>
+</div>
+<p>The <code>Renderer</code> trait abstracts code generation:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub trait Renderer {
+    fn render(&amp;self, uop: &amp;Arc&lt;UOp&gt;, name: Option&lt;&amp;str&gt;) -&gt; Result&lt;RenderedKernel&gt;;
+}
+<span class="boring">}</span></code></pre>
+<h3 id="llvm-cpu-renderer"><a class="header" href="#llvm-cpu-renderer">LLVM CPU Renderer</a></h3>
+<p>The LLVM renderer (<code>codegen/src/llvm/cpu/</code>) traverses the UOp graph and emits LLVM IR:</p>
+<pre><code class="language-llvm">define void @kernel_0(ptr %args, ptr %vars) {
+entry:
+  %buf0 = load ptr, ptr %args
+  %buf1 = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
+  ; ... loop nest ...
+  br label %loop_0
+
+loop_0:
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop_0 ]
+  ; ... computation ...
+  %i.next = add i64 %i, 1
+  %cond = icmp slt i64 %i.next, 128
+  br i1 %cond, label %loop_0, label %exit
+
+exit:
+  ret void
+}
+</code></pre>
+<p>The generated kernel takes two arguments:</p>
+<ul>
+<li><code>args</code>: Array of buffer pointers</li>
+<li><code>vars</code>: Array of symbolic variable values (for dynamic shapes)</li>
+</ul>
+<h3 id="post-optimization-passes"><a class="header" href="#post-optimization-passes">Post-Optimization Passes</a></h3>
+<p>Before code generation, 13+ pattern-based passes clean up the IR:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Pass</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pm_add_loads</code></td><td>Wrap INDEX operations in LOAD</td></tr>
+<tr><td><code>pre_expand</code></td><td>Convert UNROLL/UPCAST ranges to explicit operations</td></tr>
+<tr><td><code>devectorize</code></td><td>Group contiguous memory accesses</td></tr>
+<tr><td><code>pm_reduce_devectorize</code></td><td>Handle vector reductions (K-vec, bool, horizontal)</td></tr>
+<tr><td><code>pm_fma_decomposition</code></td><td>Convert <code>a*b+c</code> to fused multiply-add</td></tr>
+<tr><td><code>bool_storage_patterns</code></td><td>Convert bool ↔ uint8 for memory operations</td></tr>
+</tbody>
+</table>
+</div>
+<p>These passes transform the optimized AST into a form suitable for code generation. The result is clean, vectorized code with proper memory access patterns.</p>
+<hr>
+<h2 id="execution-running-the-kernels"><a class="header" href="#execution-running-the-kernels">Execution: Running the Kernels</a></h2>
+<p>Code generation produces LLVM IR strings. Execution involves JIT compilation and kernel launch.</p>
+<h3 id="the-executionplan"><a class="header" href="#the-executionplan">The ExecutionPlan</a></h3>
+<p><code>prepare_execution_plan()</code> builds an <code>ExecutionPlan</code>:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct ExecutionPlan {
+    kernels: Vec&lt;PreparedKernel&gt;,       // Compiled kernels
+    parallel_groups: Vec&lt;ParallelGroup&gt;,
+    buffers: Vec&lt;Buffer&gt;,
+    output_buffer_idx: usize,
+}
+<span class="boring">}</span></code></pre>
+<p>The plan is <strong>reusable</strong>: compile once, execute many times with different data.</p>
+<h3 id="jit-compilation"><a class="header" href="#jit-compilation">JIT Compilation</a></h3>
+<p>The LLVM runtime (<code>runtime/src/llvm.rs</code>) compiles IR to machine code:</p>
+<ol>
+<li><strong>Parse</strong> the LLVM IR string into a module</li>
+<li><strong>Verify</strong> the module is well-formed</li>
+<li><strong>Optimize</strong> with LLVM’s O3 pass pipeline</li>
+<li><strong>JIT compile</strong> to native machine code</li>
+<li><strong>Cache</strong> by (AST ID, device) for reuse</li>
+</ol>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Simplified JIT flow
+let module = Module::parse_ir(context, ir_string)?;
+module.verify()?;
+pass_manager.run(&amp;module);  // O3 optimization
+let function = execution_engine.get_function::&lt;KernelFn&gt;(&amp;name)?;
+// Cache: (ast_id, device) → function
+<span class="boring">}</span></code></pre>
+<h3 id="parallel-execution"><a class="header" href="#parallel-execution">Parallel Execution</a></h3>
+<p>With kernels compiled, execution follows the parallel groups:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>for group in &amp;plan.parallel_groups {
+    if group.kernel_indices.len() == 1 {
+        // Single kernel: direct call
+        execute_kernel(&amp;kernels[group.kernel_indices[0]]);
+    } else {
+        // Multiple kernels: parallel execution
+        rayon::scope(|s| {
+            for &amp;idx in &amp;group.kernel_indices {
+                s.spawn(|_| execute_kernel(&amp;kernels[idx]));
+            }
+        });
+    }
+}
+<span class="boring">}</span></code></pre>
+<p>Independent kernels run in parallel using Rayon’s work-stealing scheduler.</p>
+<h3 id="kernel-caching"><a class="header" href="#kernel-caching">Kernel Caching</a></h3>
+<p>Hash consing makes kernel caching highly effective:</p>
+<ul>
+<li><strong>Key</strong>: <code>(UOp ID, device string)</code></li>
+<li><strong>Storage</strong>: Lock-free HashMap (papaya crate)</li>
+<li><strong>Hit rate</strong>: High, because identical computations share UOp IDs</li>
+</ul>
+<p>When you compute the same expression twice, the second call hits the cache—no recompilation.</p>
+<hr>
+<h2 id="worked-example-matrix-multiply"><a class="header" href="#worked-example-matrix-multiply">Worked Example: Matrix Multiply</a></h2>
+<p>Let’s trace <code>C = A @ B</code> through the entire pipeline. Assume 4×4 matrices.</p>
+<h3 id="stage-1-lazy-graph-construction"><a class="header" href="#stage-1-lazy-graph-construction">Stage 1: Lazy Graph Construction</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let a = Tensor::from_slice(&amp;a_data, &amp;[4, 4])?;  // Input buffer allocated
+let b = Tensor::from_slice(&amp;b_data, &amp;[4, 4])?;  // Input buffer allocated
+let c = a.matmul(&amp;b)?;                           // Graph built, no computation
+<span class="boring">}</span></code></pre>
+<p>At this point, <code>c</code> is a lazy tensor with this UOp graph:</p>
+<pre><code class="language-text">REDUCE_AXIS(Add, axis=2)
+└── MUL
+    ├── EXPAND(A, [4, 4, 4])    — A: [4, 4] → [4, 1, 4] → [4, 4, 4]
+    └── EXPAND(B, [4, 4, 4])    — B: [4, 4] → [1, 4, 4] → [4, 4, 4]
+</code></pre>
+<h3 id="stage-2-rangeify"><a class="header" href="#stage-2-rangeify">Stage 2: Rangeify</a></h3>
+<p>Movement ops become explicit loops:</p>
+<pre><code class="language-text">STORE
+├── BUFFER(C)
+├── INDEX[RANGE(i, 0..4), RANGE(j, 0..4)]
+└── REDUCE(Add)
+    ├── MUL
+    │   ├── LOAD(A)
+    │   │   └── INDEX[RANGE(i), RANGE(k, 0..4, Reduce)]
+    │   └── LOAD(B)
+    │       └── INDEX[RANGE(k), RANGE(j)]
+    └── RANGE(k, Reduce)
+</code></pre>
+<p>The <code>i</code> and <code>j</code> ranges are output dimensions. The <code>k</code> range is the reduction (contracted) dimension.</p>
+<h3 id="stage-3-kernel-splitting"><a class="header" href="#stage-3-kernel-splitting">Stage 3: Kernel Splitting</a></h3>
+<p>Single STORE → single KERNEL:</p>
+<pre><code class="language-text">KERNEL
+├── SINK(STORE(...))
+├── ranges: [i: 0..4, j: 0..4]
+└── buffers: [C (output), A (input), B (input)]
+</code></pre>
+<h3 id="stage-4-schedule"><a class="header" href="#stage-4-schedule">Stage 4: Schedule</a></h3>
+<p>One <code>ScheduleItem</code> with:</p>
+<ul>
+<li><code>kernel</code>: The KERNEL UOp</li>
+<li><code>ast</code>: The inner SINK/STORE</li>
+<li><code>buffers</code>: [C, A, B]</li>
+<li><code>dependencies</code>: [] (no prior kernels)</li>
+</ul>
+<h3 id="stage-5-optimization"><a class="header" href="#stage-5-optimization">Stage 5: Optimization</a></h3>
+<p>Heuristic optimizer applies:</p>
+<ul>
+<li>Vectorization: UPCAST j dimension by 4</li>
+<li>Loop ordering: Ensure good cache behavior</li>
+</ul>
+<h3 id="stage-6-code-generation"><a class="header" href="#stage-6-code-generation">Stage 6: Code Generation</a></h3>
+<p>Generated LLVM IR (simplified):</p>
+<pre><code class="language-llvm">define void @matmul(ptr %args, ptr %vars) {
+entry:
+  %C = load ptr, ptr %args
+  %A = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
+  %B = load ptr, ptr getelementptr(ptr, ptr %args, i64 2)
+  br label %loop_i
+
+loop_i:
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop_i.end ]
+  br label %loop_j
+
+loop_j:
+  %j = phi i64 [ 0, %loop_i ], [ %j.next, %loop_k.end ]
+  %acc = ... ; initialize accumulator
+  br label %loop_k
+
+loop_k:
+  %k = phi i64 [ 0, %loop_j ], [ %k.next, %loop_k ]
+  %a_val = load float, ptr ...  ; A[i, k]
+  %b_val = load float, ptr ...  ; B[k, j]
+  %prod = fmul float %a_val, %b_val
+  %acc.new = fadd float %acc, %prod
+  %k.next = add i64 %k, 1
+  %k.cond = icmp slt i64 %k.next, 4
+  br i1 %k.cond, label %loop_k, label %loop_k.end
+
+loop_k.end:
+  store float %acc.new, ptr ...  ; C[i, j]
+  ; ... continue j, i loops
+}
+</code></pre>
+<h3 id="stage-7-execution"><a class="header" href="#stage-7-execution">Stage 7: Execution</a></h3>
+<ol>
+<li>JIT compile the LLVM IR</li>
+<li>Execute: <code>kernel([C_ptr, A_ptr, B_ptr], [])</code></li>
+<li>Result is in C buffer</li>
+</ol>
+<p>Total: one function call, result ready.</p>
+<hr>
+<h2 id="comparison-how-other-frameworks-execute"><a class="header" href="#comparison-how-other-frameworks-execute">Comparison: How Other Frameworks Execute</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Aspect</th><th>PyTorch</th><th>JAX</th><th>TVM</th><th><strong>Morok</strong></th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Evaluation</strong></td><td>Eager (immediate)</td><td>Traced (jit decorator)</td><td>Lazy (te.compute)</td><td>Lazy (realize)</td></tr>
+<tr><td><strong>Graph capture</strong></td><td>torch.compile</td><td>jax.jit trace</td><td>Explicit schedule</td><td>Implicit via ops</td></tr>
+<tr><td><strong>Compilation</strong></td><td>TorchInductor</td><td>XLA backend</td><td>Auto-scheduler</td><td>Pattern + beam</td></tr>
+<tr><td><strong>Caching</strong></td><td>Per-graph hash</td><td>Per-trace</td><td>Per-schedule</td><td>Per-AST (hash consing)</td></tr>
+<tr><td><strong>Parallelism</strong></td><td>DataParallel/DDP</td><td>pmap/pjit</td><td>Parallel schedule</td><td>Parallel groups</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>PyTorch</strong>: Eager by default, torch.compile for optimization. TorchInductor generates Triton or C++ code.</p>
+<p><strong>JAX</strong>: Functional transformations (jit, grad, vmap) trace computations. XLA compiles to optimized kernels.</p>
+<p><strong>TVM</strong>: Explicit separation of computation and schedule. Auto-scheduler searches for good schedules.</p>
+<p><strong>Morok</strong>: Fully lazy—nothing executes until <code>realize()</code>. Hash consing provides automatic caching. Pattern-based optimization with optional beam search for production quality.</p>
+<hr>
+<h2 id="the-deeper-insight"><a class="header" href="#the-deeper-insight">The Deeper Insight</a></h2>
+<p>The pipeline embodies several design principles:</p>
+<p><strong>Lazy evaluation enables global optimization.</strong> By deferring computation, we see the entire graph before generating code. No local decision limits global optimization.</p>
+<p><strong>Explicit loops enable hardware-specific scheduling.</strong> Movement ops are convenient abstractions, but GPUs need loops. Rangeify bridges the gap.</p>
+<p><strong>Hash consing makes caching automatic.</strong> Identical computations share pointers, so cache keys are trivial. No complex graph hashing needed.</p>
+<p><strong>Separation of concerns keeps each stage simple.</strong> Rangeify doesn’t know about LLVM. Code generation doesn’t know about tensor semantics. Each stage does one thing well.</p>
+<p>The result: a compilation pipeline that’s both powerful and maintainable. From <code>tensor.realize()</code> to machine code, every step is visible, debuggable, and extensible.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../introduction.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../examples.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../architecture/ir-design.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../architecture/path-of-the-uop.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -305,11 +655,11 @@ RANGE(4) -&gt; RANGE(2) -&gt; RANGE(3) -&gt;
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../introduction.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../examples.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../architecture/ir-design.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../architecture/path-of-the-uop.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

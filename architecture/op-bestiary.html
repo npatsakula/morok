@@ -1,0 +1,828 @@
+<!DOCTYPE HTML>
+<html lang="en" class="rust sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Op Bestiary - Morok</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "rust";
+            const default_dark_theme = "ayu";
+            window.path_to_searchindex_js = "../searchindex-403a6f69.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-6f19a375.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('rust')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Morok</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/patsak/morok" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/patsak/morok/edit/main/book/src/architecture/op-bestiary.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="op-bestiary-a-field-guide-to-uop-operations"><a class="header" href="#op-bestiary-a-field-guide-to-uop-operations">Op Bestiary: A Field Guide to UOp Operations</a></h1>
+<p>When debugging Morok IR dumps, you’ll encounter operations that aren’t obvious from their names. This chapter documents non-trivial operations with signatures, field explanations, and examples.</p>
+<p><strong>What’s covered:</strong> Operations that require explanation—loop control, reductions, memory operations, kernel structure, vectorization, tensor cores.</p>
+<p><strong>What’s NOT covered:</strong> Trivial ALU operations (<code>Add</code>, <code>Mul</code>, <code>Sqrt</code>, etc.) that work exactly as you’d expect.</p>
+<hr>
+<h2 id="loop-control-range-and-end"><a class="header" href="#loop-control-range-and-end">Loop Control: RANGE and END</a></h2>
+<h3 id="range--loop-scope-opener"><a class="header" href="#range--loop-scope-opener">RANGE — Loop Scope Opener</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Range {
+    end: Arc&lt;UOp&gt;,           // loop bound (exclusive)
+    axis_id: AxisId,         // identifier for deduplication
+    axis_type: AxisType,     // scheduling behavior
+}
+<span class="boring">}</span></code></pre>
+<p><strong>Fields:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>end</code></td><td><code>Arc&lt;UOp&gt;</code></td><td>Upper bound (exclusive), typically a <code>CONST</code></td></tr>
+<tr><td><code>axis_id</code></td><td><code>AxisId</code></td><td><code>Unrenumbered(n)</code> before kernel splitting, <code>Renumbered(n)</code> after</td></tr>
+<tr><td><code>axis_type</code></td><td><code>AxisType</code></td><td>Determines how the loop is scheduled (see below)</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>AxisType Hierarchy:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>Priority</th><th>GPU Mapping</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Outer</code></td><td>-2</td><td>—</td><td>Kernel boundary marker</td></tr>
+<tr><td><code>Loop</code></td><td>-1</td><td><code>for</code> loop</td><td>Sequential iteration</td></tr>
+<tr><td><code>Global</code></td><td>0</td><td><code>blockIdx</code></td><td>Grid parallelism</td></tr>
+<tr><td><code>Thread</code></td><td>0</td><td>thread pool</td><td>CPU parallelism</td></tr>
+<tr><td><code>Warp</code></td><td>1</td><td>warp/wavefront</td><td>Sub-group parallelism</td></tr>
+<tr><td><code>Local</code></td><td>2</td><td><code>threadIdx</code></td><td>Workgroup parallelism</td></tr>
+<tr><td><code>GroupReduce</code></td><td>2</td><td>shared memory</td><td>Two-stage reduction</td></tr>
+<tr><td><code>Upcast</code></td><td>3</td><td>SIMD</td><td>Vectorization</td></tr>
+<tr><td><code>Reduce</code></td><td>4</td><td>accumulator</td><td>Reduction dimension</td></tr>
+<tr><td><code>Unroll</code></td><td>5</td><td>unrolled</td><td>Loop unrolling</td></tr>
+</tbody>
+</table>
+</div>
+<p>Priority determines loop nesting order—lower values are outer loops.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">RANGE(end=128, axis_id=R0, type=Global)
+└── CONST(128) : Index
+</code></pre>
+<h3 id="end--loop-scope-closer"><a class="header" href="#end--loop-scope-closer">END — Loop Scope Closer</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>End {
+    computation: Arc&lt;UOp&gt;,              // value computed inside loop
+    ranges: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,    // ranges being closed
+}
+<span class="boring">}</span></code></pre>
+<p>END closes one or more RANGE scopes and removes them from the active set. Multiple ranges can be closed simultaneously.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">END
+├── STORE(...)           — computation
+├── RANGE(R0, Global)    — first range closed
+└── RANGE(R1, Local)     — second range closed
+</code></pre>
+<hr>
+<h2 id="reduction-reduce-vs-reduce_axis"><a class="header" href="#reduction-reduce-vs-reduce_axis">Reduction: REDUCE vs REDUCE_AXIS</a></h2>
+<p>Two operations with similar names serve different purposes.</p>
+<h3 id="reduce_axis--tensor-dimension-reduction-high-level"><a class="header" href="#reduce_axis--tensor-dimension-reduction-high-level">REDUCE_AXIS — Tensor Dimension Reduction (High-Level)</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>ReduceAxis {
+    src: Arc&lt;UOp&gt;,           // input tensor
+    reduce_op: ReduceOp,     // Add, Mul, Max, Min
+    axes: Vec&lt;usize&gt;,        // axes to reduce
+}
+<span class="boring">}</span></code></pre>
+<p>Used <strong>before</strong> rangeify. Operates on tensor dimensions like NumPy’s <code>.sum(axis=0)</code>.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">REDUCE_AXIS(Add, axes=[1])
+└── BUFFER[10, 20] : Float32
+</code></pre>
+<p>This reduces a <code>[10, 20]</code> tensor to <code>[10]</code> by summing along axis 1.</p>
+<h3 id="reduce--range-iteration-reduction-low-level"><a class="header" href="#reduce--range-iteration-reduction-low-level">REDUCE — Range Iteration Reduction (Low-Level)</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Reduce {
+    src: Arc&lt;UOp&gt;,                      // value to accumulate
+    ranges: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,    // ranges being reduced
+    reduce_op: ReduceOp,                // Add, Mul, Max, Min
+}
+<span class="boring">}</span></code></pre>
+<p>Used <strong>after</strong> rangeify. Accumulates values across RANGE iterations and closes the specified ranges.</p>
+<p><strong>ReduceOp Variants:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Op</th><th>Identity</th><th>Operation</th><th>Tinygrad</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Add</code></td><td>0</td><td><code>acc + value</code></td><td>✓</td></tr>
+<tr><td><code>Mul</code></td><td>1</td><td><code>acc * value</code></td><td>✓</td></tr>
+<tr><td><code>Max</code></td><td>-∞</td><td><code>max(acc, value)</code></td><td>✓</td></tr>
+<tr><td><code>Min</code></td><td>+∞</td><td><code>min(acc, value)</code></td><td>Morok-only</td></tr>
+</tbody>
+</table>
+</div>
+<blockquote>
+<p><strong>Compatibility:</strong> Tinygrad’s spec restricts REDUCE_AXIS to <code>{Add, Mul, Max}</code>. Morok extends this with <code>Min</code>.</p>
+</blockquote>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">REDUCE(Add)
+├── MUL                      — value to accumulate
+│   ├── LOAD(A, ...)
+│   └── LOAD(B, ...)
+└── RANGE(R2, Reduce)        — range being reduced
+    └── CONST(64)
+</code></pre>
+<h3 id="allreduce--cross-device-reduction"><a class="header" href="#allreduce--cross-device-reduction">ALLREDUCE — Cross-Device Reduction</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>AllReduce {
+    src: Arc&lt;UOp&gt;,           // local partial result
+    device: Arc&lt;UOp&gt;,        // device specification
+    reduce_op: ReduceOp,     // reduction operation
+}
+<span class="boring">}</span></code></pre>
+<p>Performs distributed reduction across multiple devices. Used for multi-GPU training.</p>
+<hr>
+<h2 id="buffer-operations"><a class="header" href="#buffer-operations">Buffer Operations</a></h2>
+<h3 id="buffer--buffer-declaration"><a class="header" href="#buffer--buffer-declaration">BUFFER — Buffer Declaration</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Buffer {
+    unique: Arc&lt;UOp&gt;,        // UNIQUE op for identity
+    device: Arc&lt;UOp&gt;,        // DEVICE op
+    size: usize,             // total element count
+}
+<span class="boring">}</span></code></pre>
+<p>Declares a buffer for tensor storage. The <code>unique</code> field ensures distinct buffers even with identical size/device.</p>
+<h3 id="bufferize--materialization-marker"><a class="header" href="#bufferize--materialization-marker">BUFFERIZE — Materialization Marker</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Bufferize {
+    compute: Arc&lt;UOp&gt;,                  // computation to materialize
+    ranges: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,    // output dimensions
+    opts: BufferizeOpts,                // address space, device
+}
+<span class="boring">}</span></code></pre>
+<p>Marks where computation should materialize to memory. Triggers kernel splitting.</p>
+<p><strong>BufferizeOpts:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>device</code></td><td><code>Option&lt;DeviceSpec&gt;</code></td><td>Target device, <code>None</code> for local</td></tr>
+<tr><td><code>addrspace</code></td><td><code>AddrSpace</code></td><td><code>Global</code> (device) or <code>Local</code> (shared)</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">BUFFERIZE(opts={addrspace=Global})
+├── REDUCE(Add, ...)         — computation
+├── RANGE(R0, Global)        — output dim 0
+└── RANGE(R1, Global)        — output dim 1
+</code></pre>
+<h3 id="index--multi-dimensional-buffer-access"><a class="header" href="#index--multi-dimensional-buffer-access">INDEX — Multi-Dimensional Buffer Access</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Index {
+    buffer: Arc&lt;UOp&gt;,                   // BUFFER or DEFINE_GLOBAL
+    indices: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,   // index per dimension
+    gate: Option&lt;Arc&lt;UOp&gt;&gt;,             // optional predicate
+}
+<span class="boring">}</span></code></pre>
+<p>Computes memory address from multi-dimensional indices. Returns element dtype (not pointer).</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">INDEX : Float32
+├── DEFINE_GLOBAL(0)
+├── RANGE(R0, Global)        — index for dim 0
+├── RANGE(R1, Loop)          — index for dim 1
+└── MUL(...)                 — index for dim 2
+</code></pre>
+<h3 id="pointer_index--low-level-pointer-arithmetic"><a class="header" href="#pointer_index--low-level-pointer-arithmetic">POINTER_INDEX — Low-Level Pointer Arithmetic</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>PointerIndex {
+    ptr: Arc&lt;UOp&gt;,           // base pointer
+    offset: Arc&lt;UOp&gt;,        // byte offset
+}
+<span class="boring">}</span></code></pre>
+<p>Direct pointer arithmetic. Used after linearization when indices are flattened.</p>
+<blockquote>
+<p><strong>Compatibility:</strong> Tinygrad uses <code>INDEX</code> with a <code>ptr=True</code> flag instead of a separate operation.</p>
+</blockquote>
+<h3 id="load--memory-read"><a class="header" href="#load--memory-read">LOAD — Memory Read</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Load {
+    buffer: Arc&lt;UOp&gt;,        // buffer or pointer
+    index: Arc&lt;UOp&gt;,         // INDEX op
+}
+<span class="boring">}</span></code></pre>
+<p>Read value from buffer at index. For gated loads, use an INDEX with a gate (INDEX has an optional <code>gate</code> field).</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">LOAD : Float32
+├── DEFINE_GLOBAL(1)
+└── INDEX
+    ├── DEFINE_GLOBAL(1)
+    ├── RANGE(R0)
+    └── RANGE(R2)
+</code></pre>
+<h3 id="store--memory-write"><a class="header" href="#store--memory-write">STORE — Memory Write</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Store {
+    buffer: Arc&lt;UOp&gt;,                   // output buffer
+    index: Arc&lt;UOp&gt;,                    // INDEX op
+    value: Arc&lt;UOp&gt;,                    // value to write
+    ranges: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,    // ranges being closed
+}
+<span class="boring">}</span></code></pre>
+<p>Write value to buffer. STORE closes the specified ranges, which represent output iteration dimensions. The ranges field is used for output upcasting: when a <code>Range(Upcast)</code> is included, it becomes <code>UNROLL</code> during expansion, then contracted via <code>CONTRACT</code>.</p>
+<p>For gated stores, use an INDEX with a gate (INDEX has an optional <code>gate</code> field).</p>
+<blockquote>
+<p><strong>Compatibility:</strong> Morok’s STORE has an explicit <code>index</code> field (sources: buffer=0, index=1, value=2, ranges=3+). Tinygrad’s STORE combines buffer and value differently (range_start=2).</p>
+</blockquote>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">STORE
+├── DEFINE_GLOBAL(0)         — output buffer
+├── INDEX[R0, R1]            — write address
+├── REDUCE(Add, ...)         — value
+├── RANGE(R0, Global)        — output dim 0 (closed)
+└── RANGE(R1, Global)        — output dim 1 (closed)
+</code></pre>
+<hr>
+<h2 id="kernel-structure"><a class="header" href="#kernel-structure">Kernel Structure</a></h2>
+<h3 id="kernel--kernel-wrapper"><a class="header" href="#kernel--kernel-wrapper">KERNEL — Kernel Wrapper</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Kernel {
+    sources: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,   // arguments
+    ast: Arc&lt;UOp&gt;,                       // computation (usually SINK)
+}
+<span class="boring">}</span></code></pre>
+<p>Wraps a complete kernel for code generation. Sources are kernel arguments (<code>DefineGlobal</code>, <code>DefineLocal</code>, <code>DefineVar</code>).</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">KERNEL
+├── DEFINE_GLOBAL(0)         — output buffer arg
+├── DEFINE_GLOBAL(1)         — input A arg
+├── DEFINE_GLOBAL(2)         — input B arg
+└── SINK                     — computation
+    └── STORE(...)
+</code></pre>
+<h3 id="sink--multiple-root-collector"><a class="header" href="#sink--multiple-root-collector">SINK — Multiple Root Collector</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Sink {
+    sources: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p>Collects multiple outputs into a single root. Every kernel’s <code>ast</code> is typically a SINK containing STORE operations.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">SINK
+├── STORE(output_0, ...)
+├── STORE(output_1, ...)
+└── STORE(output_2, ...)
+</code></pre>
+<h3 id="after--dependency-marker"><a class="header" href="#after--dependency-marker">AFTER — Dependency Marker</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>After {
+    passthrough: Arc&lt;UOp&gt;,              // value that flows through
+    deps: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,      // operations that must complete
+}
+<span class="boring">}</span></code></pre>
+<p>Expresses execution dependencies between kernels without data dependency. The <code>passthrough</code> value is returned unchanged, but only after all <code>deps</code> complete.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">SINK
+├── AFTER
+│   ├── DEFINE_GLOBAL(0)     — passthrough (buffer reference)
+│   └── KERNEL(...)          — must complete first
+└── KERNEL(...)              — can use buffer after AFTER
+</code></pre>
+<h3 id="barrier--synchronization-fence"><a class="header" href="#barrier--synchronization-fence">BARRIER — Synchronization Fence</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Barrier {
+    src: Arc&lt;UOp&gt;,                      // value passing through
+    deps: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,      // operations to wait for
+}
+<span class="boring">}</span></code></pre>
+<p>GPU workgroup synchronization. Ensures all threads in a workgroup reach the barrier before continuing.</p>
+<hr>
+<h2 id="vector-operations"><a class="header" href="#vector-operations">Vector Operations</a></h2>
+<h3 id="vectorize--create-vector-from-scalars"><a class="header" href="#vectorize--create-vector-from-scalars">VECTORIZE — Create Vector from Scalars</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Vectorize {
+    elements: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p>Combines N scalar values into a vector of size N. All elements must have the same base dtype.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">VECTORIZE : &lt;4 x Float32&gt;
+├── CONST(1.0)
+├── CONST(2.0)
+├── CONST(3.0)
+└── CONST(4.0)
+</code></pre>
+<h3 id="gep--get-element-pointer-vector-extract"><a class="header" href="#gep--get-element-pointer-vector-extract">GEP — Get Element Pointer (Vector Extract)</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Gep {
+    vector: Arc&lt;UOp&gt;,        // source vector
+    indices: Vec&lt;usize&gt;,     // positions to extract
+}
+<span class="boring">}</span></code></pre>
+<p>Extracts elements from a vector:</p>
+<ul>
+<li>Single index → scalar</li>
+<li>Multiple indices → smaller vector</li>
+</ul>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">GEP([0, 2]) : &lt;2 x Float32&gt;
+└── VECTORIZE : &lt;4 x Float32&gt;
+    └── ...
+</code></pre>
+<h3 id="vconst--vector-constant"><a class="header" href="#vconst--vector-constant">VConst — Vector Constant</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>VConst {
+    values: Vec&lt;ConstValue&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p>Vector of compile-time constants. More efficient than <code>VECTORIZE</code> of <code>CONST</code> nodes.</p>
+<h3 id="cat--concatenate-vectors"><a class="header" href="#cat--concatenate-vectors">CAT — Concatenate Vectors</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Cat {
+    sources: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p>Concatenates vectors into a larger vector. Output <code>vcount</code> = sum of input <code>vcount</code>s.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">CAT : &lt;8 x Float32&gt;
+├── VECTORIZE : &lt;4 x Float32&gt;
+└── VECTORIZE : &lt;4 x Float32&gt;
+</code></pre>
+<h3 id="ptrcat--concatenate-pointers"><a class="header" href="#ptrcat--concatenate-pointers">PtrCat — Concatenate Pointers</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>PtrCat {
+    sources: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p>Groups memory accesses for vectorized load/store. Used by the devectorizer pass.</p>
+<hr>
+<h2 id="expansion-unroll-and-contract"><a class="header" href="#expansion-unroll-and-contract">Expansion: UNROLL and CONTRACT</a></h2>
+<h3 id="unroll--expand-computation-across-iterations"><a class="header" href="#unroll--expand-computation-across-iterations">UNROLL — Expand Computation Across Iterations</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Unroll {
+    src: Arc&lt;UOp&gt;,                       // computation to expand
+    unroll_axes: Vec&lt;(usize, usize)&gt;,    // (axis_index, factor) pairs
+}
+<span class="boring">}</span></code></pre>
+<p>Creates multiple versions of computation for different iteration values. Used for loop unrolling optimization.</p>
+<p><strong>Example:</strong> <code>UNROLL(unroll_axes=[(0, 4)])</code> expands computation 4 times with different index values.</p>
+<h3 id="contract--collapse-unrolled-values-to-vector"><a class="header" href="#contract--collapse-unrolled-values-to-vector">CONTRACT — Collapse Unrolled Values to Vector</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Contract {
+    src: Arc&lt;UOp&gt;,                       // unrolled computation
+    upcast_ranges: Vec&lt;(usize, usize)&gt;,  // (axis_index, factor) pairs
+}
+<span class="boring">}</span></code></pre>
+<p>The inverse of UNROLL—collects expanded scalar values into a vector. Output vector size = product of factors.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">CONTRACT(upcast_ranges=[(0, 4)]) : &lt;4 x Float32&gt;
+└── UNROLL(unroll_axes=[(0, 4)])
+    └── LOAD(...)
+</code></pre>
+<p>This pattern vectorizes a load: expand 4 iterations, then pack results into a 4-element vector.</p>
+<hr>
+<h2 id="tensor-cores-wmma"><a class="header" href="#tensor-cores-wmma">Tensor Cores: WMMA</a></h2>
+<h3 id="wmma--warp-matrix-multiply-accumulate"><a class="header" href="#wmma--warp-matrix-multiply-accumulate">WMMA — Warp Matrix Multiply-Accumulate</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Wmma {
+    a: Arc&lt;UOp&gt;,             // matrix A fragment
+    b: Arc&lt;UOp&gt;,             // matrix B fragment
+    c: Arc&lt;UOp&gt;,             // accumulator C fragment
+    metadata: WmmaMetadata,  // hardware configuration
+}
+<span class="boring">}</span></code></pre>
+<p>Hardware tensor core operation: <code>D = A × B + C</code>. Requires specific matrix shapes and data layouts.</p>
+<p><strong>WmmaMetadata Fields:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td><code>String</code></td><td>Instruction name (e.g., <code>"__hmma..."</code>)</td></tr>
+<tr><td><code>dims</code></td><td><code>(N, M, K)</code></td><td>Matrix dimensions (e.g., <code>(16, 16, 16)</code>)</td></tr>
+<tr><td><code>dtype_in</code></td><td><code>DType</code></td><td>Input matrix precision (e.g., <code>Float16</code>)</td></tr>
+<tr><td><code>dtype_out</code></td><td><code>DType</code></td><td>Output precision (e.g., <code>Float32</code>)</td></tr>
+<tr><td><code>device</code></td><td><code>String</code></td><td>Target device string</td></tr>
+<tr><td><code>threads</code></td><td><code>usize</code></td><td>Threads per warp (typically 32)</td></tr>
+<tr><td><code>upcast_axes</code></td><td><code>Vec&lt;(usize, usize)&gt;</code></td><td>Vectorization for output</td></tr>
+<tr><td><code>reduce_axes</code></td><td><code>Vec&lt;(usize, usize)&gt;</code></td><td>Contraction axes</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">WMMA(dims=(16, 16, 16), dtype_in=Float16, dtype_out=Float32)
+├── A fragment : &lt;8 x Float16&gt;
+├── B fragment : &lt;8 x Float16&gt;
+└── C accumulator : &lt;8 x Float32&gt;
+</code></pre>
+<hr>
+<h2 id="control-flow"><a class="header" href="#control-flow">Control Flow</a></h2>
+<h3 id="if--endif--conditional-execution"><a class="header" href="#if--endif--conditional-execution">IF / ENDIF — Conditional Execution</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>If {
+    condition: Arc&lt;UOp&gt;,                // boolean predicate
+    body: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt;,      // operations to execute
+}
+
+EndIf {
+    if_op: Arc&lt;UOp&gt;,         // corresponding IF op
+}
+<span class="boring">}</span></code></pre>
+<p>Execute body only when condition is true. Used for boundary checks and sparse operations.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">IF
+├── LT(idx, bound)           — condition (src[0])
+├── STORE(...)               — body[0]
+└── STORE(...)               — body[1]
+
+ENDIF
+└── IF(...)                  — references IF op
+</code></pre>
+<hr>
+<h2 id="definition-operations"><a class="header" href="#definition-operations">Definition Operations</a></h2>
+<h3 id="define_global--device-memory-argument"><a class="header" href="#define_global--device-memory-argument">DEFINE_GLOBAL — Device Memory Argument</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>DefineGlobal(usize)          // argument index
+<span class="boring">}</span></code></pre>
+<p>Kernel argument for device (global) memory. Index refers to position in kernel argument list.</p>
+<h3 id="define_local--shared-memory-allocation"><a class="header" href="#define_local--shared-memory-allocation">DEFINE_LOCAL — Shared Memory Allocation</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>DefineLocal(usize)           // local memory index
+<span class="boring">}</span></code></pre>
+<p>GPU shared memory (LDS) allocation. Visible within a workgroup.</p>
+<h3 id="define_var--symbolic-runtime-variable"><a class="header" href="#define_var--symbolic-runtime-variable">DEFINE_VAR — Symbolic Runtime Variable</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>DefineVar {
+    name: String,            // variable name
+    min_val: i64,            // minimum bound
+    max_val: i64,            // maximum bound
+}
+<span class="boring">}</span></code></pre>
+<p>Runtime variable with known bounds. Used for dynamic shapes where bounds are known.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">DEFINE_VAR(name="batch_size", min=1, max=128) : Index
+</code></pre>
+<h3 id="define_reg--register-allocation"><a class="header" href="#define_reg--register-allocation">DEFINE_REG — Register Allocation</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>DefineReg {
+    size: usize,             // register size
+}
+<span class="boring">}</span></code></pre>
+<p>Allocates a register for intermediate storage. Used in code generation.</p>
+<h3 id="bind--variable-binding"><a class="header" href="#bind--variable-binding">BIND — Variable Binding</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Bind {
+    var: Arc&lt;UOp&gt;,           // DEFINE_VAR
+    value: Arc&lt;UOp&gt;,         // concrete value
+}
+<span class="boring">}</span></code></pre>
+<p>Binds a symbolic variable to a concrete value at runtime.</p>
+<hr>
+<h2 id="special-operations"><a class="header" href="#special-operations">Special Operations</a></h2>
+<h3 id="special--hardware-provided-values"><a class="header" href="#special--hardware-provided-values">SPECIAL — Hardware-Provided Values</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Special {
+    end: Arc&lt;UOp&gt;,           // upper bound for this dimension
+    name: String,            // e.g., "blockIdx.x", "threadIdx.y"
+}
+<span class="boring">}</span></code></pre>
+<p>Accesses hardware-provided values (thread/block indices). Not a loop—the hardware provides the value directly.</p>
+<p><strong>Example:</strong></p>
+<pre><code class="language-text">SPECIAL(name="blockIdx.x", end=128) : Index
+└── CONST(128)
+</code></pre>
+<h3 id="unique--identity-marker"><a class="header" href="#unique--identity-marker">UNIQUE — Identity Marker</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Unique(usize)                // unique identifier
+<span class="boring">}</span></code></pre>
+<p>Creates a unique identity for buffer disambiguation. Two buffers with different UNIQUE values are distinct even if otherwise identical.</p>
+<h3 id="device--device-specification"><a class="header" href="#device--device-specification">DEVICE — Device Specification</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>Device(DeviceSpec)           // device specification
+<span class="boring">}</span></code></pre>
+<p>Specifies target device for computation.</p>
+<hr>
+<h2 id="movement-operations"><a class="header" href="#movement-operations">Movement Operations</a></h2>
+<p>High-level tensor shape transformations. These are converted to explicit INDEX operations during rangeify.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Signature</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Reshape</code></td><td><code>{ src, new_shape }</code></td><td>Change shape, same elements</td></tr>
+<tr><td><code>Permute</code></td><td><code>{ src, axes: Vec&lt;usize&gt; }</code></td><td>Transpose/reorder axes</td></tr>
+<tr><td><code>Expand</code></td><td><code>{ src, new_shape }</code></td><td>Broadcast to larger shape</td></tr>
+<tr><td><code>Pad</code></td><td><code>{ src, begin_pads, end_pads }</code></td><td>Add padding</td></tr>
+<tr><td><code>Shrink</code></td><td><code>{ src, begins, ends }</code></td><td>Extract sub-region</td></tr>
+<tr><td><code>Flip</code></td><td><code>{ src, axes: Vec&lt;bool&gt; }</code></td><td>Reverse along axes</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Example:</strong> RESHAPE</p>
+<pre><code class="language-text">RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
+├── BUFFER[2, 3, 4] : Float32
+└── CONST([6, 4]) : Shape
+</code></pre>
+<hr>
+<h2 id="quick-reference"><a class="header" href="#quick-reference">Quick Reference</a></h2>
+<h3 id="by-category"><a class="header" href="#by-category">By Category</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Category</th><th>Operations</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Loop Control</strong></td><td><code>RANGE</code>, <code>END</code></td></tr>
+<tr><td><strong>Reduction</strong></td><td><code>REDUCE_AXIS</code>, <code>REDUCE</code>, <code>ALLREDUCE</code></td></tr>
+<tr><td><strong>Memory</strong></td><td><code>BUFFER</code>, <code>BUFFERIZE</code>, <code>INDEX</code>, <code>POINTER_INDEX</code>, <code>LOAD</code>, <code>STORE</code></td></tr>
+<tr><td><strong>Kernel</strong></td><td><code>KERNEL</code>, <code>SINK</code>, <code>AFTER</code>, <code>BARRIER</code></td></tr>
+<tr><td><strong>Vector</strong></td><td><code>VECTORIZE</code>, <code>GEP</code>, <code>VCONST</code>, <code>CAT</code>, <code>PTRCAT</code></td></tr>
+<tr><td><strong>Expansion</strong></td><td><code>UNROLL</code>, <code>CONTRACT</code></td></tr>
+<tr><td><strong>Hardware</strong></td><td><code>WMMA</code>, <code>SPECIAL</code></td></tr>
+<tr><td><strong>Control</strong></td><td><code>IF</code>, <code>ENDIF</code></td></tr>
+<tr><td><strong>Definition</strong></td><td><code>DEFINE_GLOBAL</code>, <code>DEFINE_LOCAL</code>, <code>DEFINE_VAR</code>, <code>DEFINE_REG</code>, <code>BIND</code>, <code>UNIQUE</code>, <code>DEVICE</code></td></tr>
+<tr><td><strong>Movement</strong></td><td><code>RESHAPE</code>, <code>PERMUTE</code>, <code>EXPAND</code>, <code>PAD</code>, <code>SHRINK</code>, <code>FLIP</code></td></tr>
+<tr><td><strong>ALU</strong></td><td><code>Unary(...)</code>, <code>Binary(...)</code>, <code>Ternary(...)</code>, <code>Cast</code>, <code>BitCast</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="range-ending-operations"><a class="header" href="#range-ending-operations">Range-Ending Operations</a></h3>
+<p>Operations that close RANGE scopes (remove ranges from active set):</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Range Start Index</th></tr>
+</thead>
+<tbody>
+<tr><td><code>BUFFERIZE</code></td><td>1 (compute=0, ranges=1+)</td></tr>
+<tr><td><code>REDUCE</code></td><td>1 (src=0, ranges=1+)</td></tr>
+<tr><td><code>STORE</code></td><td>3 (buffer=0, index=1, value=2, ranges=3+)</td></tr>
+<tr><td><code>WMMA</code></td><td>3 (a=0, b=1, c=2)</td></tr>
+<tr><td><code>END</code></td><td>1 (computation=0, ranges=1+)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="expandable-operations"><a class="header" href="#expandable-operations">Expandable Operations</a></h3>
+<p>Operations that propagate UNROLL through the computation graph:</p>
+<ul>
+<li>ALU: <code>Unary</code>, <code>Binary</code>, <code>Ternary</code></li>
+<li>Type: <code>Cast</code>, <code>BitCast</code></li>
+<li>Vector: <code>Gep</code>, <code>Vectorize</code></li>
+<li>Memory: <code>Load</code>, <code>Store</code>, <code>Index</code>, <code>PointerIndex</code></li>
+<li>Control: <code>Reduce</code>, <code>End</code>, <code>After</code></li>
+<li>Buffer: <code>Bufferize</code></li>
+<li>Hardware: <code>Wmma</code></li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../architecture/optimizations.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../architecture/optimizations.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-c2a407aa.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

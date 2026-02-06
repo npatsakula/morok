@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "rust";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-9ce5fe74.js";
+            window.path_to_searchindex_js = "../searchindex-403a6f69.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-23939a7d.js"></script>
+        <script src="../toc-6f19a375.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -180,135 +180,324 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="ir-design-philosophy"><a class="header" href="#ir-design-philosophy">IR Design Philosophy</a></h1>
-<p>Morok uses a single unified IR (UOp) for all compilation stages, following Tinygrad’s design philosophy.</p>
-<h2 id="the-uop-structure"><a class="header" href="#the-uop-structure">The UOp Structure</a></h2>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub struct UOp {
-    pub id: u64,                    // Unique stable ID
-    pub(crate) op: Op,              // Operation (Rust tagged union)
-    pub(crate) dtype: DType,        // Data type
-    // Cached properties (computed lazily)
-    pub(crate) shape_cache: OnceCell&lt;...&gt;,
-    pub(crate) vmin_vmax_cache: OnceCell&lt;...&gt;,
-}
-<span class="boring">}</span></code></pre>
-<p><strong>Key fields:</strong></p>
-<ul>
-<li><code>op</code>: An <code>Op</code> enum with 80+ operations spanning all abstraction levels</li>
-<li><code>dtype</code>: Type information (scalars, vectors, pointers)</li>
-<li><code>id</code>: Unique identifier for caching and provenance tracking</li>
-</ul>
-<h2 id="why-one-ir"><a class="header" href="#why-one-ir">Why One IR?</a></h2>
-<p>Traditional ML compilers use multiple IRs:</p>
-<ul>
-<li><strong>TensorFlow:</strong> Graph → XLA HLO → MLIR → LLVM IR</li>
-<li><strong>PyTorch:</strong> Python AST → TorchScript → FX Graph → Inductor IR → Triton</li>
-<li><strong>JAX:</strong> Python → Jaxpr → StableHLO → MHLO → platform IR</li>
-</ul>
-<p>Morok/Tinygrad uses <strong>one IR</strong> that represents all abstraction levels:</p>
-<h3 id="same-uop-at-different-stages"><a class="header" href="#same-uop-at-different-stages">Same UOp at Different Stages</a></h3>
-<pre><code># High-level (after tensor ops):
-BUFFER.reshape([2,3]).reduce(ADD, axis=0)
-
-# Mid-level (after rangeify):
-RANGE(2) -&gt; RANGE(3) -&gt; LOAD -&gt; REDUCE -&gt; STORE -&gt; END
-
-# Low-level (after codegen passes):
-DEFINE_GLOBAL -&gt; INDEX -&gt; LOAD -&gt; ADD -&gt; STORE
+                        <h1 id="one-ir-to-rule-them-all"><a class="header" href="#one-ir-to-rule-them-all">One IR to Rule Them All</a></h1>
+<p>You’re debugging a slow model. The profiler says “kernel X takes 200ms” but you have no idea what kernel X actually <em>does</em>. You trace through PyTorch’s dispatcher, then ATen, then TorchInductor, then Triton IR, and finally land in LLVM IR. Five different representations, five different mental models, five different debugging tools.</p>
+<p>This is the reality of modern ML compilation. TensorFlow’s XLA has a similar story: Python → Graph → XLA HLO → MLIR → LLVM IR. Each layer was added to solve a real problem, but the accumulated complexity is staggering.</p>
+<p>Morok takes a different approach, borrowed from <a href="https://github.com/tinygrad/tinygrad">Tinygrad</a>: <strong>one IR from tensors to machine code</strong>.</p>
+<pre><code class="language-text">┌──────────────────┐   ┌─────────────────┐   ┌───────────────┐
+│    TensorFlow    │   │     PyTorch     │   │     Morok     │
+├──────────────────┤   ├─────────────────┤   ├───────────────┤
+│   Python API     │   │   Python API    │   │  Rust/Python  │
+│   TF Graph       │   │   FX Graph      │   │       ↓       │
+│   XLA HLO        │   │   Inductor IR   │   │    UOp IR     │
+│   MLIR dialects  │   │   Triton IR     │   │       ↓       │
+│   LLVM IR        │   │   LLVM/PTX      │   │  Machine code │
+│   Machine code   │   │   Machine code  │   │               │
+├──────────────────┤   ├─────────────────┤   ├───────────────┤
+│      5 IRs       │   │      4 IRs      │   │     1 IR      │
+└──────────────────┘   └─────────────────┘   └───────────────┘
 </code></pre>
-<h3 id="enabling-factors"><a class="header" href="#enabling-factors">Enabling Factors</a></h3>
-<ol>
-<li>
-<p><strong>Graph Rewriting as Universal Mechanism</strong></p>
-<p>Pattern matching + rewriting handles all transformations:</p>
+<p>The simplest architecture often wins. This chapter explains how one carefully designed IR can replace an entire compiler stack.</p>
+<hr>
+<h2 id="uop-the-universal-node"><a class="header" href="#uop-the-universal-node">UOp: The Universal Node</a></h2>
+<p>A <strong>UOp</strong> (micro-operation) is a node in a computation graph. But unlike nodes in other IRs, a UOp can represent operations at <em>any</em> abstraction level—from high-level tensor reshapes down to individual CPU instructions.</p>
+<p>Here’s the key insight: instead of having separate IRs for “tensor operations” and “loop structures” and “memory accesses”, we put them all in one enum:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>let optimized = graph_rewrite(&amp;patterns, uop_graph, &amp;mut ctx);
-<span class="boring">}</span></code></pre>
-</li>
-<li>
-<p><strong>Hash Consing (Structural Sharing)</strong></p>
-<p>Identical subgraphs share memory via a thread-local cache:</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>thread_local! {
-    static CACHE: RefCell&lt;HashMap&lt;UOpKey, Weak&lt;UOp&gt;&gt;&gt; = ...;
+</span>pub enum Op {
+    // High-level tensor operations
+    Reshape { src: Arc&lt;UOp&gt;, new_shape: Arc&lt;UOp&gt; },
+    Permute { src: Arc&lt;UOp&gt;, axes: Vec&lt;usize&gt; },
+    ReduceAxis { src: Arc&lt;UOp&gt;, reduce_op: ReduceOp, axes: Vec&lt;usize&gt; },
+
+    // Loop-level control flow
+    Range { end: Arc&lt;UOp&gt;, axis_id: AxisId, axis_type: AxisType },
+    End { computation: Arc&lt;UOp&gt;, ranges: SmallVec&lt;[Arc&lt;UOp&gt;; 4]&gt; },
+
+    // Memory operations
+    Load { buffer: Arc&lt;UOp&gt;, index: Arc&lt;UOp&gt; },
+    Store { buffer: Arc&lt;UOp&gt;, index: Arc&lt;UOp&gt;, value: Arc&lt;UOp&gt;, ... },
+
+    // ALU operations (same as hardware)
+    Binary(BinaryOp, Arc&lt;UOp&gt;, Arc&lt;UOp&gt;),  // Add, Mul, etc.
+    Unary(UnaryOp, Arc&lt;UOp&gt;),              // Sqrt, Exp, etc.
 }
 <span class="boring">}</span></code></pre>
-<p>Benefits:</p>
+<p>The enum has ~80 variants organized by abstraction level:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Category</th><th>Examples</th><th>What It Represents</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Movement</strong></td><td><code>RESHAPE</code>, <code>PERMUTE</code>, <code>EXPAND</code>, <code>PAD</code></td><td>Tensor shape transformations</td></tr>
+<tr><td><strong>Reduction</strong></td><td><code>REDUCE_AXIS</code>, <code>REDUCE</code></td><td>Mathematical aggregations</td></tr>
+<tr><td><strong>Control</strong></td><td><code>RANGE</code>, <code>END</code>, <code>IF</code>, <code>BARRIER</code></td><td>Loop and branch structure</td></tr>
+<tr><td><strong>Memory</strong></td><td><code>LOAD</code>, <code>STORE</code>, <code>INDEX</code>, <code>BUFFER</code></td><td>Hardware memory access</td></tr>
+<tr><td><strong>ALU</strong></td><td><code>ADD</code>, <code>MUL</code>, <code>SQRT</code>, <code>EXP</code>, <code>WHERE</code></td><td>CPU/GPU instructions</td></tr>
+<tr><td><strong>Advanced</strong></td><td><code>WMMA</code>, <code>CONTRACT</code>, <code>UNROLL</code></td><td>Tensor cores, vectorization</td></tr>
+</tbody>
+</table>
+</div>
+<p>When you print a UOp graph, you see its tree structure:</p>
+<pre><code class="language-text">[42] STORE : Void
+├── [10] DEFINE_GLOBAL(0) : Ptr&lt;Float32&gt;
+├── [35] INDEX : Ptr&lt;Float32&gt;
+│   ├── [10] → (same as above)
+│   └── [30] RANGE(axis=0, Reduce) : Index
+│       └── [5] CONST(4) : Index
+└── [40] REDUCE(Add) : Float32
+    ├── [38] MUL : Float32
+    │   ├── [36] LOAD : Float32
+    │   └── [37] LOAD : Float32
+    └── [30] → (same RANGE as above)
+</code></pre>
+<p>Notice the arrows pointing to “same as above”? That’s not just pretty-printing—it’s a fundamental property called <strong>hash consing</strong>.</p>
+<hr>
+<h2 id="hash-consing-structural-sharing"><a class="header" href="#hash-consing-structural-sharing">Hash Consing: Structural Sharing</a></h2>
+<p>When you create the same expression twice in Morok, you get the <em>same pointer</em>. Not equal values—the same memory address.</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let a = UOp::binary(Add, x.clone(), y.clone());
+let b = UOp::binary(Add, x.clone(), y.clone());
+
+assert!(Arc::ptr_eq(&amp;a, &amp;b));  // Same pointer!
+<span class="boring">}</span></code></pre>
+<p>This works through a global cache. When constructing a UOp, we first check if an identical one exists:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub fn new(op: Op, dtype: DType) -&gt; Arc&lt;Self&gt; {
+    let key = UOpKey::new(&amp;op, dtype);
+
+    // Check cache first
+    if let Some(existing) = CACHE.get(&amp;key) {
+        return existing;
+    }
+
+    // Create new and cache it
+    let uop = Arc::new(UOp { op, dtype, ... });
+    CACHE.insert(key, uop.clone());
+    uop
+}
+<span class="boring">}</span></code></pre>
+<p>Why does this matter for ML engineers?</p>
 <ul>
-<li>O(1) equality checking (pointer comparison)</li>
-<li>No duplicate subgraphs in memory</li>
-<li>Pattern matching can use pointer identity</li>
+<li>
+<p><strong>Pointer equality is semantic equality.</strong> To check if two subexpressions are identical, just compare pointers: <code>Arc::ptr_eq(&amp;a, &amp;b)</code>. No tree traversal needed.</p>
+</li>
+<li>
+<p><strong>Pattern matching is O(1).</strong> When the optimizer asks “have I seen this pattern before?”, pointer comparison gives an instant answer.</p>
+</li>
+<li>
+<p><strong>Memory efficiency.</strong> Common subexpressions (think: shared computations in attention, gradient graphs) are stored once, not duplicated.</p>
+</li>
+<li>
+<p><strong>Thread safety.</strong> The same computation from different threads produces the same object—no synchronization bugs.</p>
+</li>
 </ul>
+<p>The tree printout shows this: when you see <code>[10] → (same as above)</code>, that’s not a copy—it’s the <em>same node</em> referenced from multiple places.</p>
+<hr>
+<h2 id="explicit-loops-the-range-operation"><a class="header" href="#explicit-loops-the-range-operation">Explicit Loops: The <code>RANGE</code> Operation</a></h2>
+<p>Most ML IRs hide loops inside operations. In ONNX, a reduction looks like:</p>
+<pre><code class="language-python">ReduceSum(data, axes=[1], keepdims=0)
+</code></pre>
+<p>Where’s the loop? It’s implicit—somewhere inside the runtime’s implementation of <code>ReduceSum</code>. You can’t see it, can’t modify it, can’t reason about it.</p>
+<p>Morok makes loops <em>explicit</em> using <code>RANGE</code> operations. The same reduction becomes:</p>
+<pre><code class="language-text">[REDUCE(Add)]
+├── [LOAD]
+│   └── [INDEX]
+│       ├── [BUFFER]
+│       ├── [RANGE(axis=0, Global)]   # outer loop (parallelized)
+│       │   └── [CONST(128)]
+│       └── [RANGE(axis=1, Reduce)]   # reduction loop
+│           └── [CONST(64)]
+└── [RANGE(axis=1, Reduce)]           # same RANGE via hash consing
+</code></pre>
+<p>Each <code>RANGE</code> has an <strong>AxisType</strong> that tells the code generator how to compile it:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>AxisType</th><th>CPU</th><th>CUDA</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Global</strong></td><td>Thread pool</td><td><code>blockIdx</code></td><td>Outer parallel dimension</td></tr>
+<tr><td><strong>Local</strong></td><td>(N/A)</td><td><code>threadIdx</code></td><td>Workgroup parallelism</td></tr>
+<tr><td><strong>Loop</strong></td><td><code>for</code> loop</td><td><code>for</code> loop</td><td>Sequential iteration</td></tr>
+<tr><td><strong>Reduce</strong></td><td>Accumulator</td><td>Warp reduce</td><td>Reduction dimension</td></tr>
+<tr><td><strong>Upcast</strong></td><td>SIMD vector</td><td>Register tile</td><td>Vectorization</td></tr>
+<tr><td><strong>Unroll</strong></td><td>Unrolled</td><td>Unrolled</td><td>Loop unrolling</td></tr>
+</tbody>
+</table>
+</div>
+<p>The AxisType hierarchy (Global → Local → Loop → Reduce → Upcast → Unroll) maps directly to GPU programming models. A <code>RANGE</code> with <code>AxisType::Global</code> becomes <code>blockIdx.x</code> in CUDA. A <code>RANGE</code> with <code>AxisType::Local</code> becomes <code>threadIdx.x</code>.</p>
+<p>Why explicit loops matter:</p>
+<ul>
+<li>
+<p><strong>Optimization is visible.</strong> You can <em>see</em> which loops will be parallelized, which will be unrolled, which will use SIMD.</p>
 </li>
 <li>
-<p><strong>Lazy Property Computation</strong></p>
-<p>Expensive analyses computed once and cached:</p>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>pub(crate) shape_cache: OnceCell&lt;Result&lt;Option&lt;Shape&gt;&gt;&gt;,
-pub(crate) vmin_vmax_cache: OnceCell&lt;(ConstValue, ConstValue)&gt;,
-<span class="boring">}</span></code></pre>
+<p><strong>Scheduling is graph rewriting.</strong> Changing loop order, tiling, or unrolling is just a pattern transformation—no special “scheduling pass”.</p>
 </li>
 <li>
-<p><strong>Operation Hierarchy</strong></p>
-<p>Ops organized by level to support progressive lowering:</p>
+<p><strong>Same IR at every stage.</strong> The <code>RANGE</code> that represents “iterate over batch dimension” at the tensor level is the <em>same</em> <code>RANGE</code> that becomes <code>for (int i = 0; i &lt; N; i++)</code> in generated code.</p>
+</li>
+</ul>
+<hr>
+<h2 id="graph-rewriting-one-transformation-mechanism"><a class="header" href="#graph-rewriting-one-transformation-mechanism">Graph Rewriting: One Transformation Mechanism</a></h2>
+<p>Traditional compilers have dozens of specialized passes: constant folding, dead code elimination, loop unrolling, operator fusion. Each pass has custom logic, custom data structures, custom bugs.</p>
+<p>Morok uses one mechanism: <strong>pattern-based graph rewriting</strong>.</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>impl Op {
-    pub fn is_movement(&amp;self) -&gt; bool { ... }
-    pub fn is_buffer(&amp;self) -&gt; bool { ... }
-    pub fn is_alu(&amp;self) -&gt; bool { ... }
+</span>patterns! {
+    // Identity folding: x + 0 → x
+    Add[x, @zero] ~&gt; x,
+
+    // Constant folding: 3 + 4 → 7
+    Add(a @const(a_val), b @const(b_val))
+        =&gt; eval_add(a_val, b_val).map(|r| UOp::const_(a.dtype(), r)),
+
+    // Self-folding: x / x → 1
+    Idiv(x, x) ~&gt; UOp::one(x.dtype()),
+
+    // Dead code: if(true) { x } else { y } → x
+    Where(@true, t, _f) ~&gt; t,
 }
 <span class="boring">}</span></code></pre>
-</li>
-</ol>
-<h2 id="trade-offs"><a class="header" href="#trade-offs">Trade-offs</a></h2>
+<p>The DSL is expressive:</p>
+<ul>
+<li><strong><code>[x, y]</code> — commutative.</strong> Try both orderings (for <code>ADD</code>, <code>MUL</code>, etc.)</li>
+<li><strong><code>(x, y)</code> — ordered.</strong> Match exactly this order.</li>
+<li><strong><code>@zero</code>, <code>@one</code>, <code>@true</code> — semantic constants.</strong> Works for any dtype.</li>
+<li><strong><code>@const(val)</code> — extract value.</strong> For compile-time computation.</li>
+<li><strong><code>x, x</code> — same operand.</strong> Detects pointer equality.</li>
+<li><strong><code>~&gt;</code> vs <code>=&gt;</code></strong> — infallible vs fallible rewrite.</li>
+</ul>
+<p>The rewrite engine applies patterns bottom-up until no more matches:</p>
+<pre><code class="language-text">Original:       Add(Mul(x, 1), 0)
+After Mul:      Add(x, 0)         # Mul(x, 1) → x
+After Add:      x                 # Add(x, 0) → x
+</code></pre>
+<p>This single mechanism handles:</p>
+<ul>
+<li><strong>Algebraic simplification</strong> — constant folding, identity removal</li>
+<li><strong>Rangeify transformation</strong> — movement ops → explicit loops</li>
+<li><strong>Kernel optimization</strong> — vectorization, unrolling, tensor cores</li>
+<li><strong>Code generation</strong> — lowering to hardware primitives</li>
+</ul>
+<p>Same patterns, same engine, different pattern sets for each stage.</p>
+<hr>
+<h2 id="worked-example-matmul-journey"><a class="header" href="#worked-example-matmul-journey">Worked Example: Matmul Journey</a></h2>
+<p>Let’s trace <code>C = A @ B</code> (a 4×4 matrix multiply) through the entire pipeline.</p>
+<h3 id="stage-1-tensor-construction"><a class="header" href="#stage-1-tensor-construction">Stage 1: Tensor Construction</a></h3>
+<p>When you write <code>A.matmul(&amp;B)</code>, Morok builds a high-level UOp graph:</p>
+<pre><code class="language-text">[REDUCE_AXIS(Add, axes=[2])]
+├── [MUL]
+│   ├── [EXPAND]           # A: [4,4] → [4,4,4]
+│   │   └── [BUFFER(A)]
+│   └── [EXPAND]           # B: [4,4] → [4,4,4]
+│       └── [PERMUTE]      # transpose for broadcasting
+│           └── [BUFFER(B)]
+</code></pre>
+<p>This is pure math: “expand A and B to align dimensions, multiply elementwise, sum along the contracted axis.”</p>
+<h3 id="stage-2-rangeify"><a class="header" href="#stage-2-rangeify">Stage 2: Rangeify</a></h3>
+<p>The rangeify pass converts movement ops (<code>EXPAND</code>, <code>PERMUTE</code>) into explicit index computations with <code>RANGE</code> loops:</p>
+<pre><code class="language-text">[STORE]
+├── [DEFINE_GLOBAL(C)]
+├── [INDEX]
+│   ├── [DEFINE_GLOBAL(C)]
+│   ├── [RANGE(i, Global)]     # i ∈ [0, 4)
+│   │   └── [CONST(4)]
+│   └── [RANGE(j, Global)]     # j ∈ [0, 4)
+│       └── [CONST(4)]
+└── [REDUCE(Add)]
+    ├── [MUL]
+    │   ├── [LOAD(A)]
+    │   │   └── [INDEX]
+    │   │       ├── [RANGE(i)]     # same i (hash consing)
+    │   │       └── [RANGE(k, Reduce)]
+    │   └── [LOAD(B)]
+    │       └── [INDEX]
+    │           ├── [RANGE(k)]     # same k
+    │           └── [RANGE(j)]     # same j
+    └── [RANGE(k, Reduce)]         # k ∈ [0, 4)
+        └── [CONST(4)]
+</code></pre>
+<p>Now we see the loop structure: <code>i</code> and <code>j</code> are <code>Global</code> (parallelized), <code>k</code> is <code>Reduce</code> (accumulated).</p>
+<h3 id="stage-3-symbolic-simplification"><a class="header" href="#stage-3-symbolic-simplification">Stage 3: Symbolic Simplification</a></h3>
+<p>Pattern rewrites clean up redundant operations, fold constants, and simplify index arithmetic.</p>
+<h3 id="stage-4-code-generation"><a class="header" href="#stage-4-code-generation">Stage 4: Code Generation</a></h3>
+<p>The final IR translates directly to loops:</p>
+<pre><code class="language-c">// GPU kernel (conceptual)
+__global__ void matmul(float* C, float* A, float* B) {
+    int i = blockIdx.x;   // from RANGE(i, Global)
+    int j = blockIdx.y;   // from RANGE(j, Global)
+    float acc = 0.0f;
+    for (int k = 0; k &lt; 4; k++) {  // from RANGE(k, Reduce)
+        acc += A[i*4 + k] * B[k*4 + j];
+    }
+    C[i*4 + j] = acc;
+}
+</code></pre>
+<p>The key observation: <strong>structure is visible at every stage</strong>. There’s no magic fusion pass that turns three nested loops into something unrecognizable. The <code>RANGE</code> structure you see in Stage 2 is exactly what becomes loops in Stage 4.</p>
+<hr>
+<h2 id="comparison-how-other-irs-differ"><a class="header" href="#comparison-how-other-irs-differ">Comparison: How Other IRs Differ</a></h2>
+<p>Different IRs make different tradeoffs. Here’s how they stack up:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Aspect</th><th>Single IR</th><th>Multi-IR</th></tr>
+<tr><th>Aspect</th><th>ONNX</th><th>XLA HLO</th><th>Triton</th><th><strong>Morok</strong></th></tr>
 </thead>
 <tbody>
-<tr><td>Complexity</td><td>Lower</td><td>Higher</td></tr>
-<tr><td>Translation bugs</td><td>None</td><td>Possible</td></tr>
-<tr><td>Cross-level optimization</td><td>Natural</td><td>Requires bridging</td></tr>
-<tr><td>Compile-time safety</td><td>Runtime checks</td><td>Per-IR guarantees</td></tr>
-<tr><td>Codebase size</td><td>~15k lines</td><td>100k+ lines</td></tr>
+<tr><td><strong>Purpose</strong></td><td>Model interchange</td><td>Backend optimization</td><td>GPU kernel DSL</td><td>Full compilation</td></tr>
+<tr><td><strong>Operators</strong></td><td>~200 high-level</td><td>~100–150 high-level</td><td>Tile operations</td><td>~80 multi-level</td></tr>
+<tr><td><strong>Loop model</strong></td><td>Implicit</td><td>Implicit</td><td>Tile-based</td><td><strong>Explicit <code>RANGE</code></strong></td></tr>
+<tr><td><strong>Memory</strong></td><td>Pure values</td><td>Pure values → buffers</td><td>Explicit pointers</td><td><strong>Explicit <code>LOAD</code>/<code>STORE</code></strong></td></tr>
+<tr><td><strong>Optimization</strong></td><td>None</td><td>Specialized passes</td><td>MLIR patterns</td><td><strong>Unified rewriting</strong></td></tr>
+<tr><td><strong>Targets</strong></td><td>Runtime engines</td><td>CPU/GPU/TPU</td><td>GPU only</td><td>CPU/GPU</td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="morok-vs-tinygrad-uop"><a class="header" href="#morok-vs-tinygrad-uop">Morok vs Tinygrad UOp</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Aspect</th><th>Tinygrad</th><th>Morok</th></tr>
-</thead>
-<tbody>
-<tr><td>Language</td><td>Python dataclass</td><td>Rust struct</td></tr>
-<tr><td>Children</td><td><code>src: tuple[UOp, ...]</code></td><td>Encoded in <code>Op</code> variants</td></tr>
-<tr><td>Type safety</td><td>Runtime</td><td>Compile-time</td></tr>
-<tr><td>Extra data</td><td><code>arg: Any</code> (untyped)</td><td>Typed per variant</td></tr>
-<tr><td>Memory</td><td>Weakref + GC</td><td><code>Rc&lt;UOp&gt;</code> + explicit cleanup</td></tr>
-</tbody>
-</table>
-</div>
-<p>Morok’s Rust implementation adds compile-time guarantees:</p>
+<p><strong>ONNX</strong> maximizes portability. Operations like <code>Conv</code> and <code>MatMul</code> hide all implementation details. Great for model exchange, but you can’t optimize what you can’t see.</p>
+<p><strong>XLA HLO</strong> is functional and pure—no side effects, immutable tensors. This enables algebraic optimization but requires a separate “buffer assignment” phase before code generation. The transition from HLO to LMHLO (buffer-based) is a fundamental boundary.</p>
+<p><strong>Triton</strong> exposes more than ONNX but less than Morok. You write “tile-level” code—operations on blocks of data—and the compiler handles thread-level details. Explicit memory (<code>tl.load</code>, <code>tl.store</code>) but implicit parallelization within tiles.</p>
+<p><strong>Morok</strong> exposes everything: loops are explicit (<code>RANGE</code>), memory is explicit (<code>LOAD</code>/<code>STORE</code>), parallelization is explicit (<code>AxisType</code>). This means more to learn, but nothing is hidden.</p>
+<hr>
+<h2 id="why-this-matters-practical-benefits"><a class="header" href="#why-this-matters-practical-benefits">Why This Matters: Practical Benefits</a></h2>
+<p>Morok’s transparent IR has practical benefits for ML engineers:</p>
+<p><strong>Debugging is direct.</strong> Print the graph at any stage:</p>
 <pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>// Each Op variant encodes its exact structure
-Op::Binary(BinaryOp::Add, lhs, rhs)  // vs Tinygrad's (Ops.ADD, (lhs, rhs))
-Op::Reduce { src, ranges, reduce_op } // Named fields, typed
+</span>println!("{}", tensor.uop().tree());
 <span class="boring">}</span></code></pre>
+<p>You’ll see exactly what operations exist, how they connect, and where the computation happens. No “kernel X” mysteries.</p>
+<p><strong>Performance tuning is informed.</strong> See which loops are parallelized:</p>
+<pre><code class="language-text">[RANGE(batch, Global)]    # parallelized across GPU blocks
+[RANGE(channel, Local)]   # parallelized within blocks
+[RANGE(pixel, Loop)]      # sequential — might be slow!
+</code></pre>
+<p>If something should be parallel but isn’t, you can see it.</p>
+<p><strong>The mental model is simple.</strong> There’s one IR, one transformation mechanism, one set of operations. You don’t need to learn XLA HLO <em>and</em> MLIR <em>and</em> Triton <em>and</em> LLVM. Just UOps.</p>
+<p><strong>Optimization is composable.</strong> Want a custom rewrite? Add a pattern:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>patterns! {
+    // Your custom optimization
+    MyPattern(x, y) ~&gt; better_version(x, y),
+}
+<span class="boring">}</span></code></pre>
+<p>It works with the same engine as constant folding, fusion, and everything else.</p>
+<hr>
+<h2 id="the-deeper-insight"><a class="header" href="#the-deeper-insight">The Deeper Insight</a></h2>
+<p>Morok/Tinygrad proves that compiler complexity is often <em>accidental</em>, not essential. The multi-layer IR stacks in TensorFlow and PyTorch accumulated organically—each layer solved a real problem, but the combined system is harder to understand than any individual part.</p>
+<p>One well-designed IR, one transformation mechanism, and principled composition can replace thousands of lines of specialized passes. It’s the Unix philosophy applied to compilers: do one thing well, and compose.</p>
+<p>The cost is explicitness—you see loops, memory accesses, and parallelization hints that other IRs hide. But visibility is a feature, not a bug. When your model is slow, you want to see <em>why</em>, not hope the compiler figures it out.</p>
+<p>That’s the bet Morok makes: transparent complexity beats hidden complexity.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../architecture/pipeline.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../architecture/path-of-the-uop.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -322,7 +511,7 @@ Op::Reduce { src, ranges, reduce_op } // Named fields, typed
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../architecture/pipeline.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../architecture/path-of-the-uop.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
