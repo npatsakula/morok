@@ -24,6 +24,8 @@ libc = "0.2"
 papaya = "0.2.3"
 rayon = "1.11"
 tracing = "0.1"
+libloading = "0.8"
+tempfile = "3"
 
 [dev-dependencies]
 smallvec = "1.15.1"
