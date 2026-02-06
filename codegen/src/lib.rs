@@ -17,6 +17,7 @@
 //! let kernel = llvm::text::render(&optimized_uop_graph, Some("kernel"))?;
 //! ```
 
+pub mod c;
 pub mod common;
 pub mod cranelift;
 pub mod error;

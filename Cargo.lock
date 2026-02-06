@@ -1648,6 +1648,7 @@ dependencies = [
  "cranelift-reader",
  "inkwell",
  "libc",
+ "libloading",
  "morok-codegen",
  "morok-device",
  "morok-dtype",
@@ -1658,6 +1659,7 @@ dependencies = [
  "rayon",
  "smallvec",
  "snafu",
+ "tempfile",
  "test-case",
  "tracing",
 ]
