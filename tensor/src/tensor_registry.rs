@@ -20,13 +20,17 @@
 //!
 //! This matches Tinygrad's `weakref.WeakKeyDictionary` pattern - no manual cleanup required.
 //!
-//! # Buffer Storage (Tinygrad-aligned)
+//! # Buffer Storage
 //!
 //! Buffers are stored in a separate map (`BUFFERS`) indexed by UOp ID.
-//! This matches Tinygrad's `buffers: weakref.WeakKeyDictionary[UOp, Buffer]` pattern:
-//! - Key is UOp ID (analogous to weak UOp reference)
-//! - Value is Arc<Buffer> (strong reference keeps buffer alive)
-//! - When UOp is dropped, buffer entry cleaned up via `gc_dead_refs()`
+//! This is a lookup index for `collect_input_buffers()` during schedule creation.
+//! - Key is UOp ID (unique per buffer via `Op::Unique` monotonic counter)
+//! - Value is `Arc<Buffer>` (strong ref — kept alive for the duration of the computation)
+//! - Stale entries cleaned via `gc_dead_refs()` when the UOp is no longer alive
+//!
+//! Unlike Tinygrad (which stores buffers inline in UOps), Morok uses a separate
+//! index because UOps are immutable and hash-consed. Unique buffer IDs guarantee
+//! entries never collide, so stale entries are harmless — only a memory concern.
 //!
 //! TensorEntry also caches the buffer for direct access via tensor.buffer().
 
@@ -85,18 +89,12 @@ impl TensorEntry {
 // - Dead weak refs cleaned lazily on access or via gc_dead_refs()
 static TENSORS: OnceLock<PapayaMap<u64, Weak<TensorEntry>>> = OnceLock::new();
 
-// Direct buffer storage: UOp ID → Arc<Buffer> (Tinygrad-aligned).
+// Direct buffer storage: UOp ID → Arc<Buffer>.
 //
-// This is Morok's equivalent of Tinygrad's `buffers: weakref.WeakKeyDictionary[UOp, Buffer]`.
-// - Buffers stored independently of TensorEntry
-// - Stays alive as long as mapping exists
-// - Cleaned up when corresponding UOp is dropped (via gc_dead_refs)
+// Lookup index for collect_input_buffers() during schedule creation.
+// Buffer UOp IDs are unique (Op::Unique monotonic counter), so entries never
+// collide across tests. Stale entries cleaned via gc_dead_refs().
 static BUFFERS: OnceLock<PapayaMap<u64, Arc<Buffer>>> = OnceLock::new();
-
-// Secondary index: UOp ID → Tensor ID.
-// Used for tensor lookups during schedule creation.
-// Entries become stale when corresponding tensor is dropped - cleaned lazily.
-static UOP_TO_TENSOR: OnceLock<PapayaMap<u64, u64>> = OnceLock::new();
 
 fn tensors() -> &'static PapayaMap<u64, Weak<TensorEntry>> {
     TENSORS.get_or_init(PapayaMap::new)
@@ -104,10 +102,6 @@ fn tensors() -> &'static PapayaMap<u64, Weak<TensorEntry>> {
 
 fn buffers() -> &'static PapayaMap<u64, Arc<Buffer>> {
     BUFFERS.get_or_init(PapayaMap::new)
-}
-
-fn uop_to_tensor() -> &'static PapayaMap<u64, u64> {
-    UOP_TO_TENSOR.get_or_init(PapayaMap::new)
 }
 
 /// Register a new tensor without buffer (for lazy computation graphs).
@@ -158,54 +152,33 @@ pub fn register_tensor_with_buffer(uop: Arc<UOp>, buffer: Arc<Buffer>, buffer_uo
     let guard = tensors().guard();
     tensors().insert(id, Arc::downgrade(&entry), &guard);
 
-    // Store buffer directly indexed by UOp ID (Tinygrad-aligned)
+    // Store buffer indexed by UOp ID (for collect_input_buffers lookups)
     let buf_guard = buffers().guard();
     buffers().insert(buffer_uop_id, buffer, &buf_guard);
-
-    // Also map UOp ID → Tensor ID for tensor lookups
-    let uop_guard = uop_to_tensor().guard();
-    uop_to_tensor().insert(buffer_uop_id, id, &uop_guard);
 
     entry
 }
 
 /// Get buffer by UOp ID.
 ///
-/// Direct lookup from BUFFERS map (Tinygrad-aligned).
+/// Direct lookup from BUFFERS map.
 /// Used by collect_input_buffers() during schedule creation.
-/// Returns None if no buffer registered for this UOp ID.
 pub fn get_buffer(uop_id: u64) -> Option<Buffer> {
     let guard = buffers().guard();
     buffers().get(&uop_id, &guard).map(|arc_buf| (**arc_buf).clone())
 }
 
-/// Remove buffer and UOp ID → Tensor ID mapping.
+/// Remove buffer entry from the BUFFERS map.
 ///
-/// Called during cleanup to free buffer and index entries.
+/// Called during cleanup to eagerly remove stale entries.
 pub fn remove_buffer(uop_id: u64) {
-    // Remove from BUFFERS map
     let buf_guard = buffers().guard();
     buffers().remove(&uop_id, &buf_guard);
-
-    // Remove from UOp → Tensor index
-    let guard = uop_to_tensor().guard();
-    uop_to_tensor().remove(&uop_id, &guard);
 }
 
-/// Get count of buffers in the registry (for testing).
+/// Get count of buffers in the registry (for testing/diagnostics).
 pub fn buffer_count() -> usize {
     buffers().len()
-}
-
-/// Clear all buffers and UOp → Tensor mappings from the index (for testing).
-pub fn clear_buffer_index() {
-    // Clear buffers
-    let buf_guard = buffers().guard();
-    buffers().clear(&buf_guard);
-
-    // Clear UOp → Tensor index
-    let guard = uop_to_tensor().guard();
-    uop_to_tensor().clear(&guard);
 }
 
 /// Register a buffer for an existing tensor.
@@ -219,7 +192,7 @@ pub fn clear_buffer_index() {
 /// * `tensor_id` - The tensor ID that owns this buffer
 /// * `buffer` - The materialized buffer
 pub fn register_buffer(uop_id: u64, tensor_id: u64, buffer: Arc<Buffer>) {
-    // Store buffer directly indexed by UOp ID (Tinygrad-aligned)
+    // Store buffer indexed by UOp ID (for collect_input_buffers lookups)
     let buf_guard = buffers().guard();
     buffers().insert(uop_id, buffer.clone(), &buf_guard);
 
@@ -227,10 +200,6 @@ pub fn register_buffer(uop_id: u64, tensor_id: u64, buffer: Arc<Buffer>) {
     if let Some(entry) = get_tensor(tensor_id) {
         entry.set_buffer(buffer);
     }
-
-    // Map UOp ID → Tensor ID for tensor lookups
-    let guard = uop_to_tensor().guard();
-    uop_to_tensor().insert(uop_id, tensor_id, &guard);
 }
 
 /// Get a tensor entry by ID.
@@ -241,25 +210,14 @@ pub fn get_tensor(id: u64) -> Option<Arc<TensorEntry>> {
     tensors().get(&id, &guard)?.upgrade()
 }
 
-/// Remove a tensor from the registry.
+/// Remove dead weak references and stale buffer entries from the registry.
 ///
-/// Thread-safe removal operation.
-pub fn remove_tensor(id: u64) {
-    let guard = tensors().guard();
-    tensors().remove(&id, &guard);
-}
-
-/// Remove dead weak references and stale buffers from the registry.
+/// Tensors: removes entries whose Weak<TensorEntry> can no longer be upgraded.
+/// Buffers: removes entries whose UOp is no longer alive in the UOp cache.
 ///
-/// This is optional - dead refs are cleaned lazily on access.
-/// Call this to proactively free registry memory.
-///
-/// Buffers are cleaned based on UOp liveness (matching Tinygrad's WeakKeyDictionary
-/// pattern where buffer entries are removed when the UOp key is garbage collected).
+/// This is optional — stale entries don't affect correctness (unique buffer IDs
+/// prevent collisions). Call this to reclaim registry memory in long-running programs.
 pub fn gc_dead_refs() {
-    // Get live UOp IDs from the UOp cache
-    let live_uop_ids = morok_ir::uop::live_uop_ids();
-
     // Clean dead tensor weak refs
     let map = tensors();
     let guard = map.guard();
@@ -268,28 +226,14 @@ pub fn gc_dead_refs() {
         map.remove(&id, &guard);
     }
 
-    // Clean stale buffers (UOp no longer alive)
+    // Clean stale buffer entries (UOp no longer alive in the cache)
+    let live_uop_ids = morok_ir::uop::live_uop_ids();
     let buf_map = buffers();
     let buf_guard = buf_map.guard();
     let stale_bufs: Vec<u64> =
         buf_map.iter(&buf_guard).filter(|(uop_id, _)| !live_uop_ids.contains(uop_id)).map(|(id, _)| *id).collect();
     for uop_id in stale_bufs {
         buf_map.remove(&uop_id, &buf_guard);
-    }
-
-    // Clean stale UOp→Tensor mappings
-    let uop_map = uop_to_tensor();
-    let uop_guard = uop_map.guard();
-    let stale_uop_ids: Vec<u64> = uop_map
-        .iter(&uop_guard)
-        .filter(|(uop_id, tensor_id)| {
-            // Remove if UOp is dead OR tensor is dead
-            !live_uop_ids.contains(uop_id) || tensors().get(*tensor_id, &guard).is_none_or(|w| w.upgrade().is_none())
-        })
-        .map(|(uop_id, _)| *uop_id)
-        .collect();
-    for uop_id in stale_uop_ids {
-        uop_map.remove(&uop_id, &uop_guard);
     }
 }
 
@@ -300,23 +244,6 @@ pub fn gc_dead_refs() {
 #[deprecated(note = "Tensor registry now uses weak refs - cleanup is automatic. Use gc_dead_refs() to clean registry.")]
 pub fn gc_unused_tensors() {
     gc_dead_refs();
-}
-
-/// Clear all tensors, buffers, and mappings from the registry.
-///
-/// Primarily useful for testing to ensure test isolation.
-pub fn clear_all() {
-    // Clear tensors
-    let guard = tensors().guard();
-    tensors().clear(&guard);
-
-    // Clear buffers
-    let buf_guard = buffers().guard();
-    buffers().clear(&buf_guard);
-
-    // Clear UOp → Tensor index
-    let uop_guard = uop_to_tensor().guard();
-    uop_to_tensor().clear(&uop_guard);
 }
 
 /// Apply a transformation map to ALL live tensors globally.
@@ -390,7 +317,7 @@ mod tests {
 
     #[test]
     fn test_register_and_get() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         let uop = UOp::const_(DType::Float32, ConstValue::Float(1.0));
         let entry = register_tensor(uop.clone());
@@ -402,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_apply_map_updates_tensors() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         // Create two tensors sharing a common UOp
         let shared = UOp::const_(DType::Float32, ConstValue::Float(1.0));

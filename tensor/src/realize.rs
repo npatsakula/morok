@@ -858,7 +858,7 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn test_realize_simple_add() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         // Test that realizing a simple computation works.
         // The pipeline transforms:
@@ -887,7 +887,7 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn test_realize_sum() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         // Create a 1D tensor: [1, 2, 3, 4]
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_prepare_simple_add() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         // Create computation: a + b
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn test_prepare_and_execute() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         // Create computation: a + b
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
@@ -990,7 +990,7 @@ mod tests {
 
     #[test]
     fn test_prepare_and_execute_twice() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         // Create computation
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
@@ -1024,7 +1024,7 @@ mod tests {
     /// leak) is tested in test_memory_growth_detection.
     #[test]
     fn test_realize_buffer_cleanup() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         // Create input tensors ONCE (these will stay in registry)
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
@@ -1042,7 +1042,7 @@ mod tests {
     /// Test that prepare() + execute() pattern can clean up with release_intermediate_buffers().
     #[test]
     fn test_prepare_execute_cleanup() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         // Create input tensors
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
@@ -1091,7 +1091,7 @@ mod tests {
     /// but subsequent calls must not grow.
     #[test]
     fn test_memory_growth_detection() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         const ITERATIONS: usize = 10;
 
@@ -1140,50 +1140,54 @@ mod tests {
         );
     }
 
-    /// Test that creating new input tensors each iteration causes growth.
+    /// Test that gc_dead_refs reclaims stale buffer entries.
     ///
-    /// This is expected behavior - input tensor buffers are not automatically
-    /// cleaned up when they go out of scope. Users should reuse tensors.
+    /// Input buffers accumulate in the global BUFFERS map (Arc<Buffer> entries
+    /// indexed by unique UOp IDs). gc_dead_refs cleans entries whose UOps are
+    /// no longer alive in the UOp cache.
     #[test]
-    fn test_memory_growth_with_new_inputs() {
-        let _guard = crate::test::helpers::test_setup();
-
-        const ITERATIONS: usize = 5;
+    fn test_gc_reclaims_stale_buffers() {
+        crate::test::helpers::test_setup();
 
         let mut executor = morok_runtime::global_executor();
-        let mut counts: Vec<usize> = Vec::with_capacity(ITERATIONS);
 
-        let count_before = crate::tensor_registry::buffer_count();
+        // Create and realize tensors in a block so they're dropped afterward
+        {
+            for _ in 0..5 {
+                let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+                let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
+                let c = &a + &b;
 
-        for _ in 0..ITERATIONS {
-            // Create NEW input tensors each iteration - this causes growth
-            let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
-            let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
-            let c = &a + &b;
-
-            let plan = c.prepare().expect("prepare should succeed");
-            plan.execute(&mut executor).expect("execute should succeed");
-            plan.release_intermediate_buffers(crate::tensor_registry::remove_buffer);
-
-            counts.push(crate::tensor_registry::buffer_count());
+                let plan = c.prepare().expect("prepare should succeed");
+                plan.execute(&mut executor).expect("execute should succeed");
+                plan.release_intermediate_buffers(crate::tensor_registry::remove_buffer);
+            }
         }
+        // Tensors dropped here — their UOps become eligible for GC
 
-        let total_growth = *counts.last().unwrap() as isize - count_before as isize;
-        let growth_per_iter = total_growth as f64 / ITERATIONS as f64;
+        let count_before_gc = crate::tensor_registry::buffer_count();
+        eprintln!("Before GC: {} buffers", count_before_gc);
 
-        eprintln!("Counts with new inputs each iteration: {:?}", counts);
-        eprintln!("Growth per iteration: {:.1} buffers", growth_per_iter);
+        // GC should reclaim stale entries
+        morok_ir::uop::gc_dead_refs();
+        crate::tensor_registry::gc_dead_refs();
 
-        // We expect growth because input tensor buffers accumulate
-        // (2 inputs per iteration that are never cleaned up)
-        // Plus some overhead for DefineGlobal registrations
-        assert!(growth_per_iter >= 2.0, "Expected growth with new inputs, but growth_per_iter={:.1}", growth_per_iter);
+        let count_after_gc = crate::tensor_registry::buffer_count();
+        eprintln!("After GC: {} buffers", count_after_gc);
+
+        // GC should reduce buffer count (stale entries from dropped tensors removed)
+        assert!(
+            count_after_gc < count_before_gc,
+            "gc_dead_refs should reduce buffer count: before={}, after={}",
+            count_before_gc,
+            count_after_gc
+        );
     }
 
     /// Test that realize() correctly computes and cleans up.
     #[test]
     fn test_memory_growth_realize_pattern() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         // Single realize should work correctly
         let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
@@ -1201,7 +1205,7 @@ mod tests {
     /// If this fails, we have a leak in the prepare or cleanup path.
     #[test]
     fn test_memory_growth_strict_cycles() {
-        let _guard = crate::test::helpers::test_setup();
+        crate::test::helpers::test_setup();
 
         const ITERATIONS: usize = 10;
 

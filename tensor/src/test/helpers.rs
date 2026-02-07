@@ -3,32 +3,16 @@
 use crate::Tensor;
 use ndarray::ArrayD;
 
-// Mutex to serialize tests that use global caches.
-// With papaya-based global caches, tests running in parallel can interfere.
-// Tests that call test_setup() acquire this mutex to prevent races.
-//
-// Using parking_lot::Mutex to avoid mutex poisoning when tests panic.
-pub static CACHE_TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
-/// Setup function to call at the start of each test to ensure isolation.
+/// Setup function to call at the start of each test.
 ///
-/// This acquires a mutex and cleans up global caches to prevent cross-test contamination.
+/// Buffer UOp IDs are globally unique (monotonic counter via `Op::Unique`),
+/// so buffer entries never collide across parallel tests — no registry
+/// clearing or mutex serialization needed.
 ///
-/// Note: Both UOp cache and tensor registry use weak references (Tinygrad-aligned),
-/// so entries are automatically cleaned up when no longer referenced. We call
-/// gc_dead_refs() to proactively clean up dead weak refs in both caches.
-///
-/// # Returns
-///
-/// A MutexGuard that must be held for the duration of the test.
-/// The guard will be dropped automatically at the end of the test function.
-pub fn test_setup() -> parking_lot::MutexGuard<'static, ()> {
-    let guard = CACHE_TEST_MUTEX.lock();
-    morok_ir::uop::gc_dead_refs(); // Clean up dead UOp weak refs
-    crate::tensor_registry::gc_dead_refs(); // Clean up dead tensor weak refs
-    crate::tensor_registry::clear_buffer_index();
+/// The kernel name dedup counter is the only non-RAII global state that
+/// needs reset between tests.
+pub fn test_setup() {
     morok_runtime::kernel_cache::clear_all();
-    guard
 }
 
 /// Compare float arrays with tolerance.
