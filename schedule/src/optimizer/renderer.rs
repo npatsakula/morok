@@ -531,11 +531,11 @@ pub const METAL_888: TcConfig = TcConfig {
     swizzle_b: (&[SL(0), R(0), R(1), SL(3), R(2)], &[SU(0)], &[SL(1), SL(2), SL(4)]),
 };
 
-// Apple AMX
+// Apple AMX (64 bytes / 4 bytes per float32 = 16 elements per register)
 pub const APPLE_AMX: TcConfig = TcConfig {
-    dims: (64, 64, 1),
+    dims: (16, 16, 1),
     threads: 1,
-    ept: (64, 64, 4096),
+    ept: (16, 16, 256),
     opts: &[U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7)], &[]),
     swizzle_b: (&[], &[SU(4), SU(5), SU(6), SU(7), SU(0), SU(1), SU(2), SU(3)], &[]),
