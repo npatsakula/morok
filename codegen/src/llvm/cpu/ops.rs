@@ -432,6 +432,16 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
+        op if op.is_movement() => {
+            panic!(
+                "movement op {:?} (id={}) reached LLVM codegen — \
+                 should have been eliminated during rangeify. \
+                 This indicates a bug in remove_movement_op or apply_bufferize_transform.",
+                std::mem::discriminant(op),
+                uop.id,
+            );
+        }
+
         _ => {
             kernel.push(format!("; UNSUPPORTED: {:?}", uop.op()));
             None
