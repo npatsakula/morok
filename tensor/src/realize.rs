@@ -565,8 +565,16 @@ fn prepare_execution_plan(
 
         // Step 3: Apply decomposition
         let ast_decomposed = match device.renderer.decompositor() {
-            Some(matcher) => morok_ir::decompositions::decompose_with(&optimized_ast, &matcher),
-            None => optimized_ast,
+            Some(matcher) => {
+                tracing::debug!("Applying backend decomposition patterns");
+                let decomposed = morok_ir::decompositions::decompose_with(&optimized_ast, &matcher);
+                tracing::debug!("Decomposition complete");
+                decomposed
+            }
+            None => {
+                tracing::debug!("No decomposition needed (renderer provides no decompositor)");
+                optimized_ast
+            }
         };
 
         // Step 4: Cache by OPTIMIZED ast id (different optimizations → different cache entries)
