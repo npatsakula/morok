@@ -22,6 +22,8 @@ pub mod common;
 pub mod cranelift;
 pub mod error;
 pub mod llvm;
+#[cfg(feature = "mlir")]
+pub mod mlir;
 pub mod traits;
 pub mod types;
 
