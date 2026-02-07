@@ -159,9 +159,21 @@ pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
 }
 
 /// Apply BUFFERIZE transformation to op sources.
+///
+/// When sources change, the new node gets a different Arc identity. We must
+/// transfer range_map + realize_map so downstream patterns (e.g. `remove_movement_op`)
+/// can find the new node's context — same as `convert_reduceaxis_with_context`.
 fn apply_bufferize_transform(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
     if let Some(new_sources) = transform_sources_with_bufferize(x, ctx) {
-        return Some(x.with_sources(new_sources));
+        let new_node = x.with_sources(new_sources);
+        // Transfer context to new identity
+        if let Some((in_rngs, out_rngs)) = ctx.get_ranges(x) {
+            ctx.set_ranges(&new_node, in_rngs.clone(), out_rngs.clone());
+        }
+        if let Some(realize_axes) = ctx.get_realize_axes(x).cloned() {
+            ctx.mark_realize(&new_node, realize_axes);
+        }
+        return Some(new_node);
     }
     None
 }
