@@ -8,3 +8,4 @@ pub mod matmul;
 pub mod realize_binary;
 pub mod reduce;
 pub mod shape_ops;
+pub mod shared_subgraph;

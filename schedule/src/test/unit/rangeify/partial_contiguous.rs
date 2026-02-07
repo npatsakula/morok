@@ -443,11 +443,12 @@ fn test_out_in_ratio_efficient_buffer() {
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
-    // Apply rewrite - efficient buffer should be kept
+    // Apply rewrite — like Tinygrad, simple path (no buffer in reduce) always inlines
+    // regardless of ratio. The ratio check only applies to the partial contiguous path.
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
-    // With ratio < 10, should keep buffer (no rewrite)
-    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Expected no rewrite for efficient buffer (ratio < 10.0)");
+    assert!(!Arc::ptr_eq(&rewritten, &idx_buf), "Simple path should always inline (no ratio guard, matching Tinygrad)");
+    assert_eq!(count_bufferizes(&rewritten), 0, "BUFFERIZE should be removed after inlining");
 }
 
 /// Test out_in_ratio heuristic at threshold boundary.
@@ -916,11 +917,10 @@ fn test_pattern4_keeps_efficient_buffer() {
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
 
-    // Apply rewrite - Pattern 4 should NOT match (ratio 1.0 < 10.0)
+    // Apply rewrite — like Tinygrad, simple path (no buffer in reduce) always inlines
     let rewritten = graph_rewrite(&matcher, idx_buf.clone(), &mut config);
 
-    // Verify buffer was kept (no optimization)
-    assert!(Arc::ptr_eq(&rewritten, &idx_buf), "Efficient buffer (ratio=1.0) should be KEPT");
+    assert!(!Arc::ptr_eq(&rewritten, &idx_buf), "Simple path should always inline (matching Tinygrad)");
 }
 
 /// Test that Pattern 1 preserves dtype.
@@ -1253,11 +1253,12 @@ fn test_edge_case_all_const_operations() {
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(compute.clone(), vec![range], opts);
 
-    // Apply rewrite - should inline via Pattern 1
+    // Like Tinygrad, only bare BUFFERIZE(CONST) is folded — BUFFERIZE(ADD(const, const))
+    // is NOT a bare constant. In the real pipeline, ADD(const, const) would be folded by
+    // symbolic patterns first, then BUFFERIZE(CONST) would be caught.
     let rewritten = graph_rewrite(&matcher, bufferized.clone(), &mut config);
 
-    // Should be different from original (inlined)
-    assert!(!Arc::ptr_eq(&rewritten, &bufferized), "Expected const computation to be inlined");
+    assert!(Arc::ptr_eq(&rewritten, &bufferized), "Bare BUFFERIZE(non-const compute) should not be removed");
 }
 
 /// Test edge case: Deeply nested BUFFERIZE operations.
@@ -1561,9 +1562,10 @@ fn test_pipeline_cheap_inline_interaction() {
     let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
     let bufferized = UOp::bufferize(neg.clone(), vec![range], opts);
 
-    // Pattern 1 should inline (unary op is cheap)
+    // Like Tinygrad, only bare BUFFERIZE(CONST) is folded — not BUFFERIZE(unary(CONST)).
+    // Non-const bare BUFFERIZEs survive to become STORE/BUFFER in later stages.
     let rewritten = graph_rewrite(&matcher, bufferized.clone(), &mut config);
-    assert!(!Arc::ptr_eq(&rewritten, &bufferized), "Pattern 1 should inline cheap unary op");
+    assert!(Arc::ptr_eq(&rewritten, &bufferized), "Bare BUFFERIZE(non-const) should not be removed");
 }
 
 // ============================================================================

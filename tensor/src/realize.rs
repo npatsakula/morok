@@ -730,7 +730,13 @@ fn prepare_execution_plan(
 /// Get the optimizer renderer for a device.
 fn get_optimizer_renderer(device: &Device) -> morok_schedule::OptimizerRenderer {
     match device.device {
-        DeviceSpec::Cpu => morok_schedule::OptimizerRenderer::cpu(),
+        DeviceSpec::Cpu => {
+            if std::env::var("MOROK_AMX").as_deref() == Ok("1") {
+                morok_schedule::OptimizerRenderer::apple_amx()
+            } else {
+                morok_schedule::OptimizerRenderer::cpu()
+            }
+        }
         DeviceSpec::Cuda { .. } => morok_schedule::OptimizerRenderer::cuda(),
         DeviceSpec::Metal { .. } => morok_schedule::OptimizerRenderer::metal(),
         _ => morok_schedule::OptimizerRenderer::cpu(),

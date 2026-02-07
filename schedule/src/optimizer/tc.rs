@@ -369,7 +369,14 @@ pub fn apply(
     if use_tensor_cores == 1 {
         let (a_axes, b_axes, c_axes) = build_upcast_axes(&tc, &new_ranges);
         let metadata = WmmaMetadata {
-            name: format!("WMMA_{}x{}x{}", tc.dims.0, tc.dims.1, tc.dims.2),
+            name: format!(
+                "WMMA_{}_{}_{}_{}_{}",
+                tc.dims.0,
+                tc.dims.1,
+                tc.dims.2,
+                wmma_dtype_name(&tc.dtype_in),
+                wmma_dtype_name(&tc.dtype_out),
+            ),
             dims: tc.dims,
             dtype_in: tc.dtype_in.clone(),
             dtype_out: tc.dtype_out.clone(),
@@ -393,6 +400,20 @@ pub fn apply(
     }
 
     Ok(())
+}
+
+/// Short dtype name for WMMA function identifiers (matches Tinygrad convention).
+fn wmma_dtype_name(dtype: &morok_ir::prelude::DType) -> &'static str {
+    use morok_dtype::ScalarDType;
+    match dtype.base() {
+        ScalarDType::Float32 => "float",
+        ScalarDType::Float16 => "half",
+        ScalarDType::BFloat16 => "bfloat",
+        ScalarDType::Float64 => "double",
+        ScalarDType::Int32 => "int",
+        ScalarDType::Int8 => "int8",
+        _ => "unknown",
+    }
 }
 
 // ============================================================================

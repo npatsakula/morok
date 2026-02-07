@@ -358,6 +358,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
+        Op::Wmma { a, b, c, metadata } => {
+            let a_val = ctx.get(a).to_string();
+            let b_val = ctx.get(b).to_string();
+            let c_val = ctx.get(c).to_string();
+            let expr = format!("__{name}({a_val}, {b_val}, {c_val})", name = metadata.name);
+            ctx.emit_expr(uop, expr, "wmma", kernel);
+            Some(())
+        }
+
         Op::Contract { src, .. } | Op::Unroll { src, .. } | Op::Detach { src } => {
             let s = ctx.get(src).to_string();
             ctx.register(uop.id, s);
