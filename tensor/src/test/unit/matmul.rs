@@ -526,6 +526,7 @@ fn test_matmul_validated_64x64() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn test_dot_product_validated() {
     // 1D @ 1D dot product
     let a_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
