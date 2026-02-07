@@ -159,9 +159,21 @@ pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
 }
 
 /// Apply BUFFERIZE transformation to op sources.
+///
+/// When sources change, the new node gets a different Arc identity. We must
+/// transfer range_map + realize_map so downstream patterns (e.g. `remove_movement_op`)
+/// can find the new node's context — same as `convert_reduceaxis_with_context`.
 fn apply_bufferize_transform(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
     if let Some(new_sources) = transform_sources_with_bufferize(x, ctx) {
-        return Some(x.with_sources(new_sources));
+        let new_node = x.with_sources(new_sources);
+        // Transfer context to new identity
+        if let Some((in_rngs, out_rngs)) = ctx.get_ranges(x) {
+            ctx.set_ranges(&new_node, in_rngs.clone(), out_rngs.clone());
+        }
+        if let Some(realize_axes) = ctx.get_realize_axes(x).cloned() {
+            ctx.mark_realize(&new_node, realize_axes);
+        }
+        return Some(new_node);
     }
     None
 }
@@ -399,20 +411,11 @@ pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
             apply_pcontig_removal_inner(buffer, src, buf_ranges, idx_ranges, ctx)
         },
 
-        // Remove cheap bufferize - inline with compute extraction
-        Bufferize { compute, .. }
-            if ctx.level > 0 && is_cheap_to_inline(compute.op()) && !unary_in_reduce_context(compute)
-            => |compute| {
-                tracing::debug!(
-                    compute_id = compute.id,
-                    compute_op = ?std::mem::discriminant(compute.op()),
-                    "removing cheap bufferize"
-                );
-                Some(compute.clone())
-            },
-
-        // Remove always-run bufferize - inline with compute extraction
-        Bufferize { compute, .. } if ctx.level > 0 && is_always_run_op(compute.op()) ~> |compute| compute.clone(),
+        // Constant buffer folding — BUFFERIZE(CONST) → CONST (like Tinygrad's pm_const_buffer_folding).
+        // Only matches bare constants, not arbitrary cheap ops.
+        Bufferize { compute: compute @ Const(_), .. }
+            if ctx.level > 0
+            => |compute| Some(compute.clone()),
 
         // Flatten nested Bufferize
         Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
@@ -420,12 +423,14 @@ pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
     }
 }
 
-/// Apply partial contiguous buffer removal (inline, like Tinygrad's remove_bufferize).
+/// Remove a BUFFERIZE+INDEX pair by inlining the computation (like Tinygrad's `remove_bufferize`).
 ///
-/// This function decides whether to remove a BUFFERIZE+INDEX pair by analyzing:
-/// 1. Buffer count threshold (too many buffers → keep materialized)
-/// 2. Output/input ratio (wasteful expansion → keep materialized)
-/// 3. Buffer in reduce scope (needs partial contiguous handling)
+/// Decision flow (matching Tinygrad):
+/// 1. Always-run ops (Contiguous/Copy/Assign) → keep
+/// 2. Buffer count > threshold (bypassed at level > 2) → keep
+/// 3. No buffer in reduce scope → simple range substitution (always inline)
+/// 4. Buffer in reduce at level ≤ 2 → keep (Tinygrad's `PCONTIG ≤ 2` default)
+/// 5. Buffer in reduce at level > 2 → ratio check + partial contiguous
 #[allow(clippy::mutable_key_type)]
 fn apply_pcontig_removal_inner(
     buffer: &Arc<UOp>,
@@ -441,7 +446,7 @@ fn apply_pcontig_removal_inner(
         return None;
     }
 
-    // Single-pass collection (like Tinygrad's gate approach)
+    // Single-pass collection of buffers, indexes, reduces in the src subtree.
     let mut accessed_buffers = Vec::new();
     let mut indexes = Vec::new();
     let mut reduces = Vec::new();
@@ -484,12 +489,41 @@ fn apply_pcontig_removal_inner(
     let mut seen = HashSet::new();
     accessed_buffers.retain(|b| seen.insert(UOpKey(Arc::clone(b))));
 
-    // Buffer count threshold
-    if accessed_buffers.len() > config.max_buffers_threshold {
+    // Buffer count threshold — bypassed at level > 2 (like Tinygrad's `not (PCONTIG > 2)`)
+    if accessed_buffers.len() > config.max_buffers_threshold && config.level <= 2 {
         return None;
     }
 
-    // Output/input ratio check (applied to ALL cases, not just buffer_in_reduce)
+    // Check if any reduce body accesses a buffer
+    let buffer_in_reduce = if reduces.is_empty() {
+        false
+    } else {
+        let reduce_sources: Vec<Arc<UOp>> = reduces
+            .iter()
+            .filter_map(|r| if let Op::Reduce { src, .. } = r.op() { Some(Arc::clone(src)) } else { None })
+            .collect();
+
+        if reduce_sources.is_empty() {
+            false
+        } else {
+            let sink = UOp::sink(reduce_sources);
+            sink.toposort().iter().any(|n| matches!(n.op(), Op::Buffer { .. } | Op::Bufferize { .. }))
+        }
+    };
+
+    // Simple substitution path — no buffer in reduce, always inline (like Tinygrad)
+    if !buffer_in_reduce {
+        let subs_map: HashMap<UOpKey, Arc<UOp>> =
+            buf_ranges.iter().zip(idx_ranges.iter()).map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v))).collect();
+        return Some(src.substitute(&subs_map));
+    }
+
+    // Buffer in reduce: at level ≤ 2, always keep (Tinygrad's `if not (PCONTIG > 2): return None`)
+    if config.level <= 2 {
+        return None;
+    }
+
+    // Output/input ratio check — only computed here (level > 2 with buffer_in_reduce)
     let output_size = match buffer.op() {
         Op::Bufferize { ranges, .. } => {
             let mut product = 1usize;
@@ -537,37 +571,6 @@ fn apply_pcontig_removal_inner(
     let ratio = (output_size + 1) as f64 / (input_size + 1) as f64;
     if ratio < config.out_in_ratio_threshold {
         return None;
-    }
-
-    // Check if buffer accessed in reduce scope
-    let buffer_in_reduce = if reduces.is_empty() {
-        false
-    } else {
-        let reduce_sources: Vec<Arc<UOp>> = reduces
-            .iter()
-            .filter_map(|r| if let Op::Reduce { src, .. } = r.op() { Some(Arc::clone(src)) } else { None })
-            .collect();
-
-        if reduce_sources.is_empty() {
-            false
-        } else {
-            let sink = UOp::sink(reduce_sources);
-            let mut found = false;
-            for node in sink.toposort() {
-                if matches!(node.op(), Op::Buffer { .. } | Op::Bufferize { .. }) {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        }
-    };
-
-    // Simple substitution path (no buffer in reduce)
-    if !buffer_in_reduce {
-        let subs_map: HashMap<UOpKey, Arc<UOp>> =
-            buf_ranges.iter().zip(idx_ranges.iter()).map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v))).collect();
-        return Some(src.substitute(&subs_map));
     }
 
     // Partial contiguous path: filter local indexes and extract exclude ranges

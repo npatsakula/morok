@@ -1,5 +1,7 @@
 device/src/test/
 dtype/src/test/
+fft/src/test/
+fft/benches/
 ir/src/test/
 schedule/src/test/
 schedule-macros/src/test/
