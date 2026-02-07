@@ -295,7 +295,7 @@ fn test_argmax_all_equal() {
 
 #[test]
 fn test_sum_1d_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
     let result = realize_f32(t.sum(()).unwrap());
     assert_close_f32(&result, &[10.0], 1e-6);
@@ -303,7 +303,7 @@ fn test_sum_1d_value() {
 
 #[test]
 fn test_sum_2d_full_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_f32(t.sum(()).unwrap());
     assert_close_f32(&result, &[21.0], 1e-6);
@@ -311,7 +311,7 @@ fn test_sum_2d_full_value() {
 
 #[test]
 fn test_sum_axis0_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_f32(t.sum(0).unwrap());
     // [[1, 2, 3], [4, 5, 6]] -> [1+4, 2+5, 3+6] = [5, 7, 9]
@@ -321,7 +321,7 @@ fn test_sum_axis0_value() {
 #[test]
 #[tracing_test::traced_test]
 fn test_sum_axis1_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_f32(t.sum(1).unwrap());
     // [[1, 2, 3], [4, 5, 6]] -> [1+2+3, 4+5+6] = [6, 15]
@@ -331,7 +331,7 @@ fn test_sum_axis1_value() {
 #[test]
 #[tracing_test::traced_test]
 fn test_sum_keepdim_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
     let result = t.sum_with().axes(1).keepdim(true).call().unwrap();
     let arr = realize_f32(result);
@@ -342,7 +342,7 @@ fn test_sum_keepdim_value() {
 
 #[test]
 fn test_sum_single_element_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([42.0f32]);
     let result = realize_f32(t.sum(()).unwrap());
     assert_close_f32(&result, &[42.0], 1e-6);
@@ -350,7 +350,7 @@ fn test_sum_single_element_value() {
 
 #[test]
 fn test_sum_negative_values() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([-1.0f32, -2.0, 3.0, 4.0]);
     let result = realize_f32(t.sum(()).unwrap());
     assert_close_f32(&result, &[4.0], 1e-6);
@@ -360,7 +360,7 @@ fn test_sum_negative_values() {
 
 #[test]
 fn test_max_1d_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0]);
     let result = realize_f32(t.max(()).unwrap());
     assert_close_f32(&result, &[5.0], 1e-6);
@@ -368,7 +368,7 @@ fn test_max_1d_value() {
 
 #[test]
 fn test_max_2d_axis1_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0, 8.0, 4.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_f32(t.max(1).unwrap());
     // [[1, 5, 3], [2, 8, 4]] -> [5, 8]
@@ -377,7 +377,7 @@ fn test_max_2d_axis1_value() {
 
 #[test]
 fn test_max_2d_axis0_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0, 8.0, 4.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_f32(t.max(0).unwrap());
     // [[1, 5, 3], [2, 8, 4]] -> [2, 8, 4]
@@ -386,7 +386,7 @@ fn test_max_2d_axis0_value() {
 
 #[test]
 fn test_max_negative_values() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([-5.0f32, -1.0, -3.0, -2.0]);
     let result = realize_f32(t.max(()).unwrap());
     assert_close_f32(&result, &[-1.0], 1e-6);
@@ -396,7 +396,7 @@ fn test_max_negative_values() {
 
 #[test]
 fn test_min_1d_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([5.0f32, 1.0, 3.0, 2.0]);
     let result = realize_f32(t.min(()).unwrap());
     assert_close_f32(&result, &[1.0], 1e-6);
@@ -404,7 +404,7 @@ fn test_min_1d_value() {
 
 #[test]
 fn test_min_2d_axis1_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0, 8.0, 4.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_f32(t.min(1).unwrap());
     // [[1, 5, 3], [2, 8, 4]] -> [1, 2]
@@ -413,7 +413,7 @@ fn test_min_2d_axis1_value() {
 
 #[test]
 fn test_min_negative_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([-1.0f32, -5.0, -3.0]);
     let result = realize_f32(t.min(()).unwrap());
     assert_close_f32(&result, &[-5.0], 1e-6);
@@ -424,7 +424,7 @@ fn test_min_negative_value() {
 #[test]
 #[tracing_test::traced_test]
 fn test_argmax_debug_steps() {
-    let _guard = test_setup();
+    test_setup();
 
     // Simplest test: compare two tensors
     let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
@@ -475,7 +475,7 @@ fn test_argmax_debug_steps() {
 #[test]
 
 fn test_argmax_full_steps() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0]);
 
     // Step 1: max value along axis 0
@@ -529,7 +529,7 @@ fn test_argmax_full_steps() {
 
 #[test]
 fn test_argmax_value_1d() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0]);
     let result = realize_i32(t.argmax(Some(0)).unwrap());
     // Max 5.0 at index 3
@@ -538,7 +538,7 @@ fn test_argmax_value_1d() {
 
 #[test]
 fn test_argmax_ties_first_value() {
-    let _guard = test_setup();
+    test_setup();
     // Tinygrad test: [2, 2] -> should return 0 (first occurrence)
     let t = Tensor::from_slice([2.0f32, 2.0]);
     let result = realize_i32(t.argmax(Some(0)).unwrap());
@@ -547,7 +547,7 @@ fn test_argmax_ties_first_value() {
 
 #[test]
 fn test_argmax_2d_axis0_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_i32(t.argmax(Some(0)).unwrap());
     // [[1, 3, 2], [4, 2, 5]]
@@ -557,7 +557,7 @@ fn test_argmax_2d_axis0_value() {
 
 #[test]
 fn test_argmax_2d_axis1_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_i32(t.argmax(Some(1)).unwrap());
     // [[1, 3, 2], [4, 2, 5]]
@@ -567,7 +567,7 @@ fn test_argmax_2d_axis1_value() {
 
 #[test]
 fn test_argmax_flatten_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_i32(t.argmax(None).unwrap());
     // Flattened: [1, 3, 2, 4, 2, 5], max 5.0 at index 5
@@ -579,7 +579,7 @@ fn test_argmax_flatten_value() {
 #[test]
 
 fn test_argmin_value_1d() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
     let result = realize_i32(t.argmin(Some(0)).unwrap());
     // Min 1.0 at index 2
@@ -588,7 +588,7 @@ fn test_argmin_value_1d() {
 
 #[test]
 fn test_argmin_negative_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.5f32, -2.3, 0.5, 1.0]);
     let result = realize_i32(t.argmin(Some(0)).unwrap());
     // Min -2.3 at index 1
@@ -597,7 +597,7 @@ fn test_argmin_negative_value() {
 
 #[test]
 fn test_argmin_2d_axis0_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_i32(t.argmin(Some(0)).unwrap());
     // [[1, 3, 2], [4, 2, 5]]
@@ -608,7 +608,7 @@ fn test_argmin_2d_axis0_value() {
 #[test]
 
 fn test_argmin_2d_axis1_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 4.0, 2.0, 5.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_i32(t.argmin(Some(1)).unwrap());
     // [[1, 3, 2], [4, 2, 5]]
@@ -620,7 +620,7 @@ fn test_argmin_2d_axis1_value() {
 
 #[test]
 fn test_mean_1d_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
     let result = realize_f32(t.mean(()).unwrap());
     assert_close_f32(&result, &[2.5], 1e-6);
@@ -628,7 +628,7 @@ fn test_mean_1d_value() {
 
 #[test]
 fn test_mean_2d_axis1_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_f32(t.mean(1).unwrap());
     // [[1, 2, 3], [4, 5, 6]] -> [mean(1,2,3), mean(4,5,6)] = [2, 5]
@@ -637,7 +637,7 @@ fn test_mean_2d_axis1_value() {
 
 #[test]
 fn test_mean_2d_axis0_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
     let result = realize_f32(t.mean(0).unwrap());
     // [[1, 2, 3], [4, 5, 6]] -> [mean(1,4), mean(2,5), mean(3,6)] = [2.5, 3.5, 4.5]
@@ -648,7 +648,7 @@ fn test_mean_2d_axis0_value() {
 
 #[test]
 fn test_any_value_all_true() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([true, true, true]);
     let result = t.any(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     assert!(result[[]]);
@@ -656,7 +656,7 @@ fn test_any_value_all_true() {
 
 #[test]
 fn test_any_value_one_true() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([false, true, false]);
     let result = t.any(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     assert!(result[[]]);
@@ -664,7 +664,7 @@ fn test_any_value_one_true() {
 
 #[test]
 fn test_any_value_all_false() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([false, false, false]);
     let result = t.any(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     assert!(!result[[]]);
@@ -672,7 +672,7 @@ fn test_any_value_all_false() {
 
 #[test]
 fn test_any_2d_axis0_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([true, false, false, true]).try_reshape(&[2, 2]).unwrap();
     let result = t.any(0).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     // [[true, false], [false, true]] -> any along axis 0 -> [true, true]
@@ -681,7 +681,7 @@ fn test_any_2d_axis0_value() {
 
 #[test]
 fn test_any_2d_axis1_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([true, false, false, false]).try_reshape(&[2, 2]).unwrap();
     let result = t.any(1).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     // [[true, false], [false, false]] -> any along axis 1 -> [true, false]
@@ -692,7 +692,7 @@ fn test_any_2d_axis1_value() {
 
 #[test]
 fn test_all_value_all_true() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([true, true, true]);
     let result = t.all(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     assert!(result[[]]);
@@ -700,7 +700,7 @@ fn test_all_value_all_true() {
 
 #[test]
 fn test_all_value_one_false() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([true, false, true]);
     let result = t.all(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     assert!(!result[[]]);
@@ -708,7 +708,7 @@ fn test_all_value_one_false() {
 
 #[test]
 fn test_all_value_all_false() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([false, false, false]);
     let result = t.all(()).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     assert!(!result[[]]);
@@ -717,7 +717,7 @@ fn test_all_value_all_false() {
 #[test]
 // #[tracing_test::traced_test]
 fn test_all_2d_axis0_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([true, true, false, true]).try_reshape(&[2, 2]).unwrap();
     let result = t.all(0).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     // [[true, true], [false, true]] -> all along axis 0 -> [false, true]
@@ -727,7 +727,7 @@ fn test_all_2d_axis0_value() {
 #[test]
 
 fn test_all_2d_axis1_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([true, true, true, false]).try_reshape(&[2, 2]).unwrap();
     let result = t.all(1).unwrap().realize().unwrap().to_ndarray::<bool>().unwrap();
     // [[true, true], [true, false]] -> all along axis 1 -> [true, false]
@@ -738,7 +738,7 @@ fn test_all_2d_axis1_value() {
 
 #[test]
 fn test_argmax_single_element_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([42.0f32]);
     let result = realize_i32(t.argmax(Some(0)).unwrap());
     // Only element, index should be 0
@@ -747,7 +747,7 @@ fn test_argmax_single_element_value() {
 
 #[test]
 fn test_argmax_all_equal_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([5.0f32, 5.0, 5.0, 5.0]);
     let result = realize_i32(t.argmax(Some(0)).unwrap());
     // All equal, should return first index (0)
@@ -756,7 +756,7 @@ fn test_argmax_all_equal_value() {
 
 #[test]
 fn test_argmin_single_element_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([42.0f32]);
     let result = realize_i32(t.argmin(Some(0)).unwrap());
     // Only element, index should be 0
@@ -765,7 +765,7 @@ fn test_argmin_single_element_value() {
 
 #[test]
 fn test_max_single_element_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([42.0f32]);
     let result = realize_f32(t.max(()).unwrap());
     assert_close_f32(&result, &[42.0], 1e-6);
@@ -773,7 +773,7 @@ fn test_max_single_element_value() {
 
 #[test]
 fn test_min_single_element_value() {
-    let _guard = test_setup();
+    test_setup();
     let t = Tensor::from_slice([42.0f32]);
     let result = realize_f32(t.min(()).unwrap());
     assert_close_f32(&result, &[42.0], 1e-6);
@@ -781,7 +781,7 @@ fn test_min_single_element_value() {
 
 #[test]
 fn test_debug_argmin_intermediate() {
-    let _guard = test_setup();
+    test_setup();
     let values = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
 
     // Test neg first - does it produce correct values?
@@ -809,7 +809,7 @@ fn test_debug_argmin_intermediate() {
 #[test]
 
 fn test_debug_lazy_neg_max() {
-    let _guard = test_setup();
+    test_setup();
     let values = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
 
     // Test max of lazy negated values
@@ -824,7 +824,7 @@ fn test_debug_lazy_neg_max() {
 #[test]
 
 fn test_debug_lazy_neg_argmax() {
-    let _guard = test_setup();
+    test_setup();
     let values = Tensor::from_slice([5.0f32, 3.0, 1.0, 4.0, 2.0]);
 
     // Chain neg and argmax LAZILY (like argmin does internally)
@@ -840,7 +840,7 @@ fn test_indices_cast_bug() {
     use crate::Tensor;
     use morok_dtype::DType;
 
-    let _guard = crate::test::helpers::test_setup();
+    crate::test::helpers::test_setup();
 
     // Create indices tensor [5, 4, 3, 2, 1]
     let indices = Tensor::arange(5, Some(0), Some(-1)).unwrap();

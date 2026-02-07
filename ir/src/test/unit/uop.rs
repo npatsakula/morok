@@ -9,11 +9,6 @@ use morok_dtype::DeviceSpec;
 
 use crate::{AxisId, ConstValue, Op, UOp}; // ConstValue kept for DType::Index
 
-// Mutex to serialize tests that clear the global UOp cache.
-// Without this, parallel test execution causes races where one test clears
-// the cache while another test is creating UOps.
-static CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn test_const_creation() {
     let c1 = UOp::native_const(1.0f32);
@@ -52,9 +47,6 @@ fn test_hash_consing_with_src() {
 fn test_cross_thread_hash_consing() {
     use std::sync::Barrier;
 
-    // Serialize tests that manipulate cache to prevent races with parallel test execution
-    let _lock = CACHE_TEST_MUTEX.lock().unwrap();
-
     let num_threads = 10;
     let barrier = Arc::new(Barrier::new(num_threads));
 
@@ -90,9 +82,6 @@ fn test_cross_thread_hash_consing() {
 #[test]
 fn test_cross_thread_hash_consing_complex() {
     use std::sync::Barrier;
-
-    // Serialize tests that manipulate cache to prevent races with parallel test execution
-    let _lock = CACHE_TEST_MUTEX.lock().unwrap();
 
     let num_threads = 8;
     let barrier = Arc::new(Barrier::new(num_threads));
