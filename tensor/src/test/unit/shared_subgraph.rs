@@ -22,7 +22,7 @@ use test_case::test_case;
 #[test_case(2 ; "N=2")]
 #[test_case(4 ; "N=4")]
 fn test_realized_matrix_matmul(n: usize) {
-    let _guard = test_setup();
+    test_setup();
 
     let data: Vec<f32> = (0..n * n).map(|i| i as f32 * 0.1).collect();
     let matrix = Tensor::from_slice(&data).try_reshape(&[n as isize, n as isize]).unwrap();
@@ -41,7 +41,7 @@ fn test_realized_matrix_matmul(n: usize) {
 #[test_case(2 ; "N=2")]
 #[test_case(4 ; "N=4")]
 fn test_unary_on_buffer_rooted_matmul(n: usize) {
-    let _guard = test_setup();
+    test_setup();
 
     let data: Vec<f32> = (0..n * n).map(|i| i as f32 * 0.1).collect();
     let matrix = Tensor::from_slice(&data).try_reshape(&[n as isize, n as isize]).unwrap().cos().unwrap();
@@ -58,7 +58,7 @@ fn test_unary_on_buffer_rooted_matmul(n: usize) {
 /// Element-wise diamond (no matmul): cos(t) + sin(t). Always works.
 #[test]
 fn test_diamond_elementwise_no_matmul() {
-    let _guard = test_setup();
+    test_setup();
 
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
 
@@ -80,7 +80,7 @@ fn test_diamond_elementwise_no_matmul() {
 #[test_case(2 ; "N=2")]
 #[test_case(4 ; "N=4")]
 fn test_lazy_outer_product_matmul(n: usize) {
-    let _guard = test_setup();
+    test_setup();
 
     let indices = Tensor::arange(n as i64, None, None).unwrap().cast(DType::Float32).unwrap();
     let k = indices.try_reshape(&[n as isize, 1]).unwrap();
@@ -100,7 +100,7 @@ fn test_lazy_outer_product_matmul(n: usize) {
 #[test_case(2 ; "N=2")]
 #[test_case(4 ; "N=4")]
 fn test_lazy_outer_product_unary_matmul(n: usize) {
-    let _guard = test_setup();
+    test_setup();
 
     let indices = Tensor::arange(n as i64, None, None).unwrap().cast(DType::Float32).unwrap();
     let k = indices.try_reshape(&[n as isize, 1]).unwrap();
@@ -121,7 +121,7 @@ fn test_lazy_outer_product_unary_matmul(n: usize) {
 #[test_case(2 ; "N=2")]
 #[test_case(4 ; "N=4")]
 fn test_dft_pattern(n: usize) {
-    let _guard = test_setup();
+    test_setup();
 
     let indices = Tensor::arange(n as i64, None, None).unwrap().cast(DType::Float32).unwrap();
     let k = indices.try_reshape(&[n as isize, 1]).unwrap();
