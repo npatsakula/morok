@@ -77,7 +77,6 @@ fn test_diamond_elementwise_no_matmul() {
 
 /// Simplest failing case: arange → outer product → matmul.
 /// No unary, no diamond — just a lazy [N,N] matrix from arange.
-// #[tracing_test::traced_test]
 #[test_case(2 ; "N=2")]
 #[test_case(4 ; "N=4")]
 fn test_lazy_outer_product_matmul(n: usize) {
