@@ -15,11 +15,12 @@
 pub mod ops;
 pub mod types;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use morok_ir::pattern::TypedPatternMatcher;
 use morok_ir::rewrite::graph_rewrite_bottom_up;
-use morok_ir::{AxisType, Op, prelude::*};
+use morok_ir::{AxisType, Op, WmmaMetadata, prelude::*};
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
 use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
@@ -129,6 +130,15 @@ impl crate::Renderer for CRenderer {
             code_lines.push(td.clone());
         }
         if !typedefs.is_empty() {
+            code_lines.push("".to_string());
+        }
+
+        // WMMA (AMX) defines and static functions
+        let wmma_defines = collect_wmma_defines(&nodes);
+        for def in &wmma_defines {
+            code_lines.push(def.clone());
+        }
+        if !wmma_defines.is_empty() {
             code_lines.push("".to_string());
         }
 
@@ -259,6 +269,82 @@ impl crate::Renderer for CRenderer {
         // for standard transcendentals. Threefry is handled by XOR in render.
         None
     }
+}
+
+/// Collect AMX WMMA macro definitions and static wrapper functions for the C preamble.
+///
+/// Scans linearized nodes for `Op::Wmma` and emits the necessary AMX inline assembly
+/// macros and static wrapper functions that implement the matrix multiply-accumulate
+/// via Apple's AMX coprocessor.
+fn collect_wmma_defines(nodes: &[Arc<UOp>]) -> Vec<String> {
+    // Collect unique WMMA signatures: (name, dims, dtype_in, dtype_out)
+    let mut seen = BTreeSet::new();
+    for node in nodes {
+        if let Op::Wmma { metadata, .. } = node.op() {
+            seen.insert(metadata.name.clone());
+        }
+    }
+
+    if seen.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+
+    // AMX macros (only emitted once)
+    lines.push(r#"#define AMX_SET(imm5) __asm("nop\nnop\nnop\n.word (0x201000+(%0<<5)+%1)" : : "i"(17), "i"(imm5) : "memory")"#.to_string());
+    lines.push(r#"#define AMX(op, gpr, btf) __asm(".word (0x201000+(%0 << 5)+0%1-((0%1>>4)*6))" : : "i"(op), "r"((unsigned long long)(gpr)+(btf)) : "memory")"#.to_string());
+
+    // Emit a static wrapper for each unique WMMA signature
+    for node in nodes {
+        if let Op::Wmma { metadata, .. } = node.op()
+            && seen.remove(&metadata.name)
+        {
+            lines.push(render_amx_wmma_function(metadata));
+        }
+    }
+
+    lines
+}
+
+/// Render a static AMX WMMA wrapper function for a specific matrix multiply configuration.
+///
+/// Generates a C function that:
+/// 1. Initializes AMX state (`AMX_SET(0)`)
+/// 2. Loads the accumulator matrix into Z registers
+/// 3. Loads A into X register, B into Y register
+/// 4. Executes the fused multiply-add (`fma32`)
+/// 5. Stores Z registers back to the accumulator
+/// 6. Finalizes AMX state (`AMX_SET(1)`)
+fn render_amx_wmma_function(metadata: &WmmaMetadata) -> String {
+    let (n, m, _k) = metadata.dims;
+    let in_scalar = c_dtype(&metadata.dtype_in.scalar_dtype());
+    let out_type = format!("{}{}", in_scalar, n * m); // e.g. float256
+    let a_type = format!("{}{}", in_scalar, n); // e.g. float16
+    let b_type = format!("{}{}", in_scalar, m); // e.g. float16
+    let bytes_per_elem = metadata.dtype_in.bytes();
+
+    // AMX instruction opcode selection based on dtype
+    let fma_op = match metadata.dtype_in.base() {
+        morok_dtype::ScalarDType::Float32 => 12, // fma32
+        morok_dtype::ScalarDType::Float16 => 14, // fma16
+        _ => 12,                                 // default to fma32
+    };
+
+    format!(
+        "static {out_type} __{name}({a_type} data1, {b_type} data2, {out_type} data0){{\n  \
+         AMX_SET(0);\n  \
+         for(int ridx0 = 0; ridx0 < {n}; ridx0++){{ \
+         AMX(4, (int *)(&data0), 0ull<<62 | (ridx0*{bytes_per_elem}ull)<<56 | ridx0*64ull); }}\n  \
+         AMX(0, (int *)(&data2), 0ull<<62); \
+         AMX(1, (int *)(&data1), 0ull<<62); \
+         AMX({fma_op}, 0, 0ull);\n  \
+         for(int ridx0 = 0; ridx0 < {n}; ridx0++){{ \
+         AMX(5, (int *)(&data0), 0ull<<62 | (ridx0*{bytes_per_elem}ull)<<56 | ridx0*64ull); }}\n  \
+         AMX_SET(1);\n  \
+         return data0;\n}}",
+        name = metadata.name,
+    )
 }
 
 fn is_output_buffer(def_global: &Arc<UOp>, nodes: &[Arc<UOp>]) -> bool {
