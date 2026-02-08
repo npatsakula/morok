@@ -3,10 +3,9 @@
 //! This module provides a Device instance for CPU execution using either:
 //! - Clang C codegen (default, human-readable, fast debug cycles)
 //! - LLVM JIT (maximum optimization, slower compilation)
-//! - Cranelift JIT (faster compilation, good-enough optimization)
 //!
 //! The backend can be selected via:
-//! - `MOROK_CPU_BACKEND` environment variable ("clang", "llvm", or "cranelift")
+//! - `MOROK_CPU_BACKEND` environment variable ("clang" or "llvm")
 //! - Explicit `create_cpu_device_with_backend()` call
 
 use std::sync::Arc;
@@ -27,9 +26,6 @@ pub enum CpuBackend {
     /// Generates C source, compiles with clang, loads via dlopen.
     #[default]
     Clang,
-    /// Cranelift JIT backend.
-    /// Faster compilation, good-enough codegen quality.
-    Cranelift,
     /// LLVM JIT backend.
     /// Maximum optimization, slower compilation.
     Llvm,
@@ -41,7 +37,6 @@ impl CpuBackend {
         match std::env::var("MOROK_CPU_BACKEND").as_deref() {
             Ok("clang") | Ok("CLANG") => CpuBackend::Clang,
             Ok("llvm") | Ok("LLVM") => CpuBackend::Llvm,
-            Ok("cranelift") | Ok("CRANELIFT") => CpuBackend::Cranelift,
             _ => CpuBackend::default(),
         }
     }
@@ -274,102 +269,13 @@ fn create_llvm_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<
 }
 
 // =============================================================================
-// Cranelift Backend
-// =============================================================================
-
-use crate::cranelift::CraneliftKernel;
-
-/// Cranelift program wrapper implementing the Program trait.
-struct CraneliftProgram {
-    kernel: CraneliftKernel,
-}
-
-impl Program for CraneliftProgram {
-    unsafe fn execute(
-        &self,
-        buffers: &[*mut u8],
-        vals: &[i64],
-        _global_size: Option<[usize; 3]>,
-        _local_size: Option<[usize; 3]>,
-    ) -> Result<()> {
-        unsafe {
-            self.kernel
-                .execute_with_vals(buffers, vals)
-                .map_err(|e| morok_device::Error::Runtime { message: format!("{}", e) })
-        }
-    }
-
-    fn name(&self) -> &str {
-        self.kernel.name()
-    }
-}
-
-/// Cranelift renderer wrapper implementing the Renderer trait.
-struct CraneliftRendererWrapper {
-    device: DeviceSpec,
-}
-
-impl Renderer for CraneliftRendererWrapper {
-    fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec> {
-        let renderer = morok_codegen::cranelift::CraneliftRenderer::new();
-        let rendered = renderer
-            .render(ast, Some("kernel"))
-            .map_err(|e| morok_device::Error::Runtime { message: format!("Cranelift rendering failed: {}", e) })?;
-
-        let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
-
-        if let Some(global) = rendered.global_size
-            && let Some(local) = rendered.local_size
-        {
-            spec.set_work_sizes(global, local);
-        }
-
-        Ok(spec)
-    }
-
-    fn device(&self) -> &DeviceSpec {
-        &self.device
-    }
-
-    fn decompositor(&self) -> Option<morok_ir::pattern::TypedPatternMatcher<()>> {
-        let renderer = morok_codegen::cranelift::CraneliftRenderer::new();
-        <morok_codegen::cranelift::CraneliftRenderer as morok_codegen::Renderer>::decompositor(&renderer)
-    }
-}
-
-/// Cranelift compiler - passes IR through to runtime for JIT.
-struct CraneliftCompiler;
-
-impl Compiler for CraneliftCompiler {
-    fn compile(&self, spec: &ProgramSpec) -> Result<morok_device::device::CompiledSpec> {
-        Ok(morok_device::device::CompiledSpec::from_source(spec.name.clone(), spec.src.clone(), spec.ast.clone()))
-    }
-
-    fn cache_key(&self) -> Option<&str> {
-        Some("cranelift-jit")
-    }
-}
-
-/// Runtime factory for creating Cranelift programs.
-fn create_cranelift_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
-    let src = spec.src.as_ref().ok_or_else(|| morok_device::Error::Runtime {
-        message: "Cranelift JIT requires source code in CompiledSpec".to_string(),
-    })?;
-
-    let kernel = CraneliftKernel::compile(src, &spec.name)
-        .map_err(|e| morok_device::Error::Runtime { message: format!("Cranelift JIT compilation failed: {}", e) })?;
-
-    Ok(Box::new(CraneliftProgram { kernel }))
-}
-
-// =============================================================================
 // Public API
 // =============================================================================
 
 /// Create a CPU device with the default backend.
 ///
 /// The default backend is selected by:
-/// 1. `MOROK_CPU_BACKEND` environment variable ("clang", "llvm", or "cranelift")
+/// 1. `MOROK_CPU_BACKEND` environment variable ("clang" or "llvm")
 /// 2. If not set, defaults to Clang
 pub fn create_cpu_device(registry: &DeviceRegistry) -> Result<Device> {
     create_cpu_device_with_backend(registry, CpuBackend::from_env())
@@ -385,12 +291,6 @@ pub fn create_cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBac
             let renderer = Arc::new(ClangRendererWrapper { device: device_spec.clone() });
             let compiler = Arc::new(ClangCompiler);
             let runtime: RuntimeFactory = Arc::new(create_clang_program);
-            Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
-        }
-        CpuBackend::Cranelift => {
-            let renderer = Arc::new(CraneliftRendererWrapper { device: device_spec.clone() });
-            let compiler = Arc::new(CraneliftCompiler);
-            let runtime: RuntimeFactory = Arc::new(create_cranelift_program);
             Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
         }
         CpuBackend::Llvm => {

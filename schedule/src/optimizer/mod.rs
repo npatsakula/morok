@@ -151,7 +151,7 @@ pub fn apply_post_optimization_with_renderer(
 ) -> Arc<morok_ir::UOp> {
     // Multi-index linearization: INDEX(buf, [i,j,k]) → INDEX(buf, [linear])
     // Moves row-major linearization from codegen to schedule, eliminating
-    // duplicated logic in LLVM and Cranelift backends.
+    // duplicated logic in LLVM backends.
     // Must run BEFORE pm_add_loads (which transforms INDEX dtype to Ptr).
     // Uses bottom-up traversal to ensure children are processed before parents.
     let linearized = graph_rewrite(&pm_linearize_multi_index(), ast, &mut ());

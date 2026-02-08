@@ -19,7 +19,6 @@
 
 pub mod c;
 pub mod common;
-pub mod cranelift;
 pub mod error;
 pub mod llvm;
 pub mod traits;
