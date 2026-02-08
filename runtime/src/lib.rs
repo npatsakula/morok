@@ -1,7 +1,7 @@
 //! Runtime execution for morok kernels.
 //!
 //! Provides generic kernel execution interface with backend-specific implementations
-//! (LLVM JIT, Cranelift JIT, native shared libraries, CUDA, etc.).
+//! (LLVM JIT, native shared libraries, CUDA, etc.).
 //!
 //! # Parallel Execution
 //!
@@ -15,7 +15,6 @@
 
 pub mod benchmark;
 pub mod clang;
-pub mod cranelift;
 pub mod device_registry;
 pub mod devices;
 pub mod error;

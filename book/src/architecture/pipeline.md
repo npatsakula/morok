@@ -270,12 +270,11 @@ Each group's kernels execute in parallel, then the next group starts.
 
 ## Code Generation: From UOp to LLVM IR
 
-With kernels scheduled, we generate actual code. Morok currently supports two backends:
+With kernels scheduled, we generate actual code. Morok currently supports the LLVM backend:
 
 | Backend | Compile Speed | Output Quality | Use Case |
 |---------|---------------|----------------|----------|
 | **LLVM** | Slower | Highly optimized | Production |
-| **Cranelift** | Faster | Good | Development/testing |
 
 The `Renderer` trait abstracts code generation:
 
