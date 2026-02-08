@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "rust";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-403a6f69.js";
+            window.path_to_searchindex_js = "../searchindex-0624f9d3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-6f19a375.js"></script>
@@ -395,7 +395,7 @@ Kernel C (reads buf0, buf1)  ─── depends on A and B
 <p>Each group’s kernels execute in parallel, then the next group starts.</p>
 <hr>
 <h2 id="code-generation-from-uop-to-llvm-ir"><a class="header" href="#code-generation-from-uop-to-llvm-ir">Code Generation: From UOp to LLVM IR</a></h2>
-<p>With kernels scheduled, we generate actual code. Morok currently supports two backends:</p>
+<p>With kernels scheduled, we generate actual code. Morok currently supports the LLVM backend:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -403,7 +403,6 @@ Kernel C (reads buf0, buf1)  ─── depends on A and B
 </thead>
 <tbody>
 <tr><td><strong>LLVM</strong></td><td>Slower</td><td>Highly optimized</td><td>Production</td></tr>
-<tr><td><strong>Cranelift</strong></td><td>Faster</td><td>Good</td><td>Development/testing</td></tr>
 </tbody>
 </table>
 </div>
