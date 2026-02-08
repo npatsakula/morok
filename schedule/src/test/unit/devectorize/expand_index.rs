@@ -504,3 +504,108 @@ fn test_expand_half_buffer() {
         other => panic!("Expected PTRCAT or CAST, got {:?}", other),
     }
 }
+
+// =============================================================================
+// Broadcast Tests (multi-lane offsets)
+// =============================================================================
+
+/// Test: Pure broadcast [0,0,0,0] → 1 scalar PTRCAT source, GEP [0,0,0,0].
+///
+/// When all lanes read the same address, PTRCAT should contain a single scalar
+/// pointer and GEP should broadcast it to all lanes via repeated index 0.
+/// Before fix: produced a contiguous vec4 load of mem[0..4] (WRONG).
+/// After fix: produces a scalar load with GEP broadcast (CORRECT).
+#[test]
+fn test_expand_pure_broadcast() {
+    let buffer = create_buffer(64);
+    let index = create_vector_index_values(buffer.clone(), vec![0, 0, 0, 0]);
+
+    let result = apply_phase1(&index);
+
+    match result.op() {
+        Op::Gep { vector, indices } => {
+            // All lanes should map to the same PTRCAT slot (index 0)
+            assert_eq!(indices, &[0, 0, 0, 0], "All lanes should read from the same slot");
+            match vector.op() {
+                Op::PtrCat { sources } => {
+                    // Single scalar pointer — no CAST to vec ptr
+                    assert_eq!(sources.len(), 1, "Broadcast should produce single scalar source");
+                    assert!(
+                        !matches!(sources[0].op(), Op::Cast { .. }),
+                        "Broadcast source should NOT be CAST to vector pointer"
+                    );
+                }
+                // Single source PTRCAT may be unwrapped
+                _ => {}
+            }
+        }
+        // If PTRCAT is unwrapped directly (single source)
+        Op::PtrCat { sources } => {
+            assert_eq!(sources.len(), 1, "Broadcast should produce single scalar source");
+        }
+        other => panic!("Expected GEP(PTRCAT) or PTRCAT, got {:?}", other),
+    }
+}
+
+/// Test: Partial broadcast [0,1,0,1] → 1 vec2 PTRCAT source, GEP [0,1,0,1].
+///
+/// Two distinct offsets (0 and 1), each read by two lanes. Should produce a
+/// single vec2 PTRCAT source (consecutive offsets 0,1), with GEP mapping
+/// lanes back to their respective slots.
+#[test]
+fn test_expand_partial_broadcast() {
+    let buffer = create_buffer(64);
+    let index = create_vector_index_values(buffer.clone(), vec![0, 1, 0, 1]);
+
+    let result = apply_phase1(&index);
+
+    match result.op() {
+        Op::Gep { vector, indices } => {
+            // Lanes 0,2 → offset 0 (slot 0), lanes 1,3 → offset 1 (slot 1)
+            assert_eq!(indices, &[0, 1, 0, 1], "GEP should map lanes to their offset slots");
+            match vector.op() {
+                Op::PtrCat { sources } => {
+                    // Single vec2 pointer (offsets 0,1 are consecutive)
+                    assert_eq!(sources.len(), 1, "Consecutive offsets should form single group");
+                    assert!(matches!(sources[0].op(), Op::Cast { .. }), "vec2 source should be CAST to vector pointer");
+                }
+                _ => {}
+            }
+        }
+        Op::PtrCat { sources } => {
+            assert_eq!(sources.len(), 1, "Consecutive offsets should form single group");
+        }
+        other => panic!("Expected GEP(PTRCAT) or PTRCAT, got {:?}", other),
+    }
+}
+
+/// Test: Mixed single/multi-lane [0,1,0,2] → 1 vec3 PTRCAT source, GEP [0,1,0,2].
+///
+/// Three distinct offsets (0, 1, 2), where offset 0 is read by two lanes.
+/// All three offsets are consecutive, so they form a single vec3 group.
+#[test]
+fn test_expand_mixed_broadcast() {
+    let buffer = create_buffer(64);
+    let index = create_vector_index_values(buffer.clone(), vec![0, 1, 0, 2]);
+
+    let result = apply_phase1(&index);
+
+    match result.op() {
+        Op::Gep { vector, indices } => {
+            // Lanes 0,2 → offset 0 (slot 0), lane 1 → offset 1 (slot 1), lane 3 → offset 2 (slot 2)
+            assert_eq!(indices, &[0, 1, 0, 2], "GEP should map lanes to their offset slots");
+            match vector.op() {
+                Op::PtrCat { sources } => {
+                    // Single vec3 pointer (offsets 0,1,2 are consecutive)
+                    assert_eq!(sources.len(), 1, "Consecutive offsets should form single group");
+                    assert!(matches!(sources[0].op(), Op::Cast { .. }), "vec3 source should be CAST to vector pointer");
+                }
+                _ => {}
+            }
+        }
+        Op::PtrCat { sources } => {
+            assert_eq!(sources.len(), 1, "Consecutive offsets should form single group");
+        }
+        other => panic!("Expected GEP(PTRCAT) or PTRCAT, got {:?}", other),
+    }
+}
