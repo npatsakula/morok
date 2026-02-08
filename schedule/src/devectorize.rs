@@ -618,7 +618,7 @@ fn gep_movement_patterns() -> TypedPatternMatcher {
 fn ptrcat_distribution_patterns() -> TypedPatternMatcher {
     crate::patterns! {
         // PTRCAT after LOAD: LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
-        load @ Load { buffer, index: ptrcat @ PtrCat { sources } }
+        load @ Load { buffer, index: ptrcat @ PtrCat { sources }, alt: None }
             => distribute_ptrcat_load(load, buffer, ptrcat, sources),
 
         // PTRCAT after STORE
@@ -778,14 +778,16 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     for offsets in offsets_by_root.values() {
         let groups = group_consecutive_offsets_from_map(offsets);
-        for (_, lanes) in groups {
-            let lidx = sources[lanes[0]].clone();
-            let ptr = if lanes.len() > 1 { lidx.cast(make_vec_ptr_dtype(&buf, lanes.len())) } else { lidx };
-            for (i, &lane) in lanes.iter().enumerate() {
-                idxs[lane] = Some(global_offset + i);
+        for grp in groups {
+            let lidx = sources[offsets[&grp[0]][0]].clone();
+            let ptr = if grp.len() > 1 { lidx.cast(make_vec_ptr_dtype(&buf, grp.len())) } else { lidx };
+            for (i, &offset) in grp.iter().enumerate() {
+                for &lane in &offsets[&offset] {
+                    idxs[lane] = Some(global_offset + i);
+                }
             }
             ret.push(ptr);
-            global_offset += lanes.len();
+            global_offset += grp.len();
         }
     }
 
@@ -803,8 +805,12 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     Some(ptrcat.gep(gep_indices))
 }
 
-/// Groups offsets where `offset - index` is constant. Breaks on multi-lane offsets.
-fn group_consecutive_offsets_from_map(offsets_map: &HashMap<i64, Vec<usize>>) -> Vec<(i64, Vec<usize>)> {
+/// Groups offsets where `offset - index` is constant.
+///
+/// Returns groups of consecutive offset keys. Multi-lane offsets (broadcasts)
+/// are handled by the caller — all lanes sharing an offset get the same PTRCAT slot.
+/// Matches Tinygrad's `itertools.groupby(enumerate(sorted(offsets.keys())), lambda x: x[1]-x[0])`.
+fn group_consecutive_offsets_from_map(offsets_map: &HashMap<i64, Vec<usize>>) -> Vec<Vec<i64>> {
     if offsets_map.is_empty() {
         return vec![];
     }
@@ -814,15 +820,9 @@ fn group_consecutive_offsets_from_map(offsets_map: &HashMap<i64, Vec<usize>>) ->
         .iter()
         .copied()
         .enumerate()
-        .chunk_by(|(idx, offset)| (offsets_map[offset].len() == 1, offset - (*idx as i64)))
+        .chunk_by(|(idx, offset)| offset - (*idx as i64))
         .into_iter()
-        .map(|(_, group)| {
-            let offsets_in_group: Vec<_> = group.collect();
-            let first_offset = offsets_in_group[0].1;
-            let lanes: Vec<usize> =
-                offsets_in_group.iter().flat_map(|(_, offset)| offsets_map[offset].iter().copied()).collect();
-            (first_offset, lanes)
-        })
+        .map(|(_, group)| group.map(|(_, offset)| offset).collect())
         .collect()
 }
 
