@@ -250,7 +250,13 @@ impl UOp {
         assert!(!sources.is_empty(), "PTRCAT requires at least one source");
         let dtype = dtype.unwrap_or_else(|| {
             // Compute vcount from total source pointer vcount, matching CAT's approach.
-            let total_vcount: usize = sources.iter().map(|s| s.dtype().vcount()).sum();
+            let total_vcount: usize = sources
+                .iter()
+                .map(|s| match s.dtype() {
+                    DType::Ptr { base, .. } => base.vcount(),
+                    other => other.vcount(),
+                })
+                .sum();
             let base = &sources[0].dtype;
             match base {
                 DType::Ptr { base, addrspace, size, .. } => {
