@@ -4,7 +4,7 @@
 //! using row-major linearization.
 //!
 //! This moves the multi-index → linear offset computation from codegen
-//! to schedule, eliminating duplicated logic in LLVM and Cranelift backends.
+//! to schedule, eliminating duplicated logic in LLVM and C backends.
 //!
 //! # Row-Major Linearization
 //!
@@ -184,7 +184,7 @@ fn build_vectorized_linear_index(indices: &[Arc<UOp>], strides: &[i64], vcount: 
 ///
 /// Where `linear = i * (D1*D2) + j * D2 + k` for row-major layout.
 ///
-/// This eliminates backend-specific linearization in LLVM/Cranelift codegen.
+/// This eliminates backend-specific linearization in LLVM/C codegen.
 pub fn pm_linearize_multi_index() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Match INDEX with multiple indices
