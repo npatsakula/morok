@@ -22,6 +22,8 @@ pub mod execution_plan;
 pub mod executor;
 pub mod kernel_cache;
 pub mod llvm;
+#[cfg(feature = "mlir")]
+pub mod mlir;
 
 #[cfg(test)]
 pub mod test;

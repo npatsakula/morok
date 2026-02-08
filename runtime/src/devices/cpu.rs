@@ -29,6 +29,10 @@ pub enum CpuBackend {
     /// LLVM JIT backend.
     /// Maximum optimization, slower compilation.
     Llvm,
+    /// MLIR backend.
+    /// Generates MLIR, lowers to LLVM IR, then JIT compiles.
+    #[cfg(feature = "mlir")]
+    Mlir,
 }
 
 impl CpuBackend {
@@ -37,6 +41,8 @@ impl CpuBackend {
         match std::env::var("MOROK_CPU_BACKEND").as_deref() {
             Ok("clang") | Ok("CLANG") => CpuBackend::Clang,
             Ok("llvm") | Ok("LLVM") => CpuBackend::Llvm,
+            #[cfg(feature = "mlir")]
+            Ok("mlir") | Ok("MLIR") => CpuBackend::Mlir,
             _ => CpuBackend::default(),
         }
     }
@@ -269,6 +275,114 @@ fn create_llvm_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<
 }
 
 // =============================================================================
+// MLIR Backend
+// =============================================================================
+
+#[cfg(feature = "mlir")]
+mod mlir_backend {
+    use super::*;
+
+    /// MLIR program wrapper using ExecutionEngine.
+    pub struct MlirProgram {
+        pub kernel: crate::mlir::MlirKernel,
+    }
+
+    impl Program for MlirProgram {
+        unsafe fn execute(
+            &self,
+            buffers: &[*mut u8],
+            vals: &[i64],
+            global_size: Option<[usize; 3]>,
+            _local_size: Option<[usize; 3]>,
+        ) -> Result<()> {
+            let thread_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
+
+            if let Some(count) = thread_count {
+                unsafe {
+                    execute_parallel(self.kernel.fn_ptr() as usize, buffers, vals, self.kernel.var_names(), count)
+                }
+            } else {
+                unsafe { self.kernel.execute_with_vals(buffers, vals) }.map_err(|e| morok_device::Error::Runtime {
+                    message: format!("MLIR kernel execution failed: {}", e),
+                })
+            }
+        }
+
+        fn name(&self) -> &str {
+            self.kernel.name()
+        }
+    }
+
+    /// MLIR renderer wrapper implementing the Renderer trait.
+    pub struct MlirRendererWrapper {
+        pub device: DeviceSpec,
+    }
+
+    impl Renderer for MlirRendererWrapper {
+        fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec> {
+            let rendered = morok_codegen::mlir::render(ast, Some("kernel"))
+                .map_err(|e| morok_device::Error::Runtime { message: format!("MLIR rendering failed: {}", e) })?;
+
+            let mut spec =
+                ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
+
+            if let Some(global) = rendered.global_size
+                && let Some(local) = rendered.local_size
+            {
+                spec.set_work_sizes(global, local);
+            }
+
+            spec.set_var_names(rendered.var_names.clone());
+
+            Ok(spec)
+        }
+
+        fn device(&self) -> &DeviceSpec {
+            &self.device
+        }
+
+        fn decompositor(&self) -> Option<morok_ir::pattern::TypedPatternMatcher<()>> {
+            use morok_ir::decompositions::ptrcat_decomposition_patterns;
+            Some(ptrcat_decomposition_patterns())
+        }
+    }
+
+    /// MLIR compiler implementing the Compiler trait.
+    pub struct MlirCompiler;
+
+    impl Compiler for MlirCompiler {
+        fn compile(&self, spec: &morok_device::device::ProgramSpec) -> Result<morok_device::device::CompiledSpec> {
+            let mut compiled =
+                morok_device::device::CompiledSpec::from_source(spec.name.clone(), spec.src.clone(), spec.ast.clone());
+            compiled.var_names = spec.var_names.clone();
+            compiled.global_size = spec.global_size;
+            compiled.local_size = spec.local_size;
+            Ok(compiled)
+        }
+
+        fn cache_key(&self) -> Option<&str> {
+            Some("mlir-exec-engine")
+        }
+    }
+
+    /// Runtime factory for creating MLIR programs.
+    pub fn create_mlir_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<dyn Program>> {
+        let src = spec.src.as_ref().ok_or_else(|| morok_device::Error::Runtime {
+            message: "MLIR backend requires source code (MLIR text) in CompiledSpec".to_string(),
+        })?;
+
+        let kernel = crate::mlir::MlirKernel::compile(src, &spec.name, spec.var_names.clone()).map_err(|e| {
+            morok_device::Error::Runtime { message: format!("MLIR ExecutionEngine compilation failed: {}", e) }
+        })?;
+
+        Ok(Box::new(MlirProgram { kernel }))
+    }
+}
+
+#[cfg(feature = "mlir")]
+use mlir_backend::{MlirCompiler, MlirRendererWrapper, create_mlir_program};
+
+// =============================================================================
 // Public API
 // =============================================================================
 
@@ -297,6 +411,13 @@ pub fn create_cpu_device_with_backend(registry: &DeviceRegistry, backend: CpuBac
             let renderer = Arc::new(LlvmRendererWrapper { device: device_spec.clone() });
             let compiler = Arc::new(LlvmCompiler);
             let runtime: RuntimeFactory = Arc::new(create_llvm_program);
+            Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
+        }
+        #[cfg(feature = "mlir")]
+        CpuBackend::Mlir => {
+            let renderer = Arc::new(MlirRendererWrapper { device: device_spec.clone() });
+            let compiler = Arc::new(MlirCompiler);
+            let runtime: RuntimeFactory = Arc::new(create_mlir_program);
             Ok(Device::new(device_spec, allocator, renderer, compiler, runtime))
         }
     }

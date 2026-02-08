@@ -429,7 +429,7 @@ pub fn count_unrolls(uop: &Arc<UOp>) -> usize {
 /// # Panics
 /// Panics if the UOp structure doesn't match expected patterns.
 pub fn extract_result_values(uop: &Arc<UOp>) -> Vec<i64> {
-    use morok_ir::types::BinaryOp;
+    
 
     match uop.op() {
         Op::VConst { values } => extract_const_values(values),

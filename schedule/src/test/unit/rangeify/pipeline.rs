@@ -128,7 +128,7 @@ fn test_run_rangeify_preserves_structure() {
 #[test]
 fn test_kernel_split_pipeline_simple_store() {
     // Test: Simple STORE should create a KERNEL
-    let buffer = UOp::buffer_id(Some(0));
+    let _buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = index.store(value);
@@ -143,7 +143,7 @@ fn test_kernel_split_pipeline_simple_store() {
 #[test]
 fn test_kernel_split_pipeline_with_end() {
     // Test: END(STORE) should be processed correctly
-    let buffer = UOp::buffer_id(Some(0));
+    let _buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = index.store(value);
@@ -162,7 +162,7 @@ fn test_kernel_split_pipeline_with_end() {
 fn test_kernel_split_pipeline_load_store() {
     // Test: LOAD + STORE pattern
     let in_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let _out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let index = UOp::index_const(0);
 
     let load = UOp::load().buffer(in_buf).index(index.clone()).call();
@@ -179,7 +179,7 @@ fn test_kernel_split_pipeline_multiple_loads() {
     // Test: Multiple LOADs feeding into STORE
     let buf1 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let buf2 = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
-    let out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
+    let _out_buf = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let index = UOp::index_const(0);
 
     let load1 = UOp::load().buffer(buf1).index(index.clone()).call();
@@ -205,7 +205,7 @@ fn test_end_to_end_simple_computation() {
     let sum = a.try_add(&b).unwrap();
 
     // Step 2: Wrap in STORE
-    let buffer = UOp::buffer_id(Some(0));
+    let _buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let store = index.store(sum);
 
@@ -223,7 +223,7 @@ fn test_end_to_end_simple_computation() {
 fn test_end_to_end_with_ranges() {
     // Test: Pipeline with explicit range operations
 
-    let buffer = UOp::buffer_id(Some(0));
+    let _buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = index.store(value);

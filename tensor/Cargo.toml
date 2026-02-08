@@ -24,6 +24,7 @@ tikv-jemallocator = "0.6.1"
 
 [features]
 default = []
+mlir = ["morok-runtime/mlir"]
 # Enable trace-level spans in hot paths (compile-time control)
 tracing-verbose = []
 

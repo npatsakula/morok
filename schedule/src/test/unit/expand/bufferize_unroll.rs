@@ -132,7 +132,7 @@ fn test_bufferize_multiple_ranges_passthrough() {
     // Pattern requires exactly 1 range - should not fire for this specific pattern
     // But other patterns may still process the UNROLLs
     if let Op::Bufferize { ranges, .. } = result.op() {
-        assert!(ranges.len() >= 1);
+        assert!(!ranges.is_empty());
     }
 }
 
