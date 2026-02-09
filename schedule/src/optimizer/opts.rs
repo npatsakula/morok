@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_ir::{AxisType, ConstValue, Op, UOp, UOpKey};
+use smallvec::SmallVec;
 
 use crate::optimizer::{Opt, OptOps, Scheduler, error::*, tc};
 
@@ -22,7 +23,8 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
     match opt.op {
         OptOps::TC => {
             let (tc_select, tc_opt, use_tensor_cores) = opt.arg.tc()?;
-            tc::apply(scheduler, tc_select, tc_opt, use_tensor_cores)?;
+            // TODO: propagate TC axes for post-TC upcasts on non-AMX devices
+            let _axes = tc::apply(scheduler, tc_select, tc_opt, use_tensor_cores)?;
         }
         OptOps::UPCAST => {
             apply_upcast(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
@@ -120,6 +122,9 @@ fn apply_local(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resul
 
 /// Split reduction into smaller range + GROUP_REDUCE using shared memory.
 fn apply_group(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize, top: bool) -> Result<(), OptError> {
+    if scheduler.applied_opts.iter().any(|opt| opt.op == OptOps::TC) {
+        return ValidationFailedSnafu { op: "GROUP", reason: "no grouping with tensor cores" }.fail();
+    }
     if !scheduler.ren.has_local {
         return UnsupportedFeatureSnafu { feature: "local memory" }.fail();
     }
@@ -344,7 +349,9 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
     }
 
     // Constraint 4: don't add more than 4x work
-    if old_sz * 4 < new_sz {
+    // Tinygrad: check(rng.vmax+1 > new_sz//4, "pad adds more than quadruple the work")
+    // Strict inequality: exactly 4x is also rejected.
+    if old_sz * 4 <= new_sz {
         return ValidationFailedSnafu { op: "PADTO", reason: "padding would add more than 4x work" }.fail();
     }
 
@@ -383,23 +390,55 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
     let mut subst_map = HashMap::new();
     subst_map.insert(UOpKey(rng.clone()), new_rng.clone());
 
-    // Update INDEX operations that use this range - add validity gate
+    // Update INDEX operations that use this range - add validity gate.
+    // The replacement INDEX must use the new padded range in its indices
+    // (not the original range), since substitute replaces the INDEX node
+    // directly without recursing into its children.
+    #[allow(clippy::mutable_key_type)]
+    let range_subst: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(rng.clone()), new_rng.clone())].into_iter().collect();
+
     for buf_op in scheduler.bufs() {
         if buf_uses_range(&buf_op, &rng)
             && let Op::Index { buffer, indices, gate } = buf_op.op()
         {
-            // Combine validity condition with existing gate if present
-            let combined_gate = match gate {
-                Some(existing) => valid
-                    .try_and_op(existing)
-                    .map_err(|_| ValidationFailedSnafu { op: "PADTO", reason: "failed to combine gates" }.build())?,
-                None => valid.clone(),
+            // Substitute old range → new range in index expressions
+            let new_indices: SmallVec<[Arc<UOp>; 4]> = indices.iter().map(|idx| idx.substitute(&range_subst)).collect();
+
+            // Encode validity gate using WHERE(cond, idx, Invalid) in the index source
+            // instead of the INDEX gate field. This prevents the expander from vectorizing
+            // the gate independently (Tinygrad's approach: symbolic.py invalid_gate encoding).
+            let new_index = if let Some(first_idx) = new_indices.first() {
+                // Extract any existing WHERE-encoded validity from the index
+                let existing_valid = first_idx.get_valid();
+                let real_idx = first_idx.get_idx();
+
+                // Combine PADTO validity with existing validity and gate field
+                let mut combined = valid.clone();
+                if let Some(existing_gate) = gate {
+                    combined = combined.try_and_op(existing_gate).map_err(|_| {
+                        ValidationFailedSnafu { op: "PADTO", reason: "failed to combine gates" }.build()
+                    })?;
+                }
+                if !matches!(existing_valid.op(), Op::Const(cv) if cv.0 == ConstValue::Bool(true)) {
+                    combined = combined.try_and_op(&existing_valid).map_err(|_| {
+                        ValidationFailedSnafu { op: "PADTO", reason: "failed to combine validity" }.build()
+                    })?;
+                }
+
+                // Encode combined validity in the index source
+                let encoded_idx = real_idx.valid(combined);
+                let mut remaining_indices = new_indices.clone();
+                remaining_indices[0] = encoded_idx;
+
+                UOp::index().buffer(buffer.clone()).indices(remaining_indices).call().map_err(|_| {
+                    ValidationFailedSnafu { op: "PADTO", reason: "failed to create gated INDEX" }.build()
+                })?
+            } else {
+                // No indices (bare buffer reference) — use gate field as fallback
+                UOp::index().buffer(buffer.clone()).indices(new_indices).gate(valid.clone()).call().map_err(|_| {
+                    ValidationFailedSnafu { op: "PADTO", reason: "failed to create gated INDEX" }.build()
+                })?
             };
-            // Create new INDEX with combined gate
-            let new_index =
-                UOp::index().buffer(buffer.clone()).indices(indices.clone()).gate(combined_gate).call().map_err(
-                    |_| ValidationFailedSnafu { op: "PADTO", reason: "failed to create gated INDEX" }.build(),
-                )?;
             subst_map.insert(UOpKey(buf_op.clone()), new_index);
         }
     }

@@ -58,9 +58,10 @@ fn test_bufferize_with_size_1_range() {
 
     // Verify the inner BUFFERIZE has the same compute
     if let Some(inner_buf) = get_inner_bufferize(&result)
-        && let Op::Bufferize { compute, .. } = inner_buf.op() {
-            assert!(Arc::ptr_eq(compute, &x), "Inner BUFFERIZE should have original compute");
-        }
+        && let Op::Bufferize { compute, .. } = inner_buf.op()
+    {
+        assert!(Arc::ptr_eq(compute, &x), "Inner BUFFERIZE should have original compute");
+    }
 }
 
 #[test]

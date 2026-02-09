@@ -233,6 +233,11 @@ impl Renderer {
         }
     }
 
+    /// Whether this renderer is for Apple AMX (CPU matrix coprocessor).
+    pub fn is_amx(&self) -> bool {
+        self.device == "AppleAMX"
+    }
+
     /// Create an AMD RDNA3 GPU renderer (RX 7000 series).
     pub fn amd_rdna3() -> Self {
         Self {
@@ -398,6 +403,17 @@ pub struct TensorCore {
         (SmallVec<[SwizzleAxis; 8]>, SmallVec<[SwizzleAxis; 8]>, SmallVec<[SwizzleAxis; 8]>),
         (SmallVec<[SwizzleAxis; 8]>, SmallVec<[SwizzleAxis; 8]>, SmallVec<[SwizzleAxis; 8]>),
     ),
+
+    /// Pre-pack operand A into contiguous scratch buffer before the reduction loop.
+    /// Beneficial when the A operand has non-unit stride access (e.g., AMX row-major matmul).
+    pub pack_a: bool,
+
+    /// Tile grid for multi-FMA batching (tile_y_count, tile_x_count).
+    ///
+    /// When > (1, 1), the codegen emits load-pair instructions and multiple FMAs
+    /// per K iteration to compute a grid of output tiles simultaneously.
+    /// Default is (1, 1) for single-tile operation.
+    pub tile_grid: (usize, usize),
 }
 
 // ============================================================================
@@ -415,6 +431,8 @@ pub struct TcConfig {
     opts: &'static [TcOpt],
     swizzle_a: (&'static [SwizzleAxis], &'static [SwizzleAxis], &'static [SwizzleAxis]),
     swizzle_b: (&'static [SwizzleAxis], &'static [SwizzleAxis], &'static [SwizzleAxis]),
+    pack_a: bool,
+    tile_grid: (usize, usize),
 }
 
 impl TcConfig {
@@ -439,6 +457,8 @@ impl TcConfig {
                     self.swizzle_b.2.iter().copied().collect(),
                 ),
             ),
+            pack_a: self.pack_a,
+            tile_grid: self.tile_grid,
         }
     }
 }
@@ -455,6 +475,8 @@ pub const CUDA_81616: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(1), R(2), SL(2), SL(3), SL(4)], &[SU(1), R(3)], &[SL(0), SL(1), SU(0), R(0)]),
     swizzle_b: (&[R(1), R(2), SU(0), SL(0), SL(1)], &[R(0), R(3)], &[SL(2), SL(3), SL(4), SU(1)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 pub const CUDA_81632: TcConfig = TcConfig {
@@ -464,6 +486,8 @@ pub const CUDA_81632: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(2), R(3), SL(2), SL(3), SL(4)], &[SU(1), R(4)], &[SL(0), SL(1), SU(0), R(0), R(1)]),
     swizzle_b: (&[R(2), R(3), SU(0), SL(0), SL(1)], &[R(1), R(4)], &[SL(2), SL(3), SL(4), SU(1), R(0)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 pub const CUDA_8168: TcConfig = TcConfig {
@@ -473,6 +497,8 @@ pub const CUDA_8168: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(1), R(2), SL(2), SL(3), SL(4)], &[R(0), SU(1)], &[SL(0), SL(1), SU(0)]),
     swizzle_b: (&[R(1), R(2), SU(0), SL(0), SL(1)], &[SU(1), R(0)], &[SL(2), SL(3), SL(4)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 pub const CUDA_8168_TF32: TcConfig = TcConfig {
@@ -482,6 +508,8 @@ pub const CUDA_8168_TF32: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(0), L(1), L(1), L(1), U(1)],
     swizzle_a: (&[R(0), R(1), SL(2), SL(3), SL(4)], &[SU(1), R(2)], &[SL(0), SL(1), SU(0)]),
     swizzle_b: (&[R(0), R(1), SU(0), SL(0), SL(1)], &[SU(1), R(2)], &[SL(2), SL(3), SL(4)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 // AMD Tensor Cores
@@ -492,6 +520,8 @@ pub const AMD_RDNA3: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), L(1), U(1), U(1), U(1)],
     swizzle_a: (&[SL(4), SU(0), SU(1), SU(2), SL(0)], &[R(1), R(2), R(3)], &[SL(1), SL(2), SL(3), R(0)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), SL(4)], &[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2), R(0)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 pub const AMD_RDNA4: TcConfig = TcConfig {
@@ -501,6 +531,8 @@ pub const AMD_RDNA4: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), U(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SU(2), SL(4), R(2)], &[R(0), R(1), R(3)], &[SL(0), SL(1), SL(2), SL(3)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2)], &[R(0), R(1), R(3)], &[SL(4), SU(0), SU(1), SU(2)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 pub const AMD_CDNA_161616: TcConfig = TcConfig {
@@ -510,6 +542,8 @@ pub const AMD_CDNA_161616: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(2), R(3)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(2), R(3)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 pub const AMD_CDNA_161632: TcConfig = TcConfig {
@@ -519,6 +553,8 @@ pub const AMD_CDNA_161632: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), L(0), U(1), U(1), L(1), L(1)],
     swizzle_a: (&[SU(0), SU(1), SL(4), SL(5), R(3), R(4)], &[R(0), R(1)], &[SL(0), SL(1), SL(2), SL(3), R(2)]),
     swizzle_b: (&[SL(0), SL(1), SL(2), SL(3), R(3), R(4)], &[R(0), R(1)], &[SL(4), SL(5), SU(0), SU(1), R(2)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 // Apple Metal Tensor Cores
@@ -529,9 +565,13 @@ pub const METAL_888: TcConfig = TcConfig {
     opts: &[U(0), L(0), L(1), L(1), L(0), L(1)],
     swizzle_a: (&[R(1), SL(1), SL(2), R(2), SL(4)], &[R(0)], &[SU(0), SL(0), SL(3)]),
     swizzle_b: (&[SL(0), R(0), R(1), SL(3), R(2)], &[SU(0)], &[SL(1), SL(2), SL(4)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 // Apple AMX (64 bytes / 4 bytes per float32 = 16 elements per register)
+// NOTE: tile_grid=(2,2) requires direct memory loads (load-pair from source matrices)
+// Temp buffer approach is incompatible with load-pair. Keep at (1,1) until fixed.
 pub const APPLE_AMX: TcConfig = TcConfig {
     dims: (16, 16, 1),
     threads: 1,
@@ -539,6 +579,53 @@ pub const APPLE_AMX: TcConfig = TcConfig {
     opts: &[U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1)],
     swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7)], &[]),
     swizzle_b: (&[], &[SU(4), SU(5), SU(6), SU(7), SU(0), SU(1), SU(2), SU(3)], &[]),
+    pack_a: true,
+    tile_grid: (1, 1),
+};
+
+pub const APPLE_AMX_F16_F32: TcConfig = TcConfig {
+    dims: (32, 32, 1),
+    threads: 1,
+    ept: (32, 32, 1024),
+    opts: &[U(0), U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1), U(1)],
+    swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7), SU(8), SU(9)], &[]),
+    swizzle_b: (&[], &[SU(5), SU(6), SU(7), SU(8), SU(9), SU(0), SU(1), SU(2), SU(3), SU(4)], &[]),
+    pack_a: true,
+    tile_grid: (1, 1),
+};
+
+pub const APPLE_AMX_F16: TcConfig = TcConfig {
+    dims: (32, 32, 1),
+    threads: 1,
+    ept: (32, 32, 1024),
+    opts: &[U(0), U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1), U(1)],
+    swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7), SU(8), SU(9)], &[]),
+    swizzle_b: (&[], &[SU(5), SU(6), SU(7), SU(8), SU(9), SU(0), SU(1), SU(2), SU(3), SU(4)], &[]),
+    pack_a: true,
+    tile_grid: (1, 1),
+};
+
+pub const APPLE_AMX_F64: TcConfig = TcConfig {
+    dims: (8, 8, 1),
+    threads: 1,
+    ept: (8, 8, 64),
+    opts: &[U(0), U(0), U(0), U(1), U(1), U(1)],
+    swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5)], &[]),
+    swizzle_b: (&[], &[SU(3), SU(4), SU(5), SU(0), SU(1), SU(2)], &[]),
+    pack_a: true,
+    tile_grid: (1, 1),
+};
+
+// MAC16: i16×i16→i16, same geometry as FMA16
+pub const APPLE_AMX_I16: TcConfig = TcConfig {
+    dims: (32, 32, 1),
+    threads: 1,
+    ept: (32, 32, 1024),
+    opts: &[U(0), U(0), U(0), U(0), U(0), U(1), U(1), U(1), U(1), U(1)],
+    swizzle_a: (&[], &[SU(0), SU(1), SU(2), SU(3), SU(4), SU(5), SU(6), SU(7), SU(8), SU(9)], &[]),
+    swizzle_b: (&[], &[SU(5), SU(6), SU(7), SU(8), SU(9), SU(0), SU(1), SU(2), SU(3), SU(4)], &[]),
+    pack_a: true,
+    tile_grid: (1, 1),
 };
 
 // Intel Xe Tensor Cores
@@ -549,6 +636,8 @@ pub const INTEL_XE_8816: TcConfig = TcConfig {
     opts: &[L(0), L(0), L(0), U(1), U(1), U(1)],
     swizzle_a: (&[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2)], &[SL(0), SL(1), SL(2), R(0)]),
     swizzle_b: (&[SL(0), SL(1), SL(2)], &[R(1), R(2), R(3)], &[SU(0), SU(1), SU(2), R(0)]),
+    pack_a: false,
+    tile_grid: (1, 1),
 };
 
 impl TensorCore {
@@ -559,9 +648,7 @@ impl TensorCore {
     /// Returns pairs of (dimension_index, unroll_amount) for the K dimension.
     /// Used during TC application to unroll the reduction dimension.
     pub fn get_reduce_axes(&self) -> Vec<(usize, usize)> {
-        // Typically unroll K dimension by 2 twice (2×2=4 total unroll)
-        // This is based on Tinygrad's tensor core implementation
-        vec![(0, 2), (1, 2)]
+        (0..(self.dims.2 as f64).log2().floor() as usize).map(|i| (i, 2)).collect()
     }
 
     /// Get the upcast axes configuration for WMMA construction.
@@ -658,7 +745,13 @@ impl TensorCore {
 
     /// Get all tensor cores for Apple AMX (M1/M2/M3 matrix accelerators).
     pub fn amx_tensor_cores() -> Vec<TensorCore> {
-        vec![APPLE_AMX.build(DType::Float32, DType::Float32)]
+        vec![
+            APPLE_AMX.build(DType::Float32, DType::Float32),
+            APPLE_AMX_F16.build(DType::Float16, DType::Float16),
+            APPLE_AMX_F16_F32.build(DType::Float16, DType::Float32), // Mixed-precision
+            APPLE_AMX_F64.build(DType::Float64, DType::Float64),
+            APPLE_AMX_I16.build(DType::Int16, DType::Int16),
+        ]
     }
 
     /// Get all tensor cores for Intel Xe architecture.

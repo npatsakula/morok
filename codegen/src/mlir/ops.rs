@@ -65,12 +65,19 @@ pub fn build_const<'c>(
 
     match val {
         morok_ir::ConstValue::Int(i) => {
-            debug_assert!(!dtype.is_float(), "Int ConstValue with float dtype {dtype:?}");
-            const_int(ctx, block, *i, mlir_ty, loc)
+            if dtype.is_float() {
+                // AMX accumulator init uses Int(0) for float zero
+                const_float(ctx, block, *i as f64, mlir_ty, loc)
+            } else {
+                const_int(ctx, block, *i, mlir_ty, loc)
+            }
         }
         morok_ir::ConstValue::UInt(u) => {
-            debug_assert!(!dtype.is_float(), "UInt ConstValue with float dtype {dtype:?}");
-            const_int(ctx, block, *u as i64, mlir_ty, loc)
+            if dtype.is_float() {
+                const_float(ctx, block, *u as f64, mlir_ty, loc)
+            } else {
+                const_int(ctx, block, *u as i64, mlir_ty, loc)
+            }
         }
         morok_ir::ConstValue::Float(f) => {
             debug_assert!(dtype.is_float(), "Float ConstValue with non-float dtype {dtype:?}");

@@ -262,10 +262,22 @@ fn compute_run_count(uop: &Arc<UOp>) -> u64 {
 }
 
 /// Get priority and optional argument value for a UOp.
+///
+/// Note: Tinygrad uses `u.arg` for DEFINE_VAR ordering (the name tuple).
+/// Morok uses `id` for tie-breaking since `arg_value` is numeric.
+/// This gives deterministic ordering but not alphabetical by name.
 fn get_priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
     match uop.op() {
         Op::DefineGlobal(id) => (priority::DEFINE_GLOBAL, Some(*id as i64)),
-        Op::DefineVar { .. } => (priority::DEFINE_VAR, None),
+        Op::DefineVar { name, .. } => {
+            // Use hash of name for stable ordering (Tinygrad: uses arg tuple for comparison)
+            // This ensures consistent ordering across runs while approximating name-based sorting
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            name.hash(&mut hasher);
+            (priority::DEFINE_VAR, Some(hasher.finish() as i64))
+        }
         Op::DefineLocal(id) => (priority::DEFINE_LOCAL, Some(*id as i64)),
         Op::DefineReg { .. } => (priority::DEFINE_REG, None),
         Op::Const(_) | Op::VConst { .. } => (priority::CONST, None),

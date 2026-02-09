@@ -4,6 +4,7 @@
 //! dialect for text serialization. Produces the same kernel ABI as the LLVM text backend:
 //! `void @kernel(ptr %args, ptr %vars)`
 
+pub mod amx;
 pub mod ctx;
 pub mod ops;
 pub mod types;
@@ -24,7 +25,7 @@ use melior::utility::{register_all_dialects, register_all_llvm_translations};
 use morok_dtype::DType;
 use morok_ir::pattern::TypedPatternMatcher;
 use morok_ir::rewrite::graph_rewrite_bottom_up;
-use morok_ir::{AxisType, ConstValue, Op, ReduceOp, prelude::*};
+use morok_ir::{AxisType, ConstValue, Op, ReduceOp, WmmaMetadata, prelude::*};
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
 use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
@@ -72,6 +73,93 @@ fn build_reduce_map(nodes: &[Arc<UOp>]) -> HashMap<usize, Vec<ReduceInfo>> {
         }
     }
     map
+}
+
+/// Info about a WMMA inside a reduce loop, for hoisting AMX SET/LDZ/STZ/CLR.
+struct WmmaReduceLoopInfo {
+    acc_reg_id: u64,
+    metadata: WmmaMetadata,
+}
+
+/// Follow AFTER wrappers to find a DEFINE_REG, returning its ID.
+fn trace_to_define_reg(node: &Arc<UOp>) -> Option<u64> {
+    let mut current = node.clone();
+    loop {
+        match current.op() {
+            Op::After { passthrough, .. } => current = passthrough.clone(),
+            Op::DefineReg { .. } => return Some(current.id),
+            _ => return None,
+        }
+    }
+}
+
+/// Check if an INDEX node accesses the given accumulator DEFINE_REG.
+fn is_amx_acc_access(index: &Arc<UOp>, acc_reg_id: u64) -> bool {
+    if let Op::Index { buffer, .. } = index.op() { trace_to_define_reg(buffer) == Some(acc_reg_id) } else { false }
+}
+
+/// Recursively trace through the WMMA C operand to find the accumulator DEFINE_REG.
+///
+/// After `pm_wmma_accumulate`, the C operand is typically:
+///   `Binary(Add, CONST(0), LOAD(INDEX(AFTER*(DEFINE_REG))))`
+/// This function follows through Binary ops to find the LOAD(INDEX(AFTER*(DEFINE_REG))) leaf.
+fn find_acc_reg_in_wmma_c(node: &Arc<UOp>) -> Option<u64> {
+    match node.op() {
+        Op::Load { index, .. } => {
+            if let Op::Index { buffer, .. } = index.op() {
+                trace_to_define_reg(buffer)
+            } else {
+                None
+            }
+        }
+        Op::Binary(_, lhs, rhs) => find_acc_reg_in_wmma_c(lhs).or_else(|| find_acc_reg_in_wmma_c(rhs)),
+        _ => None,
+    }
+}
+
+/// Pre-scan linearized nodes to detect WMMA ops inside reduce loops whose
+/// accumulator (C operand) traces back through LOAD(INDEX(AFTER*(DEFINE_REG))).
+/// Returns a map from RANGE node ID to the hoisting info, plus ordered list of range IDs.
+fn build_wmma_reduce_map(nodes: &[Arc<UOp>]) -> (HashMap<u64, WmmaReduceLoopInfo>, Vec<u64>) {
+    // Track open (non-thread) RANGE nodes: (range_id, axis_type)
+    let mut open_ranges: Vec<(u64, AxisType)> = Vec::new();
+    let mut map = HashMap::new();
+    let mut ordered_ids: Vec<u64> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    for node in nodes {
+        match node.op() {
+            Op::Range { axis_type, .. } if !matches!(axis_type, AxisType::Thread) => {
+                open_ranges.push((node.id, *axis_type));
+            }
+            Op::End { ranges, .. } => {
+                for range in ranges.iter() {
+                    if let Op::Range { axis_type, .. } = range.op()
+                        && !matches!(axis_type, AxisType::Thread)
+                    {
+                        open_ranges.retain(|(id, _)| *id != range.id);
+                    }
+                }
+            }
+            Op::Wmma { c, metadata, .. } => {
+                if let Some(acc_reg_id) = find_acc_reg_in_wmma_c(c) {
+                    // Find the innermost enclosing Reduce range
+                    for &(range_id, axis_type) in open_ranges.iter().rev() {
+                        if matches!(axis_type, AxisType::Reduce) {
+                            map.insert(range_id, WmmaReduceLoopInfo { acc_reg_id, metadata: metadata.clone() });
+                            if !seen_ids.contains(&range_id) {
+                                seen_ids.insert(range_id);
+                                ordered_ids.push(range_id);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (map, ordered_ids)
 }
 
 impl Renderer for MlirRenderer {
@@ -138,6 +226,12 @@ impl Renderer for MlirRenderer {
 
         // Pre-scan: map Range axis_id -> associated reduces
         let reduce_map = build_reduce_map(&nodes);
+
+        // Pre-scan: detect WMMA inside reduce loops for AMX hoisting
+        let (wmma_reduce_map, wmma_reduce_order) = build_wmma_reduce_map(&nodes);
+
+        // Determine if we have any WMMA reduces (for SET/CLR hoisting)
+        let has_wmma_reduces = !wmma_reduce_order.is_empty();
 
         // === Build MLIR module ===
         let context = Context::new();
@@ -212,9 +306,21 @@ impl Renderer for MlirRenderer {
             }
         }
 
+        // Emit AMX SET once in entry block if we have WMMA reduces
+        if has_wmma_reduces {
+            amx::amx_set(&context, &entry_ref, loc);
+            rctx.mark_amx_set_emitted();
+        }
+
         // Process linearized nodes
         for node in &nodes {
-            render_node(&context, &mut rctx, node, &thread_info, &reduce_map, loc);
+            render_node(&context, &mut rctx, node, &thread_info, &reduce_map, &wmma_reduce_map, loc)?;
+        }
+
+        // Emit AMX CLR before return if SET was emitted
+        if rctx.amx_set_emitted() {
+            let block = rctx.current_block();
+            amx::amx_clr(&context, &block, loc);
         }
 
         // Emit return on the final current block
@@ -232,12 +338,10 @@ impl Renderer for MlirRenderer {
 
         module.body().append_operation(func_op);
 
-        tracing::debug!(mlir_module = %module.as_operation(), "mlir codegen: before passes");
-
         // Verify module before running passes
         if !module.as_operation().verify() {
             return Err(crate::error::Error::MlirError {
-                reason: format!("module verification failed before passes\nModule:\n{}", module.as_operation()),
+                reason: "module verification failed before passes".to_string(),
             });
         }
 
@@ -255,14 +359,10 @@ impl Renderer for MlirRenderer {
         pass_manager.add_pass(melior::pass::conversion::create_reconcile_unrealized_casts());
 
         if let Err(e) = pass_manager.run(&mut module) {
-            return Err(crate::error::Error::MlirError {
-                reason: format!("pass pipeline failed: {}\nModule before passes:\n{}", e, module.as_operation()),
-            });
+            return Err(crate::error::Error::MlirError { reason: format!("pass pipeline failed: {e}") });
         }
 
-        tracing::debug!(mlir_module = %module.as_operation(), "mlir codegen: after passes");
-
-        // Return MLIR text (ExecutionEngine will be used at runtime instead of LLVM JIT)
+        // Return MLIR text
         let code = module.as_operation().to_string();
 
         let mut result = RenderedKernel::new(code, kernel_name.to_string());
@@ -297,8 +397,9 @@ fn render_node<'c, 'a: 'c>(
     node: &Arc<UOp>,
     _thread_info: &Option<(Arc<UOp>, usize)>,
     reduce_map: &HashMap<usize, Vec<ReduceInfo>>,
+    wmma_reduce_map: &HashMap<u64, WmmaReduceLoopInfo>,
     loc: Location<'c>,
-) {
+) -> crate::Result<()> {
     match node.op() {
         // Skip meta-ops and already-handled ops
         Op::Const(_)
@@ -320,7 +421,7 @@ fn render_node<'c, 'a: 'c>(
             rctx.register(node.id, val);
         }
 
-        Op::DefineReg { size } => {
+        Op::DefineReg { size, .. } => {
             let block = rctx.current_block();
             let base_dtype = match node.dtype() {
                 DType::Ptr { base, .. } => base.as_ref().clone(),
@@ -408,6 +509,17 @@ fn render_node<'c, 'a: 'c>(
         }
 
         Op::Load { index, .. } => {
+            // Skip acc loads inside a hoisted AMX reduce loop — Z regs hold the value
+            if let Some(state) = rctx.amx_loop_state()
+                && is_amx_acc_access(index, state.acc_reg_id)
+            {
+                let undef_type = mlir_type(ctx, &node.dtype());
+                let block = rctx.current_block();
+                let undef_val = block.append_operation(llvm::undef(undef_type, loc)).result(0).unwrap().into();
+                rctx.register(node.id, undef_val);
+                return Ok(());
+            }
+
             let block = rctx.current_block();
             let idx_val = rctx.get(index.id);
             let load_type = mlir_type(ctx, &node.dtype());
@@ -420,6 +532,13 @@ fn render_node<'c, 'a: 'c>(
         }
 
         Op::Store { index, value, .. } => {
+            // Skip acc stores inside a hoisted AMX reduce loop — Z regs hold the value
+            if let Some(state) = rctx.amx_loop_state()
+                && is_amx_acc_access(index, state.acc_reg_id)
+            {
+                return Ok(());
+            }
+
             let block = rctx.current_block();
             let idx_val = rctx.get(index.id);
             let val = rctx.get(value.id);
@@ -470,7 +589,7 @@ fn render_node<'c, 'a: 'c>(
         // =====================================================================
         Op::Range { end, axis_id, axis_type, .. } => {
             if matches!(axis_type, AxisType::Thread) {
-                return;
+                return Ok(());
             }
 
             let range_dtype = node.dtype();
@@ -527,6 +646,18 @@ fn render_node<'c, 'a: 'c>(
                 yield_values.push(arg);
             }
 
+            // If this RANGE encloses a WMMA reduce, emit LDZ before the loop
+            // (SET was already emitted in entry block, CLR will be emitted before return)
+            if let Some(info) = wmma_reduce_map.get(&node.id) {
+                let acc_alloca = rctx.get(info.acc_reg_id);
+                amx::render_amx_ldz(ctx, &parent_block, acc_alloca, &info.metadata, loc)?;
+                rctx.set_amx_loop_state(amx::AmxLoopState {
+                    acc_alloca,
+                    acc_reg_id: info.acc_reg_id,
+                    metadata: info.metadata.clone(),
+                });
+            }
+
             rctx.set_current_block(body_ref);
             rctx.push_scf_loop(ScfLoopInfo {
                 parent_block,
@@ -581,6 +712,15 @@ fn render_node<'c, 'a: 'c>(
                     }
 
                     rctx.set_current_block(loop_info.parent_block);
+
+                    // If this was a WMMA reduce loop, finalize: STZ back to acc alloca
+                    // (CLR will be emitted before function return)
+                    if wmma_reduce_map.contains_key(&range.id)
+                        && let Some(state) = rctx.take_amx_loop_state()
+                    {
+                        let block = rctx.current_block();
+                        amx::render_amx_stz(ctx, &block, state.acc_alloca, &state.metadata, loc)?;
+                    }
                 }
             }
         }
@@ -609,7 +749,9 @@ fn render_node<'c, 'a: 'c>(
             let vec_val = rctx.get(vector.id);
             let scalar_type = mlir_type(ctx, &node.dtype());
 
-            if indices.len() == 1 {
+            if vector.dtype().vcount() <= 1 {
+                rctx.register(node.id, vec_val);
+            } else if indices.len() == 1 {
                 let result = render_extractelement(ctx, &block, vec_val, indices[0], scalar_type, loc);
                 rctx.register(node.id, result);
             } else {
@@ -685,8 +827,11 @@ fn render_node<'c, 'a: 'c>(
         }
 
         Op::Contract { src, .. } | Op::Unroll { src, .. } | Op::Detach { src } => {
-            let s = rctx.get(src.id);
-            rctx.register(node.id, s);
+            // Source may be absent when WMMA uses in-memory accumulation
+            // (no SSA loop-carried value); the result is only consumed by Sink.
+            if let Some(s) = rctx.try_get(src.id) {
+                rctx.register(node.id, s);
+            }
         }
 
         Op::After { passthrough, .. } => {
@@ -697,6 +842,36 @@ fn render_node<'c, 'a: 'c>(
         Op::Bind { var, value } => {
             let v = rctx.get(value.id);
             rctx.register(var.id, v);
+        }
+
+        Op::Wmma { a, b, metadata, .. } => {
+            assert!(
+                rctx.amx_loop_state().is_some(),
+                "WMMA (id={}) outside a reduce loop — TC optimizer must place WMMA inside a K-reduction",
+                node.id,
+            );
+
+            let block = rctx.current_block();
+
+            // Build AMX operands: direct pointer when contiguous, temp buffer otherwise.
+            // PADTO introduces gated loads that prevent devectorization into a single
+            // contiguous LOAD, so we fall back to storing the rendered vector value
+            // into a stack alloca.
+            let a_operand = match resolve_to_load_index(a) {
+                Some(id) => amx::AmxOperand::Direct(rctx.get(id)),
+                None => amx::AmxOperand::TempBuffer(rctx.get(a.id), mlir_type(ctx, &a.dtype())),
+            };
+            let b_operand = match resolve_to_load_index(b) {
+                Some(id) => amx::AmxOperand::Direct(rctx.get(id)),
+                None => amx::AmxOperand::TempBuffer(rctx.get(b.id), mlir_type(ctx, &b.dtype())),
+            };
+
+            amx::render_amx_fma(ctx, &block, a_operand, b_operand, metadata, loc)?;
+
+            // Register undef so downstream Store (which we skip) doesn't panic
+            let undef_type = mlir_type(ctx, &node.dtype());
+            let undef_val = block.append_operation(llvm::undef(undef_type, loc)).result(0).unwrap().into();
+            rctx.register(node.id, undef_val);
         }
 
         // =====================================================================
@@ -751,6 +926,23 @@ fn render_node<'c, 'a: 'c>(
         _ => {
             tracing::warn!(op = ?node.op(), id = node.id, "unsupported op in MLIR codegen");
         }
+    }
+    Ok(())
+}
+
+/// Trace through CONTRACT/UNROLL/DETACH wrappers to find the underlying LOAD's INDEX.
+///
+/// Returns the UOp ID of the INDEX node within a LOAD. This allows AMX to
+/// use the GEP pointer directly for LDX/LDY instead of going through temp buffers.
+///
+/// Does NOT trace through VECTORIZE: multiple LOADs in a VECTORIZE means the
+/// devectorizer could not fold them into a single contiguous LOAD, indicating
+/// non-contiguous data where direct AMX load would read wrong memory.
+fn resolve_to_load_index(uop: &Arc<UOp>) -> Option<u64> {
+    match uop.op() {
+        Op::Load { index, .. } => Some(index.id),
+        Op::Contract { src, .. } | Op::Unroll { src, .. } | Op::Detach { src } => resolve_to_load_index(src),
+        _ => None,
     }
 }
 
