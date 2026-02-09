@@ -165,9 +165,10 @@ fn test_reduce_empty_ranges_bug() {
 
     // The bug manifests when result has empty ranges
     if let Op::Reduce { ranges, .. } = result.op()
-        && ranges.is_empty() {
-            panic!(
-                "BUG: REDUCE has empty ranges after pre_expand - this causes horizontal_reduce to return unchanged input"
-            );
-        }
+        && ranges.is_empty()
+    {
+        panic!(
+            "BUG: REDUCE has empty ranges after pre_expand - this causes horizontal_reduce to return unchanged input"
+        );
+    }
 }

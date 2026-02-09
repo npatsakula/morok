@@ -1,7 +1,7 @@
 //! C renderer tests for code generation verification.
 
 use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, ConstValue, ReduceOp, UOp, WmmaMetadata};
+use morok_ir::{AxisId, AxisType, ConstValue, ReduceOp, UOp, WmmaMetadata, WmmaUpcastAxes};
 use smallvec::SmallVec;
 
 use crate::c::render;
@@ -75,8 +75,9 @@ fn amx_f32_metadata() -> WmmaMetadata {
         dtype_out: DType::Float32,
         device: "AppleAMX".to_string(),
         threads: 1,
-        upcast_axes: vec![(2, 256)],
+        upcast_axes: WmmaUpcastAxes { a: vec![(2, 256)], b: vec![(2, 256)], c: vec![(2, 256)] },
         reduce_axes: vec![],
+        tile_grid: (1, 1),
     }
 }
 

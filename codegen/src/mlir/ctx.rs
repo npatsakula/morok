@@ -6,6 +6,8 @@ use std::collections::HashMap;
 
 use melior::ir::{BlockRef, Region, Type, Value};
 
+use super::amx::AmxLoopState;
+
 /// Info for an in-progress `scf.for` loop being built incrementally.
 pub struct ScfLoopInfo<'c, 'a> {
     /// Block where the `scf.for` op will be appended once the loop closes.
@@ -54,6 +56,12 @@ pub struct RenderContext<'c, 'a> {
     scf_if_stack: Vec<(u64, ScfIfInfo<'c, 'a>)>,
     /// The current insertion block reference.
     current_block: BlockRef<'c, 'a>,
+    /// The function entry block (for hoisting allocas out of loops).
+    entry_block: BlockRef<'c, 'a>,
+    /// AMX loop state when inside a hoisted WMMA reduce loop.
+    amx_loop_state: Option<AmxLoopState<'c>>,
+    /// Whether AMX SET has been emitted for this kernel.
+    amx_set_emitted: bool,
 }
 
 impl<'c, 'a> RenderContext<'c, 'a> {
@@ -63,7 +71,14 @@ impl<'c, 'a> RenderContext<'c, 'a> {
             scf_loop_stack: Vec::new(),
             scf_if_stack: Vec::new(),
             current_block: entry_block,
+            entry_block,
+            amx_loop_state: None,
+            amx_set_emitted: false,
         }
+    }
+
+    pub fn entry_block(&self) -> BlockRef<'c, 'a> {
+        self.entry_block
     }
 
     pub fn current_block(&self) -> BlockRef<'c, 'a> {
@@ -125,5 +140,29 @@ impl<'c, 'a> RenderContext<'c, 'a> {
             .rposition(|(id, _)| *id == if_id)
             .unwrap_or_else(|| panic!("scf.if {} not found on stack", if_id));
         self.scf_if_stack.remove(idx).1
+    }
+
+    // -- AMX loop state management --
+
+    pub fn set_amx_loop_state(&mut self, state: AmxLoopState<'c>) {
+        self.amx_loop_state = Some(state);
+    }
+
+    pub fn amx_loop_state(&self) -> Option<&AmxLoopState<'c>> {
+        self.amx_loop_state.as_ref()
+    }
+
+    pub fn take_amx_loop_state(&mut self) -> Option<AmxLoopState<'c>> {
+        self.amx_loop_state.take()
+    }
+
+    // -- AMX kernel-wide state management --
+
+    pub fn amx_set_emitted(&self) -> bool {
+        self.amx_set_emitted
+    }
+
+    pub fn mark_amx_set_emitted(&mut self) {
+        self.amx_set_emitted = true;
     }
 }

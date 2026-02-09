@@ -35,8 +35,8 @@ impl UOp {
     pub fn wmma(a: Arc<Self>, b: Arc<Self>, c: Arc<Self>, metadata: WmmaMetadata) -> Arc<Self> {
         let base_dtype = metadata.dtype_out.clone();
 
-        // Calculate vector size from upcast axes (product of all axis sizes)
-        let vec_size = metadata.upcast_axes.iter().map(|(_, size)| size).product::<usize>();
+        // Calculate vector size from C (output) upcast axes
+        let vec_size = metadata.upcast_axes.c.iter().map(|(_, size)| size).product::<usize>();
 
         let dtype = if vec_size > 1 { base_dtype.vec(vec_size) } else { base_dtype };
 

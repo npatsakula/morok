@@ -119,7 +119,7 @@ enum OpData {
 
     // Symbolic/Define operations
     DefineVarData(String, i64, i64), // (name, min_val, max_val)
-    DefineRegSize(usize),
+    DefineRegData(usize, usize),     // (size, id)
 
     // Advanced operations
     WmmaData(WmmaMetadata),
@@ -199,7 +199,7 @@ impl UOpKey {
 
             // Symbolic/Define operations
             Op::DefineVar { name, min_val, max_val } => OpData::DefineVarData(name.clone(), *min_val, *max_val),
-            Op::DefineReg { size } => OpData::DefineRegSize(*size),
+            Op::DefineReg { size, id } => OpData::DefineRegData(*size, *id),
 
             // Advanced operations
             Op::Wmma { metadata, .. } => OpData::WmmaData(metadata.clone()),
