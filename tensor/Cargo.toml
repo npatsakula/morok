@@ -31,7 +31,7 @@ tracing-verbose = []
 criterion = { version = "0.8", features = ["html_reports"] }
 test-case = "3.3.1"
 tracing-subscriber = "0.3.22"
-tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
+tracing-test = { version = "0.2.6", features = ["no-env-filter"] }
 
 [[bench]]
 name = "optimization"
