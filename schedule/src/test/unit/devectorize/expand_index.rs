@@ -526,17 +526,13 @@ fn test_expand_pure_broadcast() {
         Op::Gep { vector, indices } => {
             // All lanes should map to the same PTRCAT slot (index 0)
             assert_eq!(indices, &[0, 0, 0, 0], "All lanes should read from the same slot");
-            match vector.op() {
-                Op::PtrCat { sources } => {
-                    // Single scalar pointer — no CAST to vec ptr
-                    assert_eq!(sources.len(), 1, "Broadcast should produce single scalar source");
-                    assert!(
-                        !matches!(sources[0].op(), Op::Cast { .. }),
-                        "Broadcast source should NOT be CAST to vector pointer"
-                    );
-                }
-                // Single source PTRCAT may be unwrapped
-                _ => {}
+            if let Op::PtrCat { sources } = vector.op() {
+                // Single scalar pointer — no CAST to vec ptr
+                assert_eq!(sources.len(), 1, "Broadcast should produce single scalar source");
+                assert!(
+                    !matches!(sources[0].op(), Op::Cast { .. }),
+                    "Broadcast source should NOT be CAST to vector pointer"
+                );
             }
         }
         // If PTRCAT is unwrapped directly (single source)

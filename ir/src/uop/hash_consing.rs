@@ -122,7 +122,7 @@ enum OpData {
     DefineRegData(usize, usize),     // (size, id)
 
     // Advanced operations
-    WmmaData(WmmaMetadata),
+    WmmaData(Box<WmmaMetadata>),
     ContractRanges(Vec<(usize, usize)>),
     UnrollAxes(Vec<(usize, usize)>),
     CustomCode(String),
@@ -202,7 +202,7 @@ impl UOpKey {
             Op::DefineReg { size, id } => OpData::DefineRegData(*size, *id),
 
             // Advanced operations
-            Op::Wmma { metadata, .. } => OpData::WmmaData(metadata.clone()),
+            Op::Wmma { metadata, .. } => OpData::WmmaData(metadata.clone().into()),
             Op::Contract { upcast_ranges, .. } => OpData::ContractRanges(upcast_ranges.clone()),
             Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),

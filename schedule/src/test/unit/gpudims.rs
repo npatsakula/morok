@@ -37,6 +37,7 @@ fn test_in_scope_ranges_basic() {
     let range = create_local_range(16, 0);
     let value = range.add(&UOp::index_const(1)); // Use range in computation
 
+    #[allow(clippy::mutable_key_type)]
     let in_scope = value.in_scope_ranges();
 
     // Range should be in scope
@@ -54,6 +55,7 @@ fn test_in_scope_ranges_after_end() {
     // End the range
     let ended = computation.end(smallvec::smallvec![range.clone()]);
 
+    #[allow(clippy::mutable_key_type)]
     let in_scope = ended.in_scope_ranges();
 
     // Range should NOT be in scope after END
@@ -83,6 +85,7 @@ fn test_in_scope_ranges_partial_end() {
     let another_computation = range2.add(&UOp::index_const(5));
     let final_comp = another_computation.after(smallvec::smallvec![after_end1]);
 
+    #[allow(clippy::mutable_key_type)]
     let in_scope = final_comp.in_scope_ranges();
 
     // range1 should NOT be in scope (it was ended), range2 should be
