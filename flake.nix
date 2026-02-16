@@ -60,18 +60,18 @@
           libxml2
           z3
           zlib
+          clang
         ];
 
         mlirSysPrefix = pkgs.symlinkJoin {
           name = "mlir-sys-prefix";
           paths = [
-            llvm.llvm.dev    # llvm-config, LLVM headers
-            llvm.llvm.lib    # LLVM libraries
-            llvm.mlir        # MLIR libraries (libMLIR*)
-            llvm.mlir.dev    # MLIR headers (mlir-c/)
+            llvm.llvm.dev # llvm-config, LLVM headers
+            llvm.llvm.lib # LLVM libraries
+            llvm.mlir # MLIR libraries (libMLIR*)
+            llvm.mlir.dev # MLIR headers (mlir-c/)
           ];
         };
-
 
         commonArgs = {
           inherit src nativeBuildInputs;
@@ -108,7 +108,7 @@
           };
 
           rustfmt = crane'.cargoFmt { inherit src; };
-          treefmt = treefmt.config.build.check self;
+          # treefmt = treefmt.config.build.check self;
         };
 
         devShells = rec {

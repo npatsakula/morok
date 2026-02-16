@@ -30,6 +30,6 @@ test-case = "3.3.1"
 serde_json = "1"
 
 [features]
-proptest = ["dep:proptest-derive", "dep:proptest"]
+proptest = ["dep:proptest", "dep:proptest-derive"]
 # serde is always enabled but kept as a feature for downstream compatibility
 serde = []

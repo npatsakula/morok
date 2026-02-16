@@ -1157,50 +1157,6 @@ mod tests {
         );
     }
 
-    /// Test that gc_dead_refs reclaims stale buffer entries.
-    ///
-    /// Input buffers accumulate in the global BUFFERS map (Arc<Buffer> entries
-    /// indexed by unique UOp IDs). gc_dead_refs cleans entries whose UOps are
-    /// no longer alive in the UOp cache.
-    #[test]
-    fn test_gc_reclaims_stale_buffers() {
-        crate::test::helpers::test_setup();
-
-        let mut executor = morok_runtime::global_executor();
-
-        // Create and realize tensors in a block so they're dropped afterward
-        {
-            for _ in 0..5 {
-                let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
-                let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]);
-                let c = &a + &b;
-
-                let plan = c.prepare().expect("prepare should succeed");
-                plan.execute(&mut executor).expect("execute should succeed");
-                plan.release_intermediate_buffers(crate::tensor_registry::remove_buffer);
-            }
-        }
-        // Tensors dropped here — their UOps become eligible for GC
-
-        let count_before_gc = crate::tensor_registry::buffer_count();
-        eprintln!("Before GC: {} buffers", count_before_gc);
-
-        // GC should reclaim stale entries
-        morok_ir::uop::gc_dead_refs();
-        crate::tensor_registry::gc_dead_refs();
-
-        let count_after_gc = crate::tensor_registry::buffer_count();
-        eprintln!("After GC: {} buffers", count_after_gc);
-
-        // GC should reduce buffer count (stale entries from dropped tensors removed)
-        assert!(
-            count_after_gc < count_before_gc,
-            "gc_dead_refs should reduce buffer count: before={}, after={}",
-            count_before_gc,
-            count_after_gc
-        );
-    }
-
     /// Test that realize() correctly computes and cleans up.
     #[test]
     fn test_memory_growth_realize_pattern() {

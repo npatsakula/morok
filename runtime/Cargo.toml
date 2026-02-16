@@ -29,6 +29,6 @@ test-case = "3.3.1"
 [features]
 default = []
 cuda = ["morok-device/cuda"]
-mlir = ["morok-codegen/mlir", "dep:melior"]
+mlir = ["dep:melior", "morok-codegen/mlir"]
 # Enable trace-level spans in hot paths (compile-time control)
 tracing-verbose = []
