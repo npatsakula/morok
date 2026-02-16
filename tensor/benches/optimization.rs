@@ -82,8 +82,5 @@ fn bench_matmul(c: &mut Criterion) {
     group.finish();
 }
 
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 criterion_group!(benches, bench_matmul);
 criterion_main!(benches);

@@ -13,10 +13,9 @@ snafu = "0.8.9"
 itertools = "0.14.0"
 tracing = "0.1"
 melior = { version = "0.26.3", features = ["ods-dialects"], optional = true }
-mlir-sys = "210.0.1"
 
 [features]
-default = ["mlir"]
+default = []
 # Enable trace-level spans in hot paths (compile-time control)
 tracing-verbose = []
 mlir = ["dep:melior"]
