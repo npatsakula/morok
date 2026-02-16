@@ -456,6 +456,14 @@ fn cache_put(key: &CacheKey, opts: &[Opt]) {
     }
 }
 
+/// Remove a stale cache entry.
+fn cache_invalidate(key: &CacheKey) {
+    if let Some(db) = CACHE_DB.as_ref() {
+        let _ = db.remove(key.to_bytes());
+        let _ = db.flush();
+    }
+}
+
 /// Run beam search with disk caching.
 ///
 /// Checks the cache before running beam search. If a cached result exists,
@@ -485,11 +493,19 @@ where
     if !config.disable_cache
         && let Some(cached_opts) = cache_get(&key)
     {
-        // Replay cached optimizations
+        // Replay cached optimizations. If replay fails (stale entry from code changes),
+        // invalidate and fall through to fresh search.
         tracing::info!(opts_count = cached_opts.len(), "Beam cache HIT - replaying opts");
-        let replayed = replay_opts(scheduler.clone(), &cached_opts)?;
-        let timing = compile_and_time(&replayed).unwrap_or(Duration::MAX);
-        return Ok(BeamResult { scheduler: replayed, timing, iterations: 0, candidates_evaluated: 0 });
+        match replay_opts(scheduler.clone(), &cached_opts) {
+            Ok(replayed) => {
+                let timing = compile_and_time(&replayed).unwrap_or(Duration::MAX);
+                return Ok(BeamResult { scheduler: replayed, timing, iterations: 0, candidates_evaluated: 0 });
+            }
+            Err(e) => {
+                tracing::warn!(?e, "Beam cache replay failed (stale entry?) - invalidating");
+                cache_invalidate(&key);
+            }
+        }
     }
 
     tracing::info!("Beam cache MISS - running search");

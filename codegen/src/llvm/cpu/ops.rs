@@ -31,7 +31,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         | Op::Kernel { .. }
         | Op::Barrier { .. } => None,
 
-        Op::DefineReg { size } => {
+        Op::DefineReg { size, .. } => {
             let base_dtype = match uop.dtype() {
                 DType::Ptr { base, .. } => base.as_ref().clone(),
                 other => other,

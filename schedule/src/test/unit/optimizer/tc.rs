@@ -434,3 +434,129 @@ fn test_tc_opt_validation() {
     let err_msg = format!("{:?}", result.unwrap_err());
     assert!(err_msg.contains("tc_opt must be"), "Should fail validation: {}", err_msg);
 }
+
+// =============================================================================
+// AMX Tensor Core Tests
+// =============================================================================
+
+use crate::optimizer::renderer::{APPLE_AMX, SwizzleAxis};
+use crate::optimizer::{Opt, apply_opt};
+
+#[test]
+fn test_detect_matmul_amx() {
+    // 16x16 matmul with K=16 — matches AMX dims (16, 16, 1) after K-split
+    let sink = create_matmul_pattern_for_padding(16, 16, 16);
+
+    let ren = Renderer::apple_amx();
+    let scheduler = Scheduler::new(sink, ren);
+
+    let pattern = matching::detect_matmul(&scheduler);
+    assert!(pattern.is_ok(), "Pattern detection should succeed");
+    assert!(pattern.unwrap().is_some(), "Matmul pattern should be found for AMX");
+}
+
+#[test]
+fn test_select_tensor_core_amx() {
+    let sink = create_matmul_pattern_for_padding(16, 16, 16);
+
+    let ren = Renderer::apple_amx();
+    let scheduler = Scheduler::new(sink, ren);
+
+    let pattern = matching::detect_matmul(&scheduler).unwrap().unwrap();
+
+    // Auto-select should find the float32 AMX TC
+    let result = selection::select_tensor_core(&pattern, &scheduler.ren, -1, 0);
+    assert!(result.is_ok(), "TC selection should not error: {:?}", result.err());
+
+    if let Ok(Some(sel)) = result {
+        let tc = &scheduler.ren.tensor_cores[sel.tc_index];
+        assert_eq!(tc.dims, (16, 16, 1), "AMX float32 TC should have dims (16, 16, 1)");
+        assert_eq!(tc.threads, 1, "AMX uses 1 thread (CPU)");
+        assert_eq!(tc.dtype_in, DType::Float32);
+        assert_eq!(tc.dtype_out, DType::Float32);
+    }
+}
+
+#[test]
+fn test_base_shape_amx() {
+    let tc = APPLE_AMX.build(DType::Float32, DType::Float32);
+    let shape = swizzle::base_shape(&tc);
+
+    // AMX has 8 upcast opts (all U), K=1 so 0 reduce axes, no local opts
+    let upcast_count = shape.iter().filter(|&&a| matches!(a, SwizzleAxis::Upcast(_))).count();
+    let local_count = shape.iter().filter(|&&a| matches!(a, SwizzleAxis::Local(_))).count();
+    let reduce_count = shape.iter().filter(|&&a| matches!(a, SwizzleAxis::Reduce(_))).count();
+
+    assert_eq!(upcast_count, 8, "AMX should have 8 upcast axes");
+    assert_eq!(local_count, 0, "AMX should have no local axes");
+    assert_eq!(reduce_count, 0, "AMX K=1 → 0 reduce axes");
+}
+
+#[test]
+fn test_permutes_amx() {
+    let tc = APPLE_AMX.build(DType::Float32, DType::Float32);
+    let shape = swizzle::base_shape(&tc);
+    let (perm_a, perm_b) = swizzle::permutes_for_shape(&tc, &shape);
+
+    // A: identity permutation (all upcast in order)
+    assert_eq!(perm_a, (0..shape.len()).collect::<Vec<_>>(), "AMX A permutation should be identity");
+
+    // B: swap halves (first 4 upcast ↔ last 4 upcast)
+    let half = shape.len() / 2;
+    let expected_b: Vec<usize> = (half..shape.len()).chain(0..half).collect();
+    assert_eq!(perm_b, expected_b, "AMX B permutation should swap halves");
+}
+
+#[test]
+fn test_reduce_axes_count_amx() {
+    let tc = APPLE_AMX.build(DType::Float32, DType::Float32);
+    let count = swizzle::get_reduce_axes_count(&tc);
+
+    // K=1 → log2(1) = 0 reduce axes
+    assert_eq!(count, 0, "AMX K=1 should produce 0 reduce axes");
+}
+
+#[test]
+fn test_apply_tc_amx() {
+    let sink = create_matmul_pattern_for_padding(16, 16, 16);
+
+    let ren = Renderer::apple_amx();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    let result = apply(&mut scheduler, -1, 0, 1);
+    assert!(result.is_ok(), "AMX TC apply should succeed: {:?}", result.err());
+
+    let axes = result.unwrap();
+    // axes should be [N_range, M_range, K_range] — all valid UOps
+    for (i, ax) in axes.iter().enumerate() {
+        assert!(matches!(ax.op(), morok_ir::Op::Range { .. }), "axes[{i}] should be a RANGE");
+    }
+
+    // Verify WMMA is present in the resulting AST
+    let ast = scheduler.ast();
+    let has_wmma = ast.toposort().iter().any(|u| matches!(u.op(), morok_ir::Op::Wmma { .. }));
+    assert!(has_wmma, "AST should contain WMMA after TC apply");
+}
+
+#[test]
+fn test_group_after_tc_rejected() {
+    // Apply TC first, then attempt GROUP — should be rejected.
+    // Tinygrad: check(all(x.op is not OptOps.TC for x in self.applied_opts), "no grouping with tensor cores")
+    let sink = create_matmul_pattern_for_padding(16, 16, 16);
+
+    let ren = Renderer::apple_amx();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    // Apply TC
+    let tc_opt = Opt::tc(None, -1, 0, 1);
+    let tc_result = apply_opt(&mut scheduler, &tc_opt, true);
+    assert!(tc_result.is_ok(), "TC apply should succeed: {:?}", tc_result.err());
+
+    // Attempt GROUP after TC — should fail
+    let group_opt = Opt::group(0, 2);
+    let group_result = apply_opt(&mut scheduler, &group_opt, true);
+    assert!(group_result.is_err(), "GROUP after TC should be rejected");
+
+    let err_msg = format!("{:?}", group_result.unwrap_err());
+    assert!(err_msg.contains("no grouping with tensor cores"), "Error should mention TC guard: {}", err_msg);
+}

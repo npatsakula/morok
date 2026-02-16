@@ -71,8 +71,9 @@ use crate::gpudims::pm_add_gpudims;
 use crate::passes::pm_linearize_multi_index;
 use crate::rangeify::patterns::{
     pm_add_loads, pm_bool_devectorize, pm_comparison_negations, pm_div_to_shr, pm_fdiv_to_mul, pm_fma_decomposition,
-    pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_reduce_devectorize,
+    pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_reduce_devectorize, rangeify_codegen_simple,
 };
+use crate::rangeify::pm_add_buffers_local_patterns;
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
 use std::sync::Arc;
@@ -175,6 +176,16 @@ pub fn apply_post_optimization_with_renderer(
     let expanded = crate::expand::pre_expand(&with_symbolic);
     tracing::debug!(ast.optimized = expanded.tree(), "Stage 9: after pre_expand");
 
+    // =========================================================================
+    // Stage 10: Add local buffers (Tinygrad: pm_add_buffers_local + rangeify_codegen)
+    // =========================================================================
+    // Converts BUFFERIZE(Local) → DEFINE_LOCAL + STORE + LOAD for GROUP_REDUCE.
+    // Also strips leftover CONTIGUOUS and NOOP nodes.
+    // Must run AFTER expander (which creates BUFFERIZE_LOCAL) and BEFORE pm_reduce.
+    let pm_local_buffers = pm_add_buffers_local_patterns() + rangeify_codegen_simple();
+    let with_local_buffers = graph_rewrite(&pm_local_buffers, expanded, &mut ());
+    tracing::debug!(ast.optimized = with_local_buffers.tree(), "Stage 10: after add local buffers");
+
     // pm_reduce: Convert REDUCE → DEFINE_REG + accumulator pattern (Tinygrad devectorizer.py:310-316)
     // Now that UNROLL is expanded, REDUCE has its final dtype (e.g., vec2 if upcasted).
     // This creates accumulators with matching vector dtype.
@@ -188,7 +199,7 @@ pub fn apply_post_optimization_with_renderer(
     // pm_wmma_accumulate fuses Add into WMMA's accumulator: WMMA(a,b,c) + add → WMMA(a,b,c+add)
     // Tensor cores have built-in accumulation, so this is more efficient.
     let pm_reduce_combined = pm_reduce() + pm_wmma_accumulate() + gep_pushing_patterns();
-    let reduced = graph_rewrite(&pm_reduce_combined, expanded, &mut ());
+    let reduced = graph_rewrite(&pm_reduce_combined, with_local_buffers, &mut ());
     tracing::debug!(ast.optimized = reduced.tree(), "after pm_reduce");
 
     // pm_add_gpudims: Convert GLOBAL/LOCAL RANGE → SPECIAL thread indices (Tinygrad gpudims.py)
@@ -212,24 +223,24 @@ pub fn apply_post_optimization_with_renderer(
     // Based on Tinygrad's pm_add_loads (devectorizer.py:320-326).
     let with_loads = graph_rewrite(&pm_add_loads(), with_gpudims, &mut ());
 
-    // ALU Devectorization + GEP Simplification
+    // ALU Devectorization + GEP Simplification + WMMA Accumulation + Symbolic
     //
-    // Tinygrad runs no_vectorized_alu + gep_pushing in a SINGLE graph_rewrite call
-    // (codegen/__init__.py:78-81: pm_devectorize = sym+devectorize+load_store_folding+...).
-    // This is critical: gep_pushing resolves GEPs incrementally as no_vectorized_alu
-    // creates them, preventing graph explosion. Running them separately causes
-    // no_vectorized_alu to materialize ALL GEPs first, then gep_pushing processes
-    // the massive graph in bulk, hitting the 100k iteration limit.
-
-    let processed = if devectorize_alu {
-        let combined = crate::devectorize::no_vectorized_alu() + gep_pushing_patterns();
+    // Tinygrad runs sym + devectorize + load_store_folding + ... in a SINGLE graph_rewrite call
+    // (codegen/__init__.py:78-81). Key insights:
+    // - no_vectorized_alu creates VECTORIZE(GEP(src,0), ..., GEP(src,N-1)) which
+    //   gep_pushing's VECTORIZE-of-same-GEPs (symbolic.py:173) collapses back to src.
+    // - pm_wmma_accumulate MUST run here because pm_add_loads (above) created LOAD nodes
+    //   that wrap the accumulator. The earlier pm_wmma_accumulate (step 4, with pm_reduce)
+    //   couldn't match Add(LOAD, WMMA) since LOAD didn't exist yet. During fixpoint
+    //   iteration, WMMA accumulation fires first, fusing Add(LOAD, WMMA) → WMMA(a,b,acc)
+    //   and eliminating the 256-wide vector Add before no_vectorized_alu can split it.
+    let cleaned = if devectorize_alu {
+        let combined =
+            symbolic_simple() + pm_wmma_accumulate() + crate::devectorize::no_vectorized_alu() + gep_pushing_patterns();
         graph_rewrite(&combined, with_loads, &mut ())
     } else {
-        with_loads
+        graph_rewrite(&gep_pushing_patterns(), with_loads, &mut ())
     };
-
-    // Cleanup remaining GEPs (always runs, handles non-devectorize paths too)
-    let cleaned = graph_rewrite(&gep_pushing_patterns(), processed, &mut ());
     tracing::debug!(ast.optimized = cleaned.tree(), "after pm_pushing_patterns");
 
     // Second pass of pm_add_loads: expansion may create new INDEX ops that need LOAD wrapping.

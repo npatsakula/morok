@@ -46,7 +46,7 @@ pub use op::Op;
 pub use sint::{SInt, sint_max, sint_min, sint_prod};
 pub use types::{
     AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, ConstValueHash, ContiguousHint, ReduceOp,
-    TernaryOp, UnaryOp, WmmaMetadata,
+    TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
 };
 pub use uop::{IntoUOp, UOp, UOpKey};
 

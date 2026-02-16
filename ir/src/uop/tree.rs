@@ -154,7 +154,7 @@ fn format_node(uop: &Arc<UOp>) -> String {
         Op::If { .. } => "IF".to_string(),
         Op::EndIf { .. } => "END_IF".to_string(),
         Op::Barrier { .. } => "BARRIER".to_string(),
-        Op::DefineReg { size } => format!("DEFINE_REG(size={})", size),
+        Op::DefineReg { size, id } => format!("DEFINE_REG(size={}, id={})", size, id),
         Op::Wmma { .. } => "WMMA".to_string(),
         Op::Contract { .. } => "CONTRACT".to_string(),
         Op::Unroll { .. } => "UNROLL".to_string(),

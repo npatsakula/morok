@@ -607,6 +607,7 @@ pub fn unwrap_cast(uop: &Arc<UOp>) -> (Arc<UOp>, DType) {
 }
 
 /// Unwrap INDEX and return (buffer, indices, gate).
+#[allow(clippy::type_complexity)]
 pub fn unwrap_index(uop: &Arc<UOp>) -> (Arc<UOp>, SmallVec<[Arc<UOp>; 4]>, Option<Arc<UOp>>) {
     match uop.op() {
         Op::Index { buffer, indices, gate } => (buffer.clone(), indices.clone(), gate.clone()),
