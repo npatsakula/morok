@@ -1434,8 +1434,11 @@ fn test_apply_threading_heuristic_loop() {
     use crate::optimizer::heuristics::apply_threading;
 
     // Create a kernel with Loop axis
-    let end_512 = UOp::index_const(512);
-    let r_loop = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Loop);
+    // NOTE: Tinygrad requires at least 128K (131072) ops per thread
+    // For 2 threads: need at least 2 * 131072 = 262144 elements
+    // Use 2 threads with 262144 elements (exactly the minimum)
+    let end = UOp::index_const(262144);
+    let r_loop = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
 
     let compute = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![compute, r_loop]);
@@ -1443,9 +1446,9 @@ fn test_apply_threading_heuristic_loop() {
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    // Apply threading heuristic (use 8 threads as test default)
-    let applied = apply_threading(&mut scheduler, 8);
-    assert!(applied, "apply_threading should succeed on Loop axis");
+    // Apply threading heuristic with 2 threads
+    let applied = apply_threading(&mut scheduler, 2);
+    assert!(applied, "apply_threading should succeed on Loop axis with sufficient work");
 
     // Verify Thread axis was created
     let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
@@ -1453,11 +1456,12 @@ fn test_apply_threading_heuristic_loop() {
 }
 
 #[test]
-fn test_apply_threading_heuristic_outer() {
+fn test_apply_threading_heuristic_outer_not_threaded() {
     use crate::optimizer::heuristics::apply_threading;
 
-    // Create a kernel with Outer axis (like matmul reduce kernels)
-    let end_512 = UOp::index_const(512);
+    // NOTE: Tinygrad only threads LOOP axes, not Outer axes
+    // This test verifies that Outer axes are NOT threaded
+    let end_512 = UOp::index_const(524288); // 512K elements
     let r_outer = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Outer);
 
     let compute = UOp::native_const(1.0f32);
@@ -1466,11 +1470,11 @@ fn test_apply_threading_heuristic_outer() {
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    // Apply threading heuristic - should work on Outer axes too (use 8 threads)
-    let applied = apply_threading(&mut scheduler, 8);
-    assert!(applied, "apply_threading should succeed on Outer axis");
+    // Apply threading heuristic - should NOT work on Outer axes
+    let applied = apply_threading(&mut scheduler, 2);
+    assert!(!applied, "apply_threading should NOT succeed on Outer axis (only Loop axes are threaded)");
 
-    // Verify Thread axis was created
+    // Verify NO Thread axis was created
     let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
-    assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading on Outer");
+    assert!(thread_axes.is_empty(), "Should NOT have Thread axis for Outer");
 }

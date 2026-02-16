@@ -419,15 +419,15 @@ fn test_cast_bool_to_int_constant() {
 #[test]
 fn test_noop_cast_same_dtype() {
     // Test: x.cast(dtype) -> x if same dtype
+    use crate::rewrite::graph_rewrite;
+
     let matcher = symbolic_simple();
     let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let cast = x.cast(DType::Int32);
 
-    let result = matcher.rewrite(&cast, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-    if let RewriteResult::Rewritten(rewritten) = result {
-        assert!(std::sync::Arc::ptr_eq(&rewritten, &x));
-    }
+    let result = graph_rewrite(&matcher, cast, &mut ());
+    // The cast should be eliminated, returning x
+    assert!(std::sync::Arc::ptr_eq(&result, &x), "Noop cast should be eliminated");
 }
 
 #[test]
