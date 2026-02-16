@@ -746,10 +746,11 @@ mod tests {
         // Verify renderer supports threading
         assert!(scheduler.renderer().has_threads, "CPU renderer should have has_threads=true");
 
-        // Try to apply THREAD opt
+        // Try to apply THREAD opt - use available parallelism to work on machines with few cores
+        let thread_count = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
         let mut test_scheduler = scheduler.clone();
-        let result = apply_opt(&mut test_scheduler, &Opt::thread(0, 8), true);
-        assert!(result.is_ok(), "THREAD(0, 8) should succeed on Outer axis: {:?}", result);
+        let result = apply_opt(&mut test_scheduler, &Opt::thread(0, thread_count), true);
+        assert!(result.is_ok(), "THREAD(0, {}) should succeed on Outer axis: {:?}", thread_count, result);
 
         // Verify Thread axis was created
         let thread_axes = test_scheduler.axes_of(&[AxisType::Thread]);
