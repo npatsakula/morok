@@ -45,8 +45,11 @@ proptest! {
                 // If it simplified to something, it should match expected OR be semantically equivalent
                 // (we don't require exact pointer equality as different equivalent forms are ok)
                 let is_expected = Arc::ptr_eq(&simplified, &expected);
-                let is_constant_zero = matches!(simplified.op(), morok_ir::Op::Const(cv) if cv.0 == ConstValue::Int(0))
-                    && matches!(expected.op(), morok_ir::Op::Const(cv) if cv.0 == ConstValue::Int(0));
+
+                // Check for zero constant (Int(0) or UInt(0) both represent zero)
+                let is_zero = |cv: &ConstValue| matches!(cv, ConstValue::Int(0) | ConstValue::UInt(0));
+                let is_constant_zero = matches!(simplified.op(), morok_ir::Op::Const(cv) if is_zero(&cv.0))
+                    && matches!(expected.op(), morok_ir::Op::Const(cv) if is_zero(&cv.0));
 
                 prop_assert!(is_expected || is_constant_zero,
                     "Simplified result should match expected. Got: {:?}, Expected: {:?}",
