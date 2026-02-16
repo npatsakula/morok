@@ -326,11 +326,8 @@ fn test_ungate_load_unchanged() {
     let result = apply_pm_render(&load);
 
     // Result should still be LOAD without alt
-    match result.op() {
-        Op::Load { alt, .. } => {
-            assert!(alt.is_none(), "Ungated LOAD should not have alt value");
-        }
-        _ => {} // Could be transformed to VECTORIZE or other
+    if let Op::Load { alt, .. } = result.op() {
+        assert!(alt.is_none(), "Ungated LOAD should not have alt value");
     }
 }
 
