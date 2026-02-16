@@ -209,7 +209,6 @@ fn test_print_matmul_512x512_ir() {
 }
 
 #[test]
-// #[ignore] // Run with: cargo test -p morok-tensor test_beam_search_matmul -- --ignored --nocapture
 // #[tracing_test::traced_test]
 fn test_beam_search_matmul() {
     // Test beam search optimization for matmul - reproduces float vector index bug
@@ -366,9 +365,10 @@ fn test_print_matmul_64x64_ir() {
     let plan = c.prepare_with(&config).expect("prepare should succeed");
 
     println!("\n=== Generated Kernels (64x64 matmul) ===\n");
-    for kernel in plan.kernels() {
-        println!("--- {} ({}) ---", kernel.entry_point, kernel.device);
-        println!("{}", kernel.code);
+    for kernel in plan.prepared_kernels() {
+        println!("--- {} ({}) ---", kernel.kernel.entry_point, kernel.kernel.device);
+        println!("{}", kernel.ast.tree());
+        println!("{}", kernel.kernel.code);
         println!();
     }
 }
@@ -428,6 +428,7 @@ fn test_matmul_validated_3x3() {
 }
 
 #[test]
+// #[tracing_test::traced_test]
 fn test_matmul_validated_2x3_3x4() {
     // [2, 3] @ [3, 4] -> [2, 4]
     let a_data: Vec<f32> = (1..=6).map(|x| x as f32).collect();
@@ -464,6 +465,7 @@ fn test_matmul_validated_tall_wide() {
 }
 
 #[test]
+// #[tracing_test::traced_test]
 fn test_matmul_validated_16x16() {
     // Larger matrix to test vectorization paths
     const SIZE: usize = 16;
@@ -526,6 +528,7 @@ fn test_matmul_validated_64x64() {
 }
 
 #[test]
+// #[tracing_test::traced_test]
 fn test_dot_product_validated() {
     // 1D @ 1D dot product
     let a_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
@@ -668,6 +671,7 @@ fn run_validated_matmul(m: usize, k: usize, n: usize, tol: f32) {
 }
 
 // Square matrix tests with increasing sizes
+// #[tracing_test::traced_test]
 #[test_case(128, 0.5; "128x128")]
 #[test_case(256, 1.0; "256x256")]
 #[test_case(500, 1.5; "500x500 non-power-of-2")]

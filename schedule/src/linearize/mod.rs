@@ -111,16 +111,16 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
     // would need full tuple sorting.
     let mut sorted_ranges = actual_ranges;
     sorted_ranges.sort_by(|a, b| {
-        let a_id = match a.op() {
-            Op::Range { axis_id, .. } => axis_id.value(),
+        let (a_id, a_ty) = match a.op() {
+            Op::Range { axis_id, axis_type, .. } => (axis_id.value(), axis_type.priority()),
             _ => unreachable!("filtered to RANGEs only"),
         };
-        let b_id = match b.op() {
-            Op::Range { axis_id, .. } => axis_id.value(),
+        let (b_id, b_ty) = match b.op() {
+            Op::Range { axis_id, axis_type, .. } => (axis_id.value(), axis_type.priority()),
             _ => unreachable!("filtered to RANGEs only"),
         };
-        // Descending order: higher axis_id first (innermost)
-        b_id.cmp(&a_id)
+        // Descending order: sort by (axis_id, axis_type_priority) — higher values first (innermost)
+        (b_id, b_ty).cmp(&(a_id, a_ty))
     });
 
     // Step 3: Wrap computation in nested single-range ENDs
@@ -261,24 +261,32 @@ fn linearize_cleanup_pattern(uop: &Arc<UOp>, _replaced: &HashMap<u64, Arc<UOp>>)
         return None;
     };
 
-    // Create ungated INDEX, preserving the original dtype
-    let ungated_index = UOp::index()
-        .buffer(buffer.clone())
-        .indices(indices.clone())
-        .call()
-        .expect("ungated INDEX")
-        .with_dtype(actual_index.dtype());
+    // Create ungated INDEX, preserving the original dtype.
+    // Use UOp::new directly because after pm_lower_index_dtype, indices are
+    // concrete i32/i64 — the builder rejects non-Index indices.
+    let ungated_index =
+        UOp::new(Op::Index { buffer: buffer.clone(), indices: indices.clone(), gate: None }, actual_index.dtype());
 
     // Rewrap in Cast if the original was Cast-wrapped
-    let final_index = if let Some(dtype) = cast_dtype { ungated_index.cast(dtype) } else { ungated_index.clone() };
+    let final_index =
+        if let Some(ref dtype) = cast_dtype { ungated_index.cast(dtype.clone()) } else { ungated_index.clone() };
 
     let ungated_store = final_index.store_with_ranges(value.clone(), ranges.clone());
 
     // Wrap in IF/ENDIF
-    let if_op = UOp::if_(gate.clone(), smallvec![ungated_index]);
+    let if_op = UOp::if_(gate.clone(), smallvec![ungated_index.clone()]);
     let endif_op = UOp::endif(if_op.clone());
 
-    Some((ungated_store.clone(), vec![if_op, ungated_store, endif_op]))
+    // Emit all created nodes: IF, ungated INDEX (+ Cast if present), STORE, ENDIF.
+    // line_rewrite only emits nodes explicitly listed in outputs.
+    let mut outputs = vec![if_op, ungated_index];
+    if cast_dtype.is_some() {
+        outputs.push(final_index);
+    }
+    outputs.push(ungated_store.clone());
+    outputs.push(endif_op);
+
+    Some((ungated_store, outputs))
 }
 
 /// Line rewrite for injecting IF/ENDIF around gated stores.

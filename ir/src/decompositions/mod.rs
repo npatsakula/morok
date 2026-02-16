@@ -22,6 +22,7 @@
 //! ```
 
 pub mod helpers;
+pub mod ptrcat;
 pub mod transcendentals;
 
 use std::sync::Arc;
@@ -32,6 +33,35 @@ use crate::uop::UOp;
 use morok_macros::patterns;
 
 use transcendentals::{xcos, xerf, xexp, xexp2, xlog, xlog2, xpow, xrsqrt, xsin, xsqrt, xtan};
+
+/// Vector-of-pointer decomposition for MLIR backend.
+///
+/// MLIR's LLVM dialect doesn't support `vector<N x ptr>` types. This pattern
+/// eliminates VECTORIZE and PtrCat operations on pointer types that weren't
+/// consumed by LOAD/STORE patterns during devectorization.
+///
+/// # Example
+///
+/// ```ignore
+/// impl Renderer for MlirRenderer {
+///     fn decompositor(&self) -> Option<TypedPatternMatcher<()>> {
+///         Some(ptrcat_decomposition_patterns())
+///     }
+/// }
+/// ```
+pub fn ptrcat_decomposition_patterns() -> TypedPatternMatcher<()> {
+    use crate::DType;
+
+    patterns! {
+        // Eliminate VECTORIZE on pointers by returning first element
+        // (VECTORIZE on pointers that isn't consumed by GEP is dead code)
+        Vectorize { elements } if matches!(elements[0].dtype(), DType::Ptr { .. }) ~> |elements| elements[0].clone(),
+
+        // Eliminate bare PtrCat by returning first pointer
+        // (PtrCat not consumed by LOAD/STORE is dead code)
+        PtrCat { sources } ~> |sources| sources[0].clone(),
+    }
+}
 
 /// All decomposition patterns for transcendental operations.
 ///

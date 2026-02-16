@@ -32,6 +32,9 @@
 
 use std::collections::HashMap;
 
+use morok_schedule::{
+    Scheduler, apply_post_optimization, beam_search_cached, hand_coded_optimizations, prepare_scheduler,
+};
 use tracing::{debug, trace};
 
 use crate::{
@@ -548,16 +551,9 @@ fn prepare_execution_plan(
         let optimizer_renderer = get_optimizer_renderer(&device);
 
         // Step 2: Optimize OUTSIDE cache (enables beam search)
-        let optimized_ast = if let morok_schedule::OptStrategy::Beam { width } = config.strategy {
+        let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.strategy {
             // Beam search: compile-and-time multiple candidates
-            beam_search_optimize(
-                item.ast.clone(),
-                &optimizer_renderer,
-                width,
-                &device,
-                &item.buffers,
-                config.devectorize_alu,
-            )?
+            beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, config)?
         } else {
             // Heuristic optimization (default)
             morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, config)
@@ -565,8 +561,16 @@ fn prepare_execution_plan(
 
         // Step 3: Apply decomposition
         let ast_decomposed = match device.renderer.decompositor() {
-            Some(matcher) => morok_ir::decompositions::decompose_with(&optimized_ast, &matcher),
-            None => optimized_ast,
+            Some(matcher) => {
+                tracing::debug!("Applying backend decomposition patterns");
+                let decomposed = morok_ir::decompositions::decompose_with(&optimized_ast, &matcher);
+                tracing::debug!("Decomposition complete");
+                decomposed
+            }
+            None => {
+                tracing::debug!("No decomposition needed (renderer provides no decompositor)");
+                optimized_ast
+            }
         };
 
         // Step 4: Cache by OPTIMIZED ast id (different optimizations → different cache entries)
@@ -605,6 +609,7 @@ fn prepare_execution_plan(
 
         let prepared = PreparedKernel {
             id: item.ast.id,
+            ast: item.ast.clone(),
             kernel: cached,
             device: device.device.clone(),
             buffer_indices,
@@ -748,29 +753,29 @@ fn get_optimizer_renderer(device: &Device) -> morok_schedule::OptimizerRenderer 
 /// Beam search explores multiple optimization paths and selects the fastest
 /// by compiling and timing each candidate. This is slower than heuristics
 /// but can find better optimizations.
+///
+/// Note: Unlike Tinygrad which dispatches to EITHER beam search OR heuristics,
+/// we pre-seed the beam with heuristic results (TC, output upcast, threading).
+/// This gives beam search a strong starting point while letting it explore
+/// further optimizations. TC must be applied by heuristics since beam search
+/// requires TC as the very first opt.
 fn beam_search_optimize(
     ast: Arc<UOp>,
     renderer: &morok_schedule::OptimizerRenderer,
-    beam_width: usize,
     device: &Device,
     buffers: &[Buffer],
-    devectorize_alu: bool,
+    optimizer_config: &morok_schedule::OptimizerConfig,
 ) -> Result<Arc<UOp>> {
-    use morok_schedule::{
-        BeamConfig, HeuristicsConfig, Scheduler, apply_post_optimization, beam_search_cached, hand_coded_optimizations,
-        prepare_scheduler,
-    };
-
-    let mut config = BeamConfig::from_env();
-    config.beam_width = beam_width;
+    let beam_config = &optimizer_config.beam;
+    let devectorize_alu = optimizer_config.devectorize_alu;
 
     // Prepare scheduler (applies symbolic simplification and loop→global)
     let mut scheduler = prepare_scheduler(ast, renderer);
 
-    // Apply hand-coded heuristics BEFORE beam search (like Tinygrad)
-    // This seeds beam with output_upcast for matmul patterns, TC opts, etc.
-    let heuristics_config = HeuristicsConfig::from_env();
-    hand_coded_optimizations(&mut scheduler, &heuristics_config);
+    // Apply hand-coded heuristics BEFORE beam search to seed with TC, output
+    // upcast, threading, etc. Beam search then explores further optimizations
+    // on top of this baseline.
+    hand_coded_optimizations(&mut scheduler, &optimizer_config.heuristics);
 
     // Ensure all buffers are allocated for timing
     for buf in buffers {
@@ -785,7 +790,7 @@ fn beam_search_optimize(
     let dev_renderer = device.renderer.clone();
     let dev_compiler = device.compiler.clone();
     let dev_runtime = device.runtime.clone();
-    let max_uops = config.max_uops;
+    let max_uops = beam_config.max_uops;
 
     // Compile-and-time function: compilation is NOT timed, only execution.
     // Wrapped in catch_unwind because beam search explores speculative candidates
@@ -841,8 +846,14 @@ fn beam_search_optimize(
         .flatten()
     };
 
-    // Run beam search with caching
-    let result = beam_search_cached(scheduler, &config, compile_and_time).context(OptimizeSnafu)?;
+    // Suppress panic output during beam search. Speculative candidates may panic
+    // at compile or runtime — this is expected (matches Tinygrad's silent try/except).
+    // catch_unwind catches panics but the default hook prints them first.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = beam_search_cached(scheduler, beam_config, compile_and_time);
+    std::panic::set_hook(prev_hook);
+    let result = result.context(OptimizeSnafu)?;
 
     // Debug: log beam search results
     tracing::debug!(

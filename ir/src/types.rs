@@ -643,6 +643,47 @@ pub enum TernaryOp {
     MulAcc,
 }
 
+/// Per-source upcast axes for WMMA operations.
+///
+/// Each WMMA source (A, B, C) may have different upcast axis sizes
+/// based on `elements_per_thread`. For example, CUDA 8-16-16 with
+/// `elements_per_thread=(8,4,4)` produces A=8, B=4, C=4 element groups.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct WmmaUpcastAxes {
+    /// A operand upcast axes (input matrix).
+    pub a: Vec<(usize, usize)>,
+    /// B operand upcast axes (input matrix).
+    pub b: Vec<(usize, usize)>,
+    /// C operand upcast axes (output/accumulator).
+    pub c: Vec<(usize, usize)>,
+}
+
+impl WmmaUpcastAxes {
+    /// Returns deduplicated axis IDs from all three operands.
+    pub fn all_axis_ids(&self) -> Vec<usize> {
+        let mut ids: Vec<usize> = self.a.iter().chain(self.b.iter()).chain(self.c.iter()).map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Returns the axes for operand at the given index (0=A, 1=B, 2=C).
+    pub fn by_index(&self, index: usize) -> &[(usize, usize)] {
+        match index {
+            0 => &self.a,
+            1 => &self.b,
+            2 => &self.c,
+            _ => panic!("WMMA operand index must be 0, 1, or 2"),
+        }
+    }
+
+    /// Returns the product of axis sizes for operand at given index.
+    pub fn source_size(&self, index: usize) -> usize {
+        self.by_index(index).iter().map(|(_, s)| s).product::<usize>().max(1)
+    }
+}
+
 /// Metadata for WMMA (Warp Matrix Multiply-Accumulate) operations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -659,10 +700,15 @@ pub struct WmmaMetadata {
     pub device: String,
     /// Thread count.
     pub threads: usize,
-    /// Upcast axes for vectorization.
-    pub upcast_axes: Vec<(usize, usize)>,
-    /// Reduction axes.
-    pub reduce_axes: Vec<(usize, usize)>,
+    /// Per-source upcast axes for vectorization (A, B, C each have their own).
+    pub upcast_axes: WmmaUpcastAxes,
+    /// TC reduce axis IDs (used for exclude_args in expansion).
+    pub reduce_axes: Vec<usize>,
+    /// Tile grid for multi-FMA batching (tile_y_count, tile_x_count).
+    ///
+    /// When > (1, 1), uses load-pair mode and emits multiple FMAs per K iteration
+    /// to compute a 2×2 grid of output tiles. Default is (1, 1).
+    pub tile_grid: (usize, usize),
 }
 
 /// Wrapper for ConstValue that implements Eq and Hash.

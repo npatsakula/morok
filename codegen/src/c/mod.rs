@@ -326,9 +326,11 @@ fn render_amx_wmma_function(metadata: &WmmaMetadata) -> String {
 
     // AMX instruction opcode selection based on dtype
     let fma_op = match metadata.dtype_in.base() {
+        morok_dtype::ScalarDType::Float64 => 10, // fma64
         morok_dtype::ScalarDType::Float32 => 12, // fma32
-        morok_dtype::ScalarDType::Float16 => 14, // fma16
-        _ => 12,                                 // default to fma32
+        morok_dtype::ScalarDType::Int16 => 14,   // mac16
+        morok_dtype::ScalarDType::Float16 => 15, // fma16
+        _ => 12,
     };
 
     format!(

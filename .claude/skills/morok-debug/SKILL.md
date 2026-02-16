@@ -7,8 +7,22 @@ description: Debug Morok tensor pipeline issues by extracting IR at each stage, 
 
 ## Three-Step Analysis
 
-When you don't know where an error occurs in the pipeline:
+There are three places where errors can occur:
+  - Frontend: we can create incorrect IR.
+  - Transformation pipeline: we can incorrectly transform IR between stages.
+  - Codegen: we can incorrectly generate target IR.
+Most of the issues are in the transformation pipeline, and unfortunately it's the hardest
+to debug.
 
+The first step during investigation is to isolate the place where the error occurs. This
+will allow you to simplify the investigation and reduce the context. You can do it by
+extracting IR from an operation (`tensor.uop().tree()`); by extracting IR before codegen;
+by extracting kernel code before execution.
+
+Sometimes it's hard to understand if IR is correct, but we have two sources of information:
+  - Compare it with Tinygrad IR for the same code: use Python code; they should be identical.
+  - Read the @book/src/path-of-the-uop.md to understand if it's correct.
+  
 ### Step 1: Check IR before optimization
 ```bash
 RUST_LOG=morok_schedule::rangeify=debug cargo test test_name 2>&1 | rg 'range assignment complete'
@@ -24,7 +38,7 @@ RUST_LOG=morok_schedule::optimizer=debug cargo test test_name 2>&1 | rg 'optimiz
 RUST_LOG=morok_codegen::llvm::text=debug cargo test test_name 2>&1 | rg 'linearized node'
 ```
 
-Compare with Tinygrad's output using the `/tinygrad` skill to isolate broken patterns.
+Compare with Tinygrad's output using the `/tinygrad-debug` skill to isolate broken patterns.
 
 ---
 

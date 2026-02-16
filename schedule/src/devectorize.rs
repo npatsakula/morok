@@ -67,7 +67,11 @@ pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
     // - move_gep_after_load creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT))
     // - distribute_ptrcat_load needs to match the newly created LOAD(PTRCAT)
     // - The rewrite engine's fixed-point matching allows this in a single pass
-    let pm_phase2 = symbolic() + gep_movement_patterns() + ptrcat_distribution_patterns();
+    let pm_phase2 = symbolic()
+        + gep_simplification_patterns()
+        + gep_movement_patterns()
+        + ptrcat_distribution_patterns()
+        + contiguous_gep_load_patterns();
     let ast = graph_rewrite(&pm_phase2, ast, &mut ());
 
     // Phase 3: Split loads/stores by device fold lengths, drop true gates
@@ -324,7 +328,7 @@ fn no_vectorized_wmma() -> TypedPatternMatcher {
 }
 
 fn wmma_expected_size(metadata: &WmmaMetadata) -> usize {
-    metadata.upcast_axes.iter().map(|(_, size)| size).product::<usize>().max(1)
+    metadata.upcast_axes.c.iter().map(|(_, size)| size).product::<usize>().max(1)
 }
 
 fn devectorize_wmma(
@@ -339,12 +343,17 @@ fn devectorize_wmma(
         return None;
     }
 
-    // Split each source by out_sz
-    let tsrcs: Vec<Vec<Arc<UOp>>> = [a, b, c]
+    // Split each source by its OWN axis sizes (A, B, C may differ).
+    // For CUDA 8-16-16 with elements_per_thread=(8,4,4):
+    //   A split by 8, B split by 4, C split by 4.
+    let sources: [&Arc<UOp>; 3] = [a, b, c];
+    let tsrcs: Vec<Vec<Arc<UOp>>> = sources
         .iter()
-        .map(|src| {
+        .enumerate()
+        .map(|(i, src)| {
+            let ssz = metadata.upcast_axes.source_size(i);
             let n = src.dtype().vcount();
-            (0..n).step_by(out_sz).map(|g| src.gep((g..g + out_sz.min(n - g)).collect())).collect()
+            (0..n).step_by(ssz).map(|g| src.gep((g..g + ssz.min(n - g)).collect())).collect()
         })
         .collect();
 
@@ -601,6 +610,30 @@ fn expand_index_patterns() -> TypedPatternMatcher {
     }
 }
 
+/// GEP simplification: identity elimination and GEP-of-GEP folding.
+///
+/// Identity GEP `GEP(x, [0,1,...,n-1])` where n == x.vcount is a no-op.
+/// GEP-of-GEP `GEP(GEP(x, outer), inner)` composes into `GEP(x, [outer[i] for i in inner])`.
+///
+/// These must run in Phase 2 because `move_gep_on_store` creates identity GEPs
+/// that block `contiguous_gep_load_patterns` from matching.
+fn gep_simplification_patterns() -> TypedPatternMatcher {
+    crate::patterns! {
+        // Identity GEP: GEP(x, [0,1,...,n-1]) → x
+        Gep { vector, indices } if is_identity_gep(vector, indices) => Some(vector.clone()),
+
+        // GEP(GEP(x, outer), inner) → GEP(x, composed)
+        Gep { vector: Gep { vector: inner_vec, indices: outer_indices }, indices: inner_indices }
+            => |inner_vec, outer_indices, inner_indices| {
+                let composed: Vec<usize> = inner_indices.iter()
+                    .filter_map(|&i| outer_indices.get(i).copied())
+                    .collect();
+                if composed.len() != inner_indices.len() { return None; }
+                Some(inner_vec.gep(composed))
+            },
+    }
+}
+
 /// Phase 2: Move GEP through LOAD/STORE.
 fn gep_movement_patterns() -> TypedPatternMatcher {
     crate::patterns! {
@@ -624,6 +657,59 @@ fn ptrcat_distribution_patterns() -> TypedPatternMatcher {
         // PTRCAT after STORE
         Store { index: PtrCat { sources }, value, ranges }
             => distribute_ptrcat_store(sources, value, ranges),
+    }
+}
+
+/// Contiguous GEP on LOAD → direct sub-vector LOAD.
+///
+/// Transforms `GEP(LOAD(INDEX(buf)), [start..start+N])` into
+/// `LOAD(INDEX(buf, offset+start), dtype=vec<N>)`, avoiding scalar decomposition.
+///
+/// Uses scalar element dtype for the INDEX so the GEP strides by single elements,
+/// even when the buffer base type is a vector (e.g., DEFINE_REG_TYPED(1, vec256)).
+fn contiguous_gep_load_patterns() -> TypedPatternMatcher {
+    crate::patterns! {
+        Gep { vector: load @ Load { buffer, index, alt: None }, indices }
+            if indices.len() > 1
+            && is_contiguous_indices(indices).is_some()
+            && matches!(index.op(), Op::Index { .. })
+            => |load, buffer, index, indices| {
+                let start = indices[0];
+                let count = indices.len();
+                let Op::Index { buffer: buf, indices: orig_indices, gate } = index.op() else {
+                    return None;
+                };
+                let scalar_dtype = load.dtype().scalar_dtype();
+                let new_first = if start == 0 {
+                    orig_indices[0].clone()
+                } else {
+                    let offset = orig_indices[0].const_like(start as i64);
+                    orig_indices[0].add(&offset)
+                };
+                let new_indices: SmallVec<[Arc<UOp>; 4]> = std::iter::once(new_first)
+                    .chain(orig_indices[1..].iter().cloned())
+                    .collect();
+                // Use Ptr dtype with scalar base so:
+                // 1. pm_add_loads skips this INDEX (is_ptr_or_image_dtype → true)
+                // 2. MLIR codegen extracts scalar base for GEP element type (correct stride)
+                let idx_dtype = match buf.dtype() {
+                    DType::Ptr { addrspace, size, .. } => DType::Ptr {
+                        base: Box::new(scalar_dtype.clone()),
+                        addrspace,
+                        size,
+                        vcount: 1,
+                    },
+                    _ => scalar_dtype.clone(),
+                };
+                let new_index = UOp::index()
+                    .buffer(buf.clone())
+                    .indices(new_indices)
+                    .maybe_gate(gate.clone())
+                    .dtype(idx_dtype)
+                    .call()
+                    .ok()?;
+                Some(UOp::load().buffer(buffer.clone()).index(new_index).dtype(scalar_dtype.vec(count)).call())
+            },
     }
 }
 
@@ -659,6 +745,12 @@ pub fn correct_load_store_patterns() -> TypedPatternMatcher {
 
 fn is_define_or_after(uop: &Arc<UOp>) -> bool {
     matches!(uop.unwrap_after().op(), Op::DefineLocal(_) | Op::DefineReg { .. } | Op::DefineGlobal(_))
+}
+
+/// Check if GEP indices are contiguous `[start, start+1, ..., start+N-1]`.
+fn is_contiguous_indices(indices: &[usize]) -> Option<usize> {
+    let &start = indices.first()?;
+    indices.iter().enumerate().all(|(i, &idx)| idx == start + i).then_some(start)
 }
 
 /// Matches INDEX(VECTORIZE(Defines.or_after()), vec_idx) only.
@@ -776,6 +868,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let mut idxs: Vec<Option<usize>> = vec![None; count];
     let mut global_offset = 0;
 
+    // DIAG: Print grouping info for vec256 stores
     for offsets in offsets_by_root.values() {
         let groups = group_consecutive_offsets_from_map(offsets);
         for grp in groups {
@@ -923,18 +1016,69 @@ fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // Fold lengths (devectorizer.py:138-152)
     let buf_dtype = buf.dtype();
+    let is_amx = std::env::var("MOROK_AMX").is_ok_and(|v| v == "1");
+
+    // AMX TC accumulators are stored in DEFINE_REG (AddrSpace::Reg) but need vector stores.
+    // For STORE: check if VALUE comes from an AMX TC accumulator (DEFINE_REG with AddrSpace::Reg).
+    // For LOAD: check if BUFFER is an AMX TC accumulator.
+    fn is_amx_tc_reg_ptr(dtype: &DType, sz: usize) -> bool {
+        sz >= 16
+            && dtype.base().is_float()
+            && matches!(dtype, DType::Ptr { addrspace: AddrSpace::Reg, .. } | DType::Vector { .. })
+    }
+
+    // Helper to find underlying LOAD through GEP chains
+    fn find_underlying_load(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+        match uop.op() {
+            Op::Gep { vector, .. } => find_underlying_load(vector),
+            Op::Load { .. } => Some(uop.clone()),
+            _ => None,
+        }
+    }
+
+    let is_amx_tc_acc = match ls.op() {
+        Op::Store { value, .. } => {
+            // Check if value comes from LOAD of DEFINE_REG (AMX accumulator)
+            // Value may be GEP(LOAD(...)), so trace through GEP chains
+            if let Some(load) = find_underlying_load(value) {
+                if let Op::Load { index, .. } = load.op() {
+                    if let Op::Index { buffer, .. } = index.op() {
+                        let buf_dtype = buffer.dtype();
+                        is_amx && is_amx_tc_reg_ptr(&buf_dtype, sz)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        Op::Load { .. } => is_amx && is_amx_tc_reg_ptr(&buf_dtype, sz),
+        _ => false,
+    };
+
+    // Don't fold for non-float types or Image, but allow AMX TC accumulators.
+    // Tinygrad: no_fold is False for AMX operations since they use in-memory accumulation.
     let no_fold = (!buf_dtype.base().is_float() && !matches!(buf_dtype, DType::Image { .. }))
-        || matches!(buf_dtype, DType::Ptr { addrspace: AddrSpace::Reg, .. });
+        || (matches!(buf_dtype, DType::Ptr { addrspace: AddrSpace::Reg, .. }) && !is_amx_tc_acc);
+
     let mut lengths = if no_fold {
         vec![1]
     } else if matches!(buf_dtype, DType::Image { .. }) {
         vec![4, 1]
+    } else if is_amx {
+        vec![16, 8, 4, 2, 1] // AMX: wider folds matching 64-byte row stride
     } else {
         vec![4, 2, 1] // ctx.supports_float4
     };
 
     // Filter by divisibility (devectorizer.py:155-156)
-    if let Some(offset) = indices.first() {
+    // NOTE: Tinygrad has `must_divide=False` for DSP devices which skips this check.
+    // DSP uses larger fold lengths [128,64,32,16,8,4] without divisibility requirement.
+    // AMX TC accumulators also skip divisibility check to allow vector stores.
+    if !is_amx_tc_acc && let Some(offset) = indices.first() {
         lengths.retain(|&len| offset_divides_evenly(offset, len));
     }
 

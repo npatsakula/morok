@@ -53,6 +53,9 @@
           filter = sourceFilter;
         };
         nativeBuildInputs = with pkgs; [
+          llvm.llvm.dev
+          llvm.mlir
+          jemalloc
           pkgconf
           libffi
           libxml2
@@ -62,6 +65,8 @@
         commonArgs = {
           inherit src nativeBuildInputs;
           LLVM_SYS_211_PREFIX = "${llvm.llvm.dev}";
+          MLIR_SYS_210_PREFIX = "${llvm.mlir.dev}";
+          TABLEGEN_210_PREFIX = "${llvm.mlir.dev}";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib/";
         };
 
