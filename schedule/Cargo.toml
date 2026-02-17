@@ -15,12 +15,12 @@ rayon = "1.11"
 once_cell = "1.21"
 sled = "0.34"
 dirs = "6.0"
-bon = "3.8"
+bon = "3.9"
 serde = { version = "1", features = ["derive"] }
-bincode = "1.3"
+bincode = "3.0"
 
 z3 = { version = "0.19", optional = true }
-proptest-derive = { version = "0.7", optional = true }
+proptest-derive = { version = "0.8", optional = true }
 snafu = "0.8.9"
 tracing = "0.1"
 itertools = "0.14.0"
