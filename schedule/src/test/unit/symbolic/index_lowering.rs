@@ -18,7 +18,8 @@ fn index_const(val: i64) -> Arc<UOp> {
 
 #[test]
 fn test_index_const_lowering_i32() {
-    // Small constants should lower to i32
+    // Small constants should lower to i32 (wrapped in .cast(Index))
+    // Cascade Phase 1: CONST(Index) → CONST(i32).cast(Index)
     let c = index_const(42);
     assert_eq!(c.dtype(), DType::Index);
 
@@ -26,20 +27,43 @@ fn test_index_const_lowering_i32() {
     let result = matcher.rewrite(&c, &mut ());
 
     if let RewriteResult::Rewritten(lowered) = result {
-        assert!(matches!(lowered.dtype(), DType::Scalar(ScalarDType::Int32)), "Small constant should lower to i32");
+        // Result is wrapped: CAST(src=CONST(i32), dtype=Index)
+        assert_eq!(lowered.dtype(), DType::Index, "Result should still be Index (wrapped)");
+        if let Op::Cast { src, dtype } = lowered.op() {
+            assert_eq!(*dtype, DType::Index, "Cast target should be Index");
+            assert!(
+                matches!(src.dtype(), DType::Scalar(ScalarDType::Int32)),
+                "Inner const should be i32, got {:?}",
+                src.dtype()
+            );
+        } else {
+            panic!("Expected Cast op, got {:?}", lowered.op());
+        }
     }
 }
 
 #[test]
 fn test_index_const_lowering_i64() {
-    // Large constants should lower to i64
+    // Large constants should lower to i64 (wrapped in .cast(Index))
+    // Cascade Phase 1: CONST(Index) → CONST(i64).cast(Index)
     let c = index_const(i64::MAX / 2);
 
     let matcher = pm_lower_index_dtype();
     let result = matcher.rewrite(&c, &mut ());
 
     if let RewriteResult::Rewritten(lowered) = result {
-        assert!(matches!(lowered.dtype(), DType::Scalar(ScalarDType::Int64)), "Large constant should lower to i64");
+        // Result is wrapped: CAST(src=CONST(i64), dtype=Index)
+        assert_eq!(lowered.dtype(), DType::Index, "Result should still be Index (wrapped)");
+        if let Op::Cast { src, dtype } = lowered.op() {
+            assert_eq!(*dtype, DType::Index, "Cast target should be Index");
+            assert!(
+                matches!(src.dtype(), DType::Scalar(ScalarDType::Int64)),
+                "Inner const should be i64, got {:?}",
+                src.dtype()
+            );
+        } else {
+            panic!("Expected Cast op, got {:?}", lowered.op());
+        }
     }
 }
 
@@ -114,27 +138,51 @@ fn test_cast_to_index_removal() {
 
 #[test]
 fn test_define_var_lowering_i32() {
-    // DEFINE_VAR with small bounds should lower to i32
+    // DEFINE_VAR with small bounds should lower to i32 (wrapped in .cast(Index))
+    // Cascade Phase 1: DEFINE_VAR(Index) → DEFINE_VAR(i32).cast(Index)
     let dv = UOp::new(Op::DefineVar { name: "x".into(), min_val: 0, max_val: 1000 }, DType::Index);
 
     let matcher = pm_lower_index_dtype();
     let result = matcher.rewrite(&dv, &mut ());
 
     if let RewriteResult::Rewritten(lowered) = result {
-        assert!(matches!(lowered.dtype(), DType::Scalar(ScalarDType::Int32)), "Small DEFINE_VAR should lower to i32");
+        // Result is wrapped: CAST(src=DEFINE_VAR(i32), dtype=Index)
+        assert_eq!(lowered.dtype(), DType::Index, "Result should still be Index (wrapped)");
+        if let Op::Cast { src, dtype } = lowered.op() {
+            assert_eq!(*dtype, DType::Index, "Cast target should be Index");
+            assert!(
+                matches!(src.dtype(), DType::Scalar(ScalarDType::Int32)),
+                "Inner DEFINE_VAR should be i32, got {:?}",
+                src.dtype()
+            );
+        } else {
+            panic!("Expected Cast op, got {:?}", lowered.op());
+        }
     }
 }
 
 #[test]
 fn test_define_var_lowering_i64() {
-    // DEFINE_VAR with large bounds should lower to i64
+    // DEFINE_VAR with large bounds should lower to i64 (wrapped in .cast(Index))
+    // Cascade Phase 1: DEFINE_VAR(Index) → DEFINE_VAR(i64).cast(Index)
     let dv = UOp::new(Op::DefineVar { name: "x".into(), min_val: 0, max_val: i64::MAX / 2 }, DType::Index);
 
     let matcher = pm_lower_index_dtype();
     let result = matcher.rewrite(&dv, &mut ());
 
     if let RewriteResult::Rewritten(lowered) = result {
-        assert!(matches!(lowered.dtype(), DType::Scalar(ScalarDType::Int64)), "Large DEFINE_VAR should lower to i64");
+        // Result is wrapped: CAST(src=DEFINE_VAR(i64), dtype=Index)
+        assert_eq!(lowered.dtype(), DType::Index, "Result should still be Index (wrapped)");
+        if let Op::Cast { src, dtype } = lowered.op() {
+            assert_eq!(*dtype, DType::Index, "Cast target should be Index");
+            assert!(
+                matches!(src.dtype(), DType::Scalar(ScalarDType::Int64)),
+                "Inner DEFINE_VAR should be i64, got {:?}",
+                src.dtype()
+            );
+        } else {
+            panic!("Expected Cast op, got {:?}", lowered.op());
+        }
     }
 }
 

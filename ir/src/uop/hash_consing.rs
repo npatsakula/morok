@@ -119,10 +119,10 @@ enum OpData {
 
     // Symbolic/Define operations
     DefineVarData(String, i64, i64), // (name, min_val, max_val)
-    DefineRegSize(usize),
+    DefineRegData(usize, usize),     // (size, id)
 
     // Advanced operations
-    WmmaData(WmmaMetadata),
+    WmmaData(Box<WmmaMetadata>),
     ContractRanges(Vec<(usize, usize)>),
     UnrollAxes(Vec<(usize, usize)>),
     CustomCode(String),
@@ -199,10 +199,10 @@ impl UOpKey {
 
             // Symbolic/Define operations
             Op::DefineVar { name, min_val, max_val } => OpData::DefineVarData(name.clone(), *min_val, *max_val),
-            Op::DefineReg { size } => OpData::DefineRegSize(*size),
+            Op::DefineReg { size, id } => OpData::DefineRegData(*size, *id),
 
             // Advanced operations
-            Op::Wmma { metadata, .. } => OpData::WmmaData(metadata.clone()),
+            Op::Wmma { metadata, .. } => OpData::WmmaData(metadata.clone().into()),
             Op::Contract { upcast_ranges, .. } => OpData::ContractRanges(upcast_ranges.clone()),
             Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),

@@ -266,9 +266,6 @@ pub fn pm_pre_expander() -> TypedPatternMatcher {
         // Fix STORE with UNROLL in ranges/index - wrap in CONTRACT
         // MUST run BEFORE do_expand! Tinygrad's fix_store_unroll is in pm_pre_expander.
         store if matches!(store.op(), Op::Store { .. }) => |store| fix_store_unroll(store),
-
-        // Handle END with UNROLL ranges
-        end @ End(_, ..) => |end| end_unrolls(end),
     }
 }
 
@@ -306,6 +303,13 @@ pub fn expander() -> TypedPatternMatcher {
         },
 
         // =====================================================================
+        // END on UNROLL (Tinygrad expander.py:89)
+        // =====================================================================
+        // END with UNROLL ranges: wrap computation in CONTRACT and keep non-UNROLL ranges.
+        // Must be in expander (not pm_pre_expander) so it runs AFTER pm_group_for_reduce.
+        end @ End(_, ..) => |end| end_unrolls(end),
+
+        // =====================================================================
         // BUFFERIZE with UNROLL (Tinygrad expander.py:91-92)
         // =====================================================================
 
@@ -340,12 +344,70 @@ pub fn expander() -> TypedPatternMatcher {
         },
 
         // =====================================================================
+        // UNROLL GEP fusion (Tinygrad expander.py:105-107)
+        // =====================================================================
+        // Fuse element-wise Binary ops on sequential GEPs into vectorized ALU.
+        // UNROLL(Vectorize([BinOp(GEP(x,0),GEP(y,0)), ..., BinOp(GEP(x,N-1),GEP(y,N-1))]))
+        //   → UNROLL(Vectorize([GEP(BinOp(x,y),0), ..., GEP(BinOp(x,y),N-1)]))
+        // This enables gep_pushing to then collapse Vectorize(GEP(same,0..N-1)) → same.
+        unroll @ Unroll { src, .. } if matches!(src.op(), Op::Vectorize { .. }) => |unroll| fuse_unroll_gep_alu(unroll),
+
+        // =====================================================================
         // Cleanup
         // =====================================================================
 
         // Remove empty UNROLL: UNROLL(x, ()) → x
         Unroll { src, unroll_axes, .. } if unroll_axes.is_empty() ~> src,
     }
+}
+
+/// Fuse element-wise Binary ops on GEPs within UNROLL into vectorized ALU.
+///
+/// Based on Tinygrad's expander.py:105-107. Matches UNROLL where ALL elements are
+/// `BinaryOp(GEP(x, [i]), GEP(y, [i]))` with the same x, y, and BinaryOp, and
+/// sequential indices 0..N-1. Transforms to `BinaryOp(x, y)` pushed outside GEPs.
+fn fuse_unroll_gep_alu(unroll: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Unroll { src, unroll_axes } = unroll.op() else { return None };
+    let Op::Vectorize { elements } = src.op() else { return None };
+    if elements.is_empty() {
+        return None;
+    }
+
+    // Check that ALL elements are the same BinaryOp on single-index GEPs
+    let first = elements.first()?;
+    let Op::Binary(bin_op, first_a, first_b) = first.op() else { return None };
+    let Op::Gep { vector: base_x, indices: first_a_idx } = first_a.op() else { return None };
+    let Op::Gep { vector: base_y, indices: first_b_idx } = first_b.op() else { return None };
+    if first_a_idx.len() != 1 || first_b_idx.len() != 1 {
+        return None;
+    }
+    if first_a_idx[0] != 0 || first_b_idx[0] != 0 {
+        return None;
+    }
+
+    // Verify all other elements have the same structure
+    for (i, elem) in elements.iter().enumerate().skip(1) {
+        let Op::Binary(op, a, b) = elem.op() else { return None };
+        if op != bin_op {
+            return None;
+        }
+        let Op::Gep { vector: x, indices: a_idx } = a.op() else { return None };
+        let Op::Gep { vector: y, indices: b_idx } = b.op() else { return None };
+        if a_idx.len() != 1 || b_idx.len() != 1 {
+            return None;
+        }
+        if a_idx[0] != i || b_idx[0] != i {
+            return None;
+        }
+        if !Arc::ptr_eq(x, base_x) || !Arc::ptr_eq(y, base_y) {
+            return None;
+        }
+    }
+
+    // All checks passed: create fused BinaryOp(x, y) and extract via GEPs
+    let fused = UOp::new(Op::Binary(*bin_op, base_x.clone(), base_y.clone()), base_x.dtype());
+    let new_elements: SmallVec<[Arc<UOp>; 4]> = (0..elements.len()).map(|i| fused.gep(vec![i])).collect();
+    Some(UOp::vectorize(new_elements).unroll_with_dtype(unroll_axes.clone(), unroll.dtype()))
 }
 
 /// Check if any input to this operation is an UNROLL op.
@@ -385,9 +447,14 @@ fn do_expand(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Collect exclude_args for WMMA (zero out reduce axes)
+    // Collect exclude_args for WMMA: all upcast axis IDs + reduce axis IDs.
+    // These axes are TC-internal and must not participate in expansion.
     let exclude_args: Vec<usize> = if let Op::Wmma { metadata, .. } = op {
-        metadata.reduce_axes.iter().map(|(ax, _)| *ax).collect()
+        let mut ids = metadata.upcast_axes.all_axis_ids();
+        ids.extend(metadata.reduce_axes.iter());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     } else {
         vec![]
     };

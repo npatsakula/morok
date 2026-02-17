@@ -118,7 +118,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         | Op::Kernel { .. }
         | Op::Barrier { .. } => None,
 
-        Op::DefineReg { size } => {
+        Op::DefineReg { size, .. } => {
             let base_dtype = match uop.dtype() {
                 DType::Ptr { base, .. } => base.as_ref().clone(),
                 other => other,
@@ -355,6 +355,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         Op::PtrCat { sources } => {
             // PtrCat is not typical in C, render as array
             render_cat(uop, sources, ctx, kernel);
+            Some(())
+        }
+
+        Op::Wmma { a, b, c, metadata } => {
+            let a_val = ctx.get(a).to_string();
+            let b_val = ctx.get(b).to_string();
+            let c_val = ctx.get(c).to_string();
+            let expr = format!("__{name}({a_val}, {b_val}, {c_val})", name = metadata.name);
+            ctx.emit_expr(uop, expr, "wmma", kernel);
             Some(())
         }
 

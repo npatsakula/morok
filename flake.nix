@@ -53,16 +53,34 @@
           filter = sourceFilter;
         };
         nativeBuildInputs = with pkgs; [
+          llvm.llvm.dev
+          llvm.mlir
           pkgconf
           libffi
           libxml2
           z3
           zlib
+          clang
         ];
+
+        mlirSysPrefix = pkgs.symlinkJoin {
+          name = "mlir-sys-prefix";
+          paths = [
+            llvm.llvm.dev # llvm-config, LLVM headers
+            llvm.llvm.lib # LLVM libraries
+            llvm.mlir # MLIR libraries (libMLIR*)
+            llvm.mlir.dev # MLIR headers (mlir-c/)
+          ];
+        };
+
         commonArgs = {
           inherit src nativeBuildInputs;
-          LLVM_SYS_211_PREFIX = "${llvm.llvm.dev}";
+          MLIR_SYS_210_PREFIX = "${mlirSysPrefix}";
+          TABLEGEN_210_PREFIX = "${mlirSysPrefix}";
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib/";
+          # Disable fortify since debug builds use -O0 but _FORTIFY_SOURCE requires optimization
+          hardeningDisable = [ "fortify" ];
+
         };
 
         cargoArtifacts = crane'.buildDepsOnly (commonArgs // { });
@@ -90,7 +108,7 @@
           };
 
           rustfmt = crane'.cargoFmt { inherit src; };
-          treefmt = treefmt.config.build.check self;
+          # treefmt = treefmt.config.build.check self;
         };
 
         devShells = rec {

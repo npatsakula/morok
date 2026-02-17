@@ -40,8 +40,8 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     debug!("hand_coded_optimizations: starting");
 
     // 1. Tensor cores (skip other opts if applied)
+    // Post-TC UPCAST/LOCAL are handled inside try_tensor_cores (non-AMX only)
     if try_tensor_cores(scheduler, config) {
-        apply_local_dims(scheduler, config);
         debug!("hand_coded_optimizations: tensor cores applied, skipping remaining opts");
         return;
     }
@@ -51,6 +51,12 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
 
     // 3. Grouped reduction
     try_grouped_reduction(scheduler, config);
+
+    // Guard: no more opts if we are grouping (Tinygrad: if k.group_for_reduces: return k)
+    if scheduler.group_for_reduces() > 0 {
+        debug!("hand_coded_optimizations: group_for_reduces active, skipping remaining opts");
+        return;
+    }
 
     // 4. Masked upcasts
     apply_masked_upcasts(scheduler);
@@ -696,8 +702,14 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 }
 
 /// Tensor core optimization for matmul patterns.
+///
+/// Matches Tinygrad's heuristic.py:28-46:
+/// - Guard: skip when >1 reduce axis unless tc_opt >= 1
+/// - Apply TC opts via tc::apply, capturing returned axes [N, M, K]
+/// - Post-TC (non-AMX only): UPCAST M then N with [5,4,3,2], LOCAL N with [4,2]
 pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use crate::optimizer::config::TcUsage;
+    use crate::optimizer::tc;
 
     if config.tc_enabled == TcUsage::Disabled {
         return false;
@@ -709,6 +721,65 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         return false;
     }
 
+    // Guard: skip TC when >1 reduce axis and tc_opt < 1 (Bug 8)
+    // Tinygrad: len(axes_of(GROUP_REDUCE, REDUCE)) == 1 or TC_OPT >= 1
+    let reduce_count = scheduler.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len();
+    if reduce_count != 1 && config.tc_opt.as_usize() < 1 {
+        return false;
+    }
+
+    // Clone the scheduler for trial - if TC fails, no partial mutations
+    let mut trial = scheduler.clone();
+    let tc_result =
+        tc::apply(&mut trial, config.tc_select.as_i32(), config.tc_opt.as_usize(), config.tc_enabled.as_usize());
+
+    let axes = match tc_result {
+        Ok(axes) => axes,
+        Err(_) => return false,
+    };
+
+    // Record the TC opt
     let opt = Opt::tc(None, config.tc_select.as_i32(), config.tc_opt.as_usize(), config.tc_enabled.as_usize());
-    apply_opt(scheduler, &opt, true).is_ok()
+    trial.applied_opts.push(opt);
+
+    // Post-TC optimizations (non-AMX only)
+    // Tinygrad: if good_tc_opt and not AMX
+    if !trial.renderer().is_amx() {
+        // Track current N/M ranges (axes[0]=N, axes[1]=M, axes[2]=K)
+        let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
+
+        // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
+        for tc_dim in [1usize, 0] {
+            for &sz in &[5usize, 4, 3, 2] {
+                if tc_rngs[tc_dim].divisible_by(sz).is_some() {
+                    // Find the range's position in the scheduler
+                    if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
+                        && let Ok((replaced, _)) =
+                            trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
+                    {
+                        trial.applied_opts.push(Opt::upcast(rng_idx, sz));
+                        tc_rngs[tc_dim] = replaced;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // LOCAL N (dim=0) with factors [4,2]
+        if trial.renderer().has_local {
+            for &sz in &[4usize, 2] {
+                if tc_rngs[0].divisible_by(sz).is_some() {
+                    if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
+                        && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
+                    {
+                        trial.applied_opts.push(Opt::local(rng_idx, sz));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    *scheduler = trial;
+    true
 }

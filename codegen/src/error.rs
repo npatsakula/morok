@@ -32,6 +32,10 @@ pub enum Error {
     #[snafu(display("Invalid configuration: {reason}"))]
     InvalidConfig { reason: String },
 
+    /// MLIR-specific error.
+    #[snafu(display("MLIR error: {reason}"))]
+    MlirError { reason: String },
+
     /// Error from IR layer.
     #[snafu(display("IR error: {source}"))]
     IrError {

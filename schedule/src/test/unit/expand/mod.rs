@@ -134,7 +134,7 @@ fn test_reduce_empty_ranges_bug() {
     // Create data buffer representing [[1.0, 2.0], [3.0, 4.0]]
     // Layout: [1.0, 2.0, 3.0, 4.0]
     let data_buf = UOp::buffer_id(Some(0));
-    let data_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
+    let _data_val = UOp::const_(DType::Float32, ConstValue::Float(1.0));
 
     // Create INDEX to access elements
     // Simulating axis 1 reduction: for each row, sum columns 0 and 1
@@ -164,11 +164,11 @@ fn test_reduce_empty_ranges_bug() {
     println!("RESULT: {}", result.tree());
 
     // The bug manifests when result has empty ranges
-    if let Op::Reduce { ranges, .. } = result.op() {
-        if ranges.is_empty() {
-            panic!(
-                "BUG: REDUCE has empty ranges after pre_expand - this causes horizontal_reduce to return unchanged input"
-            );
-        }
+    if let Op::Reduce { ranges, .. } = result.op()
+        && ranges.is_empty()
+    {
+        panic!(
+            "BUG: REDUCE has empty ranges after pre_expand - this causes horizontal_reduce to return unchanged input"
+        );
     }
 }

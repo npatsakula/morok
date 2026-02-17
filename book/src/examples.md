@@ -366,11 +366,13 @@ You've learned the core patterns for using Morok:
 | Extract data | `result.to_ndarray::<f32>()?` |
 
 **The lazy evaluation pattern:**
+
 1. Build your computation graph with operations
 2. Call `realize()` once at the end
 3. Morok optimizes and executes everything together
 
 **Next steps:**
+
 - [Op Bestiary](./architecture/op-bestiary.md) — Reference for IR operations
 - [Execution Pipeline](./architecture/pipeline.md) — How compilation works
 - [Optimization System](./architecture/optimizations.md) — Pattern-based rewrites

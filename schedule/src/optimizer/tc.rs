@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use morok_ir::{AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, WmmaMetadata};
+use morok_ir::{AxisId, AxisType, BinaryOp, ConstValue, Op, ReduceOp, UOp, UOpKey, WmmaMetadata, WmmaUpcastAxes};
+use smallvec::{SmallVec, smallvec};
 
 use crate::optimizer::{
     Renderer, Scheduler,
@@ -169,8 +170,6 @@ pub fn select_tensor_core(
 // SWIZZLE
 // ============================================================================
 
-type UpcastAxes = (Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>);
-
 /// Generate the base shape from tensor core opts.
 pub fn base_shape(tc: &TensorCore) -> Vec<SwizzleAxis> {
     let reduce_count = (tc.dims.2 as f64).log2().floor() as usize;
@@ -240,9 +239,123 @@ pub fn get_reduce_axes_count(tc: &TensorCore) -> usize {
     (tc.dims.2 as f64).log2().floor() as usize
 }
 
-/// Build upcast axes configuration for WMMA construction.
-pub fn build_upcast_axes(tc: &TensorCore, _new_ranges: &[usize]) -> UpcastAxes {
-    (vec![(0, tc.elements_per_thread.0)], vec![(1, tc.elements_per_thread.1)], vec![(2, tc.elements_per_thread.2)])
+/// Compute inverse permutation.
+fn argsort(perm: &[usize]) -> Vec<usize> {
+    let mut inv = vec![0; perm.len()];
+    for (i, &p) in perm.iter().enumerate() {
+        inv[p] = i;
+    }
+    inv
+}
+
+// ============================================================================
+// A-TILE PACKING
+// ============================================================================
+
+/// Pre-pack a TC operand into a contiguous scratch buffer.
+///
+/// When operand A has strided memory access (e.g., row-major A in AMX matmul),
+/// each K iteration requires `tile_size` separate cache line accesses. This function
+/// creates a copy loop that packs the tile into contiguous memory, so the reduction
+/// loop reads one cache line per K iteration instead of `tile_size`.
+///
+/// The copy loop uses fresh RANGE nodes (distinct axis_ids) so it becomes a separate
+/// loop from the downstream reduction. An AFTER dependency ensures correct ordering.
+fn pack_tc_operand(
+    src: &Arc<UOp>,
+    reduce_range: &Arc<UOp>,
+    contract_ranges: &[&Arc<UOp>],
+    next_axis_id: &mut usize,
+) -> Result<Arc<UOp>, OptError> {
+    // 1. Compute buffer dimensions
+    let k_size = get_range_size(reduce_range).expect("ICE: reduce range must have const size") as usize;
+    let contract_sizes: Vec<usize> = contract_ranges
+        .iter()
+        .map(|r| get_range_size(r).expect("ICE: contract range must have const size") as usize)
+        .collect();
+    let tile_size: usize = contract_sizes.iter().product();
+    let buf_total = k_size * tile_size;
+    let element_dtype = src.dtype().scalar_dtype();
+
+    // 2. Create scratch buffer (register-allocated)
+    let buf = UOp::define_reg_typed(buf_total, element_dtype);
+
+    // 3. Create fresh RANGE nodes for the copy loop (2 loops: K × tile_size)
+    let k_end = match reduce_range.op() {
+        Op::Range { end, .. } => end.clone(),
+        _ => unreachable!(),
+    };
+    let k_clone = UOp::range_axis(k_end, AxisId::Renumbered(*next_axis_id), AxisType::Loop);
+    *next_axis_id += 1;
+
+    // Single flat range for the entire tile (replaces N nested binary ranges)
+    let m_flat = UOp::range_axis(UOp::index_const(tile_size as i64), AxisId::Renumbered(*next_axis_id), AxisType::Loop);
+    *next_axis_id += 1;
+
+    // 4. Substitute original ranges → decomposed sub-indices of m_flat in src expression
+    //
+    // The contract_ranges are N binary (size-2) Upcast ranges from shift_to splits.
+    // The src expression references them individually. We decompose m_flat back into
+    // sub-indices: sub_idx[i] = (m_flat / contract_strides[i]) % contract_sizes[i]
+    let contract_dims: Vec<i64> = contract_sizes.iter().map(|&s| s as i64).collect();
+    let contract_strides = crate::passes::linearize_index::compute_row_major_strides(&contract_dims);
+
+    #[allow(clippy::mutable_key_type)]
+    let subst: HashMap<UOpKey, Arc<UOp>> = {
+        let mut map = HashMap::with_capacity(1 + contract_ranges.len());
+        map.insert(UOpKey(reduce_range.clone()), k_clone.clone());
+        for (i, orig) in contract_ranges.iter().enumerate() {
+            let sub_idx = if contract_strides[i] == 1 {
+                m_flat
+                    .try_mod(&UOp::index_const(contract_sizes[i] as i64))
+                    .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "sub-index mod failed" }.build())?
+            } else {
+                let divided = m_flat
+                    .try_div(&UOp::index_const(contract_strides[i]))
+                    .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "sub-index div failed" }.build())?;
+                divided
+                    .try_mod(&UOp::index_const(contract_sizes[i] as i64))
+                    .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "sub-index mod failed" }.build())?
+            };
+            map.insert(UOpKey((*orig).clone()), sub_idx);
+        }
+        map
+    };
+    let src_cloned = src.substitute(&subst);
+
+    // 5. Store: buf[k_clone * tile_size + m_flat] = src_cloned
+    let tile_size_const = UOp::index_const(tile_size as i64);
+    let store_idx = k_clone
+        .try_mul(&tile_size_const)
+        .and_then(|k_offset| k_offset.try_add(&m_flat))
+        .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "store index creation failed" }.build())?;
+
+    let store_ptr = UOp::index()
+        .buffer(buf.clone())
+        .indices(vec![store_idx])
+        .ptr(true)
+        .call()
+        .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "store index creation failed" }.build())?;
+    let store = store_ptr.store(src_cloned);
+
+    let end = store.end(smallvec![k_clone, m_flat]);
+    let buf_ready = buf.after(smallvec![end]);
+
+    // 6. Read: LOAD(INDEX(buf_ready, [k * tile_size + m_linear])) using ORIGINAL ranges
+    let read_dims: Vec<i64> = std::iter::once(k_size as i64).chain(contract_sizes.iter().map(|&s| s as i64)).collect();
+    let read_strides = crate::passes::linearize_index::compute_row_major_strides(&read_dims);
+    let read_indices: Vec<Arc<UOp>> =
+        std::iter::once(reduce_range.clone()).chain(contract_ranges.iter().map(|r| (*r).clone())).collect();
+    let read_idx = crate::passes::linearize_index::build_linear_index(&read_indices, &read_strides);
+
+    let read_ptr = UOp::index()
+        .buffer(buf_ready.clone())
+        .indices(vec![read_idx])
+        .ptr(true)
+        .call()
+        .map_err(|_| ValidationFailedSnafu { op: "TC pack", reason: "read index creation failed" }.build())?;
+
+    Ok(UOp::load().buffer(buf_ready).index(read_ptr).call())
 }
 
 // ============================================================================
@@ -255,7 +368,7 @@ pub fn apply(
     tc_select: i32,
     tc_opt: usize,
     use_tensor_cores: usize,
-) -> Result<(), OptError> {
+) -> Result<[Arc<UOp>; 3], OptError> {
     // Validate
     if !scheduler.applied_opts.is_empty() {
         return ValidationFailedSnafu { op: "TC", reason: "tensor core opts must be first" }.fail();
@@ -288,6 +401,10 @@ pub fn apply(
     // Padding check and application (tc_opt >= 2)
     // When tc_opt >= 2, we use PADTO to align non-divisible dimensions
     // instead of rejecting them outright.
+    // Track whether any axis was padded — if so, B operand needs packing
+    // because PADTO gates break devectorization of the B source expression.
+    let mut padded = false;
+
     if tc_opt >= 2 {
         // Collect padding operations needed (can't mutate axes while iterating)
         let tc_dims = [tc.dims.0, tc.dims.1, tc.dims.2];
@@ -304,6 +421,8 @@ pub fn apply(
                 padding_ops.push((i, axis_idx, tc_dim));
             }
         }
+
+        padded = !padding_ops.is_empty();
 
         // Apply padding operations sequentially
         for (axes_idx, scheduler_idx, tc_dim) in padding_ops {
@@ -338,61 +457,242 @@ pub fn apply(
     }
 
     // Create WARP dimension
-    let warp = UOp::range_axis(
+    let mut warp = UOp::range_axis(
         UOp::const_(morok_dtype::DType::Index, ConstValue::Int(tc.threads as i64)),
-        morok_ir::AxisId::Renumbered(scheduler.maxarg() + 1),
+        AxisId::Renumbered(scheduler.maxarg() + 1),
         AxisType::Warp,
     );
 
-    // Apply TC opts
-    let mut new_ranges = Vec::with_capacity(tc.opts.len());
-    let _warp = warp;
+    // Step 1: Apply TC opts via shift_to — splits each axis into (reduced, new_rng)
+    let two = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(2));
+    let mut ne: Vec<Arc<UOp>> = Vec::with_capacity(tc.opts.len());
 
     for opt in &tc.opts {
-        let dim = match opt {
-            TcOpt::Local(d) | TcOpt::Upcast(d) => *d,
-        };
-        let axis_idx = scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &axes[dim]));
-        if let Some(idx) = axis_idx {
-            new_ranges.push(idx);
-        } else {
-            return ValidationFailedSnafu { op: "TC", reason: "axis not found in scheduler ranges" }.fail();
+        match opt {
+            TcOpt::Upcast(dim) => {
+                let (replaced, new_rng) = scheduler.shift_to(axes[*dim].clone(), 2, AxisType::Upcast, false, None)?;
+                axes[*dim] = replaced;
+                ne.push(new_rng);
+            }
+            TcOpt::Local(dim) => {
+                let warp_mod = warp
+                    .try_mod(&two)
+                    .map_err(|_| ValidationFailedSnafu { op: "TC", reason: "warp mod failed" }.build())?;
+                let (replaced, new_rng) =
+                    scheduler.shift_to(axes[*dim].clone(), 2, AxisType::Local, false, Some(warp_mod))?;
+                axes[*dim] = replaced;
+                warp = warp
+                    .try_div(&two)
+                    .map_err(|_| ValidationFailedSnafu { op: "TC", reason: "warp div failed" }.build())?;
+                ne.push(new_rng);
+            }
         }
     }
 
-    // Unroll reduction
+    // K-dimension UNROLL splits
     for (_idx, amt) in tc.get_reduce_axes() {
-        new_ranges.push(amt);
+        let (replaced, new_rng) = scheduler.shift_to(axes[2].clone(), amt, AxisType::Unroll, false, None)?;
+        axes[2] = replaced;
+        ne.push(new_rng);
     }
 
     // Build WMMA UOp (if use_tensor_cores == 1)
     if use_tensor_cores == 1 {
-        let (a_axes, b_axes, c_axes) = build_upcast_axes(&tc, &new_ranges);
+        // Step 2: Re-extract sources from updated AST
+        let updated_reduce = scheduler
+            .reduceop()
+            .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "REDUCE missing after shift_to" }.build())?;
+
+        // Validate that the REDUCE still contains MUL pattern after shift_to
+        let reduce_src = match updated_reduce.op() {
+            Op::Reduce { src, .. } => src.clone(),
+            _ => unreachable!(),
+        };
+        let mul = match reduce_src.op() {
+            Op::Cast { src, .. } => src.clone(),
+            _ => reduce_src.clone(),
+        };
+        if !matches!(mul.op(), Op::Binary(BinaryOp::Mul, ..)) {
+            return ValidationFailedSnafu { op: "TC", reason: "expected MUL inside REDUCE" }.fail();
+        }
+
+        // Step 3: Apply swizzle permutation via placeholders
+        let bshape = base_shape(&tc);
+        let (perm_a, perm_b) = permutes_for_shape(&tc, &bshape);
+        let inv_a = argsort(&perm_a);
+        let inv_b = argsort(&perm_b);
+
+        // Create placeholder UOps with unique axis_ids
+        let ph_base = scheduler.maxarg() + 100;
+        let placeholders: Vec<Arc<UOp>> = (0..ne.len())
+            .map(|i| {
+                UOp::range_axis(
+                    UOp::const_(morok_dtype::DType::Index, ConstValue::Int(2)),
+                    AxisId::Renumbered(ph_base + i),
+                    AxisType::Upcast,
+                )
+            })
+            .collect();
+
+        // Substitute ne → placeholders in REDUCE subtree
+        #[allow(clippy::mutable_key_type)]
+        let subst_to_ph: HashMap<UOpKey, Arc<UOp>> =
+            ne.iter().zip(&placeholders).map(|(n, ph)| (UOpKey(n.clone()), ph.clone())).collect();
+        let ret = updated_reduce.substitute(&subst_to_ph);
+
+        // Re-extract sources from substituted REDUCE
+        let ret_src = match ret.op() {
+            Op::Reduce { src, .. } => src.clone(),
+            _ => unreachable!(),
+        };
+        let ret_mul = match ret_src.op() {
+            Op::Cast { src, .. } => src.clone(),
+            _ => ret_src.clone(),
+        };
+        let (ret_a, ret_b) = match ret_mul.op() {
+            Op::Binary(BinaryOp::Mul, a, b) => (a.clone(), b.clone()),
+            _ => unreachable!(),
+        };
+
+        // Substitute placeholders → permuted ne for each source
+        #[allow(clippy::mutable_key_type)]
+        let subst_a: HashMap<UOpKey, Arc<UOp>> =
+            placeholders.iter().enumerate().map(|(i, ph)| (UOpKey(ph.clone()), ne[inv_a[i]].clone())).collect();
+        #[allow(clippy::mutable_key_type)]
+        let subst_b: HashMap<UOpKey, Arc<UOp>> =
+            placeholders.iter().enumerate().map(|(i, ph)| (UOpKey(ph.clone()), ne[inv_b[i]].clone())).collect();
+
+        let src_a = ret_a.substitute(&subst_a);
+        let src_b = ret_b.substitute(&subst_b);
+
+        // Step 4: Build tc_upcast_axes from ne ranges
+        //
+        // `ne` mirrors `tc.opts` order (upcast and local interleaved), with reduce
+        // entries appended after `ne[tc.opts.len()..]`. We must filter by opt type
+        // to extract only upcast entries, not assume positional layout.
+        let upcast_ne: Vec<&Arc<UOp>> =
+            tc.opts.iter().zip(ne.iter()).filter(|(opt, _)| opt.is_upcast()).map(|(_, rng)| rng).collect();
+        let reduce_ne: Vec<&Arc<UOp>> = ne[tc.opts.len()..].iter().collect();
+
+        // base_upcast_ne: reversed([reduce, upcast]) = [upcast_reversed, reduce_reversed]
+        let mut base_upcast_ne: Vec<&Arc<UOp>> = Vec::new();
+        base_upcast_ne.extend(&reduce_ne);
+        base_upcast_ne.extend(&upcast_ne);
+        base_upcast_ne.reverse();
+
+        let base_upcast_axes: Vec<(usize, usize)> = base_upcast_ne
+            .iter()
+            .map(|rng| match rng.op() {
+                Op::Range { axis_id, .. } => (axis_id.value(), 2),
+                _ => unreachable!(),
+            })
+            .collect();
+
+        // Slice by log2(elements_per_thread)
+        let n_a = (tc.elements_per_thread.0 as f64).log2() as usize;
+        let n_b = (tc.elements_per_thread.1 as f64).log2() as usize;
+        let n_c = (tc.elements_per_thread.2 as f64).log2() as usize;
+        let a_axes = base_upcast_axes[..n_a].to_vec();
+        let b_axes = base_upcast_axes[..n_b].to_vec();
+        let c_axes = base_upcast_axes[..n_c].to_vec();
+
+        // Pack operand A if configured (AMX: contiguous scratch buffer for strided access)
+        let mut next_axis_id = scheduler.maxarg() + 200;
+        let src_a = if tc.pack_a {
+            let contract_range_refs: Vec<&Arc<UOp>> = base_upcast_ne[..n_a].to_vec();
+            pack_tc_operand(&src_a, &axes[2], &contract_range_refs, &mut next_axis_id)?
+        } else {
+            src_a
+        };
+
+        // Pack operand B when PADTO was applied — PADTO gates break devectorization
+        // by creating per-element validity masks that prevent merging into contiguous
+        // vector loads. Packing B into a scratch buffer resolves this: the copy loop
+        // handles gated reads at the scalar level, and WMMA reads from contiguous memory.
+        let src_b = if padded {
+            let contract_range_refs: Vec<&Arc<UOp>> = base_upcast_ne[..n_b].to_vec();
+            pack_tc_operand(&src_b, &axes[2], &contract_range_refs, &mut next_axis_id)?
+        } else {
+            src_b
+        };
+
+        // Step 5: Construct WMMA
+        // Compute TC reduce axis IDs early (needed for metadata)
+        let tc_reduce_aids: Vec<usize> = ne[tc.opts.len()..]
+            .iter()
+            .filter_map(|r| match r.op() {
+                Op::Range { axis_id, .. } => Some(axis_id.value()),
+                _ => None,
+            })
+            .collect();
+
         let metadata = WmmaMetadata {
-            name: format!("WMMA_{}x{}x{}", tc.dims.0, tc.dims.1, tc.dims.2),
+            name: format!(
+                "WMMA_{}_{}_{}_{}_{}",
+                tc.dims.0,
+                tc.dims.1,
+                tc.dims.2,
+                wmma_dtype_name(&tc.dtype_in),
+                wmma_dtype_name(&tc.dtype_out),
+            ),
             dims: tc.dims,
             dtype_in: tc.dtype_in.clone(),
             dtype_out: tc.dtype_out.clone(),
             device: scheduler.ren.device.clone(),
             threads: tc.threads,
-            upcast_axes: c_axes.clone(),
-            reduce_axes: vec![],
+            upcast_axes: WmmaUpcastAxes { a: a_axes.clone(), b: b_axes.clone(), c: c_axes.clone() },
+            reduce_axes: tc_reduce_aids.clone(),
+            tile_grid: tc.tile_grid,
         };
 
-        let a_contract = pattern.in0.contract(a_axes);
-        let b_contract = pattern.in1.contract(b_axes);
-        let zero_acc = UOp::const_(tc.dtype_out.clone(), ConstValue::Float(0.0));
+        let a_contract = src_a.contract(a_axes);
+        let b_contract = src_b.contract(b_axes);
+        let zero_acc = if tc.dtype_out.is_float() {
+            UOp::const_(tc.dtype_out.clone(), ConstValue::Float(0.0))
+        } else {
+            UOp::const_(tc.dtype_out.clone(), ConstValue::Int(0))
+        };
         let wmma = UOp::wmma(a_contract, b_contract, zero_acc, metadata);
-        let tc_uop = wmma.unroll(c_axes);
+        let mut tc_uop = wmma.unroll_with_dtype(c_axes, tc.dtype_out.clone());
 
+        // Preserve extra reduce ranges (exclude TC reduce axis_ids)
+        if let Op::Reduce { ranges, .. } = updated_reduce.op() {
+            let extra: SmallVec<[Arc<UOp>; 4]> = ranges
+                .iter()
+                .filter(|r| match r.op() {
+                    Op::Range { axis_id, .. } => !tc_reduce_aids.contains(&axis_id.value()),
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            if !extra.is_empty() {
+                tc_uop = tc_uop.reduce(extra, ReduceOp::Add);
+            }
+        }
+
+        // Substitute REDUCE → WMMA chain in the AST
         #[allow(clippy::mutable_key_type)]
         let mut subst_map = HashMap::new();
-        subst_map.insert(morok_ir::UOpKey(pattern.reduce_op.clone()), tc_uop);
+        subst_map.insert(UOpKey(updated_reduce), tc_uop);
         let new_ast = scheduler.ast().substitute(&subst_map);
         scheduler.set_ast(new_ast);
     }
 
-    Ok(())
+    Ok(axes)
+}
+
+/// Short dtype name for WMMA function identifiers (matches Tinygrad convention).
+fn wmma_dtype_name(dtype: &morok_ir::prelude::DType) -> &'static str {
+    use morok_dtype::ScalarDType;
+    match dtype.base() {
+        ScalarDType::Float32 => "float",
+        ScalarDType::Float16 => "half",
+        ScalarDType::BFloat16 => "bfloat",
+        ScalarDType::Float64 => "double",
+        ScalarDType::Int32 => "int",
+        ScalarDType::Int8 => "int8",
+        _ => "unknown",
+    }
 }
 
 // ============================================================================
@@ -411,5 +711,5 @@ pub mod selection {
 
 /// Swizzle functions (was opts::tc::swizzle).
 pub mod swizzle {
-    pub use super::{base_shape, build_upcast_axes, get_reduce_axes_count, permutes_for_shape};
+    pub use super::{base_shape, get_reduce_axes_count, permutes_for_shape};
 }

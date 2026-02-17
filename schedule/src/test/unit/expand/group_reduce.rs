@@ -164,13 +164,13 @@ fn test_group_reduce_with_local_ranges() {
     // The BUFFERIZE should have ranges that include the LOCAL range
     // (fix_group_for_reduce collects upstream_locals and includes them in buf_ranges)
     for node in all_nodes.iter() {
-        if let Op::Bufferize { ranges, opts, .. } = node.op() {
-            if opts.addrspace == AddrSpace::Local {
-                // Check that LOCAL range type appears in buffer ranges
-                let has_local_in_ranges =
-                    ranges.iter().any(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Local, .. }));
-                assert!(has_local_in_ranges, "BUFFERIZE ranges should include LOCAL range for shared memory indexing");
-            }
+        if let Op::Bufferize { ranges, opts, .. } = node.op()
+            && opts.addrspace == AddrSpace::Local
+        {
+            // Check that LOCAL range type appears in buffer ranges
+            let has_local_in_ranges =
+                ranges.iter().any(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Local, .. }));
+            assert!(has_local_in_ranges, "BUFFERIZE ranges should include LOCAL range for shared memory indexing");
         }
     }
 }

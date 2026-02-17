@@ -456,6 +456,14 @@ fn cache_put(key: &CacheKey, opts: &[Opt]) {
     }
 }
 
+/// Remove a stale cache entry.
+fn cache_invalidate(key: &CacheKey) {
+    if let Some(db) = CACHE_DB.as_ref() {
+        let _ = db.remove(key.to_bytes());
+        let _ = db.flush();
+    }
+}
+
 /// Run beam search with disk caching.
 ///
 /// Checks the cache before running beam search. If a cached result exists,
@@ -485,11 +493,19 @@ where
     if !config.disable_cache
         && let Some(cached_opts) = cache_get(&key)
     {
-        // Replay cached optimizations
+        // Replay cached optimizations. If replay fails (stale entry from code changes),
+        // invalidate and fall through to fresh search.
         tracing::info!(opts_count = cached_opts.len(), "Beam cache HIT - replaying opts");
-        let replayed = replay_opts(scheduler.clone(), &cached_opts)?;
-        let timing = compile_and_time(&replayed).unwrap_or(Duration::MAX);
-        return Ok(BeamResult { scheduler: replayed, timing, iterations: 0, candidates_evaluated: 0 });
+        match replay_opts(scheduler.clone(), &cached_opts) {
+            Ok(replayed) => {
+                let timing = compile_and_time(&replayed).unwrap_or(Duration::MAX);
+                return Ok(BeamResult { scheduler: replayed, timing, iterations: 0, candidates_evaluated: 0 });
+            }
+            Err(e) => {
+                tracing::warn!(?e, "Beam cache replay failed (stale entry?) - invalidating");
+                cache_invalidate(&key);
+            }
+        }
     }
 
     tracing::info!("Beam cache MISS - running search");
@@ -730,10 +746,11 @@ mod tests {
         // Verify renderer supports threading
         assert!(scheduler.renderer().has_threads, "CPU renderer should have has_threads=true");
 
-        // Try to apply THREAD opt
+        // Try to apply THREAD opt - use available parallelism to work on machines with few cores
+        let thread_count = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
         let mut test_scheduler = scheduler.clone();
-        let result = apply_opt(&mut test_scheduler, &Opt::thread(0, 8), true);
-        assert!(result.is_ok(), "THREAD(0, 8) should succeed on Outer axis: {:?}", result);
+        let result = apply_opt(&mut test_scheduler, &Opt::thread(0, thread_count), true);
+        assert!(result.is_ok(), "THREAD(0, {}) should succeed on Outer axis: {:?}", thread_count, result);
 
         // Verify Thread axis was created
         let thread_axes = test_scheduler.axes_of(&[AxisType::Thread]);

@@ -1,6 +1,6 @@
 # Morok
 
-Use Opus 4.5 powered agents.
+Use Opus 4.6 powered agents.
 
 ## Skills
 

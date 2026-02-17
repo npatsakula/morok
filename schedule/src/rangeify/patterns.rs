@@ -862,6 +862,27 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<LocalAddBufferContext>
     }
 }
 
+/// Context-free rangeify_codegen for post-expander pipeline (Stage 10).
+///
+/// Simplified version of `rangeify_codegen_patterns()` that doesn't require
+/// `LocalAddBufferContext`. At this point CONTIGUOUS opts have already been
+/// extracted during kernel splitting, so we just strip CONTIGUOUS and NOOP.
+///
+/// Based on Tinygrad's codegen/__init__.py:79 where `rangeify_codegen` runs
+/// with `ctx=itertools.count(0)` (no LocalAddBufferContext).
+pub fn rangeify_codegen_simple() -> TypedPatternMatcher {
+    crate::patterns! {
+        // NOOP → zero constant (scalar or vector)
+        noop @ Noop() if noop.dtype().base() != morok_dtype::ScalarDType::Void => |noop| {
+            Some(dtype_zero(noop.dtype()))
+        },
+        // CONTIGUOUS → source (strip wrapper, no opts to extract at this stage)
+        Contiguous { src, .. } => |src| {
+            Some(src.clone())
+        },
+    }
+}
+
 // ============================================================================
 // KERNEL SPLITTING PATTERNS
 // ============================================================================
