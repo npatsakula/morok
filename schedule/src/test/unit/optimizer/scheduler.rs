@@ -1414,8 +1414,9 @@ fn test_thread_basic() {
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    // Apply THREAD optimization
-    let opt = Opt::thread(0, 8);
+    // Apply THREAD optimization - use available parallelism to work on machines with few cores
+    let thread_count = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let opt = Opt::thread(0, thread_count);
     let result = apply_opt(&mut scheduler, &opt, true);
     assert!(result.is_ok(), "THREAD opt should succeed: {:?}", result);
 
