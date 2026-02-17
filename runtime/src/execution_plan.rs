@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use morok_device::{Buffer, BufferId};
 use morok_dtype::DeviceSpec;
+use morok_ir::UOp;
 
 use crate::error::Result;
 use crate::executor::UnifiedExecutor;
@@ -66,6 +67,8 @@ use crate::kernel_cache::CachedKernel;
 pub struct PreparedKernel {
     /// Unique identifier (from original AST).
     pub id: u64,
+
+    pub ast: Arc<UOp>,
 
     /// Compiled kernel program (Arc-shared from cache).
     pub kernel: Arc<CachedKernel>,

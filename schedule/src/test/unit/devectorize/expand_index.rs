@@ -526,17 +526,13 @@ fn test_expand_pure_broadcast() {
         Op::Gep { vector, indices } => {
             // All lanes should map to the same PTRCAT slot (index 0)
             assert_eq!(indices, &[0, 0, 0, 0], "All lanes should read from the same slot");
-            match vector.op() {
-                Op::PtrCat { sources } => {
-                    // Single scalar pointer — no CAST to vec ptr
-                    assert_eq!(sources.len(), 1, "Broadcast should produce single scalar source");
-                    assert!(
-                        !matches!(sources[0].op(), Op::Cast { .. }),
-                        "Broadcast source should NOT be CAST to vector pointer"
-                    );
-                }
-                // Single source PTRCAT may be unwrapped
-                _ => {}
+            if let Op::PtrCat { sources } = vector.op() {
+                // Single scalar pointer — no CAST to vec ptr
+                assert_eq!(sources.len(), 1, "Broadcast should produce single scalar source");
+                assert!(
+                    !matches!(sources[0].op(), Op::Cast { .. }),
+                    "Broadcast source should NOT be CAST to vector pointer"
+                );
             }
         }
         // If PTRCAT is unwrapped directly (single source)
@@ -563,13 +559,10 @@ fn test_expand_partial_broadcast() {
         Op::Gep { vector, indices } => {
             // Lanes 0,2 → offset 0 (slot 0), lanes 1,3 → offset 1 (slot 1)
             assert_eq!(indices, &[0, 1, 0, 1], "GEP should map lanes to their offset slots");
-            match vector.op() {
-                Op::PtrCat { sources } => {
-                    // Single vec2 pointer (offsets 0,1 are consecutive)
-                    assert_eq!(sources.len(), 1, "Consecutive offsets should form single group");
-                    assert!(matches!(sources[0].op(), Op::Cast { .. }), "vec2 source should be CAST to vector pointer");
-                }
-                _ => {}
+            if let Op::PtrCat { sources } = vector.op() {
+                // Single vec2 pointer (offsets 0,1 are consecutive)
+                assert_eq!(sources.len(), 1, "Consecutive offsets should form single group");
+                assert!(matches!(sources[0].op(), Op::Cast { .. }), "vec2 source should be CAST to vector pointer");
             }
         }
         Op::PtrCat { sources } => {
@@ -594,13 +587,10 @@ fn test_expand_mixed_broadcast() {
         Op::Gep { vector, indices } => {
             // Lanes 0,2 → offset 0 (slot 0), lane 1 → offset 1 (slot 1), lane 3 → offset 2 (slot 2)
             assert_eq!(indices, &[0, 1, 0, 2], "GEP should map lanes to their offset slots");
-            match vector.op() {
-                Op::PtrCat { sources } => {
-                    // Single vec3 pointer (offsets 0,1,2 are consecutive)
-                    assert_eq!(sources.len(), 1, "Consecutive offsets should form single group");
-                    assert!(matches!(sources[0].op(), Op::Cast { .. }), "vec3 source should be CAST to vector pointer");
-                }
-                _ => {}
+            if let Op::PtrCat { sources } = vector.op() {
+                // Single vec3 pointer (offsets 0,1,2 are consecutive)
+                assert_eq!(sources.len(), 1, "Consecutive offsets should form single group");
+                assert!(matches!(sources[0].op(), Op::Cast { .. }), "vec3 source should be CAST to vector pointer");
             }
         }
         Op::PtrCat { sources } => {

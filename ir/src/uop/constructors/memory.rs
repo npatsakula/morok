@@ -287,8 +287,9 @@ impl UOp {
     /// Define register memory (void pointer - type determined by usage).
     pub fn define_reg(size: usize) -> Arc<Self> {
         use morok_dtype::AddrSpace;
+        let id = crate::uop::hash_consing::next_unique_id();
         let ptr_dtype = DType::Void.ptr(Some(size), AddrSpace::Reg);
-        Self::new(Op::DefineReg { size }, ptr_dtype)
+        Self::new(Op::DefineReg { size, id }, ptr_dtype)
     }
 
     /// Define register memory with explicit element type.
@@ -297,8 +298,9 @@ impl UOp {
     /// The element_dtype specifies the type of each element (e.g., Float32 for a float accumulator).
     pub fn define_reg_typed(size: usize, element_dtype: DType) -> Arc<Self> {
         use morok_dtype::AddrSpace;
+        let id = crate::uop::hash_consing::next_unique_id();
         let ptr_dtype =
             DType::Ptr { base: Box::new(element_dtype), addrspace: AddrSpace::Reg, size: Some(size), vcount: 1 };
-        Self::new(Op::DefineReg { size }, ptr_dtype)
+        Self::new(Op::DefineReg { size, id }, ptr_dtype)
     }
 }

@@ -678,7 +678,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         Op::Bind { value, .. } => value.shape()?.cloned(),
 
-        Op::DefineReg { size } => Some(smallvec![SInt::from(*size)]),
+        Op::DefineReg { size, .. } => Some(smallvec![SInt::from(*size)]),
 
         // =====================================================================
         // Advanced operations

@@ -214,6 +214,9 @@ pub enum Op {
     },
     DefineReg {
         size: usize,
+        /// Unique accumulator ID for disambiguation.
+        /// Without this, two same-dtype reduces would share one DefineReg via hash consing.
+        id: usize,
     },
 
     // Advanced operations (12 variants)

@@ -22,6 +22,8 @@ fn matmul_flops(m: usize, k: usize, n: usize) -> u64 {
 }
 
 fn bench_matmul(c: &mut Criterion) {
+    // tracing_subscriber::fmt::init();
+
     let mut group = c.benchmark_group("matmul_optimization");
     let mut executor = morok_runtime::global_executor();
 
@@ -30,7 +32,7 @@ fn bench_matmul(c: &mut Criterion) {
         .strategy(OptStrategy::Heuristic)
         .heuristics(HeuristicsConfig::builder().thread_count(4).build())
         .build();
-    const BEAM_WIDTH: usize = 3;
+    const BEAM_WIDTH: usize = 4;
     let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build();
 
     for size in [512] {
@@ -50,8 +52,10 @@ fn bench_matmul(c: &mut Criterion) {
             eprintln!("\n=== HEURISTIC (size={}) ===", size);
             eprintln!("Kernel count: {}", plan_h.kernels().count());
             eprintln!("UOp tree:\n{}", result_h.uop().tree());
-            for (i, kernel) in plan_h.kernels().enumerate() {
-                eprintln!("  Kernel {}: {}", i, kernel.entry_point);
+            for (i, kernel) in plan_h.prepared_kernels().iter().enumerate() {
+                eprintln!("UOp tree:\n{}", kernel.ast.tree());
+                eprintln!("  Kernel {}: {}", i, kernel.kernel.entry_point);
+                eprintln!("{}", kernel.kernel.code);
             }
 
             group.bench_with_input(BenchmarkId::new("heuristic", size), &size, |bencher, _| {
@@ -73,21 +77,10 @@ fn bench_matmul(c: &mut Criterion) {
                 bencher.iter(|| plan_b.execute(&mut executor).expect("execute should succeed"));
             });
         }
-
-        // Cleanup between sizes.
-        // With weak references in both UOp cache and tensor registry (Tinygrad-aligned),
-        // entries are auto-cleaned when dropped. We still clean up dead refs for hygiene.
-        morok_ir::uop::gc_dead_refs();
-        morok_tensor::tensor_registry::gc_dead_refs();
-        let live_ids = morok_ir::uop::live_uop_ids();
-        morok_runtime::kernel_cache::gc_unused_kernels(&live_ids);
     }
 
     group.finish();
 }
-
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 criterion_group!(benches, bench_matmul);
 criterion_main!(benches);
