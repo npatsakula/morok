@@ -1,0 +1,22 @@
+[package]
+name = "morok-onnx"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+morok-tensor = { path = "../tensor" }
+morok-ir = { path = "../ir" }
+morok-dtype = { path = "../dtype" }
+prost = "0.13"
+snafu = "0.8"
+tracing = "0.1"
+smallvec = "1.15"
+bytemuck = "1.21"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+proptest = "1.6"
+test-case = "3.3.1"
