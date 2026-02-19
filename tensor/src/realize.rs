@@ -48,6 +48,7 @@ use crate::{
 };
 use morok_device::{Buffer, device::Device};
 use morok_dtype::DType;
+use morok_ir::pattern::is_any_const;
 use morok_ir::{AxisId, DeviceSpec, Op, SInt, UOp};
 use morok_runtime::{
     ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, ParallelGroup,
@@ -82,6 +83,14 @@ impl Tensor {
     ///
     /// Returns error if preparation or execution fails.
     pub fn realize(self) -> Result<Self> {
+        // Check if this is a pure constant tensor (no computation needed).
+        // Following Tinygrad's approach: CONST/VCONST are "always contiguous" and don't need scheduling.
+        // A pure constant produces 0 kernels when scheduled, so we return early.
+        // Call `.contiguous().realize()` to force materialization into a buffer.
+        if is_any_const(&self.uop()) {
+            return Ok(self);
+        }
+
         let uop = self.uop();
         let input_buffer_ids: std::collections::HashSet<u64> = collect_input_buffers(&uop).keys().copied().collect();
 

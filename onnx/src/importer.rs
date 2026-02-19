@@ -578,7 +578,7 @@ mod tests {
         use std::fs::File;
         use std::io::BufReader;
 
-        let file = File::open("silero_vad_half.onnx").expect("silero_vad_half.onnx not found");
+        let file = File::open("audio.onnx").expect("audio.onnx not found");
         let mut reader = BufReader::new(file);
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
@@ -593,12 +593,18 @@ mod tests {
         println!("Num initializers: {}", graph.initializers.len());
         println!("Num nodes: {}", graph.nodes.len());
 
-        // Print node details
+        // Collect operator usage stats
+        let mut op_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for node in &graph.nodes {
-            println!("  Node: {} -> {:?}", node.op_type, node.output);
-            for attr in &node.attribute {
-                println!("    attr: {} (type={:?})", attr.name, attr.r#type);
-            }
+            *op_counts.entry(node.op_type.as_str()).or_insert(0) += 1;
+        }
+
+        let mut ops: Vec<_> = op_counts.into_iter().collect();
+        ops.sort_by(|a, b| b.1.cmp(&a.1));
+
+        println!("\nOperators (sorted by frequency):");
+        for (op, count) in ops {
+            println!("  {:4}x  {}", count, op);
         }
     }
 }

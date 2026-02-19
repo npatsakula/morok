@@ -3,8 +3,9 @@ use snafu::ResultExt;
 use std::sync::Arc;
 
 use morok_device::{Buffer, registry};
+use morok_dtype::DType;
 use morok_dtype::ext::HasDType;
-use morok_ir::{DeviceSpec, SInt, UOp, shape::Shape};
+use morok_ir::{ConstValue, DeviceSpec, SInt, UOp, shape::Shape};
 
 pub mod error;
 use error::*;
@@ -237,6 +238,47 @@ impl Tensor {
         Self::with_buffer(entry, buffer_arc)
     }
 
+    // === Constant Constructors ===
+
+    /// Create a scalar constant tensor.
+    ///
+    /// Creates a 0-dimensional tensor containing a single constant value.
+    /// The constant is embedded directly in the IR and does not allocate
+    /// a buffer until realized (if needed).
+    ///
+    /// # Arguments
+    /// * `value` - The constant value (will be converted to ConstValue)
+    /// * `dtype` - The data type for the tensor
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Float constant
+    /// let pi = Tensor::const_(3.14159, DType::Float32);
+    ///
+    /// // Integer constant
+    /// let forty_two = Tensor::const_(42i64, DType::Int64);
+    /// ```
+    pub fn const_<T: Into<ConstValue>>(value: T, dtype: DType) -> Self {
+        let const_val = value.into();
+        let uop = UOp::const_(dtype, const_val);
+        Self::new(uop)
+    }
+
+    /// Create a scalar constant tensor with dtype auto-inferred from value.
+    ///
+    /// Convenience method that infers dtype from the Rust type.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let f = Tensor::from_const(3.14f32);  // DType::Float32
+    /// let i = Tensor::from_const(42i32);    // DType::Int32
+    /// let b = Tensor::from_const(true);     // DType::Bool
+    /// ```
+    pub fn from_const<T: Into<ConstValue> + HasDType>(value: T) -> Self {
+        let dtype = T::DTYPE;
+        Self::const_(value, dtype)
+    }
+
     /// Get a reference to the underlying buffer.
     ///
     /// Tensors own their buffers via RAII. Input tensors get their buffer
@@ -320,8 +362,15 @@ impl Tensor {
     pub fn to_ndarray<T: HasDType + Default + Clone>(&self) -> Result<ndarray::ArrayD<T>> {
         use ndarray::{ArrayD, IxDyn};
 
-        // Get buffer
-        let buffer = self.buffer().ok_or(Error::NoBuffer)?;
+        // If no buffer, materialize the tensor.
+        // Following Tinygrad's approach: `.numpy()` calls `.contiguous().realize()` first.
+        let buffer = match self.buffer() {
+            Some(buf) => buf,
+            None => {
+                let realized = self.clone().contiguous().realize()?;
+                realized.buffer().ok_or(Error::NoBuffer)?
+            }
+        };
 
         // Validate dtype matches
         if buffer.dtype() != T::DTYPE {
@@ -354,6 +403,25 @@ impl Tensor {
     /// to point to the materialized buffer.
     pub(crate) fn set_uop(&self, uop: Arc<UOp>) {
         *self.entry.uop.write() = uop;
+    }
+
+    /// Ensure this tensor has contiguous memory layout.
+    ///
+    /// Creates a CONTIGUOUS UOp that forces materialization when realized.
+    /// Following Tinygrad's approach, calling `.contiguous().realize()` on
+    /// a pure constant tensor will create an actual buffer.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Force a constant to be materialized
+    /// let c = Tensor::const_(5.0f32, DType::Float32);
+    /// let realized = c.contiguous().realize()?;
+    /// assert!(realized.buffer().is_some());
+    /// ```
+    pub fn contiguous(&self) -> Self {
+        let uop = self.uop();
+        let contiguous_uop = uop.contiguous();
+        Self::new(contiguous_uop)
     }
 }
 

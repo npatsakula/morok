@@ -158,6 +158,11 @@ pub fn get_attr_floats(node: &NodeProto, name: &str) -> Vec<f32> {
     get_attr(node, name).map(|a| a.floats.clone()).unwrap_or_default()
 }
 
+/// Get tensor attribute value (reference).
+pub fn get_attr_tensor<'a>(node: &'a NodeProto, name: &str) -> Option<&'a TensorProto> {
+    get_attr(node, name).and_then(|a| a.t.as_ref())
+}
+
 /// ONNX opset version (domain, version).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OpSetId {
@@ -206,11 +211,19 @@ impl OpRegistry {
             "Mul" => self.op_mul(inputs).map(|t| vec![t]),
             "Div" => self.op_div(inputs).map(|t| vec![t]),
             "Neg" => self.op_neg(inputs).map(|t| vec![t]),
+            "Pow" => self.op_pow(inputs).map(|t| vec![t]),
+
+            // Math ops (single output)
+            "Sqrt" => self.op_sqrt(inputs).map(|t| vec![t]),
 
             // Activation ops (single Output)
             "Relu" => self.op_relu(inputs).map(|t| vec![t]),
             "Sigmoid" => self.op_sigmoid(inputs).map(|t| vec![t]),
             "Tanh" => self.op_tanh(inputs).map(|t| vec![t]),
+            "Softmax" => self.op_softmax(inputs, node).map(|t| vec![t]),
+
+            // Type ops (single output)
+            "Cast" => self.op_cast(inputs, node).map(|t| vec![t]),
 
             // Shape ops (single output)
             "Reshape" => self.op_reshape(inputs, node).map(|t| vec![t]),
@@ -228,8 +241,14 @@ impl OpRegistry {
             "MatMul" => self.op_matmul(inputs).map(|t| vec![t]),
             "Gemm" => self.op_gemm(inputs, node).map(|t| vec![t]),
 
+            // Conditional ops (single output)
+            "Clip" => self.op_clip(inputs, node).map(|t| vec![t]),
+
             // Identity (single output)
             "Identity" => Ok(vec![inputs[0].clone()]),
+
+            // Constant (no inputs, creates tensor from attributes)
+            "Constant" => self.op_constant(node).map(|t| vec![t]),
 
             _ => UnsupportedOpSnafu { op: op_type.to_string(), domain: domain.to_string() }.fail(),
         }
@@ -299,18 +318,45 @@ impl OpRegistry {
         }
     }
 
-    fn op_squeeze(&self, _inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        let axes = get_attr_ints(node, "axes");
+    fn op_squeeze(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
         // Squeeze removes dimensions of size 1
-        // For simplicity, reshape to remove the specified axes
-        // This is a simplified implementation
-        Err(Error::IrConstruction { details: format!("Squeeze with axes {:?} not yet implemented", axes) })
+        // axes attribute specifies which dims to squeeze (optional)
+        let axes = get_attr_ints(node, "axes");
+
+        if axes.is_empty() {
+            // No axes specified - squeeze all size-1 dimensions
+            inputs[0].try_squeeze(None).map_err(|e| e.into())
+        } else if axes.len() == 1 {
+            // Single axis
+            inputs[0].try_squeeze(Some(axes[0] as isize)).map_err(|e| e.into())
+        } else {
+            // Multiple axes - squeeze them one by one (in reverse order to maintain indices)
+            let mut result = inputs[0].clone();
+            let mut sorted_axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
+            sorted_axes.sort_by(|a, b| b.cmp(a)); // Sort descending
+            for axis in sorted_axes {
+                result = result.try_squeeze(Some(axis)).map_err(Error::from)?;
+            }
+            Ok(result)
+        }
     }
 
-    fn op_unsqueeze(&self, _inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        let axes = get_attr_ints(node, "axes");
+    fn op_unsqueeze(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
         // Unsqueeze adds dimensions of size 1 at specified positions
-        Err(Error::IrConstruction { details: format!("Unsqueeze with axes {:?} not yet implemented", axes) })
+        let axes = get_attr_ints(node, "axes");
+
+        if axes.is_empty() {
+            return Err(Error::IrConstruction { details: "Unsqueeze requires axes attribute".to_string() });
+        }
+
+        let mut result = inputs[0].clone();
+        // Sort axes ascending to insert dimensions in correct order
+        let mut sorted_axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
+        sorted_axes.sort();
+        for axis in sorted_axes {
+            result = result.try_unsqueeze(axis).map_err(Error::from)?;
+        }
+        Ok(result)
     }
 
     fn op_flatten(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
@@ -391,6 +437,102 @@ impl OpRegistry {
         }
 
         Ok(result)
+    }
+
+    // === Math Operations ===
+
+    fn op_pow(&self, inputs: &[Tensor]) -> Result<Tensor> {
+        inputs[0].try_pow(&inputs[1]).map_err(|e| e.into())
+    }
+
+    fn op_sqrt(&self, inputs: &[Tensor]) -> Result<Tensor> {
+        inputs[0].try_sqrt().map_err(|e| e.into())
+    }
+
+    // === Type Operations ===
+
+    fn op_cast(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
+        let to = get_attr_int(node, "to", 1); // Default to FLOAT
+        let dtype = convert_onnx_dtype(to as i32)?;
+        inputs[0].cast(dtype).map_err(|e| e.into())
+    }
+
+    // === Activation Operations (additional) ===
+
+    fn op_softmax(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
+        let axis = get_attr_int(node, "axis", -1) as isize;
+        inputs[0].softmax(axis).map_err(|e| e.into())
+    }
+
+    // === Conditional Operations ===
+
+    fn op_clip(&self, inputs: &[Tensor], _node: &NodeProto) -> Result<Tensor> {
+        // Clip: clip(input, min, max)
+        // min and max can be from inputs (indices 1 and 2)
+        let min = inputs.get(1);
+        let max = inputs.get(2);
+
+        // Use the builder pattern with maybe_min/maybe_max which accept Option
+        inputs[0].clamp().maybe_min(min).maybe_max(max).call().map_err(|e| e.into())
+    }
+
+    // === Constant Operations ===
+
+    /// Creates a constant tensor from ONNX Constant node attributes.
+    ///
+    /// The ONNX Constant operator supports multiple attribute formats:
+    /// - `value`: A TensorProto containing the full tensor data
+    /// - `value_float`: A single float scalar (f32)
+    /// - `value_floats`: A 1D tensor of floats (Vec<f32>)
+    /// - `value_int`: A single int64 scalar (i64)
+    /// - `value_ints`: A 1D tensor of int64s (Vec<i64>)
+    ///
+    /// For the `value` attribute, we reuse `tensor_from_proto` which handles
+    /// raw data and typed data fields properly.
+    ///
+    /// For scalar attributes, we use `Tensor::const_` which embeds constants
+    /// directly in the IR. Following Tinygrad's approach, pure constants don't
+    /// allocate buffers until `.contiguous().realize()` is called.
+    ///
+    /// For array attributes, we use `Tensor::from_slice` which creates input
+    /// buffers with proper tensor shapes (not vector dtypes). This matches
+    /// Tinygrad's `_frompy` approach for list/tuple inputs.
+    ///
+    /// See: <https://onnx.ai/onnx/operators/onnx__Constant.html>
+    fn op_constant(&self, node: &NodeProto) -> Result<Tensor> {
+        // Check for value attribute (full TensorProto)
+        if let Some(tensor_proto) = get_attr_tensor(node, "value") {
+            return tensor_from_proto(tensor_proto);
+        }
+
+        // Check for value_float (scalar float)
+        if let Some(attr) = get_attr(node, "value_float") {
+            let value = attr.f as f64; // ConstValue::Float is f64
+            return Ok(Tensor::const_(value, DType::Scalar(ScalarDType::Float32)));
+        }
+
+        // Check for value_floats (1D float array) - use from_slice for proper tensor shape
+        let float_values = get_attr_floats(node, "value_floats");
+        if !float_values.is_empty() {
+            return Ok(Tensor::from_slice(&float_values));
+        }
+
+        // Check for value_int (scalar int)
+        if let Some(attr) = get_attr(node, "value_int") {
+            let value = attr.i;
+            return Ok(Tensor::const_(value, DType::Scalar(ScalarDType::Int64)));
+        }
+
+        // Check for value_ints (1D int array) - use from_slice for proper tensor shape
+        let int_values = get_attr_ints(node, "value_ints");
+        if !int_values.is_empty() {
+            return Ok(Tensor::from_slice(&int_values));
+        }
+
+        // No supported constant attribute found
+        Err(Error::IrConstruction {
+            details: "Constant node has no supported value attribute (value, value_float, value_floats, value_int, value_ints)".to_string(),
+        })
     }
 }
 
@@ -539,5 +681,98 @@ mod tests {
         let result = registry.dispatch("ReduceSum", "", &[x], &node);
         let result = result.unwrap().realize().unwrap();
         assert!(result.buffer().is_some());
+    }
+
+    // === Constant Operator Tests ===
+
+    #[test]
+    fn test_constant_value_float() {
+        let registry = OpRegistry::new();
+        let mut node = NodeProto::default();
+        node.op_type = "Constant".to_string();
+
+        let mut attr = AttributeProto::default();
+        attr.name = "value_float".to_string();
+        attr.f = 3.14;
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        // Scalar constants need .contiguous() to force materialization (Tinygrad approach)
+        let realized = result.contiguous().realize().unwrap();
+        assert!(realized.buffer().is_some());
+    }
+
+    #[test]
+    fn test_constant_value_floats() {
+        let registry = OpRegistry::new();
+        let mut node = NodeProto::default();
+        node.op_type = "Constant".to_string();
+
+        let mut attr = AttributeProto::default();
+        attr.name = "value_floats".to_string();
+        attr.floats = vec![1.0, 2.0, 3.0];
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        // from_slice creates input buffer, so realize() works directly
+        let realized = result.realize().unwrap();
+        assert!(realized.buffer().is_some());
+    }
+
+    #[test]
+    fn test_constant_value_int() {
+        let registry = OpRegistry::new();
+        let mut node = NodeProto::default();
+        node.op_type = "Constant".to_string();
+
+        let mut attr = AttributeProto::default();
+        attr.name = "value_int".to_string();
+        attr.i = 42;
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        // Scalar constants need .contiguous() to force materialization (Tinygrad approach)
+        let realized = result.contiguous().realize().unwrap();
+        assert!(realized.buffer().is_some());
+    }
+
+    #[test]
+    fn test_constant_value_ints() {
+        let registry = OpRegistry::new();
+        let mut node = NodeProto::default();
+        node.op_type = "Constant".to_string();
+
+        let mut attr = AttributeProto::default();
+        attr.name = "value_ints".to_string();
+        attr.ints = vec![0, 1, 2, 3];
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        // from_slice creates input buffer, so realize() works directly
+        let realized = result.realize().unwrap();
+        assert!(realized.buffer().is_some());
+    }
+
+    #[test]
+    fn test_constant_value_tensor() {
+        let registry = OpRegistry::new();
+        let mut node = NodeProto::default();
+        node.op_type = "Constant".to_string();
+
+        // Create a TensorProto for the value attribute
+        let mut tensor_proto = TensorProto::default();
+        tensor_proto.data_type = 1; // FLOAT
+        tensor_proto.dims = vec![2, 2];
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        tensor_proto.raw_data = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let mut attr = AttributeProto::default();
+        attr.name = "value".to_string();
+        attr.t = Some(tensor_proto);
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Constant", "", &[], &node).unwrap();
+        let realized = result.realize().unwrap();
+        assert!(realized.buffer().is_some());
     }
 }
