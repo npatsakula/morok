@@ -239,6 +239,164 @@ impl Tensor {
         self.try_reshape(&[-1])
     }
 
+    /// Pad tensor with zeros (or other padding value).
+    ///
+    /// Each tuple in `padding` specifies (begin, end) padding for a dimension.
+    /// Use 0 for no padding on that side.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);  // Shape [3]
+    /// let padded = t.try_pad(&[(1, 2)])?;  // Shape [6]: [0, 1, 2, 3, 0, 0]
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Padding values are symbolic (not concrete)
+    /// - Number of padding pairs doesn't match dimensions
+    #[track_caller]
+    pub fn try_pad(&self, padding: &[(isize, isize)]) -> Result<Tensor> {
+        let shape = self.shape()?;
+
+        // Empty padding (scalar) → identity
+        if padding.is_empty() {
+            return Ok(self.clone());
+        }
+
+        // Convert to SInt and validate
+        snafu::ensure!(
+            padding.len() == shape.len(),
+            ShapeMismatchSnafu {
+                context: "pad",
+                expected: format!("{} dimensions", shape.len()),
+                actual: format!("{} padding pairs", padding.len())
+            }
+        );
+
+        let padding_sint: Vec<(SInt, SInt)> =
+            padding.iter().map(|(begin, end)| (SInt::Const(*begin as usize), SInt::Const(*end as usize))).collect();
+
+        self.uop().try_pad(&padding_sint).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+    }
+
+    /// Concatenate tensors along an axis.
+    ///
+    /// All tensors must have the same shape except in the concatenating dimension.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[3]).unwrap();
+    /// let b = Tensor::from_slice(&[4.0f32, 5.0]).try_reshape(&[2]).unwrap();
+    /// let c = Tensor::cat(&[&a, &b], 0)?;  // Shape [5]: [1, 2, 3, 4, 5]
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Tensors have different number of dimensions
+    /// - Non-concat dimensions don't match
+    #[track_caller]
+    pub fn cat(tensors: &[&Tensor], dim: isize) -> Result<Tensor> {
+        if tensors.is_empty() {
+            return Err(IrConstructionSnafu { details: "cat requires at least one tensor".to_string() }.build());
+        }
+
+        let first = tensors[0];
+        let first_shape = first.shape()?;
+        let ndim = first_shape.len();
+        let dim = Self::normalize_axis(dim, ndim)?;
+
+        // Validate all tensors have compatible shapes
+        for (i, t) in tensors.iter().enumerate().skip(1) {
+            let t_shape = t.shape()?;
+            snafu::ensure!(
+                t_shape.len() == ndim,
+                ShapeMismatchSnafu {
+                    context: "cat",
+                    expected: format!("{} dimensions", ndim),
+                    actual: format!("{} dimensions for tensor {}", t_shape.len(), i)
+                }
+            );
+            for (d, (s1, s2)) in first_shape.iter().zip(t_shape.iter()).enumerate() {
+                if d != dim {
+                    snafu::ensure!(
+                        s1 == s2,
+                        ShapeMismatchSnafu {
+                            context: format!("cat dimension {}", d),
+                            expected: format!("{:?}", s1),
+                            actual: format!("{:?}", s2)
+                        }
+                    );
+                }
+            }
+        }
+
+        // Compute cumulative sizes along concat dimension
+        let dim_sizes: Vec<usize> = tensors.iter().map(|t| t.shape().unwrap()[dim].as_const().unwrap_or(0)).collect();
+        let total_dim: usize = dim_sizes.iter().sum();
+
+        // Pad each tensor to final size and add
+        let mut cumsum = 0usize;
+        let padded: Vec<Tensor> = tensors
+            .iter()
+            .zip(dim_sizes.iter())
+            .map(|(t, &sz)| {
+                let begin_pad = cumsum;
+                let end_pad = total_dim - cumsum - sz;
+                cumsum += sz;
+
+                let mut padding = vec![(0isize, 0isize); ndim];
+                padding[dim] = (begin_pad as isize, end_pad as isize);
+                t.try_pad(&padding)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Sum all padded tensors
+        let mut result = padded[0].clone();
+        for t in padded.iter().skip(1) {
+            result = result.try_add(t)?;
+        }
+        Ok(result)
+    }
+
+    /// Get the shape of this tensor as a new tensor.
+    ///
+    /// Returns a 1D tensor of int64 containing the shape dimensions.
+    /// This is useful for ONNX Shape operator compatibility.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// let t = Tensor::from_slice(&[1.0f32; 6]).try_reshape(&[2, 3])?;
+    /// let shape_tensor = t.shape_tensor()?;  // Tensor([2, 3]) with dtype int64
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns error if shape is unknown or contains symbolic dimensions.
+    #[track_caller]
+    pub fn shape_tensor(&self) -> Result<Tensor> {
+        let shape = self.shape()?;
+
+        // Extract concrete dimensions
+        let dims: Vec<i64> = shape
+            .iter()
+            .map(|d| {
+                d.as_const()
+                    .map(|v| v as i64)
+                    .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape_tensor".to_string() })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Tensor::from_slice(&dims))
+    }
+
     // =========================================================================
     // Helper Methods
     // =========================================================================

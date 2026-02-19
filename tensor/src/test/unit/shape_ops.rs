@@ -511,3 +511,172 @@ fn test_symbolic_shape_binary_ops() {
     assert_eq!(product_shape.len(), 1);
     assert!(product_shape[0].as_const().is_none()); // Still symbolic
 }
+
+// =========================================================================
+// Pad Tests
+// =========================================================================
+
+#[test]
+fn test_pad_1d() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+
+    // Pad with 1 on left, 2 on right
+    let padded = t.try_pad(&[(1, 2)]).unwrap();
+    assert_eq!(get_shape(&padded), vec![6]);
+}
+
+#[test]
+fn test_pad_2d() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+
+    // Pad each dimension
+    let padded = reshaped.try_pad(&[(1, 1), (0, 2)]).unwrap();
+    assert_eq!(get_shape(&padded), vec![4, 5]);
+}
+
+#[test]
+fn test_pad_no_padding() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+
+    // No padding
+    let padded = t.try_pad(&[(0, 0)]).unwrap();
+    assert_eq!(get_shape(&padded), vec![3]);
+}
+
+#[test]
+fn test_pad_empty_is_identity() {
+    let t = Tensor::from_slice([1.0f32]);
+
+    // Empty padding (scalar case)
+    let padded = t.try_pad(&[]).unwrap();
+    assert_eq!(get_shape(&padded), vec![1]);
+}
+
+#[test]
+fn test_pad_error_dimension_mismatch() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+
+    // Wrong number of padding pairs for 1D tensor
+    let result = t.try_pad(&[(0, 0), (0, 0)]);
+    assert!(result.is_err());
+}
+
+// =========================================================================
+// Cat Tests
+// =========================================================================
+
+#[test]
+fn test_cat_1d() {
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let b = Tensor::from_slice([4.0f32, 5.0]);
+
+    let c = Tensor::cat(&[&a, &b], 0).unwrap();
+    assert_eq!(get_shape(&c), vec![5]);
+}
+
+#[test]
+fn test_cat_2d_dim0() {
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2]).unwrap();
+
+    let c = Tensor::cat(&[&a, &b], 0).unwrap();
+    assert_eq!(get_shape(&c), vec![4, 2]);
+}
+
+#[test]
+fn test_cat_2d_dim1() {
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2]).unwrap();
+
+    let c = Tensor::cat(&[&a, &b], 1).unwrap();
+    assert_eq!(get_shape(&c), vec![2, 4]);
+}
+
+#[test]
+fn test_cat_three_tensors() {
+    let a = Tensor::from_slice([1.0f32]);
+    let b = Tensor::from_slice([2.0f32]);
+    let c = Tensor::from_slice([3.0f32, 4.0]);
+
+    let result = Tensor::cat(&[&a, &b, &c], 0).unwrap();
+    assert_eq!(get_shape(&result), vec![4]);
+}
+
+#[test]
+fn test_cat_negative_axis() {
+    let a = Tensor::from_slice([1.0f32, 2.0]).try_reshape(&[1, 2]).unwrap();
+    let b = Tensor::from_slice([3.0f32, 4.0]).try_reshape(&[1, 2]).unwrap();
+
+    // -1 = last axis
+    let c = Tensor::cat(&[&a, &b], -1).unwrap();
+    assert_eq!(get_shape(&c), vec![1, 4]);
+}
+
+#[test]
+fn test_cat_error_empty() {
+    let result = Tensor::cat(&[], 0);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cat_error_dimension_mismatch() {
+    let a = Tensor::from_slice([1.0f32, 2.0]).try_reshape(&[2]).unwrap();
+    let b = Tensor::from_slice([1.0f32, 2.0]).try_reshape(&[1, 2]).unwrap();
+
+    // Different ranks
+    let result = Tensor::cat(&[&a, &b], 0);
+    assert!(result.is_err());
+}
+
+// =========================================================================
+// Shape Tensor Tests
+// =========================================================================
+
+#[test]
+fn test_shape_tensor_1d() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let shape = t.shape_tensor().unwrap();
+
+    assert_eq!(get_shape(&shape), vec![1]);
+
+    // Verify shape tensor contains [3]
+    let realized = shape.realize().unwrap().to_ndarray::<i64>().unwrap();
+    assert_eq!(realized.shape(), &[1]);
+    assert_eq!(realized[0], 3);
+}
+
+#[test]
+fn test_shape_tensor_2d() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let shape = t.shape_tensor().unwrap();
+
+    assert_eq!(get_shape(&shape), vec![2]);
+
+    // Verify shape tensor contains [2, 3]
+    let realized = shape.realize().unwrap().to_ndarray::<i64>().unwrap();
+    assert_eq!(realized.shape(), &[2]);
+    assert_eq!(realized[0], 2);
+    assert_eq!(realized[1], 3);
+}
+
+#[test]
+fn test_shape_tensor_3d() {
+    let t = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+    let shape = t.shape_tensor().unwrap();
+
+    let realized = shape.realize().unwrap().to_ndarray::<i64>().unwrap();
+    assert_eq!(realized.shape(), &[3]);
+    assert_eq!(realized[0], 2);
+    assert_eq!(realized[1], 3);
+    assert_eq!(realized[2], 4);
+}
+
+#[test]
+fn test_shape_tensor_dtype() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let shape = t.shape_tensor().unwrap();
+
+    // Shape tensor should be int64
+    assert_eq!(shape.uop().dtype(), morok_dtype::DType::Int64);
+}

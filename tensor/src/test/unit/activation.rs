@@ -88,3 +88,94 @@ fn test_silu_alias() {
 
     assert_eq!(y.unwrap().uop().dtype(), DType::Float32);
 }
+
+// =========================================================================
+// Batch Normalization Tests
+// =========================================================================
+
+#[test]
+fn test_batchnorm_basic() {
+    // Create input tensor [2, 3]
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+
+    // Create parameters (each has shape [3] for axis=1)
+    let scale = Tensor::from_slice([1.0f32, 1.0, 1.0]);
+    let bias = Tensor::from_slice([0.0f32, 0.0, 0.0]);
+    let mean = Tensor::from_slice([2.5f32, 3.5, 4.5]);
+
+    // invstd = 1/sqrt(var + eps). For var=[2.25, 2.25, 2.25] and eps=1e-5, invstd ≈ 0.666
+    let invstd = Tensor::from_slice([0.666_666_7f32, 0.666_666_7, 0.666_666_7]);
+
+    let result = x.batchnorm().scale(&scale).bias(&bias).mean(&mean).invstd(&invstd).call().unwrap();
+
+    // Verify dtype preserved
+    assert_eq!(result.uop().dtype(), DType::Float32);
+
+    // Verify shape preserved
+    let uop = result.uop();
+    let shape = uop.shape().unwrap().unwrap();
+    assert_eq!(shape.len(), 2);
+    assert_eq!(shape[0].as_const(), Some(2));
+    assert_eq!(shape[1].as_const(), Some(3));
+}
+
+#[test]
+fn test_batchnorm_no_scale_bias() {
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[3, 1]).unwrap();
+
+    // Without scale/bias (None)
+    let mean = Tensor::from_slice([2.0f32]);
+    let invstd = Tensor::from_slice([1.0f32]);
+
+    let result = x.batchnorm().mean(&mean).invstd(&invstd).call().unwrap();
+
+    assert_eq!(result.uop().dtype(), DType::Float32);
+}
+
+#[test]
+fn test_batchnorm_different_axis() {
+    // Input shape [2, 3, 4] - normalize over axis 0
+    // For axis=0, mean/scale/bias need shape [2] (size of dim 0)
+    let x = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+
+    let scale = Tensor::from_slice([1.0f32, 1.0]);
+    let bias = Tensor::from_slice([0.0f32, 0.0]);
+    let mean = Tensor::from_slice([0.5f32, 0.5]);
+    let invstd = Tensor::from_slice([1.0f32, 1.0]);
+
+    let result = x
+        .batchnorm()
+        .scale(&scale)
+        .bias(&bias)
+        .mean(&mean)
+        .invstd(&invstd)
+        .axis(reduce::AxisSpec::Single(0))
+        .call()
+        .unwrap();
+
+    // Shape should be preserved
+    let uop = result.uop();
+    let shape = uop.shape().unwrap().unwrap();
+    assert_eq!(shape.len(), 3);
+}
+
+#[test]
+fn test_batchnorm_4d() {
+    // Input shape [2, 3, 4, 5] - typical CNN shape
+    let x = Tensor::from_slice([1.0f32; 120]).try_reshape(&[2, 3, 4, 5]).unwrap();
+
+    // BatchNorm2d normalizes over channels (axis=1)
+    let scale = Tensor::from_slice([1.0f32, 1.0, 1.0]);
+    let bias = Tensor::from_slice([0.0f32, 0.0, 0.0]);
+    let mean = Tensor::from_slice([0.5f32, 0.5, 0.5]);
+    let invstd = Tensor::from_slice([1.0f32, 1.0, 1.0]);
+
+    let result = x.batchnorm().scale(&scale).bias(&bias).mean(&mean).invstd(&invstd).call().unwrap();
+
+    let uop = result.uop();
+    let shape = uop.shape().unwrap().unwrap();
+    assert_eq!(shape[0].as_const(), Some(2));
+    assert_eq!(shape[1].as_const(), Some(3));
+    assert_eq!(shape[2].as_const(), Some(4));
+    assert_eq!(shape[3].as_const(), Some(5));
+}

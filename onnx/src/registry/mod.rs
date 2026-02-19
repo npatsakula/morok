@@ -232,6 +232,8 @@ impl OpRegistry {
             "Unsqueeze" => self.op_unsqueeze(inputs, node).map(|t| vec![t]),
             "Flatten" => self.op_flatten(inputs, node).map(|t| vec![t]),
             "Concat" => self.op_concat(inputs, node).map(|t| vec![t]),
+            "Shape" => self.op_shape(inputs, node).map(|t| vec![t]),
+            "Gather" => self.op_gather(inputs, node).map(|t| vec![t]),
 
             // Reduction ops (single output)
             "ReduceMean" => self.op_reduce_mean(inputs, node).map(|t| vec![t]),
@@ -240,6 +242,7 @@ impl OpRegistry {
             // NN ops (single output)
             "MatMul" => self.op_matmul(inputs).map(|t| vec![t]),
             "Gemm" => self.op_gemm(inputs, node).map(|t| vec![t]),
+            "BatchNormalization" => self.op_batch_norm(inputs, node).map(|t| vec![t]),
 
             // Conditional ops (single output)
             "Clip" => self.op_clip(inputs, node).map(|t| vec![t]),
@@ -367,8 +370,25 @@ impl OpRegistry {
         inputs[0].try_reshape(&shape).map_err(|e| e.into())
     }
 
-    fn op_concat(&self, _inputs: &[Tensor], _node: &NodeProto) -> Result<Tensor> {
-        Err(Error::IrConstruction { details: "Concat not yet implemented".to_string() })
+    fn op_concat(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
+        let axis = get_attr_int(node, "axis", 0) as isize;
+        Tensor::cat(&inputs.iter().collect::<Vec<_>>(), axis).map_err(|e| e.into())
+    }
+
+    fn op_shape(&self, inputs: &[Tensor], _node: &NodeProto) -> Result<Tensor> {
+        // ONNX Shape: returns shape as 1D int64 tensor
+        // TODO: Support start/end attributes for slicing
+        inputs[0].shape_tensor().map_err(|e| e.into())
+    }
+
+    fn op_gather(&self, _inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
+        // ONNX Gather: gather elements along an axis
+        // For now, implement simple 0-axis gather
+        let axis = get_attr_int(node, "axis", 0) as isize;
+
+        // This is a simplified implementation
+        // Full implementation would need tensor indexing support
+        Err(Error::IrConstruction { details: format!("Gather not yet fully implemented (axis={})", axis) })
     }
 
     // === Reduction Operations ===
@@ -437,6 +457,25 @@ impl OpRegistry {
         }
 
         Ok(result)
+    }
+
+    fn op_batch_norm(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
+        // ONNX BatchNormalization: Y = scale * (X - mean) / sqrt(var + epsilon) + bias
+        // Inputs: X, scale, bias, mean, var
+        let x = &inputs[0];
+        let scale = &inputs[1];
+        let bias = &inputs[2];
+        let mean = &inputs[3];
+        let var = &inputs[4];
+        let epsilon = get_attr_float(node, "epsilon", 1e-5);
+
+        // Compute invstd = 1 / sqrt(var + epsilon)
+        let epsilon_tensor = Tensor::from_slice([epsilon]);
+        let var_plus_eps = var.try_add(&epsilon_tensor).map_err(|e| crate::Error::from(e))?;
+        let invstd = var_plus_eps.try_rsqrt().map_err(|e| crate::Error::from(e))?;
+
+        // Use Tensor::batchnorm
+        x.batchnorm().scale(scale).bias(bias).mean(mean).invstd(&invstd).call().map_err(|e| e.into())
     }
 
     // === Math Operations ===

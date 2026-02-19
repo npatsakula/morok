@@ -3,11 +3,13 @@
 //! This module provides common activation functions used in deep learning,
 //! including relu, sigmoid, tanh, softmax, and their variants.
 
+use bon::bon;
 use morok_ir::{ConstValue, UOp};
 use snafu::ResultExt;
 
 use crate::{Result, Tensor, error::UOpSnafu, reduce::AxisSpec};
 
+#[bon]
 impl Tensor {
     /// Helper to broadcast a scalar constant to match this tensor's shape.
     ///
@@ -233,5 +235,81 @@ impl Tensor {
     /// Alias for `swish` (matches PyTorch naming).
     pub fn silu(&self) -> Result<Self> {
         self.swish()
+    }
+
+    /// Batch Normalization.
+    ///
+    /// Applies: `y = scale * (x - mean) * invstd + bias`
+    /// where `invstd = 1 / sqrt(var + epsilon)`
+    ///
+    /// This is the inference mode batchnorm (no running stats update).
+    /// The caller provides pre-computed mean and inverse standard deviation.
+    ///
+    /// # Arguments
+    /// * `scale` - Gamma/weight parameter (optional, defaults to 1)
+    /// * `bias` - Beta parameter (optional, defaults to 0)
+    /// * `mean` - Running mean
+    /// * `invstd` - Inverse standard deviation (1 / sqrt(var + eps))
+    /// * `axis` - Axis/axes to normalize over (default: 1 for NCHW)
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let x = Tensor::randn(&[8, 4, 16, 16]);
+    /// let mean = x.mean(AxisSpec::Multiple(vec![0, 2, 3]))?;
+    /// let var = x.var(AxisSpec::Multiple(vec![0, 2, 3]))?;
+    /// let eps = Tensor::from_slice([1e-5]);
+    /// let invstd = var.try_add(&eps)?.try_rsqrt()?;
+    /// let normalized = x.batchnorm().mean(&mean).invstd(&invstd).call()?;
+    /// ```
+    #[builder]
+    pub fn batchnorm(
+        &self,
+        scale: Option<&Tensor>,
+        bias: Option<&Tensor>,
+        mean: &Tensor,
+        invstd: &Tensor,
+        #[builder(default = AxisSpec::Single(1))] axis: AxisSpec,
+    ) -> Result<Self> {
+        let shape = self.shape()?;
+
+        // Build broadcast shape: keep axis dimensions, others become 1
+        let axis_indices: std::collections::HashSet<usize> = match &axis {
+            AxisSpec::All => (0..shape.len()).collect(),
+            AxisSpec::Single(a) => {
+                let a = if *a < 0 { (shape.len() as isize + *a) as usize } else { *a as usize };
+                std::iter::once(a).collect()
+            }
+            AxisSpec::Multiple(axes) => {
+                axes.iter().map(|&a| if a < 0 { (shape.len() as isize + a) as usize } else { a as usize }).collect()
+            }
+        };
+
+        let broadcast_shape: Vec<isize> = shape
+            .iter()
+            .enumerate()
+            .map(|(i, dim)| if axis_indices.contains(&i) { dim.as_const().unwrap_or(1) as isize } else { 1 })
+            .collect();
+
+        // x - mean (reshape mean to broadcast shape, like Tinygrad does)
+        let mean_reshaped = mean.try_reshape(&broadcast_shape)?;
+        let x_centered = self.try_sub(&mean_reshaped)?;
+
+        // (x - mean) * invstd
+        let invstd_reshaped = invstd.try_reshape(&broadcast_shape)?;
+        let mut result = x_centered.try_mul(&invstd_reshaped)?;
+
+        // scale * (x - mean) * invstd
+        if let Some(w) = scale {
+            let w_reshaped = w.try_reshape(&broadcast_shape)?;
+            result = result.try_mul(&w_reshaped)?;
+        }
+
+        // scale * (x - mean) * invstd + bias
+        if let Some(b) = bias {
+            let b_reshaped = b.try_reshape(&broadcast_shape)?;
+            result = result.try_add(&b_reshaped)?;
+        }
+
+        Ok(result)
     }
 }

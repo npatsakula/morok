@@ -140,6 +140,12 @@ pub enum Error {
     #[snafu(display("Tensor has no shape"))]
     NoShape,
 
+    #[snafu(display("Shape mismatch for '{context}': expected {expected}, got {actual}"))]
+    ShapeMismatch { context: String, expected: String, actual: String },
+
+    #[snafu(display("IR construction error: {details}"))]
+    IrConstruction { details: String },
+
     #[snafu(display("Type mismatch: expected {expected:?}, got {actual:?}"))]
     TypeMismatch { expected: morok_dtype::DType, actual: morok_dtype::DType },
 
