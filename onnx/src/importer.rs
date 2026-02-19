@@ -285,17 +285,22 @@ impl OnnxImporter {
         let domain = &node.domain;
         let node_name = if node.name.is_empty() { "unnamed" } else { &node.name };
 
-        // Collect input Tensors, handling optional inputs (empty strings)
-        let mut inputs: Vec<Tensor> = Vec::new();
+        // Collect input Tensors, preserving positional indices for optional inputs.
+        // Empty input names in ONNX mean "optional, not provided" — we represent
+        // these as None to keep correct positional indexing for operators like Clip.
+        let mut inputs: Vec<Option<Tensor>> = Vec::new();
         for input_name in &node.input {
             if input_name.is_empty() {
-                // Optional input - skip
-                continue;
-            }
-            match values.get(input_name) {
-                Some(tensor) => inputs.push(tensor.clone()),
-                None => {
-                    return Err(crate::Error::MissingInput { node: node_name.to_string(), input: input_name.clone() });
+                inputs.push(None);
+            } else {
+                match values.get(input_name) {
+                    Some(tensor) => inputs.push(Some(tensor.clone())),
+                    None => {
+                        return Err(crate::Error::MissingInput {
+                            node: node_name.to_string(),
+                            input: input_name.clone(),
+                        });
+                    }
                 }
             }
         }

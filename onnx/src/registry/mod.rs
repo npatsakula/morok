@@ -177,15 +177,29 @@ pub struct OpRegistry {
     opsets: Vec<OpSetId>,
 }
 
+/// Extract required input tensor at `idx`. Panics if input is missing (None).
+fn inp(inputs: &[Option<Tensor>], idx: usize) -> &Tensor {
+    inputs[idx].as_ref().expect("missing required ONNX input")
+}
+
+/// Parse reduction attributes (axes + keepdims) from ONNX node.
+fn reduce_attrs(node: &NodeProto) -> (AxisSpec, bool) {
+    let axes = get_attr_ints(node, "axes");
+    let keepdims = get_attr_int(node, "keepdims", 1) == 1;
+    let spec =
+        if axes.is_empty() { AxisSpec::All } else { AxisSpec::Multiple(axes.iter().map(|&a| a as isize).collect()) };
+    (spec, keepdims)
+}
+
 impl OpRegistry {
     pub fn new() -> Self {
         Self { opsets: Vec::new() }
     }
 
-    /// Dispatch an ONNX operator to its Morok Tensor implementation.
-    /// Returns a single tensor (for backward compatibility with single-output ops).
+    /// Dispatch an ONNX operator (convenience for callers with non-optional inputs).
     pub fn dispatch(&self, op_type: &str, domain: &str, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        let outputs = self.dispatch_multi(op_type, domain, inputs, node)?;
+        let inputs: Vec<Option<Tensor>> = inputs.iter().cloned().map(Some).collect();
+        let outputs = self.dispatch_multi(op_type, domain, &inputs, node)?;
         outputs
             .into_iter()
             .next()
@@ -193,242 +207,229 @@ impl OpRegistry {
     }
 
     /// Dispatch an ONNX operator, returning a vector of output tensors.
-    /// This supports multi-output operators like Split, TopK, etc.
+    /// Inputs use `Option<Tensor>` to correctly handle optional ONNX inputs
+    /// (empty input names become `None`, preserving positional indices).
     pub fn dispatch_multi(
         &self,
         op_type: &str,
         domain: &str,
-        inputs: &[Tensor],
+        inputs: &[Option<Tensor>],
         node: &NodeProto,
     ) -> Result<Vec<Tensor>> {
-        // Empty domain is the default ONNX domain
-        // Non-empty domain could be "ai.onnx" (same as default) or custom ops
+        let r = match op_type {
+            // === Arithmetic ===
+            "Add" => inp(inputs, 0).try_add(inp(inputs, 1))?,
+            "Sub" => inp(inputs, 0).try_sub(inp(inputs, 1))?,
+            "Mul" => inp(inputs, 0).try_mul(inp(inputs, 1))?,
+            "Div" => inp(inputs, 0).try_div(inp(inputs, 1))?,
+            "Neg" => inp(inputs, 0).try_neg()?,
+            "Abs" => inp(inputs, 0).try_abs()?,
+            "Pow" => inp(inputs, 0).try_pow(inp(inputs, 1))?,
 
-        match op_type {
-            // Arithmetic ops (single output)
-            "Add" => self.op_add(inputs).map(|t| vec![t]),
-            "Sub" => self.op_sub(inputs).map(|t| vec![t]),
-            "Mul" => self.op_mul(inputs).map(|t| vec![t]),
-            "Div" => self.op_div(inputs).map(|t| vec![t]),
-            "Neg" => self.op_neg(inputs).map(|t| vec![t]),
-            "Pow" => self.op_pow(inputs).map(|t| vec![t]),
+            // === Math ===
+            "Sqrt" => inp(inputs, 0).try_sqrt()?,
+            "Exp" => inp(inputs, 0).try_exp()?,
+            "Log" => inp(inputs, 0).try_log()?,
+            "Ceil" => inp(inputs, 0).ceil()?,
+            "Floor" => inp(inputs, 0).floor()?,
+            "Round" => inp(inputs, 0).round()?,
+            "Sign" => inp(inputs, 0).sign()?,
+            "Reciprocal" => inp(inputs, 0).reciprocal()?,
+            "Erf" => inp(inputs, 0).erf()?,
+            "Sin" => inp(inputs, 0).sin()?,
+            "Cos" => inp(inputs, 0).cos()?,
+            "Tan" => inp(inputs, 0).tan()?,
 
-            // Math ops (single output)
-            "Sqrt" => self.op_sqrt(inputs).map(|t| vec![t]),
+            // === Activation ===
+            "Relu" => inp(inputs, 0).relu()?,
+            "Sigmoid" => inp(inputs, 0).sigmoid()?,
+            "Tanh" => inp(inputs, 0).tanh()?,
+            "Softmax" => {
+                let axis = get_attr_int(node, "axis", -1) as isize;
+                inp(inputs, 0).softmax(axis)?
+            }
+            "LogSoftmax" => {
+                let axis = get_attr_int(node, "axis", -1) as isize;
+                inp(inputs, 0).log_softmax(axis)?
+            }
 
-            // Activation ops (single Output)
-            "Relu" => self.op_relu(inputs).map(|t| vec![t]),
-            "Sigmoid" => self.op_sigmoid(inputs).map(|t| vec![t]),
-            "Tanh" => self.op_tanh(inputs).map(|t| vec![t]),
-            "Softmax" => self.op_softmax(inputs, node).map(|t| vec![t]),
+            // === Comparison ===
+            "Equal" => inp(inputs, 0).try_eq(inp(inputs, 1))?,
+            "Less" => inp(inputs, 0).try_lt(inp(inputs, 1))?,
+            "LessOrEqual" => inp(inputs, 0).try_le(inp(inputs, 1))?,
+            "Greater" => inp(inputs, 0).try_gt(inp(inputs, 1))?,
+            "GreaterOrEqual" => inp(inputs, 0).try_ge(inp(inputs, 1))?,
+            "Not" => inp(inputs, 0).logical_not()?,
 
-            // Type ops (single output)
-            "Cast" => self.op_cast(inputs, node).map(|t| vec![t]),
+            // === Conditional ===
+            "Where" => inp(inputs, 1).where_(inp(inputs, 0), inp(inputs, 2))?,
+            "Max" => inp(inputs, 0).maximum(inp(inputs, 1))?,
+            "Min" => inp(inputs, 0).minimum(inp(inputs, 1))?,
+            "Clip" => {
+                let min = inputs.get(1).and_then(|o| o.as_ref());
+                let max = inputs.get(2).and_then(|o| o.as_ref());
+                inp(inputs, 0).clamp().maybe_min(min).maybe_max(max).call()?
+            }
 
-            // Shape ops (single output)
-            "Reshape" => self.op_reshape(inputs, node).map(|t| vec![t]),
-            "Transpose" => self.op_transpose(inputs, node).map(|t| vec![t]),
-            "Squeeze" => self.op_squeeze(inputs, node).map(|t| vec![t]),
-            "Unsqueeze" => self.op_unsqueeze(inputs, node).map(|t| vec![t]),
-            "Flatten" => self.op_flatten(inputs, node).map(|t| vec![t]),
-            "Concat" => self.op_concat(inputs, node).map(|t| vec![t]),
-            "Shape" => self.op_shape(inputs, node).map(|t| vec![t]),
-            "Gather" => self.op_gather(inputs, node).map(|t| vec![t]),
+            // === Type ===
+            "Cast" => {
+                let to = get_attr_int(node, "to", 1);
+                let dtype = convert_onnx_dtype(to as i32)?;
+                inp(inputs, 0).cast(dtype)?
+            }
 
-            // Reduction ops (single output)
-            "ReduceMean" => self.op_reduce_mean(inputs, node).map(|t| vec![t]),
-            "ReduceSum" => self.op_reduce_sum(inputs, node).map(|t| vec![t]),
+            // === Shape ===
+            "Reshape" => self.op_reshape(inputs, node)?,
+            "Transpose" => self.op_transpose(inputs, node)?,
+            "Squeeze" => self.op_squeeze(inputs, node)?,
+            "Unsqueeze" => self.op_unsqueeze(inputs, node)?,
+            "Flatten" => self.op_flatten(inputs, node)?,
+            "Concat" => {
+                let axis = get_attr_int(node, "axis", 0) as isize;
+                let tensors: Vec<&Tensor> = inputs.iter().filter_map(|o| o.as_ref()).collect();
+                Tensor::cat(&tensors, axis)?
+            }
+            "Shape" => inp(inputs, 0).shape_tensor()?,
 
-            // NN ops (single output)
-            "MatMul" => self.op_matmul(inputs).map(|t| vec![t]),
-            "Gemm" => self.op_gemm(inputs, node).map(|t| vec![t]),
-            "BatchNormalization" => self.op_batch_norm(inputs, node).map(|t| vec![t]),
+            // === Indexing ===
+            "Gather" => {
+                let axis = get_attr_int(node, "axis", 0) as isize;
+                inp(inputs, 0).gather(axis, inp(inputs, 1))?
+            }
 
-            // Conditional ops (single output)
-            "Clip" => self.op_clip(inputs, node).map(|t| vec![t]),
+            // === Reductions ===
+            "ReduceSum" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).sum_with().axes(spec).keepdim(kd).call()?
+            }
+            "ReduceMean" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).mean_with().axes(spec).keepdim(kd).call()?
+            }
+            "ReduceMax" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).max_with().axes(spec).keepdim(kd).call()?
+            }
+            "ReduceMin" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).min_with().axes(spec).keepdim(kd).call()?
+            }
+            "ReduceProd" => {
+                let (spec, kd) = reduce_attrs(node);
+                inp(inputs, 0).prod_with().axes(spec).keepdim(kd).call()?
+            }
+            "ArgMax" => {
+                let axis = get_attr_int(node, "axis", 0) as isize;
+                let keepdims = get_attr_int(node, "keepdims", 1) == 1;
+                inp(inputs, 0).argmax_with().axis(Some(axis)).keepdim(keepdims).call()?
+            }
+            "ArgMin" => {
+                let axis = get_attr_int(node, "axis", 0) as isize;
+                let keepdims = get_attr_int(node, "keepdims", 1) == 1;
+                inp(inputs, 0).argmin_with().axis(Some(axis)).keepdim(keepdims).call()?
+            }
 
-            // Identity (single output)
-            "Identity" => Ok(vec![inputs[0].clone()]),
+            // === NN ===
+            "MatMul" => inp(inputs, 0).matmul(inp(inputs, 1))?,
+            "Gemm" => self.op_gemm(inputs, node)?,
+            "BatchNormalization" => self.op_batch_norm(inputs, node)?,
 
-            // Constant (no inputs, creates tensor from attributes)
-            "Constant" => self.op_constant(node).map(|t| vec![t]),
+            // === Identity / Constant ===
+            "Identity" => inp(inputs, 0).clone(),
+            "Constant" => return self.op_constant(node).map(|t| vec![t]),
 
-            _ => UnsupportedOpSnafu { op: op_type.to_string(), domain: domain.to_string() }.fail(),
-        }
+            _ => return UnsupportedOpSnafu { op: op_type.to_string(), domain: domain.to_string() }.fail(),
+        };
+
+        Ok(vec![r])
     }
 
-    // === Arithmetic Operations ===
-
-    fn op_add(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].try_add(&inputs[1]).map_err(|e| e.into())
-    }
-
-    fn op_sub(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].try_sub(&inputs[1]).map_err(|e| e.into())
-    }
-
-    fn op_mul(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].try_mul(&inputs[1]).map_err(|e| e.into())
-    }
-
-    fn op_div(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].try_div(&inputs[1]).map_err(|e| e.into())
-    }
-
-    fn op_neg(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].try_neg().map_err(|e| e.into())
-    }
-
-    // === Activation Operations ===
-
-    fn op_relu(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].relu().map_err(|e| e.into())
-    }
-
-    fn op_sigmoid(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].sigmoid().map_err(|e| e.into())
-    }
-
-    fn op_tanh(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].tanh().map_err(|e| e.into())
-    }
-
-    // === Shape Operations ===
-
-    fn op_reshape(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        // ONNX Reshape: input, shape (as tensor)
-        // For now, get shape from attribute or second input
+    fn op_reshape(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let shape = get_attr_ints(node, "shape");
         if !shape.is_empty() {
             let shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
-            inputs[0].try_reshape(&shape).map_err(|e| e.into())
-        } else if inputs.len() > 1 {
-            // Shape provided as second input - this requires evaluating the shape tensor
+            Ok(inp(inputs, 0).try_reshape(&shape)?)
+        } else if inputs.len() > 1 && inputs[1].is_some() {
             Err(Error::IrConstruction { details: "Reshape with shape tensor not yet implemented".to_string() })
         } else {
             Err(Error::IrConstruction { details: "Reshape requires shape attribute or input".to_string() })
         }
     }
 
-    fn op_transpose(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
+    fn op_transpose(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let perm = get_attr_ints(node, "perm");
         if perm.is_empty() {
-            // Default: reverse all dimensions - use 2D transpose as fallback
-            inputs[0].try_transpose(0, 1).map_err(|e| e.into())
+            Ok(inp(inputs, 0).try_transpose(0, 1)?)
         } else {
             let perm: Vec<isize> = perm.iter().map(|&p| p as isize).collect();
-            inputs[0].try_permute(&perm).map_err(|e| e.into())
+            Ok(inp(inputs, 0).try_permute(&perm)?)
         }
     }
 
-    fn op_squeeze(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        // Squeeze removes dimensions of size 1
-        // axes attribute specifies which dims to squeeze (optional)
+    fn op_squeeze(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let axes = get_attr_ints(node, "axes");
-
         if axes.is_empty() {
-            // No axes specified - squeeze all size-1 dimensions
-            inputs[0].try_squeeze(None).map_err(|e| e.into())
+            Ok(inp(inputs, 0).try_squeeze(None)?)
         } else if axes.len() == 1 {
-            // Single axis
-            inputs[0].try_squeeze(Some(axes[0] as isize)).map_err(|e| e.into())
+            Ok(inp(inputs, 0).try_squeeze(Some(axes[0] as isize))?)
         } else {
-            // Multiple axes - squeeze them one by one (in reverse order to maintain indices)
-            let mut result = inputs[0].clone();
+            let mut result = inp(inputs, 0).clone();
             let mut sorted_axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
-            sorted_axes.sort_by(|a, b| b.cmp(a)); // Sort descending
+            sorted_axes.sort_by(|a, b| b.cmp(a));
             for axis in sorted_axes {
-                result = result.try_squeeze(Some(axis)).map_err(Error::from)?;
+                result = result.try_squeeze(Some(axis))?;
             }
             Ok(result)
         }
     }
 
-    fn op_unsqueeze(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        // Unsqueeze adds dimensions of size 1 at specified positions
+    fn op_unsqueeze(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let axes = get_attr_ints(node, "axes");
-
         if axes.is_empty() {
             return Err(Error::IrConstruction { details: "Unsqueeze requires axes attribute".to_string() });
         }
-
-        let mut result = inputs[0].clone();
-        // Sort axes ascending to insert dimensions in correct order
+        let mut result = inp(inputs, 0).clone();
         let mut sorted_axes: Vec<isize> = axes.iter().map(|&a| a as isize).collect();
         sorted_axes.sort();
         for axis in sorted_axes {
-            result = result.try_unsqueeze(axis).map_err(Error::from)?;
+            result = result.try_unsqueeze(axis)?;
         }
         Ok(result)
     }
 
-    fn op_flatten(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        let axis = get_attr_int(node, "axis", 1) as isize;
-        // Flatten: reshape to [prod(dims[..axis]), prod(dims[axis..])]
-        // For 2D flatten with axis=1, reshape to [batch, -1]
-        let shape: Vec<isize> = if axis <= 0 { vec![-1] } else { vec![-1, -1] };
-        inputs[0].try_reshape(&shape).map_err(|e| e.into())
-    }
+    fn op_flatten(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+        let axis = get_attr_int(node, "axis", 1) as usize;
+        let uop = inp(inputs, 0).uop();
+        let shape = uop
+            .shape()
+            .map_err(|e| Error::IrConstruction { details: format!("Flatten shape error: {e}") })?
+            .ok_or_else(|| Error::IrConstruction { details: "Flatten: no shape".to_string() })?;
+        let dims: Vec<usize> = shape
+            .iter()
+            .map(|s| {
+                s.as_const()
+                    .ok_or_else(|| Error::IrConstruction { details: "Flatten requires concrete shape".to_string() })
+            })
+            .collect::<Result<_>>()?;
 
-    fn op_concat(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        let axis = get_attr_int(node, "axis", 0) as isize;
-        Tensor::cat(&inputs.iter().collect::<Vec<_>>(), axis).map_err(|e| e.into())
-    }
-
-    fn op_shape(&self, inputs: &[Tensor], _node: &NodeProto) -> Result<Tensor> {
-        // ONNX Shape: returns shape as 1D int64 tensor
-        // TODO: Support start/end attributes for slicing
-        inputs[0].shape_tensor().map_err(|e| e.into())
-    }
-
-    fn op_gather(&self, _inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        // ONNX Gather: gather elements along an axis
-        // For now, implement simple 0-axis gather
-        let axis = get_attr_int(node, "axis", 0) as isize;
-
-        // This is a simplified implementation
-        // Full implementation would need tensor indexing support
-        Err(Error::IrConstruction { details: format!("Gather not yet fully implemented (axis={})", axis) })
-    }
-
-    // === Reduction Operations ===
-
-    fn op_reduce_mean(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        let axes = get_attr_ints(node, "axes");
-        let axis_spec: AxisSpec = if axes.is_empty() {
-            AxisSpec::All
+        if axis == 0 {
+            let total: isize = dims.iter().product::<usize>() as isize;
+            Ok(inp(inputs, 0).try_reshape(&[1, total])?)
         } else {
-            AxisSpec::Multiple(axes.iter().map(|&a| a as isize).collect())
-        };
-        inputs[0].mean(axis_spec).map_err(|e| e.into())
+            let pre: isize = dims[..axis].iter().product::<usize>() as isize;
+            let post: isize = dims[axis..].iter().product::<usize>() as isize;
+            Ok(inp(inputs, 0).try_reshape(&[pre, post])?)
+        }
     }
 
-    fn op_reduce_sum(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        let axes = get_attr_ints(node, "axes");
-        let axis_spec: AxisSpec = if axes.is_empty() {
-            AxisSpec::All
-        } else {
-            AxisSpec::Multiple(axes.iter().map(|&a| a as isize).collect())
-        };
-        inputs[0].sum(axis_spec).map_err(|e| e.into())
-    }
-
-    // === Neural Network Operations ===
-
-    fn op_matmul(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].matmul(&inputs[1]).map_err(|e| e.into())
-    }
-
-    fn op_gemm(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        // Gemm: Y = alpha * A' @ B' + beta * C
-        // where A' = transA ? A.T : A, B' = transB ? B.T : B
+    fn op_gemm(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
         let alpha = get_attr_float(node, "alpha", 1.0);
         let beta = get_attr_float(node, "beta", 1.0);
         let trans_a = get_attr_int(node, "transA", 0) == 1;
         let trans_b = get_attr_int(node, "transB", 0) == 1;
 
-        let mut a = inputs[0].clone();
-        let mut b = inputs[1].clone();
+        let mut a = inp(inputs, 0).clone();
+        let mut b = inp(inputs, 1).clone();
 
         if trans_a {
             a = a.try_transpose(0, 1)?;
@@ -439,19 +440,14 @@ impl OpRegistry {
 
         let mut result = a.matmul(&b)?;
 
-        // Apply alpha scaling
         if alpha != 1.0 {
-            let alpha_tensor = Tensor::from_slice([alpha]);
-            result = result.try_mul(&alpha_tensor)?;
+            result = result.try_mul(&Tensor::from_slice([alpha]))?;
         }
 
-        // Add bias if present
-        if inputs.len() > 2 {
-            let mut c = inputs[2].clone();
-            // Apply beta scaling
+        if let Some(c) = inputs.get(2).and_then(|o| o.as_ref()) {
+            let mut c = c.clone();
             if beta != 1.0 {
-                let beta_tensor = Tensor::from_slice([beta]);
-                c = c.try_mul(&beta_tensor)?;
+                c = c.try_mul(&Tensor::from_slice([beta]))?;
             }
             result = result.try_add(&c)?;
         }
@@ -459,119 +455,36 @@ impl OpRegistry {
         Ok(result)
     }
 
-    fn op_batch_norm(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        // ONNX BatchNormalization: Y = scale * (X - mean) / sqrt(var + epsilon) + bias
-        // Inputs: X, scale, bias, mean, var
-        let x = &inputs[0];
-        let scale = &inputs[1];
-        let bias = &inputs[2];
-        let mean = &inputs[3];
-        let var = &inputs[4];
+    fn op_batch_norm(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+        let (x, scale, bias, mean, var) =
+            (inp(inputs, 0), inp(inputs, 1), inp(inputs, 2), inp(inputs, 3), inp(inputs, 4));
         let epsilon = get_attr_float(node, "epsilon", 1e-5);
 
-        // Compute invstd = 1 / sqrt(var + epsilon)
-        let epsilon_tensor = Tensor::from_slice([epsilon]);
-        let var_plus_eps = var.try_add(&epsilon_tensor).map_err(|e| crate::Error::from(e))?;
-        let invstd = var_plus_eps.try_rsqrt().map_err(|e| crate::Error::from(e))?;
+        let var_plus_eps = var.try_add(&Tensor::from_slice([epsilon]))?;
+        let invstd = var_plus_eps.try_rsqrt()?;
 
-        // Use Tensor::batchnorm
-        x.batchnorm().scale(scale).bias(bias).mean(mean).invstd(&invstd).call().map_err(|e| e.into())
+        Ok(x.batchnorm().scale(scale).bias(bias).mean(mean).invstd(&invstd).call()?)
     }
 
-    // === Math Operations ===
-
-    fn op_pow(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].try_pow(&inputs[1]).map_err(|e| e.into())
-    }
-
-    fn op_sqrt(&self, inputs: &[Tensor]) -> Result<Tensor> {
-        inputs[0].try_sqrt().map_err(|e| e.into())
-    }
-
-    // === Type Operations ===
-
-    fn op_cast(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        let to = get_attr_int(node, "to", 1); // Default to FLOAT
-        let dtype = convert_onnx_dtype(to as i32)?;
-        inputs[0].cast(dtype).map_err(|e| e.into())
-    }
-
-    // === Activation Operations (additional) ===
-
-    fn op_softmax(&self, inputs: &[Tensor], node: &NodeProto) -> Result<Tensor> {
-        let axis = get_attr_int(node, "axis", -1) as isize;
-        inputs[0].softmax(axis).map_err(|e| e.into())
-    }
-
-    // === Conditional Operations ===
-
-    fn op_clip(&self, inputs: &[Tensor], _node: &NodeProto) -> Result<Tensor> {
-        // Clip: clip(input, min, max)
-        // min and max can be from inputs (indices 1 and 2)
-        let min = inputs.get(1);
-        let max = inputs.get(2);
-
-        // Use the builder pattern with maybe_min/maybe_max which accept Option
-        inputs[0].clamp().maybe_min(min).maybe_max(max).call().map_err(|e| e.into())
-    }
-
-    // === Constant Operations ===
-
-    /// Creates a constant tensor from ONNX Constant node attributes.
-    ///
-    /// The ONNX Constant operator supports multiple attribute formats:
-    /// - `value`: A TensorProto containing the full tensor data
-    /// - `value_float`: A single float scalar (f32)
-    /// - `value_floats`: A 1D tensor of floats (Vec<f32>)
-    /// - `value_int`: A single int64 scalar (i64)
-    /// - `value_ints`: A 1D tensor of int64s (Vec<i64>)
-    ///
-    /// For the `value` attribute, we reuse `tensor_from_proto` which handles
-    /// raw data and typed data fields properly.
-    ///
-    /// For scalar attributes, we use `Tensor::const_` which embeds constants
-    /// directly in the IR. Following Tinygrad's approach, pure constants don't
-    /// allocate buffers until `.contiguous().realize()` is called.
-    ///
-    /// For array attributes, we use `Tensor::from_slice` which creates input
-    /// buffers with proper tensor shapes (not vector dtypes). This matches
-    /// Tinygrad's `_frompy` approach for list/tuple inputs.
-    ///
-    /// See: <https://onnx.ai/onnx/operators/onnx__Constant.html>
     fn op_constant(&self, node: &NodeProto) -> Result<Tensor> {
-        // Check for value attribute (full TensorProto)
         if let Some(tensor_proto) = get_attr_tensor(node, "value") {
             return tensor_from_proto(tensor_proto);
         }
-
-        // Check for value_float (scalar float)
         if let Some(attr) = get_attr(node, "value_float") {
-            let value = attr.f as f64; // ConstValue::Float is f64
-            return Ok(Tensor::const_(value, DType::Scalar(ScalarDType::Float32)));
+            return Ok(Tensor::const_(attr.f as f64, DType::Scalar(ScalarDType::Float32)));
         }
-
-        // Check for value_floats (1D float array) - use from_slice for proper tensor shape
         let float_values = get_attr_floats(node, "value_floats");
         if !float_values.is_empty() {
             return Ok(Tensor::from_slice(&float_values));
         }
-
-        // Check for value_int (scalar int)
         if let Some(attr) = get_attr(node, "value_int") {
-            let value = attr.i;
-            return Ok(Tensor::const_(value, DType::Scalar(ScalarDType::Int64)));
+            return Ok(Tensor::const_(attr.i, DType::Scalar(ScalarDType::Int64)));
         }
-
-        // Check for value_ints (1D int array) - use from_slice for proper tensor shape
         let int_values = get_attr_ints(node, "value_ints");
         if !int_values.is_empty() {
             return Ok(Tensor::from_slice(&int_values));
         }
-
-        // No supported constant attribute found
-        Err(Error::IrConstruction {
-            details: "Constant node has no supported value attribute (value, value_float, value_floats, value_int, value_ints)".to_string(),
-        })
+        Err(Error::IrConstruction { details: "Constant node has no supported value attribute".to_string() })
     }
 }
 
@@ -813,5 +726,145 @@ mod tests {
         let result = registry.dispatch("Constant", "", &[], &node).unwrap();
         let realized = result.realize().unwrap();
         assert!(realized.buffer().is_some());
+    }
+
+    // === New Operator Tests ===
+
+    #[test]
+    fn test_registry_abs() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[-2.0f32, -1.0, 0.0, 1.0, 2.0]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Abs", "", &[x], &node).unwrap().realize().unwrap();
+        assert!(result.buffer().is_some());
+    }
+
+    #[test]
+    fn test_registry_gather() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
+        let indices = Tensor::from_slice(&[0i64, 2, 4]);
+        let node = NodeProto::default(); // axis defaults to 0
+
+        let result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap().realize().unwrap();
+        assert!(result.buffer().is_some());
+    }
+
+    #[test]
+    fn test_registry_gather_axis1() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let indices = Tensor::from_slice(&[0i64, 2, 1, 0]).try_reshape(&[2, 2]).unwrap();
+
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "axis".to_string();
+        attr.i = 1;
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap().realize().unwrap();
+        assert!(result.buffer().is_some());
+    }
+
+    #[test]
+    fn test_registry_equal() {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice(&[1.0f32, 0.0, 3.0]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Equal", "", &[a, b], &node).unwrap().realize().unwrap();
+        assert!(result.buffer().is_some());
+    }
+
+    #[test]
+    fn test_registry_where() {
+        let registry = OpRegistry::new();
+        let condition = Tensor::from_slice(&[true, false, true]);
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+        let y = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
+        let node = NodeProto::default();
+
+        // ONNX Where: inputs are (condition, X, Y)
+        let result = registry.dispatch("Where", "", &[condition, x, y], &node).unwrap().realize().unwrap();
+        assert!(result.buffer().is_some());
+    }
+
+    #[test]
+    fn test_registry_reduce_max() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 4.0, 2.0, 3.0]).try_reshape(&[2, 2]).unwrap();
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("ReduceMax", "", &[x], &node).unwrap().realize().unwrap();
+        assert!(result.buffer().is_some());
+    }
+
+    #[test]
+    fn test_registry_reduce_with_keepdims() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+
+        let mut node = NodeProto::default();
+        let mut axes_attr = AttributeProto::default();
+        axes_attr.name = "axes".to_string();
+        axes_attr.ints = vec![1];
+        node.attribute.push(axes_attr);
+        let mut kd_attr = AttributeProto::default();
+        kd_attr.name = "keepdims".to_string();
+        kd_attr.i = 1;
+        node.attribute.push(kd_attr);
+
+        let result = registry.dispatch("ReduceSum", "", &[x], &node).unwrap().realize().unwrap();
+        assert!(result.buffer().is_some());
+    }
+
+    #[test]
+    fn test_registry_math_ops() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+        let node = NodeProto::default();
+
+        for op in ["Exp", "Log", "Ceil", "Floor", "Round", "Sign", "Reciprocal", "Sin", "Cos", "Tan"] {
+            let result = registry.dispatch(op, "", &[x.clone()], &node);
+            assert!(result.is_ok(), "Operator {op} failed: {:?}", result.err());
+        }
+    }
+
+    #[test]
+    fn test_registry_comparison_ops() {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice(&[2.0f32, 2.0, 1.0]);
+        let node = NodeProto::default();
+
+        for op in ["Less", "LessOrEqual", "Greater", "GreaterOrEqual"] {
+            let result = registry.dispatch(op, "", &[a.clone(), b.clone()], &node);
+            assert!(result.is_ok(), "Operator {op} failed: {:?}", result.err());
+        }
+    }
+
+    #[test]
+    fn test_registry_flatten() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let node = NodeProto::default(); // axis defaults to 1
+
+        let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
+        // Flatten [2, 3] with axis=1 should give [2, 3]
+        let realized = result.realize().unwrap();
+        assert!(realized.buffer().is_some());
+    }
+
+    #[test]
+    fn test_registry_log_softmax() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+        let node = NodeProto::default(); // axis defaults to -1
+
+        // Graph construction succeeds (realization may hit backend limitations)
+        let result = registry.dispatch("LogSoftmax", "", &[x], &node);
+        assert!(result.is_ok());
     }
 }

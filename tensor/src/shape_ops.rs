@@ -429,8 +429,8 @@ impl Tensor {
             .map(|(dim_idx, &(begin, end))| {
                 // Only need dimension size if we have negative indices
                 let (normalized_begin, normalized_end) = if begin < 0 || end < 0 {
-                    let dim_size = shape[dim_idx].as_const().ok_or_else(|| {
-                        Error::SymbolicShapeUnsupported { operation: "shrink with negative indices".to_string() }
+                    let dim_size = shape[dim_idx].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported {
+                        operation: "shrink with negative indices".to_string(),
                     })? as isize;
 
                     let nb = if begin < 0 { dim_size + begin } else { begin };
@@ -444,10 +444,7 @@ impl Tensor {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.uop()
-            .try_shrink(&ranges_sint)
-            .map(|uop| self.with_same_buffer(uop))
-            .context(UOpSnafu)
+        self.uop().try_shrink(&ranges_sint).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
     }
 
     // =========================================================================

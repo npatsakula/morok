@@ -20,14 +20,8 @@ pub enum Error {
     #[snafu(display("Missing input '{input}' for node '{node}'"))]
     MissingInput { node: String, input: String },
 
-    #[snafu(display("Missing initializer '{name}'"))]
-    MissingInitializer { name: String },
-
     #[snafu(display("Shape mismatch for '{context}': expected {expected}, got {actual}"))]
     ShapeMismatch { context: String, expected: String, actual: String },
-
-    #[snafu(display("Invalid attribute '{name}' for node '{node}': {details}"))]
-    InvalidAttribute { node: String, name: String, details: String },
 
     #[snafu(display("IR construction error: {details}"))]
     IrConstruction { details: String },
