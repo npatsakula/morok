@@ -79,21 +79,23 @@ pub fn rangeify_with_map(
     // Aggregate all becomes_maps from rewrite passes
     let mut all_becomes: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
-    // =========================================================================
-    // Stage 0: Range assignment to build IndexingContext
-    // =========================================================================
-    let (mut sink, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
-    tracing::debug!(uop.tree = sink.tree(), "Stage 0: range assignment complete");
-
-    // Combined early pass (Tinygrad: pm_mops + earliest_rewrites + replace_contiguous, ctx={})
+    // Combined early pass (Tinygrad: earliest_rewrites + replace_contiguous, ctx={})
+    // MUST run BEFORE range assignment so rangeify sees a cleaned graph.
     // Uses top-down traversal matching Tinygrad's bottom_up=False default.
     let early_combined = super::patterns::early_rewrites().with_context::<super::patterns::ReplaceContiguousCtx>()
         + super::patterns::replace_contiguous();
     let mut contig_ctx = super::patterns::ReplaceContiguousCtx::new();
     let result = graph_rewrite_with_map(&early_combined, sink, &mut contig_ctx);
-    sink = result.root;
+    let mut sink = result.root;
     all_becomes.extend(result.becomes_map);
     tracing::debug!(uop.tree = sink.tree(), "early rewrites + replace contiguous complete");
+
+    // =========================================================================
+    // Stage 0: Range assignment to build IndexingContext
+    // =========================================================================
+    let (rangeified, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
+    sink = rangeified;
+    tracing::debug!(uop.tree = sink.tree(), "Stage 0: range assignment complete");
 
     // Split large reductions BEFORE ReduceAxis → REDUCE conversion
     let mut split_config = super::kernel::SplitReduceOpConfig::default();
@@ -145,7 +147,7 @@ pub fn rangeify_with_map(
         && let Some(limit) = device.max_buffers()
     {
         let limit_matcher = super::patterns::buffer_limit_patterns(limit);
-        let result = graph_rewrite_bottom_up_with_map(&limit_matcher, sink, &mut ());
+        let result = graph_rewrite_with_map(&limit_matcher, sink, &mut ());
         sink = result.root;
         all_becomes.extend(result.becomes_map);
         tracing::debug!(uop.tree = sink.tree(), "Stage 7b: buffer limit enforcement complete");

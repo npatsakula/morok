@@ -427,14 +427,16 @@ pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> A
     sink = graph_rewrite(&symbolic_with_flatten, sink, &mut ());
     tracing::debug!(ast.pre = sink.tree(), "pre-opt: symbolic + flatten complete");
 
-    // Stage 4: Simplify ranges (Tinygrad: pm_simplify_ranges)
-    sink = graph_rewrite(&pm_simplify_ranges(), sink, &mut ());
+    // Stage 4: Simplify ranges + flatten (Tinygrad: pm_simplify_ranges + pm_flatten_range)
+    let simplify_with_flatten = pm_flatten_range() + pm_simplify_ranges();
+    sink = graph_rewrite(&simplify_with_flatten, sink, &mut ());
     tracing::debug!(ast.pre = sink.tree(), "pre-opt: simplify ranges complete");
 
-    // Stage 5: Split store (CPU only, Tinygrad: pm_split_store)
+    // Stage 5: Split store (CPU only, Tinygrad: pm_flatten_range + pm_split_store)
     if renderer.device == "CPU" {
         let mut split_store_ctx = SplitStoreContext::for_device(morok_device::DeviceSpec::Cpu);
-        sink = graph_rewrite(&pm_split_store(), sink, &mut split_store_ctx);
+        let combined = pm_flatten_range().with_context::<SplitStoreContext>() + pm_split_store();
+        sink = graph_rewrite(&combined, sink, &mut split_store_ctx);
         tracing::debug!(ast.pre = sink.tree(), "pre-opt: split store complete");
     }
 
@@ -530,19 +532,13 @@ pub fn optimize_kernel_beam<F>(
 where
     F: Fn(&Scheduler) -> Option<std::time::Duration> + Sync,
 {
-    use crate::rewrite::graph_rewrite;
-    use crate::symbolic::patterns::symbolic;
-
     // Step 0: Per-kernel pre-optimization (Tinygrad: full_rewrite_to_sink)
     let pre_optimized = apply_pre_optimization(ast, renderer);
 
-    // Step 1: Symbolic simplification
-    let simplified = graph_rewrite(&symbolic(), pre_optimized, &mut ());
+    // Step 1: Create scheduler (AST already simplified by apply_pre_optimization Stage 3)
+    let mut scheduler = Scheduler::new(pre_optimized, renderer.clone());
 
-    // Step 2: Create scheduler
-    let mut scheduler = Scheduler::new(simplified, renderer.clone());
-
-    // Step 3: Convert loops to global (for GPU parallelization)
+    // Step 2: Convert loops to global (for GPU parallelization)
     let _ = scheduler.convert_loop_to_global();
 
     // Step 4: Run beam search (with caching)
@@ -564,8 +560,7 @@ where
 /// A `Scheduler` with loops converted to globals (if applicable).
 pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Scheduler {
     let pre_optimized = apply_pre_optimization(ast, renderer);
-    let simplified = graph_rewrite(&symbolic(), pre_optimized, &mut ());
-    let mut scheduler = Scheduler::new(simplified, renderer.clone());
+    let mut scheduler = Scheduler::new(pre_optimized, renderer.clone());
     let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
     // Note: Don't apply threading here - let beam search explore THREAD actions naturally.
     // Heuristics apply threading via hand_coded_optimizations() with config.thread_count.
@@ -574,11 +569,8 @@ pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Schedu
 
 /// Apply heuristic-based optimizations.
 fn optimize_heuristic(ast: Arc<morok_ir::UOp>, renderer: &Renderer, config: &HeuristicsConfig) -> Arc<morok_ir::UOp> {
-    // Step 1: Symbolic simplification
-    let simplified = graph_rewrite(&symbolic(), ast, &mut ());
-
-    // Step 2: Create scheduler with backend capabilities
-    let mut scheduler = Scheduler::new(simplified, renderer.clone());
+    // Step 1: Create scheduler (AST already simplified by apply_pre_optimization Stage 3)
+    let mut scheduler = Scheduler::new(ast, renderer.clone());
 
     // Step 3: Convert axes for parallelization/vectorization
     let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL

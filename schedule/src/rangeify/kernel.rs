@@ -264,25 +264,14 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Per-kernel context (LocalAddBufferContext)
     let mut lctx = LocalAddBufferContext::new();
 
-    // Sequential rewrites (like Tinygrad's combined patterns)
-    // 1. to_define_global: BUFFER → DEFINE_GLOBAL, handle AFTER, BIND
+    // Combined single-pass rewrite (Tinygrad: to_define_global + pm_flatten_range + rangeify_codegen)
     let ret = {
-        let matcher = local_to_define_global_patterns();
+        let matcher = local_to_define_global_patterns()
+            + movement_op_patterns().with_context::<LocalAddBufferContext>()
+            + pm_syntactic_sugar().with_context::<LocalAddBufferContext>()
+            + pm_flatten_range().with_context::<LocalAddBufferContext>()
+            + rangeify_codegen_patterns();
         graph_rewrite_bottom_up(&matcher, x.clone(), &mut lctx)
-    };
-
-    // 2. movement_op_patterns + pm_syntactic_sugar + pm_flatten_range (combined pass)
-    // Tinygrad: to_define_global + pm_flatten_range + rangeify_codegen
-    // pm_flatten_range normalizes nested END structures before codegen.
-    let ret = {
-        let matcher = movement_op_patterns() + pm_syntactic_sugar() + pm_flatten_range();
-        graph_rewrite_bottom_up(&matcher, ret, &mut ())
-    };
-
-    // 3. rangeify_codegen (CONTIGUOUS removal, NOOP → zero, hint extraction)
-    let ret = {
-        let matcher = rangeify_codegen_patterns();
-        graph_rewrite_bottom_up(&matcher, ret, &mut lctx)
     };
 
     // Find COPY/BUFFER_VIEW or wrap in SINK (like Tinygrad rangeify.py:495-501)

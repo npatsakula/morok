@@ -200,14 +200,14 @@ impl Tensor {
         if axis_idx != ndim - 1 { x.try_transpose(axis_idx as isize, -1) } else { Ok(x) }
     }
 
-    /// Create 1D tensor with evenly spaced values.
+    /// Create 1D tensor with evenly spaced values and explicit dtype.
     ///
     /// Generates values in the range `[start, stop)` with given step size.
     /// If `stop` is None, treats `start` as stop and starts from 0.
     ///
     /// Uses lazy `full(step)._cumalu(0, Add) + (start - step)` which
     /// `reduce_collapse` simplifies into `RANGE * step + offset`.
-    pub fn arange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<Self> {
+    pub fn arange_with_dtype(start: i64, stop: Option<i64>, step: Option<i64>, dtype: DType) -> Result<Self> {
         let (actual_start, actual_stop) = match stop {
             Some(s) => (start, s),
             None => (0, start),
@@ -236,10 +236,17 @@ impl Tensor {
         }
 
         // Lazy: full(step)._cumalu(0, Add) + (start - step)
-        let step_tensor = Self::full(&[count], ConstValue::Int(actual_step), DType::Int32)?;
+        let step_tensor = Self::full(&[count], ConstValue::Int(actual_step), dtype.clone())?;
         let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
-        let offset = Self::const_(ConstValue::Int(actual_start - actual_step), DType::Int32);
+        let offset = Self::const_(ConstValue::Int(actual_start - actual_step), dtype);
         cumsum.try_add(&offset)
+    }
+
+    /// Create 1D tensor with evenly spaced Int32 values.
+    ///
+    /// Convenience wrapper around `arange_with_dtype` with `DType::Int32` default.
+    pub fn arange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<Self> {
+        Self::arange_with_dtype(start, stop, step, DType::Int32)
     }
 
     /// Create tensor from slice on CPU (default device).

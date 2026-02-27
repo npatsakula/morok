@@ -1,6 +1,7 @@
 //! ONNX operator registry - maps ONNX ops to Morok Tensor operations.
 
 use morok_dtype::{DType, ScalarDType};
+use morok_ir::ConstValue;
 use morok_tensor::Tensor;
 use morok_tensor::reduce::AxisSpec;
 
@@ -164,8 +165,7 @@ fn inp(inputs: &[Option<Tensor>], idx: usize) -> &Tensor {
 /// Opset >= 13: axes from input[1] tensor. Opset <= 12: axes from node attribute.
 fn reduce_attrs(node: &NodeProto, inputs: &[Option<Tensor>], opset: i64) -> Result<(AxisSpec, bool)> {
     let keepdims = get_attr_int(node, "keepdims", 1) == 1;
-    let default_noop = if opset >= 18 { 1 } else { 0 };
-    let noop_with_empty_axes = get_attr_int(node, "noop_with_empty_axes", default_noop) == 1;
+    let noop_with_empty_axes = get_attr_int(node, "noop_with_empty_axes", 0) == 1;
 
     let axes: Vec<i64> = if opset >= 13 {
         // Opset 13+: axes from input[1] tensor
@@ -391,7 +391,18 @@ impl OpRegistry {
             // === Indexing ===
             "Gather" => {
                 let axis = get_attr_int(node, "axis", 0) as isize;
-                inp(inputs, 0).gather(axis, inp(inputs, 1))?
+                let data = inp(inputs, 0);
+                let idx = inp(inputs, 1);
+                // ONNX spec: normalize negative indices (idx < 0 → idx + dim_size)
+                let data_shape = data.shape()?;
+                let ndim = data_shape.len();
+                let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+                let dim_size = data_shape[norm_axis].as_const().unwrap_or(1) as i64;
+                let zero = Tensor::const_(ConstValue::Int(0), idx.uop().dtype());
+                let dim_t = Tensor::const_(ConstValue::Int(dim_size), idx.uop().dtype());
+                let neg_mask = idx.try_lt(&zero)?;
+                let normalized_idx = idx.try_add(&dim_t)?.where_(&neg_mask, idx)?;
+                data.gather(axis, &normalized_idx)?
             }
 
             // === Reductions ===
@@ -425,7 +436,13 @@ impl OpRegistry {
             }
             "ReduceL2" => {
                 let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
-                inp(inputs, 0).square()?.sum_with().axes(spec).keepdim(kd).call()?.try_sqrt()?
+                let x = inp(inputs, 0);
+                let orig_dtype = x.uop().dtype();
+                let needs_upcast =
+                    matches!(orig_dtype.scalar(), Some(ScalarDType::Float16) | Some(ScalarDType::BFloat16));
+                let x = if needs_upcast { x.cast(DType::Float32)? } else { x.clone() };
+                let result = x.square()?.sum_with().axes(spec).keepdim(kd).call()?.try_sqrt()?;
+                if needs_upcast { result.cast(orig_dtype)? } else { result }
             }
             "ReduceLogSum" => {
                 let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;

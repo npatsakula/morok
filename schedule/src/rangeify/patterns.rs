@@ -1137,8 +1137,10 @@ pub fn local_to_define_global_patterns() -> TypedPatternMatcher<LocalAddBufferCo
                 Op::MSelect { buffer, .. } => buffer.clone(),
                 _ => buf,
             };
-            // Skip if buffer already mapped
+            // Duplicate buffer mapping — Tinygrad asserts here.
             if ctx.has_buffer(&buf) {
+                debug_assert!(false, "handle_after: duplicate buffer mapping for buf id={}", buf.id);
+                tracing::warn!(buf_id = buf.id, "handle_after: duplicate buffer mapping, skipping");
                 return None;
             }
             // Map buf → after (kernel sources will be AFTERs)

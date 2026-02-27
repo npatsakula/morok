@@ -128,7 +128,7 @@ impl UOp {
     /// Based on Tinygrad's `UOp.has_buffer_identity()` (ops.py:616-619).
     pub fn has_buffer_identity(&self) -> bool {
         match &self.op {
-            Op::Reshape { src, .. } | Op::Multi { src, .. } => src.has_buffer_identity(),
+            Op::Reshape { src, .. } => src.has_buffer_identity(),
             Op::Buffer { .. } => true,
             _ => false,
         }
