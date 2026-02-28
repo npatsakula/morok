@@ -651,9 +651,9 @@ impl Tensor {
 
         snafu::ensure!(!has_multiple_minus_one, MultipleInferDimensionsSnafu);
 
-        // Validate no other negative values
+        // Validate no other negative values (0 is valid for zero-size tensors)
         for &dim in shape_spec {
-            snafu::ensure!(dim > 0 || dim == -1, NegativeDimensionSnafu { dim });
+            snafu::ensure!(dim >= 0 || dim == -1, NegativeDimensionSnafu { dim });
         }
 
         // Calculate new shape
@@ -664,11 +664,13 @@ impl Tensor {
                     Error::SymbolicShapeUnsupported { operation: "reshape with -1 inference".to_string() }
                 })?;
 
-            // Calculate product of known dimensions
-            let known_product: usize = shape_spec.iter().filter(|&&s| s > 0).map(|&s| s as usize).product();
+            // Calculate product of known (non -1) dimensions.
+            // Tinygrad: -prod(source) // prod(target_with_-1). When target has both 0 and -1,
+            // prod is 0 → ZeroDivisionError. We match that: known_product=0 is a size mismatch.
+            let known_product: usize = shape_spec.iter().filter(|&&s| s != -1).map(|&s| s as usize).product();
 
             snafu::ensure!(
-                total_elements % known_product == 0,
+                known_product > 0 && total_elements % known_product == 0,
                 ReshapeSizeMismatchSnafu { operation: "reshape with inference".to_string() }
             );
 

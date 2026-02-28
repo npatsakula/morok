@@ -75,7 +75,7 @@ pub fn to_static(shape: &Shape) -> Option<SmallVec<[usize; 4]>> {
 /// assert!(validate_shape(&invalid).is_err());
 /// ```
 pub fn validate_shape(shape: &[isize]) -> Result<SmallVec<[usize; 4]>> {
-    ensure!(shape.iter().all(|&s| s > 0), ReshapeNegativeDimensionSnafu { shape });
+    ensure!(shape.iter().all(|&s| s >= 0), ReshapeNegativeDimensionSnafu { shape });
     Ok(shape.iter().map(|&s| s as usize).collect())
 }
 

@@ -360,8 +360,28 @@ impl OpRegistry {
 
             // === Conditional ===
             "Where" => inp(inputs, 1).where_(inp(inputs, 0), inp(inputs, 2))?,
-            "Max" => inp(inputs, 0).maximum(inp(inputs, 1))?,
-            "Min" => inp(inputs, 0).minimum(inp(inputs, 1))?,
+            "Max" => {
+                let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
+                let first = valid
+                    .first()
+                    .ok_or_else(|| Error::IrConstruction { details: "Max requires at least one input".into() })?;
+                let mut acc = (*first).clone();
+                for t in &valid[1..] {
+                    acc = acc.maximum(t)?;
+                }
+                acc
+            }
+            "Min" => {
+                let valid: Vec<&Tensor> = inputs.iter().filter_map(Option::as_ref).collect();
+                let first = valid
+                    .first()
+                    .ok_or_else(|| Error::IrConstruction { details: "Min requires at least one input".into() })?;
+                let mut acc = (*first).clone();
+                for t in &valid[1..] {
+                    acc = acc.minimum(t)?;
+                }
+                acc
+            }
             "Clip" => {
                 let min = inputs.get(1).and_then(|o| o.as_ref());
                 let max = inputs.get(2).and_then(|o| o.as_ref());
@@ -397,7 +417,9 @@ impl OpRegistry {
                 let data_shape = data.shape()?;
                 let ndim = data_shape.len();
                 let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
-                let dim_size = data_shape[norm_axis].as_const().unwrap_or(1) as i64;
+                let dim_size = data_shape[norm_axis].as_const().ok_or_else(|| Error::IrConstruction {
+                    details: format!("Gather requires concrete dimension on axis {norm_axis}"),
+                })? as i64;
                 let zero = Tensor::const_(ConstValue::Int(0), idx.uop().dtype());
                 let dim_t = Tensor::const_(ConstValue::Int(dim_size), idx.uop().dtype());
                 let neg_mask = idx.try_lt(&zero)?;
@@ -450,18 +472,7 @@ impl OpRegistry {
             }
             "ReduceLogSumExp" => {
                 let (spec, kd) = reduce_attrs(node, inputs, opset_version)?;
-                let x = inp(inputs, 0);
-                let max_val = x.max_with().axes(spec.clone()).keepdim(true).call()?;
-                let shifted = x.try_sub(&max_val.broadcast_to(&x.shape()?)?)?;
-                let sum_exp = shifted.try_exp()?.sum_with().axes(spec).keepdim(kd).call()?;
-                let log_val = sum_exp.try_log()?;
-                let max_reduced = if kd {
-                    max_val
-                } else {
-                    let target: Vec<isize> = sum_exp.shape()?.iter().map(|d| d.as_const().unwrap() as isize).collect();
-                    max_val.try_reshape(&target)?
-                };
-                max_reduced.try_add(&log_val)?
+                inp(inputs, 0).try_exp()?.sum_with().axes(spec).keepdim(kd).call()?.try_log()?
             }
             "ArgMax" => {
                 let axis = get_attr_int(node, "axis", 0) as isize;
@@ -492,24 +503,39 @@ impl OpRegistry {
                 inp(inputs, 0).repeat(&repeats)?
             }
             "Range" => {
-                let start = tensor_to_i64_vec(inp(inputs, 0))?[0];
-                let limit = tensor_to_i64_vec(inp(inputs, 1))?[0];
-                let delta = tensor_to_i64_vec(inp(inputs, 2))?[0];
-                Tensor::arange(start, Some(limit), Some(delta))?
+                let start_t = inp(inputs, 0);
+                let out_dtype = start_t.uop().dtype();
+                if out_dtype.is_float() {
+                    let start = tensor_to_f64_scalar(start_t)?;
+                    let limit = tensor_to_f64_scalar(inp(inputs, 1))?;
+                    let delta = tensor_to_f64_scalar(inp(inputs, 2))?;
+                    Tensor::arange_f64(start, limit, delta, out_dtype)?
+                } else {
+                    let start = tensor_to_i64_vec(start_t)?[0];
+                    let limit = tensor_to_i64_vec(inp(inputs, 1))?[0];
+                    let delta = tensor_to_i64_vec(inp(inputs, 2))?[0];
+                    Tensor::arange_with_dtype(start, Some(limit), Some(delta), out_dtype)?
+                }
             }
             "ConstantOfShape" => {
-                let shape: Vec<isize> = tensor_to_i64_vec(inp(inputs, 0))?.iter().map(|&v| v as isize).collect();
+                let shape_i64 = tensor_to_i64_vec(inp(inputs, 0))?;
                 let value = get_attr_tensor(node, "value")
                     .map(tensor_from_proto)
                     .transpose()?
                     .unwrap_or_else(|| Tensor::from_slice([0.0f32]));
-                value.try_reshape(&[1])?.try_expand(&shape)?
+                if shape_i64.contains(&0) {
+                    Tensor::empty(value.uop().dtype())
+                } else {
+                    let shape: Vec<isize> = shape_i64.iter().map(|&v| v as isize).collect();
+                    value.try_reshape(&[1])?.try_expand(&shape)?
+                }
             }
             "Size" => Tensor::from_slice([inp(inputs, 0).numel()? as i64]),
             "Dropout" => {
-                // Inference mode: return input unchanged + all-true mask
+                // Inference mode: return input unchanged + all-true mask matching shape
                 let x = inp(inputs, 0).clone();
-                let mask = Tensor::from_slice([true]);
+                let shape: Vec<usize> = x.shape()?.iter().map(|d| d.as_const().unwrap_or(1)).collect();
+                let mask = Tensor::full(&shape, true, DType::Scalar(ScalarDType::Bool))?;
                 return Ok(vec![x, mask]);
             }
 
@@ -741,9 +767,7 @@ impl OpRegistry {
                     details: "Split requires either split input or num_outputs attribute".into(),
                 });
             }
-            let mut sizes = vec![dim_size / n; n];
-            sizes[n - 1] += dim_size % n;
-            sizes
+            (0..n).map(|i| dim_size / n + if i < dim_size % n { 1 } else { 0 }).collect()
         };
 
         Ok(data.split(&split_sizes, axis)?)
@@ -1150,5 +1174,167 @@ mod tests {
         // Graph construction succeeds (realization may hit backend limitations)
         let result = registry.dispatch("LogSoftmax", "", &[x], &node);
         assert!(result.is_ok());
+    }
+
+    // === Batch 1 bug fix tests ===
+
+    #[test]
+    fn test_max_variadic_3_inputs() {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice(&[1.0f32, 5.0]);
+        let b = Tensor::from_slice(&[3.0f32, 2.0]);
+        let c = Tensor::from_slice(&[2.0f32, 4.0]);
+        let inputs = vec![Some(a), Some(b), Some(c)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![3.0, 5.0]);
+    }
+
+    #[test]
+    fn test_max_single_input() {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice(&[7.0f32, 3.0]);
+        let inputs = vec![Some(a)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![7.0, 3.0]);
+    }
+
+    #[test]
+    fn test_min_variadic_3_inputs() {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice(&[3.0f32, 1.0]);
+        let b = Tensor::from_slice(&[1.0f32, 5.0]);
+        let c = Tensor::from_slice(&[2.0f32, 3.0]);
+        let inputs = vec![Some(a), Some(b), Some(c)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Min", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_split_remainder_distribution() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let inputs = vec![Some(data)];
+
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "num_outputs".to_string();
+        attr.i = 3;
+        node.attribute.push(attr);
+
+        let result = registry.dispatch_multi("Split", "", &inputs, &node, i64::MAX).unwrap();
+        assert_eq!(result.len(), 3);
+        // 7 / 3 = 2 rem 1, so first chunk gets 3, rest get 2
+        // Verify via shape sizes
+        let shapes: Vec<usize> = result.iter().map(|t| t.shape().unwrap()[0].as_const().unwrap()).collect();
+        assert_eq!(shapes, vec![3, 2, 2]);
+    }
+
+    #[test]
+    fn test_range_float() {
+        let registry = OpRegistry::new();
+        let start = Tensor::from_slice(&[0.0f32]);
+        let limit = Tensor::from_slice(&[5.5f32]);
+        let delta = Tensor::from_slice(&[1.5f32]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
+        let arr = result.to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![0.0, 1.5, 3.0, 4.5]);
+    }
+
+    #[test]
+    fn test_range_integer_regression() {
+        let registry = OpRegistry::new();
+        let start = Tensor::from_slice(&[0i32]);
+        let limit = Tensor::from_slice(&[5i32]);
+        let delta = Tensor::from_slice(&[1i32]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
+        let arr = result.to_ndarray::<i32>().unwrap();
+        let vals: Vec<i32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_gather_negative_indices() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0, 50.0]);
+        let indices = Tensor::from_slice(&[0i64, -1, 2, -2]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap();
+        let arr = result.to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![10.0, 50.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn test_dropout_mask_shape() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let inputs = vec![Some(x)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Dropout", "", &inputs, &node, i64::MAX).unwrap();
+        assert_eq!(result.len(), 2);
+        // Mask shape must match data shape [2, 3]
+        let mask_shape = result[1].shape().unwrap();
+        assert_eq!(mask_shape.len(), 2);
+        assert_eq!(mask_shape[0].as_const().unwrap(), 2);
+        assert_eq!(mask_shape[1].as_const().unwrap(), 3);
+        // All mask values should be true
+        let arr = result[1].to_ndarray::<bool>().unwrap();
+        assert!(arr.iter().all(|&v| v));
+    }
+
+    #[test]
+    fn test_constant_of_shape_empty() {
+        let registry = OpRegistry::new();
+        let shape = Tensor::from_slice(&[0i64]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("ConstantOfShape", "", &[shape], &node).unwrap();
+        let arr = result.to_ndarray::<f32>().unwrap();
+        assert_eq!(arr.len(), 0);
+        assert_eq!(arr.shape(), &[0]);
+    }
+
+    #[test]
+    fn test_reduce_log_sum_exp() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+
+        let mut node = NodeProto::default();
+        let mut axes_attr = AttributeProto::default();
+        axes_attr.name = "axes".to_string();
+        axes_attr.ints = vec![1];
+        node.attribute.push(axes_attr);
+        let mut kd_attr = AttributeProto::default();
+        kd_attr.name = "keepdims".to_string();
+        kd_attr.i = 1;
+        node.attribute.push(kd_attr);
+
+        // Use opset 12 so axes come from attributes
+        let inputs = vec![Some(x)];
+        let result = registry.dispatch_multi("ReduceLogSumExp", "", &inputs, &node, 12).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        // log(exp(1)+exp(2)) ≈ 2.3133, log(exp(3)+exp(4)) ≈ 4.3133
+        assert!((vals[0] - 2.3133).abs() < 0.01, "got {}", vals[0]);
+        assert!((vals[1] - 4.3133).abs() < 0.01, "got {}", vals[1]);
     }
 }

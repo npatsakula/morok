@@ -152,6 +152,16 @@ impl Tensor {
         Vec::new()
     }
 
+    /// Create an empty (0-element) tensor with the given dtype and shape `[0]`.
+    ///
+    /// Matches Tinygrad's `Tensor([], dtype=dtype)`. No buffer is allocated.
+    pub fn empty(dtype: DType) -> Self {
+        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 0, dtype);
+        let shape = Shape::from_iter([SInt::Const(0)]);
+        let uop = buffer_uop.try_reshape(&shape).expect("empty reshape to [0]");
+        Self::new(uop)
+    }
+
     /// Create a tensor filled with a constant value, broadcast to the given shape.
     pub fn full(shape: &[usize], value: impl Into<ConstValue>, dtype: DType) -> Result<Self> {
         let scalar = Self::const_(value, dtype);
@@ -207,46 +217,48 @@ impl Tensor {
     ///
     /// Uses lazy `full(step)._cumalu(0, Add) + (start - step)` which
     /// `reduce_collapse` simplifies into `RANGE * step + offset`.
+    /// Create 1D tensor with evenly spaced values (integer parameters).
+    ///
+    /// Matches Tinygrad's `Tensor.arange()`: `full(step) → cumsum → + (start - step)`.
     pub fn arange_with_dtype(start: i64, stop: Option<i64>, step: Option<i64>, dtype: DType) -> Result<Self> {
-        let (actual_start, actual_stop) = match stop {
+        let (start, stop) = match stop {
             Some(s) => (start, s),
             None => (0, start),
         };
-
-        let actual_step = step.unwrap_or(1);
-
-        if actual_step == 0 {
+        let step = step.unwrap_or(1);
+        if step == 0 {
             return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
         }
-
-        let count = if actual_step > 0 {
-            if actual_stop <= actual_start {
-                0
-            } else {
-                ((actual_stop - actual_start + actual_step - 1) / actual_step) as usize
-            }
-        } else if actual_stop >= actual_start {
-            0
-        } else {
-            ((actual_start - actual_stop - actual_step - 1) / (-actual_step)) as usize
-        };
-
-        if count == 0 {
-            return Ok(Self::from_slice::<i32, _>(&[]));
-        }
-
-        // Lazy: full(step)._cumalu(0, Add) + (start - step)
-        let step_tensor = Self::full(&[count], ConstValue::Int(actual_step), dtype.clone())?;
-        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
-        let offset = Self::const_(ConstValue::Int(actual_start - actual_step), dtype);
-        cumsum.try_add(&offset)
+        Self::arange_inner(start as f64, stop as f64, step as f64, dtype, false)
     }
 
     /// Create 1D tensor with evenly spaced Int32 values.
-    ///
-    /// Convenience wrapper around `arange_with_dtype` with `DType::Int32` default.
     pub fn arange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<Self> {
         Self::arange_with_dtype(start, stop, step, DType::Int32)
+    }
+
+    /// Create 1D tensor with evenly spaced values (float parameters).
+    ///
+    /// Handles float start/stop/step natively, matching Tinygrad's `Tensor.arange()`.
+    pub fn arange_f64(start: f64, stop: f64, step: f64, dtype: DType) -> Result<Self> {
+        if step == 0.0 {
+            return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
+        }
+        Self::arange_inner(start, stop, step, dtype, true)
+    }
+
+    /// Shared implementation: `full(count, step) → cumsum → + (start - step)`.
+    fn arange_inner(start: f64, stop: f64, step: f64, dtype: DType, is_float: bool) -> Result<Self> {
+        let count = ((stop - start) / step).ceil() as i64;
+        if count <= 0 {
+            return Ok(Self::empty(dtype));
+        }
+        let count = count as usize;
+        let val = |v: f64| if is_float { ConstValue::Float(v) } else { ConstValue::Int(v as i64) };
+        let step_tensor = Self::full(&[count], val(step), dtype.clone())?;
+        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
+        let offset = Self::const_(val(start - step), dtype.clone());
+        cumsum.try_add(&offset)?.cast(dtype)
     }
 
     /// Create tensor from slice on CPU (default device).
@@ -437,6 +449,17 @@ impl Tensor {
         use ndarray::{ArrayD, IxDyn};
 
         // If no buffer, materialize the tensor.
+        // Get shape first to check for zero-size tensors
+        let uop = self.uop();
+        let shape = uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
+        let dims: Vec<usize> = shape.iter().map(|dim| dim.as_const().unwrap_or(1)).collect();
+
+        // Zero-size tensor: return empty ndarray without realization (matches Tinygrad)
+        if dims.contains(&0) {
+            let arr = ArrayD::from_shape_vec(IxDyn(&dims), vec![]).context(NdarrayShapeSnafu)?;
+            return Ok(arr);
+        }
+
         // Following Tinygrad's approach: `.numpy()` calls `.contiguous().realize()` first.
         let buffer = match self.buffer() {
             Some(buf) => buf,
@@ -450,13 +473,6 @@ impl Tensor {
         if buffer.dtype() != T::DTYPE {
             return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail();
         }
-
-        // Get shape
-        let uop = self.uop();
-        let shape = uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
-
-        // Convert shape to usize dimensions
-        let dims: Vec<usize> = shape.iter().map(|dim| dim.as_const().unwrap_or(1)).collect();
 
         // Extract data
         let count = buffer.size() / T::DTYPE.bytes();
