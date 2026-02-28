@@ -325,7 +325,20 @@ impl OpRegistry {
                 let axis = get_attr_int(node, "axis", default_axis) as isize;
                 inp(inputs, 0).log_softmax(axis)?
             }
-            "Gelu" => inp(inputs, 0).gelu()?,
+            "Gelu" => {
+                let approximate = get_attr_string(node, "approximate", "none");
+                if approximate == "tanh" {
+                    inp(inputs, 0).gelu()?
+                } else {
+                    // Exact: 0.5 * x * (1 + erf(x / sqrt(2)))
+                    let x = inp(inputs, 0);
+                    let dtype = x.uop().dtype();
+                    let half = Tensor::const_(0.5f64, dtype.clone());
+                    let one = Tensor::const_(1.0f64, dtype.clone());
+                    let sqrt2 = Tensor::const_(std::f64::consts::SQRT_2, dtype);
+                    half.try_mul(x)?.try_mul(&one.try_add(&x.try_div(&sqrt2)?.erf()?)?)?
+                }
+            }
             "HardSigmoid" => {
                 let alpha = get_attr_float(node, "alpha", 0.2) as f64;
                 let beta = get_attr_float(node, "beta", 0.5) as f64;
@@ -391,7 +404,10 @@ impl OpRegistry {
             // === Type ===
             "Cast" => {
                 let to = get_attr_int(node, "to", 1);
-                let dtype = convert_onnx_dtype(to as i32)?;
+                let dtype = convert_onnx_dtype(to as i32).unwrap_or_else(|_| {
+                    tracing::warn!("ONNX dtype {to} unsupported, falling back to Float32");
+                    DType::Float32
+                });
                 inp(inputs, 0).cast(dtype)?
             }
 
@@ -406,7 +422,23 @@ impl OpRegistry {
                 let tensors: Vec<&Tensor> = inputs.iter().filter_map(|o| o.as_ref()).collect();
                 Tensor::cat(&tensors, axis)?
             }
-            "Shape" => inp(inputs, 0).shape_tensor()?,
+            "Shape" => {
+                let start = get_attr_int(node, "start", 0) as isize;
+                let end = get_attr_int(node, "end", i64::MAX) as isize;
+                let shape = inp(inputs, 0).shape()?;
+                let ndim = shape.len() as isize;
+                let s = if start < 0 { (ndim + start).max(0) } else { start.min(ndim) } as usize;
+                let e = (if end < 0 { (ndim + end).max(0) } else { end.min(ndim) } as usize).max(s);
+                let dims: Vec<i64> = shape[s..e]
+                    .iter()
+                    .map(|d| {
+                        d.as_const()
+                            .map(|v| v as i64)
+                            .ok_or_else(|| Error::IrConstruction { details: "Shape requires concrete dims".into() })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Tensor::from_slice(&dims)
+            }
 
             // === Indexing ===
             "Gather" => {
@@ -477,12 +509,50 @@ impl OpRegistry {
             "ArgMax" => {
                 let axis = get_attr_int(node, "axis", 0) as isize;
                 let keepdims = get_attr_int(node, "keepdims", 1) == 1;
-                inp(inputs, 0).argmax_with().axis(Some(axis)).keepdim(keepdims).call()?
+                let select_last = get_attr_int(node, "select_last_index", 0) == 1;
+                let x = inp(inputs, 0);
+                if select_last {
+                    let shape = x.shape()?;
+                    let na = if axis < 0 { shape.len() as isize + axis } else { axis } as usize;
+                    let ds = shape[na].as_const().ok_or_else(|| Error::IrConstruction {
+                        details: format!("ArgMax select_last_index needs concrete axis {na}"),
+                    })? as i64;
+                    Tensor::const_(ConstValue::Int(ds - 1), DType::Int64).try_sub(
+                        &x.flip(&[axis])?
+                            .argmax_with()
+                            .axis(Some(axis))
+                            .keepdim(keepdims)
+                            .call()?
+                            .cast(DType::Int64)?,
+                    )?
+                } else {
+                    x.argmax_with().axis(Some(axis)).keepdim(keepdims).call()?.cast(DType::Int64)?
+                }
             }
             "ArgMin" => {
                 let axis = get_attr_int(node, "axis", 0) as isize;
                 let keepdims = get_attr_int(node, "keepdims", 1) == 1;
-                inp(inputs, 0).argmin_with().axis(Some(axis)).keepdim(keepdims).call()?
+                let select_last = get_attr_int(node, "select_last_index", 0) == 1;
+                let x = inp(inputs, 0);
+                let neg_x = x.try_neg()?;
+                if select_last {
+                    let shape = x.shape()?;
+                    let na = if axis < 0 { shape.len() as isize + axis } else { axis } as usize;
+                    let ds = shape[na].as_const().ok_or_else(|| Error::IrConstruction {
+                        details: format!("ArgMin select_last_index needs concrete axis {na}"),
+                    })? as i64;
+                    Tensor::const_(ConstValue::Int(ds - 1), DType::Int64).try_sub(
+                        &neg_x
+                            .flip(&[axis])?
+                            .argmax_with()
+                            .axis(Some(axis))
+                            .keepdim(keepdims)
+                            .call()?
+                            .cast(DType::Int64)?,
+                    )?
+                } else {
+                    neg_x.argmax_with().axis(Some(axis)).keepdim(keepdims).call()?.cast(DType::Int64)?
+                }
             }
 
             // === NN ===
@@ -550,16 +620,38 @@ impl OpRegistry {
     }
 
     fn op_reshape(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
-        let shape = get_attr_ints(node, "shape");
-        if !shape.is_empty() {
-            let shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
-            Ok(inp(inputs, 0).try_reshape(&shape)?)
-        } else if inputs.len() > 1 && inputs[1].is_some() {
-            let shape: Vec<isize> = tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as isize).collect();
-            Ok(inp(inputs, 0).try_reshape(&shape)?)
+        let allowzero = get_attr_int(node, "allowzero", 0);
+        let data = inp(inputs, 0);
+
+        let raw_shape: Vec<isize> = {
+            let attr_shape = get_attr_ints(node, "shape");
+            if !attr_shape.is_empty() {
+                attr_shape.iter().map(|&d| d as isize).collect()
+            } else if inputs.len() > 1 && inputs[1].is_some() {
+                tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as isize).collect()
+            } else {
+                return Err(Error::IrConstruction { details: "Reshape requires shape attribute or input".to_string() });
+            }
+        };
+
+        let shape = if allowzero == 0 {
+            let data_shape = data.shape()?;
+            raw_shape
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| {
+                    if d == 0 {
+                        data_shape.get(i).and_then(|s| s.as_const()).map(|v| v as isize).unwrap_or(d)
+                    } else {
+                        d
+                    }
+                })
+                .collect()
         } else {
-            Err(Error::IrConstruction { details: "Reshape requires shape attribute or input".to_string() })
-        }
+            raw_shape
+        };
+
+        Ok(data.try_reshape(&shape)?)
     }
 
     fn op_transpose(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
@@ -610,13 +702,16 @@ impl OpRegistry {
     }
 
     fn op_flatten(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
-        let axis = get_attr_int(node, "axis", 1) as usize;
         let shape = inp(inputs, 0).shape()?;
-        let pre: isize = shape[..axis]
-            .iter()
-            .try_fold(1isize, |acc, d| d.as_const().map(|v| acc * v as isize))
-            .ok_or_else(|| Error::IrConstruction { details: "Flatten requires concrete shape".into() })?;
-        Ok(inp(inputs, 0).try_reshape(&[pre, -1])?)
+        let ndim = shape.len() as i64;
+        let axis_raw = get_attr_int(node, "axis", 1);
+        let axis = (if axis_raw < 0 { ndim + axis_raw } else { axis_raw }) as usize;
+        let pre = morok_ir::sint_prod(&shape[..axis]);
+        let pre_val = pre
+            .as_const()
+            .map(|v| v as isize)
+            .ok_or_else(|| Error::IrConstruction { details: "Flatten requires concrete pre-axis dimensions".into() })?;
+        Ok(inp(inputs, 0).try_reshape(&[pre_val, -1])?)
     }
 
     fn op_gemm(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
@@ -649,27 +744,17 @@ impl OpRegistry {
     }
 
     fn op_expand(&self, inputs: &[Option<Tensor>]) -> Result<Tensor> {
+        use morok_ir::SInt;
+        use morok_ir::shape::{align_shapes_left, broadcast_shape};
+
         let data = inp(inputs, 0);
-        let target_shape: Vec<isize> = tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as isize).collect();
-        let data_ndim = data.ndim()?;
-
-        // ONNX Expand uses numpy broadcasting: may add leading dimensions
-        let mut result = data.clone();
-        for _ in data_ndim..target_shape.len() {
-            result = result.try_unsqueeze(0)?;
-        }
-
-        // -1 or same-size means keep, otherwise broadcast
-        let cur_shape = result.shape()?;
-        let expand_spec: Vec<isize> = target_shape
-            .iter()
-            .zip(cur_shape.iter())
-            .map(|(&tgt, cur)| {
-                let cur_val = cur.as_const().unwrap_or(1) as isize;
-                if tgt == -1 || tgt == cur_val { -1 } else { tgt }
-            })
-            .collect();
-        Ok(result.try_expand(&expand_spec)?)
+        let target_i64 = tensor_to_i64_vec(inp(inputs, 1))?;
+        let target: morok_ir::shape::Shape = target_i64.iter().map(|&v| SInt::from(v as usize)).collect();
+        let data_shape = data.shape()?;
+        let aligned = align_shapes_left(&[data_shape, target]);
+        let result_shape = broadcast_shape(&aligned[0], &aligned[1])
+            .map_err(|e| Error::IrConstruction { details: format!("Expand broadcast: {e}") })?;
+        Ok(data.broadcast_to(&result_shape)?)
     }
 
     fn op_pad(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
@@ -684,10 +769,28 @@ impl OpRegistry {
             Some(cv) => tensor_to_f64_scalar(cv)?,
             None => 0.0,
         };
-        // ONNX format: [x1_begin, x2_begin, ..., x1_end, x2_end, ...]
-        let ndim = pads.len() / 2;
-        let padding: Vec<(isize, isize)> = (0..ndim).map(|i| (pads[i] as isize, pads[ndim + i] as isize)).collect();
-        Ok(inp(inputs, 0).try_pad_value(&padding, pad_value)?)
+        let data = inp(inputs, 0);
+        let ndim = data.ndim()?;
+        let num_axes = pads.len() / 2;
+
+        // Optional axes input (input[3]): route pads to specific dimensions
+        let axes: Option<Vec<usize>> = inputs
+            .get(3)
+            .and_then(|o| o.as_ref())
+            .map(tensor_to_i64_vec)
+            .transpose()?
+            .map(|v| v.iter().map(|&a| if a < 0 { (ndim as i64 + a) as usize } else { a as usize }).collect());
+
+        let padding = if let Some(axes) = axes {
+            let mut full = vec![(0isize, 0isize); ndim];
+            for (i, &ax) in axes.iter().enumerate() {
+                full[ax] = (pads[i] as isize, pads[num_axes + i] as isize);
+            }
+            full
+        } else {
+            (0..num_axes).map(|i| (pads[i] as isize, pads[num_axes + i] as isize)).collect()
+        };
+        Ok(data.try_pad_value(&padding, pad_value)?)
     }
 
     fn op_slice(&self, inputs: &[Option<Tensor>]) -> Result<Tensor> {
@@ -712,42 +815,100 @@ impl OpRegistry {
             .transpose()?
             .unwrap_or_else(|| vec![1; starts.len()]);
 
-        for &s in &steps {
-            if s != 1 && s != -1 {
-                return Err(Error::IrConstruction {
-                    details: format!("Slice with step={s} not supported (only 1 and -1)"),
-                });
-            }
-        }
-
         let mut ranges: Vec<(isize, isize)> =
             (0..ndim).map(|d| (0isize, shape[d].as_const().unwrap() as isize)).collect();
         let mut flip_axes: Vec<isize> = Vec::new();
 
         for (i, &axis) in axes.iter().enumerate() {
             let d = shape[axis].as_const().unwrap() as i64;
-            let mut s = starts[i].clamp(-d, d);
-            let mut e = ends[i].clamp(-d, d);
+            let step = steps[i];
+            if step == 0 {
+                return Err(Error::IrConstruction { details: "Slice step cannot be 0".into() });
+            }
+
+            // Replicate Python's slice.indices(d): step-dependent clamping
+            let (lower, upper) = if step > 0 { (0i64, d) } else { (-1i64, d - 1) };
+            let mut s = starts[i].clamp(-d, d - 1);
             if s < 0 {
                 s += d;
             }
+            let s = s.clamp(lower, upper);
+
+            let mut e = ends[i].clamp(-d - 1, d);
             if e < 0 {
                 e += d;
             }
+            let e = e.clamp(lower, upper);
 
-            if steps[i] == -1 {
+            if step * (e - s) < 0 {
+                // Empty range
+                ranges[axis] = (0, 0);
+            } else if step < 0 {
                 flip_axes.push(axis as isize);
-                ranges[axis] = ((d - e) as isize, (d - s) as isize);
+                ranges[axis] = ((e + 1) as isize, (s + 1) as isize);
             } else {
                 ranges[axis] = (s as isize, e as isize);
             }
         }
 
-        let mut result = data.clone();
+        // Shrink first, then flip (Tinygrad order)
+        let mut result = data.try_shrink(&ranges)?;
         if !flip_axes.is_empty() {
             result = result.flip(&flip_axes)?;
         }
-        Ok(result.try_shrink(&ranges)?)
+
+        // Apply strides > 1 via pad→reshape→shrink→reshape pattern
+        for (i, &axis) in axes.iter().enumerate() {
+            let abs_step = steps[i].unsigned_abs() as usize;
+            if abs_step <= 1 {
+                continue;
+            }
+            let cur = result.shape()?;
+            let size = cur[axis].as_const().unwrap();
+            let padded = size.div_ceil(abs_step) * abs_step;
+            if padded > size {
+                let mut p = vec![(0isize, 0isize); cur.len()];
+                p[axis] = (0, (padded - size) as isize);
+                result = result.try_pad(&p)?;
+            }
+            let n = padded / abs_step;
+            // Reshape: split axis into (n_groups, step)
+            let cs = result.shape()?;
+            let mut rs: Vec<isize> = Vec::new();
+            for (d, dim) in cs.iter().enumerate() {
+                if d == axis {
+                    rs.push(n as isize);
+                    rs.push(abs_step as isize);
+                } else {
+                    rs.push(dim.as_const().unwrap() as isize);
+                }
+            }
+            result = result.try_reshape(&rs)?;
+            // Shrink step dim to (0, 1) — take first element of each group
+            let ss = result.shape()?;
+            let sr: Vec<(isize, isize)> = ss
+                .iter()
+                .enumerate()
+                .map(|(d, dim)| if d == axis + 1 { (0, 1) } else { (0, dim.as_const().unwrap() as isize) })
+                .collect();
+            result = result.try_shrink(&sr)?;
+            // Collapse step dim back
+            let fs: Vec<isize> = result
+                .shape()?
+                .iter()
+                .enumerate()
+                .filter(|&(d, _)| d != axis + 1)
+                .map(|(_, dim)| dim.as_const().unwrap() as isize)
+                .collect();
+            result = result.try_reshape(&fs)?;
+        }
+
+        // After flip or stride operations, the view chain may not be contiguous
+        if !flip_axes.is_empty() || steps.iter().any(|&s| s.unsigned_abs() > 1) {
+            result = result.contiguous();
+        }
+
+        Ok(result)
     }
 
     fn op_split(&self, inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
@@ -1336,5 +1497,340 @@ mod tests {
         // log(exp(1)+exp(2)) ≈ 2.3133, log(exp(3)+exp(4)) ≈ 4.3133
         assert!((vals[0] - 2.3133).abs() < 0.01, "got {}", vals[0]);
         assert!((vals[1] - 4.3133).abs() < 0.01, "got {}", vals[1]);
+    }
+
+    // === Batch 2: Semantic fixes tests ===
+
+    #[test]
+    fn test_shape_start_end() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0,
+            20.0, 21.0, 22.0, 23.0, 24.0,
+        ])
+        .try_reshape(&[2, 3, 4])
+        .unwrap();
+        let mut node = NodeProto::default();
+        let mut attr_s = AttributeProto::default();
+        attr_s.name = "start".to_string();
+        attr_s.i = 1;
+        node.attribute.push(attr_s);
+        let mut attr_e = AttributeProto::default();
+        attr_e.name = "end".to_string();
+        attr_e.i = 3;
+        node.attribute.push(attr_e);
+
+        let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
+        let arr = result.to_ndarray::<i64>().unwrap();
+        let vals: Vec<i64> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![3, 4]);
+    }
+
+    #[test]
+    fn test_shape_negative_start() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "start".to_string();
+        attr.i = -1;
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
+        let arr = result.to_ndarray::<i64>().unwrap();
+        let vals: Vec<i64> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![4]);
+    }
+
+    #[test]
+    fn test_gelu_exact() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[0.0f32, 1.0, -1.0]);
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "approximate".to_string();
+        attr.s = b"none".to_vec();
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Gelu", "", &[x], &node).unwrap();
+        let arr = result.to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert!((vals[0] - 0.0).abs() < 1e-4, "gelu(0) = {}", vals[0]);
+        assert!((vals[1] - 0.8413).abs() < 1e-3, "gelu(1) = {}", vals[1]);
+        assert!((vals[2] - (-0.1587)).abs() < 1e-3, "gelu(-1) = {}", vals[2]);
+    }
+
+    #[test]
+    fn test_gelu_tanh_regression() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[0.0f32, 1.0]);
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "approximate".to_string();
+        attr.s = b"tanh".to_vec();
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Gelu", "", &[x], &node).unwrap();
+        let arr = result.to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert!((vals[0] - 0.0).abs() < 1e-4, "gelu_tanh(0) = {}", vals[0]);
+        assert!((vals[1] - 0.8412).abs() < 1e-3, "gelu_tanh(1) = {}", vals[1]);
+    }
+
+    #[test]
+    fn test_reshape_allowzero_copy() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+        let shape_tensor = Tensor::from_slice(&[0i64, 3, -1]);
+        let inputs = vec![Some(data), Some(shape_tensor)];
+        let node = NodeProto::default(); // allowzero defaults to 0
+
+        let result = registry.dispatch_multi("Reshape", "", &inputs, &node, i64::MAX).unwrap();
+        let s = result[0].shape().unwrap();
+        assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_argmax_select_last() {
+        let registry = OpRegistry::new();
+        // [1, 3, 2, 3] — max=3 appears at indices 1 and 3
+        let x = Tensor::from_slice(&[1.0f32, 3.0, 2.0, 3.0]);
+        let mut node = NodeProto::default();
+        let mut attr_sel = AttributeProto::default();
+        attr_sel.name = "select_last_index".to_string();
+        attr_sel.i = 1;
+        node.attribute.push(attr_sel);
+
+        let result = registry.dispatch("ArgMax", "", &[x], &node).unwrap();
+        let arr = result.to_ndarray::<i64>().unwrap();
+        let vals: Vec<i64> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![3], "ArgMax select_last should return 3");
+    }
+
+    #[test]
+    fn test_argmin_select_last() {
+        let registry = OpRegistry::new();
+        // [3, 1, 2, 1] — min=1 appears at indices 1 and 3
+        let x = Tensor::from_slice(&[3.0f32, 1.0, 2.0, 1.0]);
+        let mut node = NodeProto::default();
+        let mut attr_sel = AttributeProto::default();
+        attr_sel.name = "select_last_index".to_string();
+        attr_sel.i = 1;
+        node.attribute.push(attr_sel);
+
+        let result = registry.dispatch("ArgMin", "", &[x], &node).unwrap();
+        let arr = result.to_ndarray::<i64>().unwrap();
+        let vals: Vec<i64> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![3], "ArgMin select_last should return 3");
+    }
+
+    #[test]
+    fn test_argmax_cast_int64() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 3.0, 2.0]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("ArgMax", "", &[x], &node).unwrap();
+        assert_eq!(result.uop().dtype(), DType::Int64, "ArgMax should always return Int64");
+    }
+
+    #[test]
+    fn test_expand_broadcast() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[3, 1]).unwrap();
+        let target = Tensor::from_slice(&[2i64, 3, 4]);
+        let inputs = vec![Some(data), Some(target)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Expand", "", &inputs, &node, i64::MAX).unwrap();
+        let s = result[0].shape().unwrap();
+        assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_flatten_axis_variants() {
+        let registry = OpRegistry::new();
+
+        for (axis, expected_shape) in [(0, vec![1, 24]), (1, vec![2, 12]), (2, vec![6, 4])] {
+            let x = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+            let mut node = NodeProto::default();
+            let mut attr = AttributeProto::default();
+            attr.name = "axis".to_string();
+            attr.i = axis;
+            node.attribute.push(attr);
+
+            let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
+            let s = result.shape().unwrap();
+            let dims: Vec<usize> = s.iter().map(|d| d.as_const().unwrap()).collect();
+            assert_eq!(dims, expected_shape, "Flatten axis={axis}");
+        }
+    }
+
+    #[test]
+    fn test_pad_with_axes() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let pads = Tensor::from_slice(&[1i64, 1]); // 1 before, 1 after
+        let axes = Tensor::from_slice(&[1i64]); // only pad axis 1
+        let inputs = vec![Some(data), Some(pads), None, Some(axes)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Pad", "", &inputs, &node, i64::MAX).unwrap();
+        let s = result[0].shape().unwrap();
+        assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 5]);
+    }
+
+    #[test]
+    fn test_cast_fallback() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "to".to_string();
+        attr.i = 999; // invalid dtype code
+        node.attribute.push(attr);
+
+        // Should not crash — falls back to Float32
+        let result = registry.dispatch("Cast", "", &[x], &node);
+        assert!(result.is_ok(), "Cast with invalid dtype should fallback, not crash");
+    }
+
+    #[test]
+    fn test_slice_step_2() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let starts = Tensor::from_slice(&[0i64]);
+        let ends = Tensor::from_slice(&[10i64]);
+        let axes = Tensor::from_slice(&[0i64]);
+        let steps = Tensor::from_slice(&[2i64]);
+        let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![0.0, 2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn test_slice_step_3() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let starts = Tensor::from_slice(&[0i64]);
+        let ends = Tensor::from_slice(&[10i64]);
+        let axes = Tensor::from_slice(&[0i64]);
+        let steps = Tensor::from_slice(&[3i64]);
+        let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![0.0, 3.0, 6.0, 9.0]);
+    }
+
+    #[test]
+    fn test_slice_neg_step_2() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let starts = Tensor::from_slice(&[5i64]);
+        let ends = Tensor::from_slice(&[0i64]);
+        let axes = Tensor::from_slice(&[0i64]);
+        let steps = Tensor::from_slice(&[-2i64]);
+        let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![5.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    fn test_slice_full_reverse() {
+        // start=5, end=-100, step=-1 → should include element 0
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let starts = Tensor::from_slice(&[5i64]);
+        let ends = Tensor::from_slice(&[-100i64]);
+        let axes = Tensor::from_slice(&[0i64]);
+        let steps = Tensor::from_slice(&[-1i64]);
+        let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![5.0, 4.0, 3.0, 2.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_slice_large_start_neg_step() {
+        // start=100, end=0, step=-1 → clamps start to d-1=5
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let starts = Tensor::from_slice(&[100i64]);
+        let ends = Tensor::from_slice(&[0i64]);
+        let axes = Tensor::from_slice(&[0i64]);
+        let steps = Tensor::from_slice(&[-1i64]);
+        let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert_eq!(vals, vec![5.0, 4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_slice_step_zero_errors() {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0]);
+        let starts = Tensor::from_slice(&[0i64]);
+        let ends = Tensor::from_slice(&[3i64]);
+        let axes = Tensor::from_slice(&[0i64]);
+        let steps = Tensor::from_slice(&[0i64]);
+        let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
+        let node = NodeProto::default();
+
+        assert!(registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).is_err());
+    }
+
+    #[test]
+    fn test_flatten_negative_axis() {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+        let mut node = NodeProto::default();
+        let mut attr = AttributeProto::default();
+        attr.name = "axis".to_string();
+        attr.i = -1;
+        node.attribute.push(attr);
+
+        let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
+        let s = result.shape().unwrap();
+        let dims: Vec<usize> = s.iter().map(|d| d.as_const().unwrap()).collect();
+        assert_eq!(dims, vec![6, 4]); // axis=-1 → axis=2 → pre=2*3=6, post=4
+    }
+
+    #[test]
+    fn test_shape_start_gt_end() {
+        // start=2, end=1 → should return empty, not panic
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+        let inputs = vec![Some(x)];
+        let mut node = NodeProto::default();
+        let mut attr_s = AttributeProto::default();
+        attr_s.name = "start".to_string();
+        attr_s.i = 2;
+        node.attribute.push(attr_s);
+        let mut attr_e = AttributeProto::default();
+        attr_e.name = "end".to_string();
+        attr_e.i = 1;
+        node.attribute.push(attr_e);
+
+        let result = registry.dispatch_multi("Shape", "", &inputs, &node, i64::MAX).unwrap();
+        let arr = result[0].to_ndarray::<i64>().unwrap();
+        let vals: Vec<i64> = arr.iter().copied().collect();
+        assert!(vals.is_empty()); // empty shape
     }
 }
