@@ -324,6 +324,43 @@ impl Tensor {
         Self::with_buffer(entry, buffer_arc)
     }
 
+    /// Create tensor from raw bytes with explicit dtype and shape.
+    ///
+    /// The bytes are interpreted as little-endian values of the given dtype.
+    /// Length must equal `product(shape) * dtype.bytes()`.
+    /// Used for types without a native Rust representation (Float16, BFloat16, FP8).
+    pub fn from_raw_bytes(data: &[u8], shape: &[usize], dtype: DType) -> Result<Self> {
+        let numel: usize = shape.iter().product();
+        let expected_bytes = numel * dtype.bytes();
+        if data.len() != expected_bytes {
+            return Err(error::Error::IrConstruction {
+                details: format!(
+                    "from_raw_bytes: data length {} != expected {} ({} elements * {} bytes)",
+                    data.len(),
+                    expected_bytes,
+                    numel,
+                    dtype.bytes()
+                ),
+            });
+        }
+
+        let flat_shape = Shape::from_iter([SInt::Const(numel)]);
+        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, numel, dtype.clone());
+        let buffer_uop_id = buffer_uop.id;
+
+        let allocator = registry::cpu().expect("CPU always accessible");
+        let mut buffer = Buffer::new(allocator, dtype.clone(), vec![numel], Default::default());
+        buffer.copyin(data).expect("Buffer write always successful");
+
+        let buffer_arc = Arc::new(buffer);
+        let uop = buffer_uop.try_reshape(&flat_shape).expect("flat reshape always succeeds");
+
+        let entry = tensor_registry::register_tensor_with_buffer(uop, buffer_arc.clone(), buffer_uop_id);
+        let tensor = Self::with_buffer(entry, buffer_arc);
+        let isize_shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
+        tensor.try_reshape(&isize_shape)
+    }
+
     // === Constant Constructors ===
 
     /// Create a scalar constant tensor.

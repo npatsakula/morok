@@ -1,5 +1,7 @@
 //! ONNX operator registry - maps ONNX ops to Morok Tensor operations.
 
+use std::path::Path;
+
 use morok_dtype::{DType, ScalarDType};
 use morok_ir::ConstValue;
 use morok_tensor::Tensor;
@@ -36,11 +38,73 @@ pub fn convert_onnx_dtype(onnx_dtype: i32) -> Result<DType> {
 
 /// Create a Tensor from ONNX TensorProto (weights/initializers).
 pub fn tensor_from_proto(tensor: &TensorProto) -> Result<Tensor> {
+    tensor_from_proto_ext(tensor, None)
+}
+
+/// Create a Tensor from ONNX TensorProto, with optional model directory for external data.
+pub fn tensor_from_proto_ext(tensor: &TensorProto, model_dir: Option<&Path>) -> Result<Tensor> {
     let dtype = convert_onnx_dtype(tensor.data_type)?;
     let dims: Vec<usize> = tensor.dims.iter().map(|&d| d as usize).collect();
-    let raw_data = extract_tensor_data(tensor)?;
+
+    let raw_data = if tensor.data_location == 1 {
+        let dir = model_dir
+            .ok_or_else(|| Error::IrConstruction { details: "External data requires model directory path".into() })?;
+        load_external_data(tensor, dir)?
+    } else {
+        extract_tensor_data(tensor)?
+    };
 
     create_tensor_from_raw(&raw_data, &dims, dtype)
+}
+
+/// Load external tensor data from file.
+///
+/// ONNX spec: when `data_location == 1`, `external_data` contains key-value pairs
+/// with "location" (file path), "offset", and "length".
+fn load_external_data(tensor: &TensorProto, model_dir: &Path) -> Result<Vec<u8>> {
+    let mut location = None;
+    let mut offset: u64 = 0;
+    let mut length: Option<u64> = None;
+
+    for kv in &tensor.external_data {
+        match kv.key.as_str() {
+            "location" => location = Some(kv.value.clone()),
+            "offset" => offset = kv.value.parse().unwrap_or(0),
+            "length" => length = kv.value.parse().ok(),
+            _ => {}
+        }
+    }
+
+    let location =
+        location.ok_or_else(|| Error::IrConstruction { details: "External data missing 'location' key".into() })?;
+
+    let path = model_dir.join(&location);
+    let mut file = std::fs::File::open(&path).map_err(|e| Error::IrConstruction {
+        details: format!("External data file not found: {}: {e}", path.display()),
+    })?;
+
+    use std::io::{Read, Seek, SeekFrom};
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| Error::IrConstruction { details: format!("External data seek failed: {e}") })?;
+    }
+
+    let data = match length {
+        Some(len) => {
+            let mut buf = vec![0u8; len as usize];
+            file.read_exact(&mut buf)
+                .map_err(|e| Error::IrConstruction { details: format!("External data read failed: {e}") })?;
+            buf
+        }
+        None => {
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf)
+                .map_err(|e| Error::IrConstruction { details: format!("External data read failed: {e}") })?;
+            buf
+        }
+    };
+
+    Ok(data)
 }
 
 /// Create Tensor from raw bytes, shape, and dtype.
@@ -55,19 +119,26 @@ fn create_tensor_from_raw(data: &[u8], dims: &[usize], dtype: DType) -> Result<T
     let tensor = match dtype.base() {
         ScalarDType::Float32 => typed!(f32),
         ScalarDType::Float64 => typed!(f64),
+        ScalarDType::Int8 => typed!(i8),
+        ScalarDType::Int16 => typed!(i16),
         ScalarDType::Int32 => typed!(i32),
         ScalarDType::Int64 => typed!(i64),
+        ScalarDType::UInt8 => typed!(u8),
+        ScalarDType::UInt16 => typed!(u16),
+        ScalarDType::UInt32 => typed!(u32),
+        ScalarDType::UInt64 => typed!(u64),
         ScalarDType::Bool => {
             // ONNX raw_data stores bools as single bytes; int32_data stores as i32.
-            // Detect format by checking if data is aligned to i32 boundaries.
             let values: Vec<bool> = if data.len() == dims.iter().product::<usize>() {
-                // 1-byte-per-element (raw_data or extract_tensor_data from int32)
                 data.iter().map(|&v| v != 0).collect()
             } else {
-                // i32-per-element fallback
                 bytemuck::cast_slice::<_, i32>(data).iter().map(|&v| v != 0).collect()
             };
             Tensor::from_slice(&values).try_reshape(&shape)
+        }
+        // Float16, BFloat16, FP8: no native Rust type — use raw bytes
+        ScalarDType::Float16 | ScalarDType::BFloat16 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => {
+            Tensor::from_raw_bytes(data, dims, dtype)
         }
         _ => {
             return Err(Error::IrConstruction { details: format!("Unsupported dtype for tensor creation: {dtype:?}") });
@@ -84,17 +155,26 @@ pub fn extract_tensor_data(tensor: &TensorProto) -> Result<Vec<u8>> {
 
     let dtype = convert_onnx_dtype(tensor.data_type)?;
 
-    // Match on dtype to select the right field
+    // ONNX proto field mapping (per onnx.proto spec):
+    //   float_data (field 4)  → Float32
+    //   int32_data (field 5)  → Int32, Int8, UInt8, Int16, UInt16, Bool, Float16, BFloat16, FP8
+    //   int64_data (field 7)  → Int64
+    //   double_data (field 10) → Float64
+    //   uint64_data (field 11) → UInt64, UInt32
     let data = match dtype.base() {
         ScalarDType::Float32 => tensor.float_data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
-        ScalarDType::Int32 | ScalarDType::UInt32 => tensor.int32_data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
-        ScalarDType::Int64 | ScalarDType::UInt64 => tensor.int64_data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+        ScalarDType::Float64 => tensor.double_data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+        ScalarDType::Int32 => tensor.int32_data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+        ScalarDType::Int64 => tensor.int64_data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+        ScalarDType::UInt32 => tensor.uint64_data.iter().flat_map(|&v| (v as u32).to_le_bytes()).collect(),
+        ScalarDType::UInt64 => tensor.uint64_data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
         ScalarDType::UInt8 | ScalarDType::Int8 | ScalarDType::Bool => {
             tensor.int32_data.iter().map(|&v| v as u8).collect()
         }
-        ScalarDType::Float16 | ScalarDType::BFloat16 => {
+        ScalarDType::Int16 | ScalarDType::UInt16 | ScalarDType::Float16 | ScalarDType::BFloat16 => {
             tensor.int32_data.iter().flat_map(|&v| (v as u16).to_le_bytes()).collect()
         }
+        ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => tensor.int32_data.iter().map(|&v| v as u8).collect(),
         _ => tensor.int32_data.iter().flat_map(|&v| v.to_le_bytes()).collect(),
     };
 
@@ -1832,5 +1912,193 @@ mod tests {
         let arr = result[0].to_ndarray::<i64>().unwrap();
         let vals: Vec<i64> = arr.iter().copied().collect();
         assert!(vals.is_empty()); // empty shape
+    }
+
+    // === Tensor creation dtype tests ===
+
+    #[test]
+    fn test_create_tensor_int8() {
+        let values: Vec<i8> = vec![-128, 0, 127];
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t = create_tensor_from_raw(&data, &[3], DType::Int8).unwrap();
+        let arr = t.to_ndarray::<i8>().unwrap();
+        assert_eq!(arr.as_slice().unwrap(), &[-128i8, 0, 127]);
+    }
+
+    #[test]
+    fn test_create_tensor_uint8() {
+        let values: Vec<u8> = vec![0, 128, 255];
+        let t = create_tensor_from_raw(&values, &[3], DType::UInt8).unwrap();
+        let arr = t.to_ndarray::<u8>().unwrap();
+        assert_eq!(arr.as_slice().unwrap(), &[0u8, 128, 255]);
+    }
+
+    #[test]
+    fn test_create_tensor_int16() {
+        let values: Vec<i16> = vec![-32768, 0, 32767];
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t = create_tensor_from_raw(&data, &[3], DType::Int16).unwrap();
+        let arr = t.to_ndarray::<i16>().unwrap();
+        assert_eq!(arr.as_slice().unwrap(), &[-32768i16, 0, 32767]);
+    }
+
+    #[test]
+    fn test_create_tensor_uint16() {
+        let values: Vec<u16> = vec![0, 32768, 65535];
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t = create_tensor_from_raw(&data, &[3], DType::UInt16).unwrap();
+        let arr = t.to_ndarray::<u16>().unwrap();
+        assert_eq!(arr.as_slice().unwrap(), &[0u16, 32768, 65535]);
+    }
+
+    #[test]
+    fn test_create_tensor_uint32() {
+        let values: Vec<u32> = vec![0, 1_000_000, u32::MAX];
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t = create_tensor_from_raw(&data, &[3], DType::UInt32).unwrap();
+        let arr = t.to_ndarray::<u32>().unwrap();
+        assert_eq!(arr.as_slice().unwrap(), &[0u32, 1_000_000, u32::MAX]);
+    }
+
+    #[test]
+    fn test_create_tensor_uint64() {
+        let values: Vec<u64> = vec![0, 1_000_000_000, u64::MAX];
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t = create_tensor_from_raw(&data, &[3], DType::UInt64).unwrap();
+        let arr = t.to_ndarray::<u64>().unwrap();
+        assert_eq!(arr.as_slice().unwrap(), &[0u64, 1_000_000_000, u64::MAX]);
+    }
+
+    #[test]
+    fn test_create_tensor_float16() {
+        // IEEE 754 half-precision: 1.0 = 0x3C00, 2.0 = 0x4000, 0.5 = 0x3800
+        let f16_bits: Vec<u16> = vec![0x3C00, 0x4000, 0x3800];
+        let data: Vec<u8> = f16_bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t = create_tensor_from_raw(&data, &[3], DType::Float16).unwrap();
+        // Cast to f32 to verify values
+        let t_f32 = t.cast(DType::Float32).unwrap();
+        let arr = t_f32.to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert!((vals[0] - 1.0).abs() < 1e-3);
+        assert!((vals[1] - 2.0).abs() < 1e-3);
+        assert!((vals[2] - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_create_tensor_bfloat16() {
+        // BFloat16: 1.0 = 0x3F80, 2.0 = 0x4000, 0.5 = 0x3F00
+        let bf16_bits: Vec<u16> = vec![0x3F80, 0x4000, 0x3F00];
+        let data: Vec<u8> = bf16_bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t = create_tensor_from_raw(&data, &[3], DType::BFloat16).unwrap();
+        let t_f32 = t.cast(DType::Float32).unwrap();
+        let arr = t_f32.to_ndarray::<f32>().unwrap();
+        let vals: Vec<f32> = arr.iter().copied().collect();
+        assert!((vals[0] - 1.0).abs() < 1e-2);
+        assert!((vals[1] - 2.0).abs() < 1e-2);
+        assert!((vals[2] - 0.5).abs() < 1e-2);
+    }
+
+    #[test]
+    fn test_extract_float64_from_double_data() {
+        let mut tensor = TensorProto::default();
+        tensor.data_type = tensor_proto::DataType::Double as i32;
+        tensor.dims = vec![2];
+        tensor.double_data = vec![1.5, 2.5];
+
+        let data = extract_tensor_data(&tensor).unwrap();
+        let values: Vec<f64> = bytemuck::cast_slice(&data).to_vec();
+        assert_eq!(values, vec![1.5, 2.5]);
+    }
+
+    #[test]
+    fn test_extract_uint64_from_uint64_data() {
+        // ONNX spec: UInt64 uses uint64_data (proto field 11), NOT int64_data.
+        let mut tensor = TensorProto::default();
+        tensor.data_type = tensor_proto::DataType::Uint64 as i32;
+        tensor.dims = vec![2];
+        tensor.uint64_data = vec![100, 200];
+
+        let data = extract_tensor_data(&tensor).unwrap();
+        let values: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
+        assert_eq!(values, vec![100u64, 200]);
+    }
+
+    #[test]
+    fn test_extract_uint32_from_uint64_data() {
+        // ONNX spec: UInt32 uses uint64_data (proto field 11), NOT int32_data.
+        let mut tensor = TensorProto::default();
+        tensor.data_type = tensor_proto::DataType::Uint32 as i32;
+        tensor.dims = vec![2];
+        tensor.uint64_data = vec![100, 200];
+
+        let data = extract_tensor_data(&tensor).unwrap();
+        let values: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        assert_eq!(values, vec![100u32, 200]);
+    }
+
+    #[test]
+    fn test_external_data_loading() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("morok_test_external_data");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write external data file: 3 x f32 values
+        let values: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let data_path = dir.join("weights.bin");
+        let mut f = std::fs::File::create(&data_path).unwrap();
+        f.write_all(&raw).unwrap();
+
+        // Create TensorProto with external data
+        let mut tensor = TensorProto::default();
+        tensor.data_type = tensor_proto::DataType::Float as i32;
+        tensor.dims = vec![3];
+        tensor.data_location = 1;
+        tensor.external_data = vec![
+            crate::parser::onnx::StringStringEntryProto { key: "location".into(), value: "weights.bin".into() },
+            crate::parser::onnx::StringStringEntryProto { key: "offset".into(), value: "0".into() },
+            crate::parser::onnx::StringStringEntryProto { key: "length".into(), value: raw.len().to_string() },
+        ];
+
+        let result = tensor_from_proto_ext(&tensor, Some(&dir)).unwrap();
+        let arr = result.to_ndarray::<f32>().unwrap();
+        assert_eq!(arr.as_slice().unwrap(), &[1.0f32, 2.0, 3.0]);
+
+        // Cleanup
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_external_data_with_offset() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("morok_test_external_offset");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write: 8 bytes padding + 2 x f32
+        let padding = vec![0u8; 8];
+        let values: Vec<f32> = vec![42.0, 99.0];
+        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let data_path = dir.join("weights_offset.bin");
+        let mut f = std::fs::File::create(&data_path).unwrap();
+        f.write_all(&padding).unwrap();
+        f.write_all(&raw).unwrap();
+
+        let mut tensor = TensorProto::default();
+        tensor.data_type = tensor_proto::DataType::Float as i32;
+        tensor.dims = vec![2];
+        tensor.data_location = 1;
+        tensor.external_data = vec![
+            crate::parser::onnx::StringStringEntryProto { key: "location".into(), value: "weights_offset.bin".into() },
+            crate::parser::onnx::StringStringEntryProto { key: "offset".into(), value: "8".into() },
+            crate::parser::onnx::StringStringEntryProto { key: "length".into(), value: raw.len().to_string() },
+        ];
+
+        let result = tensor_from_proto_ext(&tensor, Some(&dir)).unwrap();
+        let arr = result.to_ndarray::<f32>().unwrap();
+        assert_eq!(arr.as_slice().unwrap(), &[42.0f32, 99.0]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

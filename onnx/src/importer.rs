@@ -12,7 +12,7 @@ use snafu::ResultExt;
 
 use crate::error::{EmptyModelSnafu, IoSnafu, MissingInputSnafu, ProtobufDecodeSnafu, Result};
 use crate::parser::onnx::{ModelProto, NodeProto, ValueInfoProto};
-use crate::registry::{OpRegistry, OpSetId, convert_onnx_dtype, onnx_opset_version, tensor_from_proto};
+use crate::registry::{OpRegistry, OpSetId, convert_onnx_dtype, onnx_opset_version, tensor_from_proto_ext};
 
 /// Dimension value - either static (known size) or dynamic (named, e.g., batch dim).
 #[derive(Debug, Clone, PartialEq)]
@@ -96,16 +96,19 @@ impl OnnxGraph {
 pub struct OnnxImporter {
     /// Operator registry for dispatch
     registry: OpRegistry,
+    /// Directory containing the model file (for external data loading)
+    model_dir: Option<std::path::PathBuf>,
 }
 
 impl OnnxImporter {
     /// Create a new ONNX importer.
     pub fn new() -> Self {
-        Self { registry: OpRegistry::new() }
+        Self { registry: OpRegistry::new(), model_dir: None }
     }
 
     /// Import ONNX model from file path (convenience method for all-initializer models).
     pub fn import_path<P: AsRef<Path>>(&mut self, path: P) -> Result<HashMap<String, Tensor>> {
+        self.model_dir = path.as_ref().parent().map(|p| p.to_path_buf());
         let file = File::open(path.as_ref()).context(IoSnafu)?;
         let mut reader = BufReader::new(file);
         self.import_reader(&mut reader)
@@ -162,7 +165,7 @@ impl OnnxImporter {
 
         for init in &proto_graph.initializer {
             if !init.name.is_empty() {
-                let tensor = tensor_from_proto(init)?;
+                let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
                 initializers.insert(init.name.clone(), tensor);
             }
         }
