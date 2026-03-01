@@ -15,6 +15,7 @@ pub mod arithmetic;
 pub mod bitwise;
 pub mod broadcast;
 pub mod conditional;
+pub mod einsum;
 pub mod indexing;
 pub mod math;
 pub mod matmul;

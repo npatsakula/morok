@@ -348,7 +348,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
             }
 
             // Cycle detection (like Tinygrad rangeify.py:577-578)
-            if u.toposort().iter().any(|x| matches!(x.op(), Op::After { .. }) && x.buf_uop().id == s_buf_id) {
+            if u.any_in_subtree(|x| matches!(x.op(), Op::After { .. }) && x.buf_uop().id == s_buf_id) {
                 panic!(
                     "cycle detected in graph: kernel for buffer {} reads buffer {} which has AFTER in its tree",
                     buf_id, s_buf_id
@@ -386,98 +386,59 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
 
     let mut ctx = KernelContext::new();
 
-    // Phase 1: bufferize -> store (like Tinygrad rangeify.py:565)
-    // Use pm_add_buffers (global-only), NOT pm_add_buffers_local.
-    // Local BUFFERIZEs stay as-is here and are converted later during codegen.
-    // This matches Tinygrad where pm_add_buffers runs before split_kernels,
-    // and pm_add_buffers_local runs later in codegen/__init__.py.
-    // Shared KernelContext ensures unique buffer IDs across all BUFFERIZE conversions
-    // (like Tinygrad's ctx=itertools.count(lunique_start)).
+    let t_stage = std::time::Instant::now();
     let after_buffers = {
         let matcher = pm_add_buffers_patterns();
         graph_rewrite_bottom_up(&matcher, root, &mut ctx)
     };
+    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: pm_add_buffers complete");
 
     trace!(tree = %after_buffers.tree_full(), "after pm_add_buffers");
 
-    // Phase 2: split kernels (like Tinygrad rangeify.py:566)
-    // We manually transform STORE/END → KERNEL to avoid reprocessing transformed nodes
+    let t_stage = std::time::Instant::now();
     let after_split = split_all_stores(&after_buffers);
+    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
 
-    // Phase 3: fix_assign (like Tinygrad rangeify.py:568-580)
+    let t_stage = std::time::Instant::now();
     let result = fix_assign(&after_split);
+    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: fix_assign complete");
 
-    (result, ctx) // Keep tuple return for compatibility
+    (result, ctx)
 }
 
 /// Split all STORE/END operations into KERNELs.
 ///
-/// This function manually traverses the tree and transforms STORE/END nodes,
-/// avoiding the issue where graph_rewrite_bottom_up would reprocess
-/// transformed nodes that still contain END operations.
+/// Uses a single graph_rewrite pass with bpm (gate) + pm (split) matching Tinygrad's:
+///   `graph_rewrite(tsink, pm_gate_kernel_sink + split_kernels, bottom_up=True)`
+///
+/// - bpm (Stage 0): gates on KERNEL nodes to prevent descending into already-split subtrees
+/// - pm (Stage 1): transforms STORE/END → KERNEL after children are already optimized
+///
+/// Bottom-up processing ensures inner STORE/END become KERNELs before outer ones see them.
 fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
-    use morok_ir::UOpKey;
+    use morok_ir::op::pattern_derived::OpKey;
+    use morok_ir::pattern::{RewriteResult, SimplifiedPatternMatcher};
+    use morok_ir::rewrite::graph_rewrite_with_bpm;
+
+    // bpm: gate on KERNEL nodes (stop descent into already-processed subtrees)
+    // NOTE: patterns! macro doesn't support Gate returns, so this stays manual
+    let bpm = {
+        let mut m = SimplifiedPatternMatcher::<Vec<Arc<UOp>>>::new();
+        m.add(&[OpKey::Kernel], |node, _ctx| RewriteResult::Gate(node.clone()));
+        m
+    };
+
+    // pm: transform STORE/END → KERNEL (sees optimized children)
+    let pm = crate::patterns! {
+        @context Vec<Arc<UOp>>;
+        node @ Store { index: _, value: _ } => |node, ctx| split_store(ctx, node),
+        node @ End { computation, .. }
+            if matches!(computation.op(), Op::Store { .. } | Op::End { .. })
+            => |node, ctx| split_store(ctx, node),
+    };
 
     let mut ctx = Vec::new();
-    let mut current = root.clone();
-
-    // Process AFTER nodes from leaves to root (toposort order).
-    // Apply each replacement immediately so that outer AFTERs see updated inner AFTERs.
-    // This is necessary because split_store captures kernel sources from the current tree,
-    // and we need inner AFTERs to already be transformed before the outer END is processed.
-    loop {
-        let mut found_any = false;
-
-        for node in current.toposort() {
-            if let Op::After { passthrough, deps } = node.op() {
-                let mut new_deps = SmallVec::new();
-                let mut any_changed = false;
-
-                for dep in deps {
-                    let transformed_dep = transform_store_to_kernel(dep, &mut ctx);
-                    if !Arc::ptr_eq(&transformed_dep, dep) {
-                        any_changed = true;
-                    }
-                    new_deps.push(transformed_dep);
-                }
-
-                if any_changed {
-                    let new_after = passthrough.after(new_deps);
-                    #[allow(clippy::mutable_key_type)]
-                    let mut single_replacement: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
-                    single_replacement.insert(UOpKey(node.clone()), new_after);
-                    current = current.substitute(&single_replacement);
-                    found_any = true;
-                    break; // Restart iteration since tree changed
-                }
-            }
-        }
-
-        if !found_any {
-            break;
-        }
-    }
-
-    current
-}
-
-/// Transform a single STORE/END/BARRIER node into a KERNEL.
-fn transform_store_to_kernel(node: &Arc<UOp>, ctx: &mut Vec<Arc<UOp>>) -> Arc<UOp> {
-    match node.op() {
-        Op::Store { .. } => split_store(ctx, node).unwrap_or_else(|| node.clone()),
-        Op::End { computation, .. } => {
-            if matches!(computation.op(), Op::Store { .. } | Op::End { .. }) {
-                split_store(ctx, node).unwrap_or_else(|| node.clone())
-            } else {
-                node.clone()
-            }
-        }
-        Op::Barrier { src, deps } => {
-            let transformed_src = transform_store_to_kernel(src, ctx);
-            if Arc::ptr_eq(&transformed_src, src) { node.clone() } else { transformed_src.barrier(deps.clone()) }
-        }
-        _ => node.clone(),
-    }
+    graph_rewrite_with_bpm(&pm, &bpm, root.clone(), &mut ctx)
 }
 
 // ============================================================================

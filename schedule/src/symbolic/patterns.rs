@@ -1186,35 +1186,45 @@ fn where_on_load_index_transform(
     // Step 4: Collect all RANGE ids reachable from indices (index scope)
     let mut index_ranges = std::collections::HashSet::new();
     for idx in indices {
-        for node in idx.toposort() {
-            if matches!(node.op(), Op::Range { .. }) {
-                index_ranges.insert(node.id);
-            }
-        }
+        idx.collect_in_subtree(|n| matches!(n.op(), Op::Range { .. })).into_iter().for_each(|n| {
+            index_ranges.insert(n.id);
+        });
     }
 
     // Step 5: Partition clauses into moveable vs remaining
+    // Single DFS per clause: check range scope + index deps simultaneously
     let (moved_clauses, remaining_clauses): (Vec<_>, Vec<_>) = c1_clauses.iter().cloned().partition(|clause| {
-        // Skip duplicates
         if duplicate_ids.contains(&clause.id) {
             return true; // Treat as "moved" (but won't add to gate)
         }
 
-        // Check all ranges in clause are within index scope
-        let clause_ranges_in_scope = clause
-            .toposort()
-            .iter()
-            .filter(|n| matches!(n.op(), Op::Range { .. }))
-            .all(|r| index_ranges.contains(&r.id));
-
-        if !clause_ranges_in_scope {
-            return false; // Cannot move - out of scope ranges
+        let mut ranges_in_scope = true;
+        let mut has_index_deps = false;
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![clause.clone()];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(Arc::as_ptr(&node)) {
+                continue;
+            }
+            match node.op() {
+                Op::Range { .. } if !index_ranges.contains(&node.id) => {
+                    ranges_in_scope = false;
+                    break; // Out-of-scope range found, can't move
+                }
+                Op::Index { .. } => {
+                    has_index_deps = true;
+                    break; // Index dep found, can't move
+                }
+                _ => {}
+            }
+            node.op().map_child(|child| {
+                if !visited.contains(&Arc::as_ptr(child)) {
+                    stack.push(child.clone());
+                }
+            });
         }
 
-        // Check no index dependencies (avoid self-referential conditions)
-        let has_index_deps = clause.toposort().iter().any(|n| matches!(n.op(), Op::Index { .. }));
-
-        !has_index_deps // Can move if no index deps
+        ranges_in_scope && !has_index_deps
     });
 
     // Step 6: If no movement possible and no duplicates removed, return None

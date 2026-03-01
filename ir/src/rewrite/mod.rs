@@ -7,7 +7,7 @@ pub mod engine;
 
 pub use engine::{
     GraphRewriteOutput, NoMatcher, graph_rewrite, graph_rewrite_bottom_up, graph_rewrite_bottom_up_with_map,
-    graph_rewrite_with_bpm, graph_rewrite_with_map,
+    graph_rewrite_roots, graph_rewrite_with_bpm, graph_rewrite_with_map,
 };
 
 // Backward compatibility - deprecated

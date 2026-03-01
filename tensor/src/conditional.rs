@@ -67,7 +67,8 @@ impl Tensor {
     /// // result = [2.0, 5.0, 4.0]
     /// ```
     pub fn maximum(&self, other: &Tensor) -> Result<Self> {
-        let result = self.uop().try_max(&other.uop()).context(UOpSnafu)?;
+        let (lhs, rhs) = self.broadcast_for_binop(other)?;
+        let result = lhs.uop().try_max(&rhs.uop()).context(UOpSnafu)?;
         Ok(Self::new(result))
     }
 

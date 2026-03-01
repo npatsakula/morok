@@ -1,6 +1,10 @@
-//! Tests for neural network operations: pool, conv, normalization.
+//! Tests for neural network operations: pool, conv, normalization, resize.
 
 use crate::Tensor;
+
+fn get_shape(tensor: &Tensor) -> Vec<usize> {
+    tensor.uop().shape().unwrap().unwrap().iter().map(|s| s.as_const().unwrap()).collect()
+}
 
 // =========================================================================
 // Pool shape tests
@@ -9,7 +13,7 @@ use crate::Tensor;
 #[test]
 fn test_pool_2d_basic() {
     // (1,1,4,4) k=2 s=1 d=1 → (1,1,3,3,2,2)
-    let x = Tensor::from_slice(&[0.0f32; 16]).try_reshape(&[1, 1, 4, 4]).unwrap();
+    let x = Tensor::from_slice([0.0f32; 16]).try_reshape(&[1, 1, 4, 4]).unwrap();
     let pooled = x.pool(&[2, 2], &[1, 1], &[1, 1]).unwrap();
     let shape = pooled.shape().unwrap();
     let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
@@ -19,7 +23,7 @@ fn test_pool_2d_basic() {
 #[test]
 fn test_pool_2d_stride() {
     // (1,1,6,6) k=3 s=2 d=1 → (1,1,2,2,3,3)
-    let x = Tensor::from_slice(&[0.0f32; 36]).try_reshape(&[1, 1, 6, 6]).unwrap();
+    let x = Tensor::from_slice([0.0f32; 36]).try_reshape(&[1, 1, 6, 6]).unwrap();
     let pooled = x.pool(&[3, 3], &[2, 2], &[1, 1]).unwrap();
     let shape = pooled.shape().unwrap();
     let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
@@ -29,7 +33,7 @@ fn test_pool_2d_stride() {
 #[test]
 fn test_pool_2d_dilation() {
     // (1,1,7,7) k=3 s=1 d=2 → (1,1,3,3,3,3)
-    let x = Tensor::from_slice(&[0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
+    let x = Tensor::from_slice([0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
     let pooled = x.pool(&[3, 3], &[1, 1], &[2, 2]).unwrap();
     let shape = pooled.shape().unwrap();
     let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
@@ -41,9 +45,9 @@ fn test_pool_2d_dilation() {
 // =========================================================================
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_pad_value_neg_inf() {
-    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let padded = x.try_pad_value(&[(1, 1)], f64::NEG_INFINITY).unwrap();
     let result = padded.contiguous().realize().unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(result.len(), 5);
@@ -55,10 +59,10 @@ fn test_pad_value_neg_inf() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_pad_value_zero_delegates() {
     // pad_value with 0.0 should be identical to try_pad
-    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let padded = x.try_pad_value(&[(1, 1)], 0.0).unwrap();
     let result = padded.contiguous().realize().unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(result.len(), 5);
@@ -78,7 +82,7 @@ fn test_conv2d_1x1() {
     // Input: (1, 1, 3, 3), Weight: (1, 1, 1, 1) with value 2.0
     let x_data: Vec<f32> = (1..=9).map(|v| v as f32).collect();
     let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 3, 3]).unwrap();
-    let w = Tensor::from_slice(&[2.0f32]).try_reshape(&[1, 1, 1, 1]).unwrap();
+    let w = Tensor::from_slice([2.0f32]).try_reshape(&[1, 1, 1, 1]).unwrap();
     let result = x.conv2d().weight(&w).call().unwrap();
     let result = result.contiguous().realize().unwrap().to_ndarray::<f32>().unwrap();
     let expected: Vec<f32> = (1..=9).map(|v| v as f32 * 2.0).collect();
@@ -94,7 +98,7 @@ fn test_conv2d_3x3() {
     // Output should be 2x2 with sums of 3x3 regions
     let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
     let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 4, 4]).unwrap();
-    let w = Tensor::from_slice(&[1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+    let w = Tensor::from_slice([1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
     let result = x.conv2d().weight(&w).call().unwrap();
     let result = result.contiguous().realize().unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(result.shape(), &[1, 1, 2, 2]);
@@ -113,7 +117,7 @@ fn test_conv2d_stride() {
     // 2x2 kernel, stride=2 on 4x4 → 2x2
     let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
     let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 4, 4]).unwrap();
-    let w = Tensor::from_slice(&[1.0f32; 4]).try_reshape(&[1, 1, 2, 2]).unwrap();
+    let w = Tensor::from_slice([1.0f32; 4]).try_reshape(&[1, 1, 2, 2]).unwrap();
     let result = x.conv2d().weight(&w).stride(&[2, 2]).call().unwrap();
     let result = result.contiguous().realize().unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(result.shape(), &[1, 1, 2, 2]);
@@ -135,8 +139,8 @@ fn test_conv2d_stride() {
 #[ignore = "blocked by CONTIGUOUS realization range-leak bug in rangeify pipeline"]
 fn test_conv2d_groups() {
     // Depthwise conv: groups=2, input (1,2,3,3), weight (2,1,1,1)
-    let x = Tensor::from_slice(&[1.0f32; 18]).try_reshape(&[1, 2, 3, 3]).unwrap();
-    let w = Tensor::from_slice(&[2.0f32, 3.0f32]).try_reshape(&[2, 1, 1, 1]).unwrap();
+    let x = Tensor::from_slice([1.0f32; 18]).try_reshape(&[1, 2, 3, 3]).unwrap();
+    let w = Tensor::from_slice([2.0f32, 3.0f32]).try_reshape(&[2, 1, 1, 1]).unwrap();
     let result = x.conv2d().weight(&w).groups(2).call().unwrap();
     let result = result.contiguous().realize().unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(result.shape(), &[1, 2, 3, 3]);
@@ -148,9 +152,9 @@ fn test_conv2d_groups() {
 
 #[test]
 fn test_conv2d_bias() {
-    let x = Tensor::from_slice(&[1.0f32; 4]).try_reshape(&[1, 1, 2, 2]).unwrap();
-    let w = Tensor::from_slice(&[1.0f32]).try_reshape(&[1, 1, 1, 1]).unwrap();
-    let b = Tensor::from_slice(&[10.0f32]);
+    let x = Tensor::from_slice([1.0f32; 4]).try_reshape(&[1, 1, 2, 2]).unwrap();
+    let w = Tensor::from_slice([1.0f32]).try_reshape(&[1, 1, 1, 1]).unwrap();
+    let b = Tensor::from_slice([10.0f32]);
     let result = x.conv2d().weight(&w).bias(&b).call().unwrap();
     let result = result.contiguous().realize().unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(result.shape(), &[1, 1, 2, 2]);
@@ -159,11 +163,11 @@ fn test_conv2d_bias() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_conv2d_padding() {
     // 3x3 kernel with padding=1 on 3x3 → 3x3
-    let x = Tensor::from_slice(&[1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
-    let w = Tensor::from_slice(&[1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+    let x = Tensor::from_slice([1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+    let w = Tensor::from_slice([1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
     let result = x.conv2d().weight(&w).padding(&[(1, 1), (1, 1)]).call().unwrap();
     let shape = result.shape().unwrap();
     let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
@@ -217,11 +221,11 @@ fn test_max_pool2d() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+// #[tracing_test::traced_test]
 fn test_max_pool2d_pad() {
     // Padding should fill with -inf, not 0
     // 3x3 kernel with padding=1 on 3x3 → 3x3, all values are negative
-    let x = Tensor::from_slice(&[-5.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+    let x = Tensor::from_slice([-5.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
     let result = x.max_pool2d().kernel_size(&[3, 3]).stride(&[1, 1]).padding(&[(1, 1), (1, 1)]).call().unwrap();
     let result = result.contiguous().realize().unwrap().to_ndarray::<f32>().unwrap();
     // All outputs should be -5.0 (not 0.0 which would happen with zero padding)
@@ -237,7 +241,7 @@ fn test_max_pool2d_pad() {
 #[test]
 fn test_avg_pool2d_ceil_mode_shape() {
     // (1,1,7,7) with k=2 s=3 ceil_mode=true → output should be 3x3 (ceil) vs 2x2 (floor)
-    let x = Tensor::from_slice(&[0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
+    let x = Tensor::from_slice([0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
     let result = x.avg_pool2d().kernel_size(&[2, 2]).stride(&[3, 3]).ceil_mode(true).call().unwrap();
     let shape = result.shape().unwrap();
     let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
@@ -247,7 +251,7 @@ fn test_avg_pool2d_ceil_mode_shape() {
 #[test]
 fn test_max_pool2d_ceil_mode_shape() {
     // (1,1,7,7) with k=2 s=3 ceil_mode=true → output should be 3x3
-    let x = Tensor::from_slice(&[0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
+    let x = Tensor::from_slice([0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
     let result = x.max_pool2d().kernel_size(&[2, 2]).stride(&[3, 3]).ceil_mode(true).call().unwrap();
     let shape = result.shape().unwrap();
     let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
@@ -282,7 +286,7 @@ fn test_avg_pool2d_ceil_mode_large_stride() {
     // Without correction, apply_ceil_mode over-pads by 1.
     // Expected: ceildiv(3-2, 3)+1 = 2 output elements, but last window starts
     // past real data, so correction reduces padding.
-    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[1, 1, 1, 3]).unwrap();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[1, 1, 1, 3]).unwrap();
     let result = x.avg_pool2d().kernel_size(&[1, 2]).stride(&[1, 3]).ceil_mode(true).call().unwrap();
     let shape = result.shape().unwrap();
     let dims: Vec<usize> = shape.iter().map(|s| s.as_const().unwrap()).collect();
@@ -298,7 +302,7 @@ fn test_avg_pool2d_ceil_mode_large_stride() {
 #[test]
 fn test_layernorm() {
     // (2, 4), normalize over last axis
-    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).try_reshape(&[2, 4]).unwrap();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).try_reshape(&[2, 4]).unwrap();
     let result = x.layernorm(-1, 1e-5).unwrap();
     let result = result.contiguous().realize().unwrap().to_ndarray::<f32>().unwrap();
     assert_eq!(result.shape(), &[2, 4]);
@@ -333,4 +337,29 @@ fn test_layernorm_2d() {
         let mean = sum / 12.0;
         assert!(mean.abs() < 1e-3, "mean should be ~0, got {mean}");
     }
+}
+
+// =========================================================================
+// Resize Tests
+// =========================================================================
+
+#[test]
+fn test_resize_nearest_upsample() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 1, 2, 2]).unwrap();
+    let result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode("nearest").call().unwrap().realize().unwrap();
+    assert_eq!(get_shape(&result), vec![1, 1, 4, 4]);
+}
+
+#[test]
+fn test_resize_linear_upsample() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 1, 2, 2]).unwrap();
+    let result = t.resize().scales(&[1.0, 1.0, 2.0, 2.0]).mode("linear").call().unwrap().realize().unwrap();
+    assert_eq!(get_shape(&result), vec![1, 1, 4, 4]);
+}
+
+#[test]
+fn test_resize_nearest_downsample() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[1, 1, 3, 3]).unwrap();
+    let result = t.resize().sizes(&[1, 1, 2, 2]).mode("nearest").call().unwrap().realize().unwrap();
+    assert_eq!(get_shape(&result), vec![1, 1, 2, 2]);
 }

@@ -69,7 +69,7 @@ pub struct RangeifyResult {
 /// **Stage 6**: pm_split_store - Split store ranges (CPU only)
 /// **Stage 7**: apply_opts - Post-range optimization (happens in optimizer)
 #[allow(clippy::mutable_key_type)]
-#[tracing::instrument(skip_all, fields(origin.tree = sink.tree()))]
+#[tracing::instrument(skip_all)]
 pub fn rangeify_with_map(
     sink: Arc<UOp>,
     pcontig_config: Option<&super::kernel::PcontigConfig>,
@@ -82,40 +82,58 @@ pub fn rangeify_with_map(
     // Combined early pass (Tinygrad: earliest_rewrites + replace_contiguous, ctx={})
     // MUST run BEFORE range assignment so rangeify sees a cleaned graph.
     // Uses top-down traversal matching Tinygrad's bottom_up=False default.
+    let t_stage = std::time::Instant::now();
     let early_combined = super::patterns::early_rewrites().with_context::<super::patterns::ReplaceContiguousCtx>()
         + super::patterns::replace_contiguous();
     let mut contig_ctx = super::patterns::ReplaceContiguousCtx::new();
     let result = graph_rewrite_with_map(&early_combined, sink, &mut contig_ctx);
     let mut sink = result.root;
     all_becomes.extend(result.becomes_map);
-    tracing::debug!(uop.tree = sink.tree(), "early rewrites + replace contiguous complete");
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "early rewrites + replace contiguous complete"
+    );
 
     // =========================================================================
     // Stage 0: Range assignment to build IndexingContext
     // =========================================================================
+    let t_stage = std::time::Instant::now();
     let (rangeified, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
     sink = rangeified;
-    tracing::debug!(uop.tree = sink.tree(), "Stage 0: range assignment complete");
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "Stage 0: range assignment complete"
+    );
 
     // Split large reductions BEFORE ReduceAxis → REDUCE conversion
+    let t_stage = std::time::Instant::now();
     let mut split_config = super::kernel::SplitReduceOpConfig::default();
     let split_matcher = super::patterns::split_reduceop_patterns();
     let result = graph_rewrite_with_map(&split_matcher, sink, &mut split_config);
     sink = result.root;
     all_becomes.extend(result.becomes_map);
-    tracing::debug!(uop.tree = sink.tree(), "split reduceops complete");
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "split reduceops complete"
+    );
 
     // =========================================================================
     // Stage 1: Early movement ops (BOTTOM_UP) - Tinygrad: pm_mops + pm_syntactic_sugar
     // MUST RUN FIRST before other optimizations
     // =========================================================================
-    // Note: Movement ops are currently integrated in apply_rangeify_patterns
-    // For exact alignment, we'd separate pm_mops but current integration works
+    let t_stage = std::time::Instant::now();
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
     let result = graph_rewrite_bottom_up_with_map(&rangeify_matcher, sink, &mut indexing_ctx);
     sink = result.root;
     all_becomes.extend(result.becomes_map);
-    tracing::debug!(uop.tree = sink.tree(), "Stage 1: rangeify + movement ops complete");
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "Stage 1: rangeify + movement ops complete"
+    );
 
     // =========================================================================
     // Mega-pass: symbolic + reduce_simplify + buffer_folding + buffer_removal
@@ -127,6 +145,7 @@ pub fn rangeify_with_map(
     // =========================================================================
     {
         use super::kernel::PcontigConfig;
+        let t_stage = std::time::Instant::now();
         let mega_pass = crate::symbolic::symbolic().with_context::<PcontigConfig>()
             + super::patterns::reduction_simplify_patterns().with_context()
             + super::patterns::buffer_folding().with_context()
@@ -134,9 +153,19 @@ pub fn rangeify_with_map(
             + super::patterns::movement_op_patterns().with_context()
             + super::patterns::early_rewrites().with_context()
             + super::patterns::buffer_removal_with_pcontig();
+        tracing::debug!(
+            total_patterns = mega_pass.len(),
+            wildcard_count = mega_pass.wildcard_count(),
+            indexed_buckets = mega_pass.indexed_count(),
+            "mega-pass pattern stats"
+        );
         let mut pcontig = pcontig_config.cloned().unwrap_or_default();
         sink = apply_buffer_removal_protecting_sink(&sink, &mega_pass, &mut pcontig);
-        tracing::debug!(uop.tree = sink.tree(), "mega-pass complete");
+        tracing::debug!(
+            node_count = sink.toposort().len(),
+            elapsed_ms = t_stage.elapsed().as_millis() as u64,
+            "mega-pass complete"
+        );
     }
 
     // Stages 2a-6 (load_collapse, split_ranges, symbolic+flatten, simplify_ranges,
@@ -146,11 +175,16 @@ pub fn rangeify_with_map(
     if let Some(device) = super::patterns::extract_device_from_graph(&sink)
         && let Some(limit) = device.max_buffers()
     {
+        let t_stage = std::time::Instant::now();
         let limit_matcher = super::patterns::buffer_limit_patterns(limit);
         let result = graph_rewrite_with_map(&limit_matcher, sink, &mut ());
         sink = result.root;
         all_becomes.extend(result.becomes_map);
-        tracing::debug!(uop.tree = sink.tree(), "Stage 7b: buffer limit enforcement complete");
+        tracing::debug!(
+            uop.tree = sink.tree(),
+            elapsed_ms = t_stage.elapsed().as_millis() as u64,
+            "Stage 7b: buffer limit enforcement complete"
+        );
     }
 
     // =========================================================================
@@ -669,17 +703,27 @@ fn apply_buffer_removal_protecting_sink(
         return crate::rewrite::graph_rewrite(matcher, sink.clone(), ctx);
     };
 
-    let mut new_sources = Vec::with_capacity(sources.len());
-    for src in sources.iter() {
-        if let Op::Bufferize { compute, ranges, opts } = src.op() {
-            let optimized_compute = crate::rewrite::graph_rewrite(matcher, compute.clone(), ctx);
-            let new_bufferize = UOp::bufferize(optimized_compute, ranges.to_vec(), opts.clone());
-            new_sources.push(new_bufferize);
-        } else {
-            let optimized = crate::rewrite::graph_rewrite(matcher, src.clone(), ctx);
-            new_sources.push(optimized);
-        }
-    }
+    // Collect the rewrite roots — compute subtrees for BUFFERIZE, full nodes otherwise.
+    // Using graph_rewrite_roots shares a single engine across all roots, so shared
+    // subgraphs (e.g., bitonic sort network) are only processed once.
+    let roots: Vec<Arc<UOp>> = sources
+        .iter()
+        .map(|src| match src.op() {
+            Op::Bufferize { compute, .. } => compute.clone(),
+            _ => src.clone(),
+        })
+        .collect();
+
+    let optimized = crate::rewrite::graph_rewrite_roots(matcher, &roots, ctx);
+
+    let new_sources: Vec<Arc<UOp>> = sources
+        .iter()
+        .zip(optimized)
+        .map(|(src, opt)| match src.op() {
+            Op::Bufferize { ranges, opts, .. } => UOp::bufferize(opt, ranges.to_vec(), opts.clone()),
+            _ => opt,
+        })
+        .collect();
 
     UOp::sink(new_sources)
 }

@@ -3,8 +3,10 @@
 use bon::bon;
 use morok_dtype::DType;
 use morok_ir::{ConstValue, UOp};
+use snafu::ResultExt;
 
 use crate::Tensor;
+use crate::error::UOpSnafu;
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
@@ -888,4 +890,314 @@ impl Tensor {
         };
         Ok((values, indices))
     }
+
+    // =========================================================================
+    // Resize (ONNX Resize operator building block)
+    // Tinygrad onnx.py:789-890
+    // =========================================================================
+
+    #[builder]
+    #[allow(clippy::too_many_arguments)]
+    pub fn resize(
+        &self,
+        scales: Option<&[f64]>,
+        sizes: Option<&[usize]>,
+        #[builder(default = "nearest")] mode: &str,
+        #[builder(default = "half_pixel")] coordinate_transformation_mode: &str,
+        #[builder(default = "round_prefer_floor")] nearest_mode: &str,
+        #[builder(default = -0.75)] cubic_coeff_a: f64,
+        #[builder(default = false)] exclude_outside: bool,
+        #[builder(default = "stretch")] keep_aspect_ratio_policy: &str,
+        axes: Option<&[usize]>,
+    ) -> Result<Tensor> {
+        let ndim = self.ndim()?;
+        let shape = self.shape()?;
+        let _shape_dims = morok_ir::shape::to_vec_usize(&shape).context(UOpSnafu)?;
+
+        let axes: Vec<usize> = axes.map(|a| a.to_vec()).unwrap_or_else(|| (0..ndim).collect());
+
+        // Permute: put target axes last
+        let non_axes: Vec<usize> = (0..ndim).filter(|d| !axes.contains(d)).collect();
+        let perm: Vec<isize> = non_axes.iter().chain(axes.iter()).map(|&d| d as isize).collect();
+        let inv_perm = argsort_usize(&perm.iter().map(|&p| p as usize).collect::<Vec<_>>());
+        let inv_perm_i: Vec<isize> = inv_perm.iter().map(|&i| i as isize).collect();
+
+        let mut x = if perm.iter().enumerate().all(|(i, &p)| p == i as isize) {
+            self.clone()
+        } else {
+            self.try_permute(&perm)?
+        };
+
+        // Input spatial dimensions (last len(axes) dims of permuted x)
+        let x_shape = x.shape()?;
+        let x_dims = morok_ir::shape::to_vec_usize(&x_shape).context(UOpSnafu)?;
+        let n_spatial = axes.len();
+        let input_shape: Vec<usize> = x_dims[ndim - n_spatial..].to_vec();
+
+        // Filter scales/sizes to spatial dims only
+        let scales_trimmed: Option<Vec<f64>> = scales.map(|s| s[s.len().saturating_sub(n_spatial)..].to_vec());
+        let sizes_trimmed: Option<Vec<usize>> = sizes.map(|s| s[s.len().saturating_sub(n_spatial)..].to_vec());
+
+        // Compute output sizes and scales
+        let (output_sizes, final_scales) = if let Some(mut sz) = sizes_trimmed {
+            if keep_aspect_ratio_policy == "not_larger" || keep_aspect_ratio_policy == "not_smaller" {
+                let scale_fn: fn(f64, f64) -> f64 =
+                    if keep_aspect_ratio_policy == "not_larger" { f64::min } else { f64::max };
+                let mut scale = f64::NAN;
+                for (s, &inp) in sz.iter().zip(&input_shape) {
+                    let s_val = *s as f64 / inp as f64;
+                    if scale.is_nan() {
+                        scale = s_val;
+                    } else {
+                        scale = scale_fn(scale, s_val);
+                    }
+                }
+                sz = input_shape.iter().map(|&sh| (scale * sh as f64 + 0.5) as usize).collect();
+                let sc = vec![scale; n_spatial];
+                (sz, sc)
+            } else {
+                let sc: Vec<f64> = sz.iter().zip(&input_shape).map(|(&s, &sh)| s as f64 / sh as f64).collect();
+                (sz, sc)
+            }
+        } else if let Some(sc) = scales_trimmed {
+            let sz: Vec<usize> = sc.iter().zip(&input_shape).map(|(&s, &sh)| (s * sh as f64) as usize).collect();
+            (sz, sc)
+        } else {
+            return Err(crate::error::Error::IrConstruction {
+                details: "resize: either scales or sizes must be provided".into(),
+            });
+        };
+
+        // Early exit if no resize needed
+        if output_sizes.iter().zip(&input_shape).all(|(&o, &i)| o == i) {
+            return if perm.iter().enumerate().any(|(i, &p)| p != i as isize) {
+                x.try_permute(&inv_perm_i)
+            } else {
+                Ok(x)
+            };
+        }
+
+        // Build coordinate transforms for each spatial dim
+        let dtype = x.uop().dtype();
+        let indexes: Vec<Tensor> = input_shape
+            .iter()
+            .zip(&output_sizes)
+            .zip(&final_scales)
+            .map(|((&inp_sz, &out_sz), &scale)| {
+                apply_coordinate_transform(inp_sz, out_sz, scale, coordinate_transformation_mode, &dtype)
+            })
+            .collect::<Result<_>>()?;
+
+        // Clip for nearest/linear modes
+        let indexes: Vec<Tensor> = if mode == "nearest" || mode == "linear" {
+            indexes
+                .into_iter()
+                .zip(&input_shape)
+                .map(|(idx, &sz)| {
+                    let zero = Tensor::const_(ConstValue::Float(0.0), dtype.clone());
+                    let max_val = Tensor::const_(ConstValue::Float((sz - 1) as f64), dtype.clone());
+                    idx.clamp().min(&zero).max(&max_val).call()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            indexes
+        };
+
+        if mode == "nearest" {
+            let int_indexes: Vec<Tensor> = indexes
+                .into_iter()
+                .map(|idx| {
+                    let rounded = match nearest_mode {
+                        "round_prefer_floor" => idx.try_sub(&Tensor::const_(0.5f64, dtype.clone()))?.ceil()?,
+                        "round_prefer_ceil" => idx.try_add(&Tensor::const_(0.5f64, dtype.clone()))?.floor()?,
+                        "floor" => idx.floor()?,
+                        "ceil" => idx.ceil()?,
+                        _ => idx.floor()?,
+                    };
+                    rounded.cast(DType::Int32)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            // Sequential gather per spatial dim
+            for (i, idx) in int_indexes.iter().enumerate() {
+                let dim = (ndim - n_spatial + i) as isize;
+                // Reshape idx to broadcast: [1, ..., 1, out_sz, 1, ..., 1]
+                let cur_shape = x.shape()?;
+                let cur_dims = morok_ir::shape::to_vec_usize(&cur_shape).context(UOpSnafu)?;
+                let out_sz = output_sizes[i];
+
+                let mut idx_shape = vec![1isize; ndim];
+                idx_shape[ndim - n_spatial + i] = out_sz as isize;
+                let idx_reshaped = idx.try_reshape(&idx_shape)?;
+
+                let mut expand_shape: Vec<isize> = cur_dims.iter().map(|&d| d as isize).collect();
+                expand_shape[ndim - n_spatial + i] = out_sz as isize;
+                let idx_expanded = idx_reshaped.try_expand(&expand_shape)?;
+
+                x = x.gather(dim, &idx_expanded)?;
+            }
+        } else if mode == "linear" {
+            let mut expand = x_dims.clone();
+            for (i, &out_sz) in output_sizes.iter().enumerate() {
+                let dim_pos = ndim - n_spatial + i;
+                let index = &indexes[i];
+
+                let mut reshape = vec![1isize; ndim];
+                reshape[dim_pos] = out_sz as isize;
+                expand[dim_pos] = out_sz;
+                let expand_i: Vec<isize> = expand.iter().map(|&d| d as isize).collect();
+
+                let low = index.floor()?.cast(DType::Int32)?.try_reshape(&reshape)?.try_expand(&expand_i)?;
+                let high = index.ceil()?.cast(DType::Int32)?.try_reshape(&reshape)?.try_expand(&expand_i)?;
+                let perc = index.try_sub(&index.floor()?)?.try_reshape(&reshape)?.try_expand(&expand_i)?;
+
+                let dim_i = dim_pos as isize;
+                let gathered_low = x.gather(dim_i, &low)?;
+                let gathered_high = x.gather(dim_i, &high)?;
+                x = gathered_low.lerp(&gathered_high, &perc)?;
+            }
+        } else if mode == "cubic" {
+            let a = cubic_coeff_a;
+            let mut expand = x_dims.clone();
+            for (i, &out_sz) in output_sizes.iter().enumerate() {
+                let dim_pos = ndim - n_spatial + i;
+                let input_sz = input_shape[i];
+                let index = &indexes[i];
+
+                let mut reshape = vec![1isize; ndim];
+                reshape[dim_pos] = out_sz as isize;
+                expand[dim_pos] = out_sz;
+                let expand_i: Vec<isize> = expand.iter().map(|&d| d as isize).collect();
+
+                let p = index.floor()?.cast(DType::Int32)?;
+                let ratio = index.try_sub(&index.floor()?)?;
+
+                // Neighbor indices: p-1, p, p+1, p+2
+                let one = Tensor::const_(ConstValue::Int(1), DType::Int32);
+                let two = Tensor::const_(ConstValue::Int(2), DType::Int32);
+                let idx0 = p.try_sub(&one)?;
+                let idx1 = p.clone();
+                let idx2 = p.try_add(&one)?;
+                let idx3 = p.try_add(&two)?;
+
+                // Weights
+                let r1 = ratio.try_add(&Tensor::const_(1.0f64, dtype.clone()))?;
+                let c0 = poly_n(&r1, &[a, -5.0 * a, 8.0 * a, -4.0 * a], &dtype)?;
+                let c1 = poly_n(&ratio, &[a + 2.0, -(a + 3.0), 0.0, 1.0], &dtype)?;
+                let r_neg1 = Tensor::const_(1.0f64, dtype.clone()).try_sub(&ratio)?;
+                let c2 = poly_n(&r_neg1, &[a + 2.0, -(a + 3.0), 0.0, 1.0], &dtype)?;
+                let r_neg2 = Tensor::const_(2.0f64, dtype.clone()).try_sub(&ratio)?;
+                let c3 = poly_n(&r_neg2, &[a, -5.0 * a, 8.0 * a, -4.0 * a], &dtype)?;
+
+                let (mut c0, mut c1, mut c2, mut c3) = (c0, c1, c2, c3);
+                if exclude_outside {
+                    let max_idx = Tensor::const_(ConstValue::Int(input_sz as i64), DType::Int32);
+                    let zero_i = Tensor::const_(ConstValue::Int(0), DType::Int32);
+                    let zero_f = Tensor::const_(0.0f64, dtype.clone());
+                    let valid0 = idx0.try_ge(&zero_i)?.try_mul(&idx0.try_lt(&max_idx)?)?;
+                    let valid1 = idx1.try_ge(&zero_i)?.try_mul(&idx1.try_lt(&max_idx)?)?;
+                    let valid2 = idx2.try_ge(&zero_i)?.try_mul(&idx2.try_lt(&max_idx)?)?;
+                    let valid3 = idx3.try_ge(&zero_i)?.try_mul(&idx3.try_lt(&max_idx)?)?;
+                    c0 = c0.where_(&valid0, &zero_f)?;
+                    c1 = c1.where_(&valid1, &zero_f)?;
+                    c2 = c2.where_(&valid2, &zero_f)?;
+                    c3 = c3.where_(&valid3, &zero_f)?;
+                    let total = c0.try_add(&c1)?.try_add(&c2)?.try_add(&c3)?;
+                    let eps = Tensor::const_(1e-9f64, dtype.clone());
+                    let total_safe = total.try_add(&eps)?;
+                    c0 = c0.try_div(&total_safe)?;
+                    c1 = c1.try_div(&total_safe)?;
+                    c2 = c2.try_div(&total_safe)?;
+                    c3 = c3.try_div(&total_safe)?;
+                }
+
+                // Clip indices and reshape/expand
+                let max_val = Tensor::const_(ConstValue::Int((input_sz - 1) as i64), DType::Int32);
+                let zero_i = Tensor::const_(ConstValue::Int(0), DType::Int32);
+                let clip = |t: &Tensor| -> Result<Tensor> {
+                    t.clamp().min(&zero_i).max(&max_val).call()?.try_reshape(&reshape)?.try_expand(&expand_i)
+                };
+                let ei0 = clip(&idx0)?;
+                let ei1 = clip(&idx1)?;
+                let ei2 = clip(&idx2)?;
+                let ei3 = clip(&idx3)?;
+
+                let ec = |c: Tensor| -> Result<Tensor> { c.try_reshape(&reshape)?.try_expand(&expand_i) };
+                let ec0 = ec(c0)?;
+                let ec1 = ec(c1)?;
+                let ec2 = ec(c2)?;
+                let ec3 = ec(c3)?;
+
+                let dim_i = dim_pos as isize;
+                let v0 = x.gather(dim_i, &ei0)?.try_mul(&ec0)?;
+                let v1 = x.gather(dim_i, &ei1)?.try_mul(&ec1)?;
+                let v2 = x.gather(dim_i, &ei2)?.try_mul(&ec2)?;
+                let v3 = x.gather(dim_i, &ei3)?.try_mul(&ec3)?;
+                x = v0.try_add(&v1)?.try_add(&v2)?.try_add(&v3)?;
+            }
+        } else {
+            return Err(crate::error::Error::IrConstruction { details: format!("resize: unsupported mode '{mode}'") });
+        }
+
+        // Permute back
+        if perm.iter().enumerate().any(|(i, &p)| p != i as isize) { x.try_permute(&inv_perm_i) } else { Ok(x) }
+    }
+}
+
+/// Coordinate transform for resize operations.
+fn apply_coordinate_transform(
+    input_sz: usize,
+    output_sz: usize,
+    scale: f64,
+    mode: &str,
+    dtype: &DType,
+) -> Result<Tensor> {
+    let index = Tensor::arange(0, Some(output_sz as i64), None)?.cast(dtype.clone())?;
+    match mode {
+        "half_pixel" => {
+            // (index + 0.5) / scale - 0.5
+            let half = Tensor::const_(0.5f64, dtype.clone());
+            index.try_add(&half)?.try_div(&Tensor::const_(scale, dtype.clone()))?.try_sub(&half)
+        }
+        "align_corners" => {
+            if output_sz == 1 {
+                Ok(Tensor::const_(0.0f64, dtype.clone()))
+            } else {
+                let ratio = (input_sz as f64 - 1.0) / (output_sz as f64 - 1.0);
+                index.try_mul(&Tensor::const_(ratio, dtype.clone()))
+            }
+        }
+        "asymmetric" => index.try_div(&Tensor::const_(scale, dtype.clone())),
+        "pytorch_half_pixel" => {
+            if output_sz == 1 {
+                Ok(Tensor::const_(0.0f64, dtype.clone()))
+            } else {
+                let half = Tensor::const_(0.5f64, dtype.clone());
+                index.try_add(&half)?.try_div(&Tensor::const_(scale, dtype.clone()))?.try_sub(&half)
+            }
+        }
+        "half_pixel_symmetric" => {
+            let output_dim_scaled = input_sz as f64 * scale;
+            let offset = (input_sz as f64 / 2.0) * (1.0 - output_sz as f64 / output_dim_scaled);
+            let half = Tensor::const_(0.5f64, dtype.clone());
+            let off_t = Tensor::const_(offset, dtype.clone());
+            off_t.try_add(&index.try_add(&half)?.try_div(&Tensor::const_(scale, dtype.clone()))?)?.try_sub(&half)
+        }
+        _ => Err(crate::error::Error::IrConstruction {
+            details: format!("resize: invalid coordinate_transformation_mode '{mode}'"),
+        }),
+    }
+}
+
+/// Horner's method for polynomial evaluation.
+fn poly_n(x: &Tensor, coeffs: &[f64], dtype: &DType) -> Result<Tensor> {
+    coeffs.iter().try_fold(Tensor::const_(0.0f64, dtype.clone()), |acc, &c| {
+        acc.try_mul(x)?.try_add(&Tensor::const_(c, dtype.clone()))
+    })
+}
+
+fn argsort_usize(slice: &[usize]) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..slice.len()).collect();
+    indices.sort_by_key(|&i| slice[i]);
+    indices
 }

@@ -481,6 +481,57 @@ impl Tensor {
         Ok(result)
     }
 
+    /// Stack tensors along a new dimension.
+    ///
+    /// Creates a new axis at `dim` by unsqueezing each tensor, then concatenating.
+    #[track_caller]
+    pub fn stack(tensors: &[&Tensor], dim: isize) -> Result<Tensor> {
+        let unsqueezed: Vec<Tensor> = tensors.iter().map(|t| t.try_unsqueeze(dim)).collect::<Result<_>>()?;
+        Tensor::cat(&unsqueezed.iter().collect::<Vec<_>>(), dim)
+    }
+
+    /// Replace a single dimension with multiple dimensions.
+    ///
+    /// Inverse of flatten: splits dimension `dim` into the shape given by `sizes`.
+    #[track_caller]
+    pub fn unflatten(&self, dim: isize, sizes: &[isize]) -> Result<Tensor> {
+        let shape = self.shape()?;
+        let dim = Self::normalize_axis(dim, shape.len())?;
+        let mut new_shape: Vec<isize> = shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+        new_shape.splice(dim..=dim, sizes.iter().copied());
+        self.try_reshape(&new_shape)
+    }
+
+    /// Create coordinate grids from 1D tensors.
+    ///
+    /// `indexing`: `"ij"` (matrix/default) or `"xy"` (Cartesian, swaps first two inputs).
+    #[track_caller]
+    pub fn meshgrid(tensors: &[&Tensor], indexing: &str) -> Result<Vec<Tensor>> {
+        let n = tensors.len();
+        let sizes: Vec<usize> = tensors.iter().map(|t| t.numel().unwrap()).collect();
+        // For "xy" indexing, swap the first two inputs
+        let swapped: Vec<usize> = if indexing == "xy" && n >= 2 {
+            let mut s: Vec<usize> = (0..n).collect();
+            s.swap(0, 1);
+            s
+        } else {
+            (0..n).collect()
+        };
+        // Output shape is [sizes[swapped[0]], sizes[swapped[1]], ...]
+        let out_shape: Vec<isize> = swapped.iter().map(|&i| sizes[i] as isize).collect();
+        tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                // Position of this tensor's dimension in the output
+                let pos = swapped.iter().position(|&s| s == i).unwrap();
+                let mut shape = vec![1isize; n];
+                shape[pos] = sizes[i] as isize;
+                t.flatten()?.try_reshape(&shape)?.try_expand(&out_shape)
+            })
+            .collect()
+    }
+
     /// Get the shape of this tensor as a new tensor.
     ///
     /// Returns a 1D tensor of int64 containing the shape dimensions.

@@ -10,9 +10,24 @@ use std::sync::Arc;
 use bon::bon;
 
 use crate::op::Op;
+use crate::pattern::{Matcher, RewriteResult};
 use crate::shape;
 use crate::types::{AxisType, ConstValue};
 use morok_dtype::DType;
+
+/// Matcher for `UOp::substitute` — looks up each node in a substitution map.
+///
+/// Equivalent to Tinygrad's `_substitute = PatternMatcher([(UPat(tuple(Ops)), lambda ctx,x: ctx.get(x))])`.
+struct SubstituteMatcher<'a>(&'a HashMap<UOpKey, Arc<UOp>>);
+
+impl Matcher<()> for SubstituteMatcher<'_> {
+    fn rewrite(&self, uop: &Arc<UOp>, _ctx: &mut ()) -> RewriteResult {
+        match self.0.get(&UOpKey(uop.clone())) {
+            Some(replacement) if !Arc::ptr_eq(uop, replacement) => RewriteResult::Rewritten(replacement.clone()),
+            _ => RewriteResult::NoMatch,
+        }
+    }
+}
 
 /// Wrapper for Arc<UOp> that implements Hash and Eq based on stable ID.
 ///
@@ -586,6 +601,60 @@ impl UOp {
         result
     }
 
+    /// Check if any node in the backward slice satisfies a predicate.
+    ///
+    /// Early-exit DFS — returns `true` as soon as a matching node is found,
+    /// without building the full toposort Vec. Use this instead of
+    /// `toposort().iter().any(pred)` when you only need an existential check.
+    pub fn any_in_subtree<F>(self: &Arc<Self>, pred: F) -> bool
+    where
+        F: Fn(&Arc<UOp>) -> bool,
+    {
+        let mut visited = HashSet::new();
+        let mut stack = vec![self.clone()];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(Arc::as_ptr(&node)) {
+                continue;
+            }
+            if pred(&node) {
+                return true;
+            }
+            node.op.map_child(|child| {
+                if !visited.contains(&Arc::as_ptr(child)) {
+                    stack.push(child.clone());
+                }
+            });
+        }
+        false
+    }
+
+    /// Collect all nodes in the backward slice that match a predicate.
+    ///
+    /// DFS collecting matches — cheaper than `toposort().iter().filter(pred).collect()`
+    /// when you don't need topological ordering.
+    pub fn collect_in_subtree<F>(self: &Arc<Self>, pred: F) -> Vec<Arc<UOp>>
+    where
+        F: Fn(&Arc<UOp>) -> bool,
+    {
+        let mut visited = HashSet::new();
+        let mut stack = vec![self.clone()];
+        let mut result = Vec::new();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(Arc::as_ptr(&node)) {
+                continue;
+            }
+            if pred(&node) {
+                result.push(node.clone());
+            }
+            node.op.map_child(|child| {
+                if !visited.contains(&Arc::as_ptr(child)) {
+                    stack.push(child.clone());
+                }
+            });
+        }
+        result
+    }
+
     /// Render this UOp and its sources as a compact ASCII tree.
     ///
     /// Shared nodes (appearing multiple times due to hash-consing) are shown
@@ -826,484 +895,16 @@ impl UOp {
 
     /// Replace UOps in the computation graph according to a substitution map.
     ///
-    /// Recursively traverses the graph and replaces any UOp found in the map.
-    /// Returns a new UOp with substitutions applied.
+    /// Delegates to `graph_rewrite_bottom_up` with a wildcard pattern that looks up
+    /// each node in the map — exactly like Tinygrad's `substitute`. The rewrite engine
+    /// provides O(n) memoization via its result cache.
     #[allow(clippy::mutable_key_type)]
     pub fn substitute(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
-        use crate::Op;
-        use smallvec::SmallVec;
-
-        // Check if this UOp is in the substitution map
-        if let Some(replacement) = map.get(&UOpKey(self.clone())) {
-            // Record substitution transformation
-            use crate::provenance::{PROVENANCE_TRACKER, PassName};
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().record_transform(replacement.id, self.id, PassName::Substitute);
-            });
-
-            return replacement.clone();
+        if map.is_empty() {
+            return self.clone();
         }
-
-        // Otherwise, recursively substitute in children and reconstruct Op
-        let new_op = match &self.op {
-            // Nullary operations - no children, just clone
-            Op::Const(_)
-            | Op::Unique(_)
-            | Op::Device(_)
-            | Op::Noop
-            | Op::Invalid
-            | Op::DefineGlobal(_)
-            | Op::DefineLocal(_)
-            | Op::VConst { .. }
-            | Op::DefineVar { .. }
-            | Op::DefineReg { .. } => return self.clone(),
-
-            // Unary operations
-            Op::Unary(op, src) => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Unary(*op, new_src)
-            }
-            Op::Cast { src, dtype } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Cast { src: new_src, dtype: dtype.clone() }
-            }
-            Op::BitCast { src, dtype } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::BitCast { src: new_src, dtype: dtype.clone() }
-            }
-            Op::Reshape { src, new_shape } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Reshape { src: new_src, new_shape: new_shape.clone() }
-            }
-            Op::Expand { src, new_shape } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Expand { src: new_src, new_shape: new_shape.clone() }
-            }
-            Op::Permute { src, axes } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Permute { src: new_src, axes: axes.clone() }
-            }
-            Op::Flip { src, axes } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Flip { src: new_src, axes: axes.clone() }
-            }
-            Op::Multi { src, axis } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Multi { src: new_src, axis: *axis }
-            }
-            Op::ReduceAxis { src, reduce_op, axes } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::ReduceAxis { src: new_src, reduce_op: *reduce_op, axes: axes.clone() }
-            }
-            Op::MSelect { buffer, device_index } => {
-                let new_buffer = buffer.substitute(map);
-                if Arc::ptr_eq(&new_buffer, buffer) {
-                    return self.clone();
-                }
-                Op::MSelect { buffer: new_buffer, device_index: *device_index }
-            }
-            Op::Special { name, end } => {
-                let new_end = end.substitute(map);
-                if Arc::ptr_eq(&new_end, end) {
-                    return self.clone();
-                }
-                Op::Special { name: name.clone(), end: new_end }
-            }
-            Op::BufferView { buffer, size, offset } => {
-                let new_buffer = buffer.substitute(map);
-                if Arc::ptr_eq(&new_buffer, buffer) {
-                    return self.clone();
-                }
-                Op::BufferView { buffer: new_buffer, size: *size, offset: *offset }
-            }
-            Op::Gep { vector, indices } => {
-                let new_vector = vector.substitute(map);
-                if Arc::ptr_eq(&new_vector, vector) {
-                    return self.clone();
-                }
-                Op::Gep { vector: new_vector, indices: indices.clone() }
-            }
-            Op::Range { end, axis_id, axis_type, deps } => {
-                let new_end = end.substitute(map);
-                let new_deps: SmallVec<[Arc<Self>; 2]> = deps.iter().map(|d| d.substitute(map)).collect();
-                if Arc::ptr_eq(&new_end, end) && deps.iter().zip(&new_deps).all(|(o, n)| Arc::ptr_eq(o, n)) {
-                    return self.clone();
-                }
-                Op::Range { end: new_end, axis_id: *axis_id, axis_type: *axis_type, deps: new_deps }
-            }
-            Op::EndIf { if_op } => {
-                let new_if_op = if_op.substitute(map);
-                if Arc::ptr_eq(&new_if_op, if_op) {
-                    return self.clone();
-                }
-                Op::EndIf { if_op: new_if_op }
-            }
-            Op::End { computation, ranges } => {
-                let new_comp = computation.substitute(map);
-                let new_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
-
-                if Arc::ptr_eq(&new_comp, computation)
-                    && new_ranges.iter().zip(ranges.iter()).all(|(a, b)| Arc::ptr_eq(a, b))
-                {
-                    return self.clone();
-                }
-                Op::End { computation: new_comp, ranges: new_ranges }
-            }
-            Op::Contract { src, upcast_ranges } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Contract { src: new_src, upcast_ranges: upcast_ranges.clone() }
-            }
-            Op::Unroll { src, unroll_axes } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Unroll { src: new_src, unroll_axes: unroll_axes.clone() }
-            }
-            Op::Detach { src } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Detach { src: new_src }
-            }
-            Op::Contiguous { src, opts } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Contiguous { src: new_src, opts: opts.clone() }
-            }
-            Op::ContiguousBackward { src } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::ContiguousBackward { src: new_src }
-            }
-            Op::Precast { src } => {
-                let new_src = src.substitute(map);
-                if Arc::ptr_eq(&new_src, src) {
-                    return self.clone();
-                }
-                Op::Precast { src: new_src }
-            }
-
-            // Binary operations
-            Op::Binary(op, lhs, rhs) => {
-                let new_lhs = lhs.substitute(map);
-                let new_rhs = rhs.substitute(map);
-                if Arc::ptr_eq(&new_lhs, lhs) && Arc::ptr_eq(&new_rhs, rhs) {
-                    return self.clone();
-                }
-                Op::Binary(*op, new_lhs, new_rhs)
-            }
-            Op::Buffer { unique, device, size } => {
-                let new_unique = unique.substitute(map);
-                let new_device = device.substitute(map);
-                if Arc::ptr_eq(&new_unique, unique) && Arc::ptr_eq(&new_device, device) {
-                    return self.clone();
-                }
-                Op::Buffer { unique: new_unique, device: new_device, size: *size }
-            }
-            Op::PointerIndex { ptr, offset } => {
-                let new_ptr = ptr.substitute(map);
-                let new_offset = offset.substitute(map);
-                if Arc::ptr_eq(&new_ptr, ptr) && Arc::ptr_eq(&new_offset, offset) {
-                    return self.clone();
-                }
-                Op::PointerIndex { ptr: new_ptr, offset: new_offset }
-            }
-            Op::Copy { src, device } => {
-                let new_src = src.substitute(map);
-                let new_device = device.substitute(map);
-                if Arc::ptr_eq(&new_src, src) && Arc::ptr_eq(&new_device, device) {
-                    return self.clone();
-                }
-                Op::Copy { src: new_src, device: new_device }
-            }
-            Op::AllReduce { src, device, reduce_op } => {
-                let new_src = src.substitute(map);
-                let new_device = device.substitute(map);
-                if Arc::ptr_eq(&new_src, src) && Arc::ptr_eq(&new_device, device) {
-                    return self.clone();
-                }
-                Op::AllReduce { src: new_src, device: new_device, reduce_op: *reduce_op }
-            }
-            Op::Bind { var, value } => {
-                let new_var = var.substitute(map);
-                let new_value = value.substitute(map);
-                if Arc::ptr_eq(&new_var, var) && Arc::ptr_eq(&new_value, value) {
-                    return self.clone();
-                }
-                Op::Bind { var: new_var, value: new_value }
-            }
-            Op::Assign { target, value, movement_ops } => {
-                let new_target = target.substitute(map);
-                let new_value = value.substitute(map);
-                let new_mops = movement_ops.as_ref().map(|m| m.substitute(map));
-
-                let target_same = Arc::ptr_eq(&new_target, target);
-                let value_same = Arc::ptr_eq(&new_value, value);
-                let mops_same = match (movement_ops, &new_mops) {
-                    (None, None) => true,
-                    (Some(old), Some(new)) => Arc::ptr_eq(old, new),
-                    _ => false,
-                };
-
-                if target_same && value_same && mops_same {
-                    return self.clone();
-                }
-                Op::Assign { target: new_target, value: new_value, movement_ops: new_mops }
-            }
-            Op::Load { buffer, index, alt } => {
-                let new_buffer = buffer.substitute(map);
-                let new_index = index.substitute(map);
-                let new_alt = alt.as_ref().map(|a| a.substitute(map));
-                let alt_changed = match (&new_alt, alt) {
-                    (Some(na), Some(a)) => !Arc::ptr_eq(na, a),
-                    (None, None) => false,
-                    _ => true,
-                };
-                if Arc::ptr_eq(&new_buffer, buffer) && Arc::ptr_eq(&new_index, index) && !alt_changed {
-                    return self.clone();
-                }
-                Op::Load { buffer: new_buffer, index: new_index, alt: new_alt }
-            }
-
-            // Ternary operations
-            Op::Ternary(op, a, b, c) => {
-                let new_a = a.substitute(map);
-                let new_b = b.substitute(map);
-                let new_c = c.substitute(map);
-                if Arc::ptr_eq(&new_a, a) && Arc::ptr_eq(&new_b, b) && Arc::ptr_eq(&new_c, c) {
-                    return self.clone();
-                }
-                Op::Ternary(*op, new_a, new_b, new_c)
-            }
-            Op::Pad { src, begin_pads, end_pads } => {
-                let new_src = src.substitute(map);
-                let new_begin = begin_pads.substitute(map);
-                let new_end = end_pads.substitute(map);
-                if Arc::ptr_eq(&new_src, src) && Arc::ptr_eq(&new_begin, begin_pads) && Arc::ptr_eq(&new_end, end_pads)
-                {
-                    return self.clone();
-                }
-                Op::Pad { src: new_src, begin_pads: new_begin, end_pads: new_end }
-            }
-            Op::Shrink { src, begins, ends } => {
-                let new_src = src.substitute(map);
-                let new_begins = begins.substitute(map);
-                let new_ends = ends.substitute(map);
-                if Arc::ptr_eq(&new_src, src) && Arc::ptr_eq(&new_begins, begins) && Arc::ptr_eq(&new_ends, ends) {
-                    return self.clone();
-                }
-                Op::Shrink { src: new_src, begins: new_begins, ends: new_ends }
-            }
-            Op::Wmma { a, b, c, metadata } => {
-                let new_a = a.substitute(map);
-                let new_b = b.substitute(map);
-                let new_c = c.substitute(map);
-                if Arc::ptr_eq(&new_a, a) && Arc::ptr_eq(&new_b, b) && Arc::ptr_eq(&new_c, c) {
-                    return self.clone();
-                }
-                Op::Wmma { a: new_a, b: new_b, c: new_c, metadata: metadata.clone() }
-            }
-            Op::Store { index, value, ranges } => {
-                let new_index = index.substitute(map);
-                let new_value = value.substitute(map);
-                let new_ranges: SmallVec<[Arc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
-                if Arc::ptr_eq(&new_index, index)
-                    && Arc::ptr_eq(&new_value, value)
-                    && ranges.iter().zip(&new_ranges).all(|(old, new)| Arc::ptr_eq(old, new))
-                {
-                    return self.clone();
-                }
-                Op::Store { index: new_index, value: new_value, ranges: new_ranges }
-            }
-
-            // Variable-arity operations
-            Op::Sink { sources } => {
-                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
-                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
-                    return self.clone();
-                }
-                Op::Sink { sources: new_sources }
-            }
-            Op::Group { sources } => {
-                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
-                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
-                    return self.clone();
-                }
-                Op::Group { sources: new_sources }
-            }
-            Op::Bufferize { compute, ranges, opts } => {
-                let new_compute = compute.substitute(map);
-                let new_ranges: SmallVec<[Arc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
-                if Arc::ptr_eq(&new_compute, compute)
-                    && ranges.iter().zip(&new_ranges).all(|(old, new)| Arc::ptr_eq(old, new))
-                {
-                    return self.clone();
-                }
-                Op::Bufferize { compute: new_compute, ranges: new_ranges, opts: opts.clone() }
-            }
-            Op::Index { buffer, indices, gate } => {
-                let new_buffer = buffer.substitute(map);
-                let new_indices: SmallVec<[Arc<Self>; 4]> = indices.iter().map(|i| i.substitute(map)).collect();
-                let new_gate = gate.as_ref().map(|g| g.substitute(map));
-                let gate_unchanged = match (gate, &new_gate) {
-                    (None, None) => true,
-                    (Some(old), Some(new)) => Arc::ptr_eq(old, new),
-                    _ => false,
-                };
-                if Arc::ptr_eq(&new_buffer, buffer)
-                    && indices.iter().zip(&new_indices).all(|(old, new)| Arc::ptr_eq(old, new))
-                    && gate_unchanged
-                {
-                    return self.clone();
-                }
-                Op::Index { buffer: new_buffer, indices: new_indices, gate: new_gate }
-            }
-            Op::Reduce { src, reduce_op, ranges } => {
-                let new_src = src.substitute(map);
-                let new_ranges: SmallVec<[Arc<Self>; 4]> = ranges.iter().map(|r| r.substitute(map)).collect();
-                if Arc::ptr_eq(&new_src, src) && ranges.iter().zip(&new_ranges).all(|(old, new)| Arc::ptr_eq(old, new))
-                {
-                    return self.clone();
-                }
-                Op::Reduce { src: new_src, reduce_op: *reduce_op, ranges: new_ranges }
-            }
-            Op::If { condition, body } => {
-                let new_condition = condition.substitute(map);
-                let new_body: SmallVec<[Arc<Self>; 4]> = body.iter().map(|b| b.substitute(map)).collect();
-                if Arc::ptr_eq(&new_condition, condition)
-                    && body.iter().zip(&new_body).all(|(old, new)| Arc::ptr_eq(old, new))
-                {
-                    return self.clone();
-                }
-                Op::If { condition: new_condition, body: new_body }
-            }
-            Op::Barrier { src, deps } => {
-                let new_src = src.substitute(map);
-                let new_deps: SmallVec<[Arc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
-                if Arc::ptr_eq(&new_src, src) && deps.iter().zip(&new_deps).all(|(old, new)| Arc::ptr_eq(old, new)) {
-                    return self.clone();
-                }
-                Op::Barrier { src: new_src, deps: new_deps }
-            }
-            Op::Vectorize { elements } => {
-                let new_elements: SmallVec<[Arc<Self>; 4]> = elements.iter().map(|e| e.substitute(map)).collect();
-                if elements.iter().zip(&new_elements).all(|(old, new)| Arc::ptr_eq(old, new)) {
-                    return self.clone();
-                }
-                Op::Vectorize { elements: new_elements }
-            }
-            Op::Cat { sources } => {
-                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
-                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
-                    return self.clone();
-                }
-                Op::Cat { sources: new_sources }
-            }
-            Op::PtrCat { sources } => {
-                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
-                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new)) {
-                    return self.clone();
-                }
-                Op::PtrCat { sources: new_sources }
-            }
-            Op::MStack { buffers } => {
-                let new_buffers: SmallVec<[Arc<Self>; 4]> = buffers.iter().map(|b| b.substitute(map)).collect();
-                if buffers.iter().zip(&new_buffers).all(|(old, new)| Arc::ptr_eq(old, new)) {
-                    return self.clone();
-                }
-                Op::MStack { buffers: new_buffers }
-            }
-            Op::Kernel { sources, ast } => {
-                let new_sources: SmallVec<[Arc<Self>; 4]> = sources.iter().map(|s| s.substitute(map)).collect();
-                let new_ast = ast.substitute(map);
-
-                if sources.iter().zip(&new_sources).all(|(old, new)| Arc::ptr_eq(old, new))
-                    && Arc::ptr_eq(&new_ast, ast)
-                {
-                    return self.clone();
-                }
-                Op::Kernel { sources: new_sources, ast: new_ast }
-            }
-            Op::After { passthrough, deps } => {
-                let new_passthrough = passthrough.substitute(map);
-                let new_deps: SmallVec<[Arc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
-                if Arc::ptr_eq(&new_passthrough, passthrough)
-                    && deps.iter().zip(&new_deps).all(|(old, new)| Arc::ptr_eq(old, new))
-                {
-                    return self.clone();
-                }
-                // Validate: AFTER passthrough must not be control flow (Tinygrad semantics)
-                debug_assert!(
-                    !matches!(new_passthrough.op(), Op::Range { .. } | Op::End { .. }),
-                    "substitute: AFTER passthrough became {:?} (id={}), violates Tinygrad semantics",
-                    new_passthrough.op(),
-                    new_passthrough.id
-                );
-                Op::After { passthrough: new_passthrough, deps: new_deps }
-            }
-            Op::Custom { code, deps } => {
-                let new_deps: SmallVec<[Arc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
-                if deps.iter().zip(&new_deps).all(|(old, new)| Arc::ptr_eq(old, new)) {
-                    return self.clone();
-                }
-                Op::Custom { code: code.clone(), deps: new_deps }
-            }
-            Op::CustomI { code, deps } => {
-                let new_deps: SmallVec<[Arc<Self>; 4]> = deps.iter().map(|d| d.substitute(map)).collect();
-                if deps.iter().zip(&new_deps).all(|(old, new)| Arc::ptr_eq(old, new)) {
-                    return self.clone();
-                }
-                Op::CustomI { code: code.clone(), deps: new_deps }
-            }
-        };
-
-        // Preserve original dtype like Tinygrad - dtype is explicitly set at creation
-        // If you need a different dtype, create a new UOp explicitly
-        let new_uop = Self::new(new_op, self.dtype.clone());
-
-        // Record transformation in provenance tracker
-        use crate::provenance::{PROVENANCE_TRACKER, PassName};
-        PROVENANCE_TRACKER.with(|tracker| {
-            tracker.borrow_mut().record_transform(new_uop.id, self.id, PassName::Substitute);
-        });
-
-        new_uop
+        let matcher = SubstituteMatcher(map);
+        crate::rewrite::graph_rewrite_bottom_up(&matcher, self.clone(), &mut ())
     }
 
     /// Reconstruct this UOp with new sources.

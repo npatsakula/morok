@@ -129,7 +129,6 @@ fn test_fix_reduce_unroll_with_unroll_ops() {
 /// - Expected after fix_reduce_unroll: REDUCE(ranges=[Range(R0, Reduce)], src=CONTRACT(...))
 /// - Actual: REDUCE(ranges=[]) → horizontal_reduce returns input unchanged (wrong dtype)
 #[test]
-#[tracing_test::traced_test]
 fn test_reduce_empty_ranges_bug() {
     // Create data buffer representing [[1.0, 2.0], [3.0, 4.0]]
     // Layout: [1.0, 2.0, 3.0, 4.0]

@@ -288,6 +288,15 @@ fn tensor_to_i64_vec(t: &Tensor) -> Result<Vec<i64>> {
     Ok(arr.iter().copied().collect())
 }
 
+/// Extract concrete f64 values from a tensor.
+fn tensor_to_f64_vec(t: &Tensor) -> Result<Vec<f64>> {
+    let arr = t
+        .cast(DType::Float64)?
+        .to_ndarray::<f64>()
+        .map_err(|e| Error::IrConstruction { details: format!("tensor_to_f64_vec: {e}") })?;
+    Ok(arr.iter().copied().collect())
+}
+
 impl OpRegistry {
     pub fn new() -> Self {
         Self
@@ -892,6 +901,267 @@ impl OpRegistry {
                 return Ok(vec![x, mask]);
             }
 
+            // === Scatter / Gather ND ===
+            "ScatterElements" => {
+                let axis = get_attr_int(node, "axis", 0) as isize;
+                let reduction = get_attr_string(node, "reduction", "none");
+                let x = inp(inputs, 0);
+                let idx = inp(inputs, 1);
+                let updates = inp(inputs, 2);
+                // Normalize negative indices
+                let x_shape = x.shape()?;
+                let ndim = x_shape.len();
+                let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+                let dim_size = x_shape[norm_axis].as_const().unwrap() as i64;
+                let zero = Tensor::const_(ConstValue::Int(0), idx.uop().dtype());
+                let dim_t = Tensor::const_(ConstValue::Int(dim_size), idx.uop().dtype());
+                let neg_mask = idx.try_lt(&zero)?;
+                let norm_idx = idx.try_add(&dim_t)?.where_(&neg_mask, idx)?;
+                match reduction.as_str() {
+                    "none" => x.scatter(axis, &norm_idx, updates)?,
+                    other => {
+                        let reduce = match other {
+                            "add" => "sum",
+                            "mul" => "prod",
+                            "min" => "amin",
+                            "max" => "amax",
+                            _ => {
+                                return Err(Error::IrConstruction {
+                                    details: format!("ScatterElements: unsupported reduction '{other}'"),
+                                });
+                            }
+                        };
+                        x.scatter_reduce(axis, &norm_idx, updates, reduce, true)?
+                    }
+                }
+            }
+            "ScatterND" => {
+                let mut x = inp(inputs, 0).clone();
+                let indices = inp(inputs, 1);
+                let updates = inp(inputs, 2);
+                let reduction = get_attr_string(node, "reduction", "none");
+                let x_shape = x.shape()?;
+                let x_dims: Vec<usize> = x_shape.iter().map(|s| s.as_const().unwrap()).collect();
+                let idx_shape = indices.shape()?;
+                let last_idx_dim = idx_shape[idx_shape.len() - 1].as_const().unwrap();
+                // Compute strides for the indexed dimensions
+                let strides: Vec<i64> =
+                    (0..last_idx_dim).map(|k| x_dims[k + 1..last_idx_dim].iter().product::<usize>() as i64).collect();
+                // Flatten the first last_idx_dim dimensions of x
+                let x_numel: usize = x_dims.iter().product();
+                let inner: usize = x_dims[last_idx_dim..].iter().product();
+                let outer = x_numel / inner;
+                let x_flat = x.try_reshape(&[outer as isize, inner as isize])?;
+                // Compute flat indices from multi-dim indices
+                let idx_splits: Vec<Tensor> = (0..last_idx_dim)
+                    .map(|k| {
+                        let mut ranges: Vec<(isize, isize)> =
+                            idx_shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+                        ranges[idx_shape.len() - 1] = (k as isize, k as isize + 1);
+                        let slice = indices.try_shrink(&ranges)?;
+                        slice.try_squeeze(Some(-1))
+                    })
+                    .collect::<std::result::Result<_, _>>()?;
+                let mut flat_idx = Tensor::const_(ConstValue::Int(0), DType::Int64);
+                for (k, idx_k) in idx_splits.iter().enumerate() {
+                    let stride_t = Tensor::const_(ConstValue::Int(strides[k]), DType::Int64);
+                    flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
+                }
+                // Flatten updates to match: [num_updates, inner]
+                let upd_shape = updates.shape()?;
+                let upd_outer: usize = upd_shape[..upd_shape.len() - (x_dims.len() - last_idx_dim)]
+                    .iter()
+                    .map(|s| s.as_const().unwrap())
+                    .product();
+                let upd_flat = updates.try_reshape(&[upd_outer as isize, inner as isize])?;
+                // Expand flat_idx to [upd_outer, inner]
+                let flat_idx = flat_idx
+                    .try_reshape(&[upd_outer as isize, 1])?
+                    .try_expand(&[upd_outer as isize, inner as isize])?;
+                x = match reduction.as_str() {
+                    "none" => x_flat.scatter(0, &flat_idx.cast(DType::Int32)?, &upd_flat)?,
+                    "add" => x_flat.scatter_reduce(0, &flat_idx.cast(DType::Int32)?, &upd_flat, "sum", true)?,
+                    "mul" => x_flat.scatter_reduce(0, &flat_idx.cast(DType::Int32)?, &upd_flat, "prod", true)?,
+                    "max" => x_flat.scatter_reduce(0, &flat_idx.cast(DType::Int32)?, &upd_flat, "amax", true)?,
+                    "min" => x_flat.scatter_reduce(0, &flat_idx.cast(DType::Int32)?, &upd_flat, "amin", true)?,
+                    _ => {
+                        return Err(Error::IrConstruction {
+                            details: format!("ScatterND: unsupported reduction '{reduction}'"),
+                        });
+                    }
+                };
+                let out_shape: Vec<isize> = x_dims.iter().map(|&d| d as isize).collect();
+                x.try_reshape(&out_shape)?
+            }
+            "GatherND" => {
+                let x = inp(inputs, 0);
+                let indices = inp(inputs, 1);
+                let batch_dims = get_attr_int(node, "batch_dims", 0) as usize;
+                let x_shape = x.shape()?;
+                let x_dims: Vec<usize> = x_shape.iter().map(|s| s.as_const().unwrap()).collect();
+                let idx_shape = indices.shape()?;
+                let idx_dims: Vec<usize> = idx_shape.iter().map(|s| s.as_const().unwrap()).collect();
+                let last_idx_dim = *idx_dims.last().unwrap();
+
+                if batch_dims == 0 {
+                    // Flatten multi-dim indices to flat index via stride computation
+                    let strides: Vec<i64> = (0..last_idx_dim)
+                        .map(|k| x_dims[k + 1..last_idx_dim].iter().product::<usize>() as i64)
+                        .collect();
+                    let inner: usize = x_dims[last_idx_dim..].iter().product();
+                    let outer = x_dims[..last_idx_dim].iter().product::<usize>();
+
+                    // Compute flat index
+                    let mut flat_idx = Tensor::const_(ConstValue::Int(0), DType::Int64);
+                    for (k, stride) in strides.iter().enumerate() {
+                        let mut ranges: Vec<(isize, isize)> = idx_dims.iter().map(|&s| (0, s as isize)).collect();
+                        ranges[idx_dims.len() - 1] = (k as isize, k as isize + 1);
+                        let idx_k = indices.try_shrink(&ranges)?.try_squeeze(Some(-1))?;
+                        let stride_t = Tensor::const_(ConstValue::Int(*stride), DType::Int64);
+                        flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
+                    }
+
+                    let x_flat = x.try_reshape(&[outer as isize, inner as isize])?;
+                    // Gather shape: indices shape without last dim, then inner dims
+                    let gather_outer: Vec<isize> = idx_dims[..idx_dims.len() - 1].iter().map(|&d| d as isize).collect();
+                    let num_gathers: usize = gather_outer.iter().map(|&d| d as usize).product();
+
+                    let flat_idx_2d = flat_idx
+                        .try_reshape(&[num_gathers as isize, 1])?
+                        .try_expand(&[num_gathers as isize, inner as isize])?
+                        .cast(DType::Int32)?;
+                    let result = x_flat.gather(0, &flat_idx_2d)?;
+
+                    let mut out_shape = gather_outer;
+                    for &d in &x_dims[last_idx_dim..] {
+                        out_shape.push(d as isize);
+                    }
+                    result.try_reshape(&out_shape)?
+                } else {
+                    // Batch dims: merge batch dims, add batch arange offset
+                    let batch_size: usize = x_dims[..batch_dims].iter().product();
+                    let inner_x: Vec<usize> = x_dims[batch_dims..].to_vec();
+                    let inner_idx: Vec<usize> = idx_dims[batch_dims..].to_vec();
+
+                    let x_flat = x.try_reshape(
+                        &std::iter::once(batch_size as isize)
+                            .chain(inner_x.iter().map(|&d| d as isize))
+                            .collect::<Vec<_>>(),
+                    )?;
+                    let idx_flat = indices.try_reshape(
+                        &std::iter::once(batch_size as isize)
+                            .chain(inner_idx.iter().map(|&d| d as isize))
+                            .collect::<Vec<_>>(),
+                    )?;
+
+                    let last_inner = *inner_idx.last().unwrap();
+                    let strides: Vec<i64> =
+                        (0..last_inner).map(|k| inner_x[k + 1..last_inner].iter().product::<usize>() as i64).collect();
+
+                    // For each batch, compute flat index
+                    let mut flat_idx = Tensor::const_(ConstValue::Int(0), DType::Int64);
+                    let idx_flat_shape = idx_flat.shape()?;
+                    let idx_flat_dims: Vec<usize> = idx_flat_shape.iter().map(|s| s.as_const().unwrap()).collect();
+                    for (k, stride) in strides.iter().enumerate() {
+                        let mut ranges: Vec<(isize, isize)> = idx_flat_dims.iter().map(|&s| (0, s as isize)).collect();
+                        ranges[idx_flat_dims.len() - 1] = (k as isize, k as isize + 1);
+                        let idx_k = idx_flat.try_shrink(&ranges)?.try_squeeze(Some(-1))?;
+                        let stride_t = Tensor::const_(ConstValue::Int(*stride), DType::Int64);
+                        flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
+                    }
+
+                    // Add batch offset
+                    let _elems_per_batch = inner_x.iter().product::<usize>();
+                    let batch_stride = inner_x[..last_inner].iter().product::<usize>();
+                    let batch_offset_arr = Tensor::arange(0, Some(batch_size as i64), None)?
+                        .try_mul(&Tensor::from_slice([batch_stride as i64]))?;
+                    let gather_inner = idx_flat_dims[1..idx_flat_dims.len() - 1].iter().product::<usize>();
+                    let batch_offset = batch_offset_arr
+                        .try_reshape(&[batch_size as isize, 1])?
+                        .try_expand(&[batch_size as isize, gather_inner as isize])?;
+                    flat_idx = flat_idx.try_add(&batch_offset)?;
+
+                    let remaining: usize = inner_x[last_inner..].iter().product();
+                    let x_2d = x_flat.try_reshape(&[(batch_size * batch_stride) as isize, remaining as isize])?;
+                    let fi = flat_idx
+                        .try_reshape(&[(batch_size * gather_inner) as isize, 1])?
+                        .try_expand(&[(batch_size * gather_inner) as isize, remaining as isize])?
+                        .cast(DType::Int32)?;
+                    let result = x_2d.gather(0, &fi)?;
+
+                    let mut out_shape: Vec<isize> = x_dims[..batch_dims].iter().map(|&d| d as isize).collect();
+                    out_shape.extend(inner_idx[..inner_idx.len() - 1].iter().map(|&d| d as isize));
+                    out_shape.extend(inner_x[last_inner..].iter().map(|&d| d as isize));
+                    result.try_reshape(&out_shape)?
+                }
+            }
+
+            // === Resize ===
+            "Resize" => {
+                let x = inp(inputs, 0);
+                // inputs: X, roi (optional), scales (optional), sizes (optional)
+                let scales: Option<Vec<f64>> = inputs
+                    .get(2)
+                    .and_then(|o| o.as_ref())
+                    .filter(|t| t.numel().unwrap_or(0) > 0)
+                    .map(tensor_to_f64_vec)
+                    .transpose()?;
+                let sizes: Option<Vec<usize>> = inputs
+                    .get(3)
+                    .and_then(|o| o.as_ref())
+                    .filter(|t| t.numel().unwrap_or(0) > 0)
+                    .map(|t| tensor_to_i64_vec(t).map(|v| v.iter().map(|&x| x as usize).collect()))
+                    .transpose()?;
+                let mode = get_attr_string(node, "mode", "nearest");
+                let coord_mode = get_attr_string(node, "coordinate_transformation_mode", "half_pixel");
+                let nearest_mode = get_attr_string(node, "nearest_mode", "round_prefer_floor");
+                let cubic_coeff = get_attr_float(node, "cubic_coeff_a", -0.75) as f64;
+                let exclude_outside = get_attr_int(node, "exclude_outside", 0) != 0;
+                let policy = get_attr_string(node, "keep_aspect_ratio_policy", "stretch");
+                let axes_attr = get_attr_ints(node, "axes");
+                let axes: Option<Vec<usize>> = if axes_attr.is_empty() {
+                    None
+                } else {
+                    let ndim = x.ndim()?;
+                    Some(
+                        axes_attr
+                            .iter()
+                            .map(|&a| if a < 0 { (ndim as i64 + a) as usize } else { a as usize })
+                            .collect(),
+                    )
+                };
+                x.resize()
+                    .maybe_scales(scales.as_deref())
+                    .maybe_sizes(sizes.as_deref())
+                    .mode(&mode)
+                    .coordinate_transformation_mode(&coord_mode)
+                    .nearest_mode(&nearest_mode)
+                    .cubic_coeff_a(cubic_coeff)
+                    .exclude_outside(exclude_outside)
+                    .keep_aspect_ratio_policy(&policy)
+                    .maybe_axes(axes.as_deref())
+                    .call()?
+            }
+
+            // === NonZero ===
+            "NonZero" => inp(inputs, 0).nonzero()?.try_transpose(0, 1)?.cast(DType::Int64)?,
+
+            // === Einsum ===
+            "Einsum" => {
+                let equation = get_attr_string(node, "equation", "");
+                let ops: Vec<&Tensor> = inputs.iter().filter_map(|o| o.as_ref()).collect();
+                Tensor::einsum(&equation, &ops)?
+            }
+
+            // === TopK ===
+            "TopK" => {
+                let k = tensor_to_i64_vec(inp(inputs, 1))?[0] as usize;
+                let axis = get_attr_int(node, "axis", -1) as isize;
+                let largest = get_attr_int(node, "largest", 1) == 1;
+                let (values, indices) = inp(inputs, 0).topk(k, axis, largest)?;
+                return Ok(vec![values, indices.cast(DType::Int64)?]);
+            }
+
             // === Identity / Constant ===
             "Identity" => inp(inputs, 0).clone(),
             "Constant" => return self.op_constant(node).map(|t| vec![t]),
@@ -1316,8 +1586,8 @@ mod tests {
     #[test]
     fn test_registry_add() {
         let registry = OpRegistry::new();
-        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-        let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("Add", "", &[a, b], &node);
@@ -1328,8 +1598,8 @@ mod tests {
     #[test]
     fn test_registry_matmul() {
         let registry = OpRegistry::new();
-        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
-        let b = Tensor::from_slice(&[5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2]).unwrap();
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+        let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2]).unwrap();
         let node = NodeProto::default();
 
         let result = registry.dispatch("MatMul", "", &[a, b], &node);
@@ -1340,7 +1610,7 @@ mod tests {
     #[test]
     fn test_registry_relu() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[-2.0f32, -1.0, 0.0, 1.0, 2.0]);
+        let x = Tensor::from_slice([-2.0f32, -1.0, 0.0, 1.0, 2.0]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("Relu", "", &[x], &node);
@@ -1351,7 +1621,7 @@ mod tests {
     #[test]
     fn test_registry_transpose() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
         let mut node = NodeProto::default();
 
         let mut attr = AttributeProto::default();
@@ -1367,7 +1637,7 @@ mod tests {
     #[test]
     fn test_registry_sigmoid() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[-1.0f32, 0.0, 1.0]);
+        let x = Tensor::from_slice([-1.0f32, 0.0, 1.0]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("Sigmoid", "", &[x], &node);
@@ -1378,7 +1648,7 @@ mod tests {
     #[test]
     fn test_registry_reduce_sum() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
         let node = NodeProto::default();
 
         let result = registry.dispatch("ReduceSum", "", &[x], &node);
@@ -1389,7 +1659,7 @@ mod tests {
     // === Constant Operator Tests ===
 
     #[test]
-    #[tracing_test::traced_test]
+    // #[tracing_test::traced_test]
     fn test_constant_value_float() {
         let registry = OpRegistry::new();
         let mut node = NodeProto::default();
@@ -1485,7 +1755,7 @@ mod tests {
     #[test]
     fn test_registry_abs() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[-2.0f32, -1.0, 0.0, 1.0, 2.0]);
+        let x = Tensor::from_slice([-2.0f32, -1.0, 0.0, 1.0, 2.0]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("Abs", "", &[x], &node).unwrap().realize().unwrap();
@@ -1495,8 +1765,8 @@ mod tests {
     #[test]
     fn test_registry_gather() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
-        let indices = Tensor::from_slice(&[0i64, 2, 4]);
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
+        let indices = Tensor::from_slice([0i64, 2, 4]);
         let node = NodeProto::default(); // axis defaults to 0
 
         let result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap().realize().unwrap();
@@ -1506,8 +1776,8 @@ mod tests {
     #[test]
     fn test_registry_gather_axis1() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
-        let indices = Tensor::from_slice(&[0i64, 2, 1, 0]).try_reshape(&[2, 2]).unwrap();
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let indices = Tensor::from_slice([0i64, 2, 1, 0]).try_reshape(&[2, 2]).unwrap();
 
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
@@ -1522,8 +1792,8 @@ mod tests {
     #[test]
     fn test_registry_equal() {
         let registry = OpRegistry::new();
-        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-        let b = Tensor::from_slice(&[1.0f32, 0.0, 3.0]);
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([1.0f32, 0.0, 3.0]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("Equal", "", &[a, b], &node).unwrap().realize().unwrap();
@@ -1533,9 +1803,9 @@ mod tests {
     #[test]
     fn test_registry_where() {
         let registry = OpRegistry::new();
-        let condition = Tensor::from_slice(&[true, false, true]);
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-        let y = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
+        let condition = Tensor::from_slice([true, false, true]);
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let y = Tensor::from_slice([10.0f32, 20.0, 30.0]);
         let node = NodeProto::default();
 
         // ONNX Where: inputs are (condition, X, Y)
@@ -1546,7 +1816,7 @@ mod tests {
     #[test]
     fn test_registry_reduce_max() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 4.0, 2.0, 3.0]).try_reshape(&[2, 2]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 4.0, 2.0, 3.0]).try_reshape(&[2, 2]).unwrap();
         let node = NodeProto::default();
 
         let result = registry.dispatch("ReduceMax", "", &[x], &node).unwrap().realize().unwrap();
@@ -1556,7 +1826,7 @@ mod tests {
     #[test]
     fn test_registry_reduce_with_keepdims() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
 
         let mut node = NodeProto::default();
         let mut axes_attr = AttributeProto::default();
@@ -1575,7 +1845,7 @@ mod tests {
     #[test]
     fn test_registry_math_ops() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let node = NodeProto::default();
 
         for op in ["Exp", "Log", "Ceil", "Floor", "Round", "Sign", "Reciprocal", "Sin", "Cos", "Tan"] {
@@ -1587,8 +1857,8 @@ mod tests {
     #[test]
     fn test_registry_comparison_ops() {
         let registry = OpRegistry::new();
-        let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-        let b = Tensor::from_slice(&[2.0f32, 2.0, 1.0]);
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([2.0f32, 2.0, 1.0]);
         let node = NodeProto::default();
 
         for op in ["Less", "LessOrEqual", "Greater", "GreaterOrEqual"] {
@@ -1600,7 +1870,7 @@ mod tests {
     #[test]
     fn test_registry_flatten() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
         let node = NodeProto::default(); // axis defaults to 1
 
         let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
@@ -1612,7 +1882,7 @@ mod tests {
     #[test]
     fn test_registry_log_softmax() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
         let node = NodeProto::default(); // axis defaults to -1
 
         // Graph construction succeeds (realization may hit backend limitations)
@@ -1625,9 +1895,9 @@ mod tests {
     #[test]
     fn test_max_variadic_3_inputs() {
         let registry = OpRegistry::new();
-        let a = Tensor::from_slice(&[1.0f32, 5.0]);
-        let b = Tensor::from_slice(&[3.0f32, 2.0]);
-        let c = Tensor::from_slice(&[2.0f32, 4.0]);
+        let a = Tensor::from_slice([1.0f32, 5.0]);
+        let b = Tensor::from_slice([3.0f32, 2.0]);
+        let c = Tensor::from_slice([2.0f32, 4.0]);
         let inputs = vec![Some(a), Some(b), Some(c)];
         let node = NodeProto::default();
 
@@ -1640,7 +1910,7 @@ mod tests {
     #[test]
     fn test_max_single_input() {
         let registry = OpRegistry::new();
-        let a = Tensor::from_slice(&[7.0f32, 3.0]);
+        let a = Tensor::from_slice([7.0f32, 3.0]);
         let inputs = vec![Some(a)];
         let node = NodeProto::default();
 
@@ -1653,9 +1923,9 @@ mod tests {
     #[test]
     fn test_min_variadic_3_inputs() {
         let registry = OpRegistry::new();
-        let a = Tensor::from_slice(&[3.0f32, 1.0]);
-        let b = Tensor::from_slice(&[1.0f32, 5.0]);
-        let c = Tensor::from_slice(&[2.0f32, 3.0]);
+        let a = Tensor::from_slice([3.0f32, 1.0]);
+        let b = Tensor::from_slice([1.0f32, 5.0]);
+        let c = Tensor::from_slice([2.0f32, 3.0]);
         let inputs = vec![Some(a), Some(b), Some(c)];
         let node = NodeProto::default();
 
@@ -1668,7 +1938,7 @@ mod tests {
     #[test]
     fn test_split_remainder_distribution() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
         let inputs = vec![Some(data)];
 
         let mut node = NodeProto::default();
@@ -1688,9 +1958,9 @@ mod tests {
     #[test]
     fn test_range_float() {
         let registry = OpRegistry::new();
-        let start = Tensor::from_slice(&[0.0f32]);
-        let limit = Tensor::from_slice(&[5.5f32]);
-        let delta = Tensor::from_slice(&[1.5f32]);
+        let start = Tensor::from_slice([0.0f32]);
+        let limit = Tensor::from_slice([5.5f32]);
+        let delta = Tensor::from_slice([1.5f32]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
@@ -1702,9 +1972,9 @@ mod tests {
     #[test]
     fn test_range_integer_regression() {
         let registry = OpRegistry::new();
-        let start = Tensor::from_slice(&[0i32]);
-        let limit = Tensor::from_slice(&[5i32]);
-        let delta = Tensor::from_slice(&[1i32]);
+        let start = Tensor::from_slice([0i32]);
+        let limit = Tensor::from_slice([5i32]);
+        let delta = Tensor::from_slice([1i32]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
@@ -1716,8 +1986,8 @@ mod tests {
     #[test]
     fn test_gather_negative_indices() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[10.0f32, 20.0, 30.0, 40.0, 50.0]);
-        let indices = Tensor::from_slice(&[0i64, -1, 2, -2]);
+        let data = Tensor::from_slice([10.0f32, 20.0, 30.0, 40.0, 50.0]);
+        let indices = Tensor::from_slice([0i64, -1, 2, -2]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("Gather", "", &[data, indices], &node).unwrap();
@@ -1729,7 +1999,7 @@ mod tests {
     #[test]
     fn test_dropout_mask_shape() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
         let inputs = vec![Some(x)];
         let node = NodeProto::default();
 
@@ -1748,7 +2018,7 @@ mod tests {
     #[test]
     fn test_constant_of_shape_empty() {
         let registry = OpRegistry::new();
-        let shape = Tensor::from_slice(&[0i64]);
+        let shape = Tensor::from_slice([0i64]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("ConstantOfShape", "", &[shape], &node).unwrap();
@@ -1760,7 +2030,7 @@ mod tests {
     #[test]
     fn test_reduce_log_sum_exp() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
 
         let mut node = NodeProto::default();
         let mut axes_attr = AttributeProto::default();
@@ -1787,7 +2057,7 @@ mod tests {
     #[test]
     fn test_shape_start_end() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[
+        let x = Tensor::from_slice([
             1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0,
             20.0, 21.0, 22.0, 23.0, 24.0,
         ])
@@ -1812,7 +2082,7 @@ mod tests {
     #[test]
     fn test_shape_negative_start() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+        let x = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
         attr.name = "start".to_string();
@@ -1828,7 +2098,7 @@ mod tests {
     #[test]
     fn test_gelu_exact() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[0.0f32, 1.0, -1.0]);
+        let x = Tensor::from_slice([0.0f32, 1.0, -1.0]);
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
         attr.name = "approximate".to_string();
@@ -1846,7 +2116,7 @@ mod tests {
     #[test]
     fn test_gelu_tanh_regression() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[0.0f32, 1.0]);
+        let x = Tensor::from_slice([0.0f32, 1.0]);
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
         attr.name = "approximate".to_string();
@@ -1863,8 +2133,8 @@ mod tests {
     #[test]
     fn test_reshape_allowzero_copy() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
-        let shape_tensor = Tensor::from_slice(&[0i64, 3, -1]);
+        let data = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+        let shape_tensor = Tensor::from_slice([0i64, 3, -1]);
         let inputs = vec![Some(data), Some(shape_tensor)];
         let node = NodeProto::default(); // allowzero defaults to 0
 
@@ -1877,7 +2147,7 @@ mod tests {
     fn test_argmax_select_last() {
         let registry = OpRegistry::new();
         // [1, 3, 2, 3] — max=3 appears at indices 1 and 3
-        let x = Tensor::from_slice(&[1.0f32, 3.0, 2.0, 3.0]);
+        let x = Tensor::from_slice([1.0f32, 3.0, 2.0, 3.0]);
         let mut node = NodeProto::default();
         let mut attr_sel = AttributeProto::default();
         attr_sel.name = "select_last_index".to_string();
@@ -1894,7 +2164,7 @@ mod tests {
     fn test_argmin_select_last() {
         let registry = OpRegistry::new();
         // [3, 1, 2, 1] — min=1 appears at indices 1 and 3
-        let x = Tensor::from_slice(&[3.0f32, 1.0, 2.0, 1.0]);
+        let x = Tensor::from_slice([3.0f32, 1.0, 2.0, 1.0]);
         let mut node = NodeProto::default();
         let mut attr_sel = AttributeProto::default();
         attr_sel.name = "select_last_index".to_string();
@@ -1910,7 +2180,7 @@ mod tests {
     #[test]
     fn test_argmax_cast_int64() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 3.0, 2.0]);
+        let x = Tensor::from_slice([1.0f32, 3.0, 2.0]);
         let node = NodeProto::default();
 
         let result = registry.dispatch("ArgMax", "", &[x], &node).unwrap();
@@ -1920,8 +2190,8 @@ mod tests {
     #[test]
     fn test_expand_broadcast() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[3, 1]).unwrap();
-        let target = Tensor::from_slice(&[2i64, 3, 4]);
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[3, 1]).unwrap();
+        let target = Tensor::from_slice([2i64, 3, 4]);
         let inputs = vec![Some(data), Some(target)];
         let node = NodeProto::default();
 
@@ -1935,7 +2205,7 @@ mod tests {
         let registry = OpRegistry::new();
 
         for (axis, expected_shape) in [(0, vec![1, 24]), (1, vec![2, 12]), (2, vec![6, 4])] {
-            let x = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+            let x = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
             let mut node = NodeProto::default();
             let mut attr = AttributeProto::default();
             attr.name = "axis".to_string();
@@ -1952,9 +2222,9 @@ mod tests {
     #[test]
     fn test_pad_with_axes() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
-        let pads = Tensor::from_slice(&[1i64, 1]); // 1 before, 1 after
-        let axes = Tensor::from_slice(&[1i64]); // only pad axis 1
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let pads = Tensor::from_slice([1i64, 1]); // 1 before, 1 after
+        let axes = Tensor::from_slice([1i64]); // only pad axis 1
         let inputs = vec![Some(data), Some(pads), None, Some(axes)];
         let node = NodeProto::default();
 
@@ -1966,7 +2236,7 @@ mod tests {
     #[test]
     fn test_cast_fallback() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
         attr.name = "to".to_string();
@@ -1981,11 +2251,11 @@ mod tests {
     #[test]
     fn test_slice_step_2() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
-        let starts = Tensor::from_slice(&[0i64]);
-        let ends = Tensor::from_slice(&[10i64]);
-        let axes = Tensor::from_slice(&[0i64]);
-        let steps = Tensor::from_slice(&[2i64]);
+        let data = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let starts = Tensor::from_slice([0i64]);
+        let ends = Tensor::from_slice([10i64]);
+        let axes = Tensor::from_slice([0i64]);
+        let steps = Tensor::from_slice([2i64]);
         let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
         let node = NodeProto::default();
 
@@ -1998,11 +2268,11 @@ mod tests {
     #[test]
     fn test_slice_step_3() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
-        let starts = Tensor::from_slice(&[0i64]);
-        let ends = Tensor::from_slice(&[10i64]);
-        let axes = Tensor::from_slice(&[0i64]);
-        let steps = Tensor::from_slice(&[3i64]);
+        let data = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let starts = Tensor::from_slice([0i64]);
+        let ends = Tensor::from_slice([10i64]);
+        let axes = Tensor::from_slice([0i64]);
+        let steps = Tensor::from_slice([3i64]);
         let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
         let node = NodeProto::default();
 
@@ -2015,11 +2285,11 @@ mod tests {
     #[test]
     fn test_slice_neg_step_2() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
-        let starts = Tensor::from_slice(&[5i64]);
-        let ends = Tensor::from_slice(&[0i64]);
-        let axes = Tensor::from_slice(&[0i64]);
-        let steps = Tensor::from_slice(&[-2i64]);
+        let data = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let starts = Tensor::from_slice([5i64]);
+        let ends = Tensor::from_slice([0i64]);
+        let axes = Tensor::from_slice([0i64]);
+        let steps = Tensor::from_slice([-2i64]);
         let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
         let node = NodeProto::default();
 
@@ -2033,11 +2303,11 @@ mod tests {
     fn test_slice_full_reverse() {
         // start=5, end=-100, step=-1 → should include element 0
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
-        let starts = Tensor::from_slice(&[5i64]);
-        let ends = Tensor::from_slice(&[-100i64]);
-        let axes = Tensor::from_slice(&[0i64]);
-        let steps = Tensor::from_slice(&[-1i64]);
+        let data = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let starts = Tensor::from_slice([5i64]);
+        let ends = Tensor::from_slice([-100i64]);
+        let axes = Tensor::from_slice([0i64]);
+        let steps = Tensor::from_slice([-1i64]);
         let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
         let node = NodeProto::default();
 
@@ -2051,11 +2321,11 @@ mod tests {
     fn test_slice_large_start_neg_step() {
         // start=100, end=0, step=-1 → clamps start to d-1=5
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
-        let starts = Tensor::from_slice(&[100i64]);
-        let ends = Tensor::from_slice(&[0i64]);
-        let axes = Tensor::from_slice(&[0i64]);
-        let steps = Tensor::from_slice(&[-1i64]);
+        let data = Tensor::from_slice([0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let starts = Tensor::from_slice([100i64]);
+        let ends = Tensor::from_slice([0i64]);
+        let axes = Tensor::from_slice([0i64]);
+        let steps = Tensor::from_slice([-1i64]);
         let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
         let node = NodeProto::default();
 
@@ -2068,11 +2338,11 @@ mod tests {
     #[test]
     fn test_slice_step_zero_errors() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[0.0f32, 1.0, 2.0]);
-        let starts = Tensor::from_slice(&[0i64]);
-        let ends = Tensor::from_slice(&[3i64]);
-        let axes = Tensor::from_slice(&[0i64]);
-        let steps = Tensor::from_slice(&[0i64]);
+        let data = Tensor::from_slice([0.0f32, 1.0, 2.0]);
+        let starts = Tensor::from_slice([0i64]);
+        let ends = Tensor::from_slice([3i64]);
+        let axes = Tensor::from_slice([0i64]);
+        let steps = Tensor::from_slice([0i64]);
         let inputs = vec![Some(data), Some(starts), Some(ends), Some(axes), Some(steps)];
         let node = NodeProto::default();
 
@@ -2082,7 +2352,7 @@ mod tests {
     #[test]
     fn test_flatten_negative_axis() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+        let x = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
         attr.name = "axis".to_string();
@@ -2099,7 +2369,7 @@ mod tests {
     fn test_shape_start_gt_end() {
         // start=2, end=1 → should return empty, not panic
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+        let x = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
         let inputs = vec![Some(x)];
         let mut node = NodeProto::default();
         let mut attr_s = AttributeProto::default();
@@ -2346,8 +2616,8 @@ mod tests {
     fn test_gather_elements() {
         let registry = OpRegistry::new();
         // 3x3 input, gather along axis 1
-        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
-        let indices = Tensor::from_slice(&[1i64, 2, 0, 2, 0, 0, 0, 1, 1]).try_reshape(&[3, 3]).unwrap();
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
+        let indices = Tensor::from_slice([1i64, 2, 0, 2, 0, 0, 0, 1, 1]).try_reshape(&[3, 3]).unwrap();
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
         attr.name = "axis".to_string();
@@ -2363,9 +2633,9 @@ mod tests {
     #[test]
     fn test_gather_elements_negative_indices() {
         let registry = OpRegistry::new();
-        let data = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
         // -1 should map to index 2 (last element)
-        let indices = Tensor::from_slice(&[-1i64, 0]).try_reshape(&[2, 1]).unwrap();
+        let indices = Tensor::from_slice([-1i64, 0]).try_reshape(&[2, 1]).unwrap();
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
         attr.name = "axis".to_string();
@@ -2381,7 +2651,7 @@ mod tests {
     #[test]
     fn test_trilu_upper() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
         let inputs = vec![Some(x)];
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
@@ -2397,7 +2667,7 @@ mod tests {
     #[test]
     fn test_trilu_lower() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
         let inputs = vec![Some(x)];
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
@@ -2413,8 +2683,8 @@ mod tests {
     #[test]
     fn test_trilu_with_k() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
-        let k = Tensor::from_slice(&[1i64]);
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).try_reshape(&[3, 3]).unwrap();
+        let k = Tensor::from_slice([1i64]);
         let inputs = vec![Some(x), Some(k)];
         let node = NodeProto::default(); // upper=1 by default
         let result = registry.dispatch_multi("Trilu", "", &inputs, &node, i64::MAX).unwrap();
@@ -2427,8 +2697,8 @@ mod tests {
     #[test]
     fn test_cumsum() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
-        let axis = Tensor::from_slice(&[0i64]);
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        let axis = Tensor::from_slice([0i64]);
         let inputs = vec![Some(x), Some(axis)];
         let node = NodeProto::default();
         let result = registry.dispatch_multi("CumSum", "", &inputs, &node, i64::MAX).unwrap();
@@ -2440,8 +2710,8 @@ mod tests {
     #[test]
     fn test_cumsum_exclusive_reverse() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]);
-        let axis = Tensor::from_slice(&[0i64]);
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        let axis = Tensor::from_slice([0i64]);
         let inputs = vec![Some(x), Some(axis)];
         let mut node = NodeProto::default();
         let mut attr_exc = AttributeProto::default();
@@ -2463,9 +2733,9 @@ mod tests {
     #[test]
     fn test_one_hot() {
         let registry = OpRegistry::new();
-        let indices = Tensor::from_slice(&[0i64, 1, 2]);
-        let depth = Tensor::from_slice(&[3i64]);
-        let values = Tensor::from_slice(&[0.0f32, 1.0]); // off=0, on=1
+        let indices = Tensor::from_slice([0i64, 1, 2]);
+        let depth = Tensor::from_slice([3i64]);
+        let values = Tensor::from_slice([0.0f32, 1.0]); // off=0, on=1
         let inputs = vec![Some(indices), Some(depth), Some(values)];
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
@@ -2485,7 +2755,7 @@ mod tests {
         // 3x3 all-ones kernel on 4x4 input
         let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
         let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 4, 4]).unwrap();
-        let w = Tensor::from_slice(&[1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+        let w = Tensor::from_slice([1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
         let inputs = vec![Some(x), Some(w)];
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
@@ -2501,8 +2771,8 @@ mod tests {
     #[test]
     fn test_conv_auto_pad_same_upper() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
-        let w = Tensor::from_slice(&[1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+        let x = Tensor::from_slice([1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
+        let w = Tensor::from_slice([1.0f32; 9]).try_reshape(&[1, 1, 3, 3]).unwrap();
         let inputs = vec![Some(x), Some(w)];
         let mut node = NodeProto::default();
         let mut attr_k = AttributeProto::default();
@@ -2523,8 +2793,8 @@ mod tests {
     fn test_conv_transpose() {
         let registry = OpRegistry::new();
         // Simple 1x1 conv_transpose
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 1, 2, 2]).unwrap();
-        let w = Tensor::from_slice(&[2.0f32]).try_reshape(&[1, 1, 1, 1]).unwrap();
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 1, 2, 2]).unwrap();
+        let w = Tensor::from_slice([2.0f32]).try_reshape(&[1, 1, 1, 1]).unwrap();
         let inputs = vec![Some(x), Some(w)];
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
@@ -2563,7 +2833,7 @@ mod tests {
     #[test]
     fn test_average_pool_ceil() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
+        let x = Tensor::from_slice([0.0f32; 49]).try_reshape(&[1, 1, 7, 7]).unwrap();
         let inputs = vec![Some(x)];
         let mut node = NodeProto::default();
         let mut attr_k = AttributeProto::default();
@@ -2633,9 +2903,9 @@ mod tests {
     #[test]
     fn test_layer_norm() {
         let registry = OpRegistry::new();
-        let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).try_reshape(&[2, 4]).unwrap();
-        let scale = Tensor::from_slice(&[1.0f32; 4]);
-        let bias = Tensor::from_slice(&[0.0f32; 4]);
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).try_reshape(&[2, 4]).unwrap();
+        let scale = Tensor::from_slice([1.0f32; 4]);
+        let bias = Tensor::from_slice([0.0f32; 4]);
         let inputs = vec![Some(x), Some(scale), Some(bias)];
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
@@ -2661,8 +2931,8 @@ mod tests {
         // (1, 4, 2, 2) with 2 groups
         let x_data: Vec<f32> = (0..16).map(|v| v as f32).collect();
         let x = Tensor::from_slice(&x_data).try_reshape(&[1, 4, 2, 2]).unwrap();
-        let scale = Tensor::from_slice(&[1.0f32; 4]);
-        let bias = Tensor::from_slice(&[0.0f32; 4]);
+        let scale = Tensor::from_slice([1.0f32; 4]);
+        let bias = Tensor::from_slice([0.0f32; 4]);
         let inputs = vec![Some(x), Some(scale), Some(bias)];
         let mut node = NodeProto::default();
         let mut attr = AttributeProto::default();
@@ -2680,8 +2950,8 @@ mod tests {
         // (1, 2, 3, 3)
         let x_data: Vec<f32> = (0..18).map(|v| v as f32).collect();
         let x = Tensor::from_slice(&x_data).try_reshape(&[1, 2, 3, 3]).unwrap();
-        let scale = Tensor::from_slice(&[1.0f32; 2]);
-        let bias = Tensor::from_slice(&[0.0f32; 2]);
+        let scale = Tensor::from_slice([1.0f32; 2]);
+        let bias = Tensor::from_slice([0.0f32; 2]);
         let inputs = vec![Some(x), Some(scale), Some(bias)];
         let node = NodeProto::default();
         let result = registry.dispatch_multi("InstanceNormalization", "", &inputs, &node, i64::MAX).unwrap();

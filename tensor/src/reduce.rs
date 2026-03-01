@@ -172,10 +172,11 @@ impl Tensor {
 impl Tensor {
     /// Sum of tensor elements over given axes.
     ///
-    /// Preserves input dtype. Use `sum_with().promote(true)` or `.dtype(...)` for different accumulation.
+    /// Auto-promotes accumulation dtype (bool→int32, float16→float32) like Tinygrad.
+    /// Use `sum_with().promote(false)` to preserve input dtype.
     #[track_caller]
     pub fn sum(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
-        reduce_internal(self, ReduceOp::Add, axes.into(), false, None, false)
+        reduce_internal(self, ReduceOp::Add, axes.into(), false, None, true)
     }
 
     /// Sum with additional options (keepdim, dtype, promote).

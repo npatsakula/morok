@@ -357,7 +357,7 @@ mod tests {
         init.name = "input".to_string();
         init.data_type = tensor_proto::DataType::Float as i32;
         init.dims = vec![3];
-        init.raw_data = vec![1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        init.raw_data = [1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
         graph.initializer.push(init);
 
         // Output
@@ -391,7 +391,7 @@ mod tests {
         init.name = "input".to_string();
         init.data_type = tensor_proto::DataType::Float as i32;
         init.dims = vec![3];
-        init.raw_data = vec![1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        init.raw_data = [1.0f32, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
         graph.initializer.push(init);
 
         // Two outputs

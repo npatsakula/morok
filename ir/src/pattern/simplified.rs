@@ -149,6 +149,16 @@ impl<C> SimplifiedPatternMatcher<C> {
         self.indexed.is_empty() && self.wildcards.is_empty()
     }
 
+    /// Number of wildcard patterns (tried for every op).
+    pub fn wildcard_count(&self) -> usize {
+        self.wildcards.len()
+    }
+
+    /// Number of indexed buckets (unique OpKeys with patterns).
+    pub fn indexed_count(&self) -> usize {
+        self.indexed.len()
+    }
+
     /// Attempt to rewrite a UOp using registered patterns.
     ///
     /// This is an inherent method that provides the same functionality as

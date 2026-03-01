@@ -58,14 +58,15 @@ OUTPUT="${OUTPUT:-ir_${TEST_NAME}.txt}"
 
 RUST_LOG="morok_schedule::rangeify::transforms=debug,\
 morok_schedule::rangeify::indexing=debug,\
+morok_schedule::rangeify::kernel=debug,\
 morok_schedule::optimizer=debug,\
 morok_schedule::expand=debug,\
 morok_schedule::devectorize=debug,\
 morok_schedule::linearize=debug,\
 morok_codegen=debug"
 
-CARGO_ARGS=(test "$TEST_NAME" -- --exact --nocapture --test-threads=1)
-[[ -n "$PACKAGE" ]] && CARGO_ARGS=(test "$TEST_NAME" -p "$PACKAGE" -- --exact --nocapture --test-threads=1)
+CARGO_ARGS=(test --release "$TEST_NAME" -- --nocapture --test-threads=1)
+[[ -n "$PACKAGE" ]] && CARGO_ARGS=(test --release "$TEST_NAME" -p "$PACKAGE" --lib -- --nocapture --test-threads=1)
 
 echo "Running: RUST_LOG=... cargo ${CARGO_ARGS[*]}" >&2
 RAW=$(RUST_LOG="$RUST_LOG" cargo "${CARGO_ARGS[@]}" 2>&1) || true
@@ -113,6 +114,20 @@ function extract_message(line, field,    pat, m) {
     return ""
 }
 
+function extract_elapsed(line,    pat, m) {
+    pat = "elapsed_ms=([0-9]+)"
+    if (match(line, pat, m))
+        return m[1] + 0
+    return -1
+}
+
+function format_stage_header(msg, elapsed_ms) {
+    if (elapsed_ms >= 0)
+        return sprintf("--- %s [%dms] ---", msg, elapsed_ms)
+    else
+        return sprintf("--- %s ---", msg)
+}
+
 # ─── Rangeify phase (global, pre-kernel-split) ───
 # origin.tree span field appears on every line; extract it only once.
 
@@ -133,7 +148,7 @@ function extract_message(line, field,    pat, m) {
     msg = extract_message($0, "uop\\.tree")
     tree = extract_field($0, "uop\\.tree")
     if (msg != "" && tree != "") {
-        printf "--- %s ---\n%s\n\n", msg, unescape_tree(tree)
+        printf "%s\n%s\n\n", format_stage_header(msg, extract_elapsed($0)), unescape_tree(tree)
     }
 }
 
@@ -160,7 +175,19 @@ function extract_message(line, field,    pat, m) {
     }
 
     if (msg != "" && tree != "") {
-        printf "--- %s ---\n%s\n\n", msg, unescape_tree(tree)
+        printf "%s\n%s\n\n", format_stage_header(msg, extract_elapsed($0)), unescape_tree(tree)
+    }
+}
+
+# ─── Pre-optimization phase: elapsed-only lines (no ast.pre field) ───
+# Some stages only emit elapsed_ms without a tree (e.g. linearize_multi_index).
+
+/DEBUG/ && /elapsed_ms=/ && !/uop\.tree=/ && !/ast\.pre=/ && !/ast\.optimized=/ && !/generated_c=/ {
+    # Extract message: everything between "morok_schedule...: " and " elapsed_ms="
+    pat = "morok_schedule(::[a-z_]+)+: (.+) elapsed_ms="
+    if (match($0, pat, m)) {
+        elapsed = extract_elapsed($0)
+        printf "%s\n\n", format_stage_header(m[2], elapsed)
     }
 }
 
@@ -192,7 +219,7 @@ function extract_message(line, field,    pat, m) {
     }
 
     if (msg != "" && tree != "") {
-        printf "--- %s ---\n%s\n\n", msg, unescape_tree(tree)
+        printf "%s\n%s\n\n", format_stage_header(msg, extract_elapsed($0)), unescape_tree(tree)
     }
 }
 

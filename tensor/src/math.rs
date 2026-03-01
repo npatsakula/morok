@@ -193,4 +193,11 @@ impl Tensor {
     pub fn sign(&self) -> Result<Tensor> {
         Ok(Self::new(self.uop().sign()))
     }
+
+    /// Linear interpolation: `self + (end - self) * weight`.
+    #[track_caller]
+    pub fn lerp(&self, end: &Tensor, weight: &Tensor) -> Result<Tensor> {
+        let diff = end.try_sub(self)?;
+        self.try_add(&diff.try_mul(weight)?)
+    }
 }

@@ -617,7 +617,7 @@ fn apply_pcontig_removal_inner(
             false
         } else {
             let sink = UOp::sink(reduce_sources);
-            sink.toposort().iter().any(|n| matches!(n.op(), Op::Buffer { .. } | Op::Bufferize { .. }))
+            sink.any_in_subtree(|n| matches!(n.op(), Op::Buffer { .. } | Op::Bufferize { .. }))
         }
     };
 
@@ -1907,7 +1907,7 @@ pub fn pm_fma_decomposition() -> TypedPatternMatcher<()> {
 
 /// Check if UOp has no RANGE in backward slice (loop-invariant).
 fn no_range(u: &Arc<UOp>) -> bool {
-    !u.toposort().iter().any(|x| matches!(x.op(), Op::Range { .. }))
+    !u.any_in_subtree(|x| matches!(x.op(), Op::Range { .. }))
 }
 
 /// Check if UOp has no INDEX (load) in backward slice.
@@ -1915,7 +1915,7 @@ fn no_range(u: &Arc<UOp>) -> bool {
 /// Used for index overflow protection pattern - we want to ensure
 /// we don't do math on a loaded index since that can cause overflow.
 fn no_load(u: &Arc<UOp>) -> bool {
-    !u.toposort().iter().any(|x| matches!(x.op(), Op::Index { .. }))
+    !u.any_in_subtree(|x| matches!(x.op(), Op::Index { .. }))
 }
 
 /// Check if a UOp represents a zero constant.
