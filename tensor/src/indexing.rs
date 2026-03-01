@@ -126,14 +126,12 @@ impl Tensor {
     /// Scatter values along dim using index positions.
     ///
     /// For each position in index, places the corresponding src value into self at
-    /// the specified index along dim.
+    /// the specified index along dim. When multiple indices map to the same position,
+    /// the last value wins (matching PyTorch/Tinygrad semantics).
     #[track_caller]
     pub fn scatter(&self, dim: isize, index: &Tensor, src: &Tensor) -> Result<Tensor> {
         let (src_p, mask_p) = self._pre_scatter(dim, index, src)?;
-        let zero = Tensor::new(src_p.uop().const_like(0));
-        let gathered = src_p.where_(&mask_p, &zero)?.sum_with().axes(-1isize).call()?;
-        let any_mask = mask_p.any(-1isize)?;
-        gathered.where_(&any_mask, self)
+        masked_setitem(self, &src_p, &mask_p, &[-1])
     }
 
     /// Scatter with reduction. Applies reduce (sum/prod/amax/amin) at scatter positions.
@@ -315,11 +313,14 @@ impl Tensor {
         x = x.try_shrink(&shrink_ranges)?;
 
         // Compute indices via count-matching (matches Tinygrad's approach)
-        // Use lazy tril mask from arange comparisons — no host buffer allocation
-        let mut tril_shape: Vec<usize> = vec![1; ndim + 1];
-        tril_shape[dim] = orig_len;
-        tril_shape[dim + 1] = orig_len;
-        let tril_mask = Tensor::full(&tril_shape, true, morok_dtype::DType::Bool)?.tril(0)?;
+        // Create 2D tril mask first (tril operates on last 2 dims), then reshape
+        // to broadcast shape [1, ..., orig_len, orig_len, 1, ..., 1]
+        // Tinygrad: Tensor.ones(orig_len, orig_len).tril().reshape((None, None) + (1,)*(ndim-dim-1))
+        let tril_2d = Tensor::full(&[orig_len, orig_len], true, morok_dtype::DType::Bool)?.tril(0)?;
+        let mut tril_reshape: Vec<isize> = vec![1; ndim + 1];
+        tril_reshape[dim] = orig_len as isize;
+        tril_reshape[dim + 1] = orig_len as isize;
+        let tril_mask = tril_2d.try_reshape(&tril_reshape)?;
 
         // Count occurrences of each value up to current position
         let compute_counts = |t: &Tensor| -> Result<Tensor> {
@@ -399,4 +400,42 @@ impl Tensor {
         let selected = indices.masked_select(&expanded_mask)?;
         selected.try_reshape(&[-1, ndim as isize])
     }
+}
+
+/// Reduce repeated indices so the last value wins, then apply mask.
+///
+/// Tinygrad's `_masked_setitem`: for each axis, split mask/values into slices,
+/// fold with OR on mask and last-writer-wins on values, squeeze, then
+/// `mask.where(values, target)`.
+fn masked_setitem(target: &Tensor, values: &Tensor, mask: &Tensor, axes: &[isize]) -> Result<Tensor> {
+    let mut mask = mask.clone();
+    let mut values = values.clone();
+
+    // Phase 1: reduce repeated indices — last value wins
+    for &dim in axes.iter().rev() {
+        let shape = mask.shape()?;
+        let ndim = shape.len();
+        let norm_dim = Tensor::normalize_axis(dim, ndim)?;
+        let dim_size = shape[norm_dim].as_const().unwrap();
+        let ones = vec![1usize; dim_size];
+        let mask_slices = mask.split(&ones, dim)?;
+        let val_slices = values.split(&ones, dim)?;
+        let (mut acc_mask, mut acc_vals) = (mask_slices[0].clone(), val_slices[0].clone());
+        for (m, v) in mask_slices[1..].iter().zip(&val_slices[1..]) {
+            // last-writer-wins: where m is true take v, otherwise keep acc
+            acc_vals = v.where_(m, &acc_vals)?;
+            acc_mask = acc_mask.bitwise_or(m)?;
+        }
+        mask = acc_mask;
+        values = acc_vals;
+    }
+
+    // Phase 2: squeeze reduced axes
+    for &dim in axes.iter().rev() {
+        mask = mask.try_squeeze(Some(dim))?;
+        values = values.try_squeeze(Some(dim))?;
+    }
+
+    // Phase 3: select from values where mask is true, else target
+    values.where_(&mask, target)
 }
