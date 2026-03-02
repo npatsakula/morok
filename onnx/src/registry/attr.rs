@@ -3,7 +3,7 @@ use morok_tensor::Tensor;
 use morok_tensor::reduce::AxisSpec;
 
 use crate::error::{Error, Result};
-use crate::parser::onnx::{AttributeProto, NodeProto, TensorProto};
+use crate::parser::onnx::{AttributeProto, GraphProto, NodeProto, TensorProto};
 
 pub fn get_attr<'a>(node: &'a NodeProto, name: &str) -> Option<&'a AttributeProto> {
     node.attribute.iter().find(|a| a.name == name)
@@ -35,6 +35,20 @@ pub fn get_attr_floats(node: &NodeProto, name: &str) -> Vec<f32> {
 
 pub fn get_attr_tensor<'a>(node: &'a NodeProto, name: &str) -> Option<&'a TensorProto> {
     get_attr(node, name).and_then(|a| a.t.as_ref())
+}
+
+#[allow(dead_code)]
+pub fn get_attr_graph<'a>(node: &'a NodeProto, name: &str) -> Option<&'a GraphProto> {
+    get_attr(node, name).and_then(|a| a.g.as_ref())
+}
+
+/// Extract a scalar bool from a tensor (for If condition fallback).
+pub(crate) fn tensor_to_bool_scalar(t: &Tensor) -> Result<bool> {
+    let arr = t
+        .cast(DType::Bool)?
+        .to_ndarray::<bool>()
+        .map_err(|e| Error::IrConstruction { details: format!("tensor_to_bool_scalar: {e}") })?;
+    arr.iter().next().copied().ok_or_else(|| Error::IrConstruction { details: "empty bool tensor".into() })
 }
 
 pub(crate) fn inp(inputs: &[Option<Tensor>], idx: usize) -> &Tensor {

@@ -11,8 +11,10 @@ use prost::Message;
 use snafu::ResultExt;
 
 use crate::error::{EmptyModelSnafu, IoSnafu, MissingInputSnafu, ProtobufDecodeSnafu, Result};
-use crate::parser::onnx::{ModelProto, NodeProto, ValueInfoProto};
-use crate::registry::{OpRegistry, OpSetId, convert_onnx_dtype, onnx_opset_version, tensor_from_proto_ext};
+use crate::parser::onnx::{GraphProto, ModelProto, NodeProto, ValueInfoProto};
+use crate::registry::{
+    OpRegistry, OpSetId, convert_onnx_dtype, onnx_opset_version, tensor_from_proto_ext, tensor_to_bool_scalar,
+};
 
 /// Dimension value - either static (known size) or dynamic (named, e.g., batch dim).
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +59,17 @@ impl InputSpec {
     }
 }
 
+/// A prepared subgraph for control-flow operators (If, Loop, Scan).
+#[allow(dead_code)]
+pub(crate) struct SubGraph {
+    pub initializers: HashMap<String, Tensor>,
+    pub input_names: Vec<String>,
+    pub output_names: Vec<String>,
+    pub nodes: Vec<NodeProto>,
+    /// Nested subgraph attributes within this subgraph's nodes.
+    pub subgraphs: HashMap<(usize, String), SubGraph>,
+}
+
 /// Prepared ONNX graph - structure extracted, ready for execution.
 pub struct OnnxGraph {
     /// Input specifications (name -> spec)
@@ -69,6 +82,8 @@ pub struct OnnxGraph {
     pub nodes: Vec<NodeProto>,
     /// Opset versions
     pub opsets: Vec<OpSetId>,
+    /// Pre-parsed subgraph attributes: (node_index, attr_name) -> SubGraph
+    pub(crate) subgraphs: HashMap<(usize, String), SubGraph>,
 }
 
 impl OnnxGraph {
@@ -193,7 +208,18 @@ impl OnnxImporter {
         // Collect nodes
         let nodes = proto_graph.node;
 
-        Ok(OnnxGraph { inputs, outputs, initializers, nodes, opsets })
+        // Pre-parse subgraph attributes for control-flow ops (If, Loop, Scan)
+        let mut subgraphs: HashMap<(usize, String), SubGraph> = HashMap::new();
+        for (idx, node) in nodes.iter().enumerate() {
+            for attr in &node.attribute {
+                if let Some(ref graph) = attr.g {
+                    let sub = self.prepare_subgraph(graph)?;
+                    subgraphs.insert((idx, attr.name.clone()), sub);
+                }
+            }
+        }
+
+        Ok(OnnxGraph { inputs, outputs, initializers, nodes, opsets, subgraphs })
     }
 
     /// Extract InputSpec from ValueInfoProto.
@@ -274,14 +300,18 @@ impl OnnxImporter {
         let opset_version = onnx_opset_version(&graph.opsets, "");
 
         // Process nodes in order (ONNX guarantees topological order)
-        for node in &graph.nodes {
-            // Resolve opset for the node's domain (most nodes use default "")
+        for (node_index, node) in graph.nodes.iter().enumerate() {
             let node_opset = if node.domain.is_empty() || node.domain == "ai.onnx" {
                 opset_version
             } else {
                 onnx_opset_version(&graph.opsets, &node.domain)
             };
-            self.process_node(node, &mut values, node_opset)?;
+
+            if node.op_type == "If" {
+                self.process_if_node(node_index, node, &mut values, node_opset, &graph.subgraphs)?;
+            } else {
+                self.process_node(node, &mut values, node_opset)?;
+            }
         }
 
         // Collect outputs by name
@@ -289,6 +319,145 @@ impl OnnxImporter {
             graph.outputs.iter().filter_map(|name| values.get(name).cloned().map(|t| (name.clone(), t))).collect();
 
         Ok(outputs)
+    }
+
+    /// Prepare a subgraph from a GraphProto embedded in a node attribute.
+    /// Recursively extracts nested subgraph attributes (e.g., If inside If).
+    fn prepare_subgraph(&self, graph: &GraphProto) -> Result<SubGraph> {
+        let mut initializers: HashMap<String, Tensor> = HashMap::new();
+        for init in &graph.initializer {
+            if !init.name.is_empty() {
+                let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
+                initializers.insert(init.name.clone(), tensor);
+            }
+        }
+
+        let input_names: Vec<String> = graph
+            .input
+            .iter()
+            .filter(|i| !i.name.is_empty() && !initializers.contains_key(&i.name))
+            .map(|i| i.name.clone())
+            .collect();
+
+        let output_names: Vec<String> =
+            graph.output.iter().filter(|o| !o.name.is_empty()).map(|o| o.name.clone()).collect();
+
+        let nodes = graph.node.clone();
+
+        // Recursively extract nested subgraph attributes
+        let mut subgraphs: HashMap<(usize, String), SubGraph> = HashMap::new();
+        for (idx, node) in nodes.iter().enumerate() {
+            for attr in &node.attribute {
+                if let Some(ref nested_graph) = attr.g {
+                    let sub = self.prepare_subgraph(nested_graph)?;
+                    subgraphs.insert((idx, attr.name.clone()), sub);
+                }
+            }
+        }
+
+        Ok(SubGraph { initializers, input_names, output_names, nodes, subgraphs })
+    }
+
+    /// Execute a pre-parsed subgraph with access to parent scope values.
+    fn execute_subgraph(
+        &self,
+        subgraph: &SubGraph,
+        parent_values: &HashMap<String, Tensor>,
+        opset_version: i64,
+    ) -> Result<Vec<Tensor>> {
+        // Start with subgraph's own initializers
+        let mut values: HashMap<String, Tensor> = subgraph.initializers.clone();
+
+        // Merge parent scope (subgraph initializers take precedence)
+        for (k, v) in parent_values {
+            values.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+
+        // Execute subgraph nodes (subgraphs inherit the parent's opset).
+        // Control-flow ops (If) are intercepted here, matching execute_with_initializers.
+        for (node_index, node) in subgraph.nodes.iter().enumerate() {
+            if node.op_type == "If" {
+                self.process_if_node(node_index, node, &mut values, opset_version, &subgraph.subgraphs)?;
+            } else {
+                self.process_node(node, &mut values, opset_version)?;
+            }
+        }
+
+        // Collect declared outputs in order
+        subgraph
+            .output_names
+            .iter()
+            .map(|name| {
+                values.get(name).cloned().ok_or_else(|| crate::Error::IrConstruction {
+                    details: format!("subgraph output '{name}' not found in values"),
+                })
+            })
+            .collect()
+    }
+
+    /// Process an ONNX If node: execute both branches, select outputs.
+    fn process_if_node(
+        &self,
+        node_index: usize,
+        node: &NodeProto,
+        values: &mut HashMap<String, Tensor>,
+        opset_version: i64,
+        subgraphs: &HashMap<(usize, String), SubGraph>,
+    ) -> Result<()> {
+        let condition = values
+            .get(&node.input[0])
+            .ok_or_else(|| crate::Error::MissingInput { node: node.name.clone(), input: node.input[0].clone() })?
+            .clone();
+
+        let then_branch = subgraphs
+            .get(&(node_index, "then_branch".to_string()))
+            .ok_or_else(|| crate::Error::IrConstruction { details: "If node missing then_branch attribute".into() })?;
+        let else_branch = subgraphs
+            .get(&(node_index, "else_branch".to_string()))
+            .ok_or_else(|| crate::Error::IrConstruction { details: "If node missing else_branch attribute".into() })?;
+
+        // Execute both branches (lazy — builds tensor graphs without computing)
+        let then_outputs = self.execute_subgraph(then_branch, values, opset_version)?;
+        let else_outputs = self.execute_subgraph(else_branch, values, opset_version)?;
+
+        if then_outputs.len() != else_outputs.len() {
+            return Err(crate::Error::IrConstruction {
+                details: format!(
+                    "If: then_branch ({}) and else_branch ({}) must produce the same number of outputs",
+                    then_outputs.len(),
+                    else_outputs.len()
+                ),
+            });
+        }
+
+        // Select outputs: lazy where_ if shapes match, eager fallback otherwise
+        let selected: Vec<Tensor> = {
+            let shapes_match = then_outputs
+                .iter()
+                .zip(else_outputs.iter())
+                .all(|(t, e)| t.shape().ok() == e.shape().ok() && t.shape().is_ok());
+
+            if shapes_match {
+                then_outputs
+                    .iter()
+                    .zip(else_outputs.iter())
+                    .map(|(t, e)| t.where_(&condition, e).map_err(Into::into))
+                    .collect::<Result<_>>()?
+            } else {
+                let cond = tensor_to_bool_scalar(&condition)?;
+                if cond { then_outputs } else { else_outputs }
+            }
+        };
+
+        for (i, output_name) in node.output.iter().enumerate() {
+            if !output_name.is_empty()
+                && let Some(tensor) = selected.get(i)
+            {
+                values.insert(output_name.clone(), tensor.clone());
+            }
+        }
+
+        Ok(())
     }
 
     /// Process a single ONNX node.

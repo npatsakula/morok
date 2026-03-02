@@ -48,6 +48,30 @@ pub(crate) fn make_attr_tensor(name: &str, tensor: TensorProto) -> AttributeProt
     attr
 }
 
+pub(crate) fn make_attr_graph(name: &str, graph: GraphProto) -> AttributeProto {
+    AttributeProto {
+        name: name.to_string(),
+        r#type: 5, // GRAPH
+        g: Some(graph),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn make_graph(
+    nodes: Vec<NodeProto>,
+    inputs: Vec<&str>,
+    outputs: Vec<&str>,
+    initializers: Vec<TensorProto>,
+) -> GraphProto {
+    GraphProto {
+        node: nodes,
+        input: inputs.iter().map(|n| ValueInfoProto { name: n.to_string(), ..Default::default() }).collect(),
+        output: outputs.iter().map(|n| ValueInfoProto { name: n.to_string(), ..Default::default() }).collect(),
+        initializer: initializers,
+        ..Default::default()
+    }
+}
+
 pub(crate) fn make_tensor_proto(raw_data: Vec<u8>, dims: Vec<i64>, dtype: i32) -> TensorProto {
     let mut tensor = TensorProto::default();
     tensor.data_type = dtype;
