@@ -9,10 +9,10 @@ morok-dtype = { path = "../dtype" }
 morok-ir = { path = "../ir" }
 morok-device = { path = "../device" }
 morok-schedule = { path = "../schedule" }
-snafu = "0.8.9"
+snafu = "0.9.0"
 itertools = "0.14.0"
 tracing = "0.1"
-melior = { version = "0.26.3", features = ["ods-dialects"], optional = true }
+melior = { version = "0.26.7", features = ["ods-dialects"], optional = true }
 
 [features]
 default = []
