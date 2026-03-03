@@ -92,6 +92,27 @@ pub enum NearestMode {
     Ceil,
 }
 
+/// Padding fill mode.
+///
+/// Determines how values outside the original tensor are filled when padding.
+/// ONNX uses "edge"/"reflect"/"wrap"; Tinygrad uses "replicate"/"reflect"/"circular".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, EnumString, Display)]
+pub enum PadMode {
+    /// Fill with a constant value (default: 0).
+    #[default]
+    #[strum(serialize = "constant")]
+    Constant,
+    /// Replicate boundary values. `[1,2,3]` pad(2,2) → `[1,1,1,2,3,3,3]`.
+    #[strum(serialize = "edge", serialize = "replicate")]
+    Replicate,
+    /// Mirror without repeating boundary. `[1,2,3]` pad(2,2) → `[3,2,1,2,3,2,1]`.
+    #[strum(serialize = "reflect")]
+    Reflect,
+    /// Wrap around (circular). `[1,2,3]` pad(2,2) → `[2,3,1,2,3,1,2]`.
+    #[strum(serialize = "wrap", serialize = "circular")]
+    Circular,
+}
+
 /// Aspect ratio policy for resize.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, EnumString, Display)]
 pub enum AspectRatioPolicy {

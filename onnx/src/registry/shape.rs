@@ -114,15 +114,11 @@ pub(crate) fn op_expand(inputs: &[Option<Tensor>]) -> Result<Tensor> {
 }
 
 pub(crate) fn op_pad(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    use morok_tensor::nn::PadMode;
+    use std::str::FromStr;
+
     let pads = tensor_to_i64_vec(inp(inputs, 1))?;
-    let mode = get_attr_string(node, "mode", "constant");
-    if mode != "constant" {
-        return Err(Error::IrConstruction { details: format!("Pad mode '{}' not supported, only 'constant'", mode) });
-    }
-    let pad_value: f64 = match inputs.get(2).and_then(|o| o.as_ref()) {
-        Some(cv) => tensor_to_f64_scalar(cv)?,
-        None => 0.0,
-    };
+    let mode_str = get_attr_string(node, "mode", "constant");
     let data = inp(inputs, 0);
     let ndim = data.ndim()?;
     let num_axes = pads.len() / 2;
@@ -134,7 +130,7 @@ pub(crate) fn op_pad(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tens
         .transpose()?
         .map(|v| v.iter().map(|&a| if a < 0 { (ndim as i64 + a) as usize } else { a as usize }).collect());
 
-    let padding = if let Some(axes) = axes {
+    let padding: Vec<(isize, isize)> = if let Some(axes) = axes {
         let mut full = vec![(0isize, 0isize); ndim];
         for (i, &ax) in axes.iter().enumerate() {
             full[ax] = (pads[i] as isize, pads[num_axes + i] as isize);
@@ -143,7 +139,16 @@ pub(crate) fn op_pad(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tens
     } else {
         (0..num_axes).map(|i| (pads[i] as isize, pads[num_axes + i] as isize)).collect()
     };
-    Ok(data.try_pad_value(&padding, pad_value)?)
+
+    let mode = PadMode::from_str(&mode_str)
+        .map_err(|_| Error::IrConstruction { details: format!("Pad mode '{mode_str}' not supported") })?;
+
+    let pad_value: f64 = match inputs.get(2).and_then(|o| o.as_ref()) {
+        Some(cv) => tensor_to_f64_scalar(cv)?,
+        None => 0.0,
+    };
+
+    Ok(data.pad_with().padding(&padding).mode(mode).value(pad_value).call()?)
 }
 
 pub(crate) fn op_slice(inputs: &[Option<Tensor>]) -> Result<Tensor> {

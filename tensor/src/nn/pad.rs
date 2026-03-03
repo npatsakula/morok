@@ -1,8 +1,9 @@
 //! Padding helpers: flat-to-pair conversion, auto-pad, pool pad resolution.
 
+use bon::bon;
 use morok_ir::{ConstValue, UOp};
 
-use super::AutoPad;
+use super::{AutoPad, PadMode};
 use crate::Tensor;
 
 type Result<T> = crate::Result<T>;
@@ -62,6 +63,7 @@ pub fn resolve_pool_pads(
     }
 }
 
+#[bon]
 impl Tensor {
     /// Pad with a custom fill value. Delegates to try_pad when value == 0.
     pub fn try_pad_value(&self, padding: &[(isize, isize)], value: f64) -> Result<Tensor> {
@@ -84,6 +86,146 @@ impl Tensor {
         let fill_term = zero_val.where_(&mask, &fill_val)?;
         padded.try_add(&fill_term)
     }
+
+    /// Pad with mode and fill value options.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Edge (replicate) padding
+    /// tensor.pad_with(&[(1, 1)]).mode(PadMode::Replicate).call()?;
+    ///
+    /// // Reflect padding
+    /// tensor.pad_with(&[(2, 2)]).mode(PadMode::Reflect).call()?;
+    ///
+    /// // Constant padding with custom value
+    /// tensor.pad_with(&[(1, 1)]).value(-f64::INFINITY).call()?;
+    ///
+    /// // Circular (wrap) padding
+    /// tensor.pad_with(&[(1, 1)]).mode(PadMode::Circular).call()?;
+    /// ```
+    #[builder]
+    pub fn pad_with(
+        &self,
+        padding: &[(isize, isize)],
+        #[builder(default)] mode: PadMode,
+        #[builder(default)] value: f64,
+    ) -> Result<Tensor> {
+        match mode {
+            PadMode::Constant => self.try_pad_value(padding, value),
+            PadMode::Replicate => pad_replicate(self, padding),
+            PadMode::Reflect => pad_reflect(self, padding),
+            PadMode::Circular => pad_circular(self, padding),
+        }
+    }
+}
+
+/// Replicate (edge) padding: repeats boundary values.
+///
+/// For each padded dimension, extracts edge slices via shrink, replicates
+/// via expand, then concatenates. Mirrors Tinygrad's `pad(mode="replicate")`.
+fn pad_replicate(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
+    let mut result = data.clone();
+    for (d, &(pad_before, pad_after)) in padding.iter().enumerate() {
+        if pad_before == 0 && pad_after == 0 {
+            continue;
+        }
+        let shape = result.shape()?;
+        let dim_size = shape[d].as_const().expect("replicate pad requires concrete dims") as isize;
+        let mut parts: Vec<Tensor> = Vec::new();
+
+        if pad_before > 0 {
+            let mut shrink_ranges: Vec<(isize, isize)> =
+                shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            shrink_ranges[d] = (0, 1);
+            let edge = result.try_shrink(&shrink_ranges)?;
+            let mut expand_shape: Vec<isize> =
+                shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+            expand_shape[d] = pad_before;
+            parts.push(edge.try_expand(&expand_shape)?);
+        }
+
+        parts.push(result.clone());
+
+        if pad_after > 0 {
+            let mut shrink_ranges: Vec<(isize, isize)> =
+                shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            shrink_ranges[d] = (dim_size - 1, dim_size);
+            let edge = result.try_shrink(&shrink_ranges)?;
+            let mut expand_shape: Vec<isize> =
+                shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+            expand_shape[d] = pad_after;
+            parts.push(edge.try_expand(&expand_shape)?);
+        }
+
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        result = Tensor::cat(&refs, d as isize)?;
+    }
+    Ok(result)
+}
+
+/// Reflect padding: mirrors values without repeating the boundary.
+///
+/// For each padded dimension, extracts interior slices via shrink, flips them,
+/// then concatenates. E.g. `[1,2,3]` pad(2,2) → `[3,2,1,2,3,2,1]`.
+fn pad_reflect(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
+    let mut result = data.clone();
+    for (d, &(pad_before, pad_after)) in padding.iter().enumerate() {
+        if pad_before == 0 && pad_after == 0 {
+            continue;
+        }
+        let shape = result.shape()?;
+        let dim_size = shape[d].as_const().expect("reflect pad requires concrete dims") as isize;
+        let mut parts: Vec<Tensor> = Vec::new();
+
+        if pad_before > 0 {
+            let mut shrink_ranges: Vec<(isize, isize)> =
+                shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            shrink_ranges[d] = (1, 1 + pad_before);
+            let slice = result.try_shrink(&shrink_ranges)?;
+            parts.push(slice.flip(&[d as isize])?);
+        }
+
+        parts.push(result.clone());
+
+        if pad_after > 0 {
+            let mut shrink_ranges: Vec<(isize, isize)> =
+                shape.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            shrink_ranges[d] = (dim_size - 1 - pad_after, dim_size - 1);
+            let slice = result.try_shrink(&shrink_ranges)?;
+            parts.push(slice.flip(&[d as isize])?);
+        }
+
+        let refs: Vec<&Tensor> = parts.iter().collect();
+        result = Tensor::cat(&refs, d as isize)?;
+    }
+    Ok(result)
+}
+
+/// Circular (wrap) padding: wraps values from the opposite end.
+///
+/// Uses repeat + shrink: tile the tensor up to 3x per padded dimension,
+/// then shrink to extract the wrapped window. Mirrors Tinygrad's `pad(mode="circular")`.
+fn pad_circular(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
+    let shape = data.shape()?;
+    let ndim = shape.len();
+    let repeats: Vec<usize> = padding
+        .iter()
+        .map(|&(pb, pa)| 1 + usize::from(pb > 0) + usize::from(pa > 0))
+        .collect();
+    let repeated = data.repeat(&repeats)?;
+    let rep_shape = repeated.shape()?;
+
+    let shrink_ranges: Vec<(isize, isize)> = (0..ndim)
+        .map(|d| {
+            let (pb, _pa) = padding[d];
+            let orig = shape[d].as_const().expect("circular pad requires concrete dims") as isize;
+            let rep_dim = rep_shape[d].as_const().unwrap() as isize;
+            let start = if pb == 0 { 0 } else { orig - pb };
+            let end = if padding[d].1 == 0 { rep_dim } else { rep_dim - orig + padding[d].1 };
+            (start, end)
+        })
+        .collect();
+    repeated.try_shrink(&shrink_ranges)
 }
 
 /// Adjust padding for ceil_mode output sizes.
