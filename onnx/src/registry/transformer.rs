@@ -296,13 +296,38 @@ pub(crate) fn op_embed_layer_norm(inputs: &[Option<Tensor>], node: &NodeProto) -
     Ok(vec![out, dummy, sum])
 }
 
-/// RotaryEmbedding: reshape → split rotate/pass → lookup cos/sin → apply rotation → concat
+/// RotaryEmbedding (standard ONNX opset 23): inputs are (input, cos_cache, sin_cache, position_ids?)
 pub(crate) fn op_rotary_embedding(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
-    let x = inp(inputs, 0);
-    let position_ids = inputs.get(1).and_then(|o| o.as_ref());
-    let cos_cache = inp(inputs, 2);
-    let sin_cache = inp(inputs, 3);
+    rotary_embedding_impl(
+        inp(inputs, 0),
+        inp(inputs, 1),
+        inp(inputs, 2),
+        inputs.get(3).and_then(|o| o.as_ref()),
+        node,
+    )
+}
 
+/// RotaryEmbedding (Microsoft contrib): inputs are (input, position_ids?, cos_cache, sin_cache)
+pub(crate) fn op_rotary_embedding_contrib(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+    rotary_embedding_impl(
+        inp(inputs, 0),
+        inp(inputs, 2),
+        inp(inputs, 3),
+        inputs.get(1).and_then(|o| o.as_ref()),
+        node,
+    )
+}
+
+/// Shared RotaryEmbedding implementation.
+///
+/// reshape → split rotate/pass → lookup cos/sin → apply rotation → concat
+fn rotary_embedding_impl(
+    x: &Tensor,
+    cos_cache: &Tensor,
+    sin_cache: &Tensor,
+    position_ids: Option<&Tensor>,
+    node: &NodeProto,
+) -> Result<Vec<Tensor>> {
     let interleaved = get_attr_int(node, "interleaved", 0) != 0;
     let num_heads = get_attr_int(node, "num_heads", 0) as usize;
     let rotary_embedding_dim = get_attr_int(node, "rotary_embedding_dim", 0) as usize;
@@ -337,38 +362,23 @@ pub(crate) fn op_rotary_embedding(inputs: &[Option<Tensor>], node: &NodeProto) -
         (x_work.clone(), None)
     };
 
-    // Lookup cos/sin from cache using embedding (index into first dim)
+    // Lookup cos/sin from cache
     let (cos, sin) = if let Some(pos_ids) = position_ids {
-        // pos_ids may be [B, S] or [S]; use embedding to index: cache[pos_ids]
+        // cache is [max_seq_len, D/2]; index with position_ids [B, S] → [B, S, D/2]
         (cos_cache.embedding(pos_ids)?, sin_cache.embedding(pos_ids)?)
     } else {
-        let seq_len = work_shape[1].as_const().unwrap();
-        let pos_ids = Tensor::arange(seq_len as i64, None, None)?;
-        (cos_cache.embedding(&pos_ids)?, sin_cache.embedding(&pos_ids)?)
+        // cache is already [B, S, D/2] (pre-indexed); use directly
+        (cos_cache.clone(), sin_cache.clone())
     };
 
-    // Slice to rot_dim/2 and unsqueeze for head broadcast
+    // Slice to rot_dim/2 if cache has more columns than needed
     let half_rot = rot_dim / 2;
-    let cos_shape = cos.shape()?;
-    let cos_last = cos_shape[cos_shape.len() - 1].as_const().unwrap();
-    let cos = if cos_last > half_rot {
-        let parts = cos.split(&[half_rot, cos_last - half_rot], -1)?;
-        parts[0].clone()
-    } else {
-        cos
-    };
-    let sin_shape = sin.shape()?;
-    let sin_last = sin_shape[sin_shape.len() - 1].as_const().unwrap();
-    let sin = if sin_last > half_rot {
-        let parts = sin.split(&[half_rot, sin_last - half_rot], -1)?;
-        parts[0].clone()
-    } else {
-        sin
-    };
+    let cos = slice_last_dim_if_needed(&cos, half_rot)?;
+    let sin = slice_last_dim_if_needed(&sin, half_rot)?;
 
     // Unsqueeze for head dimension broadcast: [B, S, D/2] → [B, S, 1, D/2]
-    let cos = if cos.ndim()? < x_rotate.ndim()? { cos.try_unsqueeze(2)? } else { cos };
-    let sin = if sin.ndim()? < x_rotate.ndim()? { sin.try_unsqueeze(2)? } else { sin };
+    let cos = if cos.ndim()? < x_rotate.ndim()? { cos.try_unsqueeze(-2)? } else { cos };
+    let sin = if sin.ndim()? < x_rotate.ndim()? { sin.try_unsqueeze(-2)? } else { sin };
 
     let x_rotated = x_rotate.apply_rotary_emb(&cos, &sin, interleaved)?;
 
@@ -387,6 +397,18 @@ pub(crate) fn op_rotary_embedding(inputs: &[Option<Tensor>], node: &NodeProto) -
     };
 
     Ok(vec![output])
+}
+
+/// Slice last dimension to `target` if it's larger, otherwise return as-is.
+fn slice_last_dim_if_needed(t: &Tensor, target: usize) -> Result<Tensor> {
+    let shape = t.shape()?;
+    let last = shape[shape.len() - 1].as_const().unwrap();
+    if last > target {
+        let parts = t.split(&[target, last - target], -1)?;
+        Ok(parts[0].clone())
+    } else {
+        Ok(t.clone())
+    }
 }
 
 /// Microsoft contrib Attention: packed QKV projection, mask handling, SDPA.

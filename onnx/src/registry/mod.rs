@@ -81,7 +81,7 @@ impl OpRegistry {
             ("com.microsoft", "Attention") => Some(transformer::op_attention_contrib(inputs, node)),
             ("com.microsoft", "SkipLayerNormalization") => Some(transformer::op_skip_layer_norm(inputs, node)),
             ("com.microsoft", "EmbedLayerNormalization") => Some(transformer::op_embed_layer_norm(inputs, node)),
-            ("com.microsoft", "RotaryEmbedding") => Some(transformer::op_rotary_embedding(inputs, node)),
+            ("com.microsoft", "RotaryEmbedding") => Some(transformer::op_rotary_embedding_contrib(inputs, node)),
             _ => None,
         } {
             return result;
@@ -500,6 +500,7 @@ impl OpRegistry {
             "SoftmaxCrossEntropyLoss" => return nn::op_softmax_ce_loss(inputs, node),
             "RMSNormalization" => transformer::op_rms_norm(inputs, node)?,
             "Attention" => return transformer::op_attention_onnx(inputs, node),
+            "RotaryEmbedding" => return transformer::op_rotary_embedding(inputs, node),
 
             // === NonZero ===
             "NonZero" => inp(inputs, 0).nonzero()?.try_transpose(0, 1)?.cast(DType::Int64)?,
