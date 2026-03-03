@@ -145,15 +145,6 @@ impl Tensor {
         self
     }
 
-    /// Create a new tensor from a UOp, preserving buffer from self.
-    ///
-    /// Used by movement operations (reshape, permute, etc.) that create
-    /// new view UOps but share the underlying buffer.
-    fn with_same_buffer(&self, uop: Arc<UOp>) -> Self {
-        let entry = tensor_registry::register_tensor(uop);
-        Self { entry, buffer: self.buffer.clone() }
-    }
-
     /// Get the current UOp for this tensor.
     ///
     /// This reads from the registry, so it reflects any global substitutions.
@@ -534,14 +525,12 @@ impl Tensor {
             return Ok(arr);
         }
 
-        // Following Tinygrad's approach: `.numpy()` calls `.contiguous().realize()` first.
-        let buffer = match self.buffer() {
-            Some(buf) => buf,
-            None => {
-                let realized = self.clone().contiguous().realize()?;
-                realized.buffer().ok_or(Error::NoBuffer)?
-            }
-        };
+        // Following Tinygrad's approach: `.numpy()` always calls `.contiguous().realize()`.
+        // Never use a cached buffer directly — movement ops (permute, shrink, pad, etc.)
+        // change the logical-to-physical mapping, so the underlying buffer may not match
+        // the tensor's logical shape.
+        let realized = self.clone().contiguous().realize()?;
+        let buffer = realized.buffer().ok_or(Error::NoBuffer)?;
 
         // Validate dtype matches
         if buffer.dtype() != T::DTYPE {

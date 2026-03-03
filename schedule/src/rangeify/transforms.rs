@@ -148,6 +148,7 @@ pub fn rangeify_with_map(
         let t_stage = std::time::Instant::now();
         let mega_pass = crate::symbolic::symbolic().with_context::<PcontigConfig>()
             + super::patterns::reduction_simplify_patterns().with_context()
+            + super::patterns::absorb_invalid_into_index_gate().with_context()
             + super::patterns::buffer_folding().with_context()
             + super::patterns::dead_axis_removal().with_context()
             + super::patterns::movement_op_patterns().with_context()
@@ -1241,6 +1242,8 @@ pub(crate) fn get_range_size(range: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// Collapse REDUCE(ADD) by algebraic simplification following Tinygrad's algorithm.
 ///
+/// Core reduce collapse algorithm — parameterized by pattern matcher.
+///
 /// For each reduce range:
 /// 1. Gated toposort to find nodes "in scope" of the range
 /// 2. Replace external inputs (nodes NOT in scope) with synthetic DEFINE_VAR
@@ -1249,8 +1252,9 @@ pub(crate) fn get_range_size(range: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 5. If REDUCE is eliminated (no_range), reverse-substitute back
 ///
 /// Based on Tinygrad's `reduce_collapse` (simplify.py:121-134).
+/// Parameterized by `pm` following Tinygrad's `def reduce_collapse(red, u, pm=pm_reduce_collapse)`.
 #[allow(clippy::mutable_key_type)]
-pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> {
+fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPatternMatcher<()>) -> Option<Arc<UOp>> {
     use morok_ir::ReduceOp;
 
     if ranges.is_empty() {
@@ -1271,6 +1275,7 @@ pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> 
         }
 
         // 2. Identify external inputs and substitute with DEFINE_VAR
+        // (Tinygrad excludes: CONST, VCONST, PARAM, DEFINE_LOCAL, DEFINE_VAR)
         let mut replaces: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
         for node in &in_scope {
             node.0.op().map_child(|child| {
@@ -1278,15 +1283,16 @@ pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> 
                 if in_scope.contains(&key) || replaces.contains_key(&key) {
                     return;
                 }
-                // Constants, existing vars, and globals don't need substitution
                 if matches!(
                     child.op(),
-                    Op::Const(_) | Op::VConst { .. } | Op::DefineVar { .. } | Op::DefineGlobal { .. }
+                    Op::Const(_)
+                        | Op::VConst { .. }
+                        | Op::DefineVar { .. }
+                        | Op::DefineGlobal { .. }
+                        | Op::DefineLocal { .. }
                 ) {
                     return;
                 }
-                // Create DEFINE_VAR with bounds and dtype from the original node
-                // (Tinygrad: dtype=s.dtype to preserve Bool/Float/Int types)
                 let vmin = match child.vmin() {
                     ConstValue::Int(i) => *i,
                     ConstValue::UInt(u) => *u as i64,
@@ -1308,9 +1314,8 @@ pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> 
         let substituted = u.substitute(&replaces);
         let synthetic_reduce = substituted.reduce(smallvec![range.clone()], ReduceOp::Add);
 
-        // 4. Apply pm_reduce_collapse patterns
-        let matcher = super::patterns::build_reduce_collapse_matcher();
-        let result = crate::rewrite::graph_rewrite(&matcher, synthetic_reduce, &mut ());
+        // 4. Apply algebraic patterns to try eliminating the range
+        let result = crate::rewrite::graph_rewrite(pm, synthetic_reduce, &mut ());
 
         // 5. Check range eliminated (use plain toposort, NOT in_scope_ranges,
         //    since REDUCE "ends" ranges and would give a false positive)
@@ -1324,6 +1329,24 @@ pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> 
     }
 
     Some(u)
+}
+
+/// Collapse REDUCE using `pm_reduce_collapse` patterns.
+///
+/// Tinygrad: `reduce_collapse(red, u)` (uses default `pm=pm_reduce_collapse`).
+pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> {
+    let pm = super::patterns::build_reduce_collapse_matcher();
+    reduce_collapse_with(src, ranges, &pm)
+}
+
+/// Collapse REDUCE using extended `pm_reduce_load_collapse` patterns.
+///
+/// Tinygrad: `reduce_load_collapse(red, u)` — calls `reduce_collapse` with
+/// `pm=pm_reduce_load_collapse` which includes `.or_casted()` variants,
+/// NE lifting, and the full `pm_load_collapse` non-REDUCE patterns.
+pub fn reduce_load_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> {
+    let pm = super::patterns::build_reduce_load_collapse_matcher();
+    reduce_collapse_with(src, ranges, &pm)
 }
 
 pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Arc<UOp>> {
@@ -1478,6 +1501,7 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         let simplified = crate::rewrite::graph_rewrite(&matcher, rewritten, &mut ());
 
         // Count divmod operations (Tinygrad simplify.py:34-36)
+        use crate::passes::linearize_index::count_divmod;
         let original_divmod = count_divmod(u);
         let new_divmod = count_divmod(&simplified);
 
@@ -1488,12 +1512,6 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     None
-}
-
-/// Count IDIV and MOD operations in a UOp graph.
-fn count_divmod(uop: &Arc<UOp>) -> usize {
-    use morok_ir::types::BinaryOp;
-    uop.toposort().iter().filter(|u| matches!(u.op(), Op::Binary(BinaryOp::Idiv | BinaryOp::Mod, _, _))).count()
 }
 
 /// Pattern matcher for range simplification.

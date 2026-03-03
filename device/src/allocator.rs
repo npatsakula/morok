@@ -1,5 +1,8 @@
+use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 use std::sync::Mutex;
 
 #[cfg(feature = "cuda")]
@@ -10,6 +13,57 @@ use snafu::ResultExt;
 use std::sync::Arc;
 
 use crate::error::*;
+
+/// 64-byte aligned buffer for SIMD operations (covers SSE/AVX/AVX-512).
+///
+/// The C codegen emits vector types with alignment attributes (e.g. `aligned(32)` for
+/// `double4`). Clang then generates aligned load/store instructions (`vmovaps`) that
+/// segfault on unaligned pointers. This buffer guarantees all allocations are
+/// 64-byte aligned to satisfy any current SIMD width.
+pub struct AlignedBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+const BUFFER_ALIGN: usize = 64;
+
+impl AlignedBuffer {
+    pub fn new_zeroed(size: usize) -> Self {
+        if size == 0 {
+            return Self { ptr: NonNull::dangling(), len: 0 };
+        }
+        let layout = Layout::from_size_align(size, BUFFER_ALIGN).expect("invalid buffer layout");
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        Self { ptr, len: size }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl Deref for AlignedBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        if self.len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) } }
+    }
+}
+
+impl DerefMut for AlignedBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        if self.len == 0 { &mut [] } else { unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) } }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        if self.len > 0 {
+            let layout = Layout::from_size_align(self.len, BUFFER_ALIGN).unwrap();
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+        }
+    }
+}
 
 /// Opaque handle to device memory.
 ///
@@ -28,7 +82,7 @@ use crate::error::*;
 /// scheduler's responsibility, not the buffer's.
 pub enum RawBuffer {
     Cpu {
-        data: UnsafeCell<Box<[u8]>>,
+        data: UnsafeCell<AlignedBuffer>,
         cpu_accessible: bool,
     },
     #[cfg(feature = "cuda")]
@@ -123,7 +177,7 @@ pub struct CpuAllocator;
 
 impl Allocator for CpuAllocator {
     fn alloc(&self, size: usize, options: &BufferOptions) -> Result<RawBuffer> {
-        let data = vec![0u8; size].into_boxed_slice();
+        let data = AlignedBuffer::new_zeroed(size);
         Ok(RawBuffer::Cpu { data: UnsafeCell::new(data), cpu_accessible: options.cpu_accessible })
     }
 

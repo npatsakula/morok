@@ -90,16 +90,14 @@ impl Tensor {
     pub fn softmax(&self, axis: impl Into<AxisSpec>) -> Result<Self> {
         let axis = axis.into();
 
-        // For 1D tensors (most common case), we can simplify
         // softmax(x) = exp(x - max(x)) / sum(exp(x - max(x)))
-        let max_val = self.max(axis.clone())?; // Scalar
-        let max_broadcasted = max_val.broadcast_to(&self.shape()?)?;
-        let shifted = self.try_sub(&max_broadcasted)?;
+        // keepdim preserves the reduced axis as size 1 for correct broadcasting
+        let max_val = self.max_with().axes(axis.clone()).keepdim(true).call()?;
+        let shifted = self.try_sub(&max_val)?;
         let exp_shifted = shifted.try_exp()?;
-        let sum_exp = exp_shifted.sum(axis)?; // Scalar
-        let sum_broadcasted = sum_exp.broadcast_to(&self.shape()?)?;
+        let sum_exp = exp_shifted.sum_with().axes(axis).keepdim(true).call()?;
 
-        exp_shifted.try_div(&sum_broadcasted)
+        exp_shifted.try_div(&sum_exp)
     }
 
     /// Log-softmax activation: `log(softmax(x))`.
@@ -120,11 +118,14 @@ impl Tensor {
     pub fn log_softmax(&self, axis: impl Into<AxisSpec>) -> Result<Self> {
         let axis = axis.into();
 
-        // log_softmax(x) = x - logsumexp(x, axis)
-        // logsumexp returns reduced shape, so broadcast it back to match x
-        let logsumexp = self.logsumexp(axis)?;
-        let logsumexp_broadcast = logsumexp.broadcast_to(&self.shape()?)?;
-        self.try_sub(&logsumexp_broadcast)
+        // log_softmax(x) = x - max(x) - log(sum(exp(x - max(x))))
+        // keepdim preserves the reduced axis as size 1 for correct broadcasting
+        let max_val = self.max_with().axes(axis.clone()).keepdim(true).call()?;
+        let shifted = self.try_sub(&max_val)?;
+        let exp_shifted = shifted.try_exp()?;
+        let sum_exp = exp_shifted.sum_with().axes(axis).keepdim(true).call()?;
+        let log_sum_exp = sum_exp.try_log()?;
+        shifted.try_sub(&log_sum_exp)
     }
 
     /// Log-sum-exp: `log(sum(exp(x)))`.
@@ -143,15 +144,16 @@ impl Tensor {
         let axis = axis.into();
 
         // logsumexp(x) = max(x) + log(sum(exp(x - max(x))))
-        let max_val = self.max(axis.clone())?;
-        let max_broadcasted = max_val.broadcast_to(&self.shape()?)?;
-        let shifted = self.try_sub(&max_broadcasted)?;
+        // Use keepdim internally for correct broadcasting, then drop via max
+        let max_keepdim = self.max_with().axes(axis.clone()).keepdim(true).call()?;
+        let shifted = self.try_sub(&max_keepdim)?;
         let exp_shifted = shifted.try_exp()?;
-        let sum_exp = exp_shifted.sum(axis)?;
+        let sum_exp = exp_shifted.sum_with().axes(axis.clone()).keepdim(true).call()?;
         let log_sum = sum_exp.try_log()?;
+        let result_keepdim = max_keepdim.try_add(&log_sum)?;
 
-        // Result should have reduced shape (not broadcast back to input shape)
-        max_val.try_add(&log_sum)
+        // Drop the keepdim axis — max over size-1 dim is effectively a squeeze
+        result_keepdim.max(axis)
     }
 
     /// GELU activation (Gaussian Error Linear Unit).

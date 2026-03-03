@@ -123,19 +123,13 @@ fn should_skip(name: &str) -> bool {
         "test_batchnorm_epsilon_training_mode",
         "test_dropout_random_old",
         "test_constantofshape_int_shape_zero",
+        // If variants using sequence/optional types in subgraphs
+        "test_if_seq",
+        "test_if_opt",
     ];
 
-    const SKIP_CONTAINS: &[&str] = &[
-        "_expanded",
-        "FLOAT8",
-        "INT4",
-        "UINT4",
-        "INT2",
-        "UINT2",
-        "FLOAT4E2M1",
-        "FLOAT8E8M0",
-        "COMPLEX",
-    ];
+    const SKIP_CONTAINS: &[&str] =
+        &["_expanded", "FLOAT8", "INT4", "UINT4", "INT2", "UINT2", "FLOAT4E2M1", "FLOAT8E8M0", "COMPLEX"];
 
     SKIP_PREFIXES.iter().any(|p| name.starts_with(p))
         || SKIP_EXACT.contains(&name)

@@ -48,7 +48,7 @@ impl Tensor {
         // Convert to Shape, handling -1 inference
         let shape = self.resolve_shape_with_inference(new_shape)?;
 
-        self.uop().try_reshape(&shape).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+        self.uop().try_reshape(&shape).map(Self::new).context(UOpSnafu)
     }
 
     /// Permute (reorder) tensor dimensions.
@@ -78,7 +78,7 @@ impl Tensor {
         // Normalize negative indices and validate
         let normalized_axes = self.normalize_axes(axes, ndim)?;
 
-        self.uop().try_permute(normalized_axes).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+        self.uop().try_permute(normalized_axes).map(Self::new).context(UOpSnafu)
     }
 
     /// Transpose two dimensions.
@@ -111,7 +111,7 @@ impl Tensor {
         let mut axes: Vec<usize> = (0..ndim).collect();
         axes.swap(d0, d1);
 
-        self.uop().try_permute(axes).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+        self.uop().try_permute(axes).map(Self::new).context(UOpSnafu)
     }
 
     /// Expand (broadcast) dimensions.
@@ -136,7 +136,7 @@ impl Tensor {
     pub fn try_expand(&self, new_shape: &[isize]) -> Result<Tensor> {
         let shape = self.resolve_expand_shape(new_shape)?;
 
-        self.uop().try_expand(&shape).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+        self.uop().try_expand(&shape).map(Self::new).context(UOpSnafu)
     }
 
     /// Squeeze dimensions of size 1.
@@ -191,7 +191,7 @@ impl Tensor {
             }
         };
 
-        self.uop().try_reshape(&new_shape).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
     }
 
     /// Add a dimension of size 1.
@@ -233,7 +233,7 @@ impl Tensor {
         let mut new_shape = shape.clone();
         new_shape.insert(normalized_dim, SInt::Const(1));
 
-        self.uop().try_reshape(&new_shape).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+        self.uop().try_reshape(&new_shape).map(Self::new).context(UOpSnafu)
     }
 
     /// Reverse elements along specified axes.
@@ -251,7 +251,7 @@ impl Tensor {
         let ndim = shape.len();
         let flip_spec: Vec<bool> =
             (0..ndim).map(|d| axes.iter().any(|&a| Self::normalize_axis(a, ndim).is_ok_and(|na| na == d))).collect();
-        self.uop().try_flip(flip_spec).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+        self.uop().try_flip(flip_spec).map(Self::new).context(UOpSnafu)
     }
 
     /// Split tensor into chunks along a dimension.
@@ -408,7 +408,7 @@ impl Tensor {
         let padding_sint: Vec<(SInt, SInt)> =
             pos_padding.iter().map(|(begin, end)| (SInt::Const(*begin as usize), SInt::Const(*end as usize))).collect();
 
-        base.uop().try_pad(&padding_sint).map(|uop| base.with_same_buffer(uop)).context(UOpSnafu)
+        base.uop().try_pad(&padding_sint).map(Self::new).context(UOpSnafu)
     }
 
     /// Concatenate tensors along an axis.
@@ -624,7 +624,7 @@ impl Tensor {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.uop().try_shrink(&ranges_sint).map(|uop| self.with_same_buffer(uop)).context(UOpSnafu)
+        self.uop().try_shrink(&ranges_sint).map(Self::new).context(UOpSnafu)
     }
 
     /// Center-crop or center-pad each specified axis to the target size.

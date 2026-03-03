@@ -452,13 +452,20 @@ fn render_node<'c, 'a: 'c>(
             if indices.is_empty() {
                 rctx.register(node.id, buf_val);
             } else {
-                let idx_val = rctx.get(indices[0].id);
+                // Multi-index: linearize at render time using row-major strides
+                let idx_val = if indices.len() > 1 {
+                    render_linearize_multi_index_mlir(ctx, rctx, indices, loc)
+                } else {
+                    rctx.get(indices[0].id)
+                };
+
                 let elem_dtype = match node.dtype() {
                     DType::Ptr { ref base, .. } => base.as_ref().clone(),
                     other => other,
                 };
                 let elem_type = mlir_type(ctx, &elem_dtype);
 
+                let block = rctx.current_block();
                 let gep = block
                     .append_operation(llvm::get_element_ptr_dynamic(
                         ctx,
@@ -928,6 +935,48 @@ fn render_node<'c, 'a: 'c>(
         }
     }
     Ok(())
+}
+
+/// Linearize multiple index expressions into a single MLIR value at render time.
+///
+/// Emits arith `mul` + `add` chain for `idx0*stride0 + idx1*stride1 + ...`.
+fn render_linearize_multi_index_mlir<'c, 'a: 'c>(
+    ctx: &'c Context,
+    rctx: &RenderContext<'c, 'a>,
+    indices: &[Arc<UOp>],
+    loc: Location<'c>,
+) -> melior::ir::Value<'c, 'c> {
+    use morok_schedule::passes::linearize_index::{compute_row_major_strides, extract_index_dimension};
+
+    let dims: Vec<i64> = indices
+        .iter()
+        .map(|idx| extract_index_dimension(idx).expect("multi-index dimension must be resolvable at codegen"))
+        .collect();
+    let strides = compute_row_major_strides(&dims);
+
+    let block = rctx.current_block();
+    let idx_type = mlir_type(ctx, &indices[0].dtype());
+
+    let mut current: Option<melior::ir::Value> = None;
+    for (idx_uop, &stride) in indices.iter().zip(strides.iter()) {
+        if stride == 0 {
+            continue;
+        }
+        let idx_val = rctx.get(idx_uop.id);
+        let term = if stride == 1 {
+            idx_val
+        } else {
+            let stride_val = const_int(ctx, &block, stride, idx_type, loc);
+            block.append_operation(arith::muli(idx_val, stride_val, loc)).result(0).unwrap().into()
+        };
+
+        current = Some(match current {
+            None => term,
+            Some(acc) => block.append_operation(arith::addi(acc, term, loc)).result(0).unwrap().into(),
+        });
+    }
+
+    current.unwrap_or_else(|| const_int(ctx, &block, 0, idx_type, loc))
 }
 
 /// Trace through CONTRACT/UNROLL/DETACH wrappers to find the underlying LOAD's INDEX.

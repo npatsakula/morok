@@ -19,6 +19,28 @@ pub enum ConstValue {
     Bool(bool),
 }
 
+macro_rules! impl_from_widening {
+    ($($ty:ty => Int),+ $(,)?) => { $(
+        impl From<$ty> for ConstValue {
+            fn from(v: $ty) -> Self { ConstValue::Int(v as i64) }
+        }
+    )+ };
+    ($($ty:ty => UInt),+ $(,)?) => { $(
+        impl From<$ty> for ConstValue {
+            fn from(v: $ty) -> Self { ConstValue::UInt(v as u64) }
+        }
+    )+ };
+}
+
+impl_from_widening!(i8 => Int, i16 => Int, i32 => Int);
+impl_from_widening!(u8 => UInt, u16 => UInt, u32 => UInt);
+
+impl From<f32> for ConstValue {
+    fn from(v: f32) -> Self {
+        ConstValue::Float(v as f64)
+    }
+}
+
 /// Manual Hash impl because f64 doesn't implement Hash.
 /// Uses to_bits() for floats, which means NaN values with identical bit patterns hash equally.
 impl Hash for ConstValue {

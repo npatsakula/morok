@@ -56,23 +56,31 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             if indices.is_empty() {
                 kernel.push(format!("  {dst} = bitcast {buf_type} {buf} to {}", ldt(&uop.dtype())));
             } else {
-                let idx = ctx.get(&indices[0]);
+                // Multi-index: linearize at render time using row-major strides
+                let (final_idx, final_idx_type) = if indices.len() > 1 {
+                    render_linearize_multi_index(&dst, indices, ctx, kernel)
+                } else {
+                    (ctx.get(&indices[0]).to_string(), ldt(&indices[0].dtype()))
+                };
+
                 let elem_type = match uop.dtype() {
                     morok_dtype::DType::Ptr { ref base, .. } => ldt(base),
                     other => ldt(&other),
                 };
-                let idx_type = ldt(&indices[0].dtype());
 
                 if gate.is_some() {
                     let gate_val = ctx.get(gate.as_ref().unwrap());
                     let null_ptr = format!("{dst}.null");
                     let gep_ptr = format!("{dst}.gep");
-                    kernel
-                        .push(format!("  {gep_ptr} = getelementptr inbounds {elem_type}, ptr {buf}, {idx_type} {idx}"));
+                    kernel.push(format!(
+                        "  {gep_ptr} = getelementptr inbounds {elem_type}, ptr {buf}, {final_idx_type} {final_idx}"
+                    ));
                     kernel.push(format!("  {null_ptr} = inttoptr i64 0 to ptr"));
                     kernel.push(format!("  {dst} = select i1 {gate_val}, ptr {gep_ptr}, ptr {null_ptr}"));
                 } else {
-                    kernel.push(format!("  {dst} = getelementptr inbounds {elem_type}, ptr {buf}, {idx_type} {idx}"));
+                    kernel.push(format!(
+                        "  {dst} = getelementptr inbounds {elem_type}, ptr {buf}, {final_idx_type} {final_idx}"
+                    ));
                 }
             }
             Some(())
@@ -843,6 +851,56 @@ fn render_ptrcat(dst: &str, sources: &[Arc<UOp>], ctx: &RenderContext, kernel: &
         kernel.push(format!("  {next} = insertelement {vec_type} {prev}, {ptr_type} {val}, i32 {i}"));
         prev = next;
     }
+}
+
+/// Linearize multiple index expressions into a single linear offset at render time.
+///
+/// Emits LLVM IR `mul` + `add` chain for `idx0*stride0 + idx1*stride1 + ...`.
+/// Returns the final SSA name and its LLVM type string.
+fn render_linearize_multi_index(
+    dst: &str,
+    indices: &[Arc<UOp>],
+    ctx: &RenderContext,
+    kernel: &mut Vec<String>,
+) -> (String, String) {
+    use morok_schedule::passes::linearize_index::{compute_row_major_strides, extract_index_dimension};
+
+    // Extract dimensions from index UOps
+    let dims: Vec<i64> = indices
+        .iter()
+        .map(|idx| extract_index_dimension(idx).expect("multi-index dimension must be resolvable at codegen"))
+        .collect();
+    let strides = compute_row_major_strides(&dims);
+    let idx_type = ldt(&indices[0].dtype());
+
+    let mut current = String::new();
+    for (i, (idx_uop, &stride)) in indices.iter().zip(strides.iter()).enumerate() {
+        if stride == 0 {
+            continue;
+        }
+        let idx_val = ctx.get(idx_uop);
+        let term = if stride == 1 {
+            idx_val.to_string()
+        } else {
+            let mul_name = format!("{dst}.lin_mul{i}");
+            kernel.push(format!("  {mul_name} = mul {idx_type} {idx_val}, {stride}"));
+            mul_name
+        };
+
+        if current.is_empty() {
+            current = term;
+        } else {
+            let add_name = format!("{dst}.lin_add{i}");
+            kernel.push(format!("  {add_name} = add {idx_type} {current}, {term}"));
+            current = add_name;
+        }
+    }
+
+    if current.is_empty() {
+        current = "0".to_string();
+    }
+
+    (current, idx_type)
 }
 
 /// Get identity element for reduce operation.

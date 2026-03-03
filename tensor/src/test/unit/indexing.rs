@@ -262,3 +262,84 @@ fn test_nonzero_1d() {
     assert_eq!(vals[[1, 0]], 2); // index of 2
     assert_eq!(vals[[2, 0]], 4); // index of 3
 }
+
+#[test]
+fn test_nonzero_2d_debug_coords() {
+    // Test the coordinate building for nonzero on [2, 2]
+    // coord0: arange(2) → [0, 1], reshape [2, 1], expand [2, 2], flatten → [0, 0, 1, 1]
+    let coord0 = Tensor::arange(0, Some(2), None)
+        .unwrap()
+        .try_reshape(&[2, 1])
+        .unwrap()
+        .try_expand(&[2, 2])
+        .unwrap()
+        .flatten()
+        .unwrap();
+    let c0 = coord0.to_ndarray::<i32>().unwrap();
+    eprintln!("coord0 shape: {:?}, vals: {:?}", c0.shape(), c0.as_slice().unwrap());
+
+    // coord1: arange(2) → [0, 1], reshape [1, 2], expand [2, 2], flatten → [0, 1, 0, 1]
+    let coord1 = Tensor::arange(0, Some(2), None)
+        .unwrap()
+        .try_reshape(&[1, 2])
+        .unwrap()
+        .try_expand(&[2, 2])
+        .unwrap()
+        .flatten()
+        .unwrap();
+    let c1 = coord1.to_ndarray::<i32>().unwrap();
+    eprintln!("coord1 shape: {:?}, vals: {:?}", c1.shape(), c1.as_slice().unwrap());
+
+    assert_eq!(c0.as_slice().unwrap(), &[0, 0, 1, 1]);
+    assert_eq!(c1.as_slice().unwrap(), &[0, 1, 0, 1]);
+}
+
+#[test]
+// #[tracing_test::traced_test]
+fn test_nonzero_2d_debug_stack() {
+    // Test stack with lazy coordinate tensors
+    let coord0 = Tensor::arange(0, Some(2), None)
+        .unwrap()
+        .try_reshape(&[2, 1])
+        .unwrap()
+        .try_expand(&[2, 2])
+        .unwrap()
+        .flatten()
+        .unwrap(); // [0, 0, 1, 1]
+
+    let coord1 = Tensor::arange(0, Some(2), None)
+        .unwrap()
+        .try_reshape(&[1, 2])
+        .unwrap()
+        .try_expand(&[2, 2])
+        .unwrap()
+        .flatten()
+        .unwrap(); // [0, 1, 0, 1]
+
+    let stacked = Tensor::stack(&[&coord0, &coord1], -1).unwrap();
+    eprintln!("stacked uop tree:\n{}", stacked.uop().tree());
+    let arr = stacked.to_ndarray::<i32>().unwrap();
+    eprintln!("stacked shape: {:?}", arr.shape());
+    eprintln!("stacked values: {:?}", arr.as_slice().unwrap());
+    assert_eq!(arr.shape(), &[4, 2]);
+    // Expected: [[0, 0], [0, 1], [1, 0], [1, 1]]
+    assert_eq!(arr.as_slice().unwrap(), &[0, 0, 0, 1, 1, 0, 1, 1]);
+}
+
+#[test]
+// #[tracing_test::traced_test]
+fn test_nonzero_2d() {
+    // [[1, 0], [1, 1]] — nonzero at (0,0), (1,0), (1,1)
+    let t = Tensor::from_slice([1i32, 0, 1, 1]).try_reshape(&[2, 2]).unwrap();
+    let result = t.nonzero().unwrap();
+    let arr = result.to_ndarray::<i32>().unwrap();
+    eprintln!("nonzero shape: {:?}", arr.shape());
+    eprintln!("nonzero values: {:?}", arr.as_slice().unwrap());
+    assert_eq!(arr.shape(), &[3, 2]);
+    assert_eq!(arr[[0, 0]], 0);
+    assert_eq!(arr[[0, 1]], 0);
+    assert_eq!(arr[[1, 0]], 1);
+    assert_eq!(arr[[1, 1]], 0);
+    assert_eq!(arr[[2, 0]], 1);
+    assert_eq!(arr[[2, 1]], 1);
+}

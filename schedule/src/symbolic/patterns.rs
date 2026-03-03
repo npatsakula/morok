@@ -162,6 +162,16 @@ pub fn propagate_invalid() -> TypedPatternMatcher {
                 UOp::try_where(combined, x.clone(), inner_inv.clone()).ok()
             },
 
+        // Safety net: Eliminate WHERE-Invalid from data path.
+        // If absorb_invalid_into_index_gate didn't catch it (e.g. multi-index INDEX),
+        // WHERE(c1, WHERE(c2, x, Inv), y) → WHERE(AND(c1,c2), x, y) remains correct.
+        Where(c1, Where(c2, x, inner_inv), y)
+            if matches!(inner_inv.op(), Op::Invalid)
+            => |c1, c2, x, y| {
+                let combined = c1.try_and_op(c2).ok()?;
+                UOp::try_where(combined, x.clone(), y.clone()).ok()
+            },
+
         // Push CAST through WHERE-with-Invalid
         // CAST(WHERE(cond, x, Invalid)) → WHERE(cond, CAST(x), Invalid)
         Cast { src: Where(cond, x, invalid), dtype }

@@ -178,7 +178,12 @@ macro_rules! assert_float_close {
             assert!(
                 diff <= tol,
                 "Output '{}' element {}: actual={}, expected={}, diff={}, tol={}",
-                $name, idx, av, ev, diff, tol
+                $name,
+                idx,
+                av,
+                ev,
+                diff,
+                tol
             );
         }
     }};
@@ -200,10 +205,7 @@ fn assert_tensors_close(actual: &Tensor, expected: &Tensor, label: &str) {
     let actual_cast;
     let actual = if actual.uop().dtype() != expected_dtype {
         actual_cast = actual.cast(expected_dtype.clone()).unwrap_or_else(|e| {
-            panic!(
-                "Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}",
-                actual.uop().dtype()
-            )
+            panic!("Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}", actual.uop().dtype())
         });
         &actual_cast
     } else {
@@ -237,8 +239,7 @@ fn sorted_dirs(parent: &Path, prefix: &str) -> Vec<PathBuf> {
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                && e.file_name().to_string_lossy().starts_with(prefix)
+            e.file_type().map(|ft| ft.is_dir()).unwrap_or(false) && e.file_name().to_string_lossy().starts_with(prefix)
         })
         .map(|e| e.path())
         .collect();
@@ -302,8 +303,7 @@ pub(crate) fn run_onnx_node_test(test_dir: &str) {
                 .unwrap_or_else(|e| panic!("{test_name}/{set_name}: failed to decode output_{i}.pb: {e}"));
             let expected = tensor_from_proto_ext(&tensor_proto, None)
                 .unwrap_or_else(|e| panic!("{test_name}/{set_name}: expected output '{name}': {e}"));
-            let actual =
-                outputs.get(name).unwrap_or_else(|| panic!("{test_name}/{set_name}: missing output '{name}'"));
+            let actual = outputs.get(name).unwrap_or_else(|| panic!("{test_name}/{set_name}: missing output '{name}'"));
             assert_tensors_close(actual, &expected, &format!("{test_name}/{set_name}:{name}"));
         }
     }

@@ -27,6 +27,7 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], node: &NodeProto) -> 
     let attn_mask = inputs.get(3).and_then(|o| o.as_ref());
     let past_key = inputs.get(4).and_then(|o| o.as_ref());
     let past_value = inputs.get(5).and_then(|o| o.as_ref());
+    let nonpad_kv_seqlen = inputs.get(6).and_then(|o| o.as_ref());
 
     let is_causal = get_attr_int(node, "is_causal", 0) != 0;
     let q_num_heads = get_attr_int(node, "q_num_heads", 0) as usize;
@@ -52,8 +53,9 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], node: &NodeProto) -> 
         let q_hidden = q_shape[2].as_const().unwrap();
         let q_head_dim = q_hidden / q_num_heads;
         let k_shape = k.shape()?;
-        let k_hidden = k_shape[2].as_const().unwrap();
-        let kv_head_dim = k_hidden / kv_num_heads;
+        let k_head_dim = k_shape[2].as_const().unwrap() / kv_num_heads;
+        let v_shape = v.shape()?;
+        let v_head_dim = v_shape[2].as_const().unwrap() / kv_num_heads;
         let batch = q_shape[0].as_const().unwrap() as isize;
         let q_seq = q_shape[1].as_const().unwrap() as isize;
         let k_seq = k_shape[1].as_const().unwrap() as isize;
@@ -61,9 +63,9 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], node: &NodeProto) -> 
         let q =
             q.try_reshape(&[batch, q_seq, q_num_heads as isize, q_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
         let k =
-            k.try_reshape(&[batch, k_seq, kv_num_heads as isize, kv_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
+            k.try_reshape(&[batch, k_seq, kv_num_heads as isize, k_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
         let v =
-            v.try_reshape(&[batch, k_seq, kv_num_heads as isize, kv_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
+            v.try_reshape(&[batch, k_seq, kv_num_heads as isize, v_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
         (q, k, v)
     } else {
         (q.clone(), k.clone(), v.clone())
@@ -76,11 +78,34 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], node: &NodeProto) -> 
     let present_key = k.clone();
     let present_value = v.clone();
 
-    // GQA: repeat K/V if needed
-    let (k, v) = if q_num_heads > 0 && kv_num_heads > 0 && q_num_heads != kv_num_heads {
-        let ratio = q_num_heads / kv_num_heads;
-        let k = k.repeat(&[1, ratio, 1, 1])?;
-        let v = v.repeat(&[1, ratio, 1, 1])?;
+    // GQA: repeat-interleave K/V heads to match Q head count
+    // For 4D input, head counts come from shape dim 1 when attributes are unset
+    let q_s = q.shape()?;
+    let eff_q_heads = if q_num_heads > 0 { q_num_heads } else { q_s[1].as_const().unwrap() };
+    let eff_kv_heads = if kv_num_heads > 0 { kv_num_heads } else { k.shape()?[1].as_const().unwrap() };
+    let (k, v) = if eff_q_heads != eff_kv_heads {
+        let ratio = eff_q_heads / eff_kv_heads;
+        let k_s = k.shape()?;
+        let b = k_s[0].as_const().unwrap() as isize;
+        let kv_h = eff_kv_heads as isize;
+        let r = ratio as isize;
+        let s_k = k_s[2].as_const().unwrap() as isize;
+        let d_k = k_s[3].as_const().unwrap() as isize;
+        let v_s = v.shape()?;
+        let d_v = v_s[3].as_const().unwrap() as isize;
+        // [B, kv_h, S, D] → [B, kv_h, 1, S, D] → expand → [B, q_h, S, D]
+        let k = k.try_unsqueeze(2)?.try_expand(&[b, kv_h, r, s_k, d_k])?.try_reshape(&[
+            b,
+            eff_q_heads as isize,
+            s_k,
+            d_k,
+        ])?;
+        let v = v.try_unsqueeze(2)?.try_expand(&[b, kv_h, r, s_k, d_v])?.try_reshape(&[
+            b,
+            eff_q_heads as isize,
+            s_k,
+            d_v,
+        ])?;
         (k, v)
     } else {
         (k, v)
@@ -92,95 +117,109 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], node: &NodeProto) -> 
     let head_dim = q_s[q_s.len() - 1].as_const().unwrap();
     let scale_val = scale.unwrap_or(1.0 / (head_dim as f64).sqrt());
 
-    // If qk_matmul_output_mode != 0, we need to inline the attention computation
-    let (output, qk_return) = if qk_matmul_output_mode != 0 {
-        let kt = k.try_transpose(-1, -2)?;
-        let mut scores = q.matmul(&kt)?;
-        let scale_t = Tensor::const_(scale_val, q_dtype.clone());
-        scores = scores.try_mul(&scale_t)?;
+    // Handle nonpad_kv_seqlen: pad attn_mask to full K length and create padding mask
+    let full_k_len = k_s[k_s.len() - 2].as_const().unwrap();
+    let attn_mask = if let Some(seqlen) = nonpad_kv_seqlen {
+        // Padding mask: position >= seqlen[b] → -inf, else 0. Shape: [B, 1, 1, full_k]
+        let range = Tensor::arange(full_k_len as i64, None, None)?;
+        let valid = range.try_lt(&seqlen.try_unsqueeze(-1)?)?;
+        let neg_inf = Tensor::const_(f64::NEG_INFINITY, q_dtype.clone());
+        let zero = Tensor::const_(0.0f64, q_dtype.clone());
+        let pad_mask = zero.where_(&valid, &neg_inf)?.try_unsqueeze(1)?.try_unsqueeze(1)?;
 
-        // Mode 0: raw Q@K^T * scale
-        let qk_mode0 = scores.clone();
-
-        // Causal mask
-        if is_causal {
-            let q_len = q_s[q_s.len() - 2].as_const().unwrap();
-            let k_len = k_s[k_s.len() - 2].as_const().unwrap();
-            let causal = Tensor::full(&[q_len, k_len], true, DType::Bool)?.tril(0)?;
-            let neg_inf = Tensor::const_(f64::NEG_INFINITY, q_dtype.clone());
-            scores = scores.where_(&causal, &neg_inf)?;
-        }
-
-        // Attention mask
+        // Pad existing attn_mask to full K length, then combine with padding mask
         if let Some(mask) = attn_mask {
-            let mask_dtype = mask.uop().dtype();
-            if mask_dtype == DType::Bool {
-                let neg_inf = Tensor::const_(f64::NEG_INFINITY, q_dtype.clone());
-                let zero = Tensor::const_(0.0f64, q_dtype.clone());
-                let additive = zero.where_(mask, &neg_inf)?;
-                scores = scores.try_add(&additive)?;
+            let mask_k = mask.shape()?[mask.ndim()? - 1].as_const().unwrap();
+            let padded_mask = if mask_k < full_k_len {
+                let mut pad_shape: Vec<isize> = mask.shape()?.iter().map(|d| d.as_const().unwrap() as isize).collect();
+                let pad_cols = full_k_len - mask_k;
+                *pad_shape.last_mut().unwrap() = pad_cols as isize;
+                let pad_fill = Tensor::full(
+                    &pad_shape.iter().map(|&d| d as usize).collect::<Vec<_>>(),
+                    0.0f64,
+                    mask.uop().dtype(),
+                )?;
+                Tensor::cat(&[mask, &pad_fill], -1)?
             } else {
-                scores = scores.try_add(mask)?;
-            }
-        }
-
-        // Mode 1: after mask
-        let qk_mode1 = scores.clone();
-
-        // Softcap
-        if let Some(cap) = softcap {
-            let cap_t = Tensor::const_(cap, q_dtype.clone());
-            scores = scores.try_div(&cap_t)?.tanh()?.try_mul(&cap_t)?;
-        }
-
-        // Mode 2: after softcap
-        let qk_mode2 = scores.clone();
-
-        // Softmax precision casting
-        let scores = if softmax_precision > 0 {
-            let sm_dtype = match softmax_precision {
-                1 => DType::Float32,
-                10 => DType::Float16,
-                16 => DType::BFloat16,
-                _ => DType::Float32,
+                mask.clone()
             };
-            scores.cast(sm_dtype)?
+            Some(padded_mask.try_add(&pad_mask)?)
         } else {
-            scores
-        };
-
-        let attn_weights = scores.softmax(-1isize)?.cast(q_dtype.clone())?;
-
-        // Mode 3: after softmax
-        let qk_mode3 = attn_weights.clone();
-
-        let out = attn_weights.matmul(&v)?.cast(q_dtype.clone())?;
-
-        let qk = match qk_matmul_output_mode {
-            0 => qk_mode0,
-            1 => qk_mode1,
-            2 => qk_mode2,
-            3 => qk_mode3,
-            _ => qk_mode0,
-        };
-
-        (out, qk)
+            Some(pad_mask)
+        }
     } else {
-        // Use opaque SDPA
-        let out = q
-            .scaled_dot_product_attention()
-            .key(&k)
-            .value(&v)
-            .maybe_attn_mask(attn_mask)
-            .maybe_scale(scale)
-            .is_causal(is_causal)
-            .maybe_softcap(softcap)
-            .call()?
-            .cast(q_dtype)?;
+        attn_mask.cloned()
+    };
+    let attn_mask = attn_mask.as_ref();
 
-        // Empty QK return for mode 0
-        let qk = Tensor::from_slice([0.0f32]);
-        (out, qk)
+    // Always compute attention manually to capture QK intermediates for all modes
+    let kt = k.try_transpose(-1, -2)?;
+    let mut scores = q.matmul(&kt)?;
+    let scale_t = Tensor::const_(scale_val, q_dtype.clone());
+    scores = scores.try_mul(&scale_t)?;
+
+    // Mode 0: raw Q@K^T * scale
+    let qk_mode0 = scores.clone();
+
+    // Causal mask: only restrict CURRENT K positions, past positions always attendable
+    if is_causal {
+        let past_seq_len = past_key.map(|pk| pk.shape().unwrap()[2].as_const().unwrap()).unwrap_or(0);
+        let q_len = q_s[q_s.len() - 2].as_const().unwrap();
+        let causal = Tensor::full(&[q_len, full_k_len], true, DType::Bool)?.tril(past_seq_len as i64)?;
+        let neg_inf = Tensor::const_(f64::NEG_INFINITY, q_dtype.clone());
+        scores = scores.where_(&causal, &neg_inf)?;
+    }
+
+    // Attention mask
+    if let Some(mask) = attn_mask {
+        let mask_dtype = mask.uop().dtype();
+        if mask_dtype == DType::Bool {
+            let neg_inf = Tensor::const_(f64::NEG_INFINITY, q_dtype.clone());
+            let zero = Tensor::const_(0.0f64, q_dtype.clone());
+            let additive = zero.where_(mask, &neg_inf)?;
+            scores = scores.try_add(&additive)?;
+        } else {
+            scores = scores.try_add(mask)?;
+        }
+    }
+
+    // Mode 1: after mask
+    let qk_mode1 = scores.clone();
+
+    // Softcap
+    if let Some(cap) = softcap {
+        let cap_t = Tensor::const_(cap, q_dtype.clone());
+        scores = scores.try_div(&cap_t)?.tanh()?.try_mul(&cap_t)?;
+    }
+
+    // Mode 2: after softcap
+    let qk_mode2 = scores.clone();
+
+    // Softmax precision casting
+    let scores = if softmax_precision > 0 {
+        let sm_dtype = match softmax_precision {
+            1 => DType::Float32,
+            10 => DType::Float16,
+            16 => DType::BFloat16,
+            _ => DType::Float32,
+        };
+        scores.cast(sm_dtype)?
+    } else {
+        scores
+    };
+
+    let attn_weights = scores.softmax(-1isize)?.cast(q_dtype.clone())?;
+
+    // Mode 3: after softmax
+    let qk_mode3 = attn_weights.clone();
+
+    let output = attn_weights.matmul(&v)?.cast(q_dtype)?;
+
+    let qk_return = match qk_matmul_output_mode {
+        1 => qk_mode1,
+        2 => qk_mode2,
+        3 => qk_mode3,
+        _ => qk_mode0,
     };
 
     // Reshape back to 3D if input was 3D

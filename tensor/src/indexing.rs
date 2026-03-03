@@ -58,6 +58,31 @@ impl Tensor {
         x.where_(&mask, &Self::new(x.uop().const_like(0)))?.sum_with().axes(-1).dtype(self.uop().dtype()).call()
     }
 
+    /// Select elements along `dim` using a 1D index tensor.
+    ///
+    /// For input shape `[A, B, C]` with `dim=1` and index shape `[K]`,
+    /// returns shape `[A, K, C]`.
+    #[track_caller]
+    pub fn index_select(&self, dim: isize, index: &Tensor) -> Result<Self> {
+        let self_shape = self.shape()?;
+        let ndim = self_shape.len();
+        let dim = Self::normalize_axis(dim, ndim)?;
+        let self_dims = morok_ir::shape::to_vec_usize(&self_shape).context(UOpSnafu)?;
+
+        // Reshape 1D index [K] → [1, ..., K, ..., 1] matching input ndim
+        let idx_len = index.shape()?[0].as_const().expect("index_select: index length must be concrete");
+        let mut idx_shape = vec![1isize; ndim];
+        idx_shape[dim] = idx_len as isize;
+        let idx_nd = index.try_reshape(&idx_shape)?;
+
+        // Expand to [self[0], ..., K, ..., self[-1]] (K at dim position)
+        let mut expand_shape: Vec<isize> = self_dims.iter().map(|&d| d as isize).collect();
+        expand_shape[dim] = idx_len as isize;
+        let idx_expanded = idx_nd.try_expand(&expand_shape)?;
+
+        self.gather(dim as isize, &idx_expanded)
+    }
+
     /// One-hot encoding: self == arange(num_classes) broadcast along dim.
     /// Returns a boolean tensor with True at the class positions.
     pub fn one_hot_along_dim(&self, num_classes: usize, dim: isize) -> Result<Tensor> {
@@ -216,6 +241,7 @@ impl Tensor {
         if count == 0 {
             return Ok(Tensor::empty(self.uop().dtype()));
         }
+
         // Build gather indices: zeros.scatter(0, cumsum, 1).cumsum
         let zeros = Tensor::full(&[count], ConstValue::Int(0), morok_dtype::DType::Int32)?;
         let ones = Tensor::full(&[n], ConstValue::Int(1), morok_dtype::DType::Int32)?;
@@ -233,7 +259,7 @@ impl Tensor {
         let axis = axis.unwrap_or(0);
         let indices: Vec<i64> = condition.iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i as i64).collect();
         let idx = Tensor::from_slice(&indices);
-        x.gather(axis, &idx)
+        x.index_select(axis, &idx)
     }
 
     // =========================================================================

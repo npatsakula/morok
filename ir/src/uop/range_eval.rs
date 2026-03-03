@@ -343,15 +343,33 @@ fn compute_binary_range(
             }
         }
 
-        // Modulo operation
+        // Modulo operation — NOT monotonic, four-corner evaluation is unsound.
+        // (Tinygrad: ops.py _min_max, Ops.MOD handler)
         BinaryOp::Mod => {
-            if contains_zero(b_min, b_max) {
-                dtype_bounds(dtype)
-            } else {
-                // For positive modulo, result is in [0, |divisor|-1]
-                // For negative modulo, result can be negative
-                // Conservative: check all corners
-                eval_four_corners(op, a_min, a_max, b_min, b_max, dtype)
+            match (a_min, a_max, b_min, b_max) {
+                // Non-negative dividend, positive modulus: a % m ∈ [0, min(a_max, m_max - 1)]
+                (ConstValue::Int(a_lo), ConstValue::Int(a_hi), ConstValue::Int(b_lo), ConstValue::Int(b_hi))
+                    if a_lo >= 0 && b_lo > 0 =>
+                {
+                    (ConstValue::Int(0), ConstValue::Int(a_hi.min(b_hi - 1)))
+                }
+                // Non-positive dividend, positive modulus: result ∈ [-(m_max-1), 0]
+                (ConstValue::Int(_a_lo), ConstValue::Int(a_hi), ConstValue::Int(b_lo), ConstValue::Int(b_hi))
+                    if a_hi <= 0 && b_lo > 0 =>
+                {
+                    (ConstValue::Int(-(b_hi - 1)), ConstValue::Int(0))
+                }
+                // Mixed-sign dividend, positive modulus: result ∈ [-(m_max-1), m_max-1]
+                (ConstValue::Int(_), ConstValue::Int(_), ConstValue::Int(b_lo), ConstValue::Int(b_hi)) if b_lo > 0 => {
+                    (ConstValue::Int(-(b_hi - 1)), ConstValue::Int(b_hi - 1))
+                }
+                // Unsigned: always non-negative
+                (ConstValue::UInt(_), ConstValue::UInt(a_hi), ConstValue::UInt(b_lo), ConstValue::UInt(b_hi))
+                    if b_lo > 0 =>
+                {
+                    (ConstValue::UInt(0), ConstValue::UInt(a_hi.min(b_hi - 1)))
+                }
+                _ => dtype_bounds(dtype),
             }
         }
 

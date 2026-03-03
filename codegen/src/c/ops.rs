@@ -137,7 +137,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 // No index - just alias the buffer pointer
                 ctx.register(uop.id, buf);
             } else {
-                let idx = ctx.get(&indices[0]).to_string();
+                // Multi-index: linearize at render time using row-major strides
+                let idx = if indices.len() > 1 {
+                    render_linearize_multi_index_c(indices, ctx)
+                } else {
+                    ctx.get(&indices[0]).to_string()
+                };
                 // Gate is NOT rendered here — it's handled at LOAD/STORE level.
                 // Tinygrad: INDEX renders as (buf + idx), LOAD checks gate.
                 let expr = format!("{buf} + {idx}");
@@ -408,6 +413,34 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             None
         }
     }
+}
+
+/// Linearize multiple index expressions into a single C expression.
+///
+/// Produces `(idx0*stride0 + idx1*stride1 + ...)`.
+fn render_linearize_multi_index_c(indices: &[Arc<UOp>], ctx: &CContext) -> String {
+    use morok_schedule::passes::linearize_index::{compute_row_major_strides, extract_index_dimension};
+
+    let dims: Vec<i64> = indices
+        .iter()
+        .map(|idx| extract_index_dimension(idx).expect("multi-index dimension must be resolvable at codegen"))
+        .collect();
+    let strides = compute_row_major_strides(&dims);
+
+    let mut terms: Vec<String> = Vec::new();
+    for (idx_uop, &stride) in indices.iter().zip(strides.iter()) {
+        if stride == 0 {
+            continue;
+        }
+        let idx_val = ctx.get(idx_uop);
+        if stride == 1 {
+            terms.push(idx_val.to_string());
+        } else {
+            terms.push(format!("({idx_val} * {stride})"));
+        }
+    }
+
+    if terms.is_empty() { "0".to_string() } else { format!("({})", terms.join(" + ")) }
 }
 
 /// Render a binary operation as a C expression.

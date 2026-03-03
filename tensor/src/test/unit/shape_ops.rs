@@ -379,13 +379,17 @@ fn test_lazy_evaluation() {
     let permuted = reshaped.try_permute(&[1, 0]).unwrap();
     let unsqueezed = reshaped.try_unsqueeze(0).unwrap();
 
-    // Movement operations share the same underlying buffer via .base()
-    // They all point to the same buffer (t's buffer)
-    assert!(reshaped.buffer().is_some());
-    assert!(permuted.buffer().is_some());
-    assert!(unsqueezed.buffer().is_some());
+    // Only the original tensor (from_slice) holds a direct buffer reference.
+    // Movement ops are lazy views — they don't carry the buffer at the Tensor level.
+    // This matches Tinygrad: .buffer only traverses RESHAPE, not permute/expand/etc.
+    assert!(t.buffer().is_some());
 
-    // All should share the same buffer ID (same base)
+    // RESHAPE preserves buffer identity (Tinygrad: has_buffer_identity)
+    assert!(reshaped.uop().has_buffer_identity());
+    // PERMUTE and UNSQUEEZE (=RESHAPE+EXPAND) do NOT preserve buffer identity
+    assert!(!permuted.uop().has_buffer_identity());
+
+    // All movement ops share the same .base() — the underlying BUFFER UOp
     assert_eq!(reshaped.uop().base().id, t.uop().base().id);
     assert_eq!(permuted.uop().base().id, t.uop().base().id);
     assert_eq!(unsqueezed.uop().base().id, t.uop().base().id);

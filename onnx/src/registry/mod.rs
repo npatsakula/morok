@@ -325,11 +325,13 @@ impl OpRegistry {
                     value.try_reshape(&[1])?.try_expand(&shape)?
                 }
             }
-            "Size" => Tensor::from_slice([inp(inputs, 0).numel()? as i64]),
+            "Size" => Tensor::from_const(inp(inputs, 0).numel()? as i64),
             "Dropout" => return nn::op_dropout(inputs, node, opset_version),
 
             // === Indexing ===
             "Gather" => {
+                // ONNX Gather = np.take(data, indices, axis)
+                // output shape: data.shape[:axis] + indices.shape + data.shape[axis+1:]
                 let axis = get_attr_int(node, "axis", 0) as isize;
                 let data = inp(inputs, 0);
                 let idx = inp(inputs, 1);
@@ -339,11 +341,28 @@ impl OpRegistry {
                 let dim_size = data_shape[norm_axis].as_const().ok_or_else(|| Error::IrConstruction {
                     details: format!("Gather requires concrete dimension on axis {norm_axis}"),
                 })? as i64;
+                // Normalize negative indices
                 let zero = Tensor::const_(ConstValue::Int(0), idx.uop().dtype());
                 let dim_t = Tensor::const_(ConstValue::Int(dim_size), idx.uop().dtype());
                 let neg_mask = idx.try_lt(&zero)?;
-                let normalized_idx = idx.try_add(&dim_t)?.where_(&neg_mask, idx)?;
-                data.gather(axis, &normalized_idx)?
+                let idx = idx.try_add(&dim_t)?.where_(&neg_mask, idx)?;
+                // Flatten indices → index_select → reshape to insert indices shape
+                let idx_shape = idx.shape()?;
+                let idx_shape_concrete: Vec<usize> = idx_shape.iter().map(|d| d.as_const().unwrap()).collect();
+                let flat_idx = idx.flatten()?;
+                let selected = data.index_select(norm_axis as isize, &flat_idx)?;
+                // Output shape: data[:axis] + idx_shape + data[axis+1:]
+                let mut out_shape: Vec<isize> = Vec::new();
+                for d in &data_shape[..norm_axis] {
+                    out_shape.push(d.as_const().unwrap() as isize);
+                }
+                for &d in &idx_shape_concrete {
+                    out_shape.push(d as isize);
+                }
+                for d in &data_shape[norm_axis + 1..] {
+                    out_shape.push(d.as_const().unwrap() as isize);
+                }
+                selected.try_reshape(&out_shape)?
             }
             "GatherElements" => indexing::op_gather_elements(inputs, node)?,
             "GatherND" => indexing::op_gather_nd(inputs, node)?,

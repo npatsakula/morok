@@ -394,6 +394,52 @@ pub fn buffer_folding() -> TypedPatternMatcher {
     }
 }
 
+/// Absorb WHERE-Invalid from INDEX indices into the INDEX gate.
+///
+/// PAD lowering creates `WHERE(valid, adjusted_idx, Invalid)` in index positions.
+/// When BUFFERIZE buffers are inlined during the mega-pass, these WHERE-Invalid
+/// expressions can leak from the index domain into the data value path, creating
+/// structures like `WHERE(c, WHERE(c, 0, INVALID), 0)` that crash codegen.
+///
+/// This pattern absorbs the WHERE-Invalid into a gated INDEX *before* buffer inlining,
+/// so Invalid never enters the data domain. Same logic as `pm_lower_index_dtype`
+/// patterns C & D (`index_lowering.rs:210-233`), but running earlier in the mega-pass.
+pub fn absorb_invalid_into_index_gate() -> TypedPatternMatcher {
+    crate::patterns! {
+        // INDEX(buf, [WHERE(cond, idx, Invalid)], gate=None) → INDEX(buf, [idx], gate=cond)
+        node @ Index { buffer, indices, gate: None } if indices.len() == 1 => |node, buffer, indices| {
+            let idx_uop = &indices[0];
+            let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
+                return None;
+            };
+            if !matches!(false_val.op(), Op::Invalid) { return None; }
+
+            Some(UOp::new(Op::Index {
+                buffer: buffer.clone(),
+                indices: smallvec::smallvec![idx.clone()],
+                gate: Some(cond.clone()),
+            }, node.dtype()))
+        },
+
+        // INDEX(buf, [WHERE(cond, idx, Invalid)], gate=Some(g)) → INDEX(buf, [idx], gate=AND(g, cond))
+        node @ Index { buffer, indices, gate: Some(existing_gate) } if indices.len() == 1
+            => |node, buffer, indices, existing_gate| {
+            let idx_uop = &indices[0];
+            let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
+                return None;
+            };
+            if !matches!(false_val.op(), Op::Invalid) { return None; }
+
+            let combined_gate = existing_gate.try_and_op(cond).ok()?;
+            Some(UOp::new(Op::Index {
+                buffer: buffer.clone(),
+                indices: smallvec::smallvec![idx.clone()],
+                gate: Some(combined_gate),
+            }, node.dtype()))
+        },
+    }
+}
+
 /// Pattern matcher for dead axis removal.
 ///
 /// Based on Tinygrad's cleanup_dead_axes (rangeify.py:123-142).
@@ -512,13 +558,26 @@ pub fn buffer_removal() -> TypedPatternMatcher {
 pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
     crate::patterns! {
         @context PcontigConfig;
-        // Partial contiguous removal - use nested struct + gate: None
+        // Partial contiguous removal - ungated INDEX
         Index {
             buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
             indices: idx_ranges,
             gate: None
         } => |buffer, src, buf_ranges, idx_ranges, ctx| {
             apply_pcontig_removal_inner(buffer, src, buf_ranges, idx_ranges, ctx)
+        },
+
+        // Partial contiguous removal - gated INDEX (from absorb_invalid_into_index_gate)
+        // Inline the buffer, then wrap with WHERE(gate, inlined, 0) so Invalid never
+        // enters the data path.
+        Index {
+            buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
+            indices: idx_ranges,
+            gate: Some(gate)
+        } => |buffer, src, buf_ranges, idx_ranges, gate, ctx| {
+            let inlined = apply_pcontig_removal_inner(buffer, src, buf_ranges, idx_ranges, ctx)?;
+            let zero = UOp::const_(inlined.dtype(), ConstValue::zero(inlined.dtype().scalar()?));
+            UOp::try_where(gate.clone(), inlined, zero).ok()
         },
 
         // Constant buffer folding — BUFFERIZE(CONST) → CONST (like Tinygrad's pm_const_buffer_folding).
@@ -2020,28 +2079,41 @@ fn try_reduce_collapse(
         return count_casted.try_mul(false_val).ok();
     }
 
-    // Pattern 3: where(idx != r, 0, expr) → where(in_bounds(idx), expr[r:=idx], 0)
-    // This eliminates reduces over tensor indexing!
+    // Pattern 3: where(idx != r, 0, expr) → where(v, expr[r:=idx.valid(v)], 0)
+    // Also handles .or_casted(): where(idx != Cast(r), 0, expr)
+    // Follows Tinygrad: substitute r with idx.cast(r.dtype).valid(v), not raw idx.
+    // This attaches the validity predicate to the index inside the expression,
+    // ensuring out-of-bounds indices produce INVALID at the computation level
+    // rather than computing with garbage values then discarding.
     if let Op::Binary(BinaryOp::Ne, idx, ne_range) = cond.op()
-        && Arc::ptr_eq(ne_range, range)
         && is_const_zero(true_val)
         && no_range(idx)
     {
-        // Build bounds check: 0 <= idx < end
-        let zero = UOp::index_const(0);
-        let ge_zero = idx.try_cmpge(&zero).ok()?;
-        let lt_end = idx.try_cmplt(end).ok()?;
-        let in_bounds = ge_zero.try_and_op(&lt_end).ok()?;
+        // Unwrap optional CAST around the range (or_casted pattern)
+        let actual_range = if let Op::Cast { src, .. } = ne_range.op() { src } else { ne_range };
 
-        // Substitute range with idx in the expression
-        #[allow(clippy::mutable_key_type)]
-        let subs: std::collections::HashMap<UOpKey, Arc<UOp>> =
-            [(UOpKey(range.clone()), idx.clone())].into_iter().collect();
-        let substituted = false_val.substitute(&subs);
+        if Arc::ptr_eq(actual_range, range) {
+            // Cast idx to range dtype (Tinygrad: idx.cast(r.dtype))
+            let idx_casted = idx.cast(range.dtype());
 
-        // where(in_bounds, substituted, 0)
-        let zero_like = UOp::const_(false_val.dtype(), ConstValue::zero(false_val.dtype().base()));
-        return UOp::try_where(in_bounds, substituted, zero_like).ok();
+            // Build bounds check: v = (idx_casted >= 0) & (idx_casted < end)
+            let zero = UOp::index_const(0);
+            let ge_zero = idx_casted.try_cmpge(&zero).ok()?;
+            let lt_end = idx_casted.try_cmplt(end).ok()?;
+            let in_bounds = ge_zero.try_and_op(&lt_end).ok()?;
+
+            // Substitute range with idx.cast(r.dtype).valid(v) in the expression
+            // (Tinygrad: expr.substitute({r: idx.cast(r.dtype).valid(v)}))
+            let valid_idx = idx_casted.valid(in_bounds.clone());
+            #[allow(clippy::mutable_key_type)]
+            let subs: std::collections::HashMap<UOpKey, Arc<UOp>> =
+                [(UOpKey(range.clone()), valid_idx)].into_iter().collect();
+            let substituted = false_val.substitute(&subs);
+
+            // where(v, substituted, 0)
+            let zero_like = UOp::const_(false_val.dtype(), ConstValue::zero(false_val.dtype().base()));
+            return UOp::try_where(in_bounds, substituted, zero_like).ok();
+        }
     }
 
     // Pattern 4: Two-sided bounds
@@ -2144,6 +2216,10 @@ fn try_define_var_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Op
 /// Lifts operations out of Lt comparisons when they don't depend on ranges:
 /// - (x + y) < c → x < (c - y) when y, c are range-free
 /// - (x * y) < c → x < ceil(c/y) when y > 0, y, c range-free
+///
+/// Also handles `.or_casted()` variants where lhs is wrapped in a CAST:
+/// - Cast(x + y) < c → x < (c.cast(inner_dtype) - y)
+/// - Cast(x * y) < c → x < ceil(c.cast(inner_dtype)/y)
 fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Binary(BinaryOp::Lt, lhs, rhs) = cond.op() else {
         return None;
@@ -2154,16 +2230,26 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
+    // Unwrap optional CAST to get the inner expression (or_casted pattern).
+    // When CAST is present, we need to cast the rhs constant to the inner dtype.
+    let (inner_lhs, effective_rhs) = if let Op::Cast { src, .. } = lhs.op() {
+        let inner_dtype = src.dtype();
+        let casted_rhs = rhs.cast(inner_dtype);
+        (src.as_ref(), casted_rhs)
+    } else {
+        (lhs.as_ref(), rhs.clone())
+    };
+
     // Pattern: (x + y) < c → x < (c - y)
-    if let Op::Binary(BinaryOp::Add, x, y) = lhs.op()
+    if let Op::Binary(BinaryOp::Add, x, y) = inner_lhs.op()
         && no_range(y)
     {
-        let new_rhs = rhs.try_sub(y).ok()?;
+        let new_rhs = effective_rhs.try_sub(y).ok()?;
         return x.try_cmplt(&new_rhs).ok();
     }
 
     // Pattern: (x * y) < c → x < ceil(c/y) when y > 0
-    if let Op::Binary(BinaryOp::Mul, x, y) = lhs.op()
+    if let Op::Binary(BinaryOp::Mul, x, y) = inner_lhs.op()
         && no_range(y)
     {
         // Check y > 0 via vmin
@@ -2172,7 +2258,7 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
         {
             // ceil(c/y) = (c + y - 1) / y
             let one = UOp::index_const(1);
-            let c_plus_y = rhs.try_add(y).ok()?;
+            let c_plus_y = effective_rhs.try_add(y).ok()?;
             let c_plus_y_minus_1 = c_plus_y.try_sub(&one).ok()?;
             let new_rhs = c_plus_y_minus_1.try_div(y).ok()?;
             return x.try_cmplt(&new_rhs).ok();
@@ -2232,37 +2318,23 @@ fn try_lift_arithmetic_from_ge(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 8. Index overflow protection: `(x:index + y) < c` → `x < (c - y)` when x has loads
 pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        // Main pattern: REDUCE with WHERE condition - only Add reduces
-        reduce @ Reduce { src, ranges, reduce_op }
-            if !ranges.is_empty() && *reduce_op == ReduceOp::Add
-            => |reduce, src, ranges| {
-                try_reduce_collapse(reduce, src, ranges, ReduceOp::Add)
-                    .or_else(|| try_define_var_factor(src, ranges))
+        // Match REDUCE(ADD) with a single range → full reduce_load_collapse algorithm.
+        //
+        // Tinygrad: pm_load_collapse matches only single-range REDUCE(ADD)
+        // and goes straight to reduce_load_collapse (the full algorithm with
+        // gated toposort + DEFINE_VAR substitution). All arithmetic lifting,
+        // NE lifting, .or_casted() patterns live inside the inner matcher
+        // (build_reduce_load_collapse_matcher), not at this level.
+        _reduce @ Reduce { src, ranges, reduce_op }
+            if ranges.len() == 1 && *reduce_op == ReduceOp::Add
+            => |src, ranges| {
+                super::transforms::reduce_load_collapse(src, ranges)
             },
 
-        // Arithmetic lifting: (x + y) < c or (x * y) < c
-        cond @ Lt(_lhs @ Add(_, _), rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-        cond @ Lt(_lhs @ Mul(_, _), rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-
-        // MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
-        // Matches x * gate.cast() where gate is bool
-        Mul[x, Cast { src: gate, .. }] if gate.dtype() == DType::Bool => |x, gate| {
-            let zero = UOp::const_(x.dtype(), ConstValue::zero(x.dtype().base()));
-            UOp::try_where(gate.clone(), x.clone(), zero).ok()
-        },
-
-        // NE lifting: (x + y) != c → x != (c - y) when no_range(y, c)
-        Ne(Add(x, y), c) if no_range(y) && no_range(c) => |x, y, c| {
-            let new_c = c.try_sub(y).ok()?;
-            x.try_cmpne(&new_c).ok()
-        },
-
-        // Index overflow protection: (x:index + y) < c → x < (c - y)
-        // Only when x has loads but y, c don't - prevents overflow on loaded indices
+        // Index overflow undo rule: (x:index + y) < c → x < (c - y)
+        // Only when x has loads but y, c don't — prevents overflow on loaded indices.
+        // This undoes the arithmetic lifting that pm_reduce_load_collapse may have
+        // applied when the lifted form risks integer overflow on loaded values.
         Lt(Add(x, y), c)
             if x.dtype() == DType::Index && !no_load(x) && no_load(y) && no_load(c)
             => |x, y, c| {
@@ -2285,6 +2357,71 @@ pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
 /// Does NOT include a recursive `reduce_collapse` call (would infinite-loop).
 pub fn build_reduce_collapse_matcher() -> TypedPatternMatcher<()> {
     reduce_collapse_inner_patterns() + crate::symbolic::symbolic_simple()
+}
+
+/// Non-REDUCE patterns from `pm_load_collapse`.
+///
+/// Contains all `pm_load_collapse` patterns EXCEPT the REDUCE matcher
+/// (which calls `reduce_load_collapse` and would cause infinite recursion
+/// if included in `build_reduce_load_collapse_matcher`).
+fn pm_load_collapse_non_reduce() -> TypedPatternMatcher<()> {
+    crate::patterns! {
+        // Arithmetic lifting: (x + y) < c or (x * y) < c
+        cond @ Lt(_lhs @ Add(_, _), rhs) if no_range(rhs) => |cond| {
+            try_lift_arithmetic_from_lt(cond)
+        },
+        cond @ Lt(_lhs @ Mul(_, _), rhs) if no_range(rhs) => |cond| {
+            try_lift_arithmetic_from_lt(cond)
+        },
+
+        // .or_casted() variants: Cast(Add(x,y)) < c, Cast(Mul(x,y)) < c
+        cond @ Lt(Cast { src: _inner @ Add(_, _), .. }, rhs) if no_range(rhs) => |cond| {
+            try_lift_arithmetic_from_lt(cond)
+        },
+        cond @ Lt(Cast { src: _inner @ Mul(_, _), .. }, rhs) if no_range(rhs) => |cond| {
+            try_lift_arithmetic_from_lt(cond)
+        },
+
+        // MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
+        Mul[x, Cast { src: gate, .. }] if gate.dtype() == DType::Bool => |x, gate| {
+            let zero = UOp::const_(x.dtype(), ConstValue::zero(x.dtype().base()));
+            UOp::try_where(gate.clone(), x.clone(), zero).ok()
+        },
+
+        // NE lifting: (x + y) != c → x != (c - y) when no_range(y, c)
+        Ne(Add(x, y), c) if no_range(y) && no_range(c) => |x, y, c| {
+            let new_c = c.try_sub(y).ok()?;
+            x.try_cmpne(&new_c).ok()
+        },
+
+        // .or_casted() NE: Cast(x + y) != c → x != (c.cast(inner_dtype) - y)
+        Ne(Cast { src: inner, .. }, c) if no_range(c) => |inner, c| {
+            let Op::Binary(BinaryOp::Add, x, y) = inner.op() else { return None };
+            if !no_range(y) { return None; }
+            let casted_c = c.cast(inner.dtype());
+            let new_c = casted_c.try_sub(y).ok()?;
+            x.try_cmpne(&new_c).ok()
+        },
+
+        // Index overflow protection: (x:index + y) < c → x < (c - y)
+        Lt(Add(x, y), c)
+            if x.dtype() == DType::Index && !no_load(x) && no_load(y) && no_load(c)
+            => |x, y, c| {
+                let new_c = c.try_sub(y).ok()?;
+                x.try_cmplt(&new_c).ok()
+            },
+    }
+}
+
+/// Extended pattern matcher for `reduce_load_collapse`.
+///
+/// Combines `pm_load_collapse` non-REDUCE patterns (including `.or_casted()` variants,
+/// NE lifting, index overflow protection) with `pm_reduce_collapse` inner patterns
+/// and full symbolic simplification.
+///
+/// Does NOT include the REDUCE→reduce_load_collapse call to avoid infinite recursion.
+pub fn build_reduce_load_collapse_matcher() -> TypedPatternMatcher<()> {
+    pm_load_collapse_non_reduce() + reduce_collapse_inner_patterns() + crate::symbolic::symbolic_simple()
 }
 
 /// Reduce-specific algebraic patterns for use inside `reduce_collapse`.
@@ -2348,6 +2485,13 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
             try_lift_arithmetic_from_lt(cond)
         },
         cond @ Lt(_lhs @ Mul(_, _), rhs) if no_range(rhs) => |cond| {
+            try_lift_arithmetic_from_lt(cond)
+        },
+        // 4a. .or_casted() variants: Cast(Add(x,y)) < c, Cast(Mul(x,y)) < c
+        cond @ Lt(Cast { src: _inner @ Add(_, _), .. }, rhs) if no_range(rhs) => |cond| {
+            try_lift_arithmetic_from_lt(cond)
+        },
+        cond @ Lt(Cast { src: _inner @ Mul(_, _), .. }, rhs) if no_range(rhs) => |cond| {
             try_lift_arithmetic_from_lt(cond)
         },
         // 4b. Arithmetic lifting for Ge: (x + y) >= c → x >= (c - y)
