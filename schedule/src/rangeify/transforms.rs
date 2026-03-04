@@ -147,7 +147,7 @@ pub fn rangeify_with_map(
         use super::kernel::PcontigConfig;
         let t_stage = std::time::Instant::now();
         let mega_pass = crate::symbolic::symbolic().with_context::<PcontigConfig>()
-            + super::patterns::reduction_simplify_patterns().with_context()
+            + super::patterns::pm_reduce_simplify().with_context()
             + super::patterns::absorb_invalid_into_index_gate().with_context()
             + super::patterns::buffer_folding().with_context()
             + super::patterns::dead_axis_removal().with_context()
@@ -1319,7 +1319,8 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
 
         // 5. Check range eliminated (use plain toposort, NOT in_scope_ranges,
         //    since REDUCE "ends" ranges and would give a false positive)
-        if result.toposort().iter().any(|x| matches!(x.op(), Op::Range { .. })) {
+        let has_range = result.toposort().iter().any(|x| matches!(x.op(), Op::Range { .. }));
+        if has_range {
             return None;
         }
 

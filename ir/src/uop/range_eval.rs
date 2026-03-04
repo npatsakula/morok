@@ -19,23 +19,32 @@ pub fn compute_vmin_vmax(uop: &Arc<UOp>) -> (ConstValue, ConstValue) {
     use crate::uop::properties::VminVmaxProperty;
 
     match &uop.op {
-        // Constants have exact values
         Op::Const(c) => (c.0, c.0),
+        Op::VConst { values } => sources_range_values(values, &uop.dtype),
+        Op::DefineVar { min_val, max_val, .. } => (ConstValue::Int(*min_val), ConstValue::Int(*max_val)),
 
-        // Unary operations
+        // [0, end-1] ranges: Range, Special (Tinygrad ops.py:763)
+        Op::Range { end, .. } | Op::Special { end, .. } => zero_to_end_minus_one(end, &uop.dtype),
+
+        // Propagate source range: Unroll, Gep, Bind (Tinygrad ops.py:764-768)
+        Op::Unroll { src, .. } | Op::Bind { var: src, .. } | Op::Gep { vector: src, .. } => {
+            let (vmin, vmax) = VminVmaxProperty::get(src);
+            (*vmin, *vmax)
+        }
+
+        // Union of element ranges: Vectorize, Cat (Tinygrad ops.py:765)
+        Op::Vectorize { elements } => sources_range(elements, &uop.dtype),
+        Op::Cat { sources } => sources_range(sources, &uop.dtype),
+
         Op::Unary(op, src) => {
             let (src_min, src_max) = VminVmaxProperty::get(src);
             compute_unary_range(*op, *src_min, *src_max, &uop.dtype)
         }
-
-        // Binary operations
         Op::Binary(op, a, b) => {
             let (a_min, a_max) = VminVmaxProperty::get(a);
             let (b_min, b_max) = VminVmaxProperty::get(b);
             compute_binary_range(*op, *a_min, *a_max, *b_min, *b_max, &uop.dtype)
         }
-
-        // Ternary operations
         Op::Ternary(op, a, b, c) => {
             let (cond_min, cond_max) = VminVmaxProperty::get(a);
             let (true_min, true_max) = VminVmaxProperty::get(b);
@@ -43,50 +52,59 @@ pub fn compute_vmin_vmax(uop: &Arc<UOp>) -> (ConstValue, ConstValue) {
             compute_ternary_range(*op, *cond_min, *cond_max, *true_min, *true_max, *false_min, *false_max, &uop.dtype)
         }
 
-        // DefineVar uses explicit min_val and max_val bounds
-        Op::DefineVar { min_val, max_val, .. } => (ConstValue::Int(*min_val), ConstValue::Int(*max_val)),
-
-        // Range operations go from 0 to end-1
-        Op::Range { end, .. } => {
-            let (_end_min, end_max) = VminVmaxProperty::get(end);
-            let min = ConstValue::Int(0);
-            let max = match end_max {
-                ConstValue::Int(v) => ConstValue::Int(v - 1),
-                ConstValue::UInt(v) => ConstValue::UInt(v - 1),
-                _ => dtype_bounds(&uop.dtype).1,
-            };
-            (min, max)
-        }
-
-        // Cast operations clamp to target dtype bounds
+        // Cast: only narrow for monotone targets (float/signed/index). Tinygrad ops.py:769.
         Op::Cast { src, .. } => {
-            let (src_min, src_max) = VminVmaxProperty::get(src);
-
-            // Check for float special values (NaN, infinity) when casting
-            // These can't be safely clamped and should result in conservative bounds
-            let has_special_values = matches!(src_min, ConstValue::Float(f) if f.is_nan() || f.is_infinite())
-                || matches!(src_max, ConstValue::Float(f) if f.is_nan() || f.is_infinite());
-
-            if has_special_values {
-                // Conservative: return full dtype bounds for special values
-                return dtype_bounds(&uop.dtype);
+            let dt = &uop.dtype;
+            if !(dt.is_float() || dt.is_signed() || *dt == DType::Index) {
+                return dtype_bounds(dt);
             }
-
-            let (target_min, target_max) = dtype_bounds(&uop.dtype);
-
-            // Clamp source range to target bounds, then cast
+            let (src_min, src_max) = VminVmaxProperty::get(src);
+            let has_special = matches!(src_min, ConstValue::Float(f) if f.is_nan() || f.is_infinite())
+                || matches!(src_max, ConstValue::Float(f) if f.is_nan() || f.is_infinite());
+            if has_special {
+                return dtype_bounds(dt);
+            }
+            let (target_min, target_max) = dtype_bounds(dt);
             let clamped_min = clamp_value(*src_min, target_min, target_max);
             let clamped_max = clamp_value(*src_max, target_min, target_max);
-
-            let casted_min = clamped_min.cast(&uop.dtype).unwrap_or(target_min);
-            let casted_max = clamped_max.cast(&uop.dtype).unwrap_or(target_max);
-
-            (casted_min, casted_max)
+            (clamped_min.cast(dt).unwrap_or(target_min), clamped_max.cast(dt).unwrap_or(target_max))
         }
 
-        // Default: return dtype bounds for unsupported operations
         _ => dtype_bounds(&uop.dtype),
     }
+}
+
+/// Range [0, end-1] for Range and Special ops.
+fn zero_to_end_minus_one(end: &Arc<UOp>, dtype: &DType) -> (ConstValue, ConstValue) {
+    use crate::uop::cached_property::CachedProperty;
+    use crate::uop::properties::VminVmaxProperty;
+    let (_, end_max) = VminVmaxProperty::get(end);
+    let max = match end_max {
+        ConstValue::Int(v) => ConstValue::Int(v - 1),
+        ConstValue::UInt(v) => ConstValue::UInt(v - 1),
+        _ => dtype_bounds(dtype).1,
+    };
+    (ConstValue::Int(0), max)
+}
+
+/// Union of ranges across multiple UOp sources (Vectorize, Cat).
+fn sources_range(sources: &[Arc<UOp>], dtype: &DType) -> (ConstValue, ConstValue) {
+    use crate::uop::cached_property::CachedProperty;
+    use crate::uop::properties::VminVmaxProperty;
+    if sources.is_empty() { return dtype_bounds(dtype); }
+    let (first_min, first_max) = VminVmaxProperty::get(&sources[0]);
+    sources.iter().skip(1).fold((*first_min, *first_max), |(vmin, vmax), src| {
+        let (s_min, s_max) = VminVmaxProperty::get(src);
+        (min_value(vmin, *s_min), max_value(vmax, *s_max))
+    })
+}
+
+/// Union of ranges across ConstValue slice (VConst).
+fn sources_range_values(values: &[ConstValue], dtype: &DType) -> (ConstValue, ConstValue) {
+    if values.is_empty() { return dtype_bounds(dtype); }
+    values.iter().skip(1).fold((values[0], values[0]), |(vmin, vmax), &v| {
+        (min_value(vmin, v), max_value(vmax, v))
+    })
 }
 
 // ============================================================================
@@ -548,44 +566,26 @@ fn eval_four_corners(
 }
 
 /// Get the minimum and maximum values for a dtype.
+///
+/// Uses the base scalar type for bounds, matching Tinygrad's `dtype.scalar()` approach.
 fn dtype_bounds(dtype: &DType) -> (ConstValue, ConstValue) {
-    use ConstValue::*;
+    use morok_dtype::ScalarDType as S;
 
-    // Constants for float16/bfloat16 bounds
-    const FLOAT16_MIN: f64 = -65504.0;
-    const FLOAT16_MAX: f64 = 65504.0;
-    const BFLOAT16_MIN: f64 = -3.38953e38;
-    const BFLOAT16_MAX: f64 = 3.38953e38;
-
-    if dtype == &DType::Bool {
-        (Bool(false), Bool(true))
-    } else if dtype == &DType::Int8 {
-        (Int(i8::MIN as i64), Int(i8::MAX as i64))
-    } else if dtype == &DType::Int16 {
-        (Int(i16::MIN as i64), Int(i16::MAX as i64))
-    } else if dtype == &DType::Int32 {
-        (Int(i32::MIN as i64), Int(i32::MAX as i64))
-    } else if dtype == &DType::Int64 {
-        (Int(i64::MIN), Int(i64::MAX))
-    } else if dtype == &DType::UInt8 {
-        (UInt(u8::MIN as u64), UInt(u8::MAX as u64))
-    } else if dtype == &DType::UInt16 {
-        (UInt(u16::MIN as u64), UInt(u16::MAX as u64))
-    } else if dtype == &DType::UInt32 {
-        (UInt(u32::MIN as u64), UInt(u32::MAX as u64))
-    } else if dtype == &DType::UInt64 {
-        (UInt(u64::MIN), UInt(u64::MAX))
-    } else if dtype == &DType::Float16 {
-        (Float(FLOAT16_MIN), Float(FLOAT16_MAX))
-    } else if dtype == &DType::BFloat16 {
-        (Float(BFLOAT16_MIN), Float(BFLOAT16_MAX))
-    } else if dtype == &DType::Float32 {
-        (Float(f32::MIN as f64), Float(f32::MAX as f64))
-    } else if dtype == &DType::Float64 {
-        (Float(f64::MIN), Float(f64::MAX))
-    } else {
-        // Default for unknown types
-        (Int(0), Int(i64::MAX))
+    match dtype.base() {
+        S::Bool => (ConstValue::Bool(false), ConstValue::Bool(true)),
+        S::Int8 => (ConstValue::Int(i8::MIN as i64), ConstValue::Int(i8::MAX as i64)),
+        S::Int16 => (ConstValue::Int(i16::MIN as i64), ConstValue::Int(i16::MAX as i64)),
+        S::Int32 => (ConstValue::Int(i32::MIN as i64), ConstValue::Int(i32::MAX as i64)),
+        S::Int64 | S::Index => (ConstValue::Int(i64::MIN), ConstValue::Int(i64::MAX)),
+        S::UInt8 => (ConstValue::UInt(u8::MIN as u64), ConstValue::UInt(u8::MAX as u64)),
+        S::UInt16 => (ConstValue::UInt(u16::MIN as u64), ConstValue::UInt(u16::MAX as u64)),
+        S::UInt32 => (ConstValue::UInt(u32::MIN as u64), ConstValue::UInt(u32::MAX as u64)),
+        S::UInt64 => (ConstValue::UInt(u64::MIN), ConstValue::UInt(u64::MAX)),
+        S::FP8E4M3 | S::FP8E5M2 | S::Float16 => (ConstValue::Float(-65504.0), ConstValue::Float(65504.0)),
+        S::BFloat16 => (ConstValue::Float(-3.38953e38), ConstValue::Float(3.38953e38)),
+        S::Float32 => (ConstValue::Float(f32::MIN as f64), ConstValue::Float(f32::MAX as f64)),
+        S::Float64 => (ConstValue::Float(f64::MIN), ConstValue::Float(f64::MAX)),
+        S::Void => (ConstValue::Int(0), ConstValue::Int(0)),
     }
 }
 

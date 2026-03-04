@@ -306,6 +306,7 @@ pub fn symbolic_simple() -> TypedPatternMatcher {
         + comparison_dsl_patterns()
         + boolean_dsl_patterns()
         + minmax_dsl_patterns()
+        + where_bound_patterns()
         + power_dsl_patterns()
         + negation_dsl_patterns()
         + range_based_mod_div_patterns()
@@ -500,18 +501,10 @@ pub fn range_based_mod_div_patterns() -> TypedPatternMatcher {
             let (vmin, vmax) = VminVmaxProperty::get(x);
             if let (ConstValue::Int(min), ConstValue::Int(max), ConstValue::Int(n_int)) = (vmin, vmax, n_val)
                 && n_int > 0 {
-                    // Compute floor division for min and max
-                    let min_div = if *min >= 0 {
-                        *min / n_int
-                    } else {
-                        // For negative numbers: floor division rounds toward negative infinity
-                        (*min - n_int + 1) / n_int
-                    };
-                    let max_div = if *max >= 0 {
-                        *max / n_int
-                    } else {
-                        (*max - n_int + 1) / n_int
-                    };
+                    // Truncation division (Rust's `/` rounds toward zero) matches Morok's
+                    // IDIV semantics. n_int > 0 is already guarded above.
+                    let min_div = *min / n_int;
+                    let max_div = *max / n_int;
                     // If both endpoints divide to the same value, all values in range do too
                     if min_div == max_div {
                         trace!(
@@ -933,6 +926,16 @@ pub fn alu_folding_dsl_patterns() -> TypedPatternMatcher {
         // (x - c1) - c2 → x - (c1 + c2)
         Sub(Sub(x, c1 @const(c1_val)), _c2 @const(c2_val))
           => x.try_sub(&UOp::const_(c1.dtype(), eval_add_typed(c1_val, c2_val, c1.dtype().base())?)).ok(),
+
+        // SUB canonicalization: a - (b - x) → x + (a - b)
+        // Morok keeps SUB as a first-class IR op, unlike Tinygrad which canonicalizes
+        // a-b to ADD(a, NEG(b)). Nested SUBs like Sub(4, Sub(3, range)) don't fold
+        // naturally, so we canonicalize to expose the inner variable:
+        //   Sub(4, Sub(3, range)) → Add(range, Sub(4, 3)) → Add(range, 1)
+        Sub(a, Sub(b, x)) => |a, b, x| {
+            let diff = a.try_sub(b).ok()?;
+            x.try_add(&diff).ok()
+        },
     }
 }
 
@@ -1530,14 +1533,58 @@ pub fn boolean_dsl_patterns() -> TypedPatternMatcher {
     }
 }
 
-/// Min/max patterns.
+/// Min/max elimination via bounds analysis.
 ///
-/// - max(x, x) → x
-/// - min(x, x) → x (via Min = negated Max)
+/// Based on Tinygrad symbolic.py:213:
+///   `max(x, y) → x if x.vmin >= y.vmax else y if x.vmax <= y.vmin`
 pub fn minmax_dsl_patterns() -> TypedPatternMatcher {
     patterns! {
-        // max(x, x) → x
         Max(x, x) ~> |x| x.clone(),
+        Max(x, y) => |x, y| {
+            let (x_vmin, x_vmax) = VminVmaxProperty::get(x);
+            let (y_vmin, y_vmax) = VminVmaxProperty::get(y);
+            if cv_ge(x_vmin, y_vmax) { return Some(Arc::clone(x)); }
+            if cv_ge(y_vmin, x_vmax) { return Some(Arc::clone(y)); }
+            None
+        },
+    }
+}
+
+/// WHERE condition elimination via bounds analysis.
+///
+/// Eliminates WHERE(Lt) when the condition is provably always true or false.
+/// Uses vmin/vmax to determine if x < c holds for all possible values.
+pub fn where_bound_patterns() -> TypedPatternMatcher {
+    patterns! {
+        Where(Lt(x, c), t, f) => |x, c, t, f| {
+            let (x_vmin, x_vmax) = VminVmaxProperty::get(x);
+            let (c_vmin, c_vmax) = VminVmaxProperty::get(c);
+            // Always true: x.vmax < c.vmin → take true branch
+            if cv_lt(x_vmax, c_vmin) { return Some(Arc::clone(t)); }
+            // Always false: x.vmin >= c.vmax → take false branch
+            if cv_ge(x_vmin, c_vmax) { return Some(Arc::clone(f)); }
+            None
+        },
+    }
+}
+
+/// Compare ConstValue: a >= b
+fn cv_ge(a: &ConstValue, b: &ConstValue) -> bool {
+    match (a, b) {
+        (ConstValue::Int(a), ConstValue::Int(b)) => a >= b,
+        (ConstValue::UInt(a), ConstValue::UInt(b)) => a >= b,
+        (ConstValue::Float(a), ConstValue::Float(b)) => a >= b,
+        _ => false,
+    }
+}
+
+/// Compare ConstValue: a < b
+fn cv_lt(a: &ConstValue, b: &ConstValue) -> bool {
+    match (a, b) {
+        (ConstValue::Int(a), ConstValue::Int(b)) => a < b,
+        (ConstValue::UInt(a), ConstValue::UInt(b)) => a < b,
+        (ConstValue::Float(a), ConstValue::Float(b)) => a < b,
+        _ => false,
     }
 }
 

@@ -106,6 +106,11 @@ pub(crate) fn load_external_data(tensor: &TensorProto, model_dir: &Path) -> Resu
 /// Create Tensor from raw bytes, shape, and dtype.
 pub(crate) fn create_tensor_from_raw(data: &[u8], dims: &[usize], dtype: DType) -> Result<Tensor> {
     let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
+    // Empty data: return empty tensor (avoids bytemuck alignment panic on zero-length slices)
+    if data.is_empty() {
+        let empty: &[f32] = &[];
+        return Tensor::from_slice(empty).try_reshape(&shape).map_err(Error::from);
+    }
     macro_rules! typed {
         ($ty:ty) => {{
             let values: Vec<$ty> = bytemuck::cast_slice(data).to_vec();

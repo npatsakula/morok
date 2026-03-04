@@ -816,7 +816,6 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let buf = if let Op::Vectorize { elements } = buffer.op() { elements.first()?.clone() } else { buffer.clone() };
 
     // Generate scalar INDEX ops and simplify.
-    // Extract per-lane scalar gate from vector gate (Tinygrad: vec.gep(i) through WHERE-Invalid).
     let scalar_indices: Vec<_> = (0..count)
         .map(|i| {
             let lane_gate = gate.as_ref().map(|g| if g.dtype().vcount() > 1 { g.gep(vec![i]) } else { g.clone() });

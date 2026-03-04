@@ -348,9 +348,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 
         Op::Vectorize { elements } => {
             let vals: Vec<String> = elements.iter().map(|e| ctx.get(e).to_string()).collect();
-            let out_dtype = c_dtype(&uop.dtype());
-            let expr = format!("({out_dtype}){{{}}}", vals.join(", "));
-            ctx.emit_expr(uop, expr, "vec", kernel);
+            if matches!(uop.dtype(), DType::Ptr { .. }) {
+                // Ptr types can't be vectorized in C (no compound literal for pointers).
+                // All elements should be the same scalar pointer — use the first one.
+                ctx.emit_expr(uop, vals[0].clone(), "vec", kernel);
+            } else {
+                let out_dtype = c_dtype(&uop.dtype());
+                let expr = format!("({out_dtype}){{{}}}", vals.join(", "));
+                ctx.emit_expr(uop, expr, "vec", kernel);
+            }
             Some(())
         }
 

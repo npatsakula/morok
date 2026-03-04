@@ -227,11 +227,13 @@ pub(crate) fn op_gather_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Resul
             flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
         }
 
-        let _elems_per_batch = inner_x.iter().product::<usize>();
         let batch_stride = inner_x[..last_inner].iter().product::<usize>();
         let batch_offset_arr =
             Tensor::arange(0, Some(batch_size as i64), None)?.try_mul(&Tensor::from_slice([batch_stride as i64]))?;
         let gather_inner = idx_flat_dims[1..idx_flat_dims.len() - 1].iter().product::<usize>();
+        // Ensure flat_idx has shape [batch_size, gather_inner] before adding batch_offset,
+        // otherwise broadcasting produces incorrect shapes when gather_inner == 1.
+        flat_idx = flat_idx.try_reshape(&[batch_size as isize, gather_inner as isize])?;
         let batch_offset = batch_offset_arr
             .try_reshape(&[batch_size as isize, 1])?
             .try_expand(&[batch_size as isize, gather_inner as isize])?;

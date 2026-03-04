@@ -818,9 +818,11 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
     }
 }
 
-/// Pattern matcher for reduction simplifications (reduce_unparented, reduce_collapse).
-/// Must run AFTER ReduceAxis → REDUCE conversion (Step 7) because these match Op::Reduce.
-pub fn reduction_simplify_patterns() -> TypedPatternMatcher {
+/// Pattern matcher for reduce_unparented: remove ranges not referenced by body.
+///
+/// Factored out so it can be shared between `pm_reduce_simplify` and the inner
+/// `reduce_collapse` pattern matchers without duplication.
+fn pm_reduce_unparented() -> TypedPatternMatcher {
     crate::patterns! {
         reduce @ Reduce { src, ranges, reduce_op: Add | Mul | Max | Min } => |reduce, src, ranges, reduce_op| {
             #[allow(clippy::mutable_key_type)]
@@ -857,23 +859,23 @@ pub fn reduction_simplify_patterns() -> TypedPatternMatcher {
 
             Some(result)
         },
-
-        // Reduce distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
-        // Based on Tinygrad pm_reduce_collapse (simplify.py:104-105)
-        // This enables optimization when sum terms have different loop dependencies.
-        // NOTE: Pattern DSL cannot match nested struct in head, so we check src.op() in closure.
-        Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add => |src, ranges| {
-            // Check if src is an ADD operation
-            let Op::Binary(BinaryOp::Add, x, y) = src.op() else { return None };
-
-            let x_reduced = x.reduce(ranges.clone(), ReduceOp::Add);
-            let y_reduced = y.reduce(ranges.clone(), ReduceOp::Add);
-            x_reduced.try_add(&y_reduced).ok()
-        },
-
-        Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add
-            => |src, ranges| super::transforms::reduce_collapse(src, ranges),
     }
+}
+
+/// Pattern matcher for reduction simplifications (mega-pass path).
+///
+/// Matches Tinygrad's `pm_reduce_simplify`:
+/// - `pm_reduce_unparented`: remove ranges not referenced by body
+/// - `REDUCE(ADD) → reduce_collapse(src, ranges)`: delegate to procedural wrapper
+///
+/// No duplication of distributive or bound patterns — those live inside
+/// `reduce_collapse_inner_patterns()` and run via `reduce_collapse`.
+pub fn pm_reduce_simplify() -> TypedPatternMatcher {
+    pm_reduce_unparented()
+        + crate::patterns! {
+            Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add
+                => |src, ranges| super::transforms::reduce_collapse(src, ranges),
+        }
 }
 
 // ============================================================================
@@ -1982,14 +1984,41 @@ fn is_const_zero(u: &Arc<UOp>) -> bool {
     if let Op::Const(cv) = u.op() { cv.0.is_zero() } else { false }
 }
 
-/// Compute minimum of two UOps: min(a, b) = where(a < b, a, b)
+/// Compute minimum of two UOps: min(a, b) = -max(-a, -b)
+///
+/// Tinygrad encodes min this way (not as WHERE) so that the MAX bounds
+/// elimination rule `max(x, y) → x when x.vmin >= y.vmax` can simplify
+/// boundary cases like `min(x, N)` when `x.vmax == N`.
 fn uop_min(a: &Arc<UOp>, b: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let cond = a.try_cmplt(b).ok()?;
-    UOp::try_where(cond, a.clone(), b.clone()).ok()
+    let neg_a = a.neg();
+    let neg_b = b.neg();
+    let max_neg = neg_a.try_max(&neg_b).ok()?;
+    Some(max_neg.neg())
 }
 
 /// Try to collapse a REDUCE with conditional/gated patterns.
 ///
+/// Core gated collapse logic shared by NE (Pattern 3) and EQ (Pattern 3b).
+///
+/// Substitutes range with `idx.cast(r.dtype).valid(in_bounds)` in the expression,
+/// producing `where(in_bounds, expr[r:=valid_idx], 0)`.
+fn gated_collapse_core(
+    idx: &Arc<UOp>,
+    range: &Arc<UOp>,
+    end: &Arc<UOp>,
+    expr: &Arc<UOp>,
+) -> Option<Arc<UOp>> {
+    let idx_casted = idx.cast(range.dtype());
+    let zero = UOp::index_const(0);
+    let in_bounds = idx_casted.try_cmpge(&zero).ok()?.try_and_op(&idx_casted.try_cmplt(end).ok()?).ok()?;
+    let valid_idx = idx_casted.valid(in_bounds.clone());
+    #[allow(clippy::mutable_key_type)]
+    let subs: std::collections::HashMap<UOpKey, Arc<UOp>> = [(UOpKey(range.clone()), valid_idx)].into_iter().collect();
+    let substituted = expr.substitute(&subs);
+    let zero_like = UOp::const_(expr.dtype(), ConstValue::zero(expr.dtype().base()));
+    UOp::try_where(in_bounds, substituted, zero_like).ok()
+}
+
 /// This implements reduction collapse patterns from Tinygrad (simplify.py:93-108):
 /// 1. Sum of `where(r < cut, 0, val)` → `clamp(end-cut, 0, end) * val`
 /// 2. Sum of `where(r < cut, val, 0)` → `clamp(cut, 0, end) * val`
@@ -2079,40 +2108,31 @@ fn try_reduce_collapse(
         return count_casted.try_mul(false_val).ok();
     }
 
-    // Pattern 3: where(idx != r, 0, expr) → where(v, expr[r:=idx.valid(v)], 0)
-    // Also handles .or_casted(): where(idx != Cast(r), 0, expr)
-    // Follows Tinygrad: substitute r with idx.cast(r.dtype).valid(v), not raw idx.
-    // This attaches the validity predicate to the index inside the expression,
-    // ensuring out-of-bounds indices produce INVALID at the computation level
-    // rather than computing with garbage values then discarding.
-    if let Op::Binary(BinaryOp::Ne, idx, ne_range) = cond.op()
-        && is_const_zero(true_val)
-        && no_range(idx)
+    // Pattern 3: where(idx != r, 0, expr) — NE gated collapse
+    // Pattern 3b: where(idx == r, expr, 0) — EQ gated collapse (Morok-specific)
+    //
+    // Both collapse to: where(in_bounds, expr[r:=idx.valid(v)], 0)
+    // NE: idx != r with zero in true_val, expression in false_val
+    // EQ: idx == r with expression in true_val, zero in false_val
+    // Also handles .or_casted(): unwraps CAST around the range operand.
     {
-        // Unwrap optional CAST around the range (or_casted pattern)
-        let actual_range = if let Op::Cast { src, .. } = ne_range.op() { src } else { ne_range };
+        let (idx, cmp_range, expr) = match cond.op() {
+            // NE: where(idx != range_side, 0, expr) — Tinygrad pattern
+            Op::Binary(BinaryOp::Ne, idx, ne_range) if is_const_zero(true_val) && no_range(idx) => {
+                Some((idx, ne_range, false_val))
+            }
+            // EQ: where(idx == range_side, expr, 0) — Morok-specific
+            Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => {
+                if no_range(lhs) { Some((lhs, rhs, true_val)) }
+                else if no_range(rhs) { Some((rhs, lhs, true_val)) }
+                else { None }
+            }
+            _ => None,
+        }?;
 
+        let actual_range = if let Op::Cast { src, .. } = cmp_range.op() { src } else { cmp_range };
         if Arc::ptr_eq(actual_range, range) {
-            // Cast idx to range dtype (Tinygrad: idx.cast(r.dtype))
-            let idx_casted = idx.cast(range.dtype());
-
-            // Build bounds check: v = (idx_casted >= 0) & (idx_casted < end)
-            let zero = UOp::index_const(0);
-            let ge_zero = idx_casted.try_cmpge(&zero).ok()?;
-            let lt_end = idx_casted.try_cmplt(end).ok()?;
-            let in_bounds = ge_zero.try_and_op(&lt_end).ok()?;
-
-            // Substitute range with idx.cast(r.dtype).valid(v) in the expression
-            // (Tinygrad: expr.substitute({r: idx.cast(r.dtype).valid(v)}))
-            let valid_idx = idx_casted.valid(in_bounds.clone());
-            #[allow(clippy::mutable_key_type)]
-            let subs: std::collections::HashMap<UOpKey, Arc<UOp>> =
-                [(UOpKey(range.clone()), valid_idx)].into_iter().collect();
-            let substituted = false_val.substitute(&subs);
-
-            // where(v, substituted, 0)
-            let zero_like = UOp::const_(false_val.dtype(), ConstValue::zero(false_val.dtype().base()));
-            return UOp::try_where(in_bounds, substituted, zero_like).ok();
+            return gated_collapse_core(idx, range, end, expr);
         }
     }
 
@@ -2268,6 +2288,40 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     None
 }
 
+/// Arithmetic lifting for EQ comparisons (Morok-specific).
+///
+/// Isolates range-containing operands from arithmetic in EQ conditions:
+/// - (x + y) == c → x == (c - y) or y == (c - x)
+/// - (x - y) == c → x == (c + y) or y == (x - c)
+/// - Cast(x ± y) == c → same with c cast to inner dtype
+fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Binary(BinaryOp::Eq, lhs, rhs) = cond.op() else { return None };
+    if !no_range(rhs) { return None; }
+
+    // Unwrap optional CAST, adjusting rhs to inner dtype
+    let (inner_lhs, effective_rhs) = if let Op::Cast { src, .. } = lhs.op() {
+        (src.as_ref(), rhs.cast(src.dtype()))
+    } else {
+        (lhs.as_ref(), rhs.clone())
+    };
+
+    match inner_lhs.op() {
+        Op::Binary(BinaryOp::Add, x, y) if no_range(y) => {
+            x.try_cmpeq(&effective_rhs.try_sub(y).ok()?).ok()
+        }
+        Op::Binary(BinaryOp::Add, x, y) if no_range(x) => {
+            y.try_cmpeq(&effective_rhs.try_sub(x).ok()?).ok()
+        }
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(y) => {
+            x.try_cmpeq(&effective_rhs.try_add(y).ok()?).ok()
+        }
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(x) => {
+            y.try_cmpeq(&x.try_sub(&effective_rhs).ok()?).ok()
+        }
+        _ => None,
+    }
+}
+
 /// Arithmetic lifting for Ge comparisons.
 ///
 /// Lifts operations out of Ge comparisons when they don't depend on ranges:
@@ -2281,22 +2335,14 @@ fn try_lift_arithmetic_from_ge(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Pattern: (x + y) >= c → x >= (c - y) when y is range-free
-    if let Op::Binary(BinaryOp::Add, x, y) = lhs.op()
-        && no_range(y)
-    {
-        let new_rhs = rhs.try_sub(y).ok()?;
-        return x.try_cmpge(&new_rhs).ok();
-    }
-
-    // Also try: (y + x) >= c → x >= (c - y) when y is range-free
-    // (covered by the above since Add is commutative in the pattern, but in case
-    // canonicalization put the range-free operand first)
-    if let Op::Binary(BinaryOp::Add, y, x) = lhs.op()
-        && no_range(y)
-    {
-        let new_rhs = rhs.try_sub(y).ok()?;
-        return x.try_cmpge(&new_rhs).ok();
+    // (x + y) >= c → x >= (c - y) when y is range-free
+    if let Op::Binary(BinaryOp::Add, x, y) = lhs.op() {
+        if no_range(y) {
+            return x.try_cmpge(&rhs.try_sub(y).ok()?).ok();
+        }
+        if no_range(x) {
+            return y.try_cmpge(&rhs.try_sub(x).ok()?).ok();
+        }
     }
 
     None
@@ -2359,35 +2405,30 @@ pub fn build_reduce_collapse_matcher() -> TypedPatternMatcher<()> {
     reduce_collapse_inner_patterns() + crate::symbolic::symbolic_simple()
 }
 
-/// Non-REDUCE patterns from `pm_load_collapse`.
+/// Extended pattern matcher for `reduce_load_collapse`.
 ///
-/// Contains all `pm_load_collapse` patterns EXCEPT the REDUCE matcher
-/// (which calls `reduce_load_collapse` and would cause infinite recursion
-/// if included in `build_reduce_load_collapse_matcher`).
-fn pm_load_collapse_non_reduce() -> TypedPatternMatcher<()> {
+/// Combines the basic `reduce_collapse` patterns with NE lifting, EQ lifting,
+/// and index overflow undo patterns. These are only needed in the per-kernel
+/// `reduce_load_collapse` path, matching Tinygrad where NE lifting is only
+/// in `pm_reduce_load_collapse`.
+///
+/// Does NOT include the REDUCE→reduce_load_collapse call to avoid infinite recursion.
+pub fn build_reduce_load_collapse_matcher() -> TypedPatternMatcher<()> {
+    build_reduce_collapse_matcher() + ne_lifting_patterns()
+}
+
+/// NE lifting patterns for the extended `reduce_load_collapse` path.
+///
+/// Matches Tinygrad's `pm_reduce_load_collapse` additions over `pm_reduce_collapse`:
+/// NE lifting is only needed here (not in the basic matcher).
+/// EQ lifting is in the basic matcher since Morok uses EQ directly
+/// (unlike Tinygrad which decomposes eq() as ne().not()).
+///
+/// Note: index overflow undo lives in `pm_load_collapse()` (the outer matcher),
+/// not here — inside reduce_collapse, external inputs are DEFINE_VARs with no loads,
+/// so `!no_load(x)` never matches.
+fn ne_lifting_patterns() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        // Arithmetic lifting: (x + y) < c or (x * y) < c
-        cond @ Lt(_lhs @ Add(_, _), rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-        cond @ Lt(_lhs @ Mul(_, _), rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-
-        // .or_casted() variants: Cast(Add(x,y)) < c, Cast(Mul(x,y)) < c
-        cond @ Lt(Cast { src: _inner @ Add(_, _), .. }, rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-        cond @ Lt(Cast { src: _inner @ Mul(_, _), .. }, rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-
-        // MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
-        Mul[x, Cast { src: gate, .. }] if gate.dtype() == DType::Bool => |x, gate| {
-            let zero = UOp::const_(x.dtype(), ConstValue::zero(x.dtype().base()));
-            UOp::try_where(gate.clone(), x.clone(), zero).ok()
-        },
-
         // NE lifting: (x + y) != c → x != (c - y) when no_range(y, c)
         Ne(Add(x, y), c) if no_range(y) && no_range(c) => |x, y, c| {
             let new_c = c.try_sub(y).ok()?;
@@ -2402,69 +2443,31 @@ fn pm_load_collapse_non_reduce() -> TypedPatternMatcher<()> {
             let new_c = casted_c.try_sub(y).ok()?;
             x.try_cmpne(&new_c).ok()
         },
-
-        // Index overflow protection: (x:index + y) < c → x < (c - y)
-        Lt(Add(x, y), c)
-            if x.dtype() == DType::Index && !no_load(x) && no_load(y) && no_load(c)
-            => |x, y, c| {
-                let new_c = c.try_sub(y).ok()?;
-                x.try_cmplt(&new_c).ok()
-            },
     }
-}
-
-/// Extended pattern matcher for `reduce_load_collapse`.
-///
-/// Combines `pm_load_collapse` non-REDUCE patterns (including `.or_casted()` variants,
-/// NE lifting, index overflow protection) with `pm_reduce_collapse` inner patterns
-/// and full symbolic simplification.
-///
-/// Does NOT include the REDUCE→reduce_load_collapse call to avoid infinite recursion.
-pub fn build_reduce_load_collapse_matcher() -> TypedPatternMatcher<()> {
-    pm_load_collapse_non_reduce() + reduce_collapse_inner_patterns() + crate::symbolic::symbolic_simple()
 }
 
 /// Reduce-specific algebraic patterns for use inside `reduce_collapse`.
 ///
-/// Based on Tinygrad's pm_reduce_collapse:
+/// Based on Tinygrad's pm_reduce_collapse (simplify.py:87-111):
 /// 1. reduce_unparented: remove ranges not used by src
-/// 2. bound-from-below/above/two-sided (via try_reduce_collapse)
-/// 3. distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
-/// 4. DEFINE_VAR factoring: (dv & y).where(c,0).reduce(ADD) → y.where(c,0).reduce(ADD) * dv
-/// 5. arithmetic lifting: (x+y)<c → x<(c-y), (x*y)<c → x<ceil(c/y)
-/// 6. MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
+/// 2. Lt lifting: (x+y) < c → x < (c-y), (x*y) < c → x < ceil(c/y), including .or_casted()
+/// 3. Ge lifting: (x+y) >= c → x >= (c-y)
+/// 4. Distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
+/// 5. Bound-from-below/above/two-sided/gated collapse on REDUCE(ADD)
+/// 6. DEFINE_VAR factoring: (dv & y).where(c,0).reduce(ADD)
+/// 7. MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
+/// 8. EQ lifting: Morok-specific — needed because Morok uses EQ directly from gather,
+///    unlike Tinygrad which decomposes eq() as ne().not() and only needs NE lifting.
 fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
-    crate::patterns! {
-        // 1. reduce_unparented: remove ranges not referenced by body
-        reduce @ Reduce { src, ranges, reduce_op: Add | Mul | Max | Min } => |reduce, src, ranges, reduce_op| {
-            #[allow(clippy::mutable_key_type)]
-            let src_ranges = src.in_scope_ranges();
-            let (parented, unparented) = partition_reduce_ranges(ranges, src_ranges);
-            if unparented.is_empty() { return None; }
-            let mut result = if !parented.is_empty() || reduce.dtype() != src.dtype() {
-                src.reduce(parented, *reduce_op)
-            } else { Arc::clone(src) };
-            match reduce_op {
-                ReduceOp::Add => {
-                    for range in &unparented {
-                        let size = get_range_size(range)?;
-                        let size_casted = cast_to_dtype(&size, &result.dtype())?;
-                        result = result.try_mul(&size_casted).ok()?;
-                    }
-                }
-                ReduceOp::Mul => {
-                    for range in &unparented {
-                        let size = get_range_size(range)?;
-                        let size_casted = cast_to_dtype(&size, &result.dtype())?;
-                        result = result.try_pow(&size_casted).ok()?;
-                    }
-                }
-                ReduceOp::Max | ReduceOp::Min => {}
-            }
-            Some(result)
-        },
+    // Start with reduce_unparented (shared with pm_reduce_simplify)
+    pm_reduce_unparented().with_context()
+    // Lt/Ge arithmetic lifting: push range-free operands to rhs of comparison.
+    // Handles direct and .or_casted() (CAST-wrapped) Add/Mul forms.
+    + crate::patterns! {
+        cond @ Lt(_, rhs) if no_range(rhs) => |cond| try_lift_arithmetic_from_lt(cond),
+        cond @ Ge(_, rhs) if no_range(rhs) => |cond| try_lift_arithmetic_from_ge(cond),
 
-        // 2. Distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
+        // Distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
         Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add => |src, ranges| {
             let Op::Binary(BinaryOp::Add, x, y) = src.op() else { return None };
             let x_reduced = x.reduce(ranges.clone(), ReduceOp::Add);
@@ -2472,7 +2475,9 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
             x_reduced.try_add(&y_reduced).ok()
         },
 
-        // 3. Bound patterns + DEFINE_VAR factoring on REDUCE(ADD)
+        // Bound patterns + DEFINE_VAR factoring on REDUCE(ADD) with single range
+        // These match the synthetic REDUCE created by reduce_collapse's per-range iteration.
+        // Patterns: bound-from-below, bound-from-above, two-sided, gated NE/EQ collapse.
         reduce @ Reduce { src, ranges, reduce_op }
             if !ranges.is_empty() && *reduce_op == ReduceOp::Add
             => |reduce, src, ranges| {
@@ -2480,30 +2485,16 @@ fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
                     .or_else(|| try_define_var_factor(src, ranges))
             },
 
-        // 4. Arithmetic lifting: (x + y) < c → x < (c - y)
-        cond @ Lt(_lhs @ Add(_, _), rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-        cond @ Lt(_lhs @ Mul(_, _), rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-        // 4a. .or_casted() variants: Cast(Add(x,y)) < c, Cast(Mul(x,y)) < c
-        cond @ Lt(Cast { src: _inner @ Add(_, _), .. }, rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-        cond @ Lt(Cast { src: _inner @ Mul(_, _), .. }, rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-        // 4b. Arithmetic lifting for Ge: (x + y) >= c → x >= (c - y)
-        cond @ Ge(_lhs @ Add(_, _), rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_ge(cond)
-        },
-
-        // 5. MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
+        // MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
         Mul[x, Cast { src: gate, .. }] if gate.dtype() == DType::Bool => |x, gate| {
             let zero = UOp::const_(x.dtype(), ConstValue::zero(x.dtype().base()));
             UOp::try_where(gate.clone(), x.clone(), zero).ok()
         },
+
+        // EQ lifting — Morok-specific (Morok generates EQ directly from gather,
+        // unlike Tinygrad which decomposes eq() as ne().not()).
+        // Handles both direct and .or_casted() (CAST-wrapped) Add/Sub forms.
+        cond @ Eq[_, c] if no_range(c) => |cond| try_lift_arithmetic_from_eq(cond),
     }
 }
 

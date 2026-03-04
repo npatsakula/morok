@@ -470,6 +470,15 @@ impl OpRegistry {
 
             // === NN ===
             "MatMul" => inp(inputs, 0).matmul(inp(inputs, 1))?,
+            "MatMulInteger" => {
+                let a = inp(inputs, 0).cast(DType::Int32)?;
+                let b = inp(inputs, 1).cast(DType::Int32)?;
+                let a_zp = inputs.get(2).and_then(|o| o.as_ref()).map(|t| t.cast(DType::Int32)).transpose()?;
+                let b_zp = inputs.get(3).and_then(|o| o.as_ref()).map(|t| t.cast(DType::Int32)).transpose()?;
+                let a = if let Some(zp) = a_zp { a.try_sub(&zp)? } else { a };
+                let b = if let Some(zp) = b_zp { b.try_sub(&zp)? } else { b };
+                a.matmul(&b)?
+            }
             "Gemm" => nn::op_gemm(inputs, node)?,
             "BatchNormalization" => return nn::op_batch_norm(inputs, node),
             "Conv" => nn::op_conv(inputs, node)?,
