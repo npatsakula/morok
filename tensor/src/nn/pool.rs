@@ -199,30 +199,23 @@ impl Tensor {
         }
 
         // Path 3: count_include_pad=true, ceil_mode=true
-        // Ceil-extra padding does NOT count in the average.
-        // Divide by pool(ones_on_regularly_padded, extra_ceil_pads).sum
+        // Regular padding counts in the average, but ceil-extra padding does NOT.
+        // Tinygrad: pool(x, ceil_pads).sum / pool(pad(x, reg_pads).ones_like(), ceil-reg).sum
         let pooled = pad_and_pool(self, &ceil_pads)?;
         let sum_x = pooled.sum_with().axes(axes.clone()).keepdim(false).call()?;
 
-        // Build ones on regularly-padded input, then pool with extra ceil pads
-        // Use input dtype for ones tensor (not hardcoded Float32)
-        let dtype = self.uop().dtype();
-        let ones = Tensor::new(UOp::const_(dtype, ConstValue::Float(1.0)));
-        let mut ones_reg = ones.broadcast_to(&self.shape()?)?;
+        // ones_like of the regularly-padded input (all positions are 1, including reg pads),
+        // then pool with only the extra ceil pads (which add zeros that don't count).
+        let mut padded_self = self.clone();
         if reg_pads.iter().any(|&(b, e)| b != 0 || e != 0) {
             let mut full_pad: Vec<(isize, isize)> = vec![(0, 0); n_batch];
             full_pad.extend_from_slice(&reg_pads);
-            ones_reg = ones_reg.try_pad(&full_pad)?;
+            padded_self = padded_self.try_pad(&full_pad)?;
         }
+        let ones_reg = padded_self.one()?;
         let extra_pads: Vec<(isize, isize)> =
             ceil_pads.iter().zip(reg_pads.iter()).map(|(c, r)| (c.0 - r.0, c.1 - r.1)).collect();
-        let mut ones_extra = ones_reg;
-        if extra_pads.iter().any(|&(b, e)| b != 0 || e != 0) {
-            let mut full_pad: Vec<(isize, isize)> = vec![(0, 0); n_batch];
-            full_pad.extend_from_slice(&extra_pads);
-            ones_extra = ones_extra.try_pad(&full_pad)?;
-        }
-        let pooled_ones = ones_extra.pool(kernel_size, stride, dilation)?;
+        let pooled_ones = pad_and_pool(&ones_reg, &extra_pads)?;
         let sum_ones = pooled_ones.sum_with().axes(axes).keepdim(false).call()?;
         sum_x.try_div(&sum_ones)
     }

@@ -18,9 +18,9 @@ pub fn flat_pads_to_pairs(pads: &[i64]) -> Vec<(isize, isize)> {
 /// based on auto_pad mode (SAME_UPPER: more padding at end; SAME_LOWER: more at begin).
 pub fn auto_pad_split(total_pads: &[isize], auto_pad: AutoPad) -> Vec<isize> {
     let first: Vec<isize> = if auto_pad == AutoPad::SameUpper {
-        total_pads.iter().map(|&p| p / 2).collect()
+        total_pads.iter().map(|&p| p.div_euclid(2)).collect()
     } else {
-        total_pads.iter().map(|&p| p - p / 2).collect()
+        total_pads.iter().map(|&p| p - p.div_euclid(2)).collect()
     };
     let mut result = first.clone();
     result.extend(total_pads.iter().zip(&first).map(|(p, f)| p - f));

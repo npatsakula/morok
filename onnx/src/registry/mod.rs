@@ -302,7 +302,7 @@ impl OpRegistry {
             "Expand" => shape::op_expand(inputs)?,
             "Pad" => shape::op_pad(inputs, node)?,
             "Slice" => shape::op_slice(inputs)?,
-            "Split" => return shape::op_split(inputs, node),
+            "Split" => return shape::op_split(inputs, node, opset_version),
             "Tile" => {
                 let repeats: Vec<usize> = tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as usize).collect();
                 inp(inputs, 0).repeat(&repeats)?
@@ -492,6 +492,17 @@ impl OpRegistry {
             }
             "Gemm" => nn::op_gemm(inputs, node)?,
             "BatchNormalization" => return nn::op_batch_norm(inputs, node),
+            "RNN" => {
+                let hidden_size = get_attr_int(node, "hidden_size", 0) as usize;
+                let out = inp(inputs, 0).rnn(
+                    inp(inputs, 1),
+                    inp(inputs, 2),
+                    inputs.get(3).and_then(|o| o.as_ref()),
+                    inputs.get(5).and_then(|o| o.as_ref()),
+                    hidden_size,
+                )?;
+                return Ok(vec![out.y, out.y_h]);
+            }
             "Conv" => nn::op_conv(inputs, node)?,
             "ConvTranspose" => nn::op_conv_transpose(inputs, node)?,
             "AveragePool" => nn::op_avg_pool(inputs, node)?,
@@ -516,6 +527,7 @@ impl OpRegistry {
             "MeanVarianceNormalization" => nn::op_mean_variance_norm(inputs, node)?,
             "LRN" => nn::op_lrn(inputs, node)?,
             "AffineGrid" => nn::op_affine_grid(inputs, node)?,
+            "GridSample" => nn::op_grid_sample(inputs, node)?,
             "NegativeLogLikelihoodLoss" => return nn::op_nll_loss(inputs, node),
             "SoftmaxCrossEntropyLoss" => return nn::op_softmax_ce_loss(inputs, node),
             "RMSNormalization" => transformer::op_rms_norm(inputs, node)?,

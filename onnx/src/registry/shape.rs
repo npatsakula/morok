@@ -185,7 +185,7 @@ pub(crate) fn op_slice(inputs: &[Option<Tensor>]) -> Result<Tensor> {
 
         // Replicate Python's slice.indices(d): step-dependent clamping
         let (lower, upper) = if step > 0 { (0i64, d) } else { (-1i64, d - 1) };
-        let mut s = starts[i].clamp(-d, d - 1);
+        let mut s = starts[i].clamp(-d, d);
         if s < 0 {
             s += d;
         }
@@ -262,7 +262,7 @@ pub(crate) fn op_slice(inputs: &[Option<Tensor>]) -> Result<Tensor> {
     Ok(result)
 }
 
-pub(crate) fn op_split(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+pub(crate) fn op_split(inputs: &[Option<Tensor>], node: &NodeProto, opset_version: i64) -> Result<Vec<Tensor>> {
     let axis = get_attr_int(node, "axis", 0) as isize;
     let data = inp(inputs, 0);
     let shape = data.shape()?;
@@ -270,10 +270,23 @@ pub(crate) fn op_split(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Ve
     let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
     let dim_size = shape[norm_axis].as_const().unwrap();
 
-    let split_sizes: Vec<usize> = if let Some(split_tensor) = inputs.get(1).and_then(|o| o.as_ref()) {
+    // Opset ≤11: split is an attribute (INTS); opset 13+: split is an optional input tensor
+    let split_sizes: Vec<usize> = if opset_version < 13 {
+        let attr_split = get_attr_ints(node, "split");
+        if attr_split.is_empty() {
+            let n = node.output.len();
+            (0..n).map(|i| dim_size / n + if i < dim_size % n { 1 } else { 0 }).collect()
+        } else {
+            attr_split.iter().map(|&v| v as usize).collect()
+        }
+    } else if let Some(split_tensor) = inputs.get(1).and_then(|o| o.as_ref()) {
         tensor_to_i64_vec(split_tensor)?.iter().map(|&v| v as usize).collect()
     } else {
-        let n = get_attr_int(node, "num_outputs", 0) as usize;
+        // Opset 18+: num_outputs attribute; opset 13: infer from output count
+        let mut n = get_attr_int(node, "num_outputs", 0) as usize;
+        if n == 0 {
+            n = node.output.len();
+        }
         if n == 0 {
             return Err(Error::IrConstruction {
                 details: "Split requires either split input or num_outputs attribute".into(),

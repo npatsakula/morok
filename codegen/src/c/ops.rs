@@ -334,12 +334,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         Op::Gep { vector, indices } => {
             let vec = ctx.get(vector).to_string();
             if indices.len() == 1 {
-                let expr = format!("{vec}[{}]", indices[0]);
+                // Parenthesize to handle precedence: *((float4*)ptr)[i] → (*((float4*)ptr))[i]
+                let expr = format!("({vec})[{}]", indices[0]);
                 ctx.emit_expr(uop, expr, "gep", kernel);
             } else {
                 // Multi-element GEP: build a new vector from extracted elements
                 let out_dtype = c_dtype(&uop.dtype());
-                let elements: Vec<String> = indices.iter().map(|&i| format!("{vec}[{i}]")).collect();
+                let elements: Vec<String> = indices.iter().map(|&i| format!("({vec})[{i}]")).collect();
                 let expr = format!("({out_dtype}){{{}}}", elements.join(", "));
                 ctx.emit_expr(uop, expr, "gep", kernel);
             }

@@ -1,6 +1,9 @@
 use morok_dtype::{DType, ScalarDType};
 use morok_tensor::Tensor;
-use morok_tensor::nn::{AspectRatioPolicy, AutoPad, CoordinateTransformMode, NearestMode, Reduction, ResizeMode};
+use morok_tensor::nn::{
+    AspectRatioPolicy, AutoPad, CoordinateTransformMode, GridSampleMode, GridSamplePaddingMode, NearestMode, Reduction,
+    ResizeMode,
+};
 use morok_tensor::reduce::AxisSpec;
 use morok_tensor::shape_ops::MeshgridIndexing;
 
@@ -460,6 +463,19 @@ pub(crate) fn op_affine_grid(inputs: &[Option<Tensor>], node: &NodeProto) -> Res
     out_shape.extend(spatial_dims.iter().map(|&d| d as isize));
     out_shape.push(ndim as isize);
     Ok(output.try_reshape(&out_shape)?)
+}
+
+// =========================================================================
+// GridSample
+// =========================================================================
+
+pub(crate) fn op_grid_sample(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let x = inp(inputs, 0);
+    let grid = inp(inputs, 1);
+    let mode: GridSampleMode = parse_enum(node, "mode", "linear")?;
+    let padding_mode: GridSamplePaddingMode = parse_enum(node, "padding_mode", "zeros")?;
+    let align_corners = get_attr_int(node, "align_corners", 0) == 1;
+    Ok(x.grid_sample(grid, mode, padding_mode, align_corners)?)
 }
 
 // =========================================================================

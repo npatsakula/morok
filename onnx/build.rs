@@ -55,10 +55,10 @@ fn should_skip(name: &str) -> bool {
         // Control flow iteration (we support If, not Loop/Scan)
         "test_loop",
         "test_scan",
-        // Recurrent ops
+        // Recurrent ops (LSTM/GRU unimplemented, batchwise layout unsupported)
         "test_lstm_",
         "test_gru_",
-        "test_simple_rnn_",
+        "test_simple_rnn_batchwise",
         // Quantization
         "test_quantize",
         "test_dequantize",
@@ -73,8 +73,6 @@ fn should_skip(name: &str) -> bool {
         // Deformable convolution
         "test_basic_deform_conv",
         "test_deform_conv",
-        // Grid sampling
-        "test_gridsample_",
         // Column-to-image
         "test_col2im",
         // NMS

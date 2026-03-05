@@ -1,10 +1,14 @@
 //! Neural network operations: convolution, pooling, normalization.
 
 mod conv;
+mod grid_sample;
 mod norm;
 pub mod pad;
 mod pool;
 mod resize;
+mod rnn;
+
+pub use rnn::RnnOutput;
 
 pub use pad::{auto_pad_split, flat_pads_to_pairs, resolve_pool_pads};
 
@@ -111,6 +115,30 @@ pub enum PadMode {
     /// Wrap around (circular). `[1,2,3]` pad(2,2) → `[2,3,1,2,3,1,2]`.
     #[strum(serialize = "wrap", serialize = "circular")]
     Circular,
+}
+
+/// GridSample interpolation mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, EnumString, Display)]
+pub enum GridSampleMode {
+    #[default]
+    #[strum(serialize = "linear", serialize = "bilinear")]
+    Linear,
+    #[strum(serialize = "nearest")]
+    Nearest,
+    #[strum(serialize = "cubic", serialize = "bicubic")]
+    Cubic,
+}
+
+/// GridSample padding mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, EnumString, Display)]
+pub enum GridSamplePaddingMode {
+    #[default]
+    #[strum(serialize = "zeros")]
+    Zeros,
+    #[strum(serialize = "border")]
+    Border,
+    #[strum(serialize = "reflection")]
+    Reflection,
 }
 
 /// Aspect ratio policy for resize.
