@@ -213,10 +213,7 @@ pub(crate) fn op_instance_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> R
 }
 
 pub(crate) fn op_resize(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
-    let antialias = get_attr_int(node, "antialias", 0);
-    if antialias != 0 {
-        return Err(Error::IrConstruction { details: "Resize: antialias != 0 is not supported".into() });
-    }
+    let antialias = get_attr_int(node, "antialias", 0) != 0;
     let x = inp(inputs, 0);
     let roi: Option<Vec<f64>> = inputs
         .get(1)
@@ -258,6 +255,7 @@ pub(crate) fn op_resize(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<T
         .nearest_mode(nearest_mode)
         .cubic_coeff_a(cubic_coeff)
         .exclude_outside(exclude_outside)
+        .antialias(antialias)
         .extrapolation_value(extrapolation_value)
         .keep_aspect_ratio_policy(policy)
         .maybe_axes(axes.as_deref())

@@ -365,7 +365,9 @@ impl UOp {
     pub fn is_invalid_marker(uop: &Arc<Self>) -> bool {
         match uop.op() {
             Op::Invalid => true,
-            Op::Vectorize { elements } => !elements.is_empty() && elements.iter().all(|e| matches!(e.op(), Op::Invalid)),
+            Op::Vectorize { elements } => {
+                !elements.is_empty() && elements.iter().all(|e| matches!(e.op(), Op::Invalid))
+            }
             _ => false,
         }
     }

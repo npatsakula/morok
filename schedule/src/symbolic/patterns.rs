@@ -1198,8 +1198,12 @@ fn where_on_load_index_transform(
                 continue;
             }
             match node.op() {
-                Op::Range { .. } => { index_ranges.insert(node.id); }
-                Op::Index { .. } => { idx_indices.insert(node.id); }
+                Op::Range { .. } => {
+                    index_ranges.insert(node.id);
+                }
+                Op::Index { .. } => {
+                    idx_indices.insert(node.id);
+                }
                 _ => {}
             }
             node.op().map_child(|child| {
