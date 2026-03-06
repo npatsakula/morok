@@ -394,52 +394,6 @@ pub fn buffer_folding() -> TypedPatternMatcher {
     }
 }
 
-/// Absorb WHERE-Invalid from INDEX indices into the INDEX gate.
-///
-/// PAD lowering creates `WHERE(valid, adjusted_idx, Invalid)` in index positions.
-/// When BUFFERIZE buffers are inlined during the mega-pass, these WHERE-Invalid
-/// expressions can leak from the index domain into the data value path, creating
-/// structures like `WHERE(c, WHERE(c, 0, INVALID), 0)` that crash codegen.
-///
-/// This pattern absorbs the WHERE-Invalid into a gated INDEX *before* buffer inlining,
-/// so Invalid never enters the data domain. Same logic as `pm_lower_index_dtype`
-/// patterns C & D (`index_lowering.rs:210-233`), but running earlier in the mega-pass.
-pub fn absorb_invalid_into_index_gate() -> TypedPatternMatcher {
-    crate::patterns! {
-        // INDEX(buf, [WHERE(cond, idx, Invalid)], gate=None) → INDEX(buf, [idx], gate=cond)
-        node @ Index { buffer, indices, gate: None } if indices.len() == 1 => |node, buffer, indices| {
-            let idx_uop = &indices[0];
-            let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
-                return None;
-            };
-            if !matches!(false_val.op(), Op::Invalid) { return None; }
-
-            Some(UOp::new(Op::Index {
-                buffer: buffer.clone(),
-                indices: smallvec::smallvec![idx.clone()],
-                gate: Some(cond.clone()),
-            }, node.dtype()))
-        },
-
-        // INDEX(buf, [WHERE(cond, idx, Invalid)], gate=Some(g)) → INDEX(buf, [idx], gate=AND(g, cond))
-        node @ Index { buffer, indices, gate: Some(existing_gate) } if indices.len() == 1
-            => |node, buffer, indices, existing_gate| {
-            let idx_uop = &indices[0];
-            let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
-                return None;
-            };
-            if !matches!(false_val.op(), Op::Invalid) { return None; }
-
-            let combined_gate = existing_gate.try_and_op(cond).ok()?;
-            Some(UOp::new(Op::Index {
-                buffer: buffer.clone(),
-                indices: smallvec::smallvec![idx.clone()],
-                gate: Some(combined_gate),
-            }, node.dtype()))
-        },
-    }
-}
-
 /// Pattern matcher for dead axis removal.
 ///
 /// Based on Tinygrad's cleanup_dead_axes (rangeify.py:123-142).
@@ -558,7 +512,27 @@ pub fn buffer_removal() -> TypedPatternMatcher {
 pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
     crate::patterns! {
         @context PcontigConfig;
-        // Partial contiguous removal - ungated INDEX
+        // Partial contiguous removal - ungated INDEX with WHERE-Invalid in indices.
+        // WHERE-Invalid stays in INDEX indices (not extracted to gate). Extract cond,
+        // inline with clean idx, wrap result with WHERE(cond, inlined, 0).
+        // Must be before the general ungated pattern to match first.
+        Index {
+            buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
+            indices: idx_ranges,
+            gate: None
+        } if idx_ranges.len() == 1
+          && matches!(idx_ranges[0].op(), Op::Ternary(morok_ir::TernaryOp::Where, _, _, f) if matches!(f.op(), Op::Invalid))
+        => |buffer, src, buf_ranges, idx_ranges, ctx| {
+            let Op::Ternary(morok_ir::TernaryOp::Where, cond, clean_idx, _) = idx_ranges[0].op() else {
+                unreachable!()
+            };
+            let clean_indices: SmallVec<[Arc<UOp>; 4]> = smallvec::smallvec![clean_idx.clone()];
+            let inlined = apply_pcontig_removal_inner(buffer, src, buf_ranges, &clean_indices, ctx)?;
+            let zero = UOp::const_(inlined.dtype(), ConstValue::zero(inlined.dtype().scalar()?));
+            UOp::try_where(cond.clone(), inlined, zero).ok()
+        },
+
+        // Partial contiguous removal - ungated INDEX (no WHERE-Invalid)
         Index {
             buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
             indices: idx_ranges,
@@ -567,9 +541,9 @@ pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
             apply_pcontig_removal_inner(buffer, src, buf_ranges, idx_ranges, ctx)
         },
 
-        // Partial contiguous removal - gated INDEX (from absorb_invalid_into_index_gate)
-        // Inline the buffer, then wrap with WHERE(gate, inlined, 0) so Invalid never
-        // enters the data path.
+        // Partial contiguous removal - gated INDEX (from pm_move_where_on_load)
+        // Inline the buffer, then wrap with WHERE(gate, inlined, 0) so out-of-bounds
+        // values become zero.
         Index {
             buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
             indices: idx_ranges,
@@ -1443,56 +1417,6 @@ fn is_vectorized_bool(dtype: &DType) -> bool {
     dtype.base() == ScalarDType::Bool && dtype.vcount() > 1
 }
 
-/// Check if an INDEX has a vectorized bool gate.
-fn has_vectorized_bool_gate(index: &Arc<UOp>) -> bool {
-    match index.op() {
-        Op::Index { gate: Some(g), .. } => is_vectorized_bool(&g.dtype()),
-        Op::Cast { src, .. } => has_vectorized_bool_gate(src),
-        _ => false,
-    }
-}
-
-/// Devectorize a LOAD whose INDEX has a vectorized bool gate.
-///
-/// Splits LOAD(INDEX_GATED(buf_vN, idx, Bool_N)) into
-/// VECTORIZE(LOAD(INDEX_GATED(buf[0], idx, Bool[0])), ..., LOAD(INDEX_GATED(buf[N-1], idx, Bool[N-1])))
-fn devectorize_gated_load(load: &Arc<UOp>, index: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Index { buffer, indices, gate: Some(gate) } = index.op() else { return None };
-    let vcount = gate.dtype().vcount();
-    if vcount <= 1 {
-        return None;
-    }
-
-    let scalar_load_dtype = load.dtype().scalar_dtype();
-    let alt = match load.op() {
-        Op::Load { alt, .. } => alt.clone(),
-        _ => None,
-    };
-
-    let elements: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
-        .map(|i| {
-            let buf_i = if buffer.dtype().vcount() > 1 { buffer.gep(vec![i]) } else { buffer.clone() };
-            let gate_i = gate.gep(vec![i]);
-            let idx_i = UOp::index()
-                .buffer(buf_i.clone())
-                .indices(indices.clone())
-                .gate(gate_i)
-                .dtype(buf_i.dtype())
-                .call()
-                .unwrap();
-            match &alt {
-                Some(a) => {
-                    let alt_i = if a.dtype().vcount() > 1 { a.gep(vec![i]) } else { a.clone() };
-                    UOp::load().buffer(buf_i).index(idx_i).dtype(scalar_load_dtype.clone()).alt(alt_i).call()
-                }
-                None => UOp::load().buffer(buf_i).index(idx_i).dtype(scalar_load_dtype.clone()).call(),
-            }
-        })
-        .collect();
-
-    Some(UOp::vectorize(elements))
-}
-
 /// Unified devectorize for any binary op producing vectorized output.
 ///
 /// Handles scalar-vector operand mix (from comparisons like `vec < scalar`).
@@ -1614,11 +1538,6 @@ pub fn pm_bool_devectorize() -> TypedPatternMatcher<()> {
 
         // BITCAST with vectorized bool (cstyle.py:64)
         bc @ BitCast { src: _, .. } if is_vectorized_bool(&bc.dtype()) => devectorize_generic(bc),
-
-        // LOAD from INDEX with vectorized bool gate: split into per-element LOADs.
-        // C ext_vector_type requires gate and value to have same element size,
-        // but bool (1 byte) != float (4 bytes), so we must scalarize.
-        load @ Load { index, .. } if has_vectorized_bool_gate(index) => devectorize_gated_load(load, index),
     }
 }
 

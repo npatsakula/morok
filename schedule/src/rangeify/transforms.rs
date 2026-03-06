@@ -148,7 +148,6 @@ pub fn rangeify_with_map(
         let t_stage = std::time::Instant::now();
         let mega_pass = crate::symbolic::symbolic().with_context::<PcontigConfig>()
             + super::patterns::pm_reduce_simplify().with_context()
-            + super::patterns::absorb_invalid_into_index_gate().with_context()
             + super::patterns::buffer_folding().with_context()
             + super::patterns::dead_axis_removal().with_context()
             + super::patterns::movement_op_patterns().with_context()

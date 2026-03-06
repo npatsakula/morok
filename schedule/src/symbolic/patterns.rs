@@ -183,7 +183,7 @@ pub fn propagate_invalid() -> TypedPatternMatcher {
 
         // Push binary ALU (non-comparison) through WHERE-with-Invalid (left operand)
         // ALU(WHERE(cond, x, Invalid), y) → WHERE(cond, ALU(x, y), Invalid)
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
+        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
             r @ op(Where(cond, x, invalid), y)
                 if matches!(invalid.op(), Op::Invalid)
                 => |r, cond, x, invalid, y| {
@@ -194,7 +194,7 @@ pub fn propagate_invalid() -> TypedPatternMatcher {
 
         // Push binary ALU (non-comparison) through WHERE-with-Invalid (right operand)
         // ALU(y, WHERE(cond, x, Invalid)) → WHERE(cond, ALU(y, x), Invalid)
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
+        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
             r @ op(y, Where(cond, x, invalid))
                 if matches!(invalid.op(), Op::Invalid)
                 => |r, y, cond, x, invalid| {
@@ -227,7 +227,7 @@ pub fn propagate_invalid() -> TypedPatternMatcher {
         // ALU with bare Invalid → Invalid (left position only, right must be Index dtype)
         // Tinygrad symbolic.py:37 — only matches Invalid on LEFT with Index-typed right operand.
         // NOT matching right-position bare Invalid to avoid contaminating non-index computations.
-        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, And, Or, Xor, Shl, Shr] {
+        for op in binary [Add, Mul, Sub, Mod, Max, Idiv, Fdiv, Pow, And, Or, Xor, Shl, Shr] {
             op(invalid, y) if matches!(invalid.op(), Op::Invalid) && y.dtype() == DType::Index
                 => |invalid| { let _ = op; Some(invalid.clone()) },
         },
@@ -1055,11 +1055,12 @@ pub fn dce_dsl_patterns() -> TypedPatternMatcher {
           ~> |x| x.not(),
 
         // WHERE(!cond, t, f) → WHERE(cond, f, t) - negated condition swap
-        // Guard: don't swap when f is Invalid — PAD creates WHERE(valid, idx, Invalid),
+        // Guard: don't swap when f contains Invalid — PAD creates WHERE(valid, idx, Invalid),
         // and swapping would move Invalid to the true branch where downstream patterns can't match it.
+        // Handles both scalar Invalid and vectorized VECTORIZE(Invalid, ...) from expansion.
         // Tinygrad symbolic.py:201-202 has this same guard.
         Where(Not(cond), t, f)
-            if !matches!(f.op(), Op::Invalid)
+            if !has_invalid(f)
             => |cond, t, f| UOp::try_where(Arc::clone(cond), Arc::clone(f), Arc::clone(t)).ok(),
 
         // WHERE(a, WHERE(b, c, d), d) → WHERE(a & b, c, d) - branch merging
@@ -1098,36 +1099,31 @@ pub fn after_simplification_patterns() -> TypedPatternMatcher {
 /// (UPat.var("c1").where(UPat.var("buf").index(UPat.var("x")), 0), where_on_load),
 /// ```
 ///
+/// Moved clauses are embedded as WHERE(cond, idx, Invalid) in indices[0] instead of
+/// the gate field. This prevents gate vectorization during expansion — pm_lower_index_dtype
+/// extracts the scalar gate after devectorize.
+///
 /// The condition can be moved if:
-/// - The INDEX doesn't already have a gate (or the condition matches it)
 /// - All RANGE dependencies in the condition are within the INDEX's range scope
 /// - The condition doesn't depend on other INDEX operations (avoids speculative loads)
 pub fn pm_move_where_on_load() -> TypedPatternMatcher {
     patterns! {
         // Pattern 1: WHERE(cond, INDEX(buf, idx, None), 0)
-        // Move cond clauses into INDEX gate
+        // Embed cond clauses as WHERE-Invalid in INDEX indices[0]
         // Note: Matches INDEX directly (no LOAD), since this runs at Stage 8
         Where(cond, idx @ Index { buffer: idx_buf, indices, gate: None }, false_val)
             if is_const_zero(false_val)
             => |cond, idx_buf, indices, false_val, idx| {
-                where_on_load_index_transform(cond, idx_buf, indices, None, false_val, idx.dtype())
+                where_on_load_index_transform(cond, idx_buf, indices, false_val, idx.dtype())
             },
 
         // Pattern 2: WHERE(cond, 0, INDEX(buf, idx, None)) - inverted pattern
-        // Use !cond as the gate
+        // Use !cond embedded as WHERE-Invalid
         Where(cond, false_val, idx @ Index { buffer: idx_buf, indices, gate: None })
             if is_const_zero(false_val)
             => |cond, false_val, idx_buf, indices, idx| {
                 let not_cond = cond.not();
-                where_on_load_index_transform(&not_cond, idx_buf, indices, None, false_val, idx.dtype())
-            },
-
-        // Pattern 3: WHERE(cond, INDEX(buf, idx, existing_gate), 0)
-        // Combine cond with existing gate if they're compatible
-        Where(cond, idx @ Index { buffer: idx_buf, indices, gate: Some(existing_gate) }, false_val)
-            if is_const_zero(false_val) && can_combine_gates(cond, existing_gate)
-            => |cond, idx_buf, indices, existing_gate, false_val, idx| {
-                where_on_load_index_transform(cond, idx_buf, indices, Some(existing_gate), false_val, idx.dtype())
+                where_on_load_index_transform(&not_cond, idx_buf, indices, false_val, idx.dtype())
             },
     }
 }
@@ -1145,54 +1141,48 @@ fn is_const_zero(val: &Arc<UOp>) -> bool {
     }
 }
 
-/// Check if two gate conditions can be combined.
-///
-/// Gates can be combined if the new condition is a subset of or equal to the existing gate.
-/// For simplicity, we allow combination when:
-/// - The conditions are identical (Arc::ptr_eq)
-/// - The new condition implies the existing one (cond → existing)
-fn can_combine_gates(cond: &Arc<UOp>, existing_gate: &Arc<UOp>) -> bool {
-    // Same condition - already handled, no change needed
-    if Arc::ptr_eq(cond, existing_gate) {
-        return true;
+/// Check if a UOp is or contains Invalid (scalar or vectorized).
+fn has_invalid(uop: &Arc<UOp>) -> bool {
+    match uop.op() {
+        Op::Invalid => true,
+        Op::Vectorize { elements } => elements.iter().any(|e| matches!(e.op(), Op::Invalid)),
+        _ => false,
     }
-    // For now, be conservative - only combine identical gates
-    // A more sophisticated implementation would check implication
-    false
 }
 
-/// Transform WHERE(cond, INDEX(buf, idx), 0) to WHERE(remaining_cond, INDEX(buf, idx, gate=moved_clauses), 0).
+/// Transform WHERE(cond, INDEX(buf, idx), 0) by embedding moveable clauses as WHERE-Invalid in indices[0].
 ///
 /// This is the Stage 8 version that works directly with INDEX, matching Tinygrad's approach.
 /// LOADs are added later at Stage 13.
 ///
-/// Supports **partial clause movement** (Tinygrad: pm_move_where_on_load):
+/// Supports **partial clause movement** (Tinygrad: where_on_load in symbolic.py):
 /// - Splits condition into AND clauses
 /// - Moves only clauses where ALL ranges are within index scope AND no load dependencies
 /// - Keeps remaining clauses in outer WHERE
-/// - Removes duplicate clauses (already present in existing gate)
+/// - Deduplicates clauses already present in indices[0]'s existing WHERE-Invalid validity
 ///
-/// # Safety Checks per clause
-///
-/// A clause can be moved if:
-/// 1. No duplicate with existing gate clauses (prevents redundant checks)
-/// 2. All RANGE ops in the clause are in the INDEX's scope
-/// 3. No LOAD/INDEX dependencies (prevents speculative load side effects)
+/// Instead of setting the INDEX gate field (which gets vectorized by the expander),
+/// embeds moved clauses as WHERE(combined_cond, clean_idx, Invalid) in indices[0].
+/// pm_lower_index_dtype extracts this after devectorize when the gate is always scalar.
 fn where_on_load_index_transform(
     cond: &Arc<UOp>,
     idx_buf: &Arc<UOp>,
     indices: &SmallVec<[Arc<UOp>; 4]>,
-    existing_gate: Option<&Arc<UOp>>,
     false_val: &Arc<UOp>,
     index_dtype: DType,
 ) -> Option<Arc<UOp>> {
     // Step 1: Split condition into AND clauses
     let c1_clauses = split_and_clauses(cond);
 
-    // Step 2: Get existing gate clauses (if any)
-    let c2_clauses: Vec<Arc<UOp>> = existing_gate.map(split_and_clauses).unwrap_or_default();
+    // Step 2: Get existing validity clauses from indices[0] (handles re-application)
+    let existing_valid = indices.first()?.get_valid();
+    let c2_clauses: Vec<Arc<UOp>> = if matches!(existing_valid.op(), Op::Const(cv) if cv.0 == ConstValue::Bool(true)) {
+        vec![]
+    } else {
+        split_and_clauses(&existing_valid)
+    };
 
-    // Step 3: Find duplicate clauses (already in existing gate)
+    // Step 3: Find duplicate clauses (already in existing validity)
     let duplicate_ids: std::collections::HashSet<u64> =
         c1_clauses.iter().filter(|c| c2_clauses.iter().any(|c2| c.id == c2.id)).map(|c| c.id).collect();
 
@@ -1208,7 +1198,7 @@ fn where_on_load_index_transform(
     // Single DFS per clause: check range scope + index deps simultaneously
     let (moved_clauses, remaining_clauses): (Vec<_>, Vec<_>) = c1_clauses.iter().cloned().partition(|clause| {
         if duplicate_ids.contains(&clause.id) {
-            return true; // Treat as "moved" (but won't add to gate)
+            return true; // Treat as "moved" (but won't add to validity)
         }
 
         let mut ranges_in_scope = true;
@@ -1247,144 +1237,34 @@ fn where_on_load_index_transform(
         return None; // Nothing to move or deduplicate
     }
 
-    // Step 7: Build new gate (moved clauses + existing gate clauses)
-    let mut gate_clauses: Vec<Arc<UOp>> = actually_moved;
-    gate_clauses.extend(c2_clauses);
+    // Step 7: Build combined validity (moved clauses + existing validity)
+    let mut validity_clauses: Vec<Arc<UOp>> = actually_moved;
+    validity_clauses.extend(c2_clauses);
 
-    let new_gate =
-        if gate_clauses.is_empty() { None } else { Some(gate_clauses.into_iter().reduce(|a, b| a.and_(&b)).unwrap()) };
+    // Step 8: Create INDEX with WHERE-Invalid in indices[0], NO gate field
+    let clean_idx = indices.first()?.get_idx();
+    let new_idx = if validity_clauses.is_empty() {
+        clean_idx
+    } else {
+        let combined_valid = validity_clauses.into_iter().reduce(|a, b| a.and_(&b)).unwrap();
+        clean_idx.valid(combined_valid)
+    };
+    let mut new_indices = indices.clone();
+    new_indices[0] = new_idx;
 
-    // Step 8: Create new INDEX with gate
-    let new_index = match new_gate {
-        Some(gate) => UOp::index().buffer(idx_buf.clone()).indices(indices.clone()).gate(gate).call(),
-        None => UOp::index().buffer(idx_buf.clone()).indices(indices.clone()).call(),
-    }
-    .expect("where_on_load_index_transform: INDEX construction failed")
-    .with_dtype(index_dtype);
+    let new_index = UOp::index()
+        .buffer(idx_buf.clone())
+        .indices(new_indices)
+        .call()
+        .expect("where_on_load_index_transform: INDEX construction failed")
+        .with_dtype(index_dtype);
 
     // Step 9: Wrap in remaining WHERE if there are non-moved clauses
     if remaining_clauses.is_empty() {
-        // No remaining clauses - return WHERE with True condition (or just the index?)
-        // Tinygrad returns: remaining_clause.where(new_index, 0)
-        // If no remaining clauses, remaining_clause would be True, so WHERE(True, index, 0) = index
         Some(new_index)
     } else {
-        // Build remaining condition from non-moved clauses
         let remaining_cond = remaining_clauses.into_iter().reduce(|a, b| a.and_(&b)).unwrap();
         UOp::try_where(remaining_cond, new_index, false_val.clone()).ok()
-    }
-}
-
-/// Transform WHERE(cond, LOAD(INDEX(buf, idx)), alt) to LOAD(INDEX(buf, idx, gate=cond), alt).
-///
-/// **Deprecated**: This function is kept for reference but should not be used at Stage 8.
-/// Use `where_on_load_index_transform` instead, which matches Tinygrad's approach.
-///
-/// Supports **partial clause movement** (Tinygrad: pm_move_where_on_load):
-/// - Splits condition into AND clauses
-/// - Moves only clauses where ALL ranges are within index scope AND no load dependencies
-/// - Keeps remaining clauses in outer WHERE
-/// - Removes duplicate clauses (already present in existing gate)
-///
-/// # Safety Checks per clause
-///
-/// A clause can be moved if:
-/// 1. No duplicate with existing gate clauses (prevents redundant checks)
-/// 2. All RANGE ops in the clause are in the INDEX's scope
-/// 3. No LOAD/INDEX dependencies (prevents speculative load side effects)
-#[allow(dead_code)]
-fn where_on_load_transform(
-    cond: &Arc<UOp>,
-    buffer: &Arc<UOp>,
-    idx_buf: &Arc<UOp>,
-    indices: &SmallVec<[Arc<UOp>; 4]>,
-    existing_gate: Option<&Arc<UOp>>,
-    alt: &Arc<UOp>,
-) -> Option<Arc<UOp>> {
-    // Step 1: Split condition into AND clauses
-    let c1_clauses = split_and_clauses(cond);
-
-    // Step 2: Get existing gate clauses (if any)
-    let c2_clauses: Vec<Arc<UOp>> = existing_gate.map(split_and_clauses).unwrap_or_default();
-
-    // Step 3: Find duplicate clauses (already in existing gate)
-    let duplicate_ids: std::collections::HashSet<u64> =
-        c1_clauses.iter().filter(|c| c2_clauses.iter().any(|c2| c.id == c2.id)).map(|c| c.id).collect();
-
-    // Step 4: Collect all RANGE ids reachable from indices (index scope)
-    let mut index_ranges = std::collections::HashSet::new();
-    for idx in indices {
-        for node in idx.toposort() {
-            if matches!(node.op(), Op::Range { .. }) {
-                index_ranges.insert(node.id);
-            }
-        }
-    }
-
-    // Step 5: Partition clauses into moveable vs remaining
-    let (moved_clauses, remaining_clauses): (Vec<_>, Vec<_>) = c1_clauses.iter().cloned().partition(|clause| {
-        // Skip duplicates
-        if duplicate_ids.contains(&clause.id) {
-            return true; // Treat as "moved" (but won't add to gate)
-        }
-
-        // Check all ranges in clause are within index scope
-        let clause_ranges_in_scope = clause
-            .toposort()
-            .iter()
-            .filter(|n| matches!(n.op(), Op::Range { .. }))
-            .all(|r| index_ranges.contains(&r.id));
-
-        if !clause_ranges_in_scope {
-            return false; // Cannot move - out of scope ranges
-        }
-
-        // Check no load dependencies
-        let has_loads = clause.toposort().iter().any(|n| matches!(n.op(), Op::Load { .. } | Op::Index { .. }));
-
-        !has_loads // Can move if no loads
-    });
-
-    // Step 6: If no movement possible and no duplicates removed, return None
-    let actually_moved: Vec<_> = moved_clauses.into_iter().filter(|c| !duplicate_ids.contains(&c.id)).collect();
-
-    if actually_moved.is_empty() && duplicate_ids.is_empty() {
-        return None; // Nothing to move or deduplicate
-    }
-
-    // Step 7: Build new gate (moved clauses + existing gate clauses)
-    let mut gate_clauses: Vec<Arc<UOp>> = actually_moved;
-    gate_clauses.extend(c2_clauses);
-
-    let new_gate =
-        if gate_clauses.is_empty() { None } else { Some(gate_clauses.into_iter().reduce(|a, b| a.and_(&b)).unwrap()) };
-
-    // Step 8: Create new INDEX with gate
-    let new_index = match new_gate {
-        Some(gate) => UOp::index().buffer(idx_buf.clone()).indices(indices.clone()).gate(gate).call(),
-        None => UOp::index().buffer(idx_buf.clone()).indices(indices.clone()).call(),
-    }
-    .expect("where_on_load: INDEX construction failed - types validated by pattern");
-
-    // Step 9: Infer load dtype from buffer
-    let load_dtype = match buffer.dtype() {
-        DType::Ptr { base, .. } => base.as_ref().clone(),
-        other => other,
-    };
-
-    // Step 10: Cast alt value to match load dtype
-    let alt_casted = alt.cast(load_dtype.clone());
-
-    // Step 11: Create new LOAD with alt value
-    let new_load = UOp::load().buffer(buffer.clone()).index(new_index).dtype(load_dtype).alt(alt_casted).call();
-
-    // Step 12: Wrap in remaining WHERE if there are non-moved clauses
-    if remaining_clauses.is_empty() {
-        Some(new_load)
-    } else {
-        // Build remaining condition from non-moved clauses
-        let remaining_cond = remaining_clauses.into_iter().reduce(|a, b| a.and_(&b)).unwrap();
-        UOp::try_where(remaining_cond, new_load, alt.clone()).ok()
     }
 }
 
