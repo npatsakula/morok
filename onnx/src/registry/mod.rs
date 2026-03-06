@@ -380,7 +380,7 @@ impl OpRegistry {
             "Trilu" => indexing::op_trilu(inputs, node)?,
             "OneHot" => indexing::op_one_hot(inputs, node)?,
             "CumSum" => indexing::op_cumsum(inputs, node)?,
-            "ScatterElements" => indexing::op_scatter_elements(inputs, node)?,
+            "Scatter" | "ScatterElements" => indexing::op_scatter_elements(inputs, node)?,
             "ScatterND" => indexing::op_scatter_nd(inputs, node)?,
 
             // === Reductions ===
