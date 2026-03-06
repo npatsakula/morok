@@ -1186,16 +1186,33 @@ fn where_on_load_index_transform(
     let duplicate_ids: std::collections::HashSet<u64> =
         c1_clauses.iter().filter(|c| c2_clauses.iter().any(|c2| c.id == c2.id)).map(|c| c.id).collect();
 
-    // Step 4: Collect all RANGE ids reachable from indices (index scope)
+    // Step 4: Collect RANGE and INDEX ids reachable from indices (index scope)
+    // Tinygrad: idx_index = {u for u in idx.backward_slice_with_self if u.op is Ops.INDEX}
     let mut index_ranges = std::collections::HashSet::new();
+    let mut idx_indices = std::collections::HashSet::new();
     for idx in indices {
-        idx.collect_in_subtree(|n| matches!(n.op(), Op::Range { .. })).into_iter().for_each(|n| {
-            index_ranges.insert(n.id);
-        });
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = vec![idx.clone()];
+        while let Some(node) = stack.pop() {
+            if !visited.insert(Arc::as_ptr(&node)) {
+                continue;
+            }
+            match node.op() {
+                Op::Range { .. } => { index_ranges.insert(node.id); }
+                Op::Index { .. } => { idx_indices.insert(node.id); }
+                _ => {}
+            }
+            node.op().map_child(|child| {
+                if !visited.contains(&Arc::as_ptr(child)) {
+                    stack.push(child.clone());
+                }
+            });
+        }
     }
 
     // Step 5: Partition clauses into moveable vs remaining
     // Single DFS per clause: check range scope + index deps simultaneously
+    // Tinygrad: can_move checks c.ranges <= idx.ranges AND all INDEX ops are in idx_index
     let (moved_clauses, remaining_clauses): (Vec<_>, Vec<_>) = c1_clauses.iter().cloned().partition(|clause| {
         if duplicate_ids.contains(&clause.id) {
             return true; // Treat as "moved" (but won't add to validity)
@@ -1214,9 +1231,9 @@ fn where_on_load_index_transform(
                     ranges_in_scope = false;
                     break; // Out-of-scope range found, can't move
                 }
-                Op::Index { .. } => {
+                Op::Index { .. } if !idx_indices.contains(&node.id) => {
                     has_index_deps = true;
-                    break; // Index dep found, can't move
+                    break; // External INDEX dep found, can't move
                 }
                 _ => {}
             }

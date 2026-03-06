@@ -257,9 +257,10 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:221)
+    // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:232)
+    // Handles both scalar Invalid and vectorized VECTORIZE(Invalid,...) from expansion.
     if let Op::Ternary(TernaryOp::Where, _, _, f) = alu.op()
-        && matches!(f.op(), Op::Invalid)
+        && UOp::is_invalid_marker(f)
     {
         return None;
     }

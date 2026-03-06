@@ -213,7 +213,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
                 return None;
             };
-            if !matches!(false_val.op(), Op::Invalid) { return None; }
+            if !UOp::is_invalid_marker(false_val) { return None; }
 
             Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(cond.clone()) }, node.dtype()))
         },
@@ -226,7 +226,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
                 return None;
             };
-            if !matches!(false_val.op(), Op::Invalid) { return None; }
+            if !UOp::is_invalid_marker(false_val) { return None; }
 
             let combined_gate = existing_gate.try_and_op(cond).ok()?;
             Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(combined_gate) }, node.dtype()))
