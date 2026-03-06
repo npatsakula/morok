@@ -326,6 +326,9 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
     let mut applied = false;
     let upcastable = scheduler.upcastable_dims();
 
+    // Tinygrad caps total masked upcast product at 7*7=49.
+    let mut product: i64 = 1;
+
     for axis_idx in upcastable {
         if !is_masked(scheduler, axis_idx) {
             continue;
@@ -340,8 +343,10 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
             && let morok_ir::ConstValue::Int(size) = cv.0
             && size > 1
             && size <= 7
+            && product * size <= 49
             && apply_opt(scheduler, &Opt::upcast(axis_idx, size as usize), true).is_ok()
         {
+            product *= size;
             applied = true;
         }
     }

@@ -476,8 +476,11 @@ where
         self.pending.insert(root_key.clone());
         let mut stack: Vec<StackEntry> = vec![StackEntry::new(root.clone())];
 
-        // Limit total iterations to catch infinite loops
-        const MAX_TOTAL_ITERATIONS: usize = 100_000;
+        // Limit total iterations to catch infinite loops.
+        // 500K accommodates large kernels with wide VECTORIZE (e.g., 135-element Index
+        // expressions from conv_transpose pool ops) while still catching true infinite loops.
+        // Tinygrad has no hard limit; this is a safety net.
+        const MAX_TOTAL_ITERATIONS: usize = 500_000;
         let mut iterations = 0;
 
         while let Some(StackEntry { original, stage, working, retry_count }) = stack.pop() {

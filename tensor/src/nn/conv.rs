@@ -164,43 +164,52 @@ impl Tensor {
         flat_shape.extend(hw.iter().map(|&k| k as isize));
         w = w.try_reshape(&flat_shape)?;
 
-        // Handle stride > 1: interleave zeros
+        // Handle stride > 1: interleave zeros across all spatial dims at once.
+        // Matches Tinygrad: (k) -> reshape (k,1) -> pad (k,s) -> reshape (k*s) -> shrink (k-(s-1))
+        // All spatial dims are processed in a single reshape/pad/reshape/shrink sequence
+        // to avoid cascading PAD operations that create exponential boolean condition trees.
         let mut x = self.clone();
         if stride.iter().any(|&s| s > 1) {
-            for (j, &s) in stride.iter().enumerate() {
-                if s <= 1 {
-                    continue;
-                }
-                let cur_shape = x.shape()?;
-                let spatial_idx = 2 + j;
-                let k = cur_shape[spatial_idx].as_const().unwrap();
+            let x_shape = x.shape()?;
+            let spatial: Vec<usize> = x_shape[2..].iter().map(|s| s.as_const().unwrap()).collect();
 
-                // insert dim of 1 after spatial dim
-                let mut rshape = morok_ir::shape::to_vec_isize(&cur_shape).context(UOpSnafu)?;
-                rshape.insert(spatial_idx + 1, 1);
-                x = x.try_reshape(&rshape)?;
-
-                // pad: (0, s-1) on the inserted dim
-                let mut pad: Vec<(isize, isize)> = vec![(0, 0); rshape.len()];
-                pad[spatial_idx + 1] = (0, (s - 1) as isize);
-                x = x.try_pad(&pad)?;
-
-                // merge spatial_idx and spatial_idx+1
-                let cur_shape = x.shape()?;
-                let mut rshape = morok_ir::shape::to_vec_isize(&cur_shape).context(UOpSnafu)?;
-                let merged = rshape[spatial_idx] * rshape[spatial_idx + 1];
-                rshape[spatial_idx] = merged;
-                rshape.remove(spatial_idx + 1);
-                x = x.try_reshape(&rshape)?;
-
-                // shrink: remove trailing (s-1) from this dim
-                let cur_shape = x.shape()?;
-                let new_size = k * s - (s - 1);
-                let dims = morok_ir::shape::to_vec_isize(&cur_shape).context(UOpSnafu)?;
-                let mut ranges: Vec<(isize, isize)> = dims.iter().map(|&d| (0, d)).collect();
-                ranges[spatial_idx] = (0, new_size as isize);
-                x = x.try_shrink(&ranges)?;
+            // Step 1: reshape (N,C,h,w) -> (N,C,h,1,w,1)
+            let mut rshape: Vec<isize> =
+                vec![x_shape[0].as_const().unwrap() as isize, x_shape[1].as_const().unwrap() as isize];
+            for &k in &spatial {
+                rshape.push(k as isize);
+                rshape.push(1);
             }
+            x = x.try_reshape(&rshape)?;
+
+            // Step 2: pad inserted dims by (0, s-1): (N,C,h,s,w,s)
+            let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); 2];
+            for &s in stride.iter() {
+                pad_spec.push((0, 0)); // spatial dim unchanged
+                pad_spec.push((0, (s - 1) as isize)); // inserted dim gets stride-1 padding
+            }
+            x = x.try_pad(&pad_spec)?;
+
+            // Step 3: reshape to merge pairs: (N,C,h*s,w*s)
+            let x_shape = x.shape()?;
+            let mut rshape: Vec<isize> =
+                vec![x_shape[0].as_const().unwrap() as isize, x_shape[1].as_const().unwrap() as isize];
+            for j in 0..n_spatial {
+                let a = x_shape[2 + j * 2].as_const().unwrap();
+                let b = x_shape[2 + j * 2 + 1].as_const().unwrap();
+                rshape.push((a * b) as isize);
+            }
+            x = x.try_reshape(&rshape)?;
+
+            // Step 4: shrink to remove trailing stride-1: (N,C,h*s-(s-1),w*s-(s-1))
+            let x_shape = x.shape()?;
+            let dims = morok_ir::shape::to_vec_isize(&x_shape).context(UOpSnafu)?;
+            let mut ranges: Vec<(isize, isize)> = dims.iter().map(|&d| (0, d)).collect();
+            for j in 0..n_spatial {
+                let new_size = spatial[j] * stride[j] - (stride[j] - 1);
+                ranges[2 + j] = (0, new_size as isize);
+            }
+            x = x.try_shrink(&ranges)?;
         }
 
         // Compute transposed padding

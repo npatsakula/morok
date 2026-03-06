@@ -151,7 +151,7 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
 #[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
 pub fn apply_post_optimization_with_renderer(
     ast: Arc<morok_ir::UOp>,
-    devectorize_alu: bool,
+    _devectorize_alu: bool,
     renderer: Option<&Renderer>,
 ) -> Arc<morok_ir::UOp> {
     // Multi-index linearization: INDEX(buf, [i,j,k]) → INDEX(buf, [linear])
@@ -237,32 +237,15 @@ pub fn apply_post_optimization_with_renderer(
 
     let t_stage = std::time::Instant::now();
     let with_loads = graph_rewrite(&pm_add_loads(), with_gpudims, &mut ());
-    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "after pm_add_loads (1st)");
+    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "after pm_add_loads");
 
+    // ALU devectorization happens inside devectorize() Phase 1, alongside expand_index
+    // and full symbolic (including gep_pushing). This matches Tinygrad's structure where
+    // no_vectorized_alu runs in the same pass as load_store_folding (step 14).
+    // Previously, an isolated pass here combined no_vectorized_alu + gep_pushing without
+    // load/store folding, causing graph explosion on wide VECTORIZE nodes (VECTORIZE(135)).
     let t_stage = std::time::Instant::now();
-    let cleaned = if devectorize_alu {
-        let combined =
-            symbolic_simple() + pm_wmma_accumulate() + crate::devectorize::no_vectorized_alu() + gep_pushing_patterns();
-        graph_rewrite(&combined, with_loads, &mut ())
-    } else {
-        graph_rewrite(&gep_pushing_patterns(), with_loads, &mut ())
-    };
-    tracing::debug!(
-        ast.optimized = cleaned.tree(),
-        elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "after pm_pushing_patterns"
-    );
-
-    let t_stage = std::time::Instant::now();
-    let with_loads2 = graph_rewrite(&pm_add_loads(), cleaned, &mut ());
-    tracing::debug!(
-        ast.optimized = with_loads2.tree(),
-        elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "after pm_add_loads"
-    );
-
-    let t_stage = std::time::Instant::now();
-    let devectorized_mem = crate::devectorize::devectorize(&with_loads2);
+    let devectorized_mem = crate::devectorize::devectorize(&with_loads);
     tracing::debug!(
         ast.optimized = devectorized_mem.tree(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
@@ -285,16 +268,21 @@ pub fn apply_post_optimization_with_renderer(
         "after pm_reduce_devectorize"
     );
 
+    // Tinygrad: pm_lower_index_dtype + load_store_indexing + gep_pushing (step 15)
     let t_stage = std::time::Instant::now();
-    let with_lowered_idx = graph_rewrite(&crate::symbolic::pm_lower_index_dtype(), reduce_devec, &mut ());
+    let pm_lower_combined = crate::symbolic::pm_lower_index_dtype()
+        + crate::devectorize::load_store_indexing_patterns()
+        + gep_pushing_patterns();
+    let with_lowered_idx = graph_rewrite(&pm_lower_combined, reduce_devec, &mut ());
     tracing::debug!(
         ast.optimized = with_lowered_idx.tree(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_lower_index_dtype"
     );
 
+    // Tinygrad: symbolic (step 16) — includes gep_pushing
     let t_stage = std::time::Instant::now();
-    let with_lowered_idx = graph_rewrite(&symbolic_simple(), with_lowered_idx, &mut ());
+    let with_lowered_idx = graph_rewrite(&symbolic(), with_lowered_idx, &mut ());
     tracing::debug!(
         ast.optimized = with_lowered_idx.tree(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
@@ -302,26 +290,15 @@ pub fn apply_post_optimization_with_renderer(
     );
 
     // =========================================================================
-    // Stage 18: Late rewrite patterns (Tinygrad: pm_decomp = symbolic_simple + get_late_rewrite_patterns)
+    // Stage 18-19: Decompositions + Render (Tinygrad: pm_decomp + pm_render in one pass)
     // =========================================================================
     let t_stage = std::time::Instant::now();
-    let pm_decomp = symbolic_simple() + get_late_rewrite_patterns(renderer);
-    let decomposed = graph_rewrite(&pm_decomp, with_lowered_idx, &mut ());
-    tracing::debug!(
-        ast.optimized = decomposed.tree(),
-        elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "Stage 18: after pm_decomp"
-    );
-
-    // =========================================================================
-    // Stage 19: Final rewrite / Render preparation (Tinygrad: pm_render)
-    // =========================================================================
-    let t_stage = std::time::Instant::now();
-    let rendered = graph_rewrite(&pm_render(), decomposed, &mut ());
+    let pm_final = symbolic_simple() + get_late_rewrite_patterns(renderer) + pm_render();
+    let rendered = graph_rewrite(&pm_final, with_lowered_idx, &mut ());
     tracing::debug!(
         ast.optimized = rendered.tree(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "Stage 19: after pm_render"
+        "Stage 18-19: after pm_decomp + pm_render"
     );
 
     let t_stage = std::time::Instant::now();
