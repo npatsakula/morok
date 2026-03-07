@@ -78,6 +78,35 @@ pub(crate) fn op_cumsum(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<T
     Ok(result)
 }
 
+pub(crate) fn op_cumprod(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let x = inp(inputs, 0);
+    let axis_raw = tensor_to_i64_vec(inp(inputs, 1))?[0];
+    let ndim = x.ndim()?;
+    let axis = if axis_raw < 0 { (ndim as i64 + axis_raw) as usize } else { axis_raw as usize };
+    let exclusive = get_attr_int(node, "exclusive", 0) == 1;
+    let reverse = get_attr_int(node, "reverse", 0) == 1;
+    let mut result = x.clone();
+    if reverse {
+        result = result.flip(&[axis as isize])?;
+    }
+    if exclusive {
+        let shape = result.shape()?;
+        let dim_size = shape[axis].as_const().unwrap() as isize;
+        let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
+        pad_spec[axis] = (1, 0);
+        result = result.try_pad_value(&pad_spec, 1.0)?;
+        let mut shrink_spec: Vec<(isize, isize)> =
+            result.shape()?.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+        shrink_spec[axis] = (0, dim_size);
+        result = result.try_shrink(&shrink_spec)?;
+    }
+    result = result.cumprod(axis as isize)?;
+    if reverse {
+        result = result.flip(&[axis as isize])?;
+    }
+    Ok(result)
+}
+
 pub(crate) fn op_scatter_elements(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
     let axis = get_attr_int(node, "axis", 0) as isize;
     let reduction = get_attr_string(node, "reduction", "none");

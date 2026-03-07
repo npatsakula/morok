@@ -36,6 +36,7 @@ pub use tensor_registry::apply_map_to_tensors;
 #[derive(Debug, Clone, Copy)]
 enum CumReduceOp {
     Add,
+    Mul,
     #[allow(dead_code)]
     Max,
 }
@@ -45,6 +46,7 @@ impl CumReduceOp {
     fn identity_value(&self, dtype: DType) -> f64 {
         match self {
             CumReduceOp::Add => 0.0,
+            CumReduceOp::Mul => 1.0,
             CumReduceOp::Max => {
                 if dtype.is_int() {
                     i64::MIN as f64
@@ -212,6 +214,7 @@ impl Tensor {
         // 4. Reduce last dim
         let x = match reduce {
             CumReduceOp::Add => x.sum(-1isize)?,
+            CumReduceOp::Mul => x.prod(-1isize)?,
             CumReduceOp::Max => x.max(-1isize)?,
         };
 
@@ -222,6 +225,11 @@ impl Tensor {
     /// Cumulative sum along an axis.
     pub fn cumsum(&self, axis: isize) -> Result<Self> {
         self._cumalu(axis, CumReduceOp::Add)
+    }
+
+    /// Cumulative product along an axis.
+    pub fn cumprod(&self, axis: isize) -> Result<Self> {
+        self._cumalu(axis, CumReduceOp::Mul)
     }
 
     /// Create 1D tensor with evenly spaced values and explicit dtype.
