@@ -259,6 +259,29 @@ pub(crate) fn op_max_pool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result
     Ok(vec![values, indices])
 }
 
+pub(crate) fn op_col2im(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let image_shape: Vec<usize> = tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as usize).collect();
+    let block_shape: Vec<usize> = tensor_to_i64_vec(inp(inputs, 2))?.iter().map(|&v| v as usize).collect();
+    let n_spatial = image_shape.len();
+    let strides_raw = get_attr_ints(node, "strides");
+    let strides: Vec<usize> =
+        if strides_raw.is_empty() { vec![1; n_spatial] } else { strides_raw.iter().map(|&s| s as usize).collect() };
+    let dilations_raw = get_attr_ints(node, "dilations");
+    let dilations: Vec<usize> =
+        if dilations_raw.is_empty() { vec![1; n_spatial] } else { dilations_raw.iter().map(|&d| d as usize).collect() };
+    let pads_raw = get_attr_ints(node, "pads");
+    let pads: Vec<(isize, isize)> =
+        if pads_raw.is_empty() { vec![(0, 0); n_spatial] } else { flat_pads_to_pairs(&pads_raw) };
+    Ok(inp(inputs, 0)
+        .col2im()
+        .image_shape(&image_shape)
+        .block_shape(&block_shape)
+        .strides(&strides)
+        .pads(&pads)
+        .dilations(&dilations)
+        .call()?)
+}
+
 pub(crate) fn op_max_unpool(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
     let x = inp(inputs, 0);
     let indices = inp(inputs, 1);

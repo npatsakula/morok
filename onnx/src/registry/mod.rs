@@ -552,6 +552,7 @@ impl OpRegistry {
             "LpPool" => nn::op_lp_pool(inputs, node)?,
             "MaxPool" => return nn::op_max_pool(inputs, node),
             "MaxUnpool" => nn::op_max_unpool(inputs, node)?,
+            "Col2Im" => nn::op_col2im(inputs, node)?,
             "GlobalAveragePool" => {
                 let x = inp(inputs, 0);
                 let axes: Vec<isize> = (2..x.ndim()? as isize).collect();

@@ -73,8 +73,6 @@ fn should_skip(name: &str) -> bool {
         // Deformable convolution
         "test_basic_deform_conv",
         "test_deform_conv",
-        // Column-to-image
-        "test_col2im",
         // NMS
         "test_nonmaxsuppression_",
         // ROI align

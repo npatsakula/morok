@@ -411,4 +411,139 @@ impl Tensor {
         }
         Ok(result)
     }
+
+    /// Col2Im: adjoint of im2col. Reconstructs an image from columns, summing overlaps.
+    ///
+    /// Input shape: `[N, C * prod(block_shape), L]` where L = number of sliding positions.
+    /// Output shape: `[N, C, *image_shape]`.
+    ///
+    /// Uses the adjoint of `_pool`: for each kernel position, stride-dilate the column
+    /// data, pad to the correct offset, and accumulate. O(output_size) memory,
+    /// O(bl × output_size) compute — no large one-hot intermediates.
+    #[builder]
+    pub fn col2im(
+        &self,
+        image_shape: &[usize],
+        block_shape: &[usize],
+        strides: Option<&[usize]>,
+        pads: Option<&[(isize, isize)]>,
+        dilations: Option<&[usize]>,
+    ) -> Result<Tensor> {
+        let n_spatial = image_shape.len();
+        let no_strides: Vec<usize> = vec![1; n_spatial];
+        let no_pads: Vec<(isize, isize)> = vec![(0, 0); n_spatial];
+        let no_dilations: Vec<usize> = vec![1; n_spatial];
+        let strides = strides.unwrap_or(&no_strides);
+        let pads = pads.unwrap_or(&no_pads);
+        let dilations = dilations.unwrap_or(&no_dilations);
+
+        let shape = self.shape()?;
+        let n = shape[0].as_const().unwrap();
+        let c_times_bl: usize = shape[1].as_const().unwrap();
+        let bl: usize = block_shape.iter().product();
+        let c = c_times_bl / bl;
+
+        // Padded image shape (reconstruct in padded space, shrink at end)
+        let padded_img: Vec<usize> =
+            (0..n_spatial).map(|i| (image_shape[i] as isize + pads[i].0 + pads[i].1) as usize).collect();
+
+        // Number of sliding positions per spatial dimension
+        let l_spatial: Vec<usize> = (0..n_spatial)
+            .map(|i| {
+                let effective_k = dilations[i] * (block_shape[i] - 1) + 1;
+                (padded_img[i] - effective_k) / strides[i] + 1
+            })
+            .collect();
+
+        // Reshape input: [N, C*bl, L] → [N*C, *block_shape, *L_spatial]
+        let nc = n * c;
+        let mut data_shape: Vec<isize> = vec![nc as isize];
+        data_shape.extend(block_shape.iter().map(|&s| s as isize));
+        data_shape.extend(l_spatial.iter().map(|&s| s as isize));
+        let data = self.try_reshape(&data_shape)?;
+
+        // Initialize output: [N*C, *padded_img] with zeros
+        let mut out_dims: Vec<usize> = vec![nc];
+        out_dims.extend_from_slice(&padded_img);
+        let mut result = Tensor::full(&out_dims, 0.0f64, self.uop().dtype())?;
+
+        // Iterate over all kernel positions in block_shape
+        for be in 0..bl {
+            // Unravel be → (k0, k1, ..., k_{n-1})
+            let mut kpos = vec![0usize; n_spatial];
+            let mut rem = be;
+            for i in (0..n_spatial).rev() {
+                kpos[i] = rem % block_shape[i];
+                rem /= block_shape[i];
+            }
+
+            // Extract slice for this kernel position: [N*C, *L_spatial]
+            // Shrink block dims (dims 1..n_spatial) to singletons, keep L_spatial dims
+            let mut shrink_ranges: Vec<(isize, isize)> = vec![(0, nc as isize)];
+            for j in 0..n_spatial {
+                shrink_ranges.push((kpos[j] as isize, kpos[j] as isize + 1));
+            }
+            for j in 0..n_spatial {
+                shrink_ranges.push((0, l_spatial[j] as isize));
+            }
+            let slice = data.try_shrink(&shrink_ranges)?;
+            // Squeeze block dims → [N*C, *L_spatial]
+            let mut sq_shape: Vec<isize> = vec![nc as isize];
+            sq_shape.extend(l_spatial.iter().map(|&s| s as isize));
+            let mut slice = slice.try_reshape(&sq_shape)?;
+
+            // For each spatial dim: stride-dilate L_j, then pad to position
+            for j in 0..n_spatial {
+                let dim = 1 + j;
+                let l_j = l_spatial[j];
+
+                // Stride dilation: insert stride-1 zeros between elements
+                if strides[j] > 1 {
+                    let s = strides[j];
+                    let ndim = slice.shape()?.len();
+                    // [... L_j ...] → [... L_j, 1 ...] → pad → [... L_j, S ...] → [... L_j*S ...] → shrink
+                    let mut sh: Vec<isize> = slice.shape()?.iter().map(|d| d.as_const().unwrap() as isize).collect();
+                    sh.insert(dim + 1, 1);
+                    slice = slice.try_reshape(&sh)?;
+
+                    let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim + 1];
+                    pad_spec[dim + 1] = (0, (s - 1) as isize);
+                    slice = slice.try_pad(&pad_spec)?;
+
+                    sh[dim] = (l_j * s) as isize;
+                    sh.remove(dim + 1);
+                    slice = slice.try_reshape(&sh)?;
+
+                    let dilated_l = (l_j - 1) * s + 1;
+                    let mut sr: Vec<(isize, isize)> =
+                        slice.shape()?.iter().map(|d| (0, d.as_const().unwrap() as isize)).collect();
+                    sr[dim] = (0, dilated_l as isize);
+                    slice = slice.try_shrink(&sr)?;
+                }
+
+                // Pad for kernel position offset: left = k*d, right = (K-1-k)*d
+                let left = kpos[j] * dilations[j];
+                let right = (block_shape[j] - 1 - kpos[j]) * dilations[j];
+                if left > 0 || right > 0 {
+                    let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); slice.shape()?.len()];
+                    pad_spec[dim] = (left as isize, right as isize);
+                    slice = slice.try_pad(&pad_spec)?;
+                }
+            }
+
+            result = result.try_add(&slice)?;
+        }
+
+        // Shrink to remove padding → [N*C, *image_shape]
+        let mut shrink_ranges: Vec<(isize, isize)> = vec![(0, nc as isize)];
+        for j in 0..n_spatial {
+            shrink_ranges.push((pads[j].0, pads[j].0 + image_shape[j] as isize));
+        }
+        let result = result.try_shrink(&shrink_ranges)?;
+
+        // Reshape to [N, C, *image_shape]
+        let mut final_shape: Vec<isize> = vec![n as isize, c as isize];
+        final_shape.extend(image_shape.iter().map(|&s| s as isize));
+        result.try_reshape(&final_shape)
+    }
 }
