@@ -384,6 +384,7 @@ impl OpRegistry {
             "CumProd" => indexing::op_cumprod(inputs, node)?,
             "Scatter" | "ScatterElements" => indexing::op_scatter_elements(inputs, node)?,
             "ScatterND" => indexing::op_scatter_nd(inputs, node)?,
+            "TensorScatter" => indexing::op_tensor_scatter(inputs, node)?,
 
             // === Reductions ===
             "ReduceSum" => {

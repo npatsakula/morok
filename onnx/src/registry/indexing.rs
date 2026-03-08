@@ -189,6 +189,80 @@ pub(crate) fn op_scatter_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Resu
     Ok(x.try_reshape(&out_shape)?)
 }
 
+pub(crate) fn op_tensor_scatter(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+    let data = inp(inputs, 0);
+    let update = inp(inputs, 1);
+    let write_indices = inputs.get(2).and_then(|o| o.as_ref());
+    let mode = get_attr_string(node, "mode", "linear");
+    let axis_raw = get_attr_int(node, "axis", -2) as isize;
+
+    let data_shape = data.shape()?;
+    let ndim = data_shape.len();
+    let axis = if axis_raw < 0 { (ndim as isize + axis_raw) as usize } else { axis_raw as usize };
+    let data_dims = morok_ir::shape::to_vec_usize(&data_shape)?;
+    let update_dims = morok_ir::shape::to_vec_usize(&update.shape()?)?;
+
+    let batch_size = data_dims[0];
+    let max_seq = data_dims[axis];
+    let seq_len = update_dims[axis];
+
+    // B_total = prod(shape[:axis]), features = prod(shape[axis+1:])
+    let b_total: usize = data_dims[..axis].iter().product();
+    let features: usize = data_dims[axis + 1..].iter().product();
+
+    // write_indices shape: (batch_size,), default to zeros
+    let write_idx = if let Some(wi) = write_indices {
+        wi.cast(DType::Int32)?
+    } else {
+        Tensor::full(&[batch_size], ConstValue::Int(0), DType::Int32)?
+    };
+
+    // Expand write_indices from (B,) to (B_total,) by broadcasting over dims 1..axis
+    let wi_flat = if axis > 1 {
+        let mut wi_reshape: Vec<isize> = vec![batch_size as isize];
+        for _ in 1..axis {
+            wi_reshape.push(1);
+        }
+        let wi_expand: Vec<isize> = data_dims[..axis].iter().map(|&d| d as isize).collect();
+        write_idx.try_reshape(&wi_reshape)?.try_expand(&wi_expand)?.try_reshape(&[b_total as isize])?
+    } else {
+        write_idx
+    };
+
+    // Flatten data to (B_total * max_seq, features), updates to (B_total * seq_len, features)
+    let data_flat = data.try_reshape(&[(b_total * max_seq) as isize, features as isize])?;
+    let updates_flat = update.try_reshape(&[(b_total * seq_len) as isize, features as isize])?;
+
+    // Build flat scatter indices: batch_offset + row_idx
+    // batch_offset[b] = b * max_seq, shape (B_total, 1)
+    let batch_offset = Tensor::arange(0, Some(b_total as i64), None)?
+        .cast(DType::Int32)?
+        .try_mul(&Tensor::const_(ConstValue::Int(max_seq as i64), DType::Int32))?
+        .try_reshape(&[b_total as isize, 1])?;
+
+    // row_idx[b, s] = wi[b] + s, shape (B_total, seq_len)
+    let wi_2d = wi_flat.try_reshape(&[b_total as isize, 1])?;
+    let seq_arange =
+        Tensor::arange(0, Some(seq_len as i64), None)?.cast(DType::Int32)?.try_reshape(&[1, seq_len as isize])?;
+    let mut row_idx = wi_2d.try_add(&seq_arange)?;
+
+    if mode == "circular" {
+        let max_seq_t = Tensor::const_(ConstValue::Int(max_seq as i64), DType::Int32);
+        row_idx = row_idx.try_mod(&max_seq_t)?;
+    }
+
+    // flat_idx: (B_total * seq_len, 1) → expand to (B_total * seq_len, features)
+    let flat_idx = batch_offset
+        .try_add(&row_idx)?
+        .try_reshape(&[(b_total * seq_len) as isize, 1])?
+        .try_expand(&[(b_total * seq_len) as isize, features as isize])?;
+
+    let result = data_flat.scatter(0, &flat_idx, &updates_flat)?;
+
+    let out_shape: Vec<isize> = data_dims.iter().map(|&d| d as isize).collect();
+    Ok(result.try_reshape(&out_shape)?)
+}
+
 pub(crate) fn op_gather_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
     let x = inp(inputs, 0);
     let indices = inp(inputs, 1);

@@ -12,7 +12,7 @@
   <g fill="#fff" text-anchor="middle" font-family="DejaVu Sans,Verdana,Geneva,sans-serif" font-size="11">
     <text x="23.0" y="15" fill="#010101" fill-opacity=".3">ONNX</text>
     <text x="23.0" y="14">ONNX</text>
-    <text x="127.5" y="15" fill="#010101" fill-opacity=".3">148/198 ops  75% tests</text>
-    <text x="127.5" y="14">148/198 ops  75% tests</text>
+    <text x="127.5" y="15" fill="#010101" fill-opacity=".3">153/198 ops  78% tests</text>
+    <text x="127.5" y="14">153/198 ops  78% tests</text>
   </g>
 </svg>

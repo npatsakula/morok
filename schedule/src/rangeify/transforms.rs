@@ -334,31 +334,38 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
     // Build substitution map
     let mut subs: HashMap<u64, Arc<UOp>> = HashMap::new();
 
-    // Collect all UOps to find the marked ranges
+    // Collect all UOps to find the marked ranges and max axis_id
     let topo = sink.toposort();
+
+    // Find max axis_id across ALL ranges to avoid collisions when creating split ranges
+    let mut max_axis_id: usize = 0;
+    for uop in &topo {
+        if let Op::Range { axis_id, .. } = uop.op() {
+            max_axis_id = max_axis_id.max(axis_id.value());
+        }
+    }
+    let mut next_id = max_axis_id + 1;
+
     for uop in &topo {
         // Skip protected ranges (e.g., used in ImageDType stores)
         if ctx.protected_ranges.contains(&uop.id) {
             continue;
         }
         if let Some(&mod_val) = ctx.marked_ranges.get(&uop.id)
-            && let Op::Range { end, axis_id, axis_type, .. } = uop.op()
+            && let Op::Range { end, axis_type, .. } = uop.op()
         {
             let Some(end_val) = const_uop_to_i64(end) else {
                 continue;
             };
 
-            // Create outer range: RANGE(end / mod_val, axis_id shifted by 0, same type)
+            // Create outer range with unique axis_id
             let outer_end = end_val / mod_val;
-            let outer_range = UOp::range_axis(
-                UOp::index_const(outer_end),
-                AxisId::Renumbered(axis_id.value() * 2), // Shift to avoid collision
-                *axis_type,
-            );
+            let outer_range = UOp::range_axis(UOp::index_const(outer_end), AxisId::Renumbered(next_id), *axis_type);
+            next_id += 1;
 
-            // Create inner range: RANGE(mod_val, axis_id shifted by 1, same type)
-            let inner_range =
-                UOp::range_axis(UOp::index_const(mod_val), AxisId::Renumbered(axis_id.value() * 2 + 1), *axis_type);
+            // Create inner range with unique axis_id
+            let inner_range = UOp::range_axis(UOp::index_const(mod_val), AxisId::Renumbered(next_id), *axis_type);
+            next_id += 1;
 
             // Substitution: r → outer * mod_val + inner
             let mod_const = UOp::index_const(mod_val);

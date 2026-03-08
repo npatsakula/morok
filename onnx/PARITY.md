@@ -1,8 +1,8 @@
 # ONNX Operator Parity
 
-**148 / 198** standard operators implemented (74%).
+**153 / 198** standard operators implemented (77%).
 
-Test results from the ONNX backend node test suite: **1275** pass, **59** fail, **344** skip (out of 1678 tests).
+Test results from the ONNX backend node test suite: **1319** pass, **359** fail, **0** skip (out of 1678 tests).
 
 The *expanded uses* column counts how many `_expanded` tests exercise each
 operator as a building block (indirect coverage beyond direct tests).
@@ -58,7 +58,7 @@ operator as a building block (indirect coverage beyond direct tests).
 | Sinh | Y | 2 pass | - | - |
 | Sqrt | Y | 2 pass | - | 116 |
 | Tan | Y | 2 pass | - | - |
-| Det | - | 2 skip | - | - |
+| Det | - | 2 fail | - | - |
 
 ## Activation
 
@@ -112,13 +112,13 @@ operator as a building block (indirect coverage beyond direct tests).
 
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
-| Cast | Y | 8 pass, 52 skip | 19 pass | 205 |
-| CastLike | Y | 8 pass, 48 skip | 25 pass, 48 skip | 33 |
-| DequantizeLinear | - | 14 skip | - | - |
-| DynamicQuantizeLinear | - | 3 skip | 3 skip | - |
-| QLinearConv | - | 1 fail | - | - |
-| QLinearMatMul | - | 8 fail | - | - |
-| QuantizeLinear | - | 13 skip | - | 3 |
+| Cast | Y | 8 pass, 52 fail | 19 pass | 205 |
+| CastLike | Y | 8 pass, 48 fail | 25 pass, 48 fail | 33 |
+| DequantizeLinear | - | 14 fail | - | - |
+| DynamicQuantizeLinear | - | 3 fail | 3 fail | - |
+| QLinearConv | Y | 1 pass | - | - |
+| QLinearMatMul | Y | 8 pass | - | - |
+| QuantizeLinear | - | 13 fail | - | 3 |
 
 ## Shape & Transform
 
@@ -126,7 +126,7 @@ operator as a building block (indirect coverage beyond direct tests).
 |----------|------|-------------------|-------------------|---------------|
 | CenterCropPad | Y | 6 pass | 6 pass | - |
 | Concat | Y | 12 pass | - | 101 |
-| ConstantOfShape | Y | 2 pass, 1 skip | - | 50 |
+| ConstantOfShape | Y | 3 pass | - | 50 |
 | DepthToSpace | Y | 2 pass | - | - |
 | Expand | Y | 2 pass | - | 62 |
 | EyeLike | Y | 3 pass | - | - |
@@ -137,16 +137,16 @@ operator as a building block (indirect coverage beyond direct tests).
 | Shape | Y | 11 pass | - | 150 |
 | Size | Y | 2 pass | - | 42 |
 | Slice | Y | 8 pass | - | 55 |
-| SpaceToDepth | Y | 1 pass, 1 fail | - | - |
+| SpaceToDepth | Y | 2 pass | - | - |
 | Split | Y | 16 pass | - | 8 |
 | Squeeze | Y | 2 pass | - | 29 |
 | Tile | Y | 2 pass | - | - |
 | Transpose | Y | 7 pass | - | 107 |
 | Unsqueeze | Y | 7 pass | - | 92 |
-| Col2Im | - | 5 skip | - | - |
-| ReverseSequence | - | 2 skip | - | - |
-| SplitToSequence | - | 3 skip | - | - |
-| Unique | - | 6 skip | - | - |
+| Col2Im | - | 5 fail | - | - |
+| ReverseSequence | - | 2 fail | - | - |
+| SplitToSequence | - | 3 fail | - | - |
+| Unique | - | 6 fail | - | - |
 
 ## Indexing & Gather
 
@@ -164,7 +164,7 @@ operator as a building block (indirect coverage beyond direct tests).
 | ScatterND | Y | 5 pass | - | - |
 | TopK | Y | 7 pass | - | - |
 | Trilu | Y | 18 pass | - | - |
-| TensorScatter | - | 3 fail | - | - |
+| TensorScatter | Y | 3 pass | - | - |
 
 ## Reduction
 
@@ -190,10 +190,10 @@ operator as a building block (indirect coverage beyond direct tests).
 | AffineGrid | Y | 4 pass | 4 fail | - |
 | Attention | Y | 62 pass | 62 pass | - |
 | AveragePool | Y | 20 pass | - | - |
-| BatchNormalization | Y | 2 pass, 2 skip | - | - |
+| BatchNormalization | Y | 4 pass | - | - |
 | Conv | Y | 6 pass | - | - |
 | ConvTranspose | Y | 11 pass | - | - |
-| Dropout | Y | 7 pass, 4 fail, 1 skip | - | - |
+| Dropout | Y | 8 pass, 4 fail | - | - |
 | Einsum | Y | 6 pass | - | - |
 | Gemm | Y | 11 pass | - | - |
 | GlobalAveragePool | Y | 2 pass | - | - |
@@ -210,38 +210,38 @@ operator as a building block (indirect coverage beyond direct tests).
 | MeanVarianceNormalization | Y | 1 pass | 1 pass | - |
 | NegativeLogLikelihoodLoss | Y | 18 pass | 18 pass | 34 |
 | RMSNormalization | Y | 19 pass | 19 pass | - |
-| RNN | Y | 3 pass, 1 skip | - | - |
+| RNN | Y | 3 pass, 1 fail | - | - |
 | Resize | Y | 39 pass | - | - |
-| RotaryEmbedding | Y | 8 pass | 6 pass, 2 fail | - |
+| RotaryEmbedding | Y | 8 pass | 8 pass | - |
 | SoftmaxCrossEntropyLoss | Y | 34 pass | 34 pass | - |
 | Upsample | Y | 1 pass | - | - |
-| ConvInteger | - | 2 fail | - | - |
-| DeformConv | - | 4 skip | - | - |
-| GRU | - | 4 skip | - | - |
+| ConvInteger | Y | 2 pass | - | - |
+| DeformConv | - | 4 fail | - | - |
+| GRU | - | 4 fail | - | - |
 | GlobalLpPool | - | - | - | - |
-| LSTM | - | 4 skip | - | - |
-| LpPool | - | 8 skip | - | - |
+| LSTM | - | 4 fail | - | - |
+| LpPool | - | 8 fail | - | - |
 | MaxRoiPool | - | - | - | - |
-| MaxUnpool | - | 2 fail | - | - |
-| NonMaxSuppression | - | 10 skip | - | - |
-| RoiAlign | - | 3 skip | - | - |
+| MaxUnpool | Y | 2 pass | - | - |
+| NonMaxSuppression | - | 10 fail | - | - |
+| RoiAlign | - | 3 fail | - | - |
 
 ## Control Flow
 
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
-| If | Y | 1 pass, 2 skip | - | 4 |
-| Loop | - | 3 skip | - | 8 |
-| Scan | - | 2 skip | - | - |
+| If | Y | 1 pass, 2 fail | - | 4 |
+| Loop | - | 3 fail | - | 8 |
+| Scan | - | 2 fail | - | - |
 
 ## Constants & Identity
 
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
 | Constant | Y | 1 pass | - | 213 |
-| Identity | Y | 1 pass, 2 skip | - | 99 |
-| OptionalGetElement | Y | 4 skip | - | - |
-| OptionalHasElement | Y | 7 skip | - | - |
+| Identity | Y | 1 pass, 2 fail | - | 99 |
+| OptionalGetElement | Y | 1 pass, 3 fail | - | - |
+| OptionalHasElement | Y | 4 pass, 3 fail | - | - |
 | Optional | - | - | - | - |
 
 ## Sequence
@@ -253,15 +253,15 @@ operator as a building block (indirect coverage beyond direct tests).
 | SequenceConstruct | - | - | - | - |
 | SequenceEmpty | - | - | - | 6 |
 | SequenceErase | - | - | - | - |
-| SequenceInsert | - | 2 skip | - | - |
+| SequenceInsert | - | 2 fail | - | - |
 | SequenceLength | - | - | - | 6 |
-| SequenceMap | - | 6 skip | 6 skip | - |
+| SequenceMap | - | 6 fail | 6 fail | - |
 
 ## Random
 
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
-| Bernoulli | - | 3 skip | 3 skip | - |
+| Bernoulli | - | 3 fail | 3 fail | - |
 | Multinomial | - | - | - | - |
 | RandomNormal | - | - | - | - |
 | RandomNormalLike | - | - | - | - |
@@ -272,18 +272,18 @@ operator as a building block (indirect coverage beyond direct tests).
 
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
-| BlackmanWindow | - | 2 skip | 2 skip | - |
-| DFT | - | 10 skip | - | - |
-| HammingWindow | - | 2 skip | 2 skip | - |
-| HannWindow | - | 2 skip | 2 skip | - |
+| BlackmanWindow | - | 2 fail | 2 pass | - |
+| DFT | - | 10 fail | - | - |
+| HammingWindow | - | 2 fail | 2 pass | - |
+| HannWindow | - | 2 fail | 2 pass | - |
 | ImageDecoder | - | 9 fail | - | - |
-| MelWeightMatrix | - | 1 skip | - | - |
-| STFT | - | 2 skip | - | - |
+| MelWeightMatrix | - | 1 fail | - | - |
+| STFT | - | 2 fail | - | - |
 | RegexFullMatch | - | 3 fail | - | - |
-| StringConcat | - | 5 skip | - | - |
-| StringNormalizer | - | 6 skip | - | - |
-| StringSplit | - | 6 skip | - | - |
-| TfIdfVectorizer | - | 7 skip | - | - |
+| StringConcat | - | 5 fail | - | - |
+| StringNormalizer | - | 6 fail | - | - |
+| StringSplit | - | 6 fail | - | - |
+| TfIdfVectorizer | - | 7 fail | - | - |
 
 ## com.microsoft Extensions
 

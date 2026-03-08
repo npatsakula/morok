@@ -148,6 +148,26 @@ fn test_permute_error_wrong_length() {
     assert!(result.is_err());
 }
 
+#[test]
+#[tracing_test::traced_test]
+fn test_permute_space_to_depth() {
+    crate::test::helpers::test_setup();
+    // SpaceToDepth: (1,1,4,6) → reshape (1,1,2,2,3,2) → permute [0,3,5,1,2,4] → reshape (1,4,2,3)
+    let data: Vec<f32> = vec![
+        0., 6., 1., 7., 2., 8., 12., 18., 13., 19., 14., 20., 3., 9., 4., 10., 5., 11., 15., 21., 16., 22., 17., 23.,
+    ];
+    let x = Tensor::from_slice(data).try_reshape(&[1, 1, 4, 6]).unwrap();
+
+    let step1 = x.try_reshape(&[1, 1, 2, 2, 3, 2]).unwrap();
+    let step2 = step1.try_permute(&[0, 3, 5, 1, 2, 4]).unwrap();
+    let result = step2.try_reshape(&[1, 4, 2, 3]).unwrap();
+
+    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
+    let expected: Vec<f32> = (0..24).map(|i| i as f32).collect();
+    let actual: Vec<f32> = arr.iter().copied().collect();
+    assert_eq!(actual, expected, "SpaceToDepth reshape+permute+reshape failed");
+}
+
 // =========================================================================
 // Transpose Tests
 // =========================================================================
