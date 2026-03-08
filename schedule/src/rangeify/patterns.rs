@@ -136,6 +136,92 @@ pub fn early_rewrites() -> TypedPatternMatcher {
 }
 
 // ============================================================================
+// REPLACE_CONTIGUOUS PATTERNS
+// ============================================================================
+
+/// Context for replace_contiguous: maps base UOps to their contiguous copies.
+pub type ReplaceContiguousCtx = std::collections::HashMap<UOpKey, Arc<UOp>>;
+
+/// Push CONTIGUOUS inward through movement ops to the base buffer.
+///
+/// Based on Tinygrad's `replace_contiguous` (rangeify.py:536-539):
+/// - `CONTIGUOUS(PERMUTE(RESHAPE(...(BASE))))` → adjust contiguous through the chain, then `ctx[BASE] = adjusted_contig`
+/// - For ALU ops: replace any source that appears in `ctx`
+///
+/// Only handles PERMUTE and RESHAPE movement ops (Tinygrad: found_contiguous returns None for others).
+pub fn replace_contiguous() -> TypedPatternMatcher<ReplaceContiguousCtx> {
+    crate::patterns! {
+        @context ReplaceContiguousCtx;
+
+        // Match CONTIGUOUS wrapping a movement op chain
+        contig @ Contiguous { src, .. } if src.op().is_movement() => |contig, src, ctx| {
+            found_contiguous(ctx, contig, src)
+        },
+
+        // ALU ops: replace sources that are in ctx (base → contiguous)
+        // Tinygrad: UPat(GroupOp.ALU) — only Unary/Binary/Ternary ops.
+        x if matches!(x.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..)) => |x, ctx| {
+            if ctx.is_empty() { return None; }
+            let sources = x.op().sources();
+
+            let mut new_sources = Vec::with_capacity(sources.len());
+            let mut any_changed = false;
+            for src in sources.iter() {
+                let key = UOpKey(src.clone());
+                if let Some(replacement) = ctx.get(&key) {
+                    new_sources.push(replacement.clone());
+                    any_changed = true;
+                } else {
+                    new_sources.push(src.clone());
+                }
+            }
+            if any_changed { Some(x.with_sources(new_sources)) } else { None }
+        },
+    }
+}
+
+/// Walk from a movement op chain toward its base, adjusting the contiguous marker.
+///
+/// Based on Tinygrad's `found_contiguous` (rangeify.py:528-535).
+#[allow(clippy::mutable_key_type)] // UOpKey Hash/Eq is stable despite interior OnceLock
+fn found_contiguous(ctx: &mut ReplaceContiguousCtx, contig: &Arc<UOp>, src: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let base = src.base();
+    let mut adjusted_contig = contig.clone();
+    let mut x = src.clone();
+
+    while !Arc::ptr_eq(&x, &base) {
+        match x.op() {
+            Op::Permute { src: inner, axes } => {
+                // Apply inverse permutation: contig = contig.permute(argsort(axes))
+                let inv = argsort(axes);
+                adjusted_contig = adjusted_contig.try_permute(inv).ok()?;
+                x = inner.clone();
+            }
+            Op::Reshape { src: inner, .. } => {
+                // Reshape contig to pre-reshape shape (inner source's shape)
+                let inner_shape = inner.shape().ok()??;
+                adjusted_contig = adjusted_contig.try_reshape(inner_shape).ok()?;
+                x = inner.clone();
+            }
+            _ => return None, // Unsupported movement op — bail
+        }
+    }
+
+    // Map the base to the adjusted contiguous
+    ctx.insert(UOpKey(base.clone()), adjusted_contig);
+    None // Don't transform the CONTIGUOUS node itself; ALU pattern does the replacement
+}
+
+/// Compute inverse permutation (argsort).
+fn argsort(perm: &[usize]) -> Vec<usize> {
+    let mut inv = vec![0; perm.len()];
+    for (i, &p) in perm.iter().enumerate() {
+        inv[p] = i;
+    }
+    inv
+}
+
+// ============================================================================
 // RANGEIFY TRANSFORMATION PATTERNS
 // ============================================================================
 
@@ -143,13 +229,17 @@ pub fn early_rewrites() -> TypedPatternMatcher {
 ///
 /// Pattern order (like Tinygrad's pm_apply_rangeify):
 /// 1. ReduceAxis → REDUCE conversion
-/// 2. ALL ops get source bufferization (including movement ops)
-/// 3. Movement ops get removed (simple - just return source)
+/// 2. PAD → WHERE conversion (convert_pad_to_where_to_keep_behavior_local)
+/// 3. ALL ops get source bufferization (including movement ops)
+/// 4. Movement ops get removed (simple - just return source)
 pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
     crate::patterns! {
         @context IndexingContext;
         // ReduceAxis conversion MUST come first - before bufferize wraps it
         x @ ReduceAxis { src: _ } => |x, ctx| convert_reduceaxis_with_context(x, ctx),
+        // PAD → WHERE conversion BEFORE bufferization
+        // Tinygrad: convert_pad_to_where_to_keep_behavior_local
+        x @ Pad { src: _, begin_pads: _, end_pads: _ } => |x, ctx| convert_pad_to_where(x, ctx),
         // ALL ops (including movement) get source bufferization
         // This matches Tinygrad's approach where bufferization runs on GroupOp.All
         x => |x, ctx| apply_bufferize_transform(x, ctx),
@@ -176,6 +266,51 @@ fn apply_bufferize_transform(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<
         return Some(new_node);
     }
     None
+}
+
+/// Convert PAD → WHERE(combined_valid, source, 0).
+///
+/// Tinygrad's `convert_pad_to_where_to_keep_behavior_local` (indexing.py:77-82):
+/// Extracts validity conditions from PAD's input ranges (WHERE-Invalid patterns)
+/// and wraps the PAD's data source in a WHERE that produces 0 for padded regions.
+fn convert_pad_to_where(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
+    let (input_ranges, output_ranges) = ctx.get_ranges(x)?;
+    let input_ranges = input_ranges.clone();
+    let output_ranges = output_ranges.clone();
+
+    // Extract validity from each input range and AND them together.
+    // Ranges from PAD are WHERE(valid, adjusted_idx, Invalid) → get_valid() extracts valid.
+    // Non-pad ranges return constant true.
+    let mut combined_valid: Option<Arc<UOp>> = None;
+    for r in &input_ranges {
+        let valid = r.get_valid();
+        combined_valid = Some(match combined_valid {
+            None => valid,
+            Some(acc) => acc.try_and_op(&valid).unwrap_or(valid),
+        });
+    }
+
+    let combined_valid = combined_valid?;
+
+    // If all ranges are always-valid (no padding), no transformation needed
+    if matches!(combined_valid.op(), Op::Const(cv) if cv.0 == ConstValue::Bool(true)) {
+        return None;
+    }
+
+    // PAD source is the first source
+    let pad_src = x.op().sources().first()?.clone();
+
+    // Create WHERE(combined_valid, pad_source, const_0).
+    // The scalar zero is compatible with any-shaped pad_src via implicit broadcast.
+    let zero = UOp::const_(x.dtype(), ConstValue::zero(x.dtype().scalar().unwrap()));
+    let ret = UOp::try_where(combined_valid, pad_src, zero).ok()?;
+
+    // Transfer range_map as-is (Tinygrad keeps WHERE-Invalid in ranges).
+    // pm_lower_index_dtype later converts INDEX(buf, WHERE(cond, idx, Invalid))
+    // into gated INDEX(buf, idx, gate=cond).
+    ctx.set_ranges(&ret, input_ranges, output_ranges);
+
+    Some(ret)
 }
 
 /// Remove movement ops after source bufferization.
@@ -268,30 +403,6 @@ pub fn dead_axis_removal() -> TypedPatternMatcher {
         // Filter dead axes from BUFFERIZE with shape preservation
         bufferize @ Bufferize { compute, ranges, opts } => |bufferize, compute, ranges, opts| {
             cleanup_dead_axes_bufferize(bufferize, compute, ranges, opts)
-        },
-        // Adjust INDEX indices when BUFFERIZE has dead axes - use nested struct pattern
-        Index { buffer: buffer @ Bufferize { ranges: buf_ranges, .. }, indices, gate: _ }
-            => |buffer, buf_ranges, indices| {
-            let mut new_indices = Vec::new();
-            let mut idx_iter = indices.iter();
-
-            for range in buf_ranges.iter() {
-                if !is_dead_axis(range) {
-                    if let Some(idx_val) = idx_iter.next() {
-                        new_indices.push(Arc::clone(idx_val));
-                    }
-                } else {
-                    idx_iter.next();
-                }
-            }
-
-            if new_indices.len() < indices.len() {
-                if new_indices.is_empty() {
-                    return None;
-                }
-                return UOp::index().buffer(buffer.clone()).indices(new_indices).call().ok();
-            }
-            None
         },
     }
 }
@@ -392,7 +503,6 @@ pub fn buffer_removal() -> TypedPatternMatcher {
         buf @ Bufferize { compute } if unary_in_reduce_context(compute) => |buf| block_reduce_unary_inline(buf),
         // Other cheap ops (including non-reduce Unary) can inline
         Bufferize { compute, .. } if is_cheap_to_inline(compute.op()) ~> |compute| compute.clone(),
-        Bufferize { compute, .. } if is_always_run_op(compute.op()) ~> |compute| compute.clone(),
         Bufferize { compute: Bufferize { compute: inner, .. }, ranges, opts }
             => |inner, ranges, opts| Some(UOp::bufferize(Arc::clone(inner), ranges.to_vec(), opts.clone())),
     }
@@ -402,13 +512,46 @@ pub fn buffer_removal() -> TypedPatternMatcher {
 pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
     crate::patterns! {
         @context PcontigConfig;
-        // Partial contiguous removal - use nested struct + gate: None
+        // Partial contiguous removal - ungated INDEX with WHERE-Invalid in indices.
+        // WHERE-Invalid stays in INDEX indices (not extracted to gate). Extract cond,
+        // inline with clean idx, wrap result with WHERE(cond, inlined, 0).
+        // Must be before the general ungated pattern to match first.
+        Index {
+            buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
+            indices: idx_ranges,
+            gate: None
+        } if idx_ranges.len() == 1
+          && matches!(idx_ranges[0].op(), Op::Ternary(morok_ir::TernaryOp::Where, _, _, f) if matches!(f.op(), Op::Invalid))
+        => |buffer, src, buf_ranges, idx_ranges, ctx| {
+            let Op::Ternary(morok_ir::TernaryOp::Where, cond, clean_idx, _) = idx_ranges[0].op() else {
+                unreachable!()
+            };
+            let clean_indices: SmallVec<[Arc<UOp>; 4]> = smallvec::smallvec![clean_idx.clone()];
+            let inlined = apply_pcontig_removal_inner(buffer, src, buf_ranges, &clean_indices, ctx)?;
+            let zero = UOp::const_(inlined.dtype(), ConstValue::zero(inlined.dtype().scalar()?));
+            UOp::try_where(cond.clone(), inlined, zero).ok()
+        },
+
+        // Partial contiguous removal - ungated INDEX (no WHERE-Invalid)
         Index {
             buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
             indices: idx_ranges,
             gate: None
         } => |buffer, src, buf_ranges, idx_ranges, ctx| {
             apply_pcontig_removal_inner(buffer, src, buf_ranges, idx_ranges, ctx)
+        },
+
+        // Partial contiguous removal - gated INDEX (from pm_move_where_on_load)
+        // Inline the buffer, then wrap with WHERE(gate, inlined, 0) so out-of-bounds
+        // values become zero.
+        Index {
+            buffer: buffer @ Bufferize { compute: src, ranges: buf_ranges, .. },
+            indices: idx_ranges,
+            gate: Some(gate)
+        } => |buffer, src, buf_ranges, idx_ranges, gate, ctx| {
+            let inlined = apply_pcontig_removal_inner(buffer, src, buf_ranges, idx_ranges, ctx)?;
+            let zero = UOp::const_(inlined.dtype(), ConstValue::zero(inlined.dtype().scalar()?));
+            UOp::try_where(gate.clone(), inlined, zero).ok()
         },
 
         // Constant buffer folding — BUFFERIZE(CONST) → CONST (like Tinygrad's pm_const_buffer_folding).
@@ -507,7 +650,7 @@ fn apply_pcontig_removal_inner(
             false
         } else {
             let sink = UOp::sink(reduce_sources);
-            sink.toposort().iter().any(|n| matches!(n.op(), Op::Buffer { .. } | Op::Bufferize { .. }))
+            sink.any_in_subtree(|n| matches!(n.op(), Op::Buffer { .. } | Op::Bufferize { .. }))
         }
     };
 
@@ -649,9 +792,11 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
     }
 }
 
-/// Pattern matcher for reduction simplifications (reduce_unparented, reduce_collapse).
-/// Must run AFTER ReduceAxis → REDUCE conversion (Step 7) because these match Op::Reduce.
-pub fn reduction_simplify_patterns() -> TypedPatternMatcher {
+/// Pattern matcher for reduce_unparented: remove ranges not referenced by body.
+///
+/// Factored out so it can be shared between `pm_reduce_simplify` and the inner
+/// `reduce_collapse` pattern matchers without duplication.
+fn pm_reduce_unparented() -> TypedPatternMatcher {
     crate::patterns! {
         reduce @ Reduce { src, ranges, reduce_op: Add | Mul | Max | Min } => |reduce, src, ranges, reduce_op| {
             #[allow(clippy::mutable_key_type)]
@@ -688,22 +833,23 @@ pub fn reduction_simplify_patterns() -> TypedPatternMatcher {
 
             Some(result)
         },
-
-        // Reduce distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
-        // Based on Tinygrad pm_reduce_collapse (simplify.py:104-105)
-        // This enables optimization when sum terms have different loop dependencies.
-        // NOTE: Pattern DSL cannot match nested struct in head, so we check src.op() in closure.
-        Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add => |src, ranges| {
-            // Check if src is an ADD operation
-            let Op::Binary(BinaryOp::Add, x, y) = src.op() else { return None };
-
-            let x_reduced = x.reduce(ranges.clone(), ReduceOp::Add);
-            let y_reduced = y.reduce(ranges.clone(), ReduceOp::Add);
-            x_reduced.try_add(&y_reduced).ok()
-        },
-
-        Reduce { src, ranges } => || super::transforms::reduce_collapse(src, ranges),
     }
+}
+
+/// Pattern matcher for reduction simplifications (mega-pass path).
+///
+/// Matches Tinygrad's `pm_reduce_simplify`:
+/// - `pm_reduce_unparented`: remove ranges not referenced by body
+/// - `REDUCE(ADD) → reduce_collapse(src, ranges)`: delegate to procedural wrapper
+///
+/// No duplication of distributive or bound patterns — those live inside
+/// `reduce_collapse_inner_patterns()` and run via `reduce_collapse`.
+pub fn pm_reduce_simplify() -> TypedPatternMatcher {
+    pm_reduce_unparented()
+        + crate::patterns! {
+            Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add
+                => |src, ranges| super::transforms::reduce_collapse(src, ranges),
+        }
 }
 
 // ============================================================================
@@ -781,7 +927,7 @@ fn concat_index_indices(
 }
 
 /// Transform a movement op through INDEX by applying the movement to indices.
-fn transform_movement_through_index(
+pub(crate) fn transform_movement_through_index(
     mop: &Arc<UOp>,
     indices: &SmallVec<[Arc<UOp>; 4]>,
     gate: &Option<Arc<UOp>>,
@@ -878,6 +1024,24 @@ pub fn rangeify_codegen_simple() -> TypedPatternMatcher {
         },
         // CONTIGUOUS → source (strip wrapper, no opts to extract at this stage)
         Contiguous { src, .. } => |src| {
+            Some(src.clone())
+        },
+    }
+}
+
+/// rangeify_codegen that accepts KernelContext for combining with pm_add_buffers_local.
+///
+/// This is the same as `rangeify_codegen_simple` but accepts `KernelContext` to allow
+/// combining with `pm_add_buffers_local_patterns` in a single pass (like Tinygrad does).
+pub fn rangeify_codegen_with_kernel_ctx() -> TypedPatternMatcher<super::kernel::KernelContext> {
+    crate::patterns! {
+        @context super::kernel::KernelContext;
+        // NOOP → zero constant (scalar or vector)
+        noop @ Noop() if noop.dtype().base() != morok_dtype::ScalarDType::Void => |noop, _ctx| {
+            Some(dtype_zero(noop.dtype()))
+        },
+        // CONTIGUOUS → source (strip wrapper, no opts to extract at this stage)
+        Contiguous { src, .. } => |src, _ctx| {
             Some(src.clone())
         },
     }
@@ -1008,8 +1172,10 @@ pub fn local_to_define_global_patterns() -> TypedPatternMatcher<LocalAddBufferCo
                 Op::MSelect { buffer, .. } => buffer.clone(),
                 _ => buf,
             };
-            // Skip if buffer already mapped
+            // Duplicate buffer mapping — Tinygrad asserts here.
             if ctx.has_buffer(&buf) {
+                debug_assert!(false, "handle_after: duplicate buffer mapping for buf id={}", buf.id);
+                tracing::warn!(buf_id = buf.id, "handle_after: duplicate buffer mapping, skipping");
                 return None;
             }
             // Map buf → after (kernel sources will be AFTERs)
@@ -1209,25 +1375,13 @@ pub fn pm_add_loads() -> TypedPatternMatcher<()> {
         // Pattern 1: INDEX with non-Ptr dtype → LOAD(buffer, INDEX with Ptr dtype)
         // Guard prevents re-matching: after transformation, INDEX has Ptr dtype.
         // Also skip Image dtype - image access handled separately in codegen.
-        // Based on Tinygrad's pm_add_loads (devectorizer.py:320-323).
+        // Based on Tinygrad's pm_add_loads (devectorizer.py:320-323):
+        //   idx.replace(dtype=idx.src[0].dtype).load(dtype=idx.dtype.base)
+        // idx.dtype.base for non-PtrDType returns self — preserving vectorization.
         idx @ Index { buffer, indices } if !matches!(idx.dtype(), DType::Ptr { .. } | DType::Image { .. }) => |idx, buffer, indices| {
-            // Handle vectorized indices - if any index has vector dtype, LOAD produces vector
-            let vec_count = indices.iter().find_map(|i| match i.dtype() {
-                DType::Vector { count, .. } => Some(count),
-                _ => None,
-            });
-
-            let element_dtype = match buffer.dtype() {
-                DType::Ptr { base, .. } => (*base).clone(),
-                other => other.clone(),
-            };
-
-            // Compute result dtype based on vectorized indices
-            // If element_dtype is already vectorized, use it as-is to avoid double-vectorization
-            let result_dtype = match vec_count {
-                Some(count) if element_dtype.vcount() == 1 => element_dtype.vec(count),
-                _ => element_dtype,
-            };
+            // Use INDEX's own dtype as LOAD result type. The expander has already set
+            // the correct vectorization (e.g. Float32.vec(3) for UPCAST=3).
+            let result_dtype = idx.dtype().clone();
 
             // Create INDEX with Ptr dtype (buffer's dtype) - won't match pattern again.
             // This matches Tinygrad's idx.replace(dtype=idx.src[0].dtype) approach.
@@ -1776,7 +1930,7 @@ pub fn pm_fma_decomposition() -> TypedPatternMatcher<()> {
 
 /// Check if UOp has no RANGE in backward slice (loop-invariant).
 fn no_range(u: &Arc<UOp>) -> bool {
-    !u.toposort().iter().any(|x| matches!(x.op(), Op::Range { .. }))
+    !u.any_in_subtree(|x| matches!(x.op(), Op::Range { .. }))
 }
 
 /// Check if UOp has no INDEX (load) in backward slice.
@@ -1784,7 +1938,7 @@ fn no_range(u: &Arc<UOp>) -> bool {
 /// Used for index overflow protection pattern - we want to ensure
 /// we don't do math on a loaded index since that can cause overflow.
 fn no_load(u: &Arc<UOp>) -> bool {
-    !u.toposort().iter().any(|x| matches!(x.op(), Op::Index { .. }))
+    !u.any_in_subtree(|x| matches!(x.op(), Op::Index { .. }))
 }
 
 /// Check if a UOp represents a zero constant.
@@ -1792,27 +1946,36 @@ fn is_const_zero(u: &Arc<UOp>) -> bool {
     if let Op::Const(cv) = u.op() { cv.0.is_zero() } else { false }
 }
 
-/// Get constant i64 value from UOp.
-fn const_to_i64(u: &Arc<UOp>) -> Option<i64> {
-    if let Op::Const(cv) = u.op() {
-        match cv.0 {
-            ConstValue::Int(v) => Some(v),
-            ConstValue::UInt(v) => Some(v as i64),
-            _ => None,
-        }
-    } else {
-        None
-    }
-}
-
-/// Compute minimum of two UOps: min(a, b) = where(a < b, a, b)
+/// Compute minimum of two UOps: min(a, b) = -max(-a, -b)
+///
+/// Tinygrad encodes min this way (not as WHERE) so that the MAX bounds
+/// elimination rule `max(x, y) → x when x.vmin >= y.vmax` can simplify
+/// boundary cases like `min(x, N)` when `x.vmax == N`.
 fn uop_min(a: &Arc<UOp>, b: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let cond = a.try_cmplt(b).ok()?;
-    UOp::try_where(cond, a.clone(), b.clone()).ok()
+    let neg_a = a.neg();
+    let neg_b = b.neg();
+    let max_neg = neg_a.try_max(&neg_b).ok()?;
+    Some(max_neg.neg())
 }
 
 /// Try to collapse a REDUCE with conditional/gated patterns.
 ///
+/// Core gated collapse logic shared by NE (Pattern 3) and EQ (Pattern 3b).
+///
+/// Substitutes range with `idx.cast(r.dtype).valid(in_bounds)` in the expression,
+/// producing `where(in_bounds, expr[r:=valid_idx], 0)`.
+fn gated_collapse_core(idx: &Arc<UOp>, range: &Arc<UOp>, end: &Arc<UOp>, expr: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let idx_casted = idx.cast(range.dtype());
+    let zero = UOp::index_const(0);
+    let in_bounds = idx_casted.try_cmpge(&zero).ok()?.try_and_op(&idx_casted.try_cmplt(end).ok()?).ok()?;
+    let valid_idx = idx_casted.valid(in_bounds.clone());
+    #[allow(clippy::mutable_key_type)]
+    let subs: std::collections::HashMap<UOpKey, Arc<UOp>> = [(UOpKey(range.clone()), valid_idx)].into_iter().collect();
+    let substituted = expr.substitute(&subs);
+    let zero_like = UOp::const_(expr.dtype(), ConstValue::zero(expr.dtype().base()));
+    UOp::try_where(in_bounds, substituted, zero_like).ok()
+}
+
 /// This implements reduction collapse patterns from Tinygrad (simplify.py:93-108):
 /// 1. Sum of `where(r < cut, 0, val)` → `clamp(end-cut, 0, end) * val`
 /// 2. Sum of `where(r < cut, val, 0)` → `clamp(cut, 0, end) * val`
@@ -1844,56 +2007,94 @@ fn try_reduce_collapse(
         return None;
     };
 
-    // Pattern 1: where(r < cut, 0, val) → (end - cut).clamp(0, end) * val
+    // Pattern 1: where(r < cut, 0, val) → (end - cut).max(0).min(end) * val
     if let Op::Binary(BinaryOp::Lt, lt_lhs, cut) = cond.op()
         && Arc::ptr_eq(lt_lhs, range)
         && is_const_zero(true_val)
         && no_range(false_val)
-        && let Some(range_end) = const_to_i64(end)
     {
-        let cut_val = const_to_i64(cut)?;
-        // count = max(0, min(end - cut, end))
-        let count = (range_end - cut_val).max(0).min(range_end);
-        let count_uop = UOp::const_(false_val.dtype(), ConstValue::Int(count));
-        return count_uop.try_mul(false_val).ok();
+        // count = (end - cut).max(0).min(end)  -- symbolic UOp arithmetic
+        let zero = UOp::index_const(0);
+        let diff = end.try_sub(cut).ok()?;
+        let non_negative = diff.try_max(&zero).ok()?;
+        let count = uop_min(&non_negative, end)?;
+        let count_casted = count.cast(false_val.dtype());
+        return count_casted.try_mul(false_val).ok();
     }
 
-    // Pattern 2: where(r < cut, val, 0) → cut.clamp(0, end) * val
+    // Pattern 2: where(r < cut, val, 0) → cut.max(0).min(end) * val
     if let Op::Binary(BinaryOp::Lt, lt_lhs, cut) = cond.op()
         && Arc::ptr_eq(lt_lhs, range)
         && is_const_zero(false_val)
         && no_range(true_val)
-        && let Some(range_end) = const_to_i64(end)
     {
-        let cut_val = const_to_i64(cut)?;
-        // count = max(0, min(cut, end))
-        let count = cut_val.max(0).min(range_end);
-        let count_uop = UOp::const_(true_val.dtype(), ConstValue::Int(count));
-        return count_uop.try_mul(true_val).ok();
+        // count = cut.max(0).min(end)  -- symbolic UOp arithmetic
+        let zero = UOp::index_const(0);
+        let clamped = cut.try_max(&zero).ok()?;
+        let count = uop_min(&clamped, end)?;
+        let count_casted = count.cast(true_val.dtype());
+        return count_casted.try_mul(true_val).ok();
     }
 
-    // Pattern 3: where(idx != r, 0, expr) → where(in_bounds(idx), expr[r:=idx], 0)
-    // This eliminates reduces over tensor indexing!
-    if let Op::Binary(BinaryOp::Ne, idx, ne_range) = cond.op()
-        && Arc::ptr_eq(ne_range, range)
-        && is_const_zero(true_val)
-        && no_range(idx)
+    // Pattern 2b: where(r >= lower, val, 0) → (end - lower).max(0).min(end) * val
+    // Handles Ge directly (bound from below), equivalent to Pattern 1 with inverted condition.
+    if let Some(lower) = extract_ge_lower_bound(cond, range)
+        && is_const_zero(false_val)
+        && no_range(true_val)
+        && no_range(&lower)
     {
-        // Build bounds check: 0 <= idx < end
         let zero = UOp::index_const(0);
-        let ge_zero = idx.try_cmpge(&zero).ok()?;
-        let lt_end = idx.try_cmplt(end).ok()?;
-        let in_bounds = ge_zero.try_and_op(&lt_end).ok()?;
+        let diff = end.try_sub(&lower).ok()?;
+        let non_negative = diff.try_max(&zero).ok()?;
+        let count = uop_min(&non_negative, end)?;
+        let count_casted = count.cast(true_val.dtype());
+        return count_casted.try_mul(true_val).ok();
+    }
 
-        // Substitute range with idx in the expression
-        #[allow(clippy::mutable_key_type)]
-        let subs: std::collections::HashMap<UOpKey, Arc<UOp>> =
-            [(UOpKey(range.clone()), idx.clone())].into_iter().collect();
-        let substituted = false_val.substitute(&subs);
+    // Pattern 2c: where(r >= lower, 0, val) → lower.max(0).min(end) * val
+    // Inverted Ge: value when condition is FALSE (r < lower).
+    if let Some(lower) = extract_ge_lower_bound(cond, range)
+        && is_const_zero(true_val)
+        && no_range(false_val)
+        && no_range(&lower)
+    {
+        let zero = UOp::index_const(0);
+        let clamped = lower.try_max(&zero).ok()?;
+        let count = uop_min(&clamped, end)?;
+        let count_casted = count.cast(false_val.dtype());
+        return count_casted.try_mul(false_val).ok();
+    }
 
-        // where(in_bounds, substituted, 0)
-        let zero_like = UOp::const_(false_val.dtype(), ConstValue::zero(false_val.dtype().base()));
-        return UOp::try_where(in_bounds, substituted, zero_like).ok();
+    // Pattern 3: where(idx != r, 0, expr) — NE gated collapse
+    // Pattern 3b: where(idx == r, expr, 0) — EQ gated collapse (Morok-specific)
+    //
+    // Both collapse to: where(in_bounds, expr[r:=idx.valid(v)], 0)
+    // NE: idx != r with zero in true_val, expression in false_val
+    // EQ: idx == r with expression in true_val, zero in false_val
+    // Also handles .or_casted(): unwraps CAST around the range operand.
+    {
+        let (idx, cmp_range, expr) = match cond.op() {
+            // NE: where(idx != range_side, 0, expr) — Tinygrad pattern
+            Op::Binary(BinaryOp::Ne, idx, ne_range) if is_const_zero(true_val) && no_range(idx) => {
+                Some((idx, ne_range, false_val))
+            }
+            // EQ: where(idx == range_side, expr, 0) — Morok-specific
+            Op::Binary(BinaryOp::Eq, lhs, rhs) if is_const_zero(false_val) => {
+                if no_range(lhs) {
+                    Some((lhs, rhs, true_val))
+                } else if no_range(rhs) {
+                    Some((rhs, lhs, true_val))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }?;
+
+        let actual_range = if let Op::Cast { src, .. } = cmp_range.op() { src } else { cmp_range };
+        if Arc::ptr_eq(actual_range, range) {
+            return gated_collapse_core(idx, range, end, expr);
+        }
     }
 
     // Pattern 4: Two-sided bounds
@@ -1996,6 +2197,10 @@ fn try_define_var_factor(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Op
 /// Lifts operations out of Lt comparisons when they don't depend on ranges:
 /// - (x + y) < c → x < (c - y) when y, c are range-free
 /// - (x * y) < c → x < ceil(c/y) when y > 0, y, c range-free
+///
+/// Also handles `.or_casted()` variants where lhs is wrapped in a CAST:
+/// - Cast(x + y) < c → x < (c.cast(inner_dtype) - y)
+/// - Cast(x * y) < c → x < ceil(c.cast(inner_dtype)/y)
 fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Binary(BinaryOp::Lt, lhs, rhs) = cond.op() else {
         return None;
@@ -2006,16 +2211,26 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
+    // Unwrap optional CAST to get the inner expression (or_casted pattern).
+    // When CAST is present, we need to cast the rhs constant to the inner dtype.
+    let (inner_lhs, effective_rhs) = if let Op::Cast { src, .. } = lhs.op() {
+        let inner_dtype = src.dtype();
+        let casted_rhs = rhs.cast(inner_dtype);
+        (src.as_ref(), casted_rhs)
+    } else {
+        (lhs.as_ref(), rhs.clone())
+    };
+
     // Pattern: (x + y) < c → x < (c - y)
-    if let Op::Binary(BinaryOp::Add, x, y) = lhs.op()
+    if let Op::Binary(BinaryOp::Add, x, y) = inner_lhs.op()
         && no_range(y)
     {
-        let new_rhs = rhs.try_sub(y).ok()?;
+        let new_rhs = effective_rhs.try_sub(y).ok()?;
         return x.try_cmplt(&new_rhs).ok();
     }
 
     // Pattern: (x * y) < c → x < ceil(c/y) when y > 0
-    if let Op::Binary(BinaryOp::Mul, x, y) = lhs.op()
+    if let Op::Binary(BinaryOp::Mul, x, y) = inner_lhs.op()
         && no_range(y)
     {
         // Check y > 0 via vmin
@@ -2024,10 +2239,72 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
         {
             // ceil(c/y) = (c + y - 1) / y
             let one = UOp::index_const(1);
-            let c_plus_y = rhs.try_add(y).ok()?;
+            let c_plus_y = effective_rhs.try_add(y).ok()?;
             let c_plus_y_minus_1 = c_plus_y.try_sub(&one).ok()?;
             let new_rhs = c_plus_y_minus_1.try_div(y).ok()?;
             return x.try_cmplt(&new_rhs).ok();
+        }
+    }
+
+    None
+}
+
+/// Arithmetic lifting for EQ comparisons (Morok-specific).
+///
+/// Isolates range-containing operands from arithmetic in EQ conditions:
+/// - (x + y) == c → x == (c - y) or y == (c - x)
+/// - (x - y) == c → x == (c + y) or y == (x - c)
+/// - Cast(x ± y) == c → same with c cast to inner dtype
+fn try_lift_arithmetic_from_eq(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Binary(BinaryOp::Eq, raw_lhs, raw_rhs) = cond.op() else { return None };
+
+    // Normalize: range-containing side on lhs, range-free on rhs.
+    // The pattern `Eq[_, c] if no_range(c)` matches commutatively, but
+    // cond.op() returns operands in storage order which may differ.
+    let (lhs, rhs) = if no_range(raw_rhs) {
+        (raw_lhs, raw_rhs)
+    } else if no_range(raw_lhs) {
+        (raw_rhs, raw_lhs)
+    } else {
+        return None;
+    };
+
+    // Unwrap optional CAST, adjusting rhs to inner dtype
+    let (inner_lhs, effective_rhs) = if let Op::Cast { src, .. } = lhs.op() {
+        (src.as_ref(), rhs.cast(src.dtype()))
+    } else {
+        (lhs.as_ref(), rhs.clone())
+    };
+
+    match inner_lhs.op() {
+        Op::Binary(BinaryOp::Add, x, y) if no_range(y) => x.try_cmpeq(&effective_rhs.try_sub(y).ok()?).ok(),
+        Op::Binary(BinaryOp::Add, x, y) if no_range(x) => y.try_cmpeq(&effective_rhs.try_sub(x).ok()?).ok(),
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(y) => x.try_cmpeq(&effective_rhs.try_add(y).ok()?).ok(),
+        Op::Binary(BinaryOp::Sub, x, y) if no_range(x) => y.try_cmpeq(&x.try_sub(&effective_rhs).ok()?).ok(),
+        _ => None,
+    }
+}
+
+/// Arithmetic lifting for Ge comparisons.
+///
+/// Lifts operations out of Ge comparisons when they don't depend on ranges:
+/// - (x + y) >= c → x >= (c - y) when y, c are range-free
+fn try_lift_arithmetic_from_ge(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Binary(BinaryOp::Ge, lhs, rhs) = cond.op() else {
+        return None;
+    };
+
+    if !no_range(rhs) {
+        return None;
+    }
+
+    // (x + y) >= c → x >= (c - y) when y is range-free
+    if let Op::Binary(BinaryOp::Add, x, y) = lhs.op() {
+        if no_range(y) {
+            return x.try_cmpge(&rhs.try_sub(y).ok()?).ok();
+        }
+        if no_range(x) {
+            return y.try_cmpge(&rhs.try_sub(x).ok()?).ok();
         }
     }
 
@@ -2050,7 +2327,116 @@ fn try_lift_arithmetic_from_lt(cond: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// 8. Index overflow protection: `(x:index + y) < c` → `x < (c - y)` when x has loads
 pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
     crate::patterns! {
-        // Main pattern: REDUCE with WHERE condition - only Add reduces
+        // Match REDUCE(ADD) with a single range → full reduce_load_collapse algorithm.
+        //
+        // Tinygrad: pm_load_collapse matches only single-range REDUCE(ADD)
+        // and goes straight to reduce_load_collapse (the full algorithm with
+        // gated toposort + DEFINE_VAR substitution). All arithmetic lifting,
+        // NE lifting, .or_casted() patterns live inside the inner matcher
+        // (build_reduce_load_collapse_matcher), not at this level.
+        _reduce @ Reduce { src, ranges, reduce_op }
+            if ranges.len() == 1 && *reduce_op == ReduceOp::Add
+            => |src, ranges| {
+                super::transforms::reduce_load_collapse(src, ranges)
+            },
+
+        // Index overflow undo rule: (x:index + y) < c → x < (c - y)
+        // Only when x has loads but y, c don't — prevents overflow on loaded indices.
+        // This undoes the arithmetic lifting that pm_reduce_load_collapse may have
+        // applied when the lifted form risks integer overflow on loaded values.
+        Lt(Add(x, y), c)
+            if x.dtype() == DType::Index && !no_load(x) && no_load(y) && no_load(c)
+            => |x, y, c| {
+                let new_c = c.try_sub(y).ok()?;
+                x.try_cmplt(&new_c).ok()
+            },
+    }
+}
+
+// ============================================================================
+// PM_REDUCE_COLLAPSE - Inner patterns for reduce_collapse loop
+// ============================================================================
+// Based on Tinygrad's pm_reduce_collapse (simplify.py:87-111)
+// Used inside reduce_collapse's per-range iteration to algebraically
+// eliminate the synthetic REDUCE node.
+
+/// Inner pattern matcher used inside `reduce_collapse` per-range iteration.
+///
+/// Combines reduce-specific algebraic patterns with full symbolic simplification.
+/// Does NOT include a recursive `reduce_collapse` call (would infinite-loop).
+pub fn build_reduce_collapse_matcher() -> TypedPatternMatcher<()> {
+    reduce_collapse_inner_patterns() + crate::symbolic::symbolic_simple()
+}
+
+/// Extended pattern matcher for `reduce_load_collapse`.
+///
+/// Combines the basic `reduce_collapse` patterns with NE lifting.
+/// NE lifting is only needed in the per-kernel `reduce_load_collapse` path,
+/// matching Tinygrad where NE lifting is only in `pm_reduce_load_collapse`.
+///
+/// Does NOT include the REDUCE→reduce_load_collapse call to avoid infinite recursion.
+pub fn build_reduce_load_collapse_matcher() -> TypedPatternMatcher<()> {
+    build_reduce_collapse_matcher() + ne_lifting_patterns()
+}
+
+/// NE lifting patterns for the extended `reduce_load_collapse` path.
+///
+/// Matches Tinygrad's `pm_reduce_load_collapse` additions over `pm_reduce_collapse`:
+/// NE lifting is only needed here (not in the basic mega-pass matcher).
+///
+/// Note: index overflow undo lives in `pm_load_collapse()` (the outer matcher),
+/// not here — inside reduce_collapse, external inputs are DEFINE_VARs with no loads,
+/// so `!no_load(x)` never matches.
+fn ne_lifting_patterns() -> TypedPatternMatcher<()> {
+    crate::patterns! {
+        // NE lifting: (x + y) != c → x != (c - y) when no_range(y, c)
+        Ne(Add(x, y), c) if no_range(y) && no_range(c) => |x, y, c| {
+            let new_c = c.try_sub(y).ok()?;
+            x.try_cmpne(&new_c).ok()
+        },
+
+        // .or_casted() NE: Cast(x + y) != c → x != (c.cast(inner_dtype) - y)
+        Ne(Cast { src: inner, .. }, c) if no_range(c) => |inner, c| {
+            let Op::Binary(BinaryOp::Add, x, y) = inner.op() else { return None };
+            if !no_range(y) { return None; }
+            let casted_c = c.cast(inner.dtype());
+            let new_c = casted_c.try_sub(y).ok()?;
+            x.try_cmpne(&new_c).ok()
+        },
+    }
+}
+
+/// Reduce-specific algebraic patterns for use inside `reduce_collapse`.
+///
+/// Based on Tinygrad's pm_reduce_collapse (simplify.py:87-111):
+/// 1. reduce_unparented: remove ranges not used by src
+/// 2. Lt lifting: (x+y) < c → x < (c-y), (x*y) < c → x < ceil(c/y), including .or_casted()
+/// 3. Ge lifting: (x+y) >= c → x >= (c-y)
+/// 4. Distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
+/// 5. Bound-from-below/above/two-sided/gated collapse on REDUCE(ADD)
+/// 6. DEFINE_VAR factoring: (dv & y).where(c,0).reduce(ADD)
+/// 7. MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
+/// 8. EQ lifting: (x+y)==c → x==(c-y), Morok-specific for gather's EQ pattern
+fn reduce_collapse_inner_patterns() -> TypedPatternMatcher<()> {
+    // Start with reduce_unparented (shared with pm_reduce_simplify)
+    pm_reduce_unparented().with_context()
+    // Lt/Ge arithmetic lifting: push range-free operands to rhs of comparison.
+    // Handles direct and .or_casted() (CAST-wrapped) Add/Mul forms.
+    + crate::patterns! {
+        cond @ Lt(_, rhs) if no_range(rhs) => |cond| try_lift_arithmetic_from_lt(cond),
+        cond @ Ge(_, rhs) if no_range(rhs) => |cond| try_lift_arithmetic_from_ge(cond),
+
+        // Distributive: (x+y).reduce(ADD) → x.reduce(ADD) + y.reduce(ADD)
+        Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add => |src, ranges| {
+            let Op::Binary(BinaryOp::Add, x, y) = src.op() else { return None };
+            let x_reduced = x.reduce(ranges.clone(), ReduceOp::Add);
+            let y_reduced = y.reduce(ranges.clone(), ReduceOp::Add);
+            x_reduced.try_add(&y_reduced).ok()
+        },
+
+        // Bound patterns + DEFINE_VAR factoring on REDUCE(ADD) with single range
+        // These match the synthetic REDUCE created by reduce_collapse's per-range iteration.
+        // Patterns: bound-from-below, bound-from-above, two-sided, gated NE/EQ collapse.
         reduce @ Reduce { src, ranges, reduce_op }
             if !ranges.is_empty() && *reduce_op == ReduceOp::Add
             => |reduce, src, ranges| {
@@ -2058,35 +2444,19 @@ pub fn pm_load_collapse() -> TypedPatternMatcher<()> {
                     .or_else(|| try_define_var_factor(src, ranges))
             },
 
-        // Arithmetic lifting: (x + y) < c or (x * y) < c
-        cond @ Lt(_lhs @ Add(_, _), rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-        cond @ Lt(_lhs @ Mul(_, _), rhs) if no_range(rhs) => |cond| {
-            try_lift_arithmetic_from_lt(cond)
-        },
-
         // MUL casted bool: x * gate:bool.cast() → gate.where(x, 0)
-        // Matches x * gate.cast() where gate is bool
         Mul[x, Cast { src: gate, .. }] if gate.dtype() == DType::Bool => |x, gate| {
             let zero = UOp::const_(x.dtype(), ConstValue::zero(x.dtype().base()));
             UOp::try_where(gate.clone(), x.clone(), zero).ok()
         },
 
-        // NE lifting: (x + y) != c → x != (c - y) when no_range(y, c)
-        Ne(Add(x, y), c) if no_range(y) && no_range(c) => |x, y, c| {
-            let new_c = c.try_sub(y).ok()?;
-            x.try_cmpne(&new_c).ok()
-        },
-
-        // Index overflow protection: (x:index + y) < c → x < (c - y)
-        // Only when x has loads but y, c don't - prevents overflow on loaded indices
-        Lt(Add(x, y), c)
-            if x.dtype() == DType::Index && !no_load(x) && no_load(y) && no_load(c)
-            => |x, y, c| {
-                let new_c = c.try_sub(y).ok()?;
-                x.try_cmplt(&new_c).ok()
-            },
+        // EQ lifting: isolate range-containing operands from arithmetic in EQ conditions.
+        // Morok-specific — needed because Morok uses EQ directly from gather,
+        // unlike Tinygrad which decomposes eq() as ne().not() and only needs NE lifting.
+        // Must be in basic matcher since mega-pass buffer_folding inlines arange constants,
+        // enabling EQ lifting to work. Per-kernel pm_load_collapse runs before buffer_folding
+        // so it can't see through LOADs.
+        cond @ Eq[_, c] if no_range(c) => |cond| try_lift_arithmetic_from_eq(cond),
     }
 }
 

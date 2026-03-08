@@ -75,11 +75,26 @@ fn test_diamond_elementwise_no_matmul() {
 // FAILING: fully-lazy LHS (no buffer root)
 // =========================================================================
 
+use std::sync::Once;
+use tracing_subscriber::EnvFilter;
+
+static TRACING_INIT: Once = Once::new();
+
+pub fn setup_tracing() {
+    TRACING_INIT.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_test_writer() // Ensures output is captured by `cargo test`
+            .init();
+    });
+}
+
 /// Simplest failing case: arange → outer product → matmul.
 /// No unary, no diamond — just a lazy [N,N] matrix from arange.
 #[test_case(2 ; "N=2")]
 #[test_case(4 ; "N=4")]
 fn test_lazy_outer_product_matmul(n: usize) {
+    setup_tracing();
     test_setup();
 
     let indices = Tensor::arange(n as i64, None, None).unwrap().cast(DType::Float32).unwrap();

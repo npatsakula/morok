@@ -8,11 +8,14 @@ use std::f32::consts::PI;
 use morok_ir::{Op, UOp};
 
 use crate::rangeify::kernel::run_kernel_split_pipeline;
-use crate::test::unit::rangeify::helpers::{count_define_globals, count_define_locals, count_kernels, extract_kernel};
+use crate::test::unit::rangeify::helpers::{count_bufferizes, count_define_globals, count_kernels, extract_kernel};
 
 #[test]
 fn test_pipeline_two_bufferizes() {
-    // Two BUFFERIZEs with different address spaces
+    // Two BUFFERIZEs with different address spaces.
+    // pm_add_buffers (allow_locals=false) converts only GLOBAL BUFFERIZEs to STORE/BUFFER.
+    // LOCAL BUFFERIZEs remain as-is and are converted later in codegen (pm_add_buffers_local).
+    // This matches Tinygrad's two-stage buffer conversion.
     let compute1 = UOp::native_const(1.0f32);
     let compute2 = UOp::native_const(42i32);
 
@@ -28,14 +31,13 @@ fn test_pipeline_two_bufferizes() {
 
     let (result, _context) = run_kernel_split_pipeline(root);
 
-    // Should create buffers for both address spaces
-    // Note: Actual kernel count depends on how pipeline handles SINK
+    // Global BUFFERIZE should be converted to BUFFER (and eventually DEFINE_GLOBAL in kernel AST)
     let global_count = count_define_globals(&result);
-    let local_count = count_define_locals(&result);
+    assert!(global_count >= 1, "Should have at least 1 DEFINE_GLOBAL from global BUFFERIZE");
 
-    // At least 1 global and 1 local should exist
-    assert!(global_count >= 1, "Should have at least 1 DEFINE_GLOBAL");
-    assert!(local_count >= 1, "Should have at least 1 DEFINE_LOCAL");
+    // Local BUFFERIZE should remain as BUFFERIZE (not converted to DEFINE_LOCAL yet)
+    let local_bufferize_count = count_bufferizes(&result);
+    assert!(local_bufferize_count >= 1, "Local BUFFERIZE should remain unconverted (handled later in codegen)");
 }
 
 #[test]
@@ -95,7 +97,9 @@ fn test_pipeline_context_threading() {
 
 #[test]
 fn test_pipeline_mixed_addrspace() {
-    // Global and Local buffers in the same graph
+    // Global and Local buffers in the same graph.
+    // pm_add_buffers (allow_locals=false) converts only GLOBAL BUFFERIZEs.
+    // LOCAL BUFFERIZEs are preserved for later codegen conversion.
     let global_compute = UOp::native_const(1.0f32);
     let local_compute = UOp::native_const(2.0f32);
 
@@ -110,22 +114,19 @@ fn test_pipeline_mixed_addrspace() {
 
     let (result, _context) = run_kernel_split_pipeline(root);
 
-    // Count buffers by address space
+    // Global BUFFERIZE should be converted
     let globals = count_define_globals(&result);
-    let locals = count_define_locals(&result);
+    assert!(globals >= 1, "Should have at least 1 DEFINE_GLOBAL from global BUFFERIZE");
 
-    // Should have at least one of each
-    assert!(globals >= 1, "Should have at least 1 DEFINE_GLOBAL");
-    assert!(locals >= 1, "Should have at least 1 DEFINE_LOCAL");
-
-    // Total buffers should be at least 2
-    assert!(globals + locals >= 2, "Should have at least 2 total buffers");
+    // Local BUFFERIZE should remain unconverted
+    let local_bufferizes = count_bufferizes(&result);
+    assert!(local_bufferizes >= 1, "Local BUFFERIZE should remain for later codegen conversion");
 }
 
 #[test]
 fn test_pipeline_reshape_buffer_to_load() {
-    // Test that RESHAPE(BUFFER) input is transformed correctly through the pipeline
-    // This tests the fix for: RESHAPE(BUFFER) → INDEX(RESHAPE(BUFFER)) → INDEX(BUFFER, transformed_indices) → LOAD
+    // Test that RESHAPE(BUFFER) input is transformed correctly through the pipeline.
+    // Uses SINK(CONTIGUOUS(compute)) — the Tinygrad-aligned graph structure.
     use morok_dtype::DType;
 
     // Create input buffer with size 12
@@ -135,7 +136,7 @@ fn test_pipeline_reshape_buffer_to_load() {
     let reshape_shape = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped = UOp::new(Op::Reshape { src: input_buffer, new_shape: reshape_shape }, DType::Float32);
 
-    // Create another RESHAPE(BUFFER) with same shape - this is a more realistic test case
+    // Create another RESHAPE(BUFFER) with same shape
     let input_buffer2 = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 12, DType::Float32);
     let reshape_shape2 = UOp::vectorize(vec![UOp::index_const(3), UOp::index_const(4)].into());
     let reshaped2 = UOp::new(Op::Reshape { src: input_buffer2, new_shape: reshape_shape2 }, DType::Float32);
@@ -143,35 +144,22 @@ fn test_pipeline_reshape_buffer_to_load() {
     // Add two reshaped buffers (this is exactly what Tensor::from_slice + add does)
     let compute = reshaped.try_add(&reshaped2).expect("Add should work");
 
-    // Create ranges for the output shape
-    let range0 = UOp::range_const(3, 0);
-    let range1 = UOp::range_const(4, 1);
+    // Wrap in CONTIGUOUS + SINK (Tinygrad approach: no pre-existing BUFFERIZE)
+    let contiguous = compute.contiguous();
+    let sink = UOp::sink(vec![contiguous]);
 
-    // Wrap in BUFFERIZE to materialize the result
-    let bufferize = UOp::bufferize_global(compute, vec![range0, range1]);
-
-    // Run rangeify pipeline (Phases 1-4)
-    let (rangeified, _ctx) = crate::rangeify::rangeify(bufferize.clone(), None).expect("Rangeify should succeed");
+    // Run rangeify pipeline
+    let (rangeified, _ctx) = crate::rangeify::rangeify(sink, None).expect("Rangeify should succeed");
 
     // Verify RESHAPE operations have been eliminated
-    // After rangeify, RESHAPE(BUFFER) should be replaced by INDEX(BUFFER, transformed_indices)
     let has_reshape = rangeified.toposort().iter().any(|node| matches!(node.op(), Op::Reshape { .. }));
-
-    // Note: This may still have RESHAPEs if the ranges weren't properly applied
-    // The key test is that after kernel split, no RESHAPE should remain
-    if has_reshape {
-        println!("Note: Rangeify result still has RESHAPE (may be handled by kernel split)");
-    }
-
-    // For now, just verify rangeify works
-    // The kernel split can be tested separately once we verify the transformation is correct
     assert!(!has_reshape, "RESHAPE should be eliminated after rangeify");
 }
 
 #[test]
 fn test_full_pipeline_creates_load_for_input_buffers() {
     // Test the FULL pipeline (rangeify + kernel split) creates LOAD for input buffers.
-    // This is the critical test for: RESHAPE(BUFFER) → ... → LOAD(DEFINE_GLOBAL, INDEX(...))
+    // Uses SINK(CONTIGUOUS(compute)) — the Tinygrad-aligned graph structure.
     use morok_dtype::DType;
 
     // Create input buffer with size 12
@@ -189,16 +177,9 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
     // Add two reshaped buffers
     let compute = reshaped.try_add(&reshaped2).expect("Add should work");
 
-    // Create ranges for the output shape
-    let range0 = UOp::range_const(3, 0);
-    let range1 = UOp::range_const(4, 1);
-
-    // Wrap in BUFFERIZE to materialize the result
-    let bufferize = UOp::bufferize_global(compute, vec![range0, range1]);
-
-    // Wrap in SINK - this is how the real pipeline works
-    // SINK sources are protected from buffer removal
-    let sink = UOp::sink(vec![bufferize]);
+    // Wrap in CONTIGUOUS + SINK (Tinygrad approach)
+    let contiguous = compute.contiguous();
+    let sink = UOp::sink(vec![contiguous]);
 
     // Run rangeify pipeline (Phases 1-4)
     let (rangeified, _ctx) = crate::rangeify::rangeify(sink.clone(), None).expect("Rangeify should succeed");

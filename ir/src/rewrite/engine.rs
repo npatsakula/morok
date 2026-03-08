@@ -424,6 +424,9 @@ where
                     current = new_node;
                 }
                 RewriteResult::Gate(_) | RewriteResult::NoMatch => {
+                    if i > 5 {
+                        tracing::warn!(iterations = i, op = current.op().as_ref(), "high fixpoint iterations");
+                    }
                     break;
                 }
             }
@@ -473,8 +476,11 @@ where
         self.pending.insert(root_key.clone());
         let mut stack: Vec<StackEntry> = vec![StackEntry::new(root.clone())];
 
-        // Limit total iterations to catch infinite loops
-        const MAX_TOTAL_ITERATIONS: usize = 100_000;
+        // Limit total iterations to catch infinite loops.
+        // 500K accommodates large kernels with wide VECTORIZE (e.g., 135-element Index
+        // expressions from conv_transpose pool ops) while still catching true infinite loops.
+        // Tinygrad has no hard limit; this is a safety net.
+        const MAX_TOTAL_ITERATIONS: usize = 500_000;
         let mut iterations = 0;
 
         while let Some(StackEntry { original, stage, working, retry_count }) = stack.pop() {
@@ -500,6 +506,12 @@ where
                 Stage::Link => self.handle_link(original, working),
             }
         }
+
+        tracing::debug!(
+            total_stack_iterations = iterations,
+            results_cached = self.results.results.len(),
+            "rewrite complete"
+        );
 
         self.results.get_direct(&root_key).unwrap_or(root)
     }
@@ -567,6 +579,16 @@ pub struct GraphRewriteOutput {
     pub root: Arc<UOp>,
     /// Map from original nodes to their replacements
     pub becomes_map: HashMap<UOpKey, Arc<UOp>>,
+}
+
+/// Apply graph rewriting to multiple roots sharing a single engine.
+///
+/// All roots are rewritten using the same `RewriteEngine`, so subgraphs shared
+/// between roots are only processed once. This is critical for SINK sources that
+/// share large subgraphs (e.g., bitonic sort network).
+pub fn graph_rewrite_roots<M: Matcher<C>, C>(matcher: &M, roots: &[Arc<UOp>], ctx: &mut C) -> Vec<Arc<UOp>> {
+    let mut engine = RewriteEngine::new(Some(matcher), None::<&NoMatcher>, ctx);
+    roots.iter().map(|root| engine.rewrite(root.clone())).collect()
 }
 
 /// Apply graph rewriting and return both the result and the transformation map.

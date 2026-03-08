@@ -149,6 +149,16 @@ impl<C> SimplifiedPatternMatcher<C> {
         self.indexed.is_empty() && self.wildcards.is_empty()
     }
 
+    /// Number of wildcard patterns (tried for every op).
+    pub fn wildcard_count(&self) -> usize {
+        self.wildcards.len()
+    }
+
+    /// Number of indexed buckets (unique OpKeys with patterns).
+    pub fn indexed_count(&self) -> usize {
+        self.indexed.len()
+    }
+
     /// Attempt to rewrite a UOp using registered patterns.
     ///
     /// This is an inherent method that provides the same functionality as
@@ -197,6 +207,36 @@ impl<C> SimplifiedPatternMatcher<C> {
 impl<C> Default for SimplifiedPatternMatcher<C> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SimplifiedPatternMatcher<()> {
+    /// Lift a context-free matcher into any context type.
+    ///
+    /// Since `()` patterns ignore the context parameter, they can safely run
+    /// under any `D`. Each closure is re-wrapped to discard `&mut D` and pass
+    /// `&mut ()` to the original. This enables combining context-free matchers
+    /// with context-dependent ones via `+`:
+    ///
+    /// ```ignore
+    /// let mega = symbolic().with_context::<PcontigConfig>()
+    ///     + buffer_removal_with_pcontig(); // TypedPatternMatcher<PcontigConfig>
+    /// ```
+    pub fn with_context<D: 'static + Send + Sync>(self) -> SimplifiedPatternMatcher<D> {
+        let mut result = SimplifiedPatternMatcher::<D>::new();
+        for (key, closures) in self.indexed {
+            for closure in closures {
+                result
+                    .indexed
+                    .entry(key.clone())
+                    .or_default()
+                    .push(Box::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
+            }
+        }
+        for closure in self.wildcards {
+            result.wildcards.push(Box::new(move |uop: &Arc<UOp>, _ctx: &mut D| closure(uop, &mut ())));
+        }
+        result
     }
 }
 

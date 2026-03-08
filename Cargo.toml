@@ -6,6 +6,7 @@ members = [
   "dtype",
   "ir",
   "macros",
+  "onnx",
   "runtime",
   "schedule",
   "tensor",

@@ -213,9 +213,23 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
                 return None;
             };
-            if !matches!(false_val.op(), Op::Invalid) { return None; }
+            if !UOp::is_invalid_marker(false_val) { return None; }
 
             Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(cond.clone()) }, node.dtype()))
+        },
+
+        // INDEX(buf, WHERE(cond, idx, Invalid), gate=existing) → INDEX(buf, idx, gate=AND(existing, cond))
+        // Safety net for multi-dimensional padding where nested WHERE-Invalid merge didn't
+        // fire before index lowering. Combines existing gate with new validity condition.
+        node @ Index { buffer, indices, gate: Some(existing_gate) } if indices.len() == 1 => |node, buffer, indices, existing_gate| {
+            let idx_uop = &indices[0];
+            let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
+                return None;
+            };
+            if !UOp::is_invalid_marker(false_val) { return None; }
+
+            let combined_gate = existing_gate.try_and_op(cond).ok()?;
+            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(combined_gate) }, node.dtype()))
         },
 
         // SINK - strip .cast(Index) from sources

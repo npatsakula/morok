@@ -7,4 +7,5 @@ schedule/src/test/
 schedule-macros/src/test/
 tensor/src/test/
 tensor/benches/
+onnx/src/test/
 submodules/

@@ -99,55 +99,54 @@ fn test_keep_bufferize_expensive() {
 }
 
 // Pattern 2: Always-Run Ops Tests
+// Tinygrad KEEPS buffers for ALWAYS_RUN_OPS (CONTIGUOUS, COPY, ASSIGN).
+// These ops are materialization points that must produce actual buffers.
 
 #[test]
-fn test_remove_bufferize_contiguous() {
-    // BUFFERIZE(CONTIGUOUS(x), ranges) should be removed (always-run op)
+fn test_keep_bufferize_contiguous() {
+    // BUFFERIZE(CONTIGUOUS(x), ranges) should be KEPT (always-run op needs its buffer)
     let x = UOp::var("x", DType::Float32, 0, 100);
     let contiguous = x.contiguous();
 
     let range = create_range(10, 0);
-    let bufferized = create_bufferize(contiguous.clone(), vec![range]);
+    let bufferized = create_bufferize(contiguous, vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized, &mut ());
+    let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
-    // Should remove BUFFERIZE and return CONTIGUOUS
-    assert!(Arc::ptr_eq(&result, &contiguous), "CONTIGUOUS shouldn't be buffered");
+    assert!(Arc::ptr_eq(&result, &bufferized), "CONTIGUOUS must keep its buffer");
 }
 
 #[test]
-fn test_remove_bufferize_copy() {
-    // BUFFERIZE(COPY(x, device), ranges) should be removed (always-run op)
+fn test_keep_bufferize_copy() {
+    // BUFFERIZE(COPY(x, device), ranges) should be KEPT (always-run op needs its buffer)
     let x = UOp::var("x", DType::Float32, 0, 100);
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
     let copy = x.copy(device);
 
     let range = create_range(10, 0);
-    let bufferized = create_bufferize(copy.clone(), vec![range]);
+    let bufferized = create_bufferize(copy, vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized, &mut ());
+    let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
-    // Should remove BUFFERIZE and return COPY
-    assert!(Arc::ptr_eq(&result, &copy), "COPY shouldn't be buffered");
+    assert!(Arc::ptr_eq(&result, &bufferized), "COPY must keep its buffer");
 }
 
 #[test]
-fn test_remove_bufferize_assign() {
-    // BUFFERIZE(ASSIGN(target, value), ranges) should be removed (always-run op)
+fn test_keep_bufferize_assign() {
+    // BUFFERIZE(ASSIGN(target, value), ranges) should be KEPT (always-run op needs its buffer)
     let target = UOp::define_global(1, DType::Float32);
     let value = UOp::native_const(1.0f32);
     let assign = UOp::assign(target, value);
 
     let range = create_range(10, 0);
-    let bufferized = create_bufferize(assign.clone(), vec![range]);
+    let bufferized = create_bufferize(assign, vec![range]);
 
     let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized, &mut ());
+    let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
-    // Should remove BUFFERIZE and return ASSIGN
-    assert!(Arc::ptr_eq(&result, &assign), "ASSIGN shouldn't be buffered");
+    assert!(Arc::ptr_eq(&result, &bufferized), "ASSIGN must keep its buffer");
 }
 
 #[test]

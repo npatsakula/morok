@@ -18,7 +18,7 @@
 //! This matches Tinygrad's approach using `weakref.WeakKeyDictionary` - no manual
 //! cleanup calls required in user code.
 
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -56,14 +56,40 @@ pub(crate) fn next_uop_id() -> u64 {
 ///
 /// Uses stable UOp IDs for child UOps to avoid infinite recursion during hashing.
 /// IDs are monotonic and never reused, eliminating ABA problem from pointer-based approach.
-#[derive(Eq, PartialEq, Hash, Clone)]
+///
+/// Performance: hash is pre-computed during construction and cached in `cached_hash`.
+/// This avoids re-hashing on every HashMap lookup (the previous bottleneck: 57% of CPU
+/// in xxhash). Follows Tinygrad's approach where UOp hash is `id()`-based (~nanoseconds).
+#[derive(Clone)]
 struct UOpKey {
     op_discriminant: std::mem::Discriminant<Op>,
     dtype: DType,
     src_ids: SmallVec<[u64; 4]>,
-    // Store additional data that's not in src_ids
     op_data: OpData,
+    /// Pre-computed hash — avoids re-hashing on every HashMap operation.
+    cached_hash: u64,
 }
+
+impl Hash for UOpKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Use pre-computed hash directly — O(1) regardless of OpData complexity
+        state.write_u64(self.cached_hash);
+    }
+}
+
+impl PartialEq for UOpKey {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast path: different hashes → definitely not equal
+        self.cached_hash == other.cached_hash
+            && self.op_discriminant == other.op_discriminant
+            && self.dtype == other.dtype
+            && self.src_ids == other.src_ids
+            && self.op_data == other.op_data
+    }
+}
+
+impl Eq for UOpKey {}
 
 /// Non-recursive data from Op variants for hashing.
 ///
@@ -214,7 +240,22 @@ impl UOpKey {
             _ => OpData::None,
         };
 
-        Self { op_discriminant, dtype, src_ids, op_data }
+        // Pre-compute hash using xxhash (fast, non-cryptographic).
+        // Cached to avoid re-hashing on every HashMap lookup — the previous
+        // bottleneck was 57% of CPU time spent in xxhash due to repeated hashing.
+        let cached_hash = {
+            use xxhash_rust::xxh64::Xxh64;
+            let mut h = Xxh64::new(0);
+            op_discriminant.hash(&mut h);
+            dtype.hash(&mut h);
+            for id in &src_ids {
+                h.write_u64(*id);
+            }
+            op_data.hash(&mut h);
+            h.finish()
+        };
+
+        Self { op_discriminant, dtype, src_ids, op_data, cached_hash }
     }
 }
 
@@ -331,7 +372,6 @@ impl UOp {
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
             vmin_vmax_cache: std::sync::OnceLock::new(),
-            content_hash_cache: std::sync::OnceLock::new(),
             metadata: None,
         });
         let new_weak = Arc::downgrade(&new_arc);
@@ -395,7 +435,6 @@ impl UOp {
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
             vmin_vmax_cache: std::sync::OnceLock::new(),
-            content_hash_cache: std::sync::OnceLock::new(),
             metadata: Some(Arc::new(metadata)),
         })
     }

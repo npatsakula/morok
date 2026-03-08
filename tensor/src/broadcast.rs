@@ -96,7 +96,7 @@ impl Tensor {
     /// Returns error if:
     /// - Shape has more dimensions than target
     /// - Dimension sizes are incompatible (not 1 and not equal to target)
-    pub(crate) fn broadcast_to(&self, target_shape: &morok_ir::shape::Shape) -> Result<Tensor> {
+    pub fn broadcast_to(&self, target_shape: &morok_ir::shape::Shape) -> Result<Tensor> {
         let self_shape = self.shape()?;
 
         // Early return if already correct shape

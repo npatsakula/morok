@@ -19,6 +19,28 @@ pub enum ConstValue {
     Bool(bool),
 }
 
+macro_rules! impl_from_widening {
+    ($($ty:ty => Int),+ $(,)?) => { $(
+        impl From<$ty> for ConstValue {
+            fn from(v: $ty) -> Self { ConstValue::Int(v as i64) }
+        }
+    )+ };
+    ($($ty:ty => UInt),+ $(,)?) => { $(
+        impl From<$ty> for ConstValue {
+            fn from(v: $ty) -> Self { ConstValue::UInt(v as u64) }
+        }
+    )+ };
+}
+
+impl_from_widening!(i8 => Int, i16 => Int, i32 => Int);
+impl_from_widening!(u8 => UInt, u16 => UInt, u32 => UInt);
+
+impl From<f32> for ConstValue {
+    fn from(v: f32) -> Self {
+        ConstValue::Float(v as f64)
+    }
+}
+
 /// Manual Hash impl because f64 doesn't implement Hash.
 /// Uses to_bits() for floats, which means NaN values with identical bit patterns hash equally.
 impl Hash for ConstValue {
@@ -148,6 +170,45 @@ impl ConstValue {
             UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(1),
             FP8E4M3 | FP8E5M2 | Float16 | BFloat16 | Float32 | Float64 => Self::Float(1.0),
             Void | Index => Self::Int(1), // TODO: remove this types from scalars
+        }
+    }
+
+    /// Minimum representable value for a scalar dtype (matches Tinygrad's `dtypes.min`).
+    pub const fn min(dtype: ScalarDType) -> Self {
+        use ScalarDType::*;
+        match dtype {
+            Bool => Self::Bool(false),
+            Int8 => Self::Int(i8::MIN as i64),
+            Int16 => Self::Int(i16::MIN as i64),
+            Int32 => Self::Int(i32::MIN as i64),
+            Int64 | Index => Self::Int(i64::MIN),
+            UInt8 | UInt16 | UInt32 | UInt64 => Self::UInt(0),
+            FP8E4M3 | FP8E5M2 | Float16 => Self::Float(-65504.0),
+            BFloat16 => Self::Float(-3.38953e38),
+            Float32 => Self::Float(f32::MIN as f64),
+            Float64 => Self::Float(f64::MIN),
+            Void => Self::Int(0),
+        }
+    }
+
+    /// Maximum representable value for a scalar dtype (matches Tinygrad's `dtypes.max`).
+    pub const fn max(dtype: ScalarDType) -> Self {
+        use ScalarDType::*;
+        match dtype {
+            Bool => Self::Bool(true),
+            Int8 => Self::Int(i8::MAX as i64),
+            Int16 => Self::Int(i16::MAX as i64),
+            Int32 => Self::Int(i32::MAX as i64),
+            Int64 | Index => Self::Int(i64::MAX),
+            UInt8 => Self::UInt(u8::MAX as u64),
+            UInt16 => Self::UInt(u16::MAX as u64),
+            UInt32 => Self::UInt(u32::MAX as u64),
+            UInt64 => Self::UInt(u64::MAX),
+            FP8E4M3 | FP8E5M2 | Float16 => Self::Float(65504.0),
+            BFloat16 => Self::Float(3.38953e38),
+            Float32 => Self::Float(f32::MAX as f64),
+            Float64 => Self::Float(f64::MAX),
+            Void => Self::Int(0),
         }
     }
 

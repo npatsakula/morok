@@ -339,27 +339,24 @@ fn test_buffer_removal_cheap_compute() {
 }
 
 #[test]
-fn test_buffer_removal_always_run_ops() {
+fn test_buffer_removal_always_run_ops_kept() {
     let matcher = patterns::buffer_removal();
 
-    // Test: BUFFERIZE(CONTIGUOUS) should be removed (always-run op)
+    // Test: BUFFERIZE(CONTIGUOUS) should be KEPT (Tinygrad: ALWAYS_RUN_OPS keep their buffers).
+    // CONTIGUOUS/COPY/ASSIGN must produce actual buffers - they are materialization points.
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let contiguous = src.contiguous();
 
     let range_end = UOp::index_const(10);
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
-    let bufferize = UOp::bufferize(contiguous.clone(), vec![range], BufferizeOpts::local());
+    let bufferize = UOp::bufferize(contiguous, vec![range], BufferizeOpts::local());
 
     let result = matcher.rewrite(&bufferize, &mut ());
 
-    match result {
-        RewriteResult::Rewritten(rewritten) => {
-            assert!(Arc::ptr_eq(&rewritten, &contiguous), "Should remove BUFFERIZE from always-run op");
-        }
-        _ => {
-            // Acceptable depending on implementation
-        }
-    }
+    assert!(
+        matches!(result, RewriteResult::NoMatch),
+        "BUFFERIZE(CONTIGUOUS) must be kept - always-run ops need their buffers"
+    );
 }
 
 #[test]

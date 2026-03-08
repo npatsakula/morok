@@ -33,16 +33,34 @@ use tracing::trace;
 
 use crate::TypedPatternMatcher;
 
+/// Count divmod operations (Idiv + Mod) in an expression tree.
+///
+/// Ported from Tinygrad `simplify.py:14-18` (`count_divmod`).
+/// Used to decide whether merging/linearizing indices reduces complexity.
+pub fn count_divmod(uop: &Arc<UOp>) -> usize {
+    uop.toposort().iter().filter(|n| matches!(n.op(), Op::Binary(BinaryOp::Idiv | BinaryOp::Mod, _, _))).count()
+}
+
 /// Extract dimension from an index expression.
 ///
 /// Index expressions can be:
 /// - Direct RANGE - use its size
 /// - DefineVar - use max_val + 1
+/// - WHERE(cond, idx, Invalid) from PAD - extract actual input dim from validity
 /// - Complex expression with RANGE ops (from shift_to) - multiply all RANGE sizes
 ///
 /// This handles the transformation output from rangeify where indices
 /// become expressions like `Add(Mul(Thread, stride), Loop)`.
-fn extract_index_dimension(idx_uop: &Arc<UOp>) -> Option<i64> {
+pub fn extract_index_dimension(idx_uop: &Arc<UOp>) -> Option<i64> {
+    // Case 0: WHERE(cond, idx, Invalid) from PAD
+    // The RANGE inside is the OUTPUT range, which is larger than the buffer dimension.
+    // Extract the actual input dimension from the validity condition.
+    if let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = idx_uop.op()
+        && matches!(false_val.op(), Op::Invalid)
+    {
+        return extract_dim_from_validity(cond, true_val);
+    }
+
     // Case 1: Direct RANGE - use its size directly
     if let Op::Range { end, .. } = idx_uop.op() {
         if let Op::Const(cv) = end.op()
@@ -65,11 +83,11 @@ fn extract_index_dimension(idx_uop: &Arc<UOp>) -> Option<i64> {
 
     for node in idx_uop.toposort() {
         if let Op::Range { end, .. } = node.op() {
-            if let Op::Const(cv) = end.op() {
-                if let ConstValue::Int(size) = cv.0 {
-                    product *= size;
-                    found_range = true;
-                }
+            if let Op::Const(cv) = end.op()
+                && let ConstValue::Int(size) = cv.0
+            {
+                product *= size;
+                found_range = true;
             } else {
                 return None; // Symbolic range size
             }
@@ -88,10 +106,76 @@ fn extract_index_dimension(idx_uop: &Arc<UOp>) -> Option<i64> {
     }
 }
 
+/// Extract the actual buffer dimension from a PAD validity condition.
+///
+/// PAD creates `WHERE(valid, adjusted_idx, Invalid)` where:
+/// - `valid = (rng >= begin) AND (rng < shape + begin)` (possibly simplified)
+/// - `adjusted_idx = rng - begin`
+/// - The actual buffer dimension is `shape` (not the output range size)
+///
+/// After symbolic simplification, common patterns:
+/// - begin=0: `CMPLT(rng, shape)` → dim = shape
+/// - end=0 (begin>0): `CMPGE(rng, begin)` → dim = rng.end - begin
+/// - both nonzero: `AND(CMPGE(rng, begin), CMPLT(rng, shape+begin))` → dim = shape
+fn extract_dim_from_validity(cond: &Arc<UOp>, true_val: &Arc<UOp>) -> Option<i64> {
+    // Pattern 1: CMPLT(rng, CONST(upper)) — begin=0, dim = upper
+    if let Op::Binary(BinaryOp::Lt, _rng, upper) = cond.op()
+        && let Some(u) = const_int(upper)
+    {
+        return Some(u);
+    }
+
+    // Pattern 2: AND(CMPGE(rng, CONST(begin)), CMPLT(rng, CONST(upper))) — dim = upper - begin
+    if let Op::Binary(BinaryOp::And, left, right) = cond.op()
+        && let Some((begin, upper)) = extract_ge_lt_bounds(left, right).or_else(|| extract_ge_lt_bounds(right, left))
+    {
+        return Some(upper - begin);
+    }
+
+    // Pattern 3: CMPGE(rng, CONST(begin)) — end=0, extract dim from true_val
+    // adjusted_idx = rng - begin, dim = rng.end - begin
+    if let Op::Binary(BinaryOp::Ge, rng, begin_uop) = cond.op()
+        && let Some(begin) = const_int(begin_uop)
+        && let Op::Range { end, .. } = rng.op()
+        && let Some(rng_end) = const_int(end)
+    {
+        return Some(rng_end - begin);
+    }
+
+    // Fallback: use vmin/vmax of the true branch (adjusted index)
+    match (true_val.vmin(), true_val.vmax()) {
+        (ConstValue::Int(min), ConstValue::Int(max)) if max >= min => Some(max - min + 1),
+        _ => None,
+    }
+}
+
+/// Extract an i64 constant from a UOp.
+fn const_int(uop: &Arc<UOp>) -> Option<i64> {
+    if let Op::Const(cv) = uop.op()
+        && let ConstValue::Int(v) = cv.0
+    {
+        return Some(v);
+    }
+    None
+}
+
+/// Extract begin and upper bounds from a pair that might be (CMPGE, CMPLT).
+fn extract_ge_lt_bounds(maybe_ge: &Arc<UOp>, maybe_lt: &Arc<UOp>) -> Option<(i64, i64)> {
+    let Op::Binary(BinaryOp::Ge, range_ge, begin_uop) = maybe_ge.op() else { return None };
+    let Op::Binary(BinaryOp::Lt, range_lt, upper_uop) = maybe_lt.op() else { return None };
+    // Both conditions must reference the same RANGE variable
+    if !Arc::ptr_eq(range_ge, range_lt) {
+        return None;
+    }
+    let begin = const_int(begin_uop)?;
+    let upper = const_int(upper_uop)?;
+    Some((begin, upper))
+}
+
 /// Compute row-major strides from dimensions.
 ///
 /// For dims `[D0, D1, D2]`, strides are `[D1*D2, D2, 1]`.
-pub(crate) fn compute_row_major_strides(dims: &[i64]) -> Vec<i64> {
+pub fn compute_row_major_strides(dims: &[i64]) -> Vec<i64> {
     let mut strides = vec![1i64; dims.len()];
     for i in (0..dims.len().saturating_sub(1)).rev() {
         strides[i] = strides[i + 1] * dims[i + 1];
@@ -118,7 +202,7 @@ fn get_vector_count(indices: &[Arc<UOp>]) -> usize {
 /// Build a linear index expression from multi-dimensional indices and strides.
 ///
 /// Computes: `indices[0] * strides[0] + indices[1] * strides[1] + ...`
-pub(crate) fn build_linear_index(indices: &[Arc<UOp>], strides: &[i64]) -> Arc<UOp> {
+pub fn build_linear_index(indices: &[Arc<UOp>], strides: &[i64]) -> Arc<UOp> {
     // Start with zero
     let mut linear = UOp::index_const(0);
 
@@ -184,17 +268,17 @@ fn build_vectorized_linear_index(indices: &[Arc<UOp>], strides: &[i64], vcount: 
 ///
 /// Where `linear = i * (D1*D2) + j * D2 + k` for row-major layout.
 ///
-/// This eliminates backend-specific linearization in LLVM/C codegen.
+/// Linearization is **conditional**: only applies when the linearized form
+/// has no more divmod operations than the original multi-index form.
+/// Uses the `count_divmod(new) <= count_divmod(old)` heuristic from
+/// Tinygrad's `simplify.py`.
+///
+/// If rejected, codegen backends handle multi-index INDEX natively.
 pub fn pm_linearize_multi_index() -> TypedPatternMatcher<()> {
     crate::patterns! {
         // Match INDEX with multiple indices
         idx @ Index { buffer, indices, gate } if indices.len() > 1 => |idx, buffer, indices, gate| {
             // Extract dimensions from index expressions.
-            // Unlike Tinygrad which uses buffer.shape, we extract dimensions from:
-            // - Direct RANGE ops: RANGE.end
-            // - DefineVar: max_val + 1
-            // - Complex expressions: multiply all contained RANGE sizes
-            // - Fallback: vmin/vmax range analysis
             let dims: Option<Vec<i64>> = indices
                 .iter()
                 .map(extract_index_dimension)
@@ -212,13 +296,6 @@ pub fn pm_linearize_multi_index() -> TypedPatternMatcher<()> {
                 }
             };
 
-            trace!(
-                uop_id = idx.id,
-                index_dims = ?dims,
-                "linearize_multi_index: linearizing {}-dimensional index",
-                indices.len()
-            );
-
             // Compute row-major strides
             let strides = compute_row_major_strides(&dims);
 
@@ -227,11 +304,34 @@ pub fn pm_linearize_multi_index() -> TypedPatternMatcher<()> {
 
             let linear_index = if is_vectorized {
                 let vcount = get_vector_count(indices);
-                trace!(uop_id = idx.id, vcount, "linearize_multi_index: vectorized indices");
                 build_vectorized_linear_index(indices, &strides, vcount)
             } else {
                 build_linear_index(indices, &strides)
             };
+
+            // Heuristic: only apply if linearization doesn't increase divmod complexity.
+            // Ported from Tinygrad's simplify_merge_adjacent count_divmod check.
+            let original_divmod: usize = indices.iter().map(count_divmod).sum();
+            let linearized_divmod = count_divmod(&linear_index);
+
+            if linearized_divmod > original_divmod {
+                trace!(
+                    uop_id = idx.id,
+                    original_divmod,
+                    linearized_divmod,
+                    "linearize_multi_index: rejected (would increase divmod), keeping multi-index"
+                );
+                return None;
+            }
+
+            trace!(
+                uop_id = idx.id,
+                index_dims = ?dims,
+                original_divmod,
+                linearized_divmod,
+                "linearize_multi_index: linearizing {}-dimensional index",
+                indices.len()
+            );
 
             // Create new INDEX with single linear index, preserving gate and dtype
             let new_op = Op::Index {

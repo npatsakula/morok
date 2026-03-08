@@ -45,7 +45,8 @@ fn test_shape_product() {
 fn test_validate_shape() {
     assert!(validate_shape(&[1, 2, 3]).is_ok());
     assert!(validate_shape(&[1, -2, 3]).is_err());
-    assert!(validate_shape(&[1, 0, 3]).is_err());
+    assert!(validate_shape(&[0]).is_ok()); // zero-size tensors are valid
+    assert!(validate_shape(&[1, 0, 3]).is_ok());
 }
 
 #[test]

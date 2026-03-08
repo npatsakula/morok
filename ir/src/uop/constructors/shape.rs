@@ -73,18 +73,9 @@ impl UOp {
     /// - No negative dimensions in new_shape
     /// - Product of input shape == product of output shape
     pub fn try_reshape(self: &Arc<Self>, new_shape: &crate::shape::Shape) -> Result<Arc<Self>> {
-        use crate::error::ReshapeNegativeDimensionSnafu;
         use crate::error::ReshapeSizeMismatchSnafu;
         use crate::shape::shape_to_uop;
         use snafu::ensure;
-
-        // Check for negative dimensions
-        for dim in new_shape {
-            if let Some(val) = dim.as_const() {
-                ensure!(val > 0, ReshapeNegativeDimensionSnafu { shape: vec![val as isize] });
-            }
-            // Symbolic dimensions are assumed positive (can't validate at compile time)
-        }
 
         // Validate product equality if source shape is known
         if let Some(src_shape) = self.shape()? {
@@ -125,10 +116,7 @@ impl UOp {
             for (dim_idx, (src_dim, new_dim)) in src_shape.iter().zip(new_shape.iter()).enumerate() {
                 // If both are concrete, validate expand rule
                 if let (Some(s), Some(ns)) = (src_dim.as_const(), new_dim.as_const()) {
-                    ensure!(
-                        s == ns || (s == 1 && ns >= 1),
-                        ExpandInvalidDimensionSnafu { dim: dim_idx, input: s, output: ns }
-                    );
+                    ensure!(s == ns || s == 1, ExpandInvalidDimensionSnafu { dim: dim_idx, input: s, output: ns });
                 }
                 // Symbolic dimensions assumed compatible
             }

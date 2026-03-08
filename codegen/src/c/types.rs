@@ -27,6 +27,26 @@ pub fn c_scalar(s: ScalarDType) -> &'static str {
     }
 }
 
+/// Space-free identifier base for vector typedef names (e.g. `uchar4`, `llong2`).
+fn c_vector_base(s: ScalarDType) -> &'static str {
+    match s {
+        ScalarDType::Bool => "bool",
+        ScalarDType::Int8 => "char",
+        ScalarDType::UInt8 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => "uchar",
+        ScalarDType::Int16 => "short",
+        ScalarDType::UInt16 => "ushort",
+        ScalarDType::Int32 => "int",
+        ScalarDType::UInt32 => "uint",
+        ScalarDType::Int64 | ScalarDType::Index => "llong",
+        ScalarDType::UInt64 => "ullong",
+        ScalarDType::Float16 => "half",
+        ScalarDType::BFloat16 => "bhalf",
+        ScalarDType::Float32 => "float",
+        ScalarDType::Float64 => "double",
+        ScalarDType::Void => "void",
+    }
+}
+
 /// Convert a DType to its C type string.
 ///
 /// For vectors, returns the typedef name (e.g. `float4`).
@@ -35,7 +55,7 @@ pub fn c_dtype(dtype: &DType) -> String {
     match dtype {
         DType::Scalar(s) => c_scalar(*s).to_string(),
         DType::Vector { scalar, count } => {
-            format!("{}{}", c_scalar(*scalar), count)
+            format!("{}{}", c_vector_base(*scalar), count)
         }
         DType::Ptr { base, .. } => format!("{}*", c_dtype(base)),
         DType::Image { .. } => "void*".to_string(),
@@ -148,12 +168,14 @@ pub fn collect_vector_typedefs(nodes: &[Arc<UOp>]) -> Vec<String> {
 
     seen.into_iter()
         .map(|(scalar, count)| {
-            let scalar_name = c_scalar(scalar);
-            let vec_name = format!("{}{}", scalar_name, count);
+            // Bool can't be used as ext_vector_type base; store as unsigned char
+            let storage_scalar = if scalar == ScalarDType::Bool { "unsigned char" } else { c_scalar(scalar) };
+            let vec_name = format!("{}{}", c_vector_base(scalar), count);
             let alignment = scalar.bytes() * count;
-            // Use next power of two for alignment
             let alignment = alignment.next_power_of_two();
-            format!("typedef {scalar_name} {vec_name} __attribute__((aligned({alignment}),ext_vector_type({count})));",)
+            format!(
+                "typedef {storage_scalar} {vec_name} __attribute__((aligned({alignment}),ext_vector_type({count})));",
+            )
         })
         .collect()
 }

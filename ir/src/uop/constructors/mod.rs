@@ -153,17 +153,18 @@ impl UOp {
         let true_shape = true_val.shape()?;
         let false_shape = false_val.shape()?;
 
-        // Validate: either shapes match or at least one is None
+        // Validate: shapes must be compatible.
+        // A scalar (empty shape) is compatible with any shape (implicit broadcast).
         match (true_shape, false_shape) {
-            (Some(ts), Some(fs)) if !shapes_equal(ts, fs) => {
-                // Both have shapes but they differ - ERROR
+            (Some(ts), Some(fs)) if !shapes_equal(ts, fs) && !ts.is_empty() && !fs.is_empty() => {
+                // Both have non-scalar shapes that differ - ERROR
                 TernaryBranchShapeMismatchSnafu {
                     true_branch: Box::new(ts.clone()),
                     false_branch: Box::new(fs.clone()),
                 }
                 .fail()
             }
-            _ => Ok(()), // Either shapes match or at least one is None
+            _ => Ok(()),
         }
     }
 

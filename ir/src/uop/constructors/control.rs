@@ -76,6 +76,9 @@ impl UOp {
     ///
     /// * `ranges` - The RANGE or REDUCE operations being closed
     pub fn end(self: &Arc<Self>, ranges: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        if ranges.is_empty() {
+            return self.clone();
+        }
         Self::new(Op::End { computation: self.clone(), ranges }, DType::Void)
     }
 

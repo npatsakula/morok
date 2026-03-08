@@ -319,7 +319,7 @@ fn test_sum_axis0_value() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+
 fn test_sum_axis1_value() {
     test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
@@ -329,7 +329,7 @@ fn test_sum_axis1_value() {
 }
 
 #[test]
-#[tracing_test::traced_test]
+
 fn test_sum_keepdim_value() {
     test_setup();
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
@@ -422,7 +422,7 @@ fn test_min_negative_value() {
 // ========== Argmax Tests (from Tinygrad test_ops.py:1087-1105) ==========
 
 #[test]
-#[tracing_test::traced_test]
+
 fn test_argmax_debug_steps() {
     test_setup();
 
@@ -431,43 +431,25 @@ fn test_argmax_debug_steps() {
     let b = Tensor::from_slice([1.0f32, 5.0, 3.0]);
     let eq = a.try_eq(&b).unwrap();
     let eq_result = eq.realize().unwrap().to_ndarray::<bool>().unwrap();
-    println!("Simple eq test: a=[1,2,3], b=[1,5,3], a==b={:?}", eq_result.as_slice().unwrap());
+
     assert_eq!(eq_result.as_slice().unwrap(), &[true, false, true], "Simple eq failed");
 
     // Test with broadcast
     let c = Tensor::from_slice([1.0f32, 2.0, 3.0, 2.0]);
     let two = Tensor::from_slice([2.0f32]);
     let two_broadcast = two.try_expand(&[4]).unwrap();
-    println!("two_broadcast shape={:?}", two_broadcast.uop().shape());
     let eq2 = c.try_eq(&two_broadcast).unwrap();
     let eq2_result = eq2.realize().unwrap().to_ndarray::<bool>().unwrap();
-    println!(
-        "Broadcast eq: c=[1,2,3,2], two_broadcast=[2,2,2,2], c==two_broadcast={:?}",
-        eq2_result.as_slice().unwrap()
-    );
     // Expected: [false, true, false, true] (positions 1 and 3 equal 2)
     assert_eq!(eq2_result.as_slice().unwrap(), &[false, true, false, true], "Broadcast eq failed");
 
     // Test expand of reduction result
     let d = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0]);
     let d_max = d.max_with().axes(0).keepdim(true).call().unwrap();
-    println!("d_max shape={:?}", d_max.uop().shape());
-
-    // Realize d_max first - IMPORTANT: use the realized tensor for subsequent ops
-    // In Rust, tensor.clone().realize() creates a new independent tensor.
-    // The original tensor's uop is unchanged, so we must use the realized result.
     let d_max_realized = d_max.realize().unwrap();
-    let d_max_value = d_max_realized.clone().to_ndarray::<f32>().unwrap();
-    println!("DEBUG: d_max realized value = {:?}", d_max_value.as_slice().unwrap());
-
-    // Use the REALIZED d_max for expansion
     let d_max_expanded = d_max_realized.try_expand(&[4]).unwrap();
-    println!("d_max_expanded shape={:?}", d_max_expanded.uop().shape());
-
     let eq3 = d.try_eq(&d_max_expanded).unwrap();
-    eprintln!("=== EQ3 AST ===\n{}", eq3.uop().tree_full());
     let eq3_result = eq3.realize().unwrap().to_ndarray::<bool>().unwrap();
-    println!("Reduction expand eq: d=[1,5,3,2], d_max=5, eq={:?}", eq3_result.as_slice().unwrap());
     // Expected: [false, true, false, false] (only position 1 equals 5)
     assert_eq!(eq3_result.as_slice().unwrap(), &[false, true, false, false], "Reduction expand eq failed");
 }
@@ -528,6 +510,7 @@ fn test_argmax_full_steps() {
 }
 
 #[test]
+
 fn test_argmax_value_1d() {
     test_setup();
     let t = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0]);
@@ -587,6 +570,7 @@ fn test_argmin_value_1d() {
 }
 
 #[test]
+
 fn test_argmin_negative_value() {
     test_setup();
     let t = Tensor::from_slice([1.5f32, -2.3, 0.5, 1.0]);
@@ -715,7 +699,7 @@ fn test_all_value_all_false() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
+//
 fn test_all_2d_axis0_value() {
     test_setup();
     let t = Tensor::from_slice([true, true, false, true]).try_reshape(&[2, 2]).unwrap();
@@ -787,22 +771,18 @@ fn test_debug_argmin_intermediate() {
     // Test neg first - does it produce correct values?
     let inverted = -values.clone();
     let inv_arr = realize_f32(inverted);
-    println!("Negated values: {:?}", inv_arr.as_slice().unwrap());
-    // Expected: [-5.0, -3.0, -1.0, -4.0, -2.0]
     assert_close_f32(&inv_arr, &[-5.0, -3.0, -1.0, -4.0, -2.0], 1e-6);
 
     // Test max of explicit negated (should be -1.0)
     let inverted2 = Tensor::from_slice([-5.0f32, -3.0, -1.0, -4.0, -2.0]);
     let max_inv = inverted2.max_with().axes(0).keepdim(false).call().unwrap();
     let max_arr = realize_f32(max_inv);
-    println!("Max of explicit negated: {:?}", max_arr.as_slice().unwrap());
     assert_close_f32(&max_arr, &[-1.0], 1e-6);
 
     // Test argmax of explicit negated values
     let inverted3 = Tensor::from_slice([-5.0f32, -3.0, -1.0, -4.0, -2.0]);
     let argmax_inv = inverted3.argmax(0).unwrap();
     let argmax_arr = realize_i32(argmax_inv);
-    println!("Argmax of explicit negated: {:?}", argmax_arr.as_slice().unwrap());
     assert_eq!(argmax_arr.as_slice().unwrap()[0], 2); // -1.0 is at index 2
 }
 
@@ -816,8 +796,6 @@ fn test_debug_lazy_neg_max() {
     let inverted = -values.clone(); // lazy neg
     let max_lazy = inverted.max(()).unwrap();
     let max_arr = realize_f32(max_lazy);
-    println!("Max of LAZY negated: {:?}", max_arr.as_slice().unwrap());
-    // Should be -1.0 (max of [-5, -3, -1, -4, -2])
     assert_close_f32(&max_arr, &[-1.0], 1e-6);
 }
 
@@ -831,8 +809,6 @@ fn test_debug_lazy_neg_argmax() {
     let inverted = -values; // lazy neg
     let argmax_lazy = inverted.argmax(0).unwrap(); // lazy argmax of lazy neg
     let argmax_arr = realize_i32(argmax_lazy);
-    println!("Argmax of LAZY negated: {:?}", argmax_arr.as_slice().unwrap());
-    // Should be 2 (index of -1.0, which is the max of [-5, -3, -1, -4, -2])
     assert_eq!(argmax_arr.as_slice().unwrap()[0], 2);
 }
 #[test]
@@ -845,19 +821,18 @@ fn test_indices_cast_bug() {
     // Create indices tensor [5, 4, 3, 2, 1]
     let indices = Tensor::arange(5, Some(0), Some(-1)).unwrap();
 
-    // Realize BEFORE cast
-    let before_cast = indices.clone().realize().unwrap().to_ndarray::<i32>().unwrap();
-    eprintln!("BEFORE CAST: {:?}", before_cast.as_slice().unwrap());
-
-    // Cast to Int32 (should be no-op since arange returns Int32)
     let indices_i32 = indices.cast(DType::Int32).unwrap();
-
-    // Check UOp tree
-    eprintln!("CAST UOp tree:\n{}", indices_i32.uop().tree_full());
-
-    // Realize AFTER cast
     let after_cast = indices_i32.realize().unwrap().to_ndarray::<i32>().unwrap();
-    eprintln!("AFTER CAST: {:?}", after_cast.as_slice().unwrap());
 
     assert_eq!(after_cast.as_slice().unwrap(), &[5, 4, 3, 2, 1]);
+}
+
+#[test]
+fn test_hardmax_basic() {
+    let x = Tensor::from_slice([1.0f32, 3.0, 2.0, 5.0, 4.0, 0.0]).try_reshape(&[2, 3]).unwrap();
+    let result = x.hardmax(-1).unwrap();
+    let arr = result.to_ndarray::<f32>().unwrap();
+    assert_eq!(arr.shape(), &[2, 3]);
+    let vals: Vec<f32> = arr.iter().copied().collect();
+    assert_eq!(vals, vec![0.0, 1.0, 0.0, 1.0, 0.0, 0.0]);
 }

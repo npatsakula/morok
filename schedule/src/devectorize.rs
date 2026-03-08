@@ -257,9 +257,10 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:221)
+    // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:232)
+    // Handles both scalar Invalid and vectorized VECTORIZE(Invalid,...) from expansion.
     if let Op::Ternary(TernaryOp::Where, _, _, f) = alu.op()
-        && matches!(f.op(), Op::Invalid)
+        && UOp::is_invalid_marker(f)
     {
         return None;
     }
@@ -815,13 +816,14 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     let buf = if let Op::Vectorize { elements } = buffer.op() { elements.first()?.clone() } else { buffer.clone() };
 
-    // Generate scalar INDEX ops and simplify
+    // Generate scalar INDEX ops and simplify.
     let scalar_indices: Vec<_> = (0..count)
         .map(|i| {
+            let lane_gate = gate.as_ref().map(|g| if g.dtype().vcount() > 1 { g.gep(vec![i]) } else { g.clone() });
             UOp::index()
                 .buffer(buf.clone())
                 .indices(vec![vec.gep(vec![i])])
-                .maybe_gate(gate.clone())
+                .maybe_gate(lane_gate)
                 .ptr(true)
                 .call()
                 .expect("ICE: unable to create index")
@@ -831,13 +833,26 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let midx = graph_rewrite(&(symbolic() + load_store_indexing_patterns()), UOp::sink(scalar_indices), &mut ());
     let Op::Sink { sources } = midx.op() else { return None };
 
-    // Extract (valid, root, offset) for each lane
-    let mut offsets_by_root: HashMap<(u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
+    // Extract (valid, root, offset, gate) for each lane.
+    // Gate is included in the grouping key so lanes with different gates (e.g., valid vs invalid
+    // from padding) are grouped separately. This ensures PTRCAT groups have uniform gate values.
+    //
+    // Important: collect all lane data first to keep Arc<UOp> refs alive. Temporary UOps
+    // (e.g. const(true) from get_valid()) would get GC'd between loop iterations via the
+    // weak-ref hash consing cache, producing different ids for structurally identical nodes.
+    struct LaneData {
+        valid: Arc<UOp>,
+        root: Arc<UOp>,
+        offset: i64,
+        gate_id: u64,
+    }
+    let mut lane_data: Vec<(usize, LaneData)> = Vec::with_capacity(count);
 
     for (lane, idx_op) in sources.iter().enumerate() {
-        let Op::Index { indices: simp_indices, .. } = idx_op.op() else { continue };
+        let Op::Index { indices: simp_indices, gate: lane_gate, .. } = idx_op.op() else { continue };
         let idx = simp_indices.first()?.get_idx();
         let valid = simp_indices.first()?.get_valid();
+        let gate_id = lane_gate.as_ref().map_or(u64::MAX, |g| g.id);
 
         let (root, offset) = match idx.op() {
             // Invalid grouped separately (devectorizer.py:72-77)
@@ -859,8 +874,14 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
             _ => (idx.clone(), 0),
         };
 
-        let key = (valid.content_hash(), root.content_hash());
-        offsets_by_root.entry(key).or_default().entry(offset).or_default().push(lane);
+        lane_data.push((lane, LaneData { valid, root, offset, gate_id }));
+    }
+
+    // Now build grouping map — all Arcs are alive so ids are stable
+    let mut offsets_by_root: HashMap<(u64, u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
+    for (lane, data) in &lane_data {
+        let key = (data.valid.id, data.root.id, data.gate_id);
+        offsets_by_root.entry(key).or_default().entry(data.offset).or_default().push(*lane);
     }
 
     // Group consecutive offsets and build PTRCAT

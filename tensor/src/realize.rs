@@ -48,7 +48,8 @@ use crate::{
 };
 use morok_device::{Buffer, device::Device};
 use morok_dtype::DType;
-use morok_ir::{AxisId, DeviceSpec, Op, SInt, UOp};
+use morok_ir::pattern::is_any_const;
+use morok_ir::{DeviceSpec, Op, UOp, UOpKey};
 use morok_runtime::{
     ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, ParallelGroup,
     PreparedKernel,
@@ -82,14 +83,44 @@ impl Tensor {
     ///
     /// Returns error if preparation or execution fails.
     pub fn realize(self) -> Result<Self> {
-        let uop = self.uop();
-        let input_buffer_ids: std::collections::HashSet<u64> = collect_input_buffers(&uop).keys().copied().collect();
+        // Already realized — ensure buffer is attached and return.
+        if self.uop().has_buffer_identity() {
+            return Ok(self.ensure_buffer());
+        }
+        // Pure constant — no computation needed.
+        if is_any_const(&self.uop()) {
+            return Ok(self);
+        }
+
+        let old_uop = self.uop();
+        let input_buffer_ids: std::collections::HashSet<u64> =
+            collect_input_buffers(&old_uop).keys().copied().collect();
 
         let plan = self.prepare()?;
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
 
-        self.finalize_realize(&plan, &uop, &input_buffer_ids)
+        let result = self.finalize_realize(&plan, &old_uop)?;
+
+        // Propagate realized buffer to all live tensors referencing old_uop.
+        // This is Tinygrad's _apply_map_to_tensors approach: after realize, all
+        // tensors sharing this subgraph see the buffer instead of recomputing.
+        let realized_uop = result.uop();
+        if !Arc::ptr_eq(&old_uop, &realized_uop) {
+            #[allow(clippy::mutable_key_type)]
+            let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
+            crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+        }
+
+        // Release intermediate buffers AFTER apply_map_to_tensors so other
+        // tensors can still look up buffers during the substitution window.
+        plan.release_intermediate_buffers(|uop_id| {
+            if !input_buffer_ids.contains(&uop_id) {
+                crate::tensor_registry::remove_buffer(uop_id);
+            }
+        });
+
+        Ok(result)
     }
 
     /// Realize tensor with custom optimizer configuration.
@@ -112,23 +143,42 @@ impl Tensor {
     /// let c = c.realize_with(&config)?;
     /// ```
     pub fn realize_with(self, config: &morok_schedule::OptimizerConfig) -> Result<Self> {
-        let uop = self.uop();
-        let input_buffer_ids: std::collections::HashSet<u64> = collect_input_buffers(&uop).keys().copied().collect();
+        if self.uop().has_buffer_identity() {
+            return Ok(self.ensure_buffer());
+        }
+
+        let old_uop = self.uop();
+        let input_buffer_ids: std::collections::HashSet<u64> =
+            collect_input_buffers(&old_uop).keys().copied().collect();
 
         let plan = self.prepare_with(config)?;
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
 
-        self.finalize_realize(&plan, &uop, &input_buffer_ids)
+        let result = self.finalize_realize(&plan, &old_uop)?;
+
+        let realized_uop = result.uop();
+        if !Arc::ptr_eq(&old_uop, &realized_uop) {
+            #[allow(clippy::mutable_key_type)]
+            let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
+            crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+        }
+
+        plan.release_intermediate_buffers(|uop_id| {
+            if !input_buffer_ids.contains(&uop_id) {
+                crate::tensor_registry::remove_buffer(uop_id);
+            }
+        });
+
+        Ok(result)
     }
 
-    /// Finalize realization: bind output buffer to tensor and cleanup intermediates.
-    fn finalize_realize(
-        &self,
-        plan: &ExecutionPlan,
-        uop: &Arc<UOp>,
-        input_buffer_ids: &std::collections::HashSet<u64>,
-    ) -> Result<Self> {
+    /// Finalize realization: bind output buffer to tensor.
+    ///
+    /// Note: intermediate buffer cleanup is deferred to `realize()` so it
+    /// runs AFTER `apply_map_to_tensors`. This ensures other tensors can still
+    /// find buffers during the substitution window.
+    fn finalize_realize(&self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<Self> {
         let output_buf = plan.output_buffer().clone();
 
         trace!(
@@ -159,15 +209,7 @@ impl Tensor {
         );
 
         self.set_uop(realized_uop);
-        let result = Tensor::with_buffer(Arc::clone(&self.entry), output_buf_arc);
-
-        plan.release_intermediate_buffers(|uop_id| {
-            if !input_buffer_ids.contains(&uop_id) {
-                crate::tensor_registry::remove_buffer(uop_id);
-            }
-        });
-
-        Ok(result)
+        Ok(Tensor::with_buffer(Arc::clone(&self.entry), output_buf_arc))
     }
 
     /// Prepare an execution plan for this tensor's computation graph.
@@ -245,38 +287,22 @@ impl Tensor {
     /// - Kernel compilation fails
     /// - Buffer allocation fails
     pub fn prepare_with(&self, config: &morok_schedule::OptimizerConfig) -> Result<ExecutionPlan> {
-        use morok_ir::AxisType;
-
         let uop = self.uop();
-
-        // Step 1: Create BUFFERIZE wrapping the computation
         let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
-
-        let ranges: Vec<_> = shape
-            .iter()
-            .enumerate()
-            .map(|(i, dim)| {
-                let end = match dim {
-                    SInt::Const(n) => UOp::index_const(*n as i64),
-                    SInt::Symbolic(var) => var.clone(),
-                };
-                // Use Loop type (not Outer) so ranges are compatible with rangeify.
-                // Outer is for special cases like vmap batching, not normal computation.
-                UOp::range_axis(end, AxisId::Unrenumbered(i), AxisType::Loop)
-            })
-            .collect();
-
         let output_dtype = uop.dtype();
-        let bufferize = UOp::bufferize_global(uop.clone(), ranges);
 
-        // Step 2: Create SINK of the BUFFERIZE
-        let sink = UOp::sink(vec![bufferize]);
+        // Step 1: Mark computation for realization via CONTIGUOUS (Tinygrad approach).
+        // Ranges are NOT pre-created here — the rangeify pipeline assigns them
+        // via consumer-driven propagation in assign_ranges().
+        let contiguous = uop.contiguous();
+
+        // Step 2: Create SINK of the CONTIGUOUS
+        let sink = UOp::sink(vec![contiguous]);
 
         // Step 3: Run rangeify pipeline
-        // Note: We track becomes_map but don't apply it globally.
-        // The becomes_map contains ALL transformations from rewrite passes including internal
-        // restructuring. Applying it to other tensors could corrupt them. The diamond pattern
-        // issue (like in argmin) needs to be solved within the scheduling logic itself.
+        // Note: The rangeify becomes_map (STORE/INDEX/RANGE nodes) is NOT applied globally —
+        // it would corrupt other tensors. Instead, realize() applies a minimal output-only
+        // becomes_map (old_uop -> realized BUFFER+RESHAPE) after execution.
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let rangeified = rangeify_result.sink;
 
@@ -873,7 +899,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[tracing_test::traced_test]
+    // #[tracing_test::traced_test]
     fn test_realize_simple_add() {
         crate::test::helpers::test_setup();
 
@@ -902,7 +928,7 @@ mod tests {
     /// - ReduceAxis → REDUCE transformation following Tinygrad's approach
     /// - REDUCE codegen generates correct LLVM IR
     #[test]
-    #[tracing_test::traced_test]
+    // #[tracing_test::traced_test]
     fn test_realize_sum() {
         crate::test::helpers::test_setup();
 
@@ -1069,8 +1095,6 @@ mod tests {
         // Prepare the plan
         let plan = c.prepare().expect("prepare should succeed");
 
-        let count_before_cleanup = crate::tensor_registry::buffer_count();
-
         // Execute multiple times (simulating benchmark loop)
         let mut executor = morok_runtime::global_executor();
         for _ in 0..3 {
@@ -1085,13 +1109,14 @@ mod tests {
             .expect("copyout should succeed");
         assert_eq!(data, vec![5.0, 7.0, 9.0]);
 
-        // Now cleanup
+        // Now cleanup — count how many buffers were actually released
+        let count_before_cleanup = crate::tensor_registry::buffer_count();
         plan.release_intermediate_buffers(crate::tensor_registry::remove_buffer);
-
         let count_after_cleanup = crate::tensor_registry::buffer_count();
 
-        // After cleanup, we should have fewer or equal buffers
-        // (intermediate buffers removed)
+        // release_intermediate_buffers should remove at least one buffer (the output buffer)
+        // or at minimum not increase the count. We check the immediate delta to avoid
+        // interference from parallel tests.
         assert!(
             count_after_cleanup <= count_before_cleanup,
             "Cleanup should not increase buffer count: before={}, after={}",

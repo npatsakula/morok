@@ -275,7 +275,9 @@ fn test_split_store_end_with_outer_range() {
 
 #[test]
 fn test_split_store_end_with_mixed_ranges() {
-    // Create END with mix of LOOP and OUTER ranges wrapping a STORE with proper BUFFER
+    // Create END with mix of LOOP and OUTER ranges wrapping a STORE with proper BUFFER.
+    // Guard 2 only checks the FIRST range (Tinygrad: x.src[1].arg[-1] == AxisType.OUTER).
+    // When first range is LOOP, it should NOT skip — only skip when first range is OUTER.
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
@@ -283,12 +285,16 @@ fn test_split_store_end_with_mixed_ranges() {
     let store = store_idx.store(value);
     let range_loop = UOp::range_const(4, 0);
     let range_outer = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), AxisType::Outer);
-    let end = store.end(smallvec![range_loop, range_outer]);
 
+    // [LOOP, OUTER]: first range is LOOP → Guard 2 does not fire → kernel is created
+    let end = store.end(smallvec![range_loop.clone(), range_outer.clone()]);
     let result = call_split_store(&end);
+    assert!(result.is_some(), "first range is LOOP, should create kernel");
 
-    // Should skip if ANY range is OUTER (our implementation checks all ranges)
-    assert!(result.is_none());
+    // [OUTER, LOOP]: first range is OUTER → Guard 2 fires → returns None
+    let end = store.end(smallvec![range_outer, range_loop]);
+    let result = call_split_store(&end);
+    assert!(result.is_none(), "first range is OUTER, should skip");
 }
 
 // ============================================================================

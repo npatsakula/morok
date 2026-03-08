@@ -12,6 +12,8 @@
 //!
 //! Based on Tinygrad's expander.py:78-82.
 
+use std::sync::Arc;
+
 use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, Op, UOp};
 
@@ -134,20 +136,14 @@ fn test_end_no_unroll_passthrough() {
     }
 }
 
-/// Test: END with empty ranges passes through unchanged.
+/// Test: END with empty ranges returns self (Tinygrad-aligned).
 #[test]
 fn test_end_empty_ranges_passthrough() {
     let computation = UOp::noop();
     let end = create_end(computation.clone(), vec![]);
-    let result = phase2_only(&end);
 
-    match result.op() {
-        Op::End { computation: c, ranges } => {
-            assert!(matches!(c.op(), Op::Noop), "Computation should stay NOOP");
-            assert!(ranges.is_empty(), "Ranges should stay empty");
-        }
-        other => panic!("Expected END, got {:?}", other),
-    }
+    // UOp::end(empty) returns self, so end IS the computation
+    assert!(Arc::ptr_eq(&end, &computation), "end(empty) should return self");
 }
 
 // =============================================================================

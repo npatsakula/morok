@@ -17,7 +17,7 @@ use std::sync::Arc;
 use morok_ir::shape::Shape;
 use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
 use smallvec::{SmallVec, smallvec};
-use tracing::{debug, trace};
+use tracing::trace;
 
 use super::context::RangeifyContext;
 use super::indexing::{IndexingContext, range_size_as_i64};
@@ -69,140 +69,122 @@ pub struct RangeifyResult {
 /// **Stage 6**: pm_split_store - Split store ranges (CPU only)
 /// **Stage 7**: apply_opts - Post-range optimization (happens in optimizer)
 #[allow(clippy::mutable_key_type)]
-#[tracing::instrument(skip_all, fields(origin.tree = sink.tree()))]
+#[tracing::instrument(skip_all)]
 pub fn rangeify_with_map(
     sink: Arc<UOp>,
     pcontig_config: Option<&super::kernel::PcontigConfig>,
 ) -> morok_ir::Result<RangeifyResult> {
-    use morok_ir::rewrite::{graph_rewrite, graph_rewrite_bottom_up_with_map, graph_rewrite_with_map};
+    use morok_ir::rewrite::{graph_rewrite_bottom_up_with_map, graph_rewrite_with_map};
 
     // Aggregate all becomes_maps from rewrite passes
     let mut all_becomes: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
+    // Combined early pass (Tinygrad: earliest_rewrites + replace_contiguous, ctx={})
+    // MUST run BEFORE range assignment so rangeify sees a cleaned graph.
+    // Uses top-down traversal matching Tinygrad's bottom_up=False default.
+    let t_stage = std::time::Instant::now();
+    let early_combined = super::patterns::early_rewrites().with_context::<super::patterns::ReplaceContiguousCtx>()
+        + super::patterns::replace_contiguous();
+    let mut contig_ctx = super::patterns::ReplaceContiguousCtx::new();
+    let result = graph_rewrite_with_map(&early_combined, sink, &mut contig_ctx);
+    let mut sink = result.root;
+    all_becomes.extend(result.becomes_map);
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "early rewrites + replace contiguous complete"
+    );
+
     // =========================================================================
     // Stage 0: Range assignment to build IndexingContext
     // =========================================================================
-    let (mut sink, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
-    tracing::debug!(uop.tree = sink.tree(), "Stage 0: range assignment complete");
-
-    // Pre-cleanup: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
-    let early_matcher = super::patterns::early_rewrites();
-    let result = graph_rewrite_bottom_up_with_map(&early_matcher, sink, &mut ());
-    sink = result.root;
-    all_becomes.extend(result.becomes_map);
-    tracing::debug!(uop.tree = sink.tree(), "early rewrites complete");
+    let t_stage = std::time::Instant::now();
+    let (rangeified, mut indexing_ctx) = super::indexing::run_rangeify(sink)?;
+    sink = rangeified;
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "Stage 0: range assignment complete"
+    );
 
     // Split large reductions BEFORE ReduceAxis → REDUCE conversion
+    let t_stage = std::time::Instant::now();
     let mut split_config = super::kernel::SplitReduceOpConfig::default();
     let split_matcher = super::patterns::split_reduceop_patterns();
     let result = graph_rewrite_with_map(&split_matcher, sink, &mut split_config);
     sink = result.root;
     all_becomes.extend(result.becomes_map);
-    tracing::debug!(uop.tree = sink.tree(), "split reduceops complete");
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "split reduceops complete"
+    );
 
     // =========================================================================
     // Stage 1: Early movement ops (BOTTOM_UP) - Tinygrad: pm_mops + pm_syntactic_sugar
     // MUST RUN FIRST before other optimizations
     // =========================================================================
-    // Note: Movement ops are currently integrated in apply_rangeify_patterns
-    // For exact alignment, we'd separate pm_mops but current integration works
+    let t_stage = std::time::Instant::now();
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
     let result = graph_rewrite_bottom_up_with_map(&rangeify_matcher, sink, &mut indexing_ctx);
     sink = result.root;
     all_becomes.extend(result.becomes_map);
-    tracing::debug!(uop.tree = sink.tree(), "Stage 1: rangeify + movement ops complete");
-
-    // Buffer simplification
-    let buffer_simplify = super::patterns::buffer_folding() + super::patterns::dead_axis_removal();
-    let result = graph_rewrite_bottom_up_with_map(&buffer_simplify, sink, &mut ());
-    sink = result.root;
-    all_becomes.extend(result.becomes_map);
-    tracing::debug!(uop.tree = sink.tree(), "buffer folding + dead axis removal complete");
-
-    // Apply early rewrites again for RESHAPE to scalar
-    let result = graph_rewrite_bottom_up_with_map(&early_matcher, sink, &mut ());
-    sink = result.root;
-    all_becomes.extend(result.becomes_map);
-    tracing::debug!(uop.tree = sink.tree(), "reshape to scalar complete");
+    tracing::debug!(
+        uop.tree = sink.tree(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "Stage 1: rangeify + movement ops complete"
+    );
 
     // =========================================================================
-    // Stage 2: Load collapse - Tinygrad: pm_load_collapse
-    // Collapse load tensor indexing and REDUCE with conditional patterns
+    // Mega-pass: symbolic + reduce_simplify + buffer_folding + buffer_removal
+    // (Tinygrad: symbolic + pm_reduce_simplify + pm_const_buffer_folding + pm_remove_bufferize)
+    //
+    // One fixpoint pass combining all simplification + buffer removal.
+    // Uses PcontigConfig as the shared context (buffer_removal needs it;
+    // other patterns are lifted via with_context()).
     // =========================================================================
-    // First: apply pm_load_collapse for gated load patterns
-    let load_collapse_matcher = super::patterns::pm_load_collapse();
-    sink = graph_rewrite(&load_collapse_matcher, sink, &mut ());
-    tracing::debug!(uop.tree = sink.tree(), "Stage 2a: load collapse complete");
-
-    // Then: apply reduction simplify patterns (reduce_unparented, reduce_collapse)
-    let reduction_matcher = super::patterns::reduction_simplify_patterns();
-    let result = graph_rewrite_bottom_up_with_map(&reduction_matcher, sink, &mut ());
-    sink = result.root;
-    all_becomes.extend(result.becomes_map);
-    tracing::debug!(uop.tree = sink.tree(), "Stage 2b: reduction simplify complete");
-
-    // =========================================================================
-    // Stage 3: Split ranges - Tinygrad: pm_split_ranges + pm_flatten_range
-    // Range splitting via modulo arithmetic
-    // =========================================================================
-    // First: mark RANGE % const patterns and substitute at SINK
-    let split_matcher = pm_split_ranges();
-    let mut split_ctx = SplitRangesContext::default();
-    sink = graph_rewrite(&split_matcher, sink, &mut split_ctx);
-    tracing::debug!(uop.tree = sink.tree(), "Stage 3a: split ranges complete");
-
-    // Then: flatten nested ranges on REDUCE/STORE/END
-    let flatten_matcher = pm_flatten_range();
-    sink = graph_rewrite(&flatten_matcher, sink, &mut ());
-    tracing::debug!(uop.tree = sink.tree(), "Stage 3b: flatten ranges complete");
-
-    // =========================================================================
-    // Stage 4: Initial symbolic - Tinygrad: sym + pm_flatten_range (TOP_DOWN)
-    // CRITICAL: Must run BEFORE pm_simplify_ranges
-    // NOTE: Using symbolic() (not symbolic_simple()) to include gep_pushing_patterns
-    //       This aligns with Tinygrad's sym which includes GEP pushing at every stage.
-    // =========================================================================
-    let symbolic_with_flatten = crate::symbolic::symbolic() + flatten_matcher;
-    sink = graph_rewrite(&symbolic_with_flatten, sink, &mut ());
-    tracing::debug!(uop.tree = sink.tree(), "Stage 4: initial symbolic complete");
-
-    // =========================================================================
-    // Stage 5: Simplify ranges - Tinygrad: pm_simplify_ranges
-    // Merge adjacent ranges to reduce divmod operations
-    // =========================================================================
-    sink = graph_rewrite(&pm_simplify_ranges(), sink, &mut ());
-    tracing::debug!(uop.tree = sink.tree(), "Stage 5: simplify ranges complete");
-
-    // =========================================================================
-    // Stage 6: Split store (CPU-only) - Tinygrad: pm_split_store
-    // Split stores at comparison cut points to enable branch elimination
-    // =========================================================================
-    if let Some(device) = super::patterns::extract_device_from_graph(&sink)
-        && device == morok_device::DeviceSpec::Cpu
     {
-        let mut split_store_ctx = SplitStoreContext::for_device(device);
-        let split_store_matcher = pm_split_store();
-        sink = graph_rewrite(&split_store_matcher, sink, &mut split_store_ctx);
-        tracing::debug!(uop.tree = sink.tree(), "Stage 6: split store complete");
+        use super::kernel::PcontigConfig;
+        let t_stage = std::time::Instant::now();
+        let mega_pass = crate::symbolic::symbolic().with_context::<PcontigConfig>()
+            + super::patterns::pm_reduce_simplify().with_context()
+            + super::patterns::buffer_folding().with_context()
+            + super::patterns::dead_axis_removal().with_context()
+            + super::patterns::movement_op_patterns().with_context()
+            + super::patterns::early_rewrites().with_context()
+            + super::patterns::buffer_removal_with_pcontig();
+        tracing::debug!(
+            total_patterns = mega_pass.len(),
+            wildcard_count = mega_pass.wildcard_count(),
+            indexed_buckets = mega_pass.indexed_count(),
+            "mega-pass pattern stats"
+        );
+        let mut pcontig = pcontig_config.cloned().unwrap_or_default();
+        sink = apply_buffer_removal_protecting_sink(&sink, &mega_pass, &mut pcontig);
+        tracing::debug!(
+            node_count = sink.toposort().len(),
+            elapsed_ms = t_stage.elapsed().as_millis() as u64,
+            "mega-pass complete"
+        );
     }
 
-    // =========================================================================
-    // Stage 7: Buffer removal with partial contiguous
-    // =========================================================================
-    let mut pcontig = pcontig_config.cloned().unwrap_or_default();
-    let buffer_removal_matcher = super::patterns::buffer_removal_with_pcontig();
-    sink = apply_buffer_removal_protecting_sink(&sink, &buffer_removal_matcher, &mut pcontig);
-    tracing::debug!(uop.tree = sink.tree(), "Stage 7: buffer removal complete");
+    // Stages 2a-6 (load_collapse, split_ranges, symbolic+flatten, simplify_ranges,
+    // split_store) now run per-kernel in optimizer::apply_pre_optimization().
 
     // Buffer limit enforcement
     if let Some(device) = super::patterns::extract_device_from_graph(&sink)
         && let Some(limit) = device.max_buffers()
     {
+        let t_stage = std::time::Instant::now();
         let limit_matcher = super::patterns::buffer_limit_patterns(limit);
-        let result = graph_rewrite_bottom_up_with_map(&limit_matcher, sink, &mut ());
+        let result = graph_rewrite_with_map(&limit_matcher, sink, &mut ());
         sink = result.root;
         all_becomes.extend(result.becomes_map);
-        tracing::debug!(uop.tree = sink.tree(), "Stage 7b: buffer limit enforcement complete");
+        tracing::debug!(
+            uop.tree = sink.tree(),
+            elapsed_ms = t_stage.elapsed().as_millis() as u64,
+            "Stage 7b: buffer limit enforcement complete"
+        );
     }
 
     // =========================================================================
@@ -352,31 +334,38 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
     // Build substitution map
     let mut subs: HashMap<u64, Arc<UOp>> = HashMap::new();
 
-    // Collect all UOps to find the marked ranges
+    // Collect all UOps to find the marked ranges and max axis_id
     let topo = sink.toposort();
+
+    // Find max axis_id across ALL ranges to avoid collisions when creating split ranges
+    let mut max_axis_id: usize = 0;
+    for uop in &topo {
+        if let Op::Range { axis_id, .. } = uop.op() {
+            max_axis_id = max_axis_id.max(axis_id.value());
+        }
+    }
+    let mut next_id = max_axis_id + 1;
+
     for uop in &topo {
         // Skip protected ranges (e.g., used in ImageDType stores)
         if ctx.protected_ranges.contains(&uop.id) {
             continue;
         }
         if let Some(&mod_val) = ctx.marked_ranges.get(&uop.id)
-            && let Op::Range { end, axis_id, axis_type, .. } = uop.op()
+            && let Op::Range { end, axis_type, .. } = uop.op()
         {
             let Some(end_val) = const_uop_to_i64(end) else {
                 continue;
             };
 
-            // Create outer range: RANGE(end / mod_val, axis_id shifted by 0, same type)
+            // Create outer range with unique axis_id
             let outer_end = end_val / mod_val;
-            let outer_range = UOp::range_axis(
-                UOp::index_const(outer_end),
-                AxisId::Renumbered(axis_id.value() * 2), // Shift to avoid collision
-                *axis_type,
-            );
+            let outer_range = UOp::range_axis(UOp::index_const(outer_end), AxisId::Renumbered(next_id), *axis_type);
+            next_id += 1;
 
-            // Create inner range: RANGE(mod_val, axis_id shifted by 1, same type)
-            let inner_range =
-                UOp::range_axis(UOp::index_const(mod_val), AxisId::Renumbered(axis_id.value() * 2 + 1), *axis_type);
+            // Create inner range with unique axis_id
+            let inner_range = UOp::range_axis(UOp::index_const(mod_val), AxisId::Renumbered(next_id), *axis_type);
+            next_id += 1;
 
             // Substitution: r → outer * mod_val + inner
             let mod_const = UOp::index_const(mod_val);
@@ -551,14 +540,15 @@ pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &mut IndexingContext)
         return None;
     }
 
-    let (input_ranges, _) = ctx.get_ranges(x)?;
-    let input_ranges = input_ranges.clone(); // Clone to release borrow on ctx
+    // Tinygrad: INDEX is only added when `x in ctx.range_map`.
+    // For SINK (not in range_map), realized sources still get BUFFERIZE but no INDEX.
+    let input_ranges = if let Some((ranges, _)) = ctx.get_ranges(x) { ranges.clone() } else { Vec::new() };
 
     let mut new_sources = Vec::with_capacity(sources.len());
     let mut any_changed = false;
 
     for src in sources.iter() {
-        let new_src = transform_single_source(x, src, &input_ranges, ctx);
+        let new_src = transform_single_source(src, &input_ranges, ctx);
         if !Arc::ptr_eq(&new_src, src) {
             any_changed = true;
         }
@@ -568,95 +558,107 @@ pub fn transform_sources_with_bufferize(x: &Arc<UOp>, ctx: &mut IndexingContext)
     if any_changed { Some(new_sources) } else { None }
 }
 
+/// Linearize multi-index INDEX on BUFFERIZE using buffer's ranges as dimensions.
+///
+/// Tinygrad: `flatten_bufferize` collapses multi-range BUFFERIZE, then `pm_mops`
+/// linearizes INDEX through movement ops. We combine both: directly linearize
+/// INDEX indices using BUFFERIZE's ranges (the buffer's shape).
+///
+/// Runs as a BPM pattern in `pm_add_buffers_patterns`, so it sees the original
+/// BUFFERIZE child before `bufferize_to_store` transforms it.
+fn linearize_index_on_bufferize(node: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Index { buffer, indices, gate } = node.op() else { return None };
+    if indices.len() <= 1 {
+        return None;
+    }
+
+    // Find BUFFERIZE through optional EXPAND/RESHAPE wrapping from dead_axis_removal.
+    // After cleanup_dead_axes_bufferize: EXPAND(RESHAPE(BUFFERIZE_reduced)) or direct BUFFERIZE.
+    let bufferize = find_bufferize_through_movement(buffer)?;
+    let Op::Bufferize { ranges, .. } = bufferize.op() else { return None };
+
+    if indices.len() != ranges.len() {
+        return None;
+    }
+
+    // Extract dimension sizes from BUFFERIZE ranges.
+    // RANGE(end=CONST(n)) → n, CONST(0) → 1 (singleton/broadcast)
+    let dims: Vec<i64> = ranges
+        .iter()
+        .map(|r| {
+            if let Some(size) = range_size_as_i64(r) {
+                Some(size)
+            } else if matches!(r.op(), Op::Const(cv) if cv.0.is_zero()) {
+                Some(1)
+            } else {
+                None
+            }
+        })
+        .collect::<Option<_>>()?;
+
+    if dims.iter().any(|&d| d <= 0) {
+        return None;
+    }
+
+    let strides = compute_row_major_strides(&dims);
+    let flat_idx = build_linear_index(indices, &strides);
+
+    let builder = UOp::index().buffer(buffer.clone()).indices(vec![flat_idx]).dtype(node.dtype());
+    match gate {
+        Some(g) => builder.gate(g.clone()).call().ok(),
+        None => builder.call().ok(),
+    }
+}
+
+/// Traverse EXPAND/RESHAPE wrappers (from dead_axis_removal) to find the underlying BUFFERIZE.
+fn find_bufferize_through_movement(node: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let mut current = node.clone();
+    for _ in 0..5 {
+        match current.op() {
+            Op::Bufferize { .. } => return Some(current),
+            Op::Expand { src, .. } | Op::Reshape { src, .. } => current = src.clone(),
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Transform a single source by adding BUFFERIZE + INDEX if needed.
+///
+/// Non-recursive: only handles immediate buffer-like and realized sources.
+/// Movement ops and compute ops are left for the BPM rewrite engine to
+/// process individually (matching Tinygrad's `create_bufferize_and_index_based_on_ranges`).
+///
+/// INDEX nodes are created with a single linear index (matching Tinygrad),
+/// computed from the buffer's dimensional ranges and the consumer's index
+/// expressions. This eliminates the need for a later linearization pass.
 pub(crate) fn transform_single_source(
-    _consumer: &Arc<UOp>,
     src: &Arc<UOp>,
     input_ranges: &[Arc<UOp>],
     ctx: &mut IndexingContext,
 ) -> Arc<UOp> {
-    trace!(
-        src.id = src.id,
-        src.op = ?std::mem::discriminant(src.op()),
-        consumer.id = _consumer.id,
-        input_ranges.len = input_ranges.len(),
-        "transform_single_source"
-    );
-
-    // Case 1: Buffer-like op → add INDEX
+    // Case 1: Buffer-like op → add multi-index INDEX
+    // Unlike Case 2 (BUFFERIZE), we can't linearize here because the buffer's
+    // dimensional structure isn't directly available from ctx — the output_ranges
+    // may contain PAD validity expressions, not clean RANGE ops.
+    // Linearization is deferred to pm_linearize_multi_index.
     if matches!(
         src.op(),
         Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
     ) {
-        trace!(src.id = src.id, case = "buffer-like", "adding index");
-        return UOp::index()
-            .buffer(Arc::clone(src))
-            .indices(input_ranges.to_vec())
-            .call()
-            .expect("Failed to create INDEX for buffer source");
-    }
-
-    // Case 1.5: Movement op → transform indices through it and recurse
-    // This handles EXPAND [1]->[4] by transforming [Range(0..4)] to [Const(0)]
-    // We apply movement op transformation here directly (like Tinygrad's apply_movement_op)
-    // Then recursively call transform_single_source to let the appropriate case handle the inner source
-    if src.op().is_movement() {
-        trace!(src.id = src.id, case = "movement", "processing movement op");
-        use super::indexing::apply_movement_op;
-
-        // Get the inner source of the movement op
-        let inner_src = &src.op().sources()[0];
-
-        // Get the source shape for transformation
-        if let Some(inner_shape) = inner_src.shape().ok().flatten() {
-            // Transform indices through the movement op
-            let transformed_indices = apply_movement_op(src.op(), inner_shape, input_ranges);
-
-            // Recursively call transform_single_source with transformed indices
-            // This will hit the appropriate case (Case 1 for buffer/AFTER, CONST case, etc.)
-            return transform_single_source(_consumer, inner_src, &transformed_indices, ctx);
+        if !input_ranges.is_empty() {
+            return UOp::index()
+                .buffer(Arc::clone(src))
+                .indices(input_ranges.to_vec())
+                .call()
+                .expect("Failed to create INDEX for buffer source");
         }
-
-        // Fallback: if we can't get shape, create INDEX on the movement chain
-        // (will be handled by pattern matcher later)
-        return UOp::index()
-            .buffer(Arc::clone(src))
-            .indices(input_ranges.to_vec())
-            .call()
-            .expect("Failed to create INDEX for movement source");
+        return Arc::clone(src);
     }
-
-    // Check for REDUCE op that might have been converted from ReduceAxis
-    // During graph rewrite, ReduceAxis is converted to REDUCE but realize_map was keyed on ReduceAxis
-    // We need to handle both cases
-    let realize_axes_opt = ctx.get_realize_axes(src).cloned();
-
-    debug!(
-        src.id = src.id,
-        src.op = ?std::mem::discriminant(src.op()),
-        has_realize_axes = realize_axes_opt.is_some(),
-        realize_axes = ?realize_axes_opt,
-        "Checking realize_map"
-    );
 
     // Case 2: source needs realization → wrap in BUFFERIZE + INDEX
+    let realize_axes_opt = ctx.get_realize_axes(src).cloned();
     if let Some(ref realize_axes) = realize_axes_opt {
-        trace!(src.id = src.id, realize_axes = ?realize_axes, case = "realize", "source needs realization");
-        // Check if ANY source of this node is also marked for realization
-        // If so, skip wrapping here - the inner source should be wrapped first
-        for inner_src in src.op().sources() {
-            if ctx.should_realize(&inner_src) {
-                debug!(src.id = src.id, inner_src.id = inner_src.id, "Skipping - inner source also needs realization");
-                // Return the source as-is - inner source will be wrapped when accessed
-                return Arc::clone(src);
-            }
-        }
-
-        debug!(
-            src.id = src.id,
-            realize_axes = ?realize_axes,
-            "Creating BUFFERIZE for realized source"
-        );
         let (_, output_ranges) = ctx.get_ranges(src).expect("Realized op must have ranges");
 
         let closed_ranges: Vec<_> = output_ranges
@@ -672,11 +674,8 @@ pub(crate) fn transform_single_source(
             BufferizeOpts { device: None, addrspace: AddrSpace::Local }
         };
 
-        let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges, opts);
+        let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges.clone(), opts);
 
-        // Use input ranges AS-IS (Tinygrad indexing.py:78)
-        // Do NOT convert Reduce→Loop here - that only happens in limit_bufs for buffer overflow.
-        // REDUCE consumers need Reduce-type ranges to share the same loop counter with their source INDEX.
         let index_ranges: Vec<_> = input_ranges
             .iter()
             .enumerate()
@@ -685,6 +684,8 @@ pub(crate) fn transform_single_source(
             .collect();
 
         if !index_ranges.is_empty() {
+            // Create multi-index INDEX; linearization happens in pm_add_buffers_patterns
+            // via linearize_index_on_bufferize (BPM pattern).
             return UOp::index()
                 .buffer(bufferized)
                 .indices(index_ranges)
@@ -695,43 +696,7 @@ pub(crate) fn transform_single_source(
         }
     }
 
-    // Case 4: Intermediate compute op (Unary, Binary, etc.) → recursively transform sources
-    // This ensures that when REDUCE → Unary(Neg) → Buffer, the Buffer gets INDEX
-    // Aligns with Tinygrad's approach where patterns run on ALL nodes
-    if matches!(src.op(), Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. }) {
-        trace!(
-            src.id = src.id,
-            src.op = ?std::mem::discriminant(src.op()),
-            num_sources = src.op().sources().len(),
-            case = "compute",
-            "Recursively transforming compute op sources"
-        );
-        let inner_sources = src.op().sources();
-        let mut new_inner_sources = Vec::with_capacity(inner_sources.len());
-        let mut any_changed = false;
-
-        for inner_src in inner_sources.iter() {
-            let transformed = transform_single_source(_consumer, inner_src, input_ranges, ctx);
-            trace!(
-                inner_src.id = inner_src.id,
-                transformed.id = transformed.id,
-                changed = !Arc::ptr_eq(&transformed, inner_src),
-                "Inner source transformation"
-            );
-            if !Arc::ptr_eq(&transformed, inner_src) {
-                any_changed = true;
-            }
-            new_inner_sources.push(transformed);
-        }
-
-        if any_changed {
-            trace!(src.id = src.id, "rebuilding compute op with new sources");
-            return src.with_sources(new_inner_sources);
-        }
-    }
-
-    // Case 3: no transformation needed
-    trace!(src.id = src.id, case = "no-transform", "no transformation needed");
+    // Default: no transformation — BPM engine handles movement/compute ops individually
     Arc::clone(src)
 }
 
@@ -745,17 +710,27 @@ fn apply_buffer_removal_protecting_sink(
         return crate::rewrite::graph_rewrite(matcher, sink.clone(), ctx);
     };
 
-    let mut new_sources = Vec::with_capacity(sources.len());
-    for src in sources.iter() {
-        if let Op::Bufferize { compute, ranges, opts } = src.op() {
-            let optimized_compute = crate::rewrite::graph_rewrite(matcher, compute.clone(), ctx);
-            let new_bufferize = UOp::bufferize(optimized_compute, ranges.to_vec(), opts.clone());
-            new_sources.push(new_bufferize);
-        } else {
-            let optimized = crate::rewrite::graph_rewrite(matcher, src.clone(), ctx);
-            new_sources.push(optimized);
-        }
-    }
+    // Collect the rewrite roots — compute subtrees for BUFFERIZE, full nodes otherwise.
+    // Using graph_rewrite_roots shares a single engine across all roots, so shared
+    // subgraphs (e.g., bitonic sort network) are only processed once.
+    let roots: Vec<Arc<UOp>> = sources
+        .iter()
+        .map(|src| match src.op() {
+            Op::Bufferize { compute, .. } => compute.clone(),
+            _ => src.clone(),
+        })
+        .collect();
+
+    let optimized = crate::rewrite::graph_rewrite_roots(matcher, &roots, ctx);
+
+    let new_sources: Vec<Arc<UOp>> = sources
+        .iter()
+        .zip(optimized)
+        .map(|(src, opt)| match src.op() {
+            Op::Bufferize { ranges, opts, .. } => UOp::bufferize(opt, ranges.to_vec(), opts.clone()),
+            _ => opt,
+        })
+        .collect();
 
     UOp::sink(new_sources)
 }
@@ -985,8 +960,12 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
     // size and addrspace across all INDEX operations in this function.
     let sdtype = base_dtype.clone().ptr(Some(size), opts.addrspace);
 
-    // Get end_ranges for wrapping stores
-    let end_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.clone();
+    // Get end_ranges for wrapping stores.
+    // Filter to only actual RANGE ops, excluding CONST(0) from collapsed singleton dims.
+    // Tinygrad alignment: `.end(*rngs)` where `rngs = sorted(idx.ranges, ...)` naturally
+    // excludes non-RANGE entries because `.ranges` only collects RANGE UOps.
+    let end_ranges: SmallVec<[Arc<UOp>; 4]> =
+        ranges.iter().filter(|r| matches!(r.op(), Op::Range { .. })).cloned().collect();
 
     // =========================================================================
     // Case 1: ASSIGN → STORE (reuse existing buffer from ASSIGN target)
@@ -1057,8 +1036,9 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
             let buf_zeroed = buf.after(smallvec![zero_store]);
 
             // Build linear index from BUFFERIZE ranges (not reduce ranges)
-            // Sort ranges by axis_id for correct row-major linearization (Tinygrad: rangeify.py:303)
-            let sorted_ranges = sort_ranges_by_axis_id(ranges);
+            // Filter to only actual RANGE ops (exclude CONST(0) from collapsed dims)
+            // Sort by axis_id for correct row-major linearization (Tinygrad: rangeify.py:303)
+            let sorted_ranges = sort_ranges_by_axis_id(&end_ranges);
             let linear_index = if sorted_ranges.len() > 1 {
                 let dims: Vec<i64> = sorted_ranges.iter().filter_map(range_size_as_i64).collect();
                 if dims.len() != sorted_ranges.len() {
@@ -1099,9 +1079,16 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
 
     // Determine effective address space based on allow_locals parameter
     // Tinygrad has two matchers:
-    // - pm_add_buffers (allow_locals=False): treats local as global
+    // - pm_add_buffers (allow_locals=False): skips local buffers entirely (returns None)
     // - pm_add_buffers_local (allow_locals=True): creates DEFINE_LOCAL for local
-    let effective_addrspace = if allow_locals { opts.addrspace } else { AddrSpace::Global };
+    //
+    // When allow_locals=false and the buffer is LOCAL, we return None to leave the
+    // BUFFERIZE as-is. This matches Tinygrad's behavior where local buffers are only
+    // converted during codegen (pm_add_buffers_local), NOT during kernel splitting.
+    if !allow_locals && opts.addrspace == AddrSpace::Local {
+        return None;
+    }
+    let effective_addrspace = opts.addrspace;
 
     let buffer = if let Some(existing_buffer) = ctx.get_buffer(bufferize_op) {
         existing_buffer.clone()
@@ -1129,8 +1116,19 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
     // ptr=true is equivalent to setting dtype to buffer.dtype(), but is the
     // idiomatic way per Tinygrad's buf.index(idx, ptr=True).
 
-    // Sort ranges by axis_id for correct row-major linearization (Tinygrad: rangeify.py:303)
-    let sorted_ranges = sort_ranges_by_axis_id(ranges);
+    // Filter ranges to only include actual RANGE ops (not CONST(0) from collapsed dims).
+    //
+    // Tinygrad alignment: In Tinygrad, `bufferize_to_store` gets ranges via `idx.ranges`
+    // which is a property that traverses the expression tree and collects only actual
+    // RANGE UOps. CONST(0) entries (created by `new_range(size=1)` for singleton
+    // dimensions, e.g. from keepdim=true reductions) are NOT ranges and are naturally
+    // excluded. Morok stores all entries in BUFFERIZE.ranges including CONST(0), so
+    // we must filter here to match Tinygrad's behavior.
+    let active_ranges: SmallVec<[Arc<UOp>; 4]> =
+        ranges.iter().filter(|r| matches!(r.op(), Op::Range { .. })).cloned().collect();
+
+    // Sort active ranges by axis_id for correct row-major linearization (Tinygrad: rangeify.py:303)
+    let sorted_ranges = sort_ranges_by_axis_id(&active_ranges);
 
     let store_target = if !sorted_ranges.is_empty() {
         // Linearize multi-dimensional ranges into single linear index.
@@ -1200,17 +1198,12 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
     // NOTE: STORE takes (index, value) - buffer is accessed via index.buffer
     let store = store_target.store_value(compute.clone());
 
-    // Determine END ranges: use ONLY the output's ranges (from BUFFERIZE).
+    // Determine END ranges: use only actual RANGE ops from BUFFERIZE (Tinygrad-aligned).
     //
-    // This matches Tinygrad's approach in rangeify.py:303,337 where:
-    // - rngs = sorted(idx.ranges, key=lambda x: x.arg)
-    // - do_store = buf.index(idx, dtype=sdtype).store(x.src[0]).end(*rngs)
-    //
-    // For scalar stores (e.g., REDUCE results), ranges is empty, so END wraps with no ranges.
-    // The REDUCE's loop is handled separately by pm_reduce which creates its own END.
-    // We must NOT fallback to compute.in_scope_ranges() because that would put the
-    // OUTPUT STORE inside the reduce loop (wrong!).
-    let end_ranges: SmallVec<[Arc<UOp>; 4]> = ranges.clone();
+    // Tinygrad's `rngs = sorted(idx.ranges, ...)` naturally excludes CONST(0) entries
+    // because `.ranges` only collects RANGE UOps. END should only wrap with actual
+    // iteration ranges, not collapsed singleton dimensions.
+    let end_ranges: SmallVec<[Arc<UOp>; 4]> = sorted_ranges.clone();
 
     let mut do_store = if !end_ranges.is_empty() { store.end(end_ranges) } else { store };
 
@@ -1253,49 +1246,114 @@ pub(crate) fn get_range_size(range: &Arc<UOp>) -> Option<Arc<UOp>> {
     if let Op::Range { end, .. } = range.op() { Some(Arc::clone(end)) } else { None }
 }
 
-/// Lift range-independent computations outside REDUCE via symbolic simplification.
+/// Collapse REDUCE(ADD) by algebraic simplification following Tinygrad's algorithm.
+///
+/// Core reduce collapse algorithm — parameterized by pattern matcher.
+///
+/// For each reduce range:
+/// 1. Gated toposort to find nodes "in scope" of the range
+/// 2. Replace external inputs (nodes NOT in scope) with synthetic DEFINE_VAR
+/// 3. Wrap substituted body in a synthetic REDUCE
+/// 4. Run algebraic patterns (bound-from-below/above, distributive, etc.)
+/// 5. If REDUCE is eliminated (no_range), reverse-substitute back
+///
+/// Based on Tinygrad's `reduce_collapse` (simplify.py:121-134).
+/// Parameterized by `pm` following Tinygrad's `def reduce_collapse(red, u, pm=pm_reduce_collapse)`.
 #[allow(clippy::mutable_key_type)]
-pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> {
+fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPatternMatcher<()>) -> Option<Arc<UOp>> {
+    use morok_ir::ReduceOp;
+
     if ranges.is_empty() {
         return None;
     }
 
-    let mut substitute_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+    let mut u = Arc::clone(src);
 
-    for (i, range) in ranges.iter().enumerate() {
-        let size_i64 = super::indexing::range_size_as_i64(range)?;
+    for range in ranges {
+        // 1. Gated toposort: find nodes "in scope" of this range
+        let range_key = UOpKey(range.clone());
+        let in_scope: HashSet<UOpKey> =
+            u.toposort_filtered(|node| node.in_scope_ranges().contains(&range_key)).into_iter().map(UOpKey).collect();
 
-        if size_i64 <= 0 {
+        // Bail if nested REDUCE or STORE in scope (can't collapse through these)
+        if in_scope.iter().any(|k| matches!(k.0.op(), Op::Reduce { .. } | Op::Store { .. })) {
             return None;
         }
 
-        let var_name = format!("ridx{}", i);
-        let define_var = UOp::define_var(var_name, 0, size_i64 - 1);
+        // 2. Identify external inputs and substitute with DEFINE_VAR
+        // (Tinygrad excludes: CONST, VCONST, PARAM, DEFINE_LOCAL, DEFINE_VAR)
+        let mut replaces: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+        for node in &in_scope {
+            node.0.op().map_child(|child| {
+                let key = UOpKey(child.clone());
+                if in_scope.contains(&key) || replaces.contains_key(&key) {
+                    return;
+                }
+                if matches!(
+                    child.op(),
+                    Op::Const(_)
+                        | Op::VConst { .. }
+                        | Op::DefineVar { .. }
+                        | Op::DefineGlobal { .. }
+                        | Op::DefineLocal { .. }
+                ) {
+                    return;
+                }
+                let vmin = match child.vmin() {
+                    ConstValue::Int(i) => *i,
+                    ConstValue::UInt(u) => *u as i64,
+                    ConstValue::Float(f) => *f as i64,
+                    ConstValue::Bool(b) => *b as i64,
+                };
+                let vmax = match child.vmax() {
+                    ConstValue::Int(i) => *i,
+                    ConstValue::UInt(u) => *u as i64,
+                    ConstValue::Float(f) => *f as i64,
+                    ConstValue::Bool(b) => *b as i64,
+                };
+                let var = UOp::define_var(format!("in{}", replaces.len()), vmin, vmax).with_dtype(child.dtype());
+                replaces.insert(key, var);
+            });
+        }
 
-        substitute_map.insert(UOpKey(Arc::clone(range)), define_var);
+        // 3. Build synthetic REDUCE: substituted_body.reduce([range], ADD)
+        let substituted = u.substitute(&replaces);
+        let synthetic_reduce = substituted.reduce(smallvec![range.clone()], ReduceOp::Add);
+
+        // 4. Apply algebraic patterns to try eliminating the range
+        let result = crate::rewrite::graph_rewrite(pm, synthetic_reduce, &mut ());
+
+        // 5. Check range eliminated (use plain toposort, NOT in_scope_ranges,
+        //    since REDUCE "ends" ranges and would give a false positive)
+        let has_range = result.toposort().iter().any(|x| matches!(x.op(), Op::Range { .. }));
+        if has_range {
+            return None;
+        }
+
+        // 6. Reverse substitute: DEFINE_VAR → original external inputs
+        let reverse: HashMap<UOpKey, Arc<UOp>> = replaces.into_iter().map(|(k, v)| (UOpKey(v), k.0)).collect();
+        u = result.substitute(&reverse);
     }
 
-    let substituted = src.substitute(&substitute_map);
-    let matcher = crate::symbolic::symbolic_simple();
-    let simplified = crate::rewrite::graph_rewrite(&matcher, substituted, &mut ());
+    Some(u)
+}
 
-    let vars_in_simplified: HashSet<UOpKey> =
-        simplified.toposort().into_iter().filter(|uop| matches!(uop.op(), Op::DefineVar { .. })).map(UOpKey).collect();
+/// Collapse REDUCE using `pm_reduce_collapse` patterns.
+///
+/// Tinygrad: `reduce_collapse(red, u)` (uses default `pm=pm_reduce_collapse`).
+pub fn reduce_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> {
+    let pm = super::patterns::build_reduce_collapse_matcher();
+    reduce_collapse_with(src, ranges, &pm)
+}
 
-    let has_var_dependency = substitute_map.values().any(|var| vars_in_simplified.contains(&UOpKey(Arc::clone(var))));
-
-    if has_var_dependency {
-        return None;
-    }
-
-    if !super::indexing::no_range(&simplified) {
-        return None;
-    }
-
-    let reverse_map: HashMap<UOpKey, Arc<UOp>> =
-        substitute_map.into_iter().map(|(range_key, var)| (UOpKey(var), range_key.0)).collect();
-
-    Some(simplified.substitute(&reverse_map))
+/// Collapse REDUCE using extended `pm_reduce_load_collapse` patterns.
+///
+/// Tinygrad: `reduce_load_collapse(red, u)` — calls `reduce_collapse` with
+/// `pm=pm_reduce_load_collapse` which includes `.or_casted()` variants,
+/// NE lifting, and the full `pm_load_collapse` non-REDUCE patterns.
+pub fn reduce_load_collapse(src: &Arc<UOp>, ranges: &[Arc<UOp>]) -> Option<Arc<UOp>> {
+    let pm = super::patterns::build_reduce_load_collapse_matcher();
+    reduce_collapse_with(src, ranges, &pm)
 }
 
 pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType) -> Option<Arc<UOp>> {
@@ -1450,6 +1508,7 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         let simplified = crate::rewrite::graph_rewrite(&matcher, rewritten, &mut ());
 
         // Count divmod operations (Tinygrad simplify.py:34-36)
+        use crate::passes::linearize_index::count_divmod;
         let original_divmod = count_divmod(u);
         let new_divmod = count_divmod(&simplified);
 
@@ -1460,12 +1519,6 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     None
-}
-
-/// Count IDIV and MOD operations in a UOp graph.
-fn count_divmod(uop: &Arc<UOp>) -> usize {
-    use morok_ir::types::BinaryOp;
-    uop.toposort().iter().filter(|u| matches!(u.op(), Op::Binary(BinaryOp::Idiv | BinaryOp::Mod, _, _))).count()
 }
 
 /// Pattern matcher for range simplification.
@@ -1627,18 +1680,22 @@ pub fn find_bufs(store: &Arc<UOp>) -> HashMap<UOpKey, OpAccessType> {
 /// Create pattern matcher for adding buffers (BUFFERIZE → STORE conversion).
 ///
 /// Based on Tinygrad's pm_add_buffers (rangeify.py:358-367) with `allow_locals=False`.
-/// This treats all BUFFERIZE ops as global buffers, regardless of their addrspace.
-/// Use `pm_add_buffers_local()` when local buffers should be created for local addrspace.
-pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<()> {
-    use super::kernel::KernelContext;
-
-    // This is a workaround - we create a temporary KernelContext for each match
-    // The original code used a shared context, but the new pipeline uses graph_rewrite
+/// Uses a shared KernelContext (like Tinygrad's `ctx=itertools.count(lunique_start)`)
+/// to ensure unique buffer IDs across all pattern matches.
+pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::KernelContext> {
     crate::patterns! {
+        @context super::kernel::KernelContext;
+        // Linearize multi-index INDEX on BUFFERIZE (Tinygrad: flatten_bufferize + pm_mops)
+        node if matches!(node.op(), Op::Index { indices, .. } if indices.len() > 1)
+            => |node, _ctx| { linearize_index_on_bufferize(node) },
+        // pm_mops: push movement ops through INDEX (Tinygrad rangeify.py:24-26)
+        Index { buffer: mop, indices, gate } if mop.op().is_movement()
+            => |mop, indices, gate, _ctx| {
+                super::patterns::transform_movement_through_index(mop, indices, gate)
+            },
         // BUFFERIZE → STORE conversion (allow_locals=false: treat local as global)
-        buf @ Bufferize { compute: _ } => |buf| {
-            let mut temp_ctx = KernelContext::new();
-            bufferize_to_store(buf, &mut temp_ctx, false)
+        buf @ Bufferize { compute: _ } => |buf, ctx| {
+            bufferize_to_store(buf, ctx, false)
         },
     }
 }
@@ -1646,15 +1703,21 @@ pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<()> {
 /// Create pattern matcher for adding buffers with local buffer support.
 ///
 /// Based on Tinygrad's pm_add_buffers_local (rangeify.py:358-367) with `allow_locals=True`.
-/// This creates DEFINE_LOCAL buffers for local addrspace BUFFERIZE ops.
-pub fn pm_add_buffers_local_patterns() -> crate::TypedPatternMatcher<()> {
-    use super::kernel::KernelContext;
-
+/// Uses a shared KernelContext for unique buffer IDs.
+pub fn pm_add_buffers_local_patterns() -> crate::TypedPatternMatcher<super::kernel::KernelContext> {
     crate::patterns! {
+        @context super::kernel::KernelContext;
+        // Linearize multi-index INDEX on BUFFERIZE (Tinygrad: flatten_bufferize + pm_mops)
+        node if matches!(node.op(), Op::Index { indices, .. } if indices.len() > 1)
+            => |node, _ctx| { linearize_index_on_bufferize(node) },
+        // pm_mops: push movement ops through INDEX (Tinygrad rangeify.py:24-26)
+        Index { buffer: mop, indices, gate } if mop.op().is_movement()
+            => |mop, indices, gate, _ctx| {
+                super::patterns::transform_movement_through_index(mop, indices, gate)
+            },
         // BUFFERIZE → STORE conversion (allow_locals=true: create DEFINE_LOCAL for local addrspace)
-        buf @ Bufferize { compute: _ } => |buf| {
-            let mut temp_ctx = KernelContext::new();
-            bufferize_to_store(buf, &mut temp_ctx, true)
+        buf @ Bufferize { compute: _ } => |buf, ctx| {
+            bufferize_to_store(buf, ctx, true)
         },
     }
 }

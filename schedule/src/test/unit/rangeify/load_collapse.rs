@@ -70,8 +70,15 @@ fn test_bounded_sum_above() {
 }
 
 #[test]
-fn test_nested_reduce_not_collapsed() {
-    // Nested reduces should not be collapsed by the simple patterns
+fn test_nested_reduce_collapsed_by_full_algorithm() {
+    // pm_load_collapse now uses the full reduce_load_collapse algorithm
+    // (matching Tinygrad), which CAN collapse nested reduces via
+    // reduce_unparented: the outer range is not referenced by the inner
+    // reduce, so it gets multiplied out.
+    //
+    // REDUCE(ADD, REDUCE(ADD, 1.0, [range(5)]), [range(10)])
+    //   → inner: 1.0 * 5 = 5.0
+    //   → outer: 5.0 * 10 = 50.0
     let inner_range = test_range(5);
     let outer_range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(1), AxisType::Reduce);
 
@@ -82,8 +89,8 @@ fn test_nested_reduce_not_collapsed() {
     let matcher = pm_load_collapse();
     let result = matcher.rewrite(&outer_reduce, &mut ());
 
-    // Should not match nested structure
-    assert!(matches!(result, RewriteResult::NoMatch), "Nested reduces should not be collapsed by simple patterns");
+    // The full algorithm should successfully collapse this
+    assert!(matches!(result, RewriteResult::Rewritten(_)), "Full reduce_load_collapse should collapse nested reduces");
 }
 
 #[test]

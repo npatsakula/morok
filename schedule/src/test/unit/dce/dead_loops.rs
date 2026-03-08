@@ -6,8 +6,8 @@
 //! 3. REDUCE with all dead ranges → identity element
 
 use morok_dtype::DType;
+use morok_ir::UOp;
 use morok_ir::types::{ConstValue, ReduceOp};
-use morok_ir::{Op, UOp};
 use smallvec::smallvec;
 use std::sync::Arc;
 
@@ -176,22 +176,13 @@ fn test_range_boundary_vmax_zero() {
 // ----------------------------------------------------------------------------
 
 #[test]
-fn test_end_empty_ranges_unchanged() {
-    // END(store, []) should remain unchanged
+fn test_end_empty_ranges_returns_self() {
+    // UOp::end(empty) returns self (Tinygrad: `def end(self, *src): return self if len(src) == 0`)
     let store = UOp::noop();
     let end = Arc::clone(&store).end(smallvec![]);
 
-    let matcher = get_matcher();
-    let result = graph_rewrite(&matcher, end, &mut ());
-
-    // Should remain an END with empty ranges
-    match result.op() {
-        Op::End { computation, ranges } => {
-            assert!(Arc::ptr_eq(computation, &store), "Expected same computation");
-            assert_eq!(ranges.len(), 0, "Expected empty ranges");
-        }
-        other => panic!("Expected END operation, got {:?}", other),
-    }
+    // Empty ranges: end() should return the computation directly
+    assert!(Arc::ptr_eq(&end, &store), "end(empty) should return self");
 }
 
 #[test]

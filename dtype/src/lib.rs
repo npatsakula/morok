@@ -202,6 +202,45 @@ impl ScalarDType {
         matches!(self, Self::FP8E4M3 | Self::FP8E5M2 | Self::Float16 | Self::BFloat16 | Self::Float32 | Self::Float64)
     }
 
+    pub const fn min_value(&self) -> f64 {
+        match self {
+            Self::Bool => 0.0,
+            Self::Int8 => i8::MIN as f64,
+            Self::Int16 => i16::MIN as f64,
+            Self::Int32 => i32::MIN as f64,
+            Self::Int64 => i64::MIN as f64,
+            Self::UInt8 | Self::UInt16 | Self::UInt32 | Self::UInt64 => 0.0,
+            Self::Float16 => -65504.0,
+            Self::BFloat16 => -3.3895313892515355e38,
+            Self::Float32 => f32::MIN as f64,
+            Self::Float64 => f64::MIN,
+            Self::FP8E4M3 => -448.0,
+            Self::FP8E5M2 => -57344.0,
+            Self::Void | Self::Index => 0.0,
+        }
+    }
+
+    pub const fn max_value(&self) -> f64 {
+        match self {
+            Self::Bool => 1.0,
+            Self::Int8 => i8::MAX as f64,
+            Self::Int16 => i16::MAX as f64,
+            Self::Int32 => i32::MAX as f64,
+            Self::Int64 => i64::MAX as f64,
+            Self::UInt8 => u8::MAX as f64,
+            Self::UInt16 => u16::MAX as f64,
+            Self::UInt32 => u32::MAX as f64,
+            Self::UInt64 => u64::MAX as f64,
+            Self::Float16 => 65504.0,
+            Self::BFloat16 => 3.3895313892515355e38,
+            Self::Float32 => f32::MAX as f64,
+            Self::Float64 => f64::MAX,
+            Self::FP8E4M3 => 448.0,
+            Self::FP8E5M2 => 57344.0,
+            Self::Void | Self::Index => 0.0,
+        }
+    }
+
     pub const fn c_style(&self) -> &'static str {
         match self {
             Self::Bool => "bool",
@@ -370,6 +409,14 @@ impl DType {
     pub fn is_float(&self) -> bool {
         // Use base() to handle both Scalar and Vector types
         self.base().is_float()
+    }
+
+    pub fn min_value(&self) -> f64 {
+        self.base().min_value()
+    }
+
+    pub fn max_value(&self) -> f64 {
+        self.base().max_value()
     }
 
     pub fn c_style(&self) -> String {
