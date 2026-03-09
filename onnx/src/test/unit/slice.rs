@@ -12,8 +12,7 @@ fn test_slice_step_2() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![0.0, 2.0, 4.0, 6.0, 8.0]);
 }
 
@@ -29,8 +28,7 @@ fn test_slice_step_3() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![0.0, 3.0, 6.0, 9.0]);
 }
 
@@ -46,8 +44,7 @@ fn test_slice_neg_step_2() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![5.0, 3.0, 1.0]);
 }
 
@@ -63,8 +60,7 @@ fn test_slice_full_reverse() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![5.0, 4.0, 3.0, 2.0, 1.0, 0.0]);
 }
 
@@ -80,8 +76,7 @@ fn test_slice_large_start_neg_step() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Slice", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![5.0, 4.0, 3.0, 2.0, 1.0]);
 }
 

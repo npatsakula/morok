@@ -104,48 +104,23 @@ pub(crate) fn load_external_data(tensor: &TensorProto, model_dir: &Path) -> Resu
 }
 
 /// Create Tensor from raw bytes, shape, and dtype.
+///
+/// Uses `Tensor::from_raw_bytes` for all types except Bool, which needs
+/// explicit byte→bool conversion (ONNX encodes bools as single bytes or i32).
 pub(crate) fn create_tensor_from_raw(data: &[u8], dims: &[usize], dtype: DType) -> Result<Tensor> {
-    let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
-    // Empty data: return empty tensor (avoids bytemuck alignment panic on zero-length slices)
-    if data.is_empty() {
-        let empty: &[f32] = &[];
-        return Tensor::from_slice(empty).try_reshape(&shape).map_err(Error::from);
+    if dtype.base() == ScalarDType::Bool {
+        // ONNX raw_data stores bools as single bytes; int32_data stores as i32.
+        let values: Vec<bool> = if data.is_empty() {
+            vec![]
+        } else if data.len() == dims.iter().product::<usize>() {
+            data.iter().map(|&v| v != 0).collect()
+        } else {
+            bytemuck::cast_slice::<_, i32>(data).iter().map(|&v| v != 0).collect()
+        };
+        let shape: Vec<isize> = dims.iter().map(|&d| d as isize).collect();
+        return Tensor::from_slice(&values).try_reshape(&shape).map_err(Error::from);
     }
-    macro_rules! typed {
-        ($ty:ty) => {{
-            let values: Vec<$ty> = bytemuck::cast_slice(data).to_vec();
-            Tensor::from_slice(&values).try_reshape(&shape)
-        }};
-    }
-    let tensor = match dtype.base() {
-        ScalarDType::Float32 => typed!(f32),
-        ScalarDType::Float64 => typed!(f64),
-        ScalarDType::Int8 => typed!(i8),
-        ScalarDType::Int16 => typed!(i16),
-        ScalarDType::Int32 => typed!(i32),
-        ScalarDType::Int64 => typed!(i64),
-        ScalarDType::UInt8 => typed!(u8),
-        ScalarDType::UInt16 => typed!(u16),
-        ScalarDType::UInt32 => typed!(u32),
-        ScalarDType::UInt64 => typed!(u64),
-        ScalarDType::Bool => {
-            // ONNX raw_data stores bools as single bytes; int32_data stores as i32.
-            let values: Vec<bool> = if data.len() == dims.iter().product::<usize>() {
-                data.iter().map(|&v| v != 0).collect()
-            } else {
-                bytemuck::cast_slice::<_, i32>(data).iter().map(|&v| v != 0).collect()
-            };
-            Tensor::from_slice(&values).try_reshape(&shape)
-        }
-        // Float16, BFloat16, FP8: no native Rust type — use raw bytes
-        ScalarDType::Float16 | ScalarDType::BFloat16 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => {
-            Tensor::from_raw_bytes(data, dims, dtype)
-        }
-        _ => {
-            return Err(Error::IrConstruction { details: format!("Unsupported dtype for tensor creation: {dtype:?}") });
-        }
-    };
-    tensor.map_err(Error::from)
+    Tensor::from_raw_bytes(data, dims, dtype).map_err(Error::from)
 }
 
 /// Extract raw data bytes from TensorProto.

@@ -205,6 +205,14 @@ impl Tensor {
     /// assert_eq!(v, vec![1.0, 2.0, 3.0]);
     /// ```
     pub fn to_vec<T: HasDType + Default + Clone>(&self) -> Result<Vec<T>> {
+        // Zero-size tensor: return empty vec without realization (matches to_ndarray)
+        let uop = self.uop();
+        if let Some(Some(shape)) = uop.shape().ok() {
+            if shape.iter().any(|dim| dim.as_const() == Some(0)) {
+                return Ok(vec![]);
+            }
+        }
+
         let realized = self.clone().contiguous().realize()?;
         let buffer = realized.buffer().ok_or(Error::NoBuffer)?;
 

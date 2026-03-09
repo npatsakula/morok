@@ -80,8 +80,7 @@ fn test_max_variadic_3_inputs() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![3.0, 5.0]);
 }
 
@@ -93,8 +92,7 @@ fn test_max_single_input() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![7.0, 3.0]);
 }
 
@@ -108,8 +106,7 @@ fn test_min_variadic_3_inputs() {
     let node = NodeProto::default();
 
     let result = registry.dispatch_multi("Min", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![1.0, 1.0]);
 }
 
@@ -122,8 +119,7 @@ fn test_range_float() {
     let node = NodeProto::default();
 
     let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
-    let arr = result.to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result.to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![0.0, 1.5, 3.0, 4.5]);
 }
 
@@ -136,8 +132,7 @@ fn test_range_integer_regression() {
     let node = NodeProto::default();
 
     let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
-    let arr = result.to_ndarray::<i32>().unwrap();
-    let vals: Vec<i32> = arr.iter().copied().collect();
+    let vals = result.to_vec::<i32>().unwrap();
     assert_eq!(vals, vec![0, 1, 2, 3, 4]);
 }
 
@@ -161,8 +156,7 @@ fn test_and() {
     let node = NodeProto::default();
 
     let result = registry.dispatch("And", "", &[a, b], &node).unwrap().realize().unwrap();
-    let arr = result.to_ndarray::<bool>().unwrap();
-    let vals: Vec<bool> = arr.iter().copied().collect();
+    let vals = result.to_vec::<bool>().unwrap();
     assert_eq!(vals, vec![true, false, false, false]);
 }
 
@@ -174,8 +168,7 @@ fn test_or() {
     let node = NodeProto::default();
 
     let result = registry.dispatch("Or", "", &[a, b], &node).unwrap().realize().unwrap();
-    let arr = result.to_ndarray::<bool>().unwrap();
-    let vals: Vec<bool> = arr.iter().copied().collect();
+    let vals = result.to_vec::<bool>().unwrap();
     assert_eq!(vals, vec![true, true, true, false]);
 }
 
@@ -187,8 +180,7 @@ fn test_xor() {
     let node = NodeProto::default();
 
     let result = registry.dispatch("Xor", "", &[a, b], &node).unwrap().realize().unwrap();
-    let arr = result.to_ndarray::<bool>().unwrap();
-    let vals: Vec<bool> = arr.iter().copied().collect();
+    let vals = result.to_vec::<bool>().unwrap();
     assert_eq!(vals, vec![false, true, true, false]);
 }
 
@@ -199,8 +191,7 @@ fn test_isnan() {
     let node = NodeProto::default();
 
     let result = registry.dispatch("IsNaN", "", &[x], &node).unwrap().realize().unwrap();
-    let arr = result.to_ndarray::<bool>().unwrap();
-    let vals: Vec<bool> = arr.iter().copied().collect();
+    let vals = result.to_vec::<bool>().unwrap();
     assert_eq!(vals, vec![false, true, false]);
 }
 
@@ -221,8 +212,7 @@ fn test_shrink() {
     let node = NodeProto::default();
 
     let result = registry.dispatch("Shrink", "", &[x], &node).unwrap().realize().unwrap();
-    let arr = result.to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result.to_vec::<f32>().unwrap();
     let expected = [-2.0f32, 0.0, 0.0, 0.0, 2.0];
     for (a, b) in vals.iter().zip(expected.iter()) {
         assert!((a - b).abs() < 1e-4, "expected {b}, got {a}");

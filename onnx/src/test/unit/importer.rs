@@ -1,6 +1,7 @@
 use crate::importer::{DimValue, InputSpec, OnnxImporter};
 use crate::parser::onnx::{GraphProto, ModelProto, NodeProto, TensorProto, ValueInfoProto, tensor_proto};
 use crate::test::helpers::*;
+use ndarray::{Array2, Array3, Array4, array};
 
 #[test]
 fn test_importer_creation() {
@@ -249,8 +250,7 @@ fn test_if_true_condition() {
     let outputs = importer.import_model(model).unwrap();
 
     let result = outputs.get("output").unwrap();
-    let arr = result.to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result.to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![11.0, 12.0, 13.0]); // x + 10
 }
 
@@ -261,8 +261,7 @@ fn test_if_false_condition() {
     let outputs = importer.import_model(model).unwrap();
 
     let result = outputs.get("output").unwrap();
-    let arr = result.to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result.to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![21.0, 22.0, 23.0]); // x + 20
 }
 
@@ -274,8 +273,7 @@ fn test_if_where_path() {
     let outputs = importer.import_model(model).unwrap();
 
     let result = outputs.get("output").unwrap();
-    let arr = result.to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result.to_vec::<f32>().unwrap();
     // condition=true -> then_branch (x + 10) = [15, 16]
     assert_eq!(vals, vec![15.0, 16.0]);
 }
@@ -428,8 +426,7 @@ fn test_if_with_parent_scope() {
     let outputs = importer.import_model(model).unwrap();
 
     let result = outputs.get("output").unwrap();
-    let arr = result.to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result.to_vec::<f32>().unwrap();
     // condition=true, then_branch uses parent_val -> [100, 200, 300]
     assert_eq!(vals, vec![100.0, 200.0, 300.0]);
 }
@@ -562,8 +559,7 @@ fn test_if_nested() {
     let outputs = importer.import_model(model).unwrap();
 
     let result = outputs.get("output").unwrap();
-    let arr = result.to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result.to_vec::<f32>().unwrap();
     // outer_cond=true -> outer then_branch executes
     // inner_cond=false -> inner else_branch executes (x + 2)
     // x = [10, 20], so result = [12, 22]
@@ -735,38 +731,41 @@ use crate::registry::OpRegistry;
 fn test_rms_norm() {
     let registry = OpRegistry::new();
     // X: [1, 4], scale: [4]
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 4]).unwrap();
+    let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0, 4.0]]);
     let scale = Tensor::from_slice([1.0f32, 1.0, 1.0, 1.0]);
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("axis", -1));
     node.attribute.push(make_attr_float("epsilon", 1e-5));
     let inputs = vec![Some(x), Some(scale)];
     let result = registry.dispatch_multi("RMSNormalization", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.shape(), &[1, 4]);
+    let r = result[0].contiguous().realize().unwrap();
+    let dims: Vec<usize> = r.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [1, 4]);
+    let view = r.array_view::<f32>().unwrap();
     // With scale=[1,1,1,1], output = rms_norm(x)
     let rms_inv = 1.0 / (7.5f32 + 1e-5).sqrt();
     for i in 0..4 {
         let expected = (i + 1) as f32 * rms_inv;
-        assert!((arr[[0, i]] - expected).abs() < 1e-4);
+        assert!((view[[0, i]] - expected).abs() < 1e-4);
     }
 }
 
 #[test]
 fn test_rms_norm_with_scale() {
     let registry = OpRegistry::new();
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 4]).unwrap();
+    let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0, 4.0]]);
     let scale = Tensor::from_slice([2.0f32, 0.5, 1.0, 3.0]);
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_float("epsilon", 1e-5));
     let inputs = vec![Some(x), Some(scale)];
     let result = registry.dispatch_multi("RMSNormalization", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
+    let r = result[0].contiguous().realize().unwrap();
+    let view = r.array_view::<f32>().unwrap();
     let rms_inv = 1.0 / (7.5f32 + 1e-5).sqrt();
     let scales = [2.0, 0.5, 1.0, 3.0];
     for i in 0..4 {
         let expected = (i + 1) as f32 * rms_inv * scales[i];
-        assert!((arr[[0, i]] - expected).abs() < 1e-4);
+        assert!((view[[0, i]] - expected).abs() < 1e-4);
     }
 }
 
@@ -774,8 +773,8 @@ fn test_rms_norm_with_scale() {
 fn test_skip_layer_norm() {
     let registry = OpRegistry::new();
     // x: [1, 3], skip: [1, 3], gamma: [3], beta: [3]
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[1, 3]).unwrap();
-    let skip = Tensor::from_slice([0.1f32, 0.2, 0.3]).try_reshape(&[1, 3]).unwrap();
+    let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0]]);
+    let skip = Tensor::from_ndarray(&array![[0.1f32, 0.2, 0.3]]);
     let gamma = Tensor::from_slice([1.0f32, 1.0, 1.0]);
     let beta = Tensor::from_slice([0.0f32, 0.0, 0.0]);
     let mut node = NodeProto::default();
@@ -783,22 +782,23 @@ fn test_skip_layer_norm() {
     let inputs = vec![Some(x), Some(skip), Some(gamma), Some(beta)];
     let result = registry.dispatch_multi("SkipLayerNormalization", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 4);
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.shape(), &[1, 3]);
+    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [1, 3]);
     // x_sum = x + skip = [1.1, 2.2, 3.3], layernorm → mean ~0
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     let mean: f32 = vals.iter().sum::<f32>() / 3.0;
     assert!(mean.abs() < 1e-4, "layernorm mean should be ~0, got {mean}");
     // 4th output is x_sum
-    let x_sum = result[3].to_ndarray::<f32>().unwrap();
+    let r3 = result[3].contiguous().realize().unwrap();
+    let x_sum = r3.array_view::<f32>().unwrap();
     assert!((x_sum[[0, 0]] - 1.1).abs() < 1e-4);
 }
 
 #[test]
 fn test_skip_layer_norm_no_optionals() {
     let registry = OpRegistry::new();
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[1, 3]).unwrap();
-    let skip = Tensor::from_slice([4.0f32, 5.0, 6.0]).try_reshape(&[1, 3]).unwrap();
+    let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0]]);
+    let skip = Tensor::from_ndarray(&array![[4.0f32, 5.0, 6.0]]);
     let gamma = Tensor::from_slice([1.0f32, 1.0, 1.0]);
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_float("epsilon", 1e-5));
@@ -806,20 +806,20 @@ fn test_skip_layer_norm_no_optionals() {
     let inputs = vec![Some(x), Some(skip), Some(gamma)];
     let result = registry.dispatch_multi("SkipLayerNormalization", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 4);
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.shape(), &[1, 3]);
+    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [1, 3]);
 }
 
 #[test]
 fn test_embed_layer_norm() {
     let registry = OpRegistry::new();
     // input_ids: [1, 3] (batch=1, seq=3)
-    let input_ids = Tensor::from_slice([0i32, 1, 2]).try_reshape(&[1, 3]).unwrap();
+    let input_ids = Tensor::from_ndarray(&array![[0i32, 1, 2]]);
     // word_embedding: [3, 4] (vocab=3, embed=4)
     let word_emb_data: Vec<f32> = (0..12).map(|v| v as f32).collect();
-    let word_emb = Tensor::from_slice(&word_emb_data).try_reshape(&[3, 4]).unwrap();
+    let word_emb = Tensor::from_ndarray(&Array2::from_shape_vec((3, 4), word_emb_data).unwrap());
     // position_embedding: [3, 4] (max_pos=3, embed=4)
-    let pos_emb = Tensor::from_slice([0.1f32; 12]).try_reshape(&[3, 4]).unwrap();
+    let pos_emb = Tensor::from_ndarray(&Array2::from_elem((3, 4), 0.1f32));
     // gamma: [4], beta: [4]
     let gamma = Tensor::from_slice([1.0f32; 4]);
     let beta = Tensor::from_slice([0.0f32; 4]);
@@ -837,11 +837,11 @@ fn test_embed_layer_norm() {
     ];
     let result = registry.dispatch_multi("EmbedLayerNormalization", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 3);
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.shape(), &[1, 3, 4]);
+    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [1, 3, 4]);
     // 3rd output is the raw embedding sum (before layernorm)
-    let sum_arr = result[2].to_ndarray::<f32>().unwrap();
-    assert_eq!(sum_arr.shape(), &[1, 3, 4]);
+    let sum_dims: Vec<usize> = result[2].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(sum_dims, [1, 3, 4]);
 }
 
 #[test]
@@ -849,12 +849,12 @@ fn test_rotary_embedding_split() {
     let registry = OpRegistry::new();
     // x: [1, 1, 2, 4] (B=1, H=1, S=2, D=4)
     let x_data: Vec<f32> = (1..=8).map(|v| v as f32).collect();
-    let x = Tensor::from_slice(&x_data).try_reshape(&[1, 1, 2, 4]).unwrap();
+    let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 2, 4), x_data).unwrap());
     // cos_cache: [2, 2], sin_cache: [2, 2]
-    let cos_cache = Tensor::from_slice([1.0f32, 1.0, 1.0, 1.0]).try_reshape(&[2, 2]).unwrap();
-    let sin_cache = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape(&[2, 2]).unwrap();
+    let cos_cache = Tensor::from_ndarray(&Array2::from_elem((2, 2), 1.0f32));
+    let sin_cache = Tensor::from_ndarray(&Array2::from_elem((2, 2), 0.0f32));
     // position_ids: [1, 2]
-    let pos_ids = Tensor::from_slice([0i32, 1]).try_reshape(&[1, 2]).unwrap();
+    let pos_ids = Tensor::from_ndarray(&array![[0i32, 1]]);
 
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("interleaved", 0));
@@ -863,10 +863,10 @@ fn test_rotary_embedding_split() {
     let inputs = vec![Some(x), Some(pos_ids), Some(cos_cache), Some(sin_cache)];
     let result = registry.dispatch_multi("RotaryEmbedding", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 1);
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.shape(), &[1, 1, 2, 4]);
+    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [1, 1, 2, 4]);
     // With cos=1, sin=0 → identity rotation, output = input
-    let flat: Vec<f32> = arr.iter().copied().collect();
+    let flat = result[0].to_vec::<f32>().unwrap();
     for (i, val) in flat.iter().enumerate() {
         assert!((val - (i + 1) as f32).abs() < 1e-4, "rotary identity: got {val}, expected {}", i + 1);
     }
@@ -876,7 +876,7 @@ fn test_rotary_embedding_split() {
 fn test_attention_contrib_basic() {
     let registry = OpRegistry::new();
     // x: [1, 2, 4] (batch=1, seq=2, hidden=4)
-    let x = Tensor::from_slice([1.0f32; 8]).try_reshape(&[1, 2, 4]).unwrap();
+    let x = Tensor::from_ndarray(&Array3::from_elem((1, 2, 4), 1.0f32));
     // weights: [4, 12] (input_hidden=4, 3*hidden = 3*4 = 12)
     // ONNX contrib Attention weight layout: [input_hidden, 3*hidden]
     // qkv_hidden_sizes default: [4, 4, 4] (each third)
@@ -888,7 +888,7 @@ fn test_attention_contrib_basic() {
         w_data[i * 12 + 4 + i] = 1.0; // K block
         w_data[i * 12 + 8 + i] = 1.0; // V block
     }
-    let weights = Tensor::from_slice(&w_data).try_reshape(&[4, 12]).unwrap();
+    let weights = Tensor::from_ndarray(&Array2::from_shape_vec((4, 12), w_data).unwrap());
     let bias = Tensor::from_slice([0.0f32; 12]);
 
     let mut node = NodeProto::default();
@@ -897,15 +897,15 @@ fn test_attention_contrib_basic() {
     let inputs = vec![Some(x), Some(weights), Some(bias)];
     let result = registry.dispatch_multi("Attention", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
     assert!(!result.is_empty());
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.shape(), &[1, 2, 4]);
+    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [1, 2, 4]);
 }
 
 #[test]
 fn test_attention_contrib_causal() {
     let registry = OpRegistry::new();
     // x: [1, 2, 4], weights: [4, 6] with num_heads=1, so Q,K,V each have hidden=2
-    let x = Tensor::from_slice([1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]).try_reshape(&[1, 2, 4]).unwrap();
+    let x = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0, 1.0], [0.0, 1.0, 1.0, 0.0]]]);
     // Weight: [4, 6] (input=4, 3*hidden=6 where hidden=2, num_heads=1, head_dim=2)
     let mut w_data = vec![0.1f32; 24]; // 4 * 6
     // Make Q,K,V project to something predictable
@@ -914,7 +914,7 @@ fn test_attention_contrib_causal() {
         w_data[i * 6 + 2 + i] = 1.0; // K
         w_data[i * 6 + 4 + i] = 1.0; // V
     }
-    let weights = Tensor::from_slice(&w_data).try_reshape(&[4, 6]).unwrap();
+    let weights = Tensor::from_ndarray(&Array2::from_shape_vec((4, 6), w_data).unwrap());
     let bias = Tensor::from_slice([0.0f32; 6]);
 
     let mut node = NodeProto::default();
@@ -924,8 +924,8 @@ fn test_attention_contrib_causal() {
 
     let inputs = vec![Some(x), Some(weights), Some(bias)];
     let result = registry.dispatch_multi("Attention", "com.microsoft", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.shape(), &[1, 2, 2]);
+    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [1, 2, 2]);
     // With unidirectional, position 0 can only attend to position 0
 }
 
@@ -933,38 +933,36 @@ fn test_attention_contrib_causal() {
 fn test_attention_onnx_basic() {
     let registry = OpRegistry::new();
     // Q, K, V: [1, 2, 2, 2] (batch=1, heads=2, seq=2, dim=2)
-    let q = Tensor::from_slice([1.0f32; 8]).try_reshape(&[1, 2, 2, 2]).unwrap();
+    let q = Tensor::from_ndarray(&Array4::from_elem((1, 2, 2, 2), 1.0f32));
     let k = q.clone();
-    let v = Tensor::from_slice([1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]).try_reshape(&[1, 2, 2, 2]).unwrap();
+    let v = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0]], [[0.0, 1.0], [1.0, 0.0]]]]);
 
     let node = NodeProto::default();
     let inputs = vec![Some(q), Some(k), Some(v)];
     let result = registry.dispatch_multi("Attention", "", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 4);
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.shape(), &[1, 2, 2, 2]);
+    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [1, 2, 2, 2]);
 }
 
 #[test]
 fn test_attention_onnx_causal() {
     let registry = OpRegistry::new();
-    let q = Tensor::from_slice([1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5])
-        .try_reshape(&[1, 1, 3, 4])
-        .unwrap();
+    let q = Tensor::from_ndarray(&array![[[[1.0f32, 0.0, 0.0, 1.0], [1.0, 1.0, 0.0, 0.0], [0.5, 0.5, 0.5, 0.5]]]]);
     let k = q.clone();
-    let v = Tensor::from_slice([1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-        .try_reshape(&[1, 1, 3, 4])
-        .unwrap();
+    let v = Tensor::from_ndarray(&array![[[[1.0f32, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]]]);
 
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("is_causal", 1));
     let inputs = vec![Some(q), Some(k), Some(v)];
     let result = registry.dispatch_multi("Attention", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    assert_eq!(arr.shape(), &[1, 1, 3, 4]);
+    let r = result[0].contiguous().realize().unwrap();
+    let dims: Vec<usize> = r.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [1, 1, 3, 4]);
+    let view = r.array_view::<f32>().unwrap();
     // Position 0 can only attend to position 0 -> output[0] = V[0] = [1, 0, 0, 0]
-    assert!((arr[[0, 0, 0, 0]] - 1.0).abs() < 1e-4);
-    assert!((arr[[0, 0, 0, 1]] - 0.0).abs() < 1e-4);
+    assert!((view[[0, 0, 0, 0]] - 1.0).abs() < 1e-4);
+    assert!((view[[0, 0, 0, 1]] - 0.0).abs() < 1e-4);
 }
 
 #[test]
@@ -973,7 +971,7 @@ fn test_attention_domain_dispatch() {
     let registry = OpRegistry::new();
 
     // ONNX standard: takes pre-projected Q, K, V (4D)
-    let q = Tensor::from_slice([1.0f32; 4]).try_reshape(&[1, 1, 2, 2]).unwrap();
+    let q = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     let k = q.clone();
     let v = q.clone();
     let node = NodeProto::default();
@@ -983,8 +981,8 @@ fn test_attention_domain_dispatch() {
 
     // Microsoft contrib: takes x + weights (packed QKV projection)
     // x: [1, 2, 2], weights: [2, 6] (input_hidden=2, 3*hidden=6), num_heads=1, head_dim=2
-    let x = Tensor::from_slice([1.0f32; 4]).try_reshape(&[1, 2, 2]).unwrap();
-    let w = Tensor::from_slice([0.1f32; 12]).try_reshape(&[2, 6]).unwrap();
+    let x = Tensor::from_ndarray(&Array3::from_elem((1, 2, 2), 1.0f32));
+    let w = Tensor::from_ndarray(&Array2::from_elem((2, 6), 0.1f32));
     let b = Tensor::from_slice([0.0f32; 6]);
     let mut node_contrib = NodeProto::default();
     node_contrib.attribute.push(make_attr_int("num_heads", 1));
@@ -1003,7 +1001,7 @@ fn test_attention_domain_dispatch() {
 fn test_depth_to_space_dcr() {
     let registry = OpRegistry::new();
     // [1, 8, 1, 1] with blocksize=2 → [1, 2, 2, 2]
-    let x = Tensor::from_slice((0..8).map(|v| v as f32).collect::<Vec<_>>()).try_reshape(&[1, 8, 1, 1]).unwrap();
+    let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 8, 1, 1), (0..8).map(|v| v as f32).collect()).unwrap());
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("blocksize", 2));
     let result = registry.dispatch("DepthToSpace", "", &[x], &node).unwrap();
@@ -1014,7 +1012,7 @@ fn test_depth_to_space_dcr() {
 #[test]
 fn test_depth_to_space_crd() {
     let registry = OpRegistry::new();
-    let x = Tensor::from_slice((0..8).map(|v| v as f32).collect::<Vec<_>>()).try_reshape(&[1, 8, 1, 1]).unwrap();
+    let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 8, 1, 1), (0..8).map(|v| v as f32).collect()).unwrap());
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("blocksize", 2));
     node.attribute.push(make_attr_string("mode", "CRD"));
@@ -1027,7 +1025,7 @@ fn test_depth_to_space_crd() {
 fn test_space_to_depth() {
     let registry = OpRegistry::new();
     // [1, 1, 4, 4] with blocksize=2 → [1, 4, 2, 2]
-    let x = Tensor::from_slice((0..16).map(|v| v as f32).collect::<Vec<_>>()).try_reshape(&[1, 1, 4, 4]).unwrap();
+    let x = Tensor::from_ndarray(&Array4::from_shape_vec((1, 1, 4, 4), (0..16).map(|v| v as f32).collect()).unwrap());
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("blocksize", 2));
     let result = registry.dispatch("SpaceToDepth", "", &[x], &node).unwrap();
@@ -1042,30 +1040,32 @@ fn test_space_to_depth() {
 #[test]
 fn test_lp_norm_l1() {
     let registry = OpRegistry::new();
-    let x = Tensor::from_slice([1.0f32, -2.0, 3.0]).try_reshape(&[1, 3]).unwrap();
+    let x = Tensor::from_ndarray(&array![[1.0f32, -2.0, 3.0]]);
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("axis", 1));
     node.attribute.push(make_attr_int("p", 1));
     let result = registry.dispatch("LpNormalization", "", &[x], &node).unwrap();
-    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
+    let r = result.contiguous().realize().unwrap();
+    let view = r.array_view::<f32>().unwrap();
     // L1 norm = |1| + |-2| + |3| = 6
-    assert!((arr[[0, 0]] - 1.0 / 6.0).abs() < 1e-5);
-    assert!((arr[[0, 1]] - (-2.0 / 6.0)).abs() < 1e-5);
-    assert!((arr[[0, 2]] - 3.0 / 6.0).abs() < 1e-5);
+    assert!((view[[0, 0]] - 1.0 / 6.0).abs() < 1e-5);
+    assert!((view[[0, 1]] - (-2.0 / 6.0)).abs() < 1e-5);
+    assert!((view[[0, 2]] - 3.0 / 6.0).abs() < 1e-5);
 }
 
 #[test]
 fn test_lp_norm_l2() {
     let registry = OpRegistry::new();
-    let x = Tensor::from_slice([3.0f32, 4.0]).try_reshape(&[1, 2]).unwrap();
+    let x = Tensor::from_ndarray(&array![[3.0f32, 4.0]]);
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("axis", 1));
     node.attribute.push(make_attr_int("p", 2));
     let result = registry.dispatch("LpNormalization", "", &[x], &node).unwrap();
-    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
+    let r = result.contiguous().realize().unwrap();
+    let view = r.array_view::<f32>().unwrap();
     // L2 norm = sqrt(9 + 16) = 5
-    assert!((arr[[0, 0]] - 0.6).abs() < 1e-5);
-    assert!((arr[[0, 1]] - 0.8).abs() < 1e-5);
+    assert!((view[[0, 0]] - 0.6).abs() < 1e-5);
+    assert!((view[[0, 1]] - 0.8).abs() < 1e-5);
 }
 
 // =========================================================================
@@ -1076,16 +1076,17 @@ fn test_lp_norm_l2() {
 fn test_mean_variance_norm() {
     let registry = OpRegistry::new();
     // [1, 2, 1, 1] — default axes [0,2,3]
-    let x = Tensor::from_slice([3.0f32, 5.0]).try_reshape(&[1, 2, 1, 1]).unwrap();
+    let x = Tensor::from_ndarray(&array![[[[3.0f32]], [[5.0]]]]);
     let node = NodeProto::default(); // default axes=[0,2,3]
     let result = registry.dispatch("MeanVarianceNormalization", "", &[x], &node).unwrap();
     let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     assert_eq!(shape, vec![1, 2, 1, 1]);
     // With axes [0,2,3] on a [1,2,1,1] tensor, each channel is independently normalized
     // For single-element reduction: (x - mean) / std → 0/0 ≈ 0 (clamped by eps)
-    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
-    assert!(arr[[0, 0, 0, 0]].abs() < 1e-3);
-    assert!(arr[[0, 1, 0, 0]].abs() < 1e-3);
+    let r = result.contiguous().realize().unwrap();
+    let view = r.array_view::<f32>().unwrap();
+    assert!(view[[0, 0, 0, 0]].abs() < 1e-3);
+    assert!(view[[0, 1, 0, 0]].abs() < 1e-3);
 }
 
 // =========================================================================
@@ -1096,7 +1097,7 @@ fn test_mean_variance_norm() {
 fn test_lrn() {
     let registry = OpRegistry::new();
     // [1, 3, 1, 1] — size=3
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[1, 3, 1, 1]).unwrap();
+    let x = Tensor::from_ndarray(&array![[[[1.0f32]], [[2.0]], [[3.0]]]]);
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("size", 3));
     node.attribute.push(make_attr_float("alpha", 0.0001));
@@ -1106,8 +1107,8 @@ fn test_lrn() {
     let shape: Vec<usize> = result.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     assert_eq!(shape, vec![1, 3, 1, 1]);
     // Just verify it runs and produces finite values
-    let arr = result.realize().unwrap().to_ndarray::<f32>().unwrap();
-    for val in arr.iter() {
+    let vals = result.to_vec::<f32>().unwrap();
+    for val in &vals {
         assert!(val.is_finite(), "LRN produced non-finite value: {val}");
     }
 }
@@ -1119,19 +1120,16 @@ fn test_lrn() {
 #[test]
 fn test_nll_loss() {
     let registry = OpRegistry::new();
-    let log_probs = Tensor::from_slice([
-        -0.5f32, -1.0, -2.0, // sample 0
-        -0.3, -1.5, -0.8, // sample 1
-    ])
-    .try_reshape(&[2, 3])
-    .unwrap();
+    let log_probs = Tensor::from_ndarray(&array![
+        [-0.5f32, -1.0, -2.0], // sample 0
+        [-0.3, -1.5, -0.8],    // sample 1
+    ]);
     let target = Tensor::from_slice([0i64, 2]);
     let node = NodeProto::default(); // default: reduction="mean"
     let inputs = vec![Some(log_probs), Some(target)];
     let result = registry.dispatch_multi("NegativeLogLikelihoodLoss", "", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 1);
-    let arr = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
-    let val = arr.into_raw_vec_and_offset().0[0];
+    let val = result[0].to_vec::<f32>().unwrap()[0];
     assert!((val - 0.65).abs() < 1e-4, "NLL loss got {val}");
 }
 
@@ -1139,14 +1137,13 @@ fn test_nll_loss() {
 fn test_softmax_ce_loss() {
     let registry = OpRegistry::new();
     // Raw logits [2, 3]
-    let logits = Tensor::from_slice([1.0f32, 2.0, 3.0, 1.0, 2.0, 3.0]).try_reshape(&[2, 3]).unwrap();
+    let logits = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [1.0, 2.0, 3.0]]);
     let target = Tensor::from_slice([0i64, 2]);
     let node = NodeProto::default();
     let inputs = vec![Some(logits), Some(target)];
     let result = registry.dispatch_multi("SoftmaxCrossEntropyLoss", "", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 2); // [loss, log_probs]
-    let loss = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
-    let val = loss.into_raw_vec_and_offset().0[0];
+    let val = result[0].to_vec::<f32>().unwrap()[0];
     assert!(val > 0.0, "CE loss should be positive, got {val}");
     // log_probs shape should match logits
     let lp_shape: Vec<usize> = result[1].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
@@ -1161,7 +1158,7 @@ fn test_softmax_ce_loss() {
 fn test_affine_grid() {
     let registry = OpRegistry::new();
     // Identity transform: theta = [[1,0,0],[0,1,0]] → [1, 2, 3]
-    let theta = Tensor::from_slice([1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0]).try_reshape(&[1, 2, 3]).unwrap();
+    let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
     let size = Tensor::from_slice([1i64, 1, 2, 2]); // N=1, C=1, H=2, W=2
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("align_corners", 0));
@@ -1174,7 +1171,7 @@ fn test_affine_grid() {
 #[test]
 fn test_affine_grid_aligned() {
     let registry = OpRegistry::new();
-    let theta = Tensor::from_slice([1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0]).try_reshape(&[1, 2, 3]).unwrap();
+    let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
     let size = Tensor::from_slice([1i64, 1, 3, 3]);
     let mut node = NodeProto::default();
     node.attribute.push(make_attr_int("align_corners", 1));
@@ -1183,10 +1180,11 @@ fn test_affine_grid_aligned() {
     let shape: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     assert_eq!(shape, vec![1, 3, 3, 2]); // [N, H, W, 2]
     // With align_corners=1, identity transform on 3x3 grid should have corners at (-1,-1) and (1,1)
-    let arr = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
+    let r = result[0].contiguous().realize().unwrap();
+    let view = r.array_view::<f32>().unwrap();
     // Top-left corner: (x, y) = (-1, -1)  — note: reversed dim order in grid (W then H)
-    assert!((arr[[0, 0, 0, 0]] - (-1.0)).abs() < 1e-4, "x corner got {}", arr[[0, 0, 0, 0]]);
-    assert!((arr[[0, 0, 0, 1]] - (-1.0)).abs() < 1e-4, "y corner got {}", arr[[0, 0, 0, 1]]);
+    assert!((view[[0, 0, 0, 0]] - (-1.0)).abs() < 1e-4, "x corner got {}", view[[0, 0, 0, 0]]);
+    assert!((view[[0, 0, 0, 1]] - (-1.0)).abs() < 1e-4, "y corner got {}", view[[0, 0, 0, 1]]);
 }
 
 // =========================================================================
@@ -1197,7 +1195,7 @@ fn test_affine_grid_aligned() {
 fn test_batch_norm_training() {
     let registry = OpRegistry::new();
     // [2, 2, 1, 1] — 2 samples, 2 channels
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2, 1, 1]).unwrap();
+    let x = Tensor::from_ndarray(&array![[[[1.0f32]], [[2.0]]], [[[3.0]], [[4.0]]]]);
     let scale = Tensor::from_slice([1.0f32, 1.0]);
     let bias = Tensor::from_slice([0.0f32, 0.0]);
     let mean = Tensor::from_slice([0.0f32, 0.0]);
@@ -1208,8 +1206,8 @@ fn test_batch_norm_training() {
     let result = registry.dispatch_multi("BatchNormalization", "", &inputs, &node, i64::MAX).unwrap();
     assert_eq!(result.len(), 3); // [output, running_mean, running_var]
     // Output should be normalized (mean≈0 per channel)
-    let out = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
-    assert_eq!(out.shape(), &[2, 2, 1, 1]);
+    let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    assert_eq!(dims, [2, 2, 1, 1]);
 }
 
 // =========================================================================
@@ -1224,8 +1222,7 @@ fn test_dropout_v7_inference() {
     let inputs = vec![Some(x)];
     let result = registry.dispatch_multi("Dropout", "", &inputs, &node, 13).unwrap();
     assert_eq!(result.len(), 2); // [output, mask]
-    let out = result[0].clone().realize().unwrap().to_ndarray::<f32>().unwrap();
-    assert_eq!(out.as_slice().unwrap(), &[1.0, 2.0, 3.0]); // passthrough
+    assert_eq!(result[0].to_vec::<f32>().unwrap(), [1.0, 2.0, 3.0]); // passthrough
 }
 
 // =========================================================================
@@ -1239,8 +1236,7 @@ fn test_optional_has_element_present() {
     let inputs = vec![Some(x)];
     let node = NodeProto::default();
     let result = registry.dispatch_multi("OptionalHasElement", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<bool>().unwrap();
-    assert!(arr[[]]);
+    assert!(result[0].to_vec::<bool>().unwrap()[0]);
 }
 
 #[test]
@@ -1249,8 +1245,7 @@ fn test_optional_has_element_absent() {
     let inputs: Vec<Option<Tensor>> = vec![None];
     let node = NodeProto::default();
     let result = registry.dispatch_multi("OptionalHasElement", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<bool>().unwrap();
-    assert!(!arr[[]]);
+    assert!(!result[0].to_vec::<bool>().unwrap()[0]);
 }
 
 #[test]
@@ -1260,7 +1255,6 @@ fn test_optional_get_element() {
     let inputs = vec![Some(x)];
     let node = NodeProto::default();
     let result = registry.dispatch_multi("OptionalGetElement", "", &inputs, &node, i64::MAX).unwrap();
-    let arr = result[0].to_ndarray::<f32>().unwrap();
-    let vals: Vec<f32> = arr.iter().copied().collect();
+    let vals = result[0].to_vec::<f32>().unwrap();
     assert_eq!(vals, vec![1.0, 2.0, 3.0]);
 }

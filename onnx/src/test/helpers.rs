@@ -142,9 +142,11 @@ pub(crate) fn make_multi_output_model() -> ModelProto {
 
 macro_rules! assert_float_close {
     ($actual:expr, $expected:expr, $name:expr, $rtol:expr, $atol:expr, $ty:ty) => {{
-        let a = $actual.to_ndarray::<$ty>().unwrap();
-        let e = $expected.to_ndarray::<$ty>().unwrap();
-        assert_eq!(a.shape(), e.shape(), "Shape mismatch on output '{}'", $name);
+        let a_shape = $actual.shape().unwrap();
+        let e_shape = $expected.shape().unwrap();
+        assert_eq!(a_shape, e_shape, "Shape mismatch on output '{}'", $name);
+        let a = $actual.to_vec::<$ty>().unwrap();
+        let e = $expected.to_vec::<$ty>().unwrap();
         for (idx, (av, ev)) in a.iter().zip(e.iter()).enumerate() {
             let av = *av as f64;
             let ev = *ev as f64;
@@ -172,9 +174,11 @@ macro_rules! assert_float_close {
 
 macro_rules! assert_int_exact {
     ($actual:expr, $expected:expr, $name:expr, $ty:ty) => {{
-        let a = $actual.to_ndarray::<$ty>().unwrap();
-        let e = $expected.to_ndarray::<$ty>().unwrap();
-        assert_eq!(a.shape(), e.shape(), "Shape mismatch on output '{}'", $name);
+        let a_shape = $actual.shape().unwrap();
+        let e_shape = $expected.shape().unwrap();
+        assert_eq!(a_shape, e_shape, "Shape mismatch on output '{}'", $name);
+        let a = $actual.to_vec::<$ty>().unwrap();
+        let e = $expected.to_vec::<$ty>().unwrap();
         assert_eq!(a, e, "Value mismatch on output '{}'", $name);
     }};
 }

@@ -1563,6 +1563,7 @@ dependencies = [
  "morok-dtype",
  "morok-ir",
  "morok-tensor",
+ "ndarray",
  "proptest",
  "prost",
  "prost-build",
