@@ -30,7 +30,10 @@ fn test_registry_reduce_with_keepdims() {
     node.attribute.push(make_attr_ints("axes", &[1]));
     node.attribute.push(make_attr_int("keepdims", 1));
 
-    let result = registry.dispatch("ReduceSum", "", &[x], &node).unwrap().realize().unwrap();
+    // Use opset 12 so axes come from attributes (opset >=13 reads axes from input[1])
+    let inputs = vec![Some(x)];
+    let result = registry.dispatch_multi("ReduceSum", "", &inputs, &node, 12).unwrap();
+    let result = result[0].clone().realize().unwrap();
     assert!(result.buffer().is_some());
 }
 

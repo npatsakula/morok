@@ -4,14 +4,13 @@ use morok_tensor::Tensor;
 use morok_tensor::indexing::ScatterReduction;
 
 use crate::error::{Error, Result};
-use crate::parser::onnx::NodeProto;
 
 use super::*;
 
-pub(crate) fn op_gather_elements(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_gather_elements(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let x = inp(inputs, 0);
     let idx = inp(inputs, 1);
-    let axis = get_attr_int(node, "axis", 0) as isize;
+    let axis = attrs.int("axis", 0) as isize;
     let x_shape = x.shape()?;
     let ndim = x_shape.len();
     let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
@@ -23,18 +22,18 @@ pub(crate) fn op_gather_elements(inputs: &[Option<Tensor>], node: &NodeProto) ->
     Ok(x.gather(axis, &normalized_idx)?)
 }
 
-pub(crate) fn op_trilu(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_trilu(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let x = inp(inputs, 0);
     let k = inputs.get(1).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?.map(|v| v[0]).unwrap_or(0);
-    let upper = get_attr_int(node, "upper", 1) == 1;
+    let upper = attrs.int("upper", 1) == 1;
     Ok(if upper { x.triu(k)? } else { x.tril(k)? })
 }
 
-pub(crate) fn op_one_hot(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_one_hot(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let indices = inp(inputs, 0);
     let depth = tensor_to_i64_vec(inp(inputs, 1))?[0] as usize;
     let values = inp(inputs, 2);
-    let axis = get_attr_int(node, "axis", -1) as isize;
+    let axis = attrs.int("axis", -1) as isize;
     let zero = Tensor::const_(ConstValue::Int(0), indices.uop().dtype());
     let depth_t = Tensor::const_(ConstValue::Int(depth as i64), indices.uop().dtype());
     let neg_mask = indices.try_lt(&zero)?;
@@ -49,13 +48,13 @@ pub(crate) fn op_one_hot(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<
     Ok(on_val.where_(&mask, &off_val)?)
 }
 
-pub(crate) fn op_cumsum(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_cumsum(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let x = inp(inputs, 0);
     let axis_raw = tensor_to_i64_vec(inp(inputs, 1))?[0];
     let ndim = x.ndim()?;
     let axis = if axis_raw < 0 { (ndim as i64 + axis_raw) as usize } else { axis_raw as usize };
-    let exclusive = get_attr_int(node, "exclusive", 0) == 1;
-    let reverse = get_attr_int(node, "reverse", 0) == 1;
+    let exclusive = attrs.int("exclusive", 0) == 1;
+    let reverse = attrs.int("reverse", 0) == 1;
     let mut result = x.clone();
     if reverse {
         result = result.flip(&[axis as isize])?;
@@ -78,13 +77,13 @@ pub(crate) fn op_cumsum(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<T
     Ok(result)
 }
 
-pub(crate) fn op_cumprod(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_cumprod(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let x = inp(inputs, 0);
     let axis_raw = tensor_to_i64_vec(inp(inputs, 1))?[0];
     let ndim = x.ndim()?;
     let axis = if axis_raw < 0 { (ndim as i64 + axis_raw) as usize } else { axis_raw as usize };
-    let exclusive = get_attr_int(node, "exclusive", 0) == 1;
-    let reverse = get_attr_int(node, "reverse", 0) == 1;
+    let exclusive = attrs.int("exclusive", 0) == 1;
+    let reverse = attrs.int("reverse", 0) == 1;
     let mut result = x.clone();
     if reverse {
         result = result.flip(&[axis as isize])?;
@@ -107,9 +106,9 @@ pub(crate) fn op_cumprod(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<
     Ok(result)
 }
 
-pub(crate) fn op_scatter_elements(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
-    let axis = get_attr_int(node, "axis", 0) as isize;
-    let reduction = get_attr_string(node, "reduction", "none");
+pub(crate) fn op_scatter_elements(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
+    let axis = attrs.int("axis", 0) as isize;
+    let reduction = attrs.string("reduction", "none");
     let x = inp(inputs, 0);
     let idx = inp(inputs, 1);
     let updates = inp(inputs, 2);
@@ -140,11 +139,11 @@ pub(crate) fn op_scatter_elements(inputs: &[Option<Tensor>], node: &NodeProto) -
     })
 }
 
-pub(crate) fn op_scatter_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_scatter_nd(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let mut x = inp(inputs, 0).clone();
     let indices = inp(inputs, 1);
     let updates = inp(inputs, 2);
-    let reduction = get_attr_string(node, "reduction", "none");
+    let reduction = attrs.string("reduction", "none");
     let x_shape = x.shape()?;
     let x_dims = morok_ir::shape::to_vec_usize(&x_shape)?;
     let idx_shape = indices.shape()?;
@@ -189,12 +188,12 @@ pub(crate) fn op_scatter_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Resu
     Ok(x.try_reshape(&out_shape)?)
 }
 
-pub(crate) fn op_tensor_scatter(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_tensor_scatter(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let data = inp(inputs, 0);
     let update = inp(inputs, 1);
     let write_indices = inputs.get(2).and_then(|o| o.as_ref());
-    let mode = get_attr_string(node, "mode", "linear");
-    let axis_raw = get_attr_int(node, "axis", -2) as isize;
+    let mode = attrs.string("mode", "linear");
+    let axis_raw = attrs.int("axis", -2) as isize;
 
     let data_shape = data.shape()?;
     let ndim = data_shape.len();
@@ -220,9 +219,7 @@ pub(crate) fn op_tensor_scatter(inputs: &[Option<Tensor>], node: &NodeProto) -> 
     // Expand write_indices from (B,) to (B_total,) by broadcasting over dims 1..axis
     let wi_flat = if axis > 1 {
         let mut wi_reshape: Vec<isize> = vec![batch_size as isize];
-        for _ in 1..axis {
-            wi_reshape.push(1);
-        }
+        wi_reshape.extend(std::iter::repeat_n(1, axis - 1));
         let wi_expand: Vec<isize> = data_dims[..axis].iter().map(|&d| d as isize).collect();
         write_idx.try_reshape(&wi_reshape)?.try_expand(&wi_expand)?.try_reshape(&[b_total as isize])?
     } else {
@@ -263,10 +260,10 @@ pub(crate) fn op_tensor_scatter(inputs: &[Option<Tensor>], node: &NodeProto) -> 
     Ok(result.try_reshape(&out_shape)?)
 }
 
-pub(crate) fn op_gather_nd(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_gather_nd(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let x = inp(inputs, 0);
     let indices = inp(inputs, 1);
-    let batch_dims = get_attr_int(node, "batch_dims", 0) as usize;
+    let batch_dims = attrs.int("batch_dims", 0) as usize;
     let x_shape = x.shape()?;
     let x_dims = morok_ir::shape::to_vec_usize(&x_shape)?;
     let idx_shape = indices.shape()?;

@@ -2,7 +2,6 @@ use morok_dtype::DType;
 use morok_tensor::Tensor;
 
 use crate::error::Result;
-use crate::parser::onnx::NodeProto;
 
 use super::*;
 
@@ -11,16 +10,16 @@ use super::*;
 // =========================================================================
 
 /// RMSNormalization: `x * rsqrt(mean(x^2) + eps) * scale`
-pub(crate) fn op_rms_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_rms_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let x = inp(inputs, 0);
     let scale = inp(inputs, 1);
-    let axis = get_attr_int(node, "axis", -1) as isize;
-    let epsilon = get_attr_float(node, "epsilon", 1e-5) as f64;
+    let axis = attrs.int("axis", -1) as isize;
+    let epsilon = attrs.float("epsilon", 1e-5) as f64;
     Ok(x.rms_norm(axis, epsilon)?.try_mul(scale)?)
 }
 
 /// Standard ONNX Attention (pre-projected Q, K, V).
-pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Vec<Tensor>> {
     let q = inp(inputs, 0);
     let k = inp(inputs, 1);
     let v = inp(inputs, 2);
@@ -29,15 +28,15 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], node: &NodeProto) -> 
     let past_value = inputs.get(5).and_then(|o| o.as_ref());
     let nonpad_kv_seqlen = inputs.get(6).and_then(|o| o.as_ref());
 
-    let is_causal = get_attr_int(node, "is_causal", 0) != 0;
-    let q_num_heads = get_attr_int(node, "q_num_heads", 0) as usize;
-    let kv_num_heads = get_attr_int(node, "kv_num_heads", 0) as usize;
-    let qk_matmul_output_mode = get_attr_int(node, "qk_matmul_output_mode", 0);
-    let scale_attr = get_attr_float(node, "scale", 0.0);
+    let is_causal = attrs.int("is_causal", 0) != 0;
+    let q_num_heads = attrs.int("q_num_heads", 0) as usize;
+    let kv_num_heads = attrs.int("kv_num_heads", 0) as usize;
+    let qk_matmul_output_mode = attrs.int("qk_matmul_output_mode", 0);
+    let scale_attr = attrs.float("scale", 0.0);
     let scale = if scale_attr != 0.0 { Some(scale_attr as f64) } else { None };
-    let softcap_val = get_attr_float(node, "softcap", 0.0) as f64;
+    let softcap_val = attrs.float("softcap", 0.0) as f64;
     let softcap = if softcap_val > 0.0 { Some(softcap_val) } else { None };
-    let softmax_precision = get_attr_int(node, "softmax_precision", 0);
+    let softmax_precision = attrs.int("softmax_precision", 0);
 
     let q_shape = q.shape()?;
     let is_3d = q_shape.len() == 3;
@@ -240,13 +239,13 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], node: &NodeProto) -> 
 // =========================================================================
 
 /// SkipLayerNormalization: `x + skip [+ bias] → layernorm → * gamma [+ beta]`
-pub(crate) fn op_skip_layer_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+pub(crate) fn op_skip_layer_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Vec<Tensor>> {
     let x = inp(inputs, 0);
     let skip = inp(inputs, 1);
     let gamma = inp(inputs, 2);
     let beta = inputs.get(3).and_then(|o| o.as_ref());
     let bias = inputs.get(4).and_then(|o| o.as_ref());
-    let epsilon = get_attr_float(node, "epsilon", 1e-12) as f64;
+    let epsilon = attrs.float("epsilon", 1e-12) as f64;
 
     let mut x_sum = x.try_add(skip)?;
     if let Some(b) = bias {
@@ -261,7 +260,7 @@ pub(crate) fn op_skip_layer_norm(inputs: &[Option<Tensor>], node: &NodeProto) ->
 }
 
 /// EmbedLayerNormalization: word + position [+ segment] embedding → layernorm → * gamma + beta
-pub(crate) fn op_embed_layer_norm(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+pub(crate) fn op_embed_layer_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Vec<Tensor>> {
     let input_ids = inp(inputs, 0);
     let segment_ids = inputs.get(1).and_then(|o| o.as_ref());
     let word_emb = inp(inputs, 2);
@@ -270,7 +269,7 @@ pub(crate) fn op_embed_layer_norm(inputs: &[Option<Tensor>], node: &NodeProto) -
     let gamma = inp(inputs, 5);
     let beta = inp(inputs, 6);
     let position_ids = inputs.get(8).and_then(|o| o.as_ref());
-    let epsilon = get_attr_float(node, "epsilon", 1e-12) as f64;
+    let epsilon = attrs.float("epsilon", 1e-12) as f64;
 
     let w = word_emb.embedding(input_ids)?;
 
@@ -297,13 +296,13 @@ pub(crate) fn op_embed_layer_norm(inputs: &[Option<Tensor>], node: &NodeProto) -
 }
 
 /// RotaryEmbedding (standard ONNX opset 23): inputs are (input, cos_cache, sin_cache, position_ids?)
-pub(crate) fn op_rotary_embedding(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
-    rotary_embedding_impl(inp(inputs, 0), inp(inputs, 1), inp(inputs, 2), inputs.get(3).and_then(|o| o.as_ref()), node)
+pub(crate) fn op_rotary_embedding(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Vec<Tensor>> {
+    rotary_embedding_impl(inp(inputs, 0), inp(inputs, 1), inp(inputs, 2), inputs.get(3).and_then(|o| o.as_ref()), attrs)
 }
 
 /// RotaryEmbedding (Microsoft contrib): inputs are (input, position_ids?, cos_cache, sin_cache)
-pub(crate) fn op_rotary_embedding_contrib(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
-    rotary_embedding_impl(inp(inputs, 0), inp(inputs, 2), inp(inputs, 3), inputs.get(1).and_then(|o| o.as_ref()), node)
+pub(crate) fn op_rotary_embedding_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Vec<Tensor>> {
+    rotary_embedding_impl(inp(inputs, 0), inp(inputs, 2), inp(inputs, 3), inputs.get(1).and_then(|o| o.as_ref()), attrs)
 }
 
 /// Shared RotaryEmbedding implementation.
@@ -314,11 +313,11 @@ fn rotary_embedding_impl(
     cos_cache: &Tensor,
     sin_cache: &Tensor,
     position_ids: Option<&Tensor>,
-    node: &NodeProto,
+    attrs: &mut Attrs,
 ) -> Result<Vec<Tensor>> {
-    let interleaved = get_attr_int(node, "interleaved", 0) != 0;
-    let num_heads = get_attr_int(node, "num_heads", 0) as usize;
-    let rotary_embedding_dim = get_attr_int(node, "rotary_embedding_dim", 0) as usize;
+    let interleaved = attrs.int("interleaved", 0) != 0;
+    let num_heads = attrs.int("num_heads", 0) as usize;
+    let rotary_embedding_dim = attrs.int("rotary_embedding_dim", 0) as usize;
 
     let x_shape = x.shape()?;
     let x_ndim = x_shape.len();
@@ -400,22 +399,22 @@ fn slice_last_dim_if_needed(t: &Tensor, target: usize) -> Result<Tensor> {
 }
 
 /// Microsoft contrib Attention: packed QKV projection, mask handling, SDPA.
-pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Vec<Tensor>> {
+pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Vec<Tensor>> {
     let x = inp(inputs, 0);
     let weights = inp(inputs, 1);
     let bias = inputs.get(2).and_then(|o| o.as_ref());
     let mask_index = inputs.get(3).and_then(|o| o.as_ref());
     let past = inputs.get(4).and_then(|o| o.as_ref());
 
-    let num_heads = get_attr_int(node, "num_heads", 0) as usize;
+    let num_heads = attrs.int("num_heads", 0) as usize;
     if num_heads == 0 {
         return Err(Error::IrConstruction { details: "num_heads is required for Attention".into() });
     }
-    let mask_filter_value = get_attr_float(node, "mask_filter_value", -10000.0) as f64;
-    let scale_attr = get_attr_float(node, "scale", 0.0);
-    let unidirectional = get_attr_int(node, "unidirectional", 0) != 0;
+    let mask_filter_value = attrs.float("mask_filter_value", -10000.0) as f64;
+    let scale_attr = attrs.float("scale", 0.0);
+    let unidirectional = attrs.int("unidirectional", 0) != 0;
 
-    let qkv_hidden_sizes = get_attr_ints(node, "qkv_hidden_sizes");
+    let qkv_hidden_sizes = attrs.ints("qkv_hidden_sizes");
     let w_shape = weights.shape()?;
     let total_hidden = w_shape[1].as_const().unwrap();
     let (q_hidden, k_hidden, v_hidden) = if qkv_hidden_sizes.is_empty() {

@@ -28,21 +28,46 @@ fn test_extract_tensor_data_raw() {
 }
 
 #[test]
-fn test_get_attr_int() {
+fn test_attrs_int() {
+    use crate::registry::attr::Attrs;
+
     let mut node = NodeProto::default();
+    node.op_type = "Test".to_string();
     node.attribute.push(make_attr_int("axis", 42));
 
-    assert_eq!(get_attr_int(&node, "axis", 0), 42);
-    assert_eq!(get_attr_int(&node, "missing", -1), -1);
+    let mut attrs = Attrs::new(&node);
+    assert_eq!(attrs.int("axis", 0), 42);
+    assert_eq!(attrs.int("missing", -1), -1);
+    attrs.done().unwrap(); // all consumed
 }
 
 #[test]
-fn test_get_attr_ints() {
+fn test_attrs_ints() {
+    use crate::registry::attr::Attrs;
+
     let mut node = NodeProto::default();
+    node.op_type = "Test".to_string();
     node.attribute.push(make_attr_ints("perm", &[1, 2, 0]));
 
-    assert_eq!(get_attr_ints(&node, "perm"), vec![1, 2, 0]);
-    assert!(get_attr_ints(&node, "missing").is_empty());
+    let mut attrs = Attrs::new(&node);
+    assert_eq!(attrs.ints("perm"), vec![1, 2, 0]);
+    assert!(attrs.ints("missing").is_empty());
+    attrs.done().unwrap();
+}
+
+#[test]
+fn test_attrs_done_errors_on_unconsumed() {
+    use crate::registry::attr::Attrs;
+
+    let mut node = NodeProto::default();
+    node.op_type = "Test".to_string();
+    node.attribute.push(make_attr_int("axis", 1));
+    node.attribute.push(make_attr_float("epsilon", 0.01));
+
+    let mut attrs = Attrs::new(&node);
+    let _ = attrs.int("axis", 0); // consume only one
+    let err = attrs.done().unwrap_err();
+    assert!(err.to_string().contains("epsilon"), "error should mention unconsumed attr: {err}");
 }
 
 #[test]

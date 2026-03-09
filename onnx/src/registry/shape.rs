@@ -3,16 +3,15 @@ use morok_ir::shape::{align_shapes_left, broadcast_shape};
 use morok_tensor::Tensor;
 
 use crate::error::{Error, Result};
-use crate::parser::onnx::NodeProto;
 
 use super::*;
 
-pub(crate) fn op_reshape(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
-    let allowzero = get_attr_int(node, "allowzero", 0);
+pub(crate) fn op_reshape(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
+    let allowzero = attrs.int("allowzero", 0);
     let data = inp(inputs, 0);
 
     let raw_shape: Vec<isize> = {
-        let attr_shape = get_attr_ints(node, "shape");
+        let attr_shape = attrs.ints("shape");
         if !attr_shape.is_empty() {
             attr_shape.iter().map(|&d| d as isize).collect()
         } else if inputs.len() > 1 && inputs[1].is_some() {
@@ -43,8 +42,8 @@ pub(crate) fn op_reshape(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<
     Ok(data.try_reshape(&shape)?)
 }
 
-pub(crate) fn op_transpose(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
-    let perm = get_attr_ints(node, "perm");
+pub(crate) fn op_transpose(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
+    let perm = attrs.ints("perm");
     if perm.is_empty() {
         let ndim = inp(inputs, 0).ndim()?;
         let reversed: Vec<isize> = (0..ndim).rev().map(|i| i as isize).collect();
@@ -55,11 +54,11 @@ pub(crate) fn op_transpose(inputs: &[Option<Tensor>], node: &NodeProto) -> Resul
     }
 }
 
-pub(crate) fn op_squeeze(inputs: &[Option<Tensor>], node: &NodeProto, opset: i64) -> Result<Tensor> {
+pub(crate) fn op_squeeze(inputs: &[Option<Tensor>], attrs: &mut Attrs, opset: i64) -> Result<Tensor> {
     let axes: Vec<i64> = if opset >= 13 {
         inputs.get(1).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?.unwrap_or_default()
     } else {
-        get_attr_ints(node, "axes")
+        attrs.ints("axes")
     };
     if axes.is_empty() {
         return Ok(inp(inputs, 0).try_squeeze(None)?);
@@ -69,7 +68,7 @@ pub(crate) fn op_squeeze(inputs: &[Option<Tensor>], node: &NodeProto, opset: i64
     sorted.iter().try_fold(inp(inputs, 0).clone(), |t, &ax| Ok(t.try_squeeze(Some(ax))?))
 }
 
-pub(crate) fn op_unsqueeze(inputs: &[Option<Tensor>], node: &NodeProto, opset: i64) -> Result<Tensor> {
+pub(crate) fn op_unsqueeze(inputs: &[Option<Tensor>], attrs: &mut Attrs, opset: i64) -> Result<Tensor> {
     let axes: Vec<i64> = if opset >= 13 {
         inputs
             .get(1)
@@ -78,7 +77,7 @@ pub(crate) fn op_unsqueeze(inputs: &[Option<Tensor>], node: &NodeProto, opset: i
             .transpose()?
             .ok_or_else(|| Error::IrConstruction { details: "Unsqueeze (opset>=13) requires axes input".into() })?
     } else {
-        let axes = get_attr_ints(node, "axes");
+        let axes = attrs.ints("axes");
         if axes.is_empty() {
             return Err(Error::IrConstruction { details: "Unsqueeze requires axes attribute".into() });
         }
@@ -89,10 +88,10 @@ pub(crate) fn op_unsqueeze(inputs: &[Option<Tensor>], node: &NodeProto, opset: i
     sorted.iter().try_fold(inp(inputs, 0).clone(), |t, &ax| Ok(t.try_unsqueeze(ax)?))
 }
 
-pub(crate) fn op_flatten(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_flatten(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     let shape = inp(inputs, 0).shape()?;
     let ndim = shape.len() as i64;
-    let axis_raw = get_attr_int(node, "axis", 1);
+    let axis_raw = attrs.int("axis", 1);
     let axis = (if axis_raw < 0 { ndim + axis_raw } else { axis_raw }) as usize;
     let pre = morok_ir::sint_prod(&shape[..axis]);
     let pre_val = pre
@@ -113,12 +112,12 @@ pub(crate) fn op_expand(inputs: &[Option<Tensor>]) -> Result<Tensor> {
     Ok(data.broadcast_to(&result_shape)?)
 }
 
-pub(crate) fn op_pad(inputs: &[Option<Tensor>], node: &NodeProto) -> Result<Tensor> {
+pub(crate) fn op_pad(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result<Tensor> {
     use morok_tensor::nn::PadMode;
     use std::str::FromStr;
 
     let pads = tensor_to_i64_vec(inp(inputs, 1))?;
-    let mode_str = get_attr_string(node, "mode", "constant");
+    let mode_str = attrs.string("mode", "constant");
     let data = inp(inputs, 0);
     let ndim = data.ndim()?;
     let num_axes = pads.len() / 2;
@@ -262,8 +261,8 @@ pub(crate) fn op_slice(inputs: &[Option<Tensor>]) -> Result<Tensor> {
     Ok(result)
 }
 
-pub(crate) fn op_split(inputs: &[Option<Tensor>], node: &NodeProto, opset_version: i64) -> Result<Vec<Tensor>> {
-    let axis = get_attr_int(node, "axis", 0) as isize;
+pub(crate) fn op_split(inputs: &[Option<Tensor>], attrs: &mut Attrs, opset_version: i64) -> Result<Vec<Tensor>> {
+    let axis = attrs.int("axis", 0) as isize;
     let data = inp(inputs, 0);
     let shape = data.shape()?;
     let ndim = shape.len();
@@ -272,9 +271,9 @@ pub(crate) fn op_split(inputs: &[Option<Tensor>], node: &NodeProto, opset_versio
 
     // Opset ≤11: split is an attribute (INTS); opset 13+: split is an optional input tensor
     let split_sizes: Vec<usize> = if opset_version < 13 {
-        let attr_split = get_attr_ints(node, "split");
+        let attr_split = attrs.ints("split");
         if attr_split.is_empty() {
-            let n = node.output.len();
+            let n = attrs.output_count();
             (0..n).map(|i| dim_size / n + if i < dim_size % n { 1 } else { 0 }).collect()
         } else {
             attr_split.iter().map(|&v| v as usize).collect()
@@ -283,9 +282,9 @@ pub(crate) fn op_split(inputs: &[Option<Tensor>], node: &NodeProto, opset_versio
         tensor_to_i64_vec(split_tensor)?.iter().map(|&v| v as usize).collect()
     } else {
         // Opset 18+: num_outputs attribute; opset 13: infer from output count
-        let mut n = get_attr_int(node, "num_outputs", 0) as usize;
+        let mut n = attrs.int("num_outputs", 0) as usize;
         if n == 0 {
-            n = node.output.len();
+            n = attrs.output_count();
         }
         if n == 0 {
             return Err(Error::IrConstruction {

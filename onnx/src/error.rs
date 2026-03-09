@@ -26,6 +26,9 @@ pub enum Error {
     #[snafu(display("IR construction error: {details}"))]
     IrConstruction { details: String },
 
+    #[snafu(display("Unhandled ONNX attributes for '{op}': {attrs:?}"))]
+    UnhandledAttributes { op: String, attrs: Vec<String> },
+
     #[snafu(display("Empty model - no graph found"))]
     EmptyModel,
 

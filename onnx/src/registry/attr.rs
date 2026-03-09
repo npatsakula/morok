@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use morok_dtype::DType;
 use morok_tensor::Tensor;
 use morok_tensor::reduce::AxisSpec;
@@ -5,50 +7,92 @@ use morok_tensor::reduce::AxisSpec;
 use crate::error::{Error, Result};
 use crate::parser::onnx::{AttributeProto, GraphProto, NodeProto, TensorProto};
 
-pub fn get_attr<'a>(node: &'a NodeProto, name: &str) -> Option<&'a AttributeProto> {
-    node.attribute.iter().find(|a| a.name == name)
+/// Pop-based attribute extractor that ensures all ONNX node attributes are consumed.
+///
+/// Each accessor removes the attribute from the internal map. After all attributes
+/// have been extracted, call [`done()`](Attrs::done) to verify none were missed.
+pub struct Attrs<'a> {
+    attrs: HashMap<&'a str, &'a AttributeProto>,
+    op_type: &'a str,
+    output_count: usize,
 }
 
-pub fn get_attr_int(node: &NodeProto, name: &str, default: i64) -> i64 {
-    get_attr(node, name).map(|a| a.i).unwrap_or(default)
+impl<'a> Attrs<'a> {
+    pub fn new(node: &'a NodeProto) -> Self {
+        let attrs = node.attribute.iter().map(|a| (a.name.as_str(), a)).collect();
+        Self { attrs, op_type: &node.op_type, output_count: node.output.len() }
+    }
+
+    /// Number of outputs declared by the ONNX node.
+    pub fn output_count(&self) -> usize {
+        self.output_count
+    }
+
+    /// Pop a raw attribute by name.
+    pub fn get(&mut self, name: &str) -> Option<&'a AttributeProto> {
+        self.attrs.remove(name)
+    }
+
+    /// Pop an integer attribute, returning `default` if absent.
+    pub fn int(&mut self, name: &str, default: i64) -> i64 {
+        self.get(name).map(|a| a.i).unwrap_or(default)
+    }
+
+    /// Pop a float attribute, returning `default` if absent.
+    pub fn float(&mut self, name: &str, default: f32) -> f32 {
+        self.get(name).map(|a| a.f).unwrap_or(default)
+    }
+
+    /// Pop a string attribute, returning `default` if absent.
+    pub fn string(&mut self, name: &str, default: &str) -> String {
+        self.get(name).map(|a| String::from_utf8_lossy(&a.s).into_owned()).unwrap_or_else(|| default.to_string())
+    }
+
+    /// Pop a bytes attribute.
+    #[allow(dead_code)]
+    pub fn bytes(&mut self, name: &str) -> Option<&'a [u8]> {
+        self.get(name).map(|a| a.s.as_slice())
+    }
+
+    /// Pop an integer array attribute.
+    pub fn ints(&mut self, name: &str) -> Vec<i64> {
+        self.get(name).map(|a| a.ints.clone()).unwrap_or_default()
+    }
+
+    /// Pop a float array attribute.
+    pub fn floats(&mut self, name: &str) -> Vec<f32> {
+        self.get(name).map(|a| a.floats.clone()).unwrap_or_default()
+    }
+
+    /// Pop a tensor attribute.
+    pub fn tensor(&mut self, name: &str) -> Option<&'a TensorProto> {
+        self.get(name).and_then(|a| a.t.as_ref())
+    }
+
+    /// Pop a graph attribute.
+    #[allow(dead_code)]
+    pub fn graph(&mut self, name: &str) -> Option<&'a GraphProto> {
+        self.get(name).and_then(|a| a.g.as_ref())
+    }
+
+    /// Assert all attributes have been consumed. Returns error listing any remaining.
+    pub fn done(self) -> Result<()> {
+        if self.attrs.is_empty() {
+            return Ok(());
+        }
+        let mut names: Vec<String> = self.attrs.keys().map(|s| s.to_string()).collect();
+        names.sort();
+        Err(Error::UnhandledAttributes { op: self.op_type.to_string(), attrs: names })
+    }
 }
 
-pub fn get_attr_float(node: &NodeProto, name: &str, default: f32) -> f32 {
-    get_attr(node, name).map(|a| a.f).unwrap_or(default)
-}
-
-pub fn get_attr_bytes<'a>(node: &'a NodeProto, name: &str) -> Option<&'a [u8]> {
-    get_attr(node, name).map(|a| a.s.as_slice())
-}
-
-pub fn get_attr_string(node: &NodeProto, name: &str, default: &str) -> String {
-    get_attr_bytes(node, name).map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_else(|| default.to_string())
-}
-
-pub fn get_attr_ints(node: &NodeProto, name: &str) -> Vec<i64> {
-    get_attr(node, name).map(|a| a.ints.clone()).unwrap_or_default()
-}
-
-pub fn get_attr_floats(node: &NodeProto, name: &str) -> Vec<f32> {
-    get_attr(node, name).map(|a| a.floats.clone()).unwrap_or_default()
-}
-
-pub fn get_attr_tensor<'a>(node: &'a NodeProto, name: &str) -> Option<&'a TensorProto> {
-    get_attr(node, name).and_then(|a| a.t.as_ref())
-}
-
-#[allow(dead_code)]
-pub fn get_attr_graph<'a>(node: &'a NodeProto, name: &str) -> Option<&'a GraphProto> {
-    get_attr(node, name).and_then(|a| a.g.as_ref())
-}
-
-/// Extract a scalar bool from a tensor (for If condition fallback).
-pub(crate) fn tensor_to_bool_scalar(t: &Tensor) -> Result<bool> {
-    let arr = t
-        .cast(DType::Bool)?
-        .to_ndarray::<bool>()
-        .map_err(|e| Error::IrConstruction { details: format!("tensor_to_bool_scalar: {e}") })?;
-    arr.iter().next().copied().ok_or_else(|| Error::IrConstruction { details: "empty bool tensor".into() })
+/// Parse a string attribute into a typed enum.
+pub fn parse_enum<T: std::str::FromStr>(attrs: &mut Attrs, name: &str, default: &str) -> Result<T>
+where
+    T::Err: std::fmt::Display,
+{
+    let s = attrs.string(name, default);
+    s.parse::<T>().map_err(|e| Error::IrConstruction { details: format!("{name}='{s}': {e}") })
 }
 
 pub(crate) fn inp(inputs: &[Option<Tensor>], idx: usize) -> &Tensor {
@@ -62,13 +106,13 @@ pub(crate) fn non_empty_i64(v: &[i64]) -> Option<&[i64]> {
 /// Extract reduce axes and keepdims, opset-aware.
 /// Opset >= 13: axes from input[1] tensor. Opset <= 12: axes from node attribute.
 pub(crate) fn reduce_attrs(
-    node: &NodeProto,
+    attrs: &mut Attrs,
     inputs: &[Option<Tensor>],
     opset: i64,
     op_type: &str,
 ) -> Result<(AxisSpec, bool)> {
-    let keepdims = get_attr_int(node, "keepdims", 1) == 1;
-    let noop_with_empty_axes = get_attr_int(node, "noop_with_empty_axes", 0) == 1;
+    let keepdims = attrs.int("keepdims", 1) == 1;
+    let noop_with_empty_axes = attrs.int("noop_with_empty_axes", 0) == 1;
 
     // ReduceSum moved axes from attribute to input[1] at opset 13;
     // all other reduce ops moved at opset 18.
@@ -77,7 +121,7 @@ pub(crate) fn reduce_attrs(
     let axes: Vec<i64> = if opset >= axes_from_input_version {
         inputs.get(1).and_then(|o| o.as_ref()).map(tensor_to_i64_vec).transpose()?.unwrap_or_default()
     } else {
-        get_attr_ints(node, "axes")
+        attrs.ints("axes")
     };
 
     let spec = if axes.is_empty() {
@@ -89,6 +133,15 @@ pub(crate) fn reduce_attrs(
         AxisSpec::Multiple(axes.iter().map(|&a| a as isize).collect())
     };
     Ok((spec, keepdims))
+}
+
+/// Extract a scalar bool from a tensor (for If condition fallback).
+pub(crate) fn tensor_to_bool_scalar(t: &Tensor) -> Result<bool> {
+    let arr = t
+        .cast(DType::Bool)?
+        .to_ndarray::<bool>()
+        .map_err(|e| Error::IrConstruction { details: format!("tensor_to_bool_scalar: {e}") })?;
+    arr.iter().next().copied().ok_or_else(|| Error::IrConstruction { details: "empty bool tensor".into() })
 }
 
 /// Extract a scalar f64 from a tensor (e.g. constant_value for Pad).
