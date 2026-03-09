@@ -356,7 +356,7 @@ impl Tensor {
     /// ```
     /// # use morok_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);  // Shape [3]
-    /// let padded = t.try_pad(&[(1, 2)])?;  // Shape [6]: [0, 1, 2, 3, 0, 0]
+    /// let padded = t.try_pad(&[(1, 2)]).unwrap();  // Shape [6]: [0, 1, 2, 3, 0, 0]
     /// ```
     ///
     /// # Errors
@@ -423,7 +423,7 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[3]).unwrap();
     /// let b = Tensor::from_slice(&[4.0f32, 5.0]).try_reshape(&[2]).unwrap();
-    /// let c = Tensor::cat(&[&a, &b], 0)?;  // Shape [5]: [1, 2, 3, 4, 5]
+    /// let c = Tensor::cat(&[&a, &b], 0).unwrap();  // Shape [5]: [1, 2, 3, 4, 5]
     /// ```
     ///
     /// # Errors
@@ -555,8 +555,8 @@ impl Tensor {
     ///
     /// ```
     /// # use morok_tensor::Tensor;
-    /// let t = Tensor::from_slice(&[1.0f32; 6]).try_reshape(&[2, 3])?;
-    /// let shape_tensor = t.shape_tensor()?;  // Tensor([2, 3]) with dtype int64
+    /// let t = Tensor::from_slice(&[1.0f32; 6]).try_reshape(&[2, 3]).unwrap();
+    /// let shape_tensor = t.shape_tensor().unwrap();  // Tensor([2, 3]) with dtype int64
     /// ```
     ///
     /// # Errors
@@ -589,7 +589,7 @@ impl Tensor {
     /// ```
     /// # use morok_tensor::Tensor;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0]);
-    /// let sliced = t.try_shrink(&[(1, 4)])?;  // Elements [2, 3, 4]
+    /// let sliced = t.try_shrink(&[(1, 4)]).unwrap();  // Elements [2, 3, 4]
     /// ```
     ///
     /// # Errors

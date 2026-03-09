@@ -96,7 +96,7 @@ impl Tensor {
         self.try_eq(&arange.try_reshape(&ar_shape)?)
     }
 
-    /// Normalize negative indices: indices[i] = indices[i] < 0 ? indices[i] + dim_size : indices[i]
+    /// Normalize negative indices: `indices[i] = indices[i] < 0 ? indices[i] + dim_size : indices[i]`
     pub fn normalize_negative_indices(&self, dim_size: i64) -> Result<Tensor> {
         let zero = Tensor::const_(ConstValue::Int(0), self.uop().dtype());
         let dim_t = Tensor::const_(ConstValue::Int(dim_size), self.uop().dtype());

@@ -140,14 +140,14 @@ impl Tensor {
     /// and is transposed before multiplication.
     ///
     /// # Arguments
-    /// * `weight` - Weight matrix (shape: [out_features, in_features])
-    /// * `bias` - Optional bias vector (shape: [out_features])
+    /// * `weight` - Weight matrix (shape: `[out_features, in_features]`)
+    /// * `bias` - Optional bias vector (shape: `[out_features]`)
     ///
     /// # Shape Requirements
-    /// - self: [..., in_features]
-    /// - weight: [out_features, in_features]
-    /// - bias: [out_features] or None
-    /// - result: [..., out_features]
+    /// - self: `[..., in_features]`
+    /// - weight: `[out_features, in_features]`
+    /// - bias: `[out_features]` or None
+    /// - result: `[..., out_features]`
     ///
     /// # Examples
     /// ```ignore

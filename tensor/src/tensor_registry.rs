@@ -220,7 +220,7 @@ pub fn get_tensor(id: u64) -> Option<Arc<TensorEntry>> {
 
 /// Remove dead weak references and stale buffer entries from the registry.
 ///
-/// Tensors: removes entries whose Weak<TensorEntry> can no longer be upgraded.
+/// Tensors: removes entries whose `Weak<TensorEntry>` can no longer be upgraded.
 /// Buffers: removes entries whose UOp is no longer alive in the UOp cache.
 ///
 /// This is optional — stale entries don't affect correctness (unique buffer IDs

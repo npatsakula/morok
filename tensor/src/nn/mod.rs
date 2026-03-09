@@ -176,8 +176,38 @@ pub enum AspectRatioPolicy {
 impl Tensor {
     /// Negative log-likelihood loss.
     ///
-    /// `self` is `[N, C, ...]` log-probs, `target` is `[N, ...]` class indices.
-    /// Matches Tinygrad's `nll_loss` (tensor.py:3391-3413).
+    /// `self` is `[N, C, ...]` log-probabilities, `target` is `[N, ...]` class indices
+    /// (dtype `i64`). Gathers the log-prob at the target class and negates it.
+    ///
+    /// Supports optional per-class `weight`, `ignore_index` to mask out a class,
+    /// and `reduction` (default `Mean`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::array;
+    /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0, -2.0]]);
+    /// let target = Tensor::from_slice([0i64]);
+    /// let loss = logprobs.nll_loss().target(&target).call().unwrap();
+    /// let val = loss.to_vec::<f32>().unwrap();
+    /// // -(-0.5) = 0.5
+    /// assert!((val[0] - 0.5).abs() < 1e-5);
+    /// ```
+    ///
+    /// With sum reduction:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_tensor::nn::Reduction;
+    /// # use ndarray::array;
+    /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0], [-2.0, -0.3]]);
+    /// let target = Tensor::from_slice([0i64, 1]);
+    /// let loss = logprobs.nll_loss().target(&target).reduction(Reduction::Sum).call().unwrap();
+    /// let val = loss.to_vec::<f32>().unwrap();
+    /// // sum of 0.5 + 0.3 = 0.8
+    /// assert!((val[0] - 0.8).abs() < 1e-5);
+    /// ```
     #[builder]
     pub fn nll_loss(
         &self,
@@ -222,10 +252,26 @@ impl Tensor {
         }
     }
 
-    /// Dropout: zeros random elements during training, passes through in inference.
+    /// Dropout: randomly zeros elements during training, passes through in inference.
     ///
-    /// Returns `(output, mask)` where mask is a boolean tensor (true = kept).
-    /// Training mode is deferred until RNG infrastructure is available.
+    /// Returns `(output, mask)` where mask is a boolean tensor (`true` = kept).
+    /// In inference mode (`training=false`, the default), the output is identical
+    /// to the input and the mask is all-true.
+    ///
+    /// **Note:** Training mode is not yet implemented (requires RNG); currently
+    /// returns identity regardless of `training`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::array;
+    /// let x = Tensor::from_ndarray(&array![1.0f32, 2.0, 3.0]);
+    /// let (out, mask) = x.dropout().p(0.5).call().unwrap();
+    /// // Default is inference mode: output == input
+    /// assert_eq!(out.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
+    /// assert_eq!(mask.to_vec::<bool>().unwrap(), vec![true, true, true]);
+    /// ```
     #[builder]
     pub fn dropout(&self, p: f64, #[builder(default = false)] training: bool) -> Result<(Tensor, Tensor)> {
         snafu::ensure!(
@@ -242,7 +288,40 @@ impl Tensor {
         let mask = Tensor::full(&shape, true, DType::Bool)?;
         Ok((self.clone(), mask))
     }
-    /// Convolution with ONNX-style parameters. Wraps `conv2d`.
+    /// Convolution with ONNX-style parameters.
+    ///
+    /// Wraps the lower-level [`conv2d`](Tensor::conv2d) after resolving ONNX padding conventions
+    /// (`auto_pad`, flat `pads`). Input shape is `[N, C, H, W, ...]` and weight
+    /// shape is `[out_channels, in_channels/group, kH, kW, ...]`.
+    ///
+    /// # Examples
+    ///
+    /// Basic convolution with no padding:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let y = x.conv().weight(&w).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 1, 3, 3]);
+    /// // Each output element sums a 3x3 window of ones = 9.0
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![9.0; 9]);
+    /// ```
+    ///
+    /// With explicit padding and strides:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let y = x.conv().weight(&w).pads(&[1, 1, 1, 1]).strides(&[2, 2]).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 1, 3, 3]);
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![4.0, 6.0, 4.0, 6.0, 9.0, 6.0, 4.0, 6.0, 4.0]);
+    /// ```
     #[builder]
     pub fn conv(
         &self,
@@ -279,7 +358,37 @@ impl Tensor {
             .call()
     }
 
-    /// Transposed convolution with ONNX-style parameters. Wraps `conv_transpose2d`.
+    /// Transposed convolution with ONNX-style parameters.
+    ///
+    /// Wraps [`conv_transpose2d`](Tensor::conv_transpose2d) after resolving ONNX padding conventions.
+    /// Supports `output_shape` and `output_padding` for precise output size control.
+    ///
+    /// # Examples
+    ///
+    /// Basic transposed convolution (upsampling):
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let y = x.conv_transpose().weight(&w).call().unwrap();
+    /// let vals = y.to_vec::<f32>().unwrap();
+    /// assert_eq!(vals.len(), 16); // 4x4 output
+    /// assert_eq!(vals[5], 4.0); // center sees full overlap
+    /// ```
+    ///
+    /// With stride (larger upsampling factor):
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let y = x.conv_transpose().weight(&w).strides(&[2, 2]).call().unwrap();
+    /// let vals = y.to_vec::<f32>().unwrap();
+    /// assert_eq!(vals.len(), 25); // 5x5 output
+    /// ```
     #[builder]
     pub fn conv_transpose(
         &self,
@@ -355,7 +464,36 @@ impl Tensor {
             .call()
     }
 
-    /// Average pooling with ONNX-style parameters. Wraps `avg_pool2d`.
+    /// Average pooling with ONNX-style parameters.
+    ///
+    /// Wraps [`avg_pool2d`](Tensor::avg_pool2d) after resolving ONNX padding and stride conventions.
+    /// Stride defaults to 1 (unlike [`avg_pool2d`](Tensor::avg_pool2d) which defaults to `kernel_size`).
+    /// Input shape is `[N, C, H, W]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.avg_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 1, 3, 3]);
+    /// // Average of all-ones windows is 1.0
+    /// assert!(y.to_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    /// ```
+    ///
+    /// With strides:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.avg_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 1, 2, 2]);
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// ```
     #[builder]
     pub fn avg_pool(
         &self,
@@ -393,7 +531,23 @@ impl Tensor {
             .call()
     }
 
-    /// Lp norm pooling with ONNX-style parameters: `output = (sum(|x|^p))^(1/p)`.
+    /// Lp norm pooling with ONNX-style parameters.
+    ///
+    /// Computes `(sum(|x|^p))^(1/p)` over each pooling window. Defaults to
+    /// `p=2` (L2 pooling). Input shape is `[N, C, H, W]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.lp_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 1, 3, 3]);
+    /// // L2 pool of 2x2 window of ones = sqrt(4) = 2.0
+    /// assert!((y.to_vec::<f32>().unwrap()[0] - 2.0).abs() < 1e-5);
+    /// ```
     #[builder]
     pub fn lp_pool(
         &self,
@@ -452,8 +606,33 @@ impl Tensor {
         sum_p.try_pow(&inv_p)
     }
 
-    /// Rearrange depth data into spatial blocks (inverse of space_to_depth).
-    /// Equivalent to PyTorch's F.pixel_shuffle.
+    /// Rearrange depth data into spatial blocks (inverse of [`space_to_depth`](Tensor::space_to_depth)).
+    ///
+    /// Equivalent to PyTorch's `F.pixel_shuffle`. Reshapes a `[N, C, H, W]`
+    /// tensor to `[N, C/(b*b), H*b, W*b]` where `b` is the blocksize.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
+    /// let y = x.depth_to_space().blocksize(2).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 1, 2, 2]);
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// ```
+    ///
+    /// Using CRD mode (PyTorch pixel_shuffle order):
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_tensor::nn::DepthToSpaceMode;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
+    /// let y = x.depth_to_space().blocksize(2).mode(DepthToSpaceMode::Crd).call().unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// ```
     #[builder]
     pub fn depth_to_space(&self, blocksize: usize, #[builder(default)] mode: DepthToSpaceMode) -> Result<Tensor> {
         let ndim = self.ndim()?;
@@ -511,7 +690,22 @@ impl Tensor {
         result.try_reshape(&[b as isize, c_out as isize, (h * blocksize) as isize, (w * blocksize) as isize])
     }
 
-    /// Rearrange spatial data into depth (inverse of depth_to_space).
+    /// Rearrange spatial data into depth (inverse of [`depth_to_space`](Tensor::depth_to_space)).
+    ///
+    /// Reshapes a `[N, C, H, W]` tensor to `[N, C*b*b, H/b, W/b]` where `b`
+    /// is the blocksize. Both `H` and `W` must be divisible by `blocksize`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.space_to_depth(2).unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 4, 2, 2]);
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 16]);
+    /// ```
     pub fn space_to_depth(&self, blocksize: usize) -> Result<Tensor> {
         let ndim = self.ndim()?;
         snafu::ensure!(ndim == 4, NdimExactSnafu { op: "space_to_depth", expected: 4_usize, actual: ndim });
@@ -568,7 +762,33 @@ impl Tensor {
         ])
     }
 
-    /// Max pooling with ONNX-style parameters. Always returns `(values, indices)`. Wraps `max_pool2d_with_indices`.
+    /// Max pooling with ONNX-style parameters.
+    ///
+    /// Always returns `(values, indices)` where indices are flattened positions
+    /// (dtype `i64`). Wraps [`max_pool2d_with_indices`](Tensor::max_pool2d_with_indices) after resolving ONNX
+    /// padding conventions.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let (vals, indices) = x.max_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// let shape: Vec<_> = vals.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 1, 3, 3]);
+    /// ```
+    ///
+    /// With strides:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let (vals, _) = x.max_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
+    /// let shape: Vec<_> = vals.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 1, 2, 2]);
+    /// ```
     #[builder]
     pub fn max_pool(
         &self,
@@ -612,7 +832,35 @@ impl Tensor {
         Ok((values, indices))
     }
 
-    /// Local Response Normalization.
+    /// Local Response Normalization (LRN).
+    ///
+    /// Normalizes each element by dividing by a scaled sum of squares over a
+    /// local neighborhood of `size` channels:
+    /// `y = x / (bias + alpha * avg_pool(x^2, size))^beta`.
+    ///
+    /// Input must be 4-D `[N, C, H, W]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 3, 2, 2), 1.0f32));
+    /// let y = x.lrn().size(3).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 3, 2, 2]);
+    /// ```
+    ///
+    /// Custom alpha, beta, and bias:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 3, 2, 2), 1.0f32));
+    /// let y = x.lrn().size(3).alpha(0.001).beta(0.5).bias(2.0).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, [1, 3, 2, 2]);
+    /// ```
     #[builder]
     pub fn lrn(
         &self,

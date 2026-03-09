@@ -14,9 +14,14 @@ use super::pad::apply_ceil_mode;
 type Result<T> = crate::Result<T>;
 
 impl Tensor {
-    /// Sliding window extraction via shape manipulation (Tinygrad's _pool).
-    /// Input: (..., *spatial)  Output: (..., *out_spatial, *kernel)
-    pub(crate) fn pool(&self, kernel: &[usize], stride: &[usize], dilation: &[usize]) -> Result<Tensor> {
+    /// Sliding window extraction via shape manipulation (Tinygrad's `_pool`).
+    ///
+    /// Input: `(..., *spatial)` &rarr; Output: `(..., *out_spatial, *kernel)`.
+    ///
+    /// This is a low-level building block for pooling and convolution. It extracts
+    /// all sliding windows of the given kernel size, stride, and dilation from the
+    /// spatial dimensions, appending the kernel dimensions at the end.
+    pub fn pool(&self, kernel: &[usize], stride: &[usize], dilation: &[usize]) -> Result<Tensor> {
         let shape = self.shape()?;
         let ndim = shape.len();
         let n_spatial = kernel.len();
@@ -136,7 +141,55 @@ impl Tensor {
 
 #[bon]
 impl Tensor {
-    /// Average pooling.
+    /// Average pooling over spatial dimensions.
+    ///
+    /// Computes the mean of each sliding window. Supports padding, dilation,
+    /// `count_include_pad` (whether padded zeros count in the denominator),
+    /// and `ceil_mode` (round output size up instead of down).
+    ///
+    /// Stride defaults to `kernel_size` when not specified.
+    ///
+    /// # Examples
+    ///
+    /// Basic 2x2 average pooling:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 2, 2]);
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// ```
+    ///
+    /// With explicit stride:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.avg_pool2d().kernel_size(&[2, 2]).stride(&[1, 1]).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 3, 3]);
+    /// ```
+    ///
+    /// With padding and `count_include_pad` disabled:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
+    /// let y = x.avg_pool2d()
+    ///     .kernel_size(&[2, 2])
+    ///     .stride(&[1, 1])
+    ///     .padding(&[(1, 1), (1, 1)])
+    ///     .count_include_pad(false)
+    ///     .call()
+    ///     .unwrap();
+    /// // With count_include_pad=false, only non-padded elements count in the average
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 9]);
+    /// ```
     #[builder]
     pub fn avg_pool2d(
         &self,
@@ -220,7 +273,43 @@ impl Tensor {
         sum_x.try_div(&sum_ones)
     }
 
-    /// Max pooling.
+    /// Max pooling over spatial dimensions.
+    ///
+    /// Returns the maximum value in each sliding window. Padded positions are
+    /// filled with `-inf` (float) or `i64::MIN` (integer) so they never win.
+    ///
+    /// Stride defaults to `kernel_size` when not specified.
+    ///
+    /// # Examples
+    ///
+    /// Basic 2x2 max pooling:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.max_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 2, 2]);
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// ```
+    ///
+    /// With stride and padding:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.max_pool2d()
+    ///     .kernel_size(&[3, 3])
+    ///     .stride(&[1, 1])
+    ///     .padding(&[(1, 1), (1, 1)])
+    ///     .call()
+    ///     .unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 4, 4]);
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 16]);
+    /// ```
     #[builder]
     pub fn max_pool2d(
         &self,
@@ -261,7 +350,29 @@ impl Tensor {
         pooled.max(axes)
     }
 
-    /// Max pool returning both values and indices.
+    /// Max pooling returning both values and flat indices.
+    ///
+    /// Returns `(values, indices)` where indices are flat offsets into the
+    /// input spatial dimensions. Indices can be passed to
+    /// [`max_unpool2d`](Tensor::max_unpool2d) to invert the operation.
+    ///
+    /// Uses a reverse-arange trick (from Tinygrad) to compute first-occurrence
+    /// indices without explicit argmax.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let (values, indices) = x.max_pool2d_with_indices()
+    ///     .kernel_size(&[2, 2])
+    ///     .call()
+    ///     .unwrap();
+    /// let shape: Vec<_> = values.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 2, 2]);
+    /// assert_eq!(values.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// ```
     #[builder]
     pub fn max_pool2d_with_indices(
         &self,
@@ -338,12 +449,35 @@ impl Tensor {
         Ok((values, indices))
     }
 
-    /// Inverse of max pooling: place pooled values back at their original positions.
+    /// Inverse of max pooling: scatter pooled values back to their original positions.
     ///
-    /// Indices are flat into the *inferred* output shape (from kernel/stride/pads).
-    /// When `output_size` exceeds the inferred shape, the result is zero-padded.
+    /// Indices are flat offsets into the *inferred* output spatial shape (computed
+    /// from kernel/stride/padding). When `output_size` exceeds the inferred shape,
+    /// the result is zero-padded to match.
     ///
-    /// Uses one-hot encoding of indices to scatter values: `one_hot(idx) * vals → sum`.
+    /// Uses one-hot encoding of indices to scatter values: `one_hot(idx) * vals -> sum`.
+    ///
+    /// # Examples
+    ///
+    /// Round-trip with max_pool2d_with_indices:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let (values, indices) = x.max_pool2d_with_indices()
+    ///     .kernel_size(&[2, 2])
+    ///     .call()
+    ///     .unwrap();
+    /// let unpooled = values.max_unpool2d()
+    ///     .indices(&indices)
+    ///     .kernel_size(&[2, 2])
+    ///     .call()
+    ///     .unwrap();
+    /// let shape: Vec<_> = unpooled.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 4, 4]);
+    /// ```
     #[builder]
     pub fn max_unpool2d(
         &self,
@@ -414,12 +548,34 @@ impl Tensor {
 
     /// Col2Im: adjoint of im2col. Reconstructs an image from columns, summing overlaps.
     ///
-    /// Input shape: `[N, C * prod(block_shape), L]` where L = number of sliding positions.
+    /// Input shape: `[N, C * prod(block_shape), L]` where `L` is the number of sliding positions.
     /// Output shape: `[N, C, *image_shape]`.
     ///
-    /// Uses the adjoint of `_pool`: for each kernel position, stride-dilate the column
-    /// data, pad to the correct offset, and accumulate. O(output_size) memory,
-    /// O(bl × output_size) compute — no large one-hot intermediates.
+    /// Uses the adjoint of [`pool`](Tensor::pool): for each kernel position, stride-dilate
+    /// the column data, pad to the correct offset, and accumulate. `O(output_size)` memory,
+    /// `O(bl * output_size)` compute -- no large one-hot intermediates.
+    ///
+    /// # Examples
+    ///
+    /// Reconstruct a 4x4 image from 2x2 blocks with no overlap:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array3;
+    /// // 1 batch, 1 channel, 2x2 block = 4 cols, 4 sliding positions
+    /// let cols = Tensor::from_ndarray(&Array3::from_elem((1, 4, 4), 1.0f32));
+    /// let img = cols.col2im()
+    ///     .image_shape(&[4, 4])
+    ///     .block_shape(&[2, 2])
+    ///     .strides(&[2, 2])
+    ///     .call()
+    ///     .unwrap();
+    /// let shape: Vec<_> = img.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 4, 4]);
+    /// // Non-overlapping blocks of ones reconstruct to all ones
+    /// assert_eq!(img.to_vec::<f32>().unwrap(), vec![1.0; 16]);
+    /// ```
     #[builder]
     pub fn col2im(
         &self,

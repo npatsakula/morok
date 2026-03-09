@@ -11,7 +11,68 @@ type Result<T> = crate::Result<T>;
 
 #[bon]
 impl Tensor {
-    /// N-d convolution. Input (N,Cin,*spatial), Weight (Cout,Cin/groups,*kernel).
+    /// N-d convolution. Input `(N, Cin, *spatial)`, Weight `(Cout, Cin/groups, *kernel)`.
+    ///
+    /// Computes cross-correlation (conv without kernel flip) by extracting sliding
+    /// windows via [`pool`](Tensor::pool), then contracting against the weight tensor.
+    /// Supports grouped convolution, strided/dilated kernels, and asymmetric padding.
+    ///
+    /// # Examples
+    ///
+    /// Basic 2D convolution with uniform data:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let y = x.conv2d().weight(&w).call().unwrap();
+    /// // 3x3 kernel of ones on input of ones => each output element is 9.0
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![9.0; 9]);
+    /// ```
+    ///
+    /// With stride:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let y = x.conv2d().weight(&w).stride(&[2, 2]).call().unwrap();
+    /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 2, 2]);
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![9.0; 4]);
+    /// ```
+    ///
+    /// With padding:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// // padding=1 on each side: output matches input spatial dims
+    /// let y = x.conv2d().weight(&w).padding(&[(1, 1), (1, 1)]).call().unwrap();
+    /// let vals = y.to_vec::<f32>().unwrap();
+    /// assert_eq!(vals.len(), 9); // 3x3 output
+    /// // Center element sees full 3x3 window of ones = 9.0
+    /// assert_eq!(vals[4], 9.0);
+    /// // Corner element sees 2x2 window = 4.0
+    /// assert_eq!(vals[0], 4.0);
+    /// ```
+    ///
+    /// With bias:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let b = Tensor::from_slice([10.0f32]);
+    /// let y = x.conv2d().weight(&w).bias(&b).call().unwrap();
+    /// // Each output element: 9.0 + 10.0 = 19.0
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![19.0]);
+    /// ```
     #[builder]
     pub fn conv2d(
         &self,
@@ -119,7 +180,59 @@ impl Tensor {
         Ok(x)
     }
 
-    /// Transposed convolution.
+    /// Transposed convolution (fractionally-strided convolution).
+    ///
+    /// Computes the gradient of a forward convolution, commonly used for upsampling.
+    /// Internally flips the kernel, interleaves zeros for stride > 1, computes
+    /// transposed padding, then delegates to [`conv2d`](Tensor::conv2d).
+    ///
+    /// Input `(N, Cin, *spatial)`, Weight `(Cin, Cout/groups, *kernel)`.
+    ///
+    /// # Examples
+    ///
+    /// Basic transposed convolution (upsampling):
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let y = x.conv_transpose2d().weight(&w).call().unwrap();
+    /// let vals = y.to_vec::<f32>().unwrap();
+    /// assert_eq!(vals.len(), 16); // 4x4 output
+    /// // Center elements see full overlap of both input positions
+    /// assert_eq!(vals[5], 4.0);
+    /// ```
+    ///
+    /// With stride (stronger upsampling):
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let y = x.conv_transpose2d().weight(&w).stride(&[2, 2]).call().unwrap();
+    /// let vals = y.to_vec::<f32>().unwrap();
+    /// assert_eq!(vals.len(), 25); // 5x5 output
+    /// ```
+    ///
+    /// With padding and output padding:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
+    /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
+    /// let y = x.conv_transpose2d()
+    ///     .weight(&w)
+    ///     .stride(&[2, 2])
+    ///     .padding(&[(1, 1), (1, 1)])
+    ///     .output_padding(&[1, 1])
+    ///     .call()
+    ///     .unwrap();
+    /// let vals = y.to_vec::<f32>().unwrap();
+    /// assert_eq!(vals.len(), 16); // 4x4 output
+    /// ```
     #[builder]
     pub fn conv_transpose2d(
         &self,

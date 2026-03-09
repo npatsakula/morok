@@ -16,6 +16,41 @@ type Result<T> = crate::Result<T>;
 #[bon]
 impl Tensor {
     /// Generate an affine sampling grid from transformation parameters.
+    ///
+    /// Produces a grid of normalized coordinates suitable for [`grid_sample`](Tensor::grid_sample).
+    /// `theta` holds affine matrices of shape `[N, spatial_dims, spatial_dims+1]`.
+    /// `size` is the target output shape `[N, C, *spatial_dims]`.
+    ///
+    /// # Examples
+    ///
+    /// Identity transform producing a 4x4 grid:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::array;
+    /// let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
+    /// let grid = Tensor::affine_grid().theta(&theta).size(&[1, 1, 4, 4]).call().unwrap();
+    /// let shape: Vec<usize> = grid.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 4, 4, 2]); // [N, H, W, 2]
+    /// ```
+    ///
+    /// With `align_corners`:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::array;
+    /// let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
+    /// let grid = Tensor::affine_grid()
+    ///     .theta(&theta)
+    ///     .size(&[1, 1, 4, 4])
+    ///     .align_corners(true)
+    ///     .call()
+    ///     .unwrap();
+    /// let shape: Vec<usize> = grid.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 4, 4, 2]);
+    /// ```
     #[builder]
     pub fn affine_grid(
         theta: &Tensor,
@@ -72,6 +107,41 @@ impl Tensor {
     /// - `self`: Input tensor `[N, C, *spatial_dims]`
     /// - `grid`: Coordinate grid `[N, *output_spatial_dims, n_spatial]` with values in `[-1, 1]`
     /// - Returns: `[N, C, *output_spatial_dims]`
+    ///
+    /// # Examples
+    ///
+    /// Sample with a grid from `affine_grid`:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::{array, Array4};
+    /// let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
+    /// let grid = Tensor::affine_grid().theta(&theta).size(&[1, 1, 4, 4]).call().unwrap();
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.grid_sample().grid(&grid).call().unwrap();
+    /// let shape: Vec<usize> = y.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 4, 4]);
+    /// ```
+    ///
+    /// With nearest-mode interpolation:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_tensor::nn::GridSampleMode;
+    /// # use ndarray::{array, Array4};
+    /// let theta = Tensor::from_ndarray(&array![[[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
+    /// let grid = Tensor::affine_grid().theta(&theta).size(&[1, 1, 4, 4]).call().unwrap();
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
+    /// let y = x.grid_sample()
+    ///     .grid(&grid)
+    ///     .mode(GridSampleMode::Nearest)
+    ///     .call()
+    ///     .unwrap();
+    /// let shape: Vec<usize> = y.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 4, 4]);
+    /// ```
     #[builder]
     pub fn grid_sample(
         &self,

@@ -1,3 +1,5 @@
+//! Recurrent neural network layers (RNN, GRU, LSTM).
+
 use bon::bon;
 
 use crate::error::{NdimExactSnafu, ParamRangeSnafu};
@@ -43,6 +45,24 @@ impl Tensor {
     /// - `bias`: optional bias `[num_directions, 2 * hidden_size]` (Wb ++ Rb)
     /// - `initial_h`: optional initial hidden state `[num_directions, batch_size, hidden_size]`
     /// - `layout`: 0 = seq-first (default), 1 = batch-first
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::{array, Array3};
+    /// // seq=2, batch=1, input=3
+    /// let x = Tensor::from_ndarray(&Array3::from_elem((2, 1, 3), 0.1f32));
+    /// let w = Tensor::from_ndarray(&Array3::from_elem((1, 4, 3), 0.1f32)); // [1, hidden=4, input=3]
+    /// let r = Tensor::from_ndarray(&Array3::from_elem((1, 4, 4), 0.1f32)); // [1, hidden=4, hidden=4]
+    /// let out = x.rnn().w(&w).r(&r).hidden_size(4).call().unwrap();
+    /// let y_shape: Vec<usize> = out.y.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(y_shape, vec![2, 1, 1, 4]); // [seq, num_directions, batch, hidden]
+    /// let yh_shape: Vec<usize> = out.y_h.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(yh_shape, vec![1, 1, 4]); // [num_directions, batch, hidden]
+    /// ```
     #[builder]
     pub fn rnn(
         &self,
@@ -150,6 +170,23 @@ impl Tensor {
     /// - `initial_h`: optional `[num_directions, batch_size, hidden_size]`
     /// - `linear_before_reset`: 0 (default) or 1
     /// - `layout`: 0 = seq-first (default), 1 = batch-first
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::{array, Array3};
+    /// // seq=2, batch=1, input=3, hidden=4
+    /// let x = Tensor::from_ndarray(&Array3::from_elem((2, 1, 3), 0.1f32));
+    /// // GRU: w is [num_directions, 3*hidden_size, input_size]
+    /// let w = Tensor::from_ndarray(&Array3::from_elem((1, 12, 3), 0.1f32));
+    /// // GRU: r is [num_directions, 3*hidden_size, hidden_size]
+    /// let r = Tensor::from_ndarray(&Array3::from_elem((1, 12, 4), 0.1f32));
+    /// let out = x.gru().w(&w).r_weights(&r).hidden_size(4).call().unwrap();
+    /// let y_shape: Vec<usize> = out.y.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(y_shape, vec![2, 1, 1, 4]); // [seq, num_directions, batch, hidden]
+    /// ```
     #[builder]
     pub fn gru(
         &self,
@@ -294,6 +331,26 @@ impl Tensor {
     /// - `initial_c`: optional `[num_directions, batch_size, hidden_size]`
     /// - `peepholes`: optional `[num_directions, 3*hidden_size]` (p_i, p_o, p_f)
     /// - `layout`: 0 = seq-first (default), 1 = batch-first
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array3;
+    /// // seq=2, batch=1, input=3, hidden=4
+    /// let x = Tensor::from_ndarray(&Array3::from_elem((2, 1, 3), 0.1f32));
+    /// // LSTM: w is [num_directions, 4*hidden_size, input_size]
+    /// let w = Tensor::from_ndarray(&Array3::from_elem((1, 16, 3), 0.1f32));
+    /// // LSTM: r is [num_directions, 4*hidden_size, hidden_size]
+    /// let r = Tensor::from_ndarray(&Array3::from_elem((1, 16, 4), 0.1f32));
+    /// let out = x.lstm().w(&w).r(&r).hidden_size(4).call().unwrap();
+    /// let y_shape: Vec<usize> = out.y.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(y_shape, vec![2, 1, 1, 4]); // [seq, num_directions, batch, hidden]
+    /// let yc_shape: Vec<usize> = out.y_c.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(yc_shape, vec![1, 1, 4]); // [num_directions, batch, hidden]
+    /// ```
     #[builder]
     pub fn lstm(
         &self,

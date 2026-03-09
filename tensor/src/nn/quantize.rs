@@ -1,3 +1,5 @@
+//! Quantization operations (clamp-cast, quantized conv/matmul).
+
 use bon::bon;
 use morok_dtype::DType;
 
@@ -8,6 +10,20 @@ type Result<T> = crate::Result<T>;
 #[bon]
 impl Tensor {
     /// Clamp to the representable range of `dtype`, then cast.
+    ///
+    /// Values outside the target type's range are saturated to its min/max
+    /// before casting, preventing overflow wrap-around.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_dtype::DType;
+    /// let x = Tensor::from_slice([300.0f32, -10.0, 128.0]);
+    /// let y = x.clamp_cast(DType::UInt8).unwrap();
+    /// let vals = y.to_vec::<u8>().unwrap();
+    /// assert_eq!(vals, vec![255, 0, 128]);
+    /// ```
     pub fn clamp_cast(&self, dtype: DType) -> Result<Self> {
         let min = Tensor::const_(dtype.min_value(), self.uop().dtype());
         let max = Tensor::const_(dtype.max_value(), self.uop().dtype());
@@ -16,6 +32,36 @@ impl Tensor {
 
     /// Quantized convolution: zero-point–adjust inputs, convolve in int32,
     /// rescale and requantize to the output dtype.
+    ///
+    /// Implements the ONNX QLinearConv operator. The flow is:
+    /// 1. Subtract zero points from input and weights
+    /// 2. Perform integer convolution
+    /// 3. Rescale by `(x_scale * w_scale) / y_scale` and add `y_zero_point`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_dtype::DType;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 128u8));
+    /// let x_scale = Tensor::from_slice([0.1f32]);
+    /// let x_zp = Tensor::from_slice([128u8]);
+    /// let weight = Tensor::from_ndarray(&Array4::from_elem((1, 1, 1, 1), 128u8));
+    /// let w_scale = Tensor::from_slice([0.1f32]);
+    /// let w_zp = Tensor::from_slice([128u8]);
+    /// let y_scale = Tensor::from_slice([0.1f32]);
+    /// let y_zp = Tensor::from_slice([128u8]);
+    /// let y = x.qlinear_conv()
+    ///     .x_scale(&x_scale).x_zero_point(&x_zp)
+    ///     .weight(&weight).w_scale(&w_scale).w_zero_point(&w_zp)
+    ///     .y_scale(&y_scale).y_zero_point(&y_zp)
+    ///     .call()
+    ///     .unwrap();
+    /// let shape: Vec<usize> = y.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 3, 3]);
+    /// ```
     #[builder]
     pub fn qlinear_conv(
         &self,
@@ -54,6 +100,24 @@ impl Tensor {
 
     /// Integer convolution: zero-point–adjust inputs and convolve in int32.
     /// No rescaling — returns raw int32 result.
+    ///
+    /// Implements the ONNX ConvInteger operator. Subtracts optional zero points
+    /// from input and weights, then convolves in int32. Unlike `qlinear_conv`,
+    /// no output rescaling is applied.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_dtype::DType;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 10u8));
+    /// let weight = Tensor::from_ndarray(&Array4::from_elem((1, 1, 1, 1), 1u8));
+    /// let y = x.conv_integer().weight(&weight).call().unwrap();
+    /// let shape: Vec<usize> = y.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 3, 3]);
+    /// ```
     #[builder]
     pub fn conv_integer(
         &self,
@@ -95,6 +159,36 @@ impl Tensor {
 
     /// Quantized matrix multiplication: zero-point–adjust inputs, matmul in int32,
     /// rescale and requantize to the output dtype.
+    ///
+    /// Implements the ONNX QLinearMatMul operator. The flow is:
+    /// 1. Subtract zero points from both inputs
+    /// 2. Perform integer matrix multiplication
+    /// 3. Rescale by `(a_scale * b_scale) / y_scale` and add `y_zero_point`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_dtype::DType;
+    /// # use ndarray::Array2;
+    /// let a = Tensor::from_ndarray(&Array2::from_elem((2, 3), 128u8));
+    /// let a_scale = Tensor::from_slice([0.1f32]);
+    /// let a_zp = Tensor::from_slice([128u8]);
+    /// let b = Tensor::from_ndarray(&Array2::from_elem((3, 4), 128u8));
+    /// let b_scale = Tensor::from_slice([0.1f32]);
+    /// let b_zp = Tensor::from_slice([128u8]);
+    /// let y_scale = Tensor::from_slice([0.1f32]);
+    /// let y_zp = Tensor::from_slice([128u8]);
+    /// let y = a.qlinear_matmul()
+    ///     .a_scale(&a_scale).a_zero_point(&a_zp)
+    ///     .b(&b).b_scale(&b_scale).b_zero_point(&b_zp)
+    ///     .y_scale(&y_scale).y_zero_point(&y_zp)
+    ///     .call()
+    ///     .unwrap();
+    /// let shape: Vec<usize> = y.shape().unwrap().iter()
+    ///     .map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![2, 4]);
+    /// ```
     #[builder]
     pub fn qlinear_matmul(
         &self,

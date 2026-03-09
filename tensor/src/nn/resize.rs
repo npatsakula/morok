@@ -13,6 +13,54 @@ type Result<T> = crate::Result<T>;
 
 #[bon]
 impl Tensor {
+    /// Resize a tensor using interpolation (ONNX Resize operator).
+    ///
+    /// Supports nearest, linear, and cubic interpolation modes with various
+    /// coordinate transformation modes. Either `scales` or `sizes` must be
+    /// provided to specify the target dimensions.
+    ///
+    /// # Examples
+    ///
+    /// Nearest-mode 2x upscale via `scales`:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
+    /// let y = x.resize().scales(&[1.0, 1.0, 2.0, 2.0]).call().unwrap();
+    /// let shape: Vec<usize> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 4, 4]);
+    /// assert!(y.to_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-5));
+    /// ```
+    ///
+    /// Resize to explicit output `sizes`:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
+    /// let y = x.resize().sizes(&[1, 1, 6, 6]).call().unwrap();
+    /// let shape: Vec<usize> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 6, 6]);
+    /// assert!(y.to_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-5));
+    /// ```
+    ///
+    /// Linear interpolation mode:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_tensor::nn::ResizeMode;
+    /// # use ndarray::Array4;
+    /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
+    /// let y = x.resize()
+    ///     .scales(&[1.0, 1.0, 2.0, 2.0])
+    ///     .mode(ResizeMode::Linear)
+    ///     .call()
+    ///     .unwrap();
+    /// let shape: Vec<usize> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
+    /// assert_eq!(shape, vec![1, 1, 4, 4]);
+    /// assert!(y.to_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-5));
+    /// ```
     // Tinygrad onnx.py:789-890
     #[builder]
     #[allow(clippy::too_many_arguments)]

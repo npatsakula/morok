@@ -9,13 +9,43 @@ use crate::Tensor;
 type Result<T> = crate::Result<T>;
 
 /// Convert flat pads `[begin0, begin1, ..., end0, end1, ...]` to `[(begin0, end0), ...]`.
+///
+/// ONNX stores padding as a flat array where the first half contains begin-pads
+/// and the second half contains end-pads. This function zips them into pairs.
+///
+/// # Examples
+///
+/// ```
+/// # use morok_tensor::nn::pad::flat_pads_to_pairs;
+/// let pairs = flat_pads_to_pairs(&[1, 2, 3, 4]);
+/// assert_eq!(pairs, vec![(1, 3), (2, 4)]);
+/// ```
+///
+/// ```
+/// # use morok_tensor::nn::pad::flat_pads_to_pairs;
+/// let pairs = flat_pads_to_pairs(&[0, 0, 1, 1, 1, 1, 0, 0]);
+/// assert_eq!(pairs, vec![(0, 1), (0, 1), (1, 0), (1, 0)]);
+/// ```
 pub fn flat_pads_to_pairs(pads: &[i64]) -> Vec<(isize, isize)> {
     let n = pads.len() / 2;
     (0..n).map(|i| (pads[i] as isize, pads[i + n] as isize)).collect()
 }
 
 /// Split total padding per dimension into `[begin0, begin1, ..., end0, end1, ...]`
-/// based on auto_pad mode (SAME_UPPER: more padding at end; SAME_LOWER: more at begin).
+/// based on auto-pad mode (`SAME_UPPER`: more padding at end; `SAME_LOWER`: more at begin).
+///
+/// # Examples
+///
+/// ```
+/// # use morok_tensor::nn::AutoPad;
+/// # use morok_tensor::nn::pad::auto_pad_split;
+/// // Total pad of 3: SAME_UPPER puts floor at begin, ceil at end
+/// let flat = auto_pad_split(&[3], AutoPad::SameUpper);
+/// assert_eq!(flat, vec![1, 2]); // begin=1, end=2
+///
+/// let flat = auto_pad_split(&[3], AutoPad::SameLower);
+/// assert_eq!(flat, vec![2, 1]); // begin=2, end=1
+/// ```
 pub fn auto_pad_split(total_pads: &[isize], auto_pad: AutoPad) -> Vec<isize> {
     let first: Vec<isize> = if auto_pad == AutoPad::SameUpper {
         total_pads.iter().map(|&p| p.div_euclid(2)).collect()
@@ -27,8 +57,28 @@ pub fn auto_pad_split(total_pads: &[isize], auto_pad: AutoPad) -> Vec<isize> {
     result
 }
 
-/// Resolve auto_pad + flat pads into `[(begin, end), ...]` pairs.
-/// Handles VALID, NOTSET, SAME_UPPER, SAME_LOWER.
+/// Resolve auto-pad mode and flat pads into `[(begin, end), ...]` pairs.
+///
+/// Handles all ONNX auto-pad modes: `VALID` (no padding), `NOTSET` (use explicit pads),
+/// `SAME_UPPER` and `SAME_LOWER` (compute padding to preserve spatial size).
+///
+/// # Examples
+///
+/// ```
+/// # use morok_tensor::nn::AutoPad;
+/// # use morok_tensor::nn::pad::resolve_pool_pads;
+/// // VALID mode: no padding regardless of explicit pads
+/// let pads = resolve_pool_pads(&[5, 5], &[], &[3, 3], &[1, 1], &[1, 1], AutoPad::Valid);
+/// assert_eq!(pads, vec![(0, 0), (0, 0)]);
+/// ```
+///
+/// ```
+/// # use morok_tensor::nn::AutoPad;
+/// # use morok_tensor::nn::pad::resolve_pool_pads;
+/// // SAME_UPPER: compute pads to keep output size = ceil(input/stride)
+/// let pads = resolve_pool_pads(&[5, 5], &[], &[3, 3], &[1, 1], &[1, 1], AutoPad::SameUpper);
+/// assert_eq!(pads, vec![(1, 1), (1, 1)]);
+/// ```
 pub fn resolve_pool_pads(
     input_spatial: &[usize],
     pads: &[i64],
@@ -65,7 +115,30 @@ pub fn resolve_pool_pads(
 
 #[bon]
 impl Tensor {
-    /// Pad with a custom fill value. Delegates to try_pad when value == 0.
+    /// Pad with a custom fill value. Delegates to `try_pad` when `value == 0.0`.
+    ///
+    /// Each element of `padding` is `(before, after)` for the corresponding dimension.
+    /// Non-zero fill is implemented via an additive mask to avoid nested WHERE conditions.
+    ///
+    /// # Examples
+    ///
+    /// Zero padding (delegates to `try_pad`):
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    /// let y = x.try_pad_value(&[(1, 1)], 0.0).unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 0.0]);
+    /// ```
+    ///
+    /// Negative-infinity padding (useful for max pooling):
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    /// let y = x.try_pad_value(&[(1, 0)], f64::NEG_INFINITY).unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![f32::NEG_INFINITY, 1.0, 2.0, 3.0]);
+    /// ```
     pub fn try_pad_value(&self, padding: &[(isize, isize)], value: f64) -> Result<Tensor> {
         if value == 0.0 {
             return self.try_pad(padding);
@@ -87,21 +160,62 @@ impl Tensor {
         padded.try_add(&fill_term)
     }
 
-    /// Pad with mode and fill value options.
+    /// Pad with configurable mode and fill value.
+    ///
+    /// Supports four padding modes via [`PadMode`]:
+    /// - `Constant` (default): fill with `value` (default 0.0)
+    /// - `Replicate`: repeat boundary values
+    /// - `Reflect`: mirror without repeating boundary
+    /// - `Circular`: wrap around
     ///
     /// # Examples
-    /// ```ignore
-    /// // Edge (replicate) padding
-    /// tensor.pad_with(&[(1, 1)]).mode(PadMode::Replicate).call()?;
     ///
-    /// // Reflect padding
-    /// tensor.pad_with(&[(2, 2)]).mode(PadMode::Reflect).call()?;
+    /// Constant padding (default mode):
     ///
-    /// // Constant padding with custom value
-    /// tensor.pad_with(&[(1, 1)]).value(-f64::INFINITY).call()?;
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    /// let y = x.pad_with().padding(&[(1, 1)]).call().unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 0.0]);
+    /// ```
     ///
-    /// // Circular (wrap) padding
-    /// tensor.pad_with(&[(1, 1)]).mode(PadMode::Circular).call()?;
+    /// Constant padding with a custom fill value:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    /// let y = x.pad_with().padding(&[(1, 1)]).value(-f64::INFINITY).call().unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![f32::NEG_INFINITY, 1.0, 2.0, 3.0, f32::NEG_INFINITY]);
+    /// ```
+    ///
+    /// Replicate (edge) padding:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_tensor::nn::PadMode;
+    /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    /// let y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Replicate).call().unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 3.0]);
+    /// ```
+    ///
+    /// Reflect padding:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_tensor::nn::PadMode;
+    /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    /// let y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Reflect).call().unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]);
+    /// ```
+    ///
+    /// Circular (wrap) padding:
+    ///
+    /// ```
+    /// # use morok_tensor::Tensor;
+    /// # use morok_tensor::nn::PadMode;
+    /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    /// let y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Circular).call().unwrap();
+    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]);
     /// ```
     #[builder]
     pub fn pad_with(

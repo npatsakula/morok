@@ -267,7 +267,7 @@ impl Tensor {
     /// ```
     /// # use morok_tensor::Tensor;
     /// # use ndarray::array;
-    /// let t = Tensor::from_ndarray(&array![[0.0f32; 3]; 2]);
+    /// let t = Tensor::from_ndarray(&array![[0.0f32, 0.0, 0.0], [0.0, 0.0, 0.0]]);
     /// t.array_view_mut::<f32>().unwrap()[[1, 2]] = 42.0;
     /// assert_eq!(t.array_view::<f32>().unwrap()[[1, 2]], 42.0);
     /// ```
