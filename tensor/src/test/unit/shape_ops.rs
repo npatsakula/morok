@@ -149,7 +149,6 @@ fn test_permute_error_wrong_length() {
 }
 
 #[test]
-#[tracing_test::traced_test]
 fn test_permute_space_to_depth() {
     crate::test::helpers::test_setup();
     // SpaceToDepth: (1,1,4,6) → reshape (1,1,2,2,3,2) → permute [0,3,5,1,2,4] → reshape (1,4,2,3)
@@ -649,6 +648,66 @@ fn test_cat_error_dimension_mismatch() {
     // Different ranks
     let result = Tensor::cat(&[&a, &b], 0);
     assert!(result.is_err());
+}
+
+// =========================================================================
+// Cat Value Tests (regression: fused Concat → elementwise → reduce)
+// =========================================================================
+
+/// Concat two realized buffers, then apply elementwise + reduce.
+/// This reproduces a DenseNet121 fusion bug where lazy Concat
+/// fused with downstream ops produces wrong values.
+#[test]
+fn test_cat_fused_with_reduce() {
+    crate::test::helpers::test_setup();
+    let f32_dt = crate::DType::Scalar(morok_dtype::ScalarDType::Float32);
+    // Two realized channel-dim buffers
+    let a = Tensor::full(&[1, 4, 3, 3], 1.0f32, f32_dt.clone()).unwrap().realize().unwrap();
+    let b = Tensor::full(&[1, 2, 3, 3], 2.0f32, f32_dt.clone()).unwrap().realize().unwrap();
+
+    // Concat along channel dim (lazy)
+    let cat = Tensor::cat(&[&a, &b], 1).unwrap();
+    // Elementwise (lazy)
+    let half = Tensor::full(&[1, 6, 1, 1], 0.5f32, f32_dt).unwrap();
+    let added = cat.try_add(&half).unwrap();
+    let relu = added.relu().unwrap();
+    // Reduce over spatial dims (like GlobalAveragePool)
+    let pooled = relu.mean(vec![2isize, 3]).unwrap();
+
+    let result = pooled.realize().unwrap().to_vec::<f32>().unwrap();
+
+    // a channels are 1.0+0.5=1.5 (relu=1.5), b channels are 2.0+0.5=2.5 (relu=2.5)
+    // Mean over 3x3 spatial = same values (all spatial elements identical)
+    assert_eq!(result.len(), 6);
+    for (i, &val) in result.iter().enumerate() {
+        let expected = if i < 4 { 1.5f32 } else { 2.5 };
+        assert!(
+            (val - expected).abs() < 1e-5,
+            "test_cat_fused_with_reduce: element {i}: actual={val}, expected={expected}"
+        );
+    }
+}
+
+/// Same as above but with more channels (closer to DenseNet's 992+32=1024).
+#[test]
+fn test_cat_fused_with_reduce_large() {
+    crate::test::helpers::test_setup();
+    let f32_dt = crate::DType::Scalar(morok_dtype::ScalarDType::Float32);
+    let a = Tensor::full(&[1, 32, 7, 7], 1.0f32, f32_dt.clone()).unwrap().realize().unwrap();
+    let b = Tensor::full(&[1, 8, 7, 7], 3.0f32, f32_dt.clone()).unwrap().realize().unwrap();
+
+    let cat = Tensor::cat(&[&a, &b], 1).unwrap();
+    let one = Tensor::full(&[1, 40, 1, 1], 1.0f32, f32_dt).unwrap();
+    let added = cat.try_add(&one).unwrap();
+    let relu = added.relu().unwrap();
+    let pooled = relu.mean(vec![2isize, 3]).unwrap();
+
+    let result = pooled.realize().unwrap().to_vec::<f32>().unwrap();
+    assert_eq!(result.len(), 40);
+    for (i, &val) in result.iter().enumerate() {
+        let expected = if i < 32 { 2.0f32 } else { 4.0 };
+        assert!((val - expected).abs() < 1e-5, "test_cat_fused_large: element {i}: actual={val}, expected={expected}");
+    }
 }
 
 // =========================================================================

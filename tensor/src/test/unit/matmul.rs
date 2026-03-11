@@ -186,7 +186,6 @@ fn test_print_matmul_ir() {
 
 #[test]
 #[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_512x512_ir -- --ignored --nocapture
-// #[tracing_test::traced_test]
 fn test_print_matmul_512x512_ir() {
     const SIZE: usize = 512;
     let a = Tensor::from_ndarray(
@@ -210,7 +209,6 @@ fn test_print_matmul_512x512_ir() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_beam_search_matmul() {
     // Test beam search optimization for matmul - reproduces float vector index bug
     let size = 512; // Original size that triggered the bug
@@ -300,7 +298,6 @@ fn test_linear_1d_weight() {
 // ========== Minimal VECTORIZE Normalization Test ==========
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_vectorize_normalize_minimal() {
     // Test 64x64 matmul with vectorization enabled
     let a = Tensor::from_ndarray(&Array2::<f32>::ones((64, 64)));
@@ -308,7 +305,6 @@ fn test_vectorize_normalize_minimal() {
     let c = a.matmul(&b).unwrap();
 
     // Explicit config to avoid test pollution from shared global state
-    // Note: default config has devectorize_alu=true (converts vector ALU to scalar)
     let config = OptimizerConfig::builder().strategy(OptStrategy::Heuristic).build();
     let result = c.realize_with(&config);
     assert!(result.is_ok(), "realize failed: {:?}", result.err());
@@ -317,7 +313,6 @@ fn test_vectorize_normalize_minimal() {
 // ========== 512x512 Vectorized Test (for UPCAST debugging) ==========
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_matmul_512x512_vectorized() {
     // Create 512x512 matrices filled with 1.0
     const SIZE: usize = 512;
@@ -355,7 +350,6 @@ fn test_matmul_64x64_vectorized() {
 
 #[test]
 #[ignore] // Run with: cargo test -p morok-tensor test_print_matmul_64x64_ir -- --ignored --nocapture
-// #[tracing_test::traced_test]
 fn test_print_matmul_64x64_ir() {
     const SIZE: usize = 64;
     let a = Tensor::from_ndarray(&Array2::<f32>::ones((SIZE, SIZE)));
@@ -387,7 +381,6 @@ fn assert_matmul_close(actual: &[f32], expected: &Array2<f32>, tol: f32) {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_matmul_validated_2x2() {
     // Simple 2x2 matmul with known values
     let a_nd = Array2::from_shape_vec((2, 2), vec![1.0f32, 2.0, 3.0, 4.0]).unwrap();
@@ -423,7 +416,6 @@ fn test_matmul_validated_3x3() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_matmul_validated_2x3_3x4() {
     // [2, 3] @ [3, 4] -> [2, 4]
     let a_data: Vec<f32> = (1..=6).map(|x| x as f32).collect();
@@ -458,7 +450,6 @@ fn test_matmul_validated_tall_wide() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_matmul_validated_16x16() {
     // Larger matrix to test vectorization paths
     const SIZE: usize = 16;
@@ -477,7 +468,6 @@ fn test_matmul_validated_16x16() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_matmul_validated_32x32() {
     // Test with 32x32 to exercise more optimization paths
     const SIZE: usize = 32;
@@ -496,7 +486,6 @@ fn test_matmul_validated_32x32() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_matmul_validated_64x64() {
     // 64x64 test with varied data
     const SIZE: usize = 64;
@@ -518,7 +507,6 @@ fn test_matmul_validated_64x64() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_dot_product_validated() {
     // 1D @ 1D dot product
     let a_data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
@@ -599,7 +587,6 @@ fn test_matmul_identity_validated() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_matmul_negative_values_validated() {
     // Test with negative values to ensure sign handling
     let a_nd = Array2::from_shape_vec((2, 3), vec![-1.0f32, 2.0, -3.0, 4.0, -5.0, 6.0]).unwrap();
@@ -661,7 +648,6 @@ fn run_validated_matmul(m: usize, k: usize, n: usize, tol: f32) {
 }
 
 // Square matrix tests with increasing sizes
-// #[tracing_test::traced_test]
 #[test_case(128, 0.5; "128x128")]
 #[test_case(256, 1.0; "256x256")]
 #[test_case(500, 1.5; "500x500 non-power-of-2")]

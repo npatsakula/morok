@@ -7,7 +7,6 @@ fn get_shape(tensor: &Tensor) -> Vec<usize> {
 
 #[test]
 fn test_sort_1d_ascending() {
-    let _ = tracing_subscriber::fmt::try_init();
     let t = Tensor::from_slice([3.0f32, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0]);
     let (sorted, indices) = t.sort(-1, false).unwrap();
     let sorted = sorted.realize().unwrap();
@@ -42,7 +41,6 @@ fn test_sort_single_element() {
 
 #[test]
 fn test_sort_2d_dim1() {
-    let _ = tracing_subscriber::fmt::try_init();
     let t = Tensor::from_ndarray(&array![[3.0f32, 1.0, 2.0], [6.0, 4.0, 5.0]]);
     let (sorted, _) = t.sort(1, false).unwrap();
     let sorted = sorted.realize().unwrap();

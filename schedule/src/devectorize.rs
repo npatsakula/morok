@@ -29,15 +29,68 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, UnaryOp, WmmaMetadata};
+use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, UOpKey, UnaryOp, WmmaMetadata};
 
 use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
 
-/// Context for REDUCE transformation (Tinygrad devectorizer.py:280-281)
+/// Context for REDUCE transformation (Tinygrad devectorizer.py:280-281).
+///
+/// Tracks END nodes created per reduce-range set so that multiple ENDs sharing
+/// the same ranges can be merged into a single END with a GROUP body.
 #[derive(Debug, Default)]
 pub struct ReduceContext {
-    pub acc_num: u32,
+    range_to_ends: HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>>>,
+}
+
+impl ReduceContext {
+    /// Register an END node under its reduce-range key.
+    pub fn register_end(&mut self, end: &Arc<UOp>) {
+        if let Op::End { ranges, .. } = end.op() {
+            let mut key: SmallVec<[u64; 4]> = ranges.iter().map(|r| r.id).collect();
+            key.sort_unstable();
+            self.range_to_ends.entry(key).or_default().push(end.clone());
+        }
+    }
+
+    /// Merge END nodes that share the same reduce ranges.
+    ///
+    /// For each group of >1 ENDs with identical range sets, creates a single
+    /// `GROUP(computation1, computation2, ...).end(ranges)` and substitutes it
+    /// throughout the SINK subgraph. Clears tracking state after merge.
+    ///
+    /// Matches Tinygrad's `merge_reduce_ends` (devectorizer.py:333-336).
+    pub fn merge_reduce_ends(&mut self, sources: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+        #[allow(clippy::mutable_key_type)]
+        let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+        for ends in self.range_to_ends.values() {
+            if ends.len() <= 1 {
+                continue;
+            }
+            let computations: Vec<Arc<UOp>> = ends
+                .iter()
+                .map(|e| match e.op() {
+                    Op::End { computation, .. } => computation.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let ranges = match ends[0].op() {
+                Op::End { ranges, .. } => ranges.clone(),
+                _ => unreachable!(),
+            };
+            let merged = UOp::group(computations).end(ranges);
+            for end in ends {
+                subs.insert(UOpKey(end.clone()), merged.clone());
+            }
+        }
+        self.range_to_ends.clear();
+
+        if subs.is_empty() {
+            return None;
+        }
+        let sink = UOp::sink(sources.to_vec());
+        Some(sink.substitute(&subs))
+    }
 }
 
 use crate::rewrite::graph_rewrite;
@@ -1604,10 +1657,19 @@ use crate::symbolic::dce::reduce_identity;
 ///
 /// This runs EARLY (before pm_add_loads, before main devectorize) to eliminate
 /// REDUCE before other patterns see it. Matches Tinygrad's pm_reduce.
-pub fn pm_reduce() -> TypedPatternMatcher {
+pub fn pm_reduce() -> TypedPatternMatcher<ReduceContext> {
     crate::patterns! {
+        @context ReduceContext;
+
         // Match ALL REDUCEs - empty ranges handled by returning reduced value directly
-        red @ Reduce(_, ..) => |red| reduce_to_acc(red),
+        red @ Reduce(_, ..) => {
+            reduce_to_acc(red, ctx)
+        },
+
+        // Merge END nodes sharing the same reduce ranges (Tinygrad merge_reduce_ends)
+        Sink { sources: _sources } => {
+            ctx.merge_reduce_ends(_sources)
+        },
     }
 }
 
@@ -1631,7 +1693,7 @@ fn horizontal_reduce(inp: &Arc<UOp>, out_dtype: &DType) -> Vec<Arc<UOp>> {
 }
 
 /// Convert REDUCE to explicit accumulator pattern (devectorizer.py:291-308).
-fn reduce_to_acc(red: &Arc<UOp>) -> Option<Arc<UOp>> {
+fn reduce_to_acc(red: &Arc<UOp>, ctx: &mut ReduceContext) -> Option<Arc<UOp>> {
     let Op::Reduce { src: inp, ranges: reduce_range, reduce_op } = red.op() else { return None };
 
     let lst = horizontal_reduce(inp, &red.dtype());
@@ -1676,6 +1738,7 @@ fn reduce_to_acc(red: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // return acc.after(acc.index(0).store(ret).end(*reduce_range)).index(0)
     let store_end = make_idx(acc.clone()).store_value(ret).end(reduce_range.clone());
+    ctx.register_end(&store_end);
     Some(make_idx(acc.after(smallvec::smallvec![store_end])))
 }
 

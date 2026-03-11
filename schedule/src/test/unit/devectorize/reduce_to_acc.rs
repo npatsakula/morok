@@ -346,8 +346,9 @@ fn test_reduce_in_full_pipeline() {
     let reduce = load.reduce(smallvec![reduce_range], ReduceOp::Add);
 
     // Apply pm_reduce + gep_pushing (as done in optimizer)
-    let combined = pm_reduce() + gep_pushing_patterns();
-    let result = graph_rewrite(&combined, reduce, &mut ());
+    let combined = pm_reduce() + gep_pushing_patterns().with_context();
+    let mut ctx = crate::devectorize::ReduceContext::default();
+    let result = graph_rewrite(&combined, reduce, &mut ctx);
 
     // Should transform REDUCE to accumulator pattern
     assert!(!matches!(result.op(), Op::Reduce { .. }), "REDUCE should be transformed");

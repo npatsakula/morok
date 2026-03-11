@@ -66,8 +66,7 @@ pub struct RangeifyResult {
 /// **Stage 3**: pm_split_ranges + pm_flatten_range - Range splitting
 /// **Stage 4**: sym + pm_flatten_range - Initial symbolic (TOP_DOWN)
 /// **Stage 5**: pm_simplify_ranges - Simplify/merge ranges
-/// **Stage 6**: pm_split_store - Split store ranges (CPU only)
-/// **Stage 7**: apply_opts - Post-range optimization (happens in optimizer)
+/// **Stage 6**: apply_opts - Post-range optimization (happens in optimizer)
 #[allow(clippy::mutable_key_type)]
 #[tracing::instrument(skip_all)]
 pub fn rangeify_with_map(
@@ -393,136 +392,6 @@ fn do_split_ranges_substitute(ctx: &mut SplitRangesContext, sink: &Arc<UOp>) -> 
     ctx.marked_ranges.clear();
 
     Some(result)
-}
-
-// ============================================================================
-// SPLIT STORE (pm_split_store equivalent) - CPU only
-// ============================================================================
-
-/// Context for split store - contains target device.
-#[derive(Debug, Clone, Default)]
-pub struct SplitStoreContext {
-    /// Target device (split store only applies to CPU)
-    pub device: Option<morok_device::DeviceSpec>,
-    /// Range counter for creating unique axis IDs
-    range_counter: usize,
-}
-
-impl SplitStoreContext {
-    /// Create context for the given device.
-    pub fn for_device(device: morok_device::DeviceSpec) -> Self {
-        Self { device: Some(device), range_counter: 0 }
-    }
-
-    /// Generate a unique axis ID for split ranges.
-    fn next_axis_id(&mut self) -> morok_ir::AxisId {
-        let id = self.range_counter;
-        self.range_counter += 1;
-        morok_ir::AxisId::Renumbered(1000 + id) // Use high offset to avoid collision
-    }
-}
-
-/// Split a STORE at comparison cut points (CPU-only optimization).
-///
-/// When a RANGE has CMPLT comparisons to constants, split the store
-/// into multiple stores with disjoint ranges to enable branch elimination.
-///
-/// Based on Tinygrad's pm_split_store (simplify.py).
-#[allow(clippy::mutable_key_type)]
-pub fn cut_store_range(ctx: &mut SplitStoreContext, store: &Arc<UOp>, range: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use morok_device::DeviceSpec;
-    use morok_ir::types::BinaryOp;
-
-    // Guard 1: CPU only
-    if ctx.device != Some(DeviceSpec::Cpu) {
-        return None;
-    }
-
-    // Guard 2: Range end must be constant
-    let Op::Range { end, axis_type, .. } = range.op() else {
-        return None;
-    };
-    let range_end = const_uop_to_i64(end)?;
-    if range_end <= 0 {
-        return None;
-    }
-
-    // Find cut points from CMPLT consumers of this range
-    let consumer_map = store.get_consumer_map();
-    let consumers = consumer_map.get(&UOpKey(range.clone()))?;
-
-    let cuts: Vec<i64> = consumers
-        .iter()
-        .filter_map(|c| {
-            // Must be: Lt(range, const)
-            let Op::Binary(BinaryOp::Lt, lhs, rhs) = c.op() else {
-                return None;
-            };
-            if !Arc::ptr_eq(lhs, range) {
-                return None;
-            }
-            const_uop_to_i64(rhs)
-        })
-        .collect();
-
-    if cuts.is_empty() {
-        return None;
-    }
-
-    // Build full cut list: [0, ...cuts..., range_end]
-    let mut all_cuts: Vec<i64> = vec![0];
-    all_cuts.extend(cuts.iter().filter(|&&c| c > 0 && c < range_end));
-    all_cuts.push(range_end);
-    all_cuts.sort();
-    all_cuts.dedup();
-
-    if all_cuts.len() < 3 {
-        return None; // Need at least 2 segments
-    }
-
-    // Create split stores
-    let segments: Vec<Arc<UOp>> = all_cuts
-        .windows(2)
-        .map(|w| {
-            let (start, seg_end) = (w[0], w[1]);
-            let seg_size = seg_end - start;
-
-            // Create new range with unique axis ID
-            let new_axis_id = ctx.next_axis_id();
-            let new_range = UOp::range_axis(UOp::index_const(seg_size), new_axis_id, *axis_type);
-
-            // Build substitution: r → new_r + start
-            let offset = if start == 0 { new_range.clone() } else { new_range.add(&UOp::index_const(start)) };
-
-            // Substitute the range in the store
-            #[allow(clippy::mutable_key_type)]
-            let subs: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(range.clone()), offset)].into_iter().collect();
-            let substituted = store.substitute(&subs);
-
-            // Wrap with END containing the new range
-            substituted.end(SmallVec::from_elem(new_range, 1))
-        })
-        .collect();
-
-    Some(UOp::group(segments))
-}
-
-/// Pattern matcher for split store optimization (CPU-only).
-///
-/// Based on Tinygrad's pm_split_store (simplify.py).
-/// Matches END(STORE(...), [range]) patterns and splits at comparison cut points.
-pub fn pm_split_store() -> crate::TypedPatternMatcher<SplitStoreContext> {
-    crate::patterns! {
-        @context SplitStoreContext;
-
-        // Match: END(STORE(...), [range]) where range is single
-        _end @ End { computation: store @ Store { index: _, value: _, ranges: store_ranges }, ranges: end_ranges }
-            if end_ranges.len() == 1 && store_ranges.is_empty()
-        => |store, end_ranges| {
-            let range = &end_ranges[0];
-            cut_store_range(ctx, store, range)
-        },
-    }
 }
 
 // ============================================================================

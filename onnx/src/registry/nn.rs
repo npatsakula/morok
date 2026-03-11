@@ -487,20 +487,21 @@ pub(crate) fn op_dropout(inputs: &[Option<Tensor>], attrs: &mut Attrs, opset_ver
     let x = inp(inputs, 0);
     let _seed = attrs.int("seed", 0); // acknowledged; not used in inference
 
-    // Extract ratio (v7+: input[1], v6: attribute)
-    let ratio = if opset_version >= 7 {
+    // Extract ratio: attribute through opset 10, input[1] from opset 12+
+    let ratio = if opset_version >= 12 {
         inputs.get(1).and_then(|o| o.as_ref()).map(|t| tensor_to_f64_scalar(t).unwrap_or(0.5)).unwrap_or(0.5)
     } else {
         attrs.float("ratio", 0.5) as f64
     };
 
-    // Determine training mode
-    let training = if opset_version < 7 {
-        // v6: is_test attribute (default 0 = training)
+    // Determine training mode: is_test attribute through opset 6, input[2] from opset 12+
+    let training = if opset_version >= 12 {
+        inputs.get(2).and_then(|o| o.as_ref()).map(|t| tensor_to_bool_scalar(t).unwrap_or(false)).unwrap_or(false)
+    } else if opset_version <= 6 {
         attrs.int("is_test", 0) != 1
     } else {
-        // v7+: training_mode input (index 2, default false)
-        inputs.get(2).and_then(|o| o.as_ref()).map(|t| tensor_to_bool_scalar(t).unwrap_or(false)).unwrap_or(false)
+        // opset 7-10: no is_test, no training_mode input; always inference
+        false
     };
 
     let (output, mask) = x.dropout().p(ratio).training(training).call()?;

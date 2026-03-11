@@ -298,7 +298,6 @@ fn test_nonzero_2d_debug_coords() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_nonzero_2d_debug_stack() {
     // Test stack with lazy coordinate tensors
     let coord0 = Tensor::arange(0, Some(2), None)
@@ -331,7 +330,6 @@ fn test_nonzero_2d_debug_stack() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_nonzero_2d() {
     // [[1, 0], [1, 1]] — nonzero at (0,0), (1,0), (1,1)
     let t = Tensor::from_ndarray(&array![[1i32, 0], [1, 1]]);

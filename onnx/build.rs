@@ -3,6 +3,7 @@ use std::path::Path;
 fn main() {
     prost_build::compile_protos(&["proto/onnx.proto"], &["proto/"]).unwrap();
     generate_node_tests();
+    generate_light_tests();
 }
 
 fn generate_node_tests() {
@@ -35,6 +36,48 @@ fn generate_node_tests() {
                setup_tracing();
                run_onnx_node_test(concat!(env!(\"CARGO_MANIFEST_DIR\"), \
                \"/../submodules/onnx/onnx/backend/test/data/node/{name}\"));\n}}\n\n",
+            attr = if ignored { "#[ignore]\n" } else { "" },
+        ));
+    }
+
+    std::fs::write(&out_path, code).unwrap();
+}
+
+fn generate_light_tests() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let light_dir = Path::new(&manifest_dir).join("../submodules/onnx/onnx/backend/test/data/light");
+
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let out_path = Path::new(&out_dir).join("onnx_light_tests.rs");
+
+    if !light_dir.exists() {
+        std::fs::write(&out_path, "// ONNX light models not found\n").unwrap();
+        return;
+    }
+
+    let mut models: Vec<String> = std::fs::read_dir(&light_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.strip_suffix(".onnx").map(String::from)
+        })
+        .collect();
+    models.sort();
+
+    const SKIP_LIGHT: &[&str] = &[];
+
+    let mut code = String::new();
+    for name in &models {
+        let ignored = SKIP_LIGHT.contains(&name.as_str());
+        code.push_str(&format!(
+            "#[test]\n{attr}fn {name}() {{\n    \
+               setup_tracing();
+               run_onnx_light_test(\
+               concat!(env!(\"CARGO_MANIFEST_DIR\"), \
+               \"/../submodules/onnx/onnx/backend/test/data/light/{name}.onnx\"), \
+               concat!(env!(\"CARGO_MANIFEST_DIR\"), \
+               \"/../submodules/onnx/onnx/backend/test/data/light/{name}_output_0.pb\"));\n}}\n\n",
             attr = if ignored { "#[ignore]\n" } else { "" },
         ));
     }

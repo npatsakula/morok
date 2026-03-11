@@ -48,7 +48,6 @@ fn test_pool_2d_dilation() {
 // =========================================================================
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_pad_value_neg_inf() {
     let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let padded = x.try_pad_value(&[(1, 1)], f64::NEG_INFINITY).unwrap();
@@ -62,7 +61,6 @@ fn test_pad_value_neg_inf() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_pad_value_zero_delegates() {
     // pad_value with 0.0 should be identical to try_pad
     let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
@@ -171,7 +169,6 @@ fn test_conv2d_bias() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_conv2d_padding() {
     // 3x3 kernel with padding=1 on 3x3 → 3x3
     let x = Tensor::from_ndarray(&Array4::<f32>::ones((1, 1, 3, 3)));
@@ -232,7 +229,6 @@ fn test_max_pool2d() {
 }
 
 #[test]
-// #[tracing_test::traced_test]
 fn test_max_pool2d_pad() {
     // Padding should fill with -inf, not 0
     // 3x3 kernel with padding=1 on 3x3 → 3x3, all values are negative

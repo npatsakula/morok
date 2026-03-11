@@ -386,18 +386,6 @@ pub struct OptimizerConfig {
     pub beam: BeamConfig,
     /// Heuristics configuration (used when strategy is Heuristic).
     pub heuristics: HeuristicsConfig,
-    /// Devectorize ALU operations to scalar + VECTORIZE.
-    ///
-    /// When enabled, converts vector ALU ops (e.g., `Add<vec4>`) to
-    /// `VECTORIZE(Add<scalar>, Add<scalar>, ...)`. This is useful for:
-    /// - Backends without native vector support
-    /// - Debugging vectorization issues
-    ///
-    /// When disabled (default=false), preserves vector operations for backends
-    /// with sophisticated optimizers (like LLVM's SLP vectorizer).
-    ///
-    /// Environment: `MOROK_DEVECTORIZE=1` to enable.
-    pub devectorize_alu: bool,
 }
 
 #[bon]
@@ -408,9 +396,8 @@ impl OptimizerConfig {
         #[builder(default)] strategy: OptStrategy,
         #[builder(default)] beam: BeamConfig,
         #[builder(default)] heuristics: HeuristicsConfig,
-        #[builder(default = true)] devectorize_alu: bool,
     ) -> Self {
-        Self { strategy, beam, heuristics, devectorize_alu }
+        Self { strategy, beam, heuristics }
     }
 
     /// Create configuration from environment variables.
@@ -421,16 +408,12 @@ impl OptimizerConfig {
     ///
     /// * `MOROK_NOOPT=1` - Disable all optimizations
     /// * `MOROK_BEAM=N` - Use beam search with width N
-    /// * `MOROK_DEVECTORIZE=0` - Preserve vector ALU ops (default: devectorize)
     pub fn from_env() -> Self {
         let strategy = OptStrategy::from_env();
         let beam = BeamConfig::from_env().with_strategy_width(&strategy);
         let heuristics = HeuristicsConfig::from_env();
-        // Default: devectorize ALU to match Tinygrad's behavior
-        // Use MOROK_DEVECTORIZE=0 to preserve vectors
-        let devectorize_alu = std::env::var("MOROK_DEVECTORIZE").map(|v| v != "0").unwrap_or(true);
 
-        Self { strategy, beam, heuristics, devectorize_alu }
+        Self { strategy, beam, heuristics }
     }
 }
 

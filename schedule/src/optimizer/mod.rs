@@ -78,9 +78,7 @@ use crate::rangeify::patterns::{
     rangeify_codegen_with_kernel_ctx,
 };
 use crate::rangeify::pm_add_buffers_local_patterns;
-use crate::rangeify::transforms::{
-    SplitStoreContext, pm_flatten_range, pm_simplify_ranges, pm_split_ranges, pm_split_store,
-};
+use crate::rangeify::transforms::{pm_flatten_range, pm_simplify_ranges, pm_split_ranges};
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
 use std::sync::Arc;
@@ -119,7 +117,7 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// - pm_add_loads: Extract LOAD ops from INDEX
 /// - pre_expand: Convert Range(Unroll/Upcast) → UNROLL, expand operations
 /// - pm_add_gpudims (GPU only): Convert GLOBAL/LOCAL RANGE to SPECIAL thread indices
-/// - no_vectorized_alu (optional): Convert vector ALU to scalar + VECTORIZE
+/// - no_vectorized_alu: Convert vector ALU to scalar + VECTORIZE
 /// - pm_reduce_devectorize: Unified REDUCE devectorization (K-vec, bool, horizontal)
 /// - pm_bool_devectorize: Convert <N x i1> to scalar ops
 /// - bool_storage_patterns: Convert bool LOAD/STORE to uint8
@@ -130,14 +128,12 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// # Arguments
 ///
 /// * `ast` - The kernel AST to optimize
-/// * `devectorize_alu` - If true, convert vector ALU ops to scalar + VECTORIZE.
-///   Use for backends without native vector support. Default: false (preserve vectors).
 ///
 /// Called by both heuristic and beam search paths for consistent behavior.
 /// For GPU pipelines, use `apply_post_optimization_with_renderer` to enable GPU dimension injection.
-#[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
-pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -> Arc<morok_ir::UOp> {
-    apply_post_optimization_with_renderer(ast, devectorize_alu, None)
+#[tracing::instrument(skip_all)]
+pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
+    apply_post_optimization_with_renderer(ast, None)
 }
 
 /// Apply post-optimization passes with renderer context.
@@ -149,14 +145,14 @@ pub fn apply_post_optimization(ast: Arc<morok_ir::UOp>, devectorize_alu: bool) -
 /// # Arguments
 ///
 /// * `ast` - The kernel AST to optimize
-/// * `devectorize_alu` - If true, convert vector ALU ops to scalar + VECTORIZE
 /// * `renderer` - Optional renderer for GPU dimension injection
-#[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
+#[tracing::instrument(skip_all)]
 pub fn apply_post_optimization_with_renderer(
     ast: Arc<morok_ir::UOp>,
-    _devectorize_alu: bool,
     renderer: Option<&Renderer>,
 ) -> Arc<morok_ir::UOp> {
+    tracing::debug!(ast.initial = ast.tree(), "kernel initial");
+
     // Multi-index linearization: INDEX(buf, [i,j,k]) → INDEX(buf, [linear])
     // Moves row-major linearization from codegen to schedule, eliminating
     // duplicated logic in LLVM backends.
@@ -218,8 +214,9 @@ pub fn apply_post_optimization_with_renderer(
     );
 
     let t_stage = std::time::Instant::now();
-    let pm_reduce_combined = pm_reduce() + pm_wmma_accumulate() + gep_pushing_patterns();
-    let reduced = graph_rewrite(&pm_reduce_combined, with_local_buffers, &mut ());
+    let pm_reduce_combined = pm_reduce() + pm_wmma_accumulate().with_context() + gep_pushing_patterns().with_context();
+    let mut reduce_ctx = crate::devectorize::ReduceContext::default();
+    let reduced = graph_rewrite(&pm_reduce_combined, with_local_buffers, &mut reduce_ctx);
     tracing::debug!(
         ast.optimized = reduced.tree(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
@@ -401,9 +398,12 @@ fn get_late_rewrite_patterns(renderer: Option<&Renderer>) -> crate::TypedPattern
 /// 2. Split ranges + flatten (`pm_split_ranges + pm_flatten_range`)
 /// 3. Symbolic + flatten (`sym + pm_flatten_range`)
 /// 4. Simplify ranges (`pm_simplify_ranges`)
-/// 5. Split store (`pm_split_store`, CPU only)
-#[tracing::instrument(skip_all, fields(ast.initial = ast.tree()))]
-pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<morok_ir::UOp> {
+///
+/// Called by both heuristic and beam search paths.
+#[tracing::instrument(skip_all)]
+pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>) -> Arc<morok_ir::UOp> {
+    tracing::debug!(ast.initial = ast.tree(), "kernel initial");
+
     use crate::rangeify::transforms::SplitRangesContext;
 
     let t_stage = std::time::Instant::now();
@@ -453,18 +453,6 @@ pub fn apply_pre_optimization(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> A
         "pre-opt: simplify ranges complete"
     );
 
-    if renderer.device == "CPU" {
-        let t_stage = std::time::Instant::now();
-        let mut split_store_ctx = SplitStoreContext::for_device(morok_device::DeviceSpec::Cpu);
-        let combined = pm_flatten_range().with_context::<SplitStoreContext>() + pm_split_store();
-        sink = graph_rewrite(&combined, sink, &mut split_store_ctx);
-        tracing::debug!(
-            ast.pre = sink.tree(),
-            elapsed_ms = t_stage.elapsed().as_millis() as u64,
-            "pre-opt: split store complete"
-        );
-    }
-
     sink
 }
 
@@ -481,7 +469,7 @@ pub fn optimize_kernel_with_config(
     config: &OptimizerConfig,
 ) -> Arc<morok_ir::UOp> {
     // Pre-optimization: per-kernel stages (Tinygrad: full_rewrite_to_sink)
-    let pre_optimized = apply_pre_optimization(ast, renderer);
+    let pre_optimized = apply_pre_optimization(ast);
 
     let optimized = match config.strategy {
         OptStrategy::None => pre_optimized, // No heuristic optimization, but post-optimization still needed
@@ -497,7 +485,7 @@ pub fn optimize_kernel_with_config(
     // apply_post_optimization contains correctness transforms (pm_add_loads wraps INDEX
     // with LOAD for arithmetic ops) and must run even when optimizations are disabled.
     // Pass the renderer to enable GPU dimension injection for GPU backends.
-    apply_post_optimization_with_renderer(optimized, config.devectorize_alu, Some(renderer))
+    apply_post_optimization_with_renderer(optimized, Some(renderer))
 }
 
 /// Apply optimizations with explicit strategy selection (legacy API).
@@ -558,7 +546,7 @@ where
     F: Fn(&Scheduler) -> Option<std::time::Duration> + Sync,
 {
     // Step 0: Per-kernel pre-optimization (Tinygrad: full_rewrite_to_sink)
-    let pre_optimized = apply_pre_optimization(ast, renderer);
+    let pre_optimized = apply_pre_optimization(ast);
 
     // Step 1: Create scheduler (AST already simplified by apply_pre_optimization Stage 3)
     let mut scheduler = Scheduler::new(pre_optimized, renderer.clone());
@@ -584,7 +572,7 @@ where
 ///
 /// A `Scheduler` with loops converted to globals (if applicable).
 pub fn prepare_scheduler(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Scheduler {
-    let pre_optimized = apply_pre_optimization(ast, renderer);
+    let pre_optimized = apply_pre_optimization(ast);
     let mut scheduler = Scheduler::new(pre_optimized, renderer.clone());
     let _ = scheduler.convert_loop_to_global(); // GPU: LOOP→GLOBAL
     // Note: Don't apply threading here - let beam search explore THREAD actions naturally.

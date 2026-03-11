@@ -138,7 +138,6 @@ impl Tensor {
     /// let c = a.matmul(&b)?;
     /// let config = OptimizerConfig::builder()
     ///     .strategy(OptStrategy::Beam { width: 4 })
-    ///     .devectorize_alu(false)
     ///     .build();
     /// let c = c.realize_with(&config)?;
     /// ```
@@ -793,8 +792,6 @@ fn beam_search_optimize(
     optimizer_config: &morok_schedule::OptimizerConfig,
 ) -> Result<Arc<UOp>> {
     let beam_config = &optimizer_config.beam;
-    let devectorize_alu = optimizer_config.devectorize_alu;
-
     // Prepare scheduler (applies symbolic simplification and loop→global)
     let mut scheduler = prepare_scheduler(ast, renderer);
 
@@ -829,7 +826,7 @@ fn beam_search_optimize(
             let raw_ast = s.get_optimized_ast(None);
 
             // Apply post-optimization passes for accurate timing
-            let optimized = apply_post_optimization(raw_ast, devectorize_alu);
+            let optimized = apply_post_optimization(raw_ast);
 
             // Post-optimization UOp count filter (matches Tinygrad's BEAM_UOPS_MAX).
             // validate_limits checks pre-optimization AST size, but devectorization
@@ -891,7 +888,7 @@ fn beam_search_optimize(
 
     // Apply post-optimization to final result
     let raw_ast = result.scheduler.get_optimized_ast(None);
-    Ok(apply_post_optimization(raw_ast, devectorize_alu))
+    Ok(apply_post_optimization(raw_ast))
 }
 
 #[cfg(test)]
@@ -899,7 +896,6 @@ mod tests {
     use super::*;
 
     #[test]
-    // #[tracing_test::traced_test]
     fn test_realize_simple_add() {
         crate::test::helpers::test_setup();
 
@@ -928,7 +924,6 @@ mod tests {
     /// - ReduceAxis → REDUCE transformation following Tinygrad's approach
     /// - REDUCE codegen generates correct LLVM IR
     #[test]
-    // #[tracing_test::traced_test]
     fn test_realize_sum() {
         crate::test::helpers::test_setup();
 

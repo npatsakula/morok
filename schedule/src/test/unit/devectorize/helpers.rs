@@ -633,8 +633,9 @@ use morok_ir::{AxisId, AxisType, ReduceOp};
 ///
 /// This runs the REDUCE → accumulator transformation (reduce_to_acc).
 pub fn apply_pm_reduce(uop: &Arc<UOp>) -> Arc<UOp> {
-    use crate::devectorize::pm_reduce;
-    graph_rewrite(&pm_reduce(), uop.clone(), &mut ())
+    use crate::devectorize::{ReduceContext, pm_reduce};
+    let mut ctx = ReduceContext::default();
+    graph_rewrite(&pm_reduce(), uop.clone(), &mut ctx)
 }
 
 /// Apply GEP movement and related load/store folding patterns.

@@ -81,6 +81,7 @@ static TRACING_INIT: Once = Once::new();
 pub fn setup_tracing() {
     TRACING_INIT.call_once(|| {
         tracing_subscriber::fmt()
+            .json()
             .with_env_filter(EnvFilter::from_default_env())
             .with_test_writer() // Ensures output is captured by `cargo test`
             .init();

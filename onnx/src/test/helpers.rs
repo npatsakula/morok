@@ -11,7 +11,7 @@ pub(crate) use crate::registry::*;
 pub(crate) use morok_dtype::{DType, ScalarDType};
 pub(crate) use morok_tensor::Tensor;
 
-use crate::importer::OnnxImporter;
+use crate::importer::{DimValue, OnnxImporter};
 
 pub(crate) fn make_attr_int(name: &str, val: i64) -> AttributeProto {
     AttributeProto { name: name.to_string(), i: val, ..Default::default() }
@@ -134,6 +134,59 @@ pub(crate) fn make_multi_output_model() -> ModelProto {
         }),
         ..Default::default()
     }
+}
+
+// ---------------------------------------------------------------------------
+// ONNX light model test infrastructure
+// ---------------------------------------------------------------------------
+
+pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str) {
+    let model_path = Path::new(model_path);
+    let test_name = model_path.file_stem().unwrap().to_string_lossy();
+
+    // 1. Load and decode model
+    let model_bytes = std::fs::read(model_path).unwrap_or_else(|e| panic!("{test_name}: failed to read model: {e}"));
+    let model = ModelProto::decode(model_bytes.as_slice())
+        .unwrap_or_else(|e| panic!("{test_name}: failed to decode model: {e}"));
+
+    // 2. Prepare graph
+    let importer = OnnxImporter::new();
+    let graph = importer.prepare(model).unwrap_or_else(|e| panic!("{test_name}: prepare failed: {e}"));
+
+    // 3. Generate deterministic inputs: arange(n)/n (matches ONNX backend test runner)
+    let mut inputs = HashMap::new();
+    for (name, spec) in &graph.inputs {
+        let shape: Vec<usize> = spec
+            .shape
+            .iter()
+            .map(|d| match d {
+                DimValue::Static(s) => *s,
+                DimValue::Dynamic(name) => panic!("{test_name}: unexpected dynamic dim '{name}'"),
+            })
+            .collect();
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&data);
+        let tensor = Tensor::from_raw_bytes(bytes, &shape, DType::Scalar(ScalarDType::Float32))
+            .unwrap_or_else(|e| panic!("{test_name}: input '{name}': {e}"));
+        inputs.insert(name.clone(), tensor);
+    }
+
+    // 4. Trace with generated inputs
+    let (_, outputs) =
+        importer.trace_external(&graph, inputs).unwrap_or_else(|e| panic!("{test_name}: trace failed: {e}"));
+
+    // 5. Load expected output and compare
+    let pb_bytes =
+        std::fs::read(output_pb_path).unwrap_or_else(|e| panic!("{test_name}: failed to read expected output: {e}"));
+    let tensor_proto = TensorProto::decode(pb_bytes.as_slice())
+        .unwrap_or_else(|e| panic!("{test_name}: failed to decode expected output: {e}"));
+    let expected = tensor_from_proto_ext(&tensor_proto, None)
+        .unwrap_or_else(|e| panic!("{test_name}: expected output conversion: {e}"));
+
+    let actual =
+        outputs.get(&graph.outputs[0]).unwrap_or_else(|| panic!("{test_name}: missing output '{}'", graph.outputs[0]));
+    assert_tensors_close(actual, &expected, &test_name);
 }
 
 // ---------------------------------------------------------------------------
