@@ -38,17 +38,17 @@ use morok_schedule::{
 use tracing::{debug, trace};
 
 use crate::{
-    Result, Tensor,
+    PrepareConfig, Result, Tensor,
     error::{
-        CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceFactorySnafu, DeviceSnafu,
-        EmptyScheduleSnafu, ExecutionSnafu, OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu,
-        UOpSnafu,
+        CompileKernelSnafu, CreateProgramSnafu, DependencyCyclesSnafu, DeviceSnafu, EmptyScheduleSnafu, ExecutionSnafu,
+        OptimizeSnafu, RangeifySnafu, RenderKernelSnafu, ShapeUnknownSnafu, UOpSnafu,
     },
     schedule::{Schedule, ScheduleItem, expand_schedule},
 };
 use morok_device::{Buffer, device::Device};
 use morok_dtype::DType;
-use morok_ir::{AxisId, DeviceSpec, Op, SInt, UOp};
+use morok_ir::pattern::is_any_const;
+use morok_ir::{DeviceSpec, Op, UOp, UOpKey};
 use morok_runtime::{
     ExecutionGraph, ExecutionNode, ExecutionPlan, ExecutionPlanBuilder, KernelBufferAccess, ParallelGroup,
     PreparedKernel,
@@ -82,53 +82,102 @@ impl Tensor {
     ///
     /// Returns error if preparation or execution fails.
     pub fn realize(self) -> Result<Self> {
-        let uop = self.uop();
-        let input_buffer_ids: std::collections::HashSet<u64> = collect_input_buffers(&uop).keys().copied().collect();
+        // Already realized — ensure buffer is attached and return.
+        if self.uop().has_buffer_identity() {
+            return Ok(self.ensure_buffer());
+        }
+        // Pure constant — no computation needed.
+        if is_any_const(&self.uop()) {
+            return Ok(self);
+        }
+
+        let old_uop = self.uop();
+        let input_buffer_ids: std::collections::HashSet<u64> =
+            collect_input_buffers(&old_uop).keys().copied().collect();
 
         let plan = self.prepare()?;
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
 
-        self.finalize_realize(&plan, &uop, &input_buffer_ids)
+        let result = self.finalize_realize(&plan, &old_uop)?;
+
+        // Propagate realized buffer to all live tensors referencing old_uop.
+        // This is Tinygrad's _apply_map_to_tensors approach: after realize, all
+        // tensors sharing this subgraph see the buffer instead of recomputing.
+        let realized_uop = result.uop();
+        if !Arc::ptr_eq(&old_uop, &realized_uop) {
+            #[allow(clippy::mutable_key_type)]
+            let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
+            crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+        }
+
+        // Release intermediate buffers AFTER apply_map_to_tensors so other
+        // tensors can still look up buffers during the substitution window.
+        plan.release_intermediate_buffers(|uop_id| {
+            if !input_buffer_ids.contains(&uop_id) {
+                crate::tensor_registry::remove_buffer(uop_id);
+            }
+        });
+
+        Ok(result)
     }
 
-    /// Realize tensor with custom optimizer configuration.
+    /// Realize tensor with custom configuration.
     ///
-    /// Like [`realize()`](Self::realize) but allows specifying optimization strategy:
-    /// - Beam search width
-    /// - Devectorization settings
-    /// - Heuristics configuration
+    /// Like [`realize()`](Self::realize) but allows specifying optimization strategy
+    /// and codegen backend.
     ///
     /// # Example
     ///
     /// ```ignore
+    /// use morok_tensor::PrepareConfig;
     /// use morok_schedule::{OptStrategy, OptimizerConfig};
     ///
     /// let c = a.matmul(&b)?;
-    /// let config = OptimizerConfig::builder()
-    ///     .strategy(OptStrategy::Beam { width: 4 })
-    ///     .devectorize_alu(false)
-    ///     .build();
+    /// let config = PrepareConfig::from(
+    ///     OptimizerConfig::builder()
+    ///         .strategy(OptStrategy::Beam { width: 4 })
+    ///         .build()
+    /// );
     /// let c = c.realize_with(&config)?;
     /// ```
-    pub fn realize_with(self, config: &morok_schedule::OptimizerConfig) -> Result<Self> {
-        let uop = self.uop();
-        let input_buffer_ids: std::collections::HashSet<u64> = collect_input_buffers(&uop).keys().copied().collect();
+    pub fn realize_with(self, config: &PrepareConfig) -> Result<Self> {
+        if self.uop().has_buffer_identity() {
+            return Ok(self.ensure_buffer());
+        }
+
+        let old_uop = self.uop();
+        let input_buffer_ids: std::collections::HashSet<u64> =
+            collect_input_buffers(&old_uop).keys().copied().collect();
 
         let plan = self.prepare_with(config)?;
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
 
-        self.finalize_realize(&plan, &uop, &input_buffer_ids)
+        let result = self.finalize_realize(&plan, &old_uop)?;
+
+        let realized_uop = result.uop();
+        if !Arc::ptr_eq(&old_uop, &realized_uop) {
+            #[allow(clippy::mutable_key_type)]
+            let becomes_map = HashMap::from([(UOpKey(old_uop), realized_uop)]);
+            crate::tensor_registry::apply_map_to_tensors(&becomes_map);
+        }
+
+        plan.release_intermediate_buffers(|uop_id| {
+            if !input_buffer_ids.contains(&uop_id) {
+                crate::tensor_registry::remove_buffer(uop_id);
+            }
+        });
+
+        Ok(result)
     }
 
-    /// Finalize realization: bind output buffer to tensor and cleanup intermediates.
-    fn finalize_realize(
-        &self,
-        plan: &ExecutionPlan,
-        uop: &Arc<UOp>,
-        input_buffer_ids: &std::collections::HashSet<u64>,
-    ) -> Result<Self> {
+    /// Finalize realization: bind output buffer to tensor.
+    ///
+    /// Note: intermediate buffer cleanup is deferred to `realize()` so it
+    /// runs AFTER `apply_map_to_tensors`. This ensures other tensors can still
+    /// find buffers during the substitution window.
+    fn finalize_realize(&self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<Self> {
         let output_buf = plan.output_buffer().clone();
 
         trace!(
@@ -159,15 +208,7 @@ impl Tensor {
         );
 
         self.set_uop(realized_uop);
-        let result = Tensor::with_buffer(Arc::clone(&self.entry), output_buf_arc);
-
-        plan.release_intermediate_buffers(|uop_id| {
-            if !input_buffer_ids.contains(&uop_id) {
-                crate::tensor_registry::remove_buffer(uop_id);
-            }
-        });
-
-        Ok(result)
+        Ok(Tensor::with_buffer(Arc::clone(&self.entry), output_buf_arc))
     }
 
     /// Prepare an execution plan for this tensor's computation graph.
@@ -208,75 +249,50 @@ impl Tensor {
     /// - Kernel compilation fails
     /// - Buffer allocation fails
     pub fn prepare(&self) -> Result<ExecutionPlan> {
-        self.prepare_with(&morok_schedule::OptimizerConfig::from_env())
+        self.prepare_with(&PrepareConfig::from_env())
     }
 
-    /// Prepare an execution plan with explicit optimizer configuration.
+    /// Prepare an execution plan with explicit configuration.
     ///
-    /// This method allows fine-grained control over kernel optimization settings,
-    /// including beam search width, heuristic parameters, and tensor core usage.
+    /// This method allows fine-grained control over kernel optimization settings
+    /// and codegen backend selection.
     ///
     /// # Example
     ///
     /// ```ignore
+    /// use morok_tensor::PrepareConfig;
     /// use morok_schedule::{OptimizerConfig, OptStrategy, BeamConfig};
     ///
     /// // Beam search with width 8 and 120s timeout
-    /// let config = OptimizerConfig::builder()
-    ///     .strategy(OptStrategy::Beam { width: 8 })
-    ///     .beam(BeamConfig::builder()
-    ///         .timeout_secs(120)
-    ///         .build())
-    ///     .build();
+    /// let config = PrepareConfig::from(
+    ///     OptimizerConfig::builder()
+    ///         .strategy(OptStrategy::Beam { width: 8 })
+    ///         .beam(BeamConfig::builder()
+    ///             .timeout_secs(120)
+    ///             .build())
+    ///         .build()
+    /// );
     ///
     /// let plan = tensor.prepare_with(&config)?;
     /// plan.execute(&mut executor)?;
     /// ```
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Optimizer configuration controlling optimization strategy
-    ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Rangeify transformation fails
-    /// - No kernels found after scheduling
-    /// - Kernel compilation fails
-    /// - Buffer allocation fails
-    pub fn prepare_with(&self, config: &morok_schedule::OptimizerConfig) -> Result<ExecutionPlan> {
-        use morok_ir::AxisType;
-
+    pub fn prepare_with(&self, config: &PrepareConfig) -> Result<ExecutionPlan> {
         let uop = self.uop();
-
-        // Step 1: Create BUFFERIZE wrapping the computation
         let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
-
-        let ranges: Vec<_> = shape
-            .iter()
-            .enumerate()
-            .map(|(i, dim)| {
-                let end = match dim {
-                    SInt::Const(n) => UOp::index_const(*n as i64),
-                    SInt::Symbolic(var) => var.clone(),
-                };
-                // Use Loop type (not Outer) so ranges are compatible with rangeify.
-                // Outer is for special cases like vmap batching, not normal computation.
-                UOp::range_axis(end, AxisId::Unrenumbered(i), AxisType::Loop)
-            })
-            .collect();
-
         let output_dtype = uop.dtype();
-        let bufferize = UOp::bufferize_global(uop.clone(), ranges);
 
-        // Step 2: Create SINK of the BUFFERIZE
-        let sink = UOp::sink(vec![bufferize]);
+        // Step 1: Mark computation for realization via CONTIGUOUS (Tinygrad approach).
+        // Ranges are NOT pre-created here — the rangeify pipeline assigns them
+        // via consumer-driven propagation in assign_ranges().
+        let contiguous = uop.contiguous();
+
+        // Step 2: Create SINK of the CONTIGUOUS
+        let sink = UOp::sink(vec![contiguous]);
 
         // Step 3: Run rangeify pipeline
-        // Note: We track becomes_map but don't apply it globally.
-        // The becomes_map contains ALL transformations from rewrite passes including internal
-        // restructuring. Applying it to other tensors could corrupt them. The diamond pattern
-        // issue (like in argmin) needs to be solved within the scheduling logic itself.
+        // Note: The rangeify becomes_map (STORE/INDEX/RANGE nodes) is NOT applied globally —
+        // it would corrupt other tensors. Instead, realize() applies a minimal output-only
+        // becomes_map (old_uop -> realized BUFFER+RESHAPE) after execution.
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let rangeified = rangeify_result.sink;
 
@@ -483,7 +499,7 @@ fn prepare_execution_plan(
     schedule: &Schedule,
     expected_output_dtype: DType,
     expected_output_size: usize,
-    config: &morok_schedule::OptimizerConfig,
+    config: &PrepareConfig,
 ) -> Result<ExecutionPlan> {
     // Expand the schedule to handle OUTER range iterations
     let expanded_schedule = expand_schedule(schedule.clone());
@@ -501,20 +517,22 @@ fn prepare_execution_plan(
         return DependencyCyclesSnafu.fail();
     }
 
-    // Get device from first buffer in first kernel (Tinygrad pattern: ctx[0].device)
+    // Get device via config's resolver (allows per-call backend selection).
     let alloc_registry = morok_device::registry::registry();
     let device = if let Some(first_item) = expanded_schedule.first() {
-        if let Some(first_buffer) = first_item.buffers.first() {
-            let device_spec = first_buffer.allocator().device_spec();
-            morok_runtime::DEVICE_FACTORIES.device(&device_spec, alloc_registry).context(DeviceFactorySnafu)?
-        } else {
-            morok_runtime::DEVICE_FACTORIES.device(&DeviceSpec::Cpu, alloc_registry).context(DeviceFactorySnafu)?
-        }
+        let device_spec = first_item.buffers.first().map(|b| b.allocator().device_spec()).unwrap_or(DeviceSpec::Cpu);
+        config.resolve_device(&device_spec, alloc_registry)?
     } else {
         return EmptyScheduleSnafu.fail();
     };
 
-    let device_str = device.device.canonicalize();
+    // Include compiler cache key in device string to prevent cross-backend cache collisions.
+    // Without this, "CPU" is shared between Clang and LLVM, so switching backends in the
+    // same process would return a kernel compiled by the wrong backend.
+    let device_str = match device.compiler.cache_key() {
+        Some(key) => format!("{}:{}", device.device.canonicalize(), key),
+        None => device.device.canonicalize(),
+    };
 
     // Build the ExecutionPlan using the builder
     let mut builder = ExecutionPlanBuilder::new(device.device.clone());
@@ -551,12 +569,12 @@ fn prepare_execution_plan(
         let optimizer_renderer = get_optimizer_renderer(&device);
 
         // Step 2: Optimize OUTSIDE cache (enables beam search)
-        let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.strategy {
+        let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
             // Beam search: compile-and-time multiple candidates
-            beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, config)?
+            beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, &config.optimizer)?
         } else {
             // Heuristic optimization (default)
-            morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, config)
+            morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
         };
 
         // Step 3: Apply decomposition
@@ -767,8 +785,6 @@ fn beam_search_optimize(
     optimizer_config: &morok_schedule::OptimizerConfig,
 ) -> Result<Arc<UOp>> {
     let beam_config = &optimizer_config.beam;
-    let devectorize_alu = optimizer_config.devectorize_alu;
-
     // Prepare scheduler (applies symbolic simplification and loop→global)
     let mut scheduler = prepare_scheduler(ast, renderer);
 
@@ -803,7 +819,7 @@ fn beam_search_optimize(
             let raw_ast = s.get_optimized_ast(None);
 
             // Apply post-optimization passes for accurate timing
-            let optimized = apply_post_optimization(raw_ast, devectorize_alu);
+            let optimized = apply_post_optimization(raw_ast);
 
             // Post-optimization UOp count filter (matches Tinygrad's BEAM_UOPS_MAX).
             // validate_limits checks pre-optimization AST size, but devectorization
@@ -865,7 +881,7 @@ fn beam_search_optimize(
 
     // Apply post-optimization to final result
     let raw_ast = result.scheduler.get_optimized_ast(None);
-    Ok(apply_post_optimization(raw_ast, devectorize_alu))
+    Ok(apply_post_optimization(raw_ast))
 }
 
 #[cfg(test)]
@@ -873,7 +889,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[tracing_test::traced_test]
     fn test_realize_simple_add() {
         crate::test::helpers::test_setup();
 
@@ -902,7 +917,6 @@ mod tests {
     /// - ReduceAxis → REDUCE transformation following Tinygrad's approach
     /// - REDUCE codegen generates correct LLVM IR
     #[test]
-    #[tracing_test::traced_test]
     fn test_realize_sum() {
         crate::test::helpers::test_setup();
 
@@ -1069,8 +1083,6 @@ mod tests {
         // Prepare the plan
         let plan = c.prepare().expect("prepare should succeed");
 
-        let count_before_cleanup = crate::tensor_registry::buffer_count();
-
         // Execute multiple times (simulating benchmark loop)
         let mut executor = morok_runtime::global_executor();
         for _ in 0..3 {
@@ -1085,13 +1097,14 @@ mod tests {
             .expect("copyout should succeed");
         assert_eq!(data, vec![5.0, 7.0, 9.0]);
 
-        // Now cleanup
+        // Now cleanup — count how many buffers were actually released
+        let count_before_cleanup = crate::tensor_registry::buffer_count();
         plan.release_intermediate_buffers(crate::tensor_registry::remove_buffer);
-
         let count_after_cleanup = crate::tensor_registry::buffer_count();
 
-        // After cleanup, we should have fewer or equal buffers
-        // (intermediate buffers removed)
+        // release_intermediate_buffers should remove at least one buffer (the output buffer)
+        // or at minimum not increase the count. We check the immediate delta to avoid
+        // interference from parallel tests.
         assert!(
             count_after_cleanup <= count_before_cleanup,
             "Cleanup should not increase buffer count: before={}, after={}",

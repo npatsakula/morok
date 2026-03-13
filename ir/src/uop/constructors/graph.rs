@@ -95,7 +95,19 @@ impl UOp {
     }
 
     /// Ensure contiguous memory layout.
+    ///
+    /// Elides the CONTIGUOUS wrapper when the source is already contiguous:
+    /// - Already a CONTIGUOUS node (no double wrapping)
+    /// - Has buffer identity (BUFFER, or RESHAPE/MULTI chain to BUFFER)
+    ///
+    /// Based on Tinygrad's `UOp.contiguous()` (ops.py:463-466).
     pub fn contiguous(self: &Arc<Self>) -> Arc<Self> {
+        if matches!(self.op(), Op::Contiguous { .. }) {
+            return self.clone();
+        }
+        if self.has_buffer_identity() {
+            return self.clone();
+        }
         let dtype = self.dtype();
         Self::new(Op::Contiguous { src: self.clone(), opts: smallvec::SmallVec::new() }, dtype)
     }

@@ -296,6 +296,8 @@ attributes #0 = {{ alwaysinline nounwind "no-builtins" "no-trapping-math"="true"
             body = kernel.join("\n")
         );
 
+        tracing::debug!(generated_code = ir, "llvm codegen: final generated code");
+
         let mut result = RenderedKernel::new(ir, kernel_name.to_string());
         result.buffer_args = buffer_args;
         result.var_names = var_names;

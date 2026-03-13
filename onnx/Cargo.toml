@@ -1,0 +1,24 @@
+[package]
+name = "morok-onnx"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+morok-tensor = { path = "../tensor" }
+morok-ir = { path = "../ir" }
+morok-dtype = { path = "../dtype" }
+prost = "0.14"
+snafu = "0.9"
+tracing = "0.1"
+smallvec = "1.15"
+bytemuck = "1.25"
+
+[build-dependencies]
+prost-build = "0.14"
+
+[dev-dependencies]
+ndarray.workspace = true
+proptest = "1.10"
+test-case = "3.3.1"
+morok-schedule = { path = "../schedule", features = ["testing"] }

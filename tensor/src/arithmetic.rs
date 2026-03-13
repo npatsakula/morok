@@ -1,3 +1,5 @@
+use snafu::ResultExt;
+
 use super::*;
 
 /// Unified macro for implementing Tensor operations.
@@ -49,6 +51,7 @@ impl Tensor {
             try_sub => try_sub,
             try_mul => try_mul,
             try_div => try_div,
+            try_mod => try_mod,
             try_pow => try_pow,
             try_eq => try_cmpeq,
             try_ne => try_cmpne,
@@ -65,7 +68,9 @@ impl Tensor {
             try_sqrt => try_sqrt,
             try_rsqrt => try_rsqrt,
             try_exp => try_exp,
+            try_exp2 => try_exp2,
             try_log => try_log,
+            try_log2 => try_log2,
         }
     }
 

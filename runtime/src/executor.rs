@@ -658,6 +658,7 @@ impl UnifiedExecutor {
                             buffer.index = i,
                             buffer.id = ?buf_id,
                             buffer.dtype = "f32",
+                            buffer.size = num_elems,
                             buffer.values = ?slice,
                             "Buffer contents after kernel"
                         );

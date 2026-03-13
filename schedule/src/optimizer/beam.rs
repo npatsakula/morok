@@ -411,10 +411,13 @@ struct CacheKey {
 impl CacheKey {
     /// Create a cache key from a scheduler and config.
     fn from_scheduler(scheduler: &Scheduler, config: &BeamConfig) -> Self {
-        // Use content-based hash (stable across program runs)
-        // Unlike runtime UOp IDs which reset to 0 each run, content_hash
-        // is computed from AST structure and is deterministic.
-        let ast_hash = scheduler.ast().content_hash();
+        // Use structural hash for cross-run stability. The recursive Hash for UOp
+        // traverses (dtype, op) of the entire DAG — same AST structure produces
+        // the same hash regardless of process-local ids.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        scheduler.ast().hash(&mut hasher);
+        let ast_hash = hasher.finish();
 
         Self { ast_hash, beam_width: config.beam_width, device: scheduler.ren.device.clone() }
     }

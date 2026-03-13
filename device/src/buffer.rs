@@ -5,6 +5,8 @@ use morok_dtype::DType;
 use smallvec::{SmallVec, smallvec};
 
 use crate::allocator::{Allocator, BufferOptions, RawBuffer};
+#[cfg(feature = "cuda")]
+use crate::error::NotCpuAccessibleSnafu;
 use crate::error::{InvalidViewSnafu, Result, SizeMismatchSnafu};
 
 /// Global counter for unique buffer IDs.
@@ -99,7 +101,6 @@ pub struct Buffer {
     /// Data type of the buffer elements.
     dtype: DType,
     /// Shape of the tensor (stack-allocated for 0-4D tensors).
-    #[allow(dead_code)]
     shape: SmallVec<[usize; 4]>,
 }
 
@@ -168,6 +169,60 @@ impl Buffer {
     /// Get the data type.
     pub fn dtype(&self) -> DType {
         self.dtype.clone()
+    }
+
+    /// Get the shape of this buffer.
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Get a byte slice of the buffer data (CPU-accessible buffers only).
+    ///
+    /// Zero-copy. For realized tensors after `realize()`, this is safe because
+    /// the scheduler guarantees no concurrent kernel writes.
+    ///
+    /// # Errors
+    /// - `NotAllocated` if buffer hasn't been allocated
+    /// - `NotCpuAccessible` for CUDA device buffers (use `copyout` instead)
+    pub fn as_host_bytes(&self) -> Result<&[u8]> {
+        self.ensure_allocated()?;
+        let raw = self.data.raw();
+        match raw {
+            RawBuffer::Cpu { data, .. } => {
+                // SAFETY: After realize(), no kernels are executing.
+                // The scheduler guarantees exclusive access during kernel execution;
+                // user code only accesses buffers between kernel runs.
+                let bytes = unsafe { &(&(*data.get()))[self.offset..self.offset + self.size] };
+                Ok(bytes)
+            }
+            #[cfg(feature = "cuda")]
+            _ => NotCpuAccessibleSnafu.fail(),
+        }
+    }
+
+    /// Get a mutable byte slice of the buffer data (CPU-accessible buffers only).
+    ///
+    /// # Safety contract (same as `as_host_bytes`)
+    /// Caller must ensure no kernels are executing concurrently.
+    ///
+    /// # Errors
+    /// - `NotAllocated` if buffer hasn't been allocated
+    /// - `NotCpuAccessible` for CUDA device buffers
+    #[allow(clippy::mut_from_ref)] // interior mutability via UnsafeCell
+    pub fn as_host_bytes_mut(&self) -> Result<&mut [u8]> {
+        self.ensure_allocated()?;
+        let raw = self.data.raw();
+        match raw {
+            RawBuffer::Cpu { data, .. } => {
+                // SAFETY: Same invariant as as_host_bytes — user code only
+                // accesses buffers between kernel runs. UnsafeCell provides
+                // interior mutability through the shared Arc<BufferData>.
+                let bytes = unsafe { &mut (&mut *data.get())[self.offset..self.offset + self.size] };
+                Ok(bytes)
+            }
+            #[cfg(feature = "cuda")]
+            _ => NotCpuAccessibleSnafu.fail(),
+        }
     }
 
     /// Get the allocator used by this buffer.

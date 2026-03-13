@@ -1070,10 +1070,9 @@ impl Scheduler {
             if *count > 1 { format!("{}n{}", name, *count - 1) } else { name }
         };
 
-        // 2. Flatten ranges (using graph_rewrite like Tinygrad)
-        // Note: Tinygrad's default bottom_up=False ≈ Morok's graph_rewrite_bottom_up
+        // 2. Flatten ranges (using top-down graph_rewrite matching Tinygrad's default)
         let flattened_ast =
-            crate::rewrite::graph_rewrite_bottom_up(&crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
+            crate::rewrite::graph_rewrite(&crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
 
         // 3. Attach metadata
         let info = KernelInfo { name, applied_opts: self.applied_opts.clone(), dont_use_locals: self.dont_use_locals };

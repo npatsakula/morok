@@ -85,17 +85,12 @@ fn test_zero_size_index() {
 
 #[test]
 fn test_zero_size_end() {
-    // END with zero ranges
+    // END with zero ranges returns self (Tinygrad-aligned)
     let store = UOp::noop();
     let end = store.clone().end(SmallVec::new());
 
-    // Should create valid END
-    if let Op::End { computation, ranges } = end.op() {
-        assert!(std::sync::Arc::ptr_eq(computation, &store));
-        assert_eq!(ranges.len(), 0);
-    } else {
-        panic!("Expected END operation");
-    }
+    // UOp::end(empty) returns self
+    assert!(std::sync::Arc::ptr_eq(&end, &store), "end(empty) should return self");
 }
 
 #[test]

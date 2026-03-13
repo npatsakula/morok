@@ -75,7 +75,7 @@ pub fn to_static(shape: &Shape) -> Option<SmallVec<[usize; 4]>> {
 /// assert!(validate_shape(&invalid).is_err());
 /// ```
 pub fn validate_shape(shape: &[isize]) -> Result<SmallVec<[usize; 4]>> {
-    ensure!(shape.iter().all(|&s| s > 0), ReshapeNegativeDimensionSnafu { shape });
+    ensure!(shape.iter().all(|&s| s >= 0), ReshapeNegativeDimensionSnafu { shape });
     Ok(shape.iter().map(|&s| s as usize).collect())
 }
 
@@ -263,6 +263,22 @@ pub fn to_vec_usize(shape: &Shape) -> Result<Vec<usize>> {
         .iter()
         .map(|dim| {
             dim.as_const().ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape conversion".to_string() })
+        })
+        .collect()
+}
+
+/// Convert shape to Vec<isize>, ensuring all dimensions are concrete.
+///
+/// # Errors
+///
+/// Returns error if any dimension contains a symbolic (non-const) value.
+pub fn to_vec_isize(shape: &Shape) -> Result<Vec<isize>> {
+    shape
+        .iter()
+        .map(|dim| {
+            dim.as_const()
+                .map(|v| v as isize)
+                .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape conversion".to_string() })
         })
         .collect()
 }

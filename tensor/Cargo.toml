@@ -20,6 +20,7 @@ ndarray.workspace = true
 papaya = "0.2.3"
 parking_lot = "0.12"
 tracing = "0.1"
+strum = { version = "0.28.0", features = ["derive"] }
 
 [features]
 default = []
@@ -30,8 +31,7 @@ tracing-verbose = []
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 test-case = "3.3.1"
-tracing-subscriber = "0.3.22"
-tracing-test = { version = "0.2.5", features = ["no-env-filter"] }
+morok-schedule = { path = "../schedule", features = ["testing"] }
 
 [[bench]]
 name = "optimization"

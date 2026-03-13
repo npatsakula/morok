@@ -24,6 +24,10 @@ pub enum Error {
     #[snafu(display("buffer not allocated"))]
     NotAllocated,
 
+    /// Buffer is not CPU-accessible (device buffers require copyout).
+    #[snafu(display("buffer is not CPU-accessible (device buffers require copyout)"))]
+    NotCpuAccessible,
+
     /// Invalid buffer view parameters.
     #[snafu(display("invalid view: offset {offset} + size {size} exceeds buffer size {buffer_size}"))]
     InvalidView { offset: usize, size: usize, buffer_size: usize },

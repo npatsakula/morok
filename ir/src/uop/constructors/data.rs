@@ -25,9 +25,14 @@ impl UOp {
 
     /// Create a constant UOp with explicit dtype and value.
     ///
+    /// Normalizes the value to match the target dtype (e.g., `Float(5.0)` becomes
+    /// `Int(5)` when dtype is Int32). This prevents codegen from emitting
+    /// mismatched literals.
+    ///
     /// Use `native_const` for type-inferred constants from Rust values.
     pub fn const_(dtype: DType, value: ConstValue) -> Arc<Self> {
-        Self::new(Op::Const(ConstValueHash(value)), dtype)
+        let normalized = value.cast(&dtype).unwrap_or(value);
+        Self::new(Op::Const(ConstValueHash(normalized)), dtype)
     }
 
     /// Create a constant UOp from a Rust native value with automatic dtype inference.

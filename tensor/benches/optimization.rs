@@ -7,7 +7,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use morok_schedule::{HeuristicsConfig, OptStrategy, OptimizerConfig};
-use morok_tensor::Tensor;
+use morok_tensor::{PrepareConfig, Tensor};
 
 /// Create a test matrix of given size with sequential values.
 fn create_matrix(rows: usize, cols: usize) -> Tensor {
@@ -28,12 +28,14 @@ fn bench_matmul(c: &mut Criterion) {
     let mut executor = morok_runtime::global_executor();
 
     // Typed optimizer configurations (no environment variables needed)
-    let heuristic_config = OptimizerConfig::builder()
+    let heuristic_config: PrepareConfig = OptimizerConfig::builder()
         .strategy(OptStrategy::Heuristic)
         .heuristics(HeuristicsConfig::builder().thread_count(4).build())
-        .build();
+        .build()
+        .into();
     const BEAM_WIDTH: usize = 4;
-    let beam_config = OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build();
+    let beam_config: PrepareConfig =
+        OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build().into();
 
     for size in [512] {
         let flops = matmul_flops(size, size, size);

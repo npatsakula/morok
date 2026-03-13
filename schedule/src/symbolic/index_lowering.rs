@@ -33,6 +33,7 @@ fn select_dtype(uop: &Arc<UOp>) -> DType {
     let fits_i32 = match (vmin, vmax) {
         (ConstValue::Int(min), ConstValue::Int(max)) => *min >= i32::MIN as i64 && *max <= i32::MAX as i64,
         (ConstValue::UInt(min), ConstValue::UInt(max)) => *min <= i32::MAX as u64 && *max <= i32::MAX as u64,
+        (ConstValue::Bool(_), ConstValue::Bool(_)) => true,
         _ => false,
     };
     if fits_i32 { DType::Scalar(ScalarDType::Int32) } else { DType::Scalar(ScalarDType::Int64) }
@@ -85,9 +86,11 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         // PHASE 2: Process wrapped values
         // ================================================================
 
-        // Binary(x.cast(Index), y.cast(Index)) → x.cast(dt).alu(op, y.cast(dt)).cast(Index)
+        // Binary(x.cast(Index), y.cast(Index)) → alu(op, x.cast(dt), y.cast(dt)).cast(u.dtype)
         // Tinygrad: x.cast(dt:=least_upper_dtype(select_dtype(u), x.dtype, y.dtype)).alu(u.op, y.cast(dt)).cast(u.dtype)
-        node if node.dtype() == DType::Index && matches!(node.op(), Op::Binary(_, _, _)) => |node| {
+        // No dtype guard on result — comparisons (Lt, Ge, etc.) produce Bool, not Index,
+        // but their operands still need unwrapping from .cast(Index).
+        node if matches!(node.op(), Op::Binary(_, _, _)) => |node| {
             let Op::Binary(op, lhs, rhs) = node.op() else { return None };
 
             // Both operands must be .cast(Index) wrappers
@@ -102,9 +105,9 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             let result_dt = select_dtype(node);
             let dt = least_upper_dtype(&result_dt, &least_upper_dtype(&x.dtype(), &y.dtype()));
 
-            // x.cast(dt).alu(op, y.cast(dt)).cast(Index)
-            let result = UOp::new(Op::Binary(*op, x.cast(dt.clone()), y.cast(dt.clone())), dt);
-            Some(result.cast(DType::Index))
+            // alu() auto-selects Bool for comparisons, dt for arithmetic
+            let result = UOp::alu(*op, x.cast(dt.clone()), y.cast(dt));
+            Some(result.cast(node.dtype()))
         },
 
         // WHERE(cond, x.cast(Index), y.cast(Index)) → WHERE(cond, x.cast(dt), y.cast(dt)).cast(Index)
@@ -213,9 +216,23 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
                 return None;
             };
-            if !matches!(false_val.op(), Op::Invalid) { return None; }
+            if !UOp::is_invalid_marker(false_val) { return None; }
 
             Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(cond.clone()) }, node.dtype()))
+        },
+
+        // INDEX(buf, WHERE(cond, idx, Invalid), gate=existing) → INDEX(buf, idx, gate=AND(existing, cond))
+        // Safety net for multi-dimensional padding where nested WHERE-Invalid merge didn't
+        // fire before index lowering. Combines existing gate with new validity condition.
+        node @ Index { buffer, indices, gate: Some(existing_gate) } if indices.len() == 1 => |node, buffer, indices, existing_gate| {
+            let idx_uop = &indices[0];
+            let Op::Ternary(morok_ir::TernaryOp::Where, cond, idx, false_val) = idx_uop.op() else {
+                return None;
+            };
+            if !UOp::is_invalid_marker(false_val) { return None; }
+
+            let combined_gate = existing_gate.try_and_op(cond).ok()?;
+            Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(combined_gate) }, node.dtype()))
         },
 
         // SINK - strip .cast(Index) from sources

@@ -94,6 +94,10 @@ impl ComparisonAnalyzer {
         y_min: ConstValue,
         y_max: ConstValue,
     ) -> (ConstValue, ConstValue) {
+        let has_nan = [&x_min, &x_max, &y_min, &y_max].iter().any(|v| matches!(v, ConstValue::Float(f) if f.is_nan()));
+        if has_nan {
+            return (ConstValue::Bool(false), ConstValue::Bool(true));
+        }
         match Self::analyze_with_ranges(op, x_min, x_max, y_min, y_max) {
             Some(true) => (ConstValue::Bool(true), ConstValue::Bool(true)),
             Some(false) => (ConstValue::Bool(false), ConstValue::Bool(false)),

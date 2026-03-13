@@ -7,6 +7,82 @@ fn get_shape(tensor: &Tensor) -> Vec<usize> {
 }
 
 // =========================================================================
+// Codegen-required tests
+// =========================================================================
+
+crate::codegen_tests! {
+    fn test_permute_space_to_depth(config) {
+        crate::test::helpers::test_setup();
+        // SpaceToDepth: (1,1,4,6) → reshape (1,1,2,2,3,2) → permute [0,3,5,1,2,4] → reshape (1,4,2,3)
+        let data: Vec<f32> = vec![
+            0., 6., 1., 7., 2., 8., 12., 18., 13., 19., 14., 20., 3., 9., 4., 10., 5., 11., 15., 21., 16., 22., 17., 23.,
+        ];
+        let x = Tensor::from_ndarray(&ndarray::Array4::from_shape_vec((1, 1, 4, 6), data).unwrap());
+
+        let step1 = x.try_reshape(&[1, 1, 2, 2, 3, 2]).unwrap();
+        let step2 = step1.try_permute(&[0, 3, 5, 1, 2, 4]).unwrap();
+        let result = step2.try_reshape(&[1, 4, 2, 3]).unwrap();
+
+        let expected: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        assert_eq!(result.realize_with(&config).unwrap().to_vec::<f32>().unwrap(), expected, "SpaceToDepth reshape+permute+reshape failed");
+    }
+
+    // =========================================================================
+    // Cat Value Tests (regression: fused Concat → elementwise → reduce)
+    // =========================================================================
+
+    fn test_cat_fused_with_reduce(config) {
+        crate::test::helpers::test_setup();
+        let f32_dt = crate::DType::Scalar(morok_dtype::ScalarDType::Float32);
+        // Two realized channel-dim buffers
+        let a = Tensor::full(&[1, 4, 3, 3], 1.0f32, f32_dt.clone()).unwrap().realize_with(&config).unwrap();
+        let b = Tensor::full(&[1, 2, 3, 3], 2.0f32, f32_dt.clone()).unwrap().realize_with(&config).unwrap();
+
+        // Concat along channel dim (lazy)
+        let cat = Tensor::cat(&[&a, &b], 1).unwrap();
+        // Elementwise (lazy)
+        let half = Tensor::full(&[1, 6, 1, 1], 0.5f32, f32_dt).unwrap();
+        let added = cat.try_add(&half).unwrap();
+        let relu = added.relu().unwrap();
+        // Reduce over spatial dims (like GlobalAveragePool)
+        let pooled = relu.mean(vec![2isize, 3]).unwrap();
+
+        let result = pooled.realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+
+        // a channels are 1.0+0.5=1.5 (relu=1.5), b channels are 2.0+0.5=2.5 (relu=2.5)
+        // Mean over 3x3 spatial = same values (all spatial elements identical)
+        assert_eq!(result.len(), 6);
+        for (i, &val) in result.iter().enumerate() {
+            let expected = if i < 4 { 1.5f32 } else { 2.5 };
+            assert!(
+                (val - expected).abs() < 1e-5,
+                "test_cat_fused_with_reduce: element {i}: actual={val}, expected={expected}"
+            );
+        }
+    }
+
+    fn test_cat_fused_with_reduce_large(config) {
+        crate::test::helpers::test_setup();
+        let f32_dt = crate::DType::Scalar(morok_dtype::ScalarDType::Float32);
+        let a = Tensor::full(&[1, 32, 7, 7], 1.0f32, f32_dt.clone()).unwrap().realize_with(&config).unwrap();
+        let b = Tensor::full(&[1, 8, 7, 7], 3.0f32, f32_dt.clone()).unwrap().realize_with(&config).unwrap();
+
+        let cat = Tensor::cat(&[&a, &b], 1).unwrap();
+        let one = Tensor::full(&[1, 40, 1, 1], 1.0f32, f32_dt).unwrap();
+        let added = cat.try_add(&one).unwrap();
+        let relu = added.relu().unwrap();
+        let pooled = relu.mean(vec![2isize, 3]).unwrap();
+
+        let result = pooled.realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        assert_eq!(result.len(), 40);
+        for (i, &val) in result.iter().enumerate() {
+            let expected = if i < 32 { 2.0f32 } else { 4.0 };
+            assert!((val - expected).abs() < 1e-5, "test_cat_fused_large: element {i}: actual={val}, expected={expected}");
+        }
+    }
+}
+
+// =========================================================================
 // Reshape Tests
 // =========================================================================
 
@@ -379,13 +455,17 @@ fn test_lazy_evaluation() {
     let permuted = reshaped.try_permute(&[1, 0]).unwrap();
     let unsqueezed = reshaped.try_unsqueeze(0).unwrap();
 
-    // Movement operations share the same underlying buffer via .base()
-    // They all point to the same buffer (t's buffer)
-    assert!(reshaped.buffer().is_some());
-    assert!(permuted.buffer().is_some());
-    assert!(unsqueezed.buffer().is_some());
+    // Only the original tensor (from_slice) holds a direct buffer reference.
+    // Movement ops are lazy views — they don't carry the buffer at the Tensor level.
+    // This matches Tinygrad: .buffer only traverses RESHAPE, not permute/expand/etc.
+    assert!(t.buffer().is_some());
 
-    // All should share the same buffer ID (same base)
+    // RESHAPE preserves buffer identity (Tinygrad: has_buffer_identity)
+    assert!(reshaped.uop().has_buffer_identity());
+    // PERMUTE and UNSQUEEZE (=RESHAPE+EXPAND) do NOT preserve buffer identity
+    assert!(!permuted.uop().has_buffer_identity());
+
+    // All movement ops share the same .base() — the underlying BUFFER UOp
     assert_eq!(reshaped.uop().base().id, t.uop().base().id);
     assert_eq!(permuted.uop().base().id, t.uop().base().id);
     assert_eq!(unsqueezed.uop().base().id, t.uop().base().id);
@@ -510,4 +590,164 @@ fn test_symbolic_shape_binary_ops() {
 
     assert_eq!(product_shape.len(), 1);
     assert!(product_shape[0].as_const().is_none()); // Still symbolic
+}
+
+// =========================================================================
+// Pad Tests
+// =========================================================================
+
+#[test]
+fn test_pad_1d() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+
+    // Pad with 1 on left, 2 on right
+    let padded = t.try_pad(&[(1, 2)]).unwrap();
+    assert_eq!(get_shape(&padded), vec![6]);
+}
+
+#[test]
+fn test_pad_2d() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+
+    // Pad each dimension
+    let padded = reshaped.try_pad(&[(1, 1), (0, 2)]).unwrap();
+    assert_eq!(get_shape(&padded), vec![4, 5]);
+}
+
+#[test]
+fn test_pad_no_padding() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+
+    // No padding
+    let padded = t.try_pad(&[(0, 0)]).unwrap();
+    assert_eq!(get_shape(&padded), vec![3]);
+}
+
+#[test]
+fn test_pad_empty_is_identity() {
+    let t = Tensor::from_slice([1.0f32]);
+
+    // Empty padding (scalar case)
+    let padded = t.try_pad(&[]).unwrap();
+    assert_eq!(get_shape(&padded), vec![1]);
+}
+
+#[test]
+fn test_pad_error_dimension_mismatch() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+
+    // Wrong number of padding pairs for 1D tensor
+    let result = t.try_pad(&[(0, 0), (0, 0)]);
+    assert!(result.is_err());
+}
+
+// =========================================================================
+// Cat Tests
+// =========================================================================
+
+#[test]
+fn test_cat_1d() {
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let b = Tensor::from_slice([4.0f32, 5.0]);
+
+    let c = Tensor::cat(&[&a, &b], 0).unwrap();
+    assert_eq!(get_shape(&c), vec![5]);
+}
+
+#[test]
+fn test_cat_2d_dim0() {
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2]).unwrap();
+
+    let c = Tensor::cat(&[&a, &b], 0).unwrap();
+    assert_eq!(get_shape(&c), vec![4, 2]);
+}
+
+#[test]
+fn test_cat_2d_dim1() {
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
+    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2]).unwrap();
+
+    let c = Tensor::cat(&[&a, &b], 1).unwrap();
+    assert_eq!(get_shape(&c), vec![2, 4]);
+}
+
+#[test]
+fn test_cat_three_tensors() {
+    let a = Tensor::from_slice([1.0f32]);
+    let b = Tensor::from_slice([2.0f32]);
+    let c = Tensor::from_slice([3.0f32, 4.0]);
+
+    let result = Tensor::cat(&[&a, &b, &c], 0).unwrap();
+    assert_eq!(get_shape(&result), vec![4]);
+}
+
+#[test]
+fn test_cat_negative_axis() {
+    let a = Tensor::from_slice([1.0f32, 2.0]).try_reshape(&[1, 2]).unwrap();
+    let b = Tensor::from_slice([3.0f32, 4.0]).try_reshape(&[1, 2]).unwrap();
+
+    // -1 = last axis
+    let c = Tensor::cat(&[&a, &b], -1).unwrap();
+    assert_eq!(get_shape(&c), vec![1, 4]);
+}
+
+#[test]
+fn test_cat_error_empty() {
+    let result = Tensor::cat(&[], 0);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cat_error_dimension_mismatch() {
+    let a = Tensor::from_slice([1.0f32, 2.0]).try_reshape(&[2]).unwrap();
+    let b = Tensor::from_slice([1.0f32, 2.0]).try_reshape(&[1, 2]).unwrap();
+
+    // Different ranks
+    let result = Tensor::cat(&[&a, &b], 0);
+    assert!(result.is_err());
+}
+
+// =========================================================================
+// Shape Tensor Tests
+// =========================================================================
+
+#[test]
+fn test_shape_tensor_1d() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let shape = t.shape_tensor().unwrap();
+
+    assert_eq!(get_shape(&shape), vec![1]);
+
+    // Verify shape tensor contains [3]
+    assert_eq!(shape.to_vec::<i64>().unwrap(), [3]);
+}
+
+#[test]
+fn test_shape_tensor_2d() {
+    let t = Tensor::from_ndarray(&ndarray::array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+    let shape = t.shape_tensor().unwrap();
+
+    assert_eq!(get_shape(&shape), vec![2]);
+
+    // Verify shape tensor contains [2, 3]
+    assert_eq!(shape.to_vec::<i64>().unwrap(), [2, 3]);
+}
+
+#[test]
+fn test_shape_tensor_3d() {
+    let t = Tensor::from_ndarray(&ndarray::Array3::<f32>::ones((2, 3, 4)));
+    let shape = t.shape_tensor().unwrap();
+
+    assert_eq!(shape.to_vec::<i64>().unwrap(), [2, 3, 4]);
+}
+
+#[test]
+fn test_shape_tensor_dtype() {
+    let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let shape = t.shape_tensor().unwrap();
+
+    // Shape tensor should be int64
+    assert_eq!(shape.uop().dtype(), morok_dtype::DType::Int64);
 }

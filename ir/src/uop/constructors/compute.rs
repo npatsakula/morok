@@ -405,6 +405,16 @@ impl UOp {
         ne => try_cmpne,
     }
 
+    /// Low-level binary op constructor that auto-selects result dtype.
+    ///
+    /// Comparisons produce Bool; everything else inherits `lhs` dtype.
+    /// Matches Tinygrad's `UOp.alu()`. No type promotion or validation —
+    /// use only in rewrites where types are already correct.
+    pub fn alu(op: BinaryOp, lhs: Arc<Self>, rhs: Arc<Self>) -> Arc<Self> {
+        let dtype = if op.is_comparison() { DType::Bool } else { lhs.dtype() };
+        Self::new(Op::Binary(op, lhs, rhs), dtype)
+    }
+
     // =========================================================================
     // Random Operations
     // =========================================================================

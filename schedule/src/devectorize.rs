@@ -29,15 +29,102 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, UnaryOp, WmmaMetadata};
+use morok_ir::{BinaryOp, ConstValue, Op, ReduceOp, TernaryOp, UOp, UOpKey, UnaryOp, WmmaMetadata};
 
 use crate::TypedPatternMatcher;
 use smallvec::SmallVec;
 
-/// Context for REDUCE transformation (Tinygrad devectorizer.py:280-281)
+/// Context for REDUCE transformation (Tinygrad devectorizer.py:280-281).
+///
+/// Tracks END nodes created per reduce-range set so that multiple ENDs sharing
+/// the same ranges can be merged into a single END with a GROUP body.
 #[derive(Debug, Default)]
 pub struct ReduceContext {
-    pub acc_num: u32,
+    range_to_ends: HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>>>,
+}
+
+impl ReduceContext {
+    /// Register an END node under its reduce-range key.
+    pub fn register_end(&mut self, end: &Arc<UOp>) {
+        if let Op::End { ranges, .. } = end.op() {
+            let mut key: SmallVec<[u64; 4]> = ranges.iter().map(|r| r.id).collect();
+            key.sort_unstable();
+            self.range_to_ends.entry(key).or_default().push(end.clone());
+        }
+    }
+
+    /// Merge END nodes that share the same reduce ranges.
+    ///
+    /// For each group of >1 ENDs with identical range sets, creates a single
+    /// `GROUP(computation1, computation2, ...).end(ranges)` and substitutes it
+    /// throughout the SINK subgraph. Clears tracking state after merge.
+    ///
+    /// Matches Tinygrad's `merge_reduce_ends` (devectorizer.py:333-336).
+    pub fn merge_reduce_ends(&mut self, sources: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+        #[allow(clippy::mutable_key_type)]
+        let subs = build_end_merge_subs(&self.range_to_ends);
+        self.range_to_ends.clear();
+        if subs.is_empty() {
+            return None;
+        }
+        Some(UOp::sink(sources.to_vec()).substitute(&subs))
+    }
+}
+
+/// Core merge logic: given a map of range-key → END nodes, build substitutions.
+#[allow(clippy::mutable_key_type)]
+fn build_end_merge_subs(range_to_ends: &HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>>>) -> HashMap<UOpKey, Arc<UOp>> {
+    let mut subs = HashMap::new();
+    for ends in range_to_ends.values() {
+        if ends.len() <= 1 {
+            continue;
+        }
+        let computations: Vec<Arc<UOp>> = ends
+            .iter()
+            .map(|e| match e.op() {
+                Op::End { computation, .. } => computation.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        let ranges = match ends[0].op() {
+            Op::End { ranges, .. } => ranges.clone(),
+            _ => unreachable!(),
+        };
+        let merged = UOp::group(computations).end(ranges);
+        for end in ends {
+            subs.insert(UOpKey(end.clone()), merged.clone());
+        }
+    }
+    subs
+}
+
+/// Merge sibling END nodes that share the same reduce ranges (standalone pass).
+///
+/// Walks the SINK subgraph, discovers all END nodes, groups by range key,
+/// and merges groups of >1 into `GROUP(computations...).end(ranges)`.
+///
+/// This is the same merge as `ReduceContext::merge_reduce_ends` but doesn't
+/// require tracking during pm_reduce — it discovers ENDs from the graph directly.
+/// Needed because later passes (e.g. pm_decomp+pm_render) can create new sibling
+/// ENDs that weren't present when pm_reduce ran.
+pub fn merge_sibling_ends(sink: &Arc<UOp>) -> Arc<UOp> {
+    let Op::Sink { sources } = sink.op() else { return sink.clone() };
+
+    let mut range_to_ends: HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>>> = HashMap::new();
+    for node in sink.toposort() {
+        if let Op::End { ranges, .. } = node.op() {
+            let mut key: SmallVec<[u64; 4]> = ranges.iter().map(|r| r.id).collect();
+            key.sort_unstable();
+            range_to_ends.entry(key).or_default().push(node.clone());
+        }
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    let subs = build_end_merge_subs(&range_to_ends);
+    if subs.is_empty() {
+        return sink.clone();
+    }
+    UOp::sink(sources.to_vec()).substitute(&subs)
 }
 
 use crate::rewrite::graph_rewrite;
@@ -93,6 +180,215 @@ pub fn bool_storage_patterns() -> TypedPatternMatcher {
             let uint8_dtype = load.dtype().with_base(ScalarDType::UInt8);
             let uint8_load = UOp::load().buffer(buffer.clone()).index(index.clone()).dtype(uint8_dtype).call();
             Some(uint8_load.cast(load.dtype()))
+        },
+    }
+}
+
+// ============================================================================
+// FP8 Float Decomposition (Tinygrad: pm_float_decomp, decompositions.py:504-522)
+// ============================================================================
+
+/// Context for FP8 float decomposition.
+/// `from` is the FP8 dtype being decomposed, `to` is the target float dtype.
+#[derive(Debug, Clone)]
+pub struct Fp8DecompCtx {
+    pub from: ScalarDType,
+    pub to: ScalarDType,
+}
+
+/// Round-to-nearest-even for integer bitwise rounding.
+/// Port of Tinygrad's `rne(v, s)` (decompositions.py:383).
+fn rne(v: &Arc<UOp>, s: u32) -> Arc<UOp> {
+    let one = v.const_like(1);
+    let shifted = v.shr(&v.const_like(s));
+    let half_bit = v.shr(&v.const_like(s - 1)).and_(&one);
+    let remainder_mask = v.const_like((1i64 << (s - 1)) - 1);
+    let has_remainder = v.and_(&remainder_mask).ne(&v.const_like(0)).cast(v.dtype());
+    let lsb = shifted.and_(&one);
+    let round_up = half_bit.and_(&has_remainder.or_(&lsb));
+    shifted.try_add(&round_up).expect("rne: add failed")
+}
+
+/// Bitwise float-to-float format conversion.
+/// Port of Tinygrad's `f2f(v, fr, to)` (decompositions.py:385-404).
+///
+/// `v` is a UInt value holding the raw bits of the source float.
+/// Returns a UOp holding raw bits of the target float, which must be bitcast to get the float value.
+fn f2f(v: &Arc<UOp>, fr: ScalarDType, to: ScalarDType) -> Arc<UOp> {
+    let (fe, fm) = fr.finfo();
+    let (te, tm) = to.finfo();
+    let fs = fr.bitsize();
+    let ts = to.bitsize();
+    let fb = fr.exponent_bias() as i64;
+    let tb = to.exponent_bias() as i64;
+    let fr_uint = DType::Scalar(fr.float_to_uint());
+    let to_uint = DType::Scalar(to.float_to_uint());
+
+    if fe <= te && fm < tm {
+        // Upcast path: e.g. FP8 → Float16
+        let sign_mask = v.const_like(1i64 << (fs - 1));
+        let sign = v.and_(&sign_mask).cast(to_uint.clone()).shl(&v.const_like(ts - fs).cast(to_uint.clone()));
+        let nosign_mask = v.const_like((1i64 << (fs - 1)) - 1);
+        let nosign = v.and_(&nosign_mask).cast(to_uint.clone());
+        let exp = nosign.shr(&nosign.const_like(fm));
+        let norm = nosign
+            .shl(&nosign.const_like(tm - fm))
+            .try_add(&nosign.const_like((tb - fb) << tm))
+            .expect("f2f: add failed");
+        let nan_val = nosign.shl(&nosign.const_like(tm - fm)).or_(&nosign.const_like(((1i64 << te) - 1) << tm));
+
+        // FP8E4M3 has a single NaN value (all exponent+mantissa bits set)
+        let is_nan = if fr == ScalarDType::FP8E4M3 {
+            nosign.eq(&nosign.const_like((1i64 << (fm + fe)) - 1))
+        } else {
+            exp.eq(&exp.const_like((1i64 << fe) - 1))
+        };
+
+        let zero = nosign.const_like(0);
+        let exp_is_zero = exp.eq(&zero);
+        let inner = UOp::try_where(is_nan, nan_val, norm).expect("f2f: where failed");
+        let result = UOp::try_where(exp_is_zero, zero, inner).expect("f2f: where failed");
+        sign.or_(&result).bitcast(DType::Scalar(to))
+    } else if fe >= te && fm > tm {
+        // Downcast path: e.g. Float16 → FP8
+        let clamped = f2f_clamp(&v.bitcast(DType::Scalar(fr)), to);
+        let v = clamped.bitcast(fr_uint);
+        let sign = v.shr(&v.const_like(fs - ts)).and_(&v.const_like(1i64 << (ts - 1)));
+        let nosign_mask = v.const_like((1i64 << (fs - 1)) - 1);
+        let nosign = v.and_(&nosign_mask);
+        let norm = rne(&nosign, fm - tm)
+            .try_sub(&nosign.const_like((fb - tb) << tm))
+            .expect("f2f: sub failed")
+            .cast(to_uint.clone());
+
+        let exp_field = nosign.shr(&nosign.const_like(fm)).and_(&nosign.const_like((1i64 << fe) - 1));
+        let underflow = exp_field.lt(&exp_field.const_like(1 + fb - tb));
+
+        let nan_mantissa = if to == ScalarDType::FP8E4M3 {
+            sign.const_like((1i64 << tm) - 1).cast(to_uint.clone())
+        } else {
+            nosign.shr(&nosign.const_like(fm - tm)).and_(&nosign.const_like((1i64 << tm) - 1)).cast(to_uint.clone())
+        };
+        let nan_exp = sign.const_like(((1i64 << te) - 1) << tm).cast(to_uint.clone());
+        let nan = sign.cast(to_uint.clone()).or_(&nan_mantissa).or_(&nan_exp);
+
+        let is_nan = exp_field.eq(&exp_field.const_like((1i64 << fe) - 1));
+        let zero = sign.const_like(0).cast(to_uint.clone());
+        let normal = sign.cast(to_uint.clone()).or_(&UOp::try_where(underflow, zero, norm).expect("f2f: where failed"));
+        UOp::try_where(is_nan, nan, normal).expect("f2f: where failed")
+    } else {
+        panic!("f2f: unsupported conversion {fr:?} -> {to:?}")
+    }
+}
+
+/// Clamp a float value to the representable range of a target FP8 dtype.
+/// Port of Tinygrad's `f2f_clamp` (decompositions.py:406-412).
+fn f2f_clamp(val: &Arc<UOp>, dt: ScalarDType) -> Arc<UOp> {
+    let (e, m) = dt.finfo();
+    let (max_exp, max_man): (i64, i64) =
+        if dt == ScalarDType::FP8E4M3 { ((1 << e) - 1, (1 << m) - 2) } else { ((1 << e) - 2, (1 << m) - 1) };
+    let mx_f64 =
+        f64::powi(2.0, (max_exp - dt.exponent_bias() as i64) as i32) * (1.0 + max_man as f64 / (1i64 << m) as f64);
+    let mx = val.const_like(mx_f64);
+    let neg_mx = val.const_like(-mx_f64);
+
+    // For FP8 types, clamp to ±max; for others, clamp to ±inf
+    let sat = if dt.is_fp8() { mx.clone() } else { val.const_like(f64::INFINITY) };
+    let neg_sat = if dt.is_fp8() { neg_mx.clone() } else { val.const_like(f64::NEG_INFINITY) };
+
+    // nan → nan, < -mx → -sat, > mx → sat, otherwise → val
+    let is_nan = val.ne(val);
+    let below = val.lt(&neg_mx);
+    let above = mx.lt(val);
+    let clamped_above = UOp::try_where(above, sat, val.clone()).expect("f2f_clamp: where failed");
+    let clamped = UOp::try_where(below, neg_sat, clamped_above).expect("f2f_clamp: where failed");
+    UOp::try_where(is_nan, val.clone(), clamped).expect("f2f_clamp: where failed")
+}
+
+/// FP8 STORE decomposition patterns (bpm — sees ORIGINAL children).
+///
+/// The STORE pattern must run in the bpm slot so it sees the ORIGINAL index dtype
+/// (still FP8) before Pattern 1 changes it to UInt8. This is the Morok equivalent
+/// of Tinygrad's `tag` mechanism in `pm_float_decomp`.
+pub fn pm_float_decomp_store() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
+    crate::patterns! {
+        @context Fp8DecompCtx;
+
+        // STORE to FP8 buffer → f2f convert value→UInt8, store
+        // In bpm, index still has FP8 ptr (ORIGINAL children, before Pattern 1 runs).
+        Store { index, value, ranges }
+            if index.dtype().base() == ctx.from
+        => {
+            let target_float = DType::Scalar(ctx.to);
+            let target_uint = DType::Scalar(ctx.to.float_to_uint());
+            // Cast value to target float (handles FP8, Float32, etc. → Float16)
+            let float_val = value.cast(target_float);
+            // Bitwise float→FP8 conversion (includes clamping internally)
+            let result = f2f(&float_val.bitcast(target_uint), ctx.to, ctx.from);
+            // Change index ptr to UInt8
+            let uint8_ptr = index.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()))?;
+            let new_index = index.with_dtype(uint8_ptr);
+            Some(new_index.store_with_ranges(result, ranges.clone()))
+        },
+    }
+}
+
+/// FP8 float decomposition patterns (pm — sees OPTIMIZED children).
+///
+/// Port of Tinygrad's `pm_float_decomp` (decompositions.py:504-522).
+/// Run via `graph_rewrite_with_bpm` together with `pm_float_decomp_store()`.
+pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
+    crate::patterns! {
+        @context Fp8DecompCtx;
+
+        // Pattern 1: INDEX/DEFINE with FP8 ptr base → change ptr to UInt8
+        x if matches!(x.op(), Op::DefineGlobal(_) | Op::DefineLocal(_) | Op::Index { .. })
+            && x.dtype().base() == ctx.from
+        => {
+            let uint8_ptr = x.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()))?;
+            Some(x.with_dtype(uint8_ptr))
+        },
+
+        // Pattern 2: LOAD with FP8 dtype → load as UInt8, f2f upcast to target float
+        load @ Load { buffer, index } if load.dtype().base() == ctx.from => {
+            let uint_dtype = DType::Scalar(ctx.from.float_to_uint());
+            let uint_load = UOp::load().buffer(buffer.clone()).index(index.clone())
+                .dtype(uint_dtype).call();
+            Some(f2f(&uint_load, ctx.from, ctx.to))
+        },
+
+        // Pattern 5: CAST to FP8 → full round-trip (Float16→FP8 bytes→Float16).
+        // Must do the complete conversion (not just clamp) because the kernel may fuse
+        // Cast(Float16→FP8) and Cast(FP8→Float32) without materializing the FP8 buffer.
+        x @ Cast { src: val, .. } if x.dtype().base() == ctx.from => {
+            let target = DType::Scalar(ctx.to);
+            let target_uint = DType::Scalar(ctx.to.float_to_uint());
+            let float_val = val.cast(target);
+            // Downcast: Float16 bits → FP8 bytes (includes clamping)
+            let fp8_bytes = f2f(&float_val.bitcast(target_uint.clone()), ctx.to, ctx.from);
+            // Upcast: FP8 bytes → Float16 (proper FP8-quantized value)
+            Some(f2f(&fp8_bytes, ctx.from, ctx.to))
+        },
+
+        // Pattern 6: Any op with FP8 output dtype → promote to target float, cast FP8 sources
+        x if !matches!(x.op(), Op::BitCast { .. })
+            && x.dtype().is_float()
+            && x.dtype().base() == ctx.from
+        => {
+            let target_dtype = DType::Scalar(ctx.to);
+            let new_dtype = if x.dtype().vcount() > 1 {
+                target_dtype.vec(x.dtype().vcount())
+            } else {
+                target_dtype.clone()
+            };
+            let new_sources: Vec<Arc<UOp>> = x.op().sources().iter().map(|s| {
+                if s.dtype().base() == ctx.from {
+                    s.cast(target_dtype.clone())
+                } else {
+                    s.clone()
+                }
+            }).collect();
+            Some(x.with_sources(new_sources).with_dtype(new_dtype))
         },
     }
 }
@@ -257,9 +553,10 @@ fn devectorize_alu(alu: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:221)
+    // Skip WHERE(cond, t, Invalid) - used for image indexing (devectorizer.py:232)
+    // Handles both scalar Invalid and vectorized VECTORIZE(Invalid,...) from expansion.
     if let Op::Ternary(TernaryOp::Where, _, _, f) = alu.op()
-        && matches!(f.op(), Op::Invalid)
+        && UOp::is_invalid_marker(f)
     {
         return None;
     }
@@ -815,13 +1112,14 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     let buf = if let Op::Vectorize { elements } = buffer.op() { elements.first()?.clone() } else { buffer.clone() };
 
-    // Generate scalar INDEX ops and simplify
+    // Generate scalar INDEX ops and simplify.
     let scalar_indices: Vec<_> = (0..count)
         .map(|i| {
+            let lane_gate = gate.as_ref().map(|g| if g.dtype().vcount() > 1 { g.gep(vec![i]) } else { g.clone() });
             UOp::index()
                 .buffer(buf.clone())
                 .indices(vec![vec.gep(vec![i])])
-                .maybe_gate(gate.clone())
+                .maybe_gate(lane_gate)
                 .ptr(true)
                 .call()
                 .expect("ICE: unable to create index")
@@ -831,13 +1129,26 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let midx = graph_rewrite(&(symbolic() + load_store_indexing_patterns()), UOp::sink(scalar_indices), &mut ());
     let Op::Sink { sources } = midx.op() else { return None };
 
-    // Extract (valid, root, offset) for each lane
-    let mut offsets_by_root: HashMap<(u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
+    // Extract (valid, root, offset, gate) for each lane.
+    // Gate is included in the grouping key so lanes with different gates (e.g., valid vs invalid
+    // from padding) are grouped separately. This ensures PTRCAT groups have uniform gate values.
+    //
+    // Important: collect all lane data first to keep Arc<UOp> refs alive. Temporary UOps
+    // (e.g. const(true) from get_valid()) would get GC'd between loop iterations via the
+    // weak-ref hash consing cache, producing different ids for structurally identical nodes.
+    struct LaneData {
+        valid: Arc<UOp>,
+        root: Arc<UOp>,
+        offset: i64,
+        gate_id: u64,
+    }
+    let mut lane_data: Vec<(usize, LaneData)> = Vec::with_capacity(count);
 
     for (lane, idx_op) in sources.iter().enumerate() {
-        let Op::Index { indices: simp_indices, .. } = idx_op.op() else { continue };
+        let Op::Index { indices: simp_indices, gate: lane_gate, .. } = idx_op.op() else { continue };
         let idx = simp_indices.first()?.get_idx();
         let valid = simp_indices.first()?.get_valid();
+        let gate_id = lane_gate.as_ref().map_or(u64::MAX, |g| g.id);
 
         let (root, offset) = match idx.op() {
             // Invalid grouped separately (devectorizer.py:72-77)
@@ -859,8 +1170,14 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
             _ => (idx.clone(), 0),
         };
 
-        let key = (valid.content_hash(), root.content_hash());
-        offsets_by_root.entry(key).or_default().entry(offset).or_default().push(lane);
+        lane_data.push((lane, LaneData { valid, root, offset, gate_id }));
+    }
+
+    // Now build grouping map — all Arcs are alive so ids are stable
+    let mut offsets_by_root: HashMap<(u64, u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
+    for (lane, data) in &lane_data {
+        let key = (data.valid.id, data.root.id, data.gate_id);
+        offsets_by_root.entry(key).or_default().entry(data.offset).or_default().push(*lane);
     }
 
     // Group consecutive offsets and build PTRCAT
@@ -1374,10 +1691,19 @@ use crate::symbolic::dce::reduce_identity;
 ///
 /// This runs EARLY (before pm_add_loads, before main devectorize) to eliminate
 /// REDUCE before other patterns see it. Matches Tinygrad's pm_reduce.
-pub fn pm_reduce() -> TypedPatternMatcher {
+pub fn pm_reduce() -> TypedPatternMatcher<ReduceContext> {
     crate::patterns! {
+        @context ReduceContext;
+
         // Match ALL REDUCEs - empty ranges handled by returning reduced value directly
-        red @ Reduce(_, ..) => |red| reduce_to_acc(red),
+        red @ Reduce(_, ..) => {
+            reduce_to_acc(red, ctx)
+        },
+
+        // Merge END nodes sharing the same reduce ranges (Tinygrad merge_reduce_ends)
+        Sink { sources: _sources } => {
+            ctx.merge_reduce_ends(_sources)
+        },
     }
 }
 
@@ -1401,7 +1727,7 @@ fn horizontal_reduce(inp: &Arc<UOp>, out_dtype: &DType) -> Vec<Arc<UOp>> {
 }
 
 /// Convert REDUCE to explicit accumulator pattern (devectorizer.py:291-308).
-fn reduce_to_acc(red: &Arc<UOp>) -> Option<Arc<UOp>> {
+fn reduce_to_acc(red: &Arc<UOp>, ctx: &mut ReduceContext) -> Option<Arc<UOp>> {
     let Op::Reduce { src: inp, ranges: reduce_range, reduce_op } = red.op() else { return None };
 
     let lst = horizontal_reduce(inp, &red.dtype());
@@ -1446,6 +1772,7 @@ fn reduce_to_acc(red: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     // return acc.after(acc.index(0).store(ret).end(*reduce_range)).index(0)
     let store_end = make_idx(acc.clone()).store_value(ret).end(reduce_range.clone());
+    ctx.register_end(&store_end);
     Some(make_idx(acc.after(smallvec::smallvec![store_end])))
 }
 

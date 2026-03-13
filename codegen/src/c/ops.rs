@@ -10,7 +10,7 @@ use std::sync::Arc;
 use morok_dtype::{DType, ScalarDType};
 use morok_ir::{AxisType, BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
-use super::types::{c_cast, c_dtype, c_math_fn};
+use super::types::{c_cast, c_const, c_dtype, c_math_fn};
 
 /// Context for C code generation, tracking variable names and SSA inlining.
 pub struct CContext {
@@ -130,27 +130,23 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Index { buffer, indices, gate } => {
+        Op::Index { buffer, indices, .. } => {
             let buf = ctx.get(buffer).to_string();
 
             if indices.is_empty() {
                 // No index - just alias the buffer pointer
                 ctx.register(uop.id, buf);
             } else {
-                let idx = ctx.get(&indices[0]).to_string();
-
-                if let Some(gate_uop) = gate {
-                    let gate_val = ctx.get(gate_uop).to_string();
-                    let elem_type = match uop.dtype() {
-                        DType::Ptr { ref base, .. } => c_dtype(base),
-                        ref other => c_dtype(other),
-                    };
-                    let expr = format!("({gate_val} ? {buf} + {idx} : ({elem_type}*)0)");
-                    ctx.emit_expr(uop, expr, "idx", kernel);
+                // Multi-index: linearize at render time using row-major strides
+                let idx = if indices.len() > 1 {
+                    render_linearize_multi_index_c(indices, ctx)
                 } else {
-                    let expr = format!("{buf} + {idx}");
-                    ctx.emit_expr(uop, expr, "idx", kernel);
-                }
+                    ctx.get(&indices[0]).to_string()
+                };
+                // Gate is NOT rendered here — it's handled at LOAD/STORE level.
+                // Tinygrad: INDEX renders as (buf + idx), LOAD checks gate.
+                let expr = format!("{buf} + {idx}");
+                ctx.emit_expr(uop, expr, "idx", kernel);
             }
             Some(())
         }
@@ -166,13 +162,24 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         Op::Load { index, .. } => {
             let idx = ctx.get(index).to_string();
             let load_dtype = uop.dtype();
-            // Buffer pointers are declared as scalar types (e.g., float*) in C,
-            // so vector loads need an explicit pointer cast (e.g., *((float4*)(ptr))).
-            let expr = if load_dtype.vcount() > 1 {
+            // Check if the INDEX source has a gate — render conditional load to avoid null deref.
+            // Tinygrad: LOAD with gated INDEX → (gate ? *(index) : alt_value)
+            let gate_expr = if let Op::Index { gate: Some(gate_uop), .. } = index.op() {
+                Some(ctx.get(gate_uop).to_string())
+            } else {
+                None
+            };
+            let deref_expr = if load_dtype.vcount() > 1 {
                 let cast_type = c_dtype(&load_dtype);
                 format!("*(({cast_type}*)({idx}))")
             } else {
                 format!("*({idx})")
+            };
+            let expr = if let Some(gate) = gate_expr {
+                let zero = c_const(&morok_ir::types::ConstValue::zero(load_dtype.base()), &load_dtype);
+                format!("({gate} ? {deref_expr} : {zero})")
+            } else {
+                deref_expr
             };
             ctx.emit_expr(uop, expr, "val", kernel);
             Some(())
@@ -327,12 +334,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         Op::Gep { vector, indices } => {
             let vec = ctx.get(vector).to_string();
             if indices.len() == 1 {
-                let expr = format!("{vec}[{}]", indices[0]);
+                // Parenthesize to handle precedence: *((float4*)ptr)[i] → (*((float4*)ptr))[i]
+                let expr = format!("({vec})[{}]", indices[0]);
                 ctx.emit_expr(uop, expr, "gep", kernel);
             } else {
                 // Multi-element GEP: build a new vector from extracted elements
                 let out_dtype = c_dtype(&uop.dtype());
-                let elements: Vec<String> = indices.iter().map(|&i| format!("{vec}[{i}]")).collect();
+                let elements: Vec<String> = indices.iter().map(|&i| format!("({vec})[{i}]")).collect();
                 let expr = format!("({out_dtype}){{{}}}", elements.join(", "));
                 ctx.emit_expr(uop, expr, "gep", kernel);
             }
@@ -341,9 +349,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 
         Op::Vectorize { elements } => {
             let vals: Vec<String> = elements.iter().map(|e| ctx.get(e).to_string()).collect();
-            let out_dtype = c_dtype(&uop.dtype());
-            let expr = format!("({out_dtype}){{{}}}", vals.join(", "));
-            ctx.emit_expr(uop, expr, "vec", kernel);
+            if matches!(uop.dtype(), DType::Ptr { .. }) {
+                // Ptr types can't be vectorized in C (no compound literal for pointers).
+                // All elements should be the same scalar pointer — use the first one.
+                ctx.emit_expr(uop, vals[0].clone(), "vec", kernel);
+            } else {
+                let out_dtype = c_dtype(&uop.dtype());
+                let expr = format!("({out_dtype}){{{}}}", vals.join(", "));
+                ctx.emit_expr(uop, expr, "vec", kernel);
+            }
             Some(())
         }
 
@@ -406,6 +420,34 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             None
         }
     }
+}
+
+/// Linearize multiple index expressions into a single C expression.
+///
+/// Produces `(idx0*stride0 + idx1*stride1 + ...)`.
+fn render_linearize_multi_index_c(indices: &[Arc<UOp>], ctx: &CContext) -> String {
+    use morok_schedule::passes::linearize_index::{compute_row_major_strides, extract_index_dimension};
+
+    let dims: Vec<i64> = indices
+        .iter()
+        .map(|idx| extract_index_dimension(idx).expect("multi-index dimension must be resolvable at codegen"))
+        .collect();
+    let strides = compute_row_major_strides(&dims);
+
+    let mut terms: Vec<String> = Vec::new();
+    for (idx_uop, &stride) in indices.iter().zip(strides.iter()) {
+        if stride == 0 {
+            continue;
+        }
+        let idx_val = ctx.get(idx_uop);
+        if stride == 1 {
+            terms.push(idx_val.to_string());
+        } else {
+            terms.push(format!("({idx_val} * {stride})"));
+        }
+    }
+
+    if terms.is_empty() { "0".to_string() } else { format!("({})", terms.join(" + ")) }
 }
 
 /// Render a binary operation as a C expression.
@@ -492,7 +534,7 @@ fn render_unary(op: UnaryOp, s: &str, dtype: &DType) -> String {
         UnaryOp::Floor => format!("{}({s})", c_math_fn("floor", dtype)),
         UnaryOp::Ceil => format!("{}({s})", c_math_fn("ceil", dtype)),
         UnaryOp::Trunc => format!("{}({s})", c_math_fn("trunc", dtype)),
-        UnaryOp::Round => format!("{}({s})", c_math_fn("round", dtype)),
+        UnaryOp::Round => format!("{}({s})", c_math_fn("rint", dtype)),
         UnaryOp::Erf => format!("{}({s})", c_math_fn("erf", dtype)),
         UnaryOp::Sign => {
             if dtype.is_float() {

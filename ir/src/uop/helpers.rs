@@ -356,20 +356,20 @@ impl UOp {
 
     /// Check if a UOp represents an invalid index marker.
     ///
-    /// Currently uses a sentinel value convention (i64::MIN for Index type).
-    /// This will be replaced with proper ConstValue::Invalid in Phase 5.
+    /// Matches both scalar `Op::Invalid` and vectorized `VECTORIZE(Invalid, ..., Invalid)`
+    /// where ALL elements are Invalid. The vectorized form appears after expansion
+    /// broadcasts scalar Invalid across lanes.
     ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let invalid = UOp::invalid_marker();
-    /// assert!(UOp::is_invalid_marker(&invalid));
-    ///
-    /// let valid_idx = UOp::index_const(5);
-    /// assert!(!UOp::is_invalid_marker(&valid_idx));
-    /// ```
-    fn is_invalid_marker(uop: &Arc<Self>) -> bool {
-        matches!(uop.op(), Op::Invalid)
+    /// Uses `all()` semantics (entire vector must be Invalid). This differs from
+    /// `has_invalid()` in symbolic patterns which uses `any()` for guard semantics.
+    pub fn is_invalid_marker(uop: &Arc<Self>) -> bool {
+        match uop.op() {
+            Op::Invalid => true,
+            Op::Vectorize { elements } => {
+                !elements.is_empty() && elements.iter().all(|e| matches!(e.op(), Op::Invalid))
+            }
+            _ => false,
+        }
     }
 
     /// Create an invalid index marker.

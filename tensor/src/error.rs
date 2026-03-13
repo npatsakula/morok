@@ -46,6 +46,21 @@ pub enum Error {
     SqueezeDimensionNotOne { dim: usize, size: usize },
 
     // =========================================================================
+    // NN Input Validation Errors
+    // =========================================================================
+    #[snafu(display("{op} requires exactly {expected}D input, got {actual}D"))]
+    NdimExact { op: &'static str, expected: usize, actual: usize },
+
+    #[snafu(display("{op} requires at least {min}D input, got {actual}D"))]
+    NdimMinimum { op: &'static str, min: usize, actual: usize },
+
+    #[snafu(display("{op}: {lhs_name} ({lhs}) must be divisible by {rhs_name} ({rhs})"))]
+    Divisibility { op: &'static str, lhs_name: &'static str, lhs: usize, rhs_name: &'static str, rhs: usize },
+
+    #[snafu(display("{op}: {param} = {value} is invalid, expected {constraint}"))]
+    ParamRange { op: &'static str, param: &'static str, value: String, constraint: &'static str },
+
+    // =========================================================================
     // Reduction Errors
     // =========================================================================
     #[snafu(display("Cannot specify both 'dtype' and 'promote=true' in reduction operation"))]
@@ -139,6 +154,12 @@ pub enum Error {
 
     #[snafu(display("Tensor has no shape"))]
     NoShape,
+
+    #[snafu(display("Shape mismatch for '{context}': expected {expected}, got {actual}"))]
+    ShapeMismatch { context: String, expected: String, actual: String },
+
+    #[snafu(display("IR construction error: {details}"))]
+    IrConstruction { details: String },
 
     #[snafu(display("Type mismatch: expected {expected:?}, got {actual:?}"))]
     TypeMismatch { expected: morok_dtype::DType, actual: morok_dtype::DType },

@@ -1,10 +1,10 @@
 use bon::bon;
-use snafu::ResultExt;
 use std::sync::Arc;
 
-use morok_device::{Buffer, registry};
+use morok_device::Buffer;
+use morok_dtype::DType;
 use morok_dtype::ext::HasDType;
-use morok_ir::{DeviceSpec, SInt, UOp, shape::Shape};
+use morok_ir::{ConstValue, DeviceSpec, SInt, UOp, shape::Shape};
 
 pub mod error;
 use error::*;
@@ -14,18 +14,52 @@ pub mod arithmetic;
 pub mod bitwise;
 pub mod broadcast;
 pub mod conditional;
+pub mod config;
+pub mod data;
+pub mod einsum;
+pub mod indexing;
 pub mod math;
 pub mod matmul;
 pub mod memory_planner;
+pub mod nn;
 pub mod realize;
 pub mod reduce;
 pub mod schedule;
 pub mod shape_ops;
 pub mod tensor_registry;
 pub mod traits;
+pub mod transformer;
 
 // Re-export for public API
+pub use config::PrepareConfig;
+pub use morok_runtime::CpuBackend;
 pub use tensor_registry::apply_map_to_tensors;
+
+/// Reduction operations supported by cumulative reduce (`_cumalu`).
+#[derive(Debug, Clone, Copy)]
+enum CumReduceOp {
+    Add,
+    Mul,
+    #[allow(dead_code)]
+    Max,
+}
+
+impl CumReduceOp {
+    /// Identity element for this operation as f64, used as pad fill value.
+    fn identity_value(&self, dtype: DType) -> f64 {
+        match self {
+            CumReduceOp::Add => 0.0,
+            CumReduceOp::Mul => 1.0,
+            CumReduceOp::Max => {
+                if dtype.is_int() {
+                    i64::MIN as f64
+                } else {
+                    f64::NEG_INFINITY
+                }
+            }
+        }
+    }
+}
 
 /// Information about a rendered kernel.
 ///
@@ -87,7 +121,6 @@ impl Clone for Tensor {
     }
 }
 
-#[bon]
 impl Tensor {
     /// Create tensor without buffer (for lazy computation graphs).
     fn new(uop: Arc<UOp>) -> Self {
@@ -100,13 +133,20 @@ impl Tensor {
         Self { entry, buffer: Some(buffer) }
     }
 
-    /// Create a new tensor from a UOp, preserving buffer from self.
+    /// Ensure buffer is attached if the UOp has buffer identity.
     ///
-    /// Used by movement operations (reshape, permute, etc.) that create
-    /// new view UOps but share the underlying buffer.
-    fn with_same_buffer(&self, uop: Arc<UOp>) -> Self {
-        let entry = tensor_registry::register_tensor(uop);
-        Self { entry, buffer: self.buffer.clone() }
+    /// When `apply_map_to_tensors` substitutes a tensor's UOp with a realized
+    /// BUFFER+RESHAPE, the Tensor struct's `buffer` field isn't updated.
+    /// This method looks up the buffer from the registry and attaches it.
+    pub(crate) fn ensure_buffer(mut self) -> Self {
+        if self.buffer.is_none() {
+            let buffer_id = self.uop().base().id;
+            if let Some(buf_arc) = tensor_registry::get_buffer_arc(buffer_id) {
+                self.entry.set_buffer(Arc::clone(&buf_arc));
+                self.buffer = Some(buf_arc);
+            }
+        }
+        self
     }
 
     /// Get the current UOp for this tensor.
@@ -125,128 +165,179 @@ impl Tensor {
         Vec::new()
     }
 
-    /// Create 1D tensor with evenly spaced values.
+    /// Create an empty (0-element) tensor with the given dtype and shape `[0]`.
+    ///
+    /// Matches Tinygrad's `Tensor([], dtype=dtype)`. No buffer is allocated.
+    pub fn empty(dtype: DType) -> Self {
+        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 0, dtype);
+        let shape = Shape::from_iter([SInt::Const(0)]);
+        let uop = buffer_uop.try_reshape(&shape).expect("empty reshape to [0]");
+        Self::new(uop)
+    }
+
+    /// Create a tensor filled with a constant value, broadcast to the given shape.
+    pub fn full(shape: &[usize], value: impl Into<ConstValue>, dtype: DType) -> Result<Self> {
+        let scalar = Self::const_(value, dtype);
+        if shape.is_empty() {
+            return Ok(scalar);
+        }
+        let expand_shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
+        scalar.try_reshape(&vec![1; shape.len()])?.try_expand(&expand_shape)
+    }
+
+    /// Cumulative reduce along an axis using a sliding-window approach.
+    ///
+    /// Decomposes prefix-sum/prefix-max/prefix-prod into existing ops:
+    /// pad → pool (sliding windows) → reduce. Fully lazy, O(1) graph nodes.
+    fn _cumalu(&self, axis: isize, reduce: CumReduceOp) -> Result<Self> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let axis_idx = Self::normalize_axis(axis, ndim)?;
+        let n = shape[axis_idx]
+            .as_const()
+            .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "_cumalu".to_string() })?;
+
+        if n <= 1 {
+            return Ok(self.clone());
+        }
+
+        // 1. Transpose target axis to last
+        let x = if axis_idx != ndim - 1 { self.try_transpose(axis_idx as isize, -1)? } else { self.clone() };
+
+        // 2. Pad left with (n-1) identity elements
+        let identity = reduce.identity_value(self.uop().dtype());
+        let mut padding = vec![(0isize, 0isize); ndim];
+        padding[ndim - 1] = ((n - 1) as isize, 0);
+        let x = x.try_pad_value(&padding, identity)?;
+
+        // 3. Pool with kernel=n, stride=1
+        let x = x.pool(&[n], &[1], &[1])?;
+
+        // 4. Reduce last dim
+        let x = match reduce {
+            CumReduceOp::Add => x.sum(-1isize)?,
+            CumReduceOp::Mul => x.prod(-1isize)?,
+            CumReduceOp::Max => x.max(-1isize)?,
+        };
+
+        // 5. Transpose back
+        if axis_idx != ndim - 1 { x.try_transpose(axis_idx as isize, -1) } else { Ok(x) }
+    }
+
+    /// Cumulative sum along an axis.
+    pub fn cumsum(&self, axis: isize) -> Result<Self> {
+        self._cumalu(axis, CumReduceOp::Add)
+    }
+
+    /// Cumulative product along an axis.
+    pub fn cumprod(&self, axis: isize) -> Result<Self> {
+        self._cumalu(axis, CumReduceOp::Mul)
+    }
+
+    /// Create 1D tensor with evenly spaced values and explicit dtype.
     ///
     /// Generates values in the range `[start, stop)` with given step size.
     /// If `stop` is None, treats `start` as stop and starts from 0.
     ///
-    /// # Arguments
-    /// * `start` - Starting value (or stop value if `stop` is None)
-    /// * `stop` - Ending value (exclusive), defaults to None
-    /// * `step` - Step size, defaults to 1
+    /// Uses lazy `full(step)._cumalu(0, Add) + (start - step)` which
+    /// `reduce_collapse` simplifies into `RANGE * step + offset`.
+    /// Create 1D tensor with evenly spaced values (integer parameters).
     ///
-    /// # Examples
-    /// ```ignore
-    /// let t = Tensor::arange(5, None, None)?;         // [0, 1, 2, 3, 4]
-    /// let t = Tensor::arange(2, Some(10), Some(2))?;  // [2, 4, 6, 8]
-    /// let t = Tensor::arange(10, Some(0), Some(-2))?; // [10, 8, 6, 4, 2]
-    /// ```
-    pub fn arange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<Self> {
-        // Handle start/stop convention: arange(5) = arange(0, 5, 1)
-        let (actual_start, actual_stop) = match stop {
+    /// Matches Tinygrad's `Tensor.arange()`: `full(step) → cumsum → + (start - step)`.
+    pub fn arange_with_dtype(start: i64, stop: Option<i64>, step: Option<i64>, dtype: DType) -> Result<Self> {
+        let (start, stop) = match stop {
             Some(s) => (start, s),
             None => (0, start),
         };
-
-        let actual_step = step.unwrap_or(1);
-
-        // Calculate number of elements
-        if actual_step == 0 {
+        let step = step.unwrap_or(1);
+        if step == 0 {
             return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
         }
-
-        let count = if actual_step > 0 {
-            if actual_stop <= actual_start {
-                0
-            } else {
-                ((actual_stop - actual_start + actual_step - 1) / actual_step) as usize
-            }
-        } else if actual_stop >= actual_start {
-            0
-        } else {
-            ((actual_start - actual_stop - actual_step - 1) / (-actual_step)) as usize
-        };
-
-        // Generate values
-        let values: Vec<i32> = (0..count).map(|i| (actual_start + i as i64 * actual_step) as i32).collect();
-
-        // Create tensor from values
-        Ok(Self::from_slice(&values))
+        Self::arange_inner(start as f64, stop as f64, step as f64, dtype, false)
     }
 
-    /// Create tensor from slice on CPU (default device).
+    /// Create 1D tensor with evenly spaced Int32 values.
+    pub fn arange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<Self> {
+        Self::arange_with_dtype(start, stop, step, DType::Int32)
+    }
+
+    /// Create 1D tensor with evenly spaced values (float parameters).
     ///
-    /// For explicit device specification, use `from_slice_with`.
+    /// Handles float start/stop/step natively, matching Tinygrad's `Tensor.arange()`.
+    pub fn arange_f64(start: f64, stop: f64, step: f64, dtype: DType) -> Result<Self> {
+        if step == 0.0 {
+            return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
+        }
+        Self::arange_inner(start, stop, step, dtype, true)
+    }
+
+    /// Create 1D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
+    pub fn linspace(start: f64, end: f64, steps: usize, dtype: DType) -> Result<Self> {
+        if steps == 0 {
+            return Ok(Self::empty(dtype));
+        }
+        if steps == 1 {
+            return Self::full(&[1], start, dtype);
+        }
+        let t = Self::arange(steps as i64, None, None)?;
+        let scale = Self::const_((end - start) / (steps as f64 - 1.0), DType::Float64);
+        let offset = Self::const_(start, DType::Float64);
+        t.cast(DType::Float64)?.try_mul(&scale)?.try_add(&offset)?.cast(dtype)
+    }
+
+    /// Shared implementation: `full(count, step) → cumsum → + (start - step)`.
+    fn arange_inner(start: f64, stop: f64, step: f64, dtype: DType, is_float: bool) -> Result<Self> {
+        let count = ((stop - start) / step).ceil() as i64;
+        if count <= 0 {
+            return Ok(Self::empty(dtype));
+        }
+        let count = count as usize;
+        let val = |v: f64| if is_float { ConstValue::Float(v) } else { ConstValue::Int(v as i64) };
+        let step_tensor = Self::full(&[count], val(step), dtype.clone())?;
+        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
+        let offset = Self::const_(val(start - step), dtype.clone());
+        cumsum.try_add(&offset)?.cast(dtype)
+    }
+
+    // === Constant Constructors ===
+
+    /// Create a scalar constant tensor.
+    ///
+    /// Creates a 0-dimensional tensor containing a single constant value.
+    /// The constant is embedded directly in the IR and does not allocate
+    /// a buffer until realized (if needed).
+    ///
+    /// # Arguments
+    /// * `value` - The constant value (will be converted to ConstValue)
+    /// * `dtype` - The data type for the tensor
     ///
     /// # Examples
     /// ```ignore
-    /// let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// assert_eq!(a.device(), DeviceSpec::Cpu);
+    /// // Float constant
+    /// let pi = Tensor::const_(3.14159, DType::Float32);
+    ///
+    /// // Integer constant
+    /// let forty_two = Tensor::const_(42i64, DType::Int64);
     /// ```
-    pub fn from_slice<T: HasDType, C: AsRef<[T]>>(source: C) -> Self {
-        Self::from_slice_on(source, DeviceSpec::Cpu)
+    pub fn const_<T: Into<ConstValue>>(value: T, dtype: DType) -> Self {
+        let const_val = value.into();
+        let uop = UOp::const_(dtype, const_val);
+        Self::new(uop)
     }
 
-    /// Create tensor from slice with explicit device specification using builder pattern.
+    /// Create a scalar constant tensor with dtype auto-inferred from value.
+    ///
+    /// Convenience method that infers dtype from the Rust type.
     ///
     /// # Examples
     /// ```ignore
-    /// // CPU tensor with builder
-    /// let a = Tensor::from_slice_with(&[1.0f32, 2.0, 3.0]).call();
-    ///
-    /// // Explicit device
-    /// let b = Tensor::from_slice_with(&[1.0f32, 2.0, 3.0])
-    ///     .device(DeviceSpec::Cuda { device_id: 0 })
-    ///     .call();
+    /// let f = Tensor::from_const(3.14f32);  // DType::Float32
+    /// let i = Tensor::from_const(42i32);    // DType::Int32
+    /// let b = Tensor::from_const(true);     // DType::Bool
     /// ```
-    #[builder]
-    pub fn from_slice_with<T: HasDType, C: AsRef<[T]>>(
-        source: C,
-        #[builder(default = DeviceSpec::Cpu)] device: DeviceSpec,
-    ) -> Self {
-        Self::from_slice_on(source, device)
-    }
-
-    /// Internal: Create tensor from slice on specified device.
-    fn from_slice_on<T: HasDType, C: AsRef<[T]>>(source: C, device: DeviceSpec) -> Self {
-        let source = source.as_ref();
-        let shape = Shape::from_iter([SInt::Const(source.len())]);
+    pub fn from_const<T: Into<ConstValue> + HasDType>(value: T) -> Self {
         let dtype = T::DTYPE;
-
-        let buffer_uop = UOp::new_buffer(device.clone(), source.len(), dtype.clone());
-        let buffer_uop_id = buffer_uop.id;
-
-        // Get allocator for specified device
-        let allocator = match &device {
-            DeviceSpec::Cpu => registry::cpu().expect("CPU always should be accessible"),
-            // For non-CPU devices, try to get from registry or fall back to CPU for now
-            _ => registry::cpu().expect("CPU fallback for unsupported device"),
-        };
-
-        let mut buffer = Buffer::new(allocator, dtype.clone(), vec![source.len()], Default::default());
-        let bytes = unsafe { std::slice::from_raw_parts(source.as_ptr() as *const u8, source.len() * dtype.bytes()) };
-        buffer.copyin(bytes).expect("Buffer write always successful");
-
-        // Wrap buffer in Arc for RAII ownership
-        let buffer_arc = Arc::new(buffer);
-
-        let uop = buffer_uop.try_reshape(&shape).expect("this reshape is always successful");
-
-        // Register tensor with buffer (also adds to buffer index for schedule lookups)
-        let entry = tensor_registry::register_tensor_with_buffer(uop, buffer_arc.clone(), buffer_uop_id);
-        Self::with_buffer(entry, buffer_arc)
-    }
-
-    /// Get a reference to the underlying buffer.
-    ///
-    /// Tensors own their buffers via RAII. Input tensors get their buffer
-    /// from `from_slice()`, realized tensors get theirs from `realize()`.
-    ///
-    /// Returns `None` for lazy tensors that haven't been realized yet.
-    /// Returns `Some(buffer)` for input tensors and realized tensors.
-    pub fn buffer(&self) -> Option<Buffer> {
-        // Tensor-owned buffer via RAII (no locks, no registry lookup)
-        self.buffer.as_ref().map(|arc_buf| (**arc_buf).clone())
+        Self::const_(value, dtype)
     }
 
     /// Get device specification from underlying UOp graph.
@@ -296,56 +387,9 @@ impl Tensor {
         Ok(Self::new(casted))
     }
 
-    /// Extract data as ndarray::ArrayD<T> (for testing).
-    ///
-    /// This method is primarily intended for testing and validation.
-    /// It extracts the computed tensor data into an ndarray with the proper shape.
-    ///
-    /// # Type Parameters
-    /// * `T` - The output type, must implement HasDType and match the tensor's dtype
-    ///
-    /// # Examples
-    /// ```ignore
-    /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    /// let result = t.realize()?.to_ndarray::<f32>()?;
-    /// assert_eq!(result.shape(), &[3]);
-    /// ```
-    ///
-    /// # Errors
-    /// Returns error if:
-    /// - Tensor has no buffer (unrealized)
-    /// - Type T doesn't match tensor's dtype
-    /// - Shape cannot be extracted
-    /// - Buffer read fails
-    pub fn to_ndarray<T: HasDType + Default + Clone>(&self) -> Result<ndarray::ArrayD<T>> {
-        use ndarray::{ArrayD, IxDyn};
-
-        // Get buffer
-        let buffer = self.buffer().ok_or(Error::NoBuffer)?;
-
-        // Validate dtype matches
-        if buffer.dtype() != T::DTYPE {
-            return TypeMismatchSnafu { expected: T::DTYPE, actual: buffer.dtype() }.fail();
-        }
-
-        // Get shape
-        let uop = self.uop();
-        let shape = uop.shape().context(UOpSnafu)?.ok_or(Error::NoShape)?;
-
-        // Convert shape to usize dimensions
-        let dims: Vec<usize> = shape.iter().map(|dim| dim.as_const().unwrap_or(1)).collect();
-
-        // Extract data
-        let count = buffer.size() / T::DTYPE.bytes();
-        let mut data = vec![T::default(); count];
-        buffer
-            .copyout(unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, count * T::DTYPE.bytes()) })
-            .context(DeviceSnafu)?;
-
-        // Create ndarray with proper shape
-        let arr = ArrayD::from_shape_vec(IxDyn(&dims), data).context(NdarrayShapeSnafu)?;
-
-        Ok(arr)
+    /// Bitcast tensor to a different dtype (reinterpret bits, same byte size required).
+    pub fn bitcast(&self, dtype: morok_dtype::DType) -> Result<Self> {
+        Ok(Self::new(self.uop().bitcast(dtype)))
     }
 
     /// Update the UOp for this tensor directly.
@@ -354,6 +398,123 @@ impl Tensor {
     /// to point to the materialized buffer.
     pub(crate) fn set_uop(&self, uop: Arc<UOp>) {
         *self.entry.uop.write() = uop;
+    }
+
+    /// Ensure this tensor has contiguous memory layout.
+    ///
+    /// Creates a CONTIGUOUS UOp that forces materialization when realized.
+    /// Following Tinygrad's approach, calling `.contiguous().realize()` on
+    /// a pure constant tensor will create an actual buffer.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// // Force a constant to be materialized
+    /// let c = Tensor::const_(5.0f32, DType::Float32);
+    /// let realized = c.contiguous().realize()?;
+    /// assert!(realized.buffer().is_some());
+    /// ```
+    pub fn contiguous(&self) -> Self {
+        let uop = self.uop();
+        if matches!(uop.op(), morok_ir::Op::Contiguous { .. }) {
+            return self.clone();
+        }
+        let contiguous_uop = uop.contiguous();
+        Self::new(contiguous_uop)
+    }
+}
+
+impl Tensor {
+    /// Helper to broadcast a scalar constant to match this tensor's shape.
+    pub(crate) fn broadcast_scalar(&self, value: ConstValue) -> Result<Self> {
+        let shape = self.shape()?;
+        let scalar = Self::new(UOp::const_(self.uop().dtype(), value));
+        scalar.broadcast_to(&shape)
+    }
+
+    /// Broadcast a dtype-aware zero to match this tensor's shape.
+    pub fn zero(&self) -> Result<Self> {
+        let sdtype = self.uop().dtype().scalar().expect("scalar dtype");
+        self.broadcast_scalar(ConstValue::zero(sdtype))
+    }
+
+    /// Broadcast a dtype-aware one to match this tensor's shape.
+    pub fn one(&self) -> Result<Self> {
+        let sdtype = self.uop().dtype().scalar().expect("scalar dtype");
+        self.broadcast_scalar(ConstValue::one(sdtype))
+    }
+
+    /// Identity matrix of shape `[n, m]` with the given dtype.
+    pub fn eye(n: usize, m: usize, dtype: DType) -> Result<Self> {
+        let rows = Self::arange(n as i64, None, None)?.try_unsqueeze(-1)?;
+        let cols = Self::arange(m as i64, None, None)?;
+        rows.try_eq(&cols)?.cast(dtype)
+    }
+}
+
+#[bon]
+impl Tensor {
+    /// Cumulative sum with exclusive and reverse options.
+    #[builder]
+    pub fn cumsum_with(
+        &self,
+        axis: isize,
+        #[builder(default = false)] exclusive: bool,
+        #[builder(default = false)] reverse: bool,
+    ) -> Result<Self> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let axis_idx = Self::normalize_axis(axis, ndim)?;
+        let mut result = self.clone();
+        if reverse {
+            result = result.flip(&[axis_idx as isize])?;
+        }
+        if exclusive {
+            let dim_size = shape[axis_idx].as_const().unwrap() as isize;
+            let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
+            pad_spec[axis_idx] = (1, 0);
+            result = result.try_pad(&pad_spec)?;
+            let mut shrink_spec: Vec<(isize, isize)> =
+                result.shape()?.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            shrink_spec[axis_idx] = (0, dim_size);
+            result = result.try_shrink(&shrink_spec)?;
+        }
+        result = result.cumsum(axis_idx as isize)?;
+        if reverse {
+            result = result.flip(&[axis_idx as isize])?;
+        }
+        Ok(result)
+    }
+
+    /// Cumulative product with exclusive and reverse options.
+    #[builder]
+    pub fn cumprod_with(
+        &self,
+        axis: isize,
+        #[builder(default = false)] exclusive: bool,
+        #[builder(default = false)] reverse: bool,
+    ) -> Result<Self> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let axis_idx = Self::normalize_axis(axis, ndim)?;
+        let mut result = self.clone();
+        if reverse {
+            result = result.flip(&[axis_idx as isize])?;
+        }
+        if exclusive {
+            let dim_size = shape[axis_idx].as_const().unwrap() as isize;
+            let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); ndim];
+            pad_spec[axis_idx] = (1, 0);
+            result = result.try_pad_value(&pad_spec, 1.0)?;
+            let mut shrink_spec: Vec<(isize, isize)> =
+                result.shape()?.iter().map(|s| (0, s.as_const().unwrap() as isize)).collect();
+            shrink_spec[axis_idx] = (0, dim_size);
+            result = result.try_shrink(&shrink_spec)?;
+        }
+        result = result.cumprod(axis_idx as isize)?;
+        if reverse {
+            result = result.flip(&[axis_idx as isize])?;
+        }
+        Ok(result)
     }
 }
 

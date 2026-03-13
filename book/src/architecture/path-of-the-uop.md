@@ -283,42 +283,7 @@ The compiler only merges if it saves operations. Merging might require division/
 
 ---
 
-### Stage 6: Split Store (CPU-only)
-
-> **Stage at a Glance**
->
-> **Goal**: Avoid branch misprediction by splitting conditional stores
-> **Key Patterns**: Split store ranges at comparison boundaries
-> **Impact**: More predictable CPU execution
-
-**What This Does**: Splits store ranges at conditional boundaries when there are `CMPLT(range, const)` comparisons in the store's consumer map.
-
-**Why This Matters**: Branch misprediction slows down CPUs. Instead of one loop with an `if` statement that the CPU can't predict, we create two loops without conditionals. Each loop does predictable work, so the CPU stays fast.
-
-**Pattern**: `pm_split_store`
-
-```text
-// Before: Store with conditional (branch misprediction risk)
-for i in 0..100:
-    if i < 50:
-        output[i] = data[i]
-
-// After: Two unconditional stores (predictable)
-for i in 0..50:   // First loop
-    output[i] = data[i]
-for i in 50..100: // Second loop
-    output[i] = data[i]
-```
-
-The transformation finds constant comparison points in the store's consumer map and creates disjoint ranges for each segment.
-
-Skipped for GPU devices—they handle conditionals differently.
-
-**Morok**: `pm_split_store()` in `rangeify/transforms.rs`
-
----
-
-### Stage 7: Apply Opts
+### Stage 6: Apply Opts
 
 > **Stage at a Glance**
 >

@@ -5,7 +5,7 @@
 
 use bon::bon;
 use morok_dtype::{DType, ScalarDType};
-use morok_ir::{ReduceOp, UOp};
+use morok_ir::{ConstValue, ReduceOp, UOp};
 use snafu::ResultExt;
 
 use crate::{
@@ -172,10 +172,11 @@ impl Tensor {
 impl Tensor {
     /// Sum of tensor elements over given axes.
     ///
-    /// Preserves input dtype. Use `sum_with().promote(true)` or `.dtype(...)` for different accumulation.
+    /// Auto-promotes accumulation dtype (bool→int32, float16→float32) like Tinygrad.
+    /// Use `sum_with().promote(false)` to preserve input dtype.
     #[track_caller]
     pub fn sum(&self, axes: impl Into<AxisSpec>) -> Result<Self> {
-        reduce_internal(self, ReduceOp::Add, axes.into(), false, None, false)
+        reduce_internal(self, ReduceOp::Add, axes.into(), false, None, true)
     }
 
     /// Sum with additional options (keepdim, dtype, promote).
@@ -423,6 +424,27 @@ impl Tensor {
         argmax_impl(self, axis.into(), keepdim)
     }
 
+    /// Hard maximum: one-hot encoding of the argmax along an axis.
+    ///
+    /// Returns a tensor of the same shape with 1.0 at the position of the
+    /// maximum value along `axis` and 0.0 elsewhere, cast to the input dtype.
+    #[track_caller]
+    pub fn hardmax(&self, axis: isize) -> Result<Self> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let norm_axis = Self::normalize_axis(axis, ndim)?;
+        let axis_size = shape[norm_axis].as_const().ok_or_else(|| crate::error::Error::SymbolicShapeUnsupported {
+            operation: format!("hardmax axis {norm_axis}"),
+        })?;
+        self.argmax_with()
+            .axis(Some(axis))
+            .keepdim(false)
+            .call()?
+            .try_unsqueeze(axis)?
+            .one_hot_along_dim(axis_size, axis)?
+            .cast(self.uop().dtype())
+    }
+
     /// Index of minimum value along axis.
     ///
     /// Returns int32 tensor with indices of minimum values.
@@ -505,7 +527,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
         .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "argmax".to_string() })?;
 
     // Convert shape to isize vec once for reuse in expand operations
-    let shape_vec: Vec<isize> = shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+    let shape_vec = morok_ir::shape::to_vec_isize(&shape).context(UOpSnafu)?;
 
     // Step 1: Find maximum values along axis (with keepdim for broadcasting)
     let max_vals_keepdim = working_tensor.max_with().axes(working_axis).keepdim(true).call()?;
@@ -543,7 +565,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
     let max_idx_shape = max_idx.shape()?;
     let result = if !max_idx_shape.is_empty() {
         // Non-scalar result: broadcast n_tensor
-        let max_idx_shape_vec: Vec<isize> = max_idx_shape.iter().map(|s| s.as_const().unwrap() as isize).collect();
+        let max_idx_shape_vec = morok_ir::shape::to_vec_isize(&max_idx_shape).context(UOpSnafu)?;
         let ones_shape = vec![1isize; max_idx_shape.len()];
         let n_reshaped = n_tensor.try_reshape(&ones_shape)?;
         let n_broadcast = n_reshaped.try_expand(&max_idx_shape_vec)?;
@@ -582,6 +604,17 @@ fn all_impl(tensor: &Tensor, axes: AxisSpec, keepdim: bool) -> Result<Tensor> {
     any_negated.logical_not()
 }
 
+/// Identity element for a reduction over an empty set (matching Tinygrad's `identity_element`).
+fn reduction_identity(op: ReduceOp, dtype: &DType) -> ConstValue {
+    let s = dtype.scalar().expect("scalar dtype");
+    match op {
+        ReduceOp::Add => ConstValue::zero(s),
+        ReduceOp::Mul => ConstValue::one(s),
+        ReduceOp::Max => ConstValue::min(s),
+        ReduceOp::Min => ConstValue::max(s),
+    }
+}
+
 /// Internal reduction implementation.
 #[track_caller]
 fn reduce_internal(
@@ -612,6 +645,29 @@ fn reduce_internal(
         // Preserve input dtype
         original_dtype.clone()
     };
+
+    // Handle zero-sized dimensions: short-circuit to identity element to avoid
+    // DivisionByZero in indexing (matching Tinygrad rangeify.py:115-120).
+    let reducing_empty_axis = resolved_axes.iter().any(|&ax| shape[ax].as_const() == Some(0));
+    if reducing_empty_axis {
+        // Compute output shape: reduced axes become 1
+        let out_shape: Vec<usize> = shape
+            .iter()
+            .enumerate()
+            .map(|(i, d)| if resolved_axes.contains(&i) { 1 } else { d.as_const().unwrap_or(1) })
+            .collect();
+
+        let identity = reduction_identity(op, &acc_dtype);
+        let result = Tensor::full(&out_shape, identity, acc_dtype)?;
+
+        let result = if !keepdim { result.remove_singleton_dims(&resolved_axes)? } else { result };
+
+        return if promote && dtype.is_none() && Tensor::should_cast_back_after_sum(&original_dtype) {
+            result.cast(original_dtype)
+        } else {
+            Ok(result)
+        };
+    }
 
     // Cast to accumulation dtype if needed
     let working_tensor = if acc_dtype != original_dtype { tensor.cast(acc_dtype.clone())? } else { tensor.clone() };

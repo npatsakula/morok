@@ -274,8 +274,46 @@ let matcher = patterns! {
     Pattern => |x, ctx| ctx.transform(x)
 };
 
-// Combining matchers
+// Combining matchers (same context type)
 let combined = identity_patterns() + constant_folding_patterns();
+```
+
+### Context Lifting with `with_context()`
+
+When combining matchers that use **different context types**, use `.with_context::<D>()` to
+lift a context-free matcher (`TypedPatternMatcher`, i.e. `SimplifiedPatternMatcher<()>`) into
+a matcher with context type `D`. The lifted patterns simply ignore `&mut D` and pass `&mut ()`
+to the original closures.
+
+```rust
+// Problem: symbolic() returns TypedPatternMatcher (ctx = ())
+//          buffer_removal() returns TypedPatternMatcher<PcontigConfig>
+//          Can't combine with + because context types differ!
+
+// Solution: lift context-free matcher into the target context type
+let mega_pass = symbolic().with_context::<PcontigConfig>()
+    + reduction_simplify_patterns().with_context()  // type inferred from context
+    + buffer_removal_with_pcontig();                // TypedPatternMatcher<PcontigConfig>
+
+let mut ctx = PcontigConfig::default();
+let result = graph_rewrite(&mega_pass, root, &mut ctx);
+```
+
+**Rules:**
+- Only `SimplifiedPatternMatcher<()>` (context-free) has `.with_context()` — you cannot
+  lift a matcher that already uses a non-`()` context into a different context type.
+- The target type `D` can be specified explicitly (`.with_context::<MyCtx>()`) or inferred
+  from the `+` combination (`.with_context()`).
+- The lifted matcher consumes `self` (moves ownership). If you need the original matcher
+  elsewhere, call the constructor again (e.g., `early_rewrites().with_context()`).
+
+**Common pattern — mega-pass with shared context:**
+```rust
+// Multiple context-free matchers + one context-dependent matcher
+let pass = matcher_a().with_context::<SharedCtx>()
+    + matcher_b().with_context()
+    + matcher_c().with_context()
+    + context_dependent_matcher();  // TypedPatternMatcher<SharedCtx>
 ```
 
 ### Graph Rewrite Functions

@@ -14,7 +14,7 @@ use crate::rangeify::transforms::reduce_collapse as reduce_collapse_inner;
 
 /// Test helper - thin wrapper around pattern matcher for reduce_unparented tests.
 fn reduce_unparented(reduce: &Arc<UOp>) -> Option<Arc<UOp>> {
-    match crate::rangeify::patterns::reduction_simplify_patterns().rewrite(reduce, &mut ()) {
+    match crate::rangeify::patterns::pm_reduce_simplify().rewrite(reduce, &mut ()) {
         RewriteResult::Rewritten(r) => Some(r),
         _ => None,
     }

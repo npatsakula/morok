@@ -8,6 +8,8 @@
 //! This module provides the infrastructure for automatic broadcasting
 //! in binary operations, matching Tinygrad's architecture.
 
+use snafu::ResultExt;
+
 use super::*;
 use morok_ir::shape::{align_shapes_left, broadcast_shape};
 
@@ -96,7 +98,7 @@ impl Tensor {
     /// Returns error if:
     /// - Shape has more dimensions than target
     /// - Dimension sizes are incompatible (not 1 and not equal to target)
-    pub(crate) fn broadcast_to(&self, target_shape: &morok_ir::shape::Shape) -> Result<Tensor> {
+    pub fn broadcast_to(&self, target_shape: &morok_ir::shape::Shape) -> Result<Tensor> {
         let self_shape = self.shape()?;
 
         // Early return if already correct shape

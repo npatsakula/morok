@@ -159,13 +159,21 @@ pub fn register_tensor_with_buffer(uop: Arc<UOp>, buffer: Arc<Buffer>, buffer_uo
     entry
 }
 
-/// Get buffer by UOp ID.
+/// Get buffer by UOp ID (cloned).
 ///
 /// Direct lookup from BUFFERS map.
 /// Used by collect_input_buffers() during schedule creation.
 pub fn get_buffer(uop_id: u64) -> Option<Buffer> {
     let guard = buffers().guard();
     buffers().get(&uop_id, &guard).map(|arc_buf| (**arc_buf).clone())
+}
+
+/// Get buffer by UOp ID as Arc (shared reference, no clone).
+///
+/// Used by ensure_buffer() to attach a buffer without cloning.
+pub fn get_buffer_arc(uop_id: u64) -> Option<Arc<Buffer>> {
+    let guard = buffers().guard();
+    buffers().get(&uop_id, &guard).cloned()
 }
 
 /// Remove buffer entry from the BUFFERS map.
@@ -212,7 +220,7 @@ pub fn get_tensor(id: u64) -> Option<Arc<TensorEntry>> {
 
 /// Remove dead weak references and stale buffer entries from the registry.
 ///
-/// Tensors: removes entries whose Weak<TensorEntry> can no longer be upgraded.
+/// Tensors: removes entries whose `Weak<TensorEntry>` can no longer be upgraded.
 /// Buffers: removes entries whose UOp is no longer alive in the UOp cache.
 ///
 /// This is optional — stale entries don't affect correctness (unique buffer IDs

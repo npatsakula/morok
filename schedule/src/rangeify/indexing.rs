@@ -288,8 +288,9 @@ pub(crate) fn merge_consumer_ranges(
     }
 
     if !realize_axes.is_empty() {
-        warn!(realize_axes = ?realize_axes, "range conflict detected - marking for realization");
-        ctx.mark_realize(uop, realize_axes);
+        // Partial realization: only realize conflicting axes (matching Tinygrad indexing.py:222)
+        warn!(realize_axes = ?realize_axes, "range conflict detected - marking axes for realization");
+        ctx.mark_realize(uop, realize_axes.clone());
     }
 
     Ok(out_rngs)
@@ -345,18 +346,18 @@ fn assign_ranges(
         ending_ranges.insert(UOpKey(x.clone()), inherited_ending);
 
         let mut out_rngs = if ctx.should_realize(x) {
+            // Realized op: create fresh ranges for all dimensions (Tinygrad indexing.py:186-193).
+            // CONTIGUOUS, COPY, ASSIGN, and ops marked by ending_ranges all land here.
             if let Some(shape) = x.shape()? {
                 let rngs: Vec<_> = shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect();
                 let axes: Vec<usize> = (0..shape.len()).collect();
                 ctx.realize_map.insert(UOpKey(x.clone()), Some(axes));
-                // Clear ending_ranges when realized (like Tinygrad line 185)
+                // Clear ending_ranges when realized (like Tinygrad line 188)
                 ending_ranges.insert(UOpKey(x.clone()), Vec::new());
                 rngs
             } else {
                 continue;
             }
-        } else if let Op::Bufferize { ranges, .. } = x.op() {
-            ranges.to_vec()
         } else if let Op::ReduceAxis { .. } = x.op() {
             // Use the ReduceAxis's OUTPUT shape, not input shape.
             // For keepdim=true, output shape is [1], not [] - we must use actual output shape.
@@ -393,51 +394,25 @@ fn assign_ranges(
                 "Ending ranges detected (pre-in_rngs check)"
             );
         }
-        // Filter ending ranges: for ReduceAxis, ignore REDUCE ranges from other reductions
-        // since they're context-specific and shouldn't trigger realization here.
-        let filtered_ending: Vec<_> =
-            if matches!(x.op(), Op::ReduceAxis { .. }) {
-                ending
-                    .iter()
-                    .filter(|e| {
-                        if let Op::Range { axis_type, .. } = e.op() { *axis_type != AxisType::Reduce } else { true }
-                    })
-                    .cloned()
-                    .collect()
-            } else {
-                ending.clone()
-            };
+        // Use ending ranges directly without filtering (matches Tinygrad behavior).
+        let filtered_ending = ending.clone();
 
         if !filtered_ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
             if let Some(shape) = x.shape().ok().flatten() {
                 // Start with existing realize_axes (from merge_consumer_ranges)
                 let mut realize_axes: Vec<usize> = ctx.get_realize_axes(x).cloned().unwrap_or_default();
 
-                // Get axis_ids from ending ranges for comparison (matching Tinygrad's rr.arg > e.arg)
-                let ending_axis_ids: Vec<AxisId> = filtered_ending
-                    .iter()
-                    .filter_map(|e| if let Op::Range { axis_id, .. } = e.op() { Some(*axis_id) } else { None })
-                    .collect();
-
-                // For each axis, check if any range in out_rngs has axis_id > ending axis_id
-                // This matches Tinygrad's: any(any(rr.arg > e.arg for e in ending_ranges[x]) for rr in r.ranges)
-                for (i, r) in out_rngs.iter().enumerate() {
+                // Tinygrad line 229: `if not (PCONTIG > 1) or any(any(rr.arg > e.arg ...) ...)`
+                // With PCONTIG=0 (default), `not (0 > 1)` = True, so ALL axes are unconditionally
+                // realized when ending_ranges are present. This is critical for layernorm-style
+                // patterns where `centered = x - mean` is shared between output and variance paths.
+                // The ending_ranges from EXPAND (broadcasting mean/inv_std) must trigger full
+                // realization of elementwise ops in the backward slice.
+                for (i, _r) in out_rngs.iter().enumerate() {
                     if realize_axes.contains(&i) {
                         continue;
                     }
-
-                    // Check ranges in this output expression
-                    let should_realize = r.ranges().iter().any(|rr| {
-                        if let Op::Range { axis_id, .. } = rr.op() {
-                            ending_axis_ids.iter().any(|e_id| axis_id > e_id)
-                        } else {
-                            false
-                        }
-                    });
-
-                    if should_realize {
-                        realize_axes.push(i);
-                    }
+                    realize_axes.push(i);
                 }
 
                 debug!(
@@ -560,7 +535,10 @@ fn assign_ranges(
         // "if the EXPAND is used to inject a range, we don't mark it as ending_ranges. otherwise we do."
         if let Op::Expand { new_shape, .. } = x.op() {
             // Check if new_shape is all static (no RANGE ops being injected in the shape)
-            let shape_is_static = extract_shape_from_uop(new_shape).iter().all(|s| matches!(s, SInt::Const(_)));
+            let shape_is_static = extract_shape_from_uop(new_shape).iter().all(|s| match s {
+                SInt::Const(_) => true,
+                SInt::Symbolic(uop) => !matches!(uop.op(), Op::Range { .. }),
+            });
 
             debug!(
                 expand_id = x.id,
@@ -575,20 +553,11 @@ fn assign_ranges(
             if shape_is_static {
                 // Ranges that changed (in_rngs != out_rngs) are "ending"
                 // These are the output ranges that were collapsed to const 0 in in_rngs
+                // Tinygrad's `.ranges.keys()` returns ALL range types without filtering.
                 let mut changed_ranges: Vec<Arc<UOp>> = Vec::new();
                 for (inp, out) in in_rngs.iter().zip(out_rngs.iter()) {
                     if !Arc::ptr_eq(inp, out) {
-                        // The output range is being collapsed - collect any RANGE ops in it
-                        // Filter out REDUCE ranges - they're internal to reductions and shouldn't
-                        // propagate as ending ranges to other operations.
-                        let ranges = collect_ranges_from_uop(out);
-                        for r in ranges {
-                            if let Op::Range { axis_type, .. } = r.op()
-                                && *axis_type != AxisType::Reduce
-                            {
-                                changed_ranges.push(r);
-                            }
-                        }
+                        changed_ranges.extend(collect_ranges_from_uop(out));
                     }
                 }
 
@@ -660,8 +629,37 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
 
         Op::Expand { new_shape, .. } => {
             let new_shape_vals = extract_shape_from_uop(new_shape);
-            rngs.iter()
-                .zip(in_shape.iter())
+
+            // When rngs.len() < new_shape_vals.len(), pad from the left with CONST(0)
+            // to align indices with trailing dimensions (same logic as RESHAPE padding).
+            let padded_rngs: Vec<Arc<UOp>> = if rngs.len() < new_shape_vals.len() {
+                let padding = new_shape_vals.len() - rngs.len();
+                let mut v = Vec::with_capacity(new_shape_vals.len());
+                for _ in 0..padding {
+                    v.push(UOp::index_const(0));
+                }
+                v.extend(rngs.iter().cloned());
+                v
+            } else {
+                rngs.to_vec()
+            };
+
+            // Also pad in_shape from the left with CONST(1) if needed
+            let padded_in_shape: Vec<SInt> = if in_shape.len() < new_shape_vals.len() {
+                let padding = new_shape_vals.len() - in_shape.len();
+                let mut v = Vec::with_capacity(new_shape_vals.len());
+                for _ in 0..padding {
+                    v.push(SInt::Const(1));
+                }
+                v.extend(in_shape.iter().cloned());
+                v
+            } else {
+                in_shape.to_vec()
+            };
+
+            padded_rngs
+                .iter()
+                .zip(padded_in_shape.iter())
                 .zip(new_shape_vals.iter())
                 .map(|((rng, in_sh), out_sh)| {
                     let expanding = match (in_sh, out_sh) {
@@ -689,11 +687,14 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                         SInt::Const(n) => UOp::index_const(*n as i64 + begin as i64),
                         SInt::Symbolic(uop) => uop.try_add(&begin_uop).unwrap(),
                     };
-                    let too_low = rng.try_cmplt(&begin_uop).unwrap();
-                    let true_val = UOp::const_(DType::Bool, ConstValue::Bool(true));
-                    let valid_low = too_low.try_xor_op(&true_val).unwrap();
+                    // valid_low = rng >= begin (directly, instead of XOR(CMPLT, TRUE))
+                    let valid_low = rng.try_cmpge(&begin_uop).unwrap();
                     let valid_high = rng.try_cmplt(&shape_plus_begin).unwrap();
                     let valid = valid_low.try_and_op(&valid_high).unwrap();
+                    // Simplify validity expression so downstream patterns match cleanly
+                    // (like Tinygrad: graph_rewrite(validity, symbolic+pm_simplify_valid))
+                    let valid =
+                        crate::rewrite::graph_rewrite(&crate::symbolic::patterns::symbolic_simple(), valid, &mut ());
                     let adjusted_rng = rng.try_sub(&begin_uop).unwrap();
                     UOp::try_where(valid, adjusted_rng, UOp::invalid_marker()).unwrap()
                 })
@@ -721,17 +722,35 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                 }
             }
 
-            // Flatten output indices
+            // Flatten output indices using the output shape (new_shape_vals).
+            //
+            // When rngs.len() < new_shape_vals.len(), the indices correspond to
+            // the TRAILING dimensions (e.g., INDEX with 2 indices into a [1,1,5,5]
+            // shape means indices are for dims 2 and 3, with dims 0 and 1 implicitly 0).
+            // We pad with CONST(0) on the left to align correctly.
+            let padded_rngs: Vec<Arc<UOp>> = if rngs.len() < new_shape_vals.len() {
+                let padding = new_shape_vals.len() - rngs.len();
+                let mut v = Vec::with_capacity(new_shape_vals.len());
+                for _ in 0..padding {
+                    v.push(UOp::index_const(0));
+                }
+                v.extend(rngs.iter().cloned());
+                v
+            } else {
+                rngs.to_vec()
+            };
+
             let mut acc = UOp::index_const(1);
             let mut axes_in = Vec::new();
 
             trace!(
                 new_shape = ?new_shape_vals,
                 rngs.len = rngs.len(),
+                padded_rngs.len = padded_rngs.len(),
                 "Reshape flatten start"
             );
 
-            for (shape_dim, rng) in new_shape_vals.iter().zip(rngs.iter()).rev() {
+            for (shape_dim, rng) in new_shape_vals.iter().zip(padded_rngs.iter()).rev() {
                 trace!(
                     shape_dim = ?shape_dim,
                     rng.id = rng.id,
@@ -912,87 +931,14 @@ pub fn ranges_equal(ranges1: &[Arc<UOp>], ranges2: &[Arc<UOp>]) -> bool {
 
 /// Check if two ranges are compatible for merging.
 /// Two ranges are compatible if:
-/// 1. They are pointer-equal
-/// 2. They are structurally equal (same UOp graph)
-/// 3. They are both REDUCE ranges with the same `end` value (different axis_ids are OK)
-/// 4. They both contain the same REDUCE range in their expression graph
-///    (handles cases where movement ops create different expression structures
-///    but preserve the underlying Range identity)
-fn ranges_compatible(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
-    if Arc::ptr_eq(a, b) {
-        return true;
-    }
-    if uop_equal(a, b) {
-        return true;
-    }
-    // Special case: Two REDUCE ranges with same end value are compatible
-    // (they represent iteration over the same axis dimension, just from different contexts)
-    if let (
-        Op::Range { axis_type: AxisType::Reduce, end: end_a, .. },
-        Op::Range { axis_type: AxisType::Reduce, end: end_b, .. },
-    ) = (a.op(), b.op())
-    {
-        return Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b);
-    }
-
-    // NEW: Check if both expressions contain the same Reduce range
-    // This handles cases where movement ops (Reshape, etc.) wrap the Range in
-    // different expression structures, but the underlying Range is shared.
-    // For matmul, both A and B's k-dimension indices should contain the same
-    // Reduce Range even after different movement operation chains.
-    contains_same_reduce_range(a, b)
-}
-
-/// Check if two expressions contain at least one shared Reduce range.
+/// Check if two range index expressions are compatible (can share the same range).
 ///
-/// Uses the `.ranges()` property to extract all Range ops from each expression,
-/// then checks if any Reduce ranges match by pointer equality or end value.
-fn contains_same_reduce_range(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
-    let a_ranges = a.ranges();
-    let b_ranges = b.ranges();
-
-    // Extract Reduce ranges from each expression
-    let a_reduce_ranges: Vec<_> =
-        a_ranges.iter().filter(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Reduce, .. })).collect();
-
-    let b_reduce_ranges: Vec<_> =
-        b_ranges.iter().filter(|r| matches!(r.op(), Op::Range { axis_type: AxisType::Reduce, .. })).collect();
-
-    trace!(
-        a_id = a.id,
-        b_id = b.id,
-        a_reduce_count = a_reduce_ranges.len(),
-        b_reduce_count = b_reduce_ranges.len(),
-        a_reduce_ids = ?a_reduce_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
-        b_reduce_ids = ?b_reduce_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
-        "contains_same_reduce_range: checking"
-    );
-
-    // Check if any Reduce range from a matches any from b
-    for a_rng in &a_reduce_ranges {
-        for b_rng in &b_reduce_ranges {
-            // Pointer equality: same Range object
-            if Arc::ptr_eq(a_rng, b_rng) {
-                trace!(range_id = a_rng.id, "contains_same_reduce_range: MATCH by pointer equality");
-                return true;
-            }
-
-            // End value equality: different Range objects but same dimension
-            if let (Op::Range { end: end_a, .. }, Op::Range { end: end_b, .. }) = (a_rng.op(), b_rng.op())
-                && (Arc::ptr_eq(end_a, end_b) || uop_equal(end_a, end_b))
-            {
-                trace!(
-                    a_range_id = a_rng.id,
-                    b_range_id = b_rng.id,
-                    "contains_same_reduce_range: MATCH by end value equality"
-                );
-                return true;
-            }
-        }
-    }
-
-    trace!("contains_same_reduce_range: NO MATCH");
-    false
+/// Aligned with Tinygrad's `all_same()` which uses `==` on hash-consed UOps.
+/// Two ranges are compatible only if they are identical (pointer-equal or
+/// structurally equal including axis_id). Different REDUCE ranges from
+/// different reduction scopes must NOT be considered compatible.
+fn ranges_compatible(a: &Arc<UOp>, b: &Arc<UOp>) -> bool {
+    Arc::ptr_eq(a, b) || uop_equal(a, b)
 }
 
 /// Check if all ranges have identical index expressions (ignoring validity masks).
@@ -1190,5 +1136,5 @@ fn collect_ranges_from_uop(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
 
 /// Check if UOp is an elementwise operation.
 fn is_elementwise_op(uop: &Arc<UOp>) -> bool {
-    matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Cast { .. })
+    matches!(uop.op(), Op::Binary(..) | Op::Unary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::Noop)
 }

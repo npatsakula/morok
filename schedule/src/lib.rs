@@ -26,6 +26,8 @@ pub mod optimizer;
 pub mod passes;
 pub mod rangeify;
 pub mod symbolic;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 #[cfg(feature = "z3")]
 pub mod z3;

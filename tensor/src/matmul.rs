@@ -109,6 +109,30 @@ impl Tensor {
         if let Some(dt) = dtype { product.sum_with().axes(-1).dtype(dt).call() } else { product.sum(-1) }
     }
 
+    /// General Matrix Multiplication: alpha * A @ B + beta * C
+    #[builder]
+    pub fn gemm(
+        &self,
+        b: &Tensor,
+        #[builder(default = 1.0)] alpha: f32,
+        #[builder(default = 1.0)] beta: f32,
+        #[builder(default = false)] trans_a: bool,
+        #[builder(default = false)] trans_b: bool,
+        c: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let a = if trans_a { self.try_transpose(0, 1)? } else { self.clone() };
+        let b = if trans_b { b.try_transpose(0, 1)? } else { b.clone() };
+        let mut result = a.matmul(&b)?;
+        if alpha != 1.0 {
+            result = result.try_mul(&Tensor::from_slice([alpha]))?;
+        }
+        if let Some(c) = c {
+            let c = if beta != 1.0 { c.try_mul(&Tensor::from_slice([beta]))? } else { c.clone() };
+            result = result.try_add(&c)?;
+        }
+        Ok(result)
+    }
+
     /// Linear transformation: `self @ weight.T + bias`.
     ///
     /// Common operation in neural networks (fully connected layers).
@@ -116,14 +140,14 @@ impl Tensor {
     /// and is transposed before multiplication.
     ///
     /// # Arguments
-    /// * `weight` - Weight matrix (shape: [out_features, in_features])
-    /// * `bias` - Optional bias vector (shape: [out_features])
+    /// * `weight` - Weight matrix (shape: `[out_features, in_features]`)
+    /// * `bias` - Optional bias vector (shape: `[out_features]`)
     ///
     /// # Shape Requirements
-    /// - self: [..., in_features]
-    /// - weight: [out_features, in_features]
-    /// - bias: [out_features] or None
-    /// - result: [..., out_features]
+    /// - self: `[..., in_features]`
+    /// - weight: `[out_features, in_features]`
+    /// - bias: `[out_features]` or None
+    /// - result: `[..., out_features]`
     ///
     /// # Examples
     /// ```ignore

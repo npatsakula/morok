@@ -30,7 +30,7 @@ pub mod test;
 
 pub use benchmark::{BenchmarkConfig, BenchmarkResult, benchmark_kernel, benchmark_kernel_with_cutoff};
 pub use device_registry::DEVICE_FACTORIES;
-pub use devices::cpu::create_cpu_device;
+pub use devices::cpu::{CpuBackend, create_cpu_device, create_cpu_device_with_backend};
 pub use devices::cpu_queue::CpuQueue;
 pub use error::*;
 pub use execution_plan::{ExecutionPlan, ExecutionPlanBuilder, ParallelGroup, PreparedKernel};

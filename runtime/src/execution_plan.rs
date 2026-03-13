@@ -157,6 +157,14 @@ impl ExecutionPlan {
         self.ast_to_buffer.get(&ast_id).map(|&idx| &self.buffers[idx])
     }
 
+    /// Get a mutable buffer by AST id (for `copyin()` on input buffers).
+    ///
+    /// Used in the trace-and-rerun pattern: after `prepare()`, use this to write
+    /// new input data into the plan's pre-allocated buffers, then call `execute()`.
+    pub fn buffer_mut_by_id(&mut self, ast_id: u64) -> Option<&mut Buffer> {
+        self.ast_to_buffer.get(&ast_id).copied().map(|idx| &mut self.buffers[idx])
+    }
+
     /// Get the primary device for this plan.
     pub fn device(&self) -> &DeviceSpec {
         &self.device

@@ -29,7 +29,6 @@ pub mod reduce_simplify;
 pub mod split_kernel;
 pub mod split_patterns;
 pub mod split_reduceop;
-pub mod split_store;
 pub mod transform;
 
 use morok_ir::UOp;
