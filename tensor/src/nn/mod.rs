@@ -2,6 +2,7 @@
 
 mod conv;
 mod grid_sample;
+mod linear;
 mod norm;
 pub mod pad;
 mod pool;
@@ -9,7 +10,22 @@ mod quantize;
 mod resize;
 mod rnn;
 
+pub use linear::Linear;
 pub use rnn::{GruOutput, LstmOutput, RnnOutput};
+
+/// A neural network layer.
+pub trait Layer {
+    fn forward(&self, x: &Tensor) -> Result<Tensor>;
+}
+
+/// ReLU activation layer: `max(0, x)`.
+pub struct Relu;
+
+impl Layer for Relu {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        x.relu()
+    }
+}
 
 pub use pad::{auto_pad_split, flat_pads_to_pairs, resolve_pool_pads};
 
@@ -895,5 +911,16 @@ impl Tensor {
             .try_add(&Tensor::const_(bias, dtype.clone()))?
             .try_pow(&Tensor::const_(beta, dtype))?;
         self.try_div(&scale)
+    }
+}
+
+impl Tensor {
+    /// Apply a sequence of layers to this tensor.
+    pub fn sequential(&self, layers: &[&dyn Layer]) -> Result<Tensor> {
+        let mut x = self.clone();
+        for layer in layers {
+            x = layer.forward(&x)?;
+        }
+        Ok(x)
     }
 }

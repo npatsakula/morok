@@ -1,3 +1,6 @@
 /target
 book/build
 .direnv
+website/node_modules/
+website/.docusaurus/
+website/build/

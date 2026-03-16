@@ -1,6 +1,7 @@
 pub mod activation;
 pub mod arithmetic;
 pub mod bitwise;
+pub mod book_examples;
 pub mod broadcast;
 pub mod conditional;
 pub mod creation;
