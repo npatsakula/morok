@@ -34,16 +34,14 @@ impl UOp {
                 .unwrap_or(1),
             // MUL: only immediate CONST child, matching Tinygrad exactly
             Op::Binary(BinaryOp::Mul, a, b) => {
-                if let Op::Const(cv) = &a.op {
-                    if let ConstValue::Int(i) = cv.0 {
+                if let Op::Const(cv) = &a.op
+                    && let ConstValue::Int(i) = cv.0 {
                         return i;
                     }
-                }
-                if let Op::Const(cv) = &b.op {
-                    if let ConstValue::Int(i) = cv.0 {
+                if let Op::Const(cv) = &b.op
+                    && let ConstValue::Int(i) = cv.0 {
                         return i;
                     }
-                }
                 1
             }
             Op::Binary(BinaryOp::Add, a, b) => gcd(a.const_factor().abs(), b.const_factor().abs()),
@@ -192,7 +190,7 @@ impl UOp {
 
         // Step 5: multiply common symbolic factors with numeric GCD
         let mut result = uops[0].const_like(numeric);
-        for (_, (factor, count)) in &common {
+        for (factor, count) in common.values() {
             // Skip CONST(1) factors from divides_int normalization
             if let Op::Const(cv) = factor.op()
                 && matches!(cv.0, ConstValue::Int(1))

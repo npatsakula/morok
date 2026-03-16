@@ -44,6 +44,15 @@ fn is_scalar_shape(shape: &Arc<UOp>) -> bool {
     }
 }
 
+/// Check if a UOp has zero total size (any shape dimension is 0).
+/// Tinygrad equivalent: `x.size == 0` where `size = prod(shape)`.
+fn has_zero_size(uop: &Arc<UOp>) -> bool {
+    match uop.shape() {
+        Ok(Some(shape)) => shape.iter().any(|d| d.as_const() == Some(0)),
+        _ => false,
+    }
+}
+
 /// Check if an op is cheap to inline (no buffering needed).
 ///
 /// Note: Unary ops are included here but may need buffering in reduce context.
@@ -114,6 +123,7 @@ pub fn is_elementwise(uop: &Arc<UOp>) -> bool {
 /// - CONTIGUOUS_BACKWARD removal (gradient computation marker no longer needed)
 /// - RESHAPE to scalar (empty shape) removal
 /// - RESHAPE on REDUCE removal (REDUCE output doesn't need reshaping)
+/// - Zero-size tensor folding (Tinygrad: rangeify.py:116-120)
 pub fn early_rewrites() -> TypedPatternMatcher {
     crate::patterns! {
         Detach(x) ~> |x| x.clone(),
@@ -131,6 +141,17 @@ pub fn early_rewrites() -> TypedPatternMatcher {
             }
 
             None
+        },
+
+        // Reduce of zero-sized input → identity element (Tinygrad: rangeify.py:116-117)
+        reduce @ ReduceAxis { src: x } if has_zero_size(x) && !has_zero_size(reduce) => {
+            let Op::ReduceAxis { reduce_op, .. } = reduce.op() else { return None };
+            Some(crate::symbolic::dce::reduce_identity(*reduce_op, reduce.dtype()))
+        },
+
+        // Any non-SINK op with zero size → const 0 (Tinygrad: rangeify.py:119-120)
+        x if !matches!(x.op(), Op::Sink { .. }) && has_zero_size(x) => {
+            Some(x.const_like(0))
         }
     }
 }
@@ -2620,6 +2641,42 @@ pub fn pm_sqrt_decomposition() -> &'static TypedPatternMatcher<()> {
         Sqrt(x) if x.dtype().is_float() => |x| {
             let half = UOp::const_(x.dtype(), morok_ir::types::ConstValue::Float(0.5));
             x.try_pow(&half).ok()
+        },
+    }
+}
+
+/// ERF decomposition using Abramowitz & Stegun 7.1.26 polynomial approximation.
+///
+/// Tinygrad decomposes erf at the tensor level (elementwise.py:783-785) so it never
+/// reaches the renderer. We decompose it here because Morok keeps Erf as a UOp.
+/// `@llvm.erf` is a libcall intrinsic (not a native hardware op like sqrt/fabs),
+/// so it requires libm linkage which the LLVM JIT doesn't provide.
+///
+/// erf(x) = sign(x) * (1 - t * P(t) * exp(-x²))
+/// where t = 1 / (1 + 0.3275911 * |x|)
+///       P(t) = polyN(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592])
+pub fn pm_erf_decomposition() -> &'static TypedPatternMatcher<()> {
+    crate::cached_patterns! {
+        Erf(x) if x.dtype().is_float() => |x| {
+            let dt = x.dtype();
+            let f = |v: f64| UOp::const_(dt.clone(), ConstValue::Float(v));
+
+            let abs_x = x.abs();
+            let t = f(1.0).try_div(&f(1.0).try_add(&f(0.3275911).try_mul(&abs_x).ok()?).ok()?).ok()?;
+
+            // Horner's method: ((((a4*t + a3)*t + a2)*t + a1)*t + a0)
+            let poly = f(1.061405429);
+            let poly = poly.try_mul(&t).ok()?.try_add(&f(-1.453152027)).ok()?;
+            let poly = poly.try_mul(&t).ok()?.try_add(&f(1.421413741)).ok()?;
+            let poly = poly.try_mul(&t).ok()?.try_add(&f(-0.284496736)).ok()?;
+            let poly = poly.try_mul(&t).ok()?.try_add(&f(0.254829592)).ok()?;
+
+            // exp(-x²)
+            let exp_val = x.square().neg().try_exp().ok()?;
+
+            // sign(x) * (1 - t * poly * exp(-x²))
+            let inner = f(1.0).try_sub(&t.try_mul(&poly).ok()?.try_mul(&exp_val).ok()?).ok()?;
+            x.sign().try_mul(&inner).ok()
         },
     }
 }

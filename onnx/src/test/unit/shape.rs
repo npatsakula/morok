@@ -1,28 +1,9 @@
 use crate::test::helpers::*;
 use ndarray::{Array2, Array3, array};
 
-#[test]
-fn test_registry_transpose() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-    let mut node = NodeProto::default();
-    node.attribute.push(make_attr_ints("perm", &[1, 0]));
-
-    let result = registry.dispatch("Transpose", "", &[x], &node);
-    let result = result.unwrap().realize().unwrap();
-    assert!(result.buffer().is_some());
-}
-
-#[test]
-fn test_registry_flatten() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-    let node = NodeProto::default(); // axis defaults to 1
-
-    let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
-    let realized = result.realize().unwrap();
-    assert!(realized.buffer().is_some());
-}
+// =========================================================================
+// Shape-only tests (no realize/to_vec needed)
+// =========================================================================
 
 #[test]
 fn test_reshape_allowzero_copy() {
@@ -94,46 +75,6 @@ fn test_pad_with_axes() {
 }
 
 #[test]
-fn test_shape_start_end() {
-    let registry = OpRegistry::new();
-    let arr = Array3::from_shape_vec((2, 3, 4), (1..=24).map(|v| v as f32).collect()).unwrap();
-    let x = Tensor::from_ndarray(&arr);
-    let mut node = NodeProto::default();
-    node.attribute.push(make_attr_int("start", 1));
-    node.attribute.push(make_attr_int("end", 3));
-
-    let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
-    let vals = result.to_vec::<i64>().unwrap();
-    assert_eq!(vals, vec![3, 4]);
-}
-
-#[test]
-fn test_shape_negative_start() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_ndarray(&Array3::from_elem((2, 3, 4), 1.0f32));
-    let mut node = NodeProto::default();
-    node.attribute.push(make_attr_int("start", -1));
-
-    let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
-    let vals = result.to_vec::<i64>().unwrap();
-    assert_eq!(vals, vec![4]);
-}
-
-#[test]
-fn test_shape_start_gt_end() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_ndarray(&Array3::from_elem((2, 3, 4), 1.0f32));
-    let inputs = vec![Some(x)];
-    let mut node = NodeProto::default();
-    node.attribute.push(make_attr_int("start", 2));
-    node.attribute.push(make_attr_int("end", 1));
-
-    let result = registry.dispatch_multi("Shape", "", &inputs, &node, i64::MAX).unwrap();
-    let vals = result[0].to_vec::<i64>().unwrap();
-    assert!(vals.is_empty());
-}
-
-#[test]
 fn test_split_remainder_distribution() {
     let registry = OpRegistry::new();
     let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
@@ -149,46 +90,6 @@ fn test_split_remainder_distribution() {
 }
 
 #[test]
-fn test_dropout_mask_shape() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-    let inputs = vec![Some(x)];
-    let node = NodeProto::default();
-
-    let result = registry.dispatch_multi("Dropout", "", &inputs, &node, i64::MAX).unwrap();
-    assert_eq!(result.len(), 2);
-    let mask_shape = result[1].shape().unwrap();
-    assert_eq!(mask_shape.len(), 2);
-    assert_eq!(mask_shape[0].as_const().unwrap(), 2);
-    assert_eq!(mask_shape[1].as_const().unwrap(), 3);
-    assert!(result[1].to_vec::<bool>().unwrap().iter().all(|&v| v));
-}
-
-#[test]
-fn test_constant_of_shape_empty() {
-    let registry = OpRegistry::new();
-    let shape = Tensor::from_slice([0i64]);
-    let node = NodeProto::default();
-
-    let result = registry.dispatch("ConstantOfShape", "", &[shape], &node).unwrap();
-    let s = result.shape().unwrap();
-    assert_eq!(s.len(), 1);
-    assert_eq!(s[0].as_const().unwrap(), 0);
-    assert_eq!(result.to_vec::<f32>().unwrap().len(), 0);
-}
-
-#[test]
-fn test_eye_like() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_ndarray(&Array2::<f32>::zeros((3, 3)));
-    let node = NodeProto::default();
-    let result = registry.dispatch("EyeLike", "", &[x], &node).unwrap();
-    let s = result.shape().unwrap();
-    assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![3, 3]);
-    assert_eq!(result.to_vec::<f32>().unwrap(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
-}
-
-#[test]
 fn test_center_crop_pad_crop() {
     let registry = OpRegistry::new();
     let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
@@ -200,13 +101,113 @@ fn test_center_crop_pad_crop() {
     assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![2, 2]);
 }
 
-#[test]
-fn test_compress() {
-    let registry = OpRegistry::new();
-    let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
-    let condition = Tensor::from_slice([0i64, 1, 1, 0]);
-    let inputs = vec![Some(data), Some(condition)];
-    let node = NodeProto::default();
-    let result = registry.dispatch_multi("Compress", "", &inputs, &node, i64::MAX).unwrap();
-    assert_eq!(result[0].to_vec::<f32>().unwrap(), vec![2.0, 3.0]);
+// =========================================================================
+// Codegen-required tests (realize/to_vec)
+// =========================================================================
+
+morok_tensor::codegen_tests! {
+    fn test_registry_transpose(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+        let mut node = NodeProto::default();
+        node.attribute.push(make_attr_ints("perm", &[1, 0]));
+
+        let result = registry.dispatch("Transpose", "", &[x], &node);
+        let result = result.unwrap().realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
+    }
+
+    fn test_registry_flatten(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+        let node = NodeProto::default(); // axis defaults to 1
+
+        let result = registry.dispatch("Flatten", "", &[x], &node).unwrap();
+        let realized = result.realize_with(&config).unwrap();
+        assert!(realized.buffer().is_some());
+    }
+
+    fn test_shape_start_end(config) {
+        let registry = OpRegistry::new();
+        let arr = Array3::from_shape_vec((2, 3, 4), (1..=24).map(|v| v as f32).collect()).unwrap();
+        let x = Tensor::from_ndarray(&arr);
+        let mut node = NodeProto::default();
+        node.attribute.push(make_attr_int("start", 1));
+        node.attribute.push(make_attr_int("end", 3));
+
+        let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
+        let vals = result.realize_with(&config).unwrap().to_vec::<i64>().unwrap();
+        assert_eq!(vals, vec![3, 4]);
+    }
+
+    fn test_shape_negative_start(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_ndarray(&Array3::from_elem((2, 3, 4), 1.0f32));
+        let mut node = NodeProto::default();
+        node.attribute.push(make_attr_int("start", -1));
+
+        let result = registry.dispatch("Shape", "", &[x], &node).unwrap();
+        let vals = result.realize_with(&config).unwrap().to_vec::<i64>().unwrap();
+        assert_eq!(vals, vec![4]);
+    }
+
+    fn test_shape_start_gt_end(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_ndarray(&Array3::from_elem((2, 3, 4), 1.0f32));
+        let inputs = vec![Some(x)];
+        let mut node = NodeProto::default();
+        node.attribute.push(make_attr_int("start", 2));
+        node.attribute.push(make_attr_int("end", 1));
+
+        let result = registry.dispatch_multi("Shape", "", &inputs, &node, i64::MAX).unwrap();
+        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<i64>().unwrap();
+        assert!(vals.is_empty());
+    }
+
+    fn test_dropout_mask_shape(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+        let inputs = vec![Some(x)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Dropout", "", &inputs, &node, i64::MAX).unwrap();
+        assert_eq!(result.len(), 2);
+        let mask_shape = result[1].shape().unwrap();
+        assert_eq!(mask_shape.len(), 2);
+        assert_eq!(mask_shape[0].as_const().unwrap(), 2);
+        assert_eq!(mask_shape[1].as_const().unwrap(), 3);
+        assert!(result[1].clone().realize_with(&config).unwrap().to_vec::<bool>().unwrap().iter().all(|&v| v));
+    }
+
+    fn test_constant_of_shape_empty(config) {
+        let registry = OpRegistry::new();
+        let shape = Tensor::from_slice([0i64]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("ConstantOfShape", "", &[shape], &node).unwrap();
+        let s = result.shape().unwrap();
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].as_const().unwrap(), 0);
+        assert_eq!(result.realize_with(&config).unwrap().to_vec::<f32>().unwrap().len(), 0);
+    }
+
+    fn test_eye_like(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_ndarray(&Array2::<f32>::zeros((3, 3)));
+        let node = NodeProto::default();
+        let result = registry.dispatch("EyeLike", "", &[x], &node).unwrap();
+        let s = result.shape().unwrap();
+        assert_eq!(s.iter().map(|d| d.as_const().unwrap()).collect::<Vec<_>>(), vec![3, 3]);
+        assert_eq!(result.realize_with(&config).unwrap().to_vec::<f32>().unwrap(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    fn test_compress(config) {
+        let registry = OpRegistry::new();
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        let condition = Tensor::from_slice([0i64, 1, 1, 0]);
+        let inputs = vec![Some(data), Some(condition)];
+        let node = NodeProto::default();
+        let result = registry.dispatch_multi("Compress", "", &inputs, &node, i64::MAX).unwrap();
+        assert_eq!(result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap(), vec![2.0, 3.0]);
+    }
 }

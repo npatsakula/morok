@@ -173,6 +173,7 @@ pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
 }
 
 /// Bool LOAD/STORE via uint8. LLVM i1 can have garbage in upper bits.
+/// Also rewrites BitCast involving Bool to Cast (bitcast requires same bit-width).
 pub fn bool_storage_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // STORE bool: cast to uint8 before storing
@@ -186,6 +187,11 @@ pub fn bool_storage_patterns() -> &'static TypedPatternMatcher {
             let uint8_dtype = load.dtype().with_base(ScalarDType::UInt8);
             let uint8_load = UOp::load().buffer(buffer.clone()).index(index.clone()).dtype(uint8_dtype).call();
             Some(uint8_load.cast(load.dtype()))
+        },
+
+        // BitCast with Bool: i1 has different bit-width than i8+, use Cast instead
+        BitCast { src, dtype } if src.dtype().base().is_bool() || dtype.base().is_bool() => {
+            Some(src.cast(dtype.clone()))
         },
     }
 }

@@ -90,6 +90,10 @@ impl Tensor {
         if is_any_const(&self.uop()) {
             return Ok(self);
         }
+        // Zero-element tensor: nothing to compute.
+        if self.has_zero_elements() {
+            return Ok(self);
+        }
 
         let old_uop = self.uop();
         let input_buffer_ids: std::collections::HashSet<u64> =
@@ -144,6 +148,10 @@ impl Tensor {
     pub fn realize_with(self, config: &PrepareConfig) -> Result<Self> {
         if self.uop().has_buffer_identity() {
             return Ok(self.ensure_buffer());
+        }
+        // Zero-element tensor: nothing to compute (Tinygrad: rangeify folds size-0 to const).
+        if self.has_zero_elements() {
+            return Ok(self);
         }
 
         let old_uop = self.uop();

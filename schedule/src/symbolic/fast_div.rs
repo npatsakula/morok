@@ -35,7 +35,7 @@ fn magic_unsigned(max_val: i64, divisor: i64) -> Option<(i64, u32)> {
 
     let d = divisor as i128;
     let nc = ((max_val as i128 + 1) / d * d - 1).max(0);
-    let nbits = 64 - (max_val.leading_zeros() as u32); // = bit_length
+    let nbits = 64 - max_val.leading_zeros(); // = bit_length
 
     for s in 0..=(2 * nbits) {
         let two_s: i128 = 1 << s;
@@ -159,11 +159,10 @@ pub fn fast_division_patterns() -> TypedPatternMatcher {
                     let rv_min = vmin_as_i64(&shifted).unwrap_or(vmin >> shift_bits);
                     let rv_max = vmax_as_i64(&shifted).unwrap_or(vmax >> shift_bits);
                     let r_max_abs = rv_max.max(rv_min.saturating_abs());
-                    if let Some((rm, rs)) = magic_unsigned(r_max_abs, reduced_d) {
-                        if fits_in_dtype(rm, rv_min, rv_max, &dtype) {
+                    if let Some((rm, rs)) = magic_unsigned(r_max_abs, reduced_d)
+                        && fits_in_dtype(rm, rv_min, rv_max, &dtype) {
                             return emit_fast_div(&shifted, rm, rs, rv_min >= 0, &dtype);
                         }
-                    }
                 } else if reduced_d == 1 {
                     let shift_bits = (pow2_factor as u64).trailing_zeros() as i64;
                     let shift_const = UOp::const_(dtype.clone(), ConstValue::Int(shift_bits));

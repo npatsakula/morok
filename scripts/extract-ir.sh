@@ -143,10 +143,10 @@ reduce .[] as $e (
     .out += "\(hdr($msg; $ms; $nc))\n\($opt)\n\n"
 
   elif $ccode then
-    .out += "--- C KERNEL CODE ---\n\($ccode)\n\n"
+    .out += "--- C KERNEL CODE (kernel \(.kernel)) ---\n\($ccode)\n\n"
 
   elif $gcode then
-    .out += "--- GENERATED CODE ---\n\($gcode)\n\n"
+    .out += "--- GENERATED CODE (kernel \(.kernel)) ---\n\($gcode)\n\n"
 
   elif $ms then
     .out += "\(hdr($msg; $ms; $nc))\n\n"
@@ -157,7 +157,7 @@ reduce .[] as $e (
 ' > "$OUTPUT"
 
 STAGES=$(rg -c '^--- ' "$OUTPUT" || true)
-KERNELS=$(rg -c 'KERNEL CODE\|GENERATED CODE' "$OUTPUT" || echo 0)
+KERNELS=$(rg -c '^  KERNEL \d+' "$OUTPUT" || echo 0)
 
 if [[ "${STAGES:-0}" -eq 0 ]]; then
     echo "No stages found. Is the test using .json() tracing?" >&2

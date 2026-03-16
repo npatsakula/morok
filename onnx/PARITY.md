@@ -1,8 +1,15 @@
 # ONNX Operator Parity
 
-**160 / 198** standard operators implemented (80%).
+**162 / 200** standard operators implemented (81%).
 
-Test results from the ONNX backend node test suite: **1361** pass, **0** fail, **317** skip (out of 1678 tests).
+Test results from the ONNX backend node test suite (backends: clang, llvm): **1361** pass, **0** fail, **317** skip (out of 1678 tests). A test passes only if all backends pass.
+
+### Backend results
+
+| Backend | Pass | Fail | Skip |
+|---------|------|------|------|
+| clang | 1361 | 0 | 317 |
+| llvm | 1361 | 0 | 317 |
 
 The *expanded uses* column counts how many `_expanded` tests exercise each
 operator as a building block (indirect coverage beyond direct tests).
@@ -112,6 +119,7 @@ operator as a building block (indirect coverage beyond direct tests).
 
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
+| BitCast | Y | 10 pass | - | - |
 | Cast | Y | 16 pass, 44 skip | 19 pass | 205 |
 | CastLike | Y | 16 pass, 40 skip | 33 pass, 40 skip | 33 |
 | DequantizeLinear | - | 14 skip | - | - |
@@ -153,6 +161,7 @@ operator as a building block (indirect coverage beyond direct tests).
 | Operator | Impl | Tests (standard) | Tests (expanded) | Expanded uses |
 |----------|------|-------------------|-------------------|---------------|
 | Compress | Y | 4 pass | - | - |
+| CumProd | Y | 9 pass | - | - |
 | CumSum | Y | 9 pass | - | - |
 | Gather | Y | 4 pass | - | 27 |
 | GatherElements | Y | 3 pass | - | 18 |
@@ -284,6 +293,22 @@ operator as a building block (indirect coverage beyond direct tests).
 | StringNormalizer | - | 6 skip | - | - |
 | StringSplit | - | 6 skip | - | - |
 | TfIdfVectorizer | - | 7 skip | - | - |
+
+## Light Models
+
+End-to-end inference tests on pre-trained ONNX models (9/9 pass).
+
+| Model | clang | llvm |
+|-------|------|------|
+| bvlc_alexnet | pass | pass |
+| densenet121 | pass | pass |
+| inception_v1 | pass | pass |
+| inception_v2 | pass | pass |
+| resnet50 | pass | pass |
+| shufflenet | pass | pass |
+| squeezenet | pass | pass |
+| vgg19 | pass | pass |
+| zfnet512 | pass | pass |
 
 ## com.microsoft Extensions
 

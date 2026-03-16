@@ -10,6 +10,28 @@ use morok_ir::{AxisType, BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*}
 
 use crate::llvm::common::{RenderContext, lcast, ldt};
 
+/// Extract a scalar `ptr` from a vectorized `<N x ptr>` via `extractelement ... i32 0`.
+///
+/// When the devectorize pipeline doesn't fully eliminate vectorized DEFINE_GLOBAL pointers
+/// (see `no_vectorized_buf` / `no_vectorized_index` which only target DEFINE_LOCAL/DEFINE_REG),
+/// the GEP result can be `<N x ptr>`. All elements are identical (broadcast of the same buffer
+/// pointer), so extracting element 0 yields the correct scalar ptr for LLVM load/store.
+fn maybe_extract_scalar_ptr(
+    dst: &str,
+    idx: &str,
+    idx_type: &str,
+    dtype: &DType,
+    kernel: &mut Vec<String>,
+) -> (String, String) {
+    if matches!(dtype, DType::Ptr { vcount, .. } if *vcount > 1) {
+        let extract = format!("{dst}.ptr");
+        kernel.push(format!("  {extract} = extractelement {idx_type} {idx}, i32 0"));
+        (extract, "ptr".to_string())
+    } else {
+        (idx.to_string(), idx_type.to_string())
+    }
+}
+
 /// Render a UOp to LLVM IR string.
 ///
 /// Returns None for meta-ops that don't produce instructions.
@@ -20,7 +42,6 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Const(_)
         | Op::VConst { .. }
         | Op::DefineGlobal(_)
-        | Op::DefineLocal(_)
         | Op::DefineVar { .. }
         | Op::Noop
         | Op::Sink { .. }
@@ -31,7 +52,8 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         | Op::Kernel { .. }
         | Op::Barrier { .. } => None,
 
-        Op::DefineReg { .. } => {
+        Op::DefineLocal(_) | Op::DefineReg { .. } => {
+            // Emit alloca for local/register memory.
             // Read base type and size from dtype (matching Tinygrad's x.dtype.base/x.dtype.size).
             // After devectorize's no_vectorized_buf, dtype is the canonical source of truth.
             let (base_dtype, alloc_size) = match uop.dtype() {
@@ -39,7 +61,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 other => (other, 1),
             };
             let base = ldt(&base_dtype);
-            kernel.push(format!("  {dst} = alloca [{alloc_size} x {base}]"));
+            // Tinygrad: DEFINE_LOCAL gets align 16 (for SSE vector loads), DEFINE_REG gets default.
+            let align = if matches!(uop.op(), Op::DefineLocal(_)) { ", align 16" } else { "" };
+            kernel.push(format!("  {dst} = alloca [{alloc_size} x {base}]{align}"));
             Some(())
         }
 
@@ -66,7 +90,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 // always emits a plain GEP. The gate is handled at LOAD level (branch+phi)
                 // and at STORE level (IF/ENDIF via line_rewrite_cleanups).
                 kernel.push(format!(
-                    "  {dst} = getelementptr inbounds {elem_type}, ptr {buf}, {final_idx_type} {final_idx}"
+                    "  {dst} = getelementptr inbounds {elem_type}, {buf_type} {buf}, {final_idx_type} {final_idx}"
                 ));
             }
             Some(())
@@ -88,6 +112,9 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         Op::Load { index, alt, .. } => {
             let idx = ctx.get(index);
             let dtype = ldt(&uop.dtype());
+            let idx_type = ldt(&index.dtype());
+
+            let (idx, idx_type) = maybe_extract_scalar_ptr(&dst, idx, &idx_type, &index.dtype(), kernel);
 
             // Gated LOAD: emit branch+phi to avoid null deref.
             // Matches Tinygrad's pattern (llvmir.py:123-129) which requires BOTH
@@ -120,12 +147,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 kernel.push(format!("{entry_label}:"));
                 kernel.push(format!("  br i1 {gate}, label %{load_label}, label %{exit_label}"));
                 kernel.push(format!("{load_label}:"));
-                kernel.push(format!("  {load_val} = load {dtype}, ptr {idx}"));
+                kernel.push(format!("  {load_val} = load {dtype}, {idx_type} {idx}"));
                 kernel.push(format!("  br label %{exit_label}"));
                 kernel.push(format!("{exit_label}:"));
                 kernel.push(format!("  {dst} = phi {dtype} [{load_val}, %{load_label}], [{alt_val}, %{entry_label}]"));
             } else {
-                kernel.push(format!("  {dst} = load {dtype}, ptr {idx}"));
+                kernel.push(format!("  {dst} = load {dtype}, {idx_type} {idx}"));
             }
             Some(())
         }
@@ -134,8 +161,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             let idx = ctx.get(index);
             let val = ctx.get(value);
             let val_type = ldt(&value.dtype());
-            // LLVM uses opaque pointers (ptr) for all pointer types since LLVM 14+
-            kernel.push(format!("  store {val_type} {val}, ptr {idx}"));
+            let idx_type = ldt(&index.dtype());
+
+            let (idx, idx_type) = maybe_extract_scalar_ptr(&dst, idx, &idx_type, &index.dtype(), kernel);
+
+            kernel.push(format!("  store {val_type} {val}, {idx_type} {idx}"));
             Some(())
         }
 
@@ -187,6 +217,11 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 UnaryOp::Not => {
                     let all_ones = if src.dtype().is_bool() { "1".to_string() } else { "-1".to_string() };
                     kernel.push(format!("  {dst} = xor {stype} {s}, {all_ones}"));
+                }
+                UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Trunc | UnaryOp::Round if !src.dtype().is_float() => {
+                    // Rounding is identity for integer types (defense-in-depth;
+                    // symbolic_simple folds these away upstream).
+                    kernel.push(format!("  {dst} = bitcast {stype} {s} to {stype}"));
                 }
                 UnaryOp::Sqrt
                 | UnaryOp::Exp

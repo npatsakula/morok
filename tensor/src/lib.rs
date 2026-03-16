@@ -133,6 +133,14 @@ impl Tensor {
         Self { entry, buffer: Some(buffer) }
     }
 
+    /// Check if this tensor has zero total elements (any shape dimension is 0).
+    fn has_zero_elements(&self) -> bool {
+        match self.uop().shape() {
+            Ok(Some(shape)) => shape.iter().any(|dim| dim.as_const() == Some(0)),
+            _ => false,
+        }
+    }
+
     /// Ensure buffer is attached if the UOp has buffer identity.
     ///
     /// When `apply_map_to_tensors` substitutes a tensor's UOp with a realized

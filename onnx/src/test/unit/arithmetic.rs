@@ -1,51 +1,6 @@
 use crate::test::helpers::*;
 
 #[test]
-fn test_registry_add() {
-    let registry = OpRegistry::new();
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let node = NodeProto::default();
-
-    let result = registry.dispatch("Add", "", &[a, b], &node);
-    let result = result.unwrap().realize().unwrap();
-    assert!(result.buffer().is_some());
-}
-
-#[test]
-fn test_registry_abs() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_slice([-2.0f32, -1.0, 0.0, 1.0, 2.0]);
-    let node = NodeProto::default();
-
-    let result = registry.dispatch("Abs", "", &[x], &node).unwrap().realize().unwrap();
-    assert!(result.buffer().is_some());
-}
-
-#[test]
-fn test_registry_equal() {
-    let registry = OpRegistry::new();
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice([1.0f32, 0.0, 3.0]);
-    let node = NodeProto::default();
-
-    let result = registry.dispatch("Equal", "", &[a, b], &node).unwrap().realize().unwrap();
-    assert!(result.buffer().is_some());
-}
-
-#[test]
-fn test_registry_where() {
-    let registry = OpRegistry::new();
-    let condition = Tensor::from_slice([true, false, true]);
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let y = Tensor::from_slice([10.0f32, 20.0, 30.0]);
-    let node = NodeProto::default();
-
-    let result = registry.dispatch("Where", "", &[condition, x, y], &node).unwrap().realize().unwrap();
-    assert!(result.buffer().is_some());
-}
-
-#[test]
 fn test_registry_math_ops() {
     let registry = OpRegistry::new();
     let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
@@ -71,72 +26,6 @@ fn test_registry_comparison_ops() {
 }
 
 #[test]
-fn test_max_variadic_3_inputs() {
-    let registry = OpRegistry::new();
-    let a = Tensor::from_slice([1.0f32, 5.0]);
-    let b = Tensor::from_slice([3.0f32, 2.0]);
-    let c = Tensor::from_slice([2.0f32, 4.0]);
-    let inputs = vec![Some(a), Some(b), Some(c)];
-    let node = NodeProto::default();
-
-    let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
-    let vals = result[0].to_vec::<f32>().unwrap();
-    assert_eq!(vals, vec![3.0, 5.0]);
-}
-
-#[test]
-fn test_max_single_input() {
-    let registry = OpRegistry::new();
-    let a = Tensor::from_slice([7.0f32, 3.0]);
-    let inputs = vec![Some(a)];
-    let node = NodeProto::default();
-
-    let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
-    let vals = result[0].to_vec::<f32>().unwrap();
-    assert_eq!(vals, vec![7.0, 3.0]);
-}
-
-#[test]
-fn test_min_variadic_3_inputs() {
-    let registry = OpRegistry::new();
-    let a = Tensor::from_slice([3.0f32, 1.0]);
-    let b = Tensor::from_slice([1.0f32, 5.0]);
-    let c = Tensor::from_slice([2.0f32, 3.0]);
-    let inputs = vec![Some(a), Some(b), Some(c)];
-    let node = NodeProto::default();
-
-    let result = registry.dispatch_multi("Min", "", &inputs, &node, i64::MAX).unwrap();
-    let vals = result[0].to_vec::<f32>().unwrap();
-    assert_eq!(vals, vec![1.0, 1.0]);
-}
-
-#[test]
-fn test_range_float() {
-    let registry = OpRegistry::new();
-    let start = Tensor::from_slice([0.0f32]);
-    let limit = Tensor::from_slice([5.5f32]);
-    let delta = Tensor::from_slice([1.5f32]);
-    let node = NodeProto::default();
-
-    let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
-    let vals = result.to_vec::<f32>().unwrap();
-    assert_eq!(vals, vec![0.0, 1.5, 3.0, 4.5]);
-}
-
-#[test]
-fn test_range_integer_regression() {
-    let registry = OpRegistry::new();
-    let start = Tensor::from_slice([0i32]);
-    let limit = Tensor::from_slice([5i32]);
-    let delta = Tensor::from_slice([1i32]);
-    let node = NodeProto::default();
-
-    let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
-    let vals = result.to_vec::<i32>().unwrap();
-    assert_eq!(vals, vec![0, 1, 2, 3, 4]);
-}
-
-#[test]
 fn test_cast_fallback() {
     let registry = OpRegistry::new();
     let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
@@ -148,73 +37,171 @@ fn test_cast_fallback() {
     assert!(result.is_ok(), "Cast with invalid dtype should fallback, not crash");
 }
 
-#[test]
-fn test_and() {
-    let registry = OpRegistry::new();
-    let a = Tensor::from_slice([true, true, false, false]);
-    let b = Tensor::from_slice([true, false, true, false]);
-    let node = NodeProto::default();
+morok_tensor::codegen_tests! {
+    fn test_registry_add(config) {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
+        let node = NodeProto::default();
 
-    let result = registry.dispatch("And", "", &[a, b], &node).unwrap().realize().unwrap();
-    let vals = result.to_vec::<bool>().unwrap();
-    assert_eq!(vals, vec![true, false, false, false]);
-}
+        let result = registry.dispatch("Add", "", &[a, b], &node);
+        let result = result.unwrap().realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
+    }
 
-#[test]
-fn test_or() {
-    let registry = OpRegistry::new();
-    let a = Tensor::from_slice([true, true, false, false]);
-    let b = Tensor::from_slice([true, false, true, false]);
-    let node = NodeProto::default();
+    fn test_registry_abs(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice([-2.0f32, -1.0, 0.0, 1.0, 2.0]);
+        let node = NodeProto::default();
 
-    let result = registry.dispatch("Or", "", &[a, b], &node).unwrap().realize().unwrap();
-    let vals = result.to_vec::<bool>().unwrap();
-    assert_eq!(vals, vec![true, true, true, false]);
-}
+        let result = registry.dispatch("Abs", "", &[x], &node).unwrap().realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
+    }
 
-#[test]
-fn test_xor() {
-    let registry = OpRegistry::new();
-    let a = Tensor::from_slice([true, true, false, false]);
-    let b = Tensor::from_slice([true, false, true, false]);
-    let node = NodeProto::default();
+    fn test_registry_equal(config) {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([1.0f32, 0.0, 3.0]);
+        let node = NodeProto::default();
 
-    let result = registry.dispatch("Xor", "", &[a, b], &node).unwrap().realize().unwrap();
-    let vals = result.to_vec::<bool>().unwrap();
-    assert_eq!(vals, vec![false, true, true, false]);
-}
+        let result = registry.dispatch("Equal", "", &[a, b], &node).unwrap().realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
+    }
 
-#[test]
-fn test_isnan() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_slice([1.0f32, f32::NAN, 3.0]);
-    let node = NodeProto::default();
+    fn test_registry_where(config) {
+        let registry = OpRegistry::new();
+        let condition = Tensor::from_slice([true, false, true]);
+        let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let y = Tensor::from_slice([10.0f32, 20.0, 30.0]);
+        let node = NodeProto::default();
 
-    let result = registry.dispatch("IsNaN", "", &[x], &node).unwrap().realize().unwrap();
-    let vals = result.to_vec::<bool>().unwrap();
-    assert_eq!(vals, vec![false, true, false]);
-}
+        let result = registry.dispatch("Where", "", &[condition, x, y], &node).unwrap().realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
+    }
 
-#[test]
-fn test_isinf() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_slice([1.0f32, f32::INFINITY, f32::NEG_INFINITY]);
-    let node = NodeProto::default();
+    fn test_max_variadic_3_inputs(config) {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice([1.0f32, 5.0]);
+        let b = Tensor::from_slice([3.0f32, 2.0]);
+        let c = Tensor::from_slice([2.0f32, 4.0]);
+        let inputs = vec![Some(a), Some(b), Some(c)];
+        let node = NodeProto::default();
 
-    let result = registry.dispatch("IsInf", "", &[x], &node).unwrap().realize().unwrap();
-    assert!(result.buffer().is_some());
-}
+        let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
+        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        assert_eq!(vals, vec![3.0, 5.0]);
+    }
 
-#[test]
-fn test_shrink() {
-    let registry = OpRegistry::new();
-    let x = Tensor::from_slice([-2.0f32, -0.3, 0.0, 0.3, 2.0]);
-    let node = NodeProto::default();
+    fn test_max_single_input(config) {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice([7.0f32, 3.0]);
+        let inputs = vec![Some(a)];
+        let node = NodeProto::default();
 
-    let result = registry.dispatch("Shrink", "", &[x], &node).unwrap().realize().unwrap();
-    let vals = result.to_vec::<f32>().unwrap();
-    let expected = [-2.0f32, 0.0, 0.0, 0.0, 2.0];
-    for (a, b) in vals.iter().zip(expected.iter()) {
-        assert!((a - b).abs() < 1e-4, "expected {b}, got {a}");
+        let result = registry.dispatch_multi("Max", "", &inputs, &node, i64::MAX).unwrap();
+        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        assert_eq!(vals, vec![7.0, 3.0]);
+    }
+
+    fn test_min_variadic_3_inputs(config) {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice([3.0f32, 1.0]);
+        let b = Tensor::from_slice([1.0f32, 5.0]);
+        let c = Tensor::from_slice([2.0f32, 3.0]);
+        let inputs = vec![Some(a), Some(b), Some(c)];
+        let node = NodeProto::default();
+
+        let result = registry.dispatch_multi("Min", "", &inputs, &node, i64::MAX).unwrap();
+        let vals = result[0].clone().realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        assert_eq!(vals, vec![1.0, 1.0]);
+    }
+
+    fn test_range_float(config) {
+        let registry = OpRegistry::new();
+        let start = Tensor::from_slice([0.0f32]);
+        let limit = Tensor::from_slice([5.5f32]);
+        let delta = Tensor::from_slice([1.5f32]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
+        let vals = result.realize_with(&config).unwrap().to_vec::<f32>().unwrap();
+        assert_eq!(vals, vec![0.0, 1.5, 3.0, 4.5]);
+    }
+
+    fn test_range_integer_regression(config) {
+        let registry = OpRegistry::new();
+        let start = Tensor::from_slice([0i32]);
+        let limit = Tensor::from_slice([5i32]);
+        let delta = Tensor::from_slice([1i32]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Range", "", &[start, limit, delta], &node).unwrap();
+        let vals = result.realize_with(&config).unwrap().to_vec::<i32>().unwrap();
+        assert_eq!(vals, vec![0, 1, 2, 3, 4]);
+    }
+
+    fn test_and(config) {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice([true, true, false, false]);
+        let b = Tensor::from_slice([true, false, true, false]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("And", "", &[a, b], &node).unwrap().realize_with(&config).unwrap();
+        let vals = result.to_vec::<bool>().unwrap();
+        assert_eq!(vals, vec![true, false, false, false]);
+    }
+
+    fn test_or(config) {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice([true, true, false, false]);
+        let b = Tensor::from_slice([true, false, true, false]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Or", "", &[a, b], &node).unwrap().realize_with(&config).unwrap();
+        let vals = result.to_vec::<bool>().unwrap();
+        assert_eq!(vals, vec![true, true, true, false]);
+    }
+
+    fn test_xor(config) {
+        let registry = OpRegistry::new();
+        let a = Tensor::from_slice([true, true, false, false]);
+        let b = Tensor::from_slice([true, false, true, false]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Xor", "", &[a, b], &node).unwrap().realize_with(&config).unwrap();
+        let vals = result.to_vec::<bool>().unwrap();
+        assert_eq!(vals, vec![false, true, true, false]);
+    }
+
+    fn test_isnan(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice([1.0f32, f32::NAN, 3.0]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("IsNaN", "", &[x], &node).unwrap().realize_with(&config).unwrap();
+        let vals = result.to_vec::<bool>().unwrap();
+        assert_eq!(vals, vec![false, true, false]);
+    }
+
+    fn test_isinf(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice([1.0f32, f32::INFINITY, f32::NEG_INFINITY]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("IsInf", "", &[x], &node).unwrap().realize_with(&config).unwrap();
+        assert!(result.buffer().is_some());
+    }
+
+    fn test_shrink(config) {
+        let registry = OpRegistry::new();
+        let x = Tensor::from_slice([-2.0f32, -0.3, 0.0, 0.3, 2.0]);
+        let node = NodeProto::default();
+
+        let result = registry.dispatch("Shrink", "", &[x], &node).unwrap().realize_with(&config).unwrap();
+        let vals = result.to_vec::<f32>().unwrap();
+        let expected = [-2.0f32, 0.0, 0.0, 0.0, 2.0];
+        for (a, b) in vals.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-4, "expected {b}, got {a}");
+        }
     }
 }

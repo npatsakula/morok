@@ -6,6 +6,33 @@ fn main() {
     generate_light_tests();
 }
 
+/// Generate a dual-backend (clang + llvm) test module for each test case.
+fn write_backend_test(code: &mut String, fn_name: &str, ignored: bool, helper_call: &str) {
+    let attr = if ignored { "#[ignore]\n        " } else { "" };
+    code.push_str(&format!(
+        "\
+mod {fn_name} {{
+    use super::*;
+
+    #[test]
+    {attr}fn clang() {{
+        setup_tracing();
+        let config = morok_tensor::PrepareConfig::for_cpu_backend(morok_tensor::CpuBackend::Clang);
+        {helper_call}
+    }}
+
+    #[test]
+    {attr}fn llvm() {{
+        setup_tracing();
+        let config = morok_tensor::PrepareConfig::for_cpu_backend(morok_tensor::CpuBackend::Llvm);
+        {helper_call}
+    }}
+}}
+
+"
+    ));
+}
+
 fn generate_node_tests() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let node_dir = Path::new(&manifest_dir).join("../submodules/onnx/onnx/backend/test/data/node");
@@ -31,13 +58,11 @@ fn generate_node_tests() {
     let mut code = String::new();
     for name in &test_names {
         let ignored = should_skip(name);
-        code.push_str(&format!(
-            "#[test]\n{attr}fn {name}() {{\n    \
-               setup_tracing();
-               run_onnx_node_test(concat!(env!(\"CARGO_MANIFEST_DIR\"), \
-               \"/../submodules/onnx/onnx/backend/test/data/node/{name}\"));\n}}\n\n",
-            attr = if ignored { "#[ignore]\n" } else { "" },
-        ));
+        let helper_call = format!(
+            "run_onnx_node_test(concat!(env!(\"CARGO_MANIFEST_DIR\"), \
+             \"/../submodules/onnx/onnx/backend/test/data/node/{name}\"), &config);"
+        );
+        write_backend_test(&mut code, name, ignored, &helper_call);
     }
 
     std::fs::write(&out_path, code).unwrap();
@@ -70,16 +95,14 @@ fn generate_light_tests() {
     let mut code = String::new();
     for name in &models {
         let ignored = SKIP_LIGHT.contains(&name.as_str());
-        code.push_str(&format!(
-            "#[test]\n{attr}fn {name}() {{\n    \
-               setup_tracing();
-               run_onnx_light_test(\
-               concat!(env!(\"CARGO_MANIFEST_DIR\"), \
-               \"/../submodules/onnx/onnx/backend/test/data/light/{name}.onnx\"), \
-               concat!(env!(\"CARGO_MANIFEST_DIR\"), \
-               \"/../submodules/onnx/onnx/backend/test/data/light/{name}_output_0.pb\"));\n}}\n\n",
-            attr = if ignored { "#[ignore]\n" } else { "" },
-        ));
+        let helper_call = format!(
+            "run_onnx_light_test(\
+             concat!(env!(\"CARGO_MANIFEST_DIR\"), \
+             \"/../submodules/onnx/onnx/backend/test/data/light/{name}.onnx\"), \
+             concat!(env!(\"CARGO_MANIFEST_DIR\"), \
+             \"/../submodules/onnx/onnx/backend/test/data/light/{name}_output_0.pb\"), &config);"
+        );
+        write_backend_test(&mut code, name, ignored, &helper_call);
     }
 
     std::fs::write(&out_path, code).unwrap();

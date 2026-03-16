@@ -128,6 +128,7 @@ macro_rules! codegen_tests {
             #[test]
             $(#[$meta])*
             fn clang() {
+                ::morok_schedule::testing::setup_test_tracing();
                 let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Clang);
                 $body
             }
@@ -135,6 +136,7 @@ macro_rules! codegen_tests {
             #[test]
             $(#[$meta])*
             fn llvm() {
+                ::morok_schedule::testing::setup_test_tracing();
                 let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Llvm);
                 $body
             }
@@ -152,6 +154,7 @@ macro_rules! codegen_tests {
 
                 $(#[$meta])*
                 fn $name($($param: $ty),+) {
+                    ::morok_schedule::testing::setup_test_tracing();
                     let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Clang);
                     $body
                 }
@@ -163,6 +166,7 @@ macro_rules! codegen_tests {
 
                 $(#[$meta])*
                 fn $name($($param: $ty),+) {
+                    ::morok_schedule::testing::setup_test_tracing();
                     let $config = $crate::PrepareConfig::for_cpu_backend($crate::CpuBackend::Llvm);
                     $body
                 }

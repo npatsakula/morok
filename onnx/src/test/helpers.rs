@@ -9,7 +9,7 @@ pub(crate) use crate::parser::onnx::{
 };
 pub(crate) use crate::registry::*;
 pub(crate) use morok_dtype::{DType, ScalarDType};
-pub(crate) use morok_tensor::Tensor;
+pub(crate) use morok_tensor::{PrepareConfig, Tensor};
 
 use crate::importer::{DimValue, OnnxImporter};
 
@@ -140,7 +140,7 @@ pub(crate) fn make_multi_output_model() -> ModelProto {
 // ONNX light model test infrastructure
 // ---------------------------------------------------------------------------
 
-pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str) {
+pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config: &PrepareConfig) {
     let model_path = Path::new(model_path);
     let test_name = model_path.file_stem().unwrap().to_string_lossy();
 
@@ -186,7 +186,8 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str) {
 
     let actual =
         outputs.get(&graph.outputs[0]).unwrap_or_else(|| panic!("{test_name}: missing output '{}'", graph.outputs[0]));
-    assert_tensors_close(actual, &expected, &test_name);
+    let actual = actual.clone().realize_with(config).unwrap_or_else(|e| panic!("{test_name}: realize failed: {e}"));
+    assert_tensors_close(&actual, &expected, &test_name, config);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,15 +237,19 @@ macro_rules! assert_int_exact {
     }};
 }
 
-fn assert_tensors_close(actual: &Tensor, expected: &Tensor, label: &str) {
+fn assert_tensors_close(actual: &Tensor, expected: &Tensor, label: &str, config: &PrepareConfig) {
     let expected_dtype = expected.uop().dtype();
 
     // Cast actual to match expected dtype if they differ
     let actual_cast;
     let actual = if actual.uop().dtype() != expected_dtype {
-        actual_cast = actual.cast(expected_dtype.clone()).unwrap_or_else(|e| {
-            panic!("Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}", actual.uop().dtype())
-        });
+        actual_cast = actual
+            .cast(expected_dtype.clone())
+            .unwrap_or_else(|e| {
+                panic!("Output '{label}': dtype cast failed ({:?} -> {expected_dtype:?}): {e}", actual.uop().dtype())
+            })
+            .realize_with(config)
+            .unwrap_or_else(|e| panic!("Output '{label}': realize after cast failed: {e}"));
         &actual_cast
     } else {
         actual
@@ -255,8 +260,8 @@ fn assert_tensors_close(actual: &Tensor, expected: &Tensor, label: &str) {
         ScalarDType::Float64 => assert_float_close!(actual, expected, label, 1e-3, 1e-7, f64),
         ScalarDType::Float16 | ScalarDType::BFloat16 | ScalarDType::FP8E4M3 | ScalarDType::FP8E5M2 => {
             let f32_dtype = DType::Scalar(ScalarDType::Float32);
-            let a = actual.cast(f32_dtype.clone()).unwrap();
-            let e = expected.cast(f32_dtype).unwrap();
+            let a = actual.cast(f32_dtype.clone()).unwrap().realize_with(config).unwrap();
+            let e = expected.cast(f32_dtype).unwrap().realize_with(config).unwrap();
             assert_float_close!(&a, &e, label, 1e-2, 1e-3, f32);
         }
         ScalarDType::Int8 => assert_int_exact!(actual, expected, label, i8),
@@ -285,7 +290,7 @@ fn sorted_dirs(parent: &Path, prefix: &str) -> Vec<PathBuf> {
     entries
 }
 
-pub(crate) fn run_onnx_node_test(test_dir: &str) {
+pub(crate) fn run_onnx_node_test(test_dir: &str, config: &PrepareConfig) {
     let test_dir = Path::new(test_dir);
     let test_name = test_dir.file_name().unwrap().to_string_lossy();
 
@@ -342,7 +347,11 @@ pub(crate) fn run_onnx_node_test(test_dir: &str) {
             let expected = tensor_from_proto_ext(&tensor_proto, None)
                 .unwrap_or_else(|e| panic!("{test_name}/{set_name}: expected output '{name}': {e}"));
             let actual = outputs.get(name).unwrap_or_else(|| panic!("{test_name}/{set_name}: missing output '{name}'"));
-            assert_tensors_close(actual, &expected, &format!("{test_name}/{set_name}:{name}"));
+            let actual = actual
+                .clone()
+                .realize_with(config)
+                .unwrap_or_else(|e| panic!("{test_name}/{set_name}: realize failed: {e}"));
+            assert_tensors_close(&actual, &expected, &format!("{test_name}/{set_name}:{name}"), config);
         }
     }
 }

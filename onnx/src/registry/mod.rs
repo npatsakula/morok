@@ -88,12 +88,7 @@ impl OpRegistry {
             "Add" => vec![inp(inputs, 0).try_add(inp(inputs, 1))?],
             "Sub" => vec![inp(inputs, 0).try_sub(inp(inputs, 1))?],
             "Mul" => vec![inp(inputs, 0).try_mul(inp(inputs, 1))?],
-            "Div" => {
-                let x = inp(inputs, 0);
-                let y = inp(inputs, 1);
-                let result = x.try_div(y)?;
-                vec![if x.uop().dtype().is_int() { result.trunc()? } else { result }]
-            }
+            "Div" => vec![inp(inputs, 0).try_div(inp(inputs, 1))?],
             "Neg" => vec![inp(inputs, 0).try_neg()?],
             "Abs" => vec![inp(inputs, 0).try_abs()?],
             "Pow" => vec![inp(inputs, 0).try_pow(inp(inputs, 1))?],

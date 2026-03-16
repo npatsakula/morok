@@ -7,19 +7,19 @@ use morok_dtype::{AddrSpace, DType, ScalarDType};
 use morok_ir::ConstValue;
 
 /// Convert a DType to LLVM type string.
+///
+/// Uses LLVM opaque pointer mode: all pointers are `ptr`, vectors of
+/// pointers are `<N x ptr>`. Typed pointer syntax (`float*`) is not emitted.
 pub fn ldt(dtype: &DType) -> String {
     match dtype {
         DType::Vector { scalar, count } => {
             format!("<{} x {}>", count, ldt_scalar(*scalar))
         }
-        DType::Ptr { base, vcount, .. } if *vcount > 1 => {
-            format!("<{} x {}*>", vcount, ldt(base))
+        DType::Ptr { vcount, .. } if *vcount > 1 => {
+            format!("<{} x ptr>", vcount)
         }
-        DType::Ptr { base, .. } => {
-            format!("{}*", ldt(base))
-        }
+        DType::Ptr { .. } | DType::Image { .. } => "ptr".to_string(),
         DType::Scalar(s) => ldt_scalar(*s).to_string(),
-        DType::Image { .. } => "ptr".to_string(),
     }
 }
 
@@ -163,7 +163,7 @@ pub fn lcast(from: &DType, to: &DType) -> &'static str {
     if (from_scalar.is_unsigned() || from_scalar.is_bool()) && to_scalar.is_float() {
         return "uitofp";
     }
-    if from_scalar.is_signed() && to_scalar.is_float() {
+    if (from_scalar.is_signed() || from_scalar == ScalarDType::Index) && to_scalar.is_float() {
         return "sitofp";
     }
 
@@ -241,8 +241,8 @@ mod tests {
 
     #[test]
     fn test_ldt_ptr() {
-        assert_eq!(ldt(&DType::Float32.ptr(None, AddrSpace::Global)), "float*");
-        assert_eq!(ldt(&DType::Int32.vec(4).ptr(None, AddrSpace::Global)), "<4 x i32>*");
+        assert_eq!(ldt(&DType::Float32.ptr(None, AddrSpace::Global)), "ptr");
+        assert_eq!(ldt(&DType::Int32.vec(4).ptr(None, AddrSpace::Global)), "ptr");
     }
 
     #[test]
@@ -270,7 +270,9 @@ mod tests {
         assert_eq!(lcast(&DType::Index, &DType::Int32), "trunc");
         assert_eq!(lcast(&DType::Index, &DType::Int64), "bitcast"); // same size (both i64)
         assert_eq!(lcast(&DType::Int32, &DType::Index), "sext");
-        // Float to Index
+        // Float ↔ Index
         assert_eq!(lcast(&DType::Float32, &DType::Index), "fptosi");
+        assert_eq!(lcast(&DType::Index, &DType::Float32), "sitofp");
+        assert_eq!(lcast(&DType::Index, &DType::Float64), "sitofp");
     }
 }

@@ -73,8 +73,8 @@ use crate::devectorize::{
 use crate::gpudims::pm_add_gpudims;
 use crate::passes::pm_linearize_multi_index;
 use crate::rangeify::patterns::{
-    pm_add_loads, pm_bool_devectorize, pm_comparison_negations, pm_div_to_shr, pm_fdiv_to_mul, pm_fma_decomposition,
-    pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_reduce_devectorize,
+    pm_add_loads, pm_bool_devectorize, pm_comparison_negations, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
+    pm_fma_decomposition, pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_reduce_devectorize,
     rangeify_codegen_with_kernel_ctx,
 };
 use crate::rangeify::pm_add_buffers_local_patterns;
@@ -382,6 +382,7 @@ fn get_late_rewrite_patterns() -> &'static crate::TypedPatternMatcher {
     // (like Tinygrad's `ops: tuple[Ops, ...]`) and conditionally include patterns.
     static CACHED: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
         pm_fma_decomposition()
+            + pm_erf_decomposition()
             + pm_mod_to_and()
             + pm_mul_to_shl()
             + pm_div_to_shr()

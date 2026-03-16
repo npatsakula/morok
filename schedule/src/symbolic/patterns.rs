@@ -122,6 +122,13 @@ pub fn identity_and_zero_patterns() -> &'static TypedPatternMatcher {
         // x % 1 → 0 (anything mod 1 is 0)
         Mod(x, @one) => |x| x.dtype().scalar().map(|dt| UOp::const_(x.dtype(), ConstValue::zero(dt))),
 
+        // ========== Rounding identity for integer types ==========
+        // Floor/Ceil/Trunc/Round on integers is identity — rounding is a no-op.
+        for op in unary [Floor, Ceil, Trunc, Round] {
+            op(x) if !x.dtype().is_float()
+                => |x| { let _ = op; Some(x.clone()) }
+        },
+
         // ========== Zero propagation ==========
         // NOTE: For floats, x * 0 is NOT always 0 due to IEEE 754 special values:
         //   - NaN * 0 = NaN
@@ -582,8 +589,7 @@ fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Option<Arc<U
             if let Op::Const(cv) = g_uop.op()
                 && let ConstValue::Int(g) = cv.0
                 && g > 1
-            {
-                if let Some(new_x_base) = x_peeled.divide_exact(&g_uop) {
+                && let Some(new_x_base) = x_peeled.divide_exact(&g_uop) {
                     let const_rem_div_g = (const_val.rem_euclid(c)) / g;
                     let new_x = if const_rem_div_g != 0 {
                         new_x_base.try_add(&x.const_like(const_rem_div_g)).ok()?
@@ -614,7 +620,6 @@ fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Option<Arc<U
                         }
                     }
                 }
-            }
         }
     }
 
@@ -632,8 +637,8 @@ fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Option<Arc<U
         let g_uop = UOp::symbolic_gcd(&gcd_inputs);
 
         let is_trivial = matches!(g_uop.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(1)));
-        if !is_trivial {
-            if let Some(x_div) = x.divide_exact(&g_uop)
+        if !is_trivial
+            && let Some(x_div) = x.divide_exact(&g_uop)
                 && let Some(y_div) = y.divide_exact(&g_uop)
             {
                 let r = if op == BinaryOp::Mod {
@@ -644,7 +649,6 @@ fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> Option<Arc<U
                 };
                 return Some(r);
             }
-        }
     }
 
     // 7. factor_remainder: (d*x+y)//d → x+y//d
