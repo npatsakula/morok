@@ -60,7 +60,7 @@ jobs:
             local elapsed=0
             echo "Waiting for $crate@$version to appear on crates.io..."
             while [ $elapsed -lt $timeout ]; do
-              if curl -sf "https://crates.io/api/v1/crates/$crate/$version" > /dev/null 2>&1; then
+              if curl -sf -H "User-Agent: morok-ci (github.com/npatsakula/morok)" "https://crates.io/api/v1/crates/$crate/$version" > /dev/null 2>&1; then
                 echo "$crate@$version is available"
                 return 0
               fi
