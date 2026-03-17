@@ -16,9 +16,9 @@ morok-device = { path = "../device", version = "=0.1.0-alpha.0" }
 morok-codegen = { path = "../codegen", version = "=0.1.0-alpha.0" }
 morok-runtime = { path = "../runtime", version = "=0.1.0-alpha.0" }
 morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.0" }
-once_cell = "1.21.3"
-snafu = "0.8.9"
-bon = "3.8"
+once_cell = "1.21.4"
+snafu = "0.9.0"
+bon = "3.9"
 smallvec = "1.15"
 ndarray.workspace = true
 papaya = "0.2.3"
