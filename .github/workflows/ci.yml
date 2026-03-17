@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   pull_request:
     branches: [main]
@@ -38,7 +37,7 @@ jobs:
 
   publish:
     name: Publish crates
-    needs: nix-checks
+    needs: [nix-checks, flake-health]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: crates-io
