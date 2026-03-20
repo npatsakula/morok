@@ -585,6 +585,10 @@ fn prepare_execution_plan(
             morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
         };
 
+        // Extract kernel name from metadata (attached by Scheduler, preserved through post-opt)
+        let kernel_name =
+            optimized_ast.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+
         // Step 3: Apply decomposition
         let ast_decomposed = match device.renderer.decompositor() {
             Some(matcher) => {
@@ -602,7 +606,7 @@ fn prepare_execution_plan(
         // Step 4: Cache by OPTIMIZED ast id (different optimizations → different cache entries)
         let cached = morok_runtime::kernel_cache::get_or_compile_kernel(ast_decomposed.id, &device_str, || {
             // Render
-            let spec = device.renderer.render(&ast_decomposed).context(RenderKernelSnafu)?;
+            let spec = device.renderer.render(&ast_decomposed, kernel_name.as_deref()).context(RenderKernelSnafu)?;
 
             // Compile
             let compiled = device.compiler.compile(&spec).context(CompileKernelSnafu)?;
@@ -829,6 +833,10 @@ fn beam_search_optimize(
             // Apply post-optimization passes for accurate timing
             let optimized = apply_post_optimization(raw_ast);
 
+            // Extract kernel name before decomposition (which loses metadata)
+            let kernel_name =
+                optimized.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+
             // Post-optimization UOp count filter (matches Tinygrad's BEAM_UOPS_MAX).
             // validate_limits checks pre-optimization AST size, but devectorization
             // can massively expand the graph (e.g., 256-wide UPCAST -> 4096 GEP indices).
@@ -843,7 +851,7 @@ fn beam_search_optimize(
             };
 
             // Render and compile (NOT timed)
-            let spec = dev_renderer.render(&decomposed).ok()?;
+            let spec = dev_renderer.render(&decomposed, kernel_name.as_deref()).ok()?;
             let compiled = dev_compiler.compile(&spec).ok()?;
             let program = (dev_runtime)(&compiled).ok()?;
 

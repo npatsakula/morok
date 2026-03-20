@@ -149,8 +149,8 @@ struct ClangRendererWrapper {
 }
 
 impl Renderer for ClangRendererWrapper {
-    fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec> {
-        let rendered = morok_codegen::c::render(ast, Some("kernel"))
+    fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
+        let rendered = morok_codegen::c::render(ast, name.or(Some("kernel")))
             .map_err(|e| morok_device::Error::Runtime { message: format!("C rendering failed: {}", e) })?;
 
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
@@ -261,8 +261,8 @@ struct LlvmRendererWrapper {
 }
 
 impl Renderer for LlvmRendererWrapper {
-    fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec> {
-        let rendered = morok_codegen::llvm::text::render(ast, Some("kernel"))
+    fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
+        let rendered = morok_codegen::llvm::text::render(ast, name.or(Some("kernel")))
             .map_err(|e| morok_device::Error::Runtime { message: format!("LLVM rendering failed: {}", e) })?;
 
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
@@ -355,8 +355,8 @@ mod mlir_backend {
     }
 
     impl Renderer for MlirRendererWrapper {
-        fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec> {
-            let rendered = morok_codegen::mlir::render(ast, Some("kernel"))
+        fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec> {
+            let rendered = morok_codegen::mlir::render(ast, name.or(Some("kernel")))
                 .map_err(|e| morok_device::Error::Runtime { message: format!("MLIR rendering failed: {}", e) })?;
 
             let mut spec =

@@ -151,6 +151,9 @@ pub fn apply_post_optimization_with_renderer(
     ast: Arc<morok_ir::UOp>,
     renderer: Option<&Renderer>,
 ) -> Arc<morok_ir::UOp> {
+    // Save metadata before graph_rewrite destroys it (e.g., KernelInfo with kernel name)
+    let saved_metadata = ast.metadata_raw();
+
     tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
     // Multi-index linearization: INDEX(buf, [i,j,k]) → INDEX(buf, [linear])
@@ -363,7 +366,12 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after bool_storage_pattern"
     );
-    bs
+
+    // Re-attach metadata (e.g., KernelInfo) that was lost during graph rewrites
+    match saved_metadata {
+        Some(meta) => bs.with_metadata_raw(meta),
+        None => bs,
+    }
 }
 
 /// Late rewrite patterns for algebraic decompositions.

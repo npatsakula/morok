@@ -427,16 +427,7 @@ impl UOp {
     /// let with_info = ast.with_metadata(KernelInfo::new("r_g16l16", vec![], false));
     /// ```
     pub fn with_metadata<T: std::any::Any + Send + Sync + 'static>(self: &Arc<Self>, metadata: T) -> Arc<Self> {
-        Arc::new(Self {
-            id: next_uop_id(),
-            op: self.op.clone(),
-            dtype: self.dtype.clone(),
-            shape_cache: std::sync::OnceLock::new(),
-            ranges_cache: std::sync::OnceLock::new(),
-            in_scope_ranges_cache: std::sync::OnceLock::new(),
-            vmin_vmax_cache: std::sync::OnceLock::new(),
-            metadata: Some(Arc::new(metadata)),
-        })
+        self.with_metadata_raw(Arc::new(metadata))
     }
 
     /// Get metadata of a specific type if it exists.
@@ -452,5 +443,28 @@ impl UOp {
     /// ```
     pub fn metadata<T: std::any::Any + Send + Sync>(&self) -> Option<std::sync::Arc<T>> {
         self.metadata.as_ref()?.clone().downcast::<T>().ok()
+    }
+
+    /// Get raw metadata (type-erased).
+    ///
+    /// Used to preserve metadata across graph rewrites that create new root nodes.
+    pub fn metadata_raw(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.metadata.clone()
+    }
+
+    /// Attach raw metadata (type-erased), creating a new instance.
+    ///
+    /// Used to re-attach metadata that was saved before graph rewrites.
+    pub fn with_metadata_raw(self: &Arc<Self>, metadata: Arc<dyn std::any::Any + Send + Sync>) -> Arc<Self> {
+        Arc::new(Self {
+            id: next_uop_id(),
+            op: self.op.clone(),
+            dtype: self.dtype.clone(),
+            shape_cache: std::sync::OnceLock::new(),
+            ranges_cache: std::sync::OnceLock::new(),
+            in_scope_ranges_cache: std::sync::OnceLock::new(),
+            vmin_vmax_cache: std::sync::OnceLock::new(),
+            metadata: Some(metadata),
+        })
     }
 }

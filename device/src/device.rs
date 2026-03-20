@@ -193,6 +193,8 @@ pub trait Renderer: Send + Sync {
     /// # Arguments
     ///
     /// * `ast` - The kernel AST (UOp graph rooted at KERNEL op)
+    /// * `name` - Optional kernel name for debugging (e.g., "r_g16l16R32u4").
+    ///   Falls back to "kernel" if None.
     ///
     /// # Returns
     ///
@@ -201,7 +203,7 @@ pub trait Renderer: Send + Sync {
     /// - Entry point name
     /// - Variable list
     /// - Work sizes (for GPU backends)
-    fn render(&self, ast: &Arc<UOp>) -> Result<ProgramSpec>;
+    fn render(&self, ast: &Arc<UOp>, name: Option<&str>) -> Result<ProgramSpec>;
 
     /// Get the device spec for this renderer.
     ///
@@ -249,7 +251,7 @@ pub type CompilerPair = (Arc<dyn Renderer>, Arc<dyn Compiler>);
 ///
 /// ```ignore
 /// let cpu_device = create_cpu_device()?;
-/// let spec = cpu_device.renderer.render(&kernel_ast)?;
+/// let spec = cpu_device.renderer.render(&kernel_ast, Some("E_L3"))?;
 /// let compiled = cpu_device.compiler.compile(&spec)?;
 /// let program = (cpu_device.runtime)(&compiled)?;
 /// unsafe { program.execute(&buffers, &vals, None, None)?; }
