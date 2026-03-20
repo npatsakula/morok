@@ -65,8 +65,6 @@
         };
 
         nativeBuildInputs = with pkgs; [
-          llvm.llvm.dev
-          llvm.mlir
           pkgconf
           protobuf
           libffi
