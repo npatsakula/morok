@@ -302,18 +302,15 @@ pub trait Renderer {
 LLVM renderer (`codegen/src/llvm/cpu/`) UOp ग्राफ़ ट्रैवर्स करता है और LLVM IR एमिट करता है:
 
 ```llvm
-define void @kernel_0(ptr %args, ptr %vars) {
+define void @kernel_0(ptr noalias align 32 %buf0, ptr noalias align 32 %buf1) #0 {
 entry:
-  %buf0 = load ptr, ptr %args
-  %buf1 = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
-  ; ... loop nest ...
   br label %loop_0
 
 loop_0:
-  %i = phi i64 [ 0, %entry ], [ %i.next, %loop_0 ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop_0 ]
   ; ... computation ...
-  %i.next = add i64 %i, 1
-  %cond = icmp slt i64 %i.next, 128
+  %i.next = add nsw i32 %i, 1
+  %cond = icmp slt i32 %i.next, 128
   br i1 %cond, label %loop_0, label %exit
 
 exit:
@@ -321,9 +318,7 @@ exit:
 }
 ```
 
-जनरेटेड कर्नेल दो आर्ग्युमेंट लेता है:
-- `args`: बफ़र पॉइंटरों का array
-- `vars`: symbolic variable वैल्यूज़ का array (डायनामिक shapes के लिए)
+हर buffer एक direct `ptr noalias align 32` parameter है — args array के through कोई indirection नहीं। Symbolic variables (dynamic shapes के लिए) और thread ID अतिरिक्त typed parameters के रूप में पास होते हैं (जैसे `i32 %N`)।
 
 ### पोस्ट-ऑप्टिमाइज़ेशन पासेज़
 
@@ -501,11 +496,8 @@ Heuristic ऑप्टिमाइज़र अप्लाई करता ह�
 जनरेटेड LLVM IR (सरलीकृत):
 
 ```llvm
-define void @matmul(ptr %args, ptr %vars) {
+define void @matmul(ptr noalias align 32 %C, ptr noalias align 32 %A, ptr noalias align 32 %B) #0 {
 entry:
-  %C = load ptr, ptr %args
-  %A = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
-  %B = load ptr, ptr getelementptr(ptr, ptr %args, i64 2)
   br label %loop_i
 
 loop_i:

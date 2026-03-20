@@ -85,7 +85,7 @@ fn native_data_layout() -> &'static str {
 
 /// Text-based LLVM IR renderer.
 ///
-/// Generates LLVM IR as strings, suitable for compilation via inkwell's IR parser.
+/// Generates LLVM IR as strings, suitable for compilation via external clang.
 /// Produces a single function with direct typed parameters.
 pub struct LlvmTextRenderer;
 

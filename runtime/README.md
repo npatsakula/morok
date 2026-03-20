@@ -15,8 +15,8 @@ kernel.execute(&[buf_a.ptr(), buf_b.ptr(), buf_out.ptr()])?;
 
 | Backend | How it works | Feature |
 |---------|-------------|---------|
-| **Clang** (default) | Compiles C to `.so` via `clang -shared -O2`, loads with `dlopen` | always |
-| **LLVM JIT** | JIT compiles LLVM IR via Inkwell ExecutionEngine | always |
+| **Clang** (default) | Compiles C via `clang -c`, loads via JIT ELF loader | always |
+| **LLVM JIT** | Compiles LLVM IR via `clang -x ir`, loads via JIT ELF loader | always |
 | **MLIR** | Lowers MLIR dialects to LLVM, JIT via MLIR ExecutionEngine | `mlir` |
 
 Select at runtime: `MOROK_CPU_BACKEND=clang|llvm|mlir`

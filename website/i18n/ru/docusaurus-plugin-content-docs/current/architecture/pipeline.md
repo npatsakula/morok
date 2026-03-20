@@ -302,18 +302,15 @@ pub trait Renderer {
 LLVM-рендерер (`codegen/src/llvm/cpu/`) обходит UOp-граф и порождает LLVM IR:
 
 ```llvm
-define void @kernel_0(ptr %args, ptr %vars) {
+define void @kernel_0(ptr noalias align 32 %buf0, ptr noalias align 32 %buf1) #0 {
 entry:
-  %buf0 = load ptr, ptr %args
-  %buf1 = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
-  ; ... loop nest ...
   br label %loop_0
 
 loop_0:
-  %i = phi i64 [ 0, %entry ], [ %i.next, %loop_0 ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop_0 ]
   ; ... computation ...
-  %i.next = add i64 %i, 1
-  %cond = icmp slt i64 %i.next, 128
+  %i.next = add nsw i32 %i, 1
+  %cond = icmp slt i32 %i.next, 128
   br i1 %cond, label %loop_0, label %exit
 
 exit:
@@ -321,9 +318,7 @@ exit:
 }
 ```
 
-Сгенерированное ядро принимает два аргумента:
-- `args`: массив указателей на буферы
-- `vars`: массив значений символьных переменных (для динамических форм)
+Каждый буфер — прямой параметр `ptr noalias align 32`, без косвенной адресации через массив args. Символьные переменные (для динамических форм) и thread ID передаются как дополнительные типизированные параметры (например, `i32 %N`).
 
 ### Проходы пост-оптимизации
 
@@ -501,11 +496,8 @@ KERNEL
 Сгенерированный LLVM IR (упрощённо):
 
 ```llvm
-define void @matmul(ptr %args, ptr %vars) {
+define void @matmul(ptr noalias align 32 %C, ptr noalias align 32 %A, ptr noalias align 32 %B) #0 {
 entry:
-  %C = load ptr, ptr %args
-  %A = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
-  %B = load ptr, ptr getelementptr(ptr, ptr %args, i64 2)
   br label %loop_i
 
 loop_i:

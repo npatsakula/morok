@@ -302,18 +302,15 @@ pub trait Renderer {
 The LLVM renderer (`codegen/src/llvm/cpu/`) traverses the UOp graph and emits LLVM IR:
 
 ```llvm
-define void @kernel_0(ptr %args, ptr %vars) {
+define void @kernel_0(ptr noalias align 32 %buf0, ptr noalias align 32 %buf1) #0 {
 entry:
-  %buf0 = load ptr, ptr %args
-  %buf1 = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
-  ; ... loop nest ...
   br label %loop_0
 
 loop_0:
-  %i = phi i64 [ 0, %entry ], [ %i.next, %loop_0 ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop_0 ]
   ; ... computation ...
-  %i.next = add i64 %i, 1
-  %cond = icmp slt i64 %i.next, 128
+  %i.next = add nsw i32 %i, 1
+  %cond = icmp slt i32 %i.next, 128
   br i1 %cond, label %loop_0, label %exit
 
 exit:
@@ -321,9 +318,7 @@ exit:
 }
 ```
 
-The generated kernel takes two arguments:
-- `args`: Array of buffer pointers
-- `vars`: Array of symbolic variable values (for dynamic shapes)
+Each buffer is a direct `ptr noalias align 32` parameter — no indirection through an args array. Symbolic variables (for dynamic shapes) and thread IDs are passed as additional typed parameters (e.g. `i32 %N`).
 
 ### Post-Optimization Passes
 
@@ -501,11 +496,8 @@ Heuristic optimizer applies:
 Generated LLVM IR (simplified):
 
 ```llvm
-define void @matmul(ptr %args, ptr %vars) {
+define void @matmul(ptr noalias align 32 %C, ptr noalias align 32 %A, ptr noalias align 32 %B) #0 {
 entry:
-  %C = load ptr, ptr %args
-  %A = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
-  %B = load ptr, ptr getelementptr(ptr, ptr %args, i64 2)
   br label %loop_i
 
 loop_i:

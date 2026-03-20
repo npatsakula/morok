@@ -293,18 +293,15 @@ pub trait Renderer {
 LLVM 渲染器（`codegen/src/llvm/cpu/`）遍历 UOp 图并生成 LLVM IR：
 
 ```llvm
-define void @kernel_0(ptr %args, ptr %vars) {
+define void @kernel_0(ptr noalias align 32 %buf0, ptr noalias align 32 %buf1) #0 {
 entry:
-  %buf0 = load ptr, ptr %args
-  %buf1 = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
-  ; ... loop nest ...
   br label %loop_0
 
 loop_0:
-  %i = phi i64 [ 0, %entry ], [ %i.next, %loop_0 ]
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop_0 ]
   ; ... computation ...
-  %i.next = add i64 %i, 1
-  %cond = icmp slt i64 %i.next, 128
+  %i.next = add nsw i32 %i, 1
+  %cond = icmp slt i32 %i.next, 128
   br i1 %cond, label %loop_0, label %exit
 
 exit:
@@ -312,9 +309,7 @@ exit:
 }
 ```
 
-生成的 kernel 接受两个参数：
-- `args`：buffer 指针数组
-- `vars`：符号变量值数组（用于动态形状）
+每个 buffer 都是直接的 `ptr noalias align 32` 参数——不通过 args 数组间接访问。符号变量（用于动态 shape）和线程 ID 作为额外的类型化参数传递（例如 `i32 %N`）。
 
 ### 后优化 Pass
 
@@ -475,11 +470,8 @@ KERNEL
 生成的 LLVM IR（简化版）：
 
 ```llvm
-define void @matmul(ptr %args, ptr %vars) {
+define void @matmul(ptr noalias align 32 %C, ptr noalias align 32 %A, ptr noalias align 32 %B) #0 {
 entry:
-  %C = load ptr, ptr %args
-  %A = load ptr, ptr getelementptr(ptr, ptr %args, i64 1)
-  %B = load ptr, ptr getelementptr(ptr, ptr %args, i64 2)
   br label %loop_i
 
 loop_i:

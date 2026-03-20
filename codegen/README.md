@@ -14,8 +14,8 @@ let code = render(&kernel_graph, backend)?;
 
 | Backend | Output | Feature | Default |
 |---------|--------|---------|---------|
-| **Clang** | C source → `clang -shared -O2` → `.so` | always | yes |
-| **LLVM JIT** | LLVM IR text → Inkwell ExecutionEngine | always | no |
+| **Clang** | C source → `clang -c` → JIT ELF loader | always | yes |
+| **LLVM JIT** | LLVM IR text → `clang -x ir` → JIT ELF loader | always | no |
 | **MLIR** | MLIR (arith/scf/llvm dialects) → MLIR ExecutionEngine | `mlir` | no |
 
 Select at runtime via `MOROK_CPU_BACKEND` env var (`clang`, `llvm`, `mlir`).
