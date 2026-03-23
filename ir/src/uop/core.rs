@@ -760,58 +760,6 @@ impl UOp {
         InScopeRangesProperty::get(self)
     }
 
-    /// Internal helper to compute in-scope ranges via toposort.
-    ///
-    /// Uses toposort to ensure we process nodes in dependency order,
-    /// computing each node's scope from its sources' scopes.
-    #[allow(clippy::mutable_key_type)]
-    pub(crate) fn compute_in_scope_ranges(self: &Arc<Self>) -> HashSet<UOpKey> {
-        use crate::Op;
-
-        // Map from UOp ID to its computed in-scope ranges
-        let mut scope_map: HashMap<u64, HashSet<UOpKey>> = HashMap::new();
-
-        // Process in topological order (sources before consumers)
-        for node in self.toposort() {
-            let mut in_scope: HashSet<UOpKey> = HashSet::new();
-
-            // Step 1: Merge ranges from all sources
-            node.op.map_child(|src| {
-                if let Some(src_ranges) = scope_map.get(&src.id) {
-                    in_scope.extend(src_ranges.iter().cloned());
-                }
-            });
-
-            // Step 2: Remove ended ranges
-            for ended in node.op.ended_ranges() {
-                match ended.op() {
-                    Op::Range { .. } => {
-                        // Remove the specific RANGE
-                        in_scope.remove(&UOpKey(ended.clone()));
-                    }
-                    _ => {
-                        // Remove all ranges that were in the ended op's scope
-                        if let Some(ended_scope) = scope_map.get(&ended.id) {
-                            for r in ended_scope.iter() {
-                                in_scope.remove(r);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Step 3: If this is a RANGE, add it to scope
-            if matches!(node.op, Op::Range { .. }) {
-                in_scope.insert(UOpKey(node.clone()));
-            }
-
-            scope_map.insert(node.id, in_scope);
-        }
-
-        // Return the scope for this node
-        scope_map.remove(&self.id).unwrap_or_default()
-    }
-
     /// Check if all in-scope ranges at this UOp have the given AxisType.
     ///
     /// Returns true if the in-scope ranges set is empty or all ranges

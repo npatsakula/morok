@@ -46,30 +46,31 @@ cached_property! {
 // ============================================================================
 
 cached_property! {
-    /// Cached ranges property.
+    /// Cached ranges property (recursive, like Tinygrad's approach).
     ///
-    /// Returns all RANGE operations in the computation graph, collected via
-    /// toposort and filtering.
+    /// Returns all RANGE operations in the computation graph, computed from
+    /// children's cached values. O(N) total on first access, O(1) after.
     ///
     /// This is different from `in_scope_ranges` which only returns ranges
     /// that are currently "active" (not yet ended).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use morok_ir::uop::properties::RangesProperty;
-    /// use morok_ir::uop::cached_property::CachedProperty;
-    ///
-    /// let all_ranges = RangesProperty::get(&my_uop);
-    /// println!("Found {} ranges in graph", all_ranges.len());
-    /// ```
     RangesProperty: Vec<Arc<crate::UOp>> {
         cache_field: ranges_cache,
         compute: |uop| {
-            uop.toposort()
-                .into_iter()
-                .filter(|node| matches!(node.op, Op::Range { .. }))
-                .collect()
+            let mut seen = std::collections::HashSet::new();
+            let mut result = Vec::new();
+            // Self first if RANGE (matches Tinygrad: {self:None} | self._ranges)
+            if matches!(uop.op, Op::Range { .. }) {
+                seen.insert(uop.id);
+                result.push(uop.clone());
+            }
+            uop.op.map_child(|src| {
+                for r in RangesProperty::get(src) {
+                    if seen.insert(r.id) {
+                        result.push(r.clone());
+                    }
+                }
+            });
+            result
         }
     }
 }
@@ -79,30 +80,54 @@ cached_property! {
 // ============================================================================
 
 cached_property! {
-    /// Cached in-scope ranges property.
+    /// Cached in-scope ranges property (recursive, like Tinygrad's `@recursive_property`).
     ///
     /// Returns only the RANGE operations that are "in scope" at this UOp,
     /// meaning they are currently active (not yet ended).
     ///
-    /// This is computed bottom-up via toposort:
-    /// 1. Merge ranges from all source operations
-    /// 2. Remove ranges that are ended by this operation
+    /// Computed from children's cached values (guaranteed available by
+    /// `CachedProperty::get()`'s filtered toposort + bottom-up processing):
+    /// 1. Merge in-scope ranges from all source operations
+    /// 2. Remove ranges ended by this operation (`op.ended_ranges()`)
     /// 3. Add self if this is a RANGE operation
     ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use morok_ir::uop::properties::InScopeRangesProperty;
-    /// use morok_ir::uop::cached_property::CachedProperty;
-    ///
-    /// let in_scope = InScopeRangesProperty::get(&my_uop);
-    /// for range in in_scope {
-    ///     println!("Range {} is in scope", range.0.id);
-    /// }
-    /// ```
+    /// This is O(N) total for the first access on a graph, then O(1) for
+    /// subsequent accesses on overlapping subgraphs (cached per-node).
     InScopeRangesProperty: HashSet<UOpKey> {
         cache_field: in_scope_ranges_cache,
-        compute: |uop| uop.compute_in_scope_ranges()
+        compute: |uop| {
+            #[allow(clippy::mutable_key_type)]
+            let mut result: HashSet<UOpKey> = HashSet::new();
+
+            // Step 1: Merge from all sources' cached in_scope_ranges
+            uop.op.map_child(|src| {
+                for r in InScopeRangesProperty::get(src).iter() {
+                    result.insert(r.clone());
+                }
+            });
+
+            // Step 2: Remove ended ranges (using existing op.ended_ranges())
+            for ended in uop.op.ended_ranges() {
+                match ended.op() {
+                    Op::Range { .. } => {
+                        result.remove(&UOpKey(ended.clone()));
+                    }
+                    _ => {
+                        // Non-RANGE ended (like AFTER) — remove all its in-scope ranges
+                        for r in InScopeRangesProperty::get(ended).iter() {
+                            result.remove(r);
+                        }
+                    }
+                }
+            }
+
+            // Step 3: Add self if RANGE
+            if matches!(uop.op, Op::Range { .. }) {
+                result.insert(UOpKey(uop.clone()));
+            }
+
+            result
+        }
     }
 }
 

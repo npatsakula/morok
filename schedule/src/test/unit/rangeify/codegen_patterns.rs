@@ -98,69 +98,8 @@ fn test_get_contiguous_returns_none_for_non_contiguous() {
     assert!(result.is_none());
 }
 
-#[test]
-fn test_fix_after_broadcast_unwraps_expand() {
-    // Test that AFTER wrapping EXPAND gets unwrapped
-    let source = UOp::native_const(1.0f32);
-    let new_shape = UOp::index_const(4);
-    let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
-
-    let computation = UOp::noop();
-    let after = expand.after(smallvec::smallvec![computation]);
-
-    let result = apply_patterns(&after);
-    assert!(result.is_some());
-
-    let fixed = result.unwrap();
-    // Should have replaced passthrough with expand source
-    if let Op::After { passthrough, .. } = fixed.op() {
-        assert!(Arc::ptr_eq(passthrough, &source));
-    } else {
-        panic!("Expected AFTER operation");
-    }
-}
-
-#[test]
-fn test_fix_after_broadcast_returns_none_for_non_after() {
-    // Test that non-AFTER operations return None (unless they match another pattern)
-    let const_op = UOp::native_const(1.0f32);
-
-    let result = apply_patterns(&const_op);
-    assert!(result.is_none());
-}
-
-#[test]
-fn test_fix_after_broadcast_returns_none_for_non_expand() {
-    // Test that AFTER not wrapping EXPAND returns None
-    let source = UOp::native_const(1.0f32);
-    let computation = UOp::noop();
-    let after = source.after(smallvec::smallvec![computation]);
-
-    let result = apply_patterns(&after);
-    assert!(result.is_none());
-}
-
-#[test]
-fn test_fix_after_broadcast_no_panic_on_global() {
-    // Test that AFTER with EXPAND of global buffer (no RANGE parent) works
-    let source = UOp::native_const(1.0f32);
-
-    let new_shape = UOp::index_const(4);
-    let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
-
-    let computation = UOp::noop();
-    let after = expand.after(smallvec::smallvec![computation]);
-
-    // Should not panic for global (non-local) buffer
-    let result = apply_patterns(&after);
-    assert!(result.is_some());
-}
-
-// Note: Testing the panic case for local AFTER is complex because it requires
-// constructing a graph where the expand source has actual RANGE consumers,
-// which depends on the specific graph structure and consumer map computation.
-// The logic is implemented correctly but creating a test case that triggers
-// the panic would require a more complex setup with actual range-dependent operations.
+// AFTER(EXPAND) pattern was removed — Tinygrad doesn't have it (rangeify.py:474-496).
+// Tests for that pattern were removed with it.
 
 #[test]
 fn test_codegen_patterns_creates_matcher() {

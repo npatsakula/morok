@@ -1112,21 +1112,6 @@ pub fn rangeify_codegen_patterns() -> TypedPatternMatcher<LocalAddBufferContext>
             }
             Some(src.clone())
         },
-        // AFTER(EXPAND): strip EXPAND only if src is a valid passthrough
-        After { passthrough: Expand { src, .. }, deps } => |src, deps, _ctx| {
-            // Don't unwrap if src is control flow (Range, End)
-            // These are not valid AFTER passthroughs in Tinygrad
-            if matches!(src.op(), Op::Range { .. } | Op::End { .. }) {
-                return None;  // Keep original - can't strip EXPAND from control flow
-            }
-
-            #[allow(clippy::mutable_key_type)]
-            let has_range = src.get_consumer_map()
-                .get(&UOpKey(src.clone()))
-                .is_some_and(|c| c.iter().any(|c| matches!(c.op(), Op::Range { .. })));
-            assert!(!has_range, "can't have a local AFTER");
-            Some(src.after(deps.clone()))
-        },
     }
 }
 

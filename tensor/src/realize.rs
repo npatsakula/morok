@@ -295,6 +295,7 @@ impl Tensor {
     /// plan.execute(&mut executor)?;
     /// ```
     pub fn prepare_with(&self, config: &PrepareConfig) -> Result<ExecutionPlan> {
+        let t_total = std::time::Instant::now();
         let uop = self.uop();
         let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
         let output_dtype = uop.dtype();
@@ -311,13 +312,17 @@ impl Tensor {
         // Note: The rangeify becomes_map (STORE/INDEX/RANGE nodes) is NOT applied globally —
         // it would corrupt other tensors. Instead, realize() applies a minimal output-only
         // becomes_map (old_uop -> realized BUFFER+RESHAPE) after execution.
+        let t_step = std::time::Instant::now();
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let rangeified = rangeify_result.sink;
+        debug!(elapsed_ms = t_step.elapsed().as_millis() as u64, "prepare: rangeify complete");
 
         trace!(ast = %rangeified.tree_full(), "post-rangeify ast");
 
         // Step 4: Run kernel splitting pipeline
+        let t_step = std::time::Instant::now();
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeified);
+        debug!(elapsed_ms = t_step.elapsed().as_millis() as u64, "prepare: kernel split complete");
 
         trace!(ast = %kernelized.tree_full(), "post-kernel-split ast");
 
@@ -326,11 +331,22 @@ impl Tensor {
         let input_buffers = collect_input_buffers(&uop);
 
         // Step 6: Create schedule from kernels
+        let t_step = std::time::Instant::now();
         let schedule = crate::schedule::create_schedule(kernelized, kernel_ctx, &input_buffers)?;
+        debug!(
+            elapsed_ms = t_step.elapsed().as_millis() as u64,
+            num_kernels = schedule.len(),
+            "prepare: schedule complete"
+        );
 
         // Step 7: Build execution plan (pass expected output dtype and size)
+        let t_step = std::time::Instant::now();
         let output_size = shape.iter().map(|s| s.as_const().unwrap_or(1)).product::<usize>() * output_dtype.bytes();
-        prepare_execution_plan(&schedule, output_dtype, output_size, config)
+        let plan = prepare_execution_plan(&schedule, output_dtype, output_size, config);
+        debug!(elapsed_ms = t_step.elapsed().as_millis() as u64, "prepare: execution plan complete");
+
+        debug!(total_ms = t_total.elapsed().as_millis() as u64, "prepare: total");
+        plan
     }
 }
 

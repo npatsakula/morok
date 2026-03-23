@@ -589,6 +589,22 @@ impl Op {
         if let Some(start_idx) = self.range_ending_src_index() {
             let children = self.children();
             children.into_iter().skip(start_idx).collect()
+        } else if let Self::After { deps, .. } = self {
+            // Tinygrad (ops.py:312): flatten([x.ended_ranges for x in self.src[1:]])
+            // AFTER propagates ended ranges from its dependency chain.
+            let mut result = SmallVec::new();
+            for dep in deps {
+                result.extend(dep.op().ended_ranges());
+            }
+            result
+        } else if matches!(self, Self::Copy { .. } | Self::BufferView { .. }) {
+            // Tinygrad (ops.py:314): return self.src[0].ranges
+            // COPY/BUFFER_VIEW ends all ranges from the source.
+            // We return the source itself (not individual ranges) — the
+            // InScopeRangesProperty handles the non-RANGE branch by looking
+            // up the ended node's in_scope_ranges and removing them all.
+            let children = self.children();
+            if children.is_empty() { SmallVec::new() } else { SmallVec::from_elem(children[0], 1) }
         } else {
             SmallVec::new()
         }

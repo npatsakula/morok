@@ -210,14 +210,19 @@ impl LocalAddBufferContext {
 // SPLIT KERNEL
 // ============================================================================
 
-/// Find first COPY or BUFFER_VIEW operation.
-fn find_copy_or_buffer_view(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
-    for node in uop.toposort() {
-        if matches!(node.op(), Op::Copy { .. } | Op::BufferView { .. }) {
-            return Some(node);
-        }
+/// Extract the stored value from a STORE/END(STORE) structure.
+///
+/// Used to check if the stored value is COPY/BUFFER_VIEW without traversing
+/// the entire subgraph (matching Tinygrad rangeify.py:526-529).
+fn extract_stored_value(ret: &Arc<UOp>) -> &Arc<UOp> {
+    match ret.op() {
+        Op::Store { value, .. } => value,
+        Op::End { computation, .. } => match computation.op() {
+            Op::Store { value, .. } => value,
+            _ => ret,
+        },
+        _ => ret,
     }
-    None
 }
 
 /// Split STORE and END operations into individual kernels.
@@ -225,10 +230,7 @@ fn find_copy_or_buffer_view(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Based on Tinygrad's split_store (rangeify.py:480-507).
 /// Simplified from 280 lines to ~80 lines using LocalAddBufferContext.
 pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use super::patterns::{
-        local_to_define_global_patterns, movement_op_patterns, pm_syntactic_sugar, rangeify_codegen_patterns,
-    };
-    use super::transforms::pm_flatten_range;
+    use super::patterns::{local_to_define_global_patterns, rangeify_codegen_patterns};
     use crate::rewrite::graph_rewrite_bottom_up;
 
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
@@ -264,21 +266,27 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Per-kernel context (LocalAddBufferContext)
     let mut lctx = LocalAddBufferContext::new();
 
-    // Combined single-pass rewrite (Tinygrad: to_define_global + pm_flatten_range + rangeify_codegen)
+    // Context-dependent rewrite per kernel.
+    //
+    // Context-free patterns (movement_op, syntactic_sugar, flatten_range) were already
+    // applied in run_kernel_split_pipeline's pre-pass. Here we only run patterns that
+    // need LocalAddBufferContext (Buffer→DefineGlobal, Bind, After, Range renumber,
+    // NOOP→zero, Contiguous→extract opts).
     let ret = {
         use std::sync::LazyLock;
-        static PM_RANGEIFY: LazyLock<crate::TypedPatternMatcher<LocalAddBufferContext>> = LazyLock::new(|| {
-            local_to_define_global_patterns()
-                + movement_op_patterns().with_context::<LocalAddBufferContext>()
-                + pm_syntactic_sugar().with_context::<LocalAddBufferContext>()
-                + pm_flatten_range().with_context::<LocalAddBufferContext>()
-                + rangeify_codegen_patterns()
-        });
-        graph_rewrite_bottom_up(&*PM_RANGEIFY, x.clone(), &mut lctx)
+        static PM_CTX_DEP: LazyLock<crate::TypedPatternMatcher<LocalAddBufferContext>> =
+            LazyLock::new(|| local_to_define_global_patterns() + rangeify_codegen_patterns());
+        graph_rewrite_bottom_up(&*PM_CTX_DEP, x.clone(), &mut lctx)
     };
 
-    // Find COPY/BUFFER_VIEW or wrap in SINK (like Tinygrad rangeify.py:495-501)
-    let ast = find_copy_or_buffer_view(&ret).unwrap_or_else(|| UOp::sink(vec![ret]));
+    // Check for COPY/BUFFER_VIEW directly on the stored value (like Tinygrad rangeify.py:526-530).
+    // No graph traversal needed — just walk the STORE/END structure.
+    let stored = extract_stored_value(&ret);
+    let ast = if matches!(stored.op(), Op::Copy { .. } | Op::BufferView { .. }) {
+        stored.clone()
+    } else {
+        UOp::sink(vec![ret])
+    };
 
     // Build KERNEL from context (like Tinygrad rangeify.py:504)
     // Sources: lctx.map.values() (buffer → AFTER mappings) + lctx.vars.keys() (bound variables)
@@ -398,8 +406,20 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
 
     trace!(tree = %after_buffers.tree_full(), "after pm_add_buffers");
 
+    // Pre-run pm_flatten_range on the FULL graph ONCE before kernel splitting.
+    //
+    // Tinygrad's split_store includes pm_flatten_range but NOT pm_mops/pm_syntactic_sugar
+    // (those were already applied in earlier pipeline stages). Running flatten_range once
+    // on the full graph avoids redundant per-kernel traversals on overlapping subgraphs.
     let t_stage = std::time::Instant::now();
-    let after_split = split_all_stores(&after_buffers);
+    let after_ctx_free = graph_rewrite_bottom_up(super::transforms::pm_flatten_range(), after_buffers, &mut ());
+    tracing::debug!(
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "kernel split: pm_flatten_range pre-pass complete"
+    );
+
+    let t_stage = std::time::Instant::now();
+    let after_split = split_all_stores(&after_ctx_free);
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
 
     let t_stage = std::time::Instant::now();

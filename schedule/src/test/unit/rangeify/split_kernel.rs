@@ -423,18 +423,11 @@ fn test_split_store_nested_copy_in_store() {
 
 #[test]
 fn test_split_store_copy_precedence_documented() {
-    // This test documents the precedence behavior when multiple COPY/BUFFER_VIEW
-    // operations exist in a computation graph:
+    // This test documents the COPY/BUFFER_VIEW detection behavior.
     //
-    // **Behavior:** The first COPY or BUFFER_VIEW found during toposort() traversal
-    // becomes the kernel AST. This is deterministic based on graph structure.
-    //
-    // **Rationale:** Scheduler needs direct AST access to detect cross-device
-    // transfers (COPY) or extract view parameters (BUFFER_VIEW). Using the first
-    // special op found ensures we don't miss important operations.
-    //
-    // For this test, we create a structure with nested COPY operations to verify
-    // that find_copy_or_buffer_view() correctly identifies them.
+    // **Behavior:** The stored value of the STORE is checked directly for
+    // COPY/BUFFER_VIEW ops (matching Tinygrad rangeify.py:526-529).
+    // If found, the COPY/BV becomes the kernel AST directly.
 
     // Create nested COPY: COPY(COPY(buffer)) with proper BUFFER
     let base_buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);

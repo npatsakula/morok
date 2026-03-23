@@ -65,31 +65,7 @@ fn test_get_contiguous_in_pipeline() {
     assert!(Arc::ptr_eq(&unwrapped, &value));
 }
 
-/// Test that fix_after_broadcast handles AFTER+EXPAND correctly.
-///
-/// Verifies the pattern unwraps EXPAND from AFTER operations while
-/// checking for local AFTER violations.
-#[test]
-fn test_fix_after_broadcast_in_pipeline() {
-    // Create AFTER wrapping EXPAND (broadcast)
-    let source = UOp::native_const(1.0f32);
-    let new_shape = UOp::index_const(10);
-    let expand = UOp::new(Op::Expand { src: source.clone(), new_shape }, source.dtype());
-
-    let computation = UOp::noop();
-    let after = expand.after(smallvec::smallvec![computation]);
-
-    // Pattern should unwrap EXPAND
-    let result = apply_codegen_patterns(&after);
-    assert!(result.is_some());
-
-    let fixed = result.unwrap();
-    if let Op::After { passthrough, .. } = fixed.op() {
-        assert!(Arc::ptr_eq(passthrough, &source));
-    } else {
-        panic!("Expected AFTER operation");
-    }
-}
+// AFTER(EXPAND) pattern was removed — Tinygrad doesn't have it.
 
 /// Test cycle detection with valid buffer accesses.
 ///
