@@ -99,9 +99,14 @@ impl Tensor {
         let input_buffer_ids: std::collections::HashSet<u64> =
             collect_input_buffers(&old_uop).keys().copied().collect();
 
+        let t_prep = std::time::Instant::now();
         let plan = self.prepare()?;
+        let prep_ms = t_prep.elapsed().as_millis();
+        let t_exec = std::time::Instant::now();
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
+        let exec_ms = t_exec.elapsed().as_millis();
+        debug!(prep_ms, exec_ms, "realize complete");
 
         let result = self.finalize_realize(&plan, &old_uop)?;
 
@@ -158,9 +163,14 @@ impl Tensor {
         let input_buffer_ids: std::collections::HashSet<u64> =
             collect_input_buffers(&old_uop).keys().copied().collect();
 
+        let t_prep = std::time::Instant::now();
         let plan = self.prepare_with(config)?;
+        let prep_ms = t_prep.elapsed().as_millis();
+        let t_exec = std::time::Instant::now();
         let mut executor = morok_runtime::global_executor();
         plan.execute(&mut executor).context(ExecutionSnafu)?;
+        let exec_ms = t_exec.elapsed().as_millis();
+        debug!(prep_ms, exec_ms, "realize_with complete");
 
         let result = self.finalize_realize(&plan, &old_uop)?;
 

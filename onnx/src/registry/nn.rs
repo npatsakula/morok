@@ -67,12 +67,12 @@ pub(crate) fn op_batch_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Res
             .cast(running_var.uop().dtype())?;
 
         // Normalize with batch stats, cast back to input dtype
-        let invstd = batch_var.try_add(&Tensor::from_slice([epsilon]))?.try_rsqrt()?;
+        let invstd = batch_var.try_add(&Tensor::const_(epsilon as f64, batch_var.uop().dtype()))?.try_rsqrt()?;
         let out = x.batchnorm().scale(scale).bias(bias).mean(&batch_mean).invstd(&invstd).call()?;
         let out = out.cast(x.uop().dtype())?;
         Ok(vec![out, new_running_mean, new_running_var])
     } else {
-        let invstd = running_var.try_add(&Tensor::from_slice([epsilon]))?.try_rsqrt()?;
+        let invstd = running_var.try_add(&Tensor::const_(epsilon as f64, running_var.uop().dtype()))?.try_rsqrt()?;
         let out = x.batchnorm().scale(scale).bias(bias).mean(running_mean).invstd(&invstd).call()?;
         Ok(vec![out])
     }

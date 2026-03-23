@@ -264,14 +264,14 @@ impl UOp {
     ///
     /// This is the most common pattern - bufferize to global memory.
     pub fn bufferize_global(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
-        Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
+        Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true })
     }
 
     /// Create a BUFFERIZE operation with Local address space.
     ///
     /// For shared/local memory bufferization.
     pub fn bufferize_local(compute: Arc<Self>, ranges: Vec<Arc<Self>>) -> Arc<Self> {
-        Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Local })
+        Self::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Local, removable: true })
     }
 
     // =========================================================================

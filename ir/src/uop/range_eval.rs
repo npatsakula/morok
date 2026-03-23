@@ -10,67 +10,125 @@ use morok_dtype::DType;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-/// Compute the minimum and maximum possible values for a UOp.
+/// Sound range analysis — returns `None` for ops where range cannot be soundly computed.
 ///
-/// Returns a tuple (vmin, vmax) where both values are ConstValue types.
-/// The analysis propagates ranges bottom-up through the computation graph.
-pub fn compute_vmin_vmax(uop: &Arc<UOp>) -> (ConstValue, ConstValue) {
+/// Matches Tinygrad's `_min_max` (ops.py:734-772): ops without explicit rules fall through
+/// to `(dtype.min, dtype.max)`, making `vmin != vmax` and preventing unsound constant collapse.
+///
+/// Returns `Some((vmin, vmax))` only when the bounds are provably correct.
+/// Returns `None` for: LOAD, STORE, INDEX, REDUCE, Pow, Fdiv, BitCast, and any op
+/// whose children have unknown bounds and the op's analysis depends on them.
+pub fn compute_sound_vmin_vmax(uop: &Arc<UOp>) -> Option<(ConstValue, ConstValue)> {
     use crate::uop::cached_property::CachedProperty;
-    use crate::uop::properties::VminVmaxProperty;
+    use crate::uop::properties::SoundVminVmaxProperty;
 
     match &uop.op {
-        Op::Const(c) => (c.0, c.0),
-        Op::VConst { values } => sources_range_values(values, &uop.dtype),
-        Op::DefineVar { min_val, max_val, .. } => (ConstValue::Int(*min_val), ConstValue::Int(*max_val)),
+        Op::Const(c) => Some((c.0, c.0)),
+        Op::VConst { values } => Some(sources_range_values(values, &uop.dtype)),
+        Op::DefineVar { min_val, max_val, .. } => Some((ConstValue::Int(*min_val), ConstValue::Int(*max_val))),
 
         // [0, end-1] ranges: Range, Special (Tinygrad ops.py:763)
-        Op::Range { end, .. } | Op::Special { end, .. } => zero_to_end_minus_one(end, &uop.dtype),
+        Op::Range { end, .. } | Op::Special { end, .. } => Some(zero_to_end_minus_one(end, &uop.dtype)),
 
-        // Propagate source range: Unroll, Gep, Bind (Tinygrad ops.py:764-768)
+        // Propagate source soundness: Unroll, Gep, Bind
         Op::Unroll { src, .. } | Op::Bind { var: src, .. } | Op::Gep { vector: src, .. } => {
-            let (vmin, vmax) = VminVmaxProperty::get(src);
-            (*vmin, *vmax)
+            *SoundVminVmaxProperty::get(src)
         }
 
-        // Union of element ranges: Vectorize, Cat (Tinygrad ops.py:765)
-        Op::Vectorize { elements } => sources_range(elements, &uop.dtype),
-        Op::Cat { sources } => sources_range(sources, &uop.dtype),
+        // Union of element ranges: Vectorize, Cat — sound only if all sources are sound
+        Op::Vectorize { elements } => sound_sources_range(elements),
+        Op::Cat { sources } => sound_sources_range(sources),
 
+        // Unary: Tinygrad has no explicit unary rules — all fall through to dtype bounds.
+        // Our analysis is more aggressive but some ops (Exp2, Log2, Reciprocal on floats)
+        // can produce NaN/Inf that breaks monotonicity assumptions. Be conservative.
         Op::Unary(op, src) => {
-            let (src_min, src_max) = VminVmaxProperty::get(src);
-            compute_unary_range(*op, *src_min, *src_max, &uop.dtype)
-        }
-        Op::Binary(op, a, b) => {
-            let (a_min, a_max) = VminVmaxProperty::get(a);
-            let (b_min, b_max) = VminVmaxProperty::get(b);
-            compute_binary_range(*op, *a_min, *a_max, *b_min, *b_max, &uop.dtype)
-        }
-        Op::Ternary(op, a, b, c) => {
-            let (cond_min, cond_max) = VminVmaxProperty::get(a);
-            let (true_min, true_max) = VminVmaxProperty::get(b);
-            let (false_min, false_max) = VminVmaxProperty::get(c);
-            compute_ternary_range(*op, *cond_min, *cond_max, *true_min, *true_max, *false_min, *false_max, &uop.dtype)
+            let (src_min, src_max) = (*SoundVminVmaxProperty::get(src))?;
+            // Only Neg and Not are truly monotone/anti-monotone for all inputs
+            match op {
+                UnaryOp::Neg | UnaryOp::Not => Some(compute_unary_range(*op, src_min, src_max, &uop.dtype)),
+                _ => None,
+            }
         }
 
-        // Cast: only narrow for monotone targets (float/signed/index). Tinygrad ops.py:769.
+        // Binary: match Tinygrad's explicit rules
+        Op::Binary(op, a, b) => {
+            let (a_min, a_max) = (*SoundVminVmaxProperty::get(a))?;
+            let (b_min, b_max) = (*SoundVminVmaxProperty::get(b))?;
+            // Const-const fast path: any op on constants is sound
+            if a_min == a_max && b_min == b_max {
+                return Some(compute_binary_range(*op, a_min, a_max, b_min, b_max, &uop.dtype));
+            }
+            match op {
+                // Tinygrad has explicit rules for these
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Max
+                | BinaryOp::Mod
+                | BinaryOp::Idiv
+                | BinaryOp::Shl
+                | BinaryOp::Shr
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Gt
+                | BinaryOp::Ge => Some(compute_binary_range(*op, a_min, a_max, b_min, b_max, &uop.dtype)),
+                // Bool AND/OR have rules in Tinygrad
+                BinaryOp::And | BinaryOp::Or if uop.dtype == DType::Bool => {
+                    Some(compute_binary_range(*op, a_min, a_max, b_min, b_max, &uop.dtype))
+                }
+                // AND with constant non-negative mask (Tinygrad ops.py:739-740)
+                // Only sound when one operand is constant non-negative.
+                BinaryOp::And
+                    if uop.dtype.is_int() && b_min == b_max && matches!(b_min, ConstValue::Int(v) if v >= 0) =>
+                {
+                    Some(compute_binary_range(*op, a_min, a_max, b_min, b_max, &uop.dtype))
+                }
+                // Pow, Fdiv, XOR, OR/AND (non-bool non-int): unsound for variable ranges
+                _ => None,
+            }
+        }
+
+        // Ternary
+        Op::Ternary(op, a, b, c) => {
+            let (a_min, a_max) = (*SoundVminVmaxProperty::get(a))?;
+            let (b_min, b_max) = (*SoundVminVmaxProperty::get(b))?;
+            let (c_min, c_max) = (*SoundVminVmaxProperty::get(c))?;
+            // Const-const-const fast path
+            if a_min == a_max && b_min == b_max && c_min == c_max {
+                return Some(compute_ternary_range(*op, a_min, a_max, b_min, b_max, c_min, c_max, &uop.dtype));
+            }
+            // WHERE for int only (Tinygrad ops.py:760)
+            match op {
+                TernaryOp::Where if uop.dtype.is_int() || uop.dtype == DType::Index => {
+                    Some(compute_ternary_range(*op, a_min, a_max, b_min, b_max, c_min, c_max, &uop.dtype))
+                }
+                _ => None,
+            }
+        }
+
+        // Cast: only for monotone targets (Tinygrad ops.py:770-771)
         Op::Cast { src, .. } => {
             let dt = &uop.dtype;
             if !(dt.is_float() || dt.is_signed() || *dt == DType::Index) {
-                return dtype_bounds(dt);
+                return None;
             }
-            let (src_min, src_max) = VminVmaxProperty::get(src);
+            let (src_min, src_max) = (*SoundVminVmaxProperty::get(src))?;
             let has_special = matches!(src_min, ConstValue::Float(f) if f.is_nan() || f.is_infinite())
                 || matches!(src_max, ConstValue::Float(f) if f.is_nan() || f.is_infinite());
             if has_special {
-                return dtype_bounds(dt);
+                return None;
             }
             let (target_min, target_max) = dtype_bounds(dt);
-            let clamped_min = clamp_value(*src_min, target_min, target_max);
-            let clamped_max = clamp_value(*src_max, target_min, target_max);
-            (clamped_min.cast(dt).unwrap_or(target_min), clamped_max.cast(dt).unwrap_or(target_max))
+            let clamped_min = clamp_value(src_min, target_min, target_max);
+            let clamped_max = clamp_value(src_max, target_min, target_max);
+            Some((clamped_min.cast(dt).unwrap_or(target_min), clamped_max.cast(dt).unwrap_or(target_max)))
         }
 
-        _ => dtype_bounds(&uop.dtype),
+        // Everything else: LOAD, STORE, INDEX, REDUCE, NOOP, etc.
+        _ => None,
     }
 }
 
@@ -87,17 +145,17 @@ fn zero_to_end_minus_one(end: &Arc<UOp>, dtype: &DType) -> (ConstValue, ConstVal
     (ConstValue::Int(0), max)
 }
 
-/// Union of ranges across multiple UOp sources (Vectorize, Cat).
-fn sources_range(sources: &[Arc<UOp>], dtype: &DType) -> (ConstValue, ConstValue) {
+/// Sound union of ranges — returns None if any source is unsound.
+fn sound_sources_range(sources: &[Arc<UOp>]) -> Option<(ConstValue, ConstValue)> {
     use crate::uop::cached_property::CachedProperty;
-    use crate::uop::properties::VminVmaxProperty;
+    use crate::uop::properties::SoundVminVmaxProperty;
     if sources.is_empty() {
-        return dtype_bounds(dtype);
+        return None;
     }
-    let (first_min, first_max) = VminVmaxProperty::get(&sources[0]);
-    sources.iter().skip(1).fold((*first_min, *first_max), |(vmin, vmax), src| {
-        let (s_min, s_max) = VminVmaxProperty::get(src);
-        (min_value(vmin, *s_min), max_value(vmax, *s_max))
+    let (first_min, first_max) = (*SoundVminVmaxProperty::get(&sources[0]))?;
+    sources.iter().skip(1).try_fold((first_min, first_max), |(vmin, vmax), src| {
+        let (s_min, s_max) = (*SoundVminVmaxProperty::get(src))?;
+        Some((min_value(vmin, s_min), max_value(vmax, s_max)))
     })
 }
 
@@ -425,15 +483,14 @@ fn compute_bitwise_range(
     } else {
         match op {
             BinaryOp::And => {
-                // AND result is bounded by the smaller operand
-                // For positive values: 0 <= result <= min(a_max, b_max)
-                if let (ConstValue::Int(a), ConstValue::Int(b)) = (a_max, b_max)
-                    && a >= 0
-                    && b >= 0
+                // Sound only with constant non-negative mask: 0 <= (x & mask) <= mask
+                // (compute_sound_vmin_vmax ensures b_min == b_max >= 0)
+                if let (ConstValue::Int(bmin), ConstValue::Int(bmax)) = (b_min, b_max)
+                    && bmin == bmax
+                    && bmin >= 0
                 {
-                    return (ConstValue::Int(0), ConstValue::Int(a.min(b)));
+                    return (ConstValue::Int(0), ConstValue::Int(bmax));
                 }
-                // Conservative for mixed signs or unknowns
                 dtype_bounds(dtype)
             }
             _ => dtype_bounds(dtype), // OR, XOR are harder to bound

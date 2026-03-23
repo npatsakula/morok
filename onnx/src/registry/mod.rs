@@ -225,14 +225,12 @@ impl OpRegistry {
             "And" => {
                 let a = inp(inputs, 0).cast(DType::Bool)?;
                 let b = inp(inputs, 1).cast(DType::Bool)?;
-                vec![a.try_mul(&b)?]
+                vec![a.bitwise_and(&b)?]
             }
             "Or" => {
                 let a = inp(inputs, 0).cast(DType::Bool)?;
                 let b = inp(inputs, 1).cast(DType::Bool)?;
-                // a | b = a + b - a*b
-                let ab = a.try_mul(&b)?;
-                vec![a.try_add(&b)?.try_sub(&ab)?]
+                vec![a.bitwise_or(&b)?]
             }
             "Xor" => {
                 let x = inp(inputs, 0).cast(DType::Bool)?;

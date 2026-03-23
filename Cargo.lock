@@ -1552,6 +1552,7 @@ dependencies = [
  "bytemuck",
  "morok-dtype",
  "morok-ir",
+ "morok-runtime",
  "morok-schedule",
  "morok-tensor",
  "ndarray",

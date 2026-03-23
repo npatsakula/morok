@@ -584,7 +584,7 @@ fn test_nested_struct_field_extraction() {
             if ranges.len() == indices.len() ~> compute
     };
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let compute = UOp::native_const(42.0f32);
     let range1 = UOp::range(UOp::index_const(10), 0);
     let range2 = UOp::range(UOp::index_const(20), 1);
@@ -612,7 +612,7 @@ fn test_nested_struct_field_extraction_mismatch() {
             if ranges.len() == indices.len() ~> compute
     };
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let compute = UOp::native_const(42.0f32);
     let range1 = UOp::range(UOp::index_const(10), 0);
     let range2 = UOp::range(UOp::index_const(20), 1);
@@ -1061,7 +1061,7 @@ fn test_bufferize_variable_ranges() {
         Bufferize { compute: c, .. } if matches!(c.op(), Op::Const(_)) ~> c
     };
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let const_val = UOp::native_const(42.0f32);
     let range1 = UOp::range(UOp::index_const(10), 0);
     let range2 = UOp::range(UOp::index_const(20), 1);
@@ -1186,7 +1186,7 @@ fn test_tuple_prefix_semantics_vs_exact() {
         Bufferize { compute: c, .. } ~> c
     };
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let const_val = UOp::native_const(42.0f32);
     let range1 = UOp::range(UOp::index_const(10), 0);
     let range2 = UOp::range(UOp::index_const(20), 1);

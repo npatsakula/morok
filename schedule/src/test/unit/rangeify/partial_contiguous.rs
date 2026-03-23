@@ -224,7 +224,7 @@ fn test_disabled_config_no_rewrite() {
     let (_buffer, range1, range2, compute) = create_simple_graph(&mut ctx);
 
     // Create INDEX(BUFFERIZE(compute, [r1, r2]), [r1, r2])
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![range1.clone(), range2.clone()], vec![range1, range2], opts);
 
     // Apply rewrite - should not change anything
@@ -244,7 +244,7 @@ fn test_cheap_inline_removal() {
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
     let const_val = UOp::native_const(1.0f32);
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(const_val.clone(), vec![range], opts);
 
     // Apply rewrite - should remove BUFFERIZE and return const
@@ -265,7 +265,7 @@ fn test_nested_bufferize_removal() {
 
     // Create nested BUFFERIZE(BUFFERIZE(const, r1), r2)
     let const_val = UOp::native_const(1.0f32);
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let inner = UOp::bufferize(const_val.clone(), vec![range.clone()], opts.clone());
     let outer = UOp::bufferize(inner, vec![range.clone()], opts);
 
@@ -288,7 +288,7 @@ fn test_simple_index_bufferize_pattern() {
     let (_buffer, range1, range2, compute) = create_simple_graph(&mut ctx);
 
     // Create INDEX(BUFFERIZE(compute, [r1, r2]), [r1, r2])
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![range1.clone(), range2.clone()], vec![range1, range2], opts);
 
     // Apply rewrite
@@ -322,7 +322,7 @@ fn test_accessed_buffers_threshold(num_buffers: usize) {
     let (_buffers, ranges, compute) = create_multi_buffer_graph(&mut ctx, num_buffers);
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite
@@ -369,7 +369,7 @@ fn test_accessed_buffers_with_duplicates() {
     let compute = idx1.try_add(&idx2).expect("Failed to create ADD").try_add(&idx3).expect("Failed to create ADD");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - should see this as 1 buffer accessed (not 3)
@@ -409,7 +409,7 @@ fn test_accessed_buffers_nested_computation() {
     let compute = left.try_mul(&right).expect("Failed to create MUL");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - with 4 buffers (> threshold of 3), should keep buffer
@@ -440,7 +440,7 @@ fn test_out_in_ratio_efficient_buffer() {
     let (_input_buffer, _output_size, ranges, compute) = create_ratio_test_graph(&mut ctx, input_size, output_size);
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite — like Tinygrad, simple path (no buffer in reduce) always inlines
@@ -468,7 +468,7 @@ fn test_out_in_ratio_at_threshold() {
     let (_input_buffer, _output_size, ranges, compute) = create_ratio_test_graph(&mut ctx, input_size, output_size);
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite
@@ -496,7 +496,7 @@ fn test_out_in_ratio_wasteful_buffer() {
     let (_input_buffer, _output_size, ranges, compute) = create_ratio_test_graph(&mut ctx, input_size, output_size);
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - wasteful buffer should be optimized
@@ -537,7 +537,7 @@ fn test_out_in_ratio_flash_attention_simulation() {
     let compute = UOp::index().buffer(input_buffer).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - extreme ratio should be eligible for optimization
@@ -569,7 +569,7 @@ fn test_out_in_ratio_symbolic_sizes() {
     let compute = UOp::index().buffer(buffer).indices(ranges.clone()).call().expect("Failed to create INDEX");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - with symbolic sizes, ratio is None, should keep buffer
@@ -602,7 +602,7 @@ fn test_out_in_ratio_no_inputs() {
     let const_val = UOp::native_const(1.0f32);
 
     // Create INDEX(BUFFERIZE(const, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(const_val, ranges.clone(), ranges, opts);
 
     // Apply rewrite - should be handled by cheap_inline pattern instead
@@ -639,7 +639,7 @@ fn test_buffer_not_in_reduce_full_removal() {
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - without reduce, should do full removal
@@ -665,7 +665,7 @@ fn test_buffer_in_reduce_partial_contiguous() {
     let (ranges, compute) = create_reduce_graph(&mut ctx, true);
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(compute, ranges.clone(), opts.clone());
 
     // For REDUCE patterns, we need an INDEX to trigger Pattern 4
@@ -701,7 +701,7 @@ fn test_reduce_without_buffer_access_full_removal() {
     let compute = buffer_indexed.try_add(&reduce_compute).expect("Failed to create ADD");
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - REDUCE exists but doesn't access buffer, so full removal
@@ -743,7 +743,7 @@ fn test_multiple_reduces_with_buffer() {
     );
 
     // Create INDEX(BUFFERIZE(reduce2, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(reduce2, ranges, opts);
 
     // Apply rewrite - multiple reduces accessing buffer
@@ -788,7 +788,7 @@ fn test_nested_reduce_with_buffer() {
     );
 
     // Create BUFFERIZE(outer_reduce, ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(outer_reduce, ranges, opts);
 
     // Apply rewrite - nested reduces with buffer access
@@ -839,7 +839,7 @@ fn test_pattern1_cheap_inline() {
 
     // BUFFERIZE(const) - Pattern 1 should inline this
     let const_val = UOp::native_const(42.0f32);
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(const_val.clone(), vec![range], opts);
 
     // Apply rewrite - Pattern 1 should match
@@ -875,7 +875,7 @@ fn test_pattern4_full_removal_with_permissive_config() {
     let compute = indexed;
 
     // Create INDEX(BUFFERIZE(compute, [range]), [range])
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
 
     let bufferizes_before = count_bufferizes(&idx_buf);
@@ -914,7 +914,7 @@ fn test_pattern4_keeps_efficient_buffer() {
     let compute = indexed;
 
     // Create INDEX(BUFFERIZE(compute, [range]), [range])
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite — like Tinygrad, simple path (no buffer in reduce) always inlines
@@ -937,7 +937,7 @@ fn test_pattern1_preserves_dtype() {
     // Create BUFFERIZE(const) with specific dtype
     let const_val = UOp::native_const(42.0f32);
     let original_dtype = const_val.dtype();
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(const_val, vec![range], opts);
 
     // Apply rewrite
@@ -963,7 +963,7 @@ fn test_full_removal_blocked_by_heuristics() {
     let (_buffers, ranges, compute) = create_multi_buffer_graph(&mut ctx, 4);
 
     // Create INDEX(BUFFERIZE(compute, ranges), ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Apply rewrite - should NOT do full removal due to accessed_buffers heuristic
@@ -1002,7 +1002,7 @@ fn test_partial_contiguous_single_reduce() {
     );
 
     // Create INDEX(BUFFERIZE(reduce, [loop]), [loop])
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(reduce.clone(), vec![loop_range.clone()], opts);
     let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
@@ -1036,7 +1036,7 @@ fn test_partial_contiguous_local_axis() {
     let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
     // Create INDEX(BUFFERIZE(compute, all_ranges), all_ranges)
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, all_ranges.clone(), all_ranges, opts);
 
     // Apply rewrite
@@ -1070,7 +1070,7 @@ fn test_partial_contiguous_mixed_axes() {
     );
 
     // Create INDEX(BUFFERIZE(reduce, [loop]), [loop])
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);
     let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
@@ -1105,7 +1105,7 @@ fn test_partial_contiguous_different_reduce_ops() {
             .expect("Failed to create INDEX");
         let reduce = indexed.reduce(smallvec::smallvec![reduce_range], reduce_op);
 
-        let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+        let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
         let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);
         let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
@@ -1148,7 +1148,7 @@ fn test_partial_contiguous_multi_dimensional_reduce() {
     );
 
     // Create INDEX(BUFFERIZE(reduce, [loop]), [loop])
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);
     let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
@@ -1194,7 +1194,7 @@ fn test_partial_contiguous_blocked_by_heuristics() {
     );
 
     // Create INDEX(BUFFERIZE(reduce, [loop]), [loop])
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(reduce, vec![loop_range.clone()], opts);
     let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
@@ -1225,7 +1225,7 @@ fn test_edge_case_empty_computation() {
     let indexed = UOp::index().buffer(buffer).indices(vec![range.clone()]).call().expect("Failed to create INDEX");
 
     // Bufferize it
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(indexed, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite - should not panic
@@ -1250,7 +1250,7 @@ fn test_edge_case_all_const_operations() {
     let compute = const1.try_add(&const2).expect("Failed to create ADD");
 
     // Bufferize it
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(compute.clone(), vec![range], opts);
 
     // Like Tinygrad, only bare BUFFERIZE(CONST) is folded — BUFFERIZE(ADD(const, const))
@@ -1274,7 +1274,7 @@ fn test_edge_case_deeply_nested_bufferize() {
 
     // Create deeply nested: BUFFERIZE(BUFFERIZE(BUFFERIZE(const)))
     let const_val = UOp::native_const(42.0f32);
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
 
     let level1 = UOp::bufferize(const_val, vec![range.clone()], opts.clone());
     let level2 = UOp::bufferize(level1, vec![range.clone()], opts.clone());
@@ -1306,7 +1306,7 @@ fn test_edge_case_zero_sized_range() {
     let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
     // Bufferize with zero range
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![zero_range.clone()], vec![zero_range], opts);
 
     // Apply rewrite - should handle gracefully
@@ -1332,7 +1332,7 @@ fn test_config_custom_max_buffers_threshold() {
     // Create computation with 4 buffers (above default threshold, below permissive)
     let (_buffers, ranges, compute) = create_multi_buffer_graph(&mut ctx, 4);
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Default config should NOT optimize (4 > 3)
@@ -1375,7 +1375,7 @@ fn test_config_custom_ratio_threshold() {
     let compute = indexed.reduce(smallvec::smallvec![reduce_range], ReduceOp::Add);
 
     // Create INDEX(BUFFERIZE(compute, [outer_range]), [outer_range])
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![outer_range.clone()], vec![outer_range], opts);
 
     // Strict config: low ratio → should KEEP buffer
@@ -1413,7 +1413,7 @@ fn test_config_level_0_vs_2() {
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
 
     // Level 0: Pattern 4 disabled → should NOT optimize
@@ -1445,7 +1445,7 @@ fn test_config_different_configs_produce_different_results() {
     // Create computation with 3 buffers
     let (_buffers, ranges, compute) = create_multi_buffer_graph(&mut ctx, 3);
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, ranges.clone(), ranges, opts);
 
     // Config1 (threshold=2): should NOT optimize (3 > 2)
@@ -1497,7 +1497,7 @@ fn test_pipeline_multiple_patterns_in_sequence() {
     // Pattern 3 should remove inner BUFFERIZE
     // Pattern 1 should then remove outer BUFFERIZE
     let const_val = UOp::native_const(1.0f32);
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let inner = UOp::bufferize(const_val.clone(), vec![range.clone()], opts.clone());
     let outer = UOp::bufferize(inner, vec![range], opts);
 
@@ -1531,7 +1531,7 @@ fn test_pipeline_preserves_graph_structure() {
     let add = mul.try_add(&one).expect("Failed to create ADD");
 
     // Bufferize and index
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(add, vec![range.clone()], vec![range], opts);
 
     // Original dtype
@@ -1559,7 +1559,7 @@ fn test_pipeline_cheap_inline_interaction() {
     let const_val = UOp::native_const(5.0f32);
     let neg = const_val.neg();
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(neg.clone(), vec![range], opts);
 
     // Like Tinygrad, only bare BUFFERIZE(CONST) is folded — not BUFFERIZE(unary(CONST)).
@@ -1602,7 +1602,7 @@ fn test_symbolic_buffer_size_handling() {
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     // Bufferize with symbolic range
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(compute, vec![symbolic_range.clone()], opts);
     let idx_buf = UOp::index().buffer(bufferized).indices(vec![symbolic_range]).call().expect("Failed to create INDEX");
 
@@ -1633,7 +1633,7 @@ fn test_all_symbolic_sizes() {
     let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
     // Bufferize with symbolic ranges
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(compute, vec![range_m.clone()], opts);
     let idx_buf = UOp::index().buffer(bufferized).indices(vec![range_m]).call().expect("Failed to create INDEX");
 
@@ -1672,7 +1672,7 @@ fn test_mixed_concrete_symbolic_sizes() {
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
     // Bufferize with mixed ranges
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(compute, vec![concrete_range.clone(), symbolic_range.clone()], opts);
     let idx_buf = UOp::index()
         .buffer(bufferized)
@@ -1712,7 +1712,7 @@ fn test_complex_diamond_pattern() {
     let add = mul1.try_add(&mul2).expect("Failed to create ADD");
 
     // Bufferize and index
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(add, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite - should handle diamond correctly
@@ -1742,7 +1742,7 @@ fn test_complex_deep_computation_chain() {
     }
 
     // Bufferize the chain
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(current, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite
@@ -1778,7 +1778,7 @@ fn test_complex_multiple_independent_buffers() {
     }
 
     // Bufferize
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![range.clone()], vec![range], opts);
 
     // Apply rewrite - should block due to >3 buffers
@@ -1827,7 +1827,7 @@ fn test_complex_multiple_sequential_reduces() {
     let combined = reduce1.try_add(&reduce2).expect("Failed to create ADD");
 
     // Bufferize
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(combined, vec![loop_range.clone()], opts);
     let idx_buf = UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("Failed to create INDEX");
 
@@ -1859,7 +1859,7 @@ fn test_boundary_very_large_buffer() {
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![large_range.clone()], vec![large_range], opts);
 
     // Apply rewrite
@@ -1883,7 +1883,7 @@ fn test_boundary_size_one_dimension() {
     let two = UOp::native_const(2.0f32);
     let compute = indexed.try_mul(&two).expect("Failed to create MUL");
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![range1.clone()], vec![range1], opts);
 
     // Apply rewrite
@@ -1912,7 +1912,7 @@ fn test_boundary_exact_threshold_values() {
     let one = UOp::native_const(1.0f32);
     let compute = indexed.try_add(&one).expect("Failed to create ADD");
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let idx_buf = create_index_bufferize(compute, vec![output_range.clone()], vec![output_range], opts);
 
     // Apply rewrite - at threshold should optimize (ratio >= 10.0)
@@ -1935,7 +1935,7 @@ fn test_boundary_minimal_computation() {
     let mut ctx = IndexingContext::new();
     let range = ctx.new_range(&SInt::Const(10), AxisType::Loop);
 
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(const_val, vec![range], opts);
 
     // Apply rewrite - Pattern 1 should inline const

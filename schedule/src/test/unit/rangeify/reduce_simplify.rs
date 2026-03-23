@@ -398,3 +398,109 @@ fn test_range_size_extraction_non_range() {
     let sum = a.try_add(&b).unwrap();
     assert_eq!(crate::rangeify::indexing::range_size_as_i64(&sum), None);
 }
+
+// ===== reduce_mul_chain Tests =====
+
+#[test]
+fn test_reduce_mul_chain_simple_const() {
+    // REDUCE(range * 3, [range], ADD) → REDUCE(range, [range], ADD) * 3
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
+    let three = UOp::native_const(3i32);
+    let src = range.cast(DType::Int32).mul(&three);
+    let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
+
+    let result = reduce_unparented(&reduce).expect("Should factor const out of reduce");
+
+    // Result should have MUL at top level (reduce * 3)
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)));
+
+    // Inner should be REDUCE
+    if let Op::Binary(BinaryOp::Mul, inner, _factor) = result.op() {
+        assert!(matches!(inner.op(), Op::Reduce { .. }));
+    }
+}
+
+#[test]
+fn test_reduce_mul_chain_no_outside_factors() {
+    // REDUCE(range * range, [range], ADD) — all factors reference the range
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
+    let range_int = range.cast(DType::Int32);
+    let src = range_int.mul(&range_int);
+    let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
+
+    // reduce_unparented may still work (via reduce_collapse), but reduce_mul_chain
+    // specifically shouldn't factor anything out since both factors reference the range.
+    // We just verify it doesn't crash.
+    let _result = reduce_unparented(&reduce);
+}
+
+#[test]
+fn test_reduce_mul_chain_multiple_factors() {
+    // REDUCE(a * range * b, [range], ADD) where a, b are constants
+    // → REDUCE(range, [range], ADD) * a * b
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
+    let a = UOp::native_const(2i32);
+    let b = UOp::native_const(5i32);
+    let range_int = range.cast(DType::Int32);
+    let src = a.mul(&range_int).mul(&b);
+    let reduce = src.reduce(vec![range].into(), ReduceOp::Add);
+
+    let result = reduce_unparented(&reduce).expect("Should factor constants out");
+
+    // Result should be: REDUCE(range_int, ...) * 2 * 5
+    // Top level should be MUL
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)));
+}
+
+#[test]
+fn test_reduce_mul_chain_max_positive_factor() {
+    // REDUCE(range * 3, [range], MAX) → REDUCE(range, [range], MAX) * 3
+    // (3 >= 0, so it can be factored out)
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
+    let three = UOp::native_const(3i32);
+    let range_int = range.cast(DType::Int32);
+    let src = range_int.mul(&three);
+    let reduce = src.reduce(vec![range].into(), ReduceOp::Max);
+
+    let result = reduce_unparented(&reduce).expect("Should factor positive const out of MAX reduce");
+
+    assert!(matches!(result.op(), Op::Binary(BinaryOp::Mul, _, _)));
+}
+
+#[test]
+fn test_reduce_mul_chain_max_negative_factor_stays() {
+    // REDUCE(range * (-1), [range], MAX) — should NOT factor out (-1 < 0)
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
+    let neg_one = UOp::native_const(-1i32);
+    let range_int = range.cast(DType::Int32);
+    let src = range_int.mul(&neg_one);
+    let reduce = src.reduce(vec![range].into(), ReduceOp::Max);
+
+    // The mul_chain pattern should not fire (only 2 factors, one inside, one negative outside)
+    // The result should either be None or not have factored the -1 outside
+    let result = reduce_unparented(&reduce);
+    if let Some(ref res) = result {
+        // If some other pattern rewrote it, that's fine. But if it's a MUL at top,
+        // the REDUCE shouldn't have been split incorrectly.
+        if let Op::Binary(BinaryOp::Mul, _inner, factor) = res.op() {
+            // The -1 should NOT be factored outside a MAX reduce
+            if let Op::Const(c) = factor.op() {
+                assert!(
+                    c.0 != morok_ir::ConstValue::Int(-1),
+                    "Negative factor should not be factored out of MAX reduce"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_reduce_mul_chain_single_factor_no_op() {
+    // REDUCE(range, [range], ADD) — single factor, should not trigger mul_chain
+    let range = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Reduce);
+    let reduce = range.cast(DType::Int32).reduce(vec![range].into(), ReduceOp::Add);
+
+    // This might succeed via reduce_collapse, but not via mul_chain
+    // (mul_chain requires the src to be a MUL op)
+    let _result = reduce_unparented(&reduce);
+}

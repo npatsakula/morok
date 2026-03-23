@@ -38,7 +38,7 @@ fn test_empty_bufferize() {
         Op::Bufferize {
             compute: compute.clone(),
             ranges: SmallVec::new(),
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
+            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true },
         },
         DType::Float32,
     );
@@ -101,7 +101,7 @@ fn test_zero_size_pipeline() {
         Op::Bufferize {
             compute,
             ranges: SmallVec::new(),
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
+            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true },
         },
         DType::Int32,
     );
@@ -129,7 +129,7 @@ fn test_bufferize_with_zero_range_inside() {
         Op::Bufferize {
             compute: compute.clone(),
             ranges: smallvec::smallvec![range_zero.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global },
+            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true },
         },
         DType::Float32,
     );
@@ -153,7 +153,7 @@ fn test_multiple_zero_ranges() {
         Op::Bufferize {
             compute,
             ranges: smallvec::smallvec![range1.clone(), range2.clone()],
-            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Local },
+            opts: BufferizeOpts { device: None, addrspace: AddrSpace::Local, removable: true },
         },
         DType::Bool,
     );

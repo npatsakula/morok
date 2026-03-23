@@ -491,3 +491,55 @@ crate::codegen_tests! {
         assert!(m.iter().all(|&v| v)); // all true
     }
 }
+
+/// DenseNet 2-layer kernel structure regression test.
+/// Verifies rangeify produces 6 kernels matching Tinygrad's kernel splitting.
+#[test]
+fn test_densenet_two_layer_kernel_count() {
+    use ndarray::Array4;
+
+    let mk_bn_params = |ch: usize| {
+        let mean = Tensor::from_slice(vec![0.0f32; ch]);
+        let var = Tensor::from_slice(vec![1.0f32; ch]);
+        let gamma = Tensor::from_slice(vec![1.0f32; ch]);
+        let beta = Tensor::from_slice(vec![0.0f32; ch]);
+        let invstd =
+            (&var + Tensor::const_(1e-5f64, morok_dtype::DType::Float32)).try_sqrt().unwrap().reciprocal().unwrap();
+        (mean, invstd, gamma, beta)
+    };
+
+    let x0 = Tensor::from_ndarray(&Array4::<f32>::ones((1, 64, 14, 14)));
+
+    // Layer 1: BN+ReLU → Conv1x1(128) → BN+ReLU → Conv3x3(32) → Cat
+    let (m, inv, g, b) = mk_bn_params(64);
+    let bn1 = x0.batchnorm().mean(&m).invstd(&inv).scale(&g).bias(&b).call().unwrap().relu().unwrap();
+    let w1x1 = Tensor::from_ndarray(&Array4::<f32>::ones((128, 64, 1, 1)));
+    let conv1x1 = bn1.conv2d().weight(&w1x1).call().unwrap();
+    let (m, inv, g, b) = mk_bn_params(128);
+    let bn2 = conv1x1.batchnorm().mean(&m).invstd(&inv).scale(&g).bias(&b).call().unwrap().relu().unwrap();
+    let w3x3 = Tensor::from_ndarray(&Array4::<f32>::ones((32, 128, 3, 3)));
+    let conv3x3 = bn2.conv2d().weight(&w3x3).padding(&[(1, 1), (1, 1)]).call().unwrap();
+    let cat1 = Tensor::cat(&[&x0, &conv3x3], 1).unwrap();
+
+    // Layer 2: same pattern
+    let (m, inv, g, b) = mk_bn_params(96);
+    let bn3 = cat1.batchnorm().mean(&m).invstd(&inv).scale(&g).bias(&b).call().unwrap().relu().unwrap();
+    let w1x1_2 = Tensor::from_ndarray(&Array4::<f32>::ones((128, 96, 1, 1)));
+    let conv1x1_2 = bn3.conv2d().weight(&w1x1_2).call().unwrap();
+    let (m, inv, g, b) = mk_bn_params(128);
+    let bn4 = conv1x1_2.batchnorm().mean(&m).invstd(&inv).scale(&g).bias(&b).call().unwrap().relu().unwrap();
+    let w3x3_2 = Tensor::from_ndarray(&Array4::<f32>::ones((32, 128, 3, 3)));
+    let conv3x3_2 = bn4.conv2d().weight(&w3x3_2).padding(&[(1, 1), (1, 1)]).call().unwrap();
+    let result = Tensor::cat(&[&cat1, &conv3x3_2], 1).unwrap();
+
+    let uop = result.uop();
+    let sink = morok_ir::UOp::sink(vec![uop.clone()]);
+    let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(sink, None).unwrap();
+    let (kernels_root, _kctx) = morok_schedule::rangeify::run_kernel_split_pipeline(rangeified);
+
+    let kernels: Vec<_> =
+        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Kernel { .. })).collect();
+
+    // 6 kernels matching Tinygrad: BN+ReLU, Conv1x1+BN+ReLU, Conv3x3+Cat (×2 layers)
+    assert_eq!(kernels.len(), 6, "Expected 6 kernels for 2 dense layers, got {}", kernels.len());
+}

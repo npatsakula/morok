@@ -332,4 +332,4 @@ You've learned the core patterns for using Morok:
 
 - [Op Bestiary](./architecture/op-bestiary) — Reference for IR operations
 - [Execution Pipeline](./architecture/pipeline) — How compilation works
-- [Optimization System](./architecture/optimizations) — Pattern-based rewrites
+- [Pattern Engine](./architecture/optimizations/pattern-system) — Pattern-based rewrites

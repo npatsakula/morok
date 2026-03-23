@@ -57,7 +57,7 @@ fn test_transform_realizable_source() {
     ctx.mark_realize(&x, vec![0]);
 
     // Transform
-    let new_src = transform_single_source(&x, std::slice::from_ref(&range), &mut ctx);
+    let new_src = transform_single_source(&consumer, &x, std::slice::from_ref(&range), &mut ctx);
 
     // Should be INDEX(BUFFERIZE(x))
     if let Op::Index { buffer, .. } = new_src.op() {

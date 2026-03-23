@@ -138,7 +138,7 @@ Rangeify isn't a single transformation—it's a multi-stage pipeline:
 
 The mega-pass combines multiple symbolic and structural optimizations into a single fixpoint loop. Per-kernel passes then run in `apply_pre_optimization()`.
 
-Each pass uses pattern-based rewriting (see the [Pattern-Based Optimization](./optimizations) chapter). Patterns fire until no more match, then the next pass begins.
+Each pass uses pattern-based rewriting (see the [Pattern Engine](./optimizations/pattern-system) chapter). Patterns fire until no more match, then the next pass begins.
 
 ### Before and After
 

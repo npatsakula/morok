@@ -128,8 +128,9 @@ impl IndexingContext {
 pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingContext)> {
     let mut ctx = IndexingContext::new();
 
-    // Step 1: Generate realize map - determine which UOps need materialization
-    generate_realize_map(&sink, &mut ctx)?;
+    // Step 1: Generate realize map via pattern matcher (Tinygrad: pm_generate_realize_map)
+    // Tinygrad (indexing.py:163): bottom_up=True — patterns see ORIGINAL children
+    crate::rewrite::graph_rewrite_bottom_up(pm_generate_realize_map(), sink.clone(), &mut ctx);
 
     // Step 2: Get toposort (root-to-leaves) and consumer map
     let consumer_map = sink.get_consumer_map();
@@ -140,49 +141,94 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
     // Step 3: Assign ranges via forward traversal
     assign_ranges(&forward_topo, &consumer_map, &mut ctx)?;
 
-    // Step 4: Apply early rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
-    let early_matcher = super::patterns::early_rewrites();
-    let transformed_sink = crate::rewrite::graph_rewrite(&early_matcher, sink, &mut ());
+    // Step 4: Apply rangeify patterns (Tinygrad: pm_apply_rangeify, indexing.py:275)
+    // Converts ReduceAxis→REDUCE, PAD→WHERE, creates BUFFERIZE+INDEX, removes movement ops.
+    // Must run bottom_up so patterns see ORIGINAL children (Tinygrad: bottom_up=True).
+    let rangeify_matcher = super::patterns::apply_rangeify_patterns();
+    let transformed_sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, sink, &mut ctx);
 
     Ok((transformed_sink, ctx))
 }
 
-/// Generate the realize map - mark which UOps need to be materialized to buffers.
-#[instrument(skip(sink, ctx))]
-fn generate_realize_map(sink: &Arc<UOp>, ctx: &mut IndexingContext) -> morok_ir::Result<()> {
-    for node in sink.toposort() {
-        trace!(node_id = node.id, op = ?std::mem::discriminant(node.op()), "processing node");
-        match node.op() {
-            Op::Sink { sources } => {
-                for src in sources {
-                    if !is_always_contiguous(src) {
-                        ctx.mark_realize_all(src)?;
-                    }
+/// Pattern matcher for generating the realize map (Tinygrad: `pm_generate_realize_map`).
+///
+/// Marks which UOps need to be materialized to buffers:
+/// - SINK sources (if not always-contiguous)
+/// - COPY, CONTIGUOUS, ASSIGN (always realized)
+/// - Sources of COPY, MSTACK, MSELECT, ASSIGN (realized if not always-contiguous)
+///
+/// Patterns return `None` (no rewrite) — context side-effects mark nodes in the realize map.
+fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingContext> {
+    crate::cached_patterns! {
+        @context IndexingContext;
+
+        // SINK sources → realize non-contiguous sources
+        // Tinygrad indexing.py:22
+        x @ Sink { sources: _ } => |x, ctx| {
+            for src in x.op().sources() {
+                if !is_always_contiguous(&src) {
+                    ctx.mark_realize_all(&src).ok();
                 }
             }
-            Op::Copy { .. } | Op::Contiguous { .. } => {
-                ctx.mark_realize_all(&node)?;
+            None
+        },
+
+        // Always realize these ops
+        // Tinygrad indexing.py:24: COPY, BUFFER_VIEW, CONTIGUOUS, STORE, ASSIGN, ENCDEC
+        x @ Store { index: _, value: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
+        x @ BufferView { buffer: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
+
+        // Tinygrad indexing.py:26: always realize REDUCE on outer ranges
+        x @ Reduce { src: _, ranges, reduce_op: _ } => |x, ctx| {
+            if ranges.iter().any(|r| matches!(r.op(), Op::Range { axis_type, .. } if *axis_type == AxisType::Outer)) {
+                ctx.mark_realize_all(x).ok();
             }
-            Op::MStack { buffers } => {
-                for buf in buffers {
-                    if !is_always_contiguous(buf) {
-                        ctx.mark_realize_all(buf)?;
-                    }
+            None
+        },
+
+        x @ Copy { src: _ } => |x, ctx| {
+            ctx.mark_realize_all(x).ok();
+            // Also realize sources (Tinygrad indexing.py:28)
+            for src in x.op().sources() {
+                if !is_always_contiguous(&src) {
+                    ctx.mark_realize_all(&src).ok();
                 }
             }
-            // NOTE: ReduceAxis does NOT get unconditional realization.
-            // Tinygrad only realizes ReduceAxis when:
-            // 1. It has ending_ranges (nested reduction detection)
-            // 2. Consumer range conflicts (handled by merge_consumer_ranges)
-            // 3. Being a SINK source (handled above)
-            _ => {}
-        }
+            None
+        },
+        x @ Contiguous { src: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
+        x @ Assign { target: _, value: _ } => |x, ctx| {
+            ctx.mark_realize_all(x).ok();
+            for src in x.op().sources() {
+                if !is_always_contiguous(&src) {
+                    ctx.mark_realize_all(&src).ok();
+                }
+            }
+            None
+        },
+
+        // MStack/MSelect → realize sources (Tinygrad indexing.py:28)
+        x @ MStack { buffers: _ } => |x, ctx| {
+            for src in x.op().sources() {
+                if !is_always_contiguous(&src) {
+                    ctx.mark_realize_all(&src).ok();
+                }
+            }
+            None
+        },
+        x @ MSelect { device_index: _ } => |x, ctx| {
+            for src in x.op().sources() {
+                if !is_always_contiguous(&src) {
+                    ctx.mark_realize_all(&src).ok();
+                }
+            }
+            None
+        },
     }
-    Ok(())
 }
 
 /// Check if a UOp is always contiguous (doesn't need realization).
-fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
+pub(crate) fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
     matches!(
         uop.op(),
         Op::Contiguous { .. }
@@ -233,6 +279,21 @@ pub(crate) fn merge_consumer_ranges(
     let mut out_rngs = Vec::new();
     let mut realize_axes = Vec::new();
 
+    // Tinygrad indexing.py:212: compute all_all_same FIRST — if ANY dimension
+    // has incompatible ranges across consumers, ALL dimensions get realized.
+    // With PCONTIG=0 (default): condition per-dim = `all_all_same || (PCONTIG && all_same(dim))`.
+    // When all_all_same=False and PCONTIG=0, this is always False → all dims realized.
+    let all_all_same = all_rngs.iter().all(|dim_ranges| {
+        if dim_ranges.is_empty() {
+            return false;
+        }
+        if dim_ranges.iter().skip(1).all(|r| Arc::ptr_eq(&dim_ranges[0], r)) {
+            return true;
+        }
+        let indices: Vec<_> = dim_ranges.iter().map(|r| r.get_idx()).collect();
+        all_ranges_same(&indices)
+    });
+
     for (dim_idx, dim_ranges) in all_rngs.iter().enumerate() {
         if dim_ranges.is_empty() {
             out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Loop));
@@ -241,31 +302,20 @@ pub(crate) fn merge_consumer_ranges(
         }
 
         // FAST PATH: If all ranges are pointer-equal, return original unchanged
-        if dim_ranges.iter().skip(1).all(|r| Arc::ptr_eq(&dim_ranges[0], r)) {
+        if dim_ranges.iter().skip(1).all(|r| Arc::ptr_eq(&dim_ranges[0], r)) && all_all_same {
             out_rngs.push(Arc::clone(&dim_ranges[0]));
             continue;
+            // all_all_same=False but this dim is same → still realize (Tinygrad behavior with PCONTIG=0)
         }
-
-        // Debug: show which ranges are being compared
-        debug!(
-            dim_idx = dim_idx,
-            range_ids = ?dim_ranges.iter().map(|r| r.id).collect::<Vec<_>>(),
-            range_ops = ?dim_ranges.iter().map(|r| format!("{:?}", r.op())).collect::<Vec<_>>(),
-            "merge_consumer_ranges: ranges differ at dimension"
-        );
 
         let indices: Vec<_> = dim_ranges.iter().map(|r| r.get_idx()).collect();
         let valids: Vec<_> = dim_ranges.iter().map(|r| r.get_valid()).collect();
-
         let ranges_same = all_ranges_same(&indices);
-        debug!(
-            dim_idx = dim_idx,
-            ranges_same = ranges_same,
-            index_count = indices.len(),
-            "merge_consumer_ranges: all_ranges_same result"
-        );
 
-        if ranges_same {
+        // Tinygrad: `if all_all_same or (PCONTIG and all_same(local_rngs)):` → merge
+        // With PCONTIG=0: only merge when all_all_same is True
+        if all_all_same || ranges_same {
+            debug!(dim_idx, ranges_same, all_all_same, "merge_consumer_ranges: merging dimension");
             let merged_idx = Arc::clone(&indices[0]);
             let merged_valid = if valids.len() == 1 {
                 Arc::clone(&valids[0])
@@ -278,17 +328,15 @@ pub(crate) fn merge_consumer_ranges(
             } else {
                 UOp::try_where(merged_valid, merged_idx, UOp::invalid_marker())?
             };
-
             out_rngs.push(merged_range);
         } else {
-            debug!(dim_idx = dim_idx, "merge_consumer_ranges: creating NEW Loop range (ranges not compatible)");
+            debug!(dim_idx, "merge_consumer_ranges: creating NEW Loop range (ranges not compatible)");
             out_rngs.push(ctx.new_range(&shape[dim_idx], AxisType::Loop));
             realize_axes.push(dim_idx);
         }
     }
 
     if !realize_axes.is_empty() {
-        // Partial realization: only realize conflicting axes (matching Tinygrad indexing.py:222)
         warn!(realize_axes = ?realize_axes, "range conflict detected - marking axes for realization");
         ctx.mark_realize(uop, realize_axes.clone());
     }
@@ -687,14 +735,13 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                         SInt::Const(n) => UOp::index_const(*n as i64 + begin as i64),
                         SInt::Symbolic(uop) => uop.try_add(&begin_uop).unwrap(),
                     };
-                    // valid_low = rng >= begin (directly, instead of XOR(CMPLT, TRUE))
-                    let valid_low = rng.try_cmpge(&begin_uop).unwrap();
+                    // valid_low = NOT(rng < begin), canonical form for parse_valid
+                    // (Tinygrad encodes >= as CMPNE(CMPLT, True); we use Not(Lt))
+                    let valid_low = rng.try_cmplt(&begin_uop).unwrap().not();
                     let valid_high = rng.try_cmplt(&shape_plus_begin).unwrap();
                     let valid = valid_low.try_and_op(&valid_high).unwrap();
-                    // Simplify validity expression so downstream patterns match cleanly
-                    // (like Tinygrad: graph_rewrite(validity, symbolic+pm_simplify_valid))
-                    let valid =
-                        crate::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic_simple(), valid, &mut ());
+                    // Simplify validity expression (Tinygrad: graph_rewrite(validity, symbolic+pm_simplify_valid))
+                    let valid = crate::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic(), valid, &mut ());
                     let adjusted_rng = rng.try_sub(&begin_uop).unwrap();
                     UOp::try_where(valid, adjusted_rng, UOp::invalid_marker()).unwrap()
                 })
@@ -784,69 +831,42 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
 
             trace!(combined_axes.id = combined_axes.id, "reshape flatten combined");
 
-            // Unflatten into input shape dimensions
-            // Apply range-based simplification:
-            //   x % n → x when 0 <= vmin(x) && vmax(x) < n
-            //   x / n → 0 when 0 <= vmin(x) && vmax(x) < n
-            use morok_ir::types::ConstValue;
-            use morok_ir::uop::cached_property::CachedProperty;
-            use morok_ir::uop::properties::VminVmaxProperty;
-
-            fn simplify_mod(x: &Arc<UOp>, n: i64) -> Arc<UOp> {
-                let (vmin, vmax) = VminVmaxProperty::get(x);
-                if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
-                    && *min >= 0
-                    && *max < n
-                {
-                    // x is always in range [0, n), so x % n = x
-                    tracing::trace!(n, min, max, "simplify_mod: SIMPLIFIED to identity");
-                    return Arc::clone(x);
-                }
-                tracing::trace!(n, ?vmin, ?vmax, x.tree = %x.tree(), "simplify_mod: NOT simplified");
-                let n_uop = UOp::index_const(n);
-                x.try_mod(&n_uop).unwrap()
-            }
-
-            fn simplify_div(x: &Arc<UOp>, n: i64) -> Arc<UOp> {
-                let (vmin, vmax) = VminVmaxProperty::get(x);
-                if let (ConstValue::Int(min), ConstValue::Int(max)) = (vmin, vmax)
-                    && *min >= 0
-                    && *max < n
-                    && n > 0
-                {
-                    // x is always in range [0, n), so x / n = 0
-                    return UOp::index_const(0);
-                }
-                let n_uop = UOp::index_const(n);
-                x.try_div(&n_uop).unwrap()
-            }
-
+            // Unflatten into input shape dimensions using raw Mod/Idiv.
+            // Tinygrad (indexing.py:129-132): creates raw % and // ops, then lets
+            // graph_rewrite handle all simplification. This is critical because
+            // propagate_invalid must push WHERE outward before VminVmax-based
+            // simplification can work (WHERE-Invalid makes VminVmax return dtype_bounds).
             let mut axes_out = Vec::new();
             let mut combined = combined_axes;
             for shape_dim in in_shape.iter().rev() {
                 match shape_dim {
                     SInt::Const(n) => {
-                        let mod_result = simplify_mod(&combined, *n as i64);
-                        axes_out.push(mod_result);
-                        combined = simplify_div(&combined, *n as i64);
+                        let n_uop = UOp::index_const(*n as i64);
+                        axes_out.push(combined.try_mod(&n_uop).unwrap());
+                        combined = combined.try_div(&n_uop).unwrap();
                     }
                     SInt::Symbolic(uop) => {
-                        let mod_result = combined.try_mod(uop).unwrap();
-                        axes_out.push(mod_result);
+                        axes_out.push(combined.try_mod(uop).unwrap());
                         combined = combined.try_div(uop).unwrap();
                     }
                 }
             }
             axes_out.reverse();
 
-            // Apply symbolic simplification to the output ranges (bottom-up to ensure children are simplified first)
-            // This is critical for simplifying Range(n) % n → Range(n) and Range(n) / n → 0
-            // Like Tinygrad: graph_rewrite(UOp.sink(*axes_out), symbolic+pm_simplify_valid, name="reshape").src
-            use crate::symbolic::patterns::symbolic_simple;
+            // Apply full symbolic simplification to the output ranges.
+            // Tinygrad (indexing.py:133-134): "this simplify is doing a lot of heavy lifting.
+            // this is the replacement for the reshape view merging code"
+            // Uses symbolic + pm_simplify_valid to collapse cascading Mod/Idiv chains.
             use morok_ir::rewrite::graph_rewrite;
+            use std::sync::LazyLock;
+            static RESHAPE_SIMPLIFY: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
+                crate::symbolic::patterns::symbolic()
+                    + crate::symbolic::valid_simplification::pm_simplify_valid()
+                    + crate::symbolic::valid_simplification::pm_drop_and_clauses()
+            });
 
             let sink = UOp::sink(axes_out);
-            let simplified_sink = graph_rewrite(symbolic_simple(), sink, &mut ());
+            let simplified_sink = graph_rewrite(&*RESHAPE_SIMPLIFY, sink, &mut ());
 
             // Extract simplified sources
             match simplified_sink.op() {

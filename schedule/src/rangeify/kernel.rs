@@ -23,7 +23,7 @@ use tracing::{debug, trace};
 // ============================================================================
 
 /// Configuration for partial contiguous optimization.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PcontigConfig {
     /// 0=disabled, 1=basic, 2=enabled (default), 3+=aggressive
     pub level: u8,

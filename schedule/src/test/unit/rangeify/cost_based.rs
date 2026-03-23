@@ -23,7 +23,7 @@ fn create_range(end: i64, axis_id: usize) -> Arc<UOp> {
 }
 
 fn create_bufferize(compute: Arc<UOp>, ranges: Vec<Arc<UOp>>) -> Arc<UOp> {
-    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global })
+    UOp::bufferize(compute, ranges, BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true })
 }
 
 // Pattern 1: Cheap Compute Inlining Tests

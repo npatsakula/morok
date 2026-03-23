@@ -352,7 +352,7 @@ fn test_no_double_materialization() {
     let indexed1 = UOp::index().buffer(buffers[0].clone()).indices(ranges.clone()).call().unwrap();
 
     // Materialize it
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let materialized = UOp::bufferize(indexed1, ranges.clone(), opts);
     let indexed_materialized = UOp::index().buffer(materialized).indices(ranges).call().unwrap();
 

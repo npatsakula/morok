@@ -411,7 +411,9 @@ pub fn buffer_folding() -> TypedPatternMatcher {
         Index { buffer: c @ Const(_), .. } ~> |c| c.clone(),
         Copy { src: c @ Const(_), .. } ~> |c| c.clone(),
         Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
-            if ranges_equal(ranges, indices) ~> |compute| compute.clone(),
+            if ranges_equal(ranges, indices) => |compute| {
+                Some(compute.clone())
+            },
     }
 }
 
@@ -610,6 +612,14 @@ fn apply_pcontig_removal_inner(
         return None;
     }
 
+    // Non-removable BUFFERIZEs are multi-consumer realize boundaries.
+    // Inlining them duplicates computation into each consumer's kernel.
+    if let Op::Bufferize { opts, .. } = buffer.op()
+        && !opts.removable
+    {
+        return None;
+    }
+
     // Single-pass collection of buffers, indexes, reduces in the src subtree.
     let mut accessed_buffers = Vec::new();
     let mut indexes = Vec::new();
@@ -675,14 +685,21 @@ fn apply_pcontig_removal_inner(
         }
     };
 
-    // Simple substitution path — no buffer in reduce, always inline (like Tinygrad)
+    // No buffer in reduce: range substitution with gating (always inline).
+    // Tinygrad (rangeify.py:253): `src.substitute({k:v for k,v in zip(...) if k.op is not Ops.CONST}, extra_pm=pm_gate_substitute)`
+    // Filter: skip CONST ranges (they're broadcast dims, not real ranges).
+    // Gating: only substitute in subexpressions that contain the ranges.
     if !buffer_in_reduce {
-        let subs_map: HashMap<UOpKey, Arc<UOp>> =
-            buf_ranges.iter().zip(idx_ranges.iter()).map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v))).collect();
-        return Some(src.substitute(&subs_map));
+        let subs_map: HashMap<UOpKey, Arc<UOp>> = buf_ranges
+            .iter()
+            .zip(idx_ranges.iter())
+            .filter(|(k, _)| !matches!(k.op(), Op::Const(_)))
+            .map(|(k, v)| (UOpKey(Arc::clone(k)), Arc::clone(v)))
+            .collect();
+        return Some(src.substitute_gated(&subs_map));
     }
 
-    // Buffer in reduce: at level ≤ 2, always keep (Tinygrad's `if not (PCONTIG > 2): return None`)
+    // Buffer in reduce: at level ≤ 2, always keep (Tinygrad rangeify.py:247-248).
     if config.level <= 2 {
         return None;
     }
@@ -786,7 +803,7 @@ fn apply_pcontig_removal_inner(
 
     // Apply substitution
     let subs_map: HashMap<UOpKey, Arc<UOp>> = substitute.into_iter().map(|(k, v)| (UOpKey(k), v)).collect();
-    let substituted = src.substitute(&subs_map);
+    let substituted = src.substitute_gated(&subs_map);
 
     if materialize.is_empty() {
         return Some(substituted);
@@ -857,11 +874,87 @@ fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
     }
 }
 
+/// Check if a UOp's DAG references any of the given reduce ranges.
+///
+/// Uses `in_scope_ranges` (cached property) to check if any of the given ranges
+/// appear in the UOp's dependency graph.
+#[allow(clippy::mutable_key_type)]
+fn references_any_reduce_range(uop: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> bool {
+    let in_scope = uop.in_scope_ranges();
+    ranges.iter().any(|r| in_scope.contains(&UOpKey(r.clone())))
+}
+
+/// Split a UOp by multiplication into leaf factors.
+///
+/// E.g. `(a * b) * c` → `[a, b, c]`
+fn split_mul_factors(uop: &Arc<UOp>) -> SmallVec<[Arc<UOp>; 4]> {
+    match uop.op() {
+        Op::Binary(BinaryOp::Mul, a, b) => {
+            let mut factors = split_mul_factors(a);
+            factors.extend(split_mul_factors(b));
+            factors
+        }
+        _ => smallvec::smallvec![uop.clone()],
+    }
+}
+
+/// Factor multiplicative terms that don't depend on reduce ranges outside the REDUCE.
+///
+/// For ADD reduce: `REDUCE(x * c, ADD, ranges)` → `REDUCE(x, ADD, ranges) * c`
+/// For MAX reduce: same, but only if the outside factor's vmin >= 0.
+fn reduce_mul_chain(src: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>, reduce_op: ReduceOp) -> Option<Arc<UOp>> {
+    let factors = split_mul_factors(src);
+    if factors.len() < 2 {
+        return None;
+    }
+
+    let mut inside: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
+    let mut outside: SmallVec<[Arc<UOp>; 4]> = SmallVec::new();
+
+    for factor in &factors {
+        if references_any_reduce_range(factor, ranges) {
+            inside.push(factor.clone());
+        } else {
+            // For MAX reduce, only factor out non-negative values
+            if reduce_op == ReduceOp::Max {
+                let is_non_negative = match factor.vmin() {
+                    ConstValue::Int(v) => *v >= 0,
+                    ConstValue::UInt(_) => true,
+                    ConstValue::Float(v) => *v >= 0.0,
+                    ConstValue::Bool(_) => true,
+                };
+                if !is_non_negative {
+                    inside.push(factor.clone());
+                    continue;
+                }
+            }
+            outside.push(factor.clone());
+        }
+    }
+
+    if outside.is_empty() {
+        return None;
+    }
+
+    // Reconstruct inside product (if all factors are outside, reduce over const 1)
+    let inner = inside.into_iter().reduce(|a, b| a.mul(&b)).unwrap_or_else(|| src.const_like(1i64));
+    let reduced = inner.reduce(ranges.clone(), reduce_op);
+
+    // Multiply by outside product
+    let mut result = reduced;
+    for factor in &outside {
+        result = result.mul(factor);
+    }
+
+    Some(result)
+}
+
 /// Pattern matcher for reduction simplifications (mega-pass path).
 ///
 /// Matches Tinygrad's `pm_reduce_simplify`:
 /// - `pm_reduce_unparented`: remove ranges not referenced by body
 /// - `REDUCE(ADD) → reduce_collapse(src, ranges)`: delegate to procedural wrapper
+/// - `reduce_mul_chain`: factor range-independent multipliers outside REDUCE
 ///
 /// No duplication of distributive or bound patterns — those live inside
 /// `reduce_collapse_inner_patterns()` and run via `reduce_collapse`.
@@ -871,6 +964,11 @@ pub fn pm_reduce_simplify() -> &'static TypedPatternMatcher {
             + crate::patterns! {
                 Reduce { src, ranges, reduce_op } if *reduce_op == ReduceOp::Add
                     => |src, ranges| super::transforms::reduce_collapse(src, ranges),
+
+                Reduce { src, ranges, reduce_op }
+                    if matches!(reduce_op, ReduceOp::Add | ReduceOp::Max)
+                    && matches!(src.op(), Op::Binary(BinaryOp::Mul, _, _))
+                    => |src, ranges, reduce_op| reduce_mul_chain(src, ranges, *reduce_op),
             }
     });
     &CACHED
@@ -1377,7 +1475,7 @@ fn force_bufferize(src: &Arc<UOp>) -> Arc<UOp> {
     if ranges.is_empty() {
         return Arc::clone(src);
     }
-    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global };
+    let opts = BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true };
     let bufferized = UOp::bufferize(Arc::clone(src), ranges.clone(), opts);
     UOp::index().buffer(bufferized).indices(ranges).call().unwrap_or_else(|_| Arc::clone(src))
 }

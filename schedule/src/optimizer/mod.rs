@@ -170,7 +170,9 @@ pub fn apply_post_optimization_with_renderer(
     // This MUST run BEFORE expander to optimize conditionals before expansion.
     // =========================================================================
     let t_stage = std::time::Instant::now();
-    let with_symbolic = graph_rewrite(symbolic(), linearized, &mut ());
+    static POST_OPT_SYM: LazyLock<crate::TypedPatternMatcher> =
+        LazyLock::new(|| symbolic() + crate::symbolic::valid_simplification::pm_drop_and_clauses());
+    let with_symbolic = graph_rewrite(&*POST_OPT_SYM, linearized, &mut ());
     tracing::debug!(
         ast.optimized = with_symbolic.tree(),
         node_count = with_symbolic.node_count(),
@@ -299,9 +301,11 @@ pub fn apply_post_optimization_with_renderer(
         "after pm_lower_index_dtype"
     );
 
-    // Tinygrad: symbolic (step 16) — includes gep_pushing
+    // Tinygrad: symbolic (step 16) — phase 2 only (no simplify_valid/phase3)
     let t_stage = std::time::Instant::now();
-    let with_lowered_idx = graph_rewrite(symbolic(), with_lowered_idx, &mut ());
+    static POST_INDEX_SYM: LazyLock<crate::TypedPatternMatcher> =
+        LazyLock::new(|| symbolic_simple() + gep_pushing_patterns());
+    let with_lowered_idx = graph_rewrite(&*POST_INDEX_SYM, with_lowered_idx, &mut ());
     tracing::debug!(
         ast.optimized = with_lowered_idx.tree(),
         node_count = with_lowered_idx.node_count(),

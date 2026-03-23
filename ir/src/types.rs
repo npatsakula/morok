@@ -327,15 +327,20 @@ pub struct BufferizeOpts {
     pub device: Option<DeviceSpec>,
     /// Address space (GLOBAL or LOCAL).
     pub addrspace: AddrSpace,
+    /// Whether buffer_removal may inline this BUFFERIZE.
+    /// Multi-consumer realize boundaries set this to `false` so that
+    /// `dead_axis_removal` (which creates new BUFFERIZE nodes) preserves
+    /// the protection across mega-pass fixpoint iterations.
+    pub removable: bool,
 }
 
 impl BufferizeOpts {
     pub fn new(device: DeviceSpec) -> Self {
-        Self { device: Some(device), addrspace: AddrSpace::Global }
+        Self { device: Some(device), addrspace: AddrSpace::Global, removable: true }
     }
 
     pub fn local() -> Self {
-        Self { device: None, addrspace: AddrSpace::Local }
+        Self { device: None, addrspace: AddrSpace::Local, removable: true }
     }
 }
 

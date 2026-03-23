@@ -128,7 +128,7 @@ pub fn merge_sibling_ends(sink: &Arc<UOp>) -> Arc<UOp> {
 }
 
 use crate::rewrite::graph_rewrite;
-use crate::symbolic::patterns::symbolic;
+use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
 
 // ============================================================================
 // Main Entry Point
@@ -147,29 +147,28 @@ use crate::symbolic::patterns::symbolic;
 pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
     use std::sync::LazyLock;
 
-    // Phase 1: Devectorize ALU, WMMA, buffers, and expand vector indices
-    static PHASE1: LazyLock<TypedPatternMatcher> =
-        LazyLock::new(|| symbolic() + devectorize_patterns() + expand_index_patterns());
-    let ast = graph_rewrite(&*PHASE1, ast.clone(), &mut ());
-
-    // Phase 2: Move GEP through LOAD/STORE AND distribute PTRCAT
-    // These must be in the same pass because:
-    // - move_gep_after_load creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT))
-    // - distribute_ptrcat_load needs to match the newly created LOAD(PTRCAT)
-    // - The rewrite engine's fixed-point matching allows this in a single pass
-    static PHASE2: LazyLock<TypedPatternMatcher> = LazyLock::new(|| {
-        symbolic()
+    // Single combined pass: devectorize + GEP movement + load/store fixup.
+    // Tinygrad uses one pass (sym + devectorize + load_store_folding + ...).
+    // The rewrite engine's fixed-point iteration handles pattern ordering.
+    //
+    // Uses symbolic_simple() instead of symbolic() for performance:
+    // symbolic() adds vmin_vmax_collapse, pm_simplify_valid, etc. which are
+    // expensive on large devectorized trees (10K+ nodes) but rarely productive.
+    // The full symbolic() already ran in post-opt; devectorize only needs basic
+    // algebraic simplification + gep_pushing for the newly expanded scalar ops.
+    static COMBINED: LazyLock<TypedPatternMatcher> = LazyLock::new(|| {
+        symbolic_simple()
+            + gep_pushing_patterns()
+            + devectorize_patterns()
+            + expand_index_patterns()
             + gep_simplification_patterns()
             + gep_movement_patterns()
             + ptrcat_distribution_patterns()
             + contiguous_gep_load_patterns()
+            + correct_load_store_patterns()
+            + load_store_indexing_patterns()
     });
-    let ast = graph_rewrite(&*PHASE2, ast, &mut ());
-
-    // Phase 3: Split loads/stores by device fold lengths, drop true gates
-    static PHASE3: LazyLock<TypedPatternMatcher> =
-        LazyLock::new(|| symbolic() + correct_load_store_patterns() + load_store_indexing_patterns());
-    graph_rewrite(&*PHASE3, ast, &mut ())
+    graph_rewrite(&*COMBINED, ast.clone(), &mut ())
 }
 
 /// Bool LOAD/STORE via uint8. LLVM i1 can have garbage in upper bits.

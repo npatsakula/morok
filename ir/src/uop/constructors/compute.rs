@@ -343,7 +343,20 @@ impl UOp {
         let cond_dtype = condition.dtype();
         ensure!(cond_dtype.is_bool(), WhereConditionNotBoolSnafu { actual: cond_dtype });
 
-        let dtype = true_val.dtype(); // Result has same dtype as branches
+        // Determine result dtype from the non-INVALID branch.
+        // INVALID is always created with Index type but may appear in WHERE with
+        // different branch dtype after propagate_invalid pushes CAST/ALU through WHERE.
+        let dtype = if matches!(true_val.op, Op::Invalid) { false_val.dtype() } else { true_val.dtype() };
+        let true_val = if matches!(true_val.op, Op::Invalid) && true_val.dtype() != dtype {
+            Self::new(Op::Invalid, dtype.clone())
+        } else {
+            true_val
+        };
+        let false_val = if matches!(false_val.op, Op::Invalid) && false_val.dtype() != dtype {
+            Self::new(Op::Invalid, dtype.clone())
+        } else {
+            false_val
+        };
         Self::validate_ternary_shapes(&true_val, &false_val)?;
         Ok(Self::new(Op::Ternary(TernaryOp::Where, condition, true_val, false_val), dtype))
     }

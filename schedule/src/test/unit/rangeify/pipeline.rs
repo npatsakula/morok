@@ -43,24 +43,19 @@ fn test_run_rangeify_simple_const() {
 
 #[test]
 fn test_run_rangeify_detach_removal() {
-    // Test: DETACH should be removed by early_rewrites
+    // Test: DETACH should be removed by early_rewrites (runs before run_rangeify in pipeline)
     let x = UOp::native_const(1.0f32);
     let detach = x.detach();
 
-    let result = run_rangeify(detach);
-    assert!(result.is_ok(), "rangeify should succeed");
-    let (rangeified, _ctx) = result.unwrap();
+    // Use full pipeline — DETACH removal is in earliest_rewrites, before run_rangeify
+    let rangeified = rangeify_unwrap(detach);
 
     // DETACH should be removed, leaving only the constant
-    // The result might be the constant or a transformed version
     match rangeified.op() {
         Op::Const(_) => {
-            // DETACH successfully removed
             assert!(Arc::ptr_eq(&rangeified, &x) || matches!(rangeified.op(), Op::Const(_)));
         }
         _ => {
-            // Transformation may have applied additional patterns
-            // This is acceptable as long as it's not DETACH
             assert!(!matches!(rangeified.op(), Op::Detach { .. }));
         }
     }

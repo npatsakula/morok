@@ -1,6 +1,9 @@
 mod index_lowering;
 
-use crate::{pattern::RewriteResult, symbolic::symbolic_simple};
+use crate::{
+    pattern::RewriteResult,
+    symbolic::{symbolic, symbolic_simple},
+};
 use morok_dtype::DType;
 use morok_ir::{BinaryOp, ConstValue, Op, TernaryOp, UOp, UnaryOp};
 use std::{f32::consts::PI, sync::Arc};
@@ -2259,4 +2262,598 @@ fn test_cast_where_push() {
             panic!("Expected Where, got {:?}", rewritten.op());
         }
     }
+}
+
+// ========== Batch A+B: New Pattern Tests ==========
+
+// --- A1: vmin==vmax collapse ---
+
+#[test]
+fn test_vmin_vmax_collapse_addition() {
+    // Var(5,5) + Const(3) → Const(8) since vmin==vmax==8
+    let matcher = symbolic();
+    let x = UOp::var("x", DType::Int32, 5, 5); // single-value range
+    let c3 = UOp::native_const(3i32);
+    let add = x.try_add(&c3).unwrap();
+
+    use crate::rewrite::graph_rewrite;
+    let result = graph_rewrite(&matcher, add, &mut ());
+    if let Op::Const(cv) = result.op() {
+        assert_eq!(cv.0, ConstValue::Int(8));
+    } else {
+        panic!("Expected const 8, got {:?}", result.op());
+    }
+}
+
+// --- A3: Bool arithmetic ---
+
+#[test]
+fn test_bool_mul_is_and() {
+    // Bool * Bool → AND
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 0, 1);
+    let y = UOp::var("y", DType::Bool, 0, 1);
+    let mul = x.try_mul(&y).unwrap();
+
+    let result = matcher.rewrite(&mul, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::And, lhs, rhs) = rewritten.op() {
+            assert!(Arc::ptr_eq(lhs, &x));
+            assert!(Arc::ptr_eq(rhs, &y));
+        } else {
+            panic!("Expected And, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_bool_add_is_or() {
+    // Bool + Bool → OR
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 0, 1);
+    let y = UOp::var("y", DType::Bool, 0, 1);
+    let add = x.try_add(&y).unwrap();
+
+    let result = matcher.rewrite(&add, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Or, lhs, rhs) = rewritten.op() {
+            assert!(Arc::ptr_eq(lhs, &x));
+            assert!(Arc::ptr_eq(rhs, &y));
+        } else {
+            panic!("Expected Or, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_bool_max_is_or() {
+    // Bool max Bool → OR
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Bool, 0, 1);
+    let y = UOp::var("y", DType::Bool, 0, 1);
+    let max = x.try_max(&y).unwrap();
+
+    let result = matcher.rewrite(&max, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Or, lhs, rhs) = rewritten.op() {
+            assert!(Arc::ptr_eq(lhs, &x));
+            assert!(Arc::ptr_eq(rhs, &y));
+        } else {
+            panic!("Expected Or, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_bool_mul_non_bool_no_match() {
+    // Int * Int should NOT become AND
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, 0, 100);
+    let y = UOp::var("y", DType::Int32, 0, 100);
+    let mul = x.try_mul(&y).unwrap();
+
+    let result = matcher.rewrite(&mul, &mut ());
+    if let RewriteResult::Rewritten(rewritten) = &result {
+        assert!(!matches!(rewritten.op(), Op::Binary(BinaryOp::And, ..)));
+    }
+}
+
+// --- A2: Term combining new variants ---
+
+#[test]
+fn test_term_combine_x_plus_xc() {
+    // x + x*3 → x*4
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let c3 = UOp::native_const(3i32);
+    let xc = x.try_mul(&c3).unwrap();
+    let add = x.try_add(&xc).unwrap();
+
+    let result = matcher.rewrite(&add, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Mul, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &x));
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(4));
+            } else {
+                panic!("Expected const 4, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Mul, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_term_combine_y_plus_x_plus_x() {
+    // (y + x) + x → y + x*2
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let y = UOp::var("y", DType::Int32, 0, i64::MAX);
+    let yx = y.try_add(&x).unwrap();
+    let add = yx.try_add(&x).unwrap();
+
+    let result = matcher.rewrite(&add, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Add, lhs, rhs) = rewritten.op() {
+            assert!(Arc::ptr_eq(lhs, &y));
+            if let Op::Binary(BinaryOp::Mul, _, c) = rhs.op()
+                && let Op::Const(cv) = c.op()
+            {
+                assert_eq!(cv.0, ConstValue::Int(2));
+            }
+        } else {
+            panic!("Expected Add, got {:?}", rewritten.op());
+        }
+    }
+}
+
+// --- A4: Negation distribution (const version) ---
+
+#[test]
+fn test_neg_one_times_x_plus_const() {
+    // (-1) * (x + 3) should be distributed into a sum.
+    // Multiple patterns can fire: the const negation pattern produces neg(x) + (-3),
+    // while the general distribution pattern produces (-1*x) + (-1*3).
+    // Both are valid simplifications; we verify the result is an Add of two terms.
+    use crate::rewrite::graph_rewrite;
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Int32, 0, i64::MAX);
+    let neg_one = UOp::native_const(-1i32);
+    let c3 = UOp::native_const(3i32);
+    let add = x.try_add(&c3).unwrap();
+    let mul = neg_one.try_mul(&add).unwrap();
+
+    // Use graph_rewrite to apply all rewrites (including constant folding of -1*3 → -3)
+    let result = graph_rewrite(&matcher, mul, &mut ());
+    // After full rewriting: should be Neg(x) + (-3) or similar
+    if let Op::Binary(BinaryOp::Add, lhs, rhs) = result.op() {
+        // lhs should be either Neg(x) or Mul(-1, x)
+        match lhs.op() {
+            Op::Unary(UnaryOp::Neg, inner) => assert!(Arc::ptr_eq(inner, &x)),
+            Op::Binary(BinaryOp::Mul, _, _) => { /* distribution form, also valid */ }
+            _ => panic!("Expected Neg(x) or Mul(-1, x), got {:?}", lhs.op()),
+        }
+        // rhs should be -3 (after constant folding)
+        if let Op::Const(cv) = rhs.op() {
+            assert_eq!(cv.0, ConstValue::Int(-3));
+        } else {
+            panic!("Expected const -3, got {:?}", rhs.op());
+        }
+    } else {
+        panic!("Expected Add after full rewrite, got {:?}", result.op());
+    }
+}
+
+// --- A5: Range%end / Range//end ---
+
+#[test]
+fn test_range_mod_end() {
+    // Range(end) % end → Range(end)
+    use crate::rewrite::graph_rewrite;
+    let matcher = symbolic_simple();
+    let end = UOp::index_const(8);
+    let range = UOp::range(end.clone(), 0);
+    let modulo = range.try_mod(&end).unwrap();
+
+    let result = graph_rewrite(&matcher, modulo, &mut ());
+    assert!(matches!(result.op(), Op::Range { .. }) || matches!(result.op(), Op::Const(_)));
+}
+
+#[test]
+fn test_range_div_end() {
+    // Range(end) // end → 0
+    use crate::rewrite::graph_rewrite;
+    let matcher = symbolic_simple();
+    let end = UOp::index_const(8);
+    let range = UOp::range(end.clone(), 0);
+    let div = range.try_div(&end).unwrap();
+
+    let result = graph_rewrite(&matcher, div, &mut ());
+    if let Op::Const(cv) = result.op() {
+        assert_eq!(cv.0, ConstValue::Int(0));
+    } else {
+        panic!("Expected const 0, got {:?}", result.op());
+    }
+}
+
+// --- B1: c0*x < c1 ---
+
+#[test]
+fn test_mul_lt_ceil_div() {
+    // 3*x < 10 → x < 4 (ceil(10/3) = 4) for Index dtype
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Index, 0, i64::MAX);
+    let c3 = UOp::index_const(3);
+    let c10 = UOp::index_const(10);
+    let mul = c3.try_mul(&x).unwrap();
+    let lt = mul.try_cmplt(&c10).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Lt, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &x));
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(4));
+            } else {
+                panic!("Expected const 4, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Lt, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_mul_lt_exact_div() {
+    // 4*x < 12 → x < 3 (ceil(12/4) = 3)
+    let matcher = symbolic_simple();
+    let x = UOp::var("x", DType::Index, 0, 100);
+    let c4 = UOp::index_const(4);
+    let c12 = UOp::index_const(12);
+    let mul = c4.try_mul(&x).unwrap();
+    let lt = mul.try_cmplt(&c12).unwrap();
+
+    let result = matcher.rewrite(&lt, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Binary(BinaryOp::Lt, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &x));
+            if let Op::Const(cv) = c.op() {
+                assert_eq!(cv.0, ConstValue::Int(3));
+            } else {
+                panic!("Expected const 3, got {:?}", c.op());
+            }
+        } else {
+            panic!("Expected Lt, got {:?}", rewritten.op());
+        }
+    }
+}
+
+// --- WHERE ALU combining ---
+
+#[test]
+fn test_where_alu_combine_add() {
+    // Add(WHERE(c, 1, b), WHERE(c, 2, e)) → WHERE(c, 3, Add(b,e))
+    // Tinygrad requires at least one branch pair to be const
+    let matcher = symbolic();
+    let c = UOp::var("c", DType::Bool, 0, 1);
+    let t1 = UOp::native_const(1i32);
+    let b = UOp::var("b", DType::Int32, 0, 100);
+    let t2 = UOp::native_const(2i32);
+    let e = UOp::var("e", DType::Int32, 0, 100);
+
+    let w1 = UOp::try_where(c.clone(), t1, b.clone()).unwrap();
+    let w2 = UOp::try_where(c.clone(), t2, e.clone()).unwrap();
+    let add = w1.try_add(&w2).unwrap();
+
+    let result = matcher.rewrite(&add, &mut ());
+    assert!(matches!(result, RewriteResult::Rewritten(_)));
+    if let RewriteResult::Rewritten(rewritten) = result {
+        if let Op::Ternary(TernaryOp::Where, cond, _true_br, false_br) = rewritten.op() {
+            assert!(Arc::ptr_eq(cond, &c));
+            // false branch should be Add(b, e)
+            assert!(matches!(false_br.op(), Op::Binary(BinaryOp::Add, ..)));
+        } else {
+            panic!("Expected Where, got {:?}", rewritten.op());
+        }
+    }
+}
+
+#[test]
+fn test_where_alu_combine_associative_add() {
+    // (y + WHERE(c, 1, b)) + WHERE(c, 2, e) → y + WHERE(c, 3, Add(b,e))
+    // Tinygrad symbolic.py:207-208: associative variation for Add chains
+    use crate::rewrite::graph_rewrite;
+
+    let c = UOp::var("c", DType::Bool, 0, 1);
+    let y = UOp::var("y", DType::Int32, 0, 100);
+    let t1 = UOp::native_const(1i32);
+    let b = UOp::var("b", DType::Int32, 0, 100);
+    let t2 = UOp::native_const(2i32);
+    let e = UOp::var("e", DType::Int32, 0, 100);
+
+    let w1 = UOp::try_where(c.clone(), t1, b.clone()).unwrap();
+    let w2 = UOp::try_where(c.clone(), t2, e.clone()).unwrap();
+    // (y + w1) + w2
+    let inner_add = y.try_add(&w1).unwrap();
+    let outer_add = inner_add.try_add(&w2).unwrap();
+
+    let result = graph_rewrite(&symbolic(), outer_add.clone(), &mut ());
+
+    // Result should contain a WHERE with combined const true branches (1+2=3)
+    // and the y term outside: y + WHERE(c, 3, b+e)
+    // The key assertion: the two WHERE nodes should be merged into one
+    let where_count = result.toposort().iter().filter(|n| matches!(n.op(), Op::Ternary(TernaryOp::Where, ..))).count();
+    assert!(where_count <= 1, "Expected WHERE nodes to be combined, got {where_count}");
+}
+
+#[test]
+fn test_where_alu_combine_different_cond_no_match() {
+    // Add(WHERE(c1, a, b), WHERE(c2, d, e)) should NOT combine (different conditions)
+    let matcher = symbolic_simple();
+    let c1 = UOp::var("c1", DType::Bool, 0, 1);
+    let c2 = UOp::var("c2", DType::Bool, 0, 1);
+    let a = UOp::var("a", DType::Int32, 0, 100);
+    let b = UOp::var("b", DType::Int32, 0, 100);
+    let d = UOp::var("d", DType::Int32, 0, 100);
+    let e = UOp::var("e", DType::Int32, 0, 100);
+
+    let w1 = UOp::try_where(c1, a, b).unwrap();
+    let w2 = UOp::try_where(c2, d, e).unwrap();
+    let add = w1.try_add(&w2).unwrap();
+
+    let result = matcher.rewrite(&add, &mut ());
+    if let RewriteResult::Rewritten(rewritten) = &result {
+        assert!(!matches!(rewritten.op(), Op::Ternary(TernaryOp::Where, ..)));
+    }
+}
+
+// ============================================================================
+// F5: valid_simplification tests
+// ============================================================================
+
+#[test]
+fn test_simplify_valid_redundant_upper_bounds() {
+    // x < 10 AND x < 5: simplify_valid may or may not simplify depending on
+    // whether symbolic_simple can collapse fake_var < 10 → true.
+    // What we CAN test: the function at least processes without panic and
+    // returns either None or a valid result.
+    use crate::symbolic::valid_simplification::simplify_valid;
+
+    let x = UOp::range_const(20, 0);
+    let c10 = UOp::index_const(10);
+    let c5 = UOp::index_const(5);
+    let lt10 = x.lt(&c10);
+    let lt5 = x.lt(&c5);
+    let combined = lt10.and_(&lt5);
+
+    let result = simplify_valid(&combined);
+    if let Some(simplified) = result {
+        // If simplified, result should be no larger than original
+        assert!(simplified.node_count() <= combined.node_count(), "Simplified result should not be larger");
+    }
+    // Either way, function should not panic — this is the key test
+}
+
+#[test]
+fn test_simplify_valid_no_parseable_clauses() {
+    use crate::symbolic::valid_simplification::simplify_valid;
+
+    let a = UOp::native_const(true);
+    let b = UOp::native_const(true);
+    let combined = a.and_(&b);
+
+    let result = simplify_valid(&combined);
+    assert!(result.is_none(), "Non-Lt clauses should not be simplified");
+}
+
+#[test]
+fn test_drop_and_clauses_irrelevant_removed() {
+    use crate::rewrite::graph_rewrite;
+    use crate::symbolic::valid_simplification::pm_drop_and_clauses;
+
+    let r0 = UOp::range_const(10, 0);
+    let r1 = UOp::range_const(20, 1);
+    let c5 = UOp::index_const(5);
+    let c15 = UOp::index_const(15);
+
+    let clause1 = r0.lt(&c5);
+    let clause2 = r1.lt(&c15);
+    let combined_cond = clause1.try_and_op(&clause2).unwrap();
+
+    let expr = r0.try_add(&UOp::index_const(1)).unwrap();
+    let invalid = UOp::invalid_marker();
+    let gated = UOp::try_where(combined_cond, expr, invalid).unwrap();
+
+    let matcher = pm_drop_and_clauses();
+    let result = graph_rewrite(matcher, gated.clone(), &mut ());
+
+    assert!(!Arc::ptr_eq(&result, &gated), "Expected clause dropping");
+    assert!(matches!(result.op(), Op::Ternary(TernaryOp::Where, ..)));
+}
+
+#[test]
+fn test_drop_and_clauses_all_relevant_kept() {
+    use crate::rewrite::graph_rewrite;
+    use crate::symbolic::valid_simplification::pm_drop_and_clauses;
+
+    let r0 = UOp::range_const(10, 0);
+    let c5 = UOp::index_const(5);
+    let c8 = UOp::index_const(8);
+
+    let clause1 = r0.lt(&c5);
+    let clause2 = r0.lt(&c8);
+    let combined = clause1.try_and_op(&clause2).unwrap();
+
+    let expr = r0.try_add(&UOp::index_const(1)).unwrap();
+    let invalid = UOp::invalid_marker();
+    let gated = UOp::try_where(combined, expr, invalid).unwrap();
+
+    let matcher = pm_drop_and_clauses();
+    let result = graph_rewrite(matcher, gated.clone(), &mut ());
+
+    assert!(Arc::ptr_eq(&result, &gated), "Both clauses relevant, should not change");
+}
+
+#[test]
+fn test_drop_and_clauses_single_clause_no_change() {
+    use crate::rewrite::graph_rewrite;
+    use crate::symbolic::valid_simplification::pm_drop_and_clauses;
+
+    let r0 = UOp::range_const(10, 0);
+    let c5 = UOp::index_const(5);
+    let clause = r0.lt(&c5);
+
+    let expr = r0.try_add(&UOp::index_const(1)).unwrap();
+    let invalid = UOp::invalid_marker();
+    let gated = UOp::try_where(clause, expr, invalid).unwrap();
+
+    let matcher = pm_drop_and_clauses();
+    let result = graph_rewrite(matcher, gated.clone(), &mut ());
+
+    assert!(Arc::ptr_eq(&result, &gated), "Single clause should not change");
+}
+
+// ============================================================================
+// F6: compute_sound_vmin_vmax tests
+// ============================================================================
+
+#[test]
+fn test_sound_vmin_vmax_const() {
+    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+
+    let c = UOp::native_const(42i32);
+    let result = compute_sound_vmin_vmax(&c);
+    assert_eq!(result, Some((ConstValue::Int(42), ConstValue::Int(42))));
+}
+
+#[test]
+fn test_sound_vmin_vmax_range() {
+    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+
+    let r = UOp::range_const(10, 0);
+    let result = compute_sound_vmin_vmax(&r);
+    assert_eq!(result, Some((ConstValue::Int(0), ConstValue::Int(9))));
+}
+
+#[test]
+fn test_sound_vmin_vmax_add() {
+    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+
+    let r = UOp::range_const(10, 0);
+    let c = UOp::index_const(5);
+    let sum = r.try_add(&c).unwrap();
+    let result = compute_sound_vmin_vmax(&sum);
+    assert_eq!(result, Some((ConstValue::Int(5), ConstValue::Int(14))));
+}
+
+#[test]
+fn test_sound_vmin_vmax_and_const_mask() {
+    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+
+    let r = UOp::range_const(100, 0);
+    let mask = UOp::native_const(7i32);
+    let r_int = r.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
+    let result_node = r_int.and_(&mask);
+    let result = compute_sound_vmin_vmax(&result_node);
+    assert_eq!(result, Some((ConstValue::Int(0), ConstValue::Int(7))));
+}
+
+#[test]
+fn test_sound_vmin_vmax_and_variable_mask_unsound() {
+    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+
+    let r1 = UOp::range_const(100, 0);
+    let r2 = UOp::range_const(50, 1);
+    let r1_int = r1.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
+    let r2_int = r2.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
+    let result_node = r1_int.and_(&r2_int);
+    let result = compute_sound_vmin_vmax(&result_node);
+    assert!(result.is_none(), "AND with variable mask should be unsound");
+}
+
+#[test]
+fn test_sound_vmin_vmax_load_unsound() {
+    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+
+    let buf = UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, 100, DType::Scalar(morok_dtype::ScalarDType::Float32));
+    let idx = UOp::index_const(0);
+    let index = UOp::index().buffer(buf.clone()).indices(vec![idx]).call().unwrap();
+    let load = UOp::load().buffer(buf).index(index).call();
+    let result = compute_sound_vmin_vmax(&load);
+    assert!(result.is_none(), "LOAD should be unsound");
+}
+
+#[test]
+fn test_sound_vmin_vmax_nested_sound() {
+    use morok_ir::uop::range_eval::compute_sound_vmin_vmax;
+
+    let c = UOp::index_const(3);
+    let r = UOp::range_const(10, 0);
+    let sum = c.try_add(&r).unwrap();
+    let result = compute_sound_vmin_vmax(&sum);
+    assert_eq!(result, Some((ConstValue::Int(3), ConstValue::Int(12))));
+}
+
+// ============================================================================
+// F7: Missing pattern group tests
+// ============================================================================
+
+#[test]
+fn test_sym_phase3_neg_distribution() {
+    use crate::rewrite::graph_rewrite;
+    use crate::symbolic::symbolic;
+
+    let x = UOp::range_const(10, 0);
+    let y = UOp::range_const(20, 1);
+    let x_int = x.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
+    let y_int = y.cast(DType::Scalar(morok_dtype::ScalarDType::Int32));
+    let sum = x_int.try_add(&y_int).unwrap();
+    let neg_one = UOp::native_const(-1i32);
+    let product = neg_one.try_mul(&sum).unwrap();
+
+    let result = graph_rewrite(&symbolic(), product.clone(), &mut ());
+
+    assert!(!matches!(result.op(), Op::Binary(BinaryOp::Mul, ..)), "Expected negation distribution, got Mul");
+}
+
+#[test]
+fn test_substitute_gated_skips_irrelevant_subtrees() {
+    use morok_ir::UOpKey;
+    use std::collections::HashMap;
+
+    let r0 = UOp::range_const(10, 0);
+    let r1 = UOp::range_const(20, 1);
+    let replacement = UOp::index_const(42);
+
+    let sum = r0.try_add(&r1).unwrap();
+
+    #[allow(clippy::mutable_key_type)]
+    let map = HashMap::from([(UOpKey(r0.clone()), replacement.clone())]);
+    let result = sum.substitute_gated(&map);
+
+    if let Op::Binary(BinaryOp::Add, lhs, rhs) = result.op() {
+        assert!(Arc::ptr_eq(lhs, &replacement) || Arc::ptr_eq(rhs, &replacement), "Expected replacement in result");
+        assert!(Arc::ptr_eq(lhs, &r1) || Arc::ptr_eq(rhs, &r1), "Expected r1 preserved in result");
+    } else {
+        panic!("Expected Add, got {:?}", std::mem::discriminant(result.op()));
+    }
+}
+
+#[test]
+fn test_substitute_gated_empty_map() {
+    use std::collections::HashMap;
+
+    let r0 = UOp::range_const(10, 0);
+    #[allow(clippy::mutable_key_type)]
+    let map: HashMap<morok_ir::UOpKey, Arc<UOp>> = HashMap::new();
+    let result = r0.substitute_gated(&map);
+    assert!(Arc::ptr_eq(&result, &r0), "Empty map should return original");
 }

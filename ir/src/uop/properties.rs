@@ -131,6 +131,18 @@ cached_property! {
     /// ```
     VminVmaxProperty: (ConstValue, ConstValue) {
         cache_field: vmin_vmax_cache,
-        compute: |uop| crate::uop::range_eval::compute_vmin_vmax(uop)
+        compute: |uop| {
+            crate::uop::range_eval::compute_sound_vmin_vmax(uop)
+                .unwrap_or_else(|| crate::uop::range_eval::dtype_bounds(&uop.dtype))
+        }
+    }
+}
+
+// Sound vmin/vmax: returns None for ops without provably correct bounds.
+// Use this for optimizations that collapse expressions to constants.
+cached_property! {
+    SoundVminVmaxProperty: Option<(ConstValue, ConstValue)> {
+        cache_field: sound_vmin_vmax_cache,
+        compute: |uop| crate::uop::range_eval::compute_sound_vmin_vmax(uop)
     }
 }
