@@ -99,12 +99,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bincode"
-version = "1.3.3"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
-dependencies = [
- "serde",
-]
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
 
 [[package]]
 name = "bindgen"
@@ -295,7 +292,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -502,11 +499,11 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.17.8"
+version = "0.19.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bf99ab37ee7072d64d906aa2dada9a3422f1d975cdf8c8055a573bc84897ed8"
+checksum = "f071cd6a7b5d51607df76aa2d426aaabc7a74bc6bdb885b8afa63a880572ad9b"
 dependencies = [
- "libloading",
+ "libloading 0.9.0",
 ]
 
 [[package]]
@@ -1336,6 +1333,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1480,7 +1487,7 @@ dependencies = [
  "morok-ir",
  "morok-schedule",
  "smallvec",
- "snafu 0.8.9",
+ "snafu",
  "test-case",
  "tracing",
 ]
@@ -1499,8 +1506,8 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "smallvec",
- "snafu 0.8.9",
- "strum 0.27.2",
+ "snafu",
+ "strum",
  "tinyvec",
  "tracing",
 ]
@@ -1513,7 +1520,7 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "serde",
- "strum 0.27.2",
+ "strum",
 ]
 
 [[package]]
@@ -1534,8 +1541,8 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
- "snafu 0.8.9",
- "strum 0.27.2",
+ "snafu",
+ "strum",
  "test-case",
  "tracing",
  "xxhash-rust",
@@ -1545,7 +1552,7 @@ dependencies = [
 name = "morok-macros"
 version = "0.1.0-alpha.1"
 dependencies = [
- "convert_case 0.10.0",
+ "convert_case 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -1566,7 +1573,7 @@ dependencies = [
  "prost",
  "prost-build",
  "smallvec",
- "snafu 0.9.0",
+ "snafu",
  "test-case",
  "tracing",
 ]
@@ -1577,7 +1584,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "libc",
  "libffi",
- "libloading",
+ "libloading 0.9.0",
  "melior",
  "memmap2",
  "morok-codegen",
@@ -1590,7 +1597,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "rayon",
  "smallvec",
- "snafu 0.8.9",
+ "snafu",
  "tempfile",
  "test-case",
  "tracing",
@@ -1616,7 +1623,7 @@ dependencies = [
  "serde",
  "sled",
  "smallvec",
- "snafu 0.8.9",
+ "snafu",
  "test-case",
  "tracing",
  "tracing-subscriber",
@@ -1640,8 +1647,8 @@ dependencies = [
  "papaya",
  "parking_lot 0.12.5",
  "smallvec",
- "snafu 0.8.9",
- "strum 0.28.0",
+ "snafu",
+ "strum",
  "test-case",
  "tracing",
 ]
@@ -2113,9 +2120,9 @@ dependencies = [
 
 [[package]]
 name = "proptest-derive"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb6dc647500e84a25a85b100e76c85b8ace114c209432dc174f20aac11d4ed6c"
+checksum = "c57924a81864dddafba92e1bf92f9bf82f97096c44489548a60e888e1547549b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2766,32 +2773,11 @@ dependencies = [
 
 [[package]]
 name = "snafu"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
-dependencies = [
- "snafu-derive 0.8.9",
-]
-
-[[package]]
-name = "snafu"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1d4bced6a69f90b2056c03dcff2c4737f98d6fb9e0853493996e1d253ca29c6"
 dependencies = [
- "snafu-derive 0.9.0",
-]
-
-[[package]]
-name = "snafu-derive"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
+ "snafu-derive",
 ]
 
 [[package]]
@@ -2830,32 +2816,11 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
-dependencies = [
- "strum_macros 0.27.2",
-]
-
-[[package]]
-name = "strum"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
 dependencies = [
- "strum_macros 0.28.0",
-]
-
-[[package]]
-name = "strum_macros"
-version = "0.27.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
+ "strum_macros",
 ]
 
 [[package]]
