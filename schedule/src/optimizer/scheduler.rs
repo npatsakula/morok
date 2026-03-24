@@ -89,12 +89,17 @@ pub struct Scheduler {
     /// Used for debugging, kernel naming, and potential undo functionality.
     pub applied_opts: Vec<Opt>,
 
-    // Cached properties (computed lazily)
+    // Cached properties (computed lazily, cleared by set_ast/clear_caches)
     /// Cached list of all RANGE operations, sorted by (axis_type.priority(), axis_id).
     rngs_cache: OnceCell<Vec<Arc<UOp>>>,
-
     /// Cached maximum axis_id used in any RANGE.
     maxarg_cache: OnceCell<usize>,
+    /// Cached toposort of the AST (avoids repeated O(N) traversals).
+    toposort_cache: OnceCell<Vec<Arc<UOp>>>,
+    /// Cached REDUCE operations from the AST.
+    reduceops_cache: OnceCell<Vec<Arc<UOp>>>,
+    /// Cached INDEX (buffer access) operations from the AST.
+    bufs_cache: OnceCell<Vec<Arc<UOp>>>,
 }
 
 impl Scheduler {
@@ -116,6 +121,9 @@ impl Scheduler {
             applied_opts: Vec::new(),
             rngs_cache: OnceCell::new(),
             maxarg_cache: OnceCell::new(),
+            toposort_cache: OnceCell::new(),
+            reduceops_cache: OnceCell::new(),
+            bufs_cache: OnceCell::new(),
         }
     }
 
@@ -138,6 +146,9 @@ impl Scheduler {
     pub(crate) fn clear_caches(&mut self) {
         self.rngs_cache.take();
         self.maxarg_cache.take();
+        self.toposort_cache.take();
+        self.reduceops_cache.take();
+        self.bufs_cache.take();
     }
 
     /// Get the list of all RANGE operations, sorted by (axis_type.priority(), axis_id).
@@ -233,33 +244,25 @@ impl Scheduler {
     /// # Returns
     ///
     /// The first REDUCE UOp found via toposort, or None if no reductions exist.
+    /// Cached toposort of the AST.
+    fn ast_toposort(&self) -> &[Arc<UOp>] {
+        self.toposort_cache.get_or_init(|| self.ast.toposort())
+    }
+
     pub fn reduceop(&self) -> Option<Arc<UOp>> {
-        self.ast.toposort().into_iter().find(|node| matches!(node.op(), Op::Reduce { .. }))
+        self.reduceops().first().cloned()
     }
 
-    /// Find all REDUCE operations in the kernel.
-    ///
-    /// Some kernels may have multiple independent reductions.
-    ///
-    /// # Returns
-    ///
-    /// Vector of all REDUCE UOps found via toposort.
-    pub fn reduceops(&self) -> Vec<Arc<UOp>> {
-        self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Reduce { .. })).collect()
+    pub fn reduceops(&self) -> &[Arc<UOp>] {
+        self.reduceops_cache.get_or_init(|| {
+            self.ast_toposort().iter().filter(|n| matches!(n.op(), Op::Reduce { .. })).cloned().collect()
+        })
     }
 
-    /// Find all buffer access operations (INDEX) in the kernel.
-    ///
-    /// INDEX operations represent memory loads/stores and are used for:
-    /// - Determining which buffers are accessed
-    /// - Analyzing memory access patterns
-    /// - Applying PADTO optimizations
-    ///
-    /// # Returns
-    ///
-    /// Vector of all INDEX UOps found via toposort.
-    pub fn bufs(&self) -> Vec<Arc<UOp>> {
-        self.ast.toposort().into_iter().filter(|node| matches!(node.op(), Op::Index { .. })).collect()
+    pub fn bufs(&self) -> &[Arc<UOp>] {
+        self.bufs_cache.get_or_init(|| {
+            self.ast_toposort().iter().filter(|n| matches!(n.op(), Op::Index { .. })).cloned().collect()
+        })
     }
 
     /// Get the output shape (dimensions without reduction axes).
@@ -1106,6 +1109,9 @@ impl Clone for Scheduler {
             // Clear caches in clone - they'll be recomputed on demand
             rngs_cache: OnceCell::new(),
             maxarg_cache: OnceCell::new(),
+            toposort_cache: OnceCell::new(),
+            reduceops_cache: OnceCell::new(),
+            bufs_cache: OnceCell::new(),
         }
     }
 }

@@ -130,6 +130,10 @@ pub struct UOp {
     /// Cached O(1) lookup used by `simplify_valid` to skip And chains inside INDEX trees.
     #[debug(skip)]
     pub(crate) has_index_in_sources_cache: std::sync::OnceLock<bool>,
+    /// Cached backward slice: IDs of all nodes reachable from this UOp (including self).
+    /// O(1) membership test via `backward_slice_ids().contains(&target.id)`.
+    #[debug(skip)]
+    pub(crate) backward_slice_cache: std::sync::OnceLock<HashSet<u64>>,
     /// Optional metadata attached to this UOp.
     ///
     /// Metadata is NOT part of hash consing - attaching metadata creates a new UOp
@@ -1238,6 +1242,7 @@ impl Clone for UOp {
             vmin_vmax_cache: std::sync::OnceLock::new(),
             sound_vmin_vmax_cache: std::sync::OnceLock::new(),
             has_index_in_sources_cache: std::sync::OnceLock::new(),
+            backward_slice_cache: std::sync::OnceLock::new(),
             metadata: self.metadata.clone(),
         }
     }

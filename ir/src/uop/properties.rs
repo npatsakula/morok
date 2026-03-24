@@ -132,6 +132,34 @@ cached_property! {
 }
 
 // ============================================================================
+// Backward Slice Property
+// ============================================================================
+
+cached_property! {
+    /// Cached backward slice: all node IDs reachable from this UOp (including self).
+    ///
+    /// Tinygrad equivalent: `@functools.cached_property backward_slice` (ops.py:155).
+    /// O(N) total on first access, O(1) membership test via `HashSet::contains`.
+    ///
+    /// This replaces the uncached `backward_slice()` DFS for membership tests.
+    /// The old `backward_slice()` returning `Vec<Arc<UOp>>` is kept for callers
+    /// that need iteration with full UOp access.
+    BackwardSliceProperty: std::collections::HashSet<u64> {
+        cache_field: backward_slice_cache,
+        compute: |uop| {
+            let mut result = std::collections::HashSet::new();
+            result.insert(uop.id);
+            uop.op.map_child(|src| {
+                for &id in BackwardSliceProperty::get(src).iter() {
+                    result.insert(id);
+                }
+            });
+            result
+        }
+    }
+}
+
+// ============================================================================
 // VminVmax Property
 // ============================================================================
 

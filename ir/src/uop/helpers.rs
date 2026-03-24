@@ -268,21 +268,21 @@ impl UOp {
         result
     }
 
+    /// Cached backward slice: set of all node IDs reachable from this UOp.
+    ///
+    /// O(1) membership test via `contains()`. Computed once and cached per-node.
+    /// Prefer this over `backward_slice()` when you only need to check if a
+    /// node is in the dependency set.
+    pub fn backward_slice_ids(self: &Arc<Self>) -> &HashSet<u64> {
+        use crate::uop::cached_property::CachedProperty;
+        use crate::uop::properties::BackwardSliceProperty;
+        BackwardSliceProperty::get(self)
+    }
+
     /// Returns all nodes that this UOp depends on (backward slice / dependency set).
     ///
-    /// This is used by the optimizer to check if a range appears in an expression's dependencies.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let x = UOp::var("x", DType::Int32, 0, 10);
-    /// let y = UOp::var("y", DType::Int32, 0, 20);
-    /// let expr = x.try_add_op(&y).unwrap();
-    ///
-    /// let deps = expr.backward_slice();
-    /// // Check if x is in dependencies using pointer equality
-    /// assert!(deps.iter().any(|d| Arc::ptr_eq(d, &x)));
-    /// ```
+    /// For membership tests, prefer [`backward_slice_ids()`] which returns a
+    /// cached `HashSet<u64>` with O(1) lookup.
     pub fn backward_slice(self: &Arc<Self>) -> Vec<Arc<Self>> {
         let mut visited = HashSet::new();
         let mut result = Vec::new();

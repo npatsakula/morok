@@ -184,7 +184,7 @@ fn find_reduce_using_range(scheduler: &Scheduler, rng: &Arc<UOp>) -> Result<Arc<
         if let Op::Reduce { ranges, .. } = reduce.op()
             && ranges.iter().any(|r| Arc::ptr_eq(r, rng))
         {
-            return Ok(reduce);
+            return Ok(reduce.clone());
         }
     }
     ValidationFailedSnafu { op: "GROUP", reason: "could not find REDUCE using this range" }.fail()
@@ -398,7 +398,7 @@ fn apply_padto(scheduler: &mut Scheduler, rng: Arc<UOp>, alignment: usize) -> Re
     let range_subst: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(rng.clone()), new_rng.clone())].into_iter().collect();
 
     for buf_op in scheduler.bufs() {
-        if buf_uses_range(&buf_op, &rng)
+        if buf_uses_range(buf_op, &rng)
             && let Op::Index { buffer, indices, gate } = buf_op.op()
         {
             // Substitute old range → new range in index expressions

@@ -199,7 +199,7 @@ impl CFGContext {
                     // Skip edges that would create cycles.
                     // Cycle condition: x depends on range (adding range → x would create x → ... → range → x)
                     // Check: is range in x's backward slice?
-                    let would_cycle = x.backward_slice().iter().any(|node| node.id == range.id);
+                    let would_cycle = x.backward_slice_ids().contains(&range.id);
                     if !would_cycle {
                         tracing::trace!(range_id = range.id, predecessor_id = x.id, "CFGContext: creating edge");
                         ctx.edges.insert(UOpKey(range), x);
@@ -231,7 +231,7 @@ impl CFGContext {
 
                 for store in &stores {
                     for range in &ranges {
-                        let would_cycle = store.backward_slice().iter().any(|n| n.id == range.id);
+                        let would_cycle = store.backward_slice_ids().contains(&range.id);
                         if !would_cycle {
                             tracing::trace!(range_id = range.id, store_id = store.id, "CFGContext: reduce init edge");
                             ctx.edges.insert(UOpKey((*range).clone()), (*store).clone());

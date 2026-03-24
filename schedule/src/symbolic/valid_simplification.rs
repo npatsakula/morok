@@ -98,8 +98,7 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
     // This matches Tinygrad's _valid_priority.
     // Pre-compute backward slices once per clause (Tinygrad caches these as a property).
     let original_clauses = clauses.clone();
-    let backward_slices: Vec<HashSet<u64>> =
-        original_clauses.iter().map(|c| c.backward_slice().iter().map(|n| n.id).collect()).collect();
+    let backward_slices: Vec<&HashSet<u64>> = original_clauses.iter().map(|c| c.backward_slice_ids()).collect();
     clauses.sort_by_key(|v| {
         let Some((expr, _, _)) = parse_valid(v) else { return 0i32 };
         let expr_id = expr.id;

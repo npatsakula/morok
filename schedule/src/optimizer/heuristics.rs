@@ -114,7 +114,7 @@ pub fn is_masked(scheduler: &Scheduler, axis: usize) -> bool {
 
     for node in scheduler.ast().toposort() {
         if let Op::Ternary(TernaryOp::Where, cond, _, _) = node.op()
-            && cond.backward_slice().iter().any(|dep| Arc::ptr_eq(dep, target_rng))
+            && cond.backward_slice_ids().contains(&target_rng.id)
         {
             return true;
         }
@@ -131,13 +131,12 @@ pub fn has_broadcast_pattern(scheduler: &Scheduler, axis: usize) -> bool {
     let target_rng = &rngs[axis];
 
     for buf in scheduler.bufs() {
-        let in_backward = buf.backward_slice().iter().any(|dep| Arc::ptr_eq(dep, target_rng));
+        let in_backward = buf.backward_slice_ids().contains(&target_rng.id);
         if !in_backward {
             continue;
         }
         if let Op::Index { indices, .. } = buf.op() {
-            let in_index =
-                indices.iter().any(|idx| idx.backward_slice().iter().any(|dep| Arc::ptr_eq(dep, target_rng)));
+            let in_index = indices.iter().any(|idx| idx.backward_slice_ids().contains(&target_rng.id));
             if !in_index {
                 return true;
             }
@@ -168,7 +167,7 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
             let idx = indices.first().map(|i| i.get_idx()).unwrap_or_else(|| buf.clone());
 
             // Tinygrad: if rng in idx.backward_slice: num_strides += 1
-            if idx.backward_slice().iter().any(|dep| Arc::ptr_eq(dep, target_rng)) {
+            if idx.backward_slice_ids().contains(&target_rng.id) {
                 num_strides += 1;
             }
 
@@ -616,12 +615,10 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
                 let bufs = scheduler.bufs();
                 bufs.iter().any(|buf| {
                     if let Op::Index { indices, .. } = buf.op() {
-                        let idx_backward: Vec<_> =
-                            indices.iter().flat_map(|idx| idx.backward_slice().into_iter()).collect();
-                        let rng_not_in_idx = !idx_backward.iter().any(|dep| Arc::ptr_eq(dep, rng));
+                        let rng_not_in_idx = !indices.iter().any(|idx| idx.backward_slice_ids().contains(&rng.id));
                         let all_upcast_in_idx = upcast_and_unroll_ranges
                             .iter()
-                            .all(|r2| idx_backward.iter().any(|dep| Arc::ptr_eq(dep, r2)));
+                            .all(|r2| indices.iter().any(|idx| idx.backward_slice_ids().contains(&r2.id)));
                         rng_not_in_idx && all_upcast_in_idx
                     } else {
                         false
