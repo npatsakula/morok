@@ -267,7 +267,7 @@ Terminal nodes index consume करते हैं और `Index` wrapper disca
 ## 6. Commutative Canonicalization
 
 ```rust
-// सिर्फ़ Index dtype के लिए:
+// For Index dtype ONLY:
 op(a, b) -> op(b, a)   when b.id < a.id
 ```
 
@@ -292,8 +292,8 @@ Canonicalization rewrite engine के fixed-point iteration से interact क
 Range `R0` `0..32` iterate करता है (flat index)। Access pattern decompose होता है:
 
 ```text
-row = R0 // 8       (4 rows में कौन सी)
-col = R0 % 8        (8 columns में कौन सा)
+row = R0 // 8       (which of the 4 rows)
+col = R0 % 8        (which of the 8 columns)
 addr = row * 8 + col = (R0 // 8) * 8 + (R0 % 8)
 ```
 

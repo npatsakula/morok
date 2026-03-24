@@ -59,7 +59,7 @@ After:
 Матчер `symbolic_simple()` компонует группы паттернов в определённом порядке. Внутри группы паттерны пробуются последовательно до первого совпадения. Группы конкатенируются оператором `+`:
 
 ```text
-propagate_invalid          -- ОБЯЗАТЕЛЬНО первым (до x*0=0)
+propagate_invalid          -- MUST be first (before x*0=0)
 fold_invalid_load_store
 constant_folding_dsl_patterns
 vconst_folding_patterns
@@ -84,7 +84,7 @@ range_based_mod_div_patterns
 dce_dsl_patterns
 dead_loop_patterns
 after_simplification_patterns
-pm_move_where_on_load       -- встраивание WHERE->INDEX для маскированных загрузок
+pm_move_where_on_load       -- WHERE->INDEX embedding for masked loads
 ```
 
 ---

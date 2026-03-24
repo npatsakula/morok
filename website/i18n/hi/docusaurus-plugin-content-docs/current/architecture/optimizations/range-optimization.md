@@ -19,7 +19,7 @@ Tinygrad source: `tinygrad/codegen/simplify.py`।
 **कब**: Range variable modulo के साथ इस्तेमाल होता है: `RANGE(end) % c` जहाँ `end % c == 0`।
 
 ```text
-Before:  RANGE(end=12) % 4     One loop, body में modulo (slow)
+Before:  RANGE(end=12) % 4     One loop, modulo in body (slow)
               |
          [split: end/c outer, c inner]
               |
@@ -43,11 +43,11 @@ Tinygrad: `simplify.py:60-64`। Morok: `pm_split_ranges()` in `rangeify/transfo
 **क्या**: दो adjacent ranges को एक में merge करना, loop overhead कम करना।
 
 ```text
-Before:  RANGE(0..4), RANGE(0..8)    दो loops, 12 iterations overhead
+Before:  RANGE(0..4), RANGE(0..8)    Two loops, 12 iterations overhead
               |
          [merge: 4 * 8 = 32]
               |
-After:   RANGE(0..32)                 एक loop, divmod से indices
+After:   RANGE(0..32)                 One loop, indices via divmod
 ```
 
 **क्यों**: Loop overhead (branch prediction, counter increment) per-iteration है। Merging loops की संख्या कम करता है divmod operations की cost पर original indices reconstruct करने के लिए।
@@ -147,19 +147,19 @@ Tinygrad: `simplify.py:82-142`। Morok: `pm_reduce_simplify()` + `reduce_collap
 ### Decision Tree
 
 ```text
-क्या यह always-run op है (CONTIGUOUS, COPY, ASSIGN)?
-  └─ YES → Buffer रखो (हमेशा materialize)
+Is this an always-run op (CONTIGUOUS, COPY, ASSIGN)?
+  └─ YES → Keep buffer (always materialized)
 
-क्या inlining buffer limit exceed करता है?
-  └─ YES → Buffer रखो
+Does inlining exceed the buffer limit?
+  └─ YES → Keep buffer
 
-क्या scope में reduce है?
-  ├─ NO → Inline करो (cheap: बस ranges substitute)
+Is there a reduce in scope?
+  ├─ NO → Inline (cheap: just substitute ranges)
   └─ YES:
-      क्या pcontig level <= 2?
-        ├─ YES → Buffer रखो (reduce recomputation बहुत expensive)
-        └─ NO → Input/output ratio चेक करो
-            ├─ Ratio low (output input से छोटा) → Buffer रखो
+      Is pcontig level <= 2?
+        ├─ YES → Keep buffer (reduce recomputation too expensive)
+        └─ NO → Check input/output ratio
+            ├─ Ratio low (output small relative to input) → Keep buffer
             └─ Ratio high (output >> input) → Partial inline
 ```
 

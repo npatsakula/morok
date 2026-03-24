@@ -59,7 +59,7 @@ After:
 `symbolic_simple()` 匹配器按特定顺序组合模式组。在组内，模式按顺序尝试直到有一个匹配。组通过 `+` 运算符串联：
 
 ```text
-propagate_invalid          -- 必须在前（在 x*0=0 之前）
+propagate_invalid          -- MUST be first (before x*0=0)
 fold_invalid_load_store
 constant_folding_dsl_patterns
 vconst_folding_patterns
@@ -84,7 +84,7 @@ range_based_mod_div_patterns
 dce_dsl_patterns
 dead_loop_patterns
 after_simplification_patterns
-pm_move_where_on_load       -- WHERE->INDEX 嵌入，用于带掩码的加载
+pm_move_where_on_load       -- WHERE->INDEX embedding for masked loads
 ```
 
 ---
