@@ -560,7 +560,7 @@ fn find_split_candidates(
 
         let dim_size = match &input_shape[axis] {
             SInt::Const(n) => *n,
-            SInt::Symbolic(_) => continue,
+            SInt::Symbolic(_) | SInt::Infer => continue,
         };
 
         for divisor in (config.min_divisor..=config.max_divisor).rev() {

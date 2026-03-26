@@ -55,10 +55,7 @@ impl IndexingContext {
         let axis_id = AxisId::Unrenumbered(self.range_idx);
         self.range_idx += 1;
 
-        let size_uop = match size {
-            SInt::Const(n) => UOp::index_const(*n as i64),
-            SInt::Symbolic(uop) => Arc::clone(uop),
-        };
+        let size_uop = size.to_uop(morok_dtype::DType::Index);
 
         UOp::range_axis(size_uop, axis_id, axistype)
     }
@@ -584,7 +581,7 @@ fn assign_ranges(
         if let Op::Expand { new_shape, .. } = x.op() {
             // Check if new_shape is all static (no RANGE ops being injected in the shape)
             let shape_is_static = extract_shape_from_uop(new_shape).iter().all(|s| match s {
-                SInt::Const(_) => true,
+                SInt::Const(_) | SInt::Infer => true,
                 SInt::Symbolic(uop) => !matches!(uop.op(), Op::Range { .. }),
             });
 
@@ -663,13 +660,8 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                 if !flip {
                     Arc::clone(rng)
                 } else {
-                    let shape_minus_1 = match shape {
-                        SInt::Const(n) => UOp::index_const(*n as i64 - 1),
-                        SInt::Symbolic(uop) => {
-                            let one = UOp::index_const(1);
-                            uop.try_sub(&one).unwrap()
-                        }
-                    };
+                    let shape_uop = shape.to_uop(morok_dtype::DType::Index);
+                    let shape_minus_1 = shape_uop.try_sub(&UOp::index_const(1)).unwrap();
                     shape_minus_1.try_sub(rng).unwrap()
                 }
             })
@@ -731,10 +723,7 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                         return Arc::clone(rng);
                     }
                     let begin_uop = UOp::index_const(begin as i64);
-                    let shape_plus_begin = match shape {
-                        SInt::Const(n) => UOp::index_const(*n as i64 + begin as i64),
-                        SInt::Symbolic(uop) => uop.try_add(&begin_uop).unwrap(),
-                    };
+                    let shape_plus_begin = shape.to_uop(morok_dtype::DType::Index).try_add(&begin_uop).unwrap();
                     // valid_low = NOT(rng < begin), canonical form for parse_valid
                     // (Tinygrad encodes >= as CMPNE(CMPLT, True); we use Not(Lt))
                     let valid_low = rng.try_cmplt(&begin_uop).unwrap().not();
@@ -812,19 +801,8 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                     "Reshape flatten weighted"
                 );
                 axes_in.push(weighted);
-                acc = match shape_dim {
-                    SInt::Const(n) => {
-                        let n_uop = UOp::index_const(*n as i64);
-                        let new_acc = acc.try_mul(&n_uop).unwrap();
-                        trace!(
-                            multiplier = n,
-                            new_acc.op = ?std::mem::discriminant(new_acc.op()),
-                            "Reshape flatten acc update"
-                        );
-                        new_acc
-                    }
-                    SInt::Symbolic(uop) => acc.try_mul(uop).unwrap(),
-                };
+                let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
+                acc = acc.try_mul(&dim_uop).unwrap();
             }
             let combined_axes =
                 axes_in.into_iter().reduce(|a, b| a.try_add(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
@@ -839,17 +817,9 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             let mut axes_out = Vec::new();
             let mut combined = combined_axes;
             for shape_dim in in_shape.iter().rev() {
-                match shape_dim {
-                    SInt::Const(n) => {
-                        let n_uop = UOp::index_const(*n as i64);
-                        axes_out.push(combined.try_mod(&n_uop).unwrap());
-                        combined = combined.try_div(&n_uop).unwrap();
-                    }
-                    SInt::Symbolic(uop) => {
-                        axes_out.push(combined.try_mod(uop).unwrap());
-                        combined = combined.try_div(uop).unwrap();
-                    }
-                }
+                let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
+                axes_out.push(combined.try_mod(&dim_uop).unwrap());
+                combined = combined.try_div(&dim_uop).unwrap();
             }
             axes_out.reverse();
 

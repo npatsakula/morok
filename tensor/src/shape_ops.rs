@@ -46,11 +46,48 @@ impl Tensor {
     /// - Multiple -1 dimensions specified
     /// - Total elements don't match
     #[track_caller]
-    pub fn try_reshape(&self, new_shape: &[isize]) -> Result<Tensor> {
-        // Convert to Shape, handling -1 inference
-        let shape = self.resolve_shape_with_inference(new_shape)?;
+    pub fn try_reshape(&self, new_shape: impl IntoIterator<Item = impl Into<SInt>>) -> Result<Tensor> {
+        let dims: Vec<SInt> = new_shape.into_iter().map(Into::into).collect();
+
+        // Handle Infer (-1) if present
+        let infer_count = dims.iter().filter(|d| d.is_infer()).count();
+        snafu::ensure!(infer_count <= 1, MultipleInferDimensionsSnafu);
+
+        let shape: Shape = if infer_count == 1 {
+            let current_shape = self.shape()?;
+            let total_elements =
+                current_shape.iter().try_fold(1usize, |acc, dim| dim.as_const().map(|v| acc * v)).ok_or_else(|| {
+                    Error::SymbolicShapeUnsupported { operation: "reshape with -1 inference".to_string() }
+                })?;
+            let known_product: usize = dims
+                .iter()
+                .filter(|d| !d.is_infer())
+                .map(|d| d.as_const().expect("non-infer dims must be concrete for -1 inference"))
+                .product();
+            snafu::ensure!(
+                known_product > 0 && total_elements % known_product == 0,
+                ReshapeSizeMismatchSnafu { operation: "reshape with inference".to_string() }
+            );
+            let inferred = total_elements / known_product;
+            dims.iter().map(|d| if d.is_infer() { SInt::Const(inferred) } else { d.clone() }).collect()
+        } else {
+            dims.into()
+        };
 
         self.uop().try_reshape(&shape).map(Self::new).context(UOpSnafu)
+    }
+
+    /// Expand tensor to a new shape with mixed concrete/symbolic dimensions.
+    pub fn try_expand(&self, new_shape: impl IntoIterator<Item = impl Into<SInt>>) -> Result<Tensor> {
+        let requested: Vec<SInt> = new_shape.into_iter().map(Into::into).collect();
+        // Resolve Infer (-1) to current dimension (expand's "keep" semantics)
+        let current_shape = self.shape()?;
+        let shape: Shape = requested
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| if s.is_infer() { current_shape[i].clone() } else { s })
+            .collect();
+        self.uop().try_expand(&shape).map(Self::new).context(UOpSnafu)
     }
 
     /// Permute (reorder) tensor dimensions.
@@ -129,18 +166,6 @@ impl Tensor {
     /// // t.try_expand(&[4, -1, 5]) -> shape [4, 3, 5]
     /// ```
     ///
-    /// # Errors
-    ///
-    /// Returns error if:
-    /// - Number of dimensions doesn't match
-    /// - Trying to expand non-1 dimension to different size
-    #[track_caller]
-    pub fn try_expand(&self, new_shape: &[isize]) -> Result<Tensor> {
-        let shape = self.resolve_expand_shape(new_shape)?;
-
-        self.uop().try_expand(&shape).map(Self::new).context(UOpSnafu)
-    }
-
     /// Squeeze dimensions of size 1.
     ///
     /// If dim is None, removes all dimensions of size 1.
@@ -317,14 +342,14 @@ impl Tensor {
             let current_shape = result.shape()?;
             let dim_size = current_shape[dim]
                 .as_const()
-                .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "repeat".to_string() })?
-                as isize;
-            // Unsqueeze at dim, expand rep times, then reshape to merge
+                .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "repeat".to_string() })?;
+            // Unsqueeze at dim, expand rep times, then reshape to merge.
+            // Use -1 (Infer/keep) for other dims to preserve symbolic batch.
             result = result.try_unsqueeze(dim as isize)?;
-            let mut expand_shape = morok_ir::shape::to_vec_isize(&current_shape).context(UOpSnafu)?;
-            expand_shape.insert(dim, rep as isize);
+            let mut expand_shape: Vec<SInt> = current_shape.iter().cloned().collect();
+            expand_shape.insert(dim, (rep).into());
             result = result.try_expand(&expand_shape)?;
-            expand_shape[dim] = rep as isize * dim_size;
+            expand_shape[dim] = (rep * dim_size).into();
             expand_shape.remove(dim + 1);
             result = result.try_reshape(&expand_shape)?;
         }
@@ -343,7 +368,7 @@ impl Tensor {
     /// ```
     #[track_caller]
     pub fn flatten(&self) -> Result<Tensor> {
-        self.try_reshape(&[-1])
+        self.try_reshape([-1])
     }
 
     /// Pad tensor with zeros (or other padding value).
@@ -596,7 +621,7 @@ impl Tensor {
     ///
     /// Returns error if negative indices are used with symbolic shape dimensions.
     #[track_caller]
-    pub fn try_shrink(&self, ranges: &[(isize, isize)]) -> Result<Tensor> {
+    pub fn try_shrink(&self, ranges: &[impl Into<Option<(isize, isize)>> + Copy]) -> Result<Tensor> {
         let shape = self.shape()?;
 
         // Empty ranges (scalar) → identity
@@ -604,17 +629,29 @@ impl Tensor {
             return Ok(self.clone());
         }
 
-        // Convert to SInt and handle negative indices
-        let ranges_sint: Vec<(SInt, SInt)> = ranges
+        // Check if all ranges are None (no-op)
+        let resolved: Vec<Option<(isize, isize)>> = ranges.iter().map(|r| (*r).into()).collect();
+        if resolved.iter().all(|r| r.is_none()) {
+            return Ok(self.clone());
+        }
+
+        // Convert to SInt and handle negative indices.
+        // None means "keep entire dim" (matches Tinygrad's shrink(None) semantics).
+        let ranges_sint: Vec<(SInt, SInt)> = resolved
             .iter()
             .enumerate()
-            .map(|(dim_idx, &(begin, end))| {
-                // Only need dimension size if we have negative indices
+            .map(|(dim_idx, range)| {
+                let Some((begin, end)) = range else {
+                    // None → keep entire dimension: use concrete (0, dim_size) if possible,
+                    // otherwise the dim is symbolic and we pass it through.
+                    return Ok((SInt::Const(0), shape[dim_idx].clone()));
+                };
+                let (begin, end) = (*begin, *end);
+
                 let (normalized_begin, normalized_end) = if begin < 0 || end < 0 {
                     let dim_size = shape[dim_idx].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported {
                         operation: "shrink with negative indices".to_string(),
                     })? as isize;
-
                     let nb = if begin < 0 { dim_size + begin } else { begin };
                     let ne = if end < 0 { dim_size + end } else { end };
                     (nb, ne)
@@ -736,53 +773,6 @@ impl Tensor {
         Ok(normalized)
     }
 
-    /// Resolve reshape shape with -1 inference.
-    fn resolve_shape_with_inference(&self, shape_spec: &[isize]) -> Result<Shape> {
-        let current_shape = self.shape()?;
-
-        // Find -1 position and validate
-        let minus_one_pos = shape_spec.iter().position(|&s| s == -1);
-        let has_multiple_minus_one = shape_spec.iter().filter(|&&s| s == -1).count() > 1;
-
-        snafu::ensure!(!has_multiple_minus_one, MultipleInferDimensionsSnafu);
-
-        // Validate no other negative values (0 is valid for zero-size tensors)
-        for &dim in shape_spec {
-            snafu::ensure!(dim >= 0 || dim == -1, NegativeDimensionSnafu { dim });
-        }
-
-        // Calculate new shape
-        let new_shape: Shape = if let Some(_infer_pos) = minus_one_pos {
-            // Inference requires concrete shape to compute total elements
-            let total_elements =
-                current_shape.iter().try_fold(1usize, |acc, dim| dim.as_const().map(|v| acc * v)).ok_or_else(|| {
-                    Error::SymbolicShapeUnsupported { operation: "reshape with -1 inference".to_string() }
-                })?;
-
-            // Calculate product of known (non -1) dimensions.
-            // Tinygrad: -prod(source) // prod(target_with_-1). When target has both 0 and -1,
-            // prod is 0 → ZeroDivisionError. We match that: known_product=0 is a size mismatch.
-            let known_product: usize = shape_spec.iter().filter(|&&s| s != -1).map(|&s| s as usize).product();
-
-            snafu::ensure!(
-                known_product > 0 && total_elements % known_product == 0,
-                ReshapeSizeMismatchSnafu { operation: "reshape with inference".to_string() }
-            );
-
-            let inferred_dim = total_elements / known_product;
-
-            shape_spec
-                .iter()
-                .map(|&s| if s == -1 { SInt::Const(inferred_dim) } else { SInt::Const(s as usize) })
-                .collect()
-        } else {
-            // No inference, direct conversion - allow symbolic shapes to pass through
-            shape_spec.iter().map(|&s| SInt::Const(s as usize)).collect()
-        };
-
-        Ok(new_shape)
-    }
-
     /// Upper triangular mask: row + diagonal <= col.
     fn tri(rows: i64, cols: i64, diagonal: i64) -> Result<Tensor> {
         let row = Tensor::arange(0, Some(rows), None)?.try_unsqueeze(-1)?;
@@ -811,31 +801,6 @@ impl Tensor {
         let mask = Self::tri(r, c, diagonal + 1)?;
         let zero = Tensor::new(self.uop().const_like(ConstValue::zero(self.uop().dtype().scalar().unwrap())));
         zero.where_(&mask, self)
-    }
-
-    /// Resolve expand shape with -1 meaning "keep current dimension".
-    fn resolve_expand_shape(&self, shape_spec: &[isize]) -> Result<Shape> {
-        let current_shape = self.shape()?;
-
-        snafu::ensure!(
-            shape_spec.len() == current_shape.len(),
-            ExpandDimensionMismatchSnafu { current_dims: current_shape.len(), target_dims: shape_spec.len() }
-        );
-
-        let new_shape: Shape = shape_spec
-            .iter()
-            .zip(current_shape.iter())
-            .map(|(&spec, current)| {
-                if spec == -1 {
-                    Ok(current.clone())
-                } else {
-                    snafu::ensure!(spec > 0, NegativeDimensionSnafu { dim: spec });
-                    Ok(SInt::Const(spec as usize))
-                }
-            })
-            .collect::<Result<_>>()?;
-
-        Ok(new_shape)
     }
 }
 

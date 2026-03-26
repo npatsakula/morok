@@ -175,7 +175,7 @@ crate::codegen_tests! {
     fn test_full_dynamic_reshape(config) {
         test_setup();
         let t = Tensor::full_dynamic(&[SInt::from(2), SInt::from(3)], 1.0f32, DType::Float32).unwrap();
-        let mut r = t.try_reshape(&[6]).unwrap();
+        let mut r = t.try_reshape([6]).unwrap();
         assert_eq!(r.realize_with_and(&config).as_vec::<f32>().unwrap(), vec![1.0; 6]);
     }
 
@@ -260,7 +260,7 @@ crate::codegen_tests! {
         let batch = Variable::new("B", 1, 8);
         let shape = [batch.bind(3).unwrap().as_sint(), SInt::from(2)];
         let input = Tensor::empty_dynamic(&shape, DType::Float32);
-        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[3, 2]).unwrap();
+        let data = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([3, 2]).unwrap();
         input.assign(&data);
         let mut result = input.sum(0).unwrap();
         result.realize_with(&config).unwrap();
@@ -353,7 +353,7 @@ crate::codegen_tests! {
         // B=2: [[1,2],[3,4]] → sum(axis=0) = [4, 6]
         let shape2 = [batch.bind(2).unwrap().as_sint(), SInt::from(2)];
         let t2 = Tensor::empty_dynamic(&shape2, DType::Float32);
-        t2.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap());
+        t2.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap());
         let mut sum2 = t2.sum(0).unwrap();
         sum2.realize_with(&config).unwrap();
         assert_close_f32(&sum2.as_vec::<f32>().unwrap(), &[4.0, 6.0], 1e-5);
@@ -361,7 +361,7 @@ crate::codegen_tests! {
         // B=3: [[1,2],[3,4],[5,6]] → sum(axis=0) = [9, 12]
         let shape3 = [batch.bind(3).unwrap().as_sint(), SInt::from(2)];
         let t3 = Tensor::empty_dynamic(&shape3, DType::Float32);
-        t3.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[3, 2]).unwrap());
+        t3.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([3, 2]).unwrap());
         let mut sum3 = t3.sum(0).unwrap();
         sum3.realize_with(&config).unwrap();
         assert_close_f32(&sum3.as_vec::<f32>().unwrap(), &[9.0, 12.0], 1e-5);
@@ -412,5 +412,26 @@ crate::codegen_tests! {
             let result = sum_result.buffer().unwrap().item::<f32>().unwrap();
             assert_close_f32(&[result], &[expected], 1e-5);
         }
+    }
+}
+
+// ==========================================================================
+// Symbolic batch in nn ops
+// ==========================================================================
+
+crate::codegen_tests! {
+    // Conv2d with symbolic batch: [B, 1, 3, 3] * [1, 1, 2, 2] → [B, 1, 2, 2]
+    fn test_conv2d_symbolic_batch(config) {
+        test_setup();
+        let batch = Variable::new("B", 1, 8);
+        let shape = [batch.bind(2).unwrap().as_sint(), SInt::from(1), SInt::from(3), SInt::from(3)];
+        let input = Tensor::empty_dynamic(&shape, DType::Float32);
+        let data = ndarray::Array4::from_elem((2, 1, 3, 3), 1.0f32);
+        input.assign(&Tensor::from_ndarray(&data));
+        let weight = Tensor::from_ndarray(&ndarray::Array4::from_elem((1, 1, 2, 2), 1.0f32));
+        // Each 2x2 window of ones sums to 4.0. Output: [2, 1, 2, 2] all 4.0 → sum = 32.0
+        let mut result = input.conv2d().weight(&weight).call().unwrap().sum(()).unwrap();
+        result.realize_with(&config).unwrap();
+        assert_close_f32(&result.as_vec::<f32>().unwrap(), &[32.0], 1e-5);
     }
 }

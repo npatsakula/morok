@@ -407,7 +407,7 @@ crate::codegen_tests! {
         // Test with broadcast
         let c = Tensor::from_slice([1.0f32, 2.0, 3.0, 2.0]);
         let two = Tensor::from_slice([2.0f32]);
-        let two_broadcast = two.try_expand(&[4]).unwrap();
+        let two_broadcast = two.try_expand([4]).unwrap();
         let mut eq2 = c.try_eq(&two_broadcast).unwrap();
         // Expected: [false, true, false, true] (positions 1 and 3 equal 2)
         assert_eq!(eq2.realize_with_and(&config).as_vec::<bool>().unwrap(), [false, true, false, true], "Broadcast eq failed");
@@ -416,7 +416,7 @@ crate::codegen_tests! {
         let d = Tensor::from_slice([1.0f32, 5.0, 3.0, 2.0]);
         let mut d_max = d.max_with().axes(0).keepdim(true).call().unwrap();
         d_max.realize_with(&config).unwrap();
-        let d_max_expanded = d_max.try_expand(&[4]).unwrap();
+        let d_max_expanded = d_max.try_expand([4]).unwrap();
         let mut eq3 = d.try_eq(&d_max_expanded).unwrap();
         // Expected: [false, true, false, false] (only position 1 equals 5)
         assert_eq!(eq3.realize_with_and(&config).as_vec::<bool>().unwrap(), [false, true, false, false], "Reduction expand eq failed");
@@ -430,7 +430,7 @@ crate::codegen_tests! {
         let max_vals = t.max_with().axes(0).keepdim(true).call().unwrap();
 
         // Step 2: expand max to original shape
-        let max_broadcast = max_vals.try_expand(&[5]).unwrap();
+        let max_broadcast = max_vals.try_expand([5]).unwrap();
 
         // Step 3: mask where values == max
         let mask = t.try_eq(&max_broadcast).unwrap();
@@ -461,7 +461,7 @@ crate::codegen_tests! {
 
         // Step 8: n - max_idx
         let n_tensor = Tensor::from_slice([axis_size]);
-        let n_scalar = n_tensor.try_reshape(&[]).unwrap();
+        let n_scalar = n_tensor.try_reshape(&[] as &[isize]).unwrap();
         let mut result = n_scalar.try_sub(&max_idx).unwrap();
         // Expected: [3]
         assert_eq!(result.realize_with_and(&config).as_vec::<i32>().unwrap(), [3], "Final result mismatch");

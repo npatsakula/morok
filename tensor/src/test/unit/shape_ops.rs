@@ -19,9 +19,9 @@ crate::codegen_tests! {
         ];
         let x = Tensor::from_ndarray(&ndarray::Array4::from_shape_vec((1, 1, 4, 6), data).unwrap());
 
-        let step1 = x.try_reshape(&[1, 1, 2, 2, 3, 2]).unwrap();
+        let step1 = x.try_reshape([1, 1, 2, 2, 3, 2]).unwrap();
         let step2 = step1.try_permute(&[0, 3, 5, 1, 2, 4]).unwrap();
-        let mut result = step2.try_reshape(&[1, 4, 2, 3]).unwrap();
+        let mut result = step2.try_reshape([1, 4, 2, 3]).unwrap();
 
         let expected: Vec<f32> = (0..24).map(|i| i as f32).collect();
         result.realize_with(&config).unwrap();
@@ -97,7 +97,7 @@ crate::codegen_tests! {
 #[test]
 fn test_reshape_basic() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     assert_eq!(get_shape(&reshaped), vec![2, 3]);
     if let Op::Reshape { .. } = reshaped.uop().op() {
@@ -112,19 +112,19 @@ fn test_reshape_with_inference() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
     // -1 should infer dimension: 6 elements / 2 = 3
-    let reshaped = t.try_reshape(&[-1, 2]).unwrap();
+    let reshaped = t.try_reshape([-1, 2]).unwrap();
     assert_eq!(get_shape(&reshaped), vec![3, 2]);
 
     // -1 at different position
-    let reshaped2 = t.try_reshape(&[3, -1]).unwrap();
+    let reshaped2 = t.try_reshape([3, -1]).unwrap();
     assert_eq!(get_shape(&reshaped2), vec![3, 2]);
 }
 
 #[test]
 fn test_reshape_flatten() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
-    let flattened = reshaped.try_reshape(&[6]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
+    let flattened = reshaped.try_reshape([6]).unwrap();
 
     assert_eq!(get_shape(&flattened), vec![6]);
 }
@@ -132,7 +132,7 @@ fn test_reshape_flatten() {
 #[test]
 fn test_reshape_identity() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let reshaped = t.try_reshape(&[3]).unwrap();
+    let reshaped = t.try_reshape([3]).unwrap();
 
     assert_eq!(get_shape(&reshaped), vec![3]);
 }
@@ -142,7 +142,7 @@ fn test_reshape_error_size_mismatch() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
     // 6 elements cannot be reshaped to [2, 4] = 8 elements
-    let result = t.try_reshape(&[2, 4]);
+    let result = t.try_reshape([2, 4]);
     assert!(result.is_err());
 }
 
@@ -151,17 +151,17 @@ fn test_reshape_error_multiple_inference() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
     // Multiple -1 dimensions not allowed
-    let result = t.try_reshape(&[-1, -1]);
+    let result = t.try_reshape([-1, -1]);
     assert!(result.is_err());
 }
 
 #[test]
+#[should_panic(expected = "negative dimension -2")]
 fn test_reshape_error_invalid_negative() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
 
-    // Negative dimension other than -1 not allowed
-    let result = t.try_reshape(&[-2, 3]);
-    assert!(result.is_err());
+    // Negative dimension other than -1 panics at SInt conversion
+    let _ = t.try_reshape([-2, 3]);
 }
 
 // =========================================================================
@@ -171,7 +171,7 @@ fn test_reshape_error_invalid_negative() {
 #[test]
 fn test_permute_basic() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     // Swap dimensions [2, 3] -> [3, 2]
     let permuted = reshaped.try_permute(&[1, 0]).unwrap();
@@ -181,7 +181,7 @@ fn test_permute_basic() {
 #[test]
 fn test_permute_3d() {
     let t = Tensor::from_slice([1.0f32; 24]);
-    let reshaped = t.try_reshape(&[2, 3, 4]).unwrap();
+    let reshaped = t.try_reshape([2, 3, 4]).unwrap();
 
     // Permute [2, 3, 4] -> [4, 2, 3]
     let permuted = reshaped.try_permute(&[2, 0, 1]).unwrap();
@@ -191,7 +191,7 @@ fn test_permute_3d() {
 #[test]
 fn test_permute_identity() {
     let t = Tensor::from_slice([1.0f32; 6]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     // Identity permutation
     let permuted = reshaped.try_permute(&[0, 1]).unwrap();
@@ -201,7 +201,7 @@ fn test_permute_identity() {
 #[test]
 fn test_permute_negative_indices() {
     let t = Tensor::from_slice([1.0f32; 6]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     // Negative indices: -1 = last axis, -2 = second to last
     let permuted = reshaped.try_permute(&[-1, -2]).unwrap();
@@ -211,7 +211,7 @@ fn test_permute_negative_indices() {
 #[test]
 fn test_permute_error_invalid_permutation() {
     let t = Tensor::from_slice([1.0f32; 6]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     // Duplicate axis
     let result = reshaped.try_permute(&[0, 0]);
@@ -225,7 +225,7 @@ fn test_permute_error_invalid_permutation() {
 #[test]
 fn test_permute_error_wrong_length() {
     let t = Tensor::from_slice([1.0f32; 6]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     // Wrong number of axes
     let result = reshaped.try_permute(&[0, 1, 2]);
@@ -239,7 +239,7 @@ fn test_permute_error_wrong_length() {
 #[test]
 fn test_transpose_basic() {
     let t = Tensor::from_slice([1.0f32; 6]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     let transposed = reshaped.try_transpose(0, 1).unwrap();
     assert_eq!(get_shape(&transposed), vec![3, 2]);
@@ -248,7 +248,7 @@ fn test_transpose_basic() {
 #[test]
 fn test_transpose_3d() {
     let t = Tensor::from_slice([1.0f32; 24]);
-    let reshaped = t.try_reshape(&[2, 3, 4]).unwrap();
+    let reshaped = t.try_reshape([2, 3, 4]).unwrap();
 
     // Swap first and last dimensions
     let transposed = reshaped.try_transpose(0, 2).unwrap();
@@ -258,7 +258,7 @@ fn test_transpose_3d() {
 #[test]
 fn test_transpose_negative_indices() {
     let t = Tensor::from_slice([1.0f32; 6]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     // -1 = last axis (1), -2 = second to last (0)
     let transposed = reshaped.try_transpose(-1, -2).unwrap();
@@ -268,7 +268,7 @@ fn test_transpose_negative_indices() {
 #[test]
 fn test_transpose_same_dimension() {
     let t = Tensor::from_slice([1.0f32; 6]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     // Transpose dimension with itself = identity
     let transposed = reshaped.try_transpose(0, 0).unwrap();
@@ -282,50 +282,50 @@ fn test_transpose_same_dimension() {
 #[test]
 fn test_expand_basic() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let reshaped = t.try_reshape(&[1, 3]).unwrap();
+    let reshaped = t.try_reshape([1, 3]).unwrap();
 
     // Expand first dimension from 1 to 4
-    let expanded = reshaped.try_expand(&[4, -1]).unwrap();
+    let expanded = reshaped.try_expand([4, -1]).unwrap();
     assert_eq!(get_shape(&expanded), vec![4, 3]);
 }
 
 #[test]
 fn test_expand_keep_dimension() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let reshaped = t.try_reshape(&[1, 3]).unwrap();
+    let reshaped = t.try_reshape([1, 3]).unwrap();
 
     // -1 keeps current dimension
-    let expanded = reshaped.try_expand(&[-1, -1]).unwrap();
+    let expanded = reshaped.try_expand([-1, -1]).unwrap();
     assert_eq!(get_shape(&expanded), vec![1, 3]);
 }
 
 #[test]
 fn test_expand_multiple_dims() {
     let t = Tensor::from_slice([1.0f32]);
-    let reshaped = t.try_reshape(&[1, 1, 1]).unwrap();
+    let reshaped = t.try_reshape([1, 1, 1]).unwrap();
 
     // Expand all dimensions
-    let expanded = reshaped.try_expand(&[4, 5, 6]).unwrap();
+    let expanded = reshaped.try_expand([4, 5, 6]).unwrap();
     assert_eq!(get_shape(&expanded), vec![4, 5, 6]);
 }
 
 #[test]
 fn test_expand_error_non_one_dimension() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let reshaped = t.try_reshape(&[1, 3]).unwrap();
+    let reshaped = t.try_reshape([1, 3]).unwrap();
 
     // Cannot expand dimension of size 3 to 5
-    let result = reshaped.try_expand(&[1, 5]);
+    let result = reshaped.try_expand([1, 5]);
     assert!(result.is_err());
 }
 
 #[test]
 fn test_expand_error_dimension_mismatch() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let reshaped = t.try_reshape(&[1, 3]).unwrap();
+    let reshaped = t.try_reshape([1, 3]).unwrap();
 
     // Wrong number of dimensions
-    let result = reshaped.try_expand(&[4, 5, 6]);
+    let result = reshaped.try_expand([4, 5, 6]);
     assert!(result.is_err());
 }
 
@@ -336,7 +336,7 @@ fn test_expand_error_dimension_mismatch() {
 #[test]
 fn test_squeeze_all() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let reshaped = t.try_reshape(&[1, 3, 1]).unwrap();
+    let reshaped = t.try_reshape([1, 3, 1]).unwrap();
 
     // Remove all dimensions of size 1
     let squeezed = reshaped.try_squeeze(None).unwrap();
@@ -346,7 +346,7 @@ fn test_squeeze_all() {
 #[test]
 fn test_squeeze_specific_dim() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let reshaped = t.try_reshape(&[1, 3, 1]).unwrap();
+    let reshaped = t.try_reshape([1, 3, 1]).unwrap();
 
     // Remove only first dimension
     let squeezed = reshaped.try_squeeze(Some(0)).unwrap();
@@ -360,7 +360,7 @@ fn test_squeeze_specific_dim() {
 #[test]
 fn test_squeeze_no_effect() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let reshaped = t.try_reshape(&[3]).unwrap();
+    let reshaped = t.try_reshape([3]).unwrap();
 
     // No dimensions of size 1 to squeeze
     let squeezed = reshaped.try_squeeze(None).unwrap();
@@ -370,7 +370,7 @@ fn test_squeeze_no_effect() {
 #[test]
 fn test_squeeze_error_not_size_one() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let reshaped = t.try_reshape(&[1, 3]).unwrap();
+    let reshaped = t.try_reshape([1, 3]).unwrap();
 
     // Cannot squeeze dimension of size 3
     let result = reshaped.try_squeeze(Some(1));
@@ -409,7 +409,7 @@ fn test_unsqueeze_negative_index() {
 #[test]
 fn test_unsqueeze_middle() {
     let t = Tensor::from_slice([1.0f32; 6]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     let unsqueezed = reshaped.try_unsqueeze(1).unwrap();
     assert_eq!(get_shape(&unsqueezed), vec![2, 1, 3]);
@@ -431,7 +431,7 @@ fn test_unsqueeze_multiple() {
 #[test]
 fn test_reshape_then_transpose() {
     let t = Tensor::from_slice([1.0f32; 6]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
     let transposed = reshaped.try_transpose(0, 1).unwrap();
 
     assert_eq!(get_shape(&transposed), vec![3, 2]);
@@ -441,7 +441,7 @@ fn test_reshape_then_transpose() {
 fn test_unsqueeze_then_expand() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let unsqueezed = t.try_unsqueeze(0).unwrap();
-    let expanded = unsqueezed.try_expand(&[4, -1]).unwrap();
+    let expanded = unsqueezed.try_expand([4, -1]).unwrap();
 
     assert_eq!(get_shape(&expanded), vec![4, 3]);
 }
@@ -449,8 +449,8 @@ fn test_unsqueeze_then_expand() {
 #[test]
 fn test_expand_then_squeeze() {
     let t = Tensor::from_slice([1.0f32]);
-    let reshaped = t.try_reshape(&[1, 1]).unwrap();
-    let expanded = reshaped.try_expand(&[4, -1]).unwrap();
+    let reshaped = t.try_reshape([1, 1]).unwrap();
+    let expanded = reshaped.try_expand([4, -1]).unwrap();
     let squeezed = expanded.try_squeeze(Some(1)).unwrap();
 
     assert_eq!(get_shape(&squeezed), vec![4]);
@@ -459,7 +459,7 @@ fn test_expand_then_squeeze() {
 #[test]
 fn test_lazy_evaluation() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
     let permuted = reshaped.try_permute(&[1, 0]).unwrap();
     let unsqueezed = reshaped.try_unsqueeze(0).unwrap();
 
@@ -484,8 +484,8 @@ fn test_dtype_preservation() {
     let t_f32 = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let t_i32 = Tensor::from_slice([1i32, 2, 3]);
 
-    let reshaped_f32 = t_f32.try_reshape(&[3, 1]).unwrap();
-    let reshaped_i32 = t_i32.try_reshape(&[3, 1]).unwrap();
+    let reshaped_f32 = t_f32.try_reshape([3, 1]).unwrap();
+    let reshaped_i32 = t_i32.try_reshape([3, 1]).unwrap();
 
     assert_eq!(reshaped_f32.uop().dtype(), morok_dtype::DType::Float32);
     assert_eq!(reshaped_i32.uop().dtype(), morok_dtype::DType::Int32);
@@ -554,7 +554,7 @@ fn test_symbolic_shape_broadcast() {
     let tensor = Tensor::new(tensor_symbolic);
 
     // Create a concrete tensor to broadcast against: [1, 4]
-    let concrete = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[1, 4]).unwrap();
+    let concrete = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([1, 4]).unwrap();
 
     // Broadcasting should work with symbolic shapes
     let (broadcasted_symbolic, _broadcasted_concrete) = tensor.broadcast_for_binop(&concrete).unwrap();
@@ -616,7 +616,7 @@ fn test_pad_1d() {
 #[test]
 fn test_pad_2d() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let reshaped = t.try_reshape(&[2, 3]).unwrap();
+    let reshaped = t.try_reshape([2, 3]).unwrap();
 
     // Pad each dimension
     let padded = reshaped.try_pad(&[(1, 1), (0, 2)]).unwrap();
@@ -665,8 +665,8 @@ fn test_cat_1d() {
 
 #[test]
 fn test_cat_2d_dim0() {
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
-    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2]).unwrap();
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap();
+    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape([2, 2]).unwrap();
 
     let c = Tensor::cat(&[&a, &b], 0).unwrap();
     assert_eq!(get_shape(&c), vec![4, 2]);
@@ -674,8 +674,8 @@ fn test_cat_2d_dim0() {
 
 #[test]
 fn test_cat_2d_dim1() {
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape(&[2, 2]).unwrap();
-    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape(&[2, 2]).unwrap();
+    let a = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap();
+    let b = Tensor::from_slice([5.0f32, 6.0, 7.0, 8.0]).try_reshape([2, 2]).unwrap();
 
     let c = Tensor::cat(&[&a, &b], 1).unwrap();
     assert_eq!(get_shape(&c), vec![2, 4]);
@@ -693,8 +693,8 @@ fn test_cat_three_tensors() {
 
 #[test]
 fn test_cat_negative_axis() {
-    let a = Tensor::from_slice([1.0f32, 2.0]).try_reshape(&[1, 2]).unwrap();
-    let b = Tensor::from_slice([3.0f32, 4.0]).try_reshape(&[1, 2]).unwrap();
+    let a = Tensor::from_slice([1.0f32, 2.0]).try_reshape([1, 2]).unwrap();
+    let b = Tensor::from_slice([3.0f32, 4.0]).try_reshape([1, 2]).unwrap();
 
     // -1 = last axis
     let c = Tensor::cat(&[&a, &b], -1).unwrap();
@@ -709,8 +709,8 @@ fn test_cat_error_empty() {
 
 #[test]
 fn test_cat_error_dimension_mismatch() {
-    let a = Tensor::from_slice([1.0f32, 2.0]).try_reshape(&[2]).unwrap();
-    let b = Tensor::from_slice([1.0f32, 2.0]).try_reshape(&[1, 2]).unwrap();
+    let a = Tensor::from_slice([1.0f32, 2.0]).try_reshape([2]).unwrap();
+    let b = Tensor::from_slice([1.0f32, 2.0]).try_reshape([1, 2]).unwrap();
 
     // Different ranks
     let result = Tensor::cat(&[&a, &b], 0);

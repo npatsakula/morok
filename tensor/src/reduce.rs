@@ -161,7 +161,7 @@ impl Tensor {
         if new_shape.is_empty() {
             // For scalar result, reshape to shape [] (0-d tensor)
             // IR reshape expects same product, so [] → [] is valid
-            self.try_reshape(&[])
+            self.try_reshape(&[] as &[isize])
         } else {
             self.try_reshape(&new_shape)
         }
@@ -572,7 +572,7 @@ fn argmax_impl(tensor: &Tensor, axis: Option<isize>, keepdim: bool) -> Result<Te
         n_broadcast.try_sub(&max_idx)?
     } else {
         // Scalar result: reshape n_tensor to scalar too
-        let n_scalar = n_tensor.try_reshape(&[])?;
+        let n_scalar = n_tensor.try_reshape(&[] as &[isize])?;
         n_scalar.try_sub(&max_idx)?
     };
 

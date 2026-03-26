@@ -142,9 +142,9 @@ crate::codegen_tests! {
         // coord0: arange(2) → [0, 1], reshape [2, 1], expand [2, 2], flatten → [0, 0, 1, 1]
         let mut coord0 = Tensor::arange(0, Some(2), None)
             .unwrap()
-            .try_reshape(&[2, 1])
+            .try_reshape([2, 1])
             .unwrap()
-            .try_expand(&[2, 2])
+            .try_expand([2, 2])
             .unwrap()
             .flatten()
             .unwrap();
@@ -154,9 +154,9 @@ crate::codegen_tests! {
         // coord1: arange(2) → [0, 1], reshape [1, 2], expand [2, 2], flatten → [0, 1, 0, 1]
         let mut coord1 = Tensor::arange(0, Some(2), None)
             .unwrap()
-            .try_reshape(&[1, 2])
+            .try_reshape([1, 2])
             .unwrap()
-            .try_expand(&[2, 2])
+            .try_expand([2, 2])
             .unwrap()
             .flatten()
             .unwrap();
@@ -171,18 +171,18 @@ crate::codegen_tests! {
         // Test stack with lazy coordinate tensors
         let coord0 = Tensor::arange(0, Some(2), None)
             .unwrap()
-            .try_reshape(&[2, 1])
+            .try_reshape([2, 1])
             .unwrap()
-            .try_expand(&[2, 2])
+            .try_expand([2, 2])
             .unwrap()
             .flatten()
             .unwrap(); // [0, 0, 1, 1]
 
         let coord1 = Tensor::arange(0, Some(2), None)
             .unwrap()
-            .try_reshape(&[1, 2])
+            .try_reshape([1, 2])
             .unwrap()
-            .try_expand(&[2, 2])
+            .try_expand([2, 2])
             .unwrap()
             .flatten()
             .unwrap(); // [0, 1, 0, 1]
@@ -344,6 +344,6 @@ fn test_shrink_full_dimension() {
 #[test]
 fn test_shrink_empty_is_identity() {
     let t = Tensor::from_slice([1.0f32]);
-    let sliced = t.try_shrink(&[]).unwrap();
+    let sliced = t.try_shrink(&[] as &[(isize, isize)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![1]);
 }

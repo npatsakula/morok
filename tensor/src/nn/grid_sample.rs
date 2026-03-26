@@ -81,17 +81,17 @@ impl Tensor {
         let flat_shape = [total_elements as isize];
         let mut components: Vec<Tensor> = Vec::with_capacity(ndim + 1);
         for g in mesh.iter().rev() {
-            components.push(g.try_reshape(&flat_shape)?);
+            components.push(g.try_reshape(flat_shape)?);
         }
         components.push(Tensor::full(&[total_elements], 1.0, DType::Float32)?);
 
         let comp_refs: Vec<&Tensor> = components.iter().collect();
         let base_grid = Tensor::cat(&comp_refs, 0)?
-            .try_reshape(&[(ndim + 1) as isize, total_elements as isize])?
+            .try_reshape([(ndim + 1) as isize, total_elements as isize])?
             .try_transpose(0, 1)?;
 
         let base_grid =
-            base_grid.try_unsqueeze(0)?.try_expand(&[n as isize, total_elements as isize, (ndim + 1) as isize])?;
+            base_grid.try_unsqueeze(0)?.try_expand([n as isize, total_elements as isize, (ndim + 1) as isize])?;
 
         let theta_t = theta.try_transpose(1, 2)?;
         let output = base_grid.matmul(&theta_t)?;
@@ -167,10 +167,10 @@ impl Tensor {
         let dtype = self.uop().dtype();
 
         // Flatten X spatial: [N, C, prod(spatial)]
-        let x_flat = self.try_reshape(&[n as isize, c as isize, spatial_prod as isize])?;
+        let x_flat = self.try_reshape([n as isize, c as isize, spatial_prod as isize])?;
 
         // Flatten grid spatial: [N, prod(out_spatial), n_spatial]
-        let grid_flat = grid.try_reshape(&[n as isize, out_prod as isize, n_spatial as isize])?;
+        let grid_flat = grid.try_reshape([n as isize, out_prod as isize, n_spatial as isize])?;
 
         // Strides for flat index: stride[i] = product of spatial[i+1..]
         let strides = compute_strides(&spatial);
@@ -322,10 +322,10 @@ fn gather_and_mask(
     out_prod: usize,
     dtype: &DType,
 ) -> Result<Tensor> {
-    let expanded_idx = flat_idx.try_unsqueeze(1)?.try_expand(&[n as isize, c as isize, out_prod as isize])?;
+    let expanded_idx = flat_idx.try_unsqueeze(1)?.try_expand([n as isize, c as isize, out_prod as isize])?;
     let mut gathered = x_flat.gather(2, &expanded_idx)?;
     if let Some(mask) = valid_mask {
-        let mask = mask.try_unsqueeze(1)?.try_expand(&[n as isize, c as isize, out_prod as isize])?;
+        let mask = mask.try_unsqueeze(1)?.try_expand([n as isize, c as isize, out_prod as isize])?;
         gathered = gathered.try_mul(&mask.cast(dtype.clone())?)?;
     }
     Ok(gathered)
@@ -385,7 +385,7 @@ fn interpolate_linear(
         let (flat_idx, valid_mask) = build_flat_index(&corner_indices, spatial, strides, padding_mode)?;
         let gathered = gather_and_mask(x_flat, &flat_idx, valid_mask.as_ref(), n, c, out_prod, dtype)?;
 
-        let weight = weight.try_unsqueeze(1)?.try_expand(&[n as isize, c as isize, out_prod as isize])?;
+        let weight = weight.try_unsqueeze(1)?.try_expand([n as isize, c as isize, out_prod as isize])?;
         result = result.try_add(&gathered.try_mul(&weight)?)?;
     }
 
@@ -431,7 +431,7 @@ fn interpolate_cubic(
         let (flat_idx, valid_mask) = build_flat_index(&corner_indices, spatial, strides, padding_mode)?;
         let gathered = gather_and_mask(x_flat, &flat_idx, valid_mask.as_ref(), n, c, out_prod, dtype)?;
 
-        let weight = weight.try_unsqueeze(1)?.try_expand(&[n as isize, c as isize, out_prod as isize])?;
+        let weight = weight.try_unsqueeze(1)?.try_expand([n as isize, c as isize, out_prod as isize])?;
         result = result.try_add(&gathered.try_mul(&weight)?)?;
     }
 

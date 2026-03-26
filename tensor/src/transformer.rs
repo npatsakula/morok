@@ -14,8 +14,8 @@ impl Tensor {
         let embed_dim = weight_shape[1].as_const().expect("embedding weight dim 1 must be concrete") as isize;
         let idx_shape = indices.shape()?;
 
-        let flat = indices.try_reshape(&[-1])?;
-        let expanded = flat.try_unsqueeze(-1)?.try_expand(&[-1, embed_dim])?;
+        let flat = indices.try_reshape([-1])?;
+        let expanded = flat.try_unsqueeze(-1)?.try_expand([-1, embed_dim])?;
         let gathered = self.gather(0, &expanded)?;
 
         let mut out_shape: Vec<isize> =

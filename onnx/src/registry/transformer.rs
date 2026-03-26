@@ -60,11 +60,11 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
         let k_seq = k_shape[1].as_const().unwrap() as isize;
 
         let q =
-            q.try_reshape(&[batch, q_seq, q_num_heads as isize, q_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
+            q.try_reshape([batch, q_seq, q_num_heads as isize, q_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
         let k =
-            k.try_reshape(&[batch, k_seq, kv_num_heads as isize, k_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
+            k.try_reshape([batch, k_seq, kv_num_heads as isize, k_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
         let v =
-            v.try_reshape(&[batch, k_seq, kv_num_heads as isize, v_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
+            v.try_reshape([batch, k_seq, kv_num_heads as isize, v_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
         (q, k, v)
     } else {
         (q.clone(), k.clone(), v.clone())
@@ -93,13 +93,13 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
         let v_s = v.shape()?;
         let d_v = v_s[3].as_const().unwrap() as isize;
         // [B, kv_h, S, D] → [B, kv_h, 1, S, D] → expand → [B, q_h, S, D]
-        let k = k.try_unsqueeze(2)?.try_expand(&[b, kv_h, r, s_k, d_k])?.try_reshape(&[
+        let k = k.try_unsqueeze(2)?.try_expand([b, kv_h, r, s_k, d_k])?.try_reshape([
             b,
             eff_q_heads as isize,
             s_k,
             d_k,
         ])?;
-        let v = v.try_unsqueeze(2)?.try_expand(&[b, kv_h, r, s_k, d_v])?.try_reshape(&[
+        let v = v.try_unsqueeze(2)?.try_expand([b, kv_h, r, s_k, d_v])?.try_reshape([
             b,
             eff_q_heads as isize,
             s_k,
@@ -226,7 +226,7 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
         let out_shape = output.shape()?;
         let batch = out_shape[0].as_const().unwrap() as isize;
         let seq = out_shape[2].as_const().unwrap() as isize;
-        output.try_permute(&[0, 2, 1, 3])?.try_reshape(&[batch, seq, -1])?
+        output.try_permute(&[0, 2, 1, 3])?.try_reshape([batch, seq, -1])?
     } else {
         output
     };
@@ -280,7 +280,7 @@ pub(crate) fn op_embed_layer_norm(inputs: &[Option<Tensor>], attrs: &mut Attrs) 
             let seq_len = id_shape[1].as_const().unwrap() as i64;
             let batch = id_shape[0].as_const().unwrap() as isize;
             let pos = Tensor::arange(seq_len, None, None)?;
-            pos.try_unsqueeze(0)?.try_expand(&[batch, seq_len as isize])?
+            pos.try_unsqueeze(0)?.try_expand([batch, seq_len as isize])?
         }
     };
     let p = pos_emb.embedding(&pos_ids)?;
@@ -377,7 +377,7 @@ fn rotary_embedding_impl(
         let out_shape = output.shape()?;
         let batch = out_shape[0].as_const().unwrap() as isize;
         let seq = out_shape[1].as_const().unwrap() as isize;
-        output.try_reshape(&[batch, seq, -1])?
+        output.try_reshape([batch, seq, -1])?
     } else {
         // [B, S, H, D] -> [B, H, S, D]
         output.try_permute(&[0, 2, 1, 3])?
@@ -441,15 +441,15 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
 
     // Reshape [B, S, hidden] -> [B, H, S, D]
     let q = parts[0]
-        .try_reshape(&[batch, seq_len as isize, num_heads as isize, q_head_dim as isize])?
+        .try_reshape([batch, seq_len as isize, num_heads as isize, q_head_dim as isize])?
         .try_permute(&[0, 2, 1, 3])?;
     let k_head_dim = k_hidden / num_heads;
     let v_head_dim = v_hidden / num_heads;
     let mut k = parts[1]
-        .try_reshape(&[batch, seq_len as isize, num_heads as isize, k_head_dim as isize])?
+        .try_reshape([batch, seq_len as isize, num_heads as isize, k_head_dim as isize])?
         .try_permute(&[0, 2, 1, 3])?;
     let mut v = parts[2]
-        .try_reshape(&[batch, seq_len as isize, num_heads as isize, v_head_dim as isize])?
+        .try_reshape([batch, seq_len as isize, num_heads as isize, v_head_dim as isize])?
         .try_permute(&[0, 2, 1, 3])?;
 
     // Past KV
@@ -487,19 +487,19 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
             let mi_len = mi_shape[0].as_const().unwrap();
             if mi_len == batch as usize {
                 // mask_index[b] = end position for sample b
-                let range = Tensor::arange(total_seq as i64, None, None)?.try_reshape(&[1, total_seq as isize])?;
-                let ends = mi.try_reshape(&[batch, 1])?;
+                let range = Tensor::arange(total_seq as i64, None, None)?.try_reshape([1, total_seq as isize])?;
+                let ends = mi.try_reshape([batch, 1])?;
                 let mask = range.try_lt(&ends)?;
                 let filter = Tensor::const_(mask_filter_value, q_dtype.clone());
                 let zero = Tensor::const_(0.0f64, q_dtype.clone());
                 let additive = zero.where_(&mask, &filter)?;
-                attn_mask = Some(additive.try_reshape(&[batch, 1, 1, total_seq as isize])?);
+                attn_mask = Some(additive.try_reshape([batch, 1, 1, total_seq as isize])?);
             } else if mi_len == 2 * batch as usize {
                 // [end_0..end_B, start_0..start_B]
                 let end_parts = mi.split(&[batch as usize, batch as usize], 0)?;
-                let ends = end_parts[0].try_reshape(&[batch, 1])?;
-                let starts = end_parts[1].try_reshape(&[batch, 1])?;
-                let range = Tensor::arange(total_seq as i64, None, None)?.try_reshape(&[1, total_seq as isize])?;
+                let ends = end_parts[0].try_reshape([batch, 1])?;
+                let starts = end_parts[1].try_reshape([batch, 1])?;
+                let range = Tensor::arange(total_seq as i64, None, None)?.try_reshape([1, total_seq as isize])?;
                 let mask_end = range.try_lt(&ends)?;
                 let mask_start = range.try_ge(&starts)?;
                 // Combined: position >= start AND position < end
@@ -507,7 +507,7 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
                 let filter = Tensor::const_(mask_filter_value, q_dtype.clone());
                 let zero = Tensor::const_(0.0f64, q_dtype.clone());
                 let additive = zero.where_(&combined, &filter)?;
-                attn_mask = Some(additive.try_reshape(&[batch, 1, 1, total_seq as isize])?);
+                attn_mask = Some(additive.try_reshape([batch, 1, 1, total_seq as isize])?);
             }
         }
     }
@@ -535,7 +535,7 @@ pub(crate) fn op_attention_contrib(inputs: &[Option<Tensor>], attrs: &mut Attrs)
         .call()?;
 
     // Reshape [B, H, S, D] -> [B, S, H*D]
-    let output = output.try_permute(&[0, 2, 1, 3])?.try_reshape(&[batch, seq_len as isize, -1])?;
+    let output = output.try_permute(&[0, 2, 1, 3])?.try_reshape([batch, seq_len as isize, -1])?;
 
     let present = if has_past || past.is_some() { Tensor::stack(&[&k, &v], 0)? } else { Tensor::from_slice([0.0f32]) };
 

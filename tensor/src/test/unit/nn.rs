@@ -104,7 +104,7 @@ fn expect_err_msg<T>(result: crate::Result<T>, substr: &str) {
 
 #[test]
 fn test_depth_to_space_rejects_3d() {
-    let x = Tensor::from_slice([0.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+    let x = Tensor::from_slice([0.0f32; 24]).try_reshape([2, 3, 4]).unwrap();
     expect_err_msg(x.depth_to_space().blocksize(2).call(), "exactly 4D");
 }
 
@@ -145,7 +145,7 @@ fn test_group_norm_rejects_1d() {
 
 #[test]
 fn test_lrn_rejects_3d() {
-    let x = Tensor::from_slice([0.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+    let x = Tensor::from_slice([0.0f32; 24]).try_reshape([2, 3, 4]).unwrap();
     expect_err_msg(x.lrn().size(5).call(), "exactly 4D");
 }
 

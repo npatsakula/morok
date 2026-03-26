@@ -23,6 +23,7 @@ fn sint_vmax(s: &SInt) -> usize {
             },
             _ => 1,
         },
+        SInt::Infer => panic!("cannot compute vmax of SInt::Infer"),
     }
 }
 
@@ -230,7 +231,7 @@ impl Tensor {
             return Ok(scalar);
         }
         let expand_shape: Vec<isize> = shape.iter().map(|&d| d as isize).collect();
-        scalar.try_reshape(&vec![1; shape.len()])?.try_expand(&expand_shape)
+        scalar.try_reshape(vec![1; shape.len()])?.try_expand(&expand_shape)
     }
 
     /// Create a tensor filled with a constant value, using symbolic (dynamic) dimensions.

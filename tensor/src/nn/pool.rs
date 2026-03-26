@@ -2,11 +2,10 @@
 
 use bon::bon;
 use morok_dtype::DType;
-use morok_ir::{ConstValue, UOp};
-use snafu::ResultExt;
+use morok_ir::{ConstValue, SInt, UOp};
 
 use crate::Tensor;
-use crate::error::{DivisibilitySnafu, UOpSnafu};
+use crate::error::DivisibilitySnafu;
 use crate::reduce::AxisSpec;
 
 use super::pad::apply_ceil_mode;
@@ -66,8 +65,9 @@ impl Tensor {
         let f_: Vec<usize> =
             (0..n_spatial).map(|j| 1.max(usize::div_ceil(o_[j] * stride[j] - dilation[j], i_[j]))).collect();
 
-        let batch_dims =
-            morok_ir::shape::to_vec_isize(&shape.iter().take(n_batch).cloned().collect()).context(UOpSnafu)?;
+        // Batch dims use -1 (Infer/keep) in reshape and None-equivalent in shrink.
+        // Matches Tinygrad's `noop = [None] * (self.ndim - len(k_))` pattern.
+        let noop_shrink: Vec<Option<(isize, isize)>> = vec![None; n_batch];
 
         // Step 1: repeat
         let mut repeats: Vec<usize> = vec![1; n_batch];
@@ -76,52 +76,55 @@ impl Tensor {
         }
         let mut x = self.repeat(&repeats)?;
 
-        // Step 2: shrink to exact needed size
-        let mut shrink_ranges: Vec<(isize, isize)> = batch_dims.iter().map(|&d| (0, d)).collect();
+        // Step 2: shrink to exact needed size (batch dims pass through)
+        let mut shrink_ranges: Vec<Option<(isize, isize)>> = noop_shrink.clone();
         for j in 0..n_spatial {
-            shrink_ranges.push((0, (kernel[j] * (i_[j] * f_[j] + dilation[j])) as isize));
+            shrink_ranges.push(Some((0, (kernel[j] * (i_[j] * f_[j] + dilation[j])) as isize)));
         }
         x = x.try_shrink(&shrink_ranges)?;
 
+        // Batch dims as SInt (preserves symbolic batch, concrete channel).
+        let batch_sint: Vec<SInt> = shape.iter().take(n_batch).cloned().collect();
+
         // Step 3: reshape to interleave kernel and spatial dims
-        let mut reshape_dims: Vec<isize> = batch_dims.clone();
+        let mut reshape_dims: Vec<SInt> = batch_sint.clone();
         for j in 0..n_spatial {
-            reshape_dims.push(kernel[j] as isize);
-            reshape_dims.push((i_[j] * f_[j] + dilation[j]) as isize);
+            reshape_dims.push(kernel[j].into());
+            reshape_dims.push((i_[j] * f_[j] + dilation[j]).into());
         }
         x = x.try_reshape(&reshape_dims)?;
 
         // Step 4: shrink for stride
-        let mut shrink_ranges: Vec<(isize, isize)> = batch_dims.iter().map(|&d| (0, d)).collect();
+        let mut shrink_ranges: Vec<Option<(isize, isize)>> = noop_shrink.clone();
         for j in 0..n_spatial {
-            shrink_ranges.push((0, kernel[j] as isize));
-            shrink_ranges.push((0, (o_[j] * stride[j]) as isize));
+            shrink_ranges.push(Some((0, kernel[j] as isize)));
+            shrink_ranges.push(Some((0, (o_[j] * stride[j]) as isize)));
         }
         x = x.try_shrink(&shrink_ranges)?;
 
         // Step 5: reshape to separate stride: K_j, o_j, S_j
-        let mut reshape_dims: Vec<isize> = batch_dims.clone();
+        let mut reshape_dims: Vec<SInt> = batch_sint.clone();
         for j in 0..n_spatial {
-            reshape_dims.push(kernel[j] as isize);
-            reshape_dims.push(o_[j] as isize);
-            reshape_dims.push(stride[j] as isize);
+            reshape_dims.push(kernel[j].into());
+            reshape_dims.push(o_[j].into());
+            reshape_dims.push(stride[j].into());
         }
         x = x.try_reshape(&reshape_dims)?;
 
         // Step 6: shrink stride dim to 1
-        let mut shrink_ranges: Vec<(isize, isize)> = batch_dims.iter().map(|&d| (0, d)).collect();
+        let mut shrink_ranges: Vec<Option<(isize, isize)>> = noop_shrink.clone();
         for j in 0..n_spatial {
-            shrink_ranges.push((0, kernel[j] as isize));
-            shrink_ranges.push((0, o_[j] as isize));
-            shrink_ranges.push((0, 1));
+            shrink_ranges.push(Some((0, kernel[j] as isize)));
+            shrink_ranges.push(Some((0, o_[j] as isize)));
+            shrink_ranges.push(Some((0, 1)));
         }
         x = x.try_shrink(&shrink_ranges)?;
 
         // Step 7: reshape to collapse stride dim
-        let mut reshape_dims: Vec<isize> = batch_dims.clone();
+        let mut reshape_dims: Vec<SInt> = batch_sint.clone();
         for j in 0..n_spatial {
-            reshape_dims.push(kernel[j] as isize);
-            reshape_dims.push(o_[j] as isize);
+            reshape_dims.push(kernel[j].into());
+            reshape_dims.push(o_[j].into());
         }
         x = x.try_reshape(&reshape_dims)?;
 
@@ -510,11 +513,11 @@ impl Tensor {
 
         // Flatten: (N, C, *spatial) → (N*C, 1, num_pooled)
         let num_pooled: usize = spatial_shape.iter().product();
-        let vals_flat = self.try_reshape(&[bs as isize, 1, num_pooled as isize])?;
-        let idx_flat = indices.try_reshape(&[bs as isize, 1, num_pooled as isize])?;
+        let vals_flat = self.try_reshape([bs as isize, 1, num_pooled as isize])?;
+        let idx_flat = indices.try_reshape([bs as isize, 1, num_pooled as isize])?;
 
         // One-hot: compare indices against arange(inferred_numel)
-        let arange = Tensor::arange(inferred_numel as i64, None, None)?.cast(indices.uop().dtype())?.try_reshape(&[
+        let arange = Tensor::arange(inferred_numel as i64, None, None)?.cast(indices.uop().dtype())?.try_reshape([
             1,
             inferred_numel as isize,
             1,

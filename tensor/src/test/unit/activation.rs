@@ -98,7 +98,7 @@ fn test_silu_alias() {
 #[test]
 fn test_batchnorm_basic() {
     // Create input tensor [2, 3]
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape(&[2, 3]).unwrap();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).try_reshape([2, 3]).unwrap();
 
     // Create parameters (each has shape [3] for axis=1)
     let scale = Tensor::from_slice([1.0f32, 1.0, 1.0]);
@@ -123,7 +123,7 @@ fn test_batchnorm_basic() {
 
 #[test]
 fn test_batchnorm_no_scale_bias() {
-    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape(&[3, 1]).unwrap();
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]).try_reshape([3, 1]).unwrap();
 
     // Without scale/bias (None)
     let mean = Tensor::from_slice([2.0f32]);
@@ -138,7 +138,7 @@ fn test_batchnorm_no_scale_bias() {
 fn test_batchnorm_different_axis() {
     // Input shape [2, 3, 4] - normalize over axis 0
     // For axis=0, mean/scale/bias need shape [2] (size of dim 0)
-    let x = Tensor::from_slice([1.0f32; 24]).try_reshape(&[2, 3, 4]).unwrap();
+    let x = Tensor::from_slice([1.0f32; 24]).try_reshape([2, 3, 4]).unwrap();
 
     let scale = Tensor::from_slice([1.0f32, 1.0]);
     let bias = Tensor::from_slice([0.0f32, 0.0]);
@@ -164,7 +164,7 @@ fn test_batchnorm_different_axis() {
 #[test]
 fn test_batchnorm_4d() {
     // Input shape [2, 3, 4, 5] - typical CNN shape
-    let x = Tensor::from_slice([1.0f32; 120]).try_reshape(&[2, 3, 4, 5]).unwrap();
+    let x = Tensor::from_slice([1.0f32; 120]).try_reshape([2, 3, 4, 5]).unwrap();
 
     // BatchNorm2d normalizes over channels (axis=1)
     let scale = Tensor::from_slice([1.0f32, 1.0, 1.0]);

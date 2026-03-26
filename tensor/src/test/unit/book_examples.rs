@@ -38,7 +38,7 @@ crate::codegen_tests! {
         assert_eq!(data.shape().unwrap().len(), 1);
         assert_eq!(data.shape().unwrap()[0].as_const(), Some(6));
 
-        let matrix = data.try_reshape(&[2, 3]).unwrap();
+        let matrix = data.try_reshape([2, 3]).unwrap();
         assert_eq!(matrix.shape().unwrap().len(), 2);
     }
 

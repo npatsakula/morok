@@ -38,6 +38,9 @@ pub enum SInt {
 
     /// Symbolic runtime expression (must have dtype Index or Int).
     Symbolic(Arc<UOp>),
+
+    /// Infer this dimension from the total element count (reshape -1 placeholder).
+    Infer,
 }
 
 // Manual implementations using stable ID equality for Symbolic (consistent with hash consing)
@@ -46,7 +49,8 @@ impl PartialEq for SInt {
         match (self, other) {
             (SInt::Const(a), SInt::Const(b)) => a == b,
             (SInt::Symbolic(a), SInt::Symbolic(b)) => a.id == b.id,
-            (SInt::Const(_), SInt::Symbolic(_)) | (SInt::Symbolic(_), SInt::Const(_)) => false,
+            (SInt::Infer, SInt::Infer) => true,
+            _ => false,
         }
     }
 }
@@ -59,6 +63,7 @@ impl std::hash::Hash for SInt {
         match self {
             SInt::Const(v) => v.hash(state),
             SInt::Symbolic(uop) => uop.id.hash(state),
+            SInt::Infer => {}
         }
     }
 }
@@ -77,6 +82,11 @@ impl SInt {
         matches!(self, SInt::Const(_))
     }
 
+    /// Check if this is an infer placeholder (-1).
+    pub fn is_infer(&self) -> bool {
+        matches!(self, SInt::Infer)
+    }
+
     /// Check if this is a symbolic expression.
     ///
     /// # Examples
@@ -91,6 +101,11 @@ impl SInt {
     /// ```
     pub fn is_symbolic(&self) -> bool {
         matches!(self, SInt::Symbolic(_))
+    }
+
+    /// Check if this dimension is concrete (not symbolic and not infer).
+    pub fn is_concrete(&self) -> bool {
+        matches!(self, SInt::Const(_))
     }
 
     /// Get concrete value if this is a constant, None otherwise.
@@ -112,7 +127,7 @@ impl SInt {
     pub fn as_const(&self) -> Option<usize> {
         match self {
             SInt::Const(v) => Some(*v),
-            SInt::Symbolic(_) => None,
+            SInt::Symbolic(_) | SInt::Infer => None,
         }
     }
 
@@ -130,8 +145,8 @@ impl SInt {
     /// ```
     pub fn as_symbolic(&self) -> Option<&Arc<UOp>> {
         match self {
-            SInt::Const(_) => None,
             SInt::Symbolic(uop) => Some(uop),
+            SInt::Const(_) | SInt::Infer => None,
         }
     }
 
@@ -156,6 +171,7 @@ impl SInt {
                     uop.clone()
                 }
             }
+            SInt::Infer => panic!("cannot convert SInt::Infer to UOp — resolve -1 first"),
         }
     }
 
@@ -165,7 +181,7 @@ impl SInt {
     /// if it's a constant expression.
     pub fn simplify(&self) -> Self {
         match self {
-            SInt::Const(_) => self.clone(),
+            SInt::Const(_) | SInt::Infer => self.clone(),
             SInt::Symbolic(uop) => {
                 // Try to extract constant value from UOp if it's a Const op
                 if let crate::Op::Const(const_hash) = uop.op() {
@@ -190,6 +206,71 @@ impl SInt {
 impl From<usize> for SInt {
     fn from(value: usize) -> Self {
         SInt::Const(value)
+    }
+}
+
+impl From<isize> for SInt {
+    /// Converts isize to SInt. `-1` becomes `SInt::Infer` (reshape inference placeholder).
+    /// Panics on other negative values.
+    fn from(value: isize) -> Self {
+        if value == -1 {
+            SInt::Infer
+        } else {
+            assert!(value >= 0, "negative dimension {value} is invalid (only -1 for inference is allowed)");
+            SInt::Const(value as usize)
+        }
+    }
+}
+
+impl From<&isize> for SInt {
+    fn from(value: &isize) -> Self {
+        SInt::from(*value)
+    }
+}
+
+impl From<i32> for SInt {
+    fn from(value: i32) -> Self {
+        if value == -1 {
+            SInt::Infer
+        } else {
+            assert!(value >= 0, "negative dimension {value} is invalid (only -1 for inference is allowed)");
+            SInt::Const(value as usize)
+        }
+    }
+}
+
+impl From<&i32> for SInt {
+    fn from(value: &i32) -> Self {
+        SInt::from(*value)
+    }
+}
+
+impl From<i64> for SInt {
+    fn from(value: i64) -> Self {
+        if value == -1 {
+            SInt::Infer
+        } else {
+            assert!(value >= 0, "negative dimension {value} is invalid (only -1 for inference is allowed)");
+            SInt::Const(value as usize)
+        }
+    }
+}
+
+impl From<&i64> for SInt {
+    fn from(value: &i64) -> Self {
+        SInt::from(*value)
+    }
+}
+
+impl From<&usize> for SInt {
+    fn from(value: &usize) -> Self {
+        SInt::Const(*value)
+    }
+}
+
+impl From<&SInt> for SInt {
+    fn from(value: &SInt) -> Self {
+        value.clone()
     }
 }
 

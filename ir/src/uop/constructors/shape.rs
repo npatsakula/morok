@@ -191,10 +191,21 @@ impl UOp {
             return Ok(self.clone());
         }
 
-        // Check for symbolic range values
-        for (begin, end) in ranges {
-            ensure!(begin.is_const(), SymbolicShrinkingUnsupportedSnafu);
-            ensure!(end.is_const(), SymbolicShrinkingUnsupportedSnafu);
+        // Check for symbolic range values.
+        // Allow symbolic identity ranges (0, dim_size) — these are no-ops for batch dims.
+        if let Some(src_shape) = self.shape()? {
+            for ((begin, end), dim) in ranges.iter().zip(src_shape.iter()) {
+                let is_identity = begin.as_const() == Some(0) && end == dim;
+                if !is_identity {
+                    ensure!(begin.is_const(), SymbolicShrinkingUnsupportedSnafu);
+                    ensure!(end.is_const(), SymbolicShrinkingUnsupportedSnafu);
+                }
+            }
+        } else {
+            for (begin, end) in ranges {
+                ensure!(begin.is_const(), SymbolicShrinkingUnsupportedSnafu);
+                ensure!(end.is_const(), SymbolicShrinkingUnsupportedSnafu);
+            }
         }
 
         if let Some(src_shape) = self.shape()? {

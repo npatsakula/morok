@@ -556,17 +556,16 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             Some(
                 ranges
                     .iter()
-                    .map(|(begin, end)| {
-                        // end - begin
+                    .zip(src_shape.iter())
+                    .map(|((begin, end), dim)| {
+                        // Identity range (0, dim_size) → preserve dim (supports symbolic batch)
+                        if begin.as_const() == Some(0) && end == dim {
+                            return Ok(dim.clone());
+                        }
+                        // end - begin (must be concrete)
                         if let (Some(b), Some(e)) = (begin.as_const(), end.as_const()) {
-                            Ok(if e >= b {
-                                SInt::from(e - b)
-                            } else {
-                                SInt::from(0) // Invalid shrink
-                            })
+                            Ok(if e >= b { SInt::from(e - b) } else { SInt::from(0) })
                         } else {
-                            // Symbolic shrinking should have been rejected at construction time
-                            // This case should not be reachable if try_shrink validates properly
                             crate::error::SymbolicShrinkingUnsupportedSnafu.fail()
                         }
                     })

@@ -240,7 +240,7 @@ impl Tensor {
         // Per-sample weight: weight[target] or ones
         let sample_weight = match weight {
             Some(w) => {
-                let flat = target.try_reshape(&[-1])?;
+                let flat = target.try_reshape([-1])?;
                 let sel = w.gather(0, &flat)?;
                 let target_shape = morok_ir::shape::to_vec_isize(&target.shape()?).context(UOpSnafu)?;
                 sel.try_reshape(&target_shape)?
@@ -682,7 +682,7 @@ impl Tensor {
         );
         let c_out = c / bs_sq;
         let result = if mode == DepthToSpaceMode::Crd {
-            self.try_reshape(&[
+            self.try_reshape([
                 b as isize,
                 c_out as isize,
                 blocksize as isize,
@@ -693,7 +693,7 @@ impl Tensor {
             .try_permute(&[0, 1, 4, 2, 5, 3])?
         } else {
             // DCR (default)
-            self.try_reshape(&[
+            self.try_reshape([
                 b as isize,
                 blocksize as isize,
                 blocksize as isize,
@@ -703,7 +703,7 @@ impl Tensor {
             ])?
             .try_permute(&[0, 3, 4, 1, 5, 2])?
         };
-        result.try_reshape(&[b as isize, c_out as isize, (h * blocksize) as isize, (w * blocksize) as isize])
+        result.try_reshape([b as isize, c_out as isize, (h * blocksize) as isize, (w * blocksize) as isize])
     }
 
     /// Rearrange spatial data into depth (inverse of [`depth_to_space`](Tensor::depth_to_space)).
@@ -761,7 +761,7 @@ impl Tensor {
                 rhs: blocksize
             }
         );
-        self.try_reshape(&[
+        self.try_reshape([
             b as isize,
             c as isize,
             (h / blocksize) as isize,
@@ -770,7 +770,7 @@ impl Tensor {
             blocksize as isize,
         ])?
         .try_permute(&[0, 3, 5, 1, 2, 4])?
-        .try_reshape(&[
+        .try_reshape([
             b as isize,
             (c * blocksize * blocksize) as isize,
             (h / blocksize) as isize,
@@ -899,12 +899,12 @@ impl Tensor {
             shape[3].as_const().unwrap(),
         );
         let x_sq = self.square()?;
-        let x_sq = x_sq.try_reshape(&[b as isize, 1, c as isize, (h * w) as isize])?;
+        let x_sq = x_sq.try_reshape([b as isize, 1, c as isize, (h * w) as isize])?;
         let pad_before = ((size - 1) / 2) as isize;
         let pad_after = (size / 2) as isize;
         let x_sq = x_sq.try_pad(&[(0, 0), (0, 0), (pad_before, pad_after), (0, 0)])?;
         let pooled = x_sq.avg_pool2d().kernel_size(&[size, 1]).stride(&[1, 1]).call()?;
-        let pooled = pooled.try_reshape(&[b as isize, c as isize, h as isize, w as isize])?;
+        let pooled = pooled.try_reshape([b as isize, c as isize, h as isize, w as isize])?;
         let dtype = self.uop().dtype();
         let scale = pooled
             .try_mul(&Tensor::const_(alpha, dtype.clone()))?

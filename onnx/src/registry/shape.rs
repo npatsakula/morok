@@ -98,7 +98,7 @@ pub(crate) fn op_flatten(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result
         .as_const()
         .map(|v| v as isize)
         .ok_or_else(|| Error::IrConstruction { details: "Flatten requires concrete pre-axis dimensions".into() })?;
-    Ok(inp(inputs, 0).try_reshape(&[pre_val, -1])?)
+    Ok(inp(inputs, 0).try_reshape([pre_val, -1])?)
 }
 
 pub(crate) fn op_expand(inputs: &[Option<Tensor>]) -> Result<Tensor> {

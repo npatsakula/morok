@@ -458,9 +458,9 @@ impl Tensor {
         let indices = Tensor::stack(&coords_refs, -1)?; // [numel, ndim]
 
         // Select nonzero coordinates
-        let expanded_mask = mask.try_unsqueeze(-1)?.try_expand(&[numel as isize, ndim as isize])?;
+        let expanded_mask = mask.try_unsqueeze(-1)?.try_expand([numel as isize, ndim as isize])?;
         let selected = indices.masked_select(&expanded_mask)?;
-        selected.try_reshape(&[-1, ndim as isize])
+        selected.try_reshape([-1, ndim as isize])
     }
 
     /// Reverse the first `sequence_lens[i]` elements along `time_axis` for each
@@ -538,13 +538,13 @@ impl Tensor {
                 flat_idx = flat_idx.try_add(&idx_k.cast(DType::Int64)?.try_mul(&stride_t)?)?;
             }
 
-            let x_flat = self.try_reshape(&[outer as isize, inner as isize])?;
+            let x_flat = self.try_reshape([outer as isize, inner as isize])?;
             let gather_outer: Vec<isize> = idx_dims[..idx_dims.len() - 1].iter().map(|&d| d as isize).collect();
             let num_gathers: usize = gather_outer.iter().map(|&d| d as usize).product();
 
             let flat_idx_2d = flat_idx
-                .try_reshape(&[num_gathers as isize, 1])?
-                .try_expand(&[num_gathers as isize, inner as isize])?
+                .try_reshape([num_gathers as isize, 1])?
+                .try_expand([num_gathers as isize, inner as isize])?
                 .cast(DType::Int32)?;
             let result = x_flat.gather(0, &flat_idx_2d)?;
 
@@ -559,10 +559,10 @@ impl Tensor {
             let inner_idx: Vec<usize> = idx_dims[batch_dims..].to_vec();
 
             let x_flat = self.try_reshape(
-                &std::iter::once(batch_size as isize).chain(inner_x.iter().map(|&d| d as isize)).collect::<Vec<_>>(),
+                std::iter::once(batch_size as isize).chain(inner_x.iter().map(|&d| d as isize)).collect::<Vec<_>>(),
             )?;
             let idx_flat = indices.try_reshape(
-                &std::iter::once(batch_size as isize).chain(inner_idx.iter().map(|&d| d as isize)).collect::<Vec<_>>(),
+                std::iter::once(batch_size as isize).chain(inner_idx.iter().map(|&d| d as isize)).collect::<Vec<_>>(),
             )?;
 
             let last_inner = *inner_idx.last().unwrap();
@@ -584,17 +584,17 @@ impl Tensor {
             let batch_offset_arr = Tensor::arange(0, Some(batch_size as i64), None)?
                 .try_mul(&Tensor::from_slice([batch_stride as i64]))?;
             let gather_inner = idx_flat_dims[1..idx_flat_dims.len() - 1].iter().product::<usize>();
-            flat_idx = flat_idx.try_reshape(&[batch_size as isize, gather_inner as isize])?;
+            flat_idx = flat_idx.try_reshape([batch_size as isize, gather_inner as isize])?;
             let batch_offset = batch_offset_arr
-                .try_reshape(&[batch_size as isize, 1])?
-                .try_expand(&[batch_size as isize, gather_inner as isize])?;
+                .try_reshape([batch_size as isize, 1])?
+                .try_expand([batch_size as isize, gather_inner as isize])?;
             flat_idx = flat_idx.try_add(&batch_offset)?;
 
             let remaining: usize = inner_x[last_inner..].iter().product();
-            let x_2d = x_flat.try_reshape(&[(batch_size * batch_stride) as isize, remaining as isize])?;
+            let x_2d = x_flat.try_reshape([(batch_size * batch_stride) as isize, remaining as isize])?;
             let fi = flat_idx
-                .try_reshape(&[(batch_size * gather_inner) as isize, 1])?
-                .try_expand(&[(batch_size * gather_inner) as isize, remaining as isize])?
+                .try_reshape([(batch_size * gather_inner) as isize, 1])?
+                .try_expand([(batch_size * gather_inner) as isize, remaining as isize])?
                 .cast(DType::Int32)?;
             let result = x_2d.gather(0, &fi)?;
 
@@ -616,7 +616,7 @@ impl Tensor {
         let x_numel: usize = x_dims.iter().product();
         let inner: usize = x_dims[last_idx_dim..].iter().product();
         let outer = x_numel / inner;
-        let x_flat = self.try_reshape(&[outer as isize, inner as isize])?;
+        let x_flat = self.try_reshape([outer as isize, inner as isize])?;
         let idx_splits: Vec<Tensor> = (0..last_idx_dim)
             .map(|k| {
                 let mut ranges: Vec<(isize, isize)> =
@@ -636,9 +636,9 @@ impl Tensor {
             .iter()
             .map(|s| s.as_const().unwrap())
             .product();
-        let upd_flat = updates.try_reshape(&[upd_outer as isize, inner as isize])?;
+        let upd_flat = updates.try_reshape([upd_outer as isize, inner as isize])?;
         let flat_idx =
-            flat_idx.try_reshape(&[upd_outer as isize, 1])?.try_expand(&[upd_outer as isize, inner as isize])?;
+            flat_idx.try_reshape([upd_outer as isize, 1])?.try_expand([upd_outer as isize, inner as isize])?;
         let flat_idx_i32 = flat_idx.cast(DType::Int32)?;
         let mut result = match reduction {
             "none" => x_flat.scatter(0, &flat_idx_i32, &upd_flat)?,
@@ -688,22 +688,22 @@ impl Tensor {
             let mut wi_reshape: Vec<isize> = vec![batch_size as isize];
             wi_reshape.extend(std::iter::repeat_n(1, axis - 1));
             let wi_expand: Vec<isize> = data_dims[..axis].iter().map(|&d| d as isize).collect();
-            write_idx.try_reshape(&wi_reshape)?.try_expand(&wi_expand)?.try_reshape(&[b_total as isize])?
+            write_idx.try_reshape(&wi_reshape)?.try_expand(&wi_expand)?.try_reshape([b_total as isize])?
         } else {
             write_idx
         };
 
-        let data_flat = self.try_reshape(&[(b_total * max_seq) as isize, features as isize])?;
-        let updates_flat = update.try_reshape(&[(b_total * seq_len) as isize, features as isize])?;
+        let data_flat = self.try_reshape([(b_total * max_seq) as isize, features as isize])?;
+        let updates_flat = update.try_reshape([(b_total * seq_len) as isize, features as isize])?;
 
         let batch_offset = Tensor::arange(0, Some(b_total as i64), None)?
             .cast(DType::Int32)?
             .try_mul(&Tensor::const_(ConstValue::Int(max_seq as i64), DType::Int32))?
-            .try_reshape(&[b_total as isize, 1])?;
+            .try_reshape([b_total as isize, 1])?;
 
-        let wi_2d = wi_flat.try_reshape(&[b_total as isize, 1])?;
+        let wi_2d = wi_flat.try_reshape([b_total as isize, 1])?;
         let seq_arange =
-            Tensor::arange(0, Some(seq_len as i64), None)?.cast(DType::Int32)?.try_reshape(&[1, seq_len as isize])?;
+            Tensor::arange(0, Some(seq_len as i64), None)?.cast(DType::Int32)?.try_reshape([1, seq_len as isize])?;
         let mut row_idx = wi_2d.try_add(&seq_arange)?;
 
         if mode == "circular" {
@@ -713,8 +713,8 @@ impl Tensor {
 
         let flat_idx = batch_offset
             .try_add(&row_idx)?
-            .try_reshape(&[(b_total * seq_len) as isize, 1])?
-            .try_expand(&[(b_total * seq_len) as isize, features as isize])?;
+            .try_reshape([(b_total * seq_len) as isize, 1])?
+            .try_expand([(b_total * seq_len) as isize, features as isize])?;
 
         let result = data_flat.scatter(0, &flat_idx, &updates_flat)?;
 

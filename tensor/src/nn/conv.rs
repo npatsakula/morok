@@ -1,10 +1,10 @@
 //! Convolution operations: conv2d, conv_transpose2d.
 
 use bon::bon;
-use snafu::ResultExt;
+
+use morok_ir::SInt;
 
 use crate::Tensor;
-use crate::error::UOpSnafu;
 use crate::reduce::AxisSpec;
 
 type Result<T> = crate::Result<T>;
@@ -87,7 +87,7 @@ impl Tensor {
         let x_shape = self.shape()?;
         let w_shape = weight.shape()?;
 
-        let bs = x_shape[0].as_const().expect("batch dim must be concrete");
+        let bs = x_shape[0].clone(); // SInt — concrete or symbolic (Variable batch)
         let cin_ = x_shape[1].as_const().expect("channel dim must be concrete");
         let cout = w_shape[0].as_const().expect("cout must be concrete");
         let cin = w_shape[1].as_const().expect("cin/g must be concrete");
@@ -129,15 +129,15 @@ impl Tensor {
         let rcout = cout / groups;
 
         // Reshape: (bs, groups, cin, 1, *oyx, *hw)
-        let mut reshape_dims: Vec<isize> = vec![bs as isize, groups as isize, cin as isize, 1];
-        reshape_dims.extend(oyx.iter().map(|&o| o as isize));
-        reshape_dims.extend(hw.iter().map(|&k| k as isize));
+        let mut reshape_dims: Vec<SInt> = vec![bs.clone(), groups.into(), cin.into(), 1usize.into()];
+        reshape_dims.extend(oyx.iter().map(|&o| SInt::from(o)));
+        reshape_dims.extend(hw.iter().map(|&k| SInt::from(k)));
         x = x.try_reshape(&reshape_dims)?;
 
         // Expand: (bs, groups, cin, rcout, *oyx, *hw)
-        let mut expand_dims: Vec<isize> = vec![bs as isize, groups as isize, cin as isize, rcout as isize];
-        expand_dims.extend(oyx.iter().map(|&o| o as isize));
-        expand_dims.extend(hw.iter().map(|&k| k as isize));
+        let mut expand_dims: Vec<SInt> = vec![bs.clone(), groups.into(), cin.into(), rcout.into()];
+        expand_dims.extend(oyx.iter().map(|&o| SInt::from(o)));
+        expand_dims.extend(hw.iter().map(|&k| SInt::from(k)));
         x = x.try_expand(&expand_dims)?;
 
         // Permute: (bs, groups, rcout, *oyx, cin, *hw)
@@ -166,8 +166,8 @@ impl Tensor {
         x = x.sum_with().axes(AxisSpec::Multiple(reduce_axes)).keepdim(true).maybe_dtype(acc_dtype).call()?;
 
         // Reshape to (bs, cout, *oyx)
-        let mut final_shape: Vec<isize> = vec![bs as isize, cout as isize];
-        final_shape.extend(oyx.iter().map(|&o| o as isize));
+        let mut final_shape: Vec<SInt> = vec![bs.clone(), cout.into()];
+        final_shape.extend(oyx.iter().map(|&o| SInt::from(o)));
         x = x.try_reshape(&final_shape)?;
 
         if let Some(bias) = bias {
@@ -287,40 +287,37 @@ impl Tensor {
             let spatial: Vec<usize> = x_shape[2..].iter().map(|s| s.as_const().unwrap()).collect();
 
             // Step 1: reshape (N,C,h,w) -> (N,C,h,1,w,1)
-            let mut rshape: Vec<isize> =
-                vec![x_shape[0].as_const().unwrap() as isize, x_shape[1].as_const().unwrap() as isize];
+            let mut rshape: Vec<SInt> = vec![x_shape[0].clone(), x_shape[1].clone()];
             for &k in &spatial {
-                rshape.push(k as isize);
-                rshape.push(1);
+                rshape.push(k.into());
+                rshape.push(1usize.into());
             }
             x = x.try_reshape(&rshape)?;
 
             // Step 2: pad inserted dims by (0, s-1): (N,C,h,s,w,s)
             let mut pad_spec: Vec<(isize, isize)> = vec![(0, 0); 2];
             for &s in stride.iter() {
-                pad_spec.push((0, 0)); // spatial dim unchanged
-                pad_spec.push((0, (s - 1) as isize)); // inserted dim gets stride-1 padding
+                pad_spec.push((0, 0));
+                pad_spec.push((0, (s - 1) as isize));
             }
             x = x.try_pad(&pad_spec)?;
 
             // Step 3: reshape to merge pairs: (N,C,h*s,w*s)
             let x_shape = x.shape()?;
-            let mut rshape: Vec<isize> =
-                vec![x_shape[0].as_const().unwrap() as isize, x_shape[1].as_const().unwrap() as isize];
+            let mut rshape: Vec<SInt> = vec![x_shape[0].clone(), x_shape[1].clone()];
             for j in 0..n_spatial {
                 let a = x_shape[2 + j * 2].as_const().unwrap();
                 let b = x_shape[2 + j * 2 + 1].as_const().unwrap();
-                rshape.push((a * b) as isize);
+                rshape.push((a * b).into());
             }
             x = x.try_reshape(&rshape)?;
 
-            // Step 4: shrink to remove trailing stride-1: (N,C,h*s-(s-1),w*s-(s-1))
-            let x_shape = x.shape()?;
-            let dims = morok_ir::shape::to_vec_isize(&x_shape).context(UOpSnafu)?;
-            let mut ranges: Vec<(isize, isize)> = dims.iter().map(|&d| (0, d)).collect();
+            // Step 4: shrink to remove trailing stride-1
+            // Use None for batch/channel dims (pass through).
+            let mut ranges: Vec<Option<(isize, isize)>> = vec![None, None];
             for j in 0..n_spatial {
                 let new_size = spatial[j] * stride[j] - (stride[j] - 1);
-                ranges[2 + j] = (0, new_size as isize);
+                ranges.push(Some((0, new_size as isize)));
             }
             x = x.try_shrink(&ranges)?;
         }

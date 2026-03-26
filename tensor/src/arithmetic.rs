@@ -99,7 +99,7 @@ impl Tensor {
 
         let true_broadcast = if self_shape.is_empty() {
             // Input is scalar - reshape [1] to []
-            true_scalar.try_reshape(&[])?
+            true_scalar.try_reshape(&[] as &[isize])?
         } else {
             // Broadcast to match non-scalar shape
             true_scalar.broadcast_to(&self_shape)?
@@ -141,7 +141,7 @@ impl Tensor {
 
         let one_broadcast = if self_shape.is_empty() {
             // Input is scalar - reshape [1] to []
-            one_scalar.try_reshape(&[])?
+            one_scalar.try_reshape(&[] as &[isize])?
         } else {
             // Broadcast to match non-scalar shape
             one_scalar.broadcast_to(&self_shape)?

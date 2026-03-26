@@ -229,7 +229,7 @@ impl Tensor {
         let batch = x_shape[0].as_const().unwrap();
 
         // Reshape to (batch, num_groups, -1), cast to f32 before layernorm
-        let reshaped = self.try_reshape(&[batch as isize, num_groups as isize, -1])?;
+        let reshaped = self.try_reshape([batch as isize, num_groups as isize, -1])?;
         let reshaped = if reshaped.uop().dtype() != DType::Float32 { reshaped.cast(DType::Float32)? } else { reshaped };
         let normed = reshaped.layernorm(-1, eps)?;
         // Cast back and reshape to original
