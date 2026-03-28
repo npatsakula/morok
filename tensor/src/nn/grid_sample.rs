@@ -234,7 +234,7 @@ fn compute_strides(dims: &[usize]) -> Vec<usize> {
 
 /// Extract `t[:, :, idx]` from shape `[N, out_prod, n_spatial]` → `[N, out_prod]`.
 fn slice_last_dim(t: &Tensor, idx: usize, n: usize, out_prod: usize) -> Result<Tensor> {
-    t.try_shrink(&[(0, n as isize), (0, out_prod as isize), (idx as isize, (idx + 1) as isize)])?.try_squeeze(Some(-1))
+    t.try_shrink([(0, n as isize), (0, out_prod as isize), (idx as isize, (idx + 1) as isize)])?.try_squeeze(Some(-1))
 }
 
 /// Denormalize grid coordinate from [-1, 1] to pixel space.

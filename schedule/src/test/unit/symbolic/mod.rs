@@ -535,14 +535,14 @@ fn test_combine_terms_with_coefficients() {
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be 8*x
-        if let Op::Binary(BinaryOp::Mul, c, var) = rewritten.op() {
+        // Should be x*8 (canonical form: var on left, const on right)
+        if let Op::Binary(BinaryOp::Mul, var, c) = rewritten.op() {
+            assert!(Arc::ptr_eq(var, &x));
             if let Op::Const(cv) = c.op() {
                 assert_eq!(cv.0, ConstValue::Int(8));
             } else {
                 panic!("Expected constant, got {:?}", c.op());
             }
-            assert!(Arc::ptr_eq(var, &x));
         } else {
             panic!("Expected Mul, got {:?}", rewritten.op());
         }

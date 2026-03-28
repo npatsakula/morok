@@ -1058,6 +1058,7 @@ pub(crate) fn transform_movement_through_index(
 
     let src = &mop.op().sources()[0];
     let src_shape = src.shape().ok()??;
+
     let transformed = apply_movement_op(mop.op(), src_shape, indices.as_slice());
 
     match gate {

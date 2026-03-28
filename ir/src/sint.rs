@@ -3,10 +3,16 @@
 //! This module provides the SInt type, which represents a dimension that can be:
 //! - A concrete compile-time constant (`usize`)
 //! - A symbolic runtime expression (`Arc<UOp>`)
+//! - An inference placeholder (`-1` in reshape)
 //!
-//! This follows Tinygrad's approach where shapes can contain mixed concrete/symbolic
-//! dimensions, enabling dynamic shapes (variable batch sizes, dynamic sequences, etc.).
+//! Arithmetic via `std::ops` traits matches Tinygrad's approach: concrete values fold
+//! inline via native arithmetic, symbolic values produce UOp graph nodes. No
+//! simplification at construction time — the pipeline handles it.
+//!
+//! `SInt::Infer` panics on any arithmetic — it must be resolved at the API boundary
+//! (e.g. `try_reshape`) before computing.
 
+use std::fmt;
 use std::sync::Arc;
 
 use crate::UOp;
@@ -68,16 +74,18 @@ impl std::hash::Hash for SInt {
     }
 }
 
+impl fmt::Display for SInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SInt::Const(v) => write!(f, "{v}"),
+            SInt::Symbolic(_) => write!(f, "<symbolic>"),
+            SInt::Infer => write!(f, "-1"),
+        }
+    }
+}
+
 impl SInt {
     /// Check if this is a concrete constant.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use morok_ir::SInt;
-    /// let s = SInt::from(42);
-    /// assert!(s.is_const());
-    /// ```
     pub fn is_const(&self) -> bool {
         matches!(self, SInt::Const(_))
     }
@@ -88,17 +96,6 @@ impl SInt {
     }
 
     /// Check if this is a symbolic expression.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use morok_ir::{SInt, UOp, ConstValue, Op};
-    /// # use morok_dtype::DType;
-    /// let uop =
-    ///     UOp::new(Op::DefineVar { name: "n".to_string(), min_val: 1, max_val: 100 }, DType::Index);
-    /// let s = SInt::from(uop);
-    /// assert!(s.is_symbolic());
-    /// ```
     pub fn is_symbolic(&self) -> bool {
         matches!(self, SInt::Symbolic(_))
     }
@@ -109,21 +106,6 @@ impl SInt {
     }
 
     /// Get concrete value if this is a constant, None otherwise.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use morok_ir::SInt;
-    /// let s = SInt::from(42);
-    /// assert_eq!(s.as_const(), Some(42));
-    ///
-    /// # use morok_ir::{UOp, ConstValue, Op};
-    /// # use morok_dtype::DType;
-    /// let uop =
-    ///     UOp::new(Op::DefineVar { name: "n".to_string(), min_val: 1, max_val: 100 }, DType::Index);
-    /// let s = SInt::from(uop);
-    /// assert_eq!(s.as_const(), None);
-    /// ```
     pub fn as_const(&self) -> Option<usize> {
         match self {
             SInt::Const(v) => Some(*v),
@@ -132,17 +114,6 @@ impl SInt {
     }
 
     /// Get symbolic UOp if this is symbolic, None otherwise.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use morok_ir::{SInt, UOp, ConstValue, Op};
-    /// # use morok_dtype::DType;
-    /// let uop =
-    ///     UOp::new(Op::DefineVar { name: "n".to_string(), min_val: 1, max_val: 100 }, DType::Index);
-    /// let s = SInt::from(uop.clone());
-    /// assert!(s.as_symbolic().is_some());
-    /// ```
     pub fn as_symbolic(&self) -> Option<&Arc<UOp>> {
         match self {
             SInt::Symbolic(uop) => Some(uop),
@@ -150,17 +121,7 @@ impl SInt {
         }
     }
 
-    /// Convert to UOp (const or passthrough).
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use morok_ir::{SInt, ConstValue};
-    /// # use morok_dtype::DType;
-    /// let s = SInt::from(42);
-    /// let uop = s.to_uop(DType::Index);
-    /// assert_eq!(uop.dtype(), DType::Index);
-    /// ```
+    /// Convert to UOp (const or passthrough). Panics on Infer.
     pub fn to_uop(&self, dtype: morok_dtype::DType) -> Arc<UOp> {
         match self {
             SInt::Const(v) => UOp::const_(dtype, crate::ConstValue::Int(*v as i64)),
@@ -178,12 +139,12 @@ impl SInt {
     /// Try to simplify symbolic expression to concrete value if possible.
     ///
     /// For const values, returns self. For symbolic, attempts to evaluate
-    /// if it's a constant expression.
+    /// if it's a constant expression. No full symbolic simplification —
+    /// that's deferred to the pipeline (matching Tinygrad).
     pub fn simplify(&self) -> Self {
         match self {
             SInt::Const(_) | SInt::Infer => self.clone(),
             SInt::Symbolic(uop) => {
-                // Try to extract constant value from UOp if it's a Const op
                 if let crate::Op::Const(const_hash) = uop.op() {
                     match const_hash.0 {
                         crate::ConstValue::Int(v) if v >= 0 => SInt::Const(v as usize),
@@ -191,11 +152,174 @@ impl SInt {
                         _ => self.clone(),
                     }
                 } else {
-                    // Could implement symbolic simplification here (const folding, etc.)
                     self.clone()
                 }
             }
         }
+    }
+
+    /// Ceiling division: ceildiv(a, b) = (a + b - 1) / b.
+    /// Both operands must be positive. Panics on Infer.
+    pub fn ceildiv(&self, rhs: &SInt) -> SInt {
+        (self + rhs - 1usize) / rhs
+    }
+
+    /// Maximum of two SInt values. Panics on Infer.
+    pub fn smax(&self, rhs: &SInt) -> SInt {
+        match (self, rhs) {
+            (SInt::Infer, _) | (_, SInt::Infer) => {
+                panic!("smax on SInt::Infer — resolve -1 before computing")
+            }
+            (SInt::Const(a), SInt::Const(b)) => SInt::Const(*a.max(b)),
+            _ => {
+                let a = self.to_uop(morok_dtype::DType::Index);
+                let b = rhs.to_uop(morok_dtype::DType::Index);
+                SInt::Symbolic(a.try_max(&b).unwrap())
+            }
+        }
+    }
+
+    /// Minimum of two SInt values. Panics on Infer.
+    /// Follows Tinygrad: `min(a, b) = -max(-a, -b)`.
+    pub fn smin(&self, rhs: &SInt) -> SInt {
+        match (self, rhs) {
+            (SInt::Infer, _) | (_, SInt::Infer) => {
+                panic!("smin on SInt::Infer — resolve -1 before computing")
+            }
+            (SInt::Const(a), SInt::Const(b)) => SInt::Const(*a.min(b)),
+            _ => {
+                let a = self.to_uop(morok_dtype::DType::Index);
+                let b = rhs.to_uop(morok_dtype::DType::Index);
+                // min(a, b) = -max(-a, -b)
+                let neg_max = a.neg().try_max(&b.neg()).unwrap();
+                SInt::Symbolic(neg_max.neg())
+            }
+        }
+    }
+}
+
+// =========================================================================
+// std::ops arithmetic
+// =========================================================================
+
+macro_rules! impl_sint_binop {
+    ($trait:ident, $method:ident, $concrete_op:tt, $uop_method:ident) => {
+        // Primary: &SInt op &SInt
+        impl std::ops::$trait for &SInt {
+            type Output = SInt;
+            fn $method(self, rhs: &SInt) -> SInt {
+                match (self, rhs) {
+                    (SInt::Infer, _) | (_, SInt::Infer) => {
+                        panic!("arithmetic on SInt::Infer — resolve -1 before computing")
+                    }
+                    (SInt::Const(a), SInt::Const(b)) => SInt::Const(a $concrete_op b),
+                    _ => {
+                        let a = self.to_uop(morok_dtype::DType::Index);
+                        let b = rhs.to_uop(morok_dtype::DType::Index);
+                        SInt::Symbolic(a.$uop_method(&b).unwrap())
+                    }
+                }
+            }
+        }
+        // Forward: owned variants
+        impl std::ops::$trait for SInt {
+            type Output = SInt;
+            fn $method(self, rhs: SInt) -> SInt { (&self).$method(&rhs) }
+        }
+        impl std::ops::$trait<&SInt> for SInt {
+            type Output = SInt;
+            fn $method(self, rhs: &SInt) -> SInt { (&self).$method(rhs) }
+        }
+        impl std::ops::$trait<SInt> for &SInt {
+            type Output = SInt;
+            fn $method(self, rhs: SInt) -> SInt { self.$method(&rhs) }
+        }
+        // Convenience: SInt op usize
+        impl std::ops::$trait<usize> for &SInt {
+            type Output = SInt;
+            fn $method(self, rhs: usize) -> SInt { self.$method(&SInt::Const(rhs)) }
+        }
+        impl std::ops::$trait<usize> for SInt {
+            type Output = SInt;
+            fn $method(self, rhs: usize) -> SInt { (&self).$method(&SInt::Const(rhs)) }
+        }
+        // Convenience: usize op SInt
+        impl std::ops::$trait<SInt> for usize {
+            type Output = SInt;
+            fn $method(self, rhs: SInt) -> SInt { (&SInt::Const(self)).$method(&rhs) }
+        }
+        impl std::ops::$trait<&SInt> for usize {
+            type Output = SInt;
+            fn $method(self, rhs: &SInt) -> SInt { (&SInt::Const(self)).$method(rhs) }
+        }
+    };
+}
+
+impl_sint_binop!(Add, add, +, try_add);
+impl_sint_binop!(Mul, mul, *, try_mul);
+impl_sint_binop!(Div, div, /, try_div);
+
+// Sub is implemented separately to guard against usize underflow.
+// SInt represents non-negative dimension sizes; concrete a - b must have a >= b.
+impl std::ops::Sub for &SInt {
+    type Output = SInt;
+    fn sub(self, rhs: &SInt) -> SInt {
+        match (self, rhs) {
+            (SInt::Infer, _) | (_, SInt::Infer) => {
+                panic!("arithmetic on SInt::Infer — resolve -1 before computing")
+            }
+            (SInt::Const(a), SInt::Const(b)) => {
+                assert!(a >= b, "SInt subtraction underflow: {a} - {b} would be negative");
+                SInt::Const(a - b)
+            }
+            _ => {
+                let a = self.to_uop(morok_dtype::DType::Index);
+                let b = rhs.to_uop(morok_dtype::DType::Index);
+                SInt::Symbolic(a.try_sub(&b).unwrap())
+            }
+        }
+    }
+}
+impl std::ops::Sub for SInt {
+    type Output = SInt;
+    fn sub(self, rhs: SInt) -> SInt {
+        (&self).sub(&rhs)
+    }
+}
+impl std::ops::Sub<&SInt> for SInt {
+    type Output = SInt;
+    fn sub(self, rhs: &SInt) -> SInt {
+        (&self).sub(rhs)
+    }
+}
+impl std::ops::Sub<SInt> for &SInt {
+    type Output = SInt;
+    fn sub(self, rhs: SInt) -> SInt {
+        self.sub(&rhs)
+    }
+}
+impl std::ops::Sub<usize> for &SInt {
+    type Output = SInt;
+    fn sub(self, rhs: usize) -> SInt {
+        self.sub(&SInt::Const(rhs))
+    }
+}
+impl std::ops::Sub<usize> for SInt {
+    type Output = SInt;
+    fn sub(self, rhs: usize) -> SInt {
+        (&self).sub(&SInt::Const(rhs))
+    }
+}
+impl std::ops::Sub<SInt> for usize {
+    type Output = SInt;
+    fn sub(self, rhs: SInt) -> SInt {
+        (&SInt::Const(self)).sub(&rhs)
+    }
+}
+impl std::ops::Sub<&SInt> for usize {
+    type Output = SInt;
+    fn sub(self, rhs: &SInt) -> SInt {
+        (&SInt::Const(self)).sub(rhs)
     }
 }
 
@@ -289,6 +413,109 @@ impl From<&Arc<UOp>> for SInt {
 }
 
 // =========================================================================
+// Shrink range conversion
+// =========================================================================
+
+/// A shrink range that may be `None` (keep dim), concrete, or symbolic.
+///
+/// Intermediate representation used by [`IntoShrinkRange`]. isize values
+/// are preserved for negative-index resolution at the tensor layer.
+#[derive(Debug, Clone)]
+pub enum ShrinkRange {
+    /// Keep entire dimension (identity).
+    None,
+    /// Concrete range with possibly-negative indices (resolved by tensor layer).
+    Isize(isize, isize),
+    /// SInt range (concrete or symbolic, always non-negative).
+    Sint(SInt, SInt),
+}
+
+/// Trait for types convertible to a shrink range specification.
+pub trait IntoShrinkRange {
+    fn into_shrink_range(self) -> ShrinkRange;
+}
+
+impl IntoShrinkRange for Option<(isize, isize)> {
+    fn into_shrink_range(self) -> ShrinkRange {
+        match self {
+            Some((b, e)) => ShrinkRange::Isize(b, e),
+            ::core::option::Option::None => ShrinkRange::None,
+        }
+    }
+}
+
+impl IntoShrinkRange for &Option<(isize, isize)> {
+    fn into_shrink_range(self) -> ShrinkRange {
+        (*self).into_shrink_range()
+    }
+}
+
+impl IntoShrinkRange for (isize, isize) {
+    fn into_shrink_range(self) -> ShrinkRange {
+        ShrinkRange::Isize(self.0, self.1)
+    }
+}
+
+impl IntoShrinkRange for &(isize, isize) {
+    fn into_shrink_range(self) -> ShrinkRange {
+        ShrinkRange::Isize(self.0, self.1)
+    }
+}
+
+// (i32, i32) → concrete range (ONNX often uses i32)
+impl IntoShrinkRange for (i32, i32) {
+    fn into_shrink_range(self) -> ShrinkRange {
+        ShrinkRange::Isize(self.0 as isize, self.1 as isize)
+    }
+}
+
+impl IntoShrinkRange for &(i32, i32) {
+    fn into_shrink_range(self) -> ShrinkRange {
+        ShrinkRange::Isize(self.0 as isize, self.1 as isize)
+    }
+}
+
+// (usize, usize) → concrete range
+impl IntoShrinkRange for (usize, usize) {
+    fn into_shrink_range(self) -> ShrinkRange {
+        ShrinkRange::Sint(SInt::Const(self.0), SInt::Const(self.1))
+    }
+}
+
+impl IntoShrinkRange for &(usize, usize) {
+    fn into_shrink_range(self) -> ShrinkRange {
+        ShrinkRange::Sint(SInt::Const(self.0), SInt::Const(self.1))
+    }
+}
+
+impl IntoShrinkRange for Option<(SInt, SInt)> {
+    fn into_shrink_range(self) -> ShrinkRange {
+        match self {
+            Some((b, e)) => ShrinkRange::Sint(b, e),
+            ::core::option::Option::None => ShrinkRange::None,
+        }
+    }
+}
+
+impl IntoShrinkRange for &Option<(SInt, SInt)> {
+    fn into_shrink_range(self) -> ShrinkRange {
+        self.clone().into_shrink_range()
+    }
+}
+
+impl IntoShrinkRange for (SInt, SInt) {
+    fn into_shrink_range(self) -> ShrinkRange {
+        ShrinkRange::Sint(self.0, self.1)
+    }
+}
+
+impl IntoShrinkRange for &(SInt, SInt) {
+    fn into_shrink_range(self) -> ShrinkRange {
+        ShrinkRange::Sint(self.0.clone(), self.1.clone())
+    }
+}
+
+// =========================================================================
 // Utilities
 // =========================================================================
 
@@ -306,40 +533,7 @@ impl From<&Arc<UOp>> for SInt {
 /// assert_eq!(result.as_const(), Some(24));
 /// ```
 pub fn sint_prod(values: &[SInt]) -> SInt {
-    sint_aggregate(values, 1, |vals| vals.into_iter().product(), |a, b| a.try_mul(&b), "multiplication")
-}
-
-/// Helper for aggregating SInt values with both concrete and symbolic paths.
-fn sint_aggregate<F, G>(
-    values: &[SInt],
-    empty_val: usize,
-    concrete_op: F,
-    symbolic_op: G,
-    op_name: &'static str,
-) -> SInt
-where
-    F: FnOnce(Vec<usize>) -> usize,
-    G: Fn(Arc<UOp>, Arc<UOp>) -> crate::Result<Arc<UOp>>,
-{
-    use morok_dtype::DType;
-
-    if values.is_empty() {
-        return SInt::Const(empty_val);
-    }
-
-    // If all concrete, compute directly
-    if values.iter().all(|s| s.is_const()) {
-        let concrete_vals: Vec<usize> = values.iter().map(|s| s.as_const().unwrap()).collect();
-        return SInt::Const(concrete_op(concrete_vals));
-    }
-
-    // Build symbolic operation tree
-    let uops: Vec<_> = values.iter().map(|s| s.to_uop(DType::Index)).collect();
-    let result = uops
-        .into_iter()
-        .reduce(|acc, uop| symbolic_op(acc, uop).unwrap_or_else(|_| panic!("Index {} should not fail", op_name)));
-
-    SInt::from(result.expect("Aggregation of non-empty vec should succeed"))
+    values.iter().fold(SInt::Const(1), |acc, v| &acc * v)
 }
 
 /// Compute maximum of SInt values (symbolic-aware).
@@ -354,7 +548,8 @@ where
 /// assert_eq!(result.as_const(), Some(20));
 /// ```
 pub fn sint_max(values: &[SInt]) -> SInt {
-    sint_aggregate(values, 0, |vals| vals.into_iter().max().unwrap(), |a, b| a.try_max(&b), "max")
+    assert!(!values.is_empty(), "sint_max requires at least one value");
+    values.iter().skip(1).fold(values[0].clone(), |acc, v| acc.smax(v))
 }
 
 /// Compute minimum of SInt values (symbolic-aware).
@@ -372,17 +567,6 @@ pub fn sint_max(values: &[SInt]) -> SInt {
 /// assert_eq!(result.as_const(), Some(10));
 /// ```
 pub fn sint_min(values: &[SInt]) -> SInt {
-    if values.is_empty() {
-        return SInt::Const(usize::MAX);
-    }
-
-    // If all concrete, compute min directly
-    if values.iter().all(|s| s.is_const()) {
-        let minimum = values.iter().map(|s| s.as_const().unwrap()).min().unwrap();
-        return SInt::Const(minimum);
-    }
-
-    // TODO: Implement symbolic min when UOp::try_min_op is available
-    // For now, fall back to first element for symbolic cases
-    values[0].clone()
+    assert!(!values.is_empty(), "sint_min requires at least one value");
+    values.iter().skip(1).fold(values[0].clone(), |acc, v| acc.smin(v))
 }

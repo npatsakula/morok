@@ -23,9 +23,11 @@ prost-build = "0.14"
 
 [dev-dependencies]
 ndarray.workspace = true
-proptest = "1.10"
+proptest = "1.11"
 test-case = "3.3.1"
-morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.1", features = ["testing"] }
+morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.1", features = [
+    "testing",
+] }
 morok-runtime = { path = "../runtime" }
 
 [features]

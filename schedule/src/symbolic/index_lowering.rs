@@ -86,6 +86,18 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         // PHASE 2: Process wrapped values
         // ================================================================
 
+        // Unary(x.cast(Index)) → Unary(x.cast(dt), dt).cast(Index)
+        // Handles Neg and other unary ops on Index-wrapped values.
+        node if matches!(node.op(), Op::Unary(_, _)) && node.dtype() == DType::Index => |node| {
+            let Op::Unary(op, x) = node.op() else { return None };
+            let Op::Cast { src, dtype } = x.op() else { return None };
+            if *dtype != DType::Index { return None; }
+
+            let dt = least_upper_dtype(&select_dtype(node), &src.dtype());
+            let result = UOp::new(Op::Unary(*op, src.cast(dt.clone())), dt);
+            Some(result.cast(DType::Index))
+        },
+
         // Binary(x.cast(Index), y.cast(Index)) → alu(op, x.cast(dt), y.cast(dt)).cast(u.dtype)
         // Tinygrad: x.cast(dt:=least_upper_dtype(select_dtype(u), x.dtype, y.dtype)).alu(u.op, y.cast(dt)).cast(u.dtype)
         // No dtype guard on result — comparisons (Lt, Ge, etc.) produce Bool, not Index,

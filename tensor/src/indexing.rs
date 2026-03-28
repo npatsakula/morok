@@ -245,7 +245,7 @@ impl Tensor {
         let mask_cumsum = mask_flat.cast(morok_dtype::DType::Int32)?.cumsum(0)?;
         // Realize to get output size (data-dependent shape)
         let n = mask_flat.numel()?;
-        let mut count_t = mask_cumsum.try_shrink(&[((n - 1) as isize, n as isize)])?;
+        let mut count_t = mask_cumsum.try_shrink([((n - 1) as isize, n as isize)])?;
         count_t.realize()?;
         let count_t = count_t.as_ndarray::<i32>()?;
         let count = count_t[[0]] as usize;

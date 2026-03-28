@@ -116,7 +116,7 @@ fn test_zero_size_pipeline() {
 }
 
 #[test]
-#[should_panic(expected = "Cannot allocate buffer with symbolic size")]
+#[should_panic(expected = "Cannot allocate buffer: range vmax resolved to")]
 fn test_bufferize_with_zero_range_inside() {
     let mut ctx = KernelContext::new();
 
@@ -139,7 +139,7 @@ fn test_bufferize_with_zero_range_inside() {
 }
 
 #[test]
-#[should_panic(expected = "Cannot allocate buffer with symbolic size")]
+#[should_panic(expected = "Cannot allocate buffer: range vmax resolved to")]
 fn test_multiple_zero_ranges() {
     let mut ctx = KernelContext::new();
 

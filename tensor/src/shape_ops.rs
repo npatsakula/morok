@@ -9,6 +9,7 @@
 //! - Unsqueeze: Add dimensions of size 1
 
 use bon::bon;
+use morok_ir::IntoShrinkRange;
 use snafu::ResultExt;
 use strum::{Display, EnumString};
 
@@ -298,16 +299,16 @@ impl Tensor {
         let mut results = Vec::with_capacity(sizes.len());
         let mut offset = 0usize;
         for &size in sizes {
-            let ranges: Vec<(isize, isize)> = (0..ndim)
+            let ranges: Vec<Option<(isize, isize)>> = (0..ndim)
                 .map(|d| {
                     if d == dim {
-                        (offset as isize, (offset + size) as isize)
+                        Some((offset as isize, (offset + size) as isize))
                     } else {
-                        (0, shape[d].as_const().unwrap() as isize)
+                        None // keep entire dim (supports symbolic)
                     }
                 })
                 .collect();
-            results.push(self.try_shrink(&ranges)?);
+            results.push(self.try_shrink(ranges)?);
             offset += size;
         }
         Ok(results)
@@ -316,14 +317,16 @@ impl Tensor {
     /// Repeat tensor along each dimension.
     ///
     /// `repeats[i]` is the number of times to repeat along dimension `i`.
+    /// Accepts `&[SInt]` — supports both concrete and symbolic repeat counts.
     ///
     /// # Examples
     /// ```ignore
+    /// use morok_ir::SInt;
     /// let t = Tensor::from_slice(&[1.0f32, 2.0, 3.0]).try_reshape(&[1, 3])?;
-    /// let tiled = t.repeat(&[3, 2])?;  // Shape [3, 6]
+    /// let tiled = t.repeat(&[SInt::from(3), SInt::from(2)])?;  // Shape [3, 6]
     /// ```
     #[track_caller]
-    pub fn repeat(&self, repeats: &[usize]) -> Result<Tensor> {
+    pub fn repeat(&self, repeats: &[SInt]) -> Result<Tensor> {
         let shape = self.shape()?;
         let ndim = shape.len();
         snafu::ensure!(
@@ -335,23 +338,20 @@ impl Tensor {
             }
         );
         let mut result = self.clone();
-        for (dim, &rep) in repeats.iter().enumerate() {
-            if rep == 1 {
+        for (dim, rep) in repeats.iter().enumerate() {
+            if rep.as_const() == Some(1) {
                 continue;
             }
             let current_shape = result.shape()?;
-            let dim_size = current_shape[dim]
-                .as_const()
-                .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "repeat".to_string() })?;
+            let dim_size = &current_shape[dim];
             // Unsqueeze at dim, expand rep times, then reshape to merge.
-            // Use -1 (Infer/keep) for other dims to preserve symbolic batch.
             result = result.try_unsqueeze(dim as isize)?;
             let mut expand_shape: Vec<SInt> = current_shape.iter().cloned().collect();
-            expand_shape.insert(dim, (rep).into());
+            expand_shape.insert(dim, rep.clone());
             result = result.try_expand(&expand_shape)?;
-            expand_shape[dim] = (rep * dim_size).into();
+            expand_shape[dim] = rep * dim_size;
             expand_shape.remove(dim + 1);
-            result = result.try_reshape(&expand_shape)?;
+            result = result.try_reshape(expand_shape)?;
         }
         Ok(result)
     }
@@ -586,22 +586,29 @@ impl Tensor {
     ///
     /// # Errors
     ///
-    /// Returns error if shape is unknown or contains symbolic dimensions.
+    /// Supports symbolic dimensions — symbolic dims produce scalar UOp tensors.
     #[track_caller]
     pub fn shape_tensor(&self) -> Result<Tensor> {
         let shape = self.shape()?;
 
-        // Extract concrete dimensions
-        let dims: Vec<i64> = shape
+        // If all concrete, fast path
+        if shape.iter().all(|d| d.is_const()) {
+            let dims: Vec<i64> = shape.iter().map(|d| d.as_const().unwrap() as i64).collect();
+            return Ok(Tensor::from_slice(&dims));
+        }
+
+        // Mixed concrete/symbolic: create scalar tensors and cat
+        let shape_sint: smallvec::SmallVec<[SInt; 4]> = smallvec::smallvec![SInt::from(1usize)];
+        let scalars: Result<Vec<Tensor>> = shape
             .iter()
             .map(|d| {
-                d.as_const()
-                    .map(|v| v as i64)
-                    .ok_or_else(|| Error::SymbolicShapeUnsupported { operation: "shape_tensor".to_string() })
+                let uop = d.to_uop(morok_dtype::DType::Int64);
+                uop.try_reshape(&shape_sint).map(Tensor::new).context(UOpSnafu)
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Tensor::from_slice(&dims))
+            .collect();
+        let scalars = scalars?;
+        let refs: Vec<&Tensor> = scalars.iter().collect();
+        Tensor::cat(&refs, 0)
     }
 
     /// Shrink (slice) tensor along each dimension.
@@ -621,45 +628,41 @@ impl Tensor {
     ///
     /// Returns error if negative indices are used with symbolic shape dimensions.
     #[track_caller]
-    pub fn try_shrink(&self, ranges: &[impl Into<Option<(isize, isize)>> + Copy]) -> Result<Tensor> {
+    pub fn try_shrink<R: IntoShrinkRange>(&self, ranges: impl IntoIterator<Item = R>) -> Result<Tensor> {
+        use morok_ir::ShrinkRange;
+
         let shape = self.shape()?;
+        let resolved: Vec<ShrinkRange> = ranges.into_iter().map(|r| r.into_shrink_range()).collect();
 
         // Empty ranges (scalar) → identity
-        if ranges.is_empty() {
+        if resolved.is_empty() {
             return Ok(self.clone());
         }
 
         // Check if all ranges are None (no-op)
-        let resolved: Vec<Option<(isize, isize)>> = ranges.iter().map(|r| (*r).into()).collect();
-        if resolved.iter().all(|r| r.is_none()) {
+        if resolved.iter().all(|r| matches!(r, ShrinkRange::None)) {
             return Ok(self.clone());
         }
 
-        // Convert to SInt and handle negative indices.
+        // Convert to (SInt, SInt), resolving negative isize indices.
         // None means "keep entire dim" (matches Tinygrad's shrink(None) semantics).
         let ranges_sint: Vec<(SInt, SInt)> = resolved
-            .iter()
+            .into_iter()
             .enumerate()
-            .map(|(dim_idx, range)| {
-                let Some((begin, end)) = range else {
-                    // None → keep entire dimension: use concrete (0, dim_size) if possible,
-                    // otherwise the dim is symbolic and we pass it through.
-                    return Ok((SInt::Const(0), shape[dim_idx].clone()));
-                };
-                let (begin, end) = (*begin, *end);
-
-                let (normalized_begin, normalized_end) = if begin < 0 || end < 0 {
-                    let dim_size = shape[dim_idx].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported {
-                        operation: "shrink with negative indices".to_string(),
-                    })? as isize;
-                    let nb = if begin < 0 { dim_size + begin } else { begin };
-                    let ne = if end < 0 { dim_size + end } else { end };
-                    (nb, ne)
-                } else {
-                    (begin, end)
-                };
-
-                Ok((SInt::Const(normalized_begin as usize), SInt::Const(normalized_end as usize)))
+            .map(|(dim_idx, range)| match range {
+                ShrinkRange::None => Ok((SInt::Const(0), shape[dim_idx].clone())),
+                ShrinkRange::Sint(begin, end) => Ok((begin, end)),
+                ShrinkRange::Isize(begin, end) => {
+                    let (nb, ne) = if begin < 0 || end < 0 {
+                        let dim_size = shape[dim_idx].as_const().ok_or_else(|| Error::SymbolicShapeUnsupported {
+                            operation: "shrink with negative indices".to_string(),
+                        })? as isize;
+                        (if begin < 0 { dim_size + begin } else { begin }, if end < 0 { dim_size + end } else { end })
+                    } else {
+                        (begin, end)
+                    };
+                    Ok((SInt::Const(nb as usize), SInt::Const(ne as usize)))
+                }
             })
             .collect::<Result<Vec<_>>>()?;
 

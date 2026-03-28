@@ -439,8 +439,12 @@ impl UOp {
                 // WHERE(valid, idx, INVALID) → return valid
                 cond.clone()
             }
+            Op::Invalid => {
+                // Bare Invalid is NOT valid (Tinygrad: self.arg is not Invalid → False)
+                Self::const_(DType::Bool, ConstValue::Bool(false))
+            }
             _ => {
-                // Always valid - return constant true
+                // Non-Invalid, non-WHERE: always valid
                 Self::const_(DType::Bool, ConstValue::Bool(true))
             }
         }

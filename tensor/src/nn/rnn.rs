@@ -119,7 +119,7 @@ impl Tensor {
         let mut h_list = Vec::with_capacity(seq_length);
         for t in 0..seq_length {
             let x_t =
-                x.try_shrink(&[(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
+                x.try_shrink([(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
             let x_t = x_t.try_squeeze(Some(0))?; // [batch, input]
 
             let mut gate = x_t.matmul(&wt)?.try_add(&h_t.matmul(&rt)?)?;
@@ -257,7 +257,7 @@ impl Tensor {
         let mut h_list = Vec::with_capacity(seq_length);
         for t in 0..seq_length {
             let x_t =
-                x.try_shrink(&[(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
+                x.try_shrink([(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
             let x_t = x_t.try_squeeze(Some(0))?; // [batch, input]
 
             // z, r gates: combined matmul
@@ -429,7 +429,7 @@ impl Tensor {
         let mut h_list = Vec::with_capacity(seq_length);
         for t in 0..seq_length {
             let x_t =
-                x.try_shrink(&[(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
+                x.try_shrink([(t as isize, t as isize + 1), (0, batch_size as isize), (0, input_size as isize)])?;
             let x_t = x_t.try_squeeze(Some(0))?; // [batch, input]
 
             // gates = X_t @ W^T + H_{t-1} @ R^T + bias

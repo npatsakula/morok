@@ -14,7 +14,7 @@ mod shape;
 mod transformer;
 
 use morok_dtype::{DType, ScalarDType};
-use morok_ir::ConstValue;
+use morok_ir::{ConstValue, SInt};
 use morok_tensor::Tensor;
 use morok_tensor::reduce::AxisSpec;
 
@@ -282,26 +282,20 @@ impl OpRegistry {
             "Shape" => {
                 let start = attrs.int("start", 0) as isize;
                 let end = attrs.int("end", i64::MAX) as isize;
-                let shape = inp(inputs, 0).shape()?;
-                let ndim = shape.len() as isize;
-                let s = if start < 0 { (ndim + start).max(0) } else { start.min(ndim) } as usize;
-                let e = (if end < 0 { (ndim + end).max(0) } else { end.min(ndim) } as usize).max(s);
-                let dims: Vec<i64> = shape[s..e]
-                    .iter()
-                    .map(|d| {
-                        d.as_const()
-                            .map(|v| v as i64)
-                            .ok_or_else(|| Error::IrConstruction { details: "Shape requires concrete dims".into() })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                vec![Tensor::from_slice(&dims)]
+                let shape_t = inp(inputs, 0).shape_tensor()?;
+                let ndim = inp(inputs, 0).ndim()? as isize;
+                let s = if start < 0 { (ndim + start).max(0) } else { start.min(ndim) };
+                let e = if end < 0 { (ndim + end).max(0) } else { end.min(ndim) };
+                let e = e.max(s);
+                vec![shape_t.try_shrink([(s, e)])?]
             }
             "Expand" => vec![shape::op_expand(inputs)?],
             "Pad" => vec![shape::op_pad(inputs, &mut attrs)?],
             "Slice" => vec![shape::op_slice(inputs)?],
             "Split" => shape::op_split(inputs, &mut attrs, opset_version)?,
             "Tile" => {
-                let repeats: Vec<usize> = tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| v as usize).collect();
+                let repeats: Vec<SInt> =
+                    tensor_to_i64_vec(inp(inputs, 1))?.iter().map(|&v| SInt::from(v as usize)).collect();
                 vec![inp(inputs, 0).repeat(&repeats)?]
             }
             "Range" => {

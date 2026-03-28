@@ -121,22 +121,22 @@ impl Tensor {
 
         x = x.pool(&hw, stride, dilation)?;
 
-        let oyx: Vec<usize> = {
+        let oyx: Vec<SInt> = {
             let xs = x.shape()?;
-            (0..n_spatial).map(|j| xs[2 + j].as_const().unwrap()).collect()
+            xs[2..2 + n_spatial].to_vec()
         };
 
         let rcout = cout / groups;
 
         // Reshape: (bs, groups, cin, 1, *oyx, *hw)
         let mut reshape_dims: Vec<SInt> = vec![bs.clone(), groups.into(), cin.into(), 1usize.into()];
-        reshape_dims.extend(oyx.iter().map(|&o| SInt::from(o)));
+        reshape_dims.extend(oyx.iter().cloned());
         reshape_dims.extend(hw.iter().map(|&k| SInt::from(k)));
         x = x.try_reshape(&reshape_dims)?;
 
         // Expand: (bs, groups, cin, rcout, *oyx, *hw)
         let mut expand_dims: Vec<SInt> = vec![bs.clone(), groups.into(), cin.into(), rcout.into()];
-        expand_dims.extend(oyx.iter().map(|&o| SInt::from(o)));
+        expand_dims.extend(oyx.iter().cloned());
         expand_dims.extend(hw.iter().map(|&k| SInt::from(k)));
         x = x.try_expand(&expand_dims)?;
 
@@ -167,7 +167,7 @@ impl Tensor {
 
         // Reshape to (bs, cout, *oyx)
         let mut final_shape: Vec<SInt> = vec![bs.clone(), cout.into()];
-        final_shape.extend(oyx.iter().map(|&o| SInt::from(o)));
+        final_shape.extend(oyx.iter().cloned());
         x = x.try_reshape(&final_shape)?;
 
         if let Some(bias) = bias {

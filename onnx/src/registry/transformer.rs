@@ -59,8 +59,7 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
         let q_seq = q_shape[1].as_const().unwrap() as isize;
         let k_seq = k_shape[1].as_const().unwrap() as isize;
 
-        let q =
-            q.try_reshape([batch, q_seq, q_num_heads as isize, q_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
+        let q = q.try_reshape([batch, q_seq, q_num_heads as isize, q_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
         let k =
             k.try_reshape([batch, k_seq, kv_num_heads as isize, k_head_dim as isize])?.try_permute(&[0, 2, 1, 3])?;
         let v =
@@ -93,18 +92,10 @@ pub(crate) fn op_attention_onnx(inputs: &[Option<Tensor>], attrs: &mut Attrs) ->
         let v_s = v.shape()?;
         let d_v = v_s[3].as_const().unwrap() as isize;
         // [B, kv_h, S, D] → [B, kv_h, 1, S, D] → expand → [B, q_h, S, D]
-        let k = k.try_unsqueeze(2)?.try_expand([b, kv_h, r, s_k, d_k])?.try_reshape([
-            b,
-            eff_q_heads as isize,
-            s_k,
-            d_k,
-        ])?;
-        let v = v.try_unsqueeze(2)?.try_expand([b, kv_h, r, s_k, d_v])?.try_reshape([
-            b,
-            eff_q_heads as isize,
-            s_k,
-            d_v,
-        ])?;
+        let k =
+            k.try_unsqueeze(2)?.try_expand([b, kv_h, r, s_k, d_k])?.try_reshape([b, eff_q_heads as isize, s_k, d_k])?;
+        let v =
+            v.try_unsqueeze(2)?.try_expand([b, kv_h, r, s_k, d_v])?.try_reshape([b, eff_q_heads as isize, s_k, d_v])?;
         (k, v)
     } else {
         (k, v)

@@ -1,7 +1,7 @@
 //! Padding helpers: flat-to-pair conversion, auto-pad, pool pad resolution.
 
 use bon::bon;
-use morok_ir::{ConstValue, UOp};
+use morok_ir::{ConstValue, SInt, UOp};
 
 use super::{AutoPad, PadMode};
 use crate::Tensor;
@@ -67,20 +67,22 @@ pub fn auto_pad_split(total_pads: &[isize], auto_pad: AutoPad) -> Vec<isize> {
 /// ```
 /// # use morok_tensor::nn::AutoPad;
 /// # use morok_tensor::nn::pad::resolve_pool_pads;
+/// # use morok_ir::SInt;
 /// // VALID mode: no padding regardless of explicit pads
-/// let pads = resolve_pool_pads(&[5, 5], &[], &[3, 3], &[1, 1], &[1, 1], AutoPad::Valid);
+/// let pads = resolve_pool_pads(&[SInt::from(5), SInt::from(5)], &[], &[3, 3], &[1, 1], &[1, 1], AutoPad::Valid);
 /// assert_eq!(pads, vec![(0, 0), (0, 0)]);
 /// ```
 ///
 /// ```
 /// # use morok_tensor::nn::AutoPad;
 /// # use morok_tensor::nn::pad::resolve_pool_pads;
+/// # use morok_ir::SInt;
 /// // SAME_UPPER: compute pads to keep output size = ceil(input/stride)
-/// let pads = resolve_pool_pads(&[5, 5], &[], &[3, 3], &[1, 1], &[1, 1], AutoPad::SameUpper);
+/// let pads = resolve_pool_pads(&[SInt::from(5), SInt::from(5)], &[], &[3, 3], &[1, 1], &[1, 1], AutoPad::SameUpper);
 /// assert_eq!(pads, vec![(1, 1), (1, 1)]);
 /// ```
 pub fn resolve_pool_pads(
-    input_spatial: &[usize],
+    input_spatial: &[SInt],
     pads: &[i64],
     kernel: &[usize],
     dilations: &[usize],
@@ -98,12 +100,16 @@ pub fn resolve_pool_pads(
             }
         }
         AutoPad::SameUpper | AutoPad::SameLower => {
+            // SameUpper/SameLower require concrete spatial dims to compute padding.
             let total_pads: Vec<isize> = (0..n)
                 .map(|i| {
-                    let out_size = usize::div_ceil(input_spatial[i], strides[i]);
+                    let is = input_spatial[i]
+                        .as_const()
+                        .expect("SameUpper/SameLower auto_pad requires concrete spatial dims");
+                    let out_size = usize::div_ceil(is, strides[i]);
                     let eff_kernel = dilations[i] * (kernel[i] - 1) + 1;
                     let needed = (out_size - 1) * strides[i] + eff_kernel;
-                    needed.saturating_sub(input_spatial[i]) as isize
+                    needed.saturating_sub(is) as isize
                 })
                 .collect();
             let flat = auto_pad_split(&total_pads, auto_pad);
@@ -320,7 +326,8 @@ fn pad_reflect(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
 fn pad_circular(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
     let shape = data.shape()?;
     let ndim = shape.len();
-    let repeats: Vec<usize> = padding.iter().map(|&(pb, pa)| 1 + usize::from(pb > 0) + usize::from(pa > 0)).collect();
+    let repeats: Vec<SInt> =
+        padding.iter().map(|&(pb, pa)| SInt::from(1 + usize::from(pb > 0) + usize::from(pa > 0))).collect();
     let repeated = data.repeat(&repeats)?;
     let rep_shape = repeated.shape()?;
 
@@ -341,7 +348,7 @@ fn pad_circular(data: &Tensor, padding: &[(isize, isize)]) -> Result<Tensor> {
 /// Per arXiv:1603.07285 section 5.1, relationship 15.
 pub(super) fn apply_ceil_mode(
     padding: &[(isize, isize)],
-    input_spatial: &[usize],
+    input_spatial: &[SInt],
     kernel: &[usize],
     stride: &[usize],
     dilation: &[usize],
@@ -350,18 +357,16 @@ pub(super) fn apply_ceil_mode(
     let grouped: Vec<(isize, isize)> = padding.to_vec();
     let mut ceil_pads = grouped.clone();
     for i in 0..n {
-        let padded = input_spatial[i] as isize + grouped[i].0 + grouped[i].1;
+        let is = input_spatial[i].as_const().expect("ceil_mode requires concrete spatial dims");
+        let padded = is as isize + grouped[i].0 + grouped[i].1;
         let eff_k = (dilation[i] * (kernel[i] - 1) + 1) as isize;
         let s = stride[i] as isize;
-        // Output with ceil: ceildiv(padded - eff_k, s) + 1
         let o_ceil = (padded - eff_k + s - 1) / s + 1;
-        // Output without ceil: (padded - eff_k) / s + 1
         let o_floor = (padded - eff_k) / s + 1;
         if o_ceil > o_floor {
             let last_start = s * (o_ceil - 1);
             let extra = last_start + eff_k - padded;
-            // Decrease when last window starts past real data + pad_before
-            let correction = (last_start - (grouped[i].0 + input_spatial[i] as isize - 1)).max(0);
+            let correction = (last_start - (grouped[i].0 + is as isize - 1)).max(0);
             ceil_pads[i].1 += extra - correction;
         }
     }

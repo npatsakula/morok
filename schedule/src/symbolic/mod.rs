@@ -4,6 +4,7 @@
 //! including identity folding, constant folding, and algebraic simplification.
 
 pub mod dce;
+pub mod divmod;
 pub mod fast_div;
 pub mod index_lowering;
 pub mod patterns;

@@ -36,6 +36,7 @@ tracing-verbose = []
 criterion = { version = "0.8", features = ["html_reports"] }
 test-case = "3.3.1"
 morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.1", features = ["testing"] }
+proptest = "1.11.0"
 
 [[bench]]
 name = "optimization"

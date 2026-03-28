@@ -36,8 +36,8 @@ pub(crate) fn op_one_hot(inputs: &[Option<Tensor>], attrs: &mut Attrs) -> Result
     let norm_axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
     let expanded = norm_idx.try_unsqueeze(norm_axis as isize)?;
     let mask = expanded.one_hot_along_dim(depth, norm_axis as isize)?;
-    let on_val = values.try_shrink(&[(1, 2)])?;
-    let off_val = values.try_shrink(&[(0, 1)])?;
+    let on_val = values.try_shrink([(1, 2)])?;
+    let off_val = values.try_shrink([(0, 1)])?;
     Ok(on_val.where_(&mask, &off_val)?)
 }
 

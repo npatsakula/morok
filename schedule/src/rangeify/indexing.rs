@@ -357,6 +357,12 @@ fn assign_ranges(
             continue;
         }
 
+        // Skip Index-typed UOps: shape parameters (begins/ends, dim sizes) are not data.
+        // Matches Tinygrad rangeify.py line 177: `if x.dtype.scalar() == dtypes.index: continue`
+        if x.dtype().scalar() == Some(morok_dtype::ScalarDType::Index) {
+            continue;
+        }
+
         let _span = info_span!("assign_range",
             uop_id = x.id,
             op = ?std::mem::discriminant(x.op())
@@ -633,15 +639,17 @@ fn assign_ranges(
 pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     match op {
         Op::Shrink { begins, .. } => {
-            let begin_vals = extract_shape_values(begins);
+            // Matches Tinygrad indexing.py:140:
+            // case Ops.SHRINK: rngs = tuple(a if ss == 0 else a+ss for a,(ss,_) in zip(rngs, arg))
+            let begin_uops = extract_shape_uops(begins);
             rngs.iter()
-                .zip(begin_vals.iter())
-                .map(|(rng, &begin)| {
-                    if begin == 0 {
+                .zip(begin_uops.iter())
+                .map(|(rng, begin)| {
+                    // Skip add when begin is zero (concrete optimization)
+                    if is_const_zero(begin) {
                         Arc::clone(rng)
                     } else {
-                        let begin_uop = UOp::index_const(begin as i64);
-                        rng.try_add(&begin_uop).unwrap()
+                        rng.try_add(begin).expect("SHRINK: try_add failed")
                     }
                 })
                 .collect()
@@ -713,25 +721,27 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
         }
 
         Op::Pad { begin_pads, end_pads, .. } => {
-            let begin_vals = extract_shape_values(begin_pads);
-            let end_vals = extract_shape_values(end_pads);
+            let begin_uops = extract_shape_uops(begin_pads);
+            let end_uops = extract_shape_uops(end_pads);
             rngs.iter()
                 .zip(in_shape.iter())
-                .zip(begin_vals.iter().zip(end_vals.iter()))
-                .map(|((rng, shape), (&begin, &end))| {
-                    if begin == 0 && end == 0 {
+                .zip(begin_uops.iter().zip(end_uops.iter()))
+                .map(|((rng, shape), (begin, end))| {
+                    if is_const_zero(begin) && is_const_zero(end) {
                         return Arc::clone(rng);
                     }
-                    let begin_uop = UOp::index_const(begin as i64);
-                    let shape_plus_begin = shape.to_uop(morok_dtype::DType::Index).try_add(&begin_uop).unwrap();
-                    // valid_low = NOT(rng < begin), canonical form for parse_valid
-                    // (Tinygrad encodes >= as CMPNE(CMPLT, True); we use Not(Lt))
-                    let valid_low = rng.try_cmplt(&begin_uop).unwrap().not();
+                    let shape_plus_begin = shape.to_uop(morok_dtype::DType::Index).try_add(begin).unwrap();
+                    let valid_low = rng.try_cmplt(begin).unwrap().not();
                     let valid_high = rng.try_cmplt(&shape_plus_begin).unwrap();
                     let valid = valid_low.try_and_op(&valid_high).unwrap();
-                    // Simplify validity expression (Tinygrad: graph_rewrite(validity, symbolic+pm_simplify_valid))
-                    let valid = crate::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic(), valid, &mut ());
-                    let adjusted_rng = rng.try_sub(&begin_uop).unwrap();
+                    // Tinygrad: graph_rewrite(validity, symbolic+pm_simplify_valid)
+                    static PAD_SIMPLIFY: std::sync::LazyLock<crate::TypedPatternMatcher> =
+                        std::sync::LazyLock::new(|| {
+                            crate::symbolic::patterns::symbolic()
+                                + crate::symbolic::valid_simplification::pm_simplify_valid()
+                        });
+                    let valid = crate::rewrite::graph_rewrite(&*PAD_SIMPLIFY, valid, &mut ());
+                    let adjusted_rng = rng.try_sub(begin).unwrap();
                     UOp::try_where(valid, adjusted_rng, UOp::invalid_marker()).unwrap()
                 })
                 .collect()
@@ -779,27 +789,8 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             let mut acc = UOp::index_const(1);
             let mut axes_in = Vec::new();
 
-            trace!(
-                new_shape = ?new_shape_vals,
-                rngs.len = rngs.len(),
-                padded_rngs.len = padded_rngs.len(),
-                "Reshape flatten start"
-            );
-
             for (shape_dim, rng) in new_shape_vals.iter().zip(padded_rngs.iter()).rev() {
-                trace!(
-                    shape_dim = ?shape_dim,
-                    rng.id = rng.id,
-                    rng.op = ?std::mem::discriminant(rng.op()),
-                    acc.op = ?std::mem::discriminant(acc.op()),
-                    "Reshape flatten iteration"
-                );
                 let weighted = acc.try_mul(rng).unwrap();
-                trace!(
-                    weighted.id = weighted.id,
-                    weighted.op = ?std::mem::discriminant(weighted.op()),
-                    "Reshape flatten weighted"
-                );
                 axes_in.push(weighted);
                 let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
                 acc = acc.try_mul(&dim_uop).unwrap();
@@ -838,7 +829,6 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
             let sink = UOp::sink(axes_out);
             let simplified_sink = graph_rewrite(&*RESHAPE_SIMPLIFY, sink, &mut ());
 
-            // Extract simplified sources
             match simplified_sink.op() {
                 Op::Sink { sources } => sources.iter().cloned().collect(),
                 _ => vec![simplified_sink],
@@ -849,24 +839,60 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
     }
 }
 
-/// Extract shape values from a UOp (for SHRINK begins/ends, PAD pads).
-fn extract_shape_values(uop: &Arc<UOp>) -> Vec<usize> {
+/// Reshape ranges from `out_shape` to `in_shape` via flatten + unflatten.
+///
+/// Matches Tinygrad's `_apply_reshape` (indexing.py:122-134).
+/// Used by `flatten_bufferize` to convert multi-dim ranges to 1D.
+pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+    use morok_ir::rewrite::graph_rewrite;
+
+    // Flatten: combined = sum(acc_i * rng_i) with acc computed from out_shape
+    let mut acc = UOp::index_const(1);
+    let mut axes_in = Vec::new();
+    for (shape_dim, rng) in out_shape.iter().zip(rngs.iter()).rev() {
+        axes_in.push(acc.try_mul(rng).unwrap());
+        let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
+        acc = acc.try_mul(&dim_uop).unwrap();
+    }
+    let combined = axes_in.into_iter().reduce(|a, b| a.try_add(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
+
+    // Unflatten into in_shape via Mod/Idiv
+    let mut axes_out = Vec::new();
+    let mut remaining = combined;
+    for shape_dim in in_shape.iter().rev() {
+        let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
+        axes_out.push(remaining.try_mod(&dim_uop).unwrap());
+        remaining = remaining.try_div(&dim_uop).unwrap();
+    }
+    axes_out.reverse();
+
+    // Simplify (Tinygrad: "this simplify is doing a lot of heavy lifting")
+    static RESHAPE_SIMPLIFY: std::sync::LazyLock<crate::TypedPatternMatcher> = std::sync::LazyLock::new(|| {
+        crate::symbolic::patterns::symbolic()
+            + crate::symbolic::valid_simplification::pm_simplify_valid()
+            + crate::symbolic::valid_simplification::pm_drop_and_clauses()
+    });
+    let sink = UOp::sink(axes_out);
+    let simplified = graph_rewrite(&*RESHAPE_SIMPLIFY, sink, &mut ());
+    match simplified.op() {
+        Op::Sink { sources } => sources.iter().cloned().collect(),
+        _ => vec![simplified],
+    }
+}
+
+/// Check if a UOp is a constant zero.
+fn is_const_zero(uop: &Arc<UOp>) -> bool {
+    matches!(uop.op(), Op::Const(cv) if cv.0 == ConstValue::Int(0))
+}
+
+/// Extract shape UOps from a vectorize/const (symbolic-aware).
+/// Returns individual element UOps — may be CONST or symbolic expressions.
+/// Matches Tinygrad's `marg` which extracts via `sgep`.
+fn extract_shape_uops(uop: &Arc<UOp>) -> Vec<Arc<UOp>> {
     match uop.op() {
-        Op::Vectorize { elements } => elements
-            .iter()
-            .map(|elem| match elem.op() {
-                Op::Const(cv) => match cv.0 {
-                    ConstValue::Int(n) => n as usize,
-                    _ => panic!("Expected int constant in vectorize"),
-                },
-                _ => panic!("Expected constant element in vectorize"),
-            })
-            .collect(),
-        Op::Const(cv) => match cv.0 {
-            ConstValue::Int(n) => vec![n as usize],
-            _ => panic!("Expected int constant"),
-        },
-        _ => panic!("Expected vectorize or constant for shape values, got {:?}", uop.op()),
+        Op::Vectorize { elements } => elements.to_vec(),
+        Op::Const(_) => vec![uop.clone()],
+        _ => panic!("Expected vectorize or constant for shape uops, got {:?}", uop.op()),
     }
 }
 

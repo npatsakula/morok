@@ -182,7 +182,7 @@ impl UOp {
     /// - begin <= end for each dimension
     /// - 0 <= begin, end <= dimension_size
     pub fn try_shrink(self: &Arc<Self>, ranges: &[(crate::SInt, crate::SInt)]) -> Result<Arc<Self>> {
-        use crate::error::{ShrinkBoundsViolationSnafu, SymbolicShrinkingUnsupportedSnafu};
+        use crate::error::ShrinkBoundsViolationSnafu;
         use crate::shape::ranges_to_uops;
         use snafu::ensure;
 
@@ -191,27 +191,10 @@ impl UOp {
             return Ok(self.clone());
         }
 
-        // Check for symbolic range values.
-        // Allow symbolic identity ranges (0, dim_size) — these are no-ops for batch dims.
+        // Symbolic shrink ranges are allowed — the rangeify pipeline handles
+        // symbolic range ends. Only concrete ranges are bounds-checked.
         if let Some(src_shape) = self.shape()? {
-            for ((begin, end), dim) in ranges.iter().zip(src_shape.iter()) {
-                let is_identity = begin.as_const() == Some(0) && end == dim;
-                if !is_identity {
-                    ensure!(begin.is_const(), SymbolicShrinkingUnsupportedSnafu);
-                    ensure!(end.is_const(), SymbolicShrinkingUnsupportedSnafu);
-                }
-            }
-        } else {
-            for (begin, end) in ranges {
-                ensure!(begin.is_const(), SymbolicShrinkingUnsupportedSnafu);
-                ensure!(end.is_const(), SymbolicShrinkingUnsupportedSnafu);
-            }
-        }
-
-        if let Some(src_shape) = self.shape()? {
-            // Validate each range
             for (dim_idx, ((begin, end), dim_size)) in ranges.iter().zip(src_shape.iter()).enumerate() {
-                // All are concrete now (checked above), validate bounds
                 if let (Some(b), Some(e), Some(s)) = (begin.as_const(), end.as_const(), dim_size.as_const()) {
                     ensure!(
                         b <= e && e <= s,

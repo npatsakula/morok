@@ -524,21 +524,11 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             }
 
             // New shape = src_shape + begin_pads + end_pads for each dimension
-            // All padding values must be concrete (checked during construction)
             Some(
                 src_shape
                     .iter()
                     .zip(ranges.iter())
-                    .map(|(dim, (begin, end))| {
-                        // dim + begin + end
-                        if let (Some(d), Some(b), Some(e)) = (dim.as_const(), begin.as_const(), end.as_const()) {
-                            Ok(SInt::from(d + b + e))
-                        } else {
-                            // Symbolic padding should have been rejected at construction time
-                            // This case should not be reachable if try_pad validates properly
-                            crate::error::SymbolicPaddingUnsupportedSnafu.fail()
-                        }
-                    })
+                    .map(|(dim, (begin, end))| Ok(dim + begin + end))
                     .collect::<crate::Result<Shape>>()?,
             )
         }
@@ -552,7 +542,6 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             }
 
             // New shape = end - begin for each dimension
-            // All shrink values must be concrete (checked during construction)
             Some(
                 ranges
                     .iter()
@@ -562,12 +551,8 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
                         if begin.as_const() == Some(0) && end == dim {
                             return Ok(dim.clone());
                         }
-                        // end - begin (must be concrete)
-                        if let (Some(b), Some(e)) = (begin.as_const(), end.as_const()) {
-                            Ok(if e >= b { SInt::from(e - b) } else { SInt::from(0) })
-                        } else {
-                            crate::error::SymbolicShrinkingUnsupportedSnafu.fail()
-                        }
+                        // end - begin (works for both concrete and symbolic)
+                        Ok(end - begin)
                     })
                     .collect::<crate::Result<Shape>>()?,
             )

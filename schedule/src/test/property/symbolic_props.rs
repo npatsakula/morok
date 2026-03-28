@@ -597,3 +597,121 @@ proptest! {
             "(a * {}) // {} should simplify to a", b, b);
     }
 }
+
+// ============================================================================
+// Div/Mod Soundness: simplified expression must evaluate identically to original
+// for ALL variable assignments within declared ranges.
+// ============================================================================
+
+/// Evaluate a UOp expression tree by substituting variables with concrete values.
+/// Returns None if the expression can't be evaluated (e.g., contains unsupported ops).
+fn eval_uop(expr: &Arc<UOp>, vars: &std::collections::HashMap<String, i64>) -> Option<i64> {
+    use morok_ir::uop::eval::eval_binary_op;
+    match expr.op() {
+        Op::Const(cv) => match cv.0 {
+            ConstValue::Int(v) => Some(v),
+            _ => None,
+        },
+        Op::DefineVar { name, .. } => vars.get(name.as_str()).copied(),
+        Op::Bind { var, .. } => eval_uop(var, vars),
+        Op::Binary(op, a, b) => {
+            let av = eval_uop(a, vars)?;
+            let bv = eval_uop(b, vars)?;
+            match eval_binary_op(*op, ConstValue::Int(av), ConstValue::Int(bv))? {
+                ConstValue::Int(v) => Some(v),
+                ConstValue::Bool(b) => Some(b as i64),
+                _ => None,
+            }
+        }
+        Op::Ternary(morok_ir::TernaryOp::Where, cond, t, f) => {
+            let cv = eval_uop(cond, vars)?;
+            if cv != 0 { eval_uop(t, vars) } else { eval_uop(f, vars) }
+        }
+        Op::Unary(morok_ir::UnaryOp::Not, x) => {
+            let v = eval_uop(x, vars)?;
+            Some(if v == 0 { 1 } else { 0 })
+        }
+        Op::Invalid => Some(i64::MIN), // sentinel for invalid
+        _ => None,
+    }
+}
+
+/// Generate (a*f + b*g + const) expressions for divmod testing.
+/// Variables have range [0, max_val), constants in [-20, 20], divisor in [2, 16].
+fn arb_divmod_expr() -> impl Strategy<Value = (Arc<UOp>, i64, Vec<(String, i64, i64)>)> {
+    // (factor_a, factor_b, const_offset, divisor, var_a_max, var_b_max)
+    (
+        -20i64..20, // factor_a
+        -20i64..20, // factor_b
+        -20i64..20, // const_offset
+        2i64..16,   // divisor
+        1i64..8,    // var_a_max
+        1i64..8,    // var_b_max
+    )
+        .prop_map(|(fa, fb, k, div, a_max, b_max)| {
+            let a = UOp::var("a", DType::Index, 0, a_max);
+            let b = UOp::var("b", DType::Index, 0, b_max);
+            let mut expr = UOp::index_const(k);
+            if fa != 0 {
+                expr = expr.try_add(&UOp::index_const(fa).try_mul(&a).unwrap()).unwrap();
+            }
+            if fb != 0 {
+                expr = expr.try_add(&UOp::index_const(fb).try_mul(&b).unwrap()).unwrap();
+            }
+            let vars = vec![("a".into(), 0, a_max), ("b".into(), 0, b_max)];
+            (expr, div, vars)
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    /// Mod simplification must preserve semantics for ALL variable values in range.
+    #[test]
+    fn divmod_mod_soundness((expr, div, var_ranges) in arb_divmod_expr()) {
+        let c = UOp::index_const(div);
+        let modded = expr.try_mod(&c).unwrap();
+
+        let matcher = symbolic_simple();
+        let simplified = graph_rewrite(&matcher, modded.clone(), &mut ());
+
+        // Evaluate at all combinations of variable values
+        for a_val in var_ranges[0].1..=var_ranges[0].2 {
+            for b_val in var_ranges[1].1..=var_ranges[1].2 {
+                let mut vars = std::collections::HashMap::new();
+                vars.insert("a".into(), a_val);
+                vars.insert("b".into(), b_val);
+
+                if let (Some(orig), Some(simp)) = (eval_uop(&modded, &vars), eval_uop(&simplified, &vars)) {
+                    prop_assert_eq!(orig, simp,
+                        "Mod mismatch at a={}, b={}, div={}.\n  Original: {}\n  Simplified: {}",
+                        a_val, b_val, div, modded.tree(), simplified.tree());
+                }
+            }
+        }
+    }
+
+    /// Idiv simplification must preserve semantics for ALL variable values in range.
+    #[test]
+    fn divmod_idiv_soundness((expr, div, var_ranges) in arb_divmod_expr()) {
+        let c = UOp::index_const(div);
+        let divided = expr.try_div(&c).unwrap();
+
+        let matcher = symbolic_simple();
+        let simplified = graph_rewrite(&matcher, divided.clone(), &mut ());
+
+        for a_val in var_ranges[0].1..=var_ranges[0].2 {
+            for b_val in var_ranges[1].1..=var_ranges[1].2 {
+                let mut vars = std::collections::HashMap::new();
+                vars.insert("a".into(), a_val);
+                vars.insert("b".into(), b_val);
+
+                if let (Some(orig), Some(simp)) = (eval_uop(&divided, &vars), eval_uop(&simplified, &vars)) {
+                    prop_assert_eq!(orig, simp,
+                        "Idiv mismatch at a={}, b={}, div={}.\n  Original: {}\n  Simplified: {}",
+                        a_val, b_val, div, divided.tree(), simplified.tree());
+                }
+            }
+        }
+    }
+}

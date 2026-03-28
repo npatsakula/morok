@@ -187,8 +187,8 @@ impl OnnxImporter {
 
     /// Import from a parsed `ModelProto`.
     pub fn import_model(&self, model: ModelProto, dim_bindings: &[(&str, i64)]) -> Result<OnnxModel> {
-        let graph = self.prepare(model)?;
         let bindings: HashMap<String, i64> = dim_bindings.iter().map(|&(k, v)| (k.to_string(), v)).collect();
+        let graph = self.prepare(model)?;
         let inputs = resolve_symbolic_shapes(&graph.inputs, &graph.variables, &bindings)?;
         let outputs = self.trace_graph(&graph, inputs.clone())?;
         Ok(OnnxModel { inputs, outputs, variables: graph.variables })
@@ -204,8 +204,8 @@ impl OnnxImporter {
         inputs: HashMap<String, Tensor>,
         dim_bindings: &[(&str, i64)],
     ) -> Result<OnnxModel> {
-        let graph = self.prepare(model)?;
         let bindings: HashMap<String, i64> = dim_bindings.iter().map(|&(k, v)| (k.to_string(), v)).collect();
+        let graph = self.prepare(model)?;
         let unresolved: HashMap<String, InputSpec> = graph
             .inputs
             .iter()

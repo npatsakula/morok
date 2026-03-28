@@ -42,91 +42,95 @@ impl Tensor {
             });
         }
 
-        let i_: Vec<usize> = (0..n_spatial)
-            .map(|j| shape[n_batch + j].as_const().expect("pool requires concrete spatial dims"))
-            .collect();
+        // Spatial dims as SInt — works for both concrete and symbolic.
+        let i_: Vec<SInt> = (0..n_spatial).map(|j| shape[n_batch + j].clone()).collect();
 
+        // Validate: kernel must fit in input (concrete dims only — symbolic skips check).
         for j in 0..n_spatial {
-            if dilation[j] * (kernel[j] - 1) >= i_[j] {
+            if let Some(i) = i_[j].as_const()
+                && dilation[j] * (kernel[j] - 1) >= i
+            {
                 return Err(crate::error::Error::IrConstruction {
                     details: format!(
                         "kernel size {} (dilated {}) > input size {}",
                         kernel[j],
                         dilation[j] * (kernel[j] - 1) + 1,
-                        i_[j]
+                        i
                     ),
                 });
             }
         }
 
-        let o_: Vec<usize> =
-            (0..n_spatial).map(|j| usize::div_ceil(i_[j] - dilation[j] * (kernel[j] - 1), stride[j])).collect();
+        // Pool formulas — SInt arithmetic: concrete folds inline, symbolic creates UOp graph.
+        // o_[j] = ceildiv(i_[j] - dilation[j] * (kernel[j] - 1), stride[j])
+        let o_: Vec<SInt> =
+            (0..n_spatial).map(|j| (&i_[j] - dilation[j] * (kernel[j] - 1)).ceildiv(&SInt::from(stride[j]))).collect();
 
-        let f_: Vec<usize> =
-            (0..n_spatial).map(|j| 1.max(usize::div_ceil(o_[j] * stride[j] - dilation[j], i_[j]))).collect();
+        // f_[j] = max(1, ceildiv(o_[j] * stride[j] - dilation[j], i_[j]))
+        let f_: Vec<SInt> = (0..n_spatial)
+            .map(|j| SInt::from(1usize).smax(&(&o_[j] * stride[j] - dilation[j]).ceildiv(&i_[j])))
+            .collect();
 
-        // Batch dims use -1 (Infer/keep) in reshape and None-equivalent in shrink.
-        // Matches Tinygrad's `noop = [None] * (self.ndim - len(k_))` pattern.
-        let noop_shrink: Vec<Option<(isize, isize)>> = vec![None; n_batch];
+        // Batch dims: None in shrink (identity), SInt in reshape.
+        let noop: Vec<Option<(SInt, SInt)>> = vec![None; n_batch];
+        let batch_sint: Vec<SInt> = shape.iter().take(n_batch).cloned().collect();
 
         // Step 1: repeat
-        let mut repeats: Vec<usize> = vec![1; n_batch];
+        // repeat_count = ceildiv(k * (i*f + d), i)
+        let mut repeats: Vec<SInt> = vec![SInt::from(1usize); n_batch];
         for j in 0..n_spatial {
-            repeats.push(usize::div_ceil(kernel[j] * (i_[j] * f_[j] + dilation[j]), i_[j]));
+            repeats.push((kernel[j] * (&i_[j] * &f_[j] + dilation[j])).ceildiv(&i_[j]));
         }
         let mut x = self.repeat(&repeats)?;
 
-        // Step 2: shrink to exact needed size (batch dims pass through)
-        let mut shrink_ranges: Vec<Option<(isize, isize)>> = noop_shrink.clone();
+        // Step 2: shrink to exact needed size
+        let mut shrink: Vec<Option<(SInt, SInt)>> = noop.clone();
         for j in 0..n_spatial {
-            shrink_ranges.push(Some((0, (kernel[j] * (i_[j] * f_[j] + dilation[j])) as isize)));
+            shrink.push(Some((SInt::from(0usize), kernel[j] * (&i_[j] * &f_[j] + dilation[j]))));
         }
-        x = x.try_shrink(&shrink_ranges)?;
-
-        // Batch dims as SInt (preserves symbolic batch, concrete channel).
-        let batch_sint: Vec<SInt> = shape.iter().take(n_batch).cloned().collect();
+        x = x.try_shrink(shrink)?;
 
         // Step 3: reshape to interleave kernel and spatial dims
         let mut reshape_dims: Vec<SInt> = batch_sint.clone();
         for j in 0..n_spatial {
             reshape_dims.push(kernel[j].into());
-            reshape_dims.push((i_[j] * f_[j] + dilation[j]).into());
+            reshape_dims.push(&i_[j] * &f_[j] + dilation[j]);
         }
-        x = x.try_reshape(&reshape_dims)?;
+        x = x.try_reshape(reshape_dims)?;
 
         // Step 4: shrink for stride
-        let mut shrink_ranges: Vec<Option<(isize, isize)>> = noop_shrink.clone();
+        let mut shrink: Vec<Option<(SInt, SInt)>> = noop.clone();
         for j in 0..n_spatial {
-            shrink_ranges.push(Some((0, kernel[j] as isize)));
-            shrink_ranges.push(Some((0, (o_[j] * stride[j]) as isize)));
+            shrink.push(Some((SInt::from(0usize), SInt::from(kernel[j]))));
+            shrink.push(Some((SInt::from(0usize), &o_[j] * stride[j])));
         }
-        x = x.try_shrink(&shrink_ranges)?;
+        x = x.try_shrink(shrink)?;
 
         // Step 5: reshape to separate stride: K_j, o_j, S_j
         let mut reshape_dims: Vec<SInt> = batch_sint.clone();
         for j in 0..n_spatial {
             reshape_dims.push(kernel[j].into());
-            reshape_dims.push(o_[j].into());
+            reshape_dims.push(o_[j].clone());
             reshape_dims.push(stride[j].into());
         }
-        x = x.try_reshape(&reshape_dims)?;
+        x = x.try_reshape(reshape_dims)?;
 
         // Step 6: shrink stride dim to 1
-        let mut shrink_ranges: Vec<Option<(isize, isize)>> = noop_shrink.clone();
+        let mut shrink: Vec<Option<(SInt, SInt)>> = noop.clone();
         for j in 0..n_spatial {
-            shrink_ranges.push(Some((0, kernel[j] as isize)));
-            shrink_ranges.push(Some((0, o_[j] as isize)));
-            shrink_ranges.push(Some((0, 1)));
+            shrink.push(Some((SInt::from(0usize), SInt::from(kernel[j]))));
+            shrink.push(Some((SInt::from(0usize), o_[j].clone())));
+            shrink.push(Some((SInt::from(0usize), SInt::from(1usize))));
         }
-        x = x.try_shrink(&shrink_ranges)?;
+        x = x.try_shrink(shrink)?;
 
         // Step 7: reshape to collapse stride dim
         let mut reshape_dims: Vec<SInt> = batch_sint.clone();
         for j in 0..n_spatial {
             reshape_dims.push(kernel[j].into());
-            reshape_dims.push(o_[j].into());
+            reshape_dims.push(o_[j].clone());
         }
-        x = x.try_reshape(&reshape_dims)?;
+        x = x.try_reshape(reshape_dims)?;
 
         // Step 8: permute to move kernel dims to end
         let mut perm: Vec<isize> = (0..n_batch as isize).collect();
@@ -215,7 +219,7 @@ impl Tensor {
 
         let shape = self.shape()?;
         let n_batch = shape.len() - n_spatial;
-        let input_spatial: Vec<usize> = (0..n_spatial).map(|j| shape[n_batch + j].as_const().unwrap()).collect();
+        let input_spatial: Vec<SInt> = shape[n_batch..].to_vec();
 
         let reg_pads = padding.to_vec();
         let ceil_pads = if ceil_mode {
@@ -332,7 +336,7 @@ impl Tensor {
         let pads = if ceil_mode {
             let shape = self.shape()?;
             let n_batch = shape.len() - n_spatial;
-            let input_spatial: Vec<usize> = (0..n_spatial).map(|j| shape[n_batch + j].as_const().unwrap()).collect();
+            let input_spatial: Vec<SInt> = shape[n_batch..].to_vec();
             apply_ceil_mode(padding, &input_spatial, kernel_size, stride, dilation)
         } else {
             padding.to_vec()
@@ -396,7 +400,7 @@ impl Tensor {
         let n_batch = shape.len() - n_spatial;
 
         let pads = if ceil_mode {
-            let input_spatial: Vec<usize> = (0..n_spatial).map(|j| shape[n_batch + j].as_const().unwrap()).collect();
+            let input_spatial: Vec<SInt> = shape[n_batch..].to_vec();
             apply_ceil_mode(padding, &input_spatial, kernel_size, stride, dilation)
         } else {
             padding.to_vec()
