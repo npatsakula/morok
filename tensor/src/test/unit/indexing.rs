@@ -311,7 +311,7 @@ fn test_gather_dtype_preserved() {
 fn test_shrink_1d() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
 
-    let sliced = t.try_shrink(&[(1, 4)]).unwrap();
+    let sliced = t.try_shrink([(1, 4)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![3]);
 }
 
@@ -319,7 +319,7 @@ fn test_shrink_1d() {
 fn test_shrink_2d() {
     let t = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
 
-    let sliced = t.try_shrink(&[(0, 1), (1, 3)]).unwrap();
+    let sliced = t.try_shrink([(0, 1), (1, 3)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![1, 2]);
 }
 
@@ -328,7 +328,7 @@ fn test_shrink_negative_indices() {
     let t = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0, 5.0]);
 
     // -3 to -1 should give elements [3, 4]
-    let sliced = t.try_shrink(&[(-3, -1)]).unwrap();
+    let sliced = t.try_shrink([(-3, -1)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![2]);
 }
 
@@ -337,7 +337,7 @@ fn test_shrink_full_dimension() {
     let t = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
 
     // Keep full first dim, slice second
-    let sliced = t.try_shrink(&[(0, 2), (1, 3)]).unwrap();
+    let sliced = t.try_shrink([(0, 2), (1, 3)]).unwrap();
     assert_eq!(get_shape(&sliced), vec![2, 2]);
 }
 

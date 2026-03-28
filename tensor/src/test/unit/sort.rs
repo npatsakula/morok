@@ -79,7 +79,7 @@ crate::codegen_tests! {
         // Let me just check the result is all valid (non-zero, positive)
         let vals = crossover.as_vec::<f32>().unwrap();
         for (i, &v) in vals.iter().enumerate() {
-            assert!(v >= 1.0 && v <= 8.0, "position {i} has invalid value {v} (expected 1.0-8.0)");
+            assert!((1.0..=8.0).contains(&v), "position {i} has invalid value {v} (expected 1.0-8.0)");
         }
     }
 
