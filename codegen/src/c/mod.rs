@@ -233,8 +233,15 @@ impl crate::Renderer for CRenderer {
         }
 
         // Render all instructions
+        // Skip NOOP and GROUP — they are structural no-ops (Tinygrad cstyle.py:175)
         let mut kernel_body: Vec<String> = Vec::new();
         for node in &nodes {
+            if matches!(node.op(), Op::Noop | Op::Group { .. }) {
+                // Register with empty string so downstream UNROLL/CONTRACT can alias them.
+                // Matches LLVM backend behavior — these are structural no-ops.
+                ctx.register(node.id, String::new());
+                continue;
+            }
             if let Op::Range { axis_type, .. } = node.op()
                 && matches!(axis_type, AxisType::Thread)
             {

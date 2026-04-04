@@ -1,21 +1,10 @@
-//! Devectorize pass for contiguous memory access optimization.
+//! Devectorize pass — single-pass combined matcher matching Tinygrad's `pm_devectorize`.
 //!
-//! Transforms vectorized INDEX into grouped consecutive accesses (PTRCAT) after expansion.
+//! Composition: `sym + devectorize + load_store_folding + correct_load_store + load_store_indexing`
 //!
-//! # Multi-Pass Architecture
-//!
-//! The devectorize pass uses a multi-pass architecture to ensure pattern dependencies
-//! are respected by the bottom-up rewrite engine:
-//!
-//! - **Phase 1**: Devectorize ALU/WMMA/buffers + expand vector INDEX → GEP(PTRCAT)
-//! - **Phase 2**: Move GEP through LOAD/STORE → creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT))
-//! - **Phase 3**: Distribute PTRCAT through LOAD/STORE → LOAD(PTRCAT) → CAT(LOADs)
-//! - **Phase 4**: Split loads/stores by device fold lengths + drop true gates
-//!
-//! This separation is necessary because the bottom-up rewrite engine processes children
-//! first, then does fixed-point matching on the result. When `move_gep_after_load`
-//! transforms `LOAD(GEP(PTRCAT))` to `GEP(LOAD(PTRCAT))`, the inner `LOAD(PTRCAT)` needs
-//! to be matched by `distribute_ptrcat_load` in a subsequent pass.
+//! All patterns run in one `graph_rewrite` call with fixed-point convergence.
+//! PtrCat is an intermediate created by `fold_expanded_index` and eliminated by
+//! `distribute_ptrcat_load/store` within the same pass. It must never reach codegen.
 //!
 //! # pm_render (called AFTER devectorize)
 //!
@@ -26,6 +15,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use itertools::Itertools;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
@@ -128,7 +118,7 @@ pub fn merge_sibling_ends(sink: &Arc<UOp>) -> Arc<UOp> {
 }
 
 use crate::rewrite::graph_rewrite;
-use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple};
+use crate::symbolic::patterns::sym;
 
 // ============================================================================
 // Main Entry Point
@@ -136,35 +126,16 @@ use crate::symbolic::patterns::{gep_pushing_patterns, symbolic, symbolic_simple}
 
 /// Run devectorize pass. Call AFTER `pre_expand`, BEFORE codegen.
 ///
-/// Uses multi-pass architecture to ensure pattern dependencies are respected:
-/// - Phase 1: Devectorize ALU/WMMA/buffers + expand vector INDEX → GEP(PTRCAT)
-/// - Phase 2: Move GEP through LOAD/STORE (creates LOAD(PTRCAT) from LOAD(GEP(PTRCAT)))
-/// - Phase 3: Distribute PTRCAT through LOAD/STORE (LOAD(PTRCAT) → CAT(LOADs))
-/// - Phase 4: Split loads/stores by device fold lengths + drop true gates
+/// Single-pass combined matcher (Tinygrad `pm_devectorize`):
+/// sym + devectorize + load_store_folding + correct_load_store + load_store_indexing
 ///
 /// Note: `bool_storage_patterns()` called separately (backend-specific).
 /// Note: `pm_render()` should be applied AFTER this pass.
 pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
-    use std::sync::LazyLock;
-
-    // Single combined pass: devectorize + GEP movement + load/store fixup.
-    // Tinygrad uses one pass (sym + devectorize + load_store_folding + ...).
-    // The rewrite engine's fixed-point iteration handles pattern ordering.
-    //
-    // Uses symbolic_simple() instead of symbolic() for performance:
-    // symbolic() adds vmin_vmax_collapse, pm_simplify_valid, etc. which are
-    // expensive on large devectorized trees (10K+ nodes) but rarely productive.
-    // The full symbolic() already ran in post-opt; devectorize only needs basic
-    // algebraic simplification + gep_pushing for the newly expanded scalar ops.
     static COMBINED: LazyLock<TypedPatternMatcher> = LazyLock::new(|| {
-        symbolic_simple()
-            + gep_pushing_patterns()
+        sym()
             + devectorize_patterns()
-            + expand_index_patterns()
-            + gep_simplification_patterns()
-            + gep_movement_patterns()
-            + ptrcat_distribution_patterns()
-            + contiguous_gep_load_patterns()
+            + load_store_folding_patterns()
             + correct_load_store_patterns()
             + load_store_indexing_patterns()
     });
@@ -801,12 +772,12 @@ fn no_vectorized_index(
     } else {
         // Vector path: expand each lane by cnt elements
         // idx = [a, b, c], cnt = 3 → [a*3+0, a*3+1, a*3+2, b*3+0, b*3+1, b*3+2, c*3+0, c*3+1, c*3+2]
-        let cnt_const = UOp::index_const(cnt as i64);
         let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
             .flat_map(|i| {
                 let lane = idx.gep(vec![i]);
+                let cnt_const = UOp::const_(lane.dtype(), ConstValue::Int(cnt as i64));
                 let scaled = lane.mul(&cnt_const);
-                (0..cnt).map(move |j| scaled.add(&UOp::index_const(j as i64)))
+                (0..cnt).map(move |j| scaled.add(&UOp::const_(scaled.dtype(), ConstValue::Int(j as i64))))
             })
             .collect();
         UOp::vectorize(elements)
@@ -886,14 +857,14 @@ fn no_vectorized_index_precnt(
         let total = per_lane * idx_vcount;
 
         let buf_broadcast = buf.broadcast(total);
-        let cnt_const = UOp::index_const(cnt as i64);
         let elements: SmallVec<[Arc<UOp>; 4]> = (0..idx_vcount)
             .flat_map(|i| {
                 let lane = idx.gep(vec![i]);
+                let cnt_const = UOp::const_(lane.dtype(), ConstValue::Int(cnt as i64));
                 let scaled = lane.mul(&cnt_const);
                 (0..cnt).flat_map(move |c| {
                     let s = scaled.clone();
-                    input_gep.iter().map(move |&y| s.add(&UOp::index_const((c + y) as i64)))
+                    input_gep.iter().map(move |&y| s.add(&UOp::const_(s.dtype(), ConstValue::Int((c + y) as i64))))
                 })
             })
             .collect();
@@ -1000,134 +971,33 @@ pub fn pm_wmma_accumulate() -> &'static TypedPatternMatcher {
 // ============================================================================
 // Load Store Folding Patterns (devectorizer.py:114-126)
 // ============================================================================
-//
-// Multi-pass architecture: The patterns are split into phases because the
-// bottom-up rewrite engine processes children before parents and does fixed-point
-// matching on the result. When patterns create nested structures (e.g., GEP(LOAD(PTRCAT))),
-// inner patterns may not match if they're in the same pass.
-//
-// Phase order:
-// 1. expand_index: vector INDEX → GEP(PTRCAT)
-// 2. gep_movement: LOAD(GEP(PTRCAT)) → GEP(LOAD(PTRCAT))
-// 3. ptrcat_distribution: LOAD(PTRCAT) → CAT(LOADs)
-
-/// Phase 1: Expand vector INDEX into GEP(PTRCAT) groupings.
-fn expand_index_patterns() -> &'static TypedPatternMatcher {
+/// Tinygrad load_store_folding (devectorizer.py:119-132).
+/// 6 patterns in one matcher, exactly matching Tinygrad's order.
+pub fn load_store_folding_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        index if is_vector_index(index) => expand_vector_index(index),
-    }
-}
+        // 1. expand_index: INDEX(VECTORIZE(buf), vec) → VECTORIZE(INDEX(buf, gep(0)), ...)
+        index if is_vector_index(index) => expand_index_to_vectorize(index),
 
-/// GEP simplification: identity elimination and GEP-of-GEP folding.
-///
-/// Identity GEP `GEP(x, [0,1,...,n-1])` where n == x.vcount is a no-op.
-/// GEP-of-GEP `GEP(GEP(x, outer), inner)` composes into `GEP(x, [outer[i] for i in inner])`.
-///
-/// These must run in Phase 2 because `move_gep_on_store` creates identity GEPs
-/// that block `contiguous_gep_load_patterns` from matching.
-fn gep_simplification_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // Identity GEP: GEP(x, [0,1,...,n-1]) → x
-        Gep { vector, indices } if is_identity_gep(vector, indices) => Some(vector.clone()),
+        // 2. fold_expanded_index: VECTORIZE(INDEX, INDEX, ...) → GEP(PTRCAT(...), indices)
+        midx @ Vectorize { elements } if elements.iter().all(|e| matches!(e.op(), Op::Index { .. }))
+            => fold_expanded_index(midx),
 
-        // GEP(GEP(x, outer), inner) → GEP(x, composed)
-        Gep { vector: Gep { vector: inner_vec, indices: outer_indices }, indices: inner_indices }
-            => |inner_vec, outer_indices, inner_indices| {
-                let composed: Vec<usize> = inner_indices.iter()
-                    .filter_map(|&i| outer_indices.get(i).copied())
-                    .collect();
-                if composed.len() != inner_indices.len() { return None; }
-                Some(inner_vec.gep(composed))
-            },
-    }
-}
-
-/// Phase 2: Move GEP through LOAD/STORE.
-fn gep_movement_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // GEP after LOAD: LOAD(GEP(x)) → GEP(LOAD(x))
+        // 3. GEP after LOAD: LOAD(buf, GEP(x)) → GEP(LOAD(buf, x))
         load @ Load { buffer, index: Gep { vector, indices } }
             => move_gep_after_load(load, buffer, vector, indices),
 
-        // GEP on STORE: STORE(GEP(x), data) → STORE(x, GEP⁻¹(data))
+        // 4. GEP on STORE: STORE(GEP(x), data) → STORE(x, GEP⁻¹(data))
         Store { index: Gep { vector, indices }, value, ranges }
             => move_gep_on_store(vector, indices, value, ranges),
-    }
-}
 
-/// Phase 3: Distribute PTRCAT through LOAD/STORE.
-fn ptrcat_distribution_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        // PTRCAT after LOAD: LOAD(PTRCAT(a,b)) → CAT(LOAD(a), LOAD(b))
-        load @ Load { buffer, index: ptrcat @ PtrCat { sources }, alt: None }
+        // 5. PTRCAT after LOAD: LOAD(buf, PTRCAT) → CAT(LOAD(buf_i, ptr_i), ...)
+        load @ Load { buffer, index: ptrcat @ PtrCat { sources } }
             => distribute_ptrcat_load(load, buffer, ptrcat, sources),
 
-        // PTRCAT after STORE
+        // 6. PTRCAT after STORE: STORE(PTRCAT, data) → GROUP(STORE(ptr_i, gep(data, i)), ...)
         Store { index: PtrCat { sources }, value, ranges }
             => distribute_ptrcat_store(sources, value, ranges),
     }
-}
-
-/// Contiguous GEP on LOAD → direct sub-vector LOAD.
-///
-/// Transforms `GEP(LOAD(INDEX(buf)), [start..start+N])` into
-/// `LOAD(INDEX(buf, offset+start), dtype=vec<N>)`, avoiding scalar decomposition.
-///
-/// Uses scalar element dtype for the INDEX so the GEP strides by single elements,
-/// even when the buffer base type is a vector (e.g., DEFINE_REG_TYPED(1, vec256)).
-fn contiguous_gep_load_patterns() -> &'static TypedPatternMatcher {
-    crate::cached_patterns! {
-        Gep { vector: load @ Load { buffer, index, alt: None }, indices }
-            if indices.len() > 1
-            && is_contiguous_indices(indices).is_some()
-            && matches!(index.op(), Op::Index { .. })
-            => |load, buffer, index, indices| {
-                let start = indices[0];
-                let count = indices.len();
-                let Op::Index { buffer: buf, indices: orig_indices, gate } = index.op() else {
-                    return None;
-                };
-                let scalar_dtype = load.dtype().scalar_dtype();
-                let new_first = if start == 0 {
-                    orig_indices[0].clone()
-                } else {
-                    let offset = orig_indices[0].const_like(start as i64);
-                    orig_indices[0].add(&offset)
-                };
-                let new_indices: SmallVec<[Arc<UOp>; 4]> = std::iter::once(new_first)
-                    .chain(orig_indices[1..].iter().cloned())
-                    .collect();
-                // Use Ptr dtype with scalar base so:
-                // 1. pm_add_loads skips this INDEX (is_ptr_or_image_dtype → true)
-                // 2. MLIR codegen extracts scalar base for GEP element type (correct stride)
-                let idx_dtype = match buf.dtype() {
-                    DType::Ptr { addrspace, size, .. } => DType::Ptr {
-                        base: Box::new(scalar_dtype.clone()),
-                        addrspace,
-                        size,
-                        vcount: 1,
-                    },
-                    _ => scalar_dtype.clone(),
-                };
-                let new_index = UOp::index()
-                    .buffer(buf.clone())
-                    .indices(new_indices)
-                    .maybe_gate(gate.clone())
-                    .dtype(idx_dtype)
-                    .call()
-                    .ok()?;
-                Some(UOp::load().buffer(buffer.clone()).index(new_index).dtype(scalar_dtype.vec(count)).call())
-            },
-    }
-}
-
-/// Combined load/store folding patterns (for backward compatibility).
-/// Prefer using `devectorize()` which applies these in proper phase order.
-pub fn load_store_folding_patterns() -> &'static TypedPatternMatcher {
-    use std::sync::LazyLock;
-    static CACHED: LazyLock<TypedPatternMatcher> =
-        LazyLock::new(|| expand_index_patterns() + gep_movement_patterns() + ptrcat_distribution_patterns());
-    &CACHED
 }
 
 // ============================================================================
@@ -1156,12 +1026,6 @@ pub fn correct_load_store_patterns() -> &'static TypedPatternMatcher {
 
 fn is_define_or_after(uop: &Arc<UOp>) -> bool {
     matches!(uop.unwrap_after().op(), Op::DefineLocal(_) | Op::DefineReg { .. } | Op::DefineGlobal(_))
-}
-
-/// Check if GEP indices are contiguous `[start, start+1, ..., start+N-1]`.
-fn is_contiguous_indices(indices: &[usize]) -> Option<usize> {
-    let &start = indices.first()?;
-    indices.iter().enumerate().all(|(i, &idx)| idx == start + i).then_some(start)
 }
 
 /// Matches INDEX(VECTORIZE(Defines.or_after()), vec_idx) only.
@@ -1219,14 +1083,16 @@ fn move_gep_on_store(
 // ============================================================================
 
 /// Vector INDEX → grouped PTRCAT. Generates scalar indices, simplifies, groups by root+offset.
-fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
+/// Phase 1a: Expand vector INDEX into VECTORIZE of scalar INDEXes.
+/// Matches Tinygrad's `expand_index` (devectorizer.py:59-62).
+/// NO inner rewrite — the outer fixed-point (sym) simplifies GEP expressions.
+fn expand_index_to_vectorize(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Index { buffer, indices, gate } = index.op() else { return None };
     let vec = indices.first()?;
     let count = vec.dtype().vcount();
 
     let buf = if let Op::Vectorize { elements } = buffer.op() { elements.first()?.clone() } else { buffer.clone() };
 
-    // Generate scalar INDEX ops and simplify.
     let scalar_indices: Vec<_> = (0..count)
         .map(|i| {
             let lane_gate = gate.as_ref().map(|g| if g.dtype().vcount() > 1 { g.gep(vec![i]) } else { g.clone() });
@@ -1240,18 +1106,31 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         })
         .collect();
 
-    use std::sync::LazyLock;
-    static EXPAND_IDX_PM: LazyLock<TypedPatternMatcher> = LazyLock::new(|| symbolic() + load_store_indexing_patterns());
-    let midx = graph_rewrite(&*EXPAND_IDX_PM, UOp::sink(scalar_indices), &mut ());
-    let Op::Sink { sources } = midx.op() else { return None };
+    Some(UOp::vectorize(scalar_indices.into()))
+}
+
+/// Phase 1b: Fold VECTORIZE of scalar INDEXes into PTRCAT groupings.
+/// Matches Tinygrad's `fold_expanded_index` (devectorizer.py:64-100).
+/// By this point, the outer sym fixed-point has simplified GEP expressions
+/// into concrete root+offset form so grouping can identify consecutive accesses.
+fn fold_expanded_index(midx: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Vectorize { elements: sources } = midx.op() else { return None };
+    let count = sources.len();
+    if count == 0 {
+        return None;
+    }
+
+    // Verify all elements are INDEX and share the same buffer
+    let first_buf = match sources[0].op() {
+        Op::Index { buffer, .. } => buffer,
+        _ => return None,
+    };
+    if !sources.iter().all(|s| matches!(s.op(), Op::Index { buffer, .. } if Arc::ptr_eq(buffer, first_buf))) {
+        return None;
+    }
+    let buf = first_buf;
 
     // Extract (valid, root, offset, gate) for each lane.
-    // Gate is included in the grouping key so lanes with different gates (e.g., valid vs invalid
-    // from padding) are grouped separately. This ensures PTRCAT groups have uniform gate values.
-    //
-    // Important: collect all lane data first to keep Arc<UOp> refs alive. Temporary UOps
-    // (e.g. const(true) from get_valid()) would get GC'd between loop iterations via the
-    // weak-ref hash consing cache, producing different ids for structurally identical nodes.
     struct LaneData {
         valid: Arc<UOp>,
         root: Arc<UOp>,
@@ -1267,7 +1146,6 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         let gate_id = lane_gate.as_ref().map_or(u64::MAX, |g| g.id);
 
         let (root, offset) = match idx.op() {
-            // Invalid grouped separately (devectorizer.py:72-77)
             Op::Invalid => (UOp::invalid_marker(), 0),
             Op::Binary(BinaryOp::Add, l, r) if matches!(r.op(), Op::Const(cv) if matches!(cv.0, ConstValue::Int(_))) => {
                 let Op::Const(cv) = r.op() else { unreachable!() };
@@ -1289,7 +1167,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         lane_data.push((lane, LaneData { valid, root, offset, gate_id }));
     }
 
-    // Now build grouping map — all Arcs are alive so ids are stable
+    // Build grouping map
     let mut offsets_by_root: HashMap<(u64, u64, u64), HashMap<i64, Vec<usize>>> = HashMap::new();
     for (lane, data) in &lane_data {
         let key = (data.valid.id, data.root.id, data.gate_id);
@@ -1305,7 +1183,7 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         let groups = group_consecutive_offsets_from_map(offsets);
         for grp in groups {
             let lidx = sources[offsets[&grp[0]][0]].clone();
-            let ptr = if grp.len() > 1 { lidx.cast(make_vec_ptr_dtype(&buf, grp.len())) } else { lidx };
+            let ptr = if grp.len() > 1 { lidx.cast(make_vec_ptr_dtype(buf, grp.len())) } else { lidx };
             for (i, &offset) in grp.iter().enumerate() {
                 for &lane in &offsets[&offset] {
                     idxs[lane] = Some(global_offset + i);
@@ -1320,7 +1198,6 @@ fn expand_vector_index(index: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    // Create PTRCAT with vec(global_offset) of scalar pointers
     let DType::Ptr { base, addrspace, size, .. } = buf.dtype().clone() else { return None };
     let scalar_ptr = DType::Ptr { base: Box::new(DType::Scalar(base.scalar()?)), addrspace, size, vcount: 1 };
     let ptrcat_dtype = scalar_ptr.vec(global_offset);
@@ -1365,29 +1242,45 @@ fn make_vec_ptr_dtype(buffer: &Arc<UOp>, vec_len: usize) -> DType {
 // ============================================================================
 
 /// LOAD(PTRCAT) → CAT(LOADs). CAT dtype = ptrcat.dtype.base.vec(ptrcat.dtype.vcount)
+/// LOAD(buf, PTRCAT(idx0,idx1,...)) → CAT(LOAD(buf_i, idx_i), ...)
+///
+/// Matches Tinygrad devectorizer.py:128-129:
+///   ld.replace(dtype=x.dtype.base, src=(x,)+ld.src[1:]) for x in cat.src
+///
+/// Each PtrCat source is a scalar INDEX(buf, offset). The distributed scalar
+/// LOAD uses that INDEX directly, with the scalar buffer from GEP(buffer, i).
 fn distribute_ptrcat_load(
-    _load: &Arc<UOp>,
+    load: &Arc<UOp>,
     buffer: &Arc<UOp>,
     ptrcat: &Arc<UOp>,
     sources: &[Arc<UOp>],
 ) -> Option<Arc<UOp>> {
     let loads: Vec<Arc<UOp>> = sources
         .iter()
-        .map(|ptr| {
-            // Tinygrad: ld.replace(dtype=x.dtype.base, ...) - preserves vec type
-            // If ptr is ptr<vec4<float>>, load dtype should be vec4<float>, NOT scalar float
+        .enumerate()
+        .map(|(i, ptr)| {
             let load_dtype = match ptr.dtype() {
                 DType::Ptr { base, .. } => base.as_ref().clone(),
                 other => other.clone(),
             };
-            UOp::load().buffer(buffer.clone()).index(ptr.clone()).dtype(load_dtype).call()
+            // Extract scalar buffer for this lane.
+            // Tinygrad: ld.replace(src=(x,)+ld.src[1:]) — PtrCat source IS the full
+            // INDEX(buf, idx), so the scalar load doesn't need the outer buffer at all.
+            // Each PtrCat source already contains its own buffer reference.
+            // For VECTORIZE(buf, buf, ...) just use the scalar element.
+            let scalar_buf = match buffer.op() {
+                Op::Vectorize { elements, .. } => elements.get(i).cloned().unwrap_or_else(|| buffer.clone()),
+                _ => buffer.clone(),
+            };
+            let alt = match load.op() {
+                Op::Load { alt, .. } => alt.clone(),
+                _ => None,
+            };
+            UOp::load().buffer(scalar_buf).index(ptr.clone()).maybe_alt(alt).dtype(load_dtype).call()
         })
         .collect();
 
-    let ptrcat_vcount = ptrcat.dtype().vcount();
-    let base_scalar = ptrcat.dtype().base();
-    let cat_dtype = DType::Scalar(base_scalar).vec(ptrcat_vcount);
-
+    let cat_dtype = DType::Scalar(ptrcat.dtype().base()).vec(ptrcat.dtype().vcount());
     Some(UOp::cat().sources(loads).dtype(cat_dtype).call())
 }
 

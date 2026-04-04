@@ -85,7 +85,7 @@ impl UOp {
             // Tinygrad avoids this because their BUFFER carries shape natively and their
             // rangeify handles bare BUFFER → INDEX directly.
             if src_shape.as_slice() == new_shape.as_slice()
-                && !matches!(self.op(), crate::Op::Buffer { .. } | crate::Op::Const(_))
+                && !matches!(self.op(), crate::Op::Buffer { .. } | crate::Op::Param { .. } | crate::Op::Const(_))
             {
                 return Ok(self.clone());
             }

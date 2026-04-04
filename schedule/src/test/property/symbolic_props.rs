@@ -13,7 +13,7 @@ use morok_ir::uop::properties::VminVmaxProperty;
 use morok_ir::{Op, UOp};
 
 use crate::rewrite::graph_rewrite;
-use crate::symbolic::symbolic_simple;
+use crate::symbolic::{symbolic, symbolic_simple};
 
 // Import generators from ir crate
 use morok_ir::test::property::generators::*;
@@ -257,7 +257,7 @@ proptest! {
     fn self_eq_true(x in arb_var_uop(DType::Int32)) {
         let expr = x.try_cmpeq(&x).unwrap();
 
-        let matcher = symbolic_simple();
+        let matcher = symbolic();
         let simplified = graph_rewrite(&matcher, expr, &mut ());
 
         match simplified.op() {
@@ -426,7 +426,7 @@ proptest! {
         let div1 = a.try_div(&b_uop).unwrap();
         let div2 = div1.try_div(&c_uop).unwrap();
 
-        let matcher = symbolic_simple();
+        let matcher = symbolic();
         let simplified = graph_rewrite(&matcher, div2, &mut ());
 
         // Should simplify to a // (b * c)
@@ -457,7 +457,7 @@ proptest! {
         let mul1 = a.try_mul(&b_uop).unwrap();
         let mul2 = mul1.try_mul(&c_uop).unwrap();
 
-        let matcher = symbolic_simple();
+        let matcher = symbolic();
         let simplified = graph_rewrite(&matcher, mul2, &mut ());
 
         // Should simplify to a * (b * c)
@@ -518,7 +518,7 @@ proptest! {
         let add1 = a.try_add(&b_uop).unwrap();
         let add2 = add1.try_add(&c_uop).unwrap();
 
-        let matcher = symbolic_simple();
+        let matcher = symbolic();
         let simplified = graph_rewrite(&matcher, add2, &mut ());
 
         // Should simplify to a + (b + c), a - |b+c|, or just a when b+c=0
@@ -561,7 +561,7 @@ proptest! {
         let sub1 = a.try_sub(&b_uop).unwrap();
         let sub2 = sub1.try_sub(&c_uop).unwrap();
 
-        let matcher = symbolic_simple();
+        let matcher = symbolic();
         let simplified = graph_rewrite(&matcher, sub2, &mut ());
 
         // Should simplify to a - (b + c)

@@ -82,37 +82,6 @@ pub fn apply_cast_after(uop: &Arc<UOp>) -> Arc<UOp> {
 }
 
 // =============================================================================
-// Legacy Phase Names (Backward Compatibility)
-// =============================================================================
-
-/// Legacy name for load_store_folding patterns (Phase 1).
-///
-/// Includes expand_index patterns.
-pub fn apply_phase1(uop: &Arc<UOp>) -> Arc<UOp> {
-    apply_load_store_folding(uop)
-}
-
-/// Legacy name for load_store_folding + correct_load_store + pm_render patterns (Phase 2).
-///
-/// Includes: GEP movement, PTRCAT distribution, split patterns, and GEP/CAT normalization.
-pub fn apply_phase2(uop: &Arc<UOp>) -> Arc<UOp> {
-    let patterns = load_store_folding_patterns() + correct_load_store_patterns() + pm_render();
-    graph_rewrite(&patterns, uop.clone(), &mut ())
-}
-
-/// Legacy name for bool_storage patterns (Phase 3).
-pub fn apply_phase3(uop: &Arc<UOp>) -> Arc<UOp> {
-    apply_bool_storage(uop)
-}
-
-/// Legacy name for pm_render patterns.
-///
-/// (Was gep_ptrcat_patterns)
-pub fn apply_gep_ptrcat_patterns(uop: &Arc<UOp>) -> Arc<UOp> {
-    apply_pm_render(uop)
-}
-
-// =============================================================================
 // Buffer Builders
 // =============================================================================
 

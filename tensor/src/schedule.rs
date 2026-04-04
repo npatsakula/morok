@@ -244,7 +244,7 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
 /// - Buffer not found in registry for a kernel source
 pub fn create_schedule(
     transformed: Arc<UOp>,
-    kernel_ctx: KernelContext,
+    kernel_ctx: &KernelContext,
     input_buffers: &InputBuffers,
     var_vals: &HashMap<String, i64>,
 ) -> Result<ScheduleResult> {
@@ -408,8 +408,8 @@ fn find_first_input_buffer_device(
 
     for src in sources {
         match src.op() {
-            // Direct input buffer
-            Op::Buffer { .. } => {
+            // Direct input buffer (BUFFER or PARAM)
+            Op::Buffer { .. } | Op::Param { .. } => {
                 // Try allocated_buffers, then input_buffers (no registry needed)
                 let buffer = allocated_buffers.get(&src.id).cloned().or_else(|| input_buffers.get(&src.id).cloned());
                 if let Some(buffer) = buffer {
@@ -634,8 +634,8 @@ fn collect_kernel_buffers(
                 buffers.push(buffer);
                 uop_ids.push(src.id);
             }
-            Op::Buffer { size, .. } => {
-                // BUFFER can be either input (from input_buffers) or output (needs allocation)
+            Op::Buffer { size, .. } | Op::Param { size, .. } => {
+                // BUFFER/PARAM can be either input (from input_buffers) or output (needs allocation)
                 // Try input_buffers first, then allocated_buffers, then allocate new
                 if let Some(buffer) = input_buffers.get(&src.id).cloned() {
                     buffers.push(buffer);
@@ -645,7 +645,7 @@ fn collect_kernel_buffers(
                     uop_ids.push(src.id);
                 } else {
                     // Output buffer - allocate new buffer
-                    trace!(src.id = src.id, size, "Allocating output BUFFER");
+                    trace!(src.id = src.id, size, "Allocating output BUFFER/PARAM");
                     let scalar_dtype = src.dtype();
 
                     let buffer = Buffer::new(

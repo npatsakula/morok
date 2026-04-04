@@ -70,8 +70,8 @@ fn test_scheduler_shift_to_integration() {
                 found_reduce = true;
                 // Source should be expanded (CONTRACT or VECTORIZE)
                 assert!(
-                    matches!(src.op(), Op::Contract { .. } | Op::Vectorize { .. } | Op::Const(_)),
-                    "REDUCE.src should be CONTRACT/VECTORIZE/Const after expansion, got {:?}",
+                    matches!(src.op(), Op::Contract { .. } | Op::Vectorize { .. } | Op::Const(_) | Op::VConst { .. }),
+                    "REDUCE.src should be CONTRACT/VECTORIZE/Const/VConst after expansion, got {:?}",
                     src.op()
                 );
                 // Ranges should not contain arithmetic expressions

@@ -182,6 +182,10 @@ impl Renderer for LlvmTextRenderer {
         }
 
         for node in &nodes {
+            if matches!(node.op(), Op::Noop | Op::Group { .. }) {
+                ctx.register(node.id, String::new());
+                continue;
+            }
             if let Op::Range { axis_type, .. } = node.op()
                 && matches!(axis_type, AxisType::Thread)
             {

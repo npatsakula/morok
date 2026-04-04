@@ -74,8 +74,7 @@ fn test_gep_multiple_indices() {
 fn test_vconst_basic() {
     let values = vec![ConstValue::Float(1.0), ConstValue::Float(2.0), ConstValue::Float(3.0), ConstValue::Float(4.0)];
 
-    let vec = UOp::vconst(values);
-    // vconst infers dtype as Float64 vector
+    let vec = UOp::vconst(values, DType::Float64);
     assert_eq!(vec.dtype(), DType::Float64.vec(4));
 }
 

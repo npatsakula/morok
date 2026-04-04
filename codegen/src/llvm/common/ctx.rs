@@ -23,11 +23,20 @@ pub struct RenderContext {
     counter: usize,
     /// Pending reduce final loads: reduce_id -> (acc_ptr, dtype)
     pending_reduces: HashMap<u64, PendingReduce>,
+    /// Stack of currently open RANGE axis_ids (for correct END footer ordering).
+    /// Pushed on RANGE emission, popped on END emission.
+    range_stack: Vec<usize>,
 }
 
 impl RenderContext {
     pub fn new() -> Self {
-        Self { names: HashMap::new(), range_values: HashMap::new(), counter: 0, pending_reduces: HashMap::new() }
+        Self {
+            names: HashMap::new(),
+            range_values: HashMap::new(),
+            counter: 0,
+            pending_reduces: HashMap::new(),
+            range_stack: Vec::new(),
+        }
     }
 
     /// Get or create variable name for UOp.
@@ -123,6 +132,16 @@ impl RenderContext {
     /// Get a range value by axis_id.
     pub fn get_range(&self, axis_id: usize) -> Option<&str> {
         self.range_values.get(&axis_id).map(|s| s.as_str())
+    }
+
+    /// Push a range axis_id onto the open-range stack (called during RANGE codegen).
+    pub fn push_range(&mut self, axis_id: usize) {
+        self.range_stack.push(axis_id);
+    }
+
+    /// Pop the innermost open range axis_id (called during END codegen).
+    pub fn pop_range(&mut self) -> Option<usize> {
+        self.range_stack.pop()
     }
 
     /// Register a pending reduce final load.

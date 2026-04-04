@@ -477,7 +477,7 @@ fn flatten_bufferize(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Matches Tinygrad's pm_mops rule 2 (rangeify.py:28-29):
 ///   `UOp(r.op, r.dtype, (a.replace(src=(r.src[0],)+a.src[1:]),)+r.src[1:], r.arg)`
 /// Directly reuses the original movement op's parameters (no roundtrip/validation).
-fn push_movement_through_after(mop: &Arc<UOp>, deps: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+pub(crate) fn push_movement_through_after(mop: &Arc<UOp>, deps: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
     let inner_src = &mop.op().sources()[0];
     let new_after = inner_src.after(deps.clone());
     // Re-create the movement op with new_after as source, reusing original parameters.
@@ -518,7 +518,12 @@ pub(crate) fn transform_single_source(
     // Linearization is deferred to pm_linearize_multi_index.
     if matches!(
         src.op(),
-        Op::Buffer { .. } | Op::BufferView { .. } | Op::MStack { .. } | Op::MSelect { .. } | Op::After { .. }
+        Op::Buffer { .. }
+            | Op::Param { .. }
+            | Op::BufferView { .. }
+            | Op::MStack { .. }
+            | Op::MSelect { .. }
+            | Op::After { .. }
     ) {
         if !input_ranges.is_empty() {
             return UOp::index()
@@ -546,11 +551,19 @@ pub(crate) fn transform_single_source(
         let is_copy_consumer = matches!(consumer.op(), Op::Copy { .. });
         let is_always_contiguous_src = super::indexing::is_always_contiguous(src);
         let removable = !is_copy_consumer && !is_always_contiguous_src;
-        let opts = if output_ranges.len() == realize_axes.len() {
-            BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable }
-        } else {
-            BufferizeOpts { device: None, addrspace: AddrSpace::Local, removable }
-        };
+        let addrspace = if output_ranges.len() == realize_axes.len() { AddrSpace::Global } else { AddrSpace::Local };
+        tracing::debug!(
+            src_id = src.id,
+            src_op = src.op().as_ref(),
+            consumer_id = consumer.id,
+            consumer_op = consumer.op().as_ref(),
+            realize_axes = ?realize_axes,
+            output_ranges_len = output_ranges.len(),
+            addrspace = ?addrspace,
+            removable = removable,
+            "BUFFERIZE decision"
+        );
+        let opts = BufferizeOpts { device: None, addrspace, removable };
 
         let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges.clone(), opts);
 
@@ -1224,6 +1237,8 @@ pub(crate) fn cast_to_dtype(value: &Arc<UOp>, target_dtype: &morok_dtype::DType)
 /// - Merge: Create R_merged(128), decompose as R1 = merged // 8 and R2 = merged % 8
 /// - Accept: Only if this reduces or maintains the divmod count
 pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
+    use crate::passes::linearize_index::count_divmod;
+
     // Get ended ranges for this operation
     let ended_ranges = match u.op() {
         Op::End { computation: _, ranges } => ranges.clone(),
@@ -1236,7 +1251,6 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 
     // Collect all REDUCE operations in the backward slice (Tinygrad simplify.py:21)
-    // This ensures we only merge ranges that appear in consistent positions across all REDUCEs
     let reduce_ranges: Vec<SmallVec<[Arc<UOp>; 4]>> = u
         .toposort()
         .iter()
@@ -1246,12 +1260,15 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         })
         .collect();
 
-    // Try to merge adjacent pairs for END, or all permutations for REDUCE
+    // Cumulative merging (Tinygrad simplify.py:37: `u = nidx` inside loop)
+    // Try all pairs and accumulate successful merges into `current`.
+    let mut current = Arc::clone(u);
+    let mut changed = false;
+
+    // Re-extract ranges from current for each iteration
     let pairs: Vec<(usize, usize)> = if matches!(u.op(), Op::End { .. }) {
-        // For END: only try adjacent pairs (zip pattern from Tinygrad)
         (0..ended_ranges.len() - 1).map(|i| (i, i + 1)).collect()
     } else {
-        // For REDUCE: try all permutations
         let mut perms = Vec::new();
         for i in 0..ended_ranges.len() {
             for j in 0..ended_ranges.len() {
@@ -1267,7 +1284,6 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         let r0 = &ended_ranges[i0];
         let r1 = &ended_ranges[i1];
 
-        // Check that both ranges have the same axis type (Tinygrad simplify.py:24)
         let (r0_axis_type, r0_end) = match r0.op() {
             Op::Range { end, axis_type, .. } => (axis_type, end),
             _ => continue,
@@ -1281,19 +1297,16 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
             continue;
         }
 
-        // Tinygrad simplify.py:25-27: Check that both ranges appear in the same REDUCE scopes
-        // This prevents invalid merges when ranges have different visibility in different REDUCEs
+        // Check same REDUCE scope (Tinygrad simplify.py:25-27)
         let valid_reduce_scope = reduce_ranges.iter().all(|rngs| {
             let r0_in = rngs.iter().any(|rng| Arc::ptr_eq(rng, r0));
             let r1_in = rngs.iter().any(|rng| Arc::ptr_eq(rng, r1));
-            r0_in == r1_in // Both present or both absent in this REDUCE
+            r0_in == r1_in
         });
         if !valid_reduce_scope {
             continue;
         }
 
-        // Get range sizes as UOps (supports both constant and symbolic sizes)
-        // Skip obviously invalid cases (constant <= 0)
         if let Some(v) = const_uop_to_i64(r0_end)
             && v <= 0
         {
@@ -1304,47 +1317,40 @@ pub fn simplify_merge_adjacent(u: &Arc<UOp>) -> Option<Arc<UOp>> {
         {
             continue;
         }
-
-        // For constant sizes, check overflow
         if let (Some(s0), Some(s1)) = (const_uop_to_i64(r0_end), const_uop_to_i64(r1_end))
             && s0.checked_mul(s1).is_none()
         {
             continue;
         }
 
-        // Create merged size symbolically: s0 * s1 (Tinygrad simplify.py:28)
         let merged_size_uop = r0_end.mul(r1_end);
-
-        // Create merged range with symbolic size
         let merged_range = r0.with_sources(vec![merged_size_uop]);
 
-        // Create substitutions: r0 = merged // s1, r1 = merged % s1 (Tinygrad simplify.py:29)
-        // Using s1 as UOp for symbolic support
         let new_r0 = merged_range.idiv(r1_end);
         let new_r1 = merged_range.mod_(r1_end);
 
-        // Create substitution map
         #[allow(clippy::mutable_key_type)]
         let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
         subs.insert(UOpKey(r0.clone()), new_r0);
         subs.insert(UOpKey(r1.clone()), new_r1);
 
         // Apply substitution and simplify (Tinygrad simplify.py:30-31)
-        let rewritten = u.substitute(&subs);
-        let simplified = crate::rewrite::graph_rewrite(crate::symbolic::symbolic_simple(), rewritten, &mut ());
+        let rewritten = current.substitute(&subs);
+        static MERGE_SYM: std::sync::LazyLock<crate::TypedPatternMatcher> =
+            std::sync::LazyLock::new(|| crate::symbolic::symbolic().clone() + pm_flatten_range().clone());
+        let simplified = crate::rewrite::graph_rewrite(&*MERGE_SYM, rewritten, &mut ());
 
-        // Count divmod operations (Tinygrad simplify.py:34-36)
-        use crate::passes::linearize_index::count_divmod;
-        let original_divmod = count_divmod(u);
+        // Accept if divmod count is reduced or equal (Tinygrad simplify.py:34-36)
+        let original_divmod = count_divmod(&current);
         let new_divmod = count_divmod(&simplified);
 
-        // Only accept if divmod count is reduced or equal
         if new_divmod <= original_divmod {
-            return Some(simplified);
+            current = simplified;
+            changed = true;
         }
     }
 
-    None
+    if changed { Some(current) } else { None }
 }
 
 /// Pattern matcher for range simplification.

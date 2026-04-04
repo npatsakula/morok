@@ -181,7 +181,7 @@ pub fn swizzle_args(cargs: &[(usize, usize)], eargs: &[(usize, usize)], exclude_
 /// - Pattern dependencies require children to be transformed first
 pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     use crate::rewrite::graph_rewrite;
-    use crate::symbolic::symbolic_simple;
+    use crate::symbolic::patterns::sym;
 
     // Phase 1: Convert Range(Unroll/Upcast) to UNROLL ops
     // Uses default graph_rewrite (patterns see optimized children)
@@ -190,7 +190,7 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     // Phase 2: Expander + symbolic (Tinygrad: sym + pm_pre_expander + pm_group_for_reduce + expander)
     //
     // Pattern order matches Tinygrad exactly:
-    // 1. symbolic_simple() - algebraic simplifications
+    // 1. sym() - full symbolic (Tinygrad uses sym tier here)
     // 2. pm_pre_expander() - Range→UNROLL, fix_reduce_unroll, fix_store_unroll
     // 3. pm_group_for_reduce() - GROUP_REDUCE → shared memory pattern
     // 4. expander() - do_expand, do_contract, BARRIER handling
@@ -200,7 +200,8 @@ pub fn pre_expand(ast: &Arc<UOp>) -> Arc<UOp> {
     // correctly expanded - inner Add becomes UNROLL before outer Add is processed.
     use std::sync::LazyLock;
     static PHASE2: LazyLock<TypedPatternMatcher> =
-        LazyLock::new(|| symbolic_simple() + pm_pre_expander() + pm_group_for_reduce() + expander());
+        LazyLock::new(|| sym().clone() + pm_pre_expander() + pm_group_for_reduce() + expander());
+
     graph_rewrite(&*PHASE2, ast, &mut ())
 }
 
@@ -222,7 +223,7 @@ fn phase1_range_to_unroll() -> &'static TypedPatternMatcher {
             if matches!(axis_type, AxisType::Unroll) => |range| {
             let size = const_to_usize(&cv)?;
             let values: Vec<ConstValue> = (0..size as i64).map(ConstValue::Int).collect();
-            let vconst = UOp::vconst(values);
+            let vconst = UOp::vconst(values, range.dtype().scalar_dtype());
             Some(vconst.unroll_with_dtype(vec![(axis_id.value(), size)], range.dtype()))
         },
     }
@@ -252,7 +253,7 @@ pub fn pm_pre_expander() -> &'static TypedPatternMatcher {
             if matches!(axis_type, AxisType::Upcast | AxisType::Unroll) => |range| {
             let size = const_to_usize(&cv)?;
             let values: Vec<ConstValue> = (0..size as i64).map(ConstValue::Int).collect();
-            let vconst = UOp::vconst(values);
+            let vconst = UOp::vconst(values, range.dtype().scalar_dtype());
             Some(vconst.unroll_with_dtype(vec![(axis_id.value(), size)], range.dtype()))
         },
 

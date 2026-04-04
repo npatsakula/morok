@@ -68,14 +68,7 @@ impl UOp {
     /// Create a vector constant from multiple values.
     ///
     /// Dtype is inferred from the first value; all values must be same type.
-    pub fn vconst(values: Vec<ConstValue>) -> Arc<Self> {
-        let scalar_dtype = match values.first() {
-            Some(ConstValue::Int(_)) => DType::Int64,
-            Some(ConstValue::UInt(_)) => DType::UInt64,
-            Some(ConstValue::Float(_)) => DType::Float64,
-            Some(ConstValue::Bool(_)) => DType::Bool,
-            None => DType::Float32,
-        };
+    pub fn vconst(values: Vec<ConstValue>, scalar_dtype: DType) -> Arc<Self> {
         let vec_dtype = scalar_dtype.vec(values.len());
         Self::new(Op::VConst { values }, vec_dtype)
     }
@@ -97,6 +90,13 @@ impl UOp {
         let unique = Self::buffer_id(None);
         let dev = Self::device(device);
         Self::new(Op::Buffer { unique, device: dev, size }, dtype)
+    }
+
+    /// Create a normalized buffer parameter with positional slot.
+    /// Used by pre-schedule normalization (BUFFER→PARAM) to erase buffer identity.
+    /// Matches Tinygrad's `UOp.param(slot, dtype, shape, device)` (ops.py:817-819).
+    pub fn param(slot: usize, size: usize, dtype: DType) -> Arc<Self> {
+        Self::new(Op::Param { slot, size }, dtype)
     }
 
     /// Create a buffer view.

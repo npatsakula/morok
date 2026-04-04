@@ -1,4 +1,5 @@
 use crate::test::helpers::*;
+use morok_schedule::testing::setup_test_tracing;
 use ndarray::{Array4, array};
 
 morok_tensor::codegen_tests! {
@@ -214,4 +215,59 @@ fn test_instance_norm() {
     let result = registry.dispatch_multi("InstanceNormalization", "", &inputs, &node, i64::MAX).unwrap();
     let dims: Vec<usize> = result[0].shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     assert_eq!(dims, [1, 2, 3, 3]);
+}
+
+/// Full ONNX model kernel count analysis.
+/// Loads v3_e2e_rnnt_encoder.onnx and counts kernels at rangeify level
+/// for comparison with Tinygrad (465 kernels, 17 unique types).
+#[test]
+fn test_rnnt_encoder_kernel_count() {
+    setup_test_tracing();
+    let model_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("v3_e2e_rnnt_encoder.onnx");
+    if !model_path.exists() {
+        eprintln!("Skipping: model not found at {}", model_path.display());
+        return;
+    }
+
+    let mut importer = crate::OnnxImporter::new();
+    let model = importer.import(model_path.to_str().unwrap(), &[("batch_size", 1), ("seq_len", 500)]).unwrap();
+
+    let encoded = &model.outputs["encoded"];
+    let encoded_len = &model.outputs["encoded_len"];
+
+    // Rangeify + kernel split (no compilation — fast)
+    let contiguouses = vec![encoded.uop().contiguous(), encoded_len.uop().contiguous()];
+    let sink = morok_ir::UOp::sink(contiguouses);
+
+    let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(sink, None).unwrap();
+    let (kernels_root, _kctx) = morok_schedule::rangeify::run_kernel_split_pipeline(rangeified);
+
+    let kernels: Vec<_> =
+        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Kernel { .. })).collect();
+
+    eprintln!("Morok rangeify kernels: {}", kernels.len());
+
+    // Count by structure: (node_count, reduce_count) → frequency
+    // Extract the kernel's inner AST (SINK inside KERNEL), not the full dependency graph
+    let mut type_counts: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
+    for k in &kernels {
+        let ast = match k.op() {
+            morok_ir::Op::Kernel { ast, .. } => ast,
+            _ => continue,
+        };
+        let nodes = ast.toposort();
+        let nr = nodes.iter().filter(|n| matches!(n.op(), morok_ir::Op::Reduce { .. })).count();
+        *type_counts.entry((nodes.len(), nr)).or_insert(0) += 1;
+    }
+
+    let mut types: Vec<_> = type_counts.into_iter().collect();
+    types.sort_by(|a, b| b.1.cmp(&a.1));
+    eprintln!("\nKernel type breakdown (nodes, reduces → count):");
+    for ((nn, nr), count) in &types {
+        let per_layer = *count as f32 / 16.0;
+        eprintln!("  {count:3}x  {nn:3}n {nr}R  ({per_layer:.1}/layer)");
+    }
+    eprintln!("\nTinygrad reference: 465 kernels, 17 unique");
+    eprintln!("Gap: {} extra kernels", kernels.len() as i32 - 465);
 }

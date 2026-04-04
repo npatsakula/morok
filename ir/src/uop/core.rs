@@ -940,6 +940,7 @@ impl UOp {
             | Op::Invalid
             | Op::DefineGlobal(_)
             | Op::DefineLocal(_)
+            | Op::Param { .. }
             | Op::VConst { .. }
             | Op::DefineVar { .. }
             | Op::DefineReg { .. } => {

@@ -189,8 +189,8 @@ impl Compiler for ClangCompiler {
         Ok(compiled)
     }
 
-    fn cache_key(&self) -> Option<&str> {
-        Some("clang")
+    fn cache_key(&self) -> &'static str {
+        "clang"
     }
 }
 
@@ -250,8 +250,8 @@ impl Compiler for LlvmCompiler {
         Ok(compiled)
     }
 
-    fn cache_key(&self) -> Option<&str> {
-        Some("llvm-jit")
+    fn cache_key(&self) -> &'static str {
+        "llvm-jit"
     }
 }
 
@@ -400,8 +400,8 @@ mod mlir_backend {
             Ok(compiled)
         }
 
-        fn cache_key(&self) -> Option<&str> {
-            Some("mlir-exec-engine")
+        fn cache_key(&self) -> &'static str {
+            "mlir-exec-engine"
         }
     }
 

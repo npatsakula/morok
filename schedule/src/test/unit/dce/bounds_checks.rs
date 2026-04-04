@@ -6,7 +6,7 @@ use morok_ir::{Op, UOp};
 use std::sync::Arc;
 
 use crate::rewrite::graph_rewrite;
-use crate::symbolic::symbolic_simple;
+use crate::symbolic::{symbolic, symbolic_simple};
 
 #[test]
 fn test_lt_always_true() {
@@ -16,7 +16,7 @@ fn test_lt_always_true() {
     let size = UOp::native_const(32i32);
     let check = idx.try_cmplt(&size).unwrap();
 
-    let matcher = symbolic_simple();
+    let matcher = symbolic();
     let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant true
@@ -53,7 +53,7 @@ fn test_eq_same_var() {
     let x = UOp::var("x", DType::Int32, 0, 100);
     let check = x.try_cmpeq(&x).unwrap();
 
-    let matcher = symbolic_simple();
+    let matcher = symbolic();
     let result = graph_rewrite(&matcher, check, &mut ());
 
     // Should be constant true

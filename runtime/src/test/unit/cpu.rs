@@ -14,8 +14,7 @@ fn test_cpu_device_creation_llvm() {
 
     // Verify device properties
     assert_eq!(device.base_device_key(), "CPU");
-    assert!(device.compiler.cache_key().is_some());
-    assert_eq!(device.compiler.cache_key().unwrap(), "llvm-jit");
+    assert_eq!(device.compiler.cache_key(), "llvm-jit");
 }
 
 #[test]

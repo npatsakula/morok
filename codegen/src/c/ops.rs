@@ -36,7 +36,7 @@ impl CContext {
         self.names
             .get(&uop.id)
             .map(|s| s.as_str())
-            .unwrap_or_else(|| panic!("UOp {} ({:?}) not in C context", uop.id, uop.op()))
+            .unwrap_or_else(|| panic!("UOp {} ({}) not in C context", uop.id, uop.op().as_ref()))
     }
 
     /// Register a name/expression for a UOp ID.
@@ -367,10 +367,10 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::PtrCat { sources } => {
-            // PtrCat is not typical in C, render as array
-            render_cat(uop, sources, ctx, kernel);
-            Some(())
+        Op::PtrCat { .. } => {
+            panic!(
+                "PtrCat must be eliminated before codegen (devectorize should distribute it into scalar loads/stores)"
+            );
         }
 
         Op::Wmma { a, b, c, metadata } => {
@@ -389,6 +389,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         }
 
         Op::After { passthrough, .. } => {
+            assert!(
+                !matches!(passthrough.op(), Op::Group { .. }),
+                "BUG: AFTER passthrough is GROUP (id={}). AFTER tree:\n{}",
+                passthrough.id,
+                uop.tree()
+            );
             let s = ctx.get(passthrough).to_string();
             ctx.register(uop.id, s);
             None

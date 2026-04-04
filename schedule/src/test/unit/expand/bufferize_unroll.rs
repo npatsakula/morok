@@ -140,7 +140,7 @@ fn test_bufferize_multiple_ranges_passthrough() {
 #[test]
 fn test_bufferize_empty_unroll_axes_passthrough() {
     // UNROLL with empty axes (edge case)
-    let vconst = UOp::vconst(vec![ConstValue::Int(0)]);
+    let vconst = UOp::vconst(vec![ConstValue::Int(0)], DType::Int64);
     let compute = vconst.clone().unroll(vec![]);
     let range = vconst.unroll(vec![]);
 

@@ -294,9 +294,9 @@ fn test_gep_on_store_with_ptrcat() {
 // Integration Tests
 // =============================================================================
 
-/// Test: Combined GEP movement in phase2.
+/// Test: Combined GEP movement through load_store_folding + correct_load_store.
 #[test]
-fn test_gep_movement_in_phase2() {
+fn test_gep_movement_in_folding() {
     let buffer = create_buffer_typed(64, ScalarDType::Float32);
     let idx = create_vector_index_iota(buffer.clone(), 4);
     let gep_idx = idx.gep(vec![0, 2]);
@@ -306,7 +306,10 @@ fn test_gep_movement_in_phase2() {
     // STORE the loaded value
     let store = gep_idx.store(load.clone());
 
-    let result = apply_phase2(&store);
+    // Use targeted passes (GEP movement is part of load_store_folding)
+    let folded = apply_load_store_folding(&store);
+    let corrected = apply_correct_load_store(&folded);
+    let result = apply_pm_render(&corrected);
 
     // Both patterns should have fired, result is valid
     assert!(matches!(result.op(), Op::Store { .. } | Op::Group { .. }));
@@ -329,9 +332,12 @@ fn test_gep_movement_enables_ptrcat_distribution() {
     // LOAD through GEP(PTRCAT)
     let load = UOp::load().buffer(buffer1.clone()).index(gep_ptrcat).call();
 
-    let result = apply_phase2(&load);
+    // Use targeted passes (not full devectorize) since input is manually constructed
+    let folded = apply_load_store_folding(&load);
+    let corrected = apply_correct_load_store(&folded);
+    let result = apply_pm_render(&corrected);
 
-    // After phase2, no LOAD(PTRCAT) should exist
+    // After folding, no LOAD(PTRCAT) should exist
     let ptrcat_under_load = count_ops(&result, |u| {
         if let Op::Load { index, .. } = u.op() { matches!(index.op(), Op::PtrCat { .. }) } else { false }
     });

@@ -139,17 +139,22 @@ fn test_group_reduce_with_mixed_ranges() {
 /// Test: GROUP_REDUCE with upstream LOCAL ranges includes them in buffer indices.
 #[test]
 fn test_group_reduce_with_local_ranges() {
-    // Create a computation that includes LOCAL ranges in the dependency graph
+    // Create a computation that includes LOCAL ranges in the dependency graph.
+    // The body must depend on the group_reduce range in a way that cannot be
+    // factored out by reduce_mul_chain (realistic: address computed from both ranges).
     let local_range = create_local_range(0, 32);
     let group_range = create_group_reduce_range(1, 16);
 
-    // Source that depends on local_range (by using it in arithmetic)
-    // This simulates a computation indexed by local thread ID
-    let local_float = local_range.clone().cast(DType::Float32);
-    let scaled_src = local_float.try_mul(&UOp::const_(DType::Float32, ConstValue::Float(2.0))).unwrap();
+    // Simulate a LOAD indexed by both local and group ranges:
+    //   addr = local_range * 16 + group_range
+    //   src = Cast(addr, Float32)
+    // This creates a single factor depending on BOTH ranges (cannot be split).
+    let sixteen = UOp::index_const(16);
+    let addr = local_range.clone().try_mul(&sixteen).unwrap().try_add(&group_range.clone()).unwrap();
+    let src = addr.cast(DType::Float32);
 
     // Reduce over GROUP_REDUCE range
-    let reduce = scaled_src.reduce(smallvec![group_range.clone()], ReduceOp::Add);
+    let reduce = src.reduce(smallvec![group_range.clone()], ReduceOp::Add);
 
     let result = expander_rewrite(&reduce);
     let all_nodes = result.toposort();

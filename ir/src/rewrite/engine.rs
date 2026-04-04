@@ -86,34 +86,27 @@ struct StackEntry {
     stage: Stage,
     /// The node we're actively working with (may differ after rewrites)
     working: Arc<UOp>,
-    /// Retry count for ApplyPatterns stage (to detect infinite loops)
-    retry_count: u32,
 }
 
 impl StackEntry {
     /// Create entry for a fresh node starting at PushChildren stage.
     fn new(node: Arc<UOp>) -> Self {
-        Self { original: node.clone(), stage: Stage::PushChildren, working: node, retry_count: 0 }
+        Self { original: node.clone(), stage: Stage::PushChildren, working: node }
     }
 
     /// Create entry for PushChildren stage where original == working.
     fn push_children(node: Arc<UOp>) -> Self {
-        Self { original: node.clone(), stage: Stage::PushChildren, working: node, retry_count: 0 }
+        Self { original: node.clone(), stage: Stage::PushChildren, working: node }
     }
 
     /// Create entry for ApplyPatterns stage with potentially different working node.
     fn apply_patterns(original: Arc<UOp>, working: Arc<UOp>) -> Self {
-        Self { original, stage: Stage::ApplyPatterns, working, retry_count: 0 }
-    }
-
-    /// Create entry for ApplyPatterns stage with retry count (for re-pushed entries).
-    fn apply_patterns_retry(original: Arc<UOp>, working: Arc<UOp>, retry_count: u32) -> Self {
-        Self { original, stage: Stage::ApplyPatterns, working, retry_count }
+        Self { original, stage: Stage::ApplyPatterns, working }
     }
 
     /// Create entry for Link stage.
     fn link(original: Arc<UOp>, working: Arc<UOp>) -> Self {
-        Self { original, stage: Stage::Link, working, retry_count: 0 }
+        Self { original, stage: Stage::Link, working }
     }
 }
 
@@ -215,6 +208,10 @@ where
     /// Nodes pending processing (prevents duplicate pushes in DAGs).
     /// A node is in this set if it's currently on the stack or being processed.
     pending: HashSet<UOpKey>,
+
+    /// Event-driven waitlist: entries waiting on a dependency to be resolved.
+    /// When a node is linked to its result, all waiters are woken and pushed back onto the stack.
+    waitlist: HashMap<UOpKey, Vec<StackEntry>>,
 }
 
 impl<'a, PM, BPM, C> RewriteEngine<'a, PM, BPM, C>
@@ -223,7 +220,7 @@ where
     BPM: Matcher<C>,
 {
     fn new(pm: Option<&'a PM>, bpm: Option<&'a BPM>, ctx: &'a mut C) -> Self {
-        Self { pm, bpm, ctx, results: ResultMap::default(), pending: HashSet::default() }
+        Self { pm, bpm, ctx, results: ResultMap::default(), pending: HashSet::default(), waitlist: HashMap::default() }
     }
 }
 
@@ -253,7 +250,7 @@ where
                     RewriteResult::Gate(_) => {
                         // Gate in bpm means "stop descent, result is ready"
                         // Tinygrad: "if the bpm matching raised a gate, we are done with this node"
-                        self.link_result(original, node);
+                        self.link_result(stack, original, node);
                         return;
                     }
                     RewriteResult::NoMatch => {
@@ -291,13 +288,7 @@ where
     /// - Reconstruct node if any children changed
     /// - Apply pm patterns (sees OPTIMIZED children)
     /// - If patterns produce new node, process it through Stage 0
-    fn handle_apply_patterns(
-        &mut self,
-        stack: &mut VecDeque<StackEntry>,
-        original: Arc<UOp>,
-        working: Arc<UOp>,
-        retry_count: u32,
-    ) {
+    fn handle_apply_patterns(&mut self, stack: &mut VecDeque<StackEntry>, original: Arc<UOp>, working: Arc<UOp>) {
         let sources = working.op().sources();
 
         // For leaf nodes, apply pm patterns directly
@@ -305,25 +296,25 @@ where
             let final_node = self.apply_pm_patterns(&working);
             if Arc::ptr_eq(&final_node, &working) {
                 // No change - link directly
-                self.link_result(original, working);
+                self.link_result(stack, original, working);
             } else {
                 // Pattern produced new node - process it
                 let key = UOpKey(final_node.clone());
                 if !self.results.contains(&final_node) && !self.pending.contains(&key) {
-                    stack.push_back(StackEntry::link(original, final_node.clone()));
                     self.pending.insert(key);
+                    let fc = final_node.clone();
+                    stack.push_back(StackEntry::link(original, fc));
                     stack.push_back(StackEntry::push_children(final_node));
                 } else {
                     // Already processed - link to its result
                     let result = self.results.get(&final_node);
-                    self.link_result(original, result);
+                    self.link_result(stack, original, result);
                 }
             }
             return;
         }
 
-        // Check if all sources have been fully processed
-        let mut needs_defer = false;
+        // Check if all sources have been fully processed; if not, park in waitlist
         for src in &sources {
             // Skip self-references (pattern created wrapper containing original)
             if Arc::ptr_eq(src, &original) {
@@ -333,19 +324,11 @@ where
             if !self.results.contains(src) {
                 let src_key = UOpKey(src.clone());
                 if self.pending.contains(&src_key) {
-                    needs_defer = true;
-                    break;
+                    // Park this entry in the waitlist for the unresolved source
+                    self.waitlist.entry(src_key).or_default().push(StackEntry::apply_patterns(original, working));
+                    return;
                 }
             }
-        }
-
-        if needs_defer {
-            const MAX_RETRIES: u32 = 10_000;
-            if retry_count >= MAX_RETRIES {
-                panic!("ApplyPatterns stuck waiting for sources after {} retries: {:?}", MAX_RETRIES, working.tree());
-            }
-            stack.push_front(StackEntry::apply_patterns_retry(original, working, retry_count + 1));
-            return;
         }
 
         // Collect optimized children
@@ -361,25 +344,26 @@ where
         }
 
         // Reconstruct if children changed
-        let node = if any_changed { working.with_sources(new_sources) } else { working };
+        let node = if any_changed { working.with_sources(new_sources) } else { working.clone() };
 
         // Apply pm patterns (sees OPTIMIZED children!)
-        // This is the key semantic difference from the old implementation
         let final_node = self.apply_pm_patterns(&node);
 
         // If pattern produced new node, process it through Stage 0
         if !Arc::ptr_eq(&final_node, &node) {
             let key = UOpKey(final_node.clone());
             if !self.results.contains(&final_node) && !self.pending.contains(&key) {
-                // Schedule: Link after processing the new node
-                stack.push_back(StackEntry::link(original, final_node.clone()));
+                // push_back: LIFO (pop_back) ensures PushChildren (last pushed)
+                // runs before Link, matching Tinygrad's stack.append() order.
                 self.pending.insert(key);
+                let final_clone = final_node.clone();
+                stack.push_back(StackEntry::link(original, final_clone));
                 stack.push_back(StackEntry::push_children(final_node));
                 return;
             }
             // New node already processed - link to its result
             let result = self.results.get(&final_node);
-            self.link_result(original, result);
+            self.link_result(stack, original, result);
             return;
         }
 
@@ -387,26 +371,35 @@ where
         if any_changed {
             let recon_key = UOpKey(node.clone());
             if !self.results.contains(&node) && !self.pending.contains(&recon_key) {
-                // Reconstructed node not seen - process it
-                stack.push_back(StackEntry::link(original, node.clone()));
+                // push_back: LIFO (pop_back) ensures PushChildren runs before Link
                 self.pending.insert(recon_key);
+                let node_clone = node.clone();
+                stack.push_back(StackEntry::link(original, node_clone));
                 stack.push_back(StackEntry::push_children(node));
                 return;
             }
             // Already processed - link to its result
             let result = self.results.get(&node);
-            self.link_result(original, result);
+            self.link_result(stack, original, result);
             return;
         }
 
         // No changes - link original to working
-        self.link_result(original, node);
+        self.link_result(stack, original, node);
     }
 
     /// Stage 2 (Link): Link original node to the result of working node.
-    fn handle_link(&mut self, original: Arc<UOp>, working: Arc<UOp>) {
+    ///
+    /// Matches Tinygrad's stage 2: if the working node hasn't been resolved yet,
+    /// park in the waitlist for the working node (event-driven, no polling).
+    fn handle_link(&mut self, stack: &mut VecDeque<StackEntry>, original: Arc<UOp>, working: Arc<UOp>) {
+        if !self.results.contains(&working) {
+            // Working node not resolved yet — park in waitlist
+            self.waitlist.entry(UOpKey(working.clone())).or_default().push(StackEntry::link(original, working));
+            return;
+        }
         let result = self.results.get(&working);
-        self.link_result(original, result);
+        self.link_result(stack, original, result);
     }
 
     /// Apply pm patterns in fixed-point loop.
@@ -442,10 +435,12 @@ where
         current
     }
 
-    /// Link original node to its final result in the cache.
-    fn link_result(&mut self, original: Arc<UOp>, result: Arc<UOp>) {
+    /// Link original node to its final result in the cache and wake any waiters.
+    fn link_result(&mut self, stack: &mut VecDeque<StackEntry>, original: Arc<UOp>, result: Arc<UOp>) {
+        let key = UOpKey(original.clone());
+
         // Remove from pending set - this node is now fully processed
-        self.pending.remove(&UOpKey(original.clone()));
+        self.pending.remove(&key);
 
         // Record provenance if actually rewritten
         if !Arc::ptr_eq(&original, &result) {
@@ -456,6 +451,13 @@ where
         }
 
         self.results.link(original, result);
+
+        // Wake any entries waiting on this node
+        if let Some(waiters) = self.waitlist.remove(&key) {
+            for entry in waiters {
+                stack.push_back(entry);
+            }
+        }
     }
 
     /// Main rewrite method: Stack-based 3-stage traversal.
@@ -483,7 +485,7 @@ where
         const MAX_TOTAL_ITERATIONS: usize = 500_000;
         let mut iterations = 0;
 
-        while let Some(StackEntry { original, stage, working, retry_count }) = stack.pop_back() {
+        while let Some(StackEntry { original, stage, working }) = stack.pop_back() {
             iterations += 1;
             if iterations > MAX_TOTAL_ITERATIONS {
                 panic!(
@@ -502,8 +504,8 @@ where
 
             match stage {
                 Stage::PushChildren => self.handle_push_children(&mut stack, original, working),
-                Stage::ApplyPatterns => self.handle_apply_patterns(&mut stack, original, working, retry_count),
-                Stage::Link => self.handle_link(original, working),
+                Stage::ApplyPatterns => self.handle_apply_patterns(&mut stack, original, working),
+                Stage::Link => self.handle_link(&mut stack, original, working),
             }
         }
 

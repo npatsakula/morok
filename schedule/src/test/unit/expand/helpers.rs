@@ -47,7 +47,7 @@ pub fn phase2_only(uop: &Arc<UOp>) -> Arc<UOp> {
 /// IMPORTANT: UNROLL dtype is SCALAR (matching Tinygrad), not the vec dtype from VCONST.
 pub fn create_unroll_iota(axis_id: usize, count: usize) -> Arc<UOp> {
     let values: Vec<ConstValue> = (0..count as i64).map(ConstValue::Int).collect();
-    let vconst = UOp::vconst(values);
+    let vconst = UOp::vconst(values, DType::Int64);
     // Use scalar dtype for UNROLL wrapper (Tinygrad: dtypes.int, not dtypes.int.vec(N))
     vconst.unroll_with_dtype(vec![(axis_id, count)], DType::Int64)
 }
@@ -58,7 +58,7 @@ pub fn create_unroll_iota(axis_id: usize, count: usize) -> Arc<UOp> {
 /// IMPORTANT: UNROLL dtype is SCALAR (matching Tinygrad).
 pub fn create_unroll_scaled(axis_id: usize, count: usize, scale: i64) -> Arc<UOp> {
     let values: Vec<ConstValue> = (0..count as i64).map(|i| ConstValue::Int(i * scale)).collect();
-    let vconst = UOp::vconst(values);
+    let vconst = UOp::vconst(values, DType::Int64);
     vconst.unroll_with_dtype(vec![(axis_id, count)], DType::Int64)
 }
 
@@ -67,7 +67,7 @@ pub fn create_unroll_scaled(axis_id: usize, count: usize, scale: i64) -> Arc<UOp
 pub fn create_unroll_values(axis_id: usize, values: Vec<i64>) -> Arc<UOp> {
     let const_values: Vec<ConstValue> = values.into_iter().map(ConstValue::Int).collect();
     let count = const_values.len();
-    let vconst = UOp::vconst(const_values);
+    let vconst = UOp::vconst(const_values, DType::Int64);
     vconst.unroll_with_dtype(vec![(axis_id, count)], DType::Int64)
 }
 
@@ -79,7 +79,7 @@ pub fn create_unroll_values(axis_id: usize, values: Vec<i64>) -> Arc<UOp> {
 pub fn create_unroll_multi_axis(axes: Vec<(usize, usize)>) -> Arc<UOp> {
     let total_count: usize = axes.iter().map(|(_, sz)| sz).product();
     let values: Vec<ConstValue> = (0..total_count as i64).map(ConstValue::Int).collect();
-    let vconst = UOp::vconst(values);
+    let vconst = UOp::vconst(values, DType::Int64);
     vconst.unroll_with_dtype(axes, DType::Int64)
 }
 
@@ -87,14 +87,14 @@ pub fn create_unroll_multi_axis(axes: Vec<(usize, usize)>) -> Arc<UOp> {
 pub fn create_unroll_multi_axis_with_dtype(axes: Vec<(usize, usize)>, dtype: DType) -> Arc<UOp> {
     let total_count: usize = axes.iter().map(|(_, sz)| sz).product();
     let values: Vec<ConstValue> = (0..total_count as i64).map(ConstValue::Int).collect();
-    let vconst = UOp::vconst(values);
+    let vconst = UOp::vconst(values, DType::Int64);
     vconst.unroll_with_dtype(axes, dtype)
 }
 
 /// Create a simple integer VCONST.
 pub fn create_vconst_int(values: Vec<i64>) -> Arc<UOp> {
     let const_values: Vec<ConstValue> = values.into_iter().map(ConstValue::Int).collect();
-    UOp::vconst(const_values)
+    UOp::vconst(const_values, DType::Int64)
 }
 
 /// Create a CONTRACT operation.

@@ -46,6 +46,7 @@ pub mod nn;
 pub mod realize;
 pub mod reduce;
 pub mod schedule;
+pub(crate) mod schedule_cache;
 pub mod shape_ops;
 pub mod tensor_registry;
 pub mod traits;

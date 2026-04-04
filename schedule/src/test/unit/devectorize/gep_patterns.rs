@@ -33,7 +33,7 @@ fn test_cat_vec4_to_vectorize() {
     let cat = UOp::cat().sources(vec![a, b]).call();
     assert_vcount(&cat, 8);
 
-    let result = apply_gep_ptrcat_patterns(&cat);
+    let result = apply_pm_render(&cat);
 
     // Should become VECTORIZE with 8 elements (extracted via GEP)
     match result.op() {
@@ -64,7 +64,7 @@ fn test_cat_scalar_unchanged() {
 
     let cat = UOp::cat().sources(vec![a, b, c, d]).call();
 
-    let result = apply_gep_ptrcat_patterns(&cat);
+    let result = apply_pm_render(&cat);
 
     // Scalar CAT should remain as CAT (pattern only fires for multi-element sources)
     match result.op() {
@@ -90,7 +90,7 @@ fn test_cat_single_source_unwrap() {
     let a = create_vector_float_iota(4);
     let cat = UOp::cat().sources(vec![a.clone()]).call();
 
-    let result = apply_gep_ptrcat_patterns(&cat);
+    let result = apply_pm_render(&cat);
 
     // Should unwrap to just 'a'
     assert!(Arc::ptr_eq(&result, &a), "Single-source CAT should unwrap");
@@ -112,7 +112,7 @@ fn test_gep_vectorize_single() {
     let vec = UOp::vectorize([e0, e1.clone(), e2].into_iter().collect());
     let gep = vec.gep(vec![1]);
 
-    let result = apply_gep_ptrcat_patterns(&gep);
+    let result = apply_pm_render(&gep);
 
     // Should extract e1 directly
     assert_eq!(result.dtype().vcount(), 1, "Should be scalar");
@@ -140,7 +140,7 @@ fn test_gep_vectorize_multi() {
     let vec = UOp::vectorize(elements);
     let gep = vec.gep(vec![0, 2]);
 
-    let result = apply_gep_ptrcat_patterns(&gep);
+    let result = apply_pm_render(&gep);
 
     // Should extract elements 0 and 2
     assert_vcount(&result, 2);
@@ -161,7 +161,7 @@ fn test_gep_broadcast_extraction() {
     let vec = x.broadcast(4);
     let gep = vec.gep(vec![2]);
 
-    let result = apply_gep_ptrcat_patterns(&gep);
+    let result = apply_pm_render(&gep);
 
     // Should extract to just x
     assert_eq!(result.dtype().vcount(), 1, "Should be scalar");
@@ -193,7 +193,7 @@ fn test_gep_cat_reorder() {
     let cat = UOp::cat().sources(vec![a, b.clone(), c.clone()]).call();
     let gep = cat.gep(vec![1, 2]);
 
-    let result = apply_gep_ptrcat_patterns(&gep);
+    let result = apply_pm_render(&gep);
 
     // Should produce CAT([b, c]) or VECTORIZE([b, c])
     assert_vcount(&result, 2);
@@ -218,7 +218,7 @@ fn test_gep_cat_single() {
     let cat = UOp::cat().sources(vec![a, b.clone(), c]).call();
     let gep = cat.gep(vec![1]);
 
-    let result = apply_gep_ptrcat_patterns(&gep);
+    let result = apply_pm_render(&gep);
 
     // Should extract b directly
     assert_eq!(result.dtype().vcount(), 1);
@@ -234,7 +234,7 @@ fn test_ptrcat_single_unwrap() {
 
     let ptrcat = UOp::ptrcat().sources(vec![p.clone()]).call();
 
-    let result = apply_gep_ptrcat_patterns(&ptrcat);
+    let result = apply_pm_render(&ptrcat);
 
     // Should unwrap to just p
     assert_is_index(&result);
@@ -253,7 +253,7 @@ fn test_cat_gep_identity() {
     let geps: Vec<Arc<UOp>> = (0..4).map(|i| x.gep(vec![i])).collect();
     let cat = UOp::cat().sources(geps).call();
 
-    let result = apply_gep_ptrcat_patterns(&cat);
+    let result = apply_pm_render(&cat);
 
     // Should simplify to just x
     // Note: This requires the identity reconstruction pattern to fire
@@ -275,7 +275,7 @@ fn test_where_devectorize() {
 
     let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, t_val, f_val), DType::Float32.vec(4));
 
-    let result = apply_gep_ptrcat_patterns(&where_op);
+    let result = apply_pm_render(&where_op);
 
     // Should become VECTORIZE of 4 scalar WHEREs or remain as WHERE
     // Either way, total vcount should be 4
@@ -307,7 +307,7 @@ fn test_where_scalar_unchanged() {
 
     let where_op = UOp::new(Op::Ternary(TernaryOp::Where, cond, t_val, f_val), DType::Float32);
 
-    let result = apply_gep_ptrcat_patterns(&where_op);
+    let result = apply_pm_render(&where_op);
 
     // Scalar WHERE should remain unchanged
     assert!(matches!(result.op(), Op::Ternary(TernaryOp::Where, _, _, _)), "Scalar WHERE should remain unchanged");
@@ -325,7 +325,7 @@ fn test_gep_through_cast() {
     let cast = vec.cast(DType::Int64.vec(4));
     let gep = cast.gep(vec![1]);
 
-    let result = apply_gep_ptrcat_patterns(&gep);
+    let result = apply_pm_render(&gep);
 
     // GEP should work through CAST
     assert_eq!(result.dtype().vcount(), 1);
@@ -414,5 +414,5 @@ fn test_gep_out_of_bounds() {
     let gep = vec.gep(vec![10]); // Index 10 is out of bounds
 
     // Should not panic, but may produce invalid result
-    let _result = apply_gep_ptrcat_patterns(&gep);
+    let _result = apply_pm_render(&gep);
 }

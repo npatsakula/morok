@@ -363,7 +363,7 @@ pub fn shape_to_uop(shape: &Shape) -> Arc<UOp> {
     // Empty shape = scalar: use VConst with empty values
     // extract_shape_from_uop will decode this back to empty Shape
     if shape.is_empty() {
-        return UOp::vconst(vec![]);
+        return UOp::vconst(vec![], DType::Index);
     }
 
     let elements: SmallVec<[Arc<UOp>; 4]> = shape.iter().map(|dim| dim.to_uop(DType::Index)).collect();
@@ -600,6 +600,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         // =====================================================================
         // Buffer operations have shape (size,)
         Op::Buffer { size, .. } => Some(smallvec![SInt::from(*size)]),
+        Op::Param { size, .. } => Some(smallvec![SInt::from(*size)]),
         Op::BufferView { size, .. } => Some(smallvec![SInt::from(*size)]),
 
         // Passthrough operations

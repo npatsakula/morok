@@ -123,6 +123,7 @@ enum OpData {
 
     // Buffer operations
     BufferData(usize, usize), // (unique_id, size) - each buffer is unique
+    ParamData(usize, usize),  // (slot, size) - each param slot is unique
     BufferView(usize, usize),
     Bufferize(BufferizeOpts),
 
@@ -173,28 +174,18 @@ impl UOpKey {
         let src_ids = src_ids(op);
 
         let op_data = match op {
-            // Nullary operations
             Op::Const(c) => OpData::Const(*c),
             Op::Unique(id) => OpData::Unique(*id),
             Op::Device(d) => OpData::Device(d.clone()),
-            // DEFINE_GLOBAL/LOCAL need unique IDs to prevent hash consing across kernels
             Op::DefineGlobal(slot) => OpData::DefineGlobal(*slot, next_unique_id()),
             Op::DefineLocal(slot) => OpData::DefineLocal(*slot, next_unique_id()),
-
-            // Grouped operations
             Op::Unary(unary_op, _) => OpData::Unary(*unary_op),
             Op::Binary(binary_op, _, _) => OpData::Binary(*binary_op),
             Op::Ternary(ternary_op, _, _, _) => OpData::Ternary(*ternary_op),
-
-            // Type operations
             Op::Cast { dtype, .. } => OpData::CastDType(dtype.clone()),
             Op::BitCast { dtype, .. } => OpData::BitCastDType(dtype.clone()),
-
-            // Special operations
             Op::MSelect { device_index, .. } => OpData::MSelectIdx(*device_index),
             Op::Special { name, .. } => OpData::SpecialName(name.clone()),
-
-            // Buffer operations - include unique ID to prevent collision
             Op::Buffer { unique, size, .. } => {
                 if let Op::Unique(id) = unique.op() {
                     OpData::BufferData(*id, *size)
@@ -205,39 +196,52 @@ impl UOpKey {
             }
             Op::BufferView { size, offset, .. } => OpData::BufferView(*size, *offset),
             Op::Bufferize { opts, .. } => OpData::Bufferize(opts.clone()),
-
-            // Movement/Reshape operations
             Op::Permute { axes, .. } => OpData::PermuteAxes(axes.clone()),
             Op::Flip { axes, .. } => OpData::FlipAxes(axes.clone()),
             Op::Multi { axis, .. } => OpData::MultiAxis(*axis),
-
-            // Reduction operations
             Op::ReduceAxis { reduce_op, axes, .. } => OpData::ReduceAxisData(*reduce_op, axes.clone()),
             Op::Reduce { reduce_op, .. } => OpData::ReduceOp(*reduce_op),
             Op::AllReduce { reduce_op, .. } => OpData::AllReduceOp(*reduce_op),
-
-            // Control flow operations
             Op::Range { axis_id, axis_type, .. } => OpData::RangeData(*axis_id, *axis_type),
-
-            // Vector operations
             Op::Gep { indices, .. } => OpData::GepIndices(indices.clone()),
             Op::VConst { values } => OpData::VConstValues(values.iter().map(|v| ConstValueHash(*v)).collect()),
-
-            // Symbolic/Define operations
             Op::DefineVar { name, min_val, max_val } => OpData::DefineVarData(name.clone(), *min_val, *max_val),
             Op::DefineReg { size, id } => OpData::DefineRegData(*size, *id),
-
-            // Advanced operations
             Op::Wmma { metadata, .. } => OpData::WmmaData(metadata.clone().into()),
             Op::Contract { upcast_ranges, .. } => OpData::ContractRanges(upcast_ranges.clone()),
             Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
-
-            // Movement operations with extra data
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
-
-            // All other operations have no semantic data beyond children and discriminant
+            Op::Param { slot, size } => OpData::ParamData(*slot, *size),
             _ => OpData::None,
+            // Op::Noop => todo!(),
+            // Op::Invalid => todo!(),
+            // Op::Sink { sources } => todo!(),
+            // Op::Group { sources } => todo!(),
+            // Op::Index { buffer, indices, gate } => todo!(),
+            // Op::PointerIndex { ptr, offset } => todo!(),
+            // Op::Copy { src, device } => todo!(),
+            // Op::MStack { buffers } => todo!(),
+            // Op::Reshape { src, new_shape } => todo!(),
+            // Op::Expand { src, new_shape } => todo!(),
+            // Op::Pad { src, begin_pads, end_pads } => todo!(),
+            // Op::Shrink { src, begins, ends } => todo!(),
+            // Op::If { condition, body } => todo!(),
+            // Op::EndIf { if_op } => todo!(),
+            // Op::End { computation, ranges } => todo!(),
+            // Op::Barrier { src, deps } => todo!(),
+            // Op::Vectorize { elements } => todo!(),
+            // Op::Cat { sources } => todo!(),
+            // Op::PtrCat { sources } => todo!(),
+            // Op::Bind { var, value } => todo!(),
+            // Op::Kernel { sources, ast } => todo!(),
+            // Op::Assign { target, value, movement_ops } => todo!(),
+            // Op::Detach { src } => todo!(),
+            // Op::ContiguousBackward { src } => todo!(),
+            // Op::After { passthrough, deps } => todo!(),
+            // Op::Precast { src } => todo!(),
+            // Op::Load { buffer, index, alt } => todo!(),
+            // Op::Store { index, value, ranges } => todo!(),
         };
 
         // Pre-compute hash using xxhash (fast, non-cryptographic).

@@ -28,7 +28,7 @@ fn test_bool_load_to_uint8() {
     // Verify initial state
     assert_eq!(load.dtype().base(), ScalarDType::Bool);
 
-    let result = apply_phase3(&load);
+    let result = apply_bool_storage(&load);
 
     // Result should be CAST(LOAD<uint8>, bool) or LOAD with converted type
     // Either way, the result type should be bool (user-facing) but storage is uint8
@@ -57,7 +57,7 @@ fn test_non_bool_load_unchanged() {
 
     assert_eq!(load.dtype().base(), ScalarDType::Float32);
 
-    let result = apply_phase3(&load);
+    let result = apply_bool_storage(&load);
 
     // Float32 LOAD should remain unchanged
     assert_is_load(&result);
@@ -71,7 +71,7 @@ fn test_int32_load_unchanged() {
     let index = create_index(buffer.clone(), 0);
     let load = create_load(buffer.clone(), index);
 
-    let result = apply_phase3(&load);
+    let result = apply_bool_storage(&load);
 
     assert_is_load(&result);
     assert_eq!(result.dtype().base(), ScalarDType::Int32);
@@ -90,7 +90,7 @@ fn test_bool_store_to_uint8() {
 
     let store = create_store(index, bool_val);
 
-    let result = apply_phase3(&store);
+    let result = apply_bool_storage(&store);
 
     // Result should be STORE with CAST(bool_val, uint8) as value
     match result.op() {
@@ -119,7 +119,7 @@ fn test_non_bool_store_unchanged() {
 
     let store = create_store(index, float_val.clone());
 
-    let result = apply_phase3(&store);
+    let result = apply_bool_storage(&store);
 
     // Float STORE should remain unchanged
     match result.op() {
@@ -144,11 +144,11 @@ fn test_bool_roundtrip() {
 
     // Store bool value
     let store = create_store(index.clone(), bool_val);
-    let store_result = apply_phase3(&store);
+    let store_result = apply_bool_storage(&store);
 
     // Load bool value
     let load = create_load(buffer.clone(), index);
-    let load_result = apply_phase3(&load);
+    let load_result = apply_bool_storage(&load);
 
     // Verify store has uint8 cast
     if let Op::Store { value, .. } = store_result.op() {
@@ -194,7 +194,7 @@ fn test_vector_bool_load() {
     // Create load with explicit bool dtype
     let load = create_load(buffer.clone(), index);
 
-    let result = apply_phase3(&load);
+    let result = apply_bool_storage(&load);
 
     // Should handle vector bool correctly
     match result.op() {
@@ -216,7 +216,7 @@ fn test_vector_bool_store() {
 
     let store = create_store(index, bool_vec);
 
-    let result = apply_phase3(&store);
+    let result = apply_bool_storage(&store);
 
     // Should convert vector bool to uint8
     if let Op::Store { value, .. } = result.op() {

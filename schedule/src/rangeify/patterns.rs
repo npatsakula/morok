@@ -617,6 +617,7 @@ fn apply_pcontig_removal_inner(
     if let Op::Bufferize { opts, .. } = buffer.op()
         && !opts.removable
     {
+        tracing::debug!(src_id = src.id, src_op = src.op().as_ref(), "buffer_removal: KEPT (non-removable)");
         return None;
     }
 
@@ -643,7 +644,8 @@ fn apply_pcontig_removal_inner(
                 buffers.push(Arc::clone(uop));
                 return false; // Stop traversing into GLOBAL bufferize
             }
-            Op::Buffer { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
+            // Count PARAM (normalized input buffer) like Tinygrad counts Ops.PARAM
+            Op::Buffer { .. } | Op::Param { .. } | Op::MStack { .. } | Op::MSelect { .. } => {
                 buffers.push(Arc::clone(uop));
             }
             Op::Index { .. } => indexes.push(Arc::clone(uop)),
@@ -665,6 +667,14 @@ fn apply_pcontig_removal_inner(
 
     // Buffer count threshold — bypassed at level > 2 (like Tinygrad's `not (PCONTIG > 2)`)
     if accessed_buffers.len() > config.max_buffers_threshold && config.level <= 2 {
+        tracing::debug!(
+            src_id = src.id,
+            src_op = src.op().as_ref(),
+            buf_count = accessed_buffers.len(),
+            threshold = config.max_buffers_threshold,
+            buf_ops = ?accessed_buffers.iter().map(|b| (b.id, b.op().as_ref())).collect::<Vec<_>>(),
+            "buffer_removal: KEPT (buffer count exceeds threshold)"
+        );
         return None;
     }
 
@@ -690,6 +700,12 @@ fn apply_pcontig_removal_inner(
     // Filter: skip CONST ranges (they're broadcast dims, not real ranges).
     // Gating: only substitute in subexpressions that contain the ranges.
     if !buffer_in_reduce {
+        tracing::debug!(
+            src_id = src.id,
+            src_op = src.op().as_ref(),
+            buf_count = accessed_buffers.len(),
+            "buffer_removal: REMOVED (no buffer_in_reduce)"
+        );
         let subs_map: HashMap<UOpKey, Arc<UOp>> = buf_ranges
             .iter()
             .zip(idx_ranges.iter())
@@ -701,6 +717,13 @@ fn apply_pcontig_removal_inner(
 
     // Buffer in reduce: at level ≤ 2, always keep (Tinygrad rangeify.py:247-248).
     if config.level <= 2 {
+        tracing::debug!(
+            src_id = src.id,
+            src_op = src.op().as_ref(),
+            reduce_count = reduces.len(),
+            buf_count = accessed_buffers.len(),
+            "buffer_removal: KEPT (buffer_in_reduce at level<=2)"
+        );
         return None;
     }
 
@@ -837,6 +860,12 @@ pub fn split_reduceop_patterns() -> TypedPatternMatcher<SplitReduceOpConfig> {
 fn pm_reduce_unparented() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         reduce @ Reduce { src, ranges, reduce_op: Add | Mul | Max | Min } => |reduce, src, ranges, reduce_op| {
+            // Tinygrad simplify.py:72: assert all(x.op is Ops.RANGE for x in red.src[1:])
+            assert!(
+                ranges.iter().all(|r| matches!(r.op(), Op::Range { .. })),
+                "reduce_unparented: all reduce ranges must be RANGE ops, got: {:?}",
+                ranges.iter().map(|r| r.op().as_ref().to_string()).collect::<Vec<_>>()
+            );
             #[allow(clippy::mutable_key_type)]
             let src_ranges = src.in_scope_ranges();
             let (parented, unparented) = partition_reduce_ranges(ranges, src_ranges);
@@ -983,9 +1012,23 @@ pub fn pm_reduce_simplify() -> &'static TypedPatternMatcher {
 /// Based on Tinygrad's `pm_mops` (rangeify.py:18-25).
 pub fn movement_op_patterns() -> TypedPatternMatcher {
     crate::patterns! {
+        // pm_mops rule 1: Movement op on INDEX → apply_movement_op to indices (Tinygrad rangeify.py:25-26)
         Index { buffer: mop, indices, gate } if mop.op().is_movement() => |mop, indices, gate| {
             transform_movement_through_index(mop, indices, gate)
         },
+        // pm_mops rule 2: Movement ops through AFTER (Tinygrad rangeify.py:28-29)
+        // AFTER(MOVEMENT(x, ...), deps) → MOVEMENT(AFTER(x, deps), ...)
+        After { passthrough: mop, deps } if mop.op().is_movement()
+            => |mop, deps| {
+                super::transforms::push_movement_through_after(mop, deps)
+            },
+        // pm_mops rule 3: Movement ops through END (Tinygrad rangeify.py:30)
+        // END(MOVEMENT(x, ...), ranges) → END(x, ranges)
+        End { computation: mop, ranges } if mop.op().is_movement()
+            => |mop, ranges| {
+                let src = &mop.op().sources()[0];
+                Some(src.end(ranges.clone()))
+            },
         // Flatten nested INDEX when both have gate: None and matching single indices
         Index {
             buffer: inner @ Index { indices: inner_indices, gate: None },
@@ -1258,7 +1301,15 @@ pub fn local_to_define_global_patterns() -> TypedPatternMatcher<LocalAddBufferCo
         buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
             let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
             let replacement = UOp::define_global(ctx.next_dg(), ptr_dtype);
-            // Map buffer to itself (like Tinygrad: if buf not in ctx.map: ctx.map[buf] = buf)
+            if !ctx.has_buffer(buf) {
+                ctx.map_buffer(buf.clone(), buf.clone());
+            }
+            Some(replacement)
+        },
+        // Param → DefineGlobal (normalized buffer from pre-schedule pass)
+        buf @ Param { slot: _, size } => |buf, size, ctx| {
+            let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
+            let replacement = UOp::define_global(ctx.next_dg(), ptr_dtype);
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }
@@ -2482,7 +2533,8 @@ pub fn pm_load_collapse() -> &'static TypedPatternMatcher<()> {
 /// Does NOT include a recursive `reduce_collapse` call (would infinite-loop).
 pub fn build_reduce_collapse_matcher() -> &'static TypedPatternMatcher<()> {
     static CACHED: std::sync::LazyLock<TypedPatternMatcher<()>> =
-        std::sync::LazyLock::new(|| reduce_collapse_inner_patterns() + crate::symbolic::symbolic_simple());
+        // Tinygrad simplify.py:112: pm_reduce_collapse uses full `symbolic`
+        std::sync::LazyLock::new(|| reduce_collapse_inner_patterns() + crate::symbolic::symbolic());
     &CACHED
 }
 

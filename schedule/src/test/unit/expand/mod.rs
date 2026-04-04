@@ -46,7 +46,7 @@ fn test_vectorize_expansion_with_mixed_sources() {
     // which occurred when beam search used width >= 3.
 
     // Create an UNROLL operation (simulates expanded loop)
-    let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2)]);
+    let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2)], DType::Int64);
     let unroll = values.unroll(vec![(0, 3)]);
 
     // Create a scalar constant
@@ -91,7 +91,8 @@ fn test_fix_reduce_unroll_with_unroll_ops() {
     // This tests simplified partition-based logic.
 
     // Create an UNROLL op (simulates what Phase 1 produces from Range(Unroll))
-    let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2), ConstValue::Int(3)]);
+    let values =
+        UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1), ConstValue::Int(2), ConstValue::Int(3)], DType::Int64);
     let unroll = values.unroll(vec![(1, 4)]);
 
     // Create a Reduce range
@@ -147,7 +148,7 @@ fn test_reduce_empty_ranges_bug() {
     let reduce_range = UOp::range_axis(reduce_end, morok_ir::AxisId::Renumbered(0), AxisType::Reduce);
 
     // Create UNROLL for axis 0 (keepdim behavior)
-    let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1)]);
+    let values = UOp::vconst(vec![ConstValue::Int(0), ConstValue::Int(1)], DType::Int64);
     let unroll = values.unroll(vec![(1, 2)]);
 
     // REDUCE with both Range and UNROLL

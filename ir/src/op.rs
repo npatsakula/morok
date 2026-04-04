@@ -74,7 +74,15 @@ pub enum Op {
         name: String,
     },
 
-    // Buffer operations (high-level, 7 variants)
+    // Buffer operations (high-level, 8 variants)
+    /// Normalized buffer parameter — positional reference to an input/output buffer.
+    /// Created by pre-schedule normalization (BUFFER→PARAM) to erase buffer identity,
+    /// enabling structural deduplication of identical computations on different buffers.
+    /// Matches Tinygrad's Ops.PARAM (engine/schedule.py:125).
+    Param {
+        slot: usize,
+        size: usize,
+    },
     Buffer {
         unique: Arc<UOp>,
         device: Arc<UOp>,
@@ -311,6 +319,7 @@ impl Op {
             | Self::Invalid
             | Self::DefineGlobal(_)
             | Self::DefineLocal(_)
+            | Self::Param { .. }
             | Self::VConst { .. }
             | Self::DefineVar { .. }
             | Self::DefineReg { .. } => SmallVec::new(),

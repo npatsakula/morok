@@ -102,8 +102,8 @@ fn test_fix_reduce_range_unroll() {
             }
             // Source should be expanded (CONTRACT → VECTORIZE for Const source)
             assert!(
-                matches!(fixed_src.op(), Op::Contract { .. } | Op::Vectorize { .. }),
-                "Source should be CONTRACT or VECTORIZE (expanded), got {:?}",
+                matches!(fixed_src.op(), Op::Contract { .. } | Op::Vectorize { .. } | Op::VConst { .. }),
+                "Source should be expanded (CONTRACT/VECTORIZE/VCONST), got {:?}",
                 fixed_src.op()
             );
         }
@@ -183,8 +183,8 @@ fn test_fix_reduce_range_upcast() {
         Op::Reduce { src: fixed_src, ranges, .. } => {
             // Source should be expanded (CONTRACT → VECTORIZE for Const source)
             assert!(
-                matches!(fixed_src.op(), Op::Contract { .. } | Op::Vectorize { .. }),
-                "Source should be CONTRACT or VECTORIZE (expanded), got {:?}",
+                matches!(fixed_src.op(), Op::Contract { .. } | Op::Vectorize { .. } | Op::VConst { .. }),
+                "Source should be expanded (CONTRACT/VECTORIZE/VCONST), got {:?}",
                 fixed_src.op()
             );
             // Loop range should be preserved
@@ -269,7 +269,10 @@ fn test_fix_reduce_mixed_ranges() {
             assert!(!has_unroll, "UNROLL should be removed from ranges");
 
             // Source should be expanded
-            assert!(matches!(fixed_src.op(), Op::Contract { .. } | Op::Vectorize { .. }), "Source should be expanded");
+            assert!(
+                matches!(fixed_src.op(), Op::Contract { .. } | Op::Vectorize { .. } | Op::VConst { .. }),
+                "Source should be expanded"
+            );
         }
         other => panic!("Expected REDUCE, got {:?}", other),
     }

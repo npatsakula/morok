@@ -283,22 +283,20 @@ fn test_merge_consumer_ranges_2d_partial_overlap() {
     // Merge ranges
     let merged = merge_consumer_ranges(&reshaped, &consumer_rngs, &mut ctx).unwrap();
 
-    // Partial merge: dim 0 has identical ranges (pointer-equal r0), dim 1 differs.
-    // Current behavior (ranges_same merging): dim 0 is preserved, dim 1 gets new range.
-    // TODO: With PCONTIG=0 alignment, all dims should be realized when any differs.
+    // With PCONTIG=0 (Tinygrad-aligned): when ANY dimension has different ranges
+    // across consumers, ALL dimensions get realized — even dim 0 which is identical.
+    // Tinygrad indexing.py:217: only `all_all_same` matters when PCONTIG=0.
     assert_eq!(merged.len(), 2, "Should have 2 merged ranges");
 
-    // First range should be unchanged (identical across consumers)
-    assert!(Arc::ptr_eq(&merged[0], &r0), "Identical first dimension should be unchanged");
-
-    // Second range should be NEW (different across consumers)
+    // Both dimensions should get new ranges (not pointer-equal to originals)
+    assert!(!Arc::ptr_eq(&merged[0], &r0), "All dims realized when all_all_same=false");
     assert!(!Arc::ptr_eq(&merged[1], &r1_a), "Different second dimension should create new range");
 
-    // Should mark only dimension 1 for realization
+    // Should mark BOTH dimensions for realization
     let realize_info = ctx.realize_map.get(&morok_ir::UOpKey(reshaped.clone()));
     assert!(realize_info.is_some(), "Should mark for realization");
     if let Some(Some(axes)) = realize_info {
-        assert_eq!(axes, &[1], "Only dimension 1 should need realization");
+        assert_eq!(axes, &[0, 1], "Both dimensions should need realization");
     }
 }
 

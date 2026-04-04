@@ -562,3 +562,5 @@ fn test_densenet_two_layer_kernel_count() {
     // 6 kernels matching Tinygrad: BN+ReLU, Conv1x1+BN+ReLU, Conv3x3+Cat (×2 layers)
     assert_eq!(kernels.len(), 6, "Expected 6 kernels for 2 dense layers, got {}", kernels.len());
 }
+
+// Full ONNX model kernel count test: onnx/src/test/unit/nn.rs::test_rnnt_encoder_kernel_count

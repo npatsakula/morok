@@ -169,15 +169,11 @@ pub trait Compiler: Send + Sync {
     /// ```
     fn compile(&self, spec: &ProgramSpec) -> Result<CompiledSpec>;
 
-    /// Optional cache key for this compiler configuration.
+    /// Cache key identifying this compiler backend.
     ///
     /// Used to differentiate compiled artifacts when the same device type
-    /// can have multiple compiler configurations (e.g., different optimization levels).
-    ///
-    /// Returns None if all instances of this compiler produce identical output.
-    fn cache_key(&self) -> Option<&str> {
-        None
-    }
+    /// can have multiple compiler backends (e.g., clang vs llvm-jit).
+    fn cache_key(&self) -> &'static str;
 }
 
 /// A renderer that transforms UOp graphs into source code.

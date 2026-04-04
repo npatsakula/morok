@@ -82,12 +82,10 @@ pub fn pm_split_ends() -> &'static TypedPatternMatcher {
 /// Extracts actual RANGE ops from the ranges field (which may contain arbitrary
 /// expressions after optimization), then creates nested single-range ENDs.
 fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
-    // Step 1: Extract ONLY RANGE ops from the ranges field.
-    // The ranges field may contain non-RANGE ops (CONST, Add, etc.) after optimization.
-    // This matches Tinygrad's `UOp.sink(*e.src[1:]).ranges` which recursively extracts RANGEs.
+    // Extract RANGE ops using the cached `.ranges()` property.
+    // Matches Tinygrad's `UOp.sink(*e.src[1:]).ranges`.
     let sink = UOp::sink(ranges.iter().cloned().collect());
-    let actual_ranges: Vec<Arc<UOp>> =
-        sink.toposort().into_iter().filter(|node| matches!(node.op(), Op::Range { .. })).collect();
+    let actual_ranges = sink.ranges().clone();
 
     // No actual RANGEs found - nothing to split
     if actual_ranges.is_empty() {
@@ -104,11 +102,11 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
         return Some(new_end);
     }
 
-    // Step 2: Sort RANGEs by axis_id descending (innermost first)
-    // Note: Tinygrad sorts by full `x.arg` tuple (start, stop, axis_type) in reverse.
-    // We sort by axis_id only, which is sufficient for most cases since axis_id
-    // uniquely identifies the loop nesting level. Edge cases with duplicate axis_ids
-    // would need full tuple sorting.
+    // Step 2: Sort RANGEs by axis_id descending (innermost first).
+    // Matches Tinygrad's `sorted(..., key=lambda x: x.arg, reverse=True)`.
+    // Note: this assumes higher axis_id = innermost, which matches Tinygrad's
+    // convention. The codegen layer handles any remaining ordering issues
+    // via its range_stack (tracks actual RANGE emission order).
     let mut sorted_ranges = actual_ranges;
     sorted_ranges.sort_by(|a, b| {
         let (a_id, a_ty) = match a.op() {
@@ -119,11 +117,12 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
             Op::Range { axis_id, axis_type, .. } => (axis_id.value(), axis_type.priority()),
             _ => unreachable!("filtered to RANGEs only"),
         };
-        // Descending order: sort by (axis_id, axis_type_priority) — higher values first (innermost)
         (b_id, b_ty).cmp(&(a_id, a_ty))
     });
 
-    // Step 3: Wrap computation in nested single-range ENDs
+    // Step 3: Wrap computation in nested single-range ENDs.
+    // The first range in sorted_ranges is innermost, so it wraps computation first.
+    // Result: END(END(comp, inner), outer) — linearizer emits inner END first.
     let mut result = computation.clone();
     for range in sorted_ranges {
         result = result.end(SmallVec::from_elem(range, 1));

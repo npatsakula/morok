@@ -40,8 +40,8 @@ fn test_range_end_basic() {
     let kernel = result.unwrap();
     let ir = &kernel.code;
 
-    // Verify loop structure in generated IR
-    // Block names use uop_id which varies, so just check for the patterns
+    // Verify loop structure in generated IR (Tinygrad-style: entry/latch/body/footer/exit)
+    // Block names use axis_id which varies, so just check for the patterns
     assert!(ir.contains("loop_entry_"), "Missing entry block:\n{}", ir);
     assert!(ir.contains("loop_latch_"), "Missing latch block:\n{}", ir);
     assert!(ir.contains("loop_body_"), "Missing body block:\n{}", ir);
@@ -86,9 +86,9 @@ fn test_reduce_add_basic() {
     let kernel = result.unwrap();
     let ir = &kernel.code;
 
-    // Verify loop structure (uses standard loop blocks with alloca accumulator, like Tinygrad's DEFINE_REG)
+    // Verify loop structure (Tinygrad-style: entry/latch/body/footer/exit with alloca accumulator)
+    assert!(ir.contains("loop_entry_"), "Missing loop entry block:\n{}", ir);
     assert!(ir.contains("loop_latch_"), "Missing loop latch block:\n{}", ir);
-    assert!(ir.contains("loop_body_"), "Missing loop body block:\n{}", ir);
     assert!(ir.contains("loop_exit_"), "Missing loop exit block:\n{}", ir);
     // Verify accumulator alloca
     assert!(ir.contains("alloca float"), "Missing reduce accumulator alloca:\n{}", ir);

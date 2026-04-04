@@ -352,7 +352,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 return Some(());
             }
 
-            if src_llvm_type == dst_llvm_type {
+            if dtype.is_bool() && !src.dtype().is_bool() {
+                // Cast to bool: compare != 0 (not trunc, which only takes the low bit).
+                // Matches Tinygrad llvmir.py:99-101.
+                let cmp = if src.dtype().is_float() { "fcmp nsz arcp contract afn une" } else { "icmp ne" };
+                kernel.push(format!("  {dst} = {cmp} {src_llvm_type} {s}, zeroinitializer"));
+            } else if src_llvm_type == dst_llvm_type {
                 kernel.push(format!("  {dst} = bitcast {src_llvm_type} {s} to {dst_llvm_type}"));
             } else {
                 let cast_instr = lcast(&src.dtype(), dtype);
@@ -367,11 +372,18 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::Range { end, axis_id, .. } => {
-            let end_val = ctx.get(end);
+        Op::Range { axis_id, end, .. } => {
             let id = axis_id.value();
             let dtype = ldt(&uop.dtype());
+            let end_val = ctx.get(end).to_string();
 
+            // Track range nesting for correct END footer ordering.
+            ctx.push_range(id);
+
+            // Matches Tinygrad llvmir.py:156-165 exactly:
+            //   entry → loop_entry (preheader) → loop_latch (phi+incr+cmp) → loop_body / loop_exit
+            //   loop_body contains body instructions
+            //   END branches to loop_footer → loop_latch (back edge)
             kernel.push(format!("  br label %loop_entry_{id}"));
             kernel.push(format!("loop_entry_{id}:"));
             kernel.push(format!("  br label %loop_latch_{id}"));
@@ -385,12 +397,18 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         }
 
         Op::End { ranges, .. } => {
-            for range in ranges.iter() {
-                if let Op::Range { axis_id, axis_type, .. } = range.op() {
-                    if matches!(axis_type, AxisType::Thread) {
-                        continue;
-                    }
-                    let id = axis_id.value();
+            // After pm_split_ends, each END has exactly one RANGE.
+            // Use the range_stack to emit footer blocks in correct nesting order
+            // (innermost first = LIFO), regardless of the END's ranges field order.
+            let range_count = ranges
+                .iter()
+                .filter(|r| matches!(r.op(), Op::Range { axis_type, .. } if !matches!(axis_type, AxisType::Thread)))
+                .count();
+            for _ in 0..range_count {
+                if let Some(id) = ctx.pop_range() {
+                    // Matches Tinygrad llvmir.py:166-170 exactly:
+                    //   body → loop_footer → loop_latch (back edge)
+                    //   loop_exit: falls through after loop
                     kernel.push(format!("  br label %loop_footer_{id}"));
                     kernel.push(format!("loop_footer_{id}:"));
                     kernel.push(format!("  br label %loop_latch_{id}"));
@@ -456,9 +474,10 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
-        Op::PtrCat { sources } => {
-            render_ptrcat(&dst, sources, ctx, kernel);
-            Some(())
+        Op::PtrCat { .. } => {
+            panic!(
+                "PtrCat must be eliminated before codegen (devectorize should distribute it into scalar loads/stores)"
+            );
         }
 
         Op::Contract { src, .. } | Op::Unroll { src, .. } | Op::Detach { src } => {
@@ -895,24 +914,6 @@ fn render_cat(dst: &str, sources: &[Arc<UOp>], ctx: &RenderContext, kernel: &mut
                 out_idx += 1;
             }
         }
-    }
-}
-
-fn render_ptrcat(dst: &str, sources: &[Arc<UOp>], ctx: &RenderContext, kernel: &mut Vec<String>) {
-    if sources.is_empty() {
-        return;
-    }
-
-    let count = sources.len();
-    let ptr_type = ldt(&sources[0].dtype());
-    let vec_type = format!("<{count} x {ptr_type}>");
-
-    let mut prev = "undef".to_string();
-    for (i, src) in sources.iter().enumerate() {
-        let val = ctx.get(src);
-        let next = if i == count - 1 { dst.to_string() } else { format!("{dst}.p{i}") };
-        kernel.push(format!("  {next} = insertelement {vec_type} {prev}, {ptr_type} {val}, i32 {i}"));
-        prev = next;
     }
 }
 

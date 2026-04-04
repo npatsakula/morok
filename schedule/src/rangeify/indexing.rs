@@ -231,6 +231,7 @@ pub(crate) fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
         Op::Contiguous { .. }
             | Op::Copy { .. }
             | Op::Buffer { .. }
+            | Op::Param { .. }
             | Op::BufferView { .. }
             | Op::Const(_)
             | Op::Device(_)
@@ -310,9 +311,8 @@ pub(crate) fn merge_consumer_ranges(
         let ranges_same = all_ranges_same(&indices);
 
         // Tinygrad: `if all_all_same or (PCONTIG and all_same(local_rngs)):` → merge
-        // With PCONTIG=0: only merge when all_all_same is True.
-        // TODO: ranges_same should be gated on PCONTIG > 0 for full alignment.
-        if all_all_same || ranges_same {
+        // With PCONTIG=0 (default): only merge when all_all_same is True.
+        if all_all_same {
             debug!(dim_idx, ranges_same, all_all_same, "merge_consumer_ranges: merging dimension");
             let merged_idx = Arc::clone(&indices[0]);
             let merged_valid = if valids.len() == 1 {
@@ -321,10 +321,16 @@ pub(crate) fn merge_consumer_ranges(
                 valids.iter().skip(1).try_fold(Arc::clone(&valids[0]), |acc, v| acc.try_or_op(v))?
             };
 
+            // Build WHERE(valid, idx, Invalid) and simplify immediately.
+            // Tinygrad indexing.py:220: graph_rewrite(minimum_valid.where(x, Invalid), symbolic)
+            // Without this simplification, unsimplified WHERE/Not chains accumulate
+            // and cause oscillation in downstream symbolic passes.
             let merged_range = if is_const_true(&merged_valid) {
                 merged_idx
             } else {
-                UOp::try_where(merged_valid, merged_idx, UOp::invalid_marker())?
+                let raw = UOp::try_where(merged_valid, merged_idx, UOp::invalid_marker())?;
+                // Tinygrad indexing.py:220 uses full `symbolic` here (not symbolic_simple)
+                crate::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic(), raw, &mut ())
             };
             out_rngs.push(merged_range);
         } else {
@@ -364,11 +370,7 @@ fn assign_ranges(
             continue;
         }
 
-        let _span = info_span!("assign_range",
-            uop_id = x.id,
-            op = ?std::mem::discriminant(x.op())
-        )
-        .entered();
+        let _span = info_span!("assign_range", uop_id = x.id, op = x.op().as_ref()).entered();
 
         let consumers: Vec<_> = consumer_map.get(&UOpKey(x.clone())).cloned().unwrap_or_default();
         let consumer_rngs: Vec<Vec<Arc<UOp>>> =
@@ -401,6 +403,12 @@ fn assign_ranges(
             // Realized op: create fresh ranges for all dimensions (Tinygrad indexing.py:186-193).
             // CONTIGUOUS, COPY, ASSIGN, and ops marked by ending_ranges all land here.
             if let Some(shape) = x.shape()? {
+                debug!(
+                    node_id = x.id,
+                    op = x.op().as_ref(),
+                    dims = shape.len(),
+                    "REALIZE via realize_map (fresh ranges)"
+                );
                 let rngs: Vec<_> = shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect();
                 let axes: Vec<usize> = (0..shape.len()).collect();
                 ctx.realize_map.insert(UOpKey(x.clone()), Some(axes));
@@ -414,6 +422,12 @@ fn assign_ranges(
             // Use the ReduceAxis's OUTPUT shape, not input shape.
             // For keepdim=true, output shape is [1], not [] - we must use actual output shape.
             // Tinygrad inherits output ranges from consumers or creates based on output shape.
+            debug!(
+                node_id = x.id,
+                num_consumer_rngs = consumer_rngs.len(),
+                has_ending = !ending_ranges.get(&UOpKey(x.clone())).is_none_or(|e| e.is_empty()),
+                "ReduceAxis range assignment path"
+            );
             if consumer_rngs.is_empty() {
                 if let Some(out_shape) = x.shape()? {
                     out_shape.iter().map(|s| ctx.new_range(s, AxisType::Loop)).collect()
@@ -469,7 +483,7 @@ fn assign_ranges(
 
                 debug!(
                     node_id = x.id,
-                    op = ?std::mem::discriminant(x.op()),
+                    op = x.op().as_ref(),
                     ending_count = ending.len(),
                     realize_axes = ?realize_axes,
                     "SELECTIVE REALIZATION via ending_ranges"

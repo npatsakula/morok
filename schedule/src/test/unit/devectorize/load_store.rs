@@ -1,8 +1,9 @@
-//! Phase 2 tests: PTRCAT distribution and split load/store.
+//! Load/store tests: PTRCAT distribution, split load/store, integration.
 //!
-//! Tests for the load_store_patterns which:
-//! 1. Distribute PTRCAT through LOAD/STORE operations
-//! 2. Split LOAD/STORE by fold length divisibility
+//! Tests for the full devectorize pipeline which:
+//! 1. Distributes PTRCAT through LOAD/STORE operations
+//! 2. Splits LOAD/STORE by fold length divisibility
+//! 3. Converts vector structures to final codegen form
 //!
 //! Based on Tinygrad's devectorizer.py load_store_folding and split_load_store.
 
@@ -35,7 +36,7 @@ fn test_distribute_ptrcat_load_dual() {
     // LOAD(buffer, ptrcat)
     let load = UOp::load().buffer(buffer.clone()).index(ptrcat).call();
 
-    let result = apply_phase2(&load);
+    let result = apply_devectorize(&load);
 
     // Result should be CAT(LOAD(idx1), LOAD(idx2)) or VECTORIZE equivalent
     match result.op() {
@@ -63,7 +64,7 @@ fn test_distribute_ptrcat_load_quad() {
     let ptrcat = UOp::ptrcat().sources(indices).call();
     let load = UOp::load().buffer(buffer.clone()).index(ptrcat).call();
 
-    let result = apply_phase2(&load);
+    let result = apply_devectorize(&load);
 
     match result.op() {
         Op::Cat { sources } => {
@@ -86,7 +87,7 @@ fn test_distribute_ptrcat_preserves_buffer() {
     let ptrcat = UOp::ptrcat().sources(vec![idx1, idx2]).call();
     let load = UOp::load().buffer(buffer.clone()).index(ptrcat).call();
 
-    let result = apply_phase2(&load);
+    let result = apply_devectorize(&load);
 
     // All LOADs should reference the same buffer
     let buffer_refs =
@@ -111,7 +112,7 @@ fn test_distribute_ptrcat_store() {
     let ptrcat = UOp::ptrcat().sources(vec![idx1, idx2]).call();
     let store = ptrcat.store(value);
 
-    let result = apply_phase2(&store);
+    let result = apply_devectorize(&store);
 
     // Result should be GROUP of individual STOREs
     match result.op() {
@@ -137,7 +138,7 @@ fn test_distribute_ptrcat_store_quad() {
     let ptrcat = UOp::ptrcat().sources(indices).call();
     let store = ptrcat.store(value);
 
-    let result = apply_phase2(&store);
+    let result = apply_devectorize(&store);
 
     match result.op() {
         Op::Group { sources } => {
@@ -168,7 +169,7 @@ fn test_split_load_vec8_to_vec4() {
     let load_dtype = DType::Float32.vec(8);
     let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
-    let result = apply_phase2(&load);
+    let result = apply_devectorize(&load);
 
     // Should be split into 2x vec4 loads (8 = 4 + 4)
     match result.op() {
@@ -205,7 +206,7 @@ fn test_split_load_vec6_mixed() {
     let load_dtype = DType::Float32.vec(6);
     let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
-    let result = apply_phase2(&load);
+    let result = apply_devectorize(&load);
 
     // Should be split into vec4 + vec2
     match result.op() {
@@ -235,7 +236,7 @@ fn test_split_store_vec8() {
 
     let store = cast_idx.store(value);
 
-    let result = apply_phase2(&store);
+    let result = apply_devectorize(&store);
 
     // Should be split into 2x vec4 stores
     match result.op() {
@@ -276,7 +277,7 @@ fn test_split_preserves_ranges() {
 
     let store = cast_idx.store_with_ranges(value, smallvec![range.clone()]);
 
-    let result = apply_phase2(&store);
+    let result = apply_devectorize(&store);
 
     // Check that ranges are preserved in split stores
     match result.op() {
@@ -298,39 +299,37 @@ fn test_split_preserves_ranges() {
 }
 
 // =============================================================================
-// Integration Tests (Phase 1 -> Phase 2)
+// Integration Tests (full pipeline)
 // =============================================================================
 
-/// Test: LOAD after expand_index produces correct output.
+/// Test: LOAD with vector index through full pipeline.
 #[test]
-fn test_load_after_expand_index() {
+fn test_load_vector_index_full_pipeline() {
     let buffer = create_buffer(64);
     let index = create_vector_index_iota(buffer.clone(), 4);
     let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
-    // Apply Phase 1 first
-    let after_phase1 = apply_phase1(&load);
+    let result = apply_devectorize(&load);
 
-    // Then apply Phase 2
-    let result = apply_phase2(&after_phase1);
-
-    // Final result should have proper structure
-    // Either CAT of scalar loads, VECTORIZE, or single contiguous load
-    let total_vcount = result.dtype().vcount();
-    assert!(total_vcount >= 1, "Should produce valid dtype");
+    // No PTRCAT should remain after full pipeline
+    assert_eq!(count_ptrcats(&result), 0, "No PTRCAT should remain");
+    // Should produce valid load structure
+    let load_count = count_loads(&result);
+    assert!(load_count >= 1, "Should have at least one LOAD");
 }
 
-/// Test: STORE after expand_index produces correct output.
+/// Test: STORE with vector index through full pipeline.
 #[test]
-fn test_store_after_expand_index() {
+fn test_store_vector_index_full_pipeline() {
     let buffer = create_buffer(64);
     let value = create_vector_float_iota(4);
     let index = create_vector_index_iota(buffer.clone(), 4);
     let store = index.store(value);
 
-    let after_phase1 = apply_phase1(&store);
-    let result = apply_phase2(&after_phase1);
+    let result = apply_devectorize(&store);
 
+    // No PTRCAT should remain after full pipeline
+    assert_eq!(count_ptrcats(&result), 0, "No PTRCAT should remain");
     // Should produce GROUP of stores or single store
     let store_count = count_stores(&result);
     assert!(store_count >= 1, "Should have at least one store");
@@ -358,7 +357,7 @@ fn test_split_load_divisibility() {
     let load_dtype = DType::Float32.vec(8);
     let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
-    let result = apply_phase2(&load);
+    let result = apply_devectorize(&load);
 
     // With offset 8 (divisible by 4), should prefer vec4 chunks
     // Result may be CAT, LOAD, or VECTORIZE (of scalar GEPs from vec4 loads)
@@ -403,7 +402,7 @@ fn test_split_load_not_divisible() {
     let load_dtype = DType::Float32.vec(8);
     let load = UOp::load().buffer(buffer.clone()).index(cast_idx).dtype(load_dtype).call();
 
-    let result = apply_phase2(&load);
+    let result = apply_devectorize(&load);
 
     // With offset 3 (not divisible by 4), may use smaller chunks
     // Verify total vcount is preserved

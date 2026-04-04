@@ -12,5 +12,5 @@ pub mod valid_simplification;
 
 pub use fast_div::fast_division_patterns;
 pub use index_lowering::pm_lower_index_dtype;
-pub use patterns::{symbolic, symbolic_simple};
+pub use patterns::{sym, symbolic, symbolic_simple};
 pub use valid_simplification::pm_simplify_valid;

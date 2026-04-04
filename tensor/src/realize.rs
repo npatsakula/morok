@@ -302,77 +302,82 @@ impl Tensor {
     pub fn prepare_with(&mut self, config: &PrepareConfig) -> Result<ExecutionPlan> {
         let t_total = std::time::Instant::now();
         let uop = self.uop();
-
-        // Step 0: Resolve pending assigns so input buffers exist for scheduling.
         resolve_pending_assigns(&uop, config)?;
 
-        // Step 1: Mark computation for realization via CONTIGUOUS (Tinygrad approach).
-        // Ranges are NOT pre-created here — the rangeify pipeline assigns them
-        // via consumer-driven propagation in assign_ranges().
-        let contiguous = uop.contiguous();
-
-        // Step 2: Create SINK of the CONTIGUOUS
-        let sink = UOp::sink(vec![contiguous]);
-
-        // Step 3: Run rangeify pipeline
-        // Note: The rangeify becomes_map (STORE/INDEX/RANGE nodes) is NOT applied globally —
-        // it would corrupt other tensors. Instead, realize() applies a minimal output-only
-        // becomes_map (old_uop -> realized BUFFER+RESHAPE) after execution.
-        let t_step = std::time::Instant::now();
-        let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
-        let rangeified = rangeify_result.sink;
-        debug!(elapsed_ms = t_step.elapsed().as_millis() as u64, "prepare: rangeify complete");
-
-        trace!(ast = %rangeified.tree_full(), "post-rangeify ast");
-
-        // Step 4: Run kernel splitting pipeline
-        let t_step = std::time::Instant::now();
-        let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeified);
-        debug!(elapsed_ms = t_step.elapsed().as_millis() as u64, "prepare: kernel split complete");
-
-        trace!(ast = %kernelized.tree_full(), "post-kernel-split ast");
-
-        // Step 5: Collect input buffers from the computation graph
-        // This allows schedule creation to find buffers without global registry lookups
-        let input_buffers = collect_input_buffers(&uop);
-
-        // Step 5.5: Extract bound variable values (BIND(DEFINE_VAR, CONST)) pre-pipeline.
-        // This captures user Variable bindings so scheduling treats them as fixed parameters
-        // rather than OUTER ranges to expand.
+        let sink = UOp::sink(vec![uop.contiguous()]);
         let var_vals = extract_var_vals(&uop);
 
-        // Step 6: Create schedule from kernels
-        let t_step = std::time::Instant::now();
-        let schedule_result = crate::schedule::create_schedule(kernelized, kernel_ctx, &input_buffers, &var_vals)?;
-        debug!(
-            elapsed_ms = t_step.elapsed().as_millis() as u64,
-            num_kernels = schedule_result.items.len(),
-            "prepare: schedule complete"
-        );
+        // Pre-schedule normalization: BUFFER→PARAM (Tinygrad pm_pre_sched_cache).
+        // Erases buffer identity so structurally identical computations on different
+        // buffers share the same schedule cache entry.
+        let (normalized, param_buffers) = normalize_buffers_to_params(&sink);
 
-        // Step 7: Build execution plan
-        let t_step = std::time::Instant::now();
-        let plan = prepare_execution_plan(&schedule_result, config)?;
-        debug!(elapsed_ms = t_step.elapsed().as_millis() as u64, "prepare: execution plan complete");
-
-        // Step 8: Wire output tensor to plan buffer
-        if plan.num_outputs() > 0 {
-            let output_buf = plan.output_buffer().clone();
-            let buf_arc = Arc::new(output_buf);
-            let output_dtype = uop.dtype();
-            let output_device = buf_arc.allocator().device_spec();
-            let num_elements = buf_arc.size() / output_dtype.bytes();
-            let buffer_uop = UOp::new_buffer(output_device, num_elements, output_dtype);
-            crate::tensor_registry::register_buffer(buffer_uop.id, self.entry.id, buf_arc.clone());
-            let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
-            let realized_uop = buffer_uop.try_reshape(shape).context(UOpSnafu)?;
-            self.set_uop(realized_uop);
-            self.entry.set_buffer(Arc::clone(&buf_arc));
-            self.buffer = Some(buf_arc);
+        // Build input_buffers keyed by PARAM UOp IDs (the normalized graph
+        // no longer has BUFFER nodes — they've been replaced with PARAMs).
+        let mut param_input_buffers = crate::schedule::InputBuffers::new();
+        for node in normalized.toposort() {
+            if let Op::Param { slot, .. } = node.op() {
+                let (orig_buffer_id, _) = &param_buffers[*slot];
+                if let Some(buf) = crate::tensor_registry::get_buffer(*orig_buffer_id) {
+                    param_input_buffers.insert(node.id, buf);
+                }
+            }
         }
 
+        // Compute cache key: (structural hash of normalized sink, codegen backend).
+        let codegen = resolve_codegen(&param_buffers, config)?;
+        let sched_key = (crate::schedule_cache::content_hash(&normalized), codegen);
+
+        // Check schedule-level cache. On hit, skip rangeify + kernel_split.
+        let cache = crate::schedule_cache::schedule_cache();
+        let entry = {
+            let guard = cache.guard();
+            cache.get(&sched_key, &guard).cloned()
+        };
+        let entry = match entry {
+            Some(hit) => {
+                debug!("schedule cache hit");
+                hit
+            }
+            None => {
+                let rangeify_result = morok_schedule::rangeify_with_map(normalized, None).context(RangeifySnafu)?;
+                let (k, kctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
+                let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { kernelized: k, kernel_ctx: kctx });
+                let guard = cache.guard();
+                cache.insert(sched_key, Arc::clone(&new_entry), &guard);
+                new_entry
+            }
+        };
+
+        let schedule_result = crate::schedule::create_schedule(
+            entry.kernelized.clone(),
+            &entry.kernel_ctx,
+            &param_input_buffers,
+            &var_vals,
+        )?;
+        // Per-kernel optimization+compilation is cached globally in prepare_execution_plan
+        // via OPT_CACHE keyed by content_hash(ast). Identical kernel ASTs across calls
+        // (e.g., sort substages, repeated model inference) skip optimize+compile.
+        let plan = prepare_execution_plan(&schedule_result, config)?;
+
+        self.wire_output_tensor(&plan, &uop)?;
         debug!(total_ms = t_total.elapsed().as_millis() as u64, "prepare: total");
         Ok(plan)
+    }
+
+    fn wire_output_tensor(&mut self, plan: &ExecutionPlan, uop: &Arc<UOp>) -> Result<()> {
+        if plan.num_outputs() > 0 {
+            let buf = Arc::new(plan.output_buffer().clone());
+            let dtype = uop.dtype();
+            let device = buf.allocator().device_spec();
+            let buffer_uop = UOp::new_buffer(device, buf.size() / dtype.bytes(), dtype);
+            crate::tensor_registry::register_buffer(buffer_uop.id, self.entry.id, buf.clone());
+            let shape = uop.shape().context(UOpSnafu)?.context(ShapeUnknownSnafu)?;
+            self.set_uop(buffer_uop.try_reshape(shape).context(UOpSnafu)?);
+            self.entry.set_buffer(buf.clone());
+            self.buffer = Some(buf);
+        }
+        Ok(())
     }
 
     // =========================================================================
@@ -451,7 +456,7 @@ impl Tensor {
         // Pipeline: rangeify → kernel_split → schedule → plan → execute
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
-        let schedule_result = crate::schedule::create_schedule(kernelized, kernel_ctx, &all_input_buffers, &var_vals)?;
+        let schedule_result = crate::schedule::create_schedule(kernelized, &kernel_ctx, &all_input_buffers, &var_vals)?;
 
         let t_prep = std::time::Instant::now();
         let plan = prepare_execution_plan(&schedule_result, config)?;
@@ -538,9 +543,28 @@ impl Tensor {
         let contiguouses: Vec<Arc<UOp>> = uops.iter().map(|u| u.contiguous()).collect();
         let sink = UOp::sink(contiguouses);
 
+        // Pre-schedule normalization: BUFFER→PARAM (Tinygrad pm_pre_sched_cache).
+        // Erases buffer identity so structurally identical computations on different
+        // buffers share the same AST. Enables kernel compilation dedup.
+        let (sink, param_buffers) = normalize_buffers_to_params(&sink);
+
+        // Rebuild input_buffers keyed by PARAM UOp ids (the normalized graph
+        // no longer has BUFFER nodes — they've been replaced with PARAMs).
+        // Each PARAM's id maps to the original BUFFER's device allocation.
+        let mut param_input_buffers = crate::schedule::InputBuffers::new();
+        for node in sink.toposort() {
+            if let Op::Param { slot, .. } = node.op() {
+                let (orig_buffer_id, _) = &param_buffers[*slot];
+                if let Some(buf) = crate::tensor_registry::get_buffer(*orig_buffer_id) {
+                    param_input_buffers.insert(node.id, buf);
+                }
+            }
+        }
+
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
-        let schedule_result = crate::schedule::create_schedule(kernelized, kernel_ctx, &all_input_buffers, &var_vals)?;
+        let schedule_result =
+            crate::schedule::create_schedule(kernelized, &kernel_ctx, &param_input_buffers, &var_vals)?;
 
         let plan = prepare_execution_plan(&schedule_result, config)?;
 
@@ -626,7 +650,7 @@ fn realize_pending_recursive(buf_id: u64, config: &PrepareConfig) -> Result<()> 
 
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
-        let schedule_result = crate::schedule::create_schedule(kernelized, kernel_ctx, &input_buffers, &var_vals)?;
+        let schedule_result = crate::schedule::create_schedule(kernelized, &kernel_ctx, &input_buffers, &var_vals)?;
 
         if schedule_result.items.is_empty() {
             continue;
@@ -676,6 +700,44 @@ fn extract_var_vals(root: &Arc<UOp>) -> HashMap<String, i64> {
         }
     }
     var_vals
+}
+
+/// Pre-schedule normalization: replace BUFFER UOps with positional PARAM.
+///
+/// Erases buffer identity (UNIQUE id) so structurally identical computations
+/// on different buffers produce the same AST. Returns:
+/// - The normalized sink (BUFFER→PARAM)
+/// - `param_buffers`: slot → (original_buffer_uop_id, buffer_uop) for buffer lookup
+///
+/// Matches Tinygrad's `pm_pre_sched_cache` / `replace_input_buffer` (engine/schedule.py:103-130).
+/// Context for BUFFER→PARAM normalization (like Tinygrad's replace_input_buffer).
+pub(crate) struct NormalizeBuffersCtx {
+    pub buffer_map: HashMap<u64, usize>,
+    pub param_buffers: Vec<(u64, Arc<UOp>)>,
+}
+
+fn normalize_buffers_patterns() -> &'static morok_schedule::TypedPatternMatcher<NormalizeBuffersCtx> {
+    use std::sync::LazyLock;
+    static CACHED: LazyLock<morok_schedule::TypedPatternMatcher<NormalizeBuffersCtx>> = LazyLock::new(|| {
+        morok_schedule::patterns! {
+            @context NormalizeBuffersCtx;
+            buf @ Buffer { size, unique: _, .. } => {
+                let slot = *ctx.buffer_map.entry(buf.id).or_insert_with(|| {
+                    let s = ctx.param_buffers.len();
+                    ctx.param_buffers.push((buf.id, buf.clone()));
+                    s
+                });
+                Some(UOp::param(slot, *size, buf.dtype()))
+            },
+        }
+    });
+    &CACHED
+}
+
+pub(crate) fn normalize_buffers_to_params(sink: &Arc<UOp>) -> (Arc<UOp>, Vec<(u64, Arc<UOp>)>) {
+    let mut ctx = NormalizeBuffersCtx { buffer_map: HashMap::new(), param_buffers: Vec::new() };
+    let normalized = morok_schedule::rewrite::graph_rewrite(normalize_buffers_patterns(), sink.clone(), &mut ctx);
+    (normalized, ctx.param_buffers)
 }
 
 /// Collect input buffers from a computation graph.
@@ -886,13 +948,7 @@ fn prepare_execution_plan(
         return EmptyScheduleSnafu.fail();
     };
 
-    // Include compiler cache key in device string to prevent cross-backend cache collisions.
-    // Without this, "CPU" is shared between Clang and LLVM, so switching backends in the
-    // same process would return a kernel compiled by the wrong backend.
-    let device_str = match device.compiler.cache_key() {
-        Some(key) => format!("{}:{}", device.device.canonicalize(), key),
-        None => device.device.canonicalize(),
-    };
+    let codegen: &'static str = device.compiler.cache_key();
 
     // Build the ExecutionPlan using the builder
     let mut builder = ExecutionPlanBuilder::new(device.device.clone());
@@ -919,8 +975,13 @@ fn prepare_execution_plan(
     let mut prepared_kernels: Vec<PreparedKernel> = Vec::new();
 
     // Pre-compile: optimize + compile each UNIQUE ast once, cache by pre-optimization ast id.
-    // Expanded schedule items sharing the same ast get the same compiled kernel.
-    let mut compiled_cache: HashMap<u64, Arc<morok_runtime::kernel_cache::CachedKernel>> = HashMap::new();
+    // Uses global cache so identical kernels across prepare calls (e.g., sort substages
+    // with same axis) skip both optimization and compilation.
+    type OptKey = (u64, DeviceSpec, &'static str);
+    static OPT_CACHE: std::sync::OnceLock<papaya::HashMap<OptKey, Arc<morok_runtime::kernel_cache::CachedKernel>>> =
+        std::sync::OnceLock::new();
+    let opt_cache = OPT_CACHE.get_or_init(papaya::HashMap::new);
+    let opt_guard = opt_cache.guard();
 
     for item in &expanded_schedule {
         // Skip COPY operations for now (handle separately in execution)
@@ -929,60 +990,46 @@ fn prepare_execution_plan(
             continue;
         }
 
-        // Cache by pre-optimization AST id — expanded items sharing the same AST
-        // (from OUTER range expansion) compile once, not N times.
-        let pre_opt_id = item.ast.id;
+        let opt_key = (crate::schedule_cache::content_hash(&item.ast), device.device.clone(), codegen);
 
-        let cached = if let Some(cached) = compiled_cache.get(&pre_opt_id) {
-            cached.clone()
+        let cached = if let Some(cached) = opt_cache.get(&opt_key, &opt_guard) {
+            Arc::clone(cached)
         } else {
-            // Step 1: Get device-aware optimizer renderer
             let optimizer_renderer = get_optimizer_renderer(&device);
-
-            // Step 2: Optimize OUTSIDE cache (enables beam search)
             let optimized_ast = if let morok_schedule::OptStrategy::Beam { .. } = config.optimizer.strategy {
-                // Beam search: compile-and-time multiple candidates
                 beam_search_optimize(item.ast.clone(), &optimizer_renderer, &device, &item.buffers, &config.optimizer)?
             } else {
-                // Heuristic optimization (default)
                 morok_schedule::optimize_kernel_with_config(item.ast.clone(), &optimizer_renderer, &config.optimizer)
             };
 
-            // Extract kernel name from metadata (attached by Scheduler, preserved through post-opt)
             let kernel_name =
                 optimized_ast.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
 
-            // Step 3: Apply decomposition
             let ast_decomposed = match device.renderer.decompositor() {
-                Some(matcher) => {
-                    tracing::debug!("Applying backend decomposition patterns");
-                    let decomposed = morok_ir::decompositions::decompose_with(&optimized_ast, &matcher);
-                    tracing::debug!("Decomposition complete");
-                    decomposed
-                }
-                None => {
-                    tracing::debug!("No decomposition needed (renderer provides no decompositor)");
-                    optimized_ast
-                }
+                Some(matcher) => morok_ir::decompositions::decompose_with(&optimized_ast, &matcher),
+                None => optimized_ast,
             };
 
-            // Step 4: Compile (also cached by post-opt AST id for cross-run dedup)
-            let result = morok_runtime::kernel_cache::get_or_compile_kernel(ast_decomposed.id, &device_str, || {
-                let spec =
-                    device.renderer.render(&ast_decomposed, kernel_name.as_deref()).context(RenderKernelSnafu)?;
-                let compiled = device.compiler.compile(&spec).context(CompileKernelSnafu)?;
-                let program = (device.runtime)(&compiled).context(CreateProgramSnafu)?;
-                Ok(morok_runtime::kernel_cache::CachedKernel {
-                    program,
-                    device: device_str.clone(),
-                    code: spec.src.clone(),
-                    entry_point: spec.name.clone(),
-                    var_names: spec.var_names.clone(),
-                    global_size: spec.global_size,
-                    local_size: spec.local_size,
-                })
-            })?;
-            compiled_cache.insert(pre_opt_id, result.clone());
+            let result = morok_runtime::kernel_cache::get_or_compile_kernel(
+                crate::schedule_cache::content_hash(&ast_decomposed),
+                codegen,
+                || {
+                    let spec =
+                        device.renderer.render(&ast_decomposed, kernel_name.as_deref()).context(RenderKernelSnafu)?;
+                    let compiled = device.compiler.compile(&spec).context(CompileKernelSnafu)?;
+                    let program = (device.runtime)(&compiled).context(CreateProgramSnafu)?;
+                    Ok(morok_runtime::kernel_cache::CachedKernel {
+                        program,
+                        device: codegen.to_string(),
+                        code: spec.src.clone(),
+                        entry_point: spec.name.clone(),
+                        var_names: spec.var_names.clone(),
+                        global_size: spec.global_size,
+                        local_size: spec.local_size,
+                    })
+                },
+            )?;
+            opt_cache.insert(opt_key, Arc::clone(&result), &opt_guard);
             result
         };
 
@@ -1044,6 +1091,15 @@ fn prepare_execution_plan(
     }
 
     Ok(builder.build())
+}
+
+/// Resolve the device string for cache keying (includes compiler cache key).
+pub(crate) fn resolve_codegen(param_buffers: &[(u64, Arc<UOp>)], config: &PrepareConfig) -> Result<&'static str> {
+    let alloc_registry = morok_device::registry::registry();
+    let first_buf = param_buffers.iter().find_map(|(id, _)| crate::tensor_registry::get_buffer(*id));
+    let spec = first_buf.as_ref().map(|b| b.allocator().device_spec()).unwrap_or(DeviceSpec::Cpu);
+    let device = config.resolve_device(&spec, alloc_registry)?;
+    Ok(device.compiler.cache_key())
 }
 
 /// Get the optimizer renderer for a device.

@@ -203,8 +203,7 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
         // INDEX(buf, idx.cast(Index)) → INDEX(buf, idx) preserving INDEX dtype
         // Tinygrad: buf.index(idx, ptr=True) - preserves buffer's Ptr dtype
         // Note: we use node.dtype() instead of buffer.dtype() to preserve any
-        // explicit dtype set by earlier passes (e.g. contiguous_gep_load_patterns
-        // sets Ptr{base: scalar} for vector buffer reads).
+        // explicit dtype set by earlier passes.
         node @ Index { buffer, indices, gate: None } if indices.len() == 1 => |node, buffer, indices| {
             let idx = &indices[0];
             let Op::Cast { src, dtype } = idx.op() else { return None };
