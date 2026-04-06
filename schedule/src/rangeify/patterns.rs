@@ -691,7 +691,10 @@ fn apply_pcontig_removal_inner(
             false
         } else {
             let sink = UOp::sink(reduce_sources);
-            sink.any_in_subtree(|n| matches!(n.op(), Op::Buffer { .. } | Op::Bufferize { .. }))
+            // Tinygrad (rangeify.py:230): checks for PARAM or BUFFERIZE in reduce body.
+            // Must include Op::Param because normalize_buffers_to_params converts
+            // Buffer → Param before buffer removal runs.
+            sink.any_in_subtree(|n| matches!(n.op(), Op::Buffer { .. } | Op::Param { .. } | Op::Bufferize { .. }))
         }
     };
 

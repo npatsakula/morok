@@ -448,12 +448,15 @@ pub fn pm_render() -> &'static TypedPatternMatcher {
             Some(UOp::load().buffer(load.load_buffer()?).index(index.clone()).alt(alt_value).dtype(load.dtype()).call())
         },
 
-        // WHERE(c, LOAD(INDEX(buf, idx, c)), alt) → LOAD with alt value (devectorizer.py:271-272)
-        // The load's gate matches the WHERE condition
-        Where(cond, load @ Load { index, alt: None, .. }, alt)
+        // WHERE(c, LOAD(INDEX(buf, idx, c)), alt) → LOAD with alt value (devectorizer.py:289-291)
+        // The load's gate matches the WHERE condition.
+        // Matches Tinygrad's allow_any_len=True (no alt: None guard).
+        // NOTE: if alt is CAST and alt.src.dtype == load.dtype, use alt.src to avoid
+        // roundtrip cast (e.g. uint->float->uint).
+        Where(cond, load @ Load { index, .. }, alt)
             if index_has_gate_matching(index, cond)
             => |cond, load, index, alt| {
-                let casted_alt = alt.cast(load.dtype());
+                let casted_alt = cast_alt_avoiding_roundtrip(alt, &load.dtype());
                 let new_load = UOp::load()
                     .buffer(load.load_buffer()?)
                     .index(index.clone())
@@ -463,12 +466,13 @@ pub fn pm_render() -> &'static TypedPatternMatcher {
                 Some(new_load.cast(alt.dtype()))
             },
 
-        // WHERE(c, alt, LOAD(INDEX(buf, idx, !c))) → LOAD with alt value (devectorizer.py:273-274)
-        // Same pattern but with inverted condition in WHERE
-        Where(cond, alt, load @ Load { index, alt: None, .. })
+        // WHERE(c, alt, LOAD(INDEX(buf, idx, !c))) → LOAD with alt value (devectorizer.py:292-294)
+        // Same pattern but with inverted condition in WHERE.
+        // is_negation_of handles NOT(cond) and pm_comparison_negations simplified forms.
+        Where(cond, alt, load @ Load { index, .. })
             if index_has_inverted_gate_matching(index, cond)
             => |cond, alt, load, index| {
-                let casted_alt = alt.cast(load.dtype());
+                let casted_alt = cast_alt_avoiding_roundtrip(alt, &load.dtype());
                 let new_load = UOp::load()
                     .buffer(load.load_buffer()?)
                     .index(index.clone())
@@ -478,6 +482,18 @@ pub fn pm_render() -> &'static TypedPatternMatcher {
                 Some(new_load.cast(alt.dtype()))
             },
     }
+}
+
+/// Cast alt value to load dtype, avoiding roundtrip casts (devectorizer.py:290).
+/// If alt is CAST(inner) and inner.dtype == load_dtype, use inner directly
+/// to avoid e.g. uint→float→uint.
+fn cast_alt_avoiding_roundtrip(alt: &Arc<UOp>, load_dtype: &DType) -> Arc<UOp> {
+    if let Op::Cast { src: inner, .. } = alt.op()
+        && inner.dtype() == *load_dtype
+    {
+        return inner.clone();
+    }
+    alt.cast(load_dtype.clone())
 }
 
 /// Check if GEP is identity: GEP(x, [0,1,...,n-1]) where n == x.vcount
@@ -505,14 +521,60 @@ fn index_has_gate_matching(index: &Arc<UOp>, cond: &Arc<UOp>) -> bool {
 }
 
 /// Check if index has an inverted gate that matches the given condition.
-/// Matches INDEX(..., NOT(cond)) where cond is the WHERE condition.
+///
+/// Matches INDEX gate that is semantically NOT(cond). Handles three forms:
+/// 1. `NOT(cond)` — structural NOT, pointer-equal inner
+/// 2. `Lt(c-1, x)` when cond = `Lt(x, c)` — result of pm_comparison_negations on NOT(Lt(x,c))
+/// 3. `Lt(x, c+1)` when cond = `Lt(c, x)` — result of pm_comparison_negations on NOT(Lt(c,x))
+///
+/// Form 2/3 arise because dce_dsl_patterns swaps WHERE(NOT(Lt), t, f) → WHERE(Lt, f, t),
+/// then pm_comparison_negations converts the NOT(Lt) on the INDEX gate to a reversed Lt.
 fn index_has_inverted_gate_matching(index: &Arc<UOp>, cond: &Arc<UOp>) -> bool {
     match index.op() {
-        Op::Index { gate: Some(g), .. } => {
-            // Check if gate is NOT(cond)
-            if let Op::Unary(UnaryOp::Not, inner) = g.op() { Arc::ptr_eq(inner, cond) } else { false }
-        }
+        Op::Index { gate: Some(g), .. } => is_negation_of(g, cond),
         Op::Cast { src, .. } => index_has_inverted_gate_matching(src, cond),
+        _ => false,
+    }
+}
+
+/// Check if `gate` is semantically NOT(cond).
+fn is_negation_of(gate: &Arc<UOp>, cond: &Arc<UOp>) -> bool {
+    // Form 1: NOT(cond) — structural
+    if let Op::Unary(UnaryOp::Not, inner) = gate.op()
+        && Arc::ptr_eq(inner, cond)
+    {
+        return true;
+    }
+
+    // Form 2: gate = Lt(c-1, x), cond = Lt(x, c) — from pm_comparison_negations on NOT(Lt(x,c))
+    // Form 3: gate = Lt(x, c+1), cond = Lt(c, x) — from pm_comparison_negations on NOT(Lt(c,x))
+    if let Op::Binary(BinaryOp::Lt, gate_lhs, gate_rhs) = gate.op()
+        && let Op::Binary(BinaryOp::Lt, cond_lhs, cond_rhs) = cond.op()
+    {
+        // Form 2: gate_rhs == cond_lhs (same x), gate_lhs == c-1 where cond_rhs == c
+        if Arc::ptr_eq(gate_rhs, cond_lhs)
+            && let (Op::Const(gate_cv), Op::Const(cond_cv)) = (gate_lhs.op(), cond_rhs.op())
+            && is_const_minus_one(&cond_cv.0, &gate_cv.0)
+        {
+            return true;
+        }
+        // Form 3: gate_lhs == cond_rhs (same x), gate_rhs == c+1 where cond_lhs == c
+        if Arc::ptr_eq(gate_lhs, cond_rhs)
+            && let (Op::Const(cond_cv), Op::Const(gate_cv)) = (cond_lhs.op(), gate_rhs.op())
+            && is_const_minus_one(&cond_cv.0, &gate_cv.0)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if `a - 1 == b` (i.e., b = a - 1).
+fn is_const_minus_one(a: &ConstValue, b: &ConstValue) -> bool {
+    match (a, b) {
+        (ConstValue::Int(av), ConstValue::Int(bv)) => av.checked_sub(1) == Some(*bv),
+        (ConstValue::UInt(av), ConstValue::UInt(bv)) => av.checked_sub(1) == Some(*bv),
         _ => false,
     }
 }
@@ -901,6 +963,14 @@ fn no_vectorized_index_precnt(
 // ============================================================================
 
 /// INDEX(buf, x, true) → INDEX(buf, x, None)
+///
+/// Tinygrad (devectorizer.py:48-55) has 2 additional IMAGE-specific patterns:
+///
+/// 1. `simplify_valid_load(buf, x, cond)` for `INDEX(buf, WHERE(cond, x, Invalid))`
+/// 2. `simplify_valid_load(buf, x, c)` for `INDEX(buf, x:long, c:bool)` (post-lowering)
+///
+/// These use `uop_given_valid`/`parse_valid` and are tied to ImageDType.
+/// TODO: Add when implementing IMAGE backend support.
 pub fn load_store_indexing_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // INDEX(buf, idx, true) → INDEX(buf, idx, None) — remove trivially-true gate.
@@ -1396,7 +1466,10 @@ fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
     } else if is_amx {
         vec![16, 8, 4, 2, 1] // AMX: wider folds matching 64-byte row stride
     } else {
-        vec![4, 2, 1] // ctx.supports_float4
+        // Tinygrad uses ctx.supports_float4 from Renderer context (devectorizer.py:155-157).
+        // Hardcoded [4,2,1] matches the default supports_float4 path.
+        // TODO: Pass Renderer context through when adding backends with different fold lengths.
+        vec![4, 2, 1]
     };
 
     // Filter by divisibility (devectorizer.py:155-156)

@@ -21,10 +21,7 @@ use morok_ir::UOp;
 /// this hash is purely structural — identical trees always produce the same hash.
 /// Matches the role of Tinygrad's `UOp.key` (SHA-256 of tree structure).
 pub(crate) fn content_hash(uop: &UOp) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    uop.hash(&mut hasher);
-    hasher.finish()
+    uop.content_hash
 }
 
 /// Cache key: (content_hash of normalized sink, codegen backend string).

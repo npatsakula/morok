@@ -367,11 +367,26 @@ impl UOp {
         }
         // Dead weak ref - will be replaced below
 
+        // Compute structural content hash using children's content hashes.
+        // O(1) per node — children are already created with their content_hash set.
+        let content_hash = {
+            use xxhash_rust::xxh64::Xxh64;
+            let mut h = Xxh64::new(0);
+            std::mem::discriminant(&op).hash(&mut h);
+            dtype.hash(&mut h);
+            for child in op.children() {
+                h.write_u64(child.content_hash);
+            }
+            key.op_data.hash(&mut h);
+            h.finish()
+        };
+
         // Create new UOp (will be used if we win the race)
         let new_arc = Arc::new(Self {
             id: next_uop_id(),
             op,
             dtype,
+            content_hash,
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
@@ -467,6 +482,7 @@ impl UOp {
             id: next_uop_id(),
             op: self.op.clone(),
             dtype: self.dtype.clone(),
+            content_hash: self.content_hash, // same structure, same content hash
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),

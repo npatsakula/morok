@@ -73,9 +73,8 @@ use crate::devectorize::{
 use crate::gpudims::pm_add_gpudims;
 use crate::passes::pm_linearize_multi_index;
 use crate::rangeify::patterns::{
-    pm_add_loads, pm_bool_devectorize, pm_comparison_negations, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
-    pm_fma_decomposition, pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_reduce_devectorize,
-    rangeify_codegen_with_kernel_ctx,
+    pm_add_loads, pm_comparison_negations, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul, pm_fma_decomposition,
+    pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, rangeify_codegen_with_kernel_ctx,
 };
 use crate::rangeify::pm_add_buffers_local_patterns;
 use crate::rangeify::transforms::{pm_flatten_range, pm_simplify_ranges, pm_split_ranges};
@@ -117,9 +116,7 @@ pub fn optimize_kernel(ast: Arc<morok_ir::UOp>, renderer: &Renderer) -> Arc<moro
 /// - pm_add_loads: Extract LOAD ops from INDEX
 /// - pre_expand: Convert Range(Unroll/Upcast) → UNROLL, expand operations
 /// - pm_add_gpudims (GPU only): Convert GLOBAL/LOCAL RANGE to SPECIAL thread indices
-/// - no_vectorized_alu: Convert vector ALU to scalar + VECTORIZE
-/// - pm_reduce_devectorize: Unified REDUCE devectorization (K-vec, bool, horizontal)
-/// - pm_bool_devectorize: Convert <N x i1> to scalar ops
+/// - devectorize: Combined pass (sym + devec + load_store_folding + correct_load_store + indexing)
 /// - bool_storage_patterns: Convert bool LOAD/STORE to uint8
 ///
 /// NOTE: We do NOT apply FMA decomposition (a*b+c → MulAcc). Following Tinygrad's
@@ -295,44 +292,27 @@ pub fn apply_post_optimization_with_renderer(
     // no_vectorized_alu runs in the same pass as load_store_folding (step 14).
     // Previously, an isolated pass here combined no_vectorized_alu + gep_pushing without
     // load/store folding, causing graph explosion on wide VECTORIZE nodes (VECTORIZE(135)).
+    // Tinygrad Stage 14: devectorize — single combined pass handles ALL devectorization
+    // including bool ALU (via no_vectorized_alu). No separate pm_bool_devectorize or
+    // pm_reduce_devectorize passes — matching Tinygrad's pipeline exactly.
     let t_stage = std::time::Instant::now();
-    let devectorized_mem = crate::devectorize::devectorize(&with_loads);
-    tracing::debug!(
-        ast.optimized = devectorized_mem.tree(),
-        node_count = devectorized_mem.node_count(),
-        elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "after devectorize"
-    );
-    check_unroll_group("after_devectorize", &devectorized_mem);
-
-    let t_stage = std::time::Instant::now();
-    let devectorized = graph_rewrite(pm_bool_devectorize(), devectorized_mem, &mut ());
+    let devectorized = crate::devectorize::devectorize(&with_loads);
     tracing::debug!(
         ast.optimized = devectorized.tree(),
         node_count = devectorized.node_count(),
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "after pm_bool_devectorize"
+        "after devectorize"
     );
-    check_unroll_group("after_pm_bool_devectorize", &devectorized);
+    check_unroll_group("after_devectorize", &devectorized);
 
-    let t_stage = std::time::Instant::now();
-    let reduce_devec = graph_rewrite(pm_reduce_devectorize(), devectorized, &mut ());
-    tracing::debug!(
-        ast.optimized = reduce_devec.tree(),
-        node_count = reduce_devec.node_count(),
-        elapsed_ms = t_stage.elapsed().as_millis() as u64,
-        "after pm_reduce_devectorize"
-    );
-    check_unroll_group("after_pm_reduce_devectorize", &reduce_devec);
-
-    // Tinygrad: pm_lower_index_dtype + load_store_indexing + gep_pushing (step 15)
+    // Tinygrad Stage 15: pm_lower_index_dtype + load_store_indexing + gep_pushing
     let t_stage = std::time::Instant::now();
     static PM_LOWER_COMBINED: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
         crate::symbolic::pm_lower_index_dtype()
             + crate::devectorize::load_store_indexing_patterns()
             + gep_pushing_patterns()
     });
-    let with_lowered_idx = graph_rewrite(&*PM_LOWER_COMBINED, reduce_devec, &mut ());
+    let with_lowered_idx = graph_rewrite(&*PM_LOWER_COMBINED, devectorized, &mut ());
     tracing::debug!(
         ast.optimized = with_lowered_idx.tree(),
         node_count = with_lowered_idx.node_count(),

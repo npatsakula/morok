@@ -308,8 +308,6 @@ impl Tensor {
         let var_vals = extract_var_vals(&uop);
 
         // Pre-schedule normalization: BUFFER→PARAM (Tinygrad pm_pre_sched_cache).
-        // Erases buffer identity so structurally identical computations on different
-        // buffers share the same schedule cache entry.
         let (normalized, param_buffers) = normalize_buffers_to_params(&sink);
 
         // Build input_buffers keyed by PARAM UOp IDs (the normalized graph

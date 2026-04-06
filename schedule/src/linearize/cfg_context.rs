@@ -196,20 +196,17 @@ impl CFGContext {
                 let y_range = if let Op::End { ranges, .. } = y.op() { ranges.first().cloned() } else { None };
 
                 if let Some(range) = y_range {
-                    // Skip edges that would create cycles.
-                    // Cycle condition: x depends on range (adding range → x would create x → ... → range → x)
-                    // Check: is range in x's backward slice?
-                    let would_cycle = x.backward_slice_ids().contains(&range.id);
-                    if !would_cycle {
-                        tracing::trace!(range_id = range.id, predecessor_id = x.id, "CFGContext: creating edge");
-                        ctx.edges.insert(UOpKey(range), x);
-                    } else {
-                        tracing::warn!(
-                            range_id = range.id,
-                            predecessor_id = x.id,
-                            "CFGContext: skipped edge (would create cycle)"
-                        );
-                    }
+                    // Tinygrad: assert y.src[1] not in x.backward_slice_with_self
+                    // A cycle here indicates a malformed kernel structure.
+                    assert!(
+                        !x.backward_slice_ids().contains(&range.id),
+                        "CFGContext: edge would create cycle (range {} → predecessor {}). \
+                         This indicates a malformed kernel — see Tinygrad linearizer.py:81",
+                        range.id,
+                        x.id
+                    );
+                    tracing::trace!(range_id = range.id, predecessor_id = x.id, "CFGContext: creating edge");
+                    ctx.edges.insert(UOpKey(range), x);
                 }
             }
         }

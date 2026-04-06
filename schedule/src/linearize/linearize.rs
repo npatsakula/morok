@@ -6,7 +6,6 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 
-use morok_ir::AxisType;
 use morok_ir::UOp;
 use morok_ir::op::Op;
 use morok_ir::types::ConstValue;
@@ -21,7 +20,6 @@ mod priority {
     pub const DEFINE_VAR: i32 = -19;
     pub const DEFINE_LOCAL: i32 = -18;
     pub const DEFINE_REG: i32 = -17;
-    pub const CONST: i32 = -10;
     pub const END: i32 = -5;
     pub const LOAD: i32 = -1;
     pub const DEFAULT: i32 = 0;
@@ -242,21 +240,14 @@ fn compute_run_count(uop: &Arc<UOp>) -> u64 {
         return 1;
     }
 
+    // Tinygrad: run_count = prod([int(r.vmax)+1 for r in u.ranges])
+    // ALL ranges contribute, including Thread ranges. No filtering.
     in_scope
         .iter()
-        .filter_map(|key| {
-            // Exclude Thread ranges - they're pseudo-loops, not real loops
-            if let Op::Range { axis_type, .. } = key.0.op()
-                && matches!(axis_type, AxisType::Thread)
-            {
-                return None;
-            }
-            // Get the maximum value of the range
-            match key.0.vmax() {
-                ConstValue::Int(v) => Some((v + 1) as u64),
-                ConstValue::UInt(v) => Some(v + 1),
-                _ => Some(1),
-            }
+        .map(|key| match key.0.vmax() {
+            ConstValue::Int(v) => (v + 1) as u64,
+            ConstValue::UInt(v) => v + 1,
+            _ => 1,
         })
         .product()
 }
@@ -278,13 +269,13 @@ fn get_priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
             name.hash(&mut hasher);
             (priority::DEFINE_VAR, Some(hasher.finish() as i64))
         }
-        Op::DefineLocal(id) => (priority::DEFINE_LOCAL, Some(*id as i64)),
+        Op::DefineLocal(_) => (priority::DEFINE_LOCAL, None),
         Op::DefineReg { .. } => (priority::DEFINE_REG, None),
-        Op::Const(_) | Op::VConst { .. } => (priority::CONST, None),
+        Op::Const(_) | Op::VConst { .. } => (priority::DEFAULT, None),
         Op::End { .. } => (priority::END, None),
         Op::Load { .. } => (priority::LOAD, None),
         Op::Store { .. } => (priority::STORE, None),
-        Op::Range { axis_id, .. } => (priority::RANGE, Some(axis_id.value() as i64)),
+        Op::Range { .. } => (priority::RANGE, None),
         _ => (priority::DEFAULT, None),
     }
 }
@@ -385,9 +376,8 @@ mod tests {
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn test_priority_ordering() {
-        // Test that priority order is respected: DefineGlobal < Const < default < Range
-        assert!(priority::DEFINE_GLOBAL < priority::CONST);
-        assert!(priority::CONST < priority::DEFAULT);
+        // Test that priority order is respected: DefineGlobal < default < Range
+        assert!(priority::DEFINE_GLOBAL < priority::DEFAULT);
         assert!(priority::DEFAULT < priority::RANGE);
         assert!(priority::END < priority::DEFAULT);
         assert!(priority::LOAD < priority::DEFAULT);

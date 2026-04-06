@@ -246,6 +246,10 @@ pub fn pm_lower_index_dtype() -> TypedPatternMatcher {
             Some(UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec::smallvec![idx.clone()], gate: Some(combined_gate) }, node.dtype()))
         },
 
+        // SINK/END - strip .cast(Index) from sources
+        // Tinygrad (ops.py:1311) also includes NOOP here, but Morok's Op::Noop has no sources,
+        // so stripping .cast(Index) from NOOP sources is a no-op.
+
         // SINK - strip .cast(Index) from sources
         Sink { sources } => |sources| {
             let mut changed = false;

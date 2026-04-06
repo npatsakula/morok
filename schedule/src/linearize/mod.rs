@@ -102,11 +102,9 @@ fn split_end(computation: &Arc<UOp>, ranges: &SmallVec<[Arc<UOp>; 4]>) -> Option
         return Some(new_end);
     }
 
-    // Step 2: Sort RANGEs by axis_id descending (innermost first).
-    // Matches Tinygrad's `sorted(..., key=lambda x: x.arg, reverse=True)`.
-    // Note: this assumes higher axis_id = innermost, which matches Tinygrad's
-    // convention. The codegen layer handles any remaining ordering issues
-    // via its range_stack (tracks actual RANGE emission order).
+    // Step 2: Sort RANGEs by (axis_id, axis_type) descending (innermost first).
+    // Matches Tinygrad's `sorted(..., key=lambda x: x.arg, reverse=True)` where
+    // x.arg = (axis_id, axis_type, ...) — tuple comparison gives lex ordering.
     let mut sorted_ranges = actual_ranges;
     sorted_ranges.sort_by(|a, b| {
         let (a_id, a_ty) = match a.op() {

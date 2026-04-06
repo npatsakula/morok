@@ -24,10 +24,8 @@ use melior::pass::PassManager;
 use melior::utility::{register_all_dialects, register_all_llvm_translations};
 use morok_dtype::DType;
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::rewrite::graph_rewrite_bottom_up;
 use morok_ir::{AxisType, ConstValue, Op, ReduceOp, WmmaMetadata, prelude::*};
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
-use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
 use self::ctx::{RenderContext, ScfIfInfo, ScfLoopInfo};
 use self::ops::*;
@@ -166,11 +164,7 @@ impl Renderer for MlirRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        let uop = graph_rewrite_bottom_up(&pm_bool_devectorize(), uop.clone(), &mut ());
-
-        tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "mlir codegen: after pm_bool_devectorize");
-
-        let nodes = linearize_with_cfg(uop);
+        let nodes = linearize_with_cfg(uop.clone());
         let nodes = line_rewrite_cleanups(nodes);
 
         for (i, node) in nodes.iter().enumerate() {

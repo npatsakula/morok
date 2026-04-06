@@ -321,12 +321,16 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
 // ============================================================================
 
 /// Upcast small masked dimensions (size <= 7).
+///
+/// Matches Tinygrad heuristic.py:97-105: collect all masked-upcastable axes first,
+/// then apply in REVERSE order. Reverse iteration is critical — upcast of a higher-indexed
+/// axis doesn't shift lower-indexed axes in the rngs list, preserving index validity.
 pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
-    let mut applied = false;
     let upcastable = scheduler.upcastable_dims();
 
-    // Tinygrad caps total masked upcast product at 7*7=49.
+    // Phase 1: Collect candidates (Tinygrad heuristic.py:97-104)
     let mut product: i64 = 1;
+    let mut to_upcast: Vec<(usize, usize)> = Vec::new();
 
     for axis_idx in upcastable {
         if !is_masked(scheduler, axis_idx) {
@@ -343,9 +347,16 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
             && size > 1
             && size <= 7
             && product * size <= 49
-            && apply_opt(scheduler, &Opt::upcast(axis_idx, size as usize), true).is_ok()
         {
+            to_upcast.push((axis_idx, size as usize));
             product *= size;
+        }
+    }
+
+    // Phase 2: Apply in reverse order (Tinygrad: to_upcast[::-1])
+    let mut applied = false;
+    for (axis_idx, size) in to_upcast.into_iter().rev() {
+        if apply_opt(scheduler, &Opt::upcast(axis_idx, size), true).is_ok() {
             applied = true;
         }
     }

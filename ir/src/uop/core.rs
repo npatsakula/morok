@@ -136,6 +136,11 @@ pub struct UOp {
     /// O(1) membership test via `backward_slice_ids().contains(&target.id)`.
     #[debug(skip)]
     pub(crate) backward_slice_cache: std::sync::OnceLock<HashSet<u64>>,
+    /// Structural content hash — deterministic regardless of allocation order.
+    /// Computed at creation time: hash(op_discriminant, dtype, op_data, children_content_hashes).
+    /// O(1) per node since children are already created with their content_hash set.
+    /// Used for schedule-level caching where UOp IDs are not stable across runs.
+    pub content_hash: u64,
     /// Optional metadata attached to this UOp.
     ///
     /// Metadata is NOT part of hash consing - attaching metadata creates a new UOp
@@ -1239,6 +1244,7 @@ impl Clone for UOp {
             id: self.id,
             op: self.op.clone(),
             dtype: self.dtype.clone(),
+            content_hash: self.content_hash,
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),

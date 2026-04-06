@@ -14,10 +14,8 @@
 use std::sync::Arc;
 
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::rewrite::graph_rewrite_bottom_up;
 use morok_ir::{AxisType, Op, prelude::*};
 use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
-use morok_schedule::rangeify::patterns::pm_bool_devectorize;
 
 use crate::llvm::common::{RenderContext, ldt};
 use crate::llvm::cpu::{reduce_identity, render_uop};
@@ -45,13 +43,7 @@ impl Renderer for LlvmTextRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        // NOTE: pm_render() is now called in schedule/optimizer Stage 19.
-        // Keeping pm_bool_devectorize as safety fallback for direct codegen paths.
-        let uop = graph_rewrite_bottom_up(pm_bool_devectorize(), uop.clone(), &mut ());
-
-        tracing::debug!(ast_after_pm_bool_devectorize = %uop.tree(), "codegen: after pm_bool_devectorize");
-
-        let nodes = linearize_with_cfg(uop);
+        let nodes = linearize_with_cfg(uop.clone());
 
         // Stage 22: Apply line rewrite cleanups to handle gated INDEX operations.
         // Converts gated STOREs to IF/STORE/ENDIF sequences.

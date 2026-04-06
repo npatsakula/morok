@@ -4,7 +4,7 @@
 //! Uses SSA inlining: single-use values are inlined as expressions,
 //! multi-use values get local variable declarations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use morok_dtype::{DType, ScalarDType};
@@ -24,11 +24,23 @@ pub struct CContext {
     depth: usize,
     /// Pending reduce accumulator info: reduce_id -> (acc_name, dtype)
     pending_reduces: HashMap<u64, (String, DType)>,
+    /// UOp IDs that escape their declaration scope — need function-scope declaration.
+    scope_escaping: HashSet<u64>,
+    /// Function-scope declarations for hoisted variables (emitted before kernel body).
+    pub hoisted_declarations: Vec<String>,
 }
 
 impl CContext {
-    pub fn new(ref_counts: HashMap<u64, usize>) -> Self {
-        Self { names: HashMap::new(), ref_counts, counter: 0, depth: 1, pending_reduces: HashMap::new() }
+    pub fn new(ref_counts: HashMap<u64, usize>, scope_escaping: HashSet<u64>) -> Self {
+        Self {
+            names: HashMap::new(),
+            ref_counts,
+            counter: 0,
+            depth: 1,
+            pending_reduces: HashMap::new(),
+            scope_escaping,
+            hoisted_declarations: Vec::new(),
+        }
     }
 
     /// Get the C expression for a UOp. Panics if not registered.
@@ -83,6 +95,11 @@ impl CContext {
 
     /// Emit a C expression, either as an inline expression or a variable declaration.
     /// Returns the name/expression to reference this value.
+    ///
+    /// Variables that escape their declaration scope are hoisted: declared at function
+    /// scope and assigned at current depth. This prevents "use of undeclared identifier"
+    /// errors when the linearizer places a shared node inside a loop but consumers exist
+    /// outside the loop.
     pub fn emit_expr(&mut self, uop: &Arc<UOp>, expr: String, prefix: &str, kernel: &mut Vec<String>) -> String {
         if self.should_inline(uop.id) {
             self.register(uop.id, expr.clone());
@@ -91,7 +108,13 @@ impl CContext {
             let name = self.next_name(prefix);
             let dtype = c_dtype(&uop.dtype());
             let indent = self.indent();
-            kernel.push(format!("{indent}{dtype} {name} = {expr};"));
+            if self.scope_escaping.contains(&uop.id) {
+                // Hoist: declare at function scope, assign at current depth
+                self.hoisted_declarations.push(format!("  {dtype} {name};"));
+                kernel.push(format!("{indent}{name} = {expr};"));
+            } else {
+                kernel.push(format!("{indent}{dtype} {name} = {expr};"));
+            }
             self.register(uop.id, name.clone());
             name
         }
@@ -160,7 +183,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Load { index, .. } => {
+        Op::Load { index, alt, .. } => {
             let idx = ctx.get(index).to_string();
             let load_dtype = uop.dtype();
             // Check if the INDEX source has a gate — render conditional load to avoid null deref.
@@ -177,8 +200,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 format!("*({idx})")
             };
             let expr = if let Some(gate) = gate_expr {
-                let zero = c_const(&morok_ir::types::ConstValue::zero(load_dtype.base()), &load_dtype);
-                format!("({gate} ? {deref_expr} : {zero})")
+                // Use the LOAD's alt value if present, otherwise default to zero
+                let alt_expr = if let Some(alt_uop) = alt {
+                    ctx.get(alt_uop).to_string()
+                } else {
+                    c_const(&morok_ir::types::ConstValue::zero(load_dtype.base()), &load_dtype)
+                };
+                format!("({gate} ? {deref_expr} : {alt_expr})")
             } else {
                 deref_expr
             };
