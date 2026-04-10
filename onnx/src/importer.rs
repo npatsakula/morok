@@ -228,17 +228,67 @@ impl OnnxImporter {
         let opsets: Vec<OpSetId> =
             model.opset_import.iter().map(|op| OpSetId { domain: op.domain.clone(), version: op.version }).collect();
 
-        // Build initializer map (weights/constants)
+        // Build initializer map (weights/constants).
+        // Group float raw_data initializers by dtype, pack each group into a shared buffer,
+        // and create lazy SHRINK → RESHAPE views per weight. This reduces scheduling
+        // boundaries from ~N to 1 per dtype, enabling kernel fusion.
+        // Matches Tinygrad's approach: raw_data → lazy tensor, typed fields → eager.
         let mut initializers: HashMap<String, Tensor> = HashMap::new();
         let initializer_names: Vec<String> = proto_graph.initializer.iter().map(|i| i.name.clone()).collect();
 
+        struct InitInfo {
+            name: String,
+            dims: Vec<usize>,
+            offset: usize,
+            numel: usize,
+        }
+        let mut packed_by_dtype: HashMap<DType, (Vec<u8>, Vec<InitInfo>)> = HashMap::new();
+
         for init in &proto_graph.initializer {
-            if !init.name.is_empty() {
+            if init.name.is_empty() {
+                continue;
+            }
+            if init.data_location == 1 {
                 let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
-                // Scalar const-folding: shape () initializers become CONST UOps (inlineable,
-                // no buffer needed). Matches Tinygrad onnx.py:254-256.
-                let tensor = const_fold_scalar(tensor);
-                initializers.insert(init.name.clone(), tensor);
+                initializers.insert(init.name.clone(), const_fold_scalar(tensor));
+                continue;
+            }
+            let dtype = convert_onnx_dtype(init.data_type)?;
+            if !init.raw_data.is_empty() && dtype.is_float() {
+                let dims: Vec<usize> = init.dims.iter().map(|&d| d as usize).collect();
+                let numel: usize = dims.iter().product();
+                // Scalars: eager path for const-folding (const_fold_scalar needs buffer)
+                if numel <= 1 {
+                    let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
+                    initializers.insert(init.name.clone(), const_fold_scalar(tensor));
+                    continue;
+                }
+                let entry = packed_by_dtype.entry(dtype.clone()).or_insert_with(|| (Vec::new(), Vec::new()));
+                let elem_offset = entry.0.len() / dtype.bytes();
+                entry.0.extend_from_slice(&init.raw_data);
+                entry.1.push(InitInfo { name: init.name.clone(), dims, offset: elem_offset, numel });
+            } else {
+                let tensor = tensor_from_proto_ext(init, self.model_dir.as_deref())?;
+                initializers.insert(init.name.clone(), const_fold_scalar(tensor));
+            }
+        }
+
+        // Create shared buffers per dtype and lazy SHRINK views per weight
+        for (dtype, (packed_data, infos)) in &packed_by_dtype {
+            let total_elems = packed_data.len() / dtype.bytes();
+            let shared_buf = Tensor::from_raw_bytes(packed_data, &[total_elems], dtype.clone())
+                .expect("packed initializer buffer creation");
+
+            for info in infos {
+                // SHRINK in element units (same dtype, no bitcast) → RESHAPE to final dims
+                let view = shared_buf
+                    .uop()
+                    .try_shrink(&[(SInt::from(info.offset), SInt::from(info.offset + info.numel))])
+                    .expect("shrink to weight element range");
+                let ir_dims: smallvec::SmallVec<[SInt; 4]> = info.dims.iter().map(|&d| SInt::from(d)).collect();
+                let reshaped = view.try_reshape(&ir_dims).expect("reshape weight to final dims");
+                let tensor = Tensor::from_lazy(reshaped);
+                initializers.insert(info.name.clone(), tensor);
             }
         }
 

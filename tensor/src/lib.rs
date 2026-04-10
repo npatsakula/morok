@@ -152,6 +152,12 @@ impl Tensor {
         Self { entry, buffer: None }
     }
 
+    /// Create a lazy tensor from a UOp graph (no buffer allocated).
+    /// Used for deferred computation graphs like ONNX weight views.
+    pub fn from_lazy(uop: Arc<UOp>) -> Self {
+        Self::new(uop)
+    }
+
     /// Create tensor with existing buffer (for input tensors and realize results).
     pub(crate) fn with_buffer(entry: Arc<tensor_registry::TensorEntry>, buffer: Arc<Buffer>) -> Self {
         Self { entry, buffer: Some(buffer) }

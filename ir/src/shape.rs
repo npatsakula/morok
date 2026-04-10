@@ -485,9 +485,33 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
         }
 
         // =====================================================================
-        // Type operations - preserve shape
+        // Type operations
         // =====================================================================
-        Op::Cast { src, .. } | Op::BitCast { src, .. } => src.shape()?.cloned(),
+        Op::Cast { src, .. } => src.shape()?.cloned(),
+        // BitCast: byte-reinterpretation. Same itemsize → same shape.
+        // Different itemsize → adjust last dimension (Tinygrad tensor.py:3549-3568).
+        // BitCast: byte-reinterpretation (Tinygrad ops.py:240-245).
+        // Same itemsize → same shape. Different itemsize → adjust last dimension.
+        Op::BitCast { src, dtype } => {
+            let src_shape = src.shape()?;
+            match src_shape {
+                Some(shape) if !shape.is_empty() => {
+                    let src_bytes = src.dtype().bytes();
+                    let dst_bytes = dtype.bytes();
+                    if src_bytes == dst_bytes {
+                        Some(shape.clone())
+                    } else {
+                        // Adjust last dimension: (last * src_bytes) / dst_bytes
+                        let mut new_shape = shape.clone();
+                        let last = new_shape.last().unwrap().clone();
+                        let new_last = (last * SInt::Const(src_bytes)) / SInt::Const(dst_bytes);
+                        *new_shape.last_mut().unwrap() = new_last;
+                        Some(new_shape)
+                    }
+                }
+                other => other.cloned(),
+            }
+        }
 
         // =====================================================================
         // Vector operations (kernel-level, no tensor shape)
