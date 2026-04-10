@@ -169,7 +169,15 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config
         input_tensor.assign(&real_tensor);
     }
 
-    // 5. Load expected output and compare
+    // 5. Batch-realize ALL outputs (matches Tinygrad: all outputs in one SINK)
+    let mut outputs: Vec<(String, Tensor)> = result.outputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    {
+        let mut refs: Vec<&mut Tensor> = outputs.iter_mut().map(|(_, t)| t).collect();
+        Tensor::realize_batch_with(refs.iter_mut().map(|t| &mut **t), config)
+            .unwrap_or_else(|e| panic!("{test_name}: realize failed: {e}"));
+    }
+
+    // 6. Load expected output and compare
     let output_name = result.outputs.keys().next().unwrap_or_else(|| panic!("{test_name}: no outputs")).clone();
     let pb_bytes =
         std::fs::read(output_pb_path).unwrap_or_else(|e| panic!("{test_name}: failed to read expected output: {e}"));
@@ -178,10 +186,12 @@ pub(crate) fn run_onnx_light_test(model_path: &str, output_pb_path: &str, config
     let expected = tensor_from_proto_ext(&tensor_proto, None)
         .unwrap_or_else(|e| panic!("{test_name}: expected output conversion: {e}"));
 
-    let actual =
-        result.outputs.get(&output_name).unwrap_or_else(|| panic!("{test_name}: missing output '{output_name}'"));
-    let mut actual = actual.clone();
-    actual.realize_with(config).unwrap_or_else(|e| panic!("{test_name}: realize failed: {e}"));
+    let mut actual = outputs
+        .iter_mut()
+        .find(|(k, _)| *k == output_name)
+        .unwrap_or_else(|| panic!("{test_name}: missing output '{output_name}'"))
+        .1
+        .clone();
     assert_tensors_close(&mut actual, &expected, &test_name, config);
 }
 
