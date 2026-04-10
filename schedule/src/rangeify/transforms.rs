@@ -515,7 +515,7 @@ pub(crate) fn transform_single_source(
     // Unlike Case 2 (BUFFERIZE), we can't linearize here because the buffer's
     // dimensional structure isn't directly available from ctx — the output_ranges
     // may contain PAD validity expressions, not clean RANGE ops.
-    // Linearization is deferred to pm_linearize_multi_index.
+    // Multi-index INDEX is preserved through the pipeline; codegen linearizes at render time.
     if matches!(
         src.op(),
         Op::Buffer { .. }
@@ -779,6 +779,7 @@ fn axis_type_ordinal(at: AxisType) -> u8 {
         AxisType::Upcast => 7,
         AxisType::Unroll => 8,
         AxisType::Thread => 9,
+        AxisType::Placeholder => 10,
     }
 }
 

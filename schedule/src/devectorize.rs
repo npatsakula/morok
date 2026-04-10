@@ -1158,6 +1158,7 @@ fn move_gep_on_store(
 /// NO inner rewrite — the outer fixed-point (sym) simplifies GEP expressions.
 fn expand_index_to_vectorize(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Index { buffer, indices, gate } = index.op() else { return None };
+    assert!(indices.len() <= 1, "ICE: expand_index_to_vectorize called with multi-index INDEX (len={})", indices.len());
     let vec = indices.first()?;
     let count = vec.dtype().vcount();
 

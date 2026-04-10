@@ -1052,6 +1052,7 @@ impl Scheduler {
                             AxisType::Warp => "w",
                             AxisType::Thread => "t",
                             AxisType::Outer => "O",
+                            AxisType::Placeholder => "P",
                         };
 
                         Some(format!("{}{}", letter, size))

@@ -56,6 +56,23 @@ fn parse_valid(v: &Arc<UOp>) -> Option<(Arc<UOp>, bool, i64)> {
     None
 }
 
+/// Check if a UOp is irreducible (Tinygrad: GroupOp.Irreducible = {CONST, DEFINE_VAR, SPECIAL, RANGE}).
+fn is_irreducible(op: &Op) -> bool {
+    matches!(op, Op::Const(..) | Op::DefineVar { .. } | Op::Special { .. } | Op::Range { .. })
+}
+
+/// Split an ADD-chain into individual addends.
+fn split_add(expr: &Arc<UOp>) -> Vec<Arc<UOp>> {
+    match expr.op() {
+        Op::Binary(BinaryOp::Add, left, right) => {
+            let mut result = split_add(left);
+            result.extend(split_add(right));
+            result
+        }
+        _ => vec![expr.clone()],
+    }
+}
+
 /// Split an AND-chain into individual clauses.
 fn split_and(cond: &Arc<UOp>) -> Vec<Arc<UOp>> {
     match cond.op() {
@@ -125,7 +142,7 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
             stmt.clone()
         } else {
             let accumulated_valid = join_and(&ret);
-            uop_given_valid(&accumulated_valid, stmt)
+            uop_given_valid(&accumulated_valid, stmt, true)
         };
         ret.push(simplified);
     }
@@ -143,23 +160,24 @@ pub fn simplify_valid(valid: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Parses validity clauses into bounds, creates substitute variables with
 /// tighter ranges, and rewrites the uop.
 ///
-/// This is the `try_simplex=False` version (used by `gated_given_valid`).
-fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>) -> Arc<UOp> {
+/// When `try_simplex` is true (called from `simplify_valid`), also tries per-addend
+/// simplex decomposition for constraints like `X0 + X1 + ... >= 1`.
+fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>, try_simplex: bool) -> Arc<UOp> {
+    use morok_ir::rewrite::graph_rewrite;
+
     // Parse valid into {expr: [lower_bound, upper_bound]}
-    type Bounds = (Arc<UOp>, Option<i64>, Option<i64>);
-    let mut bounds: HashMap<u64, Bounds> = HashMap::new();
+    type BoundsEntry = (Arc<UOp>, Option<i64>, Option<i64>);
+    let mut bounds: HashMap<u64, BoundsEntry> = HashMap::new();
     for stmt in split_and(valid) {
         if let Some((expr, is_upper, c)) = parse_valid(&stmt) {
             let entry = bounds.entry(expr.id).or_insert_with(|| (expr.clone(), None, None));
             if is_upper {
-                // upper bound: X <= c
                 match entry.2 {
                     None => entry.2 = Some(c),
                     Some(existing) if c < existing => entry.2 = Some(c),
                     _ => {}
                 }
             } else {
-                // lower bound: X >= c
                 match entry.1 {
                     None => entry.1 = Some(c),
                     Some(existing) if c > existing => entry.1 = Some(c),
@@ -173,11 +191,10 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>) -> Arc<UOp> {
         return uop.clone();
     }
 
-    // Build substitution map: expr -> DefineVar with tighter bounds
-    #[allow(clippy::mutable_key_type)]
-    let mut sub_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
-    #[allow(clippy::mutable_key_type)]
-    let mut reverse_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+    // Build candidate list: (original_expr, fake_var_with_tighter_bounds)
+    // Tinygrad symbolic.py:288-292
+    let mut all_candidates: Vec<(Arc<UOp>, Arc<UOp>)> = Vec::new();
+    let mut uop = uop.clone();
 
     for (i, (_id, (expr, lower, upper))) in bounds.iter().enumerate() {
         let (expr_vmin, expr_vmax) = VminVmaxProperty::get(expr);
@@ -192,32 +209,96 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>) -> Arc<UOp> {
         }
 
         let fake_var = UOp::define_var(format!("_valid_fake{i}"), v0, v1);
-        // Cast to match expr dtype if needed (define_var creates Index dtype)
         let fake_var = if expr.dtype() != fake_var.dtype() { fake_var.cast(expr.dtype()) } else { fake_var };
+        all_candidates.push((expr.clone(), fake_var));
 
-        sub_map.insert(UOpKey(expr.clone()), fake_var.clone());
-        reverse_map.insert(UOpKey(fake_var), expr.clone());
+        // Per-candidate simplex logic (Tinygrad symbolic.py:294-309)
+        if try_simplex {
+            let mut candidate_sets: Vec<Vec<(Arc<UOp>, Arc<UOp>)>> = vec![vec![all_candidates.last().unwrap().clone()]];
+
+            // Simplex detection: X0 + X1 + ... >= 1 where all Xi are irreducible with vmin >= 0
+            if let Op::Binary(BinaryOp::Add, ..) = expr.op()
+                && v0 == 1
+            {
+                let addends = split_add(expr);
+                let all_irreducible_nonneg = addends.iter().all(|u| {
+                    is_irreducible(u.op()) && {
+                        let (vmin, _) = VminVmaxProperty::get(u);
+                        matches!(vmin, ConstValue::Int(v) if *v >= 0)
+                    }
+                });
+                if all_irreducible_nonneg {
+                    let simplex_candidates: Vec<(Arc<UOp>, Arc<UOp>)> = addends
+                        .iter()
+                        .enumerate()
+                        .map(|(j, xi)| {
+                            let (_, xi_vmax) = VminVmaxProperty::get(xi);
+                            let max_val = if let ConstValue::Int(v) = xi_vmax { *v } else { i64::MAX };
+                            let fake = UOp::define_var(format!("_simplex_fake{j}"), 1, max_val);
+                            let fake = if xi.dtype() != fake.dtype() { fake.cast(xi.dtype()) } else { fake };
+                            (xi.clone(), fake)
+                        })
+                        .collect();
+                    candidate_sets.push(simplex_candidates);
+                }
+            }
+
+            for candidates in &candidate_sets {
+                // Substitute each candidate independently
+                let new_uops: Vec<Arc<UOp>> = candidates
+                    .iter()
+                    .map(|(x, new_x)| {
+                        #[allow(clippy::mutable_key_type)]
+                        let map: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(x.clone()), new_x.clone())].into();
+                        uop.substitute(&map)
+                    })
+                    .collect();
+                // Skip if any branch doesn't contain the expression
+                if new_uops.iter().any(|u| Arc::ptr_eq(u, &uop)) {
+                    continue;
+                }
+                // Simplify each branch, substitute back, simplify again
+                let simplified: Vec<Arc<UOp>> = candidates
+                    .iter()
+                    .zip(new_uops.iter())
+                    .map(|((x, new_x), u)| {
+                        let s = graph_rewrite(crate::symbolic::patterns::symbolic(), u.clone(), &mut ());
+                        #[allow(clippy::mutable_key_type)]
+                        let rev: HashMap<UOpKey, Arc<UOp>> = [(UOpKey(new_x.clone()), x.clone())].into();
+                        graph_rewrite(crate::symbolic::patterns::symbolic(), s.substitute(&rev), &mut ())
+                    })
+                    .collect();
+                // If all branches produce the same result, accept it
+                if simplified.windows(2).all(|w| w[0].id == w[1].id) {
+                    uop = simplified[0].clone();
+                }
+                // TODO: VECTORIZE partial simplification (Tinygrad lines 307-309) — add when needed
+            }
+        }
     }
 
-    if sub_map.is_empty() {
-        return uop.clone();
+    if all_candidates.is_empty() {
+        return uop;
     }
 
-    // Substitute, simplify, substitute back
+    // Combined all-candidates substitution (Tinygrad symbolic.py:311-313)
+    #[allow(clippy::mutable_key_type)]
+    let sub_map: HashMap<UOpKey, Arc<UOp>> =
+        all_candidates.iter().map(|(x, f)| (UOpKey(x.clone()), f.clone())).collect();
     let substituted = uop.substitute(&sub_map);
-    if Arc::ptr_eq(&substituted, uop) {
-        return uop.clone();
+    if Arc::ptr_eq(&substituted, &uop) {
+        return uop;
     }
 
-    // Run symbolic simplification on substituted expression
-    let simplified =
-        morok_ir::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic_simple(), substituted, &mut ());
+    // Simplify with full symbolic (tier 2) including divmod rules
+    let simplified = graph_rewrite(crate::symbolic::patterns::symbolic(), substituted, &mut ());
 
-    // Substitute back
+    // Substitute back and simplify again
+    #[allow(clippy::mutable_key_type)]
+    let reverse_map: HashMap<UOpKey, Arc<UOp>> =
+        all_candidates.iter().map(|(x, f)| (UOpKey(f.clone()), x.clone())).collect();
     let result = simplified.substitute(&reverse_map);
-
-    // Run simplification again after substituting back
-    morok_ir::rewrite::graph_rewrite(crate::symbolic::patterns::symbolic_simple(), result, &mut ())
+    graph_rewrite(crate::symbolic::patterns::symbolic(), result, &mut ())
 }
 
 /// Simplify WHERE(cond, x, Invalid) using cond as bounds context
@@ -225,7 +306,7 @@ fn uop_given_valid(valid: &Arc<UOp>, uop: &Arc<UOp>) -> Arc<UOp> {
 ///
 /// Rewrites `x` using tighter bounds derived from the condition `cond`.
 pub fn gated_given_valid(cond: &Arc<UOp>, x: &Arc<UOp>, invalid: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let new_x = uop_given_valid(cond, x);
+    let new_x = uop_given_valid(cond, x, false);
     if new_x.id == x.id {
         return None;
     }

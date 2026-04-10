@@ -399,6 +399,9 @@ pub enum AxisType {
     Unroll,
     /// Thread dimension.
     Thread,
+    /// Temporary canonicalized range for RESHAPE caching (Tinygrad: AxisType.PLACEHOLDER).
+    /// Substituted in before `_apply_reshape` and substituted back after.
+    Placeholder,
 }
 
 impl AxisType {
@@ -435,6 +438,7 @@ impl AxisType {
             Self::Upcast => 3,
             Self::Reduce => 4,
             Self::Unroll => 5,
+            Self::Placeholder => -3,
         }
     }
 
@@ -465,6 +469,7 @@ impl AxisType {
             Self::Upcast => 'u',
             Self::Reduce => 'R',
             Self::Unroll => 'r',
+            Self::Placeholder => 'P',
         }
     }
 

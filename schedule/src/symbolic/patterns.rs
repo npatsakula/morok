@@ -317,30 +317,30 @@ pub fn propagate_invalid() -> &'static TypedPatternMatcher {
 /// causing WHERE(valid, idx, Invalid) to simplify to just Invalid when valid is always false.
 pub fn fold_invalid_load_store() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
-        // LOAD(INDEX(buf, Invalid)) → const 0 (dtype-appropriate)
+        // LOAD(INDEX(buf, ...Invalid...)) → const 0 (any per-dimension Invalid means OOB)
         load @ Load { index: Index { indices, .. }, .. }
-            if indices.len() == 1 && matches!(indices[0].op(), Op::Invalid)
+            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
             => {
                 let zero = ConstValue::zero(load.dtype().scalar()?);
                 Some(load.const_like(zero))
             },
 
-        // LOAD(CAST(INDEX(buf, Invalid))) → const 0 (dtype-appropriate)
+        // LOAD(CAST(INDEX(buf, ...Invalid...))) → const 0
         load @ Load { index: Cast { src: Index { indices, .. }, .. }, .. }
-            if indices.len() == 1 && matches!(indices[0].op(), Op::Invalid)
+            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
             => {
                 let zero = ConstValue::zero(load.dtype().scalar()?);
                 Some(load.const_like(zero))
             },
 
-        // STORE(INDEX(buf, Invalid), value) → NOOP
+        // STORE(INDEX(buf, ...Invalid...), value) → NOOP
         Store { index: Index { indices, .. }, .. }
-            if indices.len() == 1 && matches!(indices[0].op(), Op::Invalid)
+            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
             ~> UOp::new(Op::Noop, DType::Void),
 
-        // STORE(CAST(INDEX(buf, Invalid)), value) → NOOP
+        // STORE(CAST(INDEX(buf, ...Invalid...)), value) → NOOP
         Store { index: Cast { src: Index { indices, .. }, .. }, .. }
-            if indices.len() == 1 && matches!(indices[0].op(), Op::Invalid)
+            if indices.iter().any(|idx| matches!(idx.op(), Op::Invalid))
             ~> UOp::new(Op::Noop, DType::Void),
     }
 }

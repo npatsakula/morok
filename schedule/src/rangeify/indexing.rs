@@ -783,88 +783,42 @@ pub fn apply_movement_op(op: &Op, in_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<A
                 }
             }
 
-            // Flatten output indices using the output shape (new_shape_vals).
-            //
-            // When rngs.len() < new_shape_vals.len(), the indices correspond to
-            // the TRAILING dimensions (e.g., INDEX with 2 indices into a [1,1,5,5]
-            // shape means indices are for dims 2 and 3, with dims 0 and 1 implicitly 0).
-            // We pad with CONST(0) on the left to align correctly.
-            let padded_rngs: Vec<Arc<UOp>> = if rngs.len() < new_shape_vals.len() {
-                let padding = new_shape_vals.len() - rngs.len();
-                let mut v = Vec::with_capacity(new_shape_vals.len());
-                for _ in 0..padding {
-                    v.push(UOp::index_const(0));
-                }
-                v.extend(rngs.iter().cloned());
-                v
-            } else {
-                rngs.to_vec()
-            };
-
-            let mut acc = UOp::index_const(1);
-            let mut axes_in = Vec::new();
-
-            for (shape_dim, rng) in new_shape_vals.iter().zip(padded_rngs.iter()).rev() {
-                let weighted = acc.try_mul(rng).unwrap();
-                axes_in.push(weighted);
-                let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
-                acc = acc.try_mul(&dim_uop).unwrap();
-            }
-            let combined_axes =
-                axes_in.into_iter().reduce(|a, b| a.try_add(&b).unwrap()).unwrap_or_else(|| UOp::index_const(0));
-
-            trace!(combined_axes.id = combined_axes.id, "reshape flatten combined");
-
-            // Unflatten into input shape dimensions using raw Mod/Idiv.
-            // Tinygrad (indexing.py:129-132): creates raw % and // ops, then lets
-            // graph_rewrite handle all simplification. This is critical because
-            // propagate_invalid must push WHERE outward before VminVmax-based
-            // simplification can work (WHERE-Invalid makes VminVmax return dtype_bounds).
-            let mut axes_out = Vec::new();
-            let mut combined = combined_axes;
-            for shape_dim in in_shape.iter().rev() {
-                let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
-                axes_out.push(combined.try_mod(&dim_uop).unwrap());
-                combined = combined.try_div(&dim_uop).unwrap();
-            }
-            axes_out.reverse();
-
-            // Apply full symbolic simplification to the output ranges.
-            // Tinygrad (indexing.py:133-134): "this simplify is doing a lot of heavy lifting.
-            // this is the replacement for the reshape view merging code"
-            // Uses symbolic + pm_simplify_valid to collapse cascading Mod/Idiv chains.
-            use morok_ir::rewrite::graph_rewrite;
-            use std::sync::LazyLock;
-            static RESHAPE_SIMPLIFY: LazyLock<crate::TypedPatternMatcher> = LazyLock::new(|| {
-                crate::symbolic::patterns::symbolic()
-                    + crate::symbolic::valid_simplification::pm_simplify_valid()
-                    + crate::symbolic::valid_simplification::pm_drop_and_clauses()
-            });
-
-            let sink = UOp::sink(axes_out);
-            let simplified_sink = graph_rewrite(&*RESHAPE_SIMPLIFY, sink, &mut ());
-
-            match simplified_sink.op() {
-                Op::Sink { sources } => sources.iter().cloned().collect(),
-                _ => vec![simplified_sink],
-            }
+            // PLACEHOLDER canonicalization + reshape (Tinygrad indexing.py:150-153)
+            with_placeholder_canonicalization(rngs, |canonical| {
+                apply_reshape_core(in_shape, &new_shape_vals, canonical)
+            })
         }
 
         _ => panic!("apply_movement_op called with non-movement op: {:?}", op),
     }
 }
 
-/// Reshape ranges from `out_shape` to `in_shape` via flatten + unflatten.
+/// Core RESHAPE: flatten `rngs` by `out_shape` strides, decompose into `in_shape` via Mod/Idiv,
+/// then run full symbolic simplification.
 ///
 /// Matches Tinygrad's `_apply_reshape` (indexing.py:122-134).
-/// Used by `flatten_bufferize` to convert multi-dim ranges to 1D.
-pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+/// Callers should PLACEHOLDER-canonicalize `rngs` before calling this.
+fn apply_reshape_core(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
     use morok_ir::rewrite::graph_rewrite;
+
+    // Pad with CONST(0) on the left when rngs.len() < out_shape.len()
+    // (trailing-dimension alignment for partial INDEX)
+    let padded_rngs: Vec<Arc<UOp>> = if rngs.len() < out_shape.len() {
+        let padding = out_shape.len() - rngs.len();
+        let mut v = Vec::with_capacity(out_shape.len());
+        for _ in 0..padding {
+            v.push(UOp::index_const(0));
+        }
+        v.extend(rngs.iter().cloned());
+        v
+    } else {
+        rngs.to_vec()
+    };
 
     // Flatten: combined = sum(acc_i * rng_i) with acc computed from out_shape
     let mut acc = UOp::index_const(1);
     let mut axes_in = Vec::new();
-    for (shape_dim, rng) in out_shape.iter().zip(rngs.iter()).rev() {
+    for (shape_dim, rng) in out_shape.iter().zip(padded_rngs.iter()).rev() {
         axes_in.push(acc.try_mul(rng).unwrap());
         let dim_uop = shape_dim.to_uop(morok_dtype::DType::Index);
         acc = acc.try_mul(&dim_uop).unwrap();
@@ -893,6 +847,63 @@ pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<U
         Op::Sink { sources } => sources.iter().cloned().collect(),
         _ => vec![simplified],
     }
+}
+
+/// Reshape ranges from `out_shape` to `in_shape` via flatten + unflatten.
+///
+/// Public wrapper around `apply_reshape_core` with PLACEHOLDER canonicalization.
+/// Used by `flatten_bufferize` to convert multi-dim ranges to 1D.
+pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+    with_placeholder_canonicalization(rngs, |canonical| apply_reshape_core(in_shape, out_shape, canonical))
+}
+
+/// Canonicalize RANGE UOps to PLACEHOLDER before calling `f`, then restore.
+/// Matches Tinygrad indexing.py:150-153.
+fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp>]) -> Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
+    let sink = UOp::sink(rngs.to_vec());
+    let ranges_in_expr: Vec<Arc<UOp>> = sink.ranges().clone();
+
+    #[allow(clippy::mutable_key_type)]
+    let mut sub_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+    #[allow(clippy::mutable_key_type)]
+    let mut reverse_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+    for (i, r) in ranges_in_expr.iter().enumerate() {
+        let Op::Range { end, .. } = r.op() else { continue };
+        let placeholder = UOp::range_axis(end.clone(), AxisId::Renumbered(i), AxisType::Placeholder);
+        sub_map.insert(UOpKey(r.clone()), placeholder.clone());
+        reverse_map.insert(UOpKey(placeholder), r.clone());
+    }
+
+    if sub_map.is_empty() {
+        return f(rngs);
+    }
+
+    let canonical_sink = sink.substitute(&sub_map);
+    let canonical_rngs: Vec<Arc<UOp>> = match canonical_sink.op() {
+        Op::Sink { sources } => sources.iter().cloned().collect(),
+        _ => vec![canonical_sink],
+    };
+
+    let result = f(&canonical_rngs);
+
+    let result_sink = UOp::sink(result);
+    let restored = result_sink.substitute(&reverse_map);
+    let output: Vec<Arc<UOp>> = match restored.op() {
+        Op::Sink { sources } => sources.iter().cloned().collect(),
+        _ => vec![restored],
+    };
+
+    debug_assert!(
+        !output.iter().any(|r| {
+            UOp::sink(vec![r.clone()])
+                .ranges()
+                .iter()
+                .any(|rng| matches!(rng.op(), Op::Range { axis_type: AxisType::Placeholder, .. }))
+        }),
+        "Placeholder-typed ranges leaked into output"
+    );
+
+    output
 }
 
 /// Check if a UOp is a constant zero.

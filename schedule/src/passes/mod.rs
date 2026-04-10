@@ -11,6 +11,6 @@
 
 pub mod linearize_index;
 
-pub use linearize_index::{
-    build_linear_index, compute_row_major_strides, count_divmod, extract_index_dimension, pm_linearize_multi_index,
-};
+#[cfg(test)]
+pub(crate) use linearize_index::pm_linearize_multi_index;
+pub use linearize_index::{build_linear_index, compute_row_major_strides, count_divmod, extract_index_dimension};

@@ -71,7 +71,8 @@ use crate::devectorize::{
     pm_wmma_accumulate,
 };
 use crate::gpudims::pm_add_gpudims;
-use crate::passes::pm_linearize_multi_index;
+// pm_linearize_multi_index removed: Tinygrad keeps multi-index INDEX through the pipeline.
+// Codegen backends compute flat addresses at render time.
 use crate::rangeify::patterns::{
     pm_add_loads, pm_comparison_negations, pm_demorgan, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
     pm_fma_decomposition, pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_shl_add_to_mulacc,
@@ -154,14 +155,8 @@ pub fn apply_post_optimization_with_renderer(
 
     tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
-    // Multi-index linearization: INDEX(buf, [i,j,k]) → INDEX(buf, [linear])
-    // Moves row-major linearization from codegen to schedule, eliminating
-    // duplicated logic in LLVM backends.
-    // Must run BEFORE pm_add_loads (which transforms INDEX dtype to Ptr).
-    // Uses bottom-up traversal to ensure children are processed before parents.
-    let t_stage = std::time::Instant::now();
-    let linearized = graph_rewrite(pm_linearize_multi_index(), ast, &mut ());
-    tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "linearize_multi_index complete");
+    // Tinygrad keeps multi-index INDEX through the pipeline — no linearization here.
+    // Codegen backends compute flat addresses at render time via render_linearize_multi_index.
 
     // =========================================================================
     // Stage 8: Post-opt symbolic + WHERE movement (Tinygrad: sym + pm_move_where_on_load)
@@ -171,7 +166,7 @@ pub fn apply_post_optimization_with_renderer(
     // Tinygrad: sym + pm_move_where_on_load (pm_move_where_on_load only at this stage, not global)
     static POST_OPT_SYM: LazyLock<crate::TypedPatternMatcher> =
         LazyLock::new(|| sym().clone() + crate::symbolic::patterns::pm_move_where_on_load());
-    let with_symbolic = graph_rewrite(&*POST_OPT_SYM, linearized, &mut ());
+    let with_symbolic = graph_rewrite(&*POST_OPT_SYM, ast, &mut ());
     tracing::debug!(
         ast.optimized = with_symbolic.tree(),
         node_count = with_symbolic.node_count(),
