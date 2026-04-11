@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use bon::bon;
+use smallvec::SmallVec;
 
 use crate::op::Op;
 use crate::pattern::{Matcher, RewriteResult};
@@ -141,6 +142,18 @@ pub struct UOp {
     /// O(1) per node since children are already created with their content_hash set.
     /// Used for schedule-level caching where UOp IDs are not stable across runs.
     pub content_hash: u64,
+    /// Tag for tracking tensor identity through the rangeify pipeline.
+    ///
+    /// Matches Tinygrad's `UOp.tag` (ops.py:128). Tags are tuples of integer indices
+    /// that track which original tensor UOps map to which final kernel outputs.
+    /// Tags participate in hash consing — different tag = different UOp.
+    ///
+    /// Values:
+    /// - `None` — untagged (default)
+    /// - `Some([])` — empty tag (e.g., RANGE ops)
+    /// - `Some([i])` — single index (assigned by add_tags)
+    /// - `Some([i, j, ...])` — merged indices (from buffer folding)
+    pub tag: Option<SmallVec<[usize; 2]>>,
     /// Optional metadata attached to this UOp.
     ///
     /// Metadata is NOT part of hash consing - attaching metadata creates a new UOp
@@ -175,6 +188,25 @@ impl UOp {
     /// Get the data type.
     pub fn dtype(&self) -> DType {
         self.dtype.clone()
+    }
+
+    /// Get the tag.
+    pub fn tag(&self) -> &Option<SmallVec<[usize; 2]>> {
+        &self.tag
+    }
+
+    /// Create a new UOp with the given tag (Tinygrad: `rtag()`).
+    /// Returns self unchanged if tag is already equal.
+    pub fn rtag(self: &Arc<Self>, tag: Option<SmallVec<[usize; 2]>>) -> Arc<Self> {
+        if self.tag == tag {
+            return self.clone();
+        }
+        Self::new_tagged(self.op.clone(), self.dtype.clone(), tag)
+    }
+
+    /// Create a new UOp with the given tag set.
+    pub fn with_tag(self: &Arc<Self>, tag: SmallVec<[usize; 2]>) -> Arc<Self> {
+        self.rtag(Some(tag))
     }
 
     /// Check if this UOp has a concrete buffer identity in the graph.
@@ -1204,9 +1236,8 @@ impl UOp {
             Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
         };
 
-        // Preserve original dtype like Tinygrad - dtype is explicitly set at creation
-        // If you need a different dtype, create a new UOp explicitly
-        Self::new(new_op, self.dtype.clone())
+        // Preserve original dtype and tag (Tinygrad ops.py:1256: preserves tag through source reconstruction)
+        Self::new_tagged(new_op, self.dtype.clone(), self.tag.clone())
     }
 }
 
@@ -1248,6 +1279,7 @@ impl Clone for UOp {
             op: self.op.clone(),
             dtype: self.dtype.clone(),
             content_hash: self.content_hash,
+            tag: self.tag.clone(),
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),

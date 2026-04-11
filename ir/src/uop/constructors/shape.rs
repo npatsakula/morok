@@ -237,7 +237,12 @@ impl UOp {
 
         let (begins, ends) = ranges_to_uops(ranges);
         let dtype = self.dtype();
-        Ok(Self::new(Op::Shrink { src: self.clone(), begins, ends }, dtype))
+        let result = Self::new(Op::Shrink { src: self.clone(), begins, ends }, dtype);
+        // Tinygrad (movement.py:128): return self if ret.shape == self.shape else ret
+        if result.shape().ok().flatten() == self.shape().ok().flatten() {
+            return Ok(self.clone());
+        }
+        Ok(result)
     }
 
     /// Flip with strict validation.

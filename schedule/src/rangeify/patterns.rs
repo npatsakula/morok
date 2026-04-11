@@ -389,6 +389,8 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
 
     // Determine target: REDUCE if we have ranges, source otherwise
     let target = if reduce_ranges.is_empty() { Arc::clone(src) } else { src.reduce(reduce_ranges, *reduce_op) };
+    // Preserve tag from ReduceAxis (Tinygrad indexing.py:87: tag=x.tag)
+    let target = if let Some(t) = x.tag() { target.with_tag(t.clone()) } else { target };
 
     // Transfer context to new identity (range_map + realize_map only)
     ctx.set_ranges(&target, input_ranges.clone(), output_ranges.clone());
@@ -410,10 +412,27 @@ pub fn buffer_folding() -> TypedPatternMatcher {
         Bufferize { compute: c @ Const(_), .. } ~> |c| c.clone(),
         Index { buffer: c @ Const(_), .. } ~> |c| c.clone(),
         Copy { src: c @ Const(_), .. } ~> |c| c.clone(),
-        Index { buffer: Bufferize { compute, ranges, .. }, indices, gate: None }
+        Index { buffer: buf @ Bufferize { compute, ranges, .. }, indices, gate: None }
             if ranges_equal(ranges, indices) && !matches!(compute.op(), Op::BufferView { .. })
-            => |compute| {
-                Some(compute.clone())
+            => |compute, buf, ranges| {
+                // Tinygrad (rangeify.py:257-258): merge tags, shrink to bufferize shape
+                let mut merged = SmallVec::<[usize; 2]>::new();
+                if let Some(t) = compute.tag() { merged.extend(t.iter().copied()); }
+                if let Some(t) = buf.tag() { merged.extend(t.iter().copied()); }
+                let tag = if merged.is_empty() { None } else { Some(merged) };
+                let result = compute.rtag(tag);
+                // Tinygrad (rangeify.py:258): .shrink(tuple((0, s) for s in b2.shape)) if b2.shape
+                // try_shrink has noop detection (returns self when result shape == shrink shape)
+                if !ranges.is_empty()
+                    && let (Ok(Some(buf_shape)), Ok(Some(_))) = (buf.shape(), result.shape()) {
+                        let shrink_ranges: Vec<_> = buf_shape.iter()
+                            .map(|s| (morok_ir::SInt::Const(0), s.clone()))
+                            .collect();
+                        if let Ok(shrunk) = result.try_shrink(&shrink_ranges) {
+                            return Some(shrunk);
+                        }
+                    }
+                Some(result)
             },
     }
 }

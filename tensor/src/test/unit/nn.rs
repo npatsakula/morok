@@ -553,6 +553,8 @@ fn test_densenet_two_layer_kernel_count() {
 
     let uop = result.uop();
     let sink = morok_ir::UOp::sink(vec![uop.clone()]);
+    // Normalize Buffer→Param before rangeify (matches real pipeline)
+    let (sink, _param_buffers) = crate::realize::normalize_buffers_to_params(&sink);
     let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(sink, None).unwrap();
     let (kernels_root, _kctx) = morok_schedule::rangeify::run_kernel_split_pipeline(rangeified);
 

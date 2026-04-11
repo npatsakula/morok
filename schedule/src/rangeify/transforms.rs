@@ -22,6 +22,78 @@ use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, UOp, U
 use smallvec::{SmallVec, smallvec};
 
 // ============================================================================
+// ADD_TAGS — Tinygrad rangeify.py:542-555
+// ============================================================================
+
+/// Context for the add_tags pass.
+pub struct AddTagsCtx {
+    /// Sequential list of tagged UOps (index = tag value).
+    pub uop_list: Vec<Arc<UOp>>,
+    /// UOps excluded from tagging (e.g., nodes inside KERNEL/CALL).
+    excluded: HashSet<UOpKey>,
+}
+
+impl Default for AddTagsCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AddTagsCtx {
+    pub fn new() -> Self {
+        Self { uop_list: Vec::new(), excluded: HashSet::new() }
+    }
+}
+
+/// Ops that should NOT be tagged (Tinygrad rangeify.py:552-553).
+/// MStack/MSelect are handled separately with conditional logic.
+/// Note: Tinygrad also excludes LUNIQUE — Morok uses counter-based local IDs instead.
+fn should_skip_tag(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Param { .. }
+            | Op::Const(_)
+            | Op::Device(_)
+            | Op::Unique(_)
+            | Op::DefineVar { .. }
+            | Op::Bind { .. }
+            | Op::End { .. }
+            | Op::Range { .. }
+    ) || op.is_movement()
+}
+
+/// Create the add_tags pattern matcher (Tinygrad rangeify.py:550-555).
+///
+/// Assigns sequential integer tags `[i]` to each taggable UOp. Tags track which
+/// original tensor UOps map to which final kernel outputs through the pipeline.
+pub fn add_tags_patterns() -> crate::TypedPatternMatcher<AddTagsCtx> {
+    crate::patterns! {
+        @context AddTagsCtx;
+        // Wildcard: handles all ops, applies tag logic per Tinygrad rangeify.py:542-554
+        x => {
+            if x.tag().is_some() || ctx.excluded.contains(&UOpKey(x.clone())) { return None; }
+            // Kernel/Call: exclude entire subgraph from tagging (Tinygrad line 544-546)
+            if let Op::Kernel { ast, .. } = x.op() {
+                for u in ast.toposort() {
+                    ctx.excluded.insert(UOpKey(u));
+                }
+            }
+            if should_skip_tag(x.op()) { return None; }
+            // Index-typed scalars are not tagged (Tinygrad line 547)
+            if x.dtype().base() == morok_dtype::ScalarDType::Index { return None; }
+            // MStack/MSelect: only tag if NOT all sources are PARAM (Tinygrad line 554)
+            if matches!(x.op(), Op::MStack { .. } | Op::MSelect { .. })
+                && x.op().sources().iter().all(|s| matches!(s.op(), Op::Param { .. }))
+            {
+                return None;
+            }
+            ctx.uop_list.push(x.clone());
+            Some(x.with_tag(smallvec![ctx.uop_list.len() - 1]))
+        },
+    }
+}
+
+// ============================================================================
 // PUBLIC API
 // ============================================================================
 
@@ -37,14 +109,15 @@ pub fn rangeify(
     Ok((result.sink, result.context))
 }
 
-/// Result of rangeify transformation including the substitution map.
+/// Result of rangeify transformation.
 pub struct RangeifyResult {
     /// The transformed sink node
     pub sink: Arc<UOp>,
     /// Context with range information
     pub context: RangeifyContext,
-    /// Maps original UOps to their transformed versions (for global substitution)
-    pub becomes_map: HashMap<UOpKey, Arc<UOp>>,
+    /// Tagged UOps from add_tags pass (index = tag value).
+    /// Used for tag-based becomes_map construction (Tinygrad rangeify.py:614-619).
+    pub uop_list: Vec<Arc<UOp>>,
 }
 
 /// Main rangeify transformation entry point with becomes_map tracking.
@@ -70,10 +143,18 @@ pub fn rangeify_with_map(
     sink: Arc<UOp>,
     pcontig_config: Option<&super::kernel::PcontigConfig>,
 ) -> morok_ir::Result<RangeifyResult> {
-    use morok_ir::rewrite::{graph_rewrite_bottom_up_with_map, graph_rewrite_with_map};
-
-    // Aggregate all becomes_maps from rewrite passes
-    let mut all_becomes: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
+    // add_tags: assign sequential integer tags to UOps (Tinygrad rangeify.py:575).
+    // MUST run FIRST — tags track tensor identity through the entire pipeline.
+    let t_stage = std::time::Instant::now();
+    let mut tag_ctx = AddTagsCtx::new();
+    let mut sink = crate::rewrite::graph_rewrite_bottom_up(&add_tags_patterns(), sink, &mut tag_ctx);
+    let uop_list = tag_ctx.uop_list;
+    tracing::debug!(
+        tagged_count = uop_list.len(),
+        node_count = sink.node_count(),
+        elapsed_ms = t_stage.elapsed().as_millis() as u64,
+        "add_tags complete"
+    );
 
     // Combined early pass (Tinygrad: earliest_rewrites + replace_contiguous, ctx={})
     // MUST run BEFORE range assignment so rangeify sees a cleaned graph.
@@ -82,9 +163,7 @@ pub fn rangeify_with_map(
     let early_combined = super::patterns::early_rewrites().with_context::<super::patterns::ReplaceContiguousCtx>()
         + super::patterns::replace_contiguous();
     let mut contig_ctx = super::patterns::ReplaceContiguousCtx::new();
-    let result = graph_rewrite_bottom_up_with_map(&early_combined, sink, &mut contig_ctx);
-    let mut sink = result.root;
-    all_becomes.extend(result.becomes_map);
+    sink = crate::rewrite::graph_rewrite_bottom_up(&early_combined, sink, &mut contig_ctx);
     tracing::debug!(
         uop.tree = sink.tree(),
         node_count = sink.node_count(),
@@ -96,9 +175,7 @@ pub fn rangeify_with_map(
     let t_stage = std::time::Instant::now();
     let mut split_config = super::kernel::SplitReduceOpConfig::default();
     let split_matcher = super::patterns::split_reduceop_patterns();
-    let result = graph_rewrite_with_map(&split_matcher, sink, &mut split_config);
-    sink = result.root;
-    all_becomes.extend(result.becomes_map);
+    sink = crate::rewrite::graph_rewrite(&split_matcher, sink, &mut split_config);
     tracing::debug!(
         uop.tree = sink.tree(),
         node_count = sink.node_count(),
@@ -161,25 +238,27 @@ pub fn rangeify_with_map(
     // Stages 2a-6 (load_collapse, split_ranges, symbolic+flatten, simplify_ranges,
     // split_store) now run per-kernel in optimizer::apply_pre_optimization().
 
-    // SINK cleanup: filter sources to valid output types (Tinygrad rangeify.py:585-589).
-    // The mega-pass may simplify some SINK sources (e.g., BUFFERIZE(CONST) → CONST).
-    // Only keep sources whose base op is a valid output type.
+    // SINK rebuild: filter sources to tagged valid output types (Tinygrad rangeify.py:585-589).
+    // TODO: Full Tinygrad approach scans backward_slice for ALL tagged nodes and rebuilds
+    // SINK with them. This requires Phase 7 (tag-based becomes_map) to be implemented first.
+    // For now, filter existing SINK sources by tag + op type.
     if let Op::Sink { sources } = sink.op() {
         let filtered: Vec<Arc<UOp>> = sources
             .iter()
             .filter(|s| {
-                matches!(
+                let valid_op = matches!(
                     s.base().op(),
                     Op::Bufferize { .. } | Op::MStack { .. } | Op::Const(_) | Op::Param { .. } | Op::After { .. }
-                )
+                );
+                valid_op
             })
             .cloned()
             .collect();
-        if filtered.len() != sources.len() && !filtered.is_empty() {
+        if !filtered.is_empty() && filtered.len() != sources.len() {
             tracing::debug!(
                 original = sources.len(),
                 filtered = filtered.len(),
-                "SINK cleanup: removed non-output sources after mega-pass"
+                "SINK cleanup: removed invalid-type sources after mega-pass"
             );
             sink = UOp::sink(filtered);
         }
@@ -191,9 +270,7 @@ pub fn rangeify_with_map(
     {
         let t_stage = std::time::Instant::now();
         let limit_matcher = super::patterns::buffer_limit_patterns(limit);
-        let result = graph_rewrite_with_map(&limit_matcher, sink, &mut ());
-        sink = result.root;
-        all_becomes.extend(result.becomes_map);
+        sink = crate::rewrite::graph_rewrite(&limit_matcher, sink, &mut ());
         tracing::debug!(
             uop.tree = sink.tree(),
             elapsed_ms = t_stage.elapsed().as_millis() as u64,
@@ -208,7 +285,7 @@ pub fn rangeify_with_map(
     // Build RangeifyContext for return
     let rangeify_ctx = RangeifyContext { range_counter: indexing_ctx.range_counter(), range_map: HashMap::new() };
 
-    Ok(RangeifyResult { sink, context: rangeify_ctx, becomes_map: all_becomes })
+    Ok(RangeifyResult { sink, context: rangeify_ctx, uop_list })
 }
 
 /// Pattern matcher for range flattening.
@@ -591,7 +668,10 @@ pub(crate) fn transform_single_source(
         let device = src.device_spec();
         let opts = BufferizeOpts { device, addrspace, removable };
 
+        // Tinygrad (indexing.py:71): tag=s.tag if GLOBAL, else None
+        let buf_tag = if addrspace == AddrSpace::Global { src.tag().clone() } else { None };
         let bufferized = UOp::bufferize(Arc::clone(src), closed_ranges.clone(), opts);
+        let bufferized = if let Some(t) = buf_tag { bufferized.with_tag(t) } else { bufferized };
 
         let index_ranges: Vec<_> = input_ranges
             .iter()

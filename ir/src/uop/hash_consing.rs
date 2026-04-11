@@ -66,6 +66,7 @@ struct UOpKey {
     dtype: DType,
     src_ids: SmallVec<[u64; 4]>,
     op_data: OpData,
+    tag: Option<SmallVec<[usize; 2]>>,
     /// Pre-computed hash — avoids re-hashing on every HashMap operation.
     cached_hash: u64,
 }
@@ -86,6 +87,7 @@ impl PartialEq for UOpKey {
             && self.dtype == other.dtype
             && self.src_ids == other.src_ids
             && self.op_data == other.op_data
+            && self.tag == other.tag
     }
 }
 
@@ -169,7 +171,7 @@ fn src_ids(op: &Op) -> SmallVec<[u64; 4]> {
 }
 
 impl UOpKey {
-    fn new(op: &Op, dtype: DType) -> Self {
+    fn new(op: &Op, dtype: DType, tag: &Option<SmallVec<[usize; 2]>>) -> Self {
         let op_discriminant = discriminant(op);
         let src_ids = src_ids(op);
 
@@ -256,10 +258,11 @@ impl UOpKey {
                 h.write_u64(*id);
             }
             op_data.hash(&mut h);
+            tag.hash(&mut h);
             h.finish()
         };
 
-        Self { op_discriminant, dtype, src_ids, op_data, cached_hash }
+        Self { op_discriminant, dtype, src_ids, op_data, tag: tag.clone(), cached_hash }
     }
 }
 
@@ -345,30 +348,33 @@ impl UOp {
     ///
     /// The cache stores weak references. UOps are automatically cleaned up when
     /// no strong references remain (Tinygrad-aligned behavior).
+    #[inline]
     #[track_caller]
     pub fn new(op: Op, dtype: DType) -> Arc<Self> {
+        Self::new_tagged(op, dtype, None)
+    }
+
+    /// Create a UOp with an explicit tag (Tinygrad: `UOp(op, dtype, src, arg, tag)`).
+    /// Tag participates in hash consing — same structure + different tag = different UOp.
+    #[track_caller]
+    pub fn new_tagged(op: Op, dtype: DType, tag: Option<SmallVec<[usize; 2]>>) -> Arc<Self> {
         use papaya::{Compute, Operation};
 
-        // Capture caller location BEFORE entering any closures
         let caller_location = std::panic::Location::caller();
-        let key = UOpKey::new(&op, dtype.clone());
+        let key = UOpKey::new(&op, dtype.clone(), &tag);
         let guard = uops().guard();
 
         // Fast path: check if valid entry exists
         if let Some(weak) = uops().get(&key, &guard)
             && let Some(arc) = weak.upgrade()
         {
-            // Valid entry found - record provenance and return
             use crate::provenance::PROVENANCE_TRACKER;
             PROVENANCE_TRACKER.with(|tracker| {
                 tracker.borrow_mut().capture(arc.id, caller_location);
             });
             return arc;
         }
-        // Dead weak ref - will be replaced below
 
-        // Compute structural content hash using children's content hashes.
-        // O(1) per node — children are already created with their content_hash set.
         let content_hash = {
             use xxhash_rust::xxh64::Xxh64;
             let mut h = Xxh64::new(0);
@@ -381,12 +387,12 @@ impl UOp {
             h.finish()
         };
 
-        // Create new UOp (will be used if we win the race)
         let new_arc = Arc::new(Self {
             id: next_uop_id(),
             op,
             dtype,
             content_hash,
+            tag,
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),
@@ -398,36 +404,27 @@ impl UOp {
         });
         let new_weak = Arc::downgrade(&new_arc);
 
-        // Atomic insert: insert our weak ref, but if someone else has a valid one, use theirs
-        // Note: papaya's Insert replaces existing entries, which handles dead weak refs
         let result = uops().compute(
             key,
             |entry| match entry {
                 Some((_, existing_weak)) => {
                     if let Some(existing_arc) = existing_weak.upgrade() {
-                        // Valid entry exists - abort with it (reuse existing)
                         Operation::Abort(existing_arc)
                     } else {
-                        // Dead entry - replace with ours
                         Operation::Insert(new_weak.clone())
                     }
                 }
-                None => {
-                    // No entry - insert ours
-                    Operation::Insert(new_weak.clone())
-                }
+                None => Operation::Insert(new_weak.clone()),
             },
             &guard,
         );
 
-        // Determine which Arc to return based on compute result
         let final_arc = match result {
             Compute::Inserted(_, _) | Compute::Updated { .. } => new_arc,
             Compute::Aborted(existing_arc) => existing_arc,
-            _ => new_arc, // Fallback for Unchanged/Removed (shouldn't happen)
+            _ => new_arc,
         };
 
-        // Record provenance
         use crate::provenance::PROVENANCE_TRACKER;
         PROVENANCE_TRACKER.with(|tracker| {
             tracker.borrow_mut().capture(final_arc.id, caller_location);
@@ -483,6 +480,7 @@ impl UOp {
             op: self.op.clone(),
             dtype: self.dtype.clone(),
             content_hash: self.content_hash, // same structure, same content hash
+            tag: self.tag.clone(),
             shape_cache: std::sync::OnceLock::new(),
             ranges_cache: std::sync::OnceLock::new(),
             in_scope_ranges_cache: std::sync::OnceLock::new(),

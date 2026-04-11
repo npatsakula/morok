@@ -660,12 +660,25 @@ fn realize_pending_recursive(buf_id: u64, config: &PrepareConfig) -> Result<()> 
         // Schedule the ASSIGN directly in SINK — no CONTIGUOUS wrapper.
         let sink = UOp::sink(vec![assign_uop.clone()]);
 
-        let input_buffers = collect_input_buffers(&assign_uop);
+        let all_input_buffers = collect_input_buffers(&assign_uop);
         let var_vals = extract_var_vals(&assign_uop);
+
+        // Pre-schedule normalization: BUFFER→PARAM (same as prepare_with/realize_batch_with).
+        let (sink, param_buffers) = normalize_buffers_to_params(&sink);
+        let mut param_input_buffers = crate::schedule::InputBuffers::new();
+        for node in sink.toposort() {
+            if let Op::Param { slot, .. } = node.op() {
+                let (orig_buffer_id, _) = &param_buffers[*slot];
+                if let Some(buf) = all_input_buffers.get(orig_buffer_id) {
+                    param_input_buffers.insert(node.id, buf.clone());
+                }
+            }
+        }
 
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
         let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
-        let schedule_result = crate::schedule::create_schedule(kernelized, &kernel_ctx, &input_buffers, &var_vals)?;
+        let schedule_result =
+            crate::schedule::create_schedule(kernelized, &kernel_ctx, &param_input_buffers, &var_vals)?;
 
         if schedule_result.items.is_empty() {
             continue;
