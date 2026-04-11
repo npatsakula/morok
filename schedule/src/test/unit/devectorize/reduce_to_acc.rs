@@ -336,7 +336,7 @@ fn test_reduce_in_full_pipeline() {
     let reduce_range = create_range_reduce(32, 0);
     let buffer_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global);
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 1024, buffer_dtype.clone());
-    let define = UOp::define_global(0, buffer_dtype);
+    let define = UOp::param(0, 1024, buffer_dtype, None);
 
     // LOAD from buffer
     let idx = UOp::index().buffer(define).indices(vec![reduce_range.clone()]).call().unwrap();

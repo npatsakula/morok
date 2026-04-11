@@ -129,7 +129,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         // Meta-ops: no code emitted
         Op::Const(_)
         | Op::VConst { .. }
-        | Op::DefineGlobal(_)
+        | Op::Param { device: None, .. }
         | Op::DefineLocal(_)
         | Op::DefineVar { .. }
         | Op::Noop

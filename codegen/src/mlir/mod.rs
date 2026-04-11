@@ -177,12 +177,12 @@ impl Renderer for MlirRenderer {
 
         for node in &nodes {
             match node.op() {
-                Op::DefineGlobal(_) => buffers.push(node.clone()),
+                Op::Param { device: None, .. } => buffers.push(node.clone()),
                 Op::DefineVar { .. } => variables.push(node.clone()),
                 _ => {}
             }
         }
-        buffers.sort_by_key(|b| if let Op::DefineGlobal(id) = b.op() { *id } else { usize::MAX });
+        buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
 
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
             if let Op::Range { axis_type, end, .. } = n.op()
@@ -204,9 +204,9 @@ impl Renderer for MlirRenderer {
         let mut var_names: Vec<String> = Vec::new();
 
         for (i, buf) in buffers.iter().enumerate() {
-            if let Op::DefineGlobal(id) = buf.op() {
+            if let Op::Param { slot, device: None, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
-                buffer_args.push(BufferArg { index: *id, name: format!("data{i}"), dtype: buf.dtype(), is_output });
+                buffer_args.push(BufferArg { index: *slot, name: format!("data{i}"), dtype: buf.dtype(), is_output });
             }
         }
         for var in &variables {
@@ -397,7 +397,7 @@ fn render_node<'c, 'a: 'c>(
     match node.op() {
         // Skip meta-ops and already-handled ops
         Op::Const(_)
-        | Op::DefineGlobal(_)
+        | Op::Param { device: None, .. }
         | Op::DefineLocal(_)
         | Op::DefineVar { .. }
         | Op::Noop

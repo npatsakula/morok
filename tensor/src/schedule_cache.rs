@@ -10,7 +10,6 @@
 
 use std::sync::{Arc, OnceLock};
 
-use morok_schedule::rangeify::KernelContext;
 use papaya::HashMap;
 
 use morok_ir::UOp;
@@ -29,14 +28,12 @@ type ScheduleCacheKey = (u64, &'static str);
 
 /// Cached output of rangeify + kernel_split pipeline.
 ///
-/// Contains the kernelized graph and kernel context, but NOT buffer allocations.
+/// Contains the kernelized graph, but NOT buffer allocations.
 /// Buffer allocation happens fresh each time in `create_schedule`, because
 /// buffers are tensor-specific (different input data).
 pub(crate) struct CachedSchedule {
     /// The graph after rangeify + kernel_split (contains KERNEL ops).
     pub kernelized: Arc<UOp>,
-    /// Metadata from kernel splitting (buffer_map, define_to_buffer_id, etc.).
-    pub kernel_ctx: KernelContext,
 }
 
 /// Global schedule-level cache.

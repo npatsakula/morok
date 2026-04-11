@@ -69,7 +69,7 @@ fn test_empty_bufferize() {
 #[test]
 fn test_zero_size_index() {
     // INDEX with zero indices (direct buffer access)
-    let buffer = UOp::define_global(0, DType::Float32);
+    let buffer = UOp::param(0, 1, DType::Float32, None);
 
     // Create INDEX with empty indices
     let index = UOp::index().buffer(buffer.clone()).indices(vec![]).call().expect("INDEX with no indices should work");

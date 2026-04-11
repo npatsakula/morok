@@ -65,7 +65,7 @@ struct BufferEvent {
     timestep: usize,
     /// True for allocation, false for deallocation.
     is_alloc: bool,
-    /// Buffer identifier (DefineGlobal UOp ID or buffer index).
+    /// Buffer identifier (UOp ID or buffer index).
     buffer_id: BufferKey,
 }
 

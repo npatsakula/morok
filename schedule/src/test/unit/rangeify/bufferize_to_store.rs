@@ -388,7 +388,7 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
         panic!("Expected KERNEL operation, got {:?}", kernel.op());
     };
 
-    // KERNEL sources should contain the BUFFER (mapped to itself by local_to_define_global_patterns)
+    // KERNEL sources should contain the BUFFER (mapped to itself by local_to_param_patterns)
     assert!(!sources.is_empty(), "KERNEL should have at least one source");
 
     // AST should be SINK wrapping the transformed computation

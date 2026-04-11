@@ -339,20 +339,16 @@ impl Tensor {
             }
             None => {
                 let rangeify_result = morok_schedule::rangeify_with_map(normalized, None).context(RangeifySnafu)?;
-                let (k, kctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
-                let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { kernelized: k, kernel_ctx: kctx });
+                let (k, _) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
+                let new_entry = Arc::new(crate::schedule_cache::CachedSchedule { kernelized: k });
                 let guard = cache.guard();
                 cache.insert(sched_key, Arc::clone(&new_entry), &guard);
                 new_entry
             }
         };
 
-        let schedule_result = crate::schedule::create_schedule(
-            entry.kernelized.clone(),
-            &entry.kernel_ctx,
-            &param_input_buffers,
-            &var_vals,
-        )?;
+        let schedule_result =
+            crate::schedule::create_schedule(entry.kernelized.clone(), &param_input_buffers, &var_vals)?;
         // Per-kernel optimization+compilation is cached globally in prepare_execution_plan
         // via OPT_CACHE keyed by content_hash(ast). Identical kernel ASTs across calls
         // (e.g., sort substages, repeated model inference) skip optimize+compile.
@@ -469,9 +465,8 @@ impl Tensor {
 
         // Pipeline: rangeify → kernel_split → schedule → plan → execute
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
-        let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
-        let schedule_result =
-            crate::schedule::create_schedule(kernelized, &kernel_ctx, &param_input_buffers, &var_vals)?;
+        let (kernelized, _kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
+        let schedule_result = crate::schedule::create_schedule(kernelized, &param_input_buffers, &var_vals)?;
 
         let t_prep = std::time::Instant::now();
         let plan = prepare_execution_plan(&schedule_result, config)?;
@@ -577,9 +572,8 @@ impl Tensor {
         }
 
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
-        let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
-        let schedule_result =
-            crate::schedule::create_schedule(kernelized, &kernel_ctx, &param_input_buffers, &var_vals)?;
+        let (kernelized, _kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
+        let schedule_result = crate::schedule::create_schedule(kernelized, &param_input_buffers, &var_vals)?;
 
         let plan = prepare_execution_plan(&schedule_result, config)?;
 
@@ -676,9 +670,8 @@ fn realize_pending_recursive(buf_id: u64, config: &PrepareConfig) -> Result<()> 
         }
 
         let rangeify_result = morok_schedule::rangeify_with_map(sink, None).context(RangeifySnafu)?;
-        let (kernelized, kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
-        let schedule_result =
-            crate::schedule::create_schedule(kernelized, &kernel_ctx, &param_input_buffers, &var_vals)?;
+        let (kernelized, _kernel_ctx) = morok_schedule::run_kernel_split_pipeline(rangeify_result.sink);
+        let schedule_result = crate::schedule::create_schedule(kernelized, &param_input_buffers, &var_vals)?;
 
         if schedule_result.items.is_empty() {
             continue;
@@ -757,7 +750,7 @@ fn normalize_buffers_patterns() -> &'static morok_schedule::TypedPatternMatcher<
                     ctx.param_buffers.push((buf.id, buf.clone()));
                     s
                 });
-                Some(UOp::param(slot, *size, buf.dtype(), device.clone()))
+                Some(UOp::param(slot, *size, buf.dtype(), Some(device.clone())))
             },
         }
     });
@@ -850,82 +843,48 @@ fn build_execution_graph(schedule: &[ScheduleItem]) -> ExecutionGraph {
     graph
 }
 
-/// Detect output buffer indices by finding buffers written to by STORE operations.
+/// Detect output buffer indices by finding PARAM slots written to by STORE operations.
 ///
-/// Examines the kernel's AST to find STORE and STOREGATED operations, then
-/// identifies which buffers in the buffer list are written to.
-///
-/// # Arguments
-///
-/// * `kernel` - The KERNEL UOp containing the AST
-/// * `buffers` - The list of buffers for this kernel
-///
-/// # Returns
-///
-/// Indices into `buffers` for output buffers. Falls back to [0] if no outputs found.
+/// Uses PARAM slot-based matching (like Tinygrad's `ProgramSpec.from_uop`,
+/// renderer/__init__.py:119-124). The codegen PARAM slot directly indexes
+/// into the kernel's buffer list — no second pass over sources needed.
 fn detect_output_indices(kernel: &Arc<UOp>, buffers: &[Buffer]) -> Vec<usize> {
-    use std::collections::HashSet;
-
     let ast = match kernel.op() {
         Op::Kernel { ast, .. } => ast,
-        _ => return vec![0], // Fallback if not a kernel
-    };
-
-    // Find all DefineGlobal IDs that are written to by STORE operations
-    let mut output_buffer_uop_ids: HashSet<u64> = HashSet::new();
-
-    for node in ast.toposort() {
-        // Use store_buffer() helper to get buffer from STORE via its INDEX child
-        if let Some(buffer) = node.store_buffer() {
-            // Get the buffer's DefineGlobal ID
-            let buf_id = match buffer.op() {
-                Op::DefineGlobal(_) | Op::DefineLocal(_) => buffer.id,
-                Op::Index { buffer: inner, .. } => {
-                    if matches!(inner.op(), Op::DefineGlobal(_) | Op::DefineLocal(_)) {
-                        inner.id
-                    } else {
-                        continue;
-                    }
-                }
-                _ => continue,
-            };
-            output_buffer_uop_ids.insert(buf_id);
-        }
-    }
-
-    // Now map UOp IDs to buffer indices
-    // The kernel sources have DefineGlobal UOps in a specific order, which corresponds
-    // to the buffer list order. We need to find which DefineGlobal IDs match.
-    let sources = match kernel.op() {
-        Op::Kernel { sources, .. } => sources,
         _ => return vec![0],
     };
 
-    let mut output_indices = Vec::new();
-    let mut buffer_idx = 0;
-    for src in sources {
-        match src.op() {
-            Op::DefineGlobal(_) | Op::DefineLocal(_) => {
-                if output_buffer_uop_ids.contains(&src.id) && buffer_idx < buffers.len() {
-                    output_indices.push(buffer_idx);
-                }
-                buffer_idx += 1;
-            }
-            Op::Buffer { .. } => {
-                // Input buffer - also consumes a buffer slot
-                if output_buffer_uop_ids.contains(&src.id) && buffer_idx < buffers.len() {
-                    output_indices.push(buffer_idx);
-                }
-                buffer_idx += 1;
-            }
-            Op::DefineVar { .. } | Op::Bind { .. } => {
-                // Variable - doesn't consume a buffer slot
-            }
-            _ => {}
+    // Single AST walk: find STORE targets, extract PARAM slot numbers.
+    // Tinygrad: if (buf:=idx.src[0]).op is Ops.PARAM: outs.append(buf.arg)
+    let mut output_slots = Vec::new();
+    for node in ast.toposort() {
+        if !matches!(node.op(), Op::Store { .. }) {
+            continue;
+        }
+        // STORE.index → INDEX.buffer → PARAM (or STORE.index → CAST → INDEX.buffer → PARAM)
+        let idx = match node.op() {
+            Op::Store { index, .. } => index,
+            _ => continue,
+        };
+        let buf = match idx.op() {
+            Op::Index { buffer, .. } => buffer,
+            Op::Cast { src, .. } => match src.op() {
+                Op::Index { buffer, .. } => buffer,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if let Op::Param { slot, device: None, .. } = buf.op()
+            && !output_slots.contains(slot)
+        {
+            output_slots.push(*slot);
         }
     }
 
-    // Fallback to first buffer if no outputs found
+    // Slots are buffer indices (Tinygrad: sorted(dedup(outs)))
+    output_slots.sort();
+    output_slots.dedup();
+    let output_indices: Vec<usize> = output_slots.into_iter().filter(|&s| s < buffers.len()).collect();
     if output_indices.is_empty() && !buffers.is_empty() { vec![0] } else { output_indices }
 }
 

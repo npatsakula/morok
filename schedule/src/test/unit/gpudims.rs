@@ -19,7 +19,7 @@ fn create_local_range(end_value: i64, axis_id: usize) -> Arc<UOp> {
 
 /// Helper: Create a GLOBAL buffer (Ptr to Global memory).
 fn create_global_buffer(buf_id: usize) -> Arc<UOp> {
-    UOp::define_global(buf_id, DType::Float32.ptr(Some(1024), AddrSpace::Global))
+    UOp::param(buf_id, 1024, DType::Float32.ptr(Some(1024), AddrSpace::Global), None)
 }
 
 /// Helper: Create an INDEX into a buffer with given indices.

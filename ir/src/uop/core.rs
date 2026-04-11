@@ -436,13 +436,21 @@ impl UOp {
     pub fn device_spec(&self) -> Option<morok_dtype::DeviceSpec> {
         match self.op() {
             Op::Device(spec) => Some(spec.clone()),
-            Op::Buffer { device, .. } | Op::Param { device, .. } => {
+            Op::Buffer { device, .. } => {
                 if let Op::Device(spec) = device.op() {
                     Some(spec.clone())
                 } else {
                     None
                 }
             }
+            Op::Param { device: Some(device), .. } => {
+                if let Op::Device(spec) = device.op() {
+                    Some(spec.clone())
+                } else {
+                    None
+                }
+            }
+            Op::Param { device: None, .. } => None,
             Op::Copy { device, .. } => {
                 if let Op::Device(spec) = device.op() {
                     Some(spec.clone())
@@ -735,7 +743,7 @@ impl UOp {
     ///
     /// ```text
     /// [42] STORE : Void
-    /// ├── [10] DEFINE_GLOBAL(0) : Ptr<Float32> shape=[4]
+    /// ├── [10] PARAM(0) : Ptr<Float32> shape=[4]
     /// ├── [35] INDEX : Ptr<Float32> shape=[4]
     /// │   ├── [10] → (see above)
     /// │   └── [30] RANGE(0, Reduce) : Index
@@ -975,7 +983,6 @@ impl UOp {
             | Op::Device(_)
             | Op::Noop
             | Op::Invalid
-            | Op::DefineGlobal(_)
             | Op::DefineLocal(_)
             | Op::VConst { .. }
             | Op::DefineVar { .. }
@@ -1027,9 +1034,14 @@ impl UOp {
                 assert_eq!(new_srcs.len(), 2);
                 Op::Buffer { unique: src(0), device: src(1), size: *size }
             }
-            Op::Param { slot, size, .. } => {
-                assert_eq!(new_srcs.len(), 1);
-                Op::Param { slot: *slot, size: *size, device: src(0) }
+            Op::Param { slot, size, device } => {
+                if device.is_some() {
+                    assert_eq!(new_srcs.len(), 1);
+                    Op::Param { slot: *slot, size: *size, device: Some(src(0)) }
+                } else {
+                    assert_eq!(new_srcs.len(), 0);
+                    return self.clone();
+                }
             }
             Op::BufferView { size, offset, .. } => {
                 assert_eq!(new_srcs.len(), 1);

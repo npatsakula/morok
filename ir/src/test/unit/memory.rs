@@ -90,15 +90,18 @@ fn test_store() {
 }
 
 #[test]
-fn test_define_global() {
-    let dg = UOp::define_global(0, DType::Float32);
+fn test_codegen_param() {
+    // Per-kernel codegen PARAM: no device, Ptr dtype
+    let p = UOp::param(0, 1024, DType::Float32.ptr(Some(1024), morok_dtype::AddrSpace::Global), None);
 
-    assert_eq!(dg.dtype(), DType::Float32);
+    assert!(matches!(p.dtype(), DType::Ptr { .. }));
 
-    if let Op::DefineGlobal(id) = dg.op() {
-        assert_eq!(*id, 0);
+    if let Op::Param { slot, size, device } = p.op() {
+        assert_eq!(*slot, 0);
+        assert_eq!(*size, 1024);
+        assert!(device.is_none());
     } else {
-        panic!("Expected DefineGlobal op");
+        panic!("Expected Param op");
     }
 }
 

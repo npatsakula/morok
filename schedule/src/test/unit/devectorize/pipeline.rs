@@ -205,10 +205,10 @@ fn test_devectorize_with_output_upcast() {
 fn test_devectorize_loop_index() {
     let buffer = create_buffer(256);
 
-    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(20000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let define = UOp::define_global(def_id, buffer.dtype());
+    let define = UOp::param(def_id, 256, buffer.dtype(), None);
     let buf_vec = define.broadcast(4);
 
     // Create index: range * 4 + [0,1,2,3]

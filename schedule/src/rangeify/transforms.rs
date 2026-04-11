@@ -1078,7 +1078,7 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
         existing_buffer.clone()
     } else if effective_addrspace == AddrSpace::Global {
         // Create BUFFER node (like Tinygrad's UOp.new_buffer)
-        // The BUFFER → DEFINE_GLOBAL conversion happens later in split_store
+        // The BUFFER → PARAM conversion happens later in split_store
         let device = opts.device.clone().unwrap_or(morok_ir::DeviceSpec::Cpu);
         UOp::new_buffer(device, size, base_dtype.clone())
     } else {
@@ -1243,7 +1243,7 @@ fn reduce_collapse_with(src: &Arc<UOp>, ranges: &[Arc<UOp>], pm: &crate::TypedPa
                     Op::Const(_)
                         | Op::VConst { .. }
                         | Op::DefineVar { .. }
-                        | Op::DefineGlobal { .. }
+                        | Op::Param { device: None, .. }
                         | Op::DefineLocal { .. }
                 ) {
                     return;

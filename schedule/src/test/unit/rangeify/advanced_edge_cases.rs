@@ -203,7 +203,7 @@ fn test_index_with_multiple_ranges() {
 fn test_range_size_mismatch() {
     // Test BUFFERIZE with mixed constant and symbolic range sizes
     let const_range = create_range(10, 0);
-    let sym_size = UOp::define_global(0, DType::Index);
+    let sym_size = UOp::param(0, 1, DType::Index, None);
     let sym_range = create_range_symbolic(sym_size, 1);
 
     let compute = UOp::native_const(1.0f32);

@@ -68,9 +68,9 @@ pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     }
 }
 
-/// Count DEFINE_GLOBAL operations in a UOp graph.
-pub fn count_define_globals(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::DefineGlobal(_)))
+/// Count codegen PARAM operations (device: None) in a UOp graph.
+pub fn count_codegen_params(uop: &Arc<UOp>) -> usize {
+    count_ops(uop, |op| matches!(op, Op::Param { device: None, .. }))
 }
 
 /// Count DEFINE_LOCAL operations in a UOp graph.
@@ -170,7 +170,7 @@ fn test_get_const_value() {
     let c = UOp::native_const(42i32);
     assert_eq!(get_const_value(&c), Some(ConstValue::Int(42)));
 
-    let x = UOp::define_global(0, DType::Float32);
+    let x = UOp::param(0, 1, DType::Float32, None);
     assert_eq!(get_const_value(&x), None);
 }
 

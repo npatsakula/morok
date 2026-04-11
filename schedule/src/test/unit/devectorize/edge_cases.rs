@@ -201,10 +201,10 @@ fn test_devectorize_mixed_addrspaces() {
 fn test_devectorize_very_large_vector() {
     let buffer = create_buffer(512);
 
-    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let define = UOp::define_global(def_id, buffer.dtype());
+    let define = UOp::param(def_id, 512, buffer.dtype(), None);
     let buf_vec = define.broadcast(64);
 
     // Create vec64 index
@@ -229,10 +229,10 @@ fn test_devectorize_very_large_vector() {
 fn test_devectorize_vec32() {
     let buffer = create_buffer(256);
 
-    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(11000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let define = UOp::define_global(def_id, buffer.dtype());
+    let define = UOp::param(def_id, 256, buffer.dtype(), None);
     let buf_vec = define.broadcast(32);
 
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..32).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
@@ -274,10 +274,10 @@ fn test_devectorize_unaligned_access() {
 fn test_devectorize_vec3() {
     let buffer = create_buffer(64);
 
-    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(12000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let define = UOp::define_global(def_id, buffer.dtype());
+    let define = UOp::param(def_id, 64, buffer.dtype(), None);
     let buf_vec = define.broadcast(3);
 
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..3).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
@@ -300,10 +300,10 @@ fn test_devectorize_vec3() {
 fn test_devectorize_vec5() {
     let buffer = create_buffer(64);
 
-    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(13000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let define = UOp::define_global(def_id, buffer.dtype());
+    let define = UOp::param(def_id, 64, buffer.dtype(), None);
     let buf_vec = define.broadcast(5);
 
     let indices: SmallVec<[Arc<UOp>; 4]> = (0..5).map(|i| UOp::const_(DType::Index, ConstValue::Int(i))).collect();
@@ -415,7 +415,7 @@ fn test_fold_expanded_index_groups_contiguous() {
     use crate::rewrite::graph_rewrite;
     use morok_dtype::AddrSpace;
 
-    let buf = UOp::define_global(0, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global));
+    let buf = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
     let r1 = UOp::range_axis(
         UOp::const_(DType::Index, ConstValue::Int(16)),
         morok_ir::AxisId::Renumbered(0),
@@ -459,7 +459,7 @@ fn test_fold_expanded_index_no_group_scattered() {
     use crate::rewrite::graph_rewrite;
     use morok_dtype::AddrSpace;
 
-    let buf = UOp::define_global(0, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global));
+    let buf = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
     let r1 = UOp::range_axis(
         UOp::const_(DType::Index, ConstValue::Int(16)),
         morok_ir::AxisId::Renumbered(0),
@@ -510,10 +510,10 @@ fn test_scatternd_ptrcat_elimination() {
     use crate::devectorize::devectorize;
     use morok_dtype::AddrSpace;
 
-    let dg0 = UOp::define_global(0, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global));
-    let dg1 = UOp::define_global(1, DType::Scalar(ScalarDType::Int64).ptr(Some(2), AddrSpace::Global));
-    let dg2 = UOp::define_global(2, DType::Scalar(ScalarDType::Float32).ptr(Some(32), AddrSpace::Global));
-    let dg3 = UOp::define_global(3, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global));
+    let dg0 = UOp::param(0, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
+    let dg1 = UOp::param(1, 2, DType::Scalar(ScalarDType::Int64).ptr(Some(2), AddrSpace::Global), None);
+    let dg2 = UOp::param(2, 32, DType::Scalar(ScalarDType::Float32).ptr(Some(32), AddrSpace::Global), None);
+    let dg3 = UOp::param(3, 64, DType::Scalar(ScalarDType::Float32).ptr(Some(64), AddrSpace::Global), None);
 
     let dg0_vec = UOp::vectorize(smallvec::smallvec![dg0.clone(); 4]);
     let dg3_vec = UOp::vectorize(smallvec::smallvec![dg3.clone(); 4]);

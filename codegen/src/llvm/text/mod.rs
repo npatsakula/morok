@@ -64,7 +64,7 @@ impl Renderer for LlvmTextRenderer {
 
         for node in &nodes {
             match node.op() {
-                Op::DefineGlobal(_) => {
+                Op::Param { device: None, .. } => {
                     buffers.push(node.clone());
                 }
                 Op::DefineVar { .. } => {
@@ -74,7 +74,7 @@ impl Renderer for LlvmTextRenderer {
             }
         }
 
-        buffers.sort_by_key(|b| if let Op::DefineGlobal(id) = b.op() { *id } else { usize::MAX });
+        buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
 
         let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
             if let Op::Range { axis_type, end, .. } = n.op()
@@ -91,9 +91,9 @@ impl Renderer for LlvmTextRenderer {
         let thread_count = thread_info.as_ref().map(|(_, c)| *c).unwrap_or(1);
 
         for (i, buf) in buffers.iter().enumerate() {
-            if let Op::DefineGlobal(id) = buf.op() {
+            if let Op::Param { slot, device: None, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
-                buffer_args.push(BufferArg { index: *id, name: format!("data{i}"), dtype: buf.dtype(), is_output });
+                buffer_args.push(BufferArg { index: *slot, name: format!("data{i}"), dtype: buf.dtype(), is_output });
             }
         }
 
@@ -322,9 +322,9 @@ mod tests {
 
     #[test]
     fn test_simple_add() {
-        let a = UOp::define_global(0, DType::Float32.ptr(Some(1), AddrSpace::Global));
-        let b = UOp::define_global(1, DType::Float32.ptr(Some(1), AddrSpace::Global));
-        let out = UOp::define_global(2, DType::Float32.ptr(Some(1), AddrSpace::Global));
+        let a = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
+        let b = UOp::param(1, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
+        let out = UOp::param(2, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
 
         let idx = UOp::index_const(0);
         let a_idx = UOp::index().buffer(a.clone()).indices(vec![idx.clone()]).call().unwrap();

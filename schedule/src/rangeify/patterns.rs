@@ -4,7 +4,7 @@
 //! - Early cleanup rewrites (DETACH, CONTIGUOUS_BACKWARD removal)
 //! - Movement op → BUFFERIZE conversion
 //! - Buffer folding and removal
-//! - Kernel splitting patterns (BUFFER → DEFINE_GLOBAL, AFTER handling)
+//! - Kernel splitting patterns (BUFFER → PARAM, AFTER handling)
 //! - Codegen preparation (NOOP removal, INDEX linearization)
 //! - Buffer limit enforcement
 //!
@@ -1247,7 +1247,7 @@ fn extract_buffer_from_after(passthrough: &Arc<UOp>) -> Arc<UOp> {
     }
 }
 
-/// Find output DefineGlobal from KERNEL AST.
+/// Find output PARAM from KERNEL AST.
 fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
     for node in ast.toposort() {
         // Use store_buffer() helper to get buffer from STORE via its INDEX child
@@ -1256,7 +1256,7 @@ fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
                 Op::Index { buffer: inner_buf, .. } => inner_buf.clone(),
                 _ => buffer.clone(),
             };
-            if matches!(output_buf.op(), Op::DefineGlobal(_)) {
+            if matches!(output_buf.op(), Op::Param { device: None, .. }) {
                 return Some(output_buf);
             }
         }
@@ -1264,15 +1264,14 @@ fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
     None
 }
 
-/// Create patterns for to_define_global transformation.
-pub fn to_define_global_patterns() -> TypedPatternMatcher<KernelContext> {
+/// Create patterns for to_param transformation (normalizes buffers to codegen PARAMs).
+pub fn to_param_patterns() -> TypedPatternMatcher<KernelContext> {
     crate::patterns! {
         @context KernelContext;
-        // Buffer → DefineGlobal
+        // Buffer → codegen PARAM
         buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
             let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
-            let replacement = UOp::define_global(ctx.next_global(), ptr_dtype);
-            ctx.define_to_buffer_id.insert(replacement.id, buf.id);
+            let replacement = UOp::param(ctx.next_global(), *size, ptr_dtype, None);
             ctx.map_buffer(buf.clone(), replacement.clone());
             Some(replacement)
         },
@@ -1317,27 +1316,27 @@ pub fn to_define_global_patterns() -> TypedPatternMatcher<KernelContext> {
     }
 }
 
-/// Create patterns for to_define_global transformation using LocalAddBufferContext.
+/// Create patterns for to_param transformation using LocalAddBufferContext.
 ///
-/// Based on Tinygrad's to_define_global (rangeify.py:419-434).
-/// This version uses the per-kernel LocalAddBufferContext instead of global KernelContext.
-pub fn local_to_define_global_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
+/// Based on Tinygrad's to_define_global/debuf (rangeify.py:419-423).
+/// Creates per-kernel codegen PARAMs with sequential slots and PtrDType.
+pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
     crate::patterns! {
         @context LocalAddBufferContext;
-        // Buffer → DefineGlobal (like Tinygrad's debuf, rangeify.py:385-389)
-        // Creates DEFINE_GLOBAL and maps buf → buf (tracking original BUFFER)
+        // Buffer → codegen PARAM (like Tinygrad's debuf, rangeify.py:419-423)
         buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
             let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
-            let replacement = UOp::define_global(ctx.next_dg(), ptr_dtype);
+            let replacement = UOp::param(ctx.next_param_slot(), *size, ptr_dtype, None);
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }
             Some(replacement)
         },
-        // Param → DefineGlobal (normalized buffer from pre-schedule pass)
-        buf @ Param { slot: _, size } => |buf, size, ctx| {
+        // Pre-kernel Param (device: Some) → codegen PARAM (device: None)
+        // Guard: skip codegen PARAMs (device: None) to prevent infinite loop
+        buf @ Param { slot: _, size } if matches!(buf.op(), Op::Param { device: Some(_), .. }) => |buf, size, ctx| {
             let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
-            let replacement = UOp::define_global(ctx.next_dg(), ptr_dtype);
+            let replacement = UOp::param(ctx.next_param_slot(), *size, ptr_dtype, None);
             if !ctx.has_buffer(buf) {
                 ctx.map_buffer(buf.clone(), buf.clone());
             }

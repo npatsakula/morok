@@ -136,7 +136,7 @@ fn test_keep_bufferize_copy() {
 #[test]
 fn test_keep_bufferize_assign() {
     // BUFFERIZE(ASSIGN(target, value), ranges) should be KEPT (always-run op needs its buffer)
-    let target = UOp::define_global(1, DType::Float32);
+    let target = UOp::param(1, 1, DType::Float32, None);
     let value = UOp::native_const(1.0f32);
     let assign = UOp::assign(target, value);
 
@@ -169,9 +169,9 @@ fn test_remove_bufferize_noop() {
 #[test]
 fn test_flatten_nested_bufferize() {
     // BUFFERIZE(BUFFERIZE(x, R1), R2) → BUFFERIZE(x, R2)
-    // Use define_global with pointer dtype (represents a buffer pointer - not cheap)
+    // Use param with pointer dtype (represents a buffer pointer - not cheap)
     let ptr_dtype = DType::Float32.ptr(Some(100), DTypeAddrSpace::Global);
-    let x = UOp::define_global(1, ptr_dtype);
+    let x = UOp::param(1, 100, ptr_dtype, None);
     let inner_range = create_range(10, 0);
     let outer_range = create_range(20, 1);
 
@@ -194,9 +194,9 @@ fn test_flatten_nested_bufferize() {
 #[test]
 fn test_nested_bufferize_multiple_ranges() {
     // BUFFERIZE(BUFFERIZE(x, [R1, R2]), [R3, R4]) → BUFFERIZE(x, [R3, R4])
-    // Use define_global with pointer dtype (represents a buffer pointer - not cheap)
+    // Use param with pointer dtype (represents a buffer pointer - not cheap)
     let ptr_dtype = DType::Float32.ptr(Some(100), DTypeAddrSpace::Global);
-    let x = UOp::define_global(1, ptr_dtype);
+    let x = UOp::param(1, 100, ptr_dtype, None);
     let inner_ranges = vec![create_range(10, 0), create_range(15, 1)];
     let outer_ranges = vec![create_range(20, 2), create_range(25, 3)];
 
@@ -240,9 +240,9 @@ fn test_multiple_cheap_ops_inline() {
 #[test]
 fn test_no_removal_on_normal_buffer() {
     // Normal buffer operations (not cheap, not always-run) should remain
-    // Use define_global with pointer dtype (represents a buffer pointer - not cheap)
+    // Use param with pointer dtype (represents a buffer pointer - not cheap)
     let ptr_dtype = DType::Float32.ptr(Some(100), DTypeAddrSpace::Global);
-    let x = UOp::define_global(1, ptr_dtype);
+    let x = UOp::param(1, 100, ptr_dtype, None);
     let range = create_range(10, 0);
 
     // Create a normal BUFFERIZE (not covering special cases)
@@ -254,7 +254,7 @@ fn test_no_removal_on_normal_buffer() {
     // Might be the same or modified, but the key is it doesn't crash
     // and follows the expected cost-based logic
     assert!(
-        !result.op().children().is_empty() || matches!(result.op(), Op::DefineGlobal(_)),
+        !result.op().children().is_empty() || matches!(result.op(), Op::Param { device: None, .. }),
         "Should produce valid result"
     );
 }

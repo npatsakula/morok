@@ -38,7 +38,6 @@ pub enum Op {
     Noop,
     #[pattern(skip)]
     Invalid,
-    DefineGlobal(usize),
     DefineLocal(usize),
 
     // Graph organization operations (2 variants)
@@ -82,7 +81,7 @@ pub enum Op {
     Param {
         slot: usize,
         size: usize,
-        device: Arc<UOp>,
+        device: Option<Arc<UOp>>,
     },
     Buffer {
         unique: Arc<UOp>,
@@ -318,14 +317,14 @@ impl Op {
             | Self::Device(_)
             | Self::Noop
             | Self::Invalid
-            | Self::DefineGlobal(_)
             | Self::DefineLocal(_)
             | Self::VConst { .. }
             | Self::DefineVar { .. }
             | Self::DefineReg { .. } => SmallVec::new(),
 
-            // Param has device child (like Buffer) — Tinygrad Ops.PARAM has DEVICE src
-            Self::Param { device, .. } => SmallVec::from_slice(&[device]),
+            // Param has optional device child — pre-kernel PARAMs have device, codegen PARAMs don't
+            Self::Param { device: Some(d), .. } => SmallVec::from_slice(&[d]),
+            Self::Param { device: None, .. } => SmallVec::new(),
 
             // Graph organization operations
             Self::Sink { sources } | Self::Group { sources } => sources.iter().collect(),

@@ -45,7 +45,7 @@ fn test_buffer_mapping() {
     let mut ctx = KernelContext::new();
 
     let original = UOp::native_const(1.0f32);
-    let replacement = UOp::define_global(0, DType::Float32);
+    let replacement = UOp::param(0, 1, DType::Float32, None);
 
     assert!(!ctx.has_buffer(&original));
 

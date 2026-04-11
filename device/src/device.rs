@@ -320,7 +320,7 @@ impl Device {
 /// # Tinygrad Alignment
 ///
 /// Buffer metadata (`globals`, `outs`, `ins`) matches Tinygrad's Program class:
-/// - `globals`: Buffer indices from DefineGlobal ops
+/// - `globals`: Buffer indices from PARAM ops
 /// - `outs`: Output buffer indices (written by STORE ops)
 /// - `ins`: Input buffer indices (read by LOAD ops)
 #[derive(Debug, Clone)]
@@ -350,7 +350,7 @@ pub struct ProgramSpec {
     /// Includes thread_id at the end if threading is enabled.
     pub var_names: Vec<String>,
 
-    /// Global buffer indices (from DefineGlobal argument values).
+    /// Global buffer indices (from PARAM slot values).
     /// Matches Tinygrad's `globals` field.
     pub globals: Vec<usize>,
 

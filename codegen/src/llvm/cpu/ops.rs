@@ -12,7 +12,7 @@ use crate::llvm::common::{RenderContext, lcast, ldt};
 
 /// Extract a scalar `ptr` from a vectorized `<N x ptr>` via `extractelement ... i32 0`.
 ///
-/// When the devectorize pipeline doesn't fully eliminate vectorized DEFINE_GLOBAL pointers
+/// When the devectorize pipeline doesn't fully eliminate vectorized PARAM pointers
 /// (see `no_vectorized_buf` / `no_vectorized_index` which only target DEFINE_LOCAL/DEFINE_REG),
 /// the GEP result can be `<N x ptr>`. All elements are identical (broadcast of the same buffer
 /// pointer), so extracting element 0 yields the correct scalar ptr for LLVM load/store.
@@ -41,7 +41,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
     match uop.op() {
         Op::Const(_)
         | Op::VConst { .. }
-        | Op::DefineGlobal(_)
+        | Op::Param { device: None, .. }
         | Op::DefineVar { .. }
         | Op::Noop
         | Op::Sink { .. }

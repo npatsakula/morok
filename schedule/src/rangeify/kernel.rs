@@ -85,21 +85,11 @@ pub struct KernelContext {
     /// The UOp is kept for kernel sources; the i64 is the concrete bound value (None for OUTER ranges).
     pub vars: HashMap<String, (Arc<UOp>, Option<i64>)>,
     pub range_counter: usize,
-    /// Mapping from DefineGlobal UOp ID to original BUFFER UOp ID.
-    /// Used by to_define_global_patterns for buffer tracking.
-    pub define_to_buffer_id: HashMap<u64, u64>,
 }
 
 impl KernelContext {
     pub fn new() -> Self {
-        Self {
-            global_counter: 0,
-            local_counter: 0,
-            buffer_map: HashMap::new(),
-            vars: HashMap::new(),
-            range_counter: 0,
-            define_to_buffer_id: HashMap::new(),
-        }
+        Self { global_counter: 0, local_counter: 0, buffer_map: HashMap::new(), vars: HashMap::new(), range_counter: 0 }
     }
 
     pub fn next_global(&mut self) -> usize {
@@ -156,13 +146,13 @@ impl Default for KernelContext {
 /// This is used within `split_store` for each individual kernel being created.
 ///
 /// IMPORTANT: Uses IndexMap for `map` to maintain insertion order.
-/// This is critical because DEFINE_GLOBAL indices are assigned in the order
+/// This is critical because PARAM slot indices are assigned in the order
 /// patterns match, and kernel sources must be in the same order for correct
 /// buffer indexing during execution.
 #[derive(Default)]
 pub struct LocalAddBufferContext {
-    /// DEFINE_GLOBAL counter
-    pub dg: usize,
+    /// PARAM slot counter (Tinygrad: `dg`)
+    pub param_slot: usize,
     /// Buffer → AFTER mapping (IndexMap maintains insertion order)
     pub map: IndexMap<UOpKey, Arc<UOp>>,
     /// Bound variables: name → (DEFINE_VAR UOp, optional bound value).
@@ -178,10 +168,10 @@ impl LocalAddBufferContext {
         Self::default()
     }
 
-    /// Get next DEFINE_GLOBAL index.
-    pub fn next_dg(&mut self) -> usize {
-        let id = self.dg;
-        self.dg += 1;
+    /// Get next PARAM slot index (Tinygrad: `ctx.dg`).
+    pub fn next_param_slot(&mut self) -> usize {
+        let id = self.param_slot;
+        self.param_slot += 1;
         id
     }
 
@@ -234,7 +224,7 @@ fn extract_stored_value(ret: &Arc<UOp>) -> &Arc<UOp> {
 /// Based on Tinygrad's split_store (rangeify.py:480-507).
 /// Simplified from 280 lines to ~80 lines using LocalAddBufferContext.
 pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
-    use super::patterns::{local_to_define_global_patterns, rangeify_codegen_patterns};
+    use super::patterns::{local_to_param_patterns, rangeify_codegen_patterns};
     use crate::rewrite::graph_rewrite_bottom_up;
 
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
@@ -274,12 +264,12 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     //
     // Context-free patterns (movement_op, syntactic_sugar, flatten_range) were already
     // applied in run_kernel_split_pipeline's pre-pass. Here we only run patterns that
-    // need LocalAddBufferContext (Buffer→DefineGlobal, Bind, After, Range renumber,
+    // need LocalAddBufferContext (Buffer/Param→codegen PARAM, Bind, After, Range renumber,
     // NOOP→zero, Contiguous→extract opts).
     let ret = {
         use std::sync::LazyLock;
         static PM_CTX_DEP: LazyLock<crate::TypedPatternMatcher<LocalAddBufferContext>> =
-            LazyLock::new(|| local_to_define_global_patterns() + rangeify_codegen_patterns());
+            LazyLock::new(|| local_to_param_patterns() + rangeify_codegen_patterns());
         graph_rewrite_bottom_up(&*PM_CTX_DEP, x.clone(), &mut lctx)
     };
 
@@ -342,7 +332,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
 
         for s in sources {
             // Check kernel sources for buffer dependencies
-            if !matches!(s.op(), Op::Buffer { .. }) {
+            if !matches!(s.op(), Op::Buffer { .. } | Op::Param { .. }) {
                 continue;
             }
             let s_buf_id = s.buf_uop().id;

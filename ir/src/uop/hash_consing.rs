@@ -104,11 +104,8 @@ enum OpData {
     Const(ConstValueHash),
     Unique(usize),
     Device(DeviceSpec),
-    // DefineGlobal and DefineLocal include unique IDs to prevent hash consing
-    // across different kernels/realizations. Each kernel's DEFINE_GLOBAL(0)
-    // must be a distinct UOp, even though they have the same slot number.
-    DefineGlobal(usize, usize), // (slot, unique_id)
-    DefineLocal(usize, usize),  // (slot, unique_id)
+    // DefineLocal includes unique ID to prevent hash consing across kernels.
+    DefineLocal(usize, usize), // (slot, unique_id)
 
     // Grouped operations
     Unary(UnaryOp),
@@ -124,8 +121,8 @@ enum OpData {
     SpecialName(String),
 
     // Buffer operations
-    BufferData(usize, usize), // (unique_id, size) - each buffer is unique
-    ParamData(usize, usize),  // (slot, size) - each param slot is unique
+    BufferData(usize, usize),               // (unique_id, size) - each buffer is unique
+    ParamData(usize, usize, Option<usize>), // (slot, size, unique_id) - codegen PARAMs anti-dedup via unique_id
     BufferView(usize, usize),
     Bufferize(BufferizeOpts),
 
@@ -179,7 +176,6 @@ impl UOpKey {
             Op::Const(c) => OpData::Const(*c),
             Op::Unique(id) => OpData::Unique(*id),
             Op::Device(d) => OpData::Device(d.clone()),
-            Op::DefineGlobal(slot) => OpData::DefineGlobal(*slot, next_unique_id()),
             Op::DefineLocal(slot) => OpData::DefineLocal(*slot, next_unique_id()),
             Op::Unary(unary_op, _) => OpData::Unary(*unary_op),
             Op::Binary(binary_op, _, _) => OpData::Binary(*binary_op),
@@ -214,7 +210,13 @@ impl UOpKey {
             Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
-            Op::Param { slot, size, .. } => OpData::ParamData(*slot, *size),
+            Op::Param { slot, size, device } => {
+                // Per-kernel codegen PARAMs (device: None) use anti-dedup to prevent
+                // cross-kernel sharing.
+                // Pre-kernel PARAMs (device: Some) dedup normally by (slot, size).
+                let unique = if device.is_none() { Some(next_unique_id()) } else { None };
+                OpData::ParamData(*slot, *size, unique)
+            }
             _ => OpData::None,
             // Op::Noop => todo!(),
             // Op::Invalid => todo!(),

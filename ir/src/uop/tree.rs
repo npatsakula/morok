@@ -98,7 +98,6 @@ impl TreeItem for UOpTreeFull {
 fn format_node(uop: &Arc<UOp>) -> String {
     let op_str = match uop.op() {
         Op::Const(val) => format!("CONST({:?})", val.0),
-        Op::DefineGlobal(id) => format!("DEFINE_GLOBAL({})", id),
         Op::DefineLocal(id) => format!("DEFINE_LOCAL({})", id),
         Op::DefineVar { name, min_val, max_val } => format!("DEFINE_VAR('{}', min={}, max={})", name, min_val, max_val),
         Op::Buffer { size, .. } => format!("BUFFER(size={})", size),

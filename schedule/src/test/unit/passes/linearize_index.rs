@@ -108,7 +108,7 @@ fn test_unbounded_buffer_still_linearizes() {
     // With index-based dimension extraction, linearization should still work
     // because dimensions come from the RANGE indices, not the buffer
     let ptr_dtype = DType::Float32.ptr(None, morok_dtype::AddrSpace::Global);
-    let buffer = UOp::define_global(0, ptr_dtype);
+    let buffer = UOp::param(0, 1024, ptr_dtype, None);
     let i = make_range(4, 0);
     let j = make_range(8, 1);
 

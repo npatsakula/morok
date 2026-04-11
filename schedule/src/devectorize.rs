@@ -324,7 +324,7 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         @context Fp8DecompCtx;
 
         // Pattern 1: INDEX/DEFINE with FP8 ptr base → change ptr to UInt8
-        x if matches!(x.op(), Op::DefineGlobal(_) | Op::DefineLocal(_) | Op::Index { .. })
+        x if matches!(x.op(), Op::Param { device: None, .. } | Op::DefineLocal(_) | Op::Index { .. })
             && x.dtype().base() == ctx.from
         => {
             let uint8_ptr = x.dtype().with_ptr_base(DType::Scalar(ctx.from.float_to_uint()))?;
@@ -1095,7 +1095,7 @@ pub fn correct_load_store_patterns() -> &'static TypedPatternMatcher {
 // ============================================================================
 
 fn is_define_or_after(uop: &Arc<UOp>) -> bool {
-    matches!(uop.unwrap_after().op(), Op::DefineLocal(_) | Op::DefineReg { .. } | Op::DefineGlobal(_))
+    matches!(uop.unwrap_after().op(), Op::DefineLocal(_) | Op::DefineReg { .. } | Op::Param { device: None, .. })
 }
 
 /// Matches INDEX(VECTORIZE(Defines.or_after()), vec_idx) only.

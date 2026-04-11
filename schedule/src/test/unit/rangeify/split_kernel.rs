@@ -121,16 +121,16 @@ fn test_split_store_creates_sink() {
             // SINK should wrap the transformed STORE
             assert_eq!(sink_sources.len(), 1);
 
-            // Verify the STORE structure has DEFINE_GLOBAL (buffer converted)
+            // Verify the STORE structure has codegen PARAM (buffer converted)
             if let Op::Store { index: store_index, value: store_val, .. } = sink_sources[0].op() {
                 // Index should contain the buffer reference
                 let Op::Index { buffer: store_buf, .. } = store_index.op() else {
                     panic!("Expected INDEX operation in STORE, got {:?}", store_index.op());
                 };
-                // Buffer should be converted to DEFINE_GLOBAL
+                // Buffer should be converted to codegen PARAM
                 assert!(
-                    matches!(store_buf.op(), Op::DefineGlobal(_)),
-                    "Expected DEFINE_GLOBAL, got {:?}",
+                    matches!(store_buf.op(), Op::Param { device: None, .. }),
+                    "Expected codegen PARAM, got {:?}",
                     store_buf.op()
                 );
                 // Value should be preserved

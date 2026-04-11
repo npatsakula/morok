@@ -95,7 +95,7 @@ impl UOp {
     /// Create a normalized buffer parameter with positional slot.
     /// Used by pre-schedule normalization (BUFFER→PARAM) to erase buffer identity.
     /// Matches Tinygrad's `UOp.param(slot, dtype, shape, device)` (ops.py:817-819).
-    pub fn param(slot: usize, size: usize, dtype: DType, device: Arc<Self>) -> Arc<Self> {
+    pub fn param(slot: usize, size: usize, dtype: DType, device: Option<Arc<Self>>) -> Arc<Self> {
         Self::new(Op::Param { slot, size, device }, dtype)
     }
 

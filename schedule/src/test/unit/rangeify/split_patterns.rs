@@ -4,11 +4,11 @@ use morok_dtype::{AddrSpace, DType};
 use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
 
-use crate::rangeify::{KernelContext, patterns::to_define_global_patterns};
+use crate::rangeify::{KernelContext, patterns::to_param_patterns};
 
-/// Helper to apply to_define_global patterns and return result
+/// Helper to apply to_param patterns and return result
 fn apply_patterns(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
-    let matcher = to_define_global_patterns();
+    let matcher = to_param_patterns();
     match matcher.rewrite(uop, ctx) {
         morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
         _ => None,
@@ -27,9 +27,9 @@ fn test_debuf_global() {
     // Apply pattern via matcher
     let result = apply_patterns(&buffer, &mut ctx);
 
-    // Should return a DEFINE_GLOBAL
+    // Should return a codegen PARAM
     let op = result.expect("Expected Some result");
-    assert!(matches!(op.op(), Op::DefineGlobal(_)));
+    assert!(matches!(op.op(), Op::Param { device: None, .. }));
     assert_eq!(ctx.global_counter, 1);
 }
 
@@ -200,15 +200,15 @@ fn test_debuf_buffer_mapping() {
 
     let result = apply_patterns(&buffer, &mut ctx);
 
-    // Pattern returns DEFINE_GLOBAL and maps BUFFER → DEFINE_GLOBAL
+    // Pattern returns codegen PARAM and maps BUFFER → PARAM
     assert!(result.is_some());
-    let define_global = result.unwrap();
-    assert!(matches!(define_global.op(), Op::DefineGlobal(0)));
+    let param = result.unwrap();
+    assert!(matches!(param.op(), Op::Param { slot: 0, device: None, .. }));
 
-    // Buffer should be tracked, mapping to DEFINE_GLOBAL (not itself)
+    // Buffer should be tracked, mapping to PARAM (not itself)
     assert!(ctx.has_buffer(&buffer));
     let mapped = ctx.get_buffer(&buffer).unwrap();
-    assert!(Arc::ptr_eq(mapped, &define_global));
+    assert!(Arc::ptr_eq(mapped, &param));
 }
 
 #[test]
@@ -585,9 +585,9 @@ fn test_handle_after_global_buffer_tracked() {
     // Global buffers SHOULD be tracked in the buffer map
     let mut ctx = KernelContext::new();
 
-    // Create a global buffer (DEFINE_GLOBAL with Ptr{Global} dtype)
+    // Create a global buffer (PARAM with Ptr{Global} dtype)
     let global_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global);
-    let global_buf = UOp::define_global(1, global_dtype);
+    let global_buf = UOp::param(1, 1024, global_dtype, None);
 
     // Wrap in AFTER operation
     let store = UOp::noop();
@@ -599,7 +599,7 @@ fn test_handle_after_global_buffer_tracked() {
     // Should return the buffer unwrapped
     match result {
         Some(op) => {
-            assert!(matches!(op.op(), Op::DefineGlobal(_)));
+            assert!(matches!(op.op(), Op::Param { device: None, .. }));
             // Global buffer SHOULD be in buffer map
             assert!(ctx.has_buffer(&global_buf));
             assert!(Arc::ptr_eq(ctx.get_buffer(&global_buf).unwrap(), &after));
@@ -683,7 +683,7 @@ fn test_handle_after_mixed_address_spaces() {
     let global_dtype = DType::Float32.ptr(Some(128), AddrSpace::Global);
 
     let local_buf = UOp::define_local(10, local_dtype);
-    let global_buf = UOp::define_global(11, global_dtype);
+    let global_buf = UOp::param(11, 128, global_dtype, None);
 
     // Wrap both in AFTER
     let store1 = UOp::noop();

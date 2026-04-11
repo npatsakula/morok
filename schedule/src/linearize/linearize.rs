@@ -16,7 +16,7 @@ use morok_ir::uop::core::UOpKey;
 /// Lower values = higher priority (scheduled earlier).
 /// Based on Tinygrad's linearizer priority assignments.
 mod priority {
-    pub const DEFINE_GLOBAL: i32 = -20;
+    pub const PARAM: i32 = -20;
     pub const DEFINE_VAR: i32 = -19;
     pub const DEFINE_LOCAL: i32 = -18;
     pub const DEFINE_REG: i32 = -17;
@@ -32,7 +32,7 @@ mod priority {
 /// Tuple ordering: (run_count, priority, arg_value, ideal_position, id)
 /// - run_count: Higher counts scheduled later (executed in inner loops)
 /// - priority: Lower values scheduled earlier
-/// - arg_value: For DEFINE_GLOBAL, argument index for consistent ordering
+/// - arg_value: For PARAM, slot index for consistent ordering
 /// - ideal_position: Position in priority-sorted order
 /// - id: UOp ID for tie-breaking (ensures stable ordering)
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,7 +61,7 @@ struct OrderKey {
 ///
 /// | Op | Priority | Purpose |
 /// |----|----------|---------|
-/// | DefineGlobal | -20 | Function arguments first |
+/// | Param | -20 | Function arguments first |
 /// | DefineVar | -19 | Symbolic variables early |
 /// | DefineLocal | -18 | Local memory early |
 /// | DefineReg | -17 | Register definitions early |
@@ -259,7 +259,7 @@ fn compute_run_count(uop: &Arc<UOp>) -> u64 {
 /// This gives deterministic ordering but not alphabetical by name.
 fn get_priority(uop: &Arc<UOp>) -> (i32, Option<i64>) {
     match uop.op() {
-        Op::DefineGlobal(id) => (priority::DEFINE_GLOBAL, Some(*id as i64)),
+        Op::Param { slot, device: None, .. } => (priority::PARAM, Some(*slot as i64)),
         Op::DefineVar { name, .. } => {
             // Use hash of name for stable ordering (Tinygrad: uses arg tuple for comparison)
             // This ensures consistent ordering across runs while approximating name-based sorting
@@ -376,8 +376,8 @@ mod tests {
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn test_priority_ordering() {
-        // Test that priority order is respected: DefineGlobal < default < Range
-        assert!(priority::DEFINE_GLOBAL < priority::DEFAULT);
+        // Test that priority order is respected: PARAM < default < Range
+        assert!(priority::PARAM < priority::DEFAULT);
         assert!(priority::DEFAULT < priority::RANGE);
         assert!(priority::END < priority::DEFAULT);
         assert!(priority::LOAD < priority::DEFAULT);

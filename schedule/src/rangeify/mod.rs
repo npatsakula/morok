@@ -37,7 +37,7 @@ pub use patterns::{
     pm_erf_decomposition, pm_fdiv_to_mul, pm_fma_decomposition, pm_load_collapse, pm_max_decomposition, pm_mod_to_and,
     pm_mul_to_shl, pm_neg_from_mul, pm_reduce_simplify, pm_sqrt_decomposition, pm_syntactic_sugar,
     rangeify_codegen_patterns, rangeify_codegen_simple, rangeify_codegen_with_kernel_ctx, split_reduceop_patterns,
-    to_define_global_patterns,
+    to_param_patterns,
 };
 
 // Transforms

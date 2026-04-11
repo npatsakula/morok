@@ -125,11 +125,11 @@ pub enum Error {
     ))]
     TernaryBranchShapeMismatch { true_branch: Box<Shape>, false_branch: Box<Shape> },
 
-    /// DefineGlobal/DefineLocal must have Ptr dtype.
+    /// DefineLocal must have Ptr dtype.
     #[snafu(display(
         "{op} must have Ptr dtype (following Tinygrad spec), got {dtype:?}. Use DefineVar for scalar variables."
     ))]
-    DefineGlobalRequiresPtrDType { op: &'static str, dtype: DType },
+    BufferDefRequiresPtrDType { op: &'static str, dtype: DType },
 
     // =========================================================================
     // UOp Builder Guards (user-facing API for kernel implementation)

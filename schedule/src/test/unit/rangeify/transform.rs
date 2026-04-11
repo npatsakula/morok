@@ -35,8 +35,9 @@ fn test_transform_buffer_source() {
 
 #[test]
 fn test_transform_realizable_source() {
-    // Create a source that needs realization
-    let x = UOp::define_global(1, DType::Float32);
+    // Create a source that needs realization (use compute op, not buffer)
+    let a = UOp::native_const(1.0f32);
+    let x = a.try_add(&UOp::native_const(2.0f32)).unwrap();
     let consumer = x.try_sqrt().unwrap();
 
     // Create ranges
@@ -118,9 +119,10 @@ fn test_rangeify_with_symbolic_simplification() {
     // We create a computation with a PERMUTE operation that will create index expressions,
     // and ensure the full pipeline (including symbolic simplification) runs successfully.
 
-    // Create a simple PERMUTE operation: swap axes
-    let src = UOp::define_global(0, DType::Float32);
-    let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
+    // Create a simple PERMUTE operation: swap axes (use Buffer for pre-kernel pipeline)
+    let src = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 6, DType::Float32);
+    let reshaped = src.try_reshape(&smallvec::smallvec![morok_ir::SInt::Const(2), morok_ir::SInt::Const(3)]).unwrap();
+    let permute = reshaped.try_permute(vec![1, 0]).unwrap();
 
     // Run full rangeify pipeline (includes symbolic simplification in Step 8)
     let (result, _ctx) = crate::rangeify::rangeify(permute, None).unwrap();

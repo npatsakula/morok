@@ -52,7 +52,7 @@ impl RenderContext {
         let name = match uop.op() {
             Op::Const(cv) => lconst(&cv.0, &uop.dtype()),
             Op::VConst { values } => self.render_vconst(values, uop),
-            Op::DefineGlobal(id) => format!("%data{id}"),
+            Op::Param { slot, device: None, .. } => format!("%data{slot}"),
             Op::DefineLocal(id) => format!("%local{id}"),
             Op::DefineVar { name, .. } => format!("%{name}"),
             Op::DefineReg { .. } => {

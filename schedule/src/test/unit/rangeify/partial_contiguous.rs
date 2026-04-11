@@ -30,7 +30,7 @@ use crate::rewrite::graph_rewrite;
 /// counting tests reflect actual behavior (Param is counted, Buffer is not).
 fn create_test_buffer(size: usize, dtype: DType, id: usize) -> Arc<UOp> {
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
-    UOp::new(Op::Param { slot: id, size, device }, dtype.ptr(Some(size), AddrSpace::Global))
+    UOp::new(Op::Param { slot: id, size, device: Some(device) }, dtype.ptr(Some(size), AddrSpace::Global))
 }
 
 /// Create a test INDEX(BUFFERIZE(...), ...) pattern.
@@ -560,9 +560,9 @@ fn test_out_in_ratio_symbolic_sizes() {
     let mut config = PcontigConfig::default();
     let matcher = buffer_removal_with_pcontig();
 
-    // Create buffer with symbolic size via DEFINE_GLOBAL
-    let n = UOp::define_global(1, DType::Index);
-    let buffer = UOp::define_global(2, DType::Float32);
+    // Create buffer with symbolic size via codegen PARAM
+    let n = UOp::param(1, 1, DType::Index, None);
+    let buffer = UOp::param(2, 1, DType::Float32, None);
 
     // Create ranges with symbolic size
     let range = UOp::range(n, 0);
@@ -1474,9 +1474,10 @@ fn test_config_different_configs_produce_different_results() {
 fn test_pipeline_integration_full_rangeify() {
     use crate::rangeify::rangeify;
 
-    // Create a simple PERMUTE operation
-    let src = UOp::define_global(0, DType::Float32);
-    let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
+    // Create a simple PERMUTE operation using a Buffer (pre-kernel pipeline uses Buffer, not codegen Param)
+    let src = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 6, DType::Float32);
+    let reshaped = src.try_reshape(&smallvec::smallvec![morok_ir::SInt::Const(2), morok_ir::SInt::Const(3)]).unwrap();
+    let permute = reshaped.try_permute(vec![1, 0]).unwrap();
 
     // Run full rangeify pipeline (includes buffer removal at Step 7)
     let (result, _ctx) = rangeify(permute, None).expect("Rangeify should succeed");

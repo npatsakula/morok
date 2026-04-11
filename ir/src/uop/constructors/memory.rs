@@ -5,7 +5,7 @@
 //! - Memory access: load, store (gate is on INDEX, not LOAD/STORE)
 //! - Device operations: copy, copy_to_device
 //! - Bufferization: bufferize, bufferize_global, bufferize_local
-//! - Memory definitions: define_global, define_local, define_reg
+//! - Memory definitions: define_local, define_reg
 
 use std::sync::Arc;
 
@@ -277,13 +277,6 @@ impl UOp {
     // =========================================================================
     // Memory Definition Operations
     // =========================================================================
-
-    /// Create a DEFINE_GLOBAL operation.
-    ///
-    /// Defines a global memory allocation with the given ID.
-    pub fn define_global(id: usize, dtype: DType) -> Arc<Self> {
-        Self::new(Op::DefineGlobal(id), dtype)
-    }
 
     /// Create a DEFINE_LOCAL operation.
     ///

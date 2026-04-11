@@ -150,7 +150,7 @@ fn test_split_store_with_loop_ranges() {
 /// Test that patterns are applied in correct order during transformation.
 ///
 /// This integration test verifies the pipeline applies patterns sequentially:
-/// 1. to_define_global patterns
+/// 1. to_param patterns
 /// 2. rangeify_codegen patterns (remove_noop, get_contiguous, fix_after_broadcast)
 /// 3. Cycle detection
 /// 4. SINK/KERNEL creation

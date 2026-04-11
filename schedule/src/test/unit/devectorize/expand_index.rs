@@ -76,10 +76,10 @@ fn test_expand_contiguous_with_offset() {
     assert!(load_count >= 1, "Should have at least one LOAD");
 }
 
-/// Test: Contiguous expansion contains DEFINE_GLOBAL references.
+/// Test: Contiguous expansion contains codegen PARAM references.
 ///
-/// After conversion to Tinygrad's structure (VECTORIZE(DEFINE_GLOBAL)),
-/// the result should contain DEFINE_GLOBAL references.
+/// After conversion to Tinygrad's structure (VECTORIZE(PARAM)),
+/// the result should contain codegen PARAM references.
 #[test]
 fn test_expand_contiguous_preserves_buffer() {
     let buffer = create_buffer(64);
@@ -89,9 +89,9 @@ fn test_expand_contiguous_preserves_buffer() {
     let result = apply_devectorize(&load);
 
     assert_no_ptrcat(&result);
-    // Verify DEFINE_GLOBAL is present in the result tree
-    let define_count = count_ops(&result, |u| matches!(u.op(), Op::DefineGlobal(_)));
-    assert!(define_count > 0, "DEFINE_GLOBAL reference should be present");
+    // Verify codegen PARAM is present in the result tree
+    let define_count = count_ops(&result, |u| matches!(u.op(), Op::Param { device: None, .. }));
+    assert!(define_count > 0, "Codegen PARAM reference should be present");
 }
 
 // =============================================================================
@@ -222,10 +222,10 @@ fn test_expand_multi_index_unsupported() {
 fn test_expand_range_based_index() {
     let buffer = create_buffer(256);
 
-    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let define = UOp::define_global(def_id, buffer.dtype());
+    let define = UOp::param(def_id, 256, buffer.dtype(), None);
     let buf_vec = define.broadcast(4);
 
     // Create vector index: VECTORIZE([range*4+0, range*4+1, range*4+2, range*4+3])
@@ -272,10 +272,10 @@ fn test_expand_range_based_index() {
 fn test_expand_symbolic_root_grouping() {
     let buffer = create_buffer(256);
 
-    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let define = UOp::define_global(def_id, buffer.dtype());
+    let define = UOp::param(def_id, 256, buffer.dtype(), None);
     let buf_vec = define.broadcast(4);
 
     // Create two groups with same root but different base offsets
@@ -322,10 +322,10 @@ fn test_expand_symbolic_root_grouping() {
 fn test_expand_different_roots_separate() {
     let buffer = create_buffer(256);
 
-    // Create DEFINE_GLOBAL and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(3000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let define = UOp::define_global(def_id, buffer.dtype());
+    let define = UOp::param(def_id, 256, buffer.dtype(), None);
     let buf_vec = define.broadcast(4);
 
     // Two different range variables

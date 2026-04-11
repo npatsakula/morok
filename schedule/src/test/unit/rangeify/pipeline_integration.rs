@@ -8,7 +8,7 @@ use std::f32::consts::PI;
 use morok_ir::{Op, UOp};
 
 use crate::rangeify::kernel::run_kernel_split_pipeline;
-use crate::test::unit::rangeify::helpers::{count_bufferizes, count_define_globals, count_kernels, extract_kernel};
+use crate::test::unit::rangeify::helpers::{count_bufferizes, count_codegen_params, count_kernels, extract_kernel};
 
 #[test]
 fn test_pipeline_two_bufferizes() {
@@ -31,9 +31,9 @@ fn test_pipeline_two_bufferizes() {
 
     let (result, _context) = run_kernel_split_pipeline(root);
 
-    // Global BUFFERIZE should be converted to BUFFER (and eventually DEFINE_GLOBAL in kernel AST)
-    let global_count = count_define_globals(&result);
-    assert!(global_count >= 1, "Should have at least 1 DEFINE_GLOBAL from global BUFFERIZE");
+    // Global BUFFERIZE should be converted to BUFFER (and eventually codegen PARAM in kernel AST)
+    let global_count = count_codegen_params(&result);
+    assert!(global_count >= 1, "Should have at least 1 codegen PARAM from global BUFFERIZE");
 
     // Local BUFFERIZE should remain as BUFFERIZE (not converted to DEFINE_LOCAL yet)
     let local_bufferize_count = count_bufferizes(&result);
@@ -61,7 +61,7 @@ fn test_pipeline_preserves_structure() {
         assert!(matches!(ast.op(), Op::Sink { .. }));
 
         // Sources contain BUFFER nodes (the original buffers from lctx.map)
-        // The DEFINE_GLOBAL conversion happens in the AST, not the sources
+        // The codegen PARAM conversion happens in the AST, not the sources
         assert!(!sources.is_empty(), "KERNEL should have sources");
         assert!(sources.iter().any(|s| matches!(s.op(), Op::Buffer { .. })), "KERNEL sources should include BUFFER");
     } else {
@@ -87,7 +87,7 @@ fn test_pipeline_context_threading() {
     let kernel = extract_kernel(&result).expect("Pipeline should create a KERNEL");
 
     if let Op::Kernel { sources, .. } = kernel.op() {
-        // Sources contain BUFFER nodes from lctx.map (not DEFINE_GLOBAL)
+        // Sources contain BUFFER nodes from lctx.map (not codegen PARAM)
         assert_eq!(sources.len(), 1, "KERNEL should have 1 source (the buffer from stage 1)");
         assert!(matches!(sources[0].op(), Op::Buffer { .. }), "Source should be BUFFER, got {:?}", sources[0].op());
     } else {
@@ -115,8 +115,8 @@ fn test_pipeline_mixed_addrspace() {
     let (result, _context) = run_kernel_split_pipeline(root);
 
     // Global BUFFERIZE should be converted
-    let globals = count_define_globals(&result);
-    assert!(globals >= 1, "Should have at least 1 DEFINE_GLOBAL from global BUFFERIZE");
+    let globals = count_codegen_params(&result);
+    assert!(globals >= 1, "Should have at least 1 codegen PARAM from global BUFFERIZE");
 
     // Local BUFFERIZE should remain unconverted
     let local_bufferizes = count_bufferizes(&result);
@@ -214,7 +214,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
             Op::Index { buffer, .. } => {
                 let buf_name = match buffer.op() {
                     Op::Buffer { .. } => "BUFFER",
-                    Op::DefineGlobal(_) => "DEFINE_GLOBAL",
+                    Op::Param { device: None, .. } => "PARAM",
                     Op::DefineLocal(_) => "DEFINE_LOCAL",
                     _ => "OTHER",
                 };
@@ -225,8 +225,8 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
                 morok_ir::BinaryOp::Add => "ADD",
                 _ => "BINARY",
             },
-            Op::DefineGlobal(id) => {
-                println!("  DEFINE_GLOBAL({})", id);
+            Op::Param { slot, device: None, .. } => {
+                println!("  PARAM({})", slot);
                 continue;
             }
             Op::DefineLocal(id) => {
@@ -244,7 +244,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
 
     // Check that INDEX operations exist for buffer access.
     // NOTE: After aligning with Tinygrad, INDEX operations may reference BUFFER nodes
-    // directly (the BUFFER → DEFINE_GLOBAL conversion happens in the AST but the
+    // directly (the BUFFER → PARAM conversion happens in the AST but the
     // kernel sources maintain the original BUFFER references).
     //
     // INDEX dtype can be either:
@@ -255,7 +255,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
         .iter()
         .filter(|node| {
             if let Op::Index { buffer, .. } = node.op() {
-                matches!(buffer.op(), Op::Buffer { .. } | Op::DefineGlobal(_))
+                matches!(buffer.op(), Op::Buffer { .. } | Op::Param { device: None, .. })
             } else {
                 false
             }
@@ -291,6 +291,6 @@ fn test_pipeline_chained_operations() {
     assert!(kernel_count >= 1, "Should create at least 1 kernel");
 
     // Should create multiple buffers
-    let buffer_count = count_define_globals(&result);
+    let buffer_count = count_codegen_params(&result);
     assert!(buffer_count >= 1, "Should create at least 1 buffer");
 }

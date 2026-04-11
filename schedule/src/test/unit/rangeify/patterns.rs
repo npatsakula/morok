@@ -423,7 +423,7 @@ fn test_movement_op_removal_no_match_without_ranges() {
     let mut ctx = IndexingContext::new();
 
     // Create a PERMUTE operation (a movement op)
-    let src = UOp::define_global(0, DType::Float32);
+    let src = UOp::native_const(1.0f32);
     let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
 
     // Without ranges assigned, should NOT remove
@@ -438,7 +438,7 @@ fn test_movement_op_removal_removes_with_ranges() {
     let mut ctx = IndexingContext::new();
 
     // Create a PERMUTE operation
-    let src = UOp::define_global(0, DType::Float32);
+    let src = UOp::native_const(1.0f32);
     let permute = UOp::new(Op::Permute { src: src.clone(), axes: vec![1, 0] }, DType::Float32);
 
     // Assign ranges to the movement op (simulating transformation has been applied)
@@ -469,7 +469,7 @@ fn test_movement_op_removal_reshape() {
     let mut ctx = IndexingContext::new();
 
     // Create a RESHAPE operation
-    let src = UOp::define_global(0, DType::Float32);
+    let src = UOp::native_const(1.0f32);
     let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
     let reshape = UOp::new(Op::Reshape { src: src.clone(), new_shape }, DType::Float32);
 
@@ -501,7 +501,7 @@ fn test_movement_op_removal_expand() {
     let mut ctx = IndexingContext::new();
 
     // Create an EXPAND operation
-    let src = UOp::define_global(0, DType::Float32);
+    let src = UOp::native_const(1.0f32);
     let new_shape = UOp::vectorize(smallvec::smallvec![UOp::index_const(4), UOp::index_const(8)]);
     let expand = UOp::new(Op::Expand { src: src.clone(), new_shape }, DType::Float32);
 
@@ -534,7 +534,7 @@ fn test_movement_op_removal_non_movement_op() {
 
     // Create a non-movement op (SQRT)
     // neg() now produces MUL (binary), use sqrt (unary) instead.
-    let src = UOp::define_global(0, DType::Float32);
+    let src = UOp::native_const(1.0f32);
     let sqrt = src.try_sqrt().unwrap();
 
     // Non-movement ops without ranges should not match the movement removal pattern
