@@ -1428,3 +1428,61 @@ morok_tensor::codegen_tests! {
         assert_eq!(vals, vec![1.0, 2.0, 3.0]);
     }
 }
+
+// =========================================================================
+// Doc example tests — mirrors code blocks from onnx.md and onnx/README.md
+// =========================================================================
+
+morok_tensor::codegen_tests! {
+    /// onnx.md "Simple: All-Initializer Models" — destructure + realize_batch
+    fn test_doc_all_initializer_realize_batch(config) {
+        use crate::importer::OnnxModel;
+
+        let importer = OnnxImporter::new();
+        let OnnxModel { mut outputs, .. } = importer.import_model(make_minimal_model(), &[]).unwrap();
+
+        let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+        Tensor::realize_batch_with(outs, &config).unwrap();
+
+        // Minimal model: Identity([1,2,3]) = [1,2,3]
+        let view = outputs["output"].array_view::<f32>().unwrap();
+        assert_eq!(view.as_slice().unwrap(), &[1.0, 2.0, 3.0]);
+    }
+
+    /// onnx.md "Models with Runtime Inputs" — inputs.remove + assign + realize_batch
+    fn test_doc_runtime_input_assign_realize_batch(config) {
+        use crate::importer::OnnxModel;
+
+        // Build model with a runtime input (not an initializer)
+        let importer = OnnxImporter::new();
+        let model = {
+            let mut m = ModelProto::default();
+            let mut g = GraphProto::default();
+            g.name = "runtime_input_test".to_string();
+            g.input.push(make_typed_input("x", tensor_proto::DataType::Float as i32, &[3]));
+            let mut output = ValueInfoProto::default();
+            output.name = "y".to_string();
+            g.output.push(output);
+            let mut node = NodeProto::default();
+            node.op_type = "Identity".to_string();
+            node.input.push("x".to_string());
+            node.output.push("y".to_string());
+            g.node.push(node);
+            m.graph = Some(g);
+            m
+        };
+
+        let OnnxModel { mut inputs, mut outputs, .. } = importer.import_model(model, &[]).unwrap();
+
+        // Doc pattern: take ownership of input, assign data
+        let input = inputs.remove("x").unwrap();
+        input.assign(&Tensor::from_slice([10.0f32, 20.0, 30.0]));
+
+        // realize_batch resolves assigns internally
+        let outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+        Tensor::realize_batch_with(outs, &config).unwrap();
+
+        let view = outputs["y"].array_view::<f32>().unwrap();
+        assert_eq!(view.as_slice().unwrap(), &[10.0, 20.0, 30.0]);
+    }
+}

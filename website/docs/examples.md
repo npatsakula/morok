@@ -35,11 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Lazy operations (no execution yet)
     let sum = &a + &b;
-    let scaled = &sum * &Tensor::from_slice([0.1f32]);
+    let mut scaled = &sum * &Tensor::from_slice([0.1f32]);
 
     // Execute and get results
-    let result = scaled.realize()?;
-    let data = result.to_ndarray::<f32>()?;
+    scaled.realize()?;
+    let data = scaled.as_ndarray::<f32>()?;
     println!("Result: {:?}", data);
     // Output: [1.1, 2.2, 3.3, 4.4]
 
@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
    - Generates optimized code
    - Executes on the target device
 
-4. `to_ndarray()` extracts the result as an `ndarray::ArrayD` for inspection.
+4. `as_ndarray()` extracts the result as an `ndarray::ArrayD` for inspection.
 
 **Try this:** Remove the `realize()` call. The code still runs, but `data` would be empty—nothing was computed.
 
@@ -93,10 +93,10 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
     // Broadcasting: add a row vector to every row
     // [3, 2] + [1, 2] → [3, 2]
     let bias = Tensor::from_ndarray(&array![[100.0f32, 200.0]]);
-    let biased = &transposed + &bias;
+    let mut biased = &transposed + &bias;
 
-    let result = biased.realize()?;
-    println!("{:?}", result.to_ndarray::<f32>()?);
+    biased.realize()?;
+    println!("{:?}", biased.as_ndarray::<f32>()?);
     // [[101, 204],
     //  [102, 205],
     //  [103, 206]]
@@ -152,11 +152,11 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
     ]);
 
     // Matrix multiply: [4, 3] @ [3, 2] → [4, 2]
-    let output = input.dot(&weights)?;
+    let mut output = input.dot(&weights)?;
 
-    let result = output.realize()?;
-    println!("Output shape: {:?}", result.shape());  // [4, 2]
-    println!("{:?}", result.to_ndarray::<f32>()?);
+    output.realize()?;
+    println!("Output shape: {:?}", output.shape()?);  // [4, 2]
+    println!("{:?}", biased.as_ndarray::<f32>()?);
     // Each row: weighted sum of that sample's features
 
     Ok(())
@@ -191,10 +191,10 @@ fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
 
     // Forward pass
-    let output = layer.forward(&input)?;
+    let mut output = layer.forward(&input)?;
 
-    let result = output.realize()?;
-    println!("Output: {:?}", result.to_ndarray::<f32>()?);
+    output.realize()?;
+    println!("Output: {:?}", biased.as_ndarray::<f32>()?);
 
     Ok(())
 }
@@ -232,16 +232,16 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
     // Forward pass: linear → ReLU → linear
     let logits = input.sequential(&[&fc1, &Relu, &fc2])?;
-    let probs = logits.softmax(-1)?;
+    let mut probs = logits.softmax(-1)?;
 
     // Get results
-    let probs_result = probs.realize()?;
-    println!("Probabilities: {:?}", probs_result.to_ndarray::<f32>()?);
+    probs.realize()?;
+    println!("Probabilities: {:?}", probs_biased.as_ndarray::<f32>()?);
 
     // Get predicted class
-    let prediction = logits.argmax(Some(-1))?;
-    let pred_result = prediction.realize()?;
-    println!("Predicted digit: {:?}", pred_result.to_ndarray::<i32>()?);
+    let mut prediction = logits.argmax(Some(-1))?;
+    prediction.realize()?;
+    println!("Predicted digit: {:?}", pred_output.as_ndarray::<i32>()?);
 
     Ok(())
 }
@@ -267,26 +267,20 @@ Want to see what Morok generates? Here's how to inspect the IR and generated cod
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
+    let mut c = &a + &b;
 
     // Print the computation graph (before compilation)
     println!("=== IR Graph ===");
     println!("{}", c.uop().tree());
 
-    // Compile and execute
-    let result = c.realize()?;
+    // Compile and inspect the execution plan
+    let plan = c.prepare()?;  // prepare() takes &mut self
+    println!("\nKernels: {}", plan.kernels().count());
 
-    // Inspect generated kernels
-    // Note: kernel tracking via kernels() is a placeholder — use prepare() for
-    // full kernel inspection (see matmul IR test).
-    println!("\n=== Generated Kernels ===");
-    for (i, kernel) in result.kernels().iter().enumerate() {
-        println!("Kernel {}: {}", i, kernel.name);
-        println!("Backend: {}", kernel.backend);
-        println!("Code:\n{}\n", kernel.code);
-    }
+    // Execute
+    plan.execute()?;
 
     Ok(())
 }
@@ -320,7 +314,8 @@ You've learned the core patterns for using Morok:
 | Chain layers | `x.sequential(&[&fc1, &Relu, &fc2])?` |
 | Activation | `t.relu()?`, `t.softmax(-1)?` |
 | Execute | `t.realize()?` |
-| Extract data | `result.to_ndarray::<f32>()?` |
+| Batch realize | `Tensor::realize_batch(&mut [&mut a, &mut b])?` |
+| Extract data | `biased.as_ndarray::<f32>()?` |
 
 **The lazy evaluation pattern:**
 

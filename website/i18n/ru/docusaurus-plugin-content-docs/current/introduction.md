@@ -45,15 +45,12 @@ let a = Tensor::from_ndarray(&array![[1.0f32, 2.0], [3.0, 4.0]]);
 let b = Tensor::from_ndarray(&array![[5.0f32, 6.0], [7.0, 8.0]]);
 
 // Lazy — nothing executes yet
-let c = &a + &b;
+let mut c = &a + &b;
+c.realize()?;
 
-// Compile, execute, extract as ndarray
-let result = c.to_ndarray::<f32>()?;
-assert_eq!(result, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
-
-// Or extract as flat Vec
-let flat = c.to_vec::<f32>()?;
-assert_eq!(flat, vec![6.0, 8.0, 10.0, 12.0]);
+// Zero-copy view into the result
+let view = c.array_view::<f32>()?;
+assert_eq!(view, array![[6.0, 8.0], [10.0, 12.0]].into_dyn());
 ```
 
 ## Пример DSL паттернов

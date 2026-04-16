@@ -229,7 +229,7 @@ After:  KERNEL(SINK(STORE(...)), ranges, buffer_list)
 
 ### बफ़र नंबरिंग
 
-बफ़र नंबरिंग `split_store()` में `LocalAddBufferContext.dg` काउंटर हैंडल करता है। DEFINE_GLOBAL indices स्प्लिट प्रोसेस में पैटर्न-मैच ऑर्डर में असाइन होते हैं — अलग रीनंबरिंग पास की ज़रूरत नहीं।
+बफ़र नंबरिंग `split_store()` में `LocalAddBufferContext.dg` काउंटर हैंडल करता है। बफ़र indices स्प्लिट प्रोसेस में पैटर्न-मैच ऑर्डर में असाइन होते हैं — अलग रीनंबरिंग पास की ज़रूरत नहीं।
 
 ---
 
@@ -356,19 +356,26 @@ Morok कई कोड जनरेशन बैकएंड सपोर्ट 
 
 ### ExecutionPlan
 
-`prepare_execution_plan()` एक `ExecutionPlan` बनाता है:
+`prepare()` (सिंगल tensor) या `prepare_batch()` (मल्टीपल tensor) एक `ExecutionPlan` बनाता है:
 
 ```rust
 pub struct ExecutionPlan {
     kernels: Vec<PreparedKernel>,       // Compiled kernels (topological order)
-    parallel_groups: Vec<ParallelGroup>,
     buffers: Vec<Buffer>,
     ast_to_buffer: HashMap<u64, usize>, // AST id -> buffer index mapping
-    output_buffer_idx: usize,
-    device: DeviceSpec,
-    alias_ids: Vec<u64>,               // Additional UOp IDs for cleanup
+    output_buffer_indices: Vec<usize>,  // Indices of output buffers (multi-output)
 }
 ```
+
+Plans अब `realize_batch()` / `prepare_batch()` के ज़रिए **मल्टीपल आउटपुट** सपोर्ट करते हैं। जब कई tensor सबग्राफ़ शेयर करते हैं, बैच शेड्यूलिंग कम्पाइलर को आउटपुट के बीच कर्नेल शेयर करने देती है।
+
+मुख्य मेथड:
+
+| मेथड | उद्देश्य |
+|------|---------|
+| `output_buffer_at(i)` | i-वाँ आउटपुट बफ़र लें (SINK source ऑर्डर से मैच) |
+| `num_outputs()` | इस प्लान में आउटपुट बफ़र की संख्या |
+| `execute_with_vars(var_vals)` | अलग symbolic variable values के साथ फिर से एक्ज़ीक्यूट करें (कोई रीकम्पाइलेशन नहीं) |
 
 प्लान **रीयूज़ेबल** है: एक बार कम्पाइल करें, अलग-अलग डेटा के साथ कई बार एक्ज़ीक्यूट करें।
 
@@ -391,27 +398,18 @@ let function = execution_engine.get_function::<KernelFn>(&name)?;
 // Cache: (ast_id, device) → function
 ```
 
-### पैरेलल एक्ज़ीक्यूशन
+### कर्नेल एक्ज़ीक्यूशन
 
-कर्नेल कम्पाइल होने के बाद, एक्ज़ीक्यूशन पैरेलल ग्रुप फ़ॉलो करता है:
+कर्नेल कम्पाइल होने के बाद, एक्ज़ीक्यूशन टोपोलॉजिकल ऑर्डर में कर्नेल इटरेट करता है, डिपेंडेंसीज़ का ध्यान रखते हुए:
 
 ```rust
-for group in &plan.parallel_groups {
-    if group.kernel_indices.len() == 1 {
-        // Single kernel: direct call
-        execute_kernel(&kernels[group.kernel_indices[0]]);
-    } else {
-        // Multiple kernels: parallel execution
-        rayon::scope(|s| {
-            for &idx in &group.kernel_indices {
-                s.spawn(|_| execute_kernel(&kernels[idx]));
-            }
-        });
-    }
+for kernel in &plan.kernels {
+    // Dependencies tracked per-kernel via kernel.dependencies
+    kernel.execute(buffers);
 }
 ```
 
-इंडिपेंडेंट कर्नेल Rayon के work-stealing शेड्यूलर से पैरेलल चलते हैं।
+कर्नेल अपना डिवाइस स्पेसिफ़िकेशन रखते हैं, इसलिए एक प्लान मल्टीपल डिवाइसेज़ को स्पैन कर सकता है।
 
 ### कर्नेल कैशिंग
 

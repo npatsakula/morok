@@ -194,7 +194,7 @@ BUFFERIZE(opts={addrspace=Global})
 
 ```rust
 Index {
-    buffer: Arc<UOp>,                   // BUFFER or DEFINE_GLOBAL
+    buffer: Arc<UOp>,                   // BUFFER or PARAM
     indices: SmallVec<[Arc<UOp>; 4]>,   // index per dimension
     gate: Option<Arc<UOp>>,             // optional predicate
 }
@@ -205,7 +205,7 @@ Index {
 **示例：**
 ```text
 INDEX : Float32
-├── DEFINE_GLOBAL(0)
+├── PARAM(0)
 ├── RANGE(R0, Global)        — index for dim 0
 ├── RANGE(R1, Loop)          — index for dim 1
 └── MUL(...)                 — index for dim 2
@@ -239,9 +239,9 @@ Load {
 **示例：**
 ```text
 LOAD : Float32
-├── DEFINE_GLOBAL(1)
+├── PARAM(1)
 └── INDEX
-    ├── DEFINE_GLOBAL(1)
+    ├── PARAM(1)
     ├── RANGE(R0)
     └── RANGE(R2)
 ```
@@ -284,14 +284,14 @@ Kernel {
 }
 ```
 
-封装一个完整的内核用于代码生成。sources 是内核参数（`DefineGlobal`、`DefineLocal`、`DefineVar`）。
+封装一个完整的内核用于代码生成。sources 是内核参数（`Param`、`DefineLocal`、`DefineVar`）。注意：在 batching_support PR 中，`Param` 替代了 `DefineGlobal`，通过擦除 buffer 身份来实现内核去重。
 
 **示例：**
 ```text
 KERNEL
-├── DEFINE_GLOBAL(0)         — output buffer arg
-├── DEFINE_GLOBAL(1)         — input A arg
-├── DEFINE_GLOBAL(2)         — input B arg
+├── PARAM(slot=0, size=1024) — output buffer arg
+├── PARAM(slot=1, size=1024) — input A arg
+├── PARAM(slot=2, size=1024) — input B arg
 └── SINK                     — computation
     └── STORE(...)
 ```
@@ -329,7 +329,7 @@ After {
 ```text
 SINK
 ├── AFTER
-│   ├── DEFINE_GLOBAL(0)     — passthrough (buffer reference)
+│   ├── PARAM(0)     — passthrough (buffer reference)
 │   └── KERNEL(...)          — must complete first
 └── KERNEL(...)              — can use buffer after AFTER
 ```
@@ -535,13 +535,16 @@ ENDIF
 
 ## 定义操作
 
-### DEFINE_GLOBAL — 设备内存参数
+### PARAM — Buffer 参数
 
 ```rust
-DefineGlobal(usize)          // argument index
+Param { slot: usize, size: usize, device: Option<Arc<UOp>> }
 ```
 
-设备（全局）内存的内核参数。index 指的是内核参数列表中的位置。
+归一化的 buffer 参数——对输入/输出 buffer 的位置引用。
+由预调度归一化（BUFFER→PARAM）创建，通过擦除 buffer 身份，
+实现对不同 buffer 上相同计算的结构性去重。
+`slot` 是内核参数列表中的位置，`size` 是元素数量。
 
 ### DEFINE_LOCAL — 共享内存分配
 
@@ -686,7 +689,7 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 | **展开** | `UNROLL`, `CONTRACT` |
 | **硬件** | `WMMA`, `SPECIAL` |
 | **控制** | `IF`, `ENDIF` |
-| **定义** | `DEFINE_GLOBAL`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **定义** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
 | **移动** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 

@@ -14,7 +14,7 @@ ONNX-импортёр Morok — рекомендуемый способ инфе
 | 162 / 200 операторов ONNX | [Таблица паритета](https://github.com/patsak/morok/blob/main/onnx/PARITY.md) |
 | CNN-архитектуры (ResNet, DenseNet, VGG, ...) | Проверено 9 моделей |
 | Расширения Microsoft (Attention, RotaryEmbedding) | Поддерживается |
-| Динамический размер батча | Планируется в следующем релизе |
+| Динамический размер батча | Поддерживается (Variable API) |
 | Обучение / обратный проход | Не поддерживается |
 
 **Сравнение с другими фреймворками**
@@ -38,49 +38,47 @@ morok-tensor = { git = "https://github.com/patsak/morok" }
 Для моделей, у которых все входы уже вшиты в файл (без рантайм-входов):
 
 ```rust
-use morok_onnx::OnnxImporter;
+use morok_onnx::{OnnxImporter, OnnxModel};
+use morok_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
-    let outputs = importer.import_path("model.onnx")?;
+    let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
 
-    // Each output is a lazy Tensor — realize to get data
+    // Подготавливаем все выходы вместе, выполняем за один проход
+    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(&mut outs)?;
+
     for (name, tensor) in &outputs {
-        let result = tensor.realize()?;
-        println!("{name}: {:?}", result.to_ndarray::<f32>()?);
+        println!("{name}: {:?}", tensor.as_ndarray::<f32>()?);
     }
     Ok(())
 }
 ```
 
-### Двухфазный вариант: модели с рантайм-входами
+### Модели с рантайм-входами
 
-Большинству моделей нужны данные на этапе выполнения (изображения, токены, аудио). Двухфазный API разделяет подготовку графа и выполнение:
+Большинству моделей нужны данные на этапе выполнения (изображения, токены, аудио). Деструктурируйте `OnnxModel` и используйте `remove()`, чтобы взять владение входными тензорами:
 
 ```rust
-use morok_onnx::OnnxImporter;
+use morok_onnx::{OnnxImporter, OnnxModel};
+use morok_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let importer = OnnxImporter::new();
+    let mut importer = OnnxImporter::new();
+    let OnnxModel { mut inputs, mut outputs, .. } = importer.import("model.onnx", &[])?;
 
-    // Phase 1: Parse structure (no execution)
-    let graph = importer.prepare(model_proto)?;
+    // Назначаем входные данные (лениво — без аллокации)
+    let input = inputs.remove("input").unwrap();
+    input.assign(&Tensor::from_slice(&my_data));
 
-    // Inspect what the model needs
-    for (name, spec) in &graph.inputs {
-        println!("{name}: shape={:?}, dtype={:?}", spec.shape, spec.dtype);
-    }
-
-    // Phase 2: Build lazy computation graph
-    let (inputs, outputs) = importer.trace(&graph)?;
-
-    // Execute
-    let result = outputs["output"].realize()?;
+    // Подготавливаем все выходы вместе, выполняем за один проход
+    // (внутренне резолвит assign входов — отдельный realize не нужен)
+    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(&mut outs)?;
     Ok(())
 }
 ```
-
-`prepare()` и `trace()` разделены, потому что структура графа статична — парсим один раз, а `trace()` можно вызывать многократно с разными привязками размерностей или входными данными.
 
 ---
 
@@ -90,23 +88,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Импортёр обрабатывает ONNX-модели в два этапа:
 
-**Фаза 1 — `prepare()`:** Извлекает топологию графа, ничего не выполняя. Парсит protobuf, отделяет инициализаторы (веса) от рантайм-входов, запоминает версии opset, предварительно парсит подграфы control flow. Возвращает `OnnxGraph` — лёгкую структуру, которую можно изучить до запуска вычислений.
-
-**Фаза 2 — `trace()`:** Обходит граф в топологическом порядке, диспатчит каждый ONNX-узел в соответствующую реализацию Tensor. На этом этапе строится ленивый граф вычислений (DAG) — никаких реальных вычислений ещё нет. Результат — набор хэндлов `Tensor`, которые при вызове `realize()` компилируются и выполняются через полный пайплайн.
+**`import(path, dim_bindings)`** выполняет обе фазы одним вызовом: парсит protobuf, извлекает инициализаторы и спецификации входов, обходит граф в топологическом порядке, диспатчит каждый ONNX-узел в соответствующую реализацию Tensor и возвращает `OnnxModel { inputs, outputs, variables }`. Никаких вычислений — результат представляет собой набор ленивых хэндлов `Tensor`, которые компилируются и выполняются при вызове `realize()`.
 
 ```text
-model.onnx → prepare() → OnnxGraph → trace() → lazy Tensors → realize() → results
-                 │                        │
-                 │ structure only         │ builds computation DAG
-                 │ (no execution)         │ (no execution)
-                 ▼                        ▼
-          Inspect inputs/outputs    Pass to optimizer/codegen
+model.onnx → import(path, dims) → OnnxModel { inputs, outputs, variables } → realize() → results
 ```
 
-Такое разделение даёт несколько возможностей:
-- **Проверка перед запуском:** Посмотреть формы и типы данных входов до аллокаций
-- **Множественные трассировки:** Повторный `trace()` с другими привязками динамических размерностей
-- **Внешние веса:** Загрузка весов отдельно (полезно для моделей с внешними файлами данных)
+Для продвинутых сценариев (изучение структуры графа до импорта) метод `import_model()` принимает предварительно распарсенный `ModelProto`.
 
 ### Декомпозиция операторов
 
@@ -158,19 +146,21 @@ ONNX-модели объявляют импорты opset для каждого 
 
 ### Динамические размерности
 
-Входы ONNX могут содержать символические размерности вроде `"batch_size"` или `"sequence_length"`. Привяжите их на этапе трассировки:
+Входы ONNX могут содержать символические размерности вроде `"batch_size"` или `"sequence_length"`. Привяжите их при импорте через параметр `dim_bindings`:
 
 ```rust
-let graph = importer.prepare(model)?;
+let model = importer.import("model.onnx", &[
+    ("batch_size", 1),
+    ("sequence_length", 512),
+])?;
 
-// Bind symbolic dims to concrete values
-let (inputs, outputs) = importer.trace_with_dims(
-    &graph,
-    &[("batch_size", 1), ("sequence_length", 512)],
-)?;
+// Variables are auto-extracted from dim_param annotations
+for (name, var) in &model.variables {
+    println!("{name}: bounds {:?}", var.bounds());
+}
 ```
 
-Непривязанные динамические размерности дают понятную ошибку на этапе трассировки. Какие размерности динамические, можно узнать через `InputSpec::shape`:
+Непривязанные динамические размерности дают понятную ошибку при импорте. Какие размерности динамические, можно узнать через `InputSpec::shape`:
 
 ```rust
 for (name, spec) in &graph.inputs {
@@ -185,11 +175,12 @@ for (name, spec) in &graph.inputs {
 
 ### Внешние веса
 
-Некоторые ONNX-модели хранят веса в отдельных файлах. Чтобы передать их, используйте `trace_external()`:
+Некоторые ONNX-модели хранят веса в отдельных файлах. Чтобы передать их, используйте `import_model_with_inputs()`:
 
 ```rust
-let (inputs, outputs) = importer.trace_external(
-    &graph,
+let model = importer.import_model_with_inputs(
+    "model.onnx",
+    &[],
     external_weights,  // HashMap<String, Tensor>
 )?;
 ```
@@ -230,9 +221,43 @@ Morok:   then_result.where_(&condition, &else_result)
 
 Итеративный control flow (`Loop`, `Scan`) не реализован. Эти операторы требуют многократной трассировки или развёртки, что не ложится на архитектуру однократной трассировки. Модели с рекуррентными паттернами обычно работают через развёрнутые операторы (LSTM, GRU, RNN реализованы как нативные ops).
 
-### Нет батчинга (пока)
+### Батч-выполнение
 
-Динамический батчинг — одновременный инференс на нескольких входах — планируется в следующем релизе. Пока что размерности батча нужно привязывать к фиксированному значению на этапе трассировки через `trace_with_dims()`.
+Несколько тензоров можно реализовать одновременно, разделяя вычисления между выходами
+(тестируется в `tensor/src/test/unit/batch.rs`):
+
+```rust
+// Realize all outputs at once (shares compilation and execution)
+let mut outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
+Tensor::realize_batch(&mut outputs)?;
+```
+
+Для повторного инференса используйте паттерн prepare/execute (тестируется в
+`tensor/src/test/unit/variable.rs::test_prepare_execute_loop`):
+
+```rust
+let OnnxModel { mut inputs, mut outputs, variables } =
+    importer.import("model.onnx", &[("batch", 1)])?;
+
+// 1. Assign initial data (lazy — no allocation yet)
+let input = inputs.remove("audio").unwrap();
+input.assign(&Tensor::from_slice(&first_frame));
+
+// 2. Compile the execution plan (resolves assigns, allocates buffers)
+let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+let mut plan = Tensor::prepare_batch(&mut outs)?;
+plan.execute()?;  // first run
+
+// 3. Fast loop: zero-copy writes via array_view_mut, no recompilation
+for frame in audio_frames {
+    input.array_view_mut::<f32>()?[..frame.len()].copy_from_slice(&frame);
+    plan.execute()?;
+}
+
+// Re-execute with different variable bindings
+let bound = variables["batch"].bind(8)?;
+plan.execute_with_vars(&[bound.as_var_val()])?;
+```
 
 ### Нет обучения
 
@@ -266,19 +291,18 @@ RUST_LOG=morok_onnx::importer=trace cargo run
 
 ### Исследование графа
 
-Чтобы понять, что нужно модели, до трассировки используйте `OnnxGraph`:
+Чтобы понять, что нужно модели, используйте структуру `OnnxModel`:
 
 ```rust
-let graph = importer.prepare(model)?;
+let model = importer.import("model.onnx", &[])?;
 
 println!("Inputs:");
-for (name, spec) in &graph.inputs {
-    println!("  {name}: {:?} {:?}", spec.shape, spec.dtype);
+for (name, tensor) in &model.inputs {
+    println!("  {name}: {:?}", tensor.shape());
 }
 
-println!("Outputs: {:?}", graph.output_names());
-println!("Nodes: {}", graph.nodes.len());
-println!("Initializers: {}", graph.initializers.len());
+println!("Outputs: {:?}", model.outputs.keys().collect::<Vec<_>>());
+println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 ```
 
 ---
@@ -288,12 +312,12 @@ println!("Initializers: {}", graph.initializers.len());
 | Аспект | Детали |
 |--------|--------|
 | **Точка входа** | `OnnxImporter::new()` |
-| **Простой импорт** | `importer.import_path("model.onnx")?` |
-| **Двухфазный режим** | `prepare()` → `trace()` / `trace_with_dims()` |
+| **Простой импорт** | `importer.import("model.onnx", &[])?` |
+| **Динамические размерности** | `importer.import(path, &[("batch", 4)])?` |
 | **Операторы** | 162 / 200 ([полная таблица паритета](https://github.com/patsak/morok/blob/main/onnx/PARITY.md)) |
 | **Проверенные модели** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
 | **Бэкенды** | Clang + LLVM (идентичные результаты) |
 | **Расширения** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
-| **Ограничения** | Нет обучения, нет батчинга (пока), нет Loop/Scan, shape-полиморфный If |
+| **Ограничения** | Нет обучения, нет Loop/Scan, shape-полиморфный If |
 
 **Далее:** [Практические примеры](./examples) — основы работы с тензорами, или [Пайплайн выполнения](./architecture/pipeline) — чтобы разобраться, как устроена компиляция.

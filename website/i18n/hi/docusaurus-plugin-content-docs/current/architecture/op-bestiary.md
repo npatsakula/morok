@@ -194,7 +194,7 @@ BUFFERIZE(opts={addrspace=Global})
 
 ```rust
 Index {
-    buffer: Arc<UOp>,                   // BUFFER or DEFINE_GLOBAL
+    buffer: Arc<UOp>,                   // BUFFER or PARAM
     indices: SmallVec<[Arc<UOp>; 4]>,   // index per dimension
     gate: Option<Arc<UOp>>,             // optional predicate
 }
@@ -205,7 +205,7 @@ Index {
 **उदाहरण:**
 ```text
 INDEX : Float32
-├── DEFINE_GLOBAL(0)
+├── PARAM(0)
 ├── RANGE(R0, Global)        — dim 0 के लिए index
 ├── RANGE(R1, Loop)          — dim 1 के लिए index
 └── MUL(...)                 — dim 2 के लिए index
@@ -239,9 +239,9 @@ Load {
 **उदाहरण:**
 ```text
 LOAD : Float32
-├── DEFINE_GLOBAL(1)
+├── PARAM(1)
 └── INDEX
-    ├── DEFINE_GLOBAL(1)
+    ├── PARAM(1)
     ├── RANGE(R0)
     └── RANGE(R2)
 ```
@@ -284,14 +284,14 @@ Kernel {
 }
 ```
 
-कोड जनरेशन के लिए एक पूरे कर्नेल को रैप करता है। Sources कर्नेल आर्ग्युमेंट होते हैं (`DefineGlobal`, `DefineLocal`, `DefineVar`)।
+कोड जनरेशन के लिए एक पूरे कर्नेल को रैप करता है। Sources कर्नेल आर्ग्युमेंट होते हैं (`Param`, `DefineLocal`, `DefineVar`)। नोट: `Param` ने batching_support PR में `DefineGlobal` को रिप्लेस किया ताकि बफ़र आइडेंटिटी हटाकर कर्नेल डीडुप्लिकेशन सक्षम हो सके।
 
 **उदाहरण:**
 ```text
 KERNEL
-├── DEFINE_GLOBAL(0)         — आउटपुट बफ़र arg
-├── DEFINE_GLOBAL(1)         — इनपुट A arg
-├── DEFINE_GLOBAL(2)         — इनपुट B arg
+├── PARAM(slot=0, size=1024) — आउटपुट बफ़र arg
+├── PARAM(slot=1, size=1024) — इनपुट A arg
+├── PARAM(slot=2, size=1024) — इनपुट B arg
 └── SINK                     — computation
     └── STORE(...)
 ```
@@ -329,7 +329,7 @@ After {
 ```text
 SINK
 ├── AFTER
-│   ├── DEFINE_GLOBAL(0)     — passthrough (बफ़र रेफ़रेंस)
+│   ├── PARAM(0)     — passthrough (बफ़र रेफ़रेंस)
 │   └── KERNEL(...)          — पहले पूरा होना ज़रूरी
 └── KERNEL(...)              — AFTER के बाद बफ़र इस्तेमाल कर सकता है
 ```
@@ -535,13 +535,16 @@ ENDIF
 
 ## डेफ़िनिशन ऑपरेशन
 
-### DEFINE_GLOBAL — डिवाइस मेमोरी आर्ग्युमेंट
+### PARAM — बफ़र पैरामीटर
 
 ```rust
-DefineGlobal(usize)          // argument index
+Param { slot: usize, size: usize, device: Option<Arc<UOp>> }
 ```
 
-डिवाइस (global) मेमोरी के लिए कर्नेल आर्ग्युमेंट। Index कर्नेल आर्ग्युमेंट लिस्ट में पोज़िशन दर्शाता है।
+नॉर्मलाइज़्ड बफ़र पैरामीटर — इनपुट/आउटपुट बफ़र का पोज़िशनल रेफ़रेंस।
+प्री-शेड्यूल नॉर्मलाइज़ेशन (BUFFER→PARAM) द्वारा बनाया जाता है ताकि बफ़र आइडेंटिटी हटाकर
+आइडेंटिकल कम्प्यूटेशन का स्ट्रक्चरल डीडुप्लिकेशन हो सके।
+`slot` कर्नेल आर्ग्युमेंट लिस्ट में पोज़िशन है, `size` एलिमेंट काउंट है।
 
 ### DEFINE_LOCAL — Shared मेमोरी एलोकेशन
 
@@ -686,7 +689,7 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 | **Expansion** | `UNROLL`, `CONTRACT` |
 | **हार्डवेयर** | `WMMA`, `SPECIAL` |
 | **कंट्रोल** | `IF`, `ENDIF` |
-| **डेफ़िनिशन** | `DEFINE_GLOBAL`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **डेफ़िनिशन** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
 | **मूवमेंट** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 

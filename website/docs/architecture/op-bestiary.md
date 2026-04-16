@@ -194,7 +194,7 @@ BUFFERIZE(opts={addrspace=Global})
 
 ```rust
 Index {
-    buffer: Arc<UOp>,                   // BUFFER or DEFINE_GLOBAL
+    buffer: Arc<UOp>,                   // BUFFER or PARAM
     indices: SmallVec<[Arc<UOp>; 4]>,   // index per dimension
     gate: Option<Arc<UOp>>,             // optional predicate
 }
@@ -205,7 +205,7 @@ Computes memory address from multi-dimensional indices. Returns element dtype (n
 **Example:**
 ```text
 INDEX : Float32
-├── DEFINE_GLOBAL(0)
+├── PARAM(0)
 ├── RANGE(R0, Global)        — index for dim 0
 ├── RANGE(R1, Loop)          — index for dim 1
 └── MUL(...)                 — index for dim 2
@@ -239,9 +239,9 @@ Read value from buffer at index. For gated loads, the `alt` field provides a val
 **Example:**
 ```text
 LOAD : Float32
-├── DEFINE_GLOBAL(1)
+├── PARAM(1)
 └── INDEX
-    ├── DEFINE_GLOBAL(1)
+    ├── PARAM(1)
     ├── RANGE(R0)
     └── RANGE(R2)
 ```
@@ -284,14 +284,14 @@ Kernel {
 }
 ```
 
-Wraps a complete kernel for code generation. Sources are kernel arguments (`DefineGlobal`, `DefineLocal`, `DefineVar`).
+Wraps a complete kernel for code generation. Sources are kernel arguments (`Param`, `DefineLocal`, `DefineVar`). Note: `Param` replaced `DefineGlobal` in the batching_support PR to enable kernel deduplication by erasing buffer identity.
 
 **Example:**
 ```text
 KERNEL
-├── DEFINE_GLOBAL(0)         — output buffer arg
-├── DEFINE_GLOBAL(1)         — input A arg
-├── DEFINE_GLOBAL(2)         — input B arg
+├── PARAM(slot=0, size=1024) — output buffer arg
+├── PARAM(slot=1, size=1024) — input A arg
+├── PARAM(slot=2, size=1024) — input B arg
 └── SINK                     — computation
     └── STORE(...)
 ```
@@ -329,7 +329,7 @@ Expresses execution dependencies between kernels without data dependency. The `p
 ```text
 SINK
 ├── AFTER
-│   ├── DEFINE_GLOBAL(0)     — passthrough (buffer reference)
+│   ├── PARAM(0)     — passthrough (buffer reference)
 │   └── KERNEL(...)          — must complete first
 └── KERNEL(...)              — can use buffer after AFTER
 ```
@@ -535,13 +535,16 @@ ENDIF
 
 ## Definition Operations
 
-### DEFINE_GLOBAL — Device Memory Argument
+### PARAM — Buffer Parameter
 
 ```rust
-DefineGlobal(usize)          // argument index
+Param { slot: usize, size: usize, device: Option<Arc<UOp>> }
 ```
 
-Kernel argument for device (global) memory. Index refers to position in kernel argument list.
+Normalized buffer parameter — positional reference to an input/output buffer.
+Created by pre-schedule normalization (BUFFER→PARAM) to erase buffer identity,
+enabling structural deduplication of identical computations on different buffers.
+`slot` is the position in the kernel argument list, `size` is element count.
 
 ### DEFINE_LOCAL — Shared Memory Allocation
 
@@ -686,7 +689,7 @@ The following operations exist in the `Op` enum but are either internal or rarel
 | **Expansion** | `UNROLL`, `CONTRACT` |
 | **Hardware** | `WMMA`, `SPECIAL` |
 | **Control** | `IF`, `ENDIF` |
-| **Definition** | `DEFINE_GLOBAL`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **Definition** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
 | **Movement** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 

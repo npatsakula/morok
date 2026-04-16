@@ -194,7 +194,7 @@ BUFFERIZE(opts={addrspace=Global})
 
 ```rust
 Index {
-    buffer: Arc<UOp>,                   // BUFFER or DEFINE_GLOBAL
+    buffer: Arc<UOp>,                   // BUFFER or PARAM
     indices: SmallVec<[Arc<UOp>; 4]>,   // index per dimension
     gate: Option<Arc<UOp>>,             // optional predicate
 }
@@ -205,7 +205,7 @@ Index {
 **Пример:**
 ```text
 INDEX : Float32
-├── DEFINE_GLOBAL(0)
+├── PARAM(0)
 ├── RANGE(R0, Global)        — index for dim 0
 ├── RANGE(R1, Loop)          — index for dim 1
 └── MUL(...)                 — index for dim 2
@@ -239,9 +239,9 @@ Load {
 **Пример:**
 ```text
 LOAD : Float32
-├── DEFINE_GLOBAL(1)
+├── PARAM(1)
 └── INDEX
-    ├── DEFINE_GLOBAL(1)
+    ├── PARAM(1)
     ├── RANGE(R0)
     └── RANGE(R2)
 ```
@@ -284,14 +284,14 @@ Kernel {
 }
 ```
 
-Оборачивает готовое ядро для кодогенерации. Источники — аргументы ядра (`DefineGlobal`, `DefineLocal`, `DefineVar`).
+Оборачивает готовое ядро для кодогенерации. Источники — аргументы ядра (`Param`, `DefineLocal`, `DefineVar`). Замечание: `Param` заменил `DefineGlobal` в PR batching_support для дедупликации ядер путём стирания идентичности буферов.
 
 **Пример:**
 ```text
 KERNEL
-├── DEFINE_GLOBAL(0)         — output buffer arg
-├── DEFINE_GLOBAL(1)         — input A arg
-├── DEFINE_GLOBAL(2)         — input B arg
+├── PARAM(slot=0, size=1024) — output buffer arg
+├── PARAM(slot=1, size=1024) — input A arg
+├── PARAM(slot=2, size=1024) — input B arg
 └── SINK                     — computation
     └── STORE(...)
 ```
@@ -329,7 +329,7 @@ After {
 ```text
 SINK
 ├── AFTER
-│   ├── DEFINE_GLOBAL(0)     — passthrough (buffer reference)
+│   ├── PARAM(0)     — passthrough (buffer reference)
 │   └── KERNEL(...)          — must complete first
 └── KERNEL(...)              — can use buffer after AFTER
 ```
@@ -535,13 +535,16 @@ ENDIF
 
 ## Операции определения
 
-### DEFINE_GLOBAL — аргумент в памяти устройства
+### PARAM — параметр буфера
 
 ```rust
-DefineGlobal(usize)          // argument index
+Param { slot: usize, size: usize, device: Option<Arc<UOp>> }
 ```
 
-Аргумент ядра для глобальной (device) памяти. Индекс указывает на позицию в списке аргументов ядра.
+Нормализованный параметр буфера — позиционная ссылка на входной/выходной буфер.
+Создаётся при предварительной нормализации расписания (BUFFER->PARAM) для стирания идентичности буфера,
+что позволяет структурную дедупликацию идентичных вычислений на разных буферах.
+`slot` — позиция в списке аргументов ядра, `size` — количество элементов.
 
 ### DEFINE_LOCAL — аллокация shared-памяти
 
@@ -686,7 +689,7 @@ RESHAPE(new_shape=[6, 4]) : Shape[6, 4]
 | **Расширение** | `UNROLL`, `CONTRACT` |
 | **Аппаратные** | `WMMA`, `SPECIAL` |
 | **Управление** | `IF`, `ENDIF` |
-| **Определение** | `DEFINE_GLOBAL`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
+| **Определение** | `PARAM`, `DEFINE_LOCAL`, `DEFINE_VAR`, `DEFINE_REG`, `BIND`, `UNIQUE`, `DEVICE` |
 | **Перемещение** | `RESHAPE`, `PERMUTE`, `EXPAND`, `PAD`, `SHRINK`, `FLIP` |
 | **ALU** | `Unary(...)`, `Binary(...)`, `Ternary(...)`, `Cast`, `BitCast` |
 

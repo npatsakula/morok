@@ -320,3 +320,21 @@ fn test_example_6_ir_graph() {
     // The tree should contain Add operation
     assert!(tree.contains("Add"), "IR tree should contain Add: {}", tree);
 }
+
+// examples.md Example 6 — prepare + kernels + execute
+crate::codegen_tests! {
+    fn test_example_6_prepare_execute(config) {
+        test_setup();
+
+        let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+        let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
+        let mut c = &a + &b;
+
+        let plan = c.prepare_with(&config).unwrap();
+        assert!(plan.kernels().count() > 0, "should have at least 1 kernel");
+        plan.execute().unwrap();
+
+        let view = c.array_view::<f32>().unwrap();
+        assert_close_f32(view.as_slice().unwrap(), &[5.0, 7.0, 9.0], 1e-6);
+    }
+}

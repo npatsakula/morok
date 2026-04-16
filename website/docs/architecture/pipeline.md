@@ -356,19 +356,26 @@ Code generation produces LLVM IR strings. Execution involves JIT compilation and
 
 ### The ExecutionPlan
 
-`prepare_execution_plan()` builds an `ExecutionPlan`:
+`prepare()` (single tensor) or `prepare_batch()` (multiple tensors) builds an `ExecutionPlan`:
 
 ```rust
 pub struct ExecutionPlan {
     kernels: Vec<PreparedKernel>,       // Compiled kernels (topological order)
-    parallel_groups: Vec<ParallelGroup>,
     buffers: Vec<Buffer>,
     ast_to_buffer: HashMap<u64, usize>, // AST id -> buffer index mapping
-    output_buffer_idx: usize,
-    device: DeviceSpec,
-    alias_ids: Vec<u64>,               // Additional UOp IDs for cleanup
+    output_buffer_indices: Vec<usize>,  // Indices of output buffers (multi-output)
 }
 ```
+
+Plans now support **multiple outputs** via `realize_batch()` / `prepare_batch()`. When several tensors share subgraphs, batch scheduling lets the compiler share kernels across outputs.
+
+Key methods:
+
+| Method | Purpose |
+|--------|---------|
+| `output_buffer_at(i)` | Get the i-th output buffer (matches SINK source order) |
+| `num_outputs()` | Number of output buffers in this plan |
+| `execute_with_vars(var_vals)` | Re-execute with different symbolic variable values (no recompilation) |
 
 The plan is **reusable**: compile once, execute many times with different data.
 
@@ -391,27 +398,18 @@ let function = execution_engine.get_function::<KernelFn>(&name)?;
 // Cache: (ast_id, device) → function
 ```
 
-### Parallel Execution
+### Kernel Execution
 
-With kernels compiled, execution follows the parallel groups:
+With kernels compiled, execution iterates through kernels in topological order, respecting dependencies:
 
 ```rust
-for group in &plan.parallel_groups {
-    if group.kernel_indices.len() == 1 {
-        // Single kernel: direct call
-        execute_kernel(&kernels[group.kernel_indices[0]]);
-    } else {
-        // Multiple kernels: parallel execution
-        rayon::scope(|s| {
-            for &idx in &group.kernel_indices {
-                s.spawn(|_| execute_kernel(&kernels[idx]));
-            }
-        });
-    }
+for kernel in &plan.kernels {
+    // Dependencies tracked per-kernel via kernel.dependencies
+    kernel.execute(buffers);
 }
 ```
 
-Independent kernels run in parallel using Rayon's work-stealing scheduler.
+Kernels carry their own device specification, so a plan can span multiple devices.
 
 ### Kernel Caching
 

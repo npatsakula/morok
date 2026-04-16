@@ -5,96 +5,65 @@
 ONNX model frontend for Morok. Parses `.onnx` files and builds lazy Morok
 tensor graphs that can be compiled once and executed repeatedly.
 
-## Quick Start — All-Initializer Model
-
-Models where every input has an initializer (weights baked into the file):
+## Quick Start
 
 ```rust
 let mut importer = OnnxImporter::new();
-let outputs = importer.import_path("model.onnx")?;
-let result = outputs["output"].realize()?;
+let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
+
+let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+Tensor::realize_batch(&mut outs)?;
 ```
 
-## Trace API — Compile Once, Run Many
+## Import with Dynamic Dimensions
 
-For models with runtime inputs (e.g., audio frames, token embeddings), the
-trace API separates graph construction from execution:
-
-```rust
-use morok_onnx::OnnxImporter;
-use prost::Message;
-
-// 1. Parse and prepare the graph structure
-let importer = OnnxImporter::new();
-let model = ModelProto::decode(bytes)?;
-let graph = importer.prepare(model)?;
-
-// 2. Trace — builds the lazy computation graph, allocates input buffers
-let (inputs, outputs) = importer.trace(&graph)?;
-
-// 3. Compile into an execution plan (kernels compiled, buffers allocated)
-let mut plan = outputs["output"].prepare()?;
-let mut executor = morok_runtime::global_executor();
-
-// 4. Feed data and run
-let buf_id = inputs["audio_frame"].uop().base().id;
-plan.buffer_mut_by_id(buf_id).unwrap().copyin(&frame_bytes);
-plan.execute(&mut executor)?;
-
-// 5. Re-run with new data — no recompilation
-plan.buffer_mut_by_id(buf_id).unwrap().copyin(&next_frame_bytes);
-plan.execute(&mut executor)?;
-
-// 6. Read output
-let output_data = plan.output_buffer();
-```
-
-### Dynamic Dimensions
-
-When the model has symbolic dimensions (e.g., `batch_size`), bind them to
-concrete values at trace time:
+When the model has symbolic dimensions (e.g., `batch_size`), bind them at
+import time:
 
 ```rust
-let (inputs, outputs) = importer.trace_with_dims(&graph, &[
+let model = importer.import("model.onnx", &[
     ("batch_size", 1),
     ("sequence_length", 512),
 ])?;
+
+// Variables are auto-extracted from dim_param annotations
+for (name, var) in &model.variables {
+    println!("{name}: bounds {:?}", var.bounds());
+}
 ```
 
-Unbound dynamic dimensions produce an error.
+## Prepare / Execute — Compile Once, Run Many
 
-### External Weights
-
-For models with weights stored outside the `.onnx` file:
+For repeated inference (tested in `tensor/src/test/unit/variable.rs::test_prepare_execute_loop`):
 
 ```rust
-let weights: HashMap<String, Tensor> = load_weights("weights.bin")?;
-let (inputs, outputs) = importer.trace_external(&graph, weights)?;
-```
+let OnnxModel { mut inputs, mut outputs, variables } =
+    importer.import("model.onnx", &[("batch", 1)])?;
 
-Provided tensors override auto-resolved placeholders — if you supply a
-runtime input in `weights`, no zero-filled buffer is created for it.
+// 1. Assign initial data (lazy — no allocation yet)
+let input = inputs.remove("input").unwrap();
+input.assign(&Tensor::from_slice(&initial_data));
 
-Both variants can be combined:
+// 2. Compile the execution plan (resolves assigns, allocates buffers)
+let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+let mut plan = Tensor::prepare_batch(&mut outs)?;
+plan.execute()?;  // first run
 
-```rust
-let (inputs, outputs) = importer.trace_external_with_dims(
-    &graph,
-    weights,
-    &[("batch_size", 4)],
-)?;
+// 3. Fast loop: zero-copy writes via array_view_mut
+input.array_view_mut::<f32>()?[..new_data.len()].copy_from_slice(&new_data);
+plan.execute()?;
 ```
 
 ## Control Flow — If via Where
 
 ONNX `If` nodes execute both branches and merge results with
 `Tensor::where_()`. The condition selects elements lazily at runtime,
-enabling the trace-once / run-many pattern for models with data-dependent
+enabling the compile-once / run-many pattern for models with data-dependent
 branching (e.g., Silero VAD).
 
 Both branches must produce outputs with identical shapes and dtypes.
 Models with incompatible branches (e.g., expanded AffineGrid) are
-rejected at trace time.
+rejected at import time.
 
 ## Operator Support
 

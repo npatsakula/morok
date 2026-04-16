@@ -14,7 +14,7 @@ Morok का ONNX इम्पोर्टर मॉडल इन्फ़रे
 | 162 / 200 ONNX ऑपरेटर | [पैरिटी विवरण](https://github.com/patsak/morok/blob/main/onnx/PARITY.md) |
 | CNN आर्किटेक्चर (ResNet, DenseNet, VGG, ...) | 9 मॉडल सत्यापित |
 | Microsoft एक्सटेंशन (Attention, RotaryEmbedding) | समर्थित |
-| डायनामिक बैच साइज़ | अगली रिलीज़ में योजनाबद्ध |
+| डायनामिक बैच साइज़ | समर्थित (Variable API) |
 | ट्रेनिंग / बैकवर्ड पास | समर्थित नहीं |
 
 **दूसरे फ़्रेमवर्क से तुलना**
@@ -38,49 +38,47 @@ morok-tensor = { git = "https://github.com/patsak/morok" }
 उन मॉडलों के लिए जहाँ सभी इनपुट फ़ाइल में अंतर्निहित हैं (कोई रनटाइम इनपुट नहीं):
 
 ```rust
-use morok_onnx::OnnxImporter;
+use morok_onnx::{OnnxImporter, OnnxModel};
+use morok_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut importer = OnnxImporter::new();
-    let outputs = importer.import_path("model.onnx")?;
+    let OnnxModel { mut outputs, .. } = importer.import("model.onnx", &[])?;
 
-    // Each output is a lazy Tensor — realize to get data
+    // सभी आउटपुट एक साथ शेड्यूल करें, एक ही पास में एक्ज़ीक्यूट करें
+    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(&mut outs)?;
+
     for (name, tensor) in &outputs {
-        let result = tensor.realize()?;
-        println!("{name}: {:?}", result.to_ndarray::<f32>()?);
+        println!("{name}: {:?}", tensor.as_ndarray::<f32>()?);
     }
     Ok(())
 }
 ```
 
-### दो-चरणीय: रनटाइम इनपुट वाले मॉडल
+### रनटाइम इनपुट वाले मॉडल
 
-अधिकांश मॉडलों को रनटाइम डेटा (इमेज, टोकन, ऑडियो) की आवश्यकता होती है। दो-चरणीय API ग्राफ़ की तैयारी को एक्ज़ीक्यूशन से अलग करता है:
+अधिकांश मॉडलों को रनटाइम डेटा (इमेज, टोकन, ऑडियो) की आवश्यकता होती है। `OnnxModel` को destructure करें और इनपुट tensor की ownership लेने के लिए `remove()` इस्तेमाल करें:
 
 ```rust
-use morok_onnx::OnnxImporter;
+use morok_onnx::{OnnxImporter, OnnxModel};
+use morok_tensor::Tensor;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let importer = OnnxImporter::new();
+    let mut importer = OnnxImporter::new();
+    let OnnxModel { mut inputs, mut outputs, .. } = importer.import("model.onnx", &[])?;
 
-    // Phase 1: Parse structure (no execution)
-    let graph = importer.prepare(model_proto)?;
+    // इनपुट डेटा असाइन करें (lazy — अभी कोई एलोकेशन नहीं)
+    let input = inputs.remove("input").unwrap();
+    input.assign(&Tensor::from_slice(&my_data));
 
-    // Inspect what the model needs
-    for (name, spec) in &graph.inputs {
-        println!("{name}: shape={:?}, dtype={:?}", spec.shape, spec.dtype);
-    }
-
-    // Phase 2: Build lazy computation graph
-    let (inputs, outputs) = importer.trace(&graph)?;
-
-    // Execute
-    let result = outputs["output"].realize()?;
+    // सभी आउटपुट एक साथ शेड्यूल करें, एक ही पास में एक्ज़ीक्यूट करें
+    // (इनपुट के assign को इंटरनली रिज़ॉल्व करता है — अलग से realize की ज़रूरत नहीं)
+    let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+    Tensor::realize_batch(&mut outs)?;
     Ok(())
 }
 ```
-
-`prepare()` / `trace()` का विभाजन इसलिए है क्योंकि ग्राफ़ संरचना स्थिर होती है — आप इसे एक बार पार्स करते हैं और विभिन्न डायमेंशन बाइंडिंग या इनपुट डेटा के साथ कई बार ट्रेस कर सकते हैं।
 
 ---
 
@@ -90,23 +88,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 इम्पोर्टर ONNX मॉडलों को दो अलग-अलग चरणों में प्रोसेस करता है:
 
-**चरण 1 — `prepare()`:** कुछ भी एक्ज़ीक्यूट किए बिना ग्राफ़ टोपोलॉजी निकालता है। protobuf को पार्स करता है, इनिशियलाइज़र (वेट्स) को रनटाइम इनपुट से अलग करता है, opset वर्शन रिकॉर्ड करता है, और कंट्रोल फ़्लो सबग्राफ़ को प्री-पार्स करता है। एक `OnnxGraph` लौटाता है — एक हल्की संरचना जिसे आप एक्ज़ीक्यूशन शुरू करने से पहले जाँच सकते हैं।
-
-**चरण 2 — `trace()`:** ग्राफ़ को टोपोलॉजिकल क्रम में ट्रैवर्स करता है, प्रत्येक ONNX नोड को उसके Tensor इम्प्लीमेंटेशन पर डिस्पैच करता है। यह Morok का lazy कम्प्यूटेशन DAG बनाता है — अभी तक कोई वास्तविक गणना नहीं होती। परिणाम `Tensor` हैंडल का एक सेट होता है जो `realize()` करने पर पूरी पाइपलाइन के ज़रिए कम्पाइल और एक्ज़ीक्यूट होता है।
+**`import(path, dim_bindings)`** दोनों चरणों को एक ही कॉल में करता है: protobuf को पार्स करता है, इनिशियलाइज़र और इनपुट स्पेक्स निकालता है, ग्राफ़ को टोपोलॉजिकल क्रम में ट्रैवर्स करते हुए प्रत्येक ONNX नोड को उसके Tensor इम्प्लीमेंटेशन पर डिस्पैच करता है, और एक `OnnxModel { inputs, outputs, variables }` लौटाता है। कोई एक्ज़ीक्यूशन नहीं होता — रिज़ल्ट lazy `Tensor` हैंडल का सेट है जो `realize()` करने पर कम्पाइल और एक्ज़ीक्यूट होता है।
 
 ```text
-model.onnx → prepare() → OnnxGraph → trace() → lazy Tensors → realize() → results
-                 │                        │
-                 │ structure only         │ builds computation DAG
-                 │ (no execution)         │ (no execution)
-                 ▼                        ▼
-          Inspect inputs/outputs    Pass to optimizer/codegen
+model.onnx → import(path, dims) → OnnxModel { inputs, outputs, variables } → realize() → results
 ```
 
-इस अलगाव से कई फ़ायदे मिलते हैं:
-- **एक्ज़ीक्यूट करने से पहले जाँचें:** कुछ भी एलोकेट करने से पहले इनपुट शेप और DType जाँचें
-- **मल्टीपल ट्रेस:** विभिन्न डायनामिक डायमेंशन बाइंडिंग के साथ फिर से ट्रेस करें
-- **एक्सटर्नल वेट्स:** वेट्स अलग से लोड करें (बाहरी डेटा फ़ाइलों वाले मॉडलों के लिए उपयोगी)
+एडवांस्ड यूज़ केस के लिए (इम्पोर्ट से पहले ग्राफ़ स्ट्रक्चर जाँचना), `import_model()` एक पहले से पार्स्ड `ModelProto` स्वीकार करता है।
 
 ### ऑपरेटर विघटन
 
@@ -158,19 +146,21 @@ ONNX मॉडल प्रति डोमेन opset इम्पोर्ट
 
 ### डायनामिक डायमेंशन
 
-ONNX इनपुट में `"batch_size"` या `"sequence_length"` जैसे सिम्बॉलिक डायमेंशन हो सकते हैं। इन्हें ट्रेस टाइम पर बाइंड करें:
+ONNX इनपुट में `"batch_size"` या `"sequence_length"` जैसे सिम्बॉलिक डायमेंशन हो सकते हैं। इन्हें इम्पोर्ट टाइम पर `dim_bindings` पैरामीटर के ज़रिए बाइंड करें:
 
 ```rust
-let graph = importer.prepare(model)?;
+let model = importer.import("model.onnx", &[
+    ("batch_size", 1),
+    ("sequence_length", 512),
+])?;
 
-// Bind symbolic dims to concrete values
-let (inputs, outputs) = importer.trace_with_dims(
-    &graph,
-    &[("batch_size", 1), ("sequence_length", 512)],
-)?;
+// Variables are auto-extracted from dim_param annotations
+for (name, var) in &model.variables {
+    println!("{name}: bounds {:?}", var.bounds());
+}
 ```
 
-अनबाउंड डायनामिक डायमेंशन ट्रेस टाइम पर एक स्पष्ट एरर देते हैं। आप `InputSpec::shape` के ज़रिए जाँच सकते हैं कि कौन से डायमेंशन डायनामिक हैं:
+अनबाउंड डायनामिक डायमेंशन इम्पोर्ट टाइम पर एक स्पष्ट एरर देते हैं। आप `InputSpec::shape` के ज़रिए जाँच सकते हैं कि कौन से डायमेंशन डायनामिक हैं:
 
 ```rust
 for (name, spec) in &graph.inputs {
@@ -185,11 +175,12 @@ for (name, spec) in &graph.inputs {
 
 ### एक्सटर्नल वेट्स
 
-कुछ ONNX मॉडल वेट्स अलग फ़ाइलों में स्टोर करते हैं। इन्हें प्रदान करने के लिए `trace_external()` का उपयोग करें:
+कुछ ONNX मॉडल वेट्स अलग फ़ाइलों में स्टोर करते हैं। इन्हें प्रदान करने के लिए `import_model_with_inputs()` का उपयोग करें:
 
 ```rust
-let (inputs, outputs) = importer.trace_external(
-    &graph,
+let model = importer.import_model_with_inputs(
+    "model.onnx",
+    &[],
     external_weights,  // HashMap<String, Tensor>
 )?;
 ```
@@ -230,9 +221,43 @@ Morok:   then_result.where_(&condition, &else_result)
 
 इटरेटिव कंट्रोल फ़्लो (`Loop`, `Scan`) इम्प्लीमेंट नहीं है। इन ऑपरेटरों को बार-बार ट्रेसिंग या अनरोलिंग की आवश्यकता होती है, जो सिंगल-ट्रेस आर्किटेक्चर से टकराता है। रिकरेंट पैटर्न उपयोग करने वाले मॉडल आमतौर पर अनरोल्ड ऑपरेटरों के ज़रिए काम करते हैं (LSTM, GRU, RNN नेटिव ops के रूप में इम्प्लीमेंट हैं)।
 
-### कोई बैचिंग नहीं (अभी)
+### बैच एक्ज़ीक्यूशन
 
-डायनामिक बैचिंग — एक साथ कई इनपुट पर इन्फ़रेंस चलाना — अगली रिलीज़ के लिए योजनाबद्ध है। वर्तमान में, बैच डायमेंशन को `trace_with_dims()` के ज़रिए ट्रेस टाइम पर एक निश्चित मान पर बाइंड करना होगा।
+कई tensor को एक साथ realize किया जा सकता है, जिससे आउटपुट के बीच कम्प्यूटेशन शेयर होता है
+(`tensor/src/test/unit/batch.rs` में टेस्ट किया गया):
+
+```rust
+// Realize all outputs at once (shares compilation and execution)
+let mut outputs: Vec<&mut Tensor> = model.outputs.values_mut().collect();
+Tensor::realize_batch(&mut outputs)?;
+```
+
+बार-बार इन्फ़रेंस के लिए, prepare/execute पैटर्न इस्तेमाल करें
+(`tensor/src/test/unit/variable.rs::test_prepare_execute_loop` में टेस्ट किया गया):
+
+```rust
+let OnnxModel { mut inputs, mut outputs, variables } =
+    importer.import("model.onnx", &[("batch", 1)])?;
+
+// 1. Assign initial data (lazy — no allocation yet)
+let input = inputs.remove("audio").unwrap();
+input.assign(&Tensor::from_slice(&first_frame));
+
+// 2. Compile the execution plan (resolves assigns, allocates buffers)
+let mut outs: Vec<&mut Tensor> = outputs.values_mut().collect();
+let mut plan = Tensor::prepare_batch(&mut outs)?;
+plan.execute()?;  // first run
+
+// 3. Fast loop: zero-copy writes via array_view_mut, no recompilation
+for frame in audio_frames {
+    input.array_view_mut::<f32>()?[..frame.len()].copy_from_slice(&frame);
+    plan.execute()?;
+}
+
+// Re-execute with different variable bindings
+let bound = variables["batch"].bind(8)?;
+plan.execute_with_vars(&[bound.as_var_val()])?;
+```
 
 ### कोई ट्रेनिंग नहीं
 
@@ -266,19 +291,18 @@ RUST_LOG=morok_onnx::importer=trace cargo run
 
 ### ग्राफ़ का निरीक्षण
 
-ट्रेसिंग से पहले मॉडल को क्या चाहिए, यह जानने के लिए `OnnxGraph` यूज़ करें:
+मॉडल को क्या चाहिए, यह जानने के लिए `OnnxModel` स्ट्रक्चर इस्तेमाल करें:
 
 ```rust
-let graph = importer.prepare(model)?;
+let model = importer.import("model.onnx", &[])?;
 
 println!("Inputs:");
-for (name, spec) in &graph.inputs {
-    println!("  {name}: {:?} {:?}", spec.shape, spec.dtype);
+for (name, tensor) in &model.inputs {
+    println!("  {name}: {:?}", tensor.shape());
 }
 
-println!("Outputs: {:?}", graph.output_names());
-println!("Nodes: {}", graph.nodes.len());
-println!("Initializers: {}", graph.initializers.len());
+println!("Outputs: {:?}", model.outputs.keys().collect::<Vec<_>>());
+println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 ```
 
 ---
@@ -288,12 +312,12 @@ println!("Initializers: {}", graph.initializers.len());
 | पहलू | विवरण |
 |------|-------|
 | **एंट्री पॉइंट** | `OnnxImporter::new()` |
-| **सरल इम्पोर्ट** | `importer.import_path("model.onnx")?` |
-| **दो-चरणीय** | `prepare()` → `trace()` / `trace_with_dims()` |
+| **सरल इम्पोर्ट** | `importer.import("model.onnx", &[])?` |
+| **डायनामिक dims** | `importer.import(path, &[("batch", 4)])?` |
 | **ऑपरेटर** | 162 / 200 ([पूर्ण पैरिटी तालिका](https://github.com/patsak/morok/blob/main/onnx/PARITY.md)) |
 | **सत्यापित मॉडल** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
 | **बैकएंड** | Clang + LLVM (समान परिणाम) |
 | **एक्सटेंशन** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
-| **सीमाएँ** | कोई ट्रेनिंग नहीं, कोई बैचिंग नहीं (अभी), कोई Loop/Scan नहीं, शेप-पॉलीमॉर्फ़िक If |
+| **सीमाएँ** | कोई ट्रेनिंग नहीं, कोई Loop/Scan नहीं, शेप-पॉलीमॉर्फ़िक If |
 
 **आगे:** [प्रैक्टिकल उदाहरण](./examples) — tensor बेसिक्स, या [एक्ज़ीक्यूशन पाइपलाइन](./architecture/pipeline) — कम्पाइलेशन कैसे काम करता है।

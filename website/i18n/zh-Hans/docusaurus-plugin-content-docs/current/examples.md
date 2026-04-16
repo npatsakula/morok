@@ -35,11 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Lazy operations (no execution yet)
     let sum = &a + &b;
-    let scaled = &sum * &Tensor::from_slice([0.1f32]);
+    let mut scaled = &sum * &Tensor::from_slice([0.1f32]);
 
     // Execute and get results
-    let result = scaled.realize()?;
-    let data = result.to_ndarray::<f32>()?;
+    scaled.realize()?;
+    let data = scaled.as_ndarray::<f32>()?;
     println!("Result: {:?}", data);
     // Output: [1.1, 2.2, 3.3, 4.4]
 
@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
    - 生成优化后的代码
    - 在目标设备上执行
 
-4. `to_ndarray()` 将结果提取为 `ndarray::ArrayD` 以供查看。
+4. `as_ndarray()` 将结果提取为 `ndarray::ArrayD` 以供查看。
 
 **试试看：** 去掉 `realize()` 调用。代码仍能运行，但 `data` 会是空的——什么都没有被计算。
 
@@ -92,10 +92,10 @@ fn shape_example() -> Result<(), Box<dyn std::error::Error>> {
     // [3, 2] + [1, 2] → [3, 2]
     let bias = Tensor::from_slice([100.0f32, 200.0])
         .try_reshape(&[1, 2])?;
-    let biased = &transposed + &bias;
+    let mut biased = &transposed + &bias;
 
-    let result = biased.realize()?;
-    println!("{:?}", result.to_ndarray::<f32>()?);
+    biased.realize()?;
+    println!("{:?}", biased.as_ndarray::<f32>()?);
     // [[101, 204],
     //  [102, 205],
     //  [103, 206]]
@@ -151,11 +151,11 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
     ]);
 
     // Matrix multiply: [4, 3] @ [3, 2] → [4, 2]
-    let output = input.dot(&weights)?;
+    let mut output = input.dot(&weights)?;
 
-    let result = output.realize()?;
-    println!("Output shape: {:?}", result.shape());  // [4, 2]
-    println!("{:?}", result.to_ndarray::<f32>()?);
+    output.realize()?;
+    println!("Output shape: {:?}", output.shape()?);  // [4, 2]
+    println!("{:?}", biased.as_ndarray::<f32>()?);
     // Each row: weighted sum of that sample's features
 
     Ok(())
@@ -177,52 +177,23 @@ fn matmul_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 示例 4：构建线性层
 
-线性层计算 `y = x @ W.T + b`。我们从头构建一个。
+线性层计算 `y = x @ W.T + b`。Morok 提供了开箱即用的 `nn::Linear`。
 
 ```rust
-use morok_tensor::{Tensor, Error};
-
-struct Linear {
-    weight: Tensor,  // shape: [out_features, in_features]
-    bias: Tensor,    // shape: [out_features]
-}
-
-impl Linear {
-    fn new(in_features: usize, out_features: usize) -> Self {
-        // Simple initialization (real code would use proper random init)
-        let weight_data: Vec<f32> = (0..in_features * out_features)
-            .map(|i| (i as f32 * 0.1).sin() * 0.1)
-            .collect();
-        let bias_data = vec![0.0f32; out_features];
-
-        Self {
-            weight: Tensor::from_slice(weight_data)
-                .try_reshape(&[out_features as isize, in_features as isize])
-                .expect("reshape failed"),
-            bias: Tensor::from_slice(bias_data),
-        }
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, Error> {
-        // y = x @ W.T + b
-        let weight_t = self.weight.try_transpose(0, 1)?;
-        let out = x.dot(&weight_t)?;
-        Ok(&out + &self.bias)
-    }
-}
+use morok_tensor::{Tensor, nn::{Linear, Layer}};
 
 fn linear_example() -> Result<(), Box<dyn std::error::Error>> {
     // Create a layer: 4 inputs → 2 outputs
-    let layer = Linear::new(4, 2);
+    let layer = Linear::with_dims(4, 2, morok_dtype::DType::Float32);
 
     // Single sample with 4 features
     let input = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
 
     // Forward pass
-    let output = layer.forward(&input)?;
+    let mut output = layer.forward(&input)?;
 
-    let result = output.realize()?;
-    println!("Output: {:?}", result.to_ndarray::<f32>()?);
+    output.realize()?;
+    println!("Output: {:?}", biased.as_ndarray::<f32>()?);
 
     Ok(())
 }
@@ -241,42 +212,15 @@ PyTorch 惯例将权重存储为 `[out_features, in_features]`。对于一个 4 
 
 ## 示例 5：MNIST 分类器
 
-构建一个完整的神经网络，可以对手写数字进行分类。
+使用 `sequential()` 链接层，构建一个完整的神经网络。
 
 ```rust
-/// Two-layer neural network for MNIST
-/// Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
-struct MnistNet {
-    fc1: Linear,
-    fc2: Linear,
-}
-
-impl MnistNet {
-    fn new() -> Self {
-        Self {
-            fc1: Linear::new(784, 128),
-            fc2: Linear::new(128, 10),
-        }
-    }
-
-    fn forward(&self, x: &Tensor) -> Result<Tensor, Error> {
-        // Layer 1: linear + ReLU activation
-        let x = self.fc1.forward(x)?;
-        let x = x.relu()?;
-
-        // Layer 2: linear (no activation — raw logits)
-        self.fc2.forward(&x)
-    }
-
-    fn predict(&self, x: &Tensor) -> Result<Tensor, Error> {
-        let logits = self.forward(x)?;
-        // Convert logits to probabilities
-        logits.softmax(-1)
-    }
-}
+use morok_tensor::{Tensor, nn::{Linear, Relu, Layer}};
 
 fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
-    let model = MnistNet::new();
+    // Architecture: 784 (28×28 pixels) → 128 (hidden) → 10 (digits)
+    let fc1 = Linear::with_dims(784, 128, morok_dtype::DType::Float32);
+    let fc2 = Linear::with_dims(128, 10, morok_dtype::DType::Float32);
 
     // Simulate a 28×28 grayscale image (flattened to 784)
     let fake_image: Vec<f32> = (0..784)
@@ -285,18 +229,18 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
     let input = Tensor::from_slice(fake_image)
         .try_reshape(&[1, 784])?;  // batch size 1
 
-    // Forward pass
-    let logits = model.forward(&input)?;
-    let probs = logits.softmax(-1)?;
+    // Forward pass: linear → ReLU → linear
+    let logits = input.sequential(&[&fc1, &Relu, &fc2])?;
+    let mut probs = logits.softmax(-1)?;
 
     // Get results
-    let probs_result = probs.realize()?;
-    println!("Probabilities: {:?}", probs_result.to_ndarray::<f32>()?);
+    probs.realize()?;
+    println!("Probabilities: {:?}", probs_biased.as_ndarray::<f32>()?);
 
     // Get predicted class
-    let prediction = logits.argmax(Some(-1))?;
-    let pred_result = prediction.realize()?;
-    println!("Predicted digit: {:?}", pred_result.to_ndarray::<i32>()?);
+    let mut prediction = logits.argmax(Some(-1))?;
+    prediction.realize()?;
+    println!("Predicted digit: {:?}", pred_output.as_ndarray::<i32>()?);
 
     Ok(())
 }
@@ -304,13 +248,15 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 **核心概念：**
 
-1. **ReLU 激活函数：** `x.relu()` 返回 `max(0, x)`。它引入非线性——没有它的话，堆叠线性层只相当于一个大的线性层。
+1. **`sequential()`** 将层串联起来：每层的输出自动作为下一层的输入。无需手动连线。
 
-2. **Logits 与概率：** 最后一层的原始输出（logits）可以是任意实数。`softmax()` 将它们转换为总和为 1 的概率。
+2. **ReLU 激活函数：** `Relu` 是一个零大小的层，应用 `max(0, x)`。它引入非线性——没有它的话，堆叠线性层只相当于一个大的线性层。
 
-3. **argmax：** 返回最大值的索引——即预测的类别。
+3. **Logits 与概率：** 最后一层的原始输出（logits）可以是任意实数。`softmax()` 将它们转换为总和为 1 的概率。
 
-4. **批维度：** 单张图像使用形状 `[1, 784]`。如果有 32 张图像，使用 `[32, 784]`。模型会自动处理批次。
+4. **argmax：** 返回最大值的索引——即预测的类别。
+
+5. **批维度：** 单张图像使用形状 `[1, 784]`。如果有 32 张图像，使用 `[32, 784]`。模型会自动处理批次。
 
 ---
 
@@ -320,24 +266,20 @@ fn mnist_example() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
-    let a = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    let b = Tensor::from_slice([4.0f32, 5.0, 6.0]);
-    let c = &a + &b;
+    let a = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    let b = Tensor::from_slice(&[4.0f32, 5.0, 6.0]);
+    let mut c = &a + &b;
 
     // Print the computation graph (before compilation)
     println!("=== IR Graph ===");
     println!("{}", c.uop().tree());
 
-    // Compile and execute
-    let result = c.realize()?;
+    // Compile and inspect the execution plan
+    let plan = c.prepare()?;
+    println!("\nKernels: {}", plan.kernels().count());
 
-    // Inspect generated kernels
-    println!("\n=== Generated Kernels ===");
-    for (i, kernel) in result.kernels().iter().enumerate() {
-        println!("Kernel {}: {}", i, kernel.name);
-        println!("Backend: {}", kernel.backend);
-        println!("Code:\n{}\n", kernel.code);
-    }
+    // Execute
+    plan.execute()?;
 
     Ok(())
 }
@@ -367,9 +309,12 @@ fn inspect_compilation() -> Result<(), Box<dyn std::error::Error>> {
 | 重塑形状 | `t.try_reshape(&[2, 3])?` |
 | 转置 | `t.try_transpose(0, 1)?` |
 | 矩阵乘法 | `a.dot(&b)?` |
+| 线性层 | `Linear::with_dims(in, out, dtype)` |
+| 层链接 | `x.sequential(&[&fc1, &Relu, &fc2])?` |
 | 激活函数 | `t.relu()?`, `t.softmax(-1)?` |
 | 执行 | `t.realize()?` |
-| 提取数据 | `result.to_ndarray::<f32>()?` |
+| 批量 realize | `Tensor::realize_batch(&mut [&mut a, &mut b])?` |
+| 提取数据 | `biased.as_ndarray::<f32>()?` |
 
 **惰性求值模式：**
 
