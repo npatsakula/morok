@@ -46,7 +46,11 @@
         mkShell = pkgs.mkShell.override { inherit stdenv; };
         crane' = (crane.mkLib pkgs).overrideToolchain (pkgs.rust_stable);
 
-        sourceFilter = path: type: (pkgs.lib.hasSuffix ".proto" path) || (crane'.filterCargoSources path type);
+        sourceFilter =
+          path: type:
+          (crane'.filterCargoSources path type)
+          || (pkgs.lib.hasSuffix ".proto" path)
+          || (pkgs.lib.hasSuffix ".onnx" path);
 
         src = pkgs.lib.cleanSourceWith {
           src = ./.;
@@ -116,7 +120,7 @@
           );
 
           # audit = crane'.cargoAudit {
-            # inherit src advisory-db;
+          # inherit src advisory-db;
           # };
 
           rustfmt = crane'.cargoFmt { inherit src; };

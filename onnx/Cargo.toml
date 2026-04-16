@@ -27,7 +27,7 @@ ndarray.workspace = true
 proptest = "1.11"
 test-case = "3.3.1"
 morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.1", features = [
-    "testing",
+  "testing",
 ] }
 morok-runtime = { path = "../runtime" }
 

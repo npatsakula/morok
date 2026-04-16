@@ -23,7 +23,10 @@ rayon = "1.11"
 tracing = "0.1"
 libloading = { version = "0.8", optional = true }
 tempfile = { version = "3", optional = true }
-object = { version = "0.38", default-features = false, features = ["read", "elf"] }
+object = { version = "0.38", default-features = false, features = [
+  "elf",
+  "read",
+] }
 memmap2 = "0.9"
 melior = { version = "0.26.3", features = ["ods-dialects"], optional = true }
 libffi = "5.1.0"

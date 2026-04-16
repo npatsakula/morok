@@ -10,7 +10,9 @@ description = "Intermediate representation for the Morok ML compiler"
 readme = "README.md"
 
 [dependencies]
-morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.1", features = ["serde"] }
+morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.1", features = [
+  "serde",
+] }
 morok-macros = { path = "../macros", version = "=0.1.0-alpha.1" }
 smallvec = { workspace = true, features = ["serde"] }
 snafu = "0.8.9"

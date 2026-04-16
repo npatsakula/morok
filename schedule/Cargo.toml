@@ -27,7 +27,10 @@ z3 = { version = "0.19", optional = true }
 proptest-derive = { version = "0.7", optional = true }
 snafu = "0.8.9"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+tracing-subscriber = { version = "0.3", features = [
+  "env-filter",
+  "json",
+], optional = true }
 itertools = "0.14.0"
 indexmap = "2.13.0"
 
@@ -46,5 +49,7 @@ webgpu = ["morok-device/webgpu"]
 
 [dev-dependencies]
 proptest = "1.9.0"
-morok-ir = { path = "../ir", version = "=0.1.0-alpha.1", features = ["proptest"] }
+morok-ir = { path = "../ir", version = "=0.1.0-alpha.1", features = [
+  "proptest",
+] }
 test-case = "3.3.1"
