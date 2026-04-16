@@ -19,7 +19,7 @@ name = "morok"
 [workspace.package]
 authors = ["Patsakula Nikita <nikita.patsakula@gmail.com>"]
 edition = "2024"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 license = "MIT"
 repository = "https://github.com/npatsakula/morok"
 

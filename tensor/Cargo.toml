@@ -10,12 +10,12 @@ description = "High-level lazy tensor API for the Morok ML compiler"
 readme = "README.md"
 
 [dependencies]
-morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.1" }
-morok-ir = { path = "../ir", version = "=0.1.0-alpha.1" }
-morok-device = { path = "../device", version = "=0.1.0-alpha.1" }
-morok-codegen = { path = "../codegen", version = "=0.1.0-alpha.1" }
-morok-runtime = { path = "../runtime", version = "=0.1.0-alpha.1" }
-morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.1" }
+morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.2" }
+morok-ir = { path = "../ir", version = "=0.1.0-alpha.2" }
+morok-device = { path = "../device", version = "=0.1.0-alpha.2" }
+morok-codegen = { path = "../codegen", version = "=0.1.0-alpha.2" }
+morok-runtime = { path = "../runtime", version = "=0.1.0-alpha.2" }
+morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.2" }
 once_cell = "1.21.3"
 snafu = "0.8.9"
 bon = "3.8"
@@ -35,7 +35,7 @@ tracing-verbose = []
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 test-case = "3.3.1"
-morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.1", features = [
+morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.2", features = [
   "testing",
 ] }
 proptest = "1.11.0"

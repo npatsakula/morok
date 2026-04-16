@@ -9,9 +9,9 @@ description = "ONNX model importer for the Morok ML compiler"
 readme = "README.md"
 
 [dependencies]
-morok-tensor = { path = "../tensor", version = "=0.1.0-alpha.1" }
-morok-ir = { path = "../ir", version = "=0.1.0-alpha.1" }
-morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.1" }
+morok-tensor = { path = "../tensor", version = "=0.1.0-alpha.2" }
+morok-ir = { path = "../ir", version = "=0.1.0-alpha.2" }
+morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.2" }
 prost = "0.14"
 snafu = "0.9"
 tracing = "0.1"
@@ -26,7 +26,7 @@ prost-build = "0.14"
 ndarray.workspace = true
 proptest = "1.11"
 test-case = "3.3.1"
-morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.1", features = [
+morok-schedule = { path = "../schedule", version = "=0.1.0-alpha.2", features = [
   "testing",
 ] }
 morok-runtime = { path = "../runtime" }
