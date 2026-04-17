@@ -4,7 +4,7 @@ use std::sync::Arc;
 use morok_device::Buffer;
 use morok_dtype::DType;
 use morok_dtype::ext::HasDType;
-use morok_ir::{ConstValue, DeviceSpec, Op, SInt, UOp, shape::Shape};
+use morok_ir::{ConstValue, ConstValueHash, DeviceSpec, Op, SInt, UOp, shape::Shape};
 use snafu::ResultExt;
 
 /// Extract max value from an SInt for buffer allocation.
@@ -145,6 +145,7 @@ impl Clone for Tensor {
     }
 }
 
+#[bon]
 impl Tensor {
     /// Create tensor without buffer (for lazy computation graphs).
     fn new(uop: Arc<UOp>) -> Self {
@@ -346,39 +347,73 @@ impl Tensor {
 
     /// Create 1D tensor with evenly spaced values and explicit dtype.
     ///
-    /// Generates values in the range `[start, stop)` with given step size.
-    /// If `stop` is None, treats `start` as stop and starts from 0.
-    ///
-    /// Uses lazy `full(step)._cumalu(0, Add) + (start - step)` which
-    /// `reduce_collapse` simplifies into `RANGE * step + offset`.
-    /// Create 1D tensor with evenly spaced values (integer parameters).
-    ///
     /// Matches Tinygrad's `Tensor.arange()`: `full(step) → cumsum → + (start - step)`.
-    pub fn arange_with_dtype(start: i64, stop: Option<i64>, step: Option<i64>, dtype: DType) -> Result<Self> {
+    /// Accepts concrete `i64` or symbolic `Arc<UOp>` for start/stop/step.
+    /// If `stop` is None, treats `start` as stop and starts from 0.
+    #[builder]
+    pub fn arange_with_dtype(
+        start: Arc<UOp>,
+        stop: Option<Arc<UOp>>,
+        dtype: DType,
+        #[builder(default = UOp::const_(dtype.clone(), ConstValue::one(dtype.base())))] step: Arc<UOp>,
+    ) -> Result<Self> {
         let (start, stop) = match stop {
             Some(s) => (start, s),
-            None => (0, start),
+            None => (UOp::const_(dtype.clone(), ConstValue::zero(dtype.base())), start),
         };
-        let step = step.unwrap_or(1);
-        if step == 0 {
-            return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
-        }
-        Self::arange_inner(start as f64, stop as f64, step as f64, dtype, false)
+
+        let step_tensor = if let Op::Const(ConstValueHash(ConstValue::Int(start))) = start.op()
+            && let Op::Const(ConstValueHash(ConstValue::Int(stop))) = stop.op()
+            && let Op::Const(ConstValueHash(s @ ConstValue::Int(step))) = step.op()
+        {
+            let diff = stop - start;
+            let ceildiv = ((diff as f64) / (*step as f64)).ceil() as i64;
+            if ceildiv <= 0 {
+                return Ok(Self::empty_zero(dtype));
+            }
+
+            Self::full(&[ceildiv as usize], *s, dtype.clone())?
+        } else {
+            let diff = stop.sub(&start);
+            let one = UOp::const_(dtype.clone(), ConstValue::one(dtype.base()));
+            let ceildiv = diff.add(&step.sub(&one)).idiv(&step);
+            let output_len_sint = SInt::from(ceildiv.clone());
+            let ones: Shape = vec![SInt::Const(1)].into();
+            let target: Shape = vec![output_len_sint].into();
+            let reshaped = step.try_reshape(&ones).unwrap();
+            Self::new(reshaped.try_expand(&target).unwrap())
+        };
+
+        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
+        let offset = Self::new(start.sub(&step));
+        cumsum.try_add(&offset)?.cast(dtype)
     }
 
     /// Create 1D tensor with evenly spaced Int32 values.
     pub fn arange(start: i64, stop: Option<i64>, step: Option<i64>) -> Result<Self> {
-        Self::arange_with_dtype(start, stop, step, DType::Int32)
+        let dtype = DType::Int32;
+        Self::arange_with_dtype()
+            .start(UOp::const_(dtype.clone(), ConstValue::Int(start)))
+            .maybe_stop(stop.map(|s| UOp::const_(dtype.clone(), ConstValue::Int(s))))
+            .maybe_step(step.map(|s| UOp::const_(dtype.clone(), ConstValue::Int(s))))
+            .dtype(dtype)
+            .call()
     }
 
     /// Create 1D tensor with evenly spaced values (float parameters).
-    ///
-    /// Handles float start/stop/step natively, matching Tinygrad's `Tensor.arange()`.
     pub fn arange_f64(start: f64, stop: f64, step: f64, dtype: DType) -> Result<Self> {
         if step == 0.0 {
             return Err(Error::SymbolicShapeUnsupported { operation: "arange with step=0".to_string() });
         }
-        Self::arange_inner(start, stop, step, dtype, true)
+        let count = ((stop - start) / step).ceil() as i64;
+        if count <= 0 {
+            return Ok(Self::empty_zero(dtype));
+        }
+        let count = count as usize;
+        let step_tensor = Self::full(&[count], ConstValue::Float(step), dtype.clone())?;
+        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
+        let offset = Self::const_(ConstValue::Float(start - step), dtype.clone());
+        cumsum.try_add(&offset)?.cast(dtype)
     }
 
     /// Create 1D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
@@ -391,22 +426,8 @@ impl Tensor {
         }
         let t = Self::arange(steps as i64, None, None)?;
         let scale = Self::const_((end - start) / (steps as f64 - 1.0), DType::Float64);
-        let offset = Self::const_(start, DType::Float64);
+        let offset = Tensor::const_(start, DType::Float64);
         t.cast(DType::Float64)?.try_mul(&scale)?.try_add(&offset)?.cast(dtype)
-    }
-
-    /// Shared implementation: `full(count, step) → cumsum → + (start - step)`.
-    fn arange_inner(start: f64, stop: f64, step: f64, dtype: DType, is_float: bool) -> Result<Self> {
-        let count = ((stop - start) / step).ceil() as i64;
-        if count <= 0 {
-            return Ok(Self::empty_zero(dtype));
-        }
-        let count = count as usize;
-        let val = |v: f64| if is_float { ConstValue::Float(v) } else { ConstValue::Int(v as i64) };
-        let step_tensor = Self::full(&[count], val(step), dtype.clone())?;
-        let cumsum = step_tensor._cumalu(0, CumReduceOp::Add)?;
-        let offset = Self::const_(val(start - step), dtype.clone());
-        cumsum.try_add(&offset)?.cast(dtype)
     }
 
     // === Constant Constructors ===

@@ -150,6 +150,16 @@ impl ExecutionPlan {
         &self.buffers
     }
 
+    /// Get mutable access to all buffers owned by this plan.
+    pub fn buffers_mut(&mut self) -> &mut [Buffer] {
+        &mut self.buffers
+    }
+
+    /// Get a mutable buffer by its index in the buffers array.
+    pub fn buffer_at_mut(&mut self, index: usize) -> Option<&mut Buffer> {
+        self.buffers.get_mut(index)
+    }
+
     /// Get all prepared kernels.
     pub fn prepared_kernels(&self) -> &[PreparedKernel] {
         &self.kernels

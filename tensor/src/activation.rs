@@ -317,6 +317,20 @@ impl Tensor {
         self.swish()
     }
 
+    /// Gated Linear Unit: splits `self` along `dim` into two halves,
+    /// returns `first_half * sigmoid(second_half)`.
+    pub fn glu(&self, dim: isize) -> Result<Self> {
+        let shape = self.shape()?;
+        let ndim = shape.len();
+        let axis = if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize };
+        let full_size = shape[axis].as_const().expect("GLU dim must be concrete");
+        assert!(full_size % 2 == 0, "GLU dimension must be even, got {full_size}");
+        let half = full_size / 2;
+        let halves = self.split(&[half, half], dim)?;
+        let gate = halves[1].sigmoid()?;
+        halves[0].try_mul(&gate)
+    }
+
     /// Softplus: `log(1 + exp(beta*x)) / beta`, numerically stable via logaddexp.
     pub fn softplus(&self, beta: f64) -> Result<Self> {
         let beta_t = self.broadcast_scalar(ConstValue::Float(beta))?;

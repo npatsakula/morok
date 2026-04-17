@@ -1,0 +1,54 @@
+{
+  "model_type": "gigaam",
+  "cfg": {
+    "model": {
+      "cfg": {
+        "model_class": "ctc",
+        "sample_rate": 16000,
+        "preprocessor": {
+          "_target_": "modeling_gigaam.FeatureExtractor",
+          "sample_rate": 16000,
+          "features": 64,
+          "win_length": 320,
+          "hop_length": 160,
+          "mel_scale": "htk",
+          "n_fft": 320,
+          "mel_norm": null,
+          "center": false
+        },
+        "encoder": {
+          "_target_": "modeling_gigaam.ConformerEncoder",
+          "feat_in": 64,
+          "n_layers": 16,
+          "d_model": 768,
+          "subsampling": "conv1d",
+          "subs_kernel_size": 5,
+          "subsampling_factor": 4,
+          "ff_expansion_factor": 4,
+          "self_attention_model": "rotary",
+          "pos_emb_max_len": 5000,
+          "n_heads": 16,
+          "conv_kernel_size": 5,
+          "flash_attn": false,
+          "conv_norm_type": "layer_norm"
+        },
+        "head": {
+          "_target_": "modeling_gigaam.CTCHead",
+          "feat_in": 768,
+          "num_classes": 34
+        },
+        "decoding": {
+          "_target_": "modeling_gigaam.CTCGreedyDecoding",
+          "vocabulary": [
+            " ", "а", "б", "в", "г", "д", "е", "ж", "з", "и",
+            "й", "к", "л", "м", "н", "о", "п", "р", "с", "т",
+            "у", "ф", "х", "ц", "ч", "ш", "щ", "ъ", "ы", "ь",
+            "э", "ю", "я"
+          ]
+        },
+        "model_name": "v3_ctc"
+      },
+      "_target_": "modeling_gigaam.GigaAMASR"
+    }
+  }
+}

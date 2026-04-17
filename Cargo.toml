@@ -5,7 +5,7 @@ members = [
   "device",
   "dtype",
   "ir",
-  "macros",
+  "macros", "model",
   "onnx",
   "runtime",
   "schedule",

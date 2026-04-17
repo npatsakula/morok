@@ -14,7 +14,7 @@ mod shape;
 mod transformer;
 
 use morok_dtype::{DType, ScalarDType};
-use morok_ir::{ConstValue, SInt};
+use morok_ir::{ConstValue, IntoUOp, SInt};
 use morok_tensor::Tensor;
 use morok_tensor::reduce::AxisSpec;
 
@@ -320,7 +320,12 @@ impl OpRegistry {
                     let start = tensor_to_i64_vec(start_t)?[0];
                     let limit = tensor_to_i64_vec(inp(inputs, 1))?[0];
                     let delta = tensor_to_i64_vec(inp(inputs, 2))?[0];
-                    Tensor::arange_with_dtype(start, Some(limit), Some(delta), out_dtype)?
+                    Tensor::arange_with_dtype()
+                        .start(start.into_uop(DType::Int64))
+                        .stop(limit.into_uop(DType::Int64))
+                        .step(delta.into_uop(DType::Int64))
+                        .dtype(out_dtype)
+                        .call()?
                 }]
             }
             "ConstantOfShape" => {
