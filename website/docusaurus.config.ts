@@ -51,7 +51,7 @@ const config: Config = {
       {
         docs: {
           sidebarPath: "./sidebars.ts",
-          editUrl: "https://github.com/patsak/morok/edit/main/website/",
+          editUrl: "https://github.com/npatsakula/morok/edit/main/website/",
         },
         blog: false,
         theme: {
@@ -84,7 +84,7 @@ const config: Config = {
           position: "right",
         },
         {
-          href: "https://github.com/patsak/morok",
+          href: "https://github.com/npatsakula/morok",
           label: "GitHub",
           position: "right",
         },

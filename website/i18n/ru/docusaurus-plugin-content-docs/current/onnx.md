@@ -11,7 +11,7 @@ ONNX-импортёр Morok — рекомендуемый способ инфе
 | Возможность | Статус |
 |-------------|--------|
 | Прямой инференс | Поддерживается |
-| 162 / 200 операторов ONNX | [Таблица паритета](https://github.com/patsak/morok/blob/main/onnx/PARITY.md) |
+| 162 / 200 операторов ONNX | [Таблица паритета](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md) |
 | CNN-архитектуры (ResNet, DenseNet, VGG, ...) | Проверено 9 моделей |
 | Расширения Microsoft (Attention, RotaryEmbedding) | Поддерживается |
 | Динамический размер батча | Поддерживается (Variable API) |
@@ -29,8 +29,8 @@ ONNX-импортёр Morok — рекомендуемый способ инфе
 
 ```toml
 [dependencies]
-morok-onnx = { git = "https://github.com/patsak/morok" }
-morok-tensor = { git = "https://github.com/patsak/morok" }
+morok-onnx = { git = "https://github.com/npatsakula/morok" }
+morok-tensor = { git = "https://github.com/npatsakula/morok" }
 ```
 
 ### Простой вариант: модели со встроенными весами
@@ -314,7 +314,7 @@ println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 | **Точка входа** | `OnnxImporter::new()` |
 | **Простой импорт** | `importer.import("model.onnx", &[])?` |
 | **Динамические размерности** | `importer.import(path, &[("batch", 4)])?` |
-| **Операторы** | 162 / 200 ([полная таблица паритета](https://github.com/patsak/morok/blob/main/onnx/PARITY.md)) |
+| **Операторы** | 162 / 200 ([полная таблица паритета](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md)) |
 | **Проверенные модели** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
 | **Бэкенды** | Clang + LLVM (идентичные результаты) |
 | **Расширения** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |

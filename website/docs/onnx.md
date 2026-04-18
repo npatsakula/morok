@@ -11,7 +11,7 @@ Morok's ONNX importer is the recommended way to run model inference. It loads st
 | Capability | Status |
 |------------|--------|
 | Forward inference | Supported |
-| 162 / 200 ONNX operators | [Parity details](https://github.com/patsak/morok/blob/main/onnx/PARITY.md) |
+| 162 / 200 ONNX operators | [Parity details](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md) |
 | CNN architectures (ResNet, DenseNet, VGG, ...) | 9 models validated |
 | Microsoft extensions (Attention, RotaryEmbedding) | Supported |
 | Dynamic batch size | Supported (Variable API) |
@@ -29,8 +29,8 @@ Add `morok-onnx` and `morok-tensor` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-morok-onnx = { git = "https://github.com/patsak/morok" }
-morok-tensor = { git = "https://github.com/patsak/morok" }
+morok-onnx = { git = "https://github.com/npatsakula/morok" }
+morok-tensor = { git = "https://github.com/npatsakula/morok" }
 ```
 
 ### Simple: All-Initializer Models
@@ -315,7 +315,7 @@ println!("Variables: {:?}", model.variables.keys().collect::<Vec<_>>());
 | **Entry point** | `OnnxImporter::new()` |
 | **Simple import** | `importer.import("model.onnx", &[])?` |
 | **Dynamic dims** | `importer.import(path, &[("batch", 4)])?` |
-| **Operators** | 162 / 200 ([full parity table](https://github.com/patsak/morok/blob/main/onnx/PARITY.md)) |
+| **Operators** | 162 / 200 ([full parity table](https://github.com/npatsakula/morok/blob/main/onnx/PARITY.md)) |
 | **Validated models** | ResNet50, DenseNet121, VGG19, Inception, AlexNet, ShuffleNet, SqueezeNet, ZFNet |
 | **Backends** | Clang + LLVM (identical results) |
 | **Extensions** | com.microsoft Attention, RotaryEmbedding, SkipLayerNorm, EmbedLayerNorm |
