@@ -295,6 +295,10 @@ pub fn to_vec_isize(shape: &Shape) -> Result<Vec<isize>> {
 /// Returns None if the UOp is not in the expected format.
 fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
     match shape_uop.op() {
+        // pm_lower_index_dtype can wrap shape args in CAST(Index <- Int32/Int64).
+        // Unwrap and decode the underlying shape payload.
+        Op::Cast { src, .. } | Op::BitCast { src, .. } => extract_shape_from_uop(src),
+
         // VECTORIZE with Index-typed elements
         Op::Vectorize { elements } => Some(elements.into_iter().cloned().map(SInt::from).collect()),
 

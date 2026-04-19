@@ -1,10 +1,10 @@
 use morok_tensor::Tensor;
 use snafu::ResultExt;
 
-use crate::state::{get_tensor, prefixed, HasStateDict, StateDict};
+use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
 
-use super::error::TensorSnafu;
 use super::GigaAmConfig;
+use super::error::TensorSnafu;
 
 type Result<T> = super::Result<T>;
 

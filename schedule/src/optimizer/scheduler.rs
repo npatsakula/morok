@@ -782,6 +782,93 @@ impl Scheduler {
         Ok((replaced_rng, new_rng))
     }
 
+    /// TC-specific variant of `shift_to` that allows symbolic exact division.
+    ///
+    /// Unlike `shift_to`, which requires a concrete quotient size, this method
+    /// computes the reduced range end as a symbolic expression using exact
+    /// divisibility (`end.divides_int(amount)`), matching Tinygrad TC behavior.
+    pub(crate) fn shift_to_tc_symbolic(
+        &mut self,
+        rng: Arc<UOp>,
+        amount: usize,
+        new_type: AxisType,
+        top: bool,
+        input_new_rng: Option<Arc<UOp>>,
+    ) -> Result<(Arc<UOp>, Arc<UOp>), OptError> {
+        use morok_ir::{ConstValue, UOpKey};
+        use std::collections::HashMap;
+
+        // 1. Validate divisibility and compute symbolic quotient end
+        let old_end = if let Op::Range { end, .. } = rng.op() {
+            end.divides_int(amount as i64).ok_or_else(|| {
+                if let Op::Const(cv) = end.op()
+                    && let ConstValue::Int(sz) = cv.0
+                {
+                    DivisionSnafu { size: sz as usize, amount }.build()
+                } else {
+                    SymbolicDivisionSnafu { amount }.build()
+                }
+            })?
+        } else {
+            return ExpectedRangeOperationSnafu.fail();
+        };
+
+        // 2. Create new range
+        let new_rng = input_new_rng.unwrap_or_else(|| {
+            let end = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
+            UOp::range_axis(end, AxisId::Renumbered(self.maxarg() + 1), new_type)
+        });
+
+        // 3. Create reduced old range (same axis_id and type, symbolic end allowed)
+        let replaced_rng = if let Op::Range { axis_id, axis_type, .. } = rng.op() {
+            UOp::range_axis(old_end.clone(), *axis_id, *axis_type)
+        } else {
+            return ExpectedRangeOperationSnafu.fail();
+        };
+
+        // 4. Compute substitution expression
+        let sub_axis = if top {
+            // Top order: new varies faster
+            // Example: [0,8,16,24, 1,9,17,25, ...]
+            new_rng
+                .try_mul(&old_end)
+                .expect("Multiplication should not fail for index types")
+                .try_add(&replaced_rng)
+                .expect("Addition should not fail for index types")
+        } else {
+            // Bottom order: old varies faster
+            // Example: [0,1,2,3, 4,5,6,7, 8,9,10,11, ...]
+            let amount_uop = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
+            replaced_rng
+                .try_mul(&amount_uop)
+                .expect("Multiplication should not fail for index types")
+                .try_add(&new_rng)
+                .expect("Addition should not fail for index types")
+        };
+
+        // 5. Perform substitution
+        #[allow(clippy::mutable_key_type)] // UOpKey uses stable ID for Hash/Eq (safe)
+        let mut subst_map = HashMap::new();
+        subst_map.insert(UOpKey(rng), sub_axis);
+
+        let old_ast_id = self.ast.id;
+        self.ast = self.ast.substitute(&subst_map);
+
+        // Record high-level transformation
+        if old_ast_id != self.ast.id {
+            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
+            PROVENANCE_TRACKER.with(|tracker| {
+                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ShiftTo);
+            });
+        }
+
+        // Clear caches (maxarg will be recomputed on next access)
+        self.clear_caches();
+
+        // 6. Return both ranges
+        Ok((replaced_rng, new_rng))
+    }
+
     // ==== Phase 7: Initialization & Finalization ====
 
     /// Get all ranges from output operations (excluding REDUCE axes).

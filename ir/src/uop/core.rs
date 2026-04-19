@@ -1192,13 +1192,9 @@ impl UOp {
                     ast: src(new_srcs.len() - 1),
                 }
             }
-            Op::Assign { .. } => {
-                assert!(new_srcs.len() >= 2 && new_srcs.len() <= 3, "Assign requires 2-3 sources");
-                Op::Assign {
-                    target: src(0),
-                    value: src(1),
-                    movement_ops: if new_srcs.len() > 2 { Some(src(2)) } else { None },
-                }
+            Op::Assign { movement_ops, .. } => {
+                assert_eq!(new_srcs.len(), 2, "Assign requires 2 sources");
+                Op::Assign { target: src(0), value: src(1), movement_ops: movement_ops.clone() }
             }
             Op::Detach { .. } => {
                 assert_eq!(new_srcs.len(), 1);

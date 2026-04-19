@@ -5,7 +5,7 @@
 
 use bon::bon;
 use morok_dtype::{DType, ScalarDType};
-use morok_ir::{ConstValue, ReduceOp, UOp};
+use morok_ir::{ConstValue, ReduceOp, SInt, UOp};
 use snafu::ResultExt;
 
 use crate::{
@@ -143,7 +143,7 @@ impl Tensor {
         let shape = self.shape()?;
 
         // Build new shape by filtering out size-1 dimensions that were reduced
-        let new_shape: Vec<isize> = shape
+        let new_shape: Vec<SInt> = shape
             .iter()
             .enumerate()
             .filter_map(|(i, dim)| {
@@ -151,8 +151,7 @@ impl Tensor {
                 if reduced_axes.contains(&i) {
                     None // Remove this dimension
                 } else {
-                    // Keep dimension, convert to isize
-                    dim.as_const().map(|v| v as isize)
+                    Some(dim.clone())
                 }
             })
             .collect();
@@ -161,7 +160,7 @@ impl Tensor {
         if new_shape.is_empty() {
             // For scalar result, reshape to shape [] (0-d tensor)
             // IR reshape expects same product, so [] → [] is valid
-            self.try_reshape(&[] as &[isize])
+            self.try_reshape(std::iter::empty::<SInt>())
         } else {
             self.try_reshape(&new_shape)
         }

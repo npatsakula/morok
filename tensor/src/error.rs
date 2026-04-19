@@ -167,6 +167,9 @@ pub enum Error {
     #[snafu(display("Type mismatch: expected {expected:?}, got {actual:?}"))]
     TypeMismatch { expected: morok_dtype::DType, actual: morok_dtype::DType },
 
+    #[snafu(display("{op} requires floating-point dtype for {arg}, got {dtype:?}"))]
+    FloatDTypeRequired { op: &'static str, arg: &'static str, dtype: morok_dtype::DType },
+
     #[snafu(display("Failed to create ndarray: {source}"))]
     NdarrayShape { source: ndarray::ShapeError },
 

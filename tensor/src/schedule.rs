@@ -407,7 +407,7 @@ fn collect_kernel_buffers(
 
     let mut buffers = Vec::new();
     let mut uop_ids = Vec::new();
-    let alias_ids = Vec::new();
+    let mut alias_ids = Vec::new();
 
     for src in sources {
         match src.op() {
@@ -415,6 +415,9 @@ fn collect_kernel_buffers(
                 // Shared buffer from producer kernel.
                 // Use buf_uop() to get underlying buffer ID (handles AFTER chains).
                 let buf_id = passthrough.buf_uop().id;
+                if buf_id != src.id {
+                    alias_ids.push(src.id);
+                }
 
                 // Look up from allocated_buffers or input_buffers
                 let existing = allocated_buffers.get(&buf_id).cloned().or_else(|| input_buffers.get(&buf_id).cloned());
@@ -460,17 +463,26 @@ fn collect_kernel_buffers(
                 uop_ids.push(src.id);
             }
             Op::Buffer { size, .. } | Op::Param { size, .. } => {
+                let canonical_id = src.buf_uop().id;
+                if canonical_id != src.id {
+                    alias_ids.push(src.id);
+                }
+
                 // BUFFER/PARAM can be either input (from input_buffers) or output (needs allocation)
                 // Try input_buffers first, then allocated_buffers, then allocate new
-                if let Some(buffer) = input_buffers.get(&src.id).cloned() {
+                if let Some(buffer) =
+                    input_buffers.get(&canonical_id).cloned().or_else(|| input_buffers.get(&src.id).cloned())
+                {
                     buffers.push(buffer);
-                    uop_ids.push(src.id);
-                } else if let Some(buffer) = allocated_buffers.get(&src.id).cloned() {
+                    uop_ids.push(canonical_id);
+                } else if let Some(buffer) =
+                    allocated_buffers.get(&canonical_id).cloned().or_else(|| allocated_buffers.get(&src.id).cloned())
+                {
                     buffers.push(buffer);
-                    uop_ids.push(src.id);
+                    uop_ids.push(canonical_id);
                 } else {
                     // Output buffer - allocate new buffer
-                    trace!(src.id = src.id, size, "Allocating output BUFFER/PARAM");
+                    trace!(src.id = src.id, canonical_id, size, "Allocating output BUFFER/PARAM");
                     let scalar_dtype = src.dtype();
 
                     let buffer = Buffer::new(
@@ -481,9 +493,9 @@ fn collect_kernel_buffers(
                     );
 
                     // Track in allocated_buffers
-                    allocated_buffers.insert(src.id, buffer.clone());
+                    allocated_buffers.insert(canonical_id, buffer.clone());
                     buffers.push(buffer);
-                    uop_ids.push(src.id);
+                    uop_ids.push(canonical_id);
                 }
             }
             Op::Bind { .. } | Op::DefineVar { .. } => {
@@ -497,6 +509,8 @@ fn collect_kernel_buffers(
         }
     }
 
+    alias_ids.sort_unstable();
+    alias_ids.dedup();
     Ok(KernelBuffers { buffers, uop_ids, alias_ids })
 }
 
@@ -720,5 +734,28 @@ mod tests {
         };
 
         assert!(matches!(item.kernel.op(), Op::Kernel { .. }));
+    }
+
+    #[test]
+    fn test_collect_kernel_buffers_after_uses_canonical_buffer_id() {
+        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+        let after = buffer_uop.after(SmallVec::new());
+        let sink = UOp::sink(vec![UOp::native_const(0.0f32)]);
+        let mut sources = SmallVec::new();
+        sources.push(after.clone());
+        let kernel = UOp::kernel(sources.clone(), sink);
+
+        let alloc = morok_device::registry::cpu().expect("cpu allocator");
+        let input_buf = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
+        let mut input_buffers = InputBuffers::new();
+        input_buffers.insert(buffer_uop.id, input_buf.clone());
+        let mut allocated = HashMap::new();
+
+        let kb = collect_kernel_buffers(&sources, &kernel, &input_buffers, &mut allocated).expect("collect buffers");
+
+        assert_eq!(kb.uop_ids, vec![buffer_uop.id]);
+        assert_eq!(kb.buffers.len(), 1);
+        assert_eq!(kb.buffers[0].id(), input_buf.id());
+        assert!(kb.alias_ids.contains(&after.id));
     }
 }

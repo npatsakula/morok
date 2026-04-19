@@ -130,6 +130,94 @@ crate::codegen_tests! {
         }
     }
 
+    fn test_sdpa_bool_mask_true_masks_out(config) {
+        let q = Tensor::from_ndarray(&array![[[[1.0f32, 0.0]]]]);
+        let k = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0]]]]);
+        let v = Tensor::from_ndarray(&array![[[[10.0f32, 1.0], [1.0, 10.0]]]]);
+        // True means masked, False means visible.
+        let mask = Tensor::from_ndarray(&array![[[[true, false]]]]);
+
+        let mut result = q
+            .scaled_dot_product_attention()
+            .key(&k)
+            .value(&v)
+            .maybe_attn_mask(Some(&mask))
+            .call()
+            .unwrap();
+        result.realize_with(&config).unwrap();
+        let view = result.array_view::<f32>().unwrap();
+        assert_eq!(view.shape(), &[1, 1, 1, 2]);
+        assert!((view[[0, 0, 0, 0]] - 1.0).abs() < 1e-4);
+        assert!((view[[0, 0, 0, 1]] - 10.0).abs() < 1e-4);
+    }
+
+    fn test_sdpa_bool_mask_all_masked_row_finite(config) {
+        let q = Tensor::from_ndarray(&array![[[[1.0f32, 0.0]]]]);
+        let k = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0]]]]);
+        let v = Tensor::from_ndarray(&array![[[[10.0f32, 1.0], [1.0, 10.0]]]]);
+        let mask = Tensor::from_ndarray(&array![[[[true, true]]]]);
+
+        let mut result = q
+            .scaled_dot_product_attention()
+            .key(&k)
+            .value(&v)
+            .maybe_attn_mask(Some(&mask))
+            .call()
+            .unwrap();
+        result.realize_with(&config).unwrap();
+        for v in result.as_vec::<f32>().unwrap() {
+            assert!(v.is_finite(), "expected finite attention output, got {v}");
+        }
+    }
+
+    fn test_sdpa_bool_mask_all_masked_with_causal_finite(config) {
+        let q = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0]]]]);
+        let k = q.clone();
+        let v = Tensor::from_ndarray(&array![[[[10.0f32, 1.0], [1.0, 10.0]]]]);
+        let mask = Tensor::from_ndarray(&array![[[[true, true], [true, true]]]]);
+
+        let mut result = q
+            .scaled_dot_product_attention()
+            .key(&k)
+            .value(&v)
+            .is_causal(true)
+            .maybe_attn_mask(Some(&mask))
+            .call()
+            .unwrap();
+        result.realize_with(&config).unwrap();
+        for v in result.as_vec::<f32>().unwrap() {
+            assert!(v.is_finite(), "expected finite attention output with causal+mask, got {v}");
+        }
+    }
+
+    fn test_sdpa_rejects_non_float_qkv(_config) {
+        let qf = Tensor::from_ndarray(&array![[[[1.0f32, 0.0]]]]);
+        let kf = Tensor::from_ndarray(&array![[[[1.0f32, 0.0], [0.0, 1.0]]]]);
+        let vf = Tensor::from_ndarray(&array![[[[10.0f32, 1.0], [1.0, 10.0]]]]);
+
+        let qi = Tensor::from_ndarray(&array![[[[1i32, 0]]]]);
+        let ki = Tensor::from_ndarray(&array![[[[1i32, 0], [0, 1]]]]);
+        let vi = Tensor::from_ndarray(&array![[[[10i32, 1], [1, 10]]]]);
+
+        let err_q = match qi.scaled_dot_product_attention().key(&kf).value(&vf).call() {
+            Ok(_) => panic!("expected query dtype error"),
+            Err(err) => err,
+        };
+        assert!(matches!(err_q, crate::Error::FloatDTypeRequired { arg: "query", .. }));
+
+        let err_k = match qf.scaled_dot_product_attention().key(&ki).value(&vf).call() {
+            Ok(_) => panic!("expected key dtype error"),
+            Err(err) => err,
+        };
+        assert!(matches!(err_k, crate::Error::FloatDTypeRequired { arg: "key", .. }));
+
+        let err_v = match qf.scaled_dot_product_attention().key(&kf).value(&vi).call() {
+            Ok(_) => panic!("expected value dtype error"),
+            Err(err) => err,
+        };
+        assert!(matches!(err_v, crate::Error::FloatDTypeRequired { arg: "value", .. }));
+    }
+
     // =========================================================================
     // Rotary Embedding tests
     // =========================================================================

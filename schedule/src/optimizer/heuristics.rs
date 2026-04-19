@@ -489,8 +489,10 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
         return false;
     }
 
-    // Minimum work check: prod(full_shape) // (128 << 10) < threads → skip
-    let total_elements: i64 = scheduler.full_shape().iter().copied().product();
+    // Minimum work check: prod(full_shape) // (128 << 10) < threads → skip.
+    // Use conservative upper-bound extents for symbolic range ends (vmax/const_factor)
+    // so dynamic kernels don't underestimate work and collapse to tiny thread counts.
+    let total_elements = estimate_total_elements(scheduler);
 
     // Tinygrad's descending thread count list
     const THREAD_LIST: [usize; 9] = [32, 16, 12, 8, 6, 5, 4, 3, 2];
@@ -500,7 +502,7 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
             continue;
         }
         // Skip if not enough work per thread (Tinygrad: prod(full_shape) // (128 << 10) < threads)
-        if total_elements < (threads as i64) * 131072 {
+        if total_elements / 131072 < threads as i64 {
             continue;
         }
 
@@ -512,11 +514,7 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
             if axis_idx >= rngs.len() {
                 continue;
             }
-            if let Op::Range { end, .. } = rngs[axis_idx].op()
-                && let Op::Const(cv) = end.op()
-                && let morok_ir::ConstValue::Int(size) = cv.0
-                && (size as usize).is_multiple_of(threads)
-            {
+            if rngs[axis_idx].divisible_by(threads).is_some() {
                 // Found divisible axis — try applying, then break regardless of success
                 // (Tinygrad: break is inside the divisibility check)
                 thread_applied = apply_opt(scheduler, &Opt::thread(axis_idx, threads), true).is_ok();
@@ -532,6 +530,30 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
     }
 
     false
+}
+
+fn estimate_total_elements(scheduler: &Scheduler) -> i64 {
+    let mut prod: i128 = 1;
+    for rng in scheduler.rngs() {
+        let extent = match rng.op() {
+            Op::Range { end, .. } => {
+                if let Op::Const(cv) = end.op()
+                    && let morok_ir::ConstValue::Int(sz) = cv.0
+                    && sz > 0
+                {
+                    sz
+                } else if let Some(vmax) = end.vmax().try_int() {
+                    vmax.max(1)
+                } else {
+                    let cf = end.const_factor();
+                    if cf > 0 { cf } else { 1 }
+                }
+            }
+            _ => 1,
+        };
+        prod = (prod.saturating_mul(extent as i128)).min(i64::MAX as i128);
+    }
+    prod.max(1) as i64
 }
 
 // ============================================================================

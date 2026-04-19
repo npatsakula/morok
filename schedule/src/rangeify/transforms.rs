@@ -18,7 +18,7 @@ use super::context::RangeifyContext;
 use super::indexing::IndexingContext;
 use super::kernel::KernelContext;
 use morok_ir::shape::Shape;
-use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, Op, UOp, UOpKey};
+use morok_ir::{AddrSpace, AxisType, BufferizeOpts, ConstValue, DType, MovementArg, Op, UOp, UOpKey};
 use smallvec::{SmallVec, smallvec};
 
 // ============================================================================
@@ -156,11 +156,12 @@ pub fn rangeify_with_map(
         "add_tags complete"
     );
 
-    // Combined early pass (Tinygrad: earliest_rewrites + replace_contiguous, ctx={})
-    // MUST run BEFORE range assignment so rangeify sees a cleaned graph.
-    // Tinygrad (rangeify.py:577): bottom_up=True — patterns see ORIGINAL children.
+    // Combined early pass (Tinygrad rangeify.py:583):
+    // pm_syntactic_sugar + pm_mops + earliest_rewrites + replace_contiguous, bottom_up.
     let t_stage = std::time::Instant::now();
-    let early_combined = super::patterns::early_rewrites().with_context::<super::patterns::ReplaceContiguousCtx>()
+    let early_combined = super::patterns::pm_syntactic_sugar().with_context::<super::patterns::ReplaceContiguousCtx>()
+        + super::patterns::movement_op_patterns().with_context::<super::patterns::ReplaceContiguousCtx>()
+        + super::patterns::early_rewrites().with_context::<super::patterns::ReplaceContiguousCtx>()
         + super::patterns::replace_contiguous();
     let mut contig_ctx = super::patterns::ReplaceContiguousCtx::new();
     sink = crate::rewrite::graph_rewrite_bottom_up(&early_combined, sink, &mut contig_ctx);
@@ -238,28 +239,23 @@ pub fn rangeify_with_map(
     // Stages 2a-6 (load_collapse, split_ranges, symbolic+flatten, simplify_ranges,
     // split_store) now run per-kernel in optimizer::apply_pre_optimization().
 
-    // SINK rebuild: filter sources to tagged valid output types (Tinygrad rangeify.py:585-589).
-    // TODO: Full Tinygrad approach scans backward_slice for ALL tagged nodes and rebuilds
-    // SINK with them. This requires Phase 7 (tag-based becomes_map) to be implemented first.
-    // For now, filter existing SINK sources by tag + op type.
-    if let Op::Sink { sources } = sink.op() {
-        let filtered: Vec<Arc<UOp>> = sources
-            .iter()
+    // Rebuild SINK from tagged backward slice nodes (Tinygrad rangeify.py:594-595).
+    // Keep tagged nodes whose base op is one of the materializable output forms.
+    {
+        let filtered: Vec<Arc<UOp>> = sink
+            .backward_slice()
+            .into_iter()
             .filter(|s| {
                 let valid_op = matches!(
                     s.base().op(),
                     Op::Bufferize { .. } | Op::MStack { .. } | Op::Const(_) | Op::Param { .. } | Op::After { .. }
                 );
-                valid_op
+                let tagged = s.tag().as_ref().is_some_and(|t| !t.is_empty());
+                valid_op && tagged
             })
-            .cloned()
             .collect();
-        if !filtered.is_empty() && filtered.len() != sources.len() {
-            tracing::debug!(
-                original = sources.len(),
-                filtered = filtered.len(),
-                "SINK cleanup: removed invalid-type sources after mega-pass"
-            );
+        if !filtered.is_empty() {
+            tracing::debug!(filtered = filtered.len(), "SINK rebuilt from tagged backward slice");
             sink = UOp::sink(filtered);
         }
     }
@@ -578,9 +574,13 @@ fn flatten_bufferize(bufferize: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Matches Tinygrad's pm_mops rule 2 (rangeify.py:28-29):
 ///   `UOp(r.op, r.dtype, (a.replace(src=(r.src[0],)+a.src[1:]),)+r.src[1:], r.arg)`
 /// Directly reuses the original movement op's parameters (no roundtrip/validation).
-pub(crate) fn push_movement_through_after(mop: &Arc<UOp>, deps: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+pub(crate) fn push_movement_through_after(
+    after: &Arc<UOp>,
+    mop: &Arc<UOp>,
+    deps: &SmallVec<[Arc<UOp>; 4]>,
+) -> Option<Arc<UOp>> {
     let inner_src = &mop.op().sources()[0];
-    let new_after = inner_src.after(deps.clone());
+    let new_after = inner_src.after(deps.clone()).rtag(None);
     // Re-create the movement op with new_after as source, reusing original parameters.
     // Tinygrad: UOp(r.op, r.dtype, (new_after,)+r.src[1:], r.arg)
     let new_op = match mop.op() {
@@ -594,7 +594,8 @@ pub(crate) fn push_movement_through_after(mop: &Arc<UOp>, deps: &SmallVec<[Arc<U
         Op::Flip { axes, .. } => Op::Flip { src: new_after, axes: axes.clone() },
         _ => return None,
     };
-    Some(UOp::new(new_op, mop.dtype()))
+    let moved = UOp::new(new_op, mop.dtype());
+    if let Some(tag) = after.tag().clone() { Some(moved.with_tag(tag)) } else { Some(moved) }
 }
 
 /// Transform a single source by adding BUFFERIZE + INDEX if needed.
@@ -705,95 +706,21 @@ pub(crate) fn transform_single_source(
 // HELPER FUNCTIONS FOR BUFFERIZE_TO_STORE
 // ============================================================================
 
-/// Apply movement ops chain in reverse order.
-/// Walks from chain root to base using pattern matching.
-/// Uses existing .base() method at ir/src/uop/core.rs:425-438.
-fn apply_movement_ops_chain(result: &Arc<UOp>, chain: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let mut mops = Vec::new();
-    let mut walk = chain.clone();
-
-    // Walk chain collecting movement ops using pattern matching
-    while walk.op().is_movement() {
-        mops.push(walk.clone());
-        // Extract src via pattern matching
-        walk = match walk.op() {
-            Op::Reshape { src, .. }
-            | Op::Permute { src, .. }
-            | Op::Expand { src, .. }
-            | Op::Pad { src, .. }
-            | Op::Shrink { src, .. }
-            | Op::Flip { src, .. } => src.clone(),
-            _ => break,
-        };
-    }
-
-    // Apply in reverse order
-    let mut current = result.clone();
-    for mop in mops.into_iter().rev() {
-        current = apply_single_movement_op(&current, mop.op())?;
-    }
-
-    Some(current)
-}
-
-/// Apply a single movement operation.
-///
-/// Note: This extracts shape from the movement op's stored source (which has the
-/// target shape after the movement) rather than from UOp shape metadata.
-fn apply_single_movement_op(uop: &Arc<UOp>, op: &Op) -> Option<Arc<UOp>> {
-    match op {
-        Op::Reshape { new_shape, .. } => {
-            let shape = extract_shape_from_uop(new_shape)?;
-            uop.try_reshape(&shape).ok()
+/// Apply one compact ASSIGN movement metadata entry.
+fn apply_movement_arg(result: &Arc<UOp>, movement: &MovementArg) -> Option<Arc<UOp>> {
+    match movement {
+        MovementArg::Reshape(shape) => {
+            let shape: Shape = shape.iter().cloned().collect();
+            result.try_reshape(&shape).ok()
         }
-        Op::Permute { axes, .. } => uop.try_permute(axes.clone()).ok(),
-        Op::Expand { new_shape, .. } => {
-            let shape = extract_shape_from_uop(new_shape)?;
-            uop.try_expand(&shape).ok()
+        MovementArg::Expand(shape) => {
+            let shape: Shape = shape.iter().cloned().collect();
+            result.try_expand(&shape).ok()
         }
-        Op::Pad { begin_pads, end_pads, .. } => {
-            let begins = extract_shape_from_uop(begin_pads)?;
-            let ends = extract_shape_from_uop(end_pads)?;
-            let padding: Vec<_> = begins.into_iter().zip(ends).collect();
-            uop.try_pad(&padding).ok()
-        }
-        Op::Shrink { begins, ends, .. } => {
-            let begin_shape = extract_shape_from_uop(begins)?;
-            let end_shape = extract_shape_from_uop(ends)?;
-            let ranges: Vec<_> = begin_shape.into_iter().zip(end_shape).collect();
-            uop.try_shrink(&ranges).ok()
-        }
-        Op::Flip { axes, .. } => uop.try_flip(axes.clone()).ok(),
-        _ => None,
-    }
-}
-
-/// Extract shape from a UOp (for movement op parameters).
-/// Handles VECTORIZE, CONST, and VCONST patterns.
-fn extract_shape_from_uop(shape_uop: &Arc<UOp>) -> Option<Shape> {
-    use morok_ir::SInt;
-    match shape_uop.op() {
-        // VECTORIZE with Index-typed elements
-        Op::Vectorize { elements } => Some(elements.iter().cloned().map(SInt::from).collect()),
-        // Single CONST value (for 1D shapes)
-        Op::Const(const_hash) => match const_hash.0 {
-            ConstValue::Int(v) if v >= 0 => Some(smallvec![SInt::from(v as usize)]),
-            ConstValue::UInt(v) => Some(smallvec![SInt::from(v as usize)]),
-            _ => None,
-        },
-        // VConst for multiple concrete dimensions
-        Op::VConst { values } => {
-            let mut dims = smallvec![];
-            for val in values {
-                match val {
-                    ConstValue::Int(v) if *v >= 0 => dims.push(SInt::from(*v as usize)),
-                    ConstValue::UInt(v) => dims.push(SInt::from(*v as usize)),
-                    _ => return None,
-                }
-            }
-            Some(dims)
-        }
-        _ => None,
+        MovementArg::Permute(axes) => result.try_permute(axes.clone()).ok(),
+        MovementArg::Flip(axes) => result.try_flip(axes.clone()).ok(),
+        MovementArg::Pad(ranges) => result.try_pad(ranges).ok(),
+        MovementArg::Shrink(ranges) => result.try_shrink(ranges).ok(),
     }
 }
 
@@ -976,10 +903,12 @@ pub fn bufferize_to_store(bufferize_op: &Arc<UOp>, ctx: &mut KernelContext, allo
         let store = store_target.store_value(value.clone());
         let do_store = if end_ranges.is_empty() { store } else { store.end(end_ranges.clone()) };
 
-        // Apply movement ops in reverse order
+        // Replay captured movement metadata in reverse order (Tinygrad assign.arg parity)
         let mut result = buffer.after(smallvec![do_store]);
-        if let Some(mops_chain) = movement_ops {
-            result = apply_movement_ops_chain(&result, mops_chain)?;
+        if let Some(mops) = movement_ops {
+            for movement in mops.iter().rev() {
+                result = apply_movement_arg(&result, movement)?;
+            }
         }
 
         ctx.map_buffer(bufferize_op.clone(), result.clone());
@@ -1700,6 +1629,57 @@ fn late_buffer_view(compute: &Arc<UOp>, bufferize: &Arc<UOp>) -> Option<Arc<UOp>
     Some(UOp::bufferize(new_sources[0].clone(), new_sources[1..].to_vec(), opts.clone()))
 }
 
+fn move_reshape_through_mselect_mstack(m: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let rebuilt = match m.op() {
+        Op::MSelect { buffer, device_index } => {
+            let Op::Reshape { src, .. } = buffer.op() else {
+                return None;
+            };
+            src.base().mselect(*device_index)
+        }
+        Op::MStack { buffers } => {
+            let mut bases = SmallVec::<[Arc<UOp>; 4]>::with_capacity(buffers.len());
+            for buf in buffers {
+                let Op::Reshape { src, .. } = buf.op() else {
+                    return None;
+                };
+                bases.push(src.base());
+            }
+            UOp::mstack(bases)
+        }
+        _ => return None,
+    }
+    .rtag(None);
+
+    let shape = m.shape().ok()??;
+    let reshaped = rebuilt.try_reshape(shape).ok()?;
+    Some(reshaped.rtag(m.tag().clone()))
+}
+
+fn strip_reshape_on_kernel_sources(kernel: &Arc<UOp>) -> Option<Arc<UOp>> {
+    let Op::Kernel { sources, ast } = kernel.op() else {
+        return None;
+    };
+    let mut changed = false;
+    let rewritten: SmallVec<[Arc<UOp>; 4]> = sources
+        .iter()
+        .map(|src| {
+            if let Op::Reshape { src: inner, .. } = src.op() {
+                changed = true;
+                inner.clone()
+            } else {
+                src.clone()
+            }
+        })
+        .collect();
+
+    if !changed {
+        return None;
+    }
+
+    Some(UOp::kernel(rewritten, ast.clone()).rtag(kernel.tag().clone()))
+}
+
 /// Create pattern matcher for adding buffers (BUFFERIZE → STORE conversion).
 ///
 /// Based on Tinygrad's pm_add_buffers (rangeify.py:358-367) with `allow_locals=False`.
@@ -1712,15 +1692,15 @@ pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::Ke
         buf @ Bufferize { compute: _ } if matches!(buf.op(), Op::Bufferize { ranges, .. } if ranges.len() > 1)
             => |buf, _ctx| { flatten_bufferize(buf) },
         // pm_mops rule 1: push movement ops through INDEX (Tinygrad rangeify.py:25-26)
-        Index { buffer: mop, indices, gate } if mop.op().is_movement()
-            => |mop, indices, gate, _ctx| {
-                super::patterns::transform_movement_through_index(mop, indices, gate)
+        idx @ Index { buffer: mop, indices, gate } if mop.op().is_movement()
+            => |idx, mop, indices, gate, _ctx| {
+                super::patterns::transform_movement_through_index(mop, indices, gate, idx.dtype())
             },
         // pm_mops rule 2: push movement ops through AFTER (Tinygrad rangeify.py:28-29)
         // AFTER(MOVEMENT(x, ...), deps) → MOVEMENT(AFTER(x, deps), ...)
-        After { passthrough: mop, deps } if mop.op().is_movement()
-            => |mop, deps, _ctx| {
-                push_movement_through_after(mop, deps)
+        after @ After { passthrough: mop, deps } if mop.op().is_movement()
+            => |after, mop, deps, _ctx| {
+                push_movement_through_after(after, mop, deps)
             },
         // pm_mops rule 3: strip movement ops from END (Tinygrad rangeify.py:30)
         // END(MOVEMENT(x, ...), ranges) → END(x, ranges)
@@ -1737,6 +1717,15 @@ pub fn pm_add_buffers_patterns() -> crate::TypedPatternMatcher<super::kernel::Ke
         buf @ Bufferize { compute: _ } => |buf, ctx| {
             bufferize_to_store(buf, ctx, false)
         },
+        // Tinygrad: move RESHAPE through MSELECT/MSTACK (rangeify.py:401-403)
+        m @ MSelect { buffer: _ }
+            if matches!(m.op(), Op::MSelect { buffer, .. } if matches!(buffer.op(), Op::Reshape { .. }))
+            => |m, _ctx| { move_reshape_through_mselect_mstack(m) },
+        m @ MStack { buffers: _ }
+            if matches!(m.op(), Op::MStack { buffers } if buffers.iter().all(|x| matches!(x.op(), Op::Reshape { .. })))
+            => |m, _ctx| { move_reshape_through_mselect_mstack(m) },
+        // Tinygrad: remove RESHAPE wrappers on KERNEL sources (rangeify.py:405-406)
+        k @ Kernel { sources: _, ast: _ } => |k, _ctx| { strip_reshape_on_kernel_sources(k) },
     }
 }
 
@@ -1751,14 +1740,14 @@ pub fn pm_add_buffers_local_patterns() -> crate::TypedPatternMatcher<super::kern
         buf @ Bufferize { compute: _ } if matches!(buf.op(), Op::Bufferize { ranges, .. } if ranges.len() > 1)
             => |buf, _ctx| { flatten_bufferize(buf) },
         // pm_mops rule 1: push movement ops through INDEX (Tinygrad rangeify.py:25-26)
-        Index { buffer: mop, indices, gate } if mop.op().is_movement()
-            => |mop, indices, gate, _ctx| {
-                super::patterns::transform_movement_through_index(mop, indices, gate)
+        idx @ Index { buffer: mop, indices, gate } if mop.op().is_movement()
+            => |idx, mop, indices, gate, _ctx| {
+                super::patterns::transform_movement_through_index(mop, indices, gate, idx.dtype())
             },
         // pm_mops rule 2: push movement ops through AFTER (Tinygrad rangeify.py:28-29)
-        After { passthrough: mop, deps } if mop.op().is_movement()
-            => |mop, deps, _ctx| {
-                push_movement_through_after(mop, deps)
+        after @ After { passthrough: mop, deps } if mop.op().is_movement()
+            => |after, mop, deps, _ctx| {
+                push_movement_through_after(after, mop, deps)
             },
         // pm_mops rule 3: strip movement ops from END (Tinygrad rangeify.py:30)
         End { computation: mop, ranges } if mop.op().is_movement()

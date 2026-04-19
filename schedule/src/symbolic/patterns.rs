@@ -964,42 +964,45 @@ fn range_based_cast_patterns() -> &'static TypedPatternMatcher {
 pub fn term_combining_dsl_patterns() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
         // x + x → 2*x
-        Add(x, x) ~> 2.into_uop(x.dtype()).mul(x),
+        Add(x, x) => x.try_mul(&x.const_like(2i64)).ok(),
         // (x * c1) + (x * c2) → x * (c1 + c2)  (Mul[] is commutative, covers c*x too)
         Add(Mul[x, c1 @const(c1_val)], Mul[x, _c2 @const(c2_val)])
-            ~> x.mul(&eval_add_typed(c1_val, c2_val, c1.dtype().base())
-                .expect("failed to add constants")
-                .into_uop(c1.dtype())),
+            => {
+                let coeff = eval_add_typed(c1_val, c2_val, c1.dtype().base())
+                    .expect("failed to add constants")
+                    .into_uop(c1.dtype());
+                x.try_mul(&coeff).ok()
+            },
         // x + x*c → x*(c+1) — commutative outer Add
-        Add[x, Mul[x, c @const(c_val)]] ~> {
+        Add[x, Mul[x, c @const(c_val)]] => {
             let one = ConstValue::one(c.dtype().base());
             let new_c = eval_add_typed(c_val, one, c.dtype().base()).expect("failed to add constants");
-            x.mul(&UOp::const_(c.dtype(), new_c))
+            x.try_mul(&UOp::const_(c.dtype(), new_c)).ok()
         },
         // (y + x*c0) + x*c1 → y + x*(c0+c1) — commutative outer Add
-        Add[Add[y, Mul[x, c0 @const(c0_val)]], Mul[x, _c1 @const(c1_val)]] ~> {
+        Add[Add[y, Mul[x, c0 @const(c0_val)]], Mul[x, _c1 @const(c1_val)]] => {
             let new_c = eval_add_typed(c0_val, c1_val, c0.dtype().base()).expect("failed to add constants");
-            let xc = x.mul(&UOp::const_(c0.dtype(), new_c));
-            y.add(&xc)
+            let xc = x.try_mul(&UOp::const_(c0.dtype(), new_c)).ok()?;
+            y.try_add(&xc).ok()
         },
         // (y + x) + x*c → y + x*(c+1) — commutative outer Add
-        Add[Add[y, x], Mul[x, c @const(c_val)]] ~> {
+        Add[Add[y, x], Mul[x, c @const(c_val)]] => {
             let one = ConstValue::one(c.dtype().base());
             let new_c = eval_add_typed(c_val, one, c.dtype().base()).expect("failed to add constants");
-            let xc = x.mul(&UOp::const_(c.dtype(), new_c));
-            y.add(&xc)
+            let xc = x.try_mul(&UOp::const_(c.dtype(), new_c)).ok()?;
+            y.try_add(&xc).ok()
         },
         // (y + x*c) + x → y + x*(c+1) — commutative outer Add
-        Add[Add[y, Mul[x, c @const(c_val)]], x] ~> {
+        Add[Add[y, Mul[x, c @const(c_val)]], x] => {
             let one = ConstValue::one(c.dtype().base());
             let new_c = eval_add_typed(c_val, one, c.dtype().base()).expect("failed to add constants");
-            let xc = x.mul(&UOp::const_(c.dtype(), new_c));
-            y.add(&xc)
+            let xc = x.try_mul(&UOp::const_(c.dtype(), new_c)).ok()?;
+            y.try_add(&xc).ok()
         },
         // (y + x) + x → y + x*2 — commutative outer Add
-        Add[Add[y, x], x] ~> {
-            let x2 = 2.into_uop(x.dtype()).mul(x);
-            y.add(&x2)
+        Add[Add[y, x], x] => {
+            let x2 = x.try_mul(&x.const_like(2i64)).ok()?;
+            y.try_add(&x2).ok()
         },
         // (x/x2)/x3 → x/(x2*x3) — flatten nested float division
         // Guard: x2 must not be same UOp as x3 (prevents loop with x/x→1)

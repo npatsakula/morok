@@ -2,8 +2,8 @@ use morok_tensor::Tensor;
 
 use crate::state::StateDict;
 
-use super::error::{Error, Result};
 use super::GigaAmConfig;
+use super::error::{Error, Result};
 
 use super::ConvNormType;
 

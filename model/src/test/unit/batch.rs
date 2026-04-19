@@ -1,10 +1,11 @@
 use morok_dtype::DType;
-use morok_tensor::Tensor;
+use morok_tensor::{Tensor, Variable};
 
 use crate::gigaam::{ConvNormType, GigaAm, GigaAmBatchedJit, GigaAmConfig, SubsamplingMode};
 
 fn test_config() -> GigaAmConfig {
     GigaAmConfig {
+        max_batch_size: 8,
         n_mels: 64,
         d_model: 32,
         n_heads: 4,
@@ -29,10 +30,14 @@ fn model_with_random_weights() -> GigaAm {
     GigaAm::with_random_weights(test_config())
 }
 
+fn read_prefix_f32(t: &Tensor, len: usize) -> Vec<f32> {
+    let buf = t.buffer().unwrap();
+    buf.as_array::<f32>().unwrap().as_slice().unwrap()[..len].to_vec()
+}
+
 #[test]
 fn test_output_length_matches_forward() {
     let model = GigaAm::with_random_weights(test_config());
-    let d = test_config().d_model;
 
     let x = Tensor::full(&[1, 100, 64], 0.0f32, DType::Float32).unwrap();
     let out = model.subsampling.forward(&x).unwrap();
@@ -46,18 +51,34 @@ fn test_output_length_matches_forward() {
 }
 
 #[test]
-#[ignore = "JIT wrapper buffer ID mismatch after prepare_batch normalization — needs macro fix"]
 fn test_batched_jit_prepare_and_execute() {
     let model = model_with_random_weights();
     let mut jit = GigaAmBatchedJit::new(model);
 
-    let (b, t, d) = (2, 10, 32);
-    let mut features = Tensor::full(&[b, t, d], 0.5f32, DType::Float32).unwrap();
-    features.realize().unwrap();
+    let (b, t, n_mels) = (2, 10, test_config().n_mels);
+    let mut mel = Tensor::full(&[b, n_mels, t], 0.5f32, DType::Float32).unwrap();
+    mel.realize().unwrap();
     let lengths = Tensor::from_slice(&[10i32, 8]);
 
-    jit.prepare(&features, &lengths).unwrap();
-    jit.execute().unwrap();
+    jit.prepare(&mel, &lengths).unwrap();
+    jit.execute_with_vars(&[("b", b as i64), ("t", t as i64)]).unwrap();
+
+    let output = jit.output().unwrap();
+    assert!(output.size() > 0);
+}
+
+#[test]
+fn test_batched_jit_prepare_large_shape() {
+    let model = model_with_random_weights();
+    let mut jit = GigaAmBatchedJit::new(model);
+
+    let cfg = test_config();
+    let mut mel = Tensor::full(&[cfg.max_batch_size, cfg.n_mels, cfg.max_seq_len], 0.0f32, DType::Float32).unwrap();
+    mel.realize().unwrap();
+    let lengths = Tensor::from_slice(vec![cfg.max_seq_len as i32; cfg.max_batch_size]);
+
+    jit.prepare(&mel, &lengths).unwrap();
+    jit.execute_with_vars(&[("b", cfg.max_batch_size as i64), ("t", cfg.max_seq_len as i64)]).unwrap();
 
     let output = jit.output().unwrap();
     assert!(output.size() > 0);
@@ -66,20 +87,27 @@ fn test_batched_jit_prepare_and_execute() {
 #[test]
 fn test_single_vs_batch_consistency() {
     let model = model_with_random_weights();
-    let d = 32;
+    let d = test_config().d_model;
+    let n_mels = test_config().n_mels;
     let t = 10;
+    let t_sub = model.subsampling_output_length(t);
 
-    let x1 = Tensor::full(&[1, t, d], 0.5f32, DType::Float32).unwrap();
-    let x2 = Tensor::full(&[1, t, d], 0.3f32, DType::Float32).unwrap();
+    let x1 = Tensor::full(&[1, n_mels, t], 0.5f32, DType::Float32).unwrap();
+    let x2 = Tensor::full(&[1, n_mels, t], 0.3f32, DType::Float32).unwrap();
     let lengths_single = Tensor::from_slice(&[t as i32]);
 
-    let mut out1 = model.encode_batch(&x1, &lengths_single).unwrap();
-    out1.realize().unwrap();
-    let data1 = out1.as_vec::<f32>().unwrap();
+    let b_var = Variable::new("B", 1, test_config().max_batch_size as i64);
+    let t_var = Variable::new("T", 1, test_config().max_seq_len as i64);
+    let b1 = b_var.bind(1).unwrap();
+    let t1 = t_var.bind(t as i64).unwrap();
 
-    let mut out2 = model.encode_batch(&x2, &lengths_single).unwrap();
+    let mut out1 = model.encode_batch(&x1, &lengths_single, &b1, &t1).unwrap();
+    out1.realize().unwrap();
+    let data1 = read_prefix_f32(&out1, d * t_sub);
+
+    let mut out2 = model.encode_batch(&x2, &lengths_single, &b1, &t1).unwrap();
     out2.realize().unwrap();
-    let data2 = out2.as_vec::<f32>().unwrap();
+    let data2 = read_prefix_f32(&out2, d * t_sub);
 
     let batch = {
         let mut x1r = x1.clone();
@@ -88,17 +116,18 @@ fn test_single_vs_batch_consistency() {
         let mut x2r = x2.clone();
         x2r.realize().unwrap();
         let d2 = x2r.as_vec::<f32>().unwrap();
-        let mut batch_data = vec![0.0f32; 2 * t * d];
-        batch_data[..t * d].copy_from_slice(&d1);
-        batch_data[t * d..].copy_from_slice(&d2);
-        ndarray::Array3::from_shape_vec((2, t, d), batch_data).unwrap()
+        let mut batch_data = vec![0.0f32; 2 * n_mels * t];
+        batch_data[..n_mels * t].copy_from_slice(&d1);
+        batch_data[n_mels * t..].copy_from_slice(&d2);
+        ndarray::Array3::from_shape_vec((2, n_mels, t), batch_data).unwrap()
     };
     let batch_tensor = Tensor::from_ndarray(&batch);
     let batch_lengths = Tensor::from_slice(&[t as i32, t as i32]);
 
-    let mut batch_out = model.encode_batch(&batch_tensor, &batch_lengths).unwrap();
+    let b2 = b_var.bind(2).unwrap();
+    let mut batch_out = model.encode_batch(&batch_tensor, &batch_lengths, &b2, &t1).unwrap();
     batch_out.realize().unwrap();
-    let batch_data = batch_out.as_vec::<f32>().unwrap();
+    let batch_data = read_prefix_f32(&batch_out, 2 * d * t_sub);
 
     assert_eq!(data1.len() * 2, batch_data.len());
 
@@ -108,4 +137,49 @@ fn test_single_vs_batch_consistency() {
     for (i, (&b, &s)) in batch_data[data1.len()..].iter().zip(data2.iter()).enumerate() {
         assert!((b - s).abs() < 1e-4, "batch[1] mismatch at {}: batch={} single={}", i, b, s);
     }
+}
+
+#[test]
+fn test_encode_batch_full_lengths_finite() {
+    let model = model_with_random_weights();
+    let cfg = test_config();
+    let t = 256usize;
+
+    let x = Tensor::full(&[2, cfg.n_mels, t], 0.1f32, DType::Float32).unwrap();
+    let lengths = Tensor::from_slice(&[t as i32, t as i32]);
+
+    let b_var = Variable::new("B", 1, cfg.max_batch_size as i64);
+    let t_var = Variable::new("T", 1, cfg.max_seq_len as i64);
+    let b2 = b_var.bind(2).unwrap();
+    let t_bound = t_var.bind(t as i64).unwrap();
+
+    let mut out = model.encode_batch(&x, &lengths, &b2, &t_bound).unwrap();
+    out.realize().unwrap();
+
+    let buf = out.buffer().unwrap();
+    let data = buf.as_array::<f32>().unwrap();
+    for v in data.as_slice().unwrap() {
+        assert!(v.is_finite(), "encode_batch produced non-finite value: {v}");
+    }
+}
+
+#[test]
+fn test_encode_batch_respects_dynamic_seq_len() {
+    let model = model_with_random_weights();
+    let cfg = test_config();
+    let t_dynamic = 64usize;
+
+    let mut jit = GigaAmBatchedJit::new(model);
+    let mut mel = Tensor::full(&[cfg.max_batch_size, cfg.n_mels, cfg.max_seq_len], 0.0f32, DType::Float32).unwrap();
+    mel.realize().unwrap();
+    let lengths = Tensor::from_slice(vec![cfg.max_seq_len as i32; cfg.max_batch_size]);
+
+    jit.prepare(&mel, &lengths).unwrap();
+    let profiles = jit.execute_with_vars_profiled(&[("b", 1), ("t", t_dynamic as i64)]).unwrap();
+
+    assert!(!profiles.is_empty(), "expected kernels for profiled dynamic execute");
+    assert!(
+        profiles.iter().any(|p| p.kernel.var_names.iter().any(|name| name == "t")),
+        "expected at least one kernel to keep dynamic seq var 't'"
+    );
 }

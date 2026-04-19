@@ -117,6 +117,7 @@ pub fn merge_sibling_ends(sink: &Arc<UOp>) -> Arc<UOp> {
     UOp::sink(sources.to_vec()).substitute(&subs)
 }
 
+use crate::passes::linearize_index::pm_linearize_multi_index;
 use crate::rewrite::graph_rewrite;
 use crate::symbolic::patterns::sym;
 
@@ -127,13 +128,14 @@ use crate::symbolic::patterns::sym;
 /// Run devectorize pass. Call AFTER `pre_expand`, BEFORE codegen.
 ///
 /// Single-pass combined matcher (Tinygrad `pm_devectorize`):
-/// sym + devectorize + load_store_folding + correct_load_store + load_store_indexing
+/// sym + linearize_multi_index + devectorize + load_store_folding + correct_load_store + load_store_indexing
 ///
 /// Note: `bool_storage_patterns()` called separately (backend-specific).
 /// Note: `pm_render()` should be applied AFTER this pass.
 pub fn devectorize(ast: &Arc<UOp>) -> Arc<UOp> {
     static COMBINED: LazyLock<TypedPatternMatcher> = LazyLock::new(|| {
         sym()
+            + pm_linearize_multi_index()
             + devectorize_patterns()
             + load_store_folding_patterns()
             + correct_load_store_patterns()
@@ -1101,7 +1103,10 @@ fn is_define_or_after(uop: &Arc<UOp>) -> bool {
 /// Matches INDEX(VECTORIZE(Defines.or_after()), vec_idx) only.
 /// Tinygrad devectorizer.py:115 - expand_index only matches VECTORIZE of defines.
 fn is_vector_index(uop: &Arc<UOp>) -> bool {
-    let Op::Index { buffer, indices, .. } = uop.op() else { return false };
+    let Op::Index { buffer, indices, gate } = uop.op() else { return false };
+    if indices.len() != 1 || gate.is_some() {
+        return false;
+    }
     let Some(idx) = indices.first() else { return false };
     if idx.dtype().vcount() <= 1 {
         return false;
@@ -1158,7 +1163,9 @@ fn move_gep_on_store(
 /// NO inner rewrite — the outer fixed-point (sym) simplifies GEP expressions.
 fn expand_index_to_vectorize(index: &Arc<UOp>) -> Option<Arc<UOp>> {
     let Op::Index { buffer, indices, gate } = index.op() else { return None };
-    assert!(indices.len() <= 1, "ICE: expand_index_to_vectorize called with multi-index INDEX (len={})", indices.len());
+    if indices.len() != 1 {
+        return None;
+    }
     let vec = indices.first()?;
     let count = vec.dtype().vcount();
 

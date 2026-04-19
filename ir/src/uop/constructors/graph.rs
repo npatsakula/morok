@@ -53,9 +53,13 @@ impl UOp {
     /// In-place assignment with movement ops chain.
     ///
     /// The `movement_ops` parameter captures shape transformations from the
-    /// original target, used during bufferize_to_store to apply the same
-    /// transformations to the result buffer.
-    pub fn assign_with_mops(target: Arc<Self>, value: Arc<Self>, movement_ops: Option<Arc<Self>>) -> Arc<Self> {
+    /// original target as compact movement metadata, used during bufferize_to_store
+    /// to apply the same transformations to the result buffer.
+    pub fn assign_with_mops(
+        target: Arc<Self>,
+        value: Arc<Self>,
+        movement_ops: Option<Vec<crate::types::MovementArg>>,
+    ) -> Arc<Self> {
         let dtype = target.dtype();
         Self::new(Op::Assign { target, value, movement_ops }, dtype)
     }

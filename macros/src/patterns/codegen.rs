@@ -234,7 +234,7 @@ const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
     ("StoreGated", &["buffer", "index", "value", "gate"]),
     // Symbolic
     ("Bind", &["var", "value"]),
-    ("Assign", &["target", "value", "movement_ops"]),
+    ("Assign", &["target", "value"]),
     // Reduction
     ("Reduce", &["src"]),
     ("AllReduce", &["src", "device"]),

@@ -8,8 +8,8 @@ use std::path::Path;
 
 use morok_dtype::DType;
 use morok_macros::jit_wrapper;
-use morok_tensor::nn::PadMode;
 use morok_tensor::Tensor;
+use morok_tensor::nn::PadMode;
 use snafu::ResultExt;
 
 use crate::state;

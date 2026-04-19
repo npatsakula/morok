@@ -1,7 +1,7 @@
 extern crate self as morok_model;
 
 use morok_macros::jit_wrapper;
-use morok_tensor::Tensor;
+use morok_tensor::{PrepareConfig, Tensor};
 
 struct AddModel;
 
@@ -30,7 +30,8 @@ fn test_jit_single_input_prepare_and_execute() {
     let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
     let y = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
 
-    jit.prepare(&x, &y).unwrap();
+    let cfg = PrepareConfig::default();
+    jit.prepare_with_config(&x, &y, &cfg).unwrap();
     jit.execute().unwrap();
 
     let output = jit.output().unwrap();
@@ -99,6 +100,28 @@ fn test_jit_multiple_replays() {
         output.copyout(unsafe { std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 12) }).unwrap();
         assert_eq!(result, vec![(i + i + 1) as f32; 3]);
     }
+}
+
+#[test]
+fn test_jit_profiled_execution_apis() {
+    let model = AddModel;
+    let mut jit = AddJit::new(model);
+
+    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    let y = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
+
+    jit.prepare(&x, &y).unwrap();
+
+    let profiles = jit.execute_profiled().unwrap();
+    assert!(!profiles.is_empty(), "expected at least one kernel profile");
+
+    let profiles_with_vars = jit.execute_with_vars_profiled(&[]).unwrap();
+    assert!(!profiles_with_vars.is_empty(), "expected at least one kernel profile with vars");
+
+    let output = jit.output().unwrap();
+    let mut result = vec![0.0f32; 3];
+    output.copyout(unsafe { std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 12) }).unwrap();
+    assert_eq!(result, vec![11.0, 22.0, 33.0]);
 }
 
 fn copy_tensor_to_buffer(tensor: &Tensor, dst: &mut morok_device::Buffer) {

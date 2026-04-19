@@ -199,7 +199,7 @@ pub(crate) fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> O
     }
 
     // 1. cancel_divmod: range of numerator lies within a single denominator interval
-    if y_min * y_max > 0 {
+    if y_min.checked_mul(y_max).is_some_and(|p| p > 0) {
         let corners =
             [x_min.checked_div(y_min), x_min.checked_div(y_max), x_max.checked_div(y_min), x_max.checked_div(y_max)];
         if let [Some(q1), Some(q2), Some(q3), Some(q4)] = corners

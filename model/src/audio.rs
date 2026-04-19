@@ -61,11 +61,7 @@ impl MelSpectrogram {
 
     pub fn num_frames(&self, waveform_len: usize) -> usize {
         let signal_len = if self.center { waveform_len + self.n_fft } else { waveform_len };
-        if signal_len >= self.n_fft {
-            (signal_len - self.n_fft) / self.hop_length + 1
-        } else {
-            0
-        }
+        if signal_len >= self.n_fft { (signal_len - self.n_fft) / self.hop_length + 1 } else { 0 }
     }
 
     pub fn forward_into(&self, waveform: &[f32], out: &mut ArrayViewMutD<'_, f32>) {

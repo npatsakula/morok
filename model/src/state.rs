@@ -68,9 +68,5 @@ pub fn get_tensor(sd: &StateDict, key: &str) -> Result<Tensor> {
 
 /// Helper: format a prefixed key.
 pub fn prefixed(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}.{name}")
-    }
+    if prefix.is_empty() { name.to_string() } else { format!("{prefix}.{name}") }
 }

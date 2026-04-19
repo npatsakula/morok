@@ -249,11 +249,9 @@ pub enum Op {
     Assign {
         target: Arc<UOp>,
         value: Arc<UOp>,
-        /// Movement ops chain for shape tracking (third source in Tinygrad).
-        /// This is a UOp chain where each node is a movement op, and walking
-        /// via src[0] reaches the base INDEX operation. Used during
-        /// bufferize_to_store to apply the same transformations to the result buffer.
-        movement_ops: Option<Arc<UOp>>,
+        /// Compact movement metadata for shape tracking (Tinygrad assign.arg style).
+        /// Stores `(op, marg)` equivalents without embedding a movement UOp chain.
+        movement_ops: Option<Vec<MovementArg>>,
     },
     Detach {
         src: Arc<UOp>,
@@ -421,13 +419,7 @@ impl Op {
                 children.push(ast);
                 children
             }
-            Self::Assign { target, value, movement_ops } => {
-                let mut children = SmallVec::from_slice(&[target, value]);
-                if let Some(mops) = movement_ops {
-                    children.push(mops);
-                }
-                children
-            }
+            Self::Assign { target, value, .. } => SmallVec::from_slice(&[target, value]),
             Self::After { passthrough, deps } => {
                 let mut children = SmallVec::from_slice(&[passthrough]);
                 children.extend(deps.iter());

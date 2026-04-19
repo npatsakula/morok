@@ -1,8 +1,9 @@
 use morok_dtype::DType;
+use morok_ir::SInt;
 use morok_tensor::Tensor;
 use snafu::ResultExt;
 
-use crate::state::{get_tensor, prefixed, HasStateDict, StateDict};
+use crate::state::{HasStateDict, StateDict, get_tensor, prefixed};
 
 use super::error::TensorSnafu;
 use super::{ConvNormType, GigaAmConfig, SubsamplingMode};
@@ -144,28 +145,46 @@ impl MultiHeadSelfAttention {
         }
     }
 
-    pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+        _batch: SInt,
+        _seq_len: SInt,
+    ) -> Result<Tensor> {
         let shape = x.shape().context(TensorSnafu)?;
-        let b = shape[0].as_const().expect("batch dim must be concrete") as isize;
-        let t = shape[1].as_const().expect("seq dim must be concrete") as isize;
-        let d_model = self.norm.weight.shape().context(TensorSnafu)?[0].as_const().unwrap() as isize;
-        let d_k = d_model / self.n_heads as isize;
-        let h = self.n_heads as isize;
+        let b = shape[0].clone();
+        let t = shape[1].clone();
+        let d_model = self.norm.weight.shape().context(TensorSnafu)?[0].as_const().unwrap();
+        let d_k = d_model / self.n_heads;
+        let h = self.n_heads;
 
         let y = self.norm.apply(x)?;
 
         // Reshape to [T, B, H, d_k] for RoPE (matches PyTorch ordering)
-        let y_heads = y.try_transpose(0, 1).context(TensorSnafu)?.try_reshape([t, b, h, d_k]).context(TensorSnafu)?;
+        let y_heads = y
+            .try_transpose(0, 1)
+            .context(TensorSnafu)?
+            .try_reshape([t.clone(), b.clone(), SInt::Const(h), SInt::Const(d_k)])
+            .context(TensorSnafu)?;
 
         // Apply RoPE BEFORE linear projections
         let q_rot = y_heads.apply_rotary_emb(cos, sin, false).context(TensorSnafu)?;
         let k_rot = y_heads.apply_rotary_emb(cos, sin, false).context(TensorSnafu)?;
 
         // Reshape back to [B, T, d_model]
-        let q_input =
-            q_rot.try_reshape([t, b, d_model]).context(TensorSnafu)?.try_transpose(0, 1).context(TensorSnafu)?;
-        let k_input =
-            k_rot.try_reshape([t, b, d_model]).context(TensorSnafu)?.try_transpose(0, 1).context(TensorSnafu)?;
+        let q_input = q_rot
+            .try_reshape([t.clone(), b.clone(), SInt::Const(d_model)])
+            .context(TensorSnafu)?
+            .try_transpose(0, 1)
+            .context(TensorSnafu)?;
+        let k_input = k_rot
+            .try_reshape([t.clone(), b.clone(), SInt::Const(d_model)])
+            .context(TensorSnafu)?
+            .try_transpose(0, 1)
+            .context(TensorSnafu)?;
 
         // Project through Q, K, V linear layers
         let q = q_input.linear().weight(&self.q_proj).bias(&self.q_bias).call().context(TensorSnafu)?;
@@ -173,16 +192,32 @@ impl MultiHeadSelfAttention {
         let v = y.linear().weight(&self.v_proj).bias(&self.v_bias).call().context(TensorSnafu)?;
 
         // Reshape to [B, H, T, d_k]
-        let q = q.try_reshape([b, t, h, d_k]).context(TensorSnafu)?.try_transpose(1, 2).context(TensorSnafu)?;
-        let k = k.try_reshape([b, t, h, d_k]).context(TensorSnafu)?.try_transpose(1, 2).context(TensorSnafu)?;
-        let v = v.try_reshape([b, t, h, d_k]).context(TensorSnafu)?.try_transpose(1, 2).context(TensorSnafu)?;
+        let q = q
+            .try_reshape([b.clone(), t.clone(), SInt::Const(h), SInt::Const(d_k)])
+            .context(TensorSnafu)?
+            .try_transpose(1, 2)
+            .context(TensorSnafu)?;
+        let k = k
+            .try_reshape([b.clone(), t.clone(), SInt::Const(h), SInt::Const(d_k)])
+            .context(TensorSnafu)?
+            .try_transpose(1, 2)
+            .context(TensorSnafu)?;
+        let v = v
+            .try_reshape([b.clone(), t.clone(), SInt::Const(h), SInt::Const(d_k)])
+            .context(TensorSnafu)?
+            .try_transpose(1, 2)
+            .context(TensorSnafu)?;
 
         // Scaled dot-product attention
         let attn =
             q.scaled_dot_product_attention().key(&k).value(&v).maybe_attn_mask(mask).call().context(TensorSnafu)?;
 
         // [B, H, T, d_k] -> [B, T, H, d_k] -> [B, T, d_model]
-        let out = attn.try_transpose(1, 2).context(TensorSnafu)?.try_reshape([b, t, d_model]).context(TensorSnafu)?;
+        let out = attn
+            .try_transpose(1, 2)
+            .context(TensorSnafu)?
+            .try_reshape([b, t, SInt::Const(d_model)])
+            .context(TensorSnafu)?;
 
         out.linear().weight(&self.out_proj).bias(&self.out_bias).call().context(TensorSnafu)
     }
@@ -280,7 +315,7 @@ impl ConvModule {
             let valid = mask.logical_not().context(TensorSnafu)?;
             let valid = valid.try_unsqueeze(1).context(TensorSnafu)?;
             let zeros = y.zero().context(TensorSnafu)?;
-            y = zeros.where_(&valid, &y).context(TensorSnafu)?;
+            y = y.where_(&valid, &zeros).context(TensorSnafu)?;
         }
 
         let pad = ((self.conv_kernel - 1) / 2) as isize;
@@ -458,7 +493,7 @@ impl StridingSubsampling {
 
     fn forward_conv2d(&self, x: &Tensor) -> Result<Tensor> {
         let shape = x.shape().context(TensorSnafu)?;
-        let b = shape[0].as_const().expect("batch must be concrete") as isize;
+        let b = shape[0].clone();
 
         let x = x.try_unsqueeze(1).context(TensorSnafu)?;
 
@@ -483,7 +518,7 @@ impl StridingSubsampling {
         let x = x.relu().context(TensorSnafu)?;
 
         let x = x.try_permute(&[0, 2, 1, 3]).context(TensorSnafu)?;
-        let x = x.try_reshape([b, -1, (self.d_model * self.n_mels / 4) as isize]).context(TensorSnafu)?;
+        let x = x.try_reshape([b, SInt::Infer, SInt::Const(self.d_model * self.n_mels / 4)]).context(TensorSnafu)?;
 
         let lw = self.linear_weight.as_ref().expect("conv2d mode requires linear_weight");
         let lb = self.linear_bias.as_ref().expect("conv2d mode requires linear_bias");
@@ -554,6 +589,8 @@ impl ConformerLayer {
         sin: &Tensor,
         att_mask: Option<&Tensor>,
         pad_mask: Option<&Tensor>,
+        batch: SInt,
+        seq_len: SInt,
     ) -> Result<Tensor> {
         let half = Tensor::from_const(0.5f64).cast(x.uop().dtype()).context(TensorSnafu)?;
 
@@ -561,7 +598,9 @@ impl ConformerLayer {
         let x = x.try_add(&self.ffn1.forward(x)?.try_mul(&half).context(TensorSnafu)?).context(TensorSnafu)?;
 
         // MHSA
-        let x = x.try_add(&self.mhsa.forward(&x, cos, sin, att_mask)?).context(TensorSnafu)?;
+        let x = x
+            .try_add(&self.mhsa.forward(&x, cos, sin, att_mask, batch.clone(), seq_len.clone())?)
+            .context(TensorSnafu)?;
 
         // Convolution
         let x = x.try_add(&self.conv.forward(&x, pad_mask)?).context(TensorSnafu)?;

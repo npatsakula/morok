@@ -462,7 +462,8 @@ pub fn apply(
     for opt in &tc.opts {
         match opt {
             TcOpt::Upcast(dim) => {
-                let (replaced, new_rng) = scheduler.shift_to(axes[*dim].clone(), 2, AxisType::Upcast, false, None)?;
+                let (replaced, new_rng) =
+                    scheduler.shift_to_tc_symbolic(axes[*dim].clone(), 2, AxisType::Upcast, false, None)?;
                 axes[*dim] = replaced;
                 ne.push(new_rng);
             }
@@ -471,7 +472,7 @@ pub fn apply(
                     .try_mod(&two)
                     .map_err(|_| ValidationFailedSnafu { op: "TC", reason: "warp mod failed" }.build())?;
                 let (replaced, new_rng) =
-                    scheduler.shift_to(axes[*dim].clone(), 2, AxisType::Local, false, Some(warp_mod))?;
+                    scheduler.shift_to_tc_symbolic(axes[*dim].clone(), 2, AxisType::Local, false, Some(warp_mod))?;
                 axes[*dim] = replaced;
                 warp = warp
                     .try_div(&two)
@@ -483,7 +484,8 @@ pub fn apply(
 
     // K-dimension UNROLL splits
     for (_idx, amt) in tc.get_reduce_axes() {
-        let (replaced, new_rng) = scheduler.shift_to(axes[2].clone(), amt, AxisType::Unroll, false, None)?;
+        let (replaced, new_rng) =
+            scheduler.shift_to_tc_symbolic(axes[2].clone(), amt, AxisType::Unroll, false, None)?;
         axes[2] = replaced;
         ne.push(new_rng);
     }

@@ -3,6 +3,10 @@
 use crate::Tensor;
 use bon::bon;
 use morok_dtype::DType;
+use morok_ir::ConstValue;
+use snafu::ensure;
+
+use crate::error::FloatDTypeRequiredSnafu;
 
 type Result<T> = crate::Result<T>;
 
@@ -84,6 +88,22 @@ impl Tensor {
         #[builder(default)] is_causal: bool,
         softcap: Option<f64>,
     ) -> Result<Tensor> {
+        let q_dtype = self.uop().dtype();
+        ensure!(
+            q_dtype.is_float(),
+            FloatDTypeRequiredSnafu { op: "scaled_dot_product_attention", arg: "query", dtype: q_dtype.clone() }
+        );
+        let k_dtype = key.uop().dtype();
+        ensure!(
+            k_dtype.is_float(),
+            FloatDTypeRequiredSnafu { op: "scaled_dot_product_attention", arg: "key", dtype: k_dtype.clone() }
+        );
+        let v_dtype = value.uop().dtype();
+        ensure!(
+            v_dtype.is_float(),
+            FloatDTypeRequiredSnafu { op: "scaled_dot_product_attention", arg: "value", dtype: v_dtype.clone() }
+        );
+
         let q_shape = self.shape()?;
         let k_shape = key.shape()?;
         let head_dim = q_shape[q_shape.len() - 1].as_const().expect("Q head_dim must be concrete");
@@ -104,19 +124,21 @@ impl Tensor {
             let q_len = q_shape[q_shape.len() - 2].as_const().expect("Q seq_len must be concrete");
             let k_len = k_shape[k_shape.len() - 2].as_const().expect("K seq_len must be concrete");
             let causal = Tensor::full(&[q_len, k_len], true, DType::Bool)?.tril(0)?;
-            let neg_inf = Tensor::const_(f64::NEG_INFINITY, scores_dtype.clone());
-            scores = scores.where_(&causal, &neg_inf)?;
+            let neg_large = Tensor::const_(ConstValue::min(scores_dtype.base()), scores_dtype.clone());
+            scores = scores.where_(&causal, &neg_large)?;
         }
 
         // Attention mask
+        let mut bool_mask: Option<Tensor> = None;
         if let Some(mask) = attn_mask {
             let mask_dtype = mask.uop().dtype();
             if mask_dtype == DType::Bool {
-                // Bool mask: True = attend, False = mask out
-                let neg_inf = Tensor::const_(f64::NEG_INFINITY, scores_dtype.clone());
-                let zero = Tensor::const_(0.0f64, scores_dtype.clone());
-                let additive = zero.where_(mask, &neg_inf)?;
+                // Bool mask: True = mask out, False = keep.
+                let neg_large = Tensor::const_(ConstValue::min(scores_dtype.base()), scores_dtype.clone());
+                let zero = Tensor::const_(ConstValue::zero(scores_dtype.base()), scores_dtype.clone());
+                let additive = neg_large.where_(mask, &zero)?;
                 scores = scores.try_add(&additive)?;
+                bool_mask = Some(mask.clone());
             } else {
                 // Float additive mask
                 scores = scores.try_add(mask)?;
@@ -132,7 +154,11 @@ impl Tensor {
         }
 
         // Softmax + output
-        let attn_weights = scores.softmax(-1isize)?;
+        let mut attn_weights = scores.softmax(-1isize)?;
+        if let Some(mask) = bool_mask.as_ref() {
+            let zero = Tensor::const_(ConstValue::zero(scores_dtype.base()), scores_dtype);
+            attn_weights = zero.where_(mask, &attn_weights)?;
+        }
         attn_weights.matmul(value)
     }
 }

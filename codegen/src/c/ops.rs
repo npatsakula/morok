@@ -300,6 +300,12 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
+        Op::Reshape { src, .. } => {
+            let s = ctx.get(src).to_string();
+            ctx.register(uop.id, s);
+            Some(())
+        }
+
         Op::Range { end, axis_id, axis_type, .. } => {
             if matches!(axis_type, AxisType::Thread) {
                 return None;

@@ -98,6 +98,20 @@ fn test_sint_smax_concrete() {
 }
 
 #[test]
+fn test_sint_smax_absorbs_nested_max() {
+    let n_uop = UOp::new(Op::DefineVar { name: "N".to_string(), min_val: 1, max_val: 100 }, DType::Index);
+    let n = SInt::from(n_uop);
+    let n_plus_1 = &n + 1usize;
+
+    let max_ab = n.smax(&n_plus_1);
+    let absorbed_left = max_ab.smax(&n);
+    let absorbed_right = n.smax(&max_ab);
+
+    assert_eq!(absorbed_left, max_ab);
+    assert_eq!(absorbed_right, max_ab);
+}
+
+#[test]
 fn test_sint_smin_concrete() {
     assert_eq!(SInt::from(3).smin(&SInt::from(7)).as_const(), Some(3));
     assert_eq!(SInt::from(7).smin(&SInt::from(3)).as_const(), Some(3));

@@ -508,6 +508,52 @@ fn test_shift_to_division_error() {
 }
 
 #[test]
+fn test_shift_to_tc_symbolic_exact_division() {
+    // Range end is symbolic but exactly divisible by 2: V * 2.
+    let v = UOp::define_var("V".to_string(), 1, 64);
+    let two = UOp::index_const(2);
+    let end = v.try_mul(&two).expect("index mul should succeed");
+    let r_global = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Global);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_global.clone()]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    let result = scheduler.shift_to_tc_symbolic(r_global, 2, AxisType::Upcast, false, None);
+    assert!(result.is_ok(), "TC symbolic split should succeed for V*2 / 2");
+
+    let (replaced_rng, _new_rng) = result.unwrap();
+    if let Op::Range { end, .. } = replaced_rng.op() {
+        assert!(end.backward_slice_ids().contains(&v.id), "reduced symbolic end should still depend on V");
+    } else {
+        panic!("Expected range after symbolic split");
+    }
+
+    assert_eq!(scheduler.shape_len(), 2);
+}
+
+#[test]
+fn test_shift_to_tc_symbolic_non_divisible_error() {
+    // Range end is symbolic and not provably divisible by 2: V * 3.
+    let v = UOp::define_var("V".to_string(), 1, 64);
+    let three = UOp::index_const(3);
+    let end = v.try_mul(&three).expect("index mul should succeed");
+    let r_global = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Global);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_global.clone()]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    let result = scheduler.shift_to_tc_symbolic(r_global, 2, AxisType::Upcast, false, None);
+    assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), OptError::SymbolicDivisionError { .. }));
+}
+
+#[test]
 fn test_shift_to_substitution_in_ast() {
     // Create a kernel that actually uses the range value in a computation
     let end_16 = UOp::index_const(16);
@@ -1478,4 +1524,30 @@ fn test_apply_threading_heuristic_outer_not_threaded() {
     // Verify NO Thread axis was created
     let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
     assert!(thread_axes.is_empty(), "Should NOT have Thread axis for Outer");
+}
+
+#[test]
+fn test_apply_threading_heuristic_symbolic_work_and_divisibility() {
+    use crate::optimizer::heuristics::apply_threading;
+    use morok_dtype::DType;
+    use morok_ir::BinaryOp;
+
+    // Non-const loop extent with known vmax and const factor.
+    // end = V * 4 where V in [1, 131072] => vmax=524288, divisible by 4.
+    let v = UOp::define_var("V".to_string(), 1, 131072);
+    let four = UOp::index_const(4);
+    let end = UOp::new(Op::Binary(BinaryOp::Mul, v, four), DType::Index);
+    let r_loop = UOp::range_axis(end, AxisId::Renumbered(0), AxisType::Loop);
+
+    let compute = UOp::native_const(1.0f32);
+    let sink = UOp::sink(vec![compute, r_loop]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    let applied = apply_threading(&mut scheduler, 4);
+    assert!(applied, "threading should apply for symbolic extent with sufficient vmax work");
+
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading");
 }

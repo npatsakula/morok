@@ -6,6 +6,7 @@
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 
+use crate::sint::SInt;
 use morok_dtype::DeviceSpec;
 use morok_dtype::{DType, ScalarDType};
 
@@ -351,6 +352,20 @@ impl BufferizeOpts {
     pub fn local() -> Self {
         Self { device: None, addrspace: AddrSpace::Local, removable: true }
     }
+}
+
+/// Compact movement-operation metadata carried by ASSIGN.
+///
+/// Mirrors Tinygrad's `assign.arg` movement tuples `(op, marg)` so we can replay
+/// movement semantics without embedding a movement UOp chain as metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MovementArg {
+    Reshape(Vec<SInt>),
+    Expand(Vec<SInt>),
+    Permute(Vec<usize>),
+    Flip(Vec<bool>),
+    Pad(Vec<(SInt, SInt)>),
+    Shrink(Vec<(SInt, SInt)>),
 }
 
 /// Optimization hint carried by CONTIGUOUS ops.

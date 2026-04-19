@@ -100,6 +100,19 @@ fn test_broadcast_shape() {
 }
 
 #[test]
+fn test_broadcast_shape_symbolic_with_one_identity() {
+    let b = SInt::from(UOp::define_var("B".to_string(), 1, 8));
+    let t = SInt::from(UOp::define_var("T".to_string(), 1, 1024));
+
+    let lhs = smallvec![b.clone(), SInt::Const(1), t.clone()];
+    let rhs = smallvec![SInt::Const(1), SInt::Const(4), SInt::Const(1)];
+
+    let result = broadcast_shape(&lhs, &rhs).unwrap();
+    let expected: Shape = smallvec![b, SInt::Const(4), t];
+    assert_eq!(result, expected);
+}
+
+#[test]
 fn test_broadcast_shape_error() {
     let shape1 = smallvec![SInt::from(3), SInt::from(4)];
     let shape2 = smallvec![SInt::from(3), SInt::from(5)];

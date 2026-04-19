@@ -30,7 +30,7 @@
 //! let output = plan.output_buffer();
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use morok_schedule::{
     Scheduler, apply_post_optimization, beam_search_cached, hand_coded_optimizations, prepare_scheduler,
@@ -55,6 +55,23 @@ use morok_runtime::{
 use snafu::{OptionExt, ResultExt};
 use std::sync::Arc;
 use std::time::Duration;
+
+fn collect_pending_indices(tensors: &[&mut Tensor]) -> Vec<usize> {
+    tensors
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.uop().has_buffer_identity() && !is_any_const(&t.uop()) && !t.has_zero_elements())
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BufferStorageKey {
+    id: u64,
+    offset: usize,
+    size: usize,
+    dtype: morok_dtype::DType,
+}
 
 impl Tensor {
     /// Realize (execute) this tensor's computation graph.
@@ -95,10 +112,13 @@ impl Tensor {
         }
 
         resolve_pending_assigns(&self.uop(), &PrepareConfig::from_env())?;
+        if self.uop().has_buffer_identity() {
+            self.ensure_buffer();
+            return Ok(());
+        }
 
         let old_uop = self.uop();
-        let input_buffer_ids: std::collections::HashSet<u64> =
-            collect_input_buffers(&old_uop).keys().copied().collect();
+        let input_buffer_ids: HashSet<u64> = collect_input_buffers(&old_uop).keys().copied().collect();
 
         let t_prep = std::time::Instant::now();
         let plan = self.prepare()?;
@@ -160,10 +180,13 @@ impl Tensor {
         }
 
         resolve_pending_assigns(&self.uop(), config)?;
+        if self.uop().has_buffer_identity() {
+            self.ensure_buffer();
+            return Ok(());
+        }
 
         let old_uop = self.uop();
-        let input_buffer_ids: std::collections::HashSet<u64> =
-            collect_input_buffers(&old_uop).keys().copied().collect();
+        let input_buffer_ids: HashSet<u64> = collect_input_buffers(&old_uop).keys().copied().collect();
 
         let t_prep = std::time::Instant::now();
         let plan = self.prepare_with(config)?;
@@ -410,12 +433,7 @@ impl Tensor {
         }
 
         // Collect pending (unrealized) tensor indices
-        let pending_indices: Vec<usize> = tensors
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| !t.uop().has_buffer_identity() && !is_any_const(&t.uop()) && !t.has_zero_elements())
-            .map(|(i, _)| i)
-            .collect();
+        let pending_indices = collect_pending_indices(&tensors);
 
         if pending_indices.is_empty() {
             return Ok(());
@@ -426,13 +444,25 @@ impl Tensor {
             resolve_pending_assigns(&tensors[i].uop(), config)?;
         }
 
+        // Pending assigns can realize outputs. Re-sync tensor buffers and
+        // recompute pending tensors from updated graphs.
+        for t in &mut tensors {
+            if t.uop().has_buffer_identity() {
+                t.ensure_buffer();
+            }
+        }
+        let pending_indices = collect_pending_indices(&tensors);
+        if pending_indices.is_empty() {
+            return Ok(());
+        }
+
         // Collect input buffers and old UOps from ALL pending tensors
         let old_uops: Vec<Arc<UOp>> = pending_indices.iter().map(|&i| tensors[i].uop()).collect();
         let mut all_input_buffers = crate::schedule::InputBuffers::new();
         for uop in &old_uops {
             all_input_buffers.extend(collect_input_buffers(uop));
         }
-        let input_ids: std::collections::HashSet<u64> = all_input_buffers.keys().copied().collect();
+        let input_ids: HashSet<u64> = all_input_buffers.keys().copied().collect();
 
         // Create merged SINK(CONTIGUOUS(t1), ..., CONTIGUOUS(tN))
         let contiguouses: Vec<Arc<UOp>> = old_uops.iter().map(|u| u.contiguous()).collect();
@@ -549,12 +579,7 @@ impl Tensor {
         }
 
         // Collect pending (unrealized) tensor indices
-        let pending_indices: Vec<usize> = tensors
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| !t.uop().has_buffer_identity() && !is_any_const(&t.uop()) && !t.has_zero_elements())
-            .map(|(i, _)| i)
-            .collect();
+        let pending_indices = collect_pending_indices(&tensors);
 
         if pending_indices.is_empty() {
             return EmptyScheduleSnafu.fail();
@@ -563,6 +588,18 @@ impl Tensor {
         // Resolve pending assigns so input buffers exist for scheduling.
         for &i in &pending_indices {
             resolve_pending_assigns(&tensors[i].uop(), config)?;
+        }
+
+        // Pending assigns can realize outputs. Re-sync tensor buffers and
+        // recompute pending tensors from updated graphs.
+        for t in &mut tensors {
+            if t.uop().has_buffer_identity() {
+                t.ensure_buffer();
+            }
+        }
+        let pending_indices = collect_pending_indices(&tensors);
+        if pending_indices.is_empty() {
+            return EmptyScheduleSnafu.fail();
         }
 
         // Collect UOps from pending tensors only
@@ -939,7 +976,24 @@ fn prepare_execution_plan(
     config: &PrepareConfig,
 ) -> Result<ExecutionPlan> {
     // Expand the schedule to handle OUTER range iterations
-    let expanded_schedule = expand_schedule(schedule_result.items.clone());
+    let mut expanded_schedule = expand_schedule(schedule_result.items.clone());
+
+    // Memory planning (default-on): remap non-overlapping intermediate buffers
+    // before allocation/compilation. This mirrors Tinygrad's placement of the
+    // planner in the schedule finalization path.
+    if std::env::var("MOROK_DISABLE_MEMORY_PLANNER").as_deref() != Ok("1") {
+        let output_buffer_ids = collect_output_buffer_ids(&expanded_schedule, &schedule_result.output_uop_ids);
+        let planner_result = crate::memory_planner::memory_planner(&expanded_schedule, &output_buffer_ids);
+        if !planner_result.buffer_replace.is_empty() {
+            trace!(
+                replacements = planner_result.buffer_replace.len(),
+                buffers_reused = planner_result.buffers_reused,
+                memory_saved_bytes = planner_result.memory_saved,
+                "applying memory planner buffer replacements"
+            );
+            crate::memory_planner::apply_buffer_replacements(&mut expanded_schedule, &planner_result.buffer_replace);
+        }
+    }
 
     debug!(num_items = expanded_schedule.len(), "expanded schedule");
 
@@ -970,14 +1024,47 @@ fn prepare_execution_plan(
     // Buffers in each ScheduleItem are already in the correct order (from collect_kernel_buffers).
     // We track buffers by their UOp ID (what they were registered under in tensor_registry's buffer index).
     let mut uop_id_to_idx: HashMap<u64, usize> = HashMap::new();
+    let mut storage_to_idx: HashMap<BufferStorageKey, usize> = HashMap::new();
+
+    // BUFFER_VIEW output slots are replaced later with base views. Keep them as
+    // distinct entries even if they currently share physical storage, so replace
+    // cannot accidentally mutate another logical buffer mapping.
+    let buffer_view_output_uop_ids: HashSet<u64> = expanded_schedule
+        .iter()
+        .filter_map(|item| {
+            if matches!(item.ast.op(), Op::BufferView { .. }) { item.buffer_uop_ids.first().copied() } else { None }
+        })
+        .collect();
 
     for item in &expanded_schedule {
         // Ensure all buffers are allocated
         for (buffer, &uop_id) in item.buffers.iter().zip(item.buffer_uop_ids.iter()) {
             buffer.ensure_allocated().context(DeviceSnafu)?;
 
-            // Add buffer if not already added (use UOp ID for registry cleanup)
-            uop_id_to_idx.entry(uop_id).or_insert_with(|| builder.add_buffer(uop_id, buffer.clone()));
+            if uop_id_to_idx.contains_key(&uop_id) {
+                continue;
+            }
+
+            let storage_key = BufferStorageKey {
+                id: buffer.id().0,
+                offset: buffer.offset(),
+                size: buffer.size(),
+                dtype: buffer.dtype(),
+            };
+
+            let idx = if !buffer_view_output_uop_ids.contains(&uop_id) {
+                if let Some(&existing_idx) = storage_to_idx.get(&storage_key) {
+                    builder.map_buffer(uop_id, existing_idx);
+                    existing_idx
+                } else {
+                    let new_idx = builder.add_buffer(uop_id, buffer.clone());
+                    storage_to_idx.insert(storage_key, new_idx);
+                    new_idx
+                }
+            } else {
+                builder.add_buffer(uop_id, buffer.clone())
+            };
+            uop_id_to_idx.insert(uop_id, idx);
         }
 
         // Collect alias IDs for cleanup
@@ -1114,6 +1201,19 @@ fn prepare_execution_plan(
 
     let plan = builder.build();
     Ok(plan)
+}
+
+fn collect_output_buffer_ids(schedule: &crate::schedule::Schedule, output_uop_ids: &[u64]) -> HashSet<u64> {
+    let output_uop_set: HashSet<u64> = output_uop_ids.iter().copied().collect();
+    let mut output_buffer_ids = HashSet::new();
+    for item in schedule {
+        for (buffer, &uop_id) in item.buffers.iter().zip(item.buffer_uop_ids.iter()) {
+            if output_uop_set.contains(&uop_id) {
+                output_buffer_ids.insert(buffer.id().0);
+            }
+        }
+    }
+    output_buffer_ids
 }
 
 /// Resolve the device string for cache keying (includes compiler cache key).

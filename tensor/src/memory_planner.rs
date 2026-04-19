@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use morok_device::Buffer;
 use morok_dtype::{DType, DeviceSpec};
+use morok_ir::Op;
 use tracing::{debug, trace};
 
 use crate::schedule::Schedule;
@@ -41,6 +42,8 @@ pub struct BufferPoolKey {
     pub dtype: DType,
     /// Buffer size in bytes (rounded up to MIN_BLOCK_SIZE).
     pub size: usize,
+    /// Logical shape metadata (must match for safe reuse in Morok codegen).
+    pub shape: Vec<usize>,
 }
 
 /// Liveness information for a buffer.
@@ -50,12 +53,10 @@ pub struct BufferLiveness {
     pub first_appearance: usize,
     /// Index of last schedule step that uses this buffer.
     pub last_appearance: usize,
-    /// Whether this buffer is an output buffer (must not be reused).
-    pub is_output: bool,
-    /// Whether this buffer is already allocated (input tensor).
-    pub is_allocated: bool,
     /// Pool key for buffer grouping.
     pub pool_key: BufferPoolKey,
+    /// Representative logical buffer for this allocation ID.
+    pub prototype: Buffer,
 }
 
 /// Buffer allocation/deallocation event for timeline scheduling.
@@ -65,8 +66,16 @@ struct BufferEvent {
     timestep: usize,
     /// True for allocation, false for deallocation.
     is_alloc: bool,
-    /// Buffer identifier (UOp ID or buffer index).
-    buffer_id: BufferKey,
+    /// Physical buffer allocation identifier.
+    buffer_id: u64,
+}
+
+/// Collected planner inputs derived from schedule traversal.
+struct PlannerInput {
+    /// Liveness keyed by physical buffer allocation ID.
+    liveness: HashMap<u64, BufferLiveness>,
+    /// Logical schedule slots that are eligible for replacement.
+    occurrences: Vec<(BufferKey, u64)>,
 }
 
 /// Key to identify a buffer within a schedule.
@@ -103,80 +112,65 @@ pub struct MemoryPlannerResult {
 /// - Already allocated buffers (inputs)
 /// - Output buffers
 /// - Transfer operations
-fn analyze_liveness(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> HashMap<BufferKey, BufferLiveness> {
-    let mut liveness: HashMap<BufferKey, BufferLiveness> = HashMap::new();
+fn collect_noopt_buffer_ids(schedule: &Schedule) -> HashSet<u64> {
+    schedule
+        .iter()
+        .filter(|item| !matches!(item.ast.op(), Op::Sink { .. }))
+        .flat_map(|item| item.buffers.iter().map(|b| b.id().0))
+        .collect()
+}
+
+fn should_skip_buffer(buffer: &Buffer, output_buffer_ids: &HashSet<u64>, noopt_buffer_ids: &HashSet<u64>) -> bool {
+    // Phase 1 planner only remaps full logical buffers. View/offset buffers require
+    // an alias-preserving remap pass (planned for arena phase).
+    buffer.offset() != 0
+        || buffer.is_allocated()
+        || output_buffer_ids.contains(&buffer.id().0)
+        || noopt_buffer_ids.contains(&buffer.id().0)
+}
+
+fn analyze_liveness(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> PlannerInput {
+    let noopt_buffer_ids = collect_noopt_buffer_ids(schedule);
+    let mut liveness: HashMap<u64, BufferLiveness> = HashMap::new();
+    let mut occurrences: Vec<(BufferKey, u64)> = Vec::new();
 
     for (step_idx, item) in schedule.iter().enumerate() {
         for (buf_idx, buffer) in item.buffers.iter().enumerate() {
             let key = BufferKey { kernel_idx: step_idx, buffer_idx: buf_idx };
+            let buf_id = buffer.id().0;
 
-            // Skip already allocated buffers (inputs)
-            if buffer.is_allocated() {
-                trace!(step_idx, buf_idx, "skipping: already allocated (input)");
+            if should_skip_buffer(buffer, output_buffer_ids, &noopt_buffer_ids) {
+                trace!(step_idx, buf_idx, buffer_id = buf_id, "skipping buffer in memory planner");
                 continue;
             }
 
-            // Skip output buffers (must persist after execution)
-            // Check if any buffer's registry ID matches output IDs
-            if output_buffer_ids.contains(&buffer.id().0) {
-                trace!(step_idx, buf_idx, buffer_id = buffer.id().0, "skipping: output buffer");
-                continue;
-            }
-
-            // Skip transfer operations (preserve parallelism)
-            if is_transfer(&item.ast) {
-                trace!(step_idx, buf_idx, "skipping: transfer operation");
-                continue;
-            }
+            occurrences.push((key, buf_id));
 
             let pool_key = BufferPoolKey {
                 device: buffer.allocator().device_spec(),
                 dtype: buffer.dtype(),
                 size: round_up(buffer.size(), MIN_BLOCK_SIZE),
+                shape: buffer.shape().to_vec(),
             };
 
-            liveness.insert(
-                key,
-                BufferLiveness {
+            liveness
+                .entry(buf_id)
+                .and_modify(|info| {
+                    info.first_appearance = info.first_appearance.min(step_idx);
+                    info.last_appearance = info.last_appearance.max(step_idx);
+                })
+                .or_insert_with(|| BufferLiveness {
                     first_appearance: step_idx,
                     last_appearance: step_idx,
-                    is_output: false,
-                    is_allocated: false,
                     pool_key,
-                },
-            );
-        }
-    }
-
-    // Second pass: update last_appearance for shared buffers
-    // Buffers with the same underlying allocation should have the same liveness
-    let mut buffer_id_to_last: HashMap<u64, usize> = HashMap::new();
-
-    for (step_idx, item) in schedule.iter().enumerate() {
-        for buffer in &item.buffers {
-            let buf_id = buffer.id().0;
-            buffer_id_to_last.entry(buf_id).and_modify(|last| *last = (*last).max(step_idx)).or_insert(step_idx);
-        }
-    }
-
-    // Update liveness with max last_appearance for each buffer
-    for (key, info) in liveness.iter_mut() {
-        if let Some(item) = schedule.get(key.kernel_idx)
-            && let Some(buffer) = item.buffers.get(key.buffer_idx)
-            && let Some(&last) = buffer_id_to_last.get(&buffer.id().0)
-        {
-            info.last_appearance = last;
+                    prototype: buffer.clone(),
+                });
         }
     }
 
     debug!(num_optimizable = liveness.len(), "liveness analysis complete");
 
-    liveness
-}
-
-/// Check if an AST represents a transfer operation.
-fn is_transfer(ast: &std::sync::Arc<morok_ir::UOp>) -> bool {
-    matches!(ast.op(), morok_ir::Op::Copy { .. })
+    PlannerInput { liveness, occurrences }
 }
 
 // ============================================================================
@@ -190,15 +184,15 @@ fn is_transfer(ast: &std::sync::Arc<morok_ir::UOp>) -> bool {
 /// - At the same timestep, frees (is_alloc=false) come before allocs (is_alloc=true)
 ///
 /// This ordering allows immediate reuse of freed buffers.
-fn build_event_timeline(liveness: &HashMap<BufferKey, BufferLiveness>) -> Vec<BufferEvent> {
+fn build_event_timeline(liveness: &HashMap<u64, BufferLiveness>) -> Vec<BufferEvent> {
     let mut events = Vec::with_capacity(liveness.len() * 2);
 
-    for (&buf_key, info) in liveness {
+    for (&buf_id, info) in liveness {
         // Allocation event at first appearance
-        events.push(BufferEvent { timestep: info.first_appearance, is_alloc: true, buffer_id: buf_key });
+        events.push(BufferEvent { timestep: info.first_appearance, is_alloc: true, buffer_id: buf_id });
 
         // Deallocation event after last appearance
-        events.push(BufferEvent { timestep: info.last_appearance + 1, is_alloc: false, buffer_id: buf_key });
+        events.push(BufferEvent { timestep: info.last_appearance + 1, is_alloc: false, buffer_id: buf_id });
     }
 
     // Sort by (timestep, is_alloc) - false < true ensures frees before allocs
@@ -221,16 +215,16 @@ fn build_event_timeline(liveness: &HashMap<BufferKey, BufferLiveness>) -> Vec<Bu
 /// - Return the buffer to the pool for future reuse
 fn process_events(
     events: &[BufferEvent],
-    liveness: &HashMap<BufferKey, BufferLiveness>,
-    schedule: &Schedule,
+    liveness: &HashMap<u64, BufferLiveness>,
+    occurrences: &[(BufferKey, u64)],
 ) -> (HashMap<BufferKey, Buffer>, usize, usize) {
-    let mut buffer_replace: HashMap<BufferKey, Buffer> = HashMap::new();
     let mut free_pools: HashMap<BufferPoolKey, Vec<Buffer>> = HashMap::new();
     let mut memory_saved: usize = 0;
     let mut buffers_reused: usize = 0;
+    let mut chosen_by_id: HashMap<u64, Buffer> = HashMap::new();
 
-    // Track which buffer each key currently maps to (for deallocation)
-    let mut active_buffers: HashMap<BufferKey, Buffer> = HashMap::new();
+    // Track live assignment during timeline simulation.
+    let mut active_buffers: HashMap<u64, Buffer> = HashMap::new();
 
     for event in events {
         let info = match liveness.get(&event.buffer_id) {
@@ -244,15 +238,9 @@ fn process_events(
             if let Some(pool) = free_pools.get_mut(pool_key)
                 && let Some(reused) = pool.pop()
             {
-                trace!(
-                    timestep = event.timestep,
-                    kernel_idx = event.buffer_id.kernel_idx,
-                    buffer_idx = event.buffer_id.buffer_idx,
-                    reused_buffer_id = reused.id().0,
-                    "reusing buffer from pool"
-                );
+                trace!(timestep = event.timestep, reused_buffer_id = reused.id().0, "reusing buffer from pool");
 
-                buffer_replace.insert(event.buffer_id, reused.clone());
+                chosen_by_id.insert(event.buffer_id, reused.clone());
                 active_buffers.insert(event.buffer_id, reused);
                 memory_saved += pool_key.size;
                 buffers_reused += 1;
@@ -260,16 +248,22 @@ fn process_events(
             }
 
             // No reuse - use original buffer
-            if let Some(item) = schedule.get(event.buffer_id.kernel_idx)
-                && let Some(buffer) = item.buffers.get(event.buffer_id.buffer_idx)
-            {
-                active_buffers.insert(event.buffer_id, buffer.clone());
-            }
+            chosen_by_id.insert(event.buffer_id, info.prototype.clone());
+            active_buffers.insert(event.buffer_id, info.prototype.clone());
         } else {
             // Deallocation - return buffer to pool
             if let Some(buffer) = active_buffers.remove(&event.buffer_id) {
                 free_pools.entry(pool_key.clone()).or_default().push(buffer);
             }
+        }
+    }
+
+    let mut buffer_replace: HashMap<BufferKey, Buffer> = HashMap::new();
+    for (key, buf_id) in occurrences {
+        if let Some(chosen) = chosen_by_id.get(buf_id)
+            && chosen.id().0 != *buf_id
+        {
+            buffer_replace.insert(*key, chosen.clone());
         }
     }
 
@@ -299,7 +293,8 @@ pub fn memory_planner(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> 
     }
 
     // Phase 1: Liveness analysis
-    let liveness = analyze_liveness(schedule, output_buffer_ids);
+    let planner_input = analyze_liveness(schedule, output_buffer_ids);
+    let liveness = planner_input.liveness;
 
     if liveness.is_empty() {
         debug!("no optimizable buffers found");
@@ -310,7 +305,7 @@ pub fn memory_planner(schedule: &Schedule, output_buffer_ids: &HashSet<u64>) -> 
     let events = build_event_timeline(&liveness);
 
     // Phase 3: Process events and compute replacements
-    let (buffer_replace, memory_saved, buffers_reused) = process_events(&events, &liveness, schedule);
+    let (buffer_replace, memory_saved, buffers_reused) = process_events(&events, &liveness, &planner_input.occurrences);
 
     debug!(
         buffers_analyzed = liveness.len(),
@@ -343,6 +338,42 @@ pub fn apply_buffer_replacements(schedule: &mut Schedule, replacements: &HashMap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schedule::ScheduleItem;
+    use morok_device::Buffer;
+    use morok_ir::UOp;
+
+    fn make_buffer(numel: usize) -> Buffer {
+        let alloc = morok_device::registry::cpu().expect("cpu allocator");
+        Buffer::new(alloc, DType::Float32, vec![numel], Default::default())
+    }
+
+    fn make_sink_item(id: u64, buffer: Buffer) -> ScheduleItem {
+        let ast = UOp::sink(vec![UOp::native_const(0.0f32)]);
+        ScheduleItem {
+            kernel: ast.clone(),
+            ast,
+            buffers: vec![buffer],
+            buffer_uop_ids: vec![id],
+            fixedvars: HashMap::new(),
+            bound_ranges: Vec::new(),
+            dependencies: Vec::new(),
+            alias_registered_ids: Vec::new(),
+        }
+    }
+
+    fn make_nonsink_item(id: u64, buffer: Buffer) -> ScheduleItem {
+        let ast = UOp::native_const(1.0f32);
+        ScheduleItem {
+            kernel: ast.clone(),
+            ast,
+            buffers: vec![buffer],
+            buffer_uop_ids: vec![id],
+            fixedvars: HashMap::new(),
+            bound_ranges: Vec::new(),
+            dependencies: Vec::new(),
+            alias_registered_ids: Vec::new(),
+        }
+    }
 
     #[test]
     fn test_round_up() {
@@ -354,9 +385,9 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_key_equality() {
-        let key1 = BufferPoolKey { device: DeviceSpec::Cpu, dtype: DType::Float32, size: 0x1000 };
-        let key2 = BufferPoolKey { device: DeviceSpec::Cpu, dtype: DType::Float32, size: 0x1000 };
-        let key3 = BufferPoolKey { device: DeviceSpec::Cpu, dtype: DType::Float32, size: 0x2000 };
+        let key1 = BufferPoolKey { device: DeviceSpec::Cpu, dtype: DType::Float32, size: 0x1000, shape: vec![256] };
+        let key2 = BufferPoolKey { device: DeviceSpec::Cpu, dtype: DType::Float32, size: 0x1000, shape: vec![256] };
+        let key3 = BufferPoolKey { device: DeviceSpec::Cpu, dtype: DType::Float32, size: 0x2000, shape: vec![512] };
 
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
@@ -364,26 +395,33 @@ mod tests {
 
     #[test]
     fn test_event_timeline_ordering() {
-        // Create mock liveness data
-        let mut liveness = HashMap::new();
+        let mut liveness: HashMap<u64, BufferLiveness> = HashMap::new();
         liveness.insert(
-            BufferKey { kernel_idx: 0, buffer_idx: 0 },
+            1,
             BufferLiveness {
                 first_appearance: 0,
                 last_appearance: 1,
-                is_output: false,
-                is_allocated: false,
-                pool_key: BufferPoolKey { device: DeviceSpec::Cpu, dtype: DType::Float32, size: 0x1000 },
+                pool_key: BufferPoolKey {
+                    device: DeviceSpec::Cpu,
+                    dtype: DType::Float32,
+                    size: 0x1000,
+                    shape: vec![256],
+                },
+                prototype: make_buffer(256),
             },
         );
         liveness.insert(
-            BufferKey { kernel_idx: 1, buffer_idx: 0 },
+            2,
             BufferLiveness {
                 first_appearance: 2,
                 last_appearance: 3,
-                is_output: false,
-                is_allocated: false,
-                pool_key: BufferPoolKey { device: DeviceSpec::Cpu, dtype: DType::Float32, size: 0x1000 },
+                pool_key: BufferPoolKey {
+                    device: DeviceSpec::Cpu,
+                    dtype: DType::Float32,
+                    size: 0x1000,
+                    shape: vec![256],
+                },
+                prototype: make_buffer(256),
             },
         );
 
@@ -411,5 +449,31 @@ mod tests {
         assert!(result.buffer_replace.is_empty());
         assert_eq!(result.memory_saved, 0);
         assert_eq!(result.buffers_reused, 0);
+    }
+
+    #[test]
+    fn test_memory_planner_reuses_non_overlapping_buffers() {
+        let b0 = make_buffer(256);
+        let b1 = make_buffer(256);
+
+        let schedule = vec![make_sink_item(10, b0.clone()), make_sink_item(11, b1.clone())];
+        let result = memory_planner(&schedule, &HashSet::new());
+
+        assert_eq!(result.buffers_reused, 1);
+        let key = BufferKey { kernel_idx: 1, buffer_idx: 0 };
+        let replacement = result.buffer_replace.get(&key).expect("second buffer should be remapped");
+        assert_eq!(replacement.id(), b0.id());
+    }
+
+    #[test]
+    fn test_memory_planner_skips_non_sink_noopt_buffers() {
+        let b0 = make_buffer(256);
+        let b1 = make_buffer(256);
+
+        let schedule = vec![make_nonsink_item(20, b0), make_sink_item(21, b1)];
+        let result = memory_planner(&schedule, &HashSet::new());
+
+        assert_eq!(result.buffers_reused, 0);
+        assert!(result.buffer_replace.is_empty());
     }
 }

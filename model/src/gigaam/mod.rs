@@ -14,8 +14,9 @@ extern crate self as morok_model;
 use std::path::Path;
 
 use morok_dtype::DType;
+use morok_ir::SInt;
 use morok_macros::jit_wrapper;
-use morok_tensor::Tensor;
+use morok_tensor::{BoundVariable, Tensor};
 use snafu::ResultExt;
 
 use crate::audio::{MelConfig, MelSpectrogram};
@@ -34,6 +35,7 @@ pub enum ConvNormType {
 }
 
 pub struct GigaAmConfig {
+    pub max_batch_size: usize,
     pub n_mels: usize,
     pub d_model: usize,
     pub n_heads: usize,
@@ -78,6 +80,7 @@ impl GigaAmConfig {
         };
 
         Ok(Self {
+            max_batch_size: enc["max_batch_size"].as_u64().unwrap_or(32) as usize,
             n_mels: pre["features"].as_u64().expect("features") as usize,
             d_model,
             n_heads: enc["n_heads"].as_u64().expect("n_heads") as usize,
@@ -212,16 +215,33 @@ impl GigaAm {
         let x = self.subsampling.forward(&x)?;
 
         let shape = x.shape().context(TensorSnafu)?;
-        let seq_len = shape[1].as_const().expect("seq_len must be concrete after subsampling");
+        let batch = shape[0].clone();
+        let seq_len = shape[1].clone();
 
         let d_half = self.config.d_model / self.config.n_heads / 2;
 
-        let cos = self.cos_cache.try_shrink([(0, seq_len), (0, 1), (0, 1), (0, d_half)]).context(TensorSnafu)?;
-        let sin = self.sin_cache.try_shrink([(0, seq_len), (0, 1), (0, 1), (0, d_half)]).context(TensorSnafu)?;
+        let cos = self
+            .cos_cache
+            .try_shrink([
+                (SInt::Const(0), seq_len.clone()),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(d_half)),
+            ])
+            .context(TensorSnafu)?;
+        let sin = self
+            .sin_cache
+            .try_shrink([
+                (SInt::Const(0), seq_len.clone()),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(d_half)),
+            ])
+            .context(TensorSnafu)?;
 
         let mut x = x;
         for layer in &self.layers {
-            x = layer.forward(&x, &cos, &sin, None, None)?;
+            x = layer.forward(&x, &cos, &sin, None, None, batch.clone(), seq_len.clone())?;
         }
 
         x.try_transpose(-1, -2).context(TensorSnafu) // [B, d_model, T/4]
@@ -231,41 +251,95 @@ impl GigaAm {
         self.subsampling.output_length(mel_frames)
     }
 
-    pub fn encode_batch(&self, x: &Tensor, lengths: &Tensor) -> Result<Tensor> {
+    /// Batched encoder path with dynamic batch and mel-frame length.
+    ///
+    /// Input:
+    /// - `mel`: `[B, n_mels, T_mel]`
+    /// - `lengths`: `[B]` valid lengths in mel frames
+    ///
+    /// Output:
+    /// - `[B, d_model, T_sub]` where `T_sub` is subsampled from `T_mel`.
+    pub fn encode_batch(
+        &self,
+        mel: &Tensor,
+        lengths: &Tensor,
+        batch: &BoundVariable,
+        seq_len: &BoundVariable,
+    ) -> Result<Tensor> {
+        let b = batch.as_sint();
+        let t = seq_len.as_sint();
+
+        let lengths = lengths.try_shrink([Some((SInt::Const(0), b.clone()))]).context(TensorSnafu)?;
+        let lengths = lengths.cast(DType::Index).context(TensorSnafu)?;
+
+        let two_t = Tensor::from_slice([2i64]).cast(DType::Index).context(TensorSnafu)?;
+        let one_t = Tensor::from_slice([1i64]).cast(DType::Index).context(TensorSnafu)?;
+
+        let mut lengths_sub = lengths;
+        for _ in 0..2 {
+            lengths_sub = lengths_sub.try_add(&one_t).context(TensorSnafu)?.try_div(&two_t).context(TensorSnafu)?;
+        }
+
+        let mel = mel
+            .try_shrink([Some((SInt::Const(0), b.clone())), None, Some((SInt::Const(0), t.clone()))])
+            .context(TensorSnafu)?;
+        let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
+        let x = self.subsampling.forward(&x)?;
+
         let shape = x.shape().context(TensorSnafu)?;
-        let b = shape[0].as_const().expect("batch dim must be concrete");
-        let t = shape[1].as_const().expect("seq dim must be concrete");
+        let t_sub = shape[1].clone();
 
-        let (att_mask, pad_mask) = if b > 1 {
-            let range =
-                Tensor::arange(t as i64, None, None).context(TensorSnafu)?.cast(DType::Int32).context(TensorSnafu)?;
-            let range = range.try_reshape([1, t as isize]).context(TensorSnafu)?;
-            let lens = lengths.try_reshape([b as isize, 1]).context(TensorSnafu)?;
-            let pad_valid = range.try_lt(&lens).context(TensorSnafu)?;
+        let range = Tensor::arange(self.config.max_seq_len as i64, None, None).context(TensorSnafu)?;
+        let range = range.cast(DType::Index).context(TensorSnafu)?;
+        let range = range.try_shrink([(SInt::Const(0), t_sub.clone())]).context(TensorSnafu)?;
+        let range = range.try_reshape([SInt::Const(1), t_sub.clone()]).context(TensorSnafu)?;
+        let lens = lengths_sub;
+        let lens = lens.try_reshape([b.clone(), SInt::Const(1)]).context(TensorSnafu)?;
+        let pad_valid = range.try_lt(&lens).context(TensorSnafu)?;
 
-            let pv1 = pad_valid.try_unsqueeze(1).context(TensorSnafu)?;
-            let pv2 = pad_valid.try_unsqueeze(2).context(TensorSnafu)?;
-            let att = pv1
+        let pv1 = pad_valid.try_unsqueeze(1).context(TensorSnafu)?;
+        let pv2 = pad_valid.try_unsqueeze(2).context(TensorSnafu)?;
+        let att_mask = if batch.value() > 1 {
+            let att_mask = pv1
                 .bitwise_and(&pv2)
                 .context(TensorSnafu)?
                 .logical_not()
                 .context(TensorSnafu)?
                 .try_unsqueeze(1)
                 .context(TensorSnafu)?;
-
-            let pad = pad_valid.logical_not().context(TensorSnafu)?;
-            (Some(att), Some(pad))
+            Some(
+                att_mask
+                    .try_expand([b.clone(), SInt::Const(self.config.n_heads), t_sub.clone(), t_sub.clone()])
+                    .context(TensorSnafu)?,
+            )
         } else {
-            (None, None)
+            None
         };
+        let pad_mask = pad_valid.logical_not().context(TensorSnafu)?;
 
         let d_half = self.config.d_model / self.config.n_heads / 2;
-        let cos = self.cos_cache.try_shrink([(0, t), (0, 1), (0, 1), (0, d_half)]).context(TensorSnafu)?;
-        let sin = self.sin_cache.try_shrink([(0, t), (0, 1), (0, 1), (0, d_half)]).context(TensorSnafu)?;
+        let cos = self
+            .cos_cache
+            .try_shrink([
+                (SInt::Const(0), t_sub.clone()),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(d_half)),
+            ])
+            .context(TensorSnafu)?;
+        let sin = self
+            .sin_cache
+            .try_shrink([
+                (SInt::Const(0), t_sub.clone()),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(1)),
+                (SInt::Const(0), SInt::Const(d_half)),
+            ])
+            .context(TensorSnafu)?;
 
-        let mut x = x.clone();
+        let mut x = x;
         for layer in &self.layers {
-            x = layer.forward(&x, &cos, &sin, att_mask.as_ref(), pad_mask.as_ref())?;
+            x = layer.forward(&x, &cos, &sin, att_mask.as_ref(), Some(&pad_mask), b.clone(), t_sub.clone())?;
         }
 
         x.try_transpose(-1, -2).context(TensorSnafu)
@@ -285,11 +359,16 @@ jit_wrapper! {
 
 jit_wrapper! {
     GigaAmBatchedJit(GigaAm) {
-        features: Tensor,
+        mel: Tensor,
         lengths: Tensor,
 
-        build(features, lengths) {
-            let encoded = model.encode_batch(features, lengths)?;
+        vars {
+            b: (1, model.config.max_batch_size),
+            t: (1, model.config.max_seq_len),
+        }
+
+        build(mel, lengths, b, t) {
+            let encoded = model.encode_batch(mel, lengths, &b, &t)?;
             model.head.forward(&encoded)
         }
     }

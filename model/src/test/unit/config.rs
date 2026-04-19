@@ -7,6 +7,7 @@ fn test_config_from_json() {
     let config = GigaAmConfig::from_json(Path::new("tests/gigaam/ctc_config.json")).unwrap();
 
     assert_eq!(config.n_mels, 64);
+    assert_eq!(config.max_batch_size, 32);
     assert_eq!(config.d_model, 768);
     assert_eq!(config.n_heads, 16);
     assert_eq!(config.n_layers, 16);

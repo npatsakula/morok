@@ -6,6 +6,7 @@ use crate::state::StateDict;
 
 fn make_config(conv_norm: ConvNormType) -> GigaAmConfig {
     GigaAmConfig {
+        max_batch_size: 8,
         n_mels: 64,
         d_model: 768,
         n_heads: 16,

@@ -259,6 +259,23 @@ impl ExecutionPlan {
         self.execute()
     }
 
+    /// Re-execute the plan with different variable bindings and per-kernel timing.
+    ///
+    /// Updates kernel `vals` the same way as [`Self::execute_with_vars`] and then
+    /// executes via [`Self::execute_profiled`].
+    pub fn execute_with_vars_profiled(&mut self, var_vals: &[(&str, i64)]) -> Result<Vec<KernelProfile>> {
+        // Build a map for O(1) lookup (avoids O(V*K) linear scan per kernel)
+        let vals_map: HashMap<&str, i64> = var_vals.iter().copied().collect();
+        for kernel in &mut self.kernels {
+            for (idx, name) in kernel.kernel.var_names.iter().enumerate() {
+                if let Some(&v) = vals_map.get(name.as_str()) {
+                    kernel.vals[idx] = v;
+                }
+            }
+        }
+        self.execute_profiled()
+    }
+
     /// Get the first output buffer index.
     pub fn output_buffer_idx(&self) -> usize {
         self.output_buffer_indices[0]
@@ -374,6 +391,11 @@ impl ExecutionPlanBuilder {
         idx
     }
 
+    /// Map an additional AST/buffer UOp ID to an existing buffer index.
+    pub fn map_buffer(&mut self, ast_id: u64, idx: usize) {
+        self.ast_to_buffer.insert(ast_id, idx);
+    }
+
     /// Replace a buffer at the given index (for BUFFER_VIEW sub-buffer views).
     pub fn replace_buffer(&mut self, idx: usize, buffer: Buffer) {
         self.buffers[idx] = buffer;
@@ -433,5 +455,20 @@ mod tests {
         assert!(plan.kernels.is_empty());
         assert!(plan.buffers.is_empty());
         assert_eq!(plan.device, DeviceSpec::Cpu);
+    }
+
+    #[test]
+    fn test_builder_map_buffer_alias() {
+        let alloc = morok_device::registry::cpu().expect("cpu allocator");
+        let buf = Buffer::new(alloc, morok_dtype::DType::Float32, vec![8], Default::default());
+
+        let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
+        let idx = builder.add_buffer(10, buf);
+        builder.map_buffer(11, idx);
+        let plan = builder.build();
+
+        assert_eq!(plan.ast_to_buffer_map().get(&10), Some(&idx));
+        assert_eq!(plan.ast_to_buffer_map().get(&11), Some(&idx));
+        assert_eq!(plan.buffers().len(), 1);
     }
 }
