@@ -228,3 +228,32 @@ fn test_multiple_contexts_independent() {
     let r = ctx2.new_range(&SInt::Const(30), AxisType::Loop);
     assert!(matches!(r.op(), Op::Range { axis_id: AxisId::Unrenumbered(0), .. }));
 }
+
+#[test]
+fn test_recovery_stats_tracking() {
+    let mut ctx = IndexingContext::new();
+    ctx.record_recovery_retry(3, 5);
+
+    assert_eq!(ctx.stats.recovery_retries, 1);
+    assert_eq!(ctx.stats.leaked_pad_ops, 3);
+    assert_eq!(ctx.stats.leaked_reduceaxis_ops, 5);
+}
+
+#[test]
+fn test_fallback_counters_and_soft_limit() {
+    let mut ctx = IndexingContext::new();
+
+    let mut last_pad_allowed = true;
+    for _ in 0..300 {
+        last_pad_allowed = ctx.record_pad_fallback();
+    }
+
+    let mut last_reduce_allowed = true;
+    for _ in 0..300 {
+        last_reduce_allowed = ctx.record_reduceaxis_fallback();
+    }
+
+    assert!(!last_pad_allowed, "PAD fallback should eventually hit soft limit");
+    assert!(!last_reduce_allowed, "ReduceAxis fallback should eventually hit soft limit");
+    assert!(ctx.stats.fallback_suppressed > 0, "suppressed counter should increment when limits are exceeded");
+}

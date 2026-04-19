@@ -11,12 +11,13 @@
 use std::f32::consts::PI;
 use std::sync::Arc;
 
+use morok_device::DeviceSpec;
 use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
+use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp};
 
 use crate::pattern::RewriteResult;
-use crate::rangeify::IndexingContext;
 use crate::rangeify::patterns;
+use crate::rangeify::IndexingContext;
 
 // ===== early_rewrites Pattern Tests =====
 
@@ -542,6 +543,47 @@ fn test_movement_op_removal_non_movement_op() {
     // apply_bufferize_transform returns None)
     let result = matcher.rewrite(&sqrt, &mut ctx);
     assert!(matches!(result, RewriteResult::NoMatch), "Should not match non-movement ops without ranges");
+}
+
+#[test]
+fn test_pad_fallback_soft_limit_suppresses_non_upstream_recovery() {
+    let matcher = patterns::apply_rangeify_patterns();
+    let mut ctx = IndexingContext::new();
+
+    for _ in 0..300 {
+        let _ = ctx.record_pad_fallback();
+    }
+    let suppressed_before = ctx.stats.fallback_suppressed;
+
+    let src = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let r = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
+    ctx.set_ranges(&src, vec![r.clone()], vec![r]);
+
+    let begin_pads = UOp::vectorize(vec![UOp::index_const(1)].into());
+    let end_pads = UOp::vectorize(vec![UOp::index_const(1)].into());
+    let pad = UOp::new(Op::Pad { src, begin_pads, end_pads }, DType::Float32);
+
+    let result = matcher.rewrite(&pad, &mut ctx);
+    assert!(matches!(result, RewriteResult::NoMatch), "PAD fallback should be suppressed after soft limit");
+    assert!(ctx.stats.fallback_suppressed > suppressed_before, "suppressed counter should increase");
+}
+
+#[test]
+fn test_reduceaxis_fallback_soft_limit_suppresses_non_upstream_recovery() {
+    let matcher = patterns::apply_rangeify_patterns();
+    let mut ctx = IndexingContext::new();
+
+    for _ in 0..300 {
+        let _ = ctx.record_reduceaxis_fallback();
+    }
+    let suppressed_before = ctx.stats.fallback_suppressed;
+
+    let src = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+    let reduce = src.try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
+
+    let result = matcher.rewrite(&reduce, &mut ctx);
+    assert!(matches!(result, RewriteResult::NoMatch), "ReduceAxis fallback should be suppressed after soft limit");
+    assert!(ctx.stats.fallback_suppressed > suppressed_before, "suppressed counter should increase");
 }
 
 // ===== Integration Tests =====

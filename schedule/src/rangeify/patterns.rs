@@ -400,9 +400,15 @@ fn convert_pad_to_where(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<U
     let (input_ranges, output_ranges) = if let Some((input_ranges, output_ranges)) = ctx.get_ranges(x) {
         (input_ranges.clone(), output_ranges.clone())
     } else {
+        if !ctx.record_pad_fallback() {
+            trace!(uop_id = x.id, "convert_pad_to_where: PAD fallback suppressed by soft limit");
+            return None;
+        }
+
         // Rare fallback: the rewrite engine may reconstruct a semantically equivalent PAD
         // node (hash-consed to an existing global UOp) that wasn't present during
         // assign_ranges. Recover using the PAD source's output ranges.
+        trace!(uop_id = x.id, "convert_pad_to_where: using PAD fallback from source ranges");
         let pad_src = x.op().sources().first()?.clone();
         let (_, src_out) = ctx.get_ranges(&pad_src)?;
         if src_out.is_empty() {
@@ -472,8 +478,14 @@ fn convert_reduceaxis_with_context(x: &Arc<UOp>, ctx: &mut IndexingContext) -> O
     let (input_ranges, output_ranges) = if let Some((input_ranges, output_ranges)) = ctx.get_ranges(x) {
         (input_ranges.clone(), output_ranges.clone())
     } else {
+        if !ctx.record_reduceaxis_fallback() {
+            trace!(uop_id = x.id, "convert_reduceaxis_with_context: fallback suppressed by soft limit");
+            return None;
+        }
+
         // Fallback for ReduceAxis nodes that didn't get range assignment (typically
         // index/shape side paths). Still lower to REDUCE to avoid leaking high-level ops.
+        trace!(uop_id = x.id, "convert_reduceaxis_with_context: using ReduceAxis fallback");
         let src_shape = src.shape().ok()??;
         let reduce_ranges: SmallVec<[Arc<UOp>; 4]> =
             axes.iter().filter_map(|&i| src_shape.get(i)).map(|s| ctx.new_range(s, AxisType::Reduce)).collect();

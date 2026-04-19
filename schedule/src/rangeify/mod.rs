@@ -20,7 +20,7 @@ pub mod transforms;
 
 // Context types
 pub use context::RangeifyContext;
-pub use indexing::{IndexingContext, run_rangeify};
+pub use indexing::{IndexingContext, RangeifyStats, run_rangeify};
 pub use kernel::{KernelContext, LocalAddBufferContext};
 
 // Entry points

@@ -19,6 +19,20 @@ use crate::argsort;
 /// (input_ranges, output_ranges) for a UOp.
 type UOpRanges = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
 
+const PAD_FALLBACK_LIMIT: usize = 256;
+const REDUCEAXIS_FALLBACK_LIMIT: usize = 256;
+
+/// Rangeify observability counters.
+#[derive(Debug, Clone, Default)]
+pub struct RangeifyStats {
+    pub recovery_retries: usize,
+    pub leaked_pad_ops: usize,
+    pub leaked_reduceaxis_ops: usize,
+    pub pad_fallback_attempts: usize,
+    pub reduceaxis_fallback_attempts: usize,
+    pub fallback_suppressed: usize,
+}
+
 /// Context for range assignment during rangeify.
 #[derive(Default)]
 pub struct IndexingContext {
@@ -28,6 +42,8 @@ pub struct IndexingContext {
     pub range_map: HashMap<UOpKey, UOpRanges>,
     /// Counter for generating unique range IDs.
     range_idx: usize,
+    /// Observability counters for fallback/recovery behavior.
+    pub stats: RangeifyStats,
 }
 
 impl IndexingContext {
@@ -121,6 +137,33 @@ impl IndexingContext {
     pub fn range_counter(&self) -> usize {
         self.range_idx
     }
+
+    /// Record one recovery retry and leaked high-level op counts.
+    pub fn record_recovery_retry(&mut self, leaked_pad: usize, leaked_reduceaxis: usize) {
+        self.stats.recovery_retries += 1;
+        self.stats.leaked_pad_ops += leaked_pad;
+        self.stats.leaked_reduceaxis_ops += leaked_reduceaxis;
+    }
+
+    /// Record PAD fallback usage and enforce a soft cap.
+    pub fn record_pad_fallback(&mut self) -> bool {
+        self.stats.pad_fallback_attempts += 1;
+        let allowed = self.stats.pad_fallback_attempts <= PAD_FALLBACK_LIMIT;
+        if !allowed {
+            self.stats.fallback_suppressed += 1;
+        }
+        allowed
+    }
+
+    /// Record ReduceAxis fallback usage and enforce a soft cap.
+    pub fn record_reduceaxis_fallback(&mut self) -> bool {
+        self.stats.reduceaxis_fallback_attempts += 1;
+        let allowed = self.stats.reduceaxis_fallback_attempts <= REDUCEAXIS_FALLBACK_LIMIT;
+        if !allowed {
+            self.stats.fallback_suppressed += 1;
+        }
+        allowed
+    }
 }
 
 // ============================================================================
@@ -204,6 +247,8 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
             break;
         }
 
+        ctx.record_recovery_retry(leaked_pad, leaked_reduceaxis);
+
         tracing::debug!(
             recovery_pass = pass_idx + 1,
             leaked_pad,
@@ -211,14 +256,35 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
             "run_rangeify: leaked high-level ops detected, re-running assign+apply"
         );
 
-        crate::rewrite::graph_rewrite_bottom_up(pm_generate_realize_map(), transformed_sink.clone(), &mut ctx);
+        // Rebuild a fresh context on each retry to avoid stale range_map/realize_map
+        // entries from previous passes affecting subsequent recovery behavior.
+        let mut retry_ctx = IndexingContext::new();
+        retry_ctx.stats = ctx.stats.clone();
+
+        crate::rewrite::graph_rewrite_bottom_up(pm_generate_realize_map(), transformed_sink.clone(), &mut retry_ctx);
 
         let consumer_map = transformed_sink.get_consumer_map();
         let forward_topo: Vec<_> = transformed_sink.toposort().into_iter().rev().collect();
         let mut pass_cache = SimplifyCache::default();
-        assign_ranges(&forward_topo, &consumer_map, &mut ctx, &mut pass_cache)?;
+        assign_ranges(&forward_topo, &consumer_map, &mut retry_ctx, &mut pass_cache)?;
 
-        transformed_sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, transformed_sink, &mut ctx);
+        transformed_sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, transformed_sink, &mut retry_ctx);
+        ctx = retry_ctx;
+    }
+
+    if ctx.stats.recovery_retries > 0
+        || ctx.stats.pad_fallback_attempts > 0
+        || ctx.stats.reduceaxis_fallback_attempts > 0
+    {
+        tracing::debug!(
+            recovery_retries = ctx.stats.recovery_retries,
+            leaked_pad_ops = ctx.stats.leaked_pad_ops,
+            leaked_reduceaxis_ops = ctx.stats.leaked_reduceaxis_ops,
+            pad_fallback_attempts = ctx.stats.pad_fallback_attempts,
+            reduceaxis_fallback_attempts = ctx.stats.reduceaxis_fallback_attempts,
+            fallback_suppressed = ctx.stats.fallback_suppressed,
+            "rangeify diagnostics"
+        );
     }
 
     if cfg!(debug_assertions) {
@@ -547,14 +613,17 @@ fn assign_ranges(
         if !ending.is_empty() {
             debug!(
                 ending_count = ending.len(),
-                triggers_realization = matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x),
+                triggers_realization =
+                    matches!(x.op(), Op::ReduceAxis { .. } | Op::Assign { .. }) || is_elementwise_op(x),
                 "Ending ranges detected (pre-in_rngs check)"
             );
         }
         // Use ending ranges directly without filtering (matches upstream behavior).
         let filtered_ending = ending.clone();
 
-        if !filtered_ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
+        if !filtered_ending.is_empty()
+            && (matches!(x.op(), Op::ReduceAxis { .. } | Op::Assign { .. }) || is_elementwise_op(x))
+        {
             if let Some(shape) = x.shape().ok().flatten() {
                 // Start with existing realize_axes (from merge_consumer_ranges)
                 let mut realize_axes: Vec<usize> = ctx.get_realize_axes(x).cloned().unwrap_or_default();
