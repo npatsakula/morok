@@ -75,7 +75,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     apply_unroll(scheduler);
 
     // 7. Default upcast
-    if !scheduler.upcasted() {
+    if scheduler.axes_of(&[AxisType::Upcast]).is_empty() {
         apply_default_upcast(scheduler);
     }
 
@@ -268,7 +268,7 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
     use morok_ir::Op;
     use tracing::debug;
 
-    if scheduler.upcasted() {
+    if !scheduler.axes_of(&[AxisType::Upcast]).is_empty() {
         debug!("apply_default_upcast: skipping (already upcasted)");
         return false;
     }
