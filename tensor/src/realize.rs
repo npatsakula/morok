@@ -1172,7 +1172,7 @@ fn prepare_execution_plan(
             cached.var_names.iter().map(|name| item.fixedvars.get(name).copied().unwrap_or(0)).collect();
 
         let prepared = PreparedKernel {
-            id: item.ast.id,
+            id: item.kernel.id,
             ast: item.ast.clone(),
             kernel: cached,
             device: device.device.clone(),

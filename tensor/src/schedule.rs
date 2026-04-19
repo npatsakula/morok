@@ -25,6 +25,87 @@ use crate::error::*;
 use crate::{Error, Result};
 use snafu::ResultExt;
 
+fn source_primary_buffer_id(src: &Arc<UOp>) -> Option<u64> {
+    match src.op() {
+        Op::Buffer { .. } | Op::Param { .. } | Op::After { .. } => Some(src.buf_uop().id),
+        Op::MSelect { buffer, device_index } => {
+            if let Op::MStack { buffers } = buffer.op() {
+                buffers.get(*device_index).map(|b| b.buf_uop().id).or_else(|| Some(src.buf_uop().id))
+            } else {
+                Some(src.buf_uop().id)
+            }
+        }
+        Op::MStack { buffers } => buffers.first().map(|b| b.buf_uop().id),
+        _ => None,
+    }
+}
+
+fn source_dependency_buffer_ids(src: &Arc<UOp>) -> Vec<u64> {
+    match src.op() {
+        Op::MStack { buffers } => buffers.iter().map(|b| b.buf_uop().id).collect(),
+        Op::MSelect { buffer, device_index } => {
+            if let Op::MStack { buffers } = buffer.op()
+                && let Some(selected) = buffers.get(*device_index)
+            {
+                return vec![selected.buf_uop().id];
+            }
+            vec![src.buf_uop().id]
+        }
+        Op::Buffer { .. } | Op::Param { .. } | Op::After { .. } => vec![src.buf_uop().id],
+        _ => vec![],
+    }
+}
+
+fn analyze_kernel_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<HashSet<usize>> {
+    // Build kernel ID → index mapping
+    let kernel_idx: HashMap<u64, usize> = kernels.iter().enumerate().map(|(i, k)| (k.id, i)).collect();
+
+    // Map buffer_id → writer kernel index (the kernel that writes to this buffer)
+    let mut buf_to_writer: HashMap<u64, usize> = HashMap::new();
+
+    // Find AFTER nodes and map buffers to their writer kernels
+    for node in root.toposort() {
+        if let Op::After { passthrough, deps } = node.op() {
+            // Find the kernel in deps (may be wrapped in END)
+            let kernel = deps.iter().find_map(|d| match d.op() {
+                Op::Kernel { .. } => Some(d.clone()),
+                Op::End { computation, .. } if matches!(computation.op(), Op::Kernel { .. }) => {
+                    Some(computation.clone())
+                }
+                _ => None,
+            });
+
+            if let Some(k) = kernel
+                && let Some(&idx) = kernel_idx.get(&k.id)
+            {
+                // Use buf_uop() to get underlying buffer ID (handles AFTER chains)
+                let buf_id = passthrough.buf_uop().id;
+                buf_to_writer.insert(buf_id, idx);
+            }
+        }
+    }
+
+    // Build dependency edges from kernel sources
+    // A kernel depends on the writer of any buffer it reads from
+    let mut dependencies: Vec<HashSet<usize>> = vec![HashSet::new(); kernels.len()];
+    for (idx, kernel) in kernels.iter().enumerate() {
+        if let Op::Kernel { sources, .. } = kernel.op() {
+            for src in sources {
+                for buf_id in source_dependency_buffer_ids(src) {
+                    // If another kernel writes this buffer, we depend on it
+                    if let Some(&writer_idx) = buf_to_writer.get(&buf_id)
+                        && writer_idx != idx
+                    {
+                        dependencies[idx].insert(writer_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    dependencies
+}
+
 /// Input buffers collected before schedule creation.
 ///
 /// Maps BUFFER UOp ID → Buffer for input tensors.
@@ -120,59 +201,10 @@ struct KernelBuffers {
 /// This ensures producer kernels are processed before consumers, which is
 /// critical for buffer sharing: the producer allocates the buffer first,
 /// then the consumer finds it in the registry via `get_or_create_buffer`.
-fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Arc<UOp>> {
+fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> (Vec<Arc<UOp>>, HashMap<u64, Vec<u64>>) {
     debug!(num_kernels = kernels.len(), "sorting kernels by dependencies");
 
-    // Build kernel ID → index mapping
-    let kernel_idx: HashMap<u64, usize> = kernels.iter().enumerate().map(|(i, k)| (k.id, i)).collect();
-
-    // Map buffer_id → writer kernel index (the kernel that writes to this buffer)
-    let mut buf_to_writer: HashMap<u64, usize> = HashMap::new();
-
-    // Find AFTER nodes and map buffers to their writer kernels
-    for node in root.toposort() {
-        if let Op::After { passthrough, deps } = node.op() {
-            // Find the kernel in deps (may be wrapped in END)
-            let kernel = deps.iter().find_map(|d| match d.op() {
-                Op::Kernel { .. } => Some(d.clone()),
-                Op::End { computation, .. } if matches!(computation.op(), Op::Kernel { .. }) => {
-                    Some(computation.clone())
-                }
-                _ => None,
-            });
-
-            if let Some(k) = kernel
-                && let Some(&idx) = kernel_idx.get(&k.id)
-            {
-                // Use buf_uop() to get underlying buffer ID (handles AFTER chains)
-                let buf_id = passthrough.buf_uop().id;
-                buf_to_writer.insert(buf_id, idx);
-            }
-        }
-    }
-
-    // Build dependency edges from kernel sources
-    // A kernel depends on the writer of any buffer it reads from
-    let mut dependencies: Vec<HashSet<usize>> = vec![HashSet::new(); kernels.len()];
-    for (idx, kernel) in kernels.iter().enumerate() {
-        if let Op::Kernel { sources, .. } = kernel.op() {
-            for src in sources {
-                // Get the buffer ID this source refers to
-                let buf_id = match src.op() {
-                    Op::Buffer { .. } | Op::Param { .. } => src.buf_uop().id,
-                    Op::After { passthrough, .. } => passthrough.buf_uop().id,
-                    _ => continue,
-                };
-
-                // If another kernel writes this buffer, we depend on it
-                if let Some(&writer_idx) = buf_to_writer.get(&buf_id)
-                    && writer_idx != idx
-                {
-                    dependencies[idx].insert(writer_idx);
-                }
-            }
-        }
-    }
+    let dependencies = analyze_kernel_dependencies(kernels, root);
 
     // Kahn's algorithm for topological sort
     let mut in_degree: Vec<usize> = dependencies.iter().map(|deps| deps.len()).collect();
@@ -187,9 +219,9 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
     let mut queue: VecDeque<usize> =
         in_degree.iter().enumerate().filter(|&(_, &deg)| deg == 0).map(|(idx, _)| idx).collect();
 
-    let mut sorted = Vec::new();
+    let mut sorted_indices = Vec::new();
     while let Some(idx) = queue.pop_front() {
-        sorted.push(kernels[idx].clone());
+        sorted_indices.push(idx);
         for &dependent in &dependents[idx] {
             in_degree[dependent] -= 1;
             if in_degree[dependent] == 0 {
@@ -200,18 +232,35 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> Vec<Ar
 
     // If sorting didn't include all kernels (possible cycle or disconnected graph),
     // fall back to original order for any missing kernels
-    if sorted.len() < kernels.len() {
-        let sorted_ids: HashSet<u64> = sorted.iter().map(|k| k.id).collect();
-        for kernel in kernels {
-            if !sorted_ids.contains(&kernel.id) {
-                sorted.push(kernel.clone());
+    let had_cycle_or_gap = sorted_indices.len() < kernels.len();
+    if had_cycle_or_gap {
+        let sorted_idx_set: HashSet<usize> = sorted_indices.iter().copied().collect();
+        for (idx, _kernel) in kernels.iter().enumerate() {
+            if !sorted_idx_set.contains(&idx) {
+                sorted_indices.push(idx);
             }
         }
     }
 
+    let sorted: Vec<Arc<UOp>> = sorted_indices.iter().map(|&idx| kernels[idx].clone()).collect();
+
+    let dependency_ids_by_kernel: HashMap<u64, Vec<u64>> = kernels
+        .iter()
+        .enumerate()
+        .map(|(idx, kernel)| {
+            let mut deps: Vec<u64> = if had_cycle_or_gap {
+                vec![]
+            } else {
+                dependencies[idx].iter().map(|&dep_idx| kernels[dep_idx].id).collect()
+            };
+            deps.sort_unstable();
+            (kernel.id, deps)
+        })
+        .collect();
+
     debug!(num_sorted = sorted.len(), "kernels sorted");
 
-    sorted
+    (sorted, dependency_ids_by_kernel)
 }
 
 /// Extract kernels from transformed graph and create schedule.
@@ -255,7 +304,7 @@ pub fn create_schedule(
     // Step 1.5: Sort kernels by dependencies (producers before consumers)
     // This ensures producer kernels are processed first, so they allocate buffers
     // before consumers look them up.
-    let kernels = sort_kernels_by_dependencies(&kernels, &transformed);
+    let (kernels, dependency_ids_by_kernel) = sort_kernels_by_dependencies(&kernels, &transformed);
 
     // Track allocated intermediate buffers locally (no global registry needed)
     let mut allocated_buffers: HashMap<u64, Buffer> = HashMap::new();
@@ -278,10 +327,7 @@ pub fn create_schedule(
         // not OUTER ranges needing schedule expansion.
         let bound_ranges = collect_bound_ranges(inner_ast, var_vals)?;
 
-        // Dependencies are now implicit in kernel ordering (sorted by sort_kernels_by_dependencies).
-        // For explicit dependency tracking, we could extract from sources, but since
-        // kernels are already sorted topologically, sequential execution handles deps.
-        let dependencies: Vec<u64> = vec![];
+        let dependencies = dependency_ids_by_kernel.get(&kernel_uop.id).cloned().unwrap_or_default();
 
         debug!(kernel.id = kernel_uop.id, num_sources = sources.len(), "Kernel created");
 
@@ -343,29 +389,14 @@ fn find_first_input_buffer_device(
     let alloc_registry = registry::registry();
 
     for src in sources {
-        match src.op() {
-            // Direct input buffer (BUFFER or PARAM)
-            Op::Buffer { .. } | Op::Param { .. } => {
-                let buffer = allocated_buffers.get(&src.id).cloned().or_else(|| input_buffers.get(&src.id).cloned());
-                if let Some(buffer) = buffer {
-                    let device_spec = buffer.allocator().device_spec();
-                    return morok_runtime::DEVICE_FACTORIES
-                        .device(&device_spec, alloc_registry)
-                        .context(DeviceFactorySnafu);
-                }
+        if let Some(buf_id) = source_primary_buffer_id(src) {
+            let buffer = allocated_buffers.get(&buf_id).cloned().or_else(|| input_buffers.get(&buf_id).cloned());
+            if let Some(buffer) = buffer {
+                let device_spec = buffer.allocator().device_spec();
+                return morok_runtime::DEVICE_FACTORIES
+                    .device(&device_spec, alloc_registry)
+                    .context(DeviceFactorySnafu);
             }
-            // AFTER node - get device from the passthrough buffer
-            Op::After { passthrough, .. } => {
-                let buf_id = passthrough.buf_uop().id;
-                let buffer = allocated_buffers.get(&buf_id).cloned().or_else(|| input_buffers.get(&buf_id).cloned());
-                if let Some(buffer) = buffer {
-                    let device_spec = buffer.allocator().device_spec();
-                    return morok_runtime::DEVICE_FACTORIES
-                        .device(&device_spec, alloc_registry)
-                        .context(DeviceFactorySnafu);
-                }
-            }
-            _ => continue,
         }
     }
 
@@ -437,6 +468,25 @@ fn collect_kernel_buffers(
                 } else {
                     trace!(buf_id, "after buffer not found in allocated_buffers or input_buffers");
                     return Err(Error::BufferNotFound { uop_id: buf_id });
+                }
+            }
+            Op::MSelect { .. } | Op::MStack { .. } => {
+                let canonical_id = source_primary_buffer_id(src).expect("multi-device source should resolve buffer id");
+                if canonical_id != src.id {
+                    alias_ids.push(src.id);
+                }
+
+                let existing =
+                    allocated_buffers.get(&canonical_id).cloned().or_else(|| input_buffers.get(&canonical_id).cloned());
+
+                if let Some(buffer) = existing {
+                    trace!(canonical_id, buffer.id = ?buffer.id(), "Found shared buffer from MSELECT/MSTACK source");
+                    allocated_buffers.entry(canonical_id).or_insert_with(|| buffer.clone());
+                    buffers.push(buffer);
+                    uop_ids.push(canonical_id);
+                } else {
+                    trace!(canonical_id, "multi-device source buffer not found in allocated_buffers or input_buffers");
+                    return Err(Error::BufferNotFound { uop_id: canonical_id });
                 }
             }
             // Kernel sources are always Buffer/Param/After.
@@ -757,5 +807,64 @@ mod tests {
         assert_eq!(kb.buffers.len(), 1);
         assert_eq!(kb.buffers[0].id(), input_buf.id());
         assert!(kb.alias_ids.contains(&after.id));
+    }
+
+    #[test]
+    fn test_collect_kernel_buffers_mselect_uses_canonical_buffer_id() {
+        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+        let mstack = UOp::mstack(SmallVec::from_vec(vec![buffer_uop.clone()]));
+        let mselect = mstack.mselect(0);
+        let sink = UOp::sink(vec![UOp::native_const(0.0f32)]);
+        let mut sources = SmallVec::new();
+        sources.push(mselect.clone());
+        let kernel = UOp::kernel(sources.clone(), sink);
+
+        let alloc = morok_device::registry::cpu().expect("cpu allocator");
+        let input_buf = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
+        let mut input_buffers = InputBuffers::new();
+        input_buffers.insert(buffer_uop.id, input_buf.clone());
+        let mut allocated = HashMap::new();
+
+        let kb = collect_kernel_buffers(&sources, &kernel, &input_buffers, &mut allocated).expect("collect buffers");
+
+        assert_eq!(kb.uop_ids, vec![buffer_uop.id]);
+        assert_eq!(kb.buffers.len(), 1);
+        assert_eq!(kb.buffers[0].id(), input_buf.id());
+        assert!(kb.alias_ids.contains(&mselect.id));
+    }
+
+    #[test]
+    fn test_create_schedule_preserves_kernel_dependencies() {
+        let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
+
+        let sink1 = UOp::sink(vec![UOp::native_const(1.0f32)]);
+        let mut sources1 = SmallVec::new();
+        sources1.push(buffer_uop.clone());
+        let kernel1 = UOp::kernel(sources1, sink1);
+
+        let mut deps = SmallVec::new();
+        deps.push(kernel1.clone());
+        let after = buffer_uop.after(deps);
+
+        let sink2 = UOp::sink(vec![UOp::native_const(2.0f32)]);
+        let mut sources2 = SmallVec::new();
+        sources2.push(after);
+        let kernel2 = UOp::kernel(sources2, sink2);
+
+        let transformed = UOp::sink(vec![kernel1.clone(), kernel2.clone()]);
+
+        let alloc = morok_device::registry::cpu().expect("cpu allocator");
+        let input_buf = Buffer::new(alloc, DType::Float32, vec![4], Default::default());
+        let mut input_buffers = InputBuffers::new();
+        input_buffers.insert(buffer_uop.id, input_buf);
+
+        let result = create_schedule(transformed, &input_buffers, &HashMap::new()).expect("create schedule");
+
+        assert_eq!(result.items.len(), 2);
+        let k1_item = result.items.iter().find(|it| it.kernel.id == kernel1.id).expect("k1 item");
+        let k2_item = result.items.iter().find(|it| it.kernel.id == kernel2.id).expect("k2 item");
+
+        assert!(k1_item.dependencies.is_empty());
+        assert_eq!(k2_item.dependencies, vec![kernel1.id]);
     }
 }
