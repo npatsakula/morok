@@ -36,6 +36,15 @@ pub struct CachedKernel {
     /// Variable names in order for converting HashMap to positional vals.
     /// Matches the order expected by the compiled program.
     pub var_names: Vec<String>,
+    /// Global buffer slots in kernel argument order.
+    /// Matches Tinygrad's ProgramSpec.globals semantics.
+    pub globals: Vec<usize>,
+    /// Output buffer slots written by STORE operations.
+    /// Matches Tinygrad's ProgramSpec.outs semantics.
+    pub outs: Vec<usize>,
+    /// Input buffer slots read by LOAD operations.
+    /// Matches Tinygrad's ProgramSpec.ins semantics.
+    pub ins: Vec<usize>,
     /// Global work size for dispatch (GPU backends, CPU threading).
     /// For CPU threading: [thread_count, 1, 1]
     pub global_size: Option<[usize; 3]>,

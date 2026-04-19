@@ -83,6 +83,19 @@ unsafe fn execute_parallel(
     let buf_ptr = buffers.as_ptr() as usize;
     let buf_len = buffers.len();
 
+    // Nested parallelism policy: if we're already inside rayon work, avoid
+    // spawning another parallel loop for thread_id kernels.
+    if rayon::current_thread_index().is_some() {
+        for thread_id in 0..thread_count {
+            let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
+            let patch = thread_id_idx.map(|idx| (idx, thread_id));
+            unsafe {
+                cif.dispatch(fn_ptr_usize as *const (), bufs, vals, patch);
+            }
+        }
+        return Ok(());
+    }
+
     (0..thread_count).into_par_iter().for_each(|thread_id| {
         let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
         let patch = thread_id_idx.map(|idx| (idx, thread_id));
@@ -114,6 +127,23 @@ unsafe fn execute_kernel(
         unsafe { cif.dispatch(fn_ptr, buffers, vals, None) };
         Ok(())
     }
+}
+
+fn apply_buffer_metadata(spec: &mut ProgramSpec, rendered: &morok_codegen::RenderedKernel) {
+    let mut globals: Vec<usize> = Vec::new();
+    let mut outs: Vec<usize> = Vec::new();
+
+    for arg in &rendered.buffer_args {
+        if !globals.contains(&arg.index) {
+            globals.push(arg.index);
+        }
+        if arg.is_output && !outs.contains(&arg.index) {
+            outs.push(arg.index);
+        }
+    }
+
+    let ins: Vec<usize> = globals.iter().copied().filter(|slot| !outs.contains(slot)).collect();
+    spec.set_buffer_metadata(globals, outs, ins);
 }
 
 // =============================================================================
@@ -162,6 +192,7 @@ impl Renderer for ClangRendererWrapper {
         }
 
         spec.set_var_names(rendered.var_names.clone());
+        apply_buffer_metadata(&mut spec, &rendered);
         spec.buf_count = rendered.buffer_args.len();
 
         Ok(spec)
@@ -274,6 +305,7 @@ impl Renderer for LlvmRendererWrapper {
         }
 
         spec.set_var_names(rendered.var_names.clone());
+        apply_buffer_metadata(&mut spec, &rendered);
         spec.buf_count = rendered.buffer_args.len();
 
         Ok(spec)
@@ -327,6 +359,21 @@ mod mlir_backend {
                 let buf_ptr = buffers.as_ptr() as usize;
                 let buf_len = buffers.len();
                 let vals = vals.to_vec();
+
+                if rayon::current_thread_index().is_some() {
+                    for tid in 0..count {
+                        let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
+                        let mut thread_vals = vals.clone();
+                        if let Some(idx) = thread_id_idx {
+                            thread_vals[idx] = tid as i64;
+                        }
+                        unsafe { self.kernel.execute_with_vals(bufs, &thread_vals) }.map_err(|e| {
+                            morok_device::Error::Runtime { message: format!("MLIR kernel execution failed: {}", e) }
+                        })?;
+                    }
+                    return Ok(());
+                }
+
                 (0..count).into_par_iter().try_for_each(|tid| {
                     let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
                     let mut thread_vals = vals.clone();
@@ -369,6 +416,8 @@ mod mlir_backend {
             }
 
             spec.set_var_names(rendered.var_names.clone());
+            apply_buffer_metadata(&mut spec, &rendered);
+            spec.buf_count = rendered.buffer_args.len();
 
             Ok(spec)
         }

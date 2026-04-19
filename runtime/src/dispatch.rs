@@ -59,19 +59,29 @@ impl KernelCif {
         );
 
         thread_local! {
-            static PACKED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+            static PACKED: RefCell<SmallVec<[u64; 32]>> = RefCell::new(SmallVec::new());
         }
 
         PACKED.with_borrow_mut(|packed| {
-            packed.clear();
-            packed.extend(buffers.iter().map(|&p| p as u64));
-            packed.extend(vals.iter().map(|&v| v as u64));
+            if packed.len() != self.arg_count {
+                packed.resize(self.arg_count, 0);
+            }
+
+            for (idx, &ptr) in buffers.iter().enumerate() {
+                packed[idx] = ptr as u64;
+            }
+            for (idx, &val) in vals.iter().enumerate() {
+                packed[buffers.len() + idx] = val as u64;
+            }
 
             if let Some((var_idx, thread_id)) = thread_id_patch {
                 packed[buffers.len() + var_idx] = thread_id as u64;
             }
 
-            let ffi_args: SmallVec<[middle::Arg; 16]> = packed.iter().map(middle::arg).collect();
+            let mut ffi_args: SmallVec<[middle::Arg; 32]> = SmallVec::with_capacity(self.arg_count);
+            for value in packed.iter() {
+                ffi_args.push(middle::arg(value));
+            }
 
             unsafe {
                 self.cif.call::<()>(CodePtr(fn_ptr as *mut _), &ffi_args);

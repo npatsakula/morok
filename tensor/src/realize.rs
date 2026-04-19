@@ -951,6 +951,25 @@ fn detect_output_indices(kernel: &Arc<UOp>, buffers: &[Buffer]) -> Vec<usize> {
     if output_indices.is_empty() && !buffers.is_empty() { vec![0] } else { output_indices }
 }
 
+fn output_indices_from_program_metadata(globals: &[usize], outs: &[usize], num_buffers: usize) -> Vec<usize> {
+    if num_buffers == 0 || globals.is_empty() || outs.is_empty() {
+        return Vec::new();
+    }
+
+    let slot_to_position: HashMap<usize, usize> =
+        globals.iter().copied().enumerate().map(|(position, slot)| (slot, position)).collect();
+
+    let mut output_indices: Vec<usize> = outs
+        .iter()
+        .filter_map(|slot| slot_to_position.get(slot).copied())
+        .filter(|&position| position < num_buffers)
+        .collect();
+
+    output_indices.sort_unstable();
+    output_indices.dedup();
+    output_indices
+}
+
 /// Prepare an execution plan from a schedule.
 ///
 /// This performs all one-time preparation work:
@@ -1150,6 +1169,9 @@ fn prepare_execution_plan(
                         code: spec.src.clone(),
                         entry_point: spec.name.clone(),
                         var_names: spec.var_names.clone(),
+                        globals: spec.globals.clone(),
+                        outs: spec.outs.clone(),
+                        ins: spec.ins.clone(),
                         global_size: spec.global_size,
                         local_size: spec.local_size,
                     })
@@ -1171,13 +1193,30 @@ fn prepare_execution_plan(
         let vals: Vec<i64> =
             cached.var_names.iter().map(|name| item.fixedvars.get(name).copied().unwrap_or(0)).collect();
 
+        let mut output_indices =
+            output_indices_from_program_metadata(&cached.globals, &cached.outs, buffer_indices.len());
+        if output_indices.is_empty() {
+            output_indices = detect_output_indices(&item.kernel, &item.buffers);
+            output_indices.retain(|&idx| idx < buffer_indices.len());
+            if output_indices.is_empty() && !buffer_indices.is_empty() {
+                output_indices = vec![0];
+            }
+            trace!(
+                kernel_id = item.kernel.id,
+                globals = ?cached.globals,
+                outs = ?cached.outs,
+                resolved_outputs = ?output_indices,
+                "fallback output index detection used"
+            );
+        }
+
         let prepared = PreparedKernel {
             id: item.kernel.id,
             ast: item.ast.clone(),
             kernel: cached,
             device: device.device.clone(),
             buffer_indices,
-            output_indices: vec![0], // First buffer is typically output
+            output_indices,
             vals,
             dependencies: item.dependencies.clone(),
             buffer_ptrs: Vec::new(), // Computed in build()
@@ -1366,6 +1405,18 @@ fn beam_search_optimize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_output_indices_from_program_metadata_basic() {
+        let outputs = output_indices_from_program_metadata(&[0, 1, 2], &[2], 3);
+        assert_eq!(outputs, vec![2]);
+    }
+
+    #[test]
+    fn test_output_indices_from_program_metadata_sparse_slots() {
+        let outputs = output_indices_from_program_metadata(&[2, 4, 7], &[4, 7], 3);
+        assert_eq!(outputs, vec![1, 2]);
+    }
 
     #[test]
     fn test_realize_simple_add() {
