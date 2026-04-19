@@ -537,6 +537,12 @@ fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Resu
         return ValidationFailedSnafu { op: "THREAD", reason: "can only thread Outer/Global/Loop axes" }.fail();
     }
 
+    // Tinygrad parity: only ranges that are globalizable across all outputs
+    // can be threaded safely.
+    if !scheduler.globalizable_rngs().iter().any(|candidate| Arc::ptr_eq(candidate, &rng)) {
+        return ValidationFailedSnafu { op: "THREAD", reason: "can't apply range to this dim" }.fail();
+    }
+
     // Apply shift_to with top=true (outer-most position, like Tinygrad's core_id)
     let _ = scheduler.shift_to(rng, amount, AxisType::Thread, true, None)?;
     Ok(())

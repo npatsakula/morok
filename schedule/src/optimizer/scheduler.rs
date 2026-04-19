@@ -311,10 +311,10 @@ impl Scheduler {
 
     /// Check if any axes have been upcasted.
     ///
-    /// Returns true if there are any UPCAST axis types in the kernel.
+    /// Returns true if there are any UPCAST or UNROLL axis types in the kernel.
     /// Used by heuristics to avoid redundant upcasting.
     pub fn upcasted(&self) -> bool {
-        !self.axes_of(&[AxisType::Upcast]).is_empty()
+        !self.axes_of(&[AxisType::Upcast, AxisType::Unroll]).is_empty()
     }
 
     /// Get a reference to the backend renderer.
@@ -920,7 +920,7 @@ impl Scheduler {
     /// This ensures parallelizing the range won't cause race conditions.
     ///
     /// Based on Tinygrad's `_globalizable_rngs()`.
-    fn globalizable_rngs(&self) -> Vec<Arc<UOp>> {
+    pub(crate) fn globalizable_rngs(&self) -> Vec<Arc<UOp>> {
         // Start with LOOP axes from outputs
         let mut candidates: Vec<_> = self
             .output_rngs()

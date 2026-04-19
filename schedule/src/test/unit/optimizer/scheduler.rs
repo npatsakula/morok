@@ -133,6 +133,15 @@ fn test_scheduler_upcast_size() {
 }
 
 #[test]
+fn test_scheduler_upcasted_treats_unroll_as_upcasted() {
+    let r_unroll = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Unroll);
+    let sink = UOp::sink(vec![UOp::native_const(1.0f32), r_unroll]);
+
+    let scheduler = Scheduler::new(sink, Renderer::cpu());
+    assert!(scheduler.upcasted(), "UNROLL axis should satisfy upcasted parity semantics");
+}
+
+#[test]
 fn test_scheduler_group_for_reduces() {
     // Create kernel with GROUP_REDUCE axes
     let end_16 = UOp::index_const(16);
@@ -1460,8 +1469,13 @@ fn test_thread_basic() {
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    // Apply THREAD optimization - use available parallelism to work on machines with few cores
-    let thread_count = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    // Apply THREAD optimization with a divisor of 64 that fits this machine.
+    let max_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let thread_count = [32usize, 16, 8, 4, 2].into_iter().find(|&t| t <= max_threads && 64 % t == 0).unwrap_or(1);
+    if thread_count == 1 {
+        // Single-thread environment: THREAD split is not meaningful.
+        return;
+    }
     let opt = Opt::thread(0, thread_count);
     let result = apply_opt(&mut scheduler, &opt, true);
     assert!(result.is_ok(), "THREAD opt should succeed: {:?}", result);
@@ -1474,6 +1488,28 @@ fn test_thread_basic() {
     let types: Vec<AxisType> = rngs.iter().map(|r| get_axis_type(r)).collect();
     assert!(types.contains(&AxisType::Thread), "Should have Thread axis: {:?}", types);
     assert!(types.contains(&AxisType::Loop), "Should have Loop axis: {:?}", types);
+}
+
+#[test]
+fn test_thread_rejects_non_globalizable_axis() {
+    // Two independent stores with disjoint LOOP ranges.
+    // No LOOP range appears in all outputs, so THREAD must be rejected.
+    let loop_a = UOp::range_axis(UOp::index_const(64), AxisId::Renumbered(0), AxisType::Loop);
+    let loop_b = UOp::range_axis(UOp::index_const(64), AxisId::Renumbered(1), AxisType::Loop);
+
+    let idx = UOp::index_const(0);
+    let store_a = idx.store(loop_a.clone());
+    let store_b = idx.store(loop_b.clone());
+    let sink = UOp::sink(vec![store_a, store_b]);
+
+    let ren = Renderer::cpu();
+    let mut scheduler = Scheduler::new(sink, ren);
+
+    let result = apply_opt(&mut scheduler, &Opt::thread(0, 2), true);
+    assert!(result.is_err(), "THREAD should fail for non-globalizable axis");
+
+    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
+    assert!(thread_axes.is_empty(), "No Thread axis should be created on failure");
 }
 
 #[test]

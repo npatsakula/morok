@@ -257,6 +257,10 @@ pub struct HeuristicsConfig {
     pub matvec_enabled: bool,
     /// Matrix-vector block size (rows per workgroup).
     pub matvec_blocksize: usize,
+    /// Matrix-vector reduction split (threads per reduction row).
+    pub threads_per_row: usize,
+    /// Matrix-vector output lane split (rows computed per thread).
+    pub rows_per_thread: usize,
 
     // Reduction thresholds
     /// Threshold for applying grouped reduction.
@@ -304,16 +308,37 @@ impl HeuristicsConfig {
     /// # Environment Variables
     ///
     /// * `MOROK_THREADS` - Maximum thread count (default: available_parallelism)
+    /// * `MOROK_MV` - Enable/disable matvec fast-path (`0` disables)
+    /// * `MOROK_MV_BLOCKSIZE` / `MV_BLOCKSIZE` - Matvec local block size
+    /// * `MOROK_MV_THREADS_PER_ROW` / `MV_THREADS_PER_ROW` - Matvec reduce split
+    /// * `MOROK_MV_ROWS_PER_THREAD` / `MV_ROWS_PER_THREAD` - Matvec output split
     /// * `MOROK_K_VECTORIZE` - Enable K-axis vectorization (default: disabled)
     /// * `MOROK_NO_OUTPUT_UPCAST` - Disable output dimension upcasting (default: enabled)
     pub fn from_env() -> Self {
+        let parse_usize = |keys: &[&str], default: usize| {
+            keys.iter().find_map(|k| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok())).unwrap_or(default)
+        };
+
         let thread_count =
             std::env::var("MOROK_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or_else(default_thread_count);
+        let matvec_enabled = std::env::var("MOROK_MV").map(|v| v != "0").unwrap_or(true);
+        let matvec_blocksize = parse_usize(&["MOROK_MV_BLOCKSIZE", "MV_BLOCKSIZE"], 4);
+        let threads_per_row = parse_usize(&["MOROK_MV_THREADS_PER_ROW", "MV_THREADS_PER_ROW"], 8);
+        let rows_per_thread = parse_usize(&["MOROK_MV_ROWS_PER_THREAD", "MV_ROWS_PER_THREAD"], 4);
         let k_vectorize = std::env::var("MOROK_K_VECTORIZE").is_ok();
         // Default enabled, use MOROK_NO_OUTPUT_UPCAST to disable
         let output_upcast = std::env::var("MOROK_NO_OUTPUT_UPCAST").is_err();
 
-        Self { thread_count, k_vectorize, output_upcast, ..Default::default() }
+        Self {
+            matvec_enabled,
+            matvec_blocksize,
+            threads_per_row,
+            rows_per_thread,
+            thread_count,
+            k_vectorize,
+            output_upcast,
+            ..Default::default()
+        }
     }
 }
 
@@ -325,6 +350,8 @@ impl Default for HeuristicsConfig {
             tc_select: TcSelect::Auto,
             matvec_enabled: true,
             matvec_blocksize: 4,
+            threads_per_row: 8,
+            rows_per_thread: 4,
             grouped_threshold: 256,
             unroll_threshold: 32,
             disable_locals: false,
@@ -346,6 +373,8 @@ impl HeuristicsConfig {
         #[builder(default)] tc_select: TcSelect,
         #[builder(default = true)] matvec_enabled: bool,
         #[builder(default = 4)] matvec_blocksize: usize,
+        #[builder(default = 8)] threads_per_row: usize,
+        #[builder(default = 4)] rows_per_thread: usize,
         #[builder(default = 256)] grouped_threshold: usize,
         #[builder(default = 32)] unroll_threshold: usize,
         #[builder(default = false)] disable_locals: bool,
@@ -360,6 +389,8 @@ impl HeuristicsConfig {
             tc_select,
             matvec_enabled,
             matvec_blocksize,
+            threads_per_row,
+            rows_per_thread,
             grouped_threshold,
             unroll_threshold,
             disable_locals,
@@ -469,6 +500,8 @@ mod tests {
         assert_eq!(config.tc_enabled, TcUsage::Enabled);
         assert_eq!(config.tc_opt, TcOpt::Padded);
         assert!(config.matvec_enabled);
+        assert_eq!(config.threads_per_row, 8);
+        assert_eq!(config.rows_per_thread, 4);
         assert_eq!(config.grouped_threshold, 256);
     }
 
@@ -477,11 +510,15 @@ mod tests {
         let config = HeuristicsConfig::builder()
             .tc_enabled(TcUsage::Disabled)
             .matvec_enabled(false)
+            .threads_per_row(16)
+            .rows_per_thread(2)
             .grouped_threshold(128)
             .build();
 
         assert_eq!(config.tc_enabled, TcUsage::Disabled);
         assert!(!config.matvec_enabled);
+        assert_eq!(config.threads_per_row, 16);
+        assert_eq!(config.rows_per_thread, 2);
         assert_eq!(config.grouped_threshold, 128);
     }
 

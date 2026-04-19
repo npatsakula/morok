@@ -5,7 +5,8 @@
 
 use std::sync::Arc;
 
-use morok_ir::{AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
+use morok_dtype::DType;
+use morok_ir::{AxisId, AxisType, BinaryOp, Op, ReduceOp, TernaryOp};
 
 use crate::optimizer::config::HeuristicsConfig;
 use crate::optimizer::{Opt, Scheduler, apply_opt};
@@ -48,6 +49,12 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
 
     // 2. Image upcasts
     apply_image_upcasts(scheduler);
+
+    // 2.5. Matvec fast-path
+    if apply_matvec_fast_path(scheduler, config) {
+        debug!("hand_coded_optimizations: matvec fast-path applied, skipping remaining opts");
+        return;
+    }
 
     // 3. Grouped reduction
     try_grouped_reduction(scheduler, config);
@@ -200,9 +207,60 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
 // SIMPLE HEURISTICS
 // ============================================================================
 
-/// Image-specific upcasting (placeholder - not yet implemented).
-pub fn apply_image_upcasts(_scheduler: &mut Scheduler) -> bool {
-    false
+/// Image-specific upcasting/unrolling parity with Tinygrad.
+///
+/// For image buffers, find a unit-stride axis whose extent is divisible by 4.
+/// Prefer UPCAST on that axis when it's output-parallel; otherwise UNROLL the
+/// same axis when it's a reduction axis.
+pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
+    let mut applied = false;
+
+    // Snapshot to avoid borrow conflicts while mutating scheduler.
+    let bufs = scheduler.bufs().to_vec();
+    for buf in bufs {
+        let Op::Index { buffer, indices, .. } = buf.op() else {
+            continue;
+        };
+        if !matches!(buffer.dtype(), DType::Image { .. }) {
+            continue;
+        }
+
+        let Some(first_idx) = indices.first() else {
+            continue;
+        };
+        let linear_idx = first_idx.get_idx();
+
+        // Tinygrad parity: choose first range term in linearized index with size % 4 == 0.
+        let axis = linear_idx
+            .split_uop(BinaryOp::Add)
+            .into_iter()
+            .filter_map(|term| {
+                if !matches!(term.op(), Op::Range { .. }) || term.divisible_by(4).is_none() {
+                    return None;
+                }
+                scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &term))
+            })
+            .next();
+
+        let Some(axis) = axis else {
+            continue;
+        };
+
+        if scheduler.upcastable_dims().contains(&axis) {
+            if apply_opt(scheduler, &Opt::upcast(axis, 4), true).is_ok() {
+                applied = true;
+            }
+        } else {
+            let unrollable = scheduler.unrollable_dims();
+            if let Some(logical_axis) = unrollable.iter().position(|&i| i == axis)
+                && apply_opt(scheduler, &Opt::unroll(logical_axis, 4), true).is_ok()
+            {
+                applied = true;
+            }
+        }
+    }
+
+    applied
 }
 
 /// Default upcast fallback: 4x vectorization on first upcastable axis.
@@ -474,6 +532,141 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
 /// Legacy function for compatibility - calls apply_matmul_tiling
 pub fn apply_matmul_output_upcasting(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     apply_matmul_tiling(scheduler, config)
+}
+
+fn find_axis_by_axis_id(scheduler: &Scheduler, axis_id: AxisId) -> Option<usize> {
+    scheduler.rngs().iter().enumerate().find_map(|(i, rng)| {
+        if let Op::Range { axis_id: id, .. } = rng.op()
+            && *id == axis_id
+        {
+            return Some(i);
+        }
+        None
+    })
+}
+
+/// Tinygrad-style matvec fast-path.
+///
+/// Applies `GROUP` on the reduce axis and `LOCAL`/`UPCAST` on one global output
+/// axis when the index structure matches matrix-vector style access.
+pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
+    use tracing::debug;
+
+    let block_size = config.matvec_blocksize;
+    let threads_per_row = config.threads_per_row;
+    let rows_per_thread = config.rows_per_thread;
+
+    if !scheduler.renderer().has_local
+        || !scheduler.renderer().has_shared
+        || !config.matvec_enabled
+        || (block_size <= 1 && threads_per_row <= 1 && rows_per_thread <= 1)
+    {
+        return false;
+    }
+
+    if block_size == 0 || threads_per_row == 0 || rows_per_thread == 0 {
+        return false;
+    }
+
+    let Some(reduceop) = scheduler.reduceop() else {
+        return false;
+    };
+    let Op::Reduce { src, reduce_op, .. } = reduceop.op() else {
+        return false;
+    };
+    if *reduce_op != ReduceOp::Add || scheduler.full_shape().len() < 2 {
+        return false;
+    }
+
+    let Op::Binary(BinaryOp::Mul, left, right) = src.op() else {
+        return false;
+    };
+    let (idx0_src, idx1_src) = match (left.op(), right.op()) {
+        (Op::Index { indices: i0, .. }, Op::Index { indices: i1, .. }) => {
+            let Some(i0) = i0.first() else {
+                return false;
+            };
+            let Some(i1) = i1.first() else {
+                return false;
+            };
+            (i0.get_idx(), i1.get_idx())
+        }
+        _ => return false,
+    };
+
+    let Some(first_reduce_rng) = scheduler.ranges_of(&[AxisType::Reduce]).first().cloned() else {
+        return false;
+    };
+
+    // Tinygrad parity checks:
+    // 1) idx0 must contain the first reduce range as a top-level ADD term.
+    // 2) idx1 must include all ranges used by idx0.
+    let idx0_has_first_reduce = idx0_src.split_uop(BinaryOp::Add).iter().any(|u| Arc::ptr_eq(u, &first_reduce_rng));
+    if !idx0_has_first_reduce {
+        return false;
+    }
+
+    let idx1_ranges = idx1_src.ranges();
+    if !idx0_src.ranges().iter().all(|r| idx1_ranges.iter().any(|cand| Arc::ptr_eq(cand, r))) {
+        return false;
+    }
+
+    if first_reduce_rng.divisible_by(threads_per_row).is_none() {
+        return false;
+    }
+
+    let Some(row_tile) = block_size.checked_mul(rows_per_thread) else {
+        return false;
+    };
+    if row_tile == 0 {
+        return false;
+    }
+
+    let full_shape = scheduler.full_shape();
+    for global_idx in scheduler.axes_of(&[AxisType::Global]) {
+        let Some(&global_dim) = full_shape.get(global_idx) else {
+            continue;
+        };
+        if global_dim <= 0 || (global_dim as usize) % row_tile != 0 {
+            continue;
+        }
+
+        let mut trial = scheduler.clone();
+
+        // Tinygrad behavior: GROUP is best-effort in this fast path.
+        if threads_per_row > 1 {
+            let _ = apply_opt(&mut trial, &Opt::group(0, threads_per_row), true);
+        }
+
+        let mut current_axis = global_idx;
+        let axis_id = trial
+            .rngs()
+            .get(current_axis)
+            .and_then(|rng| if let Op::Range { axis_id, .. } = rng.op() { Some(*axis_id) } else { None });
+
+        if block_size > 1 {
+            if apply_opt(&mut trial, &Opt::local(current_axis, block_size), true).is_err() {
+                continue;
+            }
+            if let Some(axis_id) = axis_id {
+                if let Some(updated_axis) = find_axis_by_axis_id(&trial, axis_id) {
+                    current_axis = updated_axis;
+                } else if rows_per_thread > 1 {
+                    continue;
+                }
+            }
+        }
+
+        if rows_per_thread > 1 && apply_opt(&mut trial, &Opt::upcast(current_axis, rows_per_thread), true).is_err() {
+            continue;
+        }
+
+        debug!(global_idx, block_size, threads_per_row, rows_per_thread, "apply_matvec_fast_path: applied");
+        *scheduler = trial;
+        return true;
+    }
+
+    false
 }
 
 /// CPU threading for parallelizable loop axes.
