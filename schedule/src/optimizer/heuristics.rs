@@ -983,58 +983,85 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         return false;
     }
 
-    // Clone the scheduler for trial - if TC fails, no partial mutations
-    let mut trial = scheduler.clone();
-    let tc_result =
-        tc::apply(&mut trial, config.tc_select.as_i32(), config.tc_opt.as_usize(), config.tc_enabled.as_usize());
-
-    let axes = match tc_result {
-        Ok(axes) => axes,
-        Err(_) => return false,
+    let axis_choice_count = match tc::detect_matmul(scheduler) {
+        Ok(Some(pattern)) => pattern.axis_choices.len(),
+        _ => return false,
     };
 
-    // Record the TC opt
-    let opt = Opt::tc(None, config.tc_select.as_i32(), config.tc_opt.as_usize(), config.tc_enabled.as_usize());
-    trial.applied_opts.push(opt);
+    let mut rejections = Vec::new();
 
-    // Post-TC optimizations (non-AMX only)
-    // Tinygrad: if good_tc_opt and not AMX
-    if !trial.renderer().is_amx() {
-        // Track current N/M ranges (axes[0]=N, axes[1]=M, axes[2]=K)
-        let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
+    for axis_choice in 0..axis_choice_count {
+        // Clone the scheduler for trial - if this axis choice fails, no partial mutations.
+        let mut trial = scheduler.clone();
+        let tc_result = tc::apply_with_axis_choice(
+            &mut trial,
+            config.tc_select.as_i32(),
+            config.tc_opt.as_usize(),
+            config.tc_enabled.as_usize(),
+            Some(axis_choice),
+        );
 
-        // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
-        for tc_dim in [1usize, 0] {
-            for &sz in &[5usize, 4, 3, 2] {
-                if tc_rngs[tc_dim].divisible_by(sz).is_some() {
-                    // Find the range's position in the scheduler
-                    if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
-                        && let Ok((replaced, _)) =
-                            trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
-                    {
-                        trial.applied_opts.push(Opt::upcast(rng_idx, sz));
-                        tc_rngs[tc_dim] = replaced;
+        let axes = match tc_result {
+            Ok(axes) => axes,
+            Err(err) => {
+                let err_msg = err.to_string();
+                tracing::debug!(axis_choice, reason = %err_msg, "try_tensor_cores: axis choice rejected");
+                rejections.push((axis_choice, err_msg));
+                continue;
+            }
+        };
+
+        // Record the TC opt with explicit axis choice.
+        let opt = Opt::tc(
+            Some(axis_choice),
+            config.tc_select.as_i32(),
+            config.tc_opt.as_usize(),
+            config.tc_enabled.as_usize(),
+        );
+        trial.applied_opts.push(opt);
+
+        // Post-TC optimizations (non-AMX only)
+        // Tinygrad: if good_tc_opt and not AMX
+        if !trial.renderer().is_amx() {
+            // Track current N/M ranges (axes[0]=N, axes[1]=M, axes[2]=K)
+            let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
+
+            // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
+            for tc_dim in [1usize, 0] {
+                for &sz in &[5usize, 4, 3, 2] {
+                    if tc_rngs[tc_dim].divisible_by(sz).is_some() {
+                        // Find the range's position in the scheduler
+                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
+                            && let Ok((replaced, _)) =
+                                trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
+                        {
+                            trial.applied_opts.push(Opt::upcast(rng_idx, sz));
+                            tc_rngs[tc_dim] = replaced;
+                        }
+                        break;
                     }
-                    break;
+                }
+            }
+
+            // LOCAL N (dim=0) with factors [4,2]
+            if trial.renderer().has_local {
+                for &sz in &[4usize, 2] {
+                    if tc_rngs[0].divisible_by(sz).is_some() {
+                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
+                            && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
+                        {
+                            trial.applied_opts.push(Opt::local(rng_idx, sz));
+                        }
+                        break;
+                    }
                 }
             }
         }
 
-        // LOCAL N (dim=0) with factors [4,2]
-        if trial.renderer().has_local {
-            for &sz in &[4usize, 2] {
-                if tc_rngs[0].divisible_by(sz).is_some() {
-                    if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
-                        && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
-                    {
-                        trial.applied_opts.push(Opt::local(rng_idx, sz));
-                    }
-                    break;
-                }
-            }
-        }
+        *scheduler = trial;
+        return true;
     }
 
-    *scheduler = trial;
-    true
+    tracing::debug!(?rejections, "try_tensor_cores: all axis choices rejected");
+    false
 }

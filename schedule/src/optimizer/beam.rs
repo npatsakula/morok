@@ -91,11 +91,24 @@ pub static BEAM_ACTIONS: Lazy<Vec<Opt>> = Lazy::new(|| {
     }
 
     // TC: tensor cores
-    // Auto-select
+    const TC_AXIS_CHOICES: usize = 9;
+
+    // Auto-select without fixed axis choice.
     actions.push(Opt::tc(None, -1, 0, 1));
-    // Specific TCs
-    for axis in 0..9 {
-        actions.push(Opt::tc(None, axis, 2, 1));
+    actions.push(Opt::tc(None, -1, 2, 1));
+
+    // Auto-select with explicit axis choices.
+    for axis_choice in 0..TC_AXIS_CHOICES {
+        actions.push(Opt::tc(Some(axis_choice), -1, 0, 1));
+        actions.push(Opt::tc(Some(axis_choice), -1, 2, 1));
+    }
+
+    // Specific tensor cores, with and without explicit axis choices.
+    for tc_select in 0..9 {
+        actions.push(Opt::tc(None, tc_select, 2, 1));
+        for axis_choice in 0..TC_AXIS_CHOICES {
+            actions.push(Opt::tc(Some(axis_choice), tc_select, 2, 1));
+        }
     }
 
     // SWAP: axis pairs

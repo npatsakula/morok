@@ -354,34 +354,15 @@ fn pack_tc_operand(
 // APPLICATION
 // ============================================================================
 
-/// Apply tensor core optimization to the scheduler.
-pub fn apply(
+fn apply_axis_choice_impl(
     scheduler: &mut Scheduler,
+    pattern: &MatmulPattern,
     tc_select: i32,
     tc_opt: usize,
     use_tensor_cores: usize,
+    axis_choice: usize,
 ) -> Result<[Arc<UOp>; 3], OptError> {
-    // Validate
-    if !scheduler.applied_opts.is_empty() {
-        return ValidationFailedSnafu { op: "TC", reason: "tensor core opts must be first" }.fail();
-    }
-    if use_tensor_cores == 0 || use_tensor_cores > 2 {
-        return ValidationFailedSnafu { op: "TC", reason: "use_tensor_cores must be 1 or 2" }.fail();
-    }
-    if tc_opt > 2 {
-        return ValidationFailedSnafu { op: "TC", reason: "tc_opt must be 0, 1, or 2" }.fail();
-    }
-    if tc_select < -1 {
-        return ValidationFailedSnafu { op: "TC", reason: "tc_select must be >= -1" }.fail();
-    }
-
-    // Detect pattern
-    let pattern = detect_matmul(scheduler)?
-        .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "no matmul pattern detected" }.build())?;
-
-    // Select tensor core
-    let tc_selection = (0..pattern.axis_choices.len())
-        .find_map(|axis_choice| select_tensor_core(&pattern, &scheduler.ren, tc_select, axis_choice).ok().flatten())
+    let tc_selection = select_tensor_core(pattern, &scheduler.ren, tc_select, axis_choice)?
         .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "no compatible tensor core found" }.build())?;
 
     // Clone the TensorCore to avoid borrow conflicts when applying PADTO
@@ -673,6 +654,94 @@ pub fn apply(
     }
 
     Ok(axes)
+}
+
+fn tc_reject_reason(err: &OptError) -> &'static str {
+    match err {
+        OptError::ValidationFailed { reason, .. } => reason,
+        OptError::InvalidArgType { .. } => "invalid argument type",
+        OptError::AxisOutOfBounds { .. } => "axis out of bounds",
+        OptError::DivisionError { .. } => "division constraint violated",
+        OptError::SymbolicDivisionError { .. } => "symbolic divisibility constraint",
+        OptError::ExpectedRangeOperation { .. } => "expected range operation",
+        OptError::MissingAxisParameter { .. } => "missing axis parameter",
+        OptError::UnsupportedFeature { .. } => "unsupported backend feature",
+        OptError::DeviceLimitExceeded { .. } => "device limit exceeded",
+    }
+}
+
+/// Apply tensor core optimization to the scheduler.
+///
+/// If `axis_choice` is provided, only that axis candidate is attempted.
+/// Otherwise all axis candidates are tried in order until one succeeds.
+pub fn apply_with_axis_choice(
+    scheduler: &mut Scheduler,
+    tc_select: i32,
+    tc_opt: usize,
+    use_tensor_cores: usize,
+    axis_choice: Option<usize>,
+) -> Result<[Arc<UOp>; 3], OptError> {
+    if !scheduler.applied_opts.is_empty() {
+        return ValidationFailedSnafu { op: "TC", reason: "tensor core opts must be first" }.fail();
+    }
+    if use_tensor_cores == 0 || use_tensor_cores > 2 {
+        return ValidationFailedSnafu { op: "TC", reason: "use_tensor_cores must be 1 or 2" }.fail();
+    }
+    if tc_opt > 2 {
+        return ValidationFailedSnafu { op: "TC", reason: "tc_opt must be 0, 1, or 2" }.fail();
+    }
+    if tc_select < -1 {
+        return ValidationFailedSnafu { op: "TC", reason: "tc_select must be >= -1" }.fail();
+    }
+
+    let pattern = detect_matmul(scheduler)?
+        .ok_or_else(|| ValidationFailedSnafu { op: "TC", reason: "no matmul pattern detected" }.build())?;
+
+    let choices: Vec<usize> = if let Some(choice) = axis_choice {
+        if choice >= pattern.axis_choices.len() {
+            return ValidationFailedSnafu { op: "TC", reason: "axis choice out of bounds" }.fail();
+        }
+        vec![choice]
+    } else {
+        (0..pattern.axis_choices.len()).collect()
+    };
+
+    let mut failures: Vec<(usize, &'static str)> = Vec::new();
+    let mut last_err: Option<OptError> = None;
+
+    for choice in choices {
+        let mut trial = scheduler.clone();
+        match apply_axis_choice_impl(&mut trial, &pattern, tc_select, tc_opt, use_tensor_cores, choice) {
+            Ok(axes) => {
+                *scheduler = trial;
+                return Ok(axes);
+            }
+            Err(err) => {
+                let reason = tc_reject_reason(&err);
+                tracing::debug!(axis_choice = choice, reason, error = %err, "tensor core axis choice rejected");
+                failures.push((choice, reason));
+                last_err = Some(err);
+            }
+        }
+    }
+
+    tracing::debug!(requested_axis_choice = ?axis_choice, failures = ?failures, "tensor core optimization rejected");
+
+    if let Some(err) = last_err {
+        Err(err)
+    } else {
+        ValidationFailedSnafu { op: "TC", reason: "no compatible tensor core found" }.fail()
+    }
+}
+
+/// Apply tensor core optimization, auto-trying axis choices.
+pub fn apply(
+    scheduler: &mut Scheduler,
+    tc_select: i32,
+    tc_opt: usize,
+    use_tensor_cores: usize,
+) -> Result<[Arc<UOp>; 3], OptError> {
+    apply_with_axis_choice(scheduler, tc_select, tc_opt, use_tensor_cores, None)
 }
 
 /// Short dtype name for WMMA function identifiers (matches Tinygrad convention).

@@ -23,8 +23,7 @@ pub fn apply_opt(scheduler: &mut Scheduler, opt: &Opt, append_opt: bool) -> Resu
     match opt.op {
         OptOps::TC => {
             let (tc_select, tc_opt, use_tensor_cores) = opt.arg.tc()?;
-            // TODO: propagate TC axes for post-TC upcasts on non-AMX devices
-            let _axes = tc::apply(scheduler, tc_select, tc_opt, use_tensor_cores)?;
+            let _axes = tc::apply_with_axis_choice(scheduler, tc_select, tc_opt, use_tensor_cores, opt.axis)?;
         }
         OptOps::UPCAST => {
             apply_upcast(scheduler, rng.ok_or_else(|| MissingAxisParameterSnafu.build())?, opt.arg.int()?)?;
