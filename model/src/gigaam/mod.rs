@@ -299,22 +299,14 @@ impl GigaAm {
 
         let pv1 = pad_valid.try_unsqueeze(1).context(TensorSnafu)?;
         let pv2 = pad_valid.try_unsqueeze(2).context(TensorSnafu)?;
-        let att_mask = if batch.value() > 1 {
-            let att_mask = pv1
-                .bitwise_and(&pv2)
+        let att_mask = Some(
+            pv1.bitwise_and(&pv2)
                 .context(TensorSnafu)?
                 .logical_not()
                 .context(TensorSnafu)?
                 .try_unsqueeze(1)
-                .context(TensorSnafu)?;
-            Some(
-                att_mask
-                    .try_expand([b.clone(), SInt::Const(self.config.n_heads), t_sub.clone(), t_sub.clone()])
-                    .context(TensorSnafu)?,
-            )
-        } else {
-            None
-        };
+                .context(TensorSnafu)?,
+        );
         let pad_mask = pad_valid.logical_not().context(TensorSnafu)?;
 
         let d_half = self.config.d_model / self.config.n_heads / 2;
