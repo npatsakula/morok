@@ -707,20 +707,33 @@ pub fn apply_with_axis_choice(
     };
 
     let mut failures: Vec<(usize, &'static str)> = Vec::new();
+    let tc_choices: Vec<i32> = if tc_select == -1 {
+        (0..scheduler.ren.tensor_cores.len()).map(|idx| idx as i32).collect()
+    } else {
+        vec![tc_select]
+    };
     let mut last_err: Option<OptError> = None;
 
     for choice in choices {
-        let mut trial = scheduler.clone();
-        match apply_axis_choice_impl(&mut trial, &pattern, tc_select, tc_opt, use_tensor_cores, choice) {
-            Ok(axes) => {
-                *scheduler = trial;
-                return Ok(axes);
-            }
-            Err(err) => {
-                let reason = tc_reject_reason(&err);
-                tracing::debug!(axis_choice = choice, reason, error = %err, "tensor core axis choice rejected");
-                failures.push((choice, reason));
-                last_err = Some(err);
+        for &tc_choice in &tc_choices {
+            let mut trial = scheduler.clone();
+            match apply_axis_choice_impl(&mut trial, &pattern, tc_choice, tc_opt, use_tensor_cores, choice) {
+                Ok(axes) => {
+                    *scheduler = trial;
+                    return Ok(axes);
+                }
+                Err(err) => {
+                    let reason = tc_reject_reason(&err);
+                    tracing::debug!(
+                        axis_choice = choice,
+                        tc_select = tc_choice,
+                        reason,
+                        error = %err,
+                        "tensor core axis choice rejected"
+                    );
+                    failures.push((choice, reason));
+                    last_err = Some(err);
+                }
             }
         }
     }

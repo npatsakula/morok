@@ -16,8 +16,8 @@ use morok_dtype::DType;
 use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp};
 
 use crate::pattern::RewriteResult;
-use crate::rangeify::patterns;
 use crate::rangeify::IndexingContext;
+use crate::rangeify::patterns;
 
 // ===== early_rewrites Pattern Tests =====
 
@@ -546,14 +546,13 @@ fn test_movement_op_removal_non_movement_op() {
 }
 
 #[test]
-fn test_pad_fallback_soft_limit_suppresses_non_upstream_recovery() {
+fn test_pad_fallback_recovers_without_suppression() {
     let matcher = patterns::apply_rangeify_patterns();
     let mut ctx = IndexingContext::new();
 
     for _ in 0..300 {
         let _ = ctx.record_pad_fallback();
     }
-    let suppressed_before = ctx.stats.fallback_suppressed;
 
     let src = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
     let r = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
@@ -564,26 +563,23 @@ fn test_pad_fallback_soft_limit_suppresses_non_upstream_recovery() {
     let pad = UOp::new(Op::Pad { src, begin_pads, end_pads }, DType::Float32);
 
     let result = matcher.rewrite(&pad, &mut ctx);
-    assert!(matches!(result, RewriteResult::NoMatch), "PAD fallback should be suppressed after soft limit");
-    assert!(ctx.stats.fallback_suppressed > suppressed_before, "suppressed counter should increase");
+    assert!(matches!(result, RewriteResult::Rewritten(_)), "PAD fallback should remain enabled");
 }
 
 #[test]
-fn test_reduceaxis_fallback_soft_limit_suppresses_non_upstream_recovery() {
+fn test_reduceaxis_fallback_recovers_without_suppression() {
     let matcher = patterns::apply_rangeify_patterns();
     let mut ctx = IndexingContext::new();
 
     for _ in 0..300 {
         let _ = ctx.record_reduceaxis_fallback();
     }
-    let suppressed_before = ctx.stats.fallback_suppressed;
 
     let src = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
     let reduce = src.try_reduce_axis(ReduceOp::Add, vec![0]).unwrap();
 
     let result = matcher.rewrite(&reduce, &mut ctx);
-    assert!(matches!(result, RewriteResult::NoMatch), "ReduceAxis fallback should be suppressed after soft limit");
-    assert!(ctx.stats.fallback_suppressed > suppressed_before, "suppressed counter should increase");
+    assert!(matches!(result, RewriteResult::Rewritten(_)), "ReduceAxis fallback should remain enabled");
 }
 
 // ===== Integration Tests =====

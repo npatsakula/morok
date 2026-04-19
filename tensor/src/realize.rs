@@ -1172,6 +1172,7 @@ fn prepare_execution_plan(
                         globals: spec.globals.clone(),
                         outs: spec.outs.clone(),
                         ins: spec.ins.clone(),
+                        host_parallel_safe: matches!(device.device, DeviceSpec::Cpu),
                         global_size: spec.global_size,
                         local_size: spec.local_size,
                     })

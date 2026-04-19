@@ -45,6 +45,11 @@ pub struct CachedKernel {
     /// Input buffer slots read by LOAD operations.
     /// Matches Tinygrad's ProgramSpec.ins semantics.
     pub ins: Vec<usize>,
+    /// Whether this program can be invoked concurrently from multiple host threads.
+    ///
+    /// The `Program` trait itself does not require thread safety. We only allow
+    /// host-level parallel kernel execution when this flag is true.
+    pub host_parallel_safe: bool,
     /// Global work size for dispatch (GPU backends, CPU threading).
     /// For CPU threading: [thread_count, 1, 1]
     pub global_size: Option<[usize; 3]>,
@@ -52,9 +57,9 @@ pub struct CachedKernel {
     pub local_size: Option<[usize; 3]>,
 }
 
-// SAFETY: CachedKernel is Send + Sync because:
-// - Box<dyn Program> is Send + Sync (Program trait requires Send + Sync)
-// - String is Send + Sync
+// SAFETY: CachedKernel is immutable after construction.
+// Host-level parallel dispatch is additionally gated at execution time via
+// `host_parallel_safe`, so non-thread-safe backends still execute serially.
 unsafe impl Send for CachedKernel {}
 unsafe impl Sync for CachedKernel {}
 

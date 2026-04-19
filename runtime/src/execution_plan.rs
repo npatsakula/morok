@@ -85,8 +85,8 @@ pub struct PreparedKernel {
 // SAFETY: PreparedKernel is immutable during plan execution.
 // - `buffer_ptrs` are precomputed and never mutated after build().
 // - `vals` are read-only during `execute`/`execute_profiled`.
-// - Safety of concurrent execution is enforced by execution-level hazard filtering
-//   (RAW/WAW/WAR + alias/view overlap checks) before kernels are parallelized.
+// - Host-level parallel execution is gated by execution-level hazard filtering
+//   (RAW/WAW/WAR on BufferId equality) and backend thread-safety capability.
 unsafe impl Send for PreparedKernel {}
 unsafe impl Sync for PreparedKernel {}
 
@@ -122,6 +122,7 @@ pub struct ExecutionPlan {
 struct ExecutionLevel {
     kernel_indices: Vec<usize>,
     contains_thread_id_kernel: bool,
+    host_parallel_safe: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +130,7 @@ struct KernelAccess {
     reads: HashSet<BufferId>,
     writes: HashSet<BufferId>,
     has_thread_id_parallelism: bool,
+    host_parallel_safe: bool,
 }
 
 // ============================================================================
@@ -151,6 +153,7 @@ impl ExecutionPlan {
     fn can_parallelize_level(level: &ExecutionLevel) -> bool {
         level.kernel_indices.len() > 1
             && !level.contains_thread_id_kernel
+            && level.host_parallel_safe
             // Avoid nested rayon scheduling from callers already inside rayon pools.
             && rayon::current_thread_index().is_none()
     }
@@ -412,7 +415,7 @@ fn kernel_access(kernel: &PreparedKernel) -> KernelAccess {
     let has_thread_id_parallelism = kernel.kernel.var_names.iter().any(|name| name == "thread_id")
         && kernel.kernel.global_size.map(|[tc, _, _]| tc > 1).unwrap_or(false);
 
-    KernelAccess { reads, writes, has_thread_id_parallelism }
+    KernelAccess { reads, writes, has_thread_id_parallelism, host_parallel_safe: kernel.kernel.host_parallel_safe }
 }
 
 fn accesses_conflict(lhs: &KernelAccess, rhs: &KernelAccess) -> bool {
@@ -441,6 +444,7 @@ fn partition_level_by_hazards(level_indices: &[usize], accesses: &[KernelAccess]
         .into_iter()
         .map(|kernel_indices| ExecutionLevel {
             contains_thread_id_kernel: kernel_indices.iter().any(|&idx| accesses[idx].has_thread_id_parallelism),
+            host_parallel_safe: kernel_indices.iter().all(|&idx| accesses[idx].host_parallel_safe),
             kernel_indices,
         })
         .collect()
@@ -495,6 +499,7 @@ fn build_execution_levels(kernels: &[PreparedKernel]) -> Vec<ExecutionLevel> {
             .map(|(idx, kernel)| ExecutionLevel {
                 kernel_indices: vec![idx],
                 contains_thread_id_kernel: kernel.kernel.var_names.iter().any(|name| name == "thread_id"),
+                host_parallel_safe: kernel.kernel.host_parallel_safe,
             })
             .collect();
     }
@@ -668,6 +673,7 @@ mod tests {
             globals: (0..buffer_ids.len()).collect(),
             outs: output_indices.clone(),
             ins: Vec::new(),
+            host_parallel_safe: true,
             global_size,
             local_size: None,
         });

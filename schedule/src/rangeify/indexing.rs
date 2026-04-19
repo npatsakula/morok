@@ -19,9 +19,6 @@ use crate::argsort;
 /// (input_ranges, output_ranges) for a UOp.
 type UOpRanges = (Vec<Arc<UOp>>, Vec<Arc<UOp>>);
 
-const PAD_FALLBACK_LIMIT: usize = 256;
-const REDUCEAXIS_FALLBACK_LIMIT: usize = 256;
-
 /// Rangeify observability counters.
 #[derive(Debug, Clone, Default)]
 pub struct RangeifyStats {
@@ -145,24 +142,16 @@ impl IndexingContext {
         self.stats.leaked_reduceaxis_ops += leaked_reduceaxis;
     }
 
-    /// Record PAD fallback usage and enforce a soft cap.
+    /// Record PAD fallback usage.
     pub fn record_pad_fallback(&mut self) -> bool {
         self.stats.pad_fallback_attempts += 1;
-        let allowed = self.stats.pad_fallback_attempts <= PAD_FALLBACK_LIMIT;
-        if !allowed {
-            self.stats.fallback_suppressed += 1;
-        }
-        allowed
+        true
     }
 
-    /// Record ReduceAxis fallback usage and enforce a soft cap.
+    /// Record ReduceAxis fallback usage.
     pub fn record_reduceaxis_fallback(&mut self) -> bool {
         self.stats.reduceaxis_fallback_attempts += 1;
-        let allowed = self.stats.reduceaxis_fallback_attempts <= REDUCEAXIS_FALLBACK_LIMIT;
-        if !allowed {
-            self.stats.fallback_suppressed += 1;
-        }
-        allowed
+        true
     }
 }
 
@@ -287,15 +276,12 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
         );
     }
 
-    if cfg!(debug_assertions) {
-        let leaked_reduceaxis =
-            transformed_sink.toposort().into_iter().find(|n| matches!(n.op(), Op::ReduceAxis { .. }));
-        debug_assert!(
-            leaked_reduceaxis.is_none(),
-            "rangeify leaked ReduceAxis (id={}): {}",
-            leaked_reduceaxis.as_ref().map(|n| n.id).unwrap_or(0),
-            transformed_sink.tree()
-        );
+    let leaked =
+        transformed_sink.toposort().into_iter().find(|n| matches!(n.op(), Op::Pad { .. } | Op::ReduceAxis { .. }));
+    if leaked.is_some() {
+        return Err(morok_ir::Error::SymbolicShapeUnsupported {
+            operation: "rangeify leaked high-level PAD/ReduceAxis after recovery".to_string(),
+        });
     }
 
     Ok((transformed_sink, ctx))

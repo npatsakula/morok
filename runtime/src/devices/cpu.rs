@@ -8,13 +8,14 @@
 //! - `MOROK_CPU_BACKEND` environment variable ("clang" or "llvm")
 //! - Explicit `create_cpu_device_with_backend()` call
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use morok_device::Result;
 use morok_device::device::{Compiler, Device, Program, ProgramSpec, Renderer, RuntimeFactory};
 use morok_device::registry::DeviceRegistry;
 use morok_dtype::DeviceSpec;
-use morok_ir::UOp;
+use morok_ir::{Op, UOp};
 
 use crate::LlvmKernel;
 use crate::clang::ClangKernel;
@@ -129,20 +130,46 @@ unsafe fn execute_kernel(
     }
 }
 
-fn apply_buffer_metadata(spec: &mut ProgramSpec, rendered: &morok_codegen::RenderedKernel) {
-    let mut globals: Vec<usize> = Vec::new();
-    let mut outs: Vec<usize> = Vec::new();
-
-    for arg in &rendered.buffer_args {
-        if !globals.contains(&arg.index) {
-            globals.push(arg.index);
-        }
-        if arg.is_output && !outs.contains(&arg.index) {
-            outs.push(arg.index);
+fn ordered_unique(slots: impl IntoIterator<Item = usize>) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+    for slot in slots {
+        if seen.insert(slot) {
+            ordered.push(slot);
         }
     }
+    ordered
+}
 
-    let ins: Vec<usize> = globals.iter().copied().filter(|slot| !outs.contains(slot)).collect();
+fn extract_param_slot(uop: &Arc<UOp>) -> Option<usize> {
+    let buf = uop.buf_uop();
+    if let Op::Param { slot, device: None, .. } = buf.op() { Some(*slot) } else { None }
+}
+
+fn load_slots_from_ast(ast: &Arc<UOp>) -> Vec<usize> {
+    ordered_unique(ast.toposort().into_iter().filter_map(|node| match node.op() {
+        Op::Load { buffer, .. } => extract_param_slot(buffer),
+        _ => None,
+    }))
+}
+
+fn apply_buffer_metadata(spec: &mut ProgramSpec, rendered: &morok_codegen::RenderedKernel, ast: &Arc<UOp>) {
+    let globals = ordered_unique(rendered.buffer_args.iter().map(|arg| arg.index));
+    let outs = ordered_unique(
+        rendered.buffer_args.iter().filter_map(|arg| if arg.is_output { Some(arg.index) } else { None }),
+    );
+
+    let globals_set: HashSet<usize> = globals.iter().copied().collect();
+    let outs_set: HashSet<usize> = outs.iter().copied().collect();
+
+    let mut ins = ordered_unique(
+        load_slots_from_ast(ast).into_iter().filter(|slot| globals_set.contains(slot) && !outs_set.contains(slot)),
+    );
+
+    if ins.is_empty() {
+        ins = globals.iter().copied().filter(|slot| !outs_set.contains(slot)).collect();
+    }
+
     spec.set_buffer_metadata(globals, outs, ins);
 }
 
@@ -192,7 +219,7 @@ impl Renderer for ClangRendererWrapper {
         }
 
         spec.set_var_names(rendered.var_names.clone());
-        apply_buffer_metadata(&mut spec, &rendered);
+        apply_buffer_metadata(&mut spec, &rendered, ast);
         spec.buf_count = rendered.buffer_args.len();
 
         Ok(spec)
@@ -305,7 +332,7 @@ impl Renderer for LlvmRendererWrapper {
         }
 
         spec.set_var_names(rendered.var_names.clone());
-        apply_buffer_metadata(&mut spec, &rendered);
+        apply_buffer_metadata(&mut spec, &rendered, ast);
         spec.buf_count = rendered.buffer_args.len();
 
         Ok(spec)
@@ -416,7 +443,7 @@ mod mlir_backend {
             }
 
             spec.set_var_names(rendered.var_names.clone());
-            apply_buffer_metadata(&mut spec, &rendered);
+            apply_buffer_metadata(&mut spec, &rendered, ast);
             spec.buf_count = rendered.buffer_args.len();
 
             Ok(spec)

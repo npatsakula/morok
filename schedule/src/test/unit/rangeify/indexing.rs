@@ -240,7 +240,7 @@ fn test_recovery_stats_tracking() {
 }
 
 #[test]
-fn test_fallback_counters_and_soft_limit() {
+fn test_fallback_counters_track_attempts() {
     let mut ctx = IndexingContext::new();
 
     let mut last_pad_allowed = true;
@@ -253,7 +253,8 @@ fn test_fallback_counters_and_soft_limit() {
         last_reduce_allowed = ctx.record_reduceaxis_fallback();
     }
 
-    assert!(!last_pad_allowed, "PAD fallback should eventually hit soft limit");
-    assert!(!last_reduce_allowed, "ReduceAxis fallback should eventually hit soft limit");
-    assert!(ctx.stats.fallback_suppressed > 0, "suppressed counter should increment when limits are exceeded");
+    assert!(last_pad_allowed, "PAD fallback should remain enabled for recovery");
+    assert!(last_reduce_allowed, "ReduceAxis fallback should remain enabled for recovery");
+    assert_eq!(ctx.stats.pad_fallback_attempts, 300);
+    assert_eq!(ctx.stats.reduceaxis_fallback_attempts, 300);
 }

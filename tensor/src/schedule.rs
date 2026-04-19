@@ -44,10 +44,14 @@ fn source_dependency_buffer_ids(src: &Arc<UOp>) -> Vec<u64> {
     match src.op() {
         Op::MStack { buffers } => buffers.iter().map(|b| b.buf_uop().id).collect(),
         Op::MSelect { buffer, device_index } => {
-            if let Op::MStack { buffers } = buffer.op()
-                && let Some(selected) = buffers.get(*device_index)
-            {
-                return vec![selected.buf_uop().id];
+            if let Op::MStack { buffers } = buffer.op() {
+                let mut ids: Vec<u64> = buffers.iter().map(|b| b.buf_uop().id).collect();
+                if let Some(selected) = buffers.get(*device_index) {
+                    ids.push(selected.buf_uop().id);
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                return ids;
             }
             vec![src.buf_uop().id]
         }
@@ -201,7 +205,10 @@ struct KernelBuffers {
 /// This ensures producer kernels are processed before consumers, which is
 /// critical for buffer sharing: the producer allocates the buffer first,
 /// then the consumer finds it in the registry via `get_or_create_buffer`.
-fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> (Vec<Arc<UOp>>, HashMap<u64, Vec<u64>>) {
+fn sort_kernels_by_dependencies(
+    kernels: &[Arc<UOp>],
+    root: &Arc<UOp>,
+) -> Result<(Vec<Arc<UOp>>, HashMap<u64, Vec<u64>>)> {
     debug!(num_kernels = kernels.len(), "sorting kernels by dependencies");
 
     let dependencies = analyze_kernel_dependencies(kernels, root);
@@ -230,16 +237,8 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> (Vec<A
         }
     }
 
-    // If sorting didn't include all kernels (possible cycle or disconnected graph),
-    // fall back to original order for any missing kernels
-    let had_cycle_or_gap = sorted_indices.len() < kernels.len();
-    if had_cycle_or_gap {
-        let sorted_idx_set: HashSet<usize> = sorted_indices.iter().copied().collect();
-        for (idx, _kernel) in kernels.iter().enumerate() {
-            if !sorted_idx_set.contains(&idx) {
-                sorted_indices.push(idx);
-            }
-        }
+    if sorted_indices.len() < kernels.len() {
+        return DependencyCyclesSnafu.fail();
     }
 
     let sorted: Vec<Arc<UOp>> = sorted_indices.iter().map(|&idx| kernels[idx].clone()).collect();
@@ -248,11 +247,7 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> (Vec<A
         .iter()
         .enumerate()
         .map(|(idx, kernel)| {
-            let mut deps: Vec<u64> = if had_cycle_or_gap {
-                vec![]
-            } else {
-                dependencies[idx].iter().map(|&dep_idx| kernels[dep_idx].id).collect()
-            };
+            let mut deps: Vec<u64> = dependencies[idx].iter().map(|&dep_idx| kernels[dep_idx].id).collect();
             deps.sort_unstable();
             (kernel.id, deps)
         })
@@ -260,7 +255,7 @@ fn sort_kernels_by_dependencies(kernels: &[Arc<UOp>], root: &Arc<UOp>) -> (Vec<A
 
     debug!(num_sorted = sorted.len(), "kernels sorted");
 
-    (sorted, dependency_ids_by_kernel)
+    Ok((sorted, dependency_ids_by_kernel))
 }
 
 /// Extract kernels from transformed graph and create schedule.
@@ -304,7 +299,7 @@ pub fn create_schedule(
     // Step 1.5: Sort kernels by dependencies (producers before consumers)
     // This ensures producer kernels are processed first, so they allocate buffers
     // before consumers look them up.
-    let (kernels, dependency_ids_by_kernel) = sort_kernels_by_dependencies(&kernels, &transformed);
+    let (kernels, dependency_ids_by_kernel) = sort_kernels_by_dependencies(&kernels, &transformed)?;
 
     // Track allocated intermediate buffers locally (no global registry needed)
     let mut allocated_buffers: HashMap<u64, Buffer> = HashMap::new();
