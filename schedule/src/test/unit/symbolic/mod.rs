@@ -2,6 +2,7 @@ mod index_lowering;
 
 use crate::{
     pattern::RewriteResult,
+    rewrite::graph_rewrite,
     symbolic::{sym, symbolic, symbolic_simple},
 };
 use morok_dtype::DType;
@@ -36,8 +37,8 @@ fn test_symbolic_simple_identity_folding() {
 
     // Test: 5 - 0 -> 5
     let sub = five.try_sub(&zero).unwrap();
-    let result4 = matcher.rewrite(&sub, &mut ());
-    assert!(matches!(result4, RewriteResult::Rewritten(_)));
+    let result4 = graph_rewrite(matcher, sub, &mut ());
+    assert!(Arc::ptr_eq(&result4, &five));
 
     // Test: 5 / 1 -> 5 (int division)
     let idiv = five.try_div(&one).unwrap();
@@ -60,6 +61,18 @@ fn test_symbolic_simple_identity_folding() {
     let xor_op = five.try_xor_op(&zero).unwrap();
     let result8 = matcher.rewrite(&xor_op, &mut ());
     assert!(matches!(result8, RewriteResult::Rewritten(_)));
+}
+
+#[test]
+fn test_symbolic_add_sub_same_const_cancels() {
+    use crate::rewrite::graph_rewrite;
+
+    let x = UOp::define_var("x".to_string(), 0, 1024);
+    let one = UOp::index_const(1);
+    let expr = one.try_add(&x).unwrap().try_sub(&one).unwrap();
+
+    let result = graph_rewrite(symbolic(), expr, &mut ());
+    assert!(Arc::ptr_eq(&result, &x), "expected (1 + x) - 1 to simplify to x, got {:?}", result.op());
 }
 
 #[test]
@@ -507,7 +520,15 @@ fn test_combine_identical_terms() {
 
     if let RewriteResult::Rewritten(rewritten) = result {
         // Should be 2*x
-        if let Op::Binary(BinaryOp::Mul, c, var) = rewritten.op() {
+        if let Op::Binary(BinaryOp::Mul, lhs, rhs) = rewritten.op() {
+            let (c, var) = if matches!(lhs.op(), Op::Const(_)) {
+                (lhs, rhs)
+            } else if matches!(rhs.op(), Op::Const(_)) {
+                (rhs, lhs)
+            } else {
+                panic!("Expected one Mul operand to be constant, got {:?}", rewritten.op());
+            };
+
             if let Op::Const(cv) = c.op() {
                 assert_eq!(cv.0, ConstValue::Int(2));
             } else {
@@ -663,27 +684,23 @@ fn test_alu_fold_sub_then_add_positive() {
     let sub = x.try_sub(&c3).unwrap();
     let add = sub.try_add(&c5).unwrap();
 
-    let result = matcher.rewrite(&add, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-
-    if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be x + 2
-        if let Op::Binary(BinaryOp::Add, var, c) = rewritten.op() {
-            assert!(Arc::ptr_eq(var, &x));
-            if let Op::Const(cv) = c.op() {
-                assert_eq!(cv.0, ConstValue::Int(2));
-            } else {
-                panic!("Expected constant, got {:?}", c.op());
-            }
+    let rewritten = graph_rewrite(matcher, add, &mut ());
+    // Should be x + 2
+    if let Op::Binary(BinaryOp::Add, var, c) = rewritten.op() {
+        assert!(Arc::ptr_eq(var, &x));
+        if let Op::Const(cv) = c.op() {
+            assert_eq!(cv.0, ConstValue::Int(2));
         } else {
-            panic!("Expected Add, got {:?}", rewritten.op());
+            panic!("Expected constant, got {:?}", c.op());
         }
+    } else {
+        panic!("Expected Add, got {:?}", rewritten.op());
     }
 }
 
 #[test]
 fn test_alu_fold_sub_then_add_negative() {
-    // Test: (x - 5) + 3 → x - 2
+    // Test: (x - 5) + 3 → x + (-2)
     let matcher = symbolic();
     let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c5 = UOp::native_const(5i32);
@@ -691,21 +708,17 @@ fn test_alu_fold_sub_then_add_negative() {
     let sub = x.try_sub(&c5).unwrap();
     let add = sub.try_add(&c3).unwrap();
 
-    let result = matcher.rewrite(&add, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-
-    if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be x - 2
-        if let Op::Binary(BinaryOp::Sub, var, c) = rewritten.op() {
-            assert!(Arc::ptr_eq(var, &x));
-            if let Op::Const(cv) = c.op() {
-                assert_eq!(cv.0, ConstValue::Int(2));
-            } else {
-                panic!("Expected constant, got {:?}", c.op());
-            }
+    let rewritten = graph_rewrite(matcher, add, &mut ());
+    // Should be x + (-2)
+    if let Op::Binary(BinaryOp::Add, var, c) = rewritten.op() {
+        assert!(Arc::ptr_eq(var, &x));
+        if let Op::Const(cv) = c.op() {
+            assert_eq!(cv.0, ConstValue::Int(-2));
         } else {
-            panic!("Expected Sub, got {:?}", rewritten.op());
+            panic!("Expected constant, got {:?}", c.op());
         }
+    } else {
+        panic!("Expected Add, got {:?}", rewritten.op());
     }
 }
 
@@ -719,27 +732,23 @@ fn test_alu_fold_add_then_sub_positive() {
     let add = x.try_add(&c5).unwrap();
     let sub = add.try_sub(&c3).unwrap();
 
-    let result = matcher.rewrite(&sub, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-
-    if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be x + 2
-        if let Op::Binary(BinaryOp::Add, var, c) = rewritten.op() {
-            assert!(Arc::ptr_eq(var, &x));
-            if let Op::Const(cv) = c.op() {
-                assert_eq!(cv.0, ConstValue::Int(2));
-            } else {
-                panic!("Expected constant, got {:?}", c.op());
-            }
+    let rewritten = graph_rewrite(matcher, sub, &mut ());
+    // Should be x + 2
+    if let Op::Binary(BinaryOp::Add, var, c) = rewritten.op() {
+        assert!(Arc::ptr_eq(var, &x));
+        if let Op::Const(cv) = c.op() {
+            assert_eq!(cv.0, ConstValue::Int(2));
         } else {
-            panic!("Expected Add, got {:?}", rewritten.op());
+            panic!("Expected constant, got {:?}", c.op());
         }
+    } else {
+        panic!("Expected Add, got {:?}", rewritten.op());
     }
 }
 
 #[test]
 fn test_alu_fold_add_then_sub_negative() {
-    // Test: (x + 3) - 5 → x - 2
+    // Test: (x + 3) - 5 → x + (-2)
     let matcher = symbolic();
     let x = UOp::var("x", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
@@ -747,21 +756,17 @@ fn test_alu_fold_add_then_sub_negative() {
     let add = x.try_add(&c3).unwrap();
     let sub = add.try_sub(&c5).unwrap();
 
-    let result = matcher.rewrite(&sub, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-
-    if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be x - 2
-        if let Op::Binary(BinaryOp::Sub, var, c) = rewritten.op() {
-            assert!(Arc::ptr_eq(var, &x));
-            if let Op::Const(cv) = c.op() {
-                assert_eq!(cv.0, ConstValue::Int(2));
-            } else {
-                panic!("Expected constant, got {:?}", c.op());
-            }
+    let rewritten = graph_rewrite(matcher, sub, &mut ());
+    // Should be x + (-2)
+    if let Op::Binary(BinaryOp::Add, var, c) = rewritten.op() {
+        assert!(Arc::ptr_eq(var, &x));
+        if let Op::Const(cv) = c.op() {
+            assert_eq!(cv.0, ConstValue::Int(-2));
         } else {
-            panic!("Expected Sub, got {:?}", rewritten.op());
+            panic!("Expected constant, got {:?}", c.op());
         }
+    } else {
+        panic!("Expected Add, got {:?}", rewritten.op());
     }
 }
 
@@ -975,8 +980,8 @@ fn test_distribute_division_over_subtraction() {
     assert!(matches!(result, RewriteResult::Rewritten(_)));
 
     if let RewriteResult::Rewritten(rewritten) = result {
-        // Should be (4*x) - (2*y)
-        if let Op::Binary(BinaryOp::Sub, left, right) = rewritten.op() {
+        // Should be (4*x) + (-(2*y)) in Tinygrad-style subtraction form.
+        if let Op::Binary(BinaryOp::Add, left, right) = rewritten.op() {
             // Check left: 4*x
             if let Op::Binary(BinaryOp::Mul, c, var) = left.op() {
                 if let Op::Const(cv) = c.op() {
@@ -985,15 +990,22 @@ fn test_distribute_division_over_subtraction() {
                 assert!(Arc::ptr_eq(var, &x));
             }
 
-            // Check right: 2*y
-            if let Op::Binary(BinaryOp::Mul, c, var) = right.op() {
-                if let Op::Const(cv) = c.op() {
-                    assert_eq!(cv.0, ConstValue::Int(2));
+            // Check right: (2*y) * -1
+            if let Op::Binary(BinaryOp::Mul, inner, neg_one) = right.op() {
+                assert!(matches!(neg_one.op(), Op::Const(cv) if cv.0 == ConstValue::Int(-1)));
+                if let Op::Binary(BinaryOp::Mul, c, var) = inner.op() {
+                    if let Op::Const(cv) = c.op() {
+                        assert_eq!(cv.0, ConstValue::Int(2));
+                    }
+                    assert!(Arc::ptr_eq(var, &y));
+                } else {
+                    panic!("Expected inner Mul on right, got {:?}", inner.op());
                 }
-                assert!(Arc::ptr_eq(var, &y));
+            } else {
+                panic!("Expected negated Mul on right, got {:?}", right.op());
             }
         } else {
-            panic!("Expected Sub, got {:?}", rewritten.op());
+            panic!("Expected Add, got {:?}", rewritten.op());
         }
     }
 }
@@ -1796,7 +1808,7 @@ fn test_nested_add_add() {
 
 #[test]
 fn test_nested_sub_sub() {
-    // (a - 3) - 5 → a - 8
+    // (a - 3) - 5 → a + (-8)
     let matcher = symbolic();
     let a = UOp::var("a", DType::Int32, 0, i64::MAX);
     let c3 = UOp::native_const(3i32);
@@ -1804,20 +1816,16 @@ fn test_nested_sub_sub() {
     let sub1 = a.try_sub(&c3).unwrap();
     let sub2 = sub1.try_sub(&c5).unwrap();
 
-    let result = matcher.rewrite(&sub2, &mut ());
-    assert!(matches!(result, RewriteResult::Rewritten(_)));
-
-    if let RewriteResult::Rewritten(rewritten) = result {
-        if let Op::Binary(BinaryOp::Sub, var, c) = rewritten.op() {
-            assert!(Arc::ptr_eq(var, &a));
-            if let Op::Const(cv) = c.op() {
-                assert_eq!(cv.0, ConstValue::Int(8));
-            } else {
-                panic!("Expected constant 8, got {:?}", c.op());
-            }
+    let rewritten = graph_rewrite(matcher, sub2, &mut ());
+    if let Op::Binary(BinaryOp::Add, var, c) = rewritten.op() {
+        assert!(Arc::ptr_eq(var, &a));
+        if let Op::Const(cv) = c.op() {
+            assert_eq!(cv.0, ConstValue::Int(-8));
         } else {
-            panic!("Expected Sub, got {:?}", rewritten.op());
+            panic!("Expected constant -8, got {:?}", c.op());
         }
+    } else {
+        panic!("Expected Add, got {:?}", rewritten.op());
     }
 }
 

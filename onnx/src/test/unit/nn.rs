@@ -242,19 +242,20 @@ fn test_rnnt_encoder_kernel_count() {
     let sink = morok_ir::UOp::sink(contiguouses);
 
     let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(sink, None).unwrap();
-    let (kernels_root, _kctx) = morok_schedule::rangeify::run_kernel_split_pipeline(rangeified);
+    let (kernels_root, _kctx) = morok_schedule::rangeify::try_get_kernel_graph(rangeified)
+        .expect("kernel split pipeline should succeed for RNNT kernel count");
 
     let kernels: Vec<_> =
-        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Kernel { .. })).collect();
+        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Call { .. })).collect();
 
     eprintln!("Morok rangeify kernels: {}", kernels.len());
 
     // Count by structure: (node_count, reduce_count) → frequency
-    // Extract the kernel's inner AST (SINK inside KERNEL), not the full dependency graph
+    // Extract the call body AST (SINK inside CALL), not the full dependency graph
     let mut type_counts: std::collections::HashMap<(usize, usize), usize> = std::collections::HashMap::new();
     for k in &kernels {
         let ast = match k.op() {
-            morok_ir::Op::Kernel { ast, .. } => ast,
+            morok_ir::Op::Call { body, .. } => body,
             _ => continue,
         };
         let nodes = ast.toposort();
@@ -263,7 +264,7 @@ fn test_rnnt_encoder_kernel_count() {
     }
 
     let mut types: Vec<_> = type_counts.into_iter().collect();
-    types.sort_by(|a, b| b.1.cmp(&a.1));
+    types.sort_by_key(|row| std::cmp::Reverse(row.1));
     eprintln!("\nKernel type breakdown (nodes, reduces → count):");
     for ((nn, nr), count) in &types {
         let per_layer = *count as f32 / 16.0;

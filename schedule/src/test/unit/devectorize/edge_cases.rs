@@ -55,7 +55,7 @@ fn test_devectorize_empty_sink() {
 
     // Empty SINK should remain as SINK
     match result.op() {
-        Op::Sink { sources } => {
+        Op::Sink { sources, .. } => {
             assert!(sources.is_empty());
         }
         other => panic!("Expected SINK, got {:?}", other),
@@ -72,7 +72,7 @@ fn test_devectorize_sink_noop() {
 
     // NOOP is dropped from SINK by sym_phase3_patterns (Tinygrad sym lines 422-424)
     match result.op() {
-        Op::Sink { sources } => {
+        Op::Sink { sources, .. } => {
             assert_eq!(sources.len(), 0, "NOOP should be dropped from SINK");
         }
         Op::Noop => {}

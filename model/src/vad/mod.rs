@@ -1,3 +1,15 @@
+//! Silero V5 voice-activity detection.
+//!
+//! The forward pass mirrors the upstream Silero architecture: STFT via a
+//! convolutional filterbank, four 1D conv blocks, an LSTM cell carrying
+//! `(h, c)` between chunks, and a sigmoid head that produces a per-chunk
+//! speech probability.
+//!
+//! The chunk-counter segmentation in [`VadInference::segment`] is a deliberate
+//! simplification — it thresholds probabilities and merges nearby segments,
+//! and is not equivalent to PyAnnote-style frame-classification VAD. Outputs
+//! should not be expected to match a PyAnnote pipeline numerically.
+
 mod error;
 
 pub use error::{Error, Result};
@@ -83,8 +95,8 @@ impl SileroVad {
 
         let x = x.conv2d().weight(&self.stft_conv_weight).stride(&[128]).call().context(TensorSnafu)?;
 
-        let real = x.try_shrink(&[(0, 1), (0, CUTOFF), (0, 4)]).context(TensorSnafu)?;
-        let imag = x.try_shrink(&[(0, 1), (CUTOFF, 258), (0, 4)]).context(TensorSnafu)?;
+        let real = x.try_shrink([(0, 1), (0, CUTOFF), (0, 4)]).context(TensorSnafu)?;
+        let imag = x.try_shrink([(0, 1), (CUTOFF, 258), (0, 4)]).context(TensorSnafu)?;
         let x = real
             .square()
             .context(TensorSnafu)?
@@ -157,7 +169,7 @@ fn lstm_cell(
     let o = parts[3].sigmoid().context(TensorSnafu)?;
 
     let new_c =
-        f.try_mul(&c).context(TensorSnafu)?.try_add(&i.try_mul(&g).context(TensorSnafu)?).context(TensorSnafu)?;
+        f.try_mul(c).context(TensorSnafu)?.try_add(&i.try_mul(&g).context(TensorSnafu)?).context(TensorSnafu)?;
     let new_h = o.try_mul(&new_c.tanh().context(TensorSnafu)?).context(TensorSnafu)?;
 
     Ok((new_h, new_c))
@@ -192,8 +204,8 @@ impl VadInference {
         let h = make_zero_state();
         let c = make_zero_state();
         let mut chunk_placeholder = Tensor::full(&[1, CHUNK_LEN], 0.0f32, DType::Float32)
-            .map_err(|e| crate::jit::JitError::Tensor { source: e })?;
-        chunk_placeholder.realize().map_err(|e| crate::jit::JitError::Tensor { source: e })?;
+            .map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
+        chunk_placeholder.realize().map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })?;
 
         let mut jit = SileroVadJit::new(vad);
         jit.prepare(&chunk_placeholder, &h, &c)?;
@@ -265,15 +277,15 @@ impl VadInference {
     }
 
     fn reset(&mut self) {
-        if let Ok(mut view) = self.h.array_view_mut::<f32>() {
-            if let Some(s) = view.as_slice_mut() {
-                s.fill(0.0);
-            }
+        if let Ok(mut view) = self.h.array_view_mut::<f32>()
+            && let Some(s) = view.as_slice_mut()
+        {
+            s.fill(0.0);
         }
-        if let Ok(mut view) = self.c.array_view_mut::<f32>() {
-            if let Some(s) = view.as_slice_mut() {
-                s.fill(0.0);
-            }
+        if let Ok(mut view) = self.c.array_view_mut::<f32>()
+            && let Some(s) = view.as_slice_mut()
+        {
+            s.fill(0.0);
         }
     }
 }
@@ -330,11 +342,11 @@ fn threshold_segments(probs: &[f32], threshold: f32, chunk_samples: usize) -> Ve
     let merge_gap_samples = merge_gap_chunks * chunk_samples;
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for seg in raw {
-        if let Some(last) = merged.last_mut() {
-            if seg.0 - last.1 <= merge_gap_samples {
-                last.1 = seg.1;
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && seg.0 - last.1 <= merge_gap_samples
+        {
+            last.1 = seg.1;
+            continue;
         }
         merged.push(seg);
     }

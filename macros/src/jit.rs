@@ -107,6 +107,8 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
     let input_accessor_names: Vec<Ident> = jit.inputs.iter().map(|i| format_ident!("{}_mut", i.name)).collect();
     let input_buffer_id_fields: Vec<Ident> = jit.inputs.iter().map(|i| format_ident!("{}_buffer_id", i.name)).collect();
     let input_ast_id_locals: Vec<Ident> = jit.inputs.iter().map(|i| format_ident!("{}_ast_id", i.name)).collect();
+    let input_realized_locals: Vec<Ident> =
+        jit.inputs.iter().map(|i| format_ident!("__jit_input_{}", i.name)).collect();
 
     let build_args = &jit.build_args;
     let build_body = &jit.build_body;
@@ -149,7 +151,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
         quote! {
             let #var_name = self.#field_name
                 .bind(self.#field_name.bounds().1)
-                .map_err(|e| morok_model::jit::JitError::Tensor { source: e })?;
+                .map_err(|e| morok_model::jit::JitError::Tensor { source: Box::new(e) })?;
         }
     });
 
@@ -161,6 +163,16 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
         })()
     };
 
+    let input_realizations = input_names.iter().zip(input_realized_locals.iter()).map(|(input_name, local)| {
+        quote! {
+            let mut #local = #input_name.clone();
+            #local
+                .realize_with(config)
+                .map_err(|e| morok_model::jit::JitError::Tensor { source: Box::new(e) })?;
+            let #input_name = &#local;
+        }
+    });
+
     let buffer_id_extractions =
         input_names.iter().zip(input_buffer_id_fields.iter()).zip(input_ast_id_locals.iter()).map(
             |((input_name, buf_field), ast_field)| {
@@ -170,6 +182,26 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                 }
             },
         );
+
+    let duplicate_input_checks = input_names.iter().zip(input_buffer_id_fields.iter()).enumerate().flat_map(
+        |(left_idx, (left_name, left_buf_field))| {
+            input_names.iter().zip(input_buffer_id_fields.iter()).skip(left_idx + 1).map(
+                move |(right_name, right_buf_field)| {
+                    let left_name_str = left_name.to_string();
+                    let right_name_str = right_name.to_string();
+                    quote! {
+                        if #left_buf_field == #right_buf_field {
+                            return Err(morok_model::jit::JitError::DuplicateInputBuffer {
+                                name: #right_name_str,
+                                duplicate_of: #left_name_str,
+                                buffer_id: #right_buf_field,
+                            });
+                        }
+                    }
+                },
+            )
+        },
+    );
 
     let index_resolution =
         input_id_fields.iter().zip(input_buffer_id_fields.iter()).zip(input_ast_id_locals.iter()).map(
@@ -256,15 +288,18 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                 #(#prepare_params,)*
                 config: &morok_tensor::PrepareConfig,
             ) -> morok_model::jit::Result<()> {
+                #(#input_realizations)*
+                #(#buffer_id_extractions)*
+                #(#duplicate_input_checks)*
+
                 #(#prepare_var_bindings)*
+
                 let output: morok_tensor::Tensor = #build_closure
                     .map_err(|e| morok_model::jit::JitError::Build { source: Box::new(e) as _ })?;
 
-                #(#buffer_id_extractions)*
-
                 let mut output = output;
                 let plan = morok_tensor::Tensor::prepare_batch_with(std::iter::once(&mut output), config)
-                    .map_err(|e| morok_model::jit::JitError::Tensor { source: e })?;
+                    .map_err(|e| morok_model::jit::JitError::Tensor { source: Box::new(e) })?;
 
                 #(#index_resolution)*
 
@@ -276,7 +311,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
 
             pub fn output(&self) -> morok_model::jit::Result<&morok_device::Buffer> {
                 let state = self.state.as_ref().ok_or(morok_model::jit::JitError::NotPrepared)?;
-                Ok(state.plan.output_buffer())
+                state.plan.output_buffer().ok_or(morok_model::jit::JitError::NotPrepared)
             }
 
             pub fn buffers(&self) -> morok_model::jit::Result<&[morok_device::Buffer]> {
@@ -294,7 +329,7 @@ pub(crate) fn generate(jit: JitWrapper) -> Result<TokenStream> {
                 Ok(vec![#( state.#input_buffer_id_fields ),*])
             }
 
-            pub fn prepared_kernels(&self) -> morok_model::jit::Result<&[morok_runtime::PreparedKernel]> {
+            pub fn prepared_kernels(&self) -> morok_model::jit::Result<Vec<&morok_runtime::PreparedKernel>> {
                 let state = self.state.as_ref().ok_or(morok_model::jit::JitError::NotPrepared)?;
                 Ok(state.plan.prepared_kernels())
             }

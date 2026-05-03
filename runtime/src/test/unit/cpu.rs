@@ -4,7 +4,21 @@
 
 use crate::devices::cpu::{CpuBackend, create_cpu_device_with_backend};
 use morok_device::registry::DeviceRegistry;
-use morok_ir::UOp;
+use morok_dtype::{AddrSpace, DType};
+use morok_ir::{ConstValue, UOp};
+
+fn build_copy_sink() -> std::sync::Arc<UOp> {
+    let ptr_dtype = DType::Float32.ptr(None, AddrSpace::Global);
+    let out = UOp::param(0, 16, ptr_dtype.clone(), None);
+    let inp = UOp::param(1, 16, ptr_dtype, None);
+    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
+
+    let out_index = UOp::index().buffer(out).indices(vec![idx.clone()]).call().expect("output INDEX");
+    let in_index = UOp::index().buffer(inp.clone()).indices(vec![idx]).call().expect("input INDEX");
+    let load = UOp::load().buffer(inp).index(in_index).call();
+    let store = out_index.store(load);
+    UOp::sink(vec![store])
+}
 
 #[test]
 fn test_cpu_device_creation_llvm() {
@@ -73,4 +87,23 @@ fn test_compile_invalid_ir() {
     // TODO: Add LLVM IR validation to LlvmCompiler
     let result = device.compiler.compile(&spec);
     assert!(result.is_ok(), "Should return CompiledSpec even with invalid IR (validation TODO)");
+}
+
+#[test]
+fn test_renderer_metadata_consistent_between_clang_and_llvm() {
+    let registry = DeviceRegistry::default();
+    let clang = create_cpu_device_with_backend(&registry, CpuBackend::Clang).expect("create clang device");
+    let llvm = create_cpu_device_with_backend(&registry, CpuBackend::Llvm).expect("create llvm device");
+
+    let sink = build_copy_sink();
+    let linear = UOp::linear(sink.toposort().into());
+    let clang_spec = clang.renderer.render(&linear, Some("meta_copy")).expect("clang render");
+    let llvm_spec = llvm.renderer.render(&linear, Some("meta_copy")).expect("llvm render");
+
+    assert_eq!(clang_spec.globals, vec![0, 1]);
+    assert_eq!(clang_spec.outs, vec![0]);
+    assert_eq!(clang_spec.ins, vec![1]);
+    assert_eq!(clang_spec.globals, llvm_spec.globals);
+    assert_eq!(clang_spec.outs, llvm_spec.outs);
+    assert_eq!(clang_spec.ins, llvm_spec.ins);
 }

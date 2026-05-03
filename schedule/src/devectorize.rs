@@ -98,7 +98,7 @@ fn build_end_merge_subs(range_to_ends: &HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>
 /// Needed because later passes (e.g. pm_decomp+pm_render) can create new sibling
 /// ENDs that weren't present when pm_reduce ran.
 pub fn merge_sibling_ends(sink: &Arc<UOp>) -> Arc<UOp> {
-    let Op::Sink { sources } = sink.op() else { return sink.clone() };
+    let Op::Sink { sources, .. } = sink.op() else { return sink.clone() };
 
     let mut range_to_ends: HashMap<SmallVec<[u64; 4]>, Vec<Arc<UOp>>> = HashMap::new();
     for node in sink.toposort() {
@@ -155,9 +155,15 @@ pub fn bool_storage_patterns() -> &'static TypedPatternMatcher {
         },
 
         // LOAD bool: load as uint8, then cast to bool
-        load @ Load { buffer, index } if load.dtype().base().is_bool() => {
+        load @ Load { buffer, index, alt } if load.dtype().base().is_bool() => {
             let uint8_dtype = load.dtype().with_base(ScalarDType::UInt8);
-            let uint8_load = UOp::load().buffer(buffer.clone()).index(index.clone()).dtype(uint8_dtype).call();
+            let uint8_alt = alt.clone().map(|a| a.cast(uint8_dtype.clone()));
+            let uint8_load = UOp::load()
+                .buffer(buffer.clone())
+                .index(index.clone())
+                .maybe_alt(uint8_alt)
+                .dtype(uint8_dtype)
+                .call();
             Some(uint8_load.cast(load.dtype()))
         },
 
@@ -334,10 +340,24 @@ pub fn pm_float_decomp() -> crate::TypedPatternMatcher<Fp8DecompCtx> {
         },
 
         // Pattern 2: LOAD with FP8 dtype → load as UInt8, f2f upcast to target float
-        load @ Load { buffer, index } if load.dtype().base() == ctx.from => {
-            let uint_dtype = DType::Scalar(ctx.from.float_to_uint());
-            let uint_load = UOp::load().buffer(buffer.clone()).index(index.clone())
-                .dtype(uint_dtype).call();
+        load @ Load { buffer, index, alt } if load.dtype().base() == ctx.from => {
+            let uint_dtype = DType::Scalar(ctx.from.float_to_uint()).vec(load.dtype().vcount());
+            let uint_alt = alt.clone().map(|a| {
+                if a.dtype().base() == ctx.from {
+                    a.bitcast(uint_dtype.clone())
+                } else {
+                    let target_float = DType::Scalar(ctx.to).vec(load.dtype().vcount());
+                    let target_uint = DType::Scalar(ctx.to.float_to_uint()).vec(load.dtype().vcount());
+                    let float_alt = a.cast(target_float);
+                    f2f(&float_alt.bitcast(target_uint), ctx.to, ctx.from)
+                }
+            });
+            let uint_load = UOp::load()
+                .buffer(buffer.clone())
+                .index(index.clone())
+                .maybe_alt(uint_alt)
+                .dtype(uint_dtype)
+                .call();
             Some(f2f(&uint_load, ctx.from, ctx.to))
         },
 
@@ -1507,8 +1527,18 @@ fn split_load_store(ls: &Arc<UOp>, idx: &Arc<UOp>) -> Option<Arc<UOp>> {
                 Op::Store { value, ranges, .. } => {
                     ret.push(lidx.store_with_ranges(value.gep((pos..pos + fold_len).collect()), ranges.clone()));
                 }
-                Op::Load { buffer, .. } => {
-                    ret.push(UOp::load().buffer(buffer.clone()).index(lidx).dtype(scalar_dtype.vec(fold_len)).call());
+                Op::Load { buffer, alt, .. } => {
+                    let load = if let Some(alt) = alt {
+                        UOp::load()
+                            .buffer(buffer.clone())
+                            .index(lidx)
+                            .dtype(scalar_dtype.vec(fold_len))
+                            .alt(slice_vector_lane(alt, pos, fold_len))
+                            .call()
+                    } else {
+                        UOp::load().buffer(buffer.clone()).index(lidx).dtype(scalar_dtype.vec(fold_len)).call()
+                    };
+                    ret.push(load);
                 }
                 _ => return None,
             }
@@ -1582,6 +1612,20 @@ fn offset_index(idx: &Arc<UOp>, offset: i64) -> Arc<UOp> {
         .ptr(true)
         .call()
         .expect("ICE: unable to create index")
+}
+
+fn slice_vector_lane(value: &Arc<UOp>, pos: usize, fold_len: usize) -> Arc<UOp> {
+    if value.dtype().vcount() == 1 {
+        // Scalar inputs are broadcast across the lane (mirrors tinygrad's
+        // split_load_store, where a shared scalar alt is reused across every
+        // per-lane LOAD; the codegen-side invariant that alt vcount matches
+        // the LOAD lane width is restored here by splatting at split time).
+        return value.broadcast(fold_len);
+    }
+    if fold_len == 1 {
+        return value.gep(vec![pos]);
+    }
+    value.gep((pos..pos + fold_len).collect())
 }
 
 // ============================================================================
@@ -1664,8 +1708,11 @@ fn image_fixup(ls: &Arc<UOp>) -> Option<Arc<UOp>> {
                 .ok()?
         };
 
-        // Replace the index in LOAD/STORE
-        return Some(ls.replace().src(vec![new_idx]).call());
+        // Replace the index in LOAD/STORE while preserving all other sources (including LOAD.alt).
+        let mut src = ls.op().sources().to_vec();
+        let index_pos = if is_load { 1 } else { 0 };
+        src[index_pos] = new_idx;
+        return Some(ls.replace().src(src).call());
     }
 
     // Case 2: Direct INDEX with ImageDType (unfoldable image, no CAST)

@@ -24,7 +24,7 @@ cached_property! {
     /// Cached shape property.
     ///
     /// Computes the shape of a UOp via shape inference rules.
-    /// Returns `Ok(None)` for control flow operations (SINK, END, KERNEL, etc.),
+    /// Returns `Ok(None)` for control flow operations (SINK, END, CALL wrappers, etc.),
     /// `Ok(Some(shape))` for tensor operations, and `Err` for shape mismatches.
     ///
     /// # Example

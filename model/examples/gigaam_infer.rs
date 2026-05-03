@@ -6,10 +6,11 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use morok_dtype::DType;
-use morok_ir::Op;
+use morok_ir::{ConstValue, Op, UOp};
 use morok_model::audio::MelSpectrogram;
 use morok_model::gigaam::{GigaAm, GigaAmBatchedJit, SubsamplingMode};
 use morok_tensor::{PrepareConfig, Tensor};
@@ -25,8 +26,8 @@ struct KernelAgg {
     elapsed: Duration,
     count: usize,
     var_names: Vec<String>,
-    global_size: Option<[usize; 3]>,
-    local_size: Option<[usize; 3]>,
+    global_size: String,
+    local_size: String,
     code_len: usize,
 }
 
@@ -57,6 +58,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(_) => false,
     };
+    let debug_logits = match env::var("MOROK_DEBUG_LOGITS") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        }
+        Err(_) => false,
+    };
     let amx_enabled = std::env::var("MOROK_AMX").as_deref() == Ok("1");
 
     let t_audio = Instant::now();
@@ -68,10 +76,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let t_model = Instant::now();
     println!("\nLoading GigaAM...");
-    let model = GigaAm::from_hub_with_revision("vpermilp/GigaAM-v3", "ctc")?;
+    let mut model = GigaAm::from_hub_with_revision("vpermilp/GigaAM-v3", "ctc")?;
     let dt_model = t_model.elapsed();
     let sample_rate = model.config.sample_rate;
-    println!("Loaded: {} layers, d_model={}", model.config.n_layers, model.config.d_model);
+    println!(
+        "Loaded: {} layers, d_model={}, vocab_size={}, blank_id={}",
+        model.config.n_layers, model.config.d_model, model.config.vocab_size, BLANK_ID
+    );
 
     let mel = MelSpectrogram::new(&morok_model::audio::MelConfig {
         sample_rate,
@@ -82,13 +93,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         center: model.config.mel_center,
     });
     let n_mels = mel.n_mels();
-    let max_batch = model.config.max_batch_size;
-    let max_t_mel = model.config.max_seq_len;
+    let max_t_mel = model.config.max_mel_frames;
     let subs_kernel_size = match model.config.subsampling_mode {
         SubsamplingMode::Conv1d => model.config.subs_kernel_size,
         SubsamplingMode::Conv2d => 3,
     };
-    let max_t_sub = subs_output_length(subs_kernel_size, max_t_mel);
 
     let total_mel_frames = mel.num_frames(waveform.len());
     if total_mel_frames == 0 {
@@ -109,7 +118,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dt_mel = t_mel.elapsed();
 
     let num_chunks = total_mel_frames.div_ceil(max_t_mel);
-    println!("Chunking into {} chunks of up to {} mel frames", num_chunks, max_t_mel);
+    let max_batch = model.config.max_batch_size.min(num_chunks);
+    model.config.max_batch_size = max_batch;
+    println!("Chunking into {} chunks of up to {} mel frames; JIT batch bound {}", num_chunks, max_t_mel, max_batch);
 
     let mut mel_batch = Tensor::full(&[max_batch, n_mels, max_t_mel], 0.0f32, DType::Float32)?;
     mel_batch.realize().unwrap();
@@ -123,6 +134,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("JIT optimizer config: {:?}", prepare_config.optimizer);
     println!("AMX renderer      {}", if amx_enabled { "enabled (MOROK_AMX=1)" } else { "disabled" });
     jit.prepare_with_config(&mel_batch, &lengths, &prepare_config)?;
+    if std::env::var("MOROK_DUMP_KERNELS").as_deref() == Ok("1") {
+        for kernel in jit.prepared_kernels().unwrap() {
+            println!("{}", kernel.kernel.code);
+        }
+    }
     let dt_prepare = t_prepare.elapsed();
     println!("Plan captured.");
     print_buffer_summary(&jit)?;
@@ -141,7 +157,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if profile_ast {
         println!("Kernel AST summaries enabled via MOROK_PROFILE_AST=1");
     }
-
     let t_loop = Instant::now();
     let mut dt_pack = Duration::ZERO;
     let mut dt_exec = Duration::ZERO;
@@ -184,6 +199,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let t_exec_batch = Instant::now();
         let t_exec = chunk_lengths.iter().copied().max().unwrap_or(1).max(1);
+        let t_exec_sub = subs_output_length(subs_kernel_size, t_exec);
         if profile_kernels {
             let profiles = jit.execute_with_vars_profiled(&[("b", b as i64), ("t", t_exec as i64)])?;
             for p in profiles {
@@ -191,8 +207,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     elapsed: Duration::ZERO,
                     count: 0,
                     var_names: p.kernel.var_names.clone(),
-                    global_size: p.kernel.global_size,
-                    local_size: p.kernel.local_size,
+                    global_size: format_launch_size(&p.kernel.global_size),
+                    local_size: format_launch_local_size(p.kernel.local_size.as_ref()),
                     code_len: p.kernel.code.len(),
                 });
                 e.elapsed += p.elapsed;
@@ -206,7 +222,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t_decode_batch = Instant::now();
         for (bi, mel_len) in chunk_lengths.iter().enumerate() {
             let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
-            let text = ctc_greedy_decode_batch_item(jit.output()?, BLANK_ID, bi, max_t_sub, actual_sub);
+            if debug_logits && chunk_batch_start == 0 && bi == 0 {
+                let logits = jit.output()?.as_array::<f32>().expect("failed to read output logits");
+                let slice = logits.as_slice().expect("contiguous output logits");
+                let sample_n = (BLANK_ID + 1) * actual_sub.min(4);
+                let sample = &slice[..sample_n.min(slice.len())];
+                let (mut min_v, mut max_v, mut nonzero) = (f32::INFINITY, f32::NEG_INFINITY, 0usize);
+                for &v in sample {
+                    min_v = min_v.min(v);
+                    max_v = max_v.max(v);
+                    if v != 0.0 {
+                        nonzero += 1;
+                    }
+                }
+
+                let vocab = BLANK_ID + 1;
+                let mut first_ids = Vec::new();
+                let mut first_labels = Vec::new();
+                for t in 0..actual_sub.min(16) {
+                    let base = t * vocab;
+                    let mut best = 0usize;
+                    for c in 1..vocab {
+                        if slice[base + c] > slice[base + best] {
+                            best = c;
+                        }
+                    }
+                    first_ids.push(best);
+                    if best == BLANK_ID {
+                        first_labels.push("<blank>".to_string());
+                    } else {
+                        first_labels.push(VOCAB[best].to_string());
+                    }
+                }
+
+                let mut id_hist = vec![0usize; vocab];
+                for t in 0..actual_sub {
+                    let base = t * vocab;
+                    let mut best = 0usize;
+                    for c in 1..vocab {
+                        if slice[base + c] > slice[base + best] {
+                            best = c;
+                        }
+                    }
+                    id_hist[best] += 1;
+                }
+
+                let mut top_hist: Vec<(usize, usize)> =
+                    id_hist.into_iter().enumerate().filter(|(_, n)| *n > 0).collect();
+                top_hist.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                println!(
+                    "debug logits: sample={} min={:.6} max={:.6} nonzero={} stride={} valid={}",
+                    sample.len(),
+                    min_v,
+                    max_v,
+                    nonzero,
+                    t_exec_sub,
+                    actual_sub
+                );
+                println!("debug logits: first ids={:?}", first_ids);
+                println!("debug logits: first labels={:?}", first_labels);
+                println!("debug logits: top ids={:?}", top_hist.into_iter().take(6).collect::<Vec<_>>());
+            }
+            let text = ctc_greedy_decode_batch_item(jit.output()?, BLANK_ID, bi, t_exec_sub, actual_sub);
             if !text.is_empty() {
                 full_text.push_str(&text);
             }
@@ -235,7 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n--- Kernel profile (aggregated by entry point) ---");
 
         let mut rows: Vec<(String, KernelAgg)> = by_entry_point.into_iter().collect();
-        rows.sort_by(|a, b| b.1.elapsed.cmp(&a.1.elapsed));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1.elapsed));
 
         let mut wmma_entries = 0usize;
         if profile_ast {
@@ -247,18 +324,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let total_unique = rows.len();
         let with_t = rows.iter().filter(|(_, agg)| agg.var_names.iter().any(|n| n == "t")).count();
         let with_b = rows.iter().filter(|(_, agg)| agg.var_names.iter().any(|n| n == "b")).count();
-        let with_thread = rows.iter().filter(|(_, agg)| agg.var_names.iter().any(|n| n == "thread_id")).count();
+        let with_thread = rows.iter().filter(|(_, agg)| agg.var_names.iter().any(|n| n == "core_id")).count();
 
         let mut by_global_size: HashMap<String, (Duration, usize)> = HashMap::new();
         for (_, agg) in &rows {
-            let key = format!("{:?}", agg.global_size);
+            let key = agg.global_size.clone();
             let e = by_global_size.entry(key).or_insert((Duration::ZERO, 0));
             e.0 += agg.elapsed;
             e.1 += agg.count;
         }
         let mut gs_rows: Vec<(String, Duration, usize)> =
             by_global_size.into_iter().map(|(k, (d, c))| (k, d, c)).collect();
-        gs_rows.sort_by(|a, b| b.1.cmp(&a.1));
+        gs_rows.sort_by_key(|row| std::cmp::Reverse(row.1));
 
         let mut by_base: HashMap<String, (Duration, usize, usize)> = HashMap::new();
         for (entry, agg) in &rows {
@@ -270,7 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut base_rows: Vec<(String, Duration, usize, usize)> =
             by_base.into_iter().map(|(k, (d, c, u))| (k, d, c, u)).collect();
-        base_rows.sort_by(|a, b| b.1.cmp(&a.1));
+        base_rows.sort_by_key(|row| std::cmp::Reverse(row.1));
 
         println!("kernels total   {:>9}", fmt_duration(kernel_total));
         println!("unique entries  {:>9}", total_unique);
@@ -315,7 +392,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 entry
             );
             println!(
-                "         vars={:?} has_t={} has_b={} gsz={:?} lsz={:?} code={}B",
+                "         vars={:?} has_t={} has_b={} gsz={} lsz={} code={}B",
                 agg.var_names, has_t, has_b, agg.global_size, agg.local_size, agg.code_len
             );
             if profile_ast && let Some(summary) = kernel_ast_map.get(&entry) {
@@ -358,18 +435,56 @@ fn fmt_bytes(bytes: usize) -> String {
     }
 }
 
+fn format_const_value(value: ConstValue) -> String {
+    match value {
+        ConstValue::Int(v) => v.to_string(),
+        ConstValue::UInt(v) => v.to_string(),
+        ConstValue::Bool(v) => v.to_string(),
+        ConstValue::Float(v) => v.to_string(),
+    }
+}
+
+fn format_launch_dim(dim: &Arc<UOp>) -> String {
+    match dim.op() {
+        Op::Const(value) => format_const_value(value.0),
+        Op::DefineVar { name, .. } => name.clone(),
+        Op::Bind { var, value } => format!("{}={}", format_launch_dim(var), format_launch_dim(value)),
+        Op::Binary(op, lhs, rhs) => format!("({} {:?} {})", format_launch_dim(lhs), op, format_launch_dim(rhs)),
+        Op::Cast { src, .. } | Op::BitCast { src, .. } | Op::After { passthrough: src, .. } => format_launch_dim(src),
+        _ => dim.op().as_ref().to_string(),
+    }
+}
+
+fn format_launch_size(size: &[Arc<UOp>; 3]) -> String {
+    format!("[{}, {}, {}]", format_launch_dim(&size[0]), format_launch_dim(&size[1]), format_launch_dim(&size[2]))
+}
+
+fn format_launch_local_size(size: Option<&[Arc<UOp>; 3]>) -> String {
+    size.map(format_launch_size).unwrap_or_else(|| "None".to_string())
+}
+
 fn print_buffer_summary(jit: &GigaAmBatchedJit) -> morok_model::jit::Result<()> {
     let buffers = jit.buffers()?;
     let total_views = buffers.len();
     let total_view_bytes: usize = buffers.iter().map(|b| b.size()).sum();
 
+    // Dedup by `storage_id()` (per-allocation identity), not `id()` (per-handle).
+    // Under arena mode, hundreds of views share one underlying allocation; keying
+    // by the handle id would count each view as its own allocation and inflate
+    // the totals. `total_size` here is the underlying allocation size — fixed per
+    // storage and shared by every view of it.
     let mut by_alloc: HashMap<morok_device::BufferId, usize> = HashMap::new();
     for b in buffers {
-        by_alloc.entry(b.id()).and_modify(|s| *s = (*s).max(b.size())).or_insert(b.size());
+        by_alloc.entry(b.storage_id()).or_insert_with(|| b.total_size());
     }
 
-    let input_ids: HashSet<morok_device::BufferId> = jit.input_buffer_ids()?.into_iter().collect();
-    let output_ids: HashSet<morok_device::BufferId> = jit.output_buffers()?.into_iter().map(|b| b.id()).collect();
+    // Resolve input handle ids → storage ids by looking each input handle up in
+    // the plan's buffer table.
+    let input_handle_ids: HashSet<morok_device::BufferId> = jit.input_buffer_ids()?.into_iter().collect();
+    let input_storage_ids: HashSet<morok_device::BufferId> =
+        buffers.iter().filter(|b| input_handle_ids.contains(&b.id())).map(|b| b.storage_id()).collect();
+    let output_storage_ids: HashSet<morok_device::BufferId> =
+        jit.output_buffers()?.into_iter().map(|b| b.storage_id()).collect();
 
     let mut input_count = 0usize;
     let mut output_count = 0usize;
@@ -380,8 +495,8 @@ fn print_buffer_summary(jit: &GigaAmBatchedJit) -> morok_model::jit::Result<()> 
     let mut interm_allocs: Vec<(morok_device::BufferId, usize)> = Vec::new();
 
     for (id, size) in &by_alloc {
-        let is_input = input_ids.contains(id);
-        let is_output = output_ids.contains(id);
+        let is_input = input_storage_ids.contains(id);
+        let is_output = output_storage_ids.contains(id);
         if is_input {
             input_count += 1;
             input_bytes += *size;
@@ -397,7 +512,7 @@ fn print_buffer_summary(jit: &GigaAmBatchedJit) -> morok_model::jit::Result<()> 
         }
     }
 
-    interm_allocs.sort_by(|a, b| b.1.cmp(&a.1));
+    interm_allocs.sort_by_key(|row| std::cmp::Reverse(row.1));
 
     println!("\n--- Buffer summary ---");
     println!("buffer views     {:>8}  {}", total_views, fmt_bytes(total_view_bytes));
@@ -408,7 +523,7 @@ fn print_buffer_summary(jit: &GigaAmBatchedJit) -> morok_model::jit::Result<()> 
     if !interm_allocs.is_empty() {
         println!("largest intermediate allocations:");
         for (id, sz) in interm_allocs.into_iter().take(12) {
-            println!("  id={:<8} {}", id.0, fmt_bytes(sz));
+            println!("  storage_id={:<8} {}", id.0, fmt_bytes(sz));
         }
     }
 
@@ -417,7 +532,7 @@ fn print_buffer_summary(jit: &GigaAmBatchedJit) -> morok_model::jit::Result<()> 
 
 fn summarize_kernel_ast(pk: &morok_runtime::PreparedKernel) -> KernelAstSummary {
     let ast = match pk.ast.op() {
-        Op::Kernel { ast, .. } => ast.clone(),
+        Op::Call { body, .. } => body.clone(),
         _ => pk.ast.clone(),
     };
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -426,7 +541,7 @@ fn summarize_kernel_ast(pk: &morok_runtime::PreparedKernel) -> KernelAstSummary 
     }
     let has_wmma = counts.keys().any(|k| k.eq_ignore_ascii_case("wmma"));
     let mut top_ops: Vec<(String, usize)> = counts.into_iter().collect();
-    top_ops.sort_by(|a, b| b.1.cmp(&a.1));
+    top_ops.sort_by_key(|row| std::cmp::Reverse(row.1));
     top_ops.truncate(8);
 
     let ast_head = trim_tree_head(&ast.tree(), 14);
@@ -475,13 +590,13 @@ fn ctc_greedy_decode_batch_item(
     output_buf: &morok_device::Buffer,
     blank_id: usize,
     batch_idx: usize,
-    chunk_sub_frames: usize,
-    max_frames: usize,
+    stride_frames: usize,
+    valid_frames: usize,
 ) -> String {
     let logits = output_buf.as_array::<f32>().expect("failed to read output buffer");
     let total_vocab = blank_id + 1;
-    let n_frames = chunk_sub_frames.min(max_frames);
-    let batch_base = batch_idx * chunk_sub_frames * total_vocab;
+    let n_frames = stride_frames.min(valid_frames);
+    let batch_base = batch_idx * stride_frames * total_vocab;
 
     let mut prev = blank_id;
     let mut text = String::new();

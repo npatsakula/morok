@@ -26,6 +26,7 @@ pub mod pipeline;
 pub mod pipeline_integration;
 pub mod range_merging;
 pub mod reduce_simplify;
+pub mod resolve_call;
 pub mod split_kernel;
 pub mod split_patterns;
 pub mod split_reduceop;

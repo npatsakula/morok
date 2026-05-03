@@ -8,9 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use morok_dtype::{DType, ScalarDType};
-use morok_ir::{AxisType, BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
+use morok_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
-use super::types::{c_cast, c_const, c_dtype, c_math_fn};
+use super::types::{c_cast, c_dtype, c_math_fn};
+use crate::common::format_custom_template_strict;
 
 /// Context for C code generation, tracking variable names and SSA inlining.
 pub struct CContext {
@@ -28,6 +29,10 @@ pub struct CContext {
     scope_escaping: HashSet<u64>,
     /// Function-scope declarations for hoisted variables (emitted before kernel body).
     pub hoisted_declarations: Vec<String>,
+    /// Side-channel error set by `render_uop` when it detects a graph invariant
+    /// violation. The render loop drains this after each call and propagates as
+    /// a typed [`crate::Error`].
+    pending_error: Option<crate::Error>,
 }
 
 impl CContext {
@@ -40,7 +45,20 @@ impl CContext {
             pending_reduces: HashMap::new(),
             scope_escaping,
             hoisted_declarations: Vec::new(),
+            pending_error: None,
         }
+    }
+
+    /// Record an `InvalidGraph` error from a renderer op handler.
+    pub fn set_invalid_graph(&mut self, reason: impl Into<String>) {
+        if self.pending_error.is_none() {
+            self.pending_error = Some(crate::Error::InvalidGraph { reason: reason.into() });
+        }
+    }
+
+    /// Drain any error recorded via [`Self::set_invalid_graph`].
+    pub fn take_error(&mut self) -> Option<crate::Error> {
+        self.pending_error.take()
     }
 
     /// Get the C expression for a UOp. Panics if not registered.
@@ -138,7 +156,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         | Op::Buffer { .. }
         | Op::Unique(_)
         | Op::Device(_)
-        | Op::Kernel { .. }
+        | Op::Call { .. }
         | Op::Barrier { .. } => None,
 
         Op::DefineReg { .. } => {
@@ -163,11 +181,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 // No index - just alias the buffer pointer
                 ctx.register(uop.id, buf);
             } else {
-                // Multi-index: linearize at render time using row-major strides
-                let idx = if indices.len() > 1 {
-                    render_linearize_multi_index_c(indices, ctx)
-                } else {
+                let idx = if indices.len() == 1 {
                     ctx.get(&indices[0]).to_string()
+                } else {
+                    ctx.set_invalid_graph(format!(
+                        "C renderer requires linearized INDEX (single-axis), found {} indices on uop {}",
+                        indices.len(),
+                        uop.id
+                    ));
+                    return None;
                 };
                 let expr = format!("{buf} + {idx}");
                 ctx.emit_expr(uop, expr, "idx", kernel);
@@ -186,9 +208,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
         Op::Load { index, alt, .. } => {
             let idx = ctx.get(index).to_string();
             let load_dtype = uop.dtype();
-            // Check if the INDEX source has a gate — render conditional load to avoid null deref.
-            // Tinygrad: LOAD with gated INDEX → (gate ? *(index) : alt_value)
-            let gate_expr = if let Op::Index { gate: Some(gate_uop), .. } = index.op() {
+            // Gated LOAD follows Tinygrad semantics: conditional load with explicit alt value.
+            // The gate is carried by INDEX, possibly behind one CAST wrapper.
+            let actual_index = match index.op() {
+                Op::Cast { src, .. } => src,
+                _ => index,
+            };
+            let gate_expr = if let Op::Index { gate: Some(gate_uop), .. } = actual_index.op() {
                 Some(ctx.get(gate_uop).to_string())
             } else {
                 None
@@ -200,12 +226,14 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
                 format!("*({idx})")
             };
             let expr = if let Some(gate) = gate_expr {
-                // Use the LOAD's alt value if present, otherwise default to zero
-                let alt_expr = if let Some(alt_uop) = alt {
-                    ctx.get(alt_uop).to_string()
-                } else {
-                    c_const(&morok_ir::types::ConstValue::zero(load_dtype.base()), &load_dtype)
+                let Some(alt_uop) = alt.as_ref() else {
+                    ctx.set_invalid_graph(format!(
+                        "gated LOAD on uop {} has no alt value; line_rewrite_cleanups must lift gated LOADs",
+                        uop.id
+                    ));
+                    return None;
                 };
+                let alt_expr = ctx.get(alt_uop).to_string();
                 format!("({gate} ? {deref_expr} : {alt_expr})")
             } else {
                 deref_expr
@@ -306,10 +334,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
-        Op::Range { end, axis_id, axis_type, .. } => {
-            if matches!(axis_type, AxisType::Thread) {
-                return None;
-            }
+        Op::Range { end, axis_id, .. } => {
             let end_val = ctx.get(end).to_string();
             let id = axis_id.value();
             let range_dtype = c_dtype(&uop.dtype());
@@ -323,10 +348,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
 
         Op::End { ranges, .. } => {
             for range in ranges.iter() {
-                if let Op::Range { axis_type, .. } = range.op() {
-                    if matches!(axis_type, AxisType::Thread) {
-                        continue;
-                    }
+                if let Op::Range { .. } = range.op() {
                     ctx.pop_indent();
                     let indent = ctx.indent();
                     kernel.push(format!("{indent}}}"));
@@ -416,6 +438,49 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             Some(())
         }
 
+        Op::CustomI { deps, code } => {
+            let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
+            let expr = match format_custom_template_strict(code, &args) {
+                Ok(s) => s,
+                Err(e) => {
+                    ctx.set_invalid_graph(format!("CUSTOMI template error on uop {}: {e}", uop.id));
+                    return None;
+                }
+            };
+            // CUSTOMI is always inline in Tinygrad's cstyle renderer.
+            ctx.register(uop.id, expr);
+            Some(())
+        }
+
+        Op::Custom { deps, code } => {
+            let args: Vec<String> = deps.iter().map(|dep| ctx.get(dep).to_string()).collect();
+            let rendered = match format_custom_template_strict(code, &args) {
+                Ok(s) => s,
+                Err(e) => {
+                    ctx.set_invalid_graph(format!("CUSTOM template error on uop {}: {e}", uop.id));
+                    return None;
+                }
+            };
+            let indent = ctx.indent();
+
+            if uop.dtype() == DType::Void {
+                let stmt = if rendered.trim_end().ends_with(';') { rendered } else { format!("{rendered};") };
+                kernel.push(format!("{indent}{stmt}"));
+                ctx.register(uop.id, String::new());
+            } else {
+                let name = ctx.next_name("custom");
+                let dtype = c_dtype(&uop.dtype());
+                if ctx.scope_escaping.contains(&uop.id) {
+                    ctx.hoisted_declarations.push(format!("  {dtype} {name};"));
+                    kernel.push(format!("{indent}{name} = {rendered};"));
+                } else {
+                    kernel.push(format!("{indent}{dtype} {name} = {rendered};"));
+                }
+                ctx.register(uop.id, name);
+            }
+            Some(())
+        }
+
         Op::Contract { src, .. } | Op::Unroll { src, .. } | Op::Detach { src } => {
             let s = ctx.get(src).to_string();
             ctx.register(uop.id, s);
@@ -461,34 +526,6 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut CContext, kernel: &mut Vec<String>) 
             None
         }
     }
-}
-
-/// Linearize multiple index expressions into a single C expression.
-///
-/// Produces `(idx0*stride0 + idx1*stride1 + ...)`.
-fn render_linearize_multi_index_c(indices: &[Arc<UOp>], ctx: &CContext) -> String {
-    use morok_schedule::passes::linearize_index::{compute_row_major_strides, extract_index_dimension};
-
-    let dims: Vec<i64> = indices
-        .iter()
-        .map(|idx| extract_index_dimension(idx).expect("multi-index dimension must be resolvable at codegen"))
-        .collect();
-    let strides = compute_row_major_strides(&dims);
-
-    let mut terms: Vec<String> = Vec::new();
-    for (idx_uop, &stride) in indices.iter().zip(strides.iter()) {
-        if stride == 0 {
-            continue;
-        }
-        let idx_val = ctx.get(idx_uop);
-        if stride == 1 {
-            terms.push(idx_val.to_string());
-        } else {
-            terms.push(format!("({idx_val} * {stride})"));
-        }
-    }
-
-    if terms.is_empty() { "0".to_string() } else { format!("({})", terms.join(" + ")) }
 }
 
 /// Render a binary operation as a C expression.

@@ -123,3 +123,25 @@ fn test_unbounded_buffer_still_linearizes() {
         panic!("Expected INDEX op after linearization");
     }
 }
+
+#[test]
+fn test_symbolic_dimension_is_linearized() {
+    let ptr_dtype = DType::Float32.ptr(None, morok_dtype::AddrSpace::Global);
+    let buffer = UOp::param(0, 1024, ptr_dtype, None);
+
+    let i = make_range(4, 0);
+    let b = UOp::define_var("B".to_string(), 1, 128);
+    let j = UOp::range_axis(b, AxisId::Renumbered(1), AxisType::Loop);
+
+    let multi_index = UOp::index().buffer(buffer).indices(vec![i, j]).call().unwrap();
+    let result = crate::rewrite::graph_rewrite(pm_linearize_multi_index(), multi_index.clone(), &mut ());
+
+    let Op::Index { indices, .. } = result.op() else {
+        panic!("Expected INDEX op after linearization");
+    };
+    assert_eq!(indices.len(), 1, "Symbolic dimensions should still linearize to single index");
+    assert!(
+        indices[0].toposort().iter().any(|node| matches!(node.op(), Op::DefineVar { name, .. } if name == "B")),
+        "Linear index should preserve symbolic dimension expression"
+    );
+}

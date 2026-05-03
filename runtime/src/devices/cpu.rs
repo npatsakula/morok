@@ -8,14 +8,13 @@
 //! - `MOROK_CPU_BACKEND` environment variable ("clang" or "llvm")
 //! - Explicit `create_cpu_device_with_backend()` call
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use morok_device::Result;
 use morok_device::device::{Compiler, Device, Program, ProgramSpec, Renderer, RuntimeFactory};
 use morok_device::registry::DeviceRegistry;
 use morok_dtype::DeviceSpec;
-use morok_ir::{Op, UOp};
+use morok_ir::UOp;
 
 use crate::LlvmKernel;
 use crate::clang::ClangKernel;
@@ -59,8 +58,8 @@ impl CpuBackend {
 /// # Safety
 ///
 /// Buffer safety is guaranteed by the shift_to() transformation:
-/// - Each thread_id maps to disjoint output indices
-/// - Index formula: `output[thread_id * chunk_size + local_idx]`
+/// - Each core_id maps to disjoint output indices
+/// - Index formula: `output[core_id * chunk_size + local_idx]`
 ///
 /// Same buffer pointers can be safely passed to all threads because:
 /// 1. Input buffers: Read-only access (no data race)
@@ -71,11 +70,13 @@ unsafe fn execute_parallel(
     buffers: &[*mut u8],
     vals: &[i64],
     var_names: &[String],
-    thread_count: usize,
+    core_count: usize,
 ) -> Result<()> {
     use rayon::prelude::*;
 
-    let thread_id_idx = var_names.iter().position(|n| n == "thread_id");
+    let core_id_idx = var_names.iter().position(|n| n == "core_id").ok_or_else(|| morok_device::Error::Runtime {
+        message: "parallel CPU launch requires core_id runtime variable".to_string(),
+    })?;
     let fn_ptr_usize = fn_ptr as usize;
 
     // Convert raw pointers to usize for Send-safe cross-thread sharing.
@@ -85,23 +86,21 @@ unsafe fn execute_parallel(
     let buf_len = buffers.len();
 
     // Nested parallelism policy: if we're already inside rayon work, avoid
-    // spawning another parallel loop for thread_id kernels.
+    // spawning another parallel loop for core_id kernels.
     if rayon::current_thread_index().is_some() {
-        for thread_id in 0..thread_count {
+        for core_id in 0..core_count {
             let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
-            let patch = thread_id_idx.map(|idx| (idx, thread_id));
             unsafe {
-                cif.dispatch(fn_ptr_usize as *const (), bufs, vals, patch);
+                cif.dispatch(fn_ptr_usize as *const (), bufs, vals, Some((core_id_idx, core_id)));
             }
         }
         return Ok(());
     }
 
-    (0..thread_count).into_par_iter().for_each(|thread_id| {
+    (0..core_count).into_par_iter().for_each(|core_id| {
         let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
-        let patch = thread_id_idx.map(|idx| (idx, thread_id));
         unsafe {
-            cif.dispatch(fn_ptr_usize as *const (), bufs, vals, patch);
+            cif.dispatch(fn_ptr_usize as *const (), bufs, vals, Some((core_id_idx, core_id)));
         }
     });
 
@@ -121,56 +120,13 @@ unsafe fn execute_kernel(
     var_names: &[String],
     global_size: Option<[usize; 3]>,
 ) -> Result<()> {
-    let thread_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
-    if let Some(count) = thread_count {
+    let core_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
+    if let Some(count) = core_count {
         unsafe { execute_parallel(cif, fn_ptr, buffers, vals, var_names, count) }
     } else {
         unsafe { cif.dispatch(fn_ptr, buffers, vals, None) };
         Ok(())
     }
-}
-
-fn ordered_unique(slots: impl IntoIterator<Item = usize>) -> Vec<usize> {
-    let mut seen = HashSet::new();
-    let mut ordered = Vec::new();
-    for slot in slots {
-        if seen.insert(slot) {
-            ordered.push(slot);
-        }
-    }
-    ordered
-}
-
-fn extract_param_slot(uop: &Arc<UOp>) -> Option<usize> {
-    let buf = uop.buf_uop();
-    if let Op::Param { slot, device: None, .. } = buf.op() { Some(*slot) } else { None }
-}
-
-fn load_slots_from_ast(ast: &Arc<UOp>) -> Vec<usize> {
-    ordered_unique(ast.toposort().into_iter().filter_map(|node| match node.op() {
-        Op::Load { buffer, .. } => extract_param_slot(buffer),
-        _ => None,
-    }))
-}
-
-fn apply_buffer_metadata(spec: &mut ProgramSpec, rendered: &morok_codegen::RenderedKernel, ast: &Arc<UOp>) {
-    let globals = ordered_unique(rendered.buffer_args.iter().map(|arg| arg.index));
-    let outs = ordered_unique(
-        rendered.buffer_args.iter().filter_map(|arg| if arg.is_output { Some(arg.index) } else { None }),
-    );
-
-    let globals_set: HashSet<usize> = globals.iter().copied().collect();
-    let outs_set: HashSet<usize> = outs.iter().copied().collect();
-
-    let mut ins = ordered_unique(
-        load_slots_from_ast(ast).into_iter().filter(|slot| globals_set.contains(slot) && !outs_set.contains(slot)),
-    );
-
-    if ins.is_empty() {
-        ins = globals.iter().copied().filter(|slot| !outs_set.contains(slot)).collect();
-    }
-
-    spec.set_buffer_metadata(globals, outs, ins);
 }
 
 // =============================================================================
@@ -212,15 +168,11 @@ impl Renderer for ClangRendererWrapper {
 
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
 
-        if let Some(global) = rendered.global_size
-            && let Some(local) = rendered.local_size
-        {
-            spec.set_work_sizes(global, local);
-        }
-
         spec.set_var_names(rendered.var_names.clone());
-        apply_buffer_metadata(&mut spec, &rendered, ast);
-        spec.buf_count = rendered.buffer_args.len();
+        spec.apply_derived_metadata_from_ast();
+        if spec.buf_count == 0 {
+            spec.buf_count = rendered.buffer_args.len();
+        }
 
         Ok(spec)
     }
@@ -242,8 +194,8 @@ impl Compiler for ClangCompiler {
             spec.buf_count,
         );
         compiled.var_names = spec.var_names.clone();
-        compiled.global_size = spec.global_size;
-        compiled.local_size = spec.local_size;
+        compiled.global_size = spec.global_size.clone();
+        compiled.local_size = spec.local_size.clone();
         Ok(compiled)
     }
 
@@ -303,8 +255,8 @@ impl Compiler for LlvmCompiler {
             spec.buf_count,
         );
         compiled.var_names = spec.var_names.clone();
-        compiled.global_size = spec.global_size;
-        compiled.local_size = spec.local_size;
+        compiled.global_size = spec.global_size.clone();
+        compiled.local_size = spec.local_size.clone();
         Ok(compiled)
     }
 
@@ -325,15 +277,11 @@ impl Renderer for LlvmRendererWrapper {
 
         let mut spec = ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
 
-        if let Some(global) = rendered.global_size
-            && let Some(local) = rendered.local_size
-        {
-            spec.set_work_sizes(global, local);
-        }
-
         spec.set_var_names(rendered.var_names.clone());
-        apply_buffer_metadata(&mut spec, &rendered, ast);
-        spec.buf_count = rendered.buffer_args.len();
+        spec.apply_derived_metadata_from_ast();
+        if spec.buf_count == 0 {
+            spec.buf_count = rendered.buffer_args.len();
+        }
 
         Ok(spec)
     }
@@ -361,7 +309,61 @@ fn create_llvm_program(spec: &morok_device::device::CompiledSpec) -> Result<Box<
 
 #[cfg(feature = "mlir")]
 mod mlir_backend {
+    use std::ffi::c_void;
+
     use super::*;
+
+    type MlirKernelFn = unsafe extern "C" fn(*const *mut u8, *const i64);
+
+    unsafe fn dispatch_mlir_fn(fn_ptr: *const c_void, buffers: &[*mut u8], vals: &[i64]) {
+        let kernel: MlirKernelFn = unsafe { std::mem::transmute(fn_ptr) };
+        let buffer_usizes: Vec<usize> = buffers.iter().map(|&ptr| ptr as usize).collect();
+        let bufs_ptr = buffer_usizes.as_ptr() as *const *mut u8;
+        unsafe {
+            kernel(bufs_ptr, vals.as_ptr());
+        }
+    }
+
+    unsafe fn execute_mlir_parallel(
+        fn_ptr: *const c_void,
+        buffers: &[*mut u8],
+        vals: &[i64],
+        var_names: &[String],
+        core_count: usize,
+    ) -> Result<()> {
+        use rayon::prelude::*;
+
+        let core_id_idx =
+            var_names.iter().position(|n| n == "core_id").ok_or_else(|| morok_device::Error::Runtime {
+                message: "parallel MLIR CPU launch requires core_id runtime variable".to_string(),
+            })?;
+        let fn_ptr_usize = fn_ptr as usize;
+
+        // Convert raw pointers to usize for Send-safe cross-thread sharing.
+        let buf_ptr = buffers.as_ptr() as usize;
+        let buf_len = buffers.len();
+        let vals = vals.to_vec();
+
+        // Avoid nested parallelism when already executing inside rayon worker.
+        if rayon::current_thread_index().is_some() {
+            for core_id in 0..core_count {
+                let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
+                let mut thread_vals = vals.clone();
+                thread_vals[core_id_idx] = core_id as i64;
+                unsafe { dispatch_mlir_fn(fn_ptr_usize as *const c_void, bufs, &thread_vals) };
+            }
+            return Ok(());
+        }
+
+        (0..core_count).into_par_iter().for_each(|core_id| {
+            let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
+            let mut thread_vals = vals.clone();
+            thread_vals[core_id_idx] = core_id as i64;
+            unsafe { dispatch_mlir_fn(fn_ptr_usize as *const c_void, bufs, &thread_vals) };
+        });
+
+        Ok(())
+    }
 
     /// MLIR program wrapper using ExecutionEngine.
     pub struct MlirProgram {
@@ -376,45 +378,14 @@ mod mlir_backend {
             global_size: Option<[usize; 3]>,
             _local_size: Option<[usize; 3]>,
         ) -> Result<()> {
-            let thread_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
+            let core_count = global_size.map(|[tc, _, _]| tc).filter(|&tc| tc > 1);
+            let fn_ptr = self.kernel.fn_ptr();
 
-            if let Some(count) = thread_count {
-                // MLIR uses wrapper fn(ptr, ptr) ABI — parallel execution
-                // calls execute_with_vals per thread with patched thread_id.
-                use rayon::prelude::*;
-                let thread_id_idx = self.kernel.var_names().iter().position(|n| n == "thread_id");
-                let buf_ptr = buffers.as_ptr() as usize;
-                let buf_len = buffers.len();
-                let vals = vals.to_vec();
-
-                if rayon::current_thread_index().is_some() {
-                    for tid in 0..count {
-                        let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
-                        let mut thread_vals = vals.clone();
-                        if let Some(idx) = thread_id_idx {
-                            thread_vals[idx] = tid as i64;
-                        }
-                        unsafe { self.kernel.execute_with_vals(bufs, &thread_vals) }.map_err(|e| {
-                            morok_device::Error::Runtime { message: format!("MLIR kernel execution failed: {}", e) }
-                        })?;
-                    }
-                    return Ok(());
-                }
-
-                (0..count).into_par_iter().try_for_each(|tid| {
-                    let bufs = unsafe { std::slice::from_raw_parts(buf_ptr as *const *mut u8, buf_len) };
-                    let mut thread_vals = vals.clone();
-                    if let Some(idx) = thread_id_idx {
-                        thread_vals[idx] = tid as i64;
-                    }
-                    unsafe { self.kernel.execute_with_vals(bufs, &thread_vals) }.map_err(|e| {
-                        morok_device::Error::Runtime { message: format!("MLIR kernel execution failed: {}", e) }
-                    })
-                })
+            if let Some(count) = core_count {
+                unsafe { execute_mlir_parallel(fn_ptr, buffers, vals, self.kernel.var_names(), count) }
             } else {
-                unsafe { self.kernel.execute_with_vals(buffers, vals) }.map_err(|e| morok_device::Error::Runtime {
-                    message: format!("MLIR kernel execution failed: {}", e),
-                })
+                unsafe { dispatch_mlir_fn(fn_ptr, buffers, vals) };
+                Ok(())
             }
         }
 
@@ -436,15 +407,11 @@ mod mlir_backend {
             let mut spec =
                 ProgramSpec::new(rendered.name.clone(), rendered.code.clone(), self.device.clone(), ast.clone());
 
-            if let Some(global) = rendered.global_size
-                && let Some(local) = rendered.local_size
-            {
-                spec.set_work_sizes(global, local);
-            }
-
             spec.set_var_names(rendered.var_names.clone());
-            apply_buffer_metadata(&mut spec, &rendered, ast);
-            spec.buf_count = rendered.buffer_args.len();
+            spec.apply_derived_metadata_from_ast();
+            if spec.buf_count == 0 {
+                spec.buf_count = rendered.buffer_args.len();
+            }
 
             Ok(spec)
         }
@@ -471,8 +438,8 @@ mod mlir_backend {
                 spec.buf_count,
             );
             compiled.var_names = spec.var_names.clone();
-            compiled.global_size = spec.global_size;
-            compiled.local_size = spec.local_size;
+            compiled.global_size = spec.global_size.clone();
+            compiled.local_size = spec.local_size.clone();
             Ok(compiled)
         }
 

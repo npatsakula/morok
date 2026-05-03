@@ -20,20 +20,21 @@ use morok_dtype::DeviceSpec;
 /// Design choices:
 /// - Fixed-arity ops grouped by arity: Unary, Binary, Ternary
 /// - Special ops with extra data remain separate: Cast (dtype), MSelect (device_index)
-/// - Variable-arity ops use SmallVec: Index { indices: SmallVec<[Arc<UOp>; 4]> }
+/// - Variable-arity ops use SmallVec: `Index { indices: SmallVec<[Arc<UOp>; 4]> }`
 /// - SmallVec avoids heap allocation for common cases (≤4 children)
 /// - Gate is on INDEX (not LOAD/STORE) following Tinygrad's model
 ///
-/// Hash is derived and uses UOp's Hash impl for Arc<UOp> children.
+/// Hash is derived and uses UOp's Hash impl for `Arc<UOp>` children.
 /// UOp hashes by content (dtype + op), enabling content-based hashing for caching.
 #[derive(Debug, Clone, Hash)]
 #[derive(strum::AsRefStr)]
 #[derive(morok_macros::PatternEnum)]
 #[pattern(grouped = [Unary, Binary, Ternary])]
 pub enum Op {
-    // Nullary operations (7 variants)
+    // Nullary operations (8 variants)
     Const(ConstValueHash),
     Unique(usize),
+    LUnique(usize),
     Device(DeviceSpec),
     Noop,
     #[pattern(skip)]
@@ -43,6 +44,7 @@ pub enum Op {
     // Graph organization operations (2 variants)
     Sink {
         sources: SmallVec<[Arc<UOp>; 4]>,
+        info: Option<crate::types::KernelInfo>,
     },
     Group {
         sources: SmallVec<[Arc<UOp>; 4]>,
@@ -227,7 +229,7 @@ pub enum Op {
         id: usize,
     },
 
-    // Advanced operations (12 variants)
+    // Advanced operations (11 variants)
     Wmma {
         a: Arc<UOp>,
         b: Arc<UOp>,
@@ -242,16 +244,43 @@ pub enum Op {
         src: Arc<UOp>,
         unroll_axes: Vec<(usize, usize)>,
     },
-    Kernel {
-        sources: SmallVec<[Arc<UOp>; 4]>,
-        ast: Arc<UOp>,
+    Call {
+        body: Arc<UOp>,
+        args: SmallVec<[Arc<UOp>; 4]>,
+        info: CallInfo,
     },
-    Assign {
-        target: Arc<UOp>,
-        value: Arc<UOp>,
-        /// Compact movement metadata for shape tracking (Tinygrad assign.arg style).
-        /// Stores `(op, marg)` equivalents without embedding a movement UOp chain.
-        movement_ops: Option<Vec<MovementArg>>,
+    Function {
+        body: Arc<UOp>,
+        args: SmallVec<[Arc<UOp>; 4]>,
+        info: CallInfo,
+    },
+    /// Heterogeneous tuple of values; dtype is always Void.
+    /// Mirrors tinygrad `Ops.TUPLE` — wraps multi-value FUNCTION bodies so FUNCTION dtype stays void.
+    Tuple {
+        src: SmallVec<[Arc<UOp>; 4]>,
+    },
+    /// Extract element `index` from a TUPLE (or a FUNCTION whose body is a TUPLE).
+    /// dtype matches the inner element's dtype.
+    /// Mirrors tinygrad `Ops.GETTUPLE`.
+    GetTuple {
+        src: Arc<UOp>,
+        index: usize,
+    },
+    Program {
+        sink: Arc<UOp>,
+        device: Arc<UOp>,
+        linear: Option<Arc<UOp>>,
+        source: Option<Arc<UOp>>,
+        binary: Option<Arc<UOp>>,
+    },
+    Linear {
+        ops: SmallVec<[Arc<UOp>; 8]>,
+    },
+    Source {
+        code: String,
+    },
+    ProgramBinary {
+        bytes: Vec<u8>,
     },
     Detach {
         src: Arc<UOp>,
@@ -274,6 +303,10 @@ pub enum Op {
     Custom {
         deps: SmallVec<[Arc<UOp>; 4]>,
         code: String,
+    },
+    CustomFunction {
+        kind: CustomFunctionKind,
+        attrs: SmallVec<[Arc<UOp>; 4]>,
     },
     CustomI {
         deps: SmallVec<[Arc<UOp>; 4]>,
@@ -312,20 +345,23 @@ impl Op {
             // Nullary operations
             Self::Const(_)
             | Self::Unique(_)
+            | Self::LUnique(_)
             | Self::Device(_)
             | Self::Noop
             | Self::Invalid
             | Self::DefineLocal(_)
             | Self::VConst { .. }
             | Self::DefineVar { .. }
-            | Self::DefineReg { .. } => SmallVec::new(),
+            | Self::DefineReg { .. }
+            | Self::Source { .. }
+            | Self::ProgramBinary { .. } => SmallVec::new(),
 
             // Param has optional device child — pre-kernel PARAMs have device, codegen PARAMs don't
             Self::Param { device: Some(d), .. } => SmallVec::from_slice(&[d]),
             Self::Param { device: None, .. } => SmallVec::new(),
 
             // Graph organization operations
-            Self::Sink { sources } | Self::Group { sources } => sources.iter().collect(),
+            Self::Sink { sources, .. } | Self::Group { sources } => sources.iter().collect(),
 
             // Grouped operations
             Self::Unary(_, x) => SmallVec::from_slice(&[x]),
@@ -414,18 +450,28 @@ impl Op {
             | Self::Contiguous { src, .. }
             | Self::ContiguousBackward { src }
             | Self::Precast { src } => SmallVec::from_slice(&[src]),
-            Self::Kernel { sources, ast } => {
-                let mut children: SmallVec<[&Arc<UOp>; 4]> = sources.iter().collect();
-                children.push(ast);
+            Self::Call { body, args, .. } | Self::Function { body, args, .. } => {
+                let mut children = SmallVec::from_slice(&[body]);
+                children.extend(args.iter());
                 children
             }
-            Self::Assign { target, value, .. } => SmallVec::from_slice(&[target, value]),
+            Self::Tuple { src } => src.iter().collect(),
+            Self::GetTuple { src, .. } => SmallVec::from_slice(&[src]),
+            Self::Program { sink, device, linear, source, binary } => {
+                let mut children = SmallVec::from_slice(&[sink, device]);
+                children.extend(linear.iter());
+                children.extend(source.iter());
+                children.extend(binary.iter());
+                children
+            }
+            Self::Linear { ops } => ops.iter().collect(),
             Self::After { passthrough, deps } => {
                 let mut children = SmallVec::from_slice(&[passthrough]);
                 children.extend(deps.iter());
                 children
             }
             Self::Custom { deps, .. } | Self::CustomI { deps, .. } => deps.iter().collect(),
+            Self::CustomFunction { attrs, .. } => attrs.iter().collect(),
 
             // Memory operations
             Self::Load { buffer, index, alt } => {
@@ -493,6 +539,7 @@ impl Op {
     /// - STORE: ranges start at index 2 (index=0, value=1, ranges=2+)
     /// - WMMA: ranges start at index 3 (a=0, b=1, c=2)
     /// - END: ranges start at index 1 (computation=0, ranges=1+)
+    /// - CALL/FUNCTION: ranges start at index 1 (body=0, args=1+)
     ///
     /// These operations mark range boundaries in the computation graph.
     /// Any RANGE operations in sources at or after the returned index
@@ -518,12 +565,14 @@ impl Op {
         // - STORE: index=0, value=1, ranges=2+
         // - WMMA: a=0, b=1, c=2, (ranges start at 3)
         // - END: computation=0, ranges=1+
+        // - CALL/FUNCTION: body=0, args=1+
         match self {
             Self::Bufferize { .. } => Some(1),
             Self::Reduce { .. } => Some(1),
             Self::Store { .. } => Some(2),
             Self::Wmma { .. } => Some(3),
             Self::End { .. } => Some(1),
+            Self::Call { .. } | Self::Function { .. } => Some(1),
             _ => None,
         }
     }

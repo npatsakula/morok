@@ -3,7 +3,7 @@
 //! This module provides the core range assignment algorithm that converts
 //! movement operations into explicit loop ranges.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use morok_dtype::DType;
@@ -35,6 +35,8 @@ pub struct RangeifyStats {
 pub struct IndexingContext {
     /// Maps UOps to realize status: Some(axes) = needs realization on axes.
     pub realize_map: HashMap<UOpKey, Option<Vec<usize>>>,
+    /// Realization boundaries that must survive buffer-removal.
+    non_removable_realizes: HashSet<UOpKey>,
     /// Maps each UOp to its (input_ranges, output_ranges).
     pub range_map: HashMap<UOpKey, UOpRanges>,
     /// Counter for generating unique range IDs.
@@ -104,6 +106,18 @@ impl IndexingContext {
         self.realize_map.insert(UOpKey(Arc::clone(uop)), Some(axes));
     }
 
+    /// Mark a UOp for realization before its shape/range axes have been assigned.
+    pub fn mark_realize_pending(&mut self, uop: &Arc<UOp>) {
+        self.realize_map.insert(UOpKey(Arc::clone(uop)), None);
+    }
+
+    /// Mark a UOp for realization as a required memory dependency boundary.
+    pub fn mark_realize_non_removable(&mut self, uop: &Arc<UOp>) {
+        let key = UOpKey(Arc::clone(uop));
+        self.realize_map.insert(key.clone(), None);
+        self.non_removable_realizes.insert(key);
+    }
+
     /// Check if a UOp is in the realize map.
     pub fn should_realize(&self, uop: &Arc<UOp>) -> bool {
         self.realize_map.contains_key(&UOpKey(Arc::clone(uop)))
@@ -112,6 +126,18 @@ impl IndexingContext {
     /// Get the realize axes for a UOp.
     pub fn get_realize_axes(&self, uop: &Arc<UOp>) -> Option<&Vec<usize>> {
         self.realize_map.get(&UOpKey(Arc::clone(uop))).and_then(|opt| opt.as_ref())
+    }
+
+    /// Remove a UOp from the realize map once its realization boundary has been emitted.
+    pub fn clear_realize(&mut self, uop: &Arc<UOp>) {
+        let key = UOpKey(Arc::clone(uop));
+        self.realize_map.remove(&key);
+        self.non_removable_realizes.remove(&key);
+    }
+
+    /// Check if a realization boundary must not be inlined.
+    pub fn is_non_removable_realize(&self, uop: &Arc<UOp>) -> bool {
+        self.non_removable_realizes.contains(&UOpKey(Arc::clone(uop)))
     }
 
     /// Get all keys in the realize_map (for debugging).
@@ -196,13 +222,13 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
 
     // Step 1: Generate realize map via pattern matcher (pm_generate_realize_map)
     // bottom_up=True — patterns see ORIGINAL children
-    crate::rewrite::graph_rewrite_bottom_up(pm_generate_realize_map(), sink.clone(), &mut ctx);
+    crate::rewrite::graph_rewrite_bottom_up_preserve_calls(pm_generate_realize_map(), sink.clone(), &mut ctx);
 
     // Step 2: Get toposort (root-to-leaves) and consumer map
-    let consumer_map = sink.get_consumer_map();
+    let consumer_map = sink.get_consumer_map_call_aware(false);
 
     // Use forward toposort (root first) for range propagation
-    let forward_topo: Vec<_> = sink.toposort().into_iter().rev().collect();
+    let forward_topo: Vec<_> = sink.toposort_call_aware(false).into_iter().rev().collect();
 
     // Step 3: Assign ranges via forward traversal
     assign_ranges(&forward_topo, &consumer_map, &mut ctx, &mut simplify_cache)?;
@@ -211,7 +237,8 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
     // Converts ReduceAxis→REDUCE, PAD→WHERE, creates BUFFERIZE+INDEX, removes movement ops.
     // Must run bottom_up so patterns see ORIGINAL children (bottom_up=True).
     let rangeify_matcher = super::patterns::apply_rangeify_patterns();
-    let mut transformed_sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, sink, &mut ctx);
+    let mut transformed_sink =
+        crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&rangeify_matcher, sink, &mut ctx);
 
     // Recovery pass for rangeify leaks caused by node reconstruction during rewrite.
     //
@@ -224,7 +251,7 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
     for pass_idx in 0..2 {
         let mut leaked_pad = 0usize;
         let mut leaked_reduceaxis = 0usize;
-        for n in transformed_sink.toposort() {
+        for n in transformed_sink.toposort_call_aware(false) {
             match n.op() {
                 Op::Pad { .. } => leaked_pad += 1,
                 Op::ReduceAxis { .. } => leaked_reduceaxis += 1,
@@ -250,14 +277,19 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
         let mut retry_ctx = IndexingContext::new();
         retry_ctx.stats = ctx.stats.clone();
 
-        crate::rewrite::graph_rewrite_bottom_up(pm_generate_realize_map(), transformed_sink.clone(), &mut retry_ctx);
+        crate::rewrite::graph_rewrite_bottom_up_preserve_calls(
+            pm_generate_realize_map(),
+            transformed_sink.clone(),
+            &mut retry_ctx,
+        );
 
-        let consumer_map = transformed_sink.get_consumer_map();
-        let forward_topo: Vec<_> = transformed_sink.toposort().into_iter().rev().collect();
+        let consumer_map = transformed_sink.get_consumer_map_call_aware(false);
+        let forward_topo: Vec<_> = transformed_sink.toposort_call_aware(false).into_iter().rev().collect();
         let mut pass_cache = SimplifyCache::default();
         assign_ranges(&forward_topo, &consumer_map, &mut retry_ctx, &mut pass_cache)?;
 
-        transformed_sink = crate::rewrite::graph_rewrite_bottom_up(&rangeify_matcher, transformed_sink, &mut retry_ctx);
+        transformed_sink =
+            crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&rangeify_matcher, transformed_sink, &mut retry_ctx);
         ctx = retry_ctx;
     }
 
@@ -276,8 +308,10 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
         );
     }
 
-    let leaked =
-        transformed_sink.toposort().into_iter().find(|n| matches!(n.op(), Op::Pad { .. } | Op::ReduceAxis { .. }));
+    let leaked = transformed_sink
+        .toposort_call_aware(false)
+        .into_iter()
+        .find(|n| matches!(n.op(), Op::Pad { .. } | Op::ReduceAxis { .. }));
     if leaked.is_some() {
         return Err(morok_ir::Error::SymbolicShapeUnsupported {
             operation: "rangeify leaked high-level PAD/ReduceAxis after recovery".to_string(),
@@ -291,8 +325,8 @@ pub fn run_rangeify(sink: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, IndexingConte
 ///
 /// Marks which UOps need to be materialized to buffers:
 /// - SINK sources (if not always-contiguous)
-/// - COPY, CONTIGUOUS, ASSIGN (always realized)
-/// - Sources of COPY, MSTACK, MSELECT, ASSIGN (realized if not always-contiguous)
+/// - COPY, CONTIGUOUS, STORE (always realized)
+/// - Sources of COPY, MSTACK, MSELECT (realized if not always-contiguous)
 ///
 /// Patterns return `None` (no rewrite) — context side-effects mark nodes in the realize map.
 fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingContext> {
@@ -311,8 +345,16 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
             None
         },
 
-        // Always realize these ops: COPY, BUFFER_VIEW, CONTIGUOUS, STORE, ASSIGN
-        x @ Store { index: _, value: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
+        // Always realize STORE, and realize its value first when it reads the same base buffer.
+        // Tinygrad calls this a WAR hazard: without the temp, overlapping self-assigns can read
+        // a value that an earlier loop iteration already overwrote.
+        x @ Store { index, value } => |x, index, value, ctx| {
+            ctx.mark_realize_pending(x);
+            if value.backward_slice_ids().contains(&index.base().id) {
+                ctx.mark_realize_non_removable(value);
+            }
+            None
+        },
         x @ BufferView { buffer: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
 
         // Always realize REDUCE on outer ranges
@@ -335,17 +377,6 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
             None
         },
         x @ Contiguous { src: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
-        x @ Assign { target: _, value: _ } => |x, ctx| {
-            ctx.mark_realize_all(x).ok();
-            for src in x.op().sources() {
-                // Tinygrad realize_srcs: guard on src.base.op, realize src.
-                if !is_always_contiguous(&src.base()) {
-                    ctx.mark_realize_all(&src).ok();
-                }
-            }
-            None
-        },
-
         // MStack/MSelect → realize sources
         x @ MStack { buffers: _ } => |x, ctx| {
             for src in x.op().sources() {
@@ -377,7 +408,6 @@ pub(crate) fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
     matches!(
         uop.op(),
         Op::Contiguous { .. }
-            | Op::Assign { .. }
             | Op::Copy { .. }
             | Op::Buffer { .. }
             | Op::BufferView { .. }
@@ -390,7 +420,7 @@ pub(crate) fn is_always_contiguous(uop: &Arc<UOp>) -> bool {
             | Op::DefineLocal(_)
             | Op::DefineReg { .. }
             | Op::Load { .. }
-            | Op::Kernel { .. }
+            | Op::Call { .. }
     )
 }
 
@@ -528,8 +558,16 @@ fn assign_ranges(
             continue;
         }
 
-        // Skip KERNEL internals and MSTACK/MSELECT (treated like sink-level containers).
-        if matches!(x.op(), Op::Kernel { .. } | Op::MStack { .. } | Op::MSelect { .. }) {
+        // Tinygrad skips callable boundaries, AFTER, and MSTACK/MSELECT during range assignment.
+        if matches!(
+            x.op(),
+            Op::Call { .. }
+                | Op::Function { .. }
+                | Op::Linear { .. }
+                | Op::After { .. }
+                | Op::MStack { .. }
+                | Op::MSelect { .. }
+        ) {
             continue;
         }
 
@@ -564,8 +602,21 @@ fn assign_ranges(
 
         let mut out_rngs = if ctx.should_realize(x) {
             // Realized op: create fresh ranges for all dimensions.
-            // CONTIGUOUS, COPY, ASSIGN, and ops marked by ending_ranges all land here.
-            if let Some(shape) = x.shape()? {
+            // CONTIGUOUS, COPY, STORE, and ops marked by ending_ranges all land here.
+            let shape = match x.op() {
+                Op::Store { index, .. } => {
+                    let s = index.shape()?.cloned();
+                    // STORE without an inferable index shape is ill-formed —
+                    // fall-through would leak unrealized stores into later
+                    // passes.
+                    if s.is_none() {
+                        return Err(morok_ir::Error::StoreMissingShape { uop_id: x.id });
+                    }
+                    s
+                }
+                _ => x.shape()?.cloned(),
+            };
+            if let Some(shape) = shape {
                 debug!(
                     node_id = x.id,
                     op = x.op().as_ref(),
@@ -599,17 +650,14 @@ fn assign_ranges(
         if !ending.is_empty() {
             debug!(
                 ending_count = ending.len(),
-                triggers_realization =
-                    matches!(x.op(), Op::ReduceAxis { .. } | Op::Assign { .. }) || is_elementwise_op(x),
+                triggers_realization = matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x),
                 "Ending ranges detected (pre-in_rngs check)"
             );
         }
         // Use ending ranges directly without filtering (matches upstream behavior).
         let filtered_ending = ending.clone();
 
-        if !filtered_ending.is_empty()
-            && (matches!(x.op(), Op::ReduceAxis { .. } | Op::Assign { .. }) || is_elementwise_op(x))
-        {
+        if !filtered_ending.is_empty() && (matches!(x.op(), Op::ReduceAxis { .. }) || is_elementwise_op(x)) {
             if let Some(shape) = x.shape().ok().flatten() {
                 // Start with existing realize_axes (from merge_consumer_ranges)
                 let mut realize_axes: Vec<usize> = ctx.get_realize_axes(x).cloned().unwrap_or_default();
@@ -1006,7 +1054,7 @@ fn apply_reshape_core(
     let sink = UOp::sink(axes_out);
     let simplified = simplify_cache.get_or_simplify(&sink, || graph_rewrite(&*RESHAPE_SIMPLIFY, sink.clone(), &mut ()));
     match simplified.op() {
-        Op::Sink { sources } => sources.iter().cloned().collect(),
+        Op::Sink { sources, .. } => sources.iter().cloned().collect(),
         _ => vec![simplified],
     }
 }
@@ -1025,6 +1073,7 @@ pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<U
 fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp>]) -> Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
     let sink = UOp::sink(rngs.to_vec());
     // Tinygrad-compatible: canonicalize only live/in-scope ranges.
+    #[allow(clippy::mutable_key_type)]
     let in_scope = sink.in_scope_ranges();
     let ranges_in_expr: Vec<Arc<UOp>> =
         sink.ranges().iter().filter(|r| in_scope.contains(&UOpKey((*r).clone()))).cloned().collect();
@@ -1048,7 +1097,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
 
     let canonical_sink = sink.substitute(&sub_map);
     let canonical_rngs: Vec<Arc<UOp>> = match canonical_sink.op() {
-        Op::Sink { sources } => sources.iter().cloned().collect(),
+        Op::Sink { sources, .. } => sources.iter().cloned().collect(),
         _ => vec![canonical_sink],
     };
 
@@ -1057,7 +1106,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
     let result_sink = UOp::sink(result);
     let restored = result_sink.substitute(&reverse_map);
     let mut output: Vec<Arc<UOp>> = match restored.op() {
-        Op::Sink { sources } => sources.iter().cloned().collect(),
+        Op::Sink { sources, .. } => sources.iter().cloned().collect(),
         _ => vec![restored],
     };
 
@@ -1075,7 +1124,7 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
     if !axis_restore_map.is_empty() {
         let axis_restored = UOp::sink(output).substitute(&axis_restore_map);
         output = match axis_restored.op() {
-            Op::Sink { sources } => sources.iter().cloned().collect(),
+            Op::Sink { sources, .. } => sources.iter().cloned().collect(),
             _ => vec![axis_restored],
         };
     }

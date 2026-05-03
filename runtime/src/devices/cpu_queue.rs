@@ -15,9 +15,9 @@ use crate::error::Result;
 #[allow(dead_code)] // Will be used when batching is implemented
 enum PendingOp {
     /// Wait for a signal to reach a value.
-    Wait { signal: Arc<CpuTimelineSignal>, value: u64 },
+    Wait { signal: CpuTimelineSignal, value: u64 },
     /// Signal a value.
-    Signal { signal: Arc<CpuTimelineSignal>, value: u64 },
+    Signal { signal: CpuTimelineSignal, value: u64 },
     /// Execute a program.
     Exec {
         program: Arc<dyn DeviceProgram>,
@@ -43,20 +43,26 @@ unsafe impl Send for PendingOp {}
 pub struct CpuQueue {
     /// Pending operations to execute on submit.
     pending: Vec<PendingOp>,
+    /// Deferred builder-style errors surfaced by submit().
+    errors: Vec<String>,
     /// Device specification.
     device: DeviceSpec,
 }
 
 impl std::fmt::Debug for CpuQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CpuQueue").field("pending_count", &self.pending.len()).field("device", &self.device).finish()
+        f.debug_struct("CpuQueue")
+            .field("pending_count", &self.pending.len())
+            .field("error_count", &self.errors.len())
+            .field("device", &self.device)
+            .finish()
     }
 }
 
 impl CpuQueue {
     /// Create a new CPU queue.
     pub fn new() -> Self {
-        Self { pending: Vec::new(), device: DeviceSpec::Cpu }
+        Self { pending: Vec::new(), errors: Vec::new(), device: DeviceSpec::Cpu }
     }
 
     /// Execute a single pending operation.
@@ -101,46 +107,60 @@ impl HardwareQueue for CpuQueue {
     type Signal = CpuTimelineSignal;
 
     fn wait(&mut self, signal: &Self::Signal, value: u64) -> &mut Self {
-        // Clone the signal Arc for later use
-        // SAFETY: We know signal is a CpuTimelineSignal, and we need to wrap it in Arc
-        // Since we don't have direct Arc access, we create a new signal that will be set
-        // This is a limitation - in practice, the executor passes Arc<dyn TimelineSignal>
-        // For now, we'll do a synchronous wait in exec
-        let _ = (signal, value); // Suppress warnings for now
-        // TODO: Store signal reference properly for deferred wait
+        self.pending.push(PendingOp::Wait { signal: signal.clone(), value });
         self
     }
 
     fn signal(&mut self, signal: &Self::Signal, value: u64) -> &mut Self {
-        let _ = (signal, value); // Suppress warnings for now
-        // TODO: Store signal reference properly for deferred signal
+        self.pending.push(PendingOp::Signal { signal: signal.clone(), value });
         self
     }
 
-    fn exec(
-        &mut self,
-        program: &dyn morok_device::queue::Program,
-        buffers: &[&Buffer],
-        _params: &ExecParams,
-    ) -> &mut Self {
-        // Extract buffer pointers
-        // SAFETY: Buffers must be allocated before exec
-        let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
+    fn exec(&mut self, program: Arc<dyn DeviceProgram>, buffers: &[&Buffer], params: &ExecParams) -> &mut Self {
+        let mut buffer_ptrs = Vec::with_capacity(buffers.len());
+        for buffer in buffers {
+            if let Err(err) = buffer.ensure_allocated() {
+                self.errors.push(format!("CPU queue exec buffer allocation failed: {err}"));
+                return self;
+            }
+            // SAFETY: the buffer was just allocated and the queued op executes before
+            // submit() returns; scheduler ownership rules protect aliasing.
+            buffer_ptrs.push(unsafe { buffer.as_raw_ptr() });
+        }
 
-        // For the queue interface, we use the morok_device::queue::Program trait
-        // which is a simpler interface for device-agnostic program execution.
-        // Currently execute immediately since we don't have Arc<dyn Program>.
-        // TODO: Batch and use rayon for parallel execution
-        let _ = (program, buffer_ptrs); // Suppress warnings for now
+        self.pending.push(PendingOp::Exec {
+            program,
+            buffer_ptrs,
+            vals: params.vals.clone(),
+            global_size: Some(params.global_size),
+            local_size: params.local_size,
+        });
 
         self
     }
 
     fn copy(&mut self, dst: &Buffer, src: &Buffer) -> &mut Self {
-        // SAFETY: Buffers must be allocated before copy
+        if src.size() != dst.size() {
+            self.errors.push(format!(
+                "CPU queue copy size mismatch: src={} bytes, dst={} bytes",
+                src.size(),
+                dst.size()
+            ));
+            return self;
+        }
+        if let Err(err) = dst.ensure_allocated() {
+            self.errors.push(format!("CPU queue copy dst allocation failed: {err}"));
+            return self;
+        }
+        if let Err(err) = src.ensure_allocated() {
+            self.errors.push(format!("CPU queue copy src allocation failed: {err}"));
+            return self;
+        }
+        // SAFETY: both buffers are allocated; the queued op executes before submit() returns
+        // and scheduler ownership rules protect aliasing.
         let dst_ptr = unsafe { dst.as_raw_ptr() };
         let src_ptr = unsafe { src.as_raw_ptr() as *const u8 };
-        let size = src.size().min(dst.size());
+        let size = src.size();
 
         self.pending.push(PendingOp::Copy { dst_ptr, src_ptr, size });
         self
@@ -152,9 +172,13 @@ impl HardwareQueue for CpuQueue {
     }
 
     fn submit(&mut self) -> morok_device::Result<()> {
-        // Execute all pending operations
-        // For CPU, we execute sequentially for now
-        // TODO: Use rayon for parallel execution of independent kernels
+        if !self.errors.is_empty() {
+            let errors = std::mem::take(&mut self.errors);
+            self.pending.clear();
+            return Err(morok_device::Error::Runtime { message: errors.join("; ") });
+        }
+
+        // CPU queue is intentionally serial; parallelism across kernels is handled by ExecutionPlan.
         let ops = std::mem::take(&mut self.pending);
 
         for op in ops {
@@ -170,25 +194,5 @@ impl HardwareQueue for CpuQueue {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cpu_queue_creation() {
-        let queue = CpuQueue::new();
-        assert_eq!(queue.device(), &DeviceSpec::Cpu);
-    }
-
-    #[test]
-    fn test_cpu_queue_submit_empty() {
-        let mut queue = CpuQueue::new();
-        queue.submit().unwrap();
-    }
-
-    #[test]
-    fn test_cpu_queue_memory_barrier() {
-        let mut queue = CpuQueue::new();
-        queue.memory_barrier();
-        queue.submit().unwrap();
-    }
-}
+#[path = "../test/unit/cpu_queue.rs"]
+mod tests;

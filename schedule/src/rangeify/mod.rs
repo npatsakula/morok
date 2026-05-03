@@ -1,11 +1,11 @@
-//! RANGEIFY transformation: convert movement ops to BUFFERIZE+INDEX, then split into kernels.
+//! RANGEIFY transformation: convert movement ops to BUFFERIZE+INDEX, then split STORE/END boundaries into CALL wrappers.
 //!
 //! ## Module Structure (Consolidated from 19 → 5 files)
 //!
 //! - `indexing` - Range assignment and IndexingContext
 //! - `patterns` - All TypedPatternMatcher constructors
 //! - `transforms` - rangeify() entry point and transformation functions
-//! - `kernel` - KernelContext, kernel splitting, buffer cost analysis
+//! - `kernel` - RangeifyBufferContext, kernel splitting, buffer cost analysis
 
 // Consolidated modules
 pub mod context;
@@ -21,10 +21,10 @@ pub mod transforms;
 // Context types
 pub use context::RangeifyContext;
 pub use indexing::{IndexingContext, RangeifyStats, run_rangeify};
-pub use kernel::{KernelContext, LocalAddBufferContext};
+pub use kernel::{LocalAddBufferContext, RangeifyBufferContext};
 
 // Entry points
-pub use kernel::run_kernel_split_pipeline;
+pub use kernel::try_get_kernel_graph;
 pub use transforms::{RangeifyResult, rangeify, rangeify_with_map};
 
 // Configuration

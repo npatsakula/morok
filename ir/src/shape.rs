@@ -43,7 +43,7 @@ pub fn is_static(shape: &Shape) -> bool {
     shape.iter().all(|dim| dim.is_const())
 }
 
-/// Convert shape to concrete Vec<usize> if fully static, None otherwise.
+/// Convert shape to concrete `Vec<usize>` if fully static, None otherwise.
 ///
 /// # Examples
 ///
@@ -84,6 +84,23 @@ pub fn validate_shape(shape: &[isize]) -> Result<SmallVec<[usize; 4]>> {
 /// Uses pointer equality for symbolic dimensions (consistent with hash consing).
 pub fn shapes_equal(lhs: &Shape, rhs: &Shape) -> bool {
     lhs == rhs
+}
+
+/// Tinygrad-style upper-bound shape equality (`p.max_shape != a.max_shape`).
+///
+/// Materialises each `SInt` to its `vmax` (resolving symbolic to its known
+/// upper bound) and compares the resulting concrete shapes. This is what
+/// FUNCTION param/arg shape matching needs: two distinct symbolic dims with
+/// the same upper bound are considered equal, while differing concrete
+/// extents still mismatch.
+pub fn max_shapes_equal(lhs: &Shape, rhs: &Shape) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    lhs.iter().zip(rhs.iter()).all(|(a, b)| match (a.vmax(), b.vmax()) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    })
 }
 
 /// Check if all shapes in a slice are equal.
@@ -250,7 +267,7 @@ pub fn broadcast_shapes(shapes: &[Shape]) -> Result<Shape> {
     Ok(result)
 }
 
-/// Convert shape to Vec<usize>, ensuring all dimensions are concrete.
+/// Convert shape to `Vec<usize>`, ensuring all dimensions are concrete.
 ///
 /// This is a helper function to reduce boilerplate when converting shapes
 /// for operations that require concrete (non-symbolic) dimensions.
@@ -267,7 +284,7 @@ pub fn to_vec_usize(shape: &Shape) -> Result<Vec<usize>> {
         .collect()
 }
 
-/// Convert shape to Vec<isize>, ensuring all dimensions are concrete.
+/// Convert shape to `Vec<isize>`, ensuring all dimensions are concrete.
 ///
 /// # Errors
 ///
@@ -419,7 +436,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         Op::VConst { .. } => None,
 
-        Op::Unique(_) | Op::Device(_) | Op::Noop | Op::Invalid => None,
+        Op::Unique(_) | Op::LUnique(_) | Op::Device(_) | Op::Noop | Op::Invalid => None,
 
         // DefineLocal: shape from PtrDType.size
         Op::DefineLocal(_id) => {
@@ -711,9 +728,32 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
             None
         }
 
-        Op::Kernel { .. } => None,
-
-        Op::Assign { target, .. } => target.shape()?.cloned(),
+        Op::Program { .. } | Op::Linear { .. } | Op::Source { .. } | Op::ProgramBinary { .. } => None,
+        Op::Call { body, .. } | Op::Function { body, .. } => body.shape()?.cloned(),
+        // TUPLE is a void-typed grouping; it has no shape itself.
+        Op::Tuple { .. } => None,
+        // GETTUPLE returns the shape of its inner element when the source is a TUPLE
+        // (or a FUNCTION whose body is a TUPLE).
+        Op::GetTuple { src, index } => match src.op() {
+            Op::Tuple { src: tuple_src } => tuple_src
+                .get(*index)
+                .ok_or(crate::Error::GetTupleIndexOutOfBounds { index: *index, len: tuple_src.len(), kind: "TUPLE" })?
+                .shape()?
+                .cloned(),
+            Op::Function { body, .. } => match body.op() {
+                Op::Tuple { src: tuple_src } => tuple_src
+                    .get(*index)
+                    .ok_or(crate::Error::GetTupleIndexOutOfBounds {
+                        index: *index,
+                        len: tuple_src.len(),
+                        kind: "FUNCTION(TUPLE)",
+                    })?
+                    .shape()?
+                    .cloned(),
+                _ => None,
+            },
+            _ => None,
+        },
 
         Op::Detach { src } | Op::Contiguous { src, .. } | Op::ContiguousBackward { src } | Op::Precast { src } => {
             src.shape()?.cloned()
@@ -721,7 +761,7 @@ pub fn infer_shape_from_op(uop: &UOp) -> crate::Result<Option<Shape>> {
 
         Op::After { passthrough, .. } => passthrough.shape()?.cloned(),
 
-        Op::Custom { .. } | Op::CustomI { .. } => None,
+        Op::Custom { .. } | Op::CustomI { .. } | Op::CustomFunction { .. } => None,
 
         // Graph organization operations have no shape
         Op::Sink { .. } => None,

@@ -4,8 +4,8 @@
 //! Based on tinygrad's decompositions.py and SLEEF library.
 //!
 //! References:
-//! - Paper: https://arxiv.org/pdf/2001.09258
-//! - SLEEF: https://github.com/shibatch/sleef
+//! - Paper: <https://arxiv.org/pdf/2001.09258>
+//! - SLEEF: <https://github.com/shibatch/sleef>
 
 use std::{
     f64::consts::{FRAC_1_PI, LN_2},

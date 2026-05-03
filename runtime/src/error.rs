@@ -41,6 +41,10 @@ pub enum Error {
     #[snafu(display("Unsupported device type: {device}"))]
     UnsupportedDevice { device: String },
 
+    /// Reserved-but-unsupported runtime feature.
+    #[snafu(display("Unsupported runtime feature {kind}: {reason}"))]
+    Unsupported { kind: String, reason: String },
+
     /// Device error (from morok_device crate).
     #[snafu(display("Device error: {source}"))]
     Device { source: morok_device::Error },

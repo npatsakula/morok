@@ -7,7 +7,7 @@ use std::f32::consts::PI;
 
 use morok_ir::{Op, UOp};
 
-use crate::rangeify::kernel::run_kernel_split_pipeline;
+use crate::rangeify::try_get_kernel_graph;
 use crate::test::unit::rangeify::helpers::{count_bufferizes, count_codegen_params, count_kernels, extract_kernel};
 
 #[test]
@@ -29,7 +29,8 @@ fn test_pipeline_two_bufferizes() {
     // Create root with both
     let root = UOp::sink(vec![bufferize_global, bufferize_local]);
 
-    let (result, _context) = run_kernel_split_pipeline(root);
+    let (result, _context) =
+        try_get_kernel_graph(root).expect("kernel split pipeline should succeed for two bufferizes");
 
     // Global BUFFERIZE should be converted to BUFFER (and eventually codegen PARAM in kernel AST)
     let global_count = count_codegen_params(&result);
@@ -48,24 +49,25 @@ fn test_pipeline_preserves_structure() {
 
     let bufferize = UOp::bufferize_global(compute.clone(), vec![range.clone()]);
 
-    let (result, _context) = run_kernel_split_pipeline(bufferize.clone());
+    let (result, _context) =
+        try_get_kernel_graph(bufferize.clone()).expect("kernel split pipeline should preserve structure");
 
-    // Extract KERNEL from result (may be wrapped in AFTER structure)
-    let kernel = extract_kernel(&result).expect("Pipeline should create a KERNEL");
+    // Extract CALL from result (may be wrapped in AFTER structure)
+    let kernel = extract_kernel(&result).expect("Pipeline should create a CALL");
 
-    // KERNEL should contain the original compute somewhere in its graph
+    // CALL should contain the original compute somewhere in its graph
     // (We can't easily verify deep structure without graph traversal,
-    // but we can check that the pipeline created a valid kernel)
-    if let Op::Kernel { ast, sources } = kernel.op() {
+    // but we can check that the pipeline created a valid callable)
+    if let Op::Call { body: ast, args: sources, .. } = kernel.op() {
         // AST should be a SINK
         assert!(matches!(ast.op(), Op::Sink { .. }));
 
         // Sources contain BUFFER nodes (the original buffers from lctx.map)
         // The codegen PARAM conversion happens in the AST, not the sources
-        assert!(!sources.is_empty(), "KERNEL should have sources");
-        assert!(sources.iter().any(|s| matches!(s.op(), Op::Buffer { .. })), "KERNEL sources should include BUFFER");
+        assert!(!sources.is_empty(), "CALL should have sources");
+        assert!(sources.iter().any(|s| matches!(s.op(), Op::Buffer { .. })), "CALL sources should include BUFFER");
     } else {
-        panic!("Expected KERNEL operation, got {:?}", kernel.op());
+        panic!("Expected CALL operation, got {:?}", kernel.op());
     }
 }
 
@@ -77,21 +79,22 @@ fn test_pipeline_context_threading() {
 
     let bufferize = UOp::bufferize_global(compute, vec![range]);
 
-    let (result, _context) = run_kernel_split_pipeline(bufferize);
+    let (result, _context) =
+        try_get_kernel_graph(bufferize).expect("kernel split pipeline should preserve context threading");
 
     // After pipeline:
     // - Stage 1 (bufferize_to_store) creates BUFFER and tracks in context
-    // - Stage 2 (split_store) uses context to populate KERNEL sources with BUFFER
+    // - Stage 2 (split_store) uses context to populate CALL args with BUFFER
 
-    // Extract KERNEL from result (may be wrapped in AFTER structure)
-    let kernel = extract_kernel(&result).expect("Pipeline should create a KERNEL");
+    // Extract CALL from result (may be wrapped in AFTER structure)
+    let kernel = extract_kernel(&result).expect("Pipeline should create a CALL");
 
-    if let Op::Kernel { sources, .. } = kernel.op() {
+    if let Op::Call { args: sources, .. } = kernel.op() {
         // Sources contain BUFFER nodes from lctx.map (not codegen PARAM)
-        assert_eq!(sources.len(), 1, "KERNEL should have 1 source (the buffer from stage 1)");
+        assert_eq!(sources.len(), 1, "CALL should have 1 source (the buffer from stage 1)");
         assert!(matches!(sources[0].op(), Op::Buffer { .. }), "Source should be BUFFER, got {:?}", sources[0].op());
     } else {
-        panic!("Expected KERNEL operation, got {:?}", kernel.op());
+        panic!("Expected CALL operation, got {:?}", kernel.op());
     }
 }
 
@@ -112,7 +115,7 @@ fn test_pipeline_mixed_addrspace() {
     // Create a SINK with both
     let root = UOp::sink(vec![global_buf, local_buf]);
 
-    let (result, _context) = run_kernel_split_pipeline(root);
+    let (result, _context) = try_get_kernel_graph(root).expect("kernel split pipeline should handle mixed addrspace");
 
     // Global BUFFERIZE should be converted
     let globals = count_codegen_params(&result);
@@ -201,13 +204,14 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
     println!("Rangeified root op: {:?}", rangeified.op());
 
     // Run kernel split pipeline (Phase 5)
-    let (kernelized, _context) = run_kernel_split_pipeline(rangeified);
+    let (kernel_graph, _context) =
+        try_get_kernel_graph(rangeified).expect("kernel split pipeline should succeed after rangeify");
 
     // Print summarized graph for debugging
-    println!("Kernelized graph ops:");
-    for node in kernelized.toposort() {
+    println!("Kernel graph ops:");
+    for node in kernel_graph.toposort() {
         let op_name = match node.op() {
-            Op::Kernel { .. } => "KERNEL",
+            Op::Call { .. } => "CALL",
             Op::Sink { .. } => "SINK",
             Op::Store { .. } => "STORE",
             Op::Load { .. } => "LOAD",
@@ -250,7 +254,7 @@ fn test_full_pipeline_creates_load_for_input_buffers() {
     // INDEX dtype can be either:
     // - Element dtype (for LOAD sources, before pm_add_loads transforms them)
     // - Ptr dtype (for STORE targets, created in bufferize_to_store)
-    let topo = kernelized.toposort();
+    let topo = kernel_graph.toposort();
     let index_on_buffer = topo
         .iter()
         .filter(|node| {
@@ -284,7 +288,8 @@ fn test_pipeline_chained_operations() {
 
     let buf_b = UOp::bufferize_global(compute_b, vec![range_b]);
 
-    let (result, _context) = run_kernel_split_pipeline(buf_b);
+    let (result, _context) =
+        try_get_kernel_graph(buf_b).expect("kernel split pipeline should handle chained operations");
 
     // Should create multiple kernels for chained operations
     let kernel_count = count_kernels(&result);

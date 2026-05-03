@@ -1,4 +1,5 @@
 use morok_dtype::DType;
+use morok_dtype::DeviceSpec;
 use smallvec::SmallVec;
 use snafu::Snafu;
 
@@ -115,6 +116,10 @@ pub enum Error {
     #[snafu(display("symbolic shape is not supported for {operation}: shape dimensions must be concrete values"))]
     SymbolicShapeUnsupported { operation: String },
 
+    /// Operation requires a known shape but shape inference returned None.
+    #[snafu(display("shape inference failed for {operation}: source has no inferable shape"))]
+    MissingShape { operation: String },
+
     /// Symbolic buffer size unsupported.
     #[snafu(display("cannot allocate buffer with symbolic size: range bound resolved to {bound:?}"))]
     SymbolicBufferSize { bound: crate::ConstValue },
@@ -171,6 +176,40 @@ pub enum Error {
         "MulAcc operands must have matching dtypes (including vcount): a={a_dtype:?}, b={b_dtype:?}, c={c_dtype:?}"
     ))]
     MulAccDtypeMismatch { a_dtype: DType, b_dtype: DType, c_dtype: DType },
+
+    /// CALL body PARAM slots are not contiguous from 0.
+    #[snafu(display("CALL params not in contiguous slot order: got {slots:?}"))]
+    CallParamSlotsNotContiguous { slots: Vec<usize> },
+
+    /// CALL argument count mismatch.
+    #[snafu(display("CALL argument count mismatch: expected {expected}, got {got}"))]
+    CallArgCountMismatch { expected: usize, got: usize },
+
+    /// CALL argument shape mismatch.
+    #[snafu(display("CALL argument {arg_index} shape mismatch: expected {expected:?}, got {got:?}"))]
+    CallArgShapeMismatch { arg_index: usize, expected: Option<Box<Shape>>, got: Option<Box<Shape>> },
+
+    /// CALL argument dtype mismatch.
+    #[snafu(display("CALL argument {arg_index} dtype mismatch: expected {expected:?}, got {got:?}"))]
+    CallArgDTypeMismatch { arg_index: usize, expected: DType, got: DType },
+
+    /// Kernel split dependency cycle detected while fixing AFTER assignments.
+    #[snafu(display(
+        "kernel split dependency cycle detected: writer buffer {writer_buffer} reads buffer {read_buffer} that depends on it"
+    ))]
+    KernelSplitDependencyCycle { writer_buffer: u64, read_buffer: u64 },
+
+    /// Normal compiled kernels cannot span devices.
+    #[snafu(display("normal kernel buffers must be on the same device, got {devices:?}"))]
+    KernelSplitMixedDevices { devices: Vec<DeviceSpec> },
+
+    /// GETTUPLE index out of bounds.
+    #[snafu(display("GETTUPLE index {index} out of bounds for {kind} of length {len}"))]
+    GetTupleIndexOutOfBounds { index: usize, len: usize, kind: &'static str },
+
+    /// STORE node reached range assignment with no inferable shape.
+    #[snafu(display("STORE node id={uop_id} has no inferable index shape during range assignment"))]
+    StoreMissingShape { uop_id: u64 },
 }
 
 /// Enhance an error with provenance information for a UOp.

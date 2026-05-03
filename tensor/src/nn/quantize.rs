@@ -20,8 +20,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use morok_dtype::DType;
     /// let x = Tensor::from_slice([300.0f32, -10.0, 128.0]);
-    /// let y = x.clamp_cast(DType::UInt8).unwrap();
-    /// let vals = y.to_vec::<u8>().unwrap();
+    /// let mut y = x.clamp_cast(DType::UInt8).unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<u8>().unwrap();
     /// assert_eq!(vals, vec![255, 0, 128]);
     /// ```
     pub fn clamp_cast(&self, dtype: DType) -> Result<Self> {

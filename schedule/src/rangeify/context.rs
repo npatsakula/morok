@@ -16,7 +16,7 @@ pub struct RangeifyContext {
     /// This allows us to track how each node in the original graph
     /// has been transformed during the rangeify process.
     ///
-    /// Uses UOpKey for HashMap keys since Arc<UOp> doesn't implement Hash/Eq.
+    /// Uses UOpKey for HashMap keys since `Arc<UOp>` doesn't implement Hash/Eq.
     pub range_map: HashMap<UOpKey, Arc<UOp>>,
 
     /// Counter for generating unique range IDs.

@@ -1,6 +1,6 @@
 //! Schedule-level cache for the tensor realize pipeline.
 //!
-//! Caches the expensive rangeify + kernel_split pipeline output so that
+//! Caches the expensive rangeify + try_get_kernel_graph pipeline output so that
 //! structurally identical computations (same shape, different data) skip
 //! those passes and go straight to buffer allocation + codegen.
 //!
@@ -26,14 +26,17 @@ pub(crate) fn content_hash(uop: &UOp) -> u64 {
 /// Cache key: (content_hash of normalized sink, codegen backend string).
 type ScheduleCacheKey = (u64, &'static str);
 
-/// Cached output of rangeify + kernel_split pipeline.
+/// Cached output of rangeify + try_get_kernel_graph pipeline.
 ///
-/// Contains the kernelized graph, but NOT buffer allocations.
+/// Contains the kernel graph, but NOT buffer allocations.
 /// Buffer allocation happens fresh each time in `create_schedule`, because
 /// buffers are tensor-specific (different input data).
 pub(crate) struct CachedSchedule {
-    /// The graph after rangeify + kernel_split (contains KERNEL ops).
-    pub kernelized: Arc<UOp>,
+    /// Pre-schedule artifact after rangeify + callable extraction.
+    ///
+    /// Stores callable AST/dependency structure (without concrete buffers),
+    /// mirroring Tinygrad's cached `pre_schedule` stage.
+    pub pre_schedule: Arc<crate::schedule::PreSchedule>,
 }
 
 /// Global schedule-level cache.
@@ -48,13 +51,13 @@ pub(crate) fn schedule_cache() -> &'static HashMap<ScheduleCacheKey, Arc<CachedS
 
 /// Compute the cache key for a tensor + config.
 ///
-/// Normalizes buffers to params (erasing buffer identity), then content-hashes
-/// the result. Two tensors with the same computation shape but different input
-/// data produce the same key.
+/// Uses pre-schedule cache normalization (BUFFER->PARAM + strip BIND
+/// runtime values), then content-hashes the result.
 #[cfg(test)]
 pub(crate) fn cache_key_for(tensor: &crate::Tensor, config: &crate::PrepareConfig) -> Option<(u64, &'static str)> {
     let sink = UOp::sink(vec![tensor.uop().contiguous()]);
-    let (normalized, param_buffers) = crate::realize::normalize_buffers_to_params(&sink);
+    let normalized = crate::realize::normalize_for_schedule_cache(&sink).ok()?;
+    let param_buffers = normalized.param_buffers;
     let codegen = crate::realize::resolve_codegen(&param_buffers, config).ok()?;
-    Some((content_hash(&normalized), codegen))
+    Some((content_hash(&normalized.normalized), codegen))
 }

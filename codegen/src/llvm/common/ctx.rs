@@ -26,6 +26,10 @@ pub struct RenderContext {
     /// Stack of currently open RANGE axis_ids (for correct END footer ordering).
     /// Pushed on RANGE emission, popped on END emission.
     range_stack: Vec<usize>,
+    /// Side-channel error set by `render_uop` when it detects a graph invariant
+    /// violation. The render loop drains this after each call and propagates as
+    /// a typed [`crate::Error`].
+    pending_error: Option<crate::Error>,
 }
 
 impl RenderContext {
@@ -36,7 +40,20 @@ impl RenderContext {
             counter: 0,
             pending_reduces: HashMap::new(),
             range_stack: Vec::new(),
+            pending_error: None,
         }
+    }
+
+    /// Record an `InvalidGraph` error from a renderer op handler.
+    pub fn set_invalid_graph(&mut self, reason: impl Into<String>) {
+        if self.pending_error.is_none() {
+            self.pending_error = Some(crate::Error::InvalidGraph { reason: reason.into() });
+        }
+    }
+
+    /// Drain any error recorded via [`Self::set_invalid_graph`].
+    pub fn take_error(&mut self) -> Option<crate::Error> {
+        self.pending_error.take()
     }
 
     /// Get or create variable name for UOp.

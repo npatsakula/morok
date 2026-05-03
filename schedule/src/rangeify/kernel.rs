@@ -1,9 +1,9 @@
-//! Consolidated kernel splitting and pipeline orchestration.
+//! Consolidated kernel-graph construction and pipeline orchestration.
 //!
 //! This module contains:
-//! - KernelContext for tracking state during kernel splitting
+//! - RangeifyBufferContext for tracking state during kernel splitting
 //! - split_store for splitting computation at STORE boundaries
-//! - run_kernel_split_pipeline for full pipeline orchestration
+//! - try_get_kernel_graph for full pipeline orchestration
 //! - PcontigConfig for partial contiguous buffer removal
 //! - Two-stage reduction splitting (split_reduceop)
 //!
@@ -14,9 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use morok_ir::{AxisType, Op, SInt, UOp, UOpKey};
+use morok_dtype::DeviceSpec;
+use morok_ir::{CallInfo, Op, SInt, UOp, UOpKey};
 use smallvec::SmallVec;
 use tracing::{debug, trace};
+
+pub use morok_ir::KernelInfo;
 
 // ============================================================================
 // CONFIGURATION
@@ -67,7 +70,7 @@ impl SplitReduceOpConfig {
 }
 
 // ============================================================================
-// KERNEL CONTEXT
+// RANGEIFY BUFFER CONTEXT
 // ============================================================================
 
 /// Context for tracking state during kernel splitting.
@@ -76,9 +79,10 @@ impl SplitReduceOpConfig {
 /// `kernel_deps` and `buffer_id_mapping` that are no longer needed after
 /// aligning with fix_assign approach.
 #[derive(Clone)]
-pub struct KernelContext {
+pub struct RangeifyBufferContext {
     pub global_counter: usize,
     pub local_counter: usize,
+    pub lunique_counter: usize,
     pub buffer_map: HashMap<UOpKey, Arc<UOp>>,
     /// Bound variables: maps variable name → (DEFINE_VAR UOp, optional bound value).
     /// Populated when BIND(DEFINE_VAR, CONST) is stripped during kernel splitting.
@@ -87,9 +91,20 @@ pub struct KernelContext {
     pub range_counter: usize,
 }
 
-impl KernelContext {
+impl RangeifyBufferContext {
     pub fn new() -> Self {
-        Self { global_counter: 0, local_counter: 0, buffer_map: HashMap::new(), vars: HashMap::new(), range_counter: 0 }
+        Self::with_lunique_start(0)
+    }
+
+    pub fn with_lunique_start(lunique_start: usize) -> Self {
+        Self {
+            global_counter: 0,
+            local_counter: 0,
+            lunique_counter: lunique_start,
+            buffer_map: HashMap::new(),
+            vars: HashMap::new(),
+            range_counter: 0,
+        }
     }
 
     pub fn next_global(&mut self) -> usize {
@@ -101,6 +116,12 @@ impl KernelContext {
     pub fn next_local(&mut self) -> usize {
         let id = self.local_counter;
         self.local_counter += 1;
+        id
+    }
+
+    pub fn next_lunique(&mut self) -> usize {
+        let id = self.lunique_counter;
+        self.lunique_counter += 1;
         id
     }
 
@@ -130,7 +151,7 @@ impl KernelContext {
     }
 }
 
-impl Default for KernelContext {
+impl Default for RangeifyBufferContext {
     fn default() -> Self {
         Self::new()
     }
@@ -155,8 +176,10 @@ pub struct LocalAddBufferContext {
     pub param_slot: usize,
     /// Buffer → AFTER mapping (IndexMap maintains insertion order)
     pub map: IndexMap<UOpKey, Arc<UOp>>,
-    /// Bound variables: name → (DEFINE_VAR UOp, optional bound value).
-    pub vars: HashMap<String, (Arc<UOp>, Option<i64>)>,
+    /// Bound variables: binding UOp (typically BIND) -> (DEFINE_VAR UOp, optional bound value).
+    ///
+    /// Uses IndexMap to preserve insertion order for CALL source argument parity.
+    pub vars: IndexMap<UOpKey, (Arc<UOp>, Option<i64>)>,
     /// Range renumber counter
     pub range: usize,
     /// Optimization hints extracted from CONTIGUOUS.opts (ctx.opts)
@@ -182,10 +205,20 @@ impl LocalAddBufferContext {
         id
     }
 
-    /// Track a bound variable with its DEFINE_VAR UOp and concrete value.
-    pub fn add_var(&mut self, var: Arc<UOp>, value: Option<i64>) {
+    /// Track a bound variable and its binding source.
+    pub fn add_var(&mut self, binding: Arc<UOp>, var: Arc<UOp>, value: Option<i64>) {
         if let Op::DefineVar { name, .. } = var.op() {
-            self.vars.insert(name.clone(), (var, value));
+            // Keep latest binding for a variable name while preserving insertion order.
+            if let Some(existing_key) = self.vars.iter().find_map(|(k, (existing_var, _))| {
+                if matches!(existing_var.op(), Op::DefineVar { name: existing_name, .. } if existing_name == name) {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            }) {
+                self.vars.swap_remove(&existing_key);
+            }
+            self.vars.insert(UOpKey(binding), (var, value));
         }
     }
 
@@ -201,18 +234,8 @@ impl LocalAddBufferContext {
 }
 
 // ============================================================================
-// SPLIT KERNEL
+// SPLIT STORE INTO CALL WRAPPERS
 // ============================================================================
-
-/// Marker metadata for kernel AST SINKs.
-///
-/// Matches `KernelInfo` arg on SINK nodes:
-///   `ret = ret.sink(arg=KernelInfo(...))`
-///
-/// The gate (`pm_gate_kernel_sink`) checks for this marker to skip
-/// already-formed kernel ASTs during bottom-up traversal.
-#[derive(Debug, Clone)]
-pub struct KernelAstMarker;
 
 /// Extract the stored value from a STORE/END(STORE) structure.
 ///
@@ -229,6 +252,14 @@ fn extract_stored_value(ret: &Arc<UOp>) -> &Arc<UOp> {
     }
 }
 
+fn extract_after_callable(deps: &SmallVec<[Arc<UOp>; 4]>) -> Option<Arc<UOp>> {
+    deps.iter().find_map(|d| match d.op() {
+        Op::Call { .. } => Some(d.clone()),
+        Op::End { computation, .. } if matches!(computation.op(), Op::Call { .. }) => Some(computation.clone()),
+        _ => None,
+    })
+}
+
 /// Split STORE and END operations into individual kernels.
 ///
 /// Based on split_store.
@@ -239,20 +270,17 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
 
-    // Guard 1: Skip if has non-OUTER ranges
-    #[allow(clippy::mutable_key_type)] // UOp uses Arc<OnceLock> for caching, but keys hash by ID
-    let in_scope = x.in_scope_ranges();
-    let has_non_outer =
-        in_scope.iter().any(|r| matches!(r.0.op(), Op::Range { axis_type, .. } if *axis_type != AxisType::Outer));
-    if has_non_outer {
+    // Tinygrad parity: if any ranges are still open here, this is not a
+    // kernel boundary. END(STORE) nodes that close their full output range have
+    // empty in-scope ranges after ended_ranges() is applied.
+    if !x.in_scope_ranges().is_empty() {
         return None;
     }
 
-    // Guard 2: Skip END where FIRST range is OUTER
-    // `if x.op is Ops.END and x.src[1].arg[0] == AxisType.OUTER: return None`
-    if let Op::End { ranges, .. } = x.op()
-        && let Some(r) = ranges.first()
-        && matches!(r.op(), Op::Range { axis_type: AxisType::Outer, .. })
+    // Guard 1: Tinygrad parity for raw STORE path.
+    // Raw stores with explicit ranges/index-shape should be handled by their END wrapper.
+    if let Op::Store { index, ranges, .. } = x.op()
+        && (!ranges.is_empty() || index.shape().ok().flatten().is_some())
     {
         return None;
     }
@@ -273,7 +301,7 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
     // Context-dependent rewrite per kernel.
     //
     // Context-free patterns (movement_op, syntactic_sugar, flatten_range) were already
-    // applied in run_kernel_split_pipeline's pre-pass. Here we only run patterns that
+    // applied in try_get_kernel_graph's pre-pass. Here we only run patterns that
     // need LocalAddBufferContext (Buffer/Param→codegen PARAM, Bind, After, Range renumber,
     // NOOP→zero, Contiguous→extract opts).
     let ret = {
@@ -282,33 +310,68 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
             LazyLock::new(|| local_to_param_patterns() + rangeify_codegen_patterns());
         graph_rewrite_bottom_up(&*PM_CTX_DEP, x.clone(), &mut lctx)
     };
+    let closed_ranges = match ret.op() {
+        Op::End { ranges, .. } if !ranges.is_empty() => Some(ranges.clone()),
+        _ => None,
+    };
 
     // Check for COPY/BUFFER_VIEW directly on the stored value.
     // No graph traversal needed — just walk the STORE/END structure.
     let stored = extract_stored_value(&ret);
     let ast = if matches!(stored.op(), Op::Copy { .. } | Op::BufferView { .. }) {
-        stored.clone()
+        // Keep COPY/BUFFER_VIEW call bodies as direct ops so runtime lowering
+        // can classify them into PreparedOp::BufferCopy/BufferView.
+        if let Some(ranges) = &closed_ranges { stored.end(ranges.clone()) } else { stored.clone() }
     } else {
-        // Mark AST SINK with KernelAstMarker — matches `ret.sink(arg=KernelInfo(...))`
-        // The gate (`pm_gate_kernel_sink`) checks for this marker to skip the kernel AST subtree.
-        UOp::sink(vec![ret]).with_metadata(KernelAstMarker)
+        // Mark AST SINK structurally so it hash-cons-distinguishes from
+        // unmarked SINKs and the gate predicate can short-circuit on it.
+        UOp::sink_with_info(vec![ret], KernelInfo::default())
     };
 
-    // Build KERNEL from context
-    // Sources: lctx.map.values() (buffer → AFTER mappings) + DEFINE_VAR UOps from vars
+    // Build CALL from context
+    // Args: lctx.map.values() (buffer → AFTER mappings) + bound variable sources.
     let sources: SmallVec<[Arc<UOp>; 4]> =
-        lctx.map.values().cloned().chain(lctx.vars.values().map(|(uop, _)| uop.clone())).collect();
+        lctx.map.values().cloned().chain(lctx.vars.keys().map(|k| k.0.clone())).collect();
 
-    let kernel = UOp::kernel(sources.clone(), ast.clone());
+    let call = ast.call(sources.clone(), CallInfo::default());
     debug!(
-        kernel_id = kernel.id,
+        call_id = call.id,
         num_sources = sources.len(),
         map_size = lctx.map.len(),
         vars_size = lctx.vars.len(),
-        "split_store: created kernel"
+        "split_store: created call"
     );
 
-    Some(kernel)
+    Some(call)
+}
+
+fn validate_normal_kernel_devices(root: &Arc<UOp>) -> morok_ir::Result<()> {
+    for node in root.toposort() {
+        let Op::Call { body, args, .. } = node.op() else {
+            continue;
+        };
+        if !matches!(body.op(), Op::Sink { .. }) {
+            continue;
+        }
+
+        let mut devices: Vec<DeviceSpec> = Vec::new();
+        for arg in args {
+            if matches!(arg.op(), Op::Bind { .. }) {
+                continue;
+            }
+            let Some(device) = arg.device_spec() else {
+                continue;
+            };
+            if !devices.contains(&device) {
+                devices.push(device);
+            }
+        }
+        if devices.len() > 1 {
+            return Err(morok_ir::Error::KernelSplitMixedDevices { devices });
+        }
+    }
+
+    Ok(())
 }
 
 /// Fix inter-kernel dependencies (like fix_assign).
@@ -318,31 +381,40 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// ensures kernel B's AFTER node depends on kernel A's AFTER node.
 ///
 /// Uses buf_uop() to walk through AFTER chains and get underlying buffer IDs.
-fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
+fn fix_assign(root: &Arc<UOp>) -> morok_ir::Result<Arc<UOp>> {
     // Map buf_uop().id -> AFTER node that produces it
     let mut kernel_assign: HashMap<u64, Arc<UOp>> = HashMap::new();
     #[allow(clippy::mutable_key_type)]
     let mut assign_rep: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
-    for u in root.toposort() {
+    let afters: Vec<Arc<UOp>> = root.toposort().into_iter().filter(|u| matches!(u.op(), Op::After { .. })).collect();
+
+    for u in &afters {
+        let Op::After { passthrough, .. } = u.op() else {
+            continue;
+        };
+        kernel_assign.insert(passthrough.buf_uop().id, u.clone());
+    }
+
+    for u in afters {
         let Op::After { passthrough, deps } = u.op() else {
             continue;
         };
 
         // Use buf_uop() to get underlying buffer ID (handles AFTER chains)
         let buf_id = passthrough.buf_uop().id;
-        kernel_assign.insert(buf_id, u.clone());
 
-        // Get kernel from deps
-        let Some(kernel) = deps.iter().find(|d| matches!(d.op(), Op::Kernel { .. })).cloned() else {
+        // Get callable wrapper from deps.
+        let Some(callable) = extract_after_callable(deps) else {
             continue;
         };
 
-        let Op::Kernel { sources, .. } = kernel.op() else {
+        let Op::Call { args, .. } = callable.op() else {
             continue;
         };
+        let sources: SmallVec<[Arc<UOp>; 4]> = args.clone();
 
-        for s in sources {
+        for s in &sources {
             // Check kernel sources for buffer dependencies
             if !matches!(s.op(), Op::Buffer { .. } | Op::Param { .. }) {
                 continue;
@@ -355,21 +427,22 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
                 continue;
             };
 
-            // Same-kernel check (a.src[1] is u.src[1])
-            // Skip if both AFTERs belong to the same kernel — avoids spurious WAR deps
+            // Same-kernel check by callable identity (Tinygrad parity).
+            // Skip if both AFTERs belong to the same callable — avoids spurious WAR deps
             // between outputs of the same multi-output kernel.
             if let Op::After { deps: a_deps, .. } = a.op()
-                && a_deps.iter().any(|ad| deps.iter().any(|ud| Arc::ptr_eq(ad, ud)))
+                && let Some(a_callable) = extract_after_callable(a_deps)
+                && Arc::ptr_eq(&a_callable, &callable)
             {
                 continue;
             }
 
             // Cycle detection
             if u.any_in_subtree(|x| matches!(x.op(), Op::After { .. }) && x.buf_uop().id == s_buf_id) {
-                panic!(
-                    "cycle detected in graph: kernel for buffer {} reads buffer {} which has AFTER in its tree",
-                    buf_id, s_buf_id
-                );
+                return Err(morok_ir::Error::KernelSplitDependencyCycle {
+                    writer_buffer: buf_id,
+                    read_buffer: s_buf_id,
+                });
             }
 
             // Add dependency: a.replace(src=a.src+(u,))
@@ -383,7 +456,7 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
         }
     }
 
-    if assign_rep.is_empty() { root.clone() } else { root.substitute(&assign_rep) }
+    Ok(if assign_rep.is_empty() { root.clone() } else { root.substitute(&assign_rep) })
 }
 
 // ============================================================================
@@ -392,16 +465,25 @@ fn fix_assign(root: &Arc<UOp>) -> Arc<UOp> {
 
 /// Run the kernel splitting pipeline.
 ///
-/// Based on get_rangeify_map.
+/// Based on Tinygrad's `get_kernel_graph`.
 /// Simplified from ~200 lines to ~40 lines.
 ///
 /// # Returns
-/// Returns `(result, KernelContext)` tuple for backward compatibility with 30+ callers.
-pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
+/// Returns `(result, RangeifyBufferContext)`.
+pub fn try_get_kernel_graph(root: Arc<UOp>) -> morok_ir::Result<(Arc<UOp>, RangeifyBufferContext)> {
     use super::transforms::pm_add_buffers_patterns;
     use crate::rewrite::graph_rewrite_bottom_up;
 
-    let mut ctx = KernelContext::new();
+    let lunique_start = root
+        .toposort()
+        .into_iter()
+        .filter_map(|u| match u.op() {
+            Op::LUnique(id) => Some(*id + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let mut ctx = RangeifyBufferContext::with_lunique_start(lunique_start);
 
     // PASS 1: bufferize → store (pm_gate_kernel_sink + pm_add_buffers + pm_add_range_tags, bottom_up=True)
     let t_stage = std::time::Instant::now();
@@ -409,10 +491,9 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
         use morok_ir::op::pattern_derived::OpKey;
         use morok_ir::pattern::RewriteResult;
         let mut matcher = pm_add_buffers_patterns();
-        // Gate on SINK with KernelAstMarker to skip already-formed kernel ASTs
-        // (pm_gate_kernel_sink gates on SINK with KernelInfo arg)
+        // Skip the SINK subtree of an already-formed kernel AST.
         matcher.add(&[OpKey::Sink], |node, _ctx| {
-            if node.metadata::<KernelAstMarker>().is_some() {
+            if matches!(node.op(), Op::Sink { info: Some(_), .. }) {
                 RewriteResult::Gate(node.clone())
             } else {
                 RewriteResult::NoMatch
@@ -440,21 +521,23 @@ pub fn run_kernel_split_pipeline(root: Arc<UOp>) -> (Arc<UOp>, KernelContext) {
     let after_split = split_all_stores(&after_ctx_free);
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: split_all_stores complete");
 
+    validate_normal_kernel_devices(&after_split)?;
+
     let t_stage = std::time::Instant::now();
-    let result = fix_assign(&after_split);
+    let result = fix_assign(&after_split)?;
     tracing::debug!(elapsed_ms = t_stage.elapsed().as_millis() as u64, "kernel split: fix_assign complete");
 
-    (result, ctx)
+    Ok((result, ctx))
 }
 
-/// Split all STORE/END operations into KERNELs.
+/// Split all STORE/END operations into CALL wrappers.
 ///
 /// Matches upstream:
 ///   `graph_rewrite(tsink, pm_gate_kernel_sink + split_kernels, bottom_up=True)`
 ///
 /// All patterns run in bpm (Stage 0, see ORIGINAL children):
-/// - Gate on KERNEL nodes to prevent descending into already-split subtrees
-/// - STORE/END → KERNEL via split_store
+/// - Gate on marked SINK nodes to prevent descending into already-split subtrees
+/// - STORE/END → CALL via split_store
 fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
     use morok_ir::op::pattern_derived::OpKey;
     use morok_ir::pattern::RewriteResult;
@@ -468,10 +551,9 @@ fn split_all_stores(root: &Arc<UOp>) -> Arc<UOp> {
             if matches!(computation.op(), Op::Store { .. } | Op::End { .. })
             => |node, ctx| split_store(ctx, node),
     };
-    // Gate on SINK with KernelAstMarker to skip already-formed kernel ASTs
-    // (pm_gate_kernel_sink gates on SINK with KernelInfo arg)
+    // Skip the SINK subtree of an already-formed kernel AST.
     matcher.add(&[OpKey::Sink], |node, _ctx| {
-        if node.metadata::<KernelAstMarker>().is_some() {
+        if matches!(node.op(), Op::Sink { info: Some(_), .. }) {
             RewriteResult::Gate(node.clone())
         } else {
             RewriteResult::NoMatch
@@ -695,3 +777,7 @@ pub fn split_reduceop(reduce: &Arc<UOp>, config: &SplitReduceOpConfig) -> Option
 
     apply_split_transformation(source, reduce, &candidates[0], input_shape)
 }
+
+#[cfg(test)]
+#[path = "../test/unit/rangeify/kernel_internal.rs"]
+mod tests;

@@ -21,7 +21,7 @@ use syn::{
 /// - `ctx` is available in RHS expressions
 #[derive(Debug)]
 pub struct PatternList {
-    /// Optional context type declaration (e.g., `@context KernelContext;`)
+    /// Optional context type declaration (e.g., `@context MyContext;`)
     pub context_type: Option<syn::Type>,
     /// Pattern items
     pub items: Vec<PatternItem>,

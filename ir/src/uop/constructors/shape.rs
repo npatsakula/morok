@@ -79,14 +79,9 @@ impl UOp {
 
         // Validate product equality if source shape is known
         if let Some(src_shape) = self.shape()? {
-            // Identity reshape: skip if shapes already match.
-            // Exclude BUFFER and CONST: the rangeify pipeline requires RESHAPE(BUFFER) to
-            // generate INDEX operations for ASSIGN targets. Bare BUFFER can't be indexed.
-            // Tinygrad avoids this because their BUFFER carries shape natively and their
-            // rangeify handles bare BUFFER → INDEX directly.
-            if src_shape.as_slice() == new_shape.as_slice()
-                && !matches!(self.op(), crate::Op::Buffer { .. } | crate::Op::Param { .. } | crate::Op::Const(_))
-            {
+            // Identity reshape: skip if shapes already match. Bare BUFFER/PARAM
+            // sources are indexed directly by rangeify, matching Tinygrad.
+            if src_shape.as_slice() == new_shape.as_slice() {
                 return Ok(self.clone());
             }
 

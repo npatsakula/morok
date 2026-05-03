@@ -1,3 +1,4 @@
+mod audio;
 mod batch;
 mod config;
 mod jit;

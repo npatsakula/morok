@@ -26,6 +26,41 @@ fn test_buffer_view() {
 }
 
 #[test]
+fn test_view_has_distinct_handle_id() {
+    // Each Buffer value (including views) carries its own handle id.
+    // Disjoint views of one allocation must compare as different handles
+    // so the parallel-hazard model can treat them as independent.
+    let allocator = Arc::new(CpuAllocator);
+    let buffer = Buffer::allocate(allocator, DType::Float32, vec![16], BufferOptions::default()).unwrap();
+    let view_a = buffer.view(0, 16).unwrap();
+    let view_b = buffer.view(16, 16).unwrap();
+
+    assert_ne!(buffer.id(), view_a.id(), "view must have a fresh handle id distinct from its base");
+    assert_ne!(view_a.id(), view_b.id(), "two distinct views must have distinct handle ids");
+}
+
+#[test]
+fn test_view_shares_storage_id() {
+    // Storage identity must be shared between a base and its views; this is
+    // what alias detection in the memory planner relies on.
+    let allocator = Arc::new(CpuAllocator);
+    let buffer = Buffer::allocate(allocator, DType::Float32, vec![16], BufferOptions::default()).unwrap();
+    let view = buffer.view(8, 16).unwrap();
+
+    assert_eq!(buffer.storage_id(), view.storage_id(), "view must share its base's storage id");
+}
+
+#[test]
+fn test_independent_buffers_have_distinct_storage_ids() {
+    let allocator = Arc::new(CpuAllocator);
+    let a = Buffer::allocate(allocator.clone(), DType::Float32, vec![8], BufferOptions::default()).unwrap();
+    let b = Buffer::allocate(allocator, DType::Float32, vec![8], BufferOptions::default()).unwrap();
+
+    assert_ne!(a.storage_id(), b.storage_id(), "independent allocations must have distinct storage ids");
+    assert_ne!(a.id(), b.id());
+}
+
+#[test]
 fn test_invalid_view() {
     let allocator = Arc::new(CpuAllocator);
     let buffer = Buffer::allocate(allocator, DType::Float32, vec![10], BufferOptions::default()).unwrap();

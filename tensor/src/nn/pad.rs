@@ -133,8 +133,9 @@ impl Tensor {
     /// ```
     /// # use morok_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let y = x.try_pad_value(&[(1, 1)], 0.0).unwrap();
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 0.0]);
+    /// let mut y = x.try_pad_value(&[(1, 1)], 0.0).unwrap();
+    /// y.realize().unwrap();
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 0.0]);
     /// ```
     ///
     /// Negative-infinity padding (useful for max pooling):
@@ -142,8 +143,9 @@ impl Tensor {
     /// ```
     /// # use morok_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let y = x.try_pad_value(&[(1, 0)], f64::NEG_INFINITY).unwrap();
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![f32::NEG_INFINITY, 1.0, 2.0, 3.0]);
+    /// let mut y = x.try_pad_value(&[(1, 0)], f64::NEG_INFINITY).unwrap();
+    /// y.realize().unwrap();
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![f32::NEG_INFINITY, 1.0, 2.0, 3.0]);
     /// ```
     pub fn try_pad_value(&self, padding: &[(isize, isize)], value: f64) -> Result<Tensor> {
         if value == 0.0 {
@@ -181,8 +183,9 @@ impl Tensor {
     /// ```
     /// # use morok_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let y = x.pad_with().padding(&[(1, 1)]).call().unwrap();
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 0.0]);
+    /// let mut y = x.pad_with().padding(&[(1, 1)]).call().unwrap();
+    /// y.realize().unwrap();
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0, 0.0]);
     /// ```
     ///
     /// Constant padding with a custom fill value:
@@ -190,8 +193,9 @@ impl Tensor {
     /// ```
     /// # use morok_tensor::Tensor;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let y = x.pad_with().padding(&[(1, 1)]).value(-f64::INFINITY).call().unwrap();
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![f32::NEG_INFINITY, 1.0, 2.0, 3.0, f32::NEG_INFINITY]);
+    /// let mut y = x.pad_with().padding(&[(1, 1)]).value(-f64::INFINITY).call().unwrap();
+    /// y.realize().unwrap();
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![f32::NEG_INFINITY, 1.0, 2.0, 3.0, f32::NEG_INFINITY]);
     /// ```
     ///
     /// Replicate (edge) padding:
@@ -200,8 +204,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use morok_tensor::nn::PadMode;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Replicate).call().unwrap();
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 3.0]);
+    /// let mut y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Replicate).call().unwrap();
+    /// y.realize().unwrap();
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0, 1.0, 1.0, 2.0, 3.0, 3.0, 3.0]);
     /// ```
     ///
     /// Reflect padding:
@@ -210,8 +215,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use morok_tensor::nn::PadMode;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Reflect).call().unwrap();
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]);
+    /// let mut y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Reflect).call().unwrap();
+    /// y.realize().unwrap();
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]);
     /// ```
     ///
     /// Circular (wrap) padding:
@@ -220,8 +226,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use morok_tensor::nn::PadMode;
     /// let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
-    /// let y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Circular).call().unwrap();
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]);
+    /// let mut y = x.pad_with().padding(&[(2, 2)]).mode(PadMode::Circular).call().unwrap();
+    /// y.realize().unwrap();
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0]);
     /// ```
     #[builder]
     pub fn pad_with(

@@ -5,4 +5,7 @@
 
 pub mod engine;
 
-pub use engine::{NoMatcher, graph_rewrite, graph_rewrite_bottom_up, graph_rewrite_with_bpm};
+pub use engine::{
+    NoMatcher, graph_rewrite, graph_rewrite_bottom_up, graph_rewrite_bottom_up_preserve_calls,
+    graph_rewrite_preserve_calls, graph_rewrite_walk, graph_rewrite_with_bpm, graph_rewrite_with_bpm_preserve_calls,
+};

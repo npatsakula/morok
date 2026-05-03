@@ -71,8 +71,6 @@ use crate::devectorize::{
     pm_wmma_accumulate,
 };
 use crate::gpudims::pm_add_gpudims;
-// pm_linearize_multi_index removed: Tinygrad keeps multi-index INDEX through the pipeline.
-// Codegen backends compute flat addresses at render time.
 use crate::rangeify::patterns::{
     pm_add_loads, pm_comparison_negations, pm_demorgan, pm_div_to_shr, pm_erf_decomposition, pm_fdiv_to_mul,
     pm_fma_decomposition, pm_load_collapse, pm_mod_to_and, pm_mul_to_shl, pm_neg_from_mul, pm_shl_add_to_mulacc,
@@ -97,7 +95,7 @@ use std::sync::{Arc, LazyLock};
 ///
 /// # Arguments
 ///
-/// * `ast` - The kernel AST (inner AST from KERNEL op)
+/// * `ast` - The kernel AST (CALL body AST)
 /// * `renderer` - Backend capabilities descriptor
 ///
 /// # Returns
@@ -155,8 +153,8 @@ pub fn apply_post_optimization_with_renderer(
 
     tracing::debug!(ast.initial = ast.tree(), node_count = ast.node_count(), "kernel initial");
 
-    // Tinygrad keeps multi-index INDEX through the pipeline — no linearization here.
-    // Codegen backends compute flat addresses at render time via render_linearize_multi_index.
+    // Multi-index INDEX is normalized to single-index during devectorize
+    // via pm_linearize_multi_index. Backends consume only linearized INDEX.
 
     // =========================================================================
     // Stage 8: Post-opt symbolic + WHERE movement (Tinygrad: sym + pm_move_where_on_load)
@@ -214,8 +212,8 @@ pub fn apply_post_optimization_with_renderer(
 
     let t_stage = std::time::Instant::now();
     let with_local_buffers = {
-        let mut buf_ctx = crate::rangeify::KernelContext::new();
-        static PM_LOCAL_BUF: LazyLock<crate::TypedPatternMatcher<crate::rangeify::KernelContext>> =
+        let mut buf_ctx = crate::rangeify::RangeifyBufferContext::new();
+        static PM_LOCAL_BUF: LazyLock<crate::TypedPatternMatcher<crate::rangeify::RangeifyBufferContext>> =
             LazyLock::new(|| pm_add_buffers_local_patterns() + rangeify_codegen_with_kernel_ctx());
         graph_rewrite(&*PM_LOCAL_BUF, expanded, &mut buf_ctx)
     };
@@ -246,7 +244,11 @@ pub fn apply_post_optimization_with_renderer(
 
     let t_stage = std::time::Instant::now();
     let with_gpudims = if let Some(ren) = renderer {
-        if ren.has_local { graph_rewrite(&pm_add_gpudims(), reduced, &mut ren.clone()) } else { reduced }
+        if ren.has_local || ren.has_threads {
+            graph_rewrite(&pm_add_gpudims(), reduced, &mut ren.clone())
+        } else {
+            reduced
+        }
     } else {
         reduced
     };
@@ -349,6 +351,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "Stage 18-19: after pm_decomp + pm_render"
     );
+    assert_gated_loads_have_alt("after_pm_decomp_pm_render", &rendered);
 
     // Merge sibling ENDs that share the same reduce ranges.
     // pm_decomp+pm_render can create new sibling ENDs (e.g. by rewriting computations
@@ -384,6 +387,7 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after pm_float_decomp"
     );
+    assert_gated_loads_have_alt("after_pm_float_decomp", &fp8_decomposed);
 
     let t_stage = std::time::Instant::now();
     let bs = graph_rewrite(bool_storage_patterns(), fp8_decomposed, &mut ());
@@ -393,11 +397,31 @@ pub fn apply_post_optimization_with_renderer(
         elapsed_ms = t_stage.elapsed().as_millis() as u64,
         "after bool_storage_pattern"
     );
+    assert_gated_loads_have_alt("after_bool_storage_pattern", &bs);
 
     // Re-attach metadata (e.g., KernelInfo) that was lost during graph rewrites
     match saved_metadata {
         Some(meta) => bs.with_metadata_raw(meta),
         None => bs,
+    }
+}
+
+fn assert_gated_loads_have_alt(stage: &str, root: &Arc<morok_ir::UOp>) {
+    for node in root.toposort() {
+        let morok_ir::Op::Load { index, alt, .. } = node.op() else {
+            continue;
+        };
+        if index_has_gate(index) && alt.is_none() {
+            panic!("pipeline invariant violation ({stage}): gated LOAD {} has no alt value", node.id);
+        }
+    }
+}
+
+fn index_has_gate(index: &Arc<morok_ir::UOp>) -> bool {
+    match index.op() {
+        morok_ir::Op::Index { gate: Some(_), .. } => true,
+        morok_ir::Op::Cast { src, .. } => index_has_gate(src),
+        _ => false,
     }
 }
 

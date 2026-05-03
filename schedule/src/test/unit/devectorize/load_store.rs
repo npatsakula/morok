@@ -9,11 +9,19 @@
 
 use std::sync::Arc;
 
-use morok_dtype::{AddrSpace, DType};
+use morok_dtype::{AddrSpace, DType, DeviceSpec, ImageKind};
 use morok_ir::types::ConstValue;
 use morok_ir::{Op, UOp};
 
 use super::helpers::*;
+
+fn index_has_gate(index: &Arc<UOp>) -> bool {
+    match index.op() {
+        Op::Index { gate: Some(_), .. } => true,
+        Op::Cast { src, .. } => index_has_gate(src),
+        _ => false,
+    }
+}
 
 // =============================================================================
 // PTRCAT Distribution Tests - LOAD
@@ -249,6 +257,69 @@ fn test_split_store_vec8() {
         Op::Store { .. } => {}
         other => panic!("Expected GROUP or STORE, got {:?}", other),
     }
+}
+
+#[test]
+fn test_split_load_preserves_nonzero_alt() {
+    let buffer = create_buffer(128);
+    let gate = create_bool_const(true);
+    let idx = UOp::index()
+        .buffer(buffer.clone())
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(0))])
+        .gate(gate)
+        .call()
+        .unwrap();
+    let cast_idx = idx.cast(DType::Float32.vec(8).ptr(Some(8), AddrSpace::Global));
+    let alt = UOp::vconst(vec![ConstValue::Float(3.25); 8], DType::Float32);
+    let load = UOp::load().buffer(buffer).index(cast_idx).dtype(DType::Float32.vec(8)).alt(alt).call();
+
+    let result = apply_correct_load_store(&load);
+
+    match result.op() {
+        Op::Cat { sources } => {
+            assert!(sources.len() >= 2, "split load should produce multiple chunks");
+            for src in sources {
+                let Op::Load { index, alt, .. } = src.op() else {
+                    panic!("expected split LOAD chunk");
+                };
+                assert!(index_has_gate(index), "split LOAD chunk must keep gate");
+                assert!(alt.is_some(), "split LOAD chunk must keep alt");
+                assert!(
+                    !matches!(alt.as_ref().expect("alt").op(), Op::Const(cv) if cv.0 == ConstValue::Int(0) || cv.0 == ConstValue::Float(0.0)),
+                    "split LOAD chunk alt must not be replaced by zero"
+                );
+            }
+        }
+        other => panic!("expected CAT from split load, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_image_fixup_preserves_nonzero_alt() {
+    let img = UOp::new_buffer(DeviceSpec::Cpu, 64, DType::Image { kind: ImageKind::Float, shape: vec![8, 8] });
+    let gate = create_bool_const(true);
+    let idx = UOp::index()
+        .buffer(img.clone())
+        .indices(vec![UOp::const_(DType::Index, ConstValue::Int(12))])
+        .gate(gate)
+        .call()
+        .unwrap();
+    let cast_idx = idx.cast(DType::Float32.vec(4));
+    let alt = UOp::vconst(vec![ConstValue::Float(9.0); 4], DType::Float32);
+    let load = UOp::load().buffer(img).index(cast_idx).dtype(DType::Float32.vec(4)).alt(alt).call();
+
+    let result = apply_correct_load_store(&load);
+    let Op::Load { index, alt, .. } = result.op() else {
+        panic!("image fixup should keep LOAD shape");
+    };
+
+    assert!(matches!(index.op(), Op::Index { .. }), "image fixup should replace CAST(INDEX) with INDEX");
+    assert!(index_has_gate(index), "image fixup must preserve INDEX gate");
+    assert!(alt.is_some(), "image fixup must preserve LOAD alt");
+    assert!(
+        !matches!(alt.as_ref().expect("alt").op(), Op::Const(cv) if cv.0 == ConstValue::Int(0) || cv.0 == ConstValue::Float(0.0)),
+        "image fixup must not replace alt with zero"
+    );
 }
 
 /// Test: Split preserves ranges in STORE.

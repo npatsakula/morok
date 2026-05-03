@@ -5,7 +5,7 @@ use super::GigaAmConfig;
 
 /// Precompute RoPE cos/sin cache tensors.
 ///
-/// Returns `(cos, sin)` each of shape `[max_seq_len, 1, 1, d_k/2]`
+/// Returns `(cos, sin)` each of shape `[max_encoder_frames, 1, 1, d_k/2]`
 /// where `d_k = d_model / n_heads`.
 ///
 /// GigaAM uses non-interleaved RoPE (first_half/second_half split),
@@ -13,7 +13,7 @@ use super::GigaAmConfig;
 pub fn build_rope_cache(config: &GigaAmConfig) -> (Tensor, Tensor) {
     let d_k = config.d_model / config.n_heads;
     let half_d = d_k / 2;
-    let max_len = config.max_seq_len;
+    let max_len = config.max_encoder_frames;
 
     let inv_freq: Vec<f32> = (0..half_d).map(|i| 1.0 / 10000.0f32.powf(2.0 * i as f32 / d_k as f32)).collect();
 

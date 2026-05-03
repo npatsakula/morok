@@ -26,6 +26,7 @@ use std::sync::Arc;
 use morok_dtype::DeviceSpec;
 
 use crate::buffer::Buffer;
+use crate::device::Program;
 use crate::error::Result;
 use crate::sync::TimelineSignal;
 
@@ -34,43 +35,39 @@ use crate::sync::TimelineSignal;
 pub struct ExecParams {
     /// Global work size (total number of work items per dimension).
     pub global_size: [usize; 3],
-    /// Local work size (work group size per dimension).
-    pub local_size: [usize; 3],
+    /// Local work size (work group size per dimension). None means direct global-id execution.
+    pub local_size: Option<[usize; 3]>,
+    /// Positional runtime variable values.
+    pub vals: Vec<i64>,
 }
 
 impl ExecParams {
     /// Create 1D execution parameters.
     pub fn new_1d(global: usize, local: usize) -> Self {
-        Self { global_size: [global, 1, 1], local_size: [local, 1, 1] }
+        Self { global_size: [global, 1, 1], local_size: Some([local, 1, 1]), vals: Vec::new() }
     }
 
     /// Create 2D execution parameters.
     pub fn new_2d(global: [usize; 2], local: [usize; 2]) -> Self {
-        Self { global_size: [global[0], global[1], 1], local_size: [local[0], local[1], 1] }
+        Self { global_size: [global[0], global[1], 1], local_size: Some([local[0], local[1], 1]), vals: Vec::new() }
     }
 
     /// Create 3D execution parameters.
     pub fn new_3d(global: [usize; 3], local: [usize; 3]) -> Self {
-        Self { global_size: global, local_size: local }
+        Self { global_size: global, local_size: Some(local), vals: Vec::new() }
+    }
+
+    /// Attach positional runtime variable values.
+    pub fn with_vals(mut self, vals: Vec<i64>) -> Self {
+        self.vals = vals;
+        self
     }
 }
 
 impl Default for ExecParams {
     fn default() -> Self {
-        Self { global_size: [1, 1, 1], local_size: [1, 1, 1] }
+        Self { global_size: [1, 1, 1], local_size: Some([1, 1, 1]), vals: Vec::new() }
     }
-}
-
-/// Compiled program that can be executed on a queue.
-///
-/// This is a thin wrapper around device-specific program handles
-/// (JIT function pointers, CUDA modules, etc.).
-pub trait Program: Send + Sync + std::fmt::Debug {
-    /// Get the device this program is compiled for.
-    fn device(&self) -> &DeviceSpec;
-
-    /// Get the program name (for debugging).
-    fn name(&self) -> &str;
 }
 
 /// Hardware command queue for submitting operations to a device.
@@ -110,7 +107,7 @@ pub trait HardwareQueue: Send + std::fmt::Debug {
     /// Caller must ensure:
     /// - All buffers are allocated
     /// - No conflicting buffer accesses (handled by executor)
-    fn exec(&mut self, program: &dyn Program, buffers: &[&Buffer], params: &ExecParams) -> &mut Self;
+    fn exec(&mut self, program: Arc<dyn Program>, buffers: &[&Buffer], params: &ExecParams) -> &mut Self;
 
     /// Copy data between buffers.
     ///
@@ -196,7 +193,7 @@ impl DynQueue {
     }
 
     /// Execute a program.
-    pub fn exec(&mut self, program: &dyn Program, buffers: &[&Buffer], params: &ExecParams) -> &mut Self {
+    pub fn exec(&mut self, program: Arc<dyn Program>, buffers: &[&Buffer], params: &ExecParams) -> &mut Self {
         self.inner.exec_dyn(program, buffers, params);
         self
     }
@@ -228,7 +225,7 @@ impl DynQueue {
 trait DynQueueInner: Send + std::fmt::Debug {
     fn wait_dyn(&mut self, signal: &dyn TimelineSignal, value: u64);
     fn signal_dyn(&mut self, signal: &dyn TimelineSignal, value: u64);
-    fn exec_dyn(&mut self, program: &dyn Program, buffers: &[&Buffer], params: &ExecParams);
+    fn exec_dyn(&mut self, program: Arc<dyn Program>, buffers: &[&Buffer], params: &ExecParams);
     fn copy_dyn(&mut self, dst: &Buffer, src: &Buffer);
     fn memory_barrier_dyn(&mut self);
     fn submit_dyn(&mut self) -> Result<()>;
@@ -251,21 +248,21 @@ impl<Q: HardwareQueue + 'static> DynQueueInner for DynQueueWrapper<Q>
 where
     Q::Signal: 'static,
 {
-    fn wait_dyn(&mut self, _signal: &dyn TimelineSignal, _value: u64) {
-        // Note: In a full implementation, we'd need to downcast the signal
-        // to the concrete type. For now, this is a placeholder that demonstrates
-        // the interface. The real implementation will use concrete types
-        // in the executor where the signal type is known.
-        //
-        // The type-erased DynQueue is mainly for heterogeneous collections;
-        // most code paths will use concrete types directly.
+    fn wait_dyn(&mut self, signal: &dyn TimelineSignal, value: u64) {
+        let signal = signal.as_any().downcast_ref::<Q::Signal>().unwrap_or_else(|| {
+            panic!("DynQueue wait signal type mismatch: queue device {:?}, signal {:?}", self.queue.device(), signal)
+        });
+        self.queue.wait(signal, value);
     }
 
-    fn signal_dyn(&mut self, _signal: &dyn TimelineSignal, _value: u64) {
-        // See wait_dyn comment
+    fn signal_dyn(&mut self, signal: &dyn TimelineSignal, value: u64) {
+        let signal = signal.as_any().downcast_ref::<Q::Signal>().unwrap_or_else(|| {
+            panic!("DynQueue signal type mismatch: queue device {:?}, signal {:?}", self.queue.device(), signal)
+        });
+        self.queue.signal(signal, value);
     }
 
-    fn exec_dyn(&mut self, program: &dyn Program, buffers: &[&Buffer], params: &ExecParams) {
+    fn exec_dyn(&mut self, program: Arc<dyn Program>, buffers: &[&Buffer], params: &ExecParams) {
         self.queue.exec(program, buffers, params);
     }
 

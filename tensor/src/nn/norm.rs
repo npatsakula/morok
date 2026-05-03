@@ -26,8 +26,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-    /// let y = x.layernorm(-1, 1e-5).unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.layernorm(-1, 1e-5).unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// // Each row is independently normalized to mean~0, std~1
     /// assert!((vals[0] + vals[1] + vals[2]).abs() < 1e-5);
     /// ```
@@ -47,8 +48,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0]]);
-    /// let (normed, mean, inv_std) = x.layernorm_with_stats(-1, 1e-5).unwrap();
-    /// let mean_val = mean.to_vec::<f32>().unwrap();
+    /// let (_normed, mut mean, _inv_std) = x.layernorm_with_stats(-1, 1e-5).unwrap();
+    /// mean.realize().unwrap();
+    /// let mean_val = mean.as_vec::<f32>().unwrap();
     /// assert!((mean_val[0] - 2.0).abs() < 1e-5);
     /// ```
     pub fn layernorm_with_stats(&self, axis: isize, eps: f64) -> Result<(Tensor, Tensor, Tensor)> {
@@ -83,8 +85,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0]]);
-    /// let y = x.rms_norm(-1, 1e-5).unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.rms_norm(-1, 1e-5).unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// // RMS of [1,2,3] = sqrt((1+4+9)/3) ≈ 2.16
     /// // Output ≈ [0.46, 0.93, 1.39]
     /// assert!((vals[0] - 1.0 / (14.0f32 / 3.0).sqrt()).abs() < 1e-4);
@@ -124,8 +127,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[3.0f32, 4.0]]);
-    /// let y = x.lp_normalize(-1, 2).unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.lp_normalize(-1, 2).unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// // L2 norm of [3,4] = 5, so output ≈ [0.6, 0.8]
     /// assert!((vals[0] - 0.6).abs() < 1e-5);
     /// assert!((vals[1] - 0.8).abs() < 1e-5);
@@ -137,8 +141,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[3.0f32, 4.0]]);
-    /// let y = x.lp_normalize(-1, 1).unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.lp_normalize(-1, 1).unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// // L1 norm of [3,4] = 7, so output ≈ [3/7, 4/7]
     /// assert!((vals[0] - 3.0 / 7.0).abs() < 1e-5);
     /// ```
@@ -163,8 +168,9 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
-    /// let y = x.mean_variance_normalize(&[0, 1], 1e-5).unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.mean_variance_normalize(&[0, 1], 1e-5).unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// // Global mean = 3.5, std ≈ 1.708
     /// assert!((vals[0] - (1.0 - 3.5) / (35.0f32 / 12.0).sqrt()).abs() < 1e-4);
     /// assert!(vals[0] < 0.0);

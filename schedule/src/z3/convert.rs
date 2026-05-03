@@ -119,9 +119,27 @@ impl Z3Context {
             }
 
             Op::Cast { src, dtype } => {
-                // Conservative approximation: create a fresh bounded variable
-                let _src_z3 = self.convert_uop_cached(src, cache)?;
-                self.convert_bounded_from_dtype(dtype.clone())?
+                // Bind the cast result to the source expression so distinct casts of
+                // distinct sources stay distinct in the solver. Without an equality
+                // constraint, two `Op::Cast` nodes both produce fresh unconstrained
+                // vars and z3 can conclude they're equivalent when they aren't.
+                //
+                // The equality is only sound when the source's static range fits
+                // inside the destination dtype's range — for narrowing casts that
+                // wrap or truncate, asserting equality could make the solver
+                // globally UNSAT and falsely "verify" arbitrary equivalences. Fall
+                // back to a fresh bounded var in that case.
+                let src_z3 = self.convert_uop_cached(src, cache)?;
+                let cast_z3 = self.convert_bounded_from_dtype(dtype.clone())?;
+                let (dst_min, dst_max) = dtype_bounds(dtype.clone());
+                let src_fits = match (const_value_to_i64(src.vmin()), const_value_to_i64(src.vmax())) {
+                    (Some(lo), Some(hi)) => lo >= dst_min && hi <= dst_max,
+                    _ => false,
+                };
+                if src_fits && let (Some(s_int), Some(c_int)) = (src_z3.as_int(), cast_z3.as_int()) {
+                    self.solver.assert(c_int.eq(&s_int));
+                }
+                cast_z3
             }
 
             _ => {
@@ -280,6 +298,17 @@ impl Default for Z3Context {
     }
 }
 
+/// Best-effort conversion of `vmin`/`vmax` ConstValues to a signed i64 for
+/// range-fits comparisons. Returns `None` for floats and out-of-range u64.
+fn const_value_to_i64(cv: &ConstValue) -> Option<i64> {
+    match cv {
+        ConstValue::Int(v) => Some(*v),
+        ConstValue::UInt(v) => i64::try_from(*v).ok(),
+        ConstValue::Bool(b) => Some(*b as i64),
+        ConstValue::Float(_) => None,
+    }
+}
+
 /// Get conservative bounds for a dtype.
 fn dtype_bounds(dtype: DType) -> (i64, i64) {
     use morok_dtype::ScalarDType;
@@ -324,41 +353,5 @@ impl std::fmt::Display for ConversionError {
 impl std::error::Error for ConversionError {}
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_convert_const_int() {
-        let mut z3ctx = Z3Context::new();
-
-        let uop = UOp::const_(DType::Int32, ConstValue::Int(42));
-        let z3_expr = z3ctx.convert_uop(&uop).expect("Should convert");
-
-        assert!(z3_expr.as_int().is_some());
-    }
-
-    #[test]
-    fn test_convert_simple_add() {
-        let mut z3ctx = Z3Context::new();
-
-        let a = UOp::const_(DType::Int32, ConstValue::Int(10));
-        let b = UOp::const_(DType::Int32, ConstValue::Int(20));
-        let add = a.try_add(&b).expect("Should create ADD");
-
-        let z3_expr = z3ctx.convert_uop(&add).expect("Should convert");
-        assert!(z3_expr.as_int().is_some());
-    }
-
-    #[test]
-    fn test_convert_variable() {
-        let mut z3ctx = Z3Context::new();
-
-        let var = UOp::var("x", DType::Int32, 0, 100);
-        let z3_expr = z3ctx.convert_uop(&var).expect("Should convert");
-
-        assert!(z3_expr.as_int().is_some());
-
-        // Solver should have constraints for variable bounds
-        assert_eq!(z3ctx.solver.check(), z3::SatResult::Sat);
-    }
-}
+#[path = "../test/unit/z3/convert_internal.rs"]
+mod tests;

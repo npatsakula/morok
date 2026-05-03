@@ -5,26 +5,27 @@
 
 use morok_ir::{Op, UOp};
 
-use crate::rangeify::{KernelContext, run_kernel_split_pipeline};
+use crate::rangeify::{RangeifyBufferContext, try_get_kernel_graph};
 use crate::test::unit::rangeify::helpers::{count_kernels, count_stores};
 
 #[test]
 fn test_single_store_one_kernel() {
-    // Single BUFFERIZE → Should create 1 KERNEL
+    // Single BUFFERIZE → Should create 1 CALL wrapper
     let compute = UOp::native_const(1.0f32);
     let range = UOp::range_const(10, 0);
 
     let bufferize = UOp::bufferize_global(compute, vec![range]);
 
-    let (result, _context) = run_kernel_split_pipeline(bufferize);
+    let (result, _context) =
+        try_get_kernel_graph(bufferize).expect("kernel split pipeline should succeed for single store");
 
-    // Should create exactly 1 KERNEL
+    // Should create exactly 1 callable wrapper
     assert_eq!(count_kernels(&result), 1);
 }
 
 #[test]
 fn test_double_store_two_kernels() {
-    // Two independent BUFFERIZEs → Should create 2 KERNELs
+    // Two independent BUFFERIZEs → Should create 2 CALL wrappers
     let compute1 = UOp::native_const(1.0f32);
     let compute2 = UOp::native_const(2.0f32);
 
@@ -38,15 +39,15 @@ fn test_double_store_two_kernels() {
     // Create a root that references both (e.g., SINK)
     let root = UOp::sink(vec![bufferize1, bufferize2]);
 
-    let (result, _context) = run_kernel_split_pipeline(root);
+    let (result, _context) = try_get_kernel_graph(root).expect("kernel split pipeline should succeed for double store");
 
-    // Should create 2 KERNELs (one per BUFFERIZE)
+    // Should create 2 callable wrappers (one per BUFFERIZE)
     assert_eq!(count_kernels(&result), 2);
 }
 
 #[test]
 fn test_shared_buffer_one_kernel() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Same BUFFERIZE used twice → should reuse buffer
     let compute = UOp::native_const(42i32);
@@ -72,7 +73,7 @@ fn test_shared_buffer_one_kernel() {
 
 #[test]
 fn test_independent_buffers_separate() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Different BUFFERIZEs → separate buffers (BUFFER nodes, not DEFINE_GLOBAL)
     let compute1 = UOp::native_const(1.0f32);
@@ -139,17 +140,18 @@ fn test_pipeline_kernel_count() {
 
     let bufferize = UOp::bufferize_global(compute, vec![range]);
 
-    let (result, _context) = run_kernel_split_pipeline(bufferize);
+    let (result, _context) =
+        try_get_kernel_graph(bufferize).expect("kernel split pipeline should succeed for kernel count");
 
-    // Verify exactly 1 KERNEL was created
+    // Verify exactly 1 callable wrapper was created
     assert_eq!(count_kernels(&result), 1);
 
-    // Verify STORE is inside the KERNEL (wrapped, not bare)
-    // We expect 1 STORE inside the KERNEL body - this is correct!
+    // Verify STORE is inside the CALL body (wrapped, not bare)
+    // We expect 1 STORE inside the CALL body - this is correct!
     // The STORE represents the actual memory write operation.
-    assert_eq!(count_stores(&result), 1, "STORE should be inside KERNEL");
+    assert_eq!(count_stores(&result), 1, "STORE should be inside CALL body");
 
     // Note: After aligning with Tinygrad, buffers may be BUFFER nodes in the graph
     // rather than DEFINE_GLOBAL. The count depends on the pattern rewriting behavior.
-    // The important thing is that we have a valid kernel with sources.
+    // The important thing is that we have a valid callable with sources.
 }

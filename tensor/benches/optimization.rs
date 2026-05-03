@@ -53,7 +53,7 @@ fn bench_matmul(c: &mut Criterion) {
             eprintln!("\n=== HEURISTIC (size={}) ===", size);
             eprintln!("Kernel count: {}", plan_h.kernels().count());
             eprintln!("UOp tree:\n{}", result_h.uop().tree());
-            for (i, kernel) in plan_h.prepared_kernels().iter().enumerate() {
+            for (i, kernel) in plan_h.prepared_kernels().into_iter().enumerate() {
                 eprintln!("UOp tree:\n{}", kernel.ast.tree());
                 eprintln!("  Kernel {}: {}", i, kernel.kernel.entry_point);
                 eprintln!("{}", kernel.kernel.code);

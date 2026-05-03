@@ -1,3 +1,4 @@
+use morok_dtype::DType;
 use morok_tensor::Tensor;
 use snafu::ResultExt;
 
@@ -17,8 +18,8 @@ pub struct CTCHead {
 impl CTCHead {
     pub fn empty(config: &GigaAmConfig) -> Self {
         Self {
-            weight: Tensor::full(&[config.vocab_size, config.d_model, 1], 0.0, morok_dtype::DType::Float32).unwrap(),
-            bias: Tensor::full(&[config.vocab_size], 0.0, morok_dtype::DType::Float32).unwrap(),
+            weight: Tensor::full(&[config.vocab_size, config.d_model, 1], 0.0, DType::Float32).unwrap(),
+            bias: Tensor::full(&[config.vocab_size], 0.0, DType::Float32).unwrap(),
         }
     }
 
@@ -28,6 +29,14 @@ impl CTCHead {
         let y = x.conv2d().weight(&self.weight).bias(&self.bias).call().context(TensorSnafu)?;
         // [B, vocab_size, T] -> [B, T, vocab_size]
         let y = y.try_transpose(-1, -2).context(TensorSnafu)?;
+        // log_softmax operates on the activation dtype to match PyTorch's CTC head;
+        // we only *upcast* sub-fp32 floats (bf16/fp16) to fp32 for numerical
+        // stability. Pinning to the weight dtype was wrong because it would
+        // downcast fp32 activations whenever weights were stored in a smaller
+        // float type, breaking precision end-to-end.
+        let y_dtype = y.uop().dtype();
+        let promoted = if y_dtype.is_float() && y_dtype.bytes() < 4 { DType::Float32 } else { y_dtype.clone() };
+        let y = if promoted != y_dtype { y.cast(promoted).context(TensorSnafu)? } else { y };
         y.log_softmax(-1isize).context(TensorSnafu)
     }
 }

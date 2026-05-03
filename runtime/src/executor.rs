@@ -184,14 +184,21 @@ impl ExecutionGraph {
     /// Returns groups of nodes that can be executed in parallel.
     /// Each group contains nodes with no dependencies on each other.
     pub fn compute_parallel_groups(&mut self) -> Vec<Vec<u64>> {
-        // Build in-degree map
+        // Build in-degree map. Predecessor lists are deduplicated via
+        // sort-and-dedup on a local SmallVec so a node that lists the same
+        // predecessor twice doesn't decrement in-degree more than once during
+        // Kahn's traversal. Successor sets remain HashSet to keep insertion
+        // O(1) when many nodes share predecessors.
         let mut in_degree: HashMap<u64, usize> = HashMap::new();
-        let mut successors: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut successors: HashMap<u64, HashSet<u64>> = HashMap::new();
 
         for node in self.nodes.values() {
             in_degree.entry(node.id).or_insert(0);
-            for &pred in &node.predecessors {
-                successors.entry(pred).or_default().push(node.id);
+            let mut preds: smallvec::SmallVec<[u64; 8]> = node.predecessors.iter().copied().collect();
+            preds.sort_unstable();
+            preds.dedup();
+            for &pred in &preds {
+                successors.entry(pred).or_default().insert(node.id);
                 *in_degree.entry(node.id).or_insert(0) += 1;
             }
         }
@@ -234,94 +241,6 @@ impl ExecutionGraph {
     /// Check if all nodes have been visited (no cycles).
     pub fn is_valid(&self) -> bool {
         self.execution_order.len() == self.nodes.len()
-    }
-
-    /// Find independent kernels that can run in parallel.
-    ///
-    /// Two kernels are independent if:
-    /// 1. Neither depends on the other (no path in DAG)
-    /// 2. They don't write to the same buffer
-    /// 3. One doesn't read what the other writes
-    pub fn find_independent_kernels(&self, node_ids: &[u64]) -> Vec<Vec<u64>> {
-        if node_ids.len() <= 1 {
-            return vec![node_ids.to_vec()];
-        }
-
-        // Build conflict map (which nodes conflict with which)
-        let mut conflicts: HashMap<u64, HashSet<u64>> = HashMap::new();
-
-        for &id1 in node_ids {
-            for &id2 in node_ids {
-                if id1 >= id2 {
-                    continue;
-                }
-
-                let node1 = match self.nodes.get(&id1) {
-                    Some(n) => n,
-                    None => continue,
-                };
-                let node2 = match self.nodes.get(&id2) {
-                    Some(n) => n,
-                    None => continue,
-                };
-
-                // Check for output conflicts
-                let outputs1: HashSet<_> = node1.outputs.iter().collect();
-                let outputs2: HashSet<_> = node2.outputs.iter().collect();
-
-                // Same output buffer = conflict
-                if !outputs1.is_disjoint(&outputs2) {
-                    conflicts.entry(id1).or_default().insert(id2);
-                    conflicts.entry(id2).or_default().insert(id1);
-                    continue;
-                }
-
-                // Read-write conflict
-                let inputs1: HashSet<_> = node1.inputs.iter().collect();
-                let inputs2: HashSet<_> = node2.inputs.iter().collect();
-
-                if !inputs1.is_disjoint(&outputs2) || !inputs2.is_disjoint(&outputs1) {
-                    conflicts.entry(id1).or_default().insert(id2);
-                    conflicts.entry(id2).or_default().insert(id1);
-                    continue;
-                }
-
-                // Check DAG dependency (predecessor relationship)
-                if node1.predecessors.contains(&id2) || node2.predecessors.contains(&id1) {
-                    conflicts.entry(id1).or_default().insert(id2);
-                    conflicts.entry(id2).or_default().insert(id1);
-                }
-            }
-        }
-
-        // Greedy graph coloring to find independent sets
-        let mut groups: Vec<Vec<u64>> = Vec::new();
-        let mut assigned: HashSet<u64> = HashSet::new();
-
-        for &id in node_ids {
-            if assigned.contains(&id) {
-                continue;
-            }
-
-            // Try to add to existing group
-            let mut added = false;
-            for group in &mut groups {
-                let node_conflicts = conflicts.get(&id).cloned().unwrap_or_default();
-                if group.iter().all(|&g| !node_conflicts.contains(&g)) {
-                    group.push(id);
-                    assigned.insert(id);
-                    added = true;
-                    break;
-                }
-            }
-
-            if !added {
-                groups.push(vec![id]);
-                assigned.insert(id);
-            }
-        }
-
-        groups
     }
 }
 
@@ -554,39 +473,6 @@ impl UnifiedExecutor {
 
         Ok(timeline)
     }
-
-    /// Check if kernels can be executed in parallel.
-    ///
-    /// Returns true if the kernels have no conflicting buffer accesses.
-    /// This is used by the parallel execution path.
-    pub fn can_parallelize(&self, kernels: &[(u64, &[&Buffer], &[usize])]) -> bool {
-        // Check for output buffer conflicts
-        let mut output_buffers: HashSet<morok_device::BufferId> = HashSet::new();
-
-        for (_kernel_id, buffers, output_indices) in kernels {
-            for &idx in *output_indices {
-                let buf_id = buffers[idx].id();
-                if output_buffers.contains(&buf_id) {
-                    return false; // Same buffer written by multiple kernels
-                }
-                output_buffers.insert(buf_id);
-            }
-        }
-
-        // Check for read-write conflicts (output of one is input of another)
-        for (_kernel_id, buffers, output_indices) in kernels {
-            for (i, buffer) in buffers.iter().enumerate() {
-                if !output_indices.contains(&i) {
-                    // This is an input buffer
-                    if output_buffers.contains(&buffer.id()) {
-                        return false; // Reading a buffer being written
-                    }
-                }
-            }
-        }
-
-        true
-    }
 }
 
 /// Global executor instance.
@@ -602,226 +488,5 @@ pub fn global_executor() -> parking_lot::MutexGuard<'static, UnifiedExecutor> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_sync_strategy() {
-        assert_eq!(UnifiedExecutor::sync_strategy(&DeviceSpec::Cpu, &DeviceSpec::Cpu), SyncStrategy::None);
-
-        assert_eq!(
-            UnifiedExecutor::sync_strategy(&DeviceSpec::Cuda { device_id: 0 }, &DeviceSpec::Cuda { device_id: 1 }),
-            SyncStrategy::PeerToPeer
-        );
-
-        assert_eq!(
-            UnifiedExecutor::sync_strategy(&DeviceSpec::Cpu, &DeviceSpec::Cuda { device_id: 0 }),
-            SyncStrategy::CpuMediated
-        );
-    }
-
-    #[test]
-    fn test_executor_creation() {
-        let registry = morok_device::registry::registry();
-        let executor = UnifiedExecutor::new(registry);
-        assert!(executor.contexts.is_empty());
-    }
-
-    #[test]
-    fn test_execution_graph_empty() {
-        let mut graph = ExecutionGraph::new();
-        let groups = graph.compute_parallel_groups();
-        assert!(groups.is_empty());
-        assert!(graph.is_valid());
-    }
-
-    #[test]
-    fn test_execution_graph_single_node() {
-        let mut graph = ExecutionGraph::new();
-        graph.add_node(ExecutionNode {
-            id: 1,
-            device: DeviceSpec::Cpu,
-            inputs: vec![],
-            outputs: vec![BufferId(100)],
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-
-        let groups = graph.compute_parallel_groups();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0], vec![1]);
-        assert!(graph.is_valid());
-    }
-
-    #[test]
-    fn test_execution_graph_linear_chain() {
-        let mut graph = ExecutionGraph::new();
-
-        // A → B → C (linear dependency)
-        graph.add_node(ExecutionNode {
-            id: 1,
-            device: DeviceSpec::Cpu,
-            inputs: vec![],
-            outputs: vec![BufferId(100)],
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-        graph.add_node(ExecutionNode {
-            id: 2,
-            device: DeviceSpec::Cpu,
-            inputs: vec![BufferId(100)],
-            outputs: vec![BufferId(101)],
-            predecessors: vec![1],
-            is_transfer: false,
-            buffer_access: None,
-        });
-        graph.add_node(ExecutionNode {
-            id: 3,
-            device: DeviceSpec::Cpu,
-            inputs: vec![BufferId(101)],
-            outputs: vec![BufferId(102)],
-            predecessors: vec![2],
-            is_transfer: false,
-            buffer_access: None,
-        });
-
-        let groups = graph.compute_parallel_groups();
-        assert_eq!(groups.len(), 3); // Each node in its own group (no parallelism)
-        assert!(graph.is_valid());
-    }
-
-    #[test]
-    fn test_execution_graph_parallel_nodes() {
-        let mut graph = ExecutionGraph::new();
-
-        // A and B are independent, both feed into C
-        //   A ──┐
-        //       └──→ C
-        //   B ──┘
-        graph.add_node(ExecutionNode {
-            id: 1,
-            device: DeviceSpec::Cpu,
-            inputs: vec![],
-            outputs: vec![BufferId(100)],
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-        graph.add_node(ExecutionNode {
-            id: 2,
-            device: DeviceSpec::Cpu,
-            inputs: vec![],
-            outputs: vec![BufferId(101)],
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-        graph.add_node(ExecutionNode {
-            id: 3,
-            device: DeviceSpec::Cpu,
-            inputs: vec![BufferId(100), BufferId(101)],
-            outputs: vec![BufferId(102)],
-            predecessors: vec![1, 2],
-            is_transfer: false,
-            buffer_access: None,
-        });
-
-        let groups = graph.compute_parallel_groups();
-        assert_eq!(groups.len(), 2); // First group has A,B; second has C
-        assert!(groups[0].contains(&1));
-        assert!(groups[0].contains(&2));
-        assert_eq!(groups[1], vec![3]);
-        assert!(graph.is_valid());
-    }
-
-    #[test]
-    fn test_find_independent_kernels() {
-        let mut graph = ExecutionGraph::new();
-
-        // Two independent kernels
-        graph.add_node(ExecutionNode {
-            id: 1,
-            device: DeviceSpec::Cpu,
-            inputs: vec![BufferId(100)],
-            outputs: vec![BufferId(200)],
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-        graph.add_node(ExecutionNode {
-            id: 2,
-            device: DeviceSpec::Cpu,
-            inputs: vec![BufferId(101)],
-            outputs: vec![BufferId(201)],
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-
-        let independent = graph.find_independent_kernels(&[1, 2]);
-        // Both should be in the same group since they have no conflicts
-        assert_eq!(independent.len(), 1);
-        assert!(independent[0].contains(&1));
-        assert!(independent[0].contains(&2));
-    }
-
-    #[test]
-    fn test_find_independent_kernels_with_conflict() {
-        let mut graph = ExecutionGraph::new();
-
-        // Two kernels writing to same buffer = conflict
-        graph.add_node(ExecutionNode {
-            id: 1,
-            device: DeviceSpec::Cpu,
-            inputs: vec![BufferId(100)],
-            outputs: vec![BufferId(200)], // Same output
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-        graph.add_node(ExecutionNode {
-            id: 2,
-            device: DeviceSpec::Cpu,
-            inputs: vec![BufferId(101)],
-            outputs: vec![BufferId(200)], // Same output
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-
-        let independent = graph.find_independent_kernels(&[1, 2]);
-        // Should be in different groups due to output conflict
-        assert_eq!(independent.len(), 2);
-    }
-
-    #[test]
-    fn test_find_independent_kernels_read_write_conflict() {
-        let mut graph = ExecutionGraph::new();
-
-        // One kernel writes to buffer that another reads = conflict
-        graph.add_node(ExecutionNode {
-            id: 1,
-            device: DeviceSpec::Cpu,
-            inputs: vec![BufferId(100)],
-            outputs: vec![BufferId(200)],
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-        graph.add_node(ExecutionNode {
-            id: 2,
-            device: DeviceSpec::Cpu,
-            inputs: vec![BufferId(200)], // Reads output of kernel 1
-            outputs: vec![BufferId(201)],
-            predecessors: vec![],
-            is_transfer: false,
-            buffer_access: None,
-        });
-
-        let independent = graph.find_independent_kernels(&[1, 2]);
-        // Should be in different groups due to read-write conflict
-        assert_eq!(independent.len(), 2);
-    }
-}
+#[path = "test/unit/executor.rs"]
+mod tests;

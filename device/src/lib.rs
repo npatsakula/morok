@@ -33,8 +33,9 @@ pub mod registry;
 pub mod sync;
 
 pub use buffer::{Buffer, BufferId};
+pub use device::Program;
 pub use error::{Error, Result};
-pub use queue::{DynQueue, ExecParams, HardwareQueue, Program, QueueFactory};
+pub use queue::{DynQueue, ExecParams, HardwareQueue, QueueFactory};
 pub use sync::{CpuTimelineSignal, TimelineSignal};
 
 #[cfg(test)]

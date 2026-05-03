@@ -18,6 +18,7 @@
 use std::sync::{Arc, OnceLock};
 
 use morok_device::device::Program;
+use morok_ir::UOp;
 use papaya::HashMap;
 
 /// Cached kernel that can be reused across tensors.
@@ -45,23 +46,16 @@ pub struct CachedKernel {
     /// Input buffer slots read by LOAD operations.
     /// Matches Tinygrad's ProgramSpec.ins semantics.
     pub ins: Vec<usize>,
-    /// Whether this program can be invoked concurrently from multiple host threads.
+    /// Whether host-level scheduling may overlap this program with other kernels.
     ///
-    /// The `Program` trait itself does not require thread safety. We only allow
-    /// host-level parallel kernel execution when this flag is true.
+    /// Thread-safety is required by the `Program` trait. This flag is about
+    /// backend/kernel semantics, not Rust synchronization safety.
     pub host_parallel_safe: bool,
-    /// Global work size for dispatch (GPU backends, CPU threading).
-    /// For CPU threading: [thread_count, 1, 1]
-    pub global_size: Option<[usize; 3]>,
-    /// Local work size for dispatch (GPU backends).
-    pub local_size: Option<[usize; 3]>,
+    /// Symbolic global work size evaluated with runtime vars before dispatch.
+    pub global_size: [Arc<UOp>; 3],
+    /// Symbolic local work size. None means direct global-id execution.
+    pub local_size: Option<[Arc<UOp>; 3]>,
 }
-
-// SAFETY: CachedKernel is immutable after construction.
-// Host-level parallel dispatch is additionally gated at execution time via
-// `host_parallel_safe`, so non-thread-safe backends still execute serially.
-unsafe impl Send for CachedKernel {}
-unsafe impl Sync for CachedKernel {}
 
 /// Cache key: (AST ID, device string).
 ///
@@ -142,7 +136,7 @@ pub fn clear_all() {
 
 /// Remove kernels whose AST IDs are no longer in the live UOp set.
 ///
-/// Call this after `gc_unused_uops()` to clean up compiled kernels for
+/// Call this after `gc_dead_refs()` to clean up compiled kernels for
 /// discarded UOps. This prevents kernel cache memory accumulation during
 /// beam search and other optimization passes.
 ///
@@ -153,7 +147,7 @@ pub fn clear_all() {
 /// # Example
 ///
 /// ```ignore
-/// morok_ir::uop::gc_unused_uops();
+/// morok_ir::uop::gc_dead_refs();
 /// let live_ids = morok_ir::uop::live_uop_ids();
 /// morok_runtime::kernel_cache::gc_unused_kernels(&live_ids);
 /// ```

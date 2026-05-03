@@ -3,7 +3,7 @@ use std::sync::Arc;
 use morok_ir::{Op, UOp};
 
 use crate::rangeify::kernel::split_store;
-use crate::rangeify::{KernelContext, bufferize_to_store};
+use crate::rangeify::{RangeifyBufferContext, bufferize_to_store};
 #[allow(unused_imports)]
 use crate::test::unit::rangeify::helpers::extract_kernel;
 
@@ -15,7 +15,7 @@ fn call_split_store(x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 #[test]
 fn test_bufferize_to_store_global() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a simple BUFFERIZE with one range
     let compute = UOp::native_const(42.0f32);
@@ -78,7 +78,7 @@ fn test_bufferize_to_store_global() {
 
 #[test]
 fn test_bufferize_to_store_local_with_barrier() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create BUFFERIZE with LOCAL addrspace
     let compute = UOp::native_const(1.0f32);
@@ -139,7 +139,7 @@ fn test_bufferize_to_store_local_with_barrier() {
 #[test]
 #[should_panic(expected = "unexpected multi-range")]
 fn test_bufferize_to_store_multiple_ranges() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create BUFFERIZE with multiple ranges
     let compute = UOp::native_const(100i32);
@@ -204,7 +204,7 @@ fn test_bufferize_to_store_multiple_ranges() {
 
 #[test]
 fn test_non_bufferize_returns_none() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a non-BUFFERIZE operation
     let const_op = UOp::native_const(1.0f32);
@@ -216,7 +216,7 @@ fn test_non_bufferize_returns_none() {
 
 #[test]
 fn test_buffer_tracked_in_context() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     let compute = UOp::native_const(1.0f32);
     let bufferize = UOp::bufferize_global(compute, vec![]);
@@ -243,7 +243,7 @@ fn test_buffer_tracked_in_context() {
 
 #[test]
 fn test_bufferize_to_store_sequential_global_ids() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create three BUFFERIZE operations
     for i in 0..3 {
@@ -262,7 +262,7 @@ fn test_bufferize_to_store_sequential_global_ids() {
 
 #[test]
 fn test_bufferize_to_store_sequential_local_ids() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create three BUFFERIZE operations with LOCAL addrspace
     for i in 0..3 {
@@ -279,7 +279,7 @@ fn test_bufferize_to_store_sequential_local_ids() {
 
 #[test]
 fn test_bufferize_to_store_mixed_global_local() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     let global_compute = UOp::native_const(1.0f32);
     let local_compute = UOp::native_const(2.0f32);
@@ -348,7 +348,7 @@ fn test_bufferize_to_store_mixed_global_local() {
 
 #[test]
 fn test_bufferize_to_store_integration_with_split_kernel() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a BUFFERIZE operation with non-OUTER range
     // split_store skips END operations with OUTER ranges (control flow markers)
@@ -379,20 +379,21 @@ fn test_bufferize_to_store_integration_with_split_kernel() {
     assert_eq!(end_ranges.len(), 1);
     assert!(matches!(computation.op(), Op::Store { .. }), "Expected STORE inside END");
 
-    // Stage 2: split_store transforms END(STORE) to KERNEL
-    // The BUFFER node will be converted to DEFINE_GLOBAL inside the KERNEL
-    let kernel = call_split_store(end_op).expect("split_store should create a KERNEL");
+    // Stage 2: split_store transforms END(STORE) to END(CALL)
+    // The BUFFER node will be converted to DEFINE_GLOBAL inside the CALL body
+    let kernel = call_split_store(end_op).expect("split_store should create a CALL");
+    let kernel = extract_kernel(&kernel).expect("split_store should return CALL or END(CALL)");
 
-    // Verify KERNEL structure
-    let Op::Kernel { sources, ast } = kernel.op() else {
-        panic!("Expected KERNEL operation, got {:?}", kernel.op());
+    // Verify CALL structure
+    let Op::Call { args: sources, body: ast, .. } = kernel.op() else {
+        panic!("Expected CALL operation, got {:?}", kernel.op());
     };
 
-    // KERNEL sources should contain the BUFFER (mapped to itself by local_to_param_patterns)
-    assert!(!sources.is_empty(), "KERNEL should have at least one source");
+    // CALL sources should contain the BUFFER (mapped to itself by local_to_param_patterns)
+    assert!(!sources.is_empty(), "CALL should have at least one source");
 
     // AST should be SINK wrapping the transformed computation
-    let Op::Sink { sources: sink_sources } = ast.op() else {
+    let Op::Sink { sources: sink_sources, .. } = ast.op() else {
         panic!("Expected SINK operation in kernel AST, got {:?}", ast.op());
     };
     assert_eq!(sink_sources.len(), 1, "SINK should have 1 source");

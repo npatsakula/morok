@@ -83,6 +83,12 @@ impl UOp {
         Self::new(Op::Unique(id), DType::Void)
     }
 
+    /// Create a normalized unique identifier for cache-key parity.
+    pub fn lunique(num: Option<usize>) -> Arc<Self> {
+        let id = num.unwrap_or_else(next_unique_id);
+        Self::new(Op::LUnique(id), DType::Void)
+    }
+
     /// Create a new buffer.
     ///
     /// Equivalent to: `UOp(Ops.BUFFER, dtype, (unique(), device(device_spec)), size)`

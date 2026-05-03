@@ -31,7 +31,7 @@
 //! use morok_ir::pattern::SimplifiedPatternMatcher;
 //!
 //! // Create context
-//! let mut ctx = KernelContext::new();
+//! let mut ctx = MyContext::new();
 //!
 //! // Create matcher using the patterns! macro
 //! let matcher = patterns! {
@@ -52,11 +52,49 @@
 //! let result = graph_rewrite(&matcher, root, &mut ());
 //! ```
 
-use crate::{UOp, UOpKey};
+use crate::{Op, UOp, UOpKey};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::pattern::{Matcher, RewriteResult};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TraversalMode {
+    Full,
+    PreserveCallBodies,
+}
+
+fn traversal_children(node: &Arc<UOp>, mode: TraversalMode) -> (Vec<Arc<UOp>>, Vec<Arc<UOp>>) {
+    if mode == TraversalMode::Full {
+        return (node.op().sources().into_iter().collect(), Vec::new());
+    }
+
+    match node.op() {
+        Op::Call { body, args, .. } | Op::Function { body, args, .. } => {
+            (args.iter().cloned().collect(), vec![body.clone()])
+        }
+        // Program holds compiled artifacts (linear/source/binary) wrapped as
+        // UOps; traversing through them during rewrite passes is expensive
+        // and unnecessary — only the device producer is traversed.
+        Op::Program { sink, device, linear, source, binary } => {
+            let mut skipped = Vec::with_capacity(
+                1 + usize::from(linear.is_some()) + usize::from(source.is_some()) + usize::from(binary.is_some()),
+            );
+            skipped.push(sink.clone());
+            if let Some(linear) = linear {
+                skipped.push(linear.clone());
+            }
+            if let Some(source) = source {
+                skipped.push(source.clone());
+            }
+            if let Some(binary) = binary {
+                skipped.push(binary.clone());
+            }
+            (vec![device.clone()], skipped)
+        }
+        _ => (node.op().sources().into_iter().collect(), Vec::new()),
+    }
+}
 
 /// Maximum stack size before we consider the rewrite to be in an infinite loop.
 const REWRITE_STACK_LIMIT: usize = 500_000;
@@ -93,6 +131,9 @@ where
     /// Mutable reference to context passed through to patterns.
     ctx: &'a mut C,
 
+    /// Traversal mode controlling CALL/FUNCTION/PROGRAM boundary handling.
+    traversal_mode: TraversalMode,
+
     /// Results cache: maps original node → optimized result.
     replace: HashMap<UOpKey, Arc<UOp>>,
 
@@ -105,8 +146,8 @@ where
     PM: Matcher<C>,
     BPM: Matcher<C>,
 {
-    fn new(pm: Option<&'a PM>, bpm: Option<&'a BPM>, ctx: &'a mut C) -> Self {
-        Self { pm, bpm, ctx, replace: HashMap::new(), bpm_cache: HashMap::new() }
+    fn new(pm: Option<&'a PM>, bpm: Option<&'a BPM>, ctx: &'a mut C, traversal_mode: TraversalMode) -> Self {
+        Self { pm, bpm, ctx, traversal_mode, replace: HashMap::new(), bpm_cache: HashMap::new() }
     }
 
     /// Single-shot top-down pattern application.
@@ -243,13 +284,17 @@ where
 
                 stack.push(Entry { n: n.clone(), stage: 1, new_n: working.clone() });
 
-                let sources = working.op().sources();
-                for child in sources.iter().rev() {
+                let (sources, skipped) = traversal_children(&working, self.traversal_mode);
+                for skipped_child in skipped {
+                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert(skipped_child);
+                }
+
+                for child in sources.into_iter().rev() {
                     let child_key = UOpKey(child.clone());
                     if on_stack.contains(&child_key) {
                         continue;
                     }
-                    stack.push(Entry { n: child.clone(), stage: 0, new_n: child.clone() });
+                    stack.push(Entry { n: child.clone(), stage: 0, new_n: child });
                     on_stack.insert(child_key);
                 }
             } else if stage == 1 {
@@ -326,6 +371,84 @@ where
 
         self.replace.get(&UOpKey(root.clone())).cloned().unwrap_or(root)
     }
+
+    /// MLIR-style walk pattern rewrite driver — single-pass, no re-traversal.
+    ///
+    /// Differs from [`Self::rewrite`] in two ways:
+    /// 1. `bpm` is applied **once** per node — no fixed-point loop.
+    /// 2. When a pattern returns a replacement, the replacement is **not**
+    ///    traversed: its children are never visited and `pm` is not re-applied.
+    ///
+    /// Use this when a replacement contains the original key, e.g.
+    /// `Buffer → After(Buffer, [Store(...)])` for view-assign, where
+    /// re-traversal would loop or wrap the key multiple times.
+    fn walk_rewrite(&mut self, root: Arc<UOp>) -> Arc<UOp> {
+        let mut stack: Vec<(Arc<UOp>, bool)> = vec![(root.clone(), false)];
+
+        while let Some((n, processed)) = stack.pop() {
+            if stack.len() > REWRITE_STACK_LIMIT {
+                panic!(
+                    "infinite loop in walk_rewrite (stack too big: {}). results cached: {}",
+                    stack.len(),
+                    self.replace.len(),
+                );
+            }
+
+            let n_key = UOpKey(n.clone());
+            if self.replace.contains_key(&n_key) {
+                continue;
+            }
+
+            if !processed {
+                // Try bpm exactly once on the original node. On match, record the
+                // replacement and skip descent — the replacement is treated as a
+                // leaf even if it contains the original key.
+                if self.bpm.is_some() {
+                    match self.cached_bpm_rewrite(&n) {
+                        Ok(Some(rewritten)) => {
+                            self.record_replace(&n, rewritten);
+                            continue;
+                        }
+                        Err(gated) => {
+                            self.record_replace(&n, gated);
+                            continue;
+                        }
+                        Ok(None) => {}
+                    }
+                }
+
+                // No bpm match — process children, then come back to rebuild.
+                stack.push((n.clone(), true));
+
+                let (sources, skipped) = traversal_children(&n, self.traversal_mode);
+                for skipped_child in skipped {
+                    self.replace.entry(UOpKey(skipped_child.clone())).or_insert(skipped_child);
+                }
+                for child in sources.into_iter().rev() {
+                    let child_key = UOpKey(child.clone());
+                    if !self.replace.contains_key(&child_key) {
+                        stack.push((child, false));
+                    }
+                }
+            } else {
+                // Rebuild with rewritten sources.
+                let sources = n.op().sources();
+                let new_src: Vec<Arc<UOp>> = sources
+                    .iter()
+                    .map(|s| self.replace.get(&UOpKey(s.clone())).cloned().unwrap_or_else(|| s.clone()))
+                    .collect();
+                let any_changed = new_src.iter().zip(sources.iter()).any(|(a, b)| !Arc::ptr_eq(a, b));
+                let rebuilt = if any_changed { n.with_sources(new_src) } else { n.clone() };
+
+                // Apply pm exactly once on the rebuilt node — replacement is used as-is.
+                let final_n = if self.pm.is_some() { self.pm_rewrite(&rebuilt).unwrap_or(rebuilt) } else { rebuilt };
+
+                self.record_replace(&n, final_n);
+            }
+        }
+
+        self.replace.get(&UOpKey(root.clone())).cloned().unwrap_or(root)
+    }
 }
 
 /// Marker type for "no matcher" in generic contexts.
@@ -339,13 +462,22 @@ impl<C> Matcher<C> for NoMatcher {
 
 /// Apply graph rewriting. Patterns see **OPTIMIZED** children (Stage 1).
 pub fn graph_rewrite<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
-    RewriteEngine::new(Some(matcher), None::<&NoMatcher>, ctx).rewrite(root)
+    RewriteEngine::new(Some(matcher), None::<&NoMatcher>, ctx, TraversalMode::Full).rewrite(root)
 }
 
 /// Apply graph rewriting with bottom-up pattern application.
 /// Patterns see **ORIGINAL** children (Stage 0).
 pub fn graph_rewrite_bottom_up<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
-    RewriteEngine::new(None::<&NoMatcher>, Some(matcher), ctx).rewrite(root)
+    RewriteEngine::new(None::<&NoMatcher>, Some(matcher), ctx, TraversalMode::Full).rewrite(root)
+}
+
+/// MLIR-style walk pattern rewrite — single-pass, no re-traversal.
+///
+/// Use when a replacement may contain the original key (e.g.
+/// `Buffer → After(Buffer, [Store(...)])` for view-assign): a re-traversing
+/// driver would loop or wrap the key multiple times.
+pub fn graph_rewrite_walk<M: Matcher<C>, C>(matcher: &M, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp> {
+    RewriteEngine::new(None::<&NoMatcher>, Some(matcher), ctx, TraversalMode::Full).walk_rewrite(root)
 }
 
 /// Apply graph rewriting with both top-down and bottom-up patterns.
@@ -356,5 +488,43 @@ where
     PM: Matcher<C>,
     BPM: Matcher<C>,
 {
-    RewriteEngine::new(Some(pm), Some(bpm), ctx).rewrite(root)
+    RewriteEngine::new(Some(pm), Some(bpm), ctx, TraversalMode::Full).rewrite(root)
+}
+
+/// Apply graph rewriting with both top-down and bottom-up patterns while preserving
+/// CALL/FUNCTION/PROGRAM boundaries.
+/// - `bpm` patterns see ORIGINAL children (Stage 0)
+/// - `pm` patterns see OPTIMIZED children (Stage 1)
+/// - Traversal skips CALL/FUNCTION bodies and PROGRAM internals
+/// - CALL/FUNCTION args and PROGRAM device are still traversed
+pub fn graph_rewrite_with_bpm_preserve_calls<PM, BPM, C>(pm: &PM, bpm: &BPM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
+where
+    PM: Matcher<C>,
+    BPM: Matcher<C>,
+{
+    RewriteEngine::new(Some(pm), Some(bpm), ctx, TraversalMode::PreserveCallBodies).rewrite(root)
+}
+
+/// Rewrite graph while preserving CALL/FUNCTION/PROGRAM boundaries.
+///
+/// CALL/FUNCTION/PROGRAM nodes are still matchable/rewriteable, but traversal
+/// does not descend into CALL/FUNCTION bodies or PROGRAM internals.
+/// CALL/FUNCTION arguments and PROGRAM device are still traversed.
+pub fn graph_rewrite_preserve_calls<PM, C>(pm: &PM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
+where
+    PM: Matcher<C>,
+{
+    RewriteEngine::new(Some(pm), None::<&NoMatcher>, ctx, TraversalMode::PreserveCallBodies).rewrite(root)
+}
+
+/// Bottom-up rewrite with CALL/FUNCTION/PROGRAM boundary preservation.
+///
+/// CALL/FUNCTION/PROGRAM nodes are still matchable/rewriteable, but traversal
+/// does not descend into CALL/FUNCTION bodies or PROGRAM internals.
+/// CALL/FUNCTION arguments and PROGRAM device are still traversed.
+pub fn graph_rewrite_bottom_up_preserve_calls<BPM, C>(bpm: &BPM, root: Arc<UOp>, ctx: &mut C) -> Arc<UOp>
+where
+    BPM: Matcher<C>,
+{
+    RewriteEngine::new(None::<&NoMatcher>, Some(bpm), ctx, TraversalMode::PreserveCallBodies).rewrite(root)
 }

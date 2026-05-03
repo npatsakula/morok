@@ -494,13 +494,13 @@ fn has_unsafe_ops_before_reduce(reduce_op: &Arc<UOp>) -> bool {
 ///
 /// THREAD works like GPU's GLOBAL but for CPU: instead of GPU thread blocks,
 /// we use OS threads (via rayon). The work partition is baked into index
-/// expressions at optimization time - runtime just provides thread_id.
+/// expressions at optimization time - runtime just provides core_id.
 ///
 /// # Safety
 ///
 /// Buffer safety is guaranteed by shift_to() transformation:
-/// - Each thread_id maps to disjoint output indices
-/// - Index formula: `output[thread_id * chunk_size + local_idx]`
+/// - Each core_id maps to disjoint output indices
+/// - Index formula: `output[core_id * chunk_size + local_idx]`
 /// - Same buffer pointers can be safely passed to all threads
 fn apply_thread(scheduler: &mut Scheduler, rng: Arc<UOp>, amount: usize) -> Result<(), OptError> {
     // Validate renderer supports threads

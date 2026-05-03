@@ -554,12 +554,13 @@ fn test_densenet_two_layer_kernel_count() {
     let uop = result.uop();
     let sink = morok_ir::UOp::sink(vec![uop.clone()]);
     // Normalize Buffer→Param before rangeify (matches real pipeline)
-    let (sink, _param_buffers) = crate::realize::normalize_buffers_to_params(&sink);
-    let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(sink, None).unwrap();
-    let (kernels_root, _kctx) = morok_schedule::rangeify::run_kernel_split_pipeline(rangeified);
+    let normalization = crate::realize::normalize_for_schedule_cache(&sink).expect("normalize schedule cache");
+    let (rangeified, _ctx) = morok_schedule::rangeify::rangeify(normalization.normalized, None).unwrap();
+    let (kernels_root, _kctx) = morok_schedule::rangeify::try_get_kernel_graph(rangeified)
+        .expect("kernel split pipeline should succeed for dense layer kernel count");
 
     let kernels: Vec<_> =
-        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Kernel { .. })).collect();
+        kernels_root.toposort().into_iter().filter(|n| matches!(n.op(), morok_ir::Op::Call { .. })).collect();
 
     // 6 kernels matching Tinygrad: BN+ReLU, Conv1x1+BN+ReLU, Conv3x3+Cat (×2 layers)
     assert_eq!(kernels.len(), 6, "Expected 6 kernels for 2 dense layers, got {}", kernels.len());

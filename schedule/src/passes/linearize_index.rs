@@ -35,8 +35,13 @@ use crate::TypedPatternMatcher;
 
 /// Count divmod operations (Idiv + Mod) in an expression tree.
 ///
-/// Ported from Tinygrad `simplify.py:14-18` (`count_divmod`).
-/// Used to decide whether merging/linearizing indices reduces complexity.
+/// The helper itself is ported from Tinygrad `simplify.py` `count_divmod`,
+/// where it gates END/REDUCE range merging in `simplify_merge_adjacent`.
+/// Morok reuses the same complexity proxy to decide whether multi-index
+/// INDEX flattening introduces redundant `%` / `//` chains; that
+/// flattening pass is Morok-specific (tinygrad backends consume multi-
+/// index INDEX directly), so the borrowed metric is the only Tinygrad
+/// link here.
 pub fn count_divmod(uop: &Arc<UOp>) -> usize {
     uop.toposort().iter().filter(|n| matches!(n.op(), Op::Binary(BinaryOp::Idiv | BinaryOp::Mod, _, _))).count()
 }
@@ -149,6 +154,50 @@ fn extract_dim_from_validity(cond: &Arc<UOp>, true_val: &Arc<UOp>) -> Option<i64
     }
 }
 
+fn as_index_expr(expr: Arc<UOp>) -> Arc<UOp> {
+    if expr.dtype() == DType::Index { expr } else { expr.cast(DType::Index) }
+}
+
+fn extract_index_dimension_expr(idx_uop: &Arc<UOp>) -> Option<Arc<UOp>> {
+    // Case 0: WHERE(cond, idx, Invalid) from PAD
+    if let Op::Ternary(morok_ir::TernaryOp::Where, cond, true_val, false_val) = idx_uop.op()
+        && matches!(false_val.op(), Op::Invalid)
+    {
+        return extract_dim_from_validity(cond, true_val).map(UOp::index_const);
+    }
+
+    // Case 1: Direct RANGE - use its end expression directly (supports symbolic).
+    if let Op::Range { end, .. } = idx_uop.op() {
+        return Some(as_index_expr(end.clone()));
+    }
+
+    // Case 2: DefineVar - conservative bound fallback.
+    if let Op::DefineVar { max_val, .. } = idx_uop.op() {
+        return Some(UOp::index_const(*max_val + 1));
+    }
+
+    // Case 3: Expression containing RANGE ops - multiply all RANGE ends.
+    let mut product: Option<Arc<UOp>> = None;
+    for node in idx_uop.toposort() {
+        if let Op::Range { end, .. } = node.op() {
+            let dim = as_index_expr(end.clone());
+            product = Some(match product {
+                None => dim,
+                Some(acc) => mul_index_expr(acc, dim),
+            });
+        }
+    }
+    if product.is_some() {
+        return product;
+    }
+
+    // Fallback: vmin/vmax range analysis for fully concrete bounds.
+    match (idx_uop.vmin(), idx_uop.vmax()) {
+        (ConstValue::Int(min), ConstValue::Int(max)) if max >= min => Some(UOp::index_const(max - min + 1)),
+        _ => None,
+    }
+}
+
 /// Extract an i64 constant from a UOp.
 fn const_int(uop: &Arc<UOp>) -> Option<i64> {
     if let Op::Const(cv) = uop.op()
@@ -157,6 +206,43 @@ fn const_int(uop: &Arc<UOp>) -> Option<i64> {
         return Some(v);
     }
     None
+}
+
+fn const_index_value(uop: &Arc<UOp>) -> Option<i64> {
+    if let Op::Const(cv) = uop.op() {
+        match cv.0 {
+            ConstValue::Int(v) => Some(v),
+            ConstValue::UInt(v) => i64::try_from(v).ok(),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+fn mul_index_expr(lhs: Arc<UOp>, rhs: Arc<UOp>) -> Arc<UOp> {
+    match (const_index_value(&lhs), const_index_value(&rhs)) {
+        (Some(0), _) | (_, Some(0)) => UOp::index_const(0),
+        (Some(1), _) => rhs,
+        (_, Some(1)) => lhs,
+        (Some(a), Some(b)) => a
+            .checked_mul(b)
+            .map(UOp::index_const)
+            .unwrap_or_else(|| UOp::new(Op::Binary(BinaryOp::Mul, lhs, rhs), DType::Index)),
+        _ => UOp::new(Op::Binary(BinaryOp::Mul, lhs, rhs), DType::Index),
+    }
+}
+
+fn add_index_expr(lhs: Arc<UOp>, rhs: Arc<UOp>) -> Arc<UOp> {
+    match (const_index_value(&lhs), const_index_value(&rhs)) {
+        (Some(0), _) => rhs,
+        (_, Some(0)) => lhs,
+        (Some(a), Some(b)) => a
+            .checked_add(b)
+            .map(UOp::index_const)
+            .unwrap_or_else(|| UOp::new(Op::Binary(BinaryOp::Add, lhs, rhs), DType::Index)),
+        _ => UOp::new(Op::Binary(BinaryOp::Add, lhs, rhs), DType::Index),
+    }
 }
 
 /// Extract begin and upper bounds from a pair that might be (CMPGE, CMPLT).
@@ -183,6 +269,14 @@ pub fn compute_row_major_strides(dims: &[i64]) -> Vec<i64> {
     strides
 }
 
+fn compute_row_major_strides_expr(dims: &[Arc<UOp>]) -> Vec<Arc<UOp>> {
+    let mut strides: Vec<Arc<UOp>> = (0..dims.len()).map(|_| UOp::index_const(1)).collect();
+    for i in (0..dims.len().saturating_sub(1)).rev() {
+        strides[i] = mul_index_expr(strides[i + 1].clone(), dims[i + 1].clone());
+    }
+    strides
+}
+
 /// Check if any index in the list is vectorized.
 fn any_index_vectorized(indices: &[Arc<UOp>]) -> bool {
     indices.iter().any(|idx| idx.dtype().vcount() > 1)
@@ -197,6 +291,19 @@ fn get_vector_count(indices: &[Arc<UOp>]) -> usize {
             if vc > 1 { Some(vc) } else { None }
         })
         .unwrap_or(1)
+}
+
+fn build_linear_index_expr(indices: &[Arc<UOp>], strides: &[Arc<UOp>]) -> Arc<UOp> {
+    let mut linear = UOp::index_const(0);
+    for (idx, stride) in indices.iter().zip(strides.iter()) {
+        let term = match const_index_value(stride) {
+            Some(0) => continue,
+            Some(1) => idx.clone(),
+            _ => mul_index_expr(idx.clone(), stride.clone()),
+        };
+        linear = add_index_expr(linear, term);
+    }
+    linear
 }
 
 /// Build a linear index expression from multi-dimensional indices and strides.
@@ -233,31 +340,17 @@ pub fn build_linear_index(indices: &[Arc<UOp>], strides: &[i64]) -> Arc<UOp> {
     linear
 }
 
-/// Build a vectorized linear index for UPCAST patterns.
-///
-/// When indices are vectorized, extracts each lane and computes
-/// linearization per-lane, then assembles into a vector result.
-fn build_vectorized_linear_index(indices: &[Arc<UOp>], strides: &[i64], vcount: usize) -> Arc<UOp> {
-    // For each lane, extract scalar indices and compute linear offset
+fn build_vectorized_linear_index_expr(indices: &[Arc<UOp>], strides: &[Arc<UOp>], vcount: usize) -> Arc<UOp> {
     let lane_indices: SmallVec<[Arc<UOp>; 4]> = (0..vcount)
         .map(|lane| {
             let scalar_indices: Vec<Arc<UOp>> = indices
                 .iter()
-                .map(|idx| {
-                    if idx.dtype().vcount() > 1 {
-                        // Extract scalar from vector
-                        idx.gep(vec![lane])
-                    } else {
-                        // Scalar index, use directly
-                        idx.clone()
-                    }
-                })
+                .map(|idx| if idx.dtype().vcount() > 1 { idx.gep(vec![lane]) } else { idx.clone() })
                 .collect();
-            build_linear_index(&scalar_indices, strides)
+            build_linear_index_expr(&scalar_indices, strides)
         })
         .collect();
 
-    // Assemble into vector using VECTORIZE
     UOp::vectorize(lane_indices)
 }
 
@@ -268,20 +361,16 @@ fn build_vectorized_linear_index(indices: &[Arc<UOp>], strides: &[i64], vcount: 
 ///
 /// Where `linear = i * (D1*D2) + j * D2 + k` for row-major layout.
 ///
-/// Linearization is **conditional**: only applies when the linearized form
-/// has no more divmod operations than the original multi-index form.
-/// Uses the `count_divmod(new) <= count_divmod(old)` heuristic from
-/// Tinygrad's `simplify.py`.
-///
-/// If rejected, codegen backends handle multi-index INDEX natively.
+/// This pass normalizes every resolvable multi-index to a single index expression.
+/// Codegen assumes this normalization and does not re-linearize indices.
 pub fn pm_linearize_multi_index() -> &'static TypedPatternMatcher<()> {
     crate::cached_patterns! {
         // Match INDEX with multiple indices
         idx @ Index { buffer, indices, gate } if indices.len() > 1 => |idx, buffer, indices, gate| {
             // Extract dimensions from index expressions.
-            let dims: Option<Vec<i64>> = indices
+            let dims: Option<Vec<Arc<UOp>>> = indices
                 .iter()
-                .map(extract_index_dimension)
+                .map(extract_index_dimension_expr)
                 .collect();
 
             let dims = match dims {
@@ -296,24 +385,26 @@ pub fn pm_linearize_multi_index() -> &'static TypedPatternMatcher<()> {
                 }
             };
 
-            // Compute row-major strides
-            let strides = compute_row_major_strides(&dims);
+            // Compute row-major strides from dimension expressions.
+            let strides = compute_row_major_strides_expr(&dims);
 
             // Check if any index is vectorized
             let is_vectorized = any_index_vectorized(indices);
 
             let linear_index = if is_vectorized {
                 let vcount = get_vector_count(indices);
-                build_vectorized_linear_index(indices, &strides, vcount)
+                build_vectorized_linear_index_expr(indices, &strides, vcount)
             } else {
-                build_linear_index(indices, &strides)
+                build_linear_index_expr(indices, &strides)
             };
 
-            // Heuristic: only apply if linearization doesn't increase divmod complexity.
-            // Ported from Tinygrad's simplify_merge_adjacent count_divmod check.
+            // Only flatten when divmod complexity does not increase.
+            // Conv/attention indices that already factor into clean RANGE
+            // components can otherwise pick up redundant `% / //` chains
+            // after linearization. Backends linearize at render time as a
+            // fallback.
             let original_divmod: usize = indices.iter().map(count_divmod).sum();
             let linearized_divmod = count_divmod(&linear_index);
-
             if linearized_divmod > original_divmod {
                 trace!(
                     uop_id = idx.id,
@@ -326,7 +417,7 @@ pub fn pm_linearize_multi_index() -> &'static TypedPatternMatcher<()> {
 
             trace!(
                 uop_id = idx.id,
-                index_dims = ?dims,
+                index_dims = ?dims.iter().map(|d| format!("{:?}", d.op())).collect::<Vec<_>>(),
                 original_divmod,
                 linearized_divmod,
                 "linearize_multi_index: linearizing {}-dimensional index",
@@ -346,54 +437,5 @@ pub fn pm_linearize_multi_index() -> &'static TypedPatternMatcher<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_compute_row_major_strides() {
-        // 3D tensor [2, 3, 4]: strides should be [12, 4, 1]
-        assert_eq!(compute_row_major_strides(&[2, 3, 4]), vec![12, 4, 1]);
-
-        // 2D matrix [5, 10]: strides should be [10, 1]
-        assert_eq!(compute_row_major_strides(&[5, 10]), vec![10, 1]);
-
-        // 1D: stride is [1]
-        assert_eq!(compute_row_major_strides(&[100]), vec![1]);
-    }
-
-    #[test]
-    fn test_build_linear_index() {
-        let i = UOp::index_const(2);
-        let j = UOp::index_const(3);
-        let linear = build_linear_index(&[i, j], &[10, 1]);
-
-        // Should produce: 2*10 + 3 = Add(Mul(2, 10), 3)
-        assert!(matches!(linear.op(), Op::Binary(BinaryOp::Add, _, _)));
-    }
-
-    #[test]
-    fn test_extract_index_dimension_range() {
-        use morok_ir::AxisId;
-        // Create a RANGE with size 10
-        let end = UOp::index_const(10);
-        let range = UOp::range_axis(end, AxisId::Renumbered(0), morok_ir::AxisType::Loop);
-
-        let dim = extract_index_dimension(&range);
-        assert_eq!(dim, Some(10));
-    }
-
-    #[test]
-    fn test_extract_index_dimension_complex_expression() {
-        use morok_ir::AxisId;
-        // Create Add(Mul(Range(4), stride), Range(8))
-        // Should multiply all range sizes: 4 * 8 = 32
-        let r1 = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), morok_ir::AxisType::Loop);
-        let r2 = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), morok_ir::AxisType::Loop);
-        let stride = UOp::index_const(8);
-        let mul = UOp::new(Op::Binary(BinaryOp::Mul, r1, stride), DType::Index);
-        let add = UOp::new(Op::Binary(BinaryOp::Add, mul, r2), DType::Index);
-
-        let dim = extract_index_dimension(&add);
-        assert_eq!(dim, Some(32));
-    }
-}
+#[path = "../test/unit/passes/linearize_index_internal.rs"]
+mod tests;

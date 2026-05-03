@@ -11,6 +11,28 @@ fn test_sint_const() {
 }
 
 #[test]
+fn test_sint_vmax_returns_concrete_for_positive_symbolic() {
+    let var = UOp::define_var("n".to_string(), 1, 8);
+    let s = SInt::from(var);
+    assert!(s.is_symbolic());
+    assert_eq!(s.vmax(), Some(8));
+}
+
+#[test]
+fn test_sint_vmax_returns_zero_for_zero_bound() {
+    // A symbolic var bound at exactly 0 must return Some(0), not the previous
+    // Some(1) fallback that masked degenerate ranges as positive bounds.
+    let var = UOp::define_var("z".to_string(), 0, 0);
+    let s = SInt::from(var);
+    if s.is_symbolic() {
+        assert_eq!(s.vmax(), Some(0));
+    } else {
+        // If SInt::from collapsed it to Const(0), that path also yields Some(0).
+        assert_eq!(s.vmax(), Some(0));
+    }
+}
+
+#[test]
 fn test_sint_symbolic() {
     let uop = UOp::index_const(10);
     let s = SInt::from(uop);

@@ -7,6 +7,7 @@ pub mod broadcast;
 pub mod conditional;
 pub mod creation;
 pub mod cumsum;
+pub mod custom_kernel;
 pub mod data;
 pub mod einsum;
 pub mod indexing;
@@ -25,4 +26,5 @@ pub mod variable;
 
 pub mod fusion;
 pub mod scatter_debug;
+pub mod schedule;
 pub mod schedule_cache;

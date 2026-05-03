@@ -96,96 +96,12 @@ static TENSORS: OnceLock<PapayaMap<u64, Weak<TensorEntry>>> = OnceLock::new();
 // collide across tests. Stale entries cleaned via gc_dead_refs().
 static BUFFERS: OnceLock<PapayaMap<u64, Arc<Buffer>>> = OnceLock::new();
 
-/// Pending assigns: buffer_uop.id → list of ASSIGN UOps.
-///
-/// Matches Tinygrad's `_pending_assigns: dict[UOp, list[UOp]]`.
-/// When `tensor.assign(value)` is called, the ASSIGN UOp is appended here.
-/// During `realize()`, pending assigns for referenced BUFFERs are
-/// side-realized (recursively for transitive deps) before the main computation.
-///
-/// Uses PapayaMap for lock-free concurrent access (consistent with TENSORS/BUFFERS).
-/// Multiple assigns per buffer are supported (for partial/view assigns).
-static PENDING_ASSIGNS: OnceLock<PapayaMap<u64, Vec<Arc<UOp>>>> = OnceLock::new();
-
 fn tensors() -> &'static PapayaMap<u64, Weak<TensorEntry>> {
     TENSORS.get_or_init(PapayaMap::new)
 }
 
 fn buffers() -> &'static PapayaMap<u64, Arc<Buffer>> {
     BUFFERS.get_or_init(PapayaMap::new)
-}
-
-fn pending_assigns() -> &'static PapayaMap<u64, Vec<Arc<UOp>>> {
-    PENDING_ASSIGNS.get_or_init(PapayaMap::new)
-}
-
-/// Track a pending assign for side-realization during realize().
-///
-/// Appends to the list for this buffer (supports multiple partial/view assigns).
-/// Deduplicates: if the same UOp is already pending, it's replaced (matches Tinygrad line 322).
-pub fn add_pending_assign(buffer_id: u64, assign_uop: Arc<UOp>) {
-    let map = pending_assigns();
-    let guard = map.guard();
-    let mut list = map.get(&buffer_id, &guard).cloned().unwrap_or_default();
-    list.retain(|existing| !Arc::ptr_eq(existing, &assign_uop));
-    list.push(assign_uop);
-    map.insert(buffer_id, list, &guard);
-}
-
-/// Take all pending assigns for a buffer (removes from tracking).
-/// Returns None if no assigns pending. Matches Tinygrad's `_pending_assigns.pop(buf, [])`.
-pub fn take_pending_assigns(buffer_id: u64) -> Option<Vec<Arc<UOp>>> {
-    let map = pending_assigns();
-    let guard = map.guard();
-    let val = map.get(&buffer_id, &guard).cloned();
-    if val.is_some() {
-        map.remove(&buffer_id, &guard);
-    }
-    val.filter(|v| !v.is_empty())
-}
-
-/// Check if a specific buffer has pending assigns (for recursion guard).
-pub fn has_pending_assign(buffer_id: u64) -> bool {
-    let map = pending_assigns();
-    let guard = map.guard();
-    map.get(&buffer_id, &guard).is_some_and(|v| !v.is_empty())
-}
-
-/// Check if there are any pending assigns globally.
-pub fn has_pending_assigns() -> bool {
-    !pending_assigns().is_empty()
-}
-
-/// Substitute a becomes_map into all remaining pending assigns.
-///
-/// After side-realizing one pending assign, its becomes_map must propagate
-/// into other pending assigns that may reference stale graphs.
-/// Matches Tinygrad tensor.py:285-287.
-#[allow(clippy::mutable_key_type)]
-pub fn substitute_pending_assigns(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
-    if becomes_map.is_empty() {
-        return;
-    }
-    let map = pending_assigns();
-    let pinned = map.pin();
-    let entries: Vec<(u64, Vec<Arc<UOp>>)> = pinned.iter().map(|(&k, v)| (k, v.clone())).collect();
-    for (key, assign_list) in entries {
-        let mut changed = false;
-        let new_list: Vec<Arc<UOp>> = assign_list
-            .iter()
-            .map(|uop| {
-                let new_uop = uop.substitute(becomes_map);
-                if !Arc::ptr_eq(uop, &new_uop) {
-                    changed = true;
-                }
-                new_uop
-            })
-            .collect();
-        if changed {
-            let guard = map.guard();
-            map.insert(key, new_list, &guard);
-        }
-    }
 }
 
 /// Register a new tensor without buffer (for lazy computation graphs).
@@ -363,6 +279,20 @@ pub fn gc_unused_tensors() {
 /// Other tensors can still be read/written concurrently.
 #[allow(clippy::mutable_key_type)]
 pub fn apply_map_to_tensors(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
+    apply_map_to_tensors_inner(becomes_map, false);
+}
+
+/// Walk variant: replacements are NOT re-traversed.
+///
+/// Use when a replacement may contain the original key, such as the
+/// view-assign case `Buffer → After(Buffer, [Store(...)])`.
+#[allow(clippy::mutable_key_type)]
+pub fn apply_map_to_tensors_walk(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
+    apply_map_to_tensors_inner(becomes_map, true);
+}
+
+#[allow(clippy::mutable_key_type)]
+fn apply_map_to_tensors_inner(becomes_map: &HashMap<UOpKey, Arc<UOp>>, walk: bool) {
     if becomes_map.is_empty() {
         return;
     }
@@ -398,10 +328,10 @@ pub fn apply_map_to_tensors(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
     let sink = UOp::sink(sources.clone());
 
     // Phase 3: Atomic substitution across all affected UOps
-    let new_sink = sink.substitute(becomes_map);
+    let new_sink = if walk { sink.substitute_walk(becomes_map) } else { sink.substitute(becomes_map) };
 
     // Phase 4: Update each tensor's UOp (acquires write locks)
-    if let Op::Sink { sources: new_sources } = new_sink.op() {
+    if let Op::Sink { sources: new_sources, .. } = new_sink.op() {
         for (entry, (old, new)) in affected.iter().zip(sources.iter().zip(new_sources.iter())) {
             if !Arc::ptr_eq(old, new) {
                 *entry.uop.write() = new.clone();
@@ -411,51 +341,5 @@ pub fn apply_map_to_tensors(becomes_map: &HashMap<UOpKey, Arc<UOp>>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use morok_dtype::DType;
-    use morok_ir::ConstValue;
-
-    #[test]
-    fn test_register_and_get() {
-        crate::test::helpers::test_setup();
-
-        let uop = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let entry = register_tensor(uop.clone());
-
-        let retrieved = get_tensor(entry.id).expect("Should find tensor");
-        assert_eq!(retrieved.id, entry.id);
-        assert!(Arc::ptr_eq(&*retrieved.uop.read(), &uop));
-    }
-
-    #[test]
-    fn test_apply_map_updates_tensors() {
-        crate::test::helpers::test_setup();
-
-        // Create two tensors sharing a common UOp
-        let shared = UOp::const_(DType::Float32, ConstValue::Float(1.0));
-        let t1_uop = shared.neg();
-        let t2_uop = shared.neg(); // Same as t1_uop due to hash consing
-
-        let t1 = register_tensor(t1_uop.clone());
-        let t2 = register_tensor(t2_uop.clone());
-
-        // Create a replacement for the shared const
-        let replacement = UOp::const_(DType::Float32, ConstValue::Float(2.0));
-
-        #[allow(clippy::mutable_key_type)]
-        let mut becomes_map = HashMap::new();
-        becomes_map.insert(UOpKey(shared.clone()), replacement.clone());
-
-        // Apply the map
-        apply_map_to_tensors(&becomes_map);
-
-        // Both tensors should now reference the replacement
-        let t1_new = t1.uop.read();
-        let t2_new = t2.uop.read();
-
-        // The root NEG should now have the replacement as its source
-        assert!(!Arc::ptr_eq(&*t1_new, &t1_uop), "t1 should be updated");
-        assert!(!Arc::ptr_eq(&*t2_new, &t2_uop), "t2 should be updated");
-    }
-}
+#[path = "test/unit/tensor_registry.rs"]
+mod tests;

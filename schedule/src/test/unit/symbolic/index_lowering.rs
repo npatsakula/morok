@@ -198,7 +198,7 @@ fn test_sink_cast_strip() {
 
     if let RewriteResult::Rewritten(lowered) = result {
         // The sink should have the uncast value
-        if let Op::Sink { sources } = lowered.op() {
+        if let Op::Sink { sources, .. } = lowered.op() {
             assert!(!sources.is_empty());
             assert!(sources[0].dtype().is_int(), "SINK source should have cast stripped");
         }

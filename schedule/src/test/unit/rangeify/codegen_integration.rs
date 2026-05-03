@@ -1,7 +1,7 @@
 //! Integration tests for codegen pattern pipeline.
 //!
 //! Tests verify that all patterns work together correctly in the complete
-//! transformation pipeline from BUFFERIZE to KERNEL operations.
+//! transformation pipeline from BUFFERIZE to CALL-wrapper operations.
 //!
 //! Adapted from Tinygrad's test_rangeify.py and test_assign.py.
 
@@ -14,6 +14,8 @@ use morok_ir::{AxisId, AxisType, Op, UOp};
 use crate::rangeify::kernel::{LocalAddBufferContext, split_store};
 use crate::rangeify::patterns::rangeify_codegen_patterns;
 use crate::rangeify::transforms::find_bufs;
+
+use super::helpers::extract_kernel;
 
 /// Helper to call split_store with the new signature
 fn call_split_store(x: &Arc<UOp>) -> Option<Arc<UOp>> {
@@ -99,7 +101,7 @@ fn test_no_cycle_valid_access_pattern() {
 
 /// Test split_store integration with simple STORE operation.
 ///
-/// Verifies the complete pipeline: filtering, transformation, validation, KERNEL creation.
+/// Verifies the complete pipeline: filtering, transformation, validation, CALL-wrapper creation.
 #[test]
 fn test_split_store_simple_kernel() {
     // Create a simple STORE operation
@@ -112,9 +114,9 @@ fn test_split_store_simple_kernel() {
     // split_store may succeed if the STORE has no non-OUTER ranges in scope
     let result = call_split_store(&store);
 
-    // Verify result is a KERNEL operation if successful
+    // Verify result contains a CALL operation if successful
     if let Some(kernel) = result {
-        assert!(matches!(kernel.op(), Op::Kernel { .. }));
+        assert!(extract_kernel(&kernel).is_some());
     }
 }
 
@@ -141,9 +143,9 @@ fn test_split_store_with_loop_ranges() {
     // Try to split - behavior depends on has_non_outer_ranges() implementation
     let result = call_split_store(&end);
 
-    // If successful, verify it's a KERNEL
+    // If successful, verify it contains a CALL
     if let Some(kernel) = result {
-        assert!(matches!(kernel.op(), Op::Kernel { .. }));
+        assert!(extract_kernel(&kernel).is_some());
     }
 }
 
@@ -153,7 +155,7 @@ fn test_split_store_with_loop_ranges() {
 /// 1. to_param patterns
 /// 2. rangeify_codegen patterns (remove_noop, get_contiguous, fix_after_broadcast)
 /// 3. Cycle detection
-/// 4. SINK/KERNEL creation
+/// 4. SINK/CALL creation
 #[test]
 fn test_pattern_application_order() {
     // Create a computation with patterns to apply
@@ -225,8 +227,8 @@ fn test_end_store_structure() {
     // split_store should handle END(STORE) structure
     let result = call_split_store(&end);
 
-    // If successful, verify it's a KERNEL
+    // If successful, verify it contains a CALL
     if let Some(kernel) = result {
-        assert!(matches!(kernel.op(), Op::Kernel { .. }));
+        assert!(extract_kernel(&kernel).is_some());
     }
 }

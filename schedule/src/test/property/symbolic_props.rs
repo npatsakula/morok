@@ -564,18 +564,18 @@ proptest! {
         let matcher = symbolic();
         let simplified = graph_rewrite(&matcher, sub2, &mut ());
 
-        // Should simplify to a - (b + c)
-        if let Op::Binary(BinaryOp::Sub, var, subtrahend) = simplified.op() {
+        // Should simplify to a + (-(b + c)) in Tinygrad-style subtraction form.
+        if let Op::Binary(BinaryOp::Add, var, subtrahend) = simplified.op() {
             prop_assert!(Arc::ptr_eq(var, &a), "Variable should be preserved");
             if let Op::Const(cv) = subtrahend.op() {
-                let expected = (b as i64) + (c as i64);
+                let expected = -((b as i64) + (c as i64));
                 prop_assert_eq!(cv.0, ConstValue::Int(expected),
-                    "(a - {}) - {} should simplify to a - {}", b, c, expected);
+                    "(a - {}) - {} should simplify to a + ({})", b, c, expected);
             } else {
                 prop_assert!(false, "Subtrahend should be constant");
             }
         } else {
-            prop_assert!(false, "Should simplify to Sub");
+            prop_assert!(false, "Should simplify to Add");
         }
     }
 

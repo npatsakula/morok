@@ -22,10 +22,13 @@ fn next_buffer_id() -> u64 {
     BUFFER_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Unique identifier for a buffer allocation.
+/// Unique identifier for a buffer handle.
 ///
-/// This ID uniquely identifies the underlying allocation, not the view.
-/// Multiple views into the same buffer share the same ID.
+/// Mirrors tinygrad's distinct-identity-per-`BUFFER_VIEW` semantics: each
+/// `Buffer` value carries its own `BufferId`, including views — so two
+/// disjoint slices of a shared arena have different ids and the parallel
+/// hazard model can treat them as independent. Use [`Buffer::storage_id`]
+/// when storage-identity (rather than handle-identity) matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferId(pub u64);
 
@@ -37,8 +40,13 @@ use snafu::ResultExt;
 /// Shared buffer data that can be referenced by multiple views.
 #[derive(Debug)]
 struct BufferData {
-    /// Unique identifier for this buffer allocation.
-    id: BufferId,
+    /// Stable per-storage identifier minted when the underlying allocation
+    /// is created. Distinct from the per-handle [`Buffer::id`]: every
+    /// `Buffer` value (including views) gets a fresh handle id, but every
+    /// view of one allocation shares the same `storage_id`. Used by code
+    /// that needs storage identity (e.g. alias detection in the memory
+    /// planner) without falling into the `Arc::as_ptr` aliasing trap.
+    storage_id: BufferId,
     /// Lazily-initialized raw buffer (lock-free after first allocation).
     raw: OnceLock<RawBuffer>,
     allocator: Arc<dyn Allocator>,
@@ -50,7 +58,7 @@ struct BufferData {
 
 impl BufferData {
     fn new(allocator: Arc<dyn Allocator>, size: usize, options: BufferOptions) -> Self {
-        Self { id: BufferId(next_buffer_id()), raw: OnceLock::new(), allocator, total_size: size, options }
+        Self { storage_id: BufferId(next_buffer_id()), raw: OnceLock::new(), allocator, total_size: size, options }
     }
 
     /// Ensure the buffer is allocated, allocating if necessary.
@@ -93,8 +101,16 @@ impl Drop for BufferData {
 }
 
 /// A device buffer that may be a view into another buffer.
+///
+/// Handle-identity (`id`) is per-`Buffer` value, including views — mirroring
+/// tinygrad, where each `BUFFER_VIEW` produces a distinct UOp identity.
+/// Storage-identity (the underlying `Arc<BufferData>`) is shared between a
+/// buffer and its views; use [`Buffer::storage_id`] to compare it.
 #[derive(Debug, Clone)]
 pub struct Buffer {
+    /// Per-handle unique identifier. Views get fresh ids; storage is shared
+    /// via `data` independently.
+    id: BufferId,
     /// Shared data for the base allocation.
     data: Arc<BufferData>,
     /// Offset into the base buffer (in bytes).
@@ -112,6 +128,7 @@ impl Buffer {
     pub fn new(allocator: Arc<dyn Allocator>, dtype: DType, shape: Vec<usize>, options: BufferOptions) -> Self {
         let size = dtype.bytes() * shape.iter().product::<usize>();
         Self {
+            id: BufferId(next_buffer_id()),
             data: Arc::new(BufferData::new(allocator, size, options)),
             offset: 0,
             size,
@@ -133,6 +150,12 @@ impl Buffer {
     }
 
     /// Create a view into this buffer.
+    ///
+    /// The view shares storage with `self` (same `Arc<BufferData>`) but gets
+    /// a **fresh `BufferId`** so the runtime parallel-hazard model treats
+    /// disjoint views of one arena as independent — mirroring tinygrad's
+    /// `BUFFER_VIEW`-as-distinct-identity semantics. Use
+    /// [`Buffer::storage_id`] to compare storage identity instead.
     pub fn view(&self, offset: usize, size: usize) -> Result<Self> {
         // Validate view parameters
         if offset + size > self.size {
@@ -140,6 +163,7 @@ impl Buffer {
         }
 
         Ok(Self {
+            id: BufferId(next_buffer_id()),
             data: Arc::clone(&self.data),
             offset: self.offset + offset,
             size,
@@ -266,11 +290,12 @@ impl Buffer {
 
     /// Typed mutable view over CPU-accessible buffer memory.
     ///
-    /// Same as [`as_array`] but allows writes. Caller must ensure no kernels
-    /// are executing concurrently (safety is the caller's responsibility).
+    /// Same as [`Self::as_array`] but allows writes. Caller must ensure no
+    /// kernels are executing concurrently (safety is the caller's
+    /// responsibility).
     ///
     /// # Errors
-    /// Same as [`as_array`].
+    /// Same as [`Self::as_array`].
     #[allow(clippy::mut_from_ref)]
     pub fn as_array_mut<T: HasDType>(&self) -> Result<ndarray::ArrayViewMutD<'_, T>> {
         self.ensure_allocated()?;
@@ -320,12 +345,42 @@ impl Buffer {
         &*self.data.allocator
     }
 
-    /// Get the unique identifier for this buffer's underlying allocation.
+    /// Get an `Arc`-cloned handle to the allocator, suitable for constructing
+    /// new buffers on the same device (used by the arena memory planner to
+    /// allocate per-lane arenas matching prototype buffers' device).
+    pub fn allocator_arc(&self) -> Arc<dyn Allocator> {
+        Arc::clone(&self.data.allocator)
+    }
+
+    /// Get the unique identifier for this buffer **handle**.
     ///
-    /// Views into the same buffer share the same ID.
-    /// This is used for dependency tracking in parallel execution.
+    /// Each `Buffer` value (including each view) carries its own `BufferId`;
+    /// disjoint views of one arena therefore have different ids. Used by the
+    /// runtime parallel-hazard model. To compare storage identity (i.e. "do
+    /// these two buffers share the same underlying allocation"), use
+    /// [`Buffer::storage_id`] instead.
     pub fn id(&self) -> BufferId {
-        self.data.id
+        self.id
+    }
+
+    /// Size of the underlying allocation in bytes (shared by every view of
+    /// this buffer's storage). Distinct from [`Buffer::size`], which returns
+    /// the view's size — for a non-view buffer the two are equal; for a view
+    /// into an arena, `total_size` reports the arena's allocation size while
+    /// `size` reports just the view's window.
+    pub fn total_size(&self) -> usize {
+        self.data.total_size
+    }
+
+    /// Stable identifier for this buffer's underlying allocation.
+    ///
+    /// Equal across a base buffer and all of its views, distinct between
+    /// independent allocations. Unlike a heap-pointer probe, this id is
+    /// minted once at allocation time and never reused — safe to use as a
+    /// hash key or alias-detection key without worrying about
+    /// allocator-reuse aliasing.
+    pub fn storage_id(&self) -> BufferId {
+        self.data.storage_id
     }
 
     /// Copy data from host memory into this buffer.

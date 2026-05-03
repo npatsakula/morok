@@ -206,8 +206,9 @@ impl Tensor {
     /// # use ndarray::array;
     /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0, -2.0]]);
     /// let target = Tensor::from_slice([0i64]);
-    /// let loss = logprobs.nll_loss().target(&target).call().unwrap();
-    /// let val = loss.to_vec::<f32>().unwrap();
+    /// let mut loss = logprobs.nll_loss().target(&target).call().unwrap();
+    /// loss.realize().unwrap();
+    /// let val = loss.as_vec::<f32>().unwrap();
     /// // -(-0.5) = 0.5
     /// assert!((val[0] - 0.5).abs() < 1e-5);
     /// ```
@@ -220,8 +221,9 @@ impl Tensor {
     /// # use ndarray::array;
     /// let logprobs = Tensor::from_ndarray(&array![[-0.5f32, -1.0], [-2.0, -0.3]]);
     /// let target = Tensor::from_slice([0i64, 1]);
-    /// let loss = logprobs.nll_loss().target(&target).reduction(Reduction::Sum).call().unwrap();
-    /// let val = loss.to_vec::<f32>().unwrap();
+    /// let mut loss = logprobs.nll_loss().target(&target).reduction(Reduction::Sum).call().unwrap();
+    /// loss.realize().unwrap();
+    /// let val = loss.as_vec::<f32>().unwrap();
     /// // sum of 0.5 + 0.3 = 0.8
     /// assert!((val[0] - 0.8).abs() < 1e-5);
     /// ```
@@ -284,10 +286,12 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::array;
     /// let x = Tensor::from_ndarray(&array![1.0f32, 2.0, 3.0]);
-    /// let (out, mask) = x.dropout().p(0.5).call().unwrap();
+    /// let (mut out, mut mask) = x.dropout().p(0.5).call().unwrap();
+    /// out.realize().unwrap();
+    /// mask.realize().unwrap();
     /// // Default is inference mode: output == input
-    /// assert_eq!(out.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
-    /// assert_eq!(mask.to_vec::<bool>().unwrap(), vec![true, true, true]);
+    /// assert_eq!(out.as_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
+    /// assert_eq!(mask.as_vec::<bool>().unwrap(), vec![true, true, true]);
     /// ```
     #[builder]
     pub fn dropout(&self, p: f64, #[builder(default = false)] training: bool) -> Result<(Tensor, Tensor)> {
@@ -320,11 +324,12 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let y = x.conv().weight(&w).call().unwrap();
+    /// let mut y = x.conv().weight(&w).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
     /// // Each output element sums a 3x3 window of ones = 9.0
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![9.0; 9]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![9.0; 9]);
     /// ```
     ///
     /// With explicit padding and strides:
@@ -334,10 +339,11 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let y = x.conv().weight(&w).pads(&[1, 1, 1, 1]).strides(&[2, 2]).call().unwrap();
+    /// let mut y = x.conv().weight(&w).pads(&[1, 1, 1, 1]).strides(&[2, 2]).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![4.0, 6.0, 4.0, 6.0, 9.0, 6.0, 4.0, 6.0, 4.0]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![4.0, 6.0, 4.0, 6.0, 9.0, 6.0, 4.0, 6.0, 4.0]);
     /// ```
     #[builder]
     pub fn conv(
@@ -389,8 +395,9 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let y = x.conv_transpose().weight(&w).call().unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.conv_transpose().weight(&w).call().unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 16); // 4x4 output
     /// assert_eq!(vals[5], 4.0); // center sees full overlap
     /// ```
@@ -402,8 +409,9 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let y = x.conv_transpose().weight(&w).strides(&[2, 2]).call().unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.conv_transpose().weight(&w).strides(&[2, 2]).call().unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 25); // 5x5 output
     /// ```
     #[builder]
@@ -503,11 +511,12 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let y = x.avg_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// let mut y = x.avg_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
     /// // Average of all-ones windows is 1.0
-    /// assert!(y.to_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-6));
+    /// assert!(y.as_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-6));
     /// ```
     ///
     /// With strides:
@@ -516,10 +525,11 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let y = x.avg_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
+    /// let mut y = x.avg_pool().kernel_shape(&[2, 2]).strides(&[2, 2]).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 2, 2]);
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
     #[builder]
     pub fn avg_pool(
@@ -569,11 +579,12 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let y = x.lp_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// let mut y = x.lp_pool().kernel_shape(&[2, 2]).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 3, 3]);
     /// // L2 pool of 2x2 window of ones = sqrt(4) = 2.0
-    /// assert!((y.to_vec::<f32>().unwrap()[0] - 2.0).abs() < 1e-5);
+    /// assert!((y.as_vec::<f32>().unwrap()[0] - 2.0).abs() < 1e-5);
     /// ```
     #[builder]
     pub fn lp_pool(
@@ -644,10 +655,11 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
-    /// let y = x.depth_to_space().blocksize(2).call().unwrap();
+    /// let mut y = x.depth_to_space().blocksize(2).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 1, 2, 2]);
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
     ///
     /// Using CRD mode (PyTorch pixel_shuffle order):
@@ -657,8 +669,9 @@ impl Tensor {
     /// # use morok_tensor::nn::DepthToSpaceMode;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 4, 1, 1), 1.0f32));
-    /// let y = x.depth_to_space().blocksize(2).mode(DepthToSpaceMode::Crd).call().unwrap();
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// let mut y = x.depth_to_space().blocksize(2).mode(DepthToSpaceMode::Crd).call().unwrap();
+    /// y.realize().unwrap();
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
     #[builder]
     pub fn depth_to_space(&self, blocksize: usize, #[builder(default)] mode: DepthToSpaceMode) -> Result<Tensor> {
@@ -728,10 +741,11 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let y = x.space_to_depth(2).unwrap();
+    /// let mut y = x.space_to_depth(2).unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, [1, 4, 2, 2]);
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 16]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 16]);
     /// ```
     pub fn space_to_depth(&self, blocksize: usize) -> Result<Tensor> {
         let ndim = self.ndim()?;

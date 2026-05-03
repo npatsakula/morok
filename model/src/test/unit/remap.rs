@@ -23,12 +23,13 @@ fn make_config(conv_norm: ConvNormType) -> GigaAmConfig {
         hop_length: 160,
         win_length: 320,
         mel_center: false,
-        max_seq_len: 5000,
+        max_mel_frames: 20000,
+        max_encoder_frames: 5000,
     }
 }
 
 fn fake_tensor() -> Tensor {
-    Tensor::from_slice(&[0.0f32; 8])
+    Tensor::from_slice([0.0f32; 8])
 }
 
 #[test]

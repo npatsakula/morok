@@ -3,7 +3,7 @@
 //! Tests verify the complete transformation pipeline from tensor operations
 //! to executable kernels:
 //! - Phase 1-4: run_rangeify (movement ops → BUFFERIZE+INDEX)
-//! - Phase 5: run_kernel_split_pipeline (BUFFERIZE → KERNEL)
+//! - Phase 5: try_get_kernel_graph (BUFFERIZE → CALL wrappers)
 //! - End-to-end scenarios
 //!
 //! Based on Tinygrad's test_schedule.py integration tests.
@@ -12,9 +12,29 @@ use std::{f32::consts::PI, sync::Arc};
 
 use morok_device::DeviceSpec;
 use morok_dtype::DType;
-use morok_ir::{AxisId, AxisType, BufferizeOpts, ConstValue, Op, ReduceOp, UOp};
+use morok_ir::{AxisId, AxisType, BufferizeOpts, CallInfo, ConstValue, Op, ReduceOp, UOp};
+use smallvec::smallvec;
 
-use crate::rangeify::{rangeify, run_kernel_split_pipeline, run_rangeify};
+use crate::rangeify::{rangeify, run_rangeify, try_get_kernel_graph};
+
+struct NoRewrite;
+
+impl morok_ir::Matcher<()> for NoRewrite {
+    fn rewrite(&self, _uop: &Arc<UOp>, _ctx: &mut ()) -> morok_ir::RewriteResult {
+        morok_ir::RewriteResult::NoMatch
+    }
+}
+
+struct StripDetach;
+
+impl morok_ir::Matcher<()> for StripDetach {
+    fn rewrite(&self, uop: &Arc<UOp>, _ctx: &mut ()) -> morok_ir::RewriteResult {
+        match uop.op() {
+            Op::Detach { src } => morok_ir::RewriteResult::Rewritten(src.clone()),
+            _ => morok_ir::RewriteResult::NoMatch,
+        }
+    }
+}
 
 // ===== Helper Function =====
 
@@ -39,6 +59,75 @@ fn test_run_rangeify_simple_const() {
 
     // CONST has no movement ops, should remain unchanged
     assert!(matches!(rangeified.op(), Op::Const(_)));
+}
+
+#[test]
+fn test_run_rangeify_preserves_call_and_function_bodies_by_default() {
+    let p0 = UOp::param(0, 8, DType::Float32, None);
+    let reduced = p0.try_reduce_axis(ReduceOp::Add, vec![0]).expect("reduce axis should construct");
+    let arg = UOp::new_buffer(DeviceSpec::Cpu, 8, DType::Float32);
+
+    let call = reduced.call(smallvec![arg.clone()], CallInfo::default());
+    let (rangeified_call, _ctx) = run_rangeify(call).expect("run_rangeify should preserve call bodies");
+    let Op::Call { body: call_body, .. } = rangeified_call.op() else {
+        panic!("expected CALL root after run_rangeify")
+    };
+    assert!(
+        call_body.toposort().iter().any(|u| matches!(u.op(), Op::ReduceAxis { .. })),
+        "run_rangeify should not rewrite CALL body by default"
+    );
+
+    let function = reduced.function(smallvec![arg], CallInfo::default());
+    let (rangeified_function, _ctx) = run_rangeify(function).expect("run_rangeify should preserve function bodies");
+    let Op::Function { body: function_body, .. } = rangeified_function.op() else {
+        panic!("expected FUNCTION root after run_rangeify")
+    };
+    assert!(
+        function_body.toposort().iter().any(|u| matches!(u.op(), Op::ReduceAxis { .. })),
+        "run_rangeify should not rewrite FUNCTION body by default"
+    );
+}
+
+#[test]
+fn test_graph_rewrite_with_bpm_preserve_calls_only_rewrites_with_explicit_full_traversal() {
+    let detached = UOp::native_const(1.0f32).detach();
+    let arg = UOp::native_const(2.0f32);
+    let call = detached.call(smallvec![arg.clone()], CallInfo::default());
+    let function = detached.function(smallvec![arg], CallInfo::default());
+
+    let preserved_call =
+        morok_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, call, &mut ());
+    let Op::Call { body: preserved_call_body, .. } = preserved_call.op() else { panic!("expected CALL root") };
+    assert!(
+        preserved_call_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
+        "preserve-calls rewrite should keep CALL body unchanged"
+    );
+
+    let full_call =
+        morok_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, preserved_call.clone(), &mut ());
+    let Op::Call { body: full_call_body, .. } = full_call.op() else { panic!("expected CALL root") };
+    assert!(
+        !full_call_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
+        "explicit full rewrite should rewrite inside CALL body"
+    );
+
+    let preserved_function =
+        morok_ir::rewrite::graph_rewrite_with_bpm_preserve_calls(&NoRewrite, &StripDetach, function, &mut ());
+    let Op::Function { body: preserved_function_body, .. } = preserved_function.op() else {
+        panic!("expected FUNCTION root")
+    };
+    assert!(
+        preserved_function_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
+        "preserve-calls rewrite should keep FUNCTION body unchanged"
+    );
+
+    let full_function =
+        morok_ir::rewrite::graph_rewrite_with_bpm(&NoRewrite, &StripDetach, preserved_function.clone(), &mut ());
+    let Op::Function { body: full_function_body, .. } = full_function.op() else { panic!("expected FUNCTION root") };
+    assert!(
+        !full_function_body.toposort().iter().any(|u| matches!(u.op(), Op::Detach { .. })),
+        "explicit full rewrite should rewrite inside FUNCTION body"
+    );
 }
 
 #[test]
@@ -118,21 +207,22 @@ fn test_run_rangeify_preserves_structure() {
     }
 }
 
-// ===== Phase 5 Pipeline Tests (run_kernel_split_pipeline) =====
+// ===== Phase 5 Pipeline Tests (try_get_kernel_graph) =====
 
 #[test]
 fn test_kernel_split_pipeline_simple_store() {
-    // Test: Simple STORE should create a KERNEL
+    // Test: Simple STORE should create a CALL wrapper
     let _buffer = UOp::buffer_id(Some(0));
     let index = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store = index.store(value);
 
-    let (result, _context) = run_kernel_split_pipeline(store);
+    let (result, _context) =
+        try_get_kernel_graph(store).expect("kernel split pipeline should succeed for simple store");
 
-    // Should produce a KERNEL operation or transformation
+    // Should produce a CALL operation or transformation
     // Note: Exact output depends on split_store implementation
-    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Kernel { .. }));
+    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Call { .. }));
 }
 
 #[test]
@@ -147,10 +237,10 @@ fn test_kernel_split_pipeline_with_end() {
     let range = UOp::range_axis(range_end, AxisId::Renumbered(0), AxisType::Loop);
     let end = store.end(vec![range].into());
 
-    let (result, _context) = run_kernel_split_pipeline(end);
+    let (result, _context) = try_get_kernel_graph(end).expect("kernel split pipeline should succeed for end(store)");
 
     // Should handle END wrapper correctly
-    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Kernel { .. }));
+    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Call { .. }));
 }
 
 #[test]
@@ -163,10 +253,10 @@ fn test_kernel_split_pipeline_load_store() {
     let load = UOp::load().buffer(in_buf).index(index.clone()).call();
     let store = index.store(load);
 
-    let (result, _context) = run_kernel_split_pipeline(store);
+    let (result, _context) = try_get_kernel_graph(store).expect("kernel split pipeline should succeed for load/store");
 
-    // Should create valid kernel or passthrough
-    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Kernel { .. }));
+    // Should create valid callable wrapper or passthrough
+    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Call { .. }));
 }
 
 #[test]
@@ -182,17 +272,18 @@ fn test_kernel_split_pipeline_multiple_loads() {
     let sum = load1.try_add(&load2).unwrap();
     let store = index.store(sum);
 
-    let (result, _context) = run_kernel_split_pipeline(store);
+    let (result, _context) =
+        try_get_kernel_graph(store).expect("kernel split pipeline should succeed for multiple loads");
 
     // Should handle multiple inputs correctly
-    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Kernel { .. }));
+    assert!(result.dtype() == DType::Void || matches!(result.op(), Op::Call { .. }));
 }
 
 // ===== End-to-End Scenario Tests =====
 
 #[test]
 fn test_end_to_end_simple_computation() {
-    // Test: Full pipeline from computation to kernel
+    // Test: Full pipeline from computation to callable graph
 
     // Step 1: Create computation
     let a = UOp::native_const(1.0f32);
@@ -208,10 +299,11 @@ fn test_end_to_end_simple_computation() {
     let rangeified = rangeify_unwrap(store);
 
     // Step 4: Apply kernel split
-    let (kernel, _context) = run_kernel_split_pipeline(rangeified);
+    let (kernel, _context) =
+        try_get_kernel_graph(rangeified).expect("kernel split pipeline should succeed after rangeify");
 
     // Should produce valid output
-    assert!(kernel.dtype() == DType::Void || matches!(kernel.op(), Op::Kernel { .. }));
+    assert!(kernel.dtype() == DType::Void || matches!(kernel.op(), Op::Call { .. }));
 }
 
 #[test]
@@ -229,9 +321,10 @@ fn test_end_to_end_with_ranges() {
     let end = store.end(vec![range].into());
 
     let rangeified = rangeify_unwrap(end);
-    let (kernel, _context) = run_kernel_split_pipeline(rangeified);
+    let (kernel, _context) =
+        try_get_kernel_graph(rangeified).expect("kernel split pipeline should succeed with ranges");
 
-    assert!(kernel.dtype() == DType::Void || matches!(kernel.op(), Op::Kernel { .. }));
+    assert!(kernel.dtype() == DType::Void || matches!(kernel.op(), Op::Call { .. }));
 }
 
 // ===== Regression Tests =====

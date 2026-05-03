@@ -19,11 +19,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::{AxisType, Op, prelude::*};
-use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
+use morok_ir::{Op, prelude::*};
 
-use crate::common::is_output_buffer;
-use crate::{BufferArg, RenderedKernel, Result};
+use crate::common::{is_output_buffer, validate_custom_template_strict};
+use crate::{BufferArg, Error, RenderedKernel, Result};
 
 use self::ops::{CContext, count_references, render_uop};
 use self::types::{c_const, c_dtype, c_reduce_identity, c_vconst, collect_vector_typedefs};
@@ -47,13 +46,21 @@ impl crate::Renderer for CRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        let nodes = linearize_with_cfg(uop.clone());
-
-        // Apply line rewrite cleanups (gated stores → if/store/endif)
-        let nodes = line_rewrite_cleanups(nodes);
+        let nodes: Vec<Arc<UOp>> = match uop.op() {
+            Op::Linear { ops } => ops.iter().cloned().collect(),
+            other => {
+                return Err(Error::InvalidGraph { reason: format!("C renderer expects LINEAR input, got {other:?}") });
+            }
+        };
 
         for (i, node) in nodes.iter().enumerate() {
             tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "c linearized node");
+            match node.op() {
+                Op::Custom { deps, code } | Op::CustomI { deps, code } => {
+                    validate_custom_template_strict(code, deps.len())?;
+                }
+                _ => {}
+            }
         }
 
         // Collect buffers and variables from linearized stream
@@ -69,21 +76,6 @@ impl crate::Renderer for CRenderer {
         }
 
         buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
-
-        // Detect threading
-        let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
-            if let Op::Range { axis_type, end, .. } = n.op()
-                && matches!(axis_type, AxisType::Thread)
-                && let Op::Const(cv) = end.op()
-                && let ConstValue::Int(count) = cv.0
-            {
-                return Some((n.clone(), count as usize));
-            }
-            None
-        });
-
-        let has_threading = thread_info.is_some();
-        let thread_count = thread_info.as_ref().map(|(_, c)| *c).unwrap_or(1);
 
         // Build buffer args metadata
         let mut buffer_args: Vec<BufferArg> = Vec::new();
@@ -101,10 +93,6 @@ impl crate::Renderer for CRenderer {
                 var_names.push(name.clone());
             }
         }
-        if has_threading {
-            var_names.push("thread_id".to_string());
-        }
-
         // Count references for SSA inlining decisions
         let ref_counts = count_references(&nodes);
         let scope_escaping = find_scope_escaping_vars(&nodes, &ref_counts);
@@ -160,14 +148,6 @@ impl crate::Renderer for CRenderer {
             }
         }
 
-        // Thread ID parameter
-        if let Some((thread_range, _)) = &thread_info {
-            let range_dtype = &thread_range.dtype();
-            let c_type = c_dtype(range_dtype);
-            params.push(format!("const {c_type} thread_id"));
-            ctx.register(thread_range.id, "thread_id".to_string());
-        }
-
         // Function signature
         code_lines.push(format!("void {kernel_name}({}) {{", params.join(", ")));
 
@@ -219,9 +199,7 @@ impl crate::Renderer for CRenderer {
 
         // Pre-register range variable names
         for node in &nodes {
-            if let Op::Range { axis_id, axis_type, .. } = node.op()
-                && !matches!(axis_type, AxisType::Thread)
-            {
+            if let Op::Range { axis_id, .. } = node.op() {
                 let name = format!("ridx{}", axis_id.value());
                 ctx.register(node.id, name);
             }
@@ -237,12 +215,10 @@ impl crate::Renderer for CRenderer {
                 ctx.register(node.id, String::new());
                 continue;
             }
-            if let Op::Range { axis_type, .. } = node.op()
-                && matches!(axis_type, AxisType::Thread)
-            {
-                continue;
-            }
             render_uop(node, &mut ctx, &mut kernel_body);
+            if let Some(err) = ctx.take_error() {
+                return Err(err);
+            }
         }
 
         // Emit hoisted declarations for scope-escaping variables (before kernel body)
@@ -260,11 +236,6 @@ impl crate::Renderer for CRenderer {
         let mut result = RenderedKernel::new(code, kernel_name.to_string());
         result.buffer_args = buffer_args;
         result.var_names = var_names;
-
-        if thread_count > 1 {
-            result.global_size = Some([thread_count, 1, 1]);
-            result.local_size = Some([1, 1, 1]);
-        }
 
         Ok(result)
     }

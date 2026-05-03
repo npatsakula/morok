@@ -27,10 +27,11 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
-    /// let y = x.resize().scales(&[1.0, 1.0, 2.0, 2.0]).call().unwrap();
+    /// let mut y = x.resize().scales(&[1.0, 1.0, 2.0, 2.0]).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<usize> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 4, 4]);
-    /// assert!(y.to_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-5));
+    /// assert!(y.as_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-5));
     /// ```
     ///
     /// Resize to explicit output `sizes`:
@@ -39,10 +40,11 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
-    /// let y = x.resize().sizes(&[1, 1, 6, 6]).call().unwrap();
+    /// let mut y = x.resize().sizes(&[1, 1, 6, 6]).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<usize> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 6, 6]);
-    /// assert!(y.to_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-5));
+    /// assert!(y.as_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-5));
     /// ```
     ///
     /// Linear interpolation mode:
@@ -52,14 +54,15 @@ impl Tensor {
     /// # use morok_tensor::nn::ResizeMode;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
-    /// let y = x.resize()
+    /// let mut y = x.resize()
     ///     .scales(&[1.0, 1.0, 2.0, 2.0])
     ///     .mode(ResizeMode::Linear)
     ///     .call()
     ///     .unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<usize> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 4, 4]);
-    /// assert!(y.to_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-5));
+    /// assert!(y.as_vec::<f32>().unwrap().iter().all(|&v| (v - 1.0).abs() < 1e-5));
     /// ```
     // Tinygrad onnx.py:789-890
     #[builder]

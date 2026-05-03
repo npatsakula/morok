@@ -92,76 +92,89 @@ impl TreeItem for UOpTreeFull {
     }
 }
 
+/// Truncate a code/source string to a fixed number of leading chars for display.
+fn truncate_for_display(code: &str) -> String {
+    code.chars().take(20).collect()
+}
+
 /// Format a single UOp node for display.
 ///
 /// Output format: `[id] OP_NAME : dtype shape=[...]`
 fn format_node(uop: &Arc<UOp>) -> String {
     let op_str = match uop.op() {
         Op::Const(val) => format!("CONST({:?})", val.0),
-        Op::DefineLocal(id) => format!("DEFINE_LOCAL({})", id),
-        Op::DefineVar { name, min_val, max_val } => format!("DEFINE_VAR('{}', min={}, max={})", name, min_val, max_val),
-        Op::Buffer { size, .. } => format!("BUFFER(size={})", size),
+        Op::DefineLocal(id) => format!("DEFINE_LOCAL({id})"),
+        Op::DefineVar { name, min_val, max_val } => format!("DEFINE_VAR('{name}', min={min_val}, max={max_val})"),
+        Op::Param { slot, size, .. } => format!("PARAM(slot={slot}, size={size})"),
+        Op::Buffer { size, .. } => format!("BUFFER(size={size})"),
         Op::Bufferize { .. } => "BUFFERIZE".to_string(),
         Op::Load { .. } => "LOAD".to_string(),
         Op::Store { .. } => "STORE".to_string(),
         Op::Index { gate: Some(_), .. } => "INDEX_GATED".to_string(),
         Op::Index { .. } => "INDEX".to_string(),
         Op::PointerIndex { .. } => "PTR_INDEX".to_string(),
-        Op::Binary(bop, ..) => format!("{:?}", bop),
-        Op::Unary(uop_kind, ..) => format!("{:?}", uop_kind),
-        Op::Ternary(top, ..) => format!("{:?}", top),
+        Op::Binary(bop, ..) => format!("{bop:?}"),
+        Op::Unary(uop_kind, ..) => format!("{uop_kind:?}"),
+        Op::Ternary(top, ..) => format!("{top:?}"),
         Op::Cast { .. } => "CAST".to_string(),
         Op::BitCast { .. } => "BITCAST".to_string(),
         Op::Reduce { reduce_op, ranges, .. } => {
             let range_ids: Vec<u64> = ranges.iter().map(|r| r.id).collect();
-            format!("REDUCE({:?}, ranges={:?})", reduce_op, range_ids)
+            format!("REDUCE({reduce_op:?}, ranges={range_ids:?})")
         }
-        Op::ReduceAxis { reduce_op, axes, .. } => format!("REDUCE_AXIS({:?}, axes={:?})", reduce_op, axes),
-        Op::AllReduce { reduce_op, .. } => format!("ALL_REDUCE({:?})", reduce_op),
+        Op::ReduceAxis { reduce_op, axes, .. } => format!("REDUCE_AXIS({reduce_op:?}, axes={axes:?})"),
+        Op::AllReduce { reduce_op, .. } => format!("ALL_REDUCE({reduce_op:?})"),
         Op::Bind { .. } => "BIND".to_string(),
-        Op::Range { axis_id, axis_type, .. } => format!("RANGE({}, {:?})", axis_id, axis_type),
+        Op::Range { axis_id, axis_type, .. } => format!("RANGE({axis_id}, {axis_type:?})"),
         Op::End { .. } => "END".to_string(),
-        Op::Sink { .. } => "SINK".to_string(),
+        Op::Sink { info: Some(_), .. } => "SINK[KERNEL]".to_string(),
+        Op::Sink { info: None, .. } => "SINK".to_string(),
         Op::Group { .. } => "GROUP".to_string(),
-        Op::Kernel { .. } => "KERNEL".to_string(),
+        Op::Call { args, .. } => format!("CALL(args={})", args.len()),
+        Op::Function { args, .. } => format!("FUNCTION(args={})", args.len()),
+        Op::Program { .. } => "PROGRAM".to_string(),
+        Op::Linear { ops } => format!("LINEAR(len={})", ops.len()),
+        Op::Tuple { src } => format!("TUPLE(len={})", src.len()),
+        Op::GetTuple { index, .. } => format!("GETTUPLE({index})"),
+        Op::Source { code } => format!("SOURCE('{}')", truncate_for_display(code)),
+        Op::ProgramBinary { bytes } => format!("BINARY(len={})", bytes.len()),
         Op::Vectorize { elements } => format!("VECTORIZE(len={})", elements.len()),
-        Op::Gep { indices, .. } => format!("GEP(indices={:?})", indices),
+        Op::Gep { indices, .. } => format!("GEP(indices={indices:?})"),
         Op::VConst { values } => format!("VCONST(len={})", values.len()),
         Op::Cat { .. } => "CAT".to_string(),
         Op::PtrCat { .. } => "PTR_CAT".to_string(),
         Op::Reshape { .. } => "RESHAPE".to_string(),
-        Op::Permute { axes, .. } => format!("PERMUTE(axes={:?})", axes),
+        Op::Permute { axes, .. } => format!("PERMUTE(axes={axes:?})"),
         Op::Expand { .. } => "EXPAND".to_string(),
         Op::Pad { .. } => "PAD".to_string(),
         Op::Shrink { .. } => "SHRINK".to_string(),
-        Op::Flip { axes, .. } => format!("FLIP(axes={:?})", axes),
-        Op::Multi { axis, .. } => format!("MULTI(axis={})", axis),
+        Op::Flip { axes, .. } => format!("FLIP(axes={axes:?})"),
+        Op::Multi { axis, .. } => format!("MULTI(axis={axis})"),
         Op::Contiguous { .. } => "CONTIGUOUS".to_string(),
         Op::ContiguousBackward { .. } => "CONTIGUOUS_BACKWARD".to_string(),
         Op::Copy { .. } => "COPY".to_string(),
-        Op::Assign { .. } => "ASSIGN".to_string(),
-        Op::Custom { code, .. } => format!("CUSTOM('{}')", code.chars().take(20).collect::<String>()),
-        Op::CustomI { code, .. } => format!("CUSTOM_I('{}')", code.chars().take(20).collect::<String>()),
-        Op::Unique(id) => format!("UNIQUE({})", id),
-        Op::Device(spec) => format!("DEVICE({:?})", spec),
+        Op::Custom { code, .. } => format!("CUSTOM('{}')", truncate_for_display(code)),
+        Op::CustomFunction { kind, .. } => format!("CUSTOM_FUNCTION({kind:?})"),
+        Op::CustomI { code, .. } => format!("CUSTOM_I('{}')", truncate_for_display(code)),
+        Op::Unique(id) => format!("UNIQUE({id})"),
+        Op::LUnique(id) => format!("LUNIQUE({id})"),
+        Op::Device(spec) => format!("DEVICE({spec:?})"),
         Op::Noop => "NOOP".to_string(),
         Op::Invalid => "INVALID".to_string(),
-        Op::BufferView { size, offset, .. } => format!("BUFFER_VIEW(size={}, offset={})", size, offset),
+        Op::BufferView { size, offset, .. } => format!("BUFFER_VIEW(size={size}, offset={offset})"),
         Op::MStack { .. } => "MSTACK".to_string(),
-        Op::MSelect { device_index, .. } => format!("MSELECT(idx={})", device_index),
-        Op::Special { name, .. } => format!("SPECIAL('{}')", name),
+        Op::MSelect { device_index, .. } => format!("MSELECT(idx={device_index})"),
+        Op::Special { name, .. } => format!("SPECIAL('{name}')"),
         Op::If { .. } => "IF".to_string(),
         Op::EndIf { .. } => "END_IF".to_string(),
         Op::Barrier { .. } => "BARRIER".to_string(),
-        Op::DefineReg { size, id } => format!("DEFINE_REG(size={}, id={})", size, id),
+        Op::DefineReg { size, id } => format!("DEFINE_REG(size={size}, id={id})"),
         Op::Wmma { .. } => "WMMA".to_string(),
         Op::Contract { .. } => "CONTRACT".to_string(),
         Op::Unroll { .. } => "UNROLL".to_string(),
         Op::Detach { .. } => "DETACH".to_string(),
         Op::After { .. } => "AFTER".to_string(),
         Op::Precast { .. } => "PRECAST".to_string(),
-        #[allow(unreachable_patterns)]
-        _ => format!("{:?}", std::mem::discriminant(uop.op())),
     };
 
     // Get shape if available
@@ -171,7 +184,9 @@ fn format_node(uop: &Arc<UOp>) -> String {
         Err(_) => " shape=?".to_string(),
     };
 
-    format!("[{}] {} : {:?}{}", uop.id, op_str, uop.dtype(), shape_str)
+    let dtype = uop.dtype();
+    let id = uop.id;
+    format!("[{id}] {op_str} : {dtype:?}{shape_str}")
 }
 
 /// Render a UOp graph as a compact ASCII tree string.

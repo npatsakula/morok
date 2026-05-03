@@ -27,8 +27,7 @@ use std::sync::Arc;
 
 use morok_dtype::DType;
 use morok_ir::types::{AxisType, ConstValue};
-use morok_ir::{Op, UOp};
-use smallvec::SmallVec;
+use morok_ir::{Op, UOp, UOpKey};
 
 use crate::optimizer::Renderer;
 use crate::pattern::TypedPatternMatcher;
@@ -57,8 +56,9 @@ pub fn pm_add_gpudims() -> TypedPatternMatcher<Renderer> {
 /// 3. Categorize ranges by axis type (GLOBAL/THREAD vs LOCAL/WARP/GROUP_REDUCE)
 /// 4. Create SPECIAL indices with dimension limiting
 /// 5. Substitute RANGE ops with computed indices
+#[allow(clippy::mutable_key_type)]
 fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
-    let Op::Sink { sources } = sink.op() else {
+    let Op::Sink { .. } = sink.op() else {
         return None;
     };
 
@@ -91,15 +91,13 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     for (axis_id, axis_type) in all_ranges.keys() {
         match axis_type {
-            AxisType::Global | AxisType::Thread => {
-                if !global_dims.iter().any(|(id, _)| *id == *axis_id) {
-                    global_dims.push((*axis_id, *axis_type));
-                }
+            AxisType::Global | AxisType::Thread if !global_dims.iter().any(|(id, _)| *id == *axis_id) => {
+                global_dims.push((*axis_id, *axis_type));
             }
-            AxisType::Local | AxisType::Warp | AxisType::GroupReduce => {
-                if !local_dims.iter().any(|(id, _)| *id == *axis_id) {
-                    local_dims.push((*axis_id, *axis_type));
-                }
+            AxisType::Local | AxisType::Warp | AxisType::GroupReduce
+                if !local_dims.iter().any(|(id, _)| *id == *axis_id) =>
+            {
+                local_dims.push((*axis_id, *axis_type));
             }
             _ => {}
         }
@@ -136,33 +134,73 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
     let global_shape = extract_shape(&global_ranges);
     let local_shape = extract_shape(&local_ranges);
 
-    // Generate GPU indices
-    let global_max = ctx.global_max.as_deref();
-    let local_max_product = ctx.local_max;
+    let (all_idxs, local_idxs_for_masks): (Vec<Arc<UOp>>, Vec<Arc<UOp>>) = if ctx.has_threads {
+        // CPU threading expects exactly one global dim and no local dims; the
+        // optimizer ensures this. If a beam candidate produces something else,
+        // we have to bail (the pattern-matcher framework returns Option, not
+        // Result), but make the violation loud — in debug builds this fires
+        // a panic so tests catch malformed candidates, and in release a
+        // tracing::warn leaves a breadcrumb instead of a silent no-op that
+        // would leave extra RANGEs un-substituted for the renderer.
+        if global_dims.len() != 1 || !local_dims.is_empty() {
+            tracing::warn!(
+                global_dims = global_dims.len(),
+                local_dims = local_dims.len(),
+                "pm_add_gpudims: has_threads contract violated (expected 1 global / 0 local); skipping rewrite"
+            );
+            debug_assert!(
+                global_dims.len() == 1 && local_dims.is_empty(),
+                "pm_add_gpudims: has_threads requires exactly one global dim and no locals; got {} global, {} local",
+                global_dims.len(),
+                local_dims.len(),
+            );
+            return None;
+        }
+        let end = global_shape.first()?;
+        let end = match end.op() {
+            Op::Const(c) => const_to_i64(&c.0)?,
+            other => {
+                tracing::warn!(
+                    op = ?other,
+                    "pm_add_gpudims: has_threads requires Const global end; skipping rewrite"
+                );
+                debug_assert!(false, "pm_add_gpudims: has_threads requires Const global end, got {other:?}");
+                return None;
+            }
+        };
+        if end <= 0 {
+            tracing::warn!(end, "pm_add_gpudims: has_threads requires positive global end; skipping rewrite");
+            debug_assert!(end > 0, "pm_add_gpudims: has_threads requires positive global end, got {end}");
+            return None;
+        }
+        (vec![UOp::define_var("core_id".to_string(), 0, end - 1)], Vec::new())
+    } else {
+        // Generate GPU indices
+        let global_max = ctx.global_max.as_deref();
+        let local_max_product = ctx.local_max;
 
-    // For locals, we use product limit rather than per-dimension
-    // Convert to per-dimension limits if needed
-    let local_max: Option<Vec<usize>> = local_max_product.map(|max| {
-        // Simple heuristic: distribute limit evenly if multiple dimensions
-        let n = local_shape.len().max(1);
-        let per_dim = (max as f64).powf(1.0 / n as f64).floor() as usize;
-        vec![per_dim.max(1); n]
-    });
-    let local_max_slice = local_max.as_deref();
+        // For locals, we use product limit rather than per-dimension
+        // Convert to per-dimension limits if needed
+        let local_max: Option<Vec<usize>> = local_max_product.map(|max| {
+            // Simple heuristic: distribute limit evenly if multiple dimensions
+            let n = local_shape.len().max(1);
+            let per_dim = (max as f64).powf(1.0 / n as f64).floor() as usize;
+            vec![per_dim.max(1); n]
+        });
+        let local_max_slice = local_max.as_deref();
 
-    // Create global indices (gidx0, gidx1, ...)
-    let global_idxs = get_grouped_dims("gidx", &global_shape, global_max, true);
-    // Create local indices (lidx0, lidx1, ...)
-    let local_idxs = get_grouped_dims("lidx", &local_shape, local_max_slice, false);
+        // Create global indices (gidx0, gidx1, ...)
+        let global_idxs = get_grouped_dims("gidx", &global_shape, global_max, true);
+        // Create local indices (lidx0, lidx1, ...)
+        let local_idxs = get_grouped_dims("lidx", &local_shape, local_max_slice, false);
+        let local_idxs_for_masks = local_idxs.clone();
 
-    // Clone local_idxs for later use in store masking
-    let local_idxs_for_masks = local_idxs.clone();
-
-    // Combine indices in order: global, then local
-    let all_idxs: Vec<Arc<UOp>> = global_idxs.into_iter().chain(local_idxs).collect();
+        // Combine indices in order: global, then local
+        (global_idxs.into_iter().chain(local_idxs).collect(), local_idxs_for_masks)
+    };
 
     // Build substitution map: RANGE -> corresponding index
-    let mut subs: HashMap<u64, Arc<UOp>> = HashMap::new();
+    let mut subs: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     let all_dims: Vec<(usize, AxisType)> = global_dims.iter().chain(local_dims.iter()).cloned().collect();
 
     for (i, (axis_id, axis_type)) in all_dims.iter().enumerate() {
@@ -173,7 +211,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
         if let Some(range_uop) = all_ranges.get(&(*axis_id, *axis_type))
             && i < all_idxs.len()
         {
-            subs.insert(range_uop.id, all_idxs[i].clone());
+            subs.insert(UOpKey(range_uop.clone()), all_idxs[i].clone());
         }
     }
 
@@ -190,9 +228,7 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
         return None;
     }
 
-    let new_sources: SmallVec<[Arc<UOp>; 4]> = sources.iter().map(|s| substitute(s, &subs)).collect();
-
-    Some(UOp::new(Op::Sink { sources: new_sources }, sink.dtype().clone()))
+    Some(sink.substitute(&subs))
 }
 
 /// Compute store masks for global stores with missing local indices.
@@ -200,13 +236,14 @@ fn add_gpudims(ctx: &Renderer, sink: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// Based on Tinygrad's gpudims.py:86-96.
 /// When a STORE to global memory doesn't use all local indices,
 /// we add a mask so the store only executes when missing locals are 0.
+#[allow(clippy::mutable_key_type)]
 fn compute_store_masks(
     topo: &[Arc<UOp>],
     all_ranges: &HashMap<(usize, AxisType), Arc<UOp>>,
     local_dims: &[(usize, AxisType)],
     local_idxs: &[Arc<UOp>],
-) -> HashMap<u64, Arc<UOp>> {
-    let mut masks: HashMap<u64, Arc<UOp>> = HashMap::new();
+) -> HashMap<UOpKey, Arc<UOp>> {
+    let mut masks: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
 
     for uop in topo {
         let Op::Store { index, .. } = uop.op() else {
@@ -271,37 +308,11 @@ fn compute_store_masks(
                 .gate(new_gate)
                 .call()
                 .expect("gpudims: INDEX gate construction failed");
-            masks.insert(index.id, new_index);
+            masks.insert(UOpKey(index.clone()), new_index);
         }
     }
 
     masks
-}
-
-/// Substitute UOps according to the substitution map.
-fn substitute(uop: &Arc<UOp>, subs: &HashMap<u64, Arc<UOp>>) -> Arc<UOp> {
-    // Check if this exact UOp should be substituted
-    if let Some(replacement) = subs.get(&uop.id) {
-        return replacement.clone();
-    }
-
-    // Recursively substitute children
-    let children = uop.op().children();
-    if children.is_empty() {
-        return uop.clone();
-    }
-
-    let new_children: Vec<Arc<UOp>> = children.iter().map(|c| substitute(c, subs)).collect();
-
-    // Check if any children changed
-    let changed = children.iter().zip(&new_children).any(|(old, new)| old.id != new.id);
-
-    if !changed {
-        return uop.clone();
-    }
-
-    // Rebuild with new children
-    uop.replace().src(new_children).call()
 }
 
 /// Extract i64 value from ConstValue.
@@ -601,13 +612,7 @@ fn combine_expanded_dims(raw_idxs: &[Arc<UOp>], limited_dims: &[usize], original
             let mul2 = add1.mul(&UOp::index_const(limited_dims[2] as i64));
             vec![mul2.add(&raw_idxs[2])]
         }
-        (3, 2) => {
-            // idx0 = raw_idxs[0] * limited_dims[1] + raw_idxs[1]
-            // idx1 = raw_idxs[2]
-            let mul = raw_idxs[0].mul(&UOp::index_const(limited_dims[1] as i64));
-            vec![mul.add(&raw_idxs[1]), raw_idxs[2].clone()]
-        }
-        _ => raw_idxs.to_vec(),
+        _ => flatten_unflatten_dims(raw_idxs, limited_dims, original_dims),
     }
 }
 
@@ -642,98 +647,5 @@ fn flatten_unflatten_dims(raw_idxs: &[Arc<UOp>], limited_dims: &[usize], origina
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_group_dims_already_fits() {
-        // Dims already fit, no grouping needed
-        let result = group_dims(&[4, 4], &[16, 16, 16]);
-        assert_eq!(result, Some(vec![4, 4]));
-    }
-
-    #[test]
-    fn test_group_dims_needs_grouping() {
-        // 4 dims need to be grouped to fit into 3 max_sizes
-        // [4, 4, 4, 4] can't fit directly into [256, 256, 256] (4 dims > 3 max_sizes)
-        // Should group: [4*4, 4, 4] = [16, 4, 4]
-        let result = group_dims(&[4, 4, 4, 4], &[256, 256, 256]);
-        assert!(result.is_some());
-        let result = result.unwrap();
-        assert!(result.len() <= 3);
-    }
-
-    #[test]
-    fn test_group_dims_no_change() {
-        // Dims already fit
-        let result = group_dims(&[8, 8, 8], &[256, 256, 256]);
-        assert_eq!(result, Some(vec![8, 8, 8]));
-    }
-
-    #[test]
-    fn test_group_dims_impossible() {
-        // Can't fit 1000 into max 10
-        let result = group_dims(&[1000], &[10]);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_split_dims_simple() {
-        // 100 exceeds 64, should split
-        let result = split_dims(&[100], &[64, 64, 64]);
-        // 100 / 2 = 50, then 50 / 2 = 25 fits
-        assert!(result.iter().all(|&d| d <= 64));
-    }
-
-    #[test]
-    fn test_find_smallest_divisor() {
-        assert_eq!(find_smallest_divisor(1), 1);
-        assert_eq!(find_smallest_divisor(2), 2); // 2 is the smallest divisor of 2 (excluding 1)
-        assert_eq!(find_smallest_divisor(3), 1); // 3 is prime
-        assert_eq!(find_smallest_divisor(4), 2);
-        assert_eq!(find_smallest_divisor(9), 3);
-        assert_eq!(find_smallest_divisor(100), 2);
-    }
-
-    #[test]
-    fn test_get_contraction_non_consecutive() {
-        // [2, 5, 2] → [10, 2]: dims 0,1 fuse to 10; dim 2 stays as 2
-        // acc_old = [2, 10, 20], acc_new = [10, 20]
-        let result = get_contraction(&[2, 5, 2], &[10, 2]);
-        assert_eq!(result, Some(vec![vec![0, 1], vec![2]]));
-    }
-
-    #[test]
-    fn test_get_contraction_identity() {
-        // [4, 4, 4] → [4, 4, 4]: no grouping
-        let result = get_contraction(&[4, 4, 4], &[4, 4, 4]);
-        assert_eq!(result, Some(vec![vec![0], vec![1], vec![2]]));
-    }
-
-    #[test]
-    fn test_get_contraction_all_fused() {
-        // [2, 3, 4] → [24]: all dims fuse to one
-        let result = get_contraction(&[2, 3, 4], &[24]);
-        assert_eq!(result, Some(vec![vec![0, 1, 2]]));
-    }
-
-    #[test]
-    fn test_get_contraction_empty() {
-        let result = get_contraction(&[], &[]);
-        assert_eq!(result, Some(vec![]));
-    }
-
-    #[test]
-    fn test_get_contraction_invalid() {
-        // [2, 3, 4] → [5, 4]: 2*3 = 6 != 5
-        let result = get_contraction(&[2, 3, 4], &[5, 4]);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_get_contraction_partial() {
-        // [2, 4, 3] → [8, 3]: dims 0,1 fuse to 8; dim 2 stays as 3
-        let result = get_contraction(&[2, 4, 3], &[8, 3]);
-        assert_eq!(result, Some(vec![vec![0, 1], vec![2]]));
-    }
-}
+#[path = "test/unit/gpudims_internal.rs"]
+mod tests;

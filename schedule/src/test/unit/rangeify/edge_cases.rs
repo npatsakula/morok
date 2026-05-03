@@ -7,7 +7,7 @@ use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, ConstValue, Op, UOp};
 use smallvec::SmallVec;
 
-use crate::rangeify::{KernelContext, bufferize_to_store, run_kernel_split_pipeline};
+use crate::rangeify::{RangeifyBufferContext, bufferize_to_store, try_get_kernel_graph};
 use crate::test::unit::rangeify::helpers::extract_kernel;
 
 #[test]
@@ -30,7 +30,7 @@ fn test_zero_size_range() {
 
 #[test]
 fn test_empty_bufferize() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // BUFFERIZE with no ranges (scalar store)
     let compute = UOp::native_const(42.0f32);
@@ -107,18 +107,19 @@ fn test_zero_size_pipeline() {
     );
 
     // Run through pipeline
-    let (result, _context) = run_kernel_split_pipeline(bufferize);
+    let (result, _context) =
+        try_get_kernel_graph(bufferize).expect("kernel split pipeline should succeed for zero-size bufferize");
 
-    // Should create a KERNEL even with zero ranges
-    // Extract KERNEL from result (may be wrapped in AFTER structure)
-    let kernel = extract_kernel(&result).expect("Pipeline should create a KERNEL");
-    assert!(matches!(kernel.op(), Op::Kernel { .. }));
+    // Should create a CALL even with zero ranges
+    // Extract CALL from result (may be wrapped in AFTER structure)
+    let kernel = extract_kernel(&result).expect("Pipeline should create a CALL");
+    assert!(matches!(kernel.op(), Op::Call { .. }));
 }
 
 #[test]
 #[should_panic(expected = "Cannot allocate buffer: range vmax resolved to")]
 fn test_bufferize_with_zero_range_inside() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create BUFFERIZE with a zero-sized range
     // Zero-sized buffers are invalid (Tinygrad: "assert size > 0")
@@ -141,7 +142,7 @@ fn test_bufferize_with_zero_range_inside() {
 #[test]
 #[should_panic(expected = "Cannot allocate buffer: range vmax resolved to")]
 fn test_multiple_zero_ranges() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create BUFFERIZE with multiple zero-sized ranges
     // Zero-sized buffers are invalid (Tinygrad: "assert size > 0")

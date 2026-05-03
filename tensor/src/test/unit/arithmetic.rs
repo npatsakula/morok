@@ -143,15 +143,17 @@ fn test_lazy_evaluation() {
 
 #[test]
 fn test_sub_same_shape() {
+    // `a - b` is represented as `a + (-b)`; Sub is reintroduced by late
+    // codegen rewrites for backends that support it.
     let a = Tensor::from_slice([5.0f32, 6.0, 7.0]);
     let b = Tensor::from_slice([1.0f32, 2.0, 3.0]);
     let c = &a - &b;
 
-    if let Op::Binary(op, _, _) = c.uop().op() {
-        assert_eq!(format!("{:?}", op), "Sub");
-    } else {
-        panic!("Expected Binary Sub operation");
-    }
+    assert!(
+        matches!(c.uop().op(), Op::Binary(morok_ir::BinaryOp::Add, _, _)),
+        "Expected Binary Add (a + (-b)), got {:?}",
+        c.uop().op()
+    );
 }
 
 #[test]

@@ -19,14 +19,7 @@ pub struct RenderedKernel {
     pub buffer_args: Vec<BufferArg>,
 
     /// Variable names in order (for populating vars array at runtime).
-    /// Includes thread_id at the end if threading is enabled.
     pub var_names: Vec<String>,
-
-    /// Global work size (for GPU backends).
-    pub global_size: Option<[usize; 3]>,
-
-    /// Local work size (for GPU backends).
-    pub local_size: Option<[usize; 3]>,
 }
 
 /// Information about a buffer argument to the kernel.
@@ -48,17 +41,11 @@ pub struct BufferArg {
 impl RenderedKernel {
     /// Create a new rendered kernel.
     pub fn new(code: String, name: String) -> Self {
-        Self { code, name, buffer_args: Vec::new(), var_names: Vec::new(), global_size: None, local_size: None }
+        Self { code, name, buffer_args: Vec::new(), var_names: Vec::new() }
     }
 
     /// Add a buffer argument.
     pub fn add_buffer_arg(&mut self, arg: BufferArg) {
         self.buffer_args.push(arg);
-    }
-
-    /// Set work sizes for GPU execution.
-    pub fn set_work_sizes(&mut self, global: [usize; 3], local: [usize; 3]) {
-        self.global_size = Some(global);
-        self.local_size = Some(local);
     }
 }

@@ -14,13 +14,12 @@
 use std::sync::Arc;
 
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::{AxisType, Op, prelude::*};
-use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
+use morok_ir::{Op, prelude::*};
 
 use crate::common::is_output_buffer;
 use crate::llvm::common::{RenderContext, ldt};
 use crate::llvm::cpu::{reduce_identity, render_uop};
-use crate::{BufferArg, RenderedKernel, Renderer, Result};
+use crate::{BufferArg, Error, RenderedKernel, Renderer, Result};
 
 /// Text-based LLVM IR renderer.
 ///
@@ -44,15 +43,25 @@ impl Renderer for LlvmTextRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        let nodes = linearize_with_cfg(uop.clone());
-
-        // Stage 22: Apply line rewrite cleanups to handle gated INDEX operations.
-        // Converts gated STOREs to IF/STORE/ENDIF sequences.
-        // Based on Tinygrad's pm_linearize_cleanups (codegen/__init__.py:107-113).
-        let nodes = line_rewrite_cleanups(nodes);
+        let nodes: Vec<Arc<UOp>> = match uop.op() {
+            Op::Linear { ops } => ops.iter().cloned().collect(),
+            other => {
+                return Err(Error::InvalidGraph {
+                    reason: format!("LLVM text renderer expects LINEAR input, got {other:?}"),
+                });
+            }
+        };
 
         for (i, node) in nodes.iter().enumerate() {
             tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "linearized node");
+            if matches!(node.op(), Op::Custom { .. } | Op::CustomI { .. }) {
+                return Err(Error::InvalidGraph {
+                    reason: format!(
+                        "LLVM backend does not support CUSTOM/CUSTOMI templates (op id {}); use C backend for custom templates",
+                        node.id
+                    ),
+                });
+            }
         }
 
         let mut ctx = RenderContext::new();
@@ -77,20 +86,6 @@ impl Renderer for LlvmTextRenderer {
 
         buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
 
-        let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
-            if let Op::Range { axis_type, end, .. } = n.op()
-                && matches!(axis_type, AxisType::Thread)
-                && let Op::Const(cv) = end.op()
-                && let ConstValue::Int(count) = cv.0
-            {
-                return Some((n.clone(), count as usize));
-            }
-            None
-        });
-
-        let has_threading = thread_info.is_some();
-        let thread_count = thread_info.as_ref().map(|(_, c)| *c).unwrap_or(1);
-
         for (i, buf) in buffers.iter().enumerate() {
             if let Op::Param { slot, device: None, .. } = buf.op() {
                 let is_output = is_output_buffer(buf, &nodes);
@@ -103,10 +98,6 @@ impl Renderer for LlvmTextRenderer {
                 var_names.push(name.clone());
             }
         }
-        if has_threading {
-            var_names.push("thread_id".to_string());
-        }
-
         // -- Build function parameters --
         let mut inner_params: Vec<String> = Vec::new();
 
@@ -124,18 +115,6 @@ impl Renderer for LlvmTextRenderer {
             let var_dtype_str = ldt(&var_dtype);
             inner_params.push(format!("{var_dtype_str} %{var_base_name}"));
             ctx.register(var.id, format!("%{var_base_name}"));
-        }
-
-        // Thread ID parameter
-        if let Some((thread_range, _)) = &thread_info {
-            let range_dtype = thread_range.dtype();
-            let range_dtype_str = ldt(&range_dtype);
-            inner_params.push(format!("{range_dtype_str} %thread_id"));
-
-            if let Op::Range { axis_id, .. } = thread_range.op() {
-                ctx.register(thread_range.id, "%thread_id".to_string());
-                ctx.register_range(axis_id.value(), "%thread_id".to_string());
-            }
         }
 
         // -- Build function body --
@@ -166,9 +145,7 @@ impl Renderer for LlvmTextRenderer {
         }
 
         for node in &nodes {
-            if let Op::Range { axis_id, axis_type, .. } = node.op()
-                && !matches!(axis_type, AxisType::Thread)
-            {
+            if let Op::Range { axis_id, .. } = node.op() {
                 let name = format!("%r{}", axis_id.value());
                 ctx.register(node.id, name);
             }
@@ -179,12 +156,10 @@ impl Renderer for LlvmTextRenderer {
                 ctx.register(node.id, String::new());
                 continue;
             }
-            if let Op::Range { axis_type, .. } = node.op()
-                && matches!(axis_type, AxisType::Thread)
-            {
-                continue;
-            }
             render_uop(node, &mut ctx, &mut kernel);
+            if let Some(err) = ctx.take_error() {
+                return Err(err);
+            }
         }
 
         kernel.push("  ret void".to_string());
@@ -212,11 +187,6 @@ attributes #0 = {{ nounwind "no-builtins" "no-trapping-math"="true" }}
         let mut result = RenderedKernel::new(ir, kernel_name.to_string());
         result.buffer_args = buffer_args;
         result.var_names = var_names;
-
-        if thread_count > 1 {
-            result.global_size = Some([thread_count, 1, 1]);
-            result.local_size = Some([1, 1, 1]);
-        }
 
         Ok(result)
     }
@@ -298,39 +268,5 @@ pub fn render(uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use morok_dtype::{AddrSpace, DType};
-    use morok_ir::{BinaryOp, Op};
-
-    #[test]
-    fn test_simple_add() {
-        let a = UOp::param(0, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
-        let b = UOp::param(1, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
-        let out = UOp::param(2, 1, DType::Float32.ptr(Some(1), AddrSpace::Global), None);
-
-        let idx = UOp::index_const(0);
-        let a_idx = UOp::index().buffer(a.clone()).indices(vec![idx.clone()]).call().unwrap();
-        let b_idx = UOp::index().buffer(b.clone()).indices(vec![idx.clone()]).call().unwrap();
-        let out_idx = UOp::index().buffer(out.clone()).indices(vec![idx.clone()]).call().unwrap();
-
-        let a_load = UOp::load().buffer(a.clone()).index(a_idx).call();
-        let b_load = UOp::load().buffer(b.clone()).index(b_idx).call();
-
-        let add = UOp::new(Op::Binary(BinaryOp::Add, a_load, b_load), DType::Float32);
-
-        let store = out_idx.store(add);
-        let sink = UOp::sink(vec![store]);
-
-        let result = render(&sink, Some("test_add")).unwrap();
-        println!("{}", result.code);
-
-        assert!(result.code.contains("define void @test_add("));
-        assert!(result.code.contains("noalias align 32"));
-        assert!(!result.code.contains("_inner"));
-        assert!(!result.code.contains("ptr %args"));
-        assert!(result.code.contains("fadd"));
-        assert!(result.code.contains("load"));
-        assert!(result.code.contains("store"));
-    }
-}
+#[path = "../../test/unit/llvm_text.rs"]
+mod tests;

@@ -234,14 +234,16 @@ const OP_CHILD_FIELDS: &[(&str, &[&str])] = &[
     ("StoreGated", &["buffer", "index", "value", "gate"]),
     // Symbolic
     ("Bind", &["var", "value"]),
-    ("Assign", &["target", "value"]),
+    // Callable
+    ("Call", &["body"]),
+    ("Function", &["body"]),
+    // Tuple
+    ("GetTuple", &["src"]),
     // Reduction
     ("Reduce", &["src"]),
     ("AllReduce", &["src", "device"]),
     // WMMA
     ("Wmma", &["a", "b", "c"]),
-    // Kernel
-    ("Kernel", &["ast"]), // sources is variadic
 ];
 
 /// Get child field names for an operation.

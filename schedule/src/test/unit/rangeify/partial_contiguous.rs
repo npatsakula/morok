@@ -14,6 +14,7 @@ use morok_dtype::DType;
 use morok_ir::{AddrSpace, AxisId, AxisType, BufferizeOpts, Op, SInt, UOp};
 use test_case::test_case;
 
+use crate::pattern::RewriteResult;
 use crate::rangeify::indexing::IndexingContext;
 use crate::rangeify::kernel::PcontigConfig;
 use crate::rangeify::patterns::buffer_removal_with_pcontig;
@@ -681,6 +682,39 @@ fn test_buffer_in_reduce_partial_contiguous() {
     // With REDUCE accessing buffer, may apply partial contiguous or keep buffer
     // Depends on LOCAL index detection
     drop(rewritten);
+}
+
+#[test]
+fn test_buffer_in_reduce_counts_runtime_buffer() {
+    let mut config = PcontigConfig::default();
+    let matcher = buffer_removal_with_pcontig();
+
+    let mut ctx = IndexingContext::new();
+    let loop_range = ctx.new_range(&SInt::Const(4), AxisType::Loop);
+    let reduce_range = ctx.new_range(&SInt::Const(4), AxisType::Reduce);
+    let input = UOp::new_buffer(morok_device::DeviceSpec::Cpu, 16, DType::Float32);
+    let indexed = UOp::index()
+        .buffer(input)
+        .indices(vec![loop_range.clone(), reduce_range.clone()])
+        .call()
+        .expect("runtime BUFFER index should construct");
+    let reduced = UOp::new(
+        Op::Reduce { src: indexed, ranges: vec![reduce_range].into(), reduce_op: morok_ir::ReduceOp::Add },
+        DType::Float32,
+    );
+    let bufferized = UOp::bufferize(
+        reduced,
+        vec![loop_range.clone()],
+        BufferizeOpts { device: None, addrspace: AddrSpace::Global, removable: true },
+    );
+    let load =
+        UOp::index().buffer(bufferized).indices(vec![loop_range]).call().expect("BUFFERIZE index should construct");
+
+    let result = matcher.rewrite(&load, &mut config);
+    assert!(
+        matches!(result, RewriteResult::NoMatch),
+        "default PCONTIG must keep BUFFERIZE when a REDUCE body reads an Op::Buffer"
+    );
 }
 
 /// Test buffer_in_reduce with REDUCE that doesn't access buffer.

@@ -36,10 +36,11 @@ impl KernelCif {
     /// Call the kernel, packing buffers + vals as u64 args.
     ///
     /// Uses a thread-local buffer for the packed args — zero allocation
-    /// after warmup. The `SmallVec<[Arg; 16]>` avoids heap allocation for
-    /// kernels with ≤16 arguments (the common case).
+    /// after warmup. The `SmallVec<[Arg; 32]>` avoids heap allocation for
+    /// kernels with ≤32 arguments (the common case); kernels above that cap
+    /// fall back to a heap allocation per dispatch.
     ///
-    /// `thread_id_patch`: if `Some((var_idx, value))`, patches
+    /// `var_patch`: if `Some((var_idx, value))`, patches
     /// `vals[var_idx]` to `value` before calling.
     #[inline]
     pub unsafe fn dispatch(
@@ -47,7 +48,7 @@ impl KernelCif {
         fn_ptr: *const (),
         buffers: &[*mut u8],
         vals: &[i64],
-        thread_id_patch: Option<(usize, usize)>,
+        var_patch: Option<(usize, usize)>,
     ) {
         assert_eq!(
             buffers.len() + vals.len(),
@@ -74,8 +75,8 @@ impl KernelCif {
                 packed[buffers.len() + idx] = val as u64;
             }
 
-            if let Some((var_idx, thread_id)) = thread_id_patch {
-                packed[buffers.len() + var_idx] = thread_id as u64;
+            if let Some((var_idx, value)) = var_patch {
+                packed[buffers.len() + var_idx] = value as u64;
             }
 
             let mut ffi_args: SmallVec<[middle::Arg; 32]> = SmallVec::with_capacity(self.arg_count);

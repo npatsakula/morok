@@ -85,7 +85,8 @@ pub fn derive_pattern_enum(input: TokenStream) -> TokenStream {
 
 /// Proc-macro for declarative pattern rewrite rules.
 ///
-/// Generates a [`SimplifiedPatternMatcher`] from a list of pattern rewrite rules.
+/// Generates a `SimplifiedPatternMatcher` (in `morok_ir::pattern`) from a list
+/// of pattern rewrite rules.
 /// Patterns are compiled to efficient Rust code with O(1) dispatch via `OpKey`.
 ///
 /// # Syntax Overview
@@ -190,13 +191,12 @@ pub fn derive_pattern_enum(input: TokenStream) -> TokenStream {
 ///
 /// # Generated Code
 ///
-/// This macro generates a `SimplifiedPatternMatcher` with:
+/// This macro generates a `SimplifiedPatternMatcher` (defined in
+/// `morok_ir::pattern`) with:
 /// - Compile-time validation of all operation names
 /// - O(1) dispatch via OpKey hashmap
 /// - Inline pattern matching (no runtime pattern interpretation)
 /// - Automatic `Arc::ptr_eq` checks for duplicate variables
-///
-/// [`SimplifiedPatternMatcher`]: morok_ir::pattern::SimplifiedPatternMatcher
 #[proc_macro]
 pub fn patterns(input: TokenStream) -> TokenStream {
     let pattern_list = parse_macro_input!(input as patterns::PatternList);

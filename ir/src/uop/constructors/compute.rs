@@ -157,8 +157,20 @@ impl UOp {
 
     binary_arith_ops! {
         try_add => Add,
-        try_sub => Sub,
         try_mul => Mul,
+    }
+
+    /// Subtraction: `self - rhs`.
+    ///
+    /// Matches Tinygrad's elementwise mixin: subtraction is represented as
+    /// addition of negation (`x + (-y)`) through the optimization pipeline.
+    /// Backends still have `BinaryOp::Sub`; it is reintroduced by late render
+    /// rewrites when the target supports a native subtract instruction.
+    #[track_caller]
+    pub fn try_sub(self: &Arc<Self>, rhs: &Arc<Self>) -> Result<Arc<Self>> {
+        let (lhs, rhs, _) = Self::promote_and_cast(self.clone(), rhs.clone())?;
+        Self::validate_binary_shapes(&lhs, &rhs, BinaryOp::Sub)?;
+        lhs.try_add(&rhs.neg())
     }
 
     division_ops! {

@@ -3,10 +3,12 @@
 //! Provides generic kernel execution interface with backend-specific implementations
 //! (LLVM JIT, native shared libraries, CUDA, etc.).
 //!
-//! # Parallel Execution
+//! # Execution Model
 //!
-//! The `executor` module provides the `UnifiedExecutor` for parallel kernel
-//! execution across heterogeneous devices (CPU, GPU, etc.).
+//! `execution_plan` is the canonical runtime path and executes prepared
+//! operations in dependency order with hazard-aware host parallelism.
+//! The `executor` module remains available for explicit parallel scheduling
+//! scenarios.
 //!
 //! # Benchmarking
 //!
@@ -15,6 +17,7 @@
 
 pub mod benchmark;
 pub mod clang;
+pub mod custom_function;
 pub mod device_registry;
 pub mod devices;
 pub(crate) mod dispatch;
@@ -32,11 +35,15 @@ pub mod profiler;
 pub mod test;
 
 pub use benchmark::{BenchmarkConfig, BenchmarkResult, benchmark_kernel, benchmark_kernel_with_cutoff};
+pub use custom_function::run_custom_function;
 pub use device_registry::DEVICE_FACTORIES;
 pub use devices::cpu::{CpuBackend, create_cpu_device, create_cpu_device_with_backend};
 pub use devices::cpu_queue::CpuQueue;
 pub use error::*;
-pub use execution_plan::{ExecutionPlan, ExecutionPlanBuilder, PreparedKernel};
+pub use execution_plan::{
+    ExecutionPlan, ExecutionPlanBuilder, PreparedBufferView, PreparedCopy, PreparedCustomFunction, PreparedKernel,
+    PreparedOp,
+};
 pub use executor::{
     DeviceContext, ExecutionGraph, ExecutionNode, KernelBufferAccess, SyncStrategy, UnifiedExecutor, global_executor,
 };

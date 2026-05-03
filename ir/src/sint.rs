@@ -128,6 +128,25 @@ impl SInt {
         }
     }
 
+    /// Maximum bound (Tinygrad's `x.vmax`).
+    ///
+    /// For `Const` returns the value. For `Symbolic` returns the symbolic
+    /// expression's `vmax` if it resolves to a non-negative integer, and
+    /// `None` otherwise so callers can fall back to the worst case rather
+    /// than silently treating distinct degenerate ranges as equal. For
+    /// `Infer` returns `None`.
+    pub fn vmax(&self) -> Option<usize> {
+        match self {
+            SInt::Const(v) => Some(*v),
+            SInt::Symbolic(uop) => match uop.vmax() {
+                crate::ConstValue::Int(v) if *v >= 0 => Some(*v as usize),
+                crate::ConstValue::UInt(v) => Some(*v as usize),
+                _ => None,
+            },
+            SInt::Infer => None,
+        }
+    }
+
     /// Get symbolic UOp if this is symbolic, None otherwise.
     pub fn as_symbolic(&self) -> Option<&Arc<UOp>> {
         match self {

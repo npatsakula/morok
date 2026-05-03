@@ -226,20 +226,41 @@ impl Tensor {
 
     /// Returns `true` where elements are infinite.
     ///
-    /// Uses `(x - x).isnan() & !x.isnan()` to detect infinity without direct
-    /// equality comparison (which our range analyzer handles conservatively).
-    /// For directional detection, further filters by sign.
+    /// Detects ±∞ via bitcast to the corresponding unsigned integer type and a
+    /// bit-pattern compare. Operating in integer space sidesteps Morok's float
+    /// range analysis, which folds `x == ±inf` to false because `dtype_bounds`
+    /// returns finite ±max for floats. Tinygrad gets away with the float compare
+    /// because its `dtype.min/max` are ±inf.
     #[track_caller]
     pub fn isinf(&self, detect_positive: bool, detect_negative: bool) -> Result<Tensor> {
-        // inf - inf = NaN, finite - finite = 0, NaN - NaN = NaN
-        // So (x-x).isnan() is true for both inf and NaN; exclude NaN.
-        let is_inf = self.try_sub(self)?.isnan()?.try_sub(&self.isnan()?)?;
-        let zero = self.zero()?;
+        use morok_dtype::{DType, ScalarDType};
+        let dtype = self.uop().dtype();
+        // (uint_bitcast_dtype, +inf bit pattern, -inf bit pattern, abs-mask)
+        let (uint_dt, pos_bits, neg_bits, abs_mask): (DType, i64, i64, i64) = match dtype {
+            DType::Scalar(ScalarDType::Float16) => (DType::UInt16, 0x7C00, 0xFC00, 0x7FFF),
+            DType::Scalar(ScalarDType::BFloat16) => (DType::UInt16, 0x7F80, 0xFF80, 0x7FFF),
+            DType::Scalar(ScalarDType::Float32) => (DType::UInt32, 0x7F800000, 0xFF800000_u32 as i64, 0x7FFFFFFF),
+            DType::Scalar(ScalarDType::Float64) => {
+                (DType::UInt64, 0x7FF0000000000000, 0xFFF0000000000000_u64 as i64, 0x7FFFFFFFFFFFFFFF)
+            }
+            // Non-float dtypes never have inf.
+            _ => return self.zero()?.cast(DType::Bool),
+        };
+
+        let bits = self.bitcast(uint_dt)?;
+        let pos_pat = bits.broadcast_scalar(ConstValue::Int(pos_bits))?;
         match (detect_positive, detect_negative) {
-            (true, true) => Ok(is_inf),
-            (true, false) => is_inf.try_mul(&self.try_gt(&zero)?),
-            (false, true) => is_inf.try_mul(&self.try_lt(&zero)?),
-            (false, false) => Ok(zero.cast(morok_dtype::DType::Bool)?),
+            (true, true) => {
+                // (bits & abs_mask) == +inf bits → matches both +inf and -inf
+                let mask = bits.broadcast_scalar(ConstValue::Int(abs_mask))?;
+                bits.bitwise_and(&mask)?.try_eq(&pos_pat)
+            }
+            (true, false) => bits.try_eq(&pos_pat),
+            (false, true) => {
+                let neg_pat = bits.broadcast_scalar(ConstValue::Int(neg_bits))?;
+                bits.try_eq(&neg_pat)
+            }
+            (false, false) => self.zero()?.cast(DType::Bool),
         }
     }
 

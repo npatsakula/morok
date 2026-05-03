@@ -5,8 +5,10 @@
 //!
 //! Based on Tinygrad's PTX/NIR bool->uint8 patterns.
 
-use morok_dtype::ScalarDType;
-use morok_ir::Op;
+use morok_dtype::{DType, ScalarDType};
+use morok_ir::types::ConstValue;
+use morok_ir::{Op, UOp};
+use smallvec::smallvec;
 
 use super::helpers::*;
 
@@ -230,4 +232,29 @@ fn test_vector_bool_store() {
             _ => {}
         }
     }
+}
+
+/// Test: bool_storage keeps alt on gated loads.
+#[test]
+fn test_bool_gated_load_preserves_alt() {
+    let buffer = create_bool_buffer(64);
+    let idx = UOp::const_(DType::Index, ConstValue::Int(0));
+    let gate = create_bool_const(false);
+    let gated_index =
+        UOp::new(Op::Index { buffer: buffer.clone(), indices: smallvec![idx], gate: Some(gate) }, DType::Bool);
+    let load =
+        UOp::load().buffer(buffer.clone()).index(gated_index).alt(create_bool_const(true)).dtype(DType::Bool).call();
+
+    let result = apply_bool_storage(&load);
+    let Op::Cast { src, .. } = result.op() else {
+        panic!("Expected CAST wrapping converted bool load, got {:?}", result.op());
+    };
+    let Op::Load { index, alt, .. } = src.op() else {
+        panic!("Expected inner LOAD after bool storage, got {:?}", src.op());
+    };
+    assert!(matches!(index.op(), Op::Index { gate: Some(_), .. }), "Expected gated INDEX to remain on LOAD");
+    let Some(alt) = alt else {
+        panic!("Expected gated LOAD alt to be preserved by bool_storage");
+    };
+    assert_eq!(alt.dtype().base(), ScalarDType::UInt8, "Alt should be converted to UInt8 storage dtype");
 }

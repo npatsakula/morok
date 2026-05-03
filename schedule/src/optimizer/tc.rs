@@ -139,11 +139,26 @@ pub fn select_tensor_core(
         &renderer.tensor_cores[idx..idx + 1]
     };
 
-    let (in0_scalar, in1_scalar, out_scalar) =
-        (pattern.in0.dtype().scalar(), pattern.in1.dtype().scalar(), pattern.reduce_op.dtype().scalar());
+    // Use `.scalar()` (returns Option) instead of `.base()` so Image dtypes
+    // don't silently masquerade as Float32 (`base()` maps `Image` → Float32).
+    // Reject Image dtypes outright — TCs operate on plain Scalar/Vector dtypes.
+    let in0_dt = &pattern.in0.dtype();
+    let in1_dt = &pattern.in1.dtype();
+    let out_dt = &pattern.reduce_op.dtype();
+    if in0_dt.is_image() || in1_dt.is_image() || out_dt.is_image() {
+        return Ok(None);
+    }
+    let Some(in0_scalar) = in0_dt.scalar() else { return Ok(None) };
+    let Some(in1_scalar) = in1_dt.scalar() else { return Ok(None) };
+    let Some(out_scalar) = out_dt.scalar() else { return Ok(None) };
 
     for (tc_idx, tc) in tensor_cores.iter().enumerate() {
-        let (tc_in_scalar, tc_out_scalar) = (tc.dtype_in.scalar(), tc.dtype_out.scalar());
+        if tc.dtype_in.is_image() || tc.dtype_out.is_image() {
+            continue;
+        }
+        let (Some(tc_in_scalar), Some(tc_out_scalar)) = (tc.dtype_in.scalar(), tc.dtype_out.scalar()) else {
+            continue;
+        };
 
         if in0_scalar != tc_in_scalar || in1_scalar != tc_in_scalar || out_scalar != tc_out_scalar {
             continue;
@@ -663,8 +678,8 @@ fn tc_reject_reason(err: &OptError) -> &'static str {
         OptError::AxisOutOfBounds { .. } => "axis out of bounds",
         OptError::DivisionError { .. } => "division constraint violated",
         OptError::SymbolicDivisionError { .. } => "symbolic divisibility constraint",
-        OptError::ExpectedRangeOperation { .. } => "expected range operation",
-        OptError::MissingAxisParameter { .. } => "missing axis parameter",
+        OptError::ExpectedRangeOperation => "expected range operation",
+        OptError::MissingAxisParameter => "missing axis parameter",
         OptError::UnsupportedFeature { .. } => "unsupported backend feature",
         OptError::DeviceLimitExceeded { .. } => "device limit exceeded",
     }
@@ -714,8 +729,24 @@ pub fn apply_with_axis_choice(
     };
     let mut last_err: Option<OptError> = None;
 
-    for choice in choices {
+    // Cap total trials to bound compile time when both axis_choices and
+    // tensor_cores are large. 64 covers realistic combinations (>16 axes ×
+    // >4 TC variants is exceedingly rare) without aborting useful searches.
+    const TC_RETRY_BUDGET: usize = 64;
+    let mut trials = 0usize;
+
+    'outer: for choice in choices {
         for &tc_choice in &tc_choices {
+            if trials >= TC_RETRY_BUDGET {
+                tracing::debug!(
+                    trials,
+                    budget = TC_RETRY_BUDGET,
+                    "tensor core retry budget exhausted; aborting search"
+                );
+                break 'outer;
+            }
+            trials += 1;
+
             let mut trial = scheduler.clone();
             match apply_axis_choice_impl(&mut trial, &pattern, tc_choice, tc_opt, use_tensor_cores, choice) {
                 Ok(axes) => {

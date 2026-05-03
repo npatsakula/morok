@@ -21,40 +21,40 @@ where
     count
 }
 
-/// Count KERNEL operations in a UOp graph.
+/// Count CALL operations in a UOp graph.
 pub fn count_kernels(uop: &Arc<UOp>) -> usize {
-    count_ops(uop, |op| matches!(op, Op::Kernel { .. }))
+    count_ops(uop, |op| matches!(op, Op::Call { .. }))
 }
 
-/// Extract the first KERNEL from a pipeline result.
+/// Extract the first CALL from a pipeline result.
 ///
 /// The kernel split pipeline may return:
-/// - KERNEL directly
-/// - AFTER(DEFINE_GLOBAL, [END(KERNEL)])
+/// - CALL directly
+/// - AFTER(DEFINE_GLOBAL, [END(CALL)])
 /// - SINK([AFTER(...)])
 ///
-/// This helper extracts the first KERNEL found in any of these structures.
+/// This helper extracts the first CALL found in any of these structures.
 pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
     match uop.op() {
-        // Direct KERNEL
-        Op::Kernel { .. } => Some(uop.clone()),
-        // AFTER(passthrough, deps) - check deps for END(KERNEL)
+        // Direct callable wrapper
+        Op::Call { .. } => Some(uop.clone()),
+        // AFTER(passthrough, deps) - check deps for END(CALL)
         Op::After { deps, .. } => {
             for dep in deps.iter() {
                 if let Op::End { computation, .. } = dep.op()
-                    && matches!(computation.op(), Op::Kernel { .. })
+                    && matches!(computation.op(), Op::Call { .. })
                 {
                     return Some(computation.clone());
                 }
-                // Also check if dep is directly a KERNEL
-                if matches!(dep.op(), Op::Kernel { .. }) {
+                // Also check if dep is directly a callable wrapper
+                if matches!(dep.op(), Op::Call { .. }) {
                     return Some(dep.clone());
                 }
             }
             None
         }
         // SINK - check sources
-        Op::Sink { sources } => {
+        Op::Sink { sources, .. } => {
             for src in sources.iter() {
                 if let Some(kernel) = extract_kernel(src) {
                     return Some(kernel);
@@ -62,8 +62,8 @@ pub fn extract_kernel(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
             }
             None
         }
-        // END(KERNEL)
-        Op::End { computation, .. } if matches!(computation.op(), Op::Kernel { .. }) => Some(computation.clone()),
+        // END(CALL)
+        Op::End { computation, .. } if matches!(computation.op(), Op::Call { .. }) => Some(computation.clone()),
         _ => None,
     }
 }

@@ -38,21 +38,23 @@ pub mod rewrite;
 #[cfg(any(test, feature = "proptest"))]
 pub mod test;
 
-// Re-exports for backward compatibility
-// All types remain accessible at the crate root
+// Re-exports at crate root for ergonomic access.
 pub use error::{Error, IndexTypeMismatchSnafu, Result};
 pub use indexing::IndexSpec;
 pub use op::Op;
 pub use sint::{IntoShrinkRange, SInt, ShrinkRange, sint_max, sint_min, sint_prod};
 pub use types::{
-    AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, ConstValueHash, ContiguousHint, MovementArg,
-    ReduceOp, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
+    AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,
+    CustomFunctionKind, KernelInfo, ReduceOp, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
 };
 pub use uop::{IntoUOp, UOp, UOpKey};
 
 // Re-export pattern matching and rewriting infrastructure
 pub use pattern::{Matcher, RewriteResult, TypedPatternMatcher};
-pub use rewrite::graph_rewrite;
+pub use rewrite::{
+    graph_rewrite, graph_rewrite_bottom_up_preserve_calls, graph_rewrite_preserve_calls,
+    graph_rewrite_with_bpm_preserve_calls,
+};
 
 // Re-export external types for convenience
 pub use morok_dtype::DType;

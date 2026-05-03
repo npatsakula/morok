@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use morok_dtype::DType;
-use morok_ir::{AxisType, BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
+use morok_ir::{BinaryOp, Op, ReduceOp, TernaryOp, UnaryOp, prelude::*};
 
 use crate::llvm::common::{RenderContext, lcast, ldt};
 
@@ -49,7 +49,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
         | Op::Buffer { .. }
         | Op::Unique(_)
         | Op::Device(_)
-        | Op::Kernel { .. }
+        | Op::Call { .. }
         | Op::Barrier { .. } => None,
 
         Op::DefineLocal(_) | Op::DefineReg { .. } => {
@@ -74,11 +74,15 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             if indices.is_empty() {
                 kernel.push(format!("  {dst} = bitcast {buf_type} {buf} to {}", ldt(&uop.dtype())));
             } else {
-                // Multi-index: linearize at render time using row-major strides
-                let (final_idx, final_idx_type) = if indices.len() > 1 {
-                    render_linearize_multi_index(&dst, indices, ctx, kernel)
-                } else {
+                let (final_idx, final_idx_type) = if indices.len() == 1 {
                     (ctx.get(&indices[0]).to_string(), ldt(&indices[0].dtype()))
+                } else {
+                    ctx.set_invalid_graph(format!(
+                        "LLVM renderer requires linearized INDEX (single-axis), found {} indices on uop {}",
+                        indices.len(),
+                        uop.id
+                    ));
+                    return None;
                 };
 
                 let elem_type = match uop.dtype() {
@@ -127,10 +131,13 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                 _ => index,
             };
             let gate_info = if let Op::Index { gate: Some(gate_uop), .. } = actual_index.op() {
-                let alt_uop = alt.as_ref().expect(
-                    "gated LOAD without alt value — pipeline bug: \
-                     line_rewrite_cleanups should ensure alt is present for gated loads",
-                );
+                let Some(alt_uop) = alt.as_ref() else {
+                    ctx.set_invalid_graph(format!(
+                        "gated LOAD on uop {} has no alt value; line_rewrite_cleanups must lift gated LOADs",
+                        uop.id
+                    ));
+                    return None;
+                };
                 Some((ctx.get(gate_uop).to_string(), ctx.get(alt_uop).to_string()))
             } else {
                 None
@@ -270,25 +277,21 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
                         kernel.push(format!("  {gt_ext} = uitofp i1 {gt_zero} to {stype}"));
                         kernel.push(format!("  {lt_ext} = uitofp i1 {lt_zero} to {stype}"));
                         kernel.push(format!("  {dst} = fsub nsz arcp contract afn {stype} {gt_ext}, {lt_ext}"));
-                    } else {
-                        let is_signed = src.dtype().is_signed();
-                        let cmp = if is_signed { "sgt" } else { "ugt" };
-                        let cmp_lt = if is_signed { "slt" } else { "icmp eq" };
+                    } else if src.dtype().is_signed() {
                         let gt_zero = format!("{dst}.gt");
                         let lt_zero = format!("{dst}.lt");
                         let gt_ext = format!("{dst}.gt_ext");
                         let lt_ext = format!("{dst}.lt_ext");
-                        kernel.push(format!("  {gt_zero} = icmp {cmp} {stype} {s}, 0"));
-                        if is_signed {
-                            kernel.push(format!("  {lt_zero} = icmp {cmp_lt} {stype} {s}, 0"));
-                        } else {
-                            kernel.push(format!("  {lt_zero} = icmp eq {stype} {s}, 0"));
-                            kernel.push(format!("  {lt_zero} = xor i1 {lt_zero}, 1"));
-                            kernel.push(format!("  {lt_zero} = and i1 {lt_zero}, 0"));
-                        }
+                        kernel.push(format!("  {gt_zero} = icmp sgt {stype} {s}, 0"));
+                        kernel.push(format!("  {lt_zero} = icmp slt {stype} {s}, 0"));
                         kernel.push(format!("  {gt_ext} = zext i1 {gt_zero} to {stype}"));
                         kernel.push(format!("  {lt_ext} = zext i1 {lt_zero} to {stype}"));
                         kernel.push(format!("  {dst} = sub {stype} {gt_ext}, {lt_ext}"));
+                    } else {
+                        // Unsigned: sign(x) = (x != 0) ? 1 : 0.
+                        let ne_zero = format!("{dst}.ne");
+                        kernel.push(format!("  {ne_zero} = icmp ne {stype} {s}, 0"));
+                        kernel.push(format!("  {dst} = zext i1 {ne_zero} to {stype}"));
                     }
                 }
                 UnaryOp::Erf => {
@@ -400,10 +403,7 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             // After pm_split_ends, each END has exactly one RANGE.
             // Use the range_stack to emit footer blocks in correct nesting order
             // (innermost first = LIFO), regardless of the END's ranges field order.
-            let range_count = ranges
-                .iter()
-                .filter(|r| matches!(r.op(), Op::Range { axis_type, .. } if !matches!(axis_type, AxisType::Thread)))
-                .count();
+            let range_count = ranges.iter().filter(|r| matches!(r.op(), Op::Range { .. })).count();
             for _ in 0..range_count {
                 if let Some(id) = ctx.pop_range() {
                     // Matches Tinygrad llvmir.py:166-170 exactly:
@@ -517,6 +517,10 @@ pub fn render_uop(uop: &Arc<UOp>, ctx: &mut RenderContext, kernel: &mut Vec<Stri
             Some(())
         }
 
+        // CUSTOM / CUSTOMI are intentionally absent: tinygrad's `llvmir.py`
+        // doesn't handle CUSTOM either, and the LLVM text renderer rejects
+        // these ops at the entry point with a typed error before they reach
+        // here (see `llvm/text/mod.rs`).
         op if op.is_movement() => {
             panic!(
                 "movement op {:?} (id={}) reached LLVM codegen — \
@@ -915,56 +919,6 @@ fn render_cat(dst: &str, sources: &[Arc<UOp>], ctx: &RenderContext, kernel: &mut
             }
         }
     }
-}
-
-/// Linearize multiple index expressions into a single linear offset at render time.
-///
-/// Emits LLVM IR `mul` + `add` chain for `idx0*stride0 + idx1*stride1 + ...`.
-/// Returns the final SSA name and its LLVM type string.
-fn render_linearize_multi_index(
-    dst: &str,
-    indices: &[Arc<UOp>],
-    ctx: &RenderContext,
-    kernel: &mut Vec<String>,
-) -> (String, String) {
-    use morok_schedule::passes::linearize_index::{compute_row_major_strides, extract_index_dimension};
-
-    // Extract dimensions from index UOps
-    let dims: Vec<i64> = indices
-        .iter()
-        .map(|idx| extract_index_dimension(idx).expect("multi-index dimension must be resolvable at codegen"))
-        .collect();
-    let strides = compute_row_major_strides(&dims);
-    let idx_type = ldt(&indices[0].dtype());
-
-    let mut current = String::new();
-    for (i, (idx_uop, &stride)) in indices.iter().zip(strides.iter()).enumerate() {
-        if stride == 0 {
-            continue;
-        }
-        let idx_val = ctx.get(idx_uop);
-        let term = if stride == 1 {
-            idx_val.to_string()
-        } else {
-            let mul_name = format!("{dst}.lin_mul{i}");
-            kernel.push(format!("  {mul_name} = mul {idx_type} {idx_val}, {stride}"));
-            mul_name
-        };
-
-        if current.is_empty() {
-            current = term;
-        } else {
-            let add_name = format!("{dst}.lin_add{i}");
-            kernel.push(format!("  {add_name} = add {idx_type} {current}, {term}"));
-            current = add_name;
-        }
-    }
-
-    if current.is_empty() {
-        current = "0".to_string();
-    }
-
-    (current, idx_type)
 }
 
 /// Get identity element for reduce operation.

@@ -24,6 +24,8 @@
 //! signal.wait(1, 1000)?;  // Wait for operation 1 to complete
 //! ```
 
+use std::any::Any;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -41,7 +43,10 @@ use snafu::ensure;
 /// # Thread Safety
 ///
 /// All implementations must be `Send + Sync` for cross-thread use.
-pub trait TimelineSignal: Send + Sync + std::fmt::Debug {
+pub trait TimelineSignal: Send + Sync + std::fmt::Debug + Any {
+    /// Return this signal as `Any` for checked type-erased queue dispatch.
+    fn as_any(&self) -> &dyn Any;
+
     /// Get the current signal value.
     fn value(&self) -> u64;
 
@@ -74,8 +79,13 @@ pub trait TimelineSignal: Send + Sync + std::fmt::Debug {
 ///
 /// Efficient for CPU-only workloads. Uses `AtomicU64` for the counter and
 /// `parking_lot::Condvar` for efficient waiting.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CpuTimelineSignal {
+    inner: Arc<CpuTimelineSignalInner>,
+}
+
+#[derive(Debug)]
+struct CpuTimelineSignalInner {
     /// Current timeline value (monotonically increasing).
     value: AtomicU64,
     /// Mutex for condvar waiting (protects nothing, just for condvar).
@@ -93,71 +103,86 @@ impl Default for CpuTimelineSignal {
 impl CpuTimelineSignal {
     /// Create a new CPU timeline signal starting at 0.
     pub fn new() -> Self {
-        Self { value: AtomicU64::new(0), mutex: Mutex::new(()), condvar: Condvar::new() }
+        Self {
+            inner: Arc::new(CpuTimelineSignalInner {
+                value: AtomicU64::new(0),
+                mutex: Mutex::new(()),
+                condvar: Condvar::new(),
+            }),
+        }
     }
 
     /// Create a new CPU timeline signal with an initial value.
     pub fn with_initial(initial: u64) -> Self {
-        Self { value: AtomicU64::new(initial), mutex: Mutex::new(()), condvar: Condvar::new() }
+        Self {
+            inner: Arc::new(CpuTimelineSignalInner {
+                value: AtomicU64::new(initial),
+                mutex: Mutex::new(()),
+                condvar: Condvar::new(),
+            }),
+        }
     }
 }
 
 impl TimelineSignal for CpuTimelineSignal {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn value(&self) -> u64 {
-        self.value.load(Ordering::Acquire)
+        self.inner.value.load(Ordering::Acquire)
     }
 
     fn set(&self, value: u64) {
-        // Store the new value
-        self.value.store(value, Ordering::Release);
-
-        // Wake all waiters to check the new value
-        self.condvar.notify_all();
+        let previous = self.inner.value.fetch_max(value, Ordering::AcqRel);
+        if value > previous {
+            self.inner.condvar.notify_all();
+        }
     }
 
     fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
         // Fast path: already reached
-        if self.value.load(Ordering::Acquire) >= target {
+        if self.inner.value.load(Ordering::Acquire) >= target {
             return Ok(());
         }
 
-        let mut guard = self.mutex.lock();
+        let mut guard = self.inner.mutex.lock();
 
         if timeout_ms == 0 {
             // Infinite wait
-            while self.value.load(Ordering::Acquire) < target {
-                self.condvar.wait(&mut guard);
+            while self.inner.value.load(Ordering::Acquire) < target {
+                self.inner.condvar.wait(&mut guard);
             }
             Ok(())
         } else {
             // Timed wait
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
-            while self.value.load(Ordering::Acquire) < target {
+            while self.inner.value.load(Ordering::Acquire) < target {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     ensure!(
-                        self.value.load(Ordering::Acquire) >= target,
+                        self.inner.value.load(Ordering::Acquire) >= target,
                         RuntimeSnafu {
                             message: format!(
                                 "timeline signal timeout: waited {}ms for value {}, current {}",
                                 timeout_ms,
                                 target,
-                                self.value.load(Ordering::Acquire)
+                                self.inner.value.load(Ordering::Acquire)
                             )
                         }
                     );
                     return Ok(());
                 }
 
-                let result = self.condvar.wait_for(&mut guard, remaining);
-                if result.timed_out() && self.value.load(Ordering::Acquire) < target {
+                let result = self.inner.condvar.wait_for(&mut guard, remaining);
+                if result.timed_out() && self.inner.value.load(Ordering::Acquire) < target {
                     return RuntimeSnafu {
                         message: format!(
                             "timeline signal timeout: waited {}ms for value {}, current {}",
                             timeout_ms,
                             target,
-                            self.value.load(Ordering::Acquire)
+                            self.inner.value.load(Ordering::Acquire)
                         ),
                     }
                     .fail();
@@ -172,7 +197,7 @@ impl TimelineSignal for CpuTimelineSignal {
 pub mod cuda {
     //! CUDA-specific timeline signal using event pools.
 
-    use std::collections::HashMap;
+    use std::any::Any;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -183,47 +208,76 @@ pub mod cuda {
     use crate::error::{CudaSnafu, Result};
     use snafu::ResultExt;
 
-    /// CUDA timeline signal using event pools.
+    /// Number of event slots in the ring. 64 is well above typical in-flight
+    /// depth and bounds the worst-case event memory.
+    const EVENT_RING_SIZE: usize = 64;
+
+    /// One occupied slot in the event ring.
+    #[derive(Debug)]
+    struct EventSlot {
+        timeline_value: u64,
+        event: Arc<CudaEvent>,
+    }
+
+    /// CUDA timeline signal using a fixed-size ring of event slots.
     ///
-    /// Each timeline value maps to a CUDA event. When `set(n)` is called,
-    /// we record an event at value `n` on the stream. When `wait(n)` is called,
-    /// we synchronize on that event.
+    /// Each `record(n)` lands in the next slot of the ring. Waiters look up
+    /// the smallest slot whose `timeline_value >= target` and synchronise on
+    /// its event. When the ring wraps and a slot is overwritten, the previous
+    /// `Arc<CudaEvent>` is released only after every waiter that fetched it
+    /// drops their clone (Arc lifetime semantics) — slots are never torn out
+    /// from under outstanding waiters.
     #[derive(Debug)]
     pub struct CudaTimelineSignal {
         /// Current timeline value.
         value: AtomicU64,
-        /// Event pool: timeline value → recorded event.
-        events: Mutex<HashMap<u64, Arc<CudaEvent>>>,
+        /// Ring of recorded (timeline_value, event) slots and a next-write cursor.
+        ring: Mutex<EventRing>,
         /// CUDA context for creating events.
         context: Arc<CudaContext>,
         /// Stream for recording events.
         stream: Arc<CudaStream>,
     }
 
+    #[derive(Debug)]
+    struct EventRing {
+        slots: [Option<EventSlot>; EVENT_RING_SIZE],
+        next: usize,
+    }
+
+    impl EventRing {
+        fn new() -> Self {
+            Self { slots: std::array::from_fn(|_| None), next: 0 }
+        }
+    }
+
     impl CudaTimelineSignal {
         /// Create a new CUDA timeline signal.
         pub fn new(context: Arc<CudaContext>, stream: Arc<CudaStream>) -> Self {
-            Self { value: AtomicU64::new(0), events: Mutex::new(HashMap::new()), context, stream }
+            Self { value: AtomicU64::new(0), ring: Mutex::new(EventRing::new()), context, stream }
         }
 
         /// Record an event at the given timeline value.
         ///
-        /// This should be called after submitting work to the stream.
+        /// Called after submitting work to the stream. The new (value, event)
+        /// pair occupies the next ring slot, overwriting whatever was there.
+        /// Overwriting is safe: any waiter that looked up that slot already
+        /// holds an `Arc<CudaEvent>` clone, which keeps the event alive past
+        /// the slot's overwrite — i.e. no event is dropped while a waiter
+        /// still references it.
         pub fn record(&self, value: u64) -> Result<()> {
             let event = self.context.create_event(None).context(CudaSnafu)?;
             self.stream.record(&event).context(CudaSnafu)?;
 
-            let mut events = self.events.lock();
-            events.insert(value, Arc::new(event));
+            let mut ring = self.ring.lock();
+            let slot_idx = ring.next;
+            ring.slots[slot_idx] = Some(EventSlot { timeline_value: value, event: Arc::new(event) });
+            ring.next = (slot_idx + 1) % EVENT_RING_SIZE;
+            drop(ring);
 
-            // Update the timeline value
-            self.value.fetch_max(value, Ordering::Release);
-
-            // Clean up old events (keep last 16)
-            if events.len() > 32 {
-                let current = self.value.load(Ordering::Acquire);
-                events.retain(|&v, _| v > current.saturating_sub(16));
-            }
+            // Update the timeline value. AcqRel keeps load-half non-Relaxed so concurrent
+            // record/set observe each other's monotonic updates.
+            self.value.fetch_max(value, Ordering::AcqRel);
 
             Ok(())
         }
@@ -235,6 +289,10 @@ pub mod cuda {
     }
 
     impl TimelineSignal for CudaTimelineSignal {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
         fn value(&self) -> u64 {
             self.value.load(Ordering::Acquire)
         }
@@ -242,7 +300,7 @@ pub mod cuda {
         fn set(&self, value: u64) {
             // For CUDA, set() should be called via record() after stream work.
             // This is a fallback that just updates the counter.
-            self.value.fetch_max(value, Ordering::Release);
+            self.value.fetch_max(value, Ordering::AcqRel);
         }
 
         fn wait(&self, target: u64, timeout_ms: u64) -> Result<()> {
@@ -251,11 +309,16 @@ pub mod cuda {
                 return Ok(());
             }
 
-            // Find the event for this timeline value
+            // Find the smallest event in the ring with timeline_value >= target.
+            // Cloning the Arc keeps the event alive even if the slot is later
+            // overwritten by a recycling record() — no torn waiters.
             let event = {
-                let events = self.events.lock();
-                // Find the smallest event >= target
-                events.iter().filter(|(&v, _)| v >= target).min_by_key(|(&v, _)| v).map(|(_, e)| Arc::clone(e))
+                let ring = self.ring.lock();
+                ring.slots
+                    .iter()
+                    .filter_map(|slot| slot.as_ref().filter(|s| s.timeline_value >= target))
+                    .min_by_key(|s| s.timeline_value)
+                    .map(|s| Arc::clone(&s.event))
             };
 
             if let Some(event) = event {
@@ -281,7 +344,17 @@ pub mod cuda {
                     }
                 }
             } else {
-                // No event recorded yet - spin wait
+                // No event matched. This can happen when (a) no record() has
+                // landed for `target` yet, or (b) we lost a race against
+                // sufficient record()s to wrap the ring and overwrite the
+                // slot satisfying `target` between the fast-path load above
+                // and this lookup. Re-check the timeline counter before
+                // entering the spin so a race-loser exits immediately rather
+                // than busy-yielding for an already-completed target.
+                if self.value.load(Ordering::Acquire) >= target {
+                    return Ok(());
+                }
+
                 let start = std::time::Instant::now();
                 let timeout = if timeout_ms == 0 {
                     std::time::Duration::MAX
@@ -311,60 +384,5 @@ pub mod cuda {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::thread;
-
-    #[test]
-    fn test_cpu_signal_basic() {
-        let signal = CpuTimelineSignal::new();
-        assert_eq!(signal.value(), 0);
-
-        signal.set(5);
-        assert_eq!(signal.value(), 5);
-
-        assert!(signal.is_reached(5));
-        assert!(signal.is_reached(3));
-        assert!(!signal.is_reached(10));
-    }
-
-    #[test]
-    fn test_cpu_signal_wait_already_reached() {
-        let signal = CpuTimelineSignal::new();
-        signal.set(10);
-
-        // Should return immediately
-        signal.wait(5, 100).unwrap();
-        signal.wait(10, 100).unwrap();
-    }
-
-    #[test]
-    fn test_cpu_signal_wait_concurrent() {
-        let signal = Arc::new(CpuTimelineSignal::new());
-        let signal_clone = Arc::clone(&signal);
-
-        let waiter = thread::spawn(move || {
-            signal_clone.wait(5, 5000).unwrap();
-            signal_clone.value()
-        });
-
-        // Give waiter time to block
-        thread::sleep(std::time::Duration::from_millis(10));
-
-        // Set the signal
-        signal.set(5);
-
-        let result = waiter.join().unwrap();
-        assert!(result >= 5);
-    }
-
-    #[test]
-    fn test_cpu_signal_timeout() {
-        let signal = CpuTimelineSignal::new();
-
-        // Should timeout waiting for value 10
-        let result = signal.wait(10, 50);
-        assert!(result.is_err());
-    }
-}
+#[path = "test/unit/sync.rs"]
+mod tests;

@@ -99,7 +99,7 @@ fn test_keep_bufferize_expensive() {
 }
 
 // Pattern 2: Always-Run Ops Tests
-// Tinygrad KEEPS buffers for ALWAYS_RUN_OPS (CONTIGUOUS, COPY, ASSIGN).
+// Tinygrad KEEPS buffers for ALWAYS_RUN_OPS (CONTIGUOUS, COPY).
 // These ops are materialization points that must produce actual buffers.
 
 #[test]
@@ -131,22 +131,6 @@ fn test_keep_bufferize_copy() {
     let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
 
     assert!(Arc::ptr_eq(&result, &bufferized), "COPY must keep its buffer");
-}
-
-#[test]
-fn test_keep_bufferize_assign() {
-    // BUFFERIZE(ASSIGN(target, value), ranges) should be KEPT (always-run op needs its buffer)
-    let target = UOp::param(1, 1, DType::Float32, None);
-    let value = UOp::native_const(1.0f32);
-    let assign = UOp::assign(target, value);
-
-    let range = create_range(10, 0);
-    let bufferized = create_bufferize(assign, vec![range]);
-
-    let matcher = buffer_removal();
-    let result = graph_rewrite(&matcher, bufferized.clone(), &mut ());
-
-    assert!(Arc::ptr_eq(&result, &bufferized), "ASSIGN must keep its buffer");
 }
 
 #[test]

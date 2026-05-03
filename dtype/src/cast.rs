@@ -82,9 +82,9 @@ impl DType {
     ///
     /// Type promotion rules:
     /// - Scalar + Scalar → promoted Scalar
-    /// - Ptr<T> + Ptr<T> → Ptr<T> (same Ptr types)
-    /// - Ptr<T> + Scalar(T) → Scalar(T) (Ptr will be auto-loaded in codegen)
-    /// - Ptr<T> + Scalar(U) → promoted Scalar (if T and U are compatible)
+    /// - `Ptr<T>` + `Ptr<T>` → `Ptr<T>` (same Ptr types)
+    /// - `Ptr<T>` + `Scalar(T)` → `Scalar(T)` (Ptr will be auto-loaded in codegen)
+    /// - `Ptr<T>` + `Scalar(U)` → promoted Scalar (if T and U are compatible)
     pub fn least_upper_dtype(dtypes: &[Self]) -> Option<Self> {
         if dtypes.is_empty() {
             return None;

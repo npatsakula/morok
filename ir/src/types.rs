@@ -6,7 +6,6 @@
 use std::hash::{Hash, Hasher};
 use std::mem::discriminant;
 
-use crate::sint::SInt;
 use morok_dtype::DeviceSpec;
 use morok_dtype::{DType, ScalarDType};
 
@@ -354,20 +353,6 @@ impl BufferizeOpts {
     }
 }
 
-/// Compact movement-operation metadata carried by ASSIGN.
-///
-/// Mirrors Tinygrad's `assign.arg` movement tuples `(op, marg)` so we can replay
-/// movement semantics without embedding a movement UOp chain as metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum MovementArg {
-    Reshape(Vec<SInt>),
-    Expand(Vec<SInt>),
-    Permute(Vec<usize>),
-    Flip(Vec<bool>),
-    Pad(Vec<(SInt, SInt)>),
-    Shrink(Vec<(SInt, SInt)>),
-}
-
 /// Optimization hint carried by CONTIGUOUS ops.
 ///
 /// This is a simplified representation of optimizer hints that can be
@@ -385,6 +370,46 @@ pub struct ContiguousHint {
     /// Integer argument (amount, size, etc.)
     pub arg: Option<i64>,
 }
+
+/// Metadata payload carried by CALL operations.
+///
+/// Mirrors Tinygrad's `CallInfo` shape while staying serializable/hashable in Rust.
+/// `grad_tag` is a placeholder for future gradient callback identity and
+/// `metadata` carries stable, cache-key-safe call annotations.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct CallInfo {
+    pub grad_tag: Option<String>,
+    pub metadata: Vec<String>,
+    pub name: Option<String>,
+    pub precompile: bool,
+    pub precompile_backward: bool,
+}
+
+/// Explicit runtime custom-function kinds.
+///
+/// Both variants are reserved: the IR can construct them and the schedule
+/// lowers them, but the runtime returns an `Unsupported` error until backends
+/// implement them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum CustomFunctionKind {
+    /// HEVC encode/decode runner.
+    EncDec,
+    /// JIT graph-capture hook.
+    Graph,
+}
+
+/// Structural marker carried in `Op::Sink::info` indicating the SINK is a
+/// fully-formed kernel AST.
+///
+/// Stored as a hash-consed field rather than via the type-erased `metadata`
+/// channel so that marked and unmarked SINKs with otherwise identical
+/// sources are distinct UOps.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct KernelInfo {}
 
 /// Axis type for loop ranges and reductions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -424,7 +449,7 @@ impl AxisType {
     ///
     /// Kernel boundary ranges (Outer) exist at the scheduling level and
     /// don't go inside individual kernels. During kernel splitting, operations
-    /// with outer ranges are skipped from being packaged into KERNEL ops.
+    /// with outer ranges are skipped from being packaged into CALL wrappers.
     pub const fn is_kernel_boundary(&self) -> bool {
         matches!(self, Self::Outer)
     }

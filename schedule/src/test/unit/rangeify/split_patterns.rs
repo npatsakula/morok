@@ -4,10 +4,10 @@ use morok_dtype::{AddrSpace, DType};
 use morok_ir::{AxisId, AxisType, ConstValue, Op, UOp};
 use smallvec::smallvec;
 
-use crate::rangeify::{KernelContext, patterns::to_param_patterns};
+use crate::rangeify::{RangeifyBufferContext, patterns::to_param_patterns};
 
 /// Helper to apply to_param patterns and return result
-fn apply_patterns(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
+fn apply_patterns(uop: &Arc<UOp>, ctx: &mut RangeifyBufferContext) -> Option<Arc<UOp>> {
     let matcher = to_param_patterns();
     match matcher.rewrite(uop, ctx) {
         morok_ir::pattern::RewriteResult::Rewritten(result) => Some(result),
@@ -17,7 +17,7 @@ fn apply_patterns(uop: &Arc<UOp>, ctx: &mut KernelContext) -> Option<Arc<UOp>> {
 
 #[test]
 fn test_debuf_global() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a BUFFER operation directly
     let unique = UOp::buffer_id(Some(0));
@@ -35,7 +35,7 @@ fn test_debuf_global() {
 
 #[test]
 fn test_unbind_kernel() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a BIND operation
     let var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
@@ -55,7 +55,7 @@ fn test_unbind_kernel() {
 
 #[test]
 fn test_renumber_range() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a RANGE with unrenumbered axis_id (use Reduce since it returns plain Range)
     let end = UOp::index_const(10);
@@ -75,7 +75,7 @@ fn test_renumber_range() {
 
 #[test]
 fn test_renumber_range_loop_no_bind() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a LOOP RANGE with unrenumbered axis_id
     let end = UOp::index_const(10);
@@ -97,7 +97,7 @@ fn test_renumber_range_loop_no_bind() {
 
 #[test]
 fn test_renumber_range_already_numbered() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a RANGE with already-renumbered axis_id
     let end = UOp::index_const(10);
@@ -110,7 +110,7 @@ fn test_renumber_range_already_numbered() {
 
 #[test]
 fn test_remove_zero_range() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a RANGE with end=0
     let end = UOp::index_const(0);
@@ -126,7 +126,7 @@ fn test_remove_zero_range() {
 
 #[test]
 fn test_cleanup_const_with_sources() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a CONST operation (normally has no sources)
     let const_op = UOp::native_const(42i32);
@@ -140,7 +140,7 @@ fn test_cleanup_const_with_sources() {
 
 #[test]
 fn test_handle_after() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create an AFTER operation
     let buffer = UOp::buffer_id(Some(0));
@@ -161,7 +161,7 @@ fn test_handle_after() {
 
 #[test]
 fn test_debuf_counter_increment() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create first buffer
     let unique1 = UOp::buffer_id(Some(1));
@@ -192,7 +192,7 @@ fn test_debuf_counter_increment() {
 
 #[test]
 fn test_debuf_buffer_mapping() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     let unique = UOp::buffer_id(Some(0));
     let device = UOp::device(morok_device::DeviceSpec::Cpu);
@@ -213,7 +213,7 @@ fn test_debuf_buffer_mapping() {
 
 #[test]
 fn test_handle_after_mstack_unwrap() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create MSTACK with buffers
     let buf1 = UOp::buffer_id(Some(1));
@@ -236,7 +236,7 @@ fn test_handle_after_mstack_unwrap() {
 
 #[test]
 fn test_handle_after_mselect_unwrap() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create MSELECT
     let buffer = UOp::buffer_id(Some(1));
@@ -257,7 +257,7 @@ fn test_handle_after_mselect_unwrap() {
 
 #[test]
 fn test_renumber_range_different_axis_types() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
     let end = UOp::index_const(10);
 
     // Test axis types with unrenumbered axis_ids
@@ -283,7 +283,7 @@ fn test_renumber_range_different_axis_types() {
 
 #[test]
 fn test_renumber_range_no_change_if_same() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // First range will get ID 0
     let end = UOp::index_const(10);
@@ -303,7 +303,7 @@ fn test_renumber_range_no_change_if_same() {
 #[test]
 #[ignore = "Incomplete: only tests negative case, missing spurious sources test case"]
 fn test_cleanup_const_define_var() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a DEFINE_VAR
     let define_var = UOp::new(Op::DefineVar { name: "x".to_string(), min_val: 0, max_val: 10 }, DType::Index);
@@ -317,7 +317,7 @@ fn test_cleanup_const_define_var() {
 
 #[test]
 fn test_remove_zero_range_uint() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a RANGE with end=0 (UInt)
     let end = UOp::index_const(0);
@@ -332,7 +332,7 @@ fn test_remove_zero_range_uint() {
 
 #[test]
 fn test_remove_zero_range_non_zero() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a RANGE with non-zero end
     let end = UOp::index_const(10);
@@ -347,7 +347,7 @@ fn test_remove_zero_range_non_zero() {
 #[test]
 #[ignore = "MSTACK/AFTER handling not fully implemented yet"]
 fn test_handle_after_mstack_advanced() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create MSTACK operation
     let buf1 = UOp::buffer_id(Some(1));
@@ -375,7 +375,7 @@ fn test_handle_after_mstack_advanced() {
 
 #[test]
 fn test_cleanup_const_with_spurious_sources() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a CONST that has sources (spurious - consts shouldn't have sources normally)
     // This tests the cleanup pattern that removes unnecessary sources from CONST
@@ -391,7 +391,7 @@ fn test_cleanup_const_with_spurious_sources() {
 
 #[test]
 fn test_renumber_range_sequential() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create ranges with unrenumbered axis_ids
     // All axis types now return plain Range without BIND wrapper (Tinygrad approach)
@@ -449,7 +449,7 @@ fn test_renumber_range_sequential() {
 
 #[test]
 fn test_remove_zero_range_verification() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create RANGE with end=0
     let end = UOp::index_const(0);
@@ -480,7 +480,7 @@ fn test_remove_zero_range_verification() {
 
 #[test]
 fn test_pattern_composition_sequence() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Test that patterns can be applied in sequence
     // 1. Create a RANGE with unrenumbered ID (use Reduce for plain Range output)
@@ -521,7 +521,7 @@ fn test_pattern_composition_sequence() {
 
 #[test]
 fn test_pattern_composition_sequence_no_bind() {
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Test that LOOP ranges return plain Range (no BIND wrapper, Tinygrad approach)
     let range_unnum = UOp::range_axis(UOp::index_const(15), AxisId::Unrenumbered(7), AxisType::Loop);
@@ -556,7 +556,7 @@ fn test_pattern_composition_sequence_no_bind() {
 fn test_handle_after_local_buffer_not_tracked() {
     // Local buffers should NOT be tracked in the buffer map
     // They are kernel-scoped and synchronized via BARRIER, not AFTER
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a local buffer (DEFINE_LOCAL with Ptr{Local} dtype)
     let local_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Local);
@@ -583,7 +583,7 @@ fn test_handle_after_local_buffer_not_tracked() {
 #[test]
 fn test_handle_after_global_buffer_tracked() {
     // Global buffers SHOULD be tracked in the buffer map
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create a global buffer (PARAM with Ptr{Global} dtype)
     let global_dtype = DType::Float32.ptr(Some(1024), AddrSpace::Global);
@@ -611,7 +611,7 @@ fn test_handle_after_global_buffer_tracked() {
 #[test]
 fn test_handle_after_mstack_with_local_buffer() {
     // AFTER wrapping MSTACK containing local buffer should not be tracked
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create local buffer
     let local_dtype = DType::Float32.ptr(Some(512), AddrSpace::Local);
@@ -644,7 +644,7 @@ fn test_handle_after_mstack_with_local_buffer() {
 #[test]
 fn test_handle_after_mselect_with_local_buffer() {
     // AFTER wrapping MSELECT containing local buffer should not be tracked
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create local buffer
     let local_dtype = DType::Int32.ptr(Some(256), AddrSpace::Local);
@@ -676,7 +676,7 @@ fn test_handle_after_mselect_with_local_buffer() {
 #[test]
 fn test_handle_after_mixed_address_spaces() {
     // Verify local and global buffers are handled differently
-    let mut ctx = KernelContext::new();
+    let mut ctx = RangeifyBufferContext::new();
 
     // Create both local and global buffers
     let local_dtype = DType::Float32.ptr(Some(128), AddrSpace::Local);

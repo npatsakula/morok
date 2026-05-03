@@ -52,7 +52,8 @@ pub struct GigaAmConfig {
     pub hop_length: usize,
     pub win_length: usize,
     pub mel_center: bool,
-    pub max_seq_len: usize,
+    pub max_mel_frames: usize,
+    pub max_encoder_frames: usize,
 }
 
 impl GigaAmConfig {
@@ -79,6 +80,18 @@ impl GigaAmConfig {
             _ => ConvNormType::BatchNorm,
         };
 
+        let subsampling_factor = enc["subsampling_factor"].as_u64().expect("subsampling_factor") as usize;
+        let subs_kernel_size = enc["subs_kernel_size"].as_u64().unwrap_or(3) as usize;
+        let max_encoder_frames = enc["pos_emb_max_len"].as_u64().unwrap_or(5000) as usize;
+        // `max_mel_frames` is the pre-subsampling sequence-length bound. Configs that
+        // only specify `pos_emb_max_len` (the post-subsampling encoder bound) need it
+        // multiplied by `subsampling_factor` so audio approaching the encoder cap
+        // isn't rejected at the JIT input stage.
+        let max_mel_frames = enc["max_mel_frames"]
+            .as_u64()
+            .or_else(|| enc["max_seq_len"].as_u64())
+            .unwrap_or((max_encoder_frames * subsampling_factor) as u64) as usize;
+
         Ok(Self {
             max_batch_size: enc["max_batch_size"].as_u64().unwrap_or(32) as usize,
             n_mels: pre["features"].as_u64().expect("features") as usize,
@@ -87,9 +100,9 @@ impl GigaAmConfig {
             n_layers: enc["n_layers"].as_u64().expect("n_layers") as usize,
             d_ff: d_model * ff_expansion_factor,
             conv_kernel: enc["conv_kernel_size"].as_u64().expect("conv_kernel_size") as usize,
-            subsampling_factor: enc["subsampling_factor"].as_u64().expect("subsampling_factor") as usize,
+            subsampling_factor,
             subsampling_mode,
-            subs_kernel_size: enc["subs_kernel_size"].as_u64().unwrap_or(3) as usize,
+            subs_kernel_size,
             conv_norm_type,
             vocab_size: head["num_classes"].as_u64().expect("num_classes") as usize,
             sample_rate: pre["sample_rate"].as_u64().expect("sample_rate") as usize,
@@ -97,7 +110,8 @@ impl GigaAmConfig {
             hop_length: pre["hop_length"].as_u64().expect("hop_length") as usize,
             win_length: pre["win_length"].as_u64().expect("win_length") as usize,
             mel_center: pre["center"].as_bool().unwrap_or(true),
-            max_seq_len: enc["pos_emb_max_len"].as_u64().unwrap_or(5000) as usize,
+            max_mel_frames,
+            max_encoder_frames,
         })
     }
 }
@@ -114,6 +128,11 @@ pub struct GigaAm {
 }
 
 impl GigaAm {
+    fn encoder_input_dtype(&self) -> DType {
+        let dtype = self.subsampling.conv1_weight.uop().dtype();
+        if dtype.is_float() { dtype } else { DType::Float32 }
+    }
+
     /// Load from a HuggingFace Hub repository.
     pub fn from_hub(model_id: &str) -> Result<Self> {
         Self::from_hub_with_revision(model_id, "main")
@@ -212,10 +231,10 @@ impl GigaAm {
     /// Output: lazy tensor `[B, d_model, T/4]`.
     pub fn encode(&self, mel: &Tensor) -> Result<Tensor> {
         let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
+        let x = x.cast(self.encoder_input_dtype()).context(TensorSnafu)?;
         let x = self.subsampling.forward(&x)?;
 
         let shape = x.shape().context(TensorSnafu)?;
-        let batch = shape[0].clone();
         let seq_len = shape[1].clone();
 
         let d_half = self.config.d_model / self.config.n_heads / 2;
@@ -241,7 +260,7 @@ impl GigaAm {
 
         let mut x = x;
         for layer in &self.layers {
-            x = layer.forward(&x, &cos, &sin, None, None, batch.clone(), seq_len.clone())?;
+            x = layer.forward(&x, &cos, &sin, None, None)?;
         }
 
         x.try_transpose(-1, -2).context(TensorSnafu) // [B, d_model, T/4]
@@ -264,10 +283,10 @@ impl GigaAm {
         mel: &Tensor,
         lengths: &Tensor,
         batch: &BoundVariable,
-        seq_len: &BoundVariable,
+        mel_len: &BoundVariable,
     ) -> Result<Tensor> {
         let b = batch.as_sint();
-        let t = seq_len.as_sint();
+        let t_mel = mel_len.as_sint();
 
         let lengths = lengths.try_shrink([Some((SInt::Const(0), b.clone()))]).context(TensorSnafu)?;
         let lengths = lengths.cast(DType::Index).context(TensorSnafu)?;
@@ -281,15 +300,16 @@ impl GigaAm {
         }
 
         let mel = mel
-            .try_shrink([Some((SInt::Const(0), b.clone())), None, Some((SInt::Const(0), t.clone()))])
+            .try_shrink([Some((SInt::Const(0), b.clone())), None, Some((SInt::Const(0), t_mel))])
             .context(TensorSnafu)?;
         let x = mel.try_transpose(-1, -2).context(TensorSnafu)?;
+        let x = x.cast(self.encoder_input_dtype()).context(TensorSnafu)?;
         let x = self.subsampling.forward(&x)?;
 
         let shape = x.shape().context(TensorSnafu)?;
         let t_sub = shape[1].clone();
 
-        let range = Tensor::arange(self.config.max_seq_len as i64, None, None).context(TensorSnafu)?;
+        let range = Tensor::arange(self.config.max_encoder_frames as i64, None, None).context(TensorSnafu)?;
         let range = range.cast(DType::Index).context(TensorSnafu)?;
         let range = range.try_shrink([(SInt::Const(0), t_sub.clone())]).context(TensorSnafu)?;
         let range = range.try_reshape([SInt::Const(1), t_sub.clone()]).context(TensorSnafu)?;
@@ -331,7 +351,7 @@ impl GigaAm {
 
         let mut x = x;
         for layer in &self.layers {
-            x = layer.forward(&x, &cos, &sin, att_mask.as_ref(), Some(&pad_mask), b.clone(), t_sub.clone())?;
+            x = layer.forward(&x, &cos, &sin, att_mask.as_ref(), Some(&pad_mask))?;
         }
 
         x.try_transpose(-1, -2).context(TensorSnafu)
@@ -356,7 +376,7 @@ jit_wrapper! {
 
         vars {
             b: (1, model.config.max_batch_size),
-            t: (1, model.config.max_seq_len),
+            t: (1, model.config.max_mel_frames),
         }
 
         build(mel, lengths, b, t) {

@@ -6,8 +6,8 @@ use morok_tensor::{PrepareConfig, Tensor};
 struct AddModel;
 
 impl AddModel {
-    fn forward(&self, x: &Tensor, y: &Tensor) -> morok_tensor::error::Result<Tensor> {
-        x.try_add(y)
+    fn forward(&self, x: &Tensor, y: &Tensor) -> crate::jit::Result<Tensor> {
+        x.try_add(y).map_err(|e| crate::jit::JitError::Tensor { source: Box::new(e) })
     }
 }
 
@@ -17,7 +17,7 @@ jit_wrapper! {
         y: Tensor,
 
         build(x, y) {
-            model.forward(&x, &y)
+            model.forward(x, y)
         }
     }
 }
@@ -27,8 +27,8 @@ fn test_jit_single_input_prepare_and_execute() {
     let model = AddModel;
     let mut jit = AddJit::new(model);
 
-    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    let y = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let y = Tensor::from_slice([10.0f32, 20.0, 30.0]);
 
     let cfg = PrepareConfig::default();
     jit.prepare_with_config(&x, &y, &cfg).unwrap();
@@ -41,18 +41,37 @@ fn test_jit_single_input_prepare_and_execute() {
 }
 
 #[test]
+fn test_jit_rejects_duplicate_input_buffers() {
+    let model = AddModel;
+    let mut jit = AddJit::new(model);
+
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let x_buffer_id = x.buffer().unwrap().id();
+
+    let err = jit.prepare(&x, &x).unwrap_err();
+    match err {
+        crate::jit::JitError::DuplicateInputBuffer { name, duplicate_of, buffer_id } => {
+            assert_eq!(name, "y");
+            assert_eq!(duplicate_of, "x");
+            assert_eq!(buffer_id, x_buffer_id);
+        }
+        other => panic!("expected duplicate input buffer error, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_jit_replay() {
     let model = AddModel;
     let mut jit = AddJit::new(model);
 
-    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    let y = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let y = Tensor::from_slice([10.0f32, 20.0, 30.0]);
 
     jit.prepare(&x, &y).unwrap();
     jit.execute().unwrap();
 
-    let x2 = Tensor::from_slice(&[100.0f32, 200.0, 300.0]);
-    let y2 = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
+    let x2 = Tensor::from_slice([100.0f32, 200.0, 300.0]);
+    let y2 = Tensor::from_slice([1.0f32, 2.0, 3.0]);
 
     let x_buf = jit.x_mut().unwrap();
     let x2_buf = x2.buffer().unwrap();
@@ -81,14 +100,14 @@ fn test_jit_multiple_replays() {
     let model = AddModel;
     let mut jit = AddJit::new(model);
 
-    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    let y = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let y = Tensor::from_slice([10.0f32, 20.0, 30.0]);
 
     jit.prepare(&x, &y).unwrap();
 
     for i in 0..5 {
-        let xi = Tensor::from_slice(&[i as f32; 3]);
-        let yi = Tensor::from_slice(&[(i + 1) as f32; 3]);
+        let xi = Tensor::from_slice([i as f32; 3]);
+        let yi = Tensor::from_slice([(i + 1) as f32; 3]);
 
         copy_tensor_to_buffer(&xi, jit.x_mut().unwrap());
         copy_tensor_to_buffer(&yi, jit.y_mut().unwrap());
@@ -107,8 +126,8 @@ fn test_jit_profiled_execution_apis() {
     let model = AddModel;
     let mut jit = AddJit::new(model);
 
-    let x = Tensor::from_slice(&[1.0f32, 2.0, 3.0]);
-    let y = Tensor::from_slice(&[10.0f32, 20.0, 30.0]);
+    let x = Tensor::from_slice([1.0f32, 2.0, 3.0]);
+    let y = Tensor::from_slice([10.0f32, 20.0, 30.0]);
 
     jit.prepare(&x, &y).unwrap();
 

@@ -6,15 +6,14 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────┐
 //! │              PREPARATION (one-time)                      │
-//! │  Schedule → expand → compile_kernels → build()          │
+//! │  Schedule → instantiate → compile_kernels → build()     │
 //! │                       ↓                                  │
 //! │                ExecutionPlan                             │
 //! └─────────────────────────────────────────────────────────┘
 //!                         ↓
 //! ┌─────────────────────────────────────────────────────────┐
 //! │              EXECUTION (fast path)                       │
-//! │  for kernel in kernels:                                  │
-//! │      program.execute(ptrs, vals, global, local)          │
+//! │  dependency-ordered PreparedOp execution                 │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -26,18 +25,23 @@
 //! let output = plan.output_buffer();
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use morok_device::device::ProgramSpec;
 use morok_device::{Buffer, BufferId};
 use morok_dtype::DeviceSpec;
-use morok_ir::UOp;
+use morok_ir::{CustomFunctionKind, Op, UOp};
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
 use crate::error::Result;
 use crate::kernel_cache::CachedKernel;
 use crate::profiler::KernelProfile;
+
+type RuntimeLaunchSizes = (Option<[usize; 3]>, Option<[usize; 3]>);
 
 // ============================================================================
 // Core Structures
@@ -70,33 +74,359 @@ pub struct PreparedKernel {
     /// Variable values in positional order (matches `var_names` in CachedKernel).
     pub vals: Vec<i64>,
 
+    /// Fixed variable bindings captured at prepare time.
+    ///
+    /// These mirror Tinygrad's `fixedvars` semantics: values fixed by scheduling
+    /// (for example from bound ranges) are not overridden by `execute_with_vars`.
+    pub fixedvars: HashMap<String, i64>,
+
     /// Kernel IDs that must complete before this one (dependencies).
     pub dependencies: Vec<u64>,
 
-    /// Pre-computed raw buffer pointers for zero-allocation execution.
+    /// Pre-computed raw buffer addresses for low-allocation execution.
     /// Computed once during prepare(), stable for the lifetime of ExecutionPlan.
     /// SAFETY: Pointers are valid as long as ExecutionPlan owns the buffers.
-    pub buffer_ptrs: Vec<*mut u8>,
+    pub buffer_ptrs: Vec<usize>,
 
     /// Pre-computed buffer IDs for dependency tracking.
     pub buffer_ids: Vec<BufferId>,
+
+    /// Cached `(name, min_val, max_val)` triples for every `DefineVar` reachable
+    /// from `ast`. Populated at construction so `validate_runtime_var_bounds`
+    /// doesn't re-toposort on every execute call.
+    pub runtime_vars: Vec<RuntimeVar>,
 }
 
-// SAFETY: PreparedKernel is immutable during plan execution.
-// - `buffer_ptrs` are precomputed and never mutated after build().
-// - `vals` are read-only during `execute`/`execute_profiled`.
-// - Host-level parallel execution is gated by execution-level hazard filtering
-//   (RAW/WAW/WAR on BufferId equality) and backend thread-safety capability.
-unsafe impl Send for PreparedKernel {}
-unsafe impl Sync for PreparedKernel {}
+/// Bound description for one `DefineVar` consumed by a kernel.
+#[derive(Clone, Debug)]
+pub struct RuntimeVar {
+    pub name: String,
+    pub min_val: i64,
+    pub max_val: i64,
+}
+
+/// Walk `root` and collect bounds for every reachable `DefineVar`.
+pub fn collect_runtime_vars(root: &Arc<UOp>) -> Vec<RuntimeVar> {
+    let mut vars = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for node in root.toposort() {
+        if let Op::DefineVar { name, min_val, max_val } = node.op()
+            && seen.insert(name.clone())
+        {
+            vars.push(RuntimeVar { name: name.clone(), min_val: *min_val, max_val: *max_val });
+        }
+    }
+    vars
+}
+
+/// Prepared buffer-to-buffer copy operation.
+#[derive(Clone, Debug)]
+pub struct PreparedCopy {
+    /// Unique operation identifier.
+    pub id: u64,
+
+    /// Buffer indices in ExecutionPlan order: [dst, src].
+    pub buffer_indices: Vec<usize>,
+
+    /// Operation IDs that must complete before this copy.
+    pub dependencies: Vec<u64>,
+}
+
+/// Prepared zero-copy buffer view operation.
+#[derive(Clone, Debug)]
+pub struct PreparedBufferView {
+    /// Unique operation identifier.
+    pub id: u64,
+
+    /// Output and base buffer indices in ExecutionPlan order.
+    /// `buffer_indices[0]` is output view, `buffer_indices[1]` is base source.
+    pub buffer_indices: Vec<usize>,
+
+    /// Expected byte offset into base for the view.
+    pub byte_offset: usize,
+
+    /// Expected byte size of the view.
+    pub byte_size: usize,
+
+    /// Operation IDs that must complete before this view is consumed.
+    pub dependencies: Vec<u64>,
+}
+
+/// Prepared custom runtime function operation.
+#[derive(Clone, Debug)]
+pub struct PreparedCustomFunction {
+    /// Unique operation identifier.
+    pub id: u64,
+
+    /// Explicit custom function kind (for example: `EncDec`).
+    pub kind: CustomFunctionKind,
+
+    /// Runtime descriptor attributes encoded by the IR body.
+    pub attrs: SmallVec<[Arc<UOp>; 4]>,
+
+    /// Buffer indices in ExecutionPlan order.
+    pub buffer_indices: Vec<usize>,
+
+    /// Bound variable values for this operation.
+    pub fixedvars: HashMap<String, i64>,
+
+    /// Operation IDs that must complete before this custom function runs.
+    pub dependencies: Vec<u64>,
+
+    /// Cached `(name, min_val, max_val)` triples for every `DefineVar`
+    /// reachable from `attrs`. Populated at construction so
+    /// `validate_runtime_var_bounds` doesn't re-toposort on every execute call.
+    pub runtime_vars: Vec<RuntimeVar>,
+}
+
+/// Prepared execution item.
+#[derive(Clone, Debug)]
+pub enum PreparedOp {
+    /// Compiled kernel/program operation.
+    CompiledProgram(PreparedKernel),
+
+    /// Direct buffer copy operation.
+    BufferCopy(PreparedCopy),
+
+    /// Zero-copy view aliasing operation.
+    BufferView(PreparedBufferView),
+
+    /// Runtime custom function operation.
+    CustomFunction(PreparedCustomFunction),
+}
+
+fn op_identity(op: &PreparedOp) -> (u64, Vec<u64>) {
+    match op {
+        PreparedOp::CompiledProgram(kernel) => (kernel.id, kernel.dependencies.clone()),
+        PreparedOp::BufferCopy(copy) => (copy.id, copy.dependencies.clone()),
+        PreparedOp::BufferView(view) => (view.id, view.dependencies.clone()),
+        PreparedOp::CustomFunction(custom) => (custom.id, custom.dependencies.clone()),
+    }
+}
+
+fn validate_var_bound(name: &str, value: i64, min_val: i64, max_val: i64) -> Result<()> {
+    if value < min_val || value > max_val {
+        return Err(crate::error::Error::Execution {
+            reason: format!("variable {name}={value} is outside bounds [{min_val}, {max_val}]"),
+        });
+    }
+    Ok(())
+}
+
+struct DependencyGraph {
+    op_ids: Vec<u64>,
+    in_degree: Vec<usize>,
+    successors: Vec<Vec<usize>>,
+}
+
+fn build_dependency_graph(ops: &[PreparedOp], instance_deps_per_op: Option<&[Vec<usize>]>) -> Result<DependencyGraph> {
+    if let Some(instance_deps) = instance_deps_per_op
+        && instance_deps.len() != ops.len()
+    {
+        return Err(crate::error::Error::Execution {
+            reason: format!(
+                "prepared op instance dependency table length mismatch: ops={}, instance_deps={}",
+                ops.len(),
+                instance_deps.len()
+            ),
+        });
+    }
+
+    let mut op_ids = Vec::with_capacity(ops.len());
+    let mut deps_per_op = Vec::with_capacity(ops.len());
+    let mut id_counts: HashMap<u64, usize> = HashMap::with_capacity(ops.len());
+
+    for op in ops {
+        let (op_id, deps) = op_identity(op);
+        op_ids.push(op_id);
+        deps_per_op.push(deps);
+        *id_counts.entry(op_id).or_insert(0) += 1;
+    }
+
+    let has_duplicate_ids = id_counts.values().any(|&count| count > 1);
+
+    let mut in_degree = vec![0usize; ops.len()];
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
+
+    if !has_duplicate_ids {
+        let mut id_to_idx: HashMap<u64, usize> = HashMap::with_capacity(ops.len());
+        for (idx, &op_id) in op_ids.iter().enumerate() {
+            id_to_idx.insert(op_id, idx);
+        }
+
+        for (idx, deps) in deps_per_op.iter().enumerate() {
+            for dep in deps {
+                let Some(&dep_idx) = id_to_idx.get(dep) else {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!("prepared op {} depends on unknown op id {}", op_ids[idx], dep),
+                    });
+                };
+                in_degree[idx] += 1;
+                successors[dep_idx].push(idx);
+            }
+        }
+    } else {
+        // Expanded schedules may contain repeated op IDs for per-iteration items.
+        // Resolve dependencies against the most recent prior op with that ID.
+        let mut last_seen: HashMap<u64, usize> = HashMap::with_capacity(ops.len());
+
+        for (idx, deps) in deps_per_op.iter().enumerate() {
+            for dep in deps {
+                let Some(&dep_idx) = last_seen.get(dep) else {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!(
+                            "prepared op {} depends on unknown prior op id {} (duplicate-id schedule mode)",
+                            op_ids[idx], dep
+                        ),
+                    });
+                };
+                in_degree[idx] += 1;
+                successors[dep_idx].push(idx);
+            }
+
+            last_seen.insert(op_ids[idx], idx);
+        }
+    }
+
+    if let Some(instance_deps_per_op) = instance_deps_per_op {
+        for (idx, instance_deps) in instance_deps_per_op.iter().enumerate() {
+            for &dep_idx in instance_deps {
+                if dep_idx >= ops.len() {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!("prepared op {} depends on unknown op index {}", op_ids[idx], dep_idx),
+                    });
+                }
+                if dep_idx == idx {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!("prepared op {} cannot depend on itself by op index {}", op_ids[idx], dep_idx),
+                    });
+                }
+                in_degree[idx] += 1;
+                successors[dep_idx].push(idx);
+            }
+        }
+    }
+
+    Ok(DependencyGraph { op_ids, in_degree, successors })
+}
+
+#[cfg(test)]
+fn compute_mixed_op_order(ops: &[PreparedOp]) -> Result<Vec<usize>> {
+    compute_mixed_op_order_with_instance_dependencies(ops, &[])
+}
+
+fn compute_mixed_op_order_with_instance_dependencies(
+    ops: &[PreparedOp],
+    instance_deps_per_op: &[Vec<usize>],
+) -> Result<Vec<usize>> {
+    let instance_deps = (!instance_deps_per_op.is_empty()).then_some(instance_deps_per_op);
+    let DependencyGraph { op_ids, mut in_degree, successors } = build_dependency_graph(ops, instance_deps)?;
+
+    let mut ready: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+    for (idx, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            ready.push(Reverse(idx));
+        }
+    }
+
+    let mut order = Vec::with_capacity(ops.len());
+    while let Some(Reverse(idx)) = ready.pop() {
+        order.push(idx);
+        for &succ in &successors[idx] {
+            in_degree[succ] -= 1;
+            if in_degree[succ] == 0 {
+                ready.push(Reverse(succ));
+            }
+        }
+    }
+
+    if order.len() != ops.len() {
+        let blocked: Vec<u64> = in_degree
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &deg)| if deg > 0 { Some(op_ids[idx]) } else { None })
+            .collect();
+        return Err(crate::error::Error::Execution {
+            reason: format!("cycle detected in prepared op dependencies: blocked_ids={blocked:?}"),
+        });
+    }
+
+    Ok(order)
+}
+
+#[cfg(test)]
+fn compute_execution_levels(ops: &[PreparedOp]) -> Result<Vec<Vec<usize>>> {
+    compute_execution_levels_with_instance_dependencies(ops, &[])
+}
+
+fn compute_execution_levels_with_instance_dependencies(
+    ops: &[PreparedOp],
+    instance_deps_per_op: &[Vec<usize>],
+) -> Result<Vec<Vec<usize>>> {
+    let instance_deps = (!instance_deps_per_op.is_empty()).then_some(instance_deps_per_op);
+    let DependencyGraph { op_ids, mut in_degree, successors } = build_dependency_graph(ops, instance_deps)?;
+
+    let mut ready: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+    for (idx, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            ready.push(Reverse(idx));
+        }
+    }
+
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    let mut visited = 0usize;
+
+    while !ready.is_empty() {
+        let mut level: Vec<usize> = Vec::new();
+        while let Some(Reverse(idx)) = ready.pop() {
+            level.push(idx);
+        }
+
+        let mut next_ready: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+        for &idx in &level {
+            visited += 1;
+            for &succ in &successors[idx] {
+                in_degree[succ] -= 1;
+                if in_degree[succ] == 0 {
+                    next_ready.push(Reverse(succ));
+                }
+            }
+        }
+
+        levels.push(level);
+        ready = next_ready;
+    }
+
+    if visited != ops.len() {
+        let blocked: Vec<u64> = in_degree
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &deg)| if deg > 0 { Some(op_ids[idx]) } else { None })
+            .collect();
+        return Err(crate::error::Error::Execution {
+            reason: format!("cycle detected in prepared op dependencies: blocked_ids={blocked:?}"),
+        });
+    }
+
+    Ok(levels)
+}
 
 /// Pre-compiled execution plan for a computation graph.
 ///
 /// Created once via `prepare()`, then executed multiple times.
 /// The plan owns all its buffers and compiled kernels.
 pub struct ExecutionPlan {
-    /// Pre-compiled kernels in topological order.
-    kernels: Vec<PreparedKernel>,
+    /// Prepared operations in schedule order.
+    ops: Vec<PreparedOp>,
+
+    /// Concrete op-index dependencies parallel to `ops`.
+    op_instance_dependencies: Vec<Vec<usize>>,
+
+    /// Precomputed dependency-safe operation order.
+    op_order: Vec<usize>,
+
+    /// Topological levels of dependency-independent operations.
+    op_levels: Vec<Vec<usize>>,
 
     /// ALL buffers owned by this plan (inputs, intermediates, outputs).
     buffers: Vec<Buffer>,
@@ -110,27 +440,11 @@ pub struct ExecutionPlan {
     /// Primary device for this plan.
     device: DeviceSpec,
 
+    /// Last dynamic variable bindings supplied through `execute_with_vars`.
+    runtime_var_vals: HashMap<String, i64>,
+
     /// Additional UOp IDs registered as aliases that need cleanup.
     alias_ids: Vec<u64>,
-
-    /// Topological execution levels after hazard filtering.
-    /// Kernels within each level are safe to run in parallel.
-    execution_levels: Vec<ExecutionLevel>,
-}
-
-#[derive(Debug, Clone)]
-struct ExecutionLevel {
-    kernel_indices: Vec<usize>,
-    contains_thread_id_kernel: bool,
-    host_parallel_safe: bool,
-}
-
-#[derive(Debug, Clone)]
-struct KernelAccess {
-    reads: HashSet<BufferId>,
-    writes: HashSet<BufferId>,
-    has_thread_id_parallelism: bool,
-    host_parallel_safe: bool,
 }
 
 // ============================================================================
@@ -138,34 +452,454 @@ struct KernelAccess {
 // ============================================================================
 
 impl ExecutionPlan {
+    fn kernel_launch_sizes(kernel: &PreparedKernel) -> Result<RuntimeLaunchSizes> {
+        let mut vars: HashMap<&str, i64> =
+            HashMap::with_capacity(kernel.kernel.var_names.len() + kernel.fixedvars.len());
+        for (idx, name) in kernel.kernel.var_names.iter().enumerate() {
+            let value = kernel.vals.get(idx).copied().ok_or_else(|| crate::error::Error::Execution {
+                reason: format!(
+                    "Kernel {} has {} var names but only {} values",
+                    kernel.id,
+                    kernel.kernel.var_names.len(),
+                    kernel.vals.len()
+                ),
+            })?;
+            vars.insert(name.as_str(), value);
+        }
+        for (name, value) in &kernel.fixedvars {
+            vars.insert(name.as_str(), *value);
+        }
+
+        let dims =
+            ProgramSpec::resolve_launch_dims(&kernel.kernel.global_size, kernel.kernel.local_size.as_ref(), &vars)
+                .map_err(|e| crate::error::Error::Execution {
+                    reason: format!("Kernel {} launch dimensions failed: {e}", kernel.id),
+                })?;
+        Ok((Some(dims.global_size), dims.local_size))
+    }
+
+    fn kernel_uses_cpu_threading(kernel: &PreparedKernel) -> Result<bool> {
+        if !matches!(kernel.device, DeviceSpec::Cpu) {
+            return Ok(false);
+        }
+        let (global_size, _) = Self::kernel_launch_sizes(kernel)?;
+        Ok(global_size.map(|[x, _, _]| x > 1).unwrap_or(false))
+    }
+
     #[inline]
     fn execute_kernel(kernel: &PreparedKernel) -> Result<()> {
+        let buffer_ptrs: SmallVec<[*mut u8; 8]> = kernel.buffer_ptrs.iter().map(|&ptr| ptr as *mut u8).collect();
+        let (global_size, local_size) = Self::kernel_launch_sizes(kernel)?;
         unsafe {
             kernel
                 .kernel
                 .program
-                .execute(&kernel.buffer_ptrs, &kernel.vals, kernel.kernel.global_size, kernel.kernel.local_size)
+                .execute(&buffer_ptrs, &kernel.vals, global_size, local_size)
                 .map_err(|e| crate::error::Error::Execution { reason: format!("Kernel {} failed: {}", kernel.id, e) })
         }
     }
 
+    fn validate_runtime_var_bounds(&self, var_vals: &[(&str, i64)]) -> Result<()> {
+        let vals_map: HashMap<&str, i64> = var_vals.iter().copied().collect();
+        for op in &self.ops {
+            match op {
+                PreparedOp::CompiledProgram(kernel) => {
+                    for var in &kernel.runtime_vars {
+                        if kernel.fixedvars.contains_key(&var.name) || var.name == "core_id" {
+                            continue;
+                        }
+                        if let Some(&value) = vals_map.get(var.name.as_str()) {
+                            validate_var_bound(&var.name, value, var.min_val, var.max_val)?;
+                        }
+                    }
+                }
+                PreparedOp::CustomFunction(custom) => {
+                    for var in &custom.runtime_vars {
+                        if custom.fixedvars.contains_key(&var.name) || var.name == "core_id" {
+                            continue;
+                        }
+                        if let Some(&value) = vals_map.get(var.name.as_str()) {
+                            validate_var_bound(&var.name, value, var.min_val, var.max_val)?;
+                        }
+                    }
+                }
+                PreparedOp::BufferCopy(_) | PreparedOp::BufferView(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn update_runtime_var_vals(&mut self, var_vals: &[(&str, i64)]) -> Result<()> {
+        self.validate_runtime_var_bounds(var_vals)?;
+
+        let vals_map: HashMap<&str, i64> = var_vals.iter().copied().collect();
+        for &(name, value) in var_vals {
+            if name == "core_id" {
+                continue;
+            }
+            self.runtime_var_vals.insert(name.to_string(), value);
+        }
+        for op in &mut self.ops {
+            if let PreparedOp::CompiledProgram(kernel) = op {
+                for (idx, name) in kernel.kernel.var_names.iter().enumerate() {
+                    if kernel.fixedvars.contains_key(name) || name == "core_id" {
+                        continue;
+                    }
+                    if let Some(&v) = vals_map.get(name.as_str()) {
+                        let Some(slot) = kernel.vals.get_mut(idx) else {
+                            return Err(crate::error::Error::Execution {
+                                reason: format!(
+                                    "Kernel {} has {} var names but only {} values",
+                                    kernel.id,
+                                    kernel.kernel.var_names.len(),
+                                    kernel.vals.len()
+                                ),
+                            });
+                        };
+                        *slot = v;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
-    fn can_parallelize_level(level: &ExecutionLevel) -> bool {
-        level.kernel_indices.len() > 1
-            && !level.contains_thread_id_kernel
-            && level.host_parallel_safe
-            // Avoid nested rayon scheduling from callers already inside rayon pools.
-            && rayon::current_thread_index().is_none()
+    fn execute_copy(&self, copy: &PreparedCopy) -> Result<()> {
+        if copy.buffer_indices.len() < 2 {
+            return Err(crate::error::Error::Execution {
+                reason: format!(
+                    "Copy op {} requires at least two buffer indices (dst, src), got {}",
+                    copy.id,
+                    copy.buffer_indices.len()
+                ),
+            });
+        }
+        let dst_idx = copy.buffer_indices[0];
+        let src_idx = copy.buffer_indices[1];
+
+        if dst_idx >= self.buffers.len() || src_idx >= self.buffers.len() {
+            return Err(crate::error::Error::Execution {
+                reason: format!(
+                    "Copy op {} buffer index out of range: dst={}, src={}, total_buffers={}",
+                    copy.id,
+                    dst_idx,
+                    src_idx,
+                    self.buffers.len()
+                ),
+            });
+        }
+
+        let mut dst = self.buffers[dst_idx].clone();
+        let src = &self.buffers[src_idx];
+        dst.copy_from(src)
+            .map_err(|e| crate::error::Error::Execution { reason: format!("Copy op {} failed: {}", copy.id, e) })
+    }
+
+    #[inline]
+    fn execute_buffer_view(&self, view: &PreparedBufferView) -> Result<()> {
+        if view.buffer_indices.len() < 2 {
+            return Err(crate::error::Error::Execution {
+                reason: format!(
+                    "BufferView op {} requires at least two buffer indices (out, base), got {}",
+                    view.id,
+                    view.buffer_indices.len()
+                ),
+            });
+        }
+        let out_idx = view.buffer_indices[0];
+        let base_idx = view.buffer_indices[1];
+
+        if out_idx >= self.buffers.len() || base_idx >= self.buffers.len() {
+            return Err(crate::error::Error::Execution {
+                reason: format!(
+                    "BufferView op {} buffer index out of range: out={}, base={}, total_buffers={}",
+                    view.id,
+                    out_idx,
+                    base_idx,
+                    self.buffers.len()
+                ),
+            });
+        }
+
+        let out = &self.buffers[out_idx];
+        let base = &self.buffers[base_idx];
+        let expected_offset = base.offset() + view.byte_offset;
+
+        if out.storage_id() != base.storage_id() || out.offset() != expected_offset || out.size() != view.byte_size {
+            return Err(crate::error::Error::Execution {
+                reason: format!(
+                    "BufferView op {} mismatch: out(storage={:?},off={},size={}) base(storage={:?},off={}) expected(off={},size={})",
+                    view.id,
+                    out.storage_id(),
+                    out.offset(),
+                    out.size(),
+                    base.storage_id(),
+                    base.offset(),
+                    expected_offset,
+                    view.byte_size,
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn execute_custom_function(&self, custom: &PreparedCustomFunction) -> Result<()> {
+        let mut buffers = Vec::with_capacity(custom.buffer_indices.len());
+        for &idx in &custom.buffer_indices {
+            let Some(buffer) = self.buffers.get(idx) else {
+                return Err(crate::error::Error::Execution {
+                    reason: format!(
+                        "Custom function op {} ({:?}) buffer index out of range: idx={}, total_buffers={}",
+                        custom.id,
+                        custom.kind,
+                        idx,
+                        self.buffers.len()
+                    ),
+                });
+            };
+            buffers.push(buffer.clone());
+        }
+
+        let mut vars = self.runtime_var_vals.clone();
+        vars.extend(custom.fixedvars.iter().map(|(k, v)| (k.clone(), *v)));
+
+        crate::custom_function::run_custom_function(&custom.kind, &custom.attrs, &mut buffers, &vars).map_err(|e| {
+            // Pass typed `Unsupported` errors through unchanged so callers can match on `kind`.
+            // Other errors are wrapped with op context for debugging.
+            match e {
+                crate::error::Error::Unsupported { .. } => e,
+                other => crate::error::Error::Execution {
+                    reason: format!("Custom function op {} ({:?}) failed: {other}", custom.id, custom.kind),
+                },
+            }
+        })
+    }
+
+    #[inline]
+    fn execute_op(&self, op: &PreparedOp) -> Result<()> {
+        match op {
+            PreparedOp::CompiledProgram(kernel) => Self::execute_kernel(kernel),
+            PreparedOp::BufferCopy(copy) => self.execute_copy(copy),
+            PreparedOp::BufferView(view) => self.execute_buffer_view(view),
+            PreparedOp::CustomFunction(custom) => self.execute_custom_function(custom),
+        }
+    }
+
+    #[inline]
+    fn op_requires_serial(op: &PreparedOp) -> bool {
+        match op {
+            PreparedOp::CompiledProgram(kernel) => !kernel.kernel.host_parallel_safe,
+            PreparedOp::BufferCopy(_) | PreparedOp::BufferView(_) | PreparedOp::CustomFunction(_) => true,
+        }
+    }
+
+    #[inline]
+    fn compiled_kernel_at(&self, idx: usize) -> Option<&PreparedKernel> {
+        match &self.ops[idx] {
+            PreparedOp::CompiledProgram(kernel) => Some(kernel),
+            _ => None,
+        }
+    }
+
+    fn kernels_conflict(lhs: &PreparedKernel, rhs: &PreparedKernel) -> bool {
+        let lhs_outputs: HashSet<BufferId> =
+            lhs.output_indices.iter().filter_map(|&out_idx| lhs.buffer_ids.get(out_idx).copied()).collect();
+        let rhs_outputs: HashSet<BufferId> =
+            rhs.output_indices.iter().filter_map(|&out_idx| rhs.buffer_ids.get(out_idx).copied()).collect();
+
+        if !lhs_outputs.is_disjoint(&rhs_outputs) {
+            return true;
+        }
+
+        let lhs_reads: HashSet<BufferId> = lhs
+            .buffer_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &buf)| (!lhs.output_indices.contains(&idx)).then_some(buf))
+            .collect();
+        let rhs_reads: HashSet<BufferId> = rhs
+            .buffer_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &buf)| (!rhs.output_indices.contains(&idx)).then_some(buf))
+            .collect();
+
+        !lhs_outputs.is_disjoint(&rhs_reads) || !rhs_outputs.is_disjoint(&lhs_reads)
+    }
+
+    fn partition_parallel_safe_group(&self, indices: &[usize]) -> Result<Vec<Vec<usize>>> {
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+
+        for &idx in indices {
+            let Some(kernel) = self.compiled_kernel_at(idx) else {
+                return Err(crate::error::Error::Execution {
+                    reason: format!("parallel partition expected compiled kernel at op index {idx}"),
+                });
+            };
+
+            let mut placed = false;
+            for group in &mut groups {
+                let has_conflict = group.iter().any(|&existing_idx| {
+                    self.compiled_kernel_at(existing_idx)
+                        .map(|existing| Self::kernels_conflict(existing, kernel))
+                        .unwrap_or(true)
+                });
+                if !has_conflict {
+                    group.push(idx);
+                    placed = true;
+                    break;
+                }
+            }
+
+            if !placed {
+                groups.push(vec![idx]);
+            }
+        }
+
+        Ok(groups)
+    }
+
+    fn execute_parallel_group(&self, indices: &[usize]) -> Result<()> {
+        if indices.len() <= 1 {
+            if let Some(&idx) = indices.first() {
+                self.execute_op(&self.ops[idx])?;
+            }
+            return Ok(());
+        }
+
+        let has_threaded_cpu_kernel = indices.iter().try_fold(false, |acc, &idx| {
+            let Some(kernel) = self.compiled_kernel_at(idx) else {
+                return Err(crate::error::Error::Execution {
+                    reason: format!("parallel execution expected compiled kernel at op index {idx}"),
+                });
+            };
+            Ok(acc || Self::kernel_uses_cpu_threading(kernel)?)
+        })?;
+
+        if has_threaded_cpu_kernel {
+            for &idx in indices {
+                let Some(kernel) = self.compiled_kernel_at(idx) else {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!("parallel execution expected compiled kernel at op index {idx}"),
+                    });
+                };
+                Self::execute_kernel(kernel)?;
+            }
+            return Ok(());
+        }
+
+        indices
+            .par_iter()
+            .map(|&idx| {
+                let Some(kernel) = self.compiled_kernel_at(idx) else {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!("parallel execution expected compiled kernel at op index {idx}"),
+                    });
+                };
+                Self::execute_kernel(kernel)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(())
+    }
+
+    fn execute_parallel_group_profiled(&self, indices: &[usize]) -> Result<Vec<(usize, KernelProfile)>> {
+        if indices.len() <= 1 {
+            let mut profiles = Vec::new();
+            if let Some(&idx) = indices.first() {
+                let Some(kernel) = self.compiled_kernel_at(idx) else {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!("profiled execution expected compiled kernel at op index {idx}"),
+                    });
+                };
+                let start = Instant::now();
+                Self::execute_kernel(kernel)?;
+                profiles.push((
+                    idx,
+                    KernelProfile {
+                        kernel: Arc::clone(&kernel.kernel),
+                        device: kernel.device.clone(),
+                        num_buffers: kernel.buffer_ptrs.len(),
+                        elapsed: start.elapsed(),
+                    },
+                ));
+            }
+            return Ok(profiles);
+        }
+
+        let has_threaded_cpu_kernel = indices.iter().try_fold(false, |acc, &idx| {
+            let Some(kernel) = self.compiled_kernel_at(idx) else {
+                return Err(crate::error::Error::Execution {
+                    reason: format!("profiled execution expected compiled kernel at op index {idx}"),
+                });
+            };
+            Ok(acc || Self::kernel_uses_cpu_threading(kernel)?)
+        })?;
+
+        if has_threaded_cpu_kernel {
+            let mut profiles = Vec::with_capacity(indices.len());
+            for &idx in indices {
+                let Some(kernel) = self.compiled_kernel_at(idx) else {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!("profiled execution expected compiled kernel at op index {idx}"),
+                    });
+                };
+                let start = Instant::now();
+                Self::execute_kernel(kernel)?;
+                profiles.push((
+                    idx,
+                    KernelProfile {
+                        kernel: Arc::clone(&kernel.kernel),
+                        device: kernel.device.clone(),
+                        num_buffers: kernel.buffer_ptrs.len(),
+                        elapsed: start.elapsed(),
+                    },
+                ));
+            }
+            return Ok(profiles);
+        }
+
+        let mut profiles = indices
+            .par_iter()
+            .map(|&idx| {
+                let Some(kernel) = self.compiled_kernel_at(idx) else {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!("profiled execution expected compiled kernel at op index {idx}"),
+                    });
+                };
+                let start = Instant::now();
+                Self::execute_kernel(kernel)?;
+                Ok((
+                    idx,
+                    KernelProfile {
+                        kernel: Arc::clone(&kernel.kernel),
+                        device: kernel.device.clone(),
+                        num_buffers: kernel.buffer_ptrs.len(),
+                        elapsed: start.elapsed(),
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        profiles.sort_by_key(|(idx, _)| *idx);
+        Ok(profiles)
     }
 
     /// Get the first (or only) output buffer after execution.
-    pub fn output_buffer(&self) -> &Buffer {
-        &self.buffers[self.output_buffer_indices[0]]
+    ///
+    /// Returns `None` for plans with no output buffers (for example, plans
+    /// constructed before `set_output_buffer*` is called).
+    pub fn output_buffer(&self) -> Option<&Buffer> {
+        self.output_buffer_indices.first().and_then(|&i| self.buffers.get(i))
     }
 
     /// Get output buffer by position (matches SINK source order for batch).
-    pub fn output_buffer_at(&self, position: usize) -> &Buffer {
-        &self.buffers[self.output_buffer_indices[position]]
+    ///
+    /// Returns `None` if `position` is out of range.
+    pub fn output_buffer_at(&self, position: usize) -> Option<&Buffer> {
+        self.output_buffer_indices.get(position).and_then(|&i| self.buffers.get(i))
     }
 
     /// Get all output buffers.
@@ -209,27 +943,56 @@ impl ExecutionPlan {
     }
 
     /// Get all prepared kernels.
-    pub fn prepared_kernels(&self) -> &[PreparedKernel] {
-        &self.kernels
+    pub fn prepared_kernels(&self) -> Vec<&PreparedKernel> {
+        self.ops
+            .iter()
+            .filter_map(|op| match op {
+                PreparedOp::CompiledProgram(kernel) => Some(kernel),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get all prepared operations in schedule order.
+    pub fn prepared_ops(&self) -> &[PreparedOp] {
+        &self.ops
     }
 
     /// Iterate over compiled kernels (for inspecting generated source code).
     pub fn kernels(&self) -> impl Iterator<Item = &CachedKernel> {
-        self.kernels.iter().map(|pk| pk.kernel.as_ref())
+        self.ops.iter().filter_map(|op| match op {
+            PreparedOp::CompiledProgram(kernel) => Some(kernel.kernel.as_ref()),
+            _ => None,
+        })
     }
 
     /// Execute the plan.
     ///
-    /// This is the fast path — a tight loop over pre-compiled kernels with
-    /// pre-computed buffer pointers. No allocation, no validation, no
-    /// device context lookup.
+    /// Uses dependency-aware operation ordering for all prepared op types.
     pub fn execute(&self) -> Result<()> {
-        for level in &self.execution_levels {
-            if Self::can_parallelize_level(level) {
-                level.kernel_indices.par_iter().try_for_each(|&idx| Self::execute_kernel(&self.kernels[idx]))?;
-            } else {
-                for &idx in &level.kernel_indices {
-                    Self::execute_kernel(&self.kernels[idx])?;
+        for level in &self.op_levels {
+            let mut pending_parallel: Vec<usize> = Vec::new();
+
+            for &idx in level {
+                let op = &self.ops[idx];
+                if Self::op_requires_serial(op) {
+                    if !pending_parallel.is_empty() {
+                        let groups = self.partition_parallel_safe_group(&pending_parallel)?;
+                        for group in groups {
+                            self.execute_parallel_group(&group)?;
+                        }
+                        pending_parallel.clear();
+                    }
+                    self.execute_op(op)?;
+                } else {
+                    pending_parallel.push(idx);
+                }
+            }
+
+            if !pending_parallel.is_empty() {
+                let groups = self.partition_parallel_safe_group(&pending_parallel)?;
+                for group in groups {
+                    self.execute_parallel_group(&group)?;
                 }
             }
         }
@@ -254,36 +1017,75 @@ impl ExecutionPlan {
     /// }
     /// ```
     pub fn execute_profiled(&self) -> Result<Vec<KernelProfile>> {
-        let mut profiles = Vec::with_capacity(self.kernels.len());
-        for level in &self.execution_levels {
-            if Self::can_parallelize_level(level) {
-                let level_profiles: Result<Vec<KernelProfile>> = level
-                    .kernel_indices
-                    .par_iter()
-                    .map(|&idx| {
-                        let kernel = &self.kernels[idx];
+        let mut profiles = Vec::new();
+        for level in &self.op_levels {
+            let mut pending_parallel: Vec<usize> = Vec::new();
+
+            for &idx in level {
+                match &self.ops[idx] {
+                    PreparedOp::CompiledProgram(kernel) if kernel.kernel.host_parallel_safe => {
+                        pending_parallel.push(idx);
+                    }
+                    PreparedOp::CompiledProgram(kernel) => {
+                        if !pending_parallel.is_empty() {
+                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
+                            for group in groups {
+                                let mut prof = self.execute_parallel_group_profiled(&group)?;
+                                profiles.extend(prof.drain(..).map(|(_, p)| p));
+                            }
+                            pending_parallel.clear();
+                        }
+
                         let start = Instant::now();
                         Self::execute_kernel(kernel)?;
-                        Ok(KernelProfile {
+                        profiles.push(KernelProfile {
                             kernel: Arc::clone(&kernel.kernel),
                             device: kernel.device.clone(),
                             num_buffers: kernel.buffer_ptrs.len(),
                             elapsed: start.elapsed(),
-                        })
-                    })
-                    .collect();
-                profiles.extend(level_profiles?);
-            } else {
-                for &idx in &level.kernel_indices {
-                    let kernel = &self.kernels[idx];
-                    let start = Instant::now();
-                    Self::execute_kernel(kernel)?;
-                    profiles.push(KernelProfile {
-                        kernel: Arc::clone(&kernel.kernel),
-                        device: kernel.device.clone(),
-                        num_buffers: kernel.buffer_ptrs.len(),
-                        elapsed: start.elapsed(),
-                    });
+                        });
+                    }
+                    PreparedOp::BufferCopy(copy) => {
+                        if !pending_parallel.is_empty() {
+                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
+                            for group in groups {
+                                let mut prof = self.execute_parallel_group_profiled(&group)?;
+                                profiles.extend(prof.drain(..).map(|(_, p)| p));
+                            }
+                            pending_parallel.clear();
+                        }
+                        self.execute_copy(copy)?;
+                    }
+                    PreparedOp::BufferView(view) => {
+                        if !pending_parallel.is_empty() {
+                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
+                            for group in groups {
+                                let mut prof = self.execute_parallel_group_profiled(&group)?;
+                                profiles.extend(prof.drain(..).map(|(_, p)| p));
+                            }
+                            pending_parallel.clear();
+                        }
+                        self.execute_buffer_view(view)?;
+                    }
+                    PreparedOp::CustomFunction(custom) => {
+                        if !pending_parallel.is_empty() {
+                            let groups = self.partition_parallel_safe_group(&pending_parallel)?;
+                            for group in groups {
+                                let mut prof = self.execute_parallel_group_profiled(&group)?;
+                                profiles.extend(prof.drain(..).map(|(_, p)| p));
+                            }
+                            pending_parallel.clear();
+                        }
+                        self.execute_custom_function(custom)?;
+                    }
+                }
+            }
+
+            if !pending_parallel.is_empty() {
+                let groups = self.partition_parallel_safe_group(&pending_parallel)?;
+                for group in groups {
+                    let mut prof = self.execute_parallel_group_profiled(&group)?;
+                    profiles.extend(prof.drain(..).map(|(_, p)| p));
                 }
             }
         }
@@ -305,17 +1107,9 @@ impl ExecutionPlan {
     ///
     /// Variables not present in `var_vals` keep their existing values from
     /// `prepare()` (or the previous `execute_with_vars` call). Internal
-    /// variables like `thread_id` are left untouched.
+    /// variables like `core_id` are left untouched.
     pub fn execute_with_vars(&mut self, var_vals: &[(&str, i64)]) -> Result<()> {
-        // Build a map for O(1) lookup (avoids O(V*K) linear scan per kernel)
-        let vals_map: HashMap<&str, i64> = var_vals.iter().copied().collect();
-        for kernel in &mut self.kernels {
-            for (idx, name) in kernel.kernel.var_names.iter().enumerate() {
-                if let Some(&v) = vals_map.get(name.as_str()) {
-                    kernel.vals[idx] = v;
-                }
-            }
-        }
+        self.update_runtime_var_vals(var_vals)?;
         self.execute()
     }
 
@@ -324,15 +1118,7 @@ impl ExecutionPlan {
     /// Updates kernel `vals` the same way as [`Self::execute_with_vars`] and then
     /// executes via [`Self::execute_profiled`].
     pub fn execute_with_vars_profiled(&mut self, var_vals: &[(&str, i64)]) -> Result<Vec<KernelProfile>> {
-        // Build a map for O(1) lookup (avoids O(V*K) linear scan per kernel)
-        let vals_map: HashMap<&str, i64> = var_vals.iter().copied().collect();
-        for kernel in &mut self.kernels {
-            for (idx, name) in kernel.kernel.var_names.iter().enumerate() {
-                if let Some(&v) = vals_map.get(name.as_str()) {
-                    kernel.vals[idx] = v;
-                }
-            }
-        }
+        self.update_runtime_var_vals(var_vals)?;
         self.execute_profiled()
     }
 
@@ -388,132 +1174,16 @@ impl ExecutionPlan {
     }
 }
 
-fn kernel_access(kernel: &PreparedKernel) -> KernelAccess {
-    let mut writes = HashSet::new();
-    let mut reads = HashSet::new();
-
-    let mut output_mask = vec![false; kernel.buffer_ids.len()];
-    for &out_idx in &kernel.output_indices {
-        if out_idx < output_mask.len() {
-            output_mask[out_idx] = true;
-        }
-    }
-
-    if output_mask.iter().all(|&is_output| !is_output) {
-        // Conservatively treat unknown outputs as writes to all buffers.
-        writes.extend(kernel.buffer_ids.iter().copied());
-    } else {
-        for (idx, buffer_id) in kernel.buffer_ids.iter().copied().enumerate() {
-            if output_mask[idx] {
-                writes.insert(buffer_id);
-            } else {
-                reads.insert(buffer_id);
-            }
-        }
-    }
-
-    let has_thread_id_parallelism = kernel.kernel.var_names.iter().any(|name| name == "thread_id")
-        && kernel.kernel.global_size.map(|[tc, _, _]| tc > 1).unwrap_or(false);
-
-    KernelAccess { reads, writes, has_thread_id_parallelism, host_parallel_safe: kernel.kernel.host_parallel_safe }
-}
-
-fn accesses_conflict(lhs: &KernelAccess, rhs: &KernelAccess) -> bool {
-    // WAW, RAW, WAR hazards.
-    !lhs.writes.is_disjoint(&rhs.writes) || !lhs.writes.is_disjoint(&rhs.reads) || !lhs.reads.is_disjoint(&rhs.writes)
-}
-
-fn partition_level_by_hazards(level_indices: &[usize], accesses: &[KernelAccess]) -> Vec<ExecutionLevel> {
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-
-    for &idx in level_indices {
-        let mut placed = false;
-        for group in &mut groups {
-            if group.iter().all(|&other| !accesses_conflict(&accesses[idx], &accesses[other])) {
-                group.push(idx);
-                placed = true;
-                break;
-            }
-        }
-        if !placed {
-            groups.push(vec![idx]);
-        }
-    }
-
-    groups
-        .into_iter()
-        .map(|kernel_indices| ExecutionLevel {
-            contains_thread_id_kernel: kernel_indices.iter().any(|&idx| accesses[idx].has_thread_id_parallelism),
-            host_parallel_safe: kernel_indices.iter().all(|&idx| accesses[idx].host_parallel_safe),
-            kernel_indices,
-        })
-        .collect()
-}
-
-fn build_execution_levels(kernels: &[PreparedKernel]) -> Vec<ExecutionLevel> {
-    if kernels.is_empty() {
-        return Vec::new();
-    }
-
-    let id_to_idx: HashMap<u64, usize> = kernels.iter().enumerate().map(|(idx, kernel)| (kernel.id, idx)).collect();
-
-    let mut in_degree = vec![0usize; kernels.len()];
-    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); kernels.len()];
-
-    for (idx, kernel) in kernels.iter().enumerate() {
-        for dep_id in &kernel.dependencies {
-            if let Some(&dep_idx) = id_to_idx.get(dep_id) {
-                in_degree[idx] += 1;
-                successors[dep_idx].push(idx);
-            }
-        }
-    }
-
-    let accesses: Vec<KernelAccess> = kernels.iter().map(kernel_access).collect();
-    let mut levels = Vec::new();
-    let mut ready: Vec<usize> =
-        in_degree.iter().enumerate().filter_map(|(idx, &deg)| if deg == 0 { Some(idx) } else { None }).collect();
-    let mut visited = 0usize;
-
-    while !ready.is_empty() {
-        ready.sort_unstable();
-        visited += ready.len();
-        levels.extend(partition_level_by_hazards(&ready, &accesses));
-
-        let mut next_ready = Vec::new();
-        for idx in ready {
-            for &succ in &successors[idx] {
-                in_degree[succ] -= 1;
-                if in_degree[succ] == 0 {
-                    next_ready.push(succ);
-                }
-            }
-        }
-        ready = next_ready;
-    }
-
-    if visited != kernels.len() {
-        return kernels
-            .iter()
-            .enumerate()
-            .map(|(idx, kernel)| ExecutionLevel {
-                kernel_indices: vec![idx],
-                contains_thread_id_kernel: kernel.kernel.var_names.iter().any(|name| name == "thread_id"),
-                host_parallel_safe: kernel.kernel.host_parallel_safe,
-            })
-            .collect();
-    }
-
-    levels
-}
-
 impl std::fmt::Debug for ExecutionPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kernel_count = self.ops.iter().filter(|op| matches!(op, PreparedOp::CompiledProgram(_))).count();
         f.debug_struct("ExecutionPlan")
-            .field("kernels", &self.kernels.len())
+            .field("ops", &self.ops.len())
+            .field("op_instance_dependencies", &self.op_instance_dependencies.len())
+            .field("op_order", &self.op_order.len())
+            .field("kernels", &kernel_count)
             .field("buffers", &self.buffers.len())
             .field("device", &self.device)
-            .field("execution_levels", &self.execution_levels.len())
             .finish()
     }
 }
@@ -526,6 +1196,7 @@ impl std::fmt::Debug for PreparedKernel {
             .field("buffer_indices", &self.buffer_indices)
             .field("output_indices", &self.output_indices)
             .field("vals", &self.vals)
+            .field("fixedvars", &self.fixedvars)
             .field("dependencies", &self.dependencies)
             .finish()
     }
@@ -537,7 +1208,8 @@ impl std::fmt::Debug for PreparedKernel {
 
 /// Builder for creating ExecutionPlan from schedule data.
 pub struct ExecutionPlanBuilder {
-    kernels: Vec<PreparedKernel>,
+    ops: Vec<PreparedOp>,
+    op_instance_dependencies: Vec<Vec<usize>>,
     buffers: Vec<Buffer>,
     ast_to_buffer: HashMap<u64, usize>,
     output_buffer_indices: Vec<usize>,
@@ -549,7 +1221,8 @@ impl ExecutionPlanBuilder {
     /// Create a new builder.
     pub fn new(device: DeviceSpec) -> Self {
         Self {
-            kernels: Vec::new(),
+            ops: Vec::new(),
+            op_instance_dependencies: Vec::new(),
             buffers: Vec::new(),
             ast_to_buffer: HashMap::new(),
             output_buffer_indices: Vec::new(),
@@ -591,181 +1264,98 @@ impl ExecutionPlanBuilder {
         self.output_buffer_indices = indices;
     }
 
-    /// Add a prepared kernel.
+    /// Compatibility helper: add a compiled kernel as a prepared operation.
+    ///
+    /// The canonical builder path is `add_op(PreparedOp::...)`.
     pub fn add_kernel(&mut self, kernel: PreparedKernel) {
-        self.kernels.push(kernel);
+        self.add_op(PreparedOp::CompiledProgram(kernel));
+    }
+
+    /// Add a prepared operation in schedule order.
+    pub fn add_op(&mut self, op: PreparedOp) {
+        self.add_op_with_instance_dependencies(op, Vec::new());
+    }
+
+    /// Add a prepared operation with concrete op-index dependencies.
+    pub fn add_op_with_instance_dependencies(&mut self, op: PreparedOp, instance_dependencies: Vec<usize>) {
+        self.ops.push(op);
+        self.op_instance_dependencies.push(instance_dependencies);
     }
 
     /// Build the ExecutionPlan.
     ///
     /// Finalizes by computing pre-allocated buffer pointers and buffer IDs
     /// for zero-allocation execution.
-    pub fn build(mut self) -> ExecutionPlan {
-        for kernel in &mut self.kernels {
-            kernel.buffer_ptrs =
-                kernel.buffer_indices.iter().map(|&idx| unsafe { self.buffers[idx].as_raw_ptr() }).collect();
+    pub fn build(mut self) -> Result<ExecutionPlan> {
+        for op in &mut self.ops {
+            let PreparedOp::CompiledProgram(kernel) = op else {
+                continue;
+            };
 
-            kernel.buffer_ids = kernel.buffer_indices.iter().map(|&idx| self.buffers[idx].id()).collect();
+            if kernel.output_indices.is_empty() {
+                return Err(crate::error::Error::Execution {
+                    reason: format!("CompiledProgram {} has no output indices", kernel.id),
+                });
+            }
+            for &out_idx in &kernel.output_indices {
+                if out_idx >= kernel.buffer_indices.len() {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!(
+                            "CompiledProgram {} output index out of range: output_idx={}, kernel_buffers={}",
+                            kernel.id,
+                            out_idx,
+                            kernel.buffer_indices.len()
+                        ),
+                    });
+                }
+            }
+
+            let mut buffer_ptrs = Vec::with_capacity(kernel.buffer_indices.len());
+            let mut buffer_ids = Vec::with_capacity(kernel.buffer_indices.len());
+
+            for &idx in &kernel.buffer_indices {
+                let Some(buffer) = self.buffers.get(idx) else {
+                    return Err(crate::error::Error::Execution {
+                        reason: format!(
+                            "CompiledProgram {} buffer index out of range: idx={}, total_buffers={}",
+                            kernel.id,
+                            idx,
+                            self.buffers.len()
+                        ),
+                    });
+                };
+                buffer_ptrs.push(unsafe { buffer.as_raw_ptr() } as usize);
+                buffer_ids.push(buffer.id());
+            }
+
+            kernel.buffer_ptrs = buffer_ptrs;
+            kernel.buffer_ids = buffer_ids;
         }
 
         if self.output_buffer_indices.is_empty() && !self.buffers.is_empty() {
-            self.output_buffer_indices = vec![0];
+            return Err(crate::error::Error::Execution {
+                reason: "execution plan output buffers must be set explicitly".to_string(),
+            });
         }
 
-        let execution_levels = build_execution_levels(&self.kernels);
+        let op_order = compute_mixed_op_order_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
+        let op_levels = compute_execution_levels_with_instance_dependencies(&self.ops, &self.op_instance_dependencies)?;
 
-        ExecutionPlan {
-            kernels: self.kernels,
+        Ok(ExecutionPlan {
+            ops: self.ops,
+            op_instance_dependencies: self.op_instance_dependencies,
+            op_order,
+            op_levels,
             buffers: self.buffers,
             ast_to_buffer: self.ast_to_buffer,
             output_buffer_indices: self.output_buffer_indices,
             device: self.device,
+            runtime_var_vals: HashMap::new(),
             alias_ids: self.alias_ids,
-            execution_levels,
-        }
+        })
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use morok_device::device::Program;
-
-    #[derive(Debug)]
-    struct NoopProgram;
-
-    impl Program for NoopProgram {
-        unsafe fn execute(
-            &self,
-            _buffers: &[*mut u8],
-            _vals: &[i64],
-            _global_size: Option<[usize; 3]>,
-            _local_size: Option<[usize; 3]>,
-        ) -> morok_device::Result<()> {
-            Ok(())
-        }
-
-        fn name(&self) -> &str {
-            "noop"
-        }
-    }
-
-    fn make_kernel(
-        id: u64,
-        dependencies: Vec<u64>,
-        buffer_ids: Vec<u64>,
-        output_indices: Vec<usize>,
-        threaded: bool,
-    ) -> PreparedKernel {
-        let (var_names, vals, global_size) = if threaded {
-            (vec!["thread_id".to_string()], vec![0], Some([4, 1, 1]))
-        } else {
-            (Vec::new(), Vec::new(), None)
-        };
-
-        let cached = Arc::new(CachedKernel {
-            program: Box::new(NoopProgram),
-            device: "CPU".to_string(),
-            code: String::new(),
-            entry_point: format!("k{id}"),
-            var_names,
-            globals: (0..buffer_ids.len()).collect(),
-            outs: output_indices.clone(),
-            ins: Vec::new(),
-            host_parallel_safe: true,
-            global_size,
-            local_size: None,
-        });
-
-        PreparedKernel {
-            id,
-            ast: UOp::sink(vec![]),
-            kernel: cached,
-            device: DeviceSpec::Cpu,
-            buffer_indices: (0..buffer_ids.len()).collect(),
-            output_indices,
-            vals,
-            dependencies,
-            buffer_ptrs: Vec::new(),
-            buffer_ids: buffer_ids.into_iter().map(BufferId).collect(),
-        }
-    }
-
-    #[test]
-    fn test_builder_basic() {
-        let builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
-        let plan = builder.build();
-
-        assert!(plan.kernels.is_empty());
-        assert!(plan.buffers.is_empty());
-        assert_eq!(plan.device, DeviceSpec::Cpu);
-        assert!(plan.execution_levels.is_empty());
-    }
-
-    #[test]
-    fn test_builder_map_buffer_alias() {
-        let alloc = morok_device::registry::cpu().expect("cpu allocator");
-        let buf = Buffer::new(alloc, morok_dtype::DType::Float32, vec![8], Default::default());
-
-        let mut builder = ExecutionPlanBuilder::new(DeviceSpec::Cpu);
-        let idx = builder.add_buffer(10, buf);
-        builder.map_buffer(11, idx);
-        let plan = builder.build();
-
-        assert_eq!(plan.ast_to_buffer_map().get(&10), Some(&idx));
-        assert_eq!(plan.ast_to_buffer_map().get(&11), Some(&idx));
-        assert_eq!(plan.buffers().len(), 1);
-    }
-
-    #[test]
-    fn test_execution_levels_parallel_dependency_layers() {
-        let kernels = vec![
-            make_kernel(1, vec![], vec![10], vec![0], false),
-            make_kernel(2, vec![], vec![20], vec![0], false),
-            make_kernel(3, vec![1, 2], vec![30, 10, 20], vec![0], false),
-        ];
-
-        let levels = build_execution_levels(&kernels);
-        assert_eq!(levels.len(), 2);
-        assert_eq!(levels[0].kernel_indices, vec![0, 1]);
-        assert_eq!(levels[1].kernel_indices, vec![2]);
-        assert!(!levels[0].contains_thread_id_kernel);
-    }
-
-    #[test]
-    fn test_execution_levels_split_raw_hazard() {
-        let kernels = vec![
-            make_kernel(1, vec![], vec![7], vec![0], false),
-            // Writes buffer 8, reads buffer 7 -> RAW hazard against kernel 1.
-            make_kernel(2, vec![], vec![8, 7], vec![0], false),
-        ];
-
-        let levels = build_execution_levels(&kernels);
-        assert_eq!(levels.len(), 2);
-        assert_eq!(levels[0].kernel_indices, vec![0]);
-        assert_eq!(levels[1].kernel_indices, vec![1]);
-    }
-
-    #[test]
-    fn test_execution_levels_split_alias_overlap_waw() {
-        let kernels =
-            vec![make_kernel(1, vec![], vec![42], vec![0], false), make_kernel(2, vec![], vec![42], vec![0], false)];
-
-        let levels = build_execution_levels(&kernels);
-        assert_eq!(levels.len(), 2);
-        assert_eq!(levels[0].kernel_indices, vec![0]);
-        assert_eq!(levels[1].kernel_indices, vec![1]);
-    }
-
-    #[test]
-    fn test_execution_levels_thread_id_disables_outer_parallel() {
-        let kernels =
-            vec![make_kernel(1, vec![], vec![10], vec![0], true), make_kernel(2, vec![], vec![20], vec![0], false)];
-
-        let levels = build_execution_levels(&kernels);
-        assert_eq!(levels.len(), 1);
-        assert!(levels[0].contains_thread_id_kernel);
-        assert!(!ExecutionPlan::can_parallelize_level(&levels[0]));
-    }
-}
+#[path = "test/unit/execution_plan.rs"]
+mod tests;

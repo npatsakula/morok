@@ -346,7 +346,7 @@ fn test_buffer_removal_always_run_ops_kept() {
     let matcher = patterns::buffer_removal();
 
     // Test: BUFFERIZE(CONTIGUOUS) should be KEPT (Tinygrad: ALWAYS_RUN_OPS keep their buffers).
-    // CONTIGUOUS/COPY/ASSIGN must produce actual buffers - they are materialization points.
+    // CONTIGUOUS/COPY must produce actual buffers - they are materialization points.
     let src = UOp::const_(DType::Float32, ConstValue::Float(1.0));
     let contiguous = src.contiguous();
 

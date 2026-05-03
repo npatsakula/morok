@@ -126,6 +126,7 @@ pub struct MultiHeadSelfAttention {
     pub out_proj: Tensor,
     pub out_bias: Tensor,
     pub n_heads: usize,
+    pub d_model: usize,
 }
 
 impl MultiHeadSelfAttention {
@@ -142,22 +143,15 @@ impl MultiHeadSelfAttention {
             out_proj: zeros(&[d, d]),
             out_bias: zeros(&[d]),
             n_heads: config.n_heads,
+            d_model: d,
         }
     }
 
-    pub fn forward(
-        &self,
-        x: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-        mask: Option<&Tensor>,
-        _batch: SInt,
-        _seq_len: SInt,
-    ) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
         let shape = x.shape().context(TensorSnafu)?;
         let b = shape[0].clone();
         let t = shape[1].clone();
-        let d_model = self.norm.weight.shape().context(TensorSnafu)?[0].as_const().unwrap();
+        let d_model = self.d_model;
         let d_k = d_model / self.n_heads;
         let h = self.n_heads;
 
@@ -170,21 +164,22 @@ impl MultiHeadSelfAttention {
             .try_reshape([t.clone(), b.clone(), SInt::Const(h), SInt::Const(d_k)])
             .context(TensorSnafu)?;
 
-        // Apply RoPE BEFORE linear projections
-        let q_rot = y_heads.apply_rotary_emb(cos, sin, false).context(TensorSnafu)?;
-        let k_rot = y_heads.apply_rotary_emb(cos, sin, false).context(TensorSnafu)?;
-
-        // Reshape back to [B, T, d_model]
-        let q_input = q_rot
+        // Apply RoPE once and materialize at the [B, T, d_model] layout the projections
+        // consume, so reshape+transpose isn't recomputed per matmul kernel and Q/K share
+        // a single rotated buffer.
+        let rope_dtype = y_heads.uop().dtype();
+        let cos = cos.cast(rope_dtype.clone()).context(TensorSnafu)?;
+        let sin = sin.cast(rope_dtype).context(TensorSnafu)?;
+        let rot_btd = y_heads
+            .apply_rotary_emb(&cos, &sin, false)
+            .context(TensorSnafu)?
             .try_reshape([t.clone(), b.clone(), SInt::Const(d_model)])
             .context(TensorSnafu)?
             .try_transpose(0, 1)
-            .context(TensorSnafu)?;
-        let k_input = k_rot
-            .try_reshape([t.clone(), b.clone(), SInt::Const(d_model)])
             .context(TensorSnafu)?
-            .try_transpose(0, 1)
-            .context(TensorSnafu)?;
+            .contiguous();
+        let q_input = rot_btd.clone();
+        let k_input = rot_btd;
 
         // Project through Q, K, V linear layers
         let q = q_input.linear().weight(&self.q_proj).bias(&self.q_bias).call().context(TensorSnafu)?;
@@ -303,9 +298,10 @@ impl ConvModule {
     }
 
     pub fn forward(&self, x: &Tensor, pad_mask: Option<&Tensor>) -> Result<Tensor> {
+        let activation_dtype = x.uop().dtype();
         let y = self.norm.apply(x)?;
 
-        let y = y.try_transpose(-1, -2).context(TensorSnafu)?.contiguous();
+        let y = y.try_transpose(-1, -2).context(TensorSnafu)?;
 
         let y = y.conv2d().weight(&self.pw1_weight).bias(&self.pw1_bias).call().context(TensorSnafu)?;
 
@@ -338,6 +334,10 @@ impl ConvModule {
                 y.batchnorm().scale(scale).bias(bias).mean(mean).invstd(invstd).call().context(TensorSnafu)?
             }
         };
+        // BN/LN params (scale, bias, mean, invstd) are stored fp32; broadcasting promotes
+        // the norm output. Re-cast to the activation dtype so SiLU/pw2 stay in the right
+        // precision, matching Python's BatchNorm1d dtype semantics. No-op when types match.
+        let y = if y.uop().dtype() != activation_dtype { y.cast(activation_dtype).context(TensorSnafu)? } else { y };
 
         let y = y.silu().context(TensorSnafu)?;
 
@@ -589,8 +589,6 @@ impl ConformerLayer {
         sin: &Tensor,
         att_mask: Option<&Tensor>,
         pad_mask: Option<&Tensor>,
-        batch: SInt,
-        seq_len: SInt,
     ) -> Result<Tensor> {
         let half = Tensor::from_const(0.5f64).cast(x.uop().dtype()).context(TensorSnafu)?;
 
@@ -598,9 +596,7 @@ impl ConformerLayer {
         let x = x.try_add(&self.ffn1.forward(x)?.try_mul(&half).context(TensorSnafu)?).context(TensorSnafu)?;
 
         // MHSA
-        let x = x
-            .try_add(&self.mhsa.forward(&x, cos, sin, att_mask, batch.clone(), seq_len.clone())?)
-            .context(TensorSnafu)?;
+        let x = x.try_add(&self.mhsa.forward(&x, cos, sin, att_mask)?).context(TensorSnafu)?;
 
         // Convolution
         let x = x.try_add(&self.conv.forward(&x, pad_mask)?).context(TensorSnafu)?;

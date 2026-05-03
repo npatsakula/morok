@@ -12,7 +12,9 @@ pub use crate::Op;
 pub use crate::uop::{IntoUOp, UOp, UOpKey};
 
 // Operation types
-pub use crate::types::{BinaryOp, ConstValue, ConstValueHash, MovementArg, ReduceOp, TernaryOp, UnaryOp};
+pub use crate::types::{
+    BinaryOp, CallInfo, ConstValue, ConstValueHash, CustomFunctionKind, ReduceOp, TernaryOp, UnaryOp,
+};
 
 // Shape and indexing
 pub use crate::indexing::IndexSpec;

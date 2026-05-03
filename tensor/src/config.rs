@@ -48,32 +48,45 @@ impl DeviceResolver for CpuBackendResolver {
 ///
 /// Instead of relying on the `MOROK_CPU_BACKEND` env var (global mutable state),
 /// the backend is selected per-call via a [`DeviceResolver`].
+#[allow(rustdoc::private_intra_doc_links)]
 pub struct PrepareConfig {
     pub optimizer: OptimizerConfig,
     pub(crate) resolver: Arc<dyn DeviceResolver>,
+    /// When `true`, force the cache-cold rangeify/scheduling path even if
+    /// `MOROK_DISABLE_SCHEDULE_CACHE` is unset. Primarily useful in tests
+    /// that need to compare cache-warm vs cache-cold outputs without mutating
+    /// process-global env state.
+    pub disable_schedule_cache: bool,
 }
 
 impl std::fmt::Debug for PrepareConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PrepareConfig").field("optimizer", &self.optimizer).finish_non_exhaustive()
+        f.debug_struct("PrepareConfig")
+            .field("optimizer", &self.optimizer)
+            .field("disable_schedule_cache", &self.disable_schedule_cache)
+            .finish_non_exhaustive()
     }
 }
 
 impl Default for PrepareConfig {
     fn default() -> Self {
-        Self { optimizer: OptimizerConfig::default(), resolver: Arc::new(EnvResolver) }
+        Self { optimizer: OptimizerConfig::default(), resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
     }
 }
 
 impl PrepareConfig {
     /// Read both `MOROK_CPU_BACKEND` and optimizer env vars.
     pub fn from_env() -> Self {
-        Self { optimizer: OptimizerConfig::from_env(), resolver: Arc::new(EnvResolver) }
+        Self { optimizer: OptimizerConfig::from_env(), resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
     }
 
     /// Convenience constructor: specific CPU backend with default optimizer.
     pub fn for_cpu_backend(backend: CpuBackend) -> Self {
-        Self { optimizer: OptimizerConfig::default(), resolver: Arc::new(CpuBackendResolver(backend)) }
+        Self {
+            optimizer: OptimizerConfig::default(),
+            resolver: Arc::new(CpuBackendResolver(backend)),
+            disable_schedule_cache: false,
+        }
     }
 
     /// Resolve a `DeviceSpec` into a `Device` using this config's resolver.
@@ -84,7 +97,7 @@ impl PrepareConfig {
 
 impl From<OptimizerConfig> for PrepareConfig {
     fn from(optimizer: OptimizerConfig) -> Self {
-        Self { optimizer, resolver: Arc::new(EnvResolver) }
+        Self { optimizer, resolver: Arc::new(EnvResolver), disable_schedule_cache: false }
     }
 }
 

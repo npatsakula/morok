@@ -8,7 +8,7 @@
 //! - [`memory`] - Memory operations (load, store, index, copy, bufferize)
 //! - [`control`] - Control flow (range, if/end, barrier, var)
 //! - [`reduce`] - Reduction operations
-//! - [`hardware`] - Hardware-specific (WMMA, vectorize, kernel)
+//! - [`hardware`] - Hardware-specific (WMMA, vectorize, call, program)
 //! - [`graph`] - Graph organization (sink, group, assign)
 
 use std::sync::Arc;

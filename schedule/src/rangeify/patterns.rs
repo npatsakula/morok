@@ -18,21 +18,17 @@ use crate::argsort;
 
 use morok_device::DeviceSpec;
 use morok_dtype::{AddrSpace, DType, ScalarDType};
-use morok_ir::{
-    AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, MovementArg, Op, ReduceOp, SInt, UOp, UOpKey, UnaryOp,
-};
+use morok_ir::{AxisId, AxisType, BinaryOp, BufferizeOpts, ConstValue, Op, ReduceOp, UOp, UOpKey, UnaryOp};
 use smallvec::SmallVec;
 use tracing::trace;
 
 use crate::TypedPatternMatcher;
 use crate::rangeify::transforms::{cast_to_dtype, get_range_size, partition_reduce_ranges};
 
-// Re-export from indexing for backwards compatibility
-pub use super::indexing::{is_dead_axis, ranges_equal};
-
 // Forward declarations for types from other modules
 use super::indexing::IndexingContext;
-use super::kernel::{KernelContext, LocalAddBufferContext};
+use super::indexing::{is_dead_axis, ranges_equal};
+use super::kernel::{LocalAddBufferContext, RangeifyBufferContext};
 use super::kernel::{PcontigConfig, SplitReduceOpConfig, split_reduceop};
 use super::transforms::transform_sources_with_bufferize;
 
@@ -108,7 +104,7 @@ fn block_reduce_unary_inline(_buf: &Arc<UOp>) -> Option<Arc<UOp>> {
 
 /// Check if an op must always run (shouldn't be buffered).
 pub fn is_always_run_op(op: &Op) -> bool {
-    matches!(op, Op::Contiguous { .. } | Op::Copy { .. } | Op::Assign { .. })
+    matches!(op, Op::Contiguous { .. } | Op::Copy { .. })
 }
 
 /// Check if operation is elementwise (Binary or Ternary).
@@ -261,11 +257,6 @@ pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
         // PAD → WHERE conversion BEFORE bufferization
         // Tinygrad: convert_pad_to_where_to_keep_behavior_local
         x @ Pad { src: _, begin_pads: _, end_pads: _ } => |x, ctx| convert_pad_to_where(x, ctx),
-        // Capture movement chain on ASSIGN target before generic source rewrites.
-        // Tinygrad indexing.py: handle_assign_mops.
-        assign @ Assign { target, value, movement_ops: _ } => |assign, target, value, ctx| {
-            handle_assign_movement_ops(assign, target, value, ctx)
-        },
         // ALL ops (including movement) get source bufferization
         // This matches Tinygrad's approach where bufferization runs on GroupOp.All
         x => |x, ctx| apply_bufferize_transform(x, ctx),
@@ -274,94 +265,6 @@ pub fn apply_rangeify_patterns() -> TypedPatternMatcher<IndexingContext> {
         // Const/DefineVar shouldn't keep accidental sources after rangeify.
         x @ Const(_) | x @ DefineVar { name: _ } => |x, ctx| cleanup_const_define_var_sources(x, ctx),
     }
-}
-
-fn handle_assign_movement_ops(
-    assign: &Arc<UOp>,
-    target: &Arc<UOp>,
-    value: &Arc<UOp>,
-    ctx: &mut IndexingContext,
-) -> Option<Arc<UOp>> {
-    if !target.op().is_movement() || matches!(value.op(), Op::Kernel { .. }) {
-        return None;
-    }
-    if ctx.get_ranges(assign).is_none() {
-        return None;
-    }
-
-    let (base_target, movement_ops) = capture_assign_movement_args(target)?;
-
-    let mut ret = UOp::assign_with_mops(base_target, value.clone(), Some(movement_ops));
-    if let Some(tag) = assign.tag().clone() {
-        ret = ret.with_tag(tag);
-    }
-
-    if let Some((in_rngs, out_rngs)) = ctx.get_ranges(assign) {
-        ctx.set_ranges(&ret, in_rngs.clone(), out_rngs.clone());
-    }
-    if let Some(realize_axes) = ctx.get_realize_axes(assign).cloned() {
-        ctx.mark_realize(&ret, realize_axes);
-    }
-    Some(ret)
-}
-
-fn decode_shape_arg(shape_uop: &Arc<UOp>) -> Option<Vec<SInt>> {
-    match shape_uop.op() {
-        Op::Vectorize { elements } => Some(elements.iter().cloned().map(SInt::from).collect()),
-        Op::Const(const_hash) => match const_hash.0 {
-            ConstValue::Int(v) if v >= 0 => Some(vec![SInt::from(v as usize)]),
-            ConstValue::UInt(v) => Some(vec![SInt::from(v as usize)]),
-            _ => None,
-        },
-        Op::VConst { values } => {
-            let mut dims = Vec::with_capacity(values.len());
-            for val in values {
-                match val {
-                    ConstValue::Int(v) if *v >= 0 => dims.push(SInt::from(*v as usize)),
-                    ConstValue::UInt(v) => dims.push(SInt::from(*v as usize)),
-                    _ => return None,
-                }
-            }
-            Some(dims)
-        }
-        _ => None,
-    }
-}
-
-fn decode_ranges_arg(begins_uop: &Arc<UOp>, ends_uop: &Arc<UOp>) -> Option<Vec<(SInt, SInt)>> {
-    let begins = decode_shape_arg(begins_uop)?;
-    let ends = decode_shape_arg(ends_uop)?;
-    if begins.len() != ends.len() {
-        return None;
-    }
-    Some(begins.into_iter().zip(ends).collect())
-}
-
-fn capture_assign_movement_args(target: &Arc<UOp>) -> Option<(Arc<UOp>, Vec<MovementArg>)> {
-    let mut movement_ops = Vec::new();
-    let mut base_target = target.clone();
-
-    while base_target.op().is_movement() {
-        let (next_base, marg) = match base_target.op() {
-            Op::Reshape { src, new_shape } => (src.clone(), MovementArg::Reshape(decode_shape_arg(new_shape)?)),
-            Op::Permute { src, axes } => (src.clone(), MovementArg::Permute(axes.clone())),
-            Op::Expand { src, new_shape } => (src.clone(), MovementArg::Expand(decode_shape_arg(new_shape)?)),
-            Op::Pad { src, begin_pads, end_pads } => {
-                (src.clone(), MovementArg::Pad(decode_ranges_arg(begin_pads, end_pads)?))
-            }
-            Op::Shrink { src, begins, ends } => (src.clone(), MovementArg::Shrink(decode_ranges_arg(begins, ends)?)),
-            Op::Flip { src, axes } => (src.clone(), MovementArg::Flip(axes.clone())),
-            _ => return None,
-        };
-        movement_ops.push(marg);
-        base_target = next_base;
-    }
-
-    if movement_ops.is_empty() {
-        return None;
-    }
-
-    Some((base_target, movement_ops))
 }
 
 fn cleanup_const_define_var_sources(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<UOp>> {
@@ -426,16 +329,14 @@ fn convert_pad_to_where(x: &Arc<UOp>, ctx: &mut IndexingContext) -> Option<Arc<U
         });
     }
 
-    let Some(combined_valid) = combined_valid else {
-        return None;
-    };
+    let combined_valid = combined_valid?;
 
     // PAD source is the first source
     let pad_src = x.op().sources().first()?.clone();
 
     // Create WHERE(combined_valid, pad_source, const_0).
     // The scalar zero is compatible with any-shaped pad_src via implicit broadcast.
-    let Some(base) = x.dtype().scalar() else { return None };
+    let base = x.dtype().scalar()?;
     let zero = UOp::const_(x.dtype(), ConstValue::zero(base));
     let Ok(ret) = UOp::try_where(combined_valid, pad_src, zero) else { return None };
 
@@ -577,8 +478,11 @@ fn cleanup_dead_axes_bufferize(
     use morok_ir::SInt;
     use morok_ir::shape::Shape;
 
-    // Don't optimize ALWAYS_RUN_OPS (CONTIGUOUS, COPY, ASSIGN)
-    if matches!(compute.op(), Op::Contiguous { .. } | Op::Copy { .. } | Op::Assign { .. }) {
+    // Don't optimize ALWAYS_RUN_OPS (CONTIGUOUS, COPY, NOOP) or AFTER. AFTER
+    // is a buffer-identity wrapper: ranges define consumer access, not the
+    // computation's own shape, so dead-axis pruning would mangle assign-chain
+    // semantics.
+    if matches!(compute.op(), Op::Contiguous { .. } | Op::Copy { .. } | Op::Noop | Op::After { .. }) {
         return None;
     }
 
@@ -593,7 +497,8 @@ fn cleanup_dead_axes_bufferize(
     let mut had_dead = false;
 
     for (i, range) in ranges.iter().enumerate() {
-        // Skip symbolic ranges (non-const end) - Tinygrad TODO
+        // Tinygrad intentionally skips symbolic range ends here; dead-axis
+        // cleanup cannot prove shape/range equivalence before binding values.
         if let Op::Range { end, .. } = range.op()
             && !matches!(end.op(), Op::Const(_))
         {
@@ -721,7 +626,7 @@ pub fn buffer_removal_with_pcontig() -> TypedPatternMatcher<PcontigConfig> {
 /// Remove a BUFFERIZE+INDEX pair by inlining the computation (like Tinygrad's `remove_bufferize`).
 ///
 /// Decision flow (matching Tinygrad):
-/// 1. Always-run ops (Contiguous/Copy/Assign) → keep
+/// 1. Always-run ops (Contiguous/Copy) → keep
 /// 2. Buffer count > threshold (bypassed at level > 2) → keep
 /// 3. No buffer in reduce scope → simple range substitution (always inline)
 /// 4. Buffer in reduce at level ≤ 2 → keep (Tinygrad's `PCONTIG ≤ 2` default)
@@ -769,6 +674,9 @@ fn apply_pcontig_removal_inner(
         }
 
         match uop.op() {
+            // Tinygrad (rangeify.py:253-255): STORE doesn't count toward buffer accesses
+            // and we don't look inside it.
+            Op::Store { .. } => return false,
             // Tinygrad (rangeify.py:208-209): BUFFERIZE(Global) and MSTACK count + stop traversal
             Op::Bufferize { opts, .. } if opts.addrspace == AddrSpace::Global => {
                 buffers.push(Arc::clone(uop));
@@ -778,8 +686,9 @@ fn apply_pcontig_removal_inner(
                 buffers.push(Arc::clone(uop));
                 return false; // Stop traversing into MSTACK (Tinygrad returns False)
             }
-            // Tinygrad (rangeify.py:211): PARAM counts but continues traversal
-            Op::Param { .. } => {
+            // Tinygrad (rangeify.py:211): PARAM counts but continues traversal.
+            // Morok may still have BUFFER here where Tinygrad has normalized it to PARAM.
+            Op::Param { .. } | Op::Buffer { .. } => {
                 buffers.push(Arc::clone(uop));
             }
             Op::Index { .. } => indexes.push(Arc::clone(uop)),
@@ -826,8 +735,8 @@ fn apply_pcontig_removal_inner(
         } else {
             let sink = UOp::sink(reduce_sources);
             // Tinygrad (rangeify.py:228): checks for PARAM or BUFFERIZE in reduce body.
-            // Buffer is normalized to Param before buffer removal runs.
-            sink.any_in_subtree(|n| matches!(n.op(), Op::Param { .. } | Op::Bufferize { .. }))
+            // Morok may still have BUFFER here where Tinygrad has normalized it to PARAM.
+            sink.any_in_subtree(|n| matches!(n.op(), Op::Param { .. } | Op::Buffer { .. } | Op::Bufferize { .. }))
         }
     };
 
@@ -1159,6 +1068,12 @@ pub fn movement_op_patterns() -> TypedPatternMatcher {
             => |after, mop, deps| {
                 super::transforms::push_movement_through_after(after, mop, deps)
             },
+        // pm_mops rule 2 also covers INDEX through AFTER (Tinygrad rangeify.py:72-74)
+        // AFTER(INDEX(x, idxs), deps) → INDEX(AFTER(x, deps), idxs)
+        after @ After { passthrough: idx @ Index { buffer, indices, gate }, deps }
+            => |after, idx, buffer, indices, gate, deps| {
+                super::transforms::push_index_through_after(after, idx, buffer, indices, gate, deps)
+            },
         // pm_mops rule 3: Movement ops through END (Tinygrad rangeify.py:30)
         // END(MOVEMENT(x, ...), ranges) → END(x, ranges)
         End { computation: mop, ranges } if mop.op().is_movement()
@@ -1192,6 +1107,14 @@ pub fn movement_op_patterns() -> TypedPatternMatcher {
 /// - Outer INDEX doesn't have PtrDType (is an element access)
 pub fn pm_syntactic_sugar() -> &'static TypedPatternMatcher {
     crate::cached_patterns! {
+        // Early rangeify: INDEX(elementwise, ranges) → elementwise(INDEX(src, ranges)).
+        // Tinygrad codegen/__init__.py runs pm_syntactic_sugar before optimization to avoid
+        // treating elementwise tensor expressions as pointer-like INDEX buffers.
+        Index { buffer: x, indices, gate }
+            if is_indexable_elementwise_or_const(x)
+            => |x, indices, gate| {
+                push_index_through_elementwise(x, indices, gate)
+            },
         // INDEX on ptr INDEX concats them
         outer @ Index { buffer: inner @ Index { buffer: base_buffer, indices: inner_indices, gate: inner_gate }, indices: outer_indices, gate: outer_gate }
             if matches!(inner.dtype(), DType::Ptr { .. }) && !matches!(outer.dtype(), DType::Ptr { .. })
@@ -1199,6 +1122,30 @@ pub fn pm_syntactic_sugar() -> &'static TypedPatternMatcher {
                 concat_index_indices(base_buffer, inner_indices, outer_indices, inner_gate, outer_gate, outer.dtype())
             },
     }
+}
+
+fn is_indexable_elementwise_or_const(uop: &Arc<UOp>) -> bool {
+    matches!(
+        uop.op(),
+        Op::Unary(..) | Op::Binary(..) | Op::Ternary(..) | Op::Cast { .. } | Op::BitCast { .. } | Op::Const(_)
+    )
+}
+
+fn push_index_through_elementwise(
+    x: &Arc<UOp>,
+    indices: &SmallVec<[Arc<UOp>; 4]>,
+    gate: &Option<Arc<UOp>>,
+) -> Option<Arc<UOp>> {
+    if matches!(x.op(), Op::Const(_)) {
+        return Some(x.clone());
+    }
+
+    let mut new_sources = Vec::with_capacity(x.op().sources().len());
+    for src in x.op().sources() {
+        let indexed = UOp::index().buffer(src.clone()).indices(indices.clone()).maybe_gate(gate.clone()).call().ok()?;
+        new_sources.push(indexed);
+    }
+    Some(x.with_sources(new_sources))
 }
 
 /// Concatenate indices from nested INDEX operations.
@@ -1322,13 +1269,13 @@ pub fn rangeify_codegen_simple() -> TypedPatternMatcher {
     }
 }
 
-/// rangeify_codegen that accepts KernelContext for combining with pm_add_buffers_local.
+/// rangeify_codegen that accepts RangeifyBufferContext for combining with pm_add_buffers_local.
 ///
-/// This is the same as `rangeify_codegen_simple` but accepts `KernelContext` to allow
+/// This is the same as `rangeify_codegen_simple` but accepts `RangeifyBufferContext` to allow
 /// combining with `pm_add_buffers_local_patterns` in a single pass (like Tinygrad does).
-pub fn rangeify_codegen_with_kernel_ctx() -> TypedPatternMatcher<super::kernel::KernelContext> {
+pub fn rangeify_codegen_with_kernel_ctx() -> TypedPatternMatcher<super::kernel::RangeifyBufferContext> {
     crate::patterns! {
-        @context super::kernel::KernelContext;
+        @context super::kernel::RangeifyBufferContext;
         // NOOP → zero constant (scalar or vector)
         noop @ Noop() if noop.dtype().base() != morok_dtype::ScalarDType::Void => |noop, _ctx| {
             Some(dtype_zero(noop.dtype()))
@@ -1341,7 +1288,7 @@ pub fn rangeify_codegen_with_kernel_ctx() -> TypedPatternMatcher<super::kernel::
 }
 
 // ============================================================================
-// KERNEL SPLITTING PATTERNS
+// CALL-WRAPPER SPLITTING PATTERNS
 // ============================================================================
 
 /// Extract base dtype from a Ptr type, or return the type as-is.
@@ -1361,7 +1308,7 @@ fn extract_buffer_from_after(passthrough: &Arc<UOp>) -> Arc<UOp> {
     }
 }
 
-/// Find output PARAM from KERNEL AST.
+/// Find output PARAM from a CALL body AST.
 fn find_kernel_output(ast: &Arc<UOp>) -> Option<Arc<UOp>> {
     for node in ast.toposort() {
         // Use store_buffer() helper to get buffer from STORE via its INDEX child
@@ -1404,9 +1351,9 @@ fn map_after_like_node(node: &Arc<UOp>, ctx: &mut LocalAddBufferContext) -> Opti
 }
 
 /// Create patterns for to_param transformation (normalizes buffers to codegen PARAMs).
-pub fn to_param_patterns() -> TypedPatternMatcher<KernelContext> {
+pub fn to_param_patterns() -> TypedPatternMatcher<RangeifyBufferContext> {
     crate::patterns! {
-        @context KernelContext;
+        @context RangeifyBufferContext;
         // Buffer → codegen PARAM
         buf @ Buffer { size, unique: _ } => |buf, size, ctx| {
             let ptr_dtype = extract_base_dtype(buf.dtype()).ptr(Some(*size), AddrSpace::Global);
@@ -1450,8 +1397,8 @@ pub fn to_param_patterns() -> TypedPatternMatcher<KernelContext> {
         Range { end, axis_id, axis_type } if matches!(axis_id, AxisId::Unrenumbered(_)) => |_r, end, axis_type, ctx| {
             Some(UOp::range_axis(end.clone(), AxisId::Renumbered(ctx.next_range()), *axis_type))
         },
-        // Replace KERNEL references with their output buffer
-        Kernel { ast } => |_k, ast, _ctx| find_kernel_output(ast),
+        // Replace CALL references with their output buffer
+        Call { body, args: _, info: _ } => |_c, body, _ctx| find_kernel_output(body),
     }
 }
 
@@ -1481,13 +1428,14 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
             }
             Some(replacement)
         },
-        // Remove BIND: extract var and track it with bound value (like Tinygrad's unbind_kernel)
-        Bind { var, value } => |var, value, ctx| {
+        // Remove BIND in AST while preserving the binding as a CALL source
+        // (Tinygrad unbind_kernel semantics).
+        b @ Bind { var, value } => |b, var, value, ctx| {
             let bound_val = match value.op() {
                 Op::Const(cv) => cv.0.try_int(),
                 _ => None,
             };
-            ctx.add_var(var.clone(), bound_val);
+            ctx.add_var(b.clone(), var.clone(), bound_val);
             Some(var.clone())
         },
         // Tinygrad to_define_global: handle AFTER, MSTACK, MSELECT uniformly.
@@ -1524,7 +1472,7 @@ pub fn local_to_param_patterns() -> TypedPatternMatcher<LocalAddBufferContext> {
             let Op::Range { end, axis_type, .. } = r.op() else { return None };
             let range_cleared = UOp::range_axis(end.clone(), AxisId::Renumbered(range_id), *axis_type);
             let bound = define_var.bind(range_cleared);
-            ctx.add_var(define_var, None);
+            ctx.add_var(bound.clone(), define_var, None);
             Some(bound)
         },
         // Renumber non-OUTER RANGE axis_id (Tinygrad rangeify.py:443-445)
@@ -2084,7 +2032,7 @@ fn is_bool_reduce(reduce: &Arc<UOp>, src: &Arc<UOp>) -> bool {
 ///
 /// 3. **Horizontal reduce** (src_vcount > out_vcount):
 ///    Transforms using stride-pattern GEPs + ALU chain.
-///    Example: REDUCE(<16 x f32> → <4 x f32>) → chain(gep[0,4,8,12], gep[1,5,9,13], ...)
+///    Example: `REDUCE(<16 x f32> → <4 x f32>)` → `chain(gep[0,4,8,12], gep[1,5,9,13], ...)`
 ///
 /// Based on Tinygrad's pm_reduce (devectorizer.py:283-316).
 pub fn pm_reduce_devectorize() -> &'static TypedPatternMatcher<()> {
@@ -2866,7 +2814,7 @@ pub fn pm_neg_from_mul() -> &'static TypedPatternMatcher<()> {
             Some(UOp::new(Op::Unary(UnaryOp::Neg, x.clone()), dtype))
         },
         // x + NEG(y) → SUB(x, y) (Tinygrad decompositions.py:460)
-        Add[x, Neg(y)] ~> x.sub(y),
+        Add[x, Neg(y)] ~> UOp::alu(BinaryOp::Sub, x.clone(), y.clone()),
     }
 }
 

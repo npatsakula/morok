@@ -164,10 +164,11 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let y = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// let mut y = x.avg_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 2, 2]);
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
     ///
     /// With explicit stride:
@@ -187,15 +188,16 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
-    /// let y = x.avg_pool2d()
+    /// let mut y = x.avg_pool2d()
     ///     .kernel_size(&[2, 2])
     ///     .stride(&[1, 1])
     ///     .padding(&[(1, 1), (1, 1)])
     ///     .count_include_pad(false)
     ///     .call()
     ///     .unwrap();
+    /// y.realize().unwrap();
     /// // With count_include_pad=false, only non-padded elements count in the average
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 9]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 9]);
     /// ```
     #[builder]
     pub fn avg_pool2d(
@@ -295,10 +297,11 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let y = x.max_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// let mut y = x.max_pool2d().kernel_size(&[2, 2]).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 2, 2]);
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
     ///
     /// With stride and padding:
@@ -307,15 +310,16 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let y = x.max_pool2d()
+    /// let mut y = x.max_pool2d()
     ///     .kernel_size(&[3, 3])
     ///     .stride(&[1, 1])
     ///     .padding(&[(1, 1), (1, 1)])
     ///     .call()
     ///     .unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 4, 4]);
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![1.0; 16]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![1.0; 16]);
     /// ```
     #[builder]
     pub fn max_pool2d(
@@ -372,13 +376,15 @@ impl Tensor {
     /// # use morok_tensor::Tensor;
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 4, 4), 1.0f32));
-    /// let (values, indices) = x.max_pool2d_with_indices()
+    /// let (mut values, indices) = x.max_pool2d_with_indices()
     ///     .kernel_size(&[2, 2])
     ///     .call()
     ///     .unwrap();
+    /// let _ = indices;
+    /// values.realize().unwrap();
     /// let shape: Vec<_> = values.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 2, 2]);
-    /// assert_eq!(values.to_vec::<f32>().unwrap(), vec![1.0; 4]);
+    /// assert_eq!(values.as_vec::<f32>().unwrap(), vec![1.0; 4]);
     /// ```
     #[builder]
     pub fn max_pool2d_with_indices(
@@ -571,17 +577,18 @@ impl Tensor {
     /// # use ndarray::Array3;
     /// // 1 batch, 1 channel, 2x2 block = 4 cols, 4 sliding positions
     /// let cols = Tensor::from_ndarray(&Array3::from_elem((1, 4, 4), 1.0f32));
-    /// let img = cols.col2im()
+    /// let mut img = cols.col2im()
     ///     .image_shape(&[4, 4])
     ///     .block_shape(&[2, 2])
     ///     .strides(&[2, 2])
     ///     .call()
     ///     .unwrap();
+    /// img.realize().unwrap();
     /// let shape: Vec<_> = img.shape().unwrap().iter()
     ///     .map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 4, 4]);
     /// // Non-overlapping blocks of ones reconstruct to all ones
-    /// assert_eq!(img.to_vec::<f32>().unwrap(), vec![1.0; 16]);
+    /// assert_eq!(img.as_vec::<f32>().unwrap(), vec![1.0; 16]);
     /// ```
     #[builder]
     pub fn col2im(

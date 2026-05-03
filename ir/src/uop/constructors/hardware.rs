@@ -1,16 +1,16 @@
-//! Hardware-specific operations: WMMA, vectorize, kernel.
+//! Hardware-specific operations: WMMA, vectorize, callable kernels/programs.
 //!
 //! This module contains hardware-specific operations:
 //! - Tensor cores: wmma
 //! - Vectorization: vectorize, gep, contract, unroll, cat, ptrcat
 //! - Multi-device: mstack, mselect
-//! - Kernels: kernel
+//! - Callable/program IR: call, program
 
 use std::sync::Arc;
 
 use bon::bon;
 use morok_dtype::DType;
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use snafu::ensure;
 
 use crate::Result;
@@ -19,7 +19,7 @@ use crate::error::{
     UnrollCountMismatchSnafu, VectorizeDTypeMismatchSnafu, VectorizeEmptySnafu,
 };
 use crate::op::Op;
-use crate::types::WmmaMetadata;
+use crate::types::{CallInfo, WmmaMetadata};
 use crate::uop::UOp;
 
 #[bon]
@@ -290,18 +290,82 @@ impl UOp {
     }
 
     // =========================================================================
-    // Kernel Operations
+    // Callable Operations
     // =========================================================================
 
-    /// Kernel wrapper.
+    /// Callable wrapper around a body UOp and runtime arguments.
     ///
-    /// Creates a KERNEL operation with the given sources (kernel arguments) and AST (computation).
+    /// CALL dtype is always void per tinygrad's spec.
+    pub fn call(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Arc<Self> {
+        Self::new(Op::Call { body: self.clone(), args, info }, DType::Void)
+    }
+
+    /// FUNCTION wrapper around a value-producing body UOp and runtime arguments.
     ///
-    /// # Arguments
+    /// FUNCTION dtype is always void per tinygrad's spec, and its body is
+    /// always a TUPLE; non-Tuple bodies are auto-wrapped.
+    /// For opaque bodies (SINK / PROGRAM / COPY / BUFFER_VIEW / CUSTOM_FUNCTION) prefer
+    /// `.call()` instead — those mirror tinygrad's `_OPAQUE_CALL_BODIES` set.
+    pub fn function(self: &Arc<Self>, args: SmallVec<[Arc<Self>; 4]>, info: CallInfo) -> Arc<Self> {
+        let body = if matches!(self.op(), Op::Tuple { .. }) { self.clone() } else { self.maketuple() };
+        Self::new(Op::Function { body, args, info }, DType::Void)
+    }
+
+    /// Construct a TUPLE from value-producing UOps. dtype is always void.
+    /// Mirrors tinygrad `Ops.TUPLE`.
+    pub fn tuple(srcs: SmallVec<[Arc<Self>; 4]>) -> Arc<Self> {
+        Self::new(Op::Tuple { src: srcs }, DType::Void)
+    }
+
+    /// Wrap `self` in a single-element TUPLE. Mirrors tinygrad `UOp.maketuple(self)`.
+    pub fn maketuple(self: &Arc<Self>) -> Arc<Self> {
+        Self::tuple(smallvec![self.clone()])
+    }
+
+    /// Extract element `index` from a TUPLE (or a FUNCTION whose body is a TUPLE).
+    /// dtype matches the inner element. Mirrors tinygrad `Ops.GETTUPLE`.
     ///
-    /// * `sources` - Kernel arguments (buffers and variables)
-    /// * `ast` - The computation graph (usually SINK, COPY, or BUFFER_VIEW)
-    pub fn kernel(sources: SmallVec<[Arc<Self>; 4]>, ast: Arc<Self>) -> Arc<Self> {
-        Self::new(Op::Kernel { sources, ast }, DType::Void)
+    /// Panics if `self` is neither a TUPLE nor a FUNCTION whose body is a TUPLE,
+    /// or if `index` is out of bounds.
+    pub fn gettuple(self: &Arc<Self>, index: usize) -> Arc<Self> {
+        let inner_tuple_src: &SmallVec<[Arc<UOp>; 4]> = match self.op() {
+            Op::Tuple { src } => src,
+            Op::Function { body, .. } => match body.op() {
+                Op::Tuple { src } => src,
+                other => panic!("gettuple requires FUNCTION body to be TUPLE, got {other:?}"),
+            },
+            other => panic!("gettuple requires TUPLE or FUNCTION(TUPLE) source, got {other:?}"),
+        };
+        let elem_dtype = inner_tuple_src
+            .get(index)
+            .unwrap_or_else(|| panic!("gettuple index {} out of bounds for length {}", index, inner_tuple_src.len()))
+            .dtype();
+        Self::new(Op::GetTuple { src: self.clone(), index }, elem_dtype)
+    }
+
+    /// PROGRAM wrapper with optional progressive pipeline stages.
+    pub fn program(
+        sink: Arc<Self>,
+        device: Arc<Self>,
+        linear: Option<Arc<Self>>,
+        source: Option<Arc<Self>>,
+        binary: Option<Arc<Self>>,
+    ) -> Arc<Self> {
+        Self::new(Op::Program { sink, device, linear, source, binary }, DType::Void)
+    }
+
+    /// LINEAR stage payload.
+    pub fn linear(ops: SmallVec<[Arc<Self>; 8]>) -> Arc<Self> {
+        Self::new(Op::Linear { ops }, DType::Void)
+    }
+
+    /// SOURCE stage payload.
+    pub fn source(code: String) -> Arc<Self> {
+        Self::new(Op::Source { code }, DType::Void)
+    }
+
+    /// BINARY stage payload.
+    pub fn binary(bytes: Vec<u8>) -> Arc<Self> {
+        Self::new(Op::ProgramBinary { bytes }, DType::Void)
     }
 }

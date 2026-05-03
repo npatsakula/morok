@@ -13,7 +13,7 @@ use morok_dtype::DType;
 use morok_ir::{Op, ReduceOp, UOp};
 use smallvec::smallvec;
 
-use crate::rangeify::kernel::run_kernel_split_pipeline;
+use crate::rangeify::try_get_kernel_graph;
 
 /// Helper to create a simple buffer
 fn create_buffer(size: usize) -> Arc<UOp> {
@@ -36,7 +36,8 @@ fn test_binop_fusion_basic() {
     let sink = UOp::sink(vec![add]);
 
     // Run pipeline - returns (transformed_graph, context), not Result
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) =
+        try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for basic binop fusion");
 
     // Verify we got a valid result
     assert!(!result.op().sources().is_empty() || matches!(result.op(), Op::Sink { .. } | Op::Noop));
@@ -54,7 +55,8 @@ fn test_binop_chain_fusion() {
 
     let sink = UOp::sink(vec![add2]);
 
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) =
+        try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for binop chain fusion");
 
     // Should produce a valid transformed graph
     assert!(!result.toposort().is_empty());
@@ -77,7 +79,7 @@ fn test_binop_reshape_fusion() {
 
     let sink = UOp::sink(vec![reshaped]);
 
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) = try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for reshape fusion");
     assert!(!result.toposort().is_empty());
 }
 
@@ -98,7 +100,7 @@ fn test_binop_permute_fusion() {
 
     let sink = UOp::sink(vec![permuted]);
 
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) = try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for permute fusion");
     assert!(!result.toposort().is_empty());
 }
 
@@ -118,7 +120,7 @@ fn test_reduce_fusion_basic() {
 
     let sink = UOp::sink(vec![reduced]);
 
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) = try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for reduction fusion");
     assert!(!result.toposort().is_empty());
 }
 
@@ -139,7 +141,8 @@ fn test_reduce_binop_fusion() {
 
     let sink = UOp::sink(vec![reduced]);
 
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) =
+        try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for reduce/binop fusion");
     assert!(!result.toposort().is_empty());
 }
 
@@ -154,7 +157,8 @@ fn test_contiguous_forces_realization() {
 
     let sink = UOp::sink(vec![contiguous]);
 
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) =
+        try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for contiguous realization");
     assert!(!result.toposort().is_empty());
 }
 
@@ -176,7 +180,8 @@ fn test_multiple_outputs_same_input() {
 
     let sink = UOp::sink(vec![mul1, mul2]);
 
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) =
+        try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for multi-output fusion");
     assert!(!result.toposort().is_empty());
 }
 
@@ -187,7 +192,7 @@ fn test_empty_sink() {
     // Empty SINK should handle gracefully
     let sink = UOp::sink(vec![]);
 
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) = try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for empty sink");
     // May return empty or minimal graph
     let _ = result;
 }
@@ -198,6 +203,6 @@ fn test_single_constant() {
     let c = UOp::native_const(1.0f32);
     let sink = UOp::sink(vec![c]);
 
-    let (result, _ctx) = run_kernel_split_pipeline(sink);
+    let (result, _ctx) = try_get_kernel_graph(sink).expect("kernel split pipeline should succeed for single constant");
     assert!(!result.toposort().is_empty());
 }

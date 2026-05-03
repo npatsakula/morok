@@ -1,10 +1,12 @@
 use bon::bon;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use morok_device::Buffer;
 use morok_dtype::DType;
 use morok_dtype::ext::HasDType;
-use morok_ir::{ConstValue, ConstValueHash, DeviceSpec, Op, SInt, UOp, shape::Shape};
+use morok_ir::{CallInfo, ConstValue, ConstValueHash, DeviceSpec, Op, SInt, UOp, UOpKey, shape::Shape};
+use smallvec::smallvec;
 use snafu::ResultExt;
 
 /// Extract max value from an SInt for buffer allocation.
@@ -25,6 +27,18 @@ fn sint_vmax(s: &SInt) -> usize {
         },
         SInt::Infer => panic!("cannot compute vmax of SInt::Infer"),
     }
+}
+
+fn find_assign_identity(target: &Arc<UOp>, base: &Arc<UOp>) -> Arc<UOp> {
+    let mut identity = target.clone();
+    while !identity.has_buffer_identity() && identity.id != base.id {
+        let sources = identity.op().sources();
+        let Some(next) = sources.first() else {
+            break;
+        };
+        identity = next.clone();
+    }
+    identity
 }
 
 pub mod error;
@@ -518,6 +532,31 @@ impl Tensor {
         Ok(Self::new(casted))
     }
 
+    /// Build and apply a custom UOp kernel over this tensor and additional inputs.
+    ///
+    /// The closure receives PARAM placeholders (as UOps) corresponding to
+    /// `[self, others...]` and must return the kernel body UOp (typically a SINK).
+    /// Returns tensors wrapped with AFTER(CALL) dependencies in argument order.
+    pub fn custom_kernel<F>(&self, others: &[&Tensor], fxn: F) -> Result<Vec<Tensor>>
+    where
+        F: FnOnce(Vec<Arc<UOp>>) -> Arc<UOp>,
+    {
+        self.custom_kernel_with(others, CallInfo::default(), fxn)
+    }
+
+    /// `custom_kernel` with explicit CALL metadata.
+    pub fn custom_kernel_with<F>(&self, others: &[&Tensor], info: CallInfo, fxn: F) -> Result<Vec<Tensor>>
+    where
+        F: FnOnce(Vec<Arc<UOp>>) -> Arc<UOp>,
+    {
+        let mut srcs: Vec<Arc<UOp>> = Vec::with_capacity(1 + others.len());
+        srcs.push(self.uop());
+        srcs.extend(others.iter().map(|t| t.uop()));
+
+        let outputs = UOp::custom_kernel(srcs, fxn, info).context(UOpSnafu)?;
+        Ok(outputs.into_iter().map(Self::from_lazy).collect())
+    }
+
     /// Bitcast tensor to a different dtype (reinterpret bits, same byte size required).
     pub fn bitcast(&self, dtype: morok_dtype::DType) -> Result<Self> {
         Ok(Self::new(self.uop().bitcast(dtype)))
@@ -525,8 +564,7 @@ impl Tensor {
 
     /// Assign a value tensor to this tensor in-place.
     ///
-    /// Creates an ASSIGN UOp linking this tensor's BUFFER to the value.
-    /// The assignment is resolved lazily during `realize()`.
+    /// Embeds the write as `AFTER(target, STORE(target, value))`.
     ///
     /// # Example
     ///
@@ -536,13 +574,57 @@ impl Tensor {
     ///     .try_reshape(&[2, 3]).unwrap();
     /// placeholder.assign(&real_data);
     /// ```
-    pub fn assign(&self, value: &Tensor) {
+    pub fn try_assign(&self, value: &Tensor) -> Result<()> {
         let target_uop = self.uop();
-        let assign_uop = UOp::assign(target_uop.clone(), value.uop());
-        // Track for side-realization during realize() (Tinygrad: _pending_assigns).
-        let buffer_id = target_uop.base().id;
-        tensor_registry::add_pending_assign(buffer_id, assign_uop.clone());
-        self.set_uop(assign_uop);
+        if self.device().is_disk() {
+            return Err(Error::IrConstruction {
+                details: "assign to DISK tensors is not supported by Morok runtime".to_string(),
+            });
+        }
+
+        let target_shape = self.shape()?;
+        let value_shape = value.shape()?;
+        let value = if target_shape != value_shape { value.broadcast_to(&target_shape)? } else { value.clone() };
+        if self.device() != value.device() {
+            return Err(Error::IrConstruction {
+                details: format!("assign device mismatch {:?} != {:?}", self.device(), value.device()),
+            });
+        }
+
+        let target_dtype = target_uop.dtype();
+        let value_dtype = value.uop().dtype();
+        if target_dtype != value_dtype {
+            return Err(Error::TypeMismatch { expected: target_dtype, actual: value_dtype });
+        }
+
+        let value_uop = value.uop();
+        if Arc::ptr_eq(&target_uop, &value_uop) {
+            return Ok(());
+        }
+
+        let assign_effect = target_uop.after(smallvec![target_uop.store(value_uop)]);
+        let base = target_uop.base();
+        if matches!(base.op(), Op::Buffer { .. } | Op::After { .. })
+            && target_uop.id != base.id
+            && !target_uop.has_buffer_identity()
+        {
+            let identity = find_assign_identity(&target_uop, &base);
+            let assigned_identity = identity.after(smallvec![assign_effect]);
+            #[allow(clippy::mutable_key_type)]
+            let mut becomes_map = HashMap::new();
+            becomes_map.insert(UOpKey(identity), assigned_identity);
+            // Walk semantics required: replacement contains the original key
+            // (`After(Buffer, [...])` wraps `Buffer`). A re-traversing rewrite
+            // would loop or wrap the buffer multiple times.
+            tensor_registry::apply_map_to_tensors_walk(&becomes_map);
+        } else {
+            self.set_uop(assign_effect);
+        }
+        Ok(())
+    }
+
+    pub fn assign(&self, value: &Tensor) {
+        self.try_assign(value).expect("tensor assign failed");
     }
 
     /// Update the UOp for this tensor directly.

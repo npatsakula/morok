@@ -24,8 +24,7 @@ use melior::pass::PassManager;
 use melior::utility::{register_all_dialects, register_all_llvm_translations};
 use morok_dtype::DType;
 use morok_ir::pattern::TypedPatternMatcher;
-use morok_ir::{AxisType, ConstValue, Op, ReduceOp, WmmaMetadata, prelude::*};
-use morok_schedule::linearize::{line_rewrite_cleanups, linearize_with_cfg};
+use morok_ir::{AxisType, Op, ReduceOp, WmmaMetadata, prelude::*};
 
 use self::ctx::{RenderContext, ScfIfInfo, ScfLoopInfo};
 use self::ops::*;
@@ -120,7 +119,7 @@ fn find_acc_reg_in_wmma_c(node: &Arc<UOp>) -> Option<u64> {
 /// accumulator (C operand) traces back through LOAD(INDEX(AFTER*(DEFINE_REG))).
 /// Returns a map from RANGE node ID to the hoisting info, plus ordered list of range IDs.
 fn build_wmma_reduce_map(nodes: &[Arc<UOp>]) -> (HashMap<u64, WmmaReduceLoopInfo>, Vec<u64>) {
-    // Track open (non-thread) RANGE nodes: (range_id, axis_type)
+    // Track open RANGE nodes: (range_id, axis_type)
     let mut open_ranges: Vec<(u64, AxisType)> = Vec::new();
     let mut map = HashMap::new();
     let mut ordered_ids: Vec<u64> = Vec::new();
@@ -128,14 +127,12 @@ fn build_wmma_reduce_map(nodes: &[Arc<UOp>]) -> (HashMap<u64, WmmaReduceLoopInfo
 
     for node in nodes {
         match node.op() {
-            Op::Range { axis_type, .. } if !matches!(axis_type, AxisType::Thread) => {
+            Op::Range { axis_type, .. } => {
                 open_ranges.push((node.id, *axis_type));
             }
             Op::End { ranges, .. } => {
                 for range in ranges.iter() {
-                    if let Op::Range { axis_type, .. } = range.op()
-                        && !matches!(axis_type, AxisType::Thread)
-                    {
+                    if let Op::Range { .. } = range.op() {
                         open_ranges.retain(|(id, _)| *id != range.id);
                     }
                 }
@@ -165,14 +162,19 @@ impl Renderer for MlirRenderer {
     fn render(&self, uop: &Arc<UOp>, name: Option<&str>) -> Result<RenderedKernel> {
         let kernel_name = name.unwrap_or("kernel");
 
-        let nodes = linearize_with_cfg(uop.clone());
-        let nodes = line_rewrite_cleanups(nodes);
-
+        let nodes = match uop.op() {
+            Op::Linear { ops } => ops.iter().cloned().collect(),
+            other => {
+                return Err(crate::Error::InvalidGraph {
+                    reason: format!("MLIR renderer expects LINEAR input, got {other:?}"),
+                });
+            }
+        };
         for (i, node) in nodes.iter().enumerate() {
             tracing::debug!(position = i, op = node.op().as_ref(), id = node.id, "mlir linearized node");
         }
 
-        // Collect buffers, variables, thread info
+        // Collect buffers and variables.
         let mut buffers: Vec<Arc<UOp>> = Vec::new();
         let mut variables: Vec<Arc<UOp>> = Vec::new();
 
@@ -184,21 +186,6 @@ impl Renderer for MlirRenderer {
             }
         }
         buffers.sort_by_key(|b| if let Op::Param { slot, device: None, .. } = b.op() { *slot } else { usize::MAX });
-
-        let thread_info: Option<(Arc<UOp>, usize)> = nodes.iter().find_map(|n| {
-            if let Op::Range { axis_type, end, .. } = n.op()
-                && matches!(axis_type, AxisType::Thread)
-                && let Op::Const(cv) = end.op()
-                && let ConstValue::Int(count) = cv.0
-            {
-                Some((n.clone(), count as usize))
-            } else {
-                None
-            }
-        });
-
-        let has_threading = thread_info.is_some();
-        let thread_count = thread_info.as_ref().map(|(_, c)| *c).unwrap_or(1);
 
         // Build buffer_args and var_names for RenderedKernel metadata
         let mut buffer_args: Vec<BufferArg> = Vec::new();
@@ -215,10 +202,6 @@ impl Renderer for MlirRenderer {
                 var_names.push(name.clone());
             }
         }
-        if has_threading {
-            var_names.push("thread_id".to_string());
-        }
-
         // Pre-scan: map Range axis_id -> associated reduces
         let reduce_map = build_reduce_map(&nodes);
 
@@ -278,20 +261,6 @@ impl Renderer for MlirRenderer {
             rctx.register(var.id, var_val);
         }
 
-        // Load thread_id if present
-        if let Some((ref thread_range, _)) = thread_info {
-            let thread_idx = const_i64(&context, &entry_ref, variables.len() as i64, loc);
-            let thread_i64 = gep_load(&context, &entry_ref, vars_ptr, thread_idx, i64_type, i64_type, loc);
-
-            let range_type = mlir_type(&context, &thread_range.dtype());
-            let thread_val = if range_type == i64_type {
-                thread_i64
-            } else {
-                entry_ref.append_operation(arith::trunci(thread_i64, range_type, loc)).result(0).unwrap().into()
-            };
-            rctx.register(thread_range.id, thread_val);
-        }
-
         // Pre-register constants
         for node in &nodes {
             if let Op::Const(cv) = node.op() {
@@ -309,7 +278,7 @@ impl Renderer for MlirRenderer {
 
         // Process linearized nodes
         for node in &nodes {
-            render_node(&context, &mut rctx, node, &thread_info, &reduce_map, &wmma_reduce_map, loc)?;
+            render_node(&context, &mut rctx, node, &reduce_map, &wmma_reduce_map, loc)?;
         }
 
         // Emit AMX CLR before return if SET was emitted
@@ -364,11 +333,6 @@ impl Renderer for MlirRenderer {
         result.buffer_args = buffer_args;
         result.var_names = var_names;
 
-        if thread_count > 1 {
-            result.global_size = Some([thread_count, 1, 1]);
-            result.local_size = Some([1, 1, 1]);
-        }
-
         Ok(result)
     }
 
@@ -390,7 +354,6 @@ fn render_node<'c, 'a: 'c>(
     ctx: &'c Context,
     rctx: &mut RenderContext<'c, 'a>,
     node: &Arc<UOp>,
-    _thread_info: &Option<(Arc<UOp>, usize)>,
     reduce_map: &HashMap<usize, Vec<ReduceInfo>>,
     wmma_reduce_map: &HashMap<u64, WmmaReduceLoopInfo>,
     loc: Location<'c>,
@@ -407,7 +370,7 @@ fn render_node<'c, 'a: 'c>(
         | Op::Buffer { .. }
         | Op::Unique(_)
         | Op::Device(_)
-        | Op::Kernel { .. }
+        | Op::Call { .. }
         | Op::Barrier { .. } => {}
 
         Op::VConst { values, .. } => {
@@ -440,18 +403,22 @@ fn render_node<'c, 'a: 'c>(
             rctx.register(node.id, alloca_val);
         }
 
-        Op::Index { buffer, indices, gate } => {
-            let block = rctx.current_block();
+        Op::Index { buffer, indices, .. } => {
             let buf_val = rctx.get(buffer.id);
 
             if indices.is_empty() {
                 rctx.register(node.id, buf_val);
             } else {
-                // Multi-index: linearize at render time using row-major strides
-                let idx_val = if indices.len() > 1 {
-                    render_linearize_multi_index_mlir(ctx, rctx, indices, loc)
-                } else {
+                let idx_val = if indices.len() == 1 {
                     rctx.get(indices[0].id)
+                } else {
+                    return Err(crate::Error::InvalidGraph {
+                        reason: format!(
+                            "MLIR renderer requires linearized INDEX (single-axis), found {} indices on uop {}",
+                            indices.len(),
+                            node.id
+                        ),
+                    });
                 };
 
                 let elem_dtype = match node.dtype() {
@@ -473,16 +440,7 @@ fn render_node<'c, 'a: 'c>(
                     .result(0)
                     .unwrap()
                     .into();
-
-                let result = if let Some(gate_node) = gate {
-                    let gate_val = rctx.get(gate_node.id);
-                    let null_ptr =
-                        block.append_operation(llvm::zero(mlir_ptr_type(ctx), loc)).result(0).unwrap().into();
-                    block.append_operation(arith::select(gate_val, gep, null_ptr, loc)).result(0).unwrap().into()
-                } else {
-                    gep
-                };
-                rctx.register(node.id, result);
+                rctx.register(node.id, gep);
             }
         }
 
@@ -510,7 +468,7 @@ fn render_node<'c, 'a: 'c>(
             rctx.register(node.id, result);
         }
 
-        Op::Load { index, .. } => {
+        Op::Load { index, alt, .. } => {
             // Skip acc loads inside a hoisted AMX reduce loop — Z regs hold the value
             if let Some(state) = rctx.amx_loop_state()
                 && is_amx_acc_access(index, state.acc_reg_id)
@@ -525,11 +483,51 @@ fn render_node<'c, 'a: 'c>(
             let block = rctx.current_block();
             let idx_val = rctx.get(index.id);
             let load_type = mlir_type(ctx, &node.dtype());
-            let result = block
-                .append_operation(llvm::load(ctx, idx_val, load_type, loc, Default::default()))
-                .result(0)
-                .unwrap()
-                .into();
+
+            // Gated LOAD follows Tinygrad renderer semantics: conditional load with alt value.
+            // The gate is carried by INDEX (possibly behind one CAST wrapper).
+            let actual_index = match index.op() {
+                Op::Cast { src, .. } => src,
+                _ => index,
+            };
+            let gate_uop =
+                if let Op::Index { gate: Some(gate_uop), .. } = actual_index.op() { Some(gate_uop) } else { None };
+
+            let result = if let Some(gate_uop) = gate_uop {
+                let alt_uop = alt.as_ref().ok_or_else(|| crate::error::Error::MlirError {
+                    reason: format!("gated LOAD without alt value in MLIR backend (op id {})", node.id),
+                })?;
+
+                let gate_val = rctx.get(gate_uop.id);
+                let alt_val = rctx.get(alt_uop.id);
+
+                let then_region = Region::new();
+                let then_block = Block::new(&[]);
+                let then_ref = then_region.append_block(then_block);
+                let loaded = then_ref
+                    .append_operation(llvm::load(ctx, idx_val, load_type, loc, Default::default()))
+                    .result(0)
+                    .unwrap()
+                    .into();
+                then_ref.append_operation(scf::r#yield(&[loaded], loc));
+
+                let else_region = Region::new();
+                let else_block = Block::new(&[]);
+                let else_ref = else_region.append_block(else_block);
+                else_ref.append_operation(scf::r#yield(&[alt_val], loc));
+
+                block
+                    .append_operation(scf::r#if(gate_val, &[load_type], then_region, else_region, loc))
+                    .result(0)
+                    .unwrap()
+                    .into()
+            } else {
+                block
+                    .append_operation(llvm::load(ctx, idx_val, load_type, loc, Default::default()))
+                    .result(0)
+                    .unwrap()
+                    .into()
+            };
             rctx.register(node.id, result);
         }
 
@@ -545,6 +543,18 @@ fn render_node<'c, 'a: 'c>(
             let idx_val = rctx.get(index.id);
             let val = rctx.get(value.id);
             block.append_operation(llvm::store(ctx, val, idx_val, loc, Default::default()));
+        }
+
+        Op::Custom { .. } => {
+            return Err(crate::error::Error::MlirError {
+                reason: format!("CUSTOM is not supported by MLIR backend (op id {})", node.id),
+            });
+        }
+
+        Op::CustomI { .. } => {
+            return Err(crate::error::Error::MlirError {
+                reason: format!("CUSTOMI is not supported by MLIR backend (op id {})", node.id),
+            });
         }
 
         Op::Binary(op, lhs, rhs) => {
@@ -589,11 +599,7 @@ fn render_node<'c, 'a: 'c>(
         // =====================================================================
         // Range → scf.for setup
         // =====================================================================
-        Op::Range { end, axis_id, axis_type, .. } => {
-            if matches!(axis_type, AxisType::Thread) {
-                return Ok(());
-            }
-
+        Op::Range { end, axis_id, .. } => {
             let range_dtype = node.dtype();
             let range_type = mlir_type(ctx, &range_dtype);
             let index_type = Type::index(ctx);
@@ -682,11 +688,7 @@ fn render_node<'c, 'a: 'c>(
         // =====================================================================
         Op::End { ranges, .. } => {
             for range in ranges.iter() {
-                if let Op::Range { axis_type, .. } = range.op() {
-                    if matches!(axis_type, AxisType::Thread) {
-                        continue;
-                    }
-
+                if let Op::Range { .. } = range.op() {
                     // Emit scf.yield on the current body block
                     let body_block = rctx.current_block();
                     let loop_info = rctx.pop_scf_loop();
@@ -930,48 +932,6 @@ fn render_node<'c, 'a: 'c>(
         }
     }
     Ok(())
-}
-
-/// Linearize multiple index expressions into a single MLIR value at render time.
-///
-/// Emits arith `mul` + `add` chain for `idx0*stride0 + idx1*stride1 + ...`.
-fn render_linearize_multi_index_mlir<'c, 'a: 'c>(
-    ctx: &'c Context,
-    rctx: &RenderContext<'c, 'a>,
-    indices: &[Arc<UOp>],
-    loc: Location<'c>,
-) -> melior::ir::Value<'c, 'c> {
-    use morok_schedule::passes::linearize_index::{compute_row_major_strides, extract_index_dimension};
-
-    let dims: Vec<i64> = indices
-        .iter()
-        .map(|idx| extract_index_dimension(idx).expect("multi-index dimension must be resolvable at codegen"))
-        .collect();
-    let strides = compute_row_major_strides(&dims);
-
-    let block = rctx.current_block();
-    let idx_type = mlir_type(ctx, &indices[0].dtype());
-
-    let mut current: Option<melior::ir::Value> = None;
-    for (idx_uop, &stride) in indices.iter().zip(strides.iter()) {
-        if stride == 0 {
-            continue;
-        }
-        let idx_val = rctx.get(idx_uop.id);
-        let term = if stride == 1 {
-            idx_val
-        } else {
-            let stride_val = const_int(ctx, &block, stride, idx_type, loc);
-            block.append_operation(arith::muli(idx_val, stride_val, loc)).result(0).unwrap().into()
-        };
-
-        current = Some(match current {
-            None => term,
-            Some(acc) => block.append_operation(arith::addi(acc, term, loc)).result(0).unwrap().into(),
-        });
-    }
-
-    current.unwrap_or_else(|| const_int(ctx, &block, 0, idx_type, loc))
 }
 
 /// Trace through CONTRACT/UNROLL/DETACH wrappers to find the underlying LOAD's INDEX.

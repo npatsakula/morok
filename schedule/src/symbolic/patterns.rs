@@ -1298,8 +1298,16 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
             let mut new_deps = smallvec::SmallVec::<[Arc<UOp>; 4]>::new();
             let mut changed = false;
             for dep in deps {
-                // : {RANGE, STORE, KERNEL, BARRIER, END, UNROLL}
-                if matches!(dep.op(), Op::Range { .. } | Op::Store { .. } | Op::End { .. } | Op::Kernel { .. } | Op::Barrier { .. } | Op::Unroll { .. }) {
+                // : {RANGE, STORE, CALL, BARRIER, END, UNROLL}
+                if matches!(
+                    dep.op(),
+                    Op::Range { .. }
+                        | Op::Store { .. }
+                        | Op::End { .. }
+                        | Op::Call { .. }
+                        | Op::Barrier { .. }
+                        | Op::Unroll { .. }
+                ) {
                     new_deps.push(Arc::clone(dep));
                 } else {
                     // Inline: replace non-side-effecting dep with its children
@@ -1342,7 +1350,7 @@ pub fn after_simplification_patterns() -> &'static TypedPatternMatcher {
 /// (UPat.var("c1").where(UPat.var("buf").index(UPat.var("x")), 0), where_on_load),
 /// ```
 ///
-/// Moved clauses are embedded as WHERE(cond, idx, Invalid) in indices[0] instead of
+/// Moved clauses are embedded as `WHERE(cond, idx, Invalid)` in `indices[0]` instead of
 /// the gate field. This prevents gate vectorization during expansion — pm_lower_index_dtype
 /// extracts the scalar gate after devectorize.
 ///

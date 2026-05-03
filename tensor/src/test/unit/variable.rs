@@ -190,45 +190,124 @@ crate::codegen_tests! {
         assert_close_f32(&t.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0], 1e-6);
     }
 
-    fn test_empty_assign_downstream_add(config) {
+    fn test_assign_downstream_add_built_before_assign(config) {
         test_setup();
-        let a = Tensor::empty(&[3], DType::Float32);
+        let a = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let b = Tensor::from_slice([10.0f32, 20.0, 30.0]);
         let mut output = &a + &b;
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
-        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[11.0, 22.0, 33.0], 1e-6);
+        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[10.0, 20.0, 30.0], 1e-6);
     }
 
-    fn test_empty_assign_downstream_sum(config) {
+    fn test_assign_downstream_sum_built_before_assign(config) {
         test_setup();
-        let a = Tensor::empty(&[4], DType::Float32);
+        let a = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
         let mut sum = a.sum(()).unwrap();
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]));
-        assert_close_f32(&sum.realize_with_and(&config).as_vec::<f32>().unwrap(), &[10.0], 1e-5);
+        assert_close_f32(&sum.realize_with_and(&config).as_vec::<f32>().unwrap(), &[0.0], 1e-5);
     }
 
-    fn test_two_empty_assign_mul(config) {
+    fn test_two_assigns_downstream_mul_built_before_assign(config) {
         test_setup();
-        let a = Tensor::empty(&[3], DType::Float32);
-        let b = Tensor::empty(&[3], DType::Float32);
+        let a = Tensor::from_slice([0.0f32, 0.0, 0.0]);
+        let b = Tensor::from_slice([0.0f32, 0.0, 0.0]);
         let mut output = &a * &b;
         a.assign(&Tensor::from_slice([2.0f32, 3.0, 4.0]));
         b.assign(&Tensor::from_slice([5.0f32, 6.0, 7.0]));
-        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[10.0, 18.0, 28.0], 1e-6);
+        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[0.0, 0.0, 0.0], 1e-6);
     }
 
-    // Chained assigns: B's value depends on A's buffer.
-    // Requires recursive resolution — A must be realized before B.
-    fn test_chained_pending_assigns(config) {
+    fn test_assign_downstream_add_built_after_assign(config) {
+        test_setup();
+        let a = Tensor::from_slice([0.0f32, 0.0, 0.0]);
+        let b = Tensor::from_slice([10.0f32, 20.0, 30.0]);
+        a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
+        let mut output = &a + &b;
+        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[11.0, 22.0, 33.0], 1e-6);
+    }
+
+    fn test_chained_store_after_assigns(config) {
         test_setup();
         let a = Tensor::empty(&[3], DType::Float32);
         let b = Tensor::empty(&[3], DType::Float32);
         a.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
         b.assign(&(&a + &Tensor::from_slice([10.0f32, 20.0, 30.0])));
-        // b depends on a's buffer → recursive resolution needed
         let mut sum = b.sum(()).unwrap();
         sum.realize_with(&config).unwrap();
         assert_close_f32(&sum.as_vec::<f32>().unwrap(), &[66.0], 1e-5);
+    }
+
+    fn test_store_after_assigns_to_distinct_views_same_base(config) {
+        test_setup();
+        let base = Tensor::empty(&[4], DType::Float32);
+        let left = base.try_shrink([(0, 2)]).unwrap();
+        let right = base.try_shrink([(2, 4)]).unwrap();
+
+        left.assign(&Tensor::from_slice([1.0f32, 2.0]));
+        right.assign(&Tensor::from_slice([3.0f32, 4.0]));
+
+        let mut output = &left + &right;
+        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[4.0, 6.0], 1e-6);
+    }
+
+    fn test_store_after_view_assign_updates_realized_base(config) {
+        test_setup();
+        let base = Tensor::from_slice([9.0f32, 9.0, 9.0, 9.0]);
+        let right = base.try_shrink([(2, 4)]).unwrap();
+        right.assign(&Tensor::from_slice([3.0f32, 4.0]));
+
+        let mut output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[9.0, 9.0, 3.0, 4.0], 1e-6);
+    }
+
+    fn test_store_after_multiple_view_assigns_update_realized_base(config) {
+        test_setup();
+        let base = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let left = base.try_shrink([(0, 2)]).unwrap();
+        let right = base.try_shrink([(2, 4)]).unwrap();
+
+        left.assign(&Tensor::from_slice([1.0f32, 2.0]));
+        right.assign(&Tensor::from_slice([3.0f32, 4.0]));
+
+        let mut output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0], 1e-6);
+    }
+
+    fn test_store_after_overlapping_view_assigns_last_write_wins(config) {
+        test_setup();
+        let base = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        base.try_shrink([(0, 3)]).unwrap().assign(&Tensor::from_slice([1.0f32, 2.0, 3.0]));
+        base.try_shrink([(1, 4)]).unwrap().assign(&Tensor::from_slice([4.0f32, 5.0, 6.0]));
+
+        let mut output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 4.0, 5.0, 6.0], 1e-6);
+    }
+
+    fn test_store_after_assign_rhs_reads_base_before_write(config) {
+        test_setup();
+        let base = Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]);
+        let src = base.try_shrink([(0, 2)]).unwrap();
+        let dst = base.try_shrink([(1, 3)]).unwrap();
+        dst.assign(&src);
+
+        let mut output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        assert_close_f32(&output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 1.0, 2.0, 4.0], 1e-6);
+    }
+
+    fn test_store_after_assign_to_movement_views(config) {
+        test_setup();
+
+        let base = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape([2, 2]).unwrap();
+        let transposed = base.try_permute(&[1, 0]).unwrap();
+        transposed.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]).try_reshape([2, 2]).unwrap());
+        let mut transposed_output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]).try_reshape([2, 2]).unwrap();
+        assert_close_f32(&transposed_output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[1.0, 3.0, 2.0, 4.0], 1e-6);
+
+        let base = Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        let flipped = base.flip(&[0]).unwrap();
+        flipped.assign(&Tensor::from_slice([1.0f32, 2.0, 3.0, 4.0]));
+        let mut flipped_output = &base + &Tensor::from_slice([0.0f32, 0.0, 0.0, 0.0]);
+        assert_close_f32(&flipped_output.realize_with_and(&config).as_vec::<f32>().unwrap(), &[4.0, 3.0, 2.0, 1.0], 1e-6);
     }
 }
 

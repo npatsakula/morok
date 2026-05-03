@@ -6,10 +6,10 @@
 //! # Module Organization
 //!
 //! - [`symbolic`] - Symbolic simplification patterns
-//! - [`rangeify`] - RANGEIFY transformation (movement ops → kernels)
+//! - [`mod@rangeify`] - RANGEIFY transformation (movement ops → kernels)
 //!   - Phases 1-4: Movement ops to BUFFERIZE with symbolic simplification
 //!   - Phase 5: Kernel splitting at STORE boundaries
-//! - [`linearize`] - Priority-aware topological sort for GPU/NPU backends
+//! - [`mod@linearize`] - Priority-aware topological sort for GPU/NPU backends
 //! - [`optimizer`] - Kernel optimization layer (OptOps, Scheduler, heuristics)
 //! - [`expand`] - Pre-expansion pass for UNROLL/UPCAST range handling
 //!
@@ -44,7 +44,7 @@ pub use morok_ir::rewrite;
 pub use linearize::{CFGContext, linearize, linearize_with_cfg};
 pub use morok_ir::pattern::{Matcher, RewriteResult, TypedPatternMatcher};
 pub use morok_ir::rewrite::graph_rewrite;
-pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, run_kernel_split_pipeline};
+pub use rangeify::{RangeifyResult, rangeify, rangeify_with_map, try_get_kernel_graph};
 
 // Re-export expand pass
 pub use expand::{expander, pm_group_for_reduce, pm_pre_expander, pre_expand};
@@ -55,7 +55,7 @@ pub use devectorize::devectorize;
 // Re-export gpudims pass
 pub use gpudims::pm_add_gpudims;
 
-// Re-export backend-agnostic passes (pm_linearize_multi_index removed: Tinygrad keeps multi-index INDEX)
+// Re-export backend-agnostic pass helpers (linearize_index)
 pub use passes::{build_linear_index, compute_row_major_strides, count_divmod, extract_index_dimension};
 
 // Re-export optimizer entry points

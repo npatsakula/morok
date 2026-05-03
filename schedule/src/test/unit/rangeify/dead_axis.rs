@@ -211,6 +211,46 @@ fn test_multiple_dead_axis_removal_passes() {
 }
 
 #[test]
+fn test_dead_axis_skips_after_compute() {
+    // BUFFERIZE wrapping AFTER(buffer-identity, deps) must NOT prune dead axes:
+    // ranges define consumer access, not the wrapped computation's shape, so
+    // dead-axis cleanup would mangle assign-chain semantics.
+    use smallvec::smallvec;
+    let buf = UOp::new_buffer(morok_dtype::DeviceSpec::Cpu, 4, DType::Float32);
+    let dep = UOp::noop();
+    let after = buf.after(smallvec![dep]);
+    let dead_range = UOp::range_const(1, 0);
+    let bufferized = UOp::bufferize_global(after, vec![dead_range]);
+
+    let matcher = dead_axis_removal();
+    let result = graph_rewrite_bottom_up(&matcher, bufferized.clone(), &mut ());
+
+    assert!(
+        Arc::ptr_eq(&result, &bufferized),
+        "BUFFERIZE wrapping AFTER must be left untouched by dead-axis cleanup, got: {}",
+        result.tree()
+    );
+}
+
+#[test]
+fn test_dead_axis_skips_noop_compute() {
+    // NOOP joins ALWAYS_RUN_OPS alongside CONTIGUOUS/COPY; dead-axis cleanup
+    // must skip it.
+    let noop = UOp::noop();
+    let dead_range = UOp::range_const(1, 0);
+    let bufferized = UOp::bufferize_global(noop, vec![dead_range]);
+
+    let matcher = dead_axis_removal();
+    let result = graph_rewrite_bottom_up(&matcher, bufferized.clone(), &mut ());
+
+    assert!(
+        Arc::ptr_eq(&result, &bufferized),
+        "BUFFERIZE wrapping NOOP must be left untouched by dead-axis cleanup, got: {}",
+        result.tree()
+    );
+}
+
+#[test]
 fn test_dead_axis_uint_constant() {
     // Test with UInt constant value of 1
     let x = UOp::param(1, 1, DType::Float32, None);

@@ -69,8 +69,8 @@ fn test_mel_spectrogram_sine_wave() {
 
     let vals = output.as_vec::<f32>().unwrap();
     let shape = output.shape().unwrap();
-    let n_mels = shape[1].as_const().unwrap() as usize;
-    let n_frames = shape[2].as_const().unwrap() as usize;
+    let n_mels = shape[1].as_const().unwrap();
+    let n_frames = shape[2].as_const().unwrap();
 
     let mut avg_energy: Vec<f32> = vec![0.0; n_mels];
     for mel_idx in 0..n_mels {

@@ -386,6 +386,11 @@ impl DType {
         matches!(self, Self::Vector { .. })
     }
 
+    /// Check if this is an image (texture) type.
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Image { .. })
+    }
+
     /// Get the base scalar type (works for both scalars and vectors).
     pub fn base(&self) -> ScalarDType {
         match self {
@@ -595,7 +600,7 @@ impl DType {
 
 /// Trait for types that have an associated DType.
 ///
-/// This trait is used for type-safe tensor data extraction (e.g., to_ndarray<T>()).
+/// This trait is used for type-safe tensor data extraction (e.g., `to_ndarray::<T>()`).
 pub trait HasDType: Clone + Default {
     const DTYPE: DType;
 }

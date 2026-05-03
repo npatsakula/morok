@@ -103,6 +103,7 @@ enum OpData {
     // Nullary operations
     Const(ConstValueHash),
     Unique(usize),
+    LUnique(usize),
     Device(DeviceSpec),
     // DefineLocal includes unique ID to prevent hash consing across kernels.
     DefineLocal(usize, usize), // (slot, unique_id)
@@ -121,8 +122,14 @@ enum OpData {
     SpecialName(String),
 
     // Buffer operations
-    BufferData(usize, usize), // (unique_id, size) - each buffer is unique
-    ParamData(usize, usize),  // (slot, size) — dedup by structure, matching Tinygrad's UOp cache
+    //
+    // `local` distinguishes buffers tagged by `Op::LUnique` (per-kernel local
+    // counter starting at 0 — see `schedule/src/rangeify/kernel.rs`'s
+    // `next_lunique`) from buffers tagged by `Op::Unique` (the global atomic
+    // `next_unique_id`). Without the discriminator, `BufferData(0, size)`
+    // could collide between an LUnique slot 0 and a Unique with global id 0.
+    BufferData { local: bool, id: usize, size: usize },
+    ParamData(usize, usize), // (slot, size) — dedup by structure, matching Tinygrad's UOp cache
     BufferView(usize, usize),
     Bufferize(BufferizeOpts),
 
@@ -152,9 +159,17 @@ enum OpData {
     ContractRanges(Vec<(usize, usize)>),
     UnrollAxes(Vec<(usize, usize)>),
     CustomCode(String),
+    CustomFunctionKind(CustomFunctionKind),
+    CallInfoData(CallInfo),
+    SourceCode(String),
+    ProgramBinaryBytes(Vec<u8>),
+    SinkInfo(Option<crate::types::KernelInfo>),
 
     // Movement operations with extra data
     ContiguousOpts(Vec<crate::types::ContiguousHint>),
+
+    // Tuple operations
+    GetTupleIndex(usize),
 
     // Operations with only children (no extra semantic data)
     None,
@@ -181,6 +196,7 @@ impl UOpKey {
         let op_data = match op {
             Op::Const(c) => OpData::Const(*c),
             Op::Unique(id) => OpData::Unique(*id),
+            Op::LUnique(id) => OpData::LUnique(*id),
             Op::Device(d) => OpData::Device(d.clone()),
             Op::DefineLocal(slot) => OpData::DefineLocal(*slot, next_unique_id()),
             Op::Unary(unary_op, _) => OpData::Unary(*unary_op),
@@ -190,14 +206,12 @@ impl UOpKey {
             Op::BitCast { dtype, .. } => OpData::BitCastDType(dtype.clone()),
             Op::MSelect { device_index, .. } => OpData::MSelectIdx(*device_index),
             Op::Special { name, .. } => OpData::SpecialName(name.clone()),
-            Op::Buffer { unique, size, .. } => {
-                if let Op::Unique(id) = unique.op() {
-                    OpData::BufferData(*id, *size)
-                } else {
-                    // Fallback: use UOp's stable id
-                    OpData::BufferData(unique.id as usize, *size)
-                }
-            }
+            Op::Buffer { unique, size, .. } => match unique.op() {
+                Op::Unique(id) => OpData::BufferData { local: false, id: *id, size: *size },
+                Op::LUnique(id) => OpData::BufferData { local: true, id: *id, size: *size },
+                // Fallback: use UOp's stable id (already globally unique).
+                _ => OpData::BufferData { local: false, id: unique.id as usize, size: *size },
+            },
             Op::BufferView { size, offset, .. } => OpData::BufferView(*size, *offset),
             Op::Bufferize { opts, .. } => OpData::Bufferize(opts.clone()),
             Op::Permute { axes, .. } => OpData::PermuteAxes(axes.clone()),
@@ -215,19 +229,27 @@ impl UOpKey {
             Op::Contract { upcast_ranges, .. } => OpData::ContractRanges(upcast_ranges.clone()),
             Op::Unroll { unroll_axes, .. } => OpData::UnrollAxes(unroll_axes.clone()),
             Op::Custom { code, .. } | Op::CustomI { code, .. } => OpData::CustomCode(code.clone()),
+            Op::CustomFunction { kind, .. } => OpData::CustomFunctionKind(kind.clone()),
+            Op::Call { info, .. } | Op::Function { info, .. } => OpData::CallInfoData(info.clone()),
+            Op::Sink { info, .. } => OpData::SinkInfo(info.clone()),
+            Op::Source { code } => OpData::SourceCode(code.clone()),
+            Op::ProgramBinary { bytes } => OpData::ProgramBinaryBytes(bytes.clone()),
             Op::Contiguous { opts, .. } => OpData::ContiguousOpts(opts.to_vec()),
             Op::Param { slot, size, .. } => OpData::ParamData(*slot, *size),
             // All remaining ops encode semantic data entirely through children
             // (captured by src_hashes) — no extra OpData needed.
             Op::Noop | Op::Invalid => OpData::None,
             // Multi-child ops: children ARE the data
-            Op::Sink { .. }
-            | Op::Group { .. }
+            Op::Group { .. }
             | Op::Vectorize { .. }
             | Op::Cat { .. }
             | Op::PtrCat { .. }
             | Op::MStack { .. }
-            | Op::Barrier { .. } => OpData::None,
+            | Op::Barrier { .. }
+            | Op::Linear { .. }
+            | Op::Program { .. }
+            | Op::Tuple { .. } => OpData::None,
+            Op::GetTuple { index, .. } => OpData::GetTupleIndex(*index),
             // Movement ops: shape/bounds are Arc<UOp> children
             Op::Reshape { .. } | Op::Expand { .. } | Op::Pad { .. } | Op::Shrink { .. } => OpData::None,
             // Memory/control: all fields are Arc<UOp> children
@@ -237,8 +259,8 @@ impl UOpKey {
             Op::If { .. } | Op::EndIf { .. } | Op::End { .. } | Op::After { .. } => OpData::None,
             // Single-source ops with no extra data
             Op::Detach { .. } | Op::ContiguousBackward { .. } | Op::Precast { .. } => OpData::None,
-            // Binding/kernel: children encode all semantics
-            Op::Bind { .. } | Op::Kernel { .. } | Op::Assign { .. } => OpData::None,
+            // Binding: children encode all semantics
+            Op::Bind { .. } => OpData::None,
         };
 
         // Pre-compute hash using xxhash (fast, non-cryptographic).
@@ -303,15 +325,6 @@ pub fn gc_dead_refs() {
     for key in to_remove {
         map.remove(&key, &guard);
     }
-}
-
-/// Legacy alias for gc_dead_refs (for compatibility).
-///
-/// With weak references, UOps are automatically cleaned up when no longer
-/// referenced. This function now just cleans up dead weak refs in the cache.
-#[deprecated(note = "UOp cache now uses weak refs - cleanup is automatic. Use gc_dead_refs() to clean cache.")]
-pub fn gc_unused_uops() {
-    gc_dead_refs();
 }
 
 /// Get the set of IDs for UOps currently alive in the cache.

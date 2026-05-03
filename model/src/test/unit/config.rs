@@ -22,4 +22,11 @@ fn test_config_from_json() {
     assert!(matches!(config.subsampling_mode, SubsamplingMode::Conv1d));
     assert!(matches!(config.conv_norm_type, ConvNormType::LayerNorm));
     assert_eq!(config.subs_kernel_size, 5);
+    assert_eq!(config.subsampling_factor, 4);
+    assert_eq!(config.max_encoder_frames, 5000);
+    // No explicit `max_mel_frames` / `max_seq_len` in this config — the loader
+    // derives the pre-subsampling bound from the post-subsampling encoder bound
+    // by scaling up by `subsampling_factor`, so audio approaching the encoder
+    // cap isn't rejected at the JIT input stage.
+    assert_eq!(config.max_mel_frames, 5000 * config.subsampling_factor);
 }

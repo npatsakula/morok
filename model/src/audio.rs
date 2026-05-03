@@ -26,7 +26,6 @@ pub struct MelSpectrogram {
     window: Vec<f32>,
     n_fft: usize,
     hop_length: usize,
-    win_length: usize,
     center: bool,
 }
 
@@ -44,15 +43,7 @@ impl MelSpectrogram {
 
         let mel_fb = build_mel_filterbank(config.n_mels, n_fft, config.sample_rate as f32);
 
-        Self {
-            r2c,
-            mel_fb,
-            window,
-            n_fft,
-            hop_length: config.hop_length,
-            win_length: config.win_length,
-            center: config.center,
-        }
+        Self { r2c, mel_fb, window, n_fft, hop_length: config.hop_length, center: config.center }
     }
 
     pub fn n_mels(&self) -> usize {
@@ -80,6 +71,19 @@ impl MelSpectrogram {
         let n_frames = if signal.len() >= n_fft { (signal.len() - n_fft) / self.hop_length + 1 } else { 0 };
         let n_bins = n_fft / 2 + 1;
         let n_mels = self.mel_fb.nrows();
+
+        debug_assert!(
+            {
+                let shape = out.shape();
+                shape.len() >= 2
+                    && shape[shape.len() - 2] == n_mels
+                    && shape[shape.len() - 1] == n_frames
+                    && shape[..shape.len() - 2].iter().all(|&d| d == 1)
+            },
+            "forward_into: expected output trailing dims [.., {n_mels}, {n_frames}] with leading 1s, got {:?}",
+            out.shape(),
+        );
+
         let out_slice = out.as_slice_mut().expect("output must be contiguous");
 
         out_slice[..n_mels * n_frames].fill(0.0);
@@ -144,18 +148,23 @@ fn build_mel_filterbank(n_mels: usize, n_fft: usize, sample_rate: f32) -> Array2
     fb
 }
 
-/// Reflect-pad a signal by `pad` samples on each side.
-fn reflect_pad(signal: &[f32], pad: usize) -> Vec<f32> {
+/// Reflect-pad a signal by `pad` samples on each side, mirroring PyTorch's
+/// `Reflect1d`: the boundary element is not duplicated, and `pad` must be
+/// strictly less than the signal length (single-bounce reflection only).
+pub(crate) fn reflect_pad(signal: &[f32], pad: usize) -> Vec<f32> {
     let len = signal.len();
-    let mut padded = Vec::with_capacity(len + 2 * pad);
+    assert!(
+        pad < len,
+        "reflect_pad requires pad ({pad}) < signal length ({len}); multi-bounce reflection is not supported",
+    );
 
+    let mut padded = Vec::with_capacity(len + 2 * pad);
     for i in (1..=pad).rev() {
-        padded.push(signal[i % len]);
+        padded.push(signal[i]);
     }
     padded.extend_from_slice(signal);
     for i in 1..=pad {
-        let idx = if i < len { len - 1 - i } else { i % len };
-        padded.push(signal[idx]);
+        padded.push(signal[len - 1 - i]);
     }
     padded
 }

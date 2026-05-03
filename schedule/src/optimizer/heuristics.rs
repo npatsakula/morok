@@ -100,6 +100,7 @@ pub fn has_matmul_pattern(scheduler: &Scheduler) -> bool {
         if *reduce_op != ReduceOp::Add {
             return false;
         }
+        let src = if let Op::Cast { src, .. } = src.op() { src } else { src };
         if let Op::Binary(BinaryOp::Mul, left, right) = src.op() {
             let left_is_index = matches!(left.op(), Op::Index { .. })
                 || matches!(left.op(), Op::Cast { src, .. } if matches!(src.op(), Op::Index { .. }));
@@ -451,7 +452,7 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
 
 /// Apply matmul-specific 2D output tiling (register blocking).
 ///
-/// For matmul C[M,N] = A[M,K] @ B[K,N], this creates a tile of output elements
+/// For matmul `C[M,N] = A[M,K] @ B[K,N]`, this creates a tile of output elements
 /// that are computed together, amortizing memory loads across multiple outputs.
 ///
 /// Tinygrad achieves 8×8 register blocking with 64 scalar accumulators.
@@ -627,7 +628,7 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
         let Some(&global_dim) = full_shape.get(global_idx) else {
             continue;
         };
-        if global_dim <= 0 || (global_dim as usize) % row_tile != 0 {
+        if global_dim <= 0 || !(global_dim as usize).is_multiple_of(row_tile) {
             continue;
         }
 
@@ -960,8 +961,8 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 ///
 /// Matches Tinygrad's heuristic.py:28-46:
 /// - Guard: skip when >1 reduce axis unless tc_opt >= 1
-/// - Apply TC opts via tc::apply, capturing returned axes [N, M, K]
-/// - Post-TC (non-AMX only): UPCAST M then N with [5,4,3,2], LOCAL N with [4,2]
+/// - Apply TC opts via tc::apply, capturing returned axes `[N, M, K]`
+/// - Post-TC (non-AMX only): UPCAST M then N with `[5,4,3,2]`, LOCAL N with `[4,2]`
 pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     use crate::optimizer::config::TcUsage;
     use crate::optimizer::tc;

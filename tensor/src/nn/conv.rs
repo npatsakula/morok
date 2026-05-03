@@ -26,9 +26,10 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let y = x.conv2d().weight(&w).call().unwrap();
+    /// let mut y = x.conv2d().weight(&w).call().unwrap();
+    /// y.realize().unwrap();
     /// // 3x3 kernel of ones on input of ones => each output element is 9.0
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![9.0; 9]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![9.0; 9]);
     /// ```
     ///
     /// With stride:
@@ -38,10 +39,11 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 5, 5), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let y = x.conv2d().weight(&w).stride(&[2, 2]).call().unwrap();
+    /// let mut y = x.conv2d().weight(&w).stride(&[2, 2]).call().unwrap();
+    /// y.realize().unwrap();
     /// let shape: Vec<_> = y.shape().unwrap().iter().map(|d| d.as_const().unwrap()).collect();
     /// assert_eq!(shape, vec![1, 1, 2, 2]);
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![9.0; 4]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![9.0; 4]);
     /// ```
     ///
     /// With padding:
@@ -52,8 +54,9 @@ impl Tensor {
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// // padding=1 on each side: output matches input spatial dims
-    /// let y = x.conv2d().weight(&w).padding(&[(1, 1), (1, 1)]).call().unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.conv2d().weight(&w).padding(&[(1, 1), (1, 1)]).call().unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 9); // 3x3 output
     /// // Center element sees full 3x3 window of ones = 9.0
     /// assert_eq!(vals[4], 9.0);
@@ -69,9 +72,10 @@ impl Tensor {
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
     /// let b = Tensor::from_slice([10.0f32]);
-    /// let y = x.conv2d().weight(&w).bias(&b).call().unwrap();
+    /// let mut y = x.conv2d().weight(&w).bias(&b).call().unwrap();
+    /// y.realize().unwrap();
     /// // Each output element: 9.0 + 10.0 = 19.0
-    /// assert_eq!(y.to_vec::<f32>().unwrap(), vec![19.0]);
+    /// assert_eq!(y.as_vec::<f32>().unwrap(), vec![19.0]);
     /// ```
     #[builder]
     pub fn conv2d(
@@ -197,8 +201,9 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let y = x.conv_transpose2d().weight(&w).call().unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.conv_transpose2d().weight(&w).call().unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 16); // 4x4 output
     /// // Center elements see full overlap of both input positions
     /// assert_eq!(vals[5], 4.0);
@@ -211,8 +216,9 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let y = x.conv_transpose2d().weight(&w).stride(&[2, 2]).call().unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// let mut y = x.conv_transpose2d().weight(&w).stride(&[2, 2]).call().unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 25); // 5x5 output
     /// ```
     ///
@@ -223,14 +229,15 @@ impl Tensor {
     /// # use ndarray::Array4;
     /// let x = Tensor::from_ndarray(&Array4::from_elem((1, 1, 2, 2), 1.0f32));
     /// let w = Tensor::from_ndarray(&Array4::from_elem((1, 1, 3, 3), 1.0f32));
-    /// let y = x.conv_transpose2d()
+    /// let mut y = x.conv_transpose2d()
     ///     .weight(&w)
     ///     .stride(&[2, 2])
     ///     .padding(&[(1, 1), (1, 1)])
     ///     .output_padding(&[1, 1])
     ///     .call()
     ///     .unwrap();
-    /// let vals = y.to_vec::<f32>().unwrap();
+    /// y.realize().unwrap();
+    /// let vals = y.as_vec::<f32>().unwrap();
     /// assert_eq!(vals.len(), 16); // 4x4 output
     /// ```
     #[builder]

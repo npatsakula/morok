@@ -57,9 +57,34 @@ impl Matcher<()> for SubstituteGatedMatcher<'_> {
     }
 }
 
-/// Wrapper for Arc<UOp> that implements Hash and Eq based on stable ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraversalMode {
+    Full,
+    PreserveCalls,
+}
+
+fn traversal_sources(node: &Arc<UOp>, mode: TraversalMode) -> SmallVec<[Arc<UOp>; 4]> {
+    if mode == TraversalMode::Full {
+        return node.op().sources();
+    }
+
+    match node.op() {
+        Op::Call { args, .. } | Op::Function { args, .. } => args.clone(),
+        // Program holds compiled artifacts (linear/source/binary) wrapped as
+        // UOps; traversing through them during rewrite passes is expensive
+        // and unnecessary — only the device producer is traversed.
+        Op::Program { device, .. } => {
+            let mut children = SmallVec::new();
+            children.push(device.clone());
+            children
+        }
+        _ => node.op().sources(),
+    }
+}
+
+/// Wrapper for `Arc<UOp>` that implements Hash and Eq based on stable ID.
 ///
-/// This allows using Arc<UOp> as HashMap keys without implementing
+/// This allows using `Arc<UOp>` as HashMap keys without implementing
 /// Hash/Eq on UOp itself (which would be problematic due to OnceCell fields).
 ///
 /// Note: While UOp contains OnceCell fields, Hash/Eq are based solely on the
@@ -97,7 +122,7 @@ impl Hash for UOpKey {
 /// Shape inference is lazy and cached - computed on first access via `shape()` method.
 ///
 /// Note: Debug uses derive_more with `#[debug(skip)]` on cache fields to prevent
-/// stack overflow from recursive Arc<UOp> references in caches.
+/// stack overflow from recursive `Arc<UOp>` references in caches.
 #[derive(derive_more::Debug)]
 pub struct UOp {
     /// Unique stable ID for this UOp instance.
@@ -160,8 +185,8 @@ pub struct UOp {
     /// instance with a different ID. This is used for kernel info (name, opts) after
     /// optimization is complete.
     ///
-    /// Uses Arc<dyn Any> to allow attaching any metadata type without circular
-    /// dependencies (e.g., schedule::KernelInfo).
+    /// Uses `Arc<dyn Any>` to allow attaching any metadata type without
+    /// circular dependencies (e.g., schedule::KernelInfo).
     #[debug(skip)]
     pub(crate) metadata: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -169,7 +194,7 @@ pub struct UOp {
 /// Hash implementation for UOp based on content (dtype + op).
 ///
 /// This enables content-based hashing for cross-run caching. The hash traverses
-/// the DAG structure since Op contains Arc<UOp> children that also get hashed.
+/// the DAG structure since Op contains `Arc<UOp>` children that also get hashed.
 /// Cache fields are intentionally skipped - they don't affect semantic identity.
 impl Hash for UOp {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -211,14 +236,18 @@ impl UOp {
 
     /// Check if this UOp has a concrete buffer identity in the graph.
     ///
-    /// Returns true for BUFFER or RESHAPE/MULTI chains leading to BUFFER.
+    /// Returns true for buffer-like identities or RESHAPE/MULTI chains leading to them.
     /// These are already contiguous by definition, so wrapping in CONTIGUOUS is a no-op.
     ///
-    /// Based on Tinygrad's `UOp.has_buffer_identity()` (ops.py:616-619).
+    /// Based on Tinygrad's `UOp.has_buffer_identity()`.
     pub fn has_buffer_identity(&self) -> bool {
         match &self.op {
-            Op::Reshape { src, .. } => src.has_buffer_identity(),
-            Op::Buffer { .. } => true,
+            Op::Reshape { src, .. } | Op::Multi { src, .. } => src.has_buffer_identity(),
+            Op::Buffer { .. } | Op::BufferView { .. } | Op::Param { .. } => true,
+            Op::GetTuple { src, index } => match src.op() {
+                Op::Tuple { src: elements } => elements.get(*index).is_some_and(|t| t.has_buffer_identity()),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -529,6 +558,7 @@ impl UOp {
             Op::MSelect { buffer, .. } => buffer.buf_uop(),
             Op::MStack { buffers } if !buffers.is_empty() => buffers[0].buf_uop(),
             Op::After { passthrough, .. } => passthrough.buf_uop(),
+            Op::Call { body, .. } | Op::Function { body, .. } => body.buf_uop(),
             _ => {
                 // For other ops, check if base is AFTER
                 let base = self.base();
@@ -634,6 +664,84 @@ impl UOp {
                     for child in children.into_iter().rev() {
                         stack.push((child, false));
                     }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Topological sort with optional CALL/FUNCTION/PROGRAM boundary traversal.
+    ///
+    /// When `include_call_bodies` is false, traversal does not descend into
+    /// CALL/FUNCTION bodies or PROGRAM internals. Call/function arguments and
+    /// program device are
+    /// still traversed.
+    pub fn toposort_call_aware(self: &Arc<Self>, include_call_bodies: bool) -> Vec<Arc<Self>> {
+        let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
+
+        let mut visited = HashSet::new();
+        let mut result = Vec::new();
+        let mut stack = vec![(self.clone(), false)];
+
+        while let Some((node, processed)) = stack.pop() {
+            let ptr = Arc::as_ptr(&node);
+
+            if visited.contains(&ptr) {
+                continue;
+            }
+
+            if processed {
+                visited.insert(ptr);
+                result.push(node);
+            } else {
+                stack.push((node.clone(), true));
+                let mut children = Vec::new();
+                for child in traversal_sources(&node, mode) {
+                    if !visited.contains(&Arc::as_ptr(&child)) {
+                        children.push(child);
+                    }
+                }
+                for child in children.into_iter().rev() {
+                    stack.push((child, false));
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Filtered topological sort with optional CALL/FUNCTION/PROGRAM boundary traversal.
+    pub fn toposort_filtered_call_aware<F>(self: &Arc<Self>, gate: F, include_call_bodies: bool) -> Vec<Arc<Self>>
+    where
+        F: Fn(&Arc<UOp>) -> bool,
+    {
+        let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
+
+        let mut visited = HashSet::new();
+        let mut result = Vec::new();
+        let mut stack = vec![(self.clone(), false)];
+
+        while let Some((node, processed)) = stack.pop() {
+            let ptr = Arc::as_ptr(&node);
+
+            if visited.contains(&ptr) {
+                continue;
+            }
+
+            if processed {
+                visited.insert(ptr);
+                result.push(node);
+            } else if gate(&node) {
+                stack.push((node.clone(), true));
+                let mut children = Vec::new();
+                for child in traversal_sources(&node, mode) {
+                    if !visited.contains(&Arc::as_ptr(&child)) {
+                        children.push(child);
+                    }
+                }
+                for child in children.into_iter().rev() {
+                    stack.push((child, false));
                 }
             }
         }
@@ -874,12 +982,23 @@ impl UOp {
     /// Useful for reverse traversal and dependency analysis.
     #[allow(clippy::mutable_key_type)]
     pub fn get_consumer_map(self: &Arc<Self>) -> HashMap<UOpKey, Vec<Arc<Self>>> {
-        let mut consumer_map: HashMap<UOpKey, Vec<Arc<Self>>> = HashMap::new();
+        self.get_consumer_map_call_aware(true)
+    }
 
-        for node in self.toposort() {
-            node.op.map_child(|child| {
+    /// Build a consumer map with optional CALL/FUNCTION/PROGRAM boundary traversal.
+    ///
+    /// When `include_call_bodies` is false, traversal does not descend into
+    /// CALL/FUNCTION bodies or PROGRAM internals. Call/function arguments and
+    /// program device are still traversed.
+    #[allow(clippy::mutable_key_type)]
+    pub fn get_consumer_map_call_aware(self: &Arc<Self>, include_call_bodies: bool) -> HashMap<UOpKey, Vec<Arc<Self>>> {
+        let mut consumer_map: HashMap<UOpKey, Vec<Arc<Self>>> = HashMap::new();
+        let mode = if include_call_bodies { TraversalMode::Full } else { TraversalMode::PreserveCalls };
+
+        for node in self.toposort_call_aware(include_call_bodies) {
+            for child in traversal_sources(&node, mode) {
                 consumer_map.entry(UOpKey(child.clone())).or_default().push(node.clone());
-            });
+            }
         }
 
         consumer_map
@@ -924,7 +1043,8 @@ impl UOp {
     ///
     /// Delegates to `graph_rewrite_bottom_up` with a wildcard pattern that looks up
     /// each node in the map — exactly like Tinygrad's `substitute`. The rewrite engine
-    /// provides O(n) memoization via its result cache.
+    /// provides O(n) memoization via its result cache and an explicit work-stack
+    /// (no Rust recursion, so deep graphs do not exhaust the thread stack).
     #[allow(clippy::mutable_key_type)]
     pub fn substitute(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
@@ -932,6 +1052,36 @@ impl UOp {
         }
         let matcher = SubstituteMatcher(map);
         crate::rewrite::graph_rewrite_bottom_up(&matcher, self.clone(), &mut ())
+    }
+
+    /// Replace UOps using walk semantics — single-pass, no re-traversal into
+    /// rewritten subtrees.
+    ///
+    /// Use when a replacement may contain the original key (e.g.
+    /// `Buffer → After(Buffer, [Store(...)])` for view-assign). The default
+    /// [`Self::substitute`] would re-traverse replacements and loop or wrap
+    /// the key multiple times.
+    #[allow(clippy::mutable_key_type)]
+    pub fn substitute_walk(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
+        if map.is_empty() {
+            return self.clone();
+        }
+        let matcher = SubstituteMatcher(map);
+        crate::rewrite::graph_rewrite_walk(&matcher, self.clone(), &mut ())
+    }
+
+    /// Replace UOps while preserving CALL/FUNCTION/PROGRAM body boundaries.
+    ///
+    /// Direct substitutions still apply to CALL/FUNCTION/PROGRAM nodes themselves.
+    /// Traversal skips CALL/FUNCTION bodies and PROGRAM internals by default,
+    /// while still rewriting CALL/FUNCTION arguments and PROGRAM device.
+    #[allow(clippy::mutable_key_type)]
+    pub fn substitute_preserve_calls(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
+        if map.is_empty() {
+            return self.clone();
+        }
+        let matcher = SubstituteMatcher(map);
+        crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&matcher, self.clone(), &mut ())
     }
 
     /// Replace UOps with range-gated substitution (Tinygrad: `extra_pm=pm_gate_substitute`).
@@ -947,6 +1097,17 @@ impl UOp {
         let range_keys: HashSet<UOpKey> = map.keys().cloned().collect();
         let matcher = SubstituteGatedMatcher { map, range_keys: &range_keys };
         crate::rewrite::graph_rewrite_bottom_up(&matcher, self.clone(), &mut ())
+    }
+
+    /// Range-gated substitute that also preserves CALL/FUNCTION/PROGRAM boundaries.
+    #[allow(clippy::mutable_key_type)]
+    pub fn substitute_gated_preserve_calls(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
+        if map.is_empty() {
+            return self.clone();
+        }
+        let range_keys: HashSet<UOpKey> = map.keys().cloned().collect();
+        let matcher = SubstituteGatedMatcher { map, range_keys: &range_keys };
+        crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&matcher, self.clone(), &mut ())
     }
 
     /// Reconstruct this UOp with new sources.
@@ -980,13 +1141,16 @@ impl UOp {
             // Nullary operations - no sources
             Op::Const(_)
             | Op::Unique(_)
+            | Op::LUnique(_)
             | Op::Device(_)
             | Op::Noop
             | Op::Invalid
             | Op::DefineLocal(_)
             | Op::VConst { .. }
             | Op::DefineVar { .. }
-            | Op::DefineReg { .. } => {
+            | Op::DefineReg { .. }
+            | Op::Source { .. }
+            | Op::ProgramBinary { .. } => {
                 assert_eq!(new_srcs.len(), 0, "Nullary op should have no sources");
                 return self.clone(); // No sources to replace
             }
@@ -1185,16 +1349,52 @@ impl UOp {
                 assert_eq!(new_srcs.len(), 1);
                 Op::Unroll { src: src(0), unroll_axes: unroll_axes.clone() }
             }
-            Op::Kernel { .. } => {
-                assert!(!new_srcs.is_empty());
-                Op::Kernel {
-                    sources: new_srcs[..new_srcs.len() - 1].iter().cloned().collect(),
-                    ast: src(new_srcs.len() - 1),
-                }
+            Op::Call { info, .. } => {
+                assert!(!new_srcs.is_empty(), "Call requires at least body source");
+                Op::Call { body: src(0), args: new_srcs[1..].iter().cloned().collect(), info: info.clone() }
             }
-            Op::Assign { movement_ops, .. } => {
-                assert_eq!(new_srcs.len(), 2, "Assign requires 2 sources");
-                Op::Assign { target: src(0), value: src(1), movement_ops: movement_ops.clone() }
+            Op::Function { info, .. } => {
+                assert!(!new_srcs.is_empty(), "Function requires at least body source");
+                Op::Function { body: src(0), args: new_srcs[1..].iter().cloned().collect(), info: info.clone() }
+            }
+            Op::Program { linear, source, binary, .. } => {
+                assert!(new_srcs.len() >= 2, "Program requires sink and device sources");
+                let mut idx = 0usize;
+                let sink = src(idx);
+                idx += 1;
+                let device = src(idx);
+                idx += 1;
+
+                let linear_new = if linear.is_some() {
+                    let value = src(idx);
+                    idx += 1;
+                    Some(value)
+                } else {
+                    None
+                };
+                let source_new = if source.is_some() {
+                    let value = src(idx);
+                    idx += 1;
+                    Some(value)
+                } else {
+                    None
+                };
+                let binary_new = if binary.is_some() {
+                    let value = src(idx);
+                    idx += 1;
+                    Some(value)
+                } else {
+                    None
+                };
+
+                assert_eq!(idx, new_srcs.len(), "Program source count mismatch");
+                Op::Program { sink, device, linear: linear_new, source: source_new, binary: binary_new }
+            }
+            Op::Linear { .. } => Op::Linear { ops: new_srcs.iter().cloned().collect() },
+            Op::Tuple { .. } => Op::Tuple { src: new_srcs.iter().cloned().collect() },
+            Op::GetTuple { index, .. } => {
+                assert_eq!(new_srcs.len(), 1);
+                Op::GetTuple { src: src(0), index: *index }
             }
             Op::Detach { .. } => {
                 assert_eq!(new_srcs.len(), 1);
@@ -1225,6 +1425,9 @@ impl UOp {
                 Op::Precast { src: src(0) }
             }
             Op::Custom { code, .. } => Op::Custom { deps: new_srcs.iter().cloned().collect(), code: code.clone() },
+            Op::CustomFunction { kind, .. } => {
+                Op::CustomFunction { kind: kind.clone(), attrs: new_srcs.iter().cloned().collect() }
+            }
             Op::CustomI { code, .. } => Op::CustomI { deps: new_srcs.iter().cloned().collect(), code: code.clone() },
 
             // Memory operations
@@ -1240,7 +1443,7 @@ impl UOp {
             }
 
             // Graph organization
-            Op::Sink { .. } => Op::Sink { sources: new_srcs.iter().cloned().collect() },
+            Op::Sink { info, .. } => Op::Sink { sources: new_srcs.iter().cloned().collect(), info: info.clone() },
             Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
         };
 
