@@ -49,22 +49,23 @@ mod dlopen_impl {
                 .map_err(|e| crate::Error::JitCompilation { reason: format!("Failed to write source file: {e}") })?;
             drop(src_file);
 
-            let output = std::process::Command::new("clang")
-                .args([
-                    "-shared",
-                    "-O2",
-                    "-march=native",
-                    "-fPIC",
-                    "-fno-math-errno",
-                    "-lm",
-                    "-o",
-                    so_path.to_str().unwrap(),
-                    src_path.to_str().unwrap(),
-                ])
-                .output()
-                .map_err(|e| crate::Error::JitCompilation {
-                    reason: format!("Failed to run clang: {e}. Is clang installed?"),
-                })?;
+            // On ARM, `-mcpu=native` enables CPU-specific tuning. `-march=native`
+            // only sets the base ISA family on ARM.
+            let march = match std::env::consts::ARCH {
+                "x86_64" | "loongarch64" => "-march=native",
+                "riscv64" => "-march=rv64g",
+                _ => "-mcpu=native",
+            };
+            let mut args = vec!["-shared", "-O2", march, "-fPIC", "-fno-math-errno", "-fno-ident", "-lm"];
+            // Reserve x18 only on macOS ARM, where the kernel clobbers it on
+            // context switch. Linux ARM treats x18 as a free GPR; Windows ARM
+            // is not a target morok currently supports.
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            args.push("-ffixed-x18");
+            args.extend_from_slice(&["-o", so_path.to_str().unwrap(), src_path.to_str().unwrap()]);
+            let output = std::process::Command::new("clang").args(&args).output().map_err(|e| {
+                crate::Error::JitCompilation { reason: format!("Failed to run clang: {e}. Is clang installed?") }
+            })?;
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);

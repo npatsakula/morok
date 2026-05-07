@@ -1,6 +1,6 @@
 //! Hand-coded optimization heuristics for kernel optimization.
 //!
-//! Implements Tinygrad-style heuristics for reasonable performance without auto-tuning.
+//! Hand-coded heuristics give reasonable performance without auto-tuning.
 //! Applies optimizations in order: TC → Image → GroupReduce → Upcasts → Unroll → Local → Thread.
 
 use std::sync::Arc;
@@ -40,9 +40,13 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
 
     debug!("hand_coded_optimizations: starting");
 
-    // 1. Tensor cores (skip other opts if applied)
-    // Post-TC UPCAST/LOCAL are handled inside try_tensor_cores (non-AMX only)
-    if try_tensor_cores(scheduler, config) {
+    // 1. Tensor cores (skip other opts if applied). On AMX the heuristic
+    // explicitly avoids TC: the post-TC schedule cannot be distributed
+    // efficiently (per-WMMA marshalling of 256-element accumulators) and
+    // UNROLL inside an AMX-TC reduce loop breaks codegen. The general path
+    // (matvec → group → upcast → unroll → threading) runs instead; BEAM
+    // discovers the higher-perf sequence via its broader action grid.
+    if !scheduler.renderer().is_amx() && try_tensor_cores(scheduler, config) {
         debug!("hand_coded_optimizations: tensor cores applied, skipping remaining opts");
         return;
     }
@@ -59,7 +63,7 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     // 3. Grouped reduction
     try_grouped_reduction(scheduler, config);
 
-    // Guard: no more opts if we are grouping (Tinygrad: if k.group_for_reduces: return k)
+    // Guard: no more opts if we are grouping.
     if scheduler.group_for_reduces() > 0 {
         debug!("hand_coded_optimizations: group_for_reduces active, skipping remaining opts");
         return;
@@ -68,10 +72,10 @@ pub fn hand_coded_optimizations(scheduler: &mut Scheduler, config: &HeuristicsCo
     // 4. Masked upcasts
     apply_masked_upcasts(scheduler);
 
-    // 5. Heuristic upcasts (stride-based ranking, matches Tinygrad's "more upcasts" loop)
+    // 5. Heuristic upcasts (stride-based ranking).
     apply_heuristic_upcasts(scheduler);
 
-    // 6. Unroll (BEFORE threading, matching Tinygrad order)
+    // 6. Unroll (BEFORE threading).
     apply_unroll(scheduler);
 
     // 7. Default upcast
@@ -155,7 +159,6 @@ pub fn has_broadcast_pattern(scheduler: &Scheduler, axis: usize) -> bool {
 
 /// Count strides for axis in buffer accesses. Returns (num_buffers, sum_strides).
 ///
-/// Matches Tinygrad's stride counting (heuristic.py:119-126):
 /// - num_strides: number of buffers whose index references this range
 /// - sum_strides: sum of actual stride values from the index's ADD decomposition
 ///   (1 for unit stride, CONST value for `range * CONST`)
@@ -170,16 +173,13 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
 
     for buf in scheduler.bufs() {
         if let Op::Index { indices, .. } = buf.op() {
-            // Get the combined linearized index and unwrap WHERE if present
-            // Tinygrad: idx = b.src[1].get_idx()
+            // Get the combined linearized index and unwrap WHERE if present.
             let idx = indices.first().map(|i| i.get_idx()).unwrap_or_else(|| buf.clone());
 
-            // Tinygrad: if rng in idx.backward_slice: num_strides += 1
             if idx.backward_slice_ids().contains(&target_rng.id) {
                 num_strides += 1;
             }
 
-            // Tinygrad: for c in idx.split_uop(Ops.ADD):
             for term in idx.split_uop(BinaryOp::Add) {
                 if Arc::ptr_eq(&term, target_rng) {
                     // c is rng → stride 1
@@ -208,7 +208,7 @@ pub fn count_strides(scheduler: &Scheduler, axis: usize) -> (usize, usize) {
 // SIMPLE HEURISTICS
 // ============================================================================
 
-/// Image-specific upcasting/unrolling parity with Tinygrad.
+/// Image-specific upcasting/unrolling.
 ///
 /// For image buffers, find a unit-stride axis whose extent is divisible by 4.
 /// Prefer UPCAST on that axis when it's output-parallel; otherwise UNROLL the
@@ -231,12 +231,12 @@ pub fn apply_image_upcasts(scheduler: &mut Scheduler) -> bool {
         };
         let linear_idx = first_idx.get_idx();
 
-        // Tinygrad parity: choose first range term in linearized index with size % 4 == 0.
+        // Choose first range term in linearized index with size % 4 == 0.
         let axis = linear_idx
             .split_uop(BinaryOp::Add)
             .into_iter()
             .filter_map(|term| {
-                if !matches!(term.op(), Op::Range { .. }) || term.divisible_by(4).is_none() {
+                if !matches!(term.op(), Op::Range { end, .. } if end.divides(4).is_some()) {
                     return None;
                 }
                 scheduler.rngs().iter().position(|r| Arc::ptr_eq(r, &term))
@@ -280,11 +280,11 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
         return false;
     }
 
-    // Tinygrad: upcastable_dims[-1] (innermost upcastable axis)
+    // Innermost upcastable axis.
     let axis_idx = *upcastable.last().unwrap();
     let rngs = scheduler.rngs();
 
-    // Get axis size and check divisibility (Tinygrad: k.full_shape[axis] % upcast_amount != 0)
+    // Get axis size and check divisibility.
     if axis_idx < rngs.len()
         && let Op::Range { end, .. } = rngs[axis_idx].op()
         && let Op::Const(cv) = end.op()
@@ -300,7 +300,7 @@ pub fn apply_default_upcast(scheduler: &mut Scheduler) -> bool {
     result.is_ok()
 }
 
-/// Unroll reduction loops, matching Tinygrad's logic (heuristic.py:135-148).
+/// Unroll reduction loops.
 ///
 /// Conditions: `unrollable_dims.not_empty() AND (upcast_size() <= 4 OR no UNROLL axes) AND upcast_size() < 64`
 /// - Small dims (size <= 32): full unroll (amount=0)
@@ -316,13 +316,12 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
     let upcast_size = scheduler.upcast_size();
     let has_unroll = !scheduler.axes_of(&[AxisType::Unroll]).is_empty();
 
-    // Tinygrad: (upcast_size() <= 4 or not axes_of(UNROLL)) and upcast_size() < 64
     if upcast_size >= 64 || (upcast_size > 4 && has_unroll) {
         debug!(upcast_size, has_unroll, "apply_unroll: skipping (upcast_size guard)");
         return false;
     }
 
-    // Get last unrollable dim's size (Tinygrad: k.unrollable_dims[-1])
+    // Get last unrollable dim's size.
     let last_unrollable = *unrollable.last().unwrap();
     let rngs = scheduler.rngs();
     let size = if last_unrollable < rngs.len()
@@ -343,7 +342,7 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
         // so non-power-of-2 sizes are safe.
         debug!(last_unrollable, size, "apply_unroll: full unroll");
         if apply_opt(scheduler, &Opt::unroll(logical_idx, 0), true).is_ok() {
-            // Tinygrad: if small, try unrolling a second reduce dimension too
+            // If small, try unrolling a second reduce dimension too.
             if size <= 3 {
                 let unrollable2 = scheduler.unrollable_dims();
                 if let Some(&last2) = unrollable2.last() {
@@ -381,13 +380,13 @@ pub fn apply_unroll(scheduler: &mut Scheduler) -> bool {
 
 /// Upcast small masked dimensions (size <= 7).
 ///
-/// Matches Tinygrad heuristic.py:97-105: collect all masked-upcastable axes first,
-/// then apply in REVERSE order. Reverse iteration is critical — upcast of a higher-indexed
-/// axis doesn't shift lower-indexed axes in the rngs list, preserving index validity.
+/// Collects all masked-upcastable axes first, then applies in REVERSE order.
+/// Reverse iteration is critical — upcast of a higher-indexed axis doesn't shift
+/// lower-indexed axes in the rngs list, preserving index validity.
 pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
     let upcastable = scheduler.upcastable_dims();
 
-    // Phase 1: Collect candidates (Tinygrad heuristic.py:97-104)
+    // Phase 1: Collect candidates.
     let mut product: i64 = 1;
     let mut to_upcast: Vec<(usize, usize)> = Vec::new();
 
@@ -412,7 +411,7 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
         }
     }
 
-    // Phase 2: Apply in reverse order (Tinygrad: to_upcast[::-1])
+    // Phase 2: Apply in reverse order.
     let mut applied = false;
     for (axis_idx, size) in to_upcast.into_iter().rev() {
         if apply_opt(scheduler, &Opt::upcast(axis_idx, size), true).is_ok() {
@@ -422,26 +421,27 @@ pub fn apply_masked_upcasts(scheduler: &mut Scheduler) -> bool {
     applied
 }
 
-/// Grouped reduction for small output dimensions (Tinygrad heuristic.py:83-89).
+/// Grouped reduction for small output dimensions.
 ///
-/// When the product of upcastable output dimensions is small (<= 2048),
-/// apply GROUPTOP on output axes to enable local reduction.
+/// When the product of upcastable output dimensions is small (<= 2048,
+/// or 240 under `MOROK_NOLOCALS`), apply GROUPTOP on output axes to enable
+/// local reduction.
 pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
     if !scheduler.renderer().has_local || config.disable_locals || !scheduler.renderer().has_shared {
         return false;
     }
 
-    // Tinygrad: prod(k.output_shape[i] for i in k.upcastable_dims) <= 2048
+    // prod(output_shape[i] for i in upcastable_dims) <= threshold
     let upcastable = scheduler.upcastable_dims();
     let full_shape = scheduler.full_shape();
     let group_for_reduces: i64 = upcastable.iter().map(|&i| full_shape.get(i).copied().unwrap_or(1)).product();
 
-    if group_for_reduces > 2048 {
+    let threshold: i64 = if std::env::var("MOROK_NOLOCALS").is_ok() { 240 } else { 2048 };
+    if group_for_reduces > threshold {
         return false;
     }
 
-    // Tinygrad: for axis, sz in itertools.product((0, 1, 2), (16,)):
-    //   try: k.apply_opt(Opt(OptOps.GROUPTOP, axis, sz)); break
+    // Try GROUPTOP on axes 0..3 with size 16; first one wins.
     for axis in 0..3 {
         if apply_opt(scheduler, &Opt::grouptop(axis, 16), true).is_ok() {
             return true;
@@ -455,13 +455,13 @@ pub fn try_grouped_reduction(scheduler: &mut Scheduler, config: &HeuristicsConfi
 /// For matmul `C[M,N] = A[M,K] @ B[K,N]`, this creates a tile of output elements
 /// that are computed together, amortizing memory loads across multiple outputs.
 ///
-/// Tinygrad achieves 8×8 register blocking with 64 scalar accumulators.
-/// We achieve the same by applying UPCAST to both M and N output axes:
+/// Achieves 8×8 register blocking with 64 scalar accumulators by applying UPCAST
+/// to both M and N output axes:
 /// - UPCAST M by up to 8 → 8 rows of output
 /// - UPCAST N by up to 8 → 8 cols of output → up to 8×8 = 64 outputs
 ///
 /// The devectorize pass (no_vectorized_alu) converts these to independent scalar
-/// accumulators via MulAcc splitting, matching Tinygrad's `float acc0[64]` pattern.
+/// accumulators via MulAcc splitting.
 ///
 /// Tile sizes are chosen flexibly based on divisibility: tries 8, 7, 6, 5, 4 in order.
 pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig) -> bool {
@@ -478,9 +478,9 @@ pub fn apply_matmul_tiling(scheduler: &mut Scheduler, config: &HeuristicsConfig)
         return false;
     }
 
-    // Get output axes directly - include OUTER for reduce kernels (matmul)
-    // Note: upcastable_dims() excludes Outer, but matmul needs it
-    let output_axes = scheduler.axes_of(&[AxisType::Outer, AxisType::Global, AxisType::Loop]);
+    // Output axes are GLOBAL/LOCAL/LOOP. After the OUTER→LOOP migration,
+    // matmul output axes arrive as Loop, so no Outer arm is needed.
+    let output_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Local, AxisType::Loop]);
     debug!(output_axes = ?output_axes, "apply_matmul_tiling: output axes");
 
     // Need at least 2 output axes for 2D tiling
@@ -546,7 +546,7 @@ fn find_axis_by_axis_id(scheduler: &Scheduler, axis_id: AxisId) -> Option<usize>
     })
 }
 
-/// Tinygrad-style matvec fast-path.
+/// Matvec fast-path.
 ///
 /// Applies `GROUP` on the reduce axis and `LOCAL`/`UPCAST` on one global output
 /// axis when the index structure matches matrix-vector style access.
@@ -599,7 +599,6 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
         return false;
     };
 
-    // Tinygrad parity checks:
     // 1) idx0 must contain the first reduce range as a top-level ADD term.
     // 2) idx1 must include all ranges used by idx0.
     let idx0_has_first_reduce = idx0_src.split_uop(BinaryOp::Add).iter().any(|u| Arc::ptr_eq(u, &first_reduce_rng));
@@ -612,7 +611,7 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
         return false;
     }
 
-    if first_reduce_rng.divisible_by(threads_per_row).is_none() {
+    if !matches!(first_reduce_rng.op(), Op::Range { end, .. } if end.divides(threads_per_row as i64).is_some()) {
         return false;
     }
 
@@ -634,7 +633,7 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
 
         let mut trial = scheduler.clone();
 
-        // Tinygrad behavior: GROUP is best-effort in this fast path.
+        // GROUP is best-effort in this fast path.
         if threads_per_row > 1 {
             let _ = apply_opt(&mut trial, &Opt::group(0, threads_per_row), true);
         }
@@ -672,7 +671,6 @@ pub fn apply_matvec_fast_path(scheduler: &mut Scheduler, config: &HeuristicsConf
 
 /// CPU threading for parallelizable loop axes.
 ///
-/// Matches Tinygrad's threading heuristic (heuristic.py:179-188):
 /// 1. Descending thread list: [32, 16, 12, 8, 6, 5, 4, 3, 2]
 /// 2. Minimum work check: skip if `prod(full_shape) / 131072 < threads`
 /// 3. Only LOOP axes (matmul output dims are Loop from rangeify)
@@ -688,19 +686,17 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
     // so dynamic kernels don't underestimate work and collapse to tiny thread counts.
     let total_elements = estimate_total_elements(scheduler);
 
-    // Tinygrad's descending thread count list
     const THREAD_LIST: [usize; 9] = [32, 16, 12, 8, 6, 5, 4, 3, 2];
 
     for &threads in &THREAD_LIST {
         if threads > max_threads {
             continue;
         }
-        // Skip if not enough work per thread (Tinygrad: prod(full_shape) // (128 << 10) < threads)
         if total_elements / 131072 < threads as i64 {
             continue;
         }
 
-        // Only thread LOOP axes (matching Tinygrad)
+        // Only thread LOOP axes.
         let loop_axes = scheduler.axes_of(&[AxisType::Loop]);
         let mut thread_applied = false;
         for &axis_idx in &loop_axes {
@@ -708,9 +704,7 @@ pub fn apply_threading(scheduler: &mut Scheduler, max_threads: usize) -> bool {
             if axis_idx >= rngs.len() {
                 continue;
             }
-            if rngs[axis_idx].divisible_by(threads).is_some() {
-                // Found divisible axis — try applying, then break regardless of success
-                // (Tinygrad: break is inside the divisibility check)
+            if matches!(rngs[axis_idx].op(), Op::Range { end, .. } if end.divides(threads as i64).is_some()) {
                 thread_applied = apply_opt(scheduler, &Opt::thread(axis_idx, threads), true).is_ok();
                 if thread_applied {
                     debug!(axis = axis_idx, threads, "apply_threading: applied THREAD");
@@ -756,12 +750,11 @@ fn estimate_total_elements(scheduler: &Scheduler) -> i64 {
 
 /// Heuristic upcasts based on stride analysis.
 ///
-/// Matches Tinygrad's "more upcasts" loop (heuristic.py:107-133):
-/// - Only enters loop when `prod(output_shape[upcastable_dims]) >= 1024`
+/// - Only enters the loop when `prod(output_shape[upcastable_dims]) >= 1024`
 /// - Terminates when `upcast_size() >= 32`
 /// - Uses factors `[3, 4]`
 /// - Ranks by `(num_strides, sum_strides)` ascending (fewest strides = best)
-/// - Excludes axes that are NOT stride-0 in any buffer (Tinygrad's broadcast check)
+/// - Excludes axes NOT stride-0 in any buffer (broadcast check)
 pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
     use tracing::debug;
 
@@ -769,7 +762,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
     let mut upcasted_axes: Vec<usize> = Vec::new();
 
     loop {
-        // Tinygrad: while prod(output_shape[i] for i in upcastable_dims) >= 1024 and upcast_size() < 32
+        // While prod(output_shape[upcastable_dims]) >= 1024 and upcast_size() < 32:
         let upcastable = scheduler.upcastable_dims();
         if upcastable.is_empty() {
             break;
@@ -803,7 +796,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
         }
 
         // Build choices: (num_strides, sum_strides, axis, upcast_amount)
-        // Tinygrad: for axis, upcast_amount in product(upcastable_dims, [3, 4])
+        // for axis × upcast_amount in upcastable_dims × [3, 4].
         let mut choices: Vec<(usize, usize, usize, usize)> = Vec::new();
 
         let upcast_and_unroll_ranges = scheduler.ranges_of(&[AxisType::Upcast, AxisType::Unroll]);
@@ -819,9 +812,8 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
             }
             let rng = &rngs[axis_idx];
 
-            // Tinygrad stride-0 check (lines 117-118):
-            // axis must be NOT in some buffer's index backward_slice AND
-            // all existing UPCAST/UNROLL ranges ARE in that buffer's index backward_slice
+            // Stride-0 check: axis must be NOT in some buffer's index
+            // backward_slice AND all existing UPCAST/UNROLL ranges ARE.
             let has_stride0 = {
                 let bufs = scheduler.bufs();
                 bufs.iter().any(|buf| {
@@ -881,7 +873,7 @@ pub fn apply_heuristic_upcasts(scheduler: &mut Scheduler) -> bool {
     applied
 }
 
-/// Stride-ranked LOCAL workgroup configuration (Tinygrad heuristic.py:156-175).
+/// Stride-ranked LOCAL workgroup configuration.
 ///
 /// Prioritizes expand axes (stride-0 in some buffer = broadcast) for LOCAL,
 /// then higher axis indices. Tries sizes [32, 16, 8, 4, 3, 2] for axis 0
@@ -891,8 +883,8 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         return false;
     }
 
-    // Rank axes: (has_expand_pattern, axis_index)
-    // Tinygrad: prioritize expand axes (stride-0 in some buffer), then higher indices
+    // Rank axes by (has_expand_pattern, axis_index) — expand axes (stride-0 in
+    // some buffer = broadcast) first, then higher axis indices.
     let eligible_axes = scheduler.axes_of(&[AxisType::Global, AxisType::Loop]);
     let full_shape = scheduler.full_shape();
 
@@ -926,7 +918,7 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
             continue;
         }
 
-        // Tinygrad: axis 0 gets [32, 16, 8, 4, 3, 2], others get [16, 8, 4, 3, 2]
+        // Axis 0 gets [32, 16, 8, 4, 3, 2]; others get [16, 8, 4, 3, 2].
         let candidates: &[usize] = if axis == 0 { &[32, 16, 8, 4, 3, 2] } else { &[16, 8, 4, 3, 2] };
 
         let local_sz =
@@ -959,7 +951,6 @@ pub fn apply_local_dims(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
 
 /// Tensor core optimization for matmul patterns.
 ///
-/// Matches Tinygrad's heuristic.py:28-46:
 /// - Guard: skip when >1 reduce axis unless tc_opt >= 1
 /// - Apply TC opts via tc::apply, capturing returned axes `[N, M, K]`
 /// - Post-TC (non-AMX only): UPCAST M then N with `[5,4,3,2]`, LOCAL N with `[4,2]`
@@ -977,8 +968,7 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         return false;
     }
 
-    // Guard: skip TC when >1 reduce axis and tc_opt < 1 (Bug 8)
-    // Tinygrad: len(axes_of(GROUP_REDUCE, REDUCE)) == 1 or TC_OPT >= 1
+    // Guard: require exactly one reduce axis unless TC_OPT >= 1.
     let reduce_count = scheduler.axes_of(&[AxisType::GroupReduce, AxisType::Reduce]).len();
     if reduce_count != 1 && config.tc_opt.as_usize() < 1 {
         return false;
@@ -1021,40 +1011,37 @@ pub fn try_tensor_cores(scheduler: &mut Scheduler, config: &HeuristicsConfig) ->
         );
         trial.applied_opts.push(opt);
 
-        // Post-TC optimizations (non-AMX only)
-        // Tinygrad: if good_tc_opt and not AMX
-        if !trial.renderer().is_amx() {
-            // Track current N/M ranges (axes[0]=N, axes[1]=M, axes[2]=K)
-            let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
+        // Post-TC opts: UPCAST M/N then LOCAL N. AMX never reaches this
+        // branch — the outer `!is_amx()` gate at the `try_tensor_cores`
+        // call site routes AMX through the general hand-coded path instead.
+        let mut tc_rngs = [axes[0].clone(), axes[1].clone()];
 
-            // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
-            for tc_dim in [1usize, 0] {
-                for &sz in &[5usize, 4, 3, 2] {
-                    if tc_rngs[tc_dim].divisible_by(sz).is_some() {
-                        // Find the range's position in the scheduler
-                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
-                            && let Ok((replaced, _)) =
-                                trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
-                        {
-                            trial.applied_opts.push(Opt::upcast(rng_idx, sz));
-                            tc_rngs[tc_dim] = replaced;
-                        }
-                        break;
+        // UPCAST M (dim=1) then N (dim=0) with factors [5,4,3,2]
+        for tc_dim in [1usize, 0] {
+            for &sz in &[5usize, 4, 3, 2] {
+                if matches!(tc_rngs[tc_dim].op(), Op::Range { end, .. } if end.divides(sz as i64).is_some()) {
+                    if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[tc_dim]))
+                        && let Ok((replaced, _)) =
+                            trial.shift_to(tc_rngs[tc_dim].clone(), sz, AxisType::Upcast, false, None)
+                    {
+                        trial.applied_opts.push(Opt::upcast(rng_idx, sz));
+                        tc_rngs[tc_dim] = replaced;
                     }
+                    break;
                 }
             }
+        }
 
-            // LOCAL N (dim=0) with factors [4,2]
-            if trial.renderer().has_local {
-                for &sz in &[4usize, 2] {
-                    if tc_rngs[0].divisible_by(sz).is_some() {
-                        if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
-                            && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
-                        {
-                            trial.applied_opts.push(Opt::local(rng_idx, sz));
-                        }
-                        break;
+        // LOCAL N (dim=0) with factors [4,2]
+        if trial.renderer().has_local {
+            for &sz in &[4usize, 2] {
+                if matches!(tc_rngs[0].op(), Op::Range { end, .. } if end.divides(sz as i64).is_some()) {
+                    if let Some(rng_idx) = trial.rngs().iter().position(|r| Arc::ptr_eq(r, &tc_rngs[0]))
+                        && trial.shift_to(tc_rngs[0].clone(), sz, AxisType::Local, false, None).is_ok()
+                    {
+                        trial.applied_opts.push(Opt::local(rng_idx, sz));
                     }
+                    break;
                 }
             }
         }

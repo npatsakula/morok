@@ -2,6 +2,7 @@ use super::*;
 use crate::schedule::ScheduleItem;
 use morok_device::Buffer;
 use morok_ir::UOp;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 fn make_buffer(numel: usize) -> Buffer {
@@ -20,6 +21,7 @@ fn make_sink_item(id: u64, buffer: Buffer) -> ScheduleItem {
         dependencies: Vec::new(),
         instance_dependencies: Vec::new(),
         alias_registered_ids: Vec::new(),
+        loop_var_names: HashSet::new(),
     }
 }
 
@@ -34,6 +36,7 @@ fn make_nonsink_item(id: u64, buffer: Buffer) -> ScheduleItem {
         dependencies: Vec::new(),
         instance_dependencies: Vec::new(),
         alias_registered_ids: Vec::new(),
+        loop_var_names: HashSet::new(),
     }
 }
 
@@ -48,6 +51,7 @@ fn make_store_item(buffer_uop: &Arc<UOp>, buffer: Buffer, index: Arc<UOp>) -> Sc
         dependencies: Vec::new(),
         instance_dependencies: Vec::new(),
         alias_registered_ids: Vec::new(),
+        loop_var_names: HashSet::new(),
     }
 }
 
@@ -61,7 +65,7 @@ fn test_round_up() {
 
 #[test]
 fn test_round_up_256_block() {
-    // tinygrad parity: 256-byte alignment.
+    // 256-byte alignment.
     assert_eq!(round_up(1, 256), 256);
     assert_eq!(round_up(256, 256), 256);
     assert_eq!(round_up(257, 256), 512);
@@ -70,7 +74,7 @@ fn test_round_up_256_block() {
 
 #[test]
 fn test_parse_mode_default_is_arena() {
-    // Tinygrad parity: env unset (`NO_MEMORY_PLANNER=0`) → arena planner runs.
+    // Env unset (`NO_MEMORY_PLANNER=0`) → arena planner runs.
     assert_eq!(parse_mode(None), PlannerMode::Arena);
     assert_eq!(parse_mode(Some("")), PlannerMode::Arena);
 }
@@ -99,8 +103,8 @@ fn test_parse_mode_arena_aliases() {
 
 #[test]
 fn test_parse_mode_unknown_falls_back_to_arena() {
-    // Unknown values must not crash — default to the tinygrad-parity arena
-    // mode rather than silently regressing to a different strategy.
+    // Unknown values must not crash — default to the arena mode rather than
+    // silently regressing to a different strategy.
     assert_eq!(parse_mode(Some("garbage")), PlannerMode::Arena);
 }
 

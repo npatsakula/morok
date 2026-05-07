@@ -788,8 +788,8 @@ fn do_contract(uop: &Arc<UOp>) -> Option<Arc<UOp>> {
 /// ```
 ///
 /// For example with unroll_axes=[(2,2), (3,2)], contract_axes=[(3,2)], remaining=[(2,2)]:
-/// - Outer loop: {2:0}, {2:1}
-/// - Inner loop: {3:0}, {3:1}
+/// - outer loop: {2:0}, {2:1}
+/// - inner loop: {3:0}, {3:1}
 /// - Merged indices: {2:0,3:0}=0, {2:0,3:1}=1, {2:1,3:0}=2, {2:1,3:1}=3
 /// - Result: [0, 1, 2, 3]
 fn contract_gep_indices(

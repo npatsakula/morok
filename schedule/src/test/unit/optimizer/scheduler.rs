@@ -517,7 +517,7 @@ fn test_shift_to_division_error() {
 }
 
 #[test]
-fn test_shift_to_tc_symbolic_exact_division() {
+fn test_shift_to_symbolic_exact_division() {
     // Range end is symbolic but exactly divisible by 2: V * 2.
     let v = UOp::define_var("V".to_string(), 1, 64);
     let two = UOp::index_const(2);
@@ -530,8 +530,8 @@ fn test_shift_to_tc_symbolic_exact_division() {
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    let result = scheduler.shift_to_tc_symbolic(r_global, 2, AxisType::Upcast, false, None);
-    assert!(result.is_ok(), "TC symbolic split should succeed for V*2 / 2");
+    let result = scheduler.shift_to(r_global, 2, AxisType::Upcast, false, None);
+    assert!(result.is_ok(), "symbolic split should succeed for V*2 / 2");
 
     let (replaced_rng, _new_rng) = result.unwrap();
     if let Op::Range { end, .. } = replaced_rng.op() {
@@ -544,7 +544,7 @@ fn test_shift_to_tc_symbolic_exact_division() {
 }
 
 #[test]
-fn test_shift_to_tc_symbolic_non_divisible_error() {
+fn test_shift_to_symbolic_non_divisible_error() {
     // Range end is symbolic and not provably divisible by 2: V * 3.
     let v = UOp::define_var("V".to_string(), 1, 64);
     let three = UOp::index_const(3);
@@ -557,7 +557,7 @@ fn test_shift_to_tc_symbolic_non_divisible_error() {
     let ren = Renderer::cpu();
     let mut scheduler = Scheduler::new(sink, ren);
 
-    let result = scheduler.shift_to_tc_symbolic(r_global, 2, AxisType::Upcast, false, None);
+    let result = scheduler.shift_to(r_global, 2, AxisType::Upcast, false, None);
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), OptError::SymbolicDivisionError { .. }));
 }
@@ -1517,7 +1517,7 @@ fn test_apply_threading_heuristic_loop() {
     use crate::optimizer::heuristics::apply_threading;
 
     // Create a kernel with Loop axis
-    // NOTE: Tinygrad requires at least 128K (131072) ops per thread
+    // NOTE: requires at least 128K (131072) ops per thread.
     // For 2 threads: need at least 2 * 131072 = 262144 elements
     // Use 2 threads with 262144 elements (exactly the minimum)
     let end = UOp::index_const(262144);
@@ -1538,29 +1538,9 @@ fn test_apply_threading_heuristic_loop() {
     assert!(!thread_axes.is_empty(), "Should have Thread axis after apply_threading");
 }
 
-#[test]
-fn test_apply_threading_heuristic_outer_not_threaded() {
-    use crate::optimizer::heuristics::apply_threading;
-
-    // NOTE: Tinygrad only threads LOOP axes, not Outer axes
-    // This test verifies that Outer axes are NOT threaded
-    let end_512 = UOp::index_const(524288); // 512K elements
-    let r_outer = UOp::range_axis(end_512, AxisId::Renumbered(0), AxisType::Outer);
-
-    let compute = UOp::native_const(1.0f32);
-    let sink = UOp::sink(vec![compute, r_outer]);
-
-    let ren = Renderer::cpu();
-    let mut scheduler = Scheduler::new(sink, ren);
-
-    // Apply threading heuristic - should NOT work on Outer axes
-    let applied = apply_threading(&mut scheduler, 2);
-    assert!(!applied, "apply_threading should NOT succeed on Outer axis (only Loop axes are threaded)");
-
-    // Verify NO Thread axis was created
-    let thread_axes = scheduler.axes_of(&[AxisType::Thread]);
-    assert!(thread_axes.is_empty(), "Should NOT have Thread axis for Outer");
-}
+// (`test_apply_threading_heuristic_outer_not_threaded` was deleted along with
+// the AxisType::Outer enum variant — after the OUTER→LOOP migration,
+// Outer no longer exists and this test path is unreachable.)
 
 #[test]
 fn test_apply_threading_heuristic_symbolic_work_and_divisibility() {

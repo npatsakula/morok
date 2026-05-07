@@ -1,7 +1,7 @@
 //! Test helpers for devectorize.rs tests.
 //!
 //! Provides builders for creating test UOps and assertion helpers.
-//! Mirrors Tinygrad's test patterns for memory access operations.
+//! Test patterns for memory access operations.
 
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ use crate::devectorize::{
     bool_storage_patterns, correct_load_store_patterns, devectorize, load_store_folding_patterns,
     load_store_indexing_patterns, no_vectorized_alu, pm_render,
 };
+use crate::optimizer::Renderer;
 use crate::rewrite::graph_rewrite;
 
 // =============================================================================
@@ -22,10 +23,10 @@ use crate::rewrite::graph_rewrite;
 
 /// Apply full devectorize pass to a UOp.
 ///
-/// Now uses single-pass rewriting (aligned with Tinygrad), followed by pm_render
+/// Single-pass rewriting followed by pm_render
 /// to convert CAT to VECTORIZE for rendering.
 pub fn apply_devectorize(uop: &Arc<UOp>) -> Arc<UOp> {
-    let devectorized = devectorize(uop);
+    let devectorized = devectorize(uop, &Renderer::cpu());
     // Also run pm_render to convert CAT to VECTORIZE (required for codegen)
     graph_rewrite(pm_render(), devectorized, &mut ())
 }
@@ -41,7 +42,7 @@ pub fn apply_load_store_folding(uop: &Arc<UOp>) -> Arc<UOp> {
 ///
 /// Includes: split_load, split_store (CAST(INDEX) patterns).
 pub fn apply_correct_load_store(uop: &Arc<UOp>) -> Arc<UOp> {
-    graph_rewrite(correct_load_store_patterns(), uop.clone(), &mut ())
+    graph_rewrite(correct_load_store_patterns(), uop.clone(), &mut Renderer::cpu())
 }
 
 /// Apply bool storage patterns only.
@@ -124,14 +125,14 @@ pub fn create_index(buffer: Arc<UOp>, idx: i64) -> Arc<UOp> {
 /// Create a vector INDEX with iota pattern: [0, 1, 2, ..., count-1].
 ///
 /// Creates INDEX(VECTORIZE([def, def, ...]), VECTORIZE([0, 1, ..., count-1]))
-/// which matches Tinygrad's expand_index pattern (devectorizer.py:115).
+/// matching the expand_index pattern.
 pub fn create_vector_index_iota(buffer: Arc<UOp>, count: usize) -> Arc<UOp> {
     let indices: SmallVec<[Arc<UOp>; 4]> =
         (0..count).map(|i| UOp::const_(DType::Index, ConstValue::Int(i as i64))).collect();
     let vec_idx = UOp::vectorize(indices);
     let idx_dtype = buffer.dtype().base();
 
-    // Wrap buffer in VECTORIZE to match Tinygrad's expand_index pattern:
+    // Wrap buffer in VECTORIZE to match the expand_index pattern:
     // INDEX(VECTORIZE(Defines.or_after()), vec_idx)
     let define = buffer_to_define(&buffer);
     let buf_vec = define.broadcast(count);

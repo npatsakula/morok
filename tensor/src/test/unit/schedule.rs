@@ -1,12 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use morok_device::Buffer;
 use morok_ir::{AxisId, AxisType, CallInfo, DType, DeviceSpec, Op, UOp};
 use smallvec::SmallVec;
 
 use crate::schedule::{
-    BoundRangeRef, InputBuffers, LinearSchedOp, PreSchedule, PreScheduleItem, ScheduleItem, create_schedule,
-    instantiate_schedule,
+    InputBuffers, KernelInvocation, PreSchedule, PreScheduleItem, ScheduleItem, create_schedule, instantiate_schedule,
 };
 
 fn cpu_buffer(numel: usize) -> Buffer {
@@ -34,6 +33,7 @@ fn test_schedule_item_creation() {
         buffers: vec![],
         buffer_uop_ids: vec![],
         fixedvars: HashMap::new(),
+        loop_var_names: HashSet::new(),
         dependencies: vec![],
         instance_dependencies: vec![],
         alias_registered_ids: vec![],
@@ -207,7 +207,7 @@ fn test_create_schedule_preserves_call_arg_order() {
 #[test]
 fn test_create_schedule_unrolls_call_bound_ranges() {
     let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let outer_range = UOp::range_axis(UOp::index_const(3), morok_ir::AxisId::Renumbered(0), morok_ir::AxisType::Outer);
+    let outer_range = UOp::range_axis(UOp::index_const(3), morok_ir::AxisId::Renumbered(0), morok_ir::AxisType::Loop);
     let bind = UOp::define_var("outer_i".to_string(), 0, 2).bind(outer_range.clone());
     let body = UOp::sink(vec![UOp::native_const(1.0f32)]);
     let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone(), bind]), CallInfo::default());
@@ -482,9 +482,14 @@ fn test_create_schedule_nested_after_mstack_mselect_dependencies_consistent() {
 }
 
 #[test]
-fn test_create_schedule_rejects_outer_range_missing_end() {
+fn test_create_schedule_treats_unended_bound_range_as_runtime_bind() {
+    // After the schedule-level Range/End refactor, schedule-level wrappers are
+    // identified structurally: a Range is a loop only if it appears in an
+    // `END(Call)`. A Bind whose value is a Range with no paired END is a
+    // runtime variable bind (e.g. JIT variable), not a schedule loop — this
+    // — the schedule has no public Range concept after eager unroll.
     let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let outer_range = UOp::range_outer_const(3, 0);
+    let outer_range = UOp::range_const(3, 0);
     let bind = UOp::define_var("outer_i".to_string(), 0, 2).bind(outer_range);
     let body = UOp::sink(vec![UOp::native_const(1.0f32)]);
     let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone(), bind]), CallInfo::default());
@@ -493,11 +498,11 @@ fn test_create_schedule_rejects_outer_range_missing_end() {
     let mut input_buffers = InputBuffers::new();
     input_buffers.insert(buffer_uop.id, cpu_buffer(4));
 
-    let err = match create_schedule(transformed, &input_buffers, &HashMap::new()) {
-        Ok(_) => panic!("outer RANGE without END should fail"),
-        Err(err) => err,
-    };
-    assert_ir_construction_error_contains(err, "missing END in strict scheduler");
+    let result = create_schedule(transformed, &input_buffers, &HashMap::new()).expect("schedule should succeed");
+    // Single CALL with no enclosing schedule loop → exactly one ScheduleItem.
+    assert_eq!(result.items.len(), 1);
+    // The Range-bound variable is a runtime bind, so no fixedvars are emitted.
+    assert!(result.items[0].fixedvars.is_empty());
 }
 
 #[test]
@@ -507,7 +512,7 @@ fn test_create_schedule_rejects_non_concrete_outer_range_bounds() {
         Op::Range {
             end: UOp::native_const(3.0f32),
             axis_id: AxisId::Renumbered(0),
-            axis_type: AxisType::Outer,
+            axis_type: AxisType::Loop,
             deps: SmallVec::new(),
         },
         DType::Float32,
@@ -525,78 +530,16 @@ fn test_create_schedule_rejects_non_concrete_outer_range_bounds() {
         Ok(_) => panic!("non-concrete OUTER RANGE bounds should fail"),
         Err(err) => err,
     };
-    assert_ir_construction_error_contains(err, "OUTER RANGE vmax must be concrete integer");
+    assert_ir_construction_error_contains(err, "schedule range vmax must be concrete integer");
 }
 
 #[test]
-fn test_instantiate_schedule_rejects_bound_range_missing_from_linear_schedule() {
-    let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let body = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone()]), CallInfo::default());
-
-    let declared_range = UOp::range_outer_const(1, 0);
-    let missing_range = UOp::range_outer_const(1, 1);
-    let pre_schedule = PreSchedule {
-        items: vec![PreScheduleItem {
-            kernel: call.clone(),
-            ast: body,
-            sources: vec![buffer_uop.clone()],
-            dependencies: vec![],
-            bound_ranges: vec![BoundRangeRef { var_name: "outer_i".to_string(), range_uop: missing_range }],
-        }],
-        linear_ops: vec![
-            LinearSchedOp::Range { range: declared_range.clone() },
-            LinearSchedOp::Call { kernel_id: call.id },
-            LinearSchedOp::End { range: declared_range, kernel_id: call.id },
-        ],
-        output_buffer_uops: vec![buffer_uop.clone()],
-    };
-
-    let mut input_buffers = InputBuffers::new();
-    input_buffers.insert(buffer_uop.id, cpu_buffer(4));
-
-    let err = match instantiate_schedule(&pre_schedule, &input_buffers, &HashMap::new()) {
-        Ok(_) => panic!("bound range missing from linear schedule should fail"),
-        Err(err) => err,
-    };
-    assert_ir_construction_error_contains(err, "missing from linear schedule");
-}
-
-#[test]
-fn test_instantiate_schedule_rejects_inactive_outer_range_binding() {
-    let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let body = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone()]), CallInfo::default());
-
-    let outer_range = UOp::range_outer_const(2, 0);
-    let pre_schedule = PreSchedule {
-        items: vec![PreScheduleItem {
-            kernel: call.clone(),
-            ast: body,
-            sources: vec![buffer_uop.clone()],
-            dependencies: vec![],
-            bound_ranges: vec![BoundRangeRef { var_name: "outer_i".to_string(), range_uop: outer_range.clone() }],
-        }],
-        linear_ops: vec![
-            LinearSchedOp::Call { kernel_id: call.id },
-            LinearSchedOp::Range { range: outer_range.clone() },
-            LinearSchedOp::End { range: outer_range, kernel_id: call.id },
-        ],
-        output_buffer_uops: vec![buffer_uop.clone()],
-    };
-
-    let mut input_buffers = InputBuffers::new();
-    input_buffers.insert(buffer_uop.id, cpu_buffer(4));
-
-    let err = match instantiate_schedule(&pre_schedule, &input_buffers, &HashMap::new()) {
-        Ok(_) => panic!("inactive OUTER RANGE binding should fail"),
-        Err(err) => err,
-    };
-    assert_ir_construction_error_contains(err, "references inactive OUTER RANGE");
-}
-
-#[test]
-fn test_instantiate_schedule_rejects_unknown_kernel_id_in_linear_call() {
+fn test_instantiate_schedule_rejects_invocation_with_unknown_kernel_id() {
+    // After the schedule-level Range/End refactor, validation that previously
+    // ran at instantiation now runs at PreSchedule construction. The only
+    // remaining error path in `instantiate_schedule` is an `invocation` whose
+    // `kernel_id` doesn't match any item template — exercise it here with a
+    // fabricated `PreSchedule`.
     let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
     let body = UOp::sink(vec![UOp::native_const(1.0f32)]);
     let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone()]), CallInfo::default());
@@ -609,7 +552,7 @@ fn test_instantiate_schedule_rejects_unknown_kernel_id_in_linear_call() {
             dependencies: vec![],
             bound_ranges: vec![],
         }],
-        linear_ops: vec![LinearSchedOp::Call { kernel_id: u64::MAX - 1 }],
+        invocations: vec![KernelInvocation { kernel_id: u64::MAX - 1, fixedvars: HashMap::new() }],
         output_buffer_uops: vec![buffer_uop.clone()],
     };
 
@@ -617,40 +560,8 @@ fn test_instantiate_schedule_rejects_unknown_kernel_id_in_linear_call() {
     input_buffers.insert(buffer_uop.id, cpu_buffer(4));
 
     let err = match instantiate_schedule(&pre_schedule, &input_buffers, &HashMap::new()) {
-        Ok(_) => panic!("linear CALL with unknown kernel id should fail"),
+        Ok(_) => panic!("invocation with unknown kernel id should fail"),
         Err(err) => err,
     };
-    assert_ir_construction_error_contains(err, "linear CALL references unknown kernel id");
-}
-
-#[test]
-fn test_instantiate_schedule_rejects_unknown_kernel_id_in_linear_end() {
-    let buffer_uop = UOp::new_buffer(DeviceSpec::Cpu, 4, DType::Float32);
-    let body = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let call = body.call(SmallVec::from_vec(vec![buffer_uop.clone()]), CallInfo::default());
-
-    let outer_range = UOp::range_outer_const(1, 0);
-    let pre_schedule = PreSchedule {
-        items: vec![PreScheduleItem {
-            kernel: call,
-            ast: body,
-            sources: vec![buffer_uop.clone()],
-            dependencies: vec![],
-            bound_ranges: vec![],
-        }],
-        linear_ops: vec![
-            LinearSchedOp::Range { range: outer_range.clone() },
-            LinearSchedOp::End { range: outer_range, kernel_id: u64::MAX - 2 },
-        ],
-        output_buffer_uops: vec![buffer_uop.clone()],
-    };
-
-    let mut input_buffers = InputBuffers::new();
-    input_buffers.insert(buffer_uop.id, cpu_buffer(4));
-
-    let err = match instantiate_schedule(&pre_schedule, &input_buffers, &HashMap::new()) {
-        Ok(_) => panic!("linear END with unknown kernel id should fail"),
-        Err(err) => err,
-    };
-    assert_ir_construction_error_contains(err, "linear END references unknown CALL id");
+    assert_ir_construction_error_contains(err, "invocation references unknown kernel id");
 }

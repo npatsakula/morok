@@ -60,10 +60,11 @@ pub use passes::{build_linear_index, compute_row_major_strides, count_divmod, ex
 
 // Re-export optimizer entry points
 pub use optimizer::{
-    BeamConfig, BeamResult, HeuristicsConfig, OptError, OptStrategy, OptimizerConfig, Renderer as OptimizerRenderer,
-    Scheduler, TcOptLevel, TcSelect, TcUsage, apply_post_optimization, apply_post_optimization_with_renderer,
-    beam_search_cached, hand_coded_optimizations, optimize_kernel, optimize_kernel_with_config,
-    optimize_kernel_with_strategy, prepare_scheduler,
+    BeamConfig, BeamResult, CandidateMetrics, HeuristicsConfig, OptError, OptStrategy, OptimizerConfig,
+    Renderer as OptimizerRenderer, Scheduler, TcOptLevel, TcSelect, TcUsage, apply_post_optimization,
+    apply_post_optimization_with_renderer, beam_search_cached, compute_ops_estimate, hand_coded_optimizations,
+    hash_post_codegen_ir, optimize_kernel, optimize_kernel_with_config, optimize_kernel_with_strategy,
+    prepare_scheduler,
 };
 
 // Re-export UOp for macro usage

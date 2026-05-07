@@ -84,7 +84,7 @@ fn test_renumber_range_loop_no_bind() {
     // Apply pattern via matcher
     let result = apply_patterns(&range, &mut ctx);
 
-    // LOOP ranges should be renumbered without BIND wrapper (Tinygrad approach)
+    // LOOP ranges should be renumbered without BIND wrapper.
     // Codegen creates loops directly from RANGE ops
     let op = result.expect("Expected Some result");
     if let Op::Range { axis_id, axis_type, .. } = op.op() {
@@ -261,9 +261,9 @@ fn test_renumber_range_different_axis_types() {
     let end = UOp::index_const(10);
 
     // Test axis types with unrenumbered axis_ids
-    // All axis types now return plain Range without BIND wrapper (Tinygrad approach)
+    // All axis types now return plain Range without BIND wrapper.
     // Codegen creates loops directly from RANGE ops
-    for (i, axis_type) in [AxisType::Loop, AxisType::Reduce, AxisType::Outer].iter().enumerate() {
+    for (i, axis_type) in [AxisType::Loop, AxisType::Reduce].iter().enumerate() {
         let range = UOp::range_axis(end.clone(), AxisId::Unrenumbered(i), *axis_type);
 
         let result = apply_patterns(&range, &mut ctx);
@@ -394,7 +394,7 @@ fn test_renumber_range_sequential() {
     let mut ctx = RangeifyBufferContext::new();
 
     // Create ranges with unrenumbered axis_ids
-    // All axis types now return plain Range without BIND wrapper (Tinygrad approach)
+    // All axis types now return plain Range without BIND wrapper.
     let range0 = UOp::range_axis(UOp::index_const(10), AxisId::Unrenumbered(0), AxisType::Loop);
     let range1 = UOp::range_axis(UOp::index_const(20), AxisId::Unrenumbered(1), AxisType::Loop);
     let range2 = UOp::range_axis(UOp::index_const(30), AxisId::Unrenumbered(2), AxisType::Reduce);
@@ -523,7 +523,7 @@ fn test_pattern_composition_sequence() {
 fn test_pattern_composition_sequence_no_bind() {
     let mut ctx = RangeifyBufferContext::new();
 
-    // Test that LOOP ranges return plain Range (no BIND wrapper, Tinygrad approach)
+    // Test that LOOP ranges return plain Range (no BIND wrapper).
     let range_unnum = UOp::range_axis(UOp::index_const(15), AxisId::Unrenumbered(7), AxisType::Loop);
 
     // Apply pattern

@@ -70,7 +70,7 @@ fn test_devectorize_sink_noop() {
 
     let result = apply_devectorize(&sink);
 
-    // NOOP is dropped from SINK by sym_phase3_patterns (Tinygrad sym lines 422-424)
+    // NOOP is dropped from SINK by sym_phase3_patterns.
     match result.op() {
         Op::Sink { sources, .. } => {
             assert_eq!(sources.len(), 0, "NOOP should be dropped from SINK");
@@ -201,7 +201,7 @@ fn test_devectorize_mixed_addrspaces() {
 fn test_devectorize_very_large_vector() {
     let buffer = create_buffer(512);
 
-    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match the expand_index pattern.
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::param(def_id, 512, buffer.dtype(), None);
@@ -229,7 +229,7 @@ fn test_devectorize_very_large_vector() {
 fn test_devectorize_vec32() {
     let buffer = create_buffer(256);
 
-    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match the expand_index pattern.
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(11000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::param(def_id, 256, buffer.dtype(), None);
@@ -274,7 +274,7 @@ fn test_devectorize_unaligned_access() {
 fn test_devectorize_vec3() {
     let buffer = create_buffer(64);
 
-    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match the expand_index pattern.
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(12000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::param(def_id, 64, buffer.dtype(), None);
@@ -300,7 +300,7 @@ fn test_devectorize_vec3() {
 fn test_devectorize_vec5() {
     let buffer = create_buffer(64);
 
-    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match the expand_index pattern.
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(13000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::param(def_id, 64, buffer.dtype(), None);
@@ -586,7 +586,7 @@ fn test_scatternd_ptrcat_elimination() {
     let outer_where = UOp::try_where(cond, inner_where, load).unwrap();
 
     let store = store_idx.store_with_ranges(outer_where, smallvec::smallvec![r1]);
-    let result = devectorize(&UOp::sink(vec![store]));
+    let result = devectorize(&UOp::sink(vec![store]), &crate::optimizer::Renderer::cpu());
 
     let has_ptrcat = result.toposort().iter().any(|n| matches!(n.op(), Op::PtrCat { .. }));
     assert!(!has_ptrcat, "PTR_CAT survived devectorize! Result:\n{}", result.tree());

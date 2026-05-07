@@ -23,9 +23,11 @@ pub fn fold_divmod_congruence(x: &Arc<UOp>, c_uop: &Arc<UOp>, c_val: ConstValue,
 
     // Decompose: x = sum(factor_i * term_i) + k
     let (x_no_const, k_cv) = x.pop_const(BinaryOp::Add);
+    // `pop_const` returns the ADD identity (`Int(0)`) when no const is
+    // present, so the `Int` branch covers both "real const" and "no const"
+    // uniformly. Non-int dtypes (e.g. float) skip the fold.
     let k = match k_cv {
-        Some(ConstValue::Int(v)) => v,
-        None => 0,
+        ConstValue::Int(v) => v,
         _ => return None,
     };
     let uops: Vec<_> = x_no_const.split_uop(BinaryOp::Add);
@@ -36,7 +38,7 @@ pub fn fold_divmod_congruence(x: &Arc<UOp>, c_uop: &Arc<UOp>, c_val: ConstValue,
             if f == 0 {
                 return None;
             }
-            Some((u.divides_int(f)?, f))
+            Some((u.divides(f)?, f))
         })
         .collect();
     let decomp = decomp?;
@@ -218,11 +220,11 @@ pub(crate) fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> O
         }
     }
 
-    // Peel constant from x
+    // Peel constant from x. `pop_const` substitutes the ADD identity
+    // (`Int(0)`) when no const is present — see helpers.rs:pop_const.
     let (x_peeled, pop_const) = x.pop_const(BinaryOp::Add);
     let const_val = match pop_const {
-        Some(ConstValue::Int(v)) => v,
-        None => 0,
+        ConstValue::Int(v) => v,
         _ => return None,
     };
     let uops_no_const = x_peeled.split_uop(BinaryOp::Add);
@@ -239,7 +241,7 @@ pub(crate) fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> O
             let mut changed = false;
             for u in &uops_no_const {
                 if let Op::Binary(BinaryOp::Mod, inner_x, inner_y) = u.op()
-                    && inner_y.divides_int(c).is_some()
+                    && inner_y.divides(c).is_some()
                 {
                     new_xs.push(Arc::clone(inner_x));
                     changed = true;
@@ -265,7 +267,7 @@ pub(crate) fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> O
             .iter()
             .map(|u| {
                 let f = u.const_factor();
-                u.divides_int(f).map(|t| (t, f))
+                u.divides(f).map(|t| (t, f))
             })
             .collect();
         let decomp = decomp?;
@@ -402,7 +404,7 @@ pub(crate) fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> O
                 let div = div.min(c as u64) as i64;
                 if div > 1
                     && div < c
-                    && let Some(inner) = x.divides_int(div)
+                    && let Some(inner) = x.divides(div)
                 {
                     let remaining = c / div;
                     if let Some(result) = fold_divmod_general(BinaryOp::Idiv, &inner, &x.const_like(remaining)) {
@@ -462,7 +464,7 @@ pub(crate) fn fold_divmod_general(op: BinaryOp, x: &Arc<UOp>, y: &Arc<UOp>) -> O
         {
             let cf = u.const_factor();
             if cf.rem_euclid(y_arg) != cf {
-                let reduced = u.divides_int(cf)?.try_mul(&u.const_like(cf.rem_euclid(y_arg))).ok()?;
+                let reduced = u.divides(cf)?.try_mul(&u.const_like(cf.rem_euclid(y_arg))).ok()?;
                 rem.push(reduced);
                 quo.push(u.const_like(0i64));
             } else {

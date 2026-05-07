@@ -1032,15 +1032,21 @@ pub fn advanced_division_dsl_patterns() -> &'static TypedPatternMatcher {
             a.idiv(&UOp::const_(b.dtype(), mul))
         },
         // expr // divisor → expr.divides(divisor) (generic exact division)
-        Idiv(expr, divisor @ @const) => expr.divides(divisor),
+        Idiv(expr, _divisor @const(d_val)) => d_val.try_int().and_then(|d| expr.divides(d)),
         // Decomposes x into sum(factor_i * term_i) + const, computes centered remainders,
         // and folds if the remainder range fits in one bucket (rem.vmin//c == rem.vmax//c).
         Mod(x, c @const(c_val)) => crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, true),
         Idiv(x, c @const(c_val)) => crate::symbolic::divmod::fold_divmod_congruence(x, c, c_val, false),
         // (a + b) // c → (a // c) + (b // c) when both divide evenly
-        Idiv(Add(a, b), c @ @const) => Some(a.divides(c)?.add(&b.divides(c)?)),
+        Idiv(Add(a, b), _c @const(c_val)) => {
+            let d = c_val.try_int()?;
+            Some(a.divides(d)?.add(&b.divides(d)?))
+        },
         // (a - b) // c → (a // c) - (b // c) when both divide evenly
-        Idiv(Sub(a, b), c @ @const) => Some(a.divides(c)?.sub(&b.divides(c)?)),
+        Idiv(Sub(a, b), _c @const(c_val)) => {
+            let d = c_val.try_int()?;
+            Some(a.divides(d)?.sub(&b.divides(d)?))
+        },
         // y * (x + c) → y*x + y*c for index dtype
         // Only distributes when x is Index dtype to avoid float inf*0=nan issues.
         Mul[y @const(_yv), Add[x, c @const(_cv)]] if x.dtype() == DType::Index ~> y.mul(x).add(&y.mul(c)),
@@ -1699,7 +1705,7 @@ fn lt_folding(x: &Arc<UOp>, c_int: i64) -> Option<Arc<UOp>> {
     // Build the non-unit sum divided by d (Build non-unit sum divided by d
     let non_unit_terms: Vec<Arc<UOp>> = terms.iter().filter(|t| t.const_factor() != 1).cloned().collect();
     let non_unit_sum = super::divmod::uop_sum(&non_unit_terms, x);
-    let q = non_unit_sum.divides_int(d)?;
+    let q = non_unit_sum.divides(d)?;
 
     // Since d | c, use exact division (no ceiling needed)
     q.try_cmplt(&UOp::index_const(c_int / d)).ok()

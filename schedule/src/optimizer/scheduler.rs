@@ -157,7 +157,7 @@ impl Scheduler {
     /// to determine nesting order: lower priority types are outer loops.
     ///
     /// **Sorting order:**
-    /// - Primary: `axis_type.priority()` (Outer=-2, Loop=-1, Global=0, ..., Unroll=5)
+    /// - Primary: `axis_type.priority()` (Loop=-1, Global/Thread=0, Warp=1, Local/GroupReduce=2, Upcast=3, Reduce=4, Unroll=5)
     /// - Secondary: `axis_id` (ascending)
     ///
     /// # Returns
@@ -180,9 +180,8 @@ impl Scheduler {
     ///
     /// This is called lazily the first time `rngs()` is accessed.
     fn compute_rngs(&self) -> Vec<Arc<UOp>> {
-        // Collect all RANGE nodes via toposort
-        // Filter out size-1 ranges (where vmax == 0) to match Tinygrad's behavior
-        // This causes Global(1), Local(1), etc. axes to be excluded from rngs()
+        // Collect all RANGE nodes via toposort. Filter out size-1 ranges
+        // (where vmax == 0) so Global(1), Local(1), etc. axes are excluded.
         let mut ranges: Vec<Arc<UOp>> = self
             .ast
             .toposort()
@@ -334,13 +333,8 @@ impl Scheduler {
     ///
     /// Product of all UPCAST and UNROLL dimension sizes, or 1 if none exist.
     ///
-    /// # Note
-    ///
-    /// This matches Tinygrad's `upcast_size()` which computes:
-    /// `prod(self.full_shape[a] for a in self.axes_of(AxisType.UPCAST, AxisType.UNROLL))`
-    ///
-    /// Used as a generic guard to prevent exponential vector width growth from
-    /// multiple unroll sources (K-vectorization, output-upcast, general unrolling).
+    /// Used as a guard to prevent exponential vector width growth from multiple
+    /// unroll sources (K-vectorization, output-upcast, general unrolling).
     pub fn upcast_size(&self) -> usize {
         self.rngs()
             .iter()
@@ -433,8 +427,8 @@ impl Scheduler {
 
     /// Get indices of axes that can be upcasted (vectorized).
     ///
-    /// Upcastable axes are GLOBAL, LOCAL, or LOOP axes with size > 1.
-    /// Note: OUTER is excluded per Tinygrad's design - it's for schedule expansion, not vectorization.
+    /// Upcastable axes are GLOBAL, LOCAL, or LOOP axes with size > 1. REDUCE
+    /// axes use UNROLL instead.
     ///
     /// # Returns
     ///
@@ -445,9 +439,6 @@ impl Scheduler {
             .enumerate()
             .filter_map(|(i, rng)| {
                 if let Op::Range { axis_type, end, .. } = rng.op() {
-                    // Check type: GLOBAL/LOCAL/LOOP are upcastable
-                    // (OUTER should be converted to LOOP via convert_outer_to_loop before upcasting)
-                    // (REDUCE axes should use UNROLL instead, not UPCAST)
                     if !matches!(axis_type, AxisType::Global | AxisType::Local | AxisType::Loop) {
                         return None;
                     }
@@ -569,7 +560,6 @@ impl Scheduler {
     /// Get a colored string representation of the kernel shape.
     ///
     /// Each axis is represented by its type letter and size:
-    /// - Outer: 'O'
     /// - Loop: 'L'
     /// - Global: 'g'
     /// - Thread: 't'
@@ -658,11 +648,14 @@ impl Scheduler {
     ///
     /// # Algorithm
     ///
-    /// 1. **Validate divisibility:** Check that `rng.size()` is divisible by `amount`
-    /// 2. **Create new range:** Either use `input_new_rng` or create one with `new_type`
-    /// 3. **Create reduced old range:** Replace size with `old_sz = size / amount`
+    /// 1. **Validate divisibility:** compute the symbolic quotient `old_end =
+    ///    rng.end / amount` via [`UOp::divides`]. Const sizes resolve to
+    ///    smaller consts; symbolic sizes (e.g. `T * 4`) keep the symbolic
+    ///    factor in the quotient.
+    /// 2. **Create new range:** either use `input_new_rng` or create one with `new_type`
+    /// 3. **Create reduced old range:** with `old_end` (possibly symbolic) as its size
     /// 4. **Compute substitution:**
-    ///    - If `top=true`: `new_rng * old_sz + replaced_rng` (new varies faster)
+    ///    - If `top=true`: `new_rng * old_end + replaced_rng` (new varies faster)
     ///    - If `top=false`: `replaced_rng * amount + new_rng` (old varies faster)
     /// 5. **Substitute** in AST and clear caches
     /// 6. **Return** both ranges for further transformations
@@ -681,7 +674,8 @@ impl Scheduler {
     ///
     /// # Errors
     ///
-    /// Returns `OptError::DivisionError` if `amount` doesn't divide `rng.size()` evenly.
+    /// Returns [`OptError::Division`] / [`OptError::SymbolicDivision`] if
+    /// `amount` cannot be proved to divide `rng.end`.
     ///
     /// # Examples
     ///
@@ -708,99 +702,12 @@ impl Scheduler {
         use morok_ir::{ConstValue, UOpKey};
         use std::collections::HashMap;
 
-        // 1. Validate divisibility
-        let old_sz = rng.divisible_by(amount).ok_or_else(|| {
-            // Provide structured error based on size type
-            if let Op::Range { end, .. } = rng.op() {
-                if let Op::Const(cv) = end.op()
-                    && let ConstValue::Int(sz) = cv.0
-                {
-                    DivisionSnafu { size: sz as usize, amount }.build()
-                } else {
-                    SymbolicDivisionSnafu { amount }.build()
-                }
-            } else {
-                ExpectedRangeOperationSnafu.build()
-            }
-        })?;
-
-        // 2. Create new range
-        let new_rng = input_new_rng.unwrap_or_else(|| {
-            let end = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
-            UOp::range_axis(end, AxisId::Renumbered(self.maxarg() + 1), new_type)
-        });
-
-        // 3. Create reduced old range (same axis_id and type, but smaller size)
-        let replaced_rng = if let Op::Range { axis_id, axis_type, .. } = rng.op() {
-            let new_end = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(old_sz as i64));
-            UOp::range_axis(new_end, *axis_id, *axis_type)
-        } else {
-            return ExpectedRangeOperationSnafu.fail();
-        };
-
-        // 4. Compute substitution expression
-        let sub_axis = if top {
-            // Top order: new varies faster
-            // Example: [0,8,16,24, 1,9,17,25, ...]
-            let old_sz_uop = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(old_sz as i64));
-            new_rng
-                .try_mul(&old_sz_uop)
-                .expect("Multiplication should not fail for index types")
-                .try_add(&replaced_rng)
-                .expect("Addition should not fail for index types")
-        } else {
-            // Bottom order: old varies faster
-            // Example: [0,1,2,3, 4,5,6,7, 8,9,10,11, ...]
-            let amount_uop = UOp::const_(morok_dtype::DType::Index, ConstValue::Int(amount as i64));
-            replaced_rng
-                .try_mul(&amount_uop)
-                .expect("Multiplication should not fail for index types")
-                .try_add(&new_rng)
-                .expect("Addition should not fail for index types")
-        };
-
-        // 5. Perform substitution
-        #[allow(clippy::mutable_key_type)] // UOpKey uses stable ID for Hash/Eq (safe)
-        let mut subst_map = HashMap::new();
-        subst_map.insert(UOpKey(rng), sub_axis);
-
-        let old_ast_id = self.ast.id;
-        self.ast = self.ast.substitute(&subst_map);
-
-        // Record high-level transformation
-        if old_ast_id != self.ast.id {
-            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ShiftTo);
-            });
-        }
-
-        // Clear caches (maxarg will be recomputed on next access)
-        self.clear_caches();
-
-        // 6. Return both ranges
-        Ok((replaced_rng, new_rng))
-    }
-
-    /// TC-specific variant of `shift_to` that allows symbolic exact division.
-    ///
-    /// Unlike `shift_to`, which requires a concrete quotient size, this method
-    /// computes the reduced range end as a symbolic expression using exact
-    /// divisibility (`end.divides_int(amount)`), matching Tinygrad TC behavior.
-    pub(crate) fn shift_to_tc_symbolic(
-        &mut self,
-        rng: Arc<UOp>,
-        amount: usize,
-        new_type: AxisType,
-        top: bool,
-        input_new_rng: Option<Arc<UOp>>,
-    ) -> Result<(Arc<UOp>, Arc<UOp>), OptError> {
-        use morok_ir::{ConstValue, UOpKey};
-        use std::collections::HashMap;
-
-        // 1. Validate divisibility and compute symbolic quotient end
+        // 1. Validate divisibility and compute symbolic quotient end. When the
+        // axis size is symbolic (e.g. `T*4`), the quotient is a UOp (e.g. `T`)
+        // that must propagate through the substituted index expression — not a
+        // collapsed integer that drops the symbolic factor.
         let old_end = if let Op::Range { end, .. } = rng.op() {
-            end.divides_int(amount as i64).ok_or_else(|| {
+            end.divides(amount as i64).ok_or_else(|| {
                 if let Op::Const(cv) = end.op()
                     && let ConstValue::Int(sz) = cv.0
                 {
@@ -873,10 +780,8 @@ impl Scheduler {
 
     /// Get all ranges from output operations (excluding REDUCE axes).
     ///
-    /// Returns ranges that appear in output buffers. These are candidates for
+    /// Returns ranges that appear in output buffers — candidates for
     /// parallelization since they represent independent output elements.
-    ///
-    /// Based on Tinygrad's `_output_rngs()`.
     fn output_rngs(&self) -> Vec<Arc<UOp>> {
         // Find all STORE operations (outputs)
         let stores: Vec<_> = self
@@ -918,8 +823,6 @@ impl Scheduler {
     /// 2. It appears in all output operations (STORE nodes)
     ///
     /// This ensures parallelizing the range won't cause race conditions.
-    ///
-    /// Based on Tinygrad's `_globalizable_rngs()`.
     pub(crate) fn globalizable_rngs(&self) -> Vec<Arc<UOp>> {
         // Start with LOOP axes from outputs
         let mut candidates: Vec<_> = self
@@ -955,12 +858,8 @@ impl Scheduler {
 
     /// Convert eligible LOOP axes to GLOBAL for parallelization.
     ///
-    /// This is the initial transformation that identifies which loops can be
-    /// safely parallelized and converts them to GLOBAL (GPU thread) axes.
-    ///
-    /// Only applicable for GPU backends (has_local=true).
-    ///
-    /// Based on Tinygrad's `convert_loop_to_global()`.
+    /// Identifies which loops can be safely parallelized and converts them to
+    /// GLOBAL (GPU thread) axes. Only applicable for GPU backends (has_local=true).
     ///
     /// # Examples
     ///
@@ -1006,81 +905,6 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Convert OUTER axes to LOOP for CPU vectorization.
-    ///
-    /// For CPU backends (has_local=false), OUTER axes cannot be parallelized
-    /// externally but can be vectorized. Converting them to LOOP allows
-    /// the optimizer to apply UPCAST transformations for SIMD operations.
-    ///
-    /// **Important**: For reduce kernels, OUTER axes represent output dimensions
-    /// and should NOT be converted to LOOP. Converting them causes a vector width
-    /// mismatch in expand.rs when multiple UPCAST axes combine (16 vs 64).
-    ///
-    /// This is the CPU counterpart to `convert_loop_to_global()` for GPU.
-    pub fn convert_outer_to_loop(&mut self) -> Result<(), OptError> {
-        use tracing::debug;
-
-        // Only for CPU backends (no local memory = no GPU parallelization)
-        if self.ren.has_local {
-            debug!("convert_outer_to_loop: skipping (has_local=true)");
-            return Ok(());
-        }
-
-        // Don't convert OUTER→LOOP in reduce kernels.
-        // This would enable output tiling, but causes vector width mismatch (16 vs 64)
-        // when multiple UPCAST axes combine in expand.rs.
-        if self.reduceop().is_some() {
-            debug!("convert_outer_to_loop: skipping (has reduceop)");
-            return Ok(());
-        }
-
-        let all_rngs = self.rngs();
-        debug!(num_rngs = all_rngs.len(), "convert_outer_to_loop: checking rngs");
-        for (i, rng) in all_rngs.iter().enumerate() {
-            debug!(i, axis_type = ?rng.op(), "convert_outer_to_loop: rng");
-        }
-
-        let outer_rngs: Vec<_> = self
-            .rngs()
-            .iter()
-            .filter(|rng| matches!(rng.op(), Op::Range { axis_type: AxisType::Outer, .. }))
-            .cloned()
-            .collect();
-
-        debug!(num_outer = outer_rngs.len(), "convert_outer_to_loop: found outer ranges");
-
-        if outer_rngs.is_empty() {
-            debug!("convert_outer_to_loop: no outer ranges to convert");
-            return Ok(());
-        }
-
-        // Build substitution map: OUTER → LOOP
-        #[allow(clippy::mutable_key_type)]
-        let mut subst_map = std::collections::HashMap::new();
-        for rng in outer_rngs {
-            let new_rng = rng.with_axis_type(AxisType::Loop);
-            debug!("convert_outer_to_loop: converting {:?} -> {:?}", rng.op(), new_rng.op());
-            subst_map.insert(UOpKey(rng), new_rng);
-        }
-
-        // Apply substitution
-        let old_ast_id = self.ast.id;
-        self.ast = self.ast.substitute(&subst_map);
-        debug!(old_id = old_ast_id, new_id = self.ast.id, "convert_outer_to_loop: substitution complete");
-
-        // Record high-level transformation
-        if old_ast_id != self.ast.id {
-            use morok_ir::provenance::{PROVENANCE_TRACKER, PassName};
-            PROVENANCE_TRACKER.with(|tracker| {
-                tracker.borrow_mut().record_transform(self.ast.id, old_ast_id, PassName::ConvertOuterToLoop);
-            });
-        }
-
-        self.clear_caches();
-
-        Ok(())
-    }
-
     /// Get the optimized AST with kernel metadata attached.
     ///
     /// This is the final step of optimization, which:
@@ -1111,8 +935,7 @@ impl Scheduler {
             // Prefix: "r" for reduce, "E" for elementwise
             let prefix = if self.reduceop().is_some() { "r" } else { "E" };
 
-            // Encode each range: {letter}{size}
-            // Based on Tinygrad's axis_letters mapping
+            // Encode each range: {letter}{size}.
             let shape_parts: Vec<String> = self
                 .rngs()
                 .iter()
@@ -1138,7 +961,6 @@ impl Scheduler {
                             AxisType::Unroll => "r",
                             AxisType::Warp => "w",
                             AxisType::Thread => "t",
-                            AxisType::Outer => "O",
                             AxisType::Placeholder => "P",
                         };
 
@@ -1161,7 +983,7 @@ impl Scheduler {
             if *count > 1 { format!("{}n{}", name, *count - 1) } else { name }
         };
 
-        // 2. Flatten ranges (using top-down graph_rewrite matching Tinygrad's default)
+        // 2. Flatten ranges (top-down graph_rewrite default).
         let flattened_ast =
             crate::rewrite::graph_rewrite(crate::rangeify::pm_flatten_range(), self.ast.clone(), &mut ());
 

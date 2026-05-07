@@ -29,7 +29,7 @@ use crate::optimizer::Scheduler;
 pub fn create_simple_reduce(size: i64, reduce_op: ReduceOp) -> Arc<UOp> {
     use smallvec::smallvec;
 
-    let size_uop = UOp::native_const(size as i32 as i64);
+    let size_uop = UOp::index_const(size);
     // Use Reduce axis type for reduction dimensions
     let range = UOp::range_axis(size_uop, AxisId::Renumbered(0), AxisType::Reduce);
     let const_val = UOp::native_const(1.0f32);
@@ -67,13 +67,13 @@ pub fn create_reduce_with_globals(global_sizes: &[i64], reduce_size: i64, reduce
     // Create Global axes
     let mut all_axes = Vec::new();
     for (i, &size) in global_sizes.iter().enumerate() {
-        let size_uop = UOp::native_const(size as i32 as i64);
+        let size_uop = UOp::index_const(size);
         let axis = UOp::range_axis(size_uop, AxisId::Renumbered(i), AxisType::Global);
         all_axes.push(axis);
     }
 
     // Create Reduce axis
-    let reduce_size_uop = UOp::native_const(reduce_size as i32 as i64);
+    let reduce_size_uop = UOp::index_const(reduce_size);
     let reduce_axis = UOp::range_axis(reduce_size_uop, AxisId::Renumbered(global_sizes.len()), AxisType::Reduce);
 
     // Create reduction
@@ -117,9 +117,9 @@ pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Arc<UOp> {
     use smallvec::smallvec;
 
     // Create ranges for M, N, K dimensions
-    let m_uop = UOp::native_const(m as i32 as i64);
-    let n_uop = UOp::native_const(n as i32 as i64);
-    let k_uop = UOp::native_const(k as i32 as i64);
+    let m_uop = UOp::index_const(m);
+    let n_uop = UOp::index_const(n);
+    let k_uop = UOp::index_const(k);
 
     let m_range = UOp::range_axis(m_uop, AxisId::Renumbered(0), AxisType::Global);
     let n_range = UOp::range_axis(n_uop, AxisId::Renumbered(1), AxisType::Global);
@@ -159,8 +159,8 @@ pub fn create_matmul_pattern(m: i64, n: i64, k: i64) -> Arc<UOp> {
 pub fn create_double_reduce(size1: i64, size2: i64, reduce_op: ReduceOp) -> Arc<UOp> {
     use smallvec::smallvec;
 
-    let size1_uop = UOp::native_const(size1 as i32 as i64);
-    let size2_uop = UOp::native_const(size2 as i32 as i64);
+    let size1_uop = UOp::index_const(size1);
+    let size2_uop = UOp::index_const(size2);
 
     // Reduction axes should be marked as Reduce from the start
     let range1 = UOp::range_axis(size1_uop, AxisId::Renumbered(0), AxisType::Reduce);
@@ -209,7 +209,7 @@ pub fn create_double_reduce_with_globals(global_sizes: &[i64], reduce_sizes: &[i
     let mut axis_id = 0;
 
     for &size in global_sizes {
-        let size_uop = UOp::native_const(size as i32 as i64);
+        let size_uop = UOp::index_const(size);
         let axis = UOp::range_axis(size_uop, AxisId::Renumbered(axis_id), AxisType::Global);
         all_axes.push(axis);
         axis_id += 1;
@@ -218,7 +218,7 @@ pub fn create_double_reduce_with_globals(global_sizes: &[i64], reduce_sizes: &[i
     // Create Reduce axes
     let mut reduce_axes = smallvec![];
     for &size in reduce_sizes {
-        let size_uop = UOp::native_const(size as i32 as i64);
+        let size_uop = UOp::index_const(size);
         let axis = UOp::range_axis(size_uop, AxisId::Renumbered(axis_id), AxisType::Reduce);
         reduce_axes.push(axis);
         axis_id += 1;
@@ -256,7 +256,7 @@ pub fn create_elementwise_pattern(sizes: &[i64]) -> Arc<UOp> {
     let mut ops = vec![const_val];
 
     for (axis_id, &size) in sizes.iter().enumerate() {
-        let size_uop = UOp::native_const(size as i32 as i64);
+        let size_uop = UOp::index_const(size);
         let range = UOp::range_axis(size_uop, AxisId::Renumbered(axis_id), AxisType::Global);
         ops.push(range);
     }

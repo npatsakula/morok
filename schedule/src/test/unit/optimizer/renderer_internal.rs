@@ -1,9 +1,10 @@
 use super::*;
+use morok_ir::RendererDevice;
 
 #[test]
 fn test_renderer_cpu() {
     let r = Renderer::cpu();
-    assert_eq!(r.device, "CPU");
+    assert_eq!(r.device, RendererDevice::Cpu);
     assert!(!r.has_local);
     assert!(r.has_threads);
     assert_eq!(r.tensor_cores.len(), 0);
@@ -12,7 +13,7 @@ fn test_renderer_cpu() {
 #[test]
 fn test_renderer_cuda() {
     let r = Renderer::cuda();
-    assert_eq!(r.device, "CUDA_SM80"); // Default is SM80/Ampere
+    assert_eq!(r.device, RendererDevice::CudaSm80); // Default is SM80/Ampere
     assert!(r.has_local);
     assert!(r.has_shared);
     assert!(!r.has_threads);

@@ -22,16 +22,17 @@ fn matmul_flops(m: usize, k: usize, n: usize) -> u64 {
 }
 
 fn bench_matmul(c: &mut Criterion) {
-    // tracing_subscriber::fmt::init();
-
     let mut group = c.benchmark_group("matmul_optimization");
 
-    // Typed optimizer configurations (no environment variables needed)
+    // Typed optimizer configurations (no environment variables needed).
+    // Don't override thread_count — the default is `available_parallelism()`,
+    // matching the `renderer.global_max[0]` behavior on CPU.
     let heuristic_config: PrepareConfig = OptimizerConfig::builder()
         .strategy(OptStrategy::Heuristic)
-        .heuristics(HeuristicsConfig::builder().thread_count(4).build())
+        .heuristics(HeuristicsConfig::builder().build())
         .build()
         .into();
+
     const BEAM_WIDTH: usize = 4;
     let beam_config: PrepareConfig =
         OptimizerConfig::builder().strategy(OptStrategy::Beam { width: BEAM_WIDTH }).build().into();
@@ -70,8 +71,11 @@ fn bench_matmul(c: &mut Criterion) {
             // DEBUG: Print kernel info for beam
             eprintln!("\n=== BEAM (size={}) ===", size);
             eprintln!("Kernel count: {}", plan_b.kernels().count());
-            for (i, kernel) in plan_b.kernels().enumerate() {
-                eprintln!("  Kernel {}: {}", i, kernel.entry_point);
+            eprintln!("UOp tree:\n{}", result_h.uop().tree());
+            for (i, kernel) in plan_b.prepared_kernels().into_iter().enumerate() {
+                eprintln!("UOp tree:\n{}", kernel.ast.tree());
+                eprintln!("  Kernel {}: {}", i, kernel.kernel.entry_point);
+                eprintln!("{}", kernel.kernel.code);
             }
 
             group.bench_with_input(BenchmarkId::new(format!("beam_w{BEAM_WIDTH}"), size), &size, |bencher, _| {

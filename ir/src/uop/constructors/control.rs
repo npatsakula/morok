@@ -22,7 +22,23 @@ impl UOp {
     // =========================================================================
 
     /// Create a Range operation with specified axis type.
+    ///
+    /// `end` is coerced to `DType::Index` to keep range arithmetic
+    /// (`try_mul`/`try_add` in `shift_to`) on a uniform integer dtype. Const
+    /// inputs are rebuilt directly so structural pattern matches still see
+    /// `Op::Range { end: Op::Const(..) }` instead of a `Cast` wrapper.
     pub fn range_axis(end: Arc<Self>, axis_id: AxisId, axis_type: AxisType) -> Arc<Self> {
+        let end = if end.dtype() == DType::Index {
+            end
+        } else if let Op::Const(cv) = end.op() {
+            match cv.0 {
+                ConstValue::Int(v) => Self::const_(DType::Index, ConstValue::Int(v)),
+                ConstValue::UInt(v) => Self::const_(DType::Index, ConstValue::Int(v as i64)),
+                other => panic!("range_axis: Const end must be Int/UInt, got {other:?}"),
+            }
+        } else {
+            end.cast(DType::Index)
+        };
         Self::new(Op::Range { end, axis_id, axis_type, deps: SmallVec::new() }, DType::Index)
     }
 
@@ -40,15 +56,6 @@ impl UOp {
     pub fn range_const(end_value: i64, axis_id: usize) -> Arc<Self> {
         let end = Self::const_(DType::Index, ConstValue::Int(end_value));
         Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Loop)
-    }
-
-    /// Create an OUTER RANGE operation with constant end value (convenience for tests).
-    ///
-    /// Uses `AxisId::Renumbered` since tests typically work with renumbered kernels.
-    /// Creates an `Outer` range (wraps entire kernels).
-    pub fn range_outer_const(end_value: i64, axis_id: usize) -> Arc<Self> {
-        let end = Self::const_(DType::Index, ConstValue::Int(end_value));
-        Self::range_axis(end, AxisId::Renumbered(axis_id), AxisType::Outer)
     }
 
     // =========================================================================

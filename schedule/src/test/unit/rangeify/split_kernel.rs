@@ -287,12 +287,12 @@ fn test_split_store_end_with_outer_range() {
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
     let store = store_idx.store(value);
-    let range_outer = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Outer);
+    let range_outer = UOp::range_axis(UOp::index_const(10), AxisId::Renumbered(0), AxisType::Loop);
     let end = store.end(smallvec![range_outer]);
 
     let result = call_split_store(&end);
 
-    // Tinygrad parity: END closes ranges, so this should still split.
+    // END closes ranges, so this should still split.
     let result = result.expect("OUTER END should create kernel");
     expect_end_call(&result, 1);
 }
@@ -300,14 +300,14 @@ fn test_split_store_end_with_outer_range() {
 #[test]
 fn test_split_store_end_with_mixed_ranges() {
     // Create END with mix of LOOP and OUTER ranges wrapping a STORE with proper BUFFER.
-    // Tinygrad parity: END closes ranges, so range order does not gate splitting.
+    // END closes ranges, so range order does not gate splitting.
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 100, DType::Float32);
     let const_idx = UOp::index_const(0);
     let value = UOp::native_const(1.0f32);
     let store_idx = UOp::index().buffer(buffer).indices(vec![const_idx]).call().unwrap();
     let store = store_idx.store(value);
     let range_loop = UOp::range_const(4, 0);
-    let range_outer = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), AxisType::Outer);
+    let range_outer = UOp::range_axis(UOp::index_const(8), AxisId::Renumbered(1), AxisType::Loop);
 
     // [LOOP, OUTER]: kernel is created.
     let end = store.end(smallvec![range_loop.clone(), range_outer.clone()]);
@@ -495,7 +495,7 @@ fn test_split_store_open_loop_range_returns_none() {
 #[test]
 fn test_split_store_open_outer_range_returns_none() {
     let buffer = UOp::new_buffer(DeviceSpec::Cpu, 64, DType::Float32);
-    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Outer);
+    let range = UOp::range_axis(UOp::index_const(4), AxisId::Renumbered(0), AxisType::Loop);
     let idx = UOp::index().buffer(buffer).indices(vec![range.clone()]).call().unwrap();
     let store = idx.store(UOp::native_const(1.0f32));
 
@@ -564,7 +564,7 @@ fn test_split_store_copy_precedence_documented() {
     // This test documents the COPY/BUFFER_VIEW detection behavior.
     //
     // **Behavior:** The stored value of the STORE is checked directly for
-    // COPY/BUFFER_VIEW ops (matching Tinygrad rangeify.py:526-529).
+    // COPY/BUFFER_VIEW ops.
     // If found, the COPY/BV becomes the kernel AST directly.
 
     // Create nested COPY: COPY(COPY(buffer)) with proper BUFFER

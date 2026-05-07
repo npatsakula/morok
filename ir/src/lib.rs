@@ -45,7 +45,7 @@ pub use op::Op;
 pub use sint::{IntoShrinkRange, SInt, ShrinkRange, sint_max, sint_min, sint_prod};
 pub use types::{
     AddrSpace, AxisId, AxisType, BinaryOp, BufferizeOpts, CallInfo, ConstValue, ConstValueHash, ContiguousHint,
-    CustomFunctionKind, KernelInfo, ReduceOp, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
+    CustomFunctionKind, KernelInfo, ReduceOp, RendererDevice, TernaryOp, UnaryOp, WmmaMetadata, WmmaUpcastAxes,
 };
 pub use uop::{IntoUOp, UOp, UOpKey};
 

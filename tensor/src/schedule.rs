@@ -18,7 +18,7 @@ use morok_device::Buffer;
 use morok_device::device::Device;
 use morok_device::registry;
 use morok_dtype::{DType, DeviceSpec};
-use morok_ir::{AxisType, Op, UOp};
+use morok_ir::{Op, UOp};
 use tracing::{debug, trace};
 
 use crate::error::*;
@@ -162,7 +162,28 @@ fn callable_sources(callable: &Arc<UOp>) -> Option<Vec<Arc<UOp>>> {
     }
 }
 
-fn collect_call_bound_ranges(callable: &Arc<UOp>) -> Result<Vec<BoundRangeRef>> {
+/// Schedule-level RANGEs are uniquely identified by being paired with an
+/// `END(Call)` in the transformed graph — the END structurally proves the
+/// Range wraps a kernel call. Standalone `Bind(DefineVar, Range)` arguments
+/// (user-supplied symbolic variable binds) reference Ranges with no END
+/// pairing and must be skipped to avoid being mistaken for loop wrappers.
+fn collect_scheduled_range_ids(root: &Arc<UOp>, callable_ids: &HashSet<u64>) -> HashSet<u64> {
+    let mut ids = HashSet::new();
+    for node in root.toposort_call_aware(false) {
+        let Op::End { computation, ranges } = node.op() else { continue };
+        if !matches!(computation.op(), Op::Call { .. }) || !callable_ids.contains(&computation.id) {
+            continue;
+        }
+        for r in ranges {
+            if matches!(r.op(), Op::Range { .. }) {
+                ids.insert(r.id);
+            }
+        }
+    }
+    ids
+}
+
+fn collect_call_bound_ranges(callable: &Arc<UOp>, scheduled_range_ids: &HashSet<u64>) -> Result<Vec<BoundRangeRef>> {
     let Op::Call { args, .. } = callable.op() else {
         return ExpectedCallableOpSnafu.fail();
     };
@@ -178,24 +199,30 @@ fn collect_call_bound_ranges(callable: &Arc<UOp>) -> Result<Vec<BoundRangeRef>> 
             }
             .fail();
         };
-        let Op::Range { axis_type, .. } = value.op() else {
+        let Op::Range { .. } = value.op() else {
             // User variable binds (`BIND(DEFINE_VAR, CONST)`) are not schedule loops.
             continue;
         };
-        if *axis_type == AxisType::Outer {
-            bound_ranges.push(BoundRangeRef { var_name: name.clone(), range_uop: value.clone() });
+        // Only Ranges paired with an `END(Call)` are schedule-level wrappers;
+        // standalone Range-valued binds carry runtime values, not loop counters.
+        if !scheduled_range_ids.contains(&value.id) {
+            continue;
         }
+        bound_ranges.push(BoundRangeRef { var_name: name.clone(), range_uop: value.clone() });
     }
     Ok(bound_ranges)
 }
 
-fn collect_linear_sched_ops(root: &Arc<UOp>, callables: &[Arc<UOp>]) -> Result<Vec<LinearSchedOp>> {
-    let callable_ids: HashSet<u64> = callables.iter().map(|c| c.id).collect();
+fn collect_linear_sched_ops_internal(
+    root: &Arc<UOp>,
+    callable_ids: &HashSet<u64>,
+    scheduled_range_ids: &HashSet<u64>,
+) -> Result<Vec<LinearSchedOp>> {
     let mut linear_ops = Vec::new();
 
     for node in root.toposort_call_aware(false) {
         match node.op() {
-            Op::Range { axis_type, .. } if *axis_type == AxisType::Outer => {
+            Op::Range { .. } if scheduled_range_ids.contains(&node.id) => {
                 linear_ops.push(LinearSchedOp::Range { range: node.clone() });
             }
             Op::Call { .. } if callable_ids.contains(&node.id) => {
@@ -205,21 +232,16 @@ fn collect_linear_sched_ops(root: &Arc<UOp>, callables: &[Arc<UOp>]) -> Result<V
                 if !callable_ids.contains(&computation.id) {
                     continue;
                 }
-                let outer_ranges: Vec<Arc<UOp>> = ranges
-                    .iter()
-                    .filter_map(|r| match r.op() {
-                        Op::Range { axis_type: AxisType::Outer, .. } => Some(r.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                match outer_ranges.as_slice() {
+                let wrapper_ranges: Vec<Arc<UOp>> =
+                    ranges.iter().filter(|r| matches!(r.op(), Op::Range { .. })).cloned().collect();
+                match wrapper_ranges.as_slice() {
                     [] => {}
                     [outer] => linear_ops.push(LinearSchedOp::End { range: outer.clone(), kernel_id: computation.id }),
                     _ => {
                         return IrConstructionSnafu {
                             details: format!(
-                                "END(CALL) must close at most one OUTER range in strict scheduler, got {}",
-                                outer_ranges.len()
+                                "END(CALL) must close at most one wrapper range in strict scheduler, got {}",
+                                wrapper_ranges.len()
                             ),
                         }
                         .fail();
@@ -237,11 +259,146 @@ fn collect_linear_sched_ops(root: &Arc<UOp>, callables: &[Arc<UOp>]) -> Result<V
     Ok(linear_ops)
 }
 
+/// Eagerly unroll the schedule control stream into a flat list of kernel
+/// invocations.
+///
+/// Every outer loop iteration produces one invocation per kernel inside it,
+/// with concrete `fixedvars` derived from the loop counters at that point.
+/// Outer ranges must have concrete `vmin`/`vmax` (validated by
+/// `schedule_range_bounds`) — there is no symbolic-iteration support today.
+fn collect_kernel_invocations(
+    root: &Arc<UOp>,
+    items: &[PreScheduleItem],
+    scheduled_range_ids: &HashSet<u64>,
+) -> Result<Vec<KernelInvocation>> {
+    let callable_ids: HashSet<u64> = items.iter().map(|it| it.kernel.id).collect();
+    let linear_ops = collect_linear_sched_ops_internal(root, &callable_ids, scheduled_range_ids)?;
+
+    let bound_ranges_by_kernel: HashMap<u64, &[BoundRangeRef]> =
+        items.iter().map(|it| (it.kernel.id, it.bound_ranges.as_slice())).collect();
+
+    // Pre-validation: every declared Range must have a matching End, and every
+    // bound_range on every kernel must reference a declared Range.
+    let mut declared_ranges: HashSet<u64> = HashSet::new();
+    let mut ended_ranges: HashSet<u64> = HashSet::new();
+    for op in &linear_ops {
+        match op {
+            LinearSchedOp::Range { range } => {
+                declared_ranges.insert(range.id);
+            }
+            LinearSchedOp::End { range, .. } => {
+                ended_ranges.insert(range.id);
+            }
+            LinearSchedOp::Call { .. } => {}
+        }
+    }
+    for &rid in &declared_ranges {
+        if !ended_ranges.contains(&rid) {
+            return IrConstructionSnafu { details: format!("schedule range {rid} is missing END in strict scheduler") }
+                .fail();
+        }
+    }
+    for item in items {
+        for br in &item.bound_ranges {
+            if !declared_ranges.contains(&br.range_uop.id) {
+                return IrConstructionSnafu {
+                    details: format!(
+                        "CALL {} bound variable '{}' references schedule range {} missing from linear schedule",
+                        item.kernel.id, br.var_name, br.range_uop.id
+                    ),
+                }
+                .fail();
+            }
+        }
+    }
+
+    // Bytecode interpreter (range/end drives a counter, call emits an
+    // invocation). The output is the eagerly-unrolled invocation list.
+    let mut invocations = Vec::new();
+    let mut in_ranges: HashMap<u64, i64> = HashMap::new();
+    let mut range_ptrs: HashMap<u64, usize> = HashMap::new();
+    let mut range_bounds: HashMap<u64, (i64, i64)> = HashMap::new();
+
+    let mut sched_ptr = 0usize;
+    while sched_ptr < linear_ops.len() {
+        match &linear_ops[sched_ptr] {
+            LinearSchedOp::Range { range } => {
+                let bounds = if let Some(bounds) = range_bounds.get(&range.id).copied() {
+                    bounds
+                } else {
+                    let bounds = schedule_range_bounds(range)?;
+                    range_bounds.insert(range.id, bounds);
+                    bounds
+                };
+                in_ranges.insert(range.id, bounds.0);
+                range_ptrs.insert(range.id, sched_ptr + 1);
+            }
+            LinearSchedOp::End { range, kernel_id } => {
+                if !bound_ranges_by_kernel.contains_key(kernel_id) {
+                    return IrConstructionSnafu {
+                        details: format!("linear END references unknown CALL id {kernel_id}"),
+                    }
+                    .fail();
+                }
+                let (_, vmax) = if let Some(bounds) = range_bounds.get(&range.id).copied() {
+                    bounds
+                } else {
+                    let bounds = schedule_range_bounds(range)?;
+                    range_bounds.insert(range.id, bounds);
+                    bounds
+                };
+                let Some(cur) = in_ranges.get_mut(&range.id) else {
+                    return IrConstructionSnafu {
+                        details: format!("END references schedule range {} that is not active", range.id),
+                    }
+                    .fail();
+                };
+                if *cur < vmax {
+                    *cur += 1;
+                    let Some(jump_ptr) = range_ptrs.get(&range.id).copied() else {
+                        return IrConstructionSnafu {
+                            details: format!("missing loop jump pointer for schedule range {}", range.id),
+                        }
+                        .fail();
+                    };
+                    sched_ptr = jump_ptr;
+                    continue;
+                }
+            }
+            LinearSchedOp::Call { kernel_id } => {
+                let Some(bound_ranges) = bound_ranges_by_kernel.get(kernel_id) else {
+                    return IrConstructionSnafu {
+                        details: format!("linear CALL references unknown kernel id {kernel_id}"),
+                    }
+                    .fail();
+                };
+                let mut fixedvars = HashMap::new();
+                for br in *bound_ranges {
+                    let Some(value) = in_ranges.get(&br.range_uop.id).copied() else {
+                        return IrConstructionSnafu {
+                            details: format!(
+                                "CALL {} bound variable '{}' references inactive schedule range {}",
+                                kernel_id, br.var_name, br.range_uop.id
+                            ),
+                        }
+                        .fail();
+                    };
+                    fixedvars.insert(br.var_name.clone(), value);
+                }
+                invocations.push(KernelInvocation { kernel_id: *kernel_id, fixedvars });
+            }
+        }
+        sched_ptr += 1;
+    }
+
+    Ok(invocations)
+}
+
 fn analyze_callable_dependencies(callables: &[Arc<UOp>], root: &Arc<UOp>) -> Result<Vec<HashSet<usize>>> {
     // Build callable ID → index mapping
     let callable_idx: HashMap<u64, usize> = callables.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
-    // Build dependency edges from source-driven dependency extraction.
-    // This mirrors tinygrad scheduler semantics and avoids global writer-union heuristics.
+    // Build dependency edges from source-driven dependency extraction
+    // (avoids global writer-union heuristics).
     let mut dependencies: Vec<HashSet<usize>> = vec![HashSet::new(); callables.len()];
 
     for (consumer_idx, callable) in callables.iter().enumerate() {
@@ -315,7 +472,9 @@ fn analyze_callable_dependencies(callables: &[Arc<UOp>], root: &Arc<UOp>) -> Res
 /// This keeps schedule instantiation explicit and avoids global lookups.
 pub type InputBuffers = HashMap<u64, Buffer>;
 
-/// Bound OUTER range reference extracted from CALL arguments.
+/// Schedule-level Range bound to a DEFINE_VAR via a CALL argument's
+/// `Bind(DefineVar, Range)`. Each invocation of the wrapped CALL substitutes
+/// the loop counter value into the kernel's variable.
 #[derive(Clone, Debug)]
 pub struct BoundRangeRef {
     /// Variable name (e.g., "range_0")
@@ -324,12 +483,31 @@ pub struct BoundRangeRef {
     pub range_uop: Arc<UOp>,
 }
 
-/// Linearized scheduling control op.
+/// Linearized scheduling control op (internal to schedule construction).
+///
+/// The strict scheduler walks these as a small bytecode (Range/End drive a
+/// loop counter, Call emits an invocation) — see `collect_kernel_invocations`.
+/// Eager unrolling at pre-schedule time turns them into a flat
+/// `Vec<KernelInvocation>`.
 #[derive(Clone, Debug)]
-pub enum LinearSchedOp {
+enum LinearSchedOp {
     Range { range: Arc<UOp> },
     Call { kernel_id: u64 },
     End { range: Arc<UOp>, kernel_id: u64 },
+}
+
+/// One concrete kernel invocation: a kernel id + its loop-resolved variable bindings.
+///
+/// The schedule is a flat list of these (eagerly unrolled at
+/// `create_pre_schedule` time); each element is an atomic kernel CALL with
+/// concrete bindings.
+#[derive(Clone, Debug)]
+pub struct KernelInvocation {
+    /// Kernel ID — looked up against the `PreScheduleItem.kernel.id` index.
+    pub kernel_id: u64,
+    /// Concrete `var_name → value` bindings produced by the surrounding loop
+    /// counters at the moment of this invocation.
+    pub fixedvars: HashMap<String, i64>,
 }
 
 /// A single executable callable with its buffers and variable bindings.
@@ -360,6 +538,11 @@ pub struct ScheduleItem {
     /// Always concrete in the strict scheduler path.
     pub fixedvars: HashMap<String, i64>,
 
+    /// Names of variables in `fixedvars` whose values came from schedule-loop
+    /// counters. User `var_vals` must not override these — see
+    /// `collect_non_overridable_fixedvars`.
+    pub loop_var_names: HashSet<String>,
+
     /// Callable UOp IDs that must complete before this item can execute.
     /// Empty for callables without dependencies (first in chain or independent).
     /// Dependencies are implicit in scheduling order after topological sort.
@@ -379,7 +562,7 @@ pub struct ScheduleItem {
 /// Full execution schedule (list of callables in dependency order).
 pub type Schedule = Vec<ScheduleItem>;
 
-/// Cached pre-schedule item (Tinygrad-style `pre_schedule` equivalent).
+/// Cached pre-schedule item.
 ///
 /// Contains callable identity/AST and argument UOps, but no concrete buffers.
 #[derive(Clone)]
@@ -392,21 +575,21 @@ pub struct PreScheduleItem {
     pub sources: Vec<Arc<UOp>>,
     /// Callable dependencies by callable UOp ID.
     pub dependencies: Vec<u64>,
-    /// OUTER range bindings (`BIND(DEFINE_VAR, RANGE)`) from CALL args.
+    /// Schedule-level Range bindings (`BIND(DEFINE_VAR, RANGE)`) from CALL args.
     pub bound_ranges: Vec<BoundRangeRef>,
 }
 
 /// Cached pre-schedule artifact.
 ///
-/// Mirrors Tinygrad's cached `pre_schedule + buf_uops` split:
-/// - `items`: executable callable descriptors without buffers
-/// - `output_buffer_uops`: output buffer UOps in sink source order
+/// A flat list of kernel invocations with their concrete bindings. Outer
+/// loops are eagerly unrolled at construction time, so there is no
+/// schedule-level Range/End bytecode — just one entry per kernel call.
 #[derive(Clone)]
 pub struct PreSchedule {
-    /// Pre-schedule callable items.
+    /// Per-kernel descriptor pool indexed by `kernel.id` from `KernelInvocation`.
     pub items: Vec<PreScheduleItem>,
-    /// Strict linear schedule control stream (`RANGE`, `CALL`, `END`).
-    pub linear_ops: Vec<LinearSchedOp>,
+    /// Flat sequence of kernel invocations after eager loop unrolling.
+    pub invocations: Vec<KernelInvocation>,
     /// Output buffers in sink source order.
     pub output_buffer_uops: Vec<Arc<UOp>>,
 }
@@ -525,6 +708,12 @@ pub fn create_pre_schedule(transformed: Arc<UOp>) -> Result<PreSchedule> {
     // Step 1.5: Sort callables by dependencies (producers before consumers)
     let (callables, dependency_ids_by_callable) = sort_callables_by_dependencies(&callables, &transformed)?;
 
+    // Step 1.75: Compute the set of Range UOp IDs paired with `END(Call)` —
+    // these are the schedule-level loop wrappers, identified structurally
+    // (no axis_type filter).
+    let callable_ids: HashSet<u64> = callables.iter().map(|c| c.id).collect();
+    let scheduled_range_ids = collect_scheduled_range_ids(&transformed, &callable_ids);
+
     // Step 2: Build pre-schedule items (AST + sources + dependencies + bound ranges).
     let mut items = Vec::with_capacity(callables.len());
     for callable_uop in callables {
@@ -532,7 +721,7 @@ pub fn create_pre_schedule(transformed: Arc<UOp>) -> Result<PreSchedule> {
             unreachable!("filtered to only call wrappers above")
         };
         let dependencies = dependency_ids_by_callable.get(&callable_uop.id).cloned().unwrap_or_default();
-        let bound_ranges = collect_call_bound_ranges(&callable_uop)?;
+        let bound_ranges = collect_call_bound_ranges(&callable_uop, &scheduled_range_ids)?;
         items.push(PreScheduleItem {
             kernel: callable_uop.clone(),
             ast: body.clone(),
@@ -542,9 +731,10 @@ pub fn create_pre_schedule(transformed: Arc<UOp>) -> Result<PreSchedule> {
         });
     }
 
-    // Step 3: Build strict linear control stream (`RANGE`, `CALL`, `END`).
-    let callable_nodes: Vec<Arc<UOp>> = items.iter().map(|it| it.kernel.clone()).collect();
-    let linear_ops = collect_linear_sched_ops(&transformed, &callable_nodes)?;
+    // Step 3: Eagerly unroll outer loops into a flat list of kernel
+    // invocations — each invocation carries the concrete `fixedvars` produced
+    // by its enclosing loop counters.
+    let invocations = collect_kernel_invocations(&transformed, &items, &scheduled_range_ids)?;
 
     // Output buffers in SINK source order.
     let output_buffer_uops: Vec<Arc<UOp>> = match transformed.op() {
@@ -552,7 +742,7 @@ pub fn create_pre_schedule(transformed: Arc<UOp>) -> Result<PreSchedule> {
         _ => vec![transformed.buf_uop()],
     };
 
-    Ok(PreSchedule { items, linear_ops, output_buffer_uops })
+    Ok(PreSchedule { items, invocations, output_buffer_uops })
 }
 
 /// Instantiate a concrete execution schedule from a pre-schedule artifact.
@@ -604,12 +794,38 @@ pub fn instantiate_schedule(
                 dependencies: item.dependencies.clone(),
                 alias_registered_ids: kb.alias_ids,
                 base_fixedvars: fixedvars,
-                bound_ranges: item.bound_ranges.clone(),
             },
         );
     }
 
-    let schedule = unroll_linear_schedule_strict(&pre_schedule.linear_ops, &templates)?;
+    let mut schedule = Vec::with_capacity(pre_schedule.invocations.len());
+    for invocation in &pre_schedule.invocations {
+        let Some(template) = templates.get(&invocation.kernel_id) else {
+            return IrConstructionSnafu {
+                details: format!("invocation references unknown kernel id {}", invocation.kernel_id),
+            }
+            .fail();
+        };
+
+        // Merge the kernel's user-Variable bindings (`base_fixedvars`) with
+        // the loop-counter bindings produced at this iteration.
+        let mut fixedvars = template.base_fixedvars.clone();
+        fixedvars.extend(invocation.fixedvars.iter().map(|(k, v)| (k.clone(), *v)));
+        let loop_var_names: HashSet<String> = invocation.fixedvars.keys().cloned().collect();
+
+        schedule.push(ScheduleItem {
+            kernel: template.kernel.clone(),
+            ast: template.ast.clone(),
+            buffers: template.buffers.clone(),
+            buffer_uop_ids: template.buffer_uop_ids.clone(),
+            fixedvars,
+            loop_var_names,
+            dependencies: template.dependencies.clone(),
+            instance_dependencies: Vec::new(),
+            alias_registered_ids: template.alias_registered_ids.clone(),
+        });
+    }
+
     if schedule.is_empty() {
         return EmptyScheduleSnafu.fail();
     }
@@ -629,8 +845,8 @@ pub fn create_schedule(
 
 /// Extract device from the first input buffer in callable sources.
 ///
-/// This follows Tinygrad's pattern where `ctx[0].device` (first buffer's device)
-/// determines the device for codegen/compilation and output buffer allocation.
+/// The first buffer's device determines the device for codegen/compilation and
+/// output buffer allocation.
 ///
 /// DISK buffers are skipped: a disk-resident input is never a viable execution
 /// device (no compiler), so the search continues to find a compute-capable
@@ -677,15 +893,15 @@ fn find_first_input_buffer_device(
 /// For shared buffers (AFTER nodes), we look up the buffer using buf_uop()
 /// which walks through AFTER chains to get the underlying buffer ID.
 ///
-/// Output/intermediate buffers are allocated on the same device as the first input buffer
-/// (following Tinygrad's pattern). Newly allocated buffers are tracked in `allocated_buffers`.
+/// Output/intermediate buffers are allocated on the same device as the first
+/// input buffer. Newly allocated buffers are tracked in `allocated_buffers`.
 fn collect_callable_buffers(
     sources: &[Arc<UOp>],
     ast: &Arc<UOp>,
     input_buffers: &InputBuffers,
     allocated_buffers: &mut HashMap<u64, Buffer>,
 ) -> Result<CallableBuffers> {
-    // Get target device from first input buffer (Tinygrad pattern: ctx[0].device)
+    // Get target device from the first input buffer.
     let target_device = find_first_input_buffer_device(sources, input_buffers, allocated_buffers)?;
 
     let mut buffers = Vec::new();
@@ -843,176 +1059,39 @@ struct ScheduleItemTemplate {
     dependencies: Vec<u64>,
     alias_registered_ids: Vec<u64>,
     base_fixedvars: HashMap<String, i64>,
-    bound_ranges: Vec<BoundRangeRef>,
 }
 
-fn outer_range_bounds(range: &Arc<UOp>) -> Result<(i64, i64)> {
-    let Op::Range { axis_type, .. } = range.op() else {
-        return IrConstructionSnafu { details: format!("expected RANGE for outer loop control, got {:?}", range.op()) }
-            .fail();
-    };
-    if *axis_type != AxisType::Outer {
+fn schedule_range_bounds(range: &Arc<UOp>) -> Result<(i64, i64)> {
+    let Op::Range { .. } = range.op() else {
         return IrConstructionSnafu {
-            details: format!("strict scheduler expects OUTER RANGE control, got axis_type={axis_type:?}"),
+            details: format!("expected RANGE for schedule loop control, got {:?}", range.op()),
         }
         .fail();
-    }
+    };
 
     let Some(vmin) = range.vmin().try_int() else {
         return IrConstructionSnafu {
-            details: format!("OUTER RANGE vmin must be concrete integer, got {:?}", range.vmin()),
+            details: format!("schedule range vmin must be concrete integer, got {:?}", range.vmin()),
         }
         .fail();
     };
     let Some(vmax) = range.vmax().try_int() else {
         return IrConstructionSnafu {
-            details: format!("OUTER RANGE vmax must be concrete integer, got {:?}", range.vmax()),
+            details: format!("schedule range vmax must be concrete integer, got {:?}", range.vmax()),
         }
         .fail();
     };
     if vmax < vmin {
-        return IrConstructionSnafu { details: format!("invalid OUTER RANGE bounds: vmin={vmin}, vmax={vmax}") }.fail();
+        return IrConstructionSnafu { details: format!("invalid schedule range bounds: vmin={vmin}, vmax={vmax}") }
+            .fail();
     }
     Ok((vmin, vmax))
 }
 
-fn unroll_linear_schedule_strict(
-    linear_ops: &[LinearSchedOp],
-    templates: &HashMap<u64, ScheduleItemTemplate>,
-) -> Result<Schedule> {
-    let mut declared_ranges = HashSet::new();
-    let mut ended_ranges = HashSet::new();
-    for op in linear_ops {
-        match op {
-            LinearSchedOp::Range { range } => {
-                declared_ranges.insert(range.id);
-            }
-            LinearSchedOp::End { range, .. } => {
-                ended_ranges.insert(range.id);
-            }
-            LinearSchedOp::Call { .. } => {}
-        }
-    }
-
-    for &rid in &declared_ranges {
-        if !ended_ranges.contains(&rid) {
-            return IrConstructionSnafu { details: format!("OUTER RANGE {rid} is missing END in strict scheduler") }
-                .fail();
-        }
-    }
-    for template in templates.values() {
-        for br in &template.bound_ranges {
-            if !declared_ranges.contains(&br.range_uop.id) {
-                return IrConstructionSnafu {
-                    details: format!(
-                        "CALL {} bound variable '{}' references OUTER RANGE {} missing from linear schedule",
-                        template.kernel.id, br.var_name, br.range_uop.id
-                    ),
-                }
-                .fail();
-            }
-        }
-    }
-
-    let mut schedule = Vec::new();
-    let mut in_ranges: HashMap<u64, i64> = HashMap::new();
-    let mut range_ptrs: HashMap<u64, usize> = HashMap::new();
-    let mut range_bounds: HashMap<u64, (i64, i64)> = HashMap::new();
-
-    let mut sched_ptr = 0usize;
-    while sched_ptr < linear_ops.len() {
-        match &linear_ops[sched_ptr] {
-            LinearSchedOp::Range { range } => {
-                let bounds = if let Some(bounds) = range_bounds.get(&range.id).copied() {
-                    bounds
-                } else {
-                    let bounds = outer_range_bounds(range)?;
-                    range_bounds.insert(range.id, bounds);
-                    bounds
-                };
-                in_ranges.insert(range.id, bounds.0);
-                range_ptrs.insert(range.id, sched_ptr + 1);
-            }
-            LinearSchedOp::End { range, kernel_id } => {
-                if !templates.contains_key(kernel_id) {
-                    return IrConstructionSnafu {
-                        details: format!("linear END references unknown CALL id {kernel_id}"),
-                    }
-                    .fail();
-                }
-
-                let (_, vmax) = if let Some(bounds) = range_bounds.get(&range.id).copied() {
-                    bounds
-                } else {
-                    let bounds = outer_range_bounds(range)?;
-                    range_bounds.insert(range.id, bounds);
-                    bounds
-                };
-
-                let Some(cur) = in_ranges.get_mut(&range.id) else {
-                    return IrConstructionSnafu {
-                        details: format!("END references OUTER RANGE {} that is not active", range.id),
-                    }
-                    .fail();
-                };
-
-                if *cur < vmax {
-                    *cur += 1;
-                    let Some(jump_ptr) = range_ptrs.get(&range.id).copied() else {
-                        return IrConstructionSnafu {
-                            details: format!("missing loop jump pointer for OUTER RANGE {}", range.id),
-                        }
-                        .fail();
-                    };
-                    sched_ptr = jump_ptr;
-                    continue;
-                }
-            }
-            LinearSchedOp::Call { kernel_id } => {
-                let Some(template) = templates.get(kernel_id) else {
-                    return IrConstructionSnafu {
-                        details: format!("linear CALL references unknown kernel id {kernel_id}"),
-                    }
-                    .fail();
-                };
-
-                let mut fixedvars = template.base_fixedvars.clone();
-                for br in &template.bound_ranges {
-                    let Some(value) = in_ranges.get(&br.range_uop.id).copied() else {
-                        return IrConstructionSnafu {
-                            details: format!(
-                                "CALL {} bound variable '{}' references inactive OUTER RANGE {}",
-                                kernel_id, br.var_name, br.range_uop.id
-                            ),
-                        }
-                        .fail();
-                    };
-                    fixedvars.insert(br.var_name.clone(), value);
-                }
-
-                schedule.push(ScheduleItem {
-                    kernel: template.kernel.clone(),
-                    ast: template.ast.clone(),
-                    buffers: template.buffers.clone(),
-                    buffer_uop_ids: template.buffer_uop_ids.clone(),
-                    fixedvars,
-                    dependencies: template.dependencies.clone(),
-                    instance_dependencies: Vec::new(),
-                    alias_registered_ids: template.alias_registered_ids.clone(),
-                });
-            }
-        }
-
-        sched_ptr += 1;
-    }
-
-    Ok(schedule)
-}
-
 /// Compute buffer size from the buffer definition's dtype.
 ///
-/// Buffer size is embedded in the Ptr dtype by debuf() during rangeify.
-/// This follows Tinygrad's pattern where size is stored in `dtype.ptr(size=...)`.
+/// Buffer size is embedded in the Ptr dtype by debuf() during rangeify
+/// (`dtype.ptr(size=...)`).
 fn compute_buffer_size(_ast: &Arc<UOp>, buffer_def: &Arc<UOp>) -> Result<usize> {
     // Extract size from Ptr dtype (set by debuf() in split_patterns.rs)
     match buffer_def.dtype() {

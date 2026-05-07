@@ -426,7 +426,7 @@ fn test_devectorize_local_buffer_vector_index() {
     let sink = UOp::sink(vec![store]);
 
     // Apply full devectorize pipeline
-    let result = devectorize(&sink);
+    let result = devectorize(&sink, &crate::optimizer::Renderer::cpu());
 
     // After devectorize, all STOREs should have scalar indices (no vector INDEX on local buf)
     let has_vector_local_index = result.toposort().iter().any(|node: &Arc<UOp>| {
@@ -473,7 +473,7 @@ fn test_devectorize_local_buffer_vec9_index() {
     let store = index.store(vec81_value);
 
     let sink = UOp::sink(vec![store]);
-    let result = devectorize(&sink);
+    let result = devectorize(&sink, &crate::optimizer::Renderer::cpu());
 
     let has_vector_local_index = result.toposort().iter().any(|node: &Arc<UOp>| {
         if let Op::Index { buffer, indices, .. } = node.op() {

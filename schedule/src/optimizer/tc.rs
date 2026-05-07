@@ -458,8 +458,7 @@ fn apply_axis_choice_impl(
     for opt in &tc.opts {
         match opt {
             TcOpt::Upcast(dim) => {
-                let (replaced, new_rng) =
-                    scheduler.shift_to_tc_symbolic(axes[*dim].clone(), 2, AxisType::Upcast, false, None)?;
+                let (replaced, new_rng) = scheduler.shift_to(axes[*dim].clone(), 2, AxisType::Upcast, false, None)?;
                 axes[*dim] = replaced;
                 ne.push(new_rng);
             }
@@ -468,7 +467,7 @@ fn apply_axis_choice_impl(
                     .try_mod(&two)
                     .map_err(|_| ValidationFailedSnafu { op: "TC", reason: "warp mod failed" }.build())?;
                 let (replaced, new_rng) =
-                    scheduler.shift_to_tc_symbolic(axes[*dim].clone(), 2, AxisType::Local, false, Some(warp_mod))?;
+                    scheduler.shift_to(axes[*dim].clone(), 2, AxisType::Local, false, Some(warp_mod))?;
                 axes[*dim] = replaced;
                 warp = warp
                     .try_div(&two)
@@ -480,8 +479,7 @@ fn apply_axis_choice_impl(
 
     // K-dimension UNROLL splits
     for (_idx, amt) in tc.get_reduce_axes() {
-        let (replaced, new_rng) =
-            scheduler.shift_to_tc_symbolic(axes[2].clone(), amt, AxisType::Unroll, false, None)?;
+        let (replaced, new_rng) = scheduler.shift_to(axes[2].clone(), amt, AxisType::Unroll, false, None)?;
         axes[2] = replaced;
         ne.push(new_rng);
     }
@@ -628,7 +626,7 @@ fn apply_axis_choice_impl(
             dims: tc.dims,
             dtype_in: tc.dtype_in.clone(),
             dtype_out: tc.dtype_out.clone(),
-            device: scheduler.ren.device.clone(),
+            device: scheduler.ren.device,
             threads: tc.threads,
             upcast_axes: WmmaUpcastAxes { a: a_axes.clone(), b: b_axes.clone(), c: c_axes.clone() },
             reduce_axes: tc_reduce_aids.clone(),
@@ -788,7 +786,7 @@ pub fn apply(
     apply_with_axis_choice(scheduler, tc_select, tc_opt, use_tensor_cores, None)
 }
 
-/// Short dtype name for WMMA function identifiers (matches Tinygrad convention).
+/// Short dtype name for WMMA function identifiers.
 fn wmma_dtype_name(dtype: &morok_ir::prelude::DType) -> &'static str {
     use morok_dtype::ScalarDType;
     match dtype.base() {

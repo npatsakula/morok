@@ -47,6 +47,7 @@ fn test_resolve_compiled_kernel_buffer_indices_reorders_by_program_globals() {
         dependencies: vec![],
         instance_dependencies: vec![],
         alias_registered_ids: vec![],
+        loop_var_names: std::collections::HashSet::new(),
     };
     let uop_id_to_idx = std::collections::HashMap::from([(p1.id, 11), (p0.id, 10)]);
 
@@ -71,6 +72,7 @@ fn test_resolve_compiled_kernel_buffer_indices_treats_globals_as_buffer_position
         dependencies: vec![],
         instance_dependencies: vec![],
         alias_registered_ids: vec![],
+        loop_var_names: std::collections::HashSet::new(),
     };
     let uop_id_to_idx = std::collections::HashMap::from([(p1.id, 11), (p0.id, 10)]);
 
@@ -94,6 +96,7 @@ fn test_resolve_compiled_kernel_buffer_indices_rejects_out_of_range_global_posit
         dependencies: vec![],
         instance_dependencies: vec![],
         alias_registered_ids: vec![],
+        loop_var_names: std::collections::HashSet::new(),
     };
     let uop_id_to_idx = std::collections::HashMap::from([(p0.id, 10)]);
 
@@ -265,12 +268,15 @@ fn test_compile_with_program_pipeline_components_rejects_malformed_program_state
 }
 
 #[test]
-fn test_collect_non_overridable_fixedvars_uses_outer_bindings_not_name_prefix() {
-    let outer_range = UOp::range_outer_const(4, 0);
-    let outer_bind = UOp::define_var("outer_i".to_string(), 0, 3).bind(outer_range);
-    let loop_bind = UOp::define_var("loop_j".to_string(), 0, 1).bind(UOp::range_const(2, 1));
+fn test_collect_non_overridable_fixedvars_locks_only_loop_var_names() {
+    // After the schedule-level Range/End refactor, schedule-loop bindings are
+    // tracked structurally via `ScheduleItem.loop_var_names` (populated from
+    // `KernelInvocation.fixedvars` at instantiation time). User-supplied
+    // var_vals end up in `fixedvars` too but are NOT in `loop_var_names`,
+    // so they remain overridable. This separates loop counters from runtime
+    // variable binds.
     let body = UOp::sink(vec![UOp::native_const(1.0f32)]);
-    let call = body.call(SmallVec::from_vec(vec![outer_bind, loop_bind]), morok_ir::CallInfo::default());
+    let call = body.call(SmallVec::new(), morok_ir::CallInfo::default());
 
     let item = crate::schedule::ScheduleItem {
         kernel: call,
@@ -285,6 +291,7 @@ fn test_collect_non_overridable_fixedvars_uses_outer_bindings_not_name_prefix() 
         dependencies: vec![],
         instance_dependencies: vec![],
         alias_registered_ids: vec![],
+        loop_var_names: std::collections::HashSet::from(["outer_i".to_string()]),
     };
 
     let locked = collect_non_overridable_fixedvars(&item);
@@ -320,7 +327,7 @@ fn test_realize_simple_add() {
 /// This verifies the complete reduction pipeline:
 /// - Early-return pattern prevents unnecessary ReduceAxis for size-1 dimensions
 /// - Vectorize consistency prevents VConst panics in shape extraction
-/// - ReduceAxis → REDUCE transformation following Tinygrad's approach
+/// - ReduceAxis → REDUCE transformation
 /// - REDUCE codegen generates correct LLVM IR
 #[test]
 fn test_realize_sum() {
@@ -497,6 +504,7 @@ fn test_prepare_execution_plan_lowers_explicit_custom_function_op() {
             dependencies: vec![],
             instance_dependencies: vec![],
             alias_registered_ids: vec![],
+            loop_var_names: std::collections::HashSet::new(),
         }],
         output_uop_ids: vec![1001],
     };

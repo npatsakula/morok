@@ -83,7 +83,7 @@ fn test_devectorize_matmul_pattern() {
     let load = UOp::load().buffer(buffer.clone()).index(index).call();
 
     // Step 1: Run devectorize (without pm_render)
-    let after_devectorize = devectorize(&load);
+    let after_devectorize = devectorize(&load, &crate::optimizer::Renderer::cpu());
 
     // Step 2: Run pm_render
     let result = graph_rewrite(pm_render(), after_devectorize, &mut ());
@@ -205,7 +205,7 @@ fn test_devectorize_with_output_upcast() {
 fn test_devectorize_loop_index() {
     let buffer = create_buffer(256);
 
-    // Create codegen PARAM and broadcast to match Tinygrad's expand_index pattern
+    // Create codegen PARAM and broadcast to match the expand_index pattern.
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(20000);
     let def_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let define = UOp::param(def_id, 256, buffer.dtype(), None);

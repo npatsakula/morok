@@ -80,13 +80,14 @@ pub(crate) fn elf_target_triple() -> String {
 /// Extra clang flags required for correct JIT code on the host platform.
 /// Shared between the C and LLVM IR compilation paths.
 pub(crate) fn platform_clang_flags() -> &'static [&'static str] {
-    // macOS/Windows reserve x18 as the platform register. Bare-metal ELF
-    // targets treat it as a free GPR, so we must tell clang to avoid it.
-    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "windows")))]
+    // Reserve x18 only on macOS ARM, where the kernel clobbers it on context
+    // switch. Linux ARM treats x18 as a free GPR; Windows ARM is not a target
+    // morok currently supports.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
         &["-ffixed-x18"]
     }
-    #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "windows"))))]
+    #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
     {
         &[]
     }
@@ -99,14 +100,14 @@ fn compile_to_object(src: &str) -> crate::Result<Vec<u8>> {
 
     let arch = std::env::consts::ARCH;
 
-    // Architecture-specific tuning flags.
+    // Architecture-specific tuning. On ARM, `-march=native` only sets the
+    // base ISA family (e.g. `armv8-a`); CPU-specific tuning (Apple-Silicon
+    // pipelines, NEON dual-issue scheduling, FP cost model) requires
+    // `-mcpu=native`.
     let march = match arch {
-        "x86_64" | "aarch64" | "loongarch64" => "-march=native",
-        "riscv64" => "-march=rv64gc",
-        "powerpc64" => "-mcpu=native",
-        other => {
-            return Err(crate::Error::JitCompilation { reason: format!("Unsupported architecture: {other}") });
-        }
+        "x86_64" | "loongarch64" => "-march=native",
+        "riscv64" => "-march=rv64g",
+        _ => "-mcpu=native",
     };
 
     let target = elf_target_triple();

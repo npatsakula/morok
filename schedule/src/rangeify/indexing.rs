@@ -57,7 +57,7 @@ impl IndexingContext {
     /// renumbering. The `renumber_range` pattern will later convert them to
     /// `AxisId::Renumbered` with sequential IDs starting from 0 for each kernel.
     pub fn new_range(&mut self, size: &SInt, axistype: AxisType) -> Arc<UOp> {
-        // If size is already a RANGE UOp, return it unchanged (Tinygrad indexing.py:46)
+        // If size is already a RANGE UOp, return it unchanged.
         if let SInt::Symbolic(u) = size
             && matches!(u.op(), Op::Range { .. })
         {
@@ -333,8 +333,7 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
     crate::cached_patterns! {
         @context IndexingContext;
 
-        // SINK sources → realize non-contiguous bases
-        // Tinygrad: ctx.update((x.base, None) for x in s.src if x.base.op not in ALWAYS_CONTIGUOUS)
+        // SINK sources → realize non-contiguous bases.
         x @ Sink { sources: _ } => |x, ctx| {
             for src in x.op().sources() {
                 let base = src.base();
@@ -345,9 +344,10 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
             None
         },
 
-        // Always realize STORE, and realize its value first when it reads the same base buffer.
-        // Tinygrad calls this a WAR hazard: without the temp, overlapping self-assigns can read
-        // a value that an earlier loop iteration already overwrote.
+        // Always realize STORE, and realize its value first when it reads the
+        // same base buffer (WAR hazard: without the temp, overlapping
+        // self-assigns can read a value that an earlier loop iteration
+        // already overwrote).
         x @ Store { index, value } => |x, index, value, ctx| {
             ctx.mark_realize_pending(x);
             if value.backward_slice_ids().contains(&index.base().id) {
@@ -357,19 +357,11 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
         },
         x @ BufferView { buffer: _ } => |x, ctx| { ctx.mark_realize_all(x).ok(); None },
 
-        // Always realize REDUCE on outer ranges
-        x @ Reduce { src: _, ranges, reduce_op: _ } => |x, ctx| {
-            if ranges.iter().any(|r| matches!(r.op(), Op::Range { axis_type, .. } if *axis_type == AxisType::Outer)) {
-                ctx.mark_realize_all(x).ok();
-            }
-            None
-        },
-
         x @ Copy { src: _ } => |x, ctx| {
             ctx.mark_realize_all(x).ok();
             // Also realize sources
             for src in x.op().sources() {
-                // Tinygrad realize_srcs: guard on src.base.op, realize src.
+                // realize_srcs: guard on src.base.op, realize src.
                 if !is_always_contiguous(&src.base()) {
                     ctx.mark_realize_all(&src).ok();
                 }
@@ -380,7 +372,7 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
         // MStack/MSelect → realize sources
         x @ MStack { buffers: _ } => |x, ctx| {
             for src in x.op().sources() {
-                // Tinygrad realize_srcs: guard on src.base.op, realize src.
+                // realize_srcs: guard on src.base.op, realize src.
                 if !is_always_contiguous(&src.base()) {
                     ctx.mark_realize_all(&src).ok();
                 }
@@ -389,7 +381,7 @@ fn pm_generate_realize_map() -> &'static crate::TypedPatternMatcher<IndexingCont
         },
         x @ MSelect { device_index: _ } => |x, ctx| {
             for src in x.op().sources() {
-                // Tinygrad realize_srcs: guard on src.base.op, realize src.
+                // realize_srcs: guard on src.base.op, realize src.
                 if !is_always_contiguous(&src.base()) {
                     ctx.mark_realize_all(&src).ok();
                 }
@@ -558,7 +550,7 @@ fn assign_ranges(
             continue;
         }
 
-        // Tinygrad skips callable boundaries, AFTER, and MSTACK/MSELECT during range assignment.
+        // Skip callable boundaries, AFTER, and MSTACK/MSELECT during range assignment.
         if matches!(
             x.op(),
             Op::Call { .. }
@@ -1069,10 +1061,9 @@ pub fn apply_reshape_ranges(in_shape: &[SInt], out_shape: &[SInt], rngs: &[Arc<U
 }
 
 /// Canonicalize RANGE UOps to PLACEHOLDER before calling `f`, then restore.
-/// Matches upstream.
 fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp>]) -> Vec<Arc<UOp>>) -> Vec<Arc<UOp>> {
     let sink = UOp::sink(rngs.to_vec());
-    // Tinygrad-compatible: canonicalize only live/in-scope ranges.
+    // Canonicalize only live/in-scope ranges.
     #[allow(clippy::mutable_key_type)]
     let in_scope = sink.in_scope_ranges();
     let ranges_in_expr: Vec<Arc<UOp>> =
@@ -1110,8 +1101,8 @@ fn with_placeholder_canonicalization(rngs: &[Arc<UOp>], f: impl FnOnce(&[Arc<UOp
         _ => vec![restored],
     };
 
-    // If rewrite changed placeholder internals (e.g., `end` expr), structural reverse_map
-    // can miss restoration. Recover by axis id to mirror tinygrad intent.
+    // If rewrite changed placeholder internals (e.g., `end` expr), structural
+    // reverse_map can miss restoration. Recover by axis id.
     #[allow(clippy::mutable_key_type)]
     let mut axis_restore_map: HashMap<UOpKey, Arc<UOp>> = HashMap::new();
     for r in UOp::sink(output.clone()).ranges().iter() {

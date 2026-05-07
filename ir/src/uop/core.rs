@@ -13,12 +13,10 @@ use smallvec::SmallVec;
 use crate::op::Op;
 use crate::pattern::{Matcher, RewriteResult};
 use crate::shape;
-use crate::types::{AxisType, ConstValue};
+use crate::types::ConstValue;
 use morok_dtype::DType;
 
 /// Matcher for `UOp::substitute` — looks up each node in a substitution map.
-///
-/// Equivalent to Tinygrad's `_substitute = PatternMatcher([(UPat(tuple(Ops)), lambda ctx,x: ctx.get(x))])`.
 struct SubstituteMatcher<'a>(&'a HashMap<UOpKey, Arc<UOp>>);
 
 impl Matcher<()> for SubstituteMatcher<'_> {
@@ -32,7 +30,6 @@ impl Matcher<()> for SubstituteMatcher<'_> {
 
 /// Matcher for `UOp::substitute_gated` — substitution with range-scope gating.
 ///
-/// Equivalent to Tinygrad's `_substitute` + `pm_gate_substitute`:
 /// - If a node is in the substitution map, replace it.
 /// - If a node's ranges don't overlap with substitution keys, gate (skip subtree).
 struct SubstituteGatedMatcher<'a> {
@@ -48,8 +45,7 @@ impl Matcher<()> for SubstituteGatedMatcher<'_> {
         {
             return RewriteResult::Rewritten(replacement.clone());
         }
-        // Gate: skip subtrees whose ranges don't overlap with substitution keys
-        // Tinygrad (rangeify.py:187): `if not any(r in b.ranges for r in ctx.keys()): raise BottomUpGate()`
+        // Gate: skip subtrees whose ranges don't overlap with substitution keys.
         if !uop.in_scope_ranges().iter().any(|r| self.range_keys.contains(r)) {
             return RewriteResult::Gate(uop.clone());
         }
@@ -141,7 +137,6 @@ pub struct UOp {
     /// Cached set of RANGE operations that are in scope at this UOp.
     /// Unlike ranges_cache which contains ALL ranges in the graph,
     /// this contains only the ranges that are currently "active" (not yet ended).
-    /// Computed lazily based on Tinygrad's ranges property.
     /// Uses UOpKey wrapper to enable Hash/Eq based on UOp ID.
     #[debug(skip)]
     pub(crate) in_scope_ranges_cache: std::sync::OnceLock<HashSet<UOpKey>>,
@@ -169,9 +164,9 @@ pub struct UOp {
     pub content_hash: u64,
     /// Tag for tracking tensor identity through the rangeify pipeline.
     ///
-    /// Matches Tinygrad's `UOp.tag` (ops.py:128). Tags are tuples of integer indices
-    /// that track which original tensor UOps map to which final kernel outputs.
-    /// Tags participate in hash consing — different tag = different UOp.
+    /// Tags are sequences of integer indices that track which original tensor
+    /// UOps map to which final kernel outputs. They participate in hash consing
+    /// — different tag = different UOp.
     ///
     /// Values:
     /// - `None` — untagged (default)
@@ -220,8 +215,7 @@ impl UOp {
         &self.tag
     }
 
-    /// Create a new UOp with the given tag (Tinygrad: `rtag()`).
-    /// Returns self unchanged if tag is already equal.
+    /// Create a new UOp with the given tag. Returns self unchanged if tag is already equal.
     pub fn rtag(self: &Arc<Self>, tag: Option<SmallVec<[usize; 2]>>) -> Arc<Self> {
         if self.tag == tag {
             return self.clone();
@@ -238,8 +232,6 @@ impl UOp {
     ///
     /// Returns true for buffer-like identities or RESHAPE/MULTI chains leading to them.
     /// These are already contiguous by definition, so wrapping in CONTIGUOUS is a no-op.
-    ///
-    /// Based on Tinygrad's `UOp.has_buffer_identity()`.
     pub fn has_buffer_identity(&self) -> bool {
         match &self.op {
             Op::Reshape { src, .. } | Op::Multi { src, .. } => src.has_buffer_identity(),
@@ -278,7 +270,6 @@ impl UOp {
     /// Create a copy of this UOp with a different dtype.
     ///
     /// If the dtype is unchanged, returns self (clone of Arc).
-    /// This is the Rust equivalent of Tinygrad's `buf.replace(dtype=x)`.
     ///
     /// # Examples
     ///
@@ -299,7 +290,6 @@ impl UOp {
 
     /// Walk through AFTER nodes to get the passthrough value.
     ///
-    /// This is the Rust equivalent of Tinygrad's `.or_after()` pattern.
     /// Recursively unwraps AFTER nodes to find the underlying value.
     ///
     /// # Examples
@@ -318,7 +308,6 @@ impl UOp {
 
     /// Walk through CAST nodes to get the inner value.
     ///
-    /// This is the Rust equivalent of Tinygrad's `.or_casted()` pattern.
     /// Recursively unwraps CAST nodes to find the underlying value.
     ///
     /// # Examples
@@ -366,7 +355,6 @@ impl UOp {
     /// Store a value at this INDEX node.
     ///
     /// Convenience method for `self.store(value)`.
-    /// Matches Tinygrad's `idx.store(val)` pattern.
     ///
     /// # Panics
     ///
@@ -447,8 +435,7 @@ impl UOp {
 
     /// Extract device specification from this UOp graph.
     ///
-    /// Traverses the graph to find Op::Device nodes following Tinygrad's
-    /// `_device` recursive property (ops.py:585-599):
+    /// Traverses the graph to find Op::Device nodes:
     /// - DEVICE: returns the DeviceSpec directly
     /// - BUFFER: returns device from the device child
     /// - COPY: returns device from the device child (target device)
@@ -505,8 +492,6 @@ impl UOp {
     /// change the underlying data. This method recursively walks through these
     /// operations to find the actual buffer or computation that owns the data.
     ///
-    /// Based on Tinygrad's `base` property (ops.py:524-527).
-    ///
     /// # Examples
     ///
     /// ```rust
@@ -537,8 +522,7 @@ impl UOp {
 
     /// Get the underlying buffer UOp, walking through AFTER/MSELECT/MSTACK chains.
     ///
-    /// Based on Tinygrad's `buf_uop` property (ops.py:601-606).
-    /// This recursively unwraps AFTER chains to find the actual buffer.
+    /// Recursively unwraps AFTER chains to find the actual buffer.
     ///
     /// # Examples
     ///
@@ -888,9 +872,6 @@ impl UOp {
     /// 2. Removing ranges that are ended by this operation
     /// 3. Adding self if this is a RANGE operation
     ///
-    /// Based on Tinygrad's `ranges` property (ops.py:318-320) and
-    /// `_ranges` recursive property (ops.py:302-315).
-    ///
     /// # Returns
     ///
     /// A HashSet of RANGE UOps that are in scope at this point in the graph.
@@ -917,63 +898,6 @@ impl UOp {
         use crate::uop::cached_property::CachedProperty;
         use crate::uop::properties::InScopeRangesProperty;
         InScopeRangesProperty::get(self)
-    }
-
-    /// Check if all in-scope ranges at this UOp have the given AxisType.
-    ///
-    /// Returns true if the in-scope ranges set is empty or all ranges
-    /// match the specified axis type.
-    ///
-    /// # Use Cases
-    ///
-    /// - `all_in_scope_ranges_are(AxisType::Outer)` - Used in split_store
-    ///   to determine if we're at a kernel boundary
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use morok_ir::{UOp, AxisType};
-    ///
-    /// // At kernel boundary: only OUTER ranges in scope
-    /// assert!(uop.all_in_scope_ranges_are(AxisType::Outer));
-    ///
-    /// // Inside kernel: has non-OUTER ranges
-    /// assert!(!uop.all_in_scope_ranges_are(AxisType::Outer));
-    /// ```
-    #[allow(clippy::mutable_key_type)]
-    pub fn all_in_scope_ranges_are(self: &Arc<Self>, axis_type: AxisType) -> bool {
-        use crate::Op;
-
-        let ranges = self.in_scope_ranges();
-
-        // Empty scope means we're at the top level (treat as all OUTER)
-        if ranges.is_empty() {
-            return true;
-        }
-
-        ranges.iter().all(|r| match r.0.op() {
-            Op::Range { axis_type: at, .. } => *at == axis_type,
-            _ => false, // Should never happen
-        })
-    }
-
-    /// Check if any in-scope range is NOT of the given AxisType.
-    ///
-    /// Inverse of `all_in_scope_ranges_are`. Useful for Tinygrad-style
-    /// filtering: "skip if any range is not OUTER".
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use morok_ir::{UOp, AxisType};
-    ///
-    /// // Has non-OUTER ranges: should skip in split_store
-    /// if uop.has_non_outer_ranges() {
-    ///     return None;  // Don't split here
-    /// }
-    /// ```
-    pub fn has_non_outer_ranges(self: &Arc<Self>) -> bool {
-        !self.all_in_scope_ranges_are(AxisType::Outer)
     }
 
     /// Build a consumer map for this UOp's computation graph.
@@ -1042,9 +966,9 @@ impl UOp {
     /// Replace UOps in the computation graph according to a substitution map.
     ///
     /// Delegates to `graph_rewrite_bottom_up` with a wildcard pattern that looks up
-    /// each node in the map — exactly like Tinygrad's `substitute`. The rewrite engine
-    /// provides O(n) memoization via its result cache and an explicit work-stack
-    /// (no Rust recursion, so deep graphs do not exhaust the thread stack).
+    /// each node in the map. The rewrite engine provides O(n) memoization via its
+    /// result cache and an explicit work-stack (no Rust recursion, so deep graphs
+    /// do not exhaust the thread stack).
     #[allow(clippy::mutable_key_type)]
     pub fn substitute(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
@@ -1084,11 +1008,11 @@ impl UOp {
         crate::rewrite::graph_rewrite_bottom_up_preserve_calls(&matcher, self.clone(), &mut ())
     }
 
-    /// Replace UOps with range-gated substitution (Tinygrad: `extra_pm=pm_gate_substitute`).
+    /// Replace UOps with range-gated substitution.
     ///
     /// Like `substitute`, but skips subtrees whose `in_scope_ranges()` don't contain
-    /// any of the substitution keys. This prevents substituting ranges in subexpressions
-    /// that don't reference them, matching Tinygrad's `gate_substitute` behavior.
+    /// any of the substitution keys. Prevents substituting ranges in subexpressions
+    /// that don't reference them.
     #[allow(clippy::mutable_key_type)]
     pub fn substitute_gated(self: &Arc<Self>, map: &HashMap<UOpKey, Arc<Self>>) -> Arc<Self> {
         if map.is_empty() {
@@ -1411,10 +1335,10 @@ impl UOp {
             Op::After { .. } => {
                 assert!(!new_srcs.is_empty());
                 let passthrough = src(0);
-                // Validate: AFTER passthrough must not be control flow (Tinygrad semantics)
+                // AFTER passthrough must not be control flow.
                 debug_assert!(
                     !matches!(passthrough.op(), Op::Range { .. } | Op::End { .. }),
-                    "reconstruct_sources: AFTER passthrough is {:?} (id={}), violates Tinygrad semantics",
+                    "reconstruct_sources: AFTER passthrough is {:?} (id={}), expected non-control-flow",
                     passthrough.op(),
                     passthrough.id
                 );
@@ -1447,7 +1371,7 @@ impl UOp {
             Op::Group { .. } => Op::Group { sources: new_srcs.iter().cloned().collect() },
         };
 
-        // Preserve original dtype and tag (Tinygrad ops.py:1256: preserves tag through source reconstruction)
+        // Preserve original dtype and tag through source reconstruction.
         Self::new_tagged(new_op, self.dtype.clone(), self.tag.clone())
     }
 }

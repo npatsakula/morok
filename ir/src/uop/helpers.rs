@@ -1,6 +1,4 @@
 //! Helper methods for UOp pattern matching and simplification.
-//!
-//! These methods support symbolic pattern matching, based on Tinygrad's ops.py.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -12,7 +10,6 @@ use crate::uop::UOp;
 impl UOp {
     /// Returns the largest known integer that divides this UOp.
     ///
-    /// Based on Tinygrad's `const_factor()` (ops.py:693-700).
     /// For MUL, only checks immediate CONST children (not recursive).
     pub fn const_factor(&self) -> i64 {
         match &self.op {
@@ -21,7 +18,7 @@ impl UOp {
                 ConstValue::UInt(u) => *u as i64,
                 _ => 1,
             },
-            // VCONST: GCD of all elements (Tinygrad ops.py:697)
+            // VCONST: GCD of all elements
             Op::VConst { values } => values
                 .iter()
                 .filter_map(|v| match v {
@@ -32,7 +29,7 @@ impl UOp {
                 .map(|v| v.abs())
                 .reduce(gcd)
                 .unwrap_or(1),
-            // MUL: only immediate CONST child, matching Tinygrad exactly
+            // MUL: only immediate CONST child
             Op::Binary(BinaryOp::Mul, a, b) => {
                 if let Op::Const(cv) = &a.op
                     && let ConstValue::Int(i) = cv.0
@@ -51,24 +48,11 @@ impl UOp {
         }
     }
 
-    /// Returns `self / v` if `v` divides `self` exactly, otherwise None.
-    ///
-    /// Based on Tinygrad's `divides()` (ops.py lines 703-711).
-    /// Delegates to [`Self::divides_int`] for constant divisors.
-    pub fn divides(self: &Arc<Self>, v: &Arc<Self>) -> Option<Arc<Self>> {
-        if let Op::Const(cv) = v.op()
-            && let ConstValue::Int(divisor) = cv.0
-        {
-            return self.divides_int(divisor);
-        }
-        None
-    }
-
     /// Returns `self / v` if integer `v` divides all terms exactly, otherwise None.
     ///
-    /// Based on Tinygrad's `divides(v: int)` (ops.py:701-709).
-    /// Recursively handles Const, Add, and Mul operations.
-    pub fn divides_int(self: &Arc<Self>, v: i64) -> Option<Arc<Self>> {
+    /// Recursively handles CONST, VCONST, ADD, and MUL — preserves symbolic
+    /// factors in the quotient (e.g. `(T*4).divides(4) == T`).
+    pub fn divides(self: &Arc<Self>, v: i64) -> Option<Arc<Self>> {
         if v == 1 {
             return Some(Arc::clone(self));
         }
@@ -80,7 +64,7 @@ impl UOp {
                 let ConstValue::Int(val) = cv.0 else { return None };
                 if val % v == 0 { Some(Self::const_(self.dtype(), ConstValue::Int(val / v))) } else { None }
             }
-            // VCONST: divide each element if all are divisible (Tinygrad ops.py:704)
+            // VCONST: divide each element if all are divisible
             Op::VConst { values } => {
                 let divided: Option<Vec<ConstValue>> = values
                     .iter()
@@ -92,15 +76,15 @@ impl UOp {
                 divided.map(|v| UOp::vconst(v, self.dtype().scalar_dtype()))
             }
             Op::Binary(BinaryOp::Add, a, b) => {
-                let d0 = a.divides_int(v)?;
-                let d1 = b.divides_int(v)?;
+                let d0 = a.divides(v)?;
+                let d1 = b.divides(v)?;
                 d0.try_add(&d1).ok()
             }
             Op::Binary(BinaryOp::Mul, a, b) => {
-                if let Some(d0) = a.divides_int(v) {
+                if let Some(d0) = a.divides(v) {
                     return d0.try_mul(b).ok();
                 }
-                if let Some(d1) = b.divides_int(v) {
+                if let Some(d1) = b.divides(v) {
                     return a.try_mul(&d1).ok();
                 }
                 None
@@ -111,8 +95,9 @@ impl UOp {
 
     /// Returns `self / v` if exact division by UOp `v` is possible.
     ///
-    /// Based on Tinygrad's `divide_exact(v: UOp)` (ops.py:717-726).
-    /// Handles identity, constant divisors, Add recursion, and Mul factoring.
+    /// MUL uses multiset-Counter matching so factor ordering doesn't determine
+    /// success — `(2*a*b).divide_exact(2*a)` yields `b` regardless of the Mul
+    /// tree's associativity.
     pub fn divide_exact(self: &Arc<Self>, v: &Arc<Self>) -> Option<Arc<Self>> {
         if Arc::ptr_eq(self, v) {
             return Some(self.const_like(1i64));
@@ -120,29 +105,54 @@ impl UOp {
         if let Op::Const(cv) = v.op()
             && let ConstValue::Int(d) = cv.0
         {
-            return self.divides_int(d);
+            return self.divides(d);
         }
         if let Op::Binary(BinaryOp::Add, a, b) = self.op() {
             let d0 = a.divide_exact(v)?;
             let d1 = b.divide_exact(v)?;
             return d0.try_add(&d1).ok();
         }
-        if let Op::Binary(BinaryOp::Mul, a, b) = self.op() {
-            if let Some(d) = a.divide_exact(v) {
-                return d.try_mul(b).ok();
+        if matches!(self.op(), Op::Binary(BinaryOp::Mul, _, _)) {
+            let (fac, c_self) = self.pop_const(BinaryOp::Mul);
+            let (div_fac, c_v) = v.pop_const(BinaryOp::Mul);
+            // `pop_const` seeds the const slot with the identity element
+            // (`Int(1)` for MUL on integer dtypes), so a non-int return means
+            // the expression has a non-integer const factor we cannot reason
+            // about — bail.
+            let const_self = c_self.try_int()?;
+            let const_v = c_v.try_int()?;
+            if const_v == 0 || const_self % const_v != 0 {
+                return None;
             }
-            if let Some(d) = b.divide_exact(v) {
-                return a.try_mul(&d).ok();
+            // Multiset diff: build counts from `fac`, subtract `div_fac` factors.
+            let mut counts: HashMap<u64, (Arc<Self>, i32)> = HashMap::new();
+            for f in fac.split_uop(BinaryOp::Mul) {
+                counts.entry(f.id).and_modify(|(_, c)| *c += 1).or_insert((f, 1));
             }
+            for f in div_fac.split_uop(BinaryOp::Mul) {
+                match counts.get_mut(&f.id) {
+                    Some((_, c)) => *c -= 1,
+                    None => return None,
+                }
+            }
+            if counts.values().any(|(_, c)| *c < 0) {
+                return None;
+            }
+            // Multiply remaining factors, seeded with the const quotient.
+            let mut result = self.const_like(const_self / const_v);
+            for (factor, count) in counts.values() {
+                for _ in 0..*count {
+                    result = result.try_mul(factor).ok()?;
+                }
+            }
+            return Some(result);
         }
         None
     }
 
     /// Computes the symbolic GCD of multiple UOps, returning a UOp.
     ///
-    /// Based on Tinygrad's `UOp.gcd()` (ops.py:713-716).
     /// Finds both numeric GCD of const_factors AND common symbolic MUL factors.
-    ///
     /// For inputs `6*a*b` and `4*a*c`, returns `2*a` (numeric GCD=2, common factor=a).
     pub fn symbolic_gcd(uops: &[Arc<Self>]) -> Arc<Self> {
         assert!(!uops.is_empty(), "symbolic_gcd requires at least one uop");
@@ -152,11 +162,8 @@ impl UOp {
             .iter()
             .map(|u| {
                 let f = u.const_factor();
-                let term = if f == 1 || f == 0 {
-                    Arc::clone(u)
-                } else {
-                    u.divides_int(f).unwrap_or_else(|| u.const_like(1i64))
-                };
+                let term =
+                    if f == 1 || f == 0 { Arc::clone(u) } else { u.divides(f).unwrap_or_else(|| u.const_like(1i64)) };
                 (term, f)
             })
             .collect();
@@ -193,7 +200,7 @@ impl UOp {
         // Step 5: multiply common symbolic factors with numeric GCD
         let mut result = uops[0].const_like(numeric);
         for (factor, count) in common.values() {
-            // Skip CONST(1) factors from divides_int normalization
+            // Skip CONST(1) factors from divides normalization
             if let Op::Const(cv) = factor.op()
                 && matches!(cv.0, ConstValue::Int(1))
             {
@@ -209,38 +216,29 @@ impl UOp {
 
     /// Separates a constant term from a binary expression.
     ///
-    /// Returns (non_const_part, const_value).
-    /// Based on Tinygrad's `pop_const()` (ops.py lines 712-713).
+    /// Returns `(non_const_part, const_value)` — when no const is present the
+    /// const slot is the operation's identity element (`0` for ADD, `1` for
+    /// MUL, `dtype.min` for MAX). Relies on the const-on-right canonicalization
+    /// invariant, so only the right operand is checked.
     ///
     /// # Examples
     ///
     /// ```text
-    /// (x + 5).pop_const(ADD) = (x, Some(Int(5)))
-    /// (x + y).pop_const(ADD) = (x + y, None)
-    /// x.pop_const(ADD) = (x, None)
+    /// (x + 5).pop_const(ADD) = (x, Int(5))
+    /// (x + y).pop_const(ADD) = (x + y, Int(0))
+    /// x.pop_const(ADD)       = (x, Int(0))
     /// ```
-    pub fn pop_const(self: &Arc<Self>, op: BinaryOp) -> (Arc<Self>, Option<ConstValue>) {
+    pub fn pop_const(self: &Arc<Self>, op: BinaryOp) -> (Arc<Self>, ConstValue) {
         if let Op::Binary(self_op, a, b) = self.op()
             && *self_op == op
+            && let Op::Const(cv) = b.op()
         {
-            // Check if right operand is constant
-            if let Op::Const(cv) = b.op() {
-                return (a.clone(), Some(cv.0));
-            }
-            // Check if left operand is constant (for commutative ops)
-            if op.is_commutative()
-                && let Op::Const(cv) = a.op()
-            {
-                return (b.clone(), Some(cv.0));
-            }
+            return (a.clone(), cv.0);
         }
-
-        (self.clone(), None)
+        (self.clone(), op.identity_element(self.dtype()))
     }
 
     /// Splits an associative operation chain into its individual terms.
-    ///
-    /// Based on Tinygrad's `split_uop()` (ops.py lines 464-467).
     ///
     /// # Examples
     ///
@@ -307,49 +305,6 @@ impl UOp {
         result
     }
 
-    /// Check if this UOp's size is divisible by the given amount.
-    ///
-    /// Returns `Some(quotient)` if divisible, `None` otherwise.
-    /// This is a convenience method for the optimizer to validate transformations.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let range = UOp::range(SInt::Const(16), 0, AxisType::Loop);
-    /// assert_eq!(range.divisible_by(4), Some(4)); // 16 / 4 = 4
-    /// assert_eq!(range.divisible_by(5), None);    // 16 not divisible by 5
-    /// ```
-    pub fn divisible_by(self: &Arc<Self>, amount: usize) -> Option<usize> {
-        // For RANGE operations, check the end (size) field
-        if let Op::Range { end, .. } = self.op() {
-            // Check if end is a constant
-            if let Op::Const(cv) = end.op()
-                && let ConstValue::Int(sz) = cv.0
-                && sz > 0
-                && (sz as usize).is_multiple_of(amount)
-            {
-                return Some((sz as usize) / amount);
-            }
-
-            // Check using const_factor
-            let factor = end.const_factor();
-            if factor > 0 && (factor as usize).is_multiple_of(amount) {
-                return Some((factor as usize) / amount);
-            }
-        }
-
-        // For constants, check the value directly
-        if let Op::Const(cv) = self.op()
-            && let ConstValue::Int(val) = cv.0
-            && val > 0
-            && (val as usize).is_multiple_of(amount)
-        {
-            return Some((val as usize) / amount);
-        }
-
-        None
-    }
-
     /// Create a new RANGE UOp with a different axis type.
     ///
     /// This is a convenience method for the optimizer to convert ranges between
@@ -382,8 +337,6 @@ impl UOp {
     /// This is used for range merging when comparing indexing patterns across
     /// multiple consumers.
     ///
-    /// Based on Tinygrad's `get_idx()` (ops.py:438-439).
-    ///
     /// # Examples
     ///
     /// ```ignore
@@ -415,8 +368,6 @@ impl UOp {
     /// This is used for range merging to combine validity conditions when
     /// multiple consumers share compatible indexing patterns.
     ///
-    /// Based on Tinygrad's `get_valid()` (ops.py:440-441).
-    ///
     /// # Examples
     ///
     /// ```ignore
@@ -440,7 +391,7 @@ impl UOp {
                 cond.clone()
             }
             Op::Invalid => {
-                // Bare Invalid is NOT valid (Tinygrad: self.arg is not Invalid → False)
+                // Bare Invalid is NOT valid
                 Self::const_(DType::Bool, ConstValue::Bool(false))
             }
             _ => {
@@ -498,8 +449,6 @@ impl UOp {
     /// - Irreducible ops (RANGE, CONST, DEFINE_VAR)
     /// - ADD of increasing ops
     /// - MUL/IDIV by non-negative constants
-    ///
-    /// Based on Tinygrad's `is_increasing()` (ops.py:689-694).
     ///
     /// # Examples
     ///

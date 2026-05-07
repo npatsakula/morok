@@ -26,8 +26,7 @@ fn test_const_factor_addition() {
 #[test]
 fn test_divides_constant_exact() {
     let c = UOp::const_(DType::Int32, ConstValue::Int(12));
-    let divisor = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let result = c.divides(&divisor);
+    let result = c.divides(3);
 
     assert!(result.is_some());
     if let Some(r) = result {
@@ -42,10 +41,7 @@ fn test_divides_constant_exact() {
 #[test]
 fn test_divides_constant_not_exact() {
     let c = UOp::const_(DType::Int32, ConstValue::Int(10));
-    let divisor = UOp::const_(DType::Int32, ConstValue::Int(3));
-    let result = c.divides(&divisor);
-
-    assert!(result.is_none());
+    assert!(c.divides(3).is_none());
 }
 
 #[test]
@@ -57,7 +53,7 @@ fn test_pop_const_with_constant() {
     let (rest, const_val) = add.pop_const(BinaryOp::Add);
 
     assert!(Arc::ptr_eq(&rest, &x));
-    assert_eq!(const_val, Some(ConstValue::Int(5)));
+    assert_eq!(const_val, ConstValue::Int(5));
 }
 
 #[test]
@@ -69,7 +65,8 @@ fn test_pop_const_without_constant() {
     let (rest, const_val) = add.pop_const(BinaryOp::Add);
 
     assert!(Arc::ptr_eq(&rest, &add));
-    assert_eq!(const_val, None);
+    // No literal const present → identity (Int(0) for ADD on Int32).
+    assert_eq!(const_val, ConstValue::Int(0));
 }
 
 #[test]
@@ -169,9 +166,9 @@ fn test_const_factor_vconst_no_common() {
 }
 
 #[test]
-fn test_divides_int_vconst() {
+fn test_divides_vconst() {
     let vc = UOp::vconst(vec![ConstValue::Int(6), ConstValue::Int(12)], DType::Int64);
-    let result = vc.divides_int(3);
+    let result = vc.divides(3);
     assert!(result.is_some());
     if let Some(r) = result {
         if let Op::VConst { values } = r.op() {
@@ -183,7 +180,7 @@ fn test_divides_int_vconst() {
 }
 
 #[test]
-fn test_divides_int_vconst_not_divisible() {
+fn test_divides_vconst_not_divisible() {
     let vc = UOp::vconst(
         vec![
             ConstValue::Int(6),
@@ -191,7 +188,7 @@ fn test_divides_int_vconst_not_divisible() {
         ],
         DType::Int64,
     );
-    assert!(vc.divides_int(3).is_none());
+    assert!(vc.divides(3).is_none());
 }
 
 #[test]

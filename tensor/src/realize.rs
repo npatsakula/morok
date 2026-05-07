@@ -29,9 +29,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use morok_schedule::{
-    Scheduler, apply_post_optimization, beam_search_cached, hand_coded_optimizations, prepare_scheduler,
-};
+use morok_schedule::{Scheduler, apply_post_optimization_with_renderer, beam_search_cached, prepare_scheduler};
 use tracing::{debug, trace};
 
 use crate::{
@@ -45,7 +43,7 @@ use crate::{
 };
 use morok_device::{Buffer, device::Device};
 use morok_ir::pattern::is_any_const;
-use morok_ir::{AxisType, DeviceSpec, Op, UOp, UOpKey};
+use morok_ir::{DeviceSpec, Op, UOp, UOpKey};
 use morok_runtime::{
     ExecutionPlan, ExecutionPlanBuilder, PreparedBufferView, PreparedCopy, PreparedCustomFunction, PreparedKernel,
     PreparedOp,
@@ -535,13 +533,10 @@ impl Tensor {
 
 /// Extract bound variable values from a UOp graph (pre-pipeline).
 ///
-/// Scans for BIND(DEFINE_VAR, CONST) nodes and extracts the mapping
-/// from variable name to concrete bound value. This is the Morok equivalent
-/// of Tinygrad's `strip_bind` in `pm_pre_sched_cache`.
-///
-/// These values are passed through to scheduling so that user Variables
-/// (like `Variable::new("N", 1, 32).bind(4)`) are treated as fixed parameters
-/// rather than OUTER ranges to be expanded.
+/// Scans for BIND(DEFINE_VAR, CONST) nodes and extracts the mapping from
+/// variable name to concrete bound value. These values are passed through to
+/// scheduling so that user Variables (like `Variable::new("N", 1, 32).bind(4)`)
+/// are treated as fixed parameters rather than schedule-loop ranges to expand.
 /// Insert `(name, val)` into `var_vals` if not present, otherwise check that
 /// any existing binding agrees. Returns `Err((prev, val))` on mismatch so
 /// callers can format the error in their own context.
@@ -651,7 +646,6 @@ fn schedule_result_from_sink_uncached(
 
 /// Pre-schedule cache normalization result.
 ///
-/// Mirrors Tinygrad `pm_pre_sched_cache` behavior:
 /// - BUFFER -> PARAM
 /// - BUFFER_VIEW identities normalized via recursive BUFFER -> PARAM
 /// - strip runtime value from BIND(DEFINE_VAR, CONST)
@@ -673,7 +667,7 @@ pub(crate) struct NormalizeScheduleCacheCtx {
     pub bind_mismatch: Option<String>,
 }
 
-/// Full pre-schedule cache normalization (Tinygrad parity).
+/// Full pre-schedule cache normalization.
 pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCacheNormalization> {
     let mut ctx = NormalizeScheduleCacheCtx {
         param_map: HashMap::new(),
@@ -717,7 +711,7 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
         RewriteResult::Rewritten(UOp::param(slot, *size, node.dtype(), Some(device.clone())))
     });
 
-    // BUFFER_VIEW -> PARAM (Tinygrad pm_replace_buf parity).
+    // BUFFER_VIEW -> PARAM.
     matcher.add(&[OpKey::BufferView], |node, ctx| {
         let Op::BufferView { size, .. } = node.op() else {
             return RewriteResult::NoMatch;
@@ -751,7 +745,7 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
         RewriteResult::Rewritten(to_param(node, ctx, 0, Some(UOp::device(DeviceSpec::Cpu))))
     });
 
-    // Tinygrad pre-schedule cache normalization:
+    // Pre-schedule cache normalization:
     // - BUFFER(UNIQUE, DEVICE) -> PARAM
     // - BUFFER_VIEW base identity normalized through child BUFFER -> PARAM
     // - BIND(DEFINE_VAR, CONST) -> PARAM + var_vals capture
@@ -795,7 +789,7 @@ pub(crate) fn normalize_for_schedule_cache(sink: &Arc<UOp>) -> Result<ScheduleCa
     })
 }
 
-/// Post-schedule cache restore (Tinygrad `pm_post_sched_cache` equivalent).
+/// Post-schedule cache restore.
 ///
 /// Restores normalized placeholders back to runtime graph form for this run:
 /// - PARAM(slot, device=Some(_)) -> original source node for current invocation
@@ -842,8 +836,8 @@ pub(crate) fn restore_post_schedule_cache(root: &Arc<UOp>, normalization: &Sched
         }
     }
 
-    // Tinygrad parity: restore over the whole cached graph.
-    // This allows PARAM/BIND placeholders to be rewritten before schedule extraction.
+    // Restore over the whole cached graph so PARAM/BIND placeholders are
+    // rewritten before schedule extraction.
     root.substitute(&subs)
 }
 
@@ -877,10 +871,9 @@ fn restore_bind_placeholders_for_schedule(root: &Arc<UOp>, normalization: &Sched
 
 /// Restore cached pre-schedule buffer UOps for the current invocation.
 ///
-/// Tinygrad caches `pre_schedule` with normalized PARAM placeholders and then
-/// post-rewrites only buffer UOps (`buf_uops`). This helper mirrors that flow:
-/// callable identities/ASTs remain cached, while source/output buffer UOps are
-/// restored to run-specific BUFFER identities.
+/// `pre_schedule` is cached with normalized PARAM placeholders; this helper
+/// restores source/output buffer UOps to run-specific BUFFER identities while
+/// callable identities/ASTs stay cached.
 fn restore_post_schedule_pre_schedule(
     pre_schedule: &crate::schedule::PreSchedule,
     normalization: &ScheduleCacheNormalization,
@@ -923,7 +916,7 @@ fn restore_post_schedule_pre_schedule(
     let output_buffer_uops = restored_flat[outputs_offset..].to_vec();
     crate::schedule::PreSchedule {
         items: restored_items,
-        linear_ops: pre_schedule.linear_ops.clone(),
+        invocations: pre_schedule.invocations.clone(),
         output_buffer_uops,
     }
 }
@@ -1134,12 +1127,10 @@ fn prepare_execution_plan(
     // Schedule items are already fully expanded by strict scheduler unroll.
     let mut schedule_items = schedule_result.items.clone();
 
-    // Liveness-based pool reuse. Equivalent in correctness to tinygrad's arena
-    // planner; differs only in storage strategy (per-pool Arc<Buffer> swaps vs.
-    // monolithic arena with byte-offset BUFFER_VIEWs). Arena would pack tighter
-    // and reduce allocator calls — tracked as the deferred PlannerMode::Arena
-    // branch. Mode is selected by `MOROK_MEMORY_PLANNER`; `Disabled` short-
-    // circuits the planner cleanly so callers don't need to gate the call.
+    // Liveness-based memory planning. `PlannerMode::Arena` (default) packs
+    // plannable buffers into one or two large allocations; `Remap` swaps
+    // per-pool `Arc<Buffer>`s; `Disabled` short-circuits. Mode is selected
+    // by `MOROK_MEMORY_PLANNER` (`Arena` if unset).
     let planner_mode = crate::memory_planner::mode_from_env();
     let output_buffer_ids = collect_output_buffer_ids(&schedule_items, &schedule_result.output_uop_ids);
     let planner_result = crate::memory_planner::memory_planner(&schedule_items, &output_buffer_ids, planner_mode);
@@ -1260,7 +1251,7 @@ fn prepare_execution_plan(
 
         // BUFFER_VIEW: zero-copy sub-buffer view (DISK weight views).
         // Creates a view into the base buffer at the specified byte offset.
-        // Tinygrad schedule.py:201-204: buffers[buf_uops[0]] = base.view(size, dtype, offset)
+        // BUFFER_VIEW lowers to a base.view(size, dtype, offset) on the source buffer.
         if let Op::BufferView { size, offset, .. } = runtime_ast.op() {
             let buffer_indices = resolve_item_buffer_indices(item, &uop_id_to_idx)?;
 
@@ -1298,7 +1289,6 @@ fn prepare_execution_plan(
             continue;
         }
 
-        // Explicit CUSTOM_FUNCTION runtime operations (Tinygrad ExecItem lowerers).
         // CALL bodies rooted at CUSTOM_FUNCTION are lowered directly to runtime
         // PreparedOp::CustomFunction with typed dispatch. Match against the
         // unwrapped runtime AST so END(CustomFunction) reaches this branch
@@ -1469,24 +1459,13 @@ fn collect_output_buffer_ids(schedule: &crate::schedule::Schedule, output_uop_id
 }
 
 fn collect_non_overridable_fixedvars(item: &ScheduleItem) -> HashMap<String, i64> {
-    let Op::Call { args, .. } = item.kernel.op() else {
-        return HashMap::new();
-    };
-
-    let mut locked = HashMap::new();
-    for arg in args {
-        let Op::Bind { var, value } = arg.op() else {
-            continue;
-        };
-        let Op::DefineVar { name, .. } = var.op() else {
-            continue;
-        };
-        let Op::Range { axis_type, .. } = value.op() else {
-            continue;
-        };
-        if *axis_type != AxisType::Outer {
-            continue;
-        }
+    // Schedule-loop bindings (eagerly unrolled outer ranges) must not be
+    // overridden by user `var_vals` — they're loop counters, not symbolic
+    // input variables. `loop_var_names` is populated at instantiation time
+    // from the keys of `KernelInvocation.fixedvars`, structurally separating
+    // loop counters from runtime variable binds.
+    let mut locked = HashMap::with_capacity(item.loop_var_names.len());
+    for name in &item.loop_var_names {
         if let Some(v) = item.fixedvars.get(name) {
             locked.insert(name.clone(), *v);
         }
@@ -1581,14 +1560,8 @@ fn get_optimizer_renderer(device: &Device) -> morok_schedule::OptimizerRenderer 
 /// Optimize a kernel AST using beam search auto-tuning.
 ///
 /// Beam search explores multiple optimization paths and selects the fastest
-/// by compiling and timing each candidate. This is slower than heuristics
-/// but can find better optimizations.
-///
-/// Note: Unlike Tinygrad which dispatches to EITHER beam search OR heuristics,
-/// we pre-seed the beam with heuristic results (TC, output upcast, threading).
-/// This gives beam search a strong starting point while letting it explore
-/// further optimizations. TC must be applied by heuristics since beam search
-/// requires TC as the very first opt.
+/// by compiling and timing each candidate. Slower than heuristics but can
+/// find better optimizations. Beam and heuristic are mutually exclusive.
 fn beam_search_optimize(
     ast: Arc<UOp>,
     renderer: &morok_schedule::OptimizerRenderer,
@@ -1597,13 +1570,9 @@ fn beam_search_optimize(
     optimizer_config: &morok_schedule::OptimizerConfig,
 ) -> Result<Arc<UOp>> {
     let beam_config = &optimizer_config.beam;
-    // Prepare scheduler (applies symbolic simplification and loop→global)
-    let mut scheduler = prepare_scheduler(ast, renderer);
-
-    // Apply hand-coded heuristics BEFORE beam search to seed with TC, output
-    // upcast, threading, etc. Beam search then explores further optimizations
-    // on top of this baseline.
-    hand_coded_optimizations(&mut scheduler, &optimizer_config.heuristics);
+    // Prepare scheduler (applies symbolic simplification and loop→global).
+    // BEAM and heuristic are mutually exclusive.
+    let scheduler = prepare_scheduler(ast, renderer);
 
     // Ensure all buffers are allocated for timing
     for buf in buffers {
@@ -1621,74 +1590,201 @@ fn beam_search_optimize(
     let dev_device = device.device.clone();
     let max_uops = beam_config.max_uops;
 
-    // Compile-and-time function: compilation is NOT timed, only execution.
-    // Wrapped in catch_unwind because beam search explores speculative candidates
-    // that may trigger rewrite engine limits or other panics. Matches Tinygrad's
-    // try/except in _try_compile (codegen/opt/search.py:67-82).
-    let compile_and_time = |s: &Scheduler| -> Option<Duration> {
+    // Force rayon's global thread pool to materialise before the BEAM loop so
+    // the first candidate's bench doesn't pay pool-init cost. Subsequent calls
+    // are O(1) thread-pool dispatch — but the lazy init can dominate the first
+    // 1-2 measurements at the small kernel sizes BEAM-time uses, biasing
+    // ranking against fast candidates that happen to run first.
+    morok_runtime::warmup_thread_pool();
+
+    // Per-candidate compile timeout. Rust can't safely interrupt clang via
+    // POSIX signals, so we run each candidate's compile+time on a detached
+    // worker thread and abandon the worker on timeout. Side effect: a hung
+    // clang invocation leaks one OS thread per timeout, reaped at process
+    // exit.
+    let beam_timeout =
+        Duration::from_secs(std::env::var("MOROK_BEAM_TIMEOUT_SEC").ok().and_then(|s| s.parse().ok()).unwrap_or(10));
+
+    // Per-BEAM-call cache for `apply_post_optimization_with_renderer`. Many
+    // candidates expand from the same parent state and share the underlying
+    // raw AST; without this cache the rewrite engine re-runs the full
+    // post-optimisation graph rewrite for each, costing ~13 ms × N candidates.
+    // Scoped to one `beam_search_optimize` invocation so stale entries cannot
+    // leak between calls. Read-mostly access pattern fits papaya's lock-free
+    // reads + bounded-lock writes.
+    let post_opt_cache: Arc<papaya::HashMap<u64, Arc<UOp>>> = Arc::new(papaya::HashMap::new());
+
+    // Compile-and-time closure: compilation is NOT timed, only execution. Wrapped
+    // in catch_unwind because beam search explores speculative candidates that
+    // may trigger rewrite engine limits or other panics. Wrapped in a worker
+    // thread + recv_timeout so a hung clang invocation cannot block BEAM.
+    //
+    // Returns `CandidateMetrics` (timing + structural IR hash + compute-op count)
+    // so the beam loop can apply `seen_libs` dedup and the
+    // `least_compute_ops*1000` compute-bloat filter. The optional `early_stop`
+    // argument is propagated into `BenchmarkConfig` so `benchmark_kernel` can
+    // abort the run loop the moment any single run exceeds the threshold.
+    let compile_and_time = |s: &Scheduler, early_stop: Option<Duration>| -> Option<morok_schedule::CandidateMetrics> {
         use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::mpsc;
 
-        catch_unwind(AssertUnwindSafe(|| {
-            let raw_ast = s.get_optimized_ast(None);
+        // Per-call clones move into the worker. All Arc/Clone — no deep copy.
+        let s_owned = s.clone();
+        let renderer_c = renderer.clone();
+        let dev_renderer_c = dev_renderer.clone();
+        let dev_compiler_c = dev_compiler.clone();
+        let dev_runtime_c = dev_runtime.clone();
+        let dev_device_c = dev_device.clone();
+        let buffers_c = buffers.clone();
+        let bench_config_c = bench_config.clone();
+        let max_uops_c = max_uops;
+        let post_opt_cache_c = Arc::clone(&post_opt_cache);
 
-            // Apply post-optimization passes for accurate timing
-            let optimized = apply_post_optimization(raw_ast);
+        let (tx, rx) = mpsc::sync_channel::<Option<morok_schedule::CandidateMetrics>>(1);
+        // Detached: drop the JoinHandle so `recv_timeout` can return without
+        // blocking on the worker. If clang hangs, the thread orphans and is
+        // collected at process exit.
+        let _ = std::thread::spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let raw_ast = s_owned.get_optimized_ast(None);
 
-            // Extract kernel name before decomposition (which loses metadata)
-            let kernel_name =
-                optimized.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
+                // Apply post-optimization passes for accurate timing.
+                // Pass the renderer so pm_add_gpudims fires for has_threads/has_local backends —
+                // otherwise the Thread axis stays as a plain RANGE and gets rendered as a
+                // sequential `for` loop instead of a parallel core_id dispatch, making BEAM
+                // candidates time as single-threaded and converge to wrong tile shapes.
+                //
+                // Cache by `raw_ast.content_hash`: BEAM expands children of the same
+                // parent in lockstep, so siblings share `raw_ast` and would otherwise
+                // re-run the full graph rewrite (~13 ms each).
+                let cache_key = raw_ast.content_hash;
+                let cache_pin = post_opt_cache_c.pin();
+                let optimized = if let Some(cached) = cache_pin.get(&cache_key) {
+                    cached.clone()
+                } else {
+                    let opt = apply_post_optimization_with_renderer(raw_ast, Some(&renderer_c));
+                    cache_pin.insert(cache_key, opt.clone());
+                    opt
+                };
 
-            // Post-optimization UOp count filter (matches Tinygrad's BEAM_UOPS_MAX).
-            // validate_limits checks pre-optimization AST size, but devectorization
-            // can massively expand the graph (e.g., 256-wide UPCAST -> 4096 GEP indices).
-            if optimized.toposort().len() > max_uops {
-                return None;
-            }
+                // Extract kernel name before decomposition (which loses metadata)
+                let kernel_name =
+                    optimized.metadata::<morok_schedule::optimizer::KernelInfo>().map(|info| info.function_name());
 
-            // Apply decomposition
-            let decomposed = match dev_renderer.decompositor() {
-                Some(m) => morok_ir::decompositions::decompose_with(&optimized, &m),
-                None => optimized,
-            };
-            let program = morok_codegen::program_pipeline::program_from_sink(decomposed, dev_device.clone());
+                // Post-optimization UOp count filter. validate_limits checks
+                // pre-optimization AST size, but devectorization can massively expand
+                // the graph (e.g., 256-wide UPCAST -> 4096 GEP indices).
+                if optimized.toposort().len() > max_uops_c {
+                    return None;
+                }
 
-            // Render and compile through PROGRAM stages (NOT timed).
-            let (spec, compiled) = compile_with_program_pipeline_components(
-                program,
-                dev_renderer.as_ref(),
-                dev_compiler.as_ref(),
-                kernel_name.as_deref(),
-            )
-            .ok()?;
-            let program = (dev_runtime)(&compiled).ok()?;
+                // Pre-codegen metrics: structural hash for `seen_libs`, ALU node
+                // count for `least_compute_ops`. Computed before compile so even
+                // failed compiles still consume a slot fairly.
+                let ir_hash = morok_schedule::hash_post_codegen_ir(&optimized);
+                let compute_ops = morok_schedule::compute_ops_estimate(&optimized);
 
-            // Extract buffer pointers inside the closure (avoids Sync issue)
-            let buffer_ptrs: Vec<*mut u8> = buffers.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
+                // Apply decomposition
+                let decomposed = match dev_renderer_c.decompositor() {
+                    Some(m) => morok_ir::decompositions::decompose_with(&optimized, &m),
+                    None => optimized,
+                };
+                let program = morok_codegen::program_pipeline::program_from_sink(decomposed, dev_device_c.clone());
 
-            // Time ONLY execution (pass resolved global/local size for threaded kernels)
-            // Note: Empty vals slice since benchmark kernels don't have symbolic variables
-            let launch_dims = spec.launch_dims(&HashMap::new()).ok()?;
-            let result = unsafe {
-                morok_runtime::benchmark_kernel(
-                    program.as_ref(),
-                    &buffer_ptrs,
-                    &[],
-                    Some(launch_dims.global_size),
-                    launch_dims.local_size,
-                    &bench_config,
+                // Render and compile through PROGRAM stages (NOT timed).
+                let (spec, compiled) = compile_with_program_pipeline_components(
+                    program,
+                    dev_renderer_c.as_ref(),
+                    dev_compiler_c.as_ref(),
+                    kernel_name.as_deref(),
                 )
-                .ok()?
-            };
+                .ok()?;
+                let program = (dev_runtime_c)(&compiled).ok()?;
 
-            Some(result.min)
-        }))
-        .ok()
-        .flatten()
+                // Extract buffer pointers inside the worker (avoids Sync issue
+                // and keeps raw pointers thread-local).
+                let buffer_ptrs: Vec<*mut u8> = buffers_c.iter().map(|b| unsafe { b.as_raw_ptr() }).collect();
+
+                // Time ONLY execution. Each non-runtime variable gets the midpoint
+                // of its declared range (`(vmin+vmax)/2`) so symbolic-bound kernels
+                // do representative work. `core_id` stays unbound (patched per-thread
+                // by `execute_parallel`).
+                let mut user_var_vals: HashMap<&str, i64> = HashMap::new();
+                for v in &spec.vars {
+                    if v.name != "core_id" {
+                        user_var_vals.insert(v.name.as_str(), (v.min + v.max) / 2);
+                    }
+                }
+                let launch_dims = spec.launch_dims(&user_var_vals).ok()?;
+                let vals: Vec<i64> =
+                    spec.var_names.iter().map(|n| user_var_vals.get(n.as_str()).copied().unwrap_or(0)).collect();
+
+                // Bound BEAM dispatch grid: if `prod(global_size) > MAX_TEST_GLOBAL_SIZE`,
+                // halve the largest dim (>16) until it fits, then scale the measured
+                // time by `factor = original_size / shrunk_size` to recover the
+                // full-grid estimate. Morok's CPU dispatch has `global_size[0]` = thread
+                // count, typically ≤ 16, so this is a no-op for CPU and only engages
+                // for GPU-style large grids.
+                const MAX_TEST_GLOBAL_SIZE: usize = 65536;
+                let mut test_global_size = launch_dims.global_size;
+                let original_size: usize = test_global_size.iter().product();
+                while test_global_size.iter().product::<usize>() > MAX_TEST_GLOBAL_SIZE {
+                    let mut halved = false;
+                    for j in (0..test_global_size.len()).rev() {
+                        if test_global_size[j] > 16 {
+                            test_global_size[j] /= 2;
+                            halved = true;
+                            break;
+                        }
+                    }
+                    if !halved {
+                        break;
+                    }
+                }
+                let shrunk_size: usize = test_global_size.iter().product();
+                let factor: f64 = if shrunk_size > 0 { original_size as f64 / shrunk_size as f64 } else { 1.0 };
+
+                let mut bench_config = bench_config_c.clone();
+                // Translate the unshrunk early-stop threshold into the shrunk
+                // timing domain so per-run abort fires at the same effective point.
+                bench_config.early_stop = early_stop.map(|t| {
+                    let nanos = t.as_nanos() as f64 / factor;
+                    Duration::from_nanos(nanos.min(u64::MAX as f64) as u64)
+                });
+                // CPU/AMX have no hardware cache-invalidate primitive — run warm-cache.
+                // GPU backends keep the invalidate.
+                bench_config.clear_l2 = renderer_c.device.has_hardware_cache_invalidate();
+                let result = unsafe {
+                    morok_runtime::benchmark_kernel(
+                        program.as_ref(),
+                        &buffer_ptrs,
+                        &vals,
+                        Some(test_global_size),
+                        launch_dims.local_size,
+                        &bench_config,
+                    )
+                    .ok()?
+                };
+
+                // Scale measured time back to the full-grid estimate.
+                let scaled_nanos = (result.min.as_nanos() as f64 * factor).min(u64::MAX as f64);
+                let timing = Duration::from_nanos(scaled_nanos as u64);
+                Some(morok_schedule::CandidateMetrics { timing, ir_hash, compute_ops })
+            }))
+            .ok()
+            .flatten();
+            // Receiver may have already given up on timeout — ignore send errors.
+            let _ = tx.send(result);
+        });
+
+        // None on timeout, panic, or worker disconnect — BEAM treats all the
+        // same: candidate dropped, search continues.
+        rx.recv_timeout(beam_timeout).ok().flatten()
     };
 
     // Suppress panic output during beam search. Speculative candidates may panic
-    // at compile or runtime — this is expected (matches Tinygrad's silent try/except).
-    // catch_unwind catches panics but the default hook prints them first.
+    // at compile or runtime — this is expected. catch_unwind catches panics
+    // but the default hook prints them first.
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = beam_search_cached(scheduler, beam_config, compile_and_time);
@@ -1703,9 +1799,10 @@ fn beam_search_optimize(
         "beam_search_optimize: completed"
     );
 
-    // Apply post-optimization to final result
+    // Apply post-optimization to final result with renderer so pm_add_gpudims runs
+    // (Thread → core_id, Global → SPECIAL).
     let raw_ast = result.scheduler.get_optimized_ast(None);
-    Ok(apply_post_optimization(raw_ast))
+    Ok(apply_post_optimization_with_renderer(raw_ast, Some(renderer)))
 }
 
 #[cfg(test)]

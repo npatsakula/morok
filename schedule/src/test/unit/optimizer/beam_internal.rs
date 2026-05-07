@@ -34,14 +34,13 @@ fn test_beam_actions_contains_expected_types() {
     let has_unroll = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::UNROLL);
     let has_tc = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::TC);
     let has_swap = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::SWAP);
-    let has_nolocals = BEAM_ACTIONS.iter().any(|a| a.op == OptOps::NOLOCALS);
 
     assert!(has_upcast);
     assert!(has_local);
     assert!(has_unroll);
     assert!(has_tc);
     assert!(has_swap);
-    assert!(has_nolocals);
+    // NOLOCALS is env-gated (`MOROK_NOLOCALS`), tested separately.
 }
 
 #[test]
@@ -57,8 +56,15 @@ fn test_beam_search_with_mock_scoring() {
 
     let config = BeamConfig { beam_width: 2, timeout: Duration::from_millis(100), ..Default::default() };
 
-    // Mock scoring: just return a constant time
-    let mock_score = |_s: &Scheduler| Some(Duration::from_micros(100));
+    // Mock scoring: return constant timing + a hash that varies by scheduler
+    // pointer so dedup doesn't collapse every candidate to one entry.
+    let mock_score = |s: &Scheduler, _early_stop: Option<Duration>| {
+        Some(CandidateMetrics {
+            timing: Duration::from_micros(100),
+            ir_hash: s as *const Scheduler as u64,
+            compute_ops: 1,
+        })
+    };
 
     let result = beam_search(scheduler, &config, mock_score);
     assert!(result.is_ok());

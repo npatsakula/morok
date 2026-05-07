@@ -10,7 +10,12 @@ use morok_dtype::DeviceSpec;
 use morok_dtype::{DType, ScalarDType};
 
 /// Constant value that can be stored in a UOp.
-#[derive(Debug, Clone, Copy, PartialEq, derive_more::From)]
+///
+/// `PartialEq` is implemented manually so that float comparison uses bit
+/// equality (`to_bits()`), matching the `Hash` impl below. Without this,
+/// `-0.0 == 0.0` and `NaN != NaN` under `PartialEq` would diverge from the
+/// hash semantics, breaking Rust's `Hash`/`Eq` contract for hash-cons keys.
+#[derive(Debug, Clone, Copy, derive_more::From)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum ConstValue {
     Int(i64),
@@ -18,6 +23,20 @@ pub enum ConstValue {
     Float(f64),
     Bool(bool),
 }
+
+impl PartialEq for ConstValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::UInt(a), Self::UInt(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ConstValue {}
 
 macro_rules! impl_from_widening {
     ($($ty:ty => Int),+ $(,)?) => { $(
@@ -131,7 +150,7 @@ fn cast_float(v: f64, to: ScalarDType) -> Option<ConstValue> {
         Int16 => ConstValue::Int(cast_via!(v, i16, i64)),
         Int32 => ConstValue::Int(cast_via!(v, i32, i64)),
         Int64 | Index => ConstValue::Int(v as i64),
-        // Float-to-unsigned: route through i64 first (matches Tinygrad behavior)
+        // Float-to-unsigned: route through i64 first.
         UInt8 => ConstValue::UInt(cast_via!(v as i64, u8, u64)),
         UInt16 => ConstValue::UInt(cast_via!(v as i64, u16, u64)),
         UInt32 => ConstValue::UInt(cast_via!(v as i64, u32, u64)),
@@ -182,7 +201,7 @@ impl ConstValue {
         })
     }
 
-    /// Minimum representable value for a scalar dtype (matches Tinygrad's `dtypes.min`).
+    /// Minimum representable value for a scalar dtype.
     pub const fn min(dtype: ScalarDType) -> Self {
         use ScalarDType::*;
         match dtype {
@@ -200,7 +219,7 @@ impl ConstValue {
         }
     }
 
-    /// Maximum representable value for a scalar dtype (matches Tinygrad's `dtypes.max`).
+    /// Maximum representable value for a scalar dtype.
     pub const fn max(dtype: ScalarDType) -> Self {
         use ScalarDType::*;
         match dtype {
@@ -302,8 +321,7 @@ impl ConstValue {
 
     /// Truncate value to fit within dtype boundaries (two's complement wrapping).
     ///
-    /// This is equivalent to Tinygrad's ctypes-based truncation. Used for constant
-    /// folding to ensure results respect the target dtype's bit width.
+    /// Used for constant folding to ensure results respect the target dtype's bit width.
     pub fn truncate(self, dtype: ScalarDType) -> Self {
         use ScalarDType::*;
         match (self, dtype) {
@@ -355,11 +373,9 @@ impl BufferizeOpts {
 
 /// Optimization hint carried by CONTIGUOUS ops.
 ///
-/// This is a simplified representation of optimizer hints that can be
-/// converted to/from the full `Opt` type in the schedule crate.
-/// Keeps the IR layer decoupled from optimizer-specific types.
-///
-/// Based on Tinygrad's CONTIGUOUS.arg which carries Opt tuples.
+/// Simplified representation of optimizer hints that can be converted to/from
+/// the full `Opt` type in the schedule crate. Keeps the IR layer decoupled
+/// from optimizer-specific types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ContiguousHint {
@@ -373,8 +389,7 @@ pub struct ContiguousHint {
 
 /// Metadata payload carried by CALL operations.
 ///
-/// Mirrors Tinygrad's `CallInfo` shape while staying serializable/hashable in Rust.
-/// `grad_tag` is a placeholder for future gradient callback identity and
+/// `grad_tag` is a placeholder for future gradient callback identity;
 /// `metadata` carries stable, cache-key-safe call annotations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -415,19 +430,14 @@ pub struct KernelInfo {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum AxisType {
-    /// Outer kernel-level scheduling dimension (doesn't go inside kernels).
-    ///
-    /// Used to mark ranges that exist at the scheduling/orchestration level
-    /// but don't become part of kernel execution. These ranges are used during
-    /// kernel splitting to identify boundaries.
-    Outer,
     /// GPU grid dimension.
     Global,
     /// Warp/wavefront dimension.
     Warp,
     /// GPU block/workgroup dimension (local memory scope).
     Local,
-    /// Regular loop.
+    /// Regular loop — default axis type produced by rangeify. Schedule-level
+    /// loop wrappers are distinguished structurally by `END(Call)` pairing.
     Loop,
     /// Grouped reduction.
     GroupReduce,
@@ -439,29 +449,18 @@ pub enum AxisType {
     Unroll,
     /// Thread dimension.
     Thread,
-    /// Temporary canonicalized range for RESHAPE caching (Tinygrad: AxisType.PLACEHOLDER).
-    /// Substituted in before `_apply_reshape` and substituted back after.
+    /// Temporary canonicalized range for RESHAPE caching. Substituted in before
+    /// `_apply_reshape` and substituted back after.
     Placeholder,
 }
 
 impl AxisType {
-    /// Returns true if this axis type represents a kernel boundary.
-    ///
-    /// Kernel boundary ranges (Outer) exist at the scheduling level and
-    /// don't go inside individual kernels. During kernel splitting, operations
-    /// with outer ranges are skipped from being packaged into CALL wrappers.
-    pub const fn is_kernel_boundary(&self) -> bool {
-        matches!(self, Self::Outer)
-    }
-
     /// Returns the priority for sorting ranges.
     ///
     /// Lower values are outer loops, higher values are inner loops.
-    /// Matches Tinygrad's axis_to_pos ordering for kernel optimization.
     ///
     /// **Priority Order:**
-    /// - Outer: -2 (kernel-level boundary)
-    /// - Loop: -1 (not yet parallelized)
+    /// - Loop: -1 (not yet parallelized; rangeify default)
     /// - Global/Thread: 0 (outer parallelism)
     /// - Warp: 1 (sub-group parallelism)
     /// - Local/GroupReduce: 2 (workgroup parallelism + synchronization)
@@ -470,7 +469,6 @@ impl AxisType {
     /// - Unroll: 5 (unrolled loops, innermost)
     pub const fn priority(self) -> i32 {
         match self {
-            Self::Outer => -2,
             Self::Loop => -1,
             Self::Global | Self::Thread => 0,
             Self::Warp => 1,
@@ -487,7 +485,6 @@ impl AxisType {
     /// Used in kernel name generation and debug output.
     ///
     /// **Letter Codes:**
-    /// - O: Outer
     /// - L: Loop
     /// - g: Global
     /// - t: Thread
@@ -499,7 +496,6 @@ impl AxisType {
     /// - r: Unroll
     pub const fn letter(self) -> char {
         match self {
-            Self::Outer => 'O',
             Self::Loop => 'L',
             Self::Global => 'g',
             Self::Thread => 't',
@@ -664,30 +660,22 @@ pub enum BinaryOp {
     Sub,
     /// Modulo: a % b (C-style remainder)
     ///
-    /// Uses C/Rust semantics where result has the sign of the dividend (first operand).
-    /// This matches Tinygrad's MOD and C's % operator.
+    /// Uses C/Rust semantics where the result has the sign of the dividend.
+    /// **NOT** Python's modulo (which has sign of the divisor).
     ///
-    /// **NOT** Python's modulo operator (which has sign of the divisor).
-    ///
-    /// Examples: -9 % 5 = -4 (Python gives 1), 9 % -5 = 4 (Python gives -1)
+    /// Examples: -9 % 5 = -4 (Python: 1), 9 % -5 = 4 (Python: -1).
     Mod,
     /// Maximum: max(a, b)
     Max,
     /// Power: a^b
     Pow,
-    /// Integer division: a / b (truncated toward zero)
+    /// Integer division: a / b (C-style truncation toward zero).
     ///
-    /// Uses C-style truncation, NOT floor division.
-    /// This matches Tinygrad's IDIV and C's / operator for integers.
+    /// **NOT** Python's `//` floor division (which rounds toward -∞).
     ///
-    /// **NOT** Python's // floor division (which rounds toward -∞).
-    ///
-    /// Examples: -9 / 5 = -1 (Python's // gives -2), 9 / -5 = -1 (Python's // gives -2)
+    /// Examples: -9 / 5 = -1 (Python's `//`: -2), 9 / -5 = -1 (Python's `//`: -2).
     Idiv,
-    /// Float division: a / b (exact IEEE 754 division)
-    ///
-    /// Only used for float dtypes. Performs exact floating-point division.
-    /// Matches Tinygrad's FDIV.
+    /// Float division: a / b — exact IEEE 754 division. Float dtypes only.
     Fdiv,
 
     // Comparison operations
@@ -751,6 +739,39 @@ impl BinaryOp {
     pub fn is_idempotent(self) -> bool {
         matches!(self, Self::Or | Self::And | Self::Max)
     }
+
+    /// Returns the identity element for this operation at the given dtype.
+    ///
+    /// `pop_const` substitutes this when no const factor is present, so a
+    /// caller can safely treat the returned tuple as `(remainder, factor)`
+    /// with no Option unwrapping. Supports ADD, MUL, MAX (with their natural
+    /// identities); other ops have no canonical identity and panic.
+    pub fn identity_element(self, dtype: DType) -> ConstValue {
+        match self {
+            Self::Add => {
+                if dtype.is_float() {
+                    ConstValue::Float(0.0)
+                } else {
+                    ConstValue::Int(0)
+                }
+            }
+            Self::Mul => {
+                if dtype.is_float() {
+                    ConstValue::Float(1.0)
+                } else {
+                    ConstValue::Int(1)
+                }
+            }
+            Self::Max => {
+                if dtype.is_float() {
+                    ConstValue::Float(dtype.min_value())
+                } else {
+                    ConstValue::Int(dtype.min_value() as i64)
+                }
+            }
+            other => panic!("identity_element: no identity for {other:?}"),
+        }
+    }
 }
 
 /// Ternary operation types.
@@ -804,6 +825,76 @@ impl WmmaUpcastAxes {
     }
 }
 
+/// Identifies which renderer / TC backend a kernel or WMMA op was generated for.
+///
+/// More granular than [`DeviceSpec`] (which describes the runtime target) — a
+/// CPU+AMX kernel runs on `DeviceSpec::Cpu` but its renderer is
+/// `RendererDevice::AppleAmx`, and the distinction matters for codegen
+/// gating (e.g., wider load/store folds only apply to AMX TC accumulators).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum RendererDevice {
+    Cpu,
+    AppleAmx,
+    CudaSm75,
+    CudaSm80,
+    CudaSm89,
+    Metal,
+    AmdRdna3,
+    AmdRdna4,
+    AmdCdna3,
+    AmdCdna4,
+    IntelXe,
+    WebGpu,
+}
+
+impl RendererDevice {
+    /// Stable canonical name — used for kernel cache hashing and debug output.
+    pub const fn canonical(&self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::AppleAmx => "AppleAMX",
+            Self::CudaSm75 => "CUDA_SM75",
+            Self::CudaSm80 => "CUDA_SM80",
+            Self::CudaSm89 => "CUDA_SM89",
+            Self::Metal => "Metal",
+            Self::AmdRdna3 => "AMD_RDNA3",
+            Self::AmdRdna4 => "AMD_RDNA4",
+            Self::AmdCdna3 => "AMD_CDNA3",
+            Self::AmdCdna4 => "AMD_CDNA4",
+            Self::IntelXe => "IntelXe",
+            Self::WebGpu => "WebGPU",
+        }
+    }
+
+    pub const fn is_apple_amx(&self) -> bool {
+        matches!(self, Self::AppleAmx)
+    }
+
+    /// True if the device exposes a hardware cache-invalidation primitive.
+    /// Only NV CUDA and AMD runtimes implement `invalidate_caches`; Metal,
+    /// IntelXe, WebGpu, CPU, and Apple AMX have no such primitive and must
+    /// rely on the software fallback (or run warm-cache).
+    pub const fn has_hardware_cache_invalidate(&self) -> bool {
+        matches!(
+            self,
+            Self::CudaSm75
+                | Self::CudaSm80
+                | Self::CudaSm89
+                | Self::AmdRdna3
+                | Self::AmdRdna4
+                | Self::AmdCdna3
+                | Self::AmdCdna4
+        )
+    }
+}
+
+impl core::fmt::Display for RendererDevice {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.canonical())
+    }
+}
+
 /// Metadata for WMMA (Warp Matrix Multiply-Accumulate) operations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -816,8 +907,8 @@ pub struct WmmaMetadata {
     pub dtype_in: DType,
     /// Output/accumulator dtype.
     pub dtype_out: DType,
-    /// Target device string.
-    pub device: String,
+    /// Renderer / TC backend that produced this WMMA.
+    pub device: RendererDevice,
     /// Thread count.
     pub threads: usize,
     /// Per-source upcast axes for vectorization (A, B, C each have their own).

@@ -86,7 +86,8 @@ pub struct RangeifyBufferContext {
     pub buffer_map: HashMap<UOpKey, Arc<UOp>>,
     /// Bound variables: maps variable name → (DEFINE_VAR UOp, optional bound value).
     /// Populated when BIND(DEFINE_VAR, CONST) is stripped during kernel splitting.
-    /// The UOp is kept for kernel sources; the i64 is the concrete bound value (None for OUTER ranges).
+    /// The UOp is kept for kernel sources; the i64 is the concrete bound value
+    /// (None for schedule-loop wrappers — Range-bound variables).
     pub vars: HashMap<String, (Arc<UOp>, Option<i64>)>,
     pub range_counter: usize,
 }
@@ -270,15 +271,15 @@ pub fn split_store(_ctx: &mut Vec<Arc<UOp>>, x: &Arc<UOp>) -> Option<Arc<UOp>> {
 
     trace!(uop_id = x.id, op = ?std::mem::discriminant(x.op()), "split_store: entering");
 
-    // Tinygrad parity: if any ranges are still open here, this is not a
-    // kernel boundary. END(STORE) nodes that close their full output range have
-    // empty in-scope ranges after ended_ranges() is applied.
+    // If any ranges are still open here, this is not a kernel boundary.
+    // END(STORE) nodes that close their full output range have empty in-scope
+    // ranges after ended_ranges() is applied.
     if !x.in_scope_ranges().is_empty() {
         return None;
     }
 
-    // Guard 1: Tinygrad parity for raw STORE path.
-    // Raw stores with explicit ranges/index-shape should be handled by their END wrapper.
+    // Guard 1: raw stores with explicit ranges or index-shape should be
+    // handled by their END wrapper, not here.
     if let Op::Store { index, ranges, .. } = x.op()
         && (!ranges.is_empty() || index.shape().ok().flatten().is_some())
     {
@@ -427,9 +428,9 @@ fn fix_assign(root: &Arc<UOp>) -> morok_ir::Result<Arc<UOp>> {
                 continue;
             };
 
-            // Same-kernel check by callable identity (Tinygrad parity).
-            // Skip if both AFTERs belong to the same callable — avoids spurious WAR deps
-            // between outputs of the same multi-output kernel.
+            // Same-kernel check by callable identity. Skip if both AFTERs
+            // belong to the same callable — avoids spurious WAR deps between
+            // outputs of the same multi-output kernel.
             if let Op::After { deps: a_deps, .. } = a.op()
                 && let Some(a_callable) = extract_after_callable(a_deps)
                 && Arc::ptr_eq(&a_callable, &callable)
@@ -464,9 +465,6 @@ fn fix_assign(root: &Arc<UOp>) -> morok_ir::Result<Arc<UOp>> {
 // ============================================================================
 
 /// Run the kernel splitting pipeline.
-///
-/// Based on Tinygrad's `get_kernel_graph`.
-/// Simplified from ~200 lines to ~40 lines.
 ///
 /// # Returns
 /// Returns `(result, RangeifyBufferContext)`.

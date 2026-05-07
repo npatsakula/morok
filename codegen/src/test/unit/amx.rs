@@ -2,7 +2,7 @@
 
 use crate::mlir::amx::{fma_opcode_and_flags, validate_amx_dtypes, z_row_stride};
 use morok_dtype::DType;
-use morok_ir::{WmmaMetadata, WmmaUpcastAxes};
+use morok_ir::{RendererDevice, WmmaMetadata, WmmaUpcastAxes};
 
 /// Helper to create minimal WmmaMetadata for testing.
 fn make_metadata(dtype_in: DType, dtype_out: DType) -> WmmaMetadata {
@@ -11,7 +11,7 @@ fn make_metadata(dtype_in: DType, dtype_out: DType) -> WmmaMetadata {
         dims: (16, 16, 1),
         dtype_in,
         dtype_out,
-        device: "AppleAMX".to_string(),
+        device: RendererDevice::AppleAmx,
         threads: 1,
         upcast_axes: WmmaUpcastAxes { a: vec![], b: vec![], c: vec![] },
         reduce_axes: vec![],
