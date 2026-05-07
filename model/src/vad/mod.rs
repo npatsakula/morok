@@ -5,10 +5,11 @@
 //! `(h, c)` between chunks, and a sigmoid head that produces a per-chunk
 //! speech probability.
 //!
-//! The chunk-counter segmentation in [`VadInference::segment`] is a deliberate
-//! simplification — it thresholds probabilities and merges nearby segments,
-//! and is not equivalent to PyAnnote-style frame-classification VAD. Outputs
-//! should not be expected to match a PyAnnote pipeline numerically.
+//! [`VadInference::probs`] exposes the raw per-chunk probability array (one
+//! entry per [`NUM_SAMPLES`] samples). [`VadInference::segment`] feeds those
+//! into [`morok_arch::vad::chunks_from_probs`] to produce sample ranges
+//! suitable for long-form ASR — see the `morok-arch::vad` module for
+//! tunable knobs (min/max chunk duration, alignment, padding, etc.).
 
 mod error;
 
@@ -28,7 +29,10 @@ use crate::state;
 
 use error::{HubSnafu, StateSnafu, TensorSnafu};
 
-const NUM_SAMPLES: usize = 512;
+/// Number of input samples covered by one VAD probability entry. Exposed so
+/// callers can build [`morok_arch::vad::ChunkerOpts`] with the right
+/// `samples_per_prob`.
+pub const NUM_SAMPLES: usize = 512;
 const CONTEXT_SIZE: usize = 64;
 const STFT_PAD: usize = 64;
 const CUTOFF: usize = 128 + 1;
@@ -249,12 +253,15 @@ impl VadInference {
         Ok(prob)
     }
 
-    pub fn segment(&mut self, waveform: &[f32], threshold: f32) -> Vec<(usize, usize)> {
+    /// Run Silero V5 across the waveform and collect one speech probability
+    /// per [`NUM_SAMPLES`]-sample window. The output length is
+    /// `ceil(waveform.len() / NUM_SAMPLES)`; trailing entries cover the
+    /// zero-padding past the waveform end.
+    pub fn probs(&mut self, waveform: &[f32]) -> crate::jit::Result<Vec<f32>> {
         self.reset();
-
         let total = waveform.len();
         if total == 0 {
-            return vec![];
+            return Ok(Vec::new());
         }
 
         let pad_len = (NUM_SAMPLES - total % NUM_SAMPLES) % NUM_SAMPLES;
@@ -264,16 +271,31 @@ impl VadInference {
 
         let n_chunks = (total + pad_len) / NUM_SAMPLES;
         let mut probs: Vec<f32> = Vec::with_capacity(n_chunks);
-
         for i in 0..n_chunks {
             let start = i * NUM_SAMPLES;
             let chunk = &padded[start..start + CHUNK_LEN];
-            if let Ok(p) = self.process_chunk(chunk) {
-                probs.push(p);
-            }
+            probs.push(self.process_chunk(chunk)?);
         }
+        Ok(probs)
+    }
 
-        threshold_segments(&probs, threshold, NUM_SAMPLES)
+    /// Convenience wrapper around [`Self::probs`] +
+    /// [`morok_arch::vad::chunks_from_probs`] with default chunker knobs and
+    /// the given `threshold`. Errors from the JIT or chunker are swallowed —
+    /// callers that need fault-visibility should drive `probs()` and
+    /// `chunks_from_probs` directly.
+    pub fn segment(&mut self, waveform: &[f32], threshold: f32) -> Vec<(usize, usize)> {
+        let Ok(probs) = self.probs(waveform) else { return Vec::new() };
+        let opts = morok_arch::vad::ChunkerOpts {
+            threshold,
+            samples_per_prob: NUM_SAMPLES,
+            ..morok_arch::vad::ChunkerOpts::default()
+        };
+        morok_arch::vad::chunks_from_probs(&probs, &opts)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| (c.start_sample, c.end_sample))
+            .collect()
     }
 
     fn reset(&mut self) {
@@ -302,54 +324,4 @@ fn write_state_into(src: &Tensor, dst: &mut morok_device::Buffer) -> crate::jit:
     src_buf.copyout(&mut data).map_err(|e| crate::jit::JitError::Build { source: Box::new(e) })?;
     dst.copyin(&data).map_err(|e| crate::jit::JitError::Build { source: Box::new(e) })?;
     Ok(())
-}
-
-fn threshold_segments(probs: &[f32], threshold: f32, chunk_samples: usize) -> Vec<(usize, usize)> {
-    let min_speech_chunks = 8usize;
-    let min_silence_chunks = 4usize;
-
-    let mut raw: Vec<(usize, usize)> = Vec::new();
-    let mut speech_start: Option<usize> = None;
-    let mut silence_count = 0usize;
-
-    for (i, &p) in probs.iter().enumerate() {
-        if p >= threshold {
-            if speech_start.is_none() {
-                speech_start = Some(i);
-            }
-            silence_count = 0;
-        } else if let Some(start) = speech_start {
-            silence_count += 1;
-            if silence_count >= min_silence_chunks {
-                let end = i - min_silence_chunks + 1;
-                if end - start >= min_speech_chunks {
-                    raw.push((start * chunk_samples, end * chunk_samples));
-                }
-                speech_start = None;
-                silence_count = 0;
-            }
-        }
-    }
-
-    if let Some(start) = speech_start {
-        let end = probs.len();
-        if end - start >= min_speech_chunks {
-            raw.push((start * chunk_samples, end * chunk_samples));
-        }
-    }
-
-    let merge_gap_chunks = 8usize;
-    let merge_gap_samples = merge_gap_chunks * chunk_samples;
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for seg in raw {
-        if let Some(last) = merged.last_mut()
-            && seg.0 - last.1 <= merge_gap_samples
-        {
-            last.1 = seg.1;
-            continue;
-        }
-        merged.push(seg);
-    }
-
-    merged
 }

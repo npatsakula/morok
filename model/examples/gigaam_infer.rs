@@ -115,6 +115,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let n_mels = mel.n_mels();
     let max_t_mel = model.config.max_mel_frames;
+    let hop_length = model.config.hop_length;
+    let subsampling_factor = model.config.subsampling_factor;
     let subs_kernel_size = match model.config.subsampling_mode {
         SubsamplingMode::Conv1d => model.config.subs_kernel_size,
         SubsamplingMode::Conv2d => 3,
@@ -138,10 +140,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let full_mel_data = full_mel.as_vec::<f32>()?;
     let dt_mel = t_mel.elapsed();
 
-    let num_chunks = total_mel_frames.div_ceil(max_t_mel);
+    // VAD-aware chunking: run Silero V5 → arch::vad::chunks_from_probs to get
+    // speech-bearing sample ranges, then convert each to a (mel_start, mel_len)
+    // slice into the precomputed full_mel. Pure-silence regions are dropped.
+    let t_vad = Instant::now();
+    println!("\nLoading Silero VAD...");
+    let vad_model = morok_model::vad::SileroVad::from_hub()?;
+    let mut vad = morok_model::vad::VadInference::new(vad_model)?;
+    let probs = vad.probs(&waveform)?;
+    // Each chunk's mel-frame count must fit max_t_mel. The chunker rounds
+    // chunk boundaries to align_to-sample multiples (= subsampling_factor mel
+    // frames), and the start/end snap can each shift by up to one alignment
+    // step — so a chunk's mel length can grow by 2 × subsampling_factor
+    // beyond the chunker's nominal max_duration. Reserve that much headroom.
+    let mel_headroom = 2 * subsampling_factor;
+    let encoder_capacity_secs =
+        (max_t_mel.saturating_sub(mel_headroom) as f32 * hop_length as f32) / sample_rate as f32;
+    let default_opts = morok_arch::vad::ChunkerOpts::default();
+    let chunker_opts = morok_arch::vad::ChunkerOpts {
+        sample_rate: sample_rate as u32,
+        samples_per_prob: morok_model::vad::NUM_SAMPLES,
+        max_duration: default_opts.max_duration.min(encoder_capacity_secs),
+        strict_limit_duration: default_opts.strict_limit_duration.min(encoder_capacity_secs),
+        align_to: hop_length * subsampling_factor,
+        ..default_opts
+    };
+    let vad_chunks = morok_arch::vad::chunks_from_probs(&probs, &chunker_opts)?;
+    let dt_vad = t_vad.elapsed();
+    println!(
+        "VAD: {} probs → {} chunks (max_chunk={:.1}s, strict={:.1}s, encoder_cap={:.1}s, align_to={} samples) in {}",
+        probs.len(),
+        vad_chunks.len(),
+        chunker_opts.max_duration,
+        chunker_opts.strict_limit_duration,
+        encoder_capacity_secs,
+        chunker_opts.align_to,
+        fmt_duration(dt_vad),
+    );
+
+    // (mel_start, mel_len, start_sec) per chunk.
+    let chunks_meta: Vec<(usize, usize, f32)> = vad_chunks
+        .iter()
+        .filter_map(|c| {
+            let mel_start = c.start_sample / hop_length;
+            let mel_end = (c.end_sample / hop_length).min(total_mel_frames);
+            if mel_end <= mel_start {
+                return None;
+            }
+            let start_sec = c.start_sample as f32 / sample_rate as f32;
+            Some((mel_start, mel_end - mel_start, start_sec))
+        })
+        .collect();
+
+    if chunks_meta.is_empty() {
+        println!("\nNo speech detected; transcript is empty.");
+        println!("Audio duration: {:.1}s", duration_s);
+        return Ok(());
+    }
+
+    let num_chunks = chunks_meta.len();
     let max_batch = model.config.max_batch_size.min(num_chunks);
     model.config.max_batch_size = max_batch;
-    println!("Chunking into {} chunks of up to {} mel frames; JIT batch bound {}", num_chunks, max_t_mel, max_batch);
+    println!(
+        "Chunking into {} VAD chunks of up to {} mel frames; JIT batch bound {}",
+        num_chunks, max_t_mel, max_batch
+    );
 
     let mut mel_batch = Tensor::full(&[max_batch, n_mels, max_t_mel], 0.0f32, DType::Float32)?;
     mel_batch.realize().unwrap();
@@ -183,7 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dt_exec = Duration::ZERO;
     let mut dt_decode = Duration::ZERO;
     let mut by_entry_point: HashMap<String, KernelAgg> = HashMap::new();
-    let mut full_text = String::new();
+    let mut chunk_texts: Vec<String> = Vec::with_capacity(num_chunks);
     for chunk_batch_start in (0..num_chunks).step_by(max_batch) {
         let b = (num_chunks - chunk_batch_start).min(max_batch);
         let mut chunk_lengths = vec![0usize; b];
@@ -195,9 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             slice.fill(0.0);
 
             for (bi, chunk_len) in chunk_lengths.iter_mut().enumerate() {
-                let chunk_idx = chunk_batch_start + bi;
-                let mel_start = chunk_idx * max_t_mel;
-                let valid = (total_mel_frames - mel_start).min(max_t_mel);
+                let &(mel_start, valid, _start_sec) = &chunks_meta[chunk_batch_start + bi];
                 *chunk_len = valid;
 
                 for mel_bin in 0..n_mels {
@@ -298,13 +359,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let text = decoder.decode(item_slice, t_exec_sub, actual_sub)?;
+            let &(_, _, start_sec) = &chunks_meta[chunk_batch_start + bi];
             if !text.is_empty() {
-                full_text.push_str(&text);
+                println!("  [{:>6.1}s] {}", start_sec, text);
             }
+            chunk_texts.push(text);
         }
         dt_decode += t_decode_batch.elapsed();
     }
     let dt_loop = t_loop.elapsed();
+    let full_text = chunk_texts.iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" ");
 
     println!("Audio duration: {:.1}s", waveform.len() as f32 / sample_rate as f32);
     println!("\n--- Timings ---");
