@@ -33,6 +33,7 @@ ML-компилятор на Rust, вдохновлённый [Tinygrad](https:/
 | [runtime](https://github.com/npatsakula/morok/tree/main/runtime/) | JIT-компиляция и выполнение ядер |
 | [tensor](https://github.com/npatsakula/morok/tree/main/tensor/) | Высокоуровневый API ленивых тензоров |
 | [onnx](https://github.com/npatsakula/morok/tree/main/onnx/) | Импортер ONNX-моделей |
+| [arch](https://github.com/npatsakula/morok/tree/main/arch/) | Примитивы инференса |
 
 ## Быстрый пример
 

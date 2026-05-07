@@ -33,6 +33,7 @@ For architecture details, see the [documentation site](https://npatsakula.github
 | [runtime](https://github.com/npatsakula/morok/tree/main/runtime/) | JIT compilation and kernel execution |
 | [tensor](https://github.com/npatsakula/morok/tree/main/tensor/) | High-level lazy tensor API |
 | [onnx](https://github.com/npatsakula/morok/tree/main/onnx/) | ONNX model importer |
+| [arch](https://github.com/npatsakula/morok/tree/main/arch/) | Inference primitives |
 
 ## Quick Example
 

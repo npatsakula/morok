@@ -33,6 +33,7 @@ Morok 是一个基于 Rust 的 ML 编译器，灵感来自 [Tinygrad](https://gi
 | [runtime](https://github.com/npatsakula/morok/tree/main/runtime/) | JIT 编译与内核执行 |
 | [tensor](https://github.com/npatsakula/morok/tree/main/tensor/) | 高层惰性张量 API |
 | [onnx](https://github.com/npatsakula/morok/tree/main/onnx/) | ONNX 模型导入器 |
+| [arch](https://github.com/npatsakula/morok/tree/main/arch/) | 推理原语 |
 
 ## 快速示例
 
