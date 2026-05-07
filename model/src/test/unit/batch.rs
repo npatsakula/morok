@@ -1,3 +1,4 @@
+use morok_arch::ctc::{CtcDecoder, GreedyDecoder};
 use morok_dtype::DType;
 use morok_tensor::{Tensor, Variable};
 
@@ -24,6 +25,7 @@ fn test_config() -> GigaAmConfig {
         mel_center: false,
         max_mel_frames: 512,
         max_encoder_frames: 128,
+        decoder: CtcDecoder::Greedy(GreedyDecoder::new(Vec::new())),
     }
 }
 

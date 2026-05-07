@@ -17,6 +17,8 @@ pub enum Error {
     ConfigIo { source: std::io::Error },
     #[snafu(display("{source}"))]
     Config { source: serde_json::Error },
+    #[snafu(display("invalid decoder config: {message}"))]
+    DecoderConfig { message: String },
     #[snafu(display("hub error: {source}"))]
     Hub { source: hf_hub::api::sync::ApiError },
 }

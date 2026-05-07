@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use morok_arch::ctc::CtcDecoder;
+
 use crate::gigaam::{ConvNormType, GigaAmConfig, SubsamplingMode};
 
 #[test]
@@ -29,4 +31,13 @@ fn test_config_from_json() {
     // by scaling up by `subsampling_factor`, so audio approaching the encoder
     // cap isn't rejected at the JIT input stage.
     assert_eq!(config.max_mel_frames, 5000 * config.subsampling_factor);
+
+    // CTC decoder built from the `decoding` section: 33 Russian glyphs + blank,
+    // for `vocab_size = 34` total classes.
+    assert!(matches!(config.decoder, CtcDecoder::Greedy(_)));
+    assert_eq!(config.decoder.vocabulary().len(), 33);
+    assert_eq!(config.decoder.blank_id(), 33);
+    assert_eq!(config.decoder.total_vocab(), config.vocab_size);
+    assert_eq!(config.decoder.vocabulary()[0], " ");
+    assert_eq!(config.decoder.vocabulary()[32], "я");
 }

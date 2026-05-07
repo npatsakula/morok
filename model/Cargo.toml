@@ -10,6 +10,7 @@ repository.workspace = true
 bon = "3.9.1"
 hf-hub = "0.5.0"
 hound = "3.5.1"
+morok-arch = { version = "0.1.0-alpha.2", path = "../arch" }
 morok-device = { version = "0.1.0-alpha.2", path = "../device" }
 morok-dtype = { version = "0.1.0-alpha.2", path = "../dtype", package = "morok-dtype" }
 morok-ir = { version = "0.1.0-alpha.2", path = "../ir", package = "morok-ir" }

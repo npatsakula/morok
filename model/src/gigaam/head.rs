@@ -9,7 +9,10 @@ use super::error::TensorSnafu;
 
 type Result<T> = super::Result<T>;
 
-/// CTC decoder head: Conv1d(d_model, vocab_size, k=1) + LogSoftmax.
+/// CTC projection head: `Conv1d(d_model, vocab_size, k=1)` + transpose +
+/// `LogSoftmax`. Produces the `[B, T, vocab_size]` log-probabilities consumed
+/// by `morok_arch::ctc` decoders — the head itself is just the final
+/// projection layer, not the decoder.
 pub struct CTCHead {
     pub weight: Tensor, // [vocab_size, d_model, 1]
     pub bias: Tensor,   // [vocab_size]

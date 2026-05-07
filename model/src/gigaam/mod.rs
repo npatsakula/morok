@@ -13,6 +13,7 @@ extern crate self as morok_model;
 
 use std::path::Path;
 
+use morok_arch::ctc::{CtcDecoder, GreedyDecoder};
 use morok_dtype::DType;
 use morok_ir::SInt;
 use morok_macros::jit_wrapper;
@@ -54,6 +55,10 @@ pub struct GigaAmConfig {
     pub mel_center: bool,
     pub max_mel_frames: usize,
     pub max_encoder_frames: usize,
+    /// CTC decoder built from the `decoding` section of the config, or an
+    /// empty-vocabulary greedy decoder for synthetic configs that don't
+    /// declare one.
+    pub decoder: CtcDecoder,
 }
 
 impl GigaAmConfig {
@@ -64,6 +69,7 @@ impl GigaAmConfig {
         let pre = &cfg["preprocessor"];
         let enc = &cfg["encoder"];
         let head = &cfg["head"];
+        let decoding = &cfg["decoding"];
 
         let d_model = enc["d_model"].as_u64().expect("d_model") as usize;
         let ff_expansion_factor = enc["ff_expansion_factor"].as_u64().expect("ff_expansion_factor") as usize;
@@ -92,6 +98,9 @@ impl GigaAmConfig {
             .or_else(|| enc["max_seq_len"].as_u64())
             .unwrap_or((max_encoder_frames * subsampling_factor) as u64) as usize;
 
+        let vocab_size = head["num_classes"].as_u64().expect("num_classes") as usize;
+        let decoder = build_decoder(decoding, vocab_size)?;
+
         Ok(Self {
             max_batch_size: enc["max_batch_size"].as_u64().unwrap_or(32) as usize,
             n_mels: pre["features"].as_u64().expect("features") as usize,
@@ -104,7 +113,7 @@ impl GigaAmConfig {
             subsampling_mode,
             subs_kernel_size,
             conv_norm_type,
-            vocab_size: head["num_classes"].as_u64().expect("num_classes") as usize,
+            vocab_size,
             sample_rate: pre["sample_rate"].as_u64().expect("sample_rate") as usize,
             n_fft: pre["n_fft"].as_u64().expect("n_fft") as usize,
             hop_length: pre["hop_length"].as_u64().expect("hop_length") as usize,
@@ -112,8 +121,51 @@ impl GigaAmConfig {
             mel_center: pre["center"].as_bool().unwrap_or(true),
             max_mel_frames,
             max_encoder_frames,
+            decoder,
         })
     }
+}
+
+/// Construct a [`CtcDecoder`] from the `decoding` block of a GigaAM config.
+///
+/// Dispatches on the (PyTorch/Hydra-style) `_target_` string. The trailing
+/// fields of the JSON object are deserialized into the leaf decoder type via
+/// `serde_json::from_value` — `_target_` itself is silently ignored by serde.
+///
+/// On a missing/empty block we fall back to an empty-vocabulary
+/// [`GreedyDecoder`] so synthetic configs (no `decoding` section) still
+/// round-trip through `from_json`.
+fn build_decoder(decoding: &serde_json::Value, vocab_size: usize) -> Result<CtcDecoder> {
+    if decoding.is_null() {
+        return Ok(CtcDecoder::Greedy(GreedyDecoder::new(Vec::new())));
+    }
+    let target = decoding["_target_"].as_str().unwrap_or("");
+    let decoder: CtcDecoder = if target.contains("CTCGreedyDecoding") {
+        let g: GreedyDecoder = serde_json::from_value(decoding.clone()).context(ConfigSnafu)?;
+        CtcDecoder::Greedy(g)
+    } else if target.contains("CTCBeamDecoding") {
+        let b: morok_arch::ctc::BeamDecoder = serde_json::from_value(decoding.clone()).context(ConfigSnafu)?;
+        CtcDecoder::Beam(Box::new(b))
+    } else {
+        // Unknown / missing target. If there's a vocabulary array, default to
+        // greedy; otherwise empty.
+        let vocab: Vec<String> = decoding["vocabulary"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        CtcDecoder::Greedy(GreedyDecoder::new(vocab))
+    };
+    if !decoder.vocabulary().is_empty() && decoder.total_vocab() != vocab_size {
+        return Err(error::Error::DecoderConfig {
+            message: format!(
+                "decoder vocabulary length + 1 ({}) != head.num_classes ({}); \
+                 CTC convention is one blank token appended after the vocabulary",
+                decoder.total_vocab(),
+                vocab_size
+            ),
+        });
+    }
+    Ok(decoder)
 }
 
 /// GigaAM model: Conformer encoder + CTC head.

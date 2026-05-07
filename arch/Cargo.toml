@@ -1,0 +1,22 @@
+[package]
+name = "morok-arch"
+
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Architecture-level algorithms for the Morok ML compiler"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"], optional = true }
+snafu = "0.9"
+
+[dev-dependencies]
+proptest = "1.9"
+serde_json = "1.0"
+test-case = "3.3.1"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]

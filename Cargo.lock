@@ -1776,6 +1776,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "morok-arch"
+version = "0.1.0-alpha.2"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "snafu 0.9.0",
+ "test-case",
+]
+
+[[package]]
 name = "morok-codegen"
 version = "0.1.0-alpha.2"
 dependencies = [
@@ -1866,6 +1877,7 @@ dependencies = [
  "bytemuck",
  "hf-hub",
  "hound",
+ "morok-arch",
  "morok-device",
  "morok-dtype",
  "morok-ir",

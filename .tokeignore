@@ -1,3 +1,4 @@
+arch/src/test/
 codegen/src/test/
 device/src/test/
 dtype/src/test/

@@ -3,23 +3,17 @@
 //! Usage:
 //!   cargo run -p morok-model --example gigaam_infer -- audio_1.wav
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use morok_arch::ctc::CtcDecoder;
 use morok_dtype::DType;
 use morok_ir::{ConstValue, Op, UOp};
 use morok_model::audio::MelSpectrogram;
 use morok_model::gigaam::{GigaAm, GigaAmBatchedJit, SubsamplingMode};
 use morok_tensor::{PrepareConfig, Tensor};
-
-const VOCAB: &[&str] = &[
-    " ", "а", "б", "в", "г", "д", "е", "ж", "з", "и", "й", "к", "л", "м", "н", "о", "п", "р", "с", "т", "у", "ф", "х",
-    "ц", "ч", "ш", "щ", "ъ", "ы", "ь", "э", "ю", "я",
-];
-const BLANK_ID: usize = VOCAB.len();
 
 #[derive(Clone)]
 struct KernelAgg {
@@ -66,6 +60,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => false,
     };
     let amx_enabled = std::env::var("MOROK_AMX").as_deref() == Ok("1");
+    let beam_decode_enabled = match env::var("MOROK_BEAM_DECODE") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        }
+        Err(_) => false,
+    };
 
     let t_audio = Instant::now();
     println!("Loading audio: {wav_path}");
@@ -79,9 +80,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut model = GigaAm::from_hub_with_revision("vpermilp/GigaAM-v3", "ctc")?;
     let dt_model = t_model.elapsed();
     let sample_rate = model.config.sample_rate;
+    let mut decoder = if beam_decode_enabled {
+        // Promote a greedy config to a beam decoder using its vocabulary.
+        match &model.config.decoder {
+            CtcDecoder::Greedy(g) => CtcDecoder::Beam(Box::new(morok_arch::ctc::BeamDecoder::new(
+                g.vocabulary().to_vec(),
+                morok_arch::ctc::BeamOpts::default(),
+            ))),
+            other => other.clone(),
+        }
+    } else {
+        model.config.decoder.clone()
+    };
+    let blank_id = decoder.blank_id();
+    let total_vocab = decoder.total_vocab();
     println!(
-        "Loaded: {} layers, d_model={}, vocab_size={}, blank_id={}",
-        model.config.n_layers, model.config.d_model, model.config.vocab_size, BLANK_ID
+        "Loaded: {} layers, d_model={}, vocab_size={}, decoder={}",
+        model.config.n_layers,
+        model.config.d_model,
+        model.config.vocab_size,
+        match &decoder {
+            CtcDecoder::Greedy(_) => "greedy",
+            CtcDecoder::Beam(_) => "beam",
+        }
     );
 
     let mel = MelSpectrogram::new(&morok_model::audio::MelConfig {
@@ -220,13 +241,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dt_exec += t_exec_batch.elapsed();
 
         let t_decode_batch = Instant::now();
+        let logits_array = jit.output()?.as_array::<f32>().expect("failed to read output logits");
+        let logits_slice = logits_array.as_slice().expect("contiguous output logits");
+        let item_stride = t_exec_sub * total_vocab;
         for (bi, mel_len) in chunk_lengths.iter().enumerate() {
             let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
+            let item_base = bi * item_stride;
+            let item_slice = &logits_slice[item_base..item_base + item_stride];
+
             if debug_logits && chunk_batch_start == 0 && bi == 0 {
-                let logits = jit.output()?.as_array::<f32>().expect("failed to read output logits");
-                let slice = logits.as_slice().expect("contiguous output logits");
-                let sample_n = (BLANK_ID + 1) * actual_sub.min(4);
-                let sample = &slice[..sample_n.min(slice.len())];
+                let sample_n = total_vocab * actual_sub.min(4);
+                let sample = &item_slice[..sample_n.min(item_slice.len())];
                 let (mut min_v, mut max_v, mut nonzero) = (f32::INFINITY, f32::NEG_INFINITY, 0usize);
                 for &v in sample {
                     min_v = min_v.min(v);
@@ -236,37 +261,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                let vocab = BLANK_ID + 1;
-                let mut first_ids = Vec::new();
-                let mut first_labels = Vec::new();
-                for t in 0..actual_sub.min(16) {
-                    let base = t * vocab;
-                    let mut best = 0usize;
-                    for c in 1..vocab {
-                        if slice[base + c] > slice[base + best] {
-                            best = c;
-                        }
-                    }
-                    first_ids.push(best);
-                    if best == BLANK_ID {
-                        first_labels.push("<blank>".to_string());
-                    } else {
-                        first_labels.push(VOCAB[best].to_string());
-                    }
-                }
+                // Use the decoder's argmax helper. argmax_per_frame is on
+                // GreedyDecoder; build a lightweight one keyed off the live
+                // vocabulary so debug output matches the active decoder.
+                let debug_decoder = morok_arch::ctc::GreedyDecoder::new(decoder.vocabulary().to_vec());
+                let head_n = actual_sub.min(16);
+                let first_ids = debug_decoder.argmax_per_frame(item_slice, t_exec_sub, head_n);
+                let first_labels: Vec<String> =
+                    first_ids
+                        .iter()
+                        .map(|&id| {
+                            if id == blank_id { "<blank>".to_string() } else { debug_decoder.vocabulary()[id].clone() }
+                        })
+                        .collect();
 
-                let mut id_hist = vec![0usize; vocab];
-                for t in 0..actual_sub {
-                    let base = t * vocab;
-                    let mut best = 0usize;
-                    for c in 1..vocab {
-                        if slice[base + c] > slice[base + best] {
-                            best = c;
-                        }
-                    }
-                    id_hist[best] += 1;
+                let all_ids = debug_decoder.argmax_per_frame(item_slice, t_exec_sub, actual_sub);
+                let mut id_hist = vec![0usize; total_vocab];
+                for id in all_ids {
+                    id_hist[id] += 1;
                 }
-
                 let mut top_hist: Vec<(usize, usize)> =
                     id_hist.into_iter().enumerate().filter(|(_, n)| *n > 0).collect();
                 top_hist.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
@@ -283,7 +296,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("debug logits: first labels={:?}", first_labels);
                 println!("debug logits: top ids={:?}", top_hist.into_iter().take(6).collect::<Vec<_>>());
             }
-            let text = ctc_greedy_decode_batch_item(jit.output()?, BLANK_ID, bi, t_exec_sub, actual_sub);
+
+            let text = decoder.decode(item_slice, t_exec_sub, actual_sub)?;
             if !text.is_empty() {
                 full_text.push_str(&text);
             }
@@ -584,50 +598,4 @@ fn subs_output_length(kernel_size: usize, mel_frames: usize) -> usize {
         len = (len + 2 * pad - kernel_size) / 2 + 1;
     }
     len
-}
-
-fn ctc_greedy_decode_batch_item(
-    output_buf: &morok_device::Buffer,
-    blank_id: usize,
-    batch_idx: usize,
-    stride_frames: usize,
-    valid_frames: usize,
-) -> String {
-    let logits = output_buf.as_array::<f32>().expect("failed to read output buffer");
-    let total_vocab = blank_id + 1;
-    let n_frames = stride_frames.min(valid_frames);
-    let batch_base = batch_idx * stride_frames * total_vocab;
-
-    let mut prev = blank_id;
-    let mut text = String::new();
-    let mut nan_frames = 0usize;
-    for t in 0..n_frames {
-        let base = batch_base + t * total_vocab;
-        let best = (0..total_vocab)
-            .max_by(|&a, &b| {
-                let av = logits[base + a];
-                let bv = logits[base + b];
-                match av.partial_cmp(&bv) {
-                    Some(ord) => ord,
-                    None => match (av.is_nan(), bv.is_nan()) {
-                        (true, true) => Ordering::Equal,
-                        (true, false) => Ordering::Less,
-                        (false, true) => Ordering::Greater,
-                        (false, false) => Ordering::Equal,
-                    },
-                }
-            })
-            .unwrap();
-        if logits[base + best].is_nan() {
-            nan_frames += 1;
-        }
-        if best != blank_id && best != prev {
-            text.push_str(VOCAB[best]);
-        }
-        prev = best;
-    }
-    if nan_frames > 0 {
-        eprintln!("warning: batch {} had {}/{} frames with NaN best logit", batch_idx, nan_frames, n_frames);
-    }
-    text
 }
