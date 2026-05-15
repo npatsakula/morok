@@ -14,21 +14,21 @@ morok-dtype = { path = "../dtype", version = "=0.1.0-alpha.2" }
 morok-device = { path = "../device", version = "=0.1.0-alpha.2" }
 morok-ir = { path = "../ir", version = "=0.1.0-alpha.2" }
 morok-codegen = { path = "../codegen", version = "=0.1.0-alpha.2" }
-snafu = "0.8.9"
+snafu = "0.9.0"
 parking_lot = "0.12"
 once_cell = "1.21"
 libc = "0.2"
 papaya = "0.2.3"
 rayon = "1.11"
 tracing = "0.1"
-libloading = { version = "0.8", optional = true }
+libloading = { version = "0.9", optional = true }
 tempfile = { version = "3", optional = true }
-object = { version = "0.38", default-features = false, features = [
+object = { version = "0.39", default-features = false, features = [
   "elf",
   "read",
 ] }
 memmap2 = "0.9"
-melior = { version = "0.26.3", features = ["ods-dialects"], optional = true }
+melior = { version = "0.27.0", features = ["ods-dialects"], optional = true }
 libffi = "5.1.0"
 smallvec = { workspace = true }
 
