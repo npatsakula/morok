@@ -109,8 +109,10 @@ pub fn trim_chunks_to_waveform(chunks: &mut Vec<AudioChunk>, waveform_len: usize
     }
 }
 
-/// No-VAD splitter: walks the waveform in `bounds.max_samples()`-sized
-/// strides, aligning non-final chunks to `bounds.align_to_samples()`.
+/// No-VAD splitter: walks the waveform in fixed-size strides. By default the
+/// stride is `bounds.max_samples()`; use
+/// [`with_max_duration_secs`](Self::with_max_duration_secs) for a wall-clock
+/// cap such as 20 seconds.
 ///
 /// Zero model load. Suitable when the caller already segmented the input,
 /// for short utterances that fit a single chunk, or for tests. Boundary
@@ -125,13 +127,30 @@ pub fn trim_chunks_to_waveform(chunks: &mut Vec<AudioChunk>, waveform_len: usize
 /// the JIT pads it.
 #[derive(Clone, Debug, Default)]
 pub struct FixedLengthSplitter {
-    // Field-form (not a unit struct) so v2 can add `overlap_samples` without
-    // a breaking API change.
+    max_duration_secs: Option<f32>,
 }
 
 impl FixedLengthSplitter {
     pub fn new() -> Self {
-        Self {}
+        Self::default()
+    }
+
+    pub fn with_max_duration_secs(max_duration_secs: f32) -> Self {
+        assert!(max_duration_secs.is_finite() && max_duration_secs > 0.0, "max duration must be positive");
+        Self { max_duration_secs: Some(max_duration_secs) }
+    }
+
+    pub fn max_duration_secs(&self) -> Option<f32> {
+        self.max_duration_secs
+    }
+
+    fn target_samples(&self, bounds: &EncoderBounds) -> usize {
+        let encoder_cap = bounds.max_samples();
+        let Some(max_duration_secs) = self.max_duration_secs else {
+            return encoder_cap;
+        };
+        let duration_cap = (max_duration_secs * bounds.sample_rate as f32).floor() as usize;
+        duration_cap.max(1).min(encoder_cap.max(1))
     }
 }
 
@@ -143,9 +162,13 @@ impl Splitter for FixedLengthSplitter {
             return Ok(Vec::new());
         }
         let align = bounds.align_to_samples().max(1);
-        // Saturating max_samples so a misconfigured bounds (zero, overflow)
-        // never stalls the loop. Floor at `align` so the loop always advances.
-        let max = bounds.max_samples().max(align);
+        // Saturating target so misconfigured bounds (zero, overflow) or tiny
+        // duration caps never stall the loop.
+        let max = if self.max_duration_secs.is_some() {
+            self.target_samples(bounds).max(1)
+        } else {
+            self.target_samples(bounds).max(align)
+        };
 
         let mut chunks = Vec::new();
         let mut start = 0usize;
@@ -156,11 +179,15 @@ impl Splitter for FixedLengthSplitter {
             } else {
                 let span = nominal_end - start;
                 let aligned_span = (span / align) * align;
-                start + aligned_span.max(align)
+                if aligned_span == 0 { nominal_end } else { start + aligned_span }
             };
             chunks.push(AudioChunk::new(start, aligned_end));
             start = aligned_end;
         }
         Ok(chunks)
+    }
+
+    fn max_chunk_samples(&self, bounds: &EncoderBounds) -> usize {
+        self.target_samples(bounds)
     }
 }

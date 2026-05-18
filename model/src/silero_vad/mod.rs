@@ -15,7 +15,10 @@ extern crate self as svod_model;
 
 mod splitter;
 
-pub use splitter::{SileroVadSplitter, SileroVadSplitterError};
+pub use splitter::{SileroFixedWindowSplitter, SileroVadSplitter, SileroVadSplitterError};
+
+#[cfg(test)]
+pub(crate) use splitter::fixed_windows_from_probs;
 
 use std::path::Path;
 

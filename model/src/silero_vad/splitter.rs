@@ -29,6 +29,17 @@ pub struct SileroVadSplitter {
     pad_samples: usize,
 }
 
+/// Silero-gated fixed-window splitter. Runs VAD to decide which global,
+/// non-overlapping fixed windows contain speech, then transcribes the full
+/// retained windows. This keeps weak speech inside a retained 20s window even
+/// if Silero does not mark every frame as speech.
+pub struct SileroFixedWindowSplitter {
+    vad: VadInference,
+    threshold: f32,
+    window_duration_secs: f32,
+    min_speech_probs: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DurationBudget {
     min: f32,
@@ -83,6 +94,89 @@ impl SileroVadSplitter {
         let vad = VadInference::new(model).context(InferenceSnafu)?;
         Ok(Self::builder().vad(vad).build())
     }
+}
+
+#[bon]
+impl SileroFixedWindowSplitter {
+    /// Build from an already-loaded [`VadInference`]. Defaults to 20-second
+    /// non-overlapping windows and keeps any window with at least one
+    /// above-threshold Silero probability.
+    #[builder]
+    pub fn builder(
+        vad: VadInference,
+        #[builder(default = std::env::var("MOROK_VAD_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5))]
+        threshold: f32,
+        #[builder(default = 20.0)] window_duration_secs: f32,
+        #[builder(default = 1)] min_speech_probs: usize,
+    ) -> Self {
+        assert!(window_duration_secs.is_finite() && window_duration_secs > 0.0, "window duration must be positive");
+        Self { vad, threshold, window_duration_secs, min_speech_probs: min_speech_probs.max(1) }
+    }
+
+    pub fn from_hub() -> Result<Self, SileroVadSplitterError> {
+        let model = SileroVad::from_hub().context(LoadSnafu)?;
+        let vad = VadInference::new(model).context(InferenceSnafu)?;
+        Ok(Self::builder().vad(vad).build())
+    }
+
+    pub fn from_hub_with_window_duration_secs(window_duration_secs: f32) -> Result<Self, SileroVadSplitterError> {
+        let model = SileroVad::from_hub().context(LoadSnafu)?;
+        let vad = VadInference::new(model).context(InferenceSnafu)?;
+        Ok(Self::builder().vad(vad).window_duration_secs(window_duration_secs).build())
+    }
+
+    fn window_samples(&self, bounds: &EncoderBounds) -> usize {
+        let duration_samples = (self.window_duration_secs * bounds.sample_rate as f32).floor() as usize;
+        duration_samples.max(1).min(bounds.max_samples().max(1))
+    }
+}
+
+impl Splitter for SileroFixedWindowSplitter {
+    type Error = SileroVadSplitterError;
+
+    fn split(&mut self, waveform: &[f32], bounds: &EncoderBounds) -> Result<Vec<AudioChunk>, Self::Error> {
+        let probs = self.vad.probs(waveform).context(ProbsSnafu)?;
+        Ok(fixed_windows_from_probs(
+            &probs,
+            waveform.len(),
+            NUM_SAMPLES,
+            self.threshold,
+            self.min_speech_probs,
+            self.window_samples(bounds),
+        ))
+    }
+
+    fn max_chunk_samples(&self, bounds: &EncoderBounds) -> usize {
+        self.window_samples(bounds)
+    }
+}
+
+pub(crate) fn fixed_windows_from_probs(
+    probs: &[f32],
+    waveform_len: usize,
+    samples_per_prob: usize,
+    threshold: f32,
+    min_speech_probs: usize,
+    window_samples: usize,
+) -> Vec<AudioChunk> {
+    if probs.is_empty() || waveform_len == 0 || samples_per_prob == 0 || window_samples == 0 {
+        return Vec::new();
+    }
+
+    let min_speech_probs = min_speech_probs.max(1);
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    while start < waveform_len {
+        let end = start.saturating_add(window_samples).min(waveform_len);
+        let prob_start = start / samples_per_prob;
+        let prob_end = end.div_ceil(samples_per_prob).min(probs.len());
+        let speech_probs = probs.get(prob_start..prob_end).unwrap_or(&[]).iter().filter(|&&p| p >= threshold).count();
+        if speech_probs >= min_speech_probs {
+            chunks.push(AudioChunk::new(start, end));
+        }
+        start = end;
+    }
+    chunks
 }
 
 impl Splitter for SileroVadSplitter {

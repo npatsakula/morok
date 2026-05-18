@@ -6,10 +6,11 @@
 //! exercises the full `VadInference` JIT path (prepare → step → output reads)
 //! — useful when actively touching VAD wiring but too slow for default CI.
 
+use svod_arch::vad::AudioChunk;
 use svod_dtype::DType;
 use svod_tensor::Tensor;
 
-use crate::silero_vad::{CONTEXT_SIZE, HIDDEN, NUM_SAMPLES, SileroVad, VadInference};
+use crate::silero_vad::{CONTEXT_SIZE, HIDDEN, NUM_SAMPLES, SileroVad, VadInference, fixed_windows_from_probs};
 
 // ---------------------------------------------------------------------------
 // Cheap default tests (no realize): build forward graph, check symbolic shape.
@@ -35,6 +36,27 @@ fn forward_chunk_zero_weights_shape() {
         .collect();
     // [B=1, prob(1) + h(HIDDEN) + c(HIDDEN)]
     assert_eq!(shape, vec![1, 1 + 2 * HIDDEN]);
+}
+
+#[test]
+fn fixed_windows_from_probs_keeps_only_speech_windows() {
+    let mut probs = vec![0.0_f32; 55];
+    probs[2] = 0.8;
+    probs[42] = 0.9;
+
+    let chunks = fixed_windows_from_probs(&probs, 55, 1, 0.5, 1, 20);
+    assert_eq!(chunks, vec![AudioChunk::new(0, 20), AudioChunk::new(40, 55)]);
+}
+
+#[test]
+fn fixed_windows_from_probs_respects_min_speech_probs() {
+    let mut probs = vec![0.0_f32; 40];
+    probs[2] = 0.8;
+    probs[21] = 0.9;
+    probs[22] = 0.95;
+
+    let chunks = fixed_windows_from_probs(&probs, 40, 1, 0.5, 2, 20);
+    assert_eq!(chunks, vec![AudioChunk::new(20, 40)]);
 }
 
 // ---------------------------------------------------------------------------

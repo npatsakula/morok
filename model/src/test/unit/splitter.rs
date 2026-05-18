@@ -118,3 +118,24 @@ fn fixed_length_splitter_alignment_does_not_divide_max() {
     // Third chunk: nominal_end=26 == waveform.len() → final, 24..26.
     assert_eq!(chunks, vec![AudioChunk::new(0, 12), AudioChunk::new(12, 24), AudioChunk::new(24, 26),]);
 }
+
+#[test]
+fn fixed_length_splitter_duration_cap() {
+    let mut s = FixedLengthSplitter::with_max_duration_secs(20.0);
+    let wf = vec![0.0; 650_000];
+    let chunks = s.split(&wf, &bounds_realistic()).unwrap();
+    assert_eq!(
+        chunks,
+        vec![AudioChunk::new(0, 320_000), AudioChunk::new(320_000, 640_000), AudioChunk::new(640_000, 650_000),]
+    );
+    assert_eq!(s.max_chunk_samples(&bounds_realistic()), 320_000);
+}
+
+#[test]
+fn fixed_length_splitter_duration_cap_clamps_to_encoder_capacity() {
+    let mut s = FixedLengthSplitter::with_max_duration_secs(60.0);
+    let wf = vec![0.0; 33];
+    let chunks = s.split(&wf, &bounds_tiny()).unwrap();
+    assert_eq!(chunks, vec![AudioChunk::new(0, 16), AudioChunk::new(16, 32), AudioChunk::new(32, 33)]);
+    assert_eq!(s.max_chunk_samples(&bounds_tiny()), 16);
+}
