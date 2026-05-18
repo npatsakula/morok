@@ -1,10 +1,9 @@
 //! Silero-VAD-driven [`Splitter`](crate::audio::Splitter) implementation.
 //!
-//! Wraps [`VadInference`] + [`svod_arch::vad::chunks_from_probs`] so the
-//! pre-refactor `Transcriber` chunking flow is reachable through the generic
-//! splitter trait. Knobs forward to [`ChunkerOpts`](svod_arch::vad::ChunkerOpts)
-//! except for `sample_rate`, `samples_per_prob`, and `align_to` — those come
-//! from [`EncoderBounds`](crate::audio::EncoderBounds) at split time.
+//! Wraps [`VadInference`] + [`svod_arch::vad::chunks_from_probs`] for
+//! long-form ASR. Knobs are exposed in wall-clock seconds and translated to
+//! the prob-grid units that [`ChunkerOpts`](svod_arch::vad::ChunkerOpts)
+//! expects at split time.
 
 use bon::bon;
 use snafu::{ResultExt, Snafu};
@@ -12,27 +11,31 @@ use snafu::{ResultExt, Snafu};
 use crate::audio::{AudioChunk, EncoderBounds, Splitter, trim_chunks_to_waveform};
 use crate::silero_vad::{NUM_SAMPLES, SileroVad, VadInference};
 
+/// 2-second safety margin under the encoder's `max_samples()` so chunks
+/// never sit at the JIT capacity ceiling.
+const ENCODER_SAFETY_MARGIN_SECS: f32 = 2.0;
+
 /// VAD-driven splitter. Construction: [`from_hub`](Self::from_hub) loads the
-/// default model from HF and pulls overrides from `SVOD_VAD_THRESHOLD`. For
+/// default model from HF and pulls overrides from `SVOD_VAD_*` env vars. For
 /// custom knobs use [`builder`](Self::builder) and supply a pre-loaded
 /// [`VadInference`].
 pub struct SileroVadSplitter {
     vad: VadInference,
-    threshold: f32,
-    min_duration: f32,
-    max_duration: f32,
-    strict_limit_duration: f32,
-    min_speech_probs: usize,
-    min_silence_probs: usize,
-    merge_gap_probs: usize,
-    trough_search_probs: Option<usize>,
-    pad_samples: usize,
+    onset: f32,
+    offset: f32,
+    min_speech_secs: f32,
+    min_silence_secs: f32,
+    merge_gap_secs: f32,
+    min_chunk_secs: f32,
+    max_chunk_secs: f32,
+    pad_secs: f32,
+    min_chunk_max_prob: f32,
 }
 
 /// Silero-gated fixed-window splitter. Runs VAD to decide which global,
 /// non-overlapping fixed windows contain speech, then transcribes the full
-/// retained windows. This keeps weak speech inside a retained 20s window even
-/// if Silero does not mark every frame as speech.
+/// retained windows. Useful as a robust fallback when VAD probabilities are
+/// unreliable.
 pub struct SileroFixedWindowSplitter {
     vad: VadInference,
     threshold: f32,
@@ -40,59 +43,76 @@ pub struct SileroFixedWindowSplitter {
     min_speech_probs: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DurationBudget {
-    min: f32,
-    max: f32,
-    strict_limit: f32,
-}
-
 #[bon]
 impl SileroVadSplitter {
-    /// Build from an already-loaded [`VadInference`]. All knob defaults match
-    /// [`ChunkerOpts::default`](svod_arch::vad::ChunkerOpts) except
-    /// `threshold`, which consults `SVOD_VAD_THRESHOLD`.
+    /// Build from an already-loaded [`VadInference`]. Defaults pull from
+    /// `SVOD_VAD_ONSET` / `SVOD_VAD_OFFSET` env vars, with fallbacks
+    /// `0.50` / `0.35`.
     #[builder]
     pub fn builder(
         vad: VadInference,
-        #[builder(default = std::env::var("SVOD_VAD_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5))]
-        threshold: f32,
-        #[builder(default = 15.0)] min_duration: f32,
-        #[builder(default = 22.0)] max_duration: f32,
-        #[builder(default = 30.0)] strict_limit_duration: f32,
-        #[builder(default = 8)] min_speech_probs: usize,
-        #[builder(default = 4)] min_silence_probs: usize,
-        #[builder(default = 8)] merge_gap_probs: usize,
-        trough_search_probs: Option<usize>,
-        /// Pad budget (samples) per chunk side. Default `1600` (= 100 ms at
-        /// 16 kHz). The actual pad applied is capped at half the silence
-        /// gap to the neighbouring chunk — so chunks never overlap into
-        /// each other's speech (no transcript duplication), but at seams
-        /// with enough surrounding silence the encoder sees up to this
-        /// many extra samples of context on each side.
-        #[builder(default = 1600)]
-        pad_samples: usize,
+        #[builder(default = env_f32("SVOD_VAD_ONSET", 0.50))] onset: f32,
+        #[builder(default = env_f32("SVOD_VAD_OFFSET", 0.35))] offset: f32,
+        /// Minimum length (s) of a committed speech run.
+        #[builder(default = env_f32("SVOD_VAD_MIN_SPEECH_SECS", 0.25))]
+        min_speech_secs: f32,
+        /// Consecutive `< offset` duration (s) required to close a run.
+        #[builder(default = env_f32("SVOD_VAD_MIN_SILENCE_SECS", 0.10))]
+        min_silence_secs: f32,
+        /// Adjacent speech runs separated by ≤ this many seconds are merged.
+        #[builder(default = env_f32("SVOD_VAD_MERGE_GAP_SECS", 0.40))]
+        merge_gap_secs: f32,
+        /// Soft floor for chunk length — used as the left edge of the legal
+        /// min-cut window when splitting an over-long run.
+        #[builder(default = env_f32("SVOD_VAD_MIN_CHUNK_SECS", 0.5))]
+        min_chunk_secs: f32,
+        /// Hard ceiling for chunk length. Clamped at split time to the
+        /// encoder's prepared budget minus a 2 s safety margin. Empirically
+        /// 20 s gives the best RN-T results — longer chunks (22 s, 28 s)
+        /// degrade quality on heterogeneous content because the decoder
+        /// "skips" earlier tokens when it encounters garbled/transition
+        /// audio mid-chunk. Upstream Python (`gigaam/vad_utils.py`) uses
+        /// max=22, but it accumulates short speech segments and is less
+        /// affected by this failure mode.
+        #[builder(default = env_f32("SVOD_VAD_MAX_CHUNK_SECS", 20.0))]
+        max_chunk_secs: f32,
+        /// Per-side decode-window pad in seconds. 300 ms covers the Conformer
+        /// convolutional receptive field at the subsampled rate.
+        #[builder(default = env_f32("SVOD_VAD_PAD_SECS", 0.30))]
+        pad_secs: f32,
+        /// Speech gate: drop chunks whose peak Silero prob is below this.
+        #[builder(default = env_f32("SVOD_VAD_GATE", 0.3))]
+        min_chunk_max_prob: f32,
     ) -> Self {
         Self {
             vad,
-            threshold,
-            min_duration,
-            max_duration,
-            strict_limit_duration,
-            min_speech_probs,
-            min_silence_probs,
-            merge_gap_probs,
-            trough_search_probs,
-            pad_samples,
+            onset,
+            offset,
+            min_speech_secs,
+            min_silence_secs,
+            merge_gap_secs,
+            min_chunk_secs,
+            max_chunk_secs,
+            pad_secs,
+            min_chunk_max_prob,
         }
     }
 
     /// Convenience: download the default Silero model from HF Hub, wrap it in
-    /// a [`VadInference`], and apply env-var-driven knob defaults.
+    /// a [`VadInference`], and apply env-var-driven defaults.
     pub fn from_hub() -> Result<Self, SileroVadSplitterError> {
         let model = SileroVad::from_hub().context(LoadSnafu)?;
         let vad = VadInference::new(model).context(InferenceSnafu)?;
         Ok(Self::builder().vad(vad).build())
+    }
+
+    fn effective_max_chunk_secs(&self, bounds: &EncoderBounds) -> f32 {
+        let pad_samples = (self.pad_secs * bounds.sample_rate as f32).round() as usize;
+        let align = bounds.align_to_samples().max(1);
+        let overhead = 2 * pad_samples + 2 * align.saturating_sub(1);
+        let encoder_capacity = bounds.max_samples().saturating_sub(overhead) as f32 / bounds.sample_rate as f32;
+        let safe_capacity = (encoder_capacity - ENCODER_SAFETY_MARGIN_SECS).max(0.0);
+        self.max_chunk_secs.min(safe_capacity).max(0.0)
     }
 }
 
@@ -104,8 +124,7 @@ impl SileroFixedWindowSplitter {
     #[builder]
     pub fn builder(
         vad: VadInference,
-        #[builder(default = std::env::var("MOROK_VAD_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5))]
-        threshold: f32,
+        #[builder(default = env_f32("MOROK_VAD_THRESHOLD", 0.5))] threshold: f32,
         #[builder(default = 20.0)] window_duration_secs: f32,
         #[builder(default = 1)] min_speech_probs: usize,
     ) -> Self {
@@ -184,60 +203,47 @@ impl Splitter for SileroVadSplitter {
 
     fn split(&mut self, waveform: &[f32], bounds: &EncoderBounds) -> Result<Vec<AudioChunk>, Self::Error> {
         let probs = self.vad.probs(waveform).context(ProbsSnafu)?;
-        let budget = self.duration_budget(bounds);
-        let chunker_opts = svod_arch::vad::ChunkerOpts {
-            sample_rate: bounds.sample_rate,
-            samples_per_prob: NUM_SAMPLES,
-            threshold: self.threshold,
-            min_duration: budget.min,
-            max_duration: budget.max,
-            cluster_target_duration: Some(budget.max * 0.5),
-            strict_limit_duration: budget.strict_limit,
-            min_speech_probs: self.min_speech_probs,
-            min_silence_probs: self.min_silence_probs,
-            merge_gap_probs: self.merge_gap_probs,
-            trough_search_probs: self.trough_search_probs,
-            trough_threshold: Some(self.threshold * 0.5),
-            pad_samples: self.pad_samples,
-            align_to: bounds.align_to_samples().max(1),
-        };
-        let mut chunks = svod_arch::vad::chunks_from_probs(&probs, &chunker_opts).context(ChunkSnafu)?;
-        // `align_to` rounds chunk ends up to a stride multiple, which can push
-        // the trailing chunk past `waveform.len()`. The `Splitter` contract
+        let opts = self.chunker_opts(bounds);
+        let mut chunks = svod_arch::vad::chunks_from_probs(&probs, &opts).context(ChunkSnafu)?;
+        // align_to rounds chunk ends up to a stride multiple, which can push
+        // the trailing chunk past `waveform.len()`. The Splitter contract
         // forbids that, so clamp the tail before returning.
         trim_chunks_to_waveform(&mut chunks, waveform.len());
         Ok(chunks)
     }
 
-    /// Upper bound on chunk length the chunker can emit under this
-    /// splitter's config. Translating to samples lets `Transcriber::new`
-    /// size JIT buffers to this chunker's actual emission rather than the
-    /// encoder's full capacity. Shared bound math lives in
-    /// [`svod_arch::vad::strict_chunk_sample_bound`].
     fn max_chunk_samples(&self, bounds: &EncoderBounds) -> usize {
-        let probs_per_sec = bounds.sample_rate as f32 / NUM_SAMPLES as f32;
-        let strict_limit_probs = (self.duration_budget(bounds).strict_limit * probs_per_sec).ceil() as usize;
-        svod_arch::vad::strict_chunk_sample_bound(
-            strict_limit_probs,
-            NUM_SAMPLES,
-            self.pad_samples,
-            bounds.align_to_samples(),
-        )
+        let opts = self.chunker_opts(bounds);
+        svod_arch::vad::max_chunk_sample_bound(opts.max_chunk_probs, NUM_SAMPLES, opts.pad_samples, opts.align_to)
     }
 }
 
 impl SileroVadSplitter {
-    fn duration_budget(&self, bounds: &EncoderBounds) -> DurationBudget {
-        let align = bounds.align_to_samples().max(1);
-        let overhead = 2 * self.pad_samples + 2 * align.saturating_sub(1);
-        let safe_core_probs = bounds.max_samples().saturating_sub(overhead) / NUM_SAMPLES;
-        let configured_probs =
-            (self.strict_limit_duration * bounds.sample_rate as f32 / NUM_SAMPLES as f32).ceil() as usize;
-        let strict_limit_probs = configured_probs.min(safe_core_probs).max(1);
-        let strict_limit = strict_limit_probs as f32 * NUM_SAMPLES as f32 / bounds.sample_rate as f32;
-        let max = self.max_duration.min(strict_limit);
-        DurationBudget { min: self.min_duration.min(strict_limit), max, strict_limit }
+    fn chunker_opts(&self, bounds: &EncoderBounds) -> svod_arch::vad::ChunkerOpts {
+        let sr = bounds.sample_rate as f32;
+        let probs_per_sec = sr / NUM_SAMPLES as f32;
+        let max_chunk_secs = self.effective_max_chunk_secs(bounds);
+        let max_chunk_probs = (max_chunk_secs * probs_per_sec).floor() as usize;
+        let min_chunk_probs = (self.min_chunk_secs * probs_per_sec).ceil() as usize;
+        svod_arch::vad::ChunkerOpts {
+            sample_rate: bounds.sample_rate,
+            samples_per_prob: NUM_SAMPLES,
+            onset: self.onset,
+            offset: self.offset,
+            min_speech_probs: (self.min_speech_secs * probs_per_sec).ceil() as usize,
+            min_silence_probs: (self.min_silence_secs * probs_per_sec).ceil() as usize,
+            merge_gap_probs: (self.merge_gap_secs * probs_per_sec).ceil() as usize,
+            min_chunk_probs: min_chunk_probs.min(max_chunk_probs.max(1)),
+            max_chunk_probs: max_chunk_probs.max(1),
+            pad_samples: (self.pad_secs * sr).round() as usize,
+            align_to: bounds.align_to_samples().max(1),
+            min_chunk_max_prob: self.min_chunk_max_prob,
+        }
     }
+}
+
+fn env_f32(key: &str, fallback: f32) -> f32 {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(fallback)
 }
 
 #[derive(Debug, Snafu)]

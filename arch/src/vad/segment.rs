@@ -1,74 +1,85 @@
-//! Threshold + smoothing pass that turns per-frame speech probabilities into
-//! `[start, end)` prob-index ranges of speech.
+//! Hysteresis binarisation + merge-close pass that turns per-frame speech
+//! probabilities into `[start, end)` prob-index ranges of speech.
 //!
-//! Output is in *prob-grid index* units so downstream code (chunker
-//! post-process) can decide on sample/time conversion. Smoothing constants
-//! (min run lengths, merge gaps) are read from [`super::ChunkerOpts`].
-
-use super::ChunkerOpts;
+//! Hysteresis (two thresholds, `onset > offset`) suppresses the
+//! single-threshold chatter that earlier needed `min_speech` / `min_silence`
+//! smoothing to paper over. The smoothing knobs still exist as run-length
+//! floors: a run only commits when it lasts at least `min_speech_probs`, and
+//! only closes after `min_silence_probs` consecutive below-`offset` probs.
 
 /// Returns `[start, end)` ranges (prob-grid indices) of speech runs in
-/// `probs`, with smoothing per `opts`:
+/// `probs`, using hysteresis binarisation:
 ///
-/// - A speech run begins at the first prob ≥ `opts.threshold` after a
-///   silence run.
-/// - A speech run terminates at the first index where `opts.min_silence_probs`
-///   consecutive sub-threshold probs have been seen. The terminator index
-///   itself is *exclusive*.
-/// - Runs containing fewer than `opts.min_speech_probs` total above-threshold
-///   indices are dropped.
-/// - Adjacent speech runs separated by ≤ `opts.merge_gap_probs` silence
-///   probs are merged.
-pub(crate) fn threshold_segments(probs: &[f32], opts: &ChunkerOpts) -> Vec<(usize, usize)> {
-    let min_speech = opts.min_speech_probs;
-    let min_silence = opts.min_silence_probs;
-    let merge_gap = opts.merge_gap_probs;
-    let threshold = opts.threshold;
-
-    let mut raw: Vec<(usize, usize)> = Vec::new();
+/// - A speech run opens at the first prob `≥ onset`.
+/// - While in speech, probs `≥ offset` keep the run open (the band
+///   `[offset, onset)` is "in-speech sustain"). Below `offset` starts a
+///   silence streak.
+/// - A speech run terminates at the first index where
+///   `min_silence_probs` consecutive probs `< offset` have been seen.
+///   The terminator index is *exclusive*.
+/// - Runs shorter than `min_speech_probs` are dropped.
+///
+/// `onset` and `offset` are assumed to satisfy `offset ≤ onset`. Pass equal
+/// values to recover plain single-threshold behaviour.
+pub(crate) fn hysteresis_segments(
+    probs: &[f32],
+    onset: f32,
+    offset: f32,
+    min_speech_probs: usize,
+    min_silence_probs: usize,
+) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut speech_start: Option<usize> = None;
     let mut silence_count = 0usize;
 
     for (i, &p) in probs.iter().enumerate() {
-        if p >= threshold {
-            if speech_start.is_none() {
-                speech_start = Some(i);
-            }
-            silence_count = 0;
-        } else if let Some(start) = speech_start {
-            silence_count += 1;
-            if min_silence == 0 || silence_count >= min_silence {
-                // First non-speech index in the trailing silence run; the run
-                // started at `i + 1 - silence_count` and the speech segment
-                // ends just before it.
-                let end = i + 1 - silence_count;
-                if end > start && end - start >= min_speech {
-                    raw.push((start, end));
+        match speech_start {
+            None => {
+                if p >= onset {
+                    speech_start = Some(i);
+                    silence_count = 0;
                 }
-                speech_start = None;
-                silence_count = 0;
+            }
+            Some(start) => {
+                if p >= offset {
+                    silence_count = 0;
+                } else {
+                    silence_count += 1;
+                    if min_silence_probs == 0 || silence_count >= min_silence_probs {
+                        let end = i + 1 - silence_count;
+                        if end > start && end - start >= min_speech_probs {
+                            runs.push((start, end));
+                        }
+                        speech_start = None;
+                        silence_count = 0;
+                    }
+                }
             }
         }
     }
 
     if let Some(start) = speech_start {
         let end = probs.len();
-        if end - start >= min_speech {
-            raw.push((start, end));
+        if end > start && end - start >= min_speech_probs {
+            runs.push((start, end));
         }
     }
 
-    // Merge consecutive runs separated by ≤ merge_gap silence probs.
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for seg in raw {
-        if let Some(last) = merged.last_mut()
-            && seg.0 - last.1 <= merge_gap
+    runs
+}
+
+/// Fold consecutive speech runs whose gap is `≤ merge_gap_probs` into one.
+/// Pass `0` to disable merging.
+pub(crate) fn merge_close(runs: Vec<(usize, usize)>, merge_gap_probs: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for seg in runs {
+        if let Some(last) = out.last_mut()
+            && seg.0.saturating_sub(last.1) <= merge_gap_probs
         {
             last.1 = seg.1;
             continue;
         }
-        merged.push(seg);
+        out.push(seg);
     }
-
-    merged
+    out
 }

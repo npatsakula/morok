@@ -276,14 +276,16 @@ impl VadInference {
     }
 
     /// Convenience wrapper around [`Self::probs`] +
-    /// [`svod_arch::vad::chunks_from_probs`] with default chunker knobs and
-    /// the given `threshold`. Errors from the JIT or chunker are swallowed —
-    /// callers that need fault-visibility should drive `probs()` and
-    /// `chunks_from_probs` directly.
+    /// [`morok_arch::vad::chunks_from_probs`] with default chunker knobs and
+    /// the given single threshold (mapped to `onset == offset` —
+    /// non-hysteresis behaviour). Errors from the JIT or chunker are
+    /// swallowed — callers that need fault-visibility should drive
+    /// `probs()` and `chunks_from_probs` directly.
     pub fn segment(&mut self, waveform: &[f32], threshold: f32) -> Vec<(usize, usize)> {
         let Ok(probs) = self.probs(waveform) else { return Vec::new() };
         let opts = svod_arch::vad::ChunkerOpts {
-            threshold,
+            onset: threshold,
+            offset: threshold,
             samples_per_prob: NUM_SAMPLES,
             ..svod_arch::vad::ChunkerOpts::default()
         };
