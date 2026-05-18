@@ -127,6 +127,43 @@ pub struct ChunkResult {
     pub words: Option<Vec<Word>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ChunkMeta {
+    decode_start: usize,
+    decode_end: usize,
+    mel_len: usize,
+    start_sec: f32,
+    end_sec: f32,
+    decode_start_sec: f32,
+}
+
+impl ChunkMeta {
+    fn from_chunk(chunk: &AudioChunk, mel: &MelSpectrogram, sample_rate_hz: usize) -> Option<Self> {
+        let mel_len = mel.num_frames(chunk.decode_len());
+        if mel_len == 0 {
+            return None;
+        }
+
+        let sample_rate = sample_rate_hz as f32;
+        Some(Self {
+            decode_start: chunk.decode_start_sample,
+            decode_end: chunk.decode_end_sample,
+            mel_len,
+            start_sec: chunk.start_sample as f32 / sample_rate,
+            end_sec: chunk.end_sample as f32 / sample_rate,
+            decode_start_sec: chunk.decode_start_sample as f32 / sample_rate,
+        })
+    }
+
+    fn decode_duration_sec(&self, sample_rate_hz: usize) -> f32 {
+        (self.decode_end - self.decode_start) as f32 / sample_rate_hz as f32
+    }
+
+    fn result(self, text: String, words: Option<Vec<Word>>) -> ChunkResult {
+        ChunkResult { start_sec: self.start_sec, end_sec: self.end_sec, text, words }
+    }
+}
+
 /// Per-head decoder + JIT state. CTC needs a bounds-tied head JIT (Conv1d
 /// projection); RN-T's predictor/joint JITs ride with [`RnntStepBackend`].
 /// One instance per `Transcriber`, so the variant-size disparity is
@@ -173,6 +210,33 @@ pub(crate) fn ctc_frames_to_words(text: &str, frames: &[usize], frame_shift: f32
     }
     commit(&mut words, &mut current, first_frame, last_frame);
     words
+}
+
+pub(crate) fn crop_words_to_core(
+    words: Vec<Word>,
+    decode_start_sec: f32,
+    core_start_sec: f32,
+    core_end_sec: f32,
+) -> Vec<Word> {
+    let core_duration = core_end_sec - core_start_sec;
+    words
+        .into_iter()
+        .filter_map(|mut w| {
+            let abs_start = w.start + decode_start_sec;
+            let abs_end = w.end + decode_start_sec;
+            let mid = 0.5 * (abs_start + abs_end);
+            if !(core_start_sec..core_end_sec).contains(&mid) {
+                return None;
+            }
+            w.start = (abs_start - core_start_sec).clamp(0.0, core_duration);
+            w.end = (abs_end - core_start_sec).clamp(w.start, core_duration);
+            Some(w)
+        })
+        .collect()
+}
+
+pub(crate) fn words_to_text(words: &[Word]) -> String {
+    words.iter().map(|w| w.text.as_str()).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
 /// Transpose `[d_model, t_exec_sub]` row-major → `[actual_sub, d_model]`.
@@ -400,7 +464,14 @@ impl<S: Splitter> Transcriber<S> {
                     waveform_len: waveform.len(),
                 });
             }
-            let samples = chunk.end_sample.saturating_sub(chunk.start_sample);
+            if chunk.decode_end_sample > waveform.len() {
+                return Err(TranscribeError::ChunkOutOfRange {
+                    idx,
+                    end_sample: chunk.decode_end_sample,
+                    waveform_len: waveform.len(),
+                });
+            }
+            let samples = chunk.decode_len();
             if samples > max_samples {
                 return Err(TranscribeError::ChunkExceedsCapacity { idx, samples, max_samples });
             }
@@ -422,19 +493,8 @@ impl<S: Splitter> Transcriber<S> {
         let max_batch = self.max_batch;
         let want_words = self.opts.word_timestamps;
 
-        // (start_sample, end_sample, mel_len, start_sec, end_sec) per chunk.
-        let chunks_meta: Vec<(usize, usize, usize, f32, f32)> = chunks
-            .iter()
-            .filter_map(|c| {
-                let mel_len = self.mel.num_frames(c.end_sample.saturating_sub(c.start_sample));
-                if mel_len == 0 {
-                    return None;
-                }
-                let start_sec = c.start_sample as f32 / sample_rate_hz as f32;
-                let end_sec = c.end_sample as f32 / sample_rate_hz as f32;
-                Some((c.start_sample, c.end_sample, mel_len, start_sec, end_sec))
-            })
-            .collect();
+        let chunks_meta: Vec<ChunkMeta> =
+            chunks.iter().filter_map(|chunk| ChunkMeta::from_chunk(chunk, &self.mel, sample_rate_hz)).collect();
         if chunks_meta.is_empty() {
             return Ok(TranscribeResult { text: String::new(), chunks: Vec::new() });
         }
@@ -447,11 +507,11 @@ impl<S: Splitter> Transcriber<S> {
 
             let batch_mels: Vec<Vec<f32>> = (0..b)
                 .map(|bi| {
-                    let &(start_sample, end_sample, valid, _, _) = &chunks_meta[chunk_batch_start + bi];
-                    let mut chunk_mel = ndarray::Array3::<f32>::zeros((1, n_mels, valid));
+                    let meta = chunks_meta[chunk_batch_start + bi];
+                    let mut chunk_mel = ndarray::Array3::<f32>::zeros((1, n_mels, meta.mel_len));
                     {
                         let mut view = chunk_mel.view_mut().into_dyn();
-                        self.mel.forward_into(&waveform[start_sample..end_sample], &mut view);
+                        self.mel.forward_into(&waveform[meta.decode_start..meta.decode_end], &mut view);
                     }
                     chunk_mel.as_slice().expect("contiguous chunk mel").to_vec()
                 })
@@ -464,13 +524,13 @@ impl<S: Splitter> Transcriber<S> {
                 let slice = view.as_slice_mut().expect("contiguous mel buffer");
                 slice.fill(0.0);
                 for (bi, chunk_len) in chunk_lengths.iter_mut().enumerate() {
-                    let &(_, _, valid, _, _) = &chunks_meta[chunk_batch_start + bi];
-                    *chunk_len = valid;
+                    let meta = chunks_meta[chunk_batch_start + bi];
+                    *chunk_len = meta.mel_len;
                     let chunk_mel = &batch_mels[bi];
                     for mel_bin in 0..n_mels {
-                        let src = mel_bin * valid;
+                        let src = mel_bin * meta.mel_len;
                         let dst = ((bi * n_mels) + mel_bin) * max_t_mel;
-                        slice[dst..dst + valid].copy_from_slice(&chunk_mel[src..src + valid]);
+                        slice[dst..dst + meta.mel_len].copy_from_slice(&chunk_mel[src..src + meta.mel_len]);
                     }
                 }
             }
@@ -520,26 +580,23 @@ impl<S: Splitter> Transcriber<S> {
                     let flat = logits.as_slice().expect("contiguous head logits");
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
-                        let &(start_sample, end_sample, _, start_sec, end_sec) = &chunks_meta[chunk_batch_start + bi];
-                        let chunk_duration_sec = (end_sample - start_sample) as f32 / sample_rate_hz as f32;
-                        let frame_shift = chunk_duration_sec / (actual_sub.max(1) as f32);
+                        let meta = chunks_meta[chunk_batch_start + bi];
+                        let frame_shift = meta.decode_duration_sec(sample_rate_hz) / (actual_sub.max(1) as f32);
 
                         let item_slice = &flat[bi * item_stride..bi * item_stride + item_stride];
 
-                        let (text, frames) = if want_words {
-                            let (text, frames) = decoder
-                                .decode_with_timestamps(item_slice, t_exec_sub, actual_sub)
-                                .context(CtcDecodeSnafu)?;
-                            (text, Some(frames))
-                        } else {
-                            let text = decoder.decode(item_slice, t_exec_sub, actual_sub).context(CtcDecodeSnafu)?;
-                            (text, None)
-                        };
-                        let words = want_words.then(|| {
-                            let frames = frames.as_deref().unwrap_or(&[]);
-                            ctc_frames_to_words(&text, frames, frame_shift)
-                        });
-                        chunk_results.push(ChunkResult { start_sec, end_sec, text, words });
+                        let (text, frames) = decoder
+                            .decode_with_timestamps(item_slice, t_exec_sub, actual_sub)
+                            .context(CtcDecodeSnafu)?;
+                        let cropped_words = crop_words_to_core(
+                            ctc_frames_to_words(&text, &frames, frame_shift),
+                            meta.decode_start_sec,
+                            meta.start_sec,
+                            meta.end_sec,
+                        );
+                        let text = words_to_text(&cropped_words);
+                        let words = want_words.then_some(cropped_words);
+                        chunk_results.push(meta.result(text, words));
                     }
                 }
                 HeadDecoder::Rnnt { backend, decoder, sentencepiece } => {
@@ -549,9 +606,8 @@ impl<S: Splitter> Transcriber<S> {
                     let flat = enc.as_slice().expect("contiguous encoder output");
                     for (bi, mel_len) in chunk_lengths.iter().enumerate() {
                         let actual_sub = subs_output_length(subs_kernel_size, *mel_len);
-                        let &(start_sample, end_sample, _, start_sec, end_sec) = &chunks_meta[chunk_batch_start + bi];
-                        let chunk_duration_sec = (end_sample - start_sample) as f32 / sample_rate_hz as f32;
-                        let frame_shift = chunk_duration_sec / (actual_sub.max(1) as f32);
+                        let meta = chunks_meta[chunk_batch_start + bi];
+                        let frame_shift = meta.decode_duration_sec(sample_rate_hz) / (actual_sub.max(1) as f32);
 
                         let item_slice = &flat[bi * item_stride..bi * item_stride + item_stride];
                         // Encoder output is [d_model, t_exec_sub] row-major;
@@ -559,22 +615,21 @@ impl<S: Splitter> Transcriber<S> {
                         let frames = transpose_dt_to_td(item_slice, d_model, t_exec_sub, actual_sub);
 
                         let backend: &mut RnntStepBackend = backend;
-                        let (raw, emissions) = if want_words {
-                            let (s, e) = decoder
-                                .decode_with_timestamps(&frames, actual_sub, actual_sub, d_model, backend)
-                                .map_err(rnnt_decode_err)?;
-                            (s, e)
-                        } else {
-                            let s = decoder
-                                .decode(&frames, actual_sub, actual_sub, d_model, backend)
-                                .map_err(rnnt_decode_err)?;
-                            (s, Vec::new())
-                        };
-                        let words = want_words.then(|| decoder.frames_to_words(&emissions, frame_shift));
-                        // SP pieces carry `▁` (U+2581) as word-initial markers;
-                        // after concatenation we restore them as spaces.
-                        let text = if *sentencepiece { raw.replace('\u{2581}', " ").trim().to_string() } else { raw };
-                        chunk_results.push(ChunkResult { start_sec, end_sec, text, words });
+                        let (_raw, emissions) = decoder
+                            .decode_with_timestamps(&frames, actual_sub, actual_sub, d_model, backend)
+                            .map_err(rnnt_decode_err)?;
+                        let cropped_words = crop_words_to_core(
+                            decoder.frames_to_words(&emissions, frame_shift),
+                            meta.decode_start_sec,
+                            meta.start_sec,
+                            meta.end_sec,
+                        );
+                        let mut text = words_to_text(&cropped_words);
+                        if *sentencepiece {
+                            text = text.replace('\u{2581}', " ").trim().to_string();
+                        }
+                        let words = want_words.then_some(cropped_words);
+                        chunk_results.push(meta.result(text, words));
                     }
                 }
             }

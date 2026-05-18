@@ -29,6 +29,13 @@ pub struct SileroVadSplitter {
     pad_samples: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DurationBudget {
+    min: f32,
+    max: f32,
+    strict_limit: f32,
+}
+
 #[bon]
 impl SileroVadSplitter {
     /// Build from an already-loaded [`VadInference`]. All knob defaults match
@@ -83,17 +90,15 @@ impl Splitter for SileroVadSplitter {
 
     fn split(&mut self, waveform: &[f32], bounds: &EncoderBounds) -> Result<Vec<AudioChunk>, Self::Error> {
         let probs = self.vad.probs(waveform).context(ProbsSnafu)?;
-        // Clamp ALL THREE duration knobs to encoder capacity. Without the
-        // `min_duration` clamp the arch chunker's `MinExceedsMax` validator
-        // fires when encoder capacity < 15s.
-        let cap = bounds.encoder_capacity_secs();
+        let budget = self.duration_budget(bounds);
         let chunker_opts = svod_arch::vad::ChunkerOpts {
             sample_rate: bounds.sample_rate,
             samples_per_prob: NUM_SAMPLES,
             threshold: self.threshold,
-            min_duration: self.min_duration.min(cap),
-            max_duration: self.max_duration.min(cap),
-            strict_limit_duration: self.strict_limit_duration.min(cap),
+            min_duration: budget.min,
+            max_duration: budget.max,
+            cluster_target_duration: Some(budget.max * 0.5),
+            strict_limit_duration: budget.strict_limit,
             min_speech_probs: self.min_speech_probs,
             min_silence_probs: self.min_silence_probs,
             merge_gap_probs: self.merge_gap_probs,
@@ -116,18 +121,28 @@ impl Splitter for SileroVadSplitter {
     /// encoder's full capacity. Shared bound math lives in
     /// [`svod_arch::vad::strict_chunk_sample_bound`].
     fn max_chunk_samples(&self, bounds: &EncoderBounds) -> usize {
-        let cap = bounds.encoder_capacity_secs();
-        let secs = self.strict_limit_duration.min(cap);
         let probs_per_sec = bounds.sample_rate as f32 / NUM_SAMPLES as f32;
-        let strict_limit_probs = (secs * probs_per_sec).ceil() as usize;
-        let radius = self.trough_search_probs.unwrap_or(self.min_silence_probs);
+        let strict_limit_probs = (self.duration_budget(bounds).strict_limit * probs_per_sec).ceil() as usize;
         svod_arch::vad::strict_chunk_sample_bound(
             strict_limit_probs,
-            radius,
             NUM_SAMPLES,
             self.pad_samples,
             bounds.align_to_samples(),
         )
+    }
+}
+
+impl SileroVadSplitter {
+    fn duration_budget(&self, bounds: &EncoderBounds) -> DurationBudget {
+        let align = bounds.align_to_samples().max(1);
+        let overhead = 2 * self.pad_samples + 2 * align.saturating_sub(1);
+        let safe_core_probs = bounds.max_samples().saturating_sub(overhead) / NUM_SAMPLES;
+        let configured_probs =
+            (self.strict_limit_duration * bounds.sample_rate as f32 / NUM_SAMPLES as f32).ceil() as usize;
+        let strict_limit_probs = configured_probs.min(safe_core_probs).max(1);
+        let strict_limit = strict_limit_probs as f32 * NUM_SAMPLES as f32 / bounds.sample_rate as f32;
+        let max = self.max_duration.min(strict_limit);
+        DurationBudget { min: self.min_duration.min(strict_limit), max, strict_limit }
     }
 }
 

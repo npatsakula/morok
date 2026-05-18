@@ -102,6 +102,8 @@ pub fn trim_chunks_to_waveform(chunks: &mut Vec<AudioChunk>, waveform_len: usize
             continue;
         }
         last.end_sample = last.end_sample.min(waveform_len);
+        last.decode_start_sample = last.decode_start_sample.min(waveform_len);
+        last.decode_end_sample = last.decode_end_sample.min(waveform_len);
         chunks.push(last);
         break;
     }
@@ -156,7 +158,7 @@ impl Splitter for FixedLengthSplitter {
                 let aligned_span = (span / align) * align;
                 start + aligned_span.max(align)
             };
-            chunks.push(AudioChunk { start_sample: start, end_sample: aligned_end });
+            chunks.push(AudioChunk::new(start, aligned_end));
             start = aligned_end;
         }
         Ok(chunks)

@@ -51,7 +51,7 @@ fn fixed_length_splitter_shorter_than_max() {
     let mut s = FixedLengthSplitter::new();
     let wf = vec![0.0; 10];
     let chunks = s.split(&wf, &bounds_tiny()).unwrap();
-    assert_eq!(chunks, vec![AudioChunk { start_sample: 0, end_sample: 10 }]);
+    assert_eq!(chunks, vec![AudioChunk::new(0, 10)]);
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn fixed_length_splitter_exact_one_chunk() {
     let mut s = FixedLengthSplitter::new();
     let wf = vec![0.0; 16];
     let chunks = s.split(&wf, &bounds_tiny()).unwrap();
-    assert_eq!(chunks, vec![AudioChunk { start_sample: 0, end_sample: 16 }]);
+    assert_eq!(chunks, vec![AudioChunk::new(0, 16)]);
 }
 
 #[test]
@@ -69,10 +69,7 @@ fn fixed_length_splitter_exact_two_chunks() {
     let mut s = FixedLengthSplitter::new();
     let wf = vec![0.0; 32];
     let chunks = s.split(&wf, &bounds_tiny()).unwrap();
-    assert_eq!(
-        chunks,
-        vec![AudioChunk { start_sample: 0, end_sample: 16 }, AudioChunk { start_sample: 16, end_sample: 32 },]
-    );
+    assert_eq!(chunks, vec![AudioChunk::new(0, 16), AudioChunk::new(16, 32)]);
 }
 
 #[test]
@@ -81,14 +78,7 @@ fn fixed_length_splitter_two_chunks_plus_tail() {
     let mut s = FixedLengthSplitter::new();
     let wf = vec![0.0; 33];
     let chunks = s.split(&wf, &bounds_tiny()).unwrap();
-    assert_eq!(
-        chunks,
-        vec![
-            AudioChunk { start_sample: 0, end_sample: 16 },
-            AudioChunk { start_sample: 16, end_sample: 32 },
-            AudioChunk { start_sample: 32, end_sample: 33 },
-        ]
-    );
+    assert_eq!(chunks, vec![AudioChunk::new(0, 16), AudioChunk::new(16, 32), AudioChunk::new(32, 33),]);
 }
 
 #[test]
@@ -100,10 +90,7 @@ fn fixed_length_splitter_final_chunk_can_be_unaligned() {
     let mut s = FixedLengthSplitter::new();
     let wf = vec![0.0; 30];
     let chunks = s.split(&wf, &bounds_tiny()).unwrap();
-    assert_eq!(
-        chunks,
-        vec![AudioChunk { start_sample: 0, end_sample: 16 }, AudioChunk { start_sample: 16, end_sample: 30 },]
-    );
+    assert_eq!(chunks, vec![AudioChunk::new(0, 16), AudioChunk::new(16, 30)]);
 }
 
 #[test]
@@ -114,14 +101,7 @@ fn fixed_length_splitter_progress_under_degenerate_bounds() {
     let mut s = FixedLengthSplitter::new();
     let chunks = s.split(&[0.0_f32; 9], &bounds).unwrap();
     // align=4, max forced to 4 → chunks of 4, 4, 1.
-    assert_eq!(
-        chunks,
-        vec![
-            AudioChunk { start_sample: 0, end_sample: 4 },
-            AudioChunk { start_sample: 4, end_sample: 8 },
-            AudioChunk { start_sample: 8, end_sample: 9 },
-        ]
-    );
+    assert_eq!(chunks, vec![AudioChunk::new(0, 4), AudioChunk::new(4, 8), AudioChunk::new(8, 9),]);
 }
 
 #[test]
@@ -136,12 +116,5 @@ fn fixed_length_splitter_alignment_does_not_divide_max() {
     // First chunk: nominal_end=12, span=12, aligned_span=12 → 0..12.
     // Second chunk: nominal_end=24, span=12, aligned_span=12 → 12..24.
     // Third chunk: nominal_end=26 == waveform.len() → final, 24..26.
-    assert_eq!(
-        chunks,
-        vec![
-            AudioChunk { start_sample: 0, end_sample: 12 },
-            AudioChunk { start_sample: 12, end_sample: 24 },
-            AudioChunk { start_sample: 24, end_sample: 26 },
-        ]
-    );
+    assert_eq!(chunks, vec![AudioChunk::new(0, 12), AudioChunk::new(12, 24), AudioChunk::new(24, 26),]);
 }

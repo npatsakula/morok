@@ -10,7 +10,7 @@
 use svod_arch::rnnt::Word;
 
 use crate::gigaam::TranscribeOpts;
-use crate::gigaam::transcribe::ctc_frames_to_words;
+use crate::gigaam::transcribe::{crop_words_to_core, ctc_frames_to_words, words_to_text};
 
 #[test]
 fn ctc_frames_to_words_empty() {
@@ -68,6 +68,34 @@ fn ctc_frames_to_words_frame_shift_scales_linearly() {
     assert_eq!(b.len(), 1);
     assert!((a[0].start - 2.0 * b[0].start).abs() < 1e-6);
     assert!((a[0].end - 2.0 * b[0].end).abs() < 1e-6);
+}
+
+#[test]
+fn crop_words_to_core_keeps_midpoints_inside_core() {
+    let words = vec![
+        Word { text: "left".to_string(), start: 0.0, end: 0.25 },
+        Word { text: "keep".to_string(), start: 0.5, end: 0.75 },
+        Word { text: "right".to_string(), start: 1.25, end: 1.5 },
+    ];
+    let cropped = crop_words_to_core(words, 0.0, 0.375, 1.0);
+    assert_eq!(cropped, vec![Word { text: "keep".to_string(), start: 0.125, end: 0.375 }]);
+}
+
+#[test]
+fn crop_words_to_core_clamps_boundary_word_times() {
+    let words = vec![Word { text: "edge".to_string(), start: 0.25, end: 0.75 }];
+    let cropped = crop_words_to_core(words, 0.0, 0.375, 0.625);
+    assert_eq!(cropped, vec![Word { text: "edge".to_string(), start: 0.0, end: 0.25 }]);
+}
+
+#[test]
+fn words_to_text_joins_non_empty_words() {
+    let words = vec![
+        Word { text: "hello".to_string(), start: 0.0, end: 0.1 },
+        Word { text: "".to_string(), start: 0.1, end: 0.2 },
+        Word { text: "world".to_string(), start: 0.2, end: 0.3 },
+    ];
+    assert_eq!(words_to_text(&words), "hello world");
 }
 
 // ─── TranscribeOpts builder ──────────────────────────────────────────────
