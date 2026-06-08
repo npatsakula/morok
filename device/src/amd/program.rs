@@ -256,9 +256,10 @@ pub struct AmdProgram {
     rsrc2: u32,
     rsrc3: u32,
     /// `(kd.kernel_code_properties & 0x400) != 0` — true for wave32 kernels
-    /// (RDNA3/4 default). Controls the `cs_w32_en` bit in DISPATCH_INITIATOR.
+    /// (RDNA2/3/4 default). Controls the `cs_w32_en` bit in DISPATCH_INITIATOR.
     wave32: bool,
-    /// gfx major version (9, 11, or 12). gfx9 (CDNA) ignores `cs_w32_en`.
+    /// gfx major version (9, 10, 11, or 12). gfx9 (CDNA) ignores `cs_w32_en`;
+    /// gfx10 (RDNA2) additionally lacks the COMPUTE_DISPATCH_SCRATCH_BASE regs.
     target_major: u32,
     /// `kernel_code_properties & ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER` — kernel
     /// reads a 4-dword scratch descriptor from user SGPRs 0-3. We prepend
@@ -311,8 +312,9 @@ impl AmdProgram {
 
         // Derive PM4-path fields from the kernel descriptor:
         //   lds_size = round_up(group_segment_fixed_size, 512) / 512 (clamped 9 bits)
-        //   target_major: 9 = CDNA, 11/12 = RDNA3/4
-        //   rsrc1 |= 1<<20 on gfx11 (cwsr-priv shim)
+        //   target_major: 9 = CDNA, 10 = RDNA2, 11/12 = RDNA3/4
+        //   rsrc1 |= 1<<20 on gfx11 ONLY (cwsr-priv shim; tinygrad ops_amd gates
+        //     it `(11,0,0) <= target < (12,0,0)` — not gfx9/gfx10/gfx12)
         //   rsrc2 |= lds_size << 15
         //   wave32 = kd.kernel_code_properties bit 10
         //   pm4_prog_addr = aql_prog_addr + kernel_code_entry_byte_offset

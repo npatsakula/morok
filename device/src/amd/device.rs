@@ -245,7 +245,8 @@ impl AmdDevice {
         let arch = AmdArch::from_gfx_target_version(node.gfx_target_version).ok_or_else(|| Error::AmdAllocFailed {
             reason: format!(
                 "unsupported gfx target {} (decoded major.minor.step = {}.{}.{}); supported families: \
-                 CDNA gfx942/950, RDNA3 gfx1100/1101/1102/1151, RDNA4 gfx1200/1201",
+                 CDNA gfx942/950, RDNA2 gfx1030/1031/1032/1034, RDNA3 gfx1100/1101/1102/1151, \
+                 RDNA4 gfx1200/1201",
                 node.gfx_target_version,
                 node.gfx_target_version / 10_000,
                 (node.gfx_target_version / 100) % 100,
@@ -632,8 +633,10 @@ pub(crate) fn alloc_scratch(
 ) -> Result<(u64, usize, u32, u32, u64, AqlScratchDesc)> {
     const LANES_PER_WAVE: u32 = 64;
     const PAGE: usize = 0x1000;
-    // gfx9 (CDNA) scratch is 1024-byte aligned; gfx11/12 (RDNA) use 256.
-    let mem_alignment_size: u32 = if arch.is_cdna() { 1024 } else { 256 };
+    // Pre-gfx11 (CDNA gfx9 + RDNA2 gfx10) scratch is 1024-byte aligned; gfx11/12
+    // (RDNA3/4) use 256 (tinygrad ops_amd `_ensure_has_local_memory`:
+    // `256 if target >= (11,0,0) else 1024`).
+    let mem_alignment_size: u32 = if arch.is_cdna() || arch.is_rdna2() { 1024 } else { 256 };
 
     let xccs = node.num_xcc.max(1);
     let simd_per_cu = node.simd_per_cu.max(1);
@@ -669,10 +672,12 @@ pub(crate) fn alloc_scratch(
     let total = r.size;
     let handle = r.handle;
 
-    // gfx9 divides scratch evenly across SEs (1); gfx11/12 divide by se_cnt.
+    // Pre-gfx11 (CDNA gfx9 + RDNA2 gfx10) divides scratch evenly across SEs (1);
+    // gfx11/12 wavesize is per-SE, so divide by se_cnt (tinygrad ops_amd:
+    // `wave_scratch_len * se_cnt if target >= (11,0,0) else wave_scratch_len`).
     let wave_scratch = (LANES_PER_WAVE * size_per_thread).div_ceil(mem_alignment_size);
     let max_scratch_waves = cu_slots * max_slots * xccs;
-    let se_div = if arch.is_cdna() { 1 } else { se_cnt };
+    let se_div = if arch.is_cdna() || arch.is_rdna2() { 1 } else { se_cnt };
     let num_waves = ((size_per_xcc as u32) / (wave_scratch * mem_alignment_size)) / se_div;
     // COMPUTE_TMPRING_SIZE.WAVES must be a multiple of the per-XCC shader-engine
     // count (amd_aql_queue.cpp asserts `WAVES % (banks/xcc) == 0`); round down to
@@ -692,9 +697,11 @@ pub(crate) fn alloc_scratch(
 }
 
 /// Pack `COMPUTE_TMPRING_SIZE`: WAVES in bits 0..12, WAVESIZE at bit 12 with an
-/// arch-specific field width — gfx9 13b, gfx11 15b, gfx12 18b.
+/// arch-specific field width — gfx9/gfx10 13b, gfx11 15b, gfx12 18b (per the
+/// `COMPUTE_TMPRING_SIZE__WAVESIZE_MASK` asic_reg headers: gc_9_x/gc_10_3 =
+/// 0x01FFF000, gc_11_0 = 0x07FFF000, gc_12_0 = 0x3FFFF000).
 pub(crate) fn pack_tmpring(waves: u32, wave_scratch: u32, arch: &AmdArch) -> u32 {
-    let wavesize_mask: u32 = if arch.is_cdna() {
+    let wavesize_mask: u32 = if arch.is_cdna() || arch.is_rdna2() {
         0x1FFF
     } else if arch.is_rdna4() {
         0x3FFFF

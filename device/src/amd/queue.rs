@@ -808,7 +808,8 @@ fn dwords_as_bytes(p: &[u32; 16]) -> &[u8] {
 /// appending into `q` (minus SQTT/PMC/dispatch_ptr).
 /// The shader entry point is pre-shifted right by 8 (COMPUTE_PGM_LO/HI hold the
 /// upper bits of a 256-byte-aligned address). `wave32` comes from
-/// `kd.kernel_code_properties & 0x400`; `cs_w32_en` is gfx11/12-only.
+/// `kd.kernel_code_properties & 0x400`; `cs_w32_en` applies to gfx10+ (every
+/// non-CDNA arch — RDNA2/3/4), gfx9 (CDNA, wave64) ignores it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_exec_pm4(
     q: &mut Vec<u32>,
@@ -844,10 +845,19 @@ pub(crate) fn build_exec_pm4(
     q.extend(pm4::set_sh_reg(rsrc3_reg, &[rsrc3]));
 
     // 4. Scratch / tmpring (valid base required for wave init on RDNA3+ even
-    //    when SCRATCH_EN=0).
+    //    when SCRATCH_EN=0). COMPUTE_DISPATCH_SCRATCH_BASE registers exist on
+    //    gfx11+ and CDNA (gfx942/950) but were removed on gfx10/RDNA2 (tinygrad
+    //    `has_scratch_base_registers = target >= (11,0,0) or {(9,4,2),(9,5,0)}`);
+    //    on gfx10 the scratch base rides the private-segment-buffer V# in user
+    //    SGPRs, so skip the register write there.
     q.extend(pm4::set_sh_reg(pm4::COMPUTE_TMPRING_SIZE, &[tmpring_size]));
-    let scratch_shr = scratch_addr >> 8;
-    q.extend(pm4::set_sh_reg(pm4::COMPUTE_DISPATCH_SCRATCH_BASE_LO, &[scratch_shr as u32, (scratch_shr >> 32) as u32]));
+    if target_major != 10 {
+        let scratch_shr = scratch_addr >> 8;
+        q.extend(pm4::set_sh_reg(
+            pm4::COMPUTE_DISPATCH_SCRATCH_BASE_LO,
+            &[scratch_shr as u32, (scratch_shr >> 32) as u32],
+        ));
+    }
 
     // 5. Restart points always zero (no preempt-resume).
     q.extend(pm4::set_sh_reg(pm4::COMPUTE_RESTART_X, &[0, 0, 0]));
@@ -1235,9 +1245,11 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
     let is_cdna4 = dev.arch == svod_dtype::AmdArch::Gfx950;
     let lds_per_cu: usize = if is_cdna4 { (dev.node.lds_size_in_kb as usize) << 10 } else { 0x10000 };
 
-    // VGPR-per-CU branches on a small whitelist of gfx-target
-    // tuples: CDNA (gfx9.x) uses 0x80000, the listed
-    // RDNA3/RDNA4 tuples use 0x60000, Gfx1102 alone uses 0x40000.
+    // VGPR-per-CU, mirroring ROCr's `hsakmt_get_vgpr_size_per_cu` (libhsakmt
+    // queues.c): CDNA (gfx9.x) uses 0x80000, the listed RDNA3/RDNA4 tuples use
+    // 0x60000, and everything below gfx1100 — all RDNA2 (gfx10.3) — plus Gfx1102
+    // use the 0x40000 default. The kernel rejects CREATE_QUEUE with EINVAL if the
+    // CWSR buffer derived from this is short, so it must match the runtime.
     let vgpr_per_cu: usize = match dev.arch {
         svod_dtype::AmdArch::Gfx942 | svod_dtype::AmdArch::Gfx950 => 0x80000,
         svod_dtype::AmdArch::Gfx1100
@@ -1245,7 +1257,11 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
         | svod_dtype::AmdArch::Gfx1151
         | svod_dtype::AmdArch::Gfx1200
         | svod_dtype::AmdArch::Gfx1201 => 0x60000,
-        svod_dtype::AmdArch::Gfx1102 => 0x40000,
+        svod_dtype::AmdArch::Gfx1030
+        | svod_dtype::AmdArch::Gfx1031
+        | svod_dtype::AmdArch::Gfx1032
+        | svod_dtype::AmdArch::Gfx1034
+        | svod_dtype::AmdArch::Gfx1102 => 0x40000,
     };
 
     let xccs = dev.node.num_xcc.max(1) as usize;
@@ -1267,7 +1283,14 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
     let wg_data_size = wg_data_size.next_multiple_of(PAGE);
 
     let waves_factor = if dev.arch.is_cdna() { 8 } else { 12 };
-    let ctl_stack_size = (waves_factor * wave_cnt + 8 + 40).next_multiple_of(PAGE);
+    let mut ctl_stack_size = (waves_factor * wave_cnt + 8 + 40).next_multiple_of(PAGE);
+    // gfx10 (RDNA2) HW design caps the control stack at 0x7000 (sufficient for
+    // AQL, limited by SPI events). ROCr clamps it for `(gfxv & 0x3f0000) ==
+    // 0xA0000` (queues.c), tinygrad for `target[0] == 10`; an unclamped larger
+    // value risks CREATE_QUEUE rejection on gfx10.
+    if dev.arch.is_rdna2() {
+        ctl_stack_size = ctl_stack_size.min(0x7000);
+    }
     // `debug_memory_size = round_up(wave_cnt * 32, 64)`.
     let debug_memory_size = (wave_cnt * 32).next_multiple_of(64);
 

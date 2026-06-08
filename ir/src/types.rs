@@ -840,6 +840,7 @@ pub enum RendererDevice {
     CudaSm80,
     CudaSm89,
     Metal,
+    AmdRdna2,
     AmdRdna3,
     AmdRdna4,
     AmdCdna3,
@@ -858,6 +859,7 @@ impl RendererDevice {
             Self::CudaSm80 => "CUDA_SM80",
             Self::CudaSm89 => "CUDA_SM89",
             Self::Metal => "Metal",
+            Self::AmdRdna2 => "AMD_RDNA2",
             Self::AmdRdna3 => "AMD_RDNA3",
             Self::AmdRdna4 => "AMD_RDNA4",
             Self::AmdCdna3 => "AMD_CDNA3",
@@ -881,6 +883,7 @@ impl RendererDevice {
             Self::CudaSm75
                 | Self::CudaSm80
                 | Self::CudaSm89
+                | Self::AmdRdna2
                 | Self::AmdRdna3
                 | Self::AmdRdna4
                 | Self::AmdCdna3

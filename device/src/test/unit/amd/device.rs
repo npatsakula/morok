@@ -72,8 +72,10 @@ fn assign_owner_spreads_then_cotenants() {
 
 #[test]
 fn pack_tmpring_wavesize_width_by_arch() {
-    // wave_scratch=0x3FFFF: cdna(13b) truncates, rdna3(15b) truncates, rdna4(18b) keeps it.
+    // wave_scratch=0x3FFFF: cdna/rdna2(13b) truncate, rdna3(15b) truncates, rdna4(18b) keeps it.
     assert_eq!(pack_tmpring(1, 0x3FFFF, &AmdArch::Gfx942) >> 12, 0x1FFF);
+    // RDNA2 (gfx10.3) shares the 13-bit WAVESIZE field with CDNA (gc_10_3_0 asic_reg).
+    assert_eq!(pack_tmpring(1, 0x3FFFF, &AmdArch::Gfx1030) >> 12, 0x1FFF);
     assert_eq!(pack_tmpring(1, 0x3FFFF, &AmdArch::Gfx1100) >> 12, 0x7FFF);
     assert_eq!(pack_tmpring(1, 0x3FFFF, &AmdArch::Gfx1200) >> 12, 0x3FFFF);
     assert_eq!(pack_tmpring(0xABC, 0, &AmdArch::Gfx1100) & 0xFFF, 0xABC);
