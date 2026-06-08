@@ -269,7 +269,7 @@ impl AmdIface for KfdIface {
     ) -> Result<AllocResult> {
         // KFD VA reservation + map are page-granular; a 0-byte mmap is EINVAL.
         let size = size.max(1).next_multiple_of(0x1000);
-        let flags = compose_flags(kind, cpu_accessible);
+        let flags = compose_flags(kind, cpu_accessible, self.node.is_apu());
         let va = reserve_va(size)?;
         let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
             va_addr: va as u64,
@@ -550,12 +550,19 @@ impl KfdIface {
 /// Compose the KFD `KFD_IOC_ALLOC_MEM_FLAGS_*` set for an allocation. This is
 /// the ONLY place the flags are built; it reproduces the four pre-refactor flag
 /// sets bit-for-bit (see the module doc / call sites).
-fn compose_flags(kind: AllocKind, cpu_access: bool) -> u32 {
+///
+/// `is_apu` selects the device-memory backing: discrete GPUs use dedicated VRAM,
+/// but APUs (integrated, unified memory) have none, so `DeviceVram` is allocated
+/// from GTT (system memory the GPU reaches via the GART). The modifier bits are
+/// otherwise identical, so the coherence contract the copy paths rely on (the
+/// GPU's L2-acquire dispatch prologue) is unchanged — GTT just replaces VRAM as
+/// the heap. The control-structure (`UncachedGtt`) set is already GTT and
+/// arch-independent.
+pub(crate) fn compose_flags(kind: AllocKind, cpu_access: bool, is_apu: bool) -> u32 {
     match kind {
         AllocKind::DeviceVram { executable } => {
-            let mut flags = kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
+            let heap = if is_apu { kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT } else { kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM };
+            let mut flags = heap | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
             if executable {
                 flags |= kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE;
             }

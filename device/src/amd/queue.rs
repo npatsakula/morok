@@ -1260,7 +1260,10 @@ fn compute_ctx_sizes(dev: &AmdDeviceCore) -> (usize, usize, usize) {
         svod_dtype::AmdArch::Gfx1030
         | svod_dtype::AmdArch::Gfx1031
         | svod_dtype::AmdArch::Gfx1032
+        | svod_dtype::AmdArch::Gfx1033
         | svod_dtype::AmdArch::Gfx1034
+        | svod_dtype::AmdArch::Gfx1035
+        | svod_dtype::AmdArch::Gfx1036
         | svod_dtype::AmdArch::Gfx1102 => 0x40000,
     };
 
