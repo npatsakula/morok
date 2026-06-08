@@ -1,0 +1,151 @@
+<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/amd/debugging" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.1"><title data-rh=true>调试与故障分诊 | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://docs.morok.tech/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://docs.morok.tech/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://docs.morok.tech/zh-Hans/docs/backends/amd/debugging /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="调试与故障分诊 | Svod"/><meta data-rh=true name=description content="当一个 GPU 内核触碰了它不该碰的内存时，KFD 报告一个故障，只带着一个原始的"/><meta data-rh=true property=og:description content="当一个 GPU 内核触碰了它不该碰的内存时，KFD 报告一个故障，只带着一个原始的"/><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://docs.morok.tech/zh-Hans/docs/backends/amd/debugging /><link data-rh=true rel=alternate href=https://docs.morok.tech/docs/backends/amd/debugging hreflang=en /><link data-rh=true rel=alternate href=https://docs.morok.tech/zh-Hans/docs/backends/amd/debugging hreflang=zh-CN /><link data-rh=true rel=alternate href=https://docs.morok.tech/ru/docs/backends/amd/debugging hreflang=ru /><link data-rh=true rel=alternate href=https://docs.morok.tech/hi/docs/backends/amd/debugging hreflang=hi /><link data-rh=true rel=alternate href=https://docs.morok.tech/docs/backends/amd/debugging hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://docs.morok.tech/zh-Hans/docs/backends/amd/debugging","name":"调试","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.0af4a604.css /><script src=/zh-Hans/assets/js/runtime~main.557ee9e0.js defer></script><script src=/zh-Hans/assets/js/main.3135c107.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-ba0")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/backends/amd/debugging target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/amd/debugging target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/amd/debugging target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/backends/amd/debugging target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span title=简介 class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span title=快速上手 class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/architecture/pipeline><span title=架构 class=categoryLinkLabel_W154>架构</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/backends/jit-loader><span title=Backends class=categoryLinkLabel_W154>Backends</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/jit-loader><span title="JIT 编译器" class=linkLabel_WmDU>JIT 编译器</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span title="AMD Backend" class=categoryLinkLabel_W154>AMD Backend</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span title=概览 class=linkLabel_WmDU>概览</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/kfd-bindings><span title="KFD 绑定" class=linkLabel_WmDU>KFD 绑定</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/queues-and-dispatch><span title=队列与调度 class=linkLabel_WmDU>队列与调度</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/compile-and-graph><span title=编译与图 class=linkLabel_WmDU>编译与图</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/am-driver><span title="AM 驱动" class=linkLabel_WmDU>AM 驱动</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/backends/amd/debugging><span title=调试 class=linkLabel_WmDU>调试</span></a></ul></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Backends</span><li class=breadcrumbs__item><span class=breadcrumbs__link>AMD Backend</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>调试</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>调试与故障分诊</h1></header>
+<p>当一个 GPU 内核触碰了它不该碰的内存时，KFD 报告一个故障，只带着一个原始的
+虚拟地址，几乎别无其他。本页介绍后端把这个地址变成诊断所拥有的
+工具：对故障地址进行分类的 VA→分配注册表、干净地停下设备的
+poison 闩锁，以及调度/追踪插桩。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=问题一个光秃秃的故障-va>问题：一个光秃秃的故障 VA<a href=#问题一个光秃秃的故障-va class=hash-link aria-label="问题：一个光秃秃的故障 VA的直接链接" title="问题：一个光秃秃的故障 VA的直接链接" translate=no>​</a></h2>
+<p>一个 <code>WAIT_EVENTS</code> 内存故障事件交回一个 <code>kfd_hsa_memory_exception_data</code>，
+带有故障的 <code>va</code>、失败标志（<code>NotPresent</code>、<code>ReadOnly</code>、<code>NoExecute</code>、
+<code>imprecise</code>），以及一个 <code>ErrorType</code>。那告诉你 GPU 在<em>哪里</em>故障，却没告诉你
+<em>那里有什么</em>——而后者才是真正定位 bug 的问题。最终把它
+浮现出来的那次 panic 是在下一次 <code>synchronize()</code> 时的延迟重抛，
+远离故障现场。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=va-注册表>VA 注册表<a href=#va-注册表 class=hash-link aria-label="VA 注册表的直接链接" title="VA 注册表的直接链接" translate=no>​</a></h2>
+<p><code>device/src/amd/va_registry.rs</code> 是一张诊断旁表，它把每个活跃的
+GPU VA 范围映射回其所属的分配。它是纯记账——没有 GPU
+依赖——因此分类逻辑可在任何宿主上进行单元与属性测试。一个 <code>VaRegistry</code>
+存在于 <code>KfdIface</code> 上（一次故障会损坏整个 VM，所以每设备是
+正确的粒度）。</p>
+<p>它在一个分配生命的两端被维护：</p>
+<ul>
+<li class=""><strong><code>alloc_raw</code></strong> 在 <code>MAP_MEMORY_TO_GPU</code> 成功之后调用
+<code>va.insert(base, size, handle, tag)</code>。</li>
+<li class=""><strong><code>free_raw</code></strong> 在 unmap <em>之前</em>调用 <code>va.remove(base)</code>——这样一个落在
+刚被释放的 VA 上的故障会被分类为 use-after-free，而不是一个活跃的
+分配。</li>
+</ul>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=标签>标签<a href=#标签 class=hash-link aria-label=标签的直接链接 title=标签的直接链接 translate=no>​</a></h3>
+<p>每个分配都被打上其用途的标签（<code>AllocTag</code>），在
+<code>alloc_raw</code> 的各个调用点推导：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>标签<th>涵盖<tbody><tr><td><code>Vram</code><td>通用设备 VRAM——张量数据、代码、kernarg、EOP/ctx-save<tr><td><code>Gtt</code><td>GTT 固定的宿主可见控制内存——队列环、GART、信号槽<tr><td><code>Scratch</code><td>寄存器溢出的 scratch——仅 GPU 的 VRAM，每内核重分配</table>
+<p>真正要紧的区别是 <strong>scratch 与其他一切</strong>：scratch 是
+唯一一个共享、仅 GPU、被动态重分配并释放的区域，也是历史上的
+<code>NotPresent</code> 元凶。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=分类>分类<a href=#分类 class=hash-link aria-label=分类的直接链接 title=分类的直接链接 translate=no>​</a></h3>
+<p>注册表保有一个活跃范围的 <code>BTreeMap</code>（以基 VA 为键，便于范围
+查询），外加一个有界的、最近释放的 <strong>256</strong> 个区域的环
+（<code>FREED_HISTORY</code>）。<code>classify(va)</code> 以这一优先级解析一个故障地址：</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">1. Live    — va is inside a currently-mapped allocation</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">             (live takes precedence, so a re-allocated VA reads Live, not stale)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">2. Freed   — va is inside a recently-freed region → use-after-free</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">3. Unmapped — va is in no tracked region; report nearest live neighbours + gaps</span><br/></div></code></pre></div></div>
+<p>落进故障消息的是 <code>Display</code> 的渲染：</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">Live:     va is at offset +0x40 within a LIVE scratch allocation</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">          [0x7f…000, 0x7f…400) (handle=0x42)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Freed:    va is within a RECENTLY-FREED scratch region [0x…, 0x…) (handle=0x…)</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">          — use-after-free: a stale/recycled VA still referenced by an</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">          in-flight kernel</span><br/></div><div class=token-line style=color:#393A34><span class="token plain" style=display:inline-block></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Unmapped: va is in NO tracked allocation; nearest live below: VRAM buffer</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">          [0x…, 0x…) (va is +0x80 past its end); nearest live above: …</span><br/></div></code></pre></div></div>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=一次故障是如何被报告的>一次故障是如何被报告的<a href=#一次故障是如何被报告的 class=hash-link aria-label=一次故障是如何被报告的的直接链接 title=一次故障是如何被报告的的直接链接 translate=no>​</a></h2>
+<p>在 <code>KfdIface::wait_events</code>（<code>device/src/amd/iface.rs</code>）中，当内存故障
+事件已触发（<code>gpu_id != 0</code>），字段会从那个
+<code>#[repr(packed)]</code> 结构体中被复制出来，VA 被分类，并构建出一条
+丰富化的消息：</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">AMD GPU memory fault on gpu_id=… va=0x… (NotPresent=1 ReadOnly=0 NoExecute=0</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">Imprecise=0 ErrorType=…) — va is at offset +0x40 within a LIVE scratch …</span><br/></div></code></pre></div></div>
+<p>它通过一个 <code>fault_logged: AtomicBool</code> 闩锁和一个
+<code>tracing::error!</code> <strong>只记录一次</strong>。这一点很要紧：内存故障事件不会
+自动重置，因此后续的 poll-fault 调用（<code>wait_events(0)</code>）会重新观测到同一个
+故障——每次都记录会刷屏。该消息随后作为一个
+<code>Error::Runtime</code> 返回，并浮现给调用方。（一个硬件异常事件，
+槽 <code>[2]</code>，改为报告 <code>reset_type</code>/<code>reset_cause</code>/<code>memory_lost</code>——这些
+没有可分类的故障 VA。）</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=poison-闩锁>poison 闩锁<a href=#poison-闩锁 class=hash-link aria-label="poison 闩锁的直接链接" title="poison 闩锁的直接链接" translate=no>​</a></h2>
+<p>一次内存故障会损坏整个每 VM 的页表，因此设备在
+一次故障后就死了。<code>AmdDeviceCore</code>（<code>device/src/amd/device.rs</code>）持有一个 poison 闩锁——
+<code>poisoned: AtomicBool</code> + <code>error_msg: OnceLock&lt;String></code>——在每个
+调度与 synchronize 入口点处检查：</p>
+<ul>
+<li class=""><code>poison(msg)</code> 把消息记录一次并置位标志；</li>
+<li class=""><code>is_poisoned()</code> 是热路径上的门；</li>
+<li class=""><code>poison_error()</code> 在被毒化时返回已记录的 <code>Error::Runtime</code>；</li>
+<li class=""><code>poll_faults_nonblocking()</code> 发出 <code>wait_events(0)</code>，从一次
+停滞的信号等待中被调用（以把真实错误附到一个 30 秒超时上），也从
+<code>WAIT_EVENTS</code> 升级路径中被调用（以在故障时提前跳出轮询）。</li>
+</ul>
+<p>一旦被毒化，对该设备上任何 connector 的每一次 <code>synchronize</code>/<code>execute</code>
+都会快速失败——GPU 状态和缓存的映射不再可信。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=调度插桩svod_debug_dispatch>调度插桩：<code>SVOD_DEBUG_DISPATCH</code><a href=#调度插桩svod_debug_dispatch class=hash-link aria-label=调度插桩svod_debug_dispatch的直接链接 title=调度插桩svod_debug_dispatch的直接链接 translate=no>​</a></h2>
+<p>设置 <code>SVOD_DEBUG_DISPATCH</code>（设成任何值）会在三个点
+打开 <code>eprintln</code> 转储：</p>
+<ul>
+<li class=""><strong><code>[program-load]</code></strong>（<code>program.rs</code>）——每程序：kernarg/private/group
+尺寸、<code>kernel_code_properties</code>（逐位解码）、user-SGPR 计数、
+<code>wave32</code>，以及原始的 <code>rsrc1/2/3</code>。它会标出加载器<em>没有</em>填充的
+<code>kernel_code_properties</code> 位（那会让内核读到垃圾指针并故障）。</li>
+<li class=""><strong><code>[dispatch tv=…]</code></strong>（<code>program.rs</code>）——每调度：内核名、<code>grid</code>、
+<code>local</code>、<code>is_pm4</code>、kernarg 的 GPU VA、scratch VA，以及每个缓冲区的 VA。</li>
+<li class=""><strong><code>[graph capture]</code></strong>（<code>graph.rs</code>）——每捕获的图：内核数、
+kernargs 页 VA、kick/self 信号 VA，以及 scratch VA。</li>
+</ul>
+<p>这是看清一次故障调度究竟触碰了哪些 VA 的最快方式，以便
+与注册表的分类相互参照。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=追踪设置rust_log>追踪设置（<code>RUST_LOG</code>）<a href=#追踪设置rust_log class=hash-link aria-label=追踪设置rust_log的直接链接 title=追踪设置rust_log的直接链接 translate=no>​</a></h2>
+<p>后端使用 <code>tracing</code> crate（<code>debug!</code>、<code>tracing::error!</code>），但
+<strong>不安装任何 subscriber</strong>——那是宿主二进制的职责。<code>alloc_raw</code>/<code>free_raw</code> 的
+<code>debug!</code> 行以及那条一次性的故障 <code>error!</code>，只有在安装了 subscriber
+且级别允许时才会出现。</p>
+<p>那些会安装 subscriber 的示例二进制在 <code>main</code> 中调用
+<code>tracing_subscriber::fmt::init()</code>（它遵循 <code>RUST_LOG</code>）：</p>
+<div class="language-bash codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-bash codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain"># Surface the alloc/free debug lines and the fault error from gigaam_infer:</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">RUST_LOG=svod_device=debug \</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">SVOD_DEVICE=AMD:0 \</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">  cargo run --release -p svod-model --example gigaam_infer -- ./audio.wav</span><br/></div></code></pre></div></div>
+<p>:::tip 流水线调试器
+对于<em>编译器</em>侧的问题（IR 提取、LLVM IR、UOp 树）而非
+驱动，项目附带一个 <code>/svod-debug</code> skill，记录了前端 →
+codegen 的追踪目标（<code>SVOD_DUMP_LLVM_IR</code>、<code>SVOD_DUMP_AMD_IR</code>、每阶段的
+<code>RUST_LOG</code> 目标、<code>setup_test_tracing()</code>）。那与本页面向驱动侧的
+故障分诊是一套独立的工具箱。
+:::</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=一次实战分诊>一次实战分诊<a href=#一次实战分诊 class=hash-link aria-label=一次实战分诊的直接链接 title=一次实战分诊的直接链接 translate=no>​</a></h2>
+<p>当一次 <code>NotPresent</code> 故障复现时，工作流是：</p>
+<ol>
+<li class="">故障消息已经点名了类别——先读它。"LIVE scratch"
+指向 scratch 重分配路径；"RECENTLY-FREED"是一个
+在内核仍引用时就被释放的缓冲区的 use-after-free；"NO tracked allocation"
+且附近有活跃邻居则是一次越界（那个 gap 告诉你越了多少）。</li>
+<li class="">设上 <code>SVOD_DEBUG_DISPATCH</code> 重跑，以看清那次故障调度的确切 VA，
+并设 <code>RUST_LOG=svod_device=debug</code> 以看到直到那一刻的 alloc/free 历史。</li>
+<li class="">把故障 VA 与转储出来的 scratch/kernarg/缓冲区 VA 相互参照。</li>
+</ol>
+<p><code>NotPresent</code> 的头号嫌犯是 <strong>scratch</strong>（按 <code>Scratch</code> 标签）——
+唯一一个共享、仅 GPU、被动态重分配并释放的区域，在那里一次
+重分配与调度的竞态会让一个内核指向一个已释放的缓冲区。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=为什么这很重要>为什么这很重要<a href=#为什么这很重要 class=hash-link aria-label=为什么这很重要的直接链接 title=为什么这很重要的直接链接 translate=no>​</a></h2>
+<p>在有注册表之前，一次故障只给你一个十六进制地址，别无其他。如今
+故障<em>消息本身</em>就说明该 VA 是活跃 scratch、一个已释放/陈旧的 VA，还是
+野指针——把一次盲目的追猎变成一次有方向的。配上 poison 闩锁
+（它干净地停下设备，而不是让损坏的状态扩散）
+和调度转储，后端无需给 GPU 挂调试器就能定位一次内存
+故障。</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/amd/debugging.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/backends/amd/am-driver><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>AM 驱动</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#问题一个光秃秃的故障-va class="table-of-contents__link toc-highlight">问题：一个光秃秃的故障 VA</a><li><a href=#va-注册表 class="table-of-contents__link toc-highlight">VA 注册表</a><ul><li><a href=#标签 class="table-of-contents__link toc-highlight">标签</a><li><a href=#分类 class="table-of-contents__link toc-highlight">分类</a></ul><li><a href=#一次故障是如何被报告的 class="table-of-contents__link toc-highlight">一次故障是如何被报告的</a><li><a href=#poison-闩锁 class="table-of-contents__link toc-highlight">poison 闩锁</a><li><a href=#调度插桩svod_debug_dispatch class="table-of-contents__link toc-highlight">调度插桩：<code>SVOD_DEBUG_DISPATCH</code></a><li><a href=#追踪设置rust_log class="table-of-contents__link toc-highlight">追踪设置（<code>RUST_LOG</code>）</a><li><a href=#一次实战分诊 class="table-of-contents__link toc-highlight">一次实战分诊</a><li><a href=#为什么这很重要 class="table-of-contents__link toc-highlight">为什么这很重要</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>

@@ -1,0 +1,240 @@
+<!doctype html><html lang=zh-CN dir=ltr class="docs-wrapper plugin-docs plugin-id-default docs-version-current docs-doc-page docs-doc-id-backends/amd/queues-and-dispatch" data-has-hydrated=false><head><meta charset=UTF-8><meta name=generator content="Docusaurus v3.10.1"><title data-rh=true>队列与调度 | Svod</title><meta data-rh=true name=viewport content="width=device-width, initial-scale=1.0"/><meta data-rh=true name=twitter:card content=summary_large_image /><meta data-rh=true property=og:image content=https://docs.morok.tech/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true name=twitter:image content=https://docs.morok.tech/zh-Hans/img/docusaurus-social-card.jpg /><meta data-rh=true property=og:url content=https://docs.morok.tech/zh-Hans/docs/backends/amd/queues-and-dispatch /><meta data-rh=true property=og:locale content=zh_CN /><meta data-rh=true property=og:locale:alternate content=en /><meta data-rh=true property=og:locale:alternate content=ru /><meta data-rh=true property=og:locale:alternate content=hi /><meta data-rh=true name=docusaurus_locale content=zh-Hans /><meta data-rh=true name=docsearch:language content=zh-Hans /><meta data-rh=true name=docusaurus_version content=current /><meta data-rh=true name=docusaurus_tag content=docs-default-current /><meta data-rh=true name=docsearch:version content=current /><meta data-rh=true name=docsearch:docusaurus_tag content=docs-default-current /><meta data-rh=true property=og:title content="队列与调度 | Svod"/><meta data-rh=true name=description content=调度一个内核意味着将命令数据包写入一个环形缓冲区，并 /><meta data-rh=true property=og:description content=调度一个内核意味着将命令数据包写入一个环形缓冲区，并 /><link data-rh=true rel=icon href=/zh-Hans/img/favicon.ico /><link data-rh=true rel=canonical href=https://docs.morok.tech/zh-Hans/docs/backends/amd/queues-and-dispatch /><link data-rh=true rel=alternate href=https://docs.morok.tech/docs/backends/amd/queues-and-dispatch hreflang=en /><link data-rh=true rel=alternate href=https://docs.morok.tech/zh-Hans/docs/backends/amd/queues-and-dispatch hreflang=zh-CN /><link data-rh=true rel=alternate href=https://docs.morok.tech/ru/docs/backends/amd/queues-and-dispatch hreflang=ru /><link data-rh=true rel=alternate href=https://docs.morok.tech/hi/docs/backends/amd/queues-and-dispatch hreflang=hi /><link data-rh=true rel=alternate href=https://docs.morok.tech/docs/backends/amd/queues-and-dispatch hreflang=x-default /><script data-rh=true type=application/ld+json>{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":"https://docs.morok.tech/zh-Hans/docs/backends/amd/queues-and-dispatch","name":"队列与调度","position":1}]}</script><link rel=stylesheet href=/zh-Hans/assets/css/styles.0af4a604.css /><script src=/zh-Hans/assets/js/runtime~main.557ee9e0.js defer></script><script src=/zh-Hans/assets/js/main.3135c107.js defer></script></head><body><svg style="display: none;"><defs>
+<symbol id=theme-svg-external-link viewBox="0 0 24 24"><path fill=currentColor d="M21 13v10h-21v-19h12v2h-10v15h17v-8h2zm3-12h-10.988l4.035 4-6.977 7.07 2.828 2.828 6.977-7.07 4.125 4.172v-11z"/></symbol>
+</defs></svg>
+<script>!function(){var t=function(){try{return new URLSearchParams(window.location.search).get("docusaurus-theme")}catch(t){}}()||function(){try{return window.localStorage.getItem("theme-ba0")}catch(t){}}();document.documentElement.setAttribute("data-theme",t||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light")),document.documentElement.setAttribute("data-theme-choice",t||"system")}(),function(){try{for(var[t,e]of new URLSearchParams(window.location.search).entries())if(t.startsWith("docusaurus-data-")){var a=t.replace("docusaurus-data-","data-");document.documentElement.setAttribute(a,e)}}catch(t){}}()</script><div id=__docusaurus><link rel=preload as=image href=/zh-Hans/img/logo.svg /><div role=region aria-label=跳到主要内容><a class=skipToContent_fXgn href=#__docusaurus_skipToContent_fallback>跳到主要内容</a></div><nav aria-label=主导航 class="theme-layout-navbar navbar navbar--fixed-top"><div class=navbar__inner><div class="theme-layout-navbar-left navbar__items"><button aria-label=切换导航栏 aria-expanded=false class="navbar__toggle clean-btn" type=button><svg width=30 height=30 viewBox="0 0 30 30" aria-hidden=true><path stroke=currentColor stroke-linecap=round stroke-miterlimit=10 stroke-width=2 d="M4 7h22M4 15h22M4 23h22"/></svg></button><a class=navbar__brand href=/zh-Hans/><div class=navbar__logo><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--light_NVdE"/><img src=/zh-Hans/img/logo.svg alt="Svod Logo" class="themedComponent_mlkZ themedComponent--dark_xIcU"/></div><b class="navbar__title text--truncate">Svod</b></a><a aria-current=page class="navbar__item navbar__link navbar__link--active" href=/zh-Hans/docs/introduction>文档</a></div><div class="theme-layout-navbar-right navbar__items navbar__items--right"><div class="navbar__item dropdown dropdown--hoverable dropdown--right"><a href=# aria-haspopup=true aria-expanded=false role=button class=navbar__link><svg viewBox="0 0 24 24" width=20 height=20 aria-hidden=true class=iconLanguage_nlXk><path fill=currentColor d="M12.87 15.07l-2.54-2.51.03-.03c1.74-1.94 2.98-4.17 3.71-6.53H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>简体中文</a><ul class=dropdown__menu><li><a href=/docs/backends/amd/queues-and-dispatch target=_self rel="noopener noreferrer" class=dropdown__link lang=en>English</a><li><a href=/zh-Hans/docs/backends/amd/queues-and-dispatch target=_self rel="noopener noreferrer" class="dropdown__link dropdown__link--active" lang=zh-CN>简体中文</a><li><a href=/ru/docs/backends/amd/queues-and-dispatch target=_self rel="noopener noreferrer" class=dropdown__link lang=ru>Русский</a><li><a href=/hi/docs/backends/amd/queues-and-dispatch target=_self rel="noopener noreferrer" class=dropdown__link lang=hi>हिन्दी</a></ul></div><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class="navbar__item navbar__link">GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a><div class="toggle_vylO colorModeToggle_DEke"><button class="clean-btn toggleButton_gllP toggleButtonDisabled_aARS" type=button disabled title="system mode" aria-label="切换浅色/暗黑模式（当前为system mode）"><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP lightToggleIcon_pyhR"><path fill=currentColor d="M12,9c1.65,0,3,1.35,3,3s-1.35,3-3,3s-3-1.35-3-3S10.35,9,12,9 M12,7c-2.76,0-5,2.24-5,5s2.24,5,5,5s5-2.24,5-5 S14.76,7,12,7L12,7z M2,13l2,0c0.55,0,1-0.45,1-1s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S1.45,13,2,13z M20,13l2,0c0.55,0,1-0.45,1-1 s-0.45-1-1-1l-2,0c-0.55,0-1,0.45-1,1S19.45,13,20,13z M11,2v2c0,0.55,0.45,1,1,1s1-0.45,1-1V2c0-0.55-0.45-1-1-1S11,1.45,11,2z M11,20v2c0,0.55,0.45,1,1,1s1-0.45,1-1v-2c0-0.55-0.45-1-1-1C11.45,19,11,19.45,11,20z M5.99,4.58c-0.39-0.39-1.03-0.39-1.41,0 c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0s0.39-1.03,0-1.41L5.99,4.58z M18.36,16.95 c-0.39-0.39-1.03-0.39-1.41,0c-0.39,0.39-0.39,1.03,0,1.41l1.06,1.06c0.39,0.39,1.03,0.39,1.41,0c0.39-0.39,0.39-1.03,0-1.41 L18.36,16.95z M19.42,5.99c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06c-0.39,0.39-0.39,1.03,0,1.41 s1.03,0.39,1.41,0L19.42,5.99z M7.05,18.36c0.39-0.39,0.39-1.03,0-1.41c-0.39-0.39-1.03-0.39-1.41,0l-1.06,1.06 c-0.39,0.39-0.39,1.03,0,1.41s1.03,0.39,1.41,0L7.05,18.36z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP darkToggleIcon_wfgR"><path fill=currentColor d="M9.37,5.51C9.19,6.15,9.1,6.82,9.1,7.5c0,4.08,3.32,7.4,7.4,7.4c0.68,0,1.35-0.09,1.99-0.27C17.45,17.19,14.93,19,12,19 c-3.86,0-7-3.14-7-7C5,9.07,6.81,6.55,9.37,5.51z M12,3c-4.97,0-9,4.03-9,9s4.03,9,9,9s9-4.03,9-9c0-0.46-0.04-0.92-0.1-1.36 c-0.98,1.37-2.58,2.26-4.4,2.26c-2.98,0-5.4-2.42-5.4-5.4c0-1.81,0.89-3.42,2.26-4.4C12.92,3.04,12.46,3,12,3L12,3z"/></svg><svg viewBox="0 0 24 24" width=24 height=24 aria-hidden=true class="toggleIcon_g3eP systemToggleIcon_QzmC"><path fill=currentColor d="m12 21c4.971 0 9-4.029 9-9s-4.029-9-9-9-9 4.029-9 9 4.029 9 9 9zm4.95-13.95c1.313 1.313 2.05 3.093 2.05 4.95s-0.738 3.637-2.05 4.95c-1.313 1.313-3.093 2.05-4.95 2.05v-14c1.857 0 3.637 0.737 4.95 2.05z"/></svg></button></div><div class=navbarSearchContainer_Bca1></div></div></div><div role=presentation class=navbar-sidebar__backdrop></div></nav><div id=__docusaurus_skipToContent_fallback class="theme-layout-main main-wrapper mainWrapper_z2l0"><div class=docsWrapper_hBAB><button aria-label=回到顶部 class="clean-btn theme-back-to-top-button backToTopButton_sjWU" type=button></button><div class=docRoot_UBD9><aside class="theme-doc-sidebar-container docSidebarContainer_YfHR"><div class=sidebarViewport_aRkj><div class=sidebar_njMd><nav aria-label=文档侧边栏 class="menu thin-scrollbar menu_SIkG"><ul class="theme-doc-sidebar-menu menu__list"><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-1 menu__list-item"><a class=menu__link href=/zh-Hans/docs/introduction><span title=简介 class=linkLabel_WmDU>简介</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/examples><span title=快速上手 class=categoryLinkLabel_W154>快速上手</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item menu__list-item--collapsed"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret" role=button aria-expanded=false href=/zh-Hans/docs/architecture/pipeline><span title=架构 class=categoryLinkLabel_W154>架构</span></a></div><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-1 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true href=/zh-Hans/docs/backends/jit-loader><span title=Backends class=categoryLinkLabel_W154>Backends</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-2 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/jit-loader><span title="JIT 编译器" class=linkLabel_WmDU>JIT 编译器</span></a><li class="theme-doc-sidebar-item-category theme-doc-sidebar-item-category-level-2 menu__list-item"><div class=menu__list-item-collapsible><a class="categoryLink_byQd menu__link menu__link--sublist menu__link--sublist-caret menu__link--active" role=button aria-expanded=true tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span title="AMD Backend" class=categoryLinkLabel_W154>AMD Backend</span></a></div><ul class=menu__list><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/overview><span title=概览 class=linkLabel_WmDU>概览</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/kfd-bindings><span title="KFD 绑定" class=linkLabel_WmDU>KFD 绑定</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class="menu__link menu__link--active" aria-current=page tabindex=0 href=/zh-Hans/docs/backends/amd/queues-and-dispatch><span title=队列与调度 class=linkLabel_WmDU>队列与调度</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/compile-and-graph><span title=编译与图 class=linkLabel_WmDU>编译与图</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/am-driver><span title="AM 驱动" class=linkLabel_WmDU>AM 驱动</span></a><li class="theme-doc-sidebar-item-link theme-doc-sidebar-item-link-level-3 menu__list-item"><a class=menu__link tabindex=0 href=/zh-Hans/docs/backends/amd/debugging><span title=调试 class=linkLabel_WmDU>调试</span></a></ul></ul></ul></nav></div></div></aside><main class=docMainContainer_TBSr><div class="container padding-top--md padding-bottom--lg"><div class=row><div class="col docItemCol_VOVn"><div class=docItemContainer_Djhp><article><nav class="theme-doc-breadcrumbs breadcrumbsContainer_Z_bl" aria-label=页面路径><ul class=breadcrumbs><li class=breadcrumbs__item><a aria-label=主页面 class=breadcrumbs__link href=/zh-Hans/><svg viewBox="0 0 24 24" class=breadcrumbHomeIcon_YNFT><path d="M10 19v-5h4v5c0 .55.45 1 1 1h3c.55 0 1-.45 1-1v-7h1.7c.46 0 .68-.57.33-.87L12.67 3.6c-.38-.34-.96-.34-1.34 0l-8.36 7.53c-.34.3-.13.87.33.87H5v7c0 .55.45 1 1 1h3c.55 0 1-.45 1-1z" fill=currentColor /></svg></a><li class=breadcrumbs__item><span class=breadcrumbs__link>Backends</span><li class=breadcrumbs__item><span class=breadcrumbs__link>AMD Backend</span><li class="breadcrumbs__item breadcrumbs__item--active"><span class=breadcrumbs__link>队列与调度</span></ul></nav><div class="tocCollapsible_ETCw theme-doc-toc-mobile tocMobile_ITEo"><button type=button class="clean-btn tocCollapsibleButton_TO0P">本页总览</button></div><div class="theme-doc-markdown markdown"><header><h1>队列与调度</h1></header>
+<p>调度一个内核意味着将命令数据包写入一个环形缓冲区，并
+敲响 doorbell。本页介绍环机制（<code>AmdComputeQueue</code>）、包装它的
+每所有者捆绑（<code>AmdConnector</code>）、两种调度策略（单队列与多队列）、
+完成原语（<code>Timeline</code>），以及配置后端的每一个
+环境变量。</p>
+<p>这个设计的形态来自一个事实：<strong>tinygrad 是 GIL 串行化的</strong>——
+每个设备一个 compute 队列，由 Python 的 GIL 让每次调度成为原子的。
+Svod 移除 GIL 以获得真正的并发，因此 GIL 所提供的不变量
+必须显式地重建。其结果是一条可以做到无锁的调度路径。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=命令环amdcomputequeue>命令环：<code>AmdComputeQueue</code><a href=#命令环amdcomputequeue class=hash-link aria-label=命令环amdcomputequeue的直接链接 title=命令环amdcomputequeue的直接链接 translate=no>​</a></h2>
+<p><code>device/src/amd/queue.rs</code> 定义了 <code>AmdComputeQueue</code>，它拥有：</p>
+<ul>
+<li class="">一个 <strong>16 MiB 宿主可见环</strong>（<code>COMPUTE_RING_BYTES</code>）——命令数据包直接由 CPU
+写入其中；</li>
+<li class="">一个 <strong>doorbell</strong>（<code>*mut u64</code> MMIO）——通过在此写入新的 write-index，
+告知 GPU 的命令处理器"有新工作"；</li>
+<li class="">GART 常驻的 <strong>write/read dispatch-id</strong> 槽——KFD 除了 doorbell 之外还会读取
+write 指针，所以它会被先发布。</li>
+</ul>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=pm4-与-aql>PM4 与 AQL<a href=#pm4-与-aql class=hash-link aria-label="PM4 与 AQL的直接链接" title="PM4 与 AQL的直接链接" translate=no>​</a></h3>
+<p>存在两种线上数据包格式，在队列创建时根据
+设备的 XCC 计数一次性选定：</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">will_use_pm4(core) = !SVOD_AMD_AQL && num_xcc == 1</span><br/></div></code></pre></div></div>
+<ul>
+<li class=""><strong>PM4</strong>（单 XCC：gfx11/12 的默认）——原始 PM4 dword 直接写入
+环中（<code>KFD_IOC_QUEUE_TYPE_COMPUTE</code>）。doorbell 用
+下一个 dword 索引敲响。</li>
+<li class=""><strong>AQL</strong>（多 XCC 的 CDNA）——64 字节 AQL 数据包
+（<code>KFD_IOC_QUEUE_TYPE_COMPUTE_AQL</code>），其中 PM4 辅助包被包裹在 AQL
+vendor-IB 数据包内部。doorbell 用最后完成的槽
+（<code>write_idx - 1</code>）敲响。</li>
+</ul>
+<p>一次 PM4 调度是一个固定序列，对应 tinygrad 的
+<code>hcq.py:371-378</code>：</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">wait(timeline, prev)  →  hdp_flush  →  acquire_mem  →  exec  →  release_mem(timeline, next)</span><br/></div></code></pre></div></div>
+<p><code>exec</code> 是加载着色器地址、<code>RSRC1/2/3</code>
+寄存器、scratch 描述符和 <code>TMPRING_SIZE</code>、
+<code>USER_DATA</code> SGPR、launch 维度的 <code>SET_SH_REG</code> 流，随后是
+<code>DISPATCH_DIRECT</code>，再接一个 <code>CS_PARTIAL_FLUSH</code>。末尾的 <code>release_mem</code> 会在
+GPU 完成时将该调度的 timeline 值写入 connector 的信号槽。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=无锁内部可变性>无锁内部可变性<a href=#无锁内部可变性 class=hash-link aria-label=无锁内部可变性的直接链接 title=无锁内部可变性的直接链接 translate=no>​</a></h3>
+<p><code>AmdComputeQueue.inner</code> 是一个 <code>UnsafeCell&lt;QueueInner></code>，而非 <code>Mutex</code>——调度
+通过 <code>&self</code> 无锁地修改它。这之所以可靠，是因为一个
+<strong>单所有者不变量</strong>：在一个 <code>ConnectorLease</code> 的生命周期内，恰好有一个
+线程对该队列发出顺序的、非重入的调度（与 <code>RawBuffer</code> 在
+<code>device/src/allocator.rs</code> 中使用的模式相同）。共享的排空线程从不
+触碰队列——它只读取 timeline（见下文）。不同 connector 的
+队列由 GPU 的硬件调度器（MES——微引擎调度器）交错，而非 CPU 锁。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=环反压>环反压<a href=#环反压 class=hash-link aria-label=环反压的直接链接 title=环反压的直接链接 translate=no>​</a></h3>
+<p>一个跑 <code>wait=false</code> 比 GPU 排空更快的宿主会套圈 16 MiB 环
+并覆盖尚未消费的数据包。<code>wait_dispatch_headroom</code> 通过
+将未退役调度的数量限制到 <code>RING_MAX_INFLIGHT</code>（环的一半）来防止这一点，
+在达到该上限时在 <strong>timeline 信号</strong>上阻塞：</p>
+<div class="language-rust codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-rust codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token keyword" style=color:#00009f>let</span><span class="token plain"> last_reserved </span><span class="token operator" style=color:#393A34>=</span><span class="token plain"> conn</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>timeline_value</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>saturating_sub</span><span class="token punctuation" style=color:#393A34>(</span><span class="token number" style=color:#36acaa>1</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token keyword" style=color:#00009f>if</span><span class="token plain"> last_reserved </span><span class="token operator" style=color:#393A34>></span><span class="token plain"> </span><span class="token constant" style=color:#36acaa>RING_MAX_INFLIGHT</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>let</span><span class="token plain"> target </span><span class="token operator" style=color:#393A34>=</span><span class="token plain"> last_reserved </span><span class="token operator" style=color:#393A34>-</span><span class="token plain"> </span><span class="token constant" style=color:#36acaa>RING_MAX_INFLIGHT</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    conn</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>timeline_signal</span><span class="token punctuation" style=color:#393A34>(</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>.</span><span class="token function" style=color:#d73a49>wait_signal_value</span><span class="token punctuation" style=color:#393A34>(</span><span class="token plain">target</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> </span><span class="token number" style=color:#36acaa>30_000</span><span class="token punctuation" style=color:#393A34>)</span><span class="token operator" style=color:#393A34>?</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+<p>它在 timeline 信号——这个经过验证的完成原语——上设门，而不是在
+PM4 read 指针上，后者的 COMPUTE 队列语义不可靠，会让一次自旋
+死锁。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=每所有者捆绑amdconnector>每所有者捆绑：<code>AmdConnector</code><a href=#每所有者捆绑amdconnector class=hash-link aria-label=每所有者捆绑amdconnector的直接链接 title=每所有者捆绑amdconnector的直接链接 translate=no>​</a></h2>
+<p>单有一个队列还不足以调度。<code>AmdConnector</code>
+（<code>device/src/amd/connector.rs</code>）把一个独立调用方所需的一切捆在一起：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>字段<th>它是什么<tbody><tr><td><code>queue: Box&lt;AmdComputeQueue></code><td>环 + doorbell + GART（唯一所有者 → 无锁）<tr><td><code>arena: Box&lt;KernargArena></code><td>一个 16 MiB GTT kernarg bump arena<tr><td><code>scratch_state: Mutex&lt;ScratchState></code><td>寄存器溢出的 scratch 后备，按需增长<tr><td><code>timeline: Arc&lt;Timeline></code><td>单调计数器 + 完成信号</table>
+<p>每个 <code>ExecutionPlan</code> 和每个 <code>AmdGraph</code> 都拥有自己的 connector。队列与 arena 上的
+<code>Box</code>（而非 <code>Arc</code>）是承重的：它证明没有第二个
+句柄别名了那个 <code>UnsafeCell</code>，而这正是让无锁调度可靠的东西。
+arena 是每 connector 的，因此它的 bump 游标与该 connector 的 timeline 共享
+同一套排序——一个被绕回复用的 kernarg 槽在那个 timeline
+排空后就可证明是空闲的。</p>
+<p><code>ensure_has_local_memory(private_segment_size)</code> 会在一个
+刚加载的内核需要比当前已分配更多的每线程字节数时增长 scratch 缓冲区
+（分配新的 → 交换 → 排空 → 释放旧的）。scratch 是仅 GPU 的 VRAM，会被动态
+重新分配，也是 <code>NotPresent</code> 故障在历史上的来源——见
+<a class="" href=/zh-Hans/docs/backends/amd/debugging>调试</a>。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=两种调度策略>两种调度策略<a href=#两种调度策略 class=hash-link aria-label=两种调度策略的直接链接 title=两种调度策略的直接链接 translate=no>​</a></h2>
+<p>每设备的 <code>Dispatcher</code> 枚举（<code>device/src/amd/device.rs</code>）选择所有者如何
+获得 connector，以及调度是否被串行化。它在
+设备打开时根据 <code>SVOD_AMD_SINGLE_QUEUE</code> 一次性构建：</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=单队列默认>单队列（默认）<a href=#单队列默认 class=hash-link aria-label=单队列（默认）的直接链接 title=单队列（默认）的直接链接 translate=no>​</a></h3>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">SVOD_AMD_SINGLE_QUEUE unset or ≠ 0</span><br/></div></code></pre></div></div>
+<p>每个物理设备上的每个所有者共享<strong>一个</strong> connector，且调度 +
+scratch 重分配通过 <code>exec_guard()</code> 取得的 <code>Mutex&lt;()></code> 串行化。
+于是内核对每个 GPU 只看到一个 compute 队列——tinygrad 的模型。</p>
+<p>这是 <strong>KFD 安全</strong>模式，并且它之所以是默认有一个具体原因：
+繁重的并发多队列调度会<strong>令内核的 MES/runlist
+调度器过载，并可能让内核崩溃</strong>。一个 GPU 只有一个命令处理器，反正也是
+顺序运行调度；多队列只是重叠了 CPU 侧的数据包
+组装，而那正是把 KFD 推入坏路径的东西。单队列消除了那次
+崩溃。</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=多队列选择启用>多队列（选择启用）<a href=#多队列选择启用 class=hash-link aria-label=多队列（选择启用）的直接链接 title=多队列（选择启用）的直接链接 translate=no>​</a></h3>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">SVOD_AMD_SINGLE_QUEUE=0</span><br/></div></code></pre></div></div>
+<p>每个所有者从一个空闲池中租用一个<strong>独占拥有</strong>的 connector（上限为
+<code>CONNECTOR_POOL_CAP = 4</code>）；MES 交错这 N 个队列，因此调度
+不需要 CPU 锁，且 <code>exec_guard()</code> 返回 <code>None</code>。租约的独占且
+不可别名正是阻止两个调度者共享同一个 KFD 队列的东西。</p>
+<p>:::caution 内核过载的告诫
+多队列是无锁、最大并发的路径，但它也正是那条在
+负载下令 KFD 过载的路径。正因如此它需要选择启用。真正的修复——拥有
+GPU 使得内核永不处于调度路径中——是
+<a class="" href=/zh-Hans/docs/backends/amd/am-driver>用户态 AM 驱动</a>。
+:::</p>
+<h3 class="anchor anchorTargetStickyNavbar_Vzrq" id=connectorlease><code>ConnectorLease</code><a href=#connectorlease class=hash-link aria-label=connectorlease的直接链接 title=connectorlease的直接链接 translate=no>​</a></h3>
+<p><code>lease_connector</code> 返回一个 <code>ConnectorLease</code>——一个非 <code>Clone</code> 的句柄，它
+<code>Deref</code> 为 <code>&AmdConnector</code>，因此调用方与模式无关。在 drop 时，
+<code>return_connector</code> 会做与模式相应的事情：重新入池（多队列，直到
+上限）或什么都不做（单队列——共享 connector 继续存活于 core 上）。
+它在 drop 时<strong>不</strong>同步；connector 的 <code>Timeline</code> 保持注册
+状态，因此设备级排空仍会覆盖它。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=完成原语timeline>完成原语：<code>Timeline</code><a href=#完成原语timeline class=hash-link aria-label=完成原语timeline的直接链接 title=完成原语timeline的直接链接 translate=no>​</a></h2>
+<p><code>Timeline</code>（<code>device/src/amd/signal.rs</code>）是一个单调的 <code>AtomicU64</code> 计数器外加
+GPU 在调度完成时写入的 GTT 一致的 <code>AmdSignal</code> 槽。它是
+<strong>唯一一个跨所有者的原语</strong>：</p>
+<ul>
+<li class="">一个 connector 对它<em>调度</em>——<code>next()</code> 做 <code>fetch_add(1)</code> 以预留
+其 <code>release_mem</code> 数据包将要写入的值；</li>
+<li class="">任何线程都能对它<em>排空</em>——<code>drain()</code> 读取该原子并轮询信号
+槽，<strong>从不触碰队列</strong>。</li>
+</ul>
+<p>那种解耦正是让调度保持无锁的东西。设备 core
+（<code>AmdDeviceCore</code>）为每个 connector 持有 <code>Weak&lt;Timeline></code>——而非
+<code>Weak&lt;AmdConnector></code>——因此 <code>synchronize_all</code>（任何宿主读取或
+缓冲区释放之前的栅栏）纯粹通过这些原子来排空所有在途工作：</p>
+<div class="language-text codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-text codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token plain">AmdDeviceCore.synchronize_all():</span><br/></div><div class=token-line style=color:#393A34><span class="token plain">   for each live Timeline:  timeline.drain(30s)   // atomics + signal slot only</span><br/></div></code></pre></div></div>
+<p><code>AmdSignal::wait_signal_value</code> 分层轮询——紧凑自旋 → <code>yield_now</code> → 200 ms 之后
+KFD <code>WAIT_EVENTS</code> 睡眠——这样一次漫长或停滞的等待不会烧掉一个 CPU，
+而等待期间的 GPU 故障会立即浮现，而不是阻塞
+整整 30 秒的超时。</p>
+<p>:::note 2³² 回绕
+PM4 <code>WAIT_REG_MEM</code>/<code>RELEASE_MEM</code> 比较信号槽的低 32 位，因此
+计数器必须保持在 2³² 以下。<code>ensure_timeline_headroom</code> 在预留每个值之前，
+在一个 2³¹ 水位线（<code>TIMELINE_WRAP_WATERMARK</code>）处排空并重置，因此一个
+漫长的 <code>wait=false</code> 循环无法爬过 2³² 而产生一次假超时。
+:::</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=接缝>接缝<a href=#接缝 class=hash-link aria-label=接缝的直接链接 title=接缝的直接链接 translate=no>​</a></h2>
+<p>队列层所需的全部四种内核操作都路由经过设备 core 上的
+<a class="" href=/zh-Hans/docs/backends/amd/overview><code>AmdIface</code></a> trait：</p>
+<div class="language-rust codeBlockContainer_Ckt0 theme-code-block" style=--prism-color:#393A34;--prism-background-color:#f6f8fa><div class=codeBlockContent_QJqH><pre tabindex=0 class="prism-code language-rust codeBlock_bY9V thin-scrollbar" style=color:#393A34;background-color:#f6f8fa><code class=codeBlockLines_e6Vv><div class=token-line style=color:#393A34><span class="token keyword" style=color:#00009f>pub</span><span class="token plain"> </span><span class="token keyword" style=color:#00009f>trait</span><span class="token plain"> </span><span class="token type-definition class-name">AmdIface</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token class-name">Send</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>+</span><span class="token plain"> </span><span class="token class-name">Sync</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>+</span><span class="token plain"> </span><span class="token namespace" style=opacity:0.7>std</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token namespace" style=opacity:0.7>fmt</span><span class="token namespace punctuation" style=opacity:0.7;color:#393A34>::</span><span class="token class-name">Debug</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>{</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>fn</span><span class="token plain"> </span><span class="token function-definition function" style=color:#d73a49>alloc_raw</span><span class="token punctuation" style=color:#393A34>(</span><span class="token operator" style=color:#393A34>&</span><span class="token keyword" style=color:#00009f>self</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> size</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> kind</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> tag</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> cpu_access</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> zero</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>-></span><span class="token plain"> </span><span class="token class-name">Result</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token class-name">AllocResult</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>fn</span><span class="token plain"> </span><span class="token function-definition function" style=color:#d73a49>free_raw</span><span class="token punctuation" style=color:#393A34>(</span><span class="token operator" style=color:#393A34>&</span><span class="token keyword" style=color:#00009f>self</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> gpu_va</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> size</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> handle</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>fn</span><span class="token plain"> </span><span class="token function-definition function" style=color:#d73a49>setup_ring</span><span class="token punctuation" style=color:#393A34>(</span><span class="token operator" style=color:#393A34>&</span><span class="token keyword" style=color:#00009f>self</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> desc</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token operator" style=color:#393A34>&</span><span class="token class-name">RingDesc</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>-></span><span class="token plain"> </span><span class="token class-name">Result</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token class-name">QueueHandle</span><span class="token operator" style=color:#393A34>></span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>fn</span><span class="token plain"> </span><span class="token function-definition function" style=color:#d73a49>teardown_ring</span><span class="token punctuation" style=color:#393A34>(</span><span class="token operator" style=color:#393A34>&</span><span class="token keyword" style=color:#00009f>self</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> queue_id</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token keyword" style=color:#00009f>u32</span><span class="token punctuation" style=color:#393A34>)</span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain">    </span><span class="token keyword" style=color:#00009f>fn</span><span class="token plain"> </span><span class="token function-definition function" style=color:#d73a49>wait_events</span><span class="token punctuation" style=color:#393A34>(</span><span class="token operator" style=color:#393A34>&</span><span class="token keyword" style=color:#00009f>self</span><span class="token punctuation" style=color:#393A34>,</span><span class="token plain"> timeout_ms</span><span class="token punctuation" style=color:#393A34>:</span><span class="token plain"> </span><span class="token keyword" style=color:#00009f>u32</span><span class="token punctuation" style=color:#393A34>)</span><span class="token plain"> </span><span class="token punctuation" style=color:#393A34>-></span><span class="token plain"> </span><span class="token class-name">Result</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token class-name">Option</span><span class="token operator" style=color:#393A34>&lt;</span><span class="token class-name">Error</span><span class="token operator" style=color:#393A34>>></span><span class="token punctuation" style=color:#393A34>;</span><span class="token plain"></span><br/></div><div class=token-line style=color:#393A34><span class="token plain"></span><span class="token punctuation" style=color:#393A34>}</span><br/></div></code></pre></div></div>
+<p>注意 trait 中<em>没有</em>什么：环、GART、EOP 和 ctx-save 缓冲区
+全都在接缝之上（经由 <code>alloc_raw</code>）在 <code>create_queue</code> 内部分配。trait
+只<strong>激活</strong>队列——<code>setup_ring</code> 发出 <code>CREATE_QUEUE</code>，并在一个上半部已经拥有的
+环之上 <code>mmap</code> doorbell。<code>KfdIface</code> 是当今唯一的
+实现者。</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=配置参考>配置参考<a href=#配置参考 class=hash-link aria-label=配置参考的直接链接 title=配置参考的直接链接 translate=no>​</a></h2>
+<p>每一个影响 AMD 后端的环境变量：</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>变量<th>默认<th>效果<tbody><tr><td><code>SVOD_DEVICE</code><td><code>CPU</code><td>为张量选择默认设备。设 <code>SVOD_DEVICE=AMD:0</code> 以在第一块 AMD GPU 上运行<tr><td><code>SVOD_AMD_BACKEND</code><td><code>kfd</code><td>后端选择。如今只接受 <code>kfd</code>；<code>am</code> 是未来的接缝（若设置则报错）<tr><td><code>SVOD_AMD_SINGLE_QUEUE</code><td><code>1</code>（开）<td><code>=0</code> 选择启用无锁多队列调度；否则为 KFD 安全的单队列模式<tr><td><code>SVOD_AMD_AQL</code><td><code>0</code>（关）<td><code>=1</code> 即便在单 XCC 硬件上也强制 AQL 数据包——用于二分排查 PM4 与 AQL 问题<tr><td><code>SVOD_JIT_GRAPH</code><td>未设<td>启用 PM4 图捕获/重放（还要求多队列模式）。见 <a class="" href=/zh-Hans/docs/backends/amd/compile-and-graph>编译与图</a><tr><td><code>SVOD_KFD_TOPOLOGY</code><td>sysfs 路径<td>覆盖拓扑根，用于无硬件测试<tr><td><code>SVOD_DEBUG_DISPATCH</code><td>未设<td>转储每次调度的内核 / grid / kernarg / scratch / 缓冲区 VA。见 <a class="" href=/zh-Hans/docs/backends/amd/debugging>调试</a><tr><td><code>SVOD_DUMP_AMD_IR</code><td>未设<td>若设为一个目录，则将每个内核的 AMD LLVM IR 转储到那里</table>
+<p>:::caution 不存在 <code>SVOD_AMD_MAX_QUEUES</code>
+多队列空闲池大小是 <code>device.rs</code> 中的编译期常量
+<code>CONNECTOR_POOL_CAP = 4</code>，而非一个环境变量。
+:::</p>
+<hr/>
+<h2 class="anchor anchorTargetStickyNavbar_Vzrq" id=为什么这很重要>为什么这很重要<a href=#为什么这很重要 class=hash-link aria-label=为什么这很重要的直接链接 title=为什么这很重要的直接链接 translate=no>​</a></h2>
+<p>GIL 免费给了 tinygrad 一个原子的调度临界区。Svod 用三种方式
+重建那个保证：环的<strong>单所有者归属</strong>（无调度
+锁）、用于排空的<strong>共享 timeline 信号</strong>（原子，从不动队列），以及
+<strong>显式的环反压</strong>。单队列默认在今天保证内核
+安全；无锁的多队列路径已经就绪，待
+<a class="" href=/zh-Hans/docs/backends/amd/am-driver>AM 驱动</a> 把内核彻底移出回路时即可使用。</div><footer class="theme-doc-footer docusaurus-mt-lg"><div class="row margin-top--sm theme-doc-footer-edit-meta-row"><div class="col noPrint_WFHX"><a href=https://github.com/npatsakula/svod/edit/main/website/docs/backends/amd/queues-and-dispatch.md target=_blank rel="noopener noreferrer" class=theme-edit-this-page><svg fill=currentColor height=20 width=20 viewBox="0 0 40 40" class=iconEdit_Z9Sw aria-hidden=true><g><path d="m34.5 11.7l-3 3.1-6.3-6.3 3.1-3q0.5-0.5 1.2-0.5t1.1 0.5l3.9 3.9q0.5 0.4 0.5 1.1t-0.5 1.2z m-29.5 17.1l18.4-18.5 6.3 6.3-18.4 18.4h-6.3v-6.2z"/></g></svg>编辑此页</a></div><div class="col lastUpdated_JAkA"></div></div></footer></article><nav class="docusaurus-mt-lg pagination-nav" aria-label=文件选项卡><a class="pagination-nav__link pagination-nav__link--prev" href=/zh-Hans/docs/backends/amd/kfd-bindings><div class=pagination-nav__sublabel>上一页</div><div class=pagination-nav__label>KFD 绑定</div></a><a class="pagination-nav__link pagination-nav__link--next" href=/zh-Hans/docs/backends/amd/compile-and-graph><div class=pagination-nav__sublabel>下一页</div><div class=pagination-nav__label>编译与图</div></a></nav></div></div><div class="col col--3"><div class="tableOfContents_bqdL thin-scrollbar theme-doc-toc-desktop"><ul class="table-of-contents table-of-contents__left-border"><li><a href=#命令环amdcomputequeue class="table-of-contents__link toc-highlight">命令环：<code>AmdComputeQueue</code></a><ul><li><a href=#pm4-与-aql class="table-of-contents__link toc-highlight">PM4 与 AQL</a><li><a href=#无锁内部可变性 class="table-of-contents__link toc-highlight">无锁内部可变性</a><li><a href=#环反压 class="table-of-contents__link toc-highlight">环反压</a></ul><li><a href=#每所有者捆绑amdconnector class="table-of-contents__link toc-highlight">每所有者捆绑：<code>AmdConnector</code></a><li><a href=#两种调度策略 class="table-of-contents__link toc-highlight">两种调度策略</a><ul><li><a href=#单队列默认 class="table-of-contents__link toc-highlight">单队列（默认）</a><li><a href=#多队列选择启用 class="table-of-contents__link toc-highlight">多队列（选择启用）</a><li><a href=#connectorlease class="table-of-contents__link toc-highlight"><code>ConnectorLease</code></a></ul><li><a href=#完成原语timeline class="table-of-contents__link toc-highlight">完成原语：<code>Timeline</code></a><li><a href=#接缝 class="table-of-contents__link toc-highlight">接缝</a><li><a href=#配置参考 class="table-of-contents__link toc-highlight">配置参考</a><li><a href=#为什么这很重要 class="table-of-contents__link toc-highlight">为什么这很重要</a></ul></div></div></div></div></main></div></div></div><footer class="theme-layout-footer footer footer--dark"><div class="container container-fluid"><div class="row footer__links"><div class="theme-layout-footer-column col footer__col"><div class=footer__title>文档</div><ul class="footer__items clean-list"><li class=footer__item><a class=footer__link-item href=/zh-Hans/docs/introduction>简介</a></ul></div><div class="theme-layout-footer-column col footer__col"><div class=footer__title>社区</div><ul class="footer__items clean-list"><li class=footer__item><a href=https://github.com/npatsakula/svod target=_blank rel="noopener noreferrer" class=footer__link-item>GitHub<svg width=13.5 height=13.5 aria-label="(opens in new tab)" class=iconExternalLink_nPIU><use href=#theme-svg-external-link /></svg></a></ul></div></div><div class="footer__bottom text--center"><div class=footer__copyright>Copyright © 2026 Svod. Built with Docusaurus.</div></div></div></footer></div></body>
