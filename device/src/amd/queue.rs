@@ -526,6 +526,21 @@ impl AmdComputeQueue {
             full_user_data.push(0x20c1_4000);
         }
         full_user_data.extend_from_slice(user_data);
+        // TEMP gfx10 bring-up: dump the exact VAs the CP/shader touch so a page
+        // fault address (dmesg "in page starting at ...") can be matched to a
+        // specific buffer in a single run.
+        {
+            let kernarg_ptr = (user_data.first().copied().unwrap_or(0) as u64)
+                | ((user_data.get(1).copied().unwrap_or(0) as u64) << 32);
+            tracing::debug!(
+                counter_addr,
+                prog_addr,
+                scratch_addr,
+                kernarg_ptr,
+                enable_private_segment_sgpr,
+                "dispatch_pm4 VAs"
+            );
+        }
         let mut g = self.inner.lock();
         let prev = pool.pm4_value().saturating_sub(1);
         let next = pool.next_pm4();
