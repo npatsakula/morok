@@ -73,9 +73,17 @@ pub enum AllocKind {
     /// Device VRAM. `executable` adds the EXECUTABLE bit (set for general
     /// buffers, cleared for scratch). PUBLIC is derived from `cpu_access`.
     DeviceVram { executable: bool },
-    /// GTT-pinned, host-visible, uncached system memory (rings, GART, signal
-    /// slots, the event page).
+    /// GTT-pinned, host-visible, uncached system memory (rings, signal slots,
+    /// the event page). Carries fine-grained `COHERENT`, which the completion
+    /// signal handshake relies on.
     UncachedGtt,
+    /// The queue-descriptor page (`amd_queue_t`: rptr/wptr at +128/+56). Mirrors
+    /// ROCr's non-MES descriptor allocation (`system_allocator(AllocateQueueObject)`,
+    /// `amd_gpu_agent.cpp`): GTT, host-visible, **uncached only** — no fine-grained
+    /// `COHERENT` and no `EXECUTABLE`. Those extra MTYPE bits are harmless on
+    /// discrete/CDNA silicon but route the page through a coherence path the MEC
+    /// cannot read on RDNA2 APUs (gfx10.3), faulting the CP on the wptr read.
+    QueueDescriptor,
 }
 
 /// Result of [`AmdIface::alloc_raw`]: everything `RawBuffer::AmdDevice` needs
@@ -587,6 +595,13 @@ pub(crate) fn compose_flags(kind: AllocKind, cpu_access: bool, is_apu: bool) -> 
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
+        }
+        AllocKind::QueueDescriptor => {
+            kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
         }
     }

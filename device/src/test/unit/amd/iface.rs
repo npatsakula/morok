@@ -47,3 +47,24 @@ fn uncached_gtt_is_heap_independent() {
     assert_ne!(d & kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT, 0);
     assert_ne!(d & kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED, 0);
 }
+
+/// The queue descriptor mirrors ROCr's minimal non-MES flags: GTT + host-visible
+/// + uncached, but WITHOUT fine-grained COHERENT or EXECUTABLE. Those are exactly
+/// the two MTYPE bits that fault the MEC's wptr read on RDNA2 APUs (gfx10.3), so
+/// this is the regression guard for the APU queue-bringup fix. Heap-independent.
+#[test]
+fn queue_descriptor_drops_coherent_and_executable() {
+    for is_apu in [false, true] {
+        let f = compose_flags(AllocKind::QueueDescriptor, /*cpu_access=*/ true, is_apu);
+        // GTT, host-visible, uncached — what KFD needs to accept the ioctl.
+        assert_ne!(f & kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT, 0);
+        assert_ne!(f & kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC, 0);
+        assert_ne!(f & kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED, 0);
+        assert_ne!(f & kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE, 0);
+        // The load-bearing difference vs UncachedGtt: no COHERENT, no EXECUTABLE.
+        assert_eq!(f & kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT, 0);
+        assert_eq!(f & kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE, 0);
+        // Never VRAM — the descriptor is always GTT.
+        assert_eq!(f & kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM, 0);
+    }
+}

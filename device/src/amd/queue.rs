@@ -1056,9 +1056,9 @@ fn create_queue(
     needs_cwsr: bool,
 ) -> Result<QueueInner> {
     let dev = allocator.dev.core();
-    // Ring + GART are both VRAM with COHERENT | UNCACHED | PUBLIC flags
-    // (uncached + cpu-accessible). Using plain VRAM (no UNCACHED) makes
-    // KFD reject the create_queue ioctl with EINVAL.
+    // The ring is GTT, host-visible, uncached (COHERENT | UNCACHED | PUBLIC):
+    // plain VRAM (no UNCACHED) makes KFD reject the create_queue ioctl with
+    // EINVAL. The descriptor page below uses tighter ROCr flags (no COHERENT).
     let ring_buf = allocator.alloc_uncached(ring_size)?;
     let (ring_gpu, ring_host) = match &ring_buf {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
@@ -1079,10 +1079,11 @@ fn create_queue(
         }
     }
     // GART page holds the AQL queue descriptor (`amd_queue_t`, 256 bytes).
-    // rptr/wptr live at fixed offsets inside it; KFD reads the descriptor
-    // when wiring up the queue. The GART page is a 0x100-byte uncached,
-    // cpu-accessible allocation.
-    let gart_buf = allocator.alloc_uncached(0x100)?;
+    // rptr/wptr live at fixed offsets inside it; the CP reads them to drive the
+    // queue. Allocated with ROCr's minimal non-MES descriptor flags (GTT,
+    // host-visible, uncached — no COHERENT/EXECUTABLE), so the MEC can read the
+    // wptr on RDNA2 APUs (gfx10.3) where the extra MTYPE bits fault the CP.
+    let gart_buf = allocator.alloc_queue_descriptor(0x100)?;
     let (gart_gpu, gart_host) = match &gart_buf {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
         _ => return Err(Error::AmdAllocFailed { reason: "GART page requires host-visible buffer".into() }),

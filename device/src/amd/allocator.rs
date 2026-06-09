@@ -56,6 +56,15 @@ impl AmdAllocator {
     pub fn alloc_uncached(&self, size: usize) -> Result<RawBuffer> {
         do_alloc(&self.dev, size, AllocKind::UncachedGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
     }
+
+    /// Allocate the queue-descriptor page (`amd_queue_t`) with ROCr's minimal
+    /// non-MES flags: GTT, host-visible, uncached — without the fine-grained
+    /// `COHERENT`/`EXECUTABLE` bits that [`alloc_uncached`] carries. The CP reads
+    /// rptr/wptr from this page; on RDNA2 APUs the extra MTYPE bits make that
+    /// read permission-fault. See [`AllocKind::QueueDescriptor`].
+    pub fn alloc_queue_descriptor(&self, size: usize) -> Result<RawBuffer> {
+        do_alloc(&self.dev, size, AllocKind::QueueDescriptor, /*cpu_accessible=*/ true, /*zero_init=*/ true)
+    }
 }
 
 impl std::fmt::Debug for AmdAllocator {
@@ -241,7 +250,7 @@ fn do_alloc(
     // VRAM data/code/kernarg buffer or GTT control memory.
     let tag = match kind {
         AllocKind::DeviceVram { .. } => AllocTag::Vram,
-        AllocKind::UncachedGtt => AllocTag::Gtt,
+        AllocKind::UncachedGtt | AllocKind::QueueDescriptor => AllocTag::Gtt,
     };
     let r = dev.core().iface().alloc_raw(size, kind, tag, cpu_accessible, zero_init)?;
     Ok(RawBuffer::AmdDevice {
