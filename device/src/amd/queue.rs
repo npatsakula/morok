@@ -1015,6 +1015,15 @@ impl AmdCopyQueue {
         // no extra cache bookkeeping is needed here.
         self.timeline.drain(COPY_TIMEOUT_MS)
     }
+
+    /// Fence all in-flight SDMA work on this queue's timeline. `copy_fenced`
+    /// already drains per call, but the async graph-replay path submits without
+    /// an immediate wait, and `AmdDeviceCore::synchronize_all` (the fence before
+    /// every host read / buffer free) must quiesce the SDMA queue too — ROCr
+    /// quiesces a queue before any buffer it touched is freed. Idle-fast.
+    pub fn drain(&self) -> Result<()> {
+        self.timeline.drain(COPY_TIMEOUT_MS)
+    }
 }
 
 /// Append SDMA dwords into the byte-indexed copy ring, padding with NOPs

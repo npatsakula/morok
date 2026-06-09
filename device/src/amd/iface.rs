@@ -388,16 +388,31 @@ impl AmdIface for KfdIface {
             n_success: 0,
         };
         // SAFETY: fd is alive; handle is from a successful alloc.
-        let _ = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.kfd_fd.as_raw_fd(), &mut unmap_args as *mut _) };
-        // 2. Drop host mapping (PROT_READ|PROT_WRITE for host-visible, or the
-        //    PROT_NONE reservation for device-only). Both cases munmap the
-        //    same VA region.
+        let unmap_rc = unsafe { ioctl::kfd_unmap_memory_from_gpu(self.kfd_fd.as_raw_fd(), &mut unmap_args as *mut _) };
+        // A failed/partial unmap leaves the GPU PTEs for `gpu_va` intact while we
+        // go on to free the handle and (below) release the VA. If the VA is then
+        // recycled by a later alloc, those stale PTEs surface as a live-but-
+        // `NotPresent` fault. KFD's unmap is synchronous (PTE clear + TLB flush
+        // in-kernel), so a non-error return means the mapping is gone — surface
+        // any failure loudly instead of silently recycling a half-mapped VA.
+        match unmap_rc {
+            Err(e) => tracing::warn!(?e, gpu_va, handle, "free_raw: UNMAP_MEMORY_FROM_GPU failed — VA recycle may fault"),
+            Ok(_) if unmap_args.n_success != 1 => {
+                tracing::warn!(n_success = unmap_args.n_success, gpu_va, handle, "free_raw: UNMAP partial")
+            }
+            Ok(_) => {}
+        }
+        // 2. Free the KFD allocation BEFORE releasing the VA (ROCr `__fmm_release`
+        //    order, fmm.c: free the BO — which finalizes PTE teardown — then let
+        //    the VA become reusable). Releasing the VA first would let a
+        //    concurrent alloc map a fresh BO over a VA whose old BO isn't freed.
+        let mut free_args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
+        // SAFETY: fd alive; handle from a successful alloc.
+        let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.kfd_fd.as_raw_fd(), &mut free_args as *mut _) };
+        // 3. Drop the host mapping / VA reservation LAST (PROT_READ|PROT_WRITE for
+        //    host-visible, or the PROT_NONE reservation for device-only).
         // SAFETY: gpu_va is the VA returned by our own mmap.
         unsafe { munmap(gpu_va as *mut _, size) };
-        // 3. Free the KFD allocation.
-        let mut free_args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
-        // SAFETY: same as above.
-        let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.kfd_fd.as_raw_fd(), &mut free_args as *mut _) };
     }
 
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle> {

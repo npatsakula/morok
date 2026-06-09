@@ -337,6 +337,17 @@ impl AmdDeviceCore {
                 }
             }
         }
+        // The SDMA copy queue is NOT in the connector registry, but it has its
+        // own timeline of in-flight DMA. Quiesce it too, or an async graph-replay
+        // copy can still be touching a buffer the caller is about to free/read.
+        if let Some(copy) = self.copy_queue()
+            && let Err(e) = copy.drain()
+        {
+            tracing::warn!(?e, "synchronize_all: SDMA copy-queue drain failed; continuing");
+            if first_err.is_none() {
+                first_err = Some(e);
+            }
+        }
         // Opportunistic GC of dropped queue entries. The registry is touched
         // here on every host read/free, so dead Weaks don't accumulate.
         self.connectors.lock().retain(|w| w.strong_count() > 0);
