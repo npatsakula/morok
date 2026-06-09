@@ -633,9 +633,10 @@ pub(crate) fn alloc_scratch(
 ) -> Result<(u64, usize, u32, u32, u64, AqlScratchDesc)> {
     const LANES_PER_WAVE: u32 = 64;
     const PAGE: usize = 0x1000;
-    // Pre-gfx11 (CDNA gfx9 + RDNA2 gfx10) scratch is 1024-byte aligned; gfx11/12
-    // (RDNA3/4) use 256 (tinygrad ops_amd `_ensure_has_local_memory`:
-    // `256 if target >= (11,0,0) else 1024`).
+    // gfx9 (CDNA) AND gfx10 (RDNA2) scratch is 1024-byte aligned; only gfx11+
+    // (RDNA3/4) use 256. Authority: ROCr amd_aql_queue.cpp `mem_alignment_size =
+    // (major >= 11) ? 256 : 1024`. (new tinygrad's `256 if target[0]!=9` is wrong
+    // for gfx10 — verified against the vendored production driver.)
     let mem_alignment_size: u32 = if arch.is_cdna() || arch.is_rdna2() { 1024 } else { 256 };
 
     let xccs = node.num_xcc.max(1);
@@ -672,9 +673,11 @@ pub(crate) fn alloc_scratch(
     let total = r.size;
     let handle = r.handle;
 
-    // Pre-gfx11 (CDNA gfx9 + RDNA2 gfx10) divides scratch evenly across SEs (1);
-    // gfx11/12 wavesize is per-SE, so divide by se_cnt (tinygrad ops_amd:
-    // `wave_scratch_len * se_cnt if target >= (11,0,0) else wave_scratch_len`).
+    // gfx9 (CDNA) AND gfx10 (RDNA2) compute total waves (no per-SE division);
+    // only gfx11+ divides by se_cnt. Authority: ROCr amd_aql_queue.cpp — the base
+    // FillComputeTmpRingSize (gfx9/gfx10) does NOT divide by NumShaderBanks,
+    // whereas FillComputeTmpRingSize_Gfx11 adds `num_waves /= NumShaderBanks`
+    // ("for GFX11 we specify number of waves per engine instead of total").
     let wave_scratch = (LANES_PER_WAVE * size_per_thread).div_ceil(mem_alignment_size);
     let max_scratch_waves = cu_slots * max_slots * xccs;
     let se_div = if arch.is_cdna() || arch.is_rdna2() { 1 } else { se_cnt };

@@ -351,7 +351,16 @@ impl AmdIface for KfdIface {
         }
 
         self.va.insert(va as u64, size, mem_handle, tag);
-        debug!(size, gpu_addr = va as u64, handle = mem_handle, tag = ?tag, "AmdAllocator alloc done");
+        debug!(
+            size,
+            gpu_addr = va as u64,
+            handle = mem_handle,
+            tag = ?tag,
+            is_apu = self.node.is_apu(),
+            heap = if flags & kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM != 0 { "vram" } else { "gtt" },
+            cpu_accessible,
+            "AmdAllocator alloc done"
+        );
 
         Ok(AllocResult { gpu_va: va as u64, host_ptr, handle: mem_handle, size })
     }

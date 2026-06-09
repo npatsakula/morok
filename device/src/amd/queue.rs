@@ -845,19 +845,15 @@ pub(crate) fn build_exec_pm4(
     q.extend(pm4::set_sh_reg(rsrc3_reg, &[rsrc3]));
 
     // 4. Scratch / tmpring (valid base required for wave init on RDNA3+ even
-    //    when SCRATCH_EN=0). COMPUTE_DISPATCH_SCRATCH_BASE registers exist on
-    //    gfx11+ and CDNA (gfx942/950) but were removed on gfx10/RDNA2 (tinygrad
-    //    `has_scratch_base_registers = target >= (11,0,0) or {(9,4,2),(9,5,0)}`);
-    //    on gfx10 the scratch base rides the private-segment-buffer V# in user
-    //    SGPRs, so skip the register write there.
+    //    when SCRATCH_EN=0). COMPUTE_DISPATCH_SCRATCH_BASE is written on ALL
+    //    arches incl. gfx10.3 (RDNA2): RDNA2 uses "architected flat scratch" —
+    //    LLVM emits scratch accesses relative to FLAT_SCRATCH, which HW
+    //    initialises from this register, so it MUST be set. tinygrad ops_amd
+    //    writes it unconditionally; the old `has_scratch_base_registers` gate
+    //    (gfx11+/CDNA only) was wrong for gfx10.3 and left FLAT_SCRATCH unset.
     q.extend(pm4::set_sh_reg(pm4::COMPUTE_TMPRING_SIZE, &[tmpring_size]));
-    if target_major != 10 {
-        let scratch_shr = scratch_addr >> 8;
-        q.extend(pm4::set_sh_reg(
-            pm4::COMPUTE_DISPATCH_SCRATCH_BASE_LO,
-            &[scratch_shr as u32, (scratch_shr >> 32) as u32],
-        ));
-    }
+    let scratch_shr = scratch_addr >> 8;
+    q.extend(pm4::set_sh_reg(pm4::COMPUTE_DISPATCH_SCRATCH_BASE_LO, &[scratch_shr as u32, (scratch_shr >> 32) as u32]));
 
     // 5. Restart points always zero (no preempt-resume).
     q.extend(pm4::set_sh_reg(pm4::COMPUTE_RESTART_X, &[0, 0, 0]));
