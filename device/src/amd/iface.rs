@@ -199,9 +199,21 @@ impl KfdIface {
         }
 
         // RUNTIME_ENABLE — only on KFD >= 1.14; older kernels reject the
-        // ioctl with ENOTTY.
+        // ioctl with ENOTTY. KFD selects enable-vs-disable by
+        // `mode_mask & KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK` (bit 0), so a zero
+        // mask invokes runtime *disable* — the opposite of intent. ROCr always
+        // enables at init (libhsakmt `hsaKmtRuntimeEnable`, debug.c). The enabled
+        // runtime state is what registers the process for KFD eviction→restore +
+        // queue-resume, which a memory-pressured APU (iGPU driving display +
+        // compute) depends on; without it, an evicted-but-live BO is never
+        // restored and the CP faults NotPresent on it. No TTMP (no CWSR
+        // trap-debug); r_debug = 0 (no debugger attached).
         if kfd_version >= (1, 14) {
-            let mut rt = kfd::kfd_ioctl_runtime_enable_args { mode_mask: 0, ..Default::default() };
+            const KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK: u32 = 1;
+            let mut rt = kfd::kfd_ioctl_runtime_enable_args {
+                mode_mask: KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK,
+                ..Default::default()
+            };
             if let Err(e) = unsafe { ioctl::kfd_runtime_enable(kfd_fd.as_raw_fd(), &mut rt as *mut _) } {
                 return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_RUNTIME_ENABLE", errno: e as i32 });
             }
