@@ -379,6 +379,15 @@ impl SignalPool {
                 return Err(Error::AmdAllocFailed { reason: "SignalPool requires host-visible AMD buffer".into() });
             }
         };
+        // Diagnostic: the pool is one of several GTT control pages that share the
+        // "Gtt" registry tag, so log its exact range to disambiguate a fault VA.
+        tracing::debug!(
+            target: "svod_device::amd::signal",
+            base = base_gpu,
+            size = SLOT_BYTES * slots,
+            end = base_gpu + (SLOT_BYTES * slots) as u64,
+            "SignalPool allocated"
+        );
         let free_slots = Mutex::new((0..slots as u32).rev().collect()); // pop low slots first
         let device = Arc::clone(allocator.dev.core());
         Ok(Arc::new(Self { _buffer: buffer, base_gpu, base_host, slots, free_slots, device }))

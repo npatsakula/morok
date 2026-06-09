@@ -603,6 +603,17 @@ fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Resul
         return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU(event page)", errno: e as i32 });
     }
 
+    // Diagnostic: the event page is allocated outside `alloc_raw`, so it is
+    // absent from both the VA registry and the "AmdAllocator alloc done" logs.
+    // Log its range explicitly so a fault VA can be resolved back to it.
+    tracing::debug!(
+        target: "svod_device::amd::device",
+        base = va as u64,
+        size,
+        end = va as u64 + size as u64,
+        "event page allocated (GPU-mapped, COHERENT|EXECUTABLE GTT)"
+    );
+
     Ok((va as u64, size, handle))
 }
 
