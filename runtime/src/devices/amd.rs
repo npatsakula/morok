@@ -8,11 +8,16 @@
 //! Construction returns `Err(NoAmdGpu)` cleanly on hosts that don't have a
 //! supported AMD GPU; never panics.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use svod_codegen::llvm::LlvmTextRenderer;
 use svod_device::Result;
-use svod_device::amd::{AmdAllocator, AmdCopyQueue, AmdGraph, AmdProgram, SignalPool};
+use svod_device::amd::{AmdAllocator, AmdCopyQueue, AmdGraph, AmdProgram, PoolQueue, SignalPool};
+
+/// Diagnostic (SVOD_AMD_WARM_COMPUTE): holds compute `PoolQueue`s created before
+/// the SDMA copy queue alive for the process lifetime, so they stay in the KFD
+/// run-list. See the bring-up note at the use site in `create_amd_device`.
+static WARM_QUEUES: Mutex<Vec<Arc<PoolQueue>>> = Mutex::new(Vec::new());
 use svod_device::device::{
     CompiledSpec, Compiler, Device, Graph, GraphFactory, GraphKernel, Program, ProgramSpec, Renderer, RuntimeFactory,
 };
@@ -54,6 +59,22 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // cleanly leaves has_sdma_queue=false, so buffers stay host-visible and use
     // the memmove copy path (today's behaviour). Must run before any _alloc,
     // which reads has_sdma_queue to decide cpu_access.
+    // Diagnostic gate (SVOD_AMD_WARM_COMPUTE): create a compute queue BEFORE the
+    // SDMA copy queue, so the process's first KFD run-list entry is a compute
+    // queue — matching tinygrad/ROCr ordering (both establish a compute queue
+    // before the SDMA blit queue). On gfx10.3 the MES faults reading an SDMA
+    // queue's descriptor when that queue is the first one created into a process
+    // with no compute queue; this tests whether compute-first ordering fixes it.
+    // The warm queue is held alive (WARM_QUEUES) so it stays in the run-list.
+    if std::env::var_os("SVOD_AMD_WARM_COMPUTE").is_some() {
+        match PoolQueue::new_with_resources(device_handle.core().clone(), &amd_alloc) {
+            Ok(warm) => {
+                tracing::warn!("SVOD_AMD_WARM_COMPUTE set; compute queue created before SDMA copy queue");
+                WARM_QUEUES.lock().expect("WARM_QUEUES poisoned").push(warm);
+            }
+            Err(e) => tracing::warn!(error = %e, "SVOD_AMD_WARM_COMPUTE: warm compute queue creation failed"),
+        }
+    }
     // Diagnostic gate (SVOD_AMD_NO_SDMA): skip the SDMA copy queue entirely, so
     // host↔device staging falls back to the host memmove path (buffers stay
     // host-visible). On gfx10.3 the compute MEC faults reading the SDMA queue's
