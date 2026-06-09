@@ -54,13 +54,23 @@ pub fn create_amd_device(registry: &DeviceRegistry, device_id: usize, arch: AmdA
     // cleanly leaves has_sdma_queue=false, so buffers stay host-visible and use
     // the memmove copy path (today's behaviour). Must run before any _alloc,
     // which reads has_sdma_queue to decide cpu_access.
-    match AmdCopyQueue::create(&amd_alloc) {
-        Ok(copy_queue) => {
-            device_handle.core().install_copy_queue(copy_queue);
-            device_handle.core().set_has_sdma_queue(true);
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "SDMA copy queue unavailable; AMD buffers stay host-visible");
+    // Diagnostic gate (SVOD_AMD_NO_SDMA): skip the SDMA copy queue entirely, so
+    // host↔device staging falls back to the host memmove path (buffers stay
+    // host-visible). On gfx10.3 the compute MEC faults reading the SDMA queue's
+    // GART descriptor during run-list processing; this isolates whether the SDMA
+    // queue's presence in the run-list is the trigger. Default behaviour is
+    // unchanged — only set when bisecting.
+    if std::env::var_os("SVOD_AMD_NO_SDMA").is_some() {
+        tracing::warn!("SVOD_AMD_NO_SDMA set; skipping SDMA copy queue — AMD buffers stay host-visible");
+    } else {
+        match AmdCopyQueue::create(&amd_alloc) {
+            Ok(copy_queue) => {
+                device_handle.core().install_copy_queue(copy_queue);
+                device_handle.core().set_has_sdma_queue(true);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SDMA copy queue unavailable; AMD buffers stay host-visible");
+            }
         }
     }
     // No default connector: every dispatcher leases/owns its own connector
