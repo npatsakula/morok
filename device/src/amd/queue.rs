@@ -48,6 +48,9 @@ pub const AQL_PACKET_BYTES: usize = 64;
 const INVALID_AQL_HEADER: u32 = hsa_packet_type_t_HSA_PACKET_TYPE_INVALID << hsa_packet_header_t_HSA_PACKET_HEADER_TYPE;
 /// 16 MiB ring — the compute-ring default size.
 pub const COMPUTE_RING_BYTES: usize = 16 * 1024 * 1024;
+/// RDNA2 compute ring — ROCr never creates user queues above 1 MiB on gfx10.3
+/// (HW-confirmed: the 16 MiB ring's GART wptr poll faults the CPF mid-run).
+pub const COMPUTE_RING_BYTES_RDNA2: usize = 1024 * 1024;
 /// SDMA ring is smaller; 1 MiB is plenty for short copy bursts.
 pub const COPY_RING_BYTES: usize = 1024 * 1024;
 
@@ -60,7 +63,9 @@ const MAX_DISPATCH_DWORDS: usize = 1024;
 /// Chosen so the combined ring footprint stays at half the ring even in the
 /// worst case (`* MAX_DISPATCH_DWORDS`), leaving generous margin while still
 /// letting the host run thousands of dispatches ahead of the GPU.
-const RING_MAX_INFLIGHT: u64 = (COMPUTE_RING_BYTES / 4 / MAX_DISPATCH_DWORDS / 2) as u64;
+const fn ring_max_inflight(ring_bytes: usize) -> u64 {
+    (ring_bytes / 4 / MAX_DISPATCH_DWORDS / 2) as u64
+}
 
 /// Build an AQL `hsa_barrier_and_packet_t` (64 bytes) with no dependencies and
 /// the given `completion_signal` handle. Used as a graph batch's terminator:
@@ -434,7 +439,8 @@ impl AmdComputeQueue {
         // bisecting PM4 vs AQL bring-up issues.
         let is_pm4 = Self::will_use_pm4(core);
         let queue_type = if is_pm4 { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE } else { kfd::KFD_IOC_QUEUE_TYPE_COMPUTE_AQL };
-        let inner = create_queue(allocator, queue_type, COMPUTE_RING_BYTES, !is_pm4, /*needs_cwsr=*/ true)?;
+        let ring_bytes = if core.arch.is_rdna2() { COMPUTE_RING_BYTES_RDNA2 } else { COMPUTE_RING_BYTES };
+        let inner = create_queue(allocator, queue_type, ring_bytes, !is_pm4, /*needs_cwsr=*/ true)?;
         debug!(gpu_id = core.node.gpu_id, num_xcc = core.node.num_xcc, is_pm4 = is_pm4, "AmdComputeQueue created");
         Ok(Box::new(Self { inner: Mutex::new(inner), core: Arc::clone(core), is_pm4 }))
     }
@@ -457,9 +463,10 @@ impl AmdComputeQueue {
     /// The dispatches we wait on were submitted (doorbell rung) in prior calls,
     /// so the GPU will signal them; the wait always makes progress.
     fn wait_dispatch_headroom(&self, pool: &PoolQueue) -> Result<()> {
+        let max_inflight = ring_max_inflight(self.inner.lock().ring_size);
         let last_reserved = pool.pm4_value().saturating_sub(1);
-        if last_reserved > RING_MAX_INFLIGHT {
-            let target = last_reserved - RING_MAX_INFLIGHT;
+        if last_reserved > max_inflight {
+            let target = last_reserved - max_inflight;
             pool.pm4_signal().wait_signal_value(target, 30_000).inspect_err(|e| self.core.poison(&e.to_string()))?;
         }
         Ok(())
