@@ -56,15 +56,6 @@ impl AmdAllocator {
     pub fn alloc_uncached(&self, size: usize) -> Result<RawBuffer> {
         do_alloc(&self.dev, size, AllocKind::UncachedGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
     }
-
-    /// Allocate the queue-descriptor page (`amd_queue_t`) with ROCr's minimal
-    /// non-MES flags: GTT, host-visible, uncached — without the fine-grained
-    /// `COHERENT`/`EXECUTABLE` bits that [`alloc_uncached`] carries. The CP reads
-    /// rptr/wptr from this page; on RDNA2 APUs the extra MTYPE bits make that
-    /// read permission-fault. See [`AllocKind::QueueDescriptor`].
-    pub fn alloc_queue_descriptor(&self, size: usize) -> Result<RawBuffer> {
-        do_alloc(&self.dev, size, AllocKind::QueueDescriptor, /*cpu_accessible=*/ true, /*zero_init=*/ true)
-    }
 }
 
 impl std::fmt::Debug for AmdAllocator {
@@ -88,7 +79,7 @@ impl Allocator for AmdAllocator {
         // device-only buffer pass `zero=false` and SDMA-zero it ourselves below,
         // keeping `zero=true` honored regardless of host visibility.
         let seam_zero = zero && cpu_access;
-        let buf = do_alloc(&self.dev, size, AllocKind::DeviceVram { executable: true }, cpu_access, seam_zero)?;
+        let buf = do_alloc(&self.dev, size, AllocKind::DeviceVram, cpu_access, seam_zero)?;
         if zero && let RawBuffer::AmdDevice { host_ptr: None, gpu_addr, size: bsize, .. } = &buf {
             self.copy_queue()?.device_zero(*gpu_addr, *bsize)?;
         }
@@ -249,8 +240,8 @@ fn do_alloc(
     // site (`device::alloc_scratch`); everything routed through here is either a
     // VRAM data/code/kernarg buffer or GTT control memory.
     let tag = match kind {
-        AllocKind::DeviceVram { .. } => AllocTag::Vram,
-        AllocKind::UncachedGtt | AllocKind::QueueDescriptor => AllocTag::Gtt,
+        AllocKind::DeviceVram => AllocTag::Vram,
+        AllocKind::UncachedGtt => AllocTag::Gtt,
     };
     let r = dev.core().iface().alloc_raw(size, kind, tag, cpu_accessible, zero_init)?;
     Ok(RawBuffer::AmdDevice {

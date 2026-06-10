@@ -70,20 +70,14 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
 /// Allocation flavor — selects the KFD flag set built in [`AmdIface::alloc_raw`].
 #[derive(Clone, Copy, Debug)]
 pub enum AllocKind {
-    /// Device VRAM. `executable` adds the EXECUTABLE bit (set for general
-    /// buffers, cleared for scratch). PUBLIC is derived from `cpu_access`.
-    DeviceVram { executable: bool },
-    /// GTT-pinned, host-visible, uncached system memory (rings, signal slots,
-    /// the event page). Carries fine-grained `COHERENT`, which the completion
-    /// signal handshake relies on.
+    /// Device VRAM (GTT on APUs). WRITABLE | EXECUTABLE | NO_SUBSTITUTE, plus
+    /// PUBLIC when `cpu_access` — the tinygrad/ROCr base flag set for every
+    /// data/code/scratch buffer.
+    DeviceVram,
+    /// GTT-pinned, host-visible, uncached system memory (rings, queue GART
+    /// pages, signal slots, the event page). Carries fine-grained `COHERENT`,
+    /// which the completion signal handshake relies on.
     UncachedGtt,
-    /// The queue-descriptor page (`amd_queue_t`: rptr/wptr at +128/+56). Mirrors
-    /// ROCr's non-MES descriptor allocation (`system_allocator(AllocateQueueObject)`,
-    /// `amd_gpu_agent.cpp`): GTT, host-visible, **uncached only** — no fine-grained
-    /// `COHERENT` and no `EXECUTABLE`. Those extra MTYPE bits are harmless on
-    /// discrete/CDNA silicon but route the page through a coherence path the MEC
-    /// cannot read on RDNA2 APUs (gfx10.3), faulting the CP on the wptr read.
-    QueueDescriptor,
 }
 
 /// Result of [`AmdIface::alloc_raw`]: everything `RawBuffer::AmdDevice` needs
@@ -371,16 +365,7 @@ impl AmdIface for KfdIface {
         }
 
         self.va.insert(va as u64, size, mem_handle, tag);
-        debug!(
-            size,
-            gpu_addr = va as u64,
-            handle = mem_handle,
-            tag = ?tag,
-            is_apu = self.node.is_apu(),
-            heap = if flags & kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM != 0 { "vram" } else { "gtt" },
-            cpu_accessible,
-            "AmdAllocator alloc done"
-        );
+        debug!(size, gpu_addr = va as u64, handle = mem_handle, tag = ?tag, cpu_accessible, "AmdAllocator alloc done");
 
         Ok(AllocResult { gpu_va: va as u64, host_ptr, handle: mem_handle, size })
     }
@@ -408,7 +393,9 @@ impl AmdIface for KfdIface {
         // in-kernel), so a non-error return means the mapping is gone — surface
         // any failure loudly instead of silently recycling a half-mapped VA.
         match unmap_rc {
-            Err(e) => tracing::warn!(?e, gpu_va, handle, "free_raw: UNMAP_MEMORY_FROM_GPU failed — VA recycle may fault"),
+            Err(e) => {
+                tracing::warn!(?e, gpu_va, handle, "free_raw: UNMAP_MEMORY_FROM_GPU failed — VA recycle may fault")
+            }
             Ok(_) if unmap_args.n_success != 1 => {
                 tracing::warn!(n_success = unmap_args.n_success, gpu_va, handle, "free_raw: UNMAP partial")
             }
@@ -421,10 +408,19 @@ impl AmdIface for KfdIface {
         let mut free_args = kfd::kfd_ioctl_free_memory_of_gpu_args { handle };
         // SAFETY: fd alive; handle from a successful alloc.
         let _ = unsafe { ioctl::kfd_free_memory_of_gpu(self.kfd_fd.as_raw_fd(), &mut free_args as *mut _) };
-        // 3. Drop the host mapping / VA reservation LAST (PROT_READ|PROT_WRITE for
-        //    host-visible, or the PROT_NONE reservation for device-only).
+        // 3. Quarantine the VA instead of releasing it (ROCr `reserved_aperture_release`,
+        //    fmm.c): re-mmap PROT_NONE drops the host pages but keeps the range
+        //    reserved, so neither the OS nor a later alloc can recycle a VA the GPU
+        //    might still reference through a stale PTE or in-flight packet. The
+        //    cost is bounded by total bytes ever freed in 47-bit address space;
+        //    only on ENOMEM fall back to a real munmap.
         // SAFETY: gpu_va is the VA returned by our own mmap.
-        unsafe { munmap(gpu_va as *mut _, size) };
+        let p = unsafe {
+            mmap(gpu_va as *mut _, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0)
+        };
+        if p == libc::MAP_FAILED {
+            unsafe { munmap(gpu_va as *mut _, size) };
+        }
     }
 
     fn setup_ring(&self, desc: &RingDesc) -> Result<QueueHandle> {
@@ -604,12 +600,12 @@ impl KfdIface {
 /// arch-independent.
 pub(crate) fn compose_flags(kind: AllocKind, cpu_access: bool, is_apu: bool) -> u32 {
     match kind {
-        AllocKind::DeviceVram { executable } => {
+        AllocKind::DeviceVram => {
             let heap = if is_apu { kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT } else { kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM };
-            let mut flags = heap | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
-            if executable {
-                flags |= kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE;
-            }
+            let mut flags = heap
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE;
             if cpu_access {
                 flags |= kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC;
             }
@@ -622,13 +618,6 @@ pub(crate) fn compose_flags(kind: AllocKind, cpu_access: bool, is_apu: bool) -> 
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
-        }
-        AllocKind::QueueDescriptor => {
-            kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
-                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
         }
     }

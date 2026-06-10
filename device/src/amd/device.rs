@@ -436,6 +436,20 @@ impl AmdDeviceCore {
     pub fn install_signal_pool(&self, pool: Arc<crate::amd::signal::SignalPool>) {
         let _ = self.signal_pool.set(pool);
     }
+
+    /// Seed the queue pool with its first compute queue. gfx10.3 (RDNA2) HWS
+    /// faults reading an SDMA queue's GART descriptor when the process run-list
+    /// holds no compute queue, so the factory calls this BEFORE creating the
+    /// SDMA copy queue on RDNA2. Pool queues live for the device lifetime, so
+    /// the compute-first run-list invariant holds permanently; the seeded queue
+    /// is a normal pool member that `assign_owner` hands out as usual.
+    pub fn seed_compute_queue(self: &Arc<Self>, allocator: &crate::amd::AmdAllocator) -> Result<()> {
+        let mut queues = self.queue_pool.lock();
+        if queues.is_empty() {
+            queues.push(crate::amd::connector::PoolQueue::new_with_resources(Arc::clone(self), allocator)?);
+        }
+        Ok(())
+    }
 }
 
 impl AmdDeviceCore {
@@ -614,17 +628,6 @@ fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Resul
         return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_MAP_MEMORY_TO_GPU(event page)", errno: e as i32 });
     }
 
-    // Diagnostic: the event page is allocated outside `alloc_raw`, so it is
-    // absent from both the VA registry and the "AmdAllocator alloc done" logs.
-    // Log its range explicitly so a fault VA can be resolved back to it.
-    tracing::debug!(
-        target: "svod_device::amd::device",
-        base = va as u64,
-        size,
-        end = va as u64 + size as u64,
-        "event page allocated (GPU-mapped, COHERENT|EXECUTABLE GTT)"
-    );
-
     Ok((va as u64, size, handle))
 }
 
@@ -681,12 +684,11 @@ pub(crate) fn alloc_scratch(
         (size_per_thread as usize) * (LANES_PER_WAVE as usize) * (max_slots as usize) * (cu_slots as usize);
     let total = (size_per_xcc * xccs as usize).next_multiple_of(PAGE);
 
-    // KFD alloc as plain VRAM (GPU-only; no host access needed — the GPU writes
-    // register spills here and reads them back). Plain VRAM = no EXECUTABLE, no
-    // PUBLIC (`cpu_access=false` keeps PUBLIC off); see `AllocKind::DeviceVram`.
+    // KFD alloc as plain VRAM (GPU-only; `cpu_access=false` keeps PUBLIC off);
+    // see `AllocKind::DeviceVram`.
     let r = iface.alloc_raw(
         total,
-        crate::amd::iface::AllocKind::DeviceVram { executable: false },
+        crate::amd::iface::AllocKind::DeviceVram,
         crate::amd::va_registry::AllocTag::Scratch,
         /*cpu_access=*/ false,
         /*zero=*/ false,
