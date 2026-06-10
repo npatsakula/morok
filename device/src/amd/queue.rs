@@ -412,6 +412,7 @@ impl QueueInner {
         // ring packet / kernarg stores are still buffered (stale read → wedge).
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
         let doorbell_value = if is_pm4 { self.write_idx } else { self.write_idx - 1 };
+        tracing::debug!(write_idx = self.write_idx, doorbell_value, ring_size = self.ring_size, "ring_doorbell");
         // SAFETY: doorbell is mmapped MMIO; aligned 64-bit store.
         unsafe { std::ptr::write_volatile(self.doorbell.as_ptr(), doorbell_value) };
     }
