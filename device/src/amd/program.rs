@@ -652,6 +652,8 @@ impl AmdProgram {
         // ring hazard between co-tenant owners). Lock order: dispatch_lock →
         // queue inner Mutex (taken inside dispatch_*).
         let _disp = pool.dispatch_guard();
+        let private_seg = self.private_segment_size();
+        tracing::debug!(kernel = %self.name, private_seg, wait, "dispatch");
 
         // 1. Bump the queue's kernarg arena under the dispatch lock — the
         // ordering above guarantees the slot stays valid through dispatch.
