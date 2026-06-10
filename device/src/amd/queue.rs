@@ -516,21 +516,27 @@ impl AmdComputeQueue {
         // async (`wait=false`) burst can't lap the ring. Outside the inner lock.
         self.wait_dispatch_headroom(pool)?;
         let counter_addr = pool.pm4_signal().value_addr();
-        let scratch_addr = pool.scratch_gpu_va();
-        let tmpring_size = pool.tmpring_size();
-        // Assemble the full USER_DATA prefix here, under the lock, so the scratch
-        // SGPR descriptor (words 0-3) is derived from the SAME `scratch_addr` as
-        // the `COMPUTE_DISPATCH_SCRATCH_BASE` register below. Building it in
-        // `AmdProgram::execute` (outside the lock) let a concurrent scratch
-        // realloc slip in between the two reads, so the descriptor and the
-        // register could point at different buffers. The scratch base address
-        // is read exactly once and reused for the descriptor and the register.
+        // One snapshot under one lock window, so the scratch SGPR descriptor
+        // (words 0-3), the tmpring, and the `COMPUTE_DISPATCH_SCRATCH_BASE`
+        // register below all describe the SAME buffer even when a concurrent
+        // grow swaps the scratch state mid-dispatch.
+        let scratch = pool.scratch_snapshot();
+        let scratch_addr = scratch.gpu_va;
+        let tmpring_size = scratch.tmpring_size;
         let mut full_user_data: Vec<u32> = Vec::with_capacity(user_data.len() + 4);
         if enable_private_segment_sgpr {
             full_user_data.push(scratch_addr as u32);
             full_user_data.push((scratch_addr >> 32) as u32 | (1u32 << 31));
-            full_user_data.push(0xFFFF_FFFF);
-            full_user_data.push(0x20c1_4000);
+            if scratch.aql_desc.resource_descriptor[3] != 0 {
+                // Arch-built SRD (gfx9 on CDNA, gfx10 on RDNA2): NUM_RECORDS =
+                // per-XCC scratch size, WORD3 per `AqlScratchDesc::gfx9/gfx10`.
+                full_user_data.push(scratch.aql_desc.resource_descriptor[2]);
+                full_user_data.push(scratch.aql_desc.resource_descriptor[3]);
+            } else {
+                // gfx11+ literals (tinygrad's working RDNA3 values).
+                full_user_data.push(0xFFFF_FFFF);
+                full_user_data.push(0x20c1_4000);
+            }
         }
         full_user_data.extend_from_slice(user_data);
         let mut g = self.inner.lock();

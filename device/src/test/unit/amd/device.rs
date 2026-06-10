@@ -38,6 +38,21 @@ fn aql_scratch_descriptor_gfx9_encoding() {
     assert_eq!(d.wave64_lane_byte_size, 256); // wave64: priv_seg * 64 / 64
 }
 
+#[test]
+fn aql_scratch_descriptor_gfx10_encoding() {
+    // gfx10 (RDNA2 wave32) SRD — ROCr FillBufRsrcWord3_Gfx10: WORD0..2 as gfx9;
+    // WORD3 = DST_SEL=XYZW(0xEAC) | FORMAT=BUF_FORMAT_32_UINT(0x14<<12)
+    //       | ADD_TID_ENABLE(1<<23) | RESOURCE_LEVEL(1<<24) | OOB_SELECT(2<<28)
+    //       = 0x21814EAC. Lane size for wave32 backing is priv_seg*32/64.
+    let va: u64 = 0x1234_5678_9abc_d000;
+    let d = AqlScratchDesc::gfx10(va, 0x0004_0000, 0xDEAD, 256 * 32 / 64);
+    assert_eq!(d.resource_descriptor[0], 0x9abc_d000);
+    assert_eq!(d.resource_descriptor[1], 0x8000_5678);
+    assert_eq!(d.resource_descriptor[2], 0x0004_0000);
+    assert_eq!(d.resource_descriptor[3], 0x2181_4EAC);
+    assert_eq!(d.wave64_lane_byte_size, 128);
+}
+
 /// Cross-model parallelism (Pillar A): `assign_owner` must spread distinct
 /// owners across distinct pool queues (fill-empty-first) up to `hw_queues`, and
 /// the (hw_queues+1)-th owner must co-tenant an existing queue (the pool never
