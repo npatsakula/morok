@@ -65,6 +65,12 @@ pub trait AmdIface: Send + Sync + std::fmt::Debug {
     /// `Ok(Some(Error::Runtime{..}))` on a fault, `Ok(None)` on a normal
     /// wake-up/timeout, `Err` if the WAIT_EVENTS ioctl itself failed.
     fn wait_events(&self, timeout_ms: u32) -> Result<Option<Error>>;
+    /// `(group/LDS, private/scratch)` aperture base hi32 from
+    /// GET_PROCESS_APERTURES — written into the AQL `amd_queue_t` (the CWSR
+    /// trap path walks the struct and ROCr asserts these non-zero).
+    fn aperture_base_hi(&self) -> (u32, u32) {
+        (0, 0)
+    }
 }
 
 /// Allocation flavor — selects the KFD flag set built in [`AmdIface::alloc_raw`].
@@ -168,6 +174,9 @@ pub struct KfdIface {
     /// even though `wait_events(0)` may re-observe the (non-auto-reset) fault
     /// event on subsequent poll-fault calls.
     fault_logged: AtomicBool,
+    /// `(group/LDS, private/scratch)` aperture base hi32 from
+    /// GET_PROCESS_APERTURES, captured at open for the AQL queue descriptor.
+    aperture_base_hi: (u32, u32),
 }
 
 impl KfdIface {
@@ -219,11 +228,11 @@ impl KfdIface {
         if let Err(e) = unsafe { ioctl::kfd_get_process_apertures(kfd_fd.as_raw_fd(), &mut apertures as *mut _) } {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_GET_PROCESS_APERTURES", errno: e as i32 });
         }
-        let scratch_base = apertures.process_apertures[..apertures.num_of_nodes.min(7) as usize]
+        let node_apertures = apertures.process_apertures[..apertures.num_of_nodes.min(7) as usize]
             .iter()
-            .find(|a| a.gpu_id == node.gpu_id)
-            .map(|a| a.scratch_base)
-            .unwrap_or(0);
+            .find(|a| a.gpu_id == node.gpu_id);
+        let scratch_base = node_apertures.map(|a| a.scratch_base).unwrap_or(0);
+        let lds_base = node_apertures.map(|a| a.lds_base).unwrap_or(0);
         if scratch_base != 0 {
             let mut sb =
                 kfd::kfd_ioctl_set_scratch_backing_va_args { va_addr: scratch_base, gpu_id: node.gpu_id, pad: 0 };
@@ -321,6 +330,7 @@ impl KfdIface {
             hw_fault_event_id: hw_event.event_id,
             va: VaRegistry::default(),
             fault_logged: AtomicBool::new(false),
+            aperture_base_hi: ((lds_base >> 32) as u32, (scratch_base >> 32) as u32),
         })
     }
 }
@@ -507,6 +517,10 @@ impl AmdIface for KfdIface {
         let (doorbell_base, doorbell) = self.doorbell_mmap(args.doorbell_offset)?;
         debug!(queue_id = args.queue_id, doorbell_offset = args.doorbell_offset, "AMD queue created");
         Ok(QueueHandle { queue_id: args.queue_id, doorbell_base, doorbell })
+    }
+
+    fn aperture_base_hi(&self) -> (u32, u32) {
+        self.aperture_base_hi
     }
 
     fn teardown_ring(&self, queue_id: u32, doorbell_base: NonNull<u8>) {

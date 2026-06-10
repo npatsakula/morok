@@ -431,7 +431,10 @@ impl AmdComputeQueue {
     /// path is unsupported anyway. Same logic as `create`'s `is_pm4` decision.
     pub fn will_use_pm4(core: &AmdDeviceCore) -> bool {
         let force_aql = std::env::var("SVOD_AMD_AQL").ok().map(|s| s != "0").unwrap_or(false);
-        !force_aql && core.node.num_xcc.max(1) == 1
+        // RDNA2 (gfx10.3) runs AQL like ROCr: PM4 user compute queues have zero
+        // production users on this generation, and the HWS preempt path is only
+        // validated against an AQL `amd_queue_t`.
+        !force_aql && !core.arch.is_rdna2() && core.node.num_xcc.max(1) == 1
     }
 
     pub fn create(allocator: &AmdAllocator) -> Result<Box<Self>> {
@@ -1119,13 +1122,28 @@ fn create_queue(
                 crate::amd::sys::hsa::amd_signal_kind_t_AMD_SIGNAL_KIND_USER as i64,
             );
         }
-        // Initialize the GART descriptor.
+        // Initialize the GART descriptor with the FULL ROCr field set
+        // (amd_aql_queue.cpp ctor). The CWSR trap path walks the struct at
+        // preemption: hsa_queue.base_address/size and the aperture base_hi
+        // words must be valid (ROCr asserts them non-zero) — publishing a
+        // partial struct corrupts the context save and the resumed CPF fetch
+        // faults on the queue's control pages.
         // max_cu_id is total CUs across all XCCs - 1 (cu_cnt*xccs-1).
         let cu_cnt = dev.node.simd_count.max(1) / dev.node.simd_per_cu.max(1);
         let waves_per_cu = dev.node.max_waves_per_simd * dev.node.simd_per_cu;
+        let (group_hi, private_hi) = dev.iface().aperture_base_hi();
         // `queue_properties` is the u32 storage field; the generated property
         // constants are `amd_queue_properties_t` (c_int), narrowed here.
         let desc = crate::amd::sys::hsa::amd_queue_t {
+            hsa_queue: crate::amd::sys::hsa::hsa_queue_t {
+                type_: 0,    // HSA_QUEUE_TYPE_MULTI
+                features: 1, // HSA_QUEUE_FEATURE_KERNEL_DISPATCH
+                base_address: ring_gpu as *mut _,
+                size: (ring_size / AQL_PACKET_BYTES) as u32,
+                ..Default::default()
+            },
+            group_segment_aperture_base_hi: group_hi,
+            private_segment_aperture_base_hi: private_hi,
             queue_properties: (crate::amd::sys::hsa::amd_queue_properties_t_AMD_QUEUE_PROPERTIES_IS_PTR64
                 | crate::amd::sys::hsa::amd_queue_properties_t_AMD_QUEUE_PROPERTIES_ENABLE_PROFILING)
                 as u32,
