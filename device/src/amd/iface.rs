@@ -211,6 +211,34 @@ impl KfdIface {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_SET_MEMORY_POLICY", errno: e as i32 });
         }
 
+        // SCRATCH_BACKING_VA — ROCr programs the per-VMID scratch aperture base
+        // (SH_HIDDEN_PRIVATE_BASE) before any queue exists; KFD reports the
+        // process scratch aperture in GET_PROCESS_APERTURES. Without it, gfx10
+        // dispatches that spill resolve scratch against an unprogrammed base.
+        let mut apertures = kfd::kfd_ioctl_get_process_apertures_args::default();
+        if let Err(e) = unsafe { ioctl::kfd_get_process_apertures(kfd_fd.as_raw_fd(), &mut apertures as *mut _) } {
+            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_GET_PROCESS_APERTURES", errno: e as i32 });
+        }
+        let scratch_base = apertures.process_apertures[..apertures.num_of_nodes.min(7) as usize]
+            .iter()
+            .find(|a| a.gpu_id == node.gpu_id)
+            .map(|a| a.scratch_base)
+            .unwrap_or(0);
+        if scratch_base != 0 {
+            let mut sb =
+                kfd::kfd_ioctl_set_scratch_backing_va_args { va_addr: scratch_base, gpu_id: node.gpu_id, pad: 0 };
+            if let Err(e) = unsafe { ioctl::kfd_set_scratch_backing_va(kfd_fd.as_raw_fd(), &mut sb as *mut _) } {
+                return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_SET_SCRATCH_BACKING_VA", errno: e as i32 });
+            }
+        }
+
+        // XNACK off — explicit, matching ROCr's init on non-XNACK parts. Old
+        // kernels reject the ioctl (ENOTTY); best-effort.
+        let mut xnack = kfd::kfd_ioctl_set_xnack_mode_args { xnack_enabled: 0 };
+        if let Err(e) = unsafe { ioctl::kfd_set_xnack_mode(kfd_fd.as_raw_fd(), &mut xnack as *mut _) } {
+            tracing::warn!(?e, "SET_XNACK_MODE(0) rejected; continuing with kernel default");
+        }
+
         // RUNTIME_ENABLE — only on KFD >= 1.14; older kernels reject the
         // ioctl with ENOTTY. KFD selects enable-vs-disable by
         // `mode_mask & KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK` (bit 0), so a zero
