@@ -1074,9 +1074,9 @@ fn create_queue(
     }
     // GART page holds the AQL queue descriptor (`amd_queue_t`, 256 bytes).
     // rptr/wptr live at fixed offsets inside it; the CP reads them to drive the
-    // queue. Same coherent+uncached GTT flags as the ring — field-for-field with
-    // tinygrad's GART page and ROCr's queue control page.
-    let gart_buf = allocator.alloc_uncached(0x100)?;
+    // queue. ROCr allocates this page cached-coherent (no UNCACHED bit) — the
+    // only working gfx10.3 reference, so match it exactly.
+    let gart_buf = allocator.alloc_coherent(0x100)?;
     let (gart_gpu, gart_host) = match &gart_buf {
         crate::allocator::RawBuffer::AmdDevice { gpu_addr, host_ptr: Some(h), .. } => (*gpu_addr, *h),
         _ => return Err(Error::AmdAllocFailed { reason: "GART page requires host-visible buffer".into() }),
@@ -1150,9 +1150,8 @@ fn create_queue(
     // KFD writes debug-trap state. Undersizing causes corruption when CWSR
     // fires; oversizing is harmless.
     //
-    // EOP and ctx-save are *plain VRAM* (no PUBLIC/COHERENT/UNCACHED flags):
-    // they're written by the GPU during preemption and never read from the
-    // CPU, so the default allocation flags suffice.
+    // EOP is plain VRAM (GPU-only, ROCr device-local); ctx-save is coherent
+    // GTT (host writes the CWSR header, ROCr's CWSR heap).
     // SDMA queues take no EOP/ctx-save buffers (CWSR is a compute-shader
     // preemption mechanism) — both are zero for SDMA. Compute queues
     // size them per the CWSR contract below.
@@ -1168,9 +1167,11 @@ fn create_queue(
         // save/restore (MES preempts a busy queue as routine runlist scheduling).
         // Without the header, a restore reads garbage `DebugOffset`/`DebugSize`
         // and the queue silently strands (rptr frozen, no fault) — the exact
-        // multi-XCC wedge. Mirrors libhsakmt `fill_cwsr_header`.
-        let ctx_spec = BufferSpec { cpu_access: true, nolru: true, ..Default::default() };
-        let ctx_buf = allocator.alloc(cwsr_buffer_size, &ctx_spec, /*zero=*/ true)?;
+        // multi-XCC wedge. Mirrors libhsakmt `fill_cwsr_header`. Backing is
+        // cached-coherent GTT, ROCr's CWSR fallback heap (`queues.c`
+        // `allocate_exec_aligned_memory` nonPaged=false DeviceLocal=false) —
+        // never VRAM.
+        let ctx_buf = allocator.alloc_coherent(cwsr_buffer_size)?;
         let eop_gpu = match &eop_buf {
             crate::allocator::RawBuffer::AmdDevice { gpu_addr, .. } => *gpu_addr,
             _ => 0,

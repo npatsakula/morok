@@ -74,10 +74,15 @@ pub enum AllocKind {
     /// PUBLIC when `cpu_access` — the tinygrad/ROCr base flag set for every
     /// data/code/scratch buffer.
     DeviceVram,
-    /// GTT-pinned, host-visible, uncached system memory (rings, queue GART
-    /// pages, signal slots, the event page). Carries fine-grained `COHERENT`,
-    /// which the completion signal handshake relies on.
+    /// GTT-pinned, host-visible, uncached system memory (rings, signal slots,
+    /// the event page). Carries fine-grained `COHERENT`, which the completion
+    /// signal handshake relies on.
     UncachedGtt,
+    /// GTT-pinned, host-visible, *cached* coherent memory — ROCr's flag set for
+    /// the queue rptr/wptr control page and CWSR ctx-save (`queues.c`
+    /// `allocate_exec_aligned_memory_gpu`, Uncached=0). Same as `UncachedGtt`
+    /// minus the UNCACHED bit.
+    CoherentGtt,
 }
 
 /// Result of [`AmdIface::alloc_raw`]: everything `RawBuffer::AmdDevice` needs
@@ -190,6 +195,20 @@ impl KfdIface {
         let rc = unsafe { ioctl::kfd_acquire_vm(kfd_fd.as_raw_fd(), &mut args as *mut _) };
         if let Err(e) = rc {
             return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_ACQUIRE_VM", errno: e as i32 });
+        }
+
+        // SET_MEMORY_POLICY — ROCr issues this once per GPU right after
+        // ACQUIRE_VM (fmm_init_process_apertures): default NONCOHERENT cache
+        // policy, COHERENT alternate. We carve no alternate aperture (per-alloc
+        // COHERENT flags select fine-grain instead), so base/size stay 0.
+        let mut policy = kfd::kfd_ioctl_set_memory_policy_args {
+            gpu_id: node.gpu_id,
+            default_policy: kfd::KFD_IOC_CACHE_POLICY_NONCOHERENT,
+            alternate_policy: kfd::KFD_IOC_CACHE_POLICY_COHERENT,
+            ..Default::default()
+        };
+        if let Err(e) = unsafe { ioctl::kfd_set_memory_policy(kfd_fd.as_raw_fd(), &mut policy as *mut _) } {
+            return Err(Error::AmdIoctl { ioctl: "AMDKFD_IOC_SET_MEMORY_POLICY", errno: e as i32 });
         }
 
         // RUNTIME_ENABLE — only on KFD >= 1.14; older kernels reject the
@@ -619,6 +638,14 @@ pub(crate) fn compose_flags(kind: AllocKind, cpu_access: bool, is_apu: bool) -> 
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
                 | kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
+        }
+        AllocKind::CoherentGtt => {
+            kfd::KFD_IOC_ALLOC_MEM_FLAGS_GTT
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
+                | kfd::KFD_IOC_ALLOC_MEM_FLAGS_COHERENT
         }
     }
 }

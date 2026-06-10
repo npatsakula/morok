@@ -52,3 +52,16 @@ fn uncached_gtt_is_heap_independent() {
     assert_ne!(d & kfd::KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC, 0);
     assert_eq!(d & kfd::KFD_IOC_ALLOC_MEM_FLAGS_VRAM, 0);
 }
+
+/// ROCr's queue control / CWSR set: identical to `UncachedGtt` minus the
+/// UNCACHED bit — cached-coherent GTT. Regression guard for the only working
+/// gfx10.3 reference's rptr/wptr-page and ctx-save flags.
+#[test]
+fn coherent_gtt_is_uncached_gtt_minus_uncached() {
+    for is_apu in [false, true] {
+        let coherent = compose_flags(AllocKind::CoherentGtt, true, is_apu);
+        let uncached = compose_flags(AllocKind::UncachedGtt, true, is_apu);
+        assert_eq!(coherent | kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED, uncached);
+        assert_eq!(coherent & kfd::KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED, 0);
+    }
+}

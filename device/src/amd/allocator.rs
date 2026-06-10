@@ -56,6 +56,12 @@ impl AmdAllocator {
     pub fn alloc_uncached(&self, size: usize) -> Result<RawBuffer> {
         do_alloc(&self.dev, size, AllocKind::UncachedGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
     }
+
+    /// Allocate cached-coherent GTT (ROCr's queue control / CWSR set —
+    /// [`AllocKind::CoherentGtt`]) for the rptr/wptr GART page and ctx-save.
+    pub fn alloc_coherent(&self, size: usize) -> Result<RawBuffer> {
+        do_alloc(&self.dev, size, AllocKind::CoherentGtt, /*cpu_accessible=*/ true, /*zero_init=*/ true)
+    }
 }
 
 impl std::fmt::Debug for AmdAllocator {
@@ -241,7 +247,7 @@ fn do_alloc(
     // VRAM data/code/kernarg buffer or GTT control memory.
     let tag = match kind {
         AllocKind::DeviceVram => AllocTag::Vram,
-        AllocKind::UncachedGtt => AllocTag::Gtt,
+        AllocKind::UncachedGtt | AllocKind::CoherentGtt => AllocTag::Gtt,
     };
     let r = dev.core().iface().alloc_raw(size, kind, tag, cpu_accessible, zero_init)?;
     Ok(RawBuffer::AmdDevice {
