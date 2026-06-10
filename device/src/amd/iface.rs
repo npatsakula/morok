@@ -221,7 +221,13 @@ impl KfdIface {
         // compute) depends on; without it, an evicted-but-live BO is never
         // restored and the CP faults NotPresent on it. No TTMP (no CWSR
         // trap-debug); r_debug = 0 (no debugger attached).
-        if kfd_version >= (1, 14) {
+        // Bisect gate: KFD couples runtime-enable to per-process debug state;
+        // we pass r_debug=0 (ROCr passes a real pointer). Skip the ioctl to
+        // isolate whether the enabled-debug-runtime state perturbs queue/BO
+        // restore on gfx10.3 iGPUs.
+        if std::env::var_os("SVOD_AMD_NO_RUNTIME_ENABLE").is_some() {
+            tracing::warn!("SVOD_AMD_NO_RUNTIME_ENABLE set; skipping RUNTIME_ENABLE");
+        } else if kfd_version >= (1, 14) {
             const KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK: u32 = 1;
             let mut rt = kfd::kfd_ioctl_runtime_enable_args {
                 mode_mask: KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK,
