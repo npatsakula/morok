@@ -575,16 +575,11 @@ pub(crate) fn ensure_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNo
 /// Returns `(va, size, kfd_handle)`. The handle goes into the
 /// `event_page_offset` field of the bind `AMDKFD_IOC_CREATE_EVENT` call.
 fn alloc_event_page(kfd_fd: &OwnedFd, drm_fd: &OwnedFd, node: &AmdNode) -> Result<(u64, usize, u64)> {
-    use libc::{
-        MAP_ANONYMOUS, MAP_FIXED, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, PROT_NONE, PROT_READ, PROT_WRITE, mmap,
-        munmap,
-    };
+    use libc::{MAP_FIXED, MAP_SHARED, PROT_READ, PROT_WRITE, mmap, munmap};
     let size: usize = 0x8000;
-    // SAFETY: standard libc::mmap; PROT_NONE reservation.
-    let va = unsafe { mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
-    if va == libc::MAP_FAILED {
-        return Err(Error::AmdAllocFailed { reason: "event-page VA reservation failed".into() });
-    }
+    // Shared VA reservation path so the SVOD_AMD_LOW_VA bisect gate covers the
+    // event page too.
+    let va = crate::amd::iface::reserve_va(size)?;
     let mut args = kfd::kfd_ioctl_alloc_memory_of_gpu_args {
         va_addr: va as u64,
         size: size as u64,

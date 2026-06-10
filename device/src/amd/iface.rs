@@ -685,7 +685,34 @@ pub(crate) fn compose_flags(kind: AllocKind, cpu_access: bool, is_apu: bool) -> 
 }
 
 /// Reserve `size` bytes of host VA so KFD can bind VRAM into it.
-fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
+///
+/// Bisect gate (SVOD_AMD_LOW_VA): place reservations under 2^40 via a bump
+/// cursor + MAP_FIXED_NOREPLACE. ROCr clamps every GPU VA to
+/// `SVM_RESERVATION_LIMIT = (1<<40)-1` (fmm.c); kernel-chosen `mmap(NULL)`
+/// VAs land at ~2^47, which RDNA2's UTCL2 may not translate for CP fetches.
+pub(crate) fn reserve_va(size: usize) -> Result<*mut libc::c_void> {
+    if std::env::var_os("SVOD_AMD_LOW_VA").is_some() {
+        static CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x80_0000_0000);
+        // Bump-allocate; on collision (EEXIST) keep bumping. 64 KiB-align.
+        for _ in 0..1024 {
+            let len = size.next_multiple_of(0x10000);
+            let base = CURSOR.fetch_add(len as u64 + 0x10000, Ordering::Relaxed);
+            let p = unsafe {
+                mmap(
+                    base as *mut _,
+                    size,
+                    PROT_NONE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | libc::MAP_FIXED_NOREPLACE,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                return Ok(p);
+            }
+        }
+        return Err(Error::AmdAllocFailed { reason: "SVOD_AMD_LOW_VA: no low VA found after 1024 probes".into() });
+    }
     // SAFETY: standard libc::mmap signature; no aliasing concerns at this point.
     let p = unsafe { mmap(std::ptr::null_mut(), size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
     if p == libc::MAP_FAILED {
